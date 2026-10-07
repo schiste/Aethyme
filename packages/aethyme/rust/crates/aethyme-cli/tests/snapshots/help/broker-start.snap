@@ -12,8 +12,8 @@ exit: 0
   aethyme broker start --adopt [<path>] [--task <text>] [--short-name <name>] [--path <repo-path>]... [--agent <name-and-email>] [--repo-name <name>] [--tab-name <name>] [--ai-provider <provider>] [--reuse [--sync-integration]|--replace-stale] [--take-over] [--allow-main-checkout] [--json]
       Register an existing worktree (attach-first). Defaults to the
       current directory. A new session on the repository's main checkout is
-      refused unless --allow-main-checkout (or AETHYME_ALLOW_MAIN_CHECKOUT=1)
-      is given; use `broker start` for an isolated worktree. If the worktree already has a session:
+      refused unless the operator explicitly passes --allow-main-checkout;
+      use `broker start` for an isolated worktree. If the worktree already has a session:
       --reuse points it at a follow-up task with a fresh baseline and
       reports its relation to the current integration tip;
       --sync-integration requires --reuse and first fast-forwards a clean

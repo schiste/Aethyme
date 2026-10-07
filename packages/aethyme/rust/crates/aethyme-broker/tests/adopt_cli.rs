@@ -204,7 +204,14 @@ fn adopted_reused_session_without_a_chau7_tab_skips_mcp_lookup() {
     let tmp = fixture();
     let created = stdout(&run_verbatim(
         tmp.path(),
-        &["start", "--adopt", "--task", "first", "--json"],
+        &[
+            "start",
+            "--adopt",
+            "--allow-main-checkout",
+            "--task",
+            "first",
+            "--json",
+        ],
     ));
     let created: serde_json::Value = serde_json::from_str(&created).unwrap();
     assert_eq!(created["tab_rename"]["status"], "not_applicable");
@@ -318,7 +325,6 @@ fn run_verbatim(repo: &Path, args: &[&str]) -> Output {
         .args(args)
         .current_dir(repo)
         .env("AETHYME_CHAU7_MCP_BRIDGE", common::disabled_bridge_path())
-        .env("AETHYME_ALLOW_MAIN_CHECKOUT", "1")
         .output()
         .unwrap()
 }
@@ -329,7 +335,6 @@ fn run_enforced(repo: &Path, args: &[&str]) -> Output {
         .args(args)
         .current_dir(repo)
         .env("AETHYME_CHAU7_MCP_BRIDGE", common::disabled_bridge_path())
-        .env_remove("AETHYME_ALLOW_MAIN_CHECKOUT")
         .output()
         .unwrap()
 }
@@ -374,6 +379,7 @@ fn reuse_without_a_short_name_keeps_the_stored_name() {
         &[
             "start",
             "--adopt",
+            "--allow-main-checkout",
             "--task",
             "first",
             "--short-name",
@@ -774,7 +780,16 @@ fn adopt_cli_distinguishes_created_and_reused_session_identities() {
     );
 
     stdout(&run(tmp.path(), &["finish", "close", "--session", "1"]));
-    let created_after_close = stdout(&run(tmp.path(), &["start", "--reuse", "--task", "second"]));
+    let created_after_close = stdout(&run(
+        tmp.path(),
+        &[
+            "start",
+            "--reuse",
+            "--allow-main-checkout",
+            "--task",
+            "second",
+        ],
+    ));
     assert!(
         created_after_close.contains("Created session 2 on the existing worktree"),
         "{created_after_close}"
@@ -1136,6 +1151,27 @@ fn the_main_checkout_needs_an_explicit_override_and_its_session_stays_reusable()
     ));
     let reused: serde_json::Value = serde_json::from_str(&reused).unwrap();
     assert_eq!(reused["outcome"], "reused");
+}
+
+#[test]
+fn the_main_checkout_environment_variable_is_not_an_operator_override() {
+    let tmp = fixture();
+    let output = Command::new(CLI)
+        .args([
+            "start",
+            "--adopt",
+            "--task",
+            "environment override must not work",
+            "--short-name",
+            "environment-override",
+            "--json",
+        ])
+        .current_dir(tmp.path())
+        .env("AETHYME_CHAU7_MCP_BRIDGE", common::disabled_bridge_path())
+        .env("AETHYME_ALLOW_MAIN_CHECKOUT", "1")
+        .output()
+        .unwrap();
+    assert_main_checkout_refused(&output);
 }
 
 /// A linked worktree is not the main checkout: adopting it still works.

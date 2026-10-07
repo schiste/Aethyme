@@ -113,8 +113,8 @@ Usage:
   aethyme broker adopt [<path>] [--task <text>] [--short-name <name>] [--path <repo-path>]... [--agent <name-and-email>] [--repo-name <name>] [--tab-name <name>] [--ai-provider <provider>] [--reuse [--sync-integration]|--replace-stale] [--take-over] [--allow-main-checkout] [--json]
       Register an existing worktree (attach-first). Defaults to the
       current directory. A new session on the repository's main checkout is
-      refused unless --allow-main-checkout (or AETHYME_ALLOW_MAIN_CHECKOUT=1)
-      is given; use `broker start` for an isolated worktree. If the worktree already has a session:
+      refused unless the operator explicitly passes --allow-main-checkout;
+      use `broker start` for an isolated worktree. If the worktree already has a session:
       --reuse points it at a follow-up task with a fresh baseline and
       reports its relation to the current integration tip;
       --sync-integration requires --reuse and first fast-forwards a clean
@@ -348,8 +348,9 @@ Usage:
       A command that can delete or move a branch ref (pr merge|close
       --delete-branch, update-branch --rebase, repo sync --force, api ref
       writes, GraphQL mutations, aliases) is checked against the exact branch
-      it touches; one the broker cannot pin to a branch is refused unless
-      --destructive --ref-write-acknowledged confirms it.
+      it touches; one the broker cannot pin to a branch is refused when a
+      shared branch could be involved, even with --destructive
+      --ref-write-acknowledged.
   aethyme broker merge-chain --session <id> --repo <owner/name> --reason <text> <pr>... [--merge-method <merge|squash|rebase>] [--poll-seconds <n>] [--checks-timeout <seconds>] [--main-timeout <seconds>] [--gates-workflow <file> [--dispatch-after <seconds>]] [--dry-run] [--json]
       Land pull requests one at a time, in order. For each: mark it ready,
       update it onto the base when behind, wait for the latest run of every

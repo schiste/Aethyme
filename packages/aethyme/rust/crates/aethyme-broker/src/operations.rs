@@ -1758,28 +1758,207 @@ fn destructive_branch_targets(provider: OperationProvider, args: &[String]) -> V
     }
 }
 
-fn git_destructive_branch_targets(args: &[String]) -> Vec<String> {
-    let Some(args) = git_subcommand_args(args) else {
-        return Vec::new();
+/// The branch refs an explicit Git push may advance or rewrite. A push with
+/// implicit, wildcard, or set-expanding ref selection is rejected by the
+/// coordinated-operation guard instead of guessing what Git configuration
+/// will update.
+#[derive(Debug, Default)]
+struct GitPushBranchTargets {
+    advance: Vec<String>,
+    rewrite: Vec<String>,
+}
+
+impl GitPushBranchTargets {
+    fn all(&self) -> Vec<String> {
+        self.rewrite.iter().chain(&self.advance).cloned().collect()
+    }
+}
+
+/// Parse the branch targets of push and send-pack. Ok(None) means the argv
+/// names another Git subcommand; an error means Git can select or update
+/// refs in a way this parser cannot safely classify.
+fn git_push_branch_targets(argv: &[String]) -> Result<Option<GitPushBranchTargets>, String> {
+    let Some(args) = git_subcommand_args(argv) else {
+        return Ok(None);
     };
     let Some((command, rest)) = args.split_first() else {
+        return Ok(None);
+    };
+    if !matches!(command.as_str(), "push" | "send-pack") {
+        return Ok(None);
+    }
+
+    let mut positionals = Vec::new();
+    let mut force_all = false;
+    let mut delete_all = false;
+    let mut expands_refs = None;
+    let mut index = 0;
+    let mut end_of_options = false;
+    while index < rest.len() {
+        let arg = rest[index].as_str();
+        index += 1;
+        if end_of_options {
+            positionals.push(arg);
+            continue;
+        }
+        if arg == "--" {
+            end_of_options = true;
+            continue;
+        }
+        match arg {
+            "--force" | "--force-if-includes" | "--force-with-lease" => force_all = true,
+            "--delete" => delete_all = true,
+            "--all" | "--branches" | "--mirror" | "--prune" => {
+                expands_refs = Some(arg);
+            }
+            "-o"
+            | "--push-option"
+            | "--repo"
+            | "--receive-pack"
+            | "--exec"
+            | "--recurse-submodules" => {
+                if index == rest.len() {
+                    return Err(format!("{arg} is missing its value"));
+                }
+                index += 1;
+            }
+            "--atomic" | "--dry-run" | "--follow-tags" | "--no-follow-tags" | "--no-verify"
+            | "--tags" | "--porcelain" | "--progress" | "--no-progress" | "--quiet"
+            | "--verbose" | "--set-upstream" | "--signed" | "--no-signed" | "--thin"
+            | "--no-thin" | "--ipv4" | "--ipv6" => {}
+            _ if arg.starts_with("--force-with-lease=") => force_all = true,
+            _ if arg.starts_with("--push-option=")
+                || arg.starts_with("--repo=")
+                || arg.starts_with("--receive-pack=")
+                || arg.starts_with("--exec=")
+                || arg.starts_with("--recurse-submodules=")
+                || arg.starts_with("--signed=") => {}
+            _ if arg.starts_with('-') => {
+                let Some(flags) = arg.strip_prefix('-') else {
+                    unreachable!();
+                };
+                if flags.is_empty() || flags.starts_with('-') {
+                    return Err(format!("unrecognized push option {arg:?}"));
+                }
+                for (offset, flag) in flags.char_indices() {
+                    match flag {
+                        'f' => force_all = true,
+                        'd' => delete_all = true,
+                        'u' | 'q' | 'v' | 'n' | '4' | '6' => {}
+                        'o' => {
+                            let attached = flags.get(offset + flag.len_utf8()..).unwrap_or("");
+                            if attached.is_empty() {
+                                if index == rest.len() {
+                                    return Err("-o is missing its value".into());
+                                }
+                                index += 1;
+                            }
+                            break;
+                        }
+                        _ => return Err(format!("unrecognized push option {arg:?}")),
+                    }
+                }
+            }
+            _ => positionals.push(arg),
+        }
+    }
+
+    if let Some(mode) = expands_refs {
+        return Err(format!(
+            "{mode} selects additional refs outside explicit refspecs"
+        ));
+    }
+    if positionals.is_empty() {
+        return Err("no explicit remote was supplied".into());
+    }
+    let refspecs = &positionals[1..];
+    if refspecs.is_empty() {
+        return Err("no explicit refspec was supplied; Git configuration selects the refs".into());
+    }
+
+    let mut targets = GitPushBranchTargets::default();
+    for refspec in refspecs {
+        let forced = refspec.starts_with('+');
+        let refspec = refspec.strip_prefix('+').unwrap_or(refspec);
+        if refspec.is_empty() || refspec.starts_with('+') {
+            return Err(format!("invalid or ambiguous refspec {refspec:?}"));
+        }
+        if refspec.matches(':').count() > 1 {
+            return Err(format!("refspec {refspec:?} contains multiple separators"));
+        }
+        if refspec.chars().any(|ch| matches!(ch, '*' | '?' | '[')) {
+            return Err(format!(
+                "wildcard refspec {refspec:?} expands the target set"
+            ));
+        }
+        let destination = if delete_all {
+            refspec.split_once(':').map_or(refspec, |(_, dst)| dst)
+        } else if let Some((source, destination)) = refspec.split_once(':') {
+            if destination.contains(':') {
+                return Err(format!("refspec {refspec:?} contains multiple separators"));
+            }
+            if destination.is_empty() {
+                source
+            } else {
+                destination
+            }
+        } else {
+            if refspec == "HEAD" || refspec.contains("@{") {
+                return Err(format!(
+                    "refspec {refspec:?} needs repository state to determine its destination"
+                ));
+            }
+            refspec
+        };
+        if destination.is_empty() || destination == "HEAD" || destination.contains("@{") {
+            return Err(format!(
+                "refspec {refspec:?} has an unresolvable destination"
+            ));
+        }
+        let Some(branch) = push_branch_name(destination)? else {
+            continue;
+        };
+        if force_all || forced || delete_all || refspec.starts_with(':') {
+            targets.rewrite.push(branch);
+        } else {
+            targets.advance.push(branch);
+        }
+    }
+    Ok(Some(targets))
+}
+
+/// A push destination without a namespace is a branch. Full branch refs are
+/// also branches; tags and other refs (including refs/remotes/*) are not.
+fn push_branch_name(reference: &str) -> Result<Option<String>, String> {
+    if let Some(branch) = reference.strip_prefix("refs/heads/") {
+        if branch.is_empty() || branch.ends_with('/') || branch.contains("//") {
+            return Err(format!("invalid branch destination {reference:?}"));
+        }
+        return Ok(Some(branch.to_string()));
+    }
+    if reference.starts_with("refs/") {
+        return Ok(None);
+    }
+    Ok(Some(reference.to_string()))
+}
+
+fn git_destructive_branch_targets(args: &[String]) -> Vec<String> {
+    let Some(subcommand_args) = git_subcommand_args(args) else {
         return Vec::new();
     };
+    let Some((command, rest)) = subcommand_args.split_first() else {
+        return Vec::new();
+    };
+    if matches!(command.as_str(), "push" | "send-pack") {
+        return git_push_branch_targets(args)
+            .ok()
+            .flatten()
+            .map_or_else(Vec::new, |targets| targets.all());
+    }
     let positionals = git_positionals(rest);
     let references: Vec<&str> = match command.as_str() {
-        // The first positional is the remote; each refspec names its
-        // destination after `:`, or is itself the destination.
-        "push" | "send-pack" => positionals
-            .iter()
-            .skip(1)
-            .map(|spec| {
-                let spec = spec.trim_start_matches('+');
-                spec.split_once(':')
-                    .map_or(spec, |(_, destination)| destination)
-            })
-            .collect(),
         "branch" if has_any(rest, &["-r", "--remotes"]) || has_short_flag(rest, 'r') => {
-            // `branch -dr origin/<branch>` names the remote-tracking ref.
+            // branch -dr origin/<branch> names the remote-tracking ref.
             positionals
                 .iter()
                 .map(|name| name.split_once('/').map_or(*name, |(_, branch)| branch))
@@ -1791,7 +1970,7 @@ fn git_destructive_branch_targets(args: &[String]) -> Vec<String> {
     branch_names(references)
 }
 
-/// Strip `refs/heads/` and `refs/remotes/<remote>/` to the branch name.
+/// Strip refs/heads/ and refs/remotes/<remote>/ to the branch name.
 fn branch_names(references: Vec<&str>) -> Vec<String> {
     references
         .into_iter()
@@ -1809,49 +1988,20 @@ fn branch_names(references: Vec<&str>) -> Vec<String> {
         .collect()
 }
 
-/// The subset of [`git_destructive_branch_targets`] a git command deletes or
-/// moves non-fast-forward. A push destination counts only when the refspec
-/// deletes (`:dst`), forces (`+src:dst`), or the whole push is forced,
-/// deleting, mirrored or pruning; a plain `src:dst` is a fast-forward the
-/// remote itself enforces. `branch` and `update-ref` targets always count.
+/// The subset of git_destructive_branch_targets a git command deletes or
+/// moves non-fast-forward. A plain push is a fast-forward the remote enforces;
+/// the parsed push plan distinguishes it from deletions and forced updates.
 fn git_rewritten_branches(argv: &[String]) -> Vec<String> {
-    let Some(args) = git_subcommand_args(argv) else {
-        return Vec::new();
-    };
-    let Some((command, rest)) = args.split_first() else {
-        return Vec::new();
-    };
-    match command.as_str() {
-        "push" | "send-pack" => {
-            let whole = has_any(
-                rest,
-                &[
-                    "--force",
-                    "--force-with-lease",
-                    "--force-if-includes",
-                    "--delete",
-                    "--mirror",
-                    "--prune",
-                ],
-            ) || rest
-                .iter()
-                .any(|arg| arg.starts_with("--force-with-lease="))
-                || has_short_flag(rest, 'f')
-                || has_short_flag(rest, 'd');
-            let references = git_positionals(rest)
-                .into_iter()
-                .skip(1)
-                .filter(|spec| whole || spec.starts_with('+') || spec.starts_with(':'))
-                .map(|spec| {
-                    let spec = spec.trim_start_matches('+');
-                    spec.split_once(':')
-                        .map_or(spec, |(_, destination)| destination)
-                })
-                .collect();
-            branch_names(references)
-        }
-        _ => git_destructive_branch_targets(argv),
+    if let Some(args) = git_subcommand_args(argv)
+        && let Some((command, _)) = args.split_first()
+        && matches!(command.as_str(), "push" | "send-pack")
+    {
+        return git_push_branch_targets(argv)
+            .ok()
+            .flatten()
+            .map_or_else(Vec::new, |targets| targets.rewrite);
     }
+    git_destructive_branch_targets(argv)
 }
 
 fn same_directory(left: &Path, right: &Path) -> bool {
@@ -4598,10 +4748,10 @@ impl Broker {
             Err(BrokerOpError::InvalidCoordinatedOperation {
                 reason: format!(
                     "refusing a gh command that may write a branch ref: {why}. Nothing was run. \
-                     Use `pr merge <N> --merge|--squash|--rebase [-d]` or `api -X DELETE \
-                     repos/<owner>/<repo>/git/refs/heads/<branch>`, or, only if the operator \
-                     confirmed it touches no other live session's branch, add --destructive \
-                     --ref-write-acknowledged"
+                     Use the exact allowlisted `pr merge` or `api -X DELETE` form. An \
+                     unverifiable write can be acknowledged with --destructive \
+                     --ref-write-acknowledged only when no shared branch can be involved and the \
+                     operator confirmed it touches no other live session's branch"
                 ),
             })
         };
@@ -4609,10 +4759,17 @@ impl Broker {
         let verdict = crate::gh_ref_guard::assess(&request.args, slug);
         let (number, match_head_commit) = match verdict {
             Verdict::NoRefWrite => return Ok((GhRefTargets::default(), None)),
-            Verdict::Unverifiable(_)
+            Verdict::Unverifiable(why)
                 if request.ref_write_acknowledged && request.destructive_confirmed =>
             {
-                return Ok((GhRefTargets::default(), None));
+                let shared = self.shared_branches();
+                if shared.is_empty() {
+                    return Ok((GhRefTargets::default(), None));
+                }
+                return refuse(format!(
+                    "{why}; the broker cannot establish that this write avoids shared branch(es): {}",
+                    shared.join(", ")
+                ));
             }
             Verdict::Unverifiable(why) => return refuse(why),
             // Files land in the working directory, which must be the session
@@ -4766,7 +4923,28 @@ impl Broker {
         effect: OperationEffect,
         gh_targets: GhRefTargets,
     ) -> Result<Option<i64>, BrokerOpError> {
-        if effect != OperationEffect::Destructive && gh_targets.is_empty() {
+        let parsed_push = if request.provider == OperationProvider::Git {
+            match git_push_branch_targets(&request.args) {
+                Ok(parsed) => parsed,
+                Err(why) => {
+                    return Err(BrokerOpError::InvalidCoordinatedOperation {
+                        reason: format!(
+                            "cannot safely classify this git push's ref targets ({why}); it may \
+                             rewrite a shared or session-owned branch. Nothing was run."
+                        ),
+                    });
+                }
+            }
+        } else {
+            None
+        };
+        let has_git_branch_targets = parsed_push
+            .as_ref()
+            .is_some_and(|targets| !targets.all().is_empty());
+        if effect != OperationEffect::Destructive
+            && gh_targets.is_empty()
+            && !has_git_branch_targets
+        {
             return match request.cross_session {
                 Some(_) => Err(BrokerOpError::InvalidCoordinatedOperation {
                     reason: "--cross-session applies only to a destructive operation".into(),
@@ -4778,9 +4956,18 @@ impl Broker {
         // advances (a merge's base).
         // Git: every destination is attributed, but only a deleted or forced
         // one is a rewrite; a plain fast-forward push to main is an advance.
-        let git_targets = destructive_branch_targets(request.provider, &request.args);
+        let git_targets = match request.provider {
+            OperationProvider::Git => parsed_push.as_ref().map_or_else(
+                || destructive_branch_targets(request.provider, &request.args),
+                GitPushBranchTargets::all,
+            ),
+            OperationProvider::Github => Vec::new(),
+        };
         let mut rewrites = match request.provider {
-            OperationProvider::Git => git_rewritten_branches(&request.args),
+            OperationProvider::Git => parsed_push.as_ref().map_or_else(
+                || git_rewritten_branches(&request.args),
+                |targets| targets.rewrite.clone(),
+            ),
             OperationProvider::Github => Vec::new(),
         };
         let mut advances: Vec<String> = git_targets
@@ -7373,7 +7560,6 @@ mod tests {
             "-f",
             "--force-with-lease",
             "--force-with-lease=main",
-            "--mirror",
         ] {
             assert_eq!(
                 rewritten(&["push", force, "origin", "HEAD:refs/heads/main"]),
@@ -7384,6 +7570,71 @@ mod tests {
         assert_eq!(rewritten(&["push", "origin", "--delete", "main"]), ["main"]);
         assert!(rewritten(&["update-ref", "refs/heads/main", "abc"]).contains(&"main".to_string()));
         assert_eq!(rewritten(&["branch", "-D", "main"]), ["main"]);
+    }
+
+    #[test]
+    fn push_targets_parse_remote_aliases_urls_and_namespace_destinations() {
+        let targets = |argv: &[&str]| {
+            git_push_branch_targets(&args(argv))
+                .unwrap()
+                .unwrap_or_default()
+        };
+        for argv in [
+            &["push", "origin", "+HEAD:refs/heads/main"][..],
+            &["push", "ssh://git@example.test/repo.git", "+HEAD:main"][..],
+            &[
+                "push",
+                "--repo",
+                "ssh://git@example.test/repo.git",
+                "origin",
+                "+HEAD:main",
+            ][..],
+            &[
+                "push",
+                "--repo=ssh://git@example.test/repo.git",
+                "origin",
+                "+HEAD:main",
+            ][..],
+        ] {
+            assert_eq!(targets(argv).rewrite, ["main"], "{argv:?}");
+        }
+        assert!(
+            destructive_branch_targets(
+                OperationProvider::Git,
+                &args(&["push", "origin", "+HEAD:refs/remotes/origin/main"]),
+            )
+            .is_empty(),
+            "remote-tracking refs are not remote branch heads"
+        );
+        assert!(
+            destructive_branch_targets(
+                OperationProvider::Git,
+                &args(&["push", "origin", "+HEAD:refs/tags/main"]),
+            )
+            .is_empty(),
+            "tags are not branch heads"
+        );
+    }
+
+    #[test]
+    fn push_targets_reject_implicit_and_set_expanding_ref_selection() {
+        for argv in [
+            &["push", "origin"][..],
+            &["push"][..],
+            &["push", "--all", "origin"][..],
+            &["push", "--branches", "origin"][..],
+            &["push", "--mirror", "origin"][..],
+            &["push", "--prune", "origin", "main"][..],
+            &["push", "origin", "refs/heads/*:refs/heads/*"][..],
+            &["push", "origin", "+HEAD:"][..],
+            &["push", "origin", "HEAD"][..],
+            &["push", "--unknown-option", "origin", "main"][..],
+        ] {
+            assert!(
+                git_push_branch_targets(&args(argv)).is_err(),
+                "{argv:?} must fail closed"
+            );
+        }
     }
 
     fn push_shape(args: &[&str]) -> Option<PushShape> {

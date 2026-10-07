@@ -858,10 +858,8 @@ pub(super) fn run_worktree_root(parsed: Parsed) -> Result<(), UsageError> {
     Ok(())
 }
 
-/// The operator override as an environment variable, equivalent to
-/// `--allow-main-checkout` (`1` enables it; any other value does not).
-const ALLOW_MAIN_CHECKOUT_ENV: &str = "AETHYME_ALLOW_MAIN_CHECKOUT";
-
+/// The operator-only explicit override for registering a new session on the
+/// main checkout. Environment variables cannot authorize this exception.
 /// #284 proposal 9: a session on the main checkout lands work on the default
 /// branch before any gate runs, so a NEW one needs an explicit
 /// `--allow-main-checkout`. A session that already lives there may still be
@@ -873,7 +871,7 @@ fn refuse_new_session_on_main_checkout(
     path: &std::path::Path,
     allow_main_checkout: bool,
 ) -> Result<(), UsageError> {
-    if allow_main_checkout || std::env::var_os(ALLOW_MAIN_CHECKOUT_ENV).is_some_and(|v| v == "1") {
+    if allow_main_checkout {
         return Ok(());
     }
     let checkout = crate::GitRepo::discover(path)?;

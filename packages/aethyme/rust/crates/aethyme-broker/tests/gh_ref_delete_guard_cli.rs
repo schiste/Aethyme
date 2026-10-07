@@ -487,7 +487,51 @@ fn the_exact_branch_delete_runs_byte_identical_or_is_refused_for_an_owner() {
 }
 
 #[test]
-fn an_unverifiable_write_runs_only_when_acknowledged_and_destructive() {
+fn unclassified_branch_ref_mutations_are_refused_even_with_acknowledgement() {
+    let cases: Vec<Vec<&str>> = vec![
+        vec![
+            "api",
+            "-X",
+            "PATCH",
+            "repos/schiste/Aethyme/git/refs/heads/main",
+            "-f",
+            "sha=0",
+            "-F",
+            "force=true",
+        ],
+        vec![
+            "api",
+            "-X",
+            "DELETE",
+            "repos/schiste/Aethyme/git/refs/heads/%6Dain",
+        ],
+        vec![
+            "api",
+            "graphql",
+            "-f",
+            "query=mutation { updateRef(input:{}) { x } }",
+        ],
+    ];
+    for mutation in cases {
+        let fixture = Fixture::new();
+        let output = fixture.gh(
+            &[
+                "--effect",
+                "destructive",
+                "--scope",
+                "github:test",
+                "--destructive",
+                "--ref-write-acknowledged",
+            ],
+            &mutation,
+            "",
+        );
+        assert_refused(&fixture, &output, MAY_WRITE);
+    }
+}
+
+#[test]
+fn an_unverifiable_write_is_refused_when_shared_branches_exist() {
     let fixture = Fixture::new();
     let mutation = ["api", "graphql", "-f", "query=mutation { x }"];
     let output = fixture.gh(&[], &mutation, "");
@@ -499,7 +543,7 @@ fn an_unverifiable_write_runs_only_when_acknowledged_and_destructive() {
         &mutation,
         "",
     );
-    assert_ran_exactly(&fixture, &output, "api graphql -f query=mutation { x }");
+    assert_refused(&fixture, &output, "shared branch");
 }
 
 // --- Exact writes that cannot touch a ref run without acknowledgement ----

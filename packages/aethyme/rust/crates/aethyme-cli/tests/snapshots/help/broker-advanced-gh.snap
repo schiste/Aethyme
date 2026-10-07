@@ -9,6 +9,7 @@ exit: 0
       A command that can delete or move a branch ref (pr merge|close
       --delete-branch, update-branch --rebase, repo sync --force, api ref
       writes, GraphQL mutations, aliases) is checked against the exact branch
-      it touches; one the broker cannot pin to a branch is refused unless
-      --destructive --ref-write-acknowledged confirms it.
+      it touches; one the broker cannot pin to a branch is refused when a
+      shared branch could be involved, even with --destructive
+      --ref-write-acknowledged.
 --- stderr

@@ -12,6 +12,13 @@ pub fn test_session_args(args: &[&str]) -> Vec<String> {
     {
         args.extend(["--short-name", "test session"]);
     }
+    let adopts_main = matches!(args.first(), Some(&"adopt"))
+        || (args.first() == Some(&"start") && args.contains(&"--adopt"));
+    if adopts_main && !args.contains(&"--allow-main-checkout") {
+        // Test fixtures intentionally register sessions in their temporary
+        // main checkout; exercise the explicit operator-only CLI flag.
+        args.push("--allow-main-checkout");
+    }
     args.into_iter().map(str::to_string).collect()
 }
 
@@ -24,10 +31,6 @@ pub fn broker_cli(binary: &str, args: &[&str]) -> Command {
     let mut command = Command::new(binary);
     command
         .args(test_session_args(args))
-        .env("AETHYME_CHAU7_MCP_BRIDGE", disabled_bridge_path())
-        // Fixtures adopt their own main checkout; production refuses that
-        // unless the operator opts in (#284 proposal 9). Tests of the refusal
-        // remove this variable.
-        .env("AETHYME_ALLOW_MAIN_CHECKOUT", "1");
+        .env("AETHYME_CHAU7_MCP_BRIDGE", disabled_bridge_path());
     command
 }
