@@ -247,7 +247,7 @@ fn operation_agent_identity(process: &AgentProcess) -> serde_json::Value {
         .next()
         .and_then(|command| Path::new(command).file_name())
         .and_then(|name| name.to_str())
-        .filter(|name| !name.is_empty())
+        .filter(|name| is_plain_program_name(name))
         .unwrap_or("unknown")
         .to_string();
     serde_json::json!({
@@ -255,6 +255,17 @@ fn operation_agent_identity(process: &AgentProcess) -> serde_json::Value {
         "started": process.started,
         "program": program,
     })
+}
+
+/// A process can set its own `argv[0]` to any text, so only a short name made
+/// of ordinary program-name characters is persisted; anything else is stored
+/// as `unknown` rather than risk keeping a token-shaped string in history.
+fn is_plain_program_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '+'))
 }
 
 /// Snapshot local process provenance for one coordinated-operation journal row.
@@ -596,6 +607,22 @@ mod tests {
  2100  2023 Fri Oct  2 15:31:00 2026     /bin/bash -lc git status
  3000     1 Fri Oct  2 15:40:00 2026     /usr/bin/nohup zsh queue.sh
 ";
+
+    #[test]
+    fn operation_provenance_never_keeps_a_token_shaped_program_name() {
+        for command in [
+            "token=ghp_secretvalue --flag",
+            "/tmp/a$(id) arg",
+            "/usr/bin/name-with-a-very-long-suffix-that-goes-on-and-on-past-sixty-four-chars",
+        ] {
+            let identity = operation_agent_identity(&AgentProcess {
+                pid: 7,
+                started: "Mon Oct 5 12:34:56 2026".into(),
+                command: command.into(),
+            });
+            assert_eq!(identity["program"], "unknown", "{command}");
+        }
+    }
 
     #[test]
     fn operation_provenance_keeps_only_the_agent_program_name() {

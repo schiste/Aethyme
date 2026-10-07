@@ -2117,6 +2117,9 @@ mod tests {
         };
         let before = schema(&before_conn);
         let conn = migrated_through(48);
+        // A v48 binary stamps the compatibility floor when it finishes
+        // migrating; `migrated_through` stops before that step.
+        set_meta(&conn, "min_compatible_schema", 47);
         assert_eq!(current_version(&conn).unwrap(), 48);
         let after = schema(&conn);
         for object in &before {
@@ -2164,6 +2167,12 @@ mod tests {
             )
             .unwrap();
         assert_eq!(nullable, 0);
+
+        // A v47 database, the compatibility floor, migrates straight through.
+        let from_v47 = migrated_through(47);
+        migrate(&from_v47).unwrap();
+        assert_eq!(current_version(&from_v47).unwrap(), 49);
+        assert!(schema_is_compatible_with(&from_v47, 49, 47).unwrap());
     }
 
     #[test]
