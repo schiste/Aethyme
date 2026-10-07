@@ -213,6 +213,10 @@ fn a_cut_drift_assessment_is_named_and_points_at_the_unbounded_dry_run() {
         &fixture.repo,
         &["update-ref", "refs/remotes/origin/main", &upstream],
     );
+    // This test measures the drift budget, not the main-checkout fast-forward
+    // (#232). A local note keeps the primary checkout where the fixture left
+    // it, so `status` inspects exactly the drift set up above.
+    std::fs::write(fixture.repo.join("operator-notes.txt"), "keep\n").unwrap();
 
     let cut = run(&fixture.repo, &["status", "--refresh", "--json"], Some(0));
     assert!(

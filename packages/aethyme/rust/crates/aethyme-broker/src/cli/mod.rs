@@ -999,6 +999,17 @@ fn maybe_fast_forward_main_checkout(args: &[String], mode: &CompatibilityMode) {
     if !matches!(mode, CompatibilityMode::Normal) {
         return;
     }
+    // Only the everyday public commands keep the checkout current. Hooks run
+    // inside a Git operation (a commit, a push) and must never move HEAD
+    // under it, and advanced plumbing (`git`, `gh`, `gates`, …, resolved
+    // here without its `advanced` prefix) acts on the checkout exactly as its
+    // caller found it, within its own time budget.
+    if !matches!(
+        args.first().map(String::as_str),
+        Some("status" | "start" | "sync" | "push" | "submit" | "finish")
+    ) {
+        return;
+    }
     let Ok(cwd) = std::env::current_dir() else {
         return;
     };
@@ -1082,14 +1093,9 @@ fn maybe_fast_forward_main_checkout(args: &[String], mode: &CompatibilityMode) {
             return;
         }
     }
+    // No upstream means nothing to fast-forward to; that is not a state that
+    // needs attention on every command.
     let Some((upstream_ref, upstream_commit)) = checkout.tracking_upstream() else {
-        report_main_checkout_unchanged(
-            "the current branch has no configured upstream",
-            &format!(
-                "git -C {} branch -vv",
-                crate::broker::shell_quote(&main_root.to_string_lossy())
-            ),
-        );
         return;
     };
     let Ok(head) = checkout.head_commit() else {
