@@ -291,6 +291,7 @@ pub(super) fn read_change_from_provider(
     crate::CommitClassification,
     String,
     Vec<crate::ChangedFile>,
+    Option<String>,
 )> {
     let output = std::process::Command::new("gh")
         .current_dir(root)
@@ -301,7 +302,7 @@ pub(super) fn read_change_from_provider(
             "--repo",
             repository,
             "--json",
-            "files,commits,headRefOid",
+            "files,commits,headRefOid,baseRefOid",
         ])
         .output()
         .ok()?;
@@ -353,7 +354,8 @@ pub(super) fn read_change_from_provider(
                 .collect()
         })
         .unwrap_or_default();
-    Some((paths, classification, head, files))
+    let base_commit = json["baseRefOid"].as_str().map(String::from);
+    Some((paths, classification, head, files, base_commit))
 }
 
 /// Whether `head` has `previous` in its history.
@@ -585,14 +587,14 @@ pub(super) fn run_review_run(parsed: Parsed) -> Result<serde_json::Value, UsageE
     // below would fail on the first one. So the source is chosen before either
     // is attempted, never after.
     let (paths, classification, head, provider_files) = if parsed.from_provider {
-        let (paths, classification, head, files) =
+        let (paths, classification, head, files, base_commit) =
             read_change_from_provider(&root, &repository, pull_request).ok_or_else(|| {
                 UsageError::Message(format!(
                     "cannot read pull request {pull_request} from {repository}; \
                  --from-provider needs an authenticated gh"
                 ))
             })?;
-        (paths, classification, head, Some(files))
+        (paths, classification, head, Some((files, base_commit)))
     } else {
         let paths = git_lines(
             &change_root,
@@ -702,10 +704,11 @@ pub(super) fn run_review_run(parsed: Parsed) -> Result<serde_json::Value, UsageE
         previous.as_ref(),
     );
     let change = match provider_files {
-        Some(files) => classify_provider_change(
+        Some((files, base_commit)) => classify_provider_change(
             &root,
             &repository,
             pull_request,
+            base_commit.as_deref(),
             files,
             &facts,
             &classification_policy,
@@ -1887,7 +1890,8 @@ pub(super) fn classify_local_change(
     )
     .ok()
     .map(|text| text.lines().map(String::from).collect::<Vec<_>>());
-    Ok(classify_with(policy_root, files, diff, facts, policy))
+    // Generated-file attributes come from the base, never the change itself.
+    Ok(classify_with(policy_root, base, files, diff, facts, policy))
 }
 
 /// Classify a pull request from what the provider reports.
@@ -1898,6 +1902,7 @@ pub(super) fn classify_provider_change(
     policy_root: &Path,
     repository: &str,
     pull_request: i64,
+    base_commit: Option<&str>,
     files: Vec<crate::ChangedFile>,
     facts: &crate::ChangeFacts,
     policy: &crate::ChangeClassificationPolicy,
@@ -1922,11 +1927,21 @@ pub(super) fn classify_provider_change(
                 .map(String::from)
                 .collect::<Vec<_>>()
         });
-    classify_with(policy_root, files, diff, facts, policy)
+    // Generated-file attributes come from the pull request's base commit;
+    // without it the attributes are unknown and every file counts.
+    classify_with(
+        policy_root,
+        base_commit.unwrap_or_default(),
+        files,
+        diff,
+        facts,
+        policy,
+    )
 }
 
 fn classify_with(
     policy_root: &Path,
+    attributes_base: &str,
     files: Vec<crate::ChangedFile>,
     diff: Option<Vec<String>>,
     facts: &crate::ChangeFacts,
@@ -1944,7 +1959,7 @@ fn classify_with(
     crate::classify_change(
         policy,
         &crate::ChangeInputs {
-            generated: crate::linguist_generated_paths(policy_root, &paths),
+            generated: crate::linguist_generated_paths(policy_root, attributes_base, &paths),
             files,
             contract_symbols,
             from_fork: facts.from_fork,
