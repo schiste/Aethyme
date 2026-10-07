@@ -17,7 +17,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-use aethyme_broker::{Broker, BrokerStore};
+use aethyme_broker::{Broker, BrokerStore, GitRepo, NewSession, SessionOrigin};
 
 const CLI: &str = env!("CARGO_BIN_EXE_broker-cli-shim");
 
@@ -660,4 +660,128 @@ fn broker_commands_in_session_worktrees_never_fast_forward_them() {
             .session(session)
             .is_ok()
     );
+}
+
+/// The fast-forward must refuse for one stated reason and leave HEAD where it
+/// was, without recording a fast-forward.
+fn assert_main_checkout_held(fixture: &Fixture, before: &str, reason: &str) {
+    let output = fixture.run(&["status", "--json"], &fixture.remote);
+    let _ = json(&output);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(git_output(&fixture.repo, &["rev-parse", "HEAD"]), before);
+    assert!(
+        stderr.contains("left the main checkout unchanged") && stderr.contains(reason),
+        "{stderr}"
+    );
+    assert!(fixture.checkout_fast_forward_events().is_empty());
+}
+
+#[test]
+fn a_live_session_in_the_main_checkout_keeps_it_in_place() {
+    let fixture = Fixture::new("verify-only");
+    let (before, _) = fixture.advance_origin("other.txt", "upstream\n");
+    let session = BrokerStore::open_in_repo(&fixture.repo)
+        .unwrap()
+        .register_session(&NewSession {
+            worktree_path: fixture.repo.to_string_lossy().into_owned(),
+            branch: "main".into(),
+            origin: SessionOrigin::Adopted,
+            task: Some("an agent working in the primary checkout".into()),
+            diff_base: None,
+            adoption_base: None,
+            adopted_head: None,
+            repository_contract: None,
+            pid: None,
+            command: None,
+            log_path: None,
+            agent_identity: None,
+        })
+        .unwrap();
+
+    assert_main_checkout_held(
+        &fixture,
+        &before,
+        &format!("live broker session {} works in this checkout", session.id),
+    );
+}
+
+#[test]
+fn a_merge_in_progress_keeps_the_main_checkout_in_place() {
+    let fixture = Fixture::new("verify-only");
+    let (before, _) = fixture.advance_origin("other.txt", "upstream\n");
+    let merge_head = git_output(&fixture.repo, &["rev-parse", "--git-path", "MERGE_HEAD"]);
+    std::fs::write(fixture.repo.join(merge_head), format!("{before}\n")).unwrap();
+
+    assert_main_checkout_held(&fixture, &before, "a merge is in progress");
+}
+
+#[test]
+fn a_rebase_in_progress_keeps_the_main_checkout_in_place() {
+    let fixture = Fixture::new("verify-only");
+    let (before, _) = fixture.advance_origin("other.txt", "upstream\n");
+    let rebase = git_output(&fixture.repo, &["rev-parse", "--git-path", "rebase-merge"]);
+    std::fs::create_dir_all(fixture.repo.join(rebase)).unwrap();
+
+    assert_main_checkout_held(&fixture, &before, "a rebase is in progress");
+}
+
+#[test]
+fn a_held_index_lock_keeps_the_main_checkout_in_place() {
+    let fixture = Fixture::new("verify-only");
+    let (before, _) = fixture.advance_origin("other.txt", "upstream\n");
+    let lock = git_output(&fixture.repo, &["rev-parse", "--git-path", "index.lock"]);
+    let lock = fixture.repo.join(lock);
+    std::fs::write(&lock, "").unwrap();
+
+    assert_main_checkout_held(
+        &fixture,
+        &before,
+        "another Git process holds the index lock",
+    );
+    std::fs::remove_file(lock).unwrap();
+}
+
+/// HEAD moving between the preflight and the update must leave the checkout
+/// where the other writer put it, not carry the fast-forward on from there.
+#[test]
+fn a_head_that_moved_after_preflight_is_not_fast_forwarded() {
+    let fixture = Fixture::new("verify-only");
+    let (from, _) = fixture.advance_origin("one.txt", "one\n");
+    git(&fixture.repo, &["merge", "-q", "--ff-only", "origin/main"]);
+    let moved = git_output(&fixture.repo, &["rev-parse", "HEAD"]);
+    let (_, to) = fixture.advance_origin("two.txt", "two\n");
+    git(&fixture.repo, &["reset", "-q", "--hard", &moved]);
+    assert_ne!(from, moved);
+
+    let checkout = GitRepo::discover(&fixture.repo).unwrap();
+    assert!(
+        checkout
+            .fast_forward_checkout_from("main", &from, &to)
+            .is_err()
+    );
+
+    assert_eq!(git_output(&fixture.repo, &["rev-parse", "HEAD"]), moved);
+    assert_eq!(
+        git_output(&fixture.repo, &["status", "--porcelain"]),
+        "",
+        "the worktree must match the untouched HEAD"
+    );
+}
+
+#[test]
+fn a_matching_head_is_fast_forwarded_with_its_worktree() {
+    let fixture = Fixture::new("verify-only");
+    let (from, to) = fixture.advance_origin("one.txt", "one\n");
+
+    let checkout = GitRepo::discover(&fixture.repo).unwrap();
+    checkout
+        .fast_forward_checkout_from("main", &from, &to)
+        .unwrap();
+
+    assert_eq!(git_output(&fixture.repo, &["rev-parse", "HEAD"]), to);
+    assert_eq!(
+        std::fs::read_to_string(fixture.repo.join("one.txt")).unwrap(),
+        "one\n"
+    );
+    assert_eq!(git_output(&fixture.repo, &["status", "--porcelain"]), "");
 }

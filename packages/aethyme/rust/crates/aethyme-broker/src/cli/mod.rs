@@ -1049,6 +1049,39 @@ fn maybe_fast_forward_main_checkout(args: &[String], mode: &CompatibilityMode) {
         );
         return;
     }
+    match checkout.in_progress_operation() {
+        Ok(None) => {}
+        Ok(Some(operation)) => {
+            report_main_checkout_unchanged(operation, &status_command);
+            return;
+        }
+        Err(_) => {
+            report_main_checkout_unchanged(
+                "could not verify that no Git operation is in progress",
+                &status_command,
+            );
+            return;
+        }
+    }
+    // A session adopted on the primary checkout means an agent works in it:
+    // moving HEAD under that agent is never this command's decision.
+    match live_session_in_checkout(&main_root) {
+        Ok(None) => {}
+        Ok(Some(session)) => {
+            report_main_checkout_unchanged(
+                &format!("live broker session {session} works in this checkout"),
+                &format!("aethyme broker status --session {session}"),
+            );
+            return;
+        }
+        Err(()) => {
+            report_main_checkout_unchanged(
+                "could not verify that no live broker session works in this checkout",
+                "aethyme broker status",
+            );
+            return;
+        }
+    }
     let Some((upstream_ref, upstream_commit)) = checkout.tracking_upstream() else {
         report_main_checkout_unchanged(
             "the current branch has no configured upstream",
@@ -1114,9 +1147,12 @@ fn maybe_fast_forward_main_checkout(args: &[String], mode: &CompatibilityMode) {
         );
         return;
     }
-    if checkout.fast_forward_checkout(&upstream_commit).is_err() {
+    if checkout
+        .fast_forward_checkout_from(&branch, &head, &upstream_commit)
+        .is_err()
+    {
         report_main_checkout_unchanged(
-            "Git could not safely fast-forward to the configured upstream",
+            "Git could not safely fast-forward to the configured upstream (HEAD moved, local changes appeared, or the index was locked)",
             &format!(
                 "git -C {} merge --ff-only {}",
                 crate::broker::shell_quote(&main_root.to_string_lossy()),
@@ -1147,6 +1183,31 @@ fn maybe_fast_forward_main_checkout(args: &[String], mode: &CompatibilityMode) {
     eprintln!(
         "Updated main checkout: {branch} fast-forwarded from {head} to {upstream_commit} ({upstream_ref})."
     );
+}
+
+/// The first non-closed broker session whose worktree is this primary
+/// checkout. `Err` when the broker database exists but cannot be read: the
+/// caller then cannot rule out an agent working here and must not move it.
+fn live_session_in_checkout(main_root: &std::path::Path) -> Result<Option<i64>, ()> {
+    let Ok(db) = crate::broker_db_path(main_root) else {
+        return Err(());
+    };
+    if !db.exists() {
+        return Ok(None);
+    }
+    let store = crate::BrokerStore::open_snapshot_in_repo(main_root).map_err(|_| ())?;
+    let sessions = store.live_sessions().map_err(|_| ())?;
+    Ok(sessions
+        .into_iter()
+        .filter(|session| !session.status.is_closed())
+        .find(|session| {
+            let path = std::path::Path::new(&session.worktree_path);
+            path == main_root
+                || path
+                    .canonicalize()
+                    .is_ok_and(|canonical| canonical == main_root)
+        })
+        .map(|session| session.id))
 }
 
 fn report_main_checkout_unchanged(reason: &str, command: &str) {
