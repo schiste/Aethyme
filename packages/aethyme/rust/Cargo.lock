@@ -100,8 +100,10 @@ dependencies = [
  "clap",
  "oxc_allocator",
  "oxc_ast",
+ "oxc_ast_visit",
  "oxc_parser",
  "oxc_span",
+ "oxc_syntax",
  "ra_ap_syntax",
  "rayon",
  "rustpython-ruff_python_ast",
@@ -1129,6 +1131,18 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.117",
+]
+
+[[package]]
+name = "oxc_ast_visit"
+version = "0.125.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dfafe2434e80d214debb69f3c4f3c0b53b2850ae2b49a6c5f7722b9a4b0b1834"
+dependencies = [
+ "oxc_allocator",
+ "oxc_ast",
+ "oxc_span",
+ "oxc_syntax",
 ]
 
 [[package]]
