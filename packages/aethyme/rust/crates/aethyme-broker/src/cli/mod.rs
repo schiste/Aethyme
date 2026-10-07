@@ -704,6 +704,18 @@ Usage:
       inside the Aethyme source checkout. --fix-version is explicit and
       source-checkout-only: when the running CLI is behind integration, install
       and verify both aethyme and aethyme-engine-cli from that exact revision.
+  aethyme broker doctor plan [--json]
+      Every debris item across stores, with its owner and whether that owner
+      is gone, live or unknown: blockers (outcome_unknown operations,
+      quarantined leases, ...), stale session worktrees, and the containers
+      and volumes gate commands labelled from AETHYME_GATE_LABELS. Read-only;
+      prints the digest `doctor apply` needs. A store it could not read is
+      listed, never treated as clean.
+  aethyme broker doctor apply --confirm <sha256> [--json]
+      Remove the labelled containers and volumes a reviewed plan marked
+      removable: only those whose gate run is verifiably over, judged again
+      now. A plan that changed since review removes nothing. Blockers and
+      worktrees are never removed here; their own commands are listed.
   aethyme broker quick-test [--chau7] [--with-gate] [--json]
       Disposable first-run smoke: creates a temporary git repo, runs init,
       adopt, commit, submit, verifies promotion, and removes the repo.

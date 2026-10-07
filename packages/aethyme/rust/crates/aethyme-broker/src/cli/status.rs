@@ -542,6 +542,16 @@ pub(super) fn run_metrics(parsed: Parsed) -> Result<(), UsageError> {
 
 /// `broker doctor`.
 pub(super) fn run_doctor(parsed: Parsed) -> Result<(), UsageError> {
+    match parsed.positional.first().map(String::as_str) {
+        None => {}
+        Some("plan") if parsed.positional.len() == 1 => return run_doctor_plan(&parsed),
+        Some("apply") if parsed.positional.len() == 1 => return run_doctor_apply(&parsed),
+        Some(other) => {
+            return Err(UsageError::Message(format!(
+                "unknown doctor action {other:?}; expected `doctor`, `doctor plan` or `doctor apply --confirm <sha256>`"
+            )));
+        }
+    }
     let mut broker = open_broker(parsed.read_only_snapshot)?;
     let report = if parsed.fix_version {
         broker.doctor_with_version_fix()?
@@ -786,6 +796,7 @@ pub(super) fn run_doctor(parsed: Parsed) -> Result<(), UsageError> {
                 crate::gc::HEALTH_CHECK_ARTIFACT_SCAN_BUDGET.as_secs(),
             );
         }
+        out!("debris across stores and the container runtime: `aethyme broker status doctor plan`");
         if report.healthy() {
             out!("doctor: healthy");
         } else {
@@ -793,6 +804,142 @@ pub(super) fn run_doctor(parsed: Parsed) -> Result<(), UsageError> {
         }
     }
     Ok(())
+}
+
+/// `broker doctor plan`: every debris item across stores, read-only.
+fn run_doctor_plan(parsed: &Parsed) -> Result<(), UsageError> {
+    let mut broker = open_broker(true)?;
+    let runtime = crate::CliContainerRuntime::discover();
+    let plan = broker.debris_plan(
+        runtime
+            .as_ref()
+            .map(|runtime| runtime as &dyn crate::ContainerRuntime),
+    );
+    if parsed.json {
+        out!("{}", serde_json::to_string_pretty(&plan)?);
+        return Ok(());
+    }
+    match &plan.runtime {
+        None => out!(
+            "container runtime: none found (set {})",
+            crate::CONTAINER_RUNTIME_ENV
+        ),
+        Some(runtime) if runtime.available => out!("container runtime: {}", runtime.name),
+        Some(runtime) => out!(
+            "container runtime: {} unavailable: {}",
+            runtime.name,
+            runtime.error.as_deref().unwrap_or("unknown error")
+        ),
+    }
+    for source in &plan.unavailable {
+        out!(
+            "warning: {} not read: {}; this plan is incomplete, not clean",
+            source.source,
+            source.error
+        );
+    }
+    if plan.items.is_empty() {
+        out!("debris: none");
+    }
+    for item in &plan.items {
+        let owner = match item.owner {
+            crate::DebrisOwner::Dead => "owner gone",
+            crate::DebrisOwner::Live => "owner live",
+            crate::DebrisOwner::Unknown => "owner unknown",
+        };
+        let action = match item.action {
+            crate::DebrisAction::Remove => "remove",
+            crate::DebrisAction::Report => "keep",
+        };
+        out!(
+            "{action} {} [{}] {}: {}",
+            item.id,
+            item.kind,
+            owner,
+            item.reason
+        );
+        if let Some(clear) = &item.clear {
+            out!("  run: {clear}");
+        }
+    }
+    if let Some(paired) = &plan.paired_recovery {
+        out!("ordered recovery for {}:", paired.blockers.join(" + "));
+        for (index, step) in paired.steps.iter().enumerate() {
+            out!("  {}. {step}", index + 1);
+        }
+    }
+    out!("digest: {}", plan.digest);
+    if plan.removable_count > 0 {
+        out!(
+            "apply: aethyme broker status doctor apply --confirm {}",
+            plan.digest
+        );
+    }
+    Ok(())
+}
+
+/// `broker doctor apply --confirm <sha256>`: remove what a reviewed plan
+/// marked removable, judged again now.
+fn run_doctor_apply(parsed: &Parsed) -> Result<(), UsageError> {
+    let Some(confirm) = parsed.confirm.as_deref() else {
+        return Err(UsageError::Message(
+            "doctor apply needs --confirm <sha256> from `aethyme broker status doctor plan`".into(),
+        ));
+    };
+    let mut broker = open_broker(false)?;
+    let runtime = crate::CliContainerRuntime::discover();
+    let outcome = broker.apply_debris_plan(
+        runtime
+            .as_ref()
+            .map(|runtime| runtime as &dyn crate::ContainerRuntime),
+        confirm,
+    )?;
+    match outcome {
+        crate::DebrisApplyOutcome::Applied(report) => {
+            if parsed.json {
+                out!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                for removal in &report.removals {
+                    match &removal.error {
+                        None => out!("removed {}", removal.id),
+                        Some(error) => out!("not removed {}: {error}", removal.id),
+                    }
+                }
+                out!(
+                    "doctor apply: {} removed, {} kept",
+                    report
+                        .removals
+                        .iter()
+                        .filter(|removal| removal.removed)
+                        .count(),
+                    report.kept
+                );
+            }
+            if report.removals.iter().any(|removal| !removal.removed) {
+                return Err(UsageError::SilentExit(crate::exit_status::FAILED));
+            }
+            Ok(())
+        }
+        crate::DebrisApplyOutcome::StaleDigest { expected, current } => {
+            if parsed.json {
+                out!(
+                    "{}",
+                    serde_json::json!({
+                        "refused": "stale_digest",
+                        "expected": expected,
+                        "current": current,
+                    })
+                );
+                return Err(UsageError::SilentExit(crate::exit_status::REFUSED));
+            }
+            Err(UsageError::Exit {
+                message: format!(
+                    "doctor apply refused: the plan changed since it was reviewed (reviewed {expected}, now {current}); nothing was removed. Run `aethyme broker status doctor plan` again"
+                ),
+                code: crate::exit_status::REFUSED,
+            })
+        }
+    }
 }
 
 /// `broker init`.
