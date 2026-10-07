@@ -318,6 +318,18 @@ fn run_verbatim(repo: &Path, args: &[&str]) -> Output {
         .args(args)
         .current_dir(repo)
         .env("AETHYME_CHAU7_MCP_BRIDGE", common::disabled_bridge_path())
+        .env("AETHYME_ALLOW_MAIN_CHECKOUT", "1")
+        .output()
+        .unwrap()
+}
+
+/// `run_verbatim` without the fixture override: the production default.
+fn run_enforced(repo: &Path, args: &[&str]) -> Output {
+    Command::new(CLI)
+        .args(args)
+        .current_dir(repo)
+        .env("AETHYME_CHAU7_MCP_BRIDGE", common::disabled_bridge_path())
+        .env_remove("AETHYME_ALLOW_MAIN_CHECKOUT")
         .output()
         .unwrap()
 }
@@ -1027,4 +1039,126 @@ fn subcommands_that_cannot_honor_a_claim_refuse_it() {
             "{args:?}: {stderr}"
         );
     }
+}
+
+const MAIN_CHECKOUT_REFUSED: &str = "refusing to register a session on the main checkout";
+
+fn assert_main_checkout_refused(output: &Output) {
+    assert!(
+        !output.status.success(),
+        "adopt unexpectedly succeeded: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains(MAIN_CHECKOUT_REFUSED), "{stderr}");
+}
+
+/// #284 proposal 9: a new session on the repository's main checkout is
+/// refused, however the path is spelled; work there would land on the
+/// default branch before any gate runs.
+#[test]
+fn a_new_session_on_the_main_checkout_is_refused_however_it_is_spelled() {
+    let tmp = fixture();
+    let root = tmp.path();
+    assert_main_checkout_refused(&run_enforced(root, &["start", "--adopt", "--task", "t"]));
+
+    let elsewhere = tempfile::tempdir().unwrap();
+    let link = elsewhere.path().join("link-to-main");
+    std::os::unix::fs::symlink(root, &link).unwrap();
+    std::fs::create_dir(root.join("sub")).unwrap();
+    let trailing = format!("{}/", root.display());
+    let dotted = root.join("sub").join("..");
+    let mut spellings = vec![
+        link.display().to_string(),
+        trailing,
+        dotted.display().to_string(),
+    ];
+    // APFS is case-insensitive by default: another case names the same tree.
+    #[cfg(target_os = "macos")]
+    spellings.push(root.display().to_string().to_uppercase());
+    for spelling in spellings {
+        if !Path::new(&spelling).exists() {
+            continue;
+        }
+        let output = run_enforced(
+            &root.join("sub"),
+            &[
+                "start",
+                "--adopt",
+                &spelling,
+                "--task",
+                "t",
+                "--short-name",
+                "s",
+            ],
+        );
+        assert_main_checkout_refused(&output);
+    }
+    assert!(
+        Broker::open(root)
+            .unwrap()
+            .store()
+            .live_sessions()
+            .unwrap()
+            .is_empty(),
+        "a refused adopt registers nothing"
+    );
+}
+
+/// The operator override registers it, and a session that already lives on
+/// the main checkout can still be re-entered without the flag.
+#[test]
+fn the_main_checkout_needs_an_explicit_override_and_its_session_stays_reusable() {
+    let tmp = fixture();
+    let created = stdout(&run_enforced(
+        tmp.path(),
+        &[
+            "start",
+            "--adopt",
+            "--allow-main-checkout",
+            "--task",
+            "operator-approved",
+            "--json",
+        ],
+    ));
+    let created: serde_json::Value = serde_json::from_str(&created).unwrap();
+    assert_eq!(created["outcome"], "created");
+    let reused = stdout(&run_verbatim(
+        tmp.path(),
+        &[
+            "start",
+            "--adopt",
+            "--reuse",
+            "--task",
+            "follow-up",
+            "--json",
+        ],
+    ));
+    let reused: serde_json::Value = serde_json::from_str(&reused).unwrap();
+    assert_eq!(reused["outcome"], "reused");
+}
+
+/// A linked worktree is not the main checkout: adopting it still works.
+#[test]
+fn a_linked_worktree_is_still_adoptable() {
+    let tmp = fixture();
+    let linked = tempfile::tempdir().unwrap();
+    let worktree = linked.path().join("linked");
+    git(
+        tmp.path(),
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "feature",
+            worktree.to_str().unwrap(),
+        ],
+    );
+    let created = stdout(&run_enforced(
+        &worktree,
+        &["start", "--adopt", "--task", "linked work", "--json"],
+    ));
+    let created: serde_json::Value = serde_json::from_str(&created).unwrap();
+    assert_eq!(created["outcome"], "created");
 }

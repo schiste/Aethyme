@@ -764,16 +764,8 @@ fn a_base_owned_by_another_session_is_refused() {
 fn a_session_recorded_on_the_default_branch_does_not_own_it() {
     let fixture = Fixture::new();
     let repo = fixture.repo.path();
-    // `origin/HEAD -> origin/main` names the default branch, as a clone does.
-    git(repo, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
-    git(
-        repo,
-        &[
-            "symbolic-ref",
-            "refs/remotes/origin/HEAD",
-            "refs/remotes/origin/main",
-        ],
-    );
+    // No `origin/HEAD`: the default branch is unresolved, and the fail-closed
+    // fallback still treats `main` as shared.
     // A linked worktree checked out on main, adopted as a session.
     git(repo, &["checkout", "-q", "-b", "scratch"]);
     let linked = tempfile::tempdir().unwrap();
@@ -804,13 +796,73 @@ fn a_session_recorded_on_the_default_branch_does_not_own_it() {
     let session = value.get("session").unwrap_or(&value);
     assert_eq!(session["branch"].as_str(), Some("main"));
 
+    // The guard lets the merge into main run: gh received it. (What the
+    // offline fixture does after the merge is not this test's concern.)
     let output = fixture.gh(&[], &["pr", "merge", "7", "--squash"], &fixture.own.branch);
-    assert!(output.status.success(), "{}", stderr(&output));
     assert!(
         !stderr(&output).contains("belongs to live session"),
         "{}",
         stderr(&output)
     );
+    assert!(
+        fixture
+            .ran()
+            .starts_with("pr merge 7 --squash --match-head-commit "),
+        "gh did not run the merge: {} / {}",
+        fixture.ran(),
+        stderr(&output)
+    );
+}
+
+const SHARED: &str = "shared default or integration branch";
+
+/// Sets `origin/HEAD -> origin/main`, as a clone does, so the default branch
+/// is resolved from the repository and not guessed.
+fn name_default_branch(fixture: &Fixture) {
+    let repo = fixture.repo.path();
+    git(repo, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+    git(
+        repo,
+        &[
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/main",
+        ],
+    );
+}
+
+/// "Owned by no session" is not "allowed": the default and integration
+/// branches can never be deleted, force-updated or rebased through the
+/// broker, even with --destructive and no session recording them.
+#[test]
+fn the_default_and_integration_branches_are_never_rewritten() {
+    let fixture = Fixture::new();
+    name_default_branch(&fixture);
+    for branch in ["main", "aethyme/integration"] {
+        let path = format!("repos/schiste/Aethyme/git/refs/heads/{branch}");
+        let output = fixture.gh(DESTRUCTIVE, &["api", "-X", "DELETE", &path], "");
+        assert_refused(&fixture, &output, SHARED);
+    }
+    // update-branch writes the head; a PR whose head is main is refused.
+    let output = fixture.gh(&[], &["pr", "update-branch", "7"], "main");
+    assert_refused(&fixture, &output, SHARED);
+    // A merge may delete its head; a PR from main is refused too.
+    let output = fixture.gh(&[], &["pr", "merge", "7", "--merge"], "main");
+    assert_refused(&fixture, &output, SHARED);
+}
+
+/// The exemption is the exact default branch name, resolved from the
+/// repository: look-alike names neither get it nor get protected by it.
+#[test]
+fn only_the_exact_default_branch_name_is_shared() {
+    let fixture = Fixture::new();
+    name_default_branch(&fixture);
+    for branch in ["main2", "origin/main", "xmain"] {
+        let path = format!("repos/schiste/Aethyme/git/refs/heads/{branch}");
+        let output = fixture.gh(DESTRUCTIVE, &["api", "-X", "DELETE", &path], "");
+        assert_ran_exactly(&fixture, &output, &format!("api -X DELETE {path}"));
+        std::fs::remove_file(fixture.log()).unwrap();
+    }
 }
 
 // --- Third review: binary choice, git configuration, symlinked downloads --

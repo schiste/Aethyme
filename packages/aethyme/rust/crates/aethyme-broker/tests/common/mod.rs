@@ -24,6 +24,10 @@ pub fn broker_cli(binary: &str, args: &[&str]) -> Command {
     let mut command = Command::new(binary);
     command
         .args(test_session_args(args))
-        .env("AETHYME_CHAU7_MCP_BRIDGE", disabled_bridge_path());
+        .env("AETHYME_CHAU7_MCP_BRIDGE", disabled_bridge_path())
+        // Fixtures adopt their own main checkout; production refuses that
+        // unless the operator opts in (#284 proposal 9). Tests of the refusal
+        // remove this variable.
+        .env("AETHYME_ALLOW_MAIN_CHECKOUT", "1");
     command
 }

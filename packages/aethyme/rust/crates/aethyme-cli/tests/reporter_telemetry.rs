@@ -19,6 +19,8 @@ fn aethyme(cwd: &Path, args: &[&str]) -> Output {
             "AETHYME_CHAU7_MCP_BRIDGE",
             "/__aethyme_test_no_chau7_bridge__",
         )
+        // The fixture adopts its own main checkout (#284 proposal 9).
+        .env("AETHYME_ALLOW_MAIN_CHECKOUT", "1")
         .output()
         .expect("run aethyme")
 }

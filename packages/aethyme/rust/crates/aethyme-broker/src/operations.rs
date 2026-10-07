@@ -1719,6 +1719,36 @@ fn has_forced_refspec(args: &[String]) -> bool {
 /// Branch names a destructive command deletes or rewrites, as a session
 /// records them (`agent/<slug>`, no `refs/heads/`). Over-inclusive on
 /// purpose: a name that matches no live session's branch refuses nothing.
+/// Branches a gh command may touch, split by what it does to them.
+#[derive(Debug, Default)]
+struct GhRefTargets {
+    /// Deleted, force-updated or rebased (a merge's head, `update-branch`,
+    /// an API ref delete).
+    rewrite: Vec<String>,
+    /// Only advanced (a merge's base, a PR's chosen base).
+    advance: Vec<String>,
+}
+
+impl GhRefTargets {
+    fn rewrite(rewrite: Vec<String>) -> Self {
+        Self {
+            rewrite,
+            advance: Vec::new(),
+        }
+    }
+
+    fn advance(advance: Vec<String>) -> Self {
+        Self {
+            rewrite: Vec::new(),
+            advance,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.rewrite.is_empty() && self.advance.is_empty()
+    }
+}
+
 fn destructive_branch_targets(provider: OperationProvider, args: &[String]) -> Vec<String> {
     match provider {
         OperationProvider::Git => git_destructive_branch_targets(args),
@@ -1758,6 +1788,11 @@ fn git_destructive_branch_targets(args: &[String]) -> Vec<String> {
         "branch" | "update-ref" => positionals,
         _ => Vec::new(),
     };
+    branch_names(references)
+}
+
+/// Strip `refs/heads/` and `refs/remotes/<remote>/` to the branch name.
+fn branch_names(references: Vec<&str>) -> Vec<String> {
     references
         .into_iter()
         .map(|reference| {
@@ -1772,6 +1807,51 @@ fn git_destructive_branch_targets(args: &[String]) -> Vec<String> {
         .filter(|branch| !branch.is_empty())
         .map(str::to_string)
         .collect()
+}
+
+/// The subset of [`git_destructive_branch_targets`] a git command deletes or
+/// moves non-fast-forward. A push destination counts only when the refspec
+/// deletes (`:dst`), forces (`+src:dst`), or the whole push is forced,
+/// deleting, mirrored or pruning; a plain `src:dst` is a fast-forward the
+/// remote itself enforces. `branch` and `update-ref` targets always count.
+fn git_rewritten_branches(argv: &[String]) -> Vec<String> {
+    let Some(args) = git_subcommand_args(argv) else {
+        return Vec::new();
+    };
+    let Some((command, rest)) = args.split_first() else {
+        return Vec::new();
+    };
+    match command.as_str() {
+        "push" | "send-pack" => {
+            let whole = has_any(
+                rest,
+                &[
+                    "--force",
+                    "--force-with-lease",
+                    "--force-if-includes",
+                    "--delete",
+                    "--mirror",
+                    "--prune",
+                ],
+            ) || rest
+                .iter()
+                .any(|arg| arg.starts_with("--force-with-lease="))
+                || has_short_flag(rest, 'f')
+                || has_short_flag(rest, 'd');
+            let references = git_positionals(rest)
+                .into_iter()
+                .skip(1)
+                .filter(|spec| whole || spec.starts_with('+') || spec.starts_with(':'))
+                .map(|spec| {
+                    let spec = spec.trim_start_matches('+');
+                    spec.split_once(':')
+                        .map_or(spec, |(_, destination)| destination)
+                })
+                .collect();
+            branch_names(references)
+        }
+        _ => git_destructive_branch_targets(argv),
+    }
 }
 
 fn same_directory(left: &Path, right: &Path) -> bool {
@@ -4512,7 +4592,7 @@ impl Broker {
         request: &CoordinatedCommand,
         cwd: &Path,
         github_target: Option<&crate::ResolvedGithubTarget>,
-    ) -> Result<(Vec<String>, Option<Vec<String>>), BrokerOpError> {
+    ) -> Result<(GhRefTargets, Option<Vec<String>>), BrokerOpError> {
         use crate::gh_ref_guard::Verdict;
         let refuse = |why: String| {
             Err(BrokerOpError::InvalidCoordinatedOperation {
@@ -4528,11 +4608,11 @@ impl Broker {
         let slug = github_target.map_or("", |target| target.display_slug.as_str());
         let verdict = crate::gh_ref_guard::assess(&request.args, slug);
         let (number, match_head_commit) = match verdict {
-            Verdict::NoRefWrite => return Ok((Vec::new(), None)),
+            Verdict::NoRefWrite => return Ok((GhRefTargets::default(), None)),
             Verdict::Unverifiable(_)
                 if request.ref_write_acknowledged && request.destructive_confirmed =>
             {
-                return Ok((Vec::new(), None));
+                return Ok((GhRefTargets::default(), None));
             }
             Verdict::Unverifiable(why) => return refuse(why),
             // Files land in the working directory, which must be the session
@@ -4540,7 +4620,7 @@ impl Broker {
             Verdict::DownloadHere => {
                 return match self.store().session(request.session_id) {
                     Ok(session) if same_directory(cwd, Path::new(&session.worktree_path)) => {
-                        Ok((Vec::new(), None))
+                        Ok((GhRefTargets::default(), None))
                     }
                     _ => refuse(format!(
                         "a download must run from session {}'s worktree root, not {}",
@@ -4552,13 +4632,21 @@ impl Broker {
             // It cannot touch a ref, but only in the session's own repository.
             Verdict::SafeWrite => {
                 return match verify_github_origin(cwd, github_target) {
-                    Ok(_) => Ok((Vec::new(), None)),
+                    Ok(_) => Ok((GhRefTargets::default(), None)),
                     Err(why) => refuse(why),
                 };
             }
-            Verdict::DeleteBranch(branch) | Verdict::PrBase(branch) => {
+            Verdict::DeleteBranch(branch) => {
                 return match verify_github_origin(cwd, github_target) {
-                    Ok(_) => Ok((vec![branch], None)),
+                    Ok(_) => Ok((GhRefTargets::rewrite(vec![branch]), None)),
+                    Err(why) => refuse(why),
+                };
+            }
+            // Setting a base advances nothing yet, but names the branch a
+            // later merge will advance.
+            Verdict::PrBase(branch) => {
+                return match verify_github_origin(cwd, github_target) {
+                    Ok(_) => Ok((GhRefTargets::advance(vec![branch]), None)),
                     Err(why) => refuse(why),
                 };
             }
@@ -4569,7 +4657,7 @@ impl Broker {
                     Err(why) => return refuse(why),
                 };
                 return match gh_pr_refs(&number, cwd, target) {
-                    Ok(refs) => Ok((vec![refs.head], None)),
+                    Ok(refs) => Ok((GhRefTargets::rewrite(vec![refs.head]), None)),
                     Err(why) => refuse(why),
                 };
             }
@@ -4591,7 +4679,11 @@ impl Broker {
             Err(why) => return refuse(why),
         };
         self.advise_pr_merge_graph_integrity(request.session_id, cwd, &number, &refs.head_oid);
-        let targets = vec![refs.head, refs.base];
+        // The head may be deleted (rewrite); the base is advanced.
+        let targets = GhRefTargets {
+            rewrite: vec![refs.head],
+            advance: vec![refs.base],
+        };
         match match_head_commit {
             Some(sha) if sha != refs.head_oid => refuse(format!(
                 "--match-head-commit {sha} is not pull request #{number}'s head {}",
@@ -4643,16 +4735,24 @@ impl Broker {
         }
     }
 
-    /// Branches no session can own: the integration branch, and the default
-    /// branch as `origin/HEAD` (or the main checkout's upstream) names it. When
-    /// neither resolves, only the integration branch is excluded, so the guard
-    /// stays as strict as before rather than guessing a default branch name.
+    /// Branches no session can own and no broker operation may delete or
+    /// rewrite: the integration branch, and the default branch as
+    /// `origin/HEAD` (or the main checkout's upstream) names it. Exact names
+    /// only, resolved from the repository, never from a session record.
     fn shared_branches(&self) -> Vec<String> {
         let mut shared = vec![crate::merge::PromoteConfig::load(&self.main_root_path()).branch];
-        if let Some((upstream, _)) = self.repo_handle().upstream_default()
-            && let Some((_, branch)) = upstream.split_once('/')
-        {
-            shared.push(branch.to_string());
+        match self
+            .repo_handle()
+            .upstream_default()
+            .and_then(|(upstream, _)| {
+                upstream
+                    .split_once('/')
+                    .map(|(_, branch)| branch.to_string())
+            }) {
+            Some(branch) => shared.push(branch),
+            // Unknown default branch: protect both conventional names rather
+            // than none. This only ever refuses more; it lets nothing through.
+            None => shared.extend(["main".to_string(), "master".to_string()]),
         }
         shared
     }
@@ -4664,7 +4764,7 @@ impl Broker {
         &mut self,
         request: &CoordinatedCommand,
         effect: OperationEffect,
-        gh_targets: Vec<String>,
+        gh_targets: GhRefTargets,
     ) -> Result<Option<i64>, BrokerOpError> {
         if effect != OperationEffect::Destructive && gh_targets.is_empty() {
             return match request.cross_session {
@@ -4674,13 +4774,45 @@ impl Broker {
                 None => Ok(None),
             };
         }
-        let mut targets = destructive_branch_targets(request.provider, &request.args);
-        targets.extend(gh_targets);
-        // The default and integration branches are shared, never a session's
-        // own: a session that adopted the main checkout records `main`, and
-        // must not make every merge into main look like a write to its branch.
+        // Branches this command deletes or rewrites, and branches it only
+        // advances (a merge's base).
+        // Git: every destination is attributed, but only a deleted or forced
+        // one is a rewrite; a plain fast-forward push to main is an advance.
+        let git_targets = destructive_branch_targets(request.provider, &request.args);
+        let mut rewrites = match request.provider {
+            OperationProvider::Git => git_rewritten_branches(&request.args),
+            OperationProvider::Github => Vec::new(),
+        };
+        let mut advances: Vec<String> = git_targets
+            .into_iter()
+            .filter(|target| !rewrites.contains(target))
+            .collect();
+        rewrites.extend(gh_targets.rewrite);
+        advances.extend(gh_targets.advance);
+        // The default and integration branches are shared: never a session's
+        // own, and never deleted or rewritten through the broker. Matching is
+        // by exact branch name against the repository's own resolution, never
+        // against a session record. Unresolvable means no exemption.
         let shared = self.shared_branches();
-        targets.retain(|target| !shared.contains(target));
+        if let Some(protected) = rewrites.iter().find(|target| shared.contains(*target)) {
+            return Err(BrokerOpError::InvalidCoordinatedOperation {
+                reason: format!(
+                    "refusing to delete or rewrite {protected}: it is the repository's shared \
+                     default or integration branch, which no broker operation may delete, \
+                     force-update or rebase. Nothing was run."
+                ),
+            });
+        }
+        // Advancing a shared branch (merging into main) is ordinary; it is
+        // only never attributed to a session that happens to record it.
+        let targets: Vec<String> = rewrites
+            .into_iter()
+            .chain(
+                advances
+                    .into_iter()
+                    .filter(|target| !shared.contains(target)),
+            )
+            .collect();
         let owners: Vec<crate::Session> = if targets.is_empty() {
             Vec::new()
         } else {
@@ -4808,7 +4940,7 @@ impl Broker {
             }
             targets
         } else {
-            Vec::new()
+            GhRefTargets::default()
         };
         if let Some(owner) = self.refuse_foreign_session_branches(&request, effect, gh_targets)? {
             // Recorded with the authorization, so the journal says which
@@ -7215,6 +7347,43 @@ mod tests {
             )
             .is_empty()
         );
+    }
+
+    #[test]
+    fn only_deleted_or_forced_push_destinations_are_rewrites() {
+        let rewritten = |args: &[&str]| {
+            git_rewritten_branches(
+                &args
+                    .iter()
+                    .map(|arg| (*arg).to_string())
+                    .collect::<Vec<_>>(),
+            )
+        };
+        // A plain fast-forward to main is an advance, the deletion a rewrite.
+        assert_eq!(
+            rewritten(&["push", "origin", "HEAD:refs/heads/main", ":refs/heads/old"]),
+            ["old"]
+        );
+        assert_eq!(
+            rewritten(&["push", "origin", "+HEAD:refs/heads/main"]),
+            ["main"]
+        );
+        for force in [
+            "--force",
+            "-f",
+            "--force-with-lease",
+            "--force-with-lease=main",
+            "--mirror",
+        ] {
+            assert_eq!(
+                rewritten(&["push", force, "origin", "HEAD:refs/heads/main"]),
+                ["main"],
+                "{force}"
+            );
+        }
+        assert_eq!(rewritten(&["push", "origin", "--delete", "main"]), ["main"]);
+        assert!(rewritten(&["update-ref", "refs/heads/main", "abc"]).contains(&"main".to_string()));
+        assert_eq!(rewritten(&["branch", "-D", "main"]), ["main"]);
     }
 
     fn push_shape(args: &[&str]) -> Option<PushShape> {

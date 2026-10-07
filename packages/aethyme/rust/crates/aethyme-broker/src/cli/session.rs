@@ -858,6 +858,55 @@ pub(super) fn run_worktree_root(parsed: Parsed) -> Result<(), UsageError> {
     Ok(())
 }
 
+/// The operator override as an environment variable, equivalent to
+/// `--allow-main-checkout` (`1` enables it; any other value does not).
+const ALLOW_MAIN_CHECKOUT_ENV: &str = "AETHYME_ALLOW_MAIN_CHECKOUT";
+
+/// #284 proposal 9: a session on the main checkout lands work on the default
+/// branch before any gate runs, so a NEW one needs an explicit
+/// `--allow-main-checkout`. A session that already lives there may still be
+/// re-entered (`--reuse`, `--take-over`), which keeps existing setups working.
+/// The checkout is compared by file identity, so a symlink, a trailing slash,
+/// `..` or a different letter case cannot disguise the main checkout.
+fn refuse_new_session_on_main_checkout(
+    broker: &mut crate::Broker,
+    path: &std::path::Path,
+    allow_main_checkout: bool,
+) -> Result<(), UsageError> {
+    if allow_main_checkout || std::env::var_os(ALLOW_MAIN_CHECKOUT_ENV).is_some_and(|v| v == "1") {
+        return Ok(());
+    }
+    let checkout = crate::GitRepo::discover(path)?;
+    if !same_file(checkout.root(), &broker.main_root_path()) {
+        return Ok(());
+    }
+    let root = checkout.root().to_string_lossy().into_owned();
+    if broker.store().session_for_worktree(&root)?.is_some() {
+        return Ok(());
+    }
+    Err(crate::BrokerOpError::AdoptMainCheckoutRefused { path: root }.into())
+}
+
+/// Whether two paths name the same directory, by device and inode where the
+/// platform has them; otherwise by canonical path.
+fn same_file(a: &std::path::Path, b: &std::path::Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        match (std::fs::metadata(a), std::fs::metadata(b)) {
+            (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
+            _ => false,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        matches!(
+            (std::fs::canonicalize(a), std::fs::canonicalize(b)),
+            (Ok(a), Ok(b)) if a == b
+        )
+    }
+}
+
 /// `broker adopt`.
 pub(super) fn run_adopt(parsed: Parsed) -> Result<(), UsageError> {
     let context = session_context(&parsed)?;
@@ -883,6 +932,7 @@ pub(super) fn run_adopt(parsed: Parsed) -> Result<(), UsageError> {
         ));
     }
     warn_stale_broker_binary(&broker);
+    refuse_new_session_on_main_checkout(&mut broker, &path, parsed.allow_main_checkout)?;
     let previous_session = if mode == crate::AdoptMode::Reuse {
         let canonical_path = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
         broker

@@ -110,9 +110,11 @@ Usage:
       Inspect exact-HEAD gate quality without changing enforced selection.
       --probe explicitly runs all or one selected gate in a disposable
       detached worktree with ephemeral cache evidence and mutation capture.
-  aethyme broker adopt [<path>] [--task <text>] [--short-name <name>] [--path <repo-path>]... [--agent <name-and-email>] [--repo-name <name>] [--tab-name <name>] [--ai-provider <provider>] [--reuse [--sync-integration]|--replace-stale] [--take-over] [--json]
+  aethyme broker adopt [<path>] [--task <text>] [--short-name <name>] [--path <repo-path>]... [--agent <name-and-email>] [--repo-name <name>] [--tab-name <name>] [--ai-provider <provider>] [--reuse [--sync-integration]|--replace-stale] [--take-over] [--allow-main-checkout] [--json]
       Register an existing worktree (attach-first). Defaults to the
-      current directory. If the worktree already has a session:
+      current directory. A new session on the repository's main checkout is
+      refused unless --allow-main-checkout (or AETHYME_ALLOW_MAIN_CHECKOUT=1)
+      is given; use `broker start` for an isolated worktree. If the worktree already has a session:
       --reuse points it at a follow-up task with a fresh baseline and
       reports its relation to the current integration tip;
       --sync-integration requires --reuse and first fast-forwards a clean
@@ -1146,6 +1148,7 @@ struct Parsed {
     break_glass: bool,
     sync_main: bool,
     sync_integration: bool,
+    allow_main_checkout: bool,
     no_cache: bool,
     probe: bool,
     only: Option<String>,
@@ -1272,6 +1275,7 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
         break_glass: false,
         sync_main: false,
         sync_integration: false,
+        allow_main_checkout: false,
         no_cache: false,
         probe: false,
         only: None,
@@ -1368,6 +1372,7 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
             "--break-glass" => parsed.break_glass = true,
             "--sync-main" => parsed.sync_main = true,
             "--sync-integration" => parsed.sync_integration = true,
+            "--allow-main-checkout" => parsed.allow_main_checkout = true,
             "--no-cache" => parsed.no_cache = true,
             "--verify-only" => parsed.verify_only = true,
             "--probe" => parsed.probe = true,
