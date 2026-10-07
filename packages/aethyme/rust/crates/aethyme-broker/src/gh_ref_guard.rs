@@ -111,7 +111,6 @@ const NO_REF_WRITE: &[(&str, &str)] = &[
     ("pr", "review"),
     ("pr", "ready"),
     ("pr", "edit"),
-    ("pr", "reopen"),
     ("pr", "lock"),
     ("pr", "unlock"),
     ("repo", "view"),
@@ -151,9 +150,7 @@ pub(crate) fn assess(args: &[String], repository: &str) -> Verdict {
     if command == "pr" && action == "merge" {
         return assess_pr_merge(&rest[1..]);
     }
-    if let ["pr", "close", number] = tokens.as_slice()
-        && is_number(number)
-    {
+    if command == "pr" && matches!(action, "close" | "reopen") && is_close_or_reopen(&rest[1..]) {
         return Verdict::NoRefWrite;
     }
     if let ["pr", "update-branch", number] = tokens.as_slice()
@@ -270,6 +267,19 @@ fn assess_download(command: &str, tokens: &[&str]) -> Verdict {
         ));
     }
     Verdict::DownloadHere
+}
+
+/// Exactly `<N> [--comment <text>|-c <text>]` after `pr close` or `pr reopen`:
+/// neither form touches a ref. `pr close -d` and every other option are left
+/// to the shared-branch and ownership checks (#393).
+fn is_close_or_reopen(tokens: &[&str]) -> bool {
+    match tokens {
+        [number] => is_number(number),
+        // A comment starting with `-` could be read as an option, `-d`
+        // among them, by a parser that differs from this one; refuse it.
+        [number, "--comment" | "-c", text] => is_number(number) && !text.starts_with('-'),
+        _ => false,
+    }
 }
 
 fn is_number(token: &str) -> bool {
@@ -856,6 +866,34 @@ mod tests {
             &["issue", "comment", "1", "--body", "x"],
         ] {
             assert_eq!(assess_line(line), Verdict::NoRefWrite, "{line:?}");
+        }
+    }
+
+    #[test]
+    fn closing_or_reopening_a_pull_request_writes_no_ref() {
+        for line in [
+            &["pr", "close", "5"][..],
+            &["pr", "close", "5", "--comment", "superseded by #6"],
+            &["pr", "close", "5", "-c", "x"],
+            &["pr", "reopen", "5"],
+            &["pr", "reopen", "5", "--comment", "x"],
+        ] {
+            assert_eq!(assess_line(line), Verdict::NoRefWrite, "{line:?}");
+        }
+        for line in [
+            &["pr", "close", "5", "-d"][..],
+            &["pr", "close", "5", "--delete-branch"],
+            &["pr", "close", "5", "--comment", "x", "-d"],
+            &["pr", "close", "5", "--repo", "other/x"],
+            &["pr", "close", "abc"],
+            &["pr", "close", "agent/a"],
+            &["pr", "close", "5", "--comment=x"],
+            &["pr", "close", "5", "--comment"],
+            &["pr", "close", "5", "-c", "-d"],
+            &["pr", "reopen", "5", "--repo", "other/x"],
+            &["pr", "reopen", "abc"],
+        ] {
+            assert!(unverifiable_line(line), "{line:?}");
         }
     }
 }
