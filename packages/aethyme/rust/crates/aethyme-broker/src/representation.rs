@@ -421,7 +421,7 @@ fn find_landing_within(
 ///
 /// This is the rebase-then-merge case (#408): the same patches applied to a
 /// newer base produce different blobs wherever the base differs, so no commit
-/// holds the session's exact content, yet `git patch-id --stable` agrees for
+/// holds the session's exact content, yet `git patch-id --verbatim` agrees for
 /// every commit. Three conditions keep the verdict sound rather than likely:
 ///
 /// - **every** session commit after the base must be accounted for, either by
@@ -434,7 +434,7 @@ fn find_landing_within(
 ///   verdict names one fixed commit that carried the work, as a recorded
 ///   representation requires.
 ///
-/// `--cherry-mark` compares the session side against the branch commits since
+/// [`GitRepo::cherry_marked`] compares the session side against the branch commits since
 /// the two diverged, including those reached through a merge's second parent.
 fn patch_landing(
     repo: &GitRepo,
