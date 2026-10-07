@@ -14,4 +14,12 @@ exit: 0
       Aethyme records provider ids, authors, states, URLs and timestamps, but
       never comment/review bodies. `tick` performs one bounded foreground
       scheduling pass; the broker never starts a background poller.
+  aethyme broker advanced watch repo start --session <id> --repo <owner/name> [--events <opened,ready_for_review,reopened>] [--include-drafts] [--include-existing] [--exclude-authors <login,login>] [--auto-watch] [--seconds <15..3600>] [--json]
+  aethyme broker advanced watch repo list [--all] [--json]
+  aethyme broker advanced watch repo show|events|pause|resume|stop --id <repo-watch-id> [--json]
+      Watch every pull request of a repository: each `watch pr tick` lists its
+      open PRs (metadata only) and records one event per PR and kind, opened,
+      ready_for_review or reopened, exactly once. PRs already open at start do
+      not fire unless --include-existing. --auto-watch also starts one per-PR
+      watch for each new PR.
 --- stderr
