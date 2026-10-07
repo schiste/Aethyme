@@ -605,3 +605,75 @@ fn an_unreadable_checkout_status_keeps_it() {
     );
     assert!(worktree.exists());
 }
+
+#[cfg(unix)]
+#[test]
+fn a_live_session_recorded_through_a_symlinked_root_keeps_the_checkout() {
+    // The host-state root reached through a symlink (`/tmp` against
+    // `/private/tmp`) records a live session's worktree under a different
+    // spelling than the closed one. It is still the same checkout.
+    let fx = fixture();
+    let mut broker = Broker::open(&fx.repo).unwrap();
+    let (_, worktree, _) = merged_closed_session(&fx, &mut broker, true);
+    let alias_root = fx.repo.parent().unwrap().join("host-state-alias");
+    std::os::unix::fs::symlink(worktree.parent().unwrap(), &alias_root).unwrap();
+    let alias = alias_root.join(worktree.file_name().unwrap());
+    let live = broker
+        .store()
+        .register_session(&aethyme_broker::NewSession {
+            worktree_path: alias.to_string_lossy().into_owned(),
+            branch: "live-through-alias".into(),
+            origin: aethyme_broker::SessionOrigin::Adopted,
+            task: Some("working through the alias".into()),
+            diff_base: None,
+            adoption_base: None,
+            adopted_head: None,
+            repository_contract: None,
+            pid: None,
+            command: None,
+            log_path: None,
+            agent_identity: None,
+        })
+        .unwrap();
+    let report = run(&mut broker);
+    assert!(report.removed.is_empty(), "{report:#?}");
+    assert!(
+        kept_reason(&report, &worktree).contains(&format!("session {} is still open", live.id)),
+        "{report:#?}"
+    );
+    assert!(worktree.exists());
+}
+
+#[test]
+fn an_unclaimed_worktree_is_never_removed() {
+    // A worktree no session record names -- a stray `git worktree add`, or a
+    // live session's own checkout the broker failed to match -- has no owner
+    // the proofs can be about, so it is never a candidate.
+    let fx = fixture();
+    let mut broker = Broker::open(&fx.repo).unwrap();
+    let (_, owned, _) = merged_closed_session(&fx, &mut broker, true);
+    let stray = owned.parent().unwrap().join("unclaimed-stray");
+    git(
+        &fx.repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            stray.to_str().unwrap(),
+            "origin/main",
+        ],
+    );
+    let report = run(&mut broker);
+    assert!(stray.exists(), "{report:#?}");
+    let stray_text = std::fs::canonicalize(&stray)
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    assert!(
+        !report
+            .removed
+            .iter()
+            .any(|removed| removed.worktree == stray_text),
+        "{report:#?}"
+    );
+}

@@ -483,6 +483,52 @@ pub(crate) enum NotRemoved {
     Defer,
 }
 
+/// The canonical git directory a checkout's `.git` resolves to: the
+/// `gitdir:` a linked worktree's `.git` file names, or the `.git` directory
+/// itself. Two paths that spell the same checkout differently -- a symlinked
+/// host-state root, `/tmp` against `/private/tmp` -- resolve to the same one.
+fn checkout_git_dir(worktree: &Path) -> Option<PathBuf> {
+    let dot_git = worktree.join(".git");
+    let metadata = std::fs::symlink_metadata(&dot_git).ok()?;
+    if metadata.is_dir() {
+        return std::fs::canonicalize(&dot_git).ok();
+    }
+    let text = std::fs::read_to_string(&dot_git).ok()?;
+    let target = text
+        .lines()
+        .find_map(|line| line.strip_prefix("gitdir:"))?
+        .trim();
+    let target = Path::new(target);
+    let target = if target.is_absolute() {
+        target.to_path_buf()
+    } else {
+        worktree.join(target)
+    };
+    std::fs::canonicalize(target).ok()
+}
+
+/// Whether a live session's recorded worktree is, contains or lies inside
+/// `candidate` (canonical). Matched by canonical path, and by git-dir
+/// identity, so a recorded path that spells the checkout through a symlink
+/// still matches. Fail-closed: a recorded path that cannot be resolved is
+/// also compared as written.
+pub(crate) fn live_session_overlaps(
+    candidate: &Path,
+    candidate_git_dir: Option<&Path>,
+    recorded: &str,
+) -> bool {
+    let raw = PathBuf::from(recorded);
+    let resolved = std::fs::canonicalize(&raw).unwrap_or_else(|_| raw.clone());
+    if resolved.starts_with(candidate)
+        || candidate.starts_with(&resolved)
+        || raw.starts_with(candidate)
+        || candidate.starts_with(&raw)
+    {
+        return true;
+    }
+    candidate_git_dir.is_some_and(|git_dir| checkout_git_dir(&raw).as_deref() == Some(git_dir))
+}
+
 fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -685,9 +731,9 @@ impl Broker {
             // Proof 1: a session still open anywhere in this tree keeps it,
             // whatever state it reports -- an exited or stale session is not
             // a closed one.
+            let git_dir = checkout_git_dir(&path);
             if let Some(open) = live.iter().find(|session| {
-                canonical(Path::new(&session.worktree_path)).starts_with(&path)
-                    || path.starts_with(canonical(Path::new(&session.worktree_path)))
+                live_session_overlaps(&path, git_dir.as_deref(), &session.worktree_path)
             }) {
                 kept.push(keep(format!(
                     "session {} is still open ({}) in this worktree",
@@ -718,6 +764,12 @@ impl Broker {
         deadline: Option<Instant>,
     ) -> Result<ContainmentProof, NotRemoved> {
         let keep = NotRemoved::Keep;
+        // Only a checkout a broker session record proves it created may go.
+        // Candidates come from session records, never from scanning the
+        // worktree root, so this is the guard behind that invariant.
+        if candidate.sessions.is_empty() {
+            return Err(keep("no recorded owner".into()));
+        }
         if policy.is_pinned(&candidate.worktree) {
             return Err(keep("pinned by [cleanup] keep".into()));
         }
@@ -741,9 +793,11 @@ impl Broker {
             .map_err(|error| keep(format!("live sessions unreadable: {error}")))?
             .iter()
             .find(|live| {
-                let live_path = std::fs::canonicalize(&live.worktree_path)
-                    .unwrap_or_else(|_| PathBuf::from(&live.worktree_path));
-                live_path.starts_with(&candidate.worktree)
+                live_session_overlaps(
+                    &candidate.worktree,
+                    checkout_git_dir(&candidate.worktree).as_deref(),
+                    &live.worktree_path,
+                )
             })
         {
             return Err(keep(format!(
