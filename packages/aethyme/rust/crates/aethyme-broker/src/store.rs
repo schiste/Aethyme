@@ -5821,6 +5821,16 @@ impl BrokerStore {
             .ok_or(BrokerError::DeliveryOutboxNotFound(id))
     }
 
+    /// The connection, for broker modules that own their own tables
+    /// (repository watches, #606) rather than growing this file further.
+    pub(crate) fn connection(&self) -> &Connection {
+        &self.conn
+    }
+
+    pub(crate) fn connection_mut(&mut self) -> &mut Connection {
+        &mut self.conn
+    }
+
     pub fn delivery_outbox_item(&self, id: i64) -> Result<Option<DeliveryOutboxItem>, BrokerError> {
         self.conn
             .query_row(
@@ -7706,7 +7716,7 @@ fn release_checkpoint_pin_in_tx(
     Ok(inserted > 0)
 }
 
-fn insert_event(
+pub(crate) fn insert_event(
     conn: &Connection,
     ts: i64,
     kind: &str,
