@@ -290,6 +290,10 @@ pub struct ReviewTriggerRule {
     /// matches (#584).
     #[serde(default)]
     pub labels: Vec<String>,
+    /// A comment this rule posts and keeps current while it matches (#596),
+    /// rendered from a `[review.comments.<name>]` template.
+    #[serde(default)]
+    pub comment: Option<crate::RuleComment>,
     /// Smallest measured size tier (`trivial`, `normal`, `large`).
     #[serde(default)]
     pub min_tier: Option<String>,
@@ -457,6 +461,10 @@ pub struct ReviewTriggerPolicy {
     /// every other rule, `from_fork` included, then applies unchanged.
     #[serde(default)]
     pub include_forks: bool,
+    /// `[review.comments.<name>]`, read beside this table: the templates a
+    /// rule's `comment` renders (#596).
+    #[serde(skip)]
+    pub comment_templates: BTreeMap<String, crate::CommentTemplate>,
 }
 
 fn default_trigger_schema_version() -> u32 {
@@ -472,6 +480,7 @@ impl Default for ReviewTriggerPolicy {
             schedule: BTreeMap::new(),
             default_schedule: ReviewSchedule::default(),
             include_forks: false,
+            comment_templates: BTreeMap::new(),
         }
     }
 }
@@ -508,14 +517,20 @@ pub enum ReviewTriggerError {
         supported: u32,
     },
     #[error(
-        "{path}: review.trigger rule {index} does nothing; give it `require`, `waive` or \
-         `labels`"
+        "{path}: review.trigger rule {index} does nothing; give it `require`, `waive`, \
+         `labels` or `comment`"
     )]
     RuleRequiresNothing { path: String, index: usize },
     #[error("{path}: review.trigger rule {index}: {reason}")]
     InvalidRule {
         path: String,
         index: usize,
+        reason: String,
+    },
+    #[error("{path}: review.comments.{name}: {reason}")]
+    InvalidCommentTemplate {
+        path: String,
+        name: String,
         reason: String,
     },
     #[error(
@@ -564,7 +579,7 @@ impl ReviewTriggerPolicy {
         let Some(table) = value.get("review").and_then(|review| review.get("trigger")) else {
             return Ok(Self::default());
         };
-        let policy: Self =
+        let mut policy: Self =
             table
                 .clone()
                 .try_into()
@@ -572,6 +587,19 @@ impl ReviewTriggerPolicy {
                     path: display.to_string(),
                     source,
                 })?;
+        if let Some(comments) = value
+            .get("review")
+            .and_then(|review| review.get("comments"))
+        {
+            policy.comment_templates =
+                comments
+                    .clone()
+                    .try_into()
+                    .map_err(|source| ReviewTriggerError::Parse {
+                        path: display.to_string(),
+                        source,
+                    })?;
+        }
         policy.validate(display)?;
         Ok(policy)
     }
@@ -584,8 +612,52 @@ impl ReviewTriggerPolicy {
                 supported: REVIEW_TRIGGER_SCHEMA_VERSION,
             });
         }
+        // Every template is checked, used or not: a typo in one waiting for a
+        // rule must not surface only on the day a rule starts using it.
+        for (name, template) in &self.comment_templates {
+            if let Err(reason) = crate::rule_comments::template_variables(&template.body) {
+                return Err(ReviewTriggerError::InvalidCommentTemplate {
+                    path: path.to_string(),
+                    name: name.clone(),
+                    reason,
+                });
+            }
+        }
+        let mut comment_keys = BTreeSet::new();
         for (index, rule) in self.rule.iter().enumerate() {
-            if rule.require.is_empty() && rule.waive.is_empty() && rule.labels.is_empty() {
+            if let Some(comment) = &rule.comment {
+                let invalid = |reason: String| ReviewTriggerError::InvalidRule {
+                    path: path.to_string(),
+                    index,
+                    reason,
+                };
+                if !self.comment_templates.contains_key(&comment.template) {
+                    return Err(invalid(format!(
+                        "comment template `{}` is not defined; add `[review.comments.{}]`",
+                        comment.template, comment.template
+                    )));
+                }
+                if !crate::rule_comments::valid_key(&comment.key) {
+                    return Err(invalid(format!(
+                        "comment key `{}` must be 1-64 lowercase letters, digits or `-`, \
+                         starting with a letter or digit",
+                        comment.key
+                    )));
+                }
+                // One comment per key and pull request: two rules sharing a key
+                // would overwrite each other on every tick.
+                if !comment_keys.insert(comment.key.clone()) {
+                    return Err(invalid(format!(
+                        "comment key `{}` is already used by another rule",
+                        comment.key
+                    )));
+                }
+            }
+            if rule.require.is_empty()
+                && rule.waive.is_empty()
+                && rule.labels.is_empty()
+                && rule.comment.is_none()
+            {
                 return Err(ReviewTriggerError::RuleRequiresNothing {
                     path: path.to_string(),
                     index,
@@ -667,7 +739,7 @@ impl ReviewTriggerRule {
     /// match. That reading makes a rule narrower as an operator adds to it,
     /// which is the direction people expect when they are trying to stop a rule
     /// firing too often.
-    fn matches(&self, facts: &ChangeFacts) -> bool {
+    pub(crate) fn matches(&self, facts: &ChangeFacts) -> bool {
         if !self.on.is_empty() && !facts.trigger.is_some_and(|t| self.on.contains(&t)) {
             return false;
         }
@@ -845,7 +917,7 @@ impl ReviewTriggerRule {
         Ok(())
     }
 
-    fn label(&self, index: usize) -> String {
+    pub(crate) fn label(&self, index: usize) -> String {
         self.name.clone().unwrap_or_else(|| format!("rule {index}"))
     }
 }

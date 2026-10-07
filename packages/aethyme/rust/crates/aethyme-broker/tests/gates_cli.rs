@@ -642,7 +642,7 @@ fn gate_scope_separates_fixtures_and_protects_the_linked_primary() {
         (second.path(), "second"),
     ] {
         commands.push(format!(
-            "(cd {} && {} start --adopt --short-name {} --task {} --json) > {}",
+            "(cd {} && {} start --adopt --allow-main-checkout --short-name {} --task {} --json) > {}",
             shell_path(repo),
             shell_path(Path::new(CLI)),
             name,
@@ -695,7 +695,7 @@ fn nested_gate_retains_ancestor_database_isolation() {
         .into_iter()
         .map(|(repo, name)| {
             format!(
-                "(cd {} && {} start --adopt --short-name {} --task {} --json) > {}",
+                "(cd {} && {} start --adopt --allow-main-checkout --short-name {} --task {} --json) > {}",
                 shell_path(repo),
                 shell_path(Path::new(CLI)),
                 name,

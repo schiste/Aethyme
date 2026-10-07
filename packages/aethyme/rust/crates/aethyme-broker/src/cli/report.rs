@@ -287,7 +287,7 @@ pub(super) fn run_quality_report(parsed: Parsed) -> Result<(), UsageError> {
         cross_session: None,
         ref_write_acknowledged: false,
         authorization_reason: Some(publication.reason(pull_request, &plan.report_digest)),
-        args: publication.gh_args(pull_request),
+        args: publication.gh_args(pull_request, &repository),
     }) {
         Ok(operation) => operation,
         Err(error) => {

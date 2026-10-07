@@ -1,6 +1,6 @@
 # Testing Guide
 
-Last Updated: 2026-08-06
+Last Updated: 2026-10-07
 
 The suite is Rust. There is no database, no services, and no Python —
 `src/` was deleted on 2026-08-01 (python-retirement Phase 6) and the dev
@@ -9,12 +9,77 @@ whole test story.
 
 ## Running It
 
+Run the suite the way CI does:
+
 ```bash
-cd packages/aethyme/rust
-cargo test --workspace
+packages/aethyme/scripts/test-like-ci.sh          # what your change affects
+packages/aethyme/scripts/test-like-ci.sh --full   # the whole workspace
 ```
 
-That is the entire setup. No venv, no `pip install`, no `pyproject.toml`.
+The script is CI's own test step, and `ci_validation` keeps the two from
+drifting. It:
+
+- runs `cargo nextest run --profile ci`: parallel, one retry, and FLAKY reported;
+- reproduces a runner: no agent process above the tests, no inherited broker
+  placement, and no git identity;
+- prints the ten slowest tests and the wall time.
+
+No venv, no `pip install`, no `pyproject.toml`.
+
+**Never run the suite serially.** `--test-threads=1`, `-j 1` and
+`--no-capture` are refused. If one test fails, re-run that test by name.
+
+## Where The Time Goes
+
+Measured on 2026-10-07 on a 10-core workstation at load average 67, with
+other agents building:
+
+| Run | Wall time |
+|---|---|
+| `test-like-ci.sh --full`: 3,722 tests, nextest, parallel | 5m21s (test phase) |
+| The same suite serially, `cargo test --test-threads=1` across every target | about 2 hours |
+| CI, the "Rust workspace tests" job | about 8 minutes |
+
+What makes a serial run slow is not sleeping. The slowest tests are
+process-heavy and do real work: enrollment and upgrade flows that run many
+`aethyme` and `git` subprocesses. The top five took 53 s, 26 s, 26 s, 22 s
+and 15 s. Parallel scheduling across all test binaries overlaps them; a
+serial run adds every one up.
+
+Real-time waits are small and deliberate. The five longest tests that wait
+on a clock:
+
+| Test | Time |
+|---|---|
+| `gates_cli::independent_repositories_share_gate_host_resources_and_release_them` (lease renewal) | 7.5 s |
+| `merge_e2e::a_first_broker_timeout_defers_the_submission_and_a_repeat_rejects_it` | 6.6 s |
+| `operations_e2e::bounded_remote_write_timeout_is_journaled_unknown_and_blocks_retry` | 5.9 s |
+| `operations_e2e::a_read_does_not_wait_behind_a_held_lock_or_a_blocked_repository` | 5.2 s |
+| `gates_e2e::slow_gate_emits_heartbeat_progress` | 3.2 s |
+
+Together they come to about 28 s, overlapped in a parallel run. Their
+budgets were raised on purpose: `bounded_remote_write_timeout_…` uses 5 s
+rather than 1 s because preparing the operation alone could exceed 1 s
+under load. Shortening them would buy little and bring flakiness back, so
+they stay.
+
+### Keeping tests hermetic
+
+Two flaky tests sent an agent into a two-hour serial run on 2026-10-07. Both
+read state the test did not own:
+
+- **`closed_worktree_gc`** inherited the operator's `AETHYME_WORKTREE_ROOT`.
+  Every test repository's worktree root then landed in one shared container,
+  and GC counted the other tests' roots as orphans, so the plan digest moved
+  between `plan` and `apply`. The fixture now pins its own worktree root with
+  `Broker::with_worktree_root`.
+- **`gates_e2e`'s label test** read the gate pidfile from inside the gate
+  command. The broker writes that file just after it spawns the command, so
+  the read raced the write.
+
+A test that needs a host-level location should own it: pass a temporary
+`AETHYME_HOST_STATE_DIR` (canonicalized on macOS) or a `with_worktree_root`,
+and never read the operator's environment.
 
 ## Test Tiers
 

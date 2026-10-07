@@ -176,6 +176,7 @@ mod review_facts;
 mod review_ledger;
 mod review_report;
 mod review_trigger;
+mod rule_comments;
 mod schema;
 mod session_abandonment;
 mod session_push;
@@ -525,6 +526,12 @@ pub use review_trigger::{
     ReviewSchedule, ReviewSpend, ReviewTrigger, ReviewTriggerDecision, ReviewTriggerError,
     ReviewTriggerPolicy, ReviewTriggerRule, RuleActions, RuleLabel, classification_conflicts,
     decide, eligible_types, parse_classification, rule_actions, schedule,
+};
+pub use rule_comments::{
+    CommentTemplate, OnUnmatch, PlannedComment, RULE_COMMENT_VARIABLES, RetiredComment,
+    RuleComment, RuleCommentAction, RuleCommentContext, RuleCommentDecision, RuleCommentPlan,
+    RuleCommentWants, own_rule_comments, plan_rule_comments, render_rule_comment,
+    rule_comment_wants,
 };
 pub use schema::{EVENTS_SCHEMA_VERSION, SCHEMA_VERSION};
 pub use scopes::{

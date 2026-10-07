@@ -22,3 +22,8 @@ failure-output = "immediate-final"
 # fails the run with its name instead of holding the job until GitHub's
 # timeout (the first run of this profile sat in one step for over an hour).
 slow-timeout = { period = "60s", terminate-after = 5 }
+
+[profile.ci.junit]
+# packages/aethyme/scripts/test-like-ci.sh reads per-test durations from this
+# report to print the slowest tests after every run, local or CI (#598).
+path = "junit.xml"

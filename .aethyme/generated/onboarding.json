@@ -78,7 +78,7 @@
         },
         {
           "kind": "ci_usage",
-          "detail": "workspace root mentioned 33 time(s) in CI",
+          "detail": "workspace root mentioned 37 time(s) in CI",
           "confidence": "medium"
         }
       ],
@@ -88,9 +88,9 @@
         "root_manifest": false,
         "declares_workspace": true,
         "member_count": 10,
-        "ci_mentions": 33,
+        "ci_mentions": 37,
         "executable_entrypoints": 1,
-        "source_files": 543
+        "source_files": 562
       }
     },
     {
@@ -195,7 +195,7 @@
       },
       {
         "kind": "ci_usage",
-        "detail": "workspace root mentioned 33 time(s) in CI",
+        "detail": "workspace root mentioned 37 time(s) in CI",
         "confidence": "medium"
       }
     ],
@@ -205,47 +205,52 @@
       "root_manifest": false,
       "declares_workspace": true,
       "member_count": 10,
-      "ci_mentions": 33,
+      "ci_mentions": 37,
       "executable_entrypoints": 1,
-      "source_files": 543
+      "source_files": 562
     }
   },
   "commands": [
     {
-      "kind": "install",
-      "command": "python -m pip install -e packages/aethyme-eval",
-      "source": "packages/aethyme-eval/pyproject.toml",
-      "confidence": "medium",
-      "workspace_root": "packages/aethyme-eval",
-      "provenance": "derived from tracked workspace manifest"
-    },
-    {
       "kind": "fast_test",
-      "command": "cargo test --manifest-path packages/aethyme/rust/Cargo.toml --workspace",
-      "source": "packages/aethyme/rust/Cargo.toml",
+      "command": "packages/aethyme/scripts/test-like-ci.sh",
+      "source": "manual-override",
       "confidence": "high",
-      "workspace_root": "packages/aethyme/rust",
-      "provenance": "derived from tracked workspace manifest"
+      "workspace_root": "packages/aethyme/rust"
     },
     {
-      "kind": "fast_test",
-      "command": "python -m pytest packages/aethyme-eval",
-      "source": "packages/aethyme-eval/pyproject.toml",
-      "confidence": "medium",
-      "workspace_root": "packages/aethyme-eval",
-      "provenance": "derived from tracked workspace manifest"
+      "kind": "full_test",
+      "command": "packages/aethyme/scripts/test-like-ci.sh --full",
+      "source": "manual-override",
+      "confidence": "high",
+      "workspace_root": "packages/aethyme/rust"
     },
     {
       "kind": "build",
       "command": "cargo build --manifest-path packages/aethyme/rust/Cargo.toml --workspace",
-      "source": "packages/aethyme/rust/Cargo.toml",
+      "source": "manual-override",
       "confidence": "high",
-      "workspace_root": "packages/aethyme/rust",
-      "provenance": "derived from tracked workspace manifest"
+      "workspace_root": "packages/aethyme/rust"
+    },
+    {
+      "kind": "install",
+      "command": "python -m pip install -e packages/aethyme-eval",
+      "source": "manual-override",
+      "confidence": "medium",
+      "workspace_root": "packages/aethyme-eval"
+    },
+    {
+      "kind": "test",
+      "command": "python -m pytest packages/aethyme-eval",
+      "source": "manual-override",
+      "confidence": "medium",
+      "workspace_root": "packages/aethyme-eval"
     }
   ],
   "primary_commands": {
-    "fast_test": "cargo test --manifest-path packages/aethyme/rust/Cargo.toml --workspace",
+    "install": "python -m pip install -e packages/aethyme-eval",
+    "fast_test": "packages/aethyme/scripts/test-like-ci.sh",
+    "full_test": "packages/aethyme/scripts/test-like-ci.sh --full",
     "build": "cargo build --manifest-path packages/aethyme/rust/Cargo.toml --workspace"
   },
   "areas": [
@@ -418,12 +423,13 @@
     ]
   },
   "freshness": {
-    "source_digest": "5587730c25681c3153333afbdca2df2ca4379bdc4d8d116cdf7fede710afad78",
+    "source_digest": "27ae2fd7bbe84176a4ae15344fbb7fd9f6779c5c7761077a55f8614d7158a320",
     "source_commit": null,
-    "source_file_count": 967,
+    "source_file_count": 987,
     "generator": "deterministic"
   },
   "notes": [
+    "Validate a change with `packages/aethyme/scripts/test-like-ci.sh`: it runs the tests your diff affects exactly as CI does (nextest `--profile ci`, parallel, one retry, CI environment) and prints the slowest tests. CI runs the whole workspace on every pull request, so push and let it. Never run the suite with `--test-threads=1` or `--no-capture`: serially it took two hours on 2026-10-07 against eight minutes in CI. Re-run one failing test by name instead.",
     "`packages/aethyme` is 100% Rust. `python -m src.cli` was removed with no shim and fails with `No module named src`; run `aethyme <same thing>` instead. The only Python left is `packages/aethyme-eval`, which is Python by design. Do not add Python build files under `packages/aethyme` (the `Makefile` and `package.json` there were Python-era residue, removed 2026-09-29).",
     "Gate selection is by path trigger, and a trigger that outlives the paths it names silently disables its gate while the entry still auto-promotes. Four instances have already shipped here. `gate_policy.rs` fails on the config-only path, so a new package, manifest, or workflow directory needs its trigger added in the same change.",
     "`.aethyme/gates.toml` and `.aethyme/config.toml` are security-sensitive paths in `.aethyme/config.toml`'s own review rules. Narrowing a `triggers` glob disables a gate for a whole class of change and reads exactly like a tidy-up.",
@@ -450,14 +456,14 @@
     ],
     "counts": {
       "workspaces": 2,
-      "commands": 4,
+      "commands": 5,
       "areas": 4,
       "entrypoints": 7,
       "caution_zones": 0,
       "generated_paths": 1,
       "dangerous_paths": 2,
       "navigation_recipes": 3,
-      "notes": 8
+      "notes": 9
     },
     "overrides_applied": true,
     "override_source": ".aethyme/overrides/onboarding.json",

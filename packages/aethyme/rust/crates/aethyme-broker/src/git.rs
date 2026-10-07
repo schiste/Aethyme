@@ -1577,6 +1577,75 @@ impl GitRepo {
         Ok(())
     }
 
+    /// Fast-forward the checked-out `branch` from exactly `from` to `to`.
+    ///
+    /// The branch ref moves by compare-and-swap, so a HEAD that moved after
+    /// the caller's preflight fails here instead of being carried forward.
+    /// The index and worktree then follow with a two-tree `read-tree -m -u`,
+    /// which refuses on any local change or a held index lock; in that case
+    /// the ref is swapped back so the checkout is left exactly as found.
+    pub fn fast_forward_checkout_from(
+        &self,
+        branch: &str,
+        from: &str,
+        to: &str,
+    ) -> Result<(), GitError> {
+        let reference = format!("refs/heads/{branch}");
+        run_git(&self.root, &["update-ref", &reference, to, from])?;
+        if let Err(error) = run_git(&self.root, &["read-tree", "-m", "-u", from, to]) {
+            let restored = run_git(&self.root, &["update-ref", &reference, from, to]);
+            if let Err(restore) = restored {
+                return Err(GitError::Git {
+                    args: format!("read-tree -m -u {from} {to}"),
+                    stderr: format!(
+                        "{error}; restoring {reference} to {from} also failed: {restore}"
+                    ),
+                });
+            }
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// The first Git operation left in progress in this checkout, or a held
+    /// index lock: a merge, cherry-pick, revert, bisect or rebase that a
+    /// person or agent is in the middle of. Paths resolve through
+    /// `rev-parse --git-path`, so linked worktrees and relocated git
+    /// directories are checked where Git itself keeps them.
+    pub fn in_progress_operation(&self) -> Result<Option<&'static str>, GitError> {
+        const MARKERS: [(&str, &str); 7] = [
+            ("MERGE_HEAD", "a merge is in progress"),
+            ("CHERRY_PICK_HEAD", "a cherry-pick is in progress"),
+            ("REVERT_HEAD", "a revert is in progress"),
+            ("BISECT_LOG", "a bisect is in progress"),
+            ("rebase-merge", "a rebase is in progress"),
+            ("rebase-apply", "a rebase or am is in progress"),
+            ("index.lock", "another Git process holds the index lock"),
+        ];
+        let mut args = vec!["rev-parse"];
+        for (marker, _) in MARKERS {
+            args.extend(["--git-path", marker]);
+        }
+        let output = run_git(&self.root, &args)?;
+        let paths: Vec<&str> = output.lines().collect();
+        if paths.len() != MARKERS.len() {
+            return Err(GitError::Git {
+                args: "rev-parse --git-path".into(),
+                stderr: format!(
+                    "expected {} paths, Git printed {}",
+                    MARKERS.len(),
+                    paths.len()
+                ),
+            });
+        }
+        for ((_, reason), path) in MARKERS.iter().zip(paths) {
+            if self.root.join(path).exists() {
+                return Ok(Some(reason));
+            }
+        }
+        Ok(None)
+    }
+
     /// Create or fast-move a local branch ref to `commit` (no checkout).
     pub fn update_branch_ref(&self, branch: &str, commit: &str) -> Result<(), GitError> {
         run_git(

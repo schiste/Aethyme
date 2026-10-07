@@ -12,6 +12,13 @@ pub fn test_session_args(args: &[&str]) -> Vec<String> {
     {
         args.extend(["--short-name", "test session"]);
     }
+    let adopts_main = matches!(args.first(), Some(&"adopt"))
+        || (args.first() == Some(&"start") && args.contains(&"--adopt"));
+    if adopts_main && !args.contains(&"--allow-main-checkout") {
+        // Test fixtures intentionally register sessions in their temporary
+        // main checkout; exercise the explicit operator-only CLI flag.
+        args.push("--allow-main-checkout");
+    }
     args.into_iter().map(str::to_string).collect()
 }
 

@@ -809,7 +809,7 @@ fn gate_commands_receive_run_labels_matching_their_pidfile() {
             r#"
 [[gate]]
 name = "label-check"
-command = 'printf "%s\n%s\n" "$AETHYME_GATE_LABELS" "$AETHYME_GATE_RUN_ID" > "{capture}" && cat "{run_dir}"/*-label-check.pid >> "{capture}"'
+command = 'printf "%s\n%s\n" "$AETHYME_GATE_LABELS" "$AETHYME_GATE_RUN_ID" > "{capture}" && i=0 && while [ ! -e "{run_dir}"/*-label-check.pid ] && [ $i -lt 200 ]; do sleep 0.05; i=$((i + 1)); done && cat "{run_dir}"/*-label-check.pid >> "{capture}"'
 triggers = ["**/*.py"]
 "#,
             capture = capture.display(),
@@ -818,6 +818,9 @@ triggers = ["**/*.py"]
     );
     commit_all(tmp.path(), "add gates");
 
+    // The broker writes the pidfile just after it spawns the command, so the
+    // command waits for it (up to 10 s) before reading it. Reading it at
+    // once raced the write and failed under load (#598).
     let mut broker = Broker::open(tmp.path()).unwrap();
     let wt = add_worktree(tmp.path(), "labels");
     let session = broker.adopt(&wt, None).unwrap();
