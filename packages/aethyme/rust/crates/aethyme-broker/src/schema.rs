@@ -5,6 +5,14 @@
 //!   order inside one transaction per version.
 //! - Migrations are append-only: never edit an entry in [`MIGRATIONS`],
 //!   only add new ones.
+//! - A version number names a migration only once it is on the default
+//!   branch. A build from an unmerged branch may have stamped the same number
+//!   onto a real database with different contents (2026-10-07: #564's "v48"
+//!   added `agent_provenance_json`, so #611's v48 tables were skipped and
+//!   #613's v49 then failed with "duplicate column name"). Migrations from
+//!   v48 on are therefore applied idempotently, and every open runs a repair
+//!   pass that re-creates their objects when a database claims the version
+//!   but lacks them. Never point a dev build at a real broker database.
 //! - `meta.min_compatible_schema` records the oldest schema version whose
 //!   binaries may still read and write the database. A binary older than the
 //!   database opens it without migrating when its own [`SCHEMA_VERSION`] is at
@@ -25,7 +33,7 @@ use rusqlite::Connection;
 use crate::error::BrokerError;
 
 /// Current database schema version (== `MIGRATIONS.len()`).
-pub const SCHEMA_VERSION: i64 = 48;
+pub const SCHEMA_VERSION: i64 = 49;
 
 /// The oldest schema version whose binaries can safely use a database at
 /// [`SCHEMA_VERSION`]. Before this existed every newer database locked out
@@ -54,6 +62,9 @@ pub const SCHEMA_VERSION: i64 = 48;
 /// - v48: five new tables for repository-wide pull request watches and their
 ///   deliveries (#606). An older binary never names them, so it neither polls
 ///   repository watches nor claims their deliveries; nothing existing changes.
+/// - v49: adds nullable local operation provenance. A v48 writer names its
+///   existing columns and can continue writing; a v48 reader safely ignores
+///   the additional field.
 pub const MIN_COMPATIBLE_SCHEMA: i64 = 47;
 
 /// Whether this binary may use a database at `found`, a version newer than
@@ -1604,6 +1615,12 @@ CREATE TABLE repository_delivery_outbox (
 CREATE INDEX repository_delivery_outbox_due
     ON repository_delivery_outbox (status, claim_expires_at, id);
 ";
+const MIGRATION_V49: &str = "
+-- Keep coordinated-operation caller/holder provenance local and nullable so
+-- older compatible writers may continue to create history rows.
+ALTER TABLE coordinated_operations ADD COLUMN agent_provenance_json TEXT;
+";
+
 const MIGRATIONS: &[&str] = &[
     MIGRATION_V1,
     MIGRATION_V2,
@@ -1653,7 +1670,133 @@ const MIGRATIONS: &[&str] = &[
     MIGRATION_V46,
     MIGRATION_V47,
     MIGRATION_V48,
+    MIGRATION_V49,
 ];
+
+/// Migrations that only add columns. One is skipped when every column it adds
+/// already exists, which a build from an unmerged branch may have done under
+/// the same version number (see the module docs).
+const COLUMN_ONLY_MIGRATIONS: &[(i64, &[(&str, &str)])] =
+    &[(49, &[("coordinated_operations", "agent_provenance_json")])];
+
+/// Migrations whose tables the repair pass re-creates, with `IF NOT EXISTS`,
+/// when a database records the version but lacks one of the tables.
+const TABLE_MIGRATIONS: &[(i64, &str, &[&str])] = &[(
+    48,
+    MIGRATION_V48,
+    &[
+        "repository_watches",
+        "repository_watch_pull_requests",
+        "repository_watch_events",
+        "repository_delivery_subscriptions",
+        "repository_delivery_outbox",
+    ],
+)];
+
+fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool, BrokerError> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name = ?2",
+        [table, column],
+        |row| row.get(0),
+    )?;
+    Ok(count > 0)
+}
+
+fn table_exists(conn: &Connection, table: &str) -> Result<bool, BrokerError> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+        [table],
+        |row| row.get(0),
+    )?;
+    Ok(count > 0)
+}
+
+/// `sql` with every `CREATE TABLE` / `CREATE INDEX` made `IF NOT EXISTS`.
+fn idempotent_creates(sql: &str) -> String {
+    sql.replace("CREATE TABLE IF NOT EXISTS ", "CREATE TABLE ")
+        .replace("CREATE UNIQUE INDEX IF NOT EXISTS ", "CREATE UNIQUE INDEX ")
+        .replace("CREATE INDEX IF NOT EXISTS ", "CREATE INDEX ")
+        .replace("CREATE TABLE ", "CREATE TABLE IF NOT EXISTS ")
+        .replace("CREATE UNIQUE INDEX ", "CREATE UNIQUE INDEX IF NOT EXISTS ")
+        .replace("CREATE INDEX ", "CREATE INDEX IF NOT EXISTS ")
+}
+
+/// Whether the column-only migration `version` has nothing left to add.
+fn column_migration_already_applied(conn: &Connection, version: i64) -> Result<bool, BrokerError> {
+    let Some((_, columns)) = COLUMN_ONLY_MIGRATIONS.iter().find(|(v, _)| *v == version) else {
+        return Ok(false);
+    };
+    for (table, column) in *columns {
+        if !column_exists(conn, table, column)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Objects a recorded migration should have created but the database lacks.
+fn missing_recorded_objects(conn: &Connection, version: i64) -> Result<bool, BrokerError> {
+    for (v, _, tables) in TABLE_MIGRATIONS {
+        if version >= *v {
+            for table in *tables {
+                if !table_exists(conn, table)? {
+                    return Ok(true);
+                }
+            }
+        }
+    }
+    for (v, columns) in COLUMN_ONLY_MIGRATIONS {
+        if version >= *v {
+            for (table, column) in *columns {
+                if !column_exists(conn, table, column)? {
+                    return Ok(true);
+                }
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// Re-create the objects of recorded migrations that the database lacks.
+/// Checks without a lock first, so a current database pays two cheap reads.
+fn repair_recorded_migrations(conn: &Connection) -> Result<(), BrokerError> {
+    let version = current_version(conn)?;
+    if !missing_recorded_objects(conn, version)? {
+        return Ok(());
+    }
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+    let repaired = (|| -> Result<(), BrokerError> {
+        let version = current_version(conn)?;
+        for (v, sql, _) in TABLE_MIGRATIONS {
+            if version >= *v {
+                conn.execute_batch(&idempotent_creates(sql))?;
+            }
+        }
+        for (v, columns) in COLUMN_ONLY_MIGRATIONS {
+            if version >= *v {
+                for (table, column) in *columns {
+                    if !column_exists(conn, table, column)? {
+                        conn.execute_batch(&format!(
+                            "ALTER TABLE {table} ADD COLUMN {column} TEXT"
+                        ))?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    })();
+    match repaired {
+        Ok(()) => conn.execute_batch("COMMIT")?,
+        Err(err) => {
+            // Report the repair error unless the rollback itself fails.
+            return conn
+                .execute_batch("ROLLBACK")
+                .map_err(BrokerError::from)
+                .and(Err(err));
+        }
+    }
+    Ok(())
+}
 
 pub(crate) fn current_version(conn: &Connection) -> Result<i64, BrokerError> {
     let version = conn
@@ -1689,6 +1832,7 @@ pub fn migrate(conn: &Connection) -> Result<(), BrokerError> {
         });
     }
     if found == SCHEMA_VERSION {
+        repair_recorded_migrations(conn)?;
         record_min_compatible_schema(conn)?;
         return Ok(());
     }
@@ -1704,7 +1848,9 @@ pub fn migrate(conn: &Connection) -> Result<(), BrokerError> {
             continue;
         }
         let applied = (|| -> Result<(), BrokerError> {
-            conn.execute_batch(sql)?;
+            if !column_migration_already_applied(conn, version)? {
+                conn.execute_batch(sql)?;
+            }
             conn.execute(
                 "INSERT INTO meta (key, value) VALUES ('schema_version', ?1)
                  ON CONFLICT (key) DO UPDATE SET value = excluded.value",
@@ -1723,6 +1869,7 @@ pub fn migrate(conn: &Connection) -> Result<(), BrokerError> {
             }
         }
     }
+    repair_recorded_migrations(conn)?;
     record_min_compatible_schema(conn)?;
     Ok(())
 }
@@ -2094,7 +2241,7 @@ mod tests {
 
     #[test]
     fn v48_only_adds_repository_watch_tables_and_keeps_v47_readers_compatible() {
-        let conn = migrated_through(47);
+        let before_conn = migrated_through(47);
         let schema = |conn: &Connection| -> Vec<(String, String)> {
             let mut statement = conn
                 .prepare("SELECT name, sql FROM sqlite_master WHERE sql IS NOT NULL ORDER BY name")
@@ -2105,9 +2252,11 @@ mod tests {
                 .collect::<Result<_, _>>()
                 .unwrap()
         };
-        let before = schema(&conn);
-
-        migrate(&conn).unwrap();
+        let before = schema(&before_conn);
+        let conn = migrated_through(48);
+        // A v48 binary stamps the compatibility floor when it finishes
+        // migrating; `migrated_through` stops before that step.
+        set_meta(&conn, "min_compatible_schema", 47);
         assert_eq!(current_version(&conn).unwrap(), 48);
         let after = schema(&conn);
         for object in &before {
@@ -2132,6 +2281,35 @@ mod tests {
         );
         assert_eq!(MIN_COMPATIBLE_SCHEMA, 47);
         assert!(schema_is_compatible_with(&conn, 48, 47).unwrap());
+    }
+
+    #[test]
+    fn v49_adds_agent_provenance_without_raising_the_compatibility_floor() {
+        assert_eq!(SCHEMA_VERSION, 49);
+        assert_eq!(MIN_COMPATIBLE_SCHEMA, 47);
+
+        let conn = migrated_through(48);
+        assert_eq!(current_version(&conn).unwrap(), 48);
+        migrate(&conn).unwrap();
+        assert_eq!(current_version(&conn).unwrap(), 49);
+        assert!(schema_is_compatible_with(&conn, 49, 47).unwrap());
+        assert!(!schema_is_compatible_with(&conn, 49, 46).unwrap());
+
+        let nullable: i64 = conn
+            .query_row(
+                r#"SELECT "notnull" FROM pragma_table_info('coordinated_operations')
+                   WHERE name = 'agent_provenance_json'"#,
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(nullable, 0);
+
+        // A v47 database, the compatibility floor, migrates straight through.
+        let from_v47 = migrated_through(47);
+        migrate(&from_v47).unwrap();
+        assert_eq!(current_version(&from_v47).unwrap(), 49);
+        assert!(schema_is_compatible_with(&from_v47, 49, 47).unwrap());
     }
 
     #[test]
@@ -3794,5 +3972,80 @@ mod tests {
         conn.execute(insert, rusqlite::params!["o/other", 7, "abc"])
             .unwrap();
         assert_eq!(current_version(&conn).unwrap(), SCHEMA_VERSION);
+    }
+
+    /// The database this machine had on 2026-10-07: a build from the closed
+    /// #564 stamped "v48" after adding `agent_provenance_json`, so #611's v48
+    /// tables were never created and #613's v49 failed on the duplicate column.
+    fn database_with_a_foreign_v48() -> Connection {
+        let conn = migrated_through(47);
+        conn.execute_batch(
+            "ALTER TABLE coordinated_operations ADD COLUMN agent_provenance_json TEXT",
+        )
+        .unwrap();
+        set_meta(&conn, "schema_version", 48);
+        conn
+    }
+
+    fn repository_watch_tables_present(conn: &Connection) -> bool {
+        TABLE_MIGRATIONS
+            .iter()
+            .flat_map(|(_, _, tables)| tables.iter())
+            .all(|table| table_exists(conn, table).unwrap())
+    }
+
+    #[test]
+    fn a_database_stamped_by_a_foreign_v48_opens_and_gains_the_real_v48_tables() {
+        let conn = database_with_a_foreign_v48();
+        assert!(!repository_watch_tables_present(&conn));
+
+        migrate(&conn).unwrap();
+
+        assert_eq!(current_version(&conn).unwrap(), SCHEMA_VERSION);
+        assert!(repository_watch_tables_present(&conn));
+        assert!(column_exists(&conn, "coordinated_operations", "agent_provenance_json").unwrap());
+        assert!(table_exists(&conn, "repository_watches").unwrap());
+    }
+
+    #[test]
+    fn a_current_database_missing_recorded_objects_is_repaired_on_open() {
+        let conn = migrated_through(47);
+        conn.execute_batch(
+            "ALTER TABLE coordinated_operations ADD COLUMN agent_provenance_json TEXT",
+        )
+        .unwrap();
+        set_meta(&conn, "schema_version", SCHEMA_VERSION);
+
+        migrate(&conn).unwrap();
+
+        assert!(repository_watch_tables_present(&conn));
+    }
+
+    #[test]
+    fn migrating_twice_is_a_no_op() {
+        let conn = migrated_through(47);
+        migrate(&conn).unwrap();
+        let objects = |conn: &Connection| -> Vec<String> {
+            let mut stmt = conn
+                .prepare("SELECT type || ':' || name FROM sqlite_master ORDER BY 1")
+                .unwrap();
+            stmt.query_map([], |row| row.get(0))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        };
+        let before = objects(&conn);
+        migrate(&conn).unwrap();
+        assert_eq!(objects(&conn), before);
+        assert_eq!(current_version(&conn).unwrap(), SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn idempotent_creates_rewrites_every_create_once() {
+        let sql =
+            "CREATE TABLE a (x);\nCREATE INDEX i ON a (x);\nCREATE TABLE IF NOT EXISTS b (y);";
+        let out = idempotent_creates(sql);
+        assert_eq!(out.matches("IF NOT EXISTS").count(), 3);
+        assert!(!out.contains("IF NOT EXISTS IF NOT EXISTS"));
     }
 }

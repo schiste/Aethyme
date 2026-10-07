@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use regex::Regex;
 
 use crate::fix::fixers::base::{FixProposal, Fixer};
+use crate::fix::safety::GeneratedFileDetector;
 use crate::walk;
 
 pub const FOLDER_DOC_NAME: &str = "FOLDER.md";
@@ -225,8 +226,12 @@ impl DocsRegenerator {
     /// original, which is what trips the safety engine's doubling check
     /// and lands these patches at medium risk.
     pub fn create_folder_docs(&self) -> Vec<FixProposal> {
+        // The safety engine refuses to write a generated path, so proposing
+        // one only produces a patch that can never apply.
+        let generated = GeneratedFileDetector::new();
         self.find_directories_missing_folder_doc()
             .into_iter()
+            .filter(|directory| !generated.is_generated(&directory.join(FOLDER_DOC_NAME)))
             .map(|directory| {
                 let content = self.generate_folder_doc(&directory);
                 FixProposal {
@@ -459,6 +464,26 @@ mod tests {
         assert_eq!(created[0].file_path, tmp.join("utils/FOLDER.md"));
         assert_eq!(created[0].original_content, "");
         assert!(created[0].new_content.starts_with("# utils\n"));
+    }
+
+    #[test]
+    fn creates_no_folder_doc_the_safety_engine_would_refuse() {
+        let tmp = tmpdir("docs-generated");
+        write(&tmp, "src/app/main.py", "x = 1");
+        write(&tmp, "src/generated/client.py", "x = 1");
+        let proposals = DocsRegenerator::new(&tmp).create_folder_docs();
+        let targets: Vec<_> = proposals
+            .iter()
+            .map(|proposal| proposal.file_path.strip_prefix(&tmp).unwrap().to_path_buf())
+            .collect();
+        assert!(
+            targets.contains(&PathBuf::from("src/app/FOLDER.md")),
+            "{targets:?}"
+        );
+        assert!(
+            !targets.contains(&PathBuf::from("src/generated/FOLDER.md")),
+            "{targets:?}"
+        );
     }
 
     #[test]
