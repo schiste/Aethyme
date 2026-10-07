@@ -76,6 +76,9 @@ pub struct SessionPullRequest {
     /// invocation opened.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub ci_skips_drafts: bool,
+    /// The pull request is a draft. A review run on push skips drafts.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub draft: bool,
 }
 
 /// What `broker push` did.
@@ -118,6 +121,13 @@ pub struct SessionPushReport {
     /// `--pr`, or when the change could not be measured.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pr_size: Option<crate::PrSizeReport>,
+    /// With `[review] run_on_push`: what the review run for `pr` did, or why
+    /// it did not run or failed. The push itself succeeded either way.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub review_run: Option<serde_json::Value>,
+    /// `owner/name` the push targeted; the review run on push needs it.
+    #[serde(skip)]
+    pub repository: String,
 }
 
 /// How many paths `broker push` left behind, and a few of them.
@@ -396,6 +406,18 @@ impl Broker {
                 &head,
                 &main_root,
             )?)
+        } else if crate::ReviewPolicy::load(&main_root).is_ok_and(|policy| policy.run_on_push) {
+            // The review run on push needs the open pull request even when
+            // this push did not ask to open one. A failed lookup only means
+            // no review runs; the push already happened.
+            self.find_session_pull_request(
+                session_id,
+                &target.display_slug,
+                &session.branch,
+                &main_root,
+            )
+            .ok()
+            .flatten()
         } else {
             None
         };
@@ -458,6 +480,8 @@ impl Broker {
             default_branch,
             default_branch_note,
             pr_size,
+            review_run: None,
+            repository: target.display_slug.clone(),
         })
     }
 
@@ -712,7 +736,7 @@ impl Broker {
                     "--state".into(),
                     "open".into(),
                     "--json".into(),
-                    "number,url,state,headRefName".into(),
+                    "number,url,state,headRefName,isDraft".into(),
                 ],
             },
             cwd,
@@ -771,6 +795,7 @@ fn parse_pull_request_list(stdout: &str, branch: &str) -> Option<SessionPullRequ
             state: pr["state"].as_str().unwrap_or_default().to_string(),
             created: false,
             ci_skips_drafts: false,
+            draft: pr["isDraft"].as_bool().unwrap_or(false),
         })
     })
 }

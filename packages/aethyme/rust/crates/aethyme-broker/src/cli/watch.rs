@@ -67,9 +67,12 @@ pub(super) fn render_pr_check_report(
 }
 
 pub(super) fn run_pull_request_watch(parsed: Parsed) -> Result<(), UsageError> {
+    if parsed.positional.first().map(String::as_str) == Some("repo") {
+        return run_repository_watch(parsed);
+    }
     if parsed.positional.first().map(String::as_str) != Some("pr") {
         return Err(UsageError::Message(
-            "watch requires `pr` followed by start, list, show, poll, tick, batches, ack, pause, resume, or stop"
+            "watch requires `pr` or `repo` followed by an action, e.g. `watch pr start` or `watch repo start`"
                 .into(),
         ));
     }
@@ -209,14 +212,39 @@ pub(super) fn run_pull_request_watch(parsed: Parsed) -> Result<(), UsageError> {
                 .limit
                 .map(|limit| limit as usize)
                 .unwrap_or(crate::DEFAULT_PR_SCHEDULER_LIMIT);
+            let now = now_ms();
             let report = broker.tick_pull_request_watches(
                 &crate::GithubCliPullRequestWatchProvider,
-                now_ms(),
+                now,
+                limit,
+            )?;
+            // Repository watches share the tick, so the one host scheduler that
+            // already runs `watch pr tick` covers them too (#606).
+            let repository = broker.tick_repository_watches(
+                &crate::GithubCliRepositoryWatchProvider,
+                &crate::GithubCliPullRequestWatchProvider,
+                now,
                 limit,
             )?;
             if parsed.json {
-                out!("{}", serde_json::to_string_pretty(&report)?);
+                let mut value = serde_json::to_value(&report)?;
+                if let Some(object) = value.as_object_mut() {
+                    object.insert(
+                        "repository_watches".into(),
+                        serde_json::to_value(&repository)?,
+                    );
+                }
+                out!("{}", serde_json::to_string_pretty(&value)?);
             } else {
+                if repository.due_watch_count > 0 {
+                    out!(
+                        "Repository watch tick: {} due, {} polled, {} failed, {} new event(s).",
+                        repository.due_watch_count,
+                        repository.polled_watch_count,
+                        repository.failed_watch_count,
+                        repository.event_count,
+                    );
+                }
                 out!(
                     "PR scheduler tick: {} due, {} polled, {} failed, {} deferred.",
                     report.due_watch_count,
@@ -327,7 +355,13 @@ pub(super) fn run_deliveries(parsed: Parsed) -> Result<(), UsageError> {
             })?;
             let seconds = parsed.seconds.unwrap_or(120);
             let claim = broker.claim_next_delivery(adapter, worker, seconds, now_ms())?;
-            let Some(envelope) = claim.delivery else {
+            let claimed = match claim.delivery {
+                Some(envelope) => Some(ClaimedDelivery::from_pull_request(envelope)),
+                None => broker
+                    .claim_next_repository_delivery(adapter, worker, seconds, now_ms())?
+                    .map(ClaimedDelivery::from_repository),
+            };
+            let Some(envelope) = claimed else {
                 mark_idle_delivery_poll();
                 if parsed.json {
                     out!("{}", serde_json::json!({"claimed": false}));
@@ -336,7 +370,7 @@ pub(super) fn run_deliveries(parsed: Parsed) -> Result<(), UsageError> {
                 }
                 return Ok(());
             };
-            let session = broker.store().session(envelope.watch.session_id)?;
+            let session = broker.store().session(envelope.session_id)?;
             let raw = match parsed.tabs_file.as_deref() {
                 Some(path) => std::fs::read_to_string(path).map_err(|error| {
                     UsageError::Message(format!("cannot read {}: {error}", path.display()))
@@ -380,39 +414,39 @@ pub(super) fn run_deliveries(parsed: Parsed) -> Result<(), UsageError> {
             // whether the transport actually landed.
             match &action {
                 crate::Chau7DispatchAction::Defer { why, .. } => {
-                    broker.complete_delivery(
-                        envelope.item.id,
+                    complete_any_delivery(
+                        &mut broker,
+                        envelope.id,
                         worker,
-                        envelope.item.generation,
+                        envelope.generation,
                         crate::DeliveryCompletion::Retry,
                         Some("tab_not_ready"),
-                        now_ms(),
                     )?;
                     if !parsed.json {
-                        out!("deferred delivery {}: {why}", envelope.item.id);
+                        out!("deferred delivery {}: {why}", envelope.id);
                     }
                 }
                 crate::Chau7DispatchAction::Abandon { why } => {
-                    broker.complete_delivery(
-                        envelope.item.id,
+                    complete_any_delivery(
+                        &mut broker,
+                        envelope.id,
                         worker,
-                        envelope.item.generation,
+                        envelope.generation,
                         crate::DeliveryCompletion::Failed,
                         Some("tab_unresolvable"),
-                        now_ms(),
                     )?;
                     if !parsed.json {
-                        out!("abandoned delivery {}: {why}", envelope.item.id);
+                        out!("abandoned delivery {}: {why}", envelope.id);
                     }
                 }
                 crate::Chau7DispatchAction::Send { tab_id, .. } => {
                     if !parsed.json {
-                        out!("send delivery {} to {tab_id}", envelope.item.id);
+                        out!("send delivery {} to {tab_id}", envelope.id);
                         out!(
                             "  complete with: aethyme broker advanced deliveries complete --id {} --worker {} --generation {} --outcome delivered",
-                            envelope.item.id,
+                            envelope.id,
                             crate::broker::shell_quote(worker),
-                            envelope.item.generation
+                            envelope.generation
                         );
                     }
                 }
@@ -422,9 +456,10 @@ pub(super) fn run_deliveries(parsed: Parsed) -> Result<(), UsageError> {
                     "{}",
                     serde_json::to_string_pretty(&serde_json::json!({
                         "claimed": true,
-                        "delivery_id": envelope.item.id,
-                        "generation": envelope.item.generation,
-                        "session_id": envelope.watch.session_id,
+                        "delivery_id": envelope.id,
+                        "generation": envelope.generation,
+                        "session_id": envelope.session_id,
+                        "source": envelope.source,
                         "action": action,
                     }))?
                 );
@@ -491,15 +526,53 @@ pub(super) fn run_deliveries(parsed: Parsed) -> Result<(), UsageError> {
             }
         }
         "subscribe" => {
-            let watch_id = parsed.watch_id.ok_or_else(|| {
-                UsageError::Message("deliveries subscribe requires --watch <id>".into())
-            })?;
             let adapter = parsed.adapter.as_deref().ok_or_else(|| {
                 UsageError::Message("deliveries subscribe requires --adapter <name>".into())
             })?;
             let target = parsed.target.as_deref().ok_or_else(|| {
                 UsageError::Message("deliveries subscribe requires --target <opaque-id>".into())
             })?;
+            if let Some(repo_watch_id) = parsed.repo_watch_id {
+                if parsed.watch_id.is_some() {
+                    return Err(UsageError::Message(
+                        "deliveries subscribe takes --watch <pr-watch-id> or --repo-watch <repo-watch-id>, not both".into(),
+                    ));
+                }
+                let policy = crate::RepositoryDeliveryPolicy::parse(
+                    parsed.policy.as_deref().unwrap_or("review"),
+                )
+                .map_err(UsageError::Message)?;
+                let subscription = broker.subscribe_repository_delivery(
+                    repo_watch_id,
+                    adapter,
+                    target,
+                    policy,
+                    now_ms(),
+                )?;
+                if parsed.json {
+                    out!("{}", serde_json::to_string_pretty(&subscription)?);
+                } else {
+                    out!(
+                        "Repository delivery subscription {}: repository watch {}, adapter {}, target {}, policy {}.",
+                        subscription.id,
+                        subscription.repository_watch_id,
+                        subscription.adapter,
+                        subscription.target,
+                        subscription.policy.as_str(),
+                    );
+                }
+                return Ok(());
+            }
+            let watch_id = parsed.watch_id.ok_or_else(|| {
+                UsageError::Message(
+                    "deliveries subscribe requires --watch <pr-watch-id> or --repo-watch <repo-watch-id>".into(),
+                )
+            })?;
+            if parsed.policy.as_deref() == Some("review") {
+                return Err(UsageError::Message(
+                    "--policy review applies to repository watches; use --repo-watch <id>, or review-and-push for a PR watch".into(),
+                ));
+            }
             let policy = parse_delivery_policy(parsed.policy.as_deref())?;
             let subscription = broker.subscribe_pull_request_delivery(
                 watch_id,
@@ -523,9 +596,20 @@ pub(super) fn run_deliveries(parsed: Parsed) -> Result<(), UsageError> {
         }
         "list" => {
             let items = broker.delivery_outbox(parsed.adapter.as_deref(), parsed.all)?;
+            let repository_items =
+                broker.repository_delivery_outbox(parsed.adapter.as_deref(), parsed.all)?;
             if parsed.json {
-                out!("{}", serde_json::to_string_pretty(&items)?);
-            } else if items.is_empty() {
+                // One array: pull-request items carry `batch_id`, repository
+                // items carry `source: "repository"` and `event_id`.
+                let mut values = Vec::with_capacity(items.len() + repository_items.len());
+                for item in &items {
+                    values.push(serde_json::to_value(item)?);
+                }
+                for item in &repository_items {
+                    values.push(serde_json::to_value(item)?);
+                }
+                out!("{}", serde_json::to_string_pretty(&values)?);
+            } else if items.is_empty() && repository_items.is_empty() {
                 out!("No delivery outbox items.");
             } else {
                 for item in items {
@@ -533,6 +617,17 @@ pub(super) fn run_deliveries(parsed: Parsed) -> Result<(), UsageError> {
                         "Delivery {}: batch {}, subscription {}, {}, generation {}, attempts {}",
                         item.id,
                         item.batch_id,
+                        item.subscription_id,
+                        item.status.as_str(),
+                        item.generation,
+                        item.attempt_count,
+                    );
+                }
+                for item in repository_items {
+                    out!(
+                        "Delivery {}: repository event {}, subscription {}, {}, generation {}, attempts {}",
+                        item.id,
+                        item.event_id,
                         item.subscription_id,
                         item.status.as_str(),
                         item.generation,
@@ -557,6 +652,34 @@ pub(super) fn run_deliveries(parsed: Parsed) -> Result<(), UsageError> {
                 now_ms(),
             )?;
             if report.delivery.is_none() {
+                let repository = broker.claim_next_repository_delivery(
+                    adapter,
+                    worker,
+                    parsed
+                        .seconds
+                        .unwrap_or(crate::DEFAULT_DELIVERY_CLAIM_SECONDS),
+                    now_ms(),
+                )?;
+                if let Some(delivery) = repository {
+                    if parsed.json {
+                        out!(
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({
+                                "schema_version": report.schema_version,
+                                "claimed": true,
+                                "delivery": delivery,
+                            }))?
+                        );
+                    } else {
+                        out!(
+                            "Claimed delivery {} generation {} for {}. Use --json to read its structured envelope and prompt.",
+                            delivery.item.id,
+                            delivery.item.generation,
+                            delivery.subscription.target,
+                        );
+                    }
+                    return Ok(());
+                }
                 mark_idle_delivery_poll();
             }
             if parsed.json {
@@ -592,6 +715,22 @@ pub(super) fn run_deliveries(parsed: Parsed) -> Result<(), UsageError> {
                     ));
                 }
             };
+            if crate::is_repository_delivery_id(id) {
+                let item = broker.complete_repository_delivery(
+                    id,
+                    worker,
+                    generation,
+                    completion,
+                    parsed.error_code.as_deref(),
+                    now_ms(),
+                )?;
+                if parsed.json {
+                    out!("{}", serde_json::to_string_pretty(&item)?);
+                } else {
+                    out!("Delivery {} is {}.", item.id, item.status.as_str());
+                }
+                return Ok(());
+            }
             let item = broker.complete_delivery(
                 id,
                 worker,
@@ -611,6 +750,191 @@ pub(super) fn run_deliveries(parsed: Parsed) -> Result<(), UsageError> {
                 "unknown deliveries action {other:?} — expected subscribe, list, claim, or complete"
             )));
         }
+    }
+    Ok(())
+}
+
+/// A claimed delivery from either outbox, reduced to what dispatch needs.
+struct ClaimedDelivery {
+    id: i64,
+    generation: i64,
+    session_id: i64,
+    source: &'static str,
+    prompt: String,
+}
+
+impl ClaimedDelivery {
+    fn from_pull_request(envelope: crate::DeliveryEnvelope) -> Self {
+        Self {
+            id: envelope.item.id,
+            generation: envelope.item.generation,
+            session_id: envelope.watch.session_id,
+            source: "pull_request",
+            prompt: envelope.prompt,
+        }
+    }
+
+    fn from_repository(envelope: crate::RepositoryDeliveryEnvelope) -> Self {
+        Self {
+            id: envelope.item.id,
+            generation: envelope.item.generation,
+            session_id: envelope.watch.session_id,
+            source: "repository",
+            prompt: envelope.prompt,
+        }
+    }
+}
+
+fn complete_any_delivery(
+    broker: &mut crate::Broker,
+    id: i64,
+    worker: &str,
+    generation: i64,
+    completion: crate::DeliveryCompletion,
+    error_code: Option<&str>,
+) -> Result<(), UsageError> {
+    if crate::is_repository_delivery_id(id) {
+        broker.complete_repository_delivery(
+            id,
+            worker,
+            generation,
+            completion,
+            error_code,
+            now_ms(),
+        )?;
+    } else {
+        broker.complete_delivery(id, worker, generation, completion, error_code, now_ms())?;
+    }
+    Ok(())
+}
+
+/// `broker watch repo`: repository-wide pull request watches (#606).
+fn run_repository_watch(parsed: Parsed) -> Result<(), UsageError> {
+    let action = parsed
+        .positional
+        .get(1)
+        .map(String::as_str)
+        .ok_or_else(|| {
+            UsageError::Message(
+                "watch repo requires start, list, show, events, pause, resume, or stop".into(),
+            )
+        })?;
+    let mut broker = open_broker(parsed.read_only_snapshot)?;
+    let require_id = |action: &str| {
+        parsed.note_id.ok_or_else(|| {
+            UsageError::Message(format!("watch repo {action} requires --id <repo-watch-id>"))
+        })
+    };
+    match action {
+        "start" => {
+            let session = parsed.session.ok_or_else(|| {
+                UsageError::Message("watch repo start requires --session <id>".into())
+            })?;
+            let repository = parsed.repository.as_deref().ok_or_else(|| {
+                UsageError::Message("watch repo start requires --repo <owner/name>".into())
+            })?;
+            let mut options = crate::RepositoryWatchOptions {
+                include_drafts: parsed.include_drafts,
+                include_existing: parsed.include_existing,
+                auto_watch: parsed.auto_watch,
+                poll_interval_seconds: parsed
+                    .seconds
+                    .unwrap_or(crate::DEFAULT_PR_WATCH_INTERVAL_SECONDS),
+                ..Default::default()
+            };
+            if let Some(events) = parsed.events.as_deref() {
+                options.event_kinds = events
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|item| !item.is_empty())
+                    .map(crate::RepositoryEventKind::parse)
+                    .collect::<Result<_, _>>()
+                    .map_err(UsageError::Message)?;
+            }
+            if let Some(authors) = parsed.exclude_authors.as_deref() {
+                options.exclude_authors = authors
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|item| !item.is_empty())
+                    .map(str::to_string)
+                    .collect();
+            }
+            let watch = broker.start_repository_watch(
+                session,
+                repository,
+                &options,
+                &crate::GithubCliRepositoryWatchProvider,
+                now_ms(),
+            )?;
+            render_repository_watch(&watch, parsed.json)?;
+        }
+        "list" => {
+            let watches = broker.repository_watches(parsed.all)?;
+            if parsed.json {
+                out!("{}", serde_json::to_string_pretty(&watches)?);
+            } else if watches.is_empty() {
+                out!("No repository watches.");
+            } else {
+                for watch in watches {
+                    render_repository_watch(&watch, false)?;
+                }
+            }
+        }
+        "show" => {
+            let watch = broker.repository_watch(require_id("show")?)?;
+            render_repository_watch(&watch, parsed.json)?;
+        }
+        "events" => {
+            let events = broker.repository_watch_events(require_id("events")?)?;
+            if parsed.json {
+                out!("{}", serde_json::to_string_pretty(&events)?);
+            } else if events.is_empty() {
+                out!("No repository watch events.");
+            } else {
+                for event in events {
+                    out!(
+                        "Event {}: PR #{} {} at {}",
+                        event.id,
+                        event.pr_number,
+                        event.kind.as_str(),
+                        short_commit(&event.head_sha),
+                    );
+                }
+            }
+        }
+        "pause" | "resume" | "stop" => {
+            let id = require_id(action)?;
+            let status = match action {
+                "pause" => crate::RepositoryWatchStatus::Paused,
+                "resume" => crate::RepositoryWatchStatus::Active,
+                _ => crate::RepositoryWatchStatus::Stopped,
+            };
+            let watch = broker.set_repository_watch_status(id, status, now_ms())?;
+            render_repository_watch(&watch, parsed.json)?;
+        }
+        other => {
+            return Err(UsageError::Message(format!(
+                "unknown watch repo action {other:?} — expected start, list, show, events, pause, resume, or stop"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn render_repository_watch(watch: &crate::RepositoryWatch, json: bool) -> Result<(), UsageError> {
+    if json {
+        out!("{}", serde_json::to_string_pretty(watch)?);
+    } else {
+        out!(
+            "Repository watch {}: {} {} (session {}, every {}s{}{})",
+            watch.id,
+            watch.display_repository,
+            watch.status.as_str(),
+            watch.session_id,
+            watch.poll_interval_seconds,
+            if watch.include_drafts { ", drafts" } else { "" },
+            if watch.auto_watch { ", auto-watch" } else { "" },
+        );
     }
     Ok(())
 }
