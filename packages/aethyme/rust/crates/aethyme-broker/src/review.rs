@@ -54,7 +54,18 @@ pub struct ReviewPolicy {
     pub unlock_adapter: ValidationUnlockAdapter,
     pub unlock_label: String,
     pub workflow: Option<String>,
+    /// Run one review for the session's open, non-draft pull request right
+    /// after `broker push` publishes it (classification, projection and rule
+    /// actions), instead of waiting for a `review tick`. Off by default.
+    pub run_on_push: bool,
+    /// Wall-clock budget the push waits for that review run. A run past it is
+    /// reported and keeps going in the background, never killed mid-write;
+    /// the push itself still succeeds.
+    pub run_on_push_budget_secs: u64,
 }
+
+/// Default budget for the review run `run_on_push` starts.
+pub const DEFAULT_RUN_ON_PUSH_BUDGET_SECS: u64 = 60;
 
 impl Default for ReviewPolicy {
     fn default() -> Self {
@@ -69,6 +80,8 @@ impl Default for ReviewPolicy {
             unlock_adapter: ValidationUnlockAdapter::GithubLabel,
             unlock_label: "aethyme-validation-ready".into(),
             workflow: None,
+            run_on_push: false,
+            run_on_push_budget_secs: DEFAULT_RUN_ON_PUSH_BUDGET_SECS,
         }
     }
 }
@@ -137,6 +150,14 @@ impl ReviewPolicy {
                 reason: format!(
                     "unsupported review policy schema {}; expected {}",
                     self.schema_version, REVIEW_POLICY_SCHEMA_VERSION
+                ),
+            });
+        }
+        if !(1..=600).contains(&self.run_on_push_budget_secs) {
+            return Err(BrokerOpError::ReviewLifecycle {
+                reason: format!(
+                    "review.run_on_push_budget_secs must be between 1 and 600, got {}",
+                    self.run_on_push_budget_secs
                 ),
             });
         }

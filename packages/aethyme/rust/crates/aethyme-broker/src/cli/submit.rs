@@ -860,7 +860,7 @@ pub(super) fn run_push(parsed: Parsed) -> Result<(), UsageError> {
         .session
         .ok_or(UsageError::Message("push requires --session <id>".into()))?;
     let mut broker = open_broker(parsed.read_only_snapshot)?;
-    let report = match broker.push_session(session, parsed.open_pr) {
+    let mut report = match broker.push_session(session, parsed.open_pr) {
         Ok(report) => report,
         Err(crate::BrokerOpError::CoordinatedOperationBlocked { recovery, .. }) => {
             return Err(UsageError::Exit {
@@ -870,6 +870,7 @@ pub(super) fn run_push(parsed: Parsed) -> Result<(), UsageError> {
         }
         Err(error) => return Err(error.into()),
     };
+    report.review_run = review_on_push(broker.main_root(), &report);
     if parsed.json {
         out!("{}", serde_json::to_string_pretty(&report)?);
         return Ok(());
@@ -999,7 +1000,199 @@ pub(super) fn run_push(parsed: Parsed) -> Result<(), UsageError> {
             size.max_changed_lines
         );
     }
+    if let Some(run) = &report.review_run
+        && run["performed"].as_bool() == Some(true)
+    {
+        let actions = run["actions"].as_array().map_or(0, Vec::len);
+        out!(
+            "  Review run on push: {actions} GitHub action(s) for pull request #{}",
+            run["pull_request"]
+        );
+    }
     Ok(())
+}
+
+/// `[review] run_on_push`: run one review for the pushed pull request.
+///
+/// The review is the same `broker advanced review run --from-provider` a tick
+/// performs, started as its own process so a slow provider cannot hold the
+/// push: past `run_on_push_budget_secs` the push returns and the run carries
+/// on in the background, logging to `.aethyme/logs/`. It is never killed,
+/// because a coordinated write cut in half would leave an outcome nobody can
+/// vouch for. Failure is reported, never fatal: the push already happened.
+fn review_on_push(
+    main_root: &std::path::Path,
+    report: &crate::SessionPushReport,
+) -> Option<serde_json::Value> {
+    let program = std::env::var_os("AETHYME_BIN")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::current_exe().ok());
+    review_on_push_with(program, main_root, report)
+}
+
+fn review_on_push_with(
+    program: Option<std::path::PathBuf>,
+    main_root: &std::path::Path,
+    report: &crate::SessionPushReport,
+) -> Option<serde_json::Value> {
+    let policy = match crate::ReviewPolicy::load(main_root) {
+        Ok(policy) if policy.run_on_push => policy,
+        Ok(_) => return None,
+        Err(error) => {
+            return Some(review_on_push_failure(
+                report,
+                None,
+                &format!("cannot read [review]: {error}"),
+            ));
+        }
+    };
+    let Some(pr) = &report.pr else {
+        return Some(serde_json::json!({
+            "performed": false,
+            "skipped": "no open pull request for this branch",
+        }));
+    };
+    if pr.draft {
+        return Some(serde_json::json!({
+            "performed": false,
+            "pull_request": pr.number,
+            "skipped": "the pull request is a draft",
+        }));
+    }
+    let Some(program) = program else {
+        return Some(review_on_push_failure(
+            report,
+            Some(pr.number),
+            "cannot locate the aethyme executable",
+        ));
+    };
+    let logs = main_root.join(".aethyme/logs");
+    let log_path = logs.join(format!("review-on-push-pr{}.log", pr.number));
+    let log = std::fs::create_dir_all(&logs)
+        .and_then(|()| std::fs::File::create(&log_path))
+        .and_then(|file| Ok((file.try_clone()?, file)));
+    let Ok((stdout, stderr)) = log else {
+        return Some(review_on_push_failure(
+            report,
+            Some(pr.number),
+            &format!("cannot write {}", log_path.display()),
+        ));
+    };
+    let child = std::process::Command::new(&program)
+        .args(review_run_args(report, pr.number))
+        .current_dir(main_root)
+        .stdin(std::process::Stdio::null())
+        .stdout(stdout)
+        .stderr(stderr)
+        .spawn();
+    let mut child = match child {
+        Ok(child) => child,
+        Err(error) => {
+            return Some(review_on_push_failure(
+                report,
+                Some(pr.number),
+                &format!("cannot start the review run: {error}"),
+            ));
+        }
+    };
+    let deadline =
+        std::time::Instant::now() + std::time::Duration::from_secs(policy.run_on_push_budget_secs);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            Ok(None) => break None,
+            Err(error) => {
+                return Some(review_on_push_failure(
+                    report,
+                    Some(pr.number),
+                    &format!("cannot wait for the review run: {error}"),
+                ));
+            }
+        }
+    };
+    let output = std::fs::read_to_string(&log_path).unwrap_or_default();
+    match status {
+        None => Some(review_on_push_failure(
+            report,
+            Some(pr.number),
+            &format!(
+                "the review run is still going after {}s; it continues in the background, \
+                 logging to {}",
+                policy.run_on_push_budget_secs,
+                log_path.display()
+            ),
+        )),
+        Some(status) if status.success() => {
+            let run = serde_json::from_str::<serde_json::Value>(&output).unwrap_or_default();
+            Some(serde_json::json!({
+                "performed": true,
+                "pull_request": pr.number,
+                "actions": run["performed"].clone(),
+                "rule_comments": run["rule_comments"].clone(),
+                "decisions": run["decisions"].clone(),
+            }))
+        }
+        Some(status) => {
+            let tail: Vec<&str> = output.lines().rev().take(5).collect();
+            let tail: Vec<&str> = tail.into_iter().rev().collect();
+            Some(review_on_push_failure(
+                report,
+                Some(pr.number),
+                &format!("the review run exited with {status}: {}", tail.join(" | ")),
+            ))
+        }
+    }
+}
+
+fn review_run_args(report: &crate::SessionPushReport, pull_request: i64) -> Vec<String> {
+    vec![
+        "broker".into(),
+        "advanced".into(),
+        "review".into(),
+        "run".into(),
+        "--session".into(),
+        report.session_id.to_string(),
+        "--repo".into(),
+        report.repository.clone(),
+        "--pr".into(),
+        pull_request.to_string(),
+        "--from-provider".into(),
+        "--json".into(),
+    ]
+}
+
+/// A failed or unfinished review run on push: printed as a warning with the
+/// exact command to rerun it, and returned for `push --json`.
+fn review_on_push_failure(
+    report: &crate::SessionPushReport,
+    pull_request: Option<i64>,
+    error: &str,
+) -> serde_json::Value {
+    let rerun = pull_request.map(|pr| {
+        let args = review_run_args(report, pr)
+            .iter()
+            .filter(|arg| *arg != "--json")
+            .map(|arg| crate::broker::shell_quote(arg))
+            .collect::<Vec<_>>()
+            .join(" ");
+        format!("aethyme {args}")
+    });
+    eprintln!(
+        "warning: review run on push did not complete: {error}{}",
+        rerun
+            .as_deref()
+            .map(|command| format!(". Rerun: {command}"))
+            .unwrap_or_default()
+    );
+    serde_json::json!({
+        "performed": false,
+        "pull_request": pull_request,
+        "error": error,
+        "rerun": rerun,
+    })
 }
 
 pub(super) fn run_repair(parsed: Parsed) -> Result<(), UsageError> {
@@ -1308,4 +1501,158 @@ pub(super) fn run_promote(parsed: Parsed) -> Result<(), UsageError> {
         out!("Next: aethyme broker advanced ship plan --entry {entry}");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod review_on_push_tests {
+    use super::{review_on_push_with, review_run_args};
+    use std::os::unix::fs::PermissionsExt;
+
+    fn report(draft: bool) -> crate::SessionPushReport {
+        crate::SessionPushReport {
+            session_id: 12,
+            branch: "agent/x".into(),
+            remote: "origin".into(),
+            pushed_oid: "a".repeat(40),
+            previous_remote_oid: None,
+            commits_pushed: 1,
+            uncommitted_files: 0,
+            uncommitted: crate::UncommittedCounts::default(),
+            pr: Some(crate::SessionPullRequest {
+                url: "https://github.com/acme/product/pull/7".into(),
+                number: 7,
+                state: "OPEN".into(),
+                created: false,
+                ci_skips_drafts: false,
+                draft,
+            }),
+            pr_overlaps: Vec::new(),
+            pr_overlaps_unknown: Vec::new(),
+            duplicate_work: Vec::new(),
+            default_branch: None,
+            default_branch_note: None,
+            pr_size: None,
+            review_run: None,
+            repository: "acme/product".into(),
+        }
+    }
+
+    /// A repository with `[review]` set as given, and a stand-in for
+    /// `aethyme` that records its arguments and plays `script`.
+    fn fixture(review: &str, script: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join(".aethyme")).unwrap();
+        std::fs::write(
+            root.path().join(".aethyme/config.toml"),
+            format!("[review]\n{review}\n"),
+        )
+        .unwrap();
+        let program = root.path().join("aethyme-stub");
+        std::fs::write(
+            &program,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"{}\"\n{script}\n",
+                root.path().join("args").display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        (root, program)
+    }
+
+    #[test]
+    fn nothing_runs_unless_run_on_push_is_set() {
+        let (root, program) = fixture("schema_version = 1", "exit 0");
+        assert_eq!(
+            review_on_push_with(Some(program), root.path(), &report(false)),
+            None
+        );
+        assert!(!root.path().join("args").exists());
+    }
+
+    #[test]
+    fn an_open_pull_request_gets_one_review_run_from_the_provider() {
+        let (root, program) = fixture(
+            "run_on_push = true",
+            r#"printf '{"performed":[{"purpose":"post rule comment"}],"rule_comments":[{"decision":"create"}]}'"#,
+        );
+        let run = review_on_push_with(Some(program), root.path(), &report(false)).unwrap();
+        assert_eq!(run["performed"], true, "{run:#}");
+        assert_eq!(run["pull_request"], 7);
+        assert_eq!(run["rule_comments"][0]["decision"], "create");
+        let args = std::fs::read_to_string(root.path().join("args")).unwrap();
+        assert_eq!(
+            args.lines().collect::<Vec<_>>(),
+            review_run_args(&report(false), 7),
+            "the idempotent `review run --from-provider` path, for exactly this PR"
+        );
+    }
+
+    #[test]
+    fn a_draft_or_a_missing_pull_request_is_skipped() {
+        let (root, program) = fixture("run_on_push = true", "exit 0");
+        let run = review_on_push_with(Some(program.clone()), root.path(), &report(true)).unwrap();
+        assert_eq!(run["skipped"], "the pull request is a draft");
+        let mut none = report(false);
+        none.pr = None;
+        let run = review_on_push_with(Some(program), root.path(), &none).unwrap();
+        assert_eq!(run["performed"], false);
+        assert!(!root.path().join("args").exists());
+    }
+
+    #[test]
+    fn a_failed_review_run_is_reported_with_the_command_to_rerun_it() {
+        let (root, program) = fixture("run_on_push = true", "echo 'provider down' >&2\nexit 3");
+        let run = review_on_push_with(Some(program), root.path(), &report(false)).unwrap();
+        assert_eq!(run["performed"], false, "{run:#}");
+        assert!(
+            run["error"].as_str().unwrap().contains("provider down"),
+            "{run:#}"
+        );
+        assert_eq!(
+            run["rerun"],
+            "aethyme broker advanced review run --session 12 --repo acme/product --pr 7 --from-provider"
+        );
+    }
+
+    #[test]
+    fn a_slow_review_run_returns_at_the_budget_and_keeps_running() {
+        let (root, program) = fixture(
+            "run_on_push = true\nrun_on_push_budget_secs = 1",
+            "sleep 3\nprintf '{}'",
+        );
+        let started = std::time::Instant::now();
+        let run = review_on_push_with(Some(program), root.path(), &report(false)).unwrap();
+        assert!(started.elapsed() < std::time::Duration::from_secs(3));
+        assert!(
+            run["error"]
+                .as_str()
+                .unwrap()
+                .contains("continues in the background"),
+            "{run:#}"
+        );
+    }
+
+    #[test]
+    fn an_out_of_range_budget_is_rejected() {
+        let (root, program) = fixture("run_on_push = true\nrun_on_push_budget_secs = 0", "exit 0");
+        let run = review_on_push_with(Some(program), root.path(), &report(false)).unwrap();
+        assert!(
+            run["error"]
+                .as_str()
+                .unwrap()
+                .contains("run_on_push_budget_secs"),
+            "{run:#}"
+        );
+    }
+
+    #[test]
+    fn an_unknown_review_key_is_rejected() {
+        let (root, program) = fixture("run_on_pus = true", "exit 0");
+        let run = review_on_push_with(Some(program), root.path(), &report(false)).unwrap();
+        assert!(
+            run["error"].as_str().unwrap().contains("run_on_pus"),
+            "{run:#}"
+        );
+    }
 }

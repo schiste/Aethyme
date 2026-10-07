@@ -323,6 +323,37 @@ To get agents in a repository to write these trailers, add the instruction to
 because a repository that has not enabled `[review.trigger]` would be asking
 its agents for metadata nothing reads.
 
+## Running a review right after a push
+
+Nothing runs a review on its own: something has to call `review run` or
+`review tick`. A repository whose work is published through `aethyme broker
+push` can have that push do it:
+
+```toml
+[review]
+run_on_push = true             # default false
+run_on_push_budget_secs = 60   # 1..=600
+```
+
+After `broker push --session <id>` publishes a session branch that has an open,
+non-draft pull request (one `--pr` just opened, or one that already exists),
+the broker runs `broker advanced review run --session <id> --repo <owner/name> --pr <n>
+--from-provider` for exactly that pull request: classification, projection,
+and rule actions, through the same coordinated lane and ref guard as a tick.
+Repeating a push with the same content changes nothing, because the projection
+and rule comments edit their own marked comment in place.
+
+The push never fails because of it. A draft or a branch with no open pull
+request is reported as skipped. A run that fails is reported with the exact
+command to rerun it. A run still going at the budget is left to finish in the
+background, never killed, because a coordinated write cut in half would leave
+an outcome nobody can vouch for; its output goes to
+`.aethyme/logs/review-on-push-pr<n>.log`. `push --json` carries what happened
+as `review_run`.
+
+A pull request pushed outside the broker is not reviewed this way; schedule
+`broker advanced review tick` for those.
+
 ## Scheduling, which is a separate question
 
 Eligibility is a pure function of the change. Scheduling is a function of
@@ -662,7 +693,8 @@ Please consider splitting it, or request a review: @codex review
 
 - **Variables are measured values only:** `tier`, `risk`, `files_changed`,
   `lines_added`, `lines_deleted`, `churn`, `signals`, `reasons`, `rule`,
-  `pr_number`, `head_short` and `base`. A template naming anything else, or a
+  `pr_number`, `head` (the full 40-character head SHA the classification
+  read), `head_short` and `base`. A template naming anything else, or a
   rule naming a template that does not exist, is rejected at load. No text the
   pull request controls (title, body, branch, commit messages) is ever
   interpolated, and values render inert: Markdown is escaped, line breaks

@@ -44,6 +44,7 @@ pub const RULE_COMMENT_VARIABLES: &[&str] = &[
     "reasons",
     "rule",
     "pr_number",
+    "head",
     "head_short",
     "base",
 ];
@@ -184,6 +185,7 @@ fn variable_value(
         "reasons" => change.reasons.join("; "),
         "rule" => rule.to_string(),
         "pr_number" => context.pull_request.to_string(),
+        "head" => context.head.clone(),
         "head_short" => context.head.chars().take(12).collect(),
         "base" => context.base.clone(),
         _ => String::new(),
@@ -566,6 +568,27 @@ mod tests {
         assert!(body.contains("**large**: 1 files, 920 lines @codex review"));
         // `reasons` is rendered inert too.
         assert!(body.contains("pr\\_size"), "{body}");
+    }
+
+    #[test]
+    fn head_renders_the_full_classified_head() {
+        let head = "0123456789abcdef0123456789abcdef01234567";
+        let context = RuleCommentContext {
+            head: head.into(),
+            ..context()
+        };
+        let body = render_rule_comment(
+            "override",
+            "/review-override {{head}} trivial ({{head_short}})",
+            &change(),
+            "trivial",
+            &context,
+        );
+        assert!(
+            body.contains(&format!("/review-override {head} trivial (0123456789ab)")),
+            "{body}"
+        );
+        assert!(template_variables("{{head}}").is_ok());
     }
 
     #[test]
