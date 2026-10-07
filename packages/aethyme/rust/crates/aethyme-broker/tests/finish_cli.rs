@@ -174,9 +174,7 @@ fn finish_reports_a_bounded_git_timeout_before_closing_the_session() {
     let shim = bin.join("git");
     std::fs::write(
         &shim,
-        format!(
-            "#!/bin/sh\nif [ \"$1\" = status ] && [ \"$PWD\" = \"$AETHYME_TEST_SLOW_WORKTREE\" ]; then exec /bin/sleep 5; fi\nexec \"$AETHYME_TEST_REAL_GIT\" \"$@\"\n"
-        ),
+        "#!/bin/sh\nif [ \"$1\" = status ] && [ \"$PWD\" = \"$AETHYME_TEST_SLOW_WORKTREE\" ]; then exec /bin/sleep 5; fi\nexec \"$AETHYME_TEST_REAL_GIT\" \"$@\"\n",
     )
     .unwrap();
     let mut permissions = std::fs::metadata(&shim).unwrap().permissions();
@@ -197,7 +195,10 @@ fn finish_reports_a_bounded_git_timeout_before_closing_the_session() {
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("finish timed out after 1s"), "{stderr}");
-    assert!(stderr.contains("git status"), "{stderr}");
+    assert!(
+        stderr.contains("git ") && stderr.contains("did not finish within"),
+        "{stderr}"
+    );
     assert!(stderr.contains("broker status --json"), "{stderr}");
 
     let store = aethyme_broker::BrokerStore::open_in_repo(tmp.path()).unwrap();
