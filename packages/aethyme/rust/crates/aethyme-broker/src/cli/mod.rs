@@ -420,8 +420,10 @@ Usage:
   aethyme broker gates scope --base <ref> --head <ref> [--json]
       Evaluate the shared path selector for two exact commits using the
       gates.toml committed at head. Read-only; semantic hints stay advisory.
-  aethyme broker gates affected --session <id> [--json]
-      Show which gates the session's diff selects and why.
+  aethyme broker gates affected --session <id> [--json] [--timings]
+      Show which gates the session's diff selects and why, warning on stderr
+      when a phase exceeds its 5-second budget. --json prints the selection
+      array; --json --timings prints an object that adds per-phase timings.
   aethyme broker gates semantic --session <id> [--json]
       Advisory semantic gate-selection report: shows enforced path-triggered
       gates plus caller-edge suggestion status. Never changes what submit,
@@ -1135,6 +1137,8 @@ struct Parsed {
     include_active_gate_cache: bool,
     /// `worktrees --measure`: walk every checkout instead of a budget.
     measure: bool,
+    /// `gates affected --timings`: emit the timing object instead of the array.
+    timings: bool,
     destructive: bool,
     no_wait: bool,
     allow_parallel: bool,
@@ -1259,6 +1263,7 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
         dry_run: false,
         include_active_gate_cache: false,
         measure: false,
+        timings: false,
         destructive: false,
         no_wait: false,
         allow_parallel: false,
@@ -1338,6 +1343,7 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
             "--dry-run" => parsed.dry_run = true,
             "--include-active-gate-cache" => parsed.include_active_gate_cache = true,
             "--measure" => parsed.measure = true,
+            "--timings" => parsed.timings = true,
             "--from-provider" => parsed.from_provider = true,
             "--no-wait" => parsed.no_wait = true,
             "--queue-timeout" => {
