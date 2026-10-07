@@ -5,7 +5,7 @@
 //! state is current; reconciliation only inspects the named local ref.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 
@@ -109,6 +109,9 @@ pub enum IntegrationReconcileUnrecordedDisposition {
     PreserveAndReplay,
     ReplacedByExactUpstreamSha,
     DropBecauseContentEmpty,
+    /// The commit is preserved on a pushed branch or an open pull request,
+    /// so integration may drop it without replay (#464).
+    TrackedElsewhere,
 }
 
 impl IntegrationReconcileUnrecordedDisposition {
@@ -117,6 +120,7 @@ impl IntegrationReconcileUnrecordedDisposition {
             Self::PreserveAndReplay => "preserve_and_replay",
             Self::ReplacedByExactUpstreamSha => "replaced_by_exact_upstream_sha",
             Self::DropBecauseContentEmpty => "drop_because_content_empty",
+            Self::TrackedElsewhere => "tracked_elsewhere",
         }
     }
 }
@@ -128,6 +132,12 @@ struct IntegrationReconcileUnrecordedResolution {
     disposition: IntegrationReconcileUnrecordedDisposition,
     #[serde(default)]
     upstream_commit: Option<String>,
+    /// `tracked_elsewhere`: the pushed branch that preserves the commit.
+    #[serde(default)]
+    tracked_branch: Option<String>,
+    /// `tracked_elsewhere`: the open pull request whose head preserves it.
+    #[serde(default)]
+    pull_request: Option<u64>,
     reason: String,
 }
 
@@ -155,6 +165,10 @@ pub struct IntegrationReconcileUnrecordedResolutionTemplate {
     pub integration_commit: String,
     pub disposition: Option<IntegrationReconcileUnrecordedDisposition>,
     pub upstream_commit: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tracked_branch: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pull_request: Option<u64>,
     pub reason: Option<String>,
 }
 
@@ -206,9 +220,28 @@ pub struct IntegrationReconcileUnrecordedResolutionAudit {
     pub disposition: IntegrationReconcileUnrecordedDisposition,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub upstream_commit: Option<String>,
+    /// Where a `tracked_elsewhere` commit was proven to survive.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tracked_elsewhere: Option<IntegrationReconcileTrackedElsewhere>,
     pub operator: String,
     pub reason: String,
     pub resolution_file: String,
+}
+
+/// Evidence that an unrecorded integration commit survives outside
+/// integration (#464): the remote branch as the remote reported it, the pull
+/// request when one was named, and how the commit is contained there.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct IntegrationReconcileTrackedElsewhere {
+    pub remote: String,
+    pub branch: String,
+    pub remote_commit: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pull_request: Option<u64>,
+    /// `ancestor` when the commit itself is reachable from the branch,
+    /// `patch_id` when a commit with the same patch is.
+    pub containment: &'static str,
+    pub matching_commit: String,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -915,6 +948,8 @@ impl Broker {
 
         let missing_unrecorded = validate_unrecorded_resolutions(
             self.repo_handle(),
+            self.main_root(),
+            &upstream_remote(&options.upstream),
             operator_resolutions.as_ref(),
             &mut report.plan,
             &upstream_head,
@@ -1184,6 +1219,23 @@ impl Broker {
                 IntegrationReconcileUnrecordedDisposition::DropBecauseContentEmpty => {
                     planned.execution_evidence =
                         Some("operator reviewed this commit as content-empty".into());
+                }
+                IntegrationReconcileUnrecordedDisposition::TrackedElsewhere => {
+                    planned.execution_evidence =
+                        resolution.tracked_elsewhere.as_ref().map(|tracked| {
+                            let pull_request = tracked
+                                .pull_request
+                                .map(|number| format!(" (pull request #{number})"))
+                                .unwrap_or_default();
+                            format!(
+                                "preserved on {}/{} at {}{pull_request} by {} {}; not replayed",
+                                tracked.remote,
+                                tracked.branch,
+                                tracked.remote_commit,
+                                tracked.containment,
+                                tracked.matching_commit
+                            )
+                        });
                 }
             }
         }
@@ -1917,6 +1969,8 @@ fn load_operator_resolutions(
 
 fn validate_unrecorded_resolutions(
     repo: &crate::git::GitRepo,
+    main_root: &Path,
+    remote: &str,
     loaded: Option<&LoadedOperatorResolutions>,
     plan: &mut IntegrationReconcilePlan,
     upstream_head: &str,
@@ -1951,6 +2005,21 @@ fn validate_unrecorded_resolutions(
             missing.push(commit.commit.clone());
             continue;
         };
+        let names_tracking =
+            resolution.tracked_branch.is_some() || resolution.pull_request.is_some();
+        if names_tracking
+            && resolution.disposition != IntegrationReconcileUnrecordedDisposition::TrackedElsewhere
+        {
+            return Err(invalid_resolution(
+                &loaded.path,
+                format!(
+                    "unrecorded integration commit {} uses {} and must not name tracked_branch or pull_request",
+                    commit.commit,
+                    resolution.disposition.as_str()
+                ),
+            ));
+        }
+        let mut tracked_elsewhere = None;
         match resolution.disposition {
             IntegrationReconcileUnrecordedDisposition::PreserveAndReplay => {
                 if resolution.upstream_commit.is_some() {
@@ -2006,10 +2075,40 @@ fn validate_unrecorded_resolutions(
                     ));
                 }
             }
+            IntegrationReconcileUnrecordedDisposition::TrackedElsewhere => {
+                if resolution.upstream_commit.is_some() {
+                    return Err(invalid_resolution(
+                        &loaded.path,
+                        format!(
+                            "unrecorded integration commit {} uses tracked_elsewhere and must not name upstream_commit",
+                            commit.commit
+                        ),
+                    ));
+                }
+                let evidence = prove_tracked_elsewhere(
+                    repo,
+                    main_root,
+                    remote,
+                    upstream_head,
+                    commit,
+                    resolution,
+                )
+                .map_err(|reason| {
+                    invalid_resolution(
+                        &loaded.path,
+                        format!(
+                            "unrecorded integration commit {} cannot use tracked_elsewhere: {reason}",
+                            commit.commit
+                        ),
+                    )
+                })?;
+                tracked_elsewhere = Some(evidence);
+            }
         }
         commit.unrecorded_resolution = Some(IntegrationReconcileUnrecordedResolutionAudit {
             disposition: resolution.disposition,
             upstream_commit: resolution.upstream_commit.clone(),
+            tracked_elsewhere,
             operator: loaded.operator.clone(),
             reason: resolution.reason.trim().to_string(),
             resolution_file: loaded.path.clone(),
@@ -2096,6 +2195,8 @@ fn build_resolution_template(
                     integration_commit: resolution.integration_commit.clone(),
                     disposition: Some(resolution.disposition),
                     upstream_commit: resolution.upstream_commit.clone(),
+                    tracked_branch: resolution.tracked_branch.clone(),
+                    pull_request: resolution.pull_request,
                     reason: Some(resolution.reason.trim().to_string()),
                 },
             );
@@ -2109,6 +2210,8 @@ fn build_resolution_template(
                 integration_commit: commit.commit.clone(),
                 disposition: None,
                 upstream_commit: None,
+                tracked_branch: None,
+                pull_request: None,
                 reason: None,
             }
         });
@@ -2148,6 +2251,11 @@ fn build_resolution_template(
                         IntegrationReconcileUnrecordedDisposition::PreserveAndReplay
                         | IntegrationReconcileUnrecordedDisposition::DropBecauseContentEmpty,
                     ) => resolution.upstream_commit.is_none(),
+                    Some(IntegrationReconcileUnrecordedDisposition::TrackedElsewhere) => {
+                        resolution.upstream_commit.is_none()
+                            && (resolution.tracked_branch.is_some()
+                                != resolution.pull_request.is_some())
+                    }
                     None => false,
                 }
         });
@@ -2205,12 +2313,160 @@ fn build_resolution_template(
                     upstream_commit: "forbidden".into(),
                     condition: "allowed only when content_empty evidence is true".into(),
                 },
+                IntegrationReconcileUnrecordedDispositionRule {
+                    value: "tracked_elsewhere".into(),
+                    upstream_commit: "forbidden".into(),
+                    condition: "name exactly one of tracked_branch (a branch pushed to the upstream remote) or pull_request (an open pull request); the commit, or one with the same patch, must be reachable from that branch's remote head, which must be fetched; integration then drops it without replay".into(),
+                },
             ],
         },
         recorded_evidence,
         unrecorded_evidence,
         complete,
     })
+}
+
+/// The remote an upstream ref such as `origin/main` or
+/// `refs/remotes/origin/main` belongs to; `origin` when it names none.
+fn upstream_remote(upstream: &str) -> String {
+    let short = upstream.strip_prefix("refs/remotes/").unwrap_or(upstream);
+    match short.split_once('/') {
+        Some((remote, _)) if !remote.is_empty() => remote.to_string(),
+        _ => "origin".to_string(),
+    }
+}
+
+/// How long one remote read for `tracked_elsewhere` evidence may take.
+const TRACKED_ELSEWHERE_REMOTE_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Prove that an unrecorded integration commit survives outside integration
+/// (#464): on a branch the remote reports right now, or on the head of an
+/// open pull request. The remote head must already be fetched; containment
+/// is the commit's own ancestry or an identical patch on that branch, never a
+/// raw diff. Any doubt is a refusal.
+fn prove_tracked_elsewhere(
+    repo: &crate::git::GitRepo,
+    main_root: &Path,
+    remote: &str,
+    upstream_head: &str,
+    commit: &IntegrationReconcileCommit,
+    resolution: &IntegrationReconcileUnrecordedResolution,
+) -> Result<IntegrationReconcileTrackedElsewhere, String> {
+    let (branch, pull_request, pull_request_head) =
+        match (&resolution.tracked_branch, resolution.pull_request) {
+            (Some(branch), None) => (branch.trim().to_string(), None, None),
+            (None, Some(number)) => {
+                let (branch, head) = open_pull_request_head(main_root, number)?;
+                (branch, Some(number), Some(head))
+            }
+            _ => return Err("name exactly one of tracked_branch or pull_request".into()),
+        };
+    if branch.is_empty()
+        || branch.len() > 255
+        || branch.starts_with('-')
+        || branch.contains("..")
+        || branch
+            .chars()
+            .any(|ch| ch.is_whitespace() || ch.is_control() || "~^:?*[\\".contains(ch))
+    {
+        return Err(format!("{branch:?} is not a branch name"));
+    }
+    let remote_commit = repo
+        .remote_branch_head(remote, &branch, TRACKED_ELSEWHERE_REMOTE_BUDGET)
+        .ok_or_else(|| {
+            format!("could not read refs/heads/{branch} on {remote}; it is not proven pushed")
+        })?;
+    if let Some(head) = pull_request_head
+        && head != remote_commit
+    {
+        return Err(format!(
+            "pull request head {head} differs from {remote}/{branch} at {remote_commit}; fetch and retry"
+        ));
+    }
+    if repo.resolve_ref(&remote_commit).is_none() {
+        return Err(format!(
+            "{remote}/{branch} head {remote_commit} is not in the local object store; run `git fetch {remote}` first"
+        ));
+    }
+    if repo.is_ancestor(&commit.commit, &remote_commit) {
+        return Ok(IntegrationReconcileTrackedElsewhere {
+            remote: remote.to_string(),
+            branch,
+            remote_commit,
+            pull_request,
+            containment: "ancestor",
+            matching_commit: commit.commit.clone(),
+        });
+    }
+    let Some(patch_id) = commit.patch_id.as_deref() else {
+        return Err(format!(
+            "it is not reachable from {remote}/{branch} and has no patch to compare"
+        ));
+    };
+    let base = repo
+        .merge_base(upstream_head, &remote_commit)
+        .map_err(|error| format!("cannot compare with {remote}/{branch}: {error}"))?;
+    let branch_commits = repo
+        .first_parent_commits_between_oldest(&base, &remote_commit)
+        .map_err(|error| format!("cannot list {remote}/{branch}: {error}"))?;
+    let patch_ids = repo
+        .first_parent_patch_ids(&branch_commits)
+        .map_err(|error| format!("cannot read patches on {remote}/{branch}: {error}"))?;
+    let matching_commit = branch_commits
+        .iter()
+        .find(|candidate| patch_ids.get(*candidate).map(String::as_str) == Some(patch_id))
+        .ok_or_else(|| {
+            format!("neither it nor an identical patch is on {remote}/{branch} at {remote_commit}")
+        })?;
+    Ok(IntegrationReconcileTrackedElsewhere {
+        remote: remote.to_string(),
+        branch,
+        remote_commit,
+        pull_request,
+        containment: "patch_id",
+        matching_commit: matching_commit.clone(),
+    })
+}
+
+/// Head branch and commit of an open pull request, read with the trusted gh.
+fn open_pull_request_head(main_root: &Path, number: u64) -> Result<(String, String), String> {
+    let mut command = crate::operations::github_command();
+    command
+        .args([
+            "pr",
+            "view",
+            &number.to_string(),
+            "--json",
+            "state,headRefName,headRefOid",
+        ])
+        .current_dir(main_root)
+        .stdin(std::process::Stdio::null());
+    let output =
+        crate::bounded_output::output_within(&mut command, TRACKED_ELSEWHERE_REMOTE_BUDGET)
+            .map_err(|error| format!("could not run gh pr view {number}: {error}"))?
+            .ok_or_else(|| format!("gh pr view {number} did not answer in time"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "gh pr view {number} failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .map_err(|error| format!("gh pr view {number} returned unreadable JSON: {error}"))?;
+    if value.get("state").and_then(serde_json::Value::as_str) != Some("OPEN") {
+        return Err(format!("pull request #{number} is not open"));
+    }
+    let branch = value
+        .get("headRefName")
+        .and_then(serde_json::Value::as_str)
+        .filter(|branch| !branch.is_empty())
+        .ok_or_else(|| format!("pull request #{number} reports no head branch"))?;
+    let head = value
+        .get("headRefOid")
+        .and_then(serde_json::Value::as_str)
+        .filter(|head| head.len() == 40 && head.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .ok_or_else(|| format!("pull request #{number} reports no head commit"))?;
+    Ok((branch.to_string(), head.to_string()))
 }
 
 fn invalid_resolution(path: &str, reason: String) -> BrokerOpError {
