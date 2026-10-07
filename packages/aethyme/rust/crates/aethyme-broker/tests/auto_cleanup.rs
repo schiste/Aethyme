@@ -381,24 +381,41 @@ fn a_process_in_the_checkout_keeps_it() {
 }
 
 #[test]
-fn a_holding_lease_keeps_the_checkout() {
+fn closing_releases_leases_so_none_can_hold_a_closed_checkout() {
+    // `close` deletes the session's leases in the same transaction, so a
+    // closed checkout never has a holding lease of its own. The lease proof
+    // stays as a guard; this pins the invariant it relies on.
     let fx = fixture();
     let mut broker = Broker::open(&fx.repo).unwrap();
     let (session_id, worktree, _) = merged_closed_session(&fx, &mut broker, false);
     broker.claim_lease(session_id, "feature.txt", None).unwrap();
     broker.close(session_id).unwrap();
+    assert!(
+        broker
+            .store()
+            .session_leases(session_id)
+            .unwrap()
+            .is_empty()
+    );
     let report = run(&mut broker);
-    let leases = broker.store().session_leases(session_id).unwrap();
-    if leases.iter().any(|lease| lease.released_at.is_none()) {
-        assert!(
-            kept_reason(&report, &worktree).contains("lease"),
-            "{report:#?}"
-        );
-        assert!(worktree.exists());
-    } else {
-        // Closing released the lease (#358): nothing holds, so it may go.
-        assert_eq!(report.removed.len(), 1, "{report:#?}");
-    }
+    assert_eq!(report.removed.len(), 1, "{report:#?}");
+    assert!(!worktree.exists());
+}
+
+#[test]
+fn a_live_session_that_adopted_the_closed_checkout_keeps_it() {
+    let fx = fixture();
+    let mut broker = Broker::open(&fx.repo).unwrap();
+    let (_, worktree, _) = merged_closed_session(&fx, &mut broker, true);
+    let adopted = broker.adopt(&worktree, Some("picked up again")).unwrap();
+    let report = run(&mut broker);
+    assert!(report.removed.is_empty(), "{report:#?}");
+    assert!(
+        kept_reason(&report, &worktree)
+            .contains(&format!("session {} is still open", adopted.id)),
+        "{report:#?}"
+    );
+    assert!(worktree.exists());
 }
 
 #[test]
