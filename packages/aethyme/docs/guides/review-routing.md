@@ -1,6 +1,6 @@
 # Review Routing
 
-Last Updated: 2026-09-11
+Last Updated: 2026-10-07
 
 Which reviews a change needs, who performs them, and what the pull request
 says about it. Three independent tables in `.aethyme/config.toml`:
@@ -518,6 +518,120 @@ still in the commit, but a human's `aethyme/skip-review` has no source to
 rederive from -- once written, it *is* the source. Without `reserved`,
 reconciliation would see an unrecognised label under its own prefix and
 helpfully delete the only record of that judgement.
+
+## How large and how risky a change is
+
+The broker measures every change it plans or runs (#584), so a pull request can
+be flagged without anyone declaring anything. `review plan` reports the
+measurement under `change`:
+
+| Field | Meaning |
+| --- | --- |
+| `size` | `files_changed`, `lines_added`, `lines_deleted`, `churn`. Files the **base** commit's `.gitattributes` marks `linguist-generated`, and lockfiles, are left out and listed under `size.excluded`; a change cannot mark its own files generated. Binary files count as files with no lines. |
+| `signals` | Each with the evidence that set it: `sensitive_paths`, `contract_surface` (`clear`, `touched` with the symbols, or `unknown` when no diff text could be scanned), `gate_policy` (`.aethyme/gates.toml`, `.aethyme/config.toml`), `workflows` (`.github/workflows/**`), `migrations`, `dependency_manifest`, `from_fork`, `first_time_contributor`, `authored_by_model`. |
+| `tier` | `trivial`, `normal` or `large`, from the thresholds below. |
+| `computed_risk` | `high` for sensitive paths, a touched contract, gate policy, workflows, migrations or a fork; `low` for dependency manifests, a first-time contributor or a `large` change; otherwise `none`. |
+| `risk`, `risky` | The computed risk raised by a higher `Risk:` declaration -- a declaration never lowers it -- and whether that is `high` or above. |
+| `reasons` | One sentence per conclusion. |
+
+`signals.unknown` lists inputs that could not be determined -- `contract_surface`
+when no diff could be scanned, `generated_attributes` when the base
+`.gitattributes` could not be read (every file then counts). An unknown input
+does not raise the risk label, but it never counts as clear for anything that
+relaxes review.
+
+Thresholds and paths are configuration:
+
+```toml
+[review]
+# The advisory pull-request size (#239): above it a change is `large`, and
+# `aethyme broker push --pr` warns -- it never refuses. Default 30 files, 800 lines.
+pr_size = { max_files = 30, max_changed_lines = 800 }
+
+[review.classification]
+trivial = { max_files = 3, max_changed_lines = 40 }   # the default
+sensitive_paths = ["crates/*/src/auth/**"]           # empty by default
+migration_paths = ["**/migrations/**"]               # the default
+exclude_paths = []                                   # left out of the size
+exclude_lockfiles = true                             # the default
+contract_doc = "packages/aethyme/docs/architecture/cross-process-consumers.md"
+```
+
+**By default this only flags.** With `[review.projection] enabled = true`, the
+pull request gets `aethyme/size:<tier>` and `aethyme/risk:<level>` labels
+(`label_size`, `label_risk`) and one line in the owned comment:
+
+```markdown
+Size **large** (41 files, +1203/−88); risk **high** — signals: workflows, contract_surface
+```
+
+Nothing else follows from the measurement: no review is requested, no bot is
+mentioned and no waiver is written unless a rule says so. Generated agent
+guidance states `pr_size` only when a repository wrote it.
+
+## Acting on the classification
+
+Rules in `[review.trigger]` can condition on the measurement and act on it
+deterministically (#584). Same classification, same configuration, same head:
+same actions, all visible under `rule_actions` in `review plan` before anything
+runs, each naming the rule that caused it.
+
+| Condition | Meaning |
+| --- | --- |
+| `min_tier`, `max_tier` | `trivial`, `normal` or `large`, inclusive. |
+| `min_files`, `max_files`, `min_churn`, `max_churn` | Inclusive bounds on the measured size. |
+| `signals` | Measured signals that must all be set. |
+| `none_of_signals` | Measured signals none of which may be set. |
+
+A rule that states any of these never matches an unmeasured change.
+
+| Action | Effect |
+| --- | --- |
+| `require = [...]` | Review dimensions, routed by `[review.routing]` as before (Chau7, a `provider_comment` mention such as `@codex`, or `record`). |
+| `waive = [...]` | An automatic waiver per named dimension, bound to the head and written through the same ledger record as `review waive`, with a reason naming the rule and the measured values. A new head re-evaluates it. |
+| `labels = [...]` | Extra labels under `label_prefix`, never a `reserved` one. |
+
+A rule needs at least one of `require`, `waive` or `labels`.
+
+```toml
+# Ask the provider's bot to review large changes...
+[[review.trigger.rule]]
+name = "large-code"
+require = ["code"]
+min_tier = "large"
+
+# ...and excuse the code review on trivial ones.
+[[review.trigger.rule]]
+name = "trivial-code"
+waive = ["code"]
+max_tier = "trivial"
+```
+
+**Guardrails the broker enforces, whatever the rules say:**
+
+- No automatic waiver for a change carrying `from_fork`, `first_time_contributor`,
+  `contract_surface`, `gate_policy`, `workflows` or `sensitive_paths`. The
+  waiver is refused with a reason under `rule_actions.refused_waivers`, and a
+  rule that requires one of those signals in `signals` is rejected at load.
+- No automatic waiver when anything in `change.signals.unknown` could not be
+  determined: an unscanned contract, unreadable base attributes, fork and
+  first-time status the provider did not answer, or a file list shorter than
+  the provider's own count. `review plan` is offline and never reads fork or
+  first-time status, so it shows such a waiver as refused; only `review run`
+  writes one.
+- Path signals see every path the change touches, including a rename's source,
+  so moving a file out of `.github/workflows/` still counts as a workflow change.
+- The waiver binds to the head that was classified. `review run` re-reads the
+  head immediately before writing and writes nothing if it moved.
+- Rule terms are revalidated when a waiver is planned, not only at load.
+- Only the dimensions a rule names: no wildcard, which is rejected at load.
+- `require` beats `waive`: a dimension any rule or declaration requires on this
+  change is never waived.
+- A satisfied review is never replaced by a waiver, and a waiver is never
+  written twice for the same head.
+
+An automatic waiver appears on the pull request as the `waived` state in the
+owned comment and the `aethyme/review:waived` label.
 
 ## Trying a policy before switching it on
 

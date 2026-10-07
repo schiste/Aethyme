@@ -113,6 +113,11 @@ pub struct SessionPushReport {
     /// and the comparison used the last fetched copy.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_branch_note: Option<String>,
+    /// With `--pr`: the change measured against `[review] pr_size` (#239).
+    /// Advisory only -- a push is never refused for its size. Omitted without
+    /// `--pr`, or when the change could not be measured.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pr_size: Option<crate::PrSizeReport>,
 }
 
 /// How many paths `broker push` left behind, and a few of them.
@@ -431,6 +436,11 @@ impl Broker {
             Some(&payload),
         )?;
 
+        let pr_size = if open_pr {
+            measure_pr_size(&main_root, &default.tracking_ref, &head)
+        } else {
+            None
+        };
         let duplicate_work = self.duplicate_work_for(&session);
         Ok(SessionPushReport {
             session_id,
@@ -447,6 +457,7 @@ impl Broker {
             duplicate_work,
             default_branch,
             default_branch_note,
+            pr_size,
         })
     }
 
@@ -762,6 +773,33 @@ fn parse_pull_request_list(stdout: &str, branch: &str) -> Option<SessionPullRequ
             ci_skips_drafts: false,
         })
     })
+}
+
+/// Measure a pushed change against `[review] pr_size` (#239).
+///
+/// Best-effort and advisory: an unreadable policy or diff yields `None`, and a
+/// push that already happened is never failed over its size.
+fn measure_pr_size(main_root: &Path, base_ref: &str, head: &str) -> Option<crate::PrSizeReport> {
+    let policy = crate::ChangeClassificationPolicy::load(main_root).ok()?;
+    let output = crate::git::git_command()
+        .current_dir(main_root)
+        .args(["diff", "--numstat", "-z", &format!("{base_ref}...{head}")])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let files = crate::parse_numstat_z(&String::from_utf8_lossy(&output.stdout));
+    let paths: Vec<String> = files.iter().map(|file| file.path.clone()).collect();
+    let classification = crate::classify_change(
+        &policy,
+        &crate::ChangeInputs {
+            generated: crate::linguist_generated_paths(main_root, base_ref, &paths),
+            files,
+            ..Default::default()
+        },
+    );
+    Some(crate::pr_size_report(&policy, &classification))
 }
 
 #[cfg(test)]

@@ -987,6 +987,18 @@ pub(super) fn run_push(parsed: Parsed) -> Result<(), UsageError> {
             report.session_id
         ),
     }
+    if let Some(size) = &report.pr_size
+        && size.over_threshold
+    {
+        out!(
+            "  Warning: this change is large ({} files, {} changed lines; [review] pr_size is {} \
+             files, {} lines). Consider splitting it; the push was not refused.",
+            size.files,
+            size.changed_lines,
+            size.max_files,
+            size.max_changed_lines
+        );
+    }
     Ok(())
 }
 
