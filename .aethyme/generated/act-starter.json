@@ -21,8 +21,8 @@
     ]
   },
   "commands": {
-    "fast_test": "cargo test --manifest-path packages/aethyme/rust/Cargo.toml --workspace",
-    "full_test": null,
+    "fast_test": "packages/aethyme/scripts/test-like-ci.sh",
+    "full_test": "packages/aethyme/scripts/test-like-ci.sh --full",
     "lint": null,
     "build": "cargo build --manifest-path packages/aethyme/rust/Cargo.toml --workspace",
     "dev": null

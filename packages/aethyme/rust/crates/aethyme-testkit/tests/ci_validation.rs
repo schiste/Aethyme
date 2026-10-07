@@ -41,7 +41,7 @@ fn pr_and_main_have_one_automatic_full_workspace_owner() {
     // The workspace suite runs under nextest. `cargo test --workspace
     // --examples` once stood in for it, but a target flag narrows cargo's
     // selection to examples only, so it ran three binaries.
-    assert!(rust.contains(&"        run: cargo nextest run --locked --workspace --profile ci"));
+    assert!(rust.contains(&"        run: ../scripts/test-like-ci.sh --full"));
     // nextest runs neither example targets nor doctests, and the
     // release-manifest assertions in
     // `crates/aethyme-broker/examples/release_manifest.rs` live in an example.
@@ -163,7 +163,7 @@ fn main_skips_only_the_gates_a_pr_run_tested_on_the_same_tree() {
 fn macos_nightly_runs_the_whole_workspace_suite() {
     let nightly = workflow("macos-nightly.yml");
     let job = block(&nightly, "  rust-tests-macos-full:");
-    assert!(job.contains(&"        run: cargo nextest run --locked --workspace --profile ci"));
+    assert!(job.contains(&"        run: ../scripts/test-like-ci.sh --full"));
     assert!(job.contains(&"        run: cargo test --locked --workspace --examples"));
     assert!(job.contains(&"        run: cargo test --locked --workspace --doc"));
     assert!(job.contains(&"        run: cargo build --locked --workspace --bins"));
@@ -283,4 +283,39 @@ fn workflow_only_changes_run_this_contract() {
         .unwrap();
     assert!(gate.contains("--test ci_validation"));
     assert!(gate.contains("triggers = [\".github/workflows/**\"]"));
+}
+
+/// CI and a workstation run the workspace suite through one command
+/// (#598). A workflow that calls `cargo nextest run` directly, or a script
+/// that stops using the CI profile or starts allowing serial runs, would let
+/// the two drift apart again.
+#[test]
+fn ci_and_local_runs_share_one_test_command() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(5)
+        .unwrap();
+    for entry in std::fs::read_dir(root.join(".github/workflows")).unwrap() {
+        let path = entry.unwrap().path();
+        let text = std::fs::read_to_string(&path).unwrap();
+        for line in text
+            .lines()
+            .filter(|line| !line.trim_start().starts_with('#'))
+        {
+            assert!(
+                !line.contains("cargo nextest run --locked --workspace --profile"),
+                "{} runs nextest directly instead of test-like-ci.sh: {line}",
+                path.display()
+            );
+        }
+    }
+    let script =
+        std::fs::read_to_string(root.join("packages/aethyme/scripts/test-like-ci.sh")).unwrap();
+    assert!(script.contains("cargo nextest run --locked --workspace --profile ci"));
+    assert!(script.contains("AETHYME_TESTKIT_PREBUILT_BINS=1"));
+    assert!(script.contains("--test-threads=1|--nocapture|--no-capture|-j1"));
+    let nextest =
+        std::fs::read_to_string(root.join("packages/aethyme/rust/.config/nextest.toml")).unwrap();
+    assert!(nextest.contains("[profile.ci]"));
+    assert!(nextest.contains("[profile.ci.junit]"));
 }

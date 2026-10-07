@@ -40,6 +40,14 @@ fn aethyme(cwd: &Path, args: &[&str]) -> Output {
         // is whatever agent runtime launched the suite (a live `claude`
         // locally, none in CI), and lease liveness changes the JSON shape.
         .env("AETHYME_AGENT_PID", std::process::id().to_string())
+        // Pin the host-state directory too. Left to the host, a Linux runner
+        // has none and `start` reports `worktree_placement.fallback_reason`,
+        // while a workstation has one and does not, so the shape depended on
+        // where the suite ran (#598).
+        .env(
+            "AETHYME_HOST_STATE_DIR",
+            std::env::temp_dir().join(format!("aethyme-json-shapes-{}", std::process::id())),
+        )
         .env(
             "AETHYME_CHAU7_MCP_BRIDGE",
             "/__aethyme_test_no_chau7_bridge__",

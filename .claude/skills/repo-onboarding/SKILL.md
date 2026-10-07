@@ -26,19 +26,23 @@ description: Use when starting work in an unfamiliar repository, when the task a
 
 ## Start Here
 
-- `fast_test`: `cargo test --manifest-path packages/aethyme/rust/Cargo.toml --workspace`
+- `install`: `python -m pip install -e packages/aethyme-eval`
+- `fast_test`: `packages/aethyme/scripts/test-like-ci.sh`
+- `full_test`: `packages/aethyme/scripts/test-like-ci.sh --full`
 - `build`: `cargo build --manifest-path packages/aethyme/rust/Cargo.toml --workspace`
 
 ## Supporting Commands
 
-- `python -m pip install -e packages/aethyme-eval` (install; medium confidence from `packages/aethyme-eval/pyproject.toml`)
-  Workspace: `packages/aethyme-eval`
-- `cargo test --manifest-path packages/aethyme/rust/Cargo.toml --workspace` (fast_test; high confidence from `packages/aethyme/rust/Cargo.toml`)
+- `packages/aethyme/scripts/test-like-ci.sh` (fast_test; high confidence from `manual-override`)
   Workspace: `packages/aethyme/rust`
-- `python -m pytest packages/aethyme-eval` (fast_test; medium confidence from `packages/aethyme-eval/pyproject.toml`)
-  Workspace: `packages/aethyme-eval`
-- `cargo build --manifest-path packages/aethyme/rust/Cargo.toml --workspace` (build; high confidence from `packages/aethyme/rust/Cargo.toml`)
+- `packages/aethyme/scripts/test-like-ci.sh --full` (full_test; high confidence from `manual-override`)
   Workspace: `packages/aethyme/rust`
+- `cargo build --manifest-path packages/aethyme/rust/Cargo.toml --workspace` (build; high confidence from `manual-override`)
+  Workspace: `packages/aethyme/rust`
+- `python -m pip install -e packages/aethyme-eval` (install; medium confidence from `manual-override`)
+  Workspace: `packages/aethyme-eval`
+- `python -m pytest packages/aethyme-eval` (test; medium confidence from `manual-override`)
+  Workspace: `packages/aethyme-eval`
 
 ## Entrypoints
 
@@ -81,6 +85,7 @@ description: Use when starting work in an unfamiliar repository, when the task a
 
 ## Maintainer Notes
 
+- Validate a change with `packages/aethyme/scripts/test-like-ci.sh`: it runs the tests your diff affects exactly as CI does (nextest `--profile ci`, parallel, one retry, CI environment) and prints the slowest tests. CI runs the whole workspace on every pull request, so push and let it. Never run the suite with `--test-threads=1` or `--no-capture`: serially it took two hours on 2026-10-07 against eight minutes in CI. Re-run one failing test by name instead.
 - `packages/aethyme` is 100% Rust. `python -m src.cli` was removed with no shim and fails with `No module named src`; run `aethyme <same thing>` instead. The only Python left is `packages/aethyme-eval`, which is Python by design. Do not add Python build files under `packages/aethyme` (the `Makefile` and `package.json` there were Python-era residue, removed 2026-09-29).
 - Gate selection is by path trigger, and a trigger that outlives the paths it names silently disables its gate while the entry still auto-promotes. Four instances have already shipped here. `gate_policy.rs` fails on the config-only path, so a new package, manifest, or workflow directory needs its trigger added in the same change.
 - `.aethyme/gates.toml` and `.aethyme/config.toml` are security-sensitive paths in `.aethyme/config.toml`'s own review rules. Narrowing a `triggers` glob disables a gate for a whole class of change and reads exactly like a tidy-up.
@@ -88,11 +93,10 @@ description: Use when starting work in an unfamiliar repository, when the task a
 - Gate commands that touch a test database or any external namespace must suffix it with `$AETHYME_TEST_DB_SUFFIX` (and `$AETHYME_GATE_WORKER_ID` where relevant). Fixed shared names are unsafe under broker load.
 - Graph authority is `disabled` in `.aethyme/config.toml`, which is the intended default: `aethyme graph status` reports that posture as healthy and takes no action. A missing `.aethyme/graph` fragment store is therefore a posture, not a fault. `repo inspect`, `ingest`, and `warm` all read the graph and will fail without one; `aethyme graph refresh` materializes a local store and `aethyme deploy --repo . --with-graph` enrolls one.
 - A gate failing with `resource_contention`, or a test failing only under concurrent load, is a host-capacity signal rather than a product defect. Re-run the single failing test in isolation before changing code; a `quick_test` or `gate_doctor` failure that passes alone has told you about the machine, not the change.
-- `rust-toolchain.toml` pins the channel for local builds, gates, and CI. The pin is enforced by rustup's toolchain-file override, which wins over the `toolchain: stable` that `dtolnay/rust-toolchain` installs, so `rustc --version` inside the checkout is the pinned version even though a newer stable may be installed. Targets and components passed to that action land on `stable`, not the pinned toolchain, which is why the matrix workflows re-run `rustup target add`.
 
 ## Freshness
 
-- Source digest: `5587730c25681c3153333afbdca2df2ca4379bdc4d8d116cdf7fede710afad78`
-- Tracked source files: `967`
+- Source digest: `ee4b92000370bd25fe3d88744d248a7c8377bab48602196b9a2b49ae18687919`
+- Tracked source files: `983`
 - Overrides applied: `True`
 - Sections generated: `repo, workspaces, primary_workspace, commands, areas, entrypoints, caution_zones, generated_paths, dangerous_paths, navigation_recipes, summon, freshness`
