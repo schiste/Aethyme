@@ -2721,6 +2721,62 @@ pub struct StatusAdvice {
 /// ancestry test (plus a count when it fails), so it runs on every status;
 /// the patch-level classification is added only when a refreshed status has
 /// already computed it.
+/// The `status` row summarizing the last unattended auto-cleanup pass (#588):
+/// what it removed with which proof, and how many closed checkouts it kept.
+/// Omitted until a pass has run or when it found nothing to report.
+fn push_auto_cleanup_advice(view: &mut StatusView, report: Option<crate::AutoCleanupReport>) {
+    let Some(report) = report else {
+        return;
+    };
+    if report.removed.is_empty() && report.kept.is_empty() && report.config_error.is_none() {
+        return;
+    }
+    let mut evidence = report
+        .removed
+        .iter()
+        .map(|removed| {
+            format!(
+                "removed {} (sessions {:?}) by {} against {} at {}",
+                removed.worktree,
+                removed.sessions,
+                removed.proof,
+                removed.contained_in,
+                short_commit(&removed.containing_commit)
+            )
+        })
+        .collect::<Vec<_>>();
+    evidence.extend(
+        report
+            .kept
+            .iter()
+            .map(|kept| format!("kept {}: {}", kept.worktree, kept.reason)),
+    );
+    if let Some(error) = &report.config_error {
+        evidence.push(format!(
+            "[cleanup] is invalid, auto-removal is off: {error}"
+        ));
+    }
+    view.advice.push(StatusAdvice {
+        id: "cleanup.auto-removal",
+        severity: if report.config_error.is_some() {
+            StatusAdviceSeverity::Warning
+        } else {
+            StatusAdviceSeverity::Info
+        },
+        reason: "the unattended sweep removes closed checkouts whose work is provably on the remote default branch",
+        summary: format!(
+            "last auto-cleanup removed {} checkout(s), kept {}, deferred {}",
+            report.removed.len(),
+            report.kept.len(),
+            report.deferred
+        ),
+        session_id: None,
+        queue_entry_id: None,
+        evidence,
+        commands: vec!["aethyme broker gc plan --json".into()],
+    });
+}
+
 /// The `status` row for an integration branch this very call advanced (#352):
 /// the action the old `fast-forward-available` notice asked an operator for,
 /// reported as done.
@@ -7540,6 +7596,8 @@ impl Broker {
         let integration = self.integration_head()?;
         let mut view = self.build_status(agents, overlaps, integration, now_ms, true)?;
         push_integration_refresh_advice(&mut view, integration_refresh);
+        let auto_cleanup = self.last_auto_cleanup_report();
+        push_auto_cleanup_advice(&mut view, auto_cleanup);
         self.store.record_advisories_shown(
             &view.outstanding_advisories,
             crate::AdvisoryDeliverySurface::Status,
@@ -7696,6 +7754,8 @@ impl Broker {
         self.grant_stale_lease_requests()?;
         let mut view = self.build_status(agents, overlaps, integration, now_ms, false)?;
         push_integration_refresh_advice(&mut view, integration_refresh);
+        let auto_cleanup = self.last_auto_cleanup_report();
+        push_auto_cleanup_advice(&mut view, auto_cleanup);
         self.store.record_advisories_shown(
             &view.outstanding_advisories,
             crate::AdvisoryDeliverySurface::Status,
@@ -8806,6 +8866,19 @@ impl Broker {
         self.repo_handle()
             .is_ancestor(local_tip, &remote_tip)
             .then_some((remote_ref, remote_tip))
+    }
+
+    /// The fetched remote default branch, as `(ref, tip)`: what auto-cleanup
+    /// proves containment against (#588). Local branches and integration do
+    /// not count -- work only there is not on the remote.
+    pub(crate) fn remote_default_ref_and_tip(&self) -> Option<(String, String)> {
+        let head_ref = self.repo.symbolic_ref("refs/remotes/origin/HEAD")?;
+        let branch = head_ref.strip_prefix("refs/remotes/origin/")?;
+        if branch.is_empty() || branch == "HEAD" {
+            return None;
+        }
+        let tip = self.repo.resolve_ref(&head_ref)?;
+        Some((head_ref, tip))
     }
 
     fn remote_tracking_default_tip(&self) -> Option<String> {

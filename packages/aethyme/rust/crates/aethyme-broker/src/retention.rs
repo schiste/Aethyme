@@ -913,6 +913,11 @@ pub struct GcPlan {
     /// This repository's recovery archives. `None` when it has none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recovery_archive_inventory: Option<RecoveryArchiveInventory>,
+    /// The last unattended auto-cleanup pass: checkouts it removed with their
+    /// proof, and the reason it kept each other candidate (#588). Reporting
+    /// only; not part of the digest. `None` before any pass has run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_cleanup: Option<crate::AutoCleanupReport>,
 }
 
 /// Closed sessions whose checkout is still on disk.

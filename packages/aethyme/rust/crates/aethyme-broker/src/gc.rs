@@ -91,10 +91,12 @@ pub(crate) enum ArtifactSweepScope {
     ClosedSession(i64),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct ArtifactSweepOutcome {
     pub directories_reclaimed: usize,
     pub complete: bool,
+    /// The checkout auto-cleanup pass that ran in this sweep (#588), if any.
+    pub auto_cleanup: Option<crate::AutoCleanupReport>,
 }
 
 /// Result of an explicit `gc sweep`.
@@ -104,6 +106,9 @@ pub struct ArtifactSweepReport {
     pub complete: bool,
     pub budget_ms: u64,
     pub disk_pressured: bool,
+    /// Disposable checkouts removed or kept by this sweep (#588).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auto_cleanup: Option<crate::AutoCleanupReport>,
 }
 
 /// Visit order for one sweep pass: everything after the cursor, then the head
@@ -592,12 +597,12 @@ impl From<GcPlan> for GcJournal {
     }
 }
 
-struct GcLock {
+pub(crate) struct GcLock {
     path: PathBuf,
 }
 
 impl GcLock {
-    fn acquire(main_root: &Path) -> Result<Self, BrokerOpError> {
+    pub(crate) fn acquire(main_root: &Path) -> Result<Self, BrokerOpError> {
         let path = main_root.join(".aethyme/gc.lock");
         for _ in 0..2 {
             match std::fs::OpenOptions::new()
@@ -1894,7 +1899,11 @@ impl Broker {
             budget_verdict,
             recovery_archive_inventory,
             artifact_worktrees_not_scanned,
+            auto_cleanup: None,
         };
+        // Reporting only and outside the digest: what the last unattended
+        // pass removed and why it kept the rest (#588).
+        plan.auto_cleanup = self.last_auto_cleanup_report();
         if scan.measures() {
             plan.finish_digest()?;
         }
@@ -1994,6 +2003,7 @@ impl Broker {
             complete: outcome.complete,
             budget_ms,
             disk_pressured: urgency == crate::disk_headroom::SweepUrgency::Pressured,
+            auto_cleanup: outcome.auto_cleanup,
         })
     }
 
@@ -2112,6 +2122,7 @@ impl Broker {
             return Ok(ArtifactSweepOutcome {
                 directories_reclaimed: 0,
                 complete: true,
+                auto_cleanup: None,
             });
         }
         let closed_session_id = match scope {
@@ -2134,6 +2145,7 @@ impl Broker {
                 return Ok(ArtifactSweepOutcome {
                     directories_reclaimed: 0,
                     complete: true,
+                    auto_cleanup: None,
                 });
             }
         }
@@ -2142,6 +2154,7 @@ impl Broker {
             return Ok(ArtifactSweepOutcome {
                 directories_reclaimed: 0,
                 complete: closed_session_id.is_none(),
+                auto_cleanup: None,
             });
         };
         let live_sessions = self.store().live_sessions()?;
@@ -2405,9 +2418,19 @@ impl Broker {
                 Some(&payload),
             )?;
         }
+        // Whole checkouts go after their caches, under the same lock and
+        // budget, and only on the general sweep: the targeted pass after a
+        // close is about one session's build output (#588). Its failure must
+        // not stop the sweep any more than the sweep's may stop a command.
+        let auto_cleanup = if closed_session_id.is_none() {
+            self.auto_remove_disposable_checkouts(Some(deadline)).ok()
+        } else {
+            None
+        };
         Ok(ArtifactSweepOutcome {
             directories_reclaimed: removed.len(),
             complete: scan_completed,
+            auto_cleanup,
         })
     }
 
