@@ -85,6 +85,8 @@ fn git(root: &Path, args: &[&str]) {
         .arg("-C")
         .arg(root)
         .args(args)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
         .output()
         .unwrap();
     assert!(
@@ -258,7 +260,10 @@ fn every_public_fixer_proposes_and_applies_a_fixture_change() {
         ApplyOutcome::Executed {
             applied, failed, ..
         } => {
-            assert!(failed.is_empty(), "failed patches: {failed:?}");
+            // Button.tsx is proposed by both the selector inserter and the
+            // i18n scaffolder, each from the untouched file. The first patch
+            // applies; the second is reported instead of silently erasing it.
+            assert_eq!(failed, ["src/components/Button.tsx"], "failed patches");
             assert!(!applied.is_empty());
         }
         ApplyOutcome::RequiresApproval { message, patches } => {
@@ -280,5 +285,13 @@ fn every_public_fixer_proposes_and_applies_a_fixture_change() {
     assert_eq!(
         fixture.read("src/api/routes.py"),
         "# formatted route fixture\n"
+    );
+
+    // A second pass finds nothing left to fix where the first one applied.
+    assert!(collect(root, FixSelection::Docs).is_empty());
+    assert!(
+        collect(root, FixSelection::Links)
+            .iter()
+            .all(|proposal| !proposal.file_path.ends_with("README.md"))
     );
 }
