@@ -355,6 +355,9 @@ pub struct CoordinatedOperation {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub host_operation_id: Option<String>,
     pub identity_provenance: OperationIdentityProvenance,
+    /// Local caller/holder details for this operation; absent on legacy rows.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_provenance: Option<serde_json::Value>,
 }
 
 pub const DEFAULT_OPERATION_HISTORY_LIMIT: u32 = 50;

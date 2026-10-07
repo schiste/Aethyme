@@ -217,6 +217,25 @@ pub(super) fn render_operation_show(report: &crate::OperationShowReport) {
         out!("Queue wait:     {waiting}");
     }
     out!("Identity:       {}", operation.identity_provenance.as_str());
+    if let Some(provenance) = &operation.agent_provenance {
+        let program = |key: &str| {
+            provenance
+                .get(key)
+                .and_then(|process| process.get("program"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unidentified")
+                .to_string()
+        };
+        out!(
+            "Provenance:     caller {}, holder {}, agent {}",
+            program("caller"),
+            program("holder"),
+            provenance
+                .get("session_agent_identity")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("-")
+        );
+    }
     out!("Command:        {}", operation.command_json);
     out!(
         "Host operation: {}",
