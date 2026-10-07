@@ -25,7 +25,7 @@ use rusqlite::Connection;
 use crate::error::BrokerError;
 
 /// Current database schema version (== `MIGRATIONS.len()`).
-pub const SCHEMA_VERSION: i64 = 47;
+pub const SCHEMA_VERSION: i64 = 48;
 
 /// The oldest schema version whose binaries can safely use a database at
 /// [`SCHEMA_VERSION`]. Before this existed every newer database locked out
@@ -51,6 +51,9 @@ pub const SCHEMA_VERSION: i64 = 47;
 ///   is refused by the trigger below, so it could never clear it. The
 ///   migration fences already-open v46 writers with that DELETE trigger, and
 ///   records the new floor in the same transaction as the v47 schema marker.
+/// - v48: five new tables for repository-wide pull request watches and their
+///   deliveries (#606). An older binary never names them, so it neither polls
+///   repository watches nor claims their deliveries; nothing existing changes.
 pub const MIN_COMPATIBLE_SCHEMA: i64 = 47;
 
 /// Whether this binary may use a database at `found`, a version newer than
@@ -1523,6 +1526,84 @@ SELECT 'gate_results', MAX(
 )
 WHERE NOT EXISTS (SELECT 1 FROM sqlite_sequence WHERE name = 'gate_results');
 ";
+const MIGRATION_V48: &str = "
+CREATE TABLE repository_watches (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id            INTEGER NOT NULL REFERENCES sessions(id),
+    provider              TEXT NOT NULL CHECK (provider IN ('github')),
+    canonical_repository  TEXT NOT NULL,
+    display_repository    TEXT NOT NULL,
+    status                TEXT NOT NULL CHECK (status IN ('active', 'paused', 'stopped')),
+    event_kinds_json      TEXT NOT NULL,
+    include_drafts        INTEGER NOT NULL CHECK (include_drafts IN (0, 1)),
+    exclude_authors_json  TEXT NOT NULL,
+    auto_watch            INTEGER NOT NULL CHECK (auto_watch IN (0, 1)),
+    poll_interval_seconds INTEGER NOT NULL CHECK (poll_interval_seconds BETWEEN 15 AND 3600),
+    last_polled_at        INTEGER,
+    next_poll_at          INTEGER,
+    last_error_code       TEXT,
+    created_at            INTEGER NOT NULL,
+    updated_at            INTEGER NOT NULL
+);
+
+CREATE INDEX repository_watches_due
+    ON repository_watches (status, next_poll_at, id);
+
+CREATE TABLE repository_watch_pull_requests (
+    watch_id      INTEGER NOT NULL REFERENCES repository_watches(id),
+    pr_number     INTEGER NOT NULL CHECK (pr_number > 0),
+    is_open       INTEGER NOT NULL CHECK (is_open IN (0, 1)),
+    is_draft      INTEGER NOT NULL CHECK (is_draft IN (0, 1)),
+    first_seen_at INTEGER NOT NULL,
+    last_seen_at  INTEGER NOT NULL,
+    PRIMARY KEY (watch_id, pr_number)
+);
+
+CREATE TABLE repository_watch_events (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    watch_id   INTEGER NOT NULL REFERENCES repository_watches(id),
+    pr_number  INTEGER NOT NULL CHECK (pr_number > 0),
+    kind       TEXT NOT NULL CHECK (kind IN ('opened', 'ready_for_review', 'reopened')),
+    title      TEXT NOT NULL,
+    author     TEXT,
+    url        TEXT,
+    head_sha   TEXT NOT NULL,
+    is_draft   INTEGER NOT NULL CHECK (is_draft IN (0, 1)),
+    created_at INTEGER NOT NULL,
+    UNIQUE (watch_id, pr_number, kind)
+);
+
+CREATE TABLE repository_delivery_subscriptions (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    watch_id   INTEGER NOT NULL REFERENCES repository_watches(id),
+    adapter    TEXT NOT NULL,
+    target     TEXT NOT NULL,
+    policy     TEXT NOT NULL CHECK (policy IN ('notify', 'review')),
+    active     INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1)),
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    UNIQUE (watch_id, adapter, target)
+);
+
+CREATE TABLE repository_delivery_outbox (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    subscription_id  INTEGER NOT NULL REFERENCES repository_delivery_subscriptions(id),
+    event_id         INTEGER NOT NULL REFERENCES repository_watch_events(id),
+    status           TEXT NOT NULL CHECK (status IN ('pending', 'claimed', 'delivered', 'failed')),
+    generation       INTEGER NOT NULL DEFAULT 0,
+    claimed_by       TEXT,
+    claim_expires_at INTEGER,
+    attempt_count    INTEGER NOT NULL DEFAULT 0,
+    last_error_code  TEXT,
+    delivered_at     INTEGER,
+    created_at       INTEGER NOT NULL,
+    updated_at       INTEGER NOT NULL,
+    UNIQUE (subscription_id, event_id)
+);
+
+CREATE INDEX repository_delivery_outbox_due
+    ON repository_delivery_outbox (status, claim_expires_at, id);
+";
 const MIGRATIONS: &[&str] = &[
     MIGRATION_V1,
     MIGRATION_V2,
@@ -1571,6 +1652,7 @@ const MIGRATIONS: &[&str] = &[
     MIGRATION_V45,
     MIGRATION_V46,
     MIGRATION_V47,
+    MIGRATION_V48,
 ];
 
 pub(crate) fn current_version(conn: &Connection) -> Result<i64, BrokerError> {
@@ -2000,14 +2082,56 @@ mod tests {
 
     #[test]
     fn v47_requires_a_v47_reader_to_preserve_cleared_gate_history() {
-        assert_eq!(SCHEMA_VERSION, 47);
+        // v48 is additive (#606), so the floor stays at the v47 reader.
         assert_eq!(MIN_COMPATIBLE_SCHEMA, 47);
 
         let conn = migrated();
-        assert_eq!(current_version(&conn).unwrap(), 47);
-        assert!(schema_is_compatible_with(&conn, 47, 47).unwrap());
-        assert!(!schema_is_compatible_with(&conn, 47, 46).unwrap());
-        assert!(!schema_is_compatible_with(&conn, 47, 42).unwrap());
+        assert_eq!(current_version(&conn).unwrap(), SCHEMA_VERSION);
+        assert!(schema_is_compatible_with(&conn, SCHEMA_VERSION, 47).unwrap());
+        assert!(!schema_is_compatible_with(&conn, SCHEMA_VERSION, 46).unwrap());
+        assert!(!schema_is_compatible_with(&conn, SCHEMA_VERSION, 42).unwrap());
+    }
+
+    #[test]
+    fn v48_only_adds_repository_watch_tables_and_keeps_v47_readers_compatible() {
+        let conn = migrated_through(47);
+        let schema = |conn: &Connection| -> Vec<(String, String)> {
+            let mut statement = conn
+                .prepare("SELECT name, sql FROM sqlite_master WHERE sql IS NOT NULL ORDER BY name")
+                .unwrap();
+            statement
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        };
+        let before = schema(&conn);
+
+        migrate(&conn).unwrap();
+        assert_eq!(current_version(&conn).unwrap(), 48);
+        let after = schema(&conn);
+        for object in &before {
+            assert!(after.contains(object), "v48 changed {}", object.0);
+        }
+        let added: Vec<&str> = after
+            .iter()
+            .filter(|object| !before.contains(object))
+            .map(|(name, _)| name.as_str())
+            .collect();
+        assert_eq!(
+            added,
+            vec![
+                "repository_delivery_outbox",
+                "repository_delivery_outbox_due",
+                "repository_delivery_subscriptions",
+                "repository_watch_events",
+                "repository_watch_pull_requests",
+                "repository_watches",
+                "repository_watches_due",
+            ]
+        );
+        assert_eq!(MIN_COMPATIBLE_SCHEMA, 47);
+        assert!(schema_is_compatible_with(&conn, 48, 47).unwrap());
     }
 
     #[test]

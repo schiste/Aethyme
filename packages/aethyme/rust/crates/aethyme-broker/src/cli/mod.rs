@@ -506,7 +506,19 @@ Usage:
       Aethyme records provider ids, authors, states, URLs and timestamps, but
       never comment/review bodies. `tick` performs one bounded foreground
       scheduling pass; the broker never starts a background poller.
+  aethyme broker watch repo start --session <id> --repo <owner/name> [--events <opened,ready_for_review,reopened>] [--include-drafts] [--include-existing] [--exclude-authors <login,login>] [--auto-watch] [--seconds <15..3600>] [--json]
+  aethyme broker watch repo list [--all] [--json]
+  aethyme broker watch repo show|events|pause|resume|stop --id <repo-watch-id> [--json]
+      Watch every pull request of a repository: each `watch pr tick` lists its
+      open PRs (metadata only) and records one event per PR and kind, opened,
+      ready_for_review or reopened, exactly once. PRs already open at start do
+      not fire unless --include-existing. --auto-watch also starts one per-PR
+      watch for each new PR.
   aethyme broker deliveries subscribe --watch <id> --adapter <name> --target <opaque-id> [--policy <notify|resume|review-and-push>] [--json]
+  aethyme broker deliveries subscribe --repo-watch <id> --adapter <name> --target <opaque-id> [--policy <review|notify>] [--json]
+      A repository-watch subscription delivers one prompt per event. `review`
+      (the default) asks the session to code-review the PR; the prompt comes
+      from `[watch.prompts.review] body` in .aethyme/config.toml when set.
   aethyme broker deliveries list [--adapter <name>] [--all] [--json]
   aethyme broker deliveries claim --adapter <name> --worker <id> [--seconds <15..900>] [--json]
   aethyme broker deliveries resolve-tab --session <id> [--tabs-file <path>] [--json]
@@ -1304,6 +1316,13 @@ struct Parsed {
     policy: Option<String>,
     error_code: Option<String>,
     watch_id: Option<i64>,
+    /// `deliveries subscribe --repo-watch`: a repository watch id (#606).
+    repo_watch_id: Option<i64>,
+    /// `watch repo start` filters and options (#606).
+    include_drafts: bool,
+    include_existing: bool,
+    exclude_authors: Option<String>,
+    auto_watch: bool,
     generation: Option<i64>,
     events: Option<String>,
     ttl_seconds: Option<i64>,
@@ -1443,6 +1462,11 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
         policy: None,
         error_code: None,
         watch_id: None,
+        repo_watch_id: None,
+        include_drafts: false,
+        include_existing: false,
+        exclude_authors: None,
+        auto_watch: false,
         generation: None,
         events: None,
         ttl_seconds: None,
@@ -1637,6 +1661,28 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
                 )
             }
             "--include-task" => parsed.include_task = true,
+            "--include-drafts" => parsed.include_drafts = true,
+            "--include-existing" => parsed.include_existing = true,
+            "--auto-watch" => parsed.auto_watch = true,
+            "--exclude-authors" => {
+                parsed.exclude_authors = Some(
+                    iter.next()
+                        .ok_or(UsageError::Message(
+                            "--exclude-authors requires a comma-separated list of logins".into(),
+                        ))?
+                        .clone(),
+                );
+            }
+            "--repo-watch" => {
+                let value = iter
+                    .next()
+                    .ok_or(UsageError::Message("--repo-watch requires a value".into()))?;
+                parsed.repo_watch_id = Some(value.parse().map_err(|_| {
+                    UsageError::Message(
+                        "--repo-watch must be an integer repository watch id".into(),
+                    )
+                })?);
+            }
             "--offline" => parsed.offline = true,
             "--require" => {
                 parsed.required_mode = Some(

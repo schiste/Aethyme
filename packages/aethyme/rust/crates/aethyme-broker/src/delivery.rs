@@ -247,7 +247,11 @@ impl Broker {
     }
 }
 
-fn validate_token(field: &str, value: &str, maximum: usize) -> Result<(), DeliveryError> {
+pub(crate) fn validate_token(
+    field: &str,
+    value: &str,
+    maximum: usize,
+) -> Result<(), DeliveryError> {
     if value.is_empty()
         || value.len() > maximum
         || value.chars().any(char::is_control)

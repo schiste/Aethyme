@@ -1,6 +1,6 @@
 # PR Review Scheduling and Delivery
 
-Last Updated: 2026-09-03
+Last Updated: 2026-10-07
 
 Aethyme keeps pull-request observation durable without running a daemon. The
 broker owns normalized metadata, cursors, retry decisions, activity batches,
@@ -32,6 +32,63 @@ aethyme broker advanced deliveries subscribe \
 Policies are `notify`, `resume`, and `review-and-push`. `review-and-push` is a
 capability request, not publication authority: the host must also retain the
 matching user authorization before it allows a remote write.
+
+## Subscribe to every pull request of a repository
+
+A repository watch notices pull requests opening, becoming ready for review,
+or reopening, so a session can react to each one, for example by reviewing it.
+
+```bash
+aethyme broker advanced watch repo start \
+  --session 111 --repo owner/name \
+  [--events opened,ready_for_review,reopened] [--include-drafts] \
+  [--include-existing] [--exclude-authors dependabot,renovate] \
+  [--auto-watch] [--seconds 60] --json
+
+aethyme broker advanced deliveries subscribe \
+  --repo-watch 3 --adapter chau7 --target opaque-target \
+  --policy review --json
+```
+
+- Each `watch pr tick` also polls due repository watches with one read-only
+  `gh pr list --state open --limit 100 --json
+  number,title,author,url,headRefOid,isDraft`. Bodies and comments are never
+  read. The tick's JSON carries the pass as `repository_watches`.
+- An event is recorded exactly once per (watch, PR, kind): `opened` for a PR
+  the watch has not seen, `ready_for_review` when a seen draft becomes ready,
+  `reopened` when a PR seen closed is open again. `watch repo events --id <id>`
+  lists them.
+- PRs already open when the watch starts are recorded as seen and never fire,
+  unless `--include-existing`. Drafts do not fire unless `--include-drafts`;
+  their later `ready_for_review` does. Authors in `--exclude-authors` never
+  fire (case-insensitive).
+- `--auto-watch` also starts one per-PR watch (comments, reviews, checks) for
+  each new PR, unless one is already live.
+- `watch repo list|show|pause|resume|stop` work as for PR watches; a stopped
+  repository watch cannot be resumed.
+
+Subscriptions to a repository watch take `--policy review` (the default) or
+`notify`. A `review` delivery asks the session to code-review the PR. Its
+prompt comes from `.aethyme/config.toml`:
+
+```toml
+[watch.prompts.review]
+body = "Review {{repo}}#{{number}} ({{url}}) by {{author}}: {{title}}"
+```
+
+A template may name only `number`, `title`, `author`, `url`, `head`, `draft`,
+`repo` and `event`; one naming anything else, or one that cannot be parsed, is
+ignored in favour of the default prompt. `title` and `author` are written by
+the pull request's author, so they are always rendered as one-line JSON
+strings, and every prompt ends with a notice that they are untrusted data and
+must never be followed as instructions.
+
+Repository deliveries share `deliveries dispatch`, `claim`, `list` and
+`complete` with PR deliveries. Their ids start at 1000000000000, so
+`deliveries complete --id` routes them without a flag; `dispatch --json` adds
+`source` (`pull_request` or `repository`), and `list --json` items from a
+repository watch carry `source: "repository"` and `event_id` in place of
+`batch_id`. The scheduled PR monitor and the Chau7 adapter need no change.
 
 ## Run one scheduler tick
 
