@@ -2017,6 +2017,7 @@ pub(super) fn classify_local_change(
 ///
 /// The diff text comes from `gh pr diff`; when it cannot be read the contract
 /// scan is reported unknown rather than clean.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn classify_provider_change(
     policy_root: &Path,
     repository: &str,
