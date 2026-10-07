@@ -314,6 +314,7 @@ fn ci_and_local_runs_share_one_test_command() {
     assert!(script.contains("cargo nextest run --locked --workspace --profile ci"));
     assert!(script.contains("AETHYME_TESTKIT_PREBUILT_BINS=1"));
     assert!(script.contains("--test-threads=1|--nocapture|--no-capture|-j1"));
+    assert!(script.contains("unset AETHYME_WORKTREE_ROOT AETHYME_HOST_STATE_DIR XDG_STATE_HOME"));
     let nextest =
         std::fs::read_to_string(root.join("packages/aethyme/rust/.config/nextest.toml")).unwrap();
     assert!(nextest.contains("[profile.ci]"));

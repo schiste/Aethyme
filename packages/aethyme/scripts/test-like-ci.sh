@@ -70,12 +70,17 @@ export CARGO_NET_RETRY="${CARGO_NET_RETRY:-10}"
 # A CI runner has no agent process above the tests and no git identity. A
 # workstation usually has both, which hid real failures (#574, #576): a test
 # that commits without setting an author, or output that names the live agent.
-# On a workstation, reproduce the runner: no agent ancestor, no system or
-# global git config, and git refuses to invent an identity. The user's global
+# On a workstation, reproduce the runner: no agent ancestor, no inherited
+# broker placement, no system or global git config, and git refuses to
+# invent an identity. The user's global
 # excludes file is kept so files ignored only there (editor and agent state)
 # do not show up as untracked in fixture checks.
 if [ "${CI:-}" != "true" ]; then
     export AETHYME_AGENT_PID=0
+    # Where this host keeps broker state and worktrees is not where a runner
+    # does. An inherited AETHYME_WORKTREE_ROOT put every test repository's
+    # root in one shared container and made GC tests flaky (#598).
+    unset AETHYME_WORKTREE_ROOT AETHYME_HOST_STATE_DIR XDG_STATE_HOME
     unset GIT_AUTHOR_NAME GIT_AUTHOR_EMAIL GIT_COMMITTER_NAME GIT_COMMITTER_EMAIL EMAIL
     excludes="$(git config --global --path core.excludesFile 2>/dev/null || true)"
     isolated="$(mktemp "${TMPDIR:-/tmp}/aethyme-ci-gitconfig.XXXXXX")"
@@ -148,7 +153,7 @@ if [ -f "$junit" ]; then
     echo "Slowest tests:"
     grep -o '<testcase [^>]*' "$junit" \
         | sed -n 's/.*name="\([^"]*\)".*classname="\([^"]*\)".*time="\([0-9.]*\)".*/\3s  \2 \1/p' \
-        | sort -rn | head -10 | sed 's/^/  /'
+        | sort -rn | sed -n '1,10s/^/  /p'
 fi
 printf '\nWall time: %dm%02ds (%s)\n' $((elapsed / 60)) $((elapsed % 60)) "$mode"
 exit "$status"
