@@ -213,10 +213,10 @@ jobs:
       # Library, binary and integration tests. `cargo test --workspace
       # --examples` stood in for this step until now, but a target flag
       # narrows cargo's selection to examples only: it ran three binaries.
+      # The same command a workstation runs (#598): it sets the CI
+      # environment, uses `--profile ci`, and prints the slowest tests.
       - name: Run workspace tests
-        env:
-          AETHYME_TESTKIT_PREBUILT_BINS: "1"
-        run: cargo nextest run --locked --workspace --profile ci
+        run: ../scripts/test-like-ci.sh --full
 
   # nextest runs neither example targets nor doctests. The release-manifest
   # assertions live in examples (#435) and must keep running. A job of their

@@ -50,10 +50,10 @@ jobs:
       - name: Build the product binaries
         run: cargo build --locked --workspace --bins
 
+      # The same command a workstation runs (#598): it sets the CI
+      # environment, uses `--profile ci`, and prints the slowest tests.
       - name: Run workspace tests
-        env:
-          AETHYME_TESTKIT_PREBUILT_BINS: "1"
-        run: cargo nextest run --locked --workspace --profile ci
+        run: ../scripts/test-like-ci.sh --full
 
       - name: Run example tests
         run: cargo test --locked --workspace --examples

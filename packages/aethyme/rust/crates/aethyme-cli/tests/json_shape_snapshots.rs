@@ -30,6 +30,22 @@ fn git(repo: &Path, args: &[&str]) -> String {
     String::from_utf8_lossy(&output.stdout).trim().to_string()
 }
 
+/// A host-state directory created fresh for this test process and removed
+/// with it, so nothing a previous run left behind shows up in `status`.
+///
+/// Passed canonicalized: macOS reaches the temp directory through the
+/// `/var` -> `/private/var` symlink, and through a symlinked host-state path
+/// `status` reports the session's own worktree as unclaimed, which Linux
+/// does not (a separate defect, not what this snapshot pins).
+fn host_state() -> &'static (tempfile::TempDir, PathBuf) {
+    static STATE: std::sync::OnceLock<(tempfile::TempDir, PathBuf)> = std::sync::OnceLock::new();
+    STATE.get_or_init(|| {
+        let dir = tempfile::tempdir().expect("host state tempdir");
+        let canonical = dir.path().canonicalize().expect("canonical host state");
+        (dir, canonical)
+    })
+}
+
 fn aethyme(cwd: &Path, args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_aethyme"))
         .args(args)
@@ -40,6 +56,15 @@ fn aethyme(cwd: &Path, args: &[&str]) -> Output {
         // is whatever agent runtime launched the suite (a live `claude`
         // locally, none in CI), and lease liveness changes the JSON shape.
         .env("AETHYME_AGENT_PID", std::process::id().to_string())
+        // Pin the host-state directory too. Left to the host, a Linux runner
+        // has none and `start` reports `worktree_placement.fallback_reason`,
+        // while a workstation has one and does not, so the shape depended on
+        // where the suite ran (#598).
+        .env("AETHYME_HOST_STATE_DIR", &host_state().1)
+        // And the worktree root, which an operator may export to an external
+        // disk and which a Linux runner never sets.
+        .env_remove("AETHYME_WORKTREE_ROOT")
+        .env_remove("XDG_STATE_HOME")
         .env(
             "AETHYME_CHAU7_MCP_BRIDGE",
             "/__aethyme_test_no_chau7_bridge__",

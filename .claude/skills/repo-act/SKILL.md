@@ -27,7 +27,8 @@ description: Use after repo-onboarding or Explore when moving from orientation i
 
 ## Useful Commands
 
-- `fast_test`: `cargo test --manifest-path packages/aethyme/rust/Cargo.toml --workspace`
+- `fast_test`: `packages/aethyme/scripts/test-like-ci.sh`
+- `full_test`: `packages/aethyme/scripts/test-like-ci.sh --full`
 - `build`: `cargo build --manifest-path packages/aethyme/rust/Cargo.toml --workspace`
 
 ## Primary Entrypoints
