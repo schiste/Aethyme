@@ -29,25 +29,49 @@ fn git(repo: &Path, args: &[&str]) {
     );
 }
 
+/// A temporary repository at `<tmp>/repo` whose session worktrees live in
+/// `<tmp>/worktrees`.
+///
+/// The worktree root is pinned inside the fixture. Left to the environment, a
+/// workstation's `AETHYME_WORKTREE_ROOT` put every test repository's root in
+/// one shared container; GC then counted the other tests' roots as orphans,
+/// and a root added between `gc plan` and `gc apply` changed the digest, so
+/// the apply tests failed in parallel runs (#598).
+struct Fixture(tempfile::TempDir);
+
+impl Fixture {
+    fn path(&self) -> PathBuf {
+        self.0.path().join("repo")
+    }
+
+    fn open(&self) -> Broker {
+        Broker::open(&self.path())
+            .unwrap()
+            .with_worktree_root(self.0.path().join("worktrees"))
+    }
+}
+
 /// A repository whose closed worktrees have no grace period unless `grace`
 /// names one. `None` leaves the key out, so the shipped default applies.
-fn repository(grace_hours: Option<u32>) -> (tempfile::TempDir, Broker) {
-    let tmp = tempfile::tempdir().unwrap();
-    git(tmp.path(), &["init", "-q", "-b", "main"]);
-    std::fs::write(tmp.path().join("README.md"), "fixture\n").unwrap();
-    std::fs::write(tmp.path().join(".gitignore"), "/.aethyme/\n").unwrap();
-    git(tmp.path(), &["add", "-A"]);
-    git(tmp.path(), &["commit", "-qm", "init"]);
-    std::fs::create_dir_all(tmp.path().join(".aethyme")).unwrap();
+fn repository(grace_hours: Option<u32>) -> (Fixture, Broker) {
+    let tmp = Fixture(tempfile::tempdir().unwrap());
+    let repo = tmp.path();
+    std::fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-q", "-b", "main"]);
+    std::fs::write(repo.join("README.md"), "fixture\n").unwrap();
+    std::fs::write(repo.join(".gitignore"), "/.aethyme/\n").unwrap();
+    git(&repo, &["add", "-A"]);
+    git(&repo, &["commit", "-qm", "init"]);
+    std::fs::create_dir_all(repo.join(".aethyme")).unwrap();
     let grace = grace_hours
         .map(|hours| format!("closed_worktree_grace_hours = {hours}\n"))
         .unwrap_or_default();
     std::fs::write(
-        tmp.path().join(".aethyme/broker.toml"),
+        repo.join(".aethyme/broker.toml"),
         format!("[retention]\nartifact_sweep_budget_ms = 0\nstartup_budget_ms = 5\n{grace}"),
     )
     .unwrap();
-    let broker = Broker::open(tmp.path()).unwrap();
+    let broker = tmp.open();
     (tmp, broker)
 }
 
@@ -208,7 +232,7 @@ fn a_closed_adopted_worktree_is_reported_and_never_proposed() {
     let outside = tempfile::tempdir().unwrap();
     let checkout = outside.path().join("adopted");
     git(
-        tmp.path(),
+        &tmp.path(),
         &[
             "worktree",
             "add",
@@ -301,9 +325,9 @@ fn cleanup_keeps_the_time_a_session_was_first_closed() {
     let (id, _worktree) = session_with_commit(&mut broker, "timed", true);
     broker.close(id).unwrap();
     drop(broker);
-    set_closed_at(tmp.path(), id, 1_000);
+    set_closed_at(&tmp.path(), id, 1_000);
 
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = tmp.open();
     broker.cleanup(id, false).unwrap();
     let cleaned = broker.store().session(id).unwrap();
     assert_eq!(cleaned.cleanup_state, SessionCleanupState::Cleaned);
@@ -326,9 +350,9 @@ fn closing_again_does_not_restart_the_grace_period() {
         .unwrap()
         .as_millis() as i64
         - 48 * 3_600_000;
-    set_closed_at(tmp.path(), id, two_days_ago);
+    set_closed_at(&tmp.path(), id, two_days_ago);
 
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = tmp.open();
     broker.close(id).unwrap();
     assert_eq!(
         broker.store().session(id).unwrap().closed_at,
