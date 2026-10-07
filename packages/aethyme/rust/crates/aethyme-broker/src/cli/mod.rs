@@ -2247,9 +2247,10 @@ fn run_inner(args: &[String], mode: &CompatibilityMode) -> Result<(), UsageError
     if subcommand == "submit"
         && let Some(unknown) = parsed.positional.first()
     {
-        return Err(UsageError::Message(surface::unsupported_submit_subcommand(
-            unknown,
-        )));
+        return Err(UsageError::Exit {
+            message: surface::unsupported_submit_subcommand(unknown),
+            code: crate::exit_status::USAGE,
+        });
     }
     // One declarative check replaces the per-flag guards that grew after #285:
     // a flag the subcommand never reads is refused rather than dropped.

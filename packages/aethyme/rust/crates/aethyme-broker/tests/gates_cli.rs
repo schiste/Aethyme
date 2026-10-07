@@ -968,7 +968,21 @@ fn submit_rejects_unknown_subcommand_before_state_changes_or_gates() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("unknown broker submit subcommand \"status\""));
     assert!(stderr.contains("aethyme broker status --json"));
-    assert!(stderr.contains("aethyme broker queue --json"));
+    assert!(stderr.contains("aethyme broker advanced queue --json"));
+    assert!(!tmp.path().join("gate-runs.txt").exists());
+    assert_eq!(broker_state(), state_before);
+
+    // A trailing word after the flags never reaches the surface resolver's
+    // first-word check; the dispatcher's positional check must refuse it too.
+    let output = run(
+        &worktree,
+        &["submit", "--session", &session_id, "--no-cache", "status"],
+    );
+    assert_eq!(output.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("unknown broker submit subcommand \"status\"")
+    );
     assert!(!tmp.path().join("gate-runs.txt").exists());
     assert_eq!(broker_state(), state_before);
 }

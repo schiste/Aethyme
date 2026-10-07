@@ -210,7 +210,7 @@ pub struct Resolution {
 pub(super) fn unsupported_submit_subcommand(subcommand: &str) -> String {
     format!(
         "unknown broker submit subcommand {subcommand:?}; for broker status use \
-         `aethyme broker status --json`, or use `aethyme broker queue --json` \
+         `aethyme broker status --json`, or use `aethyme broker advanced queue --json` \
          for the read-only queue view"
     )
 }
