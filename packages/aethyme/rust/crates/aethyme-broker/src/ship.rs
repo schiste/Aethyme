@@ -551,6 +551,15 @@ impl Broker {
         delivery_override: Option<RepositoryDeliveryMode>,
         select_delivery_policy: bool,
     ) -> Result<ShipPlan, BrokerOpError> {
+        if crate::merge::PromoteConfig::load(self.main_root()).mode
+            == crate::merge::PromoteMode::VerifyOnly
+        {
+            return Err(BrokerOpError::ShipPublicationPolicy {
+                reason: "broker ship is unavailable in verify-only repositories".into(),
+                remediation: "use `aethyme broker push --session <id> --pr` to publish through the pull-request workflow".into(),
+            });
+        }
+
         let queue = self.store().merge_queue()?;
         let entry = queue
             .iter()
