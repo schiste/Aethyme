@@ -141,6 +141,12 @@ fn a_merged_closed_checkout_is_removed_by_ancestry_and_journaled() {
     // Regenerable output and Finder metadata do not keep it.
     std::fs::create_dir_all(worktree.join("target/debug")).unwrap();
     std::fs::write(worktree.join("target/debug/app"), "bin").unwrap();
+    // Cargo writes this into every target directory it owns.
+    std::fs::write(
+        worktree.join("target/CACHEDIR.TAG"),
+        "Signature: 8a477f597d28d172789f06886806bc55\n",
+    )
+    .unwrap();
     std::fs::write(worktree.join(".DS_Store"), "finder").unwrap();
 
     let report = run(&mut broker);
@@ -483,4 +489,103 @@ fn the_primary_checkout_and_non_broker_worktrees_are_never_removed() {
     assert!(foreign.exists());
     assert!(fx.repo.exists());
     assert!(kept_reason(&report, &foreign).contains("not a broker-owned worktree"));
+}
+
+/// Ignore `pattern` in every checkout of the fixture's repository.
+fn ignore(fx: &Fixture, pattern: &str) {
+    let exclude = fx.repo.join(".git/info/exclude");
+    let mut text = std::fs::read_to_string(&exclude).unwrap_or_default();
+    text.push_str(pattern);
+    text.push('\n');
+    std::fs::write(exclude, text).unwrap();
+}
+
+#[test]
+fn ignored_code_under_build_without_a_manifest_keeps_the_checkout() {
+    let fx = fixture();
+    let mut broker = Broker::open(&fx.repo).unwrap();
+    let (_, worktree, _) = merged_closed_session(&fx, &mut broker, true);
+    ignore(&fx, "build/");
+    std::fs::create_dir_all(worktree.join("build")).unwrap();
+    std::fs::write(worktree.join("build/generate.py"), "print('mine')\n").unwrap();
+    let report = run(&mut broker);
+    assert!(
+        kept_reason(&report, &worktree).contains("not inside a recognised build-output directory"),
+        "{report:#?}"
+    );
+    assert!(worktree.join("build/generate.py").exists());
+}
+
+#[test]
+fn a_prefix_named_directory_is_not_build_output() {
+    let fx = fixture();
+    let mut broker = Broker::open(&fx.repo).unwrap();
+    let (_, worktree, _) = merged_closed_session(&fx, &mut broker, true);
+    ignore(&fx, "target-notes/");
+    std::fs::create_dir_all(worktree.join("target-notes")).unwrap();
+    std::fs::write(worktree.join("target-notes/plan.md"), "notes\n").unwrap();
+    let report = run(&mut broker);
+    assert!(
+        kept_reason(&report, &worktree).contains("target-notes"),
+        "{report:#?}"
+    );
+    assert!(worktree.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_symlink_leaving_the_worktree_keeps_it() {
+    let fx = fixture();
+    let mut broker = Broker::open(&fx.repo).unwrap();
+    let (_, worktree, _) = merged_closed_session(&fx, &mut broker, true);
+    let elsewhere = tempfile::tempdir().unwrap();
+    std::fs::write(elsewhere.path().join("precious.txt"), "keep\n").unwrap();
+    std::fs::create_dir_all(worktree.join("node_modules")).unwrap();
+    std::os::unix::fs::symlink(elsewhere.path(), worktree.join("node_modules/linked")).unwrap();
+    let report = run(&mut broker);
+    assert!(
+        kept_reason(&report, &worktree).contains("outside the worktree"),
+        "{report:#?}"
+    );
+    assert!(elsewhere.path().join("precious.txt").exists());
+}
+
+#[test]
+fn a_regenerable_glob_that_could_match_a_secret_is_rejected() {
+    let fx = fixture();
+    let mut broker = Broker::open(&fx.repo).unwrap();
+    let (_, worktree, _) = merged_closed_session(&fx, &mut broker, true);
+    std::fs::create_dir_all(fx.repo.join(".aethyme")).unwrap();
+    std::fs::write(
+        fx.repo.join(".aethyme/config.toml"),
+        "[cleanup]\nregenerable = [\".env*\"]\n",
+    )
+    .unwrap();
+    let report = run(&mut broker);
+    assert!(!report.enabled, "{report:#?}");
+    assert!(
+        report
+            .config_error
+            .as_deref()
+            .unwrap_or_default()
+            .contains(".env")
+    );
+    assert!(report.removed.is_empty());
+    assert!(worktree.exists());
+}
+
+#[test]
+fn an_unreadable_checkout_status_keeps_it() {
+    let fx = fixture();
+    let mut broker = Broker::open(&fx.repo).unwrap();
+    let (_, worktree, _) = merged_closed_session(&fx, &mut broker, true);
+    // A corrupt index makes `git status` fail: not knowing is not clean.
+    let git_dir = git_out(&worktree, &["rev-parse", "--absolute-git-dir"]);
+    std::fs::write(Path::new(&git_dir).join("index"), "not an index").unwrap();
+    let report = run(&mut broker);
+    assert!(
+        kept_reason(&report, &worktree).contains("could not be checked"),
+        "{report:#?}"
+    );
+    assert!(worktree.exists());
 }
