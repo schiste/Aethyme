@@ -373,7 +373,10 @@ pub enum QualityReportPublicationAction {
 }
 
 impl QualityReportPublicationAction {
-    pub fn gh_args(&self, pull_request: i64) -> Vec<String> {
+    /// Arguments for `aethyme broker advanced gh --repo <repository> -- <these>`;
+    /// see [`crate::PrProjectionAction::gh_args`] for why the API write names
+    /// `repository` literally and uses `-X`.
+    pub fn gh_args(&self, pull_request: i64, repository: &str) -> Vec<String> {
         match self {
             Self::CreateComment { body } => vec![
                 "pr".into(),
@@ -384,9 +387,9 @@ impl QualityReportPublicationAction {
             ],
             Self::UpdateComment { comment_id, body } => vec![
                 "api".into(),
-                "--method".into(),
+                "-X".into(),
                 "PATCH".into(),
-                format!("repos/{{owner}}/{{repo}}/issues/comments/{comment_id}"),
+                format!("repos/{repository}/issues/comments/{comment_id}"),
                 "-f".into(),
                 format!("body={body}"),
             ],

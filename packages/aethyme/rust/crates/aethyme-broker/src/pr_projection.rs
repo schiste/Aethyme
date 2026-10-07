@@ -382,7 +382,7 @@ pub fn find_owned_comment<'a>(
 ///
 /// `gh pr view --json comments` reports `id` as a GraphQL node id
 /// (`IC_kwDOQ07FcM8AAAABUHRMPQ`) and never as a number, while the endpoint that
-/// edits a comment -- `repos/{owner}/{repo}/issues/comments/{id}` -- takes the
+/// edits a comment -- `repos/<owner>/<name>/issues/comments/<id>` -- takes the
 /// REST integer. That integer appears nowhere in the payload except the
 /// `#issuecomment-<id>` fragment of the comment's own URL, so this is where it
 /// has to come from.
@@ -433,13 +433,15 @@ pub enum PrProjectionAction {
 }
 
 impl PrProjectionAction {
-    /// Arguments for `aethyme broker advanced gh --repo <owner/name> -- <these>`.
+    /// Arguments for `aethyme broker advanced gh --repo <repository> -- <these>`.
     ///
-    /// The repository is never named here. It is asserted once, on the outer
-    /// broker command, and a second target inside the arguments is refused --
-    /// so `gh api` endpoints use the `{owner}`/`{repo}` placeholders the broker
-    /// resolves.
-    pub fn gh_args(&self, pull_request: i64) -> Vec<String> {
+    /// `repository` must be the same `owner/name` the outer broker command
+    /// asserts. A `gh api` write names it literally, with `-X`: the #566 ref
+    /// guard lets an API write through without acknowledgement only in the
+    /// exact form `api -X <METHOD> repos/<repository>/<allowlisted path>`, so
+    /// `{owner}`/`{repo}` placeholders or `--method` would be refused. No
+    /// `--repo`/`-R` flag ever appears here; the target is resolved once.
+    pub fn gh_args(&self, pull_request: i64, repository: &str) -> Vec<String> {
         let pr = pull_request.to_string();
         match self {
             Self::CreateComment { body } => {
@@ -453,9 +455,9 @@ impl PrProjectionAction {
             }
             Self::UpdateComment { comment_id, body } => vec![
                 "api".into(),
-                "--method".into(),
+                "-X".into(),
                 "PATCH".into(),
-                format!("repos/{{owner}}/{{repo}}/issues/comments/{comment_id}"),
+                format!("repos/{repository}/issues/comments/{comment_id}"),
                 "-f".into(),
                 format!("body={body}"),
             ],
@@ -1169,7 +1171,7 @@ mod tests {
             },
         ];
         for action in &actions {
-            let args = action.gh_args(42);
+            let args = action.gh_args(42, "acme/product");
             assert!(
                 !args.iter().any(|arg| arg == "--repo" || arg == "-R"),
                 "{action:?} names a repository: {args:?}"
@@ -1177,9 +1179,58 @@ mod tests {
             assert!(!action.reason(42).is_empty());
         }
         assert_eq!(
-            actions[1].gh_args(42)[3],
-            "repos/{owner}/{repo}/issues/comments/9"
+            actions[1].gh_args(42, "acme/product")[1..4],
+            ["-X", "PATCH", "repos/acme/product/issues/comments/9"]
         );
+    }
+
+    /// Every write the projection and the quality report emit has to pass the
+    /// #566 ref guard and the target resolver exactly as the coordinated lane
+    /// runs them, with no acknowledgement. `{owner}/{repo}` placeholders or
+    /// `--method` made the comment update unverifiable, so `review run` could
+    /// create the Aethyme comment once and never edit it again.
+    #[test]
+    fn every_projection_write_passes_the_ref_guard_without_acknowledgement() {
+        use crate::gh_ref_guard::{Verdict, assess};
+        let repository = "Acme/Product";
+        let projection = [
+            PrProjectionAction::CreateComment { body: "b".into() },
+            PrProjectionAction::UpdateComment {
+                comment_id: 9,
+                body: "b".into(),
+            },
+            PrProjectionAction::CreateLabel {
+                name: "aethyme/size:large".into(),
+                color: "0e8a16".into(),
+                description: "d".into(),
+            },
+            PrProjectionAction::AddLabels {
+                names: vec!["aethyme/size:large".into()],
+            },
+            PrProjectionAction::RemoveLabels {
+                names: vec!["aethyme/size:trivial".into()],
+            },
+        ];
+        let quality = [
+            crate::QualityReportPublicationAction::CreateComment { body: "b".into() },
+            crate::QualityReportPublicationAction::UpdateComment {
+                comment_id: 9,
+                body: "b".into(),
+            },
+        ];
+        let calls = projection
+            .iter()
+            .map(|action| action.gh_args(42, repository))
+            .chain(quality.iter().map(|action| action.gh_args(42, repository)));
+        for args in calls {
+            crate::resolve_github_target(repository, &args)
+                .unwrap_or_else(|error| panic!("{args:?} names another target: {error}"));
+            let verdict = assess(&args, repository);
+            assert!(
+                matches!(verdict, Verdict::NoRefWrite | Verdict::SafeWrite),
+                "{args:?} needs an acknowledgement: {verdict:?}"
+            );
+        }
     }
 
     #[test]
@@ -1189,7 +1240,7 @@ mod tests {
         let action = PrProjectionAction::AddLabels {
             names: vec!["aethyme/area:backend".into(), "aethyme/surface:auth".into()],
         };
-        let args = action.gh_args(42);
+        let args = action.gh_args(42, "acme/product");
         assert_eq!(
             args,
             vec![

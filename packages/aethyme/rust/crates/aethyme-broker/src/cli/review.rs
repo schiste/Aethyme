@@ -968,7 +968,13 @@ pub(super) fn run_review_run(parsed: Parsed) -> Result<serde_json::Value, UsageE
         &pr_facts,
     );
 
-    let mut plan = crate::plan_execution(&dispatch, &projection_actions, &teardown, pull_request);
+    let mut plan = crate::plan_execution(
+        &dispatch,
+        &projection_actions,
+        &teardown,
+        pull_request,
+        &repository,
+    );
     let rule_comments = plan_rule_comments_for(
         &trigger,
         &projection_policy,
