@@ -713,6 +713,13 @@ pub enum BrokerOpError {
         status: &'static str,
         task: String,
     },
+    #[error(
+        "refusing to register a session on the main checkout {path}: work there lands on the \
+         default branch before any gate runs. Start an isolated worktree instead:\n  \
+         aethyme broker start --task \"...\" --short-name \"<name>\"\n\
+         Pass --allow-main-checkout only if the operator confirmed it."
+    )]
+    AdoptMainCheckoutRefused { path: String },
     #[error("--sync-integration is valid only with adoption mode reuse")]
     ReuseSyncRequiresReuse,
     #[error("reuse synchronization requires a clean worktree; dirty paths: {paths:?}")]

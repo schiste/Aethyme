@@ -1242,9 +1242,92 @@ fn a_read_does_not_wait_behind_a_held_lock_or_a_blocked_repository() {
     assert!(read.ok());
 }
 
+#[test]
+fn configured_implicit_push_to_main_is_refused_before_journaling() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut fixture = push_fixture(tmp.path(), "implicit-main");
+    commit_push_fixture(&fixture, "implicit target\n");
+    let main_before = git_output(&fixture.remote, &["rev-parse", "refs/heads/main"]);
+    git(
+        &fixture.worktree,
+        &["config", "remote.origin.push", "+HEAD:refs/heads/main"],
+    );
+
+    // Git's own dry-run confirms that bare push origin updates main through
+    // remote.origin.push even though the argv has no refspec.
+    let selected = git_output(
+        &fixture.worktree,
+        &["push", "--dry-run", "--porcelain", "origin"],
+    );
+    assert!(
+        selected.contains("HEAD:refs/heads/main"),
+        "Git did not select the configured main ref: {selected}"
+    );
+
+    let command = exact_push_request(fixture.session_id, &fixture.worktree, &[]);
+    let error = fixture
+        .broker
+        .run_coordinated_operation(command)
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("cannot safely classify"),
+        "{error}"
+    );
+    assert!(
+        fixture
+            .broker
+            .store()
+            .coordinated_operations()
+            .unwrap()
+            .is_empty(),
+        "an implicit shared-branch target is refused before journaling"
+    );
+    assert_eq!(
+        git_output(&fixture.remote, &["rev-parse", "refs/heads/main"]),
+        main_before
+    );
+}
+
+#[test]
+fn set_expanding_push_modes_are_refused_before_journaling() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut fixture = push_fixture(tmp.path(), "expanding-push");
+    for args in [
+        &["push", "--all", "origin"][..],
+        &["push", "--mirror", "origin"][..],
+        &["push", "--prune", "origin"][..],
+    ] {
+        let mut command = request(fixture.session_id, args);
+        command.resolved_target = Some(
+            GitRepo::discover(&fixture.worktree)
+                .unwrap()
+                .resolve_remote_target("origin", None)
+                .unwrap(),
+        );
+        command.destructive_confirmed = true;
+        let error = fixture
+            .broker
+            .run_coordinated_operation(command)
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("cannot safely classify"),
+            "{args:?}: {error}"
+        );
+        assert!(
+            fixture
+                .broker
+                .store()
+                .coordinated_operations()
+                .unwrap()
+                .is_empty(),
+            "{args:?} must be refused before journaling"
+        );
+    }
+}
+
 #[cfg(unix)]
 #[test]
-fn complex_unplannable_push_remains_conservatively_unknown() {
+fn complex_unplannable_push_is_refused_before_remote_contact() {
     let tmp = tempfile::tempdir().unwrap();
     let mut fixture = push_fixture(tmp.path(), "push-unplanned");
     commit_push_fixture(&fixture, "all branches\n");
@@ -1260,14 +1343,26 @@ fn complex_unplannable_push_remains_conservatively_unknown() {
             .unwrap(),
     );
 
-    let report = fixture.broker.run_coordinated_operation(command).unwrap();
-    assert_eq!(report.operation.status, OperationStatus::OutcomeUnknown);
-    let details: serde_json::Value =
-        serde_json::from_str(report.operation.details_json.as_deref().unwrap()).unwrap();
-    assert_eq!(details["push_reconciliation"]["planning"], "unsupported");
-    assert_eq!(
-        details["push_reconciliation"]["evidence"]["classification"],
-        "unknown"
+    let error = fixture
+        .broker
+        .run_coordinated_operation(command)
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("cannot safely classify"),
+        "{error}"
+    );
+    assert!(
+        fixture
+            .broker
+            .store()
+            .coordinated_operations()
+            .unwrap()
+            .is_empty(),
+        "an unclassifiable push is refused before journaling"
+    );
+    assert!(
+        !remote_has_branch(&fixture.remote, "agent/push-unplanned"),
+        "the configured pre-receive hook and remote were never reached"
     );
 }
 
