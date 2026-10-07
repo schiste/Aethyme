@@ -429,6 +429,83 @@ fn ship_plan_accepts_an_explicit_delivery_override_and_binds_its_digest() {
 
 #[cfg(unix)]
 #[test]
+fn ship_refuses_verify_only_repositories_and_points_to_pull_request_delivery() {
+    let fixture = Fixture::new();
+    let config_dir = fixture.repo.join(".aethyme");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::write(
+        config_dir.join("config.toml"),
+        "[promote]\nmode = \"verify-only\"\n",
+    )
+    .unwrap();
+
+    let error = fixture
+        .broker()
+        .ship_plan_with_delivery(1, None)
+        .unwrap_err();
+    assert!(matches!(
+        &error,
+        BrokerOpError::ShipPublicationPolicy { .. }
+    ));
+    let message = error.to_string();
+    assert!(message.contains("verify-only"), "{message}");
+    assert!(
+        message.contains("aethyme broker push --session <id> --pr"),
+        "{message}"
+    );
+
+    let execution_error = fixture
+        .broker()
+        .ship_execute_with_policy(1, &"0".repeat(40), false, false, None)
+        .unwrap_err();
+    assert!(matches!(
+        &execution_error,
+        BrokerOpError::ShipPublicationPolicy { .. }
+    ));
+    assert!(
+        execution_error
+            .to_string()
+            .contains("aethyme broker push --session <id> --pr")
+    );
+
+    let (fake_bin, state) = fixture.configure_github_delivery_provider();
+    let output = fixture.run_delivery_cli(
+        &["advanced", "ship", "plan", "--entry", "1"],
+        &fake_bin,
+        &state,
+    );
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("verify-only"), "{stderr}");
+    assert!(
+        stderr.contains("aethyme broker push --session <id> --pr"),
+        "{stderr}"
+    );
+
+    let output = fixture.run_delivery_cli(
+        &[
+            "advanced",
+            "ship",
+            "execute",
+            "--entry",
+            "1",
+            "--confirm",
+            &"0".repeat(40),
+        ],
+        &fake_bin,
+        &state,
+    );
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("verify-only"), "{stderr}");
+    assert!(
+        stderr.contains("aethyme broker push --session <id> --pr"),
+        "{stderr}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn pull_request_delivery_pushes_and_reuses_one_exact_provider_pr() {
     let fixture = Fixture::new();
     let (entry_id, _, integration) = fixture.promoted_entry();
