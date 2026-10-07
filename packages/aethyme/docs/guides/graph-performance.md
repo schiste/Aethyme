@@ -69,6 +69,29 @@ host-disruptive behavior. Run at least three trials on an otherwise quiet host
 before setting regression thresholds. Preserve the source SHAs, Aethyme build
 identity, platform, and methodology object from every report.
 
+## Product latency regression suite
+
+packages/aethyme/scripts/bench-product-latency.sh runs release-mode Criterion
+benchmarks against the checked-in Parcel Playground in
+packages/aethyme-eval/benchmarks/performance/fixture/. It measures four
+user-facing paths: first-process Explore after materializing a fresh graph,
+repeated-process Explore with the same warm store, verify-targets over a saved
+Explore answer, and a fresh graph-index run. Every measured repository lives
+under a temporary directory with a private HOME and host cache; the benchmarks
+never scan Aethyme's own source tree.
+
+Run and save a named Criterion baseline with:
+
+    packages/aethyme/scripts/bench-product-latency.sh --save-baseline product-latency
+
+Criterion reports estimates and confidence intervals under the workspace
+target/criterion/ directory. This suite is intentionally non-gating: hardware,
+OS scheduling, parser caches, and process launch affect these measurements.
+Review changes against a baseline from the same machine, platform, fixture, and
+release profile; record the code revision and host when refreshing the committed
+baseline in docs/reports/product-performance-baseline-2026-10-07.md. Do not
+turn one noisy sample into a hard CI threshold.
+
 ## Interpretation rules
 
 - Do not compare evaluation quality or optimize scorer output with this tool.
