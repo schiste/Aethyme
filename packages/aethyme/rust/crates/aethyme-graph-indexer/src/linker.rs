@@ -206,7 +206,8 @@ fn link_one_fragment(
     // at the placeholder.
     let mut resolved_placeholders: HashSet<NodeId> = HashSet::new();
     let mut edges_rewritten = 0usize;
-    let local_import_bindings = local_import_bindings(&fragment, &placeholders, global_index);
+    let local_import_bindings =
+        local_import_bindings(&fragment, &placeholders, source_path, global_index);
 
     let new_edges: Vec<Edge> = fragment
         .edges()
@@ -299,6 +300,41 @@ struct FragmentResolution {
     was_rewritten: bool,
 }
 
+/// Whether `source_path` is a file the TypeScript/JavaScript indexer reads.
+fn is_script_source(source_path: &str) -> bool {
+    const SCRIPT_EXTENSIONS: &[&str] = &["ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs"];
+    source_path
+        .rsplit_once('.')
+        .is_some_and(|(_, extension)| SCRIPT_EXTENSIONS.contains(&extension))
+}
+
+fn is_relative_module_specifier(specifier: &str) -> bool {
+    specifier.starts_with("./") || specifier.starts_with("../")
+}
+
+/// Resolve a TypeScript-style relative module path lexically against the
+/// importing file, rejecting paths that escape the repository root.
+fn normalize_relative_module_path(source_path: &str, specifier: &str) -> Option<String> {
+    if !is_relative_module_specifier(specifier) || specifier.contains('\\') {
+        return None;
+    }
+
+    let parent = source_path
+        .rsplit_once('/')
+        .map_or("", |(parent, _)| parent);
+    let mut components: Vec<&str> = parent.split('/').filter(|part| !part.is_empty()).collect();
+    for component in specifier.split('/') {
+        match component {
+            "" | "." => {}
+            ".." => {
+                components.pop()?;
+            }
+            part => components.push(part),
+        }
+    }
+    (!components.is_empty()).then(|| components.join("/"))
+}
+
 /// Split an import path into `(module_part, symbol_part)` at the last
 /// separator.
 ///
@@ -309,6 +345,9 @@ struct FragmentResolution {
 /// where `module_part` is empty and the `(module, symbol)` fast path can
 /// never match — so Rust imports resolved only via the name-only
 /// fallback, or not at all when a name was ambiguous.
+///
+/// TypeScript relative imports preserve the relative module path and use
+/// `::` to separate the imported symbol.
 fn split_import_path(import_path: &str) -> (&str, &str) {
     // `::` is checked first: `crate::store::helper` also contains `.`
     // nowhere, but a mixed path like `a::b.c` must split on the last
@@ -333,6 +372,7 @@ fn split_import_path(import_path: &str) -> (&str, &str) {
 fn local_import_bindings(
     fragment: &Fragment,
     placeholders: &HashMap<&NodeId, &Node>,
+    source_path: &str,
     global_index: &GlobalSymbolIndex,
 ) -> HashMap<String, Vec<ResolvedRecord>> {
     let mut bindings: HashMap<String, Vec<ResolvedRecord>> = HashMap::new();
@@ -347,7 +387,9 @@ fn local_import_bindings(
         let Node::UnresolvedSymbol(p) = placeholder else {
             continue;
         };
-        if let Some(target) = global_index.resolve_imports_edge(placeholder, edge.attributes()) {
+        if let Some(target) =
+            global_index.resolve_imports_edge(source_path, placeholder, edge.attributes())
+        {
             bindings
                 .entry(p.name().to_string())
                 .or_default()
@@ -487,7 +529,9 @@ impl GlobalSymbolIndex {
         local_import_bindings: &HashMap<String, Vec<ResolvedRecord>>,
     ) -> Option<ResolvedRecord> {
         match attrs {
-            EdgeAttributes::Imports { .. } => self.resolve_imports_edge(placeholder, attrs),
+            EdgeAttributes::Imports { .. } => {
+                self.resolve_imports_edge(source_path, placeholder, attrs)
+            }
             EdgeAttributes::Calls => {
                 self.resolve_calls_edge(source_path, placeholder, local_import_bindings)
             }
@@ -500,6 +544,7 @@ impl GlobalSymbolIndex {
     /// if the placeholder cannot be resolved unambiguously.
     fn resolve_imports_edge(
         &self,
+        source_path: &str,
         placeholder: &Node,
         attrs: &EdgeAttributes,
     ) -> Option<ResolvedRecord> {
@@ -520,23 +565,38 @@ impl GlobalSymbolIndex {
         let binding = p.name();
 
         if *is_namespace {
-            // `import X` or `import X.Y`. The placeholder's name is
-            // the binding (`X`); the edge's import_path is the full
-            // module path. Resolve by *file*, not by symbol —
-            // there's no symbol-level entry for a module-as-a-whole
-            // in the shards (those record per-name entries).
+            // Relative namespace imports need the importing path as their
+            // resolution anchor; package names retain literal lookup.
+            if is_relative_module_specifier(import_path) {
+                return self.resolve_relative_import_file(source_path, import_path);
+            }
             return self.module_to_file_node.get(import_path).cloned();
         }
 
         if *is_named {
-            // `from M import X` / `use M::X`. import_path uses the
-            // source language's own separator: `.` for Python, `::` for
-            // Rust. Relative Python imports (leading `.`) are skipped —
-            // they need the importing file's package context.
+            // Relative TypeScript imports carry their module specifier before
+            // the final separator and must resolve within the same repository.
+            let (module_part, symbol_part) = split_import_path(import_path);
+            if is_relative_module_specifier(module_part) {
+                let file = self.resolve_relative_import_file(source_path, module_part)?;
+                let hits = self
+                    .by_module_and_name
+                    .get(&(file.module, symbol_part.to_string()))?;
+                return (hits.len() == 1).then(|| hits[0].clone());
+            }
+            // Relative Python imports still need package context that its
+            // indexer does not encode.
             if import_path.starts_with('.') {
                 return None;
             }
-            let (module_part, symbol_part) = split_import_path(import_path);
+            // A bare JS/TS specifier names a package or a path alias this
+            // linker cannot resolve. The name-only fallbacks below would bind
+            // `import { request } from 'http-lib'` to whichever repository
+            // function happens to be called `request`, and every call through
+            // that binding would become a false Calls edge.
+            if is_script_source(source_path) {
+                return None;
+            }
             // Fast path: look up (module, symbol). One record only?
             // Resolve. Multiple? Ambiguous → skip.
             if !module_part.is_empty()
@@ -583,6 +643,21 @@ impl GlobalSymbolIndex {
         }
 
         None
+    }
+
+    fn resolve_relative_import_file(
+        &self,
+        source_path: &str,
+        import_path: &str,
+    ) -> Option<ResolvedRecord> {
+        let normalized = normalize_relative_module_path(source_path, import_path)?;
+        let module = synthesize_module_name(&normalized);
+        if let Some(file) = self.module_to_file_node.get(&module) {
+            return Some(file.clone());
+        }
+
+        let index_module = synthesize_module_name(&format!("{normalized}/index"));
+        self.module_to_file_node.get(&index_module).cloned()
     }
 
     fn resolve_calls_edge(
@@ -778,6 +853,27 @@ pub fn link_repo_path(repo_root: PathBuf) -> Result<LinkSummary, LinkError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn relative_typescript_module_paths_stay_inside_the_repository() {
+        assert_eq!(
+            normalize_relative_module_path("src/app.ts", "./util"),
+            Some("src/util".to_string())
+        );
+        assert_eq!(
+            normalize_relative_module_path("src/app.ts", "../shared/util.js"),
+            Some("shared/util.js".to_string())
+        );
+        assert_eq!(normalize_relative_module_path("app.ts", "../outside"), None);
+        assert_eq!(
+            normalize_relative_module_path("src/app.ts", "../../outside"),
+            None
+        );
+        assert_eq!(
+            normalize_relative_module_path("src/app.ts", "./..\\outside"),
+            None
+        );
+    }
 
     #[test]
     fn synthesize_module_name_matches_pipeline() {

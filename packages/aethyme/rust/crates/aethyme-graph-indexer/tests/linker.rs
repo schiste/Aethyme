@@ -414,6 +414,121 @@ fn relative_import_stays_unresolved_for_now() {
     assert_eq!(summary.placeholders_resolved, 0);
 }
 
+#[test]
+fn typescript_relative_import_calls_resolve_for_impact_graph() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "src/app.ts",
+        b"import { helper as runHelper } from './util';
+         import * as util from './util';
+         export function main() { runHelper(); util.other(); }
+",
+    );
+    write(
+        tmp.path(),
+        "src/util.ts",
+        b"export function helper() {}
+export function other() {}
+",
+    );
+    index_repo_to_disk(&ctx(tmp.path()), &WalkOptions::default()).unwrap();
+
+    let summary = link_repo(&ctx(tmp.path())).unwrap();
+    assert_eq!(summary.placeholders_seen, 4);
+    assert_eq!(summary.placeholders_resolved, 4);
+
+    let app = read_fragment(tmp.path(), "src/app.ts").unwrap();
+    let util = read_fragment(tmp.path(), "src/util.ts").unwrap();
+    let helper_id = util
+        .nodes()
+        .iter()
+        .find(|node| node.kind() == NodeKind::Function && node.name() == Some("helper"))
+        .map(|node| node.id().clone())
+        .expect("helper target");
+    let other_id = util
+        .nodes()
+        .iter()
+        .find(|node| node.kind() == NodeKind::Function && node.name() == Some("other"))
+        .map(|node| node.id().clone())
+        .expect("other target");
+    let call_targets: Vec<_> = app
+        .edges()
+        .iter()
+        .filter(|edge| edge.kind() == EdgeKind::Calls)
+        .map(|edge| edge.dst_id().clone())
+        .collect();
+    assert_eq!(call_targets.len(), 2);
+    assert!(call_targets.contains(&helper_id));
+    assert!(call_targets.contains(&other_id));
+}
+
+#[test]
+fn typescript_calls_never_guess_a_target_from_a_name_alone() {
+    // A call is only linked through an import binding or a same-file
+    // definition. A receiver the indexer cannot type (`client.helper()`),
+    // a package import, and a same-named function in another file that
+    // was never imported must all stay unresolved: a wrong Calls edge
+    // corrupts impact analysis, a missing one only narrows it.
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "src/app.ts",
+        b"import { request } from 'http-lib';
+         export function main(client: any) { client.helper(); request(); stranger(); }
+",
+    );
+    write(
+        tmp.path(),
+        "src/util.ts",
+        b"export function helper() {}
+export function request() {}
+export function stranger() {}
+",
+    );
+    index_repo_to_disk(&ctx(tmp.path()), &WalkOptions::default()).unwrap();
+    link_repo(&ctx(tmp.path())).unwrap();
+
+    let app = read_fragment(tmp.path(), "src/app.ts").unwrap();
+    let util = read_fragment(tmp.path(), "src/util.ts").unwrap();
+    let util_ids: Vec<_> = util.nodes().iter().map(|node| node.id().clone()).collect();
+    let linked: Vec<_> = app
+        .edges()
+        .iter()
+        .filter(|edge| edge.kind() == EdgeKind::Calls)
+        .filter(|edge| util_ids.contains(edge.dst_id()))
+        .collect();
+    assert!(linked.is_empty(), "guessed call edges: {linked:?}");
+}
+
+#[test]
+fn typescript_same_file_calls_resolve_without_an_import() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "src/app.ts",
+        b"function helper() {}
+export function main() { helper(); }
+",
+    );
+    index_repo_to_disk(&ctx(tmp.path()), &WalkOptions::default()).unwrap();
+    link_repo(&ctx(tmp.path())).unwrap();
+
+    let app = read_fragment(tmp.path(), "src/app.ts").unwrap();
+    let helper_id = app
+        .nodes()
+        .iter()
+        .find(|node| node.kind() == NodeKind::Function && node.name() == Some("helper"))
+        .map(|node| node.id().clone())
+        .expect("helper");
+    assert!(
+        app.edges()
+            .iter()
+            .any(|edge| edge.kind() == EdgeKind::Calls && edge.dst_id() == &helper_id),
+        "same-file call was not linked"
+    );
+}
+
 // ─── Idempotence + invariants ────────────────────────────────────────
 
 #[test]
