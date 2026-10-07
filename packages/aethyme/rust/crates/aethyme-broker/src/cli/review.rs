@@ -869,7 +869,13 @@ pub(super) fn run_review_run(parsed: Parsed) -> Result<serde_json::Value, UsageE
         &pr_facts,
     );
 
-    let plan = crate::plan_execution(&dispatch, &projection_actions, &teardown, pull_request);
+    let plan = crate::plan_execution(
+        &dispatch,
+        &projection_actions,
+        &teardown,
+        pull_request,
+        &repository,
+    );
 
     if parsed.dry_run {
         return Ok(build_review_run_report(

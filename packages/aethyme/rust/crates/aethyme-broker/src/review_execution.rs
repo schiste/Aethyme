@@ -160,6 +160,7 @@ pub fn plan_execution(
     projection: &[PrProjectionAction],
     teardown: &[Chau7Teardown],
     pull_request: i64,
+    repository: &str,
 ) -> ReviewExecutionPlan {
     let mut plan = ReviewExecutionPlan {
         chau7_close: teardown.to_vec(),
@@ -227,7 +228,7 @@ pub fn plan_execution(
         plan.gh.push(GhCall {
             review_type: None,
             purpose: "project the review record onto the pull request".into(),
-            args: action.gh_args(pull_request),
+            args: action.gh_args(pull_request, repository),
         });
     }
     plan
@@ -252,7 +253,7 @@ mod tests {
     /// the next tick knows nothing about, and it would start a second one.
     #[test]
     fn a_chau7_review_is_recorded_before_it_is_handed_out() {
-        let plan = plan_execution(&[spawn("security")], &[], &[], 12);
+        let plan = plan_execution(&[spawn("security")], &[], &[], 12, "acme/product");
         assert_eq!(plan.ledger.len(), 1);
         assert_eq!(plan.ledger[0].state, ReviewRequestState::Requested);
         assert_eq!(plan.chau7.len(), 1);
@@ -271,6 +272,7 @@ mod tests {
             &[],
             &[],
             12,
+            "acme/product",
         );
         assert_eq!(plan.ledger[0].state, ReviewRequestState::Recorded);
         assert!(!plan.ledger[0].state.occupies_a_slot());
@@ -295,6 +297,7 @@ mod tests {
             &[],
             &[],
             12,
+            "acme/product",
         );
         assert!(plan.ledger.is_empty());
         assert_eq!(plan.deferred.len(), 1);
@@ -316,6 +319,7 @@ mod tests {
             }],
             &[],
             12,
+            "acme/product",
         );
         assert_eq!(plan.gh.len(), 2);
         assert!(plan.gh[0].purpose.contains("provider bot"));
@@ -332,7 +336,7 @@ mod tests {
     #[test]
     fn an_empty_decision_set_plans_nothing() {
         assert_eq!(
-            plan_execution(&[], &[], &[], 12),
+            plan_execution(&[], &[], &[], 12, "acme/product"),
             ReviewExecutionPlan::default()
         );
     }
