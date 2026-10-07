@@ -6667,6 +6667,7 @@ mod tests {
             finished_at: None,
             host_operation_id: None,
             identity_provenance: OperationIdentityProvenance::VerifiedCanonical,
+            agent_provenance: None,
         }
     }
 

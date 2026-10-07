@@ -194,6 +194,21 @@ fn successful_operation_is_durably_journaled_with_events() {
     assert!(report.ok());
     assert_eq!(report.operation.effect, OperationEffect::Write);
     assert_eq!(report.operation.status, OperationStatus::Succeeded);
+    let provenance = report
+        .operation
+        .agent_provenance
+        .as_ref()
+        .expect("new operation rows retain caller/holder provenance");
+    assert_eq!(provenance["schema_version"], 1);
+    assert!(provenance.get("caller").is_some());
+    assert!(provenance.get("caller_process_chain").is_some());
+    assert!(provenance.get("holder").is_some());
+    assert!(provenance.get("holder_binding_event_id").is_some());
+    assert_eq!(
+        provenance["session_agent_identity"],
+        serde_json::Value::Null
+    );
+    assert!(serde_json::to_value(&report.operation).unwrap()["agent_provenance"].is_object());
     assert_eq!(
         report.operation.authorization_reason.as_deref(),
         Some("test workflow")

@@ -18,6 +18,7 @@
 //! anyway.
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::process::Command;
 
 /// Environment override for the caller's agent process: a pid, or `0`/`none`
@@ -155,6 +156,27 @@ impl ProcessTable {
         }
         self.process(current)
     }
+
+    /// The caller's process ancestry up to its agent runtime root. Full command
+    /// lines stay in memory only; callers that persist this chain must redact
+    /// each row with `operation_agent_identity`.
+    pub fn lineage_to_agent_root(&self, pid: i64) -> Option<Vec<AgentProcess>> {
+        let root = self.agent_root(pid)?;
+        let mut lineage = Vec::new();
+        let mut current = pid;
+        for _ in 0..64 {
+            lineage.push(self.process(current)?);
+            if current == root.pid {
+                return Some(lineage);
+            }
+            let parent = self.rows.get(&current)?.ppid;
+            if parent <= 1 || parent == current {
+                return None;
+            }
+            current = parent;
+        }
+        None
+    }
 }
 
 /// Whether a command line is an agent runtime: its executable is `claude` or
@@ -217,8 +239,74 @@ pub enum HolderCheck {
     Unidentified,
 }
 
-/// The session's current holder, from its latest `session.holder_bound` event.
-/// `None` when it never had one, or retention pruned the record: the next
+/// A compact process identity for local operation history; never the full command line.
+fn operation_agent_identity(process: &AgentProcess) -> serde_json::Value {
+    let program = process
+        .command
+        .split_whitespace()
+        .next()
+        .and_then(|command| Path::new(command).file_name())
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or("unknown")
+        .to_string();
+    serde_json::json!({
+        "pid": process.pid,
+        "started": process.started,
+        "program": program,
+    })
+}
+
+/// Snapshot local process provenance for one coordinated-operation journal row.
+/// Only the executable basename is retained from a process command line.
+pub(crate) fn operation_agent_provenance(
+    store: &crate::BrokerStore,
+    session_id: i64,
+) -> Result<serde_json::Value, crate::BrokerError> {
+    let session = store.session(session_id)?;
+    let process_table = ProcessTable::snapshot();
+    let agent_pid_override = std::env::var(AGENT_PID_ENV).ok();
+    let caller = process_table
+        .as_ref()
+        .map(|table| caller_in(table, agent_pid_override.as_deref()))
+        .unwrap_or(Caller::Unidentified);
+    let caller_process = match caller {
+        Caller::Agent(process) => Some(process),
+        Caller::Unidentified => None,
+    };
+    let caller_process_chain = process_table
+        .as_ref()
+        .and_then(|table| table.lineage_to_agent_root(std::process::id() as i64))
+        .filter(|chain| {
+            chain.last().is_some_and(|root| {
+                caller_process
+                    .as_ref()
+                    .is_some_and(|caller| caller.pid == root.pid && caller.started == root.started)
+            })
+        })
+        .map(|chain| {
+            chain
+                .iter()
+                .map(operation_agent_identity)
+                .collect::<Vec<_>>()
+        });
+    let holder_event = store.latest_session_holder_event(session_id)?;
+    let holder = holder_event
+        .as_ref()
+        .and_then(|event| event.payload_json.as_deref())
+        .and_then(|payload| serde_json::from_str::<AgentProcess>(payload).ok())
+        .map(|process| operation_agent_identity(&process));
+    Ok(serde_json::json!({
+        "schema_version": 1,
+        "caller": caller_process.as_ref().map(operation_agent_identity),
+        "caller_process_chain": caller_process_chain,
+        "holder": holder,
+        "holder_binding_event_id": holder_event.map(|event| event.id),
+        "session_agent_identity": session.agent_identity,
+    }))
+}
+/// The session's current holder, from its latest holder-bound event.
+/// If it never had one, or retention pruned the record, the next
 /// identified caller then binds, so a lost record fails open.
 pub fn recorded_holder(
     store: &crate::BrokerStore,
@@ -508,6 +596,43 @@ mod tests {
  2100  2023 Fri Oct  2 15:31:00 2026     /bin/bash -lc git status
  3000     1 Fri Oct  2 15:40:00 2026     /usr/bin/nohup zsh queue.sh
 ";
+
+    #[test]
+    #[test]
+    fn operation_provenance_keeps_only_the_agent_program_name() {
+        let identity = operation_agent_identity(&AgentProcess {
+            pid: 42,
+            started: "Mon Oct 5 12:34:56 2026".into(),
+            command: "/usr/local/bin/codex --token secret-value".into(),
+        });
+        assert_eq!(identity["pid"], 42);
+        assert_eq!(identity["program"], "codex");
+        let json = identity.to_string();
+        assert!(!json.contains("secret-value"), "{json}");
+        assert!(!json.contains("--token"), "{json}");
+    }
+
+    #[test]
+    fn operation_provenance_lineage_stops_at_agent_root_and_redacts_arguments() {
+        let table = ProcessTable::parse(
+            "1 0 Mon Oct 5 12:00:00 2026 launchd\n300 1 Mon Oct 5 12:01:00 2026 node /opt/codex --api-key hidden\n400 300 Mon Oct 5 12:02:00 2026 /bin/zsh -l\n500 400 Mon Oct 5 12:03:00 2026 aethyme broker submit\n",
+        );
+        let lineage = table.lineage_to_agent_root(500).expect("agent ancestry");
+        assert_eq!(
+            lineage
+                .iter()
+                .map(|process| process.pid)
+                .collect::<Vec<_>>(),
+            [500, 400, 300]
+        );
+        let persisted = lineage
+            .iter()
+            .map(operation_agent_identity)
+            .collect::<Vec<_>>();
+        let json = serde_json::Value::Array(persisted).to_string();
+        assert!(!json.contains("--api-key"), "{json}");
+        assert!(!json.contains("hidden"), "{json}");
+    }
 
     #[test]
     fn the_caller_is_the_nearest_agent_ancestor() {
