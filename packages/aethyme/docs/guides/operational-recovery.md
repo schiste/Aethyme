@@ -78,7 +78,10 @@ When automatic evidence is insufficient, follow the dry run's commit-bound
 resolution-file instructions. `replaced_by_exact_upstream_sha` requires a full,
 reachable upstream SHA and review proving replacement. `preserve_and_replay`
 retains the promoted delta; `drop_because_content_empty` is valid only when the
-broker proves that condition. Inspect the exact new plan and confirmation digest
+broker proves that condition. `tracked_elsewhere` applies when the work already
+lives on a pushed branch or an open pull request: name `tracked_branch` or
+`pull_request`, fetch the remote, and the broker proves containment by ancestry
+or an identical patch before dropping the commit from integration. Inspect the exact new plan and confirmation digest
 after supplying evidence. If either head moves, review a new plan.
 
 Do not reset integration/default branches, merge main reflexively into every
