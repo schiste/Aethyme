@@ -142,7 +142,12 @@ resolution file:
 - `replaced_by_exact_upstream_sha` names the full reachable upstream commit
   that replaces it;
 - `drop_because_content_empty` is accepted only for a commit with no tree
-  change.
+  change;
+- `tracked_elsewhere` names exactly one of `tracked_branch` (a branch the
+  upstream remote reports right now) or `pull_request` (an open pull request).
+  The commit, or one with an identical patch, must be reachable from that
+  branch's fetched remote head; integration then drops it without replay and
+  records where it survives.
 
 There is no “discard unknown work” disposition. The file also binds the exact
 upstream and integration tips, so it becomes stale when either moves. See the

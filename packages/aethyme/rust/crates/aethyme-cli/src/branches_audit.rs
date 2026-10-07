@@ -9,7 +9,7 @@
 //! - `on-remote`: the tip equals a remote branch tip;
 //! - `contained`: the tip is an ancestor of a remote branch tip;
 //! - `merged-via-pr`: every commit not reachable from the remote is
-//!   patch-equivalent (`git cherry`) to a commit on the default branch or on
+//!   patch-equivalent (verbatim patch ids) to a commit on the default branch or on
 //!   a merged PR's head, or the branch's whole diff matches the PR's squash
 //!   commit or the PR head's tree;
 //! - `local-only`: some commits match nothing on the remote; they are listed.
@@ -189,7 +189,9 @@ fn git_with_input(repo: &Path, args: &[&str], input: &[u8]) -> Result<String, St
     }
 }
 
-/// Stable patch id of the change `from..to`, or `None` for an empty change.
+/// Verbatim patch id of the change `from..to`, or `None` for an empty change.
+/// `--verbatim` keeps whitespace, so a whitespace-only difference is never
+/// read as the same patch (and the branch never as safe to delete).
 fn patch_id(repo: &Path, from: &str, to: &str) -> Option<String> {
     // Plumbing `diff-tree`, not porcelain `diff`: wrappers that rewrite
     // `git diff` output must not change the patch being identified.
@@ -197,7 +199,7 @@ fn patch_id(repo: &Path, from: &str, to: &str) -> Option<String> {
     if patch.trim().is_empty() {
         return None;
     }
-    let ids = git_with_input(repo, &["patch-id", "--stable"], patch.as_bytes()).ok()?;
+    let ids = git_with_input(repo, &["patch-id", "--verbatim"], patch.as_bytes()).ok()?;
     ids.split_whitespace().next().map(str::to_string)
 }
 
@@ -417,12 +419,16 @@ fn unpushed_commits(repo: &Path, tip: &str, remote: &RemoteState) -> Result<Vec<
 }
 
 /// Commits of `tip` with an equivalent patch reachable from `upstream`.
+/// The broker's verbatim comparison, not `git cherry`, whose patch ids ignore
+/// whitespace: a whitespace-only difference is not an equivalent patch. Any
+/// failure reports no equivalents, so nothing is called landed by mistake.
 fn patch_equivalent(repo: &Path, upstream: &str, tip: &str) -> BTreeSet<String> {
-    git(repo, &["cherry", upstream, tip])
-        .map(|listing| {
-            listing
-                .lines()
-                .filter_map(|line| line.strip_prefix("- ").map(str::to_string))
+    aethyme_broker::GitRepo::discover(repo)
+        .and_then(|git| git.cherry_marked(upstream, tip, aethyme_broker::CherrySide::Right))
+        .map(|marked| {
+            marked
+                .into_iter()
+                .filter_map(|(commit, equivalent)| equivalent.then_some(commit))
                 .collect()
         })
         .unwrap_or_default()
