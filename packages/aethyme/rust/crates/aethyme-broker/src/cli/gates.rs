@@ -731,21 +731,42 @@ pub(super) fn run_gates(parsed: Parsed) -> Result<(), UsageError> {
                 "gates affected requires --session <id>".into(),
             ))?;
             let mut broker = open_broker(parsed.read_only_snapshot)?;
-            let selections = broker.affected_gates(session)?;
+            let report = broker.affected_gates_with_timings(session)?;
+            super::telemetry::set_command_metric_details(serde_json::json!({
+                "phase_timings_ms": report.phase_timings_ms,
+                "phase_budget_ms": report.phase_budget_ms,
+                "over_budget_phases": report.over_budget_phases,
+            }));
             if parsed.json {
-                let out: Vec<_> = selections
+                let selected_gates: Vec<_> = report
+                    .selected_gates
                     .iter()
                     .map(|(gate, why)| serde_json::json!({"gate": gate, "triggered_by": why}))
                     .collect();
-                out!("{}", serde_json::to_string_pretty(&out)?);
-            } else if selections.is_empty() {
-                out!("No gates affected by this session's diff.");
+                let output = serde_json::json!({
+                    "selected_gates": selected_gates,
+                    "phase_timings_ms": report.phase_timings_ms,
+                    "phase_budget_ms": report.phase_budget_ms,
+                    "over_budget_phases": report.over_budget_phases,
+                });
+                out!("{}", serde_json::to_string_pretty(&output)?);
             } else {
-                for (gate, why) in selections {
-                    match why {
-                        Some(path) => out!("{gate}  (triggered by {path})"),
-                        None => out!("{gate}  (always runs)"),
+                if report.selected_gates.is_empty() {
+                    out!("No gates affected by this session's diff.");
+                } else {
+                    for (gate, why) in report.selected_gates {
+                        match why {
+                            Some(path) => out!("{gate}  (triggered by {path})"),
+                            None => out!("{gate}  (always runs)"),
+                        }
                     }
+                }
+                if !report.over_budget_phases.is_empty() {
+                    out!(
+                        "Warning: gates affected phase(s) exceeded the {} ms budget: {}",
+                        report.phase_budget_ms,
+                        report.over_budget_phases.join(", ")
+                    );
                 }
             }
         }

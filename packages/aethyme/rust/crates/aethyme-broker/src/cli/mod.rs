@@ -421,7 +421,8 @@ Usage:
       Evaluate the shared path selector for two exact commits using the
       gates.toml committed at head. Read-only; semantic hints stay advisory.
   aethyme broker gates affected --session <id> [--json]
-      Show which gates the session's diff selects and why.
+      Show which gates the session's diff selects and why, with per-phase
+      timing and a warning when a phase exceeds its 5-second budget.
   aethyme broker gates semantic --session <id> [--json]
       Advisory semantic gate-selection report: shows enforced path-triggered
       gates plus caller-edge suggestion status. Never changes what submit,

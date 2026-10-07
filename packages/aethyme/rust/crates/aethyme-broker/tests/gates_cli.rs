@@ -95,6 +95,48 @@ fn fixture() -> tempfile::TempDir {
 }
 
 #[test]
+fn affected_gates_json_and_command_metrics_include_phase_timings() {
+    let tmp = fixture();
+    let mut broker = aethyme_broker::Broker::open(tmp.path()).unwrap();
+    let session = broker
+        .start_worktree("affected gate timings", None)
+        .unwrap();
+    let worktree = Path::new(&session.worktree_path);
+    std::fs::write(worktree.join("tracked.txt"), "second\n").unwrap();
+
+    let session_id = session.id.to_string();
+    let output = run(
+        tmp.path(),
+        &[
+            "advanced",
+            "gates",
+            "affected",
+            "--session",
+            &session_id,
+            "--json",
+        ],
+    );
+    let output = stdout(output);
+    let report: serde_json::Value = serde_json::from_str(&output).unwrap();
+    assert_eq!(report["selected_gates"][0]["gate"], "provenance");
+    assert_eq!(report["phase_budget_ms"], 5_000);
+    assert_eq!(report["phase_timings_ms"]["lock_wait"], 0);
+    assert!(report["over_budget_phases"].as_array().unwrap().is_empty());
+    for phase in ["graph_read", "manifest", "selection", "lock_wait"] {
+        assert!(report["phase_timings_ms"][phase].is_u64(), "{report:#}");
+    }
+
+    let metrics =
+        std::fs::read_to_string(tmp.path().join(".aethyme/logs/command-metrics.jsonl")).unwrap();
+    let metric: serde_json::Value =
+        serde_json::from_str(metrics.lines().last().expect("one command metric")).unwrap();
+    assert_eq!(metric["command"], "gates.affected");
+    assert_eq!(metric["phase_budget_ms"], report["phase_budget_ms"]);
+    assert_eq!(metric["phase_timings_ms"], report["phase_timings_ms"]);
+    assert_eq!(metric["over_budget_phases"], report["over_budget_phases"]);
+}
+
+#[test]
 fn exact_gate_scope_manifest_is_redacted_deterministic_and_selector_complete() {
     let tmp = tempfile::tempdir().unwrap();
     git(tmp.path(), &["init", "-q", "-b", "main"]);
