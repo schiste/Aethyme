@@ -559,6 +559,7 @@ fn a_killed_write_reports_both_halves_and_their_recovery_order() {
         .unwrap()
         .worktree_path;
     drop(broker);
+    let lease_holder_pid = dead_pid();
     let mut coordinator =
         HostResourceCoordinator::open(&fixture.state.join("host-resources.db")).unwrap();
     let grant = coordinator
@@ -569,7 +570,7 @@ fn a_killed_write_reports_both_halves_and_their_recovery_order() {
             worktree_fingerprint: format!("{:x}", Sha256::digest(worktree_path.as_bytes())),
             run_id: "prepush".into(),
             ttl_seconds: 600,
-            holder_pid: Some(dead_pid()),
+            holder_pid: Some(lease_holder_pid),
             resources: vec![HostResourceRequirement {
                 key: "slot".into(),
                 resource: HostResourceKind::Namespace {
@@ -607,12 +608,15 @@ fn a_killed_write_reports_both_halves_and_their_recovery_order() {
         op["cause"].as_str().unwrap().contains(&lease_id),
         "the operation names the lease: {op:#}"
     );
+    let lease = blocker(&lease_id);
+    let lease_cause = lease["cause"].as_str().unwrap();
     assert!(
-        blocker(&lease_id)["cause"]
-            .as_str()
-            .unwrap()
-            .contains(&op_id),
+        lease_cause.contains(&op_id),
         "the lease names the operation"
+    );
+    assert!(
+        lease_cause.contains(&format!("holder pid {lease_holder_pid} is gone")),
+        "the recovery diagnostic names the dead holder: {lease:#}"
     );
     let pair = &report["paired_recovery"];
     assert_eq!(pair["blockers"], serde_json::json!([op_id, lease_id]));
@@ -673,4 +677,56 @@ fn a_killed_write_reports_both_halves_and_their_recovery_order() {
     assert!(last.get("still_blocked_by").is_none(), "{last:#}");
     assert!(fixture.run(&["unblock", "--json"]).status.success());
     assert!(fixture.blockers().is_empty());
+}
+
+#[test]
+fn a_live_quarantined_lease_reports_its_holder_pid_as_running() {
+    let fixture = Fixture::new();
+    let worktree_path = fixture
+        .broker()
+        .store()
+        .session(fixture.session_id)
+        .unwrap()
+        .worktree_path;
+    let holder_pid = std::process::id();
+    let mut coordinator =
+        HostResourceCoordinator::open(&fixture.state.join("host-resources.db")).unwrap();
+    let grant = coordinator
+        .acquire(&HostResourceRequest {
+            schema_version: aethyme_broker::HOST_RESOURCE_REQUEST_SCHEMA_VERSION,
+            request_id: "live-holder".into(),
+            repository: "unrelated-origin".into(),
+            worktree_fingerprint: format!("{:x}", Sha256::digest(worktree_path.as_bytes())),
+            run_id: "prepush".into(),
+            ttl_seconds: 600,
+            holder_pid: Some(holder_pid),
+            resources: vec![HostResourceRequirement {
+                key: "slot".into(),
+                resource: HostResourceKind::Namespace {
+                    prefix: "prepush".into(),
+                },
+            }],
+        })
+        .unwrap();
+    coordinator
+        .quarantine(
+            &grant.lease.lease_id,
+            grant.lease.generation,
+            &grant.ownership_token,
+        )
+        .unwrap();
+    drop(coordinator);
+
+    let id = format!("resource:{}", grant.lease.lease_id);
+    let blocker = fixture
+        .blocker(&id)
+        .expect("quarantined lease is a blocker");
+    assert!(
+        blocker["cause"]
+            .as_str()
+            .unwrap()
+            .contains(&format!("holder pid {holder_pid} is still running")),
+        "the recovery diagnostic names the live holder: {blocker:#}"
+    );
+    assert_eq!(blocker["safe_to_clear_automatically"], false);
 }
