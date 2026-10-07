@@ -55,6 +55,13 @@ mod gate_admission;
 mod gate_cache_gc;
 mod gate_database;
 pub use gate_database::GateBrokerDatabase;
+mod gate_debris;
+pub use gate_debris::{
+    CONTAINER_RUNTIME_ENV, CliContainerRuntime, ContainerRuntime, DOCTOR_PLAN_SCHEMA_VERSION,
+    DOCTOR_REMOVED, DebrisAction, DebrisApplyOutcome, DebrisApplyReport, DebrisItem, DebrisOwner,
+    DebrisPlan, DebrisRemoval, DebrisRuntime, GATE_LABELS_ENV, GATE_RUN_ID_ENV, GateRunLabels,
+    RuntimeResource, RuntimeResourceKind,
+};
 mod gate_doctor;
 mod gates;
 mod gc;

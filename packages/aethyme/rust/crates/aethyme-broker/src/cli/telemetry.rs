@@ -369,7 +369,10 @@ pub(super) fn command_records_metric(args: &[String]) -> bool {
             Some("doctor") => args.iter().any(|arg| arg == "--probe"),
             _ => true,
         },
-        Some("doctor") => args.iter().any(|arg| arg == "--fix-version"),
+        Some("doctor") => {
+            args.get(1).map(String::as_str) == Some("apply")
+                || args.iter().any(|arg| arg == "--fix-version")
+        }
         Some("trust") => args.get(1).map(String::as_str) != Some("status"),
         Some("blockers") => false,
         // Listing the outbox is a read; claims, dispatches and completions

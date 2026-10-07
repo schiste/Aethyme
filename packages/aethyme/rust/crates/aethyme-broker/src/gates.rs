@@ -926,7 +926,7 @@ pub(crate) fn heartbeat_interval() -> Duration {
 /// gate: `<session>-<gate>.pid` containing
 /// `<pgid> <tree_hash> <pid> <start_time>`. Readers need only the first two
 /// fields, so older pidfiles (`<pgid> <tree_hash>`) still parse.
-fn running_dir(main_root: &Path) -> PathBuf {
+pub(crate) fn running_dir(main_root: &Path) -> PathBuf {
     main_root.join(".aethyme/run/gates")
 }
 
@@ -1042,12 +1042,16 @@ pub(crate) struct GatePidRecord {
     /// The leader's start time, in [`process_start_time`] units. It is what
     /// tells the recorded process apart from a later one that reused its PID.
     pub(crate) start: Option<u64>,
+    /// The run id handed to the gate command as `AETHYME_GATE_RUN_ID`, so a
+    /// labelled container can be matched to the run that started it (#287).
+    /// Absent from pidfiles written before it was recorded.
+    pub(crate) run: Option<String>,
 }
 
 impl GatePidRecord {
     /// Whether the recorded leader is still running: same PID and, where the
     /// platform reports it, the same start time.
-    fn names_running_process(&self) -> bool {
+    pub(crate) fn names_running_process(&self) -> bool {
         let pid = self.pid.unwrap_or(self.pgid);
         match (self.start, process_start_time(pid)) {
             // A different process reusing the PID is not the gate.
@@ -1064,11 +1068,12 @@ impl GatePidRecord {
     fn render(&self) -> String {
         let field = |value: Option<String>| value.unwrap_or_else(|| "-".to_string());
         format!(
-            "{} {} {} {}",
+            "{} {} {} {} {}",
             self.pgid,
             self.tree,
             field(self.pid.map(|pid| pid.to_string())),
             field(self.start.map(|start| start.to_string())),
+            field(self.run.clone()),
         )
     }
 
@@ -1078,11 +1083,13 @@ impl GatePidRecord {
         let tree = parts.next()?.to_string();
         let pid = parts.next().and_then(|pid| pid.parse().ok());
         let start = parts.next().and_then(|start| start.parse().ok());
+        let run = parts.next().filter(|run| *run != "-").map(str::to_string);
         Some(Self {
             pgid,
             tree,
             pid,
             start,
+            run,
         })
     }
 }
@@ -2220,6 +2227,8 @@ fn run_selections(
         );
         let started = Instant::now();
         let broker_database = std::cell::OnceCell::new();
+        let run_labels =
+            crate::gate_debris::GateRunLabels::new(&gate.name, session_id, &repository);
         let status = run_gate_command(
             &gate.command,
             GateCommandContext {
@@ -2241,6 +2250,7 @@ fn run_selections(
                 resources: resource_runtime.as_ref(),
                 managed_cache: managed_cache_runtime.as_ref(),
                 broker_database: &broker_database,
+                run_labels: &run_labels,
             },
         );
         if let Some(cache) = managed_cache_runtime.as_mut() {
@@ -2756,6 +2766,8 @@ struct GateCommandContext<'a> {
     /// Filled once the command's disposable broker database is prepared, so
     /// the caller can report it whatever the command then does.
     broker_database: &'a std::cell::OnceCell<crate::GateBrokerDatabase>,
+    /// The labels the command puts on what it starts (#287).
+    run_labels: &'a crate::gate_debris::GateRunLabels,
 }
 
 struct GateCommandOutcome {
@@ -2929,6 +2941,11 @@ fn run_gate_command(
         .env(crate::BROKER_DB_ENV, &isolated_broker_db_path)
         .env(crate::gate_database::SCOPE_ENV, isolated_broker_scope)
         .env("AETHYME_GATE_OWNER_PATHS", context.owner_paths.join(":"))
+        .env(crate::gate_debris::GATE_RUN_ID_ENV, &context.run_labels.run)
+        .env(
+            crate::gate_debris::GATE_LABELS_ENV,
+            context.run_labels.env_value(),
+        )
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::from(log))
         .stderr(std::process::Stdio::from(log_err))
@@ -2962,6 +2979,7 @@ fn run_gate_command(
             tree: context.tree.to_string(),
             pid: Some(pid),
             start: process_start_time(pid),
+            run: Some(context.run_labels.run.clone()),
         };
         if let Err(error) = write_gate_pidfile(pidfile, &record) {
             // Without a pidfile the run cannot be cancelled from outside, so
@@ -3621,6 +3639,7 @@ mod tests {
             tree: "tree".to_string(),
             pid: Some(pgid),
             start,
+            run: None,
         }
     }
 

@@ -390,6 +390,8 @@ pub(super) const FLAG_RULES: &[(&str, &[&str])] = &[
         &["--days", "--session-limit", "--pull-request-limit"],
     ),
     ("doctor", &["--fix-version"]),
+    ("doctor plan", &[]),
+    ("doctor apply", &["--confirm"]),
     ("quick-test", &["--chau7", "--with-gate"]),
     ("verify-loop", &[]),
     ("e2e", &[]),

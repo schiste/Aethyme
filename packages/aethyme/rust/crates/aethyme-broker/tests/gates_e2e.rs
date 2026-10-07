@@ -795,6 +795,58 @@ triggers = ["**/*.py"]
     assert!(outcomes[0].log_path.as_deref().unwrap().contains("-s"));
 }
 
+/// #287: a gate command learns the labels to put on what it starts, and its
+/// pidfile records the same run id, so `broker doctor` can tell a container
+/// of the running gate from one a killed run left behind.
+#[test]
+fn gate_commands_receive_run_labels_matching_their_pidfile() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    let capture = tmp.path().join("labels.txt");
+    write_gates(
+        tmp.path(),
+        &format!(
+            r#"
+[[gate]]
+name = "label-check"
+command = 'printf "%s\n%s\n" "$AETHYME_GATE_LABELS" "$AETHYME_GATE_RUN_ID" > "{capture}" && cat "{run_dir}"/*-label-check.pid >> "{capture}"'
+triggers = ["**/*.py"]
+"#,
+            capture = capture.display(),
+            run_dir = tmp.path().join(".aethyme/run/gates").display(),
+        ),
+    );
+    commit_all(tmp.path(), "add gates");
+
+    let mut broker = Broker::open(tmp.path()).unwrap();
+    let wt = add_worktree(tmp.path(), "labels");
+    let session = broker.adopt(&wt, None).unwrap();
+    std::fs::write(wt.join("src/app.py"), "x = 2\n").unwrap();
+    let outcomes = broker.run_gates(session.id).unwrap();
+    assert_eq!(outcomes[0].status, GateStatus::Pass, "{outcomes:?}");
+
+    let captured = std::fs::read_to_string(&capture).unwrap();
+    let mut lines = captured.lines();
+    let labels: Vec<&str> = lines.next().unwrap().split(' ').collect();
+    let run = lines.next().unwrap();
+    let pidfile = lines.next().unwrap();
+    assert!(!run.is_empty());
+    let key = broker.gate_repository_key().unwrap();
+    for expected in [
+        "aethyme.gate=label-check".to_string(),
+        format!("aethyme.session={}", session.id),
+        format!("aethyme.repo={key}"),
+        format!("aethyme.run={run}"),
+    ] {
+        assert!(labels.contains(&expected.as_str()), "{labels:?}");
+    }
+    assert_eq!(
+        pidfile.split_whitespace().nth(4),
+        Some(run),
+        "the pidfile records the run the command was told: {pidfile}"
+    );
+}
+
 #[test]
 fn executed_gates_record_machine_load_and_free_disk_and_cache_hits_do_not() {
     let tmp = tempfile::tempdir().unwrap();
