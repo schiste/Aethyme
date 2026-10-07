@@ -27,6 +27,15 @@ fn git(repo: &Path, args: &[&str]) -> String {
 /// A repository with `policy` committed on `main`, and a `change` branch that
 /// writes `files` on top of it.
 fn repository(policy: &str, files: &[(&str, String)]) -> tempfile::TempDir {
+    repository_with_base(policy, &[], files)
+}
+
+/// As [`repository`], with `base_files` committed on `main` too.
+fn repository_with_base(
+    policy: &str,
+    base_files: &[(&str, String)],
+    files: &[(&str, String)],
+) -> tempfile::TempDir {
     let root = tempfile::tempdir().unwrap();
     let path = root.path();
     git(path, &["init", "-q", "-b", "main"]);
@@ -38,6 +47,11 @@ fn repository(policy: &str, files: &[(&str, String)]) -> tempfile::TempDir {
     )
     .unwrap();
     std::fs::write(path.join("README.md"), "initial\n").unwrap();
+    for (file, content) in base_files {
+        let target = path.join(file);
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(target, content).unwrap();
+    }
     git(path, &["add", "-A"]);
     git(path, &["commit", "-qm", "initial"]);
     git(path, &["checkout", "-q", "-b", "change"]);
@@ -178,22 +192,44 @@ fn without_projection_the_change_is_measured_but_nothing_is_projected() {
 
 #[test]
 fn generated_files_and_lockfiles_do_not_count_toward_size() {
-    let root = repository(
+    // The base declares `gen/**` generated; the change adds files under it.
+    let root = repository_with_base(
         "[review.projection]\nenabled = true\n",
+        &[(".gitattributes", "gen/** linguist-generated\n".to_string())],
         &[
-            (".gitattributes", "gen/** linguist-generated\n".to_string()),
             ("gen/out.rs", lines(5000)),
             ("Cargo.lock", lines(3000)),
             ("src/lib.rs", lines(2)),
         ],
     );
     let plan = plan(root.path());
-    // `.gitattributes` and `src/lib.rs` count; the generated file and the
-    // lockfile do not.
-    assert_eq!(plan["change"]["size"]["files_changed"], 2);
+    // Only `src/lib.rs` counts; the generated file and the lockfile do not.
+    assert_eq!(plan["change"]["size"]["files_changed"], 1);
     assert_eq!(plan["change"]["tier"], "trivial");
     assert_eq!(
         plan["change"]["signals"]["dependency_manifest"],
         serde_json::json!(["Cargo.lock"])
     );
+}
+
+#[test]
+fn a_change_cannot_mark_its_own_files_generated_to_shrink_its_size() {
+    // The head's `.gitattributes` marks everything generated; the base's does
+    // not, so every file still counts and the change stays large.
+    let root = repository(
+        "[review.projection]\nenabled = true\n",
+        &[
+            (".gitattributes", "* linguist-generated\n".to_string()),
+            ("src/lib.rs", lines(2000)),
+        ],
+    );
+    let plan = plan(root.path());
+    assert_eq!(
+        plan["change"]["size"]["files_changed"], 2,
+        "{}",
+        plan["change"]
+    );
+    assert_eq!(plan["change"]["size"]["lines_added"], 2001);
+    assert_eq!(plan["change"]["tier"], "large");
+    assert!(plan["change"]["size"].get("excluded").is_none());
 }

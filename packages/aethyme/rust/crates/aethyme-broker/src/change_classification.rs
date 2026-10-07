@@ -311,8 +311,10 @@ pub struct ChangedFile {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ChangeInputs {
     pub files: Vec<ChangedFile>,
-    /// Paths `.gitattributes` marks `linguist-generated`, left out of the size.
-    pub generated: BTreeSet<String>,
+    /// Paths the base's `.gitattributes` marks `linguist-generated`, left out
+    /// of the size. `None` when the base attributes could not be read: every
+    /// file then counts, and the input is reported unknown.
+    pub generated: Option<BTreeSet<String>>,
     /// Tracked cross-process symbols the diff touches; `None` when no diff text
     /// was available to scan, which is reported as unknown.
     pub contract_symbols: Option<Vec<String>>,
@@ -375,6 +377,13 @@ pub struct RiskSignals {
     pub from_fork: bool,
     pub first_time_contributor: bool,
     pub authored_by_model: bool,
+    /// Inputs that could not be determined, so a reader never mistakes "not
+    /// computed" for "clear": `contract_surface` when no diff could be
+    /// scanned, `generated_attributes` when the base `.gitattributes` could
+    /// not be read. Anything that relaxes review must refuse when this is not
+    /// empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unknown: Vec<String>,
 }
 
 /// Signal names, as rules and the guardrails spell them.
@@ -497,7 +506,11 @@ pub fn classify(
 
     let mut size = ChangeSize::default();
     for file in &files {
-        if inputs.generated.contains(&file.path) {
+        if inputs
+            .generated
+            .as_ref()
+            .is_some_and(|generated| generated.contains(&file.path))
+        {
             size.excluded.push(ExcludedFile {
                 path: file.path.clone(),
                 why: "generated".into(),
@@ -542,6 +555,16 @@ pub fn classify(
         from_fork: inputs.from_fork,
         first_time_contributor: inputs.first_time_contributor,
         authored_by_model: inputs.authored_by_model,
+        unknown: {
+            let mut unknown = Vec::new();
+            if inputs.contract_symbols.is_none() {
+                unknown.push("contract_surface".to_string());
+            }
+            if inputs.generated.is_none() {
+                unknown.push("generated_attributes".to_string());
+            }
+            unknown
+        },
     };
 
     let mut reasons = Vec::new();
@@ -659,11 +682,11 @@ pub fn summary_line(classification: &ChangeClassification) -> String {
     if !signals.is_empty() {
         line.push_str(&format!(" — signals: {}", signals.join(", ")));
     }
-    if matches!(
-        classification.signals.contract_surface,
-        ContractSurface::Unknown
-    ) {
-        line.push_str(" (contract scan unavailable)");
+    if !classification.signals.unknown.is_empty() {
+        line.push_str(&format!(
+            " (not determined: {})",
+            classification.signals.unknown.join(", ")
+        ));
     }
     line
 }
@@ -731,45 +754,67 @@ pub fn parse_numstat_z(output: &str) -> Vec<ChangedFile> {
     files
 }
 
-/// Paths `.gitattributes` marks `linguist-generated`, as `root` resolves them.
+/// Paths the BASE commit's `.gitattributes` marks `linguist-generated`.
 ///
-/// The same rule `quality inspect` uses (#565). A failed lookup returns no
-/// paths, which counts generated files toward the size: overstating a change
-/// is the safe direction, since nothing relaxes review on a large one.
+/// Read from `base`, never from the change's own head: a pull request that
+/// adds or edits `.gitattributes` to mark its own files generated must not be
+/// able to shrink its size and tier. The base tree is loaded into a temporary
+/// index and queried with `check-attr --cached`, which works on every Git the
+/// broker supports (`--source` needs 2.40, above `MINIMUM_GIT_VERSION`).
+///
+/// `None` means the base attributes could not be read. The caller then counts
+/// every file toward the size -- the safe direction -- and reports the input
+/// as unknown so nothing relaxes review on it.
 pub fn linguist_generated_paths(
     root: &Path,
+    base: &str,
     paths: &[String],
-) -> std::collections::BTreeSet<String> {
+) -> Option<BTreeSet<String>> {
     use std::io::Write;
-    let mut found = std::collections::BTreeSet::new();
+    let mut found = BTreeSet::new();
     if paths.is_empty() {
-        return found;
+        return Some(found);
     }
-    let Ok(mut child) = crate::git::git_command()
+    let index_dir = tempfile::tempdir().ok()?;
+    let index = index_dir.path().join("base-index");
+    let read_tree = crate::git::git_command()
         .current_dir(root)
-        .args(["check-attr", "-z", "--stdin", "linguist-generated"])
+        .env("GIT_INDEX_FILE", &index)
+        .args(["read-tree", base])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .ok()?;
+    if !read_tree.success() {
+        return None;
+    }
+    let mut child = crate::git::git_command()
+        .current_dir(root)
+        .env("GIT_INDEX_FILE", &index)
+        .args([
+            "check-attr",
+            "--cached",
+            "-z",
+            "--stdin",
+            "linguist-generated",
+        ])
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .spawn()
-    else {
-        return found;
-    };
-    if let Some(mut stdin) = child.stdin.take() {
+        .ok()?;
+    {
+        let mut stdin = child.stdin.take()?;
         let mut input = Vec::new();
         for path in paths {
             input.extend_from_slice(path.as_bytes());
             input.push(0);
         }
-        if stdin.write_all(&input).is_err() {
-            return found;
-        }
+        stdin.write_all(&input).ok()?;
     }
-    let Ok(output) = child.wait_with_output() else {
-        return found;
-    };
+    let output = child.wait_with_output().ok()?;
     if !output.status.success() {
-        return found;
+        return None;
     }
     // `-z` output is `path\0attribute\0value\0` per path.
     let text = String::from_utf8_lossy(&output.stdout);
@@ -781,7 +826,7 @@ pub fn linguist_generated_paths(
             found.insert((*path).to_string());
         }
     }
-    found
+    Some(found)
 }
 
 #[cfg(test)]
@@ -800,6 +845,7 @@ mod tests {
         ChangeInputs {
             files,
             contract_symbols: Some(Vec::new()),
+            generated: Some(BTreeSet::new()),
             ..Default::default()
         }
     }
@@ -833,7 +879,7 @@ mod tests {
             file("gen/out.rs", 3000, 0),
             file("src/a.rs", 2, 0),
         ]);
-        i.generated.insert("gen/out.rs".into());
+        i.generated = Some(["gen/out.rs".to_string()].into());
         let c = classify(&ChangeClassificationPolicy::default(), &i);
         assert_eq!(c.size.files_changed, 1);
         assert_eq!(c.size.churn, 2);
