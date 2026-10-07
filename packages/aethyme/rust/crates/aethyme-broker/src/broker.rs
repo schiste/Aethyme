@@ -10704,19 +10704,9 @@ impl Broker {
             // `in_target` while this plan held the same worktree as unproven.
             // Every positive names fixed commits, so the plan digest over this
             // reason stays stable until a delivery target moves.
-            for target in delivery_targets {
-                let crate::LandingVerdict::Landed {
-                    evidence,
-                    landed_by,
-                } = crate::representation::work_landed_within(
-                    &self.repo,
-                    session_head,
-                    target,
-                    self.landing_deadline.get(),
-                )?
-                else {
-                    continue;
-                };
+            if let Some((target, evidence, landed_by)) =
+                self.landing_on_delivery_targets(session_head, delivery_targets)?
+            {
                 provenance.representation = CleanupRepresentation::Represented;
                 provenance.pending_commit_count = 0;
                 provenance.represented_on = Some(target.clone());
@@ -10730,7 +10720,7 @@ impl Broker {
                     format!(
                         "session head {} is represented on delivery target {} by {}{by}",
                         short_commit(session_head),
-                        short_commit(target),
+                        short_commit(&target),
                         evidence.as_str()
                     ),
                 ));
@@ -10777,6 +10767,47 @@ impl Broker {
             ),
         };
         Ok((provenance, reason))
+    }
+
+    /// The first delivery target `head`'s work landed on, with its evidence.
+    ///
+    /// Ancestry is asked of every target before any target gets the deep
+    /// content and patch search (#588). The targets arrive sorted by SHA, so
+    /// asking each one the full question in turn made a merged branch pay a
+    /// candidate walk over whichever non-containing target sorted first --
+    /// a trailing primary checkout, or an integration branch that diverged --
+    /// before reaching the one a single `merge-base --is-ancestor` settles.
+    /// Only squash and rebase deliveries, which ancestry cannot see, reach the
+    /// search.
+    fn landing_on_delivery_targets(
+        &self,
+        head: &str,
+        delivery_targets: &[String],
+    ) -> Result<Option<(String, crate::LandingEvidence, Option<String>)>, BrokerOpError> {
+        if let Some(target) = delivery_targets
+            .iter()
+            .find(|target| self.repo.is_ancestor(head, target))
+        {
+            return Ok(Some((
+                target.clone(),
+                crate::LandingEvidence::Ancestry,
+                None,
+            )));
+        }
+        for target in delivery_targets {
+            if let crate::LandingVerdict::Landed {
+                evidence,
+                landed_by,
+            } = crate::representation::work_landed_within(
+                &self.repo,
+                head,
+                target,
+                self.landing_deadline.get(),
+            )? {
+                return Ok(Some((target.clone(), evidence, landed_by)));
+            }
+        }
+        Ok(None)
     }
 
     /// A recorded representation, when it proves this exact head landed.
@@ -13758,6 +13789,92 @@ mod tests {
         assert!(plan.worktrees.is_empty());
         assert_eq!(plan.eligible_worktree_count, 0);
         assert!(std::path::Path::new(&session.worktree_path).exists());
+    }
+
+    /// A temporary repository with a fixed identity, so `git commit` works
+    /// on a runner with no global configuration.
+    fn landing_fixture() -> (tempfile::TempDir, impl Fn(&[&str]) -> String) {
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path().to_path_buf();
+        let git = move |args: &[&str]| -> String {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&root)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["commit", "--allow-empty", "-qm", "base"]);
+        (repo, git)
+    }
+
+    #[test]
+    fn a_merged_head_is_proved_by_ancestry_before_any_candidate_walk() {
+        let (repo, git) = landing_fixture();
+        let base = git(&["rev-parse", "HEAD"]);
+        // A target that does not contain the head but gained commits since
+        // the fork: a candidate walk over it has something to examine.
+        git(&["switch", "-q", "-c", "diverged", &base]);
+        for n in 0..3 {
+            std::fs::write(repo.path().join(format!("other{n}.txt")), "x\n").unwrap();
+            git(&["add", "."]);
+            git(&["commit", "-qm", &format!("other {n}")]);
+        }
+        let diverged = git(&["rev-parse", "HEAD"]);
+        git(&["switch", "-q", "-c", "feature", &base]);
+        std::fs::write(repo.path().join("feature.txt"), "work\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "feature"]);
+        let head = git(&["rev-parse", "HEAD"]);
+        git(&["switch", "-q", "main"]);
+        git(&["merge", "-q", "--no-ff", "-m", "merge feature", "feature"]);
+        let merged = git(&["rev-parse", "HEAD"]);
+
+        let broker = super::Broker::open(repo.path()).unwrap();
+        // An expired deadline turns any candidate walk into an error, so
+        // success here proves none ran -- with the non-containing target
+        // deliberately listed first.
+        broker.landing_deadline.set(Some(std::time::Instant::now()));
+        let landed = broker
+            .landing_on_delivery_targets(&head, &[diverged, merged.clone()])
+            .unwrap()
+            .expect("a merged head is landed");
+        assert_eq!(landed.0, merged);
+        assert_eq!(landed.1, crate::LandingEvidence::Ancestry);
+        assert_eq!(landed.2, None);
+    }
+
+    #[test]
+    fn a_squash_landing_still_reaches_the_deep_proof() {
+        let (repo, git) = landing_fixture();
+        let base = git(&["rev-parse", "HEAD"]);
+        git(&["switch", "-q", "-c", "feature", &base]);
+        std::fs::write(repo.path().join("feature.txt"), "work\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "feature"]);
+        let head = git(&["rev-parse", "HEAD"]);
+        git(&["switch", "-q", "main"]);
+        git(&["merge", "-q", "--squash", "feature"]);
+        git(&["commit", "-qm", "squash feature"]);
+        let squashed = git(&["rev-parse", "HEAD"]);
+
+        let broker = super::Broker::open(repo.path()).unwrap();
+        let landed = broker
+            .landing_on_delivery_targets(&head, std::slice::from_ref(&squashed))
+            .unwrap()
+            .expect("a squashed head is landed");
+        assert_eq!(landed.1, crate::LandingEvidence::Content);
+        assert_eq!(landed.2.as_deref(), Some(squashed.as_str()));
     }
 
     #[test]
