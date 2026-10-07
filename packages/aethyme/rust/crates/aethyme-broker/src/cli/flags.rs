@@ -380,11 +380,15 @@ pub(super) const FLAG_RULES: &[(&str, &[&str])] = &[
     ("queue", &["--active", "--limit", "--before"]),
     ("queue history", &["--limit", "--before"]),
     ("promote", &["--entry"]),
-    ("ship plan", &["--entry", "--delivery", "--detail"]),
+    (
+        "ship plan",
+        &["--entry", "--only", "--delivery", "--detail"],
+    ),
     (
         "ship execute",
         &[
             "--entry",
+            "--only",
             "--confirm",
             "--delivery",
             "--plan",

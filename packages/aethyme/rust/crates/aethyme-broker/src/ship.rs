@@ -18,7 +18,7 @@ use std::path::Path;
 use std::time::Duration;
 
 pub const PUBLICATION_POLICY_SCHEMA_VERSION: u32 = 1;
-pub const REPOSITORY_DELIVERY_POLICY_SCHEMA_VERSION: u32 = 1;
+pub const REPOSITORY_DELIVERY_POLICY_SCHEMA_VERSION: u32 = 2;
 
 /// Each remote delivery operation gets one shared admission-and-child budget.
 /// The coordinator kills a child that outlives this budget and records remote
@@ -272,6 +272,36 @@ pub struct ShipPromotedEntry {
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
+pub struct ShipOnlyGateResult {
+    pub gate: String,
+    pub tree_hash: String,
+    pub status: String,
+    pub cached: bool,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ShipOnlyVerification {
+    pub source_base_sha: String,
+    pub base_sha: String,
+    pub publication_tree_sha: String,
+    pub changed_files: Vec<String>,
+    pub selected_gates: Vec<ShipOnlyGateResult>,
+    pub newly_published: bool,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ShipIntegrationReconciliation {
+    pub safe: bool,
+    pub applied: bool,
+    pub upstream_sha: String,
+    pub old_integration: String,
+    pub new_integration: String,
+    pub preserved_queue_entry_ids: Vec<i64>,
+    pub reverified_gates: Vec<String>,
+    pub next_action: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct ShipPlan {
     pub queue_entry: MergeQueueEntry,
     pub originating_session: Session,
@@ -282,6 +312,9 @@ pub struct ShipPlan {
     pub publication_sha: String,
     pub included_entries: Vec<ShipPromotedEntry>,
     pub excluded_entries: Vec<ShipPromotedEntry>,
+    pub only: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub only_verification: Option<ShipOnlyVerification>,
     pub local_default_branch_ref: String,
     pub local_default_branch_sha: String,
     pub remote_default_branch_ref: String,
@@ -348,6 +381,8 @@ pub struct ShipExecutionReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sync_operation: Option<CoordinatedOperation>,
     pub local_main_sync: ShipLocalMainSync,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub integration_reconciliation: Option<ShipIntegrationReconciliation>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -464,6 +499,8 @@ pub struct PullRequestDeliveryReport {
     /// entry exposures or publication advisories.
     pub resolved_exposures: Vec<EntryPathExposure>,
     pub resolved_advisories: Vec<crate::Advisory>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub integration_reconciliation: Option<ShipIntegrationReconciliation>,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -482,14 +519,25 @@ fn resolve_verified_publication(
     plan: &ShipPlan,
     verified_remote_sha: &str,
 ) -> Result<(Vec<EntryPathExposure>, Vec<crate::Advisory>), BrokerOpError> {
+    let included_only_ids = plan.only.then(|| {
+        plan.included_entries
+            .iter()
+            .map(|entry| entry.queue_entry_id)
+            .collect::<std::collections::BTreeSet<_>>()
+    });
     let contained_entry_ids = broker
         .store()
         .outstanding_entry_path_exposures()?
         .into_iter()
         .filter(|exposure| {
-            broker
-                .repo_handle()
-                .is_ancestor(&exposure.promotion_sha, verified_remote_sha)
+            included_only_ids.as_ref().map_or_else(
+                || {
+                    broker
+                        .repo_handle()
+                        .is_ancestor(&exposure.promotion_sha, verified_remote_sha)
+                },
+                |included| included.contains(&exposure.queue_entry_id),
+            )
         })
         .map(|exposure| exposure.queue_entry_id)
         .collect::<Vec<_>>();
@@ -533,7 +581,17 @@ impl Broker {
         entry_id: i64,
         delivery_override: Option<RepositoryDeliveryMode>,
     ) -> Result<ShipPlan, BrokerOpError> {
-        self.ship_plan_with_delivery_mode(entry_id, delivery_override, true)
+        self.ship_plan_with_delivery_mode(entry_id, delivery_override, true, false)
+    }
+
+    /// Build a single-entry plan from the remote default branch, after checking
+    /// independence and running the selected gates on that exact tree.
+    pub fn ship_plan_only_with_delivery(
+        &mut self,
+        entry_id: i64,
+        delivery_override: Option<RepositoryDeliveryMode>,
+    ) -> Result<ShipPlan, BrokerOpError> {
+        self.ship_plan_with_delivery_mode(entry_id, delivery_override, true, true)
     }
 
     /// Build the original direct-publication plan for the compatibility API.
@@ -542,7 +600,7 @@ impl Broker {
     /// preserves their established remote-moved error after a remote commit
     /// that is not present in the local object database.
     fn ship_plan_for_legacy_execution(&mut self, entry_id: i64) -> Result<ShipPlan, BrokerOpError> {
-        self.ship_plan_with_delivery_mode(entry_id, None, false)
+        self.ship_plan_with_delivery_mode(entry_id, None, false, false)
     }
 
     fn ship_plan_with_delivery_mode(
@@ -550,6 +608,7 @@ impl Broker {
         entry_id: i64,
         delivery_override: Option<RepositoryDeliveryMode>,
         select_delivery_policy: bool,
+        only: bool,
     ) -> Result<ShipPlan, BrokerOpError> {
         if crate::merge::PromoteConfig::load(self.main_root()).mode
             == crate::merge::PromoteMode::VerifyOnly
@@ -600,7 +659,8 @@ impl Broker {
                 head: integration_sha,
             });
         }
-        let publication_sha = promotion.clone();
+        let mut publication_sha = promotion.clone();
+        let mut only_verification = None;
         let mut included_entries = Vec::new();
         let mut excluded_entries = Vec::new();
         for promoted in queue
@@ -660,6 +720,82 @@ impl Broker {
                     remote_default.ref_name
                 ),
             })?;
+        if only {
+            let tracking_ref = format!("refs/remotes/{remote}/{default_branch}");
+            if self.repo_handle().resolve_ref(&tracking_ref).as_deref()
+                != Some(remote_default.sha.as_str())
+            {
+                return Err(BrokerOpError::ShipPlanUnavailable {
+                    what: "independent publication base",
+                    reason: format!(
+                        "local {tracking_ref} is not the advertised remote tip {}; fetch the remote default branch and rebuild the plan",
+                        remote_default.sha
+                    ),
+                });
+            }
+            let (independent_sha, changed_files) = build_ship_only_publication(
+                self,
+                &queue,
+                &entry,
+                session
+                    .adopted_head
+                    .as_deref()
+                    .or(session.adoption_base.as_deref())
+                    .or(session.diff_base.as_deref())
+                    .unwrap_or(&entry.base_commit),
+                &integration_sha,
+                &remote_default.sha,
+            )?;
+            publication_sha = independent_sha;
+            included_entries = vec![ShipPromotedEntry {
+                queue_entry_id: entry.id,
+                session_id: entry.session_id,
+                promotion_sha: promotion.clone(),
+                newly_published: !self
+                    .repo_handle()
+                    .is_ancestor(&promotion, &remote_default.sha),
+            }];
+            excluded_entries = queue
+                .iter()
+                .filter(|candidate| {
+                    candidate.id != entry.id
+                        && candidate.status == MergeStatus::Promoted
+                        && promotion_sha(candidate).is_some_and(|sha| {
+                            self.repo_handle().is_ancestor(&sha, &integration_sha)
+                        })
+                })
+                .map(|candidate| ShipPromotedEntry {
+                    queue_entry_id: candidate.id,
+                    session_id: candidate.session_id,
+                    promotion_sha: promotion_sha(candidate).expect("filtered promoted entry"),
+                    newly_published: true,
+                })
+                .collect();
+            excluded_entries.sort_by_key(|item| item.queue_entry_id);
+            let selected_gates = verify_ship_only_tree(
+                self,
+                &remote_default.sha,
+                &publication_sha,
+                &changed_files,
+                entry.session_id,
+            )?;
+            only_verification = Some(ShipOnlyVerification {
+                source_base_sha: session
+                    .adopted_head
+                    .as_deref()
+                    .or(session.adoption_base.as_deref())
+                    .or(session.diff_base.as_deref())
+                    .unwrap_or(&entry.base_commit)
+                    .into(),
+                base_sha: remote_default.sha.clone(),
+                publication_tree_sha: self.repo_handle().commit_tree_id(&publication_sha)?,
+                changed_files,
+                selected_gates,
+                newly_published: !self
+                    .repo_handle()
+                    .is_ancestor(&promotion, &remote_default.sha),
+            });
+        }
         let publication_policy = publication_assessment(
             self,
             &remote_default.sha,
@@ -687,20 +823,31 @@ impl Broker {
         let integration_is_ancestor_of_remote = self
             .repo_handle()
             .is_ancestor(&publication_sha, &remote_default.sha);
+        let remote_is_ancestor_of_publication = self
+            .repo_handle()
+            .is_ancestor(&remote_default.sha, &publication_sha);
         let result = if remote_default.sha == publication_sha {
             ShipFreshnessResult::AlreadyPublished
         } else if planned_remote_base_sha.is_none() {
             ShipFreshnessResult::RemoteTrackingMissing
         } else if !remote_matches_planned_base {
             ShipFreshnessResult::RemoteTrackingStale
-        } else if remote_is_ancestor_of_integration {
+        } else if if only {
+            remote_is_ancestor_of_publication
+        } else {
+            remote_is_ancestor_of_integration
+        } {
             ShipFreshnessResult::Ready
         } else {
             ShipFreshnessResult::NonFastForward
         };
-        let fast_forward = remote_is_ancestor_of_integration;
+        let fast_forward = if only {
+            remote_is_ancestor_of_publication
+        } else {
+            remote_is_ancestor_of_integration
+        };
 
-        if fast_forward {
+        if fast_forward && !only {
             let recorded = included_entries
                 .iter()
                 .map(|item| item.promotion_sha.as_str())
@@ -751,9 +898,10 @@ impl Broker {
                 reason: format!("cannot list local commits absent from integration: {error}"),
             })?;
         let local_main_sync_safe = local_main_sync_assessment.safe
-            && local_main_sync_assessment
-                .local_commits_not_in_integration
-                .is_empty();
+            && (only
+                || local_main_sync_assessment
+                    .local_commits_not_in_integration
+                    .is_empty());
 
         // An entry already contained in the remote default branch is history, not
         // part of what this push publishes. When the remote tip is unknown the
@@ -800,6 +948,8 @@ impl Broker {
             publication_sha,
             included_entries,
             excluded_entries,
+            only,
+            only_verification,
             local_default_branch_ref,
             local_default_branch_sha,
             remote_default_branch_ref: remote_default.ref_name,
@@ -980,9 +1130,19 @@ impl Broker {
                 what: "integration ref",
                 reason: format!("{} disappeared during execution", plan.integration_ref),
             })?;
-        if !self
-            .repo_handle()
-            .is_ancestor(confirm, &current_integration)
+        if plan.only && current_integration != plan.integration_sha {
+            return Err(BrokerOpError::ShipPlanUnavailable {
+                what: "independent publication source",
+                reason: format!(
+                    "integration moved from {} to {current_integration} during execution; no publication was attempted",
+                    plan.integration_sha
+                ),
+            });
+        }
+        if !plan.only
+            && !self
+                .repo_handle()
+                .is_ancestor(confirm, &current_integration)
         {
             return Err(BrokerOpError::ShipEntryNotOnIntegration {
                 entry: plan.queue_entry.id,
@@ -1074,6 +1234,9 @@ impl Broker {
         // and stale/unknown observations never reach this point.
         let (resolved_exposures, resolved_advisories) =
             resolve_verified_publication(self, &plan, &verified_remote_sha)?;
+        let integration_reconciliation = plan
+            .only
+            .then(|| reconcile_after_independent_publication(self, &plan, &verified_remote_sha));
 
         let before_sha = plan.local_default_branch_sha.clone();
         let (sync_operation, local_main_sync) = if sync_main {
@@ -1165,6 +1328,7 @@ impl Broker {
             resolved_advisories,
             sync_operation,
             local_main_sync,
+            integration_reconciliation,
         })
     }
 }
@@ -1187,6 +1351,55 @@ impl Broker {
         break_glass_reason: Option<&str>,
     ) -> Result<DeliveryExecutionReport, BrokerOpError> {
         let plan = self.ship_plan_with_delivery(entry_id, delivery_override)?;
+        self.ship_execute_delivery_from_plan(
+            plan,
+            confirm,
+            delivery_override,
+            plan_digest,
+            sync_main,
+            break_glass,
+            break_glass_reason,
+        )
+    }
+
+    /// Execute a `ship --only` plan. The independent plan is rebuilt and its
+    /// exact-tree gates are resolved before the supplied plan digest is
+    /// accepted, so callers cannot substitute a different tree or omit the
+    /// verification result between planning and publication.
+    #[allow(clippy::too_many_arguments)]
+    pub fn ship_execute_only_delivery(
+        &mut self,
+        entry_id: i64,
+        confirm: &str,
+        delivery_override: Option<RepositoryDeliveryMode>,
+        plan_digest: Option<&str>,
+        sync_main: bool,
+        break_glass: bool,
+        break_glass_reason: Option<&str>,
+    ) -> Result<DeliveryExecutionReport, BrokerOpError> {
+        let plan = self.ship_plan_only_with_delivery(entry_id, delivery_override)?;
+        self.ship_execute_delivery_from_plan(
+            plan,
+            confirm,
+            delivery_override,
+            plan_digest,
+            sync_main,
+            break_glass,
+            break_glass_reason,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn ship_execute_delivery_from_plan(
+        &mut self,
+        plan: ShipPlan,
+        confirm: &str,
+        delivery_override: Option<RepositoryDeliveryMode>,
+        plan_digest: Option<&str>,
+        sync_main: bool,
+        break_glass: bool,
+        break_glass_reason: Option<&str>,
+    ) -> Result<DeliveryExecutionReport, BrokerOpError> {
         if plan.delivery.requires_explicit_selection && delivery_override.is_none() {
             return Err(BrokerOpError::ShipDeliveryRequiresExplicitSelection {
                 recommendation: plan
@@ -1223,9 +1436,25 @@ impl Broker {
                     });
                 }
                 if plan.delivery.source == RepositoryDeliveryModeSource::LegacyDefault {
+                    if plan.only {
+                        let ship = self.ship_execute_from_plan(
+                            plan.clone(),
+                            confirm,
+                            sync_main,
+                            break_glass,
+                            break_glass_reason,
+                            delivery_operation_wait(),
+                        )?;
+                        return Ok(DeliveryExecutionReport::LocalMainMerge {
+                            ship,
+                            preservation_operation: None,
+                            merge_operation: None,
+                            plan_digest: plan.plan_digest,
+                        });
+                    }
                     return Ok(DeliveryExecutionReport::LocalMainMerge {
                         ship: self.ship_execute_with_policy(
-                            entry_id,
+                            plan.queue_entry.id,
                             confirm,
                             sync_main,
                             break_glass,
@@ -1482,11 +1711,514 @@ fn is_broker_runtime_path(path: &str) -> bool {
     crate::runtime_paths::is_broker_runtime_path(path)
 }
 
+fn build_ship_only_publication(
+    broker: &Broker,
+    queue: &[MergeQueueEntry],
+    entry: &MergeQueueEntry,
+    source_base: &str,
+    integration_sha: &str,
+    remote_base: &str,
+) -> Result<(String, Vec<String>), BrokerOpError> {
+    let repo = broker.repo_handle();
+    if !repo.is_ancestor(source_base, &entry.head_commit) {
+        return Err(BrokerOpError::ShipPlanUnavailable {
+            what: "independent publication source",
+            reason: format!(
+                "the recorded source base {source_base} is not an ancestor of entry {} head {}",
+                entry.id, entry.head_commit
+            ),
+        });
+    }
+    let selected_paths = repo.gate_scope_changed_between(source_base, &entry.head_commit)?;
+    if selected_paths.is_empty() {
+        return Err(BrokerOpError::ShipPlanUnavailable {
+            what: "independent publication",
+            reason: format!("queue entry {} has no changed-path evidence", entry.id),
+        });
+    }
+    let dependencies = parse_ship_dependencies(&repo.commit_message(&entry.head_commit)?)?;
+
+    for dependency_id in &dependencies {
+        let Some(dependency) = queue
+            .iter()
+            .find(|candidate| candidate.id == *dependency_id)
+        else {
+            return Err(BrokerOpError::ShipPlanUnavailable {
+                what: "independent publication dependency",
+                reason: format!(
+                    "entry {} declares Depends-On: q{}, but that queue entry does not exist",
+                    entry.id, dependency_id
+                ),
+            });
+        };
+        if dependency.id >= entry.id {
+            return Err(BrokerOpError::ShipPlanUnavailable {
+                what: "independent publication dependency",
+                reason: format!(
+                    "entry {} declares Depends-On: q{}, which is not an earlier queue entry",
+                    entry.id, dependency.id
+                ),
+            });
+        }
+    }
+
+    for earlier in queue
+        .iter()
+        .filter(|candidate| candidate.id < entry.id && candidate.status == MergeStatus::Promoted)
+    {
+        let earlier_promotion =
+            promotion_sha(earlier).ok_or_else(|| BrokerOpError::ShipPlanUnavailable {
+                what: "promoted queue provenance",
+                reason: format!("entry {} has no promoted commit detail", earlier.id),
+            })?;
+        if !repo.is_ancestor(&earlier_promotion, integration_sha)
+            || repo.is_ancestor(&earlier_promotion, remote_base)
+        {
+            continue;
+        }
+
+        let ancestry_dependency = is_unshipped_ancestry_dependency(
+            repo,
+            &earlier_promotion,
+            source_base,
+            &entry.head_commit,
+        );
+        let path_overlap = repo
+            .commit_changed_paths(&earlier_promotion)?
+            .iter()
+            .map(|(_, path)| path)
+            .any(|earlier_path| {
+                selected_paths
+                    .iter()
+                    .any(|selected_path| checkout_paths_collide(earlier_path, selected_path))
+            });
+        let declared_dependency = dependencies.contains(&earlier.id);
+        let reason = if ancestry_dependency {
+            Some("ancestry dependency")
+        } else if path_overlap {
+            Some("overlapping paths")
+        } else if declared_dependency {
+            Some("declared Depends-On trailer")
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
+            return Err(BrokerOpError::ShipPlanUnavailable {
+                what: "independent publication dependency",
+                reason: format!(
+                    "entry {} is blocked by earlier unshipped entry {} ({reason})",
+                    entry.id, earlier.id
+                ),
+            });
+        }
+    }
+
+    for dependency_id in &dependencies {
+        let dependency = queue
+            .iter()
+            .find(|candidate| candidate.id == *dependency_id)
+            .expect("declared dependency was validated above");
+        let dependency_promotion =
+            promotion_sha(dependency).ok_or_else(|| BrokerOpError::ShipPlanUnavailable {
+                what: "promoted queue provenance",
+                reason: format!(
+                    "declared dependency {} has no promoted commit detail",
+                    dependency.id
+                ),
+            })?;
+        if !repo.is_ancestor(&dependency_promotion, remote_base) {
+            return Err(BrokerOpError::ShipPlanUnavailable {
+                what: "independent publication dependency",
+                reason: format!(
+                    "entry {} is blocked by declared unshipped dependency {}",
+                    entry.id, dependency.id
+                ),
+            });
+        }
+    }
+
+    let simulation = repo.merge_tree_with_base(source_base, remote_base, &entry.head_commit)?;
+    if !simulation.conflicts.is_empty() {
+        return Err(BrokerOpError::ShipPlanUnavailable {
+            what: "independent publication tree",
+            reason: format!(
+                "entry {} conflicts when applied to the remote default branch: {}",
+                entry.id,
+                simulation.conflicts.join(", ")
+            ),
+        });
+    }
+    if simulation.tree == repo.commit_tree_id(remote_base)? {
+        return Err(BrokerOpError::ShipPlanUnavailable {
+            what: "independent publication tree",
+            reason: format!(
+                "entry {} has no content change relative to the remote default branch",
+                entry.id
+            ),
+        });
+    }
+
+    let message = format!(
+        "chore(broker): ship independent queue entry q{}\n\nAethyme-Queue-Entry: q{}",
+        entry.id, entry.id
+    );
+    let timestamp = format!("@{} +0000", entry.created_at.div_euclid(1_000));
+    let attribution = crate::attribution::Attribution::broker_only();
+    let mut command = crate::git::git_command();
+    let output = command
+        .arg("commit-tree")
+        .arg(&simulation.tree)
+        .arg("-p")
+        .arg(remote_base)
+        .arg("-m")
+        .arg(message)
+        .current_dir(repo.root())
+        .env("GIT_AUTHOR_NAME", &attribution.author.name)
+        .env("GIT_AUTHOR_EMAIL", &attribution.author.email)
+        .env("GIT_COMMITTER_NAME", &attribution.committer.name)
+        .env("GIT_COMMITTER_EMAIL", &attribution.committer.email)
+        .env("GIT_AUTHOR_DATE", &timestamp)
+        .env("GIT_COMMITTER_DATE", &timestamp)
+        .output()
+        .map_err(|error| BrokerOpError::ShipPlanUnavailable {
+            what: "independent publication commit",
+            reason: format!("cannot create a stable commit object: {error}"),
+        })?;
+    if !output.status.success() {
+        return Err(BrokerOpError::ShipPlanUnavailable {
+            what: "independent publication commit",
+            reason: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        });
+    }
+    let publication_sha = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let changed_files = repo.gate_scope_changed_between(remote_base, &publication_sha)?;
+    Ok((publication_sha, changed_files))
+}
+
+fn parse_ship_dependencies(
+    message: &str,
+) -> Result<std::collections::BTreeSet<i64>, BrokerOpError> {
+    let Some((_, trailer_block)) = message.rsplit_once("\n\n") else {
+        return Ok(std::collections::BTreeSet::new());
+    };
+    let mut dependencies = std::collections::BTreeSet::new();
+    for line in trailer_block.lines() {
+        let Some((key, values)) = line.split_once(':') else {
+            continue;
+        };
+        if !key.trim().eq_ignore_ascii_case("Depends-On") {
+            continue;
+        }
+        for value in values.split(',') {
+            let value = value.trim();
+            let digits = value
+                .strip_prefix('q')
+                .or_else(|| value.strip_prefix('Q'))
+                .or_else(|| value.strip_prefix('#'))
+                .unwrap_or(value);
+            let id = digits
+                .parse::<i64>()
+                .ok()
+                .filter(|id| *id > 0)
+                .ok_or_else(|| BrokerOpError::ShipPlanUnavailable {
+                    what: "independent publication dependency",
+                    reason: format!("invalid Depends-On trailer value {value:?}"),
+                })?;
+            dependencies.insert(id);
+        }
+    }
+    Ok(dependencies)
+}
+
+fn is_unshipped_ancestry_dependency(
+    repo: &GitRepo,
+    earlier_promotion: &str,
+    entry_base: &str,
+    entry_head: &str,
+) -> bool {
+    // A prior promotion already contained in the selected entry's recorded
+    // base is merely inherited history. It is a dependency only when the
+    // selected change itself brings that unshipped commit into its ancestry.
+    !repo.is_ancestor(earlier_promotion, entry_base)
+        && repo.is_ancestor(earlier_promotion, entry_head)
+}
+
+fn verify_ship_only_tree(
+    broker: &mut Broker,
+    base_sha: &str,
+    publication_sha: &str,
+    changed_files: &[String],
+    session_id: i64,
+) -> Result<Vec<ShipOnlyGateResult>, BrokerOpError> {
+    let Some(gates) = broker.load_and_sync_gates_at_commit(base_sha)? else {
+        return Ok(Vec::new());
+    };
+    broker.require_trusted_policy_at_commit(base_sha, Some(session_id))?;
+    let main_root = broker.main_root().to_path_buf();
+    let repo = GitRepo::discover(&main_root)?;
+    let mut slot = crate::verification::ExactTreeVerificationSlot::acquire_pooled_reporting(
+        &main_root,
+        "ship-only",
+        4,
+        Duration::from_secs(2),
+        &mut |waited| {
+            eprintln!("[ship --only] waiting for an exact-tree verification slot ({waited:?})")
+        },
+    )?;
+    let checkout = slot.materialize(&repo, publication_sha)?;
+    let outcomes = crate::gates::run_affected(
+        broker.store(),
+        &main_root,
+        &checkout,
+        &gates,
+        changed_files,
+        Some(session_id),
+        crate::gates::CachePolicy::Use,
+    )?;
+    let failed = outcomes
+        .iter()
+        .filter(|outcome| outcome.status != crate::types::GateStatus::Pass)
+        .map(|outcome| format!("{} ({})", outcome.gate, outcome.status.as_str()))
+        .collect::<Vec<_>>();
+    if !failed.is_empty() {
+        return Err(BrokerOpError::ShipPlanUnavailable {
+            what: "independent publication gates",
+            reason: format!(
+                "entry tree {publication_sha} did not pass its selected gates: {}",
+                failed.join(", ")
+            ),
+        });
+    }
+    Ok(outcomes
+        .into_iter()
+        .map(|outcome| ShipOnlyGateResult {
+            gate: outcome.gate,
+            tree_hash: outcome.tree_hash,
+            status: outcome.status.as_str().into(),
+            cached: outcome.cached,
+        })
+        .collect())
+}
+
+fn reconcile_after_independent_publication(
+    broker: &mut Broker,
+    plan: &ShipPlan,
+    published_sha: &str,
+) -> ShipIntegrationReconciliation {
+    use crate::reconciliation::{
+        IntegrationReconcileClassification as Classification, IntegrationReconcileOptions,
+    };
+
+    let current_integration = broker
+        .repo_handle()
+        .resolve_ref(&format!("refs/heads/{}", plan.integration_ref))
+        .unwrap_or_else(|| plan.integration_sha.clone());
+    let pending_ids = |entries: &[crate::reconciliation::IntegrationReconcileEntry]| {
+        entries
+            .iter()
+            .filter(|entry| {
+                entry.queue_entry_id != plan.queue_entry.id
+                    && entry.classification == Classification::StillPending
+            })
+            .map(|entry| entry.queue_entry_id)
+            .collect::<Vec<_>>()
+    };
+    let failure = |safe: bool,
+                   old_integration: String,
+                   new_integration: String,
+                   preserved_queue_entry_ids: Vec<i64>,
+                   reverified_gates: Vec<String>,
+                   next_action: String| {
+        ShipIntegrationReconciliation {
+            safe,
+            applied: false,
+            upstream_sha: published_sha.into(),
+            old_integration,
+            new_integration,
+            preserved_queue_entry_ids,
+            reverified_gates,
+            next_action,
+        }
+    };
+
+    let dry_run = match broker.reconcile_integration(IntegrationReconcileOptions {
+        upstream: published_sha.into(),
+        apply: false,
+        resolution_file: None,
+        confirm: None,
+    }) {
+        Ok(report) => report,
+        Err(error) => {
+            return failure(
+                false,
+                plan.integration_sha.clone(),
+                current_integration,
+                plan.excluded_entries
+                    .iter()
+                    .map(|entry| entry.queue_entry_id)
+                    .collect(),
+                Vec::new(),
+                format!(
+                    "independent publication {published_sha} succeeded, but integration reconciliation could not be planned: {error}; run `aethyme broker integration reconcile --upstream {published_sha} --dry-run`"
+                ),
+            );
+        }
+    };
+    let mut preserved_queue_entry_ids = pending_ids(&dry_run.entries);
+    if !dry_run.safe {
+        return failure(
+            false,
+            dry_run.old_integration,
+            dry_run.new_integration,
+            preserved_queue_entry_ids,
+            Vec::new(),
+            format!(
+                "independent publication {published_sha} succeeded; main reconciliation refused safely: {}",
+                dry_run.next_action
+            ),
+        );
+    }
+    let Some(confirm) = dry_run.plan_digest.clone() else {
+        return failure(
+            false,
+            dry_run.old_integration,
+            dry_run.new_integration,
+            preserved_queue_entry_ids,
+            Vec::new(),
+            format!(
+                "independent publication {published_sha} succeeded, but integration reconciliation produced no plan digest; run `aethyme broker integration reconcile --upstream {published_sha} --dry-run`"
+            ),
+        );
+    };
+
+    let mut reverified_gates = Vec::new();
+    for entry in &dry_run.entries {
+        if entry.queue_entry_id == plan.queue_entry.id
+            || entry.classification != Classification::StillPending
+        {
+            continue;
+        }
+        let Some(replayed_commit) = entry.replayed_commit.as_deref() else {
+            continue;
+        };
+        let old_tree = match broker.repo_handle().commit_tree_id(&entry.old_merge_commit) {
+            Ok(tree) => tree,
+            Err(error) => {
+                return failure(
+                    false,
+                    dry_run.old_integration,
+                    dry_run.new_integration,
+                    preserved_queue_entry_ids,
+                    reverified_gates,
+                    format!(
+                        "independent publication {published_sha} succeeded, but the old tree for q{} could not be checked: {error}; run main reconciliation manually",
+                        entry.queue_entry_id
+                    ),
+                );
+            }
+        };
+        let replayed_tree = match broker.repo_handle().commit_tree_id(replayed_commit) {
+            Ok(tree) => tree,
+            Err(error) => {
+                return failure(
+                    false,
+                    dry_run.old_integration,
+                    dry_run.new_integration,
+                    preserved_queue_entry_ids,
+                    reverified_gates,
+                    format!(
+                        "independent publication {published_sha} succeeded, but the replayed tree for q{} could not be checked: {error}; run main reconciliation manually",
+                        entry.queue_entry_id
+                    ),
+                );
+            }
+        };
+        if old_tree == replayed_tree {
+            continue;
+        }
+        match verify_ship_only_tree(
+            broker,
+            published_sha,
+            replayed_commit,
+            &entry.files,
+            entry.session_id,
+        ) {
+            Ok(results) => reverified_gates.extend(
+                results
+                    .into_iter()
+                    .map(|result| format!("q{}:{}", entry.queue_entry_id, result.gate)),
+            ),
+            Err(error) => {
+                return failure(
+                    false,
+                    dry_run.old_integration,
+                    dry_run.new_integration,
+                    preserved_queue_entry_ids,
+                    reverified_gates,
+                    format!(
+                        "independent publication {published_sha} succeeded, but changed replay tree for q{} did not pass verification: {error}; integration was left untouched",
+                        entry.queue_entry_id
+                    ),
+                );
+            }
+        }
+    }
+
+    let old_integration = dry_run.old_integration.clone();
+    let planned_integration = dry_run.new_integration.clone();
+    match broker.reconcile_integration(IntegrationReconcileOptions {
+        upstream: published_sha.into(),
+        apply: true,
+        resolution_file: None,
+        confirm: Some(confirm),
+    }) {
+        Ok(report) => {
+            preserved_queue_entry_ids = pending_ids(&report.entries);
+            ShipIntegrationReconciliation {
+                safe: report.safe,
+                applied: report.applied,
+                upstream_sha: report.upstream_head,
+                old_integration: report.old_integration,
+                new_integration: report.new_integration,
+                preserved_queue_entry_ids,
+                reverified_gates,
+                next_action: report.next_action,
+            }
+        }
+        Err(error) => failure(
+            true,
+            old_integration,
+            planned_integration,
+            preserved_queue_entry_ids,
+            reverified_gates,
+            format!(
+                "independent publication {published_sha} succeeded, but the verified integration reconciliation plan could not be applied: {error}; rerun `aethyme broker integration reconcile --upstream {published_sha} --dry-run`"
+            ),
+        ),
+    }
+}
+
 fn delivery_plan_digest(plan: &ShipPlan) -> Result<String, BrokerOpError> {
+    #[derive(serde::Serialize)]
+    struct GateAuthorization<'a> {
+        gate: &'a str,
+        tree_hash: &'a str,
+        status: &'a str,
+    }
+    #[derive(serde::Serialize)]
+    struct IndependentPublicationAuthorization<'a> {
+        source_base_sha: &'a str,
+        base_sha: &'a str,
+        publication_tree_sha: &'a str,
+        changed_files: &'a [String],
+        selected_gates: Vec<GateAuthorization<'a>>,
+    }
     #[derive(serde::Serialize)]
     struct DeliveryPlanAuthorization<'a> {
         schema_version: u32,
         entry_id: i64,
+        only: bool,
+        only_verification: Option<IndependentPublicationAuthorization<'a>>,
         integration_ref: &'a str,
         integration_sha: &'a str,
         publication_sha: &'a str,
@@ -1503,9 +2235,31 @@ fn delivery_plan_digest(plan: &ShipPlan) -> Result<String, BrokerOpError> {
         target: &'a str,
         delivery: &'a RepositoryDeliverySelection,
     }
+    let only_verification = plan.only_verification.as_ref().map(|verification| {
+        IndependentPublicationAuthorization {
+            source_base_sha: &verification.source_base_sha,
+            base_sha: &verification.base_sha,
+            publication_tree_sha: &verification.publication_tree_sha,
+            changed_files: &verification.changed_files,
+            // Cache hits are useful operator context but are not part of the
+            // authorization: the same exact tree and passing verdict must
+            // keep the same digest on a plan-to-execute retry.
+            selected_gates: verification
+                .selected_gates
+                .iter()
+                .map(|gate| GateAuthorization {
+                    gate: &gate.gate,
+                    tree_hash: &gate.tree_hash,
+                    status: &gate.status,
+                })
+                .collect(),
+        }
+    });
     let bytes = serde_json::to_vec(&DeliveryPlanAuthorization {
         schema_version: REPOSITORY_DELIVERY_POLICY_SCHEMA_VERSION,
         entry_id: plan.queue_entry.id,
+        only: plan.only,
+        only_verification,
         integration_ref: &plan.integration_ref,
         integration_sha: &plan.integration_sha,
         publication_sha: &plan.publication_sha,
@@ -1546,7 +2300,8 @@ fn validate_delivery_execution_confirmation(
             actual: confirm.into(),
         });
     }
-    if delivery_override.is_some()
+    if plan.only
+        || delivery_override.is_some()
         || plan.delivery.source != RepositoryDeliveryModeSource::LegacyDefault
     {
         let Some(plan_digest) = plan_digest else {
@@ -1588,6 +2343,18 @@ fn validate_delivery_source(broker: &Broker, plan: &ShipPlan) -> Result<(), Brok
                 plan.integration_ref
             ),
         })?;
+    if plan.only {
+        if current_integration != plan.integration_sha {
+            return Err(BrokerOpError::ShipPlanUnavailable {
+                what: "independent publication source",
+                reason: format!(
+                    "integration moved from {} to {current_integration} after the independent plan; rebuild the plan and re-run its selected gates",
+                    plan.integration_sha
+                ),
+            });
+        }
+        return Ok(());
+    }
     if !broker
         .repo_handle()
         .is_ancestor(&plan.publication_sha, &current_integration)
@@ -2191,6 +2958,14 @@ fn execute_pull_request_delivery(
                     Vec::new(),
                 )
             };
+            let integration_reconciliation =
+                (plan.only && delivery_state == DeliveryExecutionState::Published).then(|| {
+                    reconcile_after_independent_publication(
+                        broker,
+                        &plan,
+                        &target_verification.target_sha,
+                    )
+                });
             return Ok(PullRequestDeliveryReport {
                 plan,
                 delivery_state,
@@ -2207,6 +2982,7 @@ fn execute_pull_request_delivery(
                 pull_request,
                 resolved_exposures,
                 resolved_advisories,
+                integration_reconciliation,
             });
         }
         return Err(BrokerOpError::ShipDeliveryPullRequestMismatch {
@@ -2234,6 +3010,7 @@ fn execute_pull_request_delivery(
         pull_request,
         resolved_exposures: Vec::new(),
         resolved_advisories: Vec::new(),
+        integration_reconciliation: None,
     })
 }
 
@@ -3152,8 +3929,29 @@ mod tests {
     use super::{
         DeliveryExecutionState, REPOSITORY_DELIVERY_POLICY_SCHEMA_VERSION,
         RepositoryDeliveryConfig, RepositoryDeliveryMode, checkout_paths_collide,
-        is_broker_runtime_path, parse_delivery_pull_request_value,
+        is_broker_runtime_path, is_unshipped_ancestry_dependency,
+        parse_delivery_pull_request_value,
     };
+
+    fn test_git(root: &std::path::Path, args: &[&str]) -> String {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .env("GIT_AUTHOR_NAME", "ship-test")
+            .env("GIT_AUTHOR_EMAIL", "ship-test@example.invalid")
+            .env("GIT_COMMITTER_NAME", "ship-test")
+            .env("GIT_COMMITTER_EMAIL", "ship-test@example.invalid")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout)
+            .trim_end()
+            .to_string()
+    }
 
     #[test]
     fn checkout_collision_covers_exact_and_file_directory_replacements() {
@@ -3162,6 +3960,35 @@ mod tests {
         assert!(checkout_paths_collide("feature", "feature/nested.txt"));
         assert!(!checkout_paths_collide(".codex/local.md", "src/main.rs"));
         assert!(!checkout_paths_collide("feature-old", "feature"));
+    }
+
+    #[test]
+    fn ancestry_dependency_excludes_history_already_in_the_selected_base() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        test_git(root, &["init", "-q", "-b", "main"]);
+        std::fs::write(root.join("base.txt"), "base\n").unwrap();
+        test_git(root, &["add", "base.txt"]);
+        test_git(root, &["commit", "-qm", "base"]);
+        let base = test_git(root, &["rev-parse", "HEAD"]);
+
+        std::fs::write(root.join("earlier.txt"), "earlier\n").unwrap();
+        test_git(root, &["add", "earlier.txt"]);
+        test_git(root, &["commit", "-qm", "earlier promotion"]);
+        let earlier = test_git(root, &["rev-parse", "HEAD"]);
+
+        std::fs::write(root.join("selected.txt"), "selected\n").unwrap();
+        test_git(root, &["add", "selected.txt"]);
+        test_git(root, &["commit", "-qm", "selected entry"]);
+        let head = test_git(root, &["rev-parse", "HEAD"]);
+        let repo = crate::git::GitRepo::discover(root).unwrap();
+
+        assert!(is_unshipped_ancestry_dependency(
+            &repo, &earlier, &base, &head
+        ));
+        assert!(!is_unshipped_ancestry_dependency(
+            &repo, &earlier, &earlier, &head
+        ));
     }
 
     #[test]
