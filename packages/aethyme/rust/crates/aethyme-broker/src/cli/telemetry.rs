@@ -1,5 +1,26 @@
 //! Command telemetry: the allowlisted command label and the outcome and timing records.
 
+use std::cell::RefCell;
+
+thread_local! {
+    static COMMAND_METRIC_DETAILS: RefCell<Option<serde_json::Map<String, serde_json::Value>>> = const {
+        RefCell::new(None)
+    };
+}
+
+/// Attach command-specific fields to the metric written after this command
+/// returns. The command runner takes and clears them exactly once.
+pub(super) fn set_command_metric_details(details: serde_json::Value) {
+    let Some(details) = details.as_object().cloned() else {
+        return;
+    };
+    COMMAND_METRIC_DETAILS.with(|slot| *slot.borrow_mut() = Some(details));
+}
+
+fn take_command_metric_details() -> Option<serde_json::Map<String, serde_json::Value>> {
+    COMMAND_METRIC_DETAILS.with(|slot| slot.borrow_mut().take())
+}
+
 /// Safe-by-construction command telemetry: the label is built ONLY from
 /// an allowlist of known subcommand words, so positional values (paths,
 /// session ids, task text) can never leak into the metrics file. Best
@@ -148,7 +169,7 @@ pub(super) const FAILURE_MESSAGE_MAX_CHARS: usize = 500;
 /// one. It is stored redacted and capped so a failure can be explained after
 /// the terminal that showed it is gone.
 pub(super) fn record_command_outcome(args: &[String], exit: u8, error: Option<&str>) {
-    if !command_records_metric(args) {
+    if !command_records_outcome(args) {
         return;
     }
     let Some(surface) = safe_command_surface(args) else {
@@ -217,6 +238,7 @@ pub(super) fn record_command_outcome(args: &[String], exit: u8, error: Option<&s
 /// payload an agent pays to read.
 pub(super) fn record_command_metric(args: &[String], exit: u8, duration_ms: i64) {
     let output_bytes = crate::cli_output::emitted();
+    let details = take_command_metric_details();
     // Inspection commands are contractually side-effect free: the CLI documents
     // "never writes broker state or command telemetry" and `external_events_cli`
     // asserts the metrics file is byte-identical across them. That invariant
@@ -224,7 +246,7 @@ pub(super) fn record_command_metric(args: &[String], exit: u8, duration_ms: i64)
     // the frequent, expensive ones. Measuring them is therefore opt-in: unset,
     // nothing changes; set, the operator has accepted that inspection now
     // writes one telemetry line.
-    if !command_records_metric(args) && !output_measurement_opted_in() {
+    if !command_records_metric(args) && !output_measurement_opted_in() && details.is_none() {
         return;
     }
     let Some(label) = safe_command_surface(args) else {
@@ -247,8 +269,17 @@ pub(super) fn record_command_metric(args: &[String], exit: u8, duration_ms: i64)
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0);
+    let extra_fields = details
+        .filter(|fields| !fields.is_empty())
+        .and_then(|fields| {
+            serde_json::to_string(&serde_json::Value::Object(fields))
+                .ok()
+                .map(|json| json[1..json.len().saturating_sub(1)].to_string())
+        })
+        .map(|fields| format!(",{fields}"))
+        .unwrap_or_default();
     let line = format!(
-        "{{\"ts\":{ts},\"command\":\"{}\",\"duration_ms\":{duration_ms},\"exit\":{exit},\"output_bytes\":{output_bytes}}}\n",
+        "{{\"ts\":{ts},\"command\":\"{}\",\"duration_ms\":{duration_ms},\"exit\":{exit},\"output_bytes\":{output_bytes}{extra_fields}}}\n",
         label
     );
     use std::io::Write;
@@ -333,7 +364,8 @@ pub(super) fn command_records_metric(args: &[String]) -> bool {
         ),
         Some("events") => args.get(1).map(String::as_str) == Some("prune"),
         Some("gates") => match args.get(1).map(String::as_str) {
-            Some("validate" | "manifest" | "scope" | "affected" | "semantic") => false,
+            Some("affected") => true,
+            Some("validate" | "manifest" | "scope" | "semantic") => false,
             Some("doctor") => args.iter().any(|arg| arg == "--probe"),
             _ => true,
         },
@@ -350,9 +382,21 @@ pub(super) fn command_records_metric(args: &[String]) -> bool {
     }
 }
 
+/// `gates affected` opts into a timing line while preserving its read-only
+/// event-store contract. Other outcome events follow the command metric policy.
+fn command_records_outcome(args: &[String]) -> bool {
+    !matches!(
+        (
+            args.first().map(String::as_str),
+            args.get(1).map(String::as_str)
+        ),
+        (Some("gates"), Some("affected"))
+    ) && command_records_metric(args)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::safe_command_surface;
+    use super::{command_records_metric, command_records_outcome, safe_command_surface};
 
     /// Labels are built from the resolved internal spelling, which is what
     /// the dispatcher records.
@@ -383,5 +427,21 @@ mod tests {
             label("finish cleanup 42 --force").as_deref(),
             Some("cleanup")
         );
+    }
+
+    #[test]
+    fn affected_gates_records_phase_metrics_without_a_broker_outcome_event() {
+        let affected = ["gates", "affected", "--session", "7"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        assert!(command_records_metric(&affected));
+        assert!(!command_records_outcome(&affected));
+
+        let run = ["gates", "run", "--session", "7"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        assert!(command_records_outcome(&run));
     }
 }

@@ -96,15 +96,6 @@ fn report_only_commands_do_not_append_metrics() {
             "broker",
             "advanced",
             "gates",
-            "affected",
-            "--session",
-            "1",
-            "--json",
-        ][..],
-        &[
-            "broker",
-            "advanced",
-            "gates",
             "semantic",
             "--session",
             "1",
@@ -118,6 +109,36 @@ fn report_only_commands_do_not_append_metrics() {
             "report-only command appended telemetry: {args:?}"
         );
     }
+
+    // `gates affected` is the one read-only exception (#481): it records its
+    // phase timings so a stalled selection can be localized afterwards.
+    let affected_args = [
+        "broker",
+        "advanced",
+        "gates",
+        "affected",
+        "--session",
+        "1",
+        "--json",
+    ];
+    assert_success(&aethyme(temp.path(), &affected_args), &affected_args);
+    let after_affected = fs::read_to_string(&metrics_path).expect("gates affected metric");
+    let appended = &after_affected[before.len()..];
+    let rows: Vec<serde_json::Value> = appended
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("metric line is JSON"))
+        .collect();
+    assert_eq!(rows.len(), 1, "exactly one metric line: {appended}");
+    assert_eq!(rows[0]["command"], "gates.affected", "{appended}");
+    assert_eq!(rows[0]["phase_budget_ms"], 5_000, "{appended}");
+    for phase in ["graph_read", "manifest", "selection", "lock_wait"] {
+        assert!(
+            rows[0]["phase_timings_ms"][phase].is_u64(),
+            "{phase} timing missing: {appended}"
+        );
+    }
+    assert!(rows[0]["over_budget_phases"].is_array(), "{appended}");
+    let before = after_affected.into_bytes();
 
     let stateful_args = ["broker", "status", "--json"];
     assert_success(&aethyme(temp.path(), &stateful_args), &stateful_args);
