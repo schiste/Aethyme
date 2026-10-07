@@ -63,6 +63,7 @@ pub use gate_debris::{
     DebrisPlan, DebrisRemoval, DebrisRuntime, GATE_LABELS_ENV, GATE_RUN_ID_ENV, GateRunLabels,
     RuntimeResource, RuntimeResourceKind,
 };
+mod auto_cleanup;
 mod gate_doctor;
 mod gates;
 mod gc;
@@ -132,6 +133,7 @@ pub mod release_manifest;
 mod remote_target;
 mod removal;
 pub mod renamed_targets;
+mod repo_watch;
 mod report;
 mod report_filing;
 pub use chau7_tabs::{
@@ -196,6 +198,10 @@ pub use aethyme_graph_storage::{
     GRAPH_CONFIG_RELPATH, GraphAuthority, GraphIntegrityPolicy, GraphIntegrityPolicyError,
 };
 pub use attribution::{Attribution, Identity};
+pub use auto_cleanup::{
+    AutoCleanupPlan, AutoCleanupPolicy, AutoCleanupReport, AutoKeptCheckout, AutoRemovedCheckout,
+    BUILT_IN_REGENERABLE,
+};
 pub use blockers::{
     BLOCKER_CLEARED, Blocker, BlockerKind, BlockerRef, BlockerReport, BlockerScope,
     BlockerSourceError, PairedRecovery, UnblockOutcome, UnblockRefusal, UnblockReport,
@@ -451,6 +457,16 @@ pub use remote_target::{
     RemoteUrlSyntax, ResolvedRemoteTarget, resolve_remote_command_target, resolve_remote_target,
 };
 pub use renamed_targets::RenamedTarget;
+pub use repo_watch::{
+    DEFAULT_REVIEW_PROMPT, GithubCliRepositoryWatchProvider, REPOSITORY_DELIVERY_ID_BASE,
+    REPOSITORY_WATCH_LIST_LIMIT, REPOSITORY_WATCH_SCHEMA_VERSION, REVIEW_PROMPT_VARIABLES,
+    RepositoryDeliveryEnvelope, RepositoryDeliveryItem, RepositoryDeliveryPolicy,
+    RepositoryDeliverySubscription, RepositoryEventKind, RepositoryPullRequest, RepositoryWatch,
+    RepositoryWatchEvent, RepositoryWatchOptions, RepositoryWatchPollResult,
+    RepositoryWatchProvider, RepositoryWatchStatus, RepositoryWatchTickReport,
+    is_repository_delivery_id, load_review_prompt_template, render_repository_prompt,
+    review_prompt_variables,
+};
 pub use report::{
     InvalidReportEntry, PreparedReport, REPORT_DOCUMENT_SCHEMA_VERSION, REPORT_FILINGS_FILENAME,
     REPORT_FILINGS_SCHEMA_VERSION, REPORT_INVENTORY_SCHEMA_VERSION, REPORT_MAX_BYTES,

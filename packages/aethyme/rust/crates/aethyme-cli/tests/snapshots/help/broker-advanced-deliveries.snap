@@ -1,6 +1,10 @@
 exit: 0
 --- stdout
   aethyme broker advanced deliveries subscribe --watch <id> --adapter <name> --target <opaque-id> [--policy <notify|resume|review-and-push>] [--json]
+  aethyme broker advanced deliveries subscribe --repo-watch <id> --adapter <name> --target <opaque-id> [--policy <review|notify>] [--json]
+      A repository-watch subscription delivers one prompt per event. `review`
+      (the default) asks the session to code-review the PR; the prompt comes
+      from `[watch.prompts.review] body` in .aethyme/config.toml when set.
   aethyme broker advanced deliveries list [--adapter <name>] [--all] [--json]
   aethyme broker advanced deliveries claim --adapter <name> --worker <id> [--seconds <15..900>] [--json]
   aethyme broker advanced deliveries resolve-tab --session <id> [--tabs-file <path>] [--json]

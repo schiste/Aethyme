@@ -2,7 +2,8 @@
 
 Last Updated: 2026-10-07
 
-Removing a session worktree is a reviewed operation. A closed session is not
+Removing a session worktree is a reviewed operation, with one deterministic
+exception described under *Automatic removal* below. A closed session is not
 evidence that its work is safe to discard, and a worktree that looks clean can
 still hold the only copy of something. The broker refuses by default and names
 what it would need; this runbook is how an operator answers it.
@@ -53,6 +54,39 @@ of 2,000 commits listed first: 381 ms before, 10 ms after.
 Registrations whose directory is gone are administrative metadata: `git
 worktree prune --dry-run --verbose` handles them, separately from removing a
 checkout or a branch.
+
+## Automatic removal (#588)
+
+The unattended sweep removes a closed checkout without a reviewed plan only
+when four proofs hold, each re-checked under the GC lock immediately before
+the directory goes:
+
+1. **Sessions** -- every broker session that names the worktree is closed.
+2. **No use** -- no process has a file or working directory open in it, no
+   lease that still holds covers it, and no gate is running.
+3. **Clean** -- no tracked, staged or untracked change, no stash made on its
+   branch, no rebase, merge, cherry-pick, revert or bisect in progress, and no
+   ignored path outside the regenerable set (`target/`, `node_modules/`,
+   `.venv/`, `build/`, `dist/`, `.DS_Store`, plus `[cleanup] regenerable`).
+4. **Contained** -- every commit is in the fetched remote default branch, by
+   ancestry or by the verbatim content/patch proof. Local `main` and the
+   integration branch do not count.
+
+Anything the sweep cannot decide keeps the checkout, with the reason in
+`aethyme broker gc plan --json` (`auto_cleanup.kept[]`) and a
+`cleanup.auto-removal` row in `broker status`. Each removal emits
+`broker.cleanup.auto_removed` with its proof. Configure it in
+`.aethyme/config.toml`:
+
+```toml
+[cleanup]
+auto_remove = true             # the default; false turns it off
+regenerable = [".gradle/**"]   # extra rebuildable paths
+keep = ["*-investigation"]     # worktrees never removed automatically
+```
+
+Build caches of inactive sessions are still reclaimed separately, even when a
+checkout must be kept.
 
 ## 2. Dry-run the supported sweep
 

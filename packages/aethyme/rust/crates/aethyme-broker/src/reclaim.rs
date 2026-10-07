@@ -963,12 +963,19 @@ fn git_index_path(worktree: &Path) -> Option<PathBuf> {
 /// reclaim already. Working directories are included -- `lsof` reports them as
 /// the `cwd` descriptor -- so an idle shell parked in a worktree keeps it.
 pub fn open_paths_under(root: &Path) -> Option<Vec<PathBuf>> {
-    let output = std::process::Command::new("lsof")
-        .args(["-w", "-n", "-P", "-Fn"])
-        .stdin(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .output()
-        .ok()?;
+    // `lsof` lives in /usr/sbin on macOS, which a trimmed PATH (a launchd
+    // job, a test harness) leaves out; not finding it must not read as "no
+    // process uses this", so the standard locations are tried too (#588).
+    let output = ["lsof", "/usr/sbin/lsof", "/usr/bin/lsof", "/sbin/lsof"]
+        .into_iter()
+        .find_map(|program| {
+            std::process::Command::new(program)
+                .args(["-w", "-n", "-P", "-Fn"])
+                .stdin(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .output()
+                .ok()
+        })?;
     // `lsof` exits 1 when it could not inspect some process (another user's,
     // one that exited mid-listing) while still listing every other one; only
     // an empty listing means no snapshot was taken.
