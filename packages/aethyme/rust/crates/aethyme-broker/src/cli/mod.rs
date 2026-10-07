@@ -952,6 +952,7 @@ pub fn run_resolved_with_mode(args: &[String], mode: CompatibilityMode) -> u8 {
         eprint!("{}", surface::public_help());
         return crate::exit_status::USAGE;
     }
+    maybe_fast_forward_main_checkout(args, &mode);
     // Dispatched before the shared parser: the contract check is a CI/gate
     // entry point with its own flags (`--base`, `--pr-body`) and its own
     // exit-code contract (2 = bad invocation), and it deliberately records
@@ -989,6 +990,234 @@ pub fn run_resolved_with_mode(args: &[String], mode: CompatibilityMode) -> u8 {
         record_command_metric(args, code, started.elapsed().as_millis() as i64);
     }
     code
+}
+
+/// Keep the repository's primary checkout current before broker commands
+/// inspect it. A linked session worktree is never moved here; it has the
+/// explicit `broker sync --session <id>` path instead.
+fn maybe_fast_forward_main_checkout(args: &[String], mode: &CompatibilityMode) {
+    if !matches!(mode, CompatibilityMode::Normal) {
+        return;
+    }
+    // Only the everyday public commands keep the checkout current. Hooks run
+    // inside a Git operation (a commit, a push) and must never move HEAD
+    // under it, and advanced plumbing (`git`, `gh`, `gates`, …, resolved
+    // here without its `advanced` prefix) acts on the checkout exactly as its
+    // caller found it, within its own time budget.
+    if !matches!(
+        args.first().map(String::as_str),
+        Some("status" | "start" | "sync" | "push" | "submit" | "finish")
+    ) {
+        return;
+    }
+    let Ok(cwd) = std::env::current_dir() else {
+        return;
+    };
+    let Ok(checkout) = crate::GitRepo::discover(&cwd) else {
+        return;
+    };
+    let Ok(main_root) = checkout.main_root() else {
+        return;
+    };
+    let (Ok(checkout_root), Ok(main_root)) =
+        (checkout.root().canonicalize(), main_root.canonicalize())
+    else {
+        return;
+    };
+    if checkout_root != main_root {
+        return;
+    }
+
+    let status_command = format!(
+        "git -C {} status --short --branch",
+        crate::broker::shell_quote(&main_root.to_string_lossy())
+    );
+    let Ok(branch) = checkout.current_branch() else {
+        report_main_checkout_unchanged("could not determine the current branch", &status_command);
+        return;
+    };
+    if branch == "HEAD" {
+        report_main_checkout_unchanged("the checkout is detached", &status_command);
+        return;
+    }
+    let clean = match (
+        checkout.tracked_dirty_paths(),
+        checkout.untracked_paths_readonly(),
+    ) {
+        (Ok(tracked), Ok(untracked)) => tracked.is_empty() && untracked.is_empty(),
+        _ => {
+            report_main_checkout_unchanged(
+                "could not verify that the checkout is clean",
+                &status_command,
+            );
+            return;
+        }
+    };
+    if !clean {
+        report_main_checkout_unchanged(
+            "tracked or non-ignored untracked changes are present",
+            &status_command,
+        );
+        return;
+    }
+    match checkout.in_progress_operation() {
+        Ok(None) => {}
+        Ok(Some(operation)) => {
+            report_main_checkout_unchanged(operation, &status_command);
+            return;
+        }
+        Err(_) => {
+            report_main_checkout_unchanged(
+                "could not verify that no Git operation is in progress",
+                &status_command,
+            );
+            return;
+        }
+    }
+    // A session adopted on the primary checkout means an agent works in it:
+    // moving HEAD under that agent is never this command's decision.
+    match live_session_in_checkout(&main_root) {
+        Ok(None) => {}
+        Ok(Some(session)) => {
+            report_main_checkout_unchanged(
+                &format!("live broker session {session} works in this checkout"),
+                &format!("aethyme broker status --session {session}"),
+            );
+            return;
+        }
+        Err(()) => {
+            report_main_checkout_unchanged(
+                "could not verify that no live broker session works in this checkout",
+                "aethyme broker status",
+            );
+            return;
+        }
+    }
+    // No upstream means nothing to fast-forward to; that is not a state that
+    // needs attention on every command.
+    let Some((upstream_ref, upstream_commit)) = checkout.tracking_upstream() else {
+        return;
+    };
+    let Ok(head) = checkout.head_commit() else {
+        report_main_checkout_unchanged("could not determine the checkout HEAD", &status_command);
+        return;
+    };
+    if head == upstream_commit {
+        return;
+    }
+    if checkout.is_ancestor(&upstream_commit, &head) {
+        let range = format!("{upstream_ref}..HEAD");
+        report_main_checkout_unchanged(
+            "the checkout has commits that its upstream does not contain",
+            &format!(
+                "git -C {} log --oneline --decorate {}",
+                crate::broker::shell_quote(&main_root.to_string_lossy()),
+                crate::broker::shell_quote(&range)
+            ),
+        );
+        return;
+    }
+    if !checkout.is_ancestor(&head, &upstream_commit) {
+        let range = format!("HEAD...{upstream_ref}");
+        report_main_checkout_unchanged(
+            "the checkout and its upstream have diverged",
+            &format!(
+                "git -C {} log --oneline --decorate --left-right {}",
+                crate::broker::shell_quote(&main_root.to_string_lossy()),
+                crate::broker::shell_quote(&range)
+            ),
+        );
+        return;
+    }
+
+    // Recheck the branch, refs, and working tree immediately before the
+    // update. `--ff-only` remains Git's final guard against a changed graph.
+    let still_same = checkout.current_branch().ok().as_deref() == Some(branch.as_str())
+        && checkout.head_commit().ok().as_deref() == Some(head.as_str())
+        && checkout
+            .tracking_upstream()
+            .is_some_and(|(current_ref, current_commit)| {
+                current_ref == upstream_ref && current_commit == upstream_commit
+            });
+    let still_clean = matches!(
+        (
+            checkout.tracked_dirty_paths(),
+            checkout.untracked_paths_readonly()
+        ),
+        (Ok(tracked), Ok(untracked)) if tracked.is_empty() && untracked.is_empty()
+    );
+    if !still_same || !still_clean {
+        report_main_checkout_unchanged(
+            "the checkout changed during fast-forward preflight",
+            &status_command,
+        );
+        return;
+    }
+    if checkout
+        .fast_forward_checkout_from(&branch, &head, &upstream_commit)
+        .is_err()
+    {
+        report_main_checkout_unchanged(
+            "Git could not safely fast-forward to the configured upstream (HEAD moved, local changes appeared, or the index was locked)",
+            &format!(
+                "git -C {} merge --ff-only {}",
+                crate::broker::shell_quote(&main_root.to_string_lossy()),
+                crate::broker::shell_quote(&upstream_commit)
+            ),
+        );
+        return;
+    }
+
+    let trigger = safe_command_surface(args)
+        .map(|surface| format!("broker.{surface}"))
+        .unwrap_or_else(|| "broker.unknown".to_string());
+    let payload = crate::events::broker_checkout_fast_forwarded_payload(
+        &trigger,
+        &branch,
+        &upstream_ref,
+        &head,
+        &upstream_commit,
+    );
+    let recorded = crate::BrokerStore::open_in_repo(&main_root).and_then(|mut store| {
+        store.append_event(
+            crate::events::BROKER_CHECKOUT_FAST_FORWARDED,
+            None,
+            Some(&payload),
+        )
+    });
+    crate::warn_unrecorded("record the main-checkout fast-forward event", recorded);
+    eprintln!(
+        "Updated main checkout: {branch} fast-forwarded from {head} to {upstream_commit} ({upstream_ref})."
+    );
+}
+
+/// The first non-closed broker session whose worktree is this primary
+/// checkout. `Err` when the broker database exists but cannot be read: the
+/// caller then cannot rule out an agent working here and must not move it.
+fn live_session_in_checkout(main_root: &std::path::Path) -> Result<Option<i64>, ()> {
+    let Ok(db) = crate::broker_db_path(main_root) else {
+        return Err(());
+    };
+    if !db.exists() {
+        return Ok(None);
+    }
+    let store = crate::BrokerStore::open_snapshot_in_repo(main_root).map_err(|_| ())?;
+    let sessions = store.live_sessions().map_err(|_| ())?;
+    Ok(sessions
+        .into_iter()
+        .filter(|session| !session.status.is_closed())
+        .find(|session| {
+            let path = std::path::Path::new(&session.worktree_path);
+            path == main_root
+                || path
+                    .canonicalize()
+                    .is_ok_and(|canonical| canonical == main_root)
+        })
+        .map(|session| session.id))
+}
+
+fn report_main_checkout_unchanged(reason: &str, command: &str) {
+    eprintln!("warning: left the main checkout unchanged: {reason}. Run: {command}");
 }
 
 enum UsageError {

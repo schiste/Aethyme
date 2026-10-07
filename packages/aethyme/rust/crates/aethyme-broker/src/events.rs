@@ -50,6 +50,8 @@ pub const BROKER_SESSION_SYNCED: &str = "broker.session.synced";
 /// A verify-only integration branch advanced onto the fetched default branch
 /// because it carried nothing of its own (#352).
 pub const BROKER_INTEGRATION_REFRESHED: &str = "broker.integration.refreshed";
+/// The primary checkout was clean and strictly behind its configured upstream.
+pub const BROKER_CHECKOUT_FAST_FORWARDED: &str = "broker.checkout.fast_forwarded";
 /// A session was closed with committed work no remote holds, on an explicit
 /// `--abandon --reason` under the push lane.
 pub const BROKER_SESSION_ABANDONED_UNPUSHED: &str = "broker.session.abandoned_unpushed";
@@ -404,6 +406,23 @@ pub fn integration_branch_created_payload(branch: &str, at_commit: &str) -> Stri
 
 pub fn integration_refreshed_payload(branch: &str, from: &str, to: &str) -> String {
     json!({ "branch": branch, "from": from, "to": to }).to_string()
+}
+
+pub fn broker_checkout_fast_forwarded_payload(
+    trigger: &str,
+    branch: &str,
+    upstream_ref: &str,
+    from: &str,
+    to: &str,
+) -> String {
+    json!({
+        "trigger": trigger,
+        "branch": branch,
+        "upstream_ref": upstream_ref,
+        "from": from,
+        "to": to,
+    })
+    .to_string()
 }
 
 pub fn operation_payload(
