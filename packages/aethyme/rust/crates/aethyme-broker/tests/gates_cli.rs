@@ -95,7 +95,7 @@ fn fixture() -> tempfile::TempDir {
 }
 
 #[test]
-fn affected_gates_json_and_command_metrics_include_phase_timings() {
+fn affected_gates_json_stays_an_array_and_timings_are_opt_in() {
     let tmp = fixture();
     let mut broker = aethyme_broker::Broker::open(tmp.path()).unwrap();
     let session = broker
@@ -103,22 +103,32 @@ fn affected_gates_json_and_command_metrics_include_phase_timings() {
         .unwrap();
     let worktree = Path::new(&session.worktree_path);
     std::fs::write(worktree.join("tracked.txt"), "second\n").unwrap();
-
     let session_id = session.id.to_string();
-    let output = run(
-        tmp.path(),
-        &[
+    let affected = |extra: &[&str]| {
+        let mut args = vec![
             "advanced",
             "gates",
             "affected",
             "--session",
             &session_id,
             "--json",
-        ],
+        ];
+        args.extend_from_slice(extra);
+        let output = stdout(run(tmp.path(), &args));
+        serde_json::from_str::<serde_json::Value>(&output).unwrap()
+    };
+
+    // The established `--json` contract: a bare selection array.
+    let selection = affected(&[]);
+    let selection = selection.as_array().expect("--json stays an array");
+    assert_eq!(selection[0]["gate"], "provenance");
+
+    // `--timings` opts into the object that adds the phase report.
+    let report = affected(&["--timings"]);
+    assert_eq!(
+        report["selected_gates"],
+        serde_json::Value::Array(selection.clone())
     );
-    let output = stdout(output);
-    let report: serde_json::Value = serde_json::from_str(&output).unwrap();
-    assert_eq!(report["selected_gates"][0]["gate"], "provenance");
     assert_eq!(report["phase_budget_ms"], 5_000);
     assert_eq!(report["phase_timings_ms"]["lock_wait"], 0);
     assert!(report["over_budget_phases"].as_array().unwrap().is_empty());
@@ -126,14 +136,23 @@ fn affected_gates_json_and_command_metrics_include_phase_timings() {
         assert!(report["phase_timings_ms"][phase].is_u64(), "{report:#}");
     }
 
+    // Both forms record the timing report in the command metric.
     let metrics =
         std::fs::read_to_string(tmp.path().join(".aethyme/logs/command-metrics.jsonl")).unwrap();
-    let metric: serde_json::Value =
-        serde_json::from_str(metrics.lines().last().expect("one command metric")).unwrap();
-    assert_eq!(metric["command"], "gates.affected");
-    assert_eq!(metric["phase_budget_ms"], report["phase_budget_ms"]);
-    assert_eq!(metric["phase_timings_ms"], report["phase_timings_ms"]);
-    assert_eq!(metric["over_budget_phases"], report["over_budget_phases"]);
+    let rows: Vec<serde_json::Value> = metrics
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .filter(|row: &serde_json::Value| row["command"] == "gates.affected")
+        .collect();
+    assert_eq!(rows.len(), 2, "{metrics}");
+    for metric in &rows {
+        assert_eq!(metric["phase_budget_ms"], 5_000);
+        assert!(
+            metric["phase_timings_ms"]["selection"].is_u64(),
+            "{metric:#}"
+        );
+        assert!(metric["over_budget_phases"].is_array(), "{metric:#}");
+    }
 }
 
 #[test]

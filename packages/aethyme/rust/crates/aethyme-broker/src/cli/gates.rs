@@ -743,13 +743,27 @@ pub(super) fn run_gates(parsed: Parsed) -> Result<(), UsageError> {
                     .iter()
                     .map(|(gate, why)| serde_json::json!({"gate": gate, "triggered_by": why}))
                     .collect();
-                let output = serde_json::json!({
-                    "selected_gates": selected_gates,
-                    "phase_timings_ms": report.phase_timings_ms,
-                    "phase_budget_ms": report.phase_budget_ms,
-                    "over_budget_phases": report.over_budget_phases,
-                });
-                out!("{}", serde_json::to_string_pretty(&output)?);
+                // The bare selection array is the established `--json`
+                // contract; the timing object is opt-in so existing parsers
+                // keep working.
+                if parsed.timings {
+                    let output = serde_json::json!({
+                        "selected_gates": selected_gates,
+                        "phase_timings_ms": report.phase_timings_ms,
+                        "phase_budget_ms": report.phase_budget_ms,
+                        "over_budget_phases": report.over_budget_phases,
+                    });
+                    out!("{}", serde_json::to_string_pretty(&output)?);
+                } else {
+                    out!("{}", serde_json::to_string_pretty(&selected_gates)?);
+                    if !report.over_budget_phases.is_empty() {
+                        eprintln!(
+                            "Warning: gates affected phase(s) exceeded the {} ms budget: {}",
+                            report.phase_budget_ms,
+                            report.over_budget_phases.join(", ")
+                        );
+                    }
+                }
             } else {
                 if report.selected_gates.is_empty() {
                     out!("No gates affected by this session's diff.");
