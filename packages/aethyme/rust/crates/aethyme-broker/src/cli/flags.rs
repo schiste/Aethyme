@@ -310,7 +310,7 @@ pub(super) const FLAG_RULES: &[(&str, &[&str])] = &[
     ),
     ("gates manifest", &["--head"]),
     ("gates scope", &["--base", "--head"]),
-    ("gates affected", &["--session"]),
+    ("gates affected", &["--session", "--timings"]),
     ("gates semantic", &["--session"]),
     ("gates run", &["--session", "--all", "--only", "--no-cache"]),
     ("gates pre-push", &["--session", "--all", "--no-cache"]),
