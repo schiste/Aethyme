@@ -125,6 +125,11 @@ pub struct ChangeClassificationPolicy {
     /// tracked symbols, so the signal is clear.
     #[serde(default = "default_contract_doc")]
     pub contract_doc: String,
+    /// Whether `contract_doc` was written. A missing default inventory means
+    /// nothing is tracked; a missing configured one means the scan cannot run
+    /// and the contract signal is unknown.
+    #[serde(skip)]
+    pub contract_doc_configured: bool,
     /// Filled from `[review] pr_size`, not from this table: the boundary above
     /// which a change is `large`. One definition, shared with the
     /// `broker push --pr` warning.
@@ -166,6 +171,7 @@ impl Default for ChangeClassificationPolicy {
             exclude_lockfiles: true,
             trivial: DEFAULT_TRIVIAL,
             contract_doc: default_contract_doc(),
+            contract_doc_configured: false,
             pr_size: DEFAULT_PR_SIZE,
             pr_size_configured: false,
         }
@@ -243,6 +249,10 @@ impl ChangeClassificationPolicy {
             }
             None => Self::default(),
         };
+        policy.contract_doc_configured = review
+            .and_then(|review| review.get("classification"))
+            .and_then(|table| table.get("contract_doc"))
+            .is_some();
         if let Some(pr_size) = review.and_then(|review| review.get("pr_size")) {
             policy.pr_size =
                 pr_size
@@ -302,6 +312,9 @@ impl ChangeClassificationPolicy {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChangedFile {
     pub path: String,
+    /// The source path of a rename, when the diff reports one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub old_path: Option<String>,
     /// `None` for a binary file, whose lines cannot be counted.
     pub added: Option<u64>,
     pub deleted: Option<u64>,
@@ -321,6 +334,17 @@ pub struct ChangeInputs {
     pub from_fork: bool,
     pub first_time_contributor: bool,
     pub authored_by_model: bool,
+    /// Whether `from_fork` and `first_time_contributor` were read from the
+    /// provider. `false` (the default) reports both as unknown: a failed
+    /// lookup must never read as "not a fork".
+    pub provenance_known: bool,
+    /// Whether `files` is the whole change. The provider truncates long file
+    /// lists; a partial list cannot clear any path-based signal.
+    pub files_complete: bool,
+    /// Further paths the change touches that are not size entries -- a
+    /// rename's source path, read from the diff -- matched by the path-based
+    /// signals so moving a file out of `.github/workflows/` still counts.
+    pub extra_signal_paths: Vec<String>,
     /// The highest `Risk:` the commits declared.
     pub declared_risk: Option<String>,
 }
@@ -404,6 +428,13 @@ impl RiskSignals {
     /// a caller relaxing something on "no contract touched" must not do so on
     /// a scan that never ran.
     pub fn is_set(&self, name: &str) -> Option<bool> {
+        if !SIGNAL_NAMES.contains(&name) {
+            return None;
+        }
+        // Not determined is not clear.
+        if self.unknown.iter().any(|unknown| unknown == name) {
+            return Some(true);
+        }
         Some(match name {
             "sensitive_paths" => !self.sensitive_paths.is_empty(),
             "contract_surface" => !self.contract_surface.is_clear(),
@@ -503,6 +534,12 @@ pub fn classify(
     files.sort_by(|a, b| a.path.cmp(&b.path));
     files.dedup_by(|a, b| a.path == b.path);
     let paths: Vec<&str> = files.iter().map(|file| file.path.as_str()).collect();
+    // Path signals look at every path the change touches: renamed-from paths
+    // and any the caller read from the diff, not only the new names.
+    let mut signal_path_set: BTreeSet<&str> = paths.iter().copied().collect();
+    signal_path_set.extend(files.iter().filter_map(|file| file.old_path.as_deref()));
+    signal_path_set.extend(inputs.extra_signal_paths.iter().map(String::as_str));
+    let signal_paths: Vec<&str> = signal_path_set.into_iter().collect();
 
     let mut size = ChangeSize::default();
     for file in &files {
@@ -546,12 +583,12 @@ pub fn classify(
         }
     };
     let signals = RiskSignals {
-        sensitive_paths: matching(&policy.sensitive_paths, &paths),
+        sensitive_paths: matching(&policy.sensitive_paths, &signal_paths),
         contract_surface,
-        gate_policy: matching(GATE_POLICY, &paths),
-        workflows: matching(WORKFLOWS, &paths),
-        migrations: matching(&policy.migration_paths, &paths),
-        dependency_manifest: matching(DEPENDENCY_MANIFESTS, &paths),
+        gate_policy: matching(GATE_POLICY, &signal_paths),
+        workflows: matching(WORKFLOWS, &signal_paths),
+        migrations: matching(&policy.migration_paths, &signal_paths),
+        dependency_manifest: matching(DEPENDENCY_MANIFESTS, &signal_paths),
         from_fork: inputs.from_fork,
         first_time_contributor: inputs.first_time_contributor,
         authored_by_model: inputs.authored_by_model,
@@ -562,6 +599,21 @@ pub fn classify(
             }
             if inputs.generated.is_none() {
                 unknown.push("generated_attributes".to_string());
+            }
+            if !inputs.provenance_known {
+                unknown.push("from_fork".to_string());
+                unknown.push("first_time_contributor".to_string());
+            }
+            if !inputs.files_complete {
+                for name in [
+                    "sensitive_paths",
+                    "gate_policy",
+                    "workflows",
+                    "migrations",
+                    "dependency_manifest",
+                ] {
+                    unknown.push(name.to_string());
+                }
             }
             unknown
         },
@@ -735,18 +787,19 @@ pub fn parse_numstat_z(output: &str) -> Vec<ChangedFile> {
         else {
             continue;
         };
-        let path = if path.is_empty() {
+        let (path, old_path) = if path.is_empty() {
             // Rename: the old path, then the new one.
-            let _old = fields.next();
+            let old = fields.next().map(String::from);
             match fields.next() {
-                Some(new) => new.to_string(),
+                Some(new) => (new.to_string(), old),
                 None => continue,
             }
         } else {
-            path.to_string()
+            (path.to_string(), None)
         };
         files.push(ChangedFile {
             path,
+            old_path,
             added: added.parse().ok(),
             deleted: deleted.parse().ok(),
         });
@@ -836,6 +889,7 @@ mod tests {
     fn file(path: &str, added: u64, deleted: u64) -> ChangedFile {
         ChangedFile {
             path: path.into(),
+            old_path: None,
             added: Some(added),
             deleted: Some(deleted),
         }
@@ -846,6 +900,8 @@ mod tests {
             files,
             contract_symbols: Some(Vec::new()),
             generated: Some(BTreeSet::new()),
+            provenance_known: true,
+            files_complete: true,
             ..Default::default()
         }
     }
@@ -978,6 +1034,36 @@ mod tests {
     }
 
     #[test]
+    fn a_rename_out_of_a_watched_path_still_sets_its_signal() {
+        let renamed = ChangedFile {
+            old_path: Some(".github/workflows/ci.yml".into()),
+            ..file("docs/ci.yml", 0, 0)
+        };
+        let c = classify(
+            &ChangeClassificationPolicy::default(),
+            &inputs(vec![renamed]),
+        );
+        assert_eq!(c.signals.workflows, vec![".github/workflows/ci.yml"]);
+        assert!(c.risky);
+    }
+
+    #[test]
+    fn unknown_provenance_and_a_truncated_file_list_are_not_clear() {
+        let mut i = inputs(vec![file("docs/a.md", 1, 0)]);
+        i.provenance_known = false;
+        i.files_complete = false;
+        let c = classify(&ChangeClassificationPolicy::default(), &i);
+        for name in [
+            "from_fork",
+            "first_time_contributor",
+            "workflows",
+            "sensitive_paths",
+        ] {
+            assert_eq!(c.signals.is_set(name), Some(true), "{name}");
+        }
+    }
+
+    #[test]
     fn numstat_z_reads_renames_and_binary_files() {
         let out = "3\t1\tsrc/a.rs\0-\t-\timg.png\x002\t0\t\0old.rs\0new.rs\0";
         let files = parse_numstat_z(out);
@@ -987,10 +1073,14 @@ mod tests {
                 file("src/a.rs", 3, 1),
                 ChangedFile {
                     path: "img.png".into(),
+                    old_path: None,
                     added: None,
                     deleted: None
                 },
-                file("new.rs", 2, 0),
+                ChangedFile {
+                    old_path: Some("old.rs".into()),
+                    ..file("new.rs", 2, 0)
+                },
             ]
         );
     }

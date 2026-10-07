@@ -569,6 +569,70 @@ Nothing else follows from the measurement: no review is requested, no bot is
 mentioned and no waiver is written unless a rule says so. Generated agent
 guidance states `pr_size` only when a repository wrote it.
 
+## Acting on the classification
+
+Rules in `[review.trigger]` can condition on the measurement and act on it
+deterministically (#584). Same classification, same configuration, same head:
+same actions, all visible under `rule_actions` in `review plan` before anything
+runs, each naming the rule that caused it.
+
+| Condition | Meaning |
+| --- | --- |
+| `min_tier`, `max_tier` | `trivial`, `normal` or `large`, inclusive. |
+| `min_files`, `max_files`, `min_churn`, `max_churn` | Inclusive bounds on the measured size. |
+| `signals` | Measured signals that must all be set. |
+| `none_of_signals` | Measured signals none of which may be set. |
+
+A rule that states any of these never matches an unmeasured change.
+
+| Action | Effect |
+| --- | --- |
+| `require = [...]` | Review dimensions, routed by `[review.routing]` as before (Chau7, a `provider_comment` mention such as `@codex`, or `record`). |
+| `waive = [...]` | An automatic waiver per named dimension, bound to the head and written through the same ledger record as `review waive`, with a reason naming the rule and the measured values. A new head re-evaluates it. |
+| `labels = [...]` | Extra labels under `label_prefix`, never a `reserved` one. |
+
+A rule needs at least one of `require`, `waive` or `labels`.
+
+```toml
+# Ask the provider's bot to review large changes...
+[[review.trigger.rule]]
+name = "large-code"
+require = ["code"]
+min_tier = "large"
+
+# ...and excuse the code review on trivial ones.
+[[review.trigger.rule]]
+name = "trivial-code"
+waive = ["code"]
+max_tier = "trivial"
+```
+
+**Guardrails the broker enforces, whatever the rules say:**
+
+- No automatic waiver for a change carrying `from_fork`, `first_time_contributor`,
+  `contract_surface`, `gate_policy`, `workflows` or `sensitive_paths`. The
+  waiver is refused with a reason under `rule_actions.refused_waivers`, and a
+  rule that requires one of those signals in `signals` is rejected at load.
+- No automatic waiver when anything in `change.signals.unknown` could not be
+  determined: an unscanned contract, unreadable base attributes, fork and
+  first-time status the provider did not answer, or a file list shorter than
+  the provider's own count. `review plan` is offline and never reads fork or
+  first-time status, so it shows such a waiver as refused; only `review run`
+  writes one.
+- Path signals see every path the change touches, including a rename's source,
+  so moving a file out of `.github/workflows/` still counts as a workflow change.
+- The waiver binds to the head that was classified. `review run` re-reads the
+  head immediately before writing and writes nothing if it moved.
+- Rule terms are revalidated when a waiver is planned, not only at load.
+- Only the dimensions a rule names: no wildcard, which is rejected at load.
+- `require` beats `waive`: a dimension any rule or declaration requires on this
+  change is never waived.
+- A satisfied review is never replaced by a waiver, and a waiver is never
+  written twice for the same head.
+
+An automatic waiver appears on the pull request as the `waived` state in the
+owned comment and the `aethyme/review:waived` label.
+
 ## Trying a policy before switching it on
 
 `aethyme broker advanced review plan` reads git and `.aethyme/config.toml`, and prints

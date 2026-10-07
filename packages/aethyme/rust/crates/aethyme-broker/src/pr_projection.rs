@@ -145,6 +145,9 @@ pub struct ReviewProjection {
     /// never lowered by one -- and a size label is added.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub change: Option<crate::ChangeClassification>,
+    /// Labels review rules asked for (#584), written under `label_prefix`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rule_labels: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -563,11 +566,26 @@ fn desired_labels(
     {
         add("size", change.tier.as_str());
     }
+    if policy.label_reviews
+        && projection
+            .reviews
+            .iter()
+            .any(|review| review.state == ProjectedReviewState::Waived)
+    {
+        add("review", "waived");
+    }
     if policy.label_reviews {
         for review in &projection.reviews {
             if review.state.outstanding() {
                 add("review", &review.review_type);
             }
+        }
+    }
+    for label in &projection.rule_labels {
+        let name = format!("{}{label}", policy.label_prefix);
+        // A reserved suffix is a human's decision; a rule never writes it.
+        if policy.owns(&name) {
+            desired.insert(name, ("rule", label.clone()));
         }
     }
     desired
@@ -780,6 +798,7 @@ mod tests {
             conflicts: Vec::new(),
             quality_report: None,
             change: None,
+            rule_labels: Vec::new(),
         }
     }
 

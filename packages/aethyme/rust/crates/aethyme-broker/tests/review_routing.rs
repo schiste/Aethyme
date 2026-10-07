@@ -101,6 +101,7 @@ fn facts(paths: &[&str], message: &str) -> ChangeFacts {
         from_fork: false,
         first_time_contributor: false,
         authored_by_model: None,
+        change: None,
     }
 }
 
@@ -182,6 +183,7 @@ fn plan_after(
         conflicts: Vec::new(),
         quality_report: None,
         change: None,
+        rule_labels: Vec::new(),
     };
     let actions = project(
         &policies.projection,
