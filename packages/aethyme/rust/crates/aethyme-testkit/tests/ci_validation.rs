@@ -170,6 +170,36 @@ fn macos_nightly_runs_the_whole_workspace_suite() {
 }
 
 #[test]
+fn linux_nightly_publishes_workspace_coverage_without_a_threshold() {
+    let nightly = workflow("macos-nightly.yml");
+    assert_eq!(
+        block(&nightly, "on:"),
+        [
+            "  schedule:",
+            "    - cron: \"17 3 * * *\"",
+            "  workflow_dispatch:"
+        ]
+    );
+
+    let job = block(&nightly, "  rust-coverage-linux:");
+    let job_text = job.join("\n");
+    assert!(job_text.contains("runs-on: ubuntu-latest"));
+    assert!(
+        job_text.contains("cargo llvm-cov --locked --workspace --html --output-dir coverage/html")
+    );
+    assert!(job_text.contains("cargo llvm-cov report --lcov --output-path coverage/lcov.info"));
+    assert!(job_text.contains("GITHUB_STEP_SUMMARY"));
+    assert!(job_text.contains("workspace-total"));
+    assert!(job_text.contains("$i == \"crates\""));
+    assert!(job_text.contains("total[crate] += file_total"));
+    assert!(job_text.contains("covered[crate] += file_covered"));
+    assert!(job_text.contains("packages/aethyme/rust/coverage/lcov.info"));
+    assert!(job_text.contains("packages/aethyme/rust/coverage/html/"));
+    assert!(job_text.contains("actions/upload-artifact@"));
+    assert!(!job_text.contains("--fail-under"));
+}
+
+#[test]
 fn duplicate_binary_suite_remains_available_manually() {
     let local = workflow("aethyme-local-tests.yml");
     assert_eq!(block(&local, "on:"), ["  workflow_dispatch:"]);

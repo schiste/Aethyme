@@ -28,6 +28,7 @@ pub mod attribution;
 mod blockers;
 mod bounded_output;
 mod broker;
+mod change_classification;
 mod chau7_mcp;
 mod chau7_tabs;
 mod cleanup_audit;
@@ -227,6 +228,13 @@ pub use broker::{
     StatusBrief, StatusIntegrationRelation, StatusSummary, StatusView, VersionRepairReport,
     VersionRepairStep, WORKTREE_ROOT_SCHEMA_VERSION, WorktreePlacement, WorktreeRootPlan,
     WorktreeRootSource,
+};
+pub use change_classification::{
+    CHANGE_CLASSIFICATION_SCHEMA_VERSION, ChangeClassification, ChangeClassificationError,
+    ChangeClassificationPolicy, ChangeInputs, ChangeSize, ChangedFile, ContractSurface,
+    DEFAULT_PR_SIZE, DEFAULT_TRIVIAL, PrSizeReport, RiskSignals, SIGNAL_NAMES, SizeBounds,
+    SizeTier, classify as classify_change, linguist_generated_paths, parse_numstat_z,
+    pr_size_report, summary_line as change_summary_line,
 };
 pub use cleanup_audit::{
     AuditDisposition, AuditItem, AuditOwner, AuditSummary, AuditTarget,
@@ -512,10 +520,11 @@ pub use review_report::{
     REVIEW_REPORTING_SCHEMA_VERSION, ReviewReportingError, ReviewReportingPolicy, ReviewSeverity,
 };
 pub use review_trigger::{
-    ChangeFacts, ClassificationConflict, CommitClassification, EligibleReview,
-    REVIEW_TRIGGER_SCHEMA_VERSION, ReviewFreshness, ReviewSchedule, ReviewSpend, ReviewTrigger,
-    ReviewTriggerDecision, ReviewTriggerError, ReviewTriggerPolicy, ReviewTriggerRule,
-    classification_conflicts, decide, eligible_types, parse_classification, schedule,
+    AUTO_WAIVE_GUARDED_SIGNALS, ChangeFacts, ClassificationConflict, CommitClassification,
+    EligibleReview, PlannedWaiver, REVIEW_TRIGGER_SCHEMA_VERSION, RefusedWaiver, ReviewFreshness,
+    ReviewSchedule, ReviewSpend, ReviewTrigger, ReviewTriggerDecision, ReviewTriggerError,
+    ReviewTriggerPolicy, ReviewTriggerRule, RuleActions, RuleLabel, classification_conflicts,
+    decide, eligible_types, parse_classification, rule_actions, schedule,
 };
 pub use schema::{EVENTS_SCHEMA_VERSION, SCHEMA_VERSION};
 pub use scopes::{

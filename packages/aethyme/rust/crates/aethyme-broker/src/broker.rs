@@ -36,6 +36,44 @@ use crate::worktree_reconcile::WorktreeReconciliation;
 
 pub(crate) mod gate_trust;
 
+/// Per-phase budget for the read-only `gates affected` inspection (#481).
+pub(crate) const GATES_AFFECTED_PHASE_BUDGET_MS: u64 = 5_000;
+
+/// Millisecond timings for each phase of `gates affected`.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub(crate) struct AffectedGatePhaseTimings {
+    pub graph_read: u64,
+    pub manifest: u64,
+    pub selection: u64,
+    /// The selection path deliberately does not acquire the graph-integrity
+    /// slot, so this remains zero unless a future explicit lock is introduced.
+    pub lock_wait: u64,
+}
+
+impl AffectedGatePhaseTimings {
+    fn over_budget_phases(&self) -> Vec<&'static str> {
+        [
+            ("graph_read", self.graph_read),
+            ("manifest", self.manifest),
+            ("selection", self.selection),
+            ("lock_wait", self.lock_wait),
+        ]
+        .into_iter()
+        .filter_map(|(phase, elapsed_ms)| {
+            (elapsed_ms > GATES_AFFECTED_PHASE_BUDGET_MS).then_some(phase)
+        })
+        .collect()
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct AffectedGatesReport {
+    pub selected_gates: Vec<(String, Option<String>)>,
+    pub phase_timings_ms: AffectedGatePhaseTimings,
+    pub phase_budget_ms: u64,
+    pub over_budget_phases: Vec<&'static str>,
+}
+
 /// Idle/stale thresholds for activity-derived liveness (issue #9).
 /// Configurable via `.aethyme/config.toml` in a later phase; constants
 /// for now, chosen so an agent "thinking" for a few minutes stays active.
@@ -6721,11 +6759,29 @@ impl Broker {
         &mut self,
         session_id: i64,
     ) -> Result<Vec<(String, Option<String>)>, BrokerOpError> {
-        let (_, gates, changed) = self.gate_selection_inputs(session_id)?;
-        Ok(crate::gates::select_gates(&gates, &changed)
+        Ok(self.affected_gates_with_timings(session_id)?.selected_gates)
+    }
+
+    pub(crate) fn affected_gates_with_timings(
+        &mut self,
+        session_id: i64,
+    ) -> Result<AffectedGatesReport, BrokerOpError> {
+        let (_, gates, changed, mut phase_timings_ms) =
+            self.gate_selection_inputs_with_timings(session_id)?;
+        let selection_started = std::time::Instant::now();
+        let selected_gates = crate::gates::select_gates(&gates, &changed)
             .into_iter()
             .map(|s| (s.gate.name.clone(), s.triggered_by))
-            .collect())
+            .collect();
+        phase_timings_ms.selection = selection_started.elapsed().as_millis() as u64;
+        let over_budget_phases = phase_timings_ms.over_budget_phases();
+
+        Ok(AffectedGatesReport {
+            selected_gates,
+            phase_timings_ms,
+            phase_budget_ms: GATES_AFFECTED_PHASE_BUDGET_MS,
+            over_budget_phases,
+        })
     }
 
     /// Advisory semantic gate-selection surface. The returned semantic
@@ -7116,7 +7172,51 @@ impl Broker {
         &mut self,
         session_id: i64,
     ) -> Result<(GitRepo, Vec<crate::gates::Gate>, Vec<String>), BrokerOpError> {
-        self.gate_inputs_with_integrity(session_id, false)
+        let (checkout, gates, changed, _) = self.gate_selection_inputs_with_timings(session_id)?;
+        Ok((checkout, gates, changed))
+    }
+
+    fn gate_selection_inputs_with_timings(
+        &mut self,
+        session_id: i64,
+    ) -> Result<
+        (
+            GitRepo,
+            Vec<crate::gates::Gate>,
+            Vec<String>,
+            AffectedGatePhaseTimings,
+        ),
+        BrokerOpError,
+    > {
+        let graph_read_started = std::time::Instant::now();
+        let session = self.store.session(session_id)?;
+        let checkout = GitRepo::discover(Path::new(&session.worktree_path))?;
+        let graph_read_before_manifest = graph_read_started.elapsed();
+
+        let manifest_started = std::time::Instant::now();
+        let config_root = checkout.root().to_path_buf();
+        let gates = self.load_and_sync_gates_from(&config_root)?;
+        let manifest_ms = manifest_started.elapsed().as_millis() as u64;
+
+        let diff_started = std::time::Instant::now();
+        let base = self
+            .session_change_base(&checkout)
+            .or(session.diff_base)
+            .unwrap_or_else(|| "HEAD".to_string());
+        let changed = checkout.changed_files(&base)?;
+        let graph_read_ms = graph_read_before_manifest
+            .saturating_add(diff_started.elapsed())
+            .as_millis() as u64;
+
+        // This inspection route intentionally skips `record_graph_integrity`;
+        // no repository-wide graph-integrity lock is acquired or waited on.
+        let phase_timings_ms = AffectedGatePhaseTimings {
+            graph_read: graph_read_ms,
+            manifest: manifest_ms,
+            selection: 0,
+            lock_wait: 0,
+        };
+        Ok((checkout, gates, changed, phase_timings_ms))
     }
 
     fn gate_inputs_with_integrity(
@@ -14134,6 +14234,21 @@ mod tests {
             ),
             "{}",
             summary.message
+        );
+    }
+
+    #[test]
+    fn affected_gate_timings_name_each_phase_over_budget() {
+        let timings = super::AffectedGatePhaseTimings {
+            graph_read: super::GATES_AFFECTED_PHASE_BUDGET_MS + 1,
+            manifest: super::GATES_AFFECTED_PHASE_BUDGET_MS,
+            selection: super::GATES_AFFECTED_PHASE_BUDGET_MS + 5,
+            lock_wait: super::GATES_AFFECTED_PHASE_BUDGET_MS + 1,
+        };
+
+        assert_eq!(
+            timings.over_budget_phases(),
+            vec!["graph_read", "selection", "lock_wait"]
         );
     }
 

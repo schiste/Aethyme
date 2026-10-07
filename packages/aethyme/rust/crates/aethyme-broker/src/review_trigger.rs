@@ -127,7 +127,7 @@ impl CommitClassification {
 
 /// Order the known risk words. An unrecognised word ranks above `low` but below
 /// `high`, so a typo escalates rather than silently downgrading.
-fn risk_rank(risk: &str) -> u8 {
+pub(crate) fn risk_rank(risk: &str) -> u8 {
     match risk.trim().to_ascii_lowercase().as_str() {
         "none" => 0,
         "low" => 1,
@@ -256,6 +256,9 @@ pub struct ChangeFacts {
     /// reviewer running the model that wrote the code has correlated blind
     /// spots exactly where review is supposed to be independent.
     pub authored_by_model: Option<String>,
+    /// Size and risk measured from the diff (#584). `None` when the change
+    /// was not measured; a rule conditioned on it then never matches.
+    pub change: Option<crate::ChangeClassification>,
 }
 
 // ---------------------------------------------------------------------------
@@ -275,7 +278,39 @@ pub struct ReviewTriggerRule {
     #[serde(default)]
     pub name: Option<String>,
     /// Review types this rule requires when it matches.
+    #[serde(default)]
     pub require: Vec<ReviewType>,
+    /// Review types this rule waives when it matches (#584): a waiver bound to
+    /// the head, with a generated reason. Never for a change carrying a
+    /// guarded signal, never over a type another rule requires, and only for
+    /// the types named here -- there is no wildcard.
+    #[serde(default)]
+    pub waive: Vec<ReviewType>,
+    /// Labels this rule adds under the projection's `label_prefix` when it
+    /// matches (#584).
+    #[serde(default)]
+    pub labels: Vec<String>,
+    /// Smallest measured size tier (`trivial`, `normal`, `large`).
+    #[serde(default)]
+    pub min_tier: Option<String>,
+    /// Largest measured size tier.
+    #[serde(default)]
+    pub max_tier: Option<String>,
+    /// Size bounds, each inclusive, against the measured size.
+    #[serde(default)]
+    pub min_files: Option<u64>,
+    #[serde(default)]
+    pub max_files: Option<u64>,
+    #[serde(default)]
+    pub min_churn: Option<u64>,
+    #[serde(default)]
+    pub max_churn: Option<u64>,
+    /// Measured signals that must all be set.
+    #[serde(default)]
+    pub signals: Vec<String>,
+    /// Measured signals none of which may be set.
+    #[serde(default)]
+    pub none_of_signals: Vec<String>,
     /// Lifecycle transitions this rule fires on. Empty means any.
     #[serde(default)]
     pub on: Vec<ReviewTrigger>,
@@ -472,8 +507,17 @@ pub enum ReviewTriggerError {
         found: u32,
         supported: u32,
     },
-    #[error("{path}: review.trigger rule {index} requires no review types; give it `require`")]
+    #[error(
+        "{path}: review.trigger rule {index} does nothing; give it `require`, `waive` or \
+         `labels`"
+    )]
     RuleRequiresNothing { path: String, index: usize },
+    #[error("{path}: review.trigger rule {index}: {reason}")]
+    InvalidRule {
+        path: String,
+        index: usize,
+        reason: String,
+    },
     #[error(
         "{path}: review.trigger rule {index} waits for `{trigger}`, which no tick can \
          report; remove it from `on` or the rule will never fire"
@@ -508,8 +552,13 @@ impl ReviewTriggerPolicy {
                 });
             }
         };
+        Self::from_toml_str(&text, &display)
+    }
+
+    /// Parse the policy out of a whole `.aethyme/config.toml`.
+    pub(crate) fn from_toml_str(text: &str, display: &str) -> Result<Self, ReviewTriggerError> {
         let value: toml::Value = text.parse().map_err(|source| ReviewTriggerError::Parse {
-            path: display.clone(),
+            path: display.to_string(),
             source,
         })?;
         let Some(table) = value.get("review").and_then(|review| review.get("trigger")) else {
@@ -520,10 +569,10 @@ impl ReviewTriggerPolicy {
                 .clone()
                 .try_into()
                 .map_err(|source| ReviewTriggerError::Parse {
-                    path: display.clone(),
+                    path: display.to_string(),
                     source,
                 })?;
-        policy.validate(&display)?;
+        policy.validate(display)?;
         Ok(policy)
     }
 
@@ -536,10 +585,17 @@ impl ReviewTriggerPolicy {
             });
         }
         for (index, rule) in self.rule.iter().enumerate() {
-            if rule.require.is_empty() {
+            if rule.require.is_empty() && rule.waive.is_empty() && rule.labels.is_empty() {
                 return Err(ReviewTriggerError::RuleRequiresNothing {
                     path: path.to_string(),
                     index,
+                });
+            }
+            if let Err(reason) = rule.validate_classification_terms() {
+                return Err(ReviewTriggerError::InvalidRule {
+                    path: path.to_string(),
+                    index,
+                    reason,
                 });
             }
             // A rule may only wait for something a tick can report. The
@@ -577,7 +633,7 @@ impl ReviewTriggerPolicy {
 /// `.github/workflows/**`, and small enough that an operator can predict it
 /// without consulting a reference -- which matters more here than expressiveness,
 /// because a pattern that silently fails to match quietly removes a review.
-fn path_matches(pattern: &str, path: &str) -> bool {
+pub(crate) fn path_matches(pattern: &str, path: &str) -> bool {
     fn matches(pattern: &[&str], path: &[&str]) -> bool {
         match pattern.split_first() {
             None => path.is_empty(),
@@ -683,7 +739,110 @@ impl ReviewTriggerRule {
                 return false;
             }
         }
-        true
+        self.matches_classification(facts.change.as_ref())
+    }
+
+    fn has_classification_terms(&self) -> bool {
+        self.min_tier.is_some()
+            || self.max_tier.is_some()
+            || self.min_files.is_some()
+            || self.max_files.is_some()
+            || self.min_churn.is_some()
+            || self.max_churn.is_some()
+            || !self.signals.is_empty()
+            || !self.none_of_signals.is_empty()
+    }
+
+    /// The #584 conditions. A rule that states any of them never matches an
+    /// unmeasured change: a condition nobody could evaluate is not satisfied.
+    fn matches_classification(&self, change: Option<&crate::ChangeClassification>) -> bool {
+        if !self.has_classification_terms() {
+            return true;
+        }
+        let Some(change) = change else {
+            return false;
+        };
+        let tier = change.tier;
+        let tier_at_least = |name: &Option<String>| {
+            name.as_deref()
+                .and_then(crate::SizeTier::parse)
+                .is_none_or(|minimum| tier >= minimum)
+        };
+        let tier_at_most = |name: &Option<String>| {
+            name.as_deref()
+                .and_then(crate::SizeTier::parse)
+                .is_none_or(|maximum| tier <= maximum)
+        };
+        let size = &change.size;
+        tier_at_least(&self.min_tier)
+            && tier_at_most(&self.max_tier)
+            && self.min_files.is_none_or(|n| size.files_changed >= n)
+            && self.max_files.is_none_or(|n| size.files_changed <= n)
+            && self.min_churn.is_none_or(|n| size.churn >= n)
+            && self.max_churn.is_none_or(|n| size.churn <= n)
+            && self
+                .signals
+                .iter()
+                .all(|name| change.signals.is_set(name) == Some(true))
+            && self
+                .none_of_signals
+                .iter()
+                .all(|name| change.signals.is_set(name) == Some(false))
+    }
+
+    /// Reject what can be proven wrong at load: unknown tier or signal names,
+    /// an empty or wildcard dimension, a malformed label, and a waive rule that
+    /// requires a guarded signal (it could never waive anything).
+    fn validate_classification_terms(&self) -> Result<(), String> {
+        for (key, value) in [("min_tier", &self.min_tier), ("max_tier", &self.max_tier)] {
+            if let Some(value) = value
+                && crate::SizeTier::parse(value).is_none()
+            {
+                return Err(format!(
+                    "`{key} = {value:?}` is not a tier; use trivial, normal or large"
+                ));
+            }
+        }
+        for name in self.signals.iter().chain(&self.none_of_signals) {
+            if !crate::SIGNAL_NAMES.contains(&name.as_str()) {
+                return Err(format!(
+                    "unknown signal {name:?}; known signals are {}",
+                    crate::SIGNAL_NAMES.join(", ")
+                ));
+            }
+        }
+        for dimension in self.require.iter().chain(&self.waive) {
+            let trimmed = dimension.trim();
+            if trimmed.is_empty() || trimmed.contains(['*', '?']) {
+                return Err(format!(
+                    "review type {dimension:?} is not a dimension name; name each one, \
+                     there is no wildcard"
+                ));
+            }
+        }
+        for label in &self.labels {
+            if label.is_empty()
+                || !label
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | ':' | '.'))
+            {
+                return Err(format!(
+                    "label {label:?} may only use letters, digits, `-`, `_`, `:` and `.`"
+                ));
+            }
+        }
+        if !self.waive.is_empty()
+            && let Some(guarded) = self
+                .signals
+                .iter()
+                .find(|name| AUTO_WAIVE_GUARDED_SIGNALS.contains(&name.as_str()))
+        {
+            return Err(format!(
+                "`waive` with `signals = [{guarded:?}]` can never waive anything: the broker \
+                 never auto-waives a change carrying `{guarded}`"
+            ));
+        }
+        Ok(())
     }
 
     fn label(&self, index: usize) -> String {
@@ -751,6 +910,157 @@ pub fn eligible_types(policy: &ReviewTriggerPolicy, facts: &ChangeFacts) -> Vec<
             excluded: excluded.clone(),
         })
         .collect()
+}
+
+/// Signals that forbid an automatic waiver, whatever a rule says (#584).
+///
+/// Enforced by the broker, not by configuration: a change from a fork or a
+/// first-time contributor, one that touches a cross-process contract (or whose
+/// contract scan could not run), gate or review policy, a workflow, or a
+/// sensitive path always keeps every review it would otherwise get.
+pub const AUTO_WAIVE_GUARDED_SIGNALS: &[&str] = &[
+    "from_fork",
+    "first_time_contributor",
+    "contract_surface",
+    "gate_policy",
+    "workflows",
+    "sensitive_paths",
+];
+
+/// One automatic waiver a rule asked for.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PlannedWaiver {
+    pub review_type: ReviewType,
+    /// The rule that asked for it.
+    pub rule: String,
+    /// The reason written into the waiver, naming the rule and the measured
+    /// values.
+    pub reason: String,
+}
+
+/// A waiver a rule asked for and the broker refused, with why.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RefusedWaiver {
+    pub review_type: ReviewType,
+    pub rule: String,
+    pub why: String,
+}
+
+/// One extra label a rule asked for.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RuleLabel {
+    pub label: String,
+    pub rule: String,
+}
+
+/// What the matching rules ask for beyond reviews: waivers and labels.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct RuleActions {
+    pub waivers: Vec<PlannedWaiver>,
+    pub refused_waivers: Vec<RefusedWaiver>,
+    pub labels: Vec<RuleLabel>,
+}
+
+/// The waivers and labels the matching rules ask for (#584).
+///
+/// Deterministic: rules in file order, one entry per type. `eligible` is what
+/// [`eligible_types`] found; a type in it is required by some rule or
+/// declaration, and `require` beats `waive`.
+pub fn rule_actions(
+    policy: &ReviewTriggerPolicy,
+    facts: &ChangeFacts,
+    eligible: &[EligibleReview],
+) -> RuleActions {
+    let mut actions = RuleActions::default();
+    if !policy.enabled {
+        return actions;
+    }
+    let required: BTreeSet<&str> = eligible
+        .iter()
+        .map(|review| review.review_type.as_str())
+        .collect();
+    let guarded: Vec<&str> = match &facts.change {
+        Some(change) => AUTO_WAIVE_GUARDED_SIGNALS
+            .iter()
+            .copied()
+            .filter(|name| change.signals.is_set(name) == Some(true))
+            .collect(),
+        None => Vec::new(),
+    };
+    let mut seen_waive: BTreeSet<String> = BTreeSet::new();
+    let mut seen_label: BTreeSet<String> = BTreeSet::new();
+    for (index, rule) in policy.rule.iter().enumerate() {
+        if !rule.matches(facts) {
+            continue;
+        }
+        let name = rule.label(index);
+        for label in &rule.labels {
+            if seen_label.insert(label.clone()) {
+                actions.labels.push(RuleLabel {
+                    label: label.clone(),
+                    rule: name.clone(),
+                });
+            }
+        }
+        for review_type in &rule.waive {
+            if !seen_waive.insert(review_type.clone()) {
+                continue;
+            }
+            let refuse = |why: String| RefusedWaiver {
+                review_type: review_type.clone(),
+                rule: name.clone(),
+                why,
+            };
+            let Some(change) = &facts.change else {
+                actions
+                    .refused_waivers
+                    .push(refuse("the change was not measured".into()));
+                continue;
+            };
+            // Revalidated here, not only at load: a policy built any other way
+            // must not waive through a wildcard or a guarded-signal rule.
+            if let Err(reason) = rule.validate_classification_terms() {
+                actions
+                    .refused_waivers
+                    .push(refuse(format!("the rule is invalid: {reason}")));
+                continue;
+            }
+            if !change.signals.unknown.is_empty() {
+                actions.refused_waivers.push(refuse(format!(
+                    "{} could not be determined, and the broker never waives on an \
+                     undetermined input",
+                    change.signals.unknown.join(", ")
+                )));
+                continue;
+            }
+            if !guarded.is_empty() {
+                actions.refused_waivers.push(refuse(format!(
+                    "the change carries {}, which the broker never auto-waives",
+                    guarded.join(", ")
+                )));
+                continue;
+            }
+            if required.contains(review_type.as_str()) {
+                actions.refused_waivers.push(refuse(format!(
+                    "another rule or a declaration requires a {review_type} review; require \
+                     beats waive"
+                )));
+                continue;
+            }
+            actions.waivers.push(PlannedWaiver {
+                review_type: review_type.clone(),
+                rule: name.clone(),
+                reason: format!(
+                    "auto-waived by rule `{name}`: {} change, {} files, {} changed lines, risk {}",
+                    change.tier.as_str(),
+                    change.size.files_changed,
+                    change.size.churn,
+                    change.risk
+                ),
+            });
+        }
+    }
+    actions
 }
 
 /// A declared classification that its own diff does not support.
@@ -995,6 +1305,7 @@ mod tests {
             from_fork: false,
             first_time_contributor: false,
             authored_by_model: None,
+            change: None,
         }
     }
 
@@ -1011,6 +1322,7 @@ mod tests {
             first_time_contributor: None,
             authored_by_model: None,
             models: Vec::new(),
+            ..Default::default()
         }
     }
 
@@ -1229,6 +1541,238 @@ mod tests {
             found[0].because,
             vec!["by-path".to_string(), "by-fork".to_string()]
         );
+    }
+
+    // ----- #584: classification conditions and actions -----------------------
+
+    fn measured(
+        paths: &[(&str, u64)],
+        configure: impl FnOnce(&mut crate::ChangeInputs),
+    ) -> ChangeFacts {
+        let mut inputs = crate::ChangeInputs {
+            files: paths
+                .iter()
+                .map(|(path, lines)| crate::ChangedFile {
+                    path: path.to_string(),
+                    old_path: None,
+                    added: Some(*lines),
+                    deleted: Some(0),
+                })
+                .collect(),
+            contract_symbols: Some(Vec::new()),
+            generated: Some(BTreeSet::new()),
+            provenance_known: true,
+            files_complete: true,
+            ..Default::default()
+        };
+        configure(&mut inputs);
+        let mut change = facts(&paths.iter().map(|(path, _)| *path).collect::<Vec<_>>());
+        change.from_fork = inputs.from_fork;
+        change.first_time_contributor = inputs.first_time_contributor;
+        let policy = crate::ChangeClassificationPolicy {
+            sensitive_paths: vec!["src/auth/**".into()],
+            ..Default::default()
+        };
+        change.change = Some(crate::classify_change(&policy, &inputs));
+        change
+    }
+
+    fn waive_trivial_code() -> ReviewTriggerRule {
+        ReviewTriggerRule {
+            name: Some("trivial-code".into()),
+            waive: vec!["code".into()],
+            max_tier: Some("trivial".into()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn tier_conditions_select_large_changes_only() {
+        let policy = enabled(vec![ReviewTriggerRule {
+            name: Some("large-code".into()),
+            require: vec!["code".into()],
+            min_tier: Some("large".into()),
+            ..Default::default()
+        }]);
+        let large = measured(&[("src/a.rs", 2000)], |_| {});
+        let small = measured(&[("src/a.rs", 5)], |_| {});
+        assert_eq!(eligible_types(&policy, &large).len(), 1);
+        assert!(eligible_types(&policy, &small).is_empty());
+    }
+
+    #[test]
+    fn an_unmeasured_change_never_matches_a_classification_condition() {
+        let policy = enabled(vec![waive_trivial_code()]);
+        let unmeasured = facts(&["docs/a.md"]);
+        let actions = rule_actions(&policy, &unmeasured, &[]);
+        assert!(actions.waivers.is_empty());
+        assert!(
+            actions.refused_waivers.is_empty(),
+            "the rule did not match at all"
+        );
+    }
+
+    #[test]
+    fn a_trivial_change_is_auto_waived_with_a_reason_naming_the_rule_and_size() {
+        let policy = enabled(vec![waive_trivial_code()]);
+        let change = measured(&[("docs/a.md", 3)], |_| {});
+        let actions = rule_actions(&policy, &change, &eligible_types(&policy, &change));
+        assert_eq!(actions.waivers.len(), 1, "{actions:?}");
+        let waiver = &actions.waivers[0];
+        assert_eq!(waiver.review_type, "code");
+        assert!(
+            waiver.reason.contains("`trivial-code`"),
+            "{}",
+            waiver.reason
+        );
+        assert!(
+            waiver.reason.contains("1 files, 3 changed lines"),
+            "{}",
+            waiver.reason
+        );
+        // A larger change does not match `max_tier = "trivial"`.
+        let normal = measured(&[("docs/a.md", 200)], |_| {});
+        assert!(rule_actions(&policy, &normal, &[]).waivers.is_empty());
+    }
+
+    #[test]
+    fn every_guarded_signal_refuses_an_auto_waiver() {
+        let policy = enabled(vec![waive_trivial_code()]);
+        let cases: Vec<(&str, ChangeFacts)> = vec![
+            (
+                "from_fork",
+                measured(&[("docs/a.md", 1)], |i| i.from_fork = true),
+            ),
+            (
+                "first_time_contributor",
+                measured(&[("docs/a.md", 1)], |i| i.first_time_contributor = true),
+            ),
+            (
+                "contract_surface",
+                measured(&[("docs/a.md", 1)], |i| {
+                    i.contract_symbols = Some(vec!["check-contract".into()])
+                }),
+            ),
+            (
+                "contract_surface",
+                measured(&[("docs/a.md", 1)], |i| i.contract_symbols = None),
+            ),
+            (
+                "gate_policy",
+                measured(&[(".aethyme/gates.toml", 1)], |_| {}),
+            ),
+            (
+                "workflows",
+                measured(&[(".github/workflows/ci.yml", 1)], |_| {}),
+            ),
+            (
+                "sensitive_paths",
+                measured(&[("src/auth/token.rs", 1)], |_| {}),
+            ),
+        ];
+        for (signal, change) in cases {
+            let actions = rule_actions(&policy, &change, &[]);
+            assert!(actions.waivers.is_empty(), "{signal}: {actions:?}");
+            assert_eq!(actions.refused_waivers.len(), 1, "{signal}: {actions:?}");
+            assert!(
+                actions.refused_waivers[0].why.contains(signal),
+                "{signal}: {}",
+                actions.refused_waivers[0].why
+            );
+        }
+    }
+
+    #[test]
+    fn an_undetermined_input_refuses_the_waiver() {
+        let policy = enabled(vec![waive_trivial_code()]);
+        for (what, change) in [
+            (
+                "from_fork",
+                measured(&[("docs/a.md", 1)], |i| i.provenance_known = false),
+            ),
+            (
+                "workflows",
+                measured(&[("docs/a.md", 1)], |i| i.files_complete = false),
+            ),
+            (
+                "generated_attributes",
+                measured(&[("docs/a.md", 1)], |i| i.generated = None),
+            ),
+        ] {
+            let actions = rule_actions(&policy, &change, &[]);
+            assert!(actions.waivers.is_empty(), "{what}: {actions:?}");
+            assert!(
+                actions.refused_waivers[0].why.contains(what),
+                "{what}: {}",
+                actions.refused_waivers[0].why
+            );
+        }
+    }
+
+    #[test]
+    fn an_invalid_rule_built_without_load_cannot_waive() {
+        let mut wildcard = waive_trivial_code();
+        wildcard.waive = vec!["*".into()];
+        let policy = enabled(vec![wildcard]);
+        let change = measured(&[("docs/a.md", 1)], |_| {});
+        let actions = rule_actions(&policy, &change, &[]);
+        assert!(actions.waivers.is_empty(), "{actions:?}");
+        assert!(actions.refused_waivers[0].why.contains("invalid"));
+    }
+
+    #[test]
+    fn require_beats_waive_for_the_same_dimension() {
+        let policy = enabled(vec![rule("always-code", &["code"]), waive_trivial_code()]);
+        let change = measured(&[("docs/a.md", 2)], |_| {});
+        let eligible = eligible_types(&policy, &change);
+        let actions = rule_actions(&policy, &change, &eligible);
+        assert!(actions.waivers.is_empty(), "{actions:?}");
+        assert!(
+            actions.refused_waivers[0]
+                .why
+                .contains("require beats waive")
+        );
+    }
+
+    #[test]
+    fn signal_conditions_and_labels() {
+        let policy = enabled(vec![ReviewTriggerRule {
+            name: Some("flag-deps".into()),
+            labels: vec!["deps-changed".into()],
+            signals: vec!["dependency_manifest".into()],
+            ..Default::default()
+        }]);
+        let deps = measured(&[("Cargo.toml", 1)], |_| {});
+        let plain = measured(&[("src/a.rs", 1)], |_| {});
+        assert_eq!(rule_actions(&policy, &deps, &[]).labels.len(), 1);
+        assert!(rule_actions(&policy, &plain, &[]).labels.is_empty());
+    }
+
+    #[test]
+    fn invalid_classification_terms_are_rejected_at_load() {
+        for (body, needle) in [
+            ("waive = [\"*\"]", "no wildcard"),
+            ("waive = [\"code\"]\nmax_tier = \"tiny\"", "not a tier"),
+            ("labels = [\"x\"]\nsignals = [\"nope\"]", "unknown signal"),
+            (
+                "waive = [\"code\"]\nsignals = [\"workflows\"]",
+                "can never waive",
+            ),
+            ("labels = [\"has space\"]", "may only use"),
+        ] {
+            let error = ReviewTriggerPolicy::from_toml_str(
+                &format!("[review.trigger]\nenabled = true\n[[review.trigger.rule]]\n{body}\n"),
+                "config.toml",
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains(needle), "{body}: {error}");
+        }
+        // A rule with only `labels` or only `waive` is valid.
+        ReviewTriggerPolicy::from_toml_str(
+            "[review.trigger]\nenabled = true\n[[review.trigger.rule]]\nlabels = [\"x\"]\n",
+            "config.toml",
+        )
+        .unwrap();
     }
 
     fn fork_change() -> ChangeFacts {
@@ -1876,9 +2420,9 @@ always_on_new_head = true
 
     #[test]
     fn a_rule_that_omits_require_entirely_is_rejected_too() {
-        // Caught by serde rather than by `validate`, because `require` has no
-        // default. Same outcome, and worth pinning so a later `#[serde(default)]`
-        // cannot quietly turn a missing field into a no-op rule.
+        // `require` defaults to empty since a rule may instead `waive` or add
+        // `labels` (#584), so `validate` is what refuses a rule that does
+        // nothing. Pinned so a missing field can never become a no-op rule.
         let temp = tempfile::tempdir().unwrap();
         write_config(
             temp.path(),
@@ -1886,7 +2430,7 @@ always_on_new_head = true
         );
         assert!(matches!(
             ReviewTriggerPolicy::load(temp.path()),
-            Err(ReviewTriggerError::Parse { .. })
+            Err(ReviewTriggerError::RuleRequiresNothing { index: 0, .. })
         ));
     }
 
