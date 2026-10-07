@@ -558,6 +558,15 @@ fn audit_is_scoped_to_the_named_repository_and_renders_a_summary() {
     let session = broker.start_worktree("scoped", None).unwrap();
     broker.close(session.id).unwrap();
     drop(broker);
+    // The CLI opens the broker, whose unattended sweep would remove this
+    // clean, contained checkout before the audit reads it (#588); this test
+    // is about how the audit renders a retained one.
+    std::fs::create_dir_all(repo.join(".aethyme")).unwrap();
+    std::fs::write(
+        repo.join(".aethyme/config.toml"),
+        "[cleanup]\nauto_remove = false\n",
+    )
+    .unwrap();
 
     // Run from an unrelated directory, naming the repository explicitly.
     let output = cli(
