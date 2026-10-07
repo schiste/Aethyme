@@ -58,8 +58,9 @@ pub struct ReviewPolicy {
     /// after `broker push` publishes it (classification, projection and rule
     /// actions), instead of waiting for a `review tick`. Off by default.
     pub run_on_push: bool,
-    /// Wall-clock budget for that review run; a run past it is stopped and
-    /// reported, and the push itself still succeeds.
+    /// Wall-clock budget the push waits for that review run. A run past it is
+    /// reported and keeps going in the background, never killed mid-write;
+    /// the push itself still succeeds.
     pub run_on_push_budget_secs: u64,
 }
 
