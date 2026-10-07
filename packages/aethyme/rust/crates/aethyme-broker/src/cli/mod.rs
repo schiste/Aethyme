@@ -2241,6 +2241,17 @@ fn run_inner(args: &[String], mode: &CompatibilityMode) -> Result<(), UsageError
         "start" if parsed.cmd.is_some() => "start-agent".to_string(),
         other => other.to_string(),
     };
+    // `submit` has no positional subcommands. Refuse them before advisories or
+    // holder admission can touch broker state; otherwise a typo such as
+    // `submit status` falls through to the stateful submit handler.
+    if subcommand == "submit"
+        && let Some(unknown) = parsed.positional.first()
+    {
+        return Err(UsageError::Exit {
+            message: surface::unsupported_submit_subcommand(unknown),
+            code: crate::exit_status::USAGE,
+        });
+    }
     // One declarative check replaces the per-flag guards that grew after #285:
     // a flag the subcommand never reads is refused rather than dropped.
     validate_flags(subcommand, &parsed)?;
