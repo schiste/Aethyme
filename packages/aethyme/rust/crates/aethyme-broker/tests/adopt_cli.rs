@@ -1083,14 +1083,14 @@ fn a_new_session_on_the_main_checkout_is_refused_however_it_is_spelled() {
     std::fs::create_dir(root.join("sub")).unwrap();
     let trailing = format!("{}/", root.display());
     let dotted = root.join("sub").join("..");
-    let mut spellings = vec![
+    let spellings = vec![
         link.display().to_string(),
         trailing,
         dotted.display().to_string(),
+        // APFS is case-insensitive by default: another case names the same
+        // tree. Elsewhere this path does not exist and the loop skips it.
+        root.display().to_string().to_uppercase(),
     ];
-    // APFS is case-insensitive by default: another case names the same tree.
-    #[cfg(target_os = "macos")]
-    spellings.push(root.display().to_string().to_uppercase());
     for spelling in spellings {
         if !Path::new(&spelling).exists() {
             continue;
