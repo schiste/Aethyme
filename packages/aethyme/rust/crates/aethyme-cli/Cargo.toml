@@ -27,7 +27,7 @@ toml_edit = { workspace = true }
 # `aethyme` binary as a subprocess and never link the product crates, so
 # the harness plus JSON/tempdir helpers are all they need.
 [dev-dependencies]
-criterion = "0.5"
+criterion = { workspace = true }
 aethyme-testkit = { path = "../aethyme-testkit" }
 serde_json = { workspace = true }
 sha2 = { workspace = true }

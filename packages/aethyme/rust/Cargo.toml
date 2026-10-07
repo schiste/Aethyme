@@ -16,6 +16,7 @@ resolver = "2"
 [workspace.dependencies]
 bincode = "1"
 blake3 = "1"
+criterion = "0.5"
 clap = { version = "4", features = ["derive"] }
 data-encoding = "2"
 dhat = "0.3"
