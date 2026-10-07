@@ -140,6 +140,11 @@ pub struct ReviewProjection {
     /// The quality report never creates a second provider comment.
     #[serde(default)]
     pub quality_report: Option<QualityReport>,
+    /// Size and risk measured from the diff (#584). When present, the risk
+    /// label shows its effective risk -- computed, raised by a declaration,
+    /// never lowered by one -- and a size label is added.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub change: Option<crate::ChangeClassification>,
 }
 
 // ---------------------------------------------------------------------------
@@ -172,9 +177,13 @@ pub struct PrProjectionPolicy {
     /// Label declared surfaces (`aethyme/surface:auth`).
     #[serde(default = "default_true")]
     pub label_surfaces: bool,
-    /// Label declared risk (`aethyme/risk:high`).
+    /// Label risk (`aethyme/risk:high`): the measured risk raised by any
+    /// declaration, or the declared risk alone when nothing was measured.
     #[serde(default = "default_true")]
     pub label_risk: bool,
+    /// Label the measured size tier (`aethyme/size:large`, #584).
+    #[serde(default = "default_true")]
+    pub label_size: bool,
     /// Label review dimensions still owed an answer (`aethyme/review:security`).
     #[serde(default = "default_true")]
     pub label_reviews: bool,
@@ -218,6 +227,7 @@ impl Default for PrProjectionPolicy {
             label_areas: true,
             label_surfaces: true,
             label_risk: true,
+            label_size: true,
             label_reviews: true,
             reserved: BTreeSet::new(),
             create_missing_labels: true,
@@ -501,6 +511,9 @@ fn label_color(kind: &str, value: &str) -> &'static str {
         ("risk", "critical" | "high") => "b60205",
         ("risk", "low" | "none") => "c2e0c6",
         ("risk", _) => "fbca04",
+        ("size", "large") => "d93f0b",
+        ("size", "trivial") => "c2e0c6",
+        ("size", _) => "bfd4f2",
         ("area", _) => "0e8a16",
         ("surface", _) => "1d76db",
         ("review", _) => "5319e7",
@@ -512,7 +525,8 @@ fn label_description(kind: &str, value: &str) -> String {
     match kind {
         "area" => format!("Declared area: {value}"),
         "surface" => format!("Declared surface: {value}"),
-        "risk" => format!("Declared risk: {value}"),
+        "risk" => format!("Risk: {value}"),
+        "size" => format!("Change size: {value}"),
         "review" => format!("Review outstanding: {value}"),
         _ => format!("{kind}: {value}"),
     }
@@ -537,10 +551,17 @@ fn desired_labels(
             add("surface", surface);
         }
     }
-    if policy.label_risk
-        && let Some(risk) = &projection.classification.risk
+    if policy.label_risk {
+        match (&projection.change, &projection.classification.risk) {
+            (Some(change), _) => add("risk", &change.risk),
+            (None, Some(risk)) => add("risk", risk),
+            (None, None) => {}
+        }
+    }
+    if policy.label_size
+        && let Some(change) = &projection.change
     {
-        add("risk", risk);
+        add("size", change.tier.as_str());
     }
     if policy.label_reviews {
         for review in &projection.reviews {
@@ -668,6 +689,12 @@ pub fn render_comment(projection: &ReviewProjection) -> String {
         }
     }
 
+    if let Some(change) = &projection.change {
+        out.push('\n');
+        out.push_str(&crate::change_summary_line(change));
+        out.push('\n');
+    }
+
     let classification = &projection.classification;
     if !classification.is_empty() {
         let _ = writeln!(out);
@@ -752,6 +779,7 @@ mod tests {
             ),
             conflicts: Vec::new(),
             quality_report: None,
+            change: None,
         }
     }
 

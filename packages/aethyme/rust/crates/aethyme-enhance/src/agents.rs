@@ -314,7 +314,20 @@ fn render_broker_protocol_compact(repo: &Path) -> String {
         // held 74 unpublished commits over five weeks. Where the repository
         // authorizes it, the session branch is the unit of delivery, so the
         // agent pushes it as it goes rather than at the end.
-        return r#"## Broker Coordination: before and after an edit
+        let protocol = PUSHING_PROTOCOL.to_string();
+        return match pr_size_thresholds(repo) {
+            Some((files, lines)) => format!(
+                "{protocol}\n\nKeep each pull request within {files} changed files and {lines} \
+                 changed lines (`[review] pr_size`); `aethyme broker push --pr` warns above \
+                 that and suggests splitting it."
+            ),
+            None => protocol,
+        };
+    }
+    NON_PUSHING_PROTOCOL.to_string()
+}
+
+const PUSHING_PROTOCOL: &str = r#"## Broker Coordination: before and after an edit
 
 Other agents may be working in sibling worktrees.
 
@@ -334,10 +347,9 @@ This repository's `push_session_branches` policy authorizes pushing your own
 session branch and opening a draft PR; nothing else. Other remote or shared Git
 and GitHub writes go through `aethyme broker advanced git` and
 `aethyme broker advanced gh`. If `.aethyme/broker-action-required.md` appears,
-read it first. Leases, gates, advisories and recovery: `references/broker.md`."#
-            .to_string();
-    }
-    r#"## Broker Coordination: before and after an edit
+read it first. Leases, gates, advisories and recovery: `references/broker.md`."#;
+
+const NON_PUSHING_PROTOCOL: &str = r#"## Broker Coordination: before and after an edit
 
 Other agents may be working in sibling worktrees.
 
@@ -352,8 +364,22 @@ and `aethyme broker advanced gh`; editing or submitting never authorizes
 publishing. If `.aethyme/broker-action-required.md` appears, read it first.
 Leases, gates, advisories and recovery: `references/broker.md`. Maintainers can
 let agents push session branches and open draft PRs by setting
-`[delivery] push_session_branches = true` in `.aethyme/config.toml`."#
-        .to_string()
+`[delivery] push_session_branches = true` in `.aethyme/config.toml`."#;
+
+/// The advisory pull-request size a repository chose in `[review] pr_size`
+/// (#239), as `(max_files, max_changed_lines)`.
+///
+/// Stated in guidance only when written: an unconfigured repository keeps its
+/// generated files unchanged rather than advertising a default it never chose.
+fn pr_size_thresholds(repo: &Path) -> Option<(u64, u64)> {
+    let config = std::fs::read_to_string(repo.join(".aethyme/config.toml"))
+        .ok()?
+        .parse::<toml::Value>()
+        .ok()?;
+    let size = config.get("review")?.get("pr_size")?;
+    let files = u64::try_from(size.get("max_files")?.as_integer()?).ok()?;
+    let lines = u64::try_from(size.get("max_changed_lines")?.as_integer()?).ok()?;
+    (files > 0 && lines > 0).then_some((files, lines))
 }
 
 /// Whether `.aethyme/config.toml` sets `[delivery] push_session_branches =
@@ -1031,6 +1057,31 @@ mod tests {
         std::fs::write(repo.join(".aethyme/gates.toml"), "[[gate]]\n").unwrap();
         std::fs::write(repo.join(".aethyme/config.toml"), config).unwrap();
         repo
+    }
+
+    #[test]
+    fn configured_pr_size_is_stated_and_an_unconfigured_one_is_not() {
+        let configured = broker_repo_with_config(
+            "pr-size-on",
+            "schema = 1\n[delivery]\npush_session_branches = true\n\n[review]\n\
+             pr_size = { max_files = 12, max_changed_lines = 300 }\n",
+        );
+        let doc = render_agents_document(Some(&configured)).unwrap();
+        assert!(
+            doc.contains("within 12 changed files and 300 \nchanged lines")
+                || doc.contains("within 12 changed files and 300 changed lines"),
+            "{doc}"
+        );
+        assert!(doc.contains("`[review] pr_size`"), "{doc}");
+        std::fs::remove_dir_all(&configured).unwrap();
+
+        let unconfigured = broker_repo_with_config(
+            "pr-size-off",
+            "schema = 1\n[delivery]\npush_session_branches = true\n",
+        );
+        let doc = render_agents_document(Some(&unconfigured)).unwrap();
+        assert!(!doc.contains("pr_size"), "{doc}");
+        std::fs::remove_dir_all(&unconfigured).unwrap();
     }
 
     #[test]

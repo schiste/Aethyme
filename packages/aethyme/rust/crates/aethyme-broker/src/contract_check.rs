@@ -61,7 +61,8 @@ use std::path::{Path, PathBuf};
 const MIN_SYMBOL_LEN: usize = 4;
 
 /// Path of the consumers registry, relative to the repository root.
-const DEFAULT_CONSUMERS_DOC: &str = "packages/aethyme/docs/architecture/cross-process-consumers.md";
+pub const DEFAULT_CONSUMERS_DOC: &str =
+    "packages/aethyme/docs/architecture/cross-process-consumers.md";
 
 /// python-retirement Phase 5.5/6: deployed templates project Explore with
 /// `aethyme explore-summary --from <json>` and emit their SessionStart
@@ -737,6 +738,36 @@ pub fn find_touched_symbols(
         .into_iter()
         .filter(|(symbol, lines)| lines.len() > added.get(symbol).copied().unwrap_or(0))
         .collect()
+}
+
+/// Tracked cross-process symbols a diff touches, for the change
+/// classification (#584).
+///
+/// `Ok(empty)` when the repository carries no consumer inventory at
+/// `doc_relative`: nothing is tracked, so nothing can be touched. `Err` when the
+/// inventory exists but cannot be read or yields no symbols, which the caller
+/// reports as an unknown scan rather than a clean one.
+pub fn touched_symbols_for_classification(
+    repo_root: &Path,
+    doc_relative: &str,
+    diff_lines: &[String],
+) -> Result<Vec<String>, String> {
+    let doc = repo_root.join(doc_relative);
+    let text = match std::fs::read_to_string(&doc) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(format!("could not read {}: {error}", doc.display())),
+    };
+    let tracked = extract_tracked_symbols(&text);
+    if tracked.is_empty() {
+        return Err(format!(
+            "could not extract tracked symbols from {}",
+            doc.display()
+        ));
+    }
+    Ok(find_touched_symbols(diff_lines, &tracked)
+        .into_keys()
+        .collect())
 }
 
 /// Check a broker submission's contract decision before its gates start.

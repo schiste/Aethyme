@@ -1,6 +1,6 @@
 # Review Routing
 
-Last Updated: 2026-09-11
+Last Updated: 2026-10-07
 
 Which reviews a change needs, who performs them, and what the pull request
 says about it. Three independent tables in `.aethyme/config.toml`:
@@ -518,6 +518,53 @@ still in the commit, but a human's `aethyme/skip-review` has no source to
 rederive from -- once written, it *is* the source. Without `reserved`,
 reconciliation would see an unrecognised label under its own prefix and
 helpfully delete the only record of that judgement.
+
+## How large and how risky a change is
+
+The broker measures every change it plans or runs (#584), so a pull request can
+be flagged without anyone declaring anything. `review plan` reports the
+measurement under `change`:
+
+| Field | Meaning |
+| --- | --- |
+| `size` | `files_changed`, `lines_added`, `lines_deleted`, `churn`. Files `.gitattributes` marks `linguist-generated` and lockfiles are left out and listed under `size.excluded`; binary files count as files with no lines. |
+| `signals` | Each with the evidence that set it: `sensitive_paths`, `contract_surface` (`clear`, `touched` with the symbols, or `unknown` when no diff text could be scanned), `gate_policy` (`.aethyme/gates.toml`, `.aethyme/config.toml`), `workflows` (`.github/workflows/**`), `migrations`, `dependency_manifest`, `from_fork`, `first_time_contributor`, `authored_by_model`. |
+| `tier` | `trivial`, `normal` or `large`, from the thresholds below. |
+| `computed_risk` | `high` for sensitive paths, a touched contract, gate policy, workflows, migrations or a fork; `low` for dependency manifests, a first-time contributor or a `large` change; otherwise `none`. |
+| `risk`, `risky` | The computed risk raised by a higher `Risk:` declaration -- a declaration never lowers it -- and whether that is `high` or above. |
+| `reasons` | One sentence per conclusion. |
+
+An unknown contract scan does not raise the risk label, but it never counts as
+clear for anything that relaxes review.
+
+Thresholds and paths are configuration:
+
+```toml
+[review]
+# The advisory pull-request size (#239): above it a change is `large`, and
+# `aethyme broker push --pr` warns -- it never refuses. Default 30 files, 800 lines.
+pr_size = { max_files = 30, max_changed_lines = 800 }
+
+[review.classification]
+trivial = { max_files = 3, max_changed_lines = 40 }   # the default
+sensitive_paths = ["crates/*/src/auth/**"]           # empty by default
+migration_paths = ["**/migrations/**"]               # the default
+exclude_paths = []                                   # left out of the size
+exclude_lockfiles = true                             # the default
+contract_doc = "packages/aethyme/docs/architecture/cross-process-consumers.md"
+```
+
+**By default this only flags.** With `[review.projection] enabled = true`, the
+pull request gets `aethyme/size:<tier>` and `aethyme/risk:<level>` labels
+(`label_size`, `label_risk`) and one line in the owned comment:
+
+```markdown
+Size **large** (41 files, +1203/−88); risk **high** — signals: workflows, contract_surface
+```
+
+Nothing else follows from the measurement: no review is requested, no bot is
+mentioned and no waiver is written unless a rule says so. Generated agent
+guidance states `pr_size` only when a repository wrote it.
 
 ## Trying a policy before switching it on
 

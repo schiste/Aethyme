@@ -127,7 +127,7 @@ impl CommitClassification {
 
 /// Order the known risk words. An unrecognised word ranks above `low` but below
 /// `high`, so a typo escalates rather than silently downgrading.
-fn risk_rank(risk: &str) -> u8 {
+pub(crate) fn risk_rank(risk: &str) -> u8 {
     match risk.trim().to_ascii_lowercase().as_str() {
         "none" => 0,
         "low" => 1,
@@ -577,7 +577,7 @@ impl ReviewTriggerPolicy {
 /// `.github/workflows/**`, and small enough that an operator can predict it
 /// without consulting a reference -- which matters more here than expressiveness,
 /// because a pattern that silently fails to match quietly removes a review.
-fn path_matches(pattern: &str, path: &str) -> bool {
+pub(crate) fn path_matches(pattern: &str, path: &str) -> bool {
     fn matches(pattern: &[&str], path: &[&str]) -> bool {
         match pattern.split_first() {
             None => path.is_empty(),

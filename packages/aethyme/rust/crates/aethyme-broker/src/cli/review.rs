@@ -59,6 +59,7 @@ pub(super) fn run_review_plan(parsed: Parsed) -> Result<(), UsageError> {
     let routing = crate::ReviewRoutingPolicy::load(&root).map_err(to_usage)?;
     let reporting = crate::ReviewReportingPolicy::load(&root).map_err(to_usage)?;
     let projection_policy = crate::PrProjectionPolicy::load(&root).map_err(to_usage)?;
+    let classification_policy = crate::ChangeClassificationPolicy::load(&root).map_err(to_usage)?;
 
     // `review plan` is the offline preview: git and config, no provider call,
     // runnable while other sessions work. It therefore cannot know which
@@ -73,6 +74,7 @@ pub(super) fn run_review_plan(parsed: Parsed) -> Result<(), UsageError> {
         from_fork: false,
         first_time_contributor: false,
     };
+    let change = classify_local_change(&change_root, &root, &base, &facts, &classification_policy)?;
     let eligible = crate::eligible_types(&trigger, &facts);
     let head = git_output(&change_root, &["rev-parse", "HEAD"])?
         .trim()
@@ -134,6 +136,7 @@ pub(super) fn run_review_plan(parsed: Parsed) -> Result<(), UsageError> {
         classification: classification.clone(),
         conflicts: Vec::new(),
         quality_report: None,
+        change: Some(change.clone()),
     };
     let projection_actions = crate::project(
         &projection_policy,
@@ -152,6 +155,7 @@ pub(super) fn run_review_plan(parsed: Parsed) -> Result<(), UsageError> {
         "pull_request": pull_request,
         "changed_paths": paths.len(),
         "classification": classification,
+        "change": change,
         "trigger_enabled": trigger.enabled,
         "routing_enabled": routing.enabled,
         "projection_enabled": projection_policy.enabled,
@@ -282,7 +286,12 @@ pub(super) fn read_change_from_provider(
     root: &Path,
     repository: &str,
     pull_request: i64,
-) -> Option<(Vec<String>, crate::CommitClassification, String)> {
+) -> Option<(
+    Vec<String>,
+    crate::CommitClassification,
+    String,
+    Vec<crate::ChangedFile>,
+)> {
     let output = std::process::Command::new("gh")
         .current_dir(root)
         .args([
@@ -327,7 +336,24 @@ pub(super) fn read_change_from_provider(
             .unwrap_or_default(),
     );
     let head = json["headRefOid"].as_str()?.to_string();
-    Some((paths, classification, head))
+    // The same `files` array carries per-file line counts, which is what the
+    // change classification measures (#584).
+    let files = json["files"]
+        .as_array()
+        .map(|files| {
+            files
+                .iter()
+                .filter_map(|file| {
+                    Some(crate::ChangedFile {
+                        path: file["path"].as_str()?.to_string(),
+                        added: file["additions"].as_u64(),
+                        deleted: file["deletions"].as_u64(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Some((paths, classification, head, files))
 }
 
 /// Whether `head` has `previous` in its history.
@@ -551,19 +577,22 @@ pub(super) fn run_review_run(parsed: Parsed) -> Result<serde_json::Value, UsageE
     let routing = crate::ReviewRoutingPolicy::load(&root).map_err(to_usage)?;
     let reporting = crate::ReviewReportingPolicy::load(&root).map_err(to_usage)?;
     let projection_policy = crate::PrProjectionPolicy::load(&root).map_err(to_usage)?;
+    let classification_policy = crate::ChangeClassificationPolicy::load(&root).map_err(to_usage)?;
 
     // Where the change is read from. The working directory is right for an
     // agent routing its own branch and impossible for a sweep, which visits
     // every open pull request and is standing in none of them; the git reads
     // below would fail on the first one. So the source is chosen before either
     // is attempted, never after.
-    let (paths, classification, head) = if parsed.from_provider {
-        read_change_from_provider(&root, &repository, pull_request).ok_or_else(|| {
-            UsageError::Message(format!(
-                "cannot read pull request {pull_request} from {repository}; \
+    let (paths, classification, head, provider_files) = if parsed.from_provider {
+        let (paths, classification, head, files) =
+            read_change_from_provider(&root, &repository, pull_request).ok_or_else(|| {
+                UsageError::Message(format!(
+                    "cannot read pull request {pull_request} from {repository}; \
                  --from-provider needs an authenticated gh"
-            ))
-        })?
+                ))
+            })?;
+        (paths, classification, head, Some(files))
     } else {
         let paths = git_lines(
             &change_root,
@@ -582,7 +611,7 @@ pub(super) fn run_review_run(parsed: Parsed) -> Result<serde_json::Value, UsageE
         let head = git_output(&change_root, &["rev-parse", "HEAD"])?
             .trim()
             .to_string();
-        (paths, classification, head)
+        (paths, classification, head, None)
     };
 
     // Before reading anything, stop waiting on reviews nobody is coming back
@@ -672,6 +701,17 @@ pub(super) fn run_review_run(parsed: Parsed) -> Result<serde_json::Value, UsageE
         classification.clone(),
         previous.as_ref(),
     );
+    let change = match provider_files {
+        Some(files) => classify_provider_change(
+            &root,
+            &repository,
+            pull_request,
+            files,
+            &facts,
+            &classification_policy,
+        ),
+        None => classify_local_change(&change_root, &root, &base, &facts, &classification_policy)?,
+    };
     let eligible = crate::eligible_types(&trigger, &facts);
     // The provider's answer first: on a sweep there is no local checkout of
     // this pull request's base to resolve. Falling back to the local ref keeps
@@ -763,6 +803,7 @@ pub(super) fn run_review_run(parsed: Parsed) -> Result<serde_json::Value, UsageE
             classification: classification.clone(),
             conflicts: Vec::new(),
             quality_report: None,
+            change: Some(change.clone()),
         },
         &pr_facts,
     );
@@ -1818,4 +1859,98 @@ pub(super) fn review_next_action(lifecycle: &crate::ReviewLifecycle) -> String {
             "validation is explicitly unlocked".into()
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Change classification (#584)
+// ---------------------------------------------------------------------------
+
+/// Classify the change between `base` and `HEAD` in `change_root`.
+///
+/// `policy_root` is where the policy and the consumer inventory are read,
+/// matching where the review policies come from.
+pub(super) fn classify_local_change(
+    change_root: &Path,
+    policy_root: &Path,
+    base: &str,
+    facts: &crate::ChangeFacts,
+    policy: &crate::ChangeClassificationPolicy,
+) -> Result<crate::ChangeClassification, UsageError> {
+    let range = format!("{base}...HEAD");
+    let files = crate::parse_numstat_z(&git_output(
+        change_root,
+        &["diff", "--numstat", "-z", "--no-color", &range],
+    )?);
+    let diff = git_output(
+        change_root,
+        &["diff", "--no-color", "--no-ext-diff", &range],
+    )
+    .ok()
+    .map(|text| text.lines().map(String::from).collect::<Vec<_>>());
+    Ok(classify_with(policy_root, files, diff, facts, policy))
+}
+
+/// Classify a pull request from what the provider reports.
+///
+/// The diff text comes from `gh pr diff`; when it cannot be read the contract
+/// scan is reported unknown rather than clean.
+pub(super) fn classify_provider_change(
+    policy_root: &Path,
+    repository: &str,
+    pull_request: i64,
+    files: Vec<crate::ChangedFile>,
+    facts: &crate::ChangeFacts,
+    policy: &crate::ChangeClassificationPolicy,
+) -> crate::ChangeClassification {
+    let diff = std::process::Command::new("gh")
+        .current_dir(policy_root)
+        .args([
+            "pr",
+            "diff",
+            &pull_request.to_string(),
+            "--repo",
+            repository,
+            "--color",
+            "never",
+        ])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| {
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .map(String::from)
+                .collect::<Vec<_>>()
+        });
+    classify_with(policy_root, files, diff, facts, policy)
+}
+
+fn classify_with(
+    policy_root: &Path,
+    files: Vec<crate::ChangedFile>,
+    diff: Option<Vec<String>>,
+    facts: &crate::ChangeFacts,
+    policy: &crate::ChangeClassificationPolicy,
+) -> crate::ChangeClassification {
+    let paths: Vec<String> = files.iter().map(|file| file.path.clone()).collect();
+    let contract_symbols = diff.and_then(|lines| {
+        crate::contract_check::touched_symbols_for_classification(
+            policy_root,
+            &policy.contract_doc,
+            &lines,
+        )
+        .ok()
+    });
+    crate::classify_change(
+        policy,
+        &crate::ChangeInputs {
+            generated: crate::linguist_generated_paths(policy_root, &paths),
+            files,
+            contract_symbols,
+            from_fork: facts.from_fork,
+            first_time_contributor: facts.first_time_contributor,
+            authored_by_model: facts.authored_by_model.is_some(),
+            declared_risk: facts.classification.risk.clone(),
+        },
+    )
 }
