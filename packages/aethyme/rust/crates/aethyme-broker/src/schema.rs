@@ -2104,7 +2104,7 @@ mod tests {
 
     #[test]
     fn v48_only_adds_repository_watch_tables_and_keeps_v47_readers_compatible() {
-        let conn = migrated_through(47);
+        let before_conn = migrated_through(47);
         let schema = |conn: &Connection| -> Vec<(String, String)> {
             let mut statement = conn
                 .prepare("SELECT name, sql FROM sqlite_master WHERE sql IS NOT NULL ORDER BY name")
@@ -2115,9 +2115,8 @@ mod tests {
                 .collect::<Result<_, _>>()
                 .unwrap()
         };
-        let before = schema(&conn);
-
-        migrate_through(&conn, 48);
+        let before = schema(&before_conn);
+        let conn = migrated_through(48);
         assert_eq!(current_version(&conn).unwrap(), 48);
         let after = schema(&conn);
         for object in &before {
