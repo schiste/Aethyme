@@ -598,7 +598,6 @@ mod tests {
 ";
 
     #[test]
-    #[test]
     fn operation_provenance_keeps_only_the_agent_program_name() {
         let identity = operation_agent_identity(&AgentProcess {
             pid: 42,

@@ -2117,7 +2117,7 @@ mod tests {
         };
         let before = schema(&conn);
 
-        migrate(&conn).unwrap();
+        migrate_through(&conn, 48);
         assert_eq!(current_version(&conn).unwrap(), 48);
         let after = schema(&conn);
         for object in &before {
