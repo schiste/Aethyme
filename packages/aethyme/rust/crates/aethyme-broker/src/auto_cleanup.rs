@@ -32,9 +32,60 @@ use std::time::Instant;
 use crate::types::{Session, SessionCleanupState, SessionOrigin};
 use crate::{Broker, BrokerOpError, GitRepo};
 
-/// Directory names that hold rebuildable output, at any depth. `.DS_Store`
-/// is Finder metadata and is treated the same way.
-pub const BUILT_IN_REGENERABLE: &[&str] = &["target", "node_modules", ".venv", "build", "dist"];
+/// Build-output directories, each recognised by its exact name **and** the
+/// evidence that proves what it is (#588). A name alone proves nothing:
+/// `build/` and `dist/` routinely hold source, assets or data that a
+/// repository happens to ignore, so they count only beside the manifest that
+/// produces them.
+///
+/// | Directory | Counts only when |
+/// | --- | --- |
+/// | `node_modules` | always (package manager output) |
+/// | `target` | a sibling `Cargo.toml`, or `CACHEDIR.TAG` inside |
+/// | `.venv` | `pyvenv.cfg` inside |
+/// | `build`, `dist` | a sibling `package.json`, `setup.py`, `pyproject.toml` or `CMakeLists.txt` |
+/// | `__pycache__`, `.pytest_cache`, `.mypy_cache`, `.ruff_cache` | always (tool caches) |
+///
+/// Names are compared as whole path components: `target-notes/`,
+/// `my_build/` and `targets.json` are not build output.
+pub const BUILT_IN_REGENERABLE: &[&str] = &[
+    "node_modules",
+    "target",
+    ".venv",
+    "build",
+    "dist",
+    "__pycache__",
+    ".pytest_cache",
+    ".mypy_cache",
+    ".ruff_cache",
+];
+
+/// Manifests whose presence beside `build/` or `dist/` proves it is output.
+const BUILD_MANIFESTS: &[&str] = &[
+    "package.json",
+    "setup.py",
+    "pyproject.toml",
+    "CMakeLists.txt",
+];
+
+/// Most entries a single regenerable directory may hold before it counts as
+/// unclassifiable. Classification walks it looking for sensitive files and
+/// escaping symlinks; a tree too large to walk is kept, not assumed safe.
+const CLASSIFY_ENTRY_CAP: usize = 300_000;
+
+/// Paths a configured `regenerable` glob must never match: secrets, data and
+/// ordinary root files. A glob that matches any of them is rejected at load.
+const GLOB_PROBES: &[&str] = &[
+    ".env",
+    ".env.local",
+    "secrets.key",
+    "cert.pem",
+    "data.sqlite",
+    "app.db",
+    "notes.txt",
+    "README.md",
+    ".aethyme",
+];
 
 /// Meta key holding the last auto-cleanup report, which `status` and
 /// `gc plan` show.
@@ -103,8 +154,17 @@ impl AutoCleanupPolicy {
                         })
                         .ok_or_else(|| format!("[cleanup] {key} must be a list of strings"))?;
                     for glob in &list {
-                        globset::Glob::new(glob)
-                            .map_err(|error| format!("[cleanup] {key} glob {glob:?}: {error}"))?;
+                        let matcher = globset::Glob::new(glob)
+                            .map_err(|error| format!("[cleanup] {key} glob {glob:?}: {error}"))?
+                            .compile_matcher();
+                        if key == "regenerable"
+                            && let Some(probe) =
+                                GLOB_PROBES.iter().find(|probe| matcher.is_match(probe))
+                        {
+                            return Err(format!(
+                                "[cleanup] regenerable glob {glob:?} matches {probe:?}; it may only name build-output directories"
+                            ));
+                        }
                     }
                     if key == "regenerable" {
                         policy.regenerable = list;
@@ -142,36 +202,179 @@ impl AutoCleanupPolicy {
                 .is_some_and(|name| set.is_match(Path::new(name)))
     }
 
-    /// Whether an ignored path, relative to the worktree root, is rebuildable
-    /// output rather than somebody's file.
-    pub fn is_regenerable(&self, relative: &str) -> bool {
-        let trimmed = relative.trim_end_matches('/');
-        let components = trimmed.split('/').collect::<Vec<_>>();
-        if components
-            .iter()
-            .any(|component| BUILT_IN_REGENERABLE.contains(component))
-        {
-            return true;
-        }
-        if components.last() == Some(&".DS_Store") {
-            return true;
-        }
-        if self.regenerable.is_empty() {
-            return false;
-        }
-        let set = Self::glob_set(&self.regenerable);
-        set.is_match(trimmed)
-            || components
-                .iter()
-                .scan(String::new(), |prefix, component| {
-                    if !prefix.is_empty() {
-                        prefix.push('/');
-                    }
-                    prefix.push_str(component);
-                    Some(prefix.clone())
-                })
-                .any(|prefix| set.is_match(&prefix))
+    /// Whether a configured `regenerable` glob names this directory,
+    /// relative to the worktree root. Configured globs only ever apply to
+    /// directories, never to files.
+    fn configured_regenerable_dir(&self, relative_dir: &str) -> bool {
+        !self.regenerable.is_empty() && Self::glob_set(&self.regenerable).is_match(relative_dir)
     }
+}
+
+/// A file name that is somebody's secret or data, wherever it sits.
+fn is_sensitive_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower.starts_with(".env")
+        || [".key", ".pem", ".sqlite", ".sqlite3", ".db"]
+            .iter()
+            .any(|suffix| lower.ends_with(suffix))
+}
+
+/// Whether `relative_dir` (no trailing slash) is a recognised build-output
+/// directory of `worktree`, by [`BUILT_IN_REGENERABLE`]'s evidence rules or a
+/// configured glob. `Some(true)` marks a Cargo target directory, where the
+/// compiler's own `.aethyme`-named fingerprints are not Aethyme state.
+fn regenerable_dir(
+    worktree: &Path,
+    relative_dir: &str,
+    policy: &AutoCleanupPolicy,
+) -> Option<bool> {
+    let path = worktree.join(relative_dir);
+    let name = Path::new(relative_dir).file_name()?.to_str()?;
+    let parent = path.parent()?;
+    let recognised = match name {
+        "node_modules" | "__pycache__" | ".pytest_cache" | ".mypy_cache" | ".ruff_cache" => {
+            Some(false)
+        }
+        "target" if parent.join("Cargo.toml").is_file() || path.join("CACHEDIR.TAG").is_file() => {
+            Some(true)
+        }
+        ".venv" if path.join("pyvenv.cfg").is_file() => Some(false),
+        "build" | "dist"
+            if BUILD_MANIFESTS
+                .iter()
+                .any(|manifest| parent.join(manifest).is_file()) =>
+        {
+            Some(false)
+        }
+        _ => None,
+    };
+    recognised.or_else(|| {
+        policy
+            .configured_regenerable_dir(relative_dir)
+            .then_some(false)
+    })
+}
+
+/// The nearest enclosing build-output directory of an ignored path, as
+/// `(relative_dir, is_cargo_target)`.
+fn enclosing_regenerable(
+    worktree: &Path,
+    relative: &str,
+    policy: &AutoCleanupPolicy,
+) -> Option<(String, bool)> {
+    let components = relative
+        .trim_end_matches('/')
+        .split('/')
+        .collect::<Vec<_>>();
+    (1..=components.len()).find_map(|depth| {
+        let prefix = components[..depth].join("/");
+        regenerable_dir(worktree, &prefix, policy).map(|cargo| (prefix, cargo))
+    })
+}
+
+/// Walk a build-output directory without following symlinks. Anything that
+/// is somebody's -- a sensitive file, Aethyme state, a symlink that leaves the
+/// worktree -- or anything that cannot be read, keeps the checkout.
+fn scan_regenerable_dir(
+    worktree: &Path,
+    relative_dir: &str,
+    cargo_target: bool,
+    budget: &mut usize,
+) -> Result<(), String> {
+    let root = std::fs::canonicalize(worktree)
+        .map_err(|error| format!("cannot resolve {}: {error}", worktree.display()))?;
+    let mut stack = vec![worktree.join(relative_dir)];
+    while let Some(dir) = stack.pop() {
+        let entries = std::fs::read_dir(&dir)
+            .map_err(|error| format!("cannot read {}: {error}", dir.display()))?;
+        for entry in entries {
+            let entry = entry.map_err(|error| format!("cannot read {}: {error}", dir.display()))?;
+            if *budget == 0 {
+                return Err(format!(
+                    "{relative_dir} holds more than {CLASSIFY_ENTRY_CAP} entries; too large to classify"
+                ));
+            }
+            *budget -= 1;
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let display = path
+                .strip_prefix(worktree)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .into_owned();
+            let kind = entry
+                .file_type()
+                .map_err(|error| format!("cannot stat {display}: {error}"))?;
+            if kind.is_symlink() {
+                let target = std::fs::canonicalize(&path)
+                    .map_err(|_| format!("symlink {display} cannot be resolved"))?;
+                if !target.starts_with(&root) {
+                    return Err(format!(
+                        "symlink {display} points outside the worktree, to {}",
+                        target.display()
+                    ));
+                }
+                continue;
+            }
+            if name == ".aethyme" && !cargo_target {
+                return Err(format!("{display} holds Aethyme state"));
+            }
+            if is_sensitive_name(&name) {
+                return Err(format!("{display} looks like a secret or data file"));
+            }
+            if kind.is_dir() {
+                stack.push(path);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Whether one ignored entry (as `git ls-files --directory` prints it, with a
+/// trailing `/` for a directory) is disposable: `Ok(())` when it is Finder
+/// metadata or lies inside a recognised build-output directory and holds
+/// nothing of anyone's; otherwise the reason it keeps the checkout.
+pub(crate) fn classify_ignored(
+    worktree: &Path,
+    relative: &str,
+    policy: &AutoCleanupPolicy,
+    budget: &mut usize,
+) -> Result<(), String> {
+    let is_dir = relative.ends_with('/');
+    let trimmed = relative.trim_end_matches('/');
+    let name = trimmed.rsplit('/').next().unwrap_or(trimmed);
+    if !is_dir && name == ".DS_Store" {
+        return Ok(());
+    }
+    let path = worktree.join(trimmed);
+    let metadata = std::fs::symlink_metadata(&path)
+        .map_err(|error| format!("cannot stat ignored path {relative}: {error}"))?;
+    let Some((_enclosing, cargo_target)) = enclosing_regenerable(worktree, trimmed, policy) else {
+        return Err(format!(
+            "ignored path {relative} is not inside a recognised build-output directory"
+        ));
+    };
+    if trimmed.split('/').any(|component| component == ".aethyme") && !cargo_target {
+        return Err(format!("{relative} holds Aethyme state"));
+    }
+    if metadata.file_type().is_symlink() {
+        let root = std::fs::canonicalize(worktree)
+            .map_err(|error| format!("cannot resolve worktree: {error}"))?;
+        let target = std::fs::canonicalize(&path)
+            .map_err(|_| format!("symlink {relative} cannot be resolved"))?;
+        if !target.starts_with(&root) {
+            return Err(format!("symlink {relative} points outside the worktree"));
+        }
+        return Ok(());
+    }
+    if metadata.is_dir() {
+        return scan_regenerable_dir(worktree, trimmed, cargo_target, budget);
+    }
+    if is_sensitive_name(name) {
+        return Err(format!("{relative} looks like a secret or data file"));
+    }
+    // A plain file inside a recognised build-output directory.
+    Ok(())
 }
 
 /// One checkout auto-cleanup removed, with its proof.
@@ -374,16 +577,14 @@ pub(crate) fn unclean_reason(
             "-z",
         ],
     )?;
-    let valuable = ignored
-        .split('\0')
-        .filter(|path| !path.is_empty())
-        .filter(|path| !policy.is_regenerable(path))
-        .collect::<Vec<_>>();
-    if let Some(first) = valuable.first() {
-        return Ok(Some(format!(
-            "{} ignored path(s) outside the regenerable set, first: {first}",
-            valuable.len()
-        )));
+    // Default-deny: every ignored entry must be shown disposable.
+    let mut budget = CLASSIFY_ENTRY_CAP;
+    for relative in ignored.split('\0').filter(|path| !path.is_empty()) {
+        if let Err(reason) = classify_ignored(worktree, relative, policy, &mut budget) {
+            return Ok(Some(format!(
+                "ignored content outside the regenerable set: {reason}"
+            )));
+        }
     }
     Ok(None)
 }
@@ -870,34 +1071,82 @@ impl Broker {
 
 #[cfg(test)]
 mod tests {
-    use super::AutoCleanupPolicy;
+    use super::{AutoCleanupPolicy, classify_ignored};
+    use std::path::Path;
+
+    fn classify(root: &Path, relative: &str, policy: &AutoCleanupPolicy) -> Result<(), String> {
+        let mut budget = super::CLASSIFY_ENTRY_CAP;
+        classify_ignored(root, relative, policy, &mut budget)
+    }
+
+    fn touch(root: &Path, relative: &str) {
+        let path = root.join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, "x").unwrap();
+    }
 
     #[test]
-    fn built_in_and_configured_paths_are_regenerable_and_others_are_not() {
-        let policy = AutoCleanupPolicy {
-            regenerable: vec!["coverage/**".into(), "*.log".into()],
-            ..AutoCleanupPolicy::default()
-        };
-        for path in [
-            "target/",
-            "packages/app/node_modules/",
-            ".venv/",
-            "web/dist/",
-            "build/",
-            ".DS_Store",
-            "src/.DS_Store",
-            "coverage/lcov.info",
-            "debug.log",
-        ] {
-            assert!(policy.is_regenerable(path), "{path}");
+    fn build_output_counts_only_with_the_evidence_that_proves_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let policy = AutoCleanupPolicy::default();
+        touch(root, "node_modules/pkg/index.js");
+        touch(root, "Cargo.toml");
+        touch(root, "target/debug/app");
+        touch(root, "py/__pycache__/m.pyc");
+        touch(root, ".DS_Store");
+        for ok in ["node_modules/", "target/", "py/__pycache__/", ".DS_Store"] {
+            assert_eq!(classify(root, ok, &policy), Ok(()), "{ok}");
         }
-        for path in [".env", "data/kept.csv", "notes.txt", "targets.txt"] {
-            assert!(!policy.is_regenerable(path), "{path}");
+        // `build/` with no manifest beside it is somebody's directory.
+        touch(root, "assets/build/logo.svg");
+        assert!(classify(root, "assets/build/", &policy).is_err());
+        touch(root, "web/package.json");
+        touch(root, "web/build/app.js");
+        assert_eq!(classify(root, "web/build/", &policy), Ok(()));
+        // A Cargo-less `target/` is not a Cargo target directory.
+        touch(root, "data/target/run.csv");
+        assert!(classify(root, "data/target/", &policy).is_err());
+        // Whole components only: no prefix or substring matches.
+        touch(root, "target-notes/a.md");
+        touch(root, "my_build/x");
+        touch(root, "targets.json");
+        for blocked in ["target-notes/", "my_build/", "targets.json"] {
+            assert!(classify(root, blocked, &policy).is_err(), "{blocked}");
         }
     }
 
     #[test]
-    fn the_cleanup_table_is_parsed_strictly() {
+    fn secrets_state_and_escaping_symlinks_block_even_inside_build_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let policy = AutoCleanupPolicy::default();
+        touch(root, ".env");
+        assert!(classify(root, ".env", &policy).is_err());
+        touch(root, "node_modules/pkg/server.pem");
+        assert!(classify(root, "node_modules/", &policy).is_err());
+        std::fs::remove_file(root.join("node_modules/pkg/server.pem")).unwrap();
+        touch(root, "node_modules/.aethyme/state.json");
+        assert!(classify(root, "node_modules/", &policy).is_err());
+        std::fs::remove_dir_all(root.join("node_modules/.aethyme")).unwrap();
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(outside.path(), root.join("node_modules/escape")).unwrap();
+            let reason = classify(root, "node_modules/", &policy).unwrap_err();
+            assert!(reason.contains("outside the worktree"), "{reason}");
+            std::fs::remove_file(root.join("node_modules/escape")).unwrap();
+            std::os::unix::fs::symlink(
+                root.join("node_modules/pkg"),
+                root.join("node_modules/inside"),
+            )
+            .unwrap();
+        }
+        assert_eq!(classify(root, "node_modules/", &policy), Ok(()));
+    }
+
+    #[test]
+    fn configured_globs_add_directories_and_never_secrets_or_root_files() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join(".aethyme")).unwrap();
         let write =
@@ -907,12 +1156,24 @@ mod tests {
             AutoCleanupPolicy::default()
         );
         write(
-            "[cleanup]\nauto_remove = false\nkeep = [\"*-pinned\"]\nregenerable = [\".cache/**\"]\n",
+            "[cleanup]\nauto_remove = false\nkeep = [\"*-pinned\"]\nregenerable = [\".gradle\", \"**/.gradle\"]\n",
         );
         let policy = AutoCleanupPolicy::load(dir.path()).unwrap();
         assert!(!policy.auto_remove);
-        assert!(policy.is_pinned(std::path::Path::new("/w/repo/fix-pinned")));
-        assert!(policy.is_regenerable(".cache/x"));
+        assert!(policy.is_pinned(Path::new("/w/repo/fix-pinned")));
+        touch(dir.path(), ".gradle/caches/x.bin");
+        assert_eq!(classify(dir.path(), ".gradle/", &policy), Ok(()));
+        for rejected in [
+            "\".env*\"",
+            "\"*\"",
+            "\"**\"",
+            "\"*.db\"",
+            "\"*.txt\"",
+            "\".aethyme\"",
+        ] {
+            write(&format!("[cleanup]\nregenerable = [{rejected}]\n"));
+            assert!(AutoCleanupPolicy::load(dir.path()).is_err(), "{rejected}");
+        }
         write("[cleanup]\nauto_remove = \"yes\"\n");
         assert!(AutoCleanupPolicy::load(dir.path()).is_err());
         write("[cleanup]\nautoremove = true\n");
