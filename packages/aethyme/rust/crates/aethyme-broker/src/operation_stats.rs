@@ -466,6 +466,7 @@ mod tests {
             finished_at: Some(2),
             host_operation_id: None,
             identity_provenance: crate::OperationIdentityProvenance::VerifiedCanonical,
+            agent_provenance: None,
         };
         assert!(disjoint_known_scopes(
             &operation(1, "ref:one"),

@@ -25,7 +25,7 @@ use rusqlite::Connection;
 use crate::error::BrokerError;
 
 /// Current database schema version (== `MIGRATIONS.len()`).
-pub const SCHEMA_VERSION: i64 = 48;
+pub const SCHEMA_VERSION: i64 = 49;
 
 /// The oldest schema version whose binaries can safely use a database at
 /// [`SCHEMA_VERSION`]. Before this existed every newer database locked out
@@ -54,6 +54,9 @@ pub const SCHEMA_VERSION: i64 = 48;
 /// - v48: five new tables for repository-wide pull request watches and their
 ///   deliveries (#606). An older binary never names them, so it neither polls
 ///   repository watches nor claims their deliveries; nothing existing changes.
+/// - v49: adds nullable local operation provenance. A v48 writer names its
+///   existing columns and can continue writing; a v48 reader safely ignores
+///   the additional field.
 pub const MIN_COMPATIBLE_SCHEMA: i64 = 47;
 
 /// Whether this binary may use a database at `found`, a version newer than
@@ -1604,6 +1607,12 @@ CREATE TABLE repository_delivery_outbox (
 CREATE INDEX repository_delivery_outbox_due
     ON repository_delivery_outbox (status, claim_expires_at, id);
 ";
+const MIGRATION_V49: &str = "
+-- Keep coordinated-operation caller/holder provenance local and nullable so
+-- older compatible writers may continue to create history rows.
+ALTER TABLE coordinated_operations ADD COLUMN agent_provenance_json TEXT;
+";
+
 const MIGRATIONS: &[&str] = &[
     MIGRATION_V1,
     MIGRATION_V2,
@@ -1653,6 +1662,7 @@ const MIGRATIONS: &[&str] = &[
     MIGRATION_V46,
     MIGRATION_V47,
     MIGRATION_V48,
+    MIGRATION_V49,
 ];
 
 pub(crate) fn current_version(conn: &Connection) -> Result<i64, BrokerError> {
@@ -2094,7 +2104,7 @@ mod tests {
 
     #[test]
     fn v48_only_adds_repository_watch_tables_and_keeps_v47_readers_compatible() {
-        let conn = migrated_through(47);
+        let before_conn = migrated_through(47);
         let schema = |conn: &Connection| -> Vec<(String, String)> {
             let mut statement = conn
                 .prepare("SELECT name, sql FROM sqlite_master WHERE sql IS NOT NULL ORDER BY name")
@@ -2105,9 +2115,11 @@ mod tests {
                 .collect::<Result<_, _>>()
                 .unwrap()
         };
-        let before = schema(&conn);
-
-        migrate(&conn).unwrap();
+        let before = schema(&before_conn);
+        let conn = migrated_through(48);
+        // A v48 binary stamps the compatibility floor when it finishes
+        // migrating; `migrated_through` stops before that step.
+        set_meta(&conn, "min_compatible_schema", 47);
         assert_eq!(current_version(&conn).unwrap(), 48);
         let after = schema(&conn);
         for object in &before {
@@ -2132,6 +2144,35 @@ mod tests {
         );
         assert_eq!(MIN_COMPATIBLE_SCHEMA, 47);
         assert!(schema_is_compatible_with(&conn, 48, 47).unwrap());
+    }
+
+    #[test]
+    fn v49_adds_agent_provenance_without_raising_the_compatibility_floor() {
+        assert_eq!(SCHEMA_VERSION, 49);
+        assert_eq!(MIN_COMPATIBLE_SCHEMA, 47);
+
+        let conn = migrated_through(48);
+        assert_eq!(current_version(&conn).unwrap(), 48);
+        migrate(&conn).unwrap();
+        assert_eq!(current_version(&conn).unwrap(), 49);
+        assert!(schema_is_compatible_with(&conn, 49, 47).unwrap());
+        assert!(!schema_is_compatible_with(&conn, 49, 46).unwrap());
+
+        let nullable: i64 = conn
+            .query_row(
+                r#"SELECT "notnull" FROM pragma_table_info('coordinated_operations')
+                   WHERE name = 'agent_provenance_json'"#,
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(nullable, 0);
+
+        // A v47 database, the compatibility floor, migrates straight through.
+        let from_v47 = migrated_through(47);
+        migrate(&from_v47).unwrap();
+        assert_eq!(current_version(&from_v47).unwrap(), 49);
+        assert!(schema_is_compatible_with(&from_v47, 49, 47).unwrap());
     }
 
     #[test]

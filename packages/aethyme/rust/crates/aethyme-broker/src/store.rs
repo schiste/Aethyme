@@ -3867,15 +3867,18 @@ impl BrokerStore {
         &mut self,
         operation: &NewCoordinatedOperation,
     ) -> Result<CoordinatedOperation, BrokerError> {
+        let agent_provenance_json =
+            crate::session_holder::operation_agent_provenance(self, operation.session_id)?
+                .to_string();
         let now = now_ms();
         let tx = self.conn.transaction()?;
         tx.execute(
             "INSERT INTO coordinated_operations (
                  session_id, provider, repository, scope, effect, status,
                  authorization_reason, command_json, pid, created_at, updated_at,
-                 host_operation_id, identity_provenance
+                 host_operation_id, identity_provenance, agent_provenance_json
              ) VALUES (?1, ?2, ?3, ?4, ?5, 'prepared', ?6, ?7, ?8, ?9, ?9,
-                       ?10, ?11)",
+                       ?10, ?11, ?12)",
             params![
                 operation.session_id,
                 operation.provider.as_str(),
@@ -3888,6 +3891,7 @@ impl BrokerStore {
                 now,
                 operation.host_operation_id,
                 operation.identity_provenance.as_str(),
+                agent_provenance_json,
             ],
         )?;
         let id = tx.last_insert_rowid();
@@ -3970,7 +3974,7 @@ impl BrokerStore {
                         status, authorization_reason, command_json, pid,
                         exit_code, details_json,
                         created_at, updated_at, finished_at,
-                        host_operation_id, identity_provenance
+                        host_operation_id, identity_provenance, agent_provenance_json
                  FROM coordinated_operations WHERE id = ?1",
                 [id],
                 coordinated_operation_from_row,
@@ -3985,7 +3989,7 @@ impl BrokerStore {
                     status, authorization_reason, command_json, pid,
                     exit_code, details_json,
                     created_at, updated_at, finished_at,
-                    host_operation_id, identity_provenance
+                    host_operation_id, identity_provenance, agent_provenance_json
              FROM coordinated_operations ORDER BY id",
         )?;
         let rows = stmt.query_map([], coordinated_operation_from_row)?;
@@ -4017,7 +4021,7 @@ impl BrokerStore {
                     status, authorization_reason, command_json, pid,
                     exit_code, details_json,
                     created_at, updated_at, finished_at,
-                    host_operation_id, identity_provenance
+                    host_operation_id, identity_provenance, agent_provenance_json
              FROM coordinated_operations",
         );
         let mut clauses = Vec::new();
@@ -4082,7 +4086,7 @@ impl BrokerStore {
                     status, authorization_reason, command_json, pid,
                     exit_code, details_json,
                     created_at, updated_at, finished_at,
-                    host_operation_id, identity_provenance
+                    host_operation_id, identity_provenance, agent_provenance_json
              FROM coordinated_operations
              WHERE (?2 IS NULL OR session_id = ?2)
              ORDER BY id DESC LIMIT ?1",
@@ -4124,7 +4128,7 @@ impl BrokerStore {
                     status, authorization_reason, command_json, pid,
                     exit_code, details_json,
                     created_at, updated_at, finished_at,
-                    host_operation_id, identity_provenance
+                    host_operation_id, identity_provenance, agent_provenance_json
              FROM coordinated_operations
              WHERE effect <> 'read'
                AND status IN ('prepared', 'running', 'outcome_unknown')
@@ -4147,7 +4151,7 @@ impl BrokerStore {
                     status, authorization_reason, command_json, pid,
                     exit_code, details_json,
                     created_at, updated_at, finished_at,
-                    host_operation_id, identity_provenance
+                    host_operation_id, identity_provenance, agent_provenance_json
              FROM coordinated_operations
              WHERE repository = ?1
                AND effect <> 'read'
@@ -7369,6 +7373,17 @@ fn coordinated_operation_from_row(row: &rusqlite::Row<'_>) -> RowResult<Coordina
     let effect: String = row.get(5)?;
     let status: String = row.get(6)?;
     let identity_provenance: String = row.get(16)?;
+    let agent_provenance: Option<serde_json::Value> = row
+        .get::<_, Option<String>>(17)?
+        .map(|json| serde_json::from_str(&json))
+        .transpose()
+        .map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                17,
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        })?;
     Ok((|| {
         Ok(CoordinatedOperation {
             id: row.get(0)?,
@@ -7388,6 +7403,7 @@ fn coordinated_operation_from_row(row: &rusqlite::Row<'_>) -> RowResult<Coordina
             finished_at: row.get(14)?,
             host_operation_id: row.get(15)?,
             identity_provenance: OperationIdentityProvenance::parse(&identity_provenance)?,
+            agent_provenance,
         })
     })())
 }
