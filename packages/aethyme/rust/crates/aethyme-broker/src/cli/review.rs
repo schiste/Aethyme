@@ -299,17 +299,24 @@ pub(super) fn read_author_association(
 /// sweep: a tick visits every open pull request and is standing in none of
 /// them. Asking the provider needs no fetch, no checkout, and no local ref, so
 /// one tick can route a repository it has never cloned.
+/// One pull request's change, as the provider describes it.
+pub(super) struct ProviderChange {
+    pub(super) paths: Vec<String>,
+    pub(super) classification: crate::CommitClassification,
+    pub(super) head: String,
+    /// Per-file line counts, which the change classification measures (#584).
+    pub(super) files: Vec<crate::ChangedFile>,
+    /// Whether `files` is the whole change (`changedFiles` matches).
+    pub(super) files_complete: bool,
+    /// The base commit, whose `.gitattributes` decides generated files.
+    pub(super) base_commit: Option<String>,
+}
+
 pub(super) fn read_change_from_provider(
     root: &Path,
     repository: &str,
     pull_request: i64,
-) -> Option<(
-    Vec<String>,
-    crate::CommitClassification,
-    String,
-    (Vec<crate::ChangedFile>, bool),
-    Option<String>,
-)> {
+) -> Option<ProviderChange> {
     let output = std::process::Command::new("gh")
         .current_dir(root)
         .args([
@@ -375,10 +382,17 @@ pub(super) fn read_change_from_provider(
     let base_commit = json["baseRefOid"].as_str().map(String::from);
     // The provider caps the file list; a list shorter than the change's own
     // count cannot clear a path-based signal.
-    let complete = json["changedFiles"]
+    let files_complete = json["changedFiles"]
         .as_u64()
         .is_some_and(|count| count == files.len() as u64);
-    Some((paths, classification, head, (files, complete), base_commit))
+    Some(ProviderChange {
+        paths,
+        classification,
+        head,
+        files,
+        files_complete,
+        base_commit,
+    })
 }
 
 /// Whether `head` has `previous` in its history.
@@ -612,14 +626,19 @@ pub(super) fn run_review_run(parsed: Parsed) -> Result<serde_json::Value, UsageE
     // below would fail on the first one. So the source is chosen before either
     // is attempted, never after.
     let (paths, classification, head, provider_files) = if parsed.from_provider {
-        let (paths, classification, head, files, base_commit) =
+        let change =
             read_change_from_provider(&root, &repository, pull_request).ok_or_else(|| {
                 UsageError::Message(format!(
                     "cannot read pull request {pull_request} from {repository}; \
                  --from-provider needs an authenticated gh"
                 ))
             })?;
-        (paths, classification, head, Some((files, base_commit)))
+        (
+            change.paths,
+            change.classification,
+            change.head,
+            Some(((change.files, change.files_complete), change.base_commit)),
+        )
     } else {
         let paths = git_lines(
             &change_root,
