@@ -906,6 +906,74 @@ fn submit_cli_reports_an_unchanged_worktree_submission_as_a_noop() {
 }
 
 #[test]
+fn submit_rejects_unknown_subcommand_before_state_changes_or_gates() {
+    let tmp = fixture();
+    let worktree = tmp.path().join(".aethyme/worktrees/unknown-submit-command");
+    std::fs::create_dir_all(worktree.parent().unwrap()).unwrap();
+    git(
+        tmp.path(),
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "agent/unknown-submit-command",
+            worktree.to_str().unwrap(),
+            "main",
+        ],
+    );
+    let adopted = stdout(run(
+        &worktree,
+        &[
+            "start",
+            "--adopt",
+            "--task",
+            "unknown submit command",
+            "--json",
+        ],
+    ));
+    let session: serde_json::Value = serde_json::from_str(&adopted).unwrap();
+    let session_id = session["id"].as_i64().unwrap().to_string();
+    std::fs::write(worktree.join("tracked.txt"), "pending submission\n").unwrap();
+    git(&worktree, &["add", "tracked.txt"]);
+    git(&worktree, &["commit", "-qm", "prepare pending submission"]);
+
+    let broker_state = || {
+        let mut broker = aethyme_broker::Broker::open(tmp.path()).unwrap();
+        let queue_entries = broker.store().merge_queue().unwrap().len();
+        let holder_event = broker
+            .store()
+            .latest_session_holder_event(session_id.parse().unwrap())
+            .unwrap()
+            .map(|event| event.id);
+        (queue_entries, holder_event)
+    };
+    let state_before = broker_state();
+
+    // Keep the exact typo that previously fell through to submit. The
+    // temporary fixture makes it safe to assert that it cannot run a gate or
+    // write a queue entry / holder binding.
+    let output = run(
+        &worktree,
+        &[
+            "submit",
+            "status",
+            "--session",
+            &session_id,
+            "--no-cache",
+            "--json",
+        ],
+    );
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("unknown broker submit subcommand \"status\""));
+    assert!(stderr.contains("aethyme broker status --json"));
+    assert!(stderr.contains("aethyme broker queue --json"));
+    assert!(!tmp.path().join("gate-runs.txt").exists());
+    assert_eq!(broker_state(), state_before);
+}
+
+#[test]
 fn submit_cli_bypasses_and_then_refreshes_the_merged_tree_cache() {
     let tmp = fixture();
     let counter = tmp.path().join("submit-runs.txt");

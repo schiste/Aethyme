@@ -200,11 +200,19 @@ pub struct Resolution {
     /// The command line `run_inner` dispatches (no `advanced`, no public
     /// sub-form words).
     pub args: Vec<String>,
-    /// Set when the command line must not run at all: a public verb spelled
-    /// under `advanced`. Refusing it (rather than stripping `advanced`)
-    /// keeps resolution a single step, so the router's compatibility
-    /// classification and the broker's dispatch see the same command.
+    /// Set when the command line must not run at all, such as a public verb
+    /// spelled under `advanced` or an unsupported submit subcommand. Refusing
+    /// it here keeps resolution a single step, so compatibility classification
+    /// and broker dispatch cannot disagree about whether the command may run.
     pub refusal: Option<String>,
+}
+
+pub(super) fn unsupported_submit_subcommand(subcommand: &str) -> String {
+    format!(
+        "unknown broker submit subcommand {subcommand:?}; for broker status use \
+         `aethyme broker status --json`, or use `aethyme broker queue --json` \
+         for the read-only queue view"
+    )
 }
 
 fn words(prefix: &[&str], rest: &[String]) -> Vec<String> {
@@ -253,6 +261,15 @@ pub fn resolve(args: &[String]) -> Resolution {
             return Resolution {
                 args: words(internal, &args[2..]),
                 refusal: None,
+            };
+        }
+        if first == "submit"
+            && let Some(subcommand) = args.get(1).map(String::as_str)
+            && !subcommand.starts_with('-')
+        {
+            return Resolution {
+                args: args.to_vec(),
+                refusal: Some(unsupported_submit_subcommand(subcommand)),
             };
         }
         // `unblock` with nothing to clear lists what could be cleared.
