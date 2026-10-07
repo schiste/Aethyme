@@ -4643,6 +4643,20 @@ impl Broker {
         }
     }
 
+    /// Branches no session can own: the integration branch, and the default
+    /// branch as `origin/HEAD` (or the main checkout's upstream) names it. When
+    /// neither resolves, only the integration branch is excluded, so the guard
+    /// stays as strict as before rather than guessing a default branch name.
+    fn shared_branches(&self) -> Vec<String> {
+        let mut shared = vec![crate::merge::PromoteConfig::load(&self.main_root_path()).branch];
+        if let Some((upstream, _)) = self.repo_handle().upstream_default()
+            && let Some((_, branch)) = upstream.split_once('/')
+        {
+            shared.push(branch.to_string());
+        }
+        shared
+    }
+
     /// Refuse a destructive operation on a branch that belongs to another
     /// live session, unless `cross_session` names exactly that session.
     /// Returns the session the caller was allowed to cross into.
@@ -4662,6 +4676,11 @@ impl Broker {
         }
         let mut targets = destructive_branch_targets(request.provider, &request.args);
         targets.extend(gh_targets);
+        // The default and integration branches are shared, never a session's
+        // own: a session that adopted the main checkout records `main`, and
+        // must not make every merge into main look like a write to its branch.
+        let shared = self.shared_branches();
+        targets.retain(|target| !shared.contains(target));
         let owners: Vec<crate::Session> = if targets.is_empty() {
             Vec::new()
         } else {

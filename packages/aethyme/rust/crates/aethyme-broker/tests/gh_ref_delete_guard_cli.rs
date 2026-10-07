@@ -146,9 +146,13 @@ impl Fixture {
     }
 
     fn cli(&self, args: &[&str], env: &[(&str, &str)]) -> Output {
+        self.cli_in(self.repo.path(), args, env)
+    }
+
+    fn cli_in(&self, dir: &Path, args: &[&str], env: &[(&str, &str)]) -> Output {
         let mut command = common::broker_cli(CLI, args);
         command
-            .current_dir(self.repo.path())
+            .current_dir(dir)
             .env("AETHYME_HOST_STATE_DIR", self.state.path())
             .env(
                 "PATH",
@@ -751,6 +755,62 @@ fn a_base_owned_by_another_session_is_refused() {
         let output = fixture.gh(&[], &gh, "");
         assert_refused(&fixture, &output, &owner);
     }
+}
+
+/// The default branch is shared, never a session's own: a session whose
+/// recorded branch is `main` must not turn every merge into main, or a
+/// delete of main, into a write to "its" branch.
+#[test]
+fn a_session_recorded_on_the_default_branch_does_not_own_it() {
+    let fixture = Fixture::new();
+    let repo = fixture.repo.path();
+    // `origin/HEAD -> origin/main` names the default branch, as a clone does.
+    git(repo, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+    git(
+        repo,
+        &[
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/main",
+        ],
+    );
+    // A linked worktree checked out on main, adopted as a session.
+    git(repo, &["checkout", "-q", "-b", "scratch"]);
+    let linked = tempfile::tempdir().unwrap();
+    let worktree = linked.path().join("on-main");
+    git(
+        repo,
+        &["worktree", "add", "-q", worktree.to_str().unwrap(), "main"],
+    );
+    let adopted = fixture.cli_in(
+        &worktree,
+        &[
+            "start",
+            "--adopt",
+            "--task",
+            "work recorded on main",
+            "--short-name",
+            "on-main",
+            "--json",
+        ],
+        &[],
+    );
+    assert!(
+        adopted.status.success(),
+        "adopt failed: {}",
+        stderr(&adopted)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&adopted.stdout).unwrap();
+    let session = value.get("session").unwrap_or(&value);
+    assert_eq!(session["branch"].as_str(), Some("main"));
+
+    let output = fixture.gh(&[], &["pr", "merge", "7", "--squash"], &fixture.own.branch);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(
+        !stderr(&output).contains("belongs to live session"),
+        "{}",
+        stderr(&output)
+    );
 }
 
 // --- Third review: binary choice, git configuration, symlinked downloads --
