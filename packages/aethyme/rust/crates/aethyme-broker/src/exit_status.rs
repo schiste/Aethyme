@@ -122,6 +122,7 @@ pub fn for_broker_error(error: &BrokerOpError) -> u8 {
         | E::ShipNonFastForward { .. }
         | E::ShipLocalMainUnsafe { .. }
         | E::SessionExistsForWorktree { .. }
+        | E::AdoptMainCheckoutRefused { .. }
         | E::ReuseSyncRequiresReuse
         | E::ReuseSyncDirty { .. }
         | E::ReuseSyncNotFastForward { .. }

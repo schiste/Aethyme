@@ -146,9 +146,13 @@ impl Fixture {
     }
 
     fn cli(&self, args: &[&str], env: &[(&str, &str)]) -> Output {
+        self.cli_in(self.repo.path(), args, env)
+    }
+
+    fn cli_in(&self, dir: &Path, args: &[&str], env: &[(&str, &str)]) -> Output {
         let mut command = common::broker_cli(CLI, args);
         command
-            .current_dir(self.repo.path())
+            .current_dir(dir)
             .env("AETHYME_HOST_STATE_DIR", self.state.path())
             .env(
                 "PATH",
@@ -483,7 +487,51 @@ fn the_exact_branch_delete_runs_byte_identical_or_is_refused_for_an_owner() {
 }
 
 #[test]
-fn an_unverifiable_write_runs_only_when_acknowledged_and_destructive() {
+fn unclassified_branch_ref_mutations_are_refused_even_with_acknowledgement() {
+    let cases: Vec<Vec<&str>> = vec![
+        vec![
+            "api",
+            "-X",
+            "PATCH",
+            "repos/schiste/Aethyme/git/refs/heads/main",
+            "-f",
+            "sha=0",
+            "-F",
+            "force=true",
+        ],
+        vec![
+            "api",
+            "-X",
+            "DELETE",
+            "repos/schiste/Aethyme/git/refs/heads/%6Dain",
+        ],
+        vec![
+            "api",
+            "graphql",
+            "-f",
+            "query=mutation { updateRef(input:{}) { x } }",
+        ],
+    ];
+    for mutation in cases {
+        let fixture = Fixture::new();
+        let output = fixture.gh(
+            &[
+                "--effect",
+                "destructive",
+                "--scope",
+                "github:test",
+                "--destructive",
+                "--ref-write-acknowledged",
+            ],
+            &mutation,
+            "",
+        );
+        assert_refused(&fixture, &output, MAY_WRITE);
+    }
+}
+
+#[test]
+fn an_unverifiable_write_is_refused_when_shared_branches_exist() {
     let fixture = Fixture::new();
     let mutation = ["api", "graphql", "-f", "query=mutation { x }"];
     let output = fixture.gh(&[], &mutation, "");
@@ -495,7 +543,7 @@ fn an_unverifiable_write_runs_only_when_acknowledged_and_destructive() {
         &mutation,
         "",
     );
-    assert_ran_exactly(&fixture, &output, "api graphql -f query=mutation { x }");
+    assert_refused(&fixture, &output, "shared branch");
 }
 
 // --- Exact writes that cannot touch a ref run without acknowledgement ----
@@ -750,6 +798,114 @@ fn a_base_owned_by_another_session_is_refused() {
     ] {
         let output = fixture.gh(&[], &gh, "");
         assert_refused(&fixture, &output, &owner);
+    }
+}
+
+/// The default branch is shared, never a session's own: a session whose
+/// recorded branch is `main` must not turn every merge into main, or a
+/// delete of main, into a write to "its" branch.
+#[test]
+fn a_session_recorded_on_the_default_branch_does_not_own_it() {
+    let fixture = Fixture::new();
+    let repo = fixture.repo.path();
+    // No `origin/HEAD`: the default branch is unresolved, and the fail-closed
+    // fallback still treats `main` as shared.
+    // A linked worktree checked out on main, adopted as a session.
+    git(repo, &["checkout", "-q", "-b", "scratch"]);
+    let linked = tempfile::tempdir().unwrap();
+    let worktree = linked.path().join("on-main");
+    git(
+        repo,
+        &["worktree", "add", "-q", worktree.to_str().unwrap(), "main"],
+    );
+    let adopted = fixture.cli_in(
+        &worktree,
+        &[
+            "start",
+            "--adopt",
+            "--task",
+            "work recorded on main",
+            "--short-name",
+            "on-main",
+            "--json",
+        ],
+        &[],
+    );
+    assert!(
+        adopted.status.success(),
+        "adopt failed: {}",
+        stderr(&adopted)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&adopted.stdout).unwrap();
+    let session = value.get("session").unwrap_or(&value);
+    assert_eq!(session["branch"].as_str(), Some("main"));
+
+    // The guard lets the merge into main run: gh received it. (What the
+    // offline fixture does after the merge is not this test's concern.)
+    let output = fixture.gh(&[], &["pr", "merge", "7", "--squash"], &fixture.own.branch);
+    assert!(
+        !stderr(&output).contains("belongs to live session"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(
+        fixture
+            .ran()
+            .starts_with("pr merge 7 --squash --match-head-commit "),
+        "gh did not run the merge: {} / {}",
+        fixture.ran(),
+        stderr(&output)
+    );
+}
+
+const SHARED: &str = "shared default or integration branch";
+
+/// Sets `origin/HEAD -> origin/main`, as a clone does, so the default branch
+/// is resolved from the repository and not guessed.
+fn name_default_branch(fixture: &Fixture) {
+    let repo = fixture.repo.path();
+    git(repo, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+    git(
+        repo,
+        &[
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/main",
+        ],
+    );
+}
+
+/// "Owned by no session" is not "allowed": the default and integration
+/// branches can never be deleted, force-updated or rebased through the
+/// broker, even with --destructive and no session recording them.
+#[test]
+fn the_default_and_integration_branches_are_never_rewritten() {
+    let fixture = Fixture::new();
+    name_default_branch(&fixture);
+    for branch in ["main", "aethyme/integration"] {
+        let path = format!("repos/schiste/Aethyme/git/refs/heads/{branch}");
+        let output = fixture.gh(DESTRUCTIVE, &["api", "-X", "DELETE", &path], "");
+        assert_refused(&fixture, &output, SHARED);
+    }
+    // update-branch writes the head; a PR whose head is main is refused.
+    let output = fixture.gh(&[], &["pr", "update-branch", "7"], "main");
+    assert_refused(&fixture, &output, SHARED);
+    // A merge may delete its head; a PR from main is refused too.
+    let output = fixture.gh(&[], &["pr", "merge", "7", "--merge"], "main");
+    assert_refused(&fixture, &output, SHARED);
+}
+
+/// The exemption is the exact default branch name, resolved from the
+/// repository: look-alike names neither get it nor get protected by it.
+#[test]
+fn only_the_exact_default_branch_name_is_shared() {
+    let fixture = Fixture::new();
+    name_default_branch(&fixture);
+    for branch in ["main2", "origin/main", "xmain"] {
+        let path = format!("repos/schiste/Aethyme/git/refs/heads/{branch}");
+        let output = fixture.gh(DESTRUCTIVE, &["api", "-X", "DELETE", &path], "");
+        assert_ran_exactly(&fixture, &output, &format!("api -X DELETE {path}"));
+        std::fs::remove_file(fixture.log()).unwrap();
     }
 }
 

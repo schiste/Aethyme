@@ -15,8 +15,9 @@
 //! - [`Verdict::SafeWrite`]: an exact `gh api -X POST|PATCH|DELETE` write to
 //!   one of a few comment, review, label and issue endpoints, which cannot
 //!   touch a git ref (see [`safe_write_endpoint`]).
-//! - [`Verdict::Unverifiable`]: everything else. The caller refuses it unless
-//!   the operator acknowledges it explicitly.
+//! - [`Verdict::Unverifiable`]: everything else. The caller refuses it when a
+//!   shared branch could be involved; operator acknowledgement cannot bypass
+//!   that protection.
 //!
 //! There is no fall-through that allows: every branch of [`assess`] that is
 //! not an exact match returns `Unverifiable`.

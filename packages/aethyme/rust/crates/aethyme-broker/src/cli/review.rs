@@ -154,12 +154,24 @@ pub(super) fn run_review_plan(parsed: Parsed) -> Result<(), UsageError> {
         change: Some(change.clone()),
         rule_labels: rule_labels(&rule_actions),
     };
-    let projection_actions = crate::project(
+    let assumed_pr = crate::PrProjectionFacts {
+        pull_request,
+        // Offline: the plan assumes no rule comment exists yet, as it assumes
+        // no Aethyme comment and no labels (see `assumptions`).
+        rule_comments: Some(std::collections::BTreeMap::new()),
+        ..Default::default()
+    };
+    let projection_actions = crate::project(&projection_policy, &projection, &assumed_pr);
+    let rule_comments = plan_rule_comments_for(
+        &trigger,
         &projection_policy,
-        &projection,
-        &crate::PrProjectionFacts {
+        &facts,
+        true,
+        &assumed_pr,
+        &crate::RuleCommentContext {
             pull_request,
-            ..Default::default()
+            head: head.clone(),
+            base: base.clone(),
         },
     );
 
@@ -180,6 +192,7 @@ pub(super) fn run_review_plan(parsed: Parsed) -> Result<(), UsageError> {
         "decisions": decisions,
         "dispatch": dispatch,
         "projection": projection_actions,
+        "rule_comments": rule_comments.decisions,
         "assumptions": [
             "no reviews have been spent on this pull request yet",
             "no Chau7 tabs and no reviews are in flight",
@@ -505,6 +518,85 @@ pub(super) fn owned_comment_from_view(
     ))
 }
 
+/// The broker's own rule comments (#596), by key, or `None` when they cannot
+/// be read safely.
+///
+/// "Own" means written by the identity `gh` acts as. Anybody can paste a
+/// marker into a comment; adopting one would let a rule edit or delete it.
+/// Without that identity, or with a marked comment whose REST id is
+/// unreadable, the answer is `None` and no rule comment is written.
+fn rule_comments_from_view(
+    root: &Path,
+    comments: &[serde_json::Value],
+) -> Option<std::collections::BTreeMap<String, crate::OwnedComment>> {
+    let viewer = std::process::Command::new("gh")
+        .current_dir(root)
+        .args(["api", "user", "--jq", ".login"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        .filter(|login| !login.is_empty() && login != "null")?;
+    let mut readable: Vec<(i64, String, String)> = Vec::new();
+    for comment in comments {
+        let Some(body) = comment["body"].as_str() else {
+            continue;
+        };
+        let author = comment["author"]["login"].as_str().unwrap_or_default();
+        match comment["url"].as_str().and_then(crate::rest_comment_id) {
+            Some(id) => readable.push((id, author.to_string(), body.to_string())),
+            None if author == viewer && crate::rule_comments::rule_comment_key(body).is_some() => {
+                return None;
+            }
+            None => {}
+        }
+    }
+    Some(crate::own_rule_comments(
+        readable
+            .iter()
+            .map(|(id, author, body)| (*id, author.as_str(), body.as_str())),
+        &viewer,
+    ))
+}
+
+/// What a pull request's rule comments should become (#596).
+///
+/// Suppressed for a fork's pull request unless the trigger includes forks,
+/// when the fork status itself is unknown, and when the pull request carries
+/// a reserved label such as `aethyme/skip-review`: a judgement parked there by
+/// a human is not something a rule talks over.
+fn plan_rule_comments_for(
+    trigger: &crate::ReviewTriggerPolicy,
+    projection: &crate::PrProjectionPolicy,
+    facts: &crate::ChangeFacts,
+    fork_known: bool,
+    pr_facts: &crate::PrProjectionFacts,
+    context: &crate::RuleCommentContext,
+) -> crate::RuleCommentPlan {
+    let wants = crate::rule_comment_wants(trigger, facts, context);
+    let reserved = projection
+        .reserved
+        .iter()
+        .map(|suffix| format!("{}{suffix}", projection.label_prefix))
+        .find(|label| pr_facts.current_labels.contains(label));
+    let suppressed = if !fork_known {
+        Some("whether the pull request comes from a fork could not be read".to_string())
+    } else if facts.from_fork && !trigger.include_forks {
+        Some(
+            "pull request is from a fork; rule comments are not posted on forks unless \
+             `[review.trigger] include_forks = true`"
+                .to_string(),
+        )
+    } else {
+        reserved.map(|label| format!("the pull request carries the reserved label `{label}`"))
+    };
+    crate::plan_rule_comments(
+        &wants,
+        pr_facts.rule_comments.as_ref(),
+        suppressed.as_deref(),
+    )
+}
+
 /// Read the pull request facts the projection needs, with read-only `gh`.
 ///
 /// Read-only GitHub inspection runs directly; only writes go through the
@@ -557,6 +649,13 @@ pub(super) fn read_pull_request_facts(
                 .map(Vec::as_slice)
                 .unwrap_or(&[]),
         )?;
+        facts.rule_comments = rule_comments_from_view(
+            root,
+            json["comments"]
+                .as_array()
+                .map(Vec::as_slice)
+                .unwrap_or(&[]),
+        );
     }
     let labels = std::process::Command::new("gh")
         .current_dir(root)
@@ -869,16 +968,46 @@ pub(super) fn run_review_run(parsed: Parsed) -> Result<serde_json::Value, UsageE
         &pr_facts,
     );
 
-    let plan = crate::plan_execution(
+    let mut plan = crate::plan_execution(
         &dispatch,
         &projection_actions,
         &teardown,
         pull_request,
         &repository,
     );
+    let rule_comments = plan_rule_comments_for(
+        &trigger,
+        &projection_policy,
+        &facts,
+        snapshot.is_some(),
+        &pr_facts,
+        &crate::RuleCommentContext {
+            pull_request,
+            head: head.clone(),
+            base: snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.base_ref.clone())
+                .filter(|base_ref| !base_ref.is_empty())
+                .unwrap_or_else(|| base.clone()),
+        },
+    );
+    // After the projection, so the review record is current before a rule's
+    // comment points at it.
+    for action in &rule_comments.actions {
+        plan.gh.push(crate::GhCall {
+            review_type: None,
+            purpose: action.reason(pull_request),
+            args: action.gh_args(&repository, pull_request),
+            destructive: matches!(action, crate::RuleCommentAction::Delete { .. }),
+        });
+    }
+    let with_rule_comments = |mut report: serde_json::Value| {
+        report["rule_comments"] = serde_json::json!(rule_comments.decisions);
+        report
+    };
 
     if parsed.dry_run {
-        return Ok(build_review_run_report(
+        return Ok(with_rule_comments(build_review_run_report(
             &base,
             &head,
             pull_request,
@@ -888,7 +1017,7 @@ pub(super) fn run_review_run(parsed: Parsed) -> Result<serde_json::Value, UsageE
             &expired,
             facts.trigger,
             false,
-        ));
+        )));
     }
 
     // Automatic waivers (#584) are recorded through the same ledger write as
@@ -1008,8 +1137,12 @@ pub(super) fn run_review_run(parsed: Parsed) -> Result<serde_json::Value, UsageE
                 repository: Some(repository.clone()),
                 resolved_target: None,
                 scope: Some(format!("pr/{pull_request}")),
-                declared_effect: Some(crate::OperationEffect::Write),
-                destructive_confirmed: false,
+                declared_effect: Some(if call.destructive {
+                    crate::OperationEffect::Destructive
+                } else {
+                    crate::OperationEffect::Write
+                }),
+                destructive_confirmed: call.destructive,
                 cross_session: None,
                 ref_write_acknowledged: false,
                 authorization_reason: Some(call.purpose.clone()),
@@ -1057,7 +1190,7 @@ pub(super) fn run_review_run(parsed: Parsed) -> Result<serde_json::Value, UsageE
             // The report still goes out: it names the operation that failed
             // and the row that went back to `abandoned`, which is what a
             // caller needs to decide whether to retry.
-            print_json(&build_review_run_report(
+            print_json(&with_rule_comments(build_review_run_report(
                 &base,
                 &head,
                 pull_request,
@@ -1067,7 +1200,7 @@ pub(super) fn run_review_run(parsed: Parsed) -> Result<serde_json::Value, UsageE
                 &expired,
                 facts.trigger,
                 true,
-            ))?;
+            )))?;
             // The classification rides on the error too. A caller that only
             // reads exit status and stderr is the common case, and it is the
             // one that spent 48 hours not knowing in #173.
@@ -1100,7 +1233,7 @@ pub(super) fn run_review_run(parsed: Parsed) -> Result<serde_json::Value, UsageE
             .map_err(to_usage)?;
     }
 
-    Ok(build_review_run_report(
+    Ok(with_rule_comments(build_review_run_report(
         &base,
         &head,
         pull_request,
@@ -1110,7 +1243,7 @@ pub(super) fn run_review_run(parsed: Parsed) -> Result<serde_json::Value, UsageE
         &expired,
         facts.trigger,
         true,
-    ))
+    )))
 }
 
 /// Route every open pull request in a repository, once.
