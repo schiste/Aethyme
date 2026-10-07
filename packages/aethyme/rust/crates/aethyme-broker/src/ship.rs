@@ -2059,7 +2059,7 @@ fn reconcile_after_independent_publication(
                     .collect(),
                 Vec::new(),
                 format!(
-                    "independent publication {published_sha} succeeded, but integration reconciliation could not be planned: {error}; run `aethyme broker integration reconcile --upstream {published_sha} --dry-run`"
+                    "independent publication {published_sha} succeeded, but integration reconciliation could not be planned: {error}; run `aethyme broker advanced integration reconcile --upstream {published_sha} --dry-run`"
                 ),
             );
         }
@@ -2086,7 +2086,7 @@ fn reconcile_after_independent_publication(
             preserved_queue_entry_ids,
             Vec::new(),
             format!(
-                "independent publication {published_sha} succeeded, but integration reconciliation produced no plan digest; run `aethyme broker integration reconcile --upstream {published_sha} --dry-run`"
+                "independent publication {published_sha} succeeded, but integration reconciliation produced no plan digest; run `aethyme broker advanced integration reconcile --upstream {published_sha} --dry-run`"
             ),
         );
     };
@@ -2192,7 +2192,7 @@ fn reconcile_after_independent_publication(
             preserved_queue_entry_ids,
             reverified_gates,
             format!(
-                "independent publication {published_sha} succeeded, but the verified integration reconciliation plan could not be applied: {error}; rerun `aethyme broker integration reconcile --upstream {published_sha} --dry-run`"
+                "independent publication {published_sha} succeeded, but the verified integration reconciliation plan could not be applied: {error}; rerun `aethyme broker advanced integration reconcile --upstream {published_sha} --dry-run`"
             ),
         ),
     }

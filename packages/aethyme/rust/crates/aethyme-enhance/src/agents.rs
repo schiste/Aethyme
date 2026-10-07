@@ -592,7 +592,7 @@ blocked.
    the broker rebases the remaining pending entries onto the published commit
    in integration and re-runs gates only for replayed trees that changed.
    Review that reconciliation report. If it refuses or cannot apply safely,
-   use `aethyme broker integration reconcile --upstream <published-sha> --dry-run`
+   use `aethyme broker advanced integration reconcile --upstream <published-sha> --dry-run`
    and follow its reviewed apply plan. `broker main reconcile plan/apply` remains
    the separate operation for advancing the local default checkout from
    integration; independent publication does not mark the other queue entries
@@ -1061,7 +1061,7 @@ mod tests {
             "aethyme broker advanced ship execute",
             "ship plan --entry <promoted-entry-id> --only",
             "changed-path overlap",
-            "broker integration reconcile --upstream <published-sha> --dry-run",
+            "broker advanced integration reconcile --upstream <published-sha> --dry-run",
             "broker main reconcile plan/apply",
             "aethyme broker start --reuse --task",
             "aethyme graph materialize --repo .",
@@ -1207,7 +1207,7 @@ mod tests {
             "`coordination.land-shared-edit-first`",
             "ship plan --entry <promoted-entry-id> --only",
             "changed-path overlap",
-            "broker integration reconcile --upstream <published-sha> --dry-run",
+            "broker advanced integration reconcile --upstream <published-sha> --dry-run",
             "broker main reconcile plan/apply",
         ] {
             assert!(reference.contains(needle), "missing {needle:?}");
