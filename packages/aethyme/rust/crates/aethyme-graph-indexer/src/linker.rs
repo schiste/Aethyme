@@ -300,6 +300,14 @@ struct FragmentResolution {
     was_rewritten: bool,
 }
 
+/// Whether `source_path` is a file the TypeScript/JavaScript indexer reads.
+fn is_script_source(source_path: &str) -> bool {
+    const SCRIPT_EXTENSIONS: &[&str] = &["ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs"];
+    source_path
+        .rsplit_once('.')
+        .is_some_and(|(_, extension)| SCRIPT_EXTENSIONS.contains(&extension))
+}
+
 fn is_relative_module_specifier(specifier: &str) -> bool {
     specifier.starts_with("./") || specifier.starts_with("../")
 }
@@ -579,6 +587,14 @@ impl GlobalSymbolIndex {
             // Relative Python imports still need package context that its
             // indexer does not encode.
             if import_path.starts_with('.') {
+                return None;
+            }
+            // A bare JS/TS specifier names a package or a path alias this
+            // linker cannot resolve. The name-only fallbacks below would bind
+            // `import { request } from 'http-lib'` to whichever repository
+            // function happens to be called `request`, and every call through
+            // that binding would become a false Calls edge.
+            if is_script_source(source_path) {
                 return None;
             }
             // Fast path: look up (module, symbol). One record only?
