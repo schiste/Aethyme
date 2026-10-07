@@ -1039,7 +1039,7 @@ impl Broker {
         &mut self,
         deadline: Option<Instant>,
     ) -> Result<Option<AutoCleanupPlan>, BrokerOpError> {
-        let Ok(_lock) = crate::gc::GcLock::acquire(&self.main_root().to_path_buf()) else {
+        let Ok(_lock) = crate::gc::GcLock::acquire(self.main_root()) else {
             return Ok(None);
         };
         self.auto_cleanup_plan(deadline).map(Some)
@@ -1050,7 +1050,7 @@ impl Broker {
         &mut self,
         plan: AutoCleanupPlan,
     ) -> Result<Option<AutoCleanupReport>, BrokerOpError> {
-        let Ok(_lock) = crate::gc::GcLock::acquire(&self.main_root().to_path_buf()) else {
+        let Ok(_lock) = crate::gc::GcLock::acquire(self.main_root()) else {
             return Ok(None);
         };
         self.auto_cleanup_apply(plan).map(Some)
@@ -1062,7 +1062,7 @@ impl Broker {
         &mut self,
         deadline: Option<Instant>,
     ) -> Result<Option<AutoCleanupReport>, BrokerOpError> {
-        let Ok(_lock) = crate::gc::GcLock::acquire(&self.main_root().to_path_buf()) else {
+        let Ok(_lock) = crate::gc::GcLock::acquire(self.main_root()) else {
             return Ok(None);
         };
         self.auto_remove_disposable_checkouts(deadline).map(Some)

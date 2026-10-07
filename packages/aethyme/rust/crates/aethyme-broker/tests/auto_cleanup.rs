@@ -411,8 +411,7 @@ fn a_live_session_that_adopted_the_closed_checkout_keeps_it() {
     let report = run(&mut broker);
     assert!(report.removed.is_empty(), "{report:#?}");
     assert!(
-        kept_reason(&report, &worktree)
-            .contains(&format!("session {} is still open", adopted.id)),
+        kept_reason(&report, &worktree).contains(&format!("session {} is still open", adopted.id)),
         "{report:#?}"
     );
     assert!(worktree.exists());
