@@ -102,11 +102,30 @@ impl FilePatch {
     /// No parent directory is created: the Python `open(..., "w")` does
     /// not, and every fixer proposes files in directories it already
     /// walked.
+    ///
+    /// The write only happens while the file still holds the content the
+    /// patch was computed from (or is still absent, for a created file);
+    /// a file that already holds the new content counts as applied.
+    /// Every fixer reads the tree before any patch is written, so a second
+    /// patch to the same file would otherwise silently discard the first;
+    /// it fails instead and is reported.
     pub fn apply(&self, repo_path: Option<&Path>) -> bool {
         let target_path = match repo_path {
             Some(root) if !self.file_path.is_absolute() => root.join(&self.file_path),
             _ => self.file_path.clone(),
         };
+        let current = match std::fs::read_to_string(&target_path) {
+            Ok(current) => current,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(_) => return false,
+        };
+        if current == self.new_content {
+            // Already applied: re-applying is a no-op, not a conflict.
+            return true;
+        }
+        if current != self.original_content {
+            return false;
+        }
         std::fs::write(&target_path, &self.new_content).is_ok()
     }
 }
@@ -433,6 +452,33 @@ mod tests {
         assert_eq!(pg.patches.len(), 1);
         // Stored relative to the repo root.
         assert_eq!(pg.patches[0].file_path, PathBuf::from("test.py"));
+    }
+
+    #[test]
+    fn a_second_patch_to_the_same_file_fails_instead_of_overwriting() {
+        let tmp = tmpdir("patch-stale");
+        let mut pg = generator(&tmp);
+        let file_path = tmp.join("test.py");
+        fs::write(&file_path, "original").unwrap();
+        // Two fixers each read the untouched file, as a full fix run does.
+        assert!(
+            pg.add_patch(&file_path, "original", "first", "test_fix")
+                .is_some()
+        );
+        assert!(
+            pg.add_patch(&file_path, "original", "second", "test_fix")
+                .is_some()
+        );
+        match pg.apply(true) {
+            ApplyOutcome::Executed {
+                applied, failed, ..
+            } => {
+                assert_eq!(applied.len(), 1, "{applied:?}");
+                assert_eq!(failed.len(), 1, "{failed:?}");
+            }
+            other => panic!("unexpected outcome: {other:?}"),
+        }
+        assert_eq!(fs::read_to_string(&file_path).unwrap(), "first");
     }
 
     #[test]
