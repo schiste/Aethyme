@@ -590,8 +590,9 @@ A rule that states any of these never matches an unmeasured change.
 | `require = [...]` | Review dimensions, routed by `[review.routing]` as before (Chau7, a `provider_comment` mention such as `@codex`, or `record`). |
 | `waive = [...]` | An automatic waiver per named dimension, bound to the head and written through the same ledger record as `review waive`, with a reason naming the rule and the measured values. A new head re-evaluates it. |
 | `labels = [...]` | Extra labels under `label_prefix`, never a `reserved` one. |
+| `comment = { template, key, on_unmatch }` | A pull request comment rendered from a `[review.comments.<template>]` template and kept current in place (#596). See [A rule's comment](#a-rules-comment). |
 
-A rule needs at least one of `require`, `waive` or `labels`.
+A rule needs at least one of `require`, `waive`, `labels` or `comment`.
 
 ```toml
 # Ask the provider's bot to review large changes...
@@ -632,6 +633,59 @@ max_tier = "trivial"
 
 An automatic waiver appears on the pull request as the `waived` state in the
 owned comment and the `aethyme/review:waived` label.
+
+### A rule's comment
+
+A rule can post a comment whose content is configuration, not code (#596).
+Nothing is posted unless a rule declares one.
+
+```toml
+[[review.trigger.rule]]
+name = "large-pr-heads-up"
+min_tier = "large"
+comment = { template = "large-pr", key = "size-heads-up" }
+
+[review.comments.large-pr]
+body = """
+This pull request is **{{tier}}** ({{files_changed}} files, {{churn}} changed lines).
+Please consider splitting it, or request a review: @codex review
+"""
+```
+
+A large change then gets:
+
+```text
+<!-- aethyme:comment:size-heads-up -->
+This pull request is **large** (1 files, 2000 changed lines).
+Please consider splitting it, or request a review: @codex review
+```
+
+- **Variables are measured values only:** `tier`, `risk`, `files_changed`,
+  `lines_added`, `lines_deleted`, `churn`, `signals`, `reasons`, `rule`,
+  `pr_number`, `head_short` and `base`. A template naming anything else, or a
+  rule naming a template that does not exist, is rejected at load. No text the
+  pull request controls (title, body, branch, commit messages) is ever
+  interpolated, and values render inert: Markdown is escaped, line breaks
+  become spaces, and `@` cannot mention anyone. A mention written in the
+  template itself is the operator's and is kept, which is how a bot is
+  summoned.
+- **One comment per key and pull request.** It carries a hidden first line,
+  `<!-- aethyme:comment:<key> -->`, is created on first match, edited in place
+  when its rendering changes, and left alone when nothing changed, so an
+  unchanged tick writes nothing. Keys are lowercase slugs and unique across
+  rules.
+- **`on_unmatch`** is `keep` (default: the comment stays as last rendered) or
+  `delete` (removed when the rule stops matching).
+- **Only the broker's own comments count.** A marked comment written by anyone
+  other than the identity `gh` acts as is never adopted, edited or deleted. If
+  that identity or the comments cannot be read, nothing is written.
+- **Suppressed** on a fork's pull request unless `include_forks = true`, when
+  fork status could not be read, and on a pull request carrying a
+  `[review.projection] reserved` label such as `aethyme/skip-review`.
+- `review plan` shows each rendered body and its `create`, `update`, `none`,
+  `delete` or `suppressed` decision under `rule_comments`, and `review run`
+  reports the same. Each write runs through the coordinated `gh` lane, whose
+  operation journal records the rule and key in its reason.
 
 ## Trying a policy before switching it on
 

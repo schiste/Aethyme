@@ -22,6 +22,7 @@ use aethyme_broker::{
 /// The complete v1 kind catalog. Additions append here (additive change);
 /// any rename or removal is a break that requires a schema_version bump.
 const V1_KINDS: &[&str] = &[
+    "broker.checkout.fast_forwarded",
     "gate.cached",
     "gate.cancelled",
     "gate.error",
@@ -138,6 +139,7 @@ fn v1_kind_catalog_is_frozen() {
         events::GRAPH_INTEGRITY_CHECKED.into(),
         events::MERGE_INTEGRATION_BRANCH_CREATED.into(),
         events::MERGE_INTEGRATION_REFRESHED.into(),
+        events::BROKER_CHECKOUT_FAST_FORWARDED.into(),
     ];
     for status in [
         SessionStatus::Active,
@@ -484,6 +486,17 @@ fn v1_constructor_payload_field_names_are_frozen() {
         &events::integration_refreshed_payload("b", "f", "t"),
         &["branch", "from", "to"],
         "merge.integration_refreshed",
+    );
+    assert_keys(
+        &events::broker_checkout_fast_forwarded_payload(
+            "broker.status",
+            "main",
+            "origin/main",
+            "from",
+            "to",
+        ),
+        &["branch", "from", "to", "trigger", "upstream_ref"],
+        "broker.checkout.fast_forwarded",
     );
     assert_keys(
         &events::merge_promoted_payload("b", "c"),
