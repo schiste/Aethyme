@@ -75,7 +75,17 @@ pub(super) fn run_review_plan(parsed: Parsed) -> Result<(), UsageError> {
         first_time_contributor: false,
         change: None,
     };
-    let change = classify_local_change(&change_root, &root, &base, &facts, &classification_policy)?;
+    // Offline: fork and first-time status are assumptions here, not
+    // readings, so the plan reports them unknown and never shows a waiver
+    // that `review run` would only write after reading them.
+    let change = classify_local_change(
+        &change_root,
+        &root,
+        &base,
+        &facts,
+        false,
+        &classification_policy,
+    )?;
     facts.change = Some(change.clone());
     let eligible = crate::eligible_types(&trigger, &facts);
     let rule_actions = crate::rule_actions(&trigger, &facts, &eligible);
@@ -297,7 +307,7 @@ pub(super) fn read_change_from_provider(
     Vec<String>,
     crate::CommitClassification,
     String,
-    Vec<crate::ChangedFile>,
+    (Vec<crate::ChangedFile>, bool),
     Option<String>,
 )> {
     let output = std::process::Command::new("gh")
@@ -309,7 +319,7 @@ pub(super) fn read_change_from_provider(
             "--repo",
             repository,
             "--json",
-            "files,commits,headRefOid,baseRefOid",
+            "files,commits,headRefOid,baseRefOid,changedFiles",
         ])
         .output()
         .ok()?;
@@ -346,7 +356,7 @@ pub(super) fn read_change_from_provider(
     let head = json["headRefOid"].as_str()?.to_string();
     // The same `files` array carries per-file line counts, which is what the
     // change classification measures (#584).
-    let files = json["files"]
+    let files: Vec<crate::ChangedFile> = json["files"]
         .as_array()
         .map(|files| {
             files
@@ -354,6 +364,7 @@ pub(super) fn read_change_from_provider(
                 .filter_map(|file| {
                     Some(crate::ChangedFile {
                         path: file["path"].as_str()?.to_string(),
+                        old_path: None,
                         added: file["additions"].as_u64(),
                         deleted: file["deletions"].as_u64(),
                     })
@@ -362,7 +373,12 @@ pub(super) fn read_change_from_provider(
         })
         .unwrap_or_default();
     let base_commit = json["baseRefOid"].as_str().map(String::from);
-    Some((paths, classification, head, files, base_commit))
+    // The provider caps the file list; a list shorter than the change's own
+    // count cannot clear a path-based signal.
+    let complete = json["changedFiles"]
+        .as_u64()
+        .is_some_and(|count| count == files.len() as u64);
+    Some((paths, classification, head, (files, complete), base_commit))
 }
 
 /// Whether `head` has `previous` in its history.
@@ -713,16 +729,25 @@ pub(super) fn run_review_run(parsed: Parsed) -> Result<serde_json::Value, UsageE
         previous.as_ref(),
     );
     let change = match provider_files {
-        Some((files, base_commit)) => classify_provider_change(
+        Some(((files, complete), base_commit)) => classify_provider_change(
             &root,
             &repository,
             pull_request,
             base_commit.as_deref(),
             files,
+            complete,
+            snapshot.is_some(),
             &facts,
             &classification_policy,
         ),
-        None => classify_local_change(&change_root, &root, &base, &facts, &classification_policy)?,
+        None => classify_local_change(
+            &change_root,
+            &root,
+            &base,
+            &facts,
+            snapshot.is_some(),
+            &classification_policy,
+        )?,
     };
     facts.change = Some(change.clone());
     let eligible = crate::eligible_types(&trigger, &facts);
@@ -845,7 +870,27 @@ pub(super) fn run_review_run(parsed: Parsed) -> Result<serde_json::Value, UsageE
     // `review waive`, bound to this head, before anything is projected that
     // shows them. One already written at this head is left alone, and a
     // satisfied review is never replaced by an excuse.
-    for planned in &rule_actions.waivers {
+    // A waiver binds to the head that was classified. Re-read it right before
+    // writing: a push between classification and here must not carry an
+    // excuse onto code nobody measured. Unreadable counts as moved.
+    let head_unchanged = rule_actions.waivers.is_empty() || {
+        let current = if parsed.from_provider {
+            read_pull_request_head(&root, &repository, pull_request)
+        } else {
+            git_output(&change_root, &["rev-parse", "HEAD"])
+                .ok()
+                .map(|head| head.trim().to_string())
+        };
+        current.as_deref() == Some(head.as_str())
+    };
+    if !head_unchanged {
+        eprintln!(
+            "Warning: {repository}#{pull_request} is no longer at {} after it was \
+             classified; no automatic waiver was written. The next run classifies the new head.",
+            short_sha(&head)
+        );
+    }
+    for planned in rule_actions.waivers.iter().filter(|_| head_unchanged) {
         if crate::waiver_for(&reconciled, &planned.review_type, &head).is_some() {
             continue;
         }
@@ -1921,6 +1966,7 @@ pub(super) fn classify_local_change(
     policy_root: &Path,
     base: &str,
     facts: &crate::ChangeFacts,
+    provenance_known: bool,
     policy: &crate::ChangeClassificationPolicy,
 ) -> Result<crate::ChangeClassification, UsageError> {
     let range = format!("{base}...HEAD");
@@ -1935,7 +1981,17 @@ pub(super) fn classify_local_change(
     .ok()
     .map(|text| text.lines().map(String::from).collect::<Vec<_>>());
     // Generated-file attributes come from the base, never the change itself.
-    Ok(classify_with(policy_root, base, files, diff, facts, policy))
+    // A local numstat is the whole change.
+    Ok(classify_with(
+        policy_root,
+        base,
+        files,
+        true,
+        diff,
+        facts,
+        provenance_known,
+        policy,
+    ))
 }
 
 /// Classify a pull request from what the provider reports.
@@ -1948,6 +2004,8 @@ pub(super) fn classify_provider_change(
     pull_request: i64,
     base_commit: Option<&str>,
     files: Vec<crate::ChangedFile>,
+    files_complete: bool,
+    provenance_known: bool,
     facts: &crate::ChangeFacts,
     policy: &crate::ChangeClassificationPolicy,
 ) -> crate::ChangeClassification {
@@ -1977,22 +2035,32 @@ pub(super) fn classify_provider_change(
         policy_root,
         base_commit.unwrap_or_default(),
         files,
+        files_complete,
         diff,
         facts,
+        provenance_known,
         policy,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn classify_with(
     policy_root: &Path,
     attributes_base: &str,
     files: Vec<crate::ChangedFile>,
+    files_complete: bool,
     diff: Option<Vec<String>>,
     facts: &crate::ChangeFacts,
+    provenance_known: bool,
     policy: &crate::ChangeClassificationPolicy,
 ) -> crate::ChangeClassification {
     let paths: Vec<String> = files.iter().map(|file| file.path.clone()).collect();
-    let contract_symbols = diff.and_then(|lines| {
+    let extra_signal_paths = diff.as_deref().map(diff_paths).unwrap_or_default();
+    // A configured inventory that is missing means the scan cannot run; only
+    // the default one may be absent, meaning nothing is tracked.
+    let inventory_missing =
+        policy.contract_doc_configured && !policy_root.join(&policy.contract_doc).is_file();
+    let contract_symbols = diff.filter(|_| !inventory_missing).and_then(|lines| {
         crate::contract_check::touched_symbols_for_classification(
             policy_root,
             &policy.contract_doc,
@@ -2009,9 +2077,31 @@ fn classify_with(
             from_fork: facts.from_fork,
             first_time_contributor: facts.first_time_contributor,
             authored_by_model: facts.authored_by_model.is_some(),
+            provenance_known,
+            files_complete,
+            extra_signal_paths,
             declared_risk: facts.classification.risk.clone(),
         },
     )
+}
+
+/// Every path a unified diff names on either side: rename and copy sources
+/// and the `---`/`+++` headers, so a path the change moves away from still
+/// reaches the path-based signals.
+fn diff_paths(lines: &[String]) -> Vec<String> {
+    let mut paths = std::collections::BTreeSet::new();
+    for line in lines {
+        let path = line
+            .strip_prefix("rename from ")
+            .or_else(|| line.strip_prefix("rename to "))
+            .or_else(|| line.strip_prefix("copy from "))
+            .or_else(|| line.strip_prefix("--- a/"))
+            .or_else(|| line.strip_prefix("+++ b/"));
+        if let Some(path) = path {
+            paths.insert(path.trim_end().to_string());
+        }
+    }
+    paths.into_iter().collect()
 }
 
 /// Who an automatic waiver names: the rule, never a person.
@@ -2043,4 +2133,26 @@ fn rule_labels(actions: &crate::RuleActions) -> Vec<String> {
         .iter()
         .map(|label| label.label.clone())
         .collect()
+}
+
+/// The pull request's current head, read-only; `None` when it cannot be read.
+fn read_pull_request_head(root: &Path, repository: &str, pull_request: i64) -> Option<String> {
+    let output = std::process::Command::new("gh")
+        .current_dir(root)
+        .args([
+            "pr",
+            "view",
+            &pull_request.to_string(),
+            "--repo",
+            repository,
+            "--json",
+            "headRefOid",
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
+    json["headRefOid"].as_str().map(String::from)
 }

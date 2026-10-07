@@ -1017,6 +1017,22 @@ pub fn rule_actions(
                     .push(refuse("the change was not measured".into()));
                 continue;
             };
+            // Revalidated here, not only at load: a policy built any other way
+            // must not waive through a wildcard or a guarded-signal rule.
+            if let Err(reason) = rule.validate_classification_terms() {
+                actions
+                    .refused_waivers
+                    .push(refuse(format!("the rule is invalid: {reason}")));
+                continue;
+            }
+            if !change.signals.unknown.is_empty() {
+                actions.refused_waivers.push(refuse(format!(
+                    "{} could not be determined, and the broker never waives on an \
+                     undetermined input",
+                    change.signals.unknown.join(", ")
+                )));
+                continue;
+            }
             if !guarded.is_empty() {
                 actions.refused_waivers.push(refuse(format!(
                     "the change carries {}, which the broker never auto-waives",
@@ -1538,11 +1554,15 @@ mod tests {
                 .iter()
                 .map(|(path, lines)| crate::ChangedFile {
                     path: path.to_string(),
+                    old_path: None,
                     added: Some(*lines),
                     deleted: Some(0),
                 })
                 .collect(),
             contract_symbols: Some(Vec::new()),
+            generated: Some(BTreeSet::new()),
+            provenance_known: true,
+            files_complete: true,
             ..Default::default()
         };
         configure(&mut inputs);
@@ -1660,6 +1680,44 @@ mod tests {
                 actions.refused_waivers[0].why
             );
         }
+    }
+
+    #[test]
+    fn an_undetermined_input_refuses_the_waiver() {
+        let policy = enabled(vec![waive_trivial_code()]);
+        for (what, change) in [
+            (
+                "from_fork",
+                measured(&[("docs/a.md", 1)], |i| i.provenance_known = false),
+            ),
+            (
+                "workflows",
+                measured(&[("docs/a.md", 1)], |i| i.files_complete = false),
+            ),
+            (
+                "generated_attributes",
+                measured(&[("docs/a.md", 1)], |i| i.generated = None),
+            ),
+        ] {
+            let actions = rule_actions(&policy, &change, &[]);
+            assert!(actions.waivers.is_empty(), "{what}: {actions:?}");
+            assert!(
+                actions.refused_waivers[0].why.contains(what),
+                "{what}: {}",
+                actions.refused_waivers[0].why
+            );
+        }
+    }
+
+    #[test]
+    fn an_invalid_rule_built_without_load_cannot_waive() {
+        let mut wildcard = waive_trivial_code();
+        wildcard.waive = vec!["*".into()];
+        let policy = enabled(vec![wildcard]);
+        let change = measured(&[("docs/a.md", 1)], |_| {});
+        let actions = rule_actions(&policy, &change, &[]);
+        assert!(actions.waivers.is_empty(), "{actions:?}");
+        assert!(actions.refused_waivers[0].why.contains("invalid"));
     }
 
     #[test]

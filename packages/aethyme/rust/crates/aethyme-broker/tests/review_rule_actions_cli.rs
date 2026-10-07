@@ -45,6 +45,8 @@ min_tier = "large"
 struct Fixture {
     root: tempfile::TempDir,
     fake_bin: PathBuf,
+    base: String,
+    env: Vec<(String, String)>,
 }
 
 impl Fixture {
@@ -75,7 +77,14 @@ impl Fixture {
             &gh,
             r#"#!/bin/sh
 if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
-  printf '{"number":7,"state":"OPEN","isDraft":false,"isCrossRepository":false,"authorAssociation":"MEMBER","baseRefName":"main","headRefOid":"%s","labels":[],"comments":[],"commits":[],"files":%s}\n' "$FAKE_PR_HEAD" "$FAKE_PR_FILES"
+  case "$*" in
+    *"--json headRefOid")
+      # The re-read right before a waiver is written.
+      printf '{"headRefOid":"%s"}\n' "${FAKE_PR_HEAD_RECHECK:-$FAKE_PR_HEAD}"
+      exit 0
+      ;;
+  esac
+  printf '{"number":7,"state":"OPEN","isDraft":false,"isCrossRepository":false,"authorAssociation":"MEMBER","baseRefName":"main","baseRefOid":"%s","headRefOid":"%s","changedFiles":%s,"labels":[],"comments":[],"commits":[],"files":%s}\n' "$FAKE_PR_BASE" "$FAKE_PR_HEAD" "${FAKE_PR_COUNT:-1}" "$FAKE_PR_FILES"
   exit 0
 fi
 if [ "$1" = "pr" ] && [ "$2" = "diff" ]; then
@@ -93,7 +102,13 @@ exit 1
         let mut permissions = std::fs::metadata(&gh).unwrap().permissions();
         permissions.set_mode(0o755);
         std::fs::set_permissions(&gh, permissions).unwrap();
-        Self { root, fake_bin }
+        let base = git(path, &["rev-parse", "main"]);
+        Self {
+            root,
+            fake_bin,
+            base,
+            env: Vec::new(),
+        }
     }
 
     fn broker(&self, args: &[&str], head: &str, files: &str) -> serde_json::Value {
@@ -112,6 +127,8 @@ exit 1
             .env("AETHYME_AGENT_PID", std::process::id().to_string())
             .env("FAKE_PR_HEAD", head)
             .env("FAKE_PR_FILES", files)
+            .env("FAKE_PR_BASE", &self.base)
+            .envs(self.env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
             .output()
             .unwrap();
         assert!(
@@ -228,7 +245,7 @@ fn a_guarded_signal_keeps_the_review_even_when_the_rule_matches() {
 }
 
 #[test]
-fn plan_shows_the_mention_for_a_large_change_only_and_the_waiver_for_a_trivial_one() {
+fn plan_shows_the_mention_for_a_large_change_only_and_never_promises_a_waiver() {
     let policy = format!(
         "{WAIVE_TRIVIAL}\n[review.routing]\nenabled = true\n\n\
          [review.routing.route.code]\nbackend = \"provider_comment\"\nmention = \"codex\"\n\n\
@@ -254,18 +271,19 @@ fn plan_shows_the_mention_for_a_large_change_only_and_the_waiver_for_a_trivial_o
     let plan = fixture.broker(&plan_args, "", "[]");
     assert_eq!(plan["change"]["tier"], "trivial");
     assert_eq!(plan["dispatch"], serde_json::json!([]), "{plan:#}");
-    assert_eq!(plan["rule_actions"]["waivers"][0]["review_type"], "code");
-    let labels: Vec<String> = plan["projection"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter(|action| action["action"] == "add_labels")
-        .flat_map(|action| action["names"].as_array().unwrap().clone())
-        .map(|name| name.as_str().unwrap().to_string())
-        .collect();
+    // The plan is offline: fork and first-time status are not read, so it
+    // shows the waiver refused rather than promising one.
     assert!(
-        labels.contains(&"aethyme/review:waived".to_string()),
-        "{labels:?}"
+        plan["rule_actions"]["waivers"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    let refused = &plan["rule_actions"]["refused_waivers"][0];
+    assert_eq!(refused["review_type"], "code");
+    assert!(
+        refused["why"].as_str().unwrap().contains("from_fork"),
+        "{refused}"
     );
 
     let lines: String = (0..900).map(|line| format!("line {line}\n")).collect();
@@ -282,4 +300,30 @@ fn plan_shows_the_mention_for_a_large_change_only_and_the_waiver_for_a_trivial_o
     );
     let dispatch = plan["dispatch"].to_string();
     assert!(dispatch.contains("@codex"), "{dispatch}");
+}
+
+#[test]
+fn a_head_that_moves_between_classification_and_write_gets_no_waiver() {
+    let mut fixture = Fixture::new(WAIVE_TRIVIAL);
+    fixture
+        .env
+        .push(("FAKE_PR_HEAD_RECHECK".into(), HEAD_B.into()));
+    fixture.run(HEAD_A, TRIVIAL);
+    assert!(waivers(&fixture.ledger()).is_empty());
+}
+
+#[test]
+fn rules_in_a_disabled_trigger_never_waive() {
+    let fixture = Fixture::new(&WAIVE_TRIVIAL.replace("enabled = true", "enabled = false"));
+    fixture.run(HEAD_A, TRIVIAL);
+    assert!(waivers(&fixture.ledger()).is_empty());
+}
+
+#[test]
+fn a_truncated_file_list_gets_no_waiver() {
+    let mut fixture = Fixture::new(WAIVE_TRIVIAL);
+    // The provider says 150 files changed but listed one.
+    fixture.env.push(("FAKE_PR_COUNT".into(), "150".into()));
+    fixture.run(HEAD_A, TRIVIAL);
+    assert!(waivers(&fixture.ledger()).is_empty());
 }

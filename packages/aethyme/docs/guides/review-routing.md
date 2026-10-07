@@ -610,10 +610,20 @@ max_tier = "trivial"
 **Guardrails the broker enforces, whatever the rules say:**
 
 - No automatic waiver for a change carrying `from_fork`, `first_time_contributor`,
-  `contract_surface` (including an `unknown` scan), `gate_policy`, `workflows`
-  or `sensitive_paths`. The waiver is refused with a reason under
-  `rule_actions.refused_waivers`, and a rule that requires one of those signals
-  in `signals` is rejected at load.
+  `contract_surface`, `gate_policy`, `workflows` or `sensitive_paths`. The
+  waiver is refused with a reason under `rule_actions.refused_waivers`, and a
+  rule that requires one of those signals in `signals` is rejected at load.
+- No automatic waiver when anything in `change.signals.unknown` could not be
+  determined: an unscanned contract, unreadable base attributes, fork and
+  first-time status the provider did not answer, or a file list shorter than
+  the provider's own count. `review plan` is offline and never reads fork or
+  first-time status, so it shows such a waiver as refused; only `review run`
+  writes one.
+- Path signals see every path the change touches, including a rename's source,
+  so moving a file out of `.github/workflows/` still counts as a workflow change.
+- The waiver binds to the head that was classified. `review run` re-reads the
+  head immediately before writing and writes nothing if it moved.
+- Rule terms are revalidated when a waiver is planned, not only at load.
 - Only the dimensions a rule names: no wildcard, which is rejected at load.
 - `require` beats `waive`: a dimension any rule or declaration requires on this
   change is never waived.
