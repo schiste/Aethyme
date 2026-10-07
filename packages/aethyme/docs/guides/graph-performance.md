@@ -84,13 +84,14 @@ Run and save a named Criterion baseline with:
 
     packages/aethyme/scripts/bench-product-latency.sh --save-baseline product-latency
 
-Criterion reports estimates and confidence intervals under the workspace
-target/criterion/ directory. This suite is intentionally non-gating: hardware,
-OS scheduling, parser caches, and process launch affect these measurements.
-Review changes against a baseline from the same machine, platform, fixture, and
-release profile; record the code revision and host when refreshing the committed
-baseline in docs/reports/product-performance-baseline-2026-10-07.md. Do not
-turn one noisy sample into a hard CI threshold.
+Criterion reports estimates, confidence intervals, and comparison deltas under
+the workspace target/criterion/ directory. This suite is intentionally
+non-gating: hardware, OS scheduling, parser caches, and process launch affect
+these measurements. The nightly/manual product-performance workflow compares
+the current revision with the committed reference revision using the same
+checked-in Playground fixture. Review the artifact before changing the recorded
+baseline in docs/reports/product-performance-baseline-2026-10-08.md; do not turn
+one noisy sample into a hard CI threshold.
 
 ## Interpretation rules
 

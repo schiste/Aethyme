@@ -162,6 +162,18 @@ fn binary_env(name: &str) -> PathBuf {
 }
 
 fn fixture_root() -> PathBuf {
+    if let Some(fixture) = std::env::var_os("AETHYME_BENCH_FIXTURE") {
+        let path = PathBuf::from(fixture)
+            .canonicalize()
+            .expect("AETHYME_BENCH_FIXTURE points to a checked-in Playground fixture");
+        assert!(
+            path.is_dir(),
+            "benchmark fixture is not a directory: {}",
+            path.display()
+        );
+        return path;
+    }
+
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../../../../packages/aethyme-eval/benchmarks/performance/fixture")
         .canonicalize()
@@ -193,7 +205,7 @@ fn bench_product_latency(criterion: &mut Criterion) {
     let warm_playground = Playground::new(&fixture);
     warm_playground.prepare_graph(&aethyme);
     black_box(warm_playground.explore(&aethyme));
-    group.bench_function("explore_warm_process", |bencher| {
+    group.bench_function("explore_warm_store", |bencher| {
         bencher.iter(|| black_box(warm_playground.explore(&aethyme).stdout.len()));
     });
 
