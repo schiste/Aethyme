@@ -60,6 +60,11 @@ pub struct GhCall {
     /// a human reading the audit log later.
     pub purpose: String,
     pub args: Vec<String>,
+    /// Declared destructive, with the operator's confirmation coming from
+    /// configuration: only a rule comment with `on_unmatch = "delete"` (#596)
+    /// deletes, and only a comment the broker itself wrote.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub destructive: bool,
 }
 
 /// One review to be started by an adapter with Chau7 access.
@@ -200,6 +205,7 @@ pub fn plan_execution(
                         review_type: Some(review_type.clone()),
                         purpose: format!("request the {review_type} review from the provider bot"),
                         args,
+                        destructive: false,
                     });
                 }
             }
@@ -228,6 +234,7 @@ pub fn plan_execution(
             review_type: None,
             purpose: "project the review record onto the pull request".into(),
             args: action.gh_args(pull_request),
+            destructive: false,
         });
     }
     plan

@@ -354,6 +354,11 @@ pub struct PrProjectionFacts {
     /// has to be created before it can be applied.
     pub repository_labels: BTreeSet<String>,
     pub owned_comment: Option<OwnedComment>,
+    /// The broker's own review rule comments (#596), by key. `None` when the
+    /// comments, or the identity `gh` acts as, could not be read: a rule
+    /// comment then writes nothing rather than risk a duplicate or an edit to
+    /// somebody else's comment.
+    pub rule_comments: Option<std::collections::BTreeMap<String, OwnedComment>>,
 }
 
 /// Find the comment Aethyme owns among a pull request's comments.
