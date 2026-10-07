@@ -18,6 +18,15 @@ static NEXT_PRIVATE_INDEX_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Errors from git operations. `Git` carries the failing subcommand and
 /// stderr so callers can surface actionable messages verbatim.
+/// How every patch identity is computed. `--verbatim` keeps whitespace:
+/// `--stable` (and Git's internal `--cherry-mark`/`git cherry` ids) strip it,
+/// so a commit whose only change is whitespace -- a re-indented Python block,
+/// tabs turned into spaces in a Makefile -- would count as already landed and
+/// its worktree as safe to remove. Every caller is a safety verdict (landed,
+/// unpushed, cleanup-safe, reconcile containment), and a re-indented port
+/// reported as not landed is merely kept.
+const PATCH_ID_ARGS: [&str; 2] = ["patch-id", "--verbatim"];
+
 /// Which side of a symmetric `left...right` range [`GitRepo::cherry_marked`]
 /// lists.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1894,30 +1903,59 @@ impl GitRepo {
         Ok(answers)
     }
 
-    /// Commits on one side of `left...right` with whether Git found a
-    /// patch-equivalent commit on the other side (`--cherry-mark`), newest
-    /// first. Merges are excluded, as `--cherry-mark` does for patch ids.
+    /// Commits on one side of `left...right` with whether a patch-equivalent
+    /// commit exists on the other side, newest first. Merges are excluded on
+    /// both sides, as `--cherry-mark` does. Equivalence is decided with
+    /// `git patch-id --verbatim` rather than `--cherry-mark`, whose internal patch ids
+    /// ignore whitespace: a commit that differs only in whitespace is not
+    /// equivalent. A root commit, or one whose diff is empty, has no patch id
+    /// and is never equivalent.
     pub fn cherry_marked(
         &self,
         left: &str,
         right: &str,
         side: CherrySide,
     ) -> Result<Vec<(String, bool)>, GitError> {
-        let only = match side {
-            CherrySide::Left => "--left-only",
-            CherrySide::Right => "--right-only",
+        let (listed, other) = match side {
+            CherrySide::Left => ("--left-only", "--right-only"),
+            CherrySide::Right => ("--right-only", "--left-only"),
         };
         let range = format!("{left}...{right}");
-        Ok(run_git(
-            &self.root,
-            &["rev-list", "--cherry-mark", "--no-merges", only, &range],
-        )?
-        .lines()
-        .filter_map(|line| {
-            let (mark, commit) = line.split_at_checked(1)?;
-            Some((commit.to_string(), mark == "="))
-        })
-        .collect())
+        let side_commits = |only: &str| -> Result<Vec<(String, bool)>, GitError> {
+            Ok(run_git(
+                &self.root,
+                &["rev-list", "--no-merges", "--parents", only, &range],
+            )?
+            .lines()
+            .filter_map(|line| {
+                let mut fields = line.split_whitespace();
+                let commit = fields.next()?.to_string();
+                Some((commit, fields.next().is_some()))
+            })
+            .collect())
+        };
+        let listed = side_commits(listed)?;
+        let other = side_commits(other)?;
+        let with_parent = listed
+            .iter()
+            .chain(other.iter())
+            .filter(|(_, has_parent)| *has_parent)
+            .map(|(commit, _)| commit.clone())
+            .collect::<Vec<_>>();
+        let patch_ids = self.first_parent_patch_ids(&with_parent)?;
+        let other_ids = other
+            .iter()
+            .filter_map(|(commit, _)| patch_ids.get(commit))
+            .collect::<std::collections::HashSet<_>>();
+        Ok(listed
+            .into_iter()
+            .map(|(commit, _)| {
+                let equivalent = patch_ids
+                    .get(&commit)
+                    .is_some_and(|patch| other_ids.contains(patch));
+                (commit, equivalent)
+            })
+            .collect())
     }
 
     /// Commits reachable from `to` that descend from `from`, excluding
@@ -1997,7 +2035,8 @@ impl GitRepo {
         Ok(shapes)
     }
 
-    /// Stable patch id of each commit's diff against its first parent --
+    /// Verbatim patch id (`git patch-id --verbatim`) of each commit's diff against its
+    /// first parent --
     /// [`Self::patch_id_between`] for `parent..commit` -- from one `git log -p`
     /// streamed into one `git patch-id`, however many commits are named.
     /// Commits whose diff is empty have no patch id and are absent from the
@@ -2039,14 +2078,14 @@ impl GitRepo {
         // The diff streams from one process into the other through a pipe,
         // so it is never held in memory however much history it covers.
         let patch_id = git_command()
-            .args(["patch-id", "--stable"])
+            .args(PATCH_ID_ARGS)
             .current_dir(&self.root)
             .stdin(std::process::Stdio::from(log_stdout))
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()
             .map_err(|source| GitError::Spawn {
-                args: "patch-id --stable".into(),
+                args: "patch-id --verbatim".into(),
                 source,
             })?;
         let mut log_stdin = log.stdin.take().ok_or_else(|| GitError::Git {
@@ -2070,7 +2109,7 @@ impl GitRepo {
         let output = patch_id
             .wait_with_output()
             .map_err(|source| GitError::Spawn {
-                args: "patch-id --stable".into(),
+                args: "patch-id --verbatim".into(),
                 source,
             })?;
         let log_status = log.wait().map_err(|source| GitError::Spawn {
@@ -2096,7 +2135,7 @@ impl GitRepo {
         }
         if !output.status.success() {
             return Err(GitError::Git {
-                args: "patch-id --stable".into(),
+                args: "patch-id --verbatim".into(),
                 stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
             });
         }
@@ -2153,7 +2192,8 @@ impl GitRepo {
         Ok(output.stdout)
     }
 
-    /// Stable patch id for the cumulative diff `from..to`. Empty diffs
+    /// Verbatim patch id (`git patch-id --verbatim`) for the cumulative diff
+    /// `from..to`. Empty diffs
     /// have no patch id and return `None`.
     pub fn patch_id_between(&self, from: &str, to: &str) -> Result<Option<String>, GitError> {
         let diff = git_command()
@@ -2174,35 +2214,35 @@ impl GitRepo {
             return Ok(None);
         }
         let mut child = git_command()
-            .args(["patch-id", "--stable"])
+            .args(PATCH_ID_ARGS)
             .current_dir(&self.root)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()
             .map_err(|source| GitError::Spawn {
-                args: "patch-id --stable".into(),
+                args: "patch-id --verbatim".into(),
                 source,
             })?;
         child
             .stdin
             .as_mut()
             .ok_or_else(|| GitError::Git {
-                args: "patch-id --stable".into(),
+                args: "patch-id --verbatim".into(),
                 stderr: "failed to open patch-id stdin".into(),
             })?
             .write_all(&diff.stdout)
             .map_err(|source| GitError::Spawn {
-                args: "patch-id --stable stdin".into(),
+                args: "patch-id --verbatim stdin".into(),
                 source,
             })?;
         let output = child.wait_with_output().map_err(|source| GitError::Spawn {
-            args: "patch-id --stable".into(),
+            args: "patch-id --verbatim".into(),
             source,
         })?;
         if !output.status.success() {
             return Err(GitError::Git {
-                args: "patch-id --stable".into(),
+                args: "patch-id --verbatim".into(),
                 stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
             });
         }
@@ -4227,5 +4267,65 @@ mod batched_commit_tests {
 
         let missing = vec!["0000000000000000000000000000000000000001".to_string()];
         assert!(repo.commit_shapes(&missing).is_err());
+    }
+
+    /// A port that differs only in whitespace is different work: re-indented
+    /// Python or tabs turned into spaces change what the code does. Every
+    /// patch comparison -- batched, per-commit and `cherry_marked` -- must
+    /// tell it apart from the original, while an exact cherry-pick still
+    /// matches.
+    #[test]
+    fn a_whitespace_only_difference_is_never_the_same_patch() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        run(root, &["init", "-q", "-b", "main"]);
+        std::fs::write(root.join("job.py"), "def job():\n    return 1\n").expect("write");
+        run(root, &["add", "-A"]);
+        run(root, &["commit", "-qm", "root"]);
+        let base = run(root, &["rev-parse", "HEAD"]);
+        // Upstream: the change, indented with spaces.
+        std::fs::write(
+            root.join("job.py"),
+            "def job():\n    if ready():\n        return 1\n",
+        )
+        .expect("write");
+        run(root, &["commit", "-qam", "guard"]);
+        // A session that made the same change with a tab: not the same work.
+        run(root, &["switch", "-q", "-c", "tabbed", &base]);
+        std::fs::write(
+            root.join("job.py"),
+            "def job():\n    if ready():\n\treturn 1\n",
+        )
+        .expect("write");
+        run(root, &["commit", "-qam", "guard"]);
+        // A session that cherry-picked the exact change: the same work.
+        run(root, &["switch", "-q", "-c", "exact", &base]);
+        // `-x` changes the message, so the pick is a distinct commit.
+        run(root, &["cherry-pick", "-x", "main"]);
+
+        let repo = GitRepo::discover(root).expect("repo");
+        let upstream = run(root, &["rev-parse", "main"]);
+        let tabbed = run(root, &["rev-parse", "tabbed"]);
+        let exact = run(root, &["rev-parse", "exact"]);
+
+        let batched = repo
+            .first_parent_patch_ids(&[upstream.clone(), tabbed.clone(), exact.clone()])
+            .expect("patch ids");
+        assert_ne!(batched[&upstream], batched[&tabbed], "batched");
+        assert_eq!(batched[&upstream], batched[&exact], "batched");
+        let single = |commit: &str| {
+            repo.patch_id_between(&base, commit)
+                .expect("patch id")
+                .expect("non-empty")
+        };
+        assert_ne!(single(&upstream), single(&tabbed), "per-commit");
+        assert_eq!(single(&upstream), single(&exact), "per-commit");
+
+        let marked = |branch: &str| {
+            repo.cherry_marked("main", branch, CherrySide::Right)
+                .expect("cherry marked")
+        };
+        assert_eq!(marked("tabbed"), vec![(tabbed, false)], "not landed");
+        assert_eq!(marked("exact"), vec![(exact, true)], "landed");
     }
 }
