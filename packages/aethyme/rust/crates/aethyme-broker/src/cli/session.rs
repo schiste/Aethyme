@@ -1446,7 +1446,7 @@ fn finish_timeout_error(error: UsageError, timeout_seconds: u64, session: i64) -
         other => return other,
     };
     UsageError::Message(format!(
-        "finish timed out after {timeout_seconds}s while checking Git ({message}); inspect `aethyme broker status --json` before retrying, and inspect `aethyme broker handoff --session {session}` if the session is already closed"
+        "finish timed out after {timeout_seconds}s while checking Git ({message}); inspect `aethyme broker status --json` before retrying, and inspect `aethyme broker advanced handoff --session {session}` if the session is already closed"
     ))
 }
 

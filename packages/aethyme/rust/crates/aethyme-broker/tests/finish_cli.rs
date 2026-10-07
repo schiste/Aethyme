@@ -200,6 +200,10 @@ fn finish_reports_a_bounded_git_timeout_before_closing_the_session() {
         "{stderr}"
     );
     assert!(stderr.contains("broker status --json"), "{stderr}");
+    assert!(
+        stderr.contains("aethyme broker advanced handoff --session"),
+        "{stderr}"
+    );
 
     let store = aethyme_broker::BrokerStore::open_in_repo(tmp.path()).unwrap();
     assert_eq!(store.session(session_id).unwrap().status.as_str(), "active");
