@@ -12,9 +12,38 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 static NEXT_PRIVATE_INDEX_ID: AtomicU64 = AtomicU64::new(1);
+
+thread_local! {
+    /// A command-scoped deadline for callers that need a tighter bound than
+    /// the general git timeout. Thread-local so one finish cannot shorten a
+    /// concurrent operation running in another broker thread.
+    static GIT_DEADLINE: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
+}
+
+struct RestoreGitDeadline(Option<Instant>);
+
+impl Drop for RestoreGitDeadline {
+    fn drop(&mut self) {
+        GIT_DEADLINE.with(|deadline| deadline.set(self.0));
+    }
+}
+
+/// Apply one wall-clock deadline to all Git subprocesses run synchronously by
+/// `operation`, preserving and restoring an outer deadline when nested.
+pub(crate) fn with_git_deadline<T>(timeout: Duration, operation: impl FnOnce() -> T) -> T {
+    let requested = Instant::now() + timeout;
+    let previous = GIT_DEADLINE.with(|deadline| {
+        let previous = deadline.get();
+        let effective = previous.map_or(requested, |outer| outer.min(requested));
+        deadline.set(Some(effective));
+        previous
+    });
+    let _restore = RestoreGitDeadline(previous);
+    operation()
+}
 
 /// Errors from git operations. `Git` carries the failing subcommand and
 /// stderr so callers can surface actionable messages verbatim.
@@ -87,7 +116,14 @@ fn git_timeout_from(value: Option<&str>) -> Duration {
 }
 
 fn git_timeout() -> Duration {
-    git_timeout_from(std::env::var(GIT_TIMEOUT_ENV).ok().as_deref())
+    let configured = git_timeout_from(std::env::var(GIT_TIMEOUT_ENV).ok().as_deref());
+    GIT_DEADLINE.with(|deadline| match deadline.get() {
+        Some(deadline) => deadline
+            .saturating_duration_since(Instant::now())
+            .min(configured)
+            .max(Duration::from_millis(1)),
+        None => configured,
+    })
 }
 
 /// Extract paths from `git status --porcelain` output, validating each
@@ -918,7 +954,7 @@ fn run_git_command_output(
         })?
         .ok_or_else(|| GitError::TimedOut {
             args: args.join(" "),
-            seconds: budget.as_secs(),
+            seconds: budget.as_secs().max(1),
         })?;
     if !output.status.success() {
         return Err(GitError::Git {
@@ -4071,6 +4107,21 @@ mod timeout_tests {
         );
         assert!(started.elapsed() < Duration::from_secs(10));
         assert!(error.to_string().contains(GIT_TIMEOUT_ENV), "{error}");
+    }
+
+    #[test]
+    fn a_scoped_deadline_bounds_git_and_restores_the_previous_budget() {
+        let previous = git_timeout();
+        let started = Instant::now();
+        let error = with_git_deadline(Duration::from_millis(300), || {
+            let mut command = Command::new("sh");
+            command.args(["-c", "exec sleep 30"]);
+            run_git_command(command, &["status"], git_timeout())
+                .expect_err("the scoped finish budget must stop a wedged git")
+        });
+        assert!(matches!(error, GitError::TimedOut { seconds: 1, .. }));
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert_eq!(git_timeout(), previous);
     }
 
     #[test]

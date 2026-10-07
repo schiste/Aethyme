@@ -147,6 +147,64 @@ fn finish_cli_json_is_structured_and_persists_a_redacted_handoff() {
     assert!(!payload.contains("redacted/gate.log"));
 }
 
+#[cfg(unix)]
+#[test]
+fn finish_reports_a_bounded_git_timeout_before_closing_the_session() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = tempfile::tempdir().unwrap();
+    git(tmp.path(), &["init", "-q", "-b", "main"]);
+    std::fs::write(tmp.path().join("README.md"), "fixture\n").unwrap();
+    std::fs::write(tmp.path().join(".gitignore"), "/.aethyme/\n").unwrap();
+    git(tmp.path(), &["add", "-A"]);
+    git(tmp.path(), &["commit", "-qm", "init"]);
+    let mut broker = Broker::open(tmp.path()).unwrap();
+    let session = broker.start_worktree("slow finish check", None).unwrap();
+    let worktree = std::path::PathBuf::from(&session.worktree_path);
+    let session_id = session.id;
+    drop(broker);
+
+    let original_path = std::env::var_os("PATH").unwrap();
+    let real_git = std::env::split_paths(&original_path)
+        .map(|directory| directory.join("git"))
+        .find(|candidate| candidate.is_file())
+        .expect("the test host has git on PATH");
+    let bin = tmp.path().join("slow-git-bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let shim = bin.join("git");
+    std::fs::write(
+        &shim,
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = status ] && [ \"$PWD\" = \"$AETHYME_TEST_SLOW_WORKTREE\" ]; then exec /bin/sleep 5; fi\nexec \"$AETHYME_TEST_REAL_GIT\" \"$@\"\n"
+        ),
+    )
+    .unwrap();
+    let mut permissions = std::fs::metadata(&shim).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&shim, permissions).unwrap();
+    let mut paths = vec![bin];
+    paths.extend(std::env::split_paths(&original_path));
+    let path = std::env::join_paths(paths).unwrap();
+    let session_arg = session_id.to_string();
+    let output = Command::new(CLI)
+        .args(["finish", "--session", &session_arg, "--timeout", "1"])
+        .current_dir(tmp.path())
+        .env("PATH", path)
+        .env("AETHYME_TEST_REAL_GIT", real_git)
+        .env("AETHYME_TEST_SLOW_WORKTREE", &worktree)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("finish timed out after 1s"), "{stderr}");
+    assert!(stderr.contains("git status"), "{stderr}");
+    assert!(stderr.contains("broker status --json"), "{stderr}");
+
+    let store = aethyme_broker::BrokerStore::open_in_repo(tmp.path()).unwrap();
+    assert_eq!(store.session(session_id).unwrap().status.as_str(), "active");
+    assert!(worktree.exists());
+}
+
 #[test]
 fn finish_cli_text_summarizes_the_structured_handoff() {
     let (tmp, session_id, worktree, _) = promoted_fixture();

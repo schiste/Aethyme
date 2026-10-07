@@ -1408,14 +1408,26 @@ pub(super) fn run_finish(parsed: Parsed) -> Result<(), UsageError> {
         .session
         .ok_or(UsageError::Message("finish requires --session <id>".into()))?;
     let abandon_reason = abandon_reason(&parsed)?;
-    let mut broker = open_broker(parsed.read_only_snapshot)?;
-    let options = crate::FinishOptions {
-        keep_worktree: parsed.keep_worktree,
-    };
-    let report = match abandon_reason {
-        Some(reason) => broker.finish_abandoning_unpushed(session, options, reason)?,
-        None => broker.finish_with_options(session, options)?,
-    };
+    let timeout_seconds = parsed.timeout_seconds.unwrap_or(10);
+    if !(1..=86_400).contains(&timeout_seconds) {
+        return Err(UsageError::Message(
+            "finish --timeout must be between 1 and 86400 seconds".into(),
+        ));
+    }
+    let report = crate::git::with_git_deadline(
+        std::time::Duration::from_secs(timeout_seconds),
+        || -> Result<_, UsageError> {
+            let mut broker = open_broker(parsed.read_only_snapshot)?;
+            let options = crate::FinishOptions {
+                keep_worktree: parsed.keep_worktree,
+            };
+            Ok(match abandon_reason {
+                Some(reason) => broker.finish_abandoning_unpushed(session, options, reason)?,
+                None => broker.finish_with_options(session, options)?,
+            })
+        },
+    )
+    .map_err(|error| finish_timeout_error(error, timeout_seconds, session))?;
     if parsed.json {
         out!("{}", serde_json::to_string_pretty(&report)?);
     } else {
@@ -1425,6 +1437,17 @@ pub(super) fn run_finish(parsed: Parsed) -> Result<(), UsageError> {
         }
     }
     Ok(())
+}
+
+fn finish_timeout_error(error: UsageError, timeout_seconds: u64, session: i64) -> UsageError {
+    let message = match error {
+        UsageError::Message(message) if message.contains("did not finish within") => message,
+        UsageError::Exit { message, .. } if message.contains("did not finish within") => message,
+        other => return other,
+    };
+    UsageError::Message(format!(
+        "finish timed out after {timeout_seconds}s while checking Git ({message}); inspect `aethyme broker status --json` before retrying, and inspect `aethyme broker handoff --session {session}` if the session is already closed"
+    ))
 }
 
 /// `--abandon --reason` as one decision: abandoning unpushed work without

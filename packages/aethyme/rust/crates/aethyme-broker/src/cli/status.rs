@@ -153,6 +153,35 @@ pub(super) fn run_status(parsed: Parsed) -> Result<(), UsageError> {
         out!("Summary: {}", status.summary.message);
         out!();
         render_status_advice(&status.advice);
+        let lease_waiters: Vec<_> = status
+            .lease_release_requests
+            .iter()
+            .filter(|request| request.state == crate::lease_requests::RequestState::Pending)
+            .collect();
+        if !lease_waiters.is_empty() {
+            out!();
+            out!(
+                "Lease waiters: {} pending release requests",
+                lease_waiters.len()
+            );
+            for request in lease_waiters.iter().take(10) {
+                let waited = now_ms().saturating_sub(request.requested_at).max(0) as u64 / 1_000;
+                out!(
+                    "  request {}: session {} waiting for {} held by session {} ({} ago)",
+                    request.request_id,
+                    request.requester_session_id,
+                    request.path,
+                    request.holder_session_id,
+                    crate::operations::humanize_duration(waited)
+                );
+            }
+            if lease_waiters.len() > 10 {
+                out!(
+                    "  and {} more pending lease waiters",
+                    lease_waiters.len() - 10
+                );
+            }
+        }
         if !status.outstanding_advisories.is_empty() {
             out!();
             out!(
@@ -216,10 +245,12 @@ pub(super) fn run_status(parsed: Parsed) -> Result<(), UsageError> {
                 .iter()
                 .filter(|operation| operation.holding_lock)
                 .count();
+            let waiters = status.coordinated_operations.len().saturating_sub(holders);
             out!(
-                "Coordinated operations: {} unresolved, {} holding a write lock",
+                "Coordinated operations: {} unresolved, {} holding a write lock, {} waiting",
                 status.coordinated_operations.len(),
-                holders
+                holders,
+                waiters
             );
             for operation in status.coordinated_operations.iter().take(10) {
                 let role = if operation.holding_lock {
@@ -231,7 +262,7 @@ pub(super) fn run_status(parsed: Parsed) -> Result<(), UsageError> {
                     }
                 };
                 out!(
-                    "  op {:<6} sess {:<4} {:<7} {:<28} {:<9} {:>8}  {} :: {}",
+                    "  op {:<6} sess {:<4} {:<7} lock {:<28} {:<9} {:>8}  {} :: {}",
                     operation.id,
                     operation.session_id,
                     operation.provider,

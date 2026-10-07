@@ -4,7 +4,8 @@
 //! as in `lease_liveness_cli`, so killing one is a holder going away.
 
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output};
+use std::process::{Child, Command, Output, Stdio};
+use std::time::Duration;
 
 mod common;
 
@@ -141,6 +142,31 @@ impl Fixture {
     }
 
     /// `leases wait` as `agent`: the exit code and the reported outcome.
+    fn start_wait(&self, agent: &str, session: i64, timeout: &str) -> Child {
+        let session = session.to_string();
+        common::broker_cli(
+            CLI,
+            &[
+                "advanced",
+                "leases",
+                "wait",
+                PATH,
+                "--session",
+                &session,
+                "--timeout",
+                timeout,
+                "--json",
+            ],
+        )
+        .current_dir(&self.repo)
+        .env("AETHYME_HOST_STATE_DIR", &self.host)
+        .env("AETHYME_AGENT_PID", agent)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap()
+    }
+
     fn wait(&self, agent: &str, session: i64, timeout: &str) -> (Option<i32>, String) {
         let output = self.run_as(
             agent,
@@ -216,6 +242,15 @@ fn the_holder_sees_the_request_and_an_ack_releases_the_path() {
             .any(|row| row["request_id"] == id && row["state"] == "pending"),
         "{status}"
     );
+    let human = fx.run_as("0", &["status"]);
+    assert!(human.status.success());
+    let human = String::from_utf8_lossy(&human.stdout);
+    assert!(
+        human.contains(&format!(
+            "session {asking} waiting for {PATH} held by session {holding}"
+        )),
+        "status must show the current lease waiter and holder; got:\n{human}"
+    );
 
     let acked = fx.json_as(
         &holder.pid(),
@@ -253,6 +288,47 @@ fn the_holder_sees_the_request_and_an_ack_releases_the_path() {
     assert_eq!(
         fx.wait(&requester.pid(), asking, "5"),
         (Some(0), "released".into())
+    );
+}
+
+#[test]
+fn a_wait_reports_the_lease_holder_after_two_seconds() {
+    let fx = fixture(VERIFY_ONLY);
+    let (holder, requester) = (Agent::spawn(), Agent::spawn());
+    let holding = fx.holder_as(&holder.pid());
+    let asking = fx.start_as(&requester.pid(), "asker");
+    fx.request(&requester.pid(), asking);
+
+    let mut waiter = fx.start_wait(&requester.pid(), asking, "10");
+    let stderr = waiter.stderr.take().unwrap();
+    let (send, receive) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        use std::io::BufRead as _;
+        for line in std::io::BufReader::new(stderr).lines() {
+            let Ok(line) = line else { break };
+            if send.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    let progress = receive
+        .recv_timeout(Duration::from_secs(8))
+        .expect("a long lease wait should emit progress within eight seconds");
+    let _ = waiter.kill();
+    let _ = waiter.wait_with_output().unwrap();
+    reader.join().unwrap();
+    assert!(
+        progress.contains("[coordination] still waiting for lease"),
+        "{progress}"
+    );
+    assert!(
+        progress.contains(&format!("holder session {holding}")),
+        "{progress}"
+    );
+    assert!(progress.contains(PATH), "{progress}");
+    assert!(
+        progress.contains("lease age") && progress.contains("waited"),
+        "{progress}"
     );
 }
 
