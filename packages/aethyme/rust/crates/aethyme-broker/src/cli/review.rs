@@ -66,16 +66,19 @@ pub(super) fn run_review_plan(parsed: Parsed) -> Result<(), UsageError> {
     // lifecycle transition this is, and says so in `assumptions` rather than
     // presenting a guess as a reading. `review run` derives all of this for
     // real.
-    let facts = crate::ChangeFacts {
+    let mut facts = crate::ChangeFacts {
         trigger: Some(crate::ReviewTrigger::PullRequestOpened),
         paths: paths.clone(),
         authored_by_model: classification.model.clone(),
         classification: classification.clone(),
         from_fork: false,
         first_time_contributor: false,
+        change: None,
     };
     let change = classify_local_change(&change_root, &root, &base, &facts, &classification_policy)?;
+    facts.change = Some(change.clone());
     let eligible = crate::eligible_types(&trigger, &facts);
+    let rule_actions = crate::rule_actions(&trigger, &facts, &eligible);
     let head = git_output(&change_root, &["rev-parse", "HEAD"])?
         .trim()
         .to_string();
@@ -130,6 +133,8 @@ pub(super) fn run_review_plan(parsed: Parsed) -> Result<(), UsageError> {
             detail: None,
         })
         .collect();
+    let mut reviews = reviews;
+    reviews.extend(auto_waived_reviews(&rule_actions));
     let projection = crate::ReviewProjection {
         head: Some(head.clone()),
         reviews,
@@ -137,6 +142,7 @@ pub(super) fn run_review_plan(parsed: Parsed) -> Result<(), UsageError> {
         conflicts: Vec::new(),
         quality_report: None,
         change: Some(change.clone()),
+        rule_labels: rule_labels(&rule_actions),
     };
     let projection_actions = crate::project(
         &projection_policy,
@@ -156,6 +162,7 @@ pub(super) fn run_review_plan(parsed: Parsed) -> Result<(), UsageError> {
         "changed_paths": paths.len(),
         "classification": classification,
         "change": change,
+        "rule_actions": rule_actions,
         "trigger_enabled": trigger.enabled,
         "routing_enabled": routing.enabled,
         "projection_enabled": projection_policy.enabled,
@@ -398,6 +405,7 @@ pub(super) fn gather_change_facts(
                 classification,
                 from_fork: false,
                 first_time_contributor: false,
+                change: None,
             },
             None,
         );
@@ -414,6 +422,7 @@ pub(super) fn gather_change_facts(
         first_time_contributor: crate::first_time_contributor(
             snapshot.author_association.as_deref(),
         ),
+        change: None,
     };
     (facts, Some(snapshot))
 }
@@ -693,7 +702,7 @@ pub(super) fn run_review_run(parsed: Parsed) -> Result<serde_json::Value, UsageE
         .store()
         .pull_request_observation(&repository, pull_request)
         .map_err(to_usage)?;
-    let (facts, snapshot) = gather_change_facts(
+    let (mut facts, snapshot) = gather_change_facts(
         &root,
         &repository,
         pull_request,
@@ -712,7 +721,9 @@ pub(super) fn run_review_run(parsed: Parsed) -> Result<serde_json::Value, UsageE
         ),
         None => classify_local_change(&change_root, &root, &base, &facts, &classification_policy)?,
     };
+    facts.change = Some(change.clone());
     let eligible = crate::eligible_types(&trigger, &facts);
+    let rule_actions = crate::rule_actions(&trigger, &facts, &eligible);
     // The provider's answer first: on a sweep there is no local checkout of
     // this pull request's base to resolve. Falling back to the local ref keeps
     // an agent routing its own branch working without `gh`, and `None` --
@@ -795,6 +806,8 @@ pub(super) fn run_review_run(parsed: Parsed) -> Result<serde_json::Value, UsageE
             }
         })
         .collect();
+    let mut reviews = reviews;
+    reviews.extend(auto_waived_reviews(&rule_actions));
     let projection_actions = crate::project(
         &projection_policy,
         &crate::ReviewProjection {
@@ -804,6 +817,7 @@ pub(super) fn run_review_run(parsed: Parsed) -> Result<serde_json::Value, UsageE
             conflicts: Vec::new(),
             quality_report: None,
             change: Some(change.clone()),
+            rule_labels: rule_labels(&rule_actions),
         },
         &pr_facts,
     );
@@ -822,6 +836,36 @@ pub(super) fn run_review_run(parsed: Parsed) -> Result<serde_json::Value, UsageE
             facts.trigger,
             false,
         ));
+    }
+
+    // Automatic waivers (#584) are recorded through the same ledger write as
+    // `review waive`, bound to this head, before anything is projected that
+    // shows them. One already written at this head is left alone, and a
+    // satisfied review is never replaced by an excuse.
+    for planned in &rule_actions.waivers {
+        if crate::waiver_for(&reconciled, &planned.review_type, &head).is_some() {
+            continue;
+        }
+        if let Some(existing) = broker
+            .store()
+            .latest_review_request(&repository, pull_request, &planned.review_type, Some(&head))
+            .map_err(to_usage)?
+            && existing.state == crate::ReviewRequestState::Satisfied
+        {
+            continue;
+        }
+        let waiver = crate::ReviewWaiver::new(Some(&auto_waiver_author(planned)), &planned.reason);
+        broker
+            .store()
+            .waive_review_request(
+                &repository,
+                pull_request,
+                &planned.review_type,
+                &head,
+                &waiver.detail(),
+                now_ms(),
+            )
+            .map_err(to_usage)?;
     }
 
     // Record before performing. See `review_execution`'s module comment: a
@@ -1953,4 +1997,35 @@ fn classify_with(
             declared_risk: facts.classification.risk.clone(),
         },
     )
+}
+
+/// Who an automatic waiver names: the rule, never a person.
+fn auto_waiver_author(planned: &crate::PlannedWaiver) -> String {
+    format!("aethyme review rule `{}`", planned.rule)
+}
+
+/// Each automatic waiver as the pull request shows it.
+fn auto_waived_reviews(actions: &crate::RuleActions) -> Vec<crate::ProjectedReview> {
+    actions
+        .waivers
+        .iter()
+        .map(|planned| crate::ProjectedReview {
+            review_type: planned.review_type.clone(),
+            state: crate::ProjectedReviewState::Waived,
+            detail: Some(format!(
+                "{}: {}",
+                auto_waiver_author(planned),
+                planned.reason
+            )),
+        })
+        .collect()
+}
+
+/// The labels matching rules asked for, in rule order.
+fn rule_labels(actions: &crate::RuleActions) -> Vec<String> {
+    actions
+        .labels
+        .iter()
+        .map(|label| label.label.clone())
+        .collect()
 }

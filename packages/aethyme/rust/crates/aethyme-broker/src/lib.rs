@@ -515,10 +515,11 @@ pub use review_report::{
     REVIEW_REPORTING_SCHEMA_VERSION, ReviewReportingError, ReviewReportingPolicy, ReviewSeverity,
 };
 pub use review_trigger::{
-    ChangeFacts, ClassificationConflict, CommitClassification, EligibleReview,
-    REVIEW_TRIGGER_SCHEMA_VERSION, ReviewFreshness, ReviewSchedule, ReviewSpend, ReviewTrigger,
-    ReviewTriggerDecision, ReviewTriggerError, ReviewTriggerPolicy, ReviewTriggerRule,
-    classification_conflicts, decide, eligible_types, parse_classification, schedule,
+    AUTO_WAIVE_GUARDED_SIGNALS, ChangeFacts, ClassificationConflict, CommitClassification,
+    EligibleReview, PlannedWaiver, REVIEW_TRIGGER_SCHEMA_VERSION, RefusedWaiver, ReviewFreshness,
+    ReviewSchedule, ReviewSpend, ReviewTrigger, ReviewTriggerDecision, ReviewTriggerError,
+    ReviewTriggerPolicy, ReviewTriggerRule, RuleActions, RuleLabel, classification_conflicts,
+    decide, eligible_types, parse_classification, rule_actions, schedule,
 };
 pub use schema::{EVENTS_SCHEMA_VERSION, SCHEMA_VERSION};
 pub use scopes::{
