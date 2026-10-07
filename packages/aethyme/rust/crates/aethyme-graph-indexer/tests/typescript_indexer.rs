@@ -3,7 +3,7 @@
 use aethyme_graph_indexer::{
     IndexerContext, LanguageIndexer, TypeScriptIndexer, WalkOptions, index_repo_to_disk,
 };
-use aethyme_graph_schema::NodeKind;
+use aethyme_graph_schema::{EdgeKind, NodeKind};
 use aethyme_graph_storage::read_fragment;
 
 fn write(root: &std::path::Path, rel: &str, content: &[u8]) {
@@ -71,6 +71,93 @@ fn extracts_static_method_marked_as_is_static() {
         .unwrap();
     let json = serde_json::to_string(method).unwrap();
     assert!(json.contains("\"is_static\":true"));
+}
+
+#[test]
+fn emits_calls_for_indexed_functions_and_methods_without_nested_attribution() {
+    let result = index_source(
+        "src/calls.ts",
+        "function helper() {}
+         function run() {
+           helper();
+           helper();
+           new Widget();
+           receiver.method();
+           this.ignored();
+           receiver[key]();
+           const callback = () => nested();
+           function nested() { helper(); }
+           class Local { method() { helper(); } }
+         }
+         class Runner { run() { helper(); } }
+",
+    );
+
+    let function_run = result
+        .additional_nodes
+        .iter()
+        .find(|node| node.kind() == NodeKind::Function && node.name() == Some("run"))
+        .expect("top-level run function");
+    let run_calls: Vec<_> = result
+        .additional_edges
+        .iter()
+        .filter(|edge| edge.kind() == EdgeKind::Calls && edge.src_id() == function_run.id())
+        .collect();
+    assert_eq!(
+        run_calls.len(),
+        3,
+        "helper, constructor, and static member call"
+    );
+
+    let call_name = |edge: &aethyme_graph_schema::Edge| {
+        result
+            .additional_nodes
+            .iter()
+            .find(|node| node.id() == edge.dst_id())
+            .and_then(|node| node.name())
+            .expect("call placeholder name")
+    };
+    let helper_edge = run_calls
+        .iter()
+        .find(|edge| call_name(edge) == "helper")
+        .expect("helper call edge");
+    assert_eq!(
+        helper_edge
+            .sites()
+            .iter()
+            .map(|site| site.line)
+            .collect::<Vec<_>>(),
+        vec![3, 4]
+    );
+    let constructor_edge = run_calls
+        .iter()
+        .find(|edge| call_name(edge) == "Widget")
+        .expect("constructor call edge");
+    assert_eq!(constructor_edge.sites()[0].kind_tag.as_ref(), "constructor");
+    assert!(
+        run_calls.iter().all(|edge| call_name(edge) != "nested"),
+        "calls in nested functions and arrows are not attributed to run"
+    );
+    assert!(
+        run_calls
+            .iter()
+            .all(|edge| call_name(edge) != "this.ignored"),
+        "instance-relative calls do not have a statically known target"
+    );
+
+    let method_run = result
+        .additional_nodes
+        .iter()
+        .find(|node| node.kind() == NodeKind::Method && node.name() == Some("run"))
+        .expect("class method run");
+    assert!(
+        result.additional_edges.iter().any(|edge| {
+            edge.kind() == EdgeKind::Calls
+                && edge.src_id() == method_run.id()
+                && call_name(edge) == "helper"
+        }),
+        "indexed methods emit calls owned by the method"
+    );
 }
 
 // ─── TS-specific kinds ──────────────────────────────────────────────

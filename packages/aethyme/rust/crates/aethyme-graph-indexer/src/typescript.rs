@@ -27,9 +27,10 @@
 //!   binding name; Phase 4.6 stage 1 — the linker resolves these
 //!   to concrete nodes when both ends of the import live in repo)
 //!
-//! Deferred for later commits: Calls edges (need scope
-//! resolution), arrow-function expressions assigned to variables,
-//! nested function declarations.
+//! Deferred for later commits: arrow-function expressions assigned to
+//! variables and nested function declarations. Calls in indexed functions
+//! and methods use syntax-only names; the linker leaves ambiguous targets
+//! unresolved.
 
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
@@ -50,6 +51,7 @@ use aethyme_graph_schema::{
 use crate::context::IndexerContext;
 use crate::filesystem::IndexedFile;
 use crate::language::{LanguageIndexError, LanguageIndexResult, LanguageIndexer, LineIndex};
+use crate::typescript_calls::{collect_calls, emit_call_placeholders};
 
 /// Indexer for `.ts`/`.tsx`/`.js`/`.jsx`/`.cjs`/`.mjs` files via oxc.
 ///
@@ -220,7 +222,18 @@ fn index_function(sink: &mut Sink<'_>, f: &OxcFunction) -> Result<(), LanguageIn
     if let Some(node) = build_function(sink.repo, sink.source_path, f, sink.line_index, true)? {
         let id = node.id().clone();
         sink.nodes.push(Node::Function(node));
-        sink.contains(id);
+        sink.contains(id.clone());
+        if let Some(body) = &f.body {
+            let calls = collect_calls(body, sink.line_index);
+            emit_call_placeholders(
+                sink.repo,
+                sink.source_path,
+                &id,
+                calls,
+                sink.nodes,
+                sink.edges,
+            )?;
+        }
     }
     Ok(())
 }
@@ -251,8 +264,19 @@ fn index_class(sink: &mut Sink<'_>, c: &Class) -> Result<(), LanguageIndexError>
             sink.edges.push(structural_edge(
                 EdgeAttributes::Defines,
                 class_id.clone(),
-                id,
+                id.clone(),
             ));
+            if let Some(body) = &m.value.body {
+                let calls = collect_calls(body, sink.line_index);
+                emit_call_placeholders(
+                    sink.repo,
+                    sink.source_path,
+                    &id,
+                    calls,
+                    sink.nodes,
+                    sink.edges,
+                )?;
+            }
         }
     }
     Ok(())
@@ -613,12 +637,10 @@ fn node_construction_err(e: impl std::fmt::Display) -> LanguageIndexError {
 // scoped package names and identifiers containing dots in JS
 // land.
 //
-// TypeScript's path resolution (`./x` → `<importing-dir>/x.ts`,
-// `@scope/pkg` → external) is the linker's responsibility;
-// today's linker does literal lookup and will leave TS imports
-// unresolved until that work lands. The stage-1 placeholders are
-// still valuable: they pin the *intent* of the import statement
-// into the graph for future resolution.
+// Relative TypeScript imports resolve against the importing file, with
+// extensionless and index module lookup handled by the linker.
+// Package aliases and external modules remain unresolved. The stage-1
+// placeholders still pin the intent of each import into the graph.
 
 fn emit_ts_import_placeholders(
     repo: &str,

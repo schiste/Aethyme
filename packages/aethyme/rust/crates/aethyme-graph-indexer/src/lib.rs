@@ -31,6 +31,7 @@ mod rust_calls;
 pub mod rust_lang;
 pub mod surface_flow;
 pub mod typescript;
+mod typescript_calls;
 
 pub use context::IndexerContext;
 pub use coverage::IndexCoverage;
