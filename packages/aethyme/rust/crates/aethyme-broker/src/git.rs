@@ -2004,6 +2004,13 @@ impl GitRepo {
             .collect())
         };
         let listed = side_commits(listed)?;
+        // A merged or fast-forwarded branch has nothing on the asked side.
+        // Listing the other side and hashing every patch on it -- every
+        // commit the default branch gained since the fork -- would answer a
+        // question with no commits to ask it about (#588).
+        if listed.is_empty() {
+            return Ok(Vec::new());
+        }
         let other = side_commits(other)?;
         let with_parent = listed
             .iter()
