@@ -4036,7 +4036,7 @@ fn passwd_home() -> Option<PathBuf> {
     Some(PathBuf::from(std::ffi::OsStr::from_bytes(dir.to_bytes())))
 }
 
-fn github_command() -> Command {
+pub(crate) fn github_command() -> Command {
     let program = gh_program()
         .cloned()
         .unwrap_or_else(|| PathBuf::from("/nonexistent/gh"));

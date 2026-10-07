@@ -532,7 +532,20 @@ fn first_blocked_report_templates_mixed_recorded_and_unrecorded_resolutions() {
     assert_eq!(template.recorded_evidence.len(), 1);
     assert_eq!(template.unrecorded_evidence.len(), 1);
     assert!(!template.unrecorded_evidence[0].content_empty);
-    assert_eq!(template.field_contract.unrecorded_dispositions.len(), 3);
+    assert_eq!(
+        template
+            .field_contract
+            .unrecorded_dispositions
+            .iter()
+            .map(|rule| rule.value.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "preserve_and_replay",
+            "replaced_by_exact_upstream_sha",
+            "drop_because_content_empty",
+            "tracked_elsewhere",
+        ]
+    );
 
     let placeholder_path = repo.join("placeholder-resolution.json");
     std::fs::write(

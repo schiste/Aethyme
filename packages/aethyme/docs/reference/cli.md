@@ -2136,10 +2136,13 @@ When automatic evidence correctly fails closed because landed work was later
 modified upstream, an operator can attest only the affected queue entries with
 a versioned resolution file. Schema 2 also requires one explicit disposition
 for every unrecorded integration SHA: `preserve_and_replay`,
-`replaced_by_exact_upstream_sha`, or `drop_because_content_empty`. Replacement
-must name one full SHA reachable from the bound upstream; dropping is accepted
-only when Git proves the commit tree is unchanged. There is deliberately no
-blanket discard option.
+`replaced_by_exact_upstream_sha`, `drop_because_content_empty`, or
+`tracked_elsewhere`. Replacement must name one full SHA reachable from the
+bound upstream; dropping is accepted only when Git proves the commit tree is
+unchanged. `tracked_elsewhere` names exactly one of `tracked_branch` or
+`pull_request` (open; read with `gh pr view`), and is accepted only when the
+remote reports that branch, its head is fetched, and the commit or an identical
+patch is reachable from it. There is deliberately no blanket discard option.
 
 The first blocked dry-run includes a `resolution_template` object in JSON. Its
 `document` is the complete schema-2 file: exact current refs, every unresolved
