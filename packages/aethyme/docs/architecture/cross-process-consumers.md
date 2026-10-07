@@ -38,6 +38,10 @@ consumer. This file exists so that doesn't happen again.
 
 ## Inventory
 
+### Primary-checkout fast-forward (#232)
+
+Before a normal-mode broker command runs from the primary checkout, the broker checks the current branch against its configured, already-fetched tracking ref. With no tracked or non-ignored untracked changes and no unique commits, a strictly-behind checkout advances by fast-forward and records `broker.checkout.fast_forwarded` with `trigger` (`broker.<command>`), `branch`, `upstream_ref`, `from` and `to`. This check does not fetch. Success prints `Updated main checkout: <branch> fast-forwarded from <from> to <to> (<upstream_ref>).` to stderr. Dirty, ahead, diverged, detached or unprovable states remain unchanged and print `warning: left the main checkout unchanged: <reason>. Run: <shell-quoted-command>` to stderr. Compatibility read-only snapshots and linked session worktrees are never moved; session worktrees use `broker sync --session <id>`. Standard output is unchanged, so JSON reports stay parseable.
+
 ### Skill template files (canonical sources, deployed by the `aethyme-enhance` crate)
 
 | Source | Deployed to | Invokes | Failure mode if entry point removed |
