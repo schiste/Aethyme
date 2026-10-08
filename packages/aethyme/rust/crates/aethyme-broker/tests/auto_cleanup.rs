@@ -455,15 +455,14 @@ fn removal_past_the_selection_deadline_defers_all_but_the_first() {
     let mut broker = Broker::open(&fx.repo).unwrap();
     let (_, first, _) = merged_closed_session(&fx, &mut broker, true);
     let (_, second, _) = merged_closed_session(&fx, &mut broker, true);
-    // Selection by ancestry is quick; the deadline then passes before
-    // removal, as it does when a broker open spent its budget selecting.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    // Removal finds the budget already spent, as it does when a broker open
+    // spent it selecting. Injected, so a loaded runner cannot race it.
     let plan = broker
-        .auto_cleanup_plan_now(Some(deadline))
+        .auto_cleanup_plan_now(None)
         .unwrap()
-        .unwrap();
-    assert_eq!(plan.selected_worktrees().len(), 2, "selection outran 2 s");
-    std::thread::sleep(deadline.saturating_duration_since(std::time::Instant::now()));
+        .unwrap()
+        .with_deadline(Some(std::time::Instant::now()));
+    assert_eq!(plan.selected_worktrees().len(), 2);
     let report = broker.auto_cleanup_apply_now(plan).unwrap().unwrap();
     assert_eq!(report.removed.len(), 1, "{report:#?}");
     assert_eq!(report.deferred, 1, "{report:#?}");

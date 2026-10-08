@@ -414,7 +414,8 @@ pub struct AutoCleanupReport {
     pub evaluated_at_ms: i64,
     pub removed: Vec<AutoRemovedCheckout>,
     pub kept: Vec<AutoKeptCheckout>,
-    /// Candidates whose deep proof the budget left for a later pass.
+    /// Candidates the budget left for a later pass: a deep proof it had no
+    /// time for, or a removal after the first once it was spent (#460).
     pub deferred: usize,
 }
 
@@ -468,6 +469,16 @@ impl AutoCleanupPlan {
             .iter()
             .map(|(candidate, _)| candidate.worktree.to_string_lossy().into_owned())
             .collect()
+    }
+
+    /// Replace the deadline removal honors.
+    ///
+    /// Production plans carry the selection's deadline. This hook lets tests
+    /// put removal past its budget without racing the wall clock.
+    #[doc(hidden)]
+    pub fn with_deadline(mut self, deadline: Option<Instant>) -> Self {
+        self.deadline = deadline;
+        self
     }
 }
 
