@@ -44,8 +44,8 @@ fn playground_bootstrap_indexes_docs_config_and_test_relationships() {
     let context = IndexerContext::new("playground-docs", &repository, "0.1.0").unwrap();
 
     let summary = index_repo_to_disk(&context, &WalkOptions::default()).unwrap();
-    assert_eq!(summary.total_files, 8);
-    assert_eq!(summary.counts_by_kind.get(&NodeKind::DocSection), Some(&3));
+    assert_eq!(summary.total_files, 9);
+    assert_eq!(summary.counts_by_kind.get(&NodeKind::DocSection), Some(&5));
     assert_eq!(summary.counts_by_kind.get(&NodeKind::ConfigValue), Some(&3));
     assert_eq!(
         summary.total_nodes,
@@ -61,6 +61,8 @@ fn playground_bootstrap_indexes_docs_config_and_test_relationships() {
     let api_section = node_id(&docs, NodeKind::DocSection, "API");
     let narrative_section = node_id(&docs, NodeKind::DocSection, "Narrative");
     let ambiguous_section = node_id(&docs, NodeKind::DocSection, "Ambiguous");
+    let wrong_qualifier_section = node_id(&docs, NodeKind::DocSection, "Wrong qualifier");
+    let heading_links_section = node_id(&docs, NodeKind::DocSection, "Heading links");
     assert!(
         docs.edges().iter().any(|edge| {
             edge.kind() == EdgeKind::Documents
@@ -80,6 +82,18 @@ fn playground_bootstrap_indexes_docs_config_and_test_relationships() {
             edge.kind() == EdgeKind::Documents && edge.src_id() == &ambiguous_section
         }),
         "ambiguous symbol names must remain unresolved"
+    );
+    assert!(
+        !docs.edges().iter().any(|edge| {
+            edge.kind() == EdgeKind::Documents && edge.src_id() == &wrong_qualifier_section
+        }),
+        "a qualified name must not resolve to a same-named symbol in another module"
+    );
+    assert!(
+        !docs.edges().iter().any(|edge| {
+            edge.kind() == EdgeKind::Documents && edge.src_id() == &heading_links_section
+        }),
+        "heading anchors on this page or another document are not symbols"
     );
 
     for (path, config_path, line) in [
@@ -124,6 +138,14 @@ fn playground_bootstrap_indexes_docs_config_and_test_relationships() {
         }),
         "a test function calling a uniquely resolved symbol should receive a Tests edge"
     );
+    let ts_tests = read_fragment(&repository, "web/client.test.ts").unwrap();
+    assert!(
+        ts_tests
+            .edges()
+            .iter()
+            .all(|edge| edge.kind() != EdgeKind::Tests),
+        "a TypeScript test calling `handle_request` does not test the Python function"
+    );
 
     let expected_source_bytes: u64 = [
         "README.md",
@@ -131,6 +153,7 @@ fn playground_bootstrap_indexes_docs_config_and_test_relationships() {
         "src/left.py",
         "src/right.py",
         "tests/test_handlers.py",
+        "web/client.test.ts",
         "config.yaml",
         "config.json",
         "config.toml",
@@ -176,5 +199,33 @@ fn playground_bootstrap_indexes_docs_config_and_test_relationships() {
     assert_eq!(
         first_run, second_run,
         "relationship fragments should be deterministic"
+    );
+}
+
+#[test]
+fn a_data_sized_configuration_file_adds_no_value_nodes() {
+    let (_temp, repository) = fixture_repo();
+    let entries: Vec<String> = (0..2_500)
+        .map(|index| format!("  \"key{index}\": \"value{index}\""))
+        .collect();
+    std::fs::write(
+        repository.join("data.json"),
+        format!("{{\n{}\n}}\n", entries.join(",\n")),
+    )
+    .unwrap();
+    let context = IndexerContext::new("playground-docs", &repository, "0.1.0").unwrap();
+
+    let summary = index_repo_to_disk(&context, &WalkOptions::default()).unwrap();
+
+    assert_eq!(
+        summary.counts_by_kind.get(&NodeKind::ConfigValue),
+        Some(&3),
+        "the 2,500-value data file is left out; the three real configuration values stay"
+    );
+    let data = read_fragment(&repository, "data.json").unwrap();
+    assert!(
+        data.nodes()
+            .iter()
+            .all(|node| node.kind() != NodeKind::ConfigValue)
     );
 }

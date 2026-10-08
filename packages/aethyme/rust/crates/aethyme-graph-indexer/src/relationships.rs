@@ -14,7 +14,10 @@ use aethyme_graph_storage::{Fragment, FragmentBuildError};
 use crate::filesystem::IndexedFile;
 use crate::pipeline::BuiltFragment;
 
-pub(crate) const MAX_NON_CODE_CONTENT_BYTES: u64 = 5 * 1024 * 1024;
+/// A configuration file with more scalars than this is data, not
+/// configuration (a lockfile, a fixture, a translation table). Its values are
+/// left out rather than turned into tens of thousands of graph nodes.
+const MAX_CONFIG_VALUES_PER_FILE: usize = 2_000;
 
 pub(crate) struct PendingNonCode {
     path: String,
@@ -25,8 +28,42 @@ pub(crate) struct PendingNonCode {
 
 struct PendingReference {
     source: NodeId,
-    target: String,
+    target: SymbolRef,
     attributes: EdgeAttributes,
+}
+
+/// A symbol name plus whatever the reference itself says about where the
+/// symbol lives. A qualified reference resolves only to a symbol that the
+/// qualifier really describes, never to whichever symbol shares the leaf name.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct SymbolRef {
+    name: String,
+    scope: Scope,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum Scope {
+    /// A bare name: any uniquely named symbol.
+    Any,
+    /// `module.name`, `module::name`, `Class.name`: the qualifier must be a
+    /// directory or file stem of the symbol's file, or a type declared there.
+    Qualifier(String),
+    /// `path/to/file.py#name`: the symbol must be declared in that file.
+    File(String),
+}
+
+impl SymbolRef {
+    fn any(name: &str) -> Self {
+        Self {
+            name: name.to_owned(),
+            scope: Scope::Any,
+        }
+    }
+}
+
+struct SymbolTarget {
+    id: NodeId,
+    path: Box<str>,
 }
 
 struct ConfigScalar {
@@ -62,19 +99,16 @@ pub(crate) fn index_non_code(
     };
     match indexed.language.as_ref() {
         "markdown" => add_markdown(repo, indexed, owner.id(), content, &mut pending),
-        "yaml" => {
-            for scalar in yaml_scalars(content) {
-                add_config(repo, indexed, owner.id(), scalar, &mut pending);
-            }
-        }
-        "json" => {
-            for scalar in json_scalars(content) {
-                add_config(repo, indexed, owner.id(), scalar, &mut pending);
-            }
-        }
-        "toml" => {
-            for scalar in toml_scalars(content) {
-                add_config(repo, indexed, owner.id(), scalar, &mut pending);
+        "yaml" | "json" | "toml" => {
+            let scalars = match indexed.language.as_ref() {
+                "yaml" => yaml_scalars(content),
+                "json" => json_scalars(content),
+                _ => toml_scalars(content),
+            };
+            if scalars.len() <= MAX_CONFIG_VALUES_PER_FILE {
+                for scalar in scalars {
+                    add_config(repo, indexed, owner.id(), scalar, &mut pending);
+                }
             }
         }
         _ => return None,
@@ -87,6 +121,7 @@ pub(crate) fn apply(
     pending: Vec<PendingNonCode>,
 ) -> Result<(), FragmentBuildError> {
     let symbols = unique_code_symbols(fragments);
+    let containers = container_names(fragments);
     let mut pending_by_path: BTreeMap<String, PendingNonCode> = pending
         .into_iter()
         .map(|item| (item.path.clone(), item))
@@ -102,10 +137,12 @@ pub(crate) fn apply(
             nodes.extend(item.nodes);
             edges.extend(item.edges);
             for reference in item.references {
-                if let Some(target) = symbols.get(&reference.target) {
+                if let Some(target) = symbols.get(&reference.target.name)
+                    && scope_matches(&reference.target.scope, target, &containers)
+                {
                     edges.push(derived_edge(
                         reference.source,
-                        target.clone(),
+                        target.id.clone(),
                         reference.attributes,
                     ));
                 }
@@ -143,9 +180,14 @@ pub(crate) fn apply(
                     let Some(target) = symbols.get(name) else {
                         continue;
                     };
+                    // A call resolves within its own language: a Python test
+                    // calling `render` does not test a TypeScript `render`.
+                    if language_family(&target.path) != language_family(&built.source_path) {
+                        continue;
+                    }
                     edges.push(derived_edge(
                         call.src_id().clone(),
-                        target.clone(),
+                        target.id.clone(),
                         EdgeAttributes::Tests {
                             assertion_count: None,
                         },
@@ -162,25 +204,91 @@ pub(crate) fn apply(
     Ok(())
 }
 
-fn unique_code_symbols(fragments: &[BuiltFragment]) -> HashMap<String, NodeId> {
-    let mut candidates: BTreeMap<String, Vec<NodeId>> = BTreeMap::new();
-    for node in fragments
-        .iter()
-        .flat_map(|built| built.fragment.nodes())
-        .filter(|node| is_code_symbol(node.kind()))
-    {
-        let Some(name) = node.name() else { continue };
-        let ids = candidates.entry(name.to_owned()).or_default();
-        if !ids.iter().any(|id| id == node.id()) {
-            ids.push(node.id().clone());
+fn unique_code_symbols(fragments: &[BuiltFragment]) -> HashMap<String, SymbolTarget> {
+    let mut candidates: BTreeMap<String, Vec<SymbolTarget>> = BTreeMap::new();
+    for built in fragments {
+        for node in built
+            .fragment
+            .nodes()
+            .iter()
+            .filter(|node| is_code_symbol(node.kind()))
+        {
+            let Some(name) = node.name() else { continue };
+            let targets = candidates.entry(name.to_owned()).or_default();
+            if !targets.iter().any(|target| &target.id == node.id()) {
+                targets.push(SymbolTarget {
+                    id: node.id().clone(),
+                    path: built.source_path.clone(),
+                });
+            }
         }
     }
     candidates
         .into_iter()
-        .filter_map(|(name, mut ids)| {
-            (ids.len() == 1).then(|| (name, ids.pop().expect("one candidate was checked")))
+        .filter_map(|(name, mut targets)| {
+            (targets.len() == 1).then(|| (name, targets.pop().expect("one candidate was checked")))
         })
         .collect()
+}
+
+/// Type-like names declared in each file, so `Class.method` can be checked
+/// against the file that declares `method`.
+fn container_names(fragments: &[BuiltFragment]) -> HashMap<Box<str>, HashSet<String>> {
+    fragments
+        .iter()
+        .map(|built| {
+            let names = built
+                .fragment
+                .nodes()
+                .iter()
+                .filter(|node| {
+                    matches!(
+                        node.kind(),
+                        NodeKind::Class
+                            | NodeKind::Struct
+                            | NodeKind::Trait
+                            | NodeKind::Interface
+                            | NodeKind::Enum
+                    )
+                })
+                .filter_map(|node| node.name().map(str::to_owned))
+                .collect();
+            (built.source_path.clone(), names)
+        })
+        .collect()
+}
+
+fn scope_matches(
+    scope: &Scope,
+    target: &SymbolTarget,
+    containers: &HashMap<Box<str>, HashSet<String>>,
+) -> bool {
+    match scope {
+        Scope::Any => true,
+        Scope::File(path) => target.path.as_ref() == path,
+        Scope::Qualifier(qualifier) => {
+            let mut components: Vec<&str> = target.path.split('/').collect();
+            if let Some(file) = components.pop() {
+                components.push(file.split('.').next().unwrap_or(file));
+            }
+            components.contains(&qualifier.as_str())
+                || containers
+                    .get(&target.path)
+                    .is_some_and(|names| names.contains(qualifier))
+        }
+    }
+}
+
+fn language_family(path: &str) -> &'static str {
+    let extension = path.rsplit_once('.').map_or("", |(_, extension)| extension);
+    match extension {
+        "py" | "pyi" => "python",
+        "ts" | "tsx" | "mts" | "cts" | "js" | "jsx" | "mjs" | "cjs" => "javascript",
+        "rs" => "rust",
+        "php" => "php",
+        "go" => "go",
+        _ => "other",
+    }
 }
 
 fn is_code_symbol(kind: NodeKind) -> bool {
@@ -253,7 +361,7 @@ fn add_markdown(
             Source::Structure,
             Confidence::FULL,
         ));
-        for target in section_references(&lines, heading.line, end) {
+        for target in section_references(&lines, heading.line, end, &indexed.source_path) {
             pending.references.push(PendingReference {
                 source: section_id.clone(),
                 target,
@@ -348,7 +456,12 @@ fn setext_heading(line: &str, underline: &str) -> Option<String> {
     Some(line.trim().to_owned())
 }
 
-fn section_references(lines: &[&str], start: u32, end: u32) -> BTreeSet<String> {
+fn section_references(
+    lines: &[&str],
+    start: u32,
+    end: u32,
+    document_path: &str,
+) -> BTreeSet<SymbolRef> {
     let mut references = BTreeSet::new();
     let mut fence = None;
     for line in lines
@@ -369,14 +482,14 @@ fn section_references(lines: &[&str], start: u32, end: u32) -> BTreeSet<String> 
         }
         for span in inline_code_spans(line) {
             for token in span.split_whitespace() {
-                if let Some(name) = doc_symbol_name(token) {
-                    references.insert(name);
+                if let Some(reference) = doc_symbol_ref(token) {
+                    references.insert(reference);
                 }
             }
         }
-        for anchor in markdown_link_anchors(line) {
-            if let Some(name) = doc_symbol_name(anchor) {
-                references.insert(name);
+        for (path, anchor) in markdown_link_targets(line) {
+            if let Some(reference) = linked_symbol_ref(document_path, path, anchor) {
+                references.insert(reference);
             }
         }
     }
@@ -424,8 +537,9 @@ fn inline_code_spans(line: &str) -> Vec<&str> {
     spans
 }
 
-fn markdown_link_anchors(line: &str) -> Vec<&str> {
-    let mut anchors = Vec::new();
+/// `(path, anchor)` for every `[text](path#anchor)` link on the line.
+fn markdown_link_targets(line: &str) -> Vec<(&str, &str)> {
+    let mut targets = Vec::new();
     let mut cursor = 0;
     while let Some(start) = line[cursor..].find("](") {
         let target_start = cursor + start + 2;
@@ -433,18 +547,71 @@ fn markdown_link_anchors(line: &str) -> Vec<&str> {
             break;
         };
         let target_end = target_start + relative_end;
-        if let Some((_, anchor)) = line[target_start..target_end].rsplit_once('#') {
-            let anchor = anchor.split_whitespace().next().unwrap_or(anchor);
-            if !anchor.is_empty() {
-                anchors.push(anchor);
-            }
+        let target = line[target_start..target_end]
+            .split_whitespace()
+            .next()
+            .unwrap_or_default();
+        if let Some((path, anchor)) = target.rsplit_once('#')
+            && !anchor.is_empty()
+        {
+            targets.push((path, anchor));
         }
         cursor = target_end + 1;
     }
-    anchors
+    targets
 }
 
-fn doc_symbol_name(raw: &str) -> Option<String> {
+/// A link names a symbol only when it points into a source file: an anchor on
+/// a document (`guide.md#usage`) or on the page itself (`#usage`) is a heading
+/// slug, not a symbol. The file is resolved against the linking document and
+/// must stay inside the repository.
+fn linked_symbol_ref(document_path: &str, path: &str, anchor: &str) -> Option<SymbolRef> {
+    if path.is_empty() || path.contains("://") || !is_identifier(anchor) {
+        return None;
+    }
+    let file = path.rsplit('/').next().unwrap_or(path);
+    let extension = file.rsplit_once('.').map(|(_, extension)| extension)?;
+    if matches!(
+        extension.to_ascii_lowercase().as_str(),
+        "md" | "markdown" | "mdx" | "html" | "htm" | "txt" | "rst" | "adoc"
+    ) {
+        return None;
+    }
+    let base = if let Some(rooted) = path.strip_prefix('/') {
+        resolve_repo_path("", rooted)?
+    } else {
+        let directory = document_path.rsplit_once('/').map_or("", |(dir, _)| dir);
+        resolve_repo_path(directory, path)?
+    };
+    Some(SymbolRef {
+        name: anchor.to_owned(),
+        scope: Scope::File(base),
+    })
+}
+
+/// Join `relative` onto `directory` and normalize `.` and `..`; `None` when the
+/// result would leave the repository.
+fn resolve_repo_path(directory: &str, relative: &str) -> Option<String> {
+    let mut parts: Vec<&str> = directory
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect();
+    for part in relative.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop()?;
+            }
+            part => parts.push(part),
+        }
+    }
+    (!parts.is_empty()).then(|| parts.join("/"))
+}
+
+/// A symbol reference from one inline-code token: `name`, `name()`,
+/// `module.name`, `module::name` or `Class.name`. A token that is a file path
+/// (`src/handlers.py`, `config.yaml`) names no symbol.
+fn doc_symbol_ref(raw: &str) -> Option<SymbolRef> {
     let token = raw.trim().trim_matches(|character: char| {
         matches!(
             character,
@@ -458,8 +625,62 @@ fn doc_symbol_name(raw: &str) -> Option<String> {
             '\x60' | '\'' | '"' | '(' | ')' | '[' | ']' | '{' | '}' | ',' | ';'
         )
     });
-    let leaf = token.rsplit(['#', '.', '/', '\\', ':']).next()?;
-    is_identifier(leaf).then(|| leaf.to_owned())
+    if token.contains('/') || token.contains('\\') || token.contains('#') || is_file_name(token) {
+        return None;
+    }
+    qualified_ref(token.split(['.', ':']).filter(|part| !part.is_empty()))
+}
+
+/// `README.md`, `config.yaml`, `main.rs`: a file name, not `module.symbol`.
+fn is_file_name(token: &str) -> bool {
+    token.rsplit_once('.').is_some_and(|(stem, extension)| {
+        !stem.is_empty()
+            && !stem.contains('.')
+            && matches!(
+                extension.to_ascii_lowercase().as_str(),
+                "md" | "markdown"
+                    | "txt"
+                    | "rst"
+                    | "yaml"
+                    | "yml"
+                    | "json"
+                    | "toml"
+                    | "ini"
+                    | "cfg"
+                    | "lock"
+                    | "py"
+                    | "pyi"
+                    | "rs"
+                    | "ts"
+                    | "tsx"
+                    | "js"
+                    | "jsx"
+                    | "mjs"
+                    | "cjs"
+                    | "php"
+                    | "go"
+                    | "sh"
+                    | "html"
+                    | "css"
+            )
+    })
+}
+
+/// The last segment is the name and the one before it, if any, its qualifier.
+/// Every segment must be an identifier.
+fn qualified_ref<'a>(segments: impl Iterator<Item = &'a str>) -> Option<SymbolRef> {
+    let segments: Vec<&str> = segments.collect();
+    if segments.is_empty() || !segments.iter().all(|segment| is_identifier(segment)) {
+        return None;
+    }
+    let name = segments[segments.len() - 1];
+    Some(match segments.len() {
+        1 => SymbolRef::any(name),
+        len => SymbolRef {
+            name: name.to_owned(),
+            scope: Scope::Qualifier(segments[len - 2].to_owned()),
+        },
+    })
 }
 
 fn is_identifier(value: &str) -> bool {
@@ -468,22 +689,35 @@ fn is_identifier(value: &str) -> bool {
         && characters.all(|character| character == '_' || character.is_ascii_alphanumeric())
 }
 
-fn config_target(value: &str) -> Option<String> {
+/// A configuration value names a symbol only when it is qualified:
+/// `package.module.name`, `module:name` or `path/to/module.py#name`. A bare
+/// word is a value, not a reference.
+fn config_target(value: &str) -> Option<SymbolRef> {
     let value = value.trim();
     if value.contains("://") {
         return None;
     }
     if let Some((path, anchor)) = value.rsplit_once('#') {
-        if !(path.contains('/') || path.contains('.')) {
+        if !(path.contains('/') || path.contains('.')) || !is_identifier(anchor) {
             return None;
         }
-        return is_identifier(anchor).then(|| anchor.to_owned());
+        // The module is the file stem of a path, or the last dotted segment.
+        let file = path.rsplit('/').next().unwrap_or(path);
+        let module = if path.contains('/') {
+            file.split('.').next().unwrap_or(file)
+        } else {
+            file.rsplit('.').next().unwrap_or(file)
+        };
+        if !is_identifier(module) {
+            return None;
+        }
+        return Some(SymbolRef {
+            name: anchor.to_owned(),
+            scope: Scope::Qualifier(module.to_owned()),
+        });
     }
-    let parts: Vec<&str> = value.split('.').collect();
-    if parts.len() < 2 || !parts.iter().all(|part| is_identifier(part)) {
-        return None;
-    }
-    parts.last().map(|part| (*part).to_owned())
+    let reference = qualified_ref(value.split(['.', ':']).filter(|part| !part.is_empty()))?;
+    matches!(reference.scope, Scope::Qualifier(_)).then_some(reference)
 }
 
 fn add_config(
@@ -920,7 +1154,33 @@ fn is_test_function(name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{config_target, markdown_headings, section_references, yaml_scalars};
+    use std::collections::{HashMap, HashSet};
+
+    use super::{
+        Scope, SymbolRef, SymbolTarget, config_target, language_family, markdown_headings,
+        scope_matches, section_references, yaml_scalars,
+    };
+    use aethyme_graph_schema::NodeId;
+
+    fn qualified(name: &str, qualifier: &str) -> SymbolRef {
+        SymbolRef {
+            name: name.to_owned(),
+            scope: Scope::Qualifier(qualifier.to_owned()),
+        }
+    }
+
+    fn in_file(name: &str, path: &str) -> SymbolRef {
+        SymbolRef {
+            name: name.to_owned(),
+            scope: Scope::File(path.to_owned()),
+        }
+    }
+
+    fn references(document: &str, lines: &[&str]) -> Vec<SymbolRef> {
+        section_references(lines, 1, lines.len() as u32, document)
+            .into_iter()
+            .collect()
+    }
 
     #[test]
     fn markdown_only_links_explicit_code_and_fragment_references() {
@@ -938,8 +1198,51 @@ mod tests {
         assert_eq!(headings.len(), 1);
         assert_eq!(headings[0].title, "API");
         assert_eq!(
-            section_references(&lines, 1, lines.len() as u32),
-            ["handle_request".to_owned()].into_iter().collect()
+            references("README.md", &lines),
+            vec![
+                SymbolRef::any("handle_request"),
+                in_file("handle_request", "src/handlers.py"),
+            ]
+        );
+    }
+
+    #[test]
+    fn markdown_heading_anchors_and_paths_are_not_symbols() {
+        let lines = [
+            "See [usage](#usage), [the guide](guide.md#install) and",
+            "[a page](https://example.test/x.py#run).",
+            "Files: \x60src/handlers.py\x60 and \x60config.yaml\x60.",
+        ];
+        assert_eq!(references("docs/README.md", &lines), Vec::new());
+    }
+
+    #[test]
+    fn markdown_links_resolve_against_the_document_and_stay_in_the_repository() {
+        assert_eq!(
+            references("docs/api/README.md", &["[x](../../src/app.py#run)"]),
+            vec![in_file("run", "src/app.py")]
+        );
+        assert_eq!(
+            references("docs/README.md", &["[x](/src/app.py#run)"]),
+            vec![in_file("run", "src/app.py")]
+        );
+        assert_eq!(
+            references("docs/README.md", &["[x](../../outside.py#run)"]),
+            Vec::new()
+        );
+    }
+
+    #[test]
+    fn markdown_qualified_code_keeps_its_qualifier() {
+        assert_eq!(
+            references(
+                "README.md",
+                &["Use \x60handlers.handle_request\x60 or \x60Server::start\x60."]
+            ),
+            vec![
+                qualified("handle_request", "handlers"),
+                qualified("start", "Server")
+            ]
         );
     }
 
@@ -963,14 +1266,75 @@ mod tests {
     fn config_links_require_qualified_names() {
         assert_eq!(
             config_target("src.handlers#handle_request"),
-            Some("handle_request".to_owned())
+            Some(qualified("handle_request", "handlers"))
+        );
+        assert_eq!(
+            config_target("src/handlers.py#handle_request"),
+            Some(qualified("handle_request", "handlers"))
         );
         assert_eq!(
             config_target("app.handlers.handle_request"),
-            Some("handle_request".to_owned())
+            Some(qualified("handle_request", "handlers"))
+        );
+        assert_eq!(
+            config_target("app.handlers:handle_request"),
+            Some(qualified("handle_request", "handlers"))
         );
         assert_eq!(config_target("handle_request"), None);
+        assert_eq!(
+            config_target("example.com"),
+            Some(qualified("com", "example"))
+        );
+        assert_eq!(config_target("1.2.3"), None);
         assert_eq!(config_target("https://example.test/#handle_request"), None);
+    }
+
+    #[test]
+    fn a_qualifier_must_describe_the_symbol_it_resolves_to() {
+        let target = SymbolTarget {
+            id: NodeId::new(
+                aethyme_graph_schema::NodeKind::Function,
+                "repo",
+                "src/app/handlers.py",
+                "handle_request",
+            )
+            .unwrap(),
+            path: "src/app/handlers.py".into(),
+        };
+        let mut containers: HashMap<Box<str>, HashSet<String>> = HashMap::new();
+        containers.insert(
+            "src/app/handlers.py".into(),
+            ["Router".to_owned()].into_iter().collect(),
+        );
+        for (scope, expected) in [
+            (Scope::Any, true),
+            (Scope::Qualifier("handlers".to_owned()), true),
+            (Scope::Qualifier("app".to_owned()), true),
+            (Scope::Qualifier("Router".to_owned()), true),
+            (Scope::Qualifier("billing".to_owned()), false),
+            (Scope::Qualifier("py".to_owned()), false),
+            (Scope::File("src/app/handlers.py".to_owned()), true),
+            (Scope::File("src/handlers.py".to_owned()), false),
+        ] {
+            assert_eq!(
+                scope_matches(&scope, &target, &containers),
+                expected,
+                "{scope:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn languages_group_by_runtime() {
+        assert_eq!(language_family("tests/test_app.py"), "python");
+        assert_eq!(
+            language_family("web/app.test.tsx"),
+            language_family("web/app.js")
+        );
+        assert_ne!(
+            language_family("tests/test_app.py"),
+            language_family("web/app.ts")
+        );
     }
 
     #[test]

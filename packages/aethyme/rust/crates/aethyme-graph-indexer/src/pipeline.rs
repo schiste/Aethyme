@@ -205,28 +205,23 @@ pub fn index_repo_to_disk_with(
                 IndexRepoError,
             > {
                 let language_indexer = registry.get(&indexed.language);
-                let needs_relationship_content = relationships::should_read(indexed);
-                let needs_content = language_indexer.is_some()
-                    || surface_flow::should_scan(indexed)
-                    || needs_relationship_content;
+                // The walker already skipped files above the size limit, so
+                // every file reaching here is bounded.
+                let needs_parse = language_indexer.is_some() || surface_flow::should_scan(indexed);
+                let needs_content = needs_parse || relationships::should_read(indexed);
                 let mut read_error = None;
                 let content = if needs_content {
                     let abs = ctx.repo_root().join(&*indexed.source_path);
-                    let max_relationship_bytes = options
-                        .max_file_size_bytes
-                        .unwrap_or(relationships::MAX_NON_CODE_CONTENT_BYTES);
-                    let relationship_content_too_large = needs_relationship_content
-                        && std::fs::metadata(&abs)
-                            .is_ok_and(|metadata| metadata.len() > max_relationship_bytes);
-                    if relationship_content_too_large {
-                        None
-                    } else {
-                        match std::fs::read_to_string(&abs) {
-                            Ok(content) => Some(content),
-                            Err(error) => {
+                    match std::fs::read_to_string(&abs) {
+                        Ok(content) => Some(content),
+                        // A document read only for its links (say, a
+                        // non-UTF-8 Markdown file) is simply left unlinked;
+                        // it is not a coverage failure.
+                        Err(error) => {
+                            if needs_parse {
                                 read_error = Some(error.to_string());
-                                None
                             }
+                            None
                         }
                     }
                 } else {
