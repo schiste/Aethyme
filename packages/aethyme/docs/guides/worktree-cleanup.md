@@ -48,6 +48,11 @@ candidate. Branch deletion still needs independent ownership and delivery
 proof. The storage plan is read-only with respect to session and branch state;
 its digest authorizes only the listed filesystem candidates.
 
+This output is schema version `3`. The summary reports the counts of
+ledger-owned branch refs, unclaimed agent refs, and valid roots whose branch
+inventory is incomplete. These counts describe refs visible in each inspected
+storage root; they are not deletion candidates or proof of delivery.
+
 For one repository, the audit answers the same question by content and against
 a named target:
 
