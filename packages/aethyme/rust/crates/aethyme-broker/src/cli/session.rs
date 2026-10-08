@@ -1414,13 +1414,17 @@ pub(super) fn run_finish(parsed: Parsed) -> Result<(), UsageError> {
             "finish --timeout must be between 1 and 86400 seconds".into(),
         ));
     }
+    // Open outside the deadline: opening runs host-wide maintenance (the
+    // autonomous artifact sweep) whose cost depends on every repository on the
+    // machine, not on this session, and would otherwise spend the budget
+    // before the first finish check runs.
+    let mut broker = open_broker(parsed.read_only_snapshot)?;
+    let options = crate::FinishOptions {
+        keep_worktree: parsed.keep_worktree,
+    };
     let report = crate::git::with_git_deadline(
         std::time::Duration::from_secs(timeout_seconds),
         || -> Result<_, UsageError> {
-            let mut broker = open_broker(parsed.read_only_snapshot)?;
-            let options = crate::FinishOptions {
-                keep_worktree: parsed.keep_worktree,
-            };
             Ok(match abandon_reason {
                 Some(reason) => broker.finish_abandoning_unpushed(session, options, reason)?,
                 None => broker.finish_with_options(session, options)?,

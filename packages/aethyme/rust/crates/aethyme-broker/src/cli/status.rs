@@ -245,7 +245,13 @@ pub(super) fn run_status(parsed: Parsed) -> Result<(), UsageError> {
                 .iter()
                 .filter(|operation| operation.holding_lock)
                 .count();
-            let waiters = status.coordinated_operations.len().saturating_sub(holders);
+            // Only a prepared row is queued for the lock; an `outcome_unknown`
+            // row waits on reconciliation, not on the holder.
+            let waiters = status
+                .coordinated_operations
+                .iter()
+                .filter(|operation| !operation.holding_lock && operation.status == "prepared")
+                .count();
             out!(
                 "Coordinated operations: {} unresolved, {} holding a write lock, {} waiting",
                 status.coordinated_operations.len(),

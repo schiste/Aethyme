@@ -210,6 +210,69 @@ fn finish_reports_a_bounded_git_timeout_before_closing_the_session() {
     assert!(worktree.exists());
 }
 
+#[cfg(unix)]
+#[test]
+fn finish_timeout_does_not_kill_worktree_removal_after_the_session_closes() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = tempfile::tempdir().unwrap();
+    git(tmp.path(), &["init", "-q", "-b", "main"]);
+    std::fs::write(tmp.path().join("README.md"), "fixture\n").unwrap();
+    std::fs::write(tmp.path().join(".gitignore"), "/.aethyme/\n").unwrap();
+    git(tmp.path(), &["add", "-A"]);
+    git(tmp.path(), &["commit", "-qm", "init"]);
+    let mut broker = Broker::open(tmp.path()).unwrap();
+    let session = broker
+        .start_worktree("slow worktree removal", None)
+        .unwrap();
+    let worktree = std::path::PathBuf::from(&session.worktree_path);
+    let session_id = session.id;
+    drop(broker);
+
+    let original_path = std::env::var_os("PATH").unwrap();
+    let real_git = std::env::split_paths(&original_path)
+        .map(|directory| directory.join("git"))
+        .find(|candidate| candidate.is_file())
+        .expect("the test host has git on PATH");
+    let bin = tmp.path().join("slow-remove-bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let shim = bin.join("git");
+    // Removal outlasts the 2-second finish budget; every check stays fast.
+    std::fs::write(
+        &shim,
+        "#!/bin/sh\nif [ \"$1\" = worktree ] && [ \"$2\" = remove ]; then /bin/sleep 4; fi\nexec \"$AETHYME_TEST_REAL_GIT\" \"$@\"\n",
+    )
+    .unwrap();
+    let mut permissions = std::fs::metadata(&shim).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&shim, permissions).unwrap();
+    let mut paths = vec![bin];
+    paths.extend(std::env::split_paths(&original_path));
+    let path = std::env::join_paths(paths).unwrap();
+    let session_arg = session_id.to_string();
+    let output = Command::new(CLI)
+        .args([
+            "finish",
+            "--session",
+            &session_arg,
+            "--timeout",
+            "2",
+            "--json",
+        ])
+        .current_dir(tmp.path())
+        .env("PATH", path)
+        .env("AETHYME_TEST_REAL_GIT", real_git)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stdout}\n{stderr}");
+    let report: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(report["cleanup"]["completed"], true, "{stdout}");
+    assert_eq!(report["cleanup"]["worktree_removed"], true, "{stdout}");
+    assert!(!worktree.exists());
+}
+
 #[test]
 fn finish_cli_text_summarizes_the_structured_handoff() {
     let (tmp, session_id, worktree, _) = promoted_fixture();

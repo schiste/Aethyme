@@ -1151,7 +1151,8 @@ impl RepositoryWriteLock {
         let mut next_progress = waited + progress_interval;
         loop {
             // No portable timed flock: poll so even an unbounded wait can report
-            // progress without giving up its exclusive queue position.
+            // progress. flock grants no FIFO order either way, so polling gives
+            // up no queue position a blocking wait would have kept.
             // SAFETY: as above — `file` is live and owned by this function.
             let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
             if rc == 0 {
@@ -1174,7 +1175,10 @@ impl RepositoryWriteLock {
                 });
             }
             if now >= next_progress {
-                let holder = describe_holder()?;
+                // Progress is a diagnostic: a holder lookup that fails (a busy
+                // database under exactly the contention being reported) must
+                // not abort a wait that would otherwise acquire the lock.
+                let holder = describe_holder().unwrap_or_else(|_| "holder unavailable".to_string());
                 report_progress(&holder, waited.elapsed());
                 next_progress = now + progress_interval;
             }
@@ -7260,6 +7264,54 @@ mod tests {
         assert_eq!(holder, "session 1");
         assert!(elapsed >= Duration::from_millis(50), "{elapsed:?}");
         assert!(acquired.queue_wait_ms > 0);
+    }
+
+    #[test]
+    fn a_failing_holder_lookup_does_not_abort_a_progress_reporting_wait() {
+        let root = tempfile::tempdir().unwrap();
+        let held = RepositoryWriteLock::acquire(
+            root.path(),
+            "owner/repo",
+            1,
+            || Ok("session 1".into()),
+            QueueWait::Refuse,
+            |_, _| {},
+        )
+        .unwrap();
+        let root_path = root.path().to_path_buf();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            let mut lookups = 0;
+            RepositoryWriteLock::acquire_with_progress_interval(
+                &root_path,
+                "owner/repo",
+                2,
+                move || {
+                    lookups += 1;
+                    if lookups == 1 {
+                        Ok("session 1".into())
+                    } else {
+                        Err(BrokerOpError::RepresentationUnavailable {
+                            reason: "database is locked".into(),
+                        })
+                    }
+                },
+                QueueWait::Seconds(5),
+                Duration::from_millis(50),
+                move |holder, _| {
+                    let _ = sender.send(holder.to_owned());
+                },
+            )
+        });
+        let progress = receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("the wait must keep reporting after a failed holder lookup");
+        drop(held);
+        waiter
+            .join()
+            .unwrap()
+            .expect("a failed progress lookup must not abort the wait");
+        assert_eq!(progress, "holder unavailable");
     }
 
     /// `--no-wait` must still bound its own preparation. Without a budget it

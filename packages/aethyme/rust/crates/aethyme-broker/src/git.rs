@@ -45,6 +45,15 @@ pub(crate) fn with_git_deadline<T>(timeout: Duration, operation: impl FnOnce() -
     operation()
 }
 
+/// Run `operation` with no command-scoped deadline, restoring the outer one
+/// afterwards. For work that must not be killed halfway once started, such as
+/// deleting a worktree after its session has closed.
+pub(crate) fn without_git_deadline<T>(operation: impl FnOnce() -> T) -> T {
+    let previous = GIT_DEADLINE.with(|deadline| deadline.replace(None));
+    let _restore = RestoreGitDeadline(previous);
+    operation()
+}
+
 /// Errors from git operations. `Git` carries the failing subcommand and
 /// stderr so callers can surface actionable messages verbatim.
 /// How every patch identity is computed. `--verbatim` keeps whitespace:
@@ -4107,6 +4116,17 @@ mod timeout_tests {
         );
         assert!(started.elapsed() < Duration::from_secs(10));
         assert!(error.to_string().contains(GIT_TIMEOUT_ENV), "{error}");
+    }
+
+    #[test]
+    fn lifting_the_deadline_restores_the_general_budget_then_the_outer_one() {
+        let general = git_timeout();
+        with_git_deadline(Duration::from_secs(5), || {
+            assert!(git_timeout() <= Duration::from_secs(5));
+            without_git_deadline(|| assert_eq!(git_timeout(), general));
+            assert!(git_timeout() <= Duration::from_secs(5));
+        });
+        assert_eq!(git_timeout(), general);
     }
 
     #[test]
