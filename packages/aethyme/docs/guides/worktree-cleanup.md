@@ -12,6 +12,27 @@ The one rule underneath all of it: **decide by whether the content is
 represented somewhere else, never by whether the directory looks idle.** Age,
 size, and a clean `git status` are all compatible with unique work.
 
+## Lifecycle and proof model
+
+A session, its worktree, and its branch have separate lifecycles. Finishing a
+session closes broker ownership; it does not by itself authorize deleting either
+the checkout or its branch. Delivery changes the target refs, while cleanup
+proves the session's exact content against the fetched delivery targets. The
+proof accepts ancestry for merge and fast-forward delivery and content or patch
+identity for squash and rebase delivery. If it cannot decide, it retains the
+work and reports the blocker.
+
+`finish`, the cleanup audit and cleanup plan use that proof to explain whether
+a session is represented. Automatic worktree cleanup and reviewed GC apply use
+the same worktree eligibility checks, then revalidate ownership, liveness,
+cleanliness and the expected branch tip immediately before removal. `ship` publishes a reviewed
+integration entry; integration reconciliation updates that entry from the
+fetched upstream and pending queue. Neither operation alone authorizes
+deletion: cleanup checks the resulting delivery target again. Host storage
+planning adds a read-only view of roots, caches and broker branch refs; it
+reports unknown ownership for review rather than turning it into a deletion
+candidate.
+
 ## 1. Inspect before planning
 
 ```sh
@@ -25,7 +46,9 @@ age, size, and what deleting it would cost — `recoverable`, `unpushed
 many hold work that exists nowhere else, and no cleanup path can reclaim those.
 Sizes come from recorded measurements and a 10 s walk budget; a `?` size was
 not measured in time and the header says the totals are floors. Add
-`--measure` when you need every size.
+`--measure` when you need every size. Discovery follows Git checkout metadata,
+not broker root markers, so markerless checkouts remain visible with their
+recoverability evidence.
 
 A worktree outside this repository belongs to whoever ran it. Classify it, do
 not act on it.
@@ -219,10 +242,20 @@ concluding the disk is unreclaimable:
 - `unproven_contribution` — needs step 4
 - `accepted_checkpoint` — another session names it as provenance
 
-Two things `gc` does **not** see, which have both cost real time: the gate cache
-under the OS cache directory (#295), and worktree roots with no marker file
-(#257). A reclaimable-bytes figure near zero is a statement about what `gc`
-measures, not about the disk.
+Two gaps recorded by older issues now have guarded paths:
+
+- The gate-cache gap from #295 is covered: caches under the OS cache
+  directory appear in `gc plan` and digest-bound `gc apply`. A running
+  gate's cache remains protected unless an operator explicitly asks for the
+  active-cache lane.
+- The markerless-root gap from #257 is covered by host inventory and
+  evidence-based attribution. From the owning repository,
+  `aethyme broker gc storage attribute` previews markers it can prove from
+  Git registrations; `--apply` writes only those markers and removes
+  nothing. Roots whose owner is still uncertain remain visible and report-only.
+
+A reclaimable-bytes figure near zero is still a statement about what the
+selected plan can prove and reclaim, not about the disk as a whole.
 
 ## What is protected, and stays protected
 
