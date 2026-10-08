@@ -15,14 +15,17 @@ description: Use when starting work in an unfamiliar repository, when the task a
 ## Repo Identity
 
 - Kind: `monorepo`
-- Languages: `rust, python`
+- Languages: `rust, python, typescript`
 - Package manager: `cargo`
-- Key manifests: `packages/aethyme-eval/pyproject.toml, packages/aethyme/rust/Cargo.toml, packages/aethyme/rust/crates/aethyme-broker/Cargo.toml, packages/aethyme/rust/crates/aethyme-cli/Cargo.toml, packages/aethyme/rust/crates/aethyme-engine/Cargo.toml, packages/aethyme/rust/crates/aethyme-enhance/Cargo.toml, packages/aethyme/rust/crates/aethyme-graph-indexer/Cargo.toml, packages/aethyme/rust/crates/aethyme-graph-schema/Cargo.toml, packages/aethyme/rust/crates/aethyme-graph-storage/Cargo.toml, packages/aethyme/rust/crates/aethyme-producers/Cargo.toml, packages/aethyme/rust/crates/aethyme-quality/Cargo.toml, packages/aethyme/rust/crates/aethyme-testkit/Cargo.toml`
+- Key manifests: `packages/aethyme-eval/benchmarks/performance/fixture/package.json, packages/aethyme-eval/benchmarks/performance/fixture/pyproject.toml, packages/aethyme-eval/benchmarks/performance/fixture/src/rust/Cargo.toml, packages/aethyme-eval/pyproject.toml, packages/aethyme/rust/Cargo.toml, packages/aethyme/rust/crates/aethyme-broker/Cargo.toml, packages/aethyme/rust/crates/aethyme-cli/Cargo.toml, packages/aethyme/rust/crates/aethyme-engine/Cargo.toml, packages/aethyme/rust/crates/aethyme-enhance/Cargo.toml, packages/aethyme/rust/crates/aethyme-graph-indexer/Cargo.toml, packages/aethyme/rust/crates/aethyme-graph-schema/Cargo.toml, packages/aethyme/rust/crates/aethyme-graph-storage/Cargo.toml, packages/aethyme/rust/crates/aethyme-producers/Cargo.toml, packages/aethyme/rust/crates/aethyme-quality/Cargo.toml, packages/aethyme/rust/crates/aethyme-testkit/Cargo.toml`
 
 ## Workspaces
 
 - `packages/aethyme/rust` (primary; cargo; manifest `packages/aethyme/rust/Cargo.toml`; high confidence)
 - `packages/aethyme-eval` (supporting; python; manifest `packages/aethyme-eval/pyproject.toml`; high confidence)
+- `packages/aethyme-eval/benchmarks/performance/fixture` (supporting; python; manifest `packages/aethyme-eval/benchmarks/performance/fixture/pyproject.toml`; high confidence)
+- `packages/aethyme-eval/benchmarks/performance/fixture` (supporting; npm; manifest `packages/aethyme-eval/benchmarks/performance/fixture/package.json`; high confidence)
+- `packages/aethyme-eval/benchmarks/performance/fixture/src/rust` (supporting; cargo; manifest `packages/aethyme-eval/benchmarks/performance/fixture/src/rust/Cargo.toml`; high confidence)
 
 ## Start Here
 
@@ -97,7 +100,7 @@ description: Use when starting work in an unfamiliar repository, when the task a
 
 ## Freshness
 
-- Source digest: `401f12e0d06a9abe653901a2c76f534030b5f223c34d5f43e07f3d44eb90be31`
-- Tracked source files: `1003`
+- Source digest: `1b0472665890c49330a0997d5935fcf2e0684d14f4190b60840d55d94e8bf6e2`
+- Tracked source files: `1058`
 - Overrides applied: `True`
 - Sections generated: `repo, workspaces, primary_workspace, commands, areas, entrypoints, caution_zones, generated_paths, dangerous_paths, navigation_recipes, summon, freshness`

@@ -4,6 +4,30 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.25] - 2026-10-08
+
+**Breaking:** see [UPGRADING.md](UPGRADING.md#v0825).
+
+A verified queue entry can ship on its own, Windows x64 gets a native release, Linux arm64 is validated natively, and the broker bounds its slow paths: `status` inspection, `finish` and lock waits stop at a deadline and say what they did not check, instead of hanging. The broker database stays at schema 49.
+
+### Changed
+
+- **Breaking:** the `status` and `status doctor` inspection budget drops from 15 s to 7 s, and `AETHYME_STATUS_INSPECTION_BUDGET_MS` can only lower it, never raise it. `broker advanced worktrees` and `gc plan` stop at the same shared budget and report what they did not reach: a checkout not inspected is a `state: "not_inspected"` row counted as work at risk, `deferred_checks` names the cut checks, and a partial `gc plan` reports `budget_verdict: "unknown"` (#625, issue #460).
+- **Breaking:** `broker finish` applies one deadline (default 10 s, `--timeout <1..86400>`) to the Git checks that decide whether to close, and reports the timed-out check instead of waiting indefinitely; the session is kept for explicit recovery. Opening the broker runs before the deadline and worktree removal after close runs without it. Lock waits print the holder and elapsed time, and `status --json` reports pending lease-release requests and unresolved coordinated operations (#616, issue #494).
+- `broker ship plan|execute --entry <id> --only` ships one verified queue entry ahead of unshipped entries before it, when git proves it independent of them (#619, issue #369).
+- Windows x64 ships as a native release archive beside the signed manifest, with its own checksum and signature. Broker commands refuse explicitly on Windows; macOS and Linux are unchanged (#629, issue #357).
+- The Linux arm64 release is validated natively: install, version, upgrade and uninstall (#627, issue #356).
+- `broker gc storage` reports which session owns each broker branch; the default and integration branches are reported as `shared` and never removable (#630, issue #335).
+- The graph indexes explicit non-code relationships (Markdown links to source, include directives, config references), with qualified names, per-language test edges and a per-file cap (#623, issue #213).
+- Reproducible product latency benchmarks against a pinned fixture, with a checked-in baseline (#615, issue #386).
+- `broker.rs`, `store.rs` and `operations.rs` are split into modules, as pure moves (#633, #634, #635, issue #382).
+
+### Fixed
+
+- `broker push` runs Git, and so the repository's pre-push hook, from the session worktree instead of the main checkout, and surfaces the hook's output when a push is refused (#626, issue #621).
+- `operations reconcile` and `unblock` accept host operation IDs and refuse one that belongs to another repository (exit 3), and a failed gate reports the tail of its log (#628, issue #284).
+- The cleanup runbook and the pilot guide match the shipped behaviour (#631, #632).
+
 ## [0.8.24] - 2026-10-08
 
 Agents can subscribe to a pull request or to every pull request of a repository, and receive a review prompt when one opens. A brokered push can run the review rules for its own pull request. Disposable checkouts are removed automatically. Tests run the same way locally and in CI. The broker database moves to schema 49 additively: 0.8.23 still opens it.

@@ -16,7 +16,7 @@ version and the target, oldest first. Each schema migration runs on first open
 and is one-way, so rollback is limited to the oldest binary that still reads
 the newest schema you have opened.
 
-Breaking releases: [v0.8.23](#v0823), [v0.8.8](#v088), [v0.8.2](#v082), [v0.8.1](#v081), [v0.8.0](#v080),
+Breaking releases: [v0.8.25](#v0825), [v0.8.23](#v0823), [v0.8.8](#v088), [v0.8.2](#v082), [v0.8.1](#v081), [v0.8.0](#v080),
 [v0.7.25](#v0725), [v0.7.23](#v0723), [v0.7.22](#v0722), [v0.7.19](#v0719),
 [v0.7.18](#v0718), [v0.7.16](#v0716), [v0.7.9](#v079), [v0.7.8](#v078),
 [v0.7.4](#v074), [v0.7.2](#v072),
@@ -72,6 +72,31 @@ sections below keep the Compatibility, Before upgrading, Migrate and verify,
 and Rollback parts of the breaking ones. The full per-release guides, including
 the non-breaking ones, remain in Git history under
 `packages/aethyme/docs/guides/`.
+
+## v0.8.25
+
+v0.8.25 bounds broker commands that used to wait as long as they needed. Scripts that relied on an unbounded `status` inspection or an unbounded `finish` must adapt.
+
+### Compatibility
+
+**No schema migration.** The broker database stays at schema 49, and v0.8.24 still opens it. Changed behaviour:
+
+- **`status` inspection budget.** `broker status`, `status doctor`, `broker advanced worktrees` and `gc plan` stop their Git inspection at 7 s (was 15 s for `status`). `AETHYME_STATUS_INSPECTION_BUDGET_MS` can only lower that budget; a larger value is ignored. What was not inspected is reported, never assumed clean: `deferred_checks`, `not_inspected_sessions[]`, rows with `state: "not_inspected"` (counted in `unique_work_count`), and `budget_verdict: "unknown"` in a partial `gc plan`.
+- **`finish` deadline.** `broker finish` gives its closing Git checks 10 s by default and then stops with the timed-out check named, keeping the session. Pass `--timeout <seconds>` (1 to 86400) for a repository whose checks are slower.
+
+### Migrate and verify
+
+A script that raised `AETHYME_STATUS_INSPECTION_BUDGET_MS` to get a complete answer should instead treat `deferred_checks` and `not_inspected` rows as "unknown" and re-run, or use the unbounded command the notice names (for drift, `integration reconcile --upstream <ref> --dry-run`). A script that called `finish` on a very large repository should pass `--timeout`. Then install the router and engine pair together, and verify:
+
+```bash
+aethyme --version && aethyme-engine-cli --version
+aethyme broker status --json
+aethyme broker advanced quick-test
+```
+
+### Rollback
+
+Reinstall the v0.8.24 router and engine pair together. It reads the same schema-49 database and restores the unbounded `status` budget override and `finish`.
 
 ## v0.8.23
 

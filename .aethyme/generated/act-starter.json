@@ -78,7 +78,7 @@
   "caution_zones": [],
   "telemetry": {
     "derived_from": ".aethyme/generated/onboarding.json",
-    "entrypoint_count": 7,
+    "entrypoint_count": 8,
     "primary_entrypoint_count": 1,
     "caution_zone_count": 0
   }
