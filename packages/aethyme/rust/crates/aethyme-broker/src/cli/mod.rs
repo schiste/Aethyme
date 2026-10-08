@@ -59,8 +59,9 @@ pub use surface::{
 const RESOURCES_RECONCILE_USAGE: &str =
     "usage: aethyme broker advanced resources reconcile <lease-id> --confirm <generation> [--json]";
 const OPERATIONS_RECONCILE_USAGE: &str = "usage: aethyme broker advanced operations reconcile \
-     --operation <id> --outcome <succeeded|failed> --reason <text> [--json]";
-const OPERATIONS_SHOW_USAGE: &str = "usage: aethyme broker advanced operations show <id> [--json]";
+     --operation <id|host-operation-id> --outcome <succeeded|failed> --reason <text> [--json]";
+const OPERATIONS_SHOW_USAGE: &str =
+    "usage: aethyme broker advanced operations show <id|host-operation-id> [--json]";
 const OPERATIONS_STATS_USAGE: &str = "usage: aethyme broker advanced operations stats [--repo <canonical-id>] [--limit <n>] [--json]";
 const ADVISORIES_SHOW_USAGE: &str = "usage: aethyme broker advanced advisories show <id> [--json]";
 const ADVISORIES_ACK_USAGE: &str = "usage: aethyme broker advanced advisories ack <id> [--json]";
@@ -364,10 +365,10 @@ Usage:
   aethyme broker operations list [--limit <n>] [--before <id>] [--session <id>] [--status <status>] [--repo <canonical-id>] [--provider <git|github>] [--json]
       List a filtered newest-first page of the durable operation journal.
       `operations` without `list` is a compatibility alias during deprecation.
-  aethyme broker operations show <id> [--json]
+  aethyme broker operations show <id|host-operation-id> [--json]
       Show one exact durable operation and its reconciliation state, evidence,
       write barrier, and complete recovery commands when inspection is required.
-  aethyme broker operations reconcile --operation <id> --outcome <succeeded|failed> --reason <text> [--json]
+  aethyme broker operations reconcile --operation <id|host-operation-id> --outcome <succeeded|failed> --reason <text> [--json]
       Resolve a crash-ambiguous operation after independently inspecting the
       remote state. Overlapping writes remain blocked until reconciliation.
   aethyme broker operations stats [--repo <canonical-id>] [--limit <n>] [--json]
@@ -1306,7 +1307,7 @@ struct Parsed {
     confirm: Option<String>,
     delivery_mode: Option<String>,
     delivery_plan: Option<String>,
-    operation: Option<i64>,
+    operation: Option<String>,
     before: Option<i64>,
     limit: Option<u32>,
     detail: bool,
@@ -2146,9 +2147,7 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
                 let value = iter
                     .next()
                     .ok_or(UsageError::Message("--operation requires a value".into()))?;
-                parsed.operation = Some(value.parse().map_err(|_| {
-                    UsageError::Message("--operation must be an integer operation id".into())
-                })?);
+                parsed.operation = Some(value.clone());
             }
             "--timeout" => {
                 let value = iter
