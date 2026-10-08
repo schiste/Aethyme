@@ -1,0 +1,2 @@
+[bootstrap]
+handler = "src.handlers.handle_request"
