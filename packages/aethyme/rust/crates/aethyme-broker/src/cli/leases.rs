@@ -499,6 +499,8 @@ pub(super) fn run_leases(parsed: Parsed) -> Result<(), UsageError> {
             let path = crate::broker::normalize_lease_path(path)
                 .map_err(|error| UsageError::Message(error.to_string()))?;
             let started = std::time::Instant::now();
+            let progress_interval = std::time::Duration::from_secs(2);
+            let mut next_progress = progress_interval;
             let (outcome, code, requests) = loop {
                 broker.grant_stale_lease_requests()?;
                 let mine: Vec<_> = broker
@@ -508,9 +510,15 @@ pub(super) fn run_leases(parsed: Parsed) -> Result<(), UsageError> {
                         request.requester_session_id == session && request.path == path
                     })
                     .collect();
-                let held = broker.store().active_leases()?.iter().any(|lease| {
-                    lease.session_id != session && crate::leases::paths_overlap(&path, &lease.path)
-                });
+                let held: Vec<_> = broker
+                    .store()
+                    .active_leases()?
+                    .into_iter()
+                    .filter(|lease| {
+                        lease.session_id != session
+                            && crate::leases::paths_overlap(&path, &lease.path)
+                    })
+                    .collect();
                 // Only each holder's latest request counts: an outcome a newer
                 // request superseded no longer answers the wait.
                 let latest_is = |state| {
@@ -522,7 +530,7 @@ pub(super) fn run_leases(parsed: Parsed) -> Result<(), UsageError> {
                             })
                     })
                 };
-                if !held {
+                if held.is_empty() {
                     if latest_is(crate::lease_requests::RequestState::Granted) {
                         break ("granted", crate::exit_status::LEASE_WAIT_GRANTED, mine);
                     }
@@ -531,7 +539,22 @@ pub(super) fn run_leases(parsed: Parsed) -> Result<(), UsageError> {
                 if latest_is(crate::lease_requests::RequestState::Declined) {
                     break ("declined", crate::exit_status::LEASE_WAIT_DECLINED, mine);
                 }
-                if started.elapsed() >= timeout {
+                let elapsed = started.elapsed();
+                if elapsed >= next_progress {
+                    for lease in &held {
+                        eprintln!(
+                            "[coordination] still waiting for lease {path}: holder session {} owns {} (lease age {}); waited {}",
+                            lease.session_id,
+                            lease.path,
+                            crate::operations::humanize_duration(
+                                now_ms().saturating_sub(lease.created_at).max(0) as u64 / 1_000
+                            ),
+                            crate::operations::humanize_duration(elapsed.as_secs())
+                        );
+                    }
+                    next_progress = elapsed + progress_interval;
+                }
+                if elapsed >= timeout {
                     break ("timeout", crate::exit_status::LEASE_WAIT_TIMED_OUT, mine);
                 }
                 std::thread::sleep(std::time::Duration::from_millis(500));
