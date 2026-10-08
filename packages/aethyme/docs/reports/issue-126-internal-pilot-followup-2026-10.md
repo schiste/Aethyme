@@ -4,7 +4,7 @@ Status: internal-only acceptance evidence following [PR #639](https://github.com
 
 ## Scope
 
-This exercise adds two acceptance checks missing from the 2026-10-08 internal dogfooding snapshot: a real broker conflict-recovery path in a disposable local repository, and the paired CLI/engine install, update, rollback, and uninstall lifecycle. No Aethyme source repository data was used as the conflict fixture, and no external repository or user was involved.
+This exercise adds two acceptance checks missing from the [2026-10-08 internal dogfooding snapshot](internal-dogfood-2026-10.md): a real broker conflict-recovery path in a disposable local repository, and the paired CLI/engine install, update, rollback, and uninstall lifecycle. No Aethyme source repository data was used as the conflict fixture, and no external repository or user was involved.
 
 ## Results
 
