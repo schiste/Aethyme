@@ -899,7 +899,7 @@ impl Broker {
 
     /// Commits only this session's worktree holds, when the repository opted
     /// into the push lane and has a remote to push to; `None` otherwise.
-    pub(super) fn unpushed_close_check(&self, session: &Session) -> Option<(String, u32)> {
+    pub(crate) fn unpushed_close_check(&self, session: &Session) -> Option<(String, u32)> {
         if !crate::session_push::session_push_enabled(&self.repo)
             || self.repo.remotes().unwrap_or_default().is_empty()
         {
