@@ -1,13 +1,12 @@
-# Pilot install guide (protocol v1)
+# Internal dogfooding install and recovery guide (protocol v2)
 
 Last Updated: 2026-10-08
 
-From a fresh machine to a first submitted session. Before the pilot, the owner
-selects one supported Aethyme release and tells every participant the exact
-version and installation method. Record both binary versions and keep the
-version and repository gate policy stable across the comparison windows. The
-historical v0.8.3/v0.8.4 spellings below are compatibility notes only; use the
-current command forms in this guide for a current release.
+For maintainers and internal teammates setting up Aethyme in a project-owned
+repository or disposable Playground repository. Select one supported release
+and keep both binary versions and repository gate policy stable during an
+observation window. Historical v0.8.3/v0.8.4 spellings below are compatibility
+notes only; use the current command forms for a current release.
 
 ## 1. Install
 
@@ -23,10 +22,10 @@ aethyme-engine-cli --version
 ```
 
 Update later with `brew update && brew upgrade aethyme`.
-For a fixed-version cohort, use Homebrew only when the tap formula is pinned
-to the exact version selected for the cohort; otherwise use the versioned
-installer or the matching source tag below. Confirm both installed binaries
-report that same version.
+For a fixed internal observation window, use Homebrew only when the tap
+formula is pinned to the selected version; otherwise use the versioned
+installer or matching source tag below. Confirm both installed binaries report
+that same version.
 
 **Installer script** (no Homebrew). It downloads the release archive for
 your platform and checks its checksum:
@@ -37,11 +36,11 @@ aethyme --version
 aethyme-engine-cli --version
 ```
 
-For an exact cohort pin, the owner supplies `PILOT_AETHYME_VERSION`; pass that
-version to the installer:
+For an exact internal version pin, set `PILOT_AETHYME_VERSION` to the
+selected release and pass it to the installer:
 
 ```bash
-: "${PILOT_AETHYME_VERSION:?Set the version selected for this pilot cohort}"
+: "${PILOT_AETHYME_VERSION:?Set the version selected for this observation window}"
 curl -fsSL https://github.com/schiste/Aethyme/releases/latest/download/install.sh \
   | sh -s -- --version "$PILOT_AETHYME_VERSION"
 ```
@@ -52,11 +51,11 @@ with `--verify-signature` (needs Cosign 3). Review updates explicitly with
 `aethyme update execute --confirm <manifest-sha256>`; nothing updates in the
 background. A failed download, validation, staged smoke test, or activation
 check restores the prior installer-managed bundle automatically. There is no
-user-facing command to manually switch back to that bundle; do not describe
-that as a participant rollback step.
+user-facing command to manually switch back to that bundle; do not claim a
+manual rollback path unless a reviewed procedure has been exercised.
 
-**From source** (needs a Rust toolchain; check out the same release tag selected
-for the cohort):
+**From source** (needs a Rust toolchain; check out the release tag selected
+for the observation window):
 
 ```bash
 git clone --branch "v$PILOT_AETHYME_VERSION" --depth 1 https://github.com/schiste/Aethyme.git
@@ -162,7 +161,7 @@ Then add it to cron; see [metrics-export.md](metrics-export.md).
 
 ## Historical v0.8.3 and v0.8.4 spellings
 
-This table is for reading old pilot notes, not for installing a current cohort.
+This table is for reading old command notes, not for installing a current release.
 The documented alias window ended at v0.8.8; use the current spellings above
 for later releases.
 
