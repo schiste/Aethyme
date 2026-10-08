@@ -203,9 +203,75 @@ fn operation_failure(phase: &'static str, report: &CoordinatedOperationReport) -
             phase,
             operation_id: report.operation.id,
             status: report.operation.status.as_str(),
-            stderr: report.stderr.trim().to_string(),
+            stderr: push_failure_output(&report.stdout, &report.stderr),
         }
     }
+}
+
+const PRE_PUSH_PATH_HINT: &str = "Hint: the pre-push hook could not find a required executable. Git hooks inherit the PATH of the aethyme process; ensure it includes the hook's toolchain (interactive shell startup files are not loaded), then retry.";
+
+/// The PATH hint, when a refused push reports a missing executable. Only a
+/// failed push qualifies: the same failure text is shared by every coordinated
+/// git and gh operation, and gh's `HTTP 404: Not Found` would otherwise read
+/// as a hook that could not find its toolchain.
+pub(crate) fn missing_executable_path_hint(stdout: &str, stderr: &str) -> Option<&'static str> {
+    let output = format!("{stdout}\n{stderr}").to_ascii_lowercase();
+    let refused_push =
+        output.contains("failed to push some refs") || output.contains("pre-push hook");
+    if !refused_push {
+        return None;
+    }
+    [
+        "command not found",
+        ": not found",
+        "no such file or directory",
+        "executable file not found",
+        "not recognized as an internal or external command",
+    ]
+    .iter()
+    .any(|marker| output.contains(marker))
+    .then_some(PRE_PUSH_PATH_HINT)
+}
+
+pub(crate) fn with_pre_push_path_hint(reason: &str) -> String {
+    if reason.contains("pre-push hook refused this push")
+        && missing_executable_path_hint("", reason).is_some()
+        && !reason.contains(PRE_PUSH_PATH_HINT)
+    {
+        format!("{reason}\n{PRE_PUSH_PATH_HINT}")
+    } else {
+        reason.to_string()
+    }
+}
+
+fn push_failure_output(stdout: &str, stderr: &str) -> String {
+    const MAX_LINES_PER_STREAM: usize = 3;
+    const MAX_CHARS_PER_LINE: usize = 400;
+
+    fn tail(text: &str) -> Option<String> {
+        let mut lines = Vec::new();
+        for line in text.lines() {
+            if let Some(line) = crate::text_redaction::failure_message(line, MAX_CHARS_PER_LINE) {
+                if lines.len() == MAX_LINES_PER_STREAM {
+                    lines.remove(0);
+                }
+                lines.push(line);
+            }
+        }
+        (!lines.is_empty()).then(|| lines.join(" | "))
+    }
+
+    let mut details = Vec::new();
+    if let Some(stdout) = tail(stdout) {
+        details.push(format!("push stdout: {stdout}"));
+    }
+    if let Some(stderr) = tail(stderr) {
+        details.push(format!("push stderr: {stderr}"));
+    }
+    if let Some(hint) = missing_executable_path_hint(stdout, stderr) {
+        details.push(hint.to_string());
+    }
+    details.join("\n")
 }
 
 /// Why `branch` may not be published by `broker push`, if it may not.
@@ -292,6 +358,12 @@ impl Broker {
             });
         }
         let main_root = self.main_root().to_path_buf();
+        let session_worktree = Path::new(&session.worktree_path);
+        if !session_worktree.is_dir() {
+            return Err(refused(format!(
+                "session {session_id} worktree is missing; broker push needs the session checkout to run its pre-push hook"
+            )));
+        }
         let repo = self.repo_handle();
         let default = tracked_default(repo).ok_or_else(|| {
             refused(
@@ -328,9 +400,9 @@ impl Broker {
             default.remote, session.branch
         ));
         let new_commits = repo.commits_not_on_remotes(&head)?.len();
-        let uncommitted = Path::new(&session.worktree_path)
+        let uncommitted = session_worktree
             .is_dir()
-            .then(|| GitRepo::discover(Path::new(&session.worktree_path)).ok())
+            .then(|| GitRepo::discover(session_worktree).ok())
             .flatten()
             .and_then(|worktree| worktree.uncommitted_summary().ok())
             .unwrap_or_default();
@@ -389,7 +461,7 @@ impl Broker {
                 authorization_reason: Some(format!("repository policy {SESSION_PUSH_POLICY_KEY}")),
                 args,
             },
-            &main_root,
+            session_worktree,
             push_operation_wait(),
         )?;
         if !push.ok() {
@@ -830,6 +902,32 @@ fn measure_pr_size(main_root: &Path, base_ref: &str, head: &str) -> Option<crate
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn path_hint_needs_a_refused_push_not_any_not_found() {
+        let hook = "env: node: No such file or directory\n\
+                    error: failed to push some refs to 'https://example.invalid/r.git'";
+        assert_eq!(
+            missing_executable_path_hint("", hook),
+            Some(PRE_PUSH_PATH_HINT)
+        );
+        for unrelated in [
+            "HTTP 404: Not Found (https://api.github.com/repos/o/r/pulls/9)",
+            "gh: Not Found (HTTP 404)",
+            "fatal: could not read 'x': No such file or directory",
+        ] {
+            assert_eq!(
+                missing_executable_path_hint("", unrelated),
+                None,
+                "{unrelated}"
+            );
+        }
+        assert_eq!(
+            missing_executable_path_hint("", "error: failed to push some refs to 'origin'"),
+            None,
+            "a refused push with no missing executable gets no hint"
+        );
+    }
 
     #[test]
     fn only_session_branches_are_publishable() {

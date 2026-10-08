@@ -394,10 +394,7 @@ impl Broker {
             if linked.contains(&row.operation_id) {
                 continue;
             }
-            let relevant = keys.iter().any(|key| {
-                row.remote_key == *key || row.remote_key.starts_with(&format!("{key}::"))
-            });
-            if !relevant {
+            if !remote_key_matches(&keys, &row.remote_key) {
                 continue;
             }
             let holder_alive = process_alive(row.holder_pid);
@@ -735,6 +732,22 @@ impl Broker {
         let database = self.host_operation_database_path()?;
         let operation = crate::host_operation(&database, hex)?
             .ok_or_else(|| crate::HostOperationError::NotFound(hex.into()))?;
+        // The host database is shared by every repository on this host. Only an
+        // operation on one of this repository's remotes may be decided from
+        // here; otherwise any clone could lift another repository's barrier.
+        if !remote_key_matches(&self.repository_coordination_keys(), &operation.remote_key) {
+            return Ok(refuse(
+                request,
+                BlockerKind::HostOperation,
+                format!(
+                    "host operation {hex} targets {}, which is not a remote of this repository; \
+                     reconcile it from a checkout of that repository",
+                    operation.remote_key
+                ),
+                Vec::new(),
+                false,
+            ));
+        }
         if !matches!(
             operation.status,
             OperationStatus::Prepared | OperationStatus::Running | OperationStatus::OutcomeUnknown
@@ -1419,6 +1432,12 @@ pub(crate) fn process_alive(pid: i64) -> bool {
         return true;
     }
     std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+/// Whether a host-operation remote key names one of `keys` or a scope below it.
+fn remote_key_matches(keys: &[String], remote_key: &str) -> bool {
+    keys.iter()
+        .any(|key| remote_key == key || remote_key.starts_with(&format!("{key}::")))
 }
 
 struct HostOperationRow {
