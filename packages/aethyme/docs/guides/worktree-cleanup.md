@@ -14,9 +14,13 @@ size, and a clean `git status` are all compatible with unique work.
 
 ## Lifecycle and proof model
 
-A session, its worktree, and its branch have separate lifecycles. Finishing a
-session closes broker ownership; it does not by itself authorize deleting either
-the checkout or its branch. Delivery changes the target refs, while cleanup
+A session, its worktree, and its branch have separate lifecycles. Closing a
+session (`finish close`) ends broker ownership and retains both the checkout and
+its branch. `finish` closes and then, for a broker-spawned worktree whose cleanup
+is already proven safe, removes the checkout and its local session branch in the
+same step, unless `--keep-worktree` is given or the repository's retention policy
+sets `auto_cleanup_worktrees_on_finish = false`; an adopted worktree is always
+retained. Delivery changes the target refs, while cleanup
 proves the session's exact content against the fetched delivery targets. The
 proof accepts ancestry for merge and fast-forward delivery and content or patch
 identity for squash and rebase delivery. If it cannot decide, it retains the
@@ -48,7 +52,9 @@ Sizes come from recorded measurements and a 10 s walk budget; a `?` size was
 not measured in time and the header says the totals are floors. Add
 `--measure` when you need every size. Discovery follows Git checkout metadata,
 not broker root markers, so markerless checkouts remain visible with their
-recoverability evidence.
+recoverability evidence. A checkout the report budget did not reach is listed as
+`not_inspected` and counted as holding unique work: an unfinished inspection is
+never read as clean.
 
 A worktree outside this repository belongs to whoever ran it. Classify it, do
 not act on it.
@@ -67,7 +73,9 @@ for retention. `session_branch_inventory_complete: false` means the owner or
 its refs could not be fully inspected; an empty list in that case does not
 mean there are no branches. An unclaimed `agent/` ref has unknown ownership,
 so the plan reports it for review and never offers it as an automatic removal
-candidate. Branch deletion still needs independent ownership and delivery
+candidate. The repository's integration and default branches are reported with
+`ownership: shared`, even when an old session record names them, and are never
+removable. Branch deletion still needs independent ownership and delivery
 proof. The storage plan is read-only with respect to session and branch state;
 its digest authorizes only the listed filesystem candidates.
 
