@@ -635,6 +635,11 @@ impl Broker {
         &mut self,
         upstream_ref: &str,
     ) -> Result<AutomaticIntegrationCleanupReport, BrokerOpError> {
+        // `status` reaches this through its integration refresh while an
+        // inspection deadline is installed. That deadline bounds reads; a
+        // reconciliation killed between its ref write and its queue record is
+        // exactly the partial state it must never leave (#460 review).
+        let _mutation = crate::git::suspend_git_deadline();
         self.recover_prepared_reconciliation()?;
         let upstream_head = self
             .repo_handle()
