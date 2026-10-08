@@ -1066,6 +1066,7 @@ impl RepositoryWriteLock {
         main_root: &Path,
         repository: &str,
         operation_id: i64,
+        session_id: Option<i64>,
         describe_holder: impl FnMut() -> Result<String, BrokerOpError>,
         queue_wait: QueueWait,
         report_progress: impl FnMut(&str, Duration),
@@ -1073,7 +1074,7 @@ impl RepositoryWriteLock {
         Self::acquire_with_progress_interval(
             main_root,
             repository,
-            operation_id,
+            (operation_id, session_id),
             describe_holder,
             queue_wait,
             OPERATION_LOCK_PROGRESS_INTERVAL,
@@ -1084,7 +1085,7 @@ impl RepositoryWriteLock {
     fn acquire_with_progress_interval(
         main_root: &Path,
         repository: &str,
-        operation_id: i64,
+        (operation_id, session_id): (i64, Option<i64>),
         mut describe_holder: impl FnMut() -> Result<String, BrokerOpError>,
         queue_wait: QueueWait,
         progress_interval: Duration,
@@ -1142,6 +1143,15 @@ impl RepositoryWriteLock {
         // visible while preserving the caller supplied bound.
         let holder = describe_holder()?;
         eprintln!("[coordination] waiting for the {repository} write lock: {holder}");
+        // Visible to `broker status` in other terminals for as long as this
+        // process waits; dropped (and removed) on every exit from the loop.
+        let mut registration = crate::waiters::WaitRegistration::start(
+            main_root,
+            session_id,
+            crate::waiters::WAIT_COORDINATED_WRITE_LOCK,
+            repository,
+            &holder,
+        );
         let waited = Instant::now();
         let deadline = match queue_wait {
             QueueWait::Refuse => unreachable!("refused above"),
@@ -1179,6 +1189,7 @@ impl RepositoryWriteLock {
                 // database under exactly the contention being reported) must
                 // not abort a wait that would otherwise acquire the lock.
                 let holder = describe_holder().unwrap_or_else(|_| "holder unavailable".to_string());
+                registration.update_holder(&holder);
                 report_progress(&holder, waited.elapsed());
                 next_progress = now + progress_interval;
             }
@@ -1192,6 +1203,7 @@ impl RepositoryWriteLock {
                 std::thread::sleep(sleep_for);
             }
         }
+        drop(registration);
         eprintln!(
             "[coordination] acquired the {repository} write lock after {}",
             humanize_duration(waited.elapsed().as_secs())
