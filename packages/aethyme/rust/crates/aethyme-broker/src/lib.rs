@@ -448,8 +448,9 @@ pub use release_compatibility::{
     MINIMUM_GIT_VERSION, REPOSITORY_SCHEMA_VERSION,
 };
 pub use release_manifest::{
-    RELEASE_MANIFEST_SCHEMA_VERSION, RELEASE_TARGETS, REQUIRED_RELEASE_BINARIES, ReleaseArtifact,
-    ReleaseBrokerStorageCompatibility, ReleaseCompatibility, ReleaseInstaller, ReleaseManifest,
+    DETACHED_RELEASE_TARGETS, RELEASE_MANIFEST_SCHEMA_VERSION, RELEASE_TARGETS,
+    REQUIRED_RELEASE_BINARIES, ReleaseArtifact, ReleaseBrokerStorageCompatibility,
+    ReleaseCompatibility, ReleaseInstaller, ReleaseManifest, WINDOWS_RELEASE_TARGET,
     release_archive_filename,
 };
 pub use remote_target::{

@@ -161,7 +161,7 @@ mod tests {
             let archive = release_archive_filename("0.2.0", target);
             assert_eq!(
                 formula.contains(&archive),
-                !target.ends_with("-musl") && *target != "x86_64-pc-windows-msvc",
+                !target.ends_with("-musl"),
                 "{archive}"
             );
         }

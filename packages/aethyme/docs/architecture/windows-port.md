@@ -13,8 +13,11 @@ approved this scope on 2026-10-06:
 - Broker-backed commands refuse with a clear unsupported-platform error and a
   nonzero exit code. Graph lifecycle commands that depend on the broker's
   Unix locking path are also unavailable in this phase.
-- Native build and smoke coverage on windows-latest; the signed release
-  manifest lists the Windows zip and release installation is documented below.
+- Native build and smoke coverage on windows-latest. The Windows zip is
+  checksummed in `SHA256SUMS` and signed with its own Sigstore bundle; it is not
+  listed in `release-manifest.json`, because every released updater (up to
+  0.8.24) refuses a manifest with a non-tarball entry. Installation is
+  documented in the README.
 
 Phase 2 remains a separate later issue: broker parity, named-pipe IPC,
 Windows process binding for #542 and #360, and path identity.

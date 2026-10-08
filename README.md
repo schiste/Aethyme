@@ -59,19 +59,17 @@ arm64 Linux (glibc), x86-64 Linux (musl, static, for Alpine and other
 non-glibc distributions), and Windows x64. A release contains the paired
 `aethyme` router and `aethyme-engine-cli` engine binary.
 
-On Windows, download the x86_64-pc-windows-msvc zip, the release manifest,
-and its Sigstore bundle from the same GitHub release. Verify the signed
-manifest and the archive before extracting the pair:
+On Windows, download the `x86_64-pc-windows-msvc` zip and its Sigstore bundle
+(`<zip>.sigstore.json`) from the same GitHub release, and verify the archive
+before extracting the pair. The zip is signed on its own rather than listed in
+`release-manifest.json`, which every released `aethyme update` validates and
+which therefore lists tarballs only:
 
 ~~~
-$manifest = Get-Content -LiteralPath "release-manifest.json" -Raw | ConvertFrom-Json
-$tag = "v$($manifest.version)"
-cosign verify-blob --bundle "release-manifest.sigstore.json" --certificate-identity "https://github.com/schiste/Aethyme/.github/workflows/release.yml@refs/tags/$tag" --certificate-oidc-issuer https://token.actions.githubusercontent.com "release-manifest.json"
-$artifact = $manifest.artifacts | Where-Object target -eq "x86_64-pc-windows-msvc"
+$tag = "v<version>"   # replace with the release tag you downloaded
 $archive = "aethyme-$tag-x86_64-pc-windows-msvc.zip"
-if ((Get-FileHash $archive -Algorithm SHA256).Hash.ToLowerInvariant() -ne $artifact.sha256) {
-  throw "Windows release archive checksum does not match the signed manifest"
-}
+cosign verify-blob --bundle "$archive.sigstore.json" --certificate-identity "https://github.com/schiste/Aethyme/.github/workflows/release.yml@refs/tags/$tag" --certificate-oidc-issuer https://token.actions.githubusercontent.com $archive
+if ($LASTEXITCODE -ne 0) { throw "Windows release archive signature does not verify" }
 $install = Join-Path (Join-Path $env:LOCALAPPDATA "Aethyme") "bin"
 New-Item -ItemType Directory -Force -Path $install | Out-Null
 Expand-Archive -LiteralPath $archive -DestinationPath $install -Force

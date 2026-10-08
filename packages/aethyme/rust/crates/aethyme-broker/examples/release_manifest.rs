@@ -8,8 +8,8 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use aethyme_broker::{
-    RELEASE_TARGETS, REQUIRED_RELEASE_BINARIES, ReleaseArtifact, ReleaseInstaller, ReleaseManifest,
-    release_archive_filename,
+    DETACHED_RELEASE_TARGETS, RELEASE_TARGETS, REQUIRED_RELEASE_BINARIES, ReleaseArtifact,
+    ReleaseInstaller, ReleaseManifest, release_archive_filename,
 };
 use sha2::{Digest, Sha256};
 
@@ -127,6 +127,16 @@ fn write_outputs(options: &Options, manifest: &ReleaseManifest) -> Result<(), St
             .map_err(|error| format!("write checksum for {archive}: {error}"))?;
         aggregate.push_str(&line);
     }
+    // Detached archives (the Windows zip) are checksummed beside the manifest
+    // but never listed in it: released updaters reject a non-tarball entry.
+    for target in DETACHED_RELEASE_TARGETS {
+        let archive = release_archive_filename(&manifest.version, target);
+        let (digest, _) = hash_file(&options.dist.join(&archive))?;
+        let line = format!("{digest}  {archive}\n");
+        fs::write(options.dist.join(format!("{archive}.sha256")), &line)
+            .map_err(|error| format!("write checksum for {archive}: {error}"))?;
+        aggregate.push_str(&line);
+    }
     let installer_name = &manifest.installer.filename;
     let installer_digest = &manifest.installer.sha256;
     let installer_line = format!("{installer_digest}  {installer_name}\n");
@@ -178,7 +188,7 @@ mod tests {
     fn fixture() -> (tempfile::TempDir, Options) {
         let temp = tempfile::tempdir().unwrap();
         let tag = format!("v{}", env!("CARGO_PKG_VERSION"));
-        for target in RELEASE_TARGETS {
+        for target in RELEASE_TARGETS.iter().chain(DETACHED_RELEASE_TARGETS) {
             fs::write(
                 temp.path()
                     .join(release_archive_filename(env!("CARGO_PKG_VERSION"), target)),
@@ -207,6 +217,15 @@ mod tests {
         assert_eq!(manifest.source_sha, "a".repeat(40));
         assert_eq!(manifest.release_channel, "stable");
         assert_eq!(manifest.artifacts.len(), RELEASE_TARGETS.len());
+        // Released updaters (<= 0.8.24) refuse a manifest listing any non-tarball.
+        assert!(
+            manifest
+                .artifacts
+                .iter()
+                .all(|artifact| artifact.archive.ends_with(".tar.gz")),
+            "{:?}",
+            manifest.artifacts
+        );
         assert_eq!(
             manifest.required_binaries,
             REQUIRED_RELEASE_BINARIES
@@ -240,8 +259,11 @@ mod tests {
 
         assert!(options.output.is_file());
         let sums = fs::read_to_string(options.dist.join("SHA256SUMS")).unwrap();
-        assert_eq!(sums.lines().count(), RELEASE_TARGETS.len() + 1);
-        for target in RELEASE_TARGETS {
+        assert_eq!(
+            sums.lines().count(),
+            RELEASE_TARGETS.len() + DETACHED_RELEASE_TARGETS.len() + 1
+        );
+        for target in RELEASE_TARGETS.iter().chain(DETACHED_RELEASE_TARGETS) {
             let archive = release_archive_filename(env!("CARGO_PKG_VERSION"), target);
             assert!(sums.contains(&archive));
             assert!(options.dist.join(format!("{archive}.sha256")).is_file());

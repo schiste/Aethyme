@@ -271,6 +271,20 @@ jobs:
             --certificate-oidc-issuer https://token.actions.githubusercontent.com \
             dist/release-manifest.json
 
+      - name: Sign and verify the detached Windows zip
+        # The Windows zip is not listed in release-manifest.json (released
+        # updaters reject a non-tarball entry), so it carries its own bundle.
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          zip="dist/aethyme-${REF_NAME}-x86_64-pc-windows-msvc.zip"
+          cosign sign-blob --yes --bundle "$zip.sigstore.json" "$zip"
+          cosign verify-blob \
+            --bundle "$zip.sigstore.json" \
+            --certificate-identity "https://github.com/${GITHUB_REPOSITORY}/.github/workflows/release.yml@refs/tags/${REF_NAME}" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            "$zip"
+
       - name: Render release notes
         # The body is the tag's CHANGELOG.md entry plus its UPGRADING.md
         # section when the release is breaking; release_contract checks the

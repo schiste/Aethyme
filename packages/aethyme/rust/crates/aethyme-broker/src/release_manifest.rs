@@ -15,20 +15,29 @@ use crate::{
 
 pub const RELEASE_MANIFEST_SCHEMA_VERSION: u32 = 1;
 pub const GRAPH_REFRESH_PLAN_SCHEMA_VERSION: u32 = 1;
+/// Targets listed in the signed `release-manifest.json`. Every Aethyme binary
+/// that can self-update validates that manifest before updating, and binaries
+/// up to 0.8.24 require every listed archive to be a `.tar.gz`; a manifest
+/// listing a `.zip` would make each of them refuse the release. Keep this set
+/// to tarball targets until no supported updater predates zip support.
 pub const RELEASE_TARGETS: &[&str] = &[
     "aarch64-apple-darwin",
     "x86_64-apple-darwin",
-    "x86_64-pc-windows-msvc",
     "x86_64-unknown-linux-gnu",
     "aarch64-unknown-linux-gnu",
     "x86_64-unknown-linux-musl",
 ];
+/// The native Windows x64 build, shipped as a zip.
+pub const WINDOWS_RELEASE_TARGET: &str = "x86_64-pc-windows-msvc";
+/// Targets published beside the manifest rather than in it: checksummed in
+/// `SHA256SUMS` and signed on their own, but invisible to `aethyme update`.
+pub const DETACHED_RELEASE_TARGETS: &[&str] = &[WINDOWS_RELEASE_TARGET];
 pub const REQUIRED_RELEASE_BINARIES: &[&str] = &["aethyme", "aethyme-engine-cli"];
 
 /// Return the release archive name for a version and Rust target triple.
 /// Windows artifacts are zip files; Unix artifacts remain tarballs.
 pub fn release_archive_filename(version: &str, target: &str) -> String {
-    let extension = if target == "x86_64-pc-windows-msvc" {
+    let extension = if target == WINDOWS_RELEASE_TARGET {
         "zip"
     } else {
         "tar.gz"
@@ -228,6 +237,23 @@ fn valid_version(version: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn manifest_targets_stay_readable_by_every_released_updater() {
+        // Updaters up to 0.8.24 accept only `aethyme-v<version>-<target>.tar.gz`.
+        for target in RELEASE_TARGETS {
+            assert_eq!(
+                release_archive_filename("0.2.0", target),
+                format!("aethyme-v0.2.0-{target}.tar.gz"),
+                "{target} would make released updaters refuse the manifest"
+            );
+        }
+        assert!(!RELEASE_TARGETS.contains(&WINDOWS_RELEASE_TARGET));
+        assert_eq!(
+            release_archive_filename("0.2.0", WINDOWS_RELEASE_TARGET),
+            "aethyme-v0.2.0-x86_64-pc-windows-msvc.zip"
+        );
+    }
 
     fn artifact(target: &str) -> ReleaseArtifact {
         ReleaseArtifact {

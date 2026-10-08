@@ -12,15 +12,6 @@ use aethyme_testkit::{
     repo_root, tmp_dir,
 };
 
-fn release_archive_filename(version: &str, target: &str) -> String {
-    let extension = if target == "x86_64-pc-windows-msvc" {
-        "zip"
-    } else {
-        "tar.gz"
-    };
-    format!("aethyme-v{version}-{target}.{extension}")
-}
-
 #[test]
 fn stable_installer_fetches_verifies_and_updates_the_binary_pair() {
     let router_binary = aethyme_bin();
@@ -57,7 +48,7 @@ fn stable_installer_fetches_verifies_and_updates_the_binary_pair() {
         ("linux", "aarch64") => "aarch64-unknown-linux-gnu",
         pair => panic!("unsupported installer test platform: {pair:?}"),
     };
-    let archive = release_archive_filename(&version, target);
+    let archive = format!("aethyme-v{version}-{target}.tar.gz");
     let archive_path = exact.join(&archive);
     let installer_path = repo_root().join("install.sh");
     let installer_digest = format!("{:x}", Sha256::digest(fs::read(&installer_path).unwrap()));
@@ -80,7 +71,6 @@ fn stable_installer_fetches_verifies_and_updates_the_binary_pair() {
     let targets = [
         "aarch64-apple-darwin",
         "x86_64-apple-darwin",
-        "x86_64-pc-windows-msvc",
         "x86_64-unknown-linux-gnu",
         "aarch64-unknown-linux-gnu",
         "x86_64-unknown-linux-musl",
@@ -90,7 +80,7 @@ fn stable_installer_fetches_verifies_and_updates_the_binary_pair() {
         .map(|artifact_target| {
             let selected = *artifact_target == target;
             json!({
-                "archive": release_archive_filename(&version, artifact_target),
+                "archive": format!("aethyme-v{version}-{artifact_target}.tar.gz"),
                 "binaries": ["aethyme", "aethyme-engine-cli"],
                 "sha256": if selected { digest.clone() } else { "b".repeat(64) },
                 "size_bytes": if selected { archive_size } else { 1 },
