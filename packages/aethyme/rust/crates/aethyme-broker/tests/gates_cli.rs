@@ -865,6 +865,42 @@ fn pre_push_adapter_proves_the_clean_outgoing_head_and_refuses_drift() {
 }
 
 #[test]
+fn pre_push_failure_names_the_gate_and_prints_its_bounded_output() {
+    let tmp = fixture();
+    std::fs::write(
+        tmp.path().join(".aethyme/gates.toml"),
+        "[[gate]]\nname='schema-check'\ncommand='echo packages/payment/broken.rs; exit 23'\n",
+    )
+    .unwrap();
+    git(tmp.path(), &["add", ".aethyme/gates.toml"]);
+    git(tmp.path(), &["commit", "-qm", "configure failing gate"]);
+    let head = git_output(tmp.path(), &["rev-parse", "HEAD"]);
+    let update = format!(
+        "refs/heads/main {head} refs/heads/main {}\n",
+        "0".repeat(40)
+    );
+
+    let output = run_with_stdin(
+        tmp.path(),
+        &["advanced", "gates", "pre-push", "origin", "unused-url"],
+        &update,
+    );
+    assert!(!output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stdout.contains("schema-check") && stdout.contains("fail/test_failure"),
+        "{stdout}"
+    );
+    assert!(stderr.contains("gate schema-check output"), "{stderr}");
+    assert!(stderr.contains("packages/payment/broken.rs"), "{stderr}");
+    assert!(
+        stderr.contains("bounded output are shown above"),
+        "{stderr}"
+    );
+}
+
+#[test]
 fn submit_cli_reports_an_unchanged_worktree_submission_as_a_noop() {
     let tmp = fixture();
     let worktree = tmp.path().join(".aethyme/worktrees/noop-submit");
