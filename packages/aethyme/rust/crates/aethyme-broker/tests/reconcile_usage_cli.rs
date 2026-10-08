@@ -6,7 +6,7 @@ use aethyme_broker::Broker;
 const CLI: &str = env!("CARGO_BIN_EXE_broker-cli-shim");
 const RESOURCES_USAGE: &str =
     "usage: aethyme broker advanced resources reconcile <lease-id> --confirm <generation> [--json]";
-const OPERATIONS_USAGE: &str = "usage: aethyme broker advanced operations reconcile --operation <id> \
+const OPERATIONS_USAGE: &str = "usage: aethyme broker advanced operations reconcile --operation <id|host-operation-id> \
      --outcome <succeeded|failed> --reason <text> [--json]";
 const INTEGRATION_USAGE: &str = "usage: aethyme broker advanced integration reconcile --upstream <ref> \
      [--resolution-file <path>] [--write-resolution-template <path>] \

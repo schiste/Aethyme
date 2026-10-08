@@ -3983,6 +3983,21 @@ impl BrokerStore {
             .transpose()
     }
 
+    /// Find the repository journal row linked to a host-wide operation id.
+    pub fn coordinated_operation_id_for_host_operation(
+        &self,
+        host_operation_id: &str,
+    ) -> Result<Option<i64>, BrokerError> {
+        self.conn
+            .query_row(
+                "SELECT id FROM coordinated_operations WHERE host_operation_id = ?1",
+                [host_operation_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
     pub fn coordinated_operations(&self) -> Result<Vec<CoordinatedOperation>, BrokerError> {
         let mut stmt = self.conn.prepare(
             "SELECT id, session_id, provider, repository, scope, effect,
