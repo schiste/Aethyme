@@ -210,8 +210,17 @@ fn operation_failure(phase: &'static str, report: &CoordinatedOperationReport) -
 
 const PRE_PUSH_PATH_HINT: &str = "Hint: the pre-push hook could not find a required executable. Git hooks inherit the PATH of the aethyme process; ensure it includes the hook's toolchain (interactive shell startup files are not loaded), then retry.";
 
+/// The PATH hint, when a refused push reports a missing executable. Only a
+/// failed push qualifies: the same failure text is shared by every coordinated
+/// git and gh operation, and gh's `HTTP 404: Not Found` would otherwise read
+/// as a hook that could not find its toolchain.
 pub(crate) fn missing_executable_path_hint(stdout: &str, stderr: &str) -> Option<&'static str> {
     let output = format!("{stdout}\n{stderr}").to_ascii_lowercase();
+    let refused_push =
+        output.contains("failed to push some refs") || output.contains("pre-push hook");
+    if !refused_push {
+        return None;
+    }
     [
         "command not found",
         ": not found",
@@ -893,6 +902,32 @@ fn measure_pr_size(main_root: &Path, base_ref: &str, head: &str) -> Option<crate
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn path_hint_needs_a_refused_push_not_any_not_found() {
+        let hook = "env: node: No such file or directory\n\
+                    error: failed to push some refs to 'https://example.invalid/r.git'";
+        assert_eq!(
+            missing_executable_path_hint("", hook),
+            Some(PRE_PUSH_PATH_HINT)
+        );
+        for unrelated in [
+            "HTTP 404: Not Found (https://api.github.com/repos/o/r/pulls/9)",
+            "gh: Not Found (HTTP 404)",
+            "fatal: could not read 'x': No such file or directory",
+        ] {
+            assert_eq!(
+                missing_executable_path_hint("", unrelated),
+                None,
+                "{unrelated}"
+            );
+        }
+        assert_eq!(
+            missing_executable_path_hint("", "error: failed to push some refs to 'origin'"),
+            None,
+            "a refused push with no missing executable gets no hint"
+        );
+    }
 
     #[test]
     fn only_session_branches_are_publishable() {
