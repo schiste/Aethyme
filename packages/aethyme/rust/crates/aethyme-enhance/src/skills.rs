@@ -48,13 +48,19 @@ pub fn deploy_skills(target_repo: &Path, force: bool) -> Result<Vec<String>, Str
             }
             std::fs::write(&dest, content).map_err(|e| format!("{}: {e}", dest.display()))?;
             if *executable {
-                use std::os::unix::fs::PermissionsExt;
-                let metadata =
-                    std::fs::metadata(&dest).map_err(|e| format!("{}: {e}", dest.display()))?;
-                let mut permissions = metadata.permissions();
-                permissions.set_mode(permissions.mode() | 0o111);
-                std::fs::set_permissions(&dest, permissions)
-                    .map_err(|e| format!("{}: {e}", dest.display()))?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let metadata =
+                        std::fs::metadata(&dest).map_err(|e| format!("{}: {e}", dest.display()))?;
+                    let mut permissions = metadata.permissions();
+                    permissions.set_mode(permissions.mode() | 0o111);
+                    std::fs::set_permissions(&dest, permissions)
+                        .map_err(|e| format!("{}: {e}", dest.display()))?;
+                }
+                // Windows does not represent executability with Unix mode bits.
+                #[cfg(not(unix))]
+                let _ = &dest;
             }
         }
         let broker_reference = dest_dir.join("references/broker.md");

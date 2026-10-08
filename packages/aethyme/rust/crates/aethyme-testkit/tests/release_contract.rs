@@ -659,3 +659,54 @@ fn the_current_version_renders_release_notes() {
         aethyme_testkit::release_notes::upgrading_sections(&upgrading).contains_key(&version);
     assert_eq!(body.contains("\n## Upgrading\n"), breaking);
 }
+
+#[test]
+fn windows_release_builds_and_smokes_the_native_zip() {
+    let root = aethyme_testkit::paths::repo_root();
+    let release = std::fs::read_to_string(root.join(".github/workflows/release.yml")).unwrap();
+    let ci = std::fs::read_to_string(root.join(".github/workflows/windows-release.yml")).unwrap();
+    let smoke = std::fs::read_to_string(root.join("scripts/windows-release-smoke.ps1")).unwrap();
+
+    for fragment in [
+        "build-windows:",
+        "runs-on: windows-latest",
+        "x86_64-pc-windows-msvc",
+        "Compress-Archive",
+        "windows-release-smoke.ps1",
+        "needs: [build, build-windows]",
+        "windows_count",
+        "test \"$windows_count\" = \"1\"",
+        "Sign and verify the detached Windows zip",
+    ] {
+        assert!(
+            release.contains(fragment),
+            "release workflow is missing {fragment}"
+        );
+    }
+    for fragment in [
+        "runs-on: windows-latest",
+        "cargo build --release --locked --target x86_64-pc-windows-msvc",
+        "aethyme-graph-indexer --bin aethyme-graph-index",
+        "windows-release-smoke.ps1",
+    ] {
+        assert!(
+            ci.contains(fragment),
+            "Windows CI workflow is missing {fragment}"
+        );
+    }
+    for fragment in [
+        "--repo-root",
+        "--repo-name aethyme-windows-smoke",
+        "index --repo",
+        "explore --repo",
+        "graph overview --repo",
+        "deploy --generated-only --repo",
+        "broker quick-test",
+        "the broker is not yet supported on Windows",
+    ] {
+        assert!(
+            smoke.contains(fragment),
+            "Windows smoke is missing {fragment}"
+        );
+    }
+}

@@ -378,13 +378,24 @@ fn is_executable(relative: &str) -> bool {
 }
 
 fn ensure_executable(path: &Path) -> Result<(), String> {
-    use std::os::unix::fs::PermissionsExt;
-    let mut permissions = std::fs::symlink_metadata(path)
-        .map_err(|error| format!("{}: {error}", path.display()))?
-        .permissions();
-    permissions.set_mode(permissions.mode() | 0o111);
-    std::fs::set_permissions(path, permissions)
-        .map_err(|error| format!("{}: {error}", path.display()))
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::symlink_metadata(path)
+            .map_err(|error| format!("{}: {error}", path.display()))?
+            .permissions();
+        permissions.set_mode(permissions.mode() | 0o111);
+        std::fs::set_permissions(path, permissions)
+            .map_err(|error| format!("{}: {error}", path.display()))
+    }
+    #[cfg(not(unix))]
+    {
+        // Still require the generated file to exist; Windows has no Unix mode
+        // bit to set.
+        std::fs::symlink_metadata(path)
+            .map(|_| ())
+            .map_err(|error| format!("{}: {error}", path.display()))
+    }
 }
 
 fn git_tracked(repo: &Path, relative: &str) -> Result<bool, String> {

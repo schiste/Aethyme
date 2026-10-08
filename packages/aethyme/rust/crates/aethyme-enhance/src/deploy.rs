@@ -172,7 +172,7 @@ pub(crate) fn ensure_no_symlink_in_path(repo: &Path, path: &Path) -> Result<(), 
                 return Err(format!(
                     "refusing to write {}: path must be a plain repository-relative path",
                     path.display()
-                ))
+                ));
             }
         }
         match std::fs::symlink_metadata(&current) {
@@ -212,13 +212,21 @@ fn create_parent_dirs(repo: &Path, path: &Path) -> Result<(), String> {
 }
 
 fn ensure_executable(repo: &Path, path: &Path) -> Result<(), String> {
-    use std::os::unix::fs::PermissionsExt;
     ensure_no_symlink_in_path(repo, path)?;
-    let metadata =
-        std::fs::symlink_metadata(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let mut permissions = metadata.permissions();
-    permissions.set_mode(permissions.mode() | 0o111);
-    std::fs::set_permissions(path, permissions).map_err(|e| format!("{}: {e}", path.display()))
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let metadata =
+            std::fs::symlink_metadata(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let mut permissions = metadata.permissions();
+        permissions.set_mode(permissions.mode() | 0o111);
+        std::fs::set_permissions(path, permissions).map_err(|e| format!("{}: {e}", path.display()))
+    }
+    #[cfg(not(unix))]
+    {
+        // Windows does not represent executable permission as a mode bit.
+        Ok(())
+    }
 }
 
 fn read_text(path: &Path) -> Result<String, String> {
