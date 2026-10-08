@@ -2,6 +2,7 @@
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
+use std::path::PathBuf;
 use std::process::Command;
 
 use serde_json::json;
@@ -12,10 +13,23 @@ use aethyme_testkit::{
     repo_root, tmp_dir,
 };
 
+fn installer_test_binary(name: &str, fallback: impl FnOnce() -> PathBuf) -> PathBuf {
+    let path = std::env::var_os("AETHYME_RELEASE_TEST_BIN_DIR")
+        .map(PathBuf::from)
+        .map(|directory| directory.join(name))
+        .unwrap_or_else(fallback);
+    assert!(
+        path.is_file(),
+        "installer test binary {name} is missing at {}",
+        path.display()
+    );
+    path
+}
+
 #[test]
 fn stable_installer_fetches_verifies_and_updates_the_binary_pair() {
-    let router_binary = aethyme_bin();
-    let engine_binary = engine_bin();
+    let router_binary = installer_test_binary("aethyme", aethyme_bin);
+    let engine_binary = installer_test_binary("aethyme-engine-cli", engine_bin);
     let version_output = Command::new(&router_binary)
         .arg("--version")
         .output()

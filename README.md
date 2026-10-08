@@ -59,6 +59,16 @@ arm64 Linux (glibc), and x86-64 Linux (musl, static, for Alpine and other
 non-glibc distributions). A release contains the paired `aethyme` router and
 `aethyme-engine-cli` engine binary.
 
+On arm64 Linux, only the glibc build exists; there is no arm64 musl archive,
+so Alpine and other non-glibc arm64 systems are not supported. Every release
+smoke-tests the arm64 archive on a native GitHub `ubuntu-24.04-arm` runner
+(`broker quick-test` and a graph refresh) before it is published, and pull
+requests that touch the installer, updater or release inputs also run the
+installer, update, rollback, two-worktree and host-lock tests there. Rollback
+works as on every other target: `aethyme update execute` keeps the previous
+binary pair as the single rollback bundle, and a failed download, checksum,
+staged smoke or activation leaves or restores the earlier pair.
+
 Windows is not supported natively; run the x86-64 Linux build under WSL2.
 The cost of a native port is scoped in
 [docs/architecture/windows-port.md](packages/aethyme/docs/architecture/windows-port.md).
