@@ -104,3 +104,7 @@ finally {
         Remove-Item -LiteralPath $repo -Recurse -Force
     }
 }
+
+# The expected broker refusal above leaves a native exit code of 1 behind.
+# The smoke script itself succeeded, so do not propagate that code to CI.
+$global:LASTEXITCODE = 0
