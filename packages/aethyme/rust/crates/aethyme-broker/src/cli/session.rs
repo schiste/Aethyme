@@ -731,7 +731,14 @@ pub(super) fn capture_declared_scopes(
 /// report is already answerable by `broker storage`.
 pub(super) fn render_worktree_report(report: &crate::WorktreeReport) {
     if report.rows.is_empty() {
-        out!("No worktrees on this host.");
+        if report.deferred_checks.is_empty() {
+            out!("No worktrees on this host.");
+        } else {
+            out!(
+                "No worktrees were confirmed before the report budget ended. Deferred checks: {}.",
+                report.deferred_checks.join(", ")
+            );
+        }
         return;
     }
     out!(
@@ -752,6 +759,9 @@ pub(super) fn render_worktree_report(report: &crate::WorktreeReport) {
             crate::WORKTREE_REPORT_SIZE_BUDGET.as_secs()
         );
     }
+    if !report.deferred_checks.is_empty() {
+        out!("Deferred checks: {}.", report.deferred_checks.join(", "));
+    }
     out!();
     for row in &report.rows {
         let state = match &row.work {
@@ -764,6 +774,9 @@ pub(super) fn render_worktree_report(report: &crate::WorktreeReport) {
             crate::WorkState::Recoverable => "recoverable".to_string(),
             crate::WorkState::NotACheckout => "not a checkout".to_string(),
             crate::WorkState::PrunableRegistration => "prunable registration".to_string(),
+            crate::WorkState::NotInspected => {
+                "not inspected; treat as holding unique work".to_string()
+            }
         };
         let idle = row
             .idle_days

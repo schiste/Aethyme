@@ -12,7 +12,42 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+thread_local! {
+    /// An optional end-to-end inspection deadline inherited by every Git
+    /// command on this thread. Interactive reports install it while they
+    /// inspect a checkout so one slow subprocess cannot outlive the report.
+    static GIT_INSPECTION_DEADLINE: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
+}
+
+/// Temporarily cap Git commands on the current thread at `deadline`.
+/// Nested inspections keep the earlier deadline and restore their caller's
+/// limit when the guard is dropped.
+pub(crate) struct GitDeadlineGuard {
+    previous: Option<Instant>,
+}
+
+pub(crate) fn limit_git_until(deadline: Instant) -> GitDeadlineGuard {
+    let previous = GIT_INSPECTION_DEADLINE.with(|slot| {
+        let previous = slot.get();
+        slot.set(Some(
+            previous.map_or(deadline, |current| current.min(deadline)),
+        ));
+        previous
+    });
+    GitDeadlineGuard { previous }
+}
+
+pub(crate) fn active_git_deadline() -> Option<Instant> {
+    GIT_INSPECTION_DEADLINE.with(std::cell::Cell::get)
+}
+
+impl Drop for GitDeadlineGuard {
+    fn drop(&mut self) {
+        GIT_INSPECTION_DEADLINE.with(|slot| slot.set(self.previous));
+    }
+}
 
 static NEXT_PRIVATE_INDEX_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -907,10 +942,42 @@ fn run_git_command(command: Command, args: &[&str], budget: Duration) -> Result<
 }
 
 fn run_git_command_output(
+    command: Command,
+    args: &[&str],
+    budget: Duration,
+) -> Result<std::process::Output, GitError> {
+    let output = run_git_process_output(command, args, budget)?;
+    if !output.status.success() {
+        return Err(GitError::Git {
+            args: args.join(" "),
+            stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        });
+    }
+    Ok(output)
+}
+
+/// Run Git within its ordinary timeout, or the remaining part of the
+/// enclosing interactive inspection deadline. Unlike
+/// [`run_git_command_output`], this preserves non-zero exit status for
+/// commands where it is an expected answer (such as `merge-base --is-ancestor`).
+fn run_git_process_output(
     mut command: Command,
     args: &[&str],
     budget: Duration,
 ) -> Result<std::process::Output, GitError> {
+    let budget = match active_git_deadline() {
+        Some(deadline) => {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(GitError::TimedOut {
+                    args: args.join(" "),
+                    seconds: 1,
+                });
+            }
+            budget.min(remaining)
+        }
+        None => budget,
+    };
     let output = crate::bounded_output::output_within(&mut command, budget)
         .map_err(|source| GitError::Spawn {
             args: args.join(" "),
@@ -920,12 +987,6 @@ fn run_git_command_output(
             args: args.join(" "),
             seconds: budget.as_secs(),
         })?;
-    if !output.status.success() {
-        return Err(GitError::Git {
-            args: args.join(" "),
-            stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
-        });
-    }
     Ok(output)
 }
 /// A commit's tree and parents, in Git's stored parent order.
@@ -1561,12 +1622,29 @@ impl GitRepo {
     /// True when `ancestor` is reachable from `descendant`
     /// (`git merge-base --is-ancestor`).
     pub fn is_ancestor(&self, ancestor: &str, descendant: &str) -> bool {
-        git_command()
-            .args(["merge-base", "--is-ancestor", ancestor, descendant])
-            .current_dir(&self.root)
-            .status()
-            .map(|status| status.success())
+        self.is_ancestor_checked(ancestor, descendant)
             .unwrap_or(false)
+    }
+
+    /// The checked form distinguishes "not an ancestor" from an inspection
+    /// that failed or exhausted its enclosing deadline. Interactive status
+    /// must not turn the latter into a divergence verdict.
+    pub fn is_ancestor_checked(&self, ancestor: &str, descendant: &str) -> Result<bool, GitError> {
+        let args = ["merge-base", "--is-ancestor", ancestor, descendant];
+        let mut command = git_command();
+        command
+            .args(args)
+            .current_dir(&self.root)
+            .env("GIT_OPTIONAL_LOCKS", "0");
+        let output = run_git_process_output(command, &args, git_timeout())?;
+        match output.status.code() {
+            Some(0) => Ok(true),
+            Some(1) => Ok(false),
+            _ => Err(GitError::Git {
+                args: args.join(" "),
+                stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+            }),
+        }
     }
 
     /// Fast-forward the checked-out branch and worktree to an exact commit.
@@ -4071,6 +4149,29 @@ mod timeout_tests {
         );
         assert!(started.elapsed() < Duration::from_secs(10));
         assert!(error.to_string().contains(GIT_TIMEOUT_ENV), "{error}");
+    }
+
+    #[test]
+    fn an_interactive_deadline_caps_a_git_call_with_a_larger_local_budget() {
+        let deadline = Instant::now() + Duration::from_millis(300);
+        let _limit = limit_git_until(deadline);
+        let mut command = Command::new("sh");
+        command.args(["-c", "exec sleep 30"]);
+        let started = Instant::now();
+        let error = run_git_command(command, &["status"], Duration::from_secs(30))
+            .expect_err("the enclosing inspection deadline must cap this command");
+        assert!(matches!(error, GitError::TimedOut { .. }), "{error:?}");
+        assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    #[test]
+    fn an_expired_interactive_deadline_does_not_spawn_git() {
+        let _limit = limit_git_until(Instant::now() - Duration::from_millis(1));
+        let mut command = Command::new("sh");
+        command.args(["-c", "exit 0"]);
+        let error = run_git_command(command, &["status"], Duration::from_secs(30))
+            .expect_err("an expired report must not start another Git command");
+        assert!(matches!(error, GitError::TimedOut { .. }), "{error:?}");
     }
 
     #[test]

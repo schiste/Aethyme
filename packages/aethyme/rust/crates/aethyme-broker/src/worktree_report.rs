@@ -29,12 +29,18 @@ pub enum WorkState {
     NotACheckout,
     /// Git retains a registration marked prunable; its work could not be classified.
     PrunableRegistration,
+    /// The report budget ended before Git could determine whether this
+    /// checkout contains unique work. Treat it as unique until inspected.
+    NotInspected,
 }
 
 impl WorkState {
     /// Whether removing this worktree would destroy the only copy of work.
     pub fn holds_unique_work(&self) -> bool {
-        matches!(self, Self::Uncommitted { .. } | Self::Unpushed { .. })
+        matches!(
+            self,
+            Self::Uncommitted { .. } | Self::Unpushed { .. } | Self::NotInspected
+        )
     }
 
     pub fn as_str(&self) -> &'static str {
@@ -44,6 +50,7 @@ impl WorkState {
             Self::Recoverable => "recoverable",
             Self::NotACheckout => "not_a_checkout",
             Self::PrunableRegistration => "prunable_registration",
+            Self::NotInspected => "not_inspected",
         }
     }
 }
@@ -114,6 +121,10 @@ pub struct WorktreeReport {
     pub size_scan: &'static str,
     /// Rows whose size was not measured within the budget.
     pub unmeasured_count: usize,
+    /// Checks skipped when the interactive report deadline expired. A partial
+    /// row is never a clean or recoverable verdict.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deferred_checks: Vec<String>,
 }
 
 /// Bytes under a directory, following no symlink out of it.
@@ -175,13 +186,18 @@ fn sort_report(report: &mut WorktreeReport) {
     });
 }
 
-fn append_prunable_rows(
+fn append_prunable_rows_until(
     report: &mut WorktreeReport,
     repository: &str,
     entries: &[GitWorktreeInfo],
     live: &BTreeSet<PathBuf>,
+    deadline: Option<std::time::Instant>,
 ) {
     for entry in entries.iter().filter(|entry| entry.prunable) {
+        if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+            report.deferred_checks.push("prunable_registrations".into());
+            break;
+        }
         if let Some(row) = report
             .rows
             .iter_mut()
@@ -199,20 +215,32 @@ fn append_prunable_rows(
             continue;
         }
 
-        let usage = if entry.path.is_dir() {
-            tree_usage(&entry.path)
+        let usage = if !entry.path.is_dir() {
+            Some(crate::disk_headroom::DirectoryUsage::default())
+        } else if let Some(deadline) = deadline {
+            crate::disk_headroom::directory_usage_bounded(&entry.path, deadline)
         } else {
-            crate::disk_headroom::DirectoryUsage::default()
+            Some(tree_usage(&entry.path))
         };
+        let measured = usage.is_some();
+        let usage = usage.unwrap_or_default();
         report.total_bytes = report.total_bytes.saturating_add(usage.bytes);
         report.total_inodes = report.total_inodes.saturating_add(usage.inodes);
+        if !measured {
+            report.unmeasured_count += 1;
+            report.deferred_checks.push("worktree_sizing".into());
+        }
         report.rows.push(WorktreeRow {
             repository: repository.to_string(),
             path: entry.path.clone(),
             branch: short_branch(entry.branch.as_deref()),
             bytes: usage.bytes,
             inodes: usage.inodes,
-            size: SizeSource::Measured,
+            size: if measured {
+                SizeSource::Measured
+            } else {
+                SizeSource::Unmeasured
+            },
             size_measured_at_ms: None,
             idle_days: None,
             work: WorkState::PrunableRegistration,
@@ -224,24 +252,24 @@ fn append_prunable_rows(
     }
 }
 
-pub(crate) fn append_prunable_registrations(
+pub(crate) fn append_prunable_registrations_until(
     report: &mut WorktreeReport,
     repository: &str,
     entries: &[GitWorktreeInfo],
     live: &BTreeSet<PathBuf>,
+    deadline: Option<std::time::Instant>,
 ) {
-    append_prunable_rows(report, repository, entries, live);
+    append_prunable_rows_until(report, repository, entries, live, deadline);
     sort_report(report);
 }
 
-/// How long a default `worktrees` pass may spend walking directories to size
-/// checkouts that no earlier measurement recorded.
+/// End-to-end work budget for a default `worktrees` report.
 ///
-/// Sizing has no shortcut: every figure is a full recursive walk, and on a
-/// host holding ~220 worktrees across a dozen repositories the unbounded walk
-/// kept `worktrees --json` past a 150 s caller limit (#559). `--measure`
-/// walks everything, as before.
-pub const WORKTREE_REPORT_SIZE_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+/// Git inspection, registration inventory and sizing share this deadline; a
+/// host holding hundreds of checkouts must return partial, conservative rows
+/// instead of waiting for each repository in turn (#460). `--measure` still
+/// walks every checkout, as before.
+pub const WORKTREE_REPORT_SIZE_BUDGET: std::time::Duration = std::time::Duration::from_secs(7);
 
 /// Upper bound on the threads inspecting checkouts at once. The work is
 /// process spawns and filesystem reads, not CPU.
@@ -253,10 +281,9 @@ pub enum WorktreeSizing {
     /// Walk every checkout to completion.
     Measure,
     /// Use a recorded measurement where one exists, and walk the rest for at
-    /// most `budget`, counted from when sizing starts (after the Git
-    /// inspection, which always completes). A checkout the walk did not
-    /// finish is reported as unmeasured rather than as a partial or zero
-    /// figure.
+    /// at most `budget` from the start of the report. A checkout the walk or
+    /// Git inspection did not finish is reported as unmeasured or unknown
+    /// rather than as a partial, clean or recoverable result.
     Bounded { budget: std::time::Duration },
 }
 
@@ -331,8 +358,15 @@ struct CheckoutState {
     work: WorkState,
 }
 
-fn inspect_checkout(path: &Path) -> CheckoutState {
-    let Ok(repo) = GitRepo::discover(path) else {
+fn inspect_checkout(path: &Path, deadline: Option<std::time::Instant>) -> CheckoutState {
+    if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+        return not_inspected_checkout();
+    }
+    let discovered = GitRepo::discover(path);
+    if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+        return not_inspected_checkout();
+    }
+    let Ok(repo) = discovered else {
         return CheckoutState {
             roots: None,
             branch: None,
@@ -341,6 +375,9 @@ fn inspect_checkout(path: &Path) -> CheckoutState {
         };
     };
     let branch = repo.current_branch().ok();
+    if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+        return not_inspected_checkout();
+    }
     let repository_root = repo
         .main_root()
         .unwrap_or_else(|_| repo.root().to_path_buf());
@@ -348,8 +385,13 @@ fn inspect_checkout(path: &Path) -> CheckoutState {
     // Untracked build output is not work. Counting it would report every
     // checkout that has ever been built as holding something unique, which is
     // exactly the noise that makes a report like this ignorable.
-    let dirty = repo
-        .dirty_paths()
+    let dirty_paths = repo.dirty_paths();
+    if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline)
+        || dirty_paths.is_err()
+    {
+        return not_inspected_checkout();
+    }
+    let dirty = dirty_paths
         .map(|paths| {
             paths
                 .iter()
@@ -381,13 +423,16 @@ fn inspect_checkout(path: &Path) -> CheckoutState {
             (now - at).max(0) / 86_400
         });
 
+    if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+        return not_inspected_checkout();
+    }
     let work = if dirty > 0 {
         WorkState::Uncommitted { files: dirty }
     } else {
         match repo.commits_not_on_any_remote() {
             Ok(0) => WorkState::Recoverable,
             Ok(commits) => WorkState::Unpushed { commits },
-            Err(_) => WorkState::NotACheckout,
+            Err(_) => WorkState::NotInspected,
         }
     };
     CheckoutState {
@@ -395,6 +440,15 @@ fn inspect_checkout(path: &Path) -> CheckoutState {
         branch,
         idle_days,
         work,
+    }
+}
+
+fn not_inspected_checkout() -> CheckoutState {
+    CheckoutState {
+        roots: None,
+        branch: None,
+        idle_days: None,
+        work: WorkState::NotInspected,
     }
 }
 
@@ -411,10 +465,12 @@ where
         .clamp(1, INSPECTION_WORKERS)
         .min(items.len().max(1));
     let next = std::sync::atomic::AtomicUsize::new(0);
+    let deadline = crate::git::active_git_deadline();
     let mut results: Vec<(usize, R)> = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..workers)
             .map(|_| {
                 scope.spawn(|| {
+                    let _git_deadline = deadline.map(crate::git::limit_git_until);
                     let mut done = Vec::new();
                     loop {
                         let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -436,6 +492,57 @@ where
     results.into_iter().map(|(_, result)| result).collect()
 }
 
+/// Run inspections until a shared deadline, returning `None` for work that
+/// never started. Active Git commands on each worker are killed at the same
+/// deadline, so joining the workers does not extend the report's budget.
+fn inspect_in_parallel_until<T, R, F>(
+    items: &[T],
+    deadline: std::time::Instant,
+    inspect: F,
+) -> Vec<Option<R>>
+where
+    T: Sync,
+    R: Send,
+    F: Fn(&T) -> R + Sync,
+{
+    let workers = std::thread::available_parallelism()
+        .map(|count| count.get())
+        .unwrap_or(1)
+        .clamp(1, INSPECTION_WORKERS)
+        .min(items.len().max(1));
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let completed: Vec<(usize, R)> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..workers)
+            .map(|_| {
+                scope.spawn(|| {
+                    let _git_deadline = crate::git::limit_git_until(deadline);
+                    let mut done = Vec::new();
+                    loop {
+                        if std::time::Instant::now() >= deadline {
+                            break;
+                        }
+                        let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let Some(item) = items.get(index) else {
+                            break;
+                        };
+                        done.push((index, inspect(item)));
+                    }
+                    done
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|handle| handle.join().expect("worktree inspection worker panicked"))
+            .collect()
+    });
+    let mut results: Vec<Option<R>> = (0..items.len()).map(|_| None).collect();
+    for (index, result) in completed {
+        results[index] = Some(result);
+    }
+    results
+}
+
 /// Classify an enumerated set of worktrees, worst first, measuring every
 /// checkout. See [`build_with`].
 pub fn build(worktrees: &[(String, PathBuf)], live: &BTreeSet<PathBuf>) -> WorktreeReport {
@@ -452,22 +559,63 @@ pub fn build(worktrees: &[(String, PathBuf)], live: &BTreeSet<PathBuf>) -> Workt
 /// `live` marks checkouts a session is using, so a reader can tell "busy" from
 /// "abandoned" without consulting the broker separately.
 ///
-/// Work classification always completes: it is what the report is for, and
-/// it is per-checkout bounded Git work. Only sizing is subject to `sizing`.
+/// Classification and sizing share the supplied budget when bounded. A
+/// checkout that is not reached in time is marked unknown, and omitted
+/// discovery or inventory work appears in deferred_checks.
 pub fn build_with(
     worktrees: &[(String, PathBuf)],
     live: &BTreeSet<PathBuf>,
     sizing: WorktreeSizing,
 ) -> WorktreeReport {
-    let present: Vec<&(String, PathBuf)> =
-        worktrees.iter().filter(|(_, path)| path.is_dir()).collect();
-    let states = inspect_in_parallel(&present, |(_, path)| inspect_checkout(path));
+    let deadline = match sizing {
+        WorktreeSizing::Measure => None,
+        WorktreeSizing::Bounded { budget } => Some(std::time::Instant::now() + budget),
+    };
+    build_with_deadline(worktrees, live, sizing, deadline)
+}
+
+pub(crate) fn build_with_deadline(
+    worktrees: &[(String, PathBuf)],
+    live: &BTreeSet<PathBuf>,
+    sizing: WorktreeSizing,
+    deadline: Option<std::time::Instant>,
+) -> WorktreeReport {
+    let mut deferred_checks = BTreeSet::new();
+    let mut present = Vec::new();
+    for worktree in worktrees {
+        if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+            deferred_checks.insert("worktree_discovery".to_string());
+            break;
+        }
+        if worktree.1.is_dir() {
+            present.push(worktree);
+        }
+    }
+    let states = match deadline {
+        Some(deadline) => inspect_in_parallel_until(&present, deadline, |(_, path)| {
+            inspect_checkout(path, Some(deadline))
+        })
+        .into_iter()
+        .map(|state| state.unwrap_or_else(not_inspected_checkout))
+        .collect::<Vec<_>>(),
+        None => inspect_in_parallel(&present, |(_, path)| inspect_checkout(path, None)),
+    };
+    if states
+        .iter()
+        .any(|state| state.work == WorkState::NotInspected)
+    {
+        deferred_checks.insert("worktree_inspection".to_string());
+    }
 
     // Size records live with each repository's main checkout; read each file
     // once. Read-only: a report never writes them.
     let mut records: BTreeMap<PathBuf, crate::measurement::SizeRecords> = BTreeMap::new();
     if matches!(sizing, WorktreeSizing::Bounded { .. }) {
         for state in &states {
+            if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+                deferred_checks.insert("worktree_size_records".to_string());
+                break;
+            }
             if let Some((repository_root, _)) = &state.roots {
                 records
                     .entry(repository_root.clone())
@@ -487,19 +635,36 @@ pub fn build_with(
             (path, record)
         })
         .collect();
-    let deadline = match sizing {
-        WorktreeSizing::Measure => None,
-        WorktreeSizing::Bounded { budget } => Some(std::time::Instant::now() + budget),
+    let sizes = match deadline {
+        Some(deadline) => inspect_in_parallel_until(&to_size, deadline, |(path, record)| {
+            size_checkout(path, *record, Some(deadline))
+        })
+        .into_iter()
+        .map(|size| {
+            size.unwrap_or(Sized {
+                usage: crate::disk_headroom::DirectoryUsage::default(),
+                source: SizeSource::Unmeasured,
+                measured_at_ms: None,
+            })
+        })
+        .collect::<Vec<_>>(),
+        None => inspect_in_parallel(&to_size, |(path, record)| {
+            size_checkout(path, *record, None)
+        }),
     };
-    let sizes = inspect_in_parallel(&to_size, |(path, record)| {
-        size_checkout(path, *record, deadline)
-    });
+    if sizes
+        .iter()
+        .any(|size| size.source == SizeSource::Unmeasured)
+    {
+        deferred_checks.insert("worktree_sizing".to_string());
+    }
 
     let mut report = WorktreeReport {
         size_scan: match sizing {
             WorktreeSizing::Measure => "measure",
             WorktreeSizing::Bounded { .. } => "bounded",
         },
+        deferred_checks: deferred_checks.iter().cloned().collect(),
         ..WorktreeReport::default()
     };
     let mut inventories = InventoryCache::new();
@@ -513,6 +678,10 @@ pub fn build_with(
                 let inventory = inventories
                     .entry(repository_root.clone())
                     .or_insert_with(|| {
+                        if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+                            return Err("worktree inventory deferred by the report budget".into());
+                        }
+                        let _git_deadline = deadline.map(crate::git::limit_git_until);
                         GitRepo::discover(checkout_root)
                             .map_err(|error| error.to_string())
                             .and_then(|repo| {
@@ -523,6 +692,11 @@ pub fn build_with(
                     Ok(entries) => Ok(entries.as_slice()),
                     Err(error) => Err(error.as_str()),
                 };
+                if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline)
+                    && inventory.is_err()
+                {
+                    deferred_checks.insert("git_inventory".to_string());
+                }
                 identify_registration(checkout_root, inventory)
             }
             None => (None, None, None),
@@ -556,9 +730,11 @@ pub fn build_with(
     }
     for (root, inventory) in &inventories {
         if let (Some(repository), Ok(entries)) = (inventory_repositories.get(root), inventory) {
-            append_prunable_rows(&mut report, repository, entries, live);
+            append_prunable_rows_until(&mut report, repository, entries, live, deadline);
         }
     }
+    deferred_checks.extend(report.deferred_checks.iter().cloned());
+    report.deferred_checks = deferred_checks.into_iter().collect();
     // Work at risk first, then the largest, then stable by path. A reader
     // scanning from the top sees what they could lose before what they could
     // free -- the inverse of a disk report, deliberately.
@@ -771,49 +947,39 @@ mod tests {
         );
     }
 
-    /// #559: a budget that runs out leaves sizes unmeasured, never partial or
-    /// guessed, while the work classification the report exists for still
-    /// completes for every checkout.
+    /// #460: a report with no remaining budget names the checks it skipped
+    /// instead of claiming an empty host or classifying unseen work as clean.
     #[test]
-    fn an_expired_size_budget_reports_unmeasured_rows_and_still_classifies_work() {
+    fn an_expired_report_budget_names_uninspected_worktrees() {
         let tmp = tempfile::tempdir().unwrap();
         let clean = checkout(tmp.path(), "clean");
         let dirty = checkout(tmp.path(), "dirty");
         std::fs::write(dirty.join("file.txt"), "edited\n").unwrap();
-        let expired = WorktreeSizing::Bounded {
-            budget: std::time::Duration::ZERO,
-        };
         let report = build_with(
-            &[
-                ("repo".to_string(), clean.clone()),
-                ("repo".to_string(), dirty.clone()),
-            ],
+            &[("repo".to_string(), clean), ("repo".to_string(), dirty)],
             &BTreeSet::new(),
-            expired,
+            WorktreeSizing::Bounded {
+                budget: std::time::Duration::ZERO,
+            },
         );
 
         assert_eq!(report.size_scan, "bounded");
-        assert_eq!(report.unmeasured_count, 2);
-        assert_eq!(report.total_bytes, 0, "an unmeasured row adds nothing");
-        for row in &report.rows {
-            assert_eq!(row.size, SizeSource::Unmeasured, "{row:?}");
-            assert_eq!((row.bytes, row.inodes), (0, 0));
-        }
-        let state_of = |path: &Path| {
+        assert!(
+            report.rows.is_empty(),
+            "no checkout was inspected: {report:?}"
+        );
+        assert!(
             report
-                .rows
-                .iter()
-                .find(|row| row.path == path)
-                .map(|row| row.work.clone())
-                .unwrap()
-        };
-        assert_eq!(state_of(&dirty), WorkState::Uncommitted { files: 1 });
-        assert_eq!(state_of(&clean), WorkState::Unpushed { commits: 1 });
-        assert_eq!(report.unique_work_count, 2);
-
+                .deferred_checks
+                .contains(&"worktree_discovery".to_string())
+        );
+        assert_eq!(report.unique_work_count, 0);
         let json = serde_json::to_value(&report).unwrap();
-        assert_eq!(json["unmeasured_count"], 2);
-        assert_eq!(json["rows"][0]["size"], "unmeasured");
+        assert_eq!(
+            json["deferred_checks"],
+            serde_json::json!(["worktree_discovery"])
+        );
+        assert!(json.get("rows").unwrap().as_array().unwrap().is_empty());
     }
 
     /// A recorded measurement answers without a walk, so a host whose
@@ -837,7 +1003,7 @@ mod tests {
             &[("repo".to_string(), path)],
             &BTreeSet::new(),
             WorktreeSizing::Bounded {
-                budget: std::time::Duration::ZERO,
+                budget: std::time::Duration::from_secs(10),
             },
         );
         let row = &report.rows[0];
