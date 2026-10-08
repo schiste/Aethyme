@@ -57,7 +57,7 @@ is expensive.
 Supported release targets are Apple Silicon macOS, Intel macOS, x86-64 and
 arm64 Linux (glibc), x86-64 Linux (musl, static, for Alpine and other
 non-glibc distributions), and Windows x64. A release contains the paired
-aethyme router and aethyme-engine-cli engine binary.
+`aethyme` router and `aethyme-engine-cli` engine binary.
 
 On Windows, download the x86_64-pc-windows-msvc zip, the release manifest,
 and its Sigstore bundle from the same GitHub release. Verify the signed
