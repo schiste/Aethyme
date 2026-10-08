@@ -1798,36 +1798,42 @@ mod tests {
     }
 
     #[test]
-    fn maps_supported_platforms() {
+    fn maps_self_update_supported_platforms() {
         assert_eq!(
             release_target_for("macos", "aarch64").unwrap(),
-            RELEASE_TARGETS[0]
+            "aarch64-apple-darwin"
         );
         assert_eq!(
             release_target_for("macos", "x86_64").unwrap(),
-            RELEASE_TARGETS[1]
+            "x86_64-apple-darwin"
         );
         assert_eq!(
             release_target_for("linux", "x86_64").unwrap(),
-            RELEASE_TARGETS[2]
+            "x86_64-unknown-linux-gnu"
         );
         assert_eq!(
             release_target_for("linux", "aarch64").unwrap(),
-            RELEASE_TARGETS[3]
+            "aarch64-unknown-linux-gnu"
         );
         assert_eq!(
             release_target_for_libc("linux", "x86_64", true).unwrap(),
-            RELEASE_TARGETS[4]
+            "x86_64-unknown-linux-musl"
         );
         assert!(release_target_for_libc("linux", "aarch64", true).is_err());
         assert!(release_target_for("linux", "riscv64").is_err());
         assert!(release_target_for("windows", "x86_64").is_err());
-        for target in RELEASE_TARGETS {
+        // Windows has a release archive, but self-update remains unavailable
+        // there until broker parity is implemented in the later Windows phase.
+        for target in RELEASE_TARGETS
+            .iter()
+            .copied()
+            .filter(|target| *target != "x86_64-pc-windows-msvc")
+        {
             assert!(
                 [false, true].iter().any(|musl| {
                     ["macos", "linux"].iter().any(|os| {
                         ["aarch64", "x86_64"].iter().any(|arch| {
-                            release_target_for_libc(os, arch, *musl).ok() == Some(*target)
+                            release_target_for_libc(os, arch, *musl).ok() == Some(target)
                         })
                     })
                 }),

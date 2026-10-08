@@ -3,6 +3,7 @@ pub mod cli_args;
 pub mod cli_error;
 pub mod context;
 pub mod context_pack;
+#[cfg(unix)]
 pub mod daemon;
 pub mod deps;
 pub mod explore;

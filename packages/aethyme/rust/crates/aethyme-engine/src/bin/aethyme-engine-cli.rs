@@ -80,7 +80,16 @@ fn run() -> Result<(), String> {
         return Ok(());
     }
     match command.as_str() {
-        "daemon" => return run_daemon_subcommand(&args, no_cache, fragment_mode),
+        "daemon" => {
+            #[cfg(unix)]
+            {
+                return run_daemon_subcommand(&args, no_cache, fragment_mode);
+            }
+            #[cfg(not(unix))]
+            {
+                return Err("engine daemon is not yet supported on this platform".into());
+            }
+        }
         "explore" => return run_explore_via_shared_cli(&args),
         "verify-targets" => return run_verify_targets_via_shared_cli(&args),
         "inspect" => {
@@ -829,12 +838,21 @@ fn run_explore_via_shared_cli(args: &[String]) -> Result<(), String> {
     match run(args) {
         ExploreCliOutcome::Done => Ok(()),
         ExploreCliOutcome::DaemonNotRunning { repo } => {
-            eprintln!(
-                "explore: engine daemon not running; \
-                 start one with `aethyme-engine-cli daemon start --repo {}`",
-                repo.display()
-            );
-            std::process::exit(2);
+            #[cfg(unix)]
+            {
+                eprintln!(
+                    "explore: engine daemon not running; \
+                     start one with `aethyme-engine-cli daemon start --repo {}`",
+                    repo.display()
+                );
+                std::process::exit(2);
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = repo;
+                eprintln!("explore: engine daemon is not yet supported on this platform");
+                std::process::exit(1);
+            }
         }
         ExploreCliOutcome::BadUsage(msg) => {
             eprintln!("{msg}");
@@ -849,6 +867,7 @@ fn run_explore_via_shared_cli(args: &[String]) -> Result<(), String> {
 // pidfile management, kill via libc) live here because they're shell-tied
 // concerns rather than core engine concerns.
 
+#[cfg(unix)]
 fn run_daemon_subcommand(
     args: &[String],
     no_cache: bool,
@@ -875,6 +894,7 @@ fn run_daemon_subcommand(
     }
 }
 
+#[cfg(unix)]
 fn parse_daemon_idle_timeout(args: &[String]) -> Result<std::time::Duration, String> {
     if let Ok(value) = read_option(args, "--idle-timeout") {
         let secs: u64 = value
@@ -888,6 +908,7 @@ fn parse_daemon_idle_timeout(args: &[String]) -> Result<std::time::Duration, Str
     ))
 }
 
+#[cfg(unix)]
 fn daemon_serve_action(
     repo: &Path,
     _no_cache: bool,
@@ -900,6 +921,7 @@ fn daemon_serve_action(
     aethyme_engine::daemon::serve_forever(config)
 }
 
+#[cfg(unix)]
 fn daemon_start_action(
     repo: &Path,
     _no_cache: bool,
@@ -926,6 +948,7 @@ fn daemon_start_action(
     Ok(())
 }
 
+#[cfg(unix)]
 fn daemon_stop_action(repo: &Path) -> Result<(), String> {
     let pidfile = aethyme_engine::daemon::pidfile_path_for(repo);
     let Ok(pid_str) = std::fs::read_to_string(&pidfile) else {
@@ -957,6 +980,7 @@ fn daemon_stop_action(repo: &Path) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(unix)]
 fn daemon_status_action(repo: &Path) -> Result<(), String> {
     let socket = aethyme_engine::daemon::socket_path_for(repo);
     if !socket.exists() {

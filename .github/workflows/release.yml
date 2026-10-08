@@ -154,9 +154,48 @@ jobs:
           path: packages/aethyme/rust/aethyme-*-${{ matrix.target }}.tar.gz
           if-no-files-found: error
 
+  build-windows:
+    name: Build (x86_64-pc-windows-msvc)
+    needs: verify-green-main
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: packages/aethyme/rust
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
+          targets: x86_64-pc-windows-msvc
+
+      - name: Build release binaries
+        run: cargo build --release --locked --target x86_64-pc-windows-msvc -p aethyme-cli --bin aethyme -p aethyme-engine --bin aethyme-engine-cli -p aethyme-graph-indexer --bin aethyme-graph-index
+
+      - name: Package and smoke installed zip
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          $archive = "aethyme-$env:REF_NAME-x86_64-pc-windows-msvc.zip"
+          Compress-Archive -Path "target/x86_64-pc-windows-msvc/release/aethyme.exe", "target/x86_64-pc-windows-msvc/release/aethyme-engine-cli.exe" -DestinationPath $archive -CompressionLevel Optimal
+          $smokeRoot = Join-Path $env:RUNNER_TEMP "aethyme-windows-release"
+          Expand-Archive -LiteralPath $archive -DestinationPath $smokeRoot -Force
+          & "$env:GITHUB_WORKSPACE/scripts/windows-release-smoke.ps1" -RouterPath (Join-Path $smokeRoot "aethyme.exe") -EnginePath (Join-Path $smokeRoot "aethyme-engine-cli.exe") -IndexerPath (Join-Path (Join-Path $env:GITHUB_WORKSPACE "packages/aethyme/rust/target/x86_64-pc-windows-msvc/release") "aethyme-graph-index.exe")
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: aethyme-x86_64-pc-windows-msvc
+          path: packages/aethyme/rust/aethyme-${{ github.ref_name }}-x86_64-pc-windows-msvc.zip
+          if-no-files-found: error
+
   release:
     name: Attach to GitHub release
-    needs: build
+    needs: [build, build-windows]
     runs-on: ubuntu-latest
     permissions:
       actions: read
@@ -178,12 +217,13 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --dir dist
-          find dist -mindepth 2 -type f -name '*.tar.gz' -exec mv {} dist/ \;
+          find dist -mindepth 2 -type f \( -name '*.tar.gz' -o -name '*.zip' \) -exec mv {} dist/ \;
           find dist -mindepth 1 -type d -empty -delete
-          count="$(find dist -maxdepth 1 -type f -name '*.tar.gz' | wc -l | tr -d ' ')"
-          # One archive per build matrix target (RELEASE_TARGETS in
-          # aethyme-broker's release_manifest.rs).
-          test "$count" = "5"
+          tar_count="$(find dist -maxdepth 1 -type f -name '*.tar.gz' | wc -l | tr -d ' ')"
+          windows_count="$(find dist -maxdepth 1 -type f -name '*.zip' | wc -l | tr -d ' ')"
+          # Five Unix archives plus the native Windows x64 zip.
+          test "$tar_count" = "5"
+          test "$windows_count" = "1"
 
       - name: Build release manifest and checksums
         env:

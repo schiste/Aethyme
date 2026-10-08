@@ -55,13 +55,44 @@ is expensive.
 ### 1. Install the Rust binaries
 
 Supported release targets are Apple Silicon macOS, Intel macOS, x86-64 and
-arm64 Linux (glibc), and x86-64 Linux (musl, static, for Alpine and other
-non-glibc distributions). A release contains the paired `aethyme` router and
-`aethyme-engine-cli` engine binary.
+arm64 Linux (glibc), x86-64 Linux (musl, static, for Alpine and other
+non-glibc distributions), and Windows x64. A release contains the paired
+aethyme router and aethyme-engine-cli engine binary.
 
-Windows is not supported natively; run the x86-64 Linux build under WSL2.
-The cost of a native port is scoped in
-[docs/architecture/windows-port.md](packages/aethyme/docs/architecture/windows-port.md).
+On Windows, download the x86_64-pc-windows-msvc zip, the release manifest,
+and its Sigstore bundle from the same GitHub release. Verify the signed
+manifest and the archive before extracting the pair:
+
+~~~
+$manifest = Get-Content -LiteralPath "release-manifest.json" -Raw | ConvertFrom-Json
+$tag = "v$($manifest.version)"
+cosign verify-blob --bundle "release-manifest.sigstore.json" --certificate-identity "https://github.com/schiste/Aethyme/.github/workflows/release.yml@refs/tags/$tag" --certificate-oidc-issuer https://token.actions.githubusercontent.com "release-manifest.json"
+$artifact = $manifest.artifacts | Where-Object target -eq "x86_64-pc-windows-msvc"
+$archive = "aethyme-$tag-x86_64-pc-windows-msvc.zip"
+if ((Get-FileHash $archive -Algorithm SHA256).Hash.ToLowerInvariant() -ne $artifact.sha256) {
+  throw "Windows release archive checksum does not match the signed manifest"
+}
+$install = Join-Path (Join-Path $env:LOCALAPPDATA "Aethyme") "bin"
+New-Item -ItemType Directory -Force -Path $install | Out-Null
+Expand-Archive -LiteralPath $archive -DestinationPath $install -Force
+$userPath = [Environment]::GetEnvironmentVariable("Path", "User")
+$pathEntries = @($userPath -split ";" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+if ($pathEntries -notcontains $install) {
+  [Environment]::SetEnvironmentVariable("Path", ((@($pathEntries) + $install) -join ";"), "User")
+}
+~~~
+
+Open a new terminal, then run aethyme --version and aethyme-engine-cli --version.
+Native Explore and graph navigation work when the repository has committed
+graph fragments under .aethyme/graph. Build the local store with
+aethyme-engine-cli index --repo <path>. Windows phase 1 does not generate
+committed fragments; generate them through the graph refresh workflow on a
+supported platform and commit them first.
+aethyme deploy --generated-only writes generated repository guidance. Broker
+commands and broker-backed graph lifecycle operations are not yet supported on
+Windows; use WSL2 for those workflows. See
+[docs/architecture/windows-port.md](packages/aethyme/docs/architecture/windows-port.md)
+for the phase boundary.
 
 With Homebrew:
 
