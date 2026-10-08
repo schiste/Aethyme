@@ -1,78 +1,37 @@
-# Aethyme pilot kit
+# Aethyme internal dogfooding kit
 
 Last Updated: 2026-10-08
 
-A bounded external-adopter study: one week observing the team's existing
-workflow, followed by two weeks using Aethyme. Three independent repositories
-must complete before the results are treated as evidence. The broker lets
-several coding agents work on one repository at once: each agent gets its own
-worktree and session, overlapping edits are reported before they collide, and
-`submit` verifies the merged tree using the repository's configured promotion
-mode. Publication is a separate, authorized action.
+This kit supports Aethyme maintainers and internal contributors using the
+broker in project-owned repositories. The Aethyme team is the pilot cohort;
+external recruitment is out of scope and is not an acceptance requirement.
+See the [internal dogfooding protocol](../guides/internal-dogfooding.md).
 
-## Who it is for
+## Team workflow
 
-- Teams of 2 to 10 developers.
-- Already running two or more coding agents at the same time on one
-  repository (Claude Code, Codex, Cursor agents or similar).
-- macOS (Apple Silicon or Intel), or Linux on x86-64 or arm64. Windows builds
-  do not run the broker yet, so they cannot take part.
+1. Record a baseline for a new observation window with
+   [baseline-form.md](baseline-form.md). Mark historical or missing data
+   plainly; do not reconstruct it from memory.
+2. Record the exact Aethyme and policy versions using the
+   [install and recovery guide](install.md).
+3. Route ordinary internal work through broker sessions and record elapsed
+   time, operator effort, gates, refusals, and recovery outcomes.
+4. Use disposable Playground repositories for conflict, gate-failure,
+   update/rollback, and uninstall exercises.
+5. Export only allowlisted aggregate counters with
+   [metrics-export.md](metrics-export.md). Keep raw broker data and diagnostic
+   snapshots local.
+6. Gather redacted feedback with [exit-survey.md](exit-survey.md). Review
+   failures, limitations, and product decisions with the team, then file generic
+   implementation work as separate issues.
 
-## What we ask of you
+## Data handling
 
-1. **Record the baseline before install** using
-   [baseline-form.md](baseline-form.md). Observe the team's existing workflow
-   for one week; keep task descriptions and repository identity out of the
-   shared record.
-2. **Install and enroll one repository** using the versioned
-   [install guide](install.md). Record the exact Aethyme and policy versions.
-3. **Use it for real work for two weeks.** Route agent tasks through the six
-   broker verbs in [six-verbs.md](six-verbs.md). You can stop at any time.
-4. **Run the post-session interview and survey** after the two-week follow-up.
-   Keep notes redacted and record missing answers rather than filling gaps
-   from memory; see [external-pilots.md](../guides/external-pilots.md).
-5. **Export only reviewed aggregate counters** with the numeric allowlist in
-   [metrics-export.md](metrics-export.md). The local diagnostic snapshots from
-   `export-metrics.sh` include session ids and timestamps; keep them on the
-   participant's machine and do not send them.
+The broker sends no background telemetry. Internal reports should omit source,
+diffs, task text, secrets, usernames, absolute paths, branch names, and private
+repository identity. Do not publish internal metrics as evidence of independent
+adoption or product-market fit.
 
-## What we offer
-
-- Setup help: a call to install, enroll the repository and review the first
-  gates with you.
-- Help during the two weeks when something blocks you or needs recovering.
-
-## What we measure
-
-Per team: time from install to the first successful `submit`, overlaps and
-conflicts the broker caught before they landed, recovery incidents and the
-time spent on them, whether you were still using it after week two, and what
-you would cut.
-
-## Privacy
-
-**No source code leaves your machine.** The broker runs locally and sends
-nothing to us. Participation, sharing aggregate results, and sharing any quote
-are separate choices. Share data only after explicit consent and review:
-
-- the numeric-only `pilot-delta.json` and aggregate baseline form;
-- redacted check-in notes and survey answers, if separately approved;
-- exact anonymized quotations only with separate permission.
-
-Never share `status --json`, raw broker metrics, the output directory created
-by `export-metrics.sh`, broker databases, source, diffs, task text, usernames,
-absolute paths, branch names, or private repository identity. The
-[external-pilot protocol](../guides/external-pilots.md) gives the full consent
-and retention rules. A participant may withdraw at any time.
-
-If you use `export-metrics.sh` for local troubleshooting, its filename label
-is local-only; do not use a private repository or company name, and do not
-share that snapshot or its filename.
-
-## At the end
-
-Only send the reviewed, consented aggregate artifacts to the pilot owner. If
-you want to keep using Aethyme, nothing changes; if not, finish or preserve
-open session work and follow the reviewed uninstall and rollback steps in
-[install.md](install.md). Do not remove `.aethyme/` or host state as an
-uninstall shortcut.
+The [protocol](../guides/internal-dogfooding.md) defines observation windows,
+measures, recovery exercises, and reporting limits. The
+[metrics export](metrics-export.md) describes the local allowlist.
