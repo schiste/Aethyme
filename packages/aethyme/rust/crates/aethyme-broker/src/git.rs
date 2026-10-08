@@ -43,6 +43,16 @@ pub(crate) fn active_git_deadline() -> Option<Instant> {
     GIT_INSPECTION_DEADLINE.with(std::cell::Cell::get)
 }
 
+/// Lift the inspection deadline for a mutation that runs inside a report.
+/// The deadline exists to bound reads; killing a ref or index write midway
+/// would leave the half-applied state it was never meant to produce. Each
+/// command keeps its ordinary timeout, and the caller's deadline returns
+/// when the guard is dropped.
+pub(crate) fn suspend_git_deadline() -> GitDeadlineGuard {
+    let previous = GIT_INSPECTION_DEADLINE.with(|slot| slot.replace(None));
+    GitDeadlineGuard { previous }
+}
+
 impl Drop for GitDeadlineGuard {
     fn drop(&mut self) {
         GIT_INSPECTION_DEADLINE.with(|slot| slot.set(self.previous));

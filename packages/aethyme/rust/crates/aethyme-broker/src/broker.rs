@@ -14456,6 +14456,56 @@ mod tests {
         );
     }
 
+    /// The status deadline bounds reads. A mutation that starts inside it --
+    /// the verify-only integration refresh status runs -- must not have its
+    /// Git writes cut off midway, so it runs outside that deadline.
+    #[test]
+    fn an_integration_refresh_is_not_cut_off_by_the_status_deadline() {
+        let (repo, git) = landing_fixture();
+        let base = git(&["rev-parse", "HEAD"]);
+        std::fs::write(repo.path().join(".gitignore"), "/.aethyme/\n").unwrap();
+        git(&["add", ".gitignore"]);
+        git(&["commit", "-qm", "ignore broker state"]);
+        let local_main = git(&["rev-parse", "HEAD"]);
+        git(&["update-ref", "refs/heads/aethyme/integration", &base]);
+        std::fs::create_dir_all(repo.path().join(".aethyme")).unwrap();
+        std::fs::write(
+            repo.path().join(".aethyme/config.toml"),
+            "[promote]\nmode = \"verify-only\"\n",
+        )
+        .unwrap();
+        let remote = tempfile::tempdir().unwrap();
+        let remote_path = remote.path().to_str().unwrap();
+        git(&["init", "-q", "--bare", "-b", "main", remote_path]);
+        git(&["remote", "add", "origin", remote_path]);
+        git(&["push", "-q", "origin", "main"]);
+        // Upstream moves past local main, which the merge of a pull request
+        // on the provider leaves behind.
+        git(&["commit", "--allow-empty", "-qm", "merged upstream"]);
+        let upstream = git(&["rev-parse", "HEAD"]);
+        git(&["push", "-q", "origin", "main"]);
+        git(&["reset", "-q", "--hard", &local_main]);
+        let mut broker = super::Broker::open(repo.path()).unwrap();
+
+        let _expired = crate::git::limit_git_until(
+            std::time::Instant::now() - std::time::Duration::from_millis(1),
+        );
+        let report = broker
+            .auto_cleanup_landed_integration("origin/main")
+            .expect("the refresh runs its Git commands to completion");
+
+        assert_eq!(
+            report.state,
+            crate::AutomaticIntegrationCleanupState::Cleaned,
+            "{report:#?}"
+        );
+        assert_eq!(git(&["rev-parse", "aethyme/integration"]), upstream);
+        assert!(
+            crate::git::active_git_deadline().is_some(),
+            "the caller's deadline is restored afterwards"
+        );
+    }
+
     /// A temporary repository with a fixed identity, so `git commit` works
     /// on a runner with no global configuration.
     fn landing_fixture() -> (tempfile::TempDir, impl Fn(&[&str]) -> String) {

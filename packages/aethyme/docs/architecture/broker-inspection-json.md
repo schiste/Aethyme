@@ -1,5 +1,7 @@
 # Bounded broker inspection JSON
 
+Last Updated: 2026-10-08
+
 The broker bounds interactive status, health and worktree reports so a large
 session inventory cannot stall an agent indefinitely. When a report omits work,
 its JSON names the omitted checks; an absent finding is not evidence of a clean
@@ -24,7 +26,7 @@ fields from skipped checks remain unknown.
 
 `broker advanced worktrees --json` names skipped discovery, inspection,
 inventory or sizing work in `deferred_checks`. A row with
-`work: not_inspected` was not classified; the broker treats that state as
+`state: "not_inspected"` was not classified; the broker treats that state as
 holding unique work rather than clean or recoverable. Unmeasured size fields
 are not zero-byte evidence.
 

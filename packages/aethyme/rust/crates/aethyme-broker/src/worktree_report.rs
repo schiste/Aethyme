@@ -584,8 +584,12 @@ pub(crate) fn build_with_deadline(
     let mut present = Vec::new();
     for worktree in worktrees {
         if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+            // A worktree the report never reached is still listed, as not
+            // inspected: dropping it would turn "unknown" into "absent" and
+            // undercount the work at risk.
             deferred_checks.insert("worktree_discovery".to_string());
-            break;
+            present.push(worktree);
+            continue;
         }
         if worktree.1.is_dir() {
             present.push(worktree);
@@ -964,22 +968,25 @@ mod tests {
         );
 
         assert_eq!(report.size_scan, "bounded");
-        assert!(
-            report.rows.is_empty(),
-            "no checkout was inspected: {report:?}"
-        );
-        assert!(
-            report
-                .deferred_checks
-                .contains(&"worktree_discovery".to_string())
-        );
-        assert_eq!(report.unique_work_count, 0);
+        // Neither checkout was reached, so both are listed as not inspected
+        // and counted as holding unique work; an empty report would read as
+        // "nothing at risk here".
+        assert_eq!(report.rows.len(), 2, "{report:?}");
+        for row in &report.rows {
+            assert_eq!(row.work, WorkState::NotInspected, "{row:?}");
+            assert_eq!(row.size, SizeSource::Unmeasured, "{row:?}");
+        }
+        assert_eq!(report.unique_work_count, 2);
+        for check in ["worktree_discovery", "worktree_inspection"] {
+            assert!(
+                report.deferred_checks.contains(&check.to_string()),
+                "{check}: {:?}",
+                report.deferred_checks
+            );
+        }
         let json = serde_json::to_value(&report).unwrap();
-        assert_eq!(
-            json["deferred_checks"],
-            serde_json::json!(["worktree_discovery"])
-        );
-        assert!(json.get("rows").unwrap().as_array().unwrap().is_empty());
+        assert_eq!(json["unique_work_count"], 2);
+        assert_eq!(json["rows"][0]["state"], "not_inspected");
     }
 
     /// A recorded measurement answers without a walk, so a host whose
