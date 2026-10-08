@@ -15,7 +15,8 @@ mode. Publication is a separate, authorized action.
 - Teams of 2 to 10 developers.
 - Already running two or more coding agents at the same time on one
   repository (Claude Code, Codex, Cursor agents or similar).
-- macOS (Apple Silicon or Intel) or x86-64 Linux.
+- macOS (Apple Silicon or Intel), or Linux on x86-64 or arm64. Windows builds
+  do not run the broker yet, so they cannot take part.
 
 ## What we ask of you
 

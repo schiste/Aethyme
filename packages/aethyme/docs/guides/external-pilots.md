@@ -17,7 +17,7 @@ script; the [pilot kit](../pilot/README.md) links the participant materials.
 ## Cohort and consent
 
 Recruit 3–5 teams of 2–10 developers, each using at least two concurrent coding
-agents/clones, on macOS or x86-64 Linux. Include both an expensive-CI repository
+agents/clones, on macOS or Linux (x86-64 or arm64). Include both an expensive-CI repository
 and a team unfamiliar with Aethyme. Exclude critical production repositories
 until cleanup and installer safety fixes have been reviewed and released.
 
