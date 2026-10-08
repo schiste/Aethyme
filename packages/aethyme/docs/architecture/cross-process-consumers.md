@@ -480,7 +480,15 @@ Routine `broker status` and `--summary` report recorded observations instead.
 Consumers must check `deferred_checks`, `leases_refreshed` and
 `leases_refreshed_at_ms` before interpreting zero counts as an absence of work.
 `--refresh` names in `deferred_checks` any check its inspection budget cut
-short, and lists the sessions it did not reach (#460).
+short, and lists the sessions it did not reach (#460). `status doctor --json`
+uses the same budget and emits `deferred_checks` and `budget_cut`; a nonempty
+list means `healthy` is false and omitted findings remain unknown.
+`advanced worktrees --json` may also emit `deferred_checks`; rows whose `work`
+is `not_inspected` must be treated as holding unique work. In `gc plan` and
+the retention part of `doctor`, nonempty `deferred_checks` makes an
+under-budget verdict unknown unless an over-budget floor already proves it.
+`reconciliation.complete: false` means its directory counts cover only the
+roots observed before the budget ended.
 `integration_relation: not_checked` and empty ref heads in summary mean unknown,
 not synchronized. `cleanup_retention.eligibility_checked` is false on routine
 status; its inventory can be incomplete, declared by `inventory_complete` and
