@@ -3,10 +3,10 @@ exit: 0
   aethyme broker advanced operations list [--limit <n>] [--before <id>] [--session <id>] [--status <status>] [--repo <canonical-id>] [--provider <git|github>] [--json]
       List a filtered newest-first page of the durable operation journal.
       `operations` without `list` is a compatibility alias during deprecation.
-  aethyme broker advanced operations show <id> [--json]
+  aethyme broker advanced operations show <id|host-operation-id> [--json]
       Show one exact durable operation and its reconciliation state, evidence,
       write barrier, and complete recovery commands when inspection is required.
-  aethyme broker advanced operations reconcile --operation <id> --outcome <succeeded|failed> --reason <text> [--json]
+  aethyme broker advanced operations reconcile --operation <id|host-operation-id> --outcome <succeeded|failed> --reason <text> [--json]
       Resolve a crash-ambiguous operation after independently inspecting the
       remote state. Overlapping writes remain blocked until reconciliation.
   aethyme broker advanced operations stats [--repo <canonical-id>] [--limit <n>] [--json]

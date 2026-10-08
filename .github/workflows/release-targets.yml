@@ -1,11 +1,9 @@
 name: Release Targets
 
-# Builds the release targets that are not a GitHub runner's native host
-# toolchain, the same way release.yml does, whenever the release workflow or
-# the toolchain pin changes. v0.8.5's tag was the first run of the musl
-# target and failed ("can't find crate for `core`"), because nothing
-# exercised it before a tag. This runs only on pull requests that touch these
-# paths and is not a required check.
+# Builds the targets that need a dedicated runner or cross toolchain, as well
+# as native arm64 release-lifecycle validation, whenever their inputs change.
+# v0.8.5's tag was the first run of musl and failed ("can't find crate for `core`"),
+# because nothing exercised it before a tag. This is not a required check.
 
 on:
   pull_request:
@@ -13,6 +11,14 @@ on:
       - .github/workflows/release.yml
       - .github/workflows/release-targets.yml
       - rust-toolchain.toml
+      - install.sh
+      - packages/aethyme/rust/crates/aethyme-broker/src/update*.rs
+      - packages/aethyme/rust/crates/aethyme-broker/src/release_*.rs
+      - packages/aethyme/rust/crates/aethyme-broker/src/install_*.rs
+      - packages/aethyme/rust/crates/aethyme-broker/tests/broker.rs
+      - packages/aethyme/rust/crates/aethyme-broker/tests/host_operations_e2e.rs
+      - packages/aethyme/rust/crates/aethyme-testkit/tests/release_installer.rs
+      - packages/aethyme/rust/crates/aethyme-testkit/tests/release_contract.rs
 
 permissions:
   contents: read
@@ -66,3 +72,38 @@ jobs:
         run: |
           ./target/${{ matrix.target }}/release/aethyme --version
           ./target/${{ matrix.target }}/release/aethyme-engine-cli --version
+
+      - name: Test native Linux arm64 installer, updater, and broker lifecycle
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        env:
+          AETHYME_RELEASE_TEST_BIN_DIR: ${{ github.workspace }}/packages/aethyme/rust/target/aarch64-unknown-linux-gnu/release
+        run: |
+          cargo test --locked -p aethyme-testkit --test release_installer
+          cargo test --locked -p aethyme-broker --lib bootstrap_switches_the_pair_once_and_retains_one_rollback_bundle
+          cargo test --locked -p aethyme-broker --lib failed_staged_quick_test_never_moves_the_active_pair
+          cargo test --locked -p aethyme-broker --test broker two_session_worktrees_are_distinct_and_registered
+          cargo test --locked -p aethyme-broker --test host_operations_e2e
+
+      - name: Smoke native Linux arm64 release archive
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          smoke_root="$(mktemp -d)"
+          trap 'rm -rf "$smoke_root"' EXIT
+          mkdir "$smoke_root/unpacked"
+          tar -C "target/aarch64-unknown-linux-gnu/release" -czf "$smoke_root/aethyme.tar.gz" \
+            aethyme aethyme-engine-cli
+          tar -xzf "$smoke_root/aethyme.tar.gz" -C "$smoke_root/unpacked"
+          "$smoke_root/unpacked/aethyme" broker quick-test
+          graph_repo="$smoke_root/graph-refresh"
+          mkdir -p "$graph_repo/.aethyme"
+          git -C "$graph_repo" init --quiet --initial-branch=main
+          printf '[graph]\nauthority="committed_fragments"\nrepository="release-smoke"\n' > "$graph_repo/.aethyme/config.toml"
+          "$smoke_root/unpacked/aethyme" --version | awk '{print $2}' > "$graph_repo/.aethyme/engine-version"
+          printf 'def release_smoke():\n    return True\n' > "$graph_repo/app.py"
+          git -C "$graph_repo" -c user.name='Aethyme Release' -c user.email='release@example.invalid' add -A
+          git -C "$graph_repo" -c user.name='Aethyme Release' -c user.email='release@example.invalid' commit --quiet -m fixture
+          "$smoke_root/unpacked/aethyme" graph status --repo "$graph_repo" --json
+          plan_sha="$("$smoke_root/unpacked/aethyme" graph refresh plan --repo "$graph_repo" --json | sed -n 's/.*"plan_sha256": "\([0-9a-f]*\)".*/\1/p')"
+          test "${#plan_sha}" = 64
+          "$smoke_root/unpacked/aethyme" graph refresh execute --repo "$graph_repo" --confirm "$plan_sha"
+          test -f "$graph_repo/.aethyme/graph_store.redb"

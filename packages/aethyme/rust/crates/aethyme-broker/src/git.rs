@@ -12,9 +12,86 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 static NEXT_PRIVATE_INDEX_ID: AtomicU64 = AtomicU64::new(1);
+
+thread_local! {
+    /// A command-scoped deadline for callers that need a tighter bound than
+    /// the general git timeout. Thread-local so one finish cannot shorten a
+    /// concurrent operation running in another broker thread.
+    static GIT_DEADLINE: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
+}
+
+struct RestoreGitDeadline(Option<Instant>);
+
+impl Drop for RestoreGitDeadline {
+    fn drop(&mut self) {
+        GIT_DEADLINE.with(|deadline| deadline.set(self.0));
+    }
+}
+
+/// Apply one wall-clock deadline to all Git subprocesses run synchronously by
+/// `operation`, preserving and restoring an outer deadline when nested.
+pub(crate) fn with_git_deadline<T>(timeout: Duration, operation: impl FnOnce() -> T) -> T {
+    let requested = Instant::now() + timeout;
+    let previous = GIT_DEADLINE.with(|deadline| {
+        let previous = deadline.get();
+        let effective = previous.map_or(requested, |outer| outer.min(requested));
+        deadline.set(Some(effective));
+        previous
+    });
+    let _restore = RestoreGitDeadline(previous);
+    operation()
+}
+
+/// Run `operation` with no command-scoped deadline, restoring the outer one
+/// afterwards. For work that must not be killed halfway once started, such as
+/// deleting a worktree after its session has closed.
+pub(crate) fn without_git_deadline<T>(operation: impl FnOnce() -> T) -> T {
+    let previous = GIT_DEADLINE.with(|deadline| deadline.replace(None));
+    let _restore = RestoreGitDeadline(previous);
+    operation()
+}
+
+/// Guard form of the same deadline, for an interactive report that installs
+/// it for the whole command rather than one closure (#460). There is one
+/// deadline per thread: a finish scope (`with_git_deadline`) and a report
+/// scope (`limit_git_until`) nest by taking the earlier instant, and either
+/// way of lifting it (`without_git_deadline`, `suspend_git_deadline`) lifts
+/// both, so a mutation is never cut off by whichever scope it did not lift.
+pub(crate) struct GitDeadlineGuard {
+    _restore: RestoreGitDeadline,
+}
+
+/// Cap Git commands on the current thread at `deadline`, keeping an earlier
+/// outer deadline, until the guard is dropped.
+pub(crate) fn limit_git_until(deadline: Instant) -> GitDeadlineGuard {
+    let previous = GIT_DEADLINE.with(|slot| {
+        let previous = slot.get();
+        slot.set(Some(previous.map_or(deadline, |outer| outer.min(deadline))));
+        previous
+    });
+    GitDeadlineGuard {
+        _restore: RestoreGitDeadline(previous),
+    }
+}
+
+pub(crate) fn active_git_deadline() -> Option<Instant> {
+    GIT_DEADLINE.with(std::cell::Cell::get)
+}
+
+/// Lift the deadline for a mutation that runs inside a report. The deadline
+/// exists to bound reads; killing a ref or index write midway would leave
+/// the half-applied state it was never meant to produce. Each command keeps
+/// its ordinary timeout, and the caller's deadline returns when the guard is
+/// dropped.
+pub(crate) fn suspend_git_deadline() -> GitDeadlineGuard {
+    let previous = GIT_DEADLINE.with(|slot| slot.replace(None));
+    GitDeadlineGuard {
+        _restore: RestoreGitDeadline(previous),
+    }
+}
 
 /// Errors from git operations. `Git` carries the failing subcommand and
 /// stderr so callers can surface actionable messages verbatim.
@@ -87,7 +164,14 @@ fn git_timeout_from(value: Option<&str>) -> Duration {
 }
 
 fn git_timeout() -> Duration {
-    git_timeout_from(std::env::var(GIT_TIMEOUT_ENV).ok().as_deref())
+    let configured = git_timeout_from(std::env::var(GIT_TIMEOUT_ENV).ok().as_deref());
+    GIT_DEADLINE.with(|deadline| match deadline.get() {
+        Some(deadline) => deadline
+            .saturating_duration_since(Instant::now())
+            .min(configured)
+            .max(Duration::from_millis(1)),
+        None => configured,
+    })
 }
 
 /// Extract paths from `git status --porcelain` output, validating each
@@ -907,10 +991,42 @@ fn run_git_command(command: Command, args: &[&str], budget: Duration) -> Result<
 }
 
 fn run_git_command_output(
+    command: Command,
+    args: &[&str],
+    budget: Duration,
+) -> Result<std::process::Output, GitError> {
+    let output = run_git_process_output(command, args, budget)?;
+    if !output.status.success() {
+        return Err(GitError::Git {
+            args: args.join(" "),
+            stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        });
+    }
+    Ok(output)
+}
+
+/// Run Git within its ordinary timeout, or the remaining part of the
+/// enclosing interactive inspection deadline. Unlike
+/// [`run_git_command_output`], this preserves non-zero exit status for
+/// commands where it is an expected answer (such as `merge-base --is-ancestor`).
+fn run_git_process_output(
     mut command: Command,
     args: &[&str],
     budget: Duration,
 ) -> Result<std::process::Output, GitError> {
+    let budget = match active_git_deadline() {
+        Some(deadline) => {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(GitError::TimedOut {
+                    args: args.join(" "),
+                    seconds: 1,
+                });
+            }
+            budget.min(remaining)
+        }
+        None => budget,
+    };
     let output = crate::bounded_output::output_within(&mut command, budget)
         .map_err(|source| GitError::Spawn {
             args: args.join(" "),
@@ -918,14 +1034,8 @@ fn run_git_command_output(
         })?
         .ok_or_else(|| GitError::TimedOut {
             args: args.join(" "),
-            seconds: budget.as_secs(),
+            seconds: budget.as_secs().max(1),
         })?;
-    if !output.status.success() {
-        return Err(GitError::Git {
-            args: args.join(" "),
-            stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
-        });
-    }
     Ok(output)
 }
 /// A commit's tree and parents, in Git's stored parent order.
@@ -1561,12 +1671,29 @@ impl GitRepo {
     /// True when `ancestor` is reachable from `descendant`
     /// (`git merge-base --is-ancestor`).
     pub fn is_ancestor(&self, ancestor: &str, descendant: &str) -> bool {
-        git_command()
-            .args(["merge-base", "--is-ancestor", ancestor, descendant])
-            .current_dir(&self.root)
-            .status()
-            .map(|status| status.success())
+        self.is_ancestor_checked(ancestor, descendant)
             .unwrap_or(false)
+    }
+
+    /// The checked form distinguishes "not an ancestor" from an inspection
+    /// that failed or exhausted its enclosing deadline. Interactive status
+    /// must not turn the latter into a divergence verdict.
+    pub fn is_ancestor_checked(&self, ancestor: &str, descendant: &str) -> Result<bool, GitError> {
+        let args = ["merge-base", "--is-ancestor", ancestor, descendant];
+        let mut command = git_command();
+        command
+            .args(args)
+            .current_dir(&self.root)
+            .env("GIT_OPTIONAL_LOCKS", "0");
+        let output = run_git_process_output(command, &args, git_timeout())?;
+        match output.status.code() {
+            Some(0) => Ok(true),
+            Some(1) => Ok(false),
+            _ => Err(GitError::Git {
+                args: args.join(" "),
+                stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+            }),
+        }
     }
 
     /// Fast-forward the checked-out branch and worktree to an exact commit.
@@ -4071,6 +4198,83 @@ mod timeout_tests {
         );
         assert!(started.elapsed() < Duration::from_secs(10));
         assert!(error.to_string().contains(GIT_TIMEOUT_ENV), "{error}");
+    }
+
+    #[test]
+    fn an_interactive_deadline_caps_a_git_call_with_a_larger_local_budget() {
+        let deadline = Instant::now() + Duration::from_millis(300);
+        let _limit = limit_git_until(deadline);
+        let mut command = Command::new("sh");
+        command.args(["-c", "exec sleep 30"]);
+        let started = Instant::now();
+        let error = run_git_command(command, &["status"], Duration::from_secs(30))
+            .expect_err("the enclosing inspection deadline must cap this command");
+        assert!(matches!(error, GitError::TimedOut { .. }), "{error:?}");
+        assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    #[test]
+    fn an_expired_interactive_deadline_does_not_spawn_git() {
+        let _limit = limit_git_until(Instant::now() - Duration::from_millis(1));
+        let mut command = Command::new("sh");
+        command.args(["-c", "exit 0"]);
+        let error = run_git_command(command, &["status"], Duration::from_secs(30))
+            .expect_err("an expired report must not start another Git command");
+        assert!(matches!(error, GitError::TimedOut { .. }), "{error:?}");
+    }
+
+    /// A finish scope (#616) and a report scope (#460) share one deadline:
+    /// nesting keeps the earlier instant, and either way of lifting it lifts
+    /// both, so neither mechanism can cut off a write the other suspended.
+    #[test]
+    fn finish_and_report_deadlines_nest_and_lift_as_one() {
+        let general = git_timeout();
+        let report = Instant::now() + Duration::from_secs(5);
+        let _report = limit_git_until(report);
+        with_git_deadline(Duration::from_secs(60), || {
+            assert_eq!(active_git_deadline(), Some(report), "the earlier wins");
+            {
+                let _write = suspend_git_deadline();
+                assert_eq!(active_git_deadline(), None);
+                assert_eq!(git_timeout(), general);
+            }
+            assert_eq!(active_git_deadline(), Some(report));
+        });
+        without_git_deadline(|| {
+            assert_eq!(
+                active_git_deadline(),
+                None,
+                "a finish lift lifts a report deadline"
+            );
+            assert_eq!(git_timeout(), general);
+        });
+        assert_eq!(active_git_deadline(), Some(report));
+    }
+
+    #[test]
+    fn lifting_the_deadline_restores_the_general_budget_then_the_outer_one() {
+        let general = git_timeout();
+        with_git_deadline(Duration::from_secs(5), || {
+            assert!(git_timeout() <= Duration::from_secs(5));
+            without_git_deadline(|| assert_eq!(git_timeout(), general));
+            assert!(git_timeout() <= Duration::from_secs(5));
+        });
+        assert_eq!(git_timeout(), general);
+    }
+
+    #[test]
+    fn a_scoped_deadline_bounds_git_and_restores_the_previous_budget() {
+        let previous = git_timeout();
+        let started = Instant::now();
+        let error = with_git_deadline(Duration::from_millis(300), || {
+            let mut command = Command::new("sh");
+            command.args(["-c", "exec sleep 30"]);
+            run_git_command(command, &["status"], git_timeout())
+                .expect_err("the scoped finish budget must stop a wedged git")
+        });
+        assert!(matches!(error, GitError::TimedOut { seconds: 1, .. }));
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert_eq!(git_timeout(), previous);
     }
 
     #[test]

@@ -11,11 +11,9 @@ path = "src/main.rs"
 
 [dependencies]
 aethyme-engine = { path = "../aethyme-engine" }
-aethyme-broker = { path = "../aethyme-broker" }
 aethyme-enhance = { path = "../aethyme-enhance" }
 aethyme-graph-indexer = { path = "../aethyme-graph-indexer" }
 aethyme-graph-storage = { path = "../aethyme-graph-storage" }
-aethyme-quality = { path = "../aethyme-quality" }
 libc = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -26,10 +24,19 @@ toml_edit = { workspace = true }
 # The implementation-blind CLI suites under `tests/` drive the built
 # `aethyme` binary as a subprocess and never link the product crates, so
 # the harness plus JSON/tempdir helpers are all they need.
+[target.'cfg(unix)'.dependencies]
+aethyme-broker = { path = "../aethyme-broker" }
+aethyme-quality = { path = "../aethyme-quality" }
+
 [dev-dependencies]
+criterion = { workspace = true }
 aethyme-testkit = { path = "../aethyme-testkit" }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 
 [lints]
 workspace = true
+
+[[bench]]
+name = "product_latency"
+harness = false

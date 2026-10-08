@@ -234,6 +234,31 @@ pub(super) fn render_ship_plan(
         report.integration_sha
     );
     out!("Publication prefix: {}", report.publication_sha);
+    if report.only {
+        out!(
+            "Selection: only queue entry q{}; earlier unshipped entries are excluded",
+            report.queue_entry.id
+        );
+        if let Some(verification) = &report.only_verification {
+            out!("Entry source base: {}", verification.source_base_sha);
+            out!("Independent base: {}", verification.base_sha);
+            out!("Independent tree: {}", verification.publication_tree_sha);
+            out!("Changed files: {}", verification.changed_files.join(", "));
+            if verification.selected_gates.is_empty() {
+                out!("Selected gates: none configured for the changed files");
+            } else {
+                out!("Selected gates:");
+                for gate in &verification.selected_gates {
+                    out!(
+                        "  {}: {}{}",
+                        gate.gate,
+                        gate.status,
+                        if gate.cached { " (cached)" } else { "" }
+                    );
+                }
+            }
+        }
+    }
     // One line per promoted entry ever included is unbounded and grows with
     // the repository's history; the count plus the boundary entries is what a
     // reviewer checks.
@@ -468,6 +493,33 @@ pub(super) fn render_ship_execution(
         out!("Local main unchanged. To synchronize it explicitly:");
         out!("  {command}");
     }
+    if let Some(reconciliation) = &report.integration_reconciliation {
+        out!(
+            "Integration reconciliation: {}{}",
+            if reconciliation.applied {
+                "applied"
+            } else if reconciliation.safe {
+                "safe, not applied"
+            } else {
+                "refused safely"
+            },
+            if reconciliation.preserved_queue_entry_ids.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "; preserved pending entries {:?}",
+                    reconciliation.preserved_queue_entry_ids
+                )
+            }
+        );
+        out!("  {}", reconciliation.next_action);
+        if !reconciliation.reverified_gates.is_empty() {
+            out!(
+                "  Reverified gates: {}",
+                reconciliation.reverified_gates.join(", ")
+            );
+        }
+    }
     Ok(())
 }
 
@@ -545,6 +597,25 @@ pub(super) fn render_delivery_execution(
             }
             if let Some(sha) = &report.target_remote_sha {
                 out!("Observed target branch SHA: {sha}");
+            }
+            if let Some(reconciliation) = &report.integration_reconciliation {
+                out!(
+                    "Integration reconciliation: {}",
+                    if reconciliation.applied {
+                        "applied"
+                    } else if reconciliation.safe {
+                        "safe, not applied"
+                    } else {
+                        "refused safely"
+                    }
+                );
+                out!("  {}", reconciliation.next_action);
+                if !reconciliation.reverified_gates.is_empty() {
+                    out!(
+                        "  Reverified gates: {}",
+                        reconciliation.reverified_gates.join(", ")
+                    );
+                }
             }
             if let Some(operation) = &report.branch_operation {
                 out!("Branch operation: {}", operation.id);
@@ -770,7 +841,11 @@ pub(super) fn run_ship(parsed: Parsed) -> Result<(), UsageError> {
             ))?;
             let delivery = parse_repository_delivery_mode(parsed.delivery_mode.as_deref())?;
             let mut broker = open_broker(parsed.read_only_snapshot)?;
-            let report = broker.ship_plan_with_delivery(entry, delivery)?;
+            let report = if parsed.ship_only {
+                broker.ship_plan_only_with_delivery(entry, delivery)?
+            } else {
+                broker.ship_plan_with_delivery(entry, delivery)?
+            };
             render_ship_plan(&report, parsed.json, parsed.detail)?;
         }
         "execute" => {
@@ -787,7 +862,7 @@ pub(super) fn run_ship(parsed: Parsed) -> Result<(), UsageError> {
             // repository policy still refuses this compatibility path
             // inside `ship_execute_with_policy`; an unconfigured
             // repository keeps its historical direct-ship behavior.
-            if delivery.is_none() && parsed.delivery_plan.is_none() {
+            if !parsed.ship_only && delivery.is_none() && parsed.delivery_plan.is_none() {
                 let report = broker.ship_execute_with_policy(
                     entry,
                     confirm,
@@ -798,15 +873,27 @@ pub(super) fn run_ship(parsed: Parsed) -> Result<(), UsageError> {
                 render_ship_execution(&report, parsed.json)?;
                 return Ok(());
             }
-            let report = broker.ship_execute_delivery(
-                entry,
-                confirm,
-                delivery,
-                parsed.delivery_plan.as_deref(),
-                parsed.sync_main,
-                parsed.break_glass,
-                parsed.reason.as_deref(),
-            )?;
+            let report = if parsed.ship_only {
+                broker.ship_execute_only_delivery(
+                    entry,
+                    confirm,
+                    delivery,
+                    parsed.delivery_plan.as_deref(),
+                    parsed.sync_main,
+                    parsed.break_glass,
+                    parsed.reason.as_deref(),
+                )?
+            } else {
+                broker.ship_execute_delivery(
+                    entry,
+                    confirm,
+                    delivery,
+                    parsed.delivery_plan.as_deref(),
+                    parsed.sync_main,
+                    parsed.break_glass,
+                    parsed.reason.as_deref(),
+                )?
+            };
             render_delivery_execution(&report, parsed.json)?;
         }
         other => {

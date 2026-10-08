@@ -223,16 +223,21 @@ fn engine_info(rest: &[String]) -> Result<(), String> {
     let version = env!("CARGO_PKG_VERSION");
     let store = store_path(&repo);
     let store_present = store.is_file();
-    let daemon_pidfile = crate::daemon::pidfile_path_for(&repo);
-    let daemon_running = std::fs::read_to_string(&daemon_pidfile)
-        .ok()
-        .and_then(|s| s.trim().parse::<i32>().ok())
-        // SAFETY: `kill` with signal 0 checks for existence and permission
-        // without delivering anything, and it takes the pid by value. It
-        // dereferences no pointer this crate owns, so the only requirement is
-        // a valid i32, which `parse` produced on the line above.
-        .map(|pid| unsafe { libc::kill(pid, 0) == 0 })
-        .unwrap_or(false);
+    #[cfg(unix)]
+    let daemon_running = {
+        let daemon_pidfile = crate::daemon::pidfile_path_for(&repo);
+        std::fs::read_to_string(&daemon_pidfile)
+            .ok()
+            .and_then(|s| s.trim().parse::<i32>().ok())
+            // SAFETY: `kill` with signal 0 checks for existence and permission
+            // without delivering anything, and it takes the pid by value. It
+            // dereferences no pointer this crate owns, so the only requirement is
+            // a valid i32, which `parse` produced on the line above.
+            .map(|pid| unsafe { libc::kill(pid, 0) == 0 })
+            .unwrap_or(false)
+    };
+    #[cfg(not(unix))]
+    let daemon_running = false;
     let ready = store_present;
 
     if json_output {

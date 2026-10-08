@@ -787,6 +787,10 @@ pub struct GcWorktreeBlockerSummary {
 pub struct GcPlan {
     pub schema_version: u32,
     pub digest: String,
+    /// Checks omitted by a bounded health pass. Such a plan is a report only
+    /// and cannot describe an empty or complete candidate set.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deferred_checks: Vec<String>,
     pub evaluated_at: i64,
     pub policy: RetentionPolicy,
     /// Unknown fields are ignored for forward compatibility, but remain in
@@ -1022,6 +1026,10 @@ pub struct GcApplyReport {
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct GcHealth {
+    /// Checks omitted by a bounded doctor health pass; counts are floors while
+    /// this list is non-empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deferred_checks: Vec<String>,
     pub policy: RetentionPolicy,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub retention_config_warnings: Vec<RetentionConfigWarning>,

@@ -41,8 +41,8 @@ Every provider command that has acquired the repository write lane records a
 small liveness payload in its operation journal. The payload contains the
 current phase, the last progress message, the last heartbeat, and bytes read
 from provider stdout/stderr. `broker status` exposes the derived state beside
-each unresolved operation; `operations show <id>` and `operations list` expose
-the same signal for an operator investigating a hold.
+each unresolved operation; `operations show <id|host-operation-id>` and
+`operations list` expose the same signal for an operator investigating a hold.
 
 The states answer different questions:
 

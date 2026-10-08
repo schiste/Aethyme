@@ -69,6 +69,10 @@ pub const WORKTREE_RECONCILIATION_SCHEMA_VERSION: u32 = 1;
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct WorktreeReconciliation {
     pub schema_version: u32,
+    /// False when a bounded report stopped before it finished reading all
+    /// roots. Counts then describe only the observed prefix.
+    #[serde(default = "default_complete", skip_serializing_if = "is_complete")]
+    pub complete: bool,
     /// Broker-owned roots actually scanned. Zero means the sweep found no root
     /// to look at, which is different from finding a root that was empty.
     pub scanned_root_count: usize,
@@ -82,6 +86,14 @@ pub struct WorktreeReconciliation {
     /// Whether every unclaimed directory carries a byte estimate.
     pub sized: bool,
     pub unclaimed: Vec<UnclaimedDirectory>,
+}
+
+fn default_complete() -> bool {
+    true
+}
+
+fn is_complete(complete: &bool) -> bool {
+    *complete
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
@@ -136,6 +148,7 @@ pub fn summarise(
         .all(|entry| entry.estimated_bytes.is_some());
     WorktreeReconciliation {
         schema_version: WORKTREE_RECONCILIATION_SCHEMA_VERSION,
+        complete: true,
         scanned_root_count,
         directory_count: reconciled.len(),
         claimed_count: reconciled.len() - unclaimed.len(),

@@ -1,28 +1,48 @@
-# Windows Port: Scope and Estimate (P5.2)
+# Windows Port: Phase 1 Scope and Phase 2 Broker Estimate
 
-Last Updated: 2026-09-26
+Last Updated: 2026-10-08
 
-Status: scoping only. No port code exists or is planned by this document.
-Date: 2026-09-26. Baseline: `1d9f5a35` (all file:line references are at that
-commit, relative to `packages/aethyme/rust/crates/`).
+Status: Phase 1 implementation is in draft PR #629 and still requires the
+windows-latest build and smoke job to pass before it is ready. The maintainer
+approved this scope on 2026-10-06:
 
-Method: static inspection of the Rust workspace, the scripts and the CI
-workflows. A Windows cross-check (`cargo check --target x86_64-pc-windows-msvc`)
-was **not** run: no Windows target is installed on the scoping host. That
-check is the first task of any native option below.
+- Windows x64 (x86_64-pc-windows-msvc) release with the paired router and
+  engine binaries in a .zip.
+- Native in-process aethyme explore, graph navigation over a local redb
+  store, and aethyme deploy --generated-only.
+- Broker-backed commands refuse with a clear unsupported-platform error and a
+  nonzero exit code. Graph lifecycle commands that depend on the broker's
+  Unix locking path are also unavailable in this phase.
+- Native build and smoke coverage on windows-latest. The Windows zip is
+  checksummed in `SHA256SUMS` and signed with its own Sigstore bundle; it is not
+  listed in `release-manifest.json`, because every released updater (up to
+  0.8.24) refuses a manifest with a non-tarball entry. Installation is
+  documented in the README.
 
-## 1. What works on Windows today
+Phase 2 remains a separate later issue: broker parity, named-pipe IPC,
+Windows process binding for #542 and #360, and path identity.
 
-| Surface | Native Windows | WSL2 |
+The inventory in sections 2 onward records the 2026-09-26 scoping baseline; it
+is architectural history, not a claim that Phase 1 has no port code. The
+Windows target cannot be compiled on the macOS host because its C dependencies
+need the MSVC toolchain, so native compile and runtime proof come from the
+Windows CI job.
+
+## 1. Phase 1 support boundary
+
+| Surface | Windows x64 phase 1 | WSL2 |
 |---|---|---|
-| Release binaries | None. `release.yml:48-53` builds aarch64/x86_64 macOS and x86_64 Linux only; `install.sh:57-62` refuses anything else. | The x86_64 Linux release installs with `install.sh`. |
-| Workspace compile | Does not compile (by inspection). No `cfg(windows)` code exists anywhere. | Same as Linux. |
-| Crates with no un-gated Unix API | `graph-schema`, `graph-storage` (its Unix code is gated, `cache.rs:100`, `performance.rs:82`), `graph-indexer`, `producers`, `testkit` | n/a |
-| Crates that fail to compile | `engine` (`daemon.rs:45` `UnixListener`, `daemon.rs:186` `setsid`), `enhance` (`skills.rs:51`, `deploy.rs:211`, `local.rs:381` `PermissionsExt`), `quality` (`fix/github.rs:346` `localtime_r`), `broker` (`operations.rs:13` `os::fd`, `update.rs:8`, `gates.rs:2239`, `disk_headroom.rs:31`, `blockers.rs:1183`), and `cli`, which depends on all of them | n/a |
-| Existing non-Unix fallbacks | 20 `cfg(not(unix))` blocks. Most either no-op (`host_state.rs:152` permissions) or return a hard error, for example `graph_refresh.rs:2054` "transactional graph refresh requires Unix file locking", `cache.rs:110`, `repository_upgrade.rs:1460` | n/a |
+| Release binaries | Native aethyme.exe and aethyme-engine-cli.exe in the signed .zip artifact. | Uses the Linux release. |
+| Explore | In-process native engine; no Unix daemon startup. | Full Linux behavior. |
+| Graph | Native navigation on an existing local redb store. Committed fragments under .aethyme/graph must already exist; aethyme-engine-cli index --repo <path> builds the local store. Phase 1 does not generate fragments on Windows. | Full Linux graph lifecycle. |
+| Deploy | Generated-only deployment and verification work natively. Broker enrollment and lifecycle-backed deployment are refused. | Full Linux behavior. |
+| Broker | Every broker command refuses with the documented Windows error and exits nonzero. | Full Linux broker. |
+| Engine daemon | Not supported; Explore uses the in-process engine path. | Full Linux daemon. |
 
-Conclusion: nothing works natively. WSL2 already works to the extent that Linux
-does, because it runs the Linux binary unchanged.
+Windows graph status, units, materialize, refresh, and impact remain outside
+this phase because their current lifecycle route relies on broker coordination.
+The Windows CLI does not report fabricated status or success for those
+operations.
 
 ## 2. Unix dependency inventory
 

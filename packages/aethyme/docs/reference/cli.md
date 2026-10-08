@@ -490,9 +490,9 @@ a reason.
 - `aethyme broker advanced gh --session <id> --repo <owner/name> [--scope <scope>] [--effect <read|write|destructive>] [--reason <text>] [--destructive] [--no-wait|--queue-timeout <seconds>] -- <gh-args>`
 - `aethyme broker advanced operations list [--limit <n>] [--before <id>] [--session <id>] [--status <status>] [--repo <canonical-id>] [--provider <git|github>] [--json]`
 - `aethyme broker advanced operations [same options]` (compatibility alias during deprecation)
-- `aethyme broker advanced operations show <id> [--json]`
+- `aethyme broker advanced operations show <id|host-operation-id> [--json]`
 - `aethyme broker advanced operations stats [--repo <canonical-id>] [--limit <n>] [--json]`
-- `aethyme broker advanced operations reconcile --operation <id> --outcome <succeeded|failed> --reason <text> [--json]`
+- `aethyme broker advanced operations reconcile --operation <id|host-operation-id> --outcome <succeeded|failed> --reason <text> [--json]`
 - `aethyme broker unblock [--json]` — read-only: every current blocker across `broker.db`, the host operation and resource ledgers, gate pidfiles, and conflict notices, each with a stable id (`op:<n>`, `hostop:<32-hex>`, `resource:<lease-id>`, `lease:<id>`, `gatecache:<gate>@<tree>`, `pidfile:<session>-<gate>`, `action:<session>`), its scope (`repo` or `host`), cause, owning session, `safe_to_clear_automatically`, and the exact command that clears it. `broker status --json` carries the same list as `blockers`, and `broker status doctor` prints it.
 - `aethyme broker unblock <id> [--outcome <succeeded|failed>] [--reason <text>] [--confirm <generation>] [--json]` — clear one blocker through its store's recovery path: `op:` and `hostop:` reconcile through `operations reconcile` and need `--outcome` and `--reason` from an operator who inspected the remote (the host id is accepted directly, #276); `gatecache:` marks exactly that gate's failing verdicts for that tree cleared, with the time and `--reason` (#281), so they stay in gate history but no longer satisfy the cache and the next run executes the gate (#416); `pidfile:` is removed only when its process is gone; `resource:` releases a quarantined lease once its holder is gone, without `--confirm` only when its owning session is closed; `lease:` releases a stale session's claim only when its worktree is gone; `action:` always refuses and names the resubmission. A refusal changes nothing, prints the reason and the flag it needs, and exits 3.
 - `aethyme broker advanced advisories list [--all] [--json]`
@@ -762,13 +762,16 @@ cursor proves that no older matching row remains. The bare `broker advanced oper
 spelling is retained as an alias for `broker advanced operations list` during its
 deprecation window.
 
-`broker advanced operations show <id>` returns the exact durable row plus a typed
+`broker advanced operations show <id|host-operation-id>` returns the exact durable row plus a typed
 reconciliation view. The view distinguishes `not_required`, `required`,
 `reconciled_succeeded`, and `reconciled_failed`; includes preserved exact-push
 evidence when available; and renders both complete reconciliation commands for
-an unknown outcome. `automatic_retry_allowed` is always false. A second clone
-remains blocked by the host-wide unknown-outcome barrier until an operator
-inspects external state and runs one explicit reconciliation command.
+an unknown outcome. `automatic_retry_allowed` is always false. A 32-character
+hexadecimal host-operation id printed by a refusal is accepted by `show` and
+`reconcile`; when it has no repository journal row, `show --json` returns a
+`host_operation` object and `reconcile` uses the guarded host recovery path. A
+second clone remains blocked by the host-wide unknown-outcome barrier until an
+operator inspects external state and runs one explicit reconciliation command.
 
 Every `operations reconcile` usage or validation error repeats the complete
 contract—`--operation`, `--outcome`, and `--reason`—in one message. Successful
@@ -897,8 +900,10 @@ snapshot opens remain non-mutating.
 `broker advanced gates pre-push` remains an opt-in full-gate adapter for repositories
 that wire it into their own hook manager. It reads Git's ref-update lines from
 stdin, requires all non-deletion updates to name one clean checked-out `HEAD`,
-and runs the complete gate set. This makes the reported tree truthful and lets
-declared host resources coordinate concurrent clones. See
+and runs the complete gate set. A refusal names each failed gate and prints a
+bounded tail of its output, so path-specific failures are visible at the push
+boundary. This makes the reported tree truthful and lets declared host resources
+coordinate concurrent clones. See
 [Concurrent Host Resource Coordination](../guides/host-resource-coordination.md)
 for the gate schema, repository-independent supervised runs, hook example,
 fallback contract, and quarantine recovery.

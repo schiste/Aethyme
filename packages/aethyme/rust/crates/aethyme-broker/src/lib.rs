@@ -448,8 +448,10 @@ pub use release_compatibility::{
     MINIMUM_GIT_VERSION, REPOSITORY_SCHEMA_VERSION,
 };
 pub use release_manifest::{
-    RELEASE_MANIFEST_SCHEMA_VERSION, RELEASE_TARGETS, REQUIRED_RELEASE_BINARIES, ReleaseArtifact,
-    ReleaseBrokerStorageCompatibility, ReleaseCompatibility, ReleaseInstaller, ReleaseManifest,
+    DETACHED_RELEASE_TARGETS, RELEASE_MANIFEST_SCHEMA_VERSION, RELEASE_TARGETS,
+    REQUIRED_RELEASE_BINARIES, ReleaseArtifact, ReleaseBrokerStorageCompatibility,
+    ReleaseCompatibility, ReleaseInstaller, ReleaseManifest, WINDOWS_RELEASE_TARGET,
+    release_archive_filename,
 };
 pub use remote_target::{
     RemoteAssertionEvidence, RemoteCommandSelectionEvidence, RemoteIdentityEvidence,
@@ -611,7 +613,6 @@ pub use worktree_reconcile::{
     WORKTREE_RECONCILIATION_SCHEMA_VERSION, WorktreeReconciliation,
     reconcile as reconcile_worktree_directories, summarise as summarise_worktree_reconciliation,
 };
-pub(crate) use worktree_report::append_prunable_registrations;
 pub use worktree_report::{
     GitWorktreeState, SizeSource, WORKTREE_REPORT_SIZE_BUDGET, WorkState, WorktreeReport,
     WorktreeRow, WorktreeSizing, build as build_worktree_report,
