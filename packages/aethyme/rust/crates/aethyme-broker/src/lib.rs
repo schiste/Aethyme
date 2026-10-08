@@ -107,6 +107,8 @@ mod submit_progress;
 pub use submit_progress::{
     InFlightSubmit, SUBMIT_STALL_AFTER, SlotHolder, SubmitProgressRecord, WaitPosition,
 };
+mod waiters;
+pub use waiters::{CurrentWaiter, WaitRecord};
 pub mod lease_liveness;
 pub mod lease_requests;
 pub mod session_guidance;

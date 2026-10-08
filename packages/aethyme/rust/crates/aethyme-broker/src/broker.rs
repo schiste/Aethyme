@@ -1621,6 +1621,11 @@ pub struct StatusView {
     /// when none is running.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub in_flight_submits: Vec<crate::InFlightSubmit>,
+    /// Processes blocked on a contested broker lock or lease right now: what
+    /// they wait for, behind whom, and for how long (#494). Omitted when
+    /// nobody waits.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub waiters: Vec<crate::CurrentWaiter>,
 }
 
 /// How many refused reviews `broker status` carries.
@@ -1680,6 +1685,10 @@ pub struct StatusBrief {
     /// of this call. A caller that needs current lease truth wants the full
     /// view, and should be able to see which one it got.
     pub leases_refreshed: bool,
+    /// Same as the full view's `waiters`: read from per-wait records, never
+    /// from the database, so it costs a directory listing.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub waiters: Vec<crate::CurrentWaiter>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]

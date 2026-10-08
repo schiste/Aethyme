@@ -1435,7 +1435,7 @@ pub(super) fn run_finish(parsed: Parsed) -> Result<(), UsageError> {
     let options = crate::FinishOptions {
         keep_worktree: parsed.keep_worktree,
     };
-    let report = crate::git::with_git_deadline(
+    let report = match crate::git::with_git_deadline(
         std::time::Duration::from_secs(timeout_seconds),
         || -> Result<_, UsageError> {
             Ok(match abandon_reason {
@@ -1443,8 +1443,19 @@ pub(super) fn run_finish(parsed: Parsed) -> Result<(), UsageError> {
                 None => broker.finish_with_options(session, options)?,
             })
         },
-    )
-    .map_err(|error| finish_timeout_error(error, timeout_seconds, session))?;
+    ) {
+        Ok(report) => report,
+        Err(error) => {
+            // Read the record back rather than infer it: the deadline can
+            // fall before the close or, for an artifact read, after it.
+            let state = broker
+                .store()
+                .session(session)
+                .ok()
+                .map(|record| record.status);
+            return Err(finish_timeout_error(error, timeout_seconds, session, state));
+        }
+    };
     if parsed.json {
         out!("{}", serde_json::to_string_pretty(&report)?);
     } else {
@@ -1456,14 +1467,41 @@ pub(super) fn run_finish(parsed: Parsed) -> Result<(), UsageError> {
     Ok(())
 }
 
-fn finish_timeout_error(error: UsageError, timeout_seconds: u64, session: i64) -> UsageError {
+fn finish_timeout_error(
+    error: UsageError,
+    timeout_seconds: u64,
+    session: i64,
+    state: Option<crate::SessionStatus>,
+) -> UsageError {
     let message = match error {
         UsageError::Message(message) if message.contains("did not finish within") => message,
         UsageError::Exit { message, .. } if message.contains("did not finish within") => message,
         other => return other,
     };
+    // Name what was waited on (the Git command and its limit), what state the
+    // session was left in, and the one next step that state allows (#494).
+    let next = match state {
+        Some(state) if !state.is_closed() => format!(
+            "session {session} is still {} and nothing was closed, so retrying is safe: \
+             `aethyme broker finish --session {session} --timeout {}`; if it times out again, \
+             check `aethyme broker status --json` for a process holding the repository",
+            state.as_str(),
+            timeout_seconds.saturating_mul(2).min(86_400)
+        ),
+        Some(state) => format!(
+            "session {session} is already {}; only its follow-up work timed out, so do not \
+             retry finish: inspect `aethyme broker advanced handoff --session {session}` and \
+             `aethyme broker status --json`",
+            state.as_str()
+        ),
+        None => format!(
+            "the session record could not be read back; inspect `aethyme broker status --json` \
+             before retrying, and `aethyme broker advanced handoff --session {session}` if the \
+             session is already closed"
+        ),
+    };
     UsageError::Message(format!(
-        "finish timed out after {timeout_seconds}s while checking Git ({message}); inspect `aethyme broker status --json` before retrying, and inspect `aethyme broker advanced handoff --session {session}` if the session is already closed"
+        "finish timed out after {timeout_seconds}s waiting on Git ({message}); {next}"
     ))
 }
 

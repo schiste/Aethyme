@@ -1143,6 +1143,7 @@ fn repository_lock_reports_progress_while_waiting() {
         root.path(),
         "owner/repo",
         1,
+        None,
         || Ok("session 1".into()),
         QueueWait::Refuse,
         |_, _| {},
@@ -1154,7 +1155,7 @@ fn repository_lock_reports_progress_while_waiting() {
         RepositoryWriteLock::acquire_with_progress_interval(
             &root_path,
             "owner/repo",
-            2,
+            (2, Some(9)),
             || Ok("session 1".into()),
             QueueWait::Seconds(3),
             Duration::from_millis(50),
@@ -1164,10 +1165,21 @@ fn repository_lock_reports_progress_while_waiting() {
         )
     });
     let progress = receiver.recv_timeout(Duration::from_secs(2));
+    // Another terminal's `broker status` sees who waits, on what, behind whom.
+    let waiting = crate::waiters::current_waiters(root.path(), crate::clock::epoch_ms());
     drop(held);
     let acquired = waiter.join().unwrap().unwrap();
     let (holder, elapsed) = progress.expect("a waiting writer should report progress");
     assert_eq!(holder, "session 1");
+    assert_eq!(waiting.len(), 1, "{waiting:?}");
+    assert_eq!(waiting[0].session_id, Some(9));
+    assert_eq!(waiting[0].kind, crate::waiters::WAIT_COORDINATED_WRITE_LOCK);
+    assert_eq!(waiting[0].resource, "owner/repo");
+    assert_eq!(waiting[0].holder, "session 1");
+    assert!(
+        crate::waiters::current_waiters(root.path(), crate::clock::epoch_ms()).is_empty(),
+        "an acquired lock is no longer waited for"
+    );
     assert!(elapsed >= Duration::from_millis(50), "{elapsed:?}");
     assert!(acquired.queue_wait_ms > 0);
 }
@@ -1179,6 +1191,7 @@ fn a_failing_holder_lookup_does_not_abort_a_progress_reporting_wait() {
         root.path(),
         "owner/repo",
         1,
+        None,
         || Ok("session 1".into()),
         QueueWait::Refuse,
         |_, _| {},
@@ -1191,7 +1204,7 @@ fn a_failing_holder_lookup_does_not_abort_a_progress_reporting_wait() {
         RepositoryWriteLock::acquire_with_progress_interval(
             &root_path,
             "owner/repo",
-            2,
+            (2, Some(9)),
             move || {
                 lookups += 1;
                 if lookups == 1 {

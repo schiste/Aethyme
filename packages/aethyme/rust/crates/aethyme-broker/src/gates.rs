@@ -1502,6 +1502,7 @@ impl GateOwnerLocks {
         holder: &str,
         report_every: Duration,
         progress: &dyn GateProgressSink,
+        waits: (&Path, Option<i64>),
     ) -> Result<Self, std::io::Error> {
         std::fs::create_dir_all(owner_dir)?;
         let mut paths = gate_owner_lock_paths(owner_dir, gate_name, owner_paths);
@@ -1512,6 +1513,9 @@ impl GateOwnerLocks {
         for path in paths {
             let started = Instant::now();
             let mut next_report = Duration::ZERO;
+            // Recorded on the first contended poll, so `broker status` lists
+            // this gate as waiting; removed when the lock is taken.
+            let mut registration: Option<crate::waiters::WaitRegistration> = None;
             let lock = loop {
                 let file = crate::file_lock::open_lock_file(&path)?;
                 if let Some(lock) = crate::file_lock::ExclusiveFileLock::try_acquire(file)? {
@@ -1519,11 +1523,29 @@ impl GateOwnerLocks {
                 }
                 let waited = started.elapsed();
                 if waited >= next_report {
+                    let held_by = describe_owner_lock_holder(&path);
                     progress.report(&format!(
-                        "gate {gate_name} waiting for an owner lock held by {} ({}s)",
-                        describe_owner_lock_holder(&path),
+                        "gate {gate_name} waiting for an owner lock held by {held_by} ({}s)",
                         waited.as_secs()
                     ));
+                    let held_by = format!("held by {held_by}");
+                    match registration.as_mut() {
+                        Some(registration) => registration.update_holder(&held_by),
+                        None => {
+                            registration = Some(crate::waiters::WaitRegistration::start(
+                                waits.0,
+                                waits.1,
+                                crate::waiters::WAIT_GATE_OWNER_LOCK,
+                                &format!(
+                                    "{gate_name} ({})",
+                                    path.file_name()
+                                        .map(|name| name.to_string_lossy())
+                                        .unwrap_or_default()
+                                ),
+                                &held_by,
+                            ));
+                        }
+                    }
                     next_report = waited + report_every;
                 }
                 std::thread::sleep(OWNER_LOCK_POLL);
@@ -2102,6 +2124,7 @@ fn run_selections(
             &format!("{worker_id} since={}", crate::clock::epoch_ms()),
             heartbeat_interval(),
             progress,
+            (main_root, session_id),
         )
         .map_err(|source| crate::BrokerError::Io {
             path: owner_dir,
@@ -3368,6 +3391,7 @@ mod tests {
             &format!("s812 since={}", crate::clock::epoch_ms() - 190_000),
             Duration::from_millis(100),
             &quiet,
+            (owners.path(), Some(812)),
         )
         .unwrap();
         assert!(
@@ -3386,13 +3410,27 @@ mod tests {
                 "s813 since=0",
                 Duration::from_millis(100),
                 waiter_lines.as_ref(),
+                (directory.as_path(), Some(813)),
             )
             .unwrap()
         });
         // Polls every 250ms, reporting at once and then every 100ms of waiting.
         std::thread::sleep(Duration::from_millis(800));
+        let waiting = crate::waiters::current_waiters(owners.path(), crate::clock::epoch_ms());
         drop(held);
         drop(waiter.join().unwrap());
+        assert_eq!(waiting.len(), 1, "{waiting:?}");
+        assert_eq!(waiting[0].session_id, Some(813));
+        assert_eq!(waiting[0].kind, crate::waiters::WAIT_GATE_OWNER_LOCK);
+        assert!(
+            waiting[0].holder.starts_with("held by session 812 for 3m1"),
+            "{}",
+            waiting[0].holder
+        );
+        assert!(
+            crate::waiters::current_waiters(owners.path(), crate::clock::epoch_ms()).is_empty(),
+            "a taken owner lock is no longer waited for"
+        );
 
         let lines = lines.0.lock().unwrap().clone();
         assert!(
