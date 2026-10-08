@@ -1,11 +1,18 @@
 # External adopter pilots (protocol version 1)
 
-Last Updated: 2026-09-18
+Last Updated: 2026-10-08
 
-Status: ready-to-run protocol and offline tooling, **not completed pilots**.
-Three independent repositories must finish before publishing conclusions.
+Status: protocol and offline tooling prepared, but the study is **not scheduled
+or completed**. Before recruitment, the maintainer must name an owner, 2–3
+candidate repositories, a recruitment window, and the outcomes intended for
+publication. Three independent repositories must finish before publishing
+conclusions.
 An operator must recruit consenting participants; agents must not invent users,
 send invitations, upload reports, or claim adoption without authorization.
+
+Use the [baseline form](../pilot/baseline-form.md) before any participant uses
+Aethyme. The versioned [install guide](../pilot/install.md) is the onboarding
+script; the [pilot kit](../pilot/README.md) links the participant materials.
 
 ## Cohort and consent
 
@@ -20,6 +27,9 @@ and any published quotation. Participation does not require uploading source,
 diffs, broker databases, raw metrics, task text, usernames, paths, or secrets.
 The tools below never transmit anything. A participant may withdraw at any time;
 delete their shared reports on request and state how long aggregates are retained.
+Because the cohort is small, pilot codes alone do not guarantee anonymity.
+Coarsen or suppress metadata and quotations that could identify a team or
+repository before publication.
 
 ## Install and rollback checklist
 
@@ -28,8 +38,11 @@ version locally. Use the same versions/policy throughout each comparison window.
 Follow [operational recovery](operational-recovery.md) to verify both binaries.
 Use a disposable clone for the first install → enroll → start → submit → finish.
 Record elapsed time and every manual intervention; do not quietly rescue a user.
-Exercise a failing gate and a real conflict, then recovery. Have one participant
-exercise update/rollback using the installer-managed previous bundle.
+Exercise a failing gate and a real conflict, then recovery. For installer-managed
+updates, verify the documented automatic restoration after a failed staged
+smoke or activation check on a disposable machine, using a maintainer-reviewed
+procedure. A manual switch to the previous bundle is not currently exposed as
+a participant command; do not claim that manual rollback acceptance is met.
 
 Before uninstall, finish or preserve outstanding session work, inspect integration
 and retain user branches. Never remove all host worktrees or broker state as an
@@ -62,22 +75,27 @@ At two weeks record retained use, active repository count and uninstall success.
 
 ## Offline numeric export
 
-From a checkout of this protocol, use `jq` to project metrics to a strict numeric
-allowlist. Run the broker command in the participant repository and pass the absolute
-path of the reviewed filter; the relative example below assumes it is in that checkout.
+Follow the [shareable aggregate export](../pilot/metrics-export.md) from the
+participant repository. Capture the first snapshot immediately after enrollment
+and the second at the end of the two-week Aethyme follow-up. These counters
+measure Aethyme activity; they are not a snapshot of the team's pre-Aethyme
+workflow. Record that one-week baseline with the [baseline form](../pilot/baseline-form.md)
+and compare the same manually measured task outcomes across both periods.
 
-```sh
-aethyme broker advanced metrics --json | jq -e -f scripts/pilot-report.jq > pilot-baseline.json
-# After the observation window:
-aethyme broker advanced metrics --json | jq -e -f scripts/pilot-report.jq > pilot-followup.json
-jq -e -s -f scripts/pilot-compare.jq pilot-baseline.json pilot-followup.json > pilot-delta.json
-```
+The output contains only counters: it omits repository labels, per-session ids,
+names, paths, task text, and timestamps. Do not share raw `status --json`, the
+local diagnostic snapshots from `docs/pilot/export-metrics.sh`, or a broker
+database.
 
 Check every command's exit status and review the files before sharing. The filter
 drops custom gate/command names and arbitrary extra fields. Missing, negative,
 non-numeric or unsafe-size counters fail instead of turning into zero. A counter
 decrease means pruning/reset or incompatible observation windows: start a new baseline.
 Keep raw metrics local; only share the reviewed allowlisted export by explicit consent.
+The `gate_runs` and `gate_execution_ms` counters come from configured gate
+executions. Advisory semantic gate suggestions are not executed and are not
+counted as gates. Report them separately as suggestions if observed; never add
+them to the configured-gate totals.
 
 These are cumulative instrument counters, not an end-to-end productivity benchmark.
 Command and gate execution times overlap and must **not** be added. Estimated cache
@@ -99,8 +117,11 @@ team cannot dominate the result. Do not pool incomparable tasks into a savings c
 Publish cohort size, protocol/product versions, missing data, excluded windows and
 all negative results. Small samples do not establish product-market fit.
 
-Success requires three independent completed journeys, one unaided conflict recovery,
-one update/rollback, reviewed privacy-safe data, and a prioritized decision report.
+Success requires three independent completed journeys, one unaided conflict
+recovery, evidence that installer failure restores the prior bundle, reviewed
+privacy-safe data, and a prioritized decision report. If manual rollback is a
+release requirement, keep the pilot blocked until a reviewed operator procedure
+exists and has been exercised.
 Every participant should get an explicit go/stop decision; inability to recover or
 unexplained deletion is a stop condition, not an onboarding inconvenience.
 

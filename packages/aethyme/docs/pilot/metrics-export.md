@@ -1,12 +1,13 @@
-# Pilot metrics export
+# Pilot metrics export and sharing
 
-Last Updated: 2026-09-26
+Last Updated: 2026-10-08
 
-[`export-metrics.sh`](export-metrics.sh) is opt-in and local. Each run reads
-the broker's state for one repository and writes one small, redacted JSON
-snapshot to a directory on your machine. At the end of the pilot you look
-through that directory and send it to us. The script only reads broker
-state; it never changes the repository or the broker.
+[`export-metrics.sh`](export-metrics.sh) is an opt-in local diagnostic. Each
+run reads the broker's state for one repository and writes a redacted JSON
+snapshot to a directory on your machine. The snapshot still contains stable
+session ids and timestamps, so keep it local. It is not the artifact to share
+for the external pilot. The script only reads broker state; it never changes
+the repository or the broker.
 
 ## Run it
 
@@ -23,8 +24,10 @@ Needs `aethyme` and `jq` (1.6 or later) on `PATH`.
 | `--out <dir>` | `$AETHYME_PILOT_OUT`, else `~/aethyme-pilot-metrics` | Where snapshots go |
 | `--label <name>` | `repo` | Your name for this repository; letters, digits, `-`, `_` |
 
-Once a day is enough; more often is fine. With cron, set `PATH` explicitly,
-because cron's default does not include Homebrew:
+Use this for local troubleshooting only. Do not schedule it for pilot data
+collection or send its output directory. If you choose to schedule local
+diagnostics, set `PATH` explicitly because cron's default may not include
+Homebrew:
 
 ```cron
 0 18 * * 1-5 PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin $HOME/aethyme-pilot/export-metrics.sh --repo $HOME/src/app --label app >>$HOME/aethyme-pilot-metrics/cron.log 2>&1
@@ -56,47 +59,78 @@ value) so you can tell us.
 
 Timestamps are Unix milliseconds, as the broker records them. Together with
 the queue entries they give the time from a session's start to its first
-submit.
+submit. That detail is useful for local analysis but is deliberately excluded
+from the shareable pilot export.
 
-## Sample
+## Shareable aggregate export
 
-A snapshot of this repository's own broker, with the lists cut to one entry:
+Copy `scripts/pilot-report.jq` and `scripts/pilot-compare.jq` from the Aethyme
+checkout to a participant-controlled local folder. From the participant
+repository, capture numeric counters immediately after enrollment and at the
+end of the two-week Aethyme follow-up. The filters are strict allowlists: they
+discard gate and command names, repository identity, paths, task text,
+timestamps, and all unrecognized fields. Advisory gate suggestions are not
+configured gate executions and are not included in the gate counters. These
+counters describe Aethyme activity; they do not provide the pre-install
+baseline.
+
+```sh
+set -eu
+PILOT_DIR="$HOME/aethyme-pilot"
+mkdir -p "$PILOT_DIR"
+cp /path/to/Aethyme/scripts/pilot-report.jq "$PILOT_DIR/"
+cp /path/to/Aethyme/scripts/pilot-compare.jq "$PILOT_DIR/"
+cd /path/to/participant-repo
+capture() {
+    raw=$(aethyme broker advanced metrics --json)
+    printf '%s\n' "$raw" | jq -e -f "$PILOT_DIR/pilot-report.jq" > "$PILOT_DIR/$1.json"
+    unset raw
+}
+capture pilot-start
+# At the end of the two-week follow-up:
+capture pilot-followup
+jq -e -s -f "$PILOT_DIR/pilot-compare.jq" "$PILOT_DIR/pilot-start.json" "$PILOT_DIR/pilot-followup.json" > "$PILOT_DIR/pilot-delta.json"
+```
+
+Review the numeric files before sharing. Share only `pilot-delta.json` and the
+separately reviewed aggregate form, and only with explicit consent. Record the
+pre-install baseline with the [baseline form](baseline-form.md). If a
+counter decreases, the comparison refuses: a reset or prune invalidated that
+window, so establish a new baseline. These cumulative counters do not measure
+task elapsed time, operator effort, prevented incidents, or causation; collect
+those with the [baseline form](baseline-form.md) and the interview guide.
+
+## Shareable result example
+
+Illustrative numeric-only output from `scripts/pilot-report.jq`:
 
 ```json
 {
-  "schema": "aethyme-pilot-metrics.v1",
-  "captured_at": "2026-09-26T05:18:12Z",
-  "aethyme_version": "0.8.3",
-  "label": "aethyme",
-  "summary": {"live_sessions": 7, "active_sessions": 6, "idle_sessions": 0, "stale_sessions": 1,
-              "dirty_sessions": 3, "overlap_count": 0, "promoted_conflict_count": 1,
-              "integration_relation": "current_with_main", "integration_ahead_main_commits": 0},
-  "sessions": [{"id": 621, "status": "stale", "derived_status": "stale", "origin": "spawned",
-                "cleanup_state": "open", "created_at": 1790150038269, "last_activity_at": 1790150038269}],
-  "leases": {"count": 35, "by_kind": {"explicit": 21, "implicit": 14}, "sessions": [621, 669, 670, 671, 672, 673, 674]},
-  "queue": {"count": 41, "by_status": {"verified": 41},
-            "entries": [{"id": 563, "session_id": 613, "status": "verified",
-                         "created_at": 1790090409062, "updated_at": 1790108751604}]},
-  "queue_history": {"externally_landed": 446, "rejected": 17, "superseded": 111},
-  "promoted_conflicts": {"count": 1, "sessions": [621]},
-  "advice": [{"id": "integration.upstream-main-ahead", "severity": "notice", "session_id": null}],
-  "advisories": {"count": 7, "by_producer": {"gate_reliability_history": 6, "resource_history": 1},
-                 "by_severity": {"warning": 7}},
-  "storage": {"broker_owned_worktree_count": 0, "eligible_worktree_count": 0,
-              "estimated_retained_bytes": 0, "estimated_reclaimable_bytes": 0, "severity": "notice"},
-  "blockers": {"available": true, "count": 0, "by_kind": {}, "by_scope": {},
-               "safe_to_clear_automatically": 0, "sessions": [], "unavailable_sources": []}
+  "schema_version": 1,
+  "counters": {
+    "gate_runs": 2,
+    "gate_execution_ms": 300,
+    "gate_cache_hits": 1,
+    "estimated_gate_time_saved_ms": 100,
+    "conflicts_caught_pre_gate": 1,
+    "overlap_warnings": 2,
+    "command_calls": 3,
+    "command_execution_ms": 400,
+    "command_output_bytes": 800,
+    "command_output_sampled_calls": 2
+  }
 }
 ```
 
 ## Versions
 
 On v0.8.4 and later the script reads blockers with
-`aethyme broker unblock --json`; on v0.8.3 it falls back to
-`aethyme broker unblock --json`. If `aethyme broker status --json` fails,
+`aethyme broker unblock --json`; on v0.8.3 it falls back to the deprecated
+blocker-list command. If `aethyme broker status --json` fails,
 the script exits non-zero and writes nothing.
 
 ## Sharing
 
-At the end of the pilot, read the files (they are plain JSON), delete any you
-would rather not send, and send us the directory as a zip or tarball.
+Do not send the directory produced by `export-metrics.sh`. At the end of the
+pilot, review each proposed aggregate artifact and share only the files the
+participant has explicitly consented to share.
