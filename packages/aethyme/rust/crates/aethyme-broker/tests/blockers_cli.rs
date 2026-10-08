@@ -250,6 +250,237 @@ fn a_host_operation_is_addressed_by_its_hex_id() {
 }
 
 #[test]
+fn operations_show_and_reconcile_accept_the_printed_host_operation_id() {
+    let fixture = Fixture::new();
+    let database = fixture.state.join("host-operations.db");
+    let remote_key = format!("local:{}", fixture.broker().main_root().display());
+    let hex = {
+        let mut guard = HostOperationGuard::begin(
+            &database,
+            &remote_key,
+            OperationProvider::Git,
+            OperationEffect::Write,
+        )
+        .unwrap();
+        guard.mark_running().unwrap();
+        let hex = guard.operation().operation_id.clone();
+        drop(guard);
+        hex
+    };
+    let stale_pid = dead_pid();
+    let connection = Connection::open(&database).unwrap();
+    connection
+        .execute(
+            "UPDATE host_operations SET status='outcome_unknown', holder_pid=?2 WHERE operation_id=?1",
+            rusqlite::params![hex, i64::from(stale_pid)],
+        )
+        .unwrap();
+    drop(connection);
+
+    let shown = fixture.run(&["advanced", "operations", "show", &hex, "--json"]);
+    assert!(shown.status.success(), "{}", stderr(&shown));
+    let shown: serde_json::Value = serde_json::from_slice(&shown.stdout).unwrap();
+    assert_eq!(shown["host_operation"]["operation_id"], hex);
+    assert_eq!(shown["host_operation"]["status"], "outcome_unknown");
+
+    let reconciled = fixture.run(&[
+        "advanced",
+        "operations",
+        "reconcile",
+        "--operation",
+        &hex,
+        "--outcome",
+        "failed",
+        "--reason",
+        "remote inspection shows the ref unchanged",
+        "--json",
+    ]);
+    assert!(reconciled.status.success(), "{}", stderr(&reconciled));
+    let reconciled: serde_json::Value = serde_json::from_slice(&reconciled.stdout).unwrap();
+    assert_eq!(reconciled["kind"], "host_operation");
+    assert_eq!(reconciled["cleared"], true);
+    assert!(reconciled["action"].as_str().unwrap().contains(&hex));
+    assert!(fixture.blocker(&format!("hostop:{hex}")).is_none());
+    assert_eq!(
+        aethyme_broker::host_operation(&database, &hex)
+            .unwrap()
+            .unwrap()
+            .status,
+        OperationStatus::ReconciledFailed
+    );
+}
+
+#[test]
+fn a_host_operation_on_another_repository_is_not_reconciled_from_here() {
+    let fixture = Fixture::new();
+    let database = fixture.state.join("host-operations.db");
+    // The host database is shared by every repository on the host; this row
+    // belongs to a remote this checkout does not have.
+    let foreign = "github.com/someone-else/other-repo";
+    let hex = {
+        let mut guard = HostOperationGuard::begin(
+            &database,
+            foreign,
+            OperationProvider::Git,
+            OperationEffect::Write,
+        )
+        .unwrap();
+        guard.mark_running().unwrap();
+        let hex = guard.operation().operation_id.clone();
+        drop(guard);
+        hex
+    };
+    let connection = Connection::open(&database).unwrap();
+    connection
+        .execute(
+            "UPDATE host_operations SET status='outcome_unknown', holder_pid=?2 WHERE operation_id=?1",
+            rusqlite::params![hex, i64::from(dead_pid())],
+        )
+        .unwrap();
+    drop(connection);
+
+    let reconciled = fixture.run(&[
+        "advanced",
+        "operations",
+        "reconcile",
+        "--operation",
+        &hex,
+        "--outcome",
+        "succeeded",
+        "--reason",
+        "wrong repository",
+        "--json",
+    ]);
+    assert!(
+        !reconciled.status.success(),
+        "a foreign host operation was reconciled"
+    );
+    assert!(
+        stderr(&reconciled).contains("not a remote of this repository"),
+        "{}",
+        stderr(&reconciled)
+    );
+    let unblocked = fixture.run(&[
+        "unblock",
+        &format!("hostop:{hex}"),
+        "--outcome",
+        "succeeded",
+        "--reason",
+        "wrong repository",
+    ]);
+    assert_eq!(unblocked.status.code(), Some(3), "{}", stderr(&unblocked));
+    assert!(
+        stderr(&unblocked).contains("not a remote of this repository"),
+        "{}",
+        stderr(&unblocked)
+    );
+    assert_eq!(
+        aethyme_broker::host_operation(&database, &hex)
+            .unwrap()
+            .unwrap()
+            .status,
+        OperationStatus::OutcomeUnknown,
+        "the foreign barrier must stay in place"
+    );
+}
+
+#[test]
+fn operations_show_and_reconcile_resolve_linked_host_operation_ids() {
+    let fixture = Fixture::new();
+    let database = fixture.state.join("host-operations.db");
+    let remote_key = format!("local:{}", fixture.repo.display());
+    let hex = {
+        let mut guard = HostOperationGuard::begin(
+            &database,
+            &remote_key,
+            OperationProvider::Git,
+            OperationEffect::Write,
+        )
+        .unwrap();
+        guard.mark_running().unwrap();
+        let hex = guard.operation().operation_id.clone();
+        drop(guard);
+        hex
+    };
+    let stale_pid = dead_pid();
+    let connection = Connection::open(&database).unwrap();
+    connection
+        .execute(
+            "UPDATE host_operations SET status='outcome_unknown', holder_pid=?2 WHERE operation_id=?1",
+            rusqlite::params![hex, i64::from(stale_pid)],
+        )
+        .unwrap();
+    drop(connection);
+
+    let mut broker = Broker::open(&fixture.repo)
+        .unwrap()
+        .with_host_operation_database(database.clone());
+    let coordinated = broker
+        .store()
+        .create_coordinated_operation(&NewCoordinatedOperation {
+            session_id: fixture.session_id,
+            provider: OperationProvider::Git,
+            repository: format!("local:{}", fixture.repo.display()),
+            scope: "repository".into(),
+            effect: OperationEffect::Write,
+            authorization_reason: Some("test linked host operation".into()),
+            command_json: r#"["git","push"]"#.into(),
+            pid: i64::from(stale_pid),
+            host_operation_id: Some(hex.clone()),
+            identity_provenance: OperationIdentityProvenance::LocalRepository,
+        })
+        .unwrap();
+    broker
+        .store()
+        .transition_coordinated_operation(coordinated.id, OperationStatus::Running, None, None)
+        .unwrap();
+    broker
+        .store()
+        .transition_coordinated_operation(
+            coordinated.id,
+            OperationStatus::OutcomeUnknown,
+            None,
+            None,
+        )
+        .unwrap();
+    drop(broker);
+
+    let shown = fixture.run(&["advanced", "operations", "show", &hex, "--json"]);
+    assert!(shown.status.success(), "{}", stderr(&shown));
+    let shown: serde_json::Value = serde_json::from_slice(&shown.stdout).unwrap();
+    assert_eq!(shown["operation"]["id"], coordinated.id);
+    assert_eq!(shown["reconciliation"]["state"], "required");
+
+    let reconciled = fixture.run(&[
+        "advanced",
+        "operations",
+        "reconcile",
+        "--operation",
+        &hex,
+        "--outcome",
+        "failed",
+        "--reason",
+        "remote inspection shows the ref unchanged",
+        "--json",
+    ]);
+    assert!(reconciled.status.success(), "{}", stderr(&reconciled));
+    let host_operation = aethyme_broker::host_operation(&database, &hex)
+        .unwrap()
+        .unwrap();
+    assert_eq!(host_operation.status, OperationStatus::ReconciledFailed);
+    let mut broker = fixture.broker();
+    assert_eq!(
+        broker
+            .store()
+            .coordinated_operation(coordinated.id)
+            .unwrap()
+            .unwrap()
+            .status,
+        OperationStatus::ReconciledFailed
+    );
+}
+
+#[test]
 fn a_cached_failing_verdict_can_be_invalidated_so_the_gate_runs_fresh() {
     let fixture = Fixture::new();
     let tree = "0123456789abcdef0123456789abcdef01234567";
