@@ -18,11 +18,23 @@ pub const GRAPH_REFRESH_PLAN_SCHEMA_VERSION: u32 = 1;
 pub const RELEASE_TARGETS: &[&str] = &[
     "aarch64-apple-darwin",
     "x86_64-apple-darwin",
+    "x86_64-pc-windows-msvc",
     "x86_64-unknown-linux-gnu",
     "aarch64-unknown-linux-gnu",
     "x86_64-unknown-linux-musl",
 ];
 pub const REQUIRED_RELEASE_BINARIES: &[&str] = &["aethyme", "aethyme-engine-cli"];
+
+/// Return the release archive name for a version and Rust target triple.
+/// Windows artifacts are zip files; Unix artifacts remain tarballs.
+pub fn release_archive_filename(version: &str, target: &str) -> String {
+    let extension = if target == "x86_64-pc-windows-msvc" {
+        "zip"
+    } else {
+        "tar.gz"
+    };
+    format!("aethyme-v{version}-{target}.{extension}")
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReleaseArtifact {
@@ -167,7 +179,7 @@ impl ReleaseManifest {
                     artifact.archive
                 ));
             }
-            let expected_archive = format!("aethyme-v{}-{}.tar.gz", self.version, artifact.target);
+            let expected_archive = release_archive_filename(&self.version, &artifact.target);
             if artifact.archive != expected_archive {
                 return Err(format!(
                     "release artifact {} does not match expected name {expected_archive}",
@@ -219,7 +231,7 @@ mod tests {
 
     fn artifact(target: &str) -> ReleaseArtifact {
         ReleaseArtifact {
-            archive: format!("aethyme-v0.2.0-{target}.tar.gz"),
+            archive: release_archive_filename("0.2.0", target),
             binaries: required_binaries(),
             sha256: "a".repeat(64),
             size_bytes: 42,
@@ -318,7 +330,7 @@ mod tests {
         preview.version = "0.3.0-preview.1".into();
         preview.release_channel = "preview".into();
         for artifact in &mut preview.artifacts {
-            artifact.archive = format!("aethyme-v{}-{}.tar.gz", preview.version, artifact.target);
+            artifact.archive = release_archive_filename(&preview.version, &artifact.target);
         }
 
         assert_eq!(preview.validate(), Ok(()));

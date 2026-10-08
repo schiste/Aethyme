@@ -450,6 +450,7 @@ pub use release_compatibility::{
 pub use release_manifest::{
     RELEASE_MANIFEST_SCHEMA_VERSION, RELEASE_TARGETS, REQUIRED_RELEASE_BINARIES, ReleaseArtifact,
     ReleaseBrokerStorageCompatibility, ReleaseCompatibility, ReleaseInstaller, ReleaseManifest,
+    release_archive_filename,
 };
 pub use remote_target::{
     RemoteAssertionEvidence, RemoteCommandSelectionEvidence, RemoteIdentityEvidence,

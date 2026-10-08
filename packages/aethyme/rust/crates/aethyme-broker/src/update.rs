@@ -1723,7 +1723,9 @@ fn is_cargo_bin_path(path: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use crate::{RELEASE_TARGETS, REQUIRED_RELEASE_BINARIES, ReleaseInstaller};
+    use crate::{
+        RELEASE_TARGETS, REQUIRED_RELEASE_BINARIES, ReleaseInstaller, release_archive_filename,
+    };
 
     use super::*;
 
@@ -1735,7 +1737,7 @@ mod tests {
             RELEASE_TARGETS
                 .iter()
                 .map(|target| ReleaseArtifact {
-                    archive: format!("aethyme-v{version}-{target}.tar.gz"),
+                    archive: release_archive_filename(version, target),
                     binaries: REQUIRED_RELEASE_BINARIES
                         .iter()
                         .map(|binary| (*binary).to_string())

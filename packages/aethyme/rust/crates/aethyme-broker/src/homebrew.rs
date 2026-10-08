@@ -115,7 +115,7 @@ fn repository_byte(byte: u8) -> bool {
 mod tests {
     use crate::{
         RELEASE_TARGETS, REQUIRED_RELEASE_BINARIES, ReleaseArtifact, ReleaseInstaller,
-        ReleaseManifest,
+        ReleaseManifest, release_archive_filename,
     };
 
     use super::*;
@@ -129,7 +129,7 @@ mod tests {
                 .iter()
                 .enumerate()
                 .map(|(index, target)| ReleaseArtifact {
-                    archive: format!("aethyme-v0.2.0-{target}.tar.gz"),
+                    archive: release_archive_filename("0.2.0", target),
                     binaries: REQUIRED_RELEASE_BINARIES
                         .iter()
                         .map(|binary| (*binary).to_string())
@@ -158,10 +158,10 @@ mod tests {
         // Homebrew users on Linux are glibc; the musl archive serves the
         // installer on musl distributions only.
         for target in RELEASE_TARGETS {
-            let archive = format!("aethyme-v0.2.0-{target}.tar.gz");
+            let archive = release_archive_filename("0.2.0", target);
             assert_eq!(
                 formula.contains(&archive),
-                !target.ends_with("-musl"),
+                !target.ends_with("-musl") && *target != "x86_64-pc-windows-msvc",
                 "{archive}"
             );
         }
