@@ -1,6 +1,6 @@
 # Closed-session worktree cleanup
 
-Last Updated: 2026-10-07
+Last Updated: 2026-10-08
 
 Removing a session worktree is a reviewed operation, with one deterministic
 exception described under *Automatic removal* below. A closed session is not
@@ -29,6 +29,29 @@ not measured in time and the header says the totals are floors. Add
 
 A worktree outside this repository belongs to whoever ran it. Classify it, do
 not act on it.
+
+For a host-level view of worktree roots, preparation-cache entries, primary
+checkout artifacts, and broker branch refs, use:
+
+```sh
+aethyme broker gc storage plan --json
+```
+
+Each owned root's `session_branches` lists local refs recorded by its session
+ledger and unclaimed refs in the broker's `agent/` namespace. Entries include
+the head SHA, session IDs, uncleared holders, registered checkouts, and a reason
+for retention. `session_branch_inventory_complete: false` means the owner or
+its refs could not be fully inspected; an empty list in that case does not
+mean there are no branches. An unclaimed `agent/` ref has unknown ownership,
+so the plan reports it for review and never offers it as an automatic removal
+candidate. Branch deletion still needs independent ownership and delivery
+proof. The storage plan is read-only with respect to session and branch state;
+its digest authorizes only the listed filesystem candidates.
+
+This output is schema version `3`. The summary reports the counts of
+ledger-owned branch refs, unclaimed agent refs, and valid roots whose branch
+inventory is incomplete. These counts describe refs visible in each inspected
+storage root; they are not deletion candidates or proof of delivery.
 
 For one repository, the audit answers the same question by content and against
 a named target:
