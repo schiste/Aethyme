@@ -149,6 +149,7 @@ impl WaitRegistration {
                 started_at_ms: epoch_ms(),
             },
         };
+        prune_gone(&waits_dir(main_root), crate::broker::pid_alive);
         registration.persist();
         registration
     }
@@ -175,6 +176,34 @@ impl WaitRegistration {
                 })
             });
         crate::warn_unrecorded("record a lock wait", written);
+    }
+}
+
+/// Remove the records of waiters whose process is gone. A waiter stopped by
+/// a signal (Ctrl-C included) never runs `Drop`, so without this its record
+/// would be listed by every later `status` until someone deleted it by hand.
+/// Done by the next waiter rather than by `status`, which stays read-only.
+fn prune_gone(dir: &Path, alive: impl Fn(i64) -> bool) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().is_none_or(|ext| ext != "json") {
+            continue;
+        }
+        let Some(record) = std::fs::read(&path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<WaitRecord>(&bytes).ok())
+        else {
+            continue;
+        };
+        if !alive(record.pid)
+            && let Err(error) = std::fs::remove_file(&path)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            eprintln!("Warning: cannot remove a gone waiter's record: {error}");
+        }
     }
 }
 
@@ -239,6 +268,10 @@ mod tests {
         }
         std::fs::write(dir.join("junk.json"), b"not json").unwrap();
         let waiters = current_with(root.path(), 10_000, |pid| pid == 41);
+        assert!(
+            dir.join("42-1.json").exists(),
+            "status never removes a record"
+        );
         assert_eq!(
             waiters
                 .iter()
@@ -250,6 +283,36 @@ mod tests {
             describe(&waiters[0]),
             "process 42 waiting 9s for the coordinated write lock on schiste/aethyme: \
              operation 7 (session 3) -- process gone"
+        );
+    }
+
+    #[test]
+    fn the_next_waiter_removes_the_records_of_gone_waiters_only() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = waits_dir(root.path());
+        std::fs::create_dir_all(&dir).unwrap();
+        for pid in [41, 42] {
+            let record = WaitRecord {
+                pid,
+                session_id: None,
+                kind: WAIT_LEASE.into(),
+                resource: "src/lib.rs".into(),
+                holder: "held by session 700".into(),
+                started_at_ms: 1_000,
+            };
+            std::fs::write(
+                dir.join(format!("{pid}-1.json")),
+                serde_json::to_vec(&record).unwrap(),
+            )
+            .unwrap();
+        }
+        std::fs::write(dir.join("junk.json"), b"not json").unwrap();
+        prune_gone(&dir, |pid| pid == 41);
+        assert!(dir.join("41-1.json").exists(), "a live waiter is kept");
+        assert!(!dir.join("42-1.json").exists(), "a gone waiter is removed");
+        assert!(
+            dir.join("junk.json").exists(),
+            "only parsed records are touched"
         );
     }
 }

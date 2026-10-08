@@ -1167,9 +1167,6 @@ fn render_recent_command_failures(failures: &[crate::RecentCommandFailure]) {
     out!("  all: aethyme broker advanced events --kind broker.command.failed");
 }
 
-/// Doctor's view of committed work only this machine holds. Status carries
-/// the same facts as advice rows; doctor lists them because it is where an
-/// operator looks when asking "is anything at risk here?".
 /// Who is blocked on which broker lock or lease, longest wait first (#494).
 fn render_waiters(waiters: &[crate::CurrentWaiter]) {
     if waiters.is_empty() {
@@ -1182,6 +1179,9 @@ fn render_waiters(waiters: &[crate::CurrentWaiter]) {
     }
 }
 
+/// Doctor's view of committed work only this machine holds. Status carries
+/// the same facts as advice rows; doctor lists them because it is where an
+/// operator looks when asking "is anything at risk here?".
 fn render_unpushed_work(report: &crate::UnpushedWorkReport) {
     if report.is_empty() {
         return;

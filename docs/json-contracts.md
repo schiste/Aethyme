@@ -124,7 +124,8 @@ waits. Each has `pid`, optional `session_id`, `kind`
 `holder` (the holder as last observed, with its age), `waited_ms` and `alive`
 (false when the waiting process is gone without removing its record).
 Records live in `.aethyme/run/waits/`; a wait writes one when it first meets
-contention and removes it when it ends.
+contention and removes it when it ends. A record whose process is gone stays
+listed until the next wait starts, which removes it; `status` never deletes.
 
 `review_refusals` lists reviews a provider declined and nothing has re-asked
 for since. `class` is `quota_exhausted`, `rate_limited`, `provider_error` or
