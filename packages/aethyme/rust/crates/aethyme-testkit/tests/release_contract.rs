@@ -125,6 +125,33 @@ fn release_workflow_smokes_the_installed_archive_contract() {
 }
 
 #[test]
+fn release_targets_exercises_native_linux_arm64_runtime_contract() {
+    let workflow = std::fs::read_to_string(
+        aethyme_testkit::paths::repo_root().join(".github/workflows/release-targets.yml"),
+    )
+    .unwrap();
+    assert!(workflow.contains("os: ubuntu-24.04-arm"));
+    assert!(workflow.contains("target: aarch64-unknown-linux-gnu"));
+    assert!(workflow.contains("if: matrix.target == 'aarch64-unknown-linux-gnu'"));
+
+    for command in [
+        "cargo test --locked -p aethyme-testkit --test release_installer",
+        "cargo test --locked -p aethyme-broker --lib bootstrap_switches_the_pair_once_and_retains_one_rollback_bundle",
+        "cargo test --locked -p aethyme-broker --lib failed_staged_quick_test_never_moves_the_active_pair",
+        "cargo test --locked -p aethyme-broker --test broker two_session_worktrees_are_distinct_and_registered",
+        "cargo test --locked -p aethyme-broker --test host_operations_e2e",
+        "broker quick-test",
+        "graph refresh plan",
+        "graph refresh execute",
+    ] {
+        assert!(
+            workflow.contains(command),
+            "native Linux arm64 job is missing {command}"
+        );
+    }
+}
+
+#[test]
 fn release_workflow_renders_the_homebrew_formula_from_the_manifest() {
     let workflow = std::fs::read_to_string(
         aethyme_testkit::paths::repo_root().join(".github/workflows/release.yml"),

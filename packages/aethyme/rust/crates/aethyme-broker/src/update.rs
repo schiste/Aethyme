@@ -2065,12 +2065,13 @@ mod tests {
     fn bootstrap_switches_the_pair_once_and_retains_one_rollback_bundle() {
         let temp = tempfile::tempdir().unwrap();
         let install_dir = temp.path().join("bin");
+        let target = current_release_target().unwrap();
 
         let first = bootstrap_install(
             &fake_payload(temp.path(), "0.2.0", true),
             &install_dir,
             &manifest_file(temp.path(), "0.2.0"),
-            RELEASE_TARGETS[0],
+            target,
         )
         .unwrap();
         assert!(first.rollback_bundle.is_none());
@@ -2085,7 +2086,7 @@ mod tests {
             &fake_payload(temp.path(), "0.3.0", true),
             &install_dir,
             &manifest_file(temp.path(), "0.3.0"),
-            RELEASE_TARGETS[0],
+            target,
         )
         .unwrap();
         assert!(
@@ -2102,7 +2103,7 @@ mod tests {
             &fake_payload(temp.path(), "0.4.0", true),
             &install_dir,
             &manifest_file(temp.path(), "0.4.0"),
-            RELEASE_TARGETS[0],
+            target,
         )
         .unwrap();
         let versions = fs::read_dir(root.join("versions"))
@@ -2125,11 +2126,12 @@ mod tests {
     fn failed_staged_quick_test_never_moves_the_active_pair() {
         let temp = tempfile::tempdir().unwrap();
         let install_dir = temp.path().join("bin");
+        let target = current_release_target().unwrap();
         bootstrap_install(
             &fake_payload(temp.path(), "0.2.0", true),
             &install_dir,
             &manifest_file(temp.path(), "0.2.0"),
-            RELEASE_TARGETS[0],
+            target,
         )
         .unwrap();
         let current = install_dir.join(".aethyme-managed/current");
@@ -2139,7 +2141,7 @@ mod tests {
             &fake_payload(temp.path(), "0.3.0", false),
             &install_dir,
             &manifest_file(temp.path(), "0.3.0"),
-            RELEASE_TARGETS[0],
+            target,
         )
         .unwrap_err();
 
