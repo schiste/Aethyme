@@ -388,7 +388,12 @@ pub(super) enum CheckoutInspection {
     Unreadable,
     Read {
         dirty: Vec<String>,
-        head: Option<String>,
+        branch: String,
+        head: String,
+        /// Tip of the session's recorded branch. When the checkout is still
+        /// on that branch it is the same as `head`; a different branch is
+        /// resolved separately so status can report both sides of drift.
+        recorded_branch_head: Option<String>,
     },
 }
 
@@ -413,22 +418,37 @@ pub(super) fn inspect_session_checkouts(
             Ok(_) => return CheckoutInspection::NotInspected,
             Err(error) => return checkout_inspection_error(error),
         };
+        let branch = match checkout.current_branch() {
+            Ok(branch) if !expired() => branch,
+            Ok(_) => return CheckoutInspection::NotInspected,
+            Err(error) => return checkout_inspection_error(error),
+        };
         let dirty = match checkout.dirty_paths() {
             Ok(dirty) if !expired() => dirty,
             Ok(_) => return CheckoutInspection::NotInspected,
             Err(error) => return checkout_inspection_error(error),
         };
-        // A dirty checkout's head is never consulted.
-        let head = if dirty.is_empty() {
-            match checkout.head_commit() {
-                Ok(head) if !expired() => Some(head),
-                Ok(_) => return CheckoutInspection::NotInspected,
-                Err(error) => return checkout_inspection_error(error),
-            }
-        } else {
-            None
+        let head = match checkout.head_commit() {
+            Ok(head) if !expired() => head,
+            Ok(_) => return CheckoutInspection::NotInspected,
+            Err(error) => return checkout_inspection_error(error),
         };
-        CheckoutInspection::Read { dirty, head }
+        let recorded_branch_head = if branch == agent.session.branch {
+            Some(head.clone())
+        } else {
+            let recorded_ref = format!("refs/heads/{}", agent.session.branch);
+            let recorded = checkout.resolve_ref(&recorded_ref);
+            if expired() {
+                return CheckoutInspection::NotInspected;
+            }
+            recorded
+        };
+        CheckoutInspection::Read {
+            dirty,
+            branch,
+            head,
+            recorded_branch_head,
+        }
     });
     agents
         .iter()
@@ -527,6 +547,43 @@ pub(super) fn dirty_session_count(
             matches!(inspection, CheckoutInspection::Read { dirty, .. } if !dirty.is_empty())
         })
         .count()
+}
+
+pub(super) fn checkout_drift_advice(
+    agent: &AgentView,
+    actual_branch: &str,
+    actual_head: &str,
+    recorded_branch_head: Option<&str>,
+) -> Option<StatusAdvice> {
+    if actual_branch == agent.session.branch && recorded_branch_head == Some(actual_head) {
+        return None;
+    }
+
+    let recorded_head = recorded_branch_head.map(short_commit).unwrap_or("missing");
+    let worktree = shell_quote(&agent.session.worktree_path);
+    let recorded_ref = shell_quote(&format!("refs/heads/{}", agent.session.branch));
+    Some(StatusAdvice {
+        id: "session.checkout-drift",
+        severity: StatusAdviceSeverity::Blocked,
+        reason: "checkout_branch_or_head_drifted",
+        summary: format!(
+            "session {} was recorded on branch {:?}, but its checkout is on {:?}; submit is blocked until the checkout identity is restored or re-adopted",
+            agent.session.id, agent.session.branch, actual_branch
+        ),
+        session_id: Some(agent.session.id),
+        queue_entry_id: None,
+        evidence: vec![
+            format!("recorded branch: {}", agent.session.branch),
+            format!("actual branch: {actual_branch}"),
+            format!("actual HEAD: {}", short_commit(actual_head)),
+            format!("recorded branch HEAD: {recorded_head}"),
+        ],
+        commands: vec![
+            format!("git -C {worktree} status --short --branch"),
+            format!("git -C {worktree} rev-parse HEAD"),
+            format!("git -C {worktree} rev-parse {recorded_ref}"),
+        ],
+    })
 }
 
 #[derive(Debug, PartialEq, Eq)]

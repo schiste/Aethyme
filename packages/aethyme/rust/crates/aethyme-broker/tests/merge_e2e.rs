@@ -2378,7 +2378,7 @@ fn session_161_rebase_submit_promote_continue_and_submit_again() {
 
     sh(
         &worktree,
-        &["rebase", "--onto", "aethyme/integration", &adopted, "HEAD"],
+        &["rebase", "--onto", "aethyme/integration", &adopted],
     );
     commit_edit(&worktree, "src/b.py", "b = 3\n");
     let first_accepted_head = resolve(&worktree, "HEAD");
@@ -3913,6 +3913,118 @@ fn status_advice_warns_about_dirty_worktree_wip() {
             .iter()
             .any(|command| command.contains("status --short")),
         "{advice:?}"
+    );
+}
+
+#[test]
+fn status_reports_branch_drift_and_dirty_changes_in_an_adopted_primary_checkout() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    let mut broker = Broker::open(tmp.path()).unwrap();
+    let session = broker
+        .adopt(tmp.path(), Some("adopt primary checkout"))
+        .unwrap();
+
+    sh(tmp.path(), &["checkout", "-q", "-b", "other-work"]);
+    std::fs::write(tmp.path().join("src/a.py"), "a = 99\n").unwrap();
+
+    let status = broker.status(0).unwrap();
+    assert_eq!(status.summary.dirty_sessions, 1, "{status:#?}");
+    let drift = status
+        .advice
+        .iter()
+        .find(|advice| advice.id == "session.checkout-drift")
+        .expect("branch drift should be surfaced");
+    assert_eq!(drift.severity, StatusAdviceSeverity::Blocked);
+    assert_eq!(drift.session_id, Some(session.id));
+    assert!(drift.summary.contains("\"main\""), "{drift:?}");
+    assert!(drift.summary.contains("\"other-work\""), "{drift:?}");
+    assert!(
+        drift
+            .evidence
+            .iter()
+            .any(|line| line == "recorded branch: main"),
+        "{drift:?}"
+    );
+    assert!(
+        status.advice.iter().any(|advice| {
+            advice.id == "session.dirty-worktree"
+                && advice.session_id == Some(session.id)
+                && advice.evidence.iter().any(|line| line.contains("src/a.py"))
+        }),
+        "{status:#?}"
+    );
+}
+
+#[test]
+fn submit_refuses_an_adopted_checkout_that_switched_branches_before_queueing() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    let mut broker = Broker::open(tmp.path()).unwrap();
+    let session = broker
+        .adopt(tmp.path(), Some("submit branch guard"))
+        .unwrap();
+
+    sh(tmp.path(), &["checkout", "-q", "-b", "other-work"]);
+    commit_edit(tmp.path(), "src/a.py", "a = 2\n");
+
+    let error = broker
+        .submit(session.id)
+        .expect_err("drift must fail closed");
+    assert!(
+        matches!(
+            &error,
+            aethyme_broker::BrokerOpError::SessionCheckoutDrift {
+                session_id,
+                recorded_branch,
+                actual_branch,
+                ..
+            } if *session_id == session.id
+                && recorded_branch.as_ref() == "main"
+                && actual_branch.as_ref() == "other-work"
+        ),
+        "{error}"
+    );
+
+    let db = rusqlite::Connection::open(tmp.path().join(".aethyme/broker.db")).unwrap();
+    let queued: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM merge_queue WHERE session_id = ?1",
+            [session.id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(queued, 0, "a refused submit leaves no queue row");
+}
+
+#[test]
+fn submit_accepts_a_session_adopted_on_a_detached_checkout() {
+    // Routed reviews adopt a detached checkout, so the session records `HEAD`
+    // as its branch. Staying detached is not drift; `refs/heads/HEAD` does
+    // not exist and must not be required.
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    sh(tmp.path(), &["checkout", "-q", "--detach"]);
+    let mut broker = Broker::open(tmp.path()).unwrap();
+    let session = broker.adopt(tmp.path(), Some("detached adoption")).unwrap();
+    assert_eq!(session.branch, "HEAD");
+    commit_edit(tmp.path(), "src/a.py", "a = 2\n");
+
+    let status = broker.status(0).unwrap();
+    assert!(
+        !status
+            .advice
+            .iter()
+            .any(|advice| advice.id == "session.checkout-drift"),
+        "{status:#?}"
+    );
+    let result = broker.submit(session.id);
+    assert!(
+        !matches!(
+            result,
+            Err(aethyme_broker::BrokerOpError::SessionCheckoutDrift { .. })
+        ),
+        "{result:?}"
     );
 }
 

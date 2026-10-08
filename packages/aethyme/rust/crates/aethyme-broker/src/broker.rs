@@ -494,6 +494,17 @@ pub enum BrokerOpError {
         status: &'static str,
         stderr: String,
     },
+    #[error(
+        "refusing to submit session {session_id}: checkout identity drifted from recorded branch {recorded_branch:?} at {expected_head:?} to branch {actual_branch:?} at {actual_head} (recorded branch tip {recorded_branch_head:?}); preserve its changes, restore the recorded checkout or close and re-adopt it under the actual branch, then retry"
+    )]
+    SessionCheckoutDrift {
+        session_id: i64,
+        recorded_branch: Box<str>,
+        actual_branch: Box<str>,
+        expected_head: Option<Box<str>>,
+        actual_head: Box<str>,
+        recorded_branch_head: Option<Box<str>>,
+    },
     #[error("session {session_id}'s branch {branch} does not exist in this repository")]
     SessionBranchMissing { session_id: i64, branch: String },
     /// `broker sync` declined before changing anything: the worktree is
