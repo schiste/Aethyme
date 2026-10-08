@@ -29,9 +29,14 @@ aethyme-broker = { path = "../aethyme-broker" }
 aethyme-quality = { path = "../aethyme-quality" }
 
 [dev-dependencies]
+criterion = { workspace = true }
 aethyme-testkit = { path = "../aethyme-testkit" }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 
 [lints]
 workspace = true
+
+[[bench]]
+name = "product_latency"
+harness = false

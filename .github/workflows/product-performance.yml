@@ -1,0 +1,84 @@
+name: Product latency comparison (non-gating)
+
+on:
+  schedule:
+    - cron: "17 4 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: product-latency-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  compare:
+    name: Compare fixed Playground latency baseline
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/packages/aethyme/rust/target
+      CARGO_BUILD_JOBS: "2"
+    steps:
+      - name: Checkout full history for the recorded reference
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: packages/aethyme/rust
+
+      - name: Compare the recorded product revision with this checkout
+        run: |
+          set -euo pipefail
+          report=packages/aethyme/docs/reports/product-performance-baseline-2026-10-08.md
+          baseline_sha="$(awk -F'`' '/^Reference product commit:/ { print $2; exit }' "$report")"
+          fixture_sha="$(awk -F'`' '/^Fixture tree SHA:/ { print $2; exit }' "$report")"
+          if [[ ! "$baseline_sha" =~ ^[0-9a-f]{40}$ || ! "$fixture_sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "baseline report must record full product and fixture SHAs" >&2
+            exit 1
+          fi
+          actual_fixture_sha="$(git rev-parse "$GITHUB_SHA:packages/aethyme-eval/benchmarks/performance/fixture")"
+          if [[ "$actual_fixture_sha" != "$fixture_sha" ]]; then
+            echo "Playground fixture changed; refresh the recorded baseline before comparing" >&2
+            echo "recorded=$fixture_sha current=$actual_fixture_sha" >&2
+            exit 1
+          fi
+          git cat-file -e "$baseline_sha^{commit}"
+
+          baseline_worktree="$RUNNER_TEMP/product-latency-reference"
+          baseline_bins="$RUNNER_TEMP/product-latency-reference-bin"
+          git worktree add --detach "$baseline_worktree" "$baseline_sha"
+          mkdir -p "$baseline_bins"
+          cargo build --locked \
+            --manifest-path "$baseline_worktree/packages/aethyme/rust/Cargo.toml" \
+            --release -p aethyme-cli --bin aethyme \
+            -p aethyme-graph-indexer --bin aethyme-graph-index
+          cp "$CARGO_TARGET_DIR/release/aethyme" "$baseline_bins/aethyme"
+          cp "$CARGO_TARGET_DIR/release/aethyme-graph-index" "$baseline_bins/aethyme-graph-index"
+
+          export AETHYME_BENCH_FIXTURE="$GITHUB_WORKSPACE/packages/aethyme-eval/benchmarks/performance/fixture"
+          AETHYME_BENCH_SKIP_BUILD=1 \
+            AETHYME_BENCH_BIN="$baseline_bins/aethyme" \
+            AETHYME_GRAPH_INDEX_BENCH_BIN="$baseline_bins/aethyme-graph-index" \
+            bash packages/aethyme/scripts/bench-product-latency.sh \
+              --save-baseline product-reference
+          bash packages/aethyme/scripts/bench-product-latency.sh \
+            --baseline product-reference
+
+      - name: Upload Criterion comparisons
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: product-latency-${{ github.run_id }}-${{ github.run_attempt }}
+          path: packages/aethyme/rust/target/criterion
+          if-no-files-found: warn
+          retention-days: 14
