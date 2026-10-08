@@ -112,6 +112,7 @@ fn storage_plan_reconciles_disk_git_and_session_ledger_without_writing() {
     let registered_path = std::fs::canonicalize(&registered).unwrap();
     let mut broker = Broker::open(repo.path()).unwrap();
     broker.adopt(&registered, Some("ledger claim")).unwrap();
+    git(repo.path(), &["branch", "agent/unclaimed", "HEAD"]);
     std::fs::create_dir_all(owner_root.join("stray")).unwrap();
     std::fs::write(owner_root.join("stray/data"), "stray\n").unwrap();
 
@@ -137,7 +138,7 @@ fn storage_plan_reconciles_disk_git_and_session_ledger_without_writing() {
         db_before,
         "storage plan must not mutate the owner ledger"
     );
-    assert_eq!(plan["schema_version"], 2);
+    assert_eq!(plan["schema_version"], 3);
     assert_eq!(plan["summary"]["root_count"], 3);
     assert_eq!(plan["summary"]["owner_present_count"], 1);
     assert_eq!(plan["summary"]["owner_missing_count"], 1);
@@ -154,6 +155,48 @@ fn storage_plan_reconciles_disk_git_and_session_ledger_without_writing() {
     assert_eq!(owner["worktree_count"], 2);
     assert_eq!(owner["git_registered_count"], 1);
     assert_eq!(owner["ledger_claimed_count"], 1);
+    assert_eq!(owner["session_branch_inventory_complete"], true);
+    let session_branches = owner["session_branches"].as_array().unwrap();
+    let registered_branch = session_branches
+        .iter()
+        .find(|branch| branch["name"] == "registered")
+        .unwrap();
+    assert_eq!(registered_branch["ownership"], "session_ledger");
+    assert_eq!(
+        registered_branch["session_ids"].as_array().unwrap().len(),
+        1
+    );
+    assert_eq!(
+        registered_branch["uncleared_session_ids"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        registered_branch["checked_out_paths"],
+        serde_json::json!([registered_path.clone()])
+    );
+    let unclaimed_branch = session_branches
+        .iter()
+        .find(|branch| branch["name"] == "agent/unclaimed")
+        .unwrap();
+    assert_eq!(unclaimed_branch["ownership"], "unknown");
+    assert!(
+        unclaimed_branch["session_ids"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        unclaimed_branch["retention_reason"]
+            .as_str()
+            .unwrap()
+            .contains("ownership is unknown")
+    );
+    assert_eq!(plan["summary"]["broker_branch_ref_count"], 1);
+    assert_eq!(plan["summary"]["unclaimed_agent_branch_ref_count"], 1);
+    assert_eq!(plan["summary"]["incomplete_branch_inventory_root_count"], 0);
     let entries = owner["reconciliation"]["entries"].as_array().unwrap();
     let registered_entry = entries
         .iter()
@@ -991,4 +1034,48 @@ fn a_root_this_repository_cannot_prove_is_never_marked() {
                 .contains("not attributable to this repository"))
     );
     assert_eq!(plan["summary"]["candidate_count"], 0);
+}
+
+#[test]
+fn a_shared_branch_named_by_a_session_is_reported_shared_not_session_owned() {
+    let (repo, container) = fixture();
+    let owner_root = container.path().join("owner-key");
+    marker(&owner_root, "owner-key", repo.path());
+    // A ledger row naming the integration branch, as an old adoption of a
+    // checkout on a shared branch leaves behind.
+    let shared = owner_root.join("shared");
+    git(
+        repo.path(),
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "aethyme/integration",
+            shared.to_str().unwrap(),
+            "HEAD",
+        ],
+    );
+    let mut broker = Broker::open(repo.path()).unwrap();
+    broker.adopt(&shared, Some("shared branch claim")).unwrap();
+
+    let plan = json(run(
+        repo.path(),
+        container.path(),
+        &["gc", "storage", "plan", "--json"],
+    ));
+    let owner = own_root(&plan);
+    let branches = owner["session_branches"].as_array().unwrap();
+    let integration = branches
+        .iter()
+        .find(|branch| branch["name"] == "aethyme/integration")
+        .expect("the ledger-named shared branch is listed");
+    assert_eq!(integration["ownership"], "shared");
+    assert!(
+        integration["retention_reason"]
+            .as_str()
+            .unwrap()
+            .contains("never session-owned or removable")
+    );
+    assert_eq!(plan["summary"]["broker_branch_ref_count"], 0);
 }

@@ -1723,7 +1723,9 @@ fn is_cargo_bin_path(path: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use crate::{RELEASE_TARGETS, REQUIRED_RELEASE_BINARIES, ReleaseInstaller};
+    use crate::{
+        RELEASE_TARGETS, REQUIRED_RELEASE_BINARIES, ReleaseInstaller, release_archive_filename,
+    };
 
     use super::*;
 
@@ -1735,7 +1737,7 @@ mod tests {
             RELEASE_TARGETS
                 .iter()
                 .map(|target| ReleaseArtifact {
-                    archive: format!("aethyme-v{version}-{target}.tar.gz"),
+                    archive: release_archive_filename(version, target),
                     binaries: REQUIRED_RELEASE_BINARIES
                         .iter()
                         .map(|binary| (*binary).to_string())
@@ -1796,36 +1798,42 @@ mod tests {
     }
 
     #[test]
-    fn maps_supported_platforms() {
+    fn maps_self_update_supported_platforms() {
         assert_eq!(
             release_target_for("macos", "aarch64").unwrap(),
-            RELEASE_TARGETS[0]
+            "aarch64-apple-darwin"
         );
         assert_eq!(
             release_target_for("macos", "x86_64").unwrap(),
-            RELEASE_TARGETS[1]
+            "x86_64-apple-darwin"
         );
         assert_eq!(
             release_target_for("linux", "x86_64").unwrap(),
-            RELEASE_TARGETS[2]
+            "x86_64-unknown-linux-gnu"
         );
         assert_eq!(
             release_target_for("linux", "aarch64").unwrap(),
-            RELEASE_TARGETS[3]
+            "aarch64-unknown-linux-gnu"
         );
         assert_eq!(
             release_target_for_libc("linux", "x86_64", true).unwrap(),
-            RELEASE_TARGETS[4]
+            "x86_64-unknown-linux-musl"
         );
         assert!(release_target_for_libc("linux", "aarch64", true).is_err());
         assert!(release_target_for("linux", "riscv64").is_err());
         assert!(release_target_for("windows", "x86_64").is_err());
-        for target in RELEASE_TARGETS {
+        // Windows has a release archive, but self-update remains unavailable
+        // there until broker parity is implemented in the later Windows phase.
+        for target in RELEASE_TARGETS
+            .iter()
+            .copied()
+            .filter(|target| *target != "x86_64-pc-windows-msvc")
+        {
             assert!(
                 [false, true].iter().any(|musl| {
                     ["macos", "linux"].iter().any(|os| {
                         ["aarch64", "x86_64"].iter().any(|arch| {
-                            release_target_for_libc(os, arch, *musl).ok() == Some(*target)
+                            release_target_for_libc(os, arch, *musl).ok() == Some(target)
                         })
                     })
                 }),
@@ -2057,12 +2065,13 @@ mod tests {
     fn bootstrap_switches_the_pair_once_and_retains_one_rollback_bundle() {
         let temp = tempfile::tempdir().unwrap();
         let install_dir = temp.path().join("bin");
+        let target = current_release_target().unwrap();
 
         let first = bootstrap_install(
             &fake_payload(temp.path(), "0.2.0", true),
             &install_dir,
             &manifest_file(temp.path(), "0.2.0"),
-            RELEASE_TARGETS[0],
+            target,
         )
         .unwrap();
         assert!(first.rollback_bundle.is_none());
@@ -2077,7 +2086,7 @@ mod tests {
             &fake_payload(temp.path(), "0.3.0", true),
             &install_dir,
             &manifest_file(temp.path(), "0.3.0"),
-            RELEASE_TARGETS[0],
+            target,
         )
         .unwrap();
         assert!(
@@ -2094,7 +2103,7 @@ mod tests {
             &fake_payload(temp.path(), "0.4.0", true),
             &install_dir,
             &manifest_file(temp.path(), "0.4.0"),
-            RELEASE_TARGETS[0],
+            target,
         )
         .unwrap();
         let versions = fs::read_dir(root.join("versions"))
@@ -2117,11 +2126,12 @@ mod tests {
     fn failed_staged_quick_test_never_moves_the_active_pair() {
         let temp = tempfile::tempdir().unwrap();
         let install_dir = temp.path().join("bin");
+        let target = current_release_target().unwrap();
         bootstrap_install(
             &fake_payload(temp.path(), "0.2.0", true),
             &install_dir,
             &manifest_file(temp.path(), "0.2.0"),
-            RELEASE_TARGETS[0],
+            target,
         )
         .unwrap();
         let current = install_dir.join(".aethyme-managed/current");
@@ -2131,7 +2141,7 @@ mod tests {
             &fake_payload(temp.path(), "0.3.0", false),
             &install_dir,
             &manifest_file(temp.path(), "0.3.0"),
-            RELEASE_TARGETS[0],
+            target,
         )
         .unwrap_err();
 

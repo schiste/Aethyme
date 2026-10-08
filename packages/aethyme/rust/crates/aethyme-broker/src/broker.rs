@@ -79,19 +79,19 @@ pub(crate) struct AffectedGatesReport {
 /// for now, chosen so an agent "thinking" for a few minutes stays active.
 pub(crate) const IDLE_AFTER_MS: i64 = 10 * 60 * 1000;
 const STALE_AFTER_MS: i64 = 2 * 60 * 60 * 1000;
-/// How long `status --refresh` spends on the Git work that grows with
-/// sessions and history -- checkout reads, unpushed commits, promoted-path
-/// conflicts and the integration drift assessment -- and `status doctor` on
-/// unpushed commits (#460). Whatever the budget does not reach is named in
-/// the output, never guessed. `AETHYME_STATUS_INSPECTION_BUDGET_MS` overrides
-/// it, for tests and for an operator who would rather wait.
-const STATUS_INSPECTION_BUDGET: std::time::Duration = std::time::Duration::from_secs(15);
+/// End-to-end interactive inspection budget. Status, doctor and worktree
+/// reports share this cap across their growing Git and retention phases; a
+/// phase that does not fit is named in the returned report (#460).
+const STATUS_INSPECTION_BUDGET: std::time::Duration = std::time::Duration::from_secs(7);
 
 fn status_inspection_budget() -> std::time::Duration {
     std::env::var("AETHYME_STATUS_INSPECTION_BUDGET_MS")
         .ok()
         .and_then(|value| value.trim().parse::<u64>().ok())
-        .map_or(STATUS_INSPECTION_BUDGET, std::time::Duration::from_millis)
+        .map(std::time::Duration::from_millis)
+        .map_or(STATUS_INSPECTION_BUDGET, |budget| {
+            budget.min(STATUS_INSPECTION_BUDGET)
+        })
 }
 pub const SESSION_NOTE_MAX_BYTES: usize = 1_000;
 pub const WORKTREE_ROOT_SCHEMA_VERSION: u32 = 1;
@@ -1135,6 +1135,9 @@ pub struct DoctorReport {
     /// is unknown, not healthy. Omitted when every check completed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub budget_cut: Vec<String>,
+    /// The named checks omitted by this interactive health report.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deferred_checks: Vec<String>,
 }
 
 /// One `broker.command.failed` event as `doctor` reports it.
@@ -1187,7 +1190,10 @@ impl DoctorReport {
                 .version_repair
                 .as_ref()
                 .is_some_and(VersionRepairReport::repaired);
-        self.integrity == "ok" && self.missing_worktrees.is_empty() && version_ok
+        self.deferred_checks.is_empty()
+            && self.integrity == "ok"
+            && self.missing_worktrees.is_empty()
+            && version_ok
     }
 }
 
@@ -1431,6 +1437,10 @@ impl RetentionConfigStatus {
 pub struct CleanupRetention {
     pub inventory_complete: bool,
     pub inventory_deferred_sessions: usize,
+    /// The interactive budget ran out before the gate-volume probe could
+    /// establish which volume has the least free space.
+    #[serde(skip)]
+    pub gate_headroom_deferred: bool,
     /// False on routine status: eligibility requires an explicit audit.
     pub eligibility_checked: bool,
     pub broker_owned_worktree_count: usize,
@@ -2830,7 +2840,9 @@ fn leftover_integration_advice(
     } else {
         (baseline_ref, baseline_head)
     };
-    if integration_head == baseline_head || repo.is_ancestor(integration_head, baseline_head) {
+    if integration_head == baseline_head
+        || repo.is_ancestor_checked(integration_head, baseline_head)?
+    {
         return Ok(None);
     }
     let count = repo.commit_count_between(baseline_head, integration_head)?;
@@ -3866,7 +3878,8 @@ impl Broker {
             .filter(|reference| reference.starts_with("refs/remotes/"));
         let integration_head = self.integration_head_snapshot().ok().map(|(_, head)| head);
         let (head, work) =
-            session_off_remote_work(session, upstream.as_deref(), integration_head.as_deref())?;
+            session_off_remote_work(session, upstream.as_deref(), integration_head.as_deref())
+                .ok()??;
         (work.commits > 0).then_some((head, work.commits))
     }
 
@@ -4848,6 +4861,20 @@ impl Broker {
         &self,
         sized: bool,
     ) -> Result<WorktreeReconciliation, BrokerOpError> {
+        self.reconcile_worktree_directories_until(sized, None)
+    }
+
+    pub(crate) fn reconcile_worktree_directories_until(
+        &self,
+        sized: bool,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<WorktreeReconciliation, BrokerOpError> {
+        if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+            let mut summary = crate::worktree_reconcile::summarise(&[], 0);
+            summary.complete = false;
+            summary.sized = false;
+            return Ok(summary);
+        }
         let roots = self.broker_owned_worktree_roots()?;
         // Both sides are compared as the strings the broker itself produced,
         // which is sound only because they descend from one canonical root:
@@ -4866,13 +4893,23 @@ impl Broker {
             .collect();
 
         let mut observed = Vec::new();
+        let mut complete = true;
         for root in &roots {
+            if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+                complete = false;
+                break;
+            }
             let Ok(entries) = std::fs::read_dir(root) else {
                 // An unreadable root is not drift; claiming it held nothing
                 // would understate the problem this sweep exists to surface.
+                complete = false;
                 continue;
             };
             for entry in entries.flatten() {
+                if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+                    complete = false;
+                    break;
+                }
                 let path = entry.path();
                 if !is_real_directory(&path) || is_worktree_root_infrastructure(&entry.file_name())
                 {
@@ -4889,15 +4926,29 @@ impl Broker {
         let mut reconciled = crate::worktree_reconcile::reconcile(&observed, &claims);
         if sized {
             for entry in reconciled.iter_mut().filter(|entry| entry.unclaimed()) {
-                entry.estimated_bytes = Some(
-                    directory_size_without_following_links(Path::new(&entry.path)).unwrap_or(0),
-                );
+                if let Some(deadline) = deadline {
+                    entry.estimated_bytes = crate::disk_headroom::directory_usage_bounded(
+                        Path::new(&entry.path),
+                        deadline,
+                    )
+                    .map(|usage| usage.bytes);
+                    if entry.estimated_bytes.is_none() {
+                        complete = false;
+                        break;
+                    }
+                } else {
+                    entry.estimated_bytes = Some(
+                        directory_size_without_following_links(Path::new(&entry.path)).unwrap_or(0),
+                    );
+                }
             }
         }
-        Ok(crate::worktree_reconcile::summarise(
-            &reconciled,
-            roots.len(),
-        ))
+        let mut summary = crate::worktree_reconcile::summarise(&reconciled, roots.len());
+        summary.complete = complete;
+        if !complete {
+            summary.sized = false;
+        }
+        Ok(summary)
     }
 
     /// The worktree roots this broker creates session worktrees in.
@@ -5021,6 +5072,10 @@ impl Broker {
         &mut self,
         sizing: crate::WorktreeSizing,
     ) -> Result<crate::WorktreeReport, BrokerOpError> {
+        let deadline = match sizing {
+            crate::WorktreeSizing::Measure => None,
+            crate::WorktreeSizing::Bounded { budget } => Some(std::time::Instant::now() + budget),
+        };
         fn is_checkout(path: &std::path::Path) -> bool {
             path.join(".git").exists()
         }
@@ -5040,13 +5095,39 @@ impl Broker {
         {
             roots.push(root.clone());
         }
+        let mut discovery_deferred = false;
         for root in roots {
-            let Ok(entries) = std::fs::read_dir(&root) else {
-                continue;
-            };
-            for entry in entries.flatten() {
-                if !entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false) {
+            if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+                discovery_deferred = true;
+                break;
+            }
+            let entries = match std::fs::read_dir(&root) {
+                Ok(entries) => entries,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(_) => {
+                    discovery_deferred = true;
                     continue;
+                }
+            };
+            for entry in entries {
+                if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+                    discovery_deferred = true;
+                    break;
+                }
+                let entry = match entry {
+                    Ok(entry) => entry,
+                    Err(_) => {
+                        discovery_deferred = true;
+                        continue;
+                    }
+                };
+                match entry.file_type() {
+                    Ok(kind) if kind.is_dir() => {}
+                    Ok(_) => continue,
+                    Err(_) => {
+                        discovery_deferred = true;
+                        continue;
+                    }
                 }
                 let path = entry.path();
                 let label = entry.file_name().to_string_lossy().into_owned();
@@ -5055,12 +5136,33 @@ impl Broker {
                     worktrees.entry(path).or_insert(label);
                     continue;
                 }
-                let Ok(children) = std::fs::read_dir(&path) else {
-                    continue;
-                };
-                for child in children.flatten() {
-                    if !child.file_type().map(|kind| kind.is_dir()).unwrap_or(false) {
+                let children = match std::fs::read_dir(&path) {
+                    Ok(children) => children,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(_) => {
+                        discovery_deferred = true;
                         continue;
+                    }
+                };
+                for child in children {
+                    if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+                        discovery_deferred = true;
+                        break;
+                    }
+                    let child = match child {
+                        Ok(child) => child,
+                        Err(_) => {
+                            discovery_deferred = true;
+                            continue;
+                        }
+                    };
+                    match child.file_type() {
+                        Ok(kind) if kind.is_dir() => {}
+                        Ok(_) => continue,
+                        Err(_) => {
+                            discovery_deferred = true;
+                            continue;
+                        }
                     }
                     let child_path = child.path();
                     // Shared caches sit beside worktrees under the same root.
@@ -5080,14 +5182,40 @@ impl Broker {
             .into_iter()
             .map(|(path, label)| (label, path))
             .collect();
-        let mut report = crate::build_worktree_report_with(&worktrees, &live, sizing);
-        let registrations = self.repo.worktree_inventory()?;
-        crate::append_prunable_registrations(
-            &mut report,
-            &plan.repository_key,
-            &registrations,
-            &live,
-        );
+        let mut report =
+            crate::worktree_report::build_with_deadline(&worktrees, &live, sizing, deadline);
+        if discovery_deferred {
+            report.deferred_checks.push("worktree_discovery".into());
+        }
+        let registrations = match deadline {
+            Some(deadline) if std::time::Instant::now() >= deadline => {
+                report.deferred_checks.push("git_inventory".into());
+                None
+            }
+            Some(deadline) => {
+                let _git_deadline = crate::git::limit_git_until(deadline);
+                match self.repo.worktree_inventory() {
+                    Ok(entries) => Some(entries),
+                    Err(crate::GitError::TimedOut { .. }) => {
+                        report.deferred_checks.push("git_inventory".into());
+                        None
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            None => Some(self.repo.worktree_inventory()?),
+        };
+        if let Some(registrations) = registrations {
+            crate::worktree_report::append_prunable_registrations_until(
+                &mut report,
+                &plan.repository_key,
+                &registrations,
+                &live,
+                deadline,
+            );
+        }
+        report.deferred_checks.sort();
+        report.deferred_checks.dedup();
         Ok(report)
     }
 
@@ -7587,14 +7715,38 @@ impl Broker {
     /// views, promoted/unmerged conflicts, the merge queue, and the
     /// integration branch head.
     pub fn status(&mut self, now_ms: i64) -> Result<StatusView, BrokerOpError> {
+        let started = std::time::Instant::now();
+        let deadline = started + status_inspection_budget();
+        let _git_deadline = crate::git::limit_git_until(deadline);
         let integration_refresh =
             self.refresh_disposable_integration(crate::IntegrationRefreshTrigger::Status);
-        let started = std::time::Instant::now();
-        let overlaps = self.refresh_leases()?;
-        let leases_ms = started.elapsed().as_millis() as u64;
+        let leases_started = std::time::Instant::now();
+        let overlaps = match self.refresh_leases() {
+            Ok(overlaps) => overlaps,
+            Err(_) if std::time::Instant::now() >= deadline => self.lease_overlaps_snapshot()?,
+            Err(error) => return Err(error),
+        };
+        let lease_refresh_complete = std::time::Instant::now() < deadline;
+        let leases_ms = leases_started.elapsed().as_millis() as u64;
         let agents = self.agents(now_ms)?;
-        let integration = self.integration_head()?;
+        let integration = match self.integration_head() {
+            Ok(integration) => integration,
+            Err(_) if std::time::Instant::now() >= deadline => {
+                (PromoteConfig::load(&self.main_root).branch, String::new())
+            }
+            Err(error) => return Err(error),
+        };
         let mut view = self.build_status(agents, overlaps, integration, now_ms, true)?;
+        if !lease_refresh_complete {
+            view.leases_refreshed = false;
+            if !view
+                .deferred_checks
+                .iter()
+                .any(|check| check == "lease_refresh")
+            {
+                view.deferred_checks.push("lease_refresh".into());
+            }
+        }
         push_integration_refresh_advice(&mut view, integration_refresh);
         let auto_cleanup = self.last_auto_cleanup_report();
         push_auto_cleanup_advice(&mut view, auto_cleanup);
@@ -7718,9 +7870,19 @@ impl Broker {
     /// filesystem observations, but never reconcile that state as a side
     /// effect. Used while repository deployment compatibility is degraded.
     pub fn status_snapshot(&self, now_ms: i64) -> Result<StatusView, BrokerOpError> {
+        let started = std::time::Instant::now();
+        let deadline = crate::git::active_git_deadline()
+            .unwrap_or_else(|| started + status_inspection_budget());
+        let _git_deadline = crate::git::limit_git_until(deadline);
         let overlaps = self.lease_overlaps_snapshot()?;
         let agents = self.agents_snapshot(now_ms)?;
-        let integration = self.integration_head_snapshot()?;
+        let branch = PromoteConfig::load(&self.main_root).branch;
+        let observed_integration = self.integration_head_snapshot();
+        let integration = if std::time::Instant::now() >= deadline {
+            (branch, String::new())
+        } else {
+            observed_integration?
+        };
         let mut view = self.build_status(agents, overlaps, integration, now_ms, true)?;
         view.leases_refreshed = false;
         Ok(view)
@@ -7728,28 +7890,43 @@ impl Broker {
 
     /// Routine, read-only variant for degraded CLI reporting.
     pub fn status_current_snapshot(&self, now_ms: i64) -> Result<StatusView, BrokerOpError> {
-        self.build_status(
-            self.agents_snapshot(now_ms)?,
-            self.lease_overlaps_snapshot()?,
-            self.integration_head_snapshot()?,
-            now_ms,
-            false,
-        )
+        let started = std::time::Instant::now();
+        let deadline = crate::git::active_git_deadline()
+            .unwrap_or_else(|| started + status_inspection_budget());
+        let _git_deadline = crate::git::limit_git_until(deadline);
+        let overlaps = self.lease_overlaps_snapshot()?;
+        let agents = self.agents_snapshot(now_ms)?;
+        let branch = PromoteConfig::load(&self.main_root).branch;
+        let observed_integration = self.integration_head_snapshot();
+        let integration = if std::time::Instant::now() >= deadline {
+            (branch, String::new())
+        } else {
+            observed_integration?
+        };
+        self.build_status(agents, overlaps, integration, now_ms, false)
     }
 
     /// Routine reporting uses persisted leases and recorded sizes. It never
     /// proves cleanup eligibility or reclassifies Git conflicts. Explicit
     /// refresh and all mutation paths still perform their own checks.
     pub fn status_current(&mut self, now_ms: i64) -> Result<StatusView, BrokerOpError> {
+        let started = std::time::Instant::now();
+        let deadline = started + status_inspection_budget();
+        let _git_deadline = crate::git::limit_git_until(deadline);
         let integration_refresh =
             self.refresh_disposable_integration(crate::IntegrationRefreshTrigger::Status);
-        let started = std::time::Instant::now();
         let overlaps = self.lease_overlaps_snapshot()?;
         let leases_ms = started.elapsed().as_millis() as u64;
         let sessions_started = std::time::Instant::now();
         let agents = self.agents(now_ms)?;
         let sessions_ms = sessions_started.elapsed().as_millis() as u64;
-        let integration = self.integration_head()?;
+        let integration = match self.integration_head() {
+            Ok(integration) => integration,
+            Err(_) if std::time::Instant::now() >= deadline => {
+                (PromoteConfig::load(&self.main_root).branch, String::new())
+            }
+            Err(error) => return Err(error),
+        };
         self.record_gone_lease_holders()?;
         self.grant_stale_lease_requests()?;
         let mut view = self.build_status(agents, overlaps, integration, now_ms, false)?;
@@ -7787,7 +7964,8 @@ impl Broker {
         // One deadline for every phase below whose cost grows with sessions
         // and history; each phase that runs out names what it skipped.
         let budget = status_inspection_budget();
-        let deadline = refresh.then(|| started + budget);
+        let deadline = crate::git::active_git_deadline().or_else(|| Some(started + budget));
+        let _git_deadline = deadline.map(crate::git::limit_git_until);
         let mut budget_cut: Vec<&'static str> = Vec::new();
         let conflicts_started = std::time::Instant::now();
         let promoted_conflicts = if refresh {
@@ -7821,8 +7999,21 @@ impl Broker {
         // per-session answers intact.
         let unpushed_started = std::time::Instant::now();
         let unpushed_work = if refresh {
-            self.unpushed_work_within(now_ms, deadline)
-                .unwrap_or_default()
+            match self.unpushed_work_within(now_ms, deadline) {
+                Ok(report) => report,
+                Err(_)
+                    if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) =>
+                {
+                    crate::UnpushedWorkReport {
+                        not_inspected_sessions: agents
+                            .iter()
+                            .map(|agent| agent.session.id)
+                            .collect(),
+                        ..crate::UnpushedWorkReport::default()
+                    }
+                }
+                Err(error) => return Err(error),
+            }
         } else {
             crate::UnpushedWorkReport::default()
         };
@@ -7846,40 +8037,149 @@ impl Broker {
             .map(|agent| agent.session.id)
             .collect::<Vec<i64>>();
         let latest_live_queue = self.store.latest_merge_queue_for_sessions(&session_ids)?;
-        let main_head = self.repo.head_commit()?;
-        let (upstream_ref, upstream_head) = refresh
-            .then(|| self.repo.tracking_upstream())
-            .flatten()
-            .map(|(name, commit)| (Some(name), Some(commit)))
-            .unwrap_or((None, None));
-        let (main_ahead_upstream_commits, main_behind_upstream_commits) =
-            if let Some(upstream) = upstream_head.as_deref() {
-                (
-                    self.repo.commit_count_between(upstream, &main_head)?,
-                    self.repo.commit_count_between(&main_head, upstream)?,
-                )
+        let before_deadline =
+            || deadline.is_none_or(|deadline| std::time::Instant::now() < deadline);
+        let mut refs_incomplete = false;
+        let main_head = if before_deadline() {
+            match self.repo.head_commit() {
+                Ok(head) => head,
+                Err(_) => {
+                    refs_incomplete = true;
+                    String::new()
+                }
+            }
+        } else {
+            refs_incomplete = true;
+            String::new()
+        };
+        let (upstream_ref, upstream_head) = if refresh && before_deadline() {
+            let upstream = self.repo.tracking_upstream();
+            if !before_deadline() {
+                refs_incomplete = true;
+            }
+            upstream
+                .map(|(name, commit)| (Some(name), Some(commit)))
+                .unwrap_or((None, None))
+        } else {
+            if refresh {
+                refs_incomplete = true;
+            }
+            (None, None)
+        };
+        let mut main_ahead_upstream_commits = 0;
+        let mut main_behind_upstream_commits = 0;
+        if let Some(upstream) = upstream_head.as_deref() {
+            if before_deadline() {
+                match (
+                    self.repo.commit_count_between(upstream, &main_head),
+                    self.repo.commit_count_between(&main_head, upstream),
+                ) {
+                    (Ok(ahead), Ok(behind)) => {
+                        main_ahead_upstream_commits = ahead;
+                        main_behind_upstream_commits = behind;
+                    }
+                    _ => refs_incomplete = true,
+                }
             } else {
-                (0, 0)
-            };
+                refs_incomplete = true;
+            }
+        }
         // Against the published branch, not the checkout: the number answers
         // "what would publishing add to the default branch", which is the only
         // reading anyone acts on.
-        let (baseline_ref, baseline_head) = self.publication_baseline()?;
-        let (integration_relation, integration_ahead_main_commits) = if !refresh {
+        let (baseline_ref, baseline_head) = if before_deadline() {
+            match self.publication_baseline() {
+                Ok(baseline) => baseline,
+                Err(_) => {
+                    refs_incomplete = true;
+                    ("not inspected".into(), String::new())
+                }
+            }
+        } else {
+            refs_incomplete = true;
+            ("not inspected".into(), String::new())
+        };
+        let (mut integration_relation, mut integration_ahead_main_commits) = if !refresh {
+            (StatusIntegrationRelation::NotChecked, 0)
+        } else if !before_deadline() || baseline_head.is_empty() {
+            refs_incomplete = true;
             (StatusIntegrationRelation::NotChecked, 0)
         } else if integration_head == baseline_head {
             (StatusIntegrationRelation::CurrentWithMain, 0)
-        } else if self.repo.is_ancestor(&baseline_head, &integration_head) {
-            (
-                StatusIntegrationRelation::AheadOfMain,
-                self.repo
-                    .commit_count_between(&baseline_head, &integration_head)?,
-            )
         } else {
-            (StatusIntegrationRelation::DivergedFromMain, 0)
+            match self
+                .repo
+                .is_ancestor_checked(&baseline_head, &integration_head)
+            {
+                Ok(true) if before_deadline() => {
+                    match self
+                        .repo
+                        .commit_count_between(&baseline_head, &integration_head)
+                    {
+                        Ok(ahead) if before_deadline() => {
+                            (StatusIntegrationRelation::AheadOfMain, ahead)
+                        }
+                        _ => {
+                            refs_incomplete = true;
+                            (StatusIntegrationRelation::NotChecked, 0)
+                        }
+                    }
+                }
+                Ok(false) if before_deadline() => (StatusIntegrationRelation::DivergedFromMain, 0),
+                _ => {
+                    refs_incomplete = true;
+                    (StatusIntegrationRelation::NotChecked, 0)
+                }
+            }
         };
+        if !before_deadline() && refresh {
+            refs_incomplete = true;
+            integration_relation = StatusIntegrationRelation::NotChecked;
+            integration_ahead_main_commits = 0;
+        }
+        if refs_incomplete {
+            budget_cut.push("git_refs");
+        }
         let dirty_sessions = checkouts.as_ref().map_or(0, dirty_session_count);
         let overlap_pairs = self.overlap_pairs_snapshot(&overlaps);
+        let main_is_ancestor = if refresh && before_deadline() && !main_head.is_empty() {
+            let ancestry = if main_head == integration_head {
+                Some(true)
+            } else {
+                self.repo
+                    .is_ancestor_checked(&main_head, &integration_head)
+                    .ok()
+            };
+            if !before_deadline() || ancestry.is_none() {
+                if !budget_cut.contains(&"git_refs") {
+                    budget_cut.push("git_refs");
+                }
+                false
+            } else {
+                ancestry.unwrap_or(false)
+            }
+        } else {
+            false
+        };
+        let ahead_main_commits = if refresh && before_deadline() && !main_head.is_empty() {
+            match self
+                .repo
+                .commit_count_between(&main_head, &integration_head)
+            {
+                Ok(count) if before_deadline() => count,
+                _ => {
+                    if !budget_cut.contains(&"git_refs") {
+                        budget_cut.push("git_refs");
+                    }
+                    0
+                }
+            }
+        } else {
+            if refresh && !budget_cut.contains(&"git_refs") {
+                budget_cut.push("git_refs");
+            }
+            0
+        };
         let summary = status_summary(
             &agents,
             overlaps.len(),
@@ -7900,14 +8200,8 @@ impl Broker {
                 relation: integration_relation,
                 ahead_baseline_commits: integration_ahead_main_commits,
                 main_head: main_head.clone(),
-                main_is_ancestor: main_head == integration_head
-                    || (refresh && self.repo.is_ancestor(&main_head, &integration_head)),
-                ahead_main_commits: if refresh {
-                    self.repo
-                        .commit_count_between(&main_head, &integration_head)?
-                } else {
-                    0
-                },
+                main_is_ancestor,
+                ahead_main_commits,
                 promotes,
             },
         );
@@ -7919,13 +8213,22 @@ impl Broker {
             promotes,
             checkouts.as_ref(),
         );
-        let integration_contains_upstream = upstream_head
-            .as_deref()
-            .is_some_and(|upstream| self.repo.is_ancestor(upstream, &integration_head));
+        let integration_contains_upstream = upstream_head.as_deref().and_then(|upstream| {
+            if !before_deadline() {
+                return None;
+            }
+            self.repo
+                .is_ancestor_checked(upstream, &integration_head)
+                .ok()
+                .filter(|_| before_deadline())
+        });
+        if refresh && upstream_head.is_some() && integration_contains_upstream.is_none() {
+            budget_cut.push("integration_drift");
+        }
         let drift_started = std::time::Instant::now();
         let integration_reconciliation = match (upstream_ref.as_deref(), upstream_head.as_deref()) {
             (Some(upstream_ref), Some(upstream_head))
-                if refresh && !integration_contains_upstream =>
+                if refresh && integration_contains_upstream == Some(false) =>
             {
                 match self.assess_integration_drift_within(
                     upstream_ref,
@@ -7940,8 +8243,17 @@ impl Broker {
                         budget_cut.push("integration_drift");
                         None
                     }
-                    Err(_) => None,
+                    Err(_) => {
+                        budget_cut.push("integration_drift");
+                        None
+                    }
                 }
+            }
+            (Some(_), Some(_)) if refresh && integration_contains_upstream.is_none() => {
+                if !budget_cut.contains(&"integration_drift") {
+                    budget_cut.push("integration_drift");
+                }
+                None
             }
             _ => None,
         };
@@ -7951,7 +8263,8 @@ impl Broker {
         );
         if promotes
             && upstream_head.is_some()
-            && (main_behind_upstream_commits > 0 || !integration_contains_upstream)
+            && integration_contains_upstream.is_some()
+            && (main_behind_upstream_commits > 0 || !integration_contains_upstream.unwrap_or(false))
         {
             let upstream = upstream_ref.as_deref().unwrap_or("@{upstream}");
             let stale_only = integration_reconciliation
@@ -7964,10 +8277,14 @@ impl Broker {
             // reconciliation when a fast-forward was the whole answer, and to
             // wait for the block rather than keeping the ref current (#290
             // phase 3.2). Divergence still blocks.
-            let fast_forward_available = !integration_contains_upstream
+            let fast_forward_available = before_deadline()
+                && !integration_contains_upstream.unwrap_or(false)
                 && upstream_head
                     .as_deref()
                     .is_some_and(|upstream| self.repo.is_ancestor(&integration_head, upstream));
+            if !before_deadline() && !budget_cut.contains(&"branch_drift") {
+                budget_cut.push("branch_drift");
+            }
             advice.insert(
                 0,
                 StatusAdvice {
@@ -7978,7 +8295,7 @@ impl Broker {
                     } else {
                         "integration.upstream-main-ahead"
                     },
-                    severity: if integration_contains_upstream
+                    severity: if integration_contains_upstream.unwrap_or(false)
                         || stale_only.is_some()
                         || fast_forward_available
                     {
@@ -7993,7 +8310,7 @@ impl Broker {
                     } else {
                         "configured upstream moved outside broker-managed integration"
                     },
-                    summary: if integration_contains_upstream {
+                    summary: if integration_contains_upstream.unwrap_or(false) {
                         format!(
                             "local main is {main_behind_upstream_commits} commits behind {upstream}; integration already contains upstream, so broker operations remain safe"
                         )
@@ -8023,7 +8340,7 @@ impl Broker {
                         ),
                         format!("{upstream}: {}", short_commit(upstream_head.as_deref().unwrap_or(""))),
                     ],
-                    commands: if integration_contains_upstream {
+                    commands: if integration_contains_upstream.unwrap_or(false) {
                         Vec::new()
                     } else {
                         vec![format!(
@@ -8033,22 +8350,41 @@ impl Broker {
                 },
                 );
         }
-        if !promotes
-            && let Some(row) = leftover_integration_advice(
+        if !promotes && before_deadline() {
+            match leftover_integration_advice(
                 &self.repo,
                 &integration_head,
                 (&baseline_ref, &baseline_head),
                 integration_reconciliation.as_ref(),
-            )?
-        {
-            advice.insert(0, row);
+            ) {
+                Ok(Some(row)) => advice.insert(0, row),
+                Ok(None) if !before_deadline() => budget_cut.push("branch_drift"),
+                Ok(None) => {}
+                Err(_) => budget_cut.push("branch_drift"),
+            }
+        } else if !promotes {
+            budget_cut.push("branch_drift");
         }
         // "Never passed through submit" is every commit under verify-only,
         // where landing goes through pull requests and integration stays put.
-        if let Some((branch, commits)) = promotes
-            .then(|| self.external_default_branch_writes(&integration_head))
-            .flatten()
-        {
+        let external_writes = if promotes && before_deadline() {
+            match self.external_default_branch_writes(&integration_head) {
+                Ok(writes) => writes,
+                Err(_) => {
+                    budget_cut.push("branch_drift");
+                    None
+                }
+            }
+        } else {
+            if promotes && refresh {
+                budget_cut.push("branch_drift");
+            }
+            None
+        };
+        if promotes && refresh && !before_deadline() {
+            budget_cut.push("branch_drift");
+        }
+        if let Some((branch, commits)) = external_writes {
             let count = commits.len();
             advice.push(StatusAdvice {
                 id: "main.external-writes",
@@ -8079,9 +8415,21 @@ impl Broker {
                 ],
             });
         }
+        if refresh && promotes && !before_deadline() && !budget_cut.contains(&"branch_drift") {
+            budget_cut.push("branch_drift");
+        }
         phase_timings_ms.insert("coordination".into(), started.elapsed().as_millis() as u64);
         let retention_started = std::time::Instant::now();
         let cleanup_retention = self.cleanup_retention_with_audit(now_ms, refresh)?;
+        if refresh && cleanup_retention.gate_headroom_deferred {
+            budget_cut.push("gate_headroom");
+        }
+        if refresh && !cleanup_retention.inventory_complete {
+            budget_cut.push("cleanup_eligibility");
+        }
+        if !cleanup_retention.reconciliation.complete {
+            budget_cut.push("unclaimed_worktrees");
+        }
         phase_timings_ms.insert(
             "retention".into(),
             retention_started.elapsed().as_millis() as u64,
@@ -8428,13 +8776,17 @@ impl Broker {
             advice.push(row);
         }
         advice.extend(unpushed_work_advice(&unpushed_work, now_ms, !promotes));
-        if refresh {
+        if refresh && before_deadline() {
             advice.extend(self.integration_behind_upstream_advice());
+        } else if refresh && !budget_cut.contains(&"branch_drift") {
+            budget_cut.push("branch_drift");
         }
         advice.extend(overlap_pair_advice(&overlap_pairs));
         // Cached listing and local refs only: `status` never calls GitHub.
-        if refresh {
+        if refresh && before_deadline() {
             advice.extend(self.pr_overlap_advice(now_ms));
+        } else if refresh {
+            budget_cut.push("pr_overlap_refresh");
         } else {
             advice.extend(self.recorded_pr_overlap_advice(now_ms, &baseline_head, &baseline_ref));
         }
@@ -8450,18 +8802,22 @@ impl Broker {
         // A worktree stuck mid-merge cannot be classified or submitted.
         advice.extend(crate::overlap_pairs::mid_operation_advice(&agents));
         // The default branch moving under a session: last fetched copy only.
-        if refresh {
+        if refresh && before_deadline() {
             advice.extend(self.behind_main_advice());
+        } else if refresh && !budget_cut.contains(&"branch_drift") {
+            budget_cut.push("branch_drift");
         }
         // Two sessions on one target: landing the shared edit first keeps
         // both on the default branch instead of chaining one onto the other.
-        if refresh {
+        if refresh && before_deadline() {
             advice.extend(crate::shared_edit_advice::shared_edit_advice(
                 &self.repo,
                 &agents,
                 &overlaps,
                 &scope_overlaps,
             ));
+        } else if refresh {
+            budget_cut.push("shared_edit_classification");
         }
         let in_flight_submits = crate::submit_progress::in_flight_submits(&self.main_root, now_ms);
         advice.extend(stalled_submit_advice(&in_flight_submits));
@@ -8581,6 +8937,8 @@ impl Broker {
                         deferred.push((*check).into());
                     }
                 }
+                deferred.sort();
+                deferred.dedup();
                 deferred
             },
             leases_refreshed_at_ms: self
@@ -8944,24 +9302,21 @@ impl Broker {
             push_session_branches,
             ..Default::default()
         };
-        if self.repo.remotes().unwrap_or_default().is_empty() {
+        let sessions = self.store.live_sessions()?;
+        if self.repo.remotes()?.is_empty() {
             return Ok(report);
         }
         let (baseline_ref, _) = self.publication_baseline()?;
         let upstream = baseline_ref
             .starts_with("refs/remotes/")
             .then_some(baseline_ref.as_str());
-        let integration_fallback = self.integration_head_snapshot().ok().map(|(_, head)| head);
-        let sessions = self.store.live_sessions()?;
+        let integration_fallback = Some(self.integration_head_snapshot()?.1);
         let inspected = crate::worktree_report::inspect_in_parallel(&sessions, |session| {
             if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
                 return Err(());
             }
-            Ok(session_off_remote_work(
-                session,
-                upstream,
-                integration_fallback.as_deref(),
-            ))
+            session_off_remote_work(session, upstream, integration_fallback.as_deref())
+                .map_err(|_| ())
         });
         for (session, inspected) in sessions.into_iter().zip(inspected) {
             let Ok(found) = inspected else {
@@ -8985,31 +9340,30 @@ impl Broker {
                 command: format!("aethyme broker push --session {}", session.id),
             });
         }
-        if let (Some(upstream), Ok((branch, head))) = (upstream, self.integration_head_snapshot()) {
+        if let Some(upstream) = upstream {
+            let (branch, head) = self.integration_head_snapshot()?;
             let unpublished = self
                 .repo
-                .cherry_marked(upstream, &head, crate::CherrySide::Right);
+                .cherry_marked(upstream, &head, crate::CherrySide::Right)?;
             let off_remote =
-                crate::unpushed::off_remote_work(&self.repo, &head, &[], Some(upstream));
-            if let (Ok(unpublished), Ok(off_remote)) = (unpublished, off_remote) {
-                let pending = unpublished
-                    .iter()
-                    .filter(|(_, equivalent)| !equivalent)
-                    .map(|(commit, _)| commit.as_str())
-                    .collect::<Vec<_>>();
-                if !pending.is_empty() {
-                    let oldest = self.repo.oldest_commit_time_ms(&pending);
-                    let age = now_ms.saturating_sub(oldest.unwrap_or(now_ms));
-                    report.integration = Some(crate::UnpublishedIntegrationWork {
-                        branch,
-                        head,
-                        upstream_ref: upstream.to_string(),
-                        unpublished_commits: u32::try_from(pending.len()).unwrap_or(u32::MAX),
-                        on_no_remote: off_remote.commits,
-                        oldest_unpublished_at_ms: oldest,
-                        severity: crate::unpushed::integration_severity(age),
-                    });
-                }
+                crate::unpushed::off_remote_work(&self.repo, &head, &[], Some(upstream))?;
+            let pending = unpublished
+                .iter()
+                .filter(|(_, equivalent)| !equivalent)
+                .map(|(commit, _)| commit.as_str())
+                .collect::<Vec<_>>();
+            if !pending.is_empty() {
+                let oldest = self.repo.oldest_commit_time_ms(&pending);
+                let age = now_ms.saturating_sub(oldest.unwrap_or(now_ms));
+                report.integration = Some(crate::UnpublishedIntegrationWork {
+                    branch,
+                    head,
+                    upstream_ref: upstream.to_string(),
+                    unpublished_commits: u32::try_from(pending.len()).unwrap_or(u32::MAX),
+                    on_no_remote: off_remote.commits,
+                    oldest_unpublished_at_ms: oldest,
+                    severity: crate::unpushed::integration_severity(age),
+                });
             }
         }
         Ok(report)
@@ -9049,19 +9403,23 @@ impl Broker {
     fn external_default_branch_writes(
         &self,
         integration_head: &str,
-    ) -> Option<(String, Vec<String>)> {
+    ) -> Result<Option<(String, Vec<String>)>, BrokerOpError> {
         let repo = self.repo_handle();
-        let head_ref = repo.symbolic_ref("refs/remotes/origin/HEAD")?;
-        let branch = head_ref.rsplit('/').next()?.to_string();
+        let Some(head_ref) = repo.symbolic_ref("refs/remotes/origin/HEAD") else {
+            return Ok(None);
+        };
+        let Some(branch) = head_ref.rsplit('/').next().map(str::to_string) else {
+            return Ok(None);
+        };
         let local_ref = format!("refs/heads/{branch}");
-        let local_sha = repo.resolve_ref(&local_ref)?;
-        let commits = repo
-            .commits_between_oldest(integration_head, &local_sha)
-            .ok()?;
+        let Some(local_sha) = repo.resolve_ref(&local_ref) else {
+            return Ok(None);
+        };
+        let commits = repo.commits_between_oldest(integration_head, &local_sha)?;
         if commits.is_empty() {
-            return None;
+            return Ok(None);
         }
-        Some((branch, commits))
+        Ok(Some((branch, commits)))
     }
 
     fn status_advice(
@@ -9261,6 +9619,8 @@ impl Broker {
 
     fn doctor_inner(&mut self, fix_version: bool) -> Result<DoctorReport, BrokerOpError> {
         let started = std::time::Instant::now();
+        let deadline = started + status_inspection_budget();
+        let _git_deadline = crate::git::limit_git_until(deadline);
         let mut phase_timings_ms = std::collections::BTreeMap::new();
         let mut budget_cut = Vec::new();
         let mut phase = |name: &str, since: std::time::Instant| {
@@ -9270,7 +9630,12 @@ impl Broker {
 
         let live_sessions = self.store.live_sessions()?;
         let mut missing_worktrees = Vec::new();
+        let mut missing_worktrees_cut = false;
         for session in &live_sessions {
+            if std::time::Instant::now() >= deadline {
+                missing_worktrees_cut = true;
+                break;
+            }
             if matches!(
                 session.status,
                 SessionStatus::Active | SessionStatus::Idle | SessionStatus::Stale
@@ -9279,11 +9644,19 @@ impl Broker {
                 missing_worktrees.push(session.id);
             }
         }
+        if missing_worktrees_cut {
+            budget_cut.push("missing_worktrees".into());
+        }
 
         let mut orphaned_pidfiles = Vec::new();
+        let mut gate_pidfiles_cut = false;
         let run_dir = self.main_root.join(".aethyme/run/gates");
         if let Ok(entries) = std::fs::read_dir(&run_dir) {
             for entry in entries.flatten() {
+                if std::time::Instant::now() >= deadline {
+                    gate_pidfiles_cut = true;
+                    break;
+                }
                 let Ok(content) = std::fs::read_to_string(entry.path()) else {
                     continue;
                 };
@@ -9299,35 +9672,97 @@ impl Broker {
                 }
             }
         }
+        if gate_pidfiles_cut {
+            budget_cut.push("gate_pidfiles".into());
+        }
 
-        let purged_stale_leases = self.store.purge_leases_of_cleaned_sessions()?;
+        let purged_stale_leases = if std::time::Instant::now() < deadline {
+            self.store.purge_leases_of_cleaned_sessions()?
+        } else {
+            budget_cut.push("stale_lease_purge".into());
+            0
+        };
         phase("store", started);
         let retention_started = std::time::Instant::now();
-        let retention = self.gc_health()?;
+        let retention = self.gc_health_until(deadline)?;
+        budget_cut.extend(retention.deferred_checks.iter().cloned());
         phase("retention", retention_started);
         let version_started = std::time::Instant::now();
         let version = crate::version::inspect_version(&self.main_root);
         let version_repair = fix_version.then(|| self.repair_local_cli_version(&version));
         phase("version", version_started);
         let movement_started = std::time::Instant::now();
-        let integration_movement =
-            self.integration_movement_notice_from_sessions(&live_sessions)?;
+        let integration_movement = if std::time::Instant::now() < deadline {
+            match self.integration_movement_notice_from_sessions(&live_sessions) {
+                Ok(notice) => notice,
+                Err(_) if std::time::Instant::now() >= deadline => {
+                    budget_cut.push("integration_movement".into());
+                    None
+                }
+                Err(error) => return Err(error),
+            }
+        } else {
+            budget_cut.push("integration_movement".into());
+            None
+        };
         phase("integration_movement", movement_started);
         let unpushed_started = std::time::Instant::now();
-        let unpushed_work = self
-            .unpushed_work_within(
-                now_ms(),
-                Some(unpushed_started + status_inspection_budget()),
-            )
-            .unwrap_or_default();
+        let unpushed_work = match self.unpushed_work_within(now_ms(), Some(deadline)) {
+            Ok(report) => report,
+            Err(_) if std::time::Instant::now() >= deadline => {
+                budget_cut.push("unpushed_commits".into());
+                crate::UnpushedWorkReport {
+                    not_inspected_sessions: live_sessions
+                        .iter()
+                        .map(|session| session.id)
+                        .collect(),
+                    ..crate::UnpushedWorkReport::default()
+                }
+            }
+            Err(error) => return Err(error),
+        };
         if !unpushed_work.not_inspected_sessions.is_empty() {
             budget_cut.push("unpushed_commits".to_string());
         }
         phase("unpushed", unpushed_started);
         let rest_started = std::time::Instant::now();
-        let recent_command_failures = self.recent_command_failures(now_ms())?;
-        let hooks_path = crate::hooks::inspect_hooks_path(&self.main_root);
-        let leftover_integration_work = self.leftover_integration_work()?;
+        let recent_command_failures = if std::time::Instant::now() < deadline {
+            let failures = self.recent_command_failures(now_ms())?;
+            if std::time::Instant::now() < deadline {
+                failures
+            } else {
+                budget_cut.push("recent_command_failures".into());
+                Vec::new()
+            }
+        } else {
+            budget_cut.push("recent_command_failures".into());
+            Vec::new()
+        };
+        let hooks_path = if std::time::Instant::now() < deadline {
+            let finding = crate::hooks::inspect_hooks_path(&self.main_root);
+            if std::time::Instant::now() < deadline {
+                finding
+            } else {
+                budget_cut.push("hooks_path".into());
+                None
+            }
+        } else {
+            budget_cut.push("hooks_path".into());
+            None
+        };
+        let leftover_integration_work = if std::time::Instant::now() < deadline {
+            match self.leftover_integration_work() {
+                Ok(work) => work,
+                Err(_) if std::time::Instant::now() >= deadline => {
+                    budget_cut.push("integration_drift".into());
+                    None
+                }
+                Err(error) => return Err(error),
+            }
+        } else {
+            budget_cut.push("integration_drift".into());
+            None
+        };
         phase("leftover_and_hooks", rest_started);
         phase("total", started);
 
@@ -9345,6 +9780,7 @@ impl Broker {
             hooks_path,
             leftover_integration_work,
             phase_timings_ms,
+            deferred_checks: budget_cut.clone(),
             budget_cut,
         })
     }
@@ -9909,7 +10345,11 @@ impl Broker {
             crate::events::session_finish_cleanup_started_payload(worktree_present, branch_present);
         self.store
             .begin_finish_cleanup(report.session_id, &start_payload)?;
-        match self.cleanup(report.session_id, false) {
+        // `finish --timeout` bounds the checks that decide whether to close.
+        // Once closed, reclaiming the worktree runs to completion: killing a
+        // `git worktree remove` of a multi-gigabyte tree halfway leaves an
+        // orphaned directory instead of a faster answer.
+        match crate::git::without_git_deadline(|| self.cleanup(report.session_id, false)) {
             Ok(()) => {
                 report.status = FinishStatus::Cleaned;
                 report.cleanup.completed = true;
@@ -11361,6 +11801,18 @@ impl Broker {
         Ok(plan)
     }
 
+    fn cleanup_plan_recorded_until(
+        &self,
+        deadline: std::time::Instant,
+    ) -> Result<CleanupPlan, BrokerOpError> {
+        let budget = deadline.saturating_duration_since(std::time::Instant::now());
+        let plan = self.cleanup_plan_scanned_within(crate::SizeScan::Recorded, Some(budget))?;
+        if std::time::Instant::now() < deadline {
+            self.warm_one_size_record(&plan)?;
+        }
+        Ok(plan)
+    }
+
     /// A recorded-size pass is bounded by [`HEALTH_CHECK_ELIGIBILITY_BUDGET`];
     /// a measuring pass, the only one whose digest authorizes removal, always
     /// inspects every worktree.
@@ -11372,7 +11824,7 @@ impl Broker {
         self.cleanup_plan_scanned_within(scan, budget)
     }
 
-    fn cleanup_plan_scanned_within(
+    pub(crate) fn cleanup_plan_scanned_within(
         &self,
         scan: crate::SizeScan,
         budget: Option<std::time::Duration>,
@@ -11738,33 +12190,53 @@ impl Broker {
                 },
             ),
         };
+        let deadline = crate::git::active_git_deadline();
         let (plan, deferred) = if audit {
-            (self.cleanup_plan_recorded()?, 0)
+            let plan = match deadline {
+                Some(deadline) => self.cleanup_plan_recorded_until(deadline)?,
+                None => self.cleanup_plan_recorded()?,
+            };
+            let deferred = plan.eligibility_not_inspected_count;
+            (plan, deferred)
         } else {
             self.cleanup_plan_observed()?
         };
         let closed_sessions = self.store.cleaned_sessions()?;
-        let (worktree_inodes, worktree_inode_unmeasured) =
-            self.recorded_worktree_inode_summary(&closed_sessions)?;
+        let (worktree_inodes, worktree_inode_unmeasured, inode_summary_complete) =
+            self.recorded_worktree_inode_summary(&closed_sessions, deadline)?;
         let closed_worktrees = crate::retention::ClosedWorktreeSummary::from_cleanup(
             &plan,
             &closed_sessions,
             &self.main_root,
         );
-        let oldest_closed_at = closed_sessions
-            .iter()
-            .filter(|session| {
-                let path = Path::new(&session.worktree_path);
-                path.exists() && self.is_broker_owned_worktree(session, path)
-            })
-            .filter_map(|session| session.closed_at)
-            .min();
+        let mut oldest_closed_at: Option<i64> = None;
+        let mut oldest_closed_complete = true;
+        for session in &closed_sessions {
+            if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+                oldest_closed_complete = false;
+                break;
+            }
+            let path = Path::new(&session.worktree_path);
+            if let Some(closed_at) = session.closed_at
+                && path.exists()
+                && self.is_broker_owned_worktree(session, path)
+            {
+                oldest_closed_at =
+                    Some(oldest_closed_at.map_or(closed_at, |oldest| oldest.min(closed_at)));
+            }
+        }
         let oldest_closed_age_days = oldest_closed_at
             .map(|closed_at| now_ms.saturating_sub(closed_at).max(0) as u64 / 86_400_000)
-            .unwrap_or(0);
+            .unwrap_or_else(|| {
+                if oldest_closed_complete {
+                    0
+                } else {
+                    u64::from(policy.closed_worktrees_days)
+                }
+            });
         // One reading, consumed by both the severity below and the evidence
         // line in the advice that reports it.
-        let gate_headroom = self.gate_headroom();
+        let (gate_headroom, gate_headroom_deferred) = self.gate_headroom();
         let (host_volume_probe, host_available_bytes) = gate_headroom
             .bytes
             .map(|probe| (Some(probe.path), Some(probe.available)))
@@ -11773,13 +12245,22 @@ impl Broker {
             .inodes
             .map(|probe| (Some(probe.path), Some(probe.available)))
             .unwrap_or((None, None));
-        let severity = cleanup_retention_severity(
-            plan.retained_worktree_count,
-            plan.estimated_retained_bytes,
-            oldest_closed_age_days,
-            policy.closed_worktrees_days,
-            policy.retained_bytes_budget,
-        );
+        let reconciliation = self.reconcile_worktree_directories_until(false, deadline)?;
+        let inventory_complete = deferred == 0
+            && inode_summary_complete
+            && oldest_closed_complete
+            && reconciliation.complete;
+        let severity = if inventory_complete {
+            cleanup_retention_severity(
+                plan.retained_worktree_count,
+                plan.estimated_retained_bytes,
+                oldest_closed_age_days,
+                policy.closed_worktrees_days,
+                policy.retained_bytes_budget,
+            )
+        } else {
+            StatusAdviceSeverity::Warning
+        };
         let estimated_blocked_bytes = plan
             .estimated_retained_bytes
             .saturating_sub(plan.estimated_reclaimable_bytes);
@@ -11793,15 +12274,21 @@ impl Broker {
             oldest_measured_at_ms: plan.sizes_measured_at_ms,
         };
         let mut retained_total = retained_total;
-        retained_total.unmeasured = retained_total.unmeasured.saturating_add(deferred);
+        retained_total.unmeasured = retained_total
+            .unmeasured
+            .saturating_add(deferred)
+            .saturating_add(usize::from(
+                !inode_summary_complete || !oldest_closed_complete || !reconciliation.complete,
+            ));
         let budget_verdict = crate::budget_verdict(&retained_total, policy.retained_bytes_budget);
         // Only `Over` asserts that the budget is broken. A floor under the
         // budget is not a pass -- the bytes it skipped are exactly the ones
         // that would have decided it.
         let over_retained_bytes_budget = budget_verdict.exceeded();
         Ok(CleanupRetention {
-            inventory_complete: deferred == 0,
+            inventory_complete,
             inventory_deferred_sessions: deferred,
+            gate_headroom_deferred,
             eligibility_checked: audit,
             broker_owned_worktree_count: plan.retained_worktree_count,
             retained_session_branch_count: plan.retained_branch_count,
@@ -11815,11 +12302,12 @@ impl Broker {
                 plan.estimated_retained_bytes,
                 policy.retained_bytes_budget,
             ),
-            clears_retained_bytes_budget: crate::reclaim_order::clears_budget(
-                plan.estimated_retained_bytes,
-                policy.retained_bytes_budget,
-                plan.estimated_reclaimable_bytes,
-            ),
+            clears_retained_bytes_budget: inventory_complete
+                && crate::reclaim_order::clears_budget(
+                    plan.estimated_retained_bytes,
+                    policy.retained_bytes_budget,
+                    plan.estimated_reclaimable_bytes,
+                ),
             budget_verdict,
             unmeasured_worktree_count: plan.unmeasured_worktree_count,
             sizes_measured_at_ms: plan.sizes_measured_at_ms,
@@ -11833,7 +12321,7 @@ impl Broker {
             worktree_inode_unmeasured,
             severity,
             retention_config,
-            reconciliation: self.reconcile_worktree_directories(false)?,
+            reconciliation,
             closed_worktrees,
         })
     }
@@ -11868,23 +12356,45 @@ impl Broker {
         }
     }
 
-    fn gate_headroom(&self) -> GateHeadroom {
-        lowest_headroom_with(&self.gate_headroom_probes(), |probe| {
+    fn gate_headroom(&self) -> (GateHeadroom, bool) {
+        let deadline = crate::git::active_git_deadline();
+        if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+            return (GateHeadroom::default(), true);
+        }
+        let probes = self.gate_headroom_probes();
+        if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+            return (GateHeadroom::default(), true);
+        }
+        let headroom = lowest_headroom_with(&probes, |probe| {
             crate::disk_headroom::available_headroom_at_or_above_for(&self.main_root, probe)
-        })
+        });
+        if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+            (GateHeadroom::default(), true)
+        } else {
+            (headroom, false)
+        }
     }
 
     fn recorded_worktree_inode_summary(
         &self,
         closed_sessions: &[Session],
-    ) -> Result<(u64, usize), BrokerOpError> {
+        deadline: Option<std::time::Instant>,
+    ) -> Result<(u64, usize, bool), BrokerOpError> {
         let mut paths = std::collections::BTreeSet::new();
-        for session in self
-            .store
-            .live_sessions()?
+        let live_sessions = self.store.live_sessions()?;
+        let total_sessions = live_sessions.len().saturating_add(closed_sessions.len());
+        let mut complete = true;
+        let mut unmeasured = 0_usize;
+        for (index, session) in live_sessions
             .iter()
             .chain(closed_sessions.iter())
+            .enumerate()
         {
+            if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+                complete = false;
+                unmeasured = unmeasured.saturating_add(total_sessions.saturating_sub(index));
+                break;
+            }
             if session.origin != SessionOrigin::Spawned {
                 continue;
             }
@@ -11894,16 +12404,26 @@ impl Broker {
             }
         }
 
+        if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+            complete = false;
+            unmeasured = unmeasured.saturating_add(paths.len());
+            return Ok((0, unmeasured, complete));
+        }
         let records = crate::measurement::load_size_records(&self.main_root);
         let mut known = 0_u64;
-        let mut unmeasured = 0_usize;
-        for path in paths {
+        let path_count = paths.len();
+        for (index, path) in paths.into_iter().enumerate() {
+            if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+                complete = false;
+                unmeasured = unmeasured.saturating_add(path_count.saturating_sub(index));
+                break;
+            }
             match records.get(&path).and_then(|record| record.inodes) {
                 Some(inodes) => known = known.saturating_add(inodes),
                 None => unmeasured = unmeasured.saturating_add(1),
             }
         }
-        Ok((known, unmeasured))
+        Ok((known, unmeasured, complete))
     }
 
     /// Remove a session's worktree and mark it cleaned. Refuses when the
@@ -12342,13 +12862,13 @@ fn session_off_remote_work(
     session: &Session,
     upstream: Option<&str>,
     integration_head: Option<&str>,
-) -> Option<(String, crate::unpushed::OffRemoteWork)> {
+) -> Result<Option<(String, crate::unpushed::OffRemoteWork)>, crate::GitError> {
     let worktree = Path::new(&session.worktree_path);
     if !worktree.exists() {
-        return None;
+        return Ok(None);
     }
-    let checkout = GitRepo::discover(worktree).ok()?;
-    let head = checkout.head_commit().ok()?;
+    let checkout = GitRepo::discover(worktree)?;
+    let head = checkout.head_commit()?;
     let mut excluded = Vec::new();
     if let Some(base) = session.adoption_base.as_deref() {
         excluded.push(base.to_string());
@@ -12368,8 +12888,8 @@ fn session_off_remote_work(
         .map(String::as_str)
         .filter(|base| *base != "HEAD" && checkout.resolve_ref(base).is_some())
         .collect::<Vec<_>>();
-    let work = crate::unpushed::off_remote_work(&checkout, &head, &excluded, upstream).ok()?;
-    Some((head, work))
+    let work = crate::unpushed::off_remote_work(&checkout, &head, &excluded, upstream)?;
+    Ok(Some((head, work)))
 }
 
 /// What `status --refresh` reads from one live session's checkout. Each
@@ -12389,25 +12909,42 @@ enum CheckoutInspection {
     },
 }
 
+fn checkout_inspection_error(error: crate::GitError) -> CheckoutInspection {
+    match error {
+        crate::GitError::TimedOut { .. } => CheckoutInspection::NotInspected,
+        _ => CheckoutInspection::Unreadable,
+    }
+}
+
 fn inspect_session_checkouts(
     agents: &[AgentView],
     deadline: Option<std::time::Instant>,
 ) -> std::collections::BTreeMap<i64, CheckoutInspection> {
     let inspections = crate::worktree_report::inspect_in_parallel(agents, |agent| {
-        if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+        let expired = || deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline);
+        if expired() {
             return CheckoutInspection::NotInspected;
         }
-        let Ok(checkout) = GitRepo::discover(Path::new(&agent.session.worktree_path)) else {
-            return CheckoutInspection::Unreadable;
+        let checkout = match GitRepo::discover(Path::new(&agent.session.worktree_path)) {
+            Ok(checkout) if !expired() => checkout,
+            Ok(_) => return CheckoutInspection::NotInspected,
+            Err(error) => return checkout_inspection_error(error),
         };
-        let Ok(dirty) = checkout.dirty_paths() else {
-            return CheckoutInspection::Unreadable;
+        let dirty = match checkout.dirty_paths() {
+            Ok(dirty) if !expired() => dirty,
+            Ok(_) => return CheckoutInspection::NotInspected,
+            Err(error) => return checkout_inspection_error(error),
         };
         // A dirty checkout's head is never consulted.
-        let head = dirty
-            .is_empty()
-            .then(|| checkout.head_commit().ok())
-            .flatten();
+        let head = if dirty.is_empty() {
+            match checkout.head_commit() {
+                Ok(head) if !expired() => Some(head),
+                Ok(_) => return CheckoutInspection::NotInspected,
+                Err(error) => return checkout_inspection_error(error),
+            }
+        } else {
+            None
+        };
         CheckoutInspection::Read { dirty, head }
     });
     agents
@@ -12415,6 +12952,31 @@ fn inspect_session_checkouts(
         .map(|agent| agent.session.id)
         .zip(inspections)
         .collect()
+}
+
+#[cfg(test)]
+mod checkout_inspection_error_tests {
+    use super::{CheckoutInspection, checkout_inspection_error};
+
+    #[test]
+    fn a_git_timeout_is_an_unknown_checkout_not_a_clean_or_unreadable_one() {
+        let inspection = checkout_inspection_error(crate::GitError::TimedOut {
+            args: "status --porcelain".into(),
+            seconds: 7,
+        });
+
+        assert_eq!(inspection, CheckoutInspection::NotInspected);
+    }
+
+    #[test]
+    fn a_non_timeout_git_error_remains_unreadable() {
+        let inspection = checkout_inspection_error(crate::GitError::Git {
+            args: "status --porcelain".into(),
+            stderr: "repository unavailable".into(),
+        });
+
+        assert_eq!(inspection, CheckoutInspection::Unreadable);
+    }
 }
 
 /// The row that says which refresh checks the inspection budget cut short
@@ -13871,6 +14433,83 @@ mod tests {
         assert!(std::path::Path::new(&session.worktree_path).exists());
     }
 
+    #[test]
+    fn a_degraded_status_snapshot_keeps_git_refs_unknown_after_its_deadline() {
+        let (repo, _) = landing_fixture();
+        let broker = super::Broker::open(repo.path()).unwrap();
+        let _expired = crate::git::limit_git_until(
+            std::time::Instant::now() - std::time::Duration::from_millis(1),
+        );
+        let started = std::time::Instant::now();
+
+        let report = broker
+            .status_current_snapshot(0)
+            .expect("expired Git inspection returns a partial snapshot");
+
+        assert!(
+            report
+                .deferred_checks
+                .iter()
+                .any(|check| check == "git_refs"),
+            "{report:#?}"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "snapshot outlived the expired inspection deadline: {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// The status deadline bounds reads. A mutation that starts inside it --
+    /// the verify-only integration refresh status runs -- must not have its
+    /// Git writes cut off midway, so it runs outside that deadline.
+    #[test]
+    fn an_integration_refresh_is_not_cut_off_by_the_status_deadline() {
+        let (repo, git) = landing_fixture();
+        let base = git(&["rev-parse", "HEAD"]);
+        std::fs::write(repo.path().join(".gitignore"), "/.aethyme/\n").unwrap();
+        git(&["add", ".gitignore"]);
+        git(&["commit", "-qm", "ignore broker state"]);
+        let local_main = git(&["rev-parse", "HEAD"]);
+        git(&["update-ref", "refs/heads/aethyme/integration", &base]);
+        std::fs::create_dir_all(repo.path().join(".aethyme")).unwrap();
+        std::fs::write(
+            repo.path().join(".aethyme/config.toml"),
+            "[promote]\nmode = \"verify-only\"\n",
+        )
+        .unwrap();
+        let remote = tempfile::tempdir().unwrap();
+        let remote_path = remote.path().to_str().unwrap();
+        git(&["init", "-q", "--bare", "-b", "main", remote_path]);
+        git(&["remote", "add", "origin", remote_path]);
+        git(&["push", "-q", "origin", "main"]);
+        // Upstream moves past local main, which the merge of a pull request
+        // on the provider leaves behind.
+        git(&["commit", "--allow-empty", "-qm", "merged upstream"]);
+        let upstream = git(&["rev-parse", "HEAD"]);
+        git(&["push", "-q", "origin", "main"]);
+        git(&["reset", "-q", "--hard", &local_main]);
+        let mut broker = super::Broker::open(repo.path()).unwrap();
+
+        let _expired = crate::git::limit_git_until(
+            std::time::Instant::now() - std::time::Duration::from_millis(1),
+        );
+        let report = broker
+            .auto_cleanup_landed_integration("origin/main")
+            .expect("the refresh runs its Git commands to completion");
+
+        assert_eq!(
+            report.state,
+            crate::AutomaticIntegrationCleanupState::Cleaned,
+            "{report:#?}"
+        );
+        assert_eq!(git(&["rev-parse", "aethyme/integration"]), upstream);
+        assert!(
+            crate::git::active_git_deadline().is_some(),
+            "the caller's deadline is restored afterwards"
+        );
+    }
+
     /// A temporary repository with a fixed identity, so `git commit` works
     /// on a runner with no global configuration.
     fn landing_fixture() -> (tempfile::TempDir, impl Fn(&[&str]) -> String) {
@@ -14400,9 +15039,11 @@ mod tests {
             eligibility_checked: true,
             inventory_complete: true,
             inventory_deferred_sessions: 0,
+            gate_headroom_deferred: false,
             closed_worktrees: Default::default(),
             reconciliation: crate::WorktreeReconciliation {
                 schema_version: crate::WORKTREE_RECONCILIATION_SCHEMA_VERSION,
+                complete: true,
                 scanned_root_count: 0,
                 directory_count: 0,
                 claimed_count: 0,
@@ -14682,6 +15323,7 @@ mod tests {
             orphaned_pidfiles: Vec::new(),
             purged_stale_leases: 0,
             retention: crate::GcHealth {
+                deferred_checks: Vec::new(),
                 closed_worktrees: Default::default(),
                 unclaimed_worktree_count: 0,
                 unclaimed_worktree_bytes: 0,
@@ -14715,6 +15357,7 @@ mod tests {
             hooks_path: None,
             leftover_integration_work: None,
             phase_timings_ms: Default::default(),
+            deferred_checks: Vec::new(),
             budget_cut: Vec::new(),
         }
     }

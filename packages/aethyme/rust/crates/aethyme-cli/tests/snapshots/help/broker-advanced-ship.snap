@@ -1,13 +1,18 @@
 exit: 0
 --- stdout
-  aethyme broker advanced ship plan --entry <id> [--delivery <local_main_merge|pull_request>] [--json]
-      Read-only delivery plan through an exact promoted entry: resolve the
+  aethyme broker advanced ship plan --entry <id> [--only] [--delivery <local_main_merge|pull_request>] [--json]
+      Build a delivery plan through an exact promoted entry: resolve the
       trusted delivery policy, divergence recommendation, publication prefix,
-      remote freshness, proposed route, and local-main safety.
-  aethyme broker advanced ship execute --entry <id> --confirm <full-publication-sha> [--delivery <local_main_merge|pull_request>] [--plan <sha256>] [--sync-main] [--break-glass --reason <authorization>] [--json]
+      remote freshness, proposed route, and local-main safety. --only selects
+      one independent entry and gates origin/main plus its changes in an
+      exact-tree checkout. Planning never moves refs; --only may record gate
+      results and cache entries. After publication it reconciles the remaining
+      promoted entries and re-verifies every replay whose tree changed.
+  aethyme broker advanced ship execute --entry <id> --confirm <full-publication-sha> [--only] [--delivery <local_main_merge|pull_request>] [--plan <sha256>] [--sync-main] [--break-glass --reason <authorization>] [--json]
       Revalidate and execute the reviewed delivery route. Local-main delivery
       uses a clean fast-forward merge; pull-request delivery pushes a
       deterministic branch and opens or verifies one exact GitHub PR.
+      --only requires the plan SHA-256 produced by `ship plan --only`.
       --sync-main additionally fast-forwards an unchanged primary checkout.
       A committed review-gated policy requires live exact-review evidence.
       Break-glass is available only when that committed policy opts in; the

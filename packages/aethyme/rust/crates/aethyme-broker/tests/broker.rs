@@ -176,6 +176,38 @@ fn start_worktree_creates_broker_managed_session_without_process() {
 }
 
 #[test]
+fn two_session_worktrees_are_distinct_and_registered() {
+    let tmp = tempfile::tempdir().unwrap();
+    let external_root = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    let mut broker = Broker::open(tmp.path())
+        .unwrap()
+        .with_worktree_root(external_root.path());
+
+    let first = broker
+        .start_worktree("first isolated session", None)
+        .unwrap();
+    let second = broker
+        .start_worktree("second isolated session", None)
+        .unwrap();
+    assert_ne!(first.id, second.id);
+    assert_ne!(first.branch, second.branch);
+    assert_ne!(first.worktree_path, second.worktree_path);
+    assert!(Path::new(&first.worktree_path).is_dir());
+    assert!(Path::new(&second.worktree_path).is_dir());
+
+    let sessions = broker.agents(now_ms()).unwrap();
+    assert_eq!(sessions.len(), 2);
+    assert!(sessions.iter().any(
+        |view| view.session.id == first.id && view.session.worktree_path == first.worktree_path
+    ));
+    assert!(
+        sessions.iter().any(|view| view.session.id == second.id
+            && view.session.worktree_path == second.worktree_path)
+    );
+}
+
+#[test]
 fn compatibility_status_snapshot_derives_without_reconciling_state() {
     let tmp = tempfile::tempdir().unwrap();
     init_repo(tmp.path());

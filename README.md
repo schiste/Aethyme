@@ -55,13 +55,52 @@ is expensive.
 ### 1. Install the Rust binaries
 
 Supported release targets are Apple Silicon macOS, Intel macOS, x86-64 and
-arm64 Linux (glibc), and x86-64 Linux (musl, static, for Alpine and other
-non-glibc distributions). A release contains the paired `aethyme` router and
-`aethyme-engine-cli` engine binary.
+arm64 Linux (glibc), x86-64 Linux (musl, static, for Alpine and other
+non-glibc distributions), and Windows x64. A release contains the paired
+`aethyme` router and `aethyme-engine-cli` engine binary.
 
-Windows is not supported natively; run the x86-64 Linux build under WSL2.
-The cost of a native port is scoped in
-[docs/architecture/windows-port.md](packages/aethyme/docs/architecture/windows-port.md).
+On arm64 Linux, only the glibc build exists; there is no arm64 musl archive,
+so Alpine and other non-glibc arm64 systems are not supported. Every release
+smoke-tests the arm64 archive on a native GitHub `ubuntu-24.04-arm` runner
+(`broker quick-test` and a graph refresh) before it is published, and pull
+requests that touch the installer, updater or release inputs also run the
+installer, update, rollback, two-worktree and host-lock tests there. Rollback
+works as on every other target: `aethyme update execute` keeps the previous
+binary pair as the single rollback bundle, and a failed download, checksum,
+staged smoke or activation leaves or restores the earlier pair.
+
+On Windows, download the `x86_64-pc-windows-msvc` zip and its Sigstore bundle
+(`<zip>.sigstore.json`) from the same GitHub release, and verify the archive
+before extracting the pair. The zip is signed on its own rather than listed in
+`release-manifest.json`, which every released `aethyme update` validates and
+which therefore lists tarballs only:
+
+~~~
+$tag = "v<version>"   # replace with the release tag you downloaded
+$archive = "aethyme-$tag-x86_64-pc-windows-msvc.zip"
+cosign verify-blob --bundle "$archive.sigstore.json" --certificate-identity "https://github.com/schiste/Aethyme/.github/workflows/release.yml@refs/tags/$tag" --certificate-oidc-issuer https://token.actions.githubusercontent.com $archive
+if ($LASTEXITCODE -ne 0) { throw "Windows release archive signature does not verify" }
+$install = Join-Path (Join-Path $env:LOCALAPPDATA "Aethyme") "bin"
+New-Item -ItemType Directory -Force -Path $install | Out-Null
+Expand-Archive -LiteralPath $archive -DestinationPath $install -Force
+$userPath = [Environment]::GetEnvironmentVariable("Path", "User")
+$pathEntries = @($userPath -split ";" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+if ($pathEntries -notcontains $install) {
+  [Environment]::SetEnvironmentVariable("Path", ((@($pathEntries) + $install) -join ";"), "User")
+}
+~~~
+
+Open a new terminal, then run aethyme --version and aethyme-engine-cli --version.
+Native Explore and graph navigation work when the repository has committed
+graph fragments under .aethyme/graph. Build the local store with
+aethyme-engine-cli index --repo <path>. Windows phase 1 does not generate
+committed fragments; generate them through the graph refresh workflow on a
+supported platform and commit them first.
+aethyme deploy --generated-only writes generated repository guidance. Broker
+commands and broker-backed graph lifecycle operations are not yet supported on
+Windows; use WSL2 for those workflows. See
+[docs/architecture/windows-port.md](packages/aethyme/docs/architecture/windows-port.md)
+for the phase boundary.
 
 With Homebrew:
 

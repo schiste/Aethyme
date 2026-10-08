@@ -130,14 +130,16 @@ Usage:
       refuses while the session holds commits no remote has, unless
       --abandon --reason records that they are being left behind. Prefer
       finish for normal lifecycle use.
-  aethyme broker finish --session <id> [--keep-worktree] [--abandon --reason <why>] [--json]
+  aethyme broker finish --session <id> [--timeout <1..86400 seconds>] [--keep-worktree] [--abandon --reason <why>] [--json]
       Higher-level lifecycle close: closes only when the session has no
       dirty WIP and no committed work waiting for submit/promotion. Where
       the repository sets [delivery] push_session_branches, also refuses
       while HEAD has commits no remote holds; --abandon --reason closes
       anyway and records a broker.session.abandoned_unpushed event. If it
       is not safe, prints the next command; suggests cleanup only when
-      cleanup would pass without --force. Successful closure atomically
+      cleanup would pass without --force. Git checks share a 10-second
+      deadline by default; --timeout changes it, and an expiry names the
+      timed-out check with safe status/handoff guidance. Successful closure atomically
       persists a redacted session.finished handoff with delivery, pending
       work, leases, last-gate provenance, and the recommended next action.
   aethyme broker handoff (--session <id> | --worktree <path>) [--json]
@@ -664,14 +666,19 @@ Usage:
       Manual-mode only: advance the local integration branch to a verified
       entry's merge commit; other in-flight entries are re-simulated.
       Promotion stays local; publish through `broker ship plan --entry <id>`.
-  aethyme broker ship plan --entry <id> [--delivery <local_main_merge|pull_request>] [--json]
-      Read-only delivery plan through an exact promoted entry: resolve the
+  aethyme broker ship plan --entry <id> [--only] [--delivery <local_main_merge|pull_request>] [--json]
+      Build a delivery plan through an exact promoted entry: resolve the
       trusted delivery policy, divergence recommendation, publication prefix,
-      remote freshness, proposed route, and local-main safety.
-  aethyme broker ship execute --entry <id> --confirm <full-publication-sha> [--delivery <local_main_merge|pull_request>] [--plan <sha256>] [--sync-main] [--break-glass --reason <authorization>] [--json]
+      remote freshness, proposed route, and local-main safety. --only selects
+      one independent entry and gates origin/main plus its changes in an
+      exact-tree checkout. Planning never moves refs; --only may record gate
+      results and cache entries. After publication it reconciles the remaining
+      promoted entries and re-verifies every replay whose tree changed.
+  aethyme broker ship execute --entry <id> --confirm <full-publication-sha> [--only] [--delivery <local_main_merge|pull_request>] [--plan <sha256>] [--sync-main] [--break-glass --reason <authorization>] [--json]
       Revalidate and execute the reviewed delivery route. Local-main delivery
       uses a clean fast-forward merge; pull-request delivery pushes a
       deterministic branch and opens or verifies one exact GitHub PR.
+      --only requires the plan SHA-256 produced by `ship plan --only`.
       --sync-main additionally fast-forwards an unchanged primary checkout.
       A committed review-gated policy requires live exact-review evidence.
       Break-glass is available only when that committed policy opts in; the
@@ -1327,7 +1334,7 @@ struct Parsed {
     generation: Option<i64>,
     events: Option<String>,
     ttl_seconds: Option<i64>,
-    /// `leases wait --timeout`: seconds to wait for a held path.
+    /// `leases wait --timeout` and `finish --timeout` budgets, in seconds.
     timeout_seconds: Option<u64>,
     wait: Option<String>,
     since: Option<i64>,
@@ -1402,6 +1409,7 @@ struct Parsed {
     no_cache: bool,
     probe: bool,
     only: Option<String>,
+    ship_only: bool,
     stdout: bool,
     include_task: bool,
     offline: bool,
@@ -1418,6 +1426,10 @@ struct Parsed {
 }
 
 fn parse(args: &[String]) -> Result<Parsed, UsageError> {
+    parse_with_context(args, false)
+}
+
+fn parse_with_context(args: &[String], ship_command: bool) -> Result<Parsed, UsageError> {
     let mut parsed = Parsed {
         read_only_snapshot: false,
         read_only_compatibility: None,
@@ -1534,6 +1546,7 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
         no_cache: false,
         probe: false,
         only: None,
+        ship_only: false,
         stdout: false,
         include_task: false,
         offline: false,
@@ -1631,6 +1644,7 @@ fn parse(args: &[String]) -> Result<Parsed, UsageError> {
             "--no-cache" => parsed.no_cache = true,
             "--verify-only" => parsed.verify_only = true,
             "--probe" => parsed.probe = true,
+            "--only" if ship_command => parsed.ship_only = true,
             "--only" => {
                 parsed.only = Some(
                     iter.next()
@@ -2197,7 +2211,8 @@ fn run_inner(args: &[String], mode: &CompatibilityMode) -> Result<(), UsageError
         return Err(UsageError::Help);
     };
     // Everywhere else `--pr` takes a pull-request number; for `push` it is a
-    // switch. Translating it here keeps the one context-free parser.
+    // switch. Translate it before parsing, and only give the parser ship
+    // context because `--only` normally takes a value for other commands.
     let rest: Vec<String> = if subcommand == "push" {
         let separator = args
             .iter()
@@ -2217,7 +2232,12 @@ fn run_inner(args: &[String], mode: &CompatibilityMode) -> Result<(), UsageError
     } else {
         args[1..].to_vec()
     };
-    let mut parsed = parse(&rest).map_err(|error| {
+    let parse_result = if subcommand == "ship" {
+        parse_with_context(&rest, true)
+    } else {
+        parse(&rest)
+    };
+    let mut parsed = parse_result.map_err(|error| {
         if subcommand == "operations" && args.get(1).map(String::as_str) == Some("reconcile") {
             match error {
                 UsageError::Message(message) if !message.contains(OPERATIONS_RECONCILE_USAGE) => {

@@ -125,6 +125,33 @@ fn release_workflow_smokes_the_installed_archive_contract() {
 }
 
 #[test]
+fn release_targets_exercises_native_linux_arm64_runtime_contract() {
+    let workflow = std::fs::read_to_string(
+        aethyme_testkit::paths::repo_root().join(".github/workflows/release-targets.yml"),
+    )
+    .unwrap();
+    assert!(workflow.contains("os: ubuntu-24.04-arm"));
+    assert!(workflow.contains("target: aarch64-unknown-linux-gnu"));
+    assert!(workflow.contains("if: matrix.target == 'aarch64-unknown-linux-gnu'"));
+
+    for command in [
+        "cargo test --locked -p aethyme-testkit --test release_installer",
+        "cargo test --locked -p aethyme-broker --lib bootstrap_switches_the_pair_once_and_retains_one_rollback_bundle",
+        "cargo test --locked -p aethyme-broker --lib failed_staged_quick_test_never_moves_the_active_pair",
+        "cargo test --locked -p aethyme-broker --test broker two_session_worktrees_are_distinct_and_registered",
+        "cargo test --locked -p aethyme-broker --test host_operations_e2e",
+        "broker quick-test",
+        "graph refresh plan",
+        "graph refresh execute",
+    ] {
+        assert!(
+            workflow.contains(command),
+            "native Linux arm64 job is missing {command}"
+        );
+    }
+}
+
+#[test]
 fn release_workflow_renders_the_homebrew_formula_from_the_manifest() {
     let workflow = std::fs::read_to_string(
         aethyme_testkit::paths::repo_root().join(".github/workflows/release.yml"),
@@ -631,4 +658,55 @@ fn the_current_version_renders_release_notes() {
     let breaking =
         aethyme_testkit::release_notes::upgrading_sections(&upgrading).contains_key(&version);
     assert_eq!(body.contains("\n## Upgrading\n"), breaking);
+}
+
+#[test]
+fn windows_release_builds_and_smokes_the_native_zip() {
+    let root = aethyme_testkit::paths::repo_root();
+    let release = std::fs::read_to_string(root.join(".github/workflows/release.yml")).unwrap();
+    let ci = std::fs::read_to_string(root.join(".github/workflows/windows-release.yml")).unwrap();
+    let smoke = std::fs::read_to_string(root.join("scripts/windows-release-smoke.ps1")).unwrap();
+
+    for fragment in [
+        "build-windows:",
+        "runs-on: windows-latest",
+        "x86_64-pc-windows-msvc",
+        "Compress-Archive",
+        "windows-release-smoke.ps1",
+        "needs: [build, build-windows]",
+        "windows_count",
+        "test \"$windows_count\" = \"1\"",
+        "Sign and verify the detached Windows zip",
+    ] {
+        assert!(
+            release.contains(fragment),
+            "release workflow is missing {fragment}"
+        );
+    }
+    for fragment in [
+        "runs-on: windows-latest",
+        "cargo build --release --locked --target x86_64-pc-windows-msvc",
+        "aethyme-graph-indexer --bin aethyme-graph-index",
+        "windows-release-smoke.ps1",
+    ] {
+        assert!(
+            ci.contains(fragment),
+            "Windows CI workflow is missing {fragment}"
+        );
+    }
+    for fragment in [
+        "--repo-root",
+        "--repo-name aethyme-windows-smoke",
+        "index --repo",
+        "explore --repo",
+        "graph overview --repo",
+        "deploy --generated-only --repo",
+        "broker quick-test",
+        "the broker is not yet supported on Windows",
+    ] {
+        assert!(
+            smoke.contains(fragment),
+            "Windows smoke is missing {fragment}"
+        );
+    }
 }

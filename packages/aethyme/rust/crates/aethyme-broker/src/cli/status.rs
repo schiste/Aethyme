@@ -153,6 +153,35 @@ pub(super) fn run_status(parsed: Parsed) -> Result<(), UsageError> {
         out!("Summary: {}", status.summary.message);
         out!();
         render_status_advice(&status.advice);
+        let lease_waiters: Vec<_> = status
+            .lease_release_requests
+            .iter()
+            .filter(|request| request.state == crate::lease_requests::RequestState::Pending)
+            .collect();
+        if !lease_waiters.is_empty() {
+            out!();
+            out!(
+                "Lease waiters: {} pending release requests",
+                lease_waiters.len()
+            );
+            for request in lease_waiters.iter().take(10) {
+                let waited = now_ms().saturating_sub(request.requested_at).max(0) as u64 / 1_000;
+                out!(
+                    "  request {}: session {} waiting for {} held by session {} ({} ago)",
+                    request.request_id,
+                    request.requester_session_id,
+                    request.path,
+                    request.holder_session_id,
+                    crate::operations::humanize_duration(waited)
+                );
+            }
+            if lease_waiters.len() > 10 {
+                out!(
+                    "  and {} more pending lease waiters",
+                    lease_waiters.len() - 10
+                );
+            }
+        }
         if !status.outstanding_advisories.is_empty() {
             out!();
             out!(
@@ -216,10 +245,18 @@ pub(super) fn run_status(parsed: Parsed) -> Result<(), UsageError> {
                 .iter()
                 .filter(|operation| operation.holding_lock)
                 .count();
+            // Only a prepared row is queued for the lock; an `outcome_unknown`
+            // row waits on reconciliation, not on the holder.
+            let waiters = status
+                .coordinated_operations
+                .iter()
+                .filter(|operation| !operation.holding_lock && operation.status == "prepared")
+                .count();
             out!(
-                "Coordinated operations: {} unresolved, {} holding a write lock",
+                "Coordinated operations: {} unresolved, {} holding a write lock, {} waiting",
                 status.coordinated_operations.len(),
-                holders
+                holders,
+                waiters
             );
             for operation in status.coordinated_operations.iter().take(10) {
                 let role = if operation.holding_lock {
@@ -231,7 +268,7 @@ pub(super) fn run_status(parsed: Parsed) -> Result<(), UsageError> {
                     }
                 };
                 out!(
-                    "  op {:<6} sess {:<4} {:<7} {:<28} {:<9} {:>8}  {} :: {}",
+                    "  op {:<6} sess {:<4} {:<7} lock {:<28} {:<9} {:>8}  {} :: {}",
                     operation.id,
                     operation.session_id,
                     operation.provider,
@@ -552,16 +589,45 @@ pub(super) fn run_doctor(parsed: Parsed) -> Result<(), UsageError> {
             )));
         }
     }
+    let command_started = std::time::Instant::now();
     let mut broker = open_broker(parsed.read_only_snapshot)?;
-    let report = if parsed.fix_version {
+    let mut report = if parsed.fix_version {
         broker.doctor_with_version_fix()?
     } else {
         broker.doctor()?
     };
-    let blocker_report = broker.blockers();
+    // Blocker enrichment used to run after `doctor()` dropped its Git
+    // deadline, so the command could exceed its interactive budget while
+    // resolving the repository identity. It is supplemental: if any doctor
+    // check was cut, or the command envelope is spent, report it as unknown.
+    let blocker_deadline = command_started + std::time::Duration::from_secs(9);
+    let blocker_report =
+        if report.deferred_checks.is_empty() && std::time::Instant::now() < blocker_deadline {
+            let _git_deadline = crate::git::limit_git_until(blocker_deadline);
+            let blockers = broker.blockers();
+            if std::time::Instant::now() < blocker_deadline {
+                blockers
+            } else {
+                report.deferred_checks.push("blockers".into());
+                report.budget_cut.push("blockers".into());
+                doctor_blockers_deferred()
+            }
+        } else {
+            report.deferred_checks.push("blockers".into());
+            report.budget_cut.push("blockers".into());
+            doctor_blockers_deferred()
+        };
+    report.deferred_checks.sort();
+    report.deferred_checks.dedup();
+    report.budget_cut.sort();
+    report.budget_cut.dedup();
     if parsed.json {
         let mut value = serde_json::to_value(&report)?;
         value["blockers"] = serde_json::to_value(&blocker_report.blockers)?;
+        if !blocker_report.unavailable.is_empty() {
+            value["blocker_sources_unavailable"] =
+                serde_json::to_value(&blocker_report.unavailable)?;
+        }
         out!("{}", serde_json::to_string_pretty(&value)?);
     } else {
         out!("integrity: {}", report.integrity);
@@ -804,6 +870,16 @@ pub(super) fn run_doctor(parsed: Parsed) -> Result<(), UsageError> {
         }
     }
     Ok(())
+}
+
+fn doctor_blockers_deferred() -> crate::BlockerReport {
+    crate::BlockerReport {
+        unavailable: vec![crate::BlockerSourceError {
+            source: "broker blockers",
+            error: "inspection budget expired before blocker sources were checked".into(),
+        }],
+        ..crate::BlockerReport::default()
+    }
 }
 
 /// `broker doctor plan`: every debris item across stores, read-only.
