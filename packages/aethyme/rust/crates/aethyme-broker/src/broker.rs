@@ -10345,7 +10345,11 @@ impl Broker {
             crate::events::session_finish_cleanup_started_payload(worktree_present, branch_present);
         self.store
             .begin_finish_cleanup(report.session_id, &start_payload)?;
-        match self.cleanup(report.session_id, false) {
+        // `finish --timeout` bounds the checks that decide whether to close.
+        // Once closed, reclaiming the worktree runs to completion: killing a
+        // `git worktree remove` of a multi-gigabyte tree halfway leaves an
+        // orphaned directory instead of a faster answer.
+        match crate::git::without_git_deadline(|| self.cleanup(report.session_id, false)) {
             Ok(()) => {
                 report.status = FinishStatus::Cleaned;
                 report.cleanup.completed = true;

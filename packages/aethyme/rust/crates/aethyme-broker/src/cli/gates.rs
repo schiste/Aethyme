@@ -933,6 +933,7 @@ pub(super) fn run_gates(parsed: Parsed) -> Result<(), UsageError> {
                             .unwrap_or_default(),
                         short_commit(&outcome.tree_hash),
                     );
+                    render_gate_failure_tail(outcome);
                 }
                 out!(
                     "Pre-push: verified {} for {} ref update(s) to {}.",
@@ -947,7 +948,7 @@ pub(super) fn run_gates(parsed: Parsed) -> Result<(), UsageError> {
                 .any(|outcome| outcome.status != crate::GateStatus::Pass)
             {
                 return Err(UsageError::Message(
-                    "one or more pre-push gates did not pass".into(),
+                    "one or more pre-push gates did not pass; failed gate names and bounded output are shown above".into(),
                 ));
             }
         }
