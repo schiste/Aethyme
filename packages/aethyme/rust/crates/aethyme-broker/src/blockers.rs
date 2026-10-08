@@ -29,6 +29,12 @@ pub const BLOCKER_CLEARED: &str = "broker.blocker.cleared";
 /// How many cached failing verdicts one listing carries.
 const GATE_CACHE_LIMIT: i64 = 50;
 
+/// Wall-clock budget for deriving stale-lease remedies in one listing.
+/// `broker status` lists blockers on every call, and a remedy runs the same
+/// submission plan `finish` does. Past the budget a lease names `finish`,
+/// whose own refusal names the delivering step (#637).
+const STALE_LEASE_REMEDY_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BlockerKind {
@@ -87,6 +93,14 @@ pub struct Blocker {
     /// when the store recorded enough to name one (#286).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub inspect: Option<String>,
+}
+
+/// The command that clears a stale session's lease, and the pending work
+/// that keeps `finish` from clearing it, when there is any.
+#[derive(Clone)]
+struct StaleLeaseRemedy {
+    clear: String,
+    pending: Option<String>,
 }
 
 /// A store the collection could not read. Reported rather than dropped: an
@@ -512,6 +526,13 @@ impl Broker {
 
     fn path_lease_blockers(&self) -> Result<Vec<Blocker>, BrokerOpError> {
         let mut found = Vec::new();
+        // One remedy per session, not per lease: a stale session commonly
+        // holds many leases, and each remedy reads its worktree and plans its
+        // submission. The queue is read once for all of them.
+        let mut remedies: std::collections::HashMap<i64, StaleLeaseRemedy> =
+            std::collections::HashMap::new();
+        let mut queue: Option<Option<Vec<crate::MergeQueueEntry>>> = None;
+        let deadline = std::time::Instant::now() + STALE_LEASE_REMEDY_BUDGET;
         for lease in self.store_ref().active_leases()? {
             if lease.kind != crate::LeaseKind::Explicit {
                 continue;
@@ -521,13 +542,27 @@ impl Broker {
                 continue;
             }
             let worktree_gone = !Path::new(&session.worktree_path).exists();
+            let remedy = (!worktree_gone).then(|| {
+                remedies
+                    .entry(session.id)
+                    .or_insert_with(|| {
+                        if std::time::Instant::now() >= deadline {
+                            return Self::finish_remedy(session.id);
+                        }
+                        let queue = queue
+                            .get_or_insert_with(|| self.store_ref().merge_queue().ok())
+                            .as_deref();
+                        self.stale_lease_remedy(&session, queue)
+                    })
+                    .clone()
+            });
             found.push(Blocker {
                 id: format!("lease:{}", lease.id),
                 kind: BlockerKind::PathLease,
                 scope: BlockerScope::Repo,
                 cause: format!(
                     "explicit lease on {} is held by stale session {}{}; no other session can \
-                     claim it",
+                     claim it{}",
                     lease.path,
                     session.id,
                     if worktree_gone {
@@ -535,21 +570,98 @@ impl Broker {
                     } else {
                         ""
                     },
+                    remedy
+                        .as_ref()
+                        .and_then(|remedy| remedy.pending.as_deref())
+                        .map(|pending| format!(
+                            "; {pending}, so `aethyme broker finish --session {}` refuses until \
+                             that work is delivered",
+                            session.id
+                        ))
+                        .unwrap_or_default(),
                 ),
                 session_id: Some(session.id),
-                clear: if worktree_gone {
-                    format!("{UNBLOCK} lease:{}", lease.id)
-                } else {
-                    // `finish` closes and removes the checkout when that is
-                    // safe, and refuses otherwise. `finish close` would keep
-                    // a whole checkout on disk to release one lease.
-                    format!("aethyme broker finish --session {}", session.id)
+                clear: match remedy {
+                    None => format!("{UNBLOCK} lease:{}", lease.id),
+                    Some(remedy) => remedy.clear,
                 },
                 safe_to_clear_automatically: worktree_gone,
                 inspect: None,
             });
         }
         Ok(found)
+    }
+
+    /// What clears a stale session's lease when its worktree still exists.
+    /// `finish` releases the lease only when it can close the session, and it
+    /// refuses while the session holds work that exists nowhere else (#222).
+    /// Naming `finish` then sends the operator round a refusal (#637), so the
+    /// same checks `finish` makes decide the command named here. Read-only;
+    /// a check that cannot be read falls back to `finish`, whose own refusal
+    /// names the remedy.
+    fn stale_lease_remedy(
+        &self,
+        session: &crate::types::Session,
+        queue: Option<&[crate::MergeQueueEntry]>,
+    ) -> StaleLeaseRemedy {
+        let id = session.id;
+        let finish = Self::finish_remedy(id);
+        let Ok(checkout) = GitRepo::discover(Path::new(&session.worktree_path)) else {
+            return finish;
+        };
+        if checkout.dirty_paths().is_ok_and(|dirty| !dirty.is_empty()) {
+            return StaleLeaseRemedy {
+                clear: format!(
+                    "git -C {} status --short",
+                    shell_quote(&session.worktree_path)
+                ),
+                pending: Some("its worktree has uncommitted changes".into()),
+            };
+        }
+        let Ok(head) = checkout.head_commit() else {
+            return finish;
+        };
+        let Some(queue) = queue else {
+            return finish;
+        };
+        if let Ok(delivery) = self.head_delivery(session, &checkout, &head, queue)
+            && delivery.unsubmitted_commits > 0
+        {
+            let count = delivery.unsubmitted_commits;
+            let changes = if count == 1 { "change" } else { "changes" };
+            let promotes = crate::PromoteConfig::load(self.main_root())
+                .mode
+                .promotes_at_all();
+            return StaleLeaseRemedy {
+                // Where the repository does not promote, submitting again
+                // cannot represent the work; proving it landed can.
+                clear: if promotes {
+                    format!("aethyme broker submit --session {id}")
+                } else {
+                    format!("aethyme broker advanced representation scan --session {id}")
+                },
+                pending: Some(format!(
+                    "its HEAD has {count} committed {changes} not yet delivered"
+                )),
+            };
+        }
+        if let Some((_, unpushed)) = self.unpushed_close_check(session) {
+            let commits = if unpushed == 1 { "commit" } else { "commits" };
+            return StaleLeaseRemedy {
+                clear: format!("aethyme broker push --session {id}"),
+                pending: Some(format!("its HEAD has {unpushed} {commits} on no remote")),
+            };
+        }
+        finish
+    }
+
+    /// The pre-#637 advice: `finish`, which refuses with its own remedy when
+    /// work is pending. Used when the checks cannot be read or run in time.
+    fn finish_remedy(session_id: i64) -> StaleLeaseRemedy {
+        StaleLeaseRemedy {
+            clear: format!("aethyme broker finish --session {session_id}"),
+            pending: None,
+        }
     }
 
     fn gate_cache_blockers(&self) -> Result<Vec<Blocker>, BrokerOpError> {
@@ -935,10 +1047,20 @@ impl Broker {
             })?;
         let session = self.store().session(lease.session_id)?;
         if session.status != SessionStatus::Stale || Path::new(&session.worktree_path).exists() {
-            return Ok(refuse(
-                request,
-                BlockerKind::PathLease,
-                format!(
+            let queue = self.store_ref().merge_queue().ok();
+            let remedy = self.stale_lease_remedy(&session, queue.as_deref());
+            let reason = match remedy.pending {
+                // `finish` would refuse too: name the step that delivers the
+                // work instead of a command that cannot clear the lease (#637).
+                Some(pending) => format!(
+                    "lease {lease_id} on {} belongs to session {} ({}); {pending}, so finish \
+                     refuses until that work is delivered: {}",
+                    lease.path,
+                    session.id,
+                    session.status.as_str(),
+                    remedy.clear
+                ),
+                None => format!(
                     "lease {lease_id} on {} belongs to session {} ({}) whose worktree may hold \
                      uncommitted work; release it from that session or finish it: aethyme broker \
                      finish --session {} (or aethyme broker finish close --session {} to keep \
@@ -949,6 +1071,11 @@ impl Broker {
                     session.id,
                     session.id
                 ),
+            };
+            return Ok(refuse(
+                request,
+                BlockerKind::PathLease,
+                reason,
                 Vec::new(),
                 false,
             ));

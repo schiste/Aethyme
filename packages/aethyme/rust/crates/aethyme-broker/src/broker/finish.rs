@@ -558,75 +558,17 @@ impl Broker {
         let head = checkout.head_commit()?;
         report.dirty_paths = checkout.dirty_paths()?;
 
-        let latest_for_head = queue
-            .iter()
-            .rev()
-            .find(|entry| entry.session_id == session_id && entry.head_commit == head);
-        let latest_for_session = queue
-            .iter()
-            .rev()
-            .find(|entry| entry.session_id == session_id);
-        let visible_entry = latest_for_head.or(latest_for_session);
-        if let Some(entry) = visible_entry {
+        let delivery = self.head_delivery(&session, &checkout, &head, &queue)?;
+        if let Some(entry) = delivery.visible_entry {
             report.latest_queue_entry_id = Some(entry.id);
             report.latest_queue_status = Some(entry.status);
             report.delivery = self.finish_delivery(Some(entry));
         }
-
-        // Promotion commonly represents the accepted session tree under a
-        // different integration commit SHA. Resetting the checkout to that
-        // recorded counterpart is delivered even without a queue row at HEAD.
-        let submitted_head_is_delivered = latest_for_head.is_some_and(|entry| {
-            matches!(
-                entry.status,
-                MergeStatus::Promoted | MergeStatus::ExternallyLanded
-            )
-        }) || session.accepted_integration_commit.as_deref()
-            == Some(head.as_str());
-        // Work merged through a reviewed pull request is on the default branch
-        // but leaves no promotion row, and ancestry cannot see it because a
-        // squash rewrites the SHA. A recorded representation is the evidence
-        // that it landed (#152); without it the session can never close.
-        report.representation = self.store.session_representation(session_id, &head)?;
-        let remote_default_tip = self.remote_tracking_default_tip();
-        let head_is_on_remote_default = remote_default_tip
-            .as_deref()
-            .is_some_and(|tip| self.repo.is_ancestor(&head, tip));
-        if head_is_on_remote_default {
+        report.representation = delivery.representation;
+        if delivery.on_remote_default {
             report.delivery.published = true;
         }
-        let head_is_delivered = submitted_head_is_delivered
-            || report.representation.is_some()
-            || head_is_on_remote_default;
-        report.unsubmitted_commits = if head_is_delivered {
-            0
-        } else {
-            let pending_from_plan = self.integration_tip().and_then(|integration_head| {
-                self.build_submission_plan(&session, &head, &integration_head)
-                    .ok()
-                    .filter(|plan| plan.safe)
-                    .map(|plan| {
-                        plan.pending_owned_commit_ids()
-                            .into_iter()
-                            .filter(|commit| {
-                                !remote_default_tip
-                                    .as_deref()
-                                    .is_some_and(|tip| self.repo.is_ancestor(commit, tip))
-                            })
-                            .count() as u64
-                    })
-            });
-            if let Some(pending) = pending_from_plan {
-                pending
-            } else {
-                let base = session
-                    .diff_base
-                    .clone()
-                    .or_else(|| self.session_change_base(&checkout))
-                    .unwrap_or_else(|| "HEAD".to_string());
-                checkout.commit_count_between(&base, "HEAD")?
-            }
-        };
+        report.unsubmitted_commits = delivery.unsubmitted_commits;
 
         if !report.dirty_paths.is_empty() {
             // `dirty_paths` lists every untracked file because cleanup safety
@@ -667,7 +609,10 @@ impl Broker {
             return Ok(report);
         }
 
-        if let Some(entry) = latest_for_head.filter(|_| !head_is_delivered) {
+        if let Some(entry) = delivery
+            .latest_for_head
+            .filter(|_| !delivery.head_is_delivered)
+        {
             match entry.status {
                 MergeStatus::Promoted | MergeStatus::ExternallyLanded => {}
                 // A repository that never promotes leaves every entry
@@ -902,6 +847,98 @@ impl Broker {
         Ok(report)
     }
 
+    /// Where a session's HEAD stands against its delivery targets: the
+    /// evidence `finish` refuses on when committed work is not yet delivered
+    /// (#222). Read-only, so `broker unblock` can ask the same question
+    /// before naming `finish` as the remedy for a stale lease (#637).
+    pub(crate) fn head_delivery<'q>(
+        &self,
+        session: &Session,
+        checkout: &GitRepo,
+        head: &str,
+        queue: &'q [MergeQueueEntry],
+    ) -> Result<HeadDelivery<'q>, BrokerOpError> {
+        let session_id = session.id;
+        let latest_for_head = queue
+            .iter()
+            .rev()
+            .find(|entry| entry.session_id == session_id && entry.head_commit == head);
+        let latest_for_session = queue
+            .iter()
+            .rev()
+            .find(|entry| entry.session_id == session_id);
+        let visible_entry = latest_for_head.or(latest_for_session);
+
+        // Promotion commonly represents the accepted session tree under a
+        // different integration commit SHA. Resetting the checkout to that
+        // recorded counterpart is delivered even without a queue row at HEAD.
+        let submitted_head_is_delivered = latest_for_head.is_some_and(|entry| {
+            matches!(
+                entry.status,
+                MergeStatus::Promoted | MergeStatus::ExternallyLanded
+            )
+        }) || session.accepted_integration_commit.as_deref()
+            == Some(head);
+        // Work merged through a reviewed pull request is on the default branch
+        // but leaves no promotion row, and ancestry cannot see it because a
+        // squash rewrites the SHA. A recorded representation is the evidence
+        // that it landed (#152); without it the session can never close.
+        let representation = self.store.session_representation(session_id, head)?;
+        let remote_default_tip = self.remote_tracking_default_tip();
+        let on_remote_default = remote_default_tip
+            .as_deref()
+            .is_some_and(|tip| self.repo.is_ancestor(head, tip));
+        let head_is_delivered =
+            submitted_head_is_delivered || representation.is_some() || on_remote_default;
+        let unsubmitted_commits = if head_is_delivered {
+            0
+        } else {
+            let integration_head = self.integration_tip();
+            let pending_from_plan = integration_head.as_deref().and_then(|integration_head| {
+                self.build_submission_plan(session, head, integration_head)
+                    .ok()
+                    .filter(|plan| plan.safe)
+                    .map(|plan| {
+                        plan.pending_owned_commit_ids()
+                            .into_iter()
+                            .filter(|commit| {
+                                !remote_default_tip
+                                    .as_deref()
+                                    .is_some_and(|tip| self.repo.is_ancestor(commit, tip))
+                            })
+                            .count() as u64
+                    })
+            });
+            if let Some(pending) = pending_from_plan {
+                pending
+            } else {
+                let upstream = self.repo.upstream_default().map(|(_, commit)| commit);
+                let base = session
+                    .diff_base
+                    .clone()
+                    .or_else(|| {
+                        integration_head.as_deref().and_then(|integration| {
+                            crate::merge::session_baseline(
+                                checkout,
+                                integration,
+                                upstream.as_deref(),
+                            )
+                        })
+                    })
+                    .unwrap_or_else(|| "HEAD".to_string());
+                checkout.commit_count_between(&base, "HEAD")?
+            }
+        };
+        Ok(HeadDelivery {
+            latest_for_head,
+            visible_entry,
+            head_is_delivered,
+            representation,
+            on_remote_default,
+            unsubmitted_commits,
+        })
+    }
+
     pub(super) fn finish_cleanup_safe(
         &self,
         session_id: i64,
@@ -1008,4 +1045,19 @@ impl Broker {
             _ => false,
         }
     }
+}
+
+/// What [`Broker::head_delivery`] found for one session HEAD.
+pub(crate) struct HeadDelivery<'q> {
+    /// The queue row recorded for exactly this HEAD.
+    pub(crate) latest_for_head: Option<&'q MergeQueueEntry>,
+    /// The queue row for this HEAD, else the session's latest one.
+    pub(crate) visible_entry: Option<&'q MergeQueueEntry>,
+    pub(crate) representation: Option<SessionRepresentation>,
+    pub(crate) on_remote_default: bool,
+    /// Promoted, represented, or already on the remote default branch.
+    pub(crate) head_is_delivered: bool,
+    /// Commits not represented on any delivery target; `finish` refuses
+    /// while this is above zero.
+    pub(crate) unsubmitted_commits: u64,
 }

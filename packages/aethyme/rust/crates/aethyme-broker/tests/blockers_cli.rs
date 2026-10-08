@@ -8,7 +8,7 @@ use aethyme_broker::{
     Broker, GateFailureClass, GateStatus, HostOperationGuard, HostResourceCoordinator,
     HostResourceKind, HostResourceRequest, HostResourceRequirement, NewCoordinatedOperation,
     NewGateResult, OperationEffect, OperationIdentityProvenance, OperationProvider,
-    OperationStatus,
+    OperationStatus, SessionStatus,
 };
 use rusqlite::{Connection, OptionalExtension};
 use sha2::{Digest, Sha256};
@@ -752,6 +752,94 @@ fn status_json_carries_the_blockers_and_advice_names_unblock() {
             .unwrap()
             .iter()
             .any(|command| command.as_str().unwrap() == format!("aethyme broker unblock {id}"))
+    );
+}
+
+/// #637: a stale session's lease is cleared by `finish` only when `finish`
+/// can close the session. Once the session holds committed work that exists
+/// nowhere else, `finish` refuses, so the blocker and the refusal must name
+/// the step that delivers the work instead.
+#[test]
+fn a_stale_lease_names_submit_not_finish_while_its_session_holds_undelivered_work() {
+    let fixture = Fixture::new();
+    let id = fixture.session_id;
+    let mut broker = fixture.broker();
+    broker.claim_lease(id, "src/", None).unwrap();
+    broker.claim_lease(id, "docs/", None).unwrap();
+    broker
+        .store()
+        .set_session_status(id, SessionStatus::Stale, None)
+        .unwrap();
+    drop(broker);
+    let lease_id_for = |path: &str| {
+        let mut broker = fixture.broker();
+        broker
+            .store()
+            .active_leases()
+            .unwrap()
+            .into_iter()
+            .find(|lease| lease.session_id == id && lease.path == path)
+            .expect("the explicit lease is active")
+            .id
+    };
+    let blocker_id = format!("lease:{}", lease_id_for("src/"));
+    let sibling_id = format!("lease:{}", lease_id_for("docs/"));
+    let finish = format!("aethyme broker finish --session {id}");
+
+    // Nothing to deliver: `finish` closes the session and releases the lease.
+    let blocker = fixture
+        .blocker(&blocker_id)
+        .expect("stale lease is a blocker");
+    assert_eq!(blocker["clear"], finish.as_str(), "{blocker:#}");
+
+    std::fs::create_dir_all(fixture.worktree.join("src")).unwrap();
+    std::fs::write(fixture.worktree.join("src/lib.rs"), "fn main() {}\n").unwrap();
+    git(&fixture.worktree, &["add", "src/lib.rs"]);
+    git(
+        &fixture.worktree,
+        &["commit", "-qm", "work awaiting delivery"],
+    );
+
+    let blocker = fixture
+        .blocker(&blocker_id)
+        .expect("stale lease is a blocker");
+    let submit = format!("aethyme broker submit --session {id}");
+    assert_eq!(blocker["clear"], submit.as_str(), "{blocker:#}");
+    let cause = blocker["cause"].as_str().unwrap();
+    assert!(
+        cause.contains("1 committed change not yet delivered") && cause.contains(&finish),
+        "the cause says why finish is not the remedy: {cause}"
+    );
+    // The remedy is derived once per session; every lease it holds names it.
+    let sibling = fixture
+        .blocker(&sibling_id)
+        .expect("the sibling lease is a blocker");
+    assert_eq!(sibling["clear"], submit.as_str(), "{sibling:#}");
+
+    let output = fixture.run(&["unblock", &blocker_id, "--json"]);
+    let refusal: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .unwrap_or_else(|_| panic!("json refusal: {}", stderr(&output)));
+    assert_eq!(refusal["cleared"], false, "{refusal:#}");
+    let reason = refusal["reason"].as_str().unwrap();
+    assert!(
+        reason.ends_with(&submit) && !reason.contains("finish close"),
+        "the refusal names submit, not a finish that would refuse: {reason}"
+    );
+
+    // Uncommitted work refuses `finish` too, and is checked first, as
+    // `finish` checks it.
+    std::fs::write(fixture.worktree.join("src/lib.rs"), "fn main() { }\n").unwrap();
+    let blocker = fixture
+        .blocker(&blocker_id)
+        .expect("stale lease is a blocker");
+    let clear = blocker["clear"].as_str().unwrap();
+    assert!(clear.ends_with("status --short"), "{blocker:#}");
+    assert!(
+        blocker["cause"]
+            .as_str()
+            .unwrap()
+            .contains("uncommitted changes"),
+        "{blocker:#}"
     );
 }
 
