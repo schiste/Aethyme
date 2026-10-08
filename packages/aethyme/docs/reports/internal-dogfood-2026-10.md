@@ -39,6 +39,10 @@ refusal. It does not establish that a maintainer can recover unaided from a
 real conflict, installer update/rollback failure, or uninstall. The repository
 has no pre-Aethyme baseline or structured internal interview for this window.
 
+The [internal pilot follow-up](issue-126-internal-pilot-followup-2026-10.md)
+exercises the documented conflict-recovery path and the paired install,
+update, rollback and uninstall lifecycle, within the limits it states.
+
 ## Decision
 
 Continue using Aethyme internally as the near-term pilot. Treat the observed
