@@ -3997,6 +3997,37 @@ fn submit_refuses_an_adopted_checkout_that_switched_branches_before_queueing() {
     assert_eq!(queued, 0, "a refused submit leaves no queue row");
 }
 
+#[test]
+fn submit_accepts_a_session_adopted_on_a_detached_checkout() {
+    // Routed reviews adopt a detached checkout, so the session records `HEAD`
+    // as its branch. Staying detached is not drift; `refs/heads/HEAD` does
+    // not exist and must not be required.
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    sh(tmp.path(), &["checkout", "-q", "--detach"]);
+    let mut broker = Broker::open(tmp.path()).unwrap();
+    let session = broker.adopt(tmp.path(), Some("detached adoption")).unwrap();
+    assert_eq!(session.branch, "HEAD");
+    commit_edit(tmp.path(), "src/a.py", "a = 2\n");
+
+    let status = broker.status(0).unwrap();
+    assert!(
+        !status
+            .advice
+            .iter()
+            .any(|advice| advice.id == "session.checkout-drift"),
+        "{status:#?}"
+    );
+    let result = broker.submit(session.id);
+    assert!(
+        !matches!(
+            result,
+            Err(aethyme_broker::BrokerOpError::SessionCheckoutDrift { .. })
+        ),
+        "{result:?}"
+    );
+}
+
 /// A queue entry that never landed loses its commit to `git gc` eventually --
 /// that is the expected end state, not corruption. Reconcile used to read its
 /// parents anyway and abort the entire pass on `fatal: bad object`, so one

@@ -37,12 +37,17 @@ fn require_session_checkout_identity(
 ) -> Result<String, BrokerOpError> {
     let actual_branch = checkout.current_branch()?;
     let actual_head = checkout.head_commit()?;
-    let recorded_ref = format!("refs/heads/{}", session.branch);
-    let recorded_branch_head = checkout.resolve_ref(&recorded_ref);
-    if actual_branch != session.branch
-        || recorded_branch_head.as_deref() != Some(actual_head.as_str())
-        || expected_head.is_some_and(|expected| expected != actual_head)
-    {
+    // On the recorded branch the checkout's HEAD is that branch's tip, so
+    // resolve the recorded ref only when they differ. This is the rule status
+    // uses, and it keeps a session adopted on a detached checkout (recorded
+    // branch `HEAD`, as routed reviews are) from failing `refs/heads/HEAD`.
+    let recorded_branch_head = if actual_branch == session.branch {
+        Some(actual_head.clone())
+    } else {
+        checkout.resolve_ref(&format!("refs/heads/{}", session.branch))
+    };
+    let branch_drifted = actual_branch != session.branch;
+    if branch_drifted || expected_head.is_some_and(|expected| expected != actual_head) {
         return Err(BrokerOpError::SessionCheckoutDrift {
             session_id: session.id,
             recorded_branch: session.branch.clone().into_boxed_str(),
