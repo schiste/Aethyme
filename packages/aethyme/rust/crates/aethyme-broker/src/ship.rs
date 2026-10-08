@@ -743,7 +743,7 @@ impl Broker {
                     .or(session.adoption_base.as_deref())
                     .or(session.diff_base.as_deref())
                     .unwrap_or(&entry.base_commit),
-                &integration_sha,
+                &promotion,
                 &remote_default.sha,
             )?;
             publication_sha = independent_sha;
@@ -758,10 +758,15 @@ impl Broker {
             excluded_entries = queue
                 .iter()
                 .filter(|candidate| {
+                    // Only the work this publication leaves behind: entries
+                    // already on the remote default branch are history, and
+                    // listing them as excluded (and "newly published") would
+                    // misstate what the approval leaves unshipped.
                     candidate.id != entry.id
                         && candidate.status == MergeStatus::Promoted
                         && promotion_sha(candidate).is_some_and(|sha| {
                             self.repo_handle().is_ancestor(&sha, &integration_sha)
+                                && !self.repo_handle().is_ancestor(&sha, &remote_default.sha)
                         })
                 })
                 .map(|candidate| ShipPromotedEntry {
@@ -1716,7 +1721,7 @@ fn build_ship_only_publication(
     queue: &[MergeQueueEntry],
     entry: &MergeQueueEntry,
     source_base: &str,
-    integration_sha: &str,
+    promotion: &str,
     remote_base: &str,
 ) -> Result<(String, Vec<String>), BrokerOpError> {
     let repo = broker.repo_handle();
@@ -1762,16 +1767,20 @@ fn build_ship_only_publication(
         }
     }
 
+    // "Earlier" is integration order, not queue-id order: under manual
+    // promotion an entry with a higher id can be promoted ahead of this one,
+    // and this entry's promotion was then verified on top of it.
     for earlier in queue
         .iter()
-        .filter(|candidate| candidate.id < entry.id && candidate.status == MergeStatus::Promoted)
+        .filter(|candidate| candidate.id != entry.id && candidate.status == MergeStatus::Promoted)
     {
         let earlier_promotion =
             promotion_sha(earlier).ok_or_else(|| BrokerOpError::ShipPlanUnavailable {
                 what: "promoted queue provenance",
                 reason: format!("entry {} has no promoted commit detail", earlier.id),
             })?;
-        if !repo.is_ancestor(&earlier_promotion, integration_sha)
+        if earlier_promotion == promotion
+            || !repo.is_ancestor(&earlier_promotion, promotion)
             || repo.is_ancestor(&earlier_promotion, remote_base)
         {
             continue;
@@ -1783,10 +1792,12 @@ fn build_ship_only_publication(
             source_base,
             &entry.head_commit,
         );
+        // NUL-separated, like `selected_paths`: `diff-tree --name-status`
+        // quotes unusual paths, which would then never compare equal.
+        let earlier_parent = repo.first_parent(&earlier_promotion)?;
         let path_overlap = repo
-            .commit_changed_paths(&earlier_promotion)?
+            .gate_scope_changed_between(&earlier_parent, &earlier_promotion)?
             .iter()
-            .map(|(_, path)| path)
             .any(|earlier_path| {
                 selected_paths
                     .iter()
@@ -1858,12 +1869,12 @@ fn build_ship_only_publication(
         });
     }
 
-    let message = format!(
-        "chore(broker): ship independent queue entry q{}\n\nAethyme-Queue-Entry: q{}",
-        entry.id, entry.id
-    );
+    // Carry the promotion commit's message and identities: it holds the
+    // agent's Co-Authored-By credit and the `Contract decision:` line the
+    // contract gate reads, which a prefix ship would have published.
+    let message = independent_publication_message(&repo.commit_message(promotion)?, entry.id);
+    let attribution = promotion_attribution(repo, promotion)?;
     let timestamp = format!("@{} +0000", entry.created_at.div_euclid(1_000));
-    let attribution = crate::attribution::Attribution::broker_only();
     let mut command = crate::git::git_command();
     let output = command
         .arg("commit-tree")
@@ -1893,6 +1904,49 @@ fn build_ship_only_publication(
     let publication_sha = String::from_utf8_lossy(&output.stdout).trim().to_string();
     let changed_files = repo.gate_scope_changed_between(remote_base, &publication_sha)?;
     Ok((publication_sha, changed_files))
+}
+
+/// The promotion message with an `Aethyme-Queue-Entry` trailer appended to its
+/// final paragraph, so existing trailers stay in the trailer block.
+fn independent_publication_message(promotion_message: &str, entry_id: i64) -> String {
+    let body = promotion_message.trim_end();
+    let last_paragraph = body.rsplit_once("\n\n").map_or(body, |(_, last)| last);
+    // Promotion messages end in `Key: value` lines (`Co-Authored-By`,
+    // `Contract decision`); a subject-only message has no trailer block.
+    let is_trailer_block = body.contains("\n\n")
+        && last_paragraph.lines().all(|line| {
+            line.split_once(": ")
+                .is_some_and(|(key, _)| !key.is_empty())
+        });
+    let separator = if is_trailer_block { "\n" } else { "\n\n" };
+    format!("{body}{separator}Aethyme-Queue-Entry: q{entry_id}")
+}
+
+fn promotion_attribution(
+    repo: &GitRepo,
+    promotion: &str,
+) -> Result<crate::attribution::Attribution, BrokerOpError> {
+    let fields = crate::git::git_command()
+        .args(["show", "-s", "--format=%an%x00%ae%x00%cn%x00%ce", promotion])
+        .current_dir(repo.root())
+        .output()
+        .map_err(|error| BrokerOpError::ShipPlanUnavailable {
+            what: "independent publication commit",
+            reason: format!("cannot read the promotion identities: {error}"),
+        })?;
+    let text = String::from_utf8_lossy(&fields.stdout);
+    let parts = text.trim_end_matches('\n').split('\0').collect::<Vec<_>>();
+    if !fields.status.success() || parts.len() != 4 {
+        return Err(BrokerOpError::ShipPlanUnavailable {
+            what: "independent publication commit",
+            reason: format!("cannot read the identities of promotion {promotion}"),
+        });
+    }
+    Ok(crate::attribution::Attribution {
+        author: crate::attribution::Identity::new(parts[0], parts[1]),
+        committer: crate::attribution::Identity::new(parts[2], parts[3]),
+        coauthors: Vec::new(),
+    })
 }
 
 fn parse_ship_dependencies(

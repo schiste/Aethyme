@@ -1242,6 +1242,125 @@ fn ship_plan_only_refuses_an_earlier_unshipped_path_overlap() {
 }
 
 #[test]
+fn ship_plan_only_refuses_an_overlap_promoted_ahead_with_a_higher_queue_id() {
+    // Manual promotion lets a later-submitted (higher id) entry land in
+    // integration ahead of an earlier-submitted one. "Earlier unshipped" must
+    // follow integration order, or the overlap goes unchecked.
+    let fixture = Fixture::new();
+    fixture.commit_fixture_file(
+        "shared.txt",
+        "first\nmiddle\nlast\n",
+        "test: seed overlap file",
+    );
+    std::fs::create_dir_all(fixture.repo.join(".aethyme")).unwrap();
+    std::fs::write(
+        fixture.repo.join(".aethyme/config.toml"),
+        "[promote]\nmode = \"manual\"\n",
+    )
+    .unwrap();
+    let mut broker = fixture.broker();
+    let low = broker.start_worktree("ship-only-low", None).unwrap();
+    let high = broker.start_worktree("ship-only-high", None).unwrap();
+    for (session, contents) in [
+        (&low, "FIRST\nmiddle\nlast\n"),
+        (&high, "first\nmiddle\nLAST\n"),
+    ] {
+        let worktree = PathBuf::from(&session.worktree_path);
+        std::fs::write(worktree.join("shared.txt"), contents).unwrap();
+        git(&worktree, &["add", "shared.txt"]);
+        git(&worktree, &["commit", "-qm", "feat: edit shared file"]);
+    }
+    let low_entry = broker.submit(low.id).unwrap().entry.id;
+    let high_entry = broker.submit(high.id).unwrap().entry.id;
+    assert!(low_entry < high_entry);
+    broker.promote(high_entry).unwrap();
+    broker.promote(low_entry).unwrap();
+
+    let error = broker
+        .ship_plan_only_with_delivery(low_entry, None)
+        .unwrap_err();
+
+    assert!(
+        error.to_string().contains(&format!("entry {high_entry}"))
+            && error.to_string().contains("overlapping paths"),
+        "{error}"
+    );
+}
+
+#[test]
+fn ship_plan_only_excludes_entries_already_on_the_remote() {
+    let fixture = Fixture::new();
+    let (shipped, _, integration) = fixture.promoted_entry();
+    fixture
+        .broker()
+        .ship_execute(shipped, &integration)
+        .unwrap();
+    let (first, selected, _) = fixture.promoted_siblings(
+        "first.txt",
+        "first\n",
+        "second.txt",
+        "second\n",
+        "feat: second independent entry",
+    );
+    let mut broker = fixture.broker();
+
+    let plan = broker.ship_plan_only_with_delivery(selected, None).unwrap();
+
+    assert_eq!(
+        plan.excluded_entries
+            .iter()
+            .map(|entry| entry.queue_entry_id)
+            .collect::<Vec<_>>(),
+        vec![first],
+        "an entry already on the remote is not left behind by this ship"
+    );
+}
+
+#[test]
+fn ship_plan_only_publishes_the_promotion_message_and_identities() {
+    let fixture = Fixture::new();
+    let (_, selected, _) = fixture.promoted_siblings(
+        "first.txt",
+        "first\n",
+        "second.txt",
+        "second\n",
+        "feat: second independent entry\n\nContract decision: none",
+    );
+    let mut broker = fixture.broker();
+
+    let plan = broker.ship_plan_only_with_delivery(selected, None).unwrap();
+
+    let promotion = &plan.included_entries[0].promotion_sha;
+    let format = "--format=%an <%ae>%n%cn <%ce>";
+    assert_eq!(
+        git_output(
+            &fixture.repo,
+            &["show", "-s", format, &plan.publication_sha]
+        ),
+        git_output(&fixture.repo, &["show", "-s", format, promotion]),
+    );
+    let promotion_message = git_output(&fixture.repo, &["show", "-s", "--format=%B", promotion]);
+    let published_message = git_output(
+        &fixture.repo,
+        &["show", "-s", "--format=%B", &plan.publication_sha],
+    );
+    assert!(
+        promotion_message.contains("Contract decision: none"),
+        "{promotion_message}"
+    );
+    assert!(
+        published_message.starts_with(promotion_message.trim_end()),
+        "{published_message}"
+    );
+    let (_, trailers) = published_message.rsplit_once("\n\n").unwrap();
+    assert!(
+        trailers.contains("Contract decision: none")
+            && trailers.ends_with(&format!("Aethyme-Queue-Entry: q{selected}")),
+        "{published_message}"
+    );
+}
+
+#[test]
 fn ship_plan_only_allows_an_entry_based_on_an_earlier_independent_promotion() {
     let fixture = Fixture::new();
     let (first, selected, _) = fixture.promoted_siblings(
