@@ -765,23 +765,25 @@ fn a_stale_lease_names_submit_not_finish_while_its_session_holds_undelivered_wor
     let id = fixture.session_id;
     let mut broker = fixture.broker();
     broker.claim_lease(id, "src/", None).unwrap();
+    broker.claim_lease(id, "docs/", None).unwrap();
     broker
         .store()
         .set_session_status(id, SessionStatus::Stale, None)
         .unwrap();
     drop(broker);
-    let lease_id = {
+    let lease_id_for = |path: &str| {
         let mut broker = fixture.broker();
         broker
             .store()
             .active_leases()
             .unwrap()
             .into_iter()
-            .find(|lease| lease.session_id == id && lease.path == "src/")
+            .find(|lease| lease.session_id == id && lease.path == path)
             .expect("the explicit lease is active")
             .id
     };
-    let blocker_id = format!("lease:{lease_id}");
+    let blocker_id = format!("lease:{}", lease_id_for("src/"));
+    let sibling_id = format!("lease:{}", lease_id_for("docs/"));
     let finish = format!("aethyme broker finish --session {id}");
 
     // Nothing to deliver: `finish` closes the session and releases the lease.
@@ -808,6 +810,11 @@ fn a_stale_lease_names_submit_not_finish_while_its_session_holds_undelivered_wor
         cause.contains("1 committed change not yet delivered") && cause.contains(&finish),
         "the cause says why finish is not the remedy: {cause}"
     );
+    // The remedy is derived once per session; every lease it holds names it.
+    let sibling = fixture
+        .blocker(&sibling_id)
+        .expect("the sibling lease is a blocker");
+    assert_eq!(sibling["clear"], submit.as_str(), "{sibling:#}");
 
     let output = fixture.run(&["unblock", &blocker_id, "--json"]);
     let refusal: serde_json::Value = serde_json::from_slice(&output.stdout)
