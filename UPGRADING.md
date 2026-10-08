@@ -16,7 +16,7 @@ version and the target, oldest first. Each schema migration runs on first open
 and is one-way, so rollback is limited to the oldest binary that still reads
 the newest schema you have opened.
 
-Breaking releases: [v0.8.25](#v0825), [v0.8.23](#v0823), [v0.8.8](#v088), [v0.8.2](#v082), [v0.8.1](#v081), [v0.8.0](#v080),
+Breaking releases: [v0.8.26](#v0826), [v0.8.25](#v0825), [v0.8.23](#v0823), [v0.8.8](#v088), [v0.8.2](#v082), [v0.8.1](#v081), [v0.8.0](#v080),
 [v0.7.25](#v0725), [v0.7.23](#v0723), [v0.7.22](#v0722), [v0.7.19](#v0719),
 [v0.7.18](#v0718), [v0.7.16](#v0716), [v0.7.9](#v079), [v0.7.8](#v078),
 [v0.7.4](#v074), [v0.7.2](#v072),
@@ -72,6 +72,32 @@ sections below keep the Compatibility, Before upgrading, Migrate and verify,
 and Rollback parts of the breaking ones. The full per-release guides, including
 the non-breaking ones, remain in Git history under
 `packages/aethyme/docs/guides/`.
+
+## v0.8.26
+
+v0.8.26 makes `broker submit` refuse a session whose checkout has drifted from its recorded branch, and rewords the `finish` timeout message. Scripts that submitted from a drifted checkout, or matched the old timeout text, must adapt.
+
+### Compatibility
+
+**No schema migration.** The broker database stays at schema 49, and v0.8.25 still opens it. Changed behaviour:
+
+- **`submit` refuses a drifted checkout.** When a session's worktree is no longer on its recorded branch (a different branch checked out, or a detached HEAD such as a stuck rebase leaves), `submit` refuses before queueing and again after planning; no queue entry is left. A session adopted on a detached checkout records `HEAD` and is unaffected. `status --refresh` reports the session with the blocked advice id `session.checkout-drift`.
+- **`finish` timeout wording.** The message now starts `finish timed out after <n>s waiting on Git (` instead of `… while checking Git`, and says whether the session is still open (retry with `--timeout`) or already closed (do not retry).
+- **Additive:** `status --json` and `status --summary --json` may carry a `waiters[]` array; it is omitted when nothing waits.
+
+### Migrate and verify
+
+Before upgrading, finish or repair sessions whose checkout has drifted: switch the worktree back to its recorded branch, or complete or abort the rebase in progress. Then `submit` again. Readers of `advice[].id` must tolerate `session.checkout-drift`, and anything matching the `finish` timeout text must match the new wording. Then install the router and engine pair together, and verify:
+
+```bash
+aethyme --version && aethyme-engine-cli --version
+aethyme broker status --refresh --json
+aethyme broker advanced quick-test
+```
+
+### Rollback
+
+Reinstall the v0.8.25 router and engine pair together. It reads the same schema-49 database, accepts drifted checkouts at `submit` again, and restores the old `finish` timeout wording.
 
 ## v0.8.25
 

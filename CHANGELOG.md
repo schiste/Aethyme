@@ -4,6 +4,28 @@ All notable user-visible changes to Aethyme are documented here. Release
 artifacts and their exact source revision are recorded in each signed
 `release-manifest.json`.
 
+## [0.8.26] - 2026-10-08
+
+**Breaking:** see [UPGRADING.md](UPGRADING.md#v0826).
+
+`submit` now refuses a session whose checkout has drifted from its recorded branch. Lock and lease waits can be seen from other terminals, `unblock` suggests the step that actually clears a lease, and the broker-open cleanup sweep stays within its deadline. A dependency security advisory is fixed. The broker database stays at schema 49.
+
+### Changed
+
+- **Breaking:** `broker submit` refuses a session whose checkout no longer matches its recorded branch, for example a detached HEAD left by a stuck rebase or a different branch checked out. It checks again after planning, and a refusal leaves no queue entry. Sessions adopted on a detached checkout are unaffected. `status --refresh` reports such a session with the blocked advice `session.checkout-drift`, and keeps counting its dirty files (#645, issue #640).
+- **Breaking:** a `finish` timeout now reads `finish timed out after <n>s waiting on Git (…)`, not `… while checking Git`. It reads the session back and either gives the retry command (`finish --timeout <2x>`) or says the session is already closed and must not be retried (#641, issue #494).
+- `status --json` and `status --summary --json` gain an optional `waiters[]` array listing current waits on the coordinated write lock, gate owner locks and `leases wait`: `pid`, `session_id`, `kind`, `resource`, `holder`, `waited_ms` and `alive`. The human view adds a `Waiting on locks and leases:` section. The next waiter prunes the records of dead waiters (#641, issue #494).
+- `broker unblock` names the command that actually clears a stale session's lease: `git status` for uncommitted changes, `submit` (or `representation scan`) for undelivered commits, `push` for commits on no remote, and `finish` only when nothing is pending. The `status` listing derives that advice once per session, within 2 s (#646, issue #637).
+- The internal pilot materials describe internal dogfooding, with a dated snapshot and a follow-up report on conflict recovery and the install, update, rollback and uninstall lifecycle (#639, #647, issue #126).
+
+### Fixed
+
+- Auto-cleanup removal in the sweep run on every broker open now honours the selection deadline. The first selected checkout is still removed, the rest are deferred to a later pass, and every safety check is re-read under the lock (#642, issue #460).
+
+### Security
+
+- `noyalib` moves from 0.0.24 to 0.0.53, fixing RUSTSEC-2026-0333 (parser resource budgets not enforced on typed deserialization). The broker uses the default budgets, so its behaviour is unchanged (#644).
+
 ## [0.8.25] - 2026-10-08
 
 **Breaking:** see [UPGRADING.md](UPGRADING.md#v0825).
