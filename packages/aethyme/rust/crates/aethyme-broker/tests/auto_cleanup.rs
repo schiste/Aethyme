@@ -82,7 +82,9 @@ fn fixture() -> Fixture {
 fn merged_closed_session(fx: &Fixture, broker: &mut Broker, close: bool) -> (i64, PathBuf, String) {
     let session = broker.start_worktree("merged work", None).unwrap();
     let worktree = PathBuf::from(&session.worktree_path);
-    let head = commit(&worktree, "feature.txt", "work\n", "feature");
+    // Content unique to the session, so a second one still has a change.
+    let content = format!("work {}\n", session.id);
+    let head = commit(&worktree, "feature.txt", &content, "feature");
     // The forge merges the branch with a merge commit.
     git(
         &worktree,
@@ -429,6 +431,46 @@ fn a_change_between_selection_and_removal_keeps_the_checkout() {
     assert!(report.removed.is_empty(), "{report:#?}");
     assert!(kept_reason(&report, &worktree).contains("changed before removal"));
     assert!(worktree.exists());
+}
+
+#[test]
+fn a_head_moved_after_selection_is_proved_again_not_reused() {
+    let fx = fixture();
+    let mut broker = Broker::open(&fx.repo).unwrap();
+    let (_, worktree, _) = merged_closed_session(&fx, &mut broker, true);
+    let plan = broker.auto_cleanup_plan_now(None).unwrap().unwrap();
+    assert_eq!(plan.selected_worktrees().len(), 1);
+    // A commit no remote has: the selection's proof names the old HEAD and
+    // must not vouch for this one.
+    commit(&worktree, "late.txt", "committed after selection\n", "late");
+    let report = broker.auto_cleanup_apply_now(plan).unwrap().unwrap();
+    assert!(report.removed.is_empty(), "{report:#?}");
+    assert!(kept_reason(&report, &worktree).contains("changed before removal"));
+    assert!(worktree.exists());
+}
+
+#[test]
+fn removal_past_the_selection_deadline_defers_all_but_the_first() {
+    let fx = fixture();
+    let mut broker = Broker::open(&fx.repo).unwrap();
+    let (_, first, _) = merged_closed_session(&fx, &mut broker, true);
+    let (_, second, _) = merged_closed_session(&fx, &mut broker, true);
+    // Selection by ancestry is quick; the deadline then passes before
+    // removal, as it does when a broker open spent its budget selecting.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let plan = broker
+        .auto_cleanup_plan_now(Some(deadline))
+        .unwrap()
+        .unwrap();
+    assert_eq!(plan.selected_worktrees().len(), 2, "selection outran 2 s");
+    std::thread::sleep(deadline.saturating_duration_since(std::time::Instant::now()));
+    let report = broker.auto_cleanup_apply_now(plan).unwrap().unwrap();
+    assert_eq!(report.removed.len(), 1, "{report:#?}");
+    assert_eq!(report.deferred, 1, "{report:#?}");
+    assert_ne!(first.exists(), second.exists());
+    // Unbounded, the next pass removes the one left.
+    assert_eq!(run(&mut broker).removed.len(), 1);
+    assert!(!first.exists() && !second.exists());
 }
 
 #[test]
