@@ -29,6 +29,7 @@ use crate::filesystem::{FilesystemIndexerError, IndexedFile, WalkOptions, walk_s
 use crate::language::{LanguageIndexError, LanguageIndexResult, LanguageRegistry};
 use crate::php::PhpIndexer;
 use crate::python::PythonIndexer;
+use crate::relationships;
 use crate::rust_lang::RustIndexer;
 use crate::surface_flow;
 use crate::typescript::TypeScriptIndexer;
@@ -186,33 +187,40 @@ pub fn index_repo_to_disk_with(
     // Build every fragment in memory first so parsing/indexing and serialization
     // have distinct wall-clock boundaries instead of an ambiguous combined time.
     let per_file: Vec<(
-        BTreeMap<NodeKind, usize>,
         BuiltFragment,
         u64,
         FileCoverageObservation,
+        Option<relationships::PendingNonCode>,
     )> = walk
         .files
         .par_iter()
         .map(
             |indexed| -> Result<
                 (
-                    BTreeMap<NodeKind, usize>,
                     BuiltFragment,
                     u64,
                     FileCoverageObservation,
+                    Option<relationships::PendingNonCode>,
                 ),
                 IndexRepoError,
             > {
                 let language_indexer = registry.get(&indexed.language);
-                let needs_content =
-                    language_indexer.is_some() || surface_flow::should_scan(indexed);
+                // The walker already skipped files above the size limit, so
+                // every file reaching here is bounded.
+                let needs_parse = language_indexer.is_some() || surface_flow::should_scan(indexed);
+                let needs_content = needs_parse || relationships::should_read(indexed);
                 let mut read_error = None;
                 let content = if needs_content {
                     let abs = ctx.repo_root().join(&*indexed.source_path);
                     match std::fs::read_to_string(&abs) {
                         Ok(content) => Some(content),
+                        // A document read only for its links (say, a
+                        // non-UTF-8 Markdown file) is simply left unlinked;
+                        // it is not a coverage failure.
                         Err(error) => {
-                            read_error = Some(error.to_string());
+                            if needs_parse {
+                                read_error = Some(error.to_string());
+                            }
                             None
                         }
                     }
@@ -281,11 +289,10 @@ pub fn index_repo_to_disk_with(
 
                 let built = build_fragment(indexed, lang_output).map_err(IndexRepoError::Build)?;
 
-                let mut counts: BTreeMap<NodeKind, usize> = BTreeMap::new();
-                for node in built.fragment.nodes() {
-                    *counts.entry(node.kind()).or_default() += 1;
-                }
                 let source_bytes = content.as_ref().map_or(0, |content| content.len() as u64);
+                let pending_relationships = content.as_deref().and_then(|content| {
+                    relationships::index_non_code(ctx.repo_name(), indexed, content)
+                });
                 let observation = observe_file(
                     indexed,
                     &built,
@@ -294,25 +301,34 @@ pub fn index_repo_to_disk_with(
                     status,
                     exclusion_reason,
                 );
-                Ok((counts, built, source_bytes, observation))
+                Ok((built, source_bytes, observation, pending_relationships))
             },
         )
         .collect::<Result<Vec<_>, _>>()?;
+    let mut built_fragments: Vec<BuiltFragment> = Vec::with_capacity(per_file.len());
+    let mut observations = Vec::with_capacity(per_file.len());
+    let mut pending_relationships = Vec::new();
+    let mut source_bytes_read = 0_u64;
+    for (built, source_bytes, observation, pending) in per_file {
+        source_bytes_read += source_bytes;
+        built_fragments.push(built);
+        observations.push(observation);
+        if let Some(pending) = pending {
+            pending_relationships.push(pending);
+        }
+    }
+
+    relationships::apply(&mut built_fragments, pending_relationships)
+        .map_err(|error| IndexRepoError::Build(BuildFragmentError::Fragment(error)))?;
     let source_indexing_elapsed_us = indexing_started.elapsed().as_micros();
 
     let mut counts_by_kind: BTreeMap<NodeKind, usize> = BTreeMap::new();
-    let mut built_fragments: Vec<BuiltFragment> = Vec::with_capacity(per_file.len());
-    let mut observations = Vec::with_capacity(per_file.len());
-    let mut source_bytes_read = 0_u64;
     let mut total_edges = 0_usize;
-    for (counts, built, source_bytes, observation) in per_file {
-        for (kind, count) in counts {
-            *counts_by_kind.entry(kind).or_default() += count;
+    for built in &built_fragments {
+        for node in built.fragment.nodes() {
+            *counts_by_kind.entry(node.kind()).or_default() += 1;
         }
-        source_bytes_read += source_bytes;
         total_edges += built.fragment.edge_count();
-        built_fragments.push(built);
-        observations.push(observation);
     }
 
     // Captured before this pass rewrites `units.ndjson`, so pruning can tell

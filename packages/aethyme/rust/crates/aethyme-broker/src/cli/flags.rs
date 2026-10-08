@@ -437,6 +437,7 @@ pub(super) const FLAG_RULES: &[(&str, &[&str])] = &[
             "--abandon",
             "--reason",
             "--take-over",
+            "--timeout",
         ],
     ),
     (

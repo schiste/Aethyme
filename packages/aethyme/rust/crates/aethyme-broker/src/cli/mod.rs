@@ -130,14 +130,16 @@ Usage:
       refuses while the session holds commits no remote has, unless
       --abandon --reason records that they are being left behind. Prefer
       finish for normal lifecycle use.
-  aethyme broker finish --session <id> [--keep-worktree] [--abandon --reason <why>] [--json]
+  aethyme broker finish --session <id> [--timeout <1..86400 seconds>] [--keep-worktree] [--abandon --reason <why>] [--json]
       Higher-level lifecycle close: closes only when the session has no
       dirty WIP and no committed work waiting for submit/promotion. Where
       the repository sets [delivery] push_session_branches, also refuses
       while HEAD has commits no remote holds; --abandon --reason closes
       anyway and records a broker.session.abandoned_unpushed event. If it
       is not safe, prints the next command; suggests cleanup only when
-      cleanup would pass without --force. Successful closure atomically
+      cleanup would pass without --force. Git checks share a 10-second
+      deadline by default; --timeout changes it, and an expiry names the
+      timed-out check with safe status/handoff guidance. Successful closure atomically
       persists a redacted session.finished handoff with delivery, pending
       work, leases, last-gate provenance, and the recommended next action.
   aethyme broker handoff (--session <id> | --worktree <path>) [--json]
@@ -1332,7 +1334,7 @@ struct Parsed {
     generation: Option<i64>,
     events: Option<String>,
     ttl_seconds: Option<i64>,
-    /// `leases wait --timeout`: seconds to wait for a held path.
+    /// `leases wait --timeout` and `finish --timeout` budgets, in seconds.
     timeout_seconds: Option<u64>,
     wait: Option<String>,
     since: Option<i64>,
