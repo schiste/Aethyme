@@ -346,5 +346,5 @@ fn operation_history_lists_filters_and_pages_with_a_bare_alias() {
         .cwd(tmp.path())
         .run();
     missing_show_id.expect_code(1);
-    missing_show_id.assert_contains("operations show <id> [--json]");
+    missing_show_id.assert_contains("operations show <id|host-operation-id> [--json]");
 }

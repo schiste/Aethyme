@@ -194,7 +194,7 @@ pub(super) fn operation_history_query(
 
 pub(super) fn operations_reconcile_error(detail: impl std::fmt::Display) -> UsageError {
     UsageError::Message(format!(
-        "{detail}\noperations reconcile requires every field: --operation <id>, --outcome <succeeded|failed>, and --reason <text>.\n{OPERATIONS_RECONCILE_USAGE}"
+        "{detail}\noperations reconcile requires every field: --operation <id|host-operation-id>, --outcome <succeeded|failed>, and --reason <text>.\n{OPERATIONS_RECONCILE_USAGE}"
     ))
 }
 
@@ -736,6 +736,7 @@ pub(super) fn run_git_gh(parsed: Parsed, subcommand: &str) -> Result<(), UsageEr
                 Some(missing) => format!("{reason}\n  run instead: {}", echo.corrected(&missing)),
                 None => reason,
             };
+            let reason = crate::session_push::with_pre_push_path_hint(&reason);
             return Err(crate::BrokerOpError::InvalidCoordinatedOperation { reason }.into());
         }
         Err(error) => return Err(error.into()),
@@ -830,10 +831,58 @@ fn coordinated_failure_message(
         message.push_str(": ");
         message.push_str(&tail.join(" | "));
     }
+    if let Some(hint) =
+        crate::session_push::missing_executable_path_hint(&report.stdout, &report.stderr)
+    {
+        message.push('\n');
+        message.push_str(hint);
+    }
     message
 }
 
-/// `broker operations`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum OperationIdentifier {
+    Coordinated(i64),
+    Host(String),
+}
+
+fn parse_operation_identifier(value: &str) -> Result<OperationIdentifier, String> {
+    let host_id = value.strip_prefix("hostop:").unwrap_or(value);
+    if host_id.len() == 32 && host_id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Ok(OperationIdentifier::Host(host_id.to_ascii_lowercase()));
+    }
+    if value.starts_with("hostop:") {
+        return Err("host operation id must contain exactly 32 hexadecimal characters".into());
+    }
+    if value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return value
+            .parse::<i64>()
+            .ok()
+            .filter(|id| *id > 0)
+            .map(OperationIdentifier::Coordinated)
+            .ok_or_else(|| "operation id must be a positive integer".into());
+    }
+    Err(
+        "operation id must be a positive integer or a 32-character hexadecimal host operation id"
+            .into(),
+    )
+}
+
+fn render_host_operation_show(operation: &crate::HostOperation) {
+    out!("Host operation: {}", operation.operation_id);
+    out!("Provider:       {}", operation.provider.as_str());
+    out!("Remote:         {}", operation.remote_key);
+    out!("Effect:         {}", operation.effect.as_str());
+    out!("Status:         {}", operation.status.as_str());
+    out!("Holder PID:     {}", operation.holder_pid);
+    out!("Created at:     {}", operation.created_at);
+    out!("Updated at:     {}", operation.updated_at);
+    if let Some(finished_at) = operation.finished_at {
+        out!("Finished at:    {finished_at}");
+    }
+}
+
+/// Broker operations.
 pub(super) fn run_operations(parsed: Parsed) -> Result<(), UsageError> {
     let mut broker = open_broker(parsed.read_only_snapshot)?;
     match parsed.positional.first().map(String::as_str) {
@@ -888,21 +937,42 @@ pub(super) fn run_operations(parsed: Parsed) -> Result<(), UsageError> {
             if parsed.positional.len() != 2 {
                 return Err(UsageError::Message(OPERATIONS_SHOW_USAGE.into()));
             }
-            let operation_id = parsed.positional[1].parse::<i64>().map_err(|_| {
-                UsageError::Message(format!(
-                    "operation id must be a positive integer; {OPERATIONS_SHOW_USAGE}"
-                ))
-            })?;
-            if operation_id <= 0 {
-                return Err(UsageError::Message(format!(
-                    "operation id must be a positive integer; {OPERATIONS_SHOW_USAGE}"
-                )));
-            }
-            let report = broker.show_coordinated_operation(operation_id)?;
-            if parsed.json {
-                out!("{}", serde_json::to_string_pretty(&report)?);
-            } else {
-                render_operation_show(&report);
+            let identifier =
+                parse_operation_identifier(&parsed.positional[1]).map_err(|error| {
+                    UsageError::Message(format!("{error}; {OPERATIONS_SHOW_USAGE}"))
+                })?;
+            let coordinated_id = match &identifier {
+                OperationIdentifier::Coordinated(id) => Some(*id),
+                OperationIdentifier::Host(host_id) => broker
+                    .store()
+                    .coordinated_operation_id_for_host_operation(host_id)?,
+            };
+            if let Some(operation_id) = coordinated_id {
+                let report = broker.show_coordinated_operation(operation_id)?;
+                if parsed.json {
+                    out!("{}", serde_json::to_string_pretty(&report)?);
+                } else {
+                    render_operation_show(&report);
+                }
+            } else if let OperationIdentifier::Host(host_id) = identifier {
+                let database = broker
+                    .host_operation_database_path()
+                    .map_err(|error| UsageError::Message(error.to_string()))?;
+                let operation = crate::host_operation(&database, &host_id)
+                    .map_err(|error| UsageError::Message(error.to_string()))?
+                    .ok_or_else(|| {
+                        UsageError::Message(format!("host operation {host_id} was not found"))
+                    })?;
+                if parsed.json {
+                    out!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "host_operation": operation
+                        }))?
+                    );
+                } else {
+                    render_host_operation_show(&operation);
+                }
             }
         }
         Some("stats") => {
@@ -932,7 +1002,10 @@ pub(super) fn run_operations(parsed: Parsed) -> Result<(), UsageError> {
                     "incomplete operation reconciliation request",
                 ));
             }
-            let operation = parsed.operation.expect("validated operation id");
+            let identifier = parse_operation_identifier(
+                parsed.operation.as_deref().expect("validated operation id"),
+            )
+            .map_err(operations_reconcile_error)?;
             let outcome = parsed.outcome.as_deref().expect("validated outcome");
             let succeeded = match outcome {
                 "succeeded" => true,
@@ -944,8 +1017,43 @@ pub(super) fn run_operations(parsed: Parsed) -> Result<(), UsageError> {
                 }
             };
             let reason = parsed.reason.as_deref().expect("validated reason");
+            let operation_id = match identifier {
+                OperationIdentifier::Coordinated(id) => Some(id),
+                OperationIdentifier::Host(host_id) => {
+                    if let Some(id) = broker
+                        .store()
+                        .coordinated_operation_id_for_host_operation(&host_id)?
+                    {
+                        Some(id)
+                    } else {
+                        let outcome = broker.unblock(&crate::UnblockRequest {
+                            id: format!("hostop:{host_id}"),
+                            outcome: Some(succeeded),
+                            reason: Some(reason.to_string()),
+                            confirm: None,
+                        })?;
+                        match outcome {
+                            crate::UnblockOutcome::Cleared(report) => {
+                                if parsed.json {
+                                    out!("{}", serde_json::to_string_pretty(&report)?);
+                                } else {
+                                    out!("host operation {host_id} reconciled: {}", report.action);
+                                }
+                                return Ok(());
+                            }
+                            crate::UnblockOutcome::Refused(refusal) => {
+                                return Err(operations_reconcile_error(refusal.reason));
+                            }
+                        }
+                    }
+                }
+            };
             let report = broker
-                .reconcile_coordinated_operation(operation, succeeded, reason)
+                .reconcile_coordinated_operation(
+                    operation_id.expect("coordinated operation id resolved"),
+                    succeeded,
+                    reason,
+                )
                 .map_err(operations_reconcile_error)?;
             if parsed.json {
                 out!("{}", serde_json::to_string_pretty(&report)?);

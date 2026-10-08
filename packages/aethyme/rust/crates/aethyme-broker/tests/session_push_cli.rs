@@ -69,6 +69,11 @@ fn git(cwd: &Path, args: &[&str]) {
     git_output(cwd, args);
 }
 
+fn write_executable(path: &Path, contents: &str) {
+    std::fs::write(path, contents).unwrap();
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
 struct Fixture {
     tmp: tempfile::TempDir,
     repo: PathBuf,
@@ -163,6 +168,59 @@ impl Fixture {
         (session.id, worktree)
     }
 
+    fn install_relative_pre_push_hook(&self, checkout: &Path, contents: &str) {
+        let hooks = checkout.join("hooks");
+        std::fs::create_dir_all(&hooks).unwrap();
+        write_executable(&hooks.join("pre-push"), contents);
+    }
+
+    fn select_relative_hooks_path(&self) {
+        git(&self.repo, &["config", "core.hooksPath", "hooks"]);
+    }
+
+    fn enable_hooks_outside_lock(&self) {
+        let config = self.repo.join(".aethyme/config.toml");
+        let existing = std::fs::read_to_string(&config).unwrap();
+        assert!(!existing.contains("[coordination]"));
+        std::fs::write(
+            &config,
+            format!(
+                "{}\n[coordination]\nhooks_outside_lock = true\n",
+                existing.trim_end()
+            ),
+        )
+        .unwrap();
+        git(&self.repo, &["add", ".aethyme/config.toml"]);
+        git(
+            &self.repo,
+            &["commit", "-qm", "enable outside-lock hook check"],
+        );
+        self.git_env(&["push", "-q", "origin", "main"]);
+    }
+
+    fn advanced_push(&self, session: i64, worktree: &Path) -> Output {
+        let session_id = session.to_string();
+        let branch = self.broker().store().session(session).unwrap().branch;
+        let head = git_output(worktree, &["rev-parse", "HEAD"]);
+        let refspec = format!("{head}:refs/heads/{branch}");
+        self.run(&[
+            "advanced",
+            "git",
+            "--session",
+            &session_id,
+            "--repo",
+            "acme/project",
+            "--effect",
+            "write",
+            "--reason",
+            "verify pre-push hook behavior",
+            "--",
+            "push",
+            "origin",
+            &refspec,
+        ])
+    }
+
     fn commit(&self, worktree: &Path, file: &str, body: &str, message: &str) {
         std::fs::write(worktree.join(file), body).unwrap();
         git(worktree, &["add", file]);
@@ -183,6 +241,7 @@ impl Fixture {
             )
             .env("AETHYME_HOST_STATE_DIR", self.tmp.path().join("host-state"))
             .env("AETHYME_TEST_GIT_REMOTE", &self.remote)
+            .env("AETHYME_TEST_HOOK_LOG", self.tmp.path().join("hook-log"))
             .env("AETHYME_FAKE_GH_LOG", self.tmp.path().join("gh-log"))
             .env("AETHYME_FAKE_PR_STATE", self.tmp.path().join("pr-state"))
             .output()
@@ -545,4 +604,136 @@ fn push_state_counts_commits_no_remote_holds() {
         after.head_oid,
         git_output(&worktree, &["rev-parse", "HEAD"])
     );
+}
+
+#[test]
+fn broker_and_advanced_git_push_use_session_hooks_and_caller_path() {
+    let fixture = Fixture::new();
+    fixture.authorize(true);
+    let (session, worktree) = fixture.session_with_commit();
+    write_executable(
+        &fixture.bin.join("hook-only-tool"),
+        "#!/bin/sh\nprintf 'session hook ran\\n' >> \"$AETHYME_TEST_HOOK_LOG\"\n",
+    );
+    fixture.install_relative_pre_push_hook(
+        &fixture.repo,
+        "#!/bin/sh\nprintf 'main checkout hook selected\\n' >&2\nexit 1\n",
+    );
+    fixture.install_relative_pre_push_hook(&worktree, "#!/bin/sh\nhook-only-tool\n");
+    fixture.select_relative_hooks_path();
+
+    let broker_push = fixture.push(session, &[]);
+    assert!(
+        broker_push.status.success(),
+        "broker push should use the session checkout and caller PATH: {}",
+        stderr(&broker_push)
+    );
+    let hook_log = fixture.tmp.path().join("hook-log");
+    let log = std::fs::read_to_string(&hook_log).unwrap();
+    assert_eq!(log.lines().collect::<Vec<_>>(), ["session hook ran"]);
+
+    fixture.commit(&worktree, "second.txt", "two\n", "feat: second step");
+    let advanced = fixture.advanced_push(session, &worktree);
+    assert!(
+        advanced.status.success(),
+        "advanced git push should use the same session hook and caller PATH: stdout={}; stderr={}",
+        String::from_utf8_lossy(&advanced.stdout),
+        stderr(&advanced)
+    );
+    let log = std::fs::read_to_string(hook_log).unwrap();
+    assert_eq!(
+        log.lines().collect::<Vec<_>>(),
+        ["session hook ran", "session hook ran"]
+    );
+}
+
+#[test]
+fn both_push_paths_surface_hook_streams_and_missing_path_guidance() {
+    let fixture = Fixture::new();
+    fixture.authorize(true);
+    let (session, worktree) = fixture.session_with_commit();
+    fixture.install_relative_pre_push_hook(&fixture.repo, "#!/bin/sh\nexit 0\n");
+    fixture.install_relative_pre_push_hook(
+        &worktree,
+        "#!/bin/sh\nprintf 'hook stdout: checks could not start\\n'\nprintf 'env: node: No such file or directory\\n' >&2\nexit 1\n",
+    );
+    fixture.select_relative_hooks_path();
+
+    let broker_push = fixture.push(session, &[]);
+    assert!(!broker_push.status.success());
+    let push_error = stderr(&broker_push);
+    assert!(
+        push_error.contains("hook stdout: checks could not start"),
+        "{push_error}"
+    );
+    assert!(
+        push_error.contains("env: node: No such file or directory"),
+        "{push_error}"
+    );
+    assert!(
+        push_error.contains("Hint: the pre-push hook could not find a required executable"),
+        "{push_error}"
+    );
+
+    let advanced = fixture.advanced_push(session, &worktree);
+    assert!(!advanced.status.success());
+    let advanced_output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&advanced.stdout),
+        stderr(&advanced)
+    );
+    assert!(
+        advanced_output.contains("hook stdout: checks could not start"),
+        "{advanced_output}"
+    );
+    assert!(
+        advanced_output.contains("env: node: No such file or directory"),
+        "{advanced_output}"
+    );
+    assert!(
+        advanced_output.contains("Hint: the pre-push hook could not find a required executable"),
+        "{advanced_output}"
+    );
+    let branch = fixture.broker().store().session(session).unwrap().branch;
+    assert_eq!(fixture.remote_branch(&branch), None);
+}
+
+#[test]
+fn opted_in_pre_push_refusals_show_hook_stderr_and_path_guidance_on_both_pushes() {
+    let fixture = Fixture::new();
+    fixture.authorize(true);
+    let (session, worktree) = fixture.session_with_commit();
+    fixture.install_relative_pre_push_hook(&fixture.repo, "#!/bin/sh\nexit 0\n");
+    fixture.install_relative_pre_push_hook(
+        &worktree,
+        "#!/bin/sh\nprintf 'env: node: No such file or directory\\n' >&2\nexit 1\n",
+    );
+    fixture.select_relative_hooks_path();
+    fixture.enable_hooks_outside_lock();
+
+    let broker_push = fixture.push(session, &[]);
+    assert!(!broker_push.status.success());
+    let push_error = stderr(&broker_push);
+    assert!(
+        push_error.contains("env: node: No such file or directory"),
+        "{push_error}"
+    );
+    assert!(
+        push_error.contains("Hint: the pre-push hook could not find a required executable"),
+        "{push_error}"
+    );
+
+    let advanced = fixture.advanced_push(session, &worktree);
+    assert!(!advanced.status.success());
+    let advanced_error = stderr(&advanced);
+    assert!(
+        advanced_error.contains("env: node: No such file or directory"),
+        "{advanced_error}"
+    );
+    assert!(
+        advanced_error.contains("Hint: the pre-push hook could not find a required executable"),
+        "{advanced_error}"
+    );
+    let branch = fixture.broker().store().session(session).unwrap().branch;
+    assert_eq!(fixture.remote_branch(&branch), None);
 }
