@@ -1051,6 +1051,9 @@ impl OperationShowReport {
     }
 }
 
+const OPERATION_LOCK_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const OPERATION_LOCK_PROGRESS_INTERVAL: Duration = Duration::from_secs(2);
+
 struct RepositoryWriteLock {
     file: File,
     acquired_at: Instant,
@@ -1063,9 +1066,31 @@ impl RepositoryWriteLock {
         main_root: &Path,
         repository: &str,
         operation_id: i64,
+        describe_holder: impl FnMut() -> Result<String, BrokerOpError>,
+        queue_wait: QueueWait,
+        report_progress: impl FnMut(&str, Duration),
+    ) -> Result<Self, BrokerOpError> {
+        Self::acquire_with_progress_interval(
+            main_root,
+            repository,
+            operation_id,
+            describe_holder,
+            queue_wait,
+            OPERATION_LOCK_PROGRESS_INTERVAL,
+            report_progress,
+        )
+    }
+
+    fn acquire_with_progress_interval(
+        main_root: &Path,
+        repository: &str,
+        operation_id: i64,
         mut describe_holder: impl FnMut() -> Result<String, BrokerOpError>,
         queue_wait: QueueWait,
+        progress_interval: Duration,
+        mut report_progress: impl FnMut(&str, Duration),
     ) -> Result<Self, BrokerOpError> {
+        debug_assert!(!progress_interval.is_zero());
         let dir = main_root.join(".aethyme/locks/operations");
         std::fs::create_dir_all(&dir).map_err(|source| BrokerOpError::OperationIo {
             path: dir.clone(),
@@ -1097,11 +1122,11 @@ impl RepositoryWriteLock {
                 queue_wait_ms: 0,
             });
         }
-        let would_block = std::io::Error::last_os_error().raw_os_error() == Some(libc::EWOULDBLOCK);
-        if !would_block {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::EWOULDBLOCK) {
             return Err(BrokerOpError::OperationIo {
                 path,
-                source: std::io::Error::last_os_error(),
+                source: error,
             });
         }
         if queue_wait == QueueWait::Refuse {
@@ -1113,54 +1138,58 @@ impl RepositoryWriteLock {
             });
         }
         // A coordinated operation that simply pauses is indistinguishable from one
-        // that died. Saying what holds the lock, and for how long, is what makes
-        // the difference visible to the caller (issue #138).
+        // that died. Showing the holder and periodic elapsed time keeps the wait
+        // visible while preserving the caller supplied bound.
         let holder = describe_holder()?;
-        eprintln!(
-            "[coordination] waiting for the {repository} write lock: {}",
-            holder
-        );
-        let waited = std::time::Instant::now();
-        match queue_wait {
+        eprintln!("[coordination] waiting for the {repository} write lock: {holder}");
+        let waited = Instant::now();
+        let deadline = match queue_wait {
             QueueWait::Refuse => unreachable!("refused above"),
-            QueueWait::Forever => {
-                // SAFETY: as above — `file` is a live, owned `File`, and `flock`
-                // takes the descriptor by value without dereferencing it.
-                let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
-                if rc != 0 {
-                    return Err(BrokerOpError::OperationIo {
-                        path,
-                        source: std::io::Error::last_os_error(),
-                    });
-                }
+            QueueWait::Forever => None,
+            QueueWait::Seconds(seconds) => Some(waited + Duration::from_secs(seconds)),
+        };
+        let mut next_progress = waited + progress_interval;
+        loop {
+            // No portable timed flock: poll so even an unbounded wait can report
+            // progress. flock grants no FIFO order either way, so polling gives
+            // up no queue position a blocking wait would have kept.
+            // SAFETY: as above — `file` is live and owned by this function.
+            let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+            if rc == 0 {
+                break;
             }
-            // No portable timed flock, so poll: the deadline is the caller's, and
-            // giving up honestly beats parking past it.
-            QueueWait::Seconds(seconds) => {
-                let deadline = waited + std::time::Duration::from_secs(seconds);
-                loop {
-                    // SAFETY: as above — `file` is a live, owned `File`.
-                    let rc =
-                        unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-                    if rc == 0 {
-                        break;
-                    }
-                    if std::io::Error::last_os_error().raw_os_error() != Some(libc::EWOULDBLOCK) {
-                        return Err(BrokerOpError::OperationIo {
-                            path,
-                            source: std::io::Error::last_os_error(),
-                        });
-                    }
-                    if std::time::Instant::now() >= deadline {
-                        return Err(BrokerOpError::CoordinatedLockBusy {
-                            repository: repository.into(),
-                            holder: describe_holder()?,
-                            waited: humanize_duration(waited.elapsed().as_secs()),
-                            operation_id,
-                        });
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(100));
-                }
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::EWOULDBLOCK) {
+                return Err(BrokerOpError::OperationIo {
+                    path,
+                    source: error,
+                });
+            }
+            let now = Instant::now();
+            if deadline.is_some_and(|deadline| now >= deadline) {
+                return Err(BrokerOpError::CoordinatedLockBusy {
+                    repository: repository.into(),
+                    holder: describe_holder()?,
+                    waited: humanize_duration(waited.elapsed().as_secs()),
+                    operation_id,
+                });
+            }
+            if now >= next_progress {
+                // Progress is a diagnostic: a holder lookup that fails (a busy
+                // database under exactly the contention being reported) must
+                // not abort a wait that would otherwise acquire the lock.
+                let holder = describe_holder().unwrap_or_else(|_| "holder unavailable".to_string());
+                report_progress(&holder, waited.elapsed());
+                next_progress = now + progress_interval;
+            }
+            let now = Instant::now();
+            let mut sleep_for =
+                OPERATION_LOCK_POLL_INTERVAL.min(next_progress.saturating_duration_since(now));
+            if let Some(deadline) = deadline {
+                sleep_for = sleep_for.min(deadline.saturating_duration_since(now));
+            }
+            if !sleep_for.is_zero() {
+                std::thread::sleep(sleep_for);
             }
         }
         eprintln!(
@@ -5427,6 +5456,12 @@ impl Broker {
                     Ok(holder.description)
                 },
                 admission.remaining_queue_wait(queue_wait),
+                |holder, elapsed| {
+                    eprintln!(
+                        "[coordination] still waiting for the {lock_key} write lock: {holder} (waited {})",
+                        humanize_duration(elapsed.as_secs())
+                    );
+                },
             ) {
                 Ok(lock) => Some(lock),
                 Err(error) => {
@@ -7193,6 +7228,90 @@ mod tests {
                 "{row:?} must be allowed"
             );
         }
+    }
+
+    #[test]
+    fn repository_lock_reports_progress_while_waiting() {
+        let root = tempfile::tempdir().unwrap();
+        let held = RepositoryWriteLock::acquire(
+            root.path(),
+            "owner/repo",
+            1,
+            || Ok("session 1".into()),
+            QueueWait::Refuse,
+            |_, _| {},
+        )
+        .unwrap();
+        let root_path = root.path().to_path_buf();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            RepositoryWriteLock::acquire_with_progress_interval(
+                &root_path,
+                "owner/repo",
+                2,
+                || Ok("session 1".into()),
+                QueueWait::Seconds(3),
+                Duration::from_millis(50),
+                move |holder, elapsed| {
+                    sender.send((holder.to_owned(), elapsed)).unwrap();
+                },
+            )
+        });
+        let progress = receiver.recv_timeout(Duration::from_secs(2));
+        drop(held);
+        let acquired = waiter.join().unwrap().unwrap();
+        let (holder, elapsed) = progress.expect("a waiting writer should report progress");
+        assert_eq!(holder, "session 1");
+        assert!(elapsed >= Duration::from_millis(50), "{elapsed:?}");
+        assert!(acquired.queue_wait_ms > 0);
+    }
+
+    #[test]
+    fn a_failing_holder_lookup_does_not_abort_a_progress_reporting_wait() {
+        let root = tempfile::tempdir().unwrap();
+        let held = RepositoryWriteLock::acquire(
+            root.path(),
+            "owner/repo",
+            1,
+            || Ok("session 1".into()),
+            QueueWait::Refuse,
+            |_, _| {},
+        )
+        .unwrap();
+        let root_path = root.path().to_path_buf();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            let mut lookups = 0;
+            RepositoryWriteLock::acquire_with_progress_interval(
+                &root_path,
+                "owner/repo",
+                2,
+                move || {
+                    lookups += 1;
+                    if lookups == 1 {
+                        Ok("session 1".into())
+                    } else {
+                        Err(BrokerOpError::RepresentationUnavailable {
+                            reason: "database is locked".into(),
+                        })
+                    }
+                },
+                QueueWait::Seconds(5),
+                Duration::from_millis(50),
+                move |holder, _| {
+                    let _ = sender.send(holder.to_owned());
+                },
+            )
+        });
+        let progress = receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("the wait must keep reporting after a failed holder lookup");
+        drop(held);
+        waiter
+            .join()
+            .unwrap()
+            .expect("a failed progress lookup must not abort the wait");
+        assert_eq!(progress, "holder unavailable");
     }
 
     /// `--no-wait` must still bound its own preparation. Without a budget it

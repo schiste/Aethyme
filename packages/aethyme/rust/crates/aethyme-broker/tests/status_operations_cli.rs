@@ -105,8 +105,12 @@ fn status_shows_a_wedged_operation_and_what_is_parked_behind_it() {
         "status must surface pending operations; got:\n{text}"
     );
     assert!(
-        text.contains("holding"),
-        "status must name the operation holding the lock; got:\n{text}"
+        text.contains("2 unresolved, 1 holding a write lock, 1 waiting"),
+        "status must distinguish the lock holder from the current waiter; got:\n{text}"
+    );
+    assert!(
+        text.contains(&format!("lock {repository}")),
+        "status must name the lock resource; got:\n{text}"
     );
     assert!(
         text.contains(&format!("blocked by {}", holder.id)),
