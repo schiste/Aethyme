@@ -868,6 +868,12 @@ pub(super) fn run_push(parsed: Parsed) -> Result<(), UsageError> {
                 code: crate::exit_status::OUTCOME_UNKNOWN,
             });
         }
+        Err(crate::BrokerOpError::InvalidCoordinatedOperation { reason }) => {
+            return Err(crate::BrokerOpError::InvalidCoordinatedOperation {
+                reason: crate::session_push::with_pre_push_path_hint(&reason),
+            }
+            .into());
+        }
         Err(error) => return Err(error.into()),
     };
     report.review_run = review_on_push(broker.main_root(), &report);
