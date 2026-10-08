@@ -13,6 +13,8 @@ on:
       - rust-toolchain.toml
       - install.sh
       - packages/aethyme/rust/crates/aethyme-broker/src/update*.rs
+      - packages/aethyme/rust/crates/aethyme-broker/src/release_*.rs
+      - packages/aethyme/rust/crates/aethyme-broker/src/install_*.rs
       - packages/aethyme/rust/crates/aethyme-broker/tests/broker.rs
       - packages/aethyme/rust/crates/aethyme-broker/tests/host_operations_e2e.rs
       - packages/aethyme/rust/crates/aethyme-testkit/tests/release_installer.rs
