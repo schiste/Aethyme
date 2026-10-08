@@ -311,6 +311,80 @@ fn operations_show_and_reconcile_accept_the_printed_host_operation_id() {
 }
 
 #[test]
+fn a_host_operation_on_another_repository_is_not_reconciled_from_here() {
+    let fixture = Fixture::new();
+    let database = fixture.state.join("host-operations.db");
+    // The host database is shared by every repository on the host; this row
+    // belongs to a remote this checkout does not have.
+    let foreign = "github.com/someone-else/other-repo";
+    let hex = {
+        let mut guard = HostOperationGuard::begin(
+            &database,
+            foreign,
+            OperationProvider::Git,
+            OperationEffect::Write,
+        )
+        .unwrap();
+        guard.mark_running().unwrap();
+        let hex = guard.operation().operation_id.clone();
+        drop(guard);
+        hex
+    };
+    let connection = Connection::open(&database).unwrap();
+    connection
+        .execute(
+            "UPDATE host_operations SET status='outcome_unknown', holder_pid=?2 WHERE operation_id=?1",
+            rusqlite::params![hex, i64::from(dead_pid())],
+        )
+        .unwrap();
+    drop(connection);
+
+    let reconciled = fixture.run(&[
+        "advanced",
+        "operations",
+        "reconcile",
+        "--operation",
+        &hex,
+        "--outcome",
+        "succeeded",
+        "--reason",
+        "wrong repository",
+        "--json",
+    ]);
+    assert!(
+        !reconciled.status.success(),
+        "a foreign host operation was reconciled"
+    );
+    assert!(
+        stderr(&reconciled).contains("not a remote of this repository"),
+        "{}",
+        stderr(&reconciled)
+    );
+    let unblocked = fixture.run(&[
+        "unblock",
+        &format!("hostop:{hex}"),
+        "--outcome",
+        "succeeded",
+        "--reason",
+        "wrong repository",
+    ]);
+    assert_eq!(unblocked.status.code(), Some(3), "{}", stderr(&unblocked));
+    assert!(
+        stderr(&unblocked).contains("not a remote of this repository"),
+        "{}",
+        stderr(&unblocked)
+    );
+    assert_eq!(
+        aethyme_broker::host_operation(&database, &hex)
+            .unwrap()
+            .unwrap()
+            .status,
+        OperationStatus::OutcomeUnknown,
+        "the foreign barrier must stay in place"
+    );
+}
+
+#[test]
 fn operations_show_and_reconcile_resolve_linked_host_operation_ids() {
     let fixture = Fixture::new();
     let database = fixture.state.join("host-operations.db");
