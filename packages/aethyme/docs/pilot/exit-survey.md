@@ -1,68 +1,63 @@
-# Pilot exit survey
+# Internal dogfooding feedback
 
-Last Updated: 2026-09-26
+Last Updated: 2026-10-08
 
-One copy per developer, at the end of week two. About 15 minutes. Estimates
-are fine; say so when a number is a guess. Send answers as plain text in any
-format.
+Use one copy per internal team member at the end of an observation window. Keep
+responses in the team's internal workspace. Before summarizing, remove names,
+private repository identity, task descriptions, paths, and secrets. Report themes
+and aggregate counts rather than forwarding raw notes.
 
-Your team: ______  Your role: ______  Agents you ran at once, typically: ______
+Team role category (no name): ______  Typical concurrent agents: ______
+Observation window: __________ to __________
 
 ## Setup
 
-**1. Time to first submit.** How long from starting the install to your first
+**1. Time to first submit.** How long from starting setup to the first
 successful `aethyme broker submit`? Include time spent writing or trimming
 gates.
 
 - [ ] under 30 minutes  [ ] 30–60 minutes  [ ] 1–2 hours  [ ] half a day
-  [ ] more  [ ] never got there
+  [ ] more  [ ] did not get there
 
-**2. The hardest step.** Which setup step took longest or needed help:
-install, `aethyme init`, the gates draft, `trust`, the first `start`, the
-first `submit`, something else? What happened?
+**2. Hardest step.** Which step took longest or needed help: install,
+`aethyme init`, gate setup, `trust`, first `start`, first `submit`, or something
+else? Describe the friction without including task details.
 
-## Conflicts caught
+## Conflicts and recovery
 
-**3. Overlaps and conflicts.** Over the two weeks, how many times did the
-broker tell you about an overlap (`status`) or refuse a submit because of a
-conflict with another session, before the problem reached your default
-branch?
+**3. Overlaps and conflicts.** How many times did the broker report an overlap
+or refuse a submit because another session changed the same area?
 
-- Overlap warnings you noticed: ______
+- Overlap warnings noticed: ______
 - Submits refused for a conflict: ______
 
-**4. Would they have hurt?** Of those, how many would you have hit anyway
-without the broker, as a merge conflict, a broken build or lost work? Give
-one example if you can.
+**4. Potential impact.** How many incidents might otherwise have caused a merge
+conflict, broken build, or lost work? Keep examples generic and redacted.
 
-## Recovery
-
-**5. Recovery incidents.** How many times did you have to stop and recover
-the broker or a session: a stuck blocker, a refused `finish`, a gate failing
-for reasons unrelated to your change, a worktree you had to clean up by hand,
-anything else?
+**5. Recovery incidents.** How many times did you need to recover a blocker,
+refused finish, infrastructure-related gate failure, or worktree cleanup?
 
 - Number of incidents: ______
-- Total time spent on them: ______
+- Approximate operator time: ______
+- Did status or unblock explain the next step? ____________________
 
-**6. The worst one.** Describe it: what you saw, what you ran, how long it
-took, and whether `status` or `unblock` told you what to do.
+## Continued use and friction
 
-## Keeping it
-
-**7. Week three.** After week two, did you keep routing agent work through
-the broker?
+**6. Continued use.** Will you keep routing agent work through the broker?
 
 - [ ] yes, for all agent work  [ ] for some of it  [ ] no
 
-If not for all of it, why not?
+Why? ____________________
 
-**8. Would you notice?** If we took the broker away tomorrow, what would you
-miss first, if anything?
+**7. Value.** If the broker disappeared tomorrow, what would you miss first, if
+anything? ____________________
 
-## Cutting
+**8. What would you cut?** Which command, output, step, or rule should be
+removed or made optional, and why? ____________________
 
-**9. What would you cut?** Name any command, output, step or rule you would
-remove or make optional. Say why.
+**9. Anything else.** What should the team fix before the next internal
+observation window? ____________________
 
-**10. Anything else.** What should we fix before the next team starts?
+Summarize responses with the [internal dogfooding protocol](../guides/internal-dogfooding.md).
+Do not treat this small internal sample as external adoption evidence or proof
+of product-market fit.
