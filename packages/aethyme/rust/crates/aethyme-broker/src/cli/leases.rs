@@ -501,6 +501,9 @@ pub(super) fn run_leases(parsed: Parsed) -> Result<(), UsageError> {
             let started = std::time::Instant::now();
             let progress_interval = std::time::Duration::from_secs(2);
             let mut next_progress = progress_interval;
+            // Listed by `broker status` from the first progress line until the
+            // wait ends, however it ends.
+            let mut registration: Option<crate::waiters::WaitRegistration> = None;
             let (outcome, code, requests) = loop {
                 broker.grant_stale_lease_requests()?;
                 let mine: Vec<_> = broker
@@ -541,16 +544,34 @@ pub(super) fn run_leases(parsed: Parsed) -> Result<(), UsageError> {
                 }
                 let elapsed = started.elapsed();
                 if elapsed >= next_progress {
+                    let mut holders = Vec::with_capacity(held.len());
                     for lease in &held {
-                        eprintln!(
-                            "[coordination] still waiting for lease {path}: holder session {} owns {} (lease age {}); waited {}",
+                        let holder = format!(
+                            "holder session {} owns {} (lease age {})",
                             lease.session_id,
                             lease.path,
                             crate::operations::humanize_duration(
                                 now_ms().saturating_sub(lease.created_at).max(0) as u64 / 1_000
                             ),
+                        );
+                        eprintln!(
+                            "[coordination] still waiting for lease {path}: {holder}; waited {}",
                             crate::operations::humanize_duration(elapsed.as_secs())
                         );
+                        holders.push(holder);
+                    }
+                    let holders = holders.join("; ");
+                    match registration.as_mut() {
+                        Some(registration) => registration.update_holder(&holders),
+                        None => {
+                            registration = Some(crate::waiters::WaitRegistration::start(
+                                broker.main_root(),
+                                Some(session),
+                                crate::waiters::WAIT_LEASE,
+                                &path,
+                                &holders,
+                            ));
+                        }
                     }
                     next_progress = elapsed + progress_interval;
                 }
@@ -559,6 +580,7 @@ pub(super) fn run_leases(parsed: Parsed) -> Result<(), UsageError> {
                 }
                 std::thread::sleep(std::time::Duration::from_millis(500));
             };
+            drop(registration);
             if parsed.json {
                 out!(
                     "{}",

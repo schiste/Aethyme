@@ -199,11 +199,20 @@ fn finish_reports_a_bounded_git_timeout_before_closing_the_session() {
         stderr.contains("git ") && stderr.contains("did not finish within"),
         "{stderr}"
     );
-    assert!(stderr.contains("broker status --json"), "{stderr}");
+    // The message names the session state it left and the one safe next step.
     assert!(
-        stderr.contains("aethyme broker advanced handoff --session"),
+        stderr.contains(&format!(
+            "session {session_id} is still active and nothing was closed"
+        )),
         "{stderr}"
     );
+    assert!(
+        stderr.contains(&format!(
+            "aethyme broker finish --session {session_id} --timeout 2"
+        )),
+        "{stderr}"
+    );
+    assert!(stderr.contains("broker status --json"), "{stderr}");
 
     let store = aethyme_broker::BrokerStore::open_in_repo(tmp.path()).unwrap();
     assert_eq!(store.session(session_id).unwrap().status.as_str(), "active");

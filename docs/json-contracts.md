@@ -115,6 +115,18 @@ and is not stalled. A possibly stalled submit also gets a
 `submit.possibly-stalled` advice row (`warning`). Records live in
 `.aethyme/run/submits/` and a finished submit removes its own.
 
+`waiters` (introduced 2026-10-08, #494) lists the processes blocked right now
+on a contested broker lock or lease, longest wait first, in both
+`status --json` and `status --summary --json`; it is omitted when nobody
+waits. Each has `pid`, optional `session_id`, `kind`
+(`coordinated_write_lock`, `gate_owner_lock` or `lease`; may gain values),
+`resource` (the repository, the gate and its lock file, or the lease path),
+`holder` (the holder as last observed, with its age), `waited_ms` and `alive`
+(false when the waiting process is gone without removing its record).
+Records live in `.aethyme/run/waits/`; a wait writes one when it first meets
+contention and removes it when it ends. A record whose process is gone stays
+listed until the next wait starts, which removes it; `status` never deletes.
+
 `review_refusals` lists reviews a provider declined and nothing has re-asked
 for since. `class` is `quota_exhausted`, `rate_limited`, `provider_error` or
 `unknown`, and answers whether waiting helps; `text` is the provider's own
