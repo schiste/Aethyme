@@ -414,7 +414,8 @@ pub struct AutoCleanupReport {
     pub evaluated_at_ms: i64,
     pub removed: Vec<AutoRemovedCheckout>,
     pub kept: Vec<AutoKeptCheckout>,
-    /// Candidates whose deep proof the budget left for a later pass.
+    /// Candidates the budget left for a later pass: a deep proof it had no
+    /// time for, or a removal after the first once it was spent (#460).
     pub deferred: usize,
 }
 
@@ -446,6 +447,9 @@ pub struct AutoCleanupPlan {
     policy: AutoCleanupPolicy,
     upstream: Option<(String, String)>,
     selected: Vec<(AutoCleanupCandidate, ContainmentProof)>,
+    /// The selection's deadline, which removal honors too: a pass inside a
+    /// broker open must not pay unbounded removals after a bounded selection.
+    deadline: Option<Instant>,
 }
 
 impl AutoCleanupPlan {
@@ -455,6 +459,7 @@ impl AutoCleanupPlan {
             policy: AutoCleanupPolicy::default(),
             upstream: None,
             selected: Vec::new(),
+            deadline: None,
         }
     }
 
@@ -464,6 +469,16 @@ impl AutoCleanupPlan {
             .iter()
             .map(|(candidate, _)| candidate.worktree.to_string_lossy().into_owned())
             .collect()
+    }
+
+    /// Replace the deadline removal honors.
+    ///
+    /// Production plans carry the selection's deadline. This hook lets tests
+    /// put removal past its budget without racing the wall clock.
+    #[doc(hidden)]
+    pub fn with_deadline(mut self, deadline: Option<Instant>) -> Self {
+        self.deadline = deadline;
+        self
     }
 }
 
@@ -755,6 +770,11 @@ impl Broker {
     /// Called once to select candidates and again, under the same GC lock,
     /// immediately before removal: a file created, a session adopted or a
     /// lease taken in between keeps the checkout.
+    ///
+    /// `selected` is the proof selection found. Containment depends only on
+    /// HEAD and the upstream tip, and the plan pins the tip, so an unchanged
+    /// HEAD reuses it instead of repeating the deep landing search with no
+    /// deadline; every other proof is re-read (#460).
     pub(crate) fn auto_cleanup_verdict(
         &mut self,
         candidate: &AutoCleanupCandidate,
@@ -762,6 +782,7 @@ impl Broker {
         upstream: &(String, String),
         deep: bool,
         deadline: Option<Instant>,
+        selected: Option<&ContainmentProof>,
     ) -> Result<ContainmentProof, NotRemoved> {
         let keep = NotRemoved::Keep;
         // Only a checkout a broker session record proves it created may go.
@@ -842,6 +863,9 @@ impl Broker {
         let head = checkout
             .head_commit()
             .map_err(|error| keep(format!("HEAD unreadable: {error}")))?;
+        if let Some(proof) = selected.filter(|proof| proof.head == head) {
+            return Ok(proof.clone());
+        }
         containment(self.repo_handle(), &head, &upstream.1, deep, deadline)
     }
 
@@ -897,7 +921,7 @@ impl Broker {
                 report.deferred += 1;
                 continue;
             }
-            match self.auto_cleanup_verdict(&candidate, &policy, &upstream, false, deadline) {
+            match self.auto_cleanup_verdict(&candidate, &policy, &upstream, false, deadline, None) {
                 Ok(proof) => selected.push((candidate, proof)),
                 Err(NotRemoved::Defer) => deep_needed.push(candidate),
                 Err(NotRemoved::Keep(reason)) => report.kept.push(AutoKeptCheckout {
@@ -912,7 +936,7 @@ impl Broker {
                 report.deferred += 1;
                 continue;
             }
-            match self.auto_cleanup_verdict(&candidate, &policy, &upstream, true, deadline) {
+            match self.auto_cleanup_verdict(&candidate, &policy, &upstream, true, deadline, None) {
                 Ok(proof) => selected.push((candidate, proof)),
                 Err(NotRemoved::Defer) => report.deferred += 1,
                 Err(NotRemoved::Keep(reason)) => report.kept.push(AutoKeptCheckout {
@@ -927,6 +951,7 @@ impl Broker {
             policy,
             upstream: Some(upstream),
             selected,
+            deadline,
         })
     }
 
@@ -941,6 +966,7 @@ impl Broker {
             policy,
             upstream,
             selected,
+            deadline,
         } = plan;
         let Some(upstream) = upstream.filter(|_| !selected.is_empty()) else {
             self.record_auto_cleanup_report(&report)?;
@@ -950,7 +976,16 @@ impl Broker {
         // it is as close to removal as it can be. No snapshot keeps all.
         let open_paths = crate::reclaim::open_paths_under(Path::new("/"));
         let records = crate::measurement::load_size_records(self.main_root());
-        for (candidate, _) in selected {
+        let mut attempted_any = false;
+        for (candidate, selected_proof) in selected {
+            // The first selected checkout always goes, so a pass whose
+            // selection spent the budget still converges; the rest wait for
+            // a later pass rather than stretching a broker open (#460).
+            if attempted_any && deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                report.deferred += 1;
+                continue;
+            }
+            attempted_any = true;
             let worktree_text = candidate.worktree.to_string_lossy().into_owned();
             let keep_it = |report: &mut AutoCleanupReport, reason: String| {
                 report.kept.push(AutoKeptCheckout {
@@ -978,8 +1013,14 @@ impl Broker {
                 continue;
             }
             // Revalidate every proof now, under the lock, right before removal.
-            let proof = match self.auto_cleanup_verdict(&candidate, &policy, &upstream, true, None)
-            {
+            let proof = match self.auto_cleanup_verdict(
+                &candidate,
+                &policy,
+                &upstream,
+                true,
+                None,
+                Some(&selected_proof),
+            ) {
                 Ok(proof) => proof,
                 Err(NotRemoved::Keep(reason)) => {
                     keep_it(&mut report, format!("changed before removal: {reason}"));
