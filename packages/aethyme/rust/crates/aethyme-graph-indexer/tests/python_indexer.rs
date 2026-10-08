@@ -213,12 +213,16 @@ fn non_python_files_are_untouched_by_python_indexer() {
     );
 
     let md_frag = read_fragment(tmp.path(), "README.md").unwrap();
-    assert_eq!(md_frag.node_count(), 1);
-    assert_eq!(md_frag.nodes()[0].kind(), NodeKind::NonCodeFile);
+    let md_kinds: Vec<NodeKind> = md_frag.nodes().iter().map(|node| node.kind()).collect();
+    assert_eq!(md_frag.node_count(), 2);
+    assert!(md_kinds.contains(&NodeKind::NonCodeFile));
+    assert!(md_kinds.contains(&NodeKind::DocSection));
 
-    // Sanity: summary should report counts including the File / NonCodeFile.
+    // The generic relation pass records Markdown headings; this does
+    // not come from the Python indexer.
     assert!(summary.counts_by_kind.contains_key(&NodeKind::File));
     assert!(summary.counts_by_kind.contains_key(&NodeKind::NonCodeFile));
+    assert!(summary.counts_by_kind.contains_key(&NodeKind::DocSection));
 }
 
 #[test]
