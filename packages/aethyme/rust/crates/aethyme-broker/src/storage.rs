@@ -174,6 +174,9 @@ pub struct StorageBranchEntry {
 pub enum StorageBranchOwnership {
     SessionLedger,
     Unknown,
+    /// The repository's integration or default branch. No session owns it,
+    /// even when an old ledger row (an adopted main checkout) names it.
+    Shared,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -1926,6 +1929,17 @@ fn inspect_owner(owner: &Path, host_root: &Path) -> Result<OwnerSources, String>
         paths.sort();
         paths.dedup();
     }
+    // Resolved from the repository, never from a session record: an adopted
+    // main checkout's ledger row names the default branch, and reporting it
+    // as session-owned would invite a later cleanup to review it for removal.
+    let mut shared_branches = vec![crate::merge::PromoteConfig::load(owner).branch];
+    match checkout
+        .upstream_default()
+        .and_then(|(upstream, _)| upstream.split_once('/').map(|(_, b)| b.to_string()))
+    {
+        Some(branch) => shared_branches.push(branch),
+        None => shared_branches.extend(["main".to_string(), "master".to_string()]),
+    }
     let branch_tips = checkout.local_branch_tips();
     let session_branch_inventory_complete = branch_tips.is_some();
     let session_branches = branch_tips
@@ -1934,7 +1948,12 @@ fn inspect_owner(owner: &Path, host_root: &Path) -> Result<OwnerSources, String>
         .filter_map(|(reference, head)| {
             let name = reference.strip_prefix("refs/heads/")?;
             let session_ids = session_ids_by_branch.remove(name).unwrap_or_default();
-            let ownership = if session_ids.is_empty() {
+            let ownership = if shared_branches.iter().any(|shared| shared == name) {
+                if session_ids.is_empty() {
+                    return None;
+                }
+                StorageBranchOwnership::Shared
+            } else if session_ids.is_empty() {
                 if !name.starts_with("agent/") {
                     return None;
                 }
@@ -1944,7 +1963,9 @@ fn inspect_owner(owner: &Path, host_root: &Path) -> Result<OwnerSources, String>
             };
             let uncleared_session_ids = uncleared_ids_by_branch.remove(name).unwrap_or_default();
             let checked_out_paths = checked_out.remove(name).unwrap_or_default();
-            let retention_reason = if !uncleared_session_ids.is_empty() {
+            let retention_reason = if ownership == StorageBranchOwnership::Shared {
+                "the repository's integration or default branch; it is never session-owned or removable".into()
+            } else if !uncleared_session_ids.is_empty() {
                 "one or more sessions remain in the broker ledger; retain this branch until their lifecycle is resolved".into()
             } else if !checked_out_paths.is_empty() {
                 "a registered Git worktree still checks out this branch; retain it while that checkout exists".into()

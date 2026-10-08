@@ -1035,3 +1035,47 @@ fn a_root_this_repository_cannot_prove_is_never_marked() {
     );
     assert_eq!(plan["summary"]["candidate_count"], 0);
 }
+
+#[test]
+fn a_shared_branch_named_by_a_session_is_reported_shared_not_session_owned() {
+    let (repo, container) = fixture();
+    let owner_root = container.path().join("owner-key");
+    marker(&owner_root, "owner-key", repo.path());
+    // A ledger row naming the integration branch, as an old adoption of a
+    // checkout on a shared branch leaves behind.
+    let shared = owner_root.join("shared");
+    git(
+        repo.path(),
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "aethyme/integration",
+            shared.to_str().unwrap(),
+            "HEAD",
+        ],
+    );
+    let mut broker = Broker::open(repo.path()).unwrap();
+    broker.adopt(&shared, Some("shared branch claim")).unwrap();
+
+    let plan = json(run(
+        repo.path(),
+        container.path(),
+        &["gc", "storage", "plan", "--json"],
+    ));
+    let owner = own_root(&plan);
+    let branches = owner["session_branches"].as_array().unwrap();
+    let integration = branches
+        .iter()
+        .find(|branch| branch["name"] == "aethyme/integration")
+        .expect("the ledger-named shared branch is listed");
+    assert_eq!(integration["ownership"], "shared");
+    assert!(
+        integration["retention_reason"]
+            .as_str()
+            .unwrap()
+            .contains("never session-owned or removable")
+    );
+    assert_eq!(plan["summary"]["broker_branch_ref_count"], 0);
+}
