@@ -6,11 +6,15 @@
     "kind": "monorepo",
     "languages": [
       "rust",
-      "python"
+      "python",
+      "typescript"
     ],
     "primary_language": "rust",
     "package_manager": "cargo",
     "manifests": [
+      "packages/aethyme-eval/benchmarks/performance/fixture/package.json",
+      "packages/aethyme-eval/benchmarks/performance/fixture/pyproject.toml",
+      "packages/aethyme-eval/benchmarks/performance/fixture/src/rust/Cargo.toml",
       "packages/aethyme-eval/pyproject.toml",
       "packages/aethyme/rust/Cargo.toml",
       "packages/aethyme/rust/crates/aethyme-broker/Cargo.toml",
@@ -78,7 +82,7 @@
         },
         {
           "kind": "ci_usage",
-          "detail": "workspace root mentioned 37 time(s) in CI",
+          "detail": "workspace root mentioned 63 time(s) in CI",
           "confidence": "medium"
         }
       ],
@@ -88,9 +92,9 @@
         "root_manifest": false,
         "declares_workspace": true,
         "member_count": 10,
-        "ci_mentions": 37,
+        "ci_mentions": 63,
         "executable_entrypoints": 1,
-        "source_files": 575
+        "source_files": 603
       }
     },
     {
@@ -127,7 +131,7 @@
         },
         {
           "kind": "ci_usage",
-          "detail": "workspace root mentioned 1 time(s) in CI",
+          "detail": "workspace root mentioned 3 time(s) in CI",
           "confidence": "medium"
         }
       ],
@@ -137,9 +141,138 @@
         "root_manifest": false,
         "declares_workspace": false,
         "member_count": 0,
-        "ci_mentions": 1,
-        "executable_entrypoints": 0,
-        "source_files": 72
+        "ci_mentions": 3,
+        "executable_entrypoints": 2,
+        "source_files": 83
+      }
+    },
+    {
+      "root": "packages/aethyme-eval/benchmarks/performance/fixture",
+      "manifest": {
+        "path": "packages/aethyme-eval/benchmarks/performance/fixture/pyproject.toml",
+        "kind": "python"
+      },
+      "package_manager": "python",
+      "languages": [
+        "python"
+      ],
+      "members": [],
+      "lockfiles": [],
+      "candidate_commands": [
+        {
+          "kind": "fast_test",
+          "command": "python -m pytest packages/aethyme-eval/benchmarks/performance/fixture",
+          "source": "packages/aethyme-eval/benchmarks/performance/fixture/pyproject.toml",
+          "confidence": "medium"
+        },
+        {
+          "kind": "install",
+          "command": "python -m pip install -e packages/aethyme-eval/benchmarks/performance/fixture",
+          "source": "packages/aethyme-eval/benchmarks/performance/fixture/pyproject.toml",
+          "confidence": "medium"
+        }
+      ],
+      "evidence": [
+        {
+          "kind": "tracked_manifest",
+          "detail": "packages/aethyme-eval/benchmarks/performance/fixture/pyproject.toml",
+          "confidence": "high"
+        },
+        {
+          "kind": "ci_usage",
+          "detail": "workspace root mentioned 2 time(s) in CI",
+          "confidence": "medium"
+        }
+      ],
+      "confidence": "high",
+      "primary": false,
+      "ranking": {
+        "root_manifest": false,
+        "declares_workspace": false,
+        "member_count": 0,
+        "ci_mentions": 2,
+        "executable_entrypoints": 2,
+        "source_files": 11
+      }
+    },
+    {
+      "root": "packages/aethyme-eval/benchmarks/performance/fixture",
+      "manifest": {
+        "path": "packages/aethyme-eval/benchmarks/performance/fixture/package.json",
+        "kind": "node"
+      },
+      "package_manager": "npm",
+      "languages": [
+        "typescript"
+      ],
+      "members": [],
+      "lockfiles": [],
+      "candidate_commands": [],
+      "evidence": [
+        {
+          "kind": "tracked_manifest",
+          "detail": "packages/aethyme-eval/benchmarks/performance/fixture/package.json",
+          "confidence": "high"
+        },
+        {
+          "kind": "ci_usage",
+          "detail": "workspace root mentioned 2 time(s) in CI",
+          "confidence": "medium"
+        }
+      ],
+      "confidence": "high",
+      "primary": false,
+      "ranking": {
+        "root_manifest": false,
+        "declares_workspace": false,
+        "member_count": 0,
+        "ci_mentions": 2,
+        "executable_entrypoints": 2,
+        "source_files": 11
+      }
+    },
+    {
+      "root": "packages/aethyme-eval/benchmarks/performance/fixture/src/rust",
+      "manifest": {
+        "path": "packages/aethyme-eval/benchmarks/performance/fixture/src/rust/Cargo.toml",
+        "kind": "cargo"
+      },
+      "package_manager": "cargo",
+      "languages": [
+        "rust"
+      ],
+      "members": [],
+      "lockfiles": [],
+      "candidate_commands": [
+        {
+          "kind": "fast_test",
+          "command": "cargo test --manifest-path packages/aethyme-eval/benchmarks/performance/fixture/src/rust/Cargo.toml",
+          "source": "packages/aethyme-eval/benchmarks/performance/fixture/src/rust/Cargo.toml",
+          "confidence": "high"
+        },
+        {
+          "kind": "build",
+          "command": "cargo build --manifest-path packages/aethyme-eval/benchmarks/performance/fixture/src/rust/Cargo.toml",
+          "source": "packages/aethyme-eval/benchmarks/performance/fixture/src/rust/Cargo.toml",
+          "confidence": "high"
+        }
+      ],
+      "evidence": [
+        {
+          "kind": "tracked_manifest",
+          "detail": "packages/aethyme-eval/benchmarks/performance/fixture/src/rust/Cargo.toml",
+          "confidence": "high"
+        }
+      ],
+      "confidence": "high",
+      "primary": false,
+      "ranking": {
+        "root_manifest": false,
+        "declares_workspace": false,
+        "member_count": 0,
+        "ci_mentions": 0,
+        "executable_entrypoints": 1,
+        "source_files": 2
       }
     }
   ],
@@ -195,7 +328,7 @@
       },
       {
         "kind": "ci_usage",
-        "detail": "workspace root mentioned 37 time(s) in CI",
+        "detail": "workspace root mentioned 63 time(s) in CI",
         "confidence": "medium"
       }
     ],
@@ -205,9 +338,9 @@
       "root_manifest": false,
       "declares_workspace": true,
       "member_count": 10,
-      "ci_mentions": 37,
+      "ci_mentions": 63,
       "executable_entrypoints": 1,
-      "source_files": 575
+      "source_files": 603
     }
   },
   "commands": [
@@ -336,6 +469,16 @@
       "relevance": "product"
     },
     {
+      "path": "packages/aethyme-eval/benchmarks/performance/fixture/src/rust/src/main.rs",
+      "kind": "file",
+      "role": "cli",
+      "reason": "tracked Rust binary entrypoint in `packages/aethyme-eval/benchmarks/performance/fixture/src/rust`",
+      "confidence": "high",
+      "workspace_root": "packages/aethyme-eval/benchmarks/performance/fixture/src/rust",
+      "provenance": "derived from tracked workspace source",
+      "relevance": "supporting"
+    },
+    {
       "path": "packages/aethyme/rust/crates/aethyme-broker/src/bin/broker-cli-shim.rs",
       "kind": "file",
       "role": "cli",
@@ -428,9 +571,9 @@
     ]
   },
   "freshness": {
-    "source_digest": "401f12e0d06a9abe653901a2c76f534030b5f223c34d5f43e07f3d44eb90be31",
+    "source_digest": "1b0472665890c49330a0997d5935fcf2e0684d14f4190b60840d55d94e8bf6e2",
     "source_commit": null,
-    "source_file_count": 1003,
+    "source_file_count": 1058,
     "generator": "deterministic"
   },
   "notes": [
@@ -460,10 +603,10 @@
       "freshness"
     ],
     "counts": {
-      "workspaces": 2,
+      "workspaces": 5,
       "commands": 5,
       "areas": 4,
-      "entrypoints": 7,
+      "entrypoints": 8,
       "caution_zones": 0,
       "generated_paths": 2,
       "dangerous_paths": 2,
