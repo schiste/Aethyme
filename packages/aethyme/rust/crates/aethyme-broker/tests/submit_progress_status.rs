@@ -1,11 +1,14 @@
 //! A running `broker submit` is visible from another process: `status` lists
 //! it with its phase, place in line and last progress, and flags one that has
-//! stopped reporting, so a queued submit can be told from a stuck one.
+//! stopped reporting, so a queued submit can be told from a stuck one. A
+//! process blocked on a contested lock or lease is listed the same way (#494).
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use aethyme_broker::{Broker, SUBMIT_STALL_AFTER, SubmitProgressRecord};
+use aethyme_broker::{Broker, SUBMIT_STALL_AFTER, SubmitProgressRecord, WaitRecord};
+
+const CLI: &str = env!("CARGO_BIN_EXE_broker-cli-shim");
 
 fn sh(cwd: &Path, args: &[&str]) {
     let out = Command::new("git")
@@ -168,4 +171,74 @@ fn a_completed_submit_leaves_no_progress_record() {
             .in_flight_submits
             .is_empty()
     );
+}
+
+/// What a process blocked on a contested lock writes while it waits.
+fn write_wait(repo: &Path, pid: i64, session_id: i64, started_at_ms: i64) {
+    let record = WaitRecord {
+        pid,
+        session_id: Some(session_id),
+        kind: "coordinated_write_lock".into(),
+        resource: "owner/repo".into(),
+        holder: "operation 41 (session 700)".into(),
+        started_at_ms,
+    };
+    let dir = repo.join(".aethyme/run/waits");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join(format!("{pid}-1.json")),
+        serde_json::to_vec(&record).unwrap(),
+    )
+    .unwrap();
+}
+
+#[test]
+fn status_and_its_summary_list_who_waits_on_which_lock() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = repo(tmp.path());
+    let now = now_ms();
+    write_wait(&repo, i64::from(std::process::id()), 812, now - 65_000);
+
+    let mut broker = Broker::open(&repo).unwrap();
+    for json in [
+        serde_json::to_value(broker.status(now_ms()).unwrap()).unwrap(),
+        serde_json::to_value(broker.status_brief(now_ms()).unwrap()).unwrap(),
+    ] {
+        let waiter = &json["waiters"][0];
+        assert_eq!(waiter["session_id"], 812, "{json}");
+        assert_eq!(waiter["kind"], "coordinated_write_lock");
+        assert_eq!(waiter["resource"], "owner/repo");
+        assert_eq!(waiter["holder"], "operation 41 (session 700)");
+        assert_eq!(waiter["alive"], true);
+        assert!(waiter["waited_ms"].as_i64().unwrap() >= 65_000);
+    }
+    drop(broker);
+
+    let output = Command::new(CLI)
+        .args(["status", "--summary"])
+        .current_dir(&repo)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{stdout}");
+    // The wait keeps aging while the command runs; only its shape is fixed.
+    let line = stdout
+        .lines()
+        .find(|line| line.trim_start().starts_with("session 812 waiting "))
+        .unwrap_or_else(|| panic!("no waiter line in {stdout}"));
+    assert!(
+        line.ends_with(" for the coordinated write lock on owner/repo: operation 41 (session 700)"),
+        "{line}"
+    );
+}
+
+#[test]
+fn status_omits_waiters_when_nobody_waits() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = repo(tmp.path());
+    let mut broker = Broker::open(&repo).unwrap();
+    let json = serde_json::to_value(broker.status(now_ms()).unwrap()).unwrap();
+    assert!(json.get("waiters").is_none());
+    let json = serde_json::to_value(broker.status_brief(now_ms()).unwrap()).unwrap();
+    assert!(json.get("waiters").is_none());
 }

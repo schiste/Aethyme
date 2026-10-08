@@ -384,6 +384,7 @@ impl Broker {
             summary,
             advice,
             leases_refreshed: false,
+            waiters: crate::waiters::current_waiters(&self.main_root, now_ms),
         })
     }
 
@@ -1505,6 +1506,7 @@ impl Broker {
             blocker_sources_unavailable: blocker_report.unavailable,
             unpushed_work,
             in_flight_submits,
+            waiters: crate::waiters::current_waiters(&self.main_root, now_ms),
         })
     }
 

@@ -2304,6 +2304,7 @@ impl Broker {
                 &main_root,
                 &lock_key,
                 queued_operation_id,
+                Some(request.session_id),
                 || {
                     let holder = lock_holder_info(self.store(), &repository);
                     let details =

@@ -102,6 +102,7 @@ pub(super) fn run_status(parsed: Parsed) -> Result<(), UsageError> {
             out!("{}", serde_json::to_string_pretty(&brief)?);
         } else {
             out!("{}", brief.summary.message);
+            render_waiters(&brief.waiters);
             render_status_advice(&brief.advice);
         }
         return Ok(());
@@ -372,6 +373,7 @@ pub(super) fn run_status(parsed: Parsed) -> Result<(), UsageError> {
                 }
             }
         }
+        render_waiters(&status.waiters);
         let terminal_counts = &status.queue_history.terminal_counts;
         if !terminal_counts.is_empty() {
             let total = terminal_counts.iter().map(|item| item.count).sum::<usize>();
@@ -1163,6 +1165,18 @@ fn render_recent_command_failures(failures: &[crate::RecentCommandFailure]) {
         );
     }
     out!("  all: aethyme broker advanced events --kind broker.command.failed");
+}
+
+/// Who is blocked on which broker lock or lease, longest wait first (#494).
+fn render_waiters(waiters: &[crate::CurrentWaiter]) {
+    if waiters.is_empty() {
+        return;
+    }
+    out!();
+    out!("Waiting on locks and leases:");
+    for waiter in waiters {
+        out!("  {}", crate::waiters::describe(waiter));
+    }
 }
 
 /// Doctor's view of committed work only this machine holds. Status carries
