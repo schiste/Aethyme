@@ -2018,18 +2018,24 @@ impl Broker {
         }
 
         for agent in agents.iter().filter(|_| checkouts.is_some()) {
-            let Some(CheckoutInspection::Read { dirty, head }) =
-                checkouts.and_then(|checkouts| checkouts.get(&agent.session.id))
+            let Some(CheckoutInspection::Read {
+                dirty,
+                branch,
+                head,
+                recorded_branch_head,
+            }) = checkouts.and_then(|checkouts| checkouts.get(&agent.session.id))
             else {
                 continue;
             };
+            if let Some(row) =
+                checkout_drift_advice(agent, branch, head, recorded_branch_head.as_deref())
+            {
+                advice.push(row);
+            }
             if !dirty.is_empty() {
                 advice.push(dirty_worktree_advice(agent, dirty));
                 continue;
             }
-            let Some(head) = head else {
-                continue;
-            };
             if let Some(entry) = queue.iter().rev().find(|entry| {
                 entry.session_id == agent.session.id
                     && &entry.head_commit == head

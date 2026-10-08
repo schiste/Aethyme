@@ -30,6 +30,31 @@ pub const DEFAULT_INTEGRATION_BRANCH: &str = "aethyme/integration";
 pub const ACTION_REQUIRED_RELPATH: &str = ".aethyme/broker-action-required.md";
 const PROMOTION_SUBJECT_MAX_CHARS: usize = 72;
 
+fn require_session_checkout_identity(
+    session: &crate::Session,
+    checkout: &GitRepo,
+    expected_head: Option<&str>,
+) -> Result<String, BrokerOpError> {
+    let actual_branch = checkout.current_branch()?;
+    let actual_head = checkout.head_commit()?;
+    let recorded_ref = format!("refs/heads/{}", session.branch);
+    let recorded_branch_head = checkout.resolve_ref(&recorded_ref);
+    if actual_branch != session.branch
+        || recorded_branch_head.as_deref() != Some(actual_head.as_str())
+        || expected_head.is_some_and(|expected| expected != actual_head)
+    {
+        return Err(BrokerOpError::SessionCheckoutDrift {
+            session_id: session.id,
+            recorded_branch: session.branch.clone().into_boxed_str(),
+            actual_branch: actual_branch.into_boxed_str(),
+            expected_head: expected_head.map(|head| head.to_string().into_boxed_str()),
+            actual_head: actual_head.into_boxed_str(),
+            recorded_branch_head: recorded_branch_head.map(String::into_boxed_str),
+        });
+    }
+    Ok(actual_head)
+}
+
 fn promotion_subject(session_id: i64, task: Option<&str>) -> String {
     let prefix = format!("chore(broker): promote session {session_id} (");
     let suffix = ")";
@@ -604,7 +629,7 @@ impl Broker {
         );
         let session = self.store().session(session_id)?;
         let checkout = GitRepo::discover(Path::new(&session.worktree_path))?;
-        let head = checkout.head_commit()?;
+        let head = require_session_checkout_identity(&session, &checkout, None)?;
         // Before planning: a verify-only plan is measured against integration,
         // and a stale one counts main's own commits as this session's (#352).
         self.refresh_disposable_integration(crate::IntegrationRefreshTrigger::Submit);
@@ -641,6 +666,11 @@ impl Broker {
             )?;
             return Err(error);
         }
+
+        // Planning can be expensive. Refuse if the checkout changed identity
+        // while it ran so a branch switch or new head cannot redirect the
+        // queued submission away from the session snapshot.
+        require_session_checkout_identity(&session, &checkout, Some(&head))?;
 
         let entry = self.store().submit(session_id, &head, &base)?;
         // A new head supersedes this session's older in-flight entries:
