@@ -141,17 +141,17 @@ const ALLOWED_LINES: &[(&str, &str, &str)] = &[
         "top-level words that route --help to canonical broker internals, not an invocation",
     ),
     (
-        "packages/aethyme/rust/crates/aethyme-cli/src/main.rs",
+        "packages/aethyme/rust/crates/aethyme-cli/src/main_unix.rs",
         "\"aethyme readiness\",",
         "retired spelling named only in its exit-2 migration hint",
     ),
     (
-        "packages/aethyme/rust/crates/aethyme-cli/src/main.rs",
+        "packages/aethyme/rust/crates/aethyme-cli/src/main_unix.rs",
         "\"aethyme enhance deploy\",",
         "retired spelling named only in its exit-2 migration hint",
     ),
     (
-        "packages/aethyme/rust/crates/aethyme-cli/src/main.rs",
+        "packages/aethyme/rust/crates/aethyme-cli/src/main_unix.rs",
         "\"aethyme enhance verify\",",
         "retired spelling named only in its exit-2 migration hint",
     ),

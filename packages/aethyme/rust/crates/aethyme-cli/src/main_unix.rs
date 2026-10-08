@@ -1,0 +1,1277 @@
+// Aethyme — top-level CLI binary. Entry point for agents using the
+// `aethyme` command.
+//
+// Single-entrypoint design (issue #31, 2026-07-14):
+//   1. `explore` runs **in-process** via the engine library (shared front
+//      end in `aethyme_engine::explore_cli`). When the engine daemon isn't
+//      running for the target repo, the router starts one (detached, via
+//      the sibling `aethyme-engine-cli` serve binary), waits for the
+//      socket, and retries — `aethyme explore` just works.
+//   2. Everything else is native too: `broker`/`certify`/`init`
+//      (aethyme-broker), `deploy`/`repo` UX (aethyme-enhance),
+//      `ai-ready`/`autofix` (aethyme-quality), and the engine groups.
+//      There is no delegation path: unknown subcommands are errors.
+//
+// The python-retirement finished here (Phase 6, 2026-08-01). The router
+// once shelled out to `python -m src.cli` for unflipped command groups
+// and had to *find* that package; `src/` is deleted, so both the
+// delegation and the package-finding are gone.
+//
+// The repo path for explore is found by:
+//   1. `--repo <path>` flag (explicit)
+//   2. `$AETHYME_REPO` env var
+//   3. current directory
+
+use std::env;
+use std::path::{Path, PathBuf};
+use std::process::ExitCode;
+use std::time::Duration;
+
+mod branches_audit;
+mod graph_refresh;
+mod help;
+mod readiness_remediation;
+mod repository_deploy;
+mod repository_enrollment;
+mod repository_upgrade;
+
+/// Upper bound for waiting on a freshly-spawned engine daemon. The socket
+/// binds only after the initial map build (~70s on a 12K-file repo), so
+/// this is generous rather than snappy on purpose.
+const DAEMON_READY_TIMEOUT: Duration = Duration::from_secs(240);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ParsedCommand<'a> {
+    name: &'a str,
+    args: &'a [String],
+    compatibility_capability: Option<repository_upgrade::CommandCapability>,
+    invocation_surface: Option<repository_upgrade::InvocationSurface>,
+}
+
+impl<'a> ParsedCommand<'a> {
+    fn parse(args: &'a [String]) -> Option<Self> {
+        let (name, tail) = args.split_first()?;
+        let (compatibility_capability, invocation_surface) = match name.as_str() {
+            // Contract checking only reads the Git diff and the consumers
+            // registry.  It must not perform the repository compatibility
+            // preflight, because that preflight is allowed to inspect broker
+            // state and this gate runs an unpromoted tree-built binary.
+            "broker" if tail.first().map(String::as_str) == Some("check-contract") => (None, None),
+            "broker" => (
+                Some(broker_command_capability(tail)),
+                Some(broker_invocation_surface(tail)),
+            ),
+            "upgrade" => (
+                Some(repository_upgrade::CommandCapability::Upgrade),
+                Some(repository_upgrade::InvocationSurface::UpgradeCommand),
+            ),
+            // I1 preserves the previous enforcement boundary: repository
+            // compatibility gates broker commands, while other top-level
+            // commands retain their existing behavior.
+            _ => (None, None),
+        };
+        Some(Self {
+            name,
+            args: tail,
+            compatibility_capability,
+            invocation_surface,
+        })
+    }
+}
+
+fn broker_invocation_surface(args: &[String]) -> repository_upgrade::InvocationSurface {
+    use repository_upgrade::InvocationSurface;
+
+    match (
+        args.first().map(String::as_str),
+        args.get(1).map(String::as_str),
+    ) {
+        (Some("hooks"), Some("pre-commit" | "post-commit")) => InvocationSurface::Hook,
+        (Some("git" | "gh" | "merge-chain" | "operations"), _) => {
+            InvocationSurface::CoordinatedOperation
+        }
+        _ => InvocationSurface::BrokerCommand,
+    }
+}
+
+fn broker_command_capability(args: &[String]) -> repository_upgrade::CommandCapability {
+    use repository_upgrade::CommandCapability;
+
+    let subcommand = args.first().map(String::as_str);
+    let nested = args.get(1).map(String::as_str);
+    match (subcommand, nested) {
+        (Some("readiness"), Some("apply")) => CommandCapability::Upgrade,
+        (Some("readiness"), Some("recover")) => CommandCapability::RecoveryWrite,
+        (Some("start" | "start-agent"), _) => CommandCapability::NewSession,
+        (Some("adopt"), _) => CommandCapability::NewSession,
+        (Some("submit" | "push" | "sync" | "exec" | "repair"), _) => {
+            CommandCapability::SessionContinuation
+        }
+        (Some("hooks"), Some("pre-commit")) => CommandCapability::ManagedPreCommit,
+        (Some("hooks"), Some("post-commit")) => CommandCapability::SessionContinuation,
+        (Some("leases" | "ownership"), Some("claim" | "release")) => {
+            CommandCapability::SessionContinuation
+        }
+        (Some("gates"), Some("run" | "pre-push" | "affected" | "semantic")) => {
+            CommandCapability::SessionContinuation
+        }
+        (Some("close" | "finish" | "git" | "gh" | "merge-chain" | "cleanup"), _) => {
+            CommandCapability::RecoveryWrite
+        }
+        (Some("storage"), Some("apply")) => CommandCapability::RecoveryWrite,
+        // Trust writes only host state, and it is how a refused repository
+        // recovers, so compatibility policy must not stand in its way.
+        (Some("trust"), Some("status")) => CommandCapability::DiagnosticRead,
+        (Some("trust"), _) => CommandCapability::RecoveryWrite,
+        (Some("checkpoint"), Some("apply")) => CommandCapability::RecoveryWrite,
+        (Some("report"), Some("file")) => CommandCapability::RecoveryWrite,
+        (Some("quality-report"), Some("plan")) => CommandCapability::DiagnosticRead,
+        (Some("operations" | "resources"), Some("reconcile"))
+        | (Some("advisories"), Some("ack")) => CommandCapability::RecoveryWrite,
+        (Some("external-events"), Some("ingest" | "reconcile")) => {
+            CommandCapability::SharedMutation
+        }
+        (Some("deliveries"), Some("subscribe" | "claim" | "complete")) => {
+            CommandCapability::SharedMutation
+        }
+        (Some("deliveries"), Some("list")) => CommandCapability::DiagnosticRead,
+        (Some("watch"), Some("pr"))
+            if matches!(
+                args.get(2).map(String::as_str),
+                Some("start" | "poll" | "ack" | "pause" | "resume" | "stop")
+            ) =>
+        {
+            CommandCapability::SessionContinuation
+        }
+        (Some("watch"), Some("pr"))
+            if matches!(
+                args.get(2).map(String::as_str),
+                Some("list" | "show" | "batches")
+            ) =>
+        {
+            CommandCapability::DiagnosticRead
+        }
+        (Some("review"), Some("register" | "request" | "unlock")) => {
+            CommandCapability::SharedMutation
+        }
+        (Some("integration"), Some("reconcile")) if args.iter().any(|arg| arg == "--apply") => {
+            CommandCapability::RecoveryWrite
+        }
+        (Some("ship"), Some("plan"))
+        | (Some("checkpoint"), Some("plan"))
+        | (Some("integration"), Some("status" | "reconcile"))
+        | (Some("leases" | "ownership"), _)
+        | (Some("resources"), Some("plan" | "list"))
+        | (Some("gates"), Some("validate"))
+        | (Some("report"), Some("capture" | "list" | "show" | "render"))
+        | (Some("hooks"), Some("status"))
+        | (Some("operations"), _)
+        | (Some("advisories"), Some("list" | "show"))
+        | (Some("external-events"), Some("list" | "show"))
+        | (Some("review"), Some("show"))
+        | (
+            Some(
+                "handoff" | "queue" | "status" | "agents" | "metrics" | "insights" | "certify"
+                | "readiness" | "worktree-root" | "storage",
+            ),
+            _,
+        )
+        | (Some("events"), _)
+            if nested != Some("prune") =>
+        {
+            CommandCapability::DiagnosticRead
+        }
+        _ => CommandCapability::SharedMutation,
+    }
+}
+
+fn eligible_pinned_session_contract(
+    cwd: &Path,
+    args: &[String],
+) -> Option<aethyme_broker::RepositoryContract> {
+    let checkout = aethyme_broker::GitRepo::discover(cwd).ok()?;
+    let main_root = checkout.main_root().ok()?;
+    if !main_root.join(aethyme_broker::BROKER_DB_RELPATH).is_file() {
+        return None;
+    }
+    let mut broker = aethyme_broker::Broker::open_for_compatibility_backfill(cwd).ok()?;
+    let explicit_session = args
+        .windows(2)
+        .find(|pair| pair[0] == "--session")
+        .and_then(|pair| pair[1].parse::<i64>().ok());
+    let session = if let Some(session_id) = explicit_session {
+        broker.store().session(session_id).ok()?
+    } else {
+        let worktree = checkout.root().to_string_lossy();
+        broker.store().session_for_worktree(&worktree).ok()??
+    };
+    matches!(
+        session.status,
+        aethyme_broker::SessionStatus::Active
+            | aethyme_broker::SessionStatus::Idle
+            | aethyme_broker::SessionStatus::Stale
+    )
+    .then_some(session.repository_contract)
+    .flatten()
+}
+
+fn main() -> ExitCode {
+    let args: Vec<String> = env::args().skip(1).collect();
+    if args.is_empty() {
+        print_top_level_help(false);
+        return ExitCode::from(2);
+    }
+    // Help is answered before the compatibility preflight and before any
+    // command runs, so asking what a command does has no side effects.
+    if matches!(args[0].as_str(), "-h" | "--help") {
+        print_top_level_help(true);
+        return ExitCode::SUCCESS;
+    }
+    if help::wants_help(&args)
+        && let Some(route) = help::route(&args)
+    {
+        return answer_help(route, &args);
+    }
+    let args = match resolve_spelling(args) {
+        Ok(args) => args,
+        Err(code) => return code,
+    };
+    let Some(command) = ParsedCommand::parse(&args) else {
+        print_top_level_help(false);
+        return ExitCode::from(2);
+    };
+
+    let mut broker_compatibility_mode = aethyme_broker::cli::CompatibilityMode::Normal;
+    if let Some(capability) = command.compatibility_capability
+        && let Ok(cwd) = env::current_dir()
+    {
+        let surface = command
+            .invocation_surface
+            .unwrap_or(repository_upgrade::InvocationSurface::BrokerCommand);
+        let initial = repository_upgrade::compatibility_decision(
+            &cwd,
+            capability,
+            repository_upgrade::CompatibilityContext {
+                surface,
+                ..repository_upgrade::CompatibilityContext::default()
+            },
+        );
+        let pinned_contract = initial
+            .as_ref()
+            .filter(|decision| {
+                matches!(
+                    capability,
+                    repository_upgrade::CommandCapability::SessionContinuation
+                        | repository_upgrade::CommandCapability::ManagedPreCommit
+                ) && matches!(
+                    decision.repository,
+                    repository_upgrade::RepositoryCompatibility::UpgradeRequired
+                        | repository_upgrade::RepositoryCompatibility::UpgradeInProgress
+                )
+            })
+            .and_then(|_| eligible_pinned_session_contract(&cwd, command.args));
+        let decision = if pinned_contract.is_some() {
+            repository_upgrade::compatibility_decision(
+                &cwd,
+                capability,
+                repository_upgrade::CompatibilityContext {
+                    session_contract: pinned_contract.as_ref(),
+                    surface,
+                },
+            )
+        } else {
+            initial
+        };
+        if let Some(decision) = decision {
+            if let Some(message) = decision.refusal_message() {
+                if let Some(hook_message) = decision.managed_pre_commit_refusal_message() {
+                    eprintln!("{hook_message}");
+                } else {
+                    eprintln!("Error: {message}");
+                }
+                return ExitCode::from(1);
+            }
+            if decision.execution == repository_upgrade::CompatibilityExecution::ReadOnlySnapshot {
+                broker_compatibility_mode =
+                    aethyme_broker::cli::CompatibilityMode::ReadOnlySnapshot(
+                        decision.read_only_compatibility(),
+                    );
+            }
+        }
+    }
+
+    match command.name {
+        "-V" | "--version" => {
+            print_version();
+            ExitCode::SUCCESS
+        }
+        "explore" => run_explore(&args[1..]),
+        "verify-targets" => run_verify_targets(&args[1..]),
+        // Reader sibling of verify-targets over the SAME saved
+        // answer-json (python-retirement Phase 5.5): the compact
+        // decision surface deployed skills used to build with a
+        // `.venv/bin/python` heredoc.
+        "explore-summary" => run_explore_summary(&args[1..]),
+        // Native since python-retirement Phase 1 (the Python `query`
+        // group is deleted). Errors keep Click's `Error: {msg}` shape
+        // and exit 1 so scripted consumers see the same surface.
+        "graph" if args.get(1).map(String::as_str) == Some("impact") => {
+            run_graph_impact(&args[2..])
+        }
+        "graph" if graph_refresh::handles(&args[1..]) => {
+            ExitCode::from(graph_refresh::run(&args[1..]))
+        }
+        "graph" => match aethyme_engine::graph_cli::run(&args[1..]) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => report_cli_error(error),
+        },
+        "analyze" => match aethyme_engine::analyze_cli::run(&args[1..]) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => report_cli_error(error),
+        },
+        "facts" => match aethyme_engine::facts_cli::run_facts(&args[1..]) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => report_cli_error(error),
+        },
+        "intents" => match aethyme_engine::facts_cli::run_intents(&args[1..]) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(message) => {
+                eprintln!("Error: {message}");
+                ExitCode::from(1)
+            }
+        },
+        // Fully native since python-retirement Phase 3: the engine-facing
+        // basics answer in aethyme_engine::repo_cli, the UX subcommands
+        // (skills, overrides, telemetry, commit hygiene) in
+        // aethyme_enhance::repo_cli. The Python repo group is deleted;
+        // unknown subcommands (and `--help`) get the native error shape
+        // like the other native groups.
+        // `repo branches audit` is native to the router: it needs neither
+        // the engine nor the enhance templates.
+        "repo" if args.get(1).map(String::as_str) == Some("branches") => {
+            ExitCode::from(branches_audit::run(&args[2..]))
+        }
+        "repo" => match aethyme_engine::repo_cli::run(&args[1..]) {
+            aethyme_engine::repo_cli::Outcome::Handled(Ok(())) => ExitCode::SUCCESS,
+            aethyme_engine::repo_cli::Outcome::Handled(Err(message)) => {
+                eprintln!("Error: {message}");
+                ExitCode::from(1)
+            }
+            aethyme_engine::repo_cli::Outcome::Delegate => {
+                match aethyme_enhance::repo_cli::run(&args[1..]) {
+                    aethyme_enhance::repo_cli::Outcome::Handled(code) => ExitCode::from(code),
+                    aethyme_enhance::repo_cli::Outcome::Delegate => {
+                        eprintln!(
+                            "Error: unsupported repo subcommand: {}",
+                            args.get(1).map(String::as_str).unwrap_or("<none>")
+                        );
+                        ExitCode::from(2)
+                    }
+                }
+            }
+        },
+        "task" => match aethyme_engine::task_cli::run(&args[1..]) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => report_cli_error(error),
+        },
+        "query" => match aethyme_engine::query_cli::run(&args[1..]) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => report_cli_error(error),
+        },
+        "root" => run_root_subcommand(&args[1..]),
+        // The agent-surface hook entry point the Aethyme plugin shims
+        // to. One stable spelling so an installed plugin never has to
+        // match an installed CLI version.
+        "hook" => ExitCode::from(aethyme_broker::agent_hook::run(&args[1..])),
+        // The other half of that stability: the binary that answers
+        // `hook` is the one that registers the hooks, so a plugin
+        // installed this way cannot be paired with a CLI too old to
+        // serve it.
+        "plugin" => ExitCode::from(aethyme_broker::plugin_cli::run(&args[1..])),
+        // Broker commands have been native Rust from birth (issue #31).
+        "broker" if readiness_remediation::is_command(command.args) => {
+            ExitCode::from(readiness_remediation::run(&command.args[1..]))
+        }
+        "broker" => ExitCode::from(aethyme_broker::cli::run_resolved_with_mode(
+            command.args,
+            broker_compatibility_mode,
+        )),
+        "update" => ExitCode::from(aethyme_broker::run_update_cli(command.args)),
+        // #293/#251: the supported upgrade path, spelled as the decision named it.
+        "self-update" => ExitCode::from(aethyme_broker::run_update_cli(&self_update_args(
+            command.args,
+        ))),
+        "upgrade" => ExitCode::from(repository_upgrade::run(command.args)),
+        // Certification — top-level by design (the "airport certification"
+        // inspection). Strictly read-only; adaptive setup lives in
+        // `broker scaffold`.
+        "certify" => ExitCode::from(aethyme_broker::cli::run_resolved(&args)),
+        // Guided setup — certify + scaffold + gates draft in sequence,
+        // idempotent. Top-level like certify: it is the first command a
+        // new repo runs.
+        "init" => ExitCode::from(aethyme_broker::cli::run_resolved(&args)),
+        "deploy" => ExitCode::from(repository_deploy::run(&args[1..])),
+        // Repository enrollment lives under deploy. Its --generated-only
+        // mode exposes the embedded discoverability renderer without broker
+        // scaffolding; unknown forms remain native errors.
+        // Native since python-retirement Phase 4 (the Python `ai-ready`
+        // command and src/scorecard/ are deleted). The 8 detectors,
+        // integer scoring, and json/md renderers live in the
+        // aethyme-quality crate; stdout and report bytes are parity-
+        // verified against the last Python implementation. Usage errors
+        // keep Click's `Error: {message}` line without the usage block
+        // (Phase 2 precedent).
+        "ai-ready" => ExitCode::from(aethyme_quality::ai_ready_cli::run(&args[1..])),
+        "quality" => ExitCode::from(aethyme_quality::quality_cli::run(&args[1..])),
+        // Native since python-retirement Phase 5 (the Python `autofix`
+        // command and src/autofixers/ are deleted). The safety/risk
+        // engine, patch generation, the 5 fixers, and the git/PR helper
+        // live in the same aethyme-quality crate; stdout, produced
+        // unified diffs, and post-apply trees are parity-verified
+        // against the last Python implementation. The PR-mode approval
+        // gate is unchanged: medium/high-risk patches stop the flow
+        // before anything is applied, committed, or pushed. Usage
+        // errors keep Click's `Error: {message}` line without the usage
+        // block (Phase 2 precedent).
+        "autofix" => ExitCode::from(aethyme_quality::autofix_cli::run(&args[1..])),
+        other => unknown_subcommand(other),
+    }
+}
+
+/// Crate version plus the source identity and build time captured by build.rs.
+fn print_version() {
+    let describe = env!("AETHYME_GIT_DESCRIBE");
+    let commit = {
+        let value = env!("AETHYME_GIT_COMMIT");
+        if value.is_empty() { "unknown" } else { value }
+    };
+    let build_date = env!("AETHYME_BUILD_DATE");
+    let stable = if describe.is_empty() {
+        format!("build_commit={commit}")
+    } else {
+        format!("{describe} build_commit={commit}")
+    };
+    println!(
+        "aethyme {} ({stable}) build_date={build_date}",
+        env!("CARGO_PKG_VERSION")
+    );
+}
+
+/// Map a typed engine front-end error onto a process exit code.
+///
+/// Usage errors (unknown flag, missing subcommand, bad arity) exit 2,
+/// matching the unknown-subcommand and `explore` paths. Runtime
+/// failures (missing store, unreadable path, target not found) exit 1.
+/// A caller can therefore tell "I invoked this wrong" from "the work
+/// failed" without string-matching stderr.
+fn report_cli_error(error: aethyme_engine::cli_error::CliError) -> ExitCode {
+    eprintln!("Error: {error}");
+    ExitCode::from(error.exit_code())
+}
+
+fn run_graph_impact(args: &[String]) -> ExitCode {
+    match run_graph_impact_inner(args) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(message) => {
+            eprintln!("Error: {message}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn run_graph_impact_inner(args: &[String]) -> Result<(), String> {
+    let option = |name: &str| -> Result<String, String> {
+        let Some(index) = args.iter().position(|argument| argument == name) else {
+            return Err(format!("graph impact requires {name} <value>"));
+        };
+        args.get(index + 1)
+            .filter(|value| !value.starts_with('-'))
+            .cloned()
+            .ok_or_else(|| format!("graph impact requires {name} <value>"))
+    };
+    let repo = PathBuf::from(option("--repo")?);
+    if !repo.is_dir() {
+        return Err(format!(
+            "graph impact repository is not a directory: {}",
+            repo.display()
+        ));
+    }
+    let revision = option("--revision")?;
+    let diff_input = option("--diff")?;
+    let diff_text = if Path::new(&diff_input).is_file() {
+        std::fs::read_to_string(&diff_input)
+            .map_err(|error| format!("cannot read graph impact diff {diff_input:?}: {error}"))?
+    } else {
+        diff_input
+    };
+    let changed_files = aethyme_broker::parse_diff_text(&diff_text)
+        .map_err(|error| format!("invalid graph impact diff: {error}"))?;
+    let mode = if let Some(index) = args.iter().position(|argument| argument == "--mode") {
+        let value = args
+            .get(index + 1)
+            .ok_or_else(|| "--mode requires calls or imports".to_string())?;
+        aethyme_broker::GraphImpactMode::parse(value)
+            .ok_or_else(|| "--mode must be calls or imports".to_string())?
+    } else {
+        aethyme_broker::GraphImpactMode::Calls
+    };
+    let budget = if let Some(index) = args.iter().position(|argument| argument == "--budget") {
+        args.get(index + 1)
+            .ok_or_else(|| "--budget requires a positive integer".to_string())?
+            .parse::<usize>()
+            .map_err(|_| "--budget must be a positive integer".to_string())?
+    } else {
+        aethyme_broker::GRAPH_IMPACT_DEFAULT_BUDGET
+    };
+    let json = args
+        .iter()
+        .any(|argument| argument == "--json" || argument == "--json-output");
+    // `graph impact` is a read-only report inside a group whose other
+    // 13 subcommands never write. `Broker::open` creates `broker.db` and
+    // runs the broker's write and recovery paths, so in a repository with
+    // no broker merely asking for an impact report would create one; there
+    // the report is evaluated against a read-only snapshot and recorded
+    // nowhere. Where a broker already exists, the evaluation is recorded in
+    // its append-only event log as `graph.impact_evaluated`, which needs a
+    // writable open: a snapshot rejects the append.
+    let main_root = aethyme_broker::GitRepo::discover(&repo)
+        .and_then(|repository| repository.main_root())
+        .map_err(|error| format!("cannot open repository {}: {error}", repo.display()))?;
+    let report = if main_root.join(aethyme_broker::BROKER_DB_RELPATH).is_file() {
+        aethyme_broker::Broker::open(&repo)
+            .map_err(|error| format!("cannot open broker for {}: {error}", repo.display()))?
+            .graph_impact_report(&revision, changed_files, mode, budget)
+    } else {
+        aethyme_broker::Broker::open_snapshot(&repo)
+            .map_err(|error| format!("cannot open broker for {}: {error}", repo.display()))?
+            .graph_impact_evaluate(&revision, changed_files, mode, budget)
+    }
+    .map_err(|error| error.to_string())?;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report).map_err(|error| error.to_string())?
+        );
+    } else {
+        println!(
+            "Graph impact: {} ({}, confidence {}) at {}",
+            report.status.as_str(),
+            report.request.mode.as_str(),
+            report.confidence.as_str(),
+            &report.repository.revision[..12.min(report.repository.revision.len())]
+        );
+        println!(
+            "Coverage: {} file(s) parsed, {} excluded, {} unsupported; languages={}",
+            report.coverage.parsed_files,
+            report.coverage.excluded_files,
+            report.coverage.unsupported_files,
+            if report.coverage.languages.is_empty() {
+                "-".into()
+            } else {
+                report.coverage.languages.join(",")
+            }
+        );
+        println!(
+            "Impact: {} direct, {} transitive, {} {}",
+            report.impact.direct.len(),
+            report.impact.transitive.len(),
+            if mode == aethyme_broker::GraphImpactMode::Calls {
+                report.impact.callers.len()
+            } else {
+                report.impact.importers.len()
+            },
+            mode.label().to_ascii_lowercase()
+        );
+        if !report.impact.tests.is_empty() {
+            println!("Tests: {}", report.impact.tests.join(", "));
+        }
+        if !report.impact.configs.is_empty() {
+            println!("Configs: {}", report.impact.configs.join(", "));
+        }
+        if !report.impact.manifests.is_empty() {
+            println!("Manifests: {}", report.impact.manifests.join(", "));
+        }
+        println!(
+            "Risk hints: security={}, runtime={}, workspace={}, global_config={}",
+            report.risk_hints.security_surface,
+            report.risk_hints.runtime_surface,
+            report.risk_hints.workspace_surface,
+            report.risk_hints.global_config_surface
+        );
+        println!(
+            "Limits: budget={}, nodes={}, depth={}, results={}, truncated={}",
+            report.limits.budget,
+            report.limits.max_nodes,
+            report.limits.max_depth,
+            report.limits.max_results,
+            report.limits.truncated
+        );
+        for explanation in &report.explanations {
+            println!("Reason: {explanation}");
+        }
+        println!(
+            "Provenance: request={}, result={}",
+            report.provenance.request_digest, report.provenance.result_digest
+        );
+    }
+    Ok(())
+}
+
+const TOP_LEVEL_HELP: &str = "\
+aethyme — repository navigation, task localization, agent brokering
+
+Usage: aethyme <command> [args...]
+       aethyme <command> --help
+       aethyme --version | -V
+
+Hot path:
+  explore --repo <path> --request \"<task>\"
+                              in-process engine; auto-starts the engine daemon
+  explore-summary --from explore.json
+                              compact decision surface from a saved answer-json
+  verify-targets --repo <path> --from explore.json [--max-targets 2 --max-lines 80]
+                              bounded source spans for Explore targets
+
+Agent broker:
+  broker start --task <text> --short-name <name>
+                              create an isolated worktree + session
+  broker status               sessions, overlaps, queue, integration, readiness
+  broker submit --session <id>
+                              simulate, gate, and promote a session
+  broker finish --session <id>
+                              safely close a completed session
+  broker unblock [<id>]       list blockers, or clear one
+  broker gc plan|apply        reviewed cleanup of retained state and disk
+  broker advanced <verb>      leases, git, gh, ship, review, operations, exec, ...
+  hook <event>                agent-surface hook entry point (the plugin's only
+                              entry point; reads event JSON on stdin)
+  plugin install|status|remove
+                              install the agent-surface plugin, or report the
+                              plugin/CLI version skew that makes one inert
+  update check|plan|execute|apply
+                              explicit paired-binary updates; never background
+  self-update [--version X.Y.Z]
+                              verified, atomic upgrade (= update apply)
+  upgrade plan|apply|recover  review, apply, or recover repository migrations
+
+Setup:
+  init                        guided setup: certify + scaffold + gates draft
+  certify                     read-only certification checks for this repo
+  deploy [verify|bridge] [--repo <path>]
+                              enroll repository policy and agent guidance
+  root show|set <path>        developer checkout pointer (legacy compatibility)
+
+Graph and analysis:
+  graph status|units|materialize|refresh|impact|node|callers|...
+  task | query | analyze | facts | intents | repo   (each takes --help)
+
+Quality:
+  quality inspect [--repo <path>] bounded optional repository-quality analysis
+
+Deprecated command spellings were removed in v0.8.8; current commands above are canonical.
+";
+
+/// `aethyme --help` prints on stdout and exits 0; a missing command prints the
+/// same text on stderr beside the usage-error exit.
+fn print_top_level_help(requested: bool) {
+    if requested {
+        print!("{TOP_LEVEL_HELP}");
+    } else {
+        eprint!("{TOP_LEVEL_HELP}");
+    }
+}
+
+/// Answer `--help` without running the command.
+fn answer_help(route: help::HelpRoute, args: &[String]) -> ExitCode {
+    match route {
+        help::HelpRoute::Text(text) => {
+            print!("{text}");
+            ExitCode::SUCCESS
+        }
+        help::HelpRoute::Broker => {
+            if args[0] == "broker" {
+                ExitCode::from(aethyme_broker::cli::run(&args[1..]))
+            } else {
+                ExitCode::from(aethyme_broker::cli::run_resolved(args))
+            }
+        }
+        help::HelpRoute::Native(native) => {
+            let rest = &native[1..];
+            let code = match native[0].as_str() {
+                "intents" => match aethyme_engine::facts_cli::run_intents(rest) {
+                    Ok(()) => 0,
+                    Err(message) => {
+                        eprintln!("Error: {message}");
+                        1
+                    }
+                },
+                "update" => aethyme_broker::run_update_cli(rest),
+                "self-update" => aethyme_broker::run_update_cli(&self_update_args(rest)),
+                "plugin" => aethyme_broker::plugin_cli::run(rest),
+                "ai-ready" => aethyme_quality::ai_ready_cli::run(rest),
+                "quality" => aethyme_quality::quality_cli::run(rest),
+                "autofix" => aethyme_quality::autofix_cli::run(rest),
+                "deploy" => repository_deploy::run(rest),
+                "upgrade" => repository_upgrade::run(rest),
+                other => {
+                    eprintln!("Error: no help route for {other}");
+                    2
+                }
+            };
+            ExitCode::from(code)
+        }
+    }
+}
+
+/// Translate current broker spellings and refuse removed aliases before
+/// compatibility policy or command dispatch.
+///
+/// The broker line is resolved exactly once, here, to the command the broker
+/// will dispatch, so the compatibility preflight classifies that command. A
+/// line resolution refuses (a public verb under `advanced`) never runs.
+fn resolve_spelling(args: Vec<String>) -> Result<Vec<String>, ExitCode> {
+    match args[0].as_str() {
+        "broker" => {
+            let resolved = aethyme_broker::cli::resolve(&args[1..]);
+            if let Some(refusal) = &resolved.refusal {
+                eprintln!("Error: {refusal}");
+                return Err(ExitCode::from(2));
+            }
+            if resolved.args.is_empty() {
+                return Ok(args);
+            }
+            Ok(std::iter::once("broker".to_string())
+                .chain(resolved.args)
+                .collect())
+        }
+        "readiness" => {
+            eprintln!(
+                "Error: {}",
+                aethyme_broker::cli::removed_spelling_message(
+                    "aethyme readiness",
+                    "aethyme broker status readiness"
+                )
+            );
+            Err(ExitCode::from(2))
+        }
+        "enhance" => match args.get(1).map(String::as_str) {
+            Some("deploy") => {
+                eprintln!(
+                    "Error: {}",
+                    aethyme_broker::cli::removed_spelling_message(
+                        "aethyme enhance deploy",
+                        "aethyme deploy --generated-only"
+                    )
+                );
+                Err(ExitCode::from(2))
+            }
+            Some("verify") => {
+                eprintln!(
+                    "Error: {}",
+                    aethyme_broker::cli::removed_spelling_message(
+                        "aethyme enhance verify",
+                        "aethyme deploy verify --generated-only"
+                    )
+                );
+                Err(ExitCode::from(2))
+            }
+            _ => Ok(args),
+        },
+        _ => Ok(args),
+    }
+}
+
+// ── explore ─────────────────────────────────────────────────────────────────
+//
+// In-process engine call via the shared front end. No Python involvement:
+// the Python explore orchestrator was deleted 2026-05-08, so the old
+// "fall back to Python" tail was already a dead path. The only recoverable
+// condition is "daemon not running", which the router now fixes itself.
+
+fn run_explore(args: &[String]) -> ExitCode {
+    use aethyme_engine::explore_cli::{ExploreCliOutcome, run};
+    match run(args) {
+        ExploreCliOutcome::Done => ExitCode::SUCCESS,
+        ExploreCliOutcome::BadUsage(msg) => {
+            eprintln!("{msg}");
+            ExitCode::from(2)
+        }
+        ExploreCliOutcome::Failed(msg) => {
+            eprintln!("{msg}");
+            ExitCode::from(1)
+        }
+        ExploreCliOutcome::DaemonNotRunning { repo } => {
+            eprintln!(
+                "explore: engine daemon not running for {} — starting it \
+                 (first map build can take a minute on large repos)…",
+                repo.display()
+            );
+            if let Err(msg) = start_engine_daemon_and_wait(&repo) {
+                eprintln!("explore: {msg}");
+                return ExitCode::from(1);
+            }
+            match run(args) {
+                ExploreCliOutcome::Done => ExitCode::SUCCESS,
+                ExploreCliOutcome::DaemonNotRunning { .. } => {
+                    eprintln!(
+                        "explore: engine daemon still not reachable after start; \
+                         check {}",
+                        aethyme_engine::daemon::logfile_path_for(&repo).display()
+                    );
+                    ExitCode::from(1)
+                }
+                ExploreCliOutcome::BadUsage(msg) => {
+                    eprintln!("{msg}");
+                    ExitCode::from(2)
+                }
+                ExploreCliOutcome::Failed(msg) => {
+                    eprintln!("{msg}");
+                    ExitCode::from(1)
+                }
+            }
+        }
+    }
+}
+
+fn run_verify_targets(args: &[String]) -> ExitCode {
+    use aethyme_engine::verify_targets_cli::{VerifyTargetsCliOutcome, run};
+    match run(args) {
+        VerifyTargetsCliOutcome::Done => ExitCode::SUCCESS,
+        VerifyTargetsCliOutcome::BadUsage(message) => {
+            eprintln!("{message}");
+            ExitCode::from(2)
+        }
+        VerifyTargetsCliOutcome::Failed(message) => {
+            eprintln!("{message}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn run_explore_summary(args: &[String]) -> ExitCode {
+    use aethyme_enhance::explore_summary_cli::{ExploreSummaryCliOutcome, run};
+    match run(args) {
+        ExploreSummaryCliOutcome::Done => ExitCode::SUCCESS,
+        ExploreSummaryCliOutcome::BadUsage(message) => {
+            eprintln!("{message}");
+            ExitCode::from(2)
+        }
+        ExploreSummaryCliOutcome::Failed(message) => {
+            eprintln!("{message}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn start_engine_daemon_and_wait(repo: &Path) -> Result<(), String> {
+    use aethyme_engine::daemon::{self, ReadyOutcome, StartOutcome};
+    let serve_exe = engine_cli_binary_path();
+    let opts = daemon::StartOptions::default();
+    let mut spawned = match daemon::start_detached(repo, &serve_exe, &opts)? {
+        StartOutcome::Spawned(child) => Some(child),
+        // Already running but the socket refused just now — likely mid
+        // map-build. Don't watch a process we didn't spawn.
+        StartOutcome::AlreadyRunning(_) => None,
+    };
+    match daemon::wait_until_ready(repo, spawned.as_mut(), DAEMON_READY_TIMEOUT) {
+        ReadyOutcome::Ready => Ok(()),
+        ReadyOutcome::ProcessExited => Err(format!(
+            "engine daemon exited during startup (is the repo indexed? \
+             run `aethyme graph status --repo .`, then review and execute \
+             `aethyme graph refresh plan --repo .`). Log tail:\n{}",
+            daemon::log_tail(repo, 5)
+        )),
+        ReadyOutcome::TimedOut => Err(format!(
+            "engine daemon did not become ready within {}s; log: {}",
+            DAEMON_READY_TIMEOUT.as_secs(),
+            daemon::logfile_path_for(repo).display()
+        )),
+    }
+}
+
+/// Locate the `aethyme-engine-cli` binary, used only as the detached
+/// daemon-serve process. It's built into the same directory as this
+/// binary (both by `cargo build` and by `cargo install --path`), so a
+/// sibling lookup covers both layouts; PATH is the fallback.
+fn engine_cli_binary_path() -> PathBuf {
+    if let Ok(mut exe) = env::current_exe() {
+        exe.pop();
+        let candidate = exe.join("aethyme-engine-cli");
+        if candidate.is_file() {
+            return candidate;
+        }
+    }
+    PathBuf::from("aethyme-engine-cli")
+}
+
+// ── aethyme root — legacy developer checkout pointer ────────────────────────
+//
+// Repository deployment is self-contained and does not consult this pointer.
+// The command remains for developer compatibility and explicit inspection of
+// source checkouts configured by older installations.
+//
+// Resolution order:
+//   1. $AETHYME_ROOT (explicit override, highest priority)
+//   2. pointer file: $XDG_CONFIG_HOME/aethyme/root (default ~/.config/aethyme/root)
+//   3. upward walk from the current directory (covers working inside the
+//      Aethyme repo or any of its worktrees with zero configuration)
+//
+// Existing pointer files remain readable so upgrades do not destroy operator
+// configuration.
+
+fn config_pointer_path() -> Option<PathBuf> {
+    let base = env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
+    Some(base.join("aethyme").join("root"))
+}
+
+/// A directory qualifies as an Aethyme developer checkout when it holds the
+/// Rust workspace and canonical skill sources.
+fn is_aethyme_root(dir: &Path) -> bool {
+    dir.join("rust").join("Cargo.toml").is_file() && dir.join("skills").join("aethyme").is_dir()
+}
+
+fn resolve_aethyme_root() -> Option<(PathBuf, &'static str)> {
+    if let Ok(v) = env::var("AETHYME_ROOT")
+        && !v.is_empty()
+    {
+        return Some((PathBuf::from(v), "AETHYME_ROOT env"));
+    }
+    if let Some(pointer) = config_pointer_path()
+        && let Ok(text) = std::fs::read_to_string(&pointer)
+    {
+        let trimmed = text.trim();
+        if !trimmed.is_empty() {
+            let path = PathBuf::from(trimmed);
+            if is_aethyme_root(&path) {
+                return Some((path, "pointer file"));
+            }
+        }
+    }
+    // Upward walk: <dir>/packages/aethyme (monorepo root or any worktree)
+    // or <dir> itself (running from inside the package).
+    let mut dir = env::current_dir().ok()?;
+    loop {
+        if is_aethyme_root(&dir) {
+            return Some((dir, "upward walk"));
+        }
+        let candidate = dir.join("packages").join("aethyme");
+        if is_aethyme_root(&candidate) {
+            return Some((candidate, "upward walk"));
+        }
+        if !dir.pop() {
+            return None;
+        }
+    }
+}
+
+fn run_root_subcommand(args: &[String]) -> ExitCode {
+    match args.first().map(String::as_str) {
+        Some("show") | None => match resolve_aethyme_root() {
+            Some((path, source)) => {
+                println!("{} (via {source})", path.display());
+                ExitCode::SUCCESS
+            }
+            None => {
+                eprintln!("aethyme root: not resolved. Fix one of:");
+                print_root_guidance();
+                ExitCode::from(1)
+            }
+        },
+        Some("set") => {
+            let Some(raw) = args.get(1) else {
+                eprintln!("usage: aethyme root set <path-to-aethyme-package>");
+                return ExitCode::from(2);
+            };
+            let path = match std::fs::canonicalize(raw) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("aethyme root set: {raw}: {e}");
+                    return ExitCode::from(1);
+                }
+            };
+            // Accept either the package dir or the monorepo root.
+            let target = if is_aethyme_root(&path) {
+                path
+            } else {
+                let nested = path.join("packages").join("aethyme");
+                if is_aethyme_root(&nested) {
+                    nested
+                } else {
+                    eprintln!(
+                        "aethyme root set: {} does not contain rust/Cargo.toml + skills/aethyme \
+                         (nor packages/aethyme/)",
+                        path.display()
+                    );
+                    return ExitCode::from(1);
+                }
+            };
+            let Some(pointer) = config_pointer_path() else {
+                eprintln!("aethyme root set: cannot resolve a config directory (no HOME)");
+                return ExitCode::from(1);
+            };
+            if let Some(parent) = pointer.parent()
+                && let Err(e) = std::fs::create_dir_all(parent)
+            {
+                eprintln!("aethyme root set: create {}: {e}", parent.display());
+                return ExitCode::from(1);
+            }
+            if let Err(e) = std::fs::write(&pointer, format!("{}\n", target.display())) {
+                eprintln!("aethyme root set: write {}: {e}", pointer.display());
+                return ExitCode::from(1);
+            }
+            println!(
+                "aethyme root -> {} ({})",
+                target.display(),
+                pointer.display()
+            );
+            ExitCode::SUCCESS
+        }
+        Some(other) => {
+            eprintln!("aethyme root: unknown action '{other}' (use show|set)");
+            ExitCode::from(2)
+        }
+    }
+}
+
+fn print_root_guidance() {
+    eprintln!("  - run from inside an Aethyme checkout (auto-discovered), or");
+    eprintln!("  - `aethyme root set /path/to/Aethyme` (writes ~/.config/aethyme/root), or");
+    eprintln!("  - export AETHYME_ROOT=/path/to/Aethyme/packages/aethyme");
+}
+
+/// Unknown subcommand. Until python-retirement Phase 6 this fell through
+/// to `python -m src.cli <subcommand>`; `src/` is deleted, so an unknown
+/// name is simply an error.
+fn unknown_subcommand(subcommand: &str) -> ExitCode {
+    eprintln!("aethyme: unknown subcommand '{subcommand}'");
+    eprintln!("Run `aethyme --help` for the command list.");
+    ExitCode::from(2)
+}
+
+/// `aethyme self-update <args>` is `aethyme update apply <args>`.
+fn self_update_args(args: &[String]) -> Vec<String> {
+    std::iter::once("apply".to_string())
+        .chain(args.iter().cloned())
+        .collect()
+}
+
+#[cfg(test)]
+mod compatibility_command_tests {
+    use super::{
+        ParsedCommand,
+        repository_upgrade::{CommandCapability, InvocationSurface},
+    };
+
+    fn capability(args: &[&str]) -> Option<CommandCapability> {
+        let args = args
+            .iter()
+            .map(|arg| (*arg).to_string())
+            .collect::<Vec<_>>();
+        let args = super::resolve_spelling(args).ok()?;
+        ParsedCommand::parse(&args)
+            .unwrap()
+            .compatibility_capability
+    }
+
+    fn surface(args: &[&str]) -> Option<InvocationSurface> {
+        let args = args
+            .iter()
+            .map(|arg| (*arg).to_string())
+            .collect::<Vec<_>>();
+        let args = super::resolve_spelling(args).ok()?;
+        ParsedCommand::parse(&args).unwrap().invocation_surface
+    }
+
+    #[test]
+    fn parsed_commands_cover_every_compatibility_capability() {
+        let cases = [
+            (&["broker", "status"][..], CommandCapability::DiagnosticRead),
+            (
+                &["broker", "gc", "storage"][..],
+                CommandCapability::DiagnosticRead,
+            ),
+            (
+                &["broker", "gc", "storage", "apply"][..],
+                CommandCapability::RecoveryWrite,
+            ),
+            (
+                &["broker", "status", "readiness", "--require", "agent-ready"][..],
+                CommandCapability::DiagnosticRead,
+            ),
+            (
+                &["broker", "advanced", "integration", "reconcile", "--apply"][..],
+                CommandCapability::RecoveryWrite,
+            ),
+            (
+                &["broker", "advanced", "checkpoint", "plan", "--session", "7"][..],
+                CommandCapability::DiagnosticRead,
+            ),
+            (
+                &[
+                    "broker",
+                    "advanced",
+                    "checkpoint",
+                    "apply",
+                    "--session",
+                    "7",
+                ][..],
+                CommandCapability::RecoveryWrite,
+            ),
+            (
+                &["broker", "submit", "--session", "7"][..],
+                CommandCapability::SessionContinuation,
+            ),
+            (
+                &["broker", "advanced", "hooks", "pre-commit"][..],
+                CommandCapability::ManagedPreCommit,
+            ),
+            (
+                &["broker", "start", "--task", "work"][..],
+                CommandCapability::NewSession,
+            ),
+            (
+                &["broker", "advanced", "ship", "execute"][..],
+                CommandCapability::SharedMutation,
+            ),
+            (&["upgrade", "plan"][..], CommandCapability::Upgrade),
+        ];
+
+        for (args, expected) in cases {
+            assert_eq!(
+                capability(args),
+                Some(expected),
+                "unexpected capability for {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn compatibility_is_scoped_to_the_existing_broker_boundary() {
+        assert_eq!(
+            capability(&["broker", "start", "--reuse"]),
+            Some(CommandCapability::NewSession)
+        );
+        assert_eq!(
+            capability(&["broker", "start", "--adopt"]),
+            Some(CommandCapability::NewSession)
+        );
+        assert_eq!(capability(&["explore"]), None);
+    }
+
+    #[test]
+    fn contract_check_skips_repository_compatibility_preflight() {
+        assert_eq!(capability(&["broker", "check-contract"]), None);
+        assert_eq!(surface(&["broker", "check-contract"]), None);
+    }
+
+    #[test]
+    fn invoking_surface_is_identified_before_compatibility_rendering() {
+        for (args, expected) in [
+            (
+                &["broker", "advanced", "hooks", "pre-commit"][..],
+                InvocationSurface::Hook,
+            ),
+            (&["broker", "status"][..], InvocationSurface::BrokerCommand),
+            (&["upgrade", "plan"][..], InvocationSurface::UpgradeCommand),
+            (
+                &["broker", "advanced", "gh", "--session", "7"][..],
+                InvocationSurface::CoordinatedOperation,
+            ),
+            (
+                &["broker", "advanced", "operations"][..],
+                InvocationSurface::CoordinatedOperation,
+            ),
+        ] {
+            assert_eq!(
+                surface(args),
+                Some(expected),
+                "unexpected surface: {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn degraded_repository_lanes_match_command_semantics() {
+        let cases = [
+            (
+                &[
+                    "broker",
+                    "advanced",
+                    "integration",
+                    "reconcile",
+                    "--dry-run",
+                ][..],
+                CommandCapability::DiagnosticRead,
+            ),
+            (
+                &["broker", "advanced", "integration", "reconcile", "--apply"][..],
+                CommandCapability::RecoveryWrite,
+            ),
+            (
+                &["broker", "advanced", "report", "capture"][..],
+                CommandCapability::DiagnosticRead,
+            ),
+            (
+                &["broker", "advanced", "report", "file"][..],
+                CommandCapability::RecoveryWrite,
+            ),
+            (
+                &["broker", "advanced", "git", "--session", "7"][..],
+                CommandCapability::RecoveryWrite,
+            ),
+            (
+                &["broker", "finish", "--session", "7"][..],
+                CommandCapability::RecoveryWrite,
+            ),
+            (
+                &["broker", "finish", "close", "--session", "7"][..],
+                CommandCapability::RecoveryWrite,
+            ),
+            (
+                &["broker", "advanced", "hooks", "pre-commit"][..],
+                CommandCapability::ManagedPreCommit,
+            ),
+            (
+                &["broker", "advanced", "integration", "status"][..],
+                CommandCapability::DiagnosticRead,
+            ),
+            (
+                &["broker", "advanced", "advisories", "list"][..],
+                CommandCapability::DiagnosticRead,
+            ),
+            (
+                &["broker", "advanced", "advisories", "show", "7"][..],
+                CommandCapability::DiagnosticRead,
+            ),
+            (
+                &["broker", "advanced", "advisories", "ack", "7"][..],
+                CommandCapability::RecoveryWrite,
+            ),
+            (
+                &["broker", "advanced", "watch", "pr", "list"][..],
+                CommandCapability::DiagnosticRead,
+            ),
+            (
+                &["broker", "advanced", "watch", "pr", "poll", "--id", "7"][..],
+                CommandCapability::SessionContinuation,
+            ),
+            (
+                &["broker", "advanced", "deliveries", "list"][..],
+                CommandCapability::DiagnosticRead,
+            ),
+            (
+                &["broker", "advanced", "deliveries", "claim"][..],
+                CommandCapability::SharedMutation,
+            ),
+        ];
+        for (args, expected) in cases {
+            assert_eq!(
+                capability(args),
+                Some(expected),
+                "unexpected lane: {args:?}"
+            );
+        }
+    }
+}

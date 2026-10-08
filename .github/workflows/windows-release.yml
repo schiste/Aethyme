@@ -1,0 +1,51 @@
+name: Windows release smoke
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/release.yml"
+      - ".github/workflows/windows-release.yml"
+      - "scripts/windows-release-smoke.ps1"
+      - "packages/aethyme/rust/Cargo.lock"
+      - "packages/aethyme/rust/Cargo.toml"
+      - "packages/aethyme/rust/crates/aethyme-cli/**"
+      - "packages/aethyme/rust/crates/aethyme-engine/**"
+      - "packages/aethyme/rust/crates/aethyme-enhance/**"
+      - "packages/aethyme/rust/crates/aethyme-quality/**"
+      - "packages/aethyme/rust/crates/aethyme-graph-indexer/**"
+      - "packages/aethyme/rust/crates/aethyme-graph-storage/**"
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    name: Windows x64 build and native smoke
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
+          targets: x86_64-pc-windows-msvc
+
+      - name: Build release binaries
+        working-directory: packages/aethyme/rust
+        run: cargo build --release --locked --target x86_64-pc-windows-msvc -p aethyme-cli --bin aethyme -p aethyme-engine --bin aethyme-engine-cli -p aethyme-graph-indexer --bin aethyme-graph-index
+
+      - name: Package and smoke zip
+        shell: pwsh
+        working-directory: packages/aethyme/rust
+        run: |
+          $archive = Join-Path $env:RUNNER_TEMP "aethyme-ci-x86_64-pc-windows-msvc.zip"
+          Compress-Archive -Path "target/x86_64-pc-windows-msvc/release/aethyme.exe", "target/x86_64-pc-windows-msvc/release/aethyme-engine-cli.exe" -DestinationPath $archive -CompressionLevel Optimal
+          $smokeRoot = Join-Path $env:RUNNER_TEMP "aethyme-ci-windows-unpacked"
+          Expand-Archive -LiteralPath $archive -DestinationPath $smokeRoot -Force
+          & "$env:GITHUB_WORKSPACE/scripts/windows-release-smoke.ps1" -RouterPath (Join-Path $smokeRoot "aethyme.exe") -EnginePath (Join-Path $smokeRoot "aethyme-engine-cli.exe") -IndexerPath (Join-Path (Join-Path $env:GITHUB_WORKSPACE "packages/aethyme/rust/target/x86_64-pc-windows-msvc/release") "aethyme-graph-index.exe")
