@@ -2378,7 +2378,7 @@ fn session_161_rebase_submit_promote_continue_and_submit_again() {
 
     sh(
         &worktree,
-        &["rebase", "--onto", "aethyme/integration", &adopted, "HEAD"],
+        &["rebase", "--onto", "aethyme/integration", &adopted],
     );
     commit_edit(&worktree, "src/b.py", "b = 3\n");
     let first_accepted_head = resolve(&worktree, "HEAD");

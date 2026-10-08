@@ -559,9 +559,7 @@ pub(super) fn checkout_drift_advice(
         return None;
     }
 
-    let recorded_head = recorded_branch_head
-        .map(short_commit)
-        .unwrap_or("missing");
+    let recorded_head = recorded_branch_head.map(short_commit).unwrap_or("missing");
     let worktree = shell_quote(&agent.session.worktree_path);
     let recorded_ref = shell_quote(&format!("refs/heads/{}", agent.session.branch));
     Some(StatusAdvice {
