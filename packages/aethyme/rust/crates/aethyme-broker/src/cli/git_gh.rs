@@ -736,6 +736,7 @@ pub(super) fn run_git_gh(parsed: Parsed, subcommand: &str) -> Result<(), UsageEr
                 Some(missing) => format!("{reason}\n  run instead: {}", echo.corrected(&missing)),
                 None => reason,
             };
+            let reason = crate::session_push::with_pre_push_path_hint(&reason);
             return Err(crate::BrokerOpError::InvalidCoordinatedOperation { reason }.into());
         }
         Err(error) => return Err(error.into()),
@@ -829,6 +830,12 @@ fn coordinated_failure_message(
     if !tail.is_empty() {
         message.push_str(": ");
         message.push_str(&tail.join(" | "));
+    }
+    if let Some(hint) =
+        crate::session_push::missing_executable_path_hint(&report.stdout, &report.stderr)
+    {
+        message.push('\n');
+        message.push_str(hint);
     }
     message
 }
