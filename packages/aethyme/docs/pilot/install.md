@@ -1,10 +1,13 @@
-# Pilot install guide
+# Pilot install guide (protocol v1)
 
-Last Updated: 2026-09-26
+Last Updated: 2026-10-08
 
-From a fresh machine to a first submitted session. Commands use the v0.8.4
-spellings; where v0.8.3 differs, the old spelling is noted and still works
-(it prints a deprecation warning on v0.8.4 and later).
+From a fresh machine to a first submitted session. Before the pilot, the owner
+selects one supported Aethyme release and tells every participant the exact
+version and installation method. Record both binary versions and keep the
+version and repository gate policy stable across the comparison windows. The
+historical v0.8.3/v0.8.4 spellings below are compatibility notes only; use the
+current command forms in this guide for a current release.
 
 ## 1. Install
 
@@ -20,6 +23,10 @@ aethyme-engine-cli --version
 ```
 
 Update later with `brew update && brew upgrade aethyme`.
+For a fixed-version cohort, use Homebrew only when the tap formula is pinned
+to the exact version selected for the cohort; otherwise use the versioned
+installer or the matching source tag below. Confirm both installed binaries
+report that same version.
 
 **Installer script** (no Homebrew). It downloads the release archive for
 your platform and checks its checksum:
@@ -30,17 +37,29 @@ aethyme --version
 aethyme-engine-cli --version
 ```
 
-To pin the pilot release, pass it: `sh -s -- --version 0.8.4`. For a
-signature-verified install, download `install.sh`, read it, and run it with
-`--verify-signature` (needs Cosign 3). Review updates explicitly with
-`aethyme update check`, `aethyme update plan` and
-`aethyme update execute --confirm <manifest-sha256>`; nothing updates in the
-background.
-
-**From source** (needs a Rust toolchain):
+For an exact cohort pin, the owner supplies `PILOT_AETHYME_VERSION`; pass that
+version to the installer:
 
 ```bash
-git clone https://github.com/schiste/Aethyme.git
+: "${PILOT_AETHYME_VERSION:?Set the version selected for this pilot cohort}"
+curl -fsSL https://github.com/schiste/Aethyme/releases/latest/download/install.sh \
+  | sh -s -- --version "$PILOT_AETHYME_VERSION"
+```
+
+For a signature-verified install, download `install.sh`, read it, and run it
+with `--verify-signature` (needs Cosign 3). Review updates explicitly with
+`aethyme update check`, `aethyme update plan` and
+`aethyme update execute --confirm <manifest-sha256>`; nothing updates in the
+background. A failed download, validation, staged smoke test, or activation
+check restores the prior installer-managed bundle automatically. There is no
+user-facing command to manually switch back to that bundle; do not describe
+that as a participant rollback step.
+
+**From source** (needs a Rust toolchain; check out the same release tag selected
+for the cohort):
+
+```bash
+git clone --branch "v$PILOT_AETHYME_VERSION" --depth 1 https://github.com/schiste/Aethyme.git
 cd Aethyme
 cargo install --locked --path packages/aethyme/rust/crates/aethyme-cli
 cargo install --locked --path packages/aethyme/rust/crates/aethyme-engine
@@ -141,7 +160,11 @@ creating a new one: `aethyme broker start --adopt --task "..." --short-name "...
 
 Then add it to cron; see [metrics-export.md](metrics-export.md).
 
-## v0.8.3 and v0.8.4 spellings
+## Historical v0.8.3 and v0.8.4 spellings
+
+This table is for reading old pilot notes, not for installing a current cohort.
+The documented alias window ended at v0.8.8; use the current spellings above
+for later releases.
 
 <!-- deprecated-spellings: begin (old spellings named on purpose; see aethyme-testkit/tests/deprecated_spelling_callers.rs) -->
 
@@ -157,5 +180,4 @@ Then add it to cron; see [metrics-export.md](metrics-export.md).
 <!-- deprecated-spellings: end -->
 
 `init`, `certify`, `deploy`, `start --task`, `status`, `submit`, `finish`,
-`unblock <id>` and `gc plan|apply` are the same in both. The old spellings
-keep working until v0.8.8.
+`unblock <id>` and `gc plan|apply` are the same in both historical releases.
