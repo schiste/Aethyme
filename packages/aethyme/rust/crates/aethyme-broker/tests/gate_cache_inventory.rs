@@ -9,8 +9,8 @@
 //!
 //! One fixture holds a fake gate cache tree (this repository's entries plus
 //! another repository's), a finished session and a live session, each with
-//! build output. Every case runs the CLI in its own process with private host
-//! cache and state directories, so nothing here reads or writes the machine's.
+//! build output. Every case runs the CLI in its own process with private
+//! worktree, host cache and state directories, so nothing here reads or writes the machine's.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -97,6 +97,7 @@ struct World {
     repo: PathBuf,
     cache: PathBuf,
     state: PathBuf,
+    worktree_container: PathBuf,
     finished: PathBuf,
     live: PathBuf,
     /// `<cache>/gates/<this repository's key>`.
@@ -116,6 +117,7 @@ impl World {
             .current_dir(cwd)
             .env("AETHYME_HOST_CACHE_DIR", &self.cache)
             .env("AETHYME_HOST_STATE_DIR", &self.state)
+            .env("AETHYME_WORKTREE_ROOT", &self.worktree_container)
             .output()
             .unwrap()
     }
@@ -206,6 +208,10 @@ fn world() -> World {
     .unwrap();
 
     let mut broker = Broker::open(&repo).unwrap();
+    let worktree_container = tmp.path().join("host-worktrees");
+    std::fs::create_dir_all(&worktree_container).unwrap();
+    let worktree_key = broker.worktree_root_plan().unwrap().repository_key;
+    broker = broker.with_worktree_root(worktree_container.join(worktree_key));
     let finished = broker.start_worktree("finished work", None).unwrap();
     let finished_path = PathBuf::from(&finished.worktree_path);
     std::fs::write(finished_path.join("done.txt"), "done\n").unwrap();
@@ -242,6 +248,7 @@ fn world() -> World {
         repo,
         cache,
         state,
+        worktree_container,
         finished: finished_path,
         live: live_path,
         gates: PathBuf::new(),

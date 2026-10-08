@@ -612,7 +612,6 @@ pub use worktree_reconcile::{
     WORKTREE_RECONCILIATION_SCHEMA_VERSION, WorktreeReconciliation,
     reconcile as reconcile_worktree_directories, summarise as summarise_worktree_reconciliation,
 };
-pub(crate) use worktree_report::append_prunable_registrations;
 pub use worktree_report::{
     GitWorktreeState, SizeSource, WORKTREE_REPORT_SIZE_BUDGET, WorkState, WorktreeReport,
     WorktreeRow, WorktreeSizing, build as build_worktree_report,

@@ -26,7 +26,7 @@ use crate::gc::{TreeRemoval, remove_condemned_tree};
 use crate::reclaim::is_artefact_directory_with_extras;
 use crate::{BrokerStore, GitRepo};
 
-pub const STORAGE_PLAN_SCHEMA_VERSION: u32 = 2;
+pub const STORAGE_PLAN_SCHEMA_VERSION: u32 = 3;
 pub const STORAGE_RECONCILIATION_SCHEMA_VERSION: u32 = 1;
 
 const DAY_MS: i64 = 86_400_000;
@@ -148,6 +148,37 @@ pub struct StorageReconciliation {
     pub entries: Vec<StorageEntry>,
 }
 
+/// A local branch ref that is either named by the broker session ledger or
+/// uses the broker's `agent/` namespace without a matching ledger record.
+/// This is an inventory only: it never authorizes branch deletion.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct StorageBranchEntry {
+    /// Branch name without the `refs/heads/` prefix.
+    pub name: String,
+    pub head: String,
+    /// Every session record that names this branch, including cleaned rows.
+    pub session_ids: Vec<i64>,
+    /// Session rows that have not completed cleanup and therefore still hold
+    /// the branch in the broker's ownership ledger.
+    pub uncleared_session_ids: Vec<i64>,
+    /// Registered Git worktrees that currently check out this branch.
+    pub checked_out_paths: Vec<PathBuf>,
+    pub ownership: StorageBranchOwnership,
+    /// Why this inventory keeps the ref visible and what must be reviewed
+    /// before a separate cleanup workflow could remove it.
+    pub retention_reason: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StorageBranchOwnership {
+    SessionLedger,
+    Unknown,
+    /// The repository's integration or default branch. No session owns it,
+    /// even when an old ledger row (an adopted main checkout) names it.
+    Shared,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct StorageRoot {
     /// Normalised absolute path of one direct entry beneath the host storage
@@ -187,6 +218,15 @@ pub struct StorageRoot {
     pub estimated_inodes: Option<u64>,
     pub sized: bool,
     pub reconciliation: StorageReconciliation,
+    /// Whether the owner checkout's local refs were read successfully. False
+    /// means an absent/unreadable owner or failed `for-each-ref`; it is never
+    /// interpreted as an empty branch inventory.
+    #[serde(default)]
+    pub session_branch_inventory_complete: bool,
+    /// Session-owned refs plus unclaimed `agent/` refs. An unclaimed ref is
+    /// reported as unknown ownership and retained for review.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub session_branches: Vec<StorageBranchEntry>,
     pub blockers: Vec<String>,
 }
 
@@ -232,6 +272,12 @@ pub struct StorageSummary {
     pub preparation_entry_count: usize,
     #[serde(default)]
     pub preparation_candidate_count: usize,
+    #[serde(default)]
+    pub broker_branch_ref_count: usize,
+    #[serde(default)]
+    pub unclaimed_agent_branch_ref_count: usize,
+    #[serde(default)]
+    pub incomplete_branch_inventory_root_count: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preparation_reclaimable_bytes: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -416,6 +462,8 @@ struct DiskObservation {
 struct OwnerSources {
     git_registered: BTreeSet<PathBuf>,
     ledger_claimed: BTreeMap<PathBuf, Vec<i64>>,
+    session_branch_inventory_complete: bool,
+    session_branches: Vec<StorageBranchEntry>,
     /// Claimed paths whose every claiming session finished its cleanup.
     retired: BTreeSet<PathBuf>,
 }
@@ -772,6 +820,8 @@ fn inspect_root(
             estimated_bytes,
             estimated_inodes,
             reconciliation: empty_reconciliation(),
+            session_branch_inventory_complete: false,
+            session_branches: Vec::new(),
             blockers: vec!["entry is not a real directory and is never swept".into()],
         };
     }
@@ -804,6 +854,8 @@ fn inspect_root(
             retired_count: 0,
             sized: estimated_bytes.is_some() && estimated_inodes.is_some(),
             worktree_count: 0,
+            session_branch_inventory_complete: false,
+            session_branches: Vec::new(),
         };
     }
 
@@ -880,6 +932,14 @@ fn inspect_root(
             Ok(sources) => owner_sources = Some(sources),
             Err(error) => blockers.push(error),
         }
+    }
+    if owner_sources
+        .as_ref()
+        .is_some_and(|sources| !sources.session_branch_inventory_complete)
+    {
+        blockers.push(
+            "local branch refs could not be completely enumerated; branch ownership is unknown and no ref is eligible for removal".into(),
+        );
     }
 
     let mut entries = BTreeMap::new();
@@ -979,6 +1039,12 @@ fn inspect_root(
         estimated_inodes,
         sized,
         reconciliation,
+        session_branch_inventory_complete: owner_sources
+            .as_ref()
+            .is_some_and(|sources| sources.session_branch_inventory_complete),
+        session_branches: owner_sources
+            .as_ref()
+            .map_or_else(Vec::new, |sources| sources.session_branches.clone()),
         blockers,
     }
 }
@@ -1726,6 +1792,24 @@ fn summarise(
                 .iter()
                 .map(|candidate| candidate.estimated_inodes),
         ),
+        broker_branch_ref_count: roots
+            .iter()
+            .flat_map(|root| &root.session_branches)
+            .filter(|branch| branch.ownership == StorageBranchOwnership::SessionLedger)
+            .count(),
+        unclaimed_agent_branch_ref_count: roots
+            .iter()
+            .flat_map(|root| &root.session_branches)
+            .filter(|branch| branch.ownership == StorageBranchOwnership::Unknown)
+            .count(),
+        incomplete_branch_inventory_root_count: roots
+            .iter()
+            .filter(|root| {
+                root.marker_status == StorageMarkerStatus::Valid
+                    && root.owner_exists == Some(true)
+                    && !root.session_branch_inventory_complete
+            })
+            .count(),
         estimated_bytes,
         estimated_inodes,
         reclaimable_bytes,
@@ -1757,14 +1841,29 @@ fn inspect_owner(owner: &Path, host_root: &Path) -> Result<OwnerSources, String>
             discovered_main.display()
         ));
     }
+    let worktrees = checkout
+        .worktree_inventory()
+        .map_err(|error| format!("Git worktree registrations cannot be inspected: {error}"))?;
     let mut git_registered = BTreeSet::new();
-    for path in checkout
-        .worktree_paths()
-        .map_err(|error| format!("Git worktree registrations cannot be inspected: {error}"))?
-    {
-        let path = normalise_absolute(&path, owner);
+    let mut checked_out = BTreeMap::<String, Vec<PathBuf>>::new();
+    for worktree in &worktrees {
+        let path = normalise_absolute(&worktree.path, owner);
         if is_direct_child(&path, host_root) {
-            git_registered.insert(path);
+            git_registered.insert(path.clone());
+        }
+        if !worktree.prunable
+            && worktree.path.exists()
+            && let Some(branch) = worktree.branch.as_deref()
+        {
+            checked_out
+                .entry(
+                    branch
+                        .strip_prefix("refs/heads/")
+                        .unwrap_or(branch)
+                        .to_string(),
+                )
+                .or_default()
+                .push(path);
         }
     }
 
@@ -1783,14 +1882,111 @@ fn inspect_owner(owner: &Path, host_root: &Path) -> Result<OwnerSources, String>
     })?;
     let mut ledger_claimed = BTreeMap::<PathBuf, Vec<i64>>::new();
     let mut all_cleaned = BTreeMap::<PathBuf, bool>::new();
-    let mut sessions = store
+    let uncleared_sessions = store
         .live_sessions()
         .map_err(|error| format!("live session ledger cannot be read: {error}"))?;
+    let mut sessions = uncleared_sessions.clone();
     sessions.extend(
         store
             .cleaned_sessions()
             .map_err(|error| format!("closed session ledger cannot be read: {error}"))?,
     );
+    let mut session_ids_by_branch = BTreeMap::<String, Vec<i64>>::new();
+    let mut uncleared_ids_by_branch = BTreeMap::<String, Vec<i64>>::new();
+    for session in &sessions {
+        let branch = session
+            .branch
+            .strip_prefix("refs/heads/")
+            .unwrap_or(&session.branch);
+        if !branch.is_empty() {
+            session_ids_by_branch
+                .entry(branch.to_string())
+                .or_default()
+                .push(session.id);
+        }
+    }
+    for session in &uncleared_sessions {
+        let branch = session
+            .branch
+            .strip_prefix("refs/heads/")
+            .unwrap_or(&session.branch);
+        if !branch.is_empty() {
+            uncleared_ids_by_branch
+                .entry(branch.to_string())
+                .or_default()
+                .push(session.id);
+        }
+    }
+    for ids in session_ids_by_branch.values_mut() {
+        ids.sort_unstable();
+        ids.dedup();
+    }
+    for ids in uncleared_ids_by_branch.values_mut() {
+        ids.sort_unstable();
+        ids.dedup();
+    }
+    for paths in checked_out.values_mut() {
+        paths.sort();
+        paths.dedup();
+    }
+    // Resolved from the repository, never from a session record: an adopted
+    // main checkout's ledger row names the default branch, and reporting it
+    // as session-owned would invite a later cleanup to review it for removal.
+    let mut shared_branches = vec![crate::merge::PromoteConfig::load(owner).branch];
+    match checkout
+        .upstream_default()
+        .and_then(|(upstream, _)| upstream.split_once('/').map(|(_, b)| b.to_string()))
+    {
+        Some(branch) => shared_branches.push(branch),
+        None => shared_branches.extend(["main".to_string(), "master".to_string()]),
+    }
+    let branch_tips = checkout.local_branch_tips();
+    let session_branch_inventory_complete = branch_tips.is_some();
+    let session_branches = branch_tips
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|(reference, head)| {
+            let name = reference.strip_prefix("refs/heads/")?;
+            let session_ids = session_ids_by_branch.remove(name).unwrap_or_default();
+            let ownership = if shared_branches.iter().any(|shared| shared == name) {
+                if session_ids.is_empty() {
+                    return None;
+                }
+                StorageBranchOwnership::Shared
+            } else if session_ids.is_empty() {
+                if !name.starts_with("agent/") {
+                    return None;
+                }
+                StorageBranchOwnership::Unknown
+            } else {
+                StorageBranchOwnership::SessionLedger
+            };
+            let uncleared_session_ids = uncleared_ids_by_branch.remove(name).unwrap_or_default();
+            let checked_out_paths = checked_out.remove(name).unwrap_or_default();
+            let retention_reason = if ownership == StorageBranchOwnership::Shared {
+                "the repository's integration or default branch; it is never session-owned or removable".into()
+            } else if !uncleared_session_ids.is_empty() {
+                "one or more sessions remain in the broker ledger; retain this branch until their lifecycle is resolved".into()
+            } else if !checked_out_paths.is_empty() {
+                "a registered Git worktree still checks out this branch; retain it while that checkout exists".into()
+            } else if ownership == StorageBranchOwnership::Unknown {
+                "the branch uses the broker agent namespace but has no ledger owner; ownership is unknown and requires review".into()
+            } else {
+                "a historical session record owns this ref, but delivery proof and cleanup eligibility must be reviewed before removal".into()
+            };
+            Some(StorageBranchEntry {
+                name: name.to_string(),
+                head,
+                session_ids,
+                uncleared_session_ids,
+                checked_out_paths,
+                ownership,
+                retention_reason,
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut session_branches = session_branches;
+    session_branches.sort_by(|left, right| left.name.cmp(&right.name));
     for session in sessions {
         let path = normalise_absolute(Path::new(&session.worktree_path), owner);
         if is_direct_child(&path, host_root) {
@@ -1811,6 +2007,8 @@ fn inspect_owner(owner: &Path, host_root: &Path) -> Result<OwnerSources, String>
     Ok(OwnerSources {
         git_registered,
         ledger_claimed,
+        session_branch_inventory_complete,
+        session_branches,
         retired,
     })
 }

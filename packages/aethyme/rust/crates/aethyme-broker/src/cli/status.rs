@@ -589,16 +589,45 @@ pub(super) fn run_doctor(parsed: Parsed) -> Result<(), UsageError> {
             )));
         }
     }
+    let command_started = std::time::Instant::now();
     let mut broker = open_broker(parsed.read_only_snapshot)?;
-    let report = if parsed.fix_version {
+    let mut report = if parsed.fix_version {
         broker.doctor_with_version_fix()?
     } else {
         broker.doctor()?
     };
-    let blocker_report = broker.blockers();
+    // Blocker enrichment used to run after `doctor()` dropped its Git
+    // deadline, so the command could exceed its interactive budget while
+    // resolving the repository identity. It is supplemental: if any doctor
+    // check was cut, or the command envelope is spent, report it as unknown.
+    let blocker_deadline = command_started + std::time::Duration::from_secs(9);
+    let blocker_report =
+        if report.deferred_checks.is_empty() && std::time::Instant::now() < blocker_deadline {
+            let _git_deadline = crate::git::limit_git_until(blocker_deadline);
+            let blockers = broker.blockers();
+            if std::time::Instant::now() < blocker_deadline {
+                blockers
+            } else {
+                report.deferred_checks.push("blockers".into());
+                report.budget_cut.push("blockers".into());
+                doctor_blockers_deferred()
+            }
+        } else {
+            report.deferred_checks.push("blockers".into());
+            report.budget_cut.push("blockers".into());
+            doctor_blockers_deferred()
+        };
+    report.deferred_checks.sort();
+    report.deferred_checks.dedup();
+    report.budget_cut.sort();
+    report.budget_cut.dedup();
     if parsed.json {
         let mut value = serde_json::to_value(&report)?;
         value["blockers"] = serde_json::to_value(&blocker_report.blockers)?;
+        if !blocker_report.unavailable.is_empty() {
+            value["blocker_sources_unavailable"] =
+                serde_json::to_value(&blocker_report.unavailable)?;
+        }
         out!("{}", serde_json::to_string_pretty(&value)?);
     } else {
         out!("integrity: {}", report.integrity);
@@ -841,6 +870,16 @@ pub(super) fn run_doctor(parsed: Parsed) -> Result<(), UsageError> {
         }
     }
     Ok(())
+}
+
+fn doctor_blockers_deferred() -> crate::BlockerReport {
+    crate::BlockerReport {
+        unavailable: vec![crate::BlockerSourceError {
+            source: "broker blockers",
+            error: "inspection budget expired before blocker sources were checked".into(),
+        }],
+        ..crate::BlockerReport::default()
+    }
 }
 
 /// `broker doctor plan`: every debris item across stores, read-only.

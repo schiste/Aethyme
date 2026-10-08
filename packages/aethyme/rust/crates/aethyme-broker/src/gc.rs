@@ -1029,20 +1029,28 @@ impl Broker {
         evaluated_at: i64,
         policy: &RetentionPolicy,
         scan: crate::SizeScan,
+        deadline: Option<std::time::Instant>,
     ) -> Result<
         (
             Vec<GcRecoveryArchiveCandidate>,
             Option<RecoveryArchiveInventory>,
+            bool,
         ),
         BrokerOpError,
     > {
+        // Resolving the archive location depends on the repository worktree
+        // key. Once this report's budget is exhausted, do not start that Git
+        // lookup merely to return an inventory the caller must defer.
+        if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+            return Ok((Vec::new(), None, false));
+        }
         let crate::cleanup_resolve::RecoveryArchiveScan {
             root,
             owned,
             unowned,
         } = self.recovery_archives()?;
         if owned.is_empty() && unowned.is_empty() {
-            return Ok((Vec::new(), None));
+            return Ok((Vec::new(), None, true));
         }
         let size = |path: &Path| {
             if scan.measures() {
@@ -1057,7 +1065,12 @@ impl Broker {
             ..RecoveryArchiveInventory::default()
         };
         let mut candidates = Vec::new();
+        let mut complete = true;
         for archive in &owned {
+            if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+                complete = false;
+                break;
+            }
             let bytes = size(&archive.path);
             inventory.estimated_bytes = inventory.estimated_bytes.saturating_add(bytes);
             inventory.oldest_created_at_ms = Some(
@@ -1082,13 +1095,17 @@ impl Broker {
             }
         }
         for (path, reason) in &unowned {
+            if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+                complete = false;
+                break;
+            }
             inventory.estimated_bytes = inventory.estimated_bytes.saturating_add(size(path));
             inventory
                 .unowned
                 .push(format!("{}: {reason}", path.to_string_lossy()));
         }
         candidates.sort_by(|left, right| left.path.cmp(&right.path));
-        Ok((candidates, Some(inventory)))
+        Ok((candidates, Some(inventory), complete))
     }
 
     /// Host worktree roots whose owning repository is gone.
@@ -1103,16 +1120,28 @@ impl Broker {
         policy: &RetentionPolicy,
         blockers: &mut Vec<GcBlocker>,
         scan: crate::SizeScan,
-    ) -> Result<Vec<GcOrphanCandidate>, BrokerOpError> {
+        deadline: Option<std::time::Instant>,
+    ) -> Result<(Vec<GcOrphanCandidate>, bool), BrokerOpError> {
+        // Resolving the repository worktree key shells out to Git. A doctor
+        // pass whose inspection budget is already spent must name this
+        // inventory as deferred without starting another subprocess.
+        if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+            return Ok((Vec::new(), false));
+        }
         let plan = self.worktree_root_plan()?;
         let Some(container) = plan.root_container.clone() else {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), true));
         };
         let Ok(entries) = std::fs::read_dir(&container) else {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), false));
         };
         let mut candidates = Vec::new();
+        let mut complete = true;
         for entry in entries.flatten() {
+            if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+                complete = false;
+                break;
+            }
             let root = entry.path();
             if !is_real_directory(&root) {
                 continue;
@@ -1160,10 +1189,18 @@ impl Broker {
                 continue;
             }
             let usage = if scan.measures() {
-                crate::disk_headroom::directory_usage_without_following_links(&root).ok()
+                if let Some(deadline) = deadline {
+                    crate::disk_headroom::directory_usage_bounded(&root, deadline)
+                } else {
+                    crate::disk_headroom::directory_usage_without_following_links(&root).ok()
+                }
             } else {
                 None
             };
+            if scan.measures() && usage.is_none() {
+                complete = false;
+                break;
+            }
             candidates.push(GcOrphanCandidate {
                 repository_key: marker.repository_key,
                 worktree_root: root.to_string_lossy().into_owned(),
@@ -1174,7 +1211,7 @@ impl Broker {
             });
         }
         candidates.sort_by(|left, right| left.worktree_root.cmp(&right.worktree_root));
-        Ok(candidates)
+        Ok((candidates, complete))
     }
 
     /// The full audit: walk every retained worktree, build cache and orphaned
@@ -1212,13 +1249,32 @@ impl Broker {
         scan: crate::SizeScan,
         include_active_gate_cache: bool,
     ) -> Result<GcPlan, BrokerOpError> {
+        self.gc_plan_scanned_until(scan, include_active_gate_cache, None)
+    }
+
+    fn gc_plan_scanned_until(
+        &mut self,
+        scan: crate::SizeScan,
+        include_active_gate_cache: bool,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<GcPlan, BrokerOpError> {
         let evaluated_at = now_ms();
         let main_root = self.main_root().to_path_buf();
         let retention_config = load_retention_policy_report(&main_root)?;
         let policy = retention_config.policy;
         let retention_config_warnings = retention_config.warnings;
         let exposure_cutoff = cutoff(evaluated_at, policy.publication_exposure_days);
-        let cleanup = self.cleanup_plan_scanned(scan)?;
+        let cleanup = match deadline.filter(|_| !scan.measures()) {
+            Some(deadline) => self.cleanup_plan_scanned_within(
+                scan,
+                Some(deadline.saturating_duration_since(std::time::Instant::now())),
+            )?,
+            None => self.cleanup_plan_scanned(scan)?,
+        };
+        let mut deferred_checks = Vec::new();
+        if cleanup.eligibility_not_inspected_count > 0 {
+            deferred_checks.push("cleanup_eligibility".into());
+        }
         let sessions = self
             .store()
             .cleaned_sessions()?
@@ -1509,24 +1565,50 @@ impl Broker {
             .iter()
             .map(|worktree| worktree.session_id)
             .collect::<Vec<_>>();
+        let artifact_budget =
+            deadline.map(|deadline| deadline.saturating_duration_since(std::time::Instant::now()));
         let ArtifactCandidates {
             candidates: mut artifacts,
             declined: declined_artifacts,
             not_scanned: artifact_worktrees_not_scanned,
-        } = self.artifact_candidates(
-            evaluated_at,
-            &policy,
-            &cleanup.worktrees,
-            &sessions,
-            ArtifactExclusions {
-                already_removed: &removed_sessions,
-                live_worktrees: &live_worktrees,
-            },
-            scan,
-        );
-        let mut orphans = self.orphan_candidates(evaluated_at, &policy, &mut blockers, scan)?;
-        let (recovery_archives, recovery_archive_inventory) =
-            self.recovery_archive_candidates(evaluated_at, &policy, scan)?;
+        } = match artifact_budget {
+            Some(budget) => self.artifact_candidates_within(
+                evaluated_at,
+                &policy,
+                &cleanup.worktrees,
+                &sessions,
+                ArtifactExclusions {
+                    already_removed: &removed_sessions,
+                    live_worktrees: &live_worktrees,
+                },
+                scan,
+                Some(budget),
+            ),
+            None => self.artifact_candidates(
+                evaluated_at,
+                &policy,
+                &cleanup.worktrees,
+                &sessions,
+                ArtifactExclusions {
+                    already_removed: &removed_sessions,
+                    live_worktrees: &live_worktrees,
+                },
+                scan,
+            ),
+        };
+        if artifact_worktrees_not_scanned > 0 {
+            deferred_checks.push("artifact_scan".into());
+        }
+        let (mut orphans, orphans_complete) =
+            self.orphan_candidates(evaluated_at, &policy, &mut blockers, scan, deadline)?;
+        if !orphans_complete {
+            deferred_checks.push("orphan_scan".into());
+        }
+        let (recovery_archives, recovery_archive_inventory, archives_complete) =
+            self.recovery_archive_candidates(evaluated_at, &policy, scan, deadline)?;
+        if !archives_complete {
+            deferred_checks.push("recovery_archives".into());
+        }
         // Rooted at the per-user cache directory, not at any worktree: that
         // is why no total here ever counted it (#295).
         let mut size_records = crate::measurement::load_size_records(&main_root);
@@ -1558,6 +1640,9 @@ impl Broker {
             }
             None => (None, Vec::new()),
         };
+        if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+            deferred_checks.push("gate_cache_inventory".into());
+        }
         if scan.measures() {
             crate::warn_unrecorded(
                 "record gate cache sizes",
@@ -1812,7 +1897,7 @@ impl Broker {
             unmeasured: unmeasured_directory_count,
             oldest_measured_at_ms: cleanup.sizes_measured_at_ms,
         };
-        let budget_verdict = crate::budget_verdict(&retained_total, policy_budget);
+        let mut budget_verdict = crate::budget_verdict(&retained_total, policy_budget);
         let reclaim_order =
             crate::reclaim_order::order_for(estimated_retained_bytes, policy_budget);
         crate::reclaim_order::sort_by_order(&mut worktrees, reclaim_order, |worktree| {
@@ -1845,6 +1930,25 @@ impl Broker {
                 .cmp(&left.estimated_bytes)
                 .then_with(|| left.worktree_root.cmp(&right.worktree_root))
         });
+
+        let reconciliation =
+            self.reconcile_worktree_directories_until(scan.measures(), deadline)?;
+        if !reconciliation.complete {
+            deferred_checks.push("unclaimed_worktrees".into());
+        }
+        // A partial inventory can only establish that the recorded floor is
+        // over budget. It cannot turn an under-budget floor into a pass.
+        if !deferred_checks.is_empty() && budget_verdict == crate::BudgetVerdict::Within {
+            budget_verdict = crate::BudgetVerdict::Unknown;
+        }
+        deferred_checks.sort();
+        deferred_checks.dedup();
+        let clears_retained_bytes_budget = deferred_checks.is_empty()
+            && crate::reclaim_order::clears_budget(
+                estimated_retained_bytes,
+                policy_budget,
+                worktree_scoped_reclaimable,
+            );
 
         let mut plan = GcPlan {
             schema_version: GC_PLAN_SCHEMA_VERSION,
@@ -1881,14 +1985,10 @@ impl Broker {
                 estimated_retained_bytes,
                 policy_budget,
             ),
-            clears_retained_bytes_budget: crate::reclaim_order::clears_budget(
-                estimated_retained_bytes,
-                policy_budget,
-                worktree_scoped_reclaimable,
-            ),
+            clears_retained_bytes_budget,
             // Sizing unclaimed directories is another full walk, so it
             // belongs to whichever pass was already paying for walks.
-            reconciliation: Some(self.reconcile_worktree_directories(scan.measures())?),
+            reconciliation: Some(reconciliation),
             closed_worktrees: crate::retention::ClosedWorktreeSummary::from_cleanup(
                 &cleanup,
                 &sessions.values().cloned().collect::<Vec<_>>(),
@@ -1899,6 +1999,7 @@ impl Broker {
             budget_verdict,
             recovery_archive_inventory,
             artifact_worktrees_not_scanned,
+            deferred_checks: deferred_checks.clone(),
             auto_cleanup: None,
         };
         // Reporting only and outside the digest: what the last unattended
@@ -1931,9 +2032,39 @@ impl Broker {
     /// which questions those floors can answer (#176).
     pub fn gc_health(&mut self) -> Result<GcHealth, BrokerOpError> {
         let plan = self.gc_plan_recorded()?;
-        let journal = load_journal(&self.main_root().join(".aethyme/gc-journal.json"))?;
+        self.gc_health_for_plan(plan, None)
+    }
+
+    pub(crate) fn gc_health_until(
+        &mut self,
+        deadline: std::time::Instant,
+    ) -> Result<GcHealth, BrokerOpError> {
+        let plan = self.gc_plan_scanned_until(crate::SizeScan::Recorded, false, Some(deadline))?;
+        self.gc_health_for_plan(plan, Some(deadline))
+    }
+
+    fn gc_health_for_plan(
+        &self,
+        mut plan: GcPlan,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<GcHealth, BrokerOpError> {
+        let journal = if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+            plan.deferred_checks.push("gc_journal".into());
+            None
+        } else {
+            load_journal(&self.main_root().join(".aethyme/gc-journal.json"))?
+        };
+        plan.deferred_checks.sort();
+        plan.deferred_checks.dedup();
+        if !plan.deferred_checks.is_empty() {
+            if plan.budget_verdict == crate::BudgetVerdict::Within {
+                plan.budget_verdict = crate::BudgetVerdict::Unknown;
+            }
+            plan.clears_retained_bytes_budget = false;
+        }
         let over_retained_bytes_budget = plan.budget_verdict.exceeded();
         Ok(GcHealth {
+            deferred_checks: plan.deferred_checks,
             policy: plan.policy,
             retention_config_warnings: plan.retention_config_warnings,
             pending_recovery_digest: journal.map(|journal| journal.digest),

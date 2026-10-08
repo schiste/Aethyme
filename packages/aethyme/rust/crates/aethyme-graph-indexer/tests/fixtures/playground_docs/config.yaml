@@ -1,0 +1,2 @@
+server:
+  handler: "src.handlers#handle_request"

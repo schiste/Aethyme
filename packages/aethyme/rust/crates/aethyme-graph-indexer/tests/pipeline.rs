@@ -90,11 +90,11 @@ fn index_repo_writes_fragments_to_canonical_paths() {
     let readme_frag = tmp.path().join(".aethyme/graph/README.md.bin");
     assert!(readme_frag.exists());
 
-    // src/cli.py contains a Function so src.cli gets a shard.
-    // README.md contains only a NonCodeFile node (no extracted
-    // named symbols) so it produces no shard. shards_written is
-    // therefore exactly 1.
-    assert_eq!(summary.shards_written.len(), 1);
+    // src/cli.py contributes its named Function, and README.md
+    // contributes its named DocSection heading to the symbol shards.
+    assert_eq!(summary.shards_written.len(), 2);
+    assert!(read_index_shard(tmp.path(), "src.cli").is_ok());
+    assert!(read_index_shard(tmp.path(), "README").is_ok());
 }
 
 #[test]
