@@ -64,11 +64,12 @@ use std::collections::HashSet;
 use data_encoding::HEXLOWER;
 use sha2::{Digest, Sha256};
 
+use super::digest;
+
 /// Domain-separation header that starts every v0 manifest.
 pub const MANIFEST_HEADER: &[u8] = b"aethyme source-snapshot v0\0";
 
-/// Prefix of every encoded [`SourceSnapshotId`]: the digest algorithm.
-pub const ID_PREFIX: &str = "sha256:";
+pub use super::digest::ID_PREFIX;
 
 /// Longest accepted path, in bytes. Longer paths are refused, not truncated.
 pub const MAX_PATH_BYTES: usize = 4096;
@@ -203,8 +204,7 @@ impl SourceSnapshot {
     }
 
     pub fn id(&self) -> SourceSnapshotId {
-        let digest = Sha256::digest(self.manifest_bytes());
-        SourceSnapshotId(format!("{ID_PREFIX}{}", HEXLOWER.encode(&digest)))
+        SourceSnapshotId(digest::encode(&self.manifest_bytes()))
     }
 }
 
@@ -217,13 +217,7 @@ impl SourceSnapshotId {
     /// uppercase hex, other algorithms or other lengths are refused rather
     /// than normalized.
     pub fn parse(encoded: &str) -> Result<Self, SourceSnapshotError> {
-        let well_formed = encoded.strip_prefix(ID_PREFIX).is_some_and(|hex| {
-            hex.len() == 64
-                && hex
-                    .bytes()
-                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-        });
-        if well_formed {
+        if digest::is_canonical(encoded) {
             Ok(Self(encoded.to_string()))
         } else {
             Err(SourceSnapshotError::MalformedId {
