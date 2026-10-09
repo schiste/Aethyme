@@ -23,6 +23,32 @@
 //! - `extensions` (optional): an object a reader carries without interpreting.
 //!   It is part of the digest, so it survives a round trip unchanged.
 //!
+//! ## Unknown fields are carried, so `requires` must be right
+//!
+//! A reader carries a top-level member its schema does not declare without
+//! interpreting it: the record still decodes, and the member stays in the
+//! canonical bytes and the ID, so nothing is lost when the record is passed on.
+//! The cost is that an old reader cannot tell a harmless new field from one it
+//! must understand. **`requires` is the only thing that tells it**, so a missing
+//! entry means an old reader silently acts on a record it misreads.
+//!
+//! Records are written by agents, and an agent will not reliably remember to
+//! fill `requires` by hand. So nobody should have to:
+//!
+//! - A schema declares, per field, the capability needed to interpret it
+//!   ([`FieldSpec::capability`]). That is decided once, by whoever adds the
+//!   field, in review.
+//! - Writers take `requires` from [`RecordSchema::required_capabilities`] rather
+//!   than from their input.
+//! - Every reader that knows the field checks it: a record carrying a gated
+//!   field without its capability in `requires` is refused
+//!   (`undeclared_capability`), naming the field and the capability to add. A
+//!   writer that bypassed the helper is therefore caught by the first current
+//!   reader, not discovered later by an old one.
+//!
+//! A new *value* of an existing state field needs no capability: old readers
+//! read it as [`StateReading::Unrecognized`], which never matches anything.
+//!
 //! ## Identity
 //!
 //! A record's ID is `sha256:` over `"aethyme record v0" NUL` followed by its
@@ -72,6 +98,22 @@ impl RecordSchema {
     fn field(&self, name: &str) -> Option<&FieldSpec> {
         self.fields.iter().find(|field| field.name == name)
     }
+
+    /// The `requires` set a writer must emit for a record with these members:
+    /// the capabilities of every gated field present, in canonical order.
+    /// Writers use this instead of filling `requires` themselves.
+    pub fn required_capabilities<'a>(
+        &self,
+        members: impl IntoIterator<Item = &'a str>,
+    ) -> Vec<&'static str> {
+        let mut capabilities: Vec<&'static str> = members
+            .into_iter()
+            .filter_map(|name| self.field(name).and_then(|field| field.capability))
+            .collect();
+        capabilities.sort_by(|a, b| utf16_order(a, b));
+        capabilities.dedup();
+        capabilities
+    }
 }
 
 #[derive(Debug)]
@@ -79,6 +121,11 @@ pub struct FieldSpec {
     pub name: &'static str,
     pub required: bool,
     pub kind: FieldKind,
+    /// The capability a reader must support to interpret this field safely,
+    /// or `None` when a reader that ignores it cannot be misled (a note, a
+    /// diagnostic). Whenever the field is present, the record's `requires`
+    /// must list this capability; see the module docs.
+    pub capability: Option<&'static str>,
 }
 
 #[derive(Debug)]
@@ -208,10 +255,10 @@ impl Record {
                             && checked == Value::String(UNKNOWN_STATE.into());
                         (!unknown_state).then_some(checked)
                     }
-                    None => {
-                        admit_unknown_field(schema, name, value)?;
-                        Some(value.clone())
-                    }
+                    // Not declared by this reader's schema: carried without
+                    // interpretation. `requires` is what protects this
+                    // reader from a field it would need to understand.
+                    None => Some(value.clone()),
                 },
             };
             if let Some(value) = kept {
@@ -225,6 +272,21 @@ impl Record {
         }) {
             return Err(RecordError::MissingField {
                 field: missing.name.into(),
+            });
+        }
+        let declared = match object.get("requires") {
+            Some(Value::Array(set)) => set.iter().map(string_of).collect(),
+            _ => Vec::new(),
+        };
+        if let Some(field) = schema.fields.iter().find(|field| {
+            field
+                .capability
+                .is_some_and(|capability| !declared.contains(&capability))
+                && object.get(field.name).is_some()
+        }) {
+            return Err(RecordError::UndeclaredCapability {
+                field: field.name.into(),
+                capability: field.capability.unwrap_or_default().into(),
             });
         }
         let object = Object::new(members).expect("keys came from a valid object");
@@ -274,19 +336,6 @@ impl Record {
             Some(_) => unreachable!("decode checked that state fields are strings"),
         }
     }
-}
-
-/// Decide whether a reader accepts a top-level member its schema does not
-/// declare, outside `extensions`. Typically an old reader meeting a field a
-/// newer writer added.
-fn admit_unknown_field(
-    schema: &RecordSchema,
-    name: &str,
-    value: &Value,
-) -> Result<(), RecordError> {
-    // TODO(#653): choose the policy; see the PR discussion.
-    let _ = (schema, value);
-    Err(RecordError::UnknownField { field: name.into() })
 }
 
 fn check_field(spec: &FieldSpec, value: &Value) -> Result<Value, RecordError> {
@@ -361,8 +410,10 @@ pub enum RecordError {
     MissingField { field: String },
     #[error("field {field:?} has the wrong type")]
     WrongType { field: String },
-    #[error("field {field:?} is not declared by this schema")]
-    UnknownField { field: String },
+    #[error(
+        "field {field:?} needs capability {capability:?}, but the record's `requires` does not list it; add it, ideally from RecordSchema::required_capabilities, so that older readers refuse the record instead of misreading it"
+    )]
+    UndeclaredCapability { field: String, capability: String },
     #[error("field {field:?} must be a decimal string without leading zeros")]
     InvalidDecimal { field: String },
     #[error("set field {field:?} repeats {member:?}")]
@@ -382,7 +433,7 @@ impl RecordError {
             Self::UnsupportedCapability { .. } => "unsupported_capability",
             Self::MissingField { .. } => "missing_field",
             Self::WrongType { .. } => "wrong_type",
-            Self::UnknownField { .. } => "unknown_field",
+            Self::UndeclaredCapability { .. } => "undeclared_capability",
             Self::InvalidDecimal { .. } => "invalid_decimal",
             Self::DuplicateSetMember { .. } => "duplicate_set_member",
             Self::MalformedId { .. } => "malformed_id",

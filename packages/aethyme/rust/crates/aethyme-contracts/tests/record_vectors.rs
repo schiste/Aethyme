@@ -8,6 +8,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 
+use aethyme_contracts::experimental_v0::canonical_json::Value;
 use aethyme_contracts::experimental_v0::record::RECORD_DOMAIN;
 use aethyme_contracts::experimental_v0::{
     FieldKind, FieldSpec, Record, RecordId, RecordSchema, StateReading,
@@ -37,6 +38,8 @@ struct FieldCase {
     kind: String,
     #[serde(default)]
     values: Vec<String>,
+    #[serde(default)]
+    capability: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -92,6 +95,7 @@ fn readers(vectors: &Vectors) -> HashMap<String, Vec<&'static RecordSchema>> {
                         .map(|field| FieldSpec {
                             name: leak(field.name.clone()),
                             required: field.required,
+                            capability: field.capability.clone().map(leak),
                             kind: match field.kind.as_str() {
                                 "boolean" => FieldKind::Boolean,
                                 "integer" => FieldKind::Integer,
@@ -218,5 +222,35 @@ fn record_ids_round_trip_and_only_the_canonical_form_parses() {
         assert_eq!(RecordId::parse(&case.id).unwrap().as_str(), case.id);
         let upper = case.id.to_uppercase().replacen("SHA256", "sha256", 1);
         assert_eq!(RecordId::parse(&upper).unwrap_err().code(), "malformed_id");
+    }
+}
+
+/// Writers take `requires` from the schema, so a gated field can never be
+/// written without its capability, and an ungated one adds nothing.
+#[test]
+fn required_capabilities_follow_the_fields_present() {
+    let vectors = vectors();
+    let readers = readers(&vectors);
+    let new = readers["new"][0];
+    assert_eq!(
+        new.required_capabilities(["schema", "subject", "sharing", "note"]),
+        ["retention-receipt"]
+    );
+    assert!(new.required_capabilities(["subject", "note"]).is_empty());
+    // Every record the new reader accepts already declares what it needs.
+    for case in vectors.valid.iter().filter(|case| case.reader == "new") {
+        let record = Record::decode(&hex(&case.input.hex), &readers["new"]).unwrap();
+        let fields: Vec<String> = ["sharing", "note", "subject"]
+            .into_iter()
+            .filter(|field| record.get(field).is_some())
+            .map(String::from)
+            .collect();
+        for capability in new.required_capabilities(fields.iter().map(String::as_str)) {
+            let declared = record.get("requires").is_some_and(|requires| {
+                matches!(requires, Value::Array(items)
+                    if items.contains(&Value::String(capability.into())))
+            });
+            assert!(declared, "{}: {capability} not declared", case.name);
+        }
     }
 }

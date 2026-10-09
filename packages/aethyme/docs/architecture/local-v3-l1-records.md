@@ -55,23 +55,48 @@ record never contains its own ID, a signature, a locator or an observation time.
 | Either of the above | Can never match `accepted`, `complete`, `trusted` or any other value: `StateReading::is` is true only for `Known`. |
 | Record requires a capability the reader lacks | Refused, never partially read. |
 | Different schema version | Refused. |
-| Top-level member the schema does not declare | **Open decision**, see below. |
+| Top-level member the schema does not declare | **Carried without interpretation** (decided 2026-10-09): it decodes, and stays in the canonical bytes and the ID. |
+| A field the reader knows is gated, present without its capability in `requires` | Refused (`undeclared_capability`), naming the field and the capability to add. |
 
 The vector file defines an "old" and a "new" reader of one illustrative schema; the
-cases record what each reader accepts, reads as unknown or unrecognized, and refuses.
+cases record what each reader accepts, carries, reads as unknown or unrecognized, and
+refuses. They include the risk itself: an old reader carries a gated field whose writer
+forgot `requires`. The new reader refuses the same record.
 
-## Decisions needed
+## `requires` is derived, never remembered
 
-1. **Unknown top-level fields** (`admit_unknown_field` in `record.rs`). The question is
-   whether an old reader refuses a member it does not know (outside `extensions`), or
-   carries it without interpreting it and relies on `requires` to flag fields it must
-   understand. The placeholder refuses.
+Carrying unknown fields keeps old clients working when a field is added, but it puts all
+the safety in `requires`. An old reader cannot tell a harmless new field from one it
+must understand. A missing `requires` entry means it silently acts on a record it
+misreads.
+
+Aethyme's writers are agents, and an agent will not reliably remember to fill a field
+that has no visible effect on its own run. So the rule is built so that nobody has to
+remember:
+
+1. **The schema decides, once.** Each field declares the capability needed to interpret
+   it (`FieldSpec::capability`), or `None` when ignoring it cannot mislead (a note, a
+   diagnostic). This is decided by whoever adds the field, and reviewed with the schema
+   change.
+2. **Writers derive `requires`.** Every writer path takes it from
+   `RecordSchema::required_capabilities`, not from agent input. A field an agent supplies
+   (a decision file, a brief) never sets `requires` directly.
+3. **Every current reader checks.** A record with a gated field and no matching
+   capability is refused with `undeclared_capability`, and the error says what to add.
+   A writer that bypassed rule 2 is caught by the first current reader, before any old
+   reader sees the record.
+
+A new *value* of an existing state field needs no capability: old readers read it as
+`Unrecognized`, which never matches anything.
+
+Writer paths that must follow rule 2: the brief and decision file (#654), capture records
+and receipts (#658), and lineage records (#657).
 
 ## Tests
 
 | Plan test | State |
 |---|---|
 | T01 (golden vectors: duplicate keys, large integers, set order, absent/null) | Canonical profile and record envelope: done in Rust against independent vectors. TypeScript side pending a TS consumer. Concrete records wait for their schemas. |
-| T85 (unknown fields through old/new consumers) | State and capability parts done (old/new reader fixtures). Unknown-field part waits for the decision above. |
+| T85 (unknown fields through old/new consumers) | Done for the envelope: old/new reader fixtures cover unknown and unrecognized states, unknown capabilities, carried fields, and gated fields without `requires`. |
 | T02 (brief profile) | #654. |
 | T03–T06 | Need the concrete records and E1. |
