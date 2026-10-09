@@ -119,6 +119,12 @@ does not lock out every older binary, as `host-operations.db`'s exact match does
 binaries never open `state.db`, and an old binary's deleters cannot reach the root
 (next section).
 
+The floor was raised once, to 4, by reclamation (#659). A schema 3 binary captures
+without the archive lock, the reuse refresh or clearing reclaimed markers, so in a store
+that reclamation manages it could name an object that is being removed. Every open
+raises a lower floor after migrating. No release shipped schema 2 or 3, so this locks out
+no binary that exists.
+
 ## Old binaries and cleanup (T09, T35)
 
 #656 changes no deleter, so this binary's deleters are the ones an older binary runs.
