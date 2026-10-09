@@ -42,7 +42,11 @@ names is published. Rows are an index: the objects are the authority.
 3. Publish without replacing anything (`persist_noclobber`), then flush the directory.
 4. An object that already exists under that name is accepted only if it hashes the same.
    Otherwise the archive is refused as corrupt and the existing file is left for
-   inspection.
+   inspection. The directory is flushed in this case too, and every directory the archive
+   uses is re-flushed in its parent even when it already exists. Another writer may have
+   created either entry and not flushed it yet, and an index row must never become durable
+   before the entries for the objects it names. (Fault injection would be needed to test
+   this ordering; it is not tested.)
 
 The archive never hard-links into a checkout and never uses Git alternates: it holds its own
 copy. An interrupted publication leaves at most a temporary or an unreferenced object. Both
@@ -52,43 +56,60 @@ are harmless, and a retry reuses the object (#659 reclaims leftovers).
 
 - The commit is a full object id (`CommitOid`). A ref name is refused, and `pin_commit`
   resolves one once. A branch that moves afterwards cannot change what is retained.
-- Trees come from `git ls-tree -r -z`, blobs from `git cat-file --batch`. Neither runs
-  hooks, clean/smudge filters or textconv. Replace refs are disabled, and inherited
-  `GIT_DIR`/alternates variables are cleared.
-- Each blob is hashed with the repository's object format (SHA-1 or SHA-256) while it is
-  copied, and must equal its object id. Git does not verify loose objects on read, so a
-  damaged source is caught here.
+- The commit, every tree and every blob are read through `git cat-file --batch`. Each is
+  hashed with the repository's object format (SHA-1 or SHA-256) while it is read, and
+  must equal its object id. Git does not verify loose objects on read, and `git ls-tree`
+  would list a damaged tree as genuine, so trees are walked here rather than listed.
+- Git runs with replace refs, grafts (`GIT_GRAFT_FILE=/dev/null`) and lazy fetching
+  (`GIT_NO_LAZY_FETCH=1`) off. `core.fsmonitor` is forced off and hooks point nowhere.
+  Inherited repository variables (`GIT_DIR`, `GIT_COMMON_DIR`, alternates, ...) and
+  injected configuration (`GIT_CONFIG_PARAMETERS`, `GIT_CONFIG_COUNT/KEY_*/VALUE_*`) are
+  cleared. Loading the index starts a configured fsmonitor, and `git check-attr` loads
+  it: without the override, a repository's configuration ran a program during capture
+  (found and tested).
+- A partial clone (`extensions.partialClone`, a promisor remote or a partial-clone filter)
+  is reported `partial_clone`, which is incomplete: objects it omits would surface as
+  missing part-way through, and capture never fetches.
 
 ### Results: retained, incomplete or refused
 
 | Result | Codes | Retry helps? |
 |---|---|---|
 | Retained | — | — |
-| **Incomplete** (`is_incomplete()`) | `source_unavailable` (missing commit, tree or blob, including one that disappears mid-copy), `source_mismatch`, `history_unavailable` (missing parent, shallow clone) | Possibly, from a fuller source |
-| **Refused** | `unsupported_entry` (submodule or another mode #652 refuses), `unsupported_filter`, `invalid_snapshot`, `base_not_ancestor`, `not_a_commit`, `not_an_object_id` | No |
+| **Incomplete** (`is_incomplete()`) | `source_unavailable` (missing commit, tree or blob, including one that disappears mid-copy), `source_mismatch` (a commit, tree or blob that does not match its id), `history_unavailable` (missing parent, any shallow clone), `partial_clone` | Possibly, from a fuller source |
+| **Refused** | `unsupported_entry` (submodule or another mode #652 refuses), `unsupported_filter`, `malformed_source`, `invalid_snapshot`, `base_not_ancestor`, `not_a_commit`, `not_an_object_id` | No |
 
 None of these writes an index row, so none can be mistaken for a complete capture.
 
-**Filters.** A `.gitattributes` anywhere in the tree that sets `filter=` (Git LFS, any
-clean/smudge driver) or `working-tree-encoding=` is refused. A Git checkout of that tree
-would not produce the committed bytes, and replay would depend on an external driver.
-End-of-line attributes are accepted: the archive restores the committed bytes, and line
-endings are a materialization choice.
+**Transforming attributes.** A path with `filter` (Git LFS, any clean/smudge driver),
+`working-tree-encoding` or `ident` set is refused. Git would not check that path out as
+the committed bytes, and replay would depend on an external driver. Attributes are read
+per path with `git check-attr --source=<commit>`, so they come from the commit's own
+`.gitattributes` (not the worktree), `.git/info/attributes` and `core.attributesFile`.
+`check-attr` reads files and configuration only. Combined with the forced-off fsmonitor
+and hooks, it runs nothing; a test configures an fsmonitor, filter drivers, textconv and
+hooks and checks none ran. A declaration that matches no path is accepted. End-of-line
+attributes are accepted too: the archive restores the committed bytes, and line endings
+are a materialization choice.
 
 ### Lineage
 
 A contribution (`retain_contribution(base, result)`) retains the **complete base and result
-snapshots**. It requires `base` to be an ancestor of `result` and refuses shallow clones,
-where the boundary hides history. Replay needs only the two snapshots, so the commits in
+snapshots**. It refuses any shallow clone first, as incomplete. There, Git answers "not an
+ancestor" when it cannot see the history, which must read as unknown, never as a rewrite.
+It then requires `base` to be an ancestor of `result`. Replay needs only the two snapshots, so the commits in
 between are recorded as provenance and not retained. The record holds the base and result
 commit ids, the object format and the first-parent commit count.
 
 ### Rebuild
 
 `reconstruct(snapshot, dest)` works from the archive alone:
+- It accepts only a snapshot the archive retained: one with an index row, whose manifest
+  re-encodes to exactly its stored bytes. A committed file whose bytes happen to parse as
+  a manifest is an ordinary blob, and a reordered manifest is not the snapshot it claims.
 - It verifies the manifest and every blob before writing anything, so a damaged or missing
   object writes nothing.
-- It requires an absent or empty destination.
+- It requires an absent or empty destination that is not a symbolic link.
 - It restores bytes, the executable bit and symlinks.
 - It detects collisions the destination filesystem causes, as #652 decided. Every file is
   created exclusively and every directory is tracked. A file or directory that "already
@@ -121,8 +142,8 @@ commit ids, the object format and the first-parent commit count.
 
 | Plan test | State |
 |---|---|
-| T07 | A moved branch does not change a pinned capture. Rewritten history is `base_not_ancestor`. Missing history (shallow clone) and a blob removed mid-copy are incomplete. A source object that does not match its id is incomplete. |
+| T07 | A moved branch does not change a pinned capture. Rewritten history is `base_not_ancestor`, and a graft file cannot hide it. Missing history (shallow clone, both ends as shallow boundaries), a partial clone and a blob removed mid-copy are incomplete. A blob or tree object that does not match its id is incomplete. |
 | T08 | An interrupted copy leaves orphans and no index row; a retry completes. Per-CAP-state crashes are #658's. |
 | T09 | State-root cleanup reach: #656. |
 | T10 | Retain, delete the repository, rebuild: equal to an independent reading of a Git checkout (bytes, modes, symlinks, ID); same for both ends of a contribution. |
-| Refusals | Submodule, LFS/`filter=`, `working-tree-encoding=`; EOL attributes accepted; damaged and missing archive objects; non-empty destination; case/composition collisions. |
+| Refusals | Submodule; `filter`, `working-tree-encoding`, `ident` from the tree, `info/attributes` and `core.attributesFile`; EOL attributes accepted; configured programs never run; damaged and missing archive objects; unretained or non-canonical manifests; non-empty or symlinked destination; case/composition collisions. |
