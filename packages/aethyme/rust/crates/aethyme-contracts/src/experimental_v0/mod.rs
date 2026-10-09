@@ -1,5 +1,6 @@
 //! Experimental v0 contracts. See the crate docs for the stability rule.
 
+pub mod analysis;
 pub mod brief;
 pub mod canonical_json;
 mod digest;

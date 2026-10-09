@@ -71,6 +71,7 @@ mod gh_ref_guard;
 mod git;
 mod github_target;
 mod graph_impact;
+mod graph_impact_envelope;
 mod graph_integrity;
 mod homebrew;
 pub mod hooks;
@@ -313,6 +314,7 @@ pub use graph_impact::{
     GraphImpactStatus, GraphStoreImpactProvider, diff_digest, parse_diff_text,
     revision_bound_impact_report,
 };
+pub use graph_impact_envelope::{UnbindableImpactReport, impact_analysis_envelope};
 pub use graph_integrity::{
     GraphIntegrityOutcome, GraphIntegrityRejection, GraphIntegrityStatus, GraphIntegrityVerdict,
 };
