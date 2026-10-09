@@ -15,9 +15,10 @@
 //! single-glob matcher built below is byte-identical to one member of the
 //! set the broker compiles.
 
-use aethyme_broker::{GATES_CONFIG_RELPATH, load_gates, select_gates};
+use aethyme_broker::{GATES_CONFIG_RELPATH, load_gates, parse_gates, select_gates};
 use aethyme_testkit::repo_root;
 use globset::Glob;
+use std::fs;
 use std::path::Path;
 use std::process::Command;
 
@@ -100,6 +101,38 @@ fn gate_policy_changes_select_a_triggered_gate() {
         "{GATES_CONFIG_RELPATH} matches no gate trigger, so an entry that edits gate \
          policy runs only the always-on gates. Add it to the triggers of a gate whose \
          suites read it."
+    );
+}
+
+#[test]
+fn eval_gate_pins_pytest_and_hashes_the_pin_into_its_definition() {
+    const PIN: &str = "pytest==9.1.1";
+
+    let root = repo_root();
+    let gates = load_gates(&root).expect("the shipped gates.toml parses");
+    let gate = gates
+        .iter()
+        .find(|gate| gate.name == "pytest-aethyme-eval")
+        .expect("the eval gate is configured");
+    assert!(
+        gate.command.contains(PIN),
+        "pytest-aethyme-eval must install the reviewed exact version {PIN}"
+    );
+
+    let config = fs::read_to_string(root.join(GATES_CONFIG_RELPATH)).unwrap();
+    let changed_pin = config.replacen(PIN, "pytest==9.1.2", 1);
+    assert_ne!(
+        changed_pin, config,
+        "the exact pin must occur in the command"
+    );
+    let changed_gates = parse_gates(&changed_pin).expect("changing the pin keeps valid TOML");
+    let changed_gate = changed_gates
+        .iter()
+        .find(|candidate| candidate.name == "pytest-aethyme-eval")
+        .expect("the changed config still contains the eval gate");
+    assert_ne!(
+        gate.definition_hash, changed_gate.definition_hash,
+        "changing the pinned pytest version must invalidate cached verdicts"
     );
 }
 
