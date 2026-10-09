@@ -4,7 +4,7 @@ Last Updated: 2026-10-09
 
 This record is input to decision **D10** (how identities and exact revision references are
 minted and encoded) and the identity part of **D39** (how existing NodeIds relate to
-portable references). It is a **proposal**. D10 closes only with the evidence the plan
+portable references). It is a **proposal**, except where "Decided" below says otherwise. D10 closes only with the evidence the plan
 names (two clones, rename/copy/split, rationale-only updates, canonical Rust/TypeScript
 fixtures, authority binding), and part of that evidence comes from E1 (#650), which has
 not run.
@@ -113,11 +113,10 @@ path; and the existing source digest hashes Git object ids.
   `xt_tcpmss.c`). The golden vector "case-differing paths" pins acceptance. The
   obligation moves to #670: a checkout onto APFS/NTFS must detect collisions under that
   filesystem's folding and normalization and fail explicitly, never keep one file.
-
-## Decisions needed
-
-1. **Accept the common encoding rules above** (self-describing `<scheme>:`, SHA-256,
-   canonical-only parsing) as the D10 direction, so #653 and #655 build on them.
+- **Common encoding rules (2026-10-09): accepted as the D10 direction.** Self-describing
+  `<scheme>:` identities, algorithm-tagged SHA-256 digests, canonical-only parsing, and
+  locators kept separate from identities. #653 (records) and #655 (analysis envelope)
+  build on them. D10 itself still closes only with the E1 evidence named above.
 
 ## Tests
 
