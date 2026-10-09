@@ -661,10 +661,12 @@ impl ContextError {
 
 /// A contribution is live while it has a contribution retention root that
 /// is neither released nor past its boundary (the same rule reclamation
-/// applies). `?1` is the contribution, `?2` the current time.
-const LIVE: &str = "EXISTS (SELECT 1 FROM retention_roots r
+/// applies) and reclamation has not marked it. `?1` is the contribution,
+/// `?2` the current time.
+const LIVE: &str = "(EXISTS (SELECT 1 FROM retention_roots r
      WHERE r.lineage_record_id = ?1 AND r.kind = 'contribution' AND r.released_ms IS NULL
-       AND (r.until_ms IS NULL OR r.until_ms > ?2))";
+       AND (r.until_ms IS NULL OR r.until_ms > ?2))
+   AND NOT EXISTS (SELECT 1 FROM reclaimed_contributions g WHERE g.lineage_record_id = ?1))";
 
 /// Attach `brief` to a retained contribution, replacing any earlier brief
 /// (a revision of the same contribution's rationale). Returns the brief's
@@ -2435,6 +2437,8 @@ mod tests {
             "UPDATE retention_roots SET released_ms = 1 WHERE lineage_record_id = ?1",
             "UPDATE retention_roots SET until_ms = 1 WHERE lineage_record_id = ?1",
             "DELETE FROM retention_roots WHERE lineage_record_id = ?1",
+            "INSERT INTO reclaimed_contributions (lineage_record_id, generation, reclaimed_ms)
+             VALUES (?1, 1, 1)",
         ] {
             let mut fixture = Fixture::new();
             let change = fixture.contribute(&[("src/search.rs", "v2\n")]);

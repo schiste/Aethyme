@@ -31,9 +31,10 @@ returns an `aethyme.contribution-context/experimental-v0` record:
 | `items` | Rank, contribution, base and result snapshots, receipt, durability label, retention boundary, `acceptance: unknown`, `applicability` when a source was given (`in_source`, `same_base`, `other_base`), the reasons, and the brief or `brief_omitted`. |
 | `cache` | The cache key, the visibility epoch, and how many postings the answer depended on. The postings and their versions are inside the key, not listed: the list can be long. |
 
-Only live contributions are considered: those with a `contribution` retention root that
-is neither released nor past its `until_ms`. This is the rule reclamation applies; a
-contribution with no root is not live. Liveness is checked again inside the read, so a
+Only live contributions are considered. A live contribution has a `contribution`
+retention root that is neither released nor past its `until_ms`, and is not marked
+reclaimed. This is the rule reclamation applies; a contribution with no root is not
+live. Liveness is checked again inside the read, so a
 release that lands mid-query is not returned.
 
 ### Matching and order
@@ -146,8 +147,14 @@ query:
   capture generation and not read again until a later capture moves it.
 
 `contribution_briefs` is authority: it records which brief explains which contribution.
-All four are in state.db schema 5. Version 4 is reserved for reclamation (#659), developed in parallel;
-the two must be ordered when they meet.
+All four are in state.db schema 5, after reclamation's schema 4 (#659). A test pins the
+migrations as contiguous and ending at the binary's version.
+
+**Compatibility floor: 5.** A schema 4 binary's reclamation does not know that attached
+briefs are roots, so it could remove the brief of a live contribution. A store at schema 5
+therefore refuses binaries below 5. The derived tables alone would not need this: they
+are rebuildable. Reclamation keeps each attached brief with its contribution
+(`local-v3-l2-gc.md`).
 
 ### Visibility
 
