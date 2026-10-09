@@ -219,8 +219,20 @@ pub(crate) fn session_baseline(
 /// as committed on the fetched default branch when that exists, else the main
 /// checkout's working-tree file. `[promote]` and `[worktrees]` both read it.
 pub(crate) fn repository_config_text(main_root: &Path) -> Option<String> {
+    repository_config_with_source(main_root).map(|(text, _)| text)
+}
+
+/// [`repository_config_text`] and where it came from: `committed` (the
+/// fetched default branch) or `working_copy` (the main checkout's file, used
+/// when there is no fetched default branch or it does not hold the file).
+pub(crate) fn repository_config_with_source(main_root: &Path) -> Option<(String, &'static str)> {
     committed_config_text(main_root)
-        .or_else(|| std::fs::read_to_string(main_root.join(".aethyme/config.toml")).ok())
+        .map(|text| (text, "committed"))
+        .or_else(|| {
+            std::fs::read_to_string(main_root.join(".aethyme/config.toml"))
+                .ok()
+                .map(|text| (text, "working_copy"))
+        })
 }
 
 /// `.aethyme/config.toml` as committed on the fetched default branch, if there
@@ -1783,6 +1795,15 @@ impl Broker {
                 status: entry.status.as_str(),
             });
         }
+        // Every promotion, automatic or explicit, passes here. Under
+        // `[collaboration] capture = "required"` only a head with an
+        // acknowledged required capture may move integration (#660); with
+        // capture off or advisory this reads the config and nothing else.
+        crate::collaboration_submit::require_capture_for_promotion(
+            self,
+            entry_id,
+            &entry.head_commit,
+        )?;
         let details: serde_json::Value = entry
             .details_json
             .as_deref()

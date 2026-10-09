@@ -94,6 +94,7 @@ pub fn for_broker_error(error: &BrokerOpError) -> u8 {
         | E::InvalidLeasePath { .. }
         | E::OwnershipViolation { .. }
         | E::CapturedHeadMoved { .. }
+        | E::CaptureRequiredForPromotion { .. }
         | E::InvalidCoordinatedOperation { .. }
         | E::ClosedSessionOperation { .. }
         | E::SessionRepositoryMismatch { .. }

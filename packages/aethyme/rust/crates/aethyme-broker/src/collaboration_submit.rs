@@ -1,8 +1,10 @@
 //! Opt-in contribution capture at the submit boundary (#660, plan §6.4,
 //! §6.7-6.8; D18, D32).
 //!
-//! Configured in `.aethyme/config.toml`, under the same trust rule as
-//! `[promote]` (the copy committed on the fetched default branch wins):
+//! Configured in `.aethyme/config.toml`, read with the same rule as
+//! `[promote]`: the copy committed on the fetched default branch when there
+//! is one and it holds the file, otherwise the main checkout's working copy.
+//! The report names which (`config_source`).
 //!
 //! ```toml
 //! [collaboration]
@@ -10,36 +12,38 @@
 //! project = "proj-7k2m"  # the project's collaboration directory key
 //! ```
 //!
-//! - **Off** (no section, no `capture`, or `"off"`): nothing here runs, and
-//!   submit is byte-for-byte the legacy command.
-//! - **Advisory:** after the legacy submit has decided, the session's exact
-//!   base and result are captured. The outcome is reported beside the legacy
-//!   one and never changes its verdict, output or exit code.
-//! - **Required:** the capture runs first. If it is not acknowledged the
-//!   submit is refused before any queue entry, gate or promotion, so nothing
-//!   reaches `aethyme/integration` without retained source.
-//! - **Any other value** is refused as `unsupported_policy`, as if required:
-//!   a newer policy this binary does not implement must never be treated as
-//!   satisfied. Binaries that predate this module ignore the section
-//!   entirely; see `local-v3-l2-optin.md`.
-//!
-//! The capture's base is the merge base of the submitted head and the
-//! integration tip read before the submit, and its result is the submitted
-//! head; see `submit` for how the two are bound to one commit. The
-//! operation ID is derived from the session, both commits and the policy,
-//! so a retried submit answers with the same receipt.
+//! - **Off** (no section, no `capture`, or `"off"`): nothing here runs past
+//!   reading the config, and submit is the legacy command.
+//! - **Advisory:** after the legacy submit has decided (and, in text mode,
+//!   after its verdict is printed), the submitted commit is captured. The
+//!   outcome is reported beside the legacy one. It cannot change the verdict,
+//!   output or exit code: it never returns an error, catches panics, and
+//!   reports `in_progress` instead of waiting for another capture's lock.
+//! - **Required:** the capture runs first, on the base the submit will verify
+//!   against. If it is not acknowledged the submit is refused before any
+//!   queue entry. The submit is bound to the captured commit, and every
+//!   promotion (automatic, `promote --entry`, re-verification, queue drain)
+//!   refuses a head without an acknowledged required capture.
+//! - **Anything else** fails closed: an unknown `capture` value, a
+//!   `collaboration` key that is not a table, or an unreadable config that
+//!   visibly mentions `collaboration`. A repository whose config does not
+//!   mention it stays the legacy submit even when the file is malformed.
+//!   Binaries that predate this module ignore the section; see
+//!   `local-v3-l2-optin.md`.
 
-use std::path::Path;
+use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::path::{Path, PathBuf};
 
+use rusqlite::OptionalExtension;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use crate::collaboration_archive::CommitOid;
 use crate::collaboration_capture::{
     CaptureOutcome, CapturePolicy, CaptureReceipt, CaptureRequest, OperationId, RetentionBoundary,
-    capture,
+    capture, try_capture,
 };
-use crate::collaboration_state::{ProjectKey, open_for_repository};
+use crate::collaboration_state::{CollaborationStateError, CollaborationStore, ProjectKey};
 
 /// The schema of the `collaboration_capture` report in `submit --json`.
 pub const SUBMIT_CAPTURE_SCHEMA: &str = "aethyme.submit-capture/experimental-v0";
@@ -52,23 +56,67 @@ pub(crate) enum Setting {
         policy: CapturePolicy,
         project: Result<ProjectKey, String>,
     },
+    /// Fails closed, as a required capture that cannot be satisfied.
     Unsupported {
-        value: String,
+        code: &'static str,
+        detail: String,
     },
 }
 
-pub(crate) fn setting(main_root: &Path) -> Setting {
-    setting_from_text(crate::merge::repository_config_text(main_root).as_deref())
+/// The setting and where the config came from (`None` without a config).
+pub(crate) fn setting(main_root: &Path) -> (Setting, Option<&'static str>) {
+    match crate::merge::repository_config_with_source(main_root) {
+        Some((text, source)) => (setting_from_text(Some(&text)), Some(source)),
+        None => (Setting::Off, None),
+    }
+}
+
+/// Whether the raw text visibly opts in, read without parsing it: a
+/// `[collaboration...]` header or a `collaboration` key.
+fn mentions_collaboration(text: &str) -> bool {
+    text.lines().map(str::trim_start).any(|line| {
+        line.strip_prefix('[')
+            .map(|rest| rest.trim_start().starts_with("collaboration"))
+            .unwrap_or(false)
+            || line.strip_prefix("collaboration").is_some_and(|rest| {
+                let rest = rest.trim_start();
+                rest.starts_with('=') || rest.starts_with('.')
+            })
+    })
 }
 
 fn setting_from_text(text: Option<&str>) -> Setting {
-    // An unreadable file is the legacy behaviour everywhere else in the
-    // broker; only an explicit opt-in turns capture on.
-    let Some(table) = text
-        .and_then(|text| text.parse::<toml::Value>().ok())
-        .and_then(|value| value.get("collaboration").cloned())
-    else {
+    let Some(text) = text else {
         return Setting::Off;
+    };
+    let value = match text.parse::<toml::Value>() {
+        Ok(value) => value,
+        // An unreadable file stays the legacy behaviour, unless it visibly
+        // opted in: a broken opt-in must not silently turn capture off.
+        Err(error) if mentions_collaboration(text) => {
+            return Setting::Unsupported {
+                code: "config_unreadable",
+                detail: format!(
+                    ".aethyme/config.toml mentions [collaboration] but is not valid TOML \
+                     ({}), so the capture policy cannot be read",
+                    error.message()
+                ),
+            };
+        }
+        Err(_) => return Setting::Off,
+    };
+    let table = match value.get("collaboration") {
+        None => return Setting::Off,
+        Some(toml::Value::Table(table)) => table,
+        Some(other) => {
+            return Setting::Unsupported {
+                code: "unsupported_policy",
+                detail: format!(
+                    "collaboration is a {}, not a [collaboration] table",
+                    other.type_str()
+                ),
+            };
+        }
     };
     let policy = match table.get("capture") {
         None => return Setting::Off,
@@ -78,13 +126,21 @@ fn setting_from_text(text: Option<&str>) -> Setting {
             "required" => CapturePolicy::Required,
             other => {
                 return Setting::Unsupported {
-                    value: other.to_string(),
+                    code: "unsupported_policy",
+                    detail: format!(
+                        "[collaboration] capture = {other:?} is not a policy this binary \
+                         implements, so it is treated as required and not satisfied"
+                    ),
                 };
             }
         },
         Some(other) => {
             return Setting::Unsupported {
-                value: other.to_string(),
+                code: "unsupported_policy",
+                detail: format!(
+                    "[collaboration] capture = {other} is not a policy this binary implements, \
+                     so it is treated as required and not satisfied"
+                ),
             };
         }
     };
@@ -102,6 +158,8 @@ pub struct SubmitCaptureReport {
     pub schema: &'static str,
     /// `advisory`, `required`, or `unsupported`.
     pub policy: &'static str,
+    /// `committed` (fetched default branch) or `working_copy`.
+    pub config_source: &'static str,
     pub status: CaptureStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub operation_id: Option<String>,
@@ -113,6 +171,8 @@ pub struct SubmitCaptureReport {
     pub receipt: Option<ReceiptReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub code: Option<String>,
+    /// Path-free: host paths are replaced with placeholders such as
+    /// `<host state>` or `<path>`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -130,6 +190,9 @@ pub enum CaptureStatus {
     Refused,
     /// Capture did not run or did not finish, for a local reason.
     Failed,
+    /// Another process is capturing the same operation; advisory capture
+    /// does not wait for it.
+    InProgress,
     /// Capture is enabled but cannot run with this configuration.
     NotConfigured,
 }
@@ -164,10 +227,11 @@ impl SubmitCaptureReport {
         self.status == CaptureStatus::Acknowledged
     }
 
-    fn new(policy: &'static str, status: CaptureStatus) -> Self {
+    fn new(policy: &'static str, config_source: &'static str, status: CaptureStatus) -> Self {
         Self {
             schema: SUBMIT_CAPTURE_SCHEMA,
             policy,
+            config_source,
             status,
             operation_id: None,
             base_commit: None,
@@ -183,6 +247,12 @@ impl SubmitCaptureReport {
         self.code = Some(code.to_string());
         self.detail = Some(detail);
         self.next_action = Some(next_action.to_string());
+        self
+    }
+
+    /// Replace host paths in `detail` with placeholders.
+    fn without_paths(mut self, known: &[(PathBuf, &str)]) -> Self {
+        self.detail = self.detail.map(|detail| path_free(&detail, known));
         self
     }
 
@@ -211,6 +281,65 @@ impl SubmitCaptureReport {
     }
 }
 
+/// Host paths a detail may mention, most specific first, each with the
+/// placeholder that replaces it. Both the given and the canonical spelling
+/// are listed (`/var` and `/private/var` on macOS).
+fn known_paths(main_root: &Path, worktree: Option<&Path>) -> Vec<(PathBuf, &'static str)> {
+    let mut known: Vec<(PathBuf, &'static str)> = Vec::new();
+    let mut add = |path: PathBuf, label: &'static str| {
+        if let Ok(canonical) = path.canonicalize() {
+            known.push((canonical, label));
+        }
+        known.push((path, label));
+    };
+    if let Some(worktree) = worktree {
+        add(worktree.to_path_buf(), "<session worktree>");
+    }
+    add(main_root.to_path_buf(), "<repository>");
+    let (states, caches) = crate::host_state::host_directory_candidates();
+    for state in states {
+        add(state, "<host state>");
+    }
+    for cache in caches {
+        add(cache, "<host cache>");
+    }
+    if let Some(home) = std::env::var_os("HOME").filter(|home| !home.is_empty()) {
+        add(PathBuf::from(home), "<home>");
+    }
+    add(std::env::temp_dir(), "<temp>");
+    // Longest first, so a nested root is replaced before its parent.
+    known.sort_by_key(|(path, _)| std::cmp::Reverse(path.as_os_str().len()));
+    known
+}
+
+/// `detail` with every known root replaced by its placeholder, then any
+/// remaining absolute path (a word starting with `/`, and the words that
+/// continue it after a space) replaced by `<path>`.
+fn path_free(detail: &str, known: &[(PathBuf, &str)]) -> String {
+    let mut text = detail.to_string();
+    for (path, label) in known {
+        let path = path.to_string_lossy();
+        if path.len() > 1 {
+            text = text.replace(path.as_ref(), label);
+        }
+    }
+    let mut out = Vec::new();
+    let mut in_path = false;
+    for word in text.split(' ') {
+        let bare = word.trim_start_matches(['"', '\'', '(', '`']);
+        if bare.starts_with('/') && bare.len() > 1 {
+            out.push("<path>".to_string());
+            in_path = true;
+        } else if in_path && word.contains('/') {
+            // The rest of a path containing a space ("Application Support/...").
+        } else {
+            out.push(word.to_string());
+            in_path = false;
+        }
+    }
+    out.join(" ")
+}
+
 /// `submit --json` with capture enabled: the legacy outcome's fields,
 /// unchanged and in order, then `collaboration_capture`.
 #[derive(Serialize)]
@@ -224,44 +353,94 @@ pub(crate) struct WithCapture<'a, T: Serialize> {
 pub(crate) enum CaptureSubmit {
     /// Required capture was not acknowledged; nothing was submitted.
     Refused(SubmitCaptureReport),
-    /// The legacy submit ran; `capture` is `None` when capture is off.
+    /// Required capture was acknowledged, then the session moved, so the
+    /// submit was refused (`CapturedHeadMoved`) before any queue entry. The
+    /// receipt retains a commit that was not submitted; it is harmless and
+    /// answers again if that commit is ever submitted.
+    HeadMoved {
+        report: SubmitCaptureReport,
+        error: crate::BrokerOpError,
+    },
+    /// The legacy submit ran.
     Submitted {
         outcome: Box<crate::SubmitOutcome>,
-        capture: Option<SubmitCaptureReport>,
+        capture: Option<CaptureStep>,
     },
 }
 
-type OpenStore<'a> = dyn FnMut(
-        &Path,
-        &ProjectKey,
-    ) -> Result<
-        crate::collaboration_state::CollaborationStore,
-        crate::collaboration_state::CollaborationStateError,
-    > + 'a;
+/// The capture side of a submit that ran.
+pub(crate) enum CaptureStep {
+    /// Required: captured before the submit.
+    Done(SubmitCaptureReport),
+    /// Advisory: to run after the legacy verdict is shown.
+    Pending(AdvisoryCapture),
+}
+
+impl CaptureStep {
+    /// The report, running a pending advisory capture now.
+    pub(crate) fn finish(self, broker: &crate::Broker) -> SubmitCaptureReport {
+        match self {
+            Self::Done(report) => report,
+            Self::Pending(advisory) => advisory.run(broker),
+        }
+    }
+}
+
+type OpenStore<'a> =
+    dyn FnMut(&ProjectKey) -> Result<CollaborationStore, CollaborationStateError> + 'a;
+
+/// An advisory capture of the commit a submit pinned, against the base it
+/// verified against.
+pub(crate) struct AdvisoryCapture {
+    capture: SubmitCapture,
+    base: String,
+    head: String,
+}
+
+impl AdvisoryCapture {
+    pub(crate) fn run(self, broker: &crate::Broker) -> SubmitCaptureReport {
+        self.run_with(broker.main_root(), &mut |project| {
+            broker.collaboration_store(project)
+        })
+    }
+
+    /// Never returns an error, never unwinds, never waits for another
+    /// capture's lock.
+    fn run_with(self, main_root: &Path, open: &mut OpenStore<'_>) -> SubmitCaptureReport {
+        let name = self.capture.name;
+        let source = self.capture.source;
+        let worktree = self.capture.worktree().map(Path::to_path_buf);
+        catch_unwind(AssertUnwindSafe(|| {
+            self.capture.run(&self.base, &self.head, false, open)
+        }))
+        .unwrap_or_else(|_| {
+            SubmitCaptureReport::new(name, source, CaptureStatus::Failed).problem(
+                "panicked",
+                "the advisory capture stopped unexpectedly; the legacy submit is unaffected".into(),
+                "resubmit to retry the capture",
+            )
+        })
+        .without_paths(&known_paths(main_root, worktree.as_deref()))
+    }
+}
 
 /// Submit `session`, capturing it as `[collaboration]` asks.
 ///
-/// The capture and the submit are bound to one commit:
-/// - **Required:** the captured head is passed to
-///   [`crate::Broker::submit_expecting_head`], which refuses with
-///   `CapturedHeadMoved` before any queue entry if the session moved after
-///   the capture. A receipt therefore always names the submitted commit.
-/// - **Advisory:** the capture runs after the submit, on the head the submit
-///   pinned into its queue entry, never on an earlier reading.
+/// The capture and the submit agree on one base and one commit:
+/// - **Required:** integration is refreshed and the submission base read
+///   first, exactly as submit does; that base and the head are captured;
+///   then [`crate::Broker::submit_expecting_head`] refuses with
+///   `CapturedHeadMoved` before any queue entry if the session moved.
+/// - **Advisory:** nothing runs before the submit. The returned
+///   [`CaptureStep::Pending`] captures the head the submit pinned against the
+///   base it verified against.
 pub(crate) fn submit(
     broker: &mut crate::Broker,
     session: i64,
     cache: crate::CachePolicy,
     intent: crate::PromotionIntent,
 ) -> Result<CaptureSubmit, crate::BrokerOpError> {
-    submit_with(
-        broker,
-        session,
-        cache,
-        intent,
-        &mut |root, project| open_for_repository(root, project),
-        &mut || {},
-    )
+    submit_with(broker, session, cache, intent, None, &mut || {})
 }
 
 /// [`submit`] with the store opener injected, and `between` run after the
@@ -272,7 +451,7 @@ fn submit_with(
     session: i64,
     cache: crate::CachePolicy,
     intent: crate::PromotionIntent,
-    open: &mut OpenStore<'_>,
+    open: Option<&mut OpenStore<'_>>,
     between: &mut dyn FnMut(),
 ) -> Result<CaptureSubmit, crate::BrokerOpError> {
     let Some(capture) = SubmitCapture::prepare(broker, session) else {
@@ -282,38 +461,111 @@ fn submit_with(
             capture: None,
         });
     };
-    if capture.required {
-        let report = capture.run(broker.main_root(), None, open);
-        let Some(head) = report
-            .acknowledged()
-            .then(|| report.result_commit.clone())
-            .flatten()
-        else {
-            return Ok(CaptureSubmit::Refused(report));
-        };
+    if !capture.required {
         between();
-        let outcome = broker.submit_expecting_head(session, cache, intent, &head)?;
+        let outcome = broker.submit_with_intent(session, cache, intent)?;
+        let base = outcome
+            .verified_against
+            .as_ref()
+            .map(|base| base.commit.clone())
+            .unwrap_or_else(|| outcome.entry.base_commit.clone());
+        let head = outcome.entry.head_commit.clone();
         return Ok(CaptureSubmit::Submitted {
             outcome: Box::new(outcome),
-            capture: Some(report),
+            capture: Some(CaptureStep::Pending(AdvisoryCapture {
+                capture,
+                base,
+                head,
+            })),
         });
     }
+    let main_root = broker.main_root().to_path_buf();
+    let worktree = capture.worktree().map(Path::to_path_buf);
+    let known = known_paths(&main_root, worktree.as_deref());
+    let report = match &capture.prepared {
+        Err(report) => report.clone(),
+        Ok(prepared) => {
+            // The base submit will verify against, read the way submit reads
+            // it, so a resubmit after integration refreshes is the same
+            // operation.
+            broker.refresh_disposable_integration(crate::IntegrationRefreshTrigger::Submit);
+            let base = broker.submission_base()?.commit;
+            let head = prepared.head.clone();
+            match open {
+                Some(open) => capture.run(&base, &head, true, open),
+                None => capture.run(&base, &head, true, &mut |project| {
+                    broker.collaboration_store(project)
+                }),
+            }
+        }
+    }
+    .without_paths(&known);
+    let Some(head) = report
+        .acknowledged()
+        .then(|| report.result_commit.clone())
+        .flatten()
+    else {
+        return Ok(CaptureSubmit::Refused(report));
+    };
     between();
-    let outcome = broker.submit_with_intent(session, cache, intent)?;
-    let report = capture.run(broker.main_root(), Some(&outcome.entry.head_commit), open);
-    Ok(CaptureSubmit::Submitted {
-        outcome: Box::new(outcome),
-        capture: Some(report),
-    })
+    match broker.submit_expecting_head(session, cache, intent, &head) {
+        Ok(outcome) => Ok(CaptureSubmit::Submitted {
+            outcome: Box::new(outcome),
+            capture: Some(CaptureStep::Done(report)),
+        }),
+        Err(error @ crate::BrokerOpError::CapturedHeadMoved { .. }) => {
+            Ok(CaptureSubmit::HeadMoved { report, error })
+        }
+        Err(error) => Err(error),
+    }
 }
 
-/// The commits a capture is computed from, read before the submit can move
-/// the integration tip.
+/// Refuse to promote `head` when the repository requires capture and no
+/// acknowledged required capture of it exists. Off and advisory return
+/// before touching anything but the config.
+pub(crate) fn require_capture_for_promotion(
+    broker: &crate::Broker,
+    entry: i64,
+    head: &str,
+) -> Result<(), crate::BrokerOpError> {
+    let refuse = |reason: String| crate::BrokerOpError::CaptureRequiredForPromotion {
+        entry,
+        head: head.into(),
+        reason,
+    };
+    let project = match setting(broker.main_root()).0 {
+        Setting::Off
+        | Setting::On {
+            policy: CapturePolicy::Advisory,
+            ..
+        } => return Ok(()),
+        Setting::Unsupported { code, .. } => return Err(refuse(code.to_string())),
+        Setting::On { project, .. } => project.map_err(|_| refuse("no_project".into()))?,
+    };
+    let store = broker
+        .collaboration_store(&project)
+        .map_err(|e| refuse(e.code().into()))?;
+    let found = store
+        .read_connection()
+        .query_row(
+            "SELECT 1 FROM capture_operations o
+             JOIN capture_receipts r ON r.operation_id = o.operation_id
+             WHERE o.result_commit = ?1 AND o.policy = 'required'
+               AND o.state IN ('committed', 'acknowledged')
+             LIMIT 1",
+            [head],
+            |_| Ok(()),
+        )
+        .optional()
+        .map_err(|_| refuse("state_unreadable".into()))?;
+    found.ok_or_else(|| refuse("no_receipt".into()))
+}
+
+/// The session's worktree and head, read before the submit.
 struct Prepared {
     project: ProjectKey,
     session: i64,
-    worktree: std::path::PathBuf,
-    integration: String,
+    worktree: PathBuf,
     head: String,
 }
 
@@ -322,6 +574,7 @@ struct Prepared {
 struct SubmitCapture {
     policy: CapturePolicy,
     name: &'static str,
+    source: &'static str,
     required: bool,
     prepared: Result<Prepared, SubmitCaptureReport>,
 }
@@ -329,24 +582,26 @@ struct SubmitCapture {
 impl SubmitCapture {
     /// `None` when capture is off.
     fn prepare(broker: &mut crate::Broker, session: i64) -> Option<Self> {
-        let (policy, project) = match setting(broker.main_root()) {
+        let (setting, source) = setting(broker.main_root());
+        let source = source.unwrap_or("working_copy");
+        let (policy, project) = match setting {
             Setting::Off => return None,
-            Setting::Unsupported { value } => {
+            Setting::Unsupported { code, detail } => {
                 return Some(Self {
                     policy: CapturePolicy::Required,
                     name: "unsupported",
+                    source,
                     required: true,
                     prepared: Err(SubmitCaptureReport::new(
                         "unsupported",
+                        source,
                         CaptureStatus::NotConfigured,
                     )
                     .problem(
-                        "unsupported_policy",
-                        format!(
-                            "[collaboration] capture = {value} is not a policy this binary \
-                             implements, so it is treated as required and not satisfied"
-                        ),
-                        "use capture = \"off\", \"advisory\" or \"required\", or upgrade Aethyme",
+                        code,
+                        detail,
+                        "fix [collaboration] in .aethyme/config.toml: capture = \"off\", \
+                         \"advisory\" or \"required\" (or upgrade Aethyme)",
                     )),
                 });
             }
@@ -354,20 +609,23 @@ impl SubmitCapture {
         };
         let name = policy.as_str();
         let prepared = match project {
-            Err(detail) => Err(SubmitCaptureReport::new(name, CaptureStatus::NotConfigured)
-                .problem(
-                    "no_project",
-                    detail,
-                    "set [collaboration] project = \"<key>\" in .aethyme/config.toml \
+            Err(detail) => {
+                Err(
+                    SubmitCaptureReport::new(name, source, CaptureStatus::NotConfigured).problem(
+                        "no_project",
+                        detail,
+                        "set [collaboration] project = \"<key>\" in .aethyme/config.toml \
                      (1-64 lowercase letters, digits and '-'), or capture = \"off\"",
-                )),
+                    ),
+                )
+            }
             Ok(project) => match inputs(broker, session, project) {
                 Ok(prepared) => Ok(prepared),
                 Err(detail) => Err(
-                    SubmitCaptureReport::new(name, CaptureStatus::Failed).problem(
+                    SubmitCaptureReport::new(name, source, CaptureStatus::Failed).problem(
                         "inputs_unavailable",
                         detail,
-                        "check the session worktree and the integration branch, then resubmit",
+                        "check the session worktree, then resubmit",
                     ),
                 ),
             },
@@ -375,38 +633,48 @@ impl SubmitCapture {
         Some(Self {
             policy,
             name,
+            source,
             required: policy == CapturePolicy::Required,
             prepared,
         })
     }
 
-    /// Capture `result` (default: the head read at preparation). Never
-    /// panics and never returns an error: every outcome is a report.
+    fn worktree(&self) -> Option<&Path> {
+        self.prepared
+            .as_ref()
+            .ok()
+            .map(|prepared| prepared.worktree.as_path())
+    }
+
+    /// Capture `head` against `base_ref`. `wait` chooses between waiting for
+    /// another holder of the operation lock and reporting `in_progress`.
     fn run(
         &self,
-        main_root: &Path,
-        result: Option<&str>,
+        base_ref: &str,
+        head: &str,
+        wait: bool,
         open: &mut OpenStore<'_>,
     ) -> SubmitCaptureReport {
         let prepared = match &self.prepared {
             Ok(prepared) => prepared,
             Err(report) => return report.clone(),
         };
-        let request = match request(prepared, result.unwrap_or(&prepared.head), self.policy) {
+        let fresh = |status| SubmitCaptureReport::new(self.name, self.source, status);
+        let request = match request(prepared, base_ref, head, self.policy) {
             Ok(request) => request,
             Err(detail) => {
-                return SubmitCaptureReport::new(self.name, CaptureStatus::Failed).problem(
+                return fresh(CaptureStatus::Failed).problem(
                     "inputs_unavailable",
                     detail,
-                    "check the session worktree and the integration branch, then resubmit",
+                    "check the session worktree, then resubmit",
                 );
             }
         };
-        let mut report = SubmitCaptureReport::new(self.name, CaptureStatus::Failed);
+        let mut report = fresh(CaptureStatus::Failed);
         report.operation_id = Some(request.operation_id.as_str().to_string());
         report.base_commit = Some(request.base.as_str().to_string());
         report.result_commit = Some(request.result.as_str().to_string());
-        let mut store = match open(main_root, &prepared.project) {
+        let mut store = match open(&prepared.project) {
             Ok(store) => store,
             Err(error) => {
                 report.status = CaptureStatus::NotConfigured;
@@ -417,13 +685,26 @@ impl SubmitCapture {
                 );
             }
         };
-        match capture(&mut store, &request) {
-            Ok(CaptureOutcome::Acknowledged(receipt)) => {
+        let outcome = if wait {
+            capture(&mut store, &request).map(Some)
+        } else {
+            try_capture(&mut store, &request)
+        };
+        match outcome {
+            Ok(None) => {
+                report.status = CaptureStatus::InProgress;
+                report.problem(
+                    "in_progress",
+                    "another process is capturing this operation".into(),
+                    "resubmit later to read its receipt",
+                )
+            }
+            Ok(Some(CaptureOutcome::Acknowledged(receipt))) => {
                 report.status = CaptureStatus::Acknowledged;
                 report.receipt = Some(ReceiptReport::from(&receipt));
                 report
             }
-            Ok(CaptureOutcome::Incomplete { code, detail, .. }) => {
+            Ok(Some(CaptureOutcome::Incomplete { code, detail, .. })) => {
                 report.status = CaptureStatus::Incomplete;
                 report.problem(
                     &code,
@@ -450,7 +731,7 @@ impl SubmitCapture {
     }
 }
 
-/// Read the session's worktree, head and the integration tip.
+/// Read the session's worktree and head.
 fn inputs(
     broker: &mut crate::Broker,
     session: i64,
@@ -460,32 +741,29 @@ fn inputs(
         .store()
         .session(session)
         .map_err(|error| error.to_string())?;
-    let worktree = std::path::PathBuf::from(&info.worktree_path);
+    let worktree = PathBuf::from(&info.worktree_path);
     let checkout = crate::GitRepo::discover(&worktree).map_err(|error| error.to_string())?;
     let head = checkout.head_commit().map_err(|error| error.to_string())?;
-    let (_, integration) = broker
-        .integration_head_snapshot()
-        .map_err(|error| error.to_string())?;
     Ok(Prepared {
         project,
         session,
         worktree,
-        integration,
         head,
     })
 }
 
-/// The exact capture request for `result`: its base is the merge base with
-/// the integration tip read at preparation.
+/// The exact capture request for `result`, whose base is its merge base
+/// with `base_ref`, the commit the submit verifies against.
 fn request(
     prepared: &Prepared,
+    base_ref: &str,
     result: &str,
     policy: CapturePolicy,
 ) -> Result<CaptureRequest, String> {
     let checkout =
         crate::GitRepo::discover(&prepared.worktree).map_err(|error| error.to_string())?;
     let base = checkout
-        .merge_base(&prepared.integration, result)
+        .merge_base(base_ref, result)
         .map_err(|error| error.to_string())?;
     let session = prepared.session;
     let digest: String = Sha256::digest(
@@ -513,8 +791,7 @@ fn request(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    use crate::collaboration_state::{CollaborationRoot, CollaborationStore};
+    use crate::collaboration_state::CollaborationRoot;
     use std::process::Command;
 
     fn git(dir: &Path, args: &[&str]) -> String {
@@ -537,7 +814,7 @@ mod tests {
         state: tempfile::TempDir,
         broker: crate::Broker,
         session: i64,
-        worktree: std::path::PathBuf,
+        worktree: PathBuf,
     }
 
     /// A repository with `policy` capture and one committed session.
@@ -555,20 +832,39 @@ mod tests {
         )
         .unwrap();
         let worktrees = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
         let mut broker = crate::Broker::open(repo.path())
             .unwrap()
-            .with_worktree_root(worktrees.path());
+            .with_worktree_root(worktrees.path())
+            .with_collaboration_state(state.path());
         let session = broker.start_worktree("work", None).unwrap();
-        let worktree = std::path::PathBuf::from(&session.worktree_path);
+        let worktree = PathBuf::from(&session.worktree_path);
         commit(&worktree, "first");
         Fixture {
             repo,
             _worktrees: worktrees,
-            state: tempfile::tempdir().unwrap(),
+            state,
             broker,
             session: session.id,
             worktree,
         }
+    }
+
+    /// Integration is absent or still at `main`: nothing was promoted. Submit
+    /// creates it from `main` when it does not exist yet.
+    fn assert_integration_unmoved(repo: &Path) {
+        let tip = git(
+            repo,
+            &[
+                "for-each-ref",
+                "--format=%(objectname)",
+                "refs/heads/aethyme/integration",
+            ],
+        );
+        assert!(
+            tip.is_empty() || tip == git(repo, &["rev-parse", "main"]),
+            "integration moved to {tip}"
+        );
     }
 
     fn commit(worktree: &Path, name: &str) -> String {
@@ -578,100 +874,223 @@ mod tests {
         git(worktree, &["rev-parse", "HEAD"])
     }
 
-    /// Submit with the session moved by a new commit between the capture
-    /// inputs and the submit.
-    fn submit_after_a_move(
+    fn opener(
+        state: &Path,
+    ) -> impl FnMut(&ProjectKey) -> Result<CollaborationStore, CollaborationStateError> + use<>
+    {
+        let state = state.to_path_buf();
+        move |project| {
+            CollaborationStore::open(&CollaborationRoot::under_host_state(&state), project, &[])
+        }
+    }
+
+    /// Submit through [`submit_with`], running `between` before the submit
+    /// pins its head; a pending advisory capture runs with the test store.
+    fn submit_in_test(
         fixture: &mut Fixture,
-    ) -> (Result<CaptureSubmit, crate::BrokerOpError>, String) {
-        let state = fixture.state.path().to_path_buf();
-        let worktree = fixture.worktree.clone();
-        let mut moved = String::new();
+        between: &mut dyn FnMut(),
+    ) -> Result<(CaptureSubmit, Option<SubmitCaptureReport>), crate::BrokerOpError> {
+        let mut open = opener(fixture.state.path());
         let result = submit_with(
             &mut fixture.broker,
             fixture.session,
             crate::CachePolicy::Use,
             crate::PromotionIntent::Configured,
-            &mut |_, project| {
-                CollaborationStore::open(&CollaborationRoot::under_host_state(&state), project, &[])
-            },
-            &mut || moved = commit(&worktree, "second"),
-        );
-        (result, moved)
+            Some(&mut open),
+            between,
+        )?;
+        let main_root = fixture.broker.main_root().to_path_buf();
+        Ok(match result {
+            CaptureSubmit::Submitted {
+                outcome,
+                capture: Some(CaptureStep::Pending(advisory)),
+            } => {
+                let report = advisory.run_with(&main_root, &mut open);
+                (
+                    CaptureSubmit::Submitted {
+                        outcome,
+                        capture: None,
+                    },
+                    Some(report),
+                )
+            }
+            CaptureSubmit::Submitted {
+                outcome,
+                capture: Some(CaptureStep::Done(report)),
+            } => (
+                CaptureSubmit::Submitted {
+                    outcome,
+                    capture: None,
+                },
+                Some(report),
+            ),
+            other => (other, None),
+        })
     }
 
     /// Required: the captured commit is the only one that may be submitted.
-    /// A move after the capture is refused before any queue entry, and the
-    /// integration branch does not move.
+    /// A move after the capture is refused before any queue entry, the
+    /// integration branch does not move, and the acknowledged report comes
+    /// back with the refusal.
     #[test]
     fn a_session_moved_after_a_required_capture_is_not_submitted() {
         let mut fixture = fixture("required");
-        let integration = git(fixture.repo.path(), &["for-each-ref", "refs/heads/aethyme"]);
-        let (result, moved) = submit_after_a_move(&mut fixture);
+
+        let worktree = fixture.worktree.clone();
+        let mut moved = String::new();
+        let result = submit_in_test(&mut fixture, &mut || moved = commit(&worktree, "second"));
         match result {
-            Err(crate::BrokerOpError::CapturedHeadMoved { actual, .. }) => {
-                assert_eq!(&*actual, moved.as_str());
+            Ok((CaptureSubmit::HeadMoved { report, error }, _)) => {
+                assert!(report.acknowledged());
+                assert_ne!(report.result_commit.as_deref(), Some(moved.as_str()));
+                assert!(matches!(
+                    error,
+                    crate::BrokerOpError::CapturedHeadMoved { ref actual, .. } if **actual == *moved
+                ));
+                assert_eq!(
+                    crate::exit_status::for_broker_error(&error),
+                    crate::exit_status::REFUSED
+                );
             }
-            Err(other) => panic!("unexpected error: {other}"),
             Ok(_) => panic!("submitted a commit that was never captured"),
+            Err(other) => panic!("unexpected error: {other}"),
         }
-        assert_eq!(
-            crate::exit_status::for_broker_error(&crate::BrokerOpError::CapturedHeadMoved {
-                session_id: 0,
-                captured: "a".into(),
-                actual: "b".into(),
-            }),
-            crate::exit_status::REFUSED
-        );
         assert!(fixture.broker.store().merge_queue().unwrap().is_empty());
-        assert_eq!(
-            git(fixture.repo.path(), &["for-each-ref", "refs/heads/aethyme"]),
-            integration
-        );
+        assert_integration_unmoved(fixture.repo.path());
     }
 
     /// Advisory: the receipt names the commit the submit actually pinned.
     #[test]
     fn an_advisory_capture_retains_the_commit_that_was_submitted() {
         let mut fixture = fixture("advisory");
-        let (result, moved) = submit_after_a_move(&mut fixture);
-        let Ok(CaptureSubmit::Submitted {
-            outcome,
-            capture: Some(report),
-        }) = result
-        else {
-            panic!("advisory submit did not report a capture");
+        let worktree = fixture.worktree.clone();
+        let mut moved = String::new();
+        let (submitted, report) =
+            submit_in_test(&mut fixture, &mut || moved = commit(&worktree, "second")).unwrap();
+        let CaptureSubmit::Submitted { outcome, .. } = submitted else {
+            panic!("advisory submit refused");
         };
+        let report = report.unwrap();
         assert_eq!(outcome.entry.head_commit, moved);
         assert_eq!(report.status, CaptureStatus::Acknowledged, "{report:?}");
         assert_eq!(report.result_commit.as_deref(), Some(moved.as_str()));
     }
 
-    /// Without a move, a required capture submits the captured commit.
+    /// Without a move, a required capture submits and promotes the captured
+    /// commit; the promotion gate finds its receipt.
     #[test]
     fn a_required_capture_submits_the_captured_commit() {
         let mut fixture = fixture("required");
-        let state = fixture.state.path().to_path_buf();
-        let Ok(CaptureSubmit::Submitted {
-            outcome,
-            capture: Some(report),
-        }) = submit_with(
-            &mut fixture.broker,
-            fixture.session,
-            crate::CachePolicy::Use,
-            crate::PromotionIntent::Configured,
-            &mut |_, project| {
-                CollaborationStore::open(&CollaborationRoot::under_host_state(&state), project, &[])
-            },
-            &mut || {},
-        )
-        else {
+        let (submitted, report) = submit_in_test(&mut fixture, &mut || {}).unwrap();
+        let CaptureSubmit::Submitted { outcome, .. } = submitted else {
             panic!("required submit failed");
         };
+        let report = report.unwrap();
         assert_eq!(
             report.result_commit.as_deref(),
             Some(outcome.entry.head_commit.as_str())
         );
         assert!(outcome.promoted);
+    }
+
+    /// Under required, a submit that bypasses the capture (the library API,
+    /// or any promotion path) verifies but never promotes an uncaptured head.
+    #[test]
+    fn an_uncaptured_head_is_never_promoted_under_required() {
+        let mut fixture = fixture("required");
+        let config = fixture.repo.path().join(".aethyme/config.toml");
+
+        let error = fixture.broker.submit(fixture.session).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                crate::BrokerOpError::CaptureRequiredForPromotion { .. }
+            ),
+            "{error}"
+        );
+        assert_eq!(
+            crate::exit_status::for_broker_error(&error),
+            crate::exit_status::REFUSED
+        );
+        assert_integration_unmoved(fixture.repo.path());
+        let entry = fixture.broker.store().merge_queue().unwrap().pop().unwrap();
+        assert_eq!(entry.status, crate::MergeStatus::Verified);
+        assert!(matches!(
+            fixture.broker.promote(entry.id),
+            Err(crate::BrokerOpError::CaptureRequiredForPromotion { .. })
+        ));
+        // Advisory never gates promotion.
+        std::fs::write(
+            &config,
+            "[collaboration]\ncapture = \"advisory\"\nproject = \"proj-test\"\n",
+        )
+        .unwrap();
+        fixture.broker.promote(entry.id).unwrap();
+    }
+
+    /// A panicking capture is reported, not propagated.
+    #[test]
+    fn a_panicking_advisory_capture_is_a_failed_report() {
+        let mut fixture = fixture("advisory");
+        let mut open = opener(fixture.state.path());
+        let CaptureSubmit::Submitted {
+            capture: Some(CaptureStep::Pending(advisory)),
+            ..
+        } = submit_with(
+            &mut fixture.broker,
+            fixture.session,
+            crate::CachePolicy::Use,
+            crate::PromotionIntent::Configured,
+            Some(&mut open),
+            &mut || {},
+        )
+        .unwrap()
+        else {
+            panic!("expected a pending advisory capture");
+        };
+        let main_root = fixture.broker.main_root().to_path_buf();
+        let report = advisory.run_with(&main_root, &mut |_| panic!("injected"));
+        assert_eq!(report.status, CaptureStatus::Failed);
+        assert_eq!(report.code.as_deref(), Some("panicked"));
+    }
+
+    /// An advisory capture whose operation another process is capturing
+    /// reports `in_progress` instead of waiting.
+    #[test]
+    fn an_advisory_capture_does_not_wait_for_a_held_lock() {
+        let mut fixture = fixture("advisory");
+        let mut open = opener(fixture.state.path());
+        let CaptureSubmit::Submitted {
+            capture: Some(CaptureStep::Pending(advisory)),
+            ..
+        } = submit_with(
+            &mut fixture.broker,
+            fixture.session,
+            crate::CachePolicy::Use,
+            crate::PromotionIntent::Configured,
+            Some(&mut open),
+            &mut || {},
+        )
+        .unwrap()
+        else {
+            panic!("expected a pending advisory capture");
+        };
+        let prepared = advisory.capture.prepared.as_ref().ok().unwrap();
+        let request = request(
+            prepared,
+            &advisory.base,
+            &advisory.head,
+            CapturePolicy::Advisory,
+        )
+        .unwrap();
+        let store = open(&prepared.project).unwrap();
+        let _held =
+            crate::collaboration_capture::hold_operation_lock(&store, &request.operation_id);
+        let main_root = fixture.broker.main_root().to_path_buf();
+        let started = std::time::Instant::now();
+        let report = advisory.run_with(&main_root, &mut open);
+        assert_eq!(report.status, CaptureStatus::InProgress, "{report:?}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
     }
 
     #[test]
@@ -711,9 +1130,53 @@ mod tests {
         for value in ["\"requried\"", "\"required-v2\"", "true", "1"] {
             let text = format!("[collaboration]\ncapture = {value}\nproject = \"p\"\n");
             assert!(
-                matches!(setting_from_text(Some(&text)), Setting::Unsupported { .. }),
+                matches!(
+                    setting_from_text(Some(&text)),
+                    Setting::Unsupported {
+                        code: "unsupported_policy",
+                        ..
+                    }
+                ),
                 "{value}"
             );
+        }
+    }
+
+    /// A malformed file fails closed only when it visibly opted in; a
+    /// repository that never mentions collaboration keeps the legacy submit.
+    #[test]
+    fn a_malformed_opt_in_fails_closed_and_other_malformed_files_stay_off() {
+        for text in [
+            "[collaboration]\ncapture = \"required\"\nproject = \n",
+            "[ collaboration ]\ncapture = required\n",
+            "collaboration.capture = \"required\"\n[promote\n",
+            "collaboration = { capture = \"required\" \n",
+        ] {
+            assert!(
+                matches!(
+                    setting_from_text(Some(text)),
+                    Setting::Unsupported {
+                        code: "config_unreadable",
+                        ..
+                    }
+                ),
+                "{text}"
+            );
+        }
+        for text in ["collaboration = \"required\"\n", "collaboration = true\n"] {
+            assert!(
+                matches!(
+                    setting_from_text(Some(text)),
+                    Setting::Unsupported {
+                        code: "unsupported_policy",
+                        ..
+                    }
+                ),
+                "{text}"
+            );
+        }
+        for text in ["[promote\nmode = auto\n", "# collaboration later\n[gates"] {
+            assert_eq!(setting_from_text(Some(text)), Setting::Off, "{text}");
         }
     }
 
@@ -729,5 +1192,25 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn details_carry_no_host_paths() {
+        let known = vec![
+            (
+                PathBuf::from("/Users/someone/Library/Application Support/Aethyme"),
+                "<host state>",
+            ),
+            (PathBuf::from("/Users/someone"), "<home>"),
+        ];
+        let detail = "collaboration root /Users/someone/Library/Application Support/Aethyme/collaboration \
+                      is inside the worktree container \"/Volumes/T7 drive/Application Support/x\"; \
+                      move /opt/thing elsewhere";
+        let clean = path_free(detail, &known);
+        assert!(!clean.contains("/Users"), "{clean}");
+        assert!(!clean.contains("/Volumes"), "{clean}");
+        assert!(!clean.contains("/opt"), "{clean}");
+        assert!(clean.contains("<host state>/collaboration"), "{clean}");
+        assert!(clean.contains("move <path> elsewhere"), "{clean}");
     }
 }

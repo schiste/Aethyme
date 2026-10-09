@@ -927,12 +927,43 @@ pub fn capture(
     capture_with(store, request, &Hooks::default())
 }
 
+/// Hold `operation_id`'s lock, as a concurrent capture would.
+#[cfg(test)]
+pub(crate) fn hold_operation_lock(
+    store: &CollaborationStore,
+    operation_id: &OperationId,
+) -> Option<ExclusiveFileLock> {
+    lock_operation(store, operation_id, true).unwrap()
+}
+
+/// [`capture`] without waiting: `Ok(None)` when another process holds this
+/// operation's lock, so a caller that must not block (advisory capture at
+/// submit, #660) can report the capture as in progress instead.
+pub fn try_capture(
+    store: &mut CollaborationStore,
+    request: &CaptureRequest,
+) -> Result<Option<CaptureOutcome>, CaptureError> {
+    let Some(_lock) = lock_operation(store, &request.operation_id, false)? else {
+        return Ok(None);
+    };
+    capture_locked(store, request, &Hooks::default()).map(Some)
+}
+
 pub(crate) fn capture_with(
     store: &mut CollaborationStore,
     request: &CaptureRequest,
     hooks: &Hooks,
 ) -> Result<CaptureOutcome, CaptureError> {
     let _lock = lock_operation(store, &request.operation_id, true)?;
+    capture_locked(store, request, hooks)
+}
+
+/// The capture itself; the caller holds the operation lock.
+fn capture_locked(
+    store: &mut CollaborationStore,
+    request: &CaptureRequest,
+    hooks: &Hooks,
+) -> Result<CaptureOutcome, CaptureError> {
     let Some(row) = begin(store, request, hooks)? else {
         unreachable!("begin returns the operation it recorded");
     };

@@ -515,6 +515,17 @@ pub enum BrokerOpError {
         captured: Box<str>,
         actual: Box<str>,
     },
+    /// `[collaboration] capture = "required"` and the entry's head has no
+    /// acknowledged required capture, so promoting it would integrate code
+    /// that was never retained.
+    #[error(
+        "refusing to promote entry {entry}: this repository requires collaboration capture and head {head} has no acknowledged required capture ({reason}); resubmit the session with `aethyme broker submit --session <id>` to capture and verify it"
+    )]
+    CaptureRequiredForPromotion {
+        entry: i64,
+        head: Box<str>,
+        reason: String,
+    },
     #[error("session {session_id}'s branch {branch} does not exist in this repository")]
     SessionBranchMissing { session_id: i64, branch: String },
     /// `broker sync` declined before changing anything: the worktree is
@@ -2990,6 +3001,8 @@ pub struct Broker {
     graph_impact_provider: Box<dyn GraphImpactProvider>,
     host_operation_db_path: Option<PathBuf>,
     worktree_root_override: Option<PathBuf>,
+    /// Test-only host state directory for collaboration state (#660).
+    collaboration_state_override: Option<PathBuf>,
     /// Set only while a bounded eligibility pass runs: the landing search
     /// stops at it instead of finishing one expensive worktree long past the
     /// pass's budget (#460).

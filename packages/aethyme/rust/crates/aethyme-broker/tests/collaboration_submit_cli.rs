@@ -68,6 +68,25 @@ impl Fixture {
         fixture
     }
 
+    /// A repository with an `origin` whose default branch holds the
+    /// committed `config`, so the config is read from the committed copy.
+    fn with_origin(config: &str) -> (Self, tempfile::TempDir) {
+        let fixture = Self::new(None, false);
+        let repo = fixture.repo.path();
+        let origin = tempfile::tempdir().unwrap();
+        git(origin.path(), &["init", "-q", "--bare", "-b", "main"]);
+        fixture.configure(config);
+        git(repo, &["add", "-f", ".aethyme/config.toml"]);
+        git(repo, &["commit", "-qm", "config"]);
+        git(
+            repo,
+            &["remote", "add", "origin", origin.path().to_str().unwrap()],
+        );
+        git(repo, &["push", "-q", "-u", "origin", "main"]);
+        git(repo, &["remote", "set-head", "origin", "main"]);
+        (fixture, origin)
+    }
+
     fn configure(&self, config: &str) {
         std::fs::write(self.repo.path().join(".aethyme/config.toml"), config).unwrap();
     }
@@ -239,6 +258,18 @@ fn a_failed_advisory_capture_never_changes_the_legacy_verdict() {
     assert_eq!(capture["code"], "overlaps_cleanup_root", "{capture:#}");
     assert!(capture["next_action"].is_string());
     assert!(!fixture.collaboration().exists());
+    // The detail names the problem without host paths.
+    let detail = capture["detail"].as_str().unwrap();
+    for path in [
+        fixture.state.path(),
+        fixture.repo.path(),
+        fixture.home.path(),
+    ] {
+        for spelling in [path.to_path_buf(), path.canonicalize().unwrap()] {
+            assert!(!detail.contains(spelling.to_str().unwrap()), "{detail}");
+        }
+    }
+    assert!(detail.contains("<host state>"), "{detail}");
 
     // A failing gate keeps its exit code; the capture still succeeds.
     let legacy = Fixture::new(None, true);
@@ -316,4 +347,86 @@ fn a_retried_submit_gets_the_same_receipt() {
     assert_eq!(first["status"], "acknowledged", "{first:#}");
     assert_eq!(first["operation_id"], second["operation_id"]);
     assert_eq!(first["receipt"], second["receipt"]);
+}
+
+/// Verify-only repositories verify against the fetched default branch and
+/// refresh integration onto it. The capture uses the same base, so a resubmit
+/// after the refresh is the same operation, and its base is the commit the
+/// submit verified against.
+#[test]
+fn the_capture_base_is_the_base_the_submit_verified_against() {
+    for policy in ["advisory", "required"] {
+        let (fixture, origin) = Fixture::with_origin(&format!(
+            "[promote]\nmode = \"verify-only\"\n\n[collaboration]\ncapture = \"{policy}\"\nproject = \"proj-test\"\n"
+        ));
+        let started = fixture.cli(&["start", "--task", "work", "--json"], None);
+        assert!(started.status.success());
+        let started: serde_json::Value = serde_json::from_slice(&started.stdout).unwrap();
+        let worktree = PathBuf::from(started["worktree_path"].as_str().unwrap());
+        let session = started["id"].as_i64().unwrap().to_string();
+
+        // Upstream moves on; integration still points at the old tip.
+        let other = tempfile::tempdir().unwrap();
+        git(
+            other.path(),
+            &["clone", "-q", origin.path().to_str().unwrap(), "."],
+        );
+        std::fs::write(other.path().join("upstream.txt"), "upstream\n").unwrap();
+        git(other.path(), &["add", "-A"]);
+        git(other.path(), &["commit", "-qm", "upstream"]);
+        git(other.path(), &["push", "-q", "origin", "HEAD:main"]);
+        git(fixture.repo.path(), &["fetch", "-q", "origin"]);
+        let upstream = git(fixture.repo.path(), &["rev-parse", "origin/main"]);
+        // The session is cut from upstream, not from the lagging integration.
+        git(&worktree, &["merge", "-q", "--ff-only", "origin/main"]);
+        std::fs::write(worktree.join("work.txt"), "payload\n").unwrap();
+        git(&worktree, &["add", "-A"]);
+        git(&worktree, &["commit", "-qm", "work"]);
+
+        let (_, first) = fixture.submit_json(&session, None);
+        let (_, second) = fixture.submit_json(&session, None);
+        let capture = &first["collaboration_capture"];
+        assert_eq!(capture["status"], "acknowledged", "{policy}: {capture:#}");
+        assert_eq!(first["verified_against"]["commit"], upstream.as_str());
+        assert_eq!(capture["base_commit"], upstream.as_str(), "{policy}");
+        assert_eq!(
+            capture["operation_id"], second["collaboration_capture"]["operation_id"],
+            "{policy}"
+        );
+        assert_eq!(
+            capture["receipt"],
+            second["collaboration_capture"]["receipt"]
+        );
+    }
+}
+
+/// The committed default branch decides the policy: a working copy that
+/// says off does not switch off a committed `required`.
+#[test]
+fn the_committed_policy_wins_over_the_working_copy() {
+    let (fixture, _origin) = Fixture::with_origin(REQUIRED);
+    fixture.configure("[collaboration]\ncapture = \"off\"\n");
+    let session = fixture.session("work");
+    let (code, outcome) = fixture.submit_json(&session, None);
+    assert_eq!(code, 0);
+    let capture = &outcome["collaboration_capture"];
+    assert_eq!(capture["policy"], "required", "{outcome:#}");
+    assert_eq!(capture["config_source"], "committed");
+    assert_eq!(capture["status"], "acknowledged");
+}
+
+/// In text mode the legacy verdict is printed before the advisory capture
+/// runs, so a slow or failing capture cannot hide or delay it.
+#[test]
+fn the_legacy_verdict_is_printed_before_the_advisory_capture() {
+    let fixture = Fixture::new(Some(ADVISORY), false);
+    let session = fixture.session("work");
+    let output = fixture.cli(&["submit", "--session", &session], None);
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let verdict = stdout.find("What now").expect("legacy verdict");
+    let capture = stdout
+        .find("collaboration capture (advisory)")
+        .expect("capture line");
+    assert!(verdict < capture, "{stdout}");
 }
