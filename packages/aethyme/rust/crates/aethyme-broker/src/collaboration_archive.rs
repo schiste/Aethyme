@@ -16,26 +16,36 @@
 //! - **Publication.** Write a temporary in the spool, flush it, re-read and
 //!   hash what reached the file, publish it without replacing anything, and
 //!   flush the directory. An existing object with the same name must hash
-//!   the same, or the archive is refused as corrupt. Never a hard link into
-//!   a checkout or a Git alternate: the archive holds its own copy.
+//!   the same, or the archive is refused as corrupt, and its directory is
+//!   flushed too, so a caller never records an object whose entry a
+//!   concurrent writer has not yet made durable. Never a hard link into a
+//!   checkout or a Git alternate: the archive holds its own copy.
 //! - **Capture reads Git, not the worktree.** The commit is named by a full
-//!   object id, so a branch that moves cannot change what is retained. Trees
-//!   and blobs come from `git ls-tree` and `git cat-file --batch`, which run
-//!   no hooks, filters or textconv; replace refs are ignored. Each blob's
-//!   bytes are checked against its Git object id while they are copied.
+//!   object id, so a branch that moves cannot change what is retained. The
+//!   commit, every tree and every blob are read through `git cat-file
+//!   --batch` and checked against their object ids (Git does not check loose
+//!   objects on read, and `ls-tree` would list a damaged tree). Replace
+//!   refs, grafts and lazy fetching are off; inherited repository and
+//!   configuration variables are cleared; a configured fsmonitor or hook
+//!   never runs. A partial clone is reported incomplete up front.
 //! - **Never a guessed success.** A missing object, a digest mismatch or
 //!   missing history is *incomplete* ([`ArchiveError::is_incomplete`]). A
-//!   submodule, a mode #652 refuses, or a `.gitattributes` filter whose
-//!   checkout bytes differ from the committed ones is *refused*. Either way
+//!   submodule, a mode #652 refuses, or an attribute that makes a checkout
+//!   differ from the committed bytes (`filter`, `working-tree-encoding`,
+//!   `ident`; from the tree, `.git/info/attributes` or
+//!   `core.attributesFile`) is *refused*. Either way
 //!   no index row is written, and objects already copied stay as orphans
 //!   that a retry reuses.
 //! - **Lineage.** A contribution retains its complete base and result
 //!   snapshots and checks that the base commit is an ancestor of the result.
 //!   Replay needs only those two snapshots; the commits in between are
 //!   recorded as provenance, not retained.
-//! - **Rebuild.** [`reconstruct`] writes a snapshot from the archive alone,
-//!   verifying every byte, and refuses when the destination filesystem folds
-//!   two paths into one (case or Unicode), as #652 decided.
+//! - **Rebuild.** [`reconstruct`] writes only a snapshot the archive
+//!   retained (an index row and a manifest in canonical form, so a committed
+//!   file that happens to parse as a manifest is not one), from the archive
+//!   alone, verifying every byte. It refuses a symlinked destination and
+//!   any path the destination filesystem folds (case or Unicode), as #652
+//!   decided.
 //!
 //! Retention roots, receipts and the capture state machine are #658's;
 //! reclamation is #659's. Nothing here deletes an object.
@@ -167,6 +177,13 @@ pub enum ArchiveError {
     NotAnObjectId { text: String },
     #[error("{oid} is not a commit")]
     NotACommit { oid: String },
+    #[error(
+        "the repository is a partial clone ({setting}); objects it omits would have to be \
+         fetched, which capture never does. Capture from a full clone"
+    )]
+    PartialClone { setting: String },
+    #[error("source object {oid} matches its id but is not a well-formed {kind}")]
+    MalformedSource { oid: String, kind: &'static str },
     #[error("{revision:?} does not name a commit in this repository")]
     UnknownRevision { revision: String },
     #[error(
@@ -203,6 +220,8 @@ pub enum ArchiveError {
     NotRetained { id: String },
     #[error("{} must be absent or an empty directory", path.display())]
     DestinationNotEmpty { path: PathBuf },
+    #[error("{} is a symbolic link; name the real directory", path.display())]
+    DestinationIsSymlink { path: PathBuf },
     #[error(
         "{} collides with another path on this filesystem (letter case or Unicode \
          composition); materialize on a case-sensitive, non-normalizing filesystem",
@@ -227,6 +246,8 @@ impl ArchiveError {
         match self {
             Self::NotAnObjectId { .. } => "not_an_object_id",
             Self::NotACommit { .. } => "not_a_commit",
+            Self::PartialClone { .. } => "partial_clone",
+            Self::MalformedSource { .. } => "malformed_source",
             Self::UnknownRevision { .. } => "unknown_revision",
             Self::UnsupportedEntry { .. } => "unsupported_entry",
             Self::UnsupportedFilter { .. } => "unsupported_filter",
@@ -239,6 +260,7 @@ impl ArchiveError {
             Self::MissingObject { .. } => "missing_object",
             Self::NotRetained { .. } => "not_retained",
             Self::DestinationNotEmpty { .. } => "destination_not_empty",
+            Self::DestinationIsSymlink { .. } => "destination_is_symlink",
             Self::MaterializationCollision { .. } => "materialization_collision",
             Self::Git { .. } => "git",
             Self::Io { .. } => "io",
@@ -256,6 +278,7 @@ impl ArchiveError {
             Self::SourceUnavailable { .. }
                 | Self::SourceMismatch { .. }
                 | Self::HistoryUnavailable { .. }
+                | Self::PartialClone { .. }
         )
     }
 }
@@ -293,9 +316,18 @@ fn object_path(store: &CollaborationStore, digest: &ObjectDigest) -> PathBuf {
     objects_dir(store).join(&hex[..2]).join(&hex[2..])
 }
 
-/// Create `path` and any missing parents privately, flushing each new entry.
+/// Create `path` and any missing parents privately, and make its entry in
+/// its parent durable.
+///
+/// The parent is flushed even when the directory already exists: another
+/// writer may have created it and not yet flushed the entry, and this
+/// writer's index row must not become durable before the directory that
+/// holds its objects does.
 fn ensure_dir(path: &Path) -> Result<(), ArchiveError> {
     if path.is_dir() {
+        if let Some(parent) = path.parent() {
+            sync_directory(parent)?;
+        }
         return Ok(());
     }
     if let Some(parent) = path.parent() {
@@ -303,7 +335,12 @@ fn ensure_dir(path: &Path) -> Result<(), ArchiveError> {
     }
     match std::fs::create_dir(path) {
         Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => return Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            if let Some(parent) = path.parent() {
+                sync_directory(parent)?;
+            }
+            return Ok(());
+        }
         Err(source) => return Err(io(path, source)),
     }
     crate::host_state::protect_host_state_path(path, true).map_err(|source| io(path, source))?;
@@ -351,6 +388,9 @@ fn publish(
                     digest: digest.hex(),
                 });
             }
+            // A concurrent writer may not have flushed its entry yet; a
+            // caller that records this object must not outrun it.
+            sync_directory(fan_out)?;
         }
         Err(error) => return Err(io(&target, error.error)),
     }
@@ -410,19 +450,43 @@ fn git(repo: &Path) -> Command {
     let mut command = Command::new("git");
     command
         .arg("--no-replace-objects")
+        // Loading the index starts a configured fsmonitor, and `check-attr`
+        // loads it: a repository's configuration must not run a program
+        // during capture. Hooks are pointed nowhere for the same reason.
+        .args([
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "core.hooksPath=/dev/null",
+        ])
         .arg("-C")
         .arg(repo)
         .env("GIT_NO_REPLACE_OBJECTS", "1")
+        // A partial clone must not fetch what it lacks: a missing object is
+        // reported as missing.
+        .env("GIT_NO_LAZY_FETCH", "1")
+        // Grafts rewrite parents and would change the ancestry answer.
+        .env("GIT_GRAFT_FILE", "/dev/null")
         .env("GIT_TERMINAL_PROMPT", "0");
     for name in [
         "GIT_DIR",
+        "GIT_COMMON_DIR",
         "GIT_WORK_TREE",
         "GIT_INDEX_FILE",
         "GIT_OBJECT_DIRECTORY",
         "GIT_ALTERNATE_OBJECT_DIRECTORIES",
         "GIT_NAMESPACE",
+        "GIT_CONFIG_PARAMETERS",
+        "GIT_CONFIG_COUNT",
     ] {
         command.env_remove(name);
+    }
+    // Configuration injected through the environment by the caller.
+    for (name, _) in std::env::vars_os() {
+        let name = name.to_string_lossy();
+        if name.starts_with("GIT_CONFIG_KEY_") || name.starts_with("GIT_CONFIG_VALUE_") {
+            command.env_remove(name.as_ref());
+        }
     }
     command
 }
@@ -469,6 +533,36 @@ pub fn pin_commit(repo: &Path, revision: &str) -> Result<CommitOid, ArchiveError
         });
     }
     CommitOid::parse(String::from_utf8_lossy(&output.stdout).trim())
+}
+
+/// Refuse a partial clone: objects it omitted would otherwise surface as
+/// missing part-way through, or be fetched from a promisor remote.
+fn refuse_partial_clone(repo: &Path) -> Result<(), ArchiveError> {
+    let output = git_output(
+        repo,
+        &[
+            "config",
+            "--get-regexp",
+            r"^(extensions\.partialclone|remote\..*\.promisor|remote\..*\.partialclonefilter)$",
+        ],
+    )?;
+    match output.status.code() {
+        Some(0) => Err(ArchiveError::PartialClone {
+            setting: String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .to_string(),
+        }),
+        // 1: no such key.
+        Some(1) => Ok(()),
+        _ => Err(ArchiveError::Git {
+            detail: format!(
+                "git config: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ),
+        }),
+    }
 }
 
 /// `git cat-file --batch`, one object at a time.
@@ -661,82 +755,157 @@ impl Drop for ObjectReader {
     }
 }
 
-/// One `git ls-tree -r -z` row.
+/// One file in a commit's tree.
 struct TreeEntry {
     mode: String,
     oid: String,
     path: Vec<u8>,
 }
 
-fn list_tree(repo: &Path, commit: &CommitOid) -> Result<Vec<TreeEntry>, ArchiveError> {
-    let output = git_output(
-        repo,
-        &[
-            "ls-tree",
-            "-r",
+/// The tree of a commit body: its first line, `tree <oid>`.
+fn commit_tree(commit: &str, body: &[u8], format: ObjectFormat) -> Result<String, ArchiveError> {
+    let length = match format {
+        ObjectFormat::Sha1 => 40,
+        ObjectFormat::Sha256 => 64,
+    };
+    body.strip_prefix(b"tree ")
+        .and_then(|rest| rest.get(..length + 1))
+        .filter(|line| line[length] == b'\n')
+        .and_then(|line| std::str::from_utf8(&line[..length]).ok())
+        .filter(|oid| is_lower_hex(oid, &[length]))
+        .map(str::to_string)
+        .ok_or_else(|| ArchiveError::MalformedSource {
+            oid: commit.to_string(),
+            kind: "commit",
+        })
+}
+
+/// Every file under tree `oid`, reading each tree object through `reader`
+/// so it is checked against its id. `git ls-tree` would parse a damaged
+/// loose tree without noticing.
+fn walk_tree(
+    reader: &mut ObjectReader,
+    oid: &str,
+    prefix: &[u8],
+    out: &mut Vec<TreeEntry>,
+) -> Result<(), ArchiveError> {
+    let (kind, bytes) = reader.read_whole(oid)?;
+    if kind != "tree" {
+        return Err(ArchiveError::SourceMismatch {
+            oid: oid.to_string(),
+        });
+    }
+    let malformed = || ArchiveError::MalformedSource {
+        oid: oid.to_string(),
+        kind: "tree",
+    };
+    let id_length = match reader.format {
+        ObjectFormat::Sha1 => 20,
+        ObjectFormat::Sha256 => 32,
+    };
+    let mut rest = bytes.as_slice();
+    while !rest.is_empty() {
+        let space = rest.iter().position(|b| *b == b' ').ok_or_else(malformed)?;
+        let mode = std::str::from_utf8(&rest[..space]).map_err(|_| malformed())?;
+        rest = &rest[space + 1..];
+        let nul = rest.iter().position(|b| *b == 0).ok_or_else(malformed)?;
+        let name = &rest[..nul];
+        rest = &rest[nul + 1..];
+        if name.is_empty() || name.contains(&b'/') || rest.len() < id_length {
+            return Err(malformed());
+        }
+        let child = hex(&rest[..id_length]);
+        rest = &rest[id_length..];
+        let mut path = prefix.to_vec();
+        if !path.is_empty() {
+            path.push(b'/');
+        }
+        path.extend_from_slice(name);
+        if mode == "40000" {
+            walk_tree(reader, &child, &path, out)?;
+        } else {
+            out.push(TreeEntry {
+                mode: mode.to_string(),
+                oid: child,
+                path,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Attributes that make a Git checkout differ from the committed bytes:
+/// `filter` (Git LFS and any clean/smudge driver), `working-tree-encoding`
+/// and `ident`. End-of-line conversion is not refused: it is a
+/// materialization choice, and the archive restores the committed bytes.
+const TRANSFORMING_ATTRIBUTES: &[&str] = &["filter", "working-tree-encoding", "ident"];
+
+/// Refuse a tree any of whose paths has a transforming attribute, from the
+/// tree's own `.gitattributes` (read at `commit`, not from the worktree),
+/// `.git/info/attributes` or `core.attributesFile`. `git check-attr` reads
+/// configuration and attribute files only; it runs no filter, hook or
+/// fsmonitor (tested).
+fn refuse_transforming_attributes(
+    repo: &Path,
+    commit: &CommitOid,
+    paths: &[&[u8]],
+) -> Result<(), ArchiveError> {
+    let mut child = git(repo)
+        .args([
+            "check-attr",
+            &format!("--source={}", commit.as_str()),
             "-z",
-            "--full-tree",
-            "--end-of-options",
-            commit.as_str(),
-        ],
-    )?;
-    if !output.status.success() {
-        return Err(ArchiveError::SourceUnavailable {
-            oid: commit.as_str().to_string(),
+            "--stdin",
+            "--all",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| ArchiveError::Git {
+            detail: format!("could not start git check-attr: {error}"),
+        })?;
+    let mut input = Vec::new();
+    for path in paths {
+        input.extend_from_slice(path);
+        input.push(0);
+    }
+    let mut stdin = child.stdin.take().expect("piped");
+    let writer = std::thread::spawn(move || stdin.write_all(&input));
+    let output = child
+        .wait_with_output()
+        .map_err(|error| ArchiveError::Git {
+            detail: format!("git check-attr: {error}"),
+        })?;
+    let written = writer
+        .join()
+        .unwrap_or_else(|_| Err(std::io::Error::other("the path writer panicked")));
+    if !output.status.success() || written.is_err() {
+        return Err(ArchiveError::Git {
             detail: format!(
-                "the tree could not be listed: {}",
+                "git check-attr: {}",
                 String::from_utf8_lossy(&output.stderr).trim()
             ),
         });
     }
-    let mut entries = Vec::new();
-    for row in output
-        .stdout
-        .split(|b| *b == 0)
-        .filter(|row| !row.is_empty())
-    {
-        let tab = row
-            .iter()
-            .position(|b| *b == b'\t')
-            .ok_or_else(|| ArchiveError::Git {
-                detail: "unreadable ls-tree row".into(),
-            })?;
-        let meta = String::from_utf8_lossy(&row[..tab]);
-        let mut fields = meta.split(' ');
-        let (Some(mode), Some(_kind), Some(oid)) = (fields.next(), fields.next(), fields.next())
-        else {
-            return Err(ArchiveError::Git {
-                detail: format!("unreadable ls-tree row {meta:?}"),
-            });
-        };
-        entries.push(TreeEntry {
-            mode: mode.to_string(),
-            oid: oid.to_string(),
-            path: row[tab + 1..].to_vec(),
-        });
-    }
-    Ok(entries)
-}
-
-/// The attribute in a `.gitattributes` file that makes a checkout differ
-/// from the committed bytes, if any: a `filter` (Git LFS and custom
-/// clean/smudge drivers) or a `working-tree-encoding`. End-of-line
-/// conversion is not refused: it is a materialization choice, and the
-/// archive restores the committed bytes.
-fn transforming_attribute(attributes: &[u8]) -> Option<String> {
-    for line in String::from_utf8_lossy(attributes).lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
+    let fields: Vec<&[u8]> = output.stdout.split(|b| *b == 0).collect();
+    for triple in fields.chunks(3) {
+        let [path, attribute, value] = triple else {
             continue;
-        }
-        for token in line.split_whitespace().skip(1) {
-            let name = token.split('=').next().unwrap_or(token);
-            if (name == "filter" || name == "working-tree-encoding") && token.contains('=') {
-                return Some(token.to_string());
-            }
+        };
+        let attribute = String::from_utf8_lossy(attribute);
+        let value = String::from_utf8_lossy(value);
+        if TRANSFORMING_ATTRIBUTES.contains(&attribute.as_ref())
+            && value != "unset"
+            && value != "unspecified"
+        {
+            return Err(ArchiveError::UnsupportedFilter {
+                path: path.to_vec(),
+                attribute: format!("{attribute}={value}"),
+            });
         }
     }
-    None
+    Ok(())
 }
 
 // ---------------------------------------------------------------- capture
@@ -760,27 +929,18 @@ pub(crate) fn retain_snapshot_with(
     commit: &CommitOid,
     before_blob: &mut dyn FnMut(usize) -> Result<(), ArchiveError>,
 ) -> Result<RetainedSnapshot, ArchiveError> {
+    refuse_partial_clone(repo)?;
     let mut reader = ObjectReader::open(repo)?;
     let format = reader.format;
-    match reader.request(commit.as_str())? {
-        Some((kind, size)) if kind == "commit" => {
-            // Check the commit object itself; its tree is listed separately.
-            reader.copy_body(commit.as_str(), "commit", size, &mut std::io::sink())?;
-        }
-        Some((kind, size)) => {
-            reader.copy_body(commit.as_str(), &kind, size, &mut std::io::sink())?;
-            return Err(ArchiveError::NotACommit {
-                oid: commit.as_str().to_string(),
-            });
-        }
-        None => {
-            return Err(ArchiveError::SourceUnavailable {
-                oid: commit.as_str().to_string(),
-                detail: "the commit is missing from the repository".into(),
-            });
-        }
+    let (kind, body) = reader.read_whole(commit.as_str())?;
+    if kind != "commit" {
+        return Err(ArchiveError::NotACommit {
+            oid: commit.as_str().to_string(),
+        });
     }
-    let tree = list_tree(repo, commit)?;
+    let root = commit_tree(commit.as_str(), &body, format)?;
+    let mut tree = Vec::new();
+    walk_tree(&mut reader, &root, b"", &mut tree)?;
     for entry in &tree {
         // Gitlinks (160000) and any other non-file mode are refused here; a
         // mode #652 accepts is always a blob.
@@ -791,18 +951,8 @@ pub(crate) fn retain_snapshot_with(
             });
         }
     }
-    for entry in tree
-        .iter()
-        .filter(|entry| entry.path.rsplit(|b| *b == b'/').next() == Some(b".gitattributes"))
-    {
-        let (_, bytes) = reader.read_whole(&entry.oid)?;
-        if let Some(attribute) = transforming_attribute(&bytes) {
-            return Err(ArchiveError::UnsupportedFilter {
-                path: entry.path.clone(),
-                attribute,
-            });
-        }
-    }
+    let paths: Vec<&[u8]> = tree.iter().map(|entry| entry.path.as_slice()).collect();
+    refuse_transforming_attributes(repo, commit, &paths)?;
     // Validate paths before copying anything.
     let provisional = tree
         .iter()
@@ -947,6 +1097,12 @@ pub fn retain_contribution(
         result: result.as_str().to_string(),
         detail,
     };
+    refuse_partial_clone(repo)?;
+    // In a shallow clone the boundary hides history, so a "not an ancestor"
+    // answer there means "unknown", never "rewritten". Checked first.
+    if git_text(repo, &["rev-parse", "--is-shallow-repository"])? == "true" {
+        return Err(unavailable("the repository is a shallow clone".into()));
+    }
     let ancestry = git_output(
         repo,
         &[
@@ -969,11 +1125,6 @@ pub fn retain_contribution(
                 String::from_utf8_lossy(&ancestry.stderr).trim().to_string(),
             ));
         }
-    }
-    // In a shallow clone the boundary hides history; the ancestry answer
-    // above cannot be trusted there.
-    if git_text(repo, &["rev-parse", "--is-shallow-repository"])? == "true" {
-        return Err(unavailable("the repository is a shallow clone".into()));
     }
     let count = git_output(
         repo,
@@ -1030,11 +1181,11 @@ pub fn retain_contribution(
 
 /// The archive's entry for `id`, if it is fully retained.
 pub fn retained(
-    store: &mut CollaborationStore,
+    store: &CollaborationStore,
     id: &SourceSnapshotId,
 ) -> Result<Option<RetainedSnapshot>, ArchiveError> {
     let row = store
-        .connection()
+        .read_connection()
         .query_row(
             "SELECT record_id, commit_oid, entry_count, content_bytes
              FROM retained_snapshots WHERE snapshot_id = ?1",
@@ -1106,15 +1257,20 @@ pub fn reconstruct(
     id: &SourceSnapshotId,
     dest: &Path,
 ) -> Result<SourceSnapshot, ArchiveError> {
-    let manifest = match read_object(store, &ObjectDigest::of_snapshot(id)) {
-        Err(ArchiveError::MissingObject { .. }) => {
-            return Err(ArchiveError::NotRetained { id: id.to_string() });
-        }
-        other => other?,
-    };
-    let snapshot = parse_manifest(&manifest).ok_or_else(|| ArchiveError::CorruptObject {
+    // Only a snapshot this archive retained: any object whose bytes happen
+    // to parse as a manifest (a committed file, say) is not one.
+    if retained(store, id)?.is_none() {
+        return Err(ArchiveError::NotRetained { id: id.to_string() });
+    }
+    let manifest = read_object(store, &ObjectDigest::of_snapshot(id))?;
+    let corrupt = || ArchiveError::CorruptObject {
         digest: ObjectDigest::of_snapshot(id).hex(),
-    })?;
+    };
+    let snapshot = parse_manifest(&manifest).ok_or_else(corrupt)?;
+    // Parsing sorts entries; only the canonical encoding is this snapshot.
+    if snapshot.manifest_bytes() != manifest {
+        return Err(corrupt());
+    }
     // Every object first, so a damaged archive writes nothing.
     for entry in snapshot.entries() {
         let digest = ObjectDigest(*entry.content_sha256());
@@ -1131,6 +1287,11 @@ pub fn reconstruct(
                 digest: digest.hex(),
             });
         }
+    }
+    if std::fs::symlink_metadata(dest).is_ok_and(|meta| meta.file_type().is_symlink()) {
+        return Err(ArchiveError::DestinationIsSymlink {
+            path: dest.to_path_buf(),
+        });
     }
     match std::fs::read_dir(dest) {
         Ok(mut entries) => {
@@ -1604,38 +1765,110 @@ mod tests {
         assert_eq!(object_count(&store), 0, "refused before anything is copied");
     }
 
+    /// Commit `files`, then `attributes` as the root `.gitattributes`, so
+    /// Git applies no conversion while the fixture itself is built.
+    fn commit_with_attributes(repo: &Path, files: &[(&str, &[u8])], attributes: &[u8]) {
+        for (path, bytes) in files {
+            write(repo, path, bytes);
+        }
+        git_in(repo, &["add", "-A"]);
+        git_in(repo, &["commit", "-qm", "files"]);
+        write(repo, ".gitattributes", attributes);
+        git_in(repo, &["add", ".gitattributes"]);
+        git_in(repo, &["commit", "-qm", "attributes"]);
+    }
+
     #[test]
-    fn a_checkout_filter_is_refused_and_eol_attributes_are_not() {
-        let source = repo();
-        write(
-            source.path(),
-            "assets/.gitattributes",
-            b"# comment\n*.png -filter\n*.txt text eol=lf\n",
+    fn a_checkout_transforming_attribute_is_refused_and_eol_attributes_are_not() {
+        let harmless = repo();
+        commit_with_attributes(
+            harmless.path(),
+            &[("assets/a.png", b"png"), ("assets/b.txt", b"text\n")],
+            b"# comment\n*.png -filter\n*.txt text eol=lf\n*.bin filter=lfs\n",
         );
+        let (_host, mut store) = store();
+        // `*.bin filter=lfs` matches no path in this tree, so nothing differs.
+        retain_snapshot(&mut store, harmless.path(), &head(harmless.path())).unwrap();
+
+        for (file, attributes) in [
+            (
+                "data.bin",
+                b"*.bin filter=lfs diff=lfs merge=lfs -text\n".as_slice(),
+            ),
+            ("notes.txt", b"*.txt working-tree-encoding=UTF-16\n"),
+            ("main.c", b"*.c ident\n"),
+        ] {
+            let source = repo();
+            commit_with_attributes(source.path(), &[(file, b"content\n")], attributes);
+            let error =
+                retain_snapshot(&mut store, source.path(), &head(source.path())).unwrap_err();
+            assert_eq!(error.code(), "unsupported_filter", "{file}: {error}");
+            assert!(error.to_string().contains(file), "{error}");
+        }
+    }
+
+    /// Attributes from outside the tree change a checkout too.
+    #[test]
+    fn attributes_from_outside_the_tree_are_honoured() {
+        let source = repo();
+        write(source.path(), "data.bin", b"blob\n");
         git_in(source.path(), &["add", "-A"]);
-        git_in(source.path(), &["commit", "-qm", "harmless attributes"]);
+        git_in(source.path(), &["commit", "-qm", "bin"]);
         let (_host, mut store) = store();
         retain_snapshot(&mut store, source.path(), &head(source.path())).unwrap();
 
-        write(
-            source.path(),
-            ".gitattributes",
-            b"*.bin filter=lfs diff=lfs merge=lfs -text\n",
-        );
-        git_in(source.path(), &["add", "-A"]);
-        git_in(source.path(), &["commit", "-qm", "lfs"]);
+        write(source.path(), ".git/info/attributes", b"*.bin filter=lfs\n");
         let error = retain_snapshot(&mut store, source.path(), &head(source.path())).unwrap_err();
         assert_eq!(error.code(), "unsupported_filter", "{error}");
+        std::fs::remove_file(source.path().join(".git/info/attributes")).unwrap();
 
-        write(
+        let global = source.path().join("global-attributes");
+        std::fs::write(&global, b"*.bin ident\n").unwrap();
+        git_in(
             source.path(),
-            ".gitattributes",
-            b"*.txt working-tree-encoding=UTF-16\n",
+            &["config", "core.attributesFile", global.to_str().unwrap()],
         );
-        git_in(source.path(), &["add", "-A"]);
-        git_in(source.path(), &["commit", "-qm", "encoding"]);
         let error = retain_snapshot(&mut store, source.path(), &head(source.path())).unwrap_err();
         assert_eq!(error.code(), "unsupported_filter", "{error}");
+    }
+
+    /// Capture reads the repository's configuration but runs nothing it
+    /// names: no fsmonitor, filter driver or hook.
+    #[test]
+    fn capture_executes_nothing_the_repository_configures() {
+        let source = repo();
+        let marker = source.path().join("ran");
+        let script = source.path().join("probe.sh");
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\ntouch '{}'\n", marker.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let hooks = source.path().join(".git/hooks");
+        for hook in [
+            "post-checkout",
+            "pre-commit",
+            "reference-transaction",
+            "post-index-change",
+        ] {
+            std::fs::copy(&script, hooks.join(hook)).unwrap();
+        }
+        let script = script.to_str().unwrap();
+        for (key, value) in [
+            ("core.fsmonitor", script),
+            ("filter.probe.clean", script),
+            ("filter.probe.smudge", script),
+            ("filter.probe.process", script),
+            ("diff.probe.textconv", script),
+        ] {
+            git_in(source.path(), &["config", key, value]);
+        }
+        write(source.path(), ".git/info/attributes", b"*.md diff=probe\n");
+        let (_host, mut store) = store();
+        let base = head(source.path());
+        retain_contribution(&mut store, source.path(), &base, &base).unwrap();
+        assert!(!marker.exists(), "capture ran a configured program");
     }
 
     #[test]
@@ -1835,6 +2068,166 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Both ends present, each as a shallow boundary: Git answers "not an
+    /// ancestor" because it cannot see the history, so the answer is
+    /// unknown, never a rewrite.
+    #[test]
+    fn shallow_boundaries_are_unknown_history_not_a_rewrite() {
+        let source = repo();
+        git_in(source.path(), &["branch", "base"]);
+        write(source.path(), "README.md", b"one\n");
+        git_in(source.path(), &["commit", "-qam", "one"]);
+        let shallow = tempfile::tempdir().unwrap();
+        git_in(
+            shallow.path(),
+            &[
+                "clone",
+                "-q",
+                "--depth",
+                "1",
+                "--no-single-branch",
+                &format!("file://{}", source.path().display()),
+                ".",
+            ],
+        );
+        let base = pin_commit(shallow.path(), "origin/base").unwrap();
+        let result = pin_commit(shallow.path(), "origin/main").unwrap();
+        let (_host, mut store) = store();
+        let error = retain_contribution(&mut store, shallow.path(), &base, &result).unwrap_err();
+        assert_eq!(error.code(), "history_unavailable", "{error}");
+        assert!(error.is_incomplete());
+    }
+
+    /// `git ls-tree` would list a damaged loose tree as if it were genuine.
+    /// Every tree is read and checked against its id.
+    #[test]
+    fn a_tampered_tree_object_is_never_a_complete_capture() {
+        let source = repo();
+        let root = git_in(source.path(), &["rev-parse", "HEAD^{tree}"]);
+        let src = git_in(source.path(), &["rev-parse", "HEAD:src"]);
+        let target = loose_object(source.path(), &root);
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
+        // Still a well-formed tree, just not the one this id names.
+        std::fs::copy(loose_object(source.path(), &src), &target).unwrap();
+        let (_host, mut store) = store();
+        let error = retain_snapshot(&mut store, source.path(), &head(source.path())).unwrap_err();
+        assert_eq!(error.code(), "source_mismatch", "{error}");
+        assert!(error.is_incomplete());
+        assert_eq!(rows(&mut store), 0);
+    }
+
+    /// A graft file rewrites parents; capture ignores it, so an unrelated
+    /// commit never becomes a descendant of the base.
+    #[test]
+    fn grafts_do_not_change_the_ancestry_answer() {
+        let source = repo();
+        let base = head(source.path());
+        git_in(source.path(), &["checkout", "-q", "--orphan", "unrelated"]);
+        write(source.path(), "README.md", b"unrelated\n");
+        git_in(source.path(), &["commit", "-qam", "unrelated"]);
+        let unrelated = head(source.path());
+        write(
+            source.path(),
+            ".git/info/grafts",
+            format!("{} {}\n", unrelated.as_str(), base.as_str()).as_bytes(),
+        );
+        let (_host, mut store) = store();
+        let error = retain_contribution(&mut store, source.path(), &base, &unrelated).unwrap_err();
+        assert_eq!(error.code(), "base_not_ancestor", "{error}");
+    }
+
+    /// A partial clone could omit objects; capture never fetches them, so
+    /// it is reported as incomplete up front.
+    #[test]
+    fn a_partial_clone_is_incomplete() {
+        for (key, value) in [
+            ("extensions.partialClone", "origin"),
+            ("remote.origin.promisor", "true"),
+        ] {
+            let source = repo();
+            git_in(source.path(), &["config", key, value]);
+            let base = head(source.path());
+            let (_host, mut store) = store();
+            let error = retain_snapshot(&mut store, source.path(), &base).unwrap_err();
+            assert_eq!(error.code(), "partial_clone", "{key}: {error}");
+            assert!(error.is_incomplete());
+            let error = retain_contribution(&mut store, source.path(), &base, &base).unwrap_err();
+            assert_eq!(error.code(), "partial_clone", "{key}: {error}");
+        }
+    }
+
+    /// Only a snapshot the archive retained rebuilds: a committed file whose
+    /// bytes are a valid manifest is an ordinary blob, and a manifest that
+    /// is not in canonical form is not the snapshot its name claims.
+    #[test]
+    fn only_a_retained_canonical_manifest_reconstructs() {
+        let source = repo();
+        let (_host, mut store) = store();
+        retain_snapshot(&mut store, source.path(), &head(source.path())).unwrap();
+        let readme =
+            SourceEntry::from_content(b"README.md".to_vec(), EntryKind::Regular, b"hello\n");
+        let empty = SourceEntry::from_content(b"empty".to_vec(), EntryKind::Regular, b"");
+        let crafted = SourceSnapshot::new([readme.clone()]).unwrap();
+        write(source.path(), "evil", &crafted.manifest_bytes());
+        git_in(source.path(), &["add", "-A"]);
+        git_in(
+            source.path(),
+            &["commit", "-qm", "a blob that is a manifest"],
+        );
+        retain_snapshot(&mut store, source.path(), &head(source.path())).unwrap();
+        assert!(has_object(
+            &store,
+            &ObjectDigest::of_snapshot(&crafted.id())
+        ));
+        let dest = tempfile::tempdir().unwrap();
+        let error = reconstruct(&store, &crafted.id(), dest.path()).unwrap_err();
+        assert_eq!(error.code(), "not_retained", "{error}");
+
+        // Entries out of canonical order, recorded as if retained.
+        let canonical = SourceSnapshot::new([readme, empty]).unwrap();
+        let mut reordered = b"aethyme source-snapshot v0\0".to_vec();
+        for entry in canonical.entries().iter().rev() {
+            reordered.extend_from_slice(entry.kind().git_mode().as_bytes());
+            reordered.push(b' ');
+            reordered.extend_from_slice(hex(entry.content_sha256()).as_bytes());
+            reordered.push(b' ');
+            reordered.extend_from_slice(entry.path());
+            reordered.push(0);
+        }
+        let digest = put_object(&store, &reordered).unwrap();
+        let id = SourceSnapshotId::parse(&format!("sha256:{}", digest.hex())).unwrap();
+        store
+            .connection()
+            .execute(
+                "INSERT INTO retained_snapshots VALUES (?1, ?2, ?3, ?4, 2, 6)",
+                rusqlite::params![
+                    id.as_str(),
+                    format!("sha256:{}", "cd".repeat(32)),
+                    "cd".repeat(32),
+                    head(source.path()).as_str(),
+                ],
+            )
+            .unwrap();
+        let error = reconstruct(&store, &id, dest.path()).unwrap_err();
+        assert_eq!(error.code(), "corrupt_object", "{error}");
+        assert_eq!(std::fs::read_dir(dest.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn a_symlinked_destination_is_refused() {
+        let source = repo();
+        let (_host, mut store) = store();
+        let retained = retain_snapshot(&mut store, source.path(), &head(source.path())).unwrap();
+        let place = tempfile::tempdir().unwrap();
+        let real = place.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let link = place.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let error = reconstruct(&store, &retained.snapshot_id, &link).unwrap_err();
+        assert_eq!(error.code(), "destination_is_symlink", "{error}");
+        assert_eq!(std::fs::read_dir(&real).unwrap().count(), 0);
     }
 
     /// A version 1 database from #656 gains the archive tables on open.

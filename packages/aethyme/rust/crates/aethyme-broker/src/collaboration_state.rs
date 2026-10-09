@@ -350,6 +350,11 @@ impl CollaborationStore {
         self.schema_version
     }
 
+    /// The database, read-only use.
+    pub(crate) fn read_connection(&self) -> &Connection {
+        &self.connection
+    }
+
     /// The database, for the capture and archive slices built on this one.
     #[allow(dead_code)]
     pub(crate) fn connection(&mut self) -> &mut Connection {
