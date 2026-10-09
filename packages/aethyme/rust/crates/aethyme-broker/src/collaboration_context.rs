@@ -14,29 +14,36 @@
 //!   never the repository root).
 //! - **Order.** Strongest reason, then the size of that reason's match, then
 //!   the most recently captured, then the contribution ID. Deterministic.
-//! - **Budgets.** Items, brief tokens, paths listed per reason and encoded
-//!   bytes. A brief that does not fit leaves its item in place without its
-//!   text. Every cut is named in `limit_detail.truncated_by`.
+//! - **Budgets.** Items, brief tokens, values listed per reason and encoded
+//!   bytes, plus fixed caps on the request itself and on the candidates read
+//!   per query. A brief that does not fit leaves its item in place without its
+//!   text. Every cut is named in `limit_detail.truncated_by`; a budget is
+//!   refused, never exceeded.
 //! - **Honesty.** Path matching cannot see dynamic dependencies, so the result
-//!   is `complete_within_profile` only when a complete analysis envelope bound
-//!   to the reader's source covered the scope; otherwise it is `partial`, with
-//!   the reason named. An empty result is evidence of absence only when the
-//!   coverage is complete, the result exact and nothing was cut.
+//!   is `complete_within_profile` only when the reader named its exact source
+//!   and every analysis envelope is complete, bound to that source and
+//!   provably about the scope; otherwise it is `partial`, with the reason
+//!   named. An empty result is evidence of absence only when the coverage is
+//!   complete, the result exact and nothing was cut.
 //! - **Briefs are data.** Brief text is returned verbatim with
 //!   `role: untrusted_data`. It never changes ranking (only its declared
 //!   `scope_ref`s match), budgets, policy or authority (T15).
 //! - **Invalidation by scope.** The index posts each contribution under the
 //!   paths it changed, their directories and its brief's scope refs. A result
-//!   records the version of each posting it depended on, so its cache key
-//!   changes only when a contribution that could match is added, removed,
-//!   or re-briefed, or the reader's visibility epoch changes (T14). The
-//!   postings are derived and rebuildable; the briefs attached to a
+//!   records the version of each posting it depended on (its live, visible
+//!   contributions with their brief and retention), so its cache key changes
+//!   only when something that could change the answer does: a contribution
+//!   that could match is added, released, expired or re-briefed, an
+//!   unreadable one appears, or the reader's visibility epoch changes (T14).
+//!   The postings are derived and rebuildable; the briefs attached to a
 //!   contribution are not.
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use aethyme_contracts::experimental_v0::analysis::{AnalysisEnvelope, Outcome, Status, Subject};
-use aethyme_contracts::experimental_v0::brief::Brief;
+use aethyme_contracts::experimental_v0::analysis::{
+    AnalysisEnvelope, Operation, Outcome, Status, Subject,
+};
+use aethyme_contracts::experimental_v0::brief::{Brief, MAX_SCOPE_REF_BYTES};
 use aethyme_contracts::experimental_v0::canonical_json::{self, Object, Value};
 use aethyme_contracts::experimental_v0::{
     FieldKind, FieldSpec, Record, RecordId, RecordSchema, SourceSnapshotId,
@@ -111,12 +118,28 @@ pub const MAX_MATCHED_PATHS_LIMIT: usize = 32;
 pub const MAX_BRIEF_TOKENS_LIMIT: usize = MAX_ITEMS_LIMIT * 150;
 pub const MAX_BYTES_LIMIT: usize = 512 * 1024;
 
+/// Fixed caps on a request. Beyond them a request is refused: they bound
+/// the work and the size of even an empty result.
+pub const MAX_SCOPE_PATHS: usize = 64;
+pub const MAX_SCOPE_PATH_BYTES: usize = 1024;
+pub const MAX_ANALYSIS_ENVELOPES: usize = 8;
+/// Fixed caps on what one query reads. Beyond them the result is cut and
+/// says so (`related_paths`, `candidates`).
+pub const MAX_RELATED_PATHS: usize = 256;
+pub const MAX_CANDIDATES: usize = 256;
+
+/// Unit tests lower the candidate cap so a handful of captures reach it.
+fn candidate_limit() -> usize {
+    if cfg!(test) { 3 } else { MAX_CANDIDATES }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Budget {
     pub max_items: usize,
     pub max_brief_tokens: usize,
     pub max_matched_paths: usize,
-    /// The encoded result's size; items are dropped from the end to fit.
+    /// The encoded result's size; items are dropped from the end to fit, and
+    /// a request whose empty result would not fit is refused.
     pub max_bytes: usize,
 }
 
@@ -148,11 +171,13 @@ impl Budget {
 /// How an analysis envelope relates to the reader's source.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Binding {
-    /// About the reader's exact source, or no source was named.
+    /// About the reader's exact source (as subject or base). Without a
+    /// reader source nothing can be checked; the result then carries
+    /// `no_reader_source` instead.
     Bound,
-    /// About another exact source.
+    /// About other exact sources.
     OtherSource,
-    /// A legacy subject that cannot be tied to the reader's exact source.
+    /// Only legacy subjects, which cannot be tied to the reader's exact source.
     Unbound,
 }
 
@@ -161,6 +186,9 @@ pub enum Binding {
 pub struct AnalysisSummary {
     pub status: Status,
     pub binding: Binding,
+    /// The envelope is provably about the scope: an `explain_impact` or
+    /// `find_references` result whose subject covers every scope path.
+    pub scoped: bool,
     /// `(path, edge)` pairs the envelope relates to the scope.
     pub related: Vec<(Vec<u8>, String)>,
 }
@@ -177,12 +205,27 @@ const EDGE_KINDS: [&str; 7] = [
 ];
 
 impl AnalysisSummary {
-    pub fn of(envelope: &AnalysisEnvelope, source: Option<&SourceSnapshotId>) -> Self {
-        let binding = match (&envelope.subject, source) {
-            (_, None) => Binding::Bound,
-            (Subject::Snapshot(id), Some(source)) if id == source => Binding::Bound,
-            (Subject::Snapshot(_), Some(_)) => Binding::OtherSource,
-            (_, Some(_)) => Binding::Unbound,
+    /// Summarize `envelope` for a reader working on `source`. Whether it is
+    /// about the scope needs the store, so the caller decides `scoped`.
+    pub fn of(
+        envelope: &AnalysisEnvelope,
+        source: Option<&SourceSnapshotId>,
+        scoped: bool,
+    ) -> Self {
+        let snapshots: Vec<&SourceSnapshotId> =
+            [Some(&envelope.subject), envelope.base_subject.as_ref()]
+                .into_iter()
+                .flatten()
+                .filter_map(|subject| match subject {
+                    Subject::Snapshot(id) => Some(id),
+                    _ => None,
+                })
+                .collect();
+        let binding = match source {
+            None => Binding::Bound,
+            Some(source) if snapshots.contains(&source) => Binding::Bound,
+            Some(_) if snapshots.is_empty() => Binding::Unbound,
+            Some(_) => Binding::OtherSource,
         };
         let mut related = Vec::new();
         if envelope.outcome == Outcome::Available
@@ -201,6 +244,7 @@ impl AnalysisSummary {
         Self {
             status: envelope.status(),
             binding,
+            scoped,
             related,
         }
     }
@@ -228,14 +272,21 @@ pub struct Candidate {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SelectionQuery {
     pub scope: Vec<Vec<u8>>,
+    /// The reader named its exact source.
+    pub has_source: bool,
     pub analysis: Vec<AnalysisSummary>,
     pub budget: Budget,
     /// Contributions that should have been considered but could not be read.
     pub unreadable: Vec<String>,
+    /// Related paths beyond [`MAX_RELATED_PATHS`] were not considered.
+    pub related_truncated: bool,
+    /// Candidates beyond [`MAX_CANDIDATES`] were not read.
+    pub candidates_truncated: bool,
 }
 
 /// One matched reason. `values` are paths, scope refs, or `(path, edge)`
-/// pairs, sorted and capped; `total` is the count before the cap.
+/// pairs, sorted and capped; `total` is the count before the cap, counting
+/// distinct paths for impact edges as ranking does.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Reason {
     pub kind: ReasonKind,
@@ -260,6 +311,14 @@ pub struct Selected {
     pub brief_included: Option<bool>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContextFreshness {
+    Exact,
+    Stale,
+    /// No reader source: nothing can be exact.
+    Unknown,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Selection {
     pub items: Vec<Selected>,
@@ -268,7 +327,7 @@ pub struct Selection {
     pub brief_tokens: usize,
     pub truncated_by: BTreeSet<&'static str>,
     pub gaps: BTreeSet<String>,
-    pub stale: bool,
+    pub freshness: ContextFreshness,
 }
 
 impl Selection {
@@ -280,8 +339,13 @@ impl Selection {
         }
     }
 
-    pub fn freshness(&self) -> &'static str {
-        if self.stale { "stale" } else { "exact" }
+    /// `None` reads as unknown and is omitted from the record.
+    pub fn freshness(&self) -> Option<&'static str> {
+        match self.freshness {
+            ContextFreshness::Exact => Some("exact"),
+            ContextFreshness::Stale => Some("stale"),
+            ContextFreshness::Unknown => None,
+        }
     }
 
     pub fn limits(&self) -> &'static str {
@@ -293,9 +357,11 @@ impl Selection {
     }
 
     /// Whether an empty result means "nothing relevant": only when nothing
-    /// is missing, stale or cut.
+    /// is missing, stale, unknown or cut.
     pub fn absence_is_evidence(&self) -> bool {
-        self.gaps.is_empty() && !self.stale && self.truncated_by.is_empty()
+        self.gaps.is_empty()
+            && self.freshness == ContextFreshness::Exact
+            && self.truncated_by.is_empty()
     }
 }
 
@@ -336,14 +402,15 @@ pub fn select(query: &SelectionQuery, candidates: &[Candidate]) -> Selection {
             continue;
         }
         let changed: BTreeSet<&[u8]> = candidate.changed.iter().map(Vec::as_slice).collect();
+        // (kind, values, total)
         let mut sets: Vec<(ReasonKind, Vec<ReasonValue>, usize)> = Vec::new();
         let overlap: Vec<ReasonValue> = changed
             .iter()
             .filter(|path| scope.contains(*path))
             .map(|path| ReasonValue::Path(path.to_vec()))
             .collect();
-        let overlap_len = overlap.len();
-        sets.push((ReasonKind::PathOverlap, overlap, overlap_len));
+        let total = overlap.len();
+        sets.push((ReasonKind::PathOverlap, overlap, total));
         let refs: BTreeSet<&str> = candidate
             .brief
             .iter()
@@ -351,33 +418,31 @@ pub fn select(query: &SelectionQuery, candidates: &[Candidate]) -> Selection {
             .filter(|reference| scope.iter().any(|path| covers(reference.as_bytes(), path)))
             .map(String::as_str)
             .collect();
-        let refs_len = refs.len();
-        sets.push((
-            ReasonKind::BriefScopeRef,
-            refs.into_iter()
-                .map(|reference| ReasonValue::ScopeRef(reference.to_string()))
-                .collect(),
-            refs_len,
-        ));
+        let refs: Vec<ReasonValue> = refs
+            .into_iter()
+            .map(|reference| ReasonValue::ScopeRef(reference.to_string()))
+            .collect();
+        let total = refs.len();
+        sets.push((ReasonKind::BriefScopeRef, refs, total));
         let edges: Vec<ReasonValue> = related
             .iter()
             .filter(|(path, _)| changed.contains(path))
             .map(|(path, edge)| ReasonValue::Edge(path.to_vec(), edge.to_string()))
             .collect();
-        let edge_paths = related
+        let total = related
             .iter()
             .filter(|(path, _)| changed.contains(path))
             .map(|(path, _)| *path)
             .collect::<BTreeSet<_>>()
             .len();
-        sets.push((ReasonKind::ImpactEdge, edges, edge_paths));
+        sets.push((ReasonKind::ImpactEdge, edges, total));
         let same: Vec<ReasonValue> = changed
             .iter()
             .filter(|path| !scope.contains(*path) && directories.contains(parent(path)))
             .map(|path| ReasonValue::Path(path.to_vec()))
             .collect();
-        let same_len = same.len();
-        sets.push((ReasonKind::SameDirectory, same, same_len));
+        let total = same.len();
+        sets.push((ReasonKind::SameDirectory, same, total));
         sets.retain(|(_, values, _)| !values.is_empty());
         let Some((strongest, _, primary)) = sets.first() else {
             continue;
@@ -403,9 +468,8 @@ pub fn select(query: &SelectionQuery, candidates: &[Candidate]) -> Selection {
         }
         let reasons = sets
             .iter()
-            .map(|(kind, values, _)| {
-                let total = values.len();
-                if total > budget.max_matched_paths {
+            .map(|(kind, values, total)| {
+                if values.len() > budget.max_matched_paths {
                     truncated_by.insert("matched_paths");
                 }
                 Reason {
@@ -415,7 +479,7 @@ pub fn select(query: &SelectionQuery, candidates: &[Candidate]) -> Selection {
                         .take(budget.max_matched_paths)
                         .cloned()
                         .collect(),
-                    total,
+                    total: *total,
                 }
             })
             .collect();
@@ -438,6 +502,9 @@ pub fn select(query: &SelectionQuery, candidates: &[Candidate]) -> Selection {
 
     let mut gaps = BTreeSet::new();
     let mut stale = false;
+    if !query.has_source {
+        gaps.insert("no_reader_source".to_string());
+    }
     if query.analysis.is_empty() {
         gaps.insert("no_dependency_analysis".to_string());
     }
@@ -447,6 +514,9 @@ pub fn select(query: &SelectionQuery, candidates: &[Candidate]) -> Selection {
         }
         if summary.status == Status::Stale {
             stale = true;
+        }
+        if !summary.scoped {
+            gaps.insert("analysis_not_scoped".into());
         }
         match summary.binding {
             Binding::Bound => {}
@@ -459,16 +529,31 @@ pub fn select(query: &SelectionQuery, candidates: &[Candidate]) -> Selection {
             }
         }
     }
+    if query.related_truncated {
+        gaps.insert("analysis_related_truncated".into());
+        truncated_by.insert("related_paths");
+    }
+    if query.candidates_truncated {
+        gaps.insert("candidates_truncated".into());
+        truncated_by.insert("candidates");
+    }
     for id in &query.unreadable {
         gaps.insert(format!("contribution_unreadable:{id}"));
     }
+    let freshness = if stale {
+        ContextFreshness::Stale
+    } else if query.has_source {
+        ContextFreshness::Exact
+    } else {
+        ContextFreshness::Unknown
+    };
     Selection {
         items,
         matched: matched.len(),
         brief_tokens,
         truncated_by,
         gaps,
-        stale,
+        freshness,
     }
 }
 
@@ -506,8 +591,8 @@ impl Visibility for LocalProject {
 pub struct ContextQuery {
     /// Repository-relative paths the task is about.
     pub scope: Vec<Vec<u8>>,
-    /// The exact source the reader works on, when known. It decides each
-    /// item's applicability and which analysis envelopes are bound.
+    /// The exact source the reader works on. Without it nothing in the
+    /// result can be exact or complete.
     pub source: Option<SourceSnapshotId>,
     pub analysis: Vec<AnalysisEnvelope>,
     pub budget: Budget,
@@ -531,6 +616,16 @@ pub enum ContextError {
          {MAX_BRIEF_TOKENS_LIMIT}, matched paths 1-{MAX_MATCHED_PATHS_LIMIT}, bytes 1024-{MAX_BYTES_LIMIT}"
     )]
     BudgetOutOfRange { budget: Budget },
+    #[error(
+        "the request is too large: at most {MAX_SCOPE_PATHS} scope paths of at most \
+         {MAX_SCOPE_PATH_BYTES} bytes and {MAX_ANALYSIS_ENVELOPES} analysis envelopes"
+    )]
+    RequestTooLarge,
+    #[error(
+        "even an empty result is {needed} bytes, over the {max_bytes}-byte budget; raise max_bytes \
+         or narrow the scope"
+    )]
+    BudgetTooSmall { needed: usize, max_bytes: usize },
     #[error("scope path {path:?} must be a non-empty relative path without NUL, '.' or '..'")]
     InvalidScopePath { path: String },
     #[error("the scope is empty; name at least one path")]
@@ -551,6 +646,8 @@ impl ContextError {
     pub fn code(&self) -> &'static str {
         match self {
             Self::BudgetOutOfRange { .. } => "budget_out_of_range",
+            Self::RequestTooLarge => "request_too_large",
+            Self::BudgetTooSmall { .. } => "budget_too_small",
             Self::InvalidScopePath { .. } => "invalid_scope_path",
             Self::EmptyScope => "empty_scope",
             Self::NotRetained { .. } => "not_retained",
@@ -561,6 +658,13 @@ impl ContextError {
         }
     }
 }
+
+/// A contribution is live while it has a contribution retention root that
+/// is neither released nor past its boundary (the same rule reclamation
+/// applies). `?1` is the contribution, `?2` the current time.
+const LIVE: &str = "EXISTS (SELECT 1 FROM retention_roots r
+     WHERE r.lineage_record_id = ?1 AND r.kind = 'contribution' AND r.released_ms IS NULL
+       AND (r.until_ms IS NULL OR r.until_ms > ?2))";
 
 /// Attach `brief` to a retained contribution, replacing any earlier brief
 /// (a revision of the same contribution's rationale). Returns the brief's
@@ -611,14 +715,13 @@ pub fn attach_brief(
 }
 
 fn forget(connection: &rusqlite::Connection, contribution: &str) -> rusqlite::Result<()> {
-    connection.execute(
+    for sql in [
         "DELETE FROM context_postings WHERE lineage_record_id = ?1",
-        [contribution],
-    )?;
-    connection.execute(
         "DELETE FROM context_indexed WHERE lineage_record_id = ?1",
-        [contribution],
-    )?;
+        "DELETE FROM context_unreadable WHERE lineage_record_id = ?1",
+    ] {
+        connection.execute(sql, [contribution])?;
+    }
     Ok(())
 }
 
@@ -635,6 +738,49 @@ fn posting(tag: u8, bytes: &[u8]) -> Vec<u8> {
 
 /// A snapshot's entries: path to mode and content digest.
 type Entries = BTreeMap<Vec<u8>, (String, [u8; 32])>;
+
+/// A retained snapshot's entries, or `None` if it cannot be read.
+fn snapshot_entries(
+    store: &CollaborationStore,
+    id: &SourceSnapshotId,
+) -> Result<Option<Entries>, ContextError> {
+    let bytes = match read_object(store, &ObjectDigest::of_snapshot(id)) {
+        Ok(bytes) => bytes,
+        Err(ArchiveError::MissingObject { .. } | ArchiveError::CorruptObject { .. }) => {
+            return Ok(None);
+        }
+        Err(other) => return Err(other.into()),
+    };
+    Ok(parse_manifest(&bytes)
+        .filter(|snapshot| snapshot.manifest_bytes() == bytes)
+        .map(|snapshot| {
+            snapshot
+                .entries()
+                .iter()
+                .map(|entry| {
+                    (
+                        entry.path().to_vec(),
+                        (entry.kind().git_mode().to_string(), *entry.content_sha256()),
+                    )
+                })
+                .collect()
+        }))
+}
+
+fn changed_paths(base: &Entries, result: &Entries) -> BTreeSet<Vec<u8>> {
+    let mut changed = BTreeSet::new();
+    for (path, entry) in result {
+        if base.get(path) != Some(entry) {
+            changed.insert(path.clone());
+        }
+    }
+    for path in base.keys() {
+        if !result.contains_key(path) {
+            changed.insert(path.clone());
+        }
+    }
+    changed
+}
 
 /// A contribution's changed paths and its brief, read from the archive.
 struct Loaded {
@@ -655,46 +801,15 @@ fn load(store: &CollaborationStore, contribution: &str) -> Result<Option<Loaded>
     else {
         return Ok(None);
     };
-    let manifest = |id: &str| -> Result<Option<Entries>, ContextError> {
-        let Ok(id) = SourceSnapshotId::parse(id) else {
-            return Ok(None);
-        };
-        let bytes = match read_object(store, &ObjectDigest::of_snapshot(&id)) {
-            Ok(bytes) => bytes,
-            Err(ArchiveError::MissingObject { .. } | ArchiveError::CorruptObject { .. }) => {
-                return Ok(None);
-            }
-            Err(other) => return Err(other.into()),
-        };
-        Ok(parse_manifest(&bytes)
-            .filter(|snapshot| snapshot.manifest_bytes() == bytes)
-            .map(|snapshot| {
-                snapshot
-                    .entries()
-                    .iter()
-                    .map(|entry| {
-                        (
-                            entry.path().to_vec(),
-                            (entry.kind().git_mode().to_string(), *entry.content_sha256()),
-                        )
-                    })
-                    .collect()
-            }))
+    let entries = |id: &str| -> Result<Option<Entries>, ContextError> {
+        match SourceSnapshotId::parse(id) {
+            Ok(id) => snapshot_entries(store, &id),
+            Err(_) => Ok(None),
+        }
     };
-    let (Some(base), Some(result)) = (manifest(&base)?, manifest(&result)?) else {
+    let (Some(base), Some(result)) = (entries(&base)?, entries(&result)?) else {
         return Ok(None);
     };
-    let mut changed: BTreeSet<Vec<u8>> = BTreeSet::new();
-    for (path, entry) in &result {
-        if base.get(path) != Some(entry) {
-            changed.insert(path.clone());
-        }
-    }
-    for path in base.keys() {
-        if !result.contains_key(path) {
-            changed.insert(path.clone());
-        }
-    }
     let attached: Option<(String, String)> = connection
         .query_row(
             "SELECT brief_record_id, brief_sha256 FROM contribution_briefs
@@ -705,27 +820,36 @@ fn load(store: &CollaborationStore, contribution: &str) -> Result<Option<Loaded>
         .optional()?;
     let brief = match attached {
         None => None,
-        Some((id, sha)) => {
-            let Some(digest) = hex_digest(&sha) else {
-                return Ok(None);
-            };
-            let bytes = match read_object(store, &digest) {
-                Ok(bytes) => bytes,
-                Err(ArchiveError::MissingObject { .. } | ArchiveError::CorruptObject { .. }) => {
-                    return Ok(None);
-                }
-                Err(other) => return Err(other.into()),
-            };
-            match Brief::from_record(&bytes) {
-                Ok((brief, _)) => Some((id, brief)),
-                Err(_) => return Ok(None),
-            }
-        }
+        Some((id, sha)) => match read_brief(store, &sha)? {
+            Some((brief, _)) => Some((id, brief)),
+            None => return Ok(None),
+        },
     };
     Ok(Some(Loaded {
-        changed: changed.into_iter().collect(),
+        changed: changed_paths(&base, &result).into_iter().collect(),
         brief,
     }))
+}
+
+/// A brief record by its archive digest, or `None` if it cannot be read.
+fn read_brief(
+    store: &CollaborationStore,
+    sha: &str,
+) -> Result<Option<(Brief, Value)>, ContextError> {
+    let Some(digest) = hex_digest(sha) else {
+        return Ok(None);
+    };
+    let bytes = match read_object(store, &digest) {
+        Ok(bytes) => bytes,
+        Err(ArchiveError::MissingObject { .. } | ArchiveError::CorruptObject { .. }) => {
+            return Ok(None);
+        }
+        Err(other) => return Err(other.into()),
+    };
+    match (Brief::from_record(&bytes), canonical_json::parse(&bytes)) {
+        (Ok((brief, _)), Ok(value)) => Ok(Some((brief, value))),
+        _ => Ok(None),
+    }
 }
 
 fn hex_digest(text: &str) -> Option<ObjectDigest> {
@@ -739,42 +863,95 @@ fn hex_digest(text: &str) -> Option<ObjectDigest> {
     Some(ObjectDigest::from_bytes(bytes))
 }
 
+/// The store's capture generation: it advances whenever a receipt is
+/// committed. An unreadable contribution is retried only after it moves.
+fn generation(connection: &rusqlite::Connection) -> rusqlite::Result<i64> {
+    connection.query_row(
+        "SELECT coalesce(max(rowid), 0) FROM capture_receipts",
+        [],
+        |row| row.get(0),
+    )
+}
+
+fn live_contributions(
+    connection: &rusqlite::Connection,
+    now: i64,
+) -> rusqlite::Result<BTreeSet<String>> {
+    connection
+        .prepare(&format!(
+            "SELECT c.lineage_record_id FROM retained_contributions c WHERE {}",
+            LIVE.replace("?1", "c.lineage_record_id")
+                .replace("?2", "?1")
+        ))?
+        .query_map([now], |row| row.get(0))?
+        .collect()
+}
+
 /// Bring the derived index up to date: post every live contribution not yet
-/// indexed, and drop contributions whose retention ended. Returns the
-/// contributions that could not be read.
-fn refresh_index(store: &mut CollaborationStore) -> Result<Vec<String>, ContextError> {
-    let (live, indexed): (BTreeSet<String>, BTreeSet<String>) = {
+/// indexed, and drop contributions that are no longer live. A contribution
+/// that cannot be read is recorded with the current generation and not
+/// read again until a later capture. Returns the live unreadable ones.
+fn refresh_index(
+    store: &mut CollaborationStore,
+    now: i64,
+    hooks: &mut Hooks<'_>,
+) -> Result<Vec<String>, ContextError> {
+    let (live, settled, current) = {
         let connection = store.read_connection();
-        let live = connection
-            .prepare(
-                "SELECT DISTINCT lineage_record_id FROM retention_roots
-                 WHERE kind = 'contribution' AND released_ms IS NULL
-                   AND lineage_record_id IS NOT NULL",
-            )?
-            .query_map([], |row| row.get(0))?
-            .collect::<Result<_, _>>()?;
-        let indexed = connection
+        let live = live_contributions(connection, now)?;
+        let current = generation(connection)?;
+        let mut settled: BTreeSet<String> = connection
             .prepare("SELECT lineage_record_id FROM context_indexed")?
             .query_map([], |row| row.get(0))?
             .collect::<Result<_, _>>()?;
-        (live, indexed)
+        let waiting: BTreeSet<String> = connection
+            .prepare("SELECT lineage_record_id FROM context_unreadable WHERE generation >= ?1")?
+            .query_map([current], |row| row.get(0))?
+            .collect::<Result<_, _>>()?;
+        settled.extend(waiting);
+        (live, settled, current)
     };
-    let mut unreadable = Vec::new();
-    let mut fresh = Vec::new();
-    for contribution in live.difference(&indexed) {
-        match load(store, contribution)? {
-            Some(loaded) => fresh.push((contribution.clone(), loaded)),
-            None => unreadable.push(contribution.clone()),
-        }
+    let mut loaded = Vec::new();
+    for contribution in live.difference(&settled) {
+        loaded.push((contribution.clone(), load(store, contribution)?));
     }
+    (hooks.after_load)(store);
     let transaction = store
         .connection()
         .transaction_with_behavior(TransactionBehavior::Immediate)?;
-    for gone in indexed.difference(&live) {
+    let indexed: BTreeSet<String> = transaction
+        .prepare("SELECT lineage_record_id FROM context_indexed UNION SELECT lineage_record_id FROM context_unreadable")?
+        .query_map([], |row| row.get(0))?
+        .collect::<Result<_, _>>()?;
+    let live_now = live_contributions(&transaction, now)?;
+    for gone in indexed.difference(&live_now) {
         forget(&transaction, gone)?;
     }
-    for (contribution, loaded) in fresh {
+    for (contribution, loaded) in loaded {
+        // The brief or the retention may have changed since it was read
+        // outside this transaction; such a contribution waits for the next
+        // query rather than being indexed with a stale brief.
+        let brief_now: Option<String> = transaction
+            .query_row(
+                "SELECT brief_record_id FROM contribution_briefs WHERE lineage_record_id = ?1",
+                [contribution.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if !live_now.contains(&contribution) {
+            continue;
+        }
         forget(&transaction, &contribution)?;
+        let Some(loaded) = loaded else {
+            transaction.execute(
+                "INSERT INTO context_unreadable (lineage_record_id, generation) VALUES (?1, ?2)",
+                (contribution.as_str(), current),
+            )?;
+            continue;
+        };
+        if brief_now != loaded.brief.as_ref().map(|(id, _)| id.clone()) {
+            continue;
+        }
         let mut keys = BTreeSet::new();
         for path in &loaded.changed {
             keys.insert(posting(TAG_PATH, path));
@@ -796,12 +973,16 @@ fn refresh_index(store: &mut CollaborationStore) -> Result<Vec<String>, ContextE
         }
         transaction.execute(
             "INSERT INTO context_indexed (lineage_record_id, brief_record_id) VALUES (?1, ?2)",
-            (
-                contribution.as_str(),
-                loaded.brief.as_ref().map(|(id, _)| id.as_str()),
-            ),
+            (contribution.as_str(), brief_now),
         )?;
     }
+    let unreadable = transaction
+        .prepare("SELECT lineage_record_id FROM context_unreadable ORDER BY lineage_record_id")?
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .filter(|id| live_now.contains(id))
+        .collect();
     transaction.commit()?;
     Ok(unreadable)
 }
@@ -823,7 +1004,8 @@ fn validate_scope_path(path: &[u8]) -> Result<(), ContextError> {
 }
 
 /// The posting keys a query depends on: a contribution that could match
-/// any reason posts under at least one of them.
+/// any reason posts under at least one of them. Scope refs are at most
+/// [`MAX_SCOPE_REF_BYTES`], so only ancestors that short can match one.
 fn dependency_keys(scope: &[Vec<u8>], related: &[(Vec<u8>, String)]) -> BTreeSet<Vec<u8>> {
     let mut keys = BTreeSet::new();
     for path in scope {
@@ -832,10 +1014,11 @@ fn dependency_keys(scope: &[Vec<u8>], related: &[(Vec<u8>, String)]) -> BTreeSet
         if !directory.is_empty() {
             keys.insert(posting(TAG_DIRECTORY, directory));
         }
-        // A scope ref matches the path itself or any ancestor directory.
         let mut prefix = path.as_slice();
         loop {
-            keys.insert(posting(TAG_REF, prefix));
+            if prefix.len() <= MAX_SCOPE_REF_BYTES {
+                keys.insert(posting(TAG_REF, prefix));
+            }
             let up = parent(prefix);
             if up.is_empty() {
                 break;
@@ -847,6 +1030,62 @@ fn dependency_keys(scope: &[Vec<u8>], related: &[(Vec<u8>, String)]) -> BTreeSet
         keys.insert(posting(TAG_PATH, path));
     }
     keys
+}
+
+/// Whether `envelope` is provably about every scope path: an
+/// `explain_impact` or `find_references` result whose changed-path subject
+/// is exactly the scope, an impact between two retained snapshots that
+/// changed every scope path, or references in a retained snapshot that
+/// holds every scope path.
+fn envelope_is_scoped(
+    store: &CollaborationStore,
+    envelope: &AnalysisEnvelope,
+    scope: &[Vec<u8>],
+) -> Result<bool, ContextError> {
+    if !matches!(
+        envelope.operation,
+        Operation::ExplainImpact | Operation::FindReferences
+    ) {
+        return Ok(false);
+    }
+    let subjects = [Some(&envelope.subject), envelope.base_subject.as_ref()];
+    let scope_text: Option<Vec<String>> = scope
+        .iter()
+        .map(|path| String::from_utf8(path.clone()).ok())
+        .collect();
+    if let Some(scope_text) = scope_text {
+        let digest = crate::graph_impact::diff_digest(&scope_text);
+        if subjects
+            .iter()
+            .flatten()
+            .any(|subject| matches!(subject, Subject::ChangedPaths(d) if *d == digest))
+        {
+            return Ok(true);
+        }
+    }
+    match (
+        envelope.operation,
+        &envelope.subject,
+        &envelope.base_subject,
+    ) {
+        (Operation::ExplainImpact, Subject::Snapshot(result), Some(Subject::Snapshot(base))) => {
+            let (Some(base), Some(result)) = (
+                snapshot_entries(store, base)?,
+                snapshot_entries(store, result)?,
+            ) else {
+                return Ok(false);
+            };
+            let changed = changed_paths(&base, &result);
+            Ok(scope.iter().all(|path| changed.contains(path)))
+        }
+        (Operation::FindReferences, Subject::Snapshot(id), _) => {
+            let Some(entries) = snapshot_entries(store, id)? else {
+                return Ok(false);
+            };
+            Ok(scope.iter().all(|path| entries.contains_key(path)))
+        }
+        _ => Ok(false),
+    }
 }
 
 fn noncharacter(c: char) -> bool {
@@ -906,15 +1145,61 @@ struct Provenance {
     until_ms: Option<i64>,
 }
 
+/// One live, visible contribution under a posting: its brief and retention
+/// are part of the posting's version, so a re-brief or retention change
+/// invalidates exactly the keys it is posted under.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct Posted {
+    id: String,
+    brief: Option<String>,
+    /// `None`: until released.
+    until_ms: Option<i64>,
+}
+
 /// Retrieve a bounded context for `query`.
 pub fn retrieve(
     store: &mut CollaborationStore,
     query: &ContextQuery,
     visibility: &dyn Visibility,
 ) -> Result<ContributionContext, ContextError> {
+    retrieve_with(
+        store,
+        query,
+        visibility,
+        Hooks {
+            after_load: &mut |_| {},
+            after_refresh: &mut |_| {},
+        },
+    )
+}
+
+/// Where another process's release or re-brief can land during a query:
+/// after the index refresh read contributions outside its write
+/// transaction, and after the refresh, before the read transaction. Tests
+/// act there; [`retrieve`] does nothing.
+struct Hooks<'a> {
+    after_load: &'a mut dyn FnMut(&mut CollaborationStore),
+    after_refresh: &'a mut dyn FnMut(&mut CollaborationStore),
+}
+
+fn retrieve_with(
+    store: &mut CollaborationStore,
+    query: &ContextQuery,
+    visibility: &dyn Visibility,
+    mut hooks: Hooks<'_>,
+) -> Result<ContributionContext, ContextError> {
     query.budget.check()?;
     if query.scope.is_empty() {
         return Err(ContextError::EmptyScope);
+    }
+    if query.scope.len() > MAX_SCOPE_PATHS
+        || query
+            .scope
+            .iter()
+            .any(|path| path.len() > MAX_SCOPE_PATH_BYTES)
+        || query.analysis.len() > MAX_ANALYSIS_ENVELOPES
+    {
+        return Err(ContextError::RequestTooLarge);
     }
     let mut scope = query.scope.clone();
     scope.sort();
@@ -922,119 +1207,201 @@ pub fn retrieve(
     for path in &scope {
         validate_scope_path(path)?;
     }
-    let unreadable = refresh_index(store)?;
-    let analysis: Vec<AnalysisSummary> = query
-        .analysis
-        .iter()
-        .map(|envelope| AnalysisSummary::of(envelope, query.source.as_ref()))
+    let now = crate::clock::epoch_ms();
+    let unreadable: Vec<String> = refresh_index(store, now, &mut hooks)?
+        .into_iter()
+        .filter(|id| visibility.visible(id))
         .collect();
+    let mut analysis = Vec::new();
+    for envelope in &query.analysis {
+        let scoped = envelope_is_scoped(store, envelope, &scope)?;
+        analysis.push(AnalysisSummary::of(envelope, query.source.as_ref(), scoped));
+    }
+    let mut related_seen = 0;
+    let mut related_truncated = false;
+    for summary in &mut analysis {
+        let keep = MAX_RELATED_PATHS.saturating_sub(related_seen);
+        if summary.related.len() > keep {
+            summary.related.truncate(keep);
+            related_truncated = true;
+        }
+        related_seen += summary.related.len();
+    }
     let related: Vec<(Vec<u8>, String)> = analysis
         .iter()
         .flat_map(|summary| summary.related.iter().cloned())
         .collect();
     let keys = dependency_keys(&scope, &related);
+    (hooks.after_refresh)(store);
 
-    // One read transaction: postings, candidates and provenance all come
-    // from the same index state.
+    // One read transaction: postings, versions, candidates and provenance
+    // all come from the same index state.
     let connection = store.read_connection();
     connection.execute_batch("BEGIN DEFERRED")?;
     let read = (|| -> Result<_, ContextError> {
-        let mut by_key: BTreeMap<Vec<u8>, BTreeSet<String>> = BTreeMap::new();
-        let mut statement =
-            connection.prepare("SELECT lineage_record_id FROM context_postings WHERE key = ?1")?;
+        let mut by_key: BTreeMap<Vec<u8>, BTreeSet<Posted>> = BTreeMap::new();
+        let mut statement = connection.prepare(&format!(
+            "SELECT p.lineage_record_id, i.brief_record_id,
+                    (SELECT CASE WHEN count(*) > count(r.until_ms) THEN NULL ELSE max(r.until_ms) END
+                     FROM retention_roots r
+                     WHERE r.lineage_record_id = p.lineage_record_id AND r.kind = 'contribution'
+                       AND r.released_ms IS NULL AND (r.until_ms IS NULL OR r.until_ms > ?2))
+             FROM context_postings p JOIN context_indexed i USING (lineage_record_id)
+             WHERE p.key = ?3 AND {}",
+            LIVE.replace("?1", "p.lineage_record_id")
+        ))?;
         for key in &keys {
-            let ids: BTreeSet<String> = statement
-                .query_map([key], |row| row.get(0))?
-                .collect::<Result<_, _>>()?;
-            let visible = ids
+            let posted: BTreeSet<Posted> = statement
+                .query_map(rusqlite::params![None::<i64>, now, key], |row| {
+                    Ok(Posted {
+                        id: row.get(0)?,
+                        brief: row.get(1)?,
+                        until_ms: row.get(2)?,
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()?
                 .into_iter()
-                .filter(|id| visibility.visible(id))
+                .filter(|posted| visibility.visible(&posted.id))
                 .collect();
-            by_key.insert(key.clone(), visible);
+            by_key.insert(key.clone(), posted);
         }
-        let candidates: BTreeSet<String> = by_key.values().flatten().cloned().collect();
+        // Cap the candidates read in detail. They are pre-ranked on the
+        // strongest key kind they matched and how many such keys, which is
+        // what selection ranks on for all but same-directory matches; the
+        // cut is reported, so the result is never complete when it happens.
+        let scope_paths: BTreeSet<Vec<u8>> =
+            scope.iter().map(|path| posting(TAG_PATH, path)).collect();
+        let mut strength: BTreeMap<&str, (u8, usize)> = BTreeMap::new();
+        for (key, posted) in &by_key {
+            let kind = match key[0] {
+                TAG_PATH if scope_paths.contains(key) => 0,
+                TAG_REF => 1,
+                TAG_PATH => 2,
+                _ => 3,
+            };
+            for entry in posted {
+                let best = strength.entry(entry.id.as_str()).or_insert((kind, 0));
+                if kind < best.0 {
+                    *best = (kind, 0);
+                }
+                if kind == best.0 {
+                    best.1 += 1;
+                }
+            }
+        }
+        let mut ranked: Vec<(&str, (u8, usize))> = strength.into_iter().collect();
+        ranked.sort_by(|a, b| {
+            (a.1.0, std::cmp::Reverse(a.1.1), a.0).cmp(&(b.1.0, std::cmp::Reverse(b.1.1), b.0))
+        });
+        let candidates_truncated = ranked.len() > candidate_limit();
+        let chosen: Vec<String> = ranked
+            .into_iter()
+            .take(candidate_limit())
+            .map(|(id, _)| id.to_string())
+            .collect();
+        let briefs_by_id: BTreeMap<&str, Option<&String>> = by_key
+            .values()
+            .flatten()
+            .map(|posted| (posted.id.as_str(), posted.brief.as_ref()))
+            .collect();
         let mut details = Vec::new();
-        for id in &candidates {
+        let mut stale_index = Vec::new();
+        for id in &chosen {
             let changed: Vec<Vec<u8>> = connection
-                .prepare(
+                .prepare_cached(
                     "SELECT key FROM context_postings WHERE lineage_record_id = ?1
                      AND substr(key, 1, 1) = ?2 ORDER BY key",
                 )?
                 .query_map((id, vec![TAG_PATH]), |row| row.get::<_, Vec<u8>>(0))?
                 .map(|key| key.map(|key| key[1..].to_vec()))
                 .collect::<Result<_, _>>()?;
-            let provenance = connection.query_row(
-                "SELECT r.rowid, r.base_snapshot, r.result_snapshot, r.receipt_record_id,
-                        r.durability
-                 FROM capture_receipts r WHERE r.lineage_record_id = ?1
-                 ORDER BY r.rowid LIMIT 1",
-                [id],
-                |row| {
-                    Ok(Provenance {
-                        seq: row.get(0)?,
-                        base: row.get(1)?,
-                        result: row.get(2)?,
-                        receipt: row.get(3)?,
-                        durability: row.get(4)?,
-                        until_ms: None,
-                    })
-                },
-            )?;
-            // The furthest live retention boundary; NULL means "until
-            // released", which outlasts any time.
-            let until: Option<Option<i64>> = connection
+            let Some(provenance) = connection
                 .query_row(
-                    "SELECT CASE WHEN count(*) > count(until_ms) THEN NULL ELSE max(until_ms) END
-                     FROM retention_roots WHERE lineage_record_id = ?1
-                       AND kind = 'contribution' AND released_ms IS NULL",
+                    "SELECT rowid, base_snapshot, result_snapshot, receipt_record_id, durability
+                     FROM capture_receipts WHERE lineage_record_id = ?1
+                     ORDER BY rowid LIMIT 1",
                     [id],
-                    |row| row.get(0),
+                    |row| {
+                        Ok(Provenance {
+                            seq: row.get(0)?,
+                            base: row.get(1)?,
+                            result: row.get(2)?,
+                            receipt: row.get(3)?,
+                            durability: row.get(4)?,
+                            until_ms: None,
+                        })
+                    },
                 )
-                .optional()?;
-            let brief: Option<String> = connection.query_row(
-                "SELECT brief_record_id FROM context_indexed WHERE lineage_record_id = ?1",
-                [id],
-                |row| row.get(0),
-            )?;
+                .optional()?
+            else {
+                stale_index.push(id.clone());
+                continue;
+            };
+            let until = by_key
+                .values()
+                .flatten()
+                .find(|posted| &posted.id == id)
+                .and_then(|posted| posted.until_ms);
+            // The brief the index was built with must still be the attached
+            // one; otherwise this contribution is reported, not guessed at.
+            let brief = match briefs_by_id.get(id.as_str()).copied().flatten() {
+                None => None,
+                Some(brief) => match connection
+                    .query_row(
+                        "SELECT brief_sha256 FROM contribution_briefs
+                         WHERE lineage_record_id = ?1 AND brief_record_id = ?2",
+                        [id, brief],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?
+                {
+                    Some(sha) => Some((brief.clone(), sha)),
+                    None => {
+                        stale_index.push(id.clone());
+                        continue;
+                    }
+                },
+            };
             details.push((
                 id.clone(),
                 changed,
                 Provenance {
-                    until_ms: until.flatten(),
+                    until_ms: until,
                     ..provenance
                 },
                 brief,
             ));
         }
-        Ok((by_key, details))
+        Ok((by_key, details, stale_index, candidates_truncated))
     })();
     connection.execute_batch("COMMIT")?;
-    let (by_key, details) = read?;
+    let (by_key, details, stale_index, candidates_truncated) = read?;
 
     // Briefs are immutable objects named by their record; read them once.
+    // One that cannot be read makes its contribution a gap.
     let mut briefs: BTreeMap<String, (Brief, Value)> = BTreeMap::new();
-    for (_, _, _, brief) in &details {
-        if let Some(id) = brief
+    let mut unreadable = unreadable;
+    unreadable.extend(stale_index);
+    let mut kept = Vec::new();
+    for detail in details {
+        if let Some((id, sha)) = &detail.3
             && !briefs.contains_key(id)
         {
-            let sha: String = store.read_connection().query_row(
-                "SELECT brief_sha256 FROM contribution_briefs WHERE brief_record_id = ?1",
-                [id],
-                |row| row.get(0),
-            )?;
-            let digest = hex_digest(&sha).ok_or_else(|| ArchiveError::CorruptObject {
-                digest: sha.clone(),
-            })?;
-            let bytes = read_object(store, &digest)?;
-            let (brief, _) =
-                Brief::from_record(&bytes).map_err(|_| ArchiveError::CorruptObject {
-                    digest: sha.clone(),
-                })?;
-            let value = canonical_json::parse(&bytes)
-                .map_err(|_| ArchiveError::CorruptObject { digest: sha })?;
-            briefs.insert(id.clone(), (brief, value));
+            match read_brief(store, sha)? {
+                Some(read) => {
+                    briefs.insert(id.clone(), read);
+                }
+                None => {
+                    unreadable.push(detail.0.clone());
+                    continue;
+                }
+            }
         }
+        kept.push(detail);
     }
+    let details = kept;
+    unreadable.sort();
+    unreadable.dedup();
 
     let candidates: Vec<Candidate> = details
         .iter()
@@ -1042,7 +1409,7 @@ pub fn retrieve(
             id: id.clone(),
             seq: provenance.seq,
             changed: changed.clone(),
-            brief: brief.as_ref().map(|brief| {
+            brief: brief.as_ref().map(|(brief, _)| {
                 let (brief, _) = &briefs[brief];
                 CandidateBrief {
                     tokens: brief.token_count(),
@@ -1059,9 +1426,12 @@ pub fn retrieve(
     let mut selection = select(
         &SelectionQuery {
             scope: scope.clone(),
+            has_source: query.source.is_some(),
             analysis,
             budget: query.budget,
-            unreadable,
+            unreadable: unreadable.clone(),
+            related_truncated,
+            candidates_truncated,
         },
         &candidates,
     );
@@ -1102,11 +1472,21 @@ pub fn retrieve(
     );
     let dependencies: Vec<Value> = by_key
         .iter()
-        .map(|(key, ids)| {
+        .map(|(key, posted)| {
             let mut digest = Sha256::new();
-            for id in ids {
-                digest.update(id.as_bytes());
-                digest.update(b"\n");
+            for entry in posted {
+                let until = entry
+                    .until_ms
+                    .map_or_else(|| "released".to_string(), |ms| ms.to_string());
+                digest.update(
+                    format!(
+                        "{}\t{}\t{}\n",
+                        entry.id,
+                        entry.brief.as_deref().unwrap_or("-"),
+                        until
+                    )
+                    .as_bytes(),
+                );
             }
             let mut entry = key_value(key);
             if let Value::Object(members) = &mut entry {
@@ -1123,6 +1503,10 @@ pub fn retrieve(
     let cache_input = object(vec![
         ("query", query_value.clone()),
         ("dependencies", Value::Array(dependencies.clone())),
+        (
+            "unreadable",
+            Value::Array(unreadable.iter().map(|id| text(id)).collect()),
+        ),
         ("visibility", text(visibility.name())),
         ("visibility_epoch", text(&visibility.epoch().to_string())),
     ]);
@@ -1130,10 +1514,12 @@ pub fn retrieve(
         "sha256:{}",
         hex(&Sha256::digest(cache_input.to_canonical_bytes()))
     );
+    // The dependency list itself stays out of the record: it can be long,
+    // and the key already commits to it.
     let cache = object(vec![
         ("key", text(&cache_key)),
         ("visibility_epoch", text(&visibility.epoch().to_string())),
-        ("dependencies", Value::Array(dependencies)),
+        ("dependencies", integer(dependencies.len())),
     ]);
 
     let item_value = |selected: &Selected| -> Value {
@@ -1194,7 +1580,7 @@ pub fn retrieve(
             members.push(("applicability", text(applicability)));
         }
         match (brief, selected.brief_included) {
-            (Some(id), Some(true)) => {
+            (Some((id, _)), Some(true)) => {
                 let (brief, content) = &briefs[id];
                 members.push((
                     "brief",
@@ -1206,7 +1592,7 @@ pub fn retrieve(
                     ]),
                 ));
             }
-            (Some(id), Some(false)) => {
+            (Some((id, _)), Some(false)) => {
                 members.push((
                     "brief_omitted",
                     object(vec![("record", text(id)), ("reason", text("brief_tokens"))]),
@@ -1218,7 +1604,8 @@ pub fn retrieve(
     };
 
     // Encode; drop items from the end until the byte budget holds. Each
-    // dropped item is still counted in `matched`.
+    // dropped item is still counted in `matched`. If even the empty result
+    // does not fit, the request is refused: a budget is never exceeded.
     loop {
         let items: Vec<Value> = selection.items.iter().map(&item_value).collect();
         let mut members = vec![
@@ -1227,7 +1614,6 @@ pub fn retrieve(
             ("authority", text(CONTEXT_AUTHORITY)),
             ("visibility", text(visibility.name())),
             ("coverage", text(selection.coverage())),
-            ("freshness", text(selection.freshness())),
             ("limits", text(selection.limits())),
             (
                 "limit_detail",
@@ -1244,6 +1630,9 @@ pub fn retrieve(
             ("items", Value::Array(items)),
             ("cache", cache.clone()),
         ];
+        if let Some(freshness) = selection.freshness() {
+            members.push(("freshness", text(freshness)));
+        }
         if !selection.gaps.is_empty() {
             members.push((
                 "gaps",
@@ -1251,7 +1640,7 @@ pub fn retrieve(
             ));
         }
         let bytes = object(members).to_canonical_bytes();
-        if bytes.len() <= query.budget.max_bytes || selection.items.is_empty() {
+        if bytes.len() <= query.budget.max_bytes {
             let id = Record::decode(&bytes, &[&CONTEXT_SCHEMA])
                 .expect("a context result encodes to a valid record")
                 .id();
@@ -1268,12 +1657,16 @@ pub fn retrieve(
                 contributions,
             });
         }
-        let dropped = selection.items.pop().expect("not empty");
-        if dropped.brief_included == Some(true) {
-            let (_, _, _, brief) = &details[dropped.candidate];
-            if let Some(id) = brief {
-                selection.brief_tokens -= briefs[id].0.token_count();
-            }
+        let Some(dropped) = selection.items.pop() else {
+            return Err(ContextError::BudgetTooSmall {
+                needed: bytes.len(),
+                max_bytes: query.budget.max_bytes,
+            });
+        };
+        if dropped.brief_included == Some(true)
+            && let Some((id, _)) = &details[dropped.candidate].3
+        {
+            selection.brief_tokens -= briefs[id].0.token_count();
         }
         selection.truncated_by.insert("bytes");
     }
@@ -1454,7 +1847,10 @@ mod tests {
         assert_eq!(field(&value, "coverage"), &text("partial"));
         assert_eq!(
             field(&value, "gaps"),
-            &Value::Array(vec![text("no_dependency_analysis")])
+            &Value::Array(vec![
+                text("no_dependency_analysis"),
+                text("no_reader_source")
+            ])
         );
         let Value::Array(items) = field(&value, "items") else {
             panic!()
@@ -1576,7 +1972,7 @@ mod tests {
     #[test]
     fn the_byte_budget_drops_items_from_the_end() {
         let mut fixture = Fixture::new();
-        for n in 0..6 {
+        for n in 0..candidate_limit() {
             fixture.contribute(&[("src/search.rs", &format!("v{n}\n"))]);
         }
         let budget = Budget {
@@ -1586,8 +1982,8 @@ mod tests {
         let context = fixture.retrieve_with(&["src/search.rs"], Vec::new(), budget, &LocalProject);
         assert!(context.record.len() <= 1024 || context.contributions.is_empty());
         assert!(context.selection.truncated_by.contains("bytes"));
-        assert_eq!(context.selection.matched, 6);
-        assert!(context.contributions.len() < 6);
+        assert_eq!(context.selection.matched, candidate_limit());
+        assert!(context.contributions.len() < candidate_limit());
         let full = fixture.retrieve(&["src/search.rs"]);
         assert_eq!(
             full.contributions[..context.contributions.len()],
@@ -1648,18 +2044,17 @@ mod tests {
         );
     }
 
-    fn impact(
-        source: Option<&SourceSnapshotId>,
+    fn envelope(
+        operation: Operation,
+        subject: Subject,
+        base: Option<Subject>,
         callers: &[&str],
         coverage: Coverage,
     ) -> AnalysisEnvelope {
         AnalysisEnvelope {
-            operation: Operation::ResolveSymbol,
-            subject: match source {
-                Some(id) => Subject::Snapshot(id.clone()),
-                None => Subject::LegacyGitRevision("a".repeat(40)),
-            },
-            base_subject: None,
+            operation,
+            subject,
+            base_subject: base,
             profile: ProfileRef::Legacy("test".into()),
             outcome: Outcome::Available,
             freshness: Freshness::Exact,
@@ -1677,48 +2072,99 @@ mod tests {
         }
     }
 
+    /// A contribution's base and result snapshots.
+    fn snapshots(fixture: &Fixture, id: &RecordId) -> (SourceSnapshotId, SourceSnapshotId) {
+        fixture
+            .store
+            .read_connection()
+            .query_row(
+                "SELECT base_snapshot, result_snapshot FROM retained_contributions
+                 WHERE lineage_record_id = ?1",
+                [id.as_str()],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .map(|(base, result)| {
+                (
+                    SourceSnapshotId::parse(&base).unwrap(),
+                    SourceSnapshotId::parse(&result).unwrap(),
+                )
+            })
+            .unwrap()
+    }
+
+    fn ask(
+        fixture: &mut Fixture,
+        scope: &[&str],
+        analysis: Vec<AnalysisEnvelope>,
+        source: Option<&SourceSnapshotId>,
+    ) -> ContributionContext {
+        retrieve(
+            &mut fixture.store,
+            &ContextQuery {
+                scope: scope.iter().map(|path| path.as_bytes().to_vec()).collect(),
+                source: source.cloned(),
+                analysis,
+                budget: Budget::default(),
+            },
+            &LocalProject,
+        )
+        .unwrap()
+    }
+
+    /// Delete a not-yet-indexed contribution's result manifest; return its
+    /// path and bytes so a test can put it back.
+    fn break_manifest(fixture: &Fixture, id: &RecordId) -> (std::path::PathBuf, Vec<u8>) {
+        let (_, result) = snapshots(fixture, id);
+        let digest = ObjectDigest::of_snapshot(&result).hex();
+        let path = fixture
+            .store
+            .project_dir()
+            .join("objects/sha256")
+            .join(&digest[..2])
+            .join(&digest[2..]);
+        let bytes = std::fs::read(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        (path, bytes)
+    }
+
+    fn gaps(context: &ContributionContext) -> Vec<&str> {
+        context.selection.gaps.iter().map(String::as_str).collect()
+    }
+
     #[test]
-    fn a_complete_bound_analysis_makes_an_empty_answer_evidence() {
+    fn a_complete_scoped_bound_analysis_makes_an_empty_answer_evidence() {
         let mut fixture = Fixture::new();
         let keys = fixture.contribute(&[("docs/guide.md", "v2\n"), ("README.md", "v2\n")]);
-        let source = SourceSnapshotId::parse(&format!("sha256:{}", "ab".repeat(32))).unwrap();
-        let ask =
-            |fixture: &mut Fixture, envelope: AnalysisEnvelope, src: Option<&SourceSnapshotId>| {
-                retrieve(
-                    &mut fixture.store,
-                    &ContextQuery {
-                        scope: vec![b"src/search.rs".to_vec()],
-                        source: src.cloned(),
-                        analysis: vec![envelope],
-                        budget: Budget::default(),
-                    },
-                    &LocalProject,
-                )
-                .unwrap()
-            };
-        // Complete, bound, nothing related changed: empty is evidence.
+        let (base, _) = snapshots(&fixture, &keys);
+        let refs = |callers: &[&str], coverage| {
+            envelope(
+                Operation::FindReferences,
+                Subject::Snapshot(base.clone()),
+                None,
+                callers,
+                coverage,
+            )
+        };
+        let scope = ["src/search.rs"];
+        // Complete, bound to the reader's source, about the scope, nothing
+        // related changed: empty is evidence.
         let empty = ask(
             &mut fixture,
-            impact(
-                Some(&source),
-                &["src/keys.rs"],
-                Coverage::CompleteWithinProfile,
-            ),
-            Some(&source),
+            &scope,
+            vec![refs(&["src/keys.rs"], Coverage::CompleteWithinProfile)],
+            Some(&base),
         );
         assert!(empty.contributions.is_empty());
+        assert_eq!(gaps(&empty), Vec::<&str>::new());
         assert!(empty.selection.absence_is_evidence());
         // The analysis relates a path this contribution changed.
         let related = ask(
             &mut fixture,
-            impact(
-                Some(&source),
-                &["docs/guide.md"],
-                Coverage::CompleteWithinProfile,
-            ),
-            Some(&source),
+            &scope,
+            vec![refs(&["docs/guide.md"], Coverage::CompleteWithinProfile)],
+            Some(&base),
         );
-        assert_eq!(related.contributions, ids(&[keys]));
+        assert_eq!(related.contributions, ids(std::slice::from_ref(&keys)));
         assert_eq!(
             related.selection.items[0].reasons[0].kind,
             ReasonKind::ImpactEdge
@@ -1727,33 +2173,397 @@ mod tests {
         let Value::Array(items) = field(&value, "items") else {
             panic!()
         };
-        assert_eq!(field(&items[0], "applicability"), &text("other_base"));
-        // Partial, legacy-bound or another source's analysis: never evidence.
-        for (envelope, gap) in [
+        assert_eq!(field(&items[0], "applicability"), &text("same_base"));
+        // Never evidence: partial, legacy-bound, not about the scope, about
+        // another source, or no reader source.
+        let other = SourceSnapshotId::parse(&format!("sha256:{}", "cd".repeat(32))).unwrap();
+        let cases = [
             (
-                impact(Some(&source), &[], Coverage::Partial),
-                "analysis_partial",
+                refs(&[], Coverage::Partial),
+                Some(&base),
+                vec!["analysis_partial"],
             ),
             (
-                impact(None, &[], Coverage::CompleteWithinProfile),
-                "analysis_subject_unbound",
+                envelope(
+                    Operation::FindReferences,
+                    Subject::LegacyGitRevision("a".repeat(40)),
+                    None,
+                    &[],
+                    Coverage::CompleteWithinProfile,
+                ),
+                Some(&base),
+                vec!["analysis_not_scoped", "analysis_subject_unbound"],
             ),
-        ] {
-            let result = ask(&mut fixture, envelope, Some(&source));
-            assert!(
-                result.selection.gaps.contains(gap),
-                "{:?}",
-                result.selection.gaps
-            );
+            (
+                envelope(
+                    Operation::ResolveSymbol,
+                    Subject::Snapshot(base.clone()),
+                    None,
+                    &[],
+                    Coverage::CompleteWithinProfile,
+                ),
+                Some(&base),
+                vec!["analysis_not_scoped"],
+            ),
+            (
+                envelope(
+                    Operation::FindReferences,
+                    Subject::Snapshot(other.clone()),
+                    None,
+                    &[],
+                    Coverage::CompleteWithinProfile,
+                ),
+                Some(&base),
+                vec!["analysis_not_scoped", "analysis_other_source"],
+            ),
+            (
+                refs(&[], Coverage::CompleteWithinProfile),
+                None,
+                vec!["no_reader_source"],
+            ),
+        ];
+        for (envelope, source, expected) in cases {
+            let result = ask(&mut fixture, &scope, vec![envelope], source);
+            assert_eq!(gaps(&result), expected);
             assert!(!result.selection.absence_is_evidence());
         }
-        let other = SourceSnapshotId::parse(&format!("sha256:{}", "cd".repeat(32))).unwrap();
-        let stale = ask(
+        // Another operation is not about the scope even with the scope's
+        // exact changed-path digest, and references in a snapshot that lacks
+        // a scope path are not about it either.
+        let digest = crate::graph_impact::diff_digest(&["src/search.rs".to_string()]);
+        let symbol = ask(
             &mut fixture,
-            impact(Some(&other), &[], Coverage::CompleteWithinProfile),
-            Some(&source),
+            &scope,
+            vec![envelope(
+                Operation::ResolveSymbol,
+                Subject::ChangedPaths(digest),
+                None,
+                &[],
+                Coverage::CompleteWithinProfile,
+            )],
+            Some(&base),
         );
-        assert_eq!(stale.selection.freshness(), "stale");
+        assert_eq!(
+            gaps(&symbol),
+            vec!["analysis_not_scoped", "analysis_subject_unbound"]
+        );
+        let missing = ask(
+            &mut fixture,
+            &["src/new.rs"],
+            vec![refs(&[], Coverage::CompleteWithinProfile)],
+            Some(&base),
+        );
+        assert_eq!(gaps(&missing), vec!["analysis_not_scoped"]);
+        let unsourced = ask(
+            &mut fixture,
+            &scope,
+            vec![refs(&[], Coverage::CompleteWithinProfile)],
+            None,
+        );
+        assert_eq!(unsourced.selection.freshness(), None);
+        let value = decoded(&unsourced);
+        assert!(matches!(&value, Value::Object(o) if o.get("freshness").is_none()));
+    }
+
+    /// An impact between two retained snapshots is about the scope only if
+    /// its change touched every scope path.
+    #[test]
+    fn an_impact_between_retained_snapshots_is_scoped_by_its_change() {
+        let mut fixture = Fixture::new();
+        let change = fixture.contribute(&[("src/search.rs", "v2\n")]);
+        let (base, result) = snapshots(&fixture, &change);
+        let impact = envelope(
+            Operation::ExplainImpact,
+            Subject::Snapshot(result),
+            Some(Subject::Snapshot(base.clone())),
+            &[],
+            Coverage::CompleteWithinProfile,
+        );
+        let scoped = ask(
+            &mut fixture,
+            &["src/search.rs"],
+            vec![impact.clone()],
+            Some(&base),
+        );
+        assert_eq!(gaps(&scoped), Vec::<&str>::new());
+        assert_eq!(scoped.selection.coverage(), "complete_within_profile");
+        let elsewhere = ask(&mut fixture, &["src/keys.rs"], vec![impact], Some(&base));
+        assert_eq!(gaps(&elsewhere), vec!["analysis_not_scoped"]);
+    }
+
+    /// A brief or retention change of a contribution under a dependency
+    /// changes the key, even when no posting is added or removed.
+    #[test]
+    fn briefs_and_retention_are_part_of_the_cache_key() {
+        let mut fixture = Fixture::new();
+        let change = fixture.contribute(&[("src/search.rs", "v2\n")]);
+        let key = |fixture: &mut Fixture| fixture.retrieve(&["src/search.rs"]).cache_key;
+        let plain = key(&mut fixture);
+        attach_brief(&mut fixture.store, &change, &brief("lib", "first")).unwrap();
+        let briefed = key(&mut fixture);
+        assert_ne!(briefed, plain, "a first brief on a path-only match");
+        attach_brief(&mut fixture.store, &change, &brief("lib", "second")).unwrap();
+        let rebriefed = key(&mut fixture);
+        assert_ne!(rebriefed, briefed, "a same-scope re-brief");
+        fixture
+            .store
+            .connection()
+            .execute(
+                "UPDATE retention_roots SET until_ms = 4102444800000 WHERE lineage_record_id = ?1",
+                [change.as_str()],
+            )
+            .unwrap();
+        assert_ne!(key(&mut fixture), rebriefed, "a retention change");
+    }
+
+    #[test]
+    fn unreadable_contributions_are_keyed_and_shown_only_to_their_readers() {
+        struct Hide(String);
+        impl Visibility for Hide {
+            fn name(&self) -> &str {
+                "test_reader"
+            }
+            fn epoch(&self) -> u64 {
+                0
+            }
+            fn visible(&self, contribution: &str) -> bool {
+                contribution != self.0
+            }
+        }
+        let mut fixture = Fixture::new();
+        fixture.contribute(&[("src/search.rs", "v2\n")]);
+        let before = fixture.retrieve(&["src/search.rs"]).cache_key;
+        let broken = fixture.contribute(&[("docs/x.md", "v2\n")]);
+        break_manifest(&fixture, &broken);
+        let after = fixture.retrieve(&["src/search.rs"]);
+        assert!(
+            gaps(&after).contains(&format!("contribution_unreadable:{}", broken.as_str()).as_str())
+        );
+        assert_ne!(
+            after.cache_key, before,
+            "a new unreadable contribution invalidates"
+        );
+        let hidden = fixture.retrieve_with(
+            &["src/search.rs"],
+            Vec::new(),
+            Budget::default(),
+            &Hide(broken.as_str().to_string()),
+        );
+        assert!(
+            !gaps(&hidden)
+                .iter()
+                .any(|gap| gap.starts_with("contribution_unreadable")),
+            "{:?}",
+            gaps(&hidden)
+        );
+    }
+
+    fn retrieve_hooked(
+        fixture: &mut Fixture,
+        scope: &[&str],
+        after_load: &mut dyn FnMut(&mut CollaborationStore),
+        after_refresh: &mut dyn FnMut(&mut CollaborationStore),
+    ) -> Result<ContributionContext, ContextError> {
+        retrieve_with(
+            &mut fixture.store,
+            &ContextQuery {
+                scope: scope.iter().map(|path| path.as_bytes().to_vec()).collect(),
+                source: None,
+                analysis: Vec::new(),
+                budget: Budget::default(),
+            },
+            &LocalProject,
+            Hooks {
+                after_load,
+                after_refresh,
+            },
+        )
+    }
+
+    /// A re-brief racing the index refresh is never indexed with the old
+    /// brief's scope refs; one racing the read is a gap, not an error.
+    #[test]
+    fn a_racing_rebrief_never_wedges_or_mixes_briefs() {
+        let mut fixture = Fixture::new();
+        // Matches only through its brief's scope ref, and only once the new
+        // brief lands: indexed with the old brief's refs, it would never be
+        // found again.
+        let change = fixture.contribute(&[("docs/x.md", "v2\n")]);
+        attach_brief(&mut fixture.store, &change, &brief("lib", "old")).unwrap();
+        let id = change.clone();
+        retrieve_hooked(
+            &mut fixture,
+            &["src/search.rs"],
+            &mut |store| {
+                attach_brief(store, &id, &brief("src", "new")).unwrap();
+            },
+            &mut |_| {},
+        )
+        .unwrap();
+        assert_eq!(
+            fixture.retrieve(&["src/search.rs"]).contributions,
+            ids(std::slice::from_ref(&change)),
+            "the new brief's scope ref must be indexed"
+        );
+
+        // Indexed, then the attached brief changes under the read.
+        let other = fixture.contribute(&[("src/search.rs", "v2\n")]);
+        attach_brief(&mut fixture.store, &other, &brief("src", "kept")).unwrap();
+        fixture.retrieve(&["src/search.rs"]);
+        let id = other.clone();
+        let result = retrieve_hooked(&mut fixture, &["src/search.rs"], &mut |_| {}, &mut |store| {
+            store
+                .connection()
+                .execute(
+                    "UPDATE contribution_briefs SET brief_record_id = 'sha256:00' WHERE lineage_record_id = ?1",
+                    [id.as_str()],
+                )
+                .unwrap();
+        })
+        .unwrap();
+        assert!(!result.contributions.contains(&other.as_str().to_string()));
+        assert!(
+            gaps(&result).contains(&format!("contribution_unreadable:{}", other.as_str()).as_str())
+        );
+    }
+
+    /// Released, expired or rootless between the refresh and the read: not
+    /// returned as live.
+    #[test]
+    fn a_contribution_that_stops_being_live_mid_query_is_not_returned() {
+        for sql in [
+            "UPDATE retention_roots SET released_ms = 1 WHERE lineage_record_id = ?1",
+            "UPDATE retention_roots SET until_ms = 1 WHERE lineage_record_id = ?1",
+            "DELETE FROM retention_roots WHERE lineage_record_id = ?1",
+        ] {
+            let mut fixture = Fixture::new();
+            let change = fixture.contribute(&[("src/search.rs", "v2\n")]);
+            assert_eq!(fixture.retrieve(&["src/search.rs"]).contributions.len(), 1);
+            let id = change.clone();
+            let result = retrieve_hooked(
+                &mut fixture,
+                &["src/search.rs"],
+                &mut |_| {},
+                &mut |store| {
+                    store.connection().execute(sql, [id.as_str()]).unwrap();
+                },
+            )
+            .unwrap();
+            assert!(result.contributions.is_empty(), "{sql}");
+        }
+    }
+
+    #[test]
+    fn oversized_requests_and_budgets_are_refused_never_exceeded() {
+        let mut fixture = Fixture::new();
+        let code = |fixture: &mut Fixture,
+                    scope: Vec<Vec<u8>>,
+                    analysis: Vec<AnalysisEnvelope>,
+                    budget| {
+            retrieve(
+                &mut fixture.store,
+                &ContextQuery {
+                    scope,
+                    source: None,
+                    analysis,
+                    budget,
+                },
+                &LocalProject,
+            )
+            .unwrap_err()
+            .code()
+        };
+        let many: Vec<Vec<u8>> = (0..=MAX_SCOPE_PATHS)
+            .map(|n| format!("p{n}").into_bytes())
+            .collect();
+        assert_eq!(
+            code(&mut fixture, many, Vec::new(), Budget::default()),
+            "request_too_large"
+        );
+        let long = vec![vec![b'a'; MAX_SCOPE_PATH_BYTES + 1]];
+        assert_eq!(
+            code(&mut fixture, long, Vec::new(), Budget::default()),
+            "request_too_large"
+        );
+        let base = SourceSnapshotId::parse(&format!("sha256:{}", "ab".repeat(32))).unwrap();
+        let envelopes = vec![
+            envelope(
+                Operation::FindReferences,
+                Subject::Snapshot(base),
+                None,
+                &[],
+                Coverage::Partial,
+            );
+            MAX_ANALYSIS_ENVELOPES + 1
+        ];
+        assert_eq!(
+            code(
+                &mut fixture,
+                vec![b"a".to_vec()],
+                envelopes,
+                Budget::default()
+            ),
+            "request_too_large"
+        );
+        // Even the empty result is larger than the budget: refused.
+        let wide: Vec<Vec<u8>> = (0..MAX_SCOPE_PATHS)
+            .map(|n| format!("{n}/{}", "x".repeat(900)).into_bytes())
+            .collect();
+        let small = Budget {
+            max_bytes: 1024,
+            ..Budget::default()
+        };
+        assert_eq!(
+            code(&mut fixture, wide, Vec::new(), small),
+            "budget_too_small"
+        );
+    }
+
+    /// Reads per query are capped: candidates beyond the cap and related
+    /// paths beyond theirs are cut and named, and an unreadable
+    /// contribution is not re-read until a later capture.
+    #[test]
+    fn work_per_query_is_bounded_and_reported() {
+        let mut fixture = Fixture::new();
+        for n in 0..5 {
+            fixture.contribute(&[("src/search.rs", &format!("v{n}\n"))]);
+        }
+        let capped = fixture.retrieve(&["src/search.rs"]);
+        assert!(capped.selection.truncated_by.contains("candidates"));
+        assert!(gaps(&capped).contains(&"candidates_truncated"));
+        assert_eq!(capped.contributions.len(), candidate_limit());
+
+        let callers: Vec<String> = (0..MAX_RELATED_PATHS + 1)
+            .map(|n| format!("r/{n}"))
+            .collect();
+        let callers: Vec<&str> = callers.iter().map(String::as_str).collect();
+        let base = SourceSnapshotId::parse(&format!("sha256:{}", "ab".repeat(32))).unwrap();
+        let wide = ask(
+            &mut fixture,
+            &["src/search.rs"],
+            vec![envelope(
+                Operation::FindReferences,
+                Subject::Snapshot(base.clone()),
+                None,
+                &callers,
+                Coverage::CompleteWithinProfile,
+            )],
+            Some(&base),
+        );
+        assert!(wide.selection.truncated_by.contains("related_paths"));
+
+        let mut fixture = Fixture::new();
+        let broken = fixture.contribute(&[("docs/x.md", "v2\n")]);
+        let (path, bytes) = break_manifest(&fixture, &broken);
+        let gap = format!("contribution_unreadable:{}", broken.as_str());
+        assert!(gaps(&fixture.retrieve(&["docs/x.md"])).contains(&gap.as_str()));
+        // Repaired, but not re-read until the generation moves.
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(gaps(&fixture.retrieve(&["docs/x.md"])).contains(&gap.as_str()));
+        fixture.contribute(&[("README.md", "v2\n")]);
+        let repaired = fixture.retrieve(&["docs/x.md"]);
+        assert!(!gaps(&repaired).contains(&gap.as_str()));
+        assert_eq!(repaired.contributions, ids(&[broken]));
     }
 
     #[test]

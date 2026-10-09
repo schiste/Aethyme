@@ -63,6 +63,7 @@ fn query(case: &Value) -> SelectionQuery {
                         "unbound" => Binding::Unbound,
                         other => panic!("binding {other}"),
                     },
+                    scoped: item.get("scoped").and_then(Value::as_bool).unwrap_or(true),
                     related: Vec::new(),
                 })
                 .collect()
@@ -74,7 +75,11 @@ fn query(case: &Value) -> SelectionQuery {
     } else {
         assert!(related.is_empty(), "related paths need an analysis");
     }
+    let flag = |name: &str| q.get(name).and_then(Value::as_bool);
     SelectionQuery {
+        has_source: flag("has_source").unwrap_or(true),
+        related_truncated: flag("related_truncated").unwrap_or(false),
+        candidates_truncated: flag("candidates_truncated").unwrap_or(false),
         scope: strings(&q["scope"])
             .into_iter()
             .map(String::into_bytes)
@@ -132,7 +137,7 @@ fn selection_matches_the_reference() {
     let vectors: Value =
         serde_json::from_str(include_str!("fixtures/context_selection.json")).unwrap();
     let cases = vectors["cases"].as_array().unwrap();
-    assert!(cases.len() >= 15);
+    assert!(cases.len() >= 19);
     for case in cases {
         let name = case["name"].as_str().unwrap();
         let candidates = candidates(case);
@@ -169,7 +174,11 @@ fn selection_matches_the_reference() {
         let gaps: Vec<&str> = selection.gaps.iter().map(String::as_str).collect();
         assert_eq!(serde_json::json!(gaps), expected["gaps"], "{name}");
         assert_eq!(selection.coverage(), expected["coverage"], "{name}");
-        assert_eq!(selection.freshness(), expected["freshness"], "{name}");
+        assert_eq!(
+            selection.freshness().map_or(Value::Null, Value::from),
+            expected["freshness"],
+            "{name}"
+        );
         assert_eq!(selection.limits(), expected["limits"], "{name}");
         assert_eq!(
             selection.absence_is_evidence(),

@@ -1078,7 +1078,7 @@
                     "edge": "tests"
                   }
                 ],
-                "total": 3
+                "total": 2
               },
               {
                 "kind": "same_directory",
@@ -1106,7 +1106,7 @@
                     "edge": "importers"
                   }
                 ],
-                "total": 2
+                "total": 1
               },
               {
                 "kind": "same_directory",
@@ -1127,6 +1127,169 @@
         "freshness": "exact",
         "limits": "within_limits",
         "absence_is_evidence": true
+      }
+    },
+    {
+      "name": "no reader source: never exact or complete",
+      "query": {
+        "scope": [
+          "s/a"
+        ],
+        "budget": {
+          "max_items": 8,
+          "max_brief_tokens": 600,
+          "max_matched_paths": 8
+        },
+        "analysis": [
+          {
+            "status": "complete",
+            "binding": "bound"
+          }
+        ],
+        "has_source": false
+      },
+      "candidates": [],
+      "expected": {
+        "items": [],
+        "matched": 0,
+        "brief_tokens": 0,
+        "truncated_by": [],
+        "gaps": [
+          "no_reader_source"
+        ],
+        "coverage": "partial",
+        "freshness": null,
+        "limits": "within_limits",
+        "absence_is_evidence": false
+      }
+    },
+    {
+      "name": "an analysis not about the scope is a gap",
+      "query": {
+        "scope": [
+          "s/a"
+        ],
+        "budget": {
+          "max_items": 8,
+          "max_brief_tokens": 600,
+          "max_matched_paths": 8
+        },
+        "analysis": [
+          {
+            "status": "complete",
+            "binding": "bound",
+            "scoped": false
+          }
+        ]
+      },
+      "candidates": [],
+      "expected": {
+        "items": [],
+        "matched": 0,
+        "brief_tokens": 0,
+        "truncated_by": [],
+        "gaps": [
+          "analysis_not_scoped"
+        ],
+        "coverage": "partial",
+        "freshness": "exact",
+        "limits": "within_limits",
+        "absence_is_evidence": false
+      }
+    },
+    {
+      "name": "related paths cut by the read cap",
+      "query": {
+        "scope": [
+          "s/a"
+        ],
+        "budget": {
+          "max_items": 8,
+          "max_brief_tokens": 600,
+          "max_matched_paths": 8
+        },
+        "analysis": [
+          {
+            "status": "complete",
+            "binding": "bound"
+          }
+        ],
+        "related_truncated": true
+      },
+      "candidates": [
+        {
+          "id": "one",
+          "seq": 1,
+          "changed": [
+            "s/a"
+          ]
+        }
+      ],
+      "expected": {
+        "items": [
+          {
+            "id": "one",
+            "rank": 1,
+            "reasons": [
+              {
+                "kind": "path_overlap",
+                "values": [
+                  "s/a"
+                ],
+                "total": 1
+              }
+            ],
+            "brief_included": null
+          }
+        ],
+        "matched": 1,
+        "brief_tokens": 0,
+        "truncated_by": [
+          "related_paths"
+        ],
+        "gaps": [
+          "analysis_related_truncated"
+        ],
+        "coverage": "partial",
+        "freshness": "exact",
+        "limits": "truncated",
+        "absence_is_evidence": false
+      }
+    },
+    {
+      "name": "candidates cut by the read cap",
+      "query": {
+        "scope": [
+          "s/a"
+        ],
+        "budget": {
+          "max_items": 8,
+          "max_brief_tokens": 600,
+          "max_matched_paths": 8
+        },
+        "analysis": [
+          {
+            "status": "complete",
+            "binding": "bound"
+          }
+        ],
+        "candidates_truncated": true
+      },
+      "candidates": [],
+      "expected": {
+        "items": [],
+        "matched": 0,
+        "brief_tokens": 0,
+        "truncated_by": [
+          "candidates"
+        ],
+        "gaps": [
+          "candidates_truncated"
+        ],
+        "coverage": "partial",
+        "freshness": "exact",
+        "limits": "truncated",
+        "absence_is_evidence": false
       }
     }
   ]

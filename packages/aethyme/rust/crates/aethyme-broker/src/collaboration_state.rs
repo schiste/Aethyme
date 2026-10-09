@@ -127,8 +127,8 @@ const MIGRATIONS: &[(i64, &str)] = &[
         5,
         // Contribution context (#661). `contribution_briefs` is authority:
         // which brief explains a contribution (a revision replaces it).
-        // `context_postings` and `context_indexed` are derived from the
-        // archive and rebuildable at any time.
+        // `context_postings`, `context_indexed` and `context_unreadable`
+        // are derived from the archive and rebuildable at any time.
         "CREATE TABLE IF NOT EXISTS contribution_briefs (
              lineage_record_id TEXT PRIMARY KEY NOT NULL
                  REFERENCES retained_contributions (lineage_record_id),
@@ -146,6 +146,10 @@ const MIGRATIONS: &[(i64, &str)] = &[
          CREATE TABLE IF NOT EXISTS context_indexed (
              lineage_record_id TEXT PRIMARY KEY NOT NULL,
              brief_record_id TEXT
+         ) STRICT;
+         CREATE TABLE IF NOT EXISTS context_unreadable (
+             lineage_record_id TEXT PRIMARY KEY NOT NULL,
+             generation INTEGER NOT NULL
          ) STRICT;",
     ),
 ];
