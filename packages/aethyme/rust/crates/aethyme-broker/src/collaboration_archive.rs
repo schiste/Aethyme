@@ -126,7 +126,7 @@ impl CommitOid {
 }
 
 /// The SHA-256 naming one archive object.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ObjectDigest([u8; 32]);
 
 impl ObjectDigest {
@@ -303,15 +303,15 @@ fn is_lower_hex(text: &str, lengths: &[usize]) -> bool {
 
 // ---------------------------------------------------------------- objects
 
-fn objects_dir(store: &CollaborationStore) -> PathBuf {
+pub(crate) fn objects_dir(store: &CollaborationStore) -> PathBuf {
     store.project_dir().join("objects/sha256")
 }
 
-fn spool_dir(store: &CollaborationStore) -> PathBuf {
+pub(crate) fn spool_dir(store: &CollaborationStore) -> PathBuf {
     store.project_dir().join("spool/archive")
 }
 
-fn object_path(store: &CollaborationStore, digest: &ObjectDigest) -> PathBuf {
+pub(crate) fn object_path(store: &CollaborationStore, digest: &ObjectDigest) -> PathBuf {
     let hex = digest.hex();
     objects_dir(store).join(&hex[..2]).join(&hex[2..])
 }
@@ -391,10 +391,21 @@ fn publish(
             // A concurrent writer may not have flushed its entry yet; a
             // caller that records this object must not outrun it.
             sync_directory(fan_out)?;
+            // Reuse counts as a write for reclamation's grace period (#659):
+            // an unindexed object a capture is about to name must not look
+            // like an old orphan.
+            touch(&target)?;
         }
         Err(error) => return Err(io(&target, error.error)),
     }
     Ok(digest)
+}
+
+/// Set `path`'s modification time to now.
+fn touch(path: &Path) -> Result<(), ArchiveError> {
+    std::fs::File::open(path)
+        .and_then(|file| file.set_modified(std::time::SystemTime::now()))
+        .map_err(|source| io(path, source))
 }
 
 fn new_temporary(store: &CollaborationStore) -> Result<tempfile::NamedTempFile, ArchiveError> {
@@ -1011,6 +1022,25 @@ pub(crate) fn retain_snapshot_with(
         snapshot_record(&snapshot_id, entry_count, content_bytes, commit, format);
     let record_digest = put_object(store, &record_bytes)?;
 
+    // A snapshot that reclamation removed (#659) keeps its row for the
+    // contributions and receipts that name it; retaining it again points the
+    // row at this capture's record and clears the marker.
+    store.connection().execute(
+        "UPDATE retained_snapshots
+         SET record_id = ?2, record_sha256 = ?3, commit_oid = ?4
+         WHERE snapshot_id = ?1
+           AND snapshot_id IN (SELECT snapshot_id FROM reclaimed_snapshots)",
+        rusqlite::params![
+            snapshot_id.as_str(),
+            record_id.as_str(),
+            record_digest.hex(),
+            commit.as_str(),
+        ],
+    )?;
+    store.connection().execute(
+        "DELETE FROM reclaimed_snapshots WHERE snapshot_id = ?1",
+        [snapshot_id.as_str()],
+    )?;
     store.connection().execute(
         "INSERT OR IGNORE INTO retained_snapshots
              (snapshot_id, record_id, record_sha256, commit_oid, entry_count, content_bytes)
@@ -1174,6 +1204,10 @@ pub(crate) fn retain_contribution_with(
     );
     let digest = put_object(store, &bytes)?;
     store.connection().execute(
+        "DELETE FROM reclaimed_contributions WHERE lineage_record_id = ?1",
+        [lineage_record_id.as_str()],
+    )?;
+    store.connection().execute(
         "INSERT OR IGNORE INTO retained_contributions
              (lineage_record_id, record_sha256, base_snapshot, result_snapshot)
          VALUES (?1, ?2, ?3, ?4)",
@@ -1200,7 +1234,8 @@ pub fn retained(
         .read_connection()
         .query_row(
             "SELECT record_id, commit_oid, entry_count, content_bytes
-             FROM retained_snapshots WHERE snapshot_id = ?1",
+             FROM retained_snapshots WHERE snapshot_id = ?1
+               AND snapshot_id NOT IN (SELECT snapshot_id FROM reclaimed_snapshots)",
             [id.as_str()],
             |row| {
                 Ok((
@@ -1230,7 +1265,7 @@ pub fn retained(
 
 /// Parse a #652 manifest back into a snapshot. The caller has already
 /// checked that the bytes hash to the snapshot ID.
-fn parse_manifest(bytes: &[u8]) -> Option<SourceSnapshot> {
+pub(crate) fn parse_manifest(bytes: &[u8]) -> Option<SourceSnapshot> {
     use aethyme_contracts::experimental_v0::source_snapshot::MANIFEST_HEADER;
 
     let mut rest = bytes.strip_prefix(MANIFEST_HEADER)?;
@@ -1269,6 +1304,11 @@ pub fn reconstruct(
     id: &SourceSnapshotId,
     dest: &Path,
 ) -> Result<SourceSnapshot, ArchiveError> {
+    // Reclamation cannot remove anything while this read holds the archive.
+    let _use = crate::collaboration_gc::archive_use(store).map_err(|source| ArchiveError::Io {
+        path: crate::collaboration_gc::lock_path(store),
+        source,
+    })?;
     // Only a snapshot this archive retained: any object whose bytes happen
     // to parse as a manifest (a committed file, say) is not one.
     if retained(store, id)?.is_none() {

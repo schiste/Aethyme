@@ -37,7 +37,7 @@ use serde::Serialize;
 pub use crate::host_state::HostStateSource;
 
 /// The schema this binary writes.
-pub const COLLABORATION_STATE_SCHEMA_VERSION: i64 = 3;
+pub const COLLABORATION_STATE_SCHEMA_VERSION: i64 = 4;
 /// The oldest schema a database written by this binary can be read by.
 /// Unlike `host-operations.db`, a newer database stays readable by an older
 /// binary until a release raises this floor.
@@ -119,6 +119,59 @@ const MIGRATIONS: &[(i64, &str)] = &[
              payload_record_id TEXT NOT NULL,
              created_ms INTEGER NOT NULL,
              delivered_ms INTEGER
+         ) STRICT;",
+    ),
+    (
+        4,
+        // Reclamation (#659). Reader leases and object pins are roots beside
+        // retention roots. A reclaimed snapshot or contribution keeps its
+        // index row (receipts name it) and gets a marker instead. A
+        // generation journals one apply so an interrupted one resumes.
+        "CREATE TABLE IF NOT EXISTS reader_leases (
+             lease_id INTEGER PRIMARY KEY,
+             target_kind TEXT NOT NULL CHECK (target_kind IN ('snapshot', 'contribution')),
+             target TEXT NOT NULL,
+             holder TEXT NOT NULL,
+             until_ms INTEGER NOT NULL,
+             created_ms INTEGER NOT NULL,
+             released_ms INTEGER
+         ) STRICT;
+         CREATE TABLE IF NOT EXISTS object_pins (
+             pin_id INTEGER PRIMARY KEY,
+             class TEXT NOT NULL CHECK (class IN ('analysis_view', 'cited_evidence')),
+             object_sha256 TEXT NOT NULL,
+             holder TEXT NOT NULL,
+             until_ms INTEGER,
+             created_ms INTEGER NOT NULL,
+             released_ms INTEGER
+         ) STRICT;
+         CREATE TABLE IF NOT EXISTS reclaimed_snapshots (
+             snapshot_id TEXT PRIMARY KEY NOT NULL,
+             generation INTEGER NOT NULL,
+             reclaimed_ms INTEGER NOT NULL
+         ) STRICT;
+         CREATE TABLE IF NOT EXISTS reclaimed_contributions (
+             lineage_record_id TEXT PRIMARY KEY NOT NULL,
+             generation INTEGER NOT NULL,
+             reclaimed_ms INTEGER NOT NULL
+         ) STRICT;
+         CREATE TABLE IF NOT EXISTS gc_plans (
+             digest TEXT PRIMARY KEY NOT NULL,
+             body TEXT NOT NULL,
+             created_ms INTEGER NOT NULL
+         ) STRICT;
+         CREATE TABLE IF NOT EXISTS gc_generations (
+             generation INTEGER PRIMARY KEY,
+             plan_digest TEXT NOT NULL,
+             state TEXT NOT NULL CHECK (state IN ('trashing', 'trashed', 'done')),
+             started_ms INTEGER NOT NULL,
+             finished_ms INTEGER
+         ) STRICT;
+         CREATE TABLE IF NOT EXISTS gc_trash (
+             generation INTEGER NOT NULL REFERENCES gc_generations (generation),
+             relpath TEXT NOT NULL,
+             bytes INTEGER NOT NULL,
+             PRIMARY KEY (generation, relpath)
          ) STRICT;",
     ),
 ];

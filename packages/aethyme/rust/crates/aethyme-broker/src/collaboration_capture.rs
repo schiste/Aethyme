@@ -386,7 +386,7 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-fn locks_dir(store: &CollaborationStore) -> PathBuf {
+pub(crate) fn locks_dir(store: &CollaborationStore) -> PathBuf {
     store.project_dir().join("spool/capture")
 }
 
@@ -417,6 +417,16 @@ fn lock_operation(
     } else {
         ExclusiveFileLock::try_acquire(file).map_err(io)
     }
+}
+
+/// Hold the archive shared (see `collaboration_gc`).
+fn archive_use(
+    store: &CollaborationStore,
+) -> Result<crate::collaboration_gc::ArchiveUse, CaptureError> {
+    crate::collaboration_gc::archive_use(store).map_err(|source| CaptureError::Io {
+        path: crate::collaboration_gc::lock_path(store),
+        source,
+    })
 }
 
 struct OperationRow {
@@ -932,6 +942,9 @@ pub(crate) fn capture_with(
     request: &CaptureRequest,
     hooks: &Hooks,
 ) -> Result<CaptureOutcome, CaptureError> {
+    // Shared with every other capture and reader; reclamation (#659) waits
+    // for all of them. Taken before the operation lock, always.
+    let _use = archive_use(store)?;
     let _lock = lock_operation(store, &request.operation_id, true)?;
     let Some(row) = begin(store, request, hooks)? else {
         unreachable!("begin returns the operation it recorded");
@@ -1030,6 +1043,7 @@ fn store_spool_hint() -> PathBuf {
 /// committed, because its source is already retained; `committed` and the
 /// terminal states are left alone.
 pub fn recover(store: &mut CollaborationStore) -> Result<Vec<Recovery>, CaptureError> {
+    let _use = archive_use(store)?;
     let pending: Vec<(String, String, String)> = store
         .connection()
         .prepare(
