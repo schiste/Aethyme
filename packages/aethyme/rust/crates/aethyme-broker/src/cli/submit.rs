@@ -503,6 +503,33 @@ pub(super) fn run_submit(parsed: Parsed) -> Result<(), UsageError> {
             );
         }
     }
+    // Opt-in collaboration capture (#660). Off unless `[collaboration]`
+    // asks for it, and then the legacy submit below is unchanged.
+    let capture = crate::collaboration_submit::SubmitCapture::prepare(&mut broker, session);
+    let mut capture_report = None;
+    if let Some(capture) = capture.as_ref().filter(|capture| capture.required()) {
+        let report = capture.run(broker.main_root());
+        if !report.acknowledged() {
+            if parsed.json {
+                out!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "submitted": false,
+                        "collaboration_capture": report,
+                    }))?
+                );
+            } else {
+                eprintln!("✗ {}", report.summary());
+            }
+            return Err(UsageError::Exit {
+                message: "required collaboration capture was not acknowledged; nothing was \
+                          submitted"
+                    .into(),
+                code: crate::exit_status::REFUSED,
+            });
+        }
+        capture_report = Some(report);
+    }
     let outcome = broker.submit_with_intent(
         session,
         if parsed.no_cache {
@@ -516,8 +543,26 @@ pub(super) fn run_submit(parsed: Parsed) -> Result<(), UsageError> {
             crate::PromotionIntent::Configured
         },
     )?;
+    // Advisory capture runs after the legacy verdict and cannot change it.
+    if let Some(capture) = capture.as_ref().filter(|capture| !capture.required()) {
+        capture_report = Some(capture.run(broker.main_root()));
+    }
+    if !parsed.json
+        && let Some(report) = &capture_report
+    {
+        out!("{}", report.summary());
+    }
     if parsed.json {
-        out!("{}", serde_json::to_string_pretty(&outcome)?);
+        match &capture_report {
+            None => out!("{}", serde_json::to_string_pretty(&outcome)?),
+            Some(report) => out!(
+                "{}",
+                serde_json::to_string_pretty(&crate::collaboration_submit::WithCapture {
+                    outcome: &outcome,
+                    collaboration_capture: report,
+                })?
+            ),
+        }
     } else if !outcome.conflicts.is_empty() {
         eprintln!("✗ conflict — rejected before any gate ran. Conflicting files:");
         for conflict in &outcome.conflict_details {

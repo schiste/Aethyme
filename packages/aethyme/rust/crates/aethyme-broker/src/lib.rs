@@ -37,6 +37,7 @@ mod clock;
 pub mod collaboration_archive;
 pub mod collaboration_capture;
 pub mod collaboration_state;
+pub mod collaboration_submit;
 mod disk_headroom;
 mod duplicate_work;
 pub mod exit_status;

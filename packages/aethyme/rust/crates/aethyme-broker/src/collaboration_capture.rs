@@ -135,7 +135,7 @@ pub enum CapturePolicy {
 }
 
 impl CapturePolicy {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Advisory => "advisory",
             Self::Required => "required",
@@ -164,7 +164,7 @@ impl RetentionBoundary {
         value.map_or(Self::UntilReleased, Self::UntilMs)
     }
 
-    fn describe(self) -> String {
+    pub(crate) fn describe(self) -> String {
         match self {
             Self::UntilReleased => "until_released".into(),
             Self::UntilMs(ms) => format!("until_ms:{ms}"),
