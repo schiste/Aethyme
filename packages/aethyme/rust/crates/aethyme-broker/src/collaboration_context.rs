@@ -1603,7 +1603,7 @@ mod tests {
         // Indexed while live, so its postings must be dropped on release.
         assert_eq!(
             fixture.retrieve(&["src/search.rs"]).contributions,
-            ids(&[released.clone()])
+            ids(std::slice::from_ref(&released))
         );
         let broken = fixture.contribute(&[("src/search.rs", "v3\n")]);
         let kept = fixture.contribute(&[("src/search.rs", "v4\n")]);
