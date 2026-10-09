@@ -37,10 +37,10 @@ Explicit release: `release_retention(operation)` releases an operation's contrib
 root. A lease is refused (`not_retained`) unless its target is retained now, so a lease
 never resurrects reclaimed source. A pin is refused unless the object is present.
 
-### Grace
+### Grace and the clock
 
 An unrooted item becomes reclaimable once its newest object is older than the grace
-period (default 24 h, `GcOptions::grace_ms`).
+period.
 - **Index entries** (snapshots, contributions) are judged as a unit, by their own
   record and manifest. A young entry keeps everything it names.
 - **Unindexed objects** (the leftovers of a failed capture) are judged by their own
@@ -49,10 +49,30 @@ period (default 24 h, `GcOptions::grace_ms`).
   refreshes its time, so an old orphan that a capture is about to name is inside the
   grace period again.
 
-The lock files of ended operations, and abandoned archive temporaries past grace, are
-reclaimable too. Anything under `objects/` or `spool/archive/` that is not an archive
-object or temporary is reported under `unknown` and never removed. A file whose bytes do
-not hash to its name is skipped at apply (`corrupt_object`).
+**Grace and plan lifetime are coupled.** Grace (`GcOptions::grace_ms`, default 24 h)
+must be at least the plan lifetime (`PLAN_TTL_MS`, 24 h); anything shorter is refused
+(`invalid_grace`). Otherwise an object a plan named could be reused by a new index entry
+after the plan and still look old when the plan is applied. As a second guard, apply
+skips (`named_by_index`) any object that an index entry names unless that entry is marked
+reclaimed in the same generation.
+
+**The real clock only.** There is no option to judge expiry or grace "later": a future
+time would reclaim live `until` roots, leases and pins early.
+
+**Unrecognised content.**
+- Anything under `objects/` or `spool/archive/` that is not an archive object or
+  temporary is reported under `unknown` and never removed.
+- A symlinked or non-directory component anywhere on those paths, or on `spool/capture/`,
+  is also reported as unknown. It is never followed, so reclamation never lists or moves
+  files outside the store. Integrity checks and pins never hash through a link either.
+- A file whose bytes do not hash to its name is skipped at apply (`corrupt_object`).
+
+**Lock files.** The lock file of an ended operation is reclaimable only when no retry
+can resume that operation (`committed`, `acknowledged`, `refused` or `aborted`). Lock
+files of `failed` or `incomplete` operations, which are retryable, are kept. Apply
+unlinks a lock file only while holding its flock, and re-checks the operation's state
+under it; a held lock is skipped (`lock_held`). Abandoned archive temporaries past grace
+are reclaimable too.
 
 ### Plan and apply
 
@@ -74,11 +94,19 @@ not hash to its name is skipped at apply (`corrupt_object`).
   else is reported as skipped (`no_longer_eligible`, `changed_since_plan`,
   `corrupt_object`), never removed.
 - **Refusals:** an unknown plan (`unknown_plan`) and one older than a day (`stale_plan`).
+- **How long the archive is held.** Apply holds the exclusive lock while it does three
+  things: re-surveys the store, streams each planned object through SHA-256 to check it
+  (nothing is read whole), and moves files. One generation removes at most
+  `MAX_ITEMS_PER_GENERATION` (10,000) files; the rest are skipped as
+  `deferred_to_next_generation` for the next plan. Captures and readers wait, they do not
+  fail, while it runs.
 
 ### No race between insertion and removal
 
 Every archive user holds `spool/gc.lock` shared: capture (taken before its operation lock),
-recovery, `reconstruct`, `acquire_lease` and `pin_object`. Apply holds it exclusively, so
+recovery, `reconstruct`, `acquire_lease` and `pin_object`. The archive's writers
+(`put_object`, the retain functions) are crate-private, and only capture calls them in
+production, so nothing writes the archive without the lock. Apply holds it exclusively, so
 for the whole apply nobody can name an object, find one "already present" or read one. A
 capture that arrives during an apply waits, then writes any object the apply removed
 afresh (tested).
@@ -95,8 +123,24 @@ Index rows of reclaimed snapshots and contributions stay, because receipts name 
 marker excludes them from `retained()`, `reconstruct` and leases. Retaining the same
 content again clears the marker and re-points the snapshot row at the new record.
 
+A receipt answered again (a retried capture, or `receipt()`) reports its current
+standing:
+- `retained_local` while its contribution root is live;
+- `released` once that root is released or past its boundary;
+- `reclaimed` once reclamation marked its contribution or snapshots.
+
+It never claims `retained_local` for source that no longer has a root.
+
+**Compatibility.** Reclamation raised the store's compatibility floor to 4 (see
+`local-v3-l2-state.md`). A schema 3 binary would capture without the archive lock, the
+reuse refresh or clearing markers.
+
 **`resume`** finishes an interrupted generation:
 - It puts every moved file back first, then judges each one as if nothing had moved.
+- When a later capture wrote a file again, so both copies exist, resume hashes both and
+  keeps the one that matches its name. A copy that does not match is set aside as
+  `<name>.corrupt-<generation>-<original|trashed>`, never deleted.
+- Before re-trashing anything it makes apply's integrity check again.
 - A file that something now relies on stays: for example, content captured again while
   the generation was interrupted (tested).
 - Everything else is removed.
@@ -133,3 +177,9 @@ Only this module reclaims collaboration data. Legacy broker cleanup cannot reach
 | Concurrent reader | Apply refuses while the archive is held. `reconstruct` waits for an apply. |
 | Insertion racing GC | A capture that arrives during an apply waits, then retains its source in full. |
 | Unknown and young | Unrecognised files and young orphans are protected; a misnamed object is skipped. |
+| Coupled grace | A grace shorter than a plan's lifetime is refused. An index entry created after the plan keeps the object it reused. |
+| Symlinks | A symlinked `objects/sha256`, fan-out directory or `spool/archive` is reported and never followed; files outside the store survive. A pin never hashes through a link. |
+| Resume copies | A corrupt original written during the interruption is set aside, and the good trashed copy is restored for the receipt that relies on it. |
+| Receipt standing | A retried capture reports `retained_local`, then `released`, then `reclaimed`. |
+| Lock files | A lock GC cannot take is skipped; a retryable operation's lock is never planned. |
+| Floor | New and migrated stores have floor 4. |
