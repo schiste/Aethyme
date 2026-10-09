@@ -713,6 +713,15 @@ pub struct GateEnvironment {
     pub free_disk_bytes_end: Option<i64>,
 }
 
+/// What a reusable gate verdict proves about the environment that produced it.
+/// A missing digest means profile capture was incomplete, so the run cannot be
+/// reused by the execution-profile cache.
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+pub struct GateCacheProvenance {
+    pub execution_profile_digest: Option<String>,
+    pub profile_scope: String,
+}
+
 /// Input for recording one gate run.
 #[derive(Debug, Clone)]
 pub struct NewGateResult {

@@ -33,7 +33,7 @@ use rusqlite::Connection;
 use crate::error::BrokerError;
 
 /// Current database schema version (== `MIGRATIONS.len()`).
-pub const SCHEMA_VERSION: i64 = 49;
+pub const SCHEMA_VERSION: i64 = 50;
 
 /// The oldest schema version whose binaries can safely use a database at
 /// [`SCHEMA_VERSION`]. Before this existed every newer database locked out
@@ -65,7 +65,10 @@ pub const SCHEMA_VERSION: i64 = 49;
 /// - v49: adds nullable local operation provenance. A v48 writer names its
 ///   existing columns and can continue writing; a v48 reader safely ignores
 ///   the additional field.
-pub const MIN_COMPATIBLE_SCHEMA: i64 = 47;
+/// - v50: gate verdict reuse is now bound to an execution profile. Older
+///   readers query only the tree and gate definition, so allowing them to read
+///   v50 would let them reuse a verdict without checking its profile.
+pub const MIN_COMPATIBLE_SCHEMA: i64 = 50;
 
 /// Whether this binary may use a database at `found`, a version newer than
 /// its own, because every migration past [`SCHEMA_VERSION`] was declared
@@ -1620,6 +1623,12 @@ const MIGRATION_V49: &str = "
 -- older compatible writers may continue to create history rows.
 ALTER TABLE coordinated_operations ADD COLUMN agent_provenance_json TEXT;
 ";
+const MIGRATION_V50: &str = "
+-- A NULL profile means the producing run's environment was not fingerprinted
+-- (legacy rows and runs where profile capture was incomplete). Such rows are
+-- never reusable by the execution-profile cache.
+ALTER TABLE gate_results ADD COLUMN execution_profile_hash TEXT;
+";
 
 const MIGRATIONS: &[&str] = &[
     MIGRATION_V1,
@@ -1671,13 +1680,16 @@ const MIGRATIONS: &[&str] = &[
     MIGRATION_V47,
     MIGRATION_V48,
     MIGRATION_V49,
+    MIGRATION_V50,
 ];
 
 /// Migrations that only add columns. One is skipped when every column it adds
 /// already exists, which a build from an unmerged branch may have done under
 /// the same version number (see the module docs).
-const COLUMN_ONLY_MIGRATIONS: &[(i64, &[(&str, &str)])] =
-    &[(49, &[("coordinated_operations", "agent_provenance_json")])];
+const COLUMN_ONLY_MIGRATIONS: &[(i64, &[(&str, &str)])] = &[
+    (49, &[("coordinated_operations", "agent_provenance_json")]),
+    (50, &[("gate_results", "execution_profile_hash")]),
+];
 
 /// Migrations whose tables the repair pass re-creates, with `IF NOT EXISTS`,
 /// when a database records the version but lacks one of the tables.
@@ -1983,9 +1995,9 @@ mod tests {
          VALUES (?1, 'tree', 'def', 'pass', NULL, 0, 1200, NULL, NULL, ?2, 0, 5, 10)";
 
     #[test]
-    fn v47_minimum_compatible_schema_is_committed_atomically() {
-        let conn = migrated_through(46);
-        set_meta(&conn, "min_compatible_schema", 42);
+    fn v50_minimum_compatible_schema_is_committed_atomically() {
+        let conn = migrated_through(49);
+        set_meta(&conn, "min_compatible_schema", 47);
         conn.execute_batch(
             "CREATE TRIGGER refuse_min_compatible_raise
              BEFORE UPDATE OF value ON meta
@@ -2001,7 +2013,7 @@ mod tests {
             migrate(&conn).is_err(),
             "the injected floor write must fail"
         );
-        assert_eq!(current_version(&conn).unwrap(), 46);
+        assert_eq!(current_version(&conn).unwrap(), 49);
         let minimum: String = conn
             .query_row(
                 "SELECT value FROM meta WHERE key = 'min_compatible_schema'",
@@ -2009,7 +2021,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(minimum, "42");
+        assert_eq!(minimum, "47");
         let columns = conn
             .prepare("PRAGMA table_info(gate_results)")
             .unwrap()
@@ -2017,7 +2029,11 @@ mod tests {
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
-        assert!(!columns.iter().any(|column| column == "cleared_at"));
+        assert!(
+            !columns
+                .iter()
+                .any(|column| column == "execution_profile_hash")
+        );
     }
 
     #[test]
@@ -2228,14 +2244,13 @@ mod tests {
     }
 
     #[test]
-    fn v47_requires_a_v47_reader_to_preserve_cleared_gate_history() {
-        // v48 is additive (#606), so the floor stays at the v47 reader.
-        assert_eq!(MIN_COMPATIBLE_SCHEMA, 47);
+    fn v50_requires_a_v50_reader_for_profiled_gate_cache_semantics() {
+        assert_eq!(MIN_COMPATIBLE_SCHEMA, 50);
 
         let conn = migrated();
         assert_eq!(current_version(&conn).unwrap(), SCHEMA_VERSION);
-        assert!(schema_is_compatible_with(&conn, SCHEMA_VERSION, 47).unwrap());
-        assert!(!schema_is_compatible_with(&conn, SCHEMA_VERSION, 46).unwrap());
+        assert!(schema_is_compatible_with(&conn, SCHEMA_VERSION, 50).unwrap());
+        assert!(!schema_is_compatible_with(&conn, SCHEMA_VERSION, 49).unwrap());
         assert!(!schema_is_compatible_with(&conn, SCHEMA_VERSION, 42).unwrap());
     }
 
@@ -2279,18 +2294,13 @@ mod tests {
                 "repository_watches_due",
             ]
         );
-        assert_eq!(MIN_COMPATIBLE_SCHEMA, 47);
         assert!(schema_is_compatible_with(&conn, 48, 47).unwrap());
     }
 
     #[test]
-    fn v49_adds_agent_provenance_without_raising_the_compatibility_floor() {
-        assert_eq!(SCHEMA_VERSION, 49);
-        assert_eq!(MIN_COMPATIBLE_SCHEMA, 47);
-
-        let conn = migrated_through(48);
-        assert_eq!(current_version(&conn).unwrap(), 48);
-        migrate(&conn).unwrap();
+    fn v49_adds_agent_provenance_without_changing_its_historical_floor() {
+        let conn = migrated_through(49);
+        set_meta(&conn, "min_compatible_schema", 47);
         assert_eq!(current_version(&conn).unwrap(), 49);
         assert!(schema_is_compatible_with(&conn, 49, 47).unwrap());
         assert!(!schema_is_compatible_with(&conn, 49, 46).unwrap());
@@ -2305,11 +2315,51 @@ mod tests {
             .unwrap();
         assert_eq!(nullable, 0);
 
-        // A v47 database, the compatibility floor, migrates straight through.
+        // A v47 database, the compatibility floor before v50, migrates
+        // through v49 without changing that migration's own compatibility.
         let from_v47 = migrated_through(47);
-        migrate(&from_v47).unwrap();
+        set_meta(&from_v47, "min_compatible_schema", 47);
+        for (index, migration) in MIGRATIONS.iter().enumerate().skip(47).take(2) {
+            from_v47.execute_batch(migration).unwrap();
+            set_meta(&from_v47, "schema_version", (index + 1) as i64);
+        }
         assert_eq!(current_version(&from_v47).unwrap(), 49);
         assert!(schema_is_compatible_with(&from_v47, 49, 47).unwrap());
+    }
+
+    #[test]
+    fn v50_adds_nullable_gate_profiles_and_fences_older_cache_readers() {
+        let conn = migrated_through(49);
+        set_meta(&conn, "min_compatible_schema", 47);
+        conn.execute(
+            "INSERT INTO gate_results (gate_name, tree_hash, definition_hash, status, created_at)
+             VALUES ('unit', 'tree', 'definition', 'pass', 1)",
+            [],
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+        assert_eq!(current_version(&conn).unwrap(), 50);
+        assert!(schema_is_compatible_with(&conn, 50, 50).unwrap());
+        assert!(!schema_is_compatible_with(&conn, 50, 49).unwrap());
+
+        let nullable: i64 = conn
+            .query_row(
+                r#"SELECT "notnull" FROM pragma_table_info('gate_results')
+                   WHERE name = 'execution_profile_hash'"#,
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(nullable, 0);
+        let legacy_profile: Option<String> = conn
+            .query_row(
+                "SELECT execution_profile_hash FROM gate_results WHERE gate_name = 'unit'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(legacy_profile, None);
     }
 
     #[test]

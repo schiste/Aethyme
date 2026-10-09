@@ -560,8 +560,12 @@ own; `update-ref` does not.
 
 ## Choose Gate Cache Policy Deliberately
 
-Gate results prove an exact Git tree. Normal gate runs use the cache when the
-same gate has already passed or failed for that tree:
+Gate results prove an exact Git tree under one gate definition and execution
+profile. Normal gate runs reuse a conclusive result only when all four match:
+gate name, Git tree, gate definition, and the execution-profile digest stored
+with the producing run. Rows predating profile capture have no digest and are
+not reusable. If profile capture times out or otherwise fails, that run still
+executes but cannot satisfy a later cache lookup.
 
 ```bash
 aethyme broker advanced gates run --session 111
@@ -570,10 +574,10 @@ aethyme broker advanced gates run --session 111 --json
 
 Run this session-scoped command after the final commit instead of invoking the
 same test suite directly. If integration does not move and normalized
-submission produces the identical tree, `broker submit` reuses that proof and
-does not execute the expensive gate a second time. If either tree or the full
-gate definition differs, submit runs it normally; cache reuse never weakens the
-landing check.
+submission produces the identical tree with the same gate definition and
+execution profile, `broker submit` reuses that proof and does not execute the
+expensive gate a second time. If any cache-key component differs, submit runs
+the gate normally; cache reuse never weakens the landing check.
 
 Text output shows an abbreviated 12-character tree hash. JSON returns the full
 hash in `tree_hash` and identifies whether the result was executed or cached.
@@ -584,7 +588,18 @@ output content in telemetry. They also record the machine they ran on:
 `free_disk_bytes_start`, so a slow run can be told apart from a loaded
 machine. Cached results preserve the original execution's
 startup/output measurements, report zero new wait, and report `null`
-machine-environment fields. Use these fields to tell
+machine-environment fields. A cache hit keeps the producer's `run_id`, so the
+reused verdict names the stored run that earned it. The optional
+`cache_provenance.execution_profile_digest` and `profile_scope` describe the
+profile used for a cacheable result; a null digest means profile capture was
+incomplete and that run is not reusable. Profile v1 hashes OS/architecture,
+the effective `PATH`, selected Cargo/Rust/compiler/Python/locale variables,
+and reported versions of common toolchains. It excludes arbitrary environment
+variables, ignored or generated inputs (including virtualenv contents),
+managed-cache contents, per-run broker variables and resource allocations,
+executable bytes beyond reported versions, and OS library state. The database
+compatibility floor is v50 because older readers would ignore the profile and
+could reuse a result without checking it. Use these fields to tell
 resource contention from slow startup and slow test execution. Before acting
 on any result, compare its tree with the tree you intend to submit.
 

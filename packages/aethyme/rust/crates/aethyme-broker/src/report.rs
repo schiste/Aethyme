@@ -763,8 +763,13 @@ fn gate_observation_from_event(event: &crate::Event) -> Option<(GateRunOutcome, 
     Some((
         GateRunOutcome {
             gate,
+            run_id: payload.get("run_id").and_then(serde_json::Value::as_i64),
             tree_hash,
             definition_hash: String::new(),
+            cache_provenance: payload
+                .get("cache_provenance")
+                .cloned()
+                .and_then(|value| serde_json::from_value(value).ok()),
             resource_lease: None,
             managed_cache: None,
             broker_database: None,
@@ -1451,8 +1456,10 @@ mod tests {
     fn gate() -> GateRunOutcome {
         GateRunOutcome {
             gate: "cargo-test".into(),
+            run_id: None,
             tree_hash: "fedcba9876543210".into(),
             definition_hash: "test-definition".into(),
+            cache_provenance: None,
             resource_lease: None,
             managed_cache: None,
             broker_database: None,
@@ -1626,8 +1633,10 @@ mod tests {
         };
         let second_gate = GateRunOutcome {
             gate: "lint".into(),
+            run_id: None,
             tree_hash: "aaaaaaaaaaaaaaaa".into(),
             definition_hash: "lint-definition".into(),
+            cache_provenance: None,
             resource_lease: None,
             managed_cache: None,
             broker_database: None,
@@ -1799,6 +1808,11 @@ mod tests {
                     42,
                     GateStatus::Pass,
                     None,
+                    7,
+                    &crate::GateCacheProvenance {
+                        execution_profile_digest: Some("sha256:profile".into()),
+                        profile_scope: "fixture profile scope".into(),
+                    },
                 )),
             )
             .unwrap();

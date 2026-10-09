@@ -1640,6 +1640,11 @@ fn finish_closes_promoted_session_and_suggests_cleanup_when_integration_contains
                 12,
                 GateStatus::Pass,
                 None,
+                55,
+                &aethyme_broker::GateCacheProvenance {
+                    execution_profile_digest: Some("sha256:profile".into()),
+                    profile_scope: "fixture profile scope".into(),
+                },
             )),
         )
         .unwrap();

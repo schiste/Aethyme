@@ -2170,8 +2170,10 @@ mod verdict_tests {
     ) -> GateRunOutcome {
         GateRunOutcome {
             gate: "g".into(),
+            run_id: None,
             tree_hash: "t".into(),
             definition_hash: "d".into(),
+            cache_provenance: None,
             resource_lease: None,
             managed_cache: None,
             broker_database: None,
