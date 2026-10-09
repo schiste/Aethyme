@@ -565,7 +565,9 @@ profile. Normal gate runs reuse a conclusive result only when all four match:
 gate name, Git tree, gate definition, and the execution-profile digest stored
 with the producing run. Rows predating profile capture have no digest and are
 not reusable. If profile capture times out or otherwise fails, that run still
-executes but cannot satisfy a later cache lookup.
+executes but cannot satisfy a later cache lookup. Its timeout does not classify
+a later run as a repeated timeout either, because environment equivalence was
+not established.
 
 ```bash
 aethyme broker advanced gates run --session 111
