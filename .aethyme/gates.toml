@@ -52,8 +52,10 @@
 # it is verifying rather than the main checkout's. The venv is gitignored,
 # so it does not change the tree hash the result cache keys on. Creating
 # it costs ~2s once per worktree; every run after that reuses it.
+# Pin pytest because its version affects evaluation behavior. The command is
+# part of this gate's definition hash, so changing the pin invalidates verdicts.
 name = "pytest-aethyme-eval"
-command = 'export CHAU7_CTO_OPTIM_ACTIVE=1 && cd packages/aethyme-eval && { [ -x .venv/bin/python ] || { python3 -m venv .venv && .venv/bin/python -m pip install --quiet --disable-pip-version-check pytest; }; } && PYTHONPATH=src .venv/bin/python -m pytest -q tests'
+command = 'export CHAU7_CTO_OPTIM_ACTIVE=1 && cd packages/aethyme-eval && { [ -x .venv/bin/python ] || { python3 -m venv .venv && .venv/bin/python -m pip install --quiet --disable-pip-version-check pytest==9.1.1; }; } && PYTHONPATH=src .venv/bin/python -m pytest -q tests'
 cost = 1
 timeout_seconds = 300
 triggers = ["packages/aethyme-eval/**"]
