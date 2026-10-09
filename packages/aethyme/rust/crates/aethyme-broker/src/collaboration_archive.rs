@@ -1230,7 +1230,7 @@ pub fn retained(
 
 /// Parse a #652 manifest back into a snapshot. The caller has already
 /// checked that the bytes hash to the snapshot ID.
-fn parse_manifest(bytes: &[u8]) -> Option<SourceSnapshot> {
+pub(crate) fn parse_manifest(bytes: &[u8]) -> Option<SourceSnapshot> {
     use aethyme_contracts::experimental_v0::source_snapshot::MANIFEST_HEADER;
 
     let mut rest = bytes.strip_prefix(MANIFEST_HEADER)?;

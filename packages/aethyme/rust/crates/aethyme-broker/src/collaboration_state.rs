@@ -37,7 +37,7 @@ use serde::Serialize;
 pub use crate::host_state::HostStateSource;
 
 /// The schema this binary writes.
-pub const COLLABORATION_STATE_SCHEMA_VERSION: i64 = 3;
+pub const COLLABORATION_STATE_SCHEMA_VERSION: i64 = 5;
 /// The oldest schema a database written by this binary can be read by.
 /// Unlike `host-operations.db`, a newer database stays readable by an older
 /// binary until a release raises this floor.
@@ -119,6 +119,33 @@ const MIGRATIONS: &[(i64, &str)] = &[
              payload_record_id TEXT NOT NULL,
              created_ms INTEGER NOT NULL,
              delivered_ms INTEGER
+         ) STRICT;",
+    ),
+    // Version 4 is reserved for reclamation (#659), developed in parallel;
+    // this step depends on nothing it adds.
+    (
+        5,
+        // Contribution context (#661). `contribution_briefs` is authority:
+        // which brief explains a contribution (a revision replaces it).
+        // `context_postings` and `context_indexed` are derived from the
+        // archive and rebuildable at any time.
+        "CREATE TABLE IF NOT EXISTS contribution_briefs (
+             lineage_record_id TEXT PRIMARY KEY NOT NULL
+                 REFERENCES retained_contributions (lineage_record_id),
+             brief_record_id TEXT NOT NULL,
+             brief_sha256 TEXT NOT NULL,
+             attached_ms INTEGER NOT NULL
+         ) STRICT;
+         CREATE TABLE IF NOT EXISTS context_postings (
+             key BLOB NOT NULL,
+             lineage_record_id TEXT NOT NULL,
+             PRIMARY KEY (key, lineage_record_id)
+         ) STRICT;
+         CREATE INDEX IF NOT EXISTS context_postings_by_contribution
+             ON context_postings (lineage_record_id);
+         CREATE TABLE IF NOT EXISTS context_indexed (
+             lineage_record_id TEXT PRIMARY KEY NOT NULL,
+             brief_record_id TEXT
          ) STRICT;",
     ),
 ];
