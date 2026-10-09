@@ -495,14 +495,39 @@ impl BrokerStore {
         Ok(entry)
     }
 
-    /// Transition a queue entry; emits `merge.<status>` in the same
-    /// transaction and stores updated details/merged tree when given.
+    /// Transition a queue entry; emits the merge status event in the same
+    /// transaction and stores updated details/merged tree when given. A
+    /// generic transition clears any candidate from an earlier simulation.
     pub fn set_merge_status(
         &mut self,
         entry_id: i64,
         status: MergeStatus,
         merged_tree: Option<&str>,
         details_json: Option<&str>,
+    ) -> Result<(), BrokerError> {
+        self.set_merge_status_inner(entry_id, status, merged_tree, details_json, None)
+    }
+
+    /// Record the candidate and its verdict atomically, while keeping the
+    /// legacy details projection unchanged for existing readers.
+    pub(crate) fn set_merge_status_with_candidate(
+        &mut self,
+        entry_id: i64,
+        status: MergeStatus,
+        merged_tree: Option<&str>,
+        details_json: Option<&str>,
+        candidate: &crate::types::VerificationCandidate,
+    ) -> Result<(), BrokerError> {
+        self.set_merge_status_inner(entry_id, status, merged_tree, details_json, Some(candidate))
+    }
+
+    fn set_merge_status_inner(
+        &mut self,
+        entry_id: i64,
+        status: MergeStatus,
+        merged_tree: Option<&str>,
+        details_json: Option<&str>,
+        candidate: Option<&crate::types::VerificationCandidate>,
     ) -> Result<(), BrokerError> {
         let now = now_ms();
         let tx = self.conn.transaction()?;
@@ -522,6 +547,32 @@ impl BrokerStore {
              WHERE id = ?1",
             params![entry_id, status.as_str(), merged_tree, details_json, now],
         )?;
+        if let Some(candidate) = candidate {
+            let inputs_json = serde_json::to_string(&candidate.inputs)
+                .expect("serializing candidate input commit IDs cannot fail");
+            tx.execute(
+                "INSERT INTO verification_candidates (
+                    queue_entry_id, base_commit, inputs_json, tree_id, commit_id
+                 ) VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT (queue_entry_id) DO UPDATE SET
+                    base_commit = excluded.base_commit,
+                    inputs_json = excluded.inputs_json,
+                    tree_id = excluded.tree_id,
+                    commit_id = excluded.commit_id",
+                params![
+                    entry_id,
+                    candidate.base,
+                    inputs_json,
+                    candidate.tree,
+                    candidate.commit
+                ],
+            )?;
+        } else {
+            tx.execute(
+                "DELETE FROM verification_candidates WHERE queue_entry_id = ?1",
+                [entry_id],
+            )?;
+        }
         insert_event(
             &tx,
             now,
@@ -531,6 +582,44 @@ impl BrokerStore {
         )?;
         tx.commit()?;
         Ok(())
+    }
+
+    /// Read the structured candidate saved with a queue verdict.
+    pub(crate) fn verification_candidate(
+        &self,
+        entry_id: i64,
+    ) -> Result<Option<crate::types::VerificationCandidate>, BrokerError> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT base_commit, inputs_json, tree_id, commit_id
+                 FROM verification_candidates WHERE queue_entry_id = ?1",
+                [entry_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((base, inputs_json, tree, commit)) = row else {
+            return Ok(None);
+        };
+        let inputs = serde_json::from_str(&inputs_json).map_err(|source| {
+            BrokerError::InvalidVerificationCandidateInputsJson {
+                id: entry_id,
+                source,
+            }
+        })?;
+        Ok(Some(crate::types::VerificationCandidate {
+            base,
+            inputs,
+            tree,
+            commit,
+        }))
     }
 
     /// Mark one verified queue entry promoted and advance its session's

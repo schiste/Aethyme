@@ -33,7 +33,7 @@ use rusqlite::Connection;
 use crate::error::BrokerError;
 
 /// Current database schema version (== `MIGRATIONS.len()`).
-pub const SCHEMA_VERSION: i64 = 49;
+pub const SCHEMA_VERSION: i64 = 50;
 
 /// The oldest schema version whose binaries can safely use a database at
 /// [`SCHEMA_VERSION`]. Before this existed every newer database locked out
@@ -65,6 +65,8 @@ pub const SCHEMA_VERSION: i64 = 49;
 /// - v49: adds nullable local operation provenance. A v48 writer names its
 ///   existing columns and can continue writing; a v48 reader safely ignores
 ///   the additional field.
+/// - v50: adds a typed verification-candidate table. New writers keep the
+///   legacy queue details in sync for older readers; the table is additive.
 pub const MIN_COMPATIBLE_SCHEMA: i64 = 47;
 
 /// Whether this binary may use a database at `found`, a version newer than
@@ -1621,6 +1623,21 @@ const MIGRATION_V49: &str = "
 ALTER TABLE coordinated_operations ADD COLUMN agent_provenance_json TEXT;
 ";
 
+const MIGRATION_V50: &str = "
+-- Keep the durable candidate identity typed and separate from details_json,
+-- which remains a compatibility projection for older broker readers.
+CREATE TABLE verification_candidates (
+    queue_entry_id INTEGER PRIMARY KEY REFERENCES merge_queue (id) ON DELETE CASCADE,
+    base_commit   TEXT NOT NULL,
+    inputs_json   TEXT NOT NULL,
+    tree_id       TEXT NOT NULL,
+    commit_id     TEXT NOT NULL
+);
+
+CREATE INDEX verification_candidates_by_commit
+    ON verification_candidates (commit_id, queue_entry_id);
+";
+
 const MIGRATIONS: &[&str] = &[
     MIGRATION_V1,
     MIGRATION_V2,
@@ -1671,6 +1688,7 @@ const MIGRATIONS: &[&str] = &[
     MIGRATION_V47,
     MIGRATION_V48,
     MIGRATION_V49,
+    MIGRATION_V50,
 ];
 
 /// Migrations that only add columns. One is skipped when every column it adds
@@ -1681,17 +1699,20 @@ const COLUMN_ONLY_MIGRATIONS: &[(i64, &[(&str, &str)])] =
 
 /// Migrations whose tables the repair pass re-creates, with `IF NOT EXISTS`,
 /// when a database records the version but lacks one of the tables.
-const TABLE_MIGRATIONS: &[(i64, &str, &[&str])] = &[(
-    48,
-    MIGRATION_V48,
-    &[
-        "repository_watches",
-        "repository_watch_pull_requests",
-        "repository_watch_events",
-        "repository_delivery_subscriptions",
-        "repository_delivery_outbox",
-    ],
-)];
+const TABLE_MIGRATIONS: &[(i64, &str, &[&str])] = &[
+    (
+        48,
+        MIGRATION_V48,
+        &[
+            "repository_watches",
+            "repository_watch_pull_requests",
+            "repository_watch_events",
+            "repository_delivery_subscriptions",
+            "repository_delivery_outbox",
+        ],
+    ),
+    (50, MIGRATION_V50, &["verification_candidates"]),
+];
 
 fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool, BrokerError> {
     let count: i64 = conn.query_row(
@@ -2285,12 +2306,13 @@ mod tests {
 
     #[test]
     fn v49_adds_agent_provenance_without_raising_the_compatibility_floor() {
-        assert_eq!(SCHEMA_VERSION, 49);
+        assert_eq!(SCHEMA_VERSION, 50);
         assert_eq!(MIN_COMPATIBLE_SCHEMA, 47);
 
         let conn = migrated_through(48);
-        assert_eq!(current_version(&conn).unwrap(), 48);
-        migrate(&conn).unwrap();
+        set_meta(&conn, "min_compatible_schema", 47);
+        conn.execute_batch(MIGRATION_V49).unwrap();
+        set_meta(&conn, "schema_version", 49);
         assert_eq!(current_version(&conn).unwrap(), 49);
         assert!(schema_is_compatible_with(&conn, 49, 47).unwrap());
         assert!(!schema_is_compatible_with(&conn, 49, 46).unwrap());
@@ -2305,11 +2327,50 @@ mod tests {
             .unwrap();
         assert_eq!(nullable, 0);
 
-        // A v47 database, the compatibility floor, migrates straight through.
+        // A v47 database, the compatibility floor, applies v48 and v49 while
+        // retaining the same minimum; v50 is covered by its own test.
         let from_v47 = migrated_through(47);
-        migrate(&from_v47).unwrap();
+        set_meta(&from_v47, "min_compatible_schema", 47);
+        for (index, migration) in MIGRATIONS.iter().enumerate().skip(47).take(2) {
+            from_v47.execute_batch(migration).unwrap();
+            set_meta(&from_v47, "schema_version", (index + 1) as i64);
+        }
         assert_eq!(current_version(&from_v47).unwrap(), 49);
         assert!(schema_is_compatible_with(&from_v47, 49, 47).unwrap());
+    }
+
+    #[test]
+    fn v50_adds_and_repairs_the_typed_verification_candidate_table() {
+        let conn = migrated_through(49);
+        set_meta(&conn, "min_compatible_schema", 47);
+
+        migrate(&conn).unwrap();
+        assert_eq!(current_version(&conn).unwrap(), 50);
+        assert_eq!(MIN_COMPATIBLE_SCHEMA, 47);
+        assert!(schema_is_compatible_with(&conn, 50, 47).unwrap());
+
+        let columns = conn
+            .prepare("SELECT name FROM pragma_table_info('verification_candidates') ORDER BY cid")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            columns,
+            vec![
+                "queue_entry_id".to_string(),
+                "base_commit".to_string(),
+                "inputs_json".to_string(),
+                "tree_id".to_string(),
+                "commit_id".to_string()
+            ]
+        );
+
+        conn.execute_batch("DROP TABLE verification_candidates")
+            .unwrap();
+        migrate(&conn).unwrap();
+        assert!(table_exists(&conn, "verification_candidates").unwrap());
     }
 
     #[test]

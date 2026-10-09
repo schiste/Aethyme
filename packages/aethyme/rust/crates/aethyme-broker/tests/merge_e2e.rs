@@ -327,6 +327,42 @@ fn two_clean_sessions_promote_with_requeue_on_base_move_manual_mode() {
         "verification alone must not accept B's session HEAD"
     );
 
+    let database = rusqlite::Connection::open(tmp.path().join(".aethyme/broker.db")).unwrap();
+    let (candidate_base, inputs_json, candidate_tree, candidate_commit): (
+        String,
+        String,
+        String,
+        String,
+    ) = database
+        .query_row(
+            "SELECT base_commit, inputs_json, tree_id, commit_id
+             FROM verification_candidates WHERE queue_entry_id = ?1",
+            [out_a.entry.id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    let inputs: Vec<String> = serde_json::from_str(&inputs_json).unwrap();
+    let details: serde_json::Value =
+        serde_json::from_str(out_a.entry.details_json.as_deref().unwrap()).unwrap();
+    assert_eq!(candidate_base, resolve(tmp.path(), "aethyme/integration"));
+    assert_eq!(inputs, vec![out_a.entry.head_commit.clone()]);
+    assert_eq!(candidate_tree, out_a.entry.merged_tree.as_deref().unwrap());
+    assert_eq!(candidate_commit, details["merge_commit"].as_str().unwrap());
+    assert_eq!(candidate_base, details["base"].as_str().unwrap());
+
+    // Simulate a row written by a legacy broker that knows only details_json.
+    // Promotion must preserve its old behavior when the typed row is absent.
+    assert_eq!(
+        database
+            .execute(
+                "DELETE FROM verification_candidates WHERE queue_entry_id = ?1",
+                [out_a.entry.id],
+            )
+            .unwrap(),
+        1
+    );
+    drop(database);
+
     // Promote A: integration branch advances; B was verified against the
     // OLD base and gets re-simulated automatically.
     broker.promote(out_a.entry.id).unwrap();
@@ -2560,6 +2596,20 @@ fn broker_open_checkpoints_a_promotion_interrupted_after_the_ref_move() {
     let details: serde_json::Value =
         serde_json::from_str(outcome.entry.details_json.as_deref().unwrap()).unwrap();
     let merge_commit = details["merge_commit"].as_str().unwrap();
+
+    // Reopen recovery must also read candidates produced before the typed
+    // table existed.
+    let database = rusqlite::Connection::open(tmp.path().join(".aethyme/broker.db")).unwrap();
+    assert_eq!(
+        database
+            .execute(
+                "DELETE FROM verification_candidates WHERE queue_entry_id = ?1",
+                [outcome.entry.id],
+            )
+            .unwrap(),
+        1
+    );
+    drop(database);
 
     sh(
         tmp.path(),
