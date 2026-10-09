@@ -61,6 +61,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "aethyme-contracts"
+version = "0.8.26"
+dependencies = [
+ "data-encoding",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+]
+
+[[package]]
 name = "aethyme-engine"
 version = "0.8.26"
 dependencies = [
