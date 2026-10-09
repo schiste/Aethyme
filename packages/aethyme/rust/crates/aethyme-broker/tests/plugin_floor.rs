@@ -15,6 +15,10 @@ use aethyme_broker::plugin_cli::{
 };
 use std::cmp::Ordering;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Output};
+
+const PLUGIN_MANIFEST_PATH: &str = "packages/aethyme/plugins/aethyme/.claude-plugin/plugin.json";
+const PLUGIN_HOOKS_PATH: &str = "packages/aethyme/plugins/aethyme/hooks";
 
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -26,6 +30,40 @@ fn repo_root() -> PathBuf {
 
 fn plugin_dir() -> PathBuf {
     repo_root().join("packages/aethyme/plugins/aethyme")
+}
+
+fn git_output(root: &Path, args: &[&str]) -> Output {
+    Command::new("git")
+        .current_dir(root)
+        .args(args)
+        .output()
+        .expect("git must be available to check the bundled plugin version")
+}
+
+fn plugin_version(manifest: &[u8]) -> semver::Version {
+    let manifest: serde_json::Value =
+        serde_json::from_slice(manifest).expect("plugin.json must be valid JSON");
+    semver::Version::parse(
+        manifest["version"]
+            .as_str()
+            .expect("plugin.json must declare a string version"),
+    )
+    .expect("plugin.json version must be semantic")
+}
+
+fn require_plugin_version_bump(
+    hooks_changed: bool,
+    base_version: &semver::Version,
+    current_version: &semver::Version,
+) -> Result<(), String> {
+    if hooks_changed && current_version <= base_version {
+        return Err(format!(
+            "bundled Claude hooks changed but plugin.json version did not increase \
+             ({} -> {}); bump {PLUGIN_MANIFEST_PATH}",
+            base_version, current_version
+        ));
+    }
+    Ok(())
 }
 
 #[test]
@@ -79,6 +117,67 @@ fn the_installed_id_matches_the_shipped_manifests() {
         )
     );
     assert_eq!(MARKETPLACE_NAME, marketplace["name"].as_str().unwrap());
+}
+
+/// Claude Code caches a plugin by its declared version. Keep this check on the
+/// full pull-request diff: it catches the failure from #687 before packaging,
+/// even when each individual hook commit was otherwise valid.
+#[test]
+fn changed_plugin_hooks_require_a_strictly_newer_plugin_version() {
+    let root = aethyme_testkit::paths::repo_root();
+    let base_ref = std::env::var("GITHUB_BASE_REF")
+        .map(|branch| format!("refs/remotes/origin/{branch}"))
+        .unwrap_or_else(|_| "refs/remotes/origin/main".to_string());
+    let merge_base = git_output(&root, &["merge-base", "HEAD", &base_ref]);
+    assert!(
+        merge_base.status.success(),
+        "cannot find the pull request base ({base_ref}); fetch the base branch before running \
+         the plugin hook version guard: {}",
+        String::from_utf8_lossy(&merge_base.stderr).trim()
+    );
+    let merge_base = String::from_utf8(merge_base.stdout)
+        .expect("git merge-base output must be UTF-8")
+        .trim()
+        .to_string();
+
+    let hooks_diff = git_output(
+        &root,
+        &["diff", "--quiet", &merge_base, "--", PLUGIN_HOOKS_PATH],
+    );
+    assert!(
+        hooks_diff.status.success() || hooks_diff.status.code() == Some(1),
+        "git could not compare the bundled hooks with {merge_base}: {}",
+        String::from_utf8_lossy(&hooks_diff.stderr).trim()
+    );
+    let hooks_changed = hooks_diff.status.code() == Some(1);
+    let base_manifest = git_output(
+        &root,
+        &["show", &format!("{merge_base}:{PLUGIN_MANIFEST_PATH}")],
+    );
+    assert!(
+        base_manifest.status.success(),
+        "cannot read {PLUGIN_MANIFEST_PATH} from base {merge_base}: {}",
+        String::from_utf8_lossy(&base_manifest.stderr).trim()
+    );
+    let current_manifest = std::fs::read(root.join(PLUGIN_MANIFEST_PATH))
+        .expect("read the current Claude plugin manifest");
+    let base_version = plugin_version(&base_manifest.stdout);
+    let current_version = plugin_version(&current_manifest);
+    require_plugin_version_bump(hooks_changed, &base_version, &current_version)
+        .unwrap_or_else(|error| panic!("{error}"));
+}
+
+#[test]
+fn the_plugin_version_guard_rejects_an_unchanged_or_lower_version_for_hook_changes() {
+    let base = semver::Version::parse("0.1.1").unwrap();
+    let unchanged = semver::Version::parse("0.1.1").unwrap();
+    let older = semver::Version::parse("0.1.0").unwrap();
+    let newer = semver::Version::parse("0.1.2").unwrap();
+
+    assert!(require_plugin_version_bump(true, &base, &unchanged).is_err());
+    assert!(require_plugin_version_bump(true, &base, &older).is_err());
+    assert!(require_plugin_version_bump(true, &base, &newer).is_ok());
+    assert!(require_plugin_version_bump(false, &base, &unchanged).is_ok());
 }
 
 /// Every planned command drives the surface's own binary and stays inside
