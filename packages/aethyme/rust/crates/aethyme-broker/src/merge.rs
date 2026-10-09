@@ -24,11 +24,53 @@ use std::path::Path;
 use crate::broker::{Broker, BrokerOpError};
 use crate::gates::GateRunOutcome;
 use crate::git::GitRepo;
-use crate::types::{AdvisoryEvidence, AdvisorySeverity, MergeQueueEntry, MergeStatus, NewAdvisory};
+use crate::types::{
+    AdvisoryEvidence, AdvisorySeverity, MergeQueueEntry, MergeStatus, NewAdvisory,
+    VerificationCandidate,
+};
 
 pub const DEFAULT_INTEGRATION_BRANCH: &str = "aethyme/integration";
 pub const ACTION_REQUIRED_RELPATH: &str = ".aethyme/broker-action-required.md";
 const PROMOTION_SUBJECT_MAX_CHARS: usize = 72;
+
+/// Materialize a typed candidate commit without invoking any gate or
+/// verification policy. The caller supplies the replay result and provenance.
+fn mint_verification_candidate(
+    repo: &GitRepo,
+    base: &str,
+    inputs: Vec<String>,
+    tree: &str,
+    message: &str,
+    attribution: &crate::attribution::Attribution,
+) -> Result<VerificationCandidate, BrokerOpError> {
+    let commit = repo.commit_tree(tree, &[base], message, attribution)?;
+    Ok(VerificationCandidate {
+        base: base.to_string(),
+        inputs,
+        tree: tree.to_string(),
+        commit,
+    })
+}
+
+/// Read the candidate projection written before typed candidate rows existed.
+fn legacy_verification_candidate(entry: &MergeQueueEntry) -> Option<VerificationCandidate> {
+    let details = entry
+        .details_json
+        .as_deref()
+        .and_then(|details| serde_json::from_str::<serde_json::Value>(details).ok())?;
+    let commit = details.get("merge_commit")?.as_str()?.to_string();
+    let base = details
+        .get("base")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    Some(VerificationCandidate {
+        base,
+        inputs: Vec::new(),
+        tree: entry.merged_tree.clone().unwrap_or_default(),
+        commit,
+    })
+}
 
 fn require_session_checkout_identity(
     session: &crate::Session,
@@ -975,10 +1017,10 @@ impl Broker {
             promotion_subject(session.id, session.task.as_deref()),
             attribution.trailer_block()
         );
-        let pending_messages = submission_plan
-            .pending_owned_commit_ids()
-            .into_iter()
-            .map(|commit| self.repo_handle().commit_message(&commit))
+        let inputs = submission_plan.pending_owned_commit_ids();
+        let pending_messages = inputs
+            .iter()
+            .map(|commit| self.repo_handle().commit_message(commit))
             .collect::<Result<Vec<_>, _>>()?
             .join("\n");
         if let Some(decision) = crate::contract_check::parse_contract_decision(&pending_messages) {
@@ -993,16 +1035,19 @@ impl Broker {
                 verification_message.push_str(&reason);
             }
         }
-        let merge_commit = self.repo_handle().commit_tree(
+        let candidate = mint_verification_candidate(
+            self.repo_handle(),
+            &base,
+            inputs,
             &simulation.tree,
-            &[&base],
             &verification_message,
             &attribution,
         )?;
+        let merge_commit = candidate.commit.as_str();
         let verify_base = pre_refresh.as_deref().unwrap_or(&base);
         let changed = self
             .repo_handle()
-            .gate_scope_changed_between(verify_base, &merge_commit)?;
+            .gate_scope_changed_between(verify_base, merge_commit)?;
         // One of a small pool of stable slots, not one repository-wide slot:
         // two sessions verifying different merged trees have no reason to
         // exclude each other, and a single slot made verification serial no
@@ -1032,7 +1077,7 @@ impl Broker {
         if let Some(progress) = progress {
             progress.phase(crate::submit_progress::PHASE_VERIFYING);
         }
-        let sim_worktree = verification_slot.materialize(self.repo_handle(), &merge_commit)?;
+        let sim_worktree = verification_slot.materialize(self.repo_handle(), merge_commit)?;
         // Verification policy comes from the base the change lands on, never
         // from the merged tree: otherwise a session could weaken or delete the
         // gates and graph policy that judge it. A policy change a session makes
@@ -1040,7 +1085,7 @@ impl Broker {
         let graph_policy =
             crate::graph_integrity::load_graph_policy_at_commit(self.repo_handle(), &base)?;
         let graph_policy_changed =
-            crate::graph_integrity::load_graph_policy_at_commit(self.repo_handle(), &merge_commit)
+            crate::graph_integrity::load_graph_policy_at_commit(self.repo_handle(), merge_commit)
                 .map_or(true, |merged| merged != graph_policy);
         let graph_integrity =
             crate::graph_integrity::verify_disposable_checkout(&sim_worktree, &graph_policy);
@@ -1067,7 +1112,7 @@ impl Broker {
             .file_at_commit(&base, crate::gates::GATES_CONFIG_RELPATH)?
             != self
                 .repo_handle()
-                .file_at_commit(&merge_commit, crate::gates::GATES_CONFIG_RELPATH)?;
+                .file_at_commit(merge_commit, crate::gates::GATES_CONFIG_RELPATH)?;
         if gate_policy_changed || graph_policy_changed {
             self.store().append_event(
                 crate::events::MERGE_POLICY_DEFERRED,
@@ -1142,8 +1187,8 @@ impl Broker {
                 .count(),
         };
         let mut details = serde_json::json!({
-            "merge_commit": merge_commit,
-            "base": base,
+            "merge_commit": candidate.commit.as_str(),
+            "base": candidate.base.as_str(),
             "gates": gate_outcomes.iter().map(|o| {
                 let mut gate = serde_json::json!({
                     "gate": o.gate,
@@ -1171,27 +1216,30 @@ impl Broker {
             // entry's promotion -- runs it again, and say exactly which gate
             // could not run: the next action is to free the resource, not to
             // edit code that has not been shown to be wrong.
-            self.store().set_merge_status(
+            self.store().set_merge_status_with_candidate(
                 entry.id,
                 MergeStatus::Submitted,
-                Some(&simulation.tree),
+                Some(candidate.tree.as_str()),
                 Some(&details.to_string()),
+                &candidate,
             )?;
         } else if all_pass {
-            self.store().set_merge_status(
+            self.store().set_merge_status_with_candidate(
                 entry.id,
                 MergeStatus::Verified,
-                Some(&simulation.tree),
+                Some(candidate.tree.as_str()),
                 Some(&details.to_string()),
+                &candidate,
             )?;
             let verified_entry = self.queue_entry(entry.id)?;
             self.record_review_submission(&verified_entry)?;
         } else {
-            self.store().set_merge_status(
+            self.store().set_merge_status_with_candidate(
                 entry.id,
                 MergeStatus::Rejected,
-                Some(&simulation.tree),
+                Some(candidate.tree.as_str()),
                 Some(&details.to_string()),
+                &candidate,
             )?;
         }
 
@@ -1642,6 +1690,33 @@ impl Broker {
         })
     }
 
+    /// Prefer the typed candidate when it agrees with the stable legacy
+    /// projection. Older writers can update queue details without knowing
+    /// about the additive table, so a disagreement falls back to that copy.
+    fn verification_candidate_for_entry(
+        &mut self,
+        entry: &MergeQueueEntry,
+    ) -> Result<Option<VerificationCandidate>, BrokerOpError> {
+        let typed = self.store().verification_candidate(entry.id)?;
+        let legacy = legacy_verification_candidate(entry);
+        let Some(typed) = typed else {
+            return Ok(legacy);
+        };
+        let tree_matches = entry
+            .merged_tree
+            .as_deref()
+            .is_none_or(|tree| tree == typed.tree.as_str());
+        let legacy_matches = legacy.as_ref().is_none_or(|legacy| {
+            legacy.base.as_str() == typed.base.as_str()
+                && legacy.commit.as_str() == typed.commit.as_str()
+        });
+        if tree_matches && legacy_matches {
+            Ok(Some(typed))
+        } else {
+            Ok(legacy)
+        }
+    }
+
     /// Complete the durable half of a promotion when the integration ref
     /// already names a verified entry's exact merge commit. This is the
     /// only ref/database ordering gap in normal promotion: the ref moves
@@ -1652,32 +1727,25 @@ impl Broker {
         let Some(integration_head) = self.repo_handle().resolve_ref(&config.branch) else {
             return Ok(());
         };
-        let candidate = self.store().merge_queue()?.into_iter().find(|entry| {
+        let mut candidate = None;
+        for entry in self.store().merge_queue()? {
             if entry.status != MergeStatus::Verified {
-                return false;
+                continue;
             }
-            entry
-                .details_json
-                .as_deref()
-                .and_then(|details| serde_json::from_str::<serde_json::Value>(details).ok())
-                .and_then(|details| {
-                    details
-                        .get("merge_commit")
-                        .and_then(serde_json::Value::as_str)
-                        .map(str::to_string)
-                })
-                .as_deref()
-                == Some(integration_head.as_str())
-        });
-        if let Some(entry) = candidate {
-            let recorded_base = entry
-                .details_json
-                .as_deref()
-                .and_then(|details| serde_json::from_str::<serde_json::Value>(details).ok())
-                .and_then(|details| details.get("base")?.as_str().map(str::to_string));
-            let promoted_base = match recorded_base {
-                Some(base) => base,
-                None => self.repo_handle().first_parent(&integration_head)?,
+            let Some(verification_candidate) = self.verification_candidate_for_entry(&entry)?
+            else {
+                continue;
+            };
+            if verification_candidate.commit.as_str() == integration_head.as_str() {
+                candidate = Some((entry, verification_candidate));
+                break;
+            }
+        }
+        if let Some((entry, verification_candidate)) = candidate {
+            let promoted_base = if verification_candidate.base.is_empty() {
+                self.repo_handle().first_parent(&integration_head)?
+            } else {
+                verification_candidate.base
             };
             let promoted_paths = self
                 .repo_handle()
@@ -1754,21 +1822,11 @@ impl Broker {
                 status: entry.status.as_str(),
             });
         }
-        let details: serde_json::Value = entry
-            .details_json
-            .as_deref()
-            .and_then(|d| serde_json::from_str(d).ok())
-            .unwrap_or_default();
-        let base_at_verify = details
-            .get("base")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default()
-            .to_string();
-        let merge_commit = details
-            .get("merge_commit")
-            .and_then(|v| v.as_str())
-            .ok_or(crate::BrokerError::SessionNotFound(entry_id))?
-            .to_string();
+        let candidate = self
+            .verification_candidate_for_entry(&entry)?
+            .ok_or(crate::BrokerError::SessionNotFound(entry_id))?;
+        let base_at_verify = candidate.base;
+        let merge_commit = candidate.commit;
 
         let (branch, current_base) = self.integration_head()?;
         if current_base != base_at_verify {
@@ -2321,5 +2379,75 @@ mod promotion_subject_tests {
 
         assert_eq!(subject.chars().count(), PROMOTION_SUBJECT_MAX_CHARS);
         assert!(subject.ends_with("...)"));
+    }
+}
+
+#[cfg(test)]
+mod verification_candidate_tests {
+    use super::mint_verification_candidate;
+    use crate::attribution::Attribution;
+    use crate::git::GitRepo;
+    use std::path::Path;
+    use std::process::Command;
+
+    fn git(dir: &Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
+    }
+
+    fn commit_file(dir: &Path, name: &str, contents: &str) -> String {
+        std::fs::write(dir.join(name), contents).unwrap();
+        git(dir, &["add", name]);
+        git(dir, &["commit", "-q", "-m", name]);
+        git(dir, &["rev-parse", "HEAD"])
+    }
+
+    #[test]
+    fn mints_a_typed_candidate_without_gate_configuration_or_execution() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        git(root, &["init", "-q", "-b", "main"]);
+        git(root, &["config", "user.name", "Candidate Test"]);
+        git(root, &["config", "user.email", "candidate@example.invalid"]);
+        let base = commit_file(root, "base.txt", "base\n");
+        let input = commit_file(root, "change.txt", "change\n");
+        let tree = git(root, &["write-tree"]);
+        assert!(!root.join(".aethyme/gates.toml").exists());
+
+        let repo = GitRepo::discover(root).unwrap();
+        let candidate = mint_verification_candidate(
+            &repo,
+            &base,
+            vec![input.clone()],
+            &tree,
+            "test verification candidate",
+            &Attribution::broker_only(),
+        )
+        .unwrap();
+
+        assert_eq!(candidate.base, base);
+        assert_eq!(candidate.inputs, vec![input]);
+        assert_eq!(candidate.tree, tree);
+        assert_eq!(
+            repo.commit_tree_id(&candidate.commit).unwrap(),
+            candidate.tree
+        );
+        assert_eq!(
+            repo.first_parent(&candidate.commit).unwrap(),
+            candidate.base
+        );
+        assert_eq!(
+            repo.commit_message(&candidate.commit).unwrap(),
+            "test verification candidate"
+        );
     }
 }

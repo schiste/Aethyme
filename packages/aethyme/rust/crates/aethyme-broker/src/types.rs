@@ -753,6 +753,20 @@ pub struct GateResult {
     pub environment: GateEnvironment,
 }
 
+/// Exact verified commit candidate, kept separately from the stable queue
+/// details JSON that older readers still consume.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct VerificationCandidate {
+    /// Commit the candidate was replayed onto.
+    pub base: String,
+    /// Session-owned commits replayed into this candidate, in replay order.
+    pub inputs: Vec<String>,
+    /// Resulting tree written by the replay.
+    pub tree: String,
+    /// Commit object whose tree was gated.
+    pub commit: String,
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct MergeQueueEntry {
     pub id: i64,
