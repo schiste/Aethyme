@@ -453,7 +453,10 @@ unchanged.
 An advisory capture never changes the legacy verdict, `promoted` or the exit
 code. A required capture runs before anything is queued; when it is not
 acknowledged, submit prints `{"submitted": false, "collaboration_capture": ...}`
-and exits 3 with no queue entry, gate run or promotion. A `capture` value this
+and exits 3 with no queue entry, gate run or promotion. If the session head
+moves after a required capture, submit refuses with `CapturedHeadMoved` (exit
+3) before any queue entry, so a receipt always names the submitted commit. An
+advisory receipt names the `entry.head_commit` that was submitted. A `capture` value this
 binary does not implement is reported with `policy: "unsupported"` and code
 `unsupported_policy`, and treated as a required capture that failed.
 

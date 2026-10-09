@@ -73,6 +73,27 @@ same operation and answers with the same receipt (#658). New commits, a moved
 tip or a changed policy give a new operation. Retention is `until_released` until
 #659 defines classes.
 
+### The receipt names the submitted commit
+
+A capture and a submit that read the session head separately could disagree. A
+commit, amend or reset in between would submit code the receipt does not cover,
+and a required policy would be "satisfied" for a commit that was never captured.
+They are therefore bound to one commit:
+
+- **Required:** the captured head is passed to `Broker::submit_expecting_head`.
+  Submit compares it with the head at the exact point it pins the session
+  (compare-and-swap, not an earlier re-check). A mismatch is refused as
+  `CapturedHeadMoved` (exit 3) before any queue entry exists. The existing
+  identity re-check keeps the head pinned until the queue entry records it.
+  Simulation, gates, promotion and later re-simulation all work from that
+  recorded `head_commit` and never re-read the worktree.
+- **Advisory:** the capture runs after the submit, on the `head_commit` the
+  submit recorded, not on an earlier reading. Advisory never refuses, so legacy
+  behaviour (submit whatever the head is) is unchanged.
+
+Tests move the session between capture and submit in both modes, and each
+binding has a neuter check.
+
 ### Versioning
 
 - The JSON field carries `schema: "aethyme.submit-capture/experimental-v0"` and

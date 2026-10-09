@@ -504,12 +504,26 @@ pub(super) fn run_submit(parsed: Parsed) -> Result<(), UsageError> {
         }
     }
     // Opt-in collaboration capture (#660). Off unless `[collaboration]`
-    // asks for it, and then the legacy submit below is unchanged.
-    let capture = crate::collaboration_submit::SubmitCapture::prepare(&mut broker, session);
-    let mut capture_report = None;
-    if let Some(capture) = capture.as_ref().filter(|capture| capture.required()) {
-        let report = capture.run(broker.main_root());
-        if !report.acknowledged() {
+    // asks for it, and then this is exactly the legacy submit.
+    let submitted = crate::collaboration_submit::submit(
+        &mut broker,
+        session,
+        if parsed.no_cache {
+            crate::CachePolicy::Bypass
+        } else {
+            crate::CachePolicy::Use
+        },
+        if parsed.verify_only {
+            crate::PromotionIntent::VerifyOnly
+        } else {
+            crate::PromotionIntent::Configured
+        },
+    )?;
+    let (outcome, capture_report) = match submitted {
+        crate::collaboration_submit::CaptureSubmit::Submitted { outcome, capture } => {
+            (*outcome, capture)
+        }
+        crate::collaboration_submit::CaptureSubmit::Refused(report) => {
             if parsed.json {
                 out!(
                     "{}",
@@ -528,25 +542,7 @@ pub(super) fn run_submit(parsed: Parsed) -> Result<(), UsageError> {
                 code: crate::exit_status::REFUSED,
             });
         }
-        capture_report = Some(report);
-    }
-    let outcome = broker.submit_with_intent(
-        session,
-        if parsed.no_cache {
-            crate::CachePolicy::Bypass
-        } else {
-            crate::CachePolicy::Use
-        },
-        if parsed.verify_only {
-            crate::PromotionIntent::VerifyOnly
-        } else {
-            crate::PromotionIntent::Configured
-        },
-    )?;
-    // Advisory capture runs after the legacy verdict and cannot change it.
-    if let Some(capture) = capture.as_ref().filter(|capture| !capture.required()) {
-        capture_report = Some(capture.run(broker.main_root()));
-    }
+    };
     if !parsed.json
         && let Some(report) = &capture_report
     {

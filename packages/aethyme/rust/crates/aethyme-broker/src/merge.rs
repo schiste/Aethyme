@@ -607,7 +607,23 @@ impl Broker {
         cache_policy: crate::gates::CachePolicy,
         intent: PromotionIntent,
     ) -> Result<SubmitOutcome, BrokerOpError> {
-        self.submit_inner(session_id, cache_policy, intent)
+        self.submit_inner(session_id, cache_policy, intent, None)
+    }
+
+    /// Submit only if the session head is still `expected_head` at the point
+    /// submit pins it; otherwise refuse with
+    /// [`BrokerOpError::CapturedHeadMoved`] before any queue entry exists.
+    /// Everything after that point (simulation, gates, promotion) works from
+    /// the pinned queue entry, so the submitted commit is exactly the one the
+    /// caller vouched for (#660).
+    pub fn submit_expecting_head(
+        &mut self,
+        session_id: i64,
+        cache_policy: crate::gates::CachePolicy,
+        intent: PromotionIntent,
+        expected_head: &str,
+    ) -> Result<SubmitOutcome, BrokerOpError> {
+        self.submit_inner(session_id, cache_policy, intent, Some(expected_head))
     }
 
     /// Submit with an explicit policy for merged-tree gate cache lookup.
@@ -616,7 +632,7 @@ impl Broker {
         session_id: i64,
         cache_policy: crate::gates::CachePolicy,
     ) -> Result<SubmitOutcome, BrokerOpError> {
-        self.submit_inner(session_id, cache_policy, PromotionIntent::Configured)
+        self.submit_inner(session_id, cache_policy, PromotionIntent::Configured, None)
     }
 
     fn submit_inner(
@@ -624,6 +640,7 @@ impl Broker {
         session_id: i64,
         cache_policy: crate::gates::CachePolicy,
         intent: PromotionIntent,
+        expected_head: Option<&str>,
     ) -> Result<SubmitOutcome, BrokerOpError> {
         // Recorded from the first step: lease auditing and planning can take
         // minutes on a busy repository, and a silent submit looks hung.
@@ -635,6 +652,18 @@ impl Broker {
         let session = self.store().session(session_id)?;
         let checkout = GitRepo::discover(Path::new(&session.worktree_path))?;
         let head = require_session_checkout_identity(&session, &checkout, None)?;
+        // Compare-and-swap against the caller's commit at the point the head
+        // is pinned; the identity re-check below keeps it pinned until the
+        // queue entry records it.
+        if let Some(expected) = expected_head
+            && expected != head
+        {
+            return Err(BrokerOpError::CapturedHeadMoved {
+                session_id,
+                captured: expected.into(),
+                actual: head.into_boxed_str(),
+            });
+        }
         // Before planning: a verify-only plan is measured against integration,
         // and a stale one counts main's own commits as this session's (#352).
         self.refresh_disposable_integration(crate::IntegrationRefreshTrigger::Submit);

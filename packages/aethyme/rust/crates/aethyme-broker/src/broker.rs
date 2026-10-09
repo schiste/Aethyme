@@ -505,6 +505,16 @@ pub enum BrokerOpError {
         actual_head: Box<str>,
         recorded_branch_head: Option<Box<str>>,
     },
+    /// A required collaboration capture retained one commit and the session
+    /// then moved, so submitting would integrate code that was never captured.
+    #[error(
+        "refusing to submit session {session_id}: its head moved from {captured} to {actual} after the required collaboration capture, so the captured commit is not the one that would be submitted; resubmit to capture and submit the current head"
+    )]
+    CapturedHeadMoved {
+        session_id: i64,
+        captured: Box<str>,
+        actual: Box<str>,
+    },
     #[error("session {session_id}'s branch {branch} does not exist in this repository")]
     SessionBranchMissing { session_id: i64, branch: String },
     /// `broker sync` declined before changing anything: the worktree is
