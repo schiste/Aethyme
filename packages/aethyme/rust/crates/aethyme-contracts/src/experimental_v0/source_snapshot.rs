@@ -311,13 +311,45 @@ fn validate_path(path: &[u8]) -> Result<(), SourceSnapshotError> {
         match component {
             b"" => return reject(PathRejection::EmptyComponent),
             b"." | b".." => return reject(PathRejection::RelativeComponent),
-            // Git refuses `.git` in any letter case, because on a
-            // case-insensitive filesystem `.GIT/` is the repository directory.
-            c if c.eq_ignore_ascii_case(b".git") => return reject(PathRejection::GitComponent),
+            c if is_git_component(c) => return reject(PathRejection::GitComponent),
             _ => {}
         }
     }
     Ok(())
+}
+
+/// Every name some filesystem resolves to `.git`, as Git refuses them with
+/// `core.protectHFS` and `core.protectNTFS`: any letter case (case-insensitive
+/// filesystems); HFS+ ignorable code points anywhere in the name (HFS+ drops
+/// them, so `.g\u{200c}it` is `.git`); and on NTFS, trailing dots and spaces,
+/// an alternate data stream suffix (`.git::$INDEX_ALLOCATION`) and the 8.3
+/// short name `git~1`.
+fn is_git_component(component: &[u8]) -> bool {
+    let hfs: Vec<u8> = match std::str::from_utf8(component) {
+        Ok(text) => text
+            .chars()
+            .filter(|c| {
+                !matches!(
+                    c,
+                    '\u{200C}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{206A}'..='\u{206F}' | '\u{FEFF}'
+                )
+            })
+            .collect::<String>()
+            .into_bytes(),
+        Err(_) => component.to_vec(),
+    };
+    if hfs.eq_ignore_ascii_case(b".git") {
+        return true;
+    }
+    let stream = component
+        .iter()
+        .position(|&b| b == b':')
+        .unwrap_or(component.len());
+    let mut stem = &component[..stream];
+    while let [rest @ .., b'.' | b' '] = stem {
+        stem = rest;
+    }
+    stem.eq_ignore_ascii_case(b".git") || stem.eq_ignore_ascii_case(b"git~1")
 }
 
 /// A path that is a file in one entry and a directory prefix of another
