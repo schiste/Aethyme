@@ -51,6 +51,13 @@
 //! No normalization is applied: not to line endings, not to Unicode, not to
 //! case. Paths sort by their raw bytes. A path the rules below cannot represent
 //! is refused, never rewritten (plan §5.3).
+//!
+//! Identity is faithful to the tree, not to the host. Paths that differ only by
+//! letter case (`README.md`, `readme.md`) or by Unicode composition are
+//! distinct, valid entries, as they are in Git. Whether a snapshot can be
+//! checked out on a case-insensitive or normalizing filesystem (APFS, NTFS) is
+//! decided at materialization, which must refuse such collisions explicitly
+//! rather than let the filesystem keep one file and drop the other.
 
 use std::collections::HashSet;
 
@@ -172,7 +179,6 @@ impl SourceSnapshot {
             }
         }
         check_file_directory_conflicts(&entries)?;
-        check_case_fold_collisions(&entries)?;
         Ok(Self { entries })
     }
 
@@ -269,12 +275,6 @@ pub enum SourceSnapshotError {
     DuplicatePath { path: Vec<u8> },
     #[error("{} is both a file and a directory", lossy(.path))]
     FileDirectoryConflict { path: Vec<u8> },
-    #[error(
-        "{} and {} differ only by letter case, so they cannot both be checked out on a case-insensitive filesystem",
-        lossy(.first),
-        lossy(.second)
-    )]
-    CaseFoldCollision { first: Vec<u8>, second: Vec<u8> },
     #[error("unsupported entry mode {mode}: v0 supports only 100644, 100755 and 120000")]
     UnsupportedMode { mode: String },
     #[error("malformed source snapshot id {encoded:?}: expected sha256:<64 lowercase hex>")]
@@ -341,31 +341,4 @@ fn check_file_directory_conflicts(entries: &[SourceEntry]) -> Result<(), SourceS
         }),
         None => Ok(()),
     }
-}
-
-/// Decide what to do with paths that differ only by letter case, such as
-/// `README.md` and `readme.md`.
-///
-/// Git and Linux treat them as two files. The default filesystems on macOS
-/// (APFS) and Windows (NTFS) are case-insensitive, so checking out such a
-/// snapshot there silently keeps one file and loses the other. This is where
-/// E1 and the local verifier materialize snapshots.
-///
-/// Two defensible policies:
-/// - **Identity stays faithful:** return `Ok(())`. Every valid Git tree gets an
-///   ID, and refusing case-colliding trees becomes the job of materialization
-///   (#670's "unsupported ... fail explicitly"). Real repositories do contain
-///   such pairs (the Linux kernel's netfilter has `xt_TCPMSS.c` and
-///   `xt_tcpmss.c`).
-/// - **Refuse at identity:** return `CaseFoldCollision` for the first pair, so
-///   no snapshot that cannot round-trip on this host is ever named.
-///
-/// Entries arrive in raw path byte order, which is not case-insensitive order.
-/// If you refuse, decide whether ASCII case folding is enough, or whether
-/// non-ASCII letters (`É` vs `é`) count too. (macOS also normalizes Unicode
-/// composition in file names, which is a separate collision class.)
-fn check_case_fold_collisions(entries: &[SourceEntry]) -> Result<(), SourceSnapshotError> {
-    // TODO(#652): choose the policy described above; see the PR discussion.
-    let _ = entries;
-    Ok(())
 }

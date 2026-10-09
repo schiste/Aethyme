@@ -78,7 +78,6 @@ fn error_code(error: &SourceSnapshotError) -> String {
         ),
         SourceSnapshotError::DuplicatePath { .. } => "duplicate_path".into(),
         SourceSnapshotError::FileDirectoryConflict { .. } => "file_directory_conflict".into(),
-        SourceSnapshotError::CaseFoldCollision { .. } => "case_fold_collision".into(),
         SourceSnapshotError::UnsupportedMode { .. } => "unsupported_mode".into(),
         SourceSnapshotError::MalformedId { .. } => "malformed_id".into(),
     }

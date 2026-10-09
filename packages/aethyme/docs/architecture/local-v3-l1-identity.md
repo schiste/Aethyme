@@ -50,7 +50,7 @@ path; and the existing source digest hashes Git object ids.
 | Encoding | `sha256:<64 lowercase hex>` |
 | Accepted | Regular `100644`, executable `100755`, symlink `120000`. Raw path bytes, including non-UTF-8 paths. |
 | Refused | Submodules and other modes; empty, absolute, `.`/`..`, `.git` (any case), NUL, `//`, trailing `/`, paths over 4096 bytes; duplicates; file/directory conflicts. Nothing is normalized. |
-| Open | Case-fold collisions (see "Decisions needed"). |
+| Case and composition | **Faithful (decided 2026-10-09).** Paths differing only by letter case or Unicode composition are distinct, valid entries, as in Git. Materialization (#670) must refuse such collisions explicitly on a case-insensitive or normalizing filesystem. |
 | Not | A Git object id, the graph manifest digest, or execution identity (#670). |
 
 ### ProjectId: proposed
@@ -105,12 +105,18 @@ path; and the existing source digest hashes Git object ids.
 - Cross-clone or cross-version correspondence is an explicit mapping record; when
   uncertain, it says so (T66).
 
+## Decided
+
+- **Case-fold and composition collisions (2026-10-09): faithful identity, refuse at
+  materialization.** Identity describes the tree, not a host; every valid Git tree gets
+  an ID (real repositories contain such pairs, e.g. the Linux kernel's `xt_TCPMSS.c` and
+  `xt_tcpmss.c`). The golden vector "case-differing paths" pins acceptance. The
+  obligation moves to #670: a checkout onto APFS/NTFS must detect collisions under that
+  filesystem's folding and normalization and fail explicitly, never keep one file.
+
 ## Decisions needed
 
-1. **Case-fold collisions in SourceSnapshotId** (`check_case_fold_collisions`): faithful
-   identity with refusal at materialization, or refusal at identity. Both are defensible;
-   the choice also decides whether non-ASCII case and Unicode composition count.
-2. **Accept the common encoding rules above** (self-describing `<scheme>:`, SHA-256,
+1. **Accept the common encoding rules above** (self-describing `<scheme>:`, SHA-256,
    canonical-only parsing) as the D10 direction, so #653 and #655 build on them.
 
 ## Tests
