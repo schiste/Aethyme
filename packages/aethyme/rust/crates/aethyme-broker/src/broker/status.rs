@@ -1961,6 +1961,18 @@ impl Broker {
         let (integration_branch, integration_head) = integration;
 
         let mut advice = Vec::new();
+        if let Some(warning) = PromoteConfig::load_with_warning(&self.main_root).1 {
+            advice.push(StatusAdvice {
+                id: "promote.mode-invalid",
+                severity: StatusAdviceSeverity::Warning,
+                reason: "unknown promotion mode is forced to the safe verify-only mode",
+                summary: warning,
+                session_id: None,
+                queue_entry_id: None,
+                evidence: vec![".aethyme/config.toml [promote].mode".into()],
+                commands: Vec::new(),
+            });
+        }
         let mut latest_queue_by_session = BTreeMap::new();
         for entry in queue {
             latest_queue_by_session.insert(entry.session_id, entry);

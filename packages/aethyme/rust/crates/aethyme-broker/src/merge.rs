@@ -148,6 +148,16 @@ pub struct PromoteConfig {
     pub mode: PromoteMode,
 }
 
+fn invalid_promote_mode_warning(value: Option<&str>) -> String {
+    let detail = value
+        .map(|value| format!("unknown value `{value}`"))
+        .unwrap_or_else(|| "expected a string".to_string());
+    format!(
+        "invalid [promote].mode ({detail}); using `verify-only` so it cannot enable promotion. \
+         Set it to `auto`, `manual`, `verify-only`, `none`, or `off`."
+    )
+}
+
 impl PromoteConfig {
     /// Load `[promote]` with the same trust rule as the push policy.
     ///
@@ -159,37 +169,49 @@ impl PromoteConfig {
     /// thing and the broker did another. As fresh as the last fetch; never
     /// fetches.
     pub fn load(main_root: &Path) -> Self {
+        Self::load_with_warning(main_root).0
+    }
+
+    pub(crate) fn load_with_warning(main_root: &Path) -> (Self, Option<String>) {
         Self::from_text(repository_config_text(main_root).as_deref())
     }
 
-    fn from_text(text: Option<&str>) -> Self {
+    fn from_text(text: Option<&str>) -> (Self, Option<String>) {
         let mut config = Self {
             branch: DEFAULT_INTEGRATION_BRANCH.to_string(),
             mode: PromoteMode::Auto,
         };
+        let mut warning = None;
         let Some(text) = text else {
-            return config;
+            return (config, warning);
         };
         let Ok(value) = text.parse::<toml::Value>() else {
-            return config;
+            return (config, warning);
         };
         if let Some(promote) = value.get("promote") {
             if let Some(branch) = promote.get("branch").and_then(|v| v.as_str()) {
                 config.branch = branch.to_string();
             }
-            if let Some(mode) = promote.get("mode").and_then(|v| v.as_str()) {
-                // Unknown values keep the historical default rather than
-                // failing the load: a typo in this key must not make the
-                // broker unusable, and the mode is reported wherever it
-                // matters so a wrong value is visible.
-                config.mode = match mode {
-                    "manual" => PromoteMode::Manual,
-                    "verify-only" | "none" | "off" => PromoteMode::VerifyOnly,
-                    _ => PromoteMode::Auto,
+            if let Some(mode) = promote.get("mode") {
+                // Decision for #691: preserve broker diagnostics while failing
+                // closed. An unknown critical mode warns and disables promotion
+                // instead of silently restoring the permissive `auto` default.
+                config.mode = match mode.as_str() {
+                    Some("auto") => PromoteMode::Auto,
+                    Some("manual") => PromoteMode::Manual,
+                    Some("verify-only" | "none" | "off") => PromoteMode::VerifyOnly,
+                    Some(value) => {
+                        warning = Some(invalid_promote_mode_warning(Some(value)));
+                        PromoteMode::VerifyOnly
+                    }
+                    None => {
+                        warning = Some(invalid_promote_mode_warning(None));
+                        PromoteMode::VerifyOnly
+                    }
                 };
             }
         }
-        config
+        (config, warning)
     }
 }
 
@@ -1195,13 +1217,15 @@ impl Broker {
             )?;
         }
 
-        let configured = PromoteConfig::load(&self.main_root_path()).mode;
+        let (promote_config, promotion_config_warning) =
+            PromoteConfig::load_with_warning(&self.main_root_path());
+        let configured = promote_config.mode;
         let effective = match intent {
             PromotionIntent::Configured => configured,
             PromotionIntent::VerifyOnly => PromoteMode::VerifyOnly,
         };
         let mut promoted = false;
-        let mut promotion_suppressed = None;
+        let mut promotion_suppressed = promotion_config_warning.clone();
         if all_pass {
             match effective {
                 PromoteMode::Auto => {
@@ -1216,7 +1240,7 @@ impl Broker {
                     ));
                 }
                 PromoteMode::VerifyOnly => {
-                    promotion_suppressed = Some(match intent {
+                    let reason = match intent {
                         PromotionIntent::VerifyOnly => {
                             "verified; --verify-only, so nothing was promoted".to_string()
                         }
@@ -1225,6 +1249,10 @@ impl Broker {
                              checked and nothing was moved"
                                 .to_string()
                         }
+                    };
+                    promotion_suppressed = Some(match promotion_config_warning.as_deref() {
+                        Some(warning) => format!("{reason}; {warning}"),
+                        None => reason,
                     });
                 }
             }
