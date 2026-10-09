@@ -151,6 +151,15 @@ This does not weaken `aethyme update`'s rule that nothing installs in the
 background: what runs detached downloads a manifest and prints a verdict, and
 nothing it does can change a binary.
 
+### A stale Claude Code plugin
+
+Claude Code caches installed plugin files by the version in `plugin.json`. At
+`SessionStart`, the bundled CLI compares the installed Claude hooks with the
+copies it was built to expect. If either hook file is missing or differs, the
+notice names the update command. If Claude says the plugin is already current,
+the notice gives the uninstall-and-install command to refresh its cached copy.
+The hook only reports the mismatch; it never changes the plugin installation.
+
 | Variable | Effect |
 | --- | --- |
 | `AETHYME_UPDATE_CHECK=off` | Silence both notices and the background refresh. |
