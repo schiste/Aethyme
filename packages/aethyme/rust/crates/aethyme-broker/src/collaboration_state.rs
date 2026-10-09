@@ -41,10 +41,16 @@ pub const COLLABORATION_STATE_SCHEMA_VERSION: i64 = 4;
 /// The oldest schema a database written by this binary can be read by.
 /// Unlike `host-operations.db`, a newer database stays readable by an older
 /// binary until a release raises this floor.
-const MIN_COMPATIBLE_SCHEMA: i64 = 1;
+///
+/// Raised to 4 with reclamation (#659): a schema 3 binary would capture
+/// without the archive lock, the reuse refresh or the reclaimed-marker
+/// clearing, so reclamation could remove source it had just named. No
+/// release shipped schema 2 or 3, so nothing that exists is locked out.
+const MIN_COMPATIBLE_SCHEMA: i64 = 4;
 const ROOT_DIRECTORY: &str = "collaboration";
 /// Additive schema steps after the version 1 layout (`meta` only), applied in
-/// order. Each only adds tables, so none raises the compatibility floor.
+/// order. Each only adds tables; after migrating, the compatibility floor is
+/// raised to [`MIN_COMPATIBLE_SCHEMA`].
 const MIGRATIONS: &[(i64, &str)] = &[
     (
         2,
@@ -929,9 +935,10 @@ fn initialise(
             )
             .map_err(sqlite)?;
         for (key, value) in [
-            // The version 1 layout; MIGRATIONS bring it up to date below.
+            // The version 1 layout; MIGRATIONS and the floor below bring it
+            // up to date.
             ("schema_version", "1".to_string()),
-            ("min_compatible_schema", MIN_COMPATIBLE_SCHEMA.to_string()),
+            ("min_compatible_schema", "1".to_string()),
             ("project_key", project.as_str().to_string()),
         ] {
             transaction
@@ -1006,6 +1013,14 @@ fn initialise(
         transaction.commit().map_err(sqlite)?;
         found = found.max(version);
     }
+    // Never lowered: a store another binary raised further keeps its floor.
+    connection
+        .execute(
+            "UPDATE meta SET value = ?1
+             WHERE key = 'min_compatible_schema' AND CAST(value AS INTEGER) < ?2",
+            rusqlite::params![MIN_COMPATIBLE_SCHEMA.to_string(), MIN_COMPATIBLE_SCHEMA],
+        )
+        .map_err(sqlite)?;
     Ok(found)
 }
 
@@ -1272,6 +1287,38 @@ mod tests {
         drop(store);
         let error = open(host.path(), &[]).unwrap_err();
         assert_eq!(error.code(), "schema_too_new", "{error}");
+    }
+
+    /// Schema 4 raises the floor, for new stores and for stores migrated from
+    /// schema 3, so a binary that captures without the archive lock can no
+    /// longer open a store that reclamation manages.
+    #[test]
+    fn the_floor_is_raised_for_new_and_migrated_stores() {
+        let floor = |store: &CollaborationStore| -> i64 {
+            store
+                .read_connection()
+                .query_row(
+                    "SELECT CAST(value AS INTEGER) FROM meta WHERE key = 'min_compatible_schema'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+        let host = tempfile::tempdir().unwrap();
+        let mut store = open(host.path(), &[]).unwrap();
+        assert_eq!(floor(&store), 4);
+        // As a schema 3 binary left it.
+        store
+            .connection()
+            .execute_batch(
+                "UPDATE meta SET value = '3' WHERE key = 'schema_version';
+                 UPDATE meta SET value = '1' WHERE key = 'min_compatible_schema';",
+            )
+            .unwrap();
+        drop(store);
+        let store = open(host.path(), &[]).unwrap();
+        assert_eq!(store.schema_version(), 4);
+        assert_eq!(floor(&store), 4);
     }
 
     const CRASH_CHILD: &str = "AETHYME_COLLABORATION_CRASH_CHILD";

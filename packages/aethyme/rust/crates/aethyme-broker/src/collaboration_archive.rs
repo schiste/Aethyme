@@ -363,7 +363,7 @@ fn ensure_dir(path: &Path) -> Result<(), ArchiveError> {
 }
 
 /// SHA-256 of a file's current bytes.
-fn hash_file(path: &Path) -> Result<ObjectDigest, ArchiveError> {
+pub(crate) fn hash_file(path: &Path) -> Result<ObjectDigest, ArchiveError> {
     let mut file = std::fs::File::open(path).map_err(|source| io(path, source))?;
     let mut hasher = Sha256::new();
     let mut buffer = vec![0; 64 * 1024];
@@ -430,7 +430,10 @@ fn new_temporary(store: &CollaborationStore) -> Result<tempfile::NamedTempFile, 
 }
 
 /// Store `bytes` and return their name.
-pub fn put_object(store: &CollaborationStore, bytes: &[u8]) -> Result<ObjectDigest, ArchiveError> {
+pub(crate) fn put_object(
+    store: &CollaborationStore,
+    bytes: &[u8],
+) -> Result<ObjectDigest, ArchiveError> {
     let mut temporary = new_temporary(store)?;
     let path = temporary.path().to_path_buf();
     temporary
@@ -976,7 +979,11 @@ fn refuse_transforming_attributes(
 /// Retain the tree of `commit` from `repo`: every blob, the #652 manifest,
 /// and a retained-snapshot record. Idempotent: retaining the same commit
 /// again copies nothing new and returns the same snapshot.
-pub fn retain_snapshot(
+///
+/// Only capture writes the archive in production, through the `_with`
+/// form under the archive lock; this wrapper is for tests.
+#[cfg(test)]
+pub(crate) fn retain_snapshot(
     store: &mut CollaborationStore,
     repo: &Path,
     commit: &CommitOid,
@@ -1168,7 +1175,11 @@ fn snapshot_record(
 
 /// Retain a contribution: its base and result snapshots, after checking that
 /// `base` is an ancestor of `result`, plus a lineage record.
-pub fn retain_contribution(
+///
+/// Only capture writes the archive in production, through the `_with`
+/// form under the archive lock; this wrapper is for tests.
+#[cfg(test)]
+pub(crate) fn retain_contribution(
     store: &mut CollaborationStore,
     repo: &Path,
     base: &CommitOid,

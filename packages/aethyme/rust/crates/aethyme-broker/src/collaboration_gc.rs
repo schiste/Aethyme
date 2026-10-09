@@ -32,15 +32,21 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use crate::collaboration_archive::{
-    ObjectDigest, object_path, objects_dir, parse_manifest, read_object, spool_dir,
+    ObjectDigest, hash_file, object_path, objects_dir, parse_manifest, read_object, spool_dir,
 };
 use crate::collaboration_state::{CollaborationStateError, CollaborationStore, sync_directory};
 use crate::file_lock::open_lock_file;
 
-/// How long an unrooted object is kept after it was last written.
-pub const DEFAULT_GRACE_MS: i64 = 24 * 60 * 60 * 1000;
 /// How long a recorded plan may be applied.
 pub const PLAN_TTL_MS: i64 = 24 * 60 * 60 * 1000;
+/// How long an unrooted object is kept after it was last written. Coupled to
+/// [`PLAN_TTL_MS`]: grace is never shorter than a plan's lifetime, so an
+/// object a plan names cannot be reused by a new index entry and still look
+/// old when that plan is applied.
+pub const DEFAULT_GRACE_MS: i64 = PLAN_TTL_MS;
+/// The most files one generation removes; the rest wait for the next plan.
+/// Bounds how long apply holds the archive exclusively.
+pub const MAX_ITEMS_PER_GENERATION: usize = 10_000;
 
 fn now_ms() -> i64 {
     std::time::SystemTime::now()
@@ -213,25 +219,35 @@ pub struct Resumed {
     pub restored: usize,
 }
 
+/// Expiry and grace are always judged against the real clock: there is no
+/// way to evaluate "later", which would reclaim live `until` roots, leases
+/// and pins early.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GcOptions {
+    /// At least [`PLAN_TTL_MS`]; anything shorter is refused.
     pub grace_ms: i64,
-    /// The time to judge expiry and grace by; `None` is now.
-    pub now_ms: Option<i64>,
 }
 
 impl Default for GcOptions {
     fn default() -> Self {
         Self {
             grace_ms: DEFAULT_GRACE_MS,
-            now_ms: None,
         }
     }
 }
 
 impl GcOptions {
     fn now(&self) -> i64 {
-        self.now_ms.unwrap_or_else(now_ms)
+        now_ms()
+    }
+
+    fn validate(&self) -> Result<(), GcError> {
+        if self.grace_ms < PLAN_TTL_MS {
+            return Err(GcError::InvalidGrace {
+                grace_ms: self.grace_ms,
+            });
+        }
+        Ok(())
     }
 }
 
@@ -263,6 +279,16 @@ pub enum GcError {
     NotRetained { what: String },
     #[error("holder must be 1-200 bytes")]
     InvalidHolder,
+    #[error(
+        "a grace period of {grace_ms} ms is shorter than a plan's lifetime ({PLAN_TTL_MS} ms); \
+         an object a plan names could be reused and still look old at apply"
+    )]
+    InvalidGrace { grace_ms: i64 },
+    #[error(
+        "{} is not a real directory; reclamation never follows a link out of the store",
+        path.display()
+    )]
+    SymlinkedPath { path: PathBuf },
     #[cfg(test)]
     #[error("injected fault after {0} moves")]
     Injected(usize),
@@ -286,6 +312,8 @@ impl GcError {
             Self::StalePlan { .. } => "stale_plan",
             Self::NotRetained { .. } => "not_retained",
             Self::InvalidHolder => "invalid_holder",
+            Self::InvalidGrace { .. } => "invalid_grace",
+            Self::SymlinkedPath { .. } => "symlinked_path",
             #[cfg(test)]
             Self::Injected(_) => "injected",
             Self::Io { .. } => "io",
@@ -300,6 +328,18 @@ fn io(path: &Path, source: std::io::Error) -> GcError {
         path: path.to_path_buf(),
         source,
     }
+}
+
+/// Whether the file at `path` is a regular file (never followed through a
+/// symlink) whose bytes hash to `digest`. Streams the file; nothing is read
+/// whole.
+fn intact_at(path: &Path, digest: &ObjectDigest) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_file())
+        && hash_file(path).is_ok_and(|found| found == *digest)
+}
+
+fn intact(store: &CollaborationStore, digest: &ObjectDigest) -> bool {
+    intact_at(&object_path(store, digest), digest)
 }
 
 // ------------------------------------------------------- leases and pins
@@ -389,7 +429,7 @@ pub fn pin_object(
 ) -> Result<i64, GcError> {
     check_holder(holder)?;
     let _use = archive_use(store).map_err(|source| io(&lock_path(store), source))?;
-    if read_object(store, digest).is_err() {
+    if !intact(store, digest) {
         return Err(GcError::NotRetained {
             what: format!("object {}", digest.hex()),
         });
@@ -443,6 +483,16 @@ fn parse_hex_digest(text: &str) -> Option<ObjectDigest> {
     Some(ObjectDigest::from_bytes(bytes))
 }
 
+/// The digest an object relpath names; `None` for anything else.
+fn object_digest(relpath: &str) -> Option<ObjectDigest> {
+    let rest = relpath.strip_prefix("objects/sha256/")?;
+    let (prefix, name) = rest.split_once('/')?;
+    if prefix.len() != 2 {
+        return None;
+    }
+    parse_hex_digest(&format!("{prefix}{name}"))
+}
+
 fn object_relpath(digest: &ObjectDigest) -> String {
     let hex = digest.hex();
     format!("objects/sha256/{}/{}", &hex[..2], &hex[2..])
@@ -452,6 +502,55 @@ fn modified_ms(path: &Path) -> Option<i64> {
     let modified = std::fs::metadata(path).ok()?.modified().ok()?;
     let elapsed = modified.duration_since(std::time::UNIX_EPOCH).ok()?;
     i64::try_from(elapsed.as_millis()).ok()
+}
+
+/// Whether every component of `relative` under the project directory is a
+/// real directory. `Ok(false)` when one is missing. A symlinked or
+/// non-directory component is reported in `unknown` and also gives
+/// `Ok(false)`: reclamation never follows a link out of the store.
+fn real_dir(
+    store: &CollaborationStore,
+    relative: &str,
+    unknown: &mut Vec<String>,
+) -> Result<bool, GcError> {
+    let mut path = store.project_dir().to_path_buf();
+    let mut shown = String::new();
+    for component in relative.split('/') {
+        path.push(component);
+        if !shown.is_empty() {
+            shown.push('/');
+        }
+        shown.push_str(component);
+        match std::fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) => {
+                unknown.push(shown);
+                return Ok(false);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(source) => return Err(io(&path, source)),
+        }
+    }
+    Ok(true)
+}
+
+/// The sorted entries of `relative`, if it is a real directory.
+fn real_dir_entries(
+    store: &CollaborationStore,
+    relative: &str,
+    unknown: &mut Vec<String>,
+) -> Result<Vec<PathBuf>, GcError> {
+    if !real_dir(store, relative, unknown)? {
+        return Ok(Vec::new());
+    }
+    let dir = store.project_dir().join(relative);
+    let mut entries: Vec<PathBuf> = std::fs::read_dir(&dir)
+        .map_err(|source| io(&dir, source))?
+        .map(|entry| entry.map(|entry| entry.path()))
+        .collect::<Result<_, _>>()
+        .map_err(|source| io(&dir, source))?;
+    entries.sort();
+    Ok(entries)
 }
 
 /// The objects one index entry names, with their classes.
@@ -477,7 +576,9 @@ impl<'a> Closure<'a> {
     }
 
     fn object(&mut self, digest: ObjectDigest, class: RetentionClass) {
-        if !object_path(self.store, &digest).is_file() {
+        if !std::fs::symlink_metadata(object_path(self.store, &digest))
+            .is_ok_and(|metadata| metadata.is_file())
+        {
             self.problems
                 .push(format!("object {} is missing", digest.hex()));
         }
@@ -509,8 +610,11 @@ impl<'a> Closure<'a> {
         };
         let manifest_digest = ObjectDigest::of_snapshot(&snapshot_id);
         self.object(manifest_digest, RetentionClass::Source);
-        let Some(snapshot) = read_object(self.store, &manifest_digest)
-            .ok()
+        let regular = std::fs::symlink_metadata(object_path(self.store, &manifest_digest))
+            .is_ok_and(|metadata| metadata.is_file());
+        let Some(snapshot) = regular
+            .then(|| read_object(self.store, &manifest_digest).ok())
+            .flatten()
             .and_then(|bytes| parse_manifest(&bytes))
         else {
             self.problems
@@ -784,16 +888,11 @@ fn survey(
     let mut protected_bytes = 0;
     let mut unknown = Vec::new();
     let mut candidates = BTreeMap::new();
-    let objects = objects_dir(store);
-    let mut fan_outs: Vec<PathBuf> = match std::fs::read_dir(&objects) {
-        Ok(entries) => entries
-            .map(|entry| entry.map(|entry| entry.path()))
-            .collect::<Result<_, _>>()
-            .map_err(|source| io(&objects, source))?,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-        Err(source) => return Err(io(&objects, source)),
-    };
-    fan_outs.sort();
+    debug_assert_eq!(
+        objects_dir(store),
+        store.project_dir().join("objects/sha256")
+    );
+    let fan_outs = real_dir_entries(store, "objects/sha256", &mut unknown)?;
     for fan_out in fan_outs {
         let prefix = fan_out
             .file_name()
@@ -806,16 +905,13 @@ fn survey(
                 .to_string_lossy()
                 .into_owned()
         };
-        if !fan_out.is_dir() || parse_hex_digest(&format!("{prefix}{}", "0".repeat(62))).is_none() {
+        // A symlinked or non-directory fan-out is reported by
+        // `real_dir_entries` below; only the name is checked here.
+        if parse_hex_digest(&format!("{prefix}{}", "0".repeat(62))).is_none() {
             unknown.push(relative(&fan_out));
             continue;
         }
-        let mut files: Vec<PathBuf> = std::fs::read_dir(&fan_out)
-            .map_err(|source| io(&fan_out, source))?
-            .map(|entry| entry.map(|entry| entry.path()))
-            .collect::<Result<_, _>>()
-            .map_err(|source| io(&fan_out, source))?;
-        files.sort();
+        let files = real_dir_entries(store, &format!("objects/sha256/{prefix}"), &mut unknown)?;
         for file in files {
             let name = file
                 .file_name()
@@ -857,24 +953,24 @@ fn survey(
     }
 
     // Abandoned archive temporaries and ended operations' lock files.
-    let spool = spool_dir(store);
-    if let Ok(entries) = std::fs::read_dir(&spool) {
-        for entry in entries {
-            let path = entry.map_err(|source| io(&spool, source))?.path();
+    debug_assert_eq!(spool_dir(store), store.project_dir().join("spool/archive"));
+    for path in real_dir_entries(store, "spool/archive", &mut unknown)? {
+        {
             let name = path
                 .file_name()
                 .and_then(|name| name.to_str())
                 .unwrap_or_default()
                 .to_string();
             let relpath = format!("spool/archive/{name}");
-            if !name.starts_with(".object-") || !path.is_file() {
+            let regular = std::fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.is_file());
+            if !name.starts_with(".object-") || !regular {
                 unknown.push(relpath);
                 continue;
             }
             if modified_ms(&path).is_none_or(|ms| ms > now - options.grace_ms) {
                 continue;
             }
-            let bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            let bytes = std::fs::symlink_metadata(&path).map_or(0, |m| m.len());
             candidates.insert(
                 relpath.clone(),
                 GcItem {
@@ -886,10 +982,19 @@ fn survey(
             );
         }
     }
-    let locks = crate::collaboration_capture::locks_dir(store);
-    if let Ok(entries) = std::fs::read_dir(&locks) {
-        for entry in entries {
-            let path = entry.map_err(|source| io(&locks, source))?.path();
+    debug_assert_eq!(
+        crate::collaboration_capture::locks_dir(store),
+        store.project_dir().join("spool/capture")
+    );
+    for path in real_dir_entries(store, "spool/capture", &mut unknown)? {
+        {
+            if !std::fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.is_file()) {
+                unknown.push(format!(
+                    "spool/capture/{}",
+                    path.file_name().unwrap_or_default().to_string_lossy()
+                ));
+                continue;
+            }
             let Some(operation) = path
                 .file_name()
                 .and_then(|name| name.to_str())
@@ -971,6 +1076,7 @@ fn kind_name(kind: ItemKind) -> &'static str {
 
 /// Survey the archive and record a plan. Removes nothing.
 pub fn plan(store: &mut CollaborationStore, options: &GcOptions) -> Result<GcPlan, GcError> {
+    options.validate()?;
     let survey = survey(store, options, None)?;
     let reclaimable: Vec<GcItem> = survey.candidates.into_values().collect();
     let entities: Vec<GcEntity> = survey.entities.into_iter().collect();
@@ -1146,6 +1252,7 @@ pub(crate) fn apply_with(
     options: &GcOptions,
     hooks: &GcHooks,
 ) -> Result<GcReport, GcError> {
+    options.validate()?;
     let Some(_exclusive) = try_exclusive(store)? else {
         return Err(GcError::ArchiveInUse);
     };
@@ -1183,9 +1290,8 @@ pub(crate) fn apply_with(
             Some(item) if kind_name(item.kind) == kind && item.bytes == bytes => {
                 // An object that does not hash to its name is not ours to judge.
                 if item.kind == ItemKind::Object {
-                    let name = relpath.replace("objects/sha256/", "").replace('/', "");
-                    let intact = parse_hex_digest(&name)
-                        .is_some_and(|digest| read_object(store, &digest).is_ok());
+                    let intact =
+                        object_digest(&relpath).is_some_and(|digest| intact(store, &digest));
                     if !intact {
                         skipped.push((item.clone(), "corrupt_object"));
                         continue;
@@ -1221,6 +1327,72 @@ pub(crate) fn apply_with(
         })
         .filter(|entity| survey.entities.contains(entity))
         .collect();
+
+    // Anything an index entry still names stays, unless that entry is marked
+    // reclaimed in this generation. An entry created after the plan (say, a
+    // refused capture's snapshot that reused a planned orphan) is not in
+    // `entities`, so its objects are kept and it stays whole.
+    let unmarked_contributions: Vec<String> = store
+        .read_connection()
+        .prepare(
+            "SELECT lineage_record_id FROM retained_contributions
+             WHERE lineage_record_id NOT IN (SELECT lineage_record_id FROM reclaimed_contributions)",
+        )?
+        .query_map([], |row| row.get(0))?
+        .collect::<Result<_, _>>()?;
+    let mut named = Closure::new(store);
+    for lineage in unmarked_contributions {
+        if !entities.contains(&GcEntity::Contribution(lineage.clone())) {
+            named.contribution(&lineage)?;
+        }
+    }
+    // A snapshot a surviving contribution names is not marked either.
+    let entities: Vec<GcEntity> = entities
+        .into_iter()
+        .filter(|entity| !matches!(entity, GcEntity::Snapshot(id) if named.snapshots.contains(id)))
+        .collect();
+    let unmarked_snapshots: Vec<String> = store
+        .read_connection()
+        .prepare(
+            "SELECT snapshot_id FROM retained_snapshots
+             WHERE snapshot_id NOT IN (SELECT snapshot_id FROM reclaimed_snapshots)",
+        )?
+        .query_map([], |row| row.get(0))?
+        .collect::<Result<_, _>>()?;
+    for id in unmarked_snapshots {
+        if !entities.contains(&GcEntity::Snapshot(id.clone())) {
+            named.snapshot(&id)?;
+        }
+    }
+    let mut kept_items = Vec::new();
+    for item in std::mem::take(&mut reclaim) {
+        let digest = object_digest(&item.relpath);
+        if digest.is_some_and(|digest| named.objects.contains_key(&digest)) {
+            skipped.push((item, "named_by_index"));
+        } else {
+            kept_items.push(item);
+        }
+    }
+    let reclaim = kept_items;
+
+    // Lock files are unlinked directly, each only while holding its flock and
+    // only for an operation no retry can resume (#716's contract).
+    let (locks, mut reclaim): (Vec<GcItem>, Vec<GcItem>) = reclaim
+        .into_iter()
+        .partition(|item| item.kind == ItemKind::OperationLock);
+    let mut reclaimed_locks = Vec::new();
+    for item in locks {
+        match unlink_operation_lock(store, &item)? {
+            None => reclaimed_locks.push(item),
+            Some(reason) => skipped.push((item, reason)),
+        }
+    }
+    // Bound how long the archive stays held.
+    if reclaim.len() > MAX_ITEMS_PER_GENERATION {
+        for item in reclaim.split_off(MAX_ITEMS_PER_GENERATION) {
+            skipped.push((item, "deferred_to_next_generation"));
+        }
+    }
 
     // The decision is durable before any file moves.
     let now = now_ms();
@@ -1260,17 +1432,17 @@ pub(crate) fn apply_with(
     transaction.execute("DELETE FROM gc_plans WHERE digest = ?1", [digest])?;
     transaction.commit()?;
 
-    let trash = trash_dir(store, generation);
-    std::fs::create_dir_all(&trash).map_err(|source| io(&trash, source))?;
+    let trash = prepare_trash(store, generation)?;
     let mut touched = BTreeSet::new();
     for (index, item) in reclaim.iter().enumerate() {
-        hooks.moved(index)?;
         move_to_trash(store, generation, &item.relpath, &mut touched)?;
+        hooks.moved(index + 1)?;
     }
     for dir in touched.iter().chain(std::iter::once(&trash)) {
         sync_directory(dir)?;
     }
     finish_generation(store, generation)?;
+    reclaim.extend(reclaimed_locks);
     Ok(GcReport {
         generation: Some(generation),
         reclaimed_bytes: reclaim.iter().map(|item| item.bytes).sum(),
@@ -1280,12 +1452,84 @@ pub(crate) fn apply_with(
     })
 }
 
+/// Unlink an ended operation's lock file while holding its flock. `None`
+/// when it was removed; otherwise why it stays.
+fn unlink_operation_lock(
+    store: &CollaborationStore,
+    item: &GcItem,
+) -> Result<Option<&'static str>, GcError> {
+    let path = store.project_dir().join(&item.relpath);
+    if !std::fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.is_file()) {
+        return Ok(Some("no_longer_eligible"));
+    }
+    // Never created here: a missing file is not recreated.
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(Some("no_longer_eligible"));
+        }
+        Err(source) => return Err(io(&path, source)),
+    };
+    match file.try_lock() {
+        Ok(()) => {}
+        Err(std::fs::TryLockError::WouldBlock) => return Ok(Some("lock_held")),
+        Err(std::fs::TryLockError::Error(source)) => return Err(io(&path, source)),
+    }
+    let operation = item
+        .relpath
+        .trim_start_matches("spool/capture/")
+        .trim_end_matches(".lock");
+    let state: Option<String> = store
+        .read_connection()
+        .query_row(
+            "SELECT state FROM capture_operations WHERE operation_id = ?1",
+            [operation],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if !matches!(
+        state.as_deref(),
+        Some("committed" | "acknowledged" | "refused" | "aborted")
+    ) {
+        return Ok(Some("retryable_operation"));
+    }
+    std::fs::remove_file(&path).map_err(|source| io(&path, source))?;
+    if let Some(parent) = path.parent() {
+        sync_directory(parent)?;
+    }
+    drop(file);
+    Ok(None)
+}
+
+/// The generation's trash directory, created under real directories only.
+fn prepare_trash(store: &CollaborationStore, generation: i64) -> Result<PathBuf, GcError> {
+    let mut unknown = Vec::new();
+    for relative in ["spool", "spool/gc"] {
+        if !real_dir(store, relative, &mut unknown)? && !unknown.is_empty() {
+            return Err(GcError::SymlinkedPath {
+                path: store.project_dir().join(relative),
+            });
+        }
+    }
+    let trash = trash_dir(store, generation);
+    std::fs::create_dir_all(&trash).map_err(|source| io(&trash, source))?;
+    if !real_dir(store, &format!("spool/gc/{generation}"), &mut unknown)? {
+        return Err(GcError::SymlinkedPath { path: trash });
+    }
+    Ok(trash)
+}
+
 /// Finish every interrupted generation. Each file is revalidated first: one
 /// that something now relies on is put back, the rest are removed.
 pub fn resume(
     store: &mut CollaborationStore,
     options: &GcOptions,
 ) -> Result<Vec<Resumed>, GcError> {
+    options.validate()?;
     let Some(_exclusive) = try_exclusive(store)? else {
         return Err(GcError::ArchiveInUse);
     };
@@ -1312,26 +1556,59 @@ pub fn resume(
             for relpath in &rows {
                 let trashed = trash_path(store, generation, relpath);
                 let original = store.project_dir().join(relpath);
-                if trashed.exists() {
-                    if original.exists() {
-                        // A later capture wrote it again; the copies are the same.
+                let present = |path: &Path| std::fs::symlink_metadata(path).is_ok();
+                if !present(&trashed) {
+                    continue;
+                }
+                if !present(&original) {
+                    std::fs::rename(&trashed, &original).map_err(|source| io(&original, source))?;
+                    moved_back.insert(relpath.clone());
+                    continue;
+                }
+                // A later capture wrote it again. Keep whichever copy matches
+                // its name; a copy that does not is set aside, never deleted.
+                let Some(digest) = object_digest(relpath) else {
+                    std::fs::remove_file(&trashed).map_err(|source| io(&trashed, source))?;
+                    continue;
+                };
+                let aside = |suffix: &str| {
+                    let mut name = original.file_name().unwrap_or_default().to_os_string();
+                    name.push(format!(".corrupt-{generation}-{suffix}"));
+                    original.with_file_name(name)
+                };
+                if intact_at(&original, &digest) {
+                    if intact_at(&trashed, &digest) {
                         std::fs::remove_file(&trashed).map_err(|source| io(&trashed, source))?;
                     } else {
-                        std::fs::rename(&trashed, &original)
-                            .map_err(|source| io(&original, source))?;
-                        moved_back.insert(relpath.clone());
+                        let aside = aside("trashed");
+                        std::fs::rename(&trashed, &aside).map_err(|source| io(&aside, source))?;
                     }
+                } else if intact_at(&trashed, &digest) {
+                    let set_aside = aside("original");
+                    std::fs::rename(&original, &set_aside)
+                        .map_err(|source| io(&set_aside, source))?;
+                    std::fs::rename(&trashed, &original).map_err(|source| io(&original, source))?;
+                    moved_back.insert(relpath.clone());
+                } else {
+                    let aside = aside("trashed");
+                    std::fs::rename(&trashed, &aside).map_err(|source| io(&aside, source))?;
+                }
+                if let Some(parent) = original.parent() {
+                    sync_directory(parent)?;
                 }
             }
             let survey = survey(store, options, Some(generation))?;
             if !survey.blockers.is_empty() {
                 return Err(GcError::Blocked(survey.blockers));
             }
-            let trash = trash_dir(store, generation);
-            std::fs::create_dir_all(&trash).map_err(|source| io(&trash, source))?;
+            let trash = prepare_trash(store, generation)?;
             let mut touched = BTreeSet::new();
             for relpath in &rows {
-                if survey.candidates.contains_key(relpath) {
+                // The same integrity check apply makes: a file that does not
+                // hash to its name is not reclamation's to remove.
+                let intact_object = object_digest(relpath)
+                    .is_none_or(|digest| intact_at(&store.project_dir().join(relpath), &digest));
+                if survey.candidates.contains_key(relpath) && intact_object {
                     move_to_trash(store, generation, relpath, &mut touched)?;
                     removed += 1;
                 } else if moved_back.contains(relpath) || store.project_dir().join(relpath).exists()
@@ -1432,11 +1709,37 @@ mod tests {
         }
     }
 
-    /// Judge everything as old: a day from now, no grace.
-    fn later() -> GcOptions {
-        GcOptions {
-            grace_ms: 0,
-            now_ms: Some(now_ms() + 1000),
+    /// The production settings: real clock, default grace.
+    fn defaults() -> GcOptions {
+        GcOptions::default()
+    }
+
+    /// Make every archive and spool file three days old, as if the grace
+    /// period had passed. Nothing is followed through a link.
+    fn age(store: &CollaborationStore) {
+        let then = std::time::SystemTime::now() - std::time::Duration::from_secs(3 * 86_400);
+        let mut pending = vec![
+            store.project_dir().join("objects"),
+            store.project_dir().join("spool"),
+        ];
+        while let Some(dir) = pending.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+                    continue;
+                };
+                if metadata.is_dir() {
+                    pending.push(path);
+                } else if metadata.is_file() {
+                    std::fs::File::open(&path)
+                        .unwrap()
+                        .set_modified(then)
+                        .unwrap();
+                }
+            }
         }
     }
 
@@ -1481,7 +1784,8 @@ mod tests {
                 RetentionBoundary::UntilReleased,
             ),
         );
-        let plan = plan(&mut store, &later()).unwrap();
+        age(&store);
+        let plan = plan(&mut store, &defaults()).unwrap();
         assert!(plan.blockers.is_empty(), "{:?}", plan.blockers);
         assert!(objects(&plan).is_empty(), "{:?}", plan.reclaimable);
         assert!(plan.entities.is_empty());
@@ -1500,7 +1804,7 @@ mod tests {
                 .iter()
                 .all(|item| item.kind == ItemKind::OperationLock)
         );
-        apply(&mut store, &plan.digest, &later()).unwrap();
+        apply(&mut store, &plan.digest, &defaults()).unwrap();
         assert_reconstructs(&store, &one);
     }
 
@@ -1520,11 +1824,12 @@ mod tests {
             ),
         );
         assert!(release_retention(&mut store, "op-1").unwrap());
-        let plan = plan(&mut store, &later()).unwrap();
+        age(&store);
+        let plan = plan(&mut store, &defaults()).unwrap();
         // 4 blobs, 2 manifests, 2 snapshot records, the lineage and the receipt.
         assert_eq!(objects(&plan).len(), 10, "{:?}", plan.reclaimable);
         assert_eq!(plan.entities.len(), 3);
-        let report = apply(&mut store, &plan.digest, &later()).unwrap();
+        let report = apply(&mut store, &plan.digest, &defaults()).unwrap();
         assert!(report.skipped.is_empty(), "{:?}", report.skipped);
         assert_eq!(object_files(&store), 0);
         for id in [&one.base, &one.result] {
@@ -1559,7 +1864,8 @@ mod tests {
         );
         assert_eq!(two.contribution, one.contribution);
         assert_reconstructs(&store, &two);
-        let plan = super::plan(&mut store, &later()).unwrap();
+        age(&store);
+        let plan = super::plan(&mut store, &defaults()).unwrap();
         assert!(plan.blockers.is_empty(), "{:?}", plan.blockers);
         assert!(
             objects(&plan)
@@ -1595,7 +1901,8 @@ mod tests {
             ),
         );
         release_retention(&mut store, "op-1").unwrap();
-        let plan = plan(&mut store, &later()).unwrap();
+        age(&store);
+        let plan = plan(&mut store, &defaults()).unwrap();
         let classes: Vec<_> = objects(&plan).iter().map(|item| item.class).collect();
         assert_eq!(
             classes,
@@ -1603,7 +1910,7 @@ mod tests {
             "only op-1's receipt goes"
         );
         assert!(plan.entities.is_empty());
-        apply(&mut store, &plan.digest, &later()).unwrap();
+        apply(&mut store, &plan.digest, &defaults()).unwrap();
         assert_reconstructs(&store, &two);
     }
 
@@ -1614,7 +1921,8 @@ mod tests {
         let host = tempfile::tempdir().unwrap();
         let (source, base, result) = repo("x");
         let mut store = open(host.path());
-        let expires = now_ms() + 60_000;
+        // A boundary already in the past: the root is expired from the start.
+        let expired = now_ms() - 1;
         let receipt = captured(
             &mut store,
             &request(
@@ -1622,20 +1930,18 @@ mod tests {
                 "op-1",
                 &base,
                 &result,
-                RetentionBoundary::UntilMs(expires),
+                RetentionBoundary::UntilMs(expired),
             ),
         );
         let lease = acquire_lease(
             &mut store,
             &LeaseTarget::Snapshot(receipt.result.clone()),
             "reader",
-            expires + 3_600_000,
+            now_ms() + 3_600_000,
         )
         .unwrap();
-        let after_expiry = GcOptions {
-            grace_ms: 0,
-            now_ms: Some(expires + 1),
-        };
+        let after_expiry = defaults();
+        age(&store);
         let plan = plan(&mut store, &after_expiry).unwrap();
         // The base snapshot and its unshared blob, the lineage and the receipt.
         assert!(
@@ -1653,6 +1959,7 @@ mod tests {
         assert!(retained(&store, &receipt.base).unwrap().is_none());
 
         assert!(release_lease(&mut store, lease).unwrap());
+        age(&store);
         let plan = super::plan(&mut store, &after_expiry).unwrap();
         assert!(
             plan.entities
@@ -1699,7 +2006,8 @@ mod tests {
             "not_retained"
         );
         release_retention(&mut store, "op-1").unwrap();
-        let plan = plan(&mut store, &later()).unwrap();
+        age(&store);
+        let plan = plan(&mut store, &defaults()).unwrap();
         assert_eq!(
             plan.retained.get(&RetentionClass::CitedEvidence),
             Some(&ClassTotal {
@@ -1707,7 +2015,7 @@ mod tests {
                 bytes: 11
             })
         );
-        apply(&mut store, &plan.digest, &later()).unwrap();
+        apply(&mut store, &plan.digest, &defaults()).unwrap();
         assert_eq!(read_object(&store, &evidence).unwrap(), b"x shared b\n");
         assert_eq!(object_files(&store), 1);
     }
@@ -1727,8 +2035,9 @@ mod tests {
         assert!(fresh.reclaimable.is_empty(), "{:?}", fresh.reclaimable);
         assert!(fresh.protected_bytes > 0);
         assert_eq!(fresh.unknown, ["objects/sha256/zz"]);
+        age(&store);
 
-        let old = plan(&mut store, &later()).unwrap();
+        let old = plan(&mut store, &defaults()).unwrap();
         let paths: Vec<_> = old
             .reclaimable
             .iter()
@@ -1740,7 +2049,7 @@ mod tests {
                 .iter()
                 .all(|item| item.class == RetentionClass::Orphan)
         );
-        let report = apply(&mut store, &old.digest, &later()).unwrap();
+        let report = apply(&mut store, &old.digest, &defaults()).unwrap();
         // A file that does not hash to its name is not reclaimed.
         assert_eq!(report.reclaimed.len(), 1);
         assert_eq!(report.skipped[0].1, "corrupt_object");
@@ -1767,7 +2076,8 @@ mod tests {
             ),
         );
         release_retention(&mut store, "op-1").unwrap();
-        let plan = plan(&mut store, &later()).unwrap();
+        age(&store);
+        let plan = plan(&mut store, &defaults()).unwrap();
         let two = captured(
             &mut store,
             &request(
@@ -1778,7 +2088,7 @@ mod tests {
                 RetentionBoundary::UntilReleased,
             ),
         );
-        let report = apply(&mut store, &plan.digest, &later()).unwrap();
+        let report = apply(&mut store, &plan.digest, &defaults()).unwrap();
         assert!(report.entities.is_empty(), "{:?}", report.entities);
         assert_eq!(
             report
@@ -1798,33 +2108,41 @@ mod tests {
         let host = tempfile::tempdir().unwrap();
         let mut store = open(host.path());
         crate::collaboration_archive::put_object(&store, b"orphan").unwrap();
-        let plan = plan(&mut store, &later()).unwrap();
+        age(&store);
+        let plan = plan(&mut store, &defaults()).unwrap();
         {
             let _reader = archive_use(&store).unwrap();
             assert_eq!(
-                apply(&mut store, &plan.digest, &later())
+                apply(&mut store, &plan.digest, &defaults())
                     .unwrap_err()
                     .code(),
                 "archive_in_use"
             );
         }
         assert_eq!(
-            apply(&mut store, &"0".repeat(64), &later())
+            apply(&mut store, &"0".repeat(64), &defaults())
                 .unwrap_err()
                 .code(),
             "unknown_plan"
         );
-        let much_later = GcOptions {
-            grace_ms: 0,
-            now_ms: Some(plan.created_ms + PLAN_TTL_MS + 1),
+        let set_created = |store: &mut CollaborationStore, ms: i64| {
+            store
+                .connection()
+                .execute(
+                    "UPDATE gc_plans SET created_ms = ?2 WHERE digest = ?1",
+                    rusqlite::params![plan.digest, ms],
+                )
+                .unwrap();
         };
+        set_created(&mut store, now_ms() - PLAN_TTL_MS - 1);
         assert_eq!(
-            apply(&mut store, &plan.digest, &much_later)
+            apply(&mut store, &plan.digest, &defaults())
                 .unwrap_err()
                 .code(),
             "stale_plan"
         );
-        apply(&mut store, &plan.digest, &later()).unwrap();
+        set_created(&mut store, now_ms());
+        apply(&mut store, &plan.digest, &defaults()).unwrap();
     }
 
     #[test]
@@ -1849,12 +2167,14 @@ mod tests {
             &hooks,
         )
         .unwrap_err();
-        let blocked = plan(&mut store, &later()).unwrap();
+        age(&store);
+        let blocked = plan(&mut store, &defaults()).unwrap();
         assert_eq!(blocked.blockers[0].kind, "unrecovered_capture");
         assert!(blocked.reclaimable.is_empty());
         assert!(blocked.next_action.contains("recover"));
         recover(&mut store).unwrap();
-        let plan = plan(&mut store, &later()).unwrap();
+        age(&store);
+        let plan = plan(&mut store, &defaults()).unwrap();
         assert!(plan.blockers.is_empty(), "{:?}", plan.blockers);
         assert!(!plan.reclaimable.is_empty());
     }
@@ -1889,19 +2209,21 @@ mod tests {
             ),
         );
         release_retention(&mut store, "op-1").unwrap();
-        let plan = plan(&mut store, &later()).unwrap();
+        age(&store);
+        let plan = plan(&mut store, &defaults()).unwrap();
         let hooks = GcHooks {
             fail_after_moves: Some(3),
             ..GcHooks::default()
         };
         assert_eq!(
-            apply_with(&mut store, &plan.digest, &later(), &hooks)
+            apply_with(&mut store, &plan.digest, &defaults(), &hooks)
                 .unwrap_err()
                 .code(),
             "injected"
         );
         assert_reconstructs(&store, &kept);
-        let blocked = super::plan(&mut store, &later()).unwrap();
+        age(&store);
+        let blocked = super::plan(&mut store, &defaults()).unwrap();
         assert_eq!(blocked.blockers[0].kind, "interrupted_gc");
 
         // Captured again while the generation is interrupted.
@@ -1915,13 +2237,14 @@ mod tests {
                 RetentionBoundary::UntilReleased,
             ),
         );
-        let resumed = resume(&mut store, &later()).unwrap();
+        let resumed = resume(&mut store, &defaults()).unwrap();
         assert_eq!(resumed.len(), 1);
         assert!(resumed[0].restored > 0, "{resumed:?}");
         assert_reconstructs(&store, &kept);
         assert_reconstructs(&store, &again);
+        age(&store);
         assert!(
-            super::plan(&mut store, &later())
+            super::plan(&mut store, &defaults())
                 .unwrap()
                 .blockers
                 .is_empty()
@@ -1946,7 +2269,8 @@ mod tests {
             ),
         );
         release_retention(&mut store, "op-1").unwrap();
-        let plan = plan(&mut store, &later()).unwrap();
+        age(&store);
+        let plan = plan(&mut store, &defaults()).unwrap();
 
         let racer = Arc::new(Mutex::new(None));
         let started = Arc::clone(&racer);
@@ -1970,7 +2294,7 @@ mod tests {
             )),
             ..GcHooks::default()
         };
-        let report = apply_with(&mut store, &plan.digest, &later(), &hooks).unwrap();
+        let report = apply_with(&mut store, &plan.digest, &defaults(), &hooks).unwrap();
         let receipt = racer.lock().unwrap().take().unwrap().join().unwrap();
         let removed = report
             .reclaimed
@@ -2048,6 +2372,244 @@ mod tests {
         reader.join().unwrap().unwrap();
     }
 
+    /// Grace is never shorter than a plan's lifetime.
+    #[test]
+    fn a_grace_shorter_than_a_plan_is_refused() {
+        let host = tempfile::tempdir().unwrap();
+        let mut store = open(host.path());
+        for grace_ms in [-1, 0, PLAN_TTL_MS - 1] {
+            assert_eq!(
+                plan(&mut store, &GcOptions { grace_ms })
+                    .unwrap_err()
+                    .code(),
+                "invalid_grace"
+            );
+        }
+    }
+
+    /// An index entry that appears after the plan keeps what it names, even
+    /// when file times say otherwise; it is not marked, and stays whole.
+    #[test]
+    fn an_entry_created_after_the_plan_keeps_what_it_names() {
+        let host = tempfile::tempdir().unwrap();
+        let (source, base, _) = repo("x");
+        let mut store = open(host.path());
+        let shared = crate::collaboration_archive::put_object(&store, b"x shared b\n").unwrap();
+        age(&store);
+        let plan = plan(&mut store, &defaults()).unwrap();
+        assert_eq!(objects(&plan).len(), 1);
+        let snapshot =
+            crate::collaboration_archive::retain_snapshot(&mut store, source.path(), &base)
+                .unwrap();
+        // As if the clock or file times were unreliable.
+        age(&store);
+        let report = apply(&mut store, &plan.digest, &defaults()).unwrap();
+        assert!(
+            report
+                .skipped
+                .iter()
+                .any(|(item, reason)| *reason == "named_by_index"
+                    && item.relpath == object_relpath(&shared)),
+            "{:?}",
+            report.skipped
+        );
+        assert!(intact(&store, &shared));
+        let dest = tempfile::tempdir().unwrap();
+        reconstruct(&store, &snapshot.snapshot_id, &dest.path().join("tree")).unwrap();
+    }
+
+    /// A symlinked directory is reported as unknown and never followed.
+    #[test]
+    fn symlinked_directories_are_never_followed() {
+        let outside = tempfile::tempdir().unwrap();
+        let victim_name = "1".repeat(62);
+        std::fs::write(outside.path().join(&victim_name), "not the store's").unwrap();
+        std::fs::write(outside.path().join(".object-x"), "not the store's").unwrap();
+        for link in ["objects/sha256/ab", "objects/sha256", "spool/archive"] {
+            let host = tempfile::tempdir().unwrap();
+            let mut store = open(host.path());
+            crate::collaboration_archive::put_object(&store, b"keeps dirs").unwrap();
+            let path = store.project_dir().join(link);
+            if path.exists() {
+                std::fs::remove_dir_all(&path).unwrap();
+            }
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::os::unix::fs::symlink(outside.path(), &path).unwrap();
+            age(&store);
+            let plan = plan(&mut store, &defaults()).unwrap();
+            assert!(
+                plan.unknown.contains(&link.to_string()),
+                "{link}: {:?}",
+                plan.unknown
+            );
+            assert!(
+                plan.reclaimable
+                    .iter()
+                    .all(|item| !item.relpath.starts_with(link)),
+                "{link}: {:?}",
+                plan.reclaimable
+            );
+            if !plan.reclaimable.is_empty() {
+                apply(&mut store, &plan.digest, &defaults()).unwrap();
+            }
+            assert!(outside.path().join(&victim_name).exists(), "{link}");
+            assert!(outside.path().join(".object-x").exists(), "{link}");
+        }
+        // A pin never hashes through a link either.
+        let host = tempfile::tempdir().unwrap();
+        let mut store = open(host.path());
+        let digest = ObjectDigest::of(b"not the store's");
+        let path = object_path(&store, &digest);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(outside.path().join(&victim_name), &path).unwrap();
+        assert_eq!(
+            pin_object(&mut store, PinClass::CitedEvidence, &digest, "t", None)
+                .unwrap_err()
+                .code(),
+            "not_retained"
+        );
+    }
+
+    /// Resume keeps whichever copy matches its name: a corrupt original
+    /// written after the interruption is set aside, and the good trashed
+    /// copy is put back for the receipt that now relies on it.
+    #[test]
+    fn resume_keeps_the_copy_that_matches_its_name() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let host = tempfile::tempdir().unwrap();
+        let (source, base, result) = repo("x");
+        let mut store = open(host.path());
+        captured(
+            &mut store,
+            &request(
+                source.path(),
+                "op-1",
+                &base,
+                &result,
+                RetentionBoundary::UntilReleased,
+            ),
+        );
+        release_retention(&mut store, "op-1").unwrap();
+        age(&store);
+        let plan = plan(&mut store, &defaults()).unwrap();
+        let hooks = GcHooks {
+            fail_after_moves: Some(objects(&plan).len()),
+            ..GcHooks::default()
+        };
+        apply_with(&mut store, &plan.digest, &defaults(), &hooks).unwrap_err();
+        // Captured again: every moved object is written afresh.
+        let again = captured(
+            &mut store,
+            &request(
+                source.path(),
+                "op-2",
+                &base,
+                &result,
+                RetentionBoundary::UntilReleased,
+            ),
+        );
+        let digest = ObjectDigest::of(b"x shared b\n");
+        let original = object_path(&store, &digest);
+        std::fs::set_permissions(&original, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::write(&original, "damaged after the interruption").unwrap();
+
+        resume(&mut store, &defaults()).unwrap();
+        assert!(intact(&store, &digest));
+        let mut aside = original.file_name().unwrap().to_os_string();
+        aside.push(".corrupt-1-original");
+        assert!(original.with_file_name(aside).exists());
+        assert_reconstructs(&store, &again);
+    }
+
+    /// A receipt answered again never claims retained source it no longer has.
+    #[test]
+    fn a_receipt_reports_release_and_reclamation() {
+        let host = tempfile::tempdir().unwrap();
+        let (source, base, result) = repo("x");
+        let mut store = open(host.path());
+        let request = request(
+            source.path(),
+            "op-1",
+            &base,
+            &result,
+            RetentionBoundary::UntilReleased,
+        );
+        assert_eq!(captured(&mut store, &request).status, "retained_local");
+        release_retention(&mut store, "op-1").unwrap();
+        assert_eq!(captured(&mut store, &request).status, "released");
+        age(&store);
+        let plan = plan(&mut store, &defaults()).unwrap();
+        apply(&mut store, &plan.digest, &defaults()).unwrap();
+        assert_eq!(captured(&mut store, &request).status, "reclaimed");
+    }
+
+    /// A lock file goes only while GC holds its flock, and only for an
+    /// operation no retry can resume.
+    #[test]
+    fn lock_files_go_only_when_held_by_gc_and_not_retryable() {
+        let host = tempfile::tempdir().unwrap();
+        let (source, base, result) = repo("x");
+        let mut store = open(host.path());
+        captured(
+            &mut store,
+            &request(
+                source.path(),
+                "op-1",
+                &base,
+                &result,
+                RetentionBoundary::UntilReleased,
+            ),
+        );
+        let hooks = Hooks {
+            fault: Some(FaultPoint::DuringCopy(0)),
+            free_bytes: None,
+        };
+        capture_with(
+            &mut store,
+            &request(
+                source.path(),
+                "op-2",
+                &base,
+                &result,
+                RetentionBoundary::UntilReleased,
+            ),
+            &hooks,
+        )
+        .unwrap_err();
+        recover(&mut store).unwrap(); // op-2 is now `failed`: retryable.
+        let lock = crate::collaboration_capture::locks_dir(&store).join("op-1.lock");
+        let held = open_lock_file(&lock).unwrap();
+        held.lock().unwrap();
+        age(&store);
+        let plan = plan(&mut store, &defaults()).unwrap();
+        let locks: Vec<_> = plan
+            .reclaimable
+            .iter()
+            .filter(|item| item.kind == ItemKind::OperationLock)
+            .map(|item| item.relpath.as_str())
+            .collect();
+        assert_eq!(locks, ["spool/capture/op-1.lock"]);
+        let report = apply(&mut store, &plan.digest, &defaults()).unwrap();
+        assert!(
+            report
+                .skipped
+                .iter()
+                .any(|(_, reason)| *reason == "lock_held")
+        );
+        assert!(lock.exists());
+        assert!(
+            crate::collaboration_capture::locks_dir(&store)
+                .join("op-2.lock")
+                .exists()
+        );
+        drop(held);
+        age(&store);
+        let plan = super::plan(&mut store, &defaults()).unwrap();
+        apply(&mut store, &plan.digest, &defaults()).unwrap();
+        assert!(!lock.exists());
+    }
+
     const STALL_CHILD: &str = "AETHYME_GC_STALL_CHILD";
 
     #[test]
@@ -2063,7 +2625,7 @@ mod tests {
             stall_after_moves: Some(4),
             ..GcHooks::default()
         };
-        apply_with(&mut store, digest, &later(), &hooks).unwrap();
+        apply_with(&mut store, digest, &defaults(), &hooks).unwrap();
     }
 
     /// An apply killed between moves leaves a durable generation that resume
@@ -2095,7 +2657,8 @@ mod tests {
             ),
         );
         release_retention(&mut store, "op-1").unwrap();
-        let plan = plan(&mut store, &later()).unwrap();
+        age(&store);
+        let plan = plan(&mut store, &defaults()).unwrap();
         let mut child = Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
@@ -2121,14 +2684,17 @@ mod tests {
         child.wait().unwrap();
 
         assert_reconstructs(&store, &kept);
+        age(&store);
         assert_eq!(
-            super::plan(&mut store, &later()).unwrap().blockers[0].kind,
+            super::plan(&mut store, &defaults()).unwrap().blockers[0].kind,
             "interrupted_gc"
         );
-        let resumed = resume(&mut store, &later()).unwrap();
-        assert_eq!(resumed[0].removed, plan.reclaimable.len(), "{resumed:?}");
+        let resumed = resume(&mut store, &defaults()).unwrap();
+        // Lock files are unlinked before the generation, so only objects remain.
+        assert_eq!(resumed[0].removed, objects(&plan).len(), "{resumed:?}");
         assert_reconstructs(&store, &kept);
-        let after = super::plan(&mut store, &later()).unwrap();
+        age(&store);
+        let after = super::plan(&mut store, &defaults()).unwrap();
         assert!(
             after.blockers.is_empty() && objects(&after).is_empty(),
             "{after:?}"
