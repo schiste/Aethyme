@@ -942,6 +942,18 @@ pub fn retain_contribution(
     base: &CommitOid,
     result: &CommitOid,
 ) -> Result<RetainedContribution, ArchiveError> {
+    retain_contribution_with(store, repo, base, result, &mut |_| Ok(()))
+}
+
+/// [`retain_contribution`] with the per-blob hook of [`retain_snapshot_with`],
+/// run for both snapshots, so capture tests can interrupt a copy.
+pub(crate) fn retain_contribution_with(
+    store: &mut CollaborationStore,
+    repo: &Path,
+    base: &CommitOid,
+    result: &CommitOid,
+    before_blob: &mut dyn FnMut(usize) -> Result<(), ArchiveError>,
+) -> Result<RetainedContribution, ArchiveError> {
     let unavailable = |detail: String| ArchiveError::HistoryUnavailable {
         base: base.as_str().to_string(),
         result: result.as_str().to_string(),
@@ -994,8 +1006,8 @@ pub fn retain_contribution(
         .parse()
         .map_err(|_| unavailable("unreadable commit count".into()))?;
 
-    let base_snapshot = retain_snapshot(store, repo, base)?;
-    let result_snapshot = retain_snapshot(store, repo, result)?;
+    let base_snapshot = retain_snapshot_with(store, repo, base, before_blob)?;
+    let result_snapshot = retain_snapshot_with(store, repo, result, before_blob)?;
     let format = ObjectReader::open(repo)?.format;
     let (bytes, lineage_record_id) = encode(
         object(vec![
@@ -1855,7 +1867,10 @@ mod tests {
             &[],
         )
         .unwrap();
-        assert_eq!(store.schema_version(), 2);
+        assert_eq!(
+            store.schema_version(),
+            crate::collaboration_state::COLLABORATION_STATE_SCHEMA_VERSION
+        );
         assert_eq!(rows(&mut store), 0);
     }
 }
