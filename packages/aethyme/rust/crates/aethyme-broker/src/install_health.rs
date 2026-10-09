@@ -1,6 +1,6 @@
 //! Whether this machine's Aethyme installation is coherent and current.
 //!
-//! Two failures motivated this module, and neither announced itself.
+//! Three failures motivated this module, and none announced itself.
 //!
 //! **The pair split.** `aethyme` and `aethyme-engine-cli` are one product in
 //! two binaries and must be installed together. On a machine that develops
@@ -12,16 +12,23 @@
 //! **The stale release.** `aethyme update check` has always computed the right
 //! answer, and nothing ever ran it.
 //!
+//! **The stale Claude plugin.** Claude Code caches the plugin's hook files by
+//! `plugin.json` version. When the bundled hooks change without a version bump,
+//! an installed copy can keep running the old behavior after the CLI updates.
+//! The CLI now compares the installed files with the copies embedded at build
+//! time and names the update or reinstall command when they differ.
+//!
 //! So the answers are reported where they are already free: `aethyme plugin
 //! status`, which exists to say whether the installation works, and the
 //! `SessionStart` hook, which fires at a turn boundary that costs no tokens.
 //!
 //! ## Reporting is the whole contract
 //!
-//! Nothing here installs, upgrades, or repairs anything, and nothing here
-//! reaches the network. `aethyme update` keeps its stance that changing the
-//! binaries is explicit and confirmed; this only ever prints a sentence and
-//! names the command a person may choose to run.
+//! Nothing here installs, upgrades, or repairs anything. Plugin freshness is
+//! checked from local files only, and the session hook never waits on a network.
+//! `aethyme update` keeps its stance that changing binaries is explicit and
+//! confirmed; this only ever prints a sentence and names the command a person
+//! may choose to run.
 
 use std::path::PathBuf;
 use std::process::{Command, Stdio};

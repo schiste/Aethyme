@@ -111,8 +111,9 @@ or broker command.
 
 ## What `SessionStart` says about the installation
 
-Two things about this machine's Aethyme are worth a sentence at a session
-start, and are invisible everywhere else.
+Three things about this machine's Aethyme are worth a sentence at a session
+start, and are invisible everywhere else: a split binary pair, a newer release,
+and stale Claude Code hook files.
 
 ### Split pair
 
@@ -162,7 +163,7 @@ The hook only reports the mismatch; it never changes the plugin installation.
 
 | Variable | Effect |
 | --- | --- |
-| `AETHYME_UPDATE_CHECK=off` | Silence both notices and the background refresh. |
+| `AETHYME_UPDATE_CHECK=off` | Silence all installation notices and the background refresh. |
 | `AETHYME_UPDATE_CACHE_TTL_SECONDS` | How long a cached manifest counts as current. Default 6 hours; `0` disables the cache, and with it the fallback to an expired copy when the network is down. |
 
 `aethyme update check --refresh` re-asks immediately, whatever the cache holds.
