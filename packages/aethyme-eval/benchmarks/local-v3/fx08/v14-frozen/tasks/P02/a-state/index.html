@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Catalog searches</title>
+    <link rel="stylesheet" href="./styles.css">
+  </head>
+  <body>
+    <header><h1>Catalog searches</h1></header>
+    <main>
+      <div id="primary-search-mount"></div>
+      <section id="quick-find" class="panel">
+        <h2>Quick Find</h2>
+        <div class="search-row">
+          <label for="quick-query">Recent catalog search</label>
+          <input id="quick-query" type="search">
+          <button id="quick-search-button" type="button">Search recent</button>
+        </div>
+        <ul id="quick-results" class="result-list" aria-live="polite"></ul>
+      </section>
+    </main>
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>

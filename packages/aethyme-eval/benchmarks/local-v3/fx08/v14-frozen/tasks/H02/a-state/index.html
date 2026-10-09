@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Plan chooser</title>
+    <link rel="stylesheet" href="./styles.css">
+  </head>
+  <body>
+    <main class="panel">
+      <h1>Choose a plan</h1>
+      <div id="plan-options" role="group" aria-label="Plans">
+        <button id="plan-basic" type="button" data-selected-plan="basic" aria-pressed="true">
+          Basic — $10/month
+        </button>
+        <button id="plan-pro" type="button" aria-pressed="false">
+          Pro — $20/month
+        </button>
+      </div>
+      <section aria-label="Order summary">
+        <h2>Order summary</h2>
+        <p id="order-summary" class="status">Basic plan — $10/month</p>
+      </section>
+    </main>
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>

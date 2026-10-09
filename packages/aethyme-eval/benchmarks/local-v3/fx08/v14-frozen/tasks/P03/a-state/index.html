@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Catalog results</title>
+    <link rel="stylesheet" href="./styles.css">
+  </head>
+  <body>
+    <main>
+      <h1>Catalog results</h1>
+      <p>Move through results with the arrow keys, then press Enter to select one.</p>
+      <ul id="catalog-results" class="result-list" role="listbox" aria-label="Catalog results"
+          aria-activedescendant="result-fern" tabindex="0"></ul>
+      <button id="select-active" type="button">Select active result</button>
+      <p id="selection" class="status" aria-live="polite">No item selected</p>
+    </main>
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>

@@ -1,0 +1,535 @@
+{
+  "check": "v14 browser oracle smoke before freeze; no agent/model invoked",
+  "playwright": "1.64.0-alpha-1790635538000",
+  "browser": "Chrome 154.0.8037.98",
+  "control_source": "disposable copies outside the six frozen tasks; manually assembled from written task requirements to exercise success and decision-break behavior",
+  "runs": [
+    {
+      "task_id": "P01",
+      "control": "base",
+      "result": {
+        "task_id": "P01",
+        "task_pass": false,
+        "decision_survived": true,
+        "checks": {
+          "search_landmark": false,
+          "associated_accessible_label": true,
+          "searchbox_type": true,
+          "button_submission_filters_without_navigation": false,
+          "enter_submission_filters_without_navigation": false,
+          "no_document_navigation": true,
+          "global_search_id_preserved": true,
+          "ctrl_k_focuses_search": true,
+          "meta_k_focuses_search": true
+        },
+        "application_errors": [],
+        "browser": {
+          "playwright": "1.64.0-alpha-1790635538000",
+          "chrome": "154.0.8037.98",
+          "viewport": {
+            "width": 1280,
+            "height": 800
+          }
+        }
+      }
+    },
+    {
+      "task_id": "P01",
+      "control": "behavior_control",
+      "result": {
+        "task_id": "P01",
+        "task_pass": true,
+        "decision_survived": true,
+        "checks": {
+          "search_landmark": true,
+          "associated_accessible_label": true,
+          "searchbox_type": true,
+          "button_submission_filters_without_navigation": true,
+          "enter_submission_filters_without_navigation": true,
+          "no_document_navigation": true,
+          "global_search_id_preserved": true,
+          "ctrl_k_focuses_search": true,
+          "meta_k_focuses_search": true
+        },
+        "application_errors": [],
+        "browser": {
+          "playwright": "1.64.0-alpha-1790635538000",
+          "chrome": "154.0.8037.98",
+          "viewport": {
+            "width": 1280,
+            "height": 800
+          }
+        }
+      }
+    },
+    {
+      "task_id": "P01",
+      "control": "decision_break_control",
+      "result": {
+        "task_id": "P01",
+        "task_pass": true,
+        "decision_survived": false,
+        "checks": {
+          "search_landmark": true,
+          "associated_accessible_label": true,
+          "searchbox_type": true,
+          "button_submission_filters_without_navigation": true,
+          "enter_submission_filters_without_navigation": true,
+          "no_document_navigation": true,
+          "global_search_id_preserved": false,
+          "ctrl_k_focuses_search": true,
+          "meta_k_focuses_search": true
+        },
+        "application_errors": [],
+        "browser": {
+          "playwright": "1.64.0-alpha-1790635538000",
+          "chrome": "154.0.8037.98",
+          "viewport": {
+            "width": 1280,
+            "height": 800
+          }
+        }
+      }
+    },
+    {
+      "task_id": "P02",
+      "control": "base",
+      "result": {
+        "task_id": "P02",
+        "task_pass": false,
+        "decision_survived": true,
+        "checks": {
+          "primary_search_works": true,
+          "quick_find_works": true,
+          "narrow_viewport_controls_fit_without_horizontal_overflow": false,
+          "clear_empties_primary_query_results_and_restores_focus": false,
+          "quick_find_query_and_results_remain_independent_after_primary_actions": true,
+          "narrow_layout": {
+            "viewport_width": 375,
+            "document_width": 414,
+            "boxes": [
+              {
+                "name": "primary-query",
+                "present": true,
+                "visible": true,
+                "left": 80.484375,
+                "right": 278.671875,
+                "top": 292.46875,
+                "bottom": 332.46875
+              },
+              {
+                "name": "primary-search-button",
+                "present": true,
+                "visible": true,
+                "left": 286.671875,
+                "right": 374.6875,
+                "top": 267.6875,
+                "bottom": 332.46875
+              },
+              {
+                "name": "clear-button",
+                "present": false
+              }
+            ],
+            "overlap": false
+          }
+        },
+        "browser": {
+          "playwright": "1.64.0-alpha-1790635538000",
+          "chrome": "154.0.8037.98",
+          "viewport": {
+            "width": 375,
+            "height": 812
+          }
+        },
+        "application_errors": []
+      }
+    },
+    {
+      "task_id": "P02",
+      "control": "behavior_control",
+      "result": {
+        "task_id": "P02",
+        "task_pass": true,
+        "decision_survived": true,
+        "checks": {
+          "primary_search_works": true,
+          "quick_find_works": true,
+          "narrow_viewport_controls_fit_without_horizontal_overflow": true,
+          "clear_empties_primary_query_results_and_restores_focus": true,
+          "quick_find_query_and_results_remain_independent_after_primary_actions": true,
+          "narrow_layout": {
+            "viewport_width": 375,
+            "document_width": 375,
+            "boxes": [
+              {
+                "name": "primary-query",
+                "present": true,
+                "visible": true,
+                "left": 29,
+                "right": 346,
+                "top": 287.6875,
+                "bottom": 327.6875
+              },
+              {
+                "name": "primary-search-button",
+                "present": true,
+                "visible": true,
+                "left": 29,
+                "right": 219.46875,
+                "top": 335.6875,
+                "bottom": 376.46875
+              },
+              {
+                "name": "clear-button",
+                "present": true,
+                "visible": true,
+                "left": 227.46875,
+                "right": 346,
+                "top": 335.6875,
+                "bottom": 376.46875
+              }
+            ],
+            "overlap": false
+          }
+        },
+        "browser": {
+          "playwright": "1.64.0-alpha-1790635538000",
+          "chrome": "154.0.8037.98",
+          "viewport": {
+            "width": 375,
+            "height": 812
+          }
+        },
+        "application_errors": []
+      }
+    },
+    {
+      "task_id": "P02",
+      "control": "decision_break_control",
+      "result": {
+        "task_id": "P02",
+        "task_pass": true,
+        "decision_survived": false,
+        "checks": {
+          "primary_search_works": true,
+          "quick_find_works": true,
+          "narrow_viewport_controls_fit_without_horizontal_overflow": true,
+          "clear_empties_primary_query_results_and_restores_focus": true,
+          "quick_find_query_and_results_remain_independent_after_primary_actions": false,
+          "narrow_layout": {
+            "viewport_width": 375,
+            "document_width": 375,
+            "boxes": [
+              {
+                "name": "primary-query",
+                "present": true,
+                "visible": true,
+                "left": 29,
+                "right": 346,
+                "top": 287.6875,
+                "bottom": 327.6875
+              },
+              {
+                "name": "primary-search-button",
+                "present": true,
+                "visible": true,
+                "left": 29,
+                "right": 219.46875,
+                "top": 335.6875,
+                "bottom": 376.46875
+              },
+              {
+                "name": "clear-button",
+                "present": true,
+                "visible": true,
+                "left": 227.46875,
+                "right": 346,
+                "top": 335.6875,
+                "bottom": 376.46875
+              }
+            ],
+            "overlap": false
+          }
+        },
+        "browser": {
+          "playwright": "1.64.0-alpha-1790635538000",
+          "chrome": "154.0.8037.98",
+          "viewport": {
+            "width": 375,
+            "height": 812
+          }
+        },
+        "application_errors": []
+      }
+    },
+    {
+      "task_id": "P03",
+      "control": "base",
+      "result": {
+        "task_id": "P03",
+        "task_pass": false,
+        "decision_survived": false,
+        "checks": {
+          "plants_filter": false,
+          "minerals_filter": false,
+          "all_filter_restores_full_results": true,
+          "arrow_navigation_moves_active_result": true,
+          "active_result_retained_when_visible": false,
+          "active_result_resets_when_hidden_and_enter_selects_first": false,
+          "category_controls_found": {
+            "plants": false,
+            "minerals": false,
+            "all": false
+          },
+          "selected_status": "Selected: Moss"
+        },
+        "application_errors": [],
+        "browser": {
+          "playwright": "1.64.0-alpha-1790635538000",
+          "chrome": "154.0.8037.98",
+          "viewport": {
+            "width": 1280,
+            "height": 800
+          }
+        }
+      }
+    },
+    {
+      "task_id": "P03",
+      "control": "behavior_control",
+      "result": {
+        "task_id": "P03",
+        "task_pass": true,
+        "decision_survived": true,
+        "checks": {
+          "plants_filter": true,
+          "minerals_filter": true,
+          "all_filter_restores_full_results": true,
+          "arrow_navigation_moves_active_result": true,
+          "active_result_retained_when_visible": true,
+          "active_result_resets_when_hidden_and_enter_selects_first": true,
+          "category_controls_found": {
+            "plants": true,
+            "minerals": true,
+            "all": true
+          },
+          "selected_status": "Selected: Amber"
+        },
+        "application_errors": [],
+        "browser": {
+          "playwright": "1.64.0-alpha-1790635538000",
+          "chrome": "154.0.8037.98",
+          "viewport": {
+            "width": 1280,
+            "height": 800
+          }
+        }
+      }
+    },
+    {
+      "task_id": "P03",
+      "control": "decision_break_control",
+      "result": {
+        "task_id": "P03",
+        "task_pass": true,
+        "decision_survived": false,
+        "checks": {
+          "plants_filter": true,
+          "minerals_filter": true,
+          "all_filter_restores_full_results": true,
+          "arrow_navigation_moves_active_result": true,
+          "active_result_retained_when_visible": false,
+          "active_result_resets_when_hidden_and_enter_selects_first": true,
+          "category_controls_found": {
+            "plants": true,
+            "minerals": true,
+            "all": true
+          },
+          "selected_status": "Selected: Amber"
+        },
+        "application_errors": [],
+        "browser": {
+          "playwright": "1.64.0-alpha-1790635538000",
+          "chrome": "154.0.8037.98",
+          "viewport": {
+            "width": 1280,
+            "height": 800
+          }
+        }
+      }
+    },
+    {
+      "task_id": "P04",
+      "control": "base",
+      "result": {
+        "task_id": "P04",
+        "task_pass": false,
+        "decision_survived": true,
+        "checks": {
+          "valid_alt_enter_updates_cart_once": false,
+          "repeated_keydown_does_not_add_again": false,
+          "native_submit_event_observed": false,
+          "required_min_max_invalid_cases_block_cart": true,
+          "invalid_cases": [
+            {
+              "name": "required",
+              "invalidity": {
+                "valid": false,
+                "expectedFlag": true
+              },
+              "cart_unchanged": true
+            },
+            {
+              "name": "min",
+              "invalidity": {
+                "valid": false,
+                "expectedFlag": true
+              },
+              "cart_unchanged": true
+            },
+            {
+              "name": "max",
+              "invalidity": {
+                "valid": false,
+                "expectedFlag": true
+              },
+              "cart_unchanged": true
+            }
+          ],
+          "no_document_navigation": true,
+          "quantity_constraints": {
+            "min": "1",
+            "max": "5",
+            "required": true,
+            "form": true
+          }
+        },
+        "application_errors": [],
+        "browser": {
+          "playwright": "1.64.0-alpha-1790635538000",
+          "chrome": "154.0.8037.98",
+          "viewport": {
+            "width": 1280,
+            "height": 800
+          }
+        }
+      }
+    },
+    {
+      "task_id": "P04",
+      "control": "behavior_control",
+      "result": {
+        "task_id": "P04",
+        "task_pass": true,
+        "decision_survived": true,
+        "checks": {
+          "valid_alt_enter_updates_cart_once": true,
+          "repeated_keydown_does_not_add_again": true,
+          "native_submit_event_observed": true,
+          "required_min_max_invalid_cases_block_cart": true,
+          "invalid_cases": [
+            {
+              "name": "required",
+              "invalidity": {
+                "valid": false,
+                "expectedFlag": true
+              },
+              "cart_unchanged": true
+            },
+            {
+              "name": "min",
+              "invalidity": {
+                "valid": false,
+                "expectedFlag": true
+              },
+              "cart_unchanged": true
+            },
+            {
+              "name": "max",
+              "invalidity": {
+                "valid": false,
+                "expectedFlag": true
+              },
+              "cart_unchanged": true
+            }
+          ],
+          "no_document_navigation": true,
+          "quantity_constraints": {
+            "min": "1",
+            "max": "5",
+            "required": true,
+            "form": true
+          }
+        },
+        "application_errors": [],
+        "browser": {
+          "playwright": "1.64.0-alpha-1790635538000",
+          "chrome": "154.0.8037.98",
+          "viewport": {
+            "width": 1280,
+            "height": 800
+          }
+        }
+      }
+    },
+    {
+      "task_id": "P04",
+      "control": "decision_break_control",
+      "result": {
+        "task_id": "P04",
+        "task_pass": false,
+        "decision_survived": false,
+        "checks": {
+          "valid_alt_enter_updates_cart_once": true,
+          "repeated_keydown_does_not_add_again": false,
+          "native_submit_event_observed": false,
+          "required_min_max_invalid_cases_block_cart": false,
+          "invalid_cases": [
+            {
+              "name": "required",
+              "invalidity": {
+                "valid": false,
+                "expectedFlag": true
+              },
+              "cart_unchanged": true
+            },
+            {
+              "name": "min",
+              "invalidity": {
+                "valid": false,
+                "expectedFlag": true
+              },
+              "cart_unchanged": true
+            },
+            {
+              "name": "max",
+              "invalidity": {
+                "valid": false,
+                "expectedFlag": true
+              },
+              "cart_unchanged": false
+            }
+          ],
+          "no_document_navigation": true,
+          "quantity_constraints": {
+            "min": "1",
+            "max": "5",
+            "required": true,
+            "form": true
+          }
+        },
+        "application_errors": [],
+        "browser": {
+          "playwright": "1.64.0-alpha-1790635538000",
+          "chrome": "154.0.8037.98",
+          "viewport": {
+            "width": 1280,
+            "height": 800
+          }
+        }
+      }
+    }
+  ],
+  "assertions": "all four A-states are incomplete without application errors; all four correct behavior controls pass both task and decision checks; deliberate decision-break controls are detected for each task"
+}

@@ -1,0 +1,114 @@
+{
+  "suite": "Local v3 FX08 brief usefulness pilot",
+  "version": "v14 behavior-oracle-v2 frozen rerun",
+  "pilot": {
+    "task_ids": [
+      "P01",
+      "P02",
+      "P03",
+      "P04"
+    ],
+    "variants": [
+      "absent",
+      "correct",
+      "incomplete",
+      "misleading"
+    ],
+    "repeats": [
+      1,
+      2,
+      3
+    ],
+    "planned_runs": 48
+  },
+  "heldout": {
+    "task_ids": [
+      "H01",
+      "H02"
+    ],
+    "variants": [
+      "absent",
+      "correct",
+      "incomplete",
+      "misleading"
+    ],
+    "repeats": [
+      1
+    ],
+    "planned_runs": 8,
+    "execution_status": "excluded_due_prior_exposure",
+    "reason": "H01 and H02 and prior outcomes were already exposed before this freeze; do not claim held-out generalization."
+  },
+  "runner": {
+    "script": "/Users/christophehenner/Repositories/Aethyme/packages/aethyme-eval/scripts/run_codex_eval.py",
+    "source_repository_revision": "527587a640b2a6c6414c510ca69fca3ef3bdf694",
+    "script_sha256": "dce6535d97acecf289a16b40975849cc1a05469621bbfd44e9ceab7dea260d75",
+    "invocation": "python3 packages/aethyme-eval/scripts/run_codex_eval.py",
+    "codex_exec": "codex exec --ignore-user-config --skip-git-repo-check --sandbox workspace-write --color never --json --output-schema <frozen schema>",
+    "arm": "control",
+    "task_class": "brief-usefulness",
+    "codex_cli_version": "record per run from the Playground working directory",
+    "model_version": null,
+    "model_version_note": "The runner JSONL does not emit a model identifier. Do not infer one from the CLI version; record null unless per-run metadata exposes it.",
+    "output_schema_file": "schemas/final-report.json"
+  },
+  "execution": {
+    "runner_prompt_file": "prompts/runner-prompt.md",
+    "target_root": "/private/tmp/fx08-v14-playgrounds",
+    "raw_artifact_root": "/private/tmp/fx08-v14-raw-runs",
+    "parallel_workers": 2,
+    "shuffle_seed": 65008,
+    "target_repo_contents": [
+      "tasks/<task_id>/a-state/*",
+      "HANDOFF.md",
+      "TASK.md"
+    ],
+    "handoff_contract": "Same framing text and prompt across variants; only the Decision brief section differs. The absent section reads exactly: No decision brief was provided.",
+    "environment": {
+      "AETHYME_EVAL_ARM": "control",
+      "AETHYME_PLAYGROUND_ROOTS": "/private/tmp/fx08-v14-playgrounds",
+      "AETHYME_EVAL_TASK_CLASS": "brief-usefulness",
+      "AETHYME_EVAL_FIXTURE_ID": "unset",
+      "AETHYME_EVAL_OUTPUT_SCHEMA_FILE": "/private/tmp/fx08-v14-frozen/schemas/final-report.json"
+    },
+    "freeze_before_first_ever_run": false,
+    "output_schema_file": "schemas/final-report.json",
+    "freeze_tag": "fx08-v14-frozen",
+    "host_driver_permissions": "require_escalated; only the launcher/controller process. Codex child remains --sandbox workspace-write.",
+    "freeze_before_v14_rerun": true,
+    "playwright_oracle": {
+      "module_path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright",
+      "module_version": "1.64.0-alpha-1790635538000",
+      "browser_executable": "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+      "browser_version": "154.0.8037.98",
+      "launch": "headless, local synthetic app served on 127.0.0.1; no external site",
+      "cli_note": "playwright-cli wrapper was unavailable; the pinned Playwright Node API is used for repeatable oracle checks."
+    }
+  },
+  "brief_variant_token_counts": {
+    "P01": {
+      "absent": 9,
+      "correct": 89,
+      "incomplete": 88,
+      "misleading": 97
+    },
+    "P02": {
+      "absent": 9,
+      "correct": 107,
+      "incomplete": 101,
+      "misleading": 98
+    },
+    "P03": {
+      "absent": 9,
+      "correct": 107,
+      "incomplete": 100,
+      "misleading": 110
+    },
+    "P04": {
+      "absent": 9,
+      "correct": 89,
+      "incomplete": 85,
+      "misleading": 89
+    }
+  }
+}

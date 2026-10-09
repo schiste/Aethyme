@@ -1,0 +1,12 @@
+{
+  "task_id": "P03",
+  "task_checks": [
+    "All, Plants and Minerals show the corresponding entries",
+    "arrow navigation and Enter still select an entry",
+    "filtering out the active entry selects the first visible entry"
+  ],
+  "decision_checks": [
+    "filtering while the active entry remains visible preserves it as active"
+  ],
+  "observation": "Rendered list options, active descendant and selection status."
+}
