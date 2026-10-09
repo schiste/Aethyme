@@ -201,6 +201,37 @@ fn rust_indexing_determinism() {
     assert_eq!(bytes_a, bytes_b);
 }
 
+// ─── Identity: what a function NodeId survives (T65 baseline, #700) ──
+
+fn function_id(source: &str, name: &str) -> aethyme_graph_schema::NodeId {
+    let result = index_source(source);
+    let matching: Vec<_> = result
+        .additional_nodes
+        .iter()
+        .filter(|n| n.kind() == NodeKind::Function && n.name() == Some(name))
+        .collect();
+    assert_eq!(matching.len(), 1, "expected one function named {name}");
+    matching[0].id().clone()
+}
+
+/// The indexer mints a function's NodeId from (repo, path, name, kind) only,
+/// so the same ID names different source. Anything that reuses an analysis
+/// result must bind the exact source snapshot as well (#652, #655): a stable
+/// NodeId is never evidence that the code behind it is unchanged.
+#[test]
+fn function_node_id_survives_body_and_signature_edits_but_not_a_rename() {
+    let original = "pub fn total(xs: &[u32]) -> u32 { xs.iter().sum() }\n";
+    let body_edited = "pub fn total(xs: &[u32]) -> u32 {\n    let mut sum = 0;\n    for x in xs {\n        sum += x;\n    }\n    sum\n}\n";
+    let signature_edited =
+        "pub fn total(xs: &[u64], start: u64) -> u64 { start + xs.iter().sum::<u64>() }\n";
+    let renamed = "pub fn sum_all(xs: &[u32]) -> u32 { xs.iter().sum() }\n";
+
+    let id = function_id(original, "total");
+    assert_eq!(id, function_id(body_edited, "total"));
+    assert_eq!(id, function_id(signature_edited, "total"));
+    assert_ne!(id, function_id(renamed, "sum_all"));
+}
+
 // ─── Phase 4.6 stage 1: import extraction ───────────────────────────
 
 #[test]
