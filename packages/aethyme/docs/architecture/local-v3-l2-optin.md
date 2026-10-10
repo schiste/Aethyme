@@ -178,20 +178,36 @@ required capture must shut such binaries out. The only fence they honour is
   stays 47, so repositories that do not require capture keep working with every
   0.8.2+ binary. Its number, `COLLABORATION_FENCE_SCHEMA`, is the first schema
   whose binaries implement required capture.
-- **A #660+ binary raises the repository's floor to 50** when its config says
-  `capture = "required"`, and records `meta.collaboration_fence =
-  "collaboration capture required"`. Every pre-#660 binary (schema 49) then
-  refuses the database with `SchemaTooNew`, for every command.
+- **A #660+ binary raises the repository's floor to 50** when the config
+  committed on the fetched default branch says an explicit
+  `capture = "required"`. It records `meta.collaboration_fence = "collaboration
+  capture required"` and `meta.collaboration_fence_source = "committed"`. Every
+  pre-#660 binary (schema 49) then refuses the database with `SchemaTooNew`, for
+  every command.
+- **Only the committed copy fences.** An uncommitted or experimental `required`
+  in the main checkout, a feature branch checked out there, or a repository with
+  no fetched default branch never raises the floor. Because the floor is never
+  lowered, the decision rests on the reviewed, shared copy. Without a fetched
+  default branch the fence cannot engage at all.
 - **When:**
-  - On every broker open, as one meta query. If the repository is not yet
-    fenced, a plain read of the main checkout's working-copy config follows,
-    with no Git, because opens run on every hook call.
-  - On `broker status`, before a required capture, and in the promotion gate,
-    under the committed-first rule those paths already read.
-
-  The fence therefore engages at the first open by a new binary whose main
-  checkout shows `required`, or at its first status, submit or promotion,
-  whichever comes first.
+  - On every **writable** broker open, best effort. The open reads the
+    working-copy config, and only when it says `required` does it confirm
+    against the committed copy (Git spawns only in such repositories). Once
+    fenced, it is one meta query.
+  - On writable `broker status`, before a required capture, and in the
+    promotion gate, using the config those paths already load (status shares
+    one read with its promote-mode check, so the fence adds no Git calls).
+  - **Snapshot opens never write the fence:** read-only status, graph refresh
+    preconditions, the PreToolUse hook and pre-commit checks run on
+    `query_only` stores. When the committed config requires a fence that is not
+    yet raised, they report it with `state: "pending"` and a
+    `collaboration.fence-pending` advice row naming the next action (a writable
+    `aethyme broker status`). They never fail the command.
+- **Never fails a command.** A read or write error is warned about
+  (`warning: aethyme could not raise the collaboration fence ...`) and reported
+  as `pending`; the next writable status, submit or promotion retries. The raise
+  runs in one SQLite transaction that rolls back on any failure, so it never
+  leaves a write lock held.
 - **Never lowered.** Raising uses the same "only upward" write as
   `record_min_compatible_schema`, and no code lowers it. **Turning `required`
   off later does not let older binaries back in.**
@@ -199,16 +215,18 @@ required capture must shut such binaries out. The only fence they honour is
   still refuses submits and promotions in #660+ binaries, but does not raise the
   floor: a typo must not lock older binaries out for good.
 - `broker status` reports it: `collaboration_fence: {"min_compatible_schema": 50,
-  "reason": "collaboration capture required"}` in JSON, and one
-  `Collaboration fence:` line in text.
+  "reason": "collaboration capture required", "source": "committed", "state":
+  "active" | "pending"}` in JSON, and one `Collaboration fence:` line in text
+  once active.
 
 What this means for operators:
 
 - **Every binary that touches the repository must be #660 or newer** before
   `required` is committed: agents, plugin hooks, CI, other machines sharing the
   checkout.
-- **Until the first new-binary open after `required` is committed, an older
-  binary can still submit uncaptured work.** The fence is not retroactive.
+- **Until the first writable new-binary open, status, submit or promotion after
+  `required` is committed and fetched, an older binary can still submit
+  uncaptured work.** The fence is not retroactive.
 - The floor belongs to this repository's `broker.db`. Other repositories, and
   the host-level databases, are unaffected.
 - The schema number is positional. If another schema-50 migration lands first
@@ -216,6 +234,8 @@ What this means for operators:
   50), this migration and `COLLABORATION_FENCE_SCHEMA` move up together. A test
   pins the pair, so a rebase that moves one without the other fails. The fence
   must always name the first schema that implements required capture.
+  `v50_is_a_compatible_marker_that_leaves_the_floor_alone` hard-codes 50 and
+  must follow such a renumber too.
 
 ## Not decided here
 
@@ -235,7 +255,7 @@ What this means for operators:
 |---|---|
 | T33 (legacy outputs unchanged when disabled) | Four off spellings: legacy exit, verdict, key order, no capture line, no state written. |
 | T34 (capture failure keeps the legacy verdict) | No project; refused root; a failing gate keeps its exit code while the capture succeeds. |
-| T35 (old binaries) | A required repository's floor is 50 after an open, and a schema-49 binary is refused (`schema_is_compatible_with(…, 49)`); off and advisory leave it at 47 and a schema-49 binary opens; required then off keeps the fence; an unsupported value does not raise it; status reports it. A real cross-binary run is #681's. |
+| T35 (old binaries) | A committed `required` fences on a writable open (`schema_is_compatible_with(…, 49)` refuses); an uncommitted or working-copy-only `required` does not; off and advisory leave the floor at 47; committing required off keeps the fence; an unsupported value does not raise it; a failed raise rolls back and leaves no transaction open; read-only status and graph refresh preconditions report `pending` and write nothing, also with no database; a writable status then raises it; status JSON reports source and state. A real cross-binary run is #681's. |
 | T57 (required policy) | Missing project and an unsupported policy refuse with no queue entry or ref movement; an acknowledged required capture proceeds. |
 | Idempotency | A resubmit under `verify-only` returns the same operation and receipt, including after integration is refreshed onto an upstream that moved (both policies). |
 | Promotion gate | A library submit without capture verifies and is refused at promotion; `promote --entry` is refused; advisory never gates. |

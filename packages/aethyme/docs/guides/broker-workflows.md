@@ -1416,9 +1416,10 @@ project = "proj-7k2m"
 - `required` refuses a submit, and every promotion, whose exact head was not
   captured.
 
-> **`required` is one-way for older binaries.** The first time a binary from
-> #660 or later opens a repository whose config says `capture = "required"`, it
-> raises `.aethyme/broker.db`'s compatibility floor to schema 50
+> **`required` is one-way for older binaries.** Once `capture = "required"` is
+> committed on the default branch and fetched, the first writable open, status,
+> submit or promotion by a binary from #660 or later raises
+> `.aethyme/broker.db`'s compatibility floor to schema 50
 > (`broker status` reports it as the collaboration fence). From then on, every
 > older Aethyme refuses that repository with "schema version is newer than this
 > binary supports".
@@ -1426,8 +1427,11 @@ project = "proj-7k2m"
 > - **Upgrade first.** Every binary that touches the repository (agents, hooks,
 >   CI, other machines sharing the checkout) must be #660 or newer before you
 >   commit `required`.
-> - **Not retroactive.** Until a new binary has opened the repository after
->   `required` is committed, an older binary can still submit uncaptured work.
+> - **Not retroactive.** Until then, an older binary can still submit
+>   uncaptured work. Read-only commands (hooks, pre-commit, snapshot status)
+>   never raise it; they report it as `pending`.
+> - **Only the committed copy counts.** An uncommitted `required` in a checkout
+>   never fences.
 > - **Turning `required` off does not undo it.** The floor is never lowered, so
 >   older binaries stay locked out.
 >
