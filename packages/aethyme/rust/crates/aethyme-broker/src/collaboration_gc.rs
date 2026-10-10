@@ -74,30 +74,20 @@ fn open_archive_lock(store: &CollaborationStore) -> std::io::Result<std::fs::Fil
 /// The archive held shared: reclamation cannot apply until it drops.
 #[derive(Debug)]
 pub struct ArchiveUse {
-    file: std::fs::File,
-}
-
-impl Drop for ArchiveUse {
-    fn drop(&mut self) {
-        let _ = self.file.unlock();
-    }
+    /// Closing the file releases the lock.
+    _file: std::fs::File,
 }
 
 /// Hold the archive shared, waiting while a reclamation applies.
 pub fn archive_use(store: &CollaborationStore) -> std::io::Result<ArchiveUse> {
     let file = open_archive_lock(store)?;
     file.lock_shared()?;
-    Ok(ArchiveUse { file })
+    Ok(ArchiveUse { _file: file })
 }
 
 struct ArchiveExclusive {
-    file: std::fs::File,
-}
-
-impl Drop for ArchiveExclusive {
-    fn drop(&mut self) {
-        let _ = self.file.unlock();
-    }
+    /// Closing the file releases the lock.
+    _file: std::fs::File,
 }
 
 fn try_exclusive(store: &CollaborationStore) -> Result<Option<ArchiveExclusive>, GcError> {
@@ -106,7 +96,7 @@ fn try_exclusive(store: &CollaborationStore) -> Result<Option<ArchiveExclusive>,
         source,
     })?;
     match file.try_lock() {
-        Ok(()) => Ok(Some(ArchiveExclusive { file })),
+        Ok(()) => Ok(Some(ArchiveExclusive { _file: file })),
         Err(std::fs::TryLockError::WouldBlock) => Ok(None),
         Err(std::fs::TryLockError::Error(source)) => Err(GcError::Io {
             path: lock_path(store),
