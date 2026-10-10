@@ -220,8 +220,8 @@ const MIGRATIONS: &[(i64, &str)] = &[
         6,
         // The context cache (#662). Every table here is derived: answers are
         // stored under their cache key, which commits to every input that can
-        // change them. The index is rebuilt, because version 6 also posts
-        // broad-risk contributions.
+        // change them. The derived index is rebuilt on first use, because it
+        // carries no `context_index_format` stamp yet (collaboration_context).
         "CREATE TABLE IF NOT EXISTS context_cache (
              cache_key TEXT PRIMARY KEY NOT NULL,
              visibility TEXT NOT NULL,
@@ -240,10 +240,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
              PRIMARY KEY (cache_key, lineage_record_id)
          ) STRICT;
          CREATE INDEX IF NOT EXISTS context_cache_members_by_contribution
-             ON context_cache_members (lineage_record_id);
-         DELETE FROM context_postings;
-         DELETE FROM context_indexed;
-         DELETE FROM context_unreadable;",
+             ON context_cache_members (lineage_record_id);",
     ),
 ];
 /// The file that marks a directory as a collaboration root.

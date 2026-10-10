@@ -952,6 +952,7 @@ fn refresh_index(
     now: i64,
     hooks: &mut Hooks<'_>,
 ) -> Result<Vec<String>, ContextError> {
+    rebuild_if_format_changed(store)?;
     let (live, settled, current) = {
         let connection = store.read_connection();
         let live = live_contributions(connection, now)?;
@@ -1044,6 +1045,47 @@ fn refresh_index(
         .collect();
     transaction.commit()?;
     Ok(unreadable)
+}
+
+/// The derived index and the cache are built by one [`CACHE_FORMAT`]. A
+/// store whose index carries another (or none: built before the stamp, or
+/// by an older binary) is rebuilt from the archive, and its cached answers
+/// dropped, so a change to the dependency-key or broad-risk rules reaches
+/// contributions indexed before it.
+fn rebuild_if_format_changed(store: &mut CollaborationStore) -> Result<(), ContextError> {
+    let stamped = |connection: &rusqlite::Connection| -> rusqlite::Result<bool> {
+        Ok(connection
+            .query_row(
+                "SELECT value FROM meta WHERE key = ?1",
+                [INDEX_FORMAT_KEY],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .as_deref()
+            == Some(CACHE_FORMAT))
+    };
+    if stamped(store.read_connection())? {
+        return Ok(());
+    }
+    let transaction = store
+        .connection()
+        .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    if !stamped(&transaction)? {
+        transaction.execute_batch(
+            "DELETE FROM context_postings;
+             DELETE FROM context_indexed;
+             DELETE FROM context_unreadable;
+             DELETE FROM context_cache_members;
+             DELETE FROM context_cache;",
+        )?;
+        transaction.execute(
+            "INSERT INTO meta (key, value) VALUES (?1, ?2)
+             ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+            (INDEX_FORMAT_KEY, CACHE_FORMAT),
+        )?;
+    }
+    transaction.commit()?;
+    Ok(())
 }
 
 fn validate_scope_path(path: &[u8]) -> Result<(), ContextError> {
@@ -1229,10 +1271,11 @@ pub fn retrieve(
         Hooks {
             after_load: &mut |_| {},
             after_refresh: &mut |_| {},
+            before_store: &mut |_| {},
         },
         false,
     )? {
-        Answer::Fresh(context) => Ok(context),
+        Answer::Fresh { context, .. } => Ok(context),
         Answer::Cached(_) => unreachable!("the cache is not consulted"),
     }
 }
@@ -1247,6 +1290,23 @@ pub const REFETCH_AFTER_MS: i64 = 5 * 60 * 1000;
 
 /// Cached answers kept per project store; the least recently used go first.
 pub const MAX_CACHE_ENTRIES: i64 = 1024;
+
+/// The version of everything a cached answer and the derived index are
+/// computed by. **Bump it on any change to selection, the result encoding,
+/// dependency keys or the broad-risk rules** (list or threshold): it is part
+/// of every cache key, so an older binary's answers are never served, and it
+/// is stamped on the derived index, so a mismatch rebuilds the index and
+/// drops the cache.
+pub const CACHE_FORMAT: &str = "aethyme-context-cache/1";
+
+/// Where the derived index records the [`CACHE_FORMAT`] it was built with.
+const INDEX_FORMAT_KEY: &str = "context_index_format";
+
+/// The `meta` key recording when a reader class's cached answers were last
+/// revoked by [`forget_reader`].
+fn revocation_key(visibility: &str) -> String {
+    format!("context_cache_revoked:{visibility}")
+}
 
 /// [`MAX_CACHE_ENTRIES`], small under test so eviction is exercised.
 fn cache_limit() -> i64 {
@@ -1311,15 +1371,14 @@ pub fn retrieve_cached(
         Hooks {
             after_load: &mut |_| {},
             after_refresh: &mut |_| {},
+            before_store: &mut |_| {},
         },
         true,
     )?;
     Ok(match answer {
         Answer::Cached(hit) => hit,
-        Answer::Fresh(context) => CachedContext {
-            served: Served::Fresh {
-                stored: context.cacheable,
-            },
+        Answer::Fresh { context, stored } => CachedContext {
+            served: Served::Fresh { stored },
             record: context.record,
             id: context.id,
             cache_key: context.cache_key,
@@ -1335,12 +1394,23 @@ pub fn forget_reader(
     store: &mut CollaborationStore,
     visibility: &str,
 ) -> Result<usize, ContextError> {
-    let connection = store.connection();
-    let removed = connection.execute(
+    let now = crate::clock::epoch_ms();
+    let transaction = store
+        .connection()
+        .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let removed = transaction.execute(
         "DELETE FROM context_cache WHERE visibility = ?1",
         [visibility],
     )?;
-    drop_orphan_members(connection)?;
+    // An answer computed before this moment and stored after it must not
+    // bring the class's rows back: storing checks this marker.
+    transaction.execute(
+        "INSERT INTO meta (key, value) VALUES (?1, ?2)
+         ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+        (revocation_key(visibility), now.to_string()),
+    )?;
+    drop_orphan_members(&transaction)?;
+    transaction.commit()?;
     Ok(removed)
 }
 
@@ -1380,7 +1450,9 @@ fn version_of(posted: &BTreeSet<Posted>) -> String {
 
 /// The cache key, and how many postings it covers.
 fn cache_key_of(
+    format: &str,
     query_value: &Value,
+    scoped: &[bool],
     by_key: &BTreeMap<Vec<u8>, BTreeSet<Posted>>,
     broad: &BTreeSet<Posted>,
     unreadable: &[String],
@@ -1405,7 +1477,15 @@ fn cache_key_of(
     dependencies.push(versioned(&[TAG_BROAD], broad));
     let count = dependencies.len();
     let cache_input = object(vec![
+        ("format", text(format)),
         ("query", query_value.clone()),
+        // Whether each envelope, in query order, is provably about the
+        // scope: read from retained snapshots, so it can change when one is
+        // reclaimed while the envelope itself does not.
+        (
+            "analysis_scoped",
+            Value::Array(scoped.iter().map(|bit| Value::Bool(*bit)).collect()),
+        ),
         ("dependencies", Value::Array(dependencies)),
         (
             "unreadable",
@@ -1504,14 +1584,26 @@ fn touch(store: &mut CollaborationStore, key: &str, now: i64) -> Result<(), Cont
 /// Store a fresh, cacheable answer under its key, then bound the cache:
 /// entries of this reader class from another epoch go, and so do the least
 /// recently used beyond [`MAX_CACHE_ENTRIES`].
+///
+/// Storing is a separate transaction from the read, so what the answer
+/// carries is checked again under the write lock: every returned
+/// contribution must still be indexed with the brief the answer used and be
+/// live, and the reader class must not have been revoked since the answer
+/// was computed. Otherwise nothing is stored (`false`), so a forget, a
+/// re-brief or a revocation that lands in between can never bring a purged
+/// answer back. A change to anything else in between only leaves a row no
+/// later key reaches. `computed_ms` and `generation` are the answer's.
 fn store_answer(
     store: &mut CollaborationStore,
     context: &ContributionContext,
+    members: &[(String, Option<String>)],
     visibility: &dyn Visibility,
-    now: i64,
-) -> Result<(), ContextError> {
+    computed_ms: i64,
+    generation: i64,
+) -> Result<bool, ContextError> {
+    let now = computed_ms;
     let Some(epoch) = epoch_of(visibility) else {
-        return Ok(());
+        return Ok(false);
     };
     let cut_dependencies = context.selection.truncated_by.contains("candidates")
         || context.selection.truncated_by.contains("related_paths");
@@ -1519,7 +1611,29 @@ fn store_answer(
     let transaction = store
         .connection()
         .transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let current = generation(&transaction)?;
+    let revoked: Option<i64> = transaction
+        .query_row(
+            "SELECT CAST(value AS INTEGER) FROM meta WHERE key = ?1",
+            [revocation_key(visibility.name())],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if revoked.is_some_and(|at| at >= computed_ms) {
+        return Ok(false);
+    }
+    let live_now = crate::clock::epoch_ms();
+    let mut still = transaction.prepare(&format!(
+        "SELECT 1 FROM context_indexed i
+         WHERE i.lineage_record_id = ?1 AND i.brief_record_id IS ?3 AND {}",
+        LIVE
+    ))?;
+    for (member, brief) in members {
+        if !still.exists(rusqlite::params![member, live_now, brief])? {
+            return Ok(false);
+        }
+    }
+    drop(still);
+    let current = generation;
     transaction.execute(
         "DELETE FROM context_cache_members WHERE cache_key = ?1",
         [&context.cache_key],
@@ -1563,7 +1677,7 @@ fn store_answer(
     )?;
     drop_orphan_members(&transaction)?;
     transaction.commit()?;
-    Ok(())
+    Ok(true)
 }
 
 /// Where another process's release or re-brief can land during a query:
@@ -1573,11 +1687,17 @@ fn store_answer(
 struct Hooks<'a> {
     after_load: &'a mut dyn FnMut(&mut CollaborationStore),
     after_refresh: &'a mut dyn FnMut(&mut CollaborationStore),
+    /// After the read, before a fresh answer is stored in the cache.
+    before_store: &'a mut dyn FnMut(&mut CollaborationStore),
 }
 
 /// A fresh answer, or one served from the cache.
 enum Answer {
-    Fresh(ContributionContext),
+    /// `stored`: whether the answer was written to the cache.
+    Fresh {
+        context: ContributionContext,
+        stored: bool,
+    },
     Cached(CachedContext),
 }
 
@@ -1592,6 +1712,7 @@ enum Read {
         cache_key: String,
         dependencies: usize,
         broad_risk: usize,
+        generation: i64,
     },
 }
 
@@ -1631,9 +1752,11 @@ fn retrieve_with(
         .filter(|id| visibility.visible(id))
         .collect();
     let mut analysis = Vec::new();
+    let mut scoped = Vec::with_capacity(query.analysis.len());
     for envelope in &query.analysis {
-        let scoped = envelope_is_scoped(store, envelope, &scope)?;
-        analysis.push(AnalysisSummary::of(envelope, query.source.as_ref(), scoped));
+        let bit = envelope_is_scoped(store, envelope, &scope)?;
+        scoped.push(bit);
+        analysis.push(AnalysisSummary::of(envelope, query.source.as_ref(), bit));
     }
     let mut related_seen = 0;
     let mut related_truncated = false;
@@ -1734,8 +1857,17 @@ fn retrieve_with(
             .into_iter()
             .filter(|posted| visibility.visible(&posted.id))
             .collect();
-        let (cache_key, dependencies) =
-            cache_key_of(&query_value, &by_key, &broad, &unreadable, visibility);
+        let (cache_key, dependencies) = cache_key_of(
+            CACHE_FORMAT,
+            &query_value,
+            &scoped,
+            &by_key,
+            &broad,
+            &unreadable,
+            visibility,
+        );
+        // The generation the answer is computed at, for its provenance.
+        let computed_generation = generation(connection)?;
         if use_cache && let Some(hit) = lookup(connection, &cache_key, visibility, now)? {
             return Ok(Read::Hit(hit));
         }
@@ -1853,31 +1985,41 @@ fn retrieve_with(
             cache_key,
             dependencies,
             broad_risk: broad.len(),
+            generation: computed_generation,
         })
     })();
     connection.execute_batch("COMMIT")?;
-    let (details, stale_index, candidates_truncated, cache_key, dependencies, broad_risk) =
-        match read? {
-            Read::Hit(hit) => {
-                touch(store, &hit.cache_key, now)?;
-                return Ok(Answer::Cached(hit));
-            }
-            Read::Fresh {
-                details,
-                stale_index,
-                candidates_truncated,
-                cache_key,
-                dependencies,
-                broad_risk,
-            } => (
-                details,
-                stale_index,
-                candidates_truncated,
-                cache_key,
-                dependencies,
-                broad_risk,
-            ),
-        };
+    let (
+        details,
+        stale_index,
+        candidates_truncated,
+        cache_key,
+        dependencies,
+        broad_risk,
+        computed_generation,
+    ) = match read? {
+        Read::Hit(hit) => {
+            touch(store, &hit.cache_key, now)?;
+            return Ok(Answer::Cached(hit));
+        }
+        Read::Fresh {
+            details,
+            stale_index,
+            candidates_truncated,
+            cache_key,
+            dependencies,
+            broad_risk,
+            generation,
+        } => (
+            details,
+            stale_index,
+            candidates_truncated,
+            cache_key,
+            dependencies,
+            broad_risk,
+            generation,
+        ),
+    };
     let raced = !stale_index.is_empty();
 
     // Briefs are immutable objects named by their record; read them once.
@@ -2078,6 +2220,16 @@ fn retrieve_with(
                 .map(|selected| details[selected.candidate].0.clone())
                 .collect();
             let cacheable = !raced && !brief_lost;
+            // Each returned contribution with the brief this answer used: a
+            // row is stored only if they are all still so when it is written.
+            let members: Vec<(String, Option<String>)> = selection
+                .items
+                .iter()
+                .map(|selected| {
+                    let (id, _, _, brief) = &details[selected.candidate];
+                    (id.clone(), brief.as_ref().map(|(brief, _)| brief.clone()))
+                })
+                .collect();
             let context = ContributionContext {
                 record: bytes,
                 id,
@@ -2087,9 +2239,19 @@ fn retrieve_with(
                 cacheable,
             };
             if use_cache && cacheable {
-                store_answer(store, &context, visibility, now)?;
+                (hooks.before_store)(store);
             }
-            return Ok(Answer::Fresh(context));
+            let stored = use_cache
+                && cacheable
+                && store_answer(
+                    store,
+                    &context,
+                    &members,
+                    visibility,
+                    now,
+                    computed_generation,
+                )?;
+            return Ok(Answer::Fresh { context, stored });
         }
         let Some(dropped) = selection.items.pop() else {
             return Err(ContextError::BudgetTooSmall {
@@ -2810,11 +2972,12 @@ mod tests {
             Hooks {
                 after_load,
                 after_refresh,
+                before_store: &mut |_| {},
             },
             false,
         )
         .map(|answer| match answer {
-            Answer::Fresh(context) => context,
+            Answer::Fresh { context, .. } => context,
             Answer::Cached(_) => unreachable!("the cache is not consulted"),
         })
     }
@@ -3262,6 +3425,11 @@ mod tests {
         ];
         let all = Reader::all("all");
         let mut some = Reader::all("some");
+        // An analysis query scoped through a retained snapshot, reclaimed
+        // part-way through.
+        let docs_only = fixture.contribute(&[("docs/guide.md", "analysis base\n")]);
+        let (_, analysed) = snapshots(&fixture, &docs_only);
+        let analysis_query = scoped_query(&analysed);
         let mut live: Vec<RecordId> = Vec::new();
         let mut state: u64 = 0x5eed;
         let mut next = |bound: u64| {
@@ -3305,6 +3473,13 @@ mod tests {
                 }
                 _ => {}
             }
+            if step == 18 {
+                release(&mut fixture, &docs_only);
+                break_manifest(&fixture, &docs_only);
+            }
+            let first = retrieve_cached(&mut fixture.store, &analysis_query, &all).unwrap();
+            let now = retrieve(&mut fixture.store, &analysis_query, &all).unwrap();
+            assert_eq!(first.record, now.record, "step {step} analysis");
             for scope in scopes {
                 for reader in [&all as &dyn Visibility, &some] {
                     let first = cached(&mut fixture, scope, reader);
@@ -3577,11 +3752,12 @@ mod tests {
                         )
                         .unwrap();
                 },
+                before_store: &mut |_| {},
             },
             true,
         )
         .unwrap();
-        let Answer::Fresh(context) = answer else {
+        let Answer::Fresh { context, .. } = answer else {
             panic!("nothing was cached yet")
         };
         assert!(!context.cacheable);
@@ -3665,6 +3841,7 @@ mod tests {
             .connection()
             .execute_batch(
                 "DELETE FROM context_postings WHERE key = x'62';
+                 DELETE FROM meta WHERE key = 'context_index_format';
                  UPDATE meta SET value = '5' WHERE key = 'schema_version';
                  UPDATE meta SET value = '5' WHERE key = 'min_compatible_schema';",
             )
@@ -3678,6 +3855,216 @@ mod tests {
         let context = cached(&mut fixture, &["src/search.rs"], &reader);
         let value = canonical_json::parse(&context.record).unwrap();
         assert_eq!(field(field(&value, "cache"), "broad_risk"), &integer(1));
+    }
+
+    /// A request ready to capture, committed but not yet captured: a test
+    /// can capture it from inside a hook.
+    fn prepared(fixture: &mut Fixture, files: &[(&str, &str)]) -> CaptureRequest {
+        fixture.next += 1;
+        let repo = fixture.repo.path();
+        git(repo, &["checkout", "-q", "--detach", fixture.base.as_str()]);
+        for (path, body) in files {
+            write(repo, path, body);
+        }
+        git(repo, &["add", "-A"]);
+        git(
+            repo,
+            &["commit", "-qm", &format!("change {}", fixture.next)],
+        );
+        CaptureRequest {
+            operation_id: OperationId::parse(&format!("op-{}", fixture.next)).unwrap(),
+            repository: repo.to_path_buf(),
+            base: fixture.base.clone(),
+            result: pin_commit(repo, "HEAD").unwrap(),
+            policy: CapturePolicy::Advisory,
+            retention: RetentionBoundary::UntilReleased,
+        }
+    }
+
+    /// A query whose analysis is scoped through a retained snapshot.
+    /// `snapshot` holds the scope path; `docs_only` changed nothing under it.
+    fn scoped_query(snapshot: &SourceSnapshotId) -> ContextQuery {
+        query(
+            &["src/search.rs"],
+            Some(snapshot.clone()),
+            vec![envelope(
+                Operation::FindReferences,
+                Subject::Snapshot(snapshot.clone()),
+                None,
+                &[],
+                Coverage::CompleteWithinProfile,
+            )],
+        )
+    }
+
+    /// Whether an envelope is about the scope is read from a retained
+    /// snapshot. When that snapshot is reclaimed the envelope is unchanged,
+    /// but the answer is no longer complete: the cached complete answer must
+    /// not be served.
+    #[test]
+    fn reclaiming_an_analysis_snapshot_invalidates_a_complete_answer() {
+        let mut fixture = Fixture::new();
+        let reader = Reader::all("all");
+        let docs_only = fixture.contribute(&[("docs/guide.md", "v2\n")]);
+        let (_, snapshot) = snapshots(&fixture, &docs_only);
+        let ask = |fixture: &mut Fixture| {
+            retrieve_cached(&mut fixture.store, &scoped_query(&snapshot), &reader).unwrap()
+        };
+        let complete = ask(&mut fixture);
+        assert!(complete.absence_is_evidence(), "the setup must be complete");
+        assert!(hit(&ask(&mut fixture)));
+        release(&mut fixture, &docs_only);
+        break_manifest(&fixture, &docs_only);
+        let after = ask(&mut fixture);
+        assert!(!hit(&after), "a stale complete answer was served");
+        assert!(!after.absence_is_evidence());
+    }
+
+    /// The format is part of every key: another format never reaches a row.
+    #[test]
+    fn the_cache_format_is_part_of_the_key() {
+        let query = object(vec![("scope", Value::Array(Vec::new()))]);
+        let key = |format: &str| {
+            cache_key_of(
+                format,
+                &query,
+                &[],
+                &BTreeMap::new(),
+                &BTreeSet::new(),
+                &[],
+                &LocalProject,
+            )
+            .0
+        };
+        assert_ne!(key(CACHE_FORMAT), key("aethyme-context-cache/0"));
+    }
+
+    /// An index built by another format is rebuilt from the archive on the
+    /// next query, and the cache dropped with it.
+    #[test]
+    fn an_index_from_another_format_is_rebuilt_and_the_cache_dropped() {
+        let mut fixture = Fixture::new();
+        let reader = Reader::all("all");
+        fixture.contribute(&[("Cargo.toml", "[workspace]\n")]);
+        cached(&mut fixture, &["src/search.rs"], &reader);
+        fixture
+            .store
+            .connection()
+            .execute_batch(
+                "DELETE FROM context_postings WHERE key = x'62';
+                 UPDATE meta SET value = 'aethyme-context-cache/0'
+                     WHERE key = 'context_index_format';",
+            )
+            .unwrap();
+        let context = cached(&mut fixture, &["src/search.rs"], &reader);
+        assert!(!hit(&context));
+        let value = canonical_json::parse(&context.record).unwrap();
+        assert_eq!(field(field(&value, "cache"), "broad_risk"), &integer(1));
+        assert_eq!(cache_rows(&fixture, "?1 = ?1", ""), 1);
+    }
+
+    fn cached_with_hook(
+        fixture: &mut Fixture,
+        scope: &[&str],
+        reader: &dyn Visibility,
+        before_store: &mut dyn FnMut(&mut CollaborationStore),
+    ) -> CachedContext {
+        let answer = retrieve_with(
+            &mut fixture.store,
+            &query(scope, None, Vec::new()),
+            reader,
+            Hooks {
+                after_load: &mut |_| {},
+                after_refresh: &mut |_| {},
+                before_store,
+            },
+            true,
+        )
+        .unwrap();
+        match answer {
+            Answer::Fresh { context, stored } => CachedContext {
+                served: Served::Fresh { stored },
+                record: context.record,
+                id: context.id,
+                cache_key: context.cache_key,
+                contributions: context.contributions,
+            },
+            Answer::Cached(hit) => hit,
+        }
+    }
+
+    /// A release, a re-brief or a revocation landing between the read and
+    /// the store never lets the answer be stored: purged data cannot come
+    /// back, and `stored` says so.
+    #[test]
+    fn a_change_between_read_and_store_prevents_the_store() {
+        let reader = Reader::all("all");
+        let carrying = "CAST(record AS TEXT) LIKE '%' || ?1 || '%'";
+        // Released.
+        let mut fixture = Fixture::new();
+        let gone = fixture.contribute(&[("src/search.rs", "v2\n")]);
+        let id = gone.as_str().to_string();
+        let answer = cached_with_hook(&mut fixture, &["src/search.rs"], &reader, &mut |store| {
+            store
+                .connection()
+                .execute(
+                    "UPDATE retention_roots SET released_ms = 1 WHERE lineage_record_id = ?1",
+                    [&id],
+                )
+                .unwrap();
+        });
+        assert_eq!(answer.served, Served::Fresh { stored: false });
+        assert_eq!(cache_rows(&fixture, carrying, gone.as_str()), 0);
+        // Re-briefed: the answer carries the old brief.
+        let mut fixture = Fixture::new();
+        let rebriefed = fixture.contribute(&[("src/search.rs", "v2\n")]);
+        attach_brief(&mut fixture.store, &rebriefed, &brief("src", "old reason")).unwrap();
+        let target = rebriefed.clone();
+        let answer = cached_with_hook(&mut fixture, &["src/search.rs"], &reader, &mut |store| {
+            attach_brief(store, &target, &brief("src", "new reason")).unwrap();
+            // Another query re-indexes it with the new brief before the store.
+            retrieve(
+                store,
+                &query(&["src/search.rs"], None, Vec::new()),
+                &LocalProject,
+            )
+            .unwrap();
+        });
+        assert_eq!(answer.served, Served::Fresh { stored: false });
+        assert_eq!(cache_rows(&fixture, carrying, "old reason"), 0);
+        // Revoked: even an answer that names no contribution.
+        let mut fixture = Fixture::new();
+        let answer = cached_with_hook(&mut fixture, &["lib/none.rs"], &reader, &mut |store| {
+            forget_reader(store, "all").unwrap();
+        });
+        assert_eq!(answer.served, Served::Fresh { stored: false });
+        assert_eq!(cache_rows(&fixture, "visibility = ?1", "all"), 0);
+        // An answer computed after the revocation is stored again.
+        assert_eq!(
+            cached(&mut fixture, &["lib/none.rs"], &reader).served,
+            Served::Fresh { stored: true }
+        );
+    }
+
+    /// A served row reports the generation its answer was computed at, not
+    /// the one current when it was stored.
+    #[test]
+    fn a_cached_answer_reports_its_compute_generation() {
+        let mut fixture = Fixture::new();
+        let reader = Reader::all("all");
+        fixture.contribute(&[("src/search.rs", "v2\n")]);
+        let before: i64 = generation(fixture.store.read_connection()).unwrap();
+        let request = prepared(&mut fixture, &[("docs/unrelated.md", "x\n")]);
+        let answer = cached_with_hook(&mut fixture, &["src/search.rs"], &reader, &mut |store| {
+            capture(store, &request).unwrap();
+        });
+        assert_eq!(answer.served, Served::Fresh { stored: true });
+        assert!(generation(fixture.store.read_connection()).unwrap() > before);
+        let served = cached(&mut fixture, &["src/search.rs"], &reader);
+        match served.served {
+            Served::Cache { generation, .. } => assert_eq!(generation, before),
+            other => panic!("{other:?}"),
+        }
     }
 
     /// T85: a row this binary cannot read as a context record (another
