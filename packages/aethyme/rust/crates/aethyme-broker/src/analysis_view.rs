@@ -593,7 +593,14 @@ fn build(store: &CollaborationStore, plan: BuildPlan<'_>) -> Result<String, View
     let lock_path = view_dir.join(".build.lock");
     let lock = open_lock(&lock_path)?;
     lock.lock().map_err(io(&lock_path))?;
-    let _ = std::fs::remove_file(view_dir.join("RETIRED"));
+    // Building revives a retired view. A marker that cannot be removed would
+    // leave the new generation looking retired, so that is an error.
+    let retired = view_dir.join("RETIRED");
+    match std::fs::remove_file(&retired) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(io(&retired)(error)),
+    }
 
     let generation = generations(&view_dir)?.last().copied().unwrap_or(0) + 1;
     let building = view_dir.join(format!("building-{generation}-{}", std::process::id()));
