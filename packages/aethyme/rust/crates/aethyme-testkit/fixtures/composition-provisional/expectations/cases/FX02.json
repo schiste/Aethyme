@@ -1,0 +1,85 @@
+{
+  "schema": "aethyme.composition-expectations/provisional-v0",
+  "case": "FX02",
+  "title": "Move a subtree and edit its child; identical subtrees make correspondence ambiguous",
+  "plan": "#650 FX02; plan v3 §7.2 rows 'move a subtree and edit its child' (mandatory positive) and 'delete versus modify; ambiguous correspondence'",
+  "scenarios": {
+    "s1": {
+      "title": "c1 moves #card-news into #pinned (re-indented); c2 edits its button",
+      "required_outcomes": [
+        "candidate"
+      ],
+      "behaviors": [
+        {
+          "check": "inside",
+          "file": "app.html",
+          "selector": "#card-news",
+          "ancestor": "#pinned"
+        },
+        {
+          "check": "not_inside",
+          "file": "app.html",
+          "selector": "#card-news",
+          "ancestor": "#content"
+        },
+        {
+          "check": "attr",
+          "file": "app.html",
+          "selector": "#card-news button",
+          "name": "onkeydown",
+          "equals": "openOnEnter(event)"
+        },
+        {
+          "check": "attr",
+          "file": "app.html",
+          "selector": "#card-news button",
+          "name": "aria-label",
+          "equals": "More news"
+        },
+        {
+          "check": "inside",
+          "file": "app.html",
+          "selector": "#card-events",
+          "ancestor": "#content"
+        },
+        {
+          "check": "attr_absent",
+          "file": "app.html",
+          "selector": "#card-events button",
+          "name": "onkeydown"
+        },
+        {
+          "check": "attr_absent",
+          "file": "app.html",
+          "selector": "#card-events button",
+          "name": "aria-label"
+        },
+        {
+          "check": "count",
+          "file": "app.html",
+          "selector": "article.card",
+          "equals": 2
+        }
+      ],
+      "provisional_text": {
+        "outcome": "conflict",
+        "behavior": null,
+        "note": "a line merge sees the re-indented move as a deletion that overlaps the edited line; the mandatory positive is NOT met by the provisional profile"
+      }
+    },
+    "s2": {
+      "title": "two identical cards: c3 moves the first into #pinned, c4 edits the first card's button",
+      "required_outcomes": [
+        "conflict",
+        "resolution_required",
+        "unsupported"
+      ],
+      "behaviors": [],
+      "provisional_text": {
+        "outcome": "candidate",
+        "behavior": "fails",
+        "note": "SILENT WRONG MERGE: the line diff deletes the second identical card, so the edit lands on the card that stayed. Correspondence between identical cards is ambiguous, so no candidate is acceptable: a right answer would be a guess"
+      }
+    }
+  }
+}

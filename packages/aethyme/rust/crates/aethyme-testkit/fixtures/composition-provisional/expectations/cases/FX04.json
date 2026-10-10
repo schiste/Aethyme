@@ -1,0 +1,51 @@
+{
+  "schema": "aethyme.composition-expectations/provisional-v0",
+  "case": "FX04",
+  "title": "Bounded synthesis: a rename and a new handler that still uses the old id",
+  "plan": "#650 FX04; plan v3 §7.1 'semantic synthesis', §7.3 steps 6-8, T20 (complete-candidate check)",
+  "scenarios": {
+    "s1": {
+      "title": "c1 renames #submit to #send-signup everywhere; c2 adds an Enter handler that clicks #submit",
+      "required_outcomes": [
+        "candidate",
+        "resolution_required"
+      ],
+      "behaviors": [
+        {
+          "check": "count",
+          "file": "app.html",
+          "selector": "#send-signup",
+          "equals": 1
+        },
+        {
+          "check": "count",
+          "file": "app.html",
+          "selector": "#submit",
+          "equals": 0
+        },
+        {
+          "check": "id_refs_resolve",
+          "file": "app.ts",
+          "html": "app.html"
+        },
+        {
+          "check": "listener_references",
+          "file": "app.ts",
+          "event": "keydown",
+          "id": "send-signup"
+        },
+        {
+          "check": "listener_references",
+          "file": "app.ts",
+          "event": "click",
+          "id": "status"
+        }
+      ],
+      "provisional_text": {
+        "outcome": "candidate",
+        "behavior": "fails",
+        "note": "the text merge is clean but the new keyboard handler looks up the renamed id; only a complete-candidate check (or a resolver) catches it"
+      }
+    }
+  }
+}

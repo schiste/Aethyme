@@ -1,0 +1,52 @@
+{
+  "schema": "aethyme.composition-expectations/provisional-v0",
+  "case": "HX02",
+  "title": "Held-out FX02 variant: move the middle of three similar items and edit its button",
+  "plan": "#650 held-out variant of FX02",
+  "scenarios": {
+    "s1": {
+      "title": "",
+      "required_outcomes": [
+        "candidate"
+      ],
+      "behaviors": [
+        {
+          "check": "inside",
+          "file": "list.html",
+          "selector": "#item-green",
+          "ancestor": "#favorites"
+        },
+        {
+          "check": "attr",
+          "file": "list.html",
+          "selector": "#item-green button",
+          "name": "onkeydown",
+          "equals": "openOnEnter(event)"
+        },
+        {
+          "check": "attr_absent",
+          "file": "list.html",
+          "selector": "#item-red button",
+          "name": "onkeydown"
+        },
+        {
+          "check": "attr_absent",
+          "file": "list.html",
+          "selector": "#item-blue button",
+          "name": "onkeydown"
+        },
+        {
+          "check": "count",
+          "file": "list.html",
+          "selector": "#feed article.item",
+          "equals": 2
+        }
+      ],
+      "provisional_text": {
+        "outcome": "conflict",
+        "behavior": null,
+        "note": "the re-indented move deletes the edited line"
+      }
+    }
+  }
+}

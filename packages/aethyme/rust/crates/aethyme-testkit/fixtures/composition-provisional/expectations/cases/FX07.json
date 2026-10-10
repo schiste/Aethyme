@@ -1,0 +1,82 @@
+{
+  "schema": "aethyme.composition-expectations/provisional-v0",
+  "case": "FX07",
+  "title": "Synthesized subtraction: A+B became X; ask for A without B, with and without retained originals, and with a consumer of X",
+  "plan": "#650 FX07; plan v3 §7.1 'extraction/recomposition', §7.4, T22",
+  "scenarios": {
+    "s1": {
+      "title": "X (c3) synthesized from c1+c2; request X without c2, originals retained",
+      "required_outcomes": [
+        "candidate",
+        "inseparable_selection",
+        "unsupported"
+      ],
+      "behaviors": [
+        {
+          "check": "attr",
+          "file": "app.html",
+          "selector": "#submit",
+          "name": "aria-label",
+          "equals": "Send the form"
+        },
+        {
+          "check": "text",
+          "file": "app.html",
+          "selector": "#submit",
+          "equals": "Send"
+        },
+        {
+          "check": "attr_absent",
+          "file": "app.html",
+          "selector": "#title",
+          "name": "data-track"
+        },
+        {
+          "check": "text",
+          "file": "app.html",
+          "selector": "#pitch",
+          "equals": "Monthly news, no spam."
+        }
+      ],
+      "provisional_text": {
+        "outcome": "candidate",
+        "behavior": "passes",
+        "note": "measured as a fresh composition of the retained original c1 on t0; X is never relabelled",
+        "measured_orders": [
+          [
+            "c1"
+          ]
+        ]
+      },
+      "allowed_changes": [
+        "c1"
+      ]
+    },
+    "s2": {
+      "title": "same request, but c1's original source is not retained",
+      "required_outcomes": [
+        "inseparable_selection",
+        "unsupported"
+      ],
+      "behaviors": [],
+      "provisional_text": {
+        "outcome": null,
+        "behavior": null,
+        "note": "planning refusal: decided from lineage, selection and records before any merge engine runs, so the text profile is not measured"
+      }
+    },
+    "s3": {
+      "title": "same request, keeping c4, which was built on X",
+      "required_outcomes": [
+        "inseparable_selection",
+        "missing_input"
+      ],
+      "behaviors": [],
+      "provisional_text": {
+        "outcome": null,
+        "behavior": null,
+        "note": "planning refusal: decided from lineage, selection and records before any merge engine runs, so the text profile is not measured"
+      }
+    }
+  }
+}

@@ -1,0 +1,70 @@
+{
+  "schema": "aethyme.composition-expectations/provisional-v0",
+  "case": "FX01",
+  "title": "Common base: independent label, accessibility and child changes",
+  "plan": "#650 FX01; plan v3 §7.2 rows 'same-base changes to different supported regions' and 'different attributes of a known element'",
+  "scenarios": {
+    "s1": {
+      "title": "label (c1), aria-label (c2) and a new intro paragraph (c3) on one base",
+      "required_outcomes": [
+        "candidate"
+      ],
+      "behaviors": [
+        {
+          "check": "text",
+          "file": "app.html",
+          "selector": "label[for=email]",
+          "equals": "Email address"
+        },
+        {
+          "check": "attr",
+          "file": "app.html",
+          "selector": "#submit",
+          "name": "aria-label",
+          "equals": "Send the sign-up form"
+        },
+        {
+          "check": "text",
+          "file": "app.html",
+          "selector": "#intro",
+          "equals": "One short email a month."
+        },
+        {
+          "check": "inside",
+          "file": "app.html",
+          "selector": "#intro",
+          "ancestor": "#app"
+        },
+        {
+          "check": "not_inside",
+          "file": "app.html",
+          "selector": "#intro",
+          "ancestor": "#signup"
+        },
+        {
+          "check": "text",
+          "file": "app.html",
+          "selector": "#submit",
+          "equals": "Send"
+        },
+        {
+          "check": "inside",
+          "file": "app.html",
+          "selector": "#email",
+          "ancestor": "#signup"
+        },
+        {
+          "check": "text",
+          "file": "app.html",
+          "selector": "#legal",
+          "equals": "No spam."
+        }
+      ],
+      "provisional_text": {
+        "outcome": "candidate",
+        "behavior": "passes",
+        "note": "the three changes touch lines separated by unchanged lines, so a line-based three-way merge composes them in every order"
+      }
+    }
+  }
+}
