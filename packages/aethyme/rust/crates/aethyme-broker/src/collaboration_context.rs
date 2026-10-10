@@ -1248,6 +1248,11 @@ pub const REFETCH_AFTER_MS: i64 = 5 * 60 * 1000;
 /// Cached answers kept per project store; the least recently used go first.
 pub const MAX_CACHE_ENTRIES: i64 = 1024;
 
+/// [`MAX_CACHE_ENTRIES`], small under test so eviction is exercised.
+fn cache_limit() -> i64 {
+    if cfg!(test) { 16 } else { MAX_CACHE_ENTRIES }
+}
+
 /// Where an answer came from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Served {
@@ -1554,7 +1559,7 @@ fn store_answer(
         "DELETE FROM context_cache WHERE cache_key IN (
              SELECT cache_key FROM context_cache ORDER BY last_used_ms, cache_key
              LIMIT max(0, (SELECT count(*) FROM context_cache) - ?1))",
-        [MAX_CACHE_ENTRIES],
+        [cache_limit()],
     )?;
     drop_orphan_members(&transaction)?;
     transaction.commit()?;
@@ -3605,6 +3610,74 @@ mod tests {
             panic!()
         };
         assert!(gaps.contains(&text("no_dependency_analysis")));
+    }
+
+    /// The cache is bounded: beyond its limit the least recently used
+    /// answers go, and their member rows with them.
+    #[test]
+    fn the_least_recently_used_answers_are_evicted() {
+        let mut fixture = Fixture::new();
+        let reader = Reader::all("all");
+        let scopes: Vec<String> = (0..cache_limit() + 3)
+            .map(|n| format!("src/m{n}.rs"))
+            .collect();
+        for scope in &scopes {
+            cached(&mut fixture, &[scope.as_str()], &reader);
+            // Distinct last-use times without waiting.
+            fixture
+                .store
+                .connection()
+                .execute(
+                    "UPDATE context_cache SET last_used_ms = last_used_ms - 1",
+                    [],
+                )
+                .unwrap();
+        }
+        assert_eq!(cache_rows(&fixture, "?1 = ?1", ""), cache_limit());
+        let oldest = cached(&mut fixture, &[scopes[0].as_str()], &reader);
+        assert!(!hit(&oldest), "the oldest answer should have been evicted");
+        let newest = cached(&mut fixture, &[scopes[scopes.len() - 1].as_str()], &reader);
+        assert!(hit(&newest));
+        let orphans: i64 = fixture
+            .store
+            .read_connection()
+            .query_row(
+                "SELECT count(*) FROM context_cache_members
+                 WHERE cache_key NOT IN (SELECT cache_key FROM context_cache)",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(orphans, 0);
+    }
+
+    /// A store a schema 5 binary indexed has no broad-risk postings; opening
+    /// it at schema 6 rebuilds the derived index so they appear.
+    #[test]
+    fn migrating_to_schema_6_rebuilds_the_index_with_broad_postings() {
+        let mut fixture = Fixture::new();
+        let reader = Reader::all("all");
+        fixture.contribute(&[("Cargo.toml", "[workspace]\n")]);
+        fresh(&mut fixture, &["src/search.rs"], &reader);
+        // As a schema 5 binary would have left it.
+        fixture
+            .store
+            .connection()
+            .execute_batch(
+                "DELETE FROM context_postings WHERE key = x'62';
+                 UPDATE meta SET value = '5' WHERE key = 'schema_version';
+                 UPDATE meta SET value = '5' WHERE key = 'min_compatible_schema';",
+            )
+            .unwrap();
+        fixture.store = CollaborationStore::open(
+            &CollaborationRoot::under_host_state(fixture._host.path()),
+            &ProjectKey::parse("proj-ctx").unwrap(),
+            &[],
+        )
+        .unwrap();
+        let context = cached(&mut fixture, &["src/search.rs"], &reader);
+        let value = canonical_json::parse(&context.record).unwrap();
+        assert_eq!(field(field(&value, "cache"), "broad_risk"), &integer(1));
     }
 
     /// T85: a row this binary cannot read as a context record (another
