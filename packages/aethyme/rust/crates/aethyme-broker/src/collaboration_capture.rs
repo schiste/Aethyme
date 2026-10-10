@@ -1273,12 +1273,16 @@ fn in_flight(store: &mut CollaborationStore) -> Result<Vec<OperationId>, Capture
     ids.iter().map(|id| OperationId::parse(id)).collect()
 }
 
-/// Resolve crashed operations other than `except`, ignoring failures: an
-/// operation that cannot be resolved now is left for [`recover`] to report.
+/// Resolve crashed operations other than `except`. A failure is printed as a
+/// warning and does not stop the capture: an operation that cannot be
+/// resolved now is left for [`recover`] to report.
 fn reap_crashed(store: &mut CollaborationStore, except: Option<&OperationId>) {
     let Ok(ids) = in_flight(store) else { return };
     for id in ids.iter().filter(|id| Some(*id) != except) {
-        let _ = recover_one(store, id);
+        crate::warn_unrecorded(
+            &format!("resolve crashed capture {}", id.as_str()),
+            recover_one(store, id),
+        );
     }
 }
 
