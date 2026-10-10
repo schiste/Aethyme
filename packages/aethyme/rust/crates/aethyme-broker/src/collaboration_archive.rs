@@ -151,6 +151,10 @@ impl ObjectDigest {
         Self(bytes)
     }
 
+    pub fn raw(&self) -> [u8; 32] {
+        self.0
+    }
+
     pub fn hex(&self) -> String {
         self.0.iter().map(|b| format!("{b:02x}")).collect()
     }
@@ -1469,6 +1473,79 @@ pub fn retained(
         entry_count: entry_count.try_into().unwrap_or(0),
         content_bytes: content_bytes.try_into().unwrap_or(0),
     }))
+}
+
+/// The archive's entry for the contribution whose lineage record is
+/// `lineage`, if its record and both snapshots are still retained. The
+/// lineage record is re-read and must hash to its row, decode to
+/// `lineage`, and name the row's base and result snapshots, so a damaged
+/// index cannot substitute another contribution or its source.
+pub fn retained_contribution(
+    store: &CollaborationStore,
+    lineage: &RecordId,
+) -> Result<Option<RetainedContribution>, ArchiveError> {
+    let row = store
+        .read_connection()
+        .query_row(
+            "SELECT record_sha256, base_snapshot, result_snapshot
+             FROM retained_contributions WHERE lineage_record_id = ?1
+               AND lineage_record_id NOT IN
+                   (SELECT lineage_record_id FROM reclaimed_contributions)",
+            [lineage.as_str()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((record_sha256, base, result)) = row else {
+        return Ok(None);
+    };
+    let corrupt = || ArchiveError::CorruptObject {
+        digest: record_sha256.clone(),
+    };
+    let digest = parse_digest(&record_sha256).ok_or_else(corrupt)?;
+    let bytes = read_object(store, &digest)?;
+    let record = Record::decode(&bytes, &[&CONTRIBUTION_LINEAGE_SCHEMA]).map_err(|_| corrupt())?;
+    if record.id() != *lineage {
+        return Err(corrupt());
+    }
+    // The row is an index, not the record: its snapshot columns must say
+    // what the record says, or an edited row could pass another
+    // contribution's source off under this lineage.
+    let field = |name: &str| match record.get(name) {
+        Some(Value::String(text)) => Some(text.as_str()),
+        _ => None,
+    };
+    if field("base") != Some(base.as_str()) || field("result") != Some(result.as_str()) {
+        return Err(corrupt());
+    }
+    let snapshot = |text: &str| SourceSnapshotId::parse(text).map_err(|_| corrupt());
+    let (Some(base), Some(result)) = (
+        retained(store, &snapshot(&base)?)?,
+        retained(store, &snapshot(&result)?)?,
+    ) else {
+        return Ok(None);
+    };
+    Ok(Some(RetainedContribution {
+        base,
+        result,
+        lineage_record_id: lineage.clone(),
+    }))
+}
+
+fn parse_digest(hex: &str) -> Option<ObjectDigest> {
+    if !is_lower_hex(hex, &[64]) {
+        return None;
+    }
+    let mut digest = [0; 32];
+    for (i, byte) in digest.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).ok()?;
+    }
+    Some(ObjectDigest(digest))
 }
 
 // ----------------------------------------------------------- reconstruct

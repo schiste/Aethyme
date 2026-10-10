@@ -95,7 +95,8 @@ pub struct Candidate {
     /// The accepted state the inputs were applied to.
     pub baseline: CommitOid,
     /// Where `baseline` came from: `integration` or `upstream`, as in a
-    /// submit outcome's `verified_against.source`.
+    /// submit outcome's `verified_against.source`, or `retained` for a
+    /// composer's baseline read from the archive.
     pub baseline_source: &'static str,
     /// In application order.
     pub inputs: Vec<CandidateInput>,
@@ -109,6 +110,46 @@ pub struct CompositionConflict {
     pub path: String,
     /// The input whose application conflicted.
     pub input: CommitOid,
+    pub reason: ConflictReason,
+}
+
+/// Why a path conflicted. The legacy replay reports only `content`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConflictReason {
+    /// Both sides changed overlapping content.
+    Content,
+    /// One side deleted the path, the other changed it.
+    DeleteModify,
+    /// Both sides added the path with different content.
+    AddAdd,
+    /// Both sides changed the path's kind (mode) differently.
+    Mode,
+    /// Both sides changed a binary file or symlink: exact replacement only.
+    Binary,
+    /// A side moved a block of lines, which a line merge cannot carry
+    /// another side's edit along (#664's text profile limit).
+    MovedBlock,
+    /// A side deleted lines that have an identical twin left in the base,
+    /// so a line merge cannot tell which copy went (#664's text profile
+    /// limit).
+    AmbiguousAnchor,
+    /// The result would hold a file where another path needs a directory.
+    DirectoryFile,
+}
+
+impl ConflictReason {
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::Content => "content",
+            Self::DeleteModify => "delete_modify",
+            Self::AddAdd => "add_add",
+            Self::Mode => "mode",
+            Self::Binary => "binary",
+            Self::MovedBlock => "moved_block",
+            Self::AmbiguousAnchor => "ambiguous_anchor",
+            Self::DirectoryFile => "directory_file",
+        }
+    }
 }
 
 /// Why construction was refused before any candidate could exist. The
@@ -314,6 +355,7 @@ impl Broker {
                     Ok(CompositionConflict {
                         path: detail.path.clone(),
                         input: commit_oid(&detail.originating_commit)?,
+                        reason: ConflictReason::Content,
                     })
                 })
                 .collect::<Result<_, BrokerOpError>>()?;

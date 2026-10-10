@@ -37,6 +37,7 @@ dependencies = [
  "serde_json",
  "sha1",
  "sha2",
+ "similar",
  "tempfile",
  "thiserror",
  "toml",
@@ -181,6 +182,7 @@ dependencies = [
 name = "aethyme-testkit"
 version = "0.1.0"
 dependencies = [
+ "serde",
  "serde_json",
  "sha2",
  "tempfile",

@@ -1,0 +1,51 @@
+{
+  "schema": "aethyme.composition-expectations/provisional-v0",
+  "case": "HX04",
+  "title": "Held-out FX04 variant: a renamed status element and a new handler using the old id",
+  "plan": "#650 held-out variant of FX04",
+  "scenarios": {
+    "s1": {
+      "title": "",
+      "required_outcomes": [
+        "candidate",
+        "resolution_required"
+      ],
+      "behaviors": [
+        {
+          "check": "count",
+          "file": "page.html",
+          "selector": "#upload-status",
+          "equals": 1
+        },
+        {
+          "check": "count",
+          "file": "page.html",
+          "selector": "#status",
+          "equals": 0
+        },
+        {
+          "check": "id_refs_resolve",
+          "file": "page.ts",
+          "html": "page.html"
+        },
+        {
+          "check": "listener_references",
+          "file": "page.ts",
+          "event": "change",
+          "id": "upload-status"
+        },
+        {
+          "check": "listener_references",
+          "file": "page.ts",
+          "event": "click",
+          "id": "upload-status"
+        }
+      ],
+      "provisional_text": {
+        "outcome": "candidate",
+        "behavior": "fails",
+        "note": "the text merge is clean but the new change handler looks up the renamed status id"
+      }
+    }
+  }
+}
