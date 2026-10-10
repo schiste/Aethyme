@@ -666,3 +666,26 @@ fn reads_are_confined_to_exact_scoped_paths() {
         "inconclusive"
     );
 }
+
+#[test]
+fn a_requirement_path_outside_the_tree_is_refused() {
+    let mut world = world(BASE, &[("A", &[("a.txt", Some("one\nA\nthree\n"))])]);
+    let request = composition_request(&world, &["A"]);
+    let composition = composer::compose(&mut world.store, &world.repo, &request).unwrap();
+    for path in ["../outside", "pkg/../../x", "/", "./"] {
+        let error = resolution::request_resolution(
+            &mut world.store,
+            &world.repo,
+            &request,
+            &composition,
+            &opaque(),
+            &[RequirementRef {
+                id: "harness".into(),
+                path: Some(path.into()),
+            }],
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), "invalid_request", "{path}");
+    }
+}

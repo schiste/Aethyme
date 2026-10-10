@@ -327,10 +327,11 @@ fn judge(case: &CaseInput, input: &ScenarioInput) -> (fx::Verdict, Vec<String>) 
     (fx::judge_scenario(case, &input.id, &runs), lines)
 }
 
-/// The composer alone met 15 provisional scenarios (#664). Verification
-/// turning a clean but wrong candidate into a resolution request adds the
-/// semantic interaction; the move-plus-edit positive still needs E1's
-/// structural engine.
+/// The composer alone met 15 provisional scenarios (#664). The one this
+/// adds is the oracle-backed stand-in check rejecting a clean but wrong
+/// candidate, which the pipeline turns into a resolution request: it
+/// measures the plumbing, not what real gates would catch. The
+/// move-plus-edit positive still needs E1's structural engine.
 const ACCEPTED_FLOOR: usize = 16;
 
 #[test]
@@ -414,7 +415,10 @@ fn raise(case: &CaseInput, input: &ScenarioInput) -> (World, ResolutionRequest) 
 /// A test double that propagates identifier renames: where a member's own
 /// change renames `id="old"` to `id="new"`, it rewrites the remaining
 /// `"old"` and `"#old"` references in the accumulator's scoped files. It
-/// reads only the request's inputs.
+/// reads only the request's inputs. It is format-specific (HTML ids and
+/// their string references), and the held-out interaction is a structural
+/// twin of the provisional one, so its passing there is weak evidence that
+/// it generalizes and none that a real resolver would.
 struct RenamePropagator;
 
 impl Resolver for RenamePropagator {
