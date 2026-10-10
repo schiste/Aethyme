@@ -34,6 +34,7 @@ const TOP_LEVEL: &[&str] = &[
     "broker",
     "update",
     "upgrade",
+    "collab",
     "certify",
     "init",
     "deploy",

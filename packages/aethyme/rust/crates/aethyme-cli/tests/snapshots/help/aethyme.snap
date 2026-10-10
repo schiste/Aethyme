@@ -36,6 +36,12 @@ Agent broker:
                               verified, atomic upgrade (= update apply)
   upgrade plan|apply|recover  review, apply, or recover repository migrations
 
+Collaboration (opt-in, experimental; disabled unless [collaboration] enables it):
+  collab status|enroll        policy, state root and captures; mint a project ID
+  collab capture|gc|context|brief
+                              recover captures, reclaim retained data, read
+                              bounded context, attach decision briefs
+
 Setup:
   init                        guided setup: certify + scaffold + gates draft
   certify                     read-only certification checks for this repo

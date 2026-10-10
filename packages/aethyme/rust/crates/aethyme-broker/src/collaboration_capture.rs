@@ -135,7 +135,7 @@ pub enum CapturePolicy {
 }
 
 impl CapturePolicy {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Advisory => "advisory",
             Self::Required => "required",
@@ -164,7 +164,7 @@ impl RetentionBoundary {
         value.map_or(Self::UntilReleased, Self::UntilMs)
     }
 
-    fn describe(self) -> String {
+    pub(crate) fn describe(self) -> String {
         match self {
             Self::UntilReleased => "until_released".into(),
             Self::UntilMs(ms) => format!("until_ms:{ms}"),
@@ -1074,6 +1074,37 @@ pub fn capture(
     capture_with(store, request, &Hooks::default())
 }
 
+/// Hold `operation_id`'s lock, as a concurrent capture would.
+#[cfg(test)]
+pub(crate) fn hold_operation_lock(
+    store: &CollaborationStore,
+    operation_id: &OperationId,
+) -> Option<ExclusiveFileLock> {
+    lock_operation(store, operation_id, true).unwrap()
+}
+
+/// [`capture`] without waiting: `Ok(None)` when a reclamation is applying or
+/// another process holds this operation's lock, so a caller that must not
+/// block (advisory capture at submit, #660) can report the capture as in
+/// progress instead. The locks are taken in [`capture_with`]'s order.
+pub fn try_capture(
+    store: &mut CollaborationStore,
+    request: &CaptureRequest,
+) -> Result<Option<CaptureOutcome>, CaptureError> {
+    let Some(_use) =
+        crate::collaboration_gc::try_archive_use(store).map_err(|source| CaptureError::Io {
+            path: crate::collaboration_gc::lock_path(store),
+            source,
+        })?
+    else {
+        return Ok(None);
+    };
+    let Some(_lock) = lock_operation(store, &request.operation_id, false)? else {
+        return Ok(None);
+    };
+    capture_locked(store, request, &Hooks::default()).map(Some)
+}
+
 pub(crate) fn capture_with(
     store: &mut CollaborationStore,
     request: &CaptureRequest,
@@ -1083,6 +1114,15 @@ pub(crate) fn capture_with(
     // for all of them. Taken before the operation lock, always.
     let _use = archive_use(store)?;
     let _lock = lock_operation(store, &request.operation_id, true)?;
+    capture_locked(store, request, hooks)
+}
+
+/// The capture itself; the caller holds the archive and operation locks.
+fn capture_locked(
+    store: &mut CollaborationStore,
+    request: &CaptureRequest,
+    hooks: &Hooks,
+) -> Result<CaptureOutcome, CaptureError> {
     let row = match begin(store, request, hooks)? {
         Begun::Row(row) => row,
         Begun::Incomplete(outcome) => return Ok(outcome),
