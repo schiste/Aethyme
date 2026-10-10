@@ -6493,5 +6493,23 @@
     "playground_targets_only": true,
     "driver_process_exit_code": 1,
     "driver_exit_reason": "The driver returns 1 when any run returns nonzero; eight completed Codex runs returned 3 because the generated-artifact leakage gate fired."
+  },
+  "metadata_follow_up": {
+    "version": "v15",
+    "kind": "metadata-only frozen-package correction",
+    "reason": "The six v14 handoff framing sidecars retained an earlier hash than the actual common framing and v14 pre-freeze check.",
+    "v14_frozen_revision": "694ad1e4bf71eb40e669e0a8557dec1039bd73b1",
+    "v14_results_preserved": true,
+    "v14_runs_rescored": 0,
+    "v15_frozen_revision": "b684ea6cbcf2c248cdc7cc04fbd8bea4065ca718",
+    "v15_tag": "fx08-v15-frozen",
+    "v15_bundle": "packages/aethyme-eval/benchmarks/local-v3/fx08/fx08-v15-frozen.bundle",
+    "v15_bundle_sha256": "784492acd0b051c8972e4bae84d1cf02b483c1243c5e0d6906b010efd80ae37e",
+    "previous_framing_sha256": "39cb1e70dbb145abceece6c949dc97142358c342abe428d86e8f68306d789423",
+    "corrected_framing_sha256": "1f92fc7b2f2f1e1e7a74d15a63d63630fce59a216b27d8c3c39404602c2090c1",
+    "corrected_sidecars": 6,
+    "task_brief_prompt_oracle_and_run_config_bytes_unchanged": true,
+    "v15_agent_runs": 0,
+    "heldout_shortfall_unchanged": 8
   }
 }
