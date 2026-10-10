@@ -162,7 +162,7 @@ impl PromoteConfig {
         Self::from_text(repository_config_text(main_root).as_deref())
     }
 
-    fn from_text(text: Option<&str>) -> Self {
+    pub(crate) fn from_text(text: Option<&str>) -> Self {
         let mut config = Self {
             branch: DEFAULT_INTEGRATION_BRANCH.to_string(),
             mode: PromoteMode::Auto,

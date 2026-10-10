@@ -493,7 +493,8 @@ fn submit_with(
     }
     // Raise the compatibility floor before capturing, so no pre-#660 binary
     // can submit to this repository uncaptured from here on.
-    broker.apply_collaboration_fence(true)?;
+    let config = crate::merge::repository_config_with_source(broker.main_root());
+    broker.collaboration_fence_state(crate::broker::FenceTrigger::Config(config.as_ref()));
     let main_root = broker.main_root().to_path_buf();
     let worktree = capture.worktree().map(Path::to_path_buf);
     let known = known_paths(&main_root, worktree.as_deref());
@@ -557,9 +558,8 @@ pub(crate) fn require_capture_for_promotion(
         Setting::Unsupported { code, .. } => return Err(refuse(code.to_string())),
         Setting::On { project, .. } => project.map_err(|_| refuse("no_project".into()))?,
     };
-    broker
-        .apply_collaboration_fence(true)
-        .map_err(|e| refuse(format!("fence_unavailable: {e}")))?;
+    let config = crate::merge::repository_config_with_source(broker.main_root());
+    broker.collaboration_fence_state(crate::broker::FenceTrigger::Config(config.as_ref()));
     let store = broker
         .collaboration_store(&project)
         .map_err(|e| refuse(e.code().into()))?;
@@ -828,6 +828,7 @@ mod tests {
 
     struct Fixture {
         repo: tempfile::TempDir,
+        _origin: Option<tempfile::TempDir>,
         _worktrees: tempfile::TempDir,
         state: tempfile::TempDir,
         broker: crate::Broker,
@@ -837,6 +838,13 @@ mod tests {
 
     /// A repository with `policy` capture and one committed session.
     fn fixture(policy: &str) -> Fixture {
+        fixture_with(policy, false)
+    }
+
+    /// `capture = policy` in `.aethyme/config.toml`, committed on a fetched
+    /// default branch (`origin/main`) when `committed`, otherwise only in the
+    /// working copy.
+    fn fixture_with(policy: &str, committed: bool) -> Fixture {
         let repo = tempfile::tempdir().unwrap();
         git(repo.path(), &["init", "-q", "-b", "main"]);
         std::fs::write(repo.path().join("README.md"), "fixture\n").unwrap();
@@ -849,6 +857,19 @@ mod tests {
             format!("[collaboration]\ncapture = \"{policy}\"\nproject = \"proj-test\"\n"),
         )
         .unwrap();
+        let origin = committed.then(|| {
+            let origin = tempfile::tempdir().unwrap();
+            git(origin.path(), &["init", "-q", "--bare", "-b", "main"]);
+            git(repo.path(), &["add", "-f", ".aethyme/config.toml"]);
+            git(repo.path(), &["commit", "-qm", "config"]);
+            git(
+                repo.path(),
+                &["remote", "add", "origin", origin.path().to_str().unwrap()],
+            );
+            git(repo.path(), &["push", "-q", "-u", "origin", "main"]);
+            git(repo.path(), &["remote", "set-head", "origin", "main"]);
+            origin
+        });
         let worktrees = tempfile::tempdir().unwrap();
         let state = tempfile::tempdir().unwrap();
         let mut broker = crate::Broker::open(repo.path())
@@ -860,6 +881,7 @@ mod tests {
         commit(&worktree, "first");
         Fixture {
             repo,
+            _origin: origin,
             _worktrees: worktrees,
             state,
             broker,
@@ -1124,49 +1146,162 @@ mod tests {
         crate::schema::collaboration_fence(&conn).unwrap()
     }
 
-    /// Any open by a #660 binary of a repository that requires capture fences
-    /// older binaries out; off and advisory leave the floor alone.
+    /// Commit `policy` on the default branch from another clone and fetch
+    /// it, leaving the main checkout's working copy as it was.
+    fn commit_upstream_policy(fixture: &Fixture, policy: &str) {
+        let origin = fixture._origin.as_ref().unwrap().path();
+        let other = tempfile::tempdir().unwrap();
+        git(
+            other.path(),
+            &["clone", "-q", origin.to_str().unwrap(), "."],
+        );
+        std::fs::write(
+            other.path().join(".aethyme/config.toml"),
+            format!("[collaboration]\ncapture = \"{policy}\"\nproject = \"proj-test\"\n"),
+        )
+        .unwrap();
+        git(other.path(), &["commit", "-qam", policy]);
+        git(other.path(), &["push", "-q", "origin", "HEAD:main"]);
+        git(fixture.repo.path(), &["fetch", "-q", "origin"]);
+    }
+
+    fn effective_fence(broker: &crate::Broker) -> Option<crate::CollaborationFence> {
+        let config = crate::merge::repository_config_with_source(broker.main_root());
+        broker.collaboration_fence_state(crate::broker::FenceTrigger::Config(config.as_ref()))
+    }
+
+    /// Any writable open by a #660 binary of a repository whose committed
+    /// config requires capture fences older binaries out; off and advisory
+    /// leave the floor alone.
     #[test]
     fn opening_a_required_repository_fences_older_binaries_out() {
-        let required = fixture("required");
+        let required = fixture_with("required", true);
         assert_eq!(
             fence(required.repo.path()),
             Some(crate::CollaborationFence {
                 min_compatible_schema: crate::COLLABORATION_FENCE_SCHEMA,
                 reason: crate::schema::COLLABORATION_FENCE_REASON.into(),
+                source: "committed".into(),
+                state: "active",
             })
         );
         assert!(!older_binary_opens(required.repo.path()));
         for policy in ["advisory", "off"] {
-            let fixture = fixture(policy);
+            let fixture = fixture_with(policy, true);
             assert_eq!(fence(fixture.repo.path()), None, "{policy}");
             assert!(older_binary_opens(fixture.repo.path()), "{policy}");
         }
     }
 
-    /// The fence is one-way: turning required off does not let older
+    /// Only the committed copy fences: an uncommitted or experimental
+    /// `required` in the main checkout never locks older binaries out.
+    #[test]
+    fn an_uncommitted_required_does_not_fence() {
+        // No fetched default branch at all: the working copy alone.
+        let local = fixture_with("required", false);
+        assert_eq!(fence(local.repo.path()), None);
+        assert!(effective_fence(&local.broker).is_none());
+        assert!(older_binary_opens(local.repo.path()));
+
+        // Committed off, working copy edited to required.
+        let fixture = fixture_with("off", true);
+        std::fs::write(
+            fixture.repo.path().join(".aethyme/config.toml"),
+            "[collaboration]\ncapture = \"required\"\nproject = \"proj-test\"\n",
+        )
+        .unwrap();
+        let reopened = crate::Broker::open(fixture.repo.path()).unwrap();
+        assert!(effective_fence(&reopened).is_none());
+        assert_eq!(fence(fixture.repo.path()), None);
+        assert!(older_binary_opens(fixture.repo.path()));
+    }
+
+    /// The fence is one-way: committing required off does not let older
     /// binaries back in.
     #[test]
     fn turning_required_off_keeps_the_fence() {
-        let fixture = fixture("required");
+        let fixture = fixture_with("required", true);
+        commit_upstream_policy(&fixture, "off");
         std::fs::write(
             fixture.repo.path().join(".aethyme/config.toml"),
             "[collaboration]\ncapture = \"off\"\n",
         )
         .unwrap();
         let reopened = crate::Broker::open(fixture.repo.path()).unwrap();
-        assert!(reopened.apply_collaboration_fence(true).unwrap().is_some());
+        assert_eq!(effective_fence(&reopened).unwrap().state, "active");
         assert!(!older_binary_opens(fixture.repo.path()));
-        assert!(fence(fixture.repo.path()).is_some());
     }
 
     /// A typo is refused at submit but is not a reason to lock older binaries
     /// out for good: only an explicit required raises the floor.
     #[test]
     fn an_unsupported_value_does_not_raise_the_floor() {
-        let fixture = fixture("requried");
+        let fixture = fixture_with("requried", true);
+        assert!(effective_fence(&fixture.broker).is_none());
         assert_eq!(fence(fixture.repo.path()), None);
         assert!(older_binary_opens(fixture.repo.path()));
+    }
+
+    /// Read-only status (snapshot opens: `status --read-only-snapshot`,
+    /// graph refresh preconditions) never writes the fence and never fails
+    /// because of it: with `required` committed upstream while the main
+    /// checkout's working copy trails, it reports the fence as pending. A
+    /// writable status then raises it.
+    #[test]
+    fn read_only_status_reports_a_pending_fence_and_writes_nothing() {
+        let fixture = fixture_with("off", true);
+        commit_upstream_policy(&fixture, "required");
+        let snapshot = crate::Broker::open_snapshot(fixture.repo.path()).unwrap();
+        for view in [
+            snapshot.status_snapshot(0).unwrap(),
+            snapshot.status_current_snapshot(0).unwrap(),
+        ] {
+            assert_eq!(view.collaboration_fence.as_ref().unwrap().state, "pending");
+            assert!(
+                view.advice
+                    .iter()
+                    .any(|advice| advice.id == "collaboration.fence-pending"),
+                "{:?}",
+                view.advice
+            );
+        }
+        assert_eq!(fence(fixture.repo.path()), None);
+        assert!(older_binary_opens(fixture.repo.path()));
+
+        let mut writable = crate::Broker::open(fixture.repo.path()).unwrap();
+        let view = writable.status_current(0).unwrap();
+        assert_eq!(view.collaboration_fence.unwrap().state, "active");
+        assert!(!older_binary_opens(fixture.repo.path()));
+    }
+
+    /// Without any broker database, the snapshot status runs on an in-memory
+    /// store: it still reports the pending fence and creates nothing.
+    #[test]
+    fn a_snapshot_without_a_database_reports_a_pending_fence() {
+        let repo = tempfile::tempdir().unwrap();
+        let origin = tempfile::tempdir().unwrap();
+        git(origin.path(), &["init", "-q", "--bare", "-b", "main"]);
+        git(repo.path(), &["init", "-q", "-b", "main"]);
+        std::fs::create_dir_all(repo.path().join(".aethyme")).unwrap();
+        std::fs::write(repo.path().join(".gitignore"), "/.aethyme/\n").unwrap();
+        std::fs::write(
+            repo.path().join(".aethyme/config.toml"),
+            "[collaboration]\ncapture = \"required\"\nproject = \"proj-test\"\n",
+        )
+        .unwrap();
+        git(repo.path(), &["add", "-A"]);
+        git(repo.path(), &["add", "-f", ".aethyme/config.toml"]);
+        git(repo.path(), &["commit", "-qm", "init"]);
+        git(
+            repo.path(),
+            &["remote", "add", "origin", origin.path().to_str().unwrap()],
+        );
+        git(repo.path(), &["push", "-q", "-u", "origin", "main"]);
+        git(repo.path(), &["remote", "set-head", "origin", "main"]);
+        let snapshot = crate::Broker::open_snapshot(repo.path()).unwrap();
+        let view = snapshot.status_snapshot(0).unwrap();
+        assert_eq!(view.collaboration_fence.unwrap().state, "pending");
+        assert!(!repo.path().join(".aethyme/broker.db").exists());
     }
 
     #[test]

@@ -1577,6 +1577,16 @@ pub struct PendingOperationView {
     pub liveness: crate::operations::OperationLivenessView,
 }
 
+/// What prompts a collaboration-fence check (#660); see
+/// `Broker::collaboration_fence_state`.
+pub(crate) enum FenceTrigger<'a> {
+    /// A broker open: cheap, reaching Git only when the working copy says
+    /// `capture = "required"`.
+    Open,
+    /// A caller that already loaded the repository config (text, source).
+    Config(Option<&'a (String, &'static str)>),
+}
+
 /// Everything `broker status` renders, in one serializable shape.
 #[derive(Debug, serde::Serialize)]
 pub struct StatusView {

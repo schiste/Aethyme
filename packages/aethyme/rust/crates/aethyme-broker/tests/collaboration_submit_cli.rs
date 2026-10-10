@@ -431,11 +431,12 @@ fn the_legacy_verdict_is_printed_before_the_advisory_capture() {
     assert!(verdict < capture, "{stdout}");
 }
 
-/// `broker status` reports the fence once a repository requires capture, in
-/// JSON and as one line of text, and says nothing for advisory.
+/// `broker status` reports the fence once the committed config requires
+/// capture, in JSON (with its source) and as one line of text, and says
+/// nothing for advisory.
 #[test]
 fn status_reports_the_collaboration_fence() {
-    let required = Fixture::new(Some(REQUIRED), false);
+    let (required, _origin) = Fixture::with_origin(REQUIRED);
     let output = required.cli(&["status", "--json"], None);
     assert!(
         output.status.success(),
@@ -448,6 +449,8 @@ fn status_reports_the_collaboration_fence() {
         serde_json::json!({
             "min_compatible_schema": aethyme_broker::COLLABORATION_FENCE_SCHEMA,
             "reason": "collaboration capture required",
+            "source": "committed",
+            "state": "active",
         })
     );
     let text = required.cli(&["status"], None);
@@ -458,7 +461,7 @@ fn status_reports_the_collaboration_fence() {
         String::from_utf8_lossy(&text.stdout)
     );
 
-    let advisory = Fixture::new(Some(ADVISORY), false);
+    let (advisory, _origin) = Fixture::with_origin(ADVISORY);
     let output = advisory.cli(&["status", "--json"], None);
     let status: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert!(status.get("collaboration_fence").is_none(), "{status:#}");

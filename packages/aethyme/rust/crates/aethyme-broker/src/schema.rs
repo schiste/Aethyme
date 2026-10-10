@@ -85,46 +85,79 @@ pub const COLLABORATION_FENCE_SCHEMA: i64 = 50;
 /// Why a database carries the collaboration fence (`meta.collaboration_fence`).
 pub const COLLABORATION_FENCE_REASON: &str = "collaboration capture required";
 
-/// The collaboration fence on a database, when one was raised.
+/// The collaboration fence on a database: raised, or required by the
+/// committed config but not yet raised.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct CollaborationFence {
-    /// The database's current floor (at least [`COLLABORATION_FENCE_SCHEMA`]).
+    /// The floor in force (`active`), or the one to be raised (`pending`).
     pub min_compatible_schema: i64,
     pub reason: String,
+    /// The config that required it: `committed` (the fetched default
+    /// branch's `.aethyme/config.toml`).
+    pub source: String,
+    /// `active` once raised; `pending` while required but not yet raised,
+    /// because this open is read-only or the write failed.
+    pub state: &'static str,
 }
 
-/// Read the fence in one query: the floor and the recorded reason.
+impl CollaborationFence {
+    /// Required by the committed config, not yet raised.
+    pub fn pending() -> Self {
+        Self {
+            min_compatible_schema: COLLABORATION_FENCE_SCHEMA,
+            reason: COLLABORATION_FENCE_REASON.into(),
+            source: "committed".into(),
+            state: "pending",
+        }
+    }
+}
+
+/// Read the fence in one query: the floor, the reason and the source.
 pub fn collaboration_fence(conn: &Connection) -> Result<Option<CollaborationFence>, BrokerError> {
-    let (minimum, reason): (Option<String>, Option<String>) = conn.query_row(
-        "SELECT (SELECT value FROM meta WHERE key = 'min_compatible_schema'),
-                (SELECT value FROM meta WHERE key = 'collaboration_fence')",
-        [],
-        |row| Ok((row.get(0)?, row.get(1)?)),
-    )?;
+    let (minimum, reason, source): (Option<String>, Option<String>, Option<String>) = conn
+        .query_row(
+            "SELECT (SELECT value FROM meta WHERE key = 'min_compatible_schema'),
+                    (SELECT value FROM meta WHERE key = 'collaboration_fence'),
+                    (SELECT value FROM meta WHERE key = 'collaboration_fence_source')",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
     let minimum = minimum.and_then(|value| value.parse::<i64>().ok());
     Ok(match (minimum, reason) {
         (Some(minimum), Some(reason)) if minimum >= COLLABORATION_FENCE_SCHEMA => {
             Some(CollaborationFence {
                 min_compatible_schema: minimum,
                 reason,
+                source: source.unwrap_or_else(|| "unknown".into()),
+                state: "active",
             })
         }
         _ => None,
     })
 }
 
-/// Raise the floor to [`COLLABORATION_FENCE_SCHEMA`] and record why, in one
-/// transaction. Never lowers a higher floor and never replaces the reason.
-pub fn raise_collaboration_fence(conn: &Connection) -> Result<(), BrokerError> {
-    conn.execute_batch(&format!(
-        "BEGIN IMMEDIATE;
-         INSERT INTO meta (key, value) VALUES ('min_compatible_schema', '{COLLABORATION_FENCE_SCHEMA}')
+/// Raise the floor to [`COLLABORATION_FENCE_SCHEMA`] and record why and from
+/// which config, in one transaction that rolls back on any failure, so a
+/// failed raise never leaves the connection holding a write lock. Never
+/// lowers a higher floor and never replaces a recorded reason or source.
+pub fn raise_collaboration_fence(conn: &Connection, source: &str) -> Result<(), BrokerError> {
+    let transaction = conn.unchecked_transaction()?;
+    transaction.execute(
+        "INSERT INTO meta (key, value) VALUES ('min_compatible_schema', ?1)
          ON CONFLICT (key) DO UPDATE SET value = excluded.value
-         WHERE CAST(meta.value AS INTEGER) < CAST(excluded.value AS INTEGER);
-         INSERT INTO meta (key, value) VALUES ('collaboration_fence', '{COLLABORATION_FENCE_REASON}')
-         ON CONFLICT (key) DO NOTHING;
-         COMMIT;"
-    ))?;
+         WHERE CAST(meta.value AS INTEGER) < CAST(excluded.value AS INTEGER)",
+        [COLLABORATION_FENCE_SCHEMA.to_string()],
+    )?;
+    for (key, value) in [
+        ("collaboration_fence", COLLABORATION_FENCE_REASON),
+        ("collaboration_fence_source", source),
+    ] {
+        transaction.execute(
+            "INSERT INTO meta (key, value) VALUES (?1, ?2) ON CONFLICT (key) DO NOTHING",
+            [key, value],
+        )?;
+    }
+    transaction.commit()?;
     Ok(())
 }
 
@@ -2031,7 +2064,7 @@ mod tests {
         assert!(schema_is_compatible_with(&conn, found, 49).unwrap());
         assert_eq!(collaboration_fence(&conn).unwrap(), None);
 
-        raise_collaboration_fence(&conn).unwrap();
+        raise_collaboration_fence(&conn, "committed").unwrap();
         assert!(!schema_is_compatible_with(&conn, found, 49).unwrap());
         assert!(schema_is_compatible_with(&conn, found, COLLABORATION_FENCE_SCHEMA).unwrap());
         assert_eq!(
@@ -2039,10 +2072,12 @@ mod tests {
             Some(CollaborationFence {
                 min_compatible_schema: COLLABORATION_FENCE_SCHEMA,
                 reason: COLLABORATION_FENCE_REASON.into(),
+                source: "committed".into(),
+                state: "active",
             })
         );
         // Re-opening, re-raising and re-migrating never lower it.
-        raise_collaboration_fence(&conn).unwrap();
+        raise_collaboration_fence(&conn, "committed").unwrap();
         migrate(&conn).unwrap();
         record_min_compatible_schema(&conn).unwrap();
         assert!(!schema_is_compatible_with(&conn, found, 49).unwrap());
@@ -2053,7 +2088,7 @@ mod tests {
             "min_compatible_schema",
             COLLABORATION_FENCE_SCHEMA + 3,
         );
-        raise_collaboration_fence(&conn).unwrap();
+        raise_collaboration_fence(&conn, "committed").unwrap();
         assert_eq!(
             collaboration_fence(&conn)
                 .unwrap()
@@ -2061,6 +2096,26 @@ mod tests {
                 .min_compatible_schema,
             COLLABORATION_FENCE_SCHEMA + 3
         );
+    }
+
+    /// A raise that fails part-way rolls back and leaves no transaction open,
+    /// so the connection keeps working and other processes are not blocked.
+    #[test]
+    fn a_failed_fence_raise_leaves_no_open_transaction() {
+        let conn = migrated();
+        conn.execute_batch(
+            "CREATE TRIGGER refuse_fence_source BEFORE INSERT ON meta
+             WHEN NEW.key = 'collaboration_fence_source'
+             BEGIN SELECT RAISE(ABORT, 'injected'); END;",
+        )
+        .unwrap();
+        assert!(raise_collaboration_fence(&conn, "committed").is_err());
+        assert!(conn.is_autocommit(), "a transaction was left open");
+        // The floor was rolled back with the rest.
+        assert_eq!(collaboration_fence(&conn).unwrap(), None);
+        let found = current_version(&conn).unwrap();
+        assert!(schema_is_compatible_with(&conn, found, 49).unwrap());
+        conn.execute_batch("BEGIN IMMEDIATE; COMMIT;").unwrap();
     }
 
     #[test]

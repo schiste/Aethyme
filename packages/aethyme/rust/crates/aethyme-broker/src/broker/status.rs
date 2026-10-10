@@ -482,7 +482,15 @@ impl Broker {
         // row below that tells an agent integration may move, has drifted, or
         // needs reconciling is noise there (and some of it is `blocked`), so
         // the mode is read once and gates all of them.
-        let promotes = PromoteConfig::load(&self.main_root).mode.promotes_at_all();
+        // Read once and shared with the collaboration fence below, so the
+        // fence costs status no extra Git calls.
+        let repository_config = crate::merge::repository_config_with_source(&self.main_root);
+        let promotes =
+            PromoteConfig::from_text(repository_config.as_ref().map(|(text, _)| text.as_str()))
+                .mode
+                .promotes_at_all();
+        let collaboration_fence =
+            self.collaboration_fence_state(FenceTrigger::Config(repository_config.as_ref()));
         // One deadline for every phase below whose cost grows with sessions
         // and history; each phase that runs out names what it skipped.
         let budget = status_inspection_budget();
@@ -735,6 +743,26 @@ impl Broker {
             promotes,
             checkouts.as_ref(),
         );
+        if collaboration_fence
+            .as_ref()
+            .is_some_and(|fence| fence.state == "pending")
+        {
+            advice.push(StatusAdvice {
+                id: "collaboration.fence-pending",
+                severity: StatusAdviceSeverity::Warning,
+                reason: "collaboration_fence_pending",
+                summary: format!(
+                    "the committed config requires collaboration capture, but broker.db's \
+                     floor is not yet raised to schema {}: binaries older than that can still \
+                     open this repository and submit uncaptured work",
+                    crate::COLLABORATION_FENCE_SCHEMA
+                ),
+                session_id: None,
+                queue_entry_id: None,
+                evidence: Vec::new(),
+                commands: vec!["aethyme broker status".into()],
+            });
+        }
         let integration_contains_upstream = upstream_head.as_deref().and_then(|upstream| {
             if !before_deadline() {
                 return None;
@@ -1476,7 +1504,7 @@ impl Broker {
             outstanding_advisories: self.store.advisories(false)?,
             advisory_delivery: self.store.advisory_delivery_summary()?,
             outstanding_entry_exposures: self.store.outstanding_entry_path_exposures()?,
-            collaboration_fence: self.apply_collaboration_fence(true)?,
+            collaboration_fence,
             agents,
             leases,
             lease_liveness,
