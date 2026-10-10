@@ -59,6 +59,9 @@ pub enum CompositionMode {
     Text,
     Structural,
     Hybrid,
+    /// A bounded resolver wrote the content (#665). Never verified by being
+    /// produced: the candidate is checked again as its own candidate.
+    Synthesized,
 }
 
 impl CompositionMode {
@@ -67,6 +70,7 @@ impl CompositionMode {
             Self::Text => "text",
             Self::Structural => "structural",
             Self::Hybrid => "hybrid",
+            Self::Synthesized => "synthesized",
         }
     }
 }

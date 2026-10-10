@@ -247,7 +247,7 @@ fn io(path: &Path, source: std::io::Error) -> ComposeError {
     }
 }
 
-type Entries = BTreeMap<Vec<u8>, (EntryKind, [u8; 32])>;
+pub(crate) type Entries = BTreeMap<Vec<u8>, (EntryKind, [u8; 32])>;
 
 struct Refused(Refusal, String);
 
@@ -950,7 +950,7 @@ impl Reader<'_> {
 
 // ---------------------------------------------------------------- applying
 
-type Entry = (EntryKind, [u8; 32]);
+pub(crate) type Entry = (EntryKind, [u8; 32]);
 
 /// Apply one contribution's change to one path: `Ok(Ok(new entry or
 /// removal))`, `Ok(Err(reason))` for a conflict.
@@ -1145,6 +1145,108 @@ fn git_version() -> Result<String, ComposeError> {
         return Err(ComposeError::Git("git --version failed".into()));
     }
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+// ------------------------------------------------- shared with resolution
+
+/// The entries of retained snapshot `id`, verified against its digest.
+pub(crate) fn snapshot_entries(
+    store: &CollaborationStore,
+    id: &SourceSnapshotId,
+) -> Result<Entries, ComposeError> {
+    let mut reader = Reader {
+        store,
+        cache: HashMap::new(),
+        manifests: HashMap::new(),
+        bytes: 0,
+    };
+    reader.entries(id)
+}
+
+/// The bytes of one retained blob, verified against its digest.
+pub(crate) fn blob(store: &CollaborationStore, digest: &[u8; 32]) -> Result<Vec<u8>, ComposeError> {
+    let mut reader = Reader {
+        store,
+        cache: HashMap::new(),
+        manifests: HashMap::new(),
+        bytes: 0,
+    };
+    reader.blob(digest)
+}
+
+/// Write `entries` as a candidate commit on `baseline` and retain it, the
+/// way [`compose`] does: Git objects only, the commit's snapshot checked
+/// against `entries`, then retained. `blobs` holds content the archive does
+/// not have yet, by SHA-256. Returns the subject, tree and commit.
+pub(crate) fn materialize_candidate(
+    store: &mut CollaborationStore,
+    repo: &Path,
+    baseline: &RetainedSnapshot,
+    entries: &Entries,
+    blobs: HashMap<[u8; 32], Vec<u8>>,
+) -> Result<(SourceSnapshotId, String, CommitOid), ComposeError> {
+    let expected = SourceSnapshot::new(
+        entries
+            .iter()
+            .map(|(path, (kind, digest))| {
+                SourceEntry::from_content_digest(path.clone(), *kind, *digest)
+            })
+            .collect::<Vec<_>>(),
+    )
+    .map_err(|error| ComposeError::Archive(ArchiveError::InvalidSnapshot(error)))?
+    .id();
+    let (tree, commit) = {
+        let _use = crate::collaboration_gc::archive_use(store)
+            .map_err(|source| io(&crate::collaboration_gc::lock_path(store), source))?;
+        let mut reader = Reader {
+            store,
+            cache: blobs,
+            manifests: HashMap::new(),
+            bytes: 0,
+        };
+        let baseline_entries = reader.entries(&baseline.snapshot_id)?;
+        let scratch = tempfile::tempdir().map_err(|source| io(Path::new("<tempdir>"), source))?;
+        materialize(
+            &mut reader,
+            repo,
+            scratch.path(),
+            baseline,
+            &baseline_entries,
+            entries,
+        )?
+    };
+    let observed = collaboration_archive::snapshot_of_commit(repo, &commit)?.id();
+    if observed != expected {
+        return Err(ComposeError::SubjectMismatch {
+            commit: commit.as_str().to_string(),
+            expected: expected.to_string(),
+            observed: observed.to_string(),
+        });
+    }
+    let retained =
+        collaboration_archive::retain_snapshot_with(store, repo, &commit, &mut |_| Ok(()))?;
+    if retained.snapshot_id != expected {
+        return Err(ComposeError::SubjectMismatch {
+            commit: commit.as_str().to_string(),
+            expected: expected.to_string(),
+            observed: retained.snapshot_id.to_string(),
+        });
+    }
+    Ok((expected, tree, commit))
+}
+
+/// The retained snapshot of `commit`, read from Git as capture reads it.
+pub(crate) fn retain_commit(
+    store: &mut CollaborationStore,
+    repo: &Path,
+    commit: &CommitOid,
+) -> Result<RetainedSnapshot, ComposeError> {
+    let retained =
+        collaboration_archive::retain_snapshot_with(store, repo, commit, &mut |_| Ok(()))?;
+    Ok(RetainedSnapshot {
+        commit: commit.clone(),
+        ..retained
+    })
 }
 
 // ------------------------------------------------------------ materializing
