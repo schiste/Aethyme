@@ -447,28 +447,14 @@ impl BrokerStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let id = tx
             .query_row(
-                "SELECT o.id
-                 FROM delivery_outbox o
-                 JOIN delivery_subscriptions s ON s.id = o.subscription_id
-                 WHERE s.adapter = ?1 AND s.active = 1
-                   AND (
-                        -- Never attempted: claimable at once.
-                        (o.status = 'pending' AND o.attempt_count = 0)
-                        -- Retried: hold it back, or `ORDER BY o.id` re-selects
-                        -- the same row forever and starves every later
-                        -- delivery for this adapter (#154). The target that
-                        -- just declined will not have changed a millisecond
-                        -- later, so an immediate retry cannot succeed anyway.
-                        OR (o.status = 'pending' AND o.attempt_count > 0
-                            AND o.updated_at + MIN(
-
-                                    15000 * (1 << MIN(o.attempt_count - 1, 5)),
-                                    300000
-                                ) <= ?2)
-                        -- An expired claim means the worker died, not that the
-                        -- target refused, so it retries promptly.
-                        OR (o.status = 'claimed' AND o.claim_expires_at <= ?2))
-                 ORDER BY o.id LIMIT 1",
+                &format!(
+                    "SELECT o.id
+                     FROM delivery_outbox o
+                     JOIN delivery_subscriptions s ON s.id = o.subscription_id
+                     WHERE s.adapter = ?1 AND s.active = 1 AND {}
+                     ORDER BY o.id LIMIT 1",
+                    crate::outbox::CLAIMABLE_PREDICATE_SQL
+                ),
                 params![adapter, now],
                 |row| row.get::<_, i64>(0),
             )
@@ -477,13 +463,10 @@ impl BrokerStore {
             tx.commit()?;
             return Ok(None);
         };
+        let claim_update =
+            crate::outbox::claim_update_statement(crate::outbox::OutboxTable::PullRequest);
         tx.execute(
-            "UPDATE delivery_outbox
-             SET status = 'claimed', generation = generation + 1,
-                 claimed_by = ?2, claim_expires_at = ?3,
-                 attempt_count = attempt_count + 1,
-                 last_error_code = NULL, updated_at = ?4
-             WHERE id = ?1",
+            &claim_update,
             params![id, worker, now + claim_seconds as i64 * 1_000, now],
         )?;
         tx.commit()?;
@@ -500,38 +483,30 @@ impl BrokerStore {
         now: i64,
     ) -> Result<DeliveryOutboxItem, BrokerError> {
         let (current, subscription, watch, _) = self.delivery_context(id)?;
-        if current.status != DeliveryStatus::Claimed
-            || current.claimed_by.as_deref() != Some(worker)
-            || current.generation != generation
-            || current.claim_expires_at.is_none_or(|expiry| expiry <= now)
-        {
+        if !crate::outbox::claim_is_current(
+            current.status,
+            current.claimed_by.as_deref(),
+            current.generation,
+            current.claim_expires_at,
+            worker,
+            generation,
+            now,
+        ) {
             return Err(BrokerError::DeliveryClaimChanged {
                 id,
                 worker: worker.into(),
                 generation,
             });
         }
-        let (status, delivered_at) = match completion {
-            DeliveryCompletion::Delivered => (DeliveryStatus::Delivered, Some(now)),
-            // The claim already counted this attempt, so an exhausted row is
-            // dead-lettered here rather than handed back to the adapter that
-            // has just failed to place it `MAX_DELIVERY_ATTEMPTS` times. The
-            // caller's `Retry` stays advisory: only the broker can see how
-            // long the row has been asking, so only the broker can stop it.
-            DeliveryCompletion::Retry if current.attempt_count >= MAX_DELIVERY_ATTEMPTS => {
-                (DeliveryStatus::Failed, None)
-            }
-            DeliveryCompletion::Retry => (DeliveryStatus::Pending, None),
-            DeliveryCompletion::Failed => (DeliveryStatus::Failed, None),
-        };
+        let (status, delivered_at) =
+            crate::outbox::completion_state(completion, current.attempt_count, now);
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let completion_update =
+            crate::outbox::completion_update_statement(crate::outbox::OutboxTable::PullRequest);
         let updated = tx.execute(
-            "UPDATE delivery_outbox
-             SET status = ?2, claimed_by = NULL, claim_expires_at = NULL,
-                 last_error_code = ?3, delivered_at = ?4, updated_at = ?5
-             WHERE id = ?1 AND status = 'claimed' AND generation = ?6 AND claimed_by = ?7",
+            &completion_update,
             params![
                 id,
                 status.as_str(),
