@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::process::{Command, Output};
 
-use aethyme_broker::{Broker, GateStatus, NewGateResult, events};
+use aethyme_broker::{Broker, GateStatus, GitError, GitRepo, NewGateResult, events};
 
 const CLI: &str = env!("CARGO_BIN_EXE_broker-cli-shim");
 
@@ -32,6 +32,12 @@ fn run(repo: &Path, args: &[&str]) -> Output {
 }
 
 fn promoted_fixture() -> (tempfile::TempDir, i64, std::path::PathBuf, String) {
+    promoted_fixture_with_worktree_root(None)
+}
+
+fn promoted_fixture_with_worktree_root(
+    worktree_root: Option<&Path>,
+) -> (tempfile::TempDir, i64, std::path::PathBuf, String) {
     let tmp = tempfile::tempdir().unwrap();
     git(tmp.path(), &["init", "-q", "-b", "main"]);
     std::fs::write(tmp.path().join("README.md"), "fixture\n").unwrap();
@@ -40,6 +46,9 @@ fn promoted_fixture() -> (tempfile::TempDir, i64, std::path::PathBuf, String) {
     git(tmp.path(), &["commit", "-qm", "init"]);
 
     let mut broker = Broker::open(tmp.path()).unwrap();
+    if let Some(worktree_root) = worktree_root {
+        broker = broker.with_worktree_root(worktree_root);
+    }
     let session = broker.start_worktree("finish CLI fixture", None).unwrap();
     let worktree = std::path::PathBuf::from(&session.worktree_path);
     std::fs::write(worktree.join("done.txt"), "done\n").unwrap();
@@ -147,6 +156,48 @@ fn finish_cli_json_is_structured_and_persists_a_redacted_handoff() {
     assert!(!payload.contains("redacted/gate.log"));
 }
 
+#[test]
+fn finish_cli_succeeds_for_a_clean_worktree_root_with_spaces() {
+    let worktree_root = tempfile::Builder::new()
+        .prefix("aethyme finish worktrees with spaces ")
+        .tempdir()
+        .unwrap();
+    let (tmp, session_id, worktree, _) =
+        promoted_fixture_with_worktree_root(Some(worktree_root.path()));
+    assert!(
+        worktree.to_string_lossy().contains(' '),
+        "fixture path must contain spaces: {}",
+        worktree.display()
+    );
+
+    let output = Command::new(CLI)
+        .args(["finish", "--session", &session_id.to_string(), "--json"])
+        .current_dir(tmp.path())
+        .env("AETHYME_WORKTREE_ROOT", worktree_root.path())
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stdout}\n{stderr}");
+    let report: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(report["status"], "cleaned", "{stdout}");
+    assert_eq!(report["cleanup"]["completed"], true, "{stdout}");
+    assert_eq!(report["cleanup"]["worktree_removed"], true, "{stdout}");
+    assert!(!worktree.exists());
+}
+
+#[test]
+fn discover_keeps_the_specific_non_repository_error() {
+    let tmp = tempfile::tempdir().unwrap();
+    let error = GitRepo::discover(tmp.path())
+        .err()
+        .expect("not a repository");
+    assert!(matches!(
+        error,
+        GitError::NotARepository { path } if path == tmp.path()
+    ));
+}
+
 #[cfg(unix)]
 #[test]
 fn finish_reports_a_bounded_git_timeout_before_closing_the_session() {
@@ -158,9 +209,20 @@ fn finish_reports_a_bounded_git_timeout_before_closing_the_session() {
     std::fs::write(tmp.path().join(".gitignore"), "/.aethyme/\n").unwrap();
     git(tmp.path(), &["add", "-A"]);
     git(tmp.path(), &["commit", "-qm", "init"]);
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let worktree_root = tempfile::Builder::new()
+        .prefix("aethyme finish worktrees with spaces ")
+        .tempdir()
+        .unwrap();
+    let mut broker = Broker::open(tmp.path())
+        .unwrap()
+        .with_worktree_root(worktree_root.path());
     let session = broker.start_worktree("slow finish check", None).unwrap();
     let worktree = std::path::PathBuf::from(&session.worktree_path);
+    assert!(
+        worktree.to_string_lossy().contains(' '),
+        "fixture path must contain spaces: {}",
+        worktree.display()
+    );
     let session_id = session.id;
     drop(broker);
 
@@ -174,7 +236,7 @@ fn finish_reports_a_bounded_git_timeout_before_closing_the_session() {
     let shim = bin.join("git");
     std::fs::write(
         &shim,
-        "#!/bin/sh\nif [ \"$1\" = status ] && [ \"$PWD\" = \"$AETHYME_TEST_SLOW_WORKTREE\" ]; then exec /bin/sleep 5; fi\nexec \"$AETHYME_TEST_REAL_GIT\" \"$@\"\n",
+        "#!/bin/sh\nif [ \"$PWD\" = \"$AETHYME_TEST_SLOW_WORKTREE\" ] && [ \"$1\" = rev-parse ] && [ \"$2\" = --show-toplevel ]; then exec /bin/sleep 5; fi\nexec \"$AETHYME_TEST_REAL_GIT\" \"$@\"\n",
     )
     .unwrap();
     let mut permissions = std::fs::metadata(&shim).unwrap().permissions();
@@ -188,16 +250,20 @@ fn finish_reports_a_bounded_git_timeout_before_closing_the_session() {
         .args(["finish", "--session", &session_arg, "--timeout", "1"])
         .current_dir(tmp.path())
         .env("PATH", path)
+        .env("AETHYME_WORKTREE_ROOT", worktree_root.path())
         .env("AETHYME_TEST_REAL_GIT", real_git)
         .env("AETHYME_TEST_SLOW_WORKTREE", &worktree)
         .output()
         .unwrap();
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("finish timed out after 1s"), "{stderr}");
     assert!(
-        stderr.contains("git ") && stderr.contains("did not finish within"),
+        stderr.contains("git rev-parse --show-toplevel did not finish within 1s"),
         "{stderr}"
+    );
+    assert!(
+        !stderr.contains("is not inside a git repository"),
+        "a Git deadline must not be reported as a missing repository: {stderr}"
     );
     // The message names the session state it left and the one safe next step.
     assert!(

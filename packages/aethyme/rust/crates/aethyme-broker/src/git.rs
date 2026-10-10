@@ -1163,11 +1163,19 @@ pub struct ConfigEntry {
 impl GitRepo {
     /// Discover the repository containing `path`.
     pub fn discover(path: &Path) -> Result<Self, GitError> {
-        let root = run_git(path, &["rev-parse", "--show-toplevel"]).map_err(|_| {
-            GitError::NotARepository {
-                path: path.to_path_buf(),
+        let root = match run_git(path, &["rev-parse", "--show-toplevel"]) {
+            Ok(root) => root,
+            Err(GitError::Git { stderr, .. }) if stderr.contains("not a git repository") => {
+                return Err(GitError::NotARepository {
+                    path: path.to_path_buf(),
+                });
             }
-        })?;
+            // A timeout, spawn failure, or unrelated Git error says nothing
+            // about whether the path belongs to a repository. Preserve the
+            // original invocation and failure instead of disguising it as an
+            // invalid checkout (#688).
+            Err(error) => return Err(error),
+        };
         Ok(Self {
             root: PathBuf::from(root),
         })
