@@ -492,7 +492,7 @@ a reason.
 - `aethyme broker advanced operations [same options]` (compatibility alias during deprecation)
 - `aethyme broker advanced operations show <id|host-operation-id> [--json]`
 - `aethyme broker advanced operations stats [--repo <canonical-id>] [--limit <n>] [--json]`
-- `aethyme broker advanced operations reconcile --operation <id|host-operation-id> --outcome <succeeded|failed> --reason <text> [--json]`
+- `aethyme broker advanced operations reconcile --operation <id|host-operation-id> (--outcome <succeeded|failed> | --inspect-remote) --reason <text> [--json]`
 - `aethyme broker unblock [--json]` — read-only: every current blocker across `broker.db`, the host operation and resource ledgers, gate pidfiles, and conflict notices, each with a stable id (`op:<n>`, `hostop:<32-hex>`, `resource:<lease-id>`, `lease:<id>`, `gatecache:<gate>@<tree>`, `pidfile:<session>-<gate>`, `action:<session>`), its scope (`repo` or `host`), cause, owning session, `safe_to_clear_automatically`, and the exact command that clears it. `broker status --json` carries the same list as `blockers`, and `broker status doctor` prints it.
 - `aethyme broker unblock <id> [--outcome <succeeded|failed>] [--reason <text>] [--confirm <generation>] [--json]` — clear one blocker through its store's recovery path: `op:` and `hostop:` reconcile through `operations reconcile` and need `--outcome` and `--reason` from an operator who inspected the remote (the host id is accepted directly, #276); `gatecache:` marks exactly that gate's failing verdicts for that tree cleared, with the time and `--reason` (#281), so they stay in gate history but no longer satisfy the cache and the next run executes the gate (#416); `pidfile:` is removed only when its process is gone; `resource:` releases a quarantined lease once its holder is gone, without `--confirm` only when its owning session is closed; `lease:` releases a stale session's claim only when its worktree is gone; `action:` always refuses and names the resubmission. A refusal changes nothing, prints the reason and the flag it needs, and exits 3.
 - `aethyme broker advanced advisories list [--all] [--json]`
@@ -774,9 +774,19 @@ second clone remains blocked by the host-wide unknown-outcome barrier until an
 operator inspects external state and runs one explicit reconciliation command.
 
 Every `operations reconcile` usage or validation error repeats the complete
-contract—`--operation`, `--outcome`, and `--reason`—in one message. Successful
-manual reconciliation appends the operator outcome and reason without deleting
-the original push plan or remote evidence.
+contract—`--operation`, `--reason`, and exactly one of `--outcome` or
+`--inspect-remote`—in one message. The inspection mode supports only an
+outcome-unknown Git write with a recorded exact-ref push plan. It queries every
+planned destination, records the observed SHAs and a proposed outcome when all
+refs match either the planned bases or proposed commits, and leaves the write
+barrier in place. Mixed, changed, or unavailable evidence produces no proposal.
+Current refs are a snapshot, not proof of historical state. The existing
+`--outcome` mode remains an operator assertion and records
+`reconciliation.source: operator_assertion` and the supplied reason, preserving
+any earlier remote-inspection evidence. `operations show --json` exposes that
+evidence as `reconciliation.remote_inspection` separately from the original
+push evidence; a recorded final decision exposes its provenance as
+`reconciliation.source: operator_assertion`.
 
 `broker advanced operations stats` is a bounded, read-only measurement surface for the
 coordination-lock decision. It reports p50/p99 lock-hold and queue-wait
@@ -2066,8 +2076,10 @@ is a reconciled success. Missing, unexpected, or mixed evidence remains
 `outcome_unknown` (with mixed base/proposed refs recorded as `partial`). Pushes
 using shorthand, deletion, wildcard, `--all`, `--mirror`, `--tags`, or another
 unplannable shape remain conservatively unknown. Output text never participates
-in this classification. V1 deliberately serializes all writes for one
-repository.
+in this classification. For a later crash-ambiguous result, `operations
+reconcile --inspect-remote` records a proposal from a fresh exact-ref query;
+it never clears the barrier because a ref could have advanced and later been
+rewound. V1 deliberately serializes all writes for one repository.
 
 A labelled `gh issue`/`pr` `create` or `edit` is pre-flighted before anything is
 journaled, queued, or sent: every `--label`, `--add-label`, and `--remove-label`

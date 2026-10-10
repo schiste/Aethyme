@@ -59,7 +59,7 @@ pub use surface::{
 const RESOURCES_RECONCILE_USAGE: &str =
     "usage: aethyme broker advanced resources reconcile <lease-id> --confirm <generation> [--json]";
 const OPERATIONS_RECONCILE_USAGE: &str = "usage: aethyme broker advanced operations reconcile \
-     --operation <id|host-operation-id> --outcome <succeeded|failed> --reason <text> [--json]";
+     --operation <id|host-operation-id> (--outcome <succeeded|failed> | --inspect-remote) --reason <text> [--json]";
 const OPERATIONS_SHOW_USAGE: &str =
     "usage: aethyme broker advanced operations show <id|host-operation-id> [--json]";
 const OPERATIONS_STATS_USAGE: &str = "usage: aethyme broker advanced operations stats [--repo <canonical-id>] [--limit <n>] [--json]";
@@ -368,9 +368,9 @@ Usage:
   aethyme broker operations show <id|host-operation-id> [--json]
       Show one exact durable operation and its reconciliation state, evidence,
       write barrier, and complete recovery commands when inspection is required.
-  aethyme broker operations reconcile --operation <id|host-operation-id> --outcome <succeeded|failed> --reason <text> [--json]
-      Resolve a crash-ambiguous operation after independently inspecting the
-      remote state. Overlapping writes remain blocked until reconciliation.
+  aethyme broker operations reconcile --operation <id|host-operation-id> (--outcome <succeeded|failed> | --inspect-remote) --reason <text> [--json]
+      Record a broker inspection proposal for an exact-ref Git push, or record
+      an operator-asserted outcome. Inspection never clears the write barrier.
   aethyme broker operations stats [--repo <canonical-id>] [--limit <n>] [--json]
       Read bounded lock-hold, queue-wait, queue-depth, and known-unrelated
       contention measurements. Older operations without timing data are
@@ -1294,6 +1294,7 @@ struct Parsed {
     scope: Option<String>,
     effect: Option<String>,
     outcome: Option<String>,
+    inspect_remote: bool,
     reason: Option<String>,
     agent: Option<String>,
     repo_name: Option<String>,
@@ -1445,6 +1446,7 @@ fn parse_with_context(args: &[String], ship_command: bool) -> Result<Parsed, Usa
         scope: None,
         effect: None,
         outcome: None,
+        inspect_remote: false,
         reason: None,
         agent: None,
         repo_name: None,
@@ -1618,6 +1620,7 @@ fn parse_with_context(args: &[String], ship_command: bool) -> Result<Parsed, Usa
             "--timings" => parsed.timings = true,
             "--from-provider" => parsed.from_provider = true,
             "--no-wait" => parsed.no_wait = true,
+            "--inspect-remote" => parsed.inspect_remote = true,
             "--queue-timeout" => {
                 let value = iter.next().ok_or(UsageError::Message(
                     "--queue-timeout requires a value in seconds".into(),

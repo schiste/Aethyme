@@ -470,6 +470,13 @@ fn unknown_mutating_git_commands_are_recorded_as_outcome_unknown() {
 
     assert_eq!(report.operation.status, OperationStatus::OutcomeUnknown);
     assert!(!report.command_success);
+    assert!(
+        broker
+            .inspect_coordinated_push_operation(report.operation.id, "inspect unknown write")
+            .unwrap_err()
+            .to_string()
+            .contains("no recorded exact-ref push plan")
+    );
 }
 
 #[test]
@@ -958,6 +965,37 @@ fn mixed_exact_destinations_remain_partial_and_write_blocking() {
             .to_string()
             .contains("Blind retry is forbidden")
     );
+    let partial_inspection = fixture
+        .broker
+        .inspect_coordinated_push_operation(report.operation.id, "inspect the two destination refs")
+        .unwrap();
+    assert_eq!(partial_inspection.source, "remote_inspection");
+    assert_eq!(partial_inspection.outcome, None);
+    assert!(!partial_inspection.reconciled);
+    assert_eq!(
+        partial_inspection.operation.status,
+        OperationStatus::OutcomeUnknown
+    );
+    assert_eq!(
+        partial_inspection.evidence.as_ref().unwrap()["classification"],
+        "partial"
+    );
+    git(
+        &fixture.remote,
+        &["update-ref", "-d", "refs/heads/accepted"],
+    );
+    let failed_proposal = fixture
+        .broker
+        .inspect_coordinated_push_operation(
+            report.operation.id,
+            "inspect refs after remote rollback",
+        )
+        .unwrap();
+    assert_eq!(failed_proposal.outcome.as_deref(), Some("failed"));
+    assert_eq!(
+        failed_proposal.operation.status,
+        OperationStatus::OutcomeUnknown
+    );
     fixture
         .broker
         .reconcile_coordinated_operation(
@@ -981,6 +1019,108 @@ fn mixed_exact_destinations_remain_partial_and_write_blocking() {
     assert_eq!(
         reconciled.reconciliation.operator_reason.as_deref(),
         Some("reviewed both destination refs")
+    );
+    assert_eq!(
+        reconciled.reconciliation.source.as_deref(),
+        Some("operator_assertion")
+    );
+    let reconciled_details: serde_json::Value = serde_json::from_str(
+        reconciled
+            .operation
+            .details_json
+            .as_deref()
+            .expect("reconciliation details are journaled"),
+    )
+    .unwrap();
+    assert_eq!(
+        reconciled_details["reconciliation"]["source"],
+        "operator_assertion"
+    );
+    assert_eq!(
+        reconciled_details["remote_inspection"]["evidence"]["proposed_outcome"],
+        "failed"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn exact_push_inspection_proposes_success_without_clearing_the_write_barrier() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut fixture = push_fixture(tmp.path(), "push-inspect-success");
+    commit_push_fixture(&fixture, "inspection proposal\n");
+    write_executable(
+        &fixture.remote.join("hooks/update"),
+        "#!/bin/sh\nif [ \"$1\" = 'refs/heads/rejected' ]; then exit 1; fi\nexit 0\n",
+    );
+
+    let report = fixture
+        .broker
+        .run_coordinated_operation(exact_push_request(
+            fixture.session_id,
+            &fixture.worktree,
+            &["HEAD:refs/heads/accepted", "HEAD:refs/heads/rejected"],
+        ))
+        .unwrap();
+    assert_eq!(report.operation.status, OperationStatus::OutcomeUnknown);
+    std::fs::remove_file(fixture.remote.join("hooks/update")).unwrap();
+    git(
+        &fixture.worktree,
+        &["push", "origin", "HEAD:refs/heads/rejected"],
+    );
+
+    let inspected = fixture
+        .broker
+        .inspect_coordinated_push_operation(report.operation.id, "verify the exact remote refs")
+        .unwrap();
+    assert_eq!(inspected.source, "remote_inspection");
+    assert_eq!(inspected.outcome.as_deref(), Some("succeeded"));
+    assert!(!inspected.reconciled);
+    assert_eq!(inspected.operation.status, OperationStatus::OutcomeUnknown);
+    assert_eq!(
+        inspected.evidence.as_ref().unwrap()["classification"],
+        "succeeded"
+    );
+    let recorded: serde_json::Value = serde_json::from_str(
+        inspected
+            .operation
+            .details_json
+            .as_deref()
+            .expect("remote inspection is recorded"),
+    )
+    .unwrap();
+    assert_eq!(
+        recorded["remote_inspection"]["evidence"]["destinations"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    let shown = fixture
+        .broker
+        .show_coordinated_operation(report.operation.id)
+        .unwrap();
+    assert_eq!(
+        shown.reconciliation.remote_inspection.as_ref().unwrap()["evidence"]["proposed_outcome"],
+        "succeeded"
+    );
+
+    let reconciled = fixture
+        .broker
+        .reconcile_coordinated_operation(
+            report.operation.id,
+            true,
+            "accept the broker's exact-ref inspection",
+        )
+        .unwrap();
+    assert_eq!(reconciled.source, "operator_assertion");
+    assert_eq!(reconciled.outcome.as_deref(), Some("succeeded"));
+    assert!(reconciled.reconciled);
+    let details: serde_json::Value =
+        serde_json::from_str(reconciled.operation.details_json.as_deref().unwrap()).unwrap();
+    assert_eq!(details["reconciliation"]["source"], "operator_assertion");
+    assert_eq!(
+        details["remote_inspection"]["evidence"]["proposed_outcome"],
+        "succeeded"
     );
 }
 

@@ -6,9 +6,9 @@ exit: 0
   aethyme broker advanced operations show <id|host-operation-id> [--json]
       Show one exact durable operation and its reconciliation state, evidence,
       write barrier, and complete recovery commands when inspection is required.
-  aethyme broker advanced operations reconcile --operation <id|host-operation-id> --outcome <succeeded|failed> --reason <text> [--json]
-      Resolve a crash-ambiguous operation after independently inspecting the
-      remote state. Overlapping writes remain blocked until reconciliation.
+  aethyme broker advanced operations reconcile --operation <id|host-operation-id> (--outcome <succeeded|failed> | --inspect-remote) --reason <text> [--json]
+      Record a broker inspection proposal for an exact-ref Git push, or record
+      an operator-asserted outcome. Inspection never clears the write barrier.
   aethyme broker advanced operations stats [--repo <canonical-id>] [--limit <n>] [--json]
       Read bounded lock-hold, queue-wait, queue-depth, and known-unrelated
       contention measurements. Older operations without timing data are

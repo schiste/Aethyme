@@ -194,7 +194,7 @@ pub(super) fn operation_history_query(
 
 pub(super) fn operations_reconcile_error(detail: impl std::fmt::Display) -> UsageError {
     UsageError::Message(format!(
-        "{detail}\noperations reconcile requires every field: --operation <id|host-operation-id>, --outcome <succeeded|failed>, and --reason <text>.\n{OPERATIONS_RECONCILE_USAGE}"
+        "{detail}\noperations reconcile requires --operation and --reason, plus exactly one of --outcome <succeeded|failed> or --inspect-remote.\n{OPERATIONS_RECONCILE_USAGE}"
     ))
 }
 
@@ -253,6 +253,12 @@ pub(super) fn render_operation_show(report: &crate::OperationShowReport) {
     out!("Automatic retry: forbidden");
     if let Some(evidence) = &report.reconciliation.evidence {
         out!("Evidence:       {evidence}");
+    }
+    if let Some(inspection) = &report.reconciliation.remote_inspection {
+        out!("Remote inspection: {inspection}");
+    }
+    if let Some(source) = &report.reconciliation.source {
+        out!("Outcome source:   {source}");
     }
     if let Some(reason) = &report.reconciliation.operator_reason {
         out!("Operator reason: {reason}");
@@ -995,7 +1001,7 @@ pub(super) fn run_operations(parsed: Parsed) -> Result<(), UsageError> {
         }
         Some("reconcile") => {
             if parsed.operation.is_none()
-                || parsed.outcome.is_none()
+                || (parsed.inspect_remote == parsed.outcome.is_some())
                 || parsed.reason.as_deref().is_none_or(str::is_empty)
             {
                 return Err(operations_reconcile_error(
@@ -1006,6 +1012,41 @@ pub(super) fn run_operations(parsed: Parsed) -> Result<(), UsageError> {
                 parsed.operation.as_deref().expect("validated operation id"),
             )
             .map_err(operations_reconcile_error)?;
+            let reason = parsed.reason.as_deref().expect("validated reason");
+            if parsed.inspect_remote {
+                let operation_id = match identifier {
+                    OperationIdentifier::Coordinated(id) => id,
+                    OperationIdentifier::Host(host_id) => broker
+                        .store()
+                        .coordinated_operation_id_for_host_operation(&host_id)?
+                        .ok_or_else(|| {
+                            operations_reconcile_error(
+                                "remote inspection requires a linked coordinated Git operation; use an operator outcome for an unlinked host operation",
+                            )
+                        })?,
+                };
+                let report = broker
+                    .inspect_coordinated_push_operation(operation_id, reason)
+                    .map_err(operations_reconcile_error)?;
+                if parsed.json {
+                    out!("{}", serde_json::to_string_pretty(&report)?);
+                } else if let Some(outcome) = report.outcome.as_deref() {
+                    out!(
+                        "operation {} remote inspection proposes {outcome}; state remains {}: {}",
+                        report.operation.id,
+                        report.operation.status.as_str(),
+                        report.reason,
+                    );
+                } else {
+                    out!(
+                        "operation {} remote inspection has no safe proposal; state remains {}: {}",
+                        report.operation.id,
+                        report.operation.status.as_str(),
+                        report.reason,
+                    );
+                }
+                return Ok(());
+            }
             let outcome = parsed.outcome.as_deref().expect("validated outcome");
             let succeeded = match outcome {
                 "succeeded" => true,
@@ -1016,7 +1057,6 @@ pub(super) fn run_operations(parsed: Parsed) -> Result<(), UsageError> {
                     ));
                 }
             };
-            let reason = parsed.reason.as_deref().expect("validated reason");
             let operation_id = match identifier {
                 OperationIdentifier::Coordinated(id) => Some(id),
                 OperationIdentifier::Host(host_id) => {
