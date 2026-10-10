@@ -35,18 +35,66 @@ pub(crate) fn repository_key(main_root: &Path, git_common_dir: Option<&Path>) ->
 }
 
 pub(crate) fn default_host_state_dir() -> Option<PathBuf> {
+    resolve_host_state_dir().map(|(path, _)| path)
+}
+
+/// Which setting chose the host state directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HostStateSource {
+    /// `AETHYME_HOST_STATE_DIR`.
+    AethymeHostStateDir,
+    /// `$XDG_STATE_HOME/aethyme`.
+    XdgStateHome,
+    /// The platform default under `HOME`.
+    PlatformDefault,
+}
+
+/// Every host state directory and host cache directory a process on this
+/// host could resolve: the ones the current environment names, plus the
+/// platform defaults that a process without those settings uses.
+pub(crate) fn host_directory_candidates() -> (Vec<PathBuf>, Vec<PathBuf>) {
+    let named = |name: &str| std::env::var_os(name).filter(|value| !value.is_empty());
+    let mut state: Vec<PathBuf> = named("AETHYME_HOST_STATE_DIR")
+        .map(PathBuf::from)
+        .into_iter()
+        .collect();
+    state.extend(named("XDG_STATE_HOME").map(|path| PathBuf::from(path).join("aethyme")));
+    let mut cache: Vec<PathBuf> = named("AETHYME_HOST_CACHE_DIR")
+        .map(PathBuf::from)
+        .into_iter()
+        .collect();
+    cache.extend(named("XDG_CACHE_HOME").map(|path| PathBuf::from(path).join("aethyme")));
+    if let Some(home) = named("HOME").map(PathBuf::from) {
+        if cfg!(target_os = "macos") {
+            state.push(home.join("Library/Application Support/Aethyme"));
+            cache.push(home.join("Library/Caches/Aethyme"));
+        } else {
+            state.push(home.join(".local/state/aethyme"));
+            cache.push(home.join(".cache/aethyme"));
+        }
+    }
+    (state, cache)
+}
+
+/// The host state directory and the setting that chose it.
+pub(crate) fn resolve_host_state_dir() -> Option<(PathBuf, HostStateSource)> {
     if let Some(path) = std::env::var_os("AETHYME_HOST_STATE_DIR").filter(|path| !path.is_empty()) {
-        return Some(PathBuf::from(path));
+        return Some((PathBuf::from(path), HostStateSource::AethymeHostStateDir));
     }
     if let Some(path) = std::env::var_os("XDG_STATE_HOME").filter(|path| !path.is_empty()) {
-        return Some(PathBuf::from(path).join("aethyme"));
+        return Some((
+            PathBuf::from(path).join("aethyme"),
+            HostStateSource::XdgStateHome,
+        ));
     }
     let home = PathBuf::from(std::env::var_os("HOME")?);
-    Some(if cfg!(target_os = "macos") {
+    let path = if cfg!(target_os = "macos") {
         home.join("Library/Application Support/Aethyme")
     } else {
         home.join(".local/state/aethyme")
-    })
+    };
+    Some((path, HostStateSource::PlatformDefault))
 }
 
 /// True when the host state directory was named explicitly rather than derived
