@@ -204,8 +204,11 @@ impl CaptureRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CaptureReceipt {
     pub operation_id: OperationId,
-    /// Always `retained_local`: the bytes and record survived the store's
-    /// durability profile on this host. Never an off-host promise.
+    /// `retained_local` while a live retention root holds the contribution:
+    /// the bytes and record survived the store's durability profile on this
+    /// host (never an off-host promise). `released` once the operation's
+    /// root is released or past its boundary, and `reclaimed` once
+    /// reclamation (#659) removed its source; neither still promises source.
     pub status: &'static str,
     /// The store's receipt label: `local_durable` only on the supported
     /// profile, `local_unverified` otherwise.
@@ -386,7 +389,7 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-fn locks_dir(store: &CollaborationStore) -> PathBuf {
+pub(crate) fn locks_dir(store: &CollaborationStore) -> PathBuf {
     store.project_dir().join("spool/capture")
 }
 
@@ -439,6 +442,16 @@ fn same_file(file: &std::fs::File, path: &Path) -> bool {
         (Ok(open), Ok(named)) => open.dev() == named.dev() && open.ino() == named.ino(),
         _ => false,
     }
+}
+
+/// Hold the archive shared (see `collaboration_gc`).
+fn archive_use(
+    store: &CollaborationStore,
+) -> Result<crate::collaboration_gc::ArchiveUse, CaptureError> {
+    crate::collaboration_gc::archive_use(store).map_err(|source| CaptureError::Io {
+        path: crate::collaboration_gc::lock_path(store),
+        source,
+    })
 }
 
 struct OperationRow {
@@ -784,9 +797,29 @@ pub fn receipt(
     let Some((receipt_id, lineage, base, result, durability, until)) = row else {
         return Ok(None);
     };
+    let reclaimed: bool = store.connection().query_row(
+        "SELECT EXISTS (SELECT 1 FROM reclaimed_contributions WHERE lineage_record_id = ?1)
+             OR EXISTS (SELECT 1 FROM reclaimed_snapshots WHERE snapshot_id IN (?2, ?3))",
+        rusqlite::params![lineage, base, result],
+        |row| row.get(0),
+    )?;
+    let live_root: bool = store.connection().query_row(
+        "SELECT EXISTS (SELECT 1 FROM retention_roots
+             WHERE operation_id = ?1 AND kind = 'contribution' AND released_ms IS NULL
+               AND (until_ms IS NULL OR until_ms > ?2))",
+        rusqlite::params![operation_id.as_str(), now_ms()],
+        |row| row.get(0),
+    )?;
+    let status = if reclaimed {
+        "reclaimed"
+    } else if live_root {
+        "retained_local"
+    } else {
+        "released"
+    };
     Ok(Some(CaptureReceipt {
         operation_id: operation_id.clone(),
-        status: "retained_local",
+        status,
         durability,
         contribution: record_id(&lineage, operation_id)?,
         base: snapshot_id(&base, operation_id)?,
@@ -1046,6 +1079,9 @@ pub(crate) fn capture_with(
     request: &CaptureRequest,
     hooks: &Hooks,
 ) -> Result<CaptureOutcome, CaptureError> {
+    // Shared with every other capture and reader; reclamation (#659) waits
+    // for all of them. Taken before the operation lock, always.
+    let _use = archive_use(store)?;
     let _lock = lock_operation(store, &request.operation_id, true)?;
     let row = match begin(store, request, hooks)? {
         Begun::Row(row) => row,
@@ -1256,6 +1292,8 @@ fn reap_crashed(store: &mut CollaborationStore, except: Option<&OperationId>) {
 /// (`corrupt_receipt`) if those bytes are gone; `committed` and the terminal
 /// states are left alone. One operation's error does not stop the others.
 pub fn recover(store: &mut CollaborationStore) -> Result<RecoveryReport, CaptureError> {
+    // Shared with captures, exclusive with a GC apply (#659).
+    let _use = archive_use(store)?;
     let mut report = RecoveryReport::default();
     for operation_id in in_flight(store)? {
         match recover_one(store, &operation_id) {
