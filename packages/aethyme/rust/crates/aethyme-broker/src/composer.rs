@@ -398,13 +398,20 @@ fn compose_inner(
     let mut usage = BudgetUsage::default();
     let mut order = Vec::new();
     let unavailable = |detail: String, error: ArchiveError| -> Result<Composition, ComposeError> {
-        let outcome = match error {
-            ArchiveError::UnsupportedEntry { .. }
-            | ArchiveError::UnsupportedFilter { .. }
-            | ArchiveError::InvalidSnapshot(_) => CompositionOutcome::Unsupported {
-                reason: crate::composition::Unsupported::SnapshotEntry,
-                detail: format!("{detail}: {error}"),
-            },
+        let unsupported = |reason| CompositionOutcome::Unsupported {
+            reason,
+            detail: format!("{detail}: {error}"),
+        };
+        let outcome = match &error {
+            ArchiveError::UnsupportedEntry { .. } | ArchiveError::InvalidSnapshot(_) => {
+                unsupported(crate::composition::Unsupported::SnapshotEntry)
+            }
+            ArchiveError::UnsupportedFilter { .. } => {
+                unsupported(crate::composition::Unsupported::TransformingAttribute)
+            }
+            ArchiveError::PartialClone { .. } => {
+                unsupported(crate::composition::Unsupported::PartialClone)
+            }
             error
                 if error.is_incomplete()
                     || matches!(
@@ -417,7 +424,7 @@ fn compose_inner(
                     detail: format!("{detail}: {error}"),
                 }
             }
-            error => return Err(error.into()),
+            _ => return Err(error.into()),
         };
         Ok(Composition {
             outcome,

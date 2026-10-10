@@ -140,7 +140,11 @@ fn run(world: &mut World, input: &ScenarioInput, order: &[String]) -> Compositio
 fn outcome_of(code: &str) -> Outcome {
     match code {
         "conflict" => Outcome::Conflict,
-        "merge_commit" | "snapshot_entry" => Outcome::Unsupported,
+        "merge_commit"
+        | "snapshot_entry"
+        | "commit_shape"
+        | "transforming_attribute"
+        | "partial_clone" => Outcome::Unsupported,
         "unknown_base" => Outcome::UnknownBase,
         "dependency_cycle" => Outcome::DependencyCycle,
         "missing_input" => Outcome::MissingInput,
@@ -711,10 +715,11 @@ fn recomposition_never_relabels_the_synthesized_result() {
         subtract(&mut world, &["d"]).outcome.code(),
         "inseparable_selection"
     );
-    // ... or requires x outright, whatever its base.
-    world.spec("d").requires = vec!["x".into()];
+    // ... or, built on the original base, requires x outright.
+    let e = world.commit(&[("f.txt", R, b"1\n2\n3\nfour\n5\n")], Some(&base));
+    world.add("e", &base, &e).requires = vec!["x".into()];
     assert_eq!(
-        subtract(&mut world, &["d"]).outcome.code(),
+        subtract(&mut world, &["e"]).outcome.code(),
         "inseparable_selection"
     );
     // A constituent that is no longer retained.
