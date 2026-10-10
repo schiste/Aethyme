@@ -520,3 +520,55 @@ parsed allowlist-only capture artifact (`schema_version`, `kind`, `title`,
 `captured_at`, and `snapshot`). Invalid JSON, unsupported report/snapshot
 schemas, symlinks, oversized artifacts, and paths outside
 `.aethyme/reports/` fail closed.
+
+### `collab <command> --json` (experimental)
+
+Introduced 2026-10-10 (#680, experimental). `aethyme collab` is the opt-in
+Local collaboration surface. Every subcommand prints exactly one JSON object
+whose `schema` names its shape; the field set may change while the schema
+says `experimental-v0`, and a consumer must check `schema` first.
+
+| Command | `schema` |
+|---|---|
+| `collab status` | `aethyme.collab-status/experimental-v0` |
+| `collab enroll` | `aethyme.collab-enroll/experimental-v0` |
+| `collab capture recover` | `aethyme.collab-capture-recover/experimental-v0` |
+| `collab capture abort` | `aethyme.collab-capture-abort/experimental-v0` |
+| `collab capture receipt` | `aethyme.collab-capture-receipt/experimental-v0` |
+| `collab gc plan` | `aethyme.collab-gc-plan/experimental-v0` |
+| `collab gc apply` | `aethyme.collab-gc-apply/experimental-v0` |
+| `collab gc resume` | `aethyme.collab-gc-resume/experimental-v0` |
+| `collab context` | `aethyme.collab-context/experimental-v0` |
+| `collab brief attach` | `aethyme.collab-brief-attach/experimental-v0` |
+| any refusal or failure | `aethyme.collab-error/experimental-v0` |
+
+A refusal or failure is printed on stdout in `--json` mode:
+
+```
+{
+  "schema": "aethyme.collab-error/experimental-v0",
+  "command": "gc plan",
+  "code": "collaboration_disabled",
+  "message": "collaboration is disabled for this repository: ...",
+  "next_action": "run `aethyme collab enroll` to get the section that enables it, ..."
+}
+```
+
+Exit codes: 0 done, 1 failed (I/O, database, Git), 2 usage, 3 refused
+(collaboration disabled, a refused or unknown policy, a refused state root, or
+a state that forbids the action). `next_action` is the safe next step and may
+be `null` for a failure with no known remedy.
+
+`collab status` reports `enabled`, `policy` (`off`, `advisory`, `required` or
+`unsupported` with `policy_error.code`), `config_source`, and, when enabled,
+`state` (`root`, `root_source`, `project_dir`, `initialized`, and once the
+store exists `durability`, `receipt_label`, `schema_version`,
+`min_compatible_schema`; or `refusal` with `code` and `next_action`),
+`captures` (`by_state`, `reserved_bytes`, `attention`), `gc`
+(`unfinished_generations`) and `next_actions`. It never creates state.
+
+`collab context` wraps the `aethyme.contribution-context/experimental-v0`
+record as `context`, with `served` (`fresh` or `cache`), `stored`,
+`cache_key`, `context_id` and `absence_is_evidence`. Briefs inside it carry
+`role: untrusted_data`. `collab gc plan` adds `recorded`: only a recorded
+plan can be applied.
