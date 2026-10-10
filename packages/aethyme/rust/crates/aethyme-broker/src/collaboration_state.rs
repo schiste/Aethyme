@@ -37,7 +37,7 @@ use serde::Serialize;
 pub use crate::host_state::HostStateSource;
 
 /// The schema this binary writes.
-pub const COLLABORATION_STATE_SCHEMA_VERSION: i64 = 5;
+pub const COLLABORATION_STATE_SCHEMA_VERSION: i64 = 6;
 /// The oldest schema a database written by this binary can be read by.
 /// Unlike `host-operations.db`, a newer database stays readable by an older
 /// binary until a release raises this floor.
@@ -47,9 +47,13 @@ pub const COLLABORATION_STATE_SCHEMA_VERSION: i64 = 5;
 /// clearing, so reclamation could remove source it had just named. Raised
 /// to 5 with contribution context (#661): a schema 4 binary's reclamation
 /// does not treat attached brief objects as roots, so it could remove the
-/// brief of a live contribution. No release shipped schemas 2 to 4, so
-/// nothing that exists is locked out.
-const MIN_COMPATIBLE_SCHEMA: i64 = 5;
+/// brief of a live contribution. Raised to 6 with the context cache (#662):
+/// a schema 5 binary indexes contributions without broad-risk postings and
+/// purges no cached answer when a contribution stops being live, so a newer
+/// binary could serve a cached answer a broad change should have
+/// invalidated. No release shipped schemas 2 to 5, so nothing that exists
+/// is locked out.
+const MIN_COMPATIBLE_SCHEMA: i64 = 6;
 const ROOT_DIRECTORY: &str = "collaboration";
 /// Additive schema steps after the version 1 layout (`meta` only), applied in
 /// order. Each only adds tables; after migrating, the compatibility floor is
@@ -211,6 +215,35 @@ const MIGRATIONS: &[(i64, &str)] = &[
              lineage_record_id TEXT PRIMARY KEY NOT NULL,
              generation INTEGER NOT NULL
          ) STRICT;",
+    ),
+    (
+        6,
+        // The context cache (#662). Every table here is derived: answers are
+        // stored under their cache key, which commits to every input that can
+        // change them. The index is rebuilt, because version 6 also posts
+        // broad-risk contributions.
+        "CREATE TABLE IF NOT EXISTS context_cache (
+             cache_key TEXT PRIMARY KEY NOT NULL,
+             visibility TEXT NOT NULL,
+             epoch INTEGER NOT NULL,
+             record BLOB NOT NULL,
+             record_id TEXT NOT NULL,
+             contributions TEXT NOT NULL,
+             refetch_after_ms INTEGER,
+             computed_ms INTEGER NOT NULL,
+             generation INTEGER NOT NULL,
+             last_used_ms INTEGER NOT NULL
+         ) STRICT;
+         CREATE TABLE IF NOT EXISTS context_cache_members (
+             cache_key TEXT NOT NULL REFERENCES context_cache (cache_key) ON DELETE CASCADE,
+             lineage_record_id TEXT NOT NULL,
+             PRIMARY KEY (cache_key, lineage_record_id)
+         ) STRICT;
+         CREATE INDEX IF NOT EXISTS context_cache_members_by_contribution
+             ON context_cache_members (lineage_record_id);
+         DELETE FROM context_postings;
+         DELETE FROM context_indexed;
+         DELETE FROM context_unreadable;",
     ),
 ];
 /// The file that marks a directory as a collaboration root.
@@ -1362,8 +1395,9 @@ mod tests {
         let expected: Vec<i64> = (2..=COLLABORATION_STATE_SCHEMA_VERSION).collect();
         assert_eq!(versions, expected);
         const { assert!(MIN_COMPATIBLE_SCHEMA <= COLLABORATION_STATE_SCHEMA_VERSION) };
-        // A schema 4 binary's reclamation does not keep attached briefs.
-        const { assert!(MIN_COMPATIBLE_SCHEMA >= 5) };
+        // A schema 4 binary's reclamation does not keep attached briefs; a
+        // schema 5 binary posts no broad-risk keys and purges no cache entry.
+        const { assert!(MIN_COMPATIBLE_SCHEMA >= 6) };
     }
 
     const CRASH_CHILD: &str = "AETHYME_COLLABORATION_CRASH_CHILD";
