@@ -151,6 +151,10 @@ impl ObjectDigest {
         Self(bytes)
     }
 
+    pub fn raw(&self) -> [u8; 32] {
+        self.0
+    }
+
     pub fn hex(&self) -> String {
         self.0.iter().map(|b| format!("{b:02x}")).collect()
     }
@@ -1473,8 +1477,9 @@ pub fn retained(
 
 /// The archive's entry for the contribution whose lineage record is
 /// `lineage`, if its record and both snapshots are still retained. The
-/// lineage record is re-read and must hash to its row and decode to
-/// `lineage`, so a damaged index cannot substitute another contribution.
+/// lineage record is re-read and must hash to its row, decode to
+/// `lineage`, and name the row's base and result snapshots, so a damaged
+/// index cannot substitute another contribution or its source.
 pub fn retained_contribution(
     store: &CollaborationStore,
     lineage: &RecordId,
@@ -1506,6 +1511,16 @@ pub fn retained_contribution(
     let bytes = read_object(store, &digest)?;
     let record = Record::decode(&bytes, &[&CONTRIBUTION_LINEAGE_SCHEMA]).map_err(|_| corrupt())?;
     if record.id() != *lineage {
+        return Err(corrupt());
+    }
+    // The row is an index, not the record: its snapshot columns must say
+    // what the record says, or an edited row could pass another
+    // contribution's source off under this lineage.
+    let field = |name: &str| match record.get(name) {
+        Some(Value::String(text)) => Some(text.as_str()),
+        _ => None,
+    };
+    if field("base") != Some(base.as_str()) || field("result") != Some(result.as_str()) {
         return Err(corrupt());
     }
     let snapshot = |text: &str| SourceSnapshotId::parse(text).map_err(|_| corrupt());

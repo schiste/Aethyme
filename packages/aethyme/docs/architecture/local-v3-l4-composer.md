@@ -49,12 +49,18 @@ supply, is `missing_input`; a baseline holding an entry a snapshot cannot name i
 | A base that is neither accepted history nor a selected result | `unknown_base` |
 | Any budget limit exceeded | `budget_exhausted` |
 
-Lineage is read from the archive, not trusted from the caller. A base in accepted history
-(the baseline or an accepted ancestor) applies three-way onto the baseline. A contribution
-whose retained base equals another selected contribution's retained result goes after it
-and applies only its own base-to-result change. A contribution delivered twice, by name or
-by lineage, applies once: re-merging it as text would conflict with the work built on it
-(FX03). Order is topological over requirements and inherited bases, then the order
+Lineage is read from the archive, not trusted from the caller. The lineage record's own
+base and result must equal its index row, or the archive is reported corrupt. A base in
+accepted history (the baseline or an accepted ancestor) applies three-way onto the
+baseline. Each accepted commit must be an ancestor of the baseline, or the request is
+refused `unknown_base`. A contribution whose retained base equals another selected
+contribution's retained result goes after it and applies only its own base-to-result
+change. A contribution delivered twice applies once. FX03 s2 tests a repeat by name, where
+re-merging as text would conflict with the work built on it. A repeat by lineage under
+another name is tested on its own, by the order it applies in. Every delivered name is
+still checked against its own requirements and atomic group, so an alias cannot drop a
+constraint. A `revision_of` loop is one line, named by its least member, so two of its
+members compete. Order is topological over requirements and inherited bases, then the order
 of first delivery. Nothing else is sorted, so no order independence is implied: the
 fixtures' commutativity claims are tested by permutation.
 
@@ -72,23 +78,50 @@ atomically: one conflicting path and none of its paths apply, and the outcome is
 | `add_add` | Both added the path with different content |
 | `mode` | Both changed the entry kind differently |
 | `binary` | Both changed a binary file (Git's NUL test) or a symlink: exact replacement only |
-| `moved_block` | Either side moved a block within the file (below) |
+| `ambiguous_anchor` | Either side deleted lines that have an identical twin left in the base (below) |
+| `moved_block` | Either side moved a unique block within the file (below) |
+| `directory_file` | The step would leave a file where another path needs a directory |
 
-`git merge-file` runs with no system or global configuration, so a configured conflict
-style or driver cannot change the profile. The engine version is recorded.
+`git merge-file` runs in a scratch directory outside any repository, with no system or
+global configuration, so neither a configured conflict style nor a repository's own
+configuration can change the profile. Its version, and the line diff the profile's own
+rules use (`similar`, version kept in step with `Cargo.lock` by a test), are recorded.
 
-### The profile's own limit: moved blocks
+### The profile's own limits: ambiguous anchors and moved blocks
 
-A line merge has no notion of identity. When one side moves a block and the other edits
-inside it, the edit either conflicts with the deletion or, when the block has an identical
-twin, lands cleanly on the copy that did not move (FX02 `identical-twins`, measured by
-#733 as a silent wrong merge under plain `git merge-file`). Only the complete-candidate
-behavior check sees that, so the profile refuses to guess: if either side's line diff
-deletes three consecutive non-blank lines (compared without surrounding whitespace) and
-inserts the same three elsewhere, a concurrent change to that file is a `moved_block`
-conflict. The rule is about the merge engine, not any fixture: it also makes a
-re-indented block conflict with a concurrent edit, which is the right answer for a line
-merge. A structural engine selected by E1 replaces it.
+A line merge has no notion of identity. When one side deletes lines that have an identical
+twin elsewhere in the base, which copy went is a guess the line diff makes. A line merge
+then puts the other side's change inside either copy on whichever one stayed, cleanly and
+silently. The deletion may be half of a move within the file, a move into another file,
+a move split across inherited contributions, or a plain removal. FX02 s2 measured this
+under plain `git merge-file`, and the independent review reproduced the other three
+shapes.
+
+The profile refuses to guess, by rule rather than by case. If either side of a step, the
+accumulator or the contribution's result, compared with the step's base, deletes (with
+nothing in its place) a run whose non-blank lines (compared without surrounding
+whitespace) also appear contiguously elsewhere in the base, a concurrent change to that
+file is an `ambiguous_anchor` conflict. Both sides are checked at every step, so the
+outcome does not depend on delivery order. Twin search stays within the file: a twin in
+another file does not make this file's alignment ambiguous, and a cross-file move still
+deletes from a file that holds the twin.
+
+A unique block that moves cannot be misplaced, but a line merge cannot carry the other
+side's edit along with it either. If either side's diff deletes three consecutive
+non-blank lines and inserts the same three elsewhere, a concurrent change to that file is
+a `moved_block` conflict. That also makes a re-indented block conflict with a concurrent
+edit, which is the right answer for a line merge. A structural engine selected by E1
+replaces both rules.
+
+### Budgets and processes
+
+`max_bytes` counts manifest bytes read plus the stored size of every distinct blob
+read, merged, or staged into the candidate. Staged blobs are charged before anything is
+read or written, so a large added file is refused, not materialized. Merge output goes to
+the archive as soon as it is made. The in-memory blob cache holds at most 64 MiB. A
+candidate is written with a fixed number of Git processes, whatever the tree size: one
+`hash-object --stdin-paths` for blobs the baseline lacks, then `update-index` and
+`write-tree` on a private index file. Line merges are bounded by `max_merges`.
 
 ### The candidate
 
@@ -129,11 +162,11 @@ which also checks that outcomes and candidates are identical across runs.
 
 | Scenario | Outcome | Why |
 |---|---|---|
-| FX02 s1 (move plus edit) | conflict `moved_block` | The mandatory structural positive needs E1's engine; a line merge cannot carry the edit along the move. |
+| FX02 s1 (move plus edit) | conflict | The mandatory structural positive needs E1's engine; a line merge cannot carry the edit along the move. |
 | FX04 s1 (semantic interaction) | candidate, behavior fails | The text merge is clean but the handler keeps an id the other contribution renamed. Only the complete-candidate check sees it; resolution is #665's. |
 
 FX02 s2 (identical twins), where plain `git merge-file` silently puts the edit on the wrong
-card, is a `moved_block` conflict and accepted. The test asserts a floor of 15 accepted
+card, is a conflict and accepted. The test asserts a floor of 15 accepted
 scenarios, so a regression fails without the test naming any scenario.
 
 **Held-out**, run once after the profile was fixed, never used for tuning: **8 of 12**
@@ -142,9 +175,14 @@ class as FX02 s1: the text profile is conservative), and HX04 is a clean candida
 behavior fails (the same class as FX04). None is a planning error.
 
 Rules the fixtures do not isolate have their own small repositories in the same test:
-each conflict reason, mode-plus-content composition, revert to `no_change`, the twins
-layout, inherited order, accepted-history bases, repeats by name and by lineage, every
-planning refusal, recomposition, each budget limit, and no ref movement.
+each conflict reason, mode-plus-content composition in both orders, revert to
+`no_change`, the twins layout, a unique-block move, inherited order, accepted-history
+bases, repeats by name and by lineage, every planning refusal, recomposition, each budget
+limit, and no ref movement. The independent review's eleven probes (P01–P11) are ported as
+regression tests: a file/directory collision, an added file over the bytes budget, a
+split, cross-file and two-line twin move, an edited index row, a lineage alias's
+constraints, unrelated accepted history, keeping a removed constituent, repository commit
+encoding, and a revision loop.
 
 ## Not decided here
 

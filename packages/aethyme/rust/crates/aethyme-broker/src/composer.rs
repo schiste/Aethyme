@@ -34,11 +34,14 @@
 //! merge-file`, standing in until E1 (#650) selects a structural engine
 //! (D04). Its limits are reported, never smoothed over: deleting and
 //! modifying one path, adding one path twice, changing one mode two ways,
-//! any concurrent change to a binary file or symlink, and a concurrent
-//! change to a file one side **moved a block** within are conflicts. The
-//! last one is the profile's own limit: a line merge cannot carry an edit
-//! along a moved block, and where the block has an identical twin it would
-//! put the edit on the wrong copy without any conflict (FX02).
+//! any concurrent change to a binary file or symlink, and a file left where
+//! a directory is needed are conflicts. So is a concurrent change to a file
+//! one side deleted **a twinned run** from (`ambiguous_anchor`: which copy
+//! went is the diff's guess, and a line merge would put the other change
+//! on the copy that stayed, silently) or **moved a unique block** within
+//! (`moved_block`: a line merge cannot carry the edit along). Those two are
+//! the profile's own limits; both sides of every step are checked, so the
+//! outcome does not depend on delivery order.
 //!
 //! The candidate is written as Git objects only (no ref moves), retained in
 //! the archive, and returned as a [`Candidate`] through the #663 boundary.
@@ -86,6 +89,10 @@ pub const COMPOSITION_RECIPE_SCHEMA_NAME: &str = "aethyme.composition-recipe/exp
 /// Consecutive non-blank lines (whitespace-insensitive) that must leave one
 /// place and reappear in another for a change to count as moving a block.
 const MOVE_WINDOW: usize = 3;
+
+/// The line diff the profile's own rules use. A test keeps the version in
+/// step with Cargo.lock.
+const DIFF_ENGINE: &str = "similar 3.2.0 (Myers, lines)";
 
 const fn field(name: &'static str, kind: FieldKind, required: bool) -> FieldSpec {
     FieldSpec {
@@ -302,6 +309,12 @@ pub fn recompose_without(
             return refuse(format!("{removed} is not a constituent of {}", from.id));
         }
     }
+    for kept in &subtraction.keep {
+        if subtraction.remove.contains(kept) || *kept == from.id {
+            // Keeping what is removed, or X itself, would rebuild X.
+            return refuse(format!("{kept} is both kept and removed from {}", from.id));
+        }
+    }
     let originals: Vec<String> = from
         .derived_from
         .iter()
@@ -449,6 +462,21 @@ fn compose_inner(
     };
     let mut accepted = Vec::with_capacity(request.accepted.len());
     for commit in &request.accepted {
+        if !is_ancestor(repo, commit, &request.baseline)? {
+            return Ok(Composition {
+                outcome: CompositionOutcome::Refused {
+                    reason: Refusal::UnknownBase,
+                    detail: format!(
+                        "accepted commit {} is not an ancestor of the baseline {}",
+                        commit.as_str(),
+                        request.baseline.as_str()
+                    ),
+                },
+                recipe: None,
+                order: Vec::new(),
+                usage: BudgetUsage::default(),
+            });
+        }
         match collaboration_archive::snapshot_of_commit(repo, commit) {
             Ok(snapshot) => accepted.push(snapshot.id()),
             Err(error) => {
@@ -547,6 +575,8 @@ fn build(
     let mut reader = Reader {
         store,
         cache: HashMap::new(),
+        cached_bytes: 0,
+        charged: HashSet::new(),
         manifests: HashMap::new(),
         bytes: 0,
     };
@@ -595,7 +625,15 @@ fn build(
                 Err(refusal) => return Ok(Err(refusal)),
             };
             match applied {
-                Ok(entry) => staged.push((path.clone(), entry)),
+                Ok(entry) => {
+                    // What the candidate will hold is charged before it is
+                    // read or written, whether it is added, replaced or
+                    // merged.
+                    if let Some((_, digest)) = entry {
+                        reader.charge(&digest)?;
+                    }
+                    staged.push((path.clone(), entry));
+                }
                 Err(reason) => conflicts.push(CompositionConflict {
                     path: String::from_utf8_lossy(path).into_owned(),
                     input: step.retained.result.commit.clone(),
@@ -603,18 +641,35 @@ fn build(
                 }),
             }
         }
-        if !conflicts.is_empty() {
-            return Ok(Ok(Built::Other(CompositionOutcome::Conflict {
-                baseline: plan.baseline.commit.clone(),
-                conflicts,
-            })));
+        if let Err(refusal) = reader.within(usage, request) {
+            return Ok(Err(refusal));
         }
-        for (path, entry) in staged {
-            match entry {
-                Some(entry) => accumulator.insert(path, entry),
-                None => accumulator.remove(&path),
-            };
+        if conflicts.is_empty() {
+            let mut next = accumulator.clone();
+            for (path, entry) in &staged {
+                match entry {
+                    Some(entry) => next.insert(path.clone(), *entry),
+                    None => next.remove(path),
+                };
+            }
+            for (path, entry) in &staged {
+                if entry.is_some() && collides(&next, path) {
+                    conflicts.push(CompositionConflict {
+                        path: String::from_utf8_lossy(path).into_owned(),
+                        input: step.retained.result.commit.clone(),
+                        reason: ConflictReason::DirectoryFile,
+                    });
+                }
+            }
+            if conflicts.is_empty() {
+                accumulator = next;
+                continue;
+            }
         }
+        return Ok(Ok(Built::Other(CompositionOutcome::Conflict {
+            baseline: plan.baseline.commit.clone(),
+            conflicts,
+        })));
     }
     if accumulator == baseline_entries {
         return Ok(Ok(Built::Other(CompositionOutcome::NoChange {
@@ -639,6 +694,7 @@ fn build(
         &baseline_entries,
         &accumulator,
     )?;
+    usage.bytes = reader.bytes;
     let observed = collaboration_archive::snapshot_of_commit(repo, &commit)?.id();
     if observed != snapshot.id() {
         return Err(ComposeError::SubjectMismatch {
@@ -672,6 +728,23 @@ fn build(
     Ok(Ok(Built::Candidate(candidate, plan)))
 }
 
+/// Whether `path` is a file where `entries` also needs a directory: one of
+/// its parents is a file, or another path lies beneath it.
+fn collides(entries: &Entries, path: &[u8]) -> bool {
+    let parent_is_file = path
+        .iter()
+        .enumerate()
+        .filter(|(_, byte)| **byte == b'/')
+        .any(|(index, _)| entries.contains_key(&path[..index]));
+    let mut beneath = path.to_vec();
+    beneath.push(b'/');
+    let has_children = entries
+        .range(beneath.clone()..)
+        .next()
+        .is_some_and(|(other, _)| other.starts_with(&beneath));
+    parent_is_file || has_children
+}
+
 // ---------------------------------------------------------------- planning
 
 fn plan(
@@ -683,8 +756,10 @@ fn plan(
 ) -> Result<Result<Plan, Refused>, ComposeError> {
     let catalog = catalog(request)?;
 
-    // Deliveries in policy order; a repeat is the same contribution.
-    let mut selected: Vec<&ContributionSpec> = Vec::new();
+    // Deliveries in policy order. Every delivered name is checked against
+    // its own requirements and group below; a repeat by name, or by
+    // lineage under another name, then applies once.
+    let mut delivered: Vec<&ContributionSpec> = Vec::new();
     for id in deliveries {
         let Some(spec) = catalog.get(id.as_str()) else {
             return Ok(Err(refused(
@@ -692,12 +767,25 @@ fn plan(
                 format!("{id} is not a known contribution"),
             )));
         };
-        // A repeat by name or by lineage is the same contribution.
-        if !selected.iter().any(|known| {
-            known.id == spec.id || (known.lineage.is_some() && known.lineage == spec.lineage)
-        }) {
-            selected.push(spec);
+        if !delivered.iter().any(|known| known.id == spec.id) {
+            delivered.push(spec);
         }
+    }
+    let mut selected: Vec<&ContributionSpec> = Vec::new();
+    // Each delivered name to the index of the contribution it applies as.
+    let mut applies_as: BTreeMap<&str, usize> = BTreeMap::new();
+    for spec in &delivered {
+        let index = match selected
+            .iter()
+            .position(|known| known.lineage.is_some() && known.lineage == spec.lineage)
+        {
+            Some(index) => index,
+            None => {
+                selected.push(spec);
+                selected.len() - 1
+            }
+        };
+        applies_as.insert(&spec.id, index);
     }
     usage.contributions = selected.len();
     if selected.len() > request.budget.max_contributions {
@@ -710,26 +798,25 @@ fn plan(
             ),
         )));
     }
-    let is_selected = |id: &str| selected.iter().any(|spec| spec.id == id);
+    let is_selected = |id: &str| applies_as.contains_key(id);
 
     // Revisions of one contribution share a line, named by its first
-    // revision.
+    // revision, or, when `revision_of` loops, by the loop's least name.
     let line = |id: &str| -> String {
-        let mut current = id;
-        let mut seen = BTreeSet::new();
+        let mut chain: Vec<&str> = vec![id];
         while let Some(previous) = catalog
-            .get(current)
+            .get(chain[chain.len() - 1])
             .and_then(|spec| spec.revision_of.as_deref())
         {
-            if !seen.insert(current) {
-                break;
+            if let Some(start) = chain.iter().position(|seen| *seen == previous) {
+                return chain[start..].iter().min().expect("non-empty").to_string();
             }
-            current = previous;
+            chain.push(previous);
         }
-        current.to_string()
+        chain[chain.len() - 1].to_string()
     };
     let mut lines: BTreeMap<String, &str> = BTreeMap::new();
-    for spec in &selected {
+    for spec in &delivered {
         if let Some(other) = lines.insert(line(&spec.id), &spec.id) {
             return Ok(Err(refused(
                 Refusal::CompetingRevisions,
@@ -737,7 +824,7 @@ fn plan(
             )));
         }
     }
-    for spec in &selected {
+    for spec in &delivered {
         for constituent in &spec.derived_from {
             if let Some(other) = lines.get(&line(constituent)) {
                 return Ok(Err(refused(
@@ -750,7 +837,7 @@ fn plan(
             }
         }
     }
-    for spec in &selected {
+    for spec in &delivered {
         for required in &spec.requires {
             if is_selected(required) {
                 continue;
@@ -770,7 +857,7 @@ fn plan(
             )));
         }
     }
-    let groups: BTreeSet<&str> = selected
+    let groups: BTreeSet<&str> = delivered
         .iter()
         .filter_map(|spec| spec.atomic_group.as_deref())
         .collect();
@@ -843,9 +930,12 @@ fn plan(
             ),
         )));
     }
-    for (index, spec) in selected.iter().enumerate() {
+    for spec in &delivered {
+        let index = applies_as[spec.id.as_str()];
         for required in &spec.requires {
-            if let Some(parent) = selected.iter().position(|other| other.id == *required) {
+            if let Some(&parent) = applies_as.get(required.as_str())
+                && parent != index
+            {
                 edges[index].insert(parent);
             }
         }
@@ -887,11 +977,19 @@ fn plan(
 
 // ----------------------------------------------------------------- reading
 
+/// Blob bytes kept in memory at once; past this the cache starts over and
+/// later reads go back to the archive.
+const CACHE_LIMIT: u64 = 64 * 1024 * 1024;
+
 struct Reader<'a> {
     store: &'a CollaborationStore,
     cache: HashMap<[u8; 32], Vec<u8>>,
+    cached_bytes: u64,
+    /// Blobs already counted in `bytes`.
+    charged: HashSet<[u8; 32]>,
     manifests: HashMap<SourceSnapshotId, Entries>,
-    /// Bytes read from the archive so far.
+    /// Manifest bytes read plus the size of every distinct blob read,
+    /// merged or staged into the candidate.
     bytes: u64,
 }
 
@@ -927,9 +1025,55 @@ impl Reader<'_> {
         }
         let bytes =
             collaboration_archive::read_object(self.store, &ObjectDigest::from_bytes(*digest))?;
-        self.bytes += bytes.len() as u64;
-        self.cache.insert(*digest, bytes.clone());
+        if self.charged.insert(*digest) {
+            self.bytes += bytes.len() as u64;
+        }
+        self.remember(*digest, &bytes);
         Ok(bytes)
+    }
+
+    fn remember(&mut self, digest: [u8; 32], bytes: &[u8]) {
+        let size = bytes.len() as u64;
+        if size > CACHE_LIMIT {
+            return;
+        }
+        if self.cached_bytes + size > CACHE_LIMIT {
+            self.cache.clear();
+            self.cached_bytes = 0;
+        }
+        self.cached_bytes += size;
+        self.cache.insert(digest, bytes.to_vec());
+    }
+
+    /// Count a blob the candidate will hold, by its stored size, without
+    /// reading it.
+    fn charge(&mut self, digest: &[u8; 32]) -> Result<(), ComposeError> {
+        if !self.charged.insert(*digest) {
+            return Ok(());
+        }
+        let path =
+            collaboration_archive::object_path(self.store, &ObjectDigest::from_bytes(*digest));
+        let size = std::fs::metadata(&path)
+            .map_err(|source| match source.kind() {
+                std::io::ErrorKind::NotFound => {
+                    ComposeError::Archive(ArchiveError::MissingObject {
+                        digest: ObjectDigest::from_bytes(*digest).hex(),
+                    })
+                }
+                _ => io(&path, source),
+            })?
+            .len();
+        self.bytes += size;
+        Ok(())
+    }
+
+    /// Keep a merge's output in the archive, so it is read back like any
+    /// other blob and the cache can forget it.
+    fn store_merged(&mut self, bytes: &[u8]) -> Result<[u8; 32], ComposeError> {
+        let digest = collaboration_archive::put_object(self.store, bytes)?;
+        let raw = digest.raw();
+        self.remember(raw, bytes);
+        Ok(raw)
     }
 
     /// Refuse once more bytes were read than the budget allows.
@@ -1005,6 +1149,9 @@ fn apply_path(
     {
         return Ok(Ok(Err(ConflictReason::Binary)));
     }
+    if deletes_a_twin(&base_text, &current_text) || deletes_a_twin(&base_text, &result_text) {
+        return Ok(Ok(Err(ConflictReason::AmbiguousAnchor)));
+    }
     if moves_a_block(&base_text, &current_text) || moves_a_block(&base_text, &result_text) {
         return Ok(Ok(Err(ConflictReason::MovedBlock)));
     }
@@ -1021,17 +1168,63 @@ fn apply_path(
     let Some(merged) = merge_file(scratch, &base_text, &current_text, &result_text)? else {
         return Ok(Ok(Err(ConflictReason::Content)));
     };
-    let digest: [u8; 32] = {
-        use sha2::{Digest, Sha256};
-        Sha256::digest(&merged).into()
-    };
-    reader.cache.insert(digest, merged);
+    let digest = reader.store_merged(&merged)?;
     Ok(Ok(Ok(Some((kind, digest)))))
 }
 
 /// Git's own test: a NUL in the first 8000 bytes.
 fn is_binary(bytes: &[u8]) -> bool {
     bytes.iter().take(8000).any(|byte| *byte == 0)
+}
+
+/// Whether `side` deletes, with nothing put in its place, a run of `base`
+/// lines whose non-blank lines (compared without surrounding whitespace)
+/// also appear, in order and contiguously, elsewhere in `base`. Which copy
+/// went is then a guess the line diff makes, and a line merge would put
+/// another side's change inside either copy on whichever one stayed. That
+/// holds whether the deletion is half of a move, within this file or into
+/// another, or a plain removal, so any concurrent change conflicts.
+fn deletes_a_twin(base: &[u8], side: &[u8]) -> bool {
+    use similar::{DiffOp, TextDiff};
+
+    let base = String::from_utf8_lossy(base);
+    let side = String::from_utf8_lossy(side);
+    let diff = TextDiff::from_lines(base.as_ref(), side.as_ref());
+    let lines: Vec<&str> = (0..)
+        .map_while(|index| diff.old_slice(index))
+        .map(|line| line.trim())
+        .collect();
+    // Non-blank base lines, with their positions.
+    let content: Vec<(usize, &str)> = lines
+        .iter()
+        .copied()
+        .enumerate()
+        .filter(|(_, line)| !line.is_empty())
+        .collect();
+    diff.ops().iter().any(|op| {
+        let DiffOp::Delete {
+            old_index, old_len, ..
+        } = *op
+        else {
+            return false;
+        };
+        let deleted: Vec<usize> = (0..content.len())
+            .filter(|&at| (old_index..old_index + old_len).contains(&content[at].0))
+            .collect();
+        let (Some(&first), Some(&last)) = (deleted.first(), deleted.last()) else {
+            return false;
+        };
+        let run: Vec<&str> = content[first..=last]
+            .iter()
+            .map(|(_, line)| *line)
+            .collect();
+        content
+            .windows(run.len())
+            .enumerate()
+            .any(|(start, window)| {
+                start != first && window.iter().map(|(_, line)| *line).eq(run.iter().copied())
+            })
+    })
 }
 
 /// Whether `side` moves a block of `base`: [`MOVE_WINDOW`] consecutive
@@ -1094,7 +1287,7 @@ fn merge_file(
     let current = write("current", current)?;
     let base = write("base", base)?;
     let result = write("result", result)?;
-    let output = engine()
+    let output = engine(scratch)
         .args([
             "merge-file",
             "-p",
@@ -1121,11 +1314,15 @@ fn merge_file(
     }
 }
 
-/// `git` with no user or system configuration, so a configured merge driver,
-/// conflict style or attribute cannot change what the profile does.
-fn engine() -> Command {
+/// `git` run in `dir`, outside any repository (discovery stops at `dir`'s
+/// parent), with no system or global configuration, so neither a
+/// configured conflict style nor a repository's own configuration can
+/// change what the profile does.
+fn engine(dir: &Path) -> Command {
     let mut command = Command::new("git");
     command
+        .current_dir(dir)
+        .env("GIT_CEILING_DIRECTORIES", dir.parent().unwrap_or(dir))
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env_remove("GIT_CONFIG_PARAMETERS")
@@ -1136,7 +1333,7 @@ fn engine() -> Command {
 }
 
 fn git_version() -> Result<String, ComposeError> {
-    let output = engine()
+    let output = engine(&std::env::temp_dir())
         .arg("--version")
         .stdin(Stdio::null())
         .output()
@@ -1157,6 +1354,8 @@ pub(crate) fn snapshot_entries(
     let mut reader = Reader {
         store,
         cache: HashMap::new(),
+        cached_bytes: 0,
+        charged: HashSet::new(),
         manifests: HashMap::new(),
         bytes: 0,
     };
@@ -1168,6 +1367,8 @@ pub(crate) fn blob(store: &CollaborationStore, digest: &[u8; 32]) -> Result<Vec<
     let mut reader = Reader {
         store,
         cache: HashMap::new(),
+        cached_bytes: 0,
+        charged: HashSet::new(),
         manifests: HashMap::new(),
         bytes: 0,
     };
@@ -1198,9 +1399,21 @@ pub(crate) fn materialize_candidate(
     let (tree, commit) = {
         let _use = crate::collaboration_gc::archive_use(store)
             .map_err(|source| io(&crate::collaboration_gc::lock_path(store), source))?;
+        // Proposed content goes into the archive first, as merged content
+        // does, so the reader finds it whatever its cache holds.
+        for (digest, bytes) in &blobs {
+            let stored = collaboration_archive::put_object(store, bytes)?;
+            if stored != ObjectDigest::from_bytes(*digest) {
+                return Err(ComposeError::Archive(ArchiveError::CorruptObject {
+                    digest: stored.hex(),
+                }));
+            }
+        }
         let mut reader = Reader {
             store,
-            cache: blobs,
+            cache: HashMap::new(),
+            cached_bytes: 0,
+            charged: HashSet::new(),
             manifests: HashMap::new(),
             bytes: 0,
         };
@@ -1249,6 +1462,32 @@ pub(crate) fn retain_commit(
     })
 }
 
+/// Whether `ancestor` is `descendant` or one of its ancestors.
+fn is_ancestor(
+    repo: &Path,
+    ancestor: &CommitOid,
+    descendant: &CommitOid,
+) -> Result<bool, ComposeError> {
+    let output = collaboration_archive::git(repo)
+        .args([
+            "merge-base",
+            "--is-ancestor",
+            ancestor.as_str(),
+            descendant.as_str(),
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|source| io(Path::new("git"), source))?;
+    match output.status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => Err(ComposeError::Git(format!(
+            "merge-base --is-ancestor: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))),
+    }
+}
+
 // ------------------------------------------------------------ materializing
 
 /// Write the candidate as Git objects in `repo`: blobs, trees and one commit
@@ -1287,7 +1526,13 @@ fn materialize(
         }
     }
 
+    // Blobs the baseline lacks are written in one hash-object, and the
+    // tree in one index: a fixed number of processes, whatever the size.
+    let blobs = scratch.join("blobs");
+    std::fs::create_dir_all(&blobs).map_err(|source| io(&blobs, source))?;
     let mut oids: BTreeMap<Vec<u8>, (EntryKind, String)> = BTreeMap::new();
+    let mut pending: Vec<(Vec<u8>, EntryKind, PathBuf)> = Vec::new();
+    let mut written: HashMap<[u8; 32], PathBuf> = HashMap::new();
     for (path, (kind, digest)) in entries {
         if baseline_entries.get(path) == Some(&(*kind, *digest))
             && let Some(oid) = known.get(path)
@@ -1295,17 +1540,49 @@ fn materialize(
             oids.insert(path.clone(), (*kind, oid.clone()));
             continue;
         }
-        let bytes = reader.blob(digest)?;
-        let file = scratch.join("blob");
-        std::fs::write(&file, &bytes).map_err(|source| io(&file, source))?;
-        let oid = repo_git(
-            repo,
-            &["hash-object", "-w", "--no-filters", "--"],
-            Some(&file),
-        )?;
-        oids.insert(path.clone(), (*kind, text_of(&oid)));
+        let file = match written.get(digest) {
+            Some(file) => file.clone(),
+            None => {
+                let file = blobs.join(written.len().to_string());
+                let bytes = reader.blob(digest)?;
+                std::fs::write(&file, &bytes).map_err(|source| io(&file, source))?;
+                written.insert(*digest, file.clone());
+                file
+            }
+        };
+        pending.push((path.clone(), *kind, file));
     }
-    let tree = write_tree(repo, &oids, b"")?;
+    if !pending.is_empty() {
+        let mut paths = Vec::new();
+        for (_, _, file) in &pending {
+            paths.extend_from_slice(file.as_os_str().as_encoded_bytes());
+            paths.push(b'\n');
+        }
+        let output = run(
+            collaboration_archive::git(repo).args([
+                "hash-object",
+                "-w",
+                "--no-filters",
+                "--stdin-paths",
+            ]),
+            Some(&paths),
+        )?;
+        let hashed: Vec<String> = String::from_utf8_lossy(&output)
+            .lines()
+            .map(str::to_string)
+            .collect();
+        if hashed.len() != pending.len() {
+            return Err(ComposeError::Git(format!(
+                "hash-object wrote {} of {} blobs",
+                hashed.len(),
+                pending.len()
+            )));
+        }
+        for ((path, kind, _), oid) in pending.into_iter().zip(hashed) {
+            oids.insert(path, (kind, oid));
+        }
+    }
+    let tree = write_tree(repo, scratch, &oids)?;
     let commit = repo_git_env(
         repo,
         &[
@@ -1320,40 +1597,31 @@ fn materialize(
     Ok((tree, CommitOid::parse(&text_of(&commit))?))
 }
 
+/// Write `entries` as one tree through a private index file, leaving the
+/// repository's own index alone.
 fn write_tree(
     repo: &Path,
+    scratch: &Path,
     entries: &BTreeMap<Vec<u8>, (EntryKind, String)>,
-    prefix: &[u8],
 ) -> Result<String, ComposeError> {
+    let index = scratch.join("index");
     let mut lines: Vec<u8> = Vec::new();
-    let mut subdirectories: BTreeSet<Vec<u8>> = BTreeSet::new();
-    for (path, (kind, oid)) in entries.range(prefix.to_vec()..) {
-        let Some(rest) = path.strip_prefix(prefix) else {
-            break;
-        };
-        match rest.iter().position(|byte| *byte == b'/') {
-            Some(slash) => {
-                subdirectories.insert(rest[..slash].to_vec());
-            }
-            None => {
-                lines.extend_from_slice(format!("{} blob {oid}\t", kind.git_mode()).as_bytes());
-                lines.extend_from_slice(rest);
-                lines.push(0);
-            }
-        }
-    }
-    for name in subdirectories {
-        let mut child = prefix.to_vec();
-        child.extend_from_slice(&name);
-        child.push(b'/');
-        let oid = write_tree(repo, entries, &child)?;
-        lines.extend_from_slice(format!("040000 tree {oid}\t").as_bytes());
-        lines.extend_from_slice(&name);
+    for (path, (kind, oid)) in entries {
+        lines.extend_from_slice(format!("{} {oid}\t", kind.git_mode()).as_bytes());
+        lines.extend_from_slice(path);
         lines.push(0);
     }
-    let output = run(
-        collaboration_archive::git(repo).args(["mktree", "-z"]),
+    run(
+        collaboration_archive::git(repo)
+            .env("GIT_INDEX_FILE", &index)
+            .args(["update-index", "-z", "--add", "--index-info"]),
         Some(&lines),
+    )?;
+    let output = run(
+        collaboration_archive::git(repo)
+            .env("GIT_INDEX_FILE", &index)
+            .args(["write-tree"]),
+        None,
     )?;
     Ok(text_of(&output))
 }
@@ -1376,7 +1644,12 @@ fn repo_git(repo: &Path, args: &[&str], file: Option<&Path>) -> Result<Vec<u8>, 
 fn repo_git_env(repo: &Path, args: &[&str]) -> Result<Vec<u8>, ComposeError> {
     let mut command = collaboration_archive::git(repo);
     command
-        .args(["-c", "commit.gpgsign=false"])
+        .args([
+            "-c",
+            "commit.gpgsign=false",
+            "-c",
+            "i18n.commitEncoding=UTF-8",
+        ])
         .args(args)
         .env("GIT_AUTHOR_NAME", "Aethyme composer")
         .env("GIT_AUTHOR_EMAIL", "composer@aethyme.invalid")
@@ -1475,6 +1748,7 @@ fn recipe_record(
             object(vec![
                 ("name", text("git merge-file")),
                 ("version", text(&plan.engine_version)),
+                ("diff", text(DIFF_ENGINE)),
                 ("move_window", integer(MOVE_WINDOW)),
             ]),
         ),
@@ -1576,6 +1850,50 @@ mod tests {
         let base = "p\nq\nr\ns\nt\nu\na\nb\n\nc\n";
         let side = "a\nb\n\nc\np\nq\nr\ns\nt\nu\n";
         assert!(moves_a_block(base.as_bytes(), side.as_bytes()));
+    }
+
+    #[test]
+    fn deleting_one_of_two_identical_runs_is_ambiguous() {
+        let base =
+            "<ul>\n  <li>tip</li>\n  <li>more</li>\n  <li>tip</li>\n  <li>more</li>\n</ul>\n";
+        let side = "<ul>\n  <li>tip</li>\n  <li>more</li>\n</ul>\n";
+        assert!(deletes_a_twin(base.as_bytes(), side.as_bytes()));
+        // Indentation does not make a copy distinct.
+        let indented = "<ul>\n  <li>tip</li>\n  <li>more</li>\n      <li>tip</li>\n      <li>more</li>\n</ul>\n";
+        assert!(deletes_a_twin(indented.as_bytes(), side.as_bytes()));
+    }
+
+    #[test]
+    fn deleting_a_unique_run_or_changing_a_twin_is_not_ambiguous() {
+        let base = "a\nb\nc\nb\nd\n";
+        // A unique line goes.
+        assert!(!deletes_a_twin(base.as_bytes(), b"a\nb\nb\nd\n"));
+        // A twin is changed in place, not deleted.
+        assert!(!deletes_a_twin(base.as_bytes(), b"a\nB\nc\nb\nd\n"));
+        // Only a blank line goes.
+        assert!(!deletes_a_twin(b"a\n\nb\n\nc\n", b"a\nb\n\nc\n"));
+    }
+
+    #[test]
+    fn the_recorded_diff_engine_is_the_locked_version() {
+        let lock = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../Cargo.lock"),
+        )
+        .unwrap();
+        let version = lock
+            .split("[[package]]")
+            .find(|package| package.contains("name = \"similar\""))
+            .and_then(|package| {
+                package
+                    .lines()
+                    .find_map(|line| line.strip_prefix("version = \""))
+                    .map(|rest| rest.trim_end_matches('"').to_string())
+            })
+            .expect("similar is locked");
+        assert!(
+            DIFF_ENGINE.starts_with(&format!("similar {version} ")),
+            "{DIFF_ENGINE} vs locked {version}"
+        );
     }
 
     #[test]
