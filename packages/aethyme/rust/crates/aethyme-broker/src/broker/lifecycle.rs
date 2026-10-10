@@ -73,10 +73,10 @@ impl Broker {
             landing_deadline: std::cell::Cell::new(None),
             main_common_dir: std::cell::OnceCell::new(),
         };
-        // Fence pre-#660 binaries out of a repository that requires
-        // collaboration capture. One meta query once fenced; until then a
-        // plain read of the working-copy config, no Git.
-        broker.apply_collaboration_fence(false)?;
+        // Fence pre-#660 binaries out of a repository whose committed config
+        // requires collaboration capture. Best effort: the open never fails
+        // because of it.
+        broker.collaboration_fence_state(FenceTrigger::Open);
         broker.backfill_live_repository_contracts()?;
         broker.reap_abandoned_prepared_operations()?;
         broker.recover_interrupted_promotion()?;
@@ -135,37 +135,77 @@ impl Broker {
         self
     }
 
-    /// Raise `broker.db`'s compatibility floor to
-    /// [`crate::COLLABORATION_FENCE_SCHEMA`] when this repository requires
-    /// collaboration capture, and return the fence the database carries.
+    /// The collaboration fence for this repository (#660): raise
+    /// `broker.db`'s compatibility floor to [`crate::COLLABORATION_FENCE_SCHEMA`]
+    /// when the **committed** config requires capture, and report it.
     ///
-    /// Once fenced this is one meta query. Otherwise `effective` chooses the
-    /// config: the committed-first rule (`true`, used by status, submit and
-    /// promotion, which read it anyway) or only the main checkout's working
-    /// copy (`false`, used on every open, where spawning Git would tax every
-    /// hook call). Only an explicit `capture = "required"` raises the floor:
-    /// it is one-way, so a typo must not lock older binaries out for good.
-    pub(crate) fn apply_collaboration_fence(
+    /// - Only the copy committed on the fetched default branch counts. An
+    ///   uncommitted or experimental `required`, or a feature branch checked
+    ///   out in the main checkout, never fences: the floor is never lowered.
+    /// - Once fenced, this is one meta query.
+    /// - Read-only stores (`query_only`: snapshot opens, the missing-database
+    ///   in-memory store, migrated temporary copies) never write; a fence the
+    ///   committed config requires is reported as `pending`.
+    /// - Never fails: a read or write error is warned about, and a raise that
+    ///   could not be written is reported as `pending`. The next writable
+    ///   status, submit or promotion retries.
+    pub(crate) fn collaboration_fence_state(
         &self,
-        effective: bool,
-    ) -> Result<Option<crate::CollaborationFence>, BrokerOpError> {
+        trigger: FenceTrigger<'_>,
+    ) -> Option<crate::CollaborationFence> {
         let conn = self.store.connection();
-        if let Some(fence) = crate::schema::collaboration_fence(conn)? {
-            return Ok(Some(fence));
-        }
-        let setting = if effective {
-            crate::collaboration_submit::setting(&self.main_root).0
-        } else {
-            match std::fs::read_to_string(self.main_root.join(".aethyme/config.toml")) {
-                Ok(text) => crate::collaboration_submit::setting_from_text(Some(&text)),
-                Err(_) => return Ok(None),
+        match crate::schema::collaboration_fence(conn) {
+            Ok(Some(fence)) => return Some(fence),
+            Ok(None) => {}
+            Err(error) => {
+                crate::warn_unrecorded("read the collaboration fence", Err::<(), _>(error));
+                return None;
             }
-        };
-        if !crate::collaboration_submit::requires_capture(&setting) {
-            return Ok(None);
         }
-        crate::schema::raise_collaboration_fence(conn)?;
-        Ok(crate::schema::collaboration_fence(conn)?)
+        let loaded;
+        let config = match trigger {
+            // Opens run on every hook call: reach Git only when the working
+            // copy says required, then confirm against the committed copy.
+            FenceTrigger::Open => {
+                let text =
+                    std::fs::read_to_string(self.main_root.join(".aethyme/config.toml")).ok()?;
+                if !crate::collaboration_submit::requires_capture(
+                    &crate::collaboration_submit::setting_from_text(Some(&text)),
+                ) {
+                    return None;
+                }
+                loaded = crate::merge::repository_config_with_source(&self.main_root);
+                loaded.as_ref()
+            }
+            FenceTrigger::Config(config) => config,
+        };
+        let (text, "committed") = config.map(|(text, source)| (text.as_str(), *source))? else {
+            return None;
+        };
+        if !crate::collaboration_submit::requires_capture(
+            &crate::collaboration_submit::setting_from_text(Some(text)),
+        ) {
+            return None;
+        }
+        let read_only = conn
+            .pragma_query_value(None, "query_only", |row| row.get::<_, bool>(0))
+            .unwrap_or(true);
+        if read_only {
+            return Some(crate::CollaborationFence::pending());
+        }
+        match crate::schema::raise_collaboration_fence(conn, "committed")
+            .and_then(|()| crate::schema::collaboration_fence(conn))
+        {
+            Ok(Some(fence)) => Some(fence),
+            Ok(None) => Some(crate::CollaborationFence::pending()),
+            Err(error) => {
+                crate::warn_unrecorded(
+                    "raise the collaboration fence (the next status or submit retries)",
+                    Err::<(), _>(error),
+                );
+                Some(crate::CollaborationFence::pending())
+            }
+        }
     }
 
     /// Open `project`'s collaboration state for this repository.
