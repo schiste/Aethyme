@@ -869,30 +869,68 @@ impl Broker {
             .find(|entry| entry.session_id == session_id);
         let visible_entry = latest_for_head.or(latest_for_session);
 
-        // Use cleanup's exact delivery proof so a historical queue row or a
-        // stale representation record cannot make finish disagree with cleanup.
+        // Finish, cleanup, and integration reconciliation share the same
+        // landing proof. Finish keeps #152's explicit confirmation gate for
+        // non-ancestry deliveries: a content or patch match is a candidate,
+        // not permission to delete the only worktree, until it is recorded.
         let delivery_targets = self.cleanup_delivery_targets()?;
-        let (delivery_provenance, _) = self.cleanup_provenance(session, head, &delivery_targets)?;
-        let head_is_delivered =
-            delivery_provenance.representation == crate::CleanupRepresentation::Represented;
+        let landing = self.landing_on_delivery_targets(head, &delivery_targets)?;
 
-        // A stored record appears in the report only when cleanup's record
-        // validation finds its carrying commit on one of the current targets.
-        let representation = if self
-            .recorded_representation_evidence(session, head, &delivery_targets)?
-            .is_some()
-        {
+        // Unlike a historical queue status, a representation record only
+        // counts when its carrying commit is still reachable from a current
+        // delivery target.
+        let representation_evidence =
+            self.recorded_representation_evidence(session, head, &delivery_targets)?;
+        let representation = if representation_evidence.is_some() {
             self.store.session_representation(session_id, head)?
         } else {
             None
         };
+
+        // A promoted queue row is a trusted acceptance only while both its
+        // recorded promotion commit and this exact session head still have
+        // shared landing evidence on current targets. A later squash that
+        // overwrote the contribution cannot keep a historical `Promoted` row
+        // alive as delivery evidence.
+        let queued_merge_commit = latest_for_head
+            .and_then(|entry| entry.details_json.as_deref())
+            .and_then(|details| serde_json::from_str::<serde_json::Value>(details).ok())
+            .and_then(|details| {
+                details
+                    .get("merge_commit")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+            });
+        let accepted_integration_commit = session
+            .accepted_integration_commit
+            .as_deref()
+            .or(queued_merge_commit.as_deref());
+        let accepted_commit_is_current = accepted_integration_commit.is_some_and(|accepted| {
+            delivery_targets
+                .iter()
+                .any(|target| self.repo.is_ancestor(accepted, target))
+        });
+        let queue_accepts_head = latest_for_head.is_some_and(|entry| {
+            matches!(
+                entry.status,
+                MergeStatus::Promoted | MergeStatus::ExternallyLanded
+            )
+        }) || session.accepted_session_head.as_deref() == Some(head);
+        let submitted_head_is_delivered =
+            queue_accepts_head && accepted_commit_is_current && landing.is_some();
+
         let remote_default_tip = self.remote_tracking_default_tip();
         let on_remote_default = if let Some(tip) = remote_default_tip.as_ref() {
+            // An ancestry proof is self-verifying. A squash/rebase match on
+            // this branch still needs the explicit representation record
+            // checked above before finish can close the session.
             self.landing_on_delivery_targets(head, std::slice::from_ref(tip))?
-                .is_some()
+                .is_some_and(|(_, evidence, _)| evidence == crate::LandingEvidence::Ancestry)
         } else {
             false
         };
+        let head_is_delivered =
+            submitted_head_is_delivered || representation.is_some() || on_remote_default;
         let unsubmitted_commits = if head_is_delivered {
             0
         } else {
