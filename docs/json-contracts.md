@@ -572,7 +572,10 @@ be `null` for a failure with no known remedy.
 store exists `durability`, `receipt_label`, `schema_version`,
 `min_compatible_schema`; or `refusal` with `code` and `next_action`),
 `captures` (`by_state`, `reserved_bytes`, `attention`), `gc`
-(`unfinished_generations`) and `next_actions`. It never creates state.
+(`unfinished_generations`), `collaboration_fence` (the broker.db fence #660
+raises under required capture, as `broker status` reports it, or `null`) and
+`next_actions`. It never creates state and never raises the fence: it reads
+broker.db from a read-only snapshot.
 
 `collab context` wraps the `aethyme.contribution-context/experimental-v0`
 record as `context`, with `served` (`fresh` or `cache`), `stored`,

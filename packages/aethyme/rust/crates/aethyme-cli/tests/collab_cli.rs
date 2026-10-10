@@ -478,3 +478,47 @@ fn usage_errors_are_exit_2_and_help_has_no_side_effects() {
     }
     assert!(!fixture.collaboration_dir().exists());
 }
+
+/// Under required capture, status shows the broker.db fence #660 raises,
+/// read without raising it: before any broker command it is absent and the
+/// next action says how it is raised; afterwards it is reported.
+#[test]
+fn status_reports_the_required_capture_fence_without_raising_it() {
+    let fixture = Fixture::new(Some(&format!(
+        "[collaboration]\ncapture = \"required\"\nproject = \"{PROJECT}\"\n"
+    )));
+    let (code, before) = fixture.json(&["collab", "status"]);
+    assert_eq!(code, 0);
+    assert_eq!(before["collaboration_fence"], serde_json::Value::Null);
+    assert!(
+        before["next_actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|action| action
+                .as_str()
+                .unwrap()
+                .contains("raise the required-capture fence")),
+        "{before:#}"
+    );
+    let (_, again) = fixture.json(&["collab", "status"]);
+    assert_eq!(
+        again["collaboration_fence"],
+        serde_json::Value::Null,
+        "status raised it"
+    );
+
+    let (code, _) = fixture.json(&["broker", "status"]);
+    assert_eq!(code, 0);
+    let (_, after) = fixture.json(&["collab", "status"]);
+    let fence = &after["collaboration_fence"];
+    assert!(
+        fence["min_compatible_schema"].as_i64().unwrap() >= 50,
+        "{after:#}"
+    );
+    assert!(fence["reason"].is_string());
+
+    let advisory = Fixture::new(Some(&enabled_config()));
+    let (_, status) = advisory.json(&["collab", "status"]);
+    assert_eq!(status["collaboration_fence"], serde_json::Value::Null);
+}

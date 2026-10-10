@@ -32,7 +32,7 @@ command.
 
 | Command | What it does | Writes |
 |---|---|---|
-| `status` | Policy, config source, state root and its source, durability profile and receipt label, schema and compatibility floor, captures by state, captures needing attention, reserved bytes, unfinished reclamation, next actions. | Never creates state. It opens an existing store, which may migrate it. |
+| `status` | Policy, config source, the required-capture fence on broker.db (read with `broker status`'s own reader from a read-only snapshot; under `required` with no fence yet, the next action says a broker command raises it), state root and its source, durability profile and receipt label, schema and compatibility floor, captures by state, captures needing attention, reserved bytes, unfinished reclamation, next actions. | Never creates state or raises the fence. It opens an existing collaboration store, which may migrate it. |
 | `enroll [--write]` | Mints a project ID (`proj:<128-bit base32>`, directory key `proj-<base32>`, the #652 proposal) and prints the section enabling advisory capture. `--write` appends it only to a config that does not mention collaboration. | Only with `--write`. |
 | `capture recover` | Resolves crashed captures. Live ones are skipped; per-operation errors are listed and do not stop the rest. | Yes |
 | `capture abort --operation <id>` | Aborts an unfinished capture. A committed one is refused (`already_committed`). | Yes |
@@ -97,8 +97,6 @@ network call (§6.7: "An upgrade must not silently install an always-on daemon")
   write an enrollment descriptor record or bind two clones (T03).
 - **`--write` edits only a config that does not mention collaboration.** Editing an
   existing section safely needs a format-preserving editor.
-- **The status of the required-capture fence** (#719's broker.db floor) is shown here
-  once that lands.
 
 ## Tests
 
@@ -107,4 +105,5 @@ network call (§6.7: "An upgrade must not silently install an always-on daemon")
 | T33 (default disabled) | No policy, another table only, or `capture = "off"`: `status` says disabled. Every other subcommand exits 3 with `collaboration_disabled` and creates no state. |
 | T34 (malformed policy) | An unreadable opt-in, a non-table `collaboration`, an unknown `capture` value and an unknown setting are each refused with their code; nothing is created. |
 | T35 (explicit commands) | Over a real advisory capture made by `broker submit`: status, receipt, a missing receipt, aborting a committed capture, recover, a valid and an invalid brief, context (fresh, then cached, briefs untrusted, a budget out of range), an unrecorded plan refused, an orphan reclaimed by plan and apply, resume. |
+| Fence (#660) | Under required capture, status shows no fence and the next action before any broker command, does not raise it itself, and reports it after `broker status`; advisory shows none. |
 | T57 (version and help) | Schema names asserted for every subcommand. `--help` on every subcommand exits 0 with no side effects; usage errors exit 2. |

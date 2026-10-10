@@ -445,6 +445,7 @@ fn status(main_root: &Path) -> Result<Output, Failure> {
     if let Some(source) = source {
         text.push_str(&format!("  config: {source} .aethyme/config.toml\n"));
     }
+    fence_status(main_root, &setting, &mut value, &mut text, &mut next);
     if let Some(project) = project {
         state_status(main_root, &project, &mut value, &mut text, &mut next)?;
     }
@@ -453,6 +454,46 @@ fn status(main_root: &Path) -> Result<Output, Failure> {
         text.push_str(&format!("  next: {action}\n"));
     }
     Ok((value, text))
+}
+
+/// The required-capture fence on broker.db (#660), read with the same
+/// reader `broker status` uses, from a read-only snapshot: looking never
+/// raises it. A broker command raises it on its next open.
+fn fence_status(
+    main_root: &Path,
+    setting: &Setting,
+    value: &mut Value,
+    text: &mut String,
+    next: &mut Vec<String>,
+) {
+    let fence = crate::BrokerStore::open_snapshot_in_repo(main_root)
+        .ok()
+        .and_then(|store| crate::schema::collaboration_fence(store.connection()).ok())
+        .flatten();
+    value["collaboration_fence"] = serde_json::to_value(&fence).unwrap_or(Value::Null);
+    let required = matches!(
+        setting,
+        Setting::On {
+            policy: crate::collaboration_capture::CapturePolicy::Required,
+            ..
+        }
+    );
+    match &fence {
+        Some(fence) => text.push_str(&format!(
+            "  fence: broker.db requires schema {} or newer ({}); older binaries cannot open \
+             this repository, and this does not lift if required capture is turned off\n",
+            fence.min_compatible_schema, fence.reason
+        )),
+        None if required => {
+            text.push_str("  fence: not raised yet; older binaries can still submit uncaptured\n");
+            next.push(
+                "run any `aethyme broker` command (e.g. `aethyme broker status`) to raise the \
+                 required-capture fence"
+                    .into(),
+            );
+        }
+        None => {}
+    }
 }
 
 fn state_status(
