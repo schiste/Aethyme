@@ -29,6 +29,8 @@ use crate::types::{AdvisoryEvidence, AdvisorySeverity, MergeQueueEntry, MergeSta
 pub const DEFAULT_INTEGRATION_BRANCH: &str = "aethyme/integration";
 pub const ACTION_REQUIRED_RELPATH: &str = ".aethyme/broker-action-required.md";
 const PROMOTION_SUBJECT_MAX_CHARS: usize = 72;
+const VERIFY_ONLY_FALLBACK_REASON: &str = "no fetched default branch to verify against; verified against the \
+     integration branch instead (set the main checkout's upstream or fetch it)";
 
 fn require_session_checkout_identity(
     session: &crate::Session,
@@ -399,6 +401,8 @@ pub struct SubmissionPlan {
     pub session_id: i64,
     pub recorded_baseline: Option<String>,
     pub session_head: String,
+    /// Effective commit used as the plan base: integration in promoting
+    /// repositories, or the fetched default branch in verify-only mode.
     pub integration_head: String,
     pub safe: bool,
     pub commits: Vec<SubmissionCommitProvenance>,
@@ -500,19 +504,38 @@ struct SubmissionReplay {
 
 impl Broker {
     /// Build the exact plan used by submission before creating a queue entry
-    /// or running gates. Replaying patches can create unreachable Git objects,
-    /// but this operation changes neither refs nor worktrees.
+    /// or running gates. Verify-only repositories use the same fetched-default
+    /// base as submit, while the plan remains read-only when falling back to
+    /// the integration branch. Replaying patches can create unreachable Git
+    /// objects, but this operation changes neither refs nor worktrees.
     pub fn submission_plan(&mut self, session_id: i64) -> Result<SubmissionPlan, BrokerOpError> {
         let session = self.store().session(session_id)?;
         let checkout = GitRepo::discover(Path::new(&session.worktree_path))?;
         let session_head = checkout.head_commit()?;
-        let (_, integration_head) = self.integration_head_snapshot()?;
-        let mut plan = self.build_submission_plan(&session, &session_head, &integration_head)?;
+        let config = PromoteConfig::load(&self.main_root_path());
+        let (integration_reference, integration_head) = self.integration_head_snapshot()?;
+        let base = if config.mode == PromoteMode::VerifyOnly {
+            self.upstream_verification_base()
+                .unwrap_or(VerificationBase {
+                    source: VERIFIED_AGAINST_INTEGRATION,
+                    reference: integration_reference,
+                    commit: integration_head,
+                    fallback_reason: Some(VERIFY_ONLY_FALLBACK_REASON.to_string()),
+                })
+        } else {
+            VerificationBase {
+                source: VERIFIED_AGAINST_INTEGRATION,
+                reference: integration_reference,
+                commit: integration_head,
+                fallback_reason: None,
+            }
+        };
+        let mut plan = self.build_submission_plan(&session, &session_head, &base.commit)?;
         let replay = self.replay_submission_plan(&plan)?;
         if replay.conflicts.is_empty() {
             plan.merged_tree_paths = self
                 .repo_handle()
-                .changed_between(&integration_head, &replay.tree)?;
+                .changed_between(&base.commit, &replay.tree)?;
         }
         Ok(plan)
     }
@@ -567,28 +590,28 @@ impl Broker {
     /// what a verified entry is promoted onto. Never fetches.
     pub(crate) fn submission_base(&mut self) -> Result<VerificationBase, BrokerOpError> {
         let config = PromoteConfig::load(&self.main_root_path());
-        let mut fallback_reason = None;
-        if config.mode == PromoteMode::VerifyOnly {
-            if let Some((reference, commit)) = self.repo_handle().upstream_default() {
-                return Ok(VerificationBase {
-                    source: VERIFIED_AGAINST_UPSTREAM,
-                    reference,
-                    commit,
-                    fallback_reason: None,
-                });
-            }
-            fallback_reason = Some(
-                "no fetched default branch to verify against; verified against the \
-                 integration branch instead (set the main checkout's upstream or fetch it)"
-                    .to_string(),
-            );
+        if config.mode == PromoteMode::VerifyOnly
+            && let Some(base) = self.upstream_verification_base()
+        {
+            return Ok(base);
         }
         let (reference, commit) = self.integration_head()?;
         Ok(VerificationBase {
             source: VERIFIED_AGAINST_INTEGRATION,
             reference,
             commit,
-            fallback_reason,
+            fallback_reason: (config.mode == PromoteMode::VerifyOnly)
+                .then(|| VERIFY_ONLY_FALLBACK_REASON.to_string()),
+        })
+    }
+
+    fn upstream_verification_base(&self) -> Option<VerificationBase> {
+        let (reference, commit) = self.repo_handle().upstream_default()?;
+        Some(VerificationBase {
+            source: VERIFIED_AGAINST_UPSTREAM,
+            reference,
+            commit,
+            fallback_reason: None,
         })
     }
 
@@ -635,8 +658,10 @@ impl Broker {
         let session = self.store().session(session_id)?;
         let checkout = GitRepo::discover(Path::new(&session.worktree_path))?;
         let head = require_session_checkout_identity(&session, &checkout, None)?;
-        // Before planning: a verify-only plan is measured against integration,
-        // and a stale one counts main's own commits as this session's (#352).
+        // Planning must use the same policy-aware base reported by submit:
+        // fetched upstream in verify-only mode, integration otherwise. This
+        // prevents upstream-only commits from being counted as session work
+        // when integration is stale (#352).
         self.refresh_disposable_integration(crate::IntegrationRefreshTrigger::Submit);
         progress.phase("auditing lease ownership");
         let ownership = self.audit_submit_ownership(session_id)?;

@@ -117,6 +117,86 @@ fn refresh_graph(root: &Path, repository: &str) {
     write_graph_authority_manifest(root, &source, repository, env!("CARGO_PKG_VERSION")).unwrap();
 }
 
+#[test]
+fn verify_only_submission_plan_and_submit_use_the_same_upstream_base() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    std::fs::write(
+        tmp.path().join(".aethyme/config.toml"),
+        "[promote]\nmode = \"verify-only\"\n",
+    )
+    .unwrap();
+    sh(tmp.path(), &["add", ".aethyme/config.toml"]);
+    sh(tmp.path(), &["commit", "-qm", "configure verify-only mode"]);
+    let stale_integration = resolve(tmp.path(), "HEAD");
+    sh(
+        tmp.path(),
+        &[
+            "update-ref",
+            "refs/heads/aethyme/integration",
+            &stale_integration,
+        ],
+    );
+
+    sh(tmp.path(), &["switch", "-qc", "external-upstream", "main"]);
+    std::fs::write(tmp.path().join("src/upstream.txt"), "upstream\n").unwrap();
+    sh(tmp.path(), &["add", "src/upstream.txt"]);
+    sh(
+        tmp.path(),
+        &["commit", "-qm", "advance fetched default branch"],
+    );
+    let upstream = resolve(tmp.path(), "HEAD");
+    sh(
+        tmp.path(),
+        &["update-ref", "refs/remotes/origin/main", &upstream],
+    );
+    sh(
+        tmp.path(),
+        &[
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/main",
+        ],
+    );
+    sh(tmp.path(), &["switch", "main"]);
+
+    assert_eq!(
+        GitRepo::discover(tmp.path()).unwrap().upstream_default(),
+        Some(("origin/main".to_string(), upstream.clone()))
+    );
+    assert!(matches!(
+        aethyme_broker::PromoteConfig::load(tmp.path()).mode,
+        aethyme_broker::PromoteMode::VerifyOnly
+    ));
+
+    let mut broker = Broker::open(tmp.path()).unwrap();
+    let worktree = agent_worktree(tmp.path(), "verify-only-base-parity");
+    let session = broker
+        .adopt(&worktree, Some("verify-only base parity"))
+        .unwrap();
+    commit_edit(&worktree, "src/notes.md", "session work\n");
+
+    let plan = broker.submission_plan(session.id).unwrap();
+    assert_eq!(plan.integration_head, upstream);
+    assert_ne!(plan.integration_head, stale_integration);
+    // Planning is read-only even when the disposable integration ref is stale.
+    assert_eq!(
+        resolve(tmp.path(), "aethyme/integration"),
+        stale_integration
+    );
+
+    let outcome = broker.submit(session.id).unwrap();
+    let verified_against = outcome.verified_against.as_ref().unwrap();
+    assert_eq!(verified_against.source, "upstream");
+    assert_eq!(verified_against.reference, "origin/main");
+    assert_eq!(verified_against.commit, upstream);
+    assert_eq!(
+        outcome.submission_plan.integration_head,
+        plan.integration_head
+    );
+    assert!(!outcome.promoted);
+}
+
 /// #280: a sound `Stale` verdict is advice. The submission runs its gates
 /// and lands, and the verdict travels with it to the submit JSON and to
 /// `broker status`.
