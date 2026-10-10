@@ -73,6 +73,10 @@ impl Broker {
             landing_deadline: std::cell::Cell::new(None),
             main_common_dir: std::cell::OnceCell::new(),
         };
+        // Fence pre-#660 binaries out of a repository that requires
+        // collaboration capture. One meta query once fenced; until then a
+        // plain read of the working-copy config, no Git.
+        broker.apply_collaboration_fence(false)?;
         broker.backfill_live_repository_contracts()?;
         broker.reap_abandoned_prepared_operations()?;
         broker.recover_interrupted_promotion()?;
@@ -129,6 +133,39 @@ impl Broker {
     pub fn with_collaboration_state(mut self, host_state: impl Into<PathBuf>) -> Self {
         self.collaboration_state_override = Some(host_state.into());
         self
+    }
+
+    /// Raise `broker.db`'s compatibility floor to
+    /// [`crate::COLLABORATION_FENCE_SCHEMA`] when this repository requires
+    /// collaboration capture, and return the fence the database carries.
+    ///
+    /// Once fenced this is one meta query. Otherwise `effective` chooses the
+    /// config: the committed-first rule (`true`, used by status, submit and
+    /// promotion, which read it anyway) or only the main checkout's working
+    /// copy (`false`, used on every open, where spawning Git would tax every
+    /// hook call). Only an explicit `capture = "required"` raises the floor:
+    /// it is one-way, so a typo must not lock older binaries out for good.
+    pub(crate) fn apply_collaboration_fence(
+        &self,
+        effective: bool,
+    ) -> Result<Option<crate::CollaborationFence>, BrokerOpError> {
+        let conn = self.store.connection();
+        if let Some(fence) = crate::schema::collaboration_fence(conn)? {
+            return Ok(Some(fence));
+        }
+        let setting = if effective {
+            crate::collaboration_submit::setting(&self.main_root).0
+        } else {
+            match std::fs::read_to_string(self.main_root.join(".aethyme/config.toml")) {
+                Ok(text) => crate::collaboration_submit::setting_from_text(Some(&text)),
+                Err(_) => return Ok(None),
+            }
+        };
+        if !crate::collaboration_submit::requires_capture(&setting) {
+            return Ok(None);
+        }
+        crate::schema::raise_collaboration_fence(conn)?;
+        Ok(crate::schema::collaboration_fence(conn)?)
     }
 
     /// Open `project`'s collaboration state for this repository.

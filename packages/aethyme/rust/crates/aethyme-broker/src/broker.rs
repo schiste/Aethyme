@@ -1592,6 +1592,10 @@ pub struct StatusView {
     pub advisory_delivery: crate::AdvisoryDeliverySummary,
     /// Promoted entry paths whose publication has not yet been proven.
     pub outstanding_entry_exposures: Vec<crate::EntryPathExposure>,
+    /// `broker.db`'s compatibility floor raised because this repository
+    /// requires collaboration capture (#660); absent otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub collaboration_fence: Option<crate::CollaborationFence>,
     pub agents: Vec<AgentView>,
     pub leases: Vec<crate::Lease>,
     /// Liveness of each lease in `leases`, bound to its holder process (#360).

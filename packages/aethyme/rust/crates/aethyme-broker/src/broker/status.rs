@@ -1476,6 +1476,7 @@ impl Broker {
             outstanding_advisories: self.store.advisories(false)?,
             advisory_delivery: self.store.advisory_delivery_summary()?,
             outstanding_entry_exposures: self.store.outstanding_entry_path_exposures()?,
+            collaboration_fence: self.apply_collaboration_fence(true)?,
             agents,
             leases,
             lease_liveness,
