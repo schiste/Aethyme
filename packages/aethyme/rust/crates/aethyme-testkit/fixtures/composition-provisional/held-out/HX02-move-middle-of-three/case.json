@@ -1,0 +1,22 @@
+{
+  "schema": "aethyme.composition-fixture/provisional-v0",
+  "case": "HX02",
+  "title": "Held-out FX02 variant: move the middle of three similar items and edit its button",
+  "plan": "#650 held-out variant of FX02",
+  "trees": { "S0": { "recorded": true } },
+  "contributions": [
+    { "id": "move", "base": "tree:S0" },
+    { "id": "edit", "base": "tree:S0" }
+  ],
+  "scenarios": [
+    {
+      "id": "move-and-edit",
+      "baseline": "S0",
+      "request": { "compose": ["move", "edit"] },
+      "orders": [["move", "edit"], ["edit", "move"]],
+      "commutative": true,
+      "required_outcomes": ["candidate"],
+      "provisional_text": { "outcome": "conflict", "behavior": null, "note": "the re-indented move deletes the edited line" }
+    }
+  ]
+}

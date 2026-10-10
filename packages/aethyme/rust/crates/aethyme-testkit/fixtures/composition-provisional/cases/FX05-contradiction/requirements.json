@@ -1,0 +1,5 @@
+{
+  "schema": "aethyme.composition-requirements/provisional-v0",
+  "case": "FX05",
+  "scenarios": { "same-property": [] }
+}

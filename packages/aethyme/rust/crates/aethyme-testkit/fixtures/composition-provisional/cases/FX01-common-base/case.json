@@ -1,0 +1,34 @@
+{
+  "schema": "aethyme.composition-fixture/provisional-v0",
+  "case": "FX01",
+  "title": "Common base: independent label, accessibility and child changes",
+  "plan": "#650 FX01; plan v3 §7.2 rows 'same-base changes to different supported regions' and 'different attributes of a known element'",
+  "trees": { "S0": { "recorded": true } },
+  "contributions": [
+    { "id": "label", "base": "tree:S0" },
+    { "id": "a11y", "base": "tree:S0" },
+    { "id": "child", "base": "tree:S0" }
+  ],
+  "scenarios": [
+    {
+      "id": "compose-all",
+      "baseline": "S0",
+      "request": { "compose": ["label", "a11y", "child"] },
+      "orders": [
+        ["label", "a11y", "child"],
+        ["label", "child", "a11y"],
+        ["a11y", "label", "child"],
+        ["a11y", "child", "label"],
+        ["child", "label", "a11y"],
+        ["child", "a11y", "label"]
+      ],
+      "commutative": true,
+      "required_outcomes": ["candidate"],
+      "provisional_text": {
+        "outcome": "candidate",
+        "behavior": "passes",
+        "note": "the three changes touch lines separated by unchanged lines, so a line-based three-way merge composes them in every order"
+      }
+    }
+  ]
+}

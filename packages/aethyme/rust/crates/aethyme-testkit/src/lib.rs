@@ -14,6 +14,10 @@
 //!   `tests/support/repo_builders.py` did.
 //! * [`release_notes`] — the CHANGELOG/UPGRADING release-notes contract,
 //!   shared by the release workflow's renderer and `release_contract`.
+//! * [`composition_fixtures`] — provisional FX01–FX07 composition cases
+//!   (L4 #664, standing in for E1 #650) and their independent behavior
+//!   oracle. The case trees are plain files, materialized into a fresh
+//!   Git repository per test, never checked in as repositories.
 //!
 //! **Placement.** It is a workspace member rather than a
 //! `tests/common/mod.rs` inside one crate because more than one crate
@@ -32,6 +36,7 @@
 //! internal function instead of the external behaviour.
 
 pub mod bins;
+pub mod composition_fixtures;
 pub mod invoke;
 pub mod paths;
 pub mod release_notes;
