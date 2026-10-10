@@ -1,6 +1,6 @@
 # Local v3 — L3 contribution context (#661)
 
-Last Updated: 2026-10-09
+Last Updated: 2026-10-10
 
 This record covers how an agent asks "what earlier contributions and decisions matter for
 the paths I am about to change?" and how the answer states its limits (plan §6.5; D27,
@@ -154,15 +154,15 @@ migrations as contiguous and ending at the binary's version.
 briefs are roots, so it could remove the brief of a live contribution. A store at schema 5
 therefore refuses binaries below 5. The derived tables alone would not need this: they
 are rebuildable. Reclamation keeps each attached brief with its contribution
-(`local-v3-l2-gc.md`).
+(`local-v3-l2-gc.md`). The context cache (#662) raises the floor to 6.
 
 ### Visibility
 
 `Visibility` names the reader class, its epoch, and whether a contribution is visible.
 Local v0 has one class, `LocalProject`: everyone who can open the store sees all of it.
 Hidden contributions are filtered before matching, so they appear nowhere, not in
-`matched` and not in posting versions. Membership and ACL changes (#662) replace the
-policy and bump the epoch.
+`matched` and not in posting versions. Membership and ACL changes replace the policy and
+bump the epoch; the cache's rules for them are in `local-v3-l3-invalidation.md`.
 
 ## Not decided here
 
@@ -174,8 +174,9 @@ policy and bump the epoch.
   retained contribution that matches.
 - **Ranking by symbols.** Envelopes contribute paths only. Symbol-level matching waits
   for `resolve_symbol` producers (D39).
-- **#662** owns invalidation on membership changes and the cache itself; this slice
-  produces the keys a cache would store.
+- **The cache** and invalidation on membership changes are #662's
+  (`local-v3-l3-invalidation.md`). It adds a broad-risk bucket to the key, and raises the
+  floor to 6.
 
 ## Tests
 
