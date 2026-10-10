@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Field catalog</title>
+    <link rel="stylesheet" href="./styles.css">
+  </head>
+  <body>
+    <header class="panel">
+      <h1>Field catalog</h1>
+      <div class="search-row" id="catalog-search-area">
+        <span class="search-mark" aria-hidden="true">⌕</span>
+        <label for="global-search">Find in page</label>
+        <input id="global-search" type="search" aria-label="Catalog lookup" placeholder="Search the catalog">
+        <button id="run-search" type="button">Search</button>
+      </div>
+    </header>
+    <main>
+      <p>Search a few field notes by name.</p>
+      <ul id="catalog-results" class="result-list" aria-live="polite"></ul>
+    </main>
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>

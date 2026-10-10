@@ -1,0 +1,24 @@
+# Handoff
+
+A previous contributor left a short decision brief for the next change. Read it before editing.
+
+## Decision brief
+
+```json
+{
+  "intent": "Adapt the primary catalog search for narrow screens without coupling the two search panels.",
+  "decisions": [
+    {
+      "scope_ref": "quick-find",
+      "choice": "Use one shared query state for primary search and Quick Find.",
+      "reason": "Both panels search the same catalog, so separate state is redundant and can drift."
+    }
+  ],
+  "preserves": [
+    "A single clear action should reset both views."
+  ],
+  "assumptions": [
+    "Only this catalog view is mounted in the page."
+  ]
+}
+```

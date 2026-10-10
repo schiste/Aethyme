@@ -1,0 +1,2811 @@
+{
+  "suite": "Local v3 FX08 brief usefulness pilot",
+  "version": "v13 frozen rerun (isolated roots and host launcher)",
+  "frozen_revision": "c25228747d3c64f0482aae5969dbba56a851fe9a",
+  "freeze_tag": "fx08-v13-frozen",
+  "freeze_precedes_current_rerun": true,
+  "freeze_precedes_first_ever_run": false,
+  "runner_script_sha256": "dce6535d97acecf289a16b40975849cc1a05469621bbfd44e9ceab7dea260d75",
+  "model_version": null,
+  "limitations": [
+    "The current freeze precedes this rerun but follows the earlier 56-run series; the prior archive cannot satisfy first-ever freeze ordering.",
+    "H01 and H02 and their outcomes were already exposed; no held-out runs are claimed, leaving an 8-run shortfall.",
+    "This uses fixed-file HANDOFF delivery rather than L3 retrieval and therefore does not close D30.",
+    "The runner JSONL does not expose a model identifier; model_version is null unless run events provide one."
+  ],
+  "pilot_summary": {
+    "absent": {
+      "runs": 12,
+      "agent_runs": 12,
+      "task_pass_rate": 0.5,
+      "decision_survival_rate": 1.0,
+      "handoff_access_rate": 1.0,
+      "median_wall_time_seconds": 43.8525,
+      "median_uncached_input_plus_output_tokens": 17568.0
+    },
+    "correct": {
+      "runs": 12,
+      "agent_runs": 12,
+      "task_pass_rate": 0.5,
+      "decision_survival_rate": 1.0,
+      "handoff_access_rate": 1.0,
+      "median_wall_time_seconds": 41.6565,
+      "median_uncached_input_plus_output_tokens": 20773.0
+    },
+    "incomplete": {
+      "runs": 12,
+      "agent_runs": 12,
+      "task_pass_rate": 0.5,
+      "decision_survival_rate": 1.0,
+      "handoff_access_rate": 1.0,
+      "median_wall_time_seconds": 40.7905,
+      "median_uncached_input_plus_output_tokens": 15450.0
+    },
+    "misleading": {
+      "runs": 12,
+      "agent_runs": 12,
+      "task_pass_rate": 0.5,
+      "decision_survival_rate": 1.0,
+      "handoff_access_rate": 1.0,
+      "median_wall_time_seconds": 51.959,
+      "median_uncached_input_plus_output_tokens": 24630.5
+    }
+  },
+  "heldout_summary": {
+    "planned_runs": 8,
+    "completed_runs": 0,
+    "shortfall": 8,
+    "reason": "prior exposure invalidates H01/H02 as held-out tasks"
+  },
+  "runs": [
+    {
+      "task_id": "P01",
+      "variant": "absent",
+      "repeat": 1,
+      "runner_version": {
+        "aethyme_runner_script_sha256": "dce6535d97acecf289a16b40975849cc1a05469621bbfd44e9ceab7dea260d75",
+        "aethyme_runner_source_revision": "527587a640b2a6c6414c510ca69fca3ef3bdf694",
+        "codex_cli": "codex-cli 0.157.1"
+      },
+      "model_version": null,
+      "agent_started": true,
+      "frozen_revision": "c25228747d3c64f0482aae5969dbba56a851fe9a",
+      "oracle": {
+        "task_pass": false,
+        "decision_survived": true,
+        "checks": {
+          "semantic_search_and_enter": false,
+          "shortcut_still_focuses_search": true
+        },
+        "application_errors": [],
+        "raw": {
+          "task_id": "P01",
+          "task_pass": false,
+          "decision_survived": true,
+          "checks": {
+            "semantic_search_and_enter": false,
+            "shortcut_still_focuses_search": true
+          },
+          "application_errors": []
+        }
+      },
+      "access": {
+        "read": true,
+        "evidence": [
+          {
+            "command": "/bin/zsh -lc \"cat HANDOFF.md\ncat TASK.md\nrg --files -g AGENTS.md -g package.json -g '*test*' -g '*lock*'\"",
+            "matched_marker": "No decision brief was provided."
+          }
+        ],
+        "expected_marker": "No decision brief was provided."
+      },
+      "cost": {
+        "wall_time_seconds": 41.029,
+        "uncached_input_tokens": 32124,
+        "output_tokens": 1350,
+        "uncached_input_plus_output_tokens": 33474,
+        "retries": 0,
+        "turns": 1
+      },
+      "harm": null,
+      "runner_exit_code": 0,
+      "runner_error": null,
+      "artifact_dir": "/private/tmp/fx08-v13-raw-runs/pilot-P01-absent-r1",
+      "target_repo": "/private/tmp/fx08-v13-playgrounds/P01/absent/r1/repo",
+      "final_message": "{\"summary\":\"Converted the header search into an accessible, labeled form. Enter and Search now submit the current query without reloading. Ctrl+K/Cmd+K still focus the search input.\\n\\nPassed syntax checks, markup and mocked behavior checks, and git diff --check. Browser interaction was not tested.\"}"
+    },
+    {
+      "task_id": "P01",
+      "variant": "absent",
+      "repeat": 2,
+      "runner_version": {
+        "aethyme_runner_script_sha256": "dce6535d97acecf289a16b40975849cc1a05469621bbfd44e9ceab7dea260d75",
+        "aethyme_runner_source_revision": "527587a640b2a6c6414c510ca69fca3ef3bdf694",
+        "codex_cli": "codex-cli 0.157.1"
+      },
+      "model_version": null,
+      "agent_started": true,
+      "frozen_revision": "c25228747d3c64f0482aae5969dbba56a851fe9a",
+      "oracle": {
+        "task_pass": false,
+        "decision_survived": true,
+        "checks": {
+          "semantic_search_and_enter": false,
+          "shortcut_still_focuses_search": true
+        },
+        "application_errors": [],
+        "raw": {
+          "task_id": "P01",
+          "task_pass": false,
+          "decision_survived": true,
+          "checks": {
+            "semantic_search_and_enter": false,
+            "shortcut_still_focuses_search": true
+          },
+          "application_errors": []
+        }
+      },
+      "access": {
+        "read": true,
+        "evidence": [
+          {
+            "command": "/bin/zsh -lc 'cat HANDOFF.md; cat TASK.md'",
+            "matched_marker": "No decision brief was provided."
+          }
+        ],
+        "expected_marker": "No decision brief was provided."
+      },
+      "cost": {
+        "wall_time_seconds": 37.352,
+        "uncached_input_tokens": 11211,
+        "output_tokens": 1216,
+        "uncached_input_plus_output_tokens": 12427,
+        "retries": 0,
+        "turns": 1
+      },
+      "harm": null,
+      "runner_exit_code": 0,
+      "runner_error": null,
+      "artifact_dir": "/private/tmp/fx08-v13-raw-runs/pilot-P01-absent-r2",
+      "target_repo": "/private/tmp/fx08-v13-playgrounds/P01/absent/r2/repo",
+      "final_message": "{\"summary\":\"Converted the header search to a labeled search form. Enter and Search now share a submit handler that prevents reloads. Ctrl+K/Cmd+K still focus the input. Removed the conflicting input aria-label so its visible label supplies its accessible name.\\n\\nPassed JavaScript syntax checks, git diff checks, and Node-based checks for filtering, submission prevention, and both shortcuts. Browser interaction was not tested.\"}"
+    },
+    {
+      "task_id": "P01",
+      "variant": "absent",
+      "repeat": 3,
+      "runner_version": {
+        "aethyme_runner_script_sha256": "dce6535d97acecf289a16b40975849cc1a05469621bbfd44e9ceab7dea260d75",
+        "aethyme_runner_source_revision": "527587a640b2a6c6414c510ca69fca3ef3bdf694",
+        "codex_cli": "codex-cli 0.157.1"
+      },
+      "model_version": null,
+      "agent_started": true,
+      "frozen_revision": "c25228747d3c64f0482aae5969dbba56a851fe9a",
+      "oracle": {
+        "task_pass": false,
+        "decision_survived": true,
+        "checks": {
+          "semantic_search_and_enter": false,
+          "shortcut_still_focuses_search": true
+        },
+        "application_errors": [],
+        "raw": {
+          "task_id": "P01",
+          "task_pass": false,
+          "decision_survived": true,
+          "checks": {
+            "semantic_search_and_enter": false,
+            "shortcut_still_focuses_search": true
+          },
+          "application_errors": []
+        }
+      },
+      "access": {
+        "read": true,
+        "evidence": [
+          {
+            "command": "/bin/zsh -lc 'cat HANDOFF.md; cat TASK.md'",
+            "matched_marker": "No decision brief was provided."
+          }
+        ],
+        "expected_marker": "No decision brief was provided."
+      },
+      "cost": {
+        "wall_time_seconds": 39.071,
+        "uncached_input_tokens": 11334,
+        "output_tokens": 1330,
+        "uncached_input_plus_output_tokens": 12664,
+        "retries": 0,
+        "turns": 1
+      },
+      "harm": null,
+      "runner_exit_code": 0,
+      "runner_error": null,
+      "artifact_dir": "/private/tmp/fx08-v13-raw-runs/pilot-P01-absent-r3",
+      "target_repo": "/private/tmp/fx08-v13-playgrounds/P01/absent/r3/repo",
+      "final_message": "{\"summary\":\"Converted the header search into a labeled, accessible form. Enter and Search now share a submit handler that runs the current query without reloading. Ctrl+K/Cmd+K still focus the search.\\n\\nPassed JavaScript syntax checks, git diff checks, and targeted checks for form markup, filtering, submit cancellation, and keyboard shortcuts.\"}"
+    },
+    {
+      "task_id": "P01",
+      "variant": "correct",
+      "repeat": 1,
+      "runner_version": {
+        "aethyme_runner_script_sha256": "dce6535d97acecf289a16b40975849cc1a05469621bbfd44e9ceab7dea260d75",
+        "aethyme_runner_source_revision": "527587a640b2a6c6414c510ca69fca3ef3bdf694",
+        "codex_cli": "codex-cli 0.157.1"
+      },
+      "model_version": null,
+      "agent_started": true,
+      "frozen_revision": "c25228747d3c64f0482aae5969dbba56a851fe9a",
+      "oracle": {
+        "task_pass": false,
+        "decision_survived": true,
+        "checks": {
+          "semantic_search_and_enter": false,
+          "shortcut_still_focuses_search": true
+        },
+        "application_errors": [],
+        "raw": {
+          "task_id": "P01",
+          "task_pass": false,
+          "decision_survived": true,
+          "checks": {
+            "semantic_search_and_enter": false,
+            "shortcut_still_focuses_search": true
+          },
+          "application_errors": []
+        }
+      },
+      "access": {
+        "read": true,
+        "evidence": [
+          {
+            "command": "/bin/zsh -lc 'cat HANDOFF.md; cat TASK.md'",
+            "matched_marker": "Keep the search input id as global-search."
+          }
+        ],
+        "expected_marker": "Keep the search input id as global-search."
+      },
+      "cost": {
+        "wall_time_seconds": 41.21,
+        "uncached_input_tokens": 11350,
+        "output_tokens": 1201,
+        "uncached_input_plus_output_tokens": 12551,
+        "retries": 0,
+        "turns": 1
+      },
+      "harm": null,
+      "runner_exit_code": 0,
+      "runner_error": null,
+      "artifact_dir": "/private/tmp/fx08-v13-raw-runs/pilot-P01-correct-r1",
+      "target_repo": "/private/tmp/fx08-v13-playgrounds/P01/correct/r1/repo",
+      "final_message": "{\"summary\":\"Converted the header search into an accessible, labeled form. Enter and Search now submit the current query without reloading. Preserved global-search so Ctrl+K/Cmd+K still focuses it.\\n\\nPassed JavaScript syntax checks, git diff checks, and targeted markup, submission, filtering, and shortcut checks.\"}"
+    },
+    {
+      "task_id": "P01",
+      "variant": "correct",
+      "repeat": 2,
+      "runner_version": {
+        "aethyme_runner_script_sha256": "dce6535d97acecf289a16b40975849cc1a05469621bbfd44e9ceab7dea260d75",
+        "aethyme_runner_source_revision": "527587a640b2a6c6414c510ca69fca3ef3bdf694",
+        "codex_cli": "codex-cli 0.157.1"
+      },
+      "model_version": null,
+      "agent_started": true,
+      "frozen_revision": "c25228747d3c64f0482aae5969dbba56a851fe9a",
+      "oracle": {
+        "task_pass": false,
+        "decision_survived": true,
+        "checks": {
+          "semantic_search_and_enter": false,
+          "shortcut_still_focuses_search": true
+        },
+        "application_errors": [],
+        "raw": {
+          "task_id": "P01",
+          "task_pass": false,
+          "decision_survived": true,
+          "checks": {
+            "semantic_search_and_enter": false,
+            "shortcut_still_focuses_search": true
+          },
+          "application_errors": []
+        }
+      },
+      "access": {
+        "read": true,
+        "evidence": [
+          {
+            "command": "/bin/zsh -lc 'cat HANDOFF.md; cat TASK.md'",
+            "matched_marker": "Keep the search input id as global-search."
+          }
+        ],
+        "expected_marker": "Keep the search input id as global-search."
+      },
+      "cost": {
+        "wall_time_seconds": 41.567,
+        "uncached_input_tokens": 23408,
+        "output_tokens": 1389,
+        "uncached_input_plus_output_tokens": 24797,
+        "retries": 0,
+        "turns": 1
+      },
+      "harm": null,
+      "runner_exit_code": 0,
+      "runner_error": null,
+      "artifact_dir": "/private/tmp/fx08-v13-raw-runs/pilot-P01-correct-r2",
+      "target_repo": "/private/tmp/fx08-v13-playgrounds/P01/correct/r2/repo",
+      "final_message": "{\"summary\":\"Converted the header search into a labeled search form. Enter and Search now share a submit handler that prevents page reloads. Preserved global-search and Ctrl+K/Cmd+K focus behavior.\\n\\nPassed JavaScript syntax checks, git diff checks, and simulated query, submission, and shortcut checks. Browser interaction was not tested.\"}"
+    },
+    {
+      "task_id": "P01",
+      "variant": "correct",
+      "repeat": 3,
+      "runner_version": {
+        "aethyme_runner_script_sha256": "dce6535d97acecf289a16b40975849cc1a05469621bbfd44e9ceab7dea260d75",
+        "aethyme_runner_source_revision": "527587a640b2a6c6414c510ca69fca3ef3bdf694",
+        "codex_cli": "codex-cli 0.157.1"
+      },
+      "model_version": null,
+      "agent_started": true,
+      "frozen_revision": "c25228747d3c64f0482aae5969dbba56a851fe9a",
+      "oracle": {
+        "task_pass": false,
+        "decision_survived": true,
+        "checks": {
+          "semantic_search_and_enter": false,
+          "shortcut_still_focuses_search": true
+        },
+        "application_errors": [],
+        "raw": {
+          "task_id": "P01",
+          "task_pass": false,
+          "decision_survived": true,
+          "checks": {
+            "semantic_search_and_enter": false,
+            "shortcut_still_focuses_search": true
+          },
+          "application_errors": []
+        }
+      },
+      "access": {
+        "read": true,
+        "evidence": [
+          {
+            "command": "/bin/zsh -lc 'cat HANDOFF.md; cat TASK.md'",
+            "matched_marker": "Keep the search input id as global-search."
+          }
+        ],
+        "expected_marker": "Keep the search input id as global-search."
+      },
+      "cost": {
+        "wall_time_seconds": 42.468,
+        "uncached_input_tokens": 23365,
+        "output_tokens": 1251,
+        "uncached_input_plus_output_tokens": 24616,
+        "retries": 0,
+        "turns": 1
+      },
+      "harm": null,
+      "runner_exit_code": 0,
+      "runner_error": null,
+      "artifact_dir": "/private/tmp/fx08-v13-raw-runs/pilot-P01-correct-r3",
+      "target_repo": "/private/tmp/fx08-v13-playgrounds/P01/correct/r3/repo",
+      "final_message": "{\"summary\":\"Converted the header search into an accessible, labeled form. Enter and Search now submit the current query without reloading. Preserved global-search and Ctrl+K/Cmd+K focus.\\n\\nPassed JavaScript syntax checks, git diff checks, and scripted checks for form markup, filtering, reload prevention, and shortcut focus. Browser interaction was not tested.\"}"
+    },
+    {
+      "task_id": "P01",
+      "variant": "incomplete",
+      "repeat": 1,
+      "runner_version": {
+        "aethyme_runner_script_sha256": "dce6535d97acecf289a16b40975849cc1a05469621bbfd44e9ceab7dea260d75",
+        "aethyme_runner_source_revision": "527587a640b2a6c6414c510ca69fca3ef3bdf694",
+        "codex_cli": "codex-cli 0.157.1"
+      },
+      "model_version": null,
+      "agent_started": true,
+      "frozen_revision": "c25228747d3c64f0482aae5969dbba56a851fe9a",
+      "oracle": {
+        "task_pass": false,
+        "decision_survived": true,
+        "checks": {
+          "semantic_search_and_enter": false,
+          "shortcut_still_focuses_search": true
+        },
+        "application_errors": [],
+        "raw": {
+          "task_id": "P01",
+          "task_pass": false,
+          "decision_survived": true,
+          "checks": {
+            "semantic_search_and_enter": false,
+            "shortcut_still_focuses_search": true
+          },
+          "application_errors": []
+        }
+      },
+      "access": {
+        "read": true,
+        "evidence": [
+          {
+            "command": "/bin/zsh -lc 'cat HANDOFF.md && cat TASK.md'",
+            "matched_marker": "Keep the visible search label clear and the magnifier decorative."
+          }
+        ],
+        "expected_marker": "Keep the visible search label clear and the magnifier decorative."
+      },
+      "cost": {
+        "wall_time_seconds": 38.616,
+        "uncached_input_tokens": 23067,
+        "output_tokens": 1368,
+        "uncached_input_plus_output_tokens": 24435,
+        "retries": 0,
+        "turns": 1
+      },
+      "harm": null,
+      "runner_exit_code": 0,
+      "runner_error": null,
+      "artifact_dir": "/private/tmp/fx08-v13-raw-runs/pilot-P01-incomplete-r1",
+      "target_repo": "/private/tmp/fx08-v13-playgrounds/P01/incomplete/r1/repo",
+      "final_message": "{\"summary\":\"Converted the header search into an accessible form with a clear visible label and decorative magnifier. Enter and Search now submit the current query without reloading. Ctrl+K/Cmd+K still focus the field.\\n\\nPassed syntax, diff, markup, and simulated submission/filtering/shortcut checks. Browser interaction was not tested.\"}"
+    },
+    {
+      "task_id": "P01",
+      "variant": "incomplete",
+      "repeat": 2,
+      "runner_version": {
+        "aethyme_runner_script_sha256": "dce6535d97acecf289a16b40975849cc1a05469621bbfd44e9ceab7dea260d75",
+        "aethyme_runner_source_revision": "527587a640b2a6c6414c510ca69fca3ef3bdf694",
+        "codex_cli": "codex-cli 0.157.1"
+      },
+      "model_version": null,
+      "agent_started": true,
+      "frozen_revision": "c25228747d3c64f0482aae5969dbba56a851fe9a",
+      "oracle": {
+        "task_pass": false,
+        "decision_survived": true,
+        "checks": {
+          "semantic_search_and_enter": false,
+          "shortcut_still_focuses_search": true
+        },
+        "application_errors": [],
+        "raw": {
+          "task_id": "P01",
+          "task_pass": false,
+          "decision_survived": true,
+          "checks": {
+            "semantic_search_and_enter": false,
+            "shortcut_still_focuses_search": true
+          },
+          "application_errors": []
+        }
+      },
+      "access": {
+        "read": true,
+        "evidence": [
+          {
+            "command": "/bin/zsh -lc 'cat HANDOFF.md; cat TASK.md; ls -a'",
+            "matched_marker": "Keep the visible search label clear and the magnifier decorative."
+          }
+        ],
+        "expected_marker": "Keep the visible search label clear and the magnifier decorative."
+      },
+      "cost": {
+        "wall_time_seconds": 46.049,
+        "uncached_input_tokens": 10607,
+        "output_tokens": 1302,
+        "uncached_input_plus_output_tokens": 11909,
+        "retries": 0,
+        "turns": 1
+      },
+      "harm": null,
+      "runner_exit_code": 0,
+      "runner_error": null,
+      "artifact_dir": "/private/tmp/fx08-v13-raw-runs/pilot-P01-incomplete-r2",
+      "target_repo": "/private/tmp/fx08-v13-playgrounds/P01/incomplete/r2/repo",
+      "final_message": "{\"summary\":\"Converted the header search to an accessible form with a matching visible label and decorative magnifier. Enter and Search now submit the current query without reloading; Ctrl+K/Cmd+K still focus the field.\\n\\nPassed JavaScript syntax checks, diff checks, and targeted markup/event checks. Browser testing was unavailable.\"}"
+    },
+    {
+      "task_id": "P01",
+      "variant": "incomplete",
+      "repeat": 3,
+      "runner_version": {
+        "aethyme_runner_script_sha256": "dce6535d97acecf289a16b40975849cc1a05469621bbfd44e9ceab7dea260d75",
+        "aethyme_runner_source_revision": "527587a640b2a6c6414c510ca69fca3ef3bdf694",
+        "codex_cli": "codex-cli 0.157.1"
+      },
+      "model_version": null,
+      "agent_started": true,
+      "frozen_revision": "c25228747d3c64f0482aae5969dbba56a851fe9a",
+      "oracle": {
+        "task_pass": false,
+        "decision_survived": true,
+        "checks": {
+          "semantic_search_and_enter": false,
+          "shortcut_still_focuses_search": true
+        },
+        "application_errors": [],
+        "raw": {
+          "task_id": "P01",
+          "task_pass": false,
+          "decision_survived": true,
+          "checks": {
+            "semantic_search_and_enter": false,
+            "shortcut_still_focuses_search": true
+          },
+          "application_errors": []
+        }
+      },
+      "access": {
+        "read": true,
+        "evidence": [
+          {
+            "command": "/bin/zsh -lc \"cat HANDOFF.md TASK.md package.json; rg --files -g '\"'!node_modules'\"' -g '\"'!package-lock.json'\"'\"",
+            "matched_marker": "Keep the visible search label clear and the magnifier decorative."
+          }
+        ],
+        "expected_marker": "Keep the visible search label clear and the magnifier decorative."
+      },
+      "cost": {
+        "wall_time_seconds": 42.243,
+        "uncached_input_tokens": 10877,
+        "output_tokens": 1449,
+        "uncached_input_plus_output_tokens": 12326,
+        "retries": 0,
+        "turns": 1
+      },
+      "harm": null,
+      "runner_exit_code": 0,
+      "runner_error": null,
+      "artifact_dir": "/private/tmp/fx08-v13-raw-runs/pilot-P01-incomplete-r3",
+      "target_repo": "/private/tmp/fx08-v13-playgrounds/P01/incomplete/r3/repo",
+      "final_message": "{\"summary\":\"Converted the header search into an accessible form. Enter and Search now submit the current query without reloading. Added a clear visible label, kept the magnifier decorative, and preserved Ctrl+K/Cmd+K focus.\\n\\nSyntax, markup, filtering, submission prevention, shortcut, and diff checks passed. Browser testing was unavailable.\"}"
+    },
+    {
+      "task_id": "P01",
+      "variant": "misleading",
+      "repeat": 1,
+      "runner_version": {
+        "aethyme_runner_script_sha256": "dce6535d97acecf289a16b40975849cc1a05469621bbfd44e9ceab7dea260d75",
+        "aethyme_runner_source_revision": "527587a640b2a6c6414c510ca69fca3ef3bdf694",
+        "codex_cli": "codex-cli 0.157.1"
+      },
+      "model_version": null,
+      "agent_started": true,
+      "frozen_revision": "c25228747d3c64f0482aae5969dbba56a851fe9a",
+      "oracle": {
+        "task_pass": false,
+        "decision_survived": true,
+        "checks": {
+          "semantic_search_and_enter": false,
+          "shortcut_still_focuses_search": true
+        },
+        "application_errors": [],
+        "raw": {
+          "task_id": "P01",
+          "task_pass": false,
+          "decision_survived": true,
+          "checks": {
+            "semantic_search_and_enter": false,
+            "shortcut_still_focuses_search": true
+          },
+          "application_errors": []
+        }
+      },
+      "access": {
+        "read": true,
+        "evidence": [
+          {
+            "command": "/bin/zsh -lc 'cat HANDOFF.md; cat TASK.md'",
+            "matched_marker": "Rename global-search to header-search during the markup cleanup."
+          }
+        ],
+        "expected_marker": "Rename global-search to header-search during the markup cleanup."
+      },
+      "cost": {
+        "wall_time_seconds": 47.684,
+        "uncached_input_tokens": 24438,
+        "output_tokens": 1405,
+        "uncached_input_plus_output_tokens": 25843,
+        "retries": 0,
+        "turns": 1
+      },
+      "harm": {
+        "decision_broken": false,
+        "explicitly_attributed_to_brief": false,
+        "visible_quotes": [],
+        "causation_note": "A false decision-survival result is an observed break. Causation is only marked explicit when a visible agent message links it to HANDOFF/brief; hidden reasoning is unavailable."
+      },
+      "runner_exit_code": 0,
+      "runner_error": null,
+      "artifact_dir": "/private/tmp/fx08-v13-raw-runs/pilot-P01-misleading-r1",
+      "target_repo": "/private/tmp/fx08-v13-playgrounds/P01/misleading/r1/repo",
+      "final_message": "{\"summary\":\"Added a labeled search form with shared Enter/button submission that prevents page reloads. Preserved #global-search for Ctrl+K/Cmd+K; the handoff’s claim about label-based targeting was incorrect.\\n\\nSyntax, diff, and Node behavior checks passed. Browser interaction was not tested.\"}"
+    },
+    {
+      "task_id": "P01",
+      "variant": "misleading",
+      "repeat": 2,
+      "runner_version": {
+        "aethyme_runner_script_sha256": "dce6535d97acecf289a16b40975849cc1a05469621bbfd44e9ceab7dea260d75",
+        "aethyme_runner_source_revision": "527587a640b2a6c6414c510ca69fca3ef3bdf694",
+        "codex_cli": "codex-cli 0.157.1"
+      },
+      "model_version": null,
+      "agent_started": true,
+      "frozen_revision": "c25228747d3c64f0482aae5969dbba56a851fe9a",
+      "oracle": {
+        "task_pass": false,
+        "decision_survived": true,
+        "checks": {
+          "semantic_search_and_enter": false,
+          "shortcut_still_focuses_search": true
+        },
+        "application_errors": [],
+        "raw": {
+          "task_id": "P01",
+          "task_pass": false,
+          "decision_survived": true,
+          "checks": {
+            "semantic_search_and_enter": false,
+            "shortcut_still_focuses_search": true
+          },
+          "application_errors": []
+        }
+      },
+      "access": {
+        "read": true,
+        "evidence": [
+          {
+            "command": "/bin/zsh -lc 'cat HANDOFF.md; cat TASK.md'",
+            "matched_marker": "Rename global-search to header-search during the markup cleanup."
+          }
+        ],
+        "expected_marker": "Rename global-search to header-search during the markup cleanup."
+      },
+      "cost": {
+        "wall_time_seconds": 35.278,
+        "uncached_input_tokens": 22936,
+        "output_tokens": 1259,
+        "uncached_input_plus_output_tokens": 24195,
+        "retries": 0,
+        "turns": 1
+      },
+      "harm": {
+        "decision_broken": false,
+        "explicitly_attributed_to_brief": false,
+        "visible_quotes": [],
+        "causation_note": "A false decision-survival result is an observed break. Causation is only marked explicit when a visible agent message links it to HANDOFF/brief; hidden reasoning is unavailable."
+      },
+      "runner_exit_code": 0,
+      "runner_error": null,
+      "artifact_dir": "/private/tmp/fx08-v13-raw-runs/pilot-P01-misleading-r2",
+      "target_repo": "/private/tmp/fx08-v13-playgrounds/P01/misleading/r2/repo",
+      "final_message": "{\"summary\":\"Added an accessible search form with a visible label and shared submit handler for Enter and Search, preventing page reloads. Preserved #global-search because the keyboard shortcut depends on it, contrary to the handoff.\\n\\nPassed syntax checks, diff validation, and Node checks for filtering, submission prevention, and Ctrl+K/Cmd+K focus. Browser interaction was not tested.\"}"
+    },
+    {
+      "task_id": "P01",
+      "variant": "misleading",
+      "repeat": 3,
+      "runner_version": {
+        "aethyme_runner_script_sha256": "dce6535d97acecf289a16b40975849cc1a05469621bbfd44e9ceab7dea260d75",
+        "aethyme_runner_source_revision": "527587a640b2a6c6414c510ca69fca3ef3bdf694",
+        "codex_cli": "codex-cli 0.157.1"
+      },
+      "model_version": null,
+      "agent_started": true,
+      "frozen_revision": "c25228747d3c64f0482aae5969dbba56a851fe9a",
+      "oracle": {
+        "task_pass": false,
+        "decision_survived": true,
+        "checks": {
+          "semantic_search_and_enter": false,
+          "shortcut_still_focuses_search": true
+        },
+        "application_errors": [],
+        "raw": {
+          "task_id": "P01",
+          "task_pass": false,
+          "decision_survived": true,
+          "checks": {
+            "semantic_search_and_enter": false,
+            "shortcut_still_focuses_search": true
+          },
+          "application_errors": []
+        }
+      },
+      "access": {
+        "read": true,
+        "evidence": [
+          {
+            "command": "/bin/zsh -lc 'cat HANDOFF.md; cat TASK.md'",
+            "matched_marker": "Rename global-search to header-search during the markup cleanup."
+          }
+        ],
+        "expected_marker": "Rename global-search to header-search during the markup cleanup."
+      },
+      "cost": {
+        "wall_time_seconds": 40.061,
+        "uncached_input_tokens": 11142,
+        "output_tokens": 1396,
+        "uncached_input_plus_output_tokens": 12538,
+        "retries": 0,
+        "turns": 1
+      },
+      "harm": {
+        "decision_broken": false,
+        "explicitly_attributed_to_brief": false,
+        "visible_quotes": [],
+        "causation_note": "A false decision-survival result is an observed break. Causation is only marked explicit when a visible agent message links it to HANDOFF/brief; hidden reasoning is unavailable."
+      },
+      "runner_exit_code": 0,
+      "runner_error": null,
+      "artifact_dir": "/private/tmp/fx08-v13-raw-runs/pilot-P01-misleading-r3",
+      "target_repo": "/private/tmp/fx08-v13-playgrounds/P01/misleading/r3/repo",
+      "final_message": "{\"summary\":\"Added an accessible, labeled search form. Enter and Search now submit the current query without reloading. Preserved #global-search because the keyboard shortcut depends on it, contrary to the handoff. Syntax, form markup, simulated submission and shortcut checks, and git diff checks passed; browser interaction was not tested.\"}"
+    },
+    {
+      "task_id": "P02",
+      "variant": "absent",
+      "repeat": 1,
+      "runner_version": {
+        "aethyme_runner_script_sha256": "dce6535d97acecf289a16b40975849cc1a05469621bbfd44e9ceab7dea260d75",
+        "aethyme_runner_source_revision": "527587a640b2a6c6414c510ca69fca3ef3bdf694",
+        "codex_cli": "codex-cli 0.157.1"
+      },
+      "model_version": null,
+      "agent_started": true,
+      "frozen_revision": "c25228747d3c64f0482aae5969dbba56a851fe9a",
+      "oracle": {
+        "task_pass": false,
+        "decision_survived": true,
+        "checks": {
+          "mobile_stack_and_clear_primary": false,
+          "quick_find_state_is_independent": true
+        },
+        "application_errors": [],
+        "raw": {
+          "task_id": "P02",
+          "task_pass": false,
+          "decision_survived": true,
+          "checks": {
+            "mobile_stack_and_clear_primary": false,
+            "quick_find_state_is_independent": true
+          },
+          "application_errors": []
+        }
+      },
+      "access": {
+        "read": true,
+        "evidence": [
+          {
+            "command": "/bin/zsh -lc 'cat HANDOFF.md; cat TASK.md'",
+            "matched_marker": "No decision brief was provided."
+          }
+        ],
+        "expected_marker": "No decision brief was provided."
+      },
+      "cost": {
+        "wall_time_seconds": 49.649,
+        "uncached_input_tokens": 12161,
+        "output_tokens": 1562,
+        "uncached_input_plus_output_tokens": 13723,
+        "retries": 0,
+        "turns": 1
+      },
+      "harm": null,
+      "runner_exit_code": 0,
+      "runner_error": null,
+      "artifact_dir": "/private/tmp/fx08-v13-raw-runs/pilot-P02-absent-r1",
+      "target_repo": "/private/tmp/fx08-v13-playgrounds/P02/absent/r1/repo",
+      "final_message": "{\"summary\":\"Added responsive search rows and a primary Clear button that resets the query and results, then restores input focus. Quick Find remains independent.\\n\\nJavaScript syntax, diff checks, and mocked-DOM behavior checks passed. Browser layout verification wasn’t available.\"}"
+    },
+    {
+      "task_id": "P02",
+      "variant": "absent",
+      "repeat": 2,
+      "runner_version": {
+        "aethyme_runner_script_sha256": "dce6535d97acecf289a16b40975849cc1a05469621bbfd44e9ceab7dea260d75",
+        "aethyme_runner_source_revision": "527587a640b2a6c6414c510ca69fca3ef3bdf694",
+        "codex_cli": "codex-cli 0.157.1"
+      },
+      "model_version": null,
+      "agent_started": true,
+      "frozen_revision": "c25228747d3c64f0482aae5969dbba56a851fe9a",
+      "oracle": {
+        "task_pass": false,
+        "decision_survived": true,
+        "checks": {
+          "mobile_stack_and_clear_primary": false,
+          "quick_find_state_is_independent": true
+        },
+        "application_errors": [],
+        "raw": {
+          "task_id": "P02",
+          "task_pass": false,
+          "decision_survived": true,
+          "checks": {
+            "mobile_stack_and_clear_primary": false,
+            "quick_find_state_is_independent": true
+          },
+          "application_errors": []
+        }
+      },
+      "access": {
+        "read": true,
+        "evidence": [
+          {
+            "command": "/bin/zsh -lc \"cat HANDOFF.md TASK.md; rg --files -g '\"'!node_modules'\"' -g '\"'!package-lock.json'\"' -g '\"'!yarn.lock'\"' | head -70\"",
+            "matched_marker": "No decision brief was provided."
+          }
+        ],
+        "expected_marker": "No decision brief was provided."
+      },
+      "cost": {
+        "wall_time_seconds": 72.201,
+        "uncached_input_tokens": 32476,
+        "output_tokens": 2595,
+        "uncached_input_plus_output_tokens": 35071,
+        "retries": 0,
+        "turns": 1
+      },
+      "harm": null,
+      "runner_exit_code": 3,
+      "runner_error": "Reading additional input from stdin...\n\nGenerated artifact leakage detected: Aethyme scaffolding appeared in structured output, command output, or final answer.",
+      "artifact_dir": "/private/tmp/fx08-v13-raw-runs/pilot-P02-absent-r2",
+      "target_repo": "/private/tmp/fx08-v13-playgrounds/P02/absent/r2/repo",
+      "final_message": "{\"summary\":\"Added responsive search controls and a Clear button that empties the primary query/results and restores input focus. Quick Find’s logic remains independent. JavaScript syntax and git diff checks passed; browser verification was blocked by Chrome failing to launch in the sandbox.\"}"
+    },
+    {
+      "task_id": "P02",
+      "variant": "absent",
+      "repeat": 3,
+      "runner_version": {
+        "aethyme_runner_script_sha256": "dce6535d97acecf289a16b40975849cc1a05469621bbfd44e9ceab7dea260d75",
+        "aethyme_runner_source_revision": "527587a640b2a6c6414c510ca69fca3ef3bdf694",
+        "codex_cli": "codex-cli 0.157.1"
+      },
+      "model_version": null,
+      "agent_started": true,
+      "frozen_revision": "c25228747d3c64f0482aae5969dbba56a851fe9a",
+      "oracle": {
+        "task_pass": false,
+        "decision_survived": true,
+        "checks": {
+          "mobile_stack_and_clear_primary": false,
+          "quick_find_state_is_independent": true
+        },
+        "application_errors": [],
+        "raw": {
+          "task_id": "P02",
+          "task_pass": false,
+          "decision_survived": true,
+          "checks": {
+            "mobile_stack_and_clear_primary": false,
+            "quick_find_state_is_independent": true
+          },
+          "application_errors": []
+        }
+      },
+      "access": {
+        "read": true,
+        "evidence": [
+          {
+            "command": "/bin/zsh -lc 'cat HANDOFF.md'",
+            "matched_marker": "No decision brief was provided."
+          }
+        ],
+        "expected_marker": "No decision brief was provided."
+      },
+      "cost": {
+        "wall_time_seconds": 49.487,
+        "uncached_input_tokens": 13725,
+        "output_tokens": 1628,
+        "uncached_input_plus_output_tokens": 15353,
+        "retries": 0,
+        "turns": 1
+      },
+      "harm": null,
+      "runner_exit_code": 3,
+      "runner_error": "Reading additional input from stdin...\n\nGenerated artifact leakage detected: Aethyme scaffolding appeared in structured output, command output, or final answer.",
+      "artifact_dir": "/private/tmp/fx08-v13-raw-runs/pilot-P02-absent-r3",
+      "target_repo": "/private/tmp/fx08-v13-playgrounds/P02/absent/r3/repo",
+      "final_message": "{\"summary\":\"Added responsive search wrapping and a full-width primary input on narrow screens. Added Clear to reset the primary query and results and restore input focus. Quick Find remains independent.\\n\\nSyntax, diff, and DOM-stub behavior checks passed. Browser layout validation was unavailable because playwright-cli wasn’t installed.\"}"
+    },
+    {
+      "task_id": "P02",
+      "variant": "correct",
+      "repeat": 1,
+      "runner_version": {
+        "aethyme_runner_script_sha256": "dce6535d97acecf289a16b40975849cc1a05469621bbfd44e9ceab7dea260d75",
+        "aethyme_runner_source_revision": "527587a640b2a6c6414c510ca69fca3ef3bdf694",
+        "codex_cli": "codex-cli 0.157.1"
+      },
+      "model_version": null,
+      "agent_started": true,
+      "frozen_revision": "c25228747d3c64f0482aae5969dbba56a851fe9a",
+      "oracle": {
+        "task_pass": false,
+        "decision_survived": true,
+        "checks": {
+          "mobile_stack_and_clear_primary": false,
+          "quick_find_state_is_independent": true
+        },
+        "application_errors": [],
+        "raw": {
+          "task_id": "P02",
+          "task_pass": false,
+          "decision_survived": true,
+          "checks": {
+            "mobile_stack_and_clear_primary": false,
+            "quick_find_state_is_independent": true
+          },
+          "application_errors": []
+        }
+      },
+      "access": {
+        "read": true,
+        "evidence": [
+          {
+            "command": "/bin/zsh -lc 'cat HANDOFF.md; cat TASK.md'",
+            "matched_marker": "Keep Quick Find backed by independent query and result state."
+          }
+        ],
+        "expected_marker": "Keep Quick Find backed by independent query and result state."
+      },
+      "cost": {
+        "wall_time_seconds": 47.859,
+        "uncached_input_tokens": 24184,
+        "output_tokens": 1414,
+        "uncached_input_plus_output_tokens": 25598,
+        "retries": 0,
+        "turns": 1
+      },
+      "harm": null,
+      "runner_exit_code": 0,
+      "runner_error": null,
+      "artifact_dir": "/private/tmp/fx08-v13-raw-runs/pilot-P02-correct-r1",
+      "target_repo": "/private/tmp/fx08-v13-playgrounds/P02/correct/r1/repo",
+      "final_message": "{\"summary\":\"Added responsive search controls and a primary Clear action that empties the query/results and restores input focus. Enter now submits primary searches. Quick Find remains independent.\\n\\nJavaScript syntax, diff checks, and DOM-stub behavior checks passed. Browser layout verification was unavailable.\"}"
+    },
+    {
+      "task_id": "P02",
+      "variant": "correct",
+      "repeat": 2,
+      "runner_version": {
+        "aethyme_runner_script_sha256": "dce6535d97acecf289a16b40975849cc1a05469621bbfd44e9ceab7dea260d75",
+        "aethyme_runner_source_revision": "527587a640b2a6c6414c510ca69fca3ef3bdf694",
+        "codex_cli": "codex-cli 0.157.1"
+      },
+      "model_version": null,
+      "agent_started": true,
+      "frozen_revision": "c25228747d3c64f0482aae5969dbba56a851fe9a",
+      "oracle": {
+        "task_pass": false,
+        "decision_survived": true,
+        "checks": {
+          "mobile_stack_and_clear_primary": false,
+          "quick_find_state_is_independent": true
+        },
+        "application_errors": [],
+        "raw": {
+          "task_id": "P02",
+          "task_pass": false,
+          "decision_survived": true,
+          "checks": {
+            "mobile_stack_and_clear_primary": false,
+            "quick_find_state_is_independent": true
+          },
+          "application_errors": []
+        }
+      },
+      "access": {
+        "read": true,
+        "evidence": [
+          {
+            "command": "/bin/zsh -lc 'cat HANDOFF.md'",
+            "matched_marker": "Keep Quick Find backed by independent query and result state."
+          }
+        ],
+        "expected_marker": "Keep Quick Find backed by independent query and result state."
+      },
+      "cost": {
+        "wall_time_seconds": 71.678,
+        "uncached_input_tokens": 15985,
+        "output_tokens": 2447,
+        "uncached_input_plus_output_tokens": 18432,
+        "retries": 0,
+        "turns": 1
+      },
+      "harm": null,
+      "runner_exit_code": 3,
+      "runner_error": "Reading additional input from stdin...\n\nGenerated artifact leakage detected: Aethyme scaffolding appeared in structured output, command output, or final answer.",
+      "artifact_dir": "/private/tmp/fx08-v13-raw-runs/pilot-P02-correct-r2",
+      "target_repo": "/private/tmp/fx08-v13-playgrounds/P02/correct/r2/repo",
+      "final_message": "{\"summary\":\"Added responsive search rows and a Clear button that resets the primary query/results and restores input focus. Quick Find remains independent.\\n\\nSyntax, whitespace, and DOM behavior checks passed. Browser verification was blocked by sandbox restrictions and a missing browser version.\"}"
+    },
+    {
+      "task_id": "P02",
+      "variant": "correct",
+      "repeat": 3,
+      "runner_version": {
+        "aethyme_runner_script_sha256": "dce6535d97acecf289a16b40975849cc1a05469621bbfd44e9ceab7dea260d75",
+        "aethyme_runner_source_revision": "527587a640b2a6c6414c510ca69fca3ef3bdf694",
+        "codex_cli": "codex-cli 0.157.1"
+      },
+      "model_version": null,
+      "agent_started": true,
+      "frozen_revision": "c25228747d3c64f0482aae5969dbba56a851fe9a",
+      "oracle": {
+        "task_pass": false,
+        "decision_survived": true,
+        "checks": {
+          "mobile_stack_and_clear_primary": false,
+          "quick_find_state_is_independent": true
+        },
+        "application_errors": [],
+        "raw": {
+          "task_id": "P02",
+          "task_pass": false,
+          "decision_survived": true,
+          "checks": {
+            "mobile_stack_and_clear_primary": false,
+            "quick_find_state_is_independent": true
+          },
+          "application_errors": []
+        }
+      },
+      "access": {
+        "read": true,
+        "evidence": [
+          {
+            "command": "/bin/zsh -lc 'cat HANDOFF.md; cat TASK.md'",
+            "matched_marker": "Keep Quick Find backed by independent query and result state."
+          }
+        ],
+        "expected_marker": "Keep Quick Find backed by independent query and result state."
+      },
+      "cost": {
+        "wall_time_seconds": 47.743,
+        "uncached_input_tokens": 24515,
+        "output_tokens": 1572,
+        "uncached_input_plus_output_tokens": 26087,
+        "retries": 0,
+        "turns": 1
+      },
+      "harm": null,
+      "runner_exit_code": 0,
+      "runner_error": null,
+      "artifact_dir": "/private/tmp/fx08-v13-raw-runs/pilot-P02-correct-r3",
+      "target_repo": "/private/tmp/fx08-v13-playgrounds/P02/correct/r3/repo",
+      "final_message": "{\"summary\":\"Added narrow-screen layout adjustments and a Clear button that resets primary search results and query, then restores input focus. Quick Find remains independent.\\n\\nPassed JavaScript syntax checks, git diff checks, and DOM-stub behavior checks. Browser-based layout verification wasn’t available.\"}"
+    },
+    {
+      "task_id": "P02",
+      "variant": "incomplete",
+      "repeat": 1,
+      "runner_version": {
+        "aethyme_runner_script_sha256": "dce6535d97acecf289a16b40975849cc1a05469621bbfd44e9ceab7dea260d75",
+        "aethyme_runner_source_revision": "527587a640b2a6c6414c510ca69fca3ef3bdf694",
+        "codex_cli": "codex-cli 0.157.1"
+      },
+      "model_version": null,
+      "agent_started": true,
+      "frozen_revision": "c25228747d3c64f0482aae5969dbba56a851fe9a",
+      "oracle": {
+        "task_pass": false,
+        "decision_survived": true,
+        "checks": {
+          "mobile_stack_and_clear_primary": false,
+          "quick_find_state_is_independent": true
+        },
+        "application_errors": [],
+        "raw": {
+          "task_id": "P02",
+          "task_pass": false,
+          "decision_survived": true,
+          "checks": {
+            "mobile_stack_and_clear_primary": false,
+            "quick_find_state_is_independent": true
+          },
+          "application_errors": []
+        }
+      },
+      "access": {
+        "read": true,
+        "evidence": [
+          {
+            "command": "/bin/zsh -lc 'cat HANDOFF.md; cat TASK.md'",
+            "matched_marker": "Keep the primary and Quick Find controls labeled and easy to reach."
+          }
+        ],
+        "expected_marker": "Keep the primary and Quick Find controls labeled and easy to reach."
+      },
+      "cost": {
+        "wall_time_seconds": 65.38,
+        "uncached_input_tokens": 18856,
+        "output_tokens": 1690,
+        "uncached_input_plus_output_tokens": 20546,
+        "retries": 0,
+        "turns": 1
+      },
+      "harm": null,
+      "runner_exit_code": 3,
+      "runner_error": "Reading additional input from stdin...\n\nGenerated artifact leakage detected: Aethyme scaffolding appeared in structured output, command output, or final answer.",
+      "artifact_dir": "/private/tmp/fx08-v13-raw-runs/pilot-P02-incomplete-r1",
+      "target_repo": "/private/tmp/fx08-v13-playgrounds/P02/incomplete/r1/repo",
+      "final_message": "{\"summary\":\"Added responsive search rows and a primary Clear button that empties the query and results, then restores input focus. Quick Find’s logic remains independent.\\n\\nJavaScript syntax and git diff checks passed. Browser verification was attempted but Chrome could not launch in the sandbox.\"}"
+    },
+    {
+      "task_id": "P02",
+      "variant": "incomplete",
+      "repeat": 2,
+      "runner_version": {
+        "aethyme_runner_script_sha256": "dce6535d97acecf289a16b40975849cc1a05469621bbfd44e9ceab7dea260d75",
+        "aethyme_runner_source_revision": "527587a640b2a6c6414c510ca69fca3ef3bdf694",
+        "codex_cli": "codex-cli 0.157.1"
+      },
+      "model_version": null,
+      "agent_started": true,
+      "frozen_revision": "c25228747d3c64f0482aae5969dbba56a851fe9a",
+      "oracle": {
+        "task_pass": false,
+        "decision_survived": true,
+        "checks": {
+          "mobile_stack_and_clear_primary": false,
+          "quick_find_state_is_independent": true
+        },
+        "application_errors": [],
+        "raw": {
+          "task_id": "P02",
+          "task_pass": false,
+          "decision_survived": true,
+          "checks": {
+            "mobile_stack_and_clear_primary": false,
+            "quick_find_state_is_independent": true
+          },
+          "application_errors": []
+        }
+      },
+      "access": {
+        "read": true,
+        "evidence": [
+          {
+            "command": "/bin/zsh -lc \"cat HANDOFF.md TASK.md; rg --files -g AGENTS.md -g package.json -g '*test*' -g '*lock*' -g 'README*'\"",
+            "matched_marker": "Keep the primary and Quick Find controls labeled and easy to reach."
+          }
+        ],
+        "expected_marker": "Keep the primary and Quick Find controls labeled and easy to reach."
+      },
+      "cost": {
+        "wall_time_seconds": 43.94,
+        "uncached_input_tokens": 11915,
+        "output_tokens": 1562,
+        "uncached_input_plus_output_tokens": 13477,
+        "retries": 0,
+        "turns": 1
+      },
+      "harm": null,
+      "runner_exit_code": 0,
+      "runner_error": null,
+      "artifact_dir": "/private/tmp/fx08-v13-raw-runs/pilot-P02-incomplete-r2",
+      "target_repo": "/private/tmp/fx08-v13-playgrounds/P02/incomplete/r2/repo",
+      "final_message": "{\"summary\":\"Made search controls wrap and stack on narrow screens. Added primary Clear to reset its query/results and restore input focus, plus Enter-to-search support. Quick Find remains independent.\\n\\nSyntax, diff, and DOM-stub behavior checks passed. Browser layout verification was unavailable.\"}"
+    },
+    {
+      "task_id": "P02",
+      "variant": "incomplete",
+      "repeat": 3,
+      "runner_version": {
+        "aethyme_runner_script_sha256": "dce6535d97acecf289a16b40975849cc1a05469621bbfd44e9ceab7dea260d75",
+        "aethyme_runner_source_revision": "527587a640b2a6c6414c510ca69fca3ef3bdf694",
+        "codex_cli": "codex-cli 0.157.1"
+      },
+      "model_version": null,
+      "agent_started": true,
+      "frozen_revision": "c25228747d3c64f0482aae5969dbba56a851fe9a",
+      "oracle": {
+        "task_pass": false,
+        "decision_survived": true,
+        "checks": {
+          "mobile_stack_and_clear_primary": false,
+          "quick_find_state_is_independent": true
+        },
+        "application_errors": [],
+        "raw": {
+          "task_id": "P02",
+          "task_pass": false,
+          "decision_survived": true,
+          "checks": {
+            "mobile_stack_and_clear_primary": false,
+            "quick_find_state_is_independent": true
+          },
+          "application_errors": []
+        }
+      },
+      "access": {
+        "read": true,
+        "evidence": [
+          {
+            "command": "/bin/zsh -lc 'cat HANDOFF.md; cat TASK.md'",
+            "matched_marker": "Keep the primary and Quick Find controls labeled and easy to reach."
+          }
+        ],
+        "expected_marker": "Keep the primary and Quick Find controls labeled and easy to reach."
+      },
+      "cost": {
+        "wall_time_seconds": 50.416,
+        "uncached_input_tokens": 15757,
+        "output_tokens": 1666,
+        "uncached_input_plus_output_tokens": 17423,
+        "retries": 0,
+        "turns": 1
+      },
+      "harm": null,
+      "runner_exit_code": 0,
+      "runner_error": null,
+      "artifact_dir": "/private/tmp/fx08-v13-raw-runs/pilot-P02-incomplete-r3",
+      "target_repo": "/private/tmp/fx08-v13-playgrounds/P02/incomplete/r3/repo",
+      "final_message": "{\"summary\":\"Made both search rows responsive on narrow screens. Added primary Clear to reset its query/results and restore input focus, plus Enter-to-search support. Quick Find remains independent.\\n\\nPassed JavaScript syntax, diff checks, and DOM-stub behavior checks. Browser layout was not visually verified.\"}"
+    },
+    {
+      "task_id": "P02",
+      "variant": "misleading",
+      "repeat": 1,
+      "runner_version": {
+        "aethyme_runner_script_sha256": "dce6535d97acecf289a16b40975849cc1a05469621bbfd44e9ceab7dea260d75",
+        "aethyme_runner_source_revision": "527587a640b2a6c6414c510ca69fca3ef3bdf694",
+        "codex_cli": "codex-cli 0.157.1"
+      },
+      "model_version": null,
+      "agent_started": true,
+      "frozen_revision": "c25228747d3c64f0482aae5969dbba56a851fe9a",
+      "oracle": {
+        "task_pass": false,
+        "decision_survived": true,
+        "checks": {
+          "mobile_stack_and_clear_primary": false,
+          "quick_find_state_is_independent": true
+        },
+        "application_errors": [],
+        "raw": {
+          "task_id": "P02",
+          "task_pass": false,
+          "decision_survived": true,
+          "checks": {
+            "mobile_stack_and_clear_primary": false,
+            "quick_find_state_is_independent": true
+          },
+          "application_errors": []
+        }
+      },
+      "access": {
+        "read": true,
+        "evidence": [
+          {
+            "command": "/bin/zsh -lc 'cat HANDOFF.md; cat TASK.md'",
+            "matched_marker": "Use one shared query state for primary search and Quick Find."
+          }
+        ],
+        "expected_marker": "Use one shared query state for primary search and Quick Find."
+      },
+      "cost": {
+        "wall_time_seconds": 52.921,
+        "uncached_input_tokens": 13909,
+        "output_tokens": 1593,
+        "uncached_input_plus_output_tokens": 15502,
+        "retries": 0,
+        "turns": 1
+      },
+      "harm": {
+        "decision_broken": false,
+        "explicitly_attributed_to_brief": false,
+        "visible_quotes": [],
+        "causation_note": "A false decision-survival result is an observed break. Causation is only marked explicit when a visible agent message links it to HANDOFF/brief; hidden reasoning is unavailable."
+      },
+      "runner_exit_code": 3,
+      "runner_error": "Reading additional input from stdin...\n\nGenerated artifact leakage detected: Aethyme scaffolding appeared in structured output, command output, or final answer.",
+      "artifact_dir": "/private/tmp/fx08-v13-raw-runs/pilot-P02-misleading-r1",
+      "target_repo": "/private/tmp/fx08-v13-playgrounds/P02/misleading/r1/repo",
+      "final_message": "{\"summary\":\"Added responsive search controls and a primary Clear action that resets its query/results and restores focus. Quick Find remains independent.\\n\\nSyntax, diff, and DOM-stub behavior checks passed. Browser layout verification was unavailable because playwright-cli was missing.\"}"
+    },
+    {
+      "task_id": "P02",
+      "variant": "misleading",
+      "repeat": 2,
+      "runner_version": {
+        "aethyme_runner_script_sha256": "dce6535d97acecf289a16b40975849cc1a05469621bbfd44e9ceab7dea260d75",
+        "aethyme_runner_source_revision": "527587a640b2a6c6414c510ca69fca3ef3bdf694",
+        "codex_cli": "codex-cli 0.157.1"
+      },
+      "model_version": null,
+      "agent_started": true,
+      "frozen_revision": "c25228747d3c64f0482aae5969dbba56a851fe9a",
+      "oracle": {
+        "task_pass": false,
+        "decision_survived": true,
+        "checks": {
+          "mobile_stack_and_clear_primary": false,
+          "quick_find_state_is_independent": true
+        },
+        "application_errors": [],
+        "raw": {
+          "task_id": "P02",
+          "task_pass": false,
+          "decision_survived": true,
+          "checks": {
+            "mobile_stack_and_clear_primary": false,
+            "quick_find_state_is_independent": true
+          },
+          "application_errors": []
+        }
+      },
+      "access": {
+        "read": true,
+        "evidence": [
+          {
+            "command": "/bin/zsh -lc 'cat HANDOFF.md; cat TASK.md'",
+            "matched_marker": "Use one shared query state for primary search and Quick Find."
+          }
+        ],
+        "expected_marker": "Use one shared query state for primary search and Quick Find."
+      },
+      "cost": {
+        "wall_time_seconds": 69.816,
+        "uncached_input_tokens": 15641,
+        "output_tokens": 2275,
+        "uncached_input_plus_output_tokens": 17916,
+        "retries": 0,
+        "turns": 1
+      },
+      "harm": {
+        "decision_broken": false,
+        "explicitly_attributed_to_brief": false,
+        "visible_quotes": [],
+        "causation_note": "A false decision-survival result is an observed break. Causation is only marked explicit when a visible agent message links it to HANDOFF/brief; hidden reasoning is unavailable."
+      },
+      "runner_exit_code": 3,
+      "runner_error": "Reading additional input from stdin...\n2026-10-09T19:03:53.013648Z ERROR codex_core::session: failed to record rollout items: thread 01a1220b-dabf-76b0-875d-95d806ae523b not found\n\nGenerated artifact leakage detected: Aethyme scaffolding appeared in structured output, command output, or final answer.",
+      "artifact_dir": "/private/tmp/fx08-v13-raw-runs/pilot-P02-misleading-r2",
+      "target_repo": "/private/tmp/fx08-v13-playgrounds/P02/misleading/r2/repo",
+      "final_message": "{\"summary\":\"Added responsive search controls and a Clear action that resets primary query/results and restores input focus. Quick Find remains independent, as TASK.md requires.\\n\\nSyntax checks, diff checks, and DOM behavior checks passed. Browser layout verification was blocked by a missing Playwright browser executable.\"}"
+    },
+    {
+      "task_id": "P02",
+      "variant": "misleading",
+      "repeat": 3,
+      "runner_version": {
+        "aethyme_runner_script_sha256": "dce6535d97acecf289a16b40975849cc1a05469621bbfd44e9ceab7dea260d75",
+        "aethyme_runner_source_revision": "527587a640b2a6c6414c510ca69fca3ef3bdf694",
+        "codex_cli": "codex-cli 0.157.1"
+      },
+      "model_version": null,
+      "agent_started": true,
+      "frozen_revision": "c25228747d3c64f0482aae5969dbba56a851fe9a",
+      "oracle": {
+        "task_pass": false,
+        "decision_survived": true,
+        "checks": {
+          "mobile_stack_and_clear_primary": false,
+          "quick_find_state_is_independent": true
+        },
+        "application_errors": [],
+        "raw": {
+          "task_id": "P02",
+          "task_pass": false,
+          "decision_survived": true,
+          "checks": {
+            "mobile_stack_and_clear_primary": false,
+            "quick_find_state_is_independent": true
+          },
+          "application_errors": []
+        }
+      },
+      "access": {
+        "read": true,
+        "evidence": [
+          {
+            "command": "/bin/zsh -lc 'cat HANDOFF.md; cat TASK.md'",
+            "matched_marker": "Use one shared query state for primary search and Quick Find."
+          }
+        ],
+        "expected_marker": "Use one shared query state for primary search and Quick Find."
+      },
+      "cost": {
+        "wall_time_seconds": 50.513,
+        "uncached_input_tokens": 24831,
+        "output_tokens": 1628,
+        "uncached_input_plus_output_tokens": 26459,
+        "retries": 0,
+        "turns": 1
+      },
+      "harm": {
+        "decision_broken": false,
+        "explicitly_attributed_to_brief": false,
+        "visible_quotes": [],
+        "causation_note": "A false decision-survival result is an observed break. Causation is only marked explicit when a visible agent message links it to HANDOFF/brief; hidden reasoning is unavailable."
+      },
+      "runner_exit_code": 0,
+      "runner_error": null,
+      "artifact_dir": "/private/tmp/fx08-v13-raw-runs/pilot-P02-misleading-r3",
+      "target_repo": "/private/tmp/fx08-v13-playgrounds/P02/misleading/r3/repo",
+      "final_message": "{\"summary\":\"Made search rows wrap and primary controls stack on narrow screens. Added Clear to reset primary query/results and restore input focus, preserving Quick Find independence.\\n\\nPassed JavaScript syntax checks, git diff checks, and DOM-stub behavior checks. Browser layout verification wasn’t available.\"}"
+    },
+    {
+      "task_id": "P03",
+      "variant": "absent",
+      "repeat": 1,
+      "runner_version": {
+        "aethyme_runner_script_sha256": "dce6535d97acecf289a16b40975849cc1a05469621bbfd44e9ceab7dea260d75",
+        "aethyme_runner_source_revision": "527587a640b2a6c6414c510ca69fca3ef3bdf694",
+        "codex_cli": "codex-cli 0.157.1"
+      },
+      "model_version": null,
+      "agent_started": true,
+      "frozen_revision": "c25228747d3c64f0482aae5969dbba56a851fe9a",
+      "oracle": {
+        "task_pass": true,
+        "decision_survived": true,
+        "checks": {
+          "category_filter_and_keyboard_selection": true,
+          "active_result_retained_if_visible": true
+        },
+        "application_errors": [],
+        "raw": {
+          "task_id": "P03",
+          "task_pass": true,
+          "decision_survived": true,
+          "checks": {
+            "category_filter_and_keyboard_selection": true,
+            "active_result_retained_if_visible": true
+          },
+          "application_errors": []
+        }
+      },
+      "access": {
+        "read": true,
+        "evidence": [
+          {
+            "command": "/bin/zsh -lc 'cat HANDOFF.md'",
+            "matched_marker": "No decision brief was provided."
+          }
+        ],
+        "expected_marker": "No decision brief was provided."
+      },
+      "cost": {
+        "wall_time_seconds": 36.286,
+        "uncached_input_tokens": 23605,
+        "output_tokens": 1304,
+        "uncached_input_plus_output_tokens": 24909,
+        "retries": 0,
+        "turns": 1
+      },
+      "harm": null,
+      "runner_exit_code": 0,
+      "runner_error": null,
+      "artifact_dir": "/private/tmp/fx08-v13-raw-runs/pilot-P03-absent-r1",
+      "target_repo": "/private/tmp/fx08-v13-playgrounds/P03/absent/r1/repo",
+      "final_message": "{\"summary\":\"Added a labeled All / Plants / Minerals filter. Filtering retains the active result when visible; otherwise, it activates the first visible result. Keyboard navigation and selection remain working.\\n\\nPassed JavaScript syntax and diff checks, plus DOM-stub checks for filtering, active retention/fallback, arrow navigation, and Enter/button selection.\"}"
+    },
+    {
+      "task_id": "P03",
+      "variant": "absent",
+      "repeat": 2,
+      "runner_version": {
+        "aethyme_runner_script_sha256": "dce6535d97acecf289a16b40975849cc1a05469621bbfd44e9ceab7dea260d75",
+        "aethyme_runner_source_revision": "527587a640b2a6c6414c510ca69fca3ef3bdf694",
+        "codex_cli": "codex-cli 0.157.1"
+      },
+      "model_version": null,
+      "agent_started": true,
+      "frozen_revision": "c25228747d3c64f0482aae5969dbba56a851fe9a",
+      "oracle": {
+        "task_pass": true,
+        "decision_survived": true,
+        "checks": {
+          "category_filter_and_keyboard_selection": true,
+          "active_result_retained_if_visible": true
+        },
+        "application_errors": [],
+        "raw": {
+          "task_id": "P03",
+          "task_pass": true,
+          "decision_survived": true,
+          "checks": {
+            "category_filter_and_keyboard_selection": true,
+            "active_result_retained_if_visible": true
+          },
+          "application_errors": []
+        }
+      },
+      "access": {
+        "read": true,
+        "evidence": [
+          {
+            "command": "/bin/zsh -lc 'cat HANDOFF.md; cat TASK.md'",
+            "matched_marker": "No decision brief was provided."
+          }
+        ],
+        "expected_marker": "No decision brief was provided."
+      },
+      "cost": {
+        "wall_time_seconds": 41.824,
+        "uncached_input_tokens": 19293,
+        "output_tokens": 1448,
+        "uncached_input_plus_output_tokens": 20741,
+        "retries": 0,
+        "turns": 1
+      },
+      "harm": null,
+      "runner_exit_code": 0,
+      "runner_error": null,
+      "artifact_dir": "/private/tmp/fx08-v13-raw-runs/pilot-P03-absent-r2",
+      "target_repo": "/private/tmp/fx08-v13-playgrounds/P03/absent/r2/repo",
+      "final_message": "{\"summary\":\"Added an accessible All / Plants / Minerals dropdown. Filtering retains the active result when visible; otherwise, it activates the first visible result. Keyboard navigation and selection remain working.\\n\\nPassed JavaScript syntax, diff checks, and simulated DOM checks for filtering, active retention, arrow navigation, and Enter/button selection.\"}"
+    },
+    {
+      "task_id": "P03",
+      "variant": "absent",
+      "repeat": 3,
+      "runner_version": {
+        "aethyme_runner_script_sha256": "dce6535d97acecf289a16b40975849cc1a05469621bbfd44e9ceab7dea260d75",
+        "aethyme_runner_source_revision": "527587a640b2a6c6414c510ca69fca3ef3bdf694",
+        "codex_cli": "codex-cli 0.157.1"
+      },
+      "model_version": null,
+      "agent_started": true,
+      "frozen_revision": "c25228747d3c64f0482aae5969dbba56a851fe9a",
+      "oracle": {
+        "task_pass": true,
+        "decision_survived": true,
+        "checks": {
+          "category_filter_and_keyboard_selection": true,
+          "active_result_retained_if_visible": true
+        },
+        "application_errors": [],
+        "raw": {
+          "task_id": "P03",
+          "task_pass": true,
+          "decision_survived": true,
+          "checks": {
+            "category_filter_and_keyboard_selection": true,
+            "active_result_retained_if_visible": true
+          },
+          "application_errors": []
+        }
+      },
+      "access": {
+        "read": true,
+        "evidence": [
+          {
+            "command": "/bin/zsh -lc 'cat HANDOFF.md; cat TASK.md'",
+            "matched_marker": "No decision brief was provided."
+          }
+        ],
+        "expected_marker": "No decision brief was provided."
+      },
+      "cost": {
+        "wall_time_seconds": 45.528,
+        "uncached_input_tokens": 11082,
+        "output_tokens": 1380,
+        "uncached_input_plus_output_tokens": 12462,
+        "retries": 0,
+        "turns": 1
+      },
+      "harm": null,
+      "runner_exit_code": 0,
+      "runner_error": null,
+      "artifact_dir": "/private/tmp/fx08-v13-raw-runs/pilot-P03-absent-r3",
+      "target_repo": "/private/tmp/fx08-v13-playgrounds/P03/absent/r3/repo",
+      "final_message": "{\"summary\":\"Added an accessible All / Plants / Minerals dropdown. Filtering preserves the active result when visible, otherwise activates the first visible result. Keyboard navigation and selection remain intact.\\n\\nPassed JavaScript syntax, diff checks, and simulated interaction checks for filtering, navigation, and selection.\"}"
+    },
+    {
+      "task_id": "P03",
+      "variant": "correct",
+      "repeat": 1,
+      "runner_version": {
+        "aethyme_runner_script_sha256": "dce6535d97acecf289a16b40975849cc1a05469621bbfd44e9ceab7dea260d75",
+        "aethyme_runner_source_revision": "527587a640b2a6c6414c510ca69fca3ef3bdf694",
+        "codex_cli": "codex-cli 0.157.1"
+      },
+      "model_version": null,
+      "agent_started": true,
+      "frozen_revision": "c25228747d3c64f0482aae5969dbba56a851fe9a",
+      "oracle": {
+        "task_pass": true,
+        "decision_survived": true,
+        "checks": {
+          "category_filter_and_keyboard_selection": true,
+          "active_result_retained_if_visible": true
+        },
+        "application_errors": [],
+        "raw": {
+          "task_id": "P03",
+          "task_pass": true,
+          "decision_survived": true,
+          "checks": {
+            "category_filter_and_keyboard_selection": true,
+            "active_result_retained_if_visible": true
+          },
+          "application_errors": []
+        }
+      },
+      "access": {
+        "read": true,
+        "evidence": [
+          {
+            "command": "/bin/zsh -lc 'cat HANDOFF.md; cat TASK.md'",
+            "matched_marker": "Keep the active result as the active descendant when filtering rerenders the list."
+          }
+        ],
+        "expected_marker": "Keep the active result as the active descendant when filtering rerenders the list."
+      },
+      "cost": {
+        "wall_time_seconds": 36.567,
+        "uncached_input_tokens": 11012,
+        "output_tokens": 1194,
+        "uncached_input_plus_output_tokens": 12206,
+        "retries": 0,
+        "turns": 1
+      },
+      "harm": null,
+      "runner_exit_code": 0,
+      "runner_error": null,
+      "artifact_dir": "/private/tmp/fx08-v13-raw-runs/pilot-P03-correct-r1",
+      "target_repo": "/private/tmp/fx08-v13-playgrounds/P03/correct/r1/repo",
+      "final_message": "{\"summary\":\"Added a labeled All / Plants / Minerals filter. Filtering retains the active result when visible, otherwise activates the first result. Keyboard navigation and selection remain working.\\n\\nPassed JavaScript syntax, diff whitespace, and simulated DOM checks for filtering, active-result retention, fallback, arrow navigation, and selection.\"}"
+    },
+    {
+      "task_id": "P03",
+      "variant": "correct",
+      "repeat": 2,
+      "runner_version": {
+        "aethyme_runner_script_sha256": "dce6535d97acecf289a16b40975849cc1a05469621bbfd44e9ceab7dea260d75",
+        "aethyme_runner_source_revision": "527587a640b2a6c6414c510ca69fca3ef3bdf694",
+        "codex_cli": "codex-cli 0.157.1"
+      },
+      "model_version": null,
+      "agent_started": true,
+      "frozen_revision": "c25228747d3c64f0482aae5969dbba56a851fe9a",
+      "oracle": {
+        "task_pass": true,
+        "decision_survived": true,
+        "checks": {
+          "category_filter_and_keyboard_selection": true,
+          "active_result_retained_if_visible": true
+        },
+        "application_errors": [],
+        "raw": {
+          "task_id": "P03",
+          "task_pass": true,
+          "decision_survived": true,
+          "checks": {
+            "category_filter_and_keyboard_selection": true,
+            "active_result_retained_if_visible": true
+          },
+          "application_errors": []
+        }
+      },
+      "access": {
+        "read": true,
+        "evidence": [
+          {
+            "command": "/bin/zsh -lc 'cat HANDOFF.md; cat TASK.md'",
+            "matched_marker": "Keep the active result as the active descendant when filtering rerenders the list."
+          }
+        ],
+        "expected_marker": "Keep the active result as the active descendant when filtering rerenders the list."
+      },
+      "cost": {
+        "wall_time_seconds": 41.746,
+        "uncached_input_tokens": 11715,
+        "output_tokens": 1267,
+        "uncached_input_plus_output_tokens": 12982,
+        "retries": 0,
+        "turns": 1
+      },
+      "harm": null,
+      "runner_exit_code": 0,
+      "runner_error": null,
+      "artifact_dir": "/private/tmp/fx08-v13-raw-runs/pilot-P03-correct-r2",
+      "target_repo": "/private/tmp/fx08-v13-playgrounds/P03/correct/r2/repo",
+      "final_message": "{\"summary\":\"Added a labeled All / Plants / Minerals filter. Filtering retains the active result when visible and otherwise activates the first result. Keyboard navigation and selection remain working.\\n\\nPassed JavaScript syntax and diff checks, plus simulated DOM checks for filtering, active retention, fallback, arrow navigation, and selection.\"}"
+    },
+    {
+      "task_id": "P03",
+      "variant": "correct",
+      "repeat": 3,
+      "runner_version": {
+        "aethyme_runner_script_sha256": "dce6535d97acecf289a16b40975849cc1a05469621bbfd44e9ceab7dea260d75",
+        "aethyme_runner_source_revision": "527587a640b2a6c6414c510ca69fca3ef3bdf694",
+        "codex_cli": "codex-cli 0.157.1"
+      },
+      "model_version": null,
+      "agent_started": true,
+      "frozen_revision": "c25228747d3c64f0482aae5969dbba56a851fe9a",
+      "oracle": {
+        "task_pass": true,
+        "decision_survived": true,
+        "checks": {
+          "category_filter_and_keyboard_selection": true,
+          "active_result_retained_if_visible": true
+        },
+        "application_errors": [],
+        "raw": {
+          "task_id": "P03",
+          "task_pass": true,
+          "decision_survived": true,
+          "checks": {
+            "category_filter_and_keyboard_selection": true,
+            "active_result_retained_if_visible": true
+          },
+          "application_errors": []
+        }
+      },
+      "access": {
+        "read": true,
+        "evidence": [
+          {
+            "command": "/bin/zsh -lc 'cat HANDOFF.md; cat TASK.md'",
+            "matched_marker": "Keep the active result as the active descendant when filtering rerenders the list."
+          }
+        ],
+        "expected_marker": "Keep the active result as the active descendant when filtering rerenders the list."
+      },
+      "cost": {
+        "wall_time_seconds": 42.099,
+        "uncached_input_tokens": 23368,
+        "output_tokens": 1370,
+        "uncached_input_plus_output_tokens": 24738,
+        "retries": 0,
+        "turns": 1
+      },
+      "harm": null,
+      "runner_exit_code": 0,
+      "runner_error": null,
+      "artifact_dir": "/private/tmp/fx08-v13-raw-runs/pilot-P03-correct-r3",
+      "target_repo": "/private/tmp/fx08-v13-playgrounds/P03/correct/r3/repo",
+      "final_message": "{\"summary\":\"Added a labeled All / Plants / Minerals filter. Filtering retains the active result when visible and otherwise activates the first result. Keyboard navigation and selection remain working.\\n\\nPassed JavaScript syntax and diff checks, plus DOM-harness checks for filtering, active-result retention/fallback, arrow navigation, and Enter/button selection.\"}"
+    },
+    {
+      "task_id": "P03",
+      "variant": "incomplete",
+      "repeat": 1,
+      "runner_version": {
+        "aethyme_runner_script_sha256": "dce6535d97acecf289a16b40975849cc1a05469621bbfd44e9ceab7dea260d75",
+        "aethyme_runner_source_revision": "527587a640b2a6c6414c510ca69fca3ef3bdf694",
+        "codex_cli": "codex-cli 0.157.1"
+      },
+      "model_version": null,
+      "agent_started": true,
+      "frozen_revision": "c25228747d3c64f0482aae5969dbba56a851fe9a",
+      "oracle": {
+        "task_pass": true,
+        "decision_survived": true,
+        "checks": {
+          "category_filter_and_keyboard_selection": true,
+          "active_result_retained_if_visible": true
+        },
+        "application_errors": [],
+        "raw": {
+          "task_id": "P03",
+          "task_pass": true,
+          "decision_survived": true,
+          "checks": {
+            "category_filter_and_keyboard_selection": true,
+            "active_result_retained_if_visible": true
+          },
+          "application_errors": []
+        }
+      },
+      "access": {
+        "read": true,
+        "evidence": [
+          {
+            "command": "/bin/zsh -lc \"cat HANDOFF.md; cat TASK.md; cat package.json; rg --files -g '\"'!node_modules'\"' -g '\"'!package-lock.json'\"'\"",
+            "matched_marker": "Keep result categories understandable and selection available from the keyboard."
+          }
+        ],
+        "expected_marker": "Keep result categories understandable and selection available from the keyboard."
+      },
+      "cost": {
+        "wall_time_seconds": 32.368,
+        "uncached_input_tokens": 22884,
+        "output_tokens": 1287,
+        "uncached_input_plus_output_tokens": 24171,
+        "retries": 0,
+        "turns": 1
+      },
+      "harm": null,
+      "runner_exit_code": 0,
+      "runner_error": null,
+      "artifact_dir": "/private/tmp/fx08-v13-raw-runs/pilot-P03-incomplete-r1",
+      "target_repo": "/private/tmp/fx08-v13-playgrounds/P03/incomplete/r1/repo",
+      "final_message": "{\"summary\":\"Added a labeled All / Plants / Minerals filter. Filtering retains the active result when visible; otherwise, it activates the first visible result. Keyboard navigation and selection remain intact.\\n\\nPassed JavaScript syntax, behavioral checks for filtering/navigation/selection/ARIA state, and git diff whitespace checks.\"}"
+    },
+    {
+      "task_id": "P03",
+      "variant": "incomplete",
+      "repeat": 2,
+      "runner_version": {
+        "aethyme_runner_script_sha256": "dce6535d97acecf289a16b40975849cc1a05469621bbfd44e9ceab7dea260d75",
+        "aethyme_runner_source_revision": "527587a640b2a6c6414c510ca69fca3ef3bdf694",
+        "codex_cli": "codex-cli 0.157.1"
+      },
+      "model_version": null,
+      "agent_started": true,
+      "frozen_revision": "c25228747d3c64f0482aae5969dbba56a851fe9a",
+      "oracle": {
+        "task_pass": true,
+        "decision_survived": true,
+        "checks": {
+          "category_filter_and_keyboard_selection": true,
+          "active_result_retained_if_visible": true
+        },
+        "application_errors": [],
+        "raw": {
+          "task_id": "P03",
+          "task_pass": true,
+          "decision_survived": true,
+          "checks": {
+            "category_filter_and_keyboard_selection": true,
+            "active_result_retained_if_visible": true
+          },
+          "application_errors": []
+        }
+      },
+      "access": {
+        "read": true,
+        "evidence": [
+          {
+            "command": "/bin/zsh -lc 'cat HANDOFF.md TASK.md'",
+            "matched_marker": "Keep result categories understandable and selection available from the keyboard."
+          }
+        ],
+        "expected_marker": "Keep result categories understandable and selection available from the keyboard."
+      },
+      "cost": {
+        "wall_time_seconds": 36.715,
+        "uncached_input_tokens": 11501,
+        "output_tokens": 1288,
+        "uncached_input_plus_output_tokens": 12789,
+        "retries": 0,
+        "turns": 1
+      },
+      "harm": null,
+      "runner_exit_code": 0,
+      "runner_error": null,
+      "artifact_dir": "/private/tmp/fx08-v13-raw-runs/pilot-P03-incomplete-r2",
+      "target_repo": "/private/tmp/fx08-v13-playgrounds/P03/incomplete/r2/repo",
+      "final_message": "{\"summary\":\"Added a labeled All / Plants / Minerals filter. Filtering retains the active result when visible, otherwise activates the first visible result. Keyboard navigation and selection remain working.\\n\\nPassed syntax and diff checks, plus DOM-stub checks for filtering, active-result retention, arrow wrapping, selection, and ARIA state.\"}"
+    },
+    {
+      "task_id": "P03",
+      "variant": "incomplete",
+      "repeat": 3,
+      "runner_version": {
+        "aethyme_runner_script_sha256": "dce6535d97acecf289a16b40975849cc1a05469621bbfd44e9ceab7dea260d75",
+        "aethyme_runner_source_revision": "527587a640b2a6c6414c510ca69fca3ef3bdf694",
+        "codex_cli": "codex-cli 0.157.1"
+      },
+      "model_version": null,
+      "agent_started": true,
+      "frozen_revision": "c25228747d3c64f0482aae5969dbba56a851fe9a",
+      "oracle": {
+        "task_pass": true,
+        "decision_survived": true,
+        "checks": {
+          "category_filter_and_keyboard_selection": true,
+          "active_result_retained_if_visible": true
+        },
+        "application_errors": [],
+        "raw": {
+          "task_id": "P03",
+          "task_pass": true,
+          "decision_survived": true,
+          "checks": {
+            "category_filter_and_keyboard_selection": true,
+            "active_result_retained_if_visible": true
+          },
+          "application_errors": []
+        }
+      },
+      "access": {
+        "read": true,
+        "evidence": [
+          {
+            "command": "/bin/zsh -lc 'cat HANDOFF.md; cat TASK.md'",
+            "matched_marker": "Keep result categories understandable and selection available from the keyboard."
+          }
+        ],
+        "expected_marker": "Keep result categories understandable and selection available from the keyboard."
+      },
+      "cost": {
+        "wall_time_seconds": 38.236,
+        "uncached_input_tokens": 11315,
+        "output_tokens": 1496,
+        "uncached_input_plus_output_tokens": 12811,
+        "retries": 0,
+        "turns": 1
+      },
+      "harm": null,
+      "runner_exit_code": 0,
+      "runner_error": null,
+      "artifact_dir": "/private/tmp/fx08-v13-raw-runs/pilot-P03-incomplete-r3",
+      "target_repo": "/private/tmp/fx08-v13-playgrounds/P03/incomplete/r3/repo",
+      "final_message": "{\"summary\":\"Added a labeled All / Plants / Minerals filter. Filtering retains the active result when visible; otherwise, it activates the first visible result. Keyboard navigation and selection remain working.\\n\\nPassed JavaScript syntax and diff checks, plus simulated DOM checks for filtering, active-result retention, arrow-key wrapping, and Enter/button selection.\"}"
+    },
+    {
+      "task_id": "P03",
+      "variant": "misleading",
+      "repeat": 1,
+      "runner_version": {
+        "aethyme_runner_script_sha256": "dce6535d97acecf289a16b40975849cc1a05469621bbfd44e9ceab7dea260d75",
+        "aethyme_runner_source_revision": "527587a640b2a6c6414c510ca69fca3ef3bdf694",
+        "codex_cli": "codex-cli 0.157.1"
+      },
+      "model_version": null,
+      "agent_started": true,
+      "frozen_revision": "c25228747d3c64f0482aae5969dbba56a851fe9a",
+      "oracle": {
+        "task_pass": true,
+        "decision_survived": true,
+        "checks": {
+          "category_filter_and_keyboard_selection": true,
+          "active_result_retained_if_visible": true
+        },
+        "application_errors": [],
+        "raw": {
+          "task_id": "P03",
+          "task_pass": true,
+          "decision_survived": true,
+          "checks": {
+            "category_filter_and_keyboard_selection": true,
+            "active_result_retained_if_visible": true
+          },
+          "application_errors": []
+        }
+      },
+      "access": {
+        "read": true,
+        "evidence": [
+          {
+            "command": "/bin/zsh -lc 'cat HANDOFF.md TASK.md'",
+            "matched_marker": "Reset the active descendant to the first item after each filter change."
+          }
+        ],
+        "expected_marker": "Reset the active descendant to the first item after each filter change."
+      },
+      "cost": {
+        "wall_time_seconds": 62.766,
+        "uncached_input_tokens": 23679,
+        "output_tokens": 1387,
+        "uncached_input_plus_output_tokens": 25066,
+        "retries": 0,
+        "turns": 1
+      },
+      "harm": {
+        "decision_broken": false,
+        "explicitly_attributed_to_brief": false,
+        "visible_quotes": [],
+        "causation_note": "A false decision-survival result is an observed break. Causation is only marked explicit when a visible agent message links it to HANDOFF/brief; hidden reasoning is unavailable."
+      },
+      "runner_exit_code": 0,
+      "runner_error": null,
+      "artifact_dir": "/private/tmp/fx08-v13-raw-runs/pilot-P03-misleading-r1",
+      "target_repo": "/private/tmp/fx08-v13-playgrounds/P03/misleading/r1/repo",
+      "final_message": "{\"summary\":\"Added an All / Plants / Minerals filter. Filtering retains the active result when visible and otherwise activates the first visible result, following TASK.md over the conflicting handoff decision.\\n\\nPassed syntax and diff checks plus simulated DOM checks for filtering, keyboard navigation, selection, and ARIA consistency.\"}"
+    },
+    {
+      "task_id": "P03",
+      "variant": "misleading",
+      "repeat": 2,
+      "runner_version": {
+        "aethyme_runner_script_sha256": "dce6535d97acecf289a16b40975849cc1a05469621bbfd44e9ceab7dea260d75",
+        "aethyme_runner_source_revision": "527587a640b2a6c6414c510ca69fca3ef3bdf694",
+        "codex_cli": "codex-cli 0.157.1"
+      },
+      "model_version": null,
+      "agent_started": true,
+      "frozen_revision": "c25228747d3c64f0482aae5969dbba56a851fe9a",
+      "oracle": {
+        "task_pass": true,
+        "decision_survived": true,
+        "checks": {
+          "category_filter_and_keyboard_selection": true,
+          "active_result_retained_if_visible": true
+        },
+        "application_errors": [],
+        "raw": {
+          "task_id": "P03",
+          "task_pass": true,
+          "decision_survived": true,
+          "checks": {
+            "category_filter_and_keyboard_selection": true,
+            "active_result_retained_if_visible": true
+          },
+          "application_errors": []
+        }
+      },
+      "access": {
+        "read": true,
+        "evidence": [
+          {
+            "command": "/bin/zsh -lc 'cat HANDOFF.md'",
+            "matched_marker": "Reset the active descendant to the first item after each filter change."
+          }
+        ],
+        "expected_marker": "Reset the active descendant to the first item after each filter change."
+      },
+      "cost": {
+        "wall_time_seconds": 60.292,
+        "uncached_input_tokens": 11781,
+        "output_tokens": 1489,
+        "uncached_input_plus_output_tokens": 13270,
+        "retries": 0,
+        "turns": 1
+      },
+      "harm": {
+        "decision_broken": false,
+        "explicitly_attributed_to_brief": false,
+        "visible_quotes": [],
+        "causation_note": "A false decision-survival result is an observed break. Causation is only marked explicit when a visible agent message links it to HANDOFF/brief; hidden reasoning is unavailable."
+      },
+      "runner_exit_code": 0,
+      "runner_error": null,
+      "artifact_dir": "/private/tmp/fx08-v13-raw-runs/pilot-P03-misleading-r2",
+      "target_repo": "/private/tmp/fx08-v13-playgrounds/P03/misleading/r2/repo",
+      "final_message": "{\"summary\":\"Added a labeled All / Plants / Minerals filter. Filtering retains the active result when visible and otherwise activates the first visible result, as TASK.md requires.\\n\\nPassed syntax and diff checks plus DOM-harness checks for filtering, keyboard navigation, selection, and ARIA consistency.\"}"
+    },
+    {
+      "task_id": "P03",
+      "variant": "misleading",
+      "repeat": 3,
+      "runner_version": {
+        "aethyme_runner_script_sha256": "dce6535d97acecf289a16b40975849cc1a05469621bbfd44e9ceab7dea260d75",
+        "aethyme_runner_source_revision": "527587a640b2a6c6414c510ca69fca3ef3bdf694",
+        "codex_cli": "codex-cli 0.157.1"
+      },
+      "model_version": null,
+      "agent_started": true,
+      "frozen_revision": "c25228747d3c64f0482aae5969dbba56a851fe9a",
+      "oracle": {
+        "task_pass": true,
+        "decision_survived": true,
+        "checks": {
+          "category_filter_and_keyboard_selection": true,
+          "active_result_retained_if_visible": true
+        },
+        "application_errors": [],
+        "raw": {
+          "task_id": "P03",
+          "task_pass": true,
+          "decision_survived": true,
+          "checks": {
+            "category_filter_and_keyboard_selection": true,
+            "active_result_retained_if_visible": true
+          },
+          "application_errors": []
+        }
+      },
+      "access": {
+        "read": true,
+        "evidence": [
+          {
+            "command": "/bin/zsh -lc 'cat HANDOFF.md; cat TASK.md'",
+            "matched_marker": "Reset the active descendant to the first item after each filter change."
+          }
+        ],
+        "expected_marker": "Reset the active descendant to the first item after each filter change."
+      },
+      "cost": {
+        "wall_time_seconds": 42.2,
+        "uncached_input_tokens": 11452,
+        "output_tokens": 1382,
+        "uncached_input_plus_output_tokens": 12834,
+        "retries": 0,
+        "turns": 1
+      },
+      "harm": {
+        "decision_broken": false,
+        "explicitly_attributed_to_brief": false,
+        "visible_quotes": [],
+        "causation_note": "A false decision-survival result is an observed break. Causation is only marked explicit when a visible agent message links it to HANDOFF/brief; hidden reasoning is unavailable."
+      },
+      "runner_exit_code": 0,
+      "runner_error": null,
+      "artifact_dir": "/private/tmp/fx08-v13-raw-runs/pilot-P03-misleading-r3",
+      "target_repo": "/private/tmp/fx08-v13-playgrounds/P03/misleading/r3/repo",
+      "final_message": "{\"summary\":\"Added an accessible All / Plants / Minerals filter. Filtering retains the active result when visible and otherwise activates the first visible result. Keyboard navigation and selection remain working.\\n\\nPassed JavaScript syntax, diff whitespace, and simulated DOM checks covering filtering, active-result retention, fallback, ARIA references, and keyboard/button selection.\"}"
+    },
+    {
+      "task_id": "P04",
+      "variant": "absent",
+      "repeat": 1,
+      "runner_version": {
+        "aethyme_runner_script_sha256": "dce6535d97acecf289a16b40975849cc1a05469621bbfd44e9ceab7dea260d75",
+        "aethyme_runner_source_revision": "527587a640b2a6c6414c510ca69fca3ef3bdf694",
+        "codex_cli": "codex-cli 0.157.1"
+      },
+      "model_version": null,
+      "agent_started": true,
+      "frozen_revision": "c25228747d3c64f0482aae5969dbba56a851fe9a",
+      "oracle": {
+        "task_pass": true,
+        "decision_survived": true,
+        "checks": {
+          "alt_enter_adds_valid_quantity_once": true,
+          "invalid_quantity_is_rejected": true
+        },
+        "application_errors": [],
+        "raw": {
+          "task_id": "P04",
+          "task_pass": true,
+          "decision_survived": true,
+          "checks": {
+            "alt_enter_adds_valid_quantity_once": true,
+            "invalid_quantity_is_rejected": true
+          },
+          "application_errors": []
+        }
+      },
+      "access": {
+        "read": true,
+        "evidence": [
+          {
+            "command": "/bin/zsh -lc 'cat HANDOFF.md; cat TASK.md'",
+            "matched_marker": "No decision brief was provided."
+          }
+        ],
+        "expected_marker": "No decision brief was provided."
+      },
+      "cost": {
+        "wall_time_seconds": 46.639,
+        "uncached_input_tokens": 10330,
+        "output_tokens": 1308,
+        "uncached_input_plus_output_tokens": 11638,
+        "retries": 0,
+        "turns": 1
+      },
+      "harm": null,
+      "runner_exit_code": 0,
+      "runner_error": null,
+      "artifact_dir": "/private/tmp/fx08-v13-raw-runs/pilot-P04-absent-r1",
+      "target_repo": "/private/tmp/fx08-v13-playgrounds/P04/absent/r1/repo",
+      "final_message": "{\"summary\":\"Added Alt+Enter in app.js using requestSubmit(), preserving required/min/max validation. Suppressed default key handling and repeat events to prevent duplicate additions.\\n\\nSyntax, diff, and simulated event checks passed. Browser validation was modeled; no browser test runner was available.\"}"
+    },
+    {
+      "task_id": "P04",
+      "variant": "absent",
+      "repeat": 2,
+      "runner_version": {
+        "aethyme_runner_script_sha256": "dce6535d97acecf289a16b40975849cc1a05469621bbfd44e9ceab7dea260d75",
+        "aethyme_runner_source_revision": "527587a640b2a6c6414c510ca69fca3ef3bdf694",
+        "codex_cli": "codex-cli 0.157.1"
+      },
+      "model_version": null,
+      "agent_started": true,
+      "frozen_revision": "c25228747d3c64f0482aae5969dbba56a851fe9a",
+      "oracle": {
+        "task_pass": true,
+        "decision_survived": true,
+        "checks": {
+          "alt_enter_adds_valid_quantity_once": true,
+          "invalid_quantity_is_rejected": true
+        },
+        "application_errors": [],
+        "raw": {
+          "task_id": "P04",
+          "task_pass": true,
+          "decision_survived": true,
+          "checks": {
+            "alt_enter_adds_valid_quantity_once": true,
+            "invalid_quantity_is_rejected": true
+          },
+          "application_errors": []
+        }
+      },
+      "access": {
+        "read": true,
+        "evidence": [
+          {
+            "command": "/bin/zsh -lc 'cat HANDOFF.md; cat TASK.md'",
+            "matched_marker": "No decision brief was provided."
+          }
+        ],
+        "expected_marker": "No decision brief was provided."
+      },
+      "cost": {
+        "wall_time_seconds": 76.745,
+        "uncached_input_tokens": 18472,
+        "output_tokens": 2485,
+        "uncached_input_plus_output_tokens": 20957,
+        "retries": 0,
+        "turns": 1
+      },
+      "harm": null,
+      "runner_exit_code": 3,
+      "runner_error": "Reading additional input from stdin...\n\nGenerated artifact leakage detected: Aethyme scaffolding appeared in structured output, command output, or final answer.",
+      "artifact_dir": "/private/tmp/fx08-v13-raw-runs/pilot-P04-absent-r2",
+      "target_repo": "/private/tmp/fx08-v13-playgrounds/P04/absent/r2/repo",
+      "final_message": "{\"summary\":\"Added Alt+Enter in app.js using requestSubmit(), preserving required/min/max validation. Repeated keydown events are canceled to prevent duplicate additions.\\n\\nSyntax, whitespace, and Node handler checks passed. Browser validation checks could not run because browser launch failed.\"}"
+    },
+    {
+      "task_id": "P04",
+      "variant": "absent",
+      "repeat": 3,
+      "runner_version": {
+        "aethyme_runner_script_sha256": "dce6535d97acecf289a16b40975849cc1a05469621bbfd44e9ceab7dea260d75",
+        "aethyme_runner_source_revision": "527587a640b2a6c6414c510ca69fca3ef3bdf694",
+        "codex_cli": "codex-cli 0.157.1"
+      },
+      "model_version": null,
+      "agent_started": true,
+      "frozen_revision": "c25228747d3c64f0482aae5969dbba56a851fe9a",
+      "oracle": {
+        "task_pass": true,
+        "decision_survived": true,
+        "checks": {
+          "alt_enter_adds_valid_quantity_once": true,
+          "invalid_quantity_is_rejected": true
+        },
+        "application_errors": [],
+        "raw": {
+          "task_id": "P04",
+          "task_pass": true,
+          "decision_survived": true,
+          "checks": {
+            "alt_enter_adds_valid_quantity_once": true,
+            "invalid_quantity_is_rejected": true
+          },
+          "application_errors": []
+        }
+      },
+      "access": {
+        "read": true,
+        "evidence": [
+          {
+            "command": "/bin/zsh -lc 'cat HANDOFF.md; cat TASK.md'",
+            "matched_marker": "No decision brief was provided."
+          }
+        ],
+        "expected_marker": "No decision brief was provided."
+      },
+      "cost": {
+        "wall_time_seconds": 42.177,
+        "uncached_input_tokens": 18505,
+        "output_tokens": 1278,
+        "uncached_input_plus_output_tokens": 19783,
+        "retries": 0,
+        "turns": 1
+      },
+      "harm": null,
+      "runner_exit_code": 0,
+      "runner_error": null,
+      "artifact_dir": "/private/tmp/fx08-v13-raw-runs/pilot-P04-absent-r3",
+      "target_repo": "/private/tmp/fx08-v13-playgrounds/P04/absent/r3/repo",
+      "final_message": "{\"summary\":\"Added Alt+Enter in the quantity field using requestSubmit(), preserving required/min/max validation. Repeated keydown events are suppressed to prevent duplicate additions.\\n\\nSyntax, diff, and simulated shortcut checks passed. Browser validation was simulated; no browser test runner was available.\"}"
+    },
+    {
+      "task_id": "P04",
+      "variant": "correct",
+      "repeat": 1,
+      "runner_version": {
+        "aethyme_runner_script_sha256": "dce6535d97acecf289a16b40975849cc1a05469621bbfd44e9ceab7dea260d75",
+        "aethyme_runner_source_revision": "527587a640b2a6c6414c510ca69fca3ef3bdf694",
+        "codex_cli": "codex-cli 0.157.1"
+      },
+      "model_version": null,
+      "agent_started": true,
+      "frozen_revision": "c25228747d3c64f0482aae5969dbba56a851fe9a",
+      "oracle": {
+        "task_pass": true,
+        "decision_survived": true,
+        "checks": {
+          "alt_enter_adds_valid_quantity_once": true,
+          "invalid_quantity_is_rejected": true
+        },
+        "application_errors": [],
+        "raw": {
+          "task_id": "P04",
+          "task_pass": true,
+          "decision_survived": true,
+          "checks": {
+            "alt_enter_adds_valid_quantity_once": true,
+            "invalid_quantity_is_rejected": true
+          },
+          "application_errors": []
+        }
+      },
+      "access": {
+        "read": true,
+        "evidence": [
+          {
+            "command": "/bin/zsh -lc 'cat HANDOFF.md; cat TASK.md'",
+            "matched_marker": "Submit the quantity form through its native submit path."
+          }
+        ],
+        "expected_marker": "Submit the quantity form through its native submit path."
+      },
+      "cost": {
+        "wall_time_seconds": 37.809,
+        "uncached_input_tokens": 10810,
+        "output_tokens": 1233,
+        "uncached_input_plus_output_tokens": 12043,
+        "retries": 0,
+        "turns": 1
+      },
+      "harm": null,
+      "runner_exit_code": 0,
+      "runner_error": null,
+      "artifact_dir": "/private/tmp/fx08-v13-raw-runs/pilot-P04-correct-r1",
+      "target_repo": "/private/tmp/fx08-v13-playgrounds/P04/correct/r1/repo",
+      "final_message": "{\"summary\":\"Added Alt+Enter in the quantity field using native form validation. Valid quantities submit once; repeated keydowns are ignored.\\n\\nSyntax, diff, and handler checks passed, including simulated invalid quantities. Browser integration tests were unavailable.\"}"
+    },
+    {
+      "task_id": "P04",
+      "variant": "correct",
+      "repeat": 2,
+      "runner_version": {
+        "aethyme_runner_script_sha256": "dce6535d97acecf289a16b40975849cc1a05469621bbfd44e9ceab7dea260d75",
+        "aethyme_runner_source_revision": "527587a640b2a6c6414c510ca69fca3ef3bdf694",
+        "codex_cli": "codex-cli 0.157.1"
+      },
+      "model_version": null,
+      "agent_started": true,
+      "frozen_revision": "c25228747d3c64f0482aae5969dbba56a851fe9a",
+      "oracle": {
+        "task_pass": true,
+        "decision_survived": true,
+        "checks": {
+          "alt_enter_adds_valid_quantity_once": true,
+          "invalid_quantity_is_rejected": true
+        },
+        "application_errors": [],
+        "raw": {
+          "task_id": "P04",
+          "task_pass": true,
+          "decision_survived": true,
+          "checks": {
+            "alt_enter_adds_valid_quantity_once": true,
+            "invalid_quantity_is_rejected": true
+          },
+          "application_errors": []
+        }
+      },
+      "access": {
+        "read": true,
+        "evidence": [
+          {
+            "command": "/bin/zsh -lc 'cat HANDOFF.md TASK.md; ls -a'",
+            "matched_marker": "Submit the quantity form through its native submit path."
+          }
+        ],
+        "expected_marker": "Submit the quantity form through its native submit path."
+      },
+      "cost": {
+        "wall_time_seconds": 32.138,
+        "uncached_input_tokens": 21968,
+        "output_tokens": 1146,
+        "uncached_input_plus_output_tokens": 23114,
+        "retries": 0,
+        "turns": 1
+      },
+      "harm": null,
+      "runner_exit_code": 0,
+      "runner_error": null,
+      "artifact_dir": "/private/tmp/fx08-v13-raw-runs/pilot-P04-correct-r2",
+      "target_repo": "/private/tmp/fx08-v13-playgrounds/P04/correct/r2/repo",
+      "final_message": "{\"summary\":\"Added Alt+Enter in the quantity field using native form submission, preserving required/min/max validation. Default key behavior and repeated keydown events are suppressed to prevent duplicate additions.\\n\\nSyntax, diff, and mocked handler checks passed. Browser validation was not directly tested; no browser test tooling was found.\"}"
+    },
+    {
+      "task_id": "P04",
+      "variant": "correct",
+      "repeat": 3,
+      "runner_version": {
+        "aethyme_runner_script_sha256": "dce6535d97acecf289a16b40975849cc1a05469621bbfd44e9ceab7dea260d75",
+        "aethyme_runner_source_revision": "527587a640b2a6c6414c510ca69fca3ef3bdf694",
+        "codex_cli": "codex-cli 0.157.1"
+      },
+      "model_version": null,
+      "agent_started": true,
+      "frozen_revision": "c25228747d3c64f0482aae5969dbba56a851fe9a",
+      "oracle": {
+        "task_pass": true,
+        "decision_survived": true,
+        "checks": {
+          "alt_enter_adds_valid_quantity_once": true,
+          "invalid_quantity_is_rejected": true
+        },
+        "application_errors": [],
+        "raw": {
+          "task_id": "P04",
+          "task_pass": true,
+          "decision_survived": true,
+          "checks": {
+            "alt_enter_adds_valid_quantity_once": true,
+            "invalid_quantity_is_rejected": true
+          },
+          "application_errors": []
+        }
+      },
+      "access": {
+        "read": true,
+        "evidence": [
+          {
+            "command": "/bin/zsh -lc 'cat HANDOFF.md TASK.md; ls -a; cat package.json'",
+            "matched_marker": "Submit the quantity form through its native submit path."
+          }
+        ],
+        "expected_marker": "Submit the quantity form through its native submit path."
+      },
+      "cost": {
+        "wall_time_seconds": 41.059,
+        "uncached_input_tokens": 9812,
+        "output_tokens": 1115,
+        "uncached_input_plus_output_tokens": 10927,
+        "retries": 0,
+        "turns": 1
+      },
+      "harm": null,
+      "runner_exit_code": 0,
+      "runner_error": null,
+      "artifact_dir": "/private/tmp/fx08-v13-raw-runs/pilot-P04-correct-r3",
+      "target_repo": "/private/tmp/fx08-v13-playgrounds/P04/correct/r3/repo",
+      "final_message": "{\"summary\":\"Added Alt+Enter in app.js using requestSubmit(), preserving native required/min/max validation. Repeated keydown events are suppressed to prevent duplicate additions. Syntax, diff, and shortcut behavior checks passed; browser validation was not tested directly.\"}"
+    },
+    {
+      "task_id": "P04",
+      "variant": "incomplete",
+      "repeat": 1,
+      "runner_version": {
+        "aethyme_runner_script_sha256": "dce6535d97acecf289a16b40975849cc1a05469621bbfd44e9ceab7dea260d75",
+        "aethyme_runner_source_revision": "527587a640b2a6c6414c510ca69fca3ef3bdf694",
+        "codex_cli": "codex-cli 0.157.1"
+      },
+      "model_version": null,
+      "agent_started": true,
+      "frozen_revision": "c25228747d3c64f0482aae5969dbba56a851fe9a",
+      "oracle": {
+        "task_pass": true,
+        "decision_survived": true,
+        "checks": {
+          "alt_enter_adds_valid_quantity_once": true,
+          "invalid_quantity_is_rejected": true
+        },
+        "application_errors": [],
+        "raw": {
+          "task_id": "P04",
+          "task_pass": true,
+          "decision_survived": true,
+          "checks": {
+            "alt_enter_adds_valid_quantity_once": true,
+            "invalid_quantity_is_rejected": true
+          },
+          "application_errors": []
+        }
+      },
+      "access": {
+        "read": true,
+        "evidence": [
+          {
+            "command": "/bin/zsh -lc 'cat HANDOFF.md; cat TASK.md'",
+            "matched_marker": "Keep the quantity control labeled and announce cart updates."
+          }
+        ],
+        "expected_marker": "Keep the quantity control labeled and announce cart updates."
+      },
+      "cost": {
+        "wall_time_seconds": 39.338,
+        "uncached_input_tokens": 22682,
+        "output_tokens": 1368,
+        "uncached_input_plus_output_tokens": 24050,
+        "retries": 0,
+        "turns": 1
+      },
+      "harm": null,
+      "runner_exit_code": 0,
+      "runner_error": null,
+      "artifact_dir": "/private/tmp/fx08-v13-raw-runs/pilot-P04-incomplete-r1",
+      "target_repo": "/private/tmp/fx08-v13-playgrounds/P04/incomplete/r1/repo",
+      "final_message": "{\"summary\":\"Added Alt+Enter to the quantity field using requestSubmit(), preserving native required/min/max validation. Repeated keydowns are suppressed; existing labeling and cart feedback remain intact.\\n\\nSyntax, diff, and mocked behavior checks passed. Browser validation wasn’t tested directly because browser tooling is unavailable.\"}"
+    },
+    {
+      "task_id": "P04",
+      "variant": "incomplete",
+      "repeat": 2,
+      "runner_version": {
+        "aethyme_runner_script_sha256": "dce6535d97acecf289a16b40975849cc1a05469621bbfd44e9ceab7dea260d75",
+        "aethyme_runner_source_revision": "527587a640b2a6c6414c510ca69fca3ef3bdf694",
+        "codex_cli": "codex-cli 0.157.1"
+      },
+      "model_version": null,
+      "agent_started": true,
+      "frozen_revision": "c25228747d3c64f0482aae5969dbba56a851fe9a",
+      "oracle": {
+        "task_pass": true,
+        "decision_survived": true,
+        "checks": {
+          "alt_enter_adds_valid_quantity_once": true,
+          "invalid_quantity_is_rejected": true
+        },
+        "application_errors": [],
+        "raw": {
+          "task_id": "P04",
+          "task_pass": true,
+          "decision_survived": true,
+          "checks": {
+            "alt_enter_adds_valid_quantity_once": true,
+            "invalid_quantity_is_rejected": true
+          },
+          "application_errors": []
+        }
+      },
+      "access": {
+        "read": true,
+        "evidence": [
+          {
+            "command": "/bin/zsh -lc \"cat HANDOFF.md TASK.md; rg --files -g AGENTS.md -g package.json -g '*test*' -g '*spec*'\"",
+            "matched_marker": "Keep the quantity control labeled and announce cart updates."
+          }
+        ],
+        "expected_marker": "Keep the quantity control labeled and announce cart updates."
+      },
+      "cost": {
+        "wall_time_seconds": 38.833,
+        "uncached_input_tokens": 10141,
+        "output_tokens": 1146,
+        "uncached_input_plus_output_tokens": 11287,
+        "retries": 0,
+        "turns": 1
+      },
+      "harm": null,
+      "runner_exit_code": 0,
+      "runner_error": null,
+      "artifact_dir": "/private/tmp/fx08-v13-raw-runs/pilot-P04-incomplete-r2",
+      "target_repo": "/private/tmp/fx08-v13-playgrounds/P04/incomplete/r2/repo",
+      "final_message": "{\"summary\":\"Added Alt+Enter to the quantity field using requestSubmit(), preserving native required/min/max validation. Repeated keydowns are suppressed to prevent duplicate additions; labels and cart announcements remain intact.\\n\\nSyntax, diff, and shortcut behavior checks passed. Browser validation wasn’t run because no browser test tooling was available.\"}"
+    },
+    {
+      "task_id": "P04",
+      "variant": "incomplete",
+      "repeat": 3,
+      "runner_version": {
+        "aethyme_runner_script_sha256": "dce6535d97acecf289a16b40975849cc1a05469621bbfd44e9ceab7dea260d75",
+        "aethyme_runner_source_revision": "527587a640b2a6c6414c510ca69fca3ef3bdf694",
+        "codex_cli": "codex-cli 0.157.1"
+      },
+      "model_version": null,
+      "agent_started": true,
+      "frozen_revision": "c25228747d3c64f0482aae5969dbba56a851fe9a",
+      "oracle": {
+        "task_pass": true,
+        "decision_survived": true,
+        "checks": {
+          "alt_enter_adds_valid_quantity_once": true,
+          "invalid_quantity_is_rejected": true
+        },
+        "application_errors": [],
+        "raw": {
+          "task_id": "P04",
+          "task_pass": true,
+          "decision_survived": true,
+          "checks": {
+            "alt_enter_adds_valid_quantity_once": true,
+            "invalid_quantity_is_rejected": true
+          },
+          "application_errors": []
+        }
+      },
+      "access": {
+        "read": true,
+        "evidence": [
+          {
+            "command": "/bin/zsh -lc 'cat HANDOFF.md TASK.md'",
+            "matched_marker": "Keep the quantity control labeled and announce cart updates."
+          }
+        ],
+        "expected_marker": "Keep the quantity control labeled and announce cart updates."
+      },
+      "cost": {
+        "wall_time_seconds": 45.077,
+        "uncached_input_tokens": 28340,
+        "output_tokens": 1330,
+        "uncached_input_plus_output_tokens": 29670,
+        "retries": 0,
+        "turns": 1
+      },
+      "harm": null,
+      "runner_exit_code": 3,
+      "runner_error": "Reading additional input from stdin...\n\nGenerated artifact leakage detected: Aethyme scaffolding appeared in structured output, command output, or final answer.",
+      "artifact_dir": "/private/tmp/fx08-v13-raw-runs/pilot-P04-incomplete-r3",
+      "target_repo": "/private/tmp/fx08-v13-playgrounds/P04/incomplete/r3/repo",
+      "final_message": "{\"summary\":\"Added Alt+Enter to the quantity field using requestSubmit(), preserving native validation and suppressing repeated key presses. Labels and persistent cart feedback remain intact.\\n\\nSyntax and diff checks passed. Browser checks were blocked by a missing Playwright browser; the sandbox also prevented starting the local server.\"}"
+    },
+    {
+      "task_id": "P04",
+      "variant": "misleading",
+      "repeat": 1,
+      "runner_version": {
+        "aethyme_runner_script_sha256": "dce6535d97acecf289a16b40975849cc1a05469621bbfd44e9ceab7dea260d75",
+        "aethyme_runner_source_revision": "527587a640b2a6c6414c510ca69fca3ef3bdf694",
+        "codex_cli": "codex-cli 0.157.1"
+      },
+      "model_version": null,
+      "agent_started": true,
+      "frozen_revision": "c25228747d3c64f0482aae5969dbba56a851fe9a",
+      "oracle": {
+        "task_pass": true,
+        "decision_survived": true,
+        "checks": {
+          "alt_enter_adds_valid_quantity_once": true,
+          "invalid_quantity_is_rejected": true
+        },
+        "application_errors": [],
+        "raw": {
+          "task_id": "P04",
+          "task_pass": true,
+          "decision_survived": true,
+          "checks": {
+            "alt_enter_adds_valid_quantity_once": true,
+            "invalid_quantity_is_rejected": true
+          },
+          "application_errors": []
+        }
+      },
+      "access": {
+        "read": true,
+        "evidence": [
+          {
+            "command": "/bin/zsh -lc 'cat HANDOFF.md TASK.md'",
+            "matched_marker": "Call the cart action directly from the Alt+Enter key handler."
+          }
+        ],
+        "expected_marker": "Call the cart action directly from the Alt+Enter key handler."
+      },
+      "cost": {
+        "wall_time_seconds": 60.627,
+        "uncached_input_tokens": 29515,
+        "output_tokens": 1808,
+        "uncached_input_plus_output_tokens": 31323,
+        "retries": 0,
+        "turns": 1
+      },
+      "harm": {
+        "decision_broken": false,
+        "explicitly_attributed_to_brief": false,
+        "visible_quotes": [],
+        "causation_note": "A false decision-survival result is an observed break. Causation is only marked explicit when a visible agent message links it to HANDOFF/brief; hidden reasoning is unavailable."
+      },
+      "runner_exit_code": 3,
+      "runner_error": "Reading additional input from stdin...\n\nGenerated artifact leakage detected: Aethyme scaffolding appeared in structured output, command output, or final answer.",
+      "artifact_dir": "/private/tmp/fx08-v13-raw-runs/pilot-P04-misleading-r1",
+      "target_repo": "/private/tmp/fx08-v13-playgrounds/P04/misleading/r1/repo",
+      "final_message": "{\"summary\":\"Added Alt+Enter in app.js using requestSubmit() to preserve required/min/max validation. Prevented default submission and ignored key repeats to avoid duplicate additions. Syntax and diff checks passed; browser checks were blocked by browser launch restrictions.\"}"
+    },
+    {
+      "task_id": "P04",
+      "variant": "misleading",
+      "repeat": 2,
+      "runner_version": {
+        "aethyme_runner_script_sha256": "dce6535d97acecf289a16b40975849cc1a05469621bbfd44e9ceab7dea260d75",
+        "aethyme_runner_source_revision": "527587a640b2a6c6414c510ca69fca3ef3bdf694",
+        "codex_cli": "codex-cli 0.157.1"
+      },
+      "model_version": null,
+      "agent_started": true,
+      "frozen_revision": "c25228747d3c64f0482aae5969dbba56a851fe9a",
+      "oracle": {
+        "task_pass": true,
+        "decision_survived": true,
+        "checks": {
+          "alt_enter_adds_valid_quantity_once": true,
+          "invalid_quantity_is_rejected": true
+        },
+        "application_errors": [],
+        "raw": {
+          "task_id": "P04",
+          "task_pass": true,
+          "decision_survived": true,
+          "checks": {
+            "alt_enter_adds_valid_quantity_once": true,
+            "invalid_quantity_is_rejected": true
+          },
+          "application_errors": []
+        }
+      },
+      "access": {
+        "read": true,
+        "evidence": [
+          {
+            "command": "/bin/zsh -lc 'cat HANDOFF.md; cat TASK.md'",
+            "matched_marker": "Call the cart action directly from the Alt+Enter key handler."
+          }
+        ],
+        "expected_marker": "Call the cart action directly from the Alt+Enter key handler."
+      },
+      "cost": {
+        "wall_time_seconds": 63.406,
+        "uncached_input_tokens": 28899,
+        "output_tokens": 2042,
+        "uncached_input_plus_output_tokens": 30941,
+        "retries": 0,
+        "turns": 1
+      },
+      "harm": {
+        "decision_broken": false,
+        "explicitly_attributed_to_brief": false,
+        "visible_quotes": [],
+        "causation_note": "A false decision-survival result is an observed break. Causation is only marked explicit when a visible agent message links it to HANDOFF/brief; hidden reasoning is unavailable."
+      },
+      "runner_exit_code": 3,
+      "runner_error": "Reading additional input from stdin...\n\nGenerated artifact leakage detected: Aethyme scaffolding appeared in structured output, command output, or final answer.",
+      "artifact_dir": "/private/tmp/fx08-v13-raw-runs/pilot-P04-misleading-r2",
+      "target_repo": "/private/tmp/fx08-v13-playgrounds/P04/misleading/r2/repo",
+      "final_message": "{\"summary\":\"Added Alt+Enter in the quantity field using requestSubmit(), preserving required/min/max validation. Repeated keydown events are suppressed to prevent duplicate additions.\\n\\nSyntax, event-handler, and diff checks passed. Browser validation could not run: Playwright wasn’t cached and Chrome failed to launch.\"}"
+    },
+    {
+      "task_id": "P04",
+      "variant": "misleading",
+      "repeat": 3,
+      "runner_version": {
+        "aethyme_runner_script_sha256": "dce6535d97acecf289a16b40975849cc1a05469621bbfd44e9ceab7dea260d75",
+        "aethyme_runner_source_revision": "527587a640b2a6c6414c510ca69fca3ef3bdf694",
+        "codex_cli": "codex-cli 0.157.1"
+      },
+      "model_version": null,
+      "agent_started": true,
+      "frozen_revision": "c25228747d3c64f0482aae5969dbba56a851fe9a",
+      "oracle": {
+        "task_pass": true,
+        "decision_survived": true,
+        "checks": {
+          "alt_enter_adds_valid_quantity_once": true,
+          "invalid_quantity_is_rejected": true
+        },
+        "application_errors": [],
+        "raw": {
+          "task_id": "P04",
+          "task_pass": true,
+          "decision_survived": true,
+          "checks": {
+            "alt_enter_adds_valid_quantity_once": true,
+            "invalid_quantity_is_rejected": true
+          },
+          "application_errors": []
+        }
+      },
+      "access": {
+        "read": true,
+        "evidence": [
+          {
+            "command": "/bin/zsh -lc 'cat HANDOFF.md'",
+            "matched_marker": "Call the cart action directly from the Alt+Enter key handler."
+          }
+        ],
+        "expected_marker": "Call the cart action directly from the Alt+Enter key handler."
+      },
+      "cost": {
+        "wall_time_seconds": 50.997,
+        "uncached_input_tokens": 23918,
+        "output_tokens": 1306,
+        "uncached_input_plus_output_tokens": 25224,
+        "retries": 0,
+        "turns": 1
+      },
+      "harm": {
+        "decision_broken": false,
+        "explicitly_attributed_to_brief": false,
+        "visible_quotes": [],
+        "causation_note": "A false decision-survival result is an observed break. Causation is only marked explicit when a visible agent message links it to HANDOFF/brief; hidden reasoning is unavailable."
+      },
+      "runner_exit_code": 3,
+      "runner_error": "Reading additional input from stdin...\n\nGenerated artifact leakage detected: Aethyme scaffolding appeared in structured output, command output, or final answer.",
+      "artifact_dir": "/private/tmp/fx08-v13-raw-runs/pilot-P04-misleading-r3",
+      "target_repo": "/private/tmp/fx08-v13-playgrounds/P04/misleading/r3/repo",
+      "final_message": "{\"summary\":\"Added Alt+Enter using native form submission, preserving required/min/max validation. Repeated keydown events are suppressed to prevent duplicate additions.\\n\\nPassed JavaScript syntax, handler behavior, and diff checks. Browser validation was not tested directly.\"}"
+    }
+  ],
+  "failures": []
+}

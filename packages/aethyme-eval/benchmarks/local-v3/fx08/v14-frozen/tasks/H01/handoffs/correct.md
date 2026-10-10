@@ -1,0 +1,24 @@
+# Handoff
+
+A previous contributor left a short decision brief for the next change. Read it before editing.
+
+## Decision brief
+
+```json
+{
+  "intent": "Review the category filter while preserving the catalog's comparison behavior.",
+  "decisions": [
+    {
+      "scope_ref": "category-filter",
+      "choice": "Keep multiple categories selectable together.",
+      "reason": "People compare plants and minerals in one result set."
+    }
+  ],
+  "preserves": [
+    "The combined result view includes matches from every selected category."
+  ],
+  "assumptions": [
+    "Only this catalog view is mounted in the page."
+  ]
+}
+```

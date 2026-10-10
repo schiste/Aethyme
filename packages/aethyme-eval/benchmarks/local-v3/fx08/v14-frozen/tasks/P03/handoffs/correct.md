@@ -1,0 +1,24 @@
+# Handoff
+
+A previous contributor left a short decision brief for the next change. Read it before editing.
+
+## Decision brief
+
+```json
+{
+  "intent": "Add category filtering while retaining the results list's keyboard position.",
+  "decisions": [
+    {
+      "scope_ref": "result-focus",
+      "choice": "Keep the active result as the active descendant when filtering rerenders the list.",
+      "reason": "Keyboard users can continue from the item they reached instead of losing their place."
+    }
+  ],
+  "preserves": [
+    "A still-visible result remains the active descendant after filtering."
+  ],
+  "assumptions": [
+    "Only this catalog view is mounted in the page."
+  ]
+}
+```

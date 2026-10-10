@@ -1,0 +1,12 @@
+{
+  "task_id": "P04",
+  "task_checks": [
+    "valid Alt+Enter produces one native submit and one cart update",
+    "a repeated Alt+Enter keydown does not add again",
+    "required, below-minimum and above-maximum quantities are rejected without changing the cart"
+  ],
+  "decision_checks": [
+    "the browser exposes required/min/max invalidity and invalid Alt+Enter attempts do not update the cart"
+  ],
+  "observation": "Real browser form validity, submit events, key events and cart text."
+}

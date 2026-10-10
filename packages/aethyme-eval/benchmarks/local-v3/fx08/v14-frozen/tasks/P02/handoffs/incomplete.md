@@ -1,0 +1,24 @@
+# Handoff
+
+A previous contributor left a short decision brief for the next change. Read it before editing.
+
+## Decision brief
+
+```json
+{
+  "intent": "Adapt the primary catalog search for narrow screens without coupling the two search panels.",
+  "decisions": [
+    {
+      "scope_ref": "quick-find",
+      "choice": "Keep the primary and Quick Find controls labeled and easy to reach.",
+      "reason": "The page exposes two catalog search actions for different browsing moments."
+    }
+  ],
+  "preserves": [
+    "Both search panels remain discoverable on narrow screens and usable by keyboard."
+  ],
+  "assumptions": [
+    "Only this catalog view is mounted in the page."
+  ]
+}
+```

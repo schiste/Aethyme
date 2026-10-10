@@ -1,0 +1,24 @@
+# Handoff
+
+A previous contributor left a short decision brief for the next change. Read it before editing.
+
+## Decision brief
+
+```json
+{
+  "intent": "Add a quantity-field shortcut while preserving the form's input constraints.",
+  "decisions": [
+    {
+      "scope_ref": "form-validity",
+      "choice": "Call the cart action directly from the Alt+Enter key handler.",
+      "reason": "The minimum and maximum are spinner hints and do not block programmatic actions."
+    }
+  ],
+  "preserves": [
+    "The shortcut should feel immediate."
+  ],
+  "assumptions": [
+    "Only this catalog view is mounted in the page."
+  ]
+}
+```

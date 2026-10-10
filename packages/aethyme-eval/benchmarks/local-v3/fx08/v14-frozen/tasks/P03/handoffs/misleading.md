@@ -1,0 +1,24 @@
+# Handoff
+
+A previous contributor left a short decision brief for the next change. Read it before editing.
+
+## Decision brief
+
+```json
+{
+  "intent": "Add category filtering while retaining the results list's keyboard position.",
+  "decisions": [
+    {
+      "scope_ref": "result-focus",
+      "choice": "Reset the active descendant to the first item after each filter change.",
+      "reason": "Filtering replaces the result nodes, so preserving the old position would point at stale markup."
+    }
+  ],
+  "preserves": [
+    "The first visible result is an obvious starting point after filtering."
+  ],
+  "assumptions": [
+    "Only this catalog view is mounted in the page."
+  ]
+}
+```

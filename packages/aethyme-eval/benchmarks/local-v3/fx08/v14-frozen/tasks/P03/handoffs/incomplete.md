@@ -1,0 +1,24 @@
+# Handoff
+
+A previous contributor left a short decision brief for the next change. Read it before editing.
+
+## Decision brief
+
+```json
+{
+  "intent": "Add category filtering while retaining the results list's keyboard position.",
+  "decisions": [
+    {
+      "scope_ref": "result-focus",
+      "choice": "Keep result categories understandable and selection available from the keyboard.",
+      "reason": "The catalog list is browsed with arrow keys and can select its active result."
+    }
+  ],
+  "preserves": [
+    "Category filtering should not hide the active result's name."
+  ],
+  "assumptions": [
+    "Only this catalog view is mounted in the page."
+  ]
+}
+```

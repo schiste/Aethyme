@@ -1,0 +1,10 @@
+{
+  "check": "runner resolves the frozen output schema before rejecting a non-Playground target",
+  "runner_exit_code": 2,
+  "result": {
+    "error": "Eval target must live under a Playground root (/private/tmp/fx08-v11-playgrounds)",
+    "contract_failed": true,
+    "arm": "control"
+  },
+  "agent_invoked": false
+}

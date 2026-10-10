@@ -1,0 +1,12 @@
+{
+  "task_id": "P01",
+  "task_checks": [
+    "one accessible search landmark contains one searchbox with an associated non-empty label",
+    "Search button and Enter both filter the visible catalog without navigation",
+    "Ctrl+K and Cmd+K focus the searchbox"
+  ],
+  "decision_checks": [
+    "the input retains id global-search and both keyboard shortcuts still focus it"
+  ],
+  "observation": "Rendered browser DOM, real click/keyboard events, result text and page-load counter; no expected source file."
+}

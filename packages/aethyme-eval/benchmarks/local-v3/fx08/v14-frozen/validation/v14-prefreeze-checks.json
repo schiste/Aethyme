@@ -1,0 +1,212 @@
+{
+  "version": "FX08 v14 pre-freeze checks",
+  "checks": {
+    "approved_task_descriptions": [
+      "P01",
+      "P02",
+      "P03",
+      "P04",
+      "H01",
+      "H02"
+    ],
+    "all_24_brief_files_unchanged_from_v13": true,
+    "required_checker_validation_record": "24/24 ok",
+    "handoff_framing_same_within_each_task": true,
+    "absent_handoff_text_exact": true,
+    "embedded_briefs_match_json_files": true,
+    "task_oracle_baselines_and_behavior_controls": "12/12 passed",
+    "python_syntax": "passed",
+    "node_syntax": "passed",
+    "runner_sha256_matches": true,
+    "pilot_jobs": 48,
+    "heldout_jobs_excluded": 8,
+    "runner_codex_cli": "codex-cli 0.157.1",
+    "playwright": "1.64.0-alpha-1790635538000",
+    "chrome": "154.0.8037.98",
+    "agent_or_model_invoked": false,
+    "playground_roots_unused_before_freeze": true
+  },
+  "handoff_framing_sha256": {
+    "P01": "39cb1e70dbb145abceece6c949dc97142358c342abe428d86e8f68306d789423",
+    "P02": "39cb1e70dbb145abceece6c949dc97142358c342abe428d86e8f68306d789423",
+    "P03": "39cb1e70dbb145abceece6c949dc97142358c342abe428d86e8f68306d789423",
+    "P04": "39cb1e70dbb145abceece6c949dc97142358c342abe428d86e8f68306d789423",
+    "H01": "39cb1e70dbb145abceece6c949dc97142358c342abe428d86e8f68306d789423",
+    "H02": "39cb1e70dbb145abceece6c949dc97142358c342abe428d86e8f68306d789423"
+  },
+  "brief_file_sha256": [
+    {
+      "task_id": "P01",
+      "variant": "absent",
+      "sha256": "7d573defcf681496eb061907990d0f1f9b5ab92b978b9619aebe4e3fca459eed"
+    },
+    {
+      "task_id": "P01",
+      "variant": "correct",
+      "sha256": "7a31d731402441f8dd5278b12662870cabd9ce9594031de8663e2ce57a239432"
+    },
+    {
+      "task_id": "P01",
+      "variant": "incomplete",
+      "sha256": "da4a192ff747d6a45d6f760f1383f8c00ce12329fdd0d55b40b8fa4bf7517430"
+    },
+    {
+      "task_id": "P01",
+      "variant": "misleading",
+      "sha256": "f112800c1653d7801655307050da4f0c1cfd1bce0562ceba80b2ec7c523a4c43"
+    },
+    {
+      "task_id": "P02",
+      "variant": "absent",
+      "sha256": "7d573defcf681496eb061907990d0f1f9b5ab92b978b9619aebe4e3fca459eed"
+    },
+    {
+      "task_id": "P02",
+      "variant": "correct",
+      "sha256": "69dfa6d0a01ed39f5483891285b27c63dee28d81d02d720eb06e6186a4d6e548"
+    },
+    {
+      "task_id": "P02",
+      "variant": "incomplete",
+      "sha256": "729eedf17fb9bbc9b41cea9023b6416ffe36911d536e74d0f36b2ccabcb40e95"
+    },
+    {
+      "task_id": "P02",
+      "variant": "misleading",
+      "sha256": "45b63b60aaab0bdf75adc914af56fcdffe36e30758ebaefbcd4a9ed821780f28"
+    },
+    {
+      "task_id": "P03",
+      "variant": "absent",
+      "sha256": "7d573defcf681496eb061907990d0f1f9b5ab92b978b9619aebe4e3fca459eed"
+    },
+    {
+      "task_id": "P03",
+      "variant": "correct",
+      "sha256": "a7092d76941bc058c62865e6fb33c52496d1e3a7f21022014dbfe706d10e160a"
+    },
+    {
+      "task_id": "P03",
+      "variant": "incomplete",
+      "sha256": "62fd1bc7a9ffe6c3e2cffe5e7cd90ed3c970f0ff3dde5a5c3f1a1a17ab19b749"
+    },
+    {
+      "task_id": "P03",
+      "variant": "misleading",
+      "sha256": "0d3d51e9142196f3f099639c56b16721b8f2c491f332c47402bf93c0b753c0b5"
+    },
+    {
+      "task_id": "P04",
+      "variant": "absent",
+      "sha256": "7d573defcf681496eb061907990d0f1f9b5ab92b978b9619aebe4e3fca459eed"
+    },
+    {
+      "task_id": "P04",
+      "variant": "correct",
+      "sha256": "045c7836d6859cb8e4f697b8e09d8eacdfef27a46bfba182b07f94d58b5822dd"
+    },
+    {
+      "task_id": "P04",
+      "variant": "incomplete",
+      "sha256": "286de161cb2b6f3fb10c197061b78a872f76fb689bfb39577e845fb25603340c"
+    },
+    {
+      "task_id": "P04",
+      "variant": "misleading",
+      "sha256": "4cc9a347997cb610a6d10a882813436799f54f8feaeb6eba6123558cc7727aee"
+    },
+    {
+      "task_id": "H01",
+      "variant": "absent",
+      "sha256": "7d573defcf681496eb061907990d0f1f9b5ab92b978b9619aebe4e3fca459eed"
+    },
+    {
+      "task_id": "H01",
+      "variant": "correct",
+      "sha256": "4af8b38a5db706cfc21d3ab551a1e8a2f43996938fd68385f0a7ccfad453d46d"
+    },
+    {
+      "task_id": "H01",
+      "variant": "incomplete",
+      "sha256": "57f9c42ec5049bb816951a87640211a5dcbe3ea030621bd32f908b855952b89a"
+    },
+    {
+      "task_id": "H01",
+      "variant": "misleading",
+      "sha256": "fabf1e414f7b9a62cdded64b91e42fe266cfe7500fe7015fdc3b91370e63e336"
+    },
+    {
+      "task_id": "H02",
+      "variant": "absent",
+      "sha256": "7d573defcf681496eb061907990d0f1f9b5ab92b978b9619aebe4e3fca459eed"
+    },
+    {
+      "task_id": "H02",
+      "variant": "correct",
+      "sha256": "018c209425265d1a9f78647b1eb8ad02b2fdfa7d9b21aaae7a96c67c361f0ef7"
+    },
+    {
+      "task_id": "H02",
+      "variant": "incomplete",
+      "sha256": "0d1e54fdf965bb48cd70f14daa90a5ae027e1f9e42b250070ed1a727f20214e7"
+    },
+    {
+      "task_id": "H02",
+      "variant": "misleading",
+      "sha256": "b05c489732c486552c42d60f069b53f926be9c1b80cc2e09198ab58f1bc5e7e9"
+    }
+  ],
+  "brief_token_counts": {
+    "H01": {
+      "absent": 9,
+      "correct": 85,
+      "incomplete": 88,
+      "misleading": 95
+    },
+    "H02": {
+      "absent": 9,
+      "correct": 84,
+      "incomplete": 92,
+      "misleading": 90
+    },
+    "P01": {
+      "absent": 9,
+      "correct": 89,
+      "incomplete": 88,
+      "misleading": 97
+    },
+    "P02": {
+      "absent": 9,
+      "correct": 107,
+      "incomplete": 101,
+      "misleading": 98
+    },
+    "P03": {
+      "absent": 9,
+      "correct": 107,
+      "incomplete": 100,
+      "misleading": 110
+    },
+    "P04": {
+      "absent": 9,
+      "correct": 89,
+      "incomplete": 85,
+      "misleading": 89
+    }
+  },
+  "brief_length_note": "The absent HANDOFF section is exactly the required short sentence; its 9-token brief file cannot match the 85-110-token non-absent variants without ceasing to represent absence. Correct/incomplete/misleading variants are similar within each task.",
+  "oracle_smoke_summary": {
+    "runs": 12,
+    "agent_invoked": false,
+    "assertions": "all passed",
+    "record": "validation/v14-oracle-smoke.json"
+  },
+  "freeze_order": {
+    "before_v14_agent_runs": true,
+    "before_first_ever_agent_run": false,
+    "heldout_previously_exposed": [
+      "H01",
+      "H02"
+    ]
+  }
+}
