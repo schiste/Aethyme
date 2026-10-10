@@ -554,3 +554,261 @@ fn held_out_cases_never_yield_a_failing_candidate() {
     }
     eprintln!("{}", table.join("\n"));
 }
+
+// ------------------------------------------- path rules beyond the fixtures
+
+/// A repository with one commit per tree, each a map of path to (mode,
+/// content), parented as given.
+struct Adhoc {
+    _root: tempfile::TempDir,
+    store: CollaborationStore,
+    repo: PathBuf,
+}
+
+fn git_in(repo: &Path, args: &[&str], input: Option<&[u8]>) -> String {
+    use std::io::Write as _;
+    let mut child = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .env("GIT_AUTHOR_NAME", "t")
+        .env("GIT_AUTHOR_EMAIL", "t@example.invalid")
+        .env("GIT_COMMITTER_NAME", "t")
+        .env("GIT_COMMITTER_EMAIL", "t@example.invalid")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(input.unwrap_or_default())
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success(), "git {args:?}");
+    String::from_utf8(output.stdout).unwrap().trim().to_string()
+}
+
+impl Adhoc {
+    fn new() -> Self {
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        git_in(&repo, &["init", "-q"], None);
+        let store = open_store(&root.path().join("state"), &repo);
+        Self {
+            _root: root,
+            store,
+            repo,
+        }
+    }
+
+    fn commit(&self, files: &[(&str, &str, &[u8])], parent: Option<&str>) -> String {
+        let mut listing = Vec::new();
+        for (path, mode, content) in files {
+            let oid = git_in(&self.repo, &["hash-object", "-w", "--stdin"], Some(content));
+            listing.extend_from_slice(format!("{mode} blob {oid}\t{path}\n").as_bytes());
+        }
+        let tree = git_in(&self.repo, &["mktree"], Some(&listing));
+        let mut args = vec!["commit-tree", tree.as_str(), "-m", "t"];
+        if let Some(parent) = parent {
+            args.extend(["-p", parent]);
+        }
+        git_in(&self.repo, &args, None)
+    }
+
+    fn capture(&mut self, id: &str, base: &str, result: &str) -> ContributionSpec {
+        let request = CaptureRequest {
+            operation_id: OperationId::mint().unwrap(),
+            repository: self.repo.clone(),
+            base: CommitOid::parse(base).unwrap(),
+            result: CommitOid::parse(result).unwrap(),
+            policy: CapturePolicy::Advisory,
+            retention: RetentionBoundary::UntilReleased,
+        };
+        let CaptureOutcome::Acknowledged(receipt) = capture(&mut self.store, &request).unwrap()
+        else {
+            panic!("incomplete capture");
+        };
+        ContributionSpec {
+            id: id.into(),
+            lineage: receipt.contribution,
+            requires: Vec::new(),
+            atomic_group: None,
+            revision_of: None,
+            derived_from: Vec::new(),
+        }
+    }
+
+    fn compose(&mut self, baseline: &str, catalog: Vec<ContributionSpec>) -> Composition {
+        let baseline = collaboration_archive::snapshot_of_commit(
+            &self.repo,
+            &CommitOid::parse(baseline).unwrap(),
+        )
+        .unwrap()
+        .id();
+        let deliveries = catalog.iter().map(|spec| spec.id.clone()).collect();
+        composer::compose(
+            &mut self.store,
+            &self.repo,
+            &CompositionRequest {
+                baseline,
+                catalog,
+                deliveries,
+                budget: CompositionBudget::default(),
+            },
+        )
+        .unwrap()
+    }
+}
+
+fn reasons(composition: &Composition) -> Vec<ConflictReason> {
+    match &composition.outcome {
+        CompositionOutcome::Conflict { conflicts, .. } => {
+            conflicts.iter().map(|conflict| conflict.reason).collect()
+        }
+        other => panic!("expected a conflict, got {other:?}"),
+    }
+}
+
+#[test]
+fn each_path_conflict_has_its_reason_and_one_side_changes_apply() {
+    const R: &str = "100644";
+    const X: &str = "100755";
+    let mut world = Adhoc::new();
+    let base = world.commit(
+        &[
+            ("doc.txt", R, b"one\ntwo\nthree\n"),
+            ("tool.sh", R, b"echo hi\n"),
+            ("image.bin", R, b"\0base"),
+        ],
+        None,
+    );
+    let edit = |world: &Adhoc, files: &[(&str, &str, &[u8])]| world.commit(files, Some(&base));
+
+    // Delete versus modify.
+    let deleted = edit(
+        &world,
+        &[("tool.sh", R, b"echo hi\n"), ("image.bin", R, b"\0base")],
+    );
+    let modified = edit(
+        &world,
+        &[
+            ("doc.txt", R, b"one\nTWO\nthree\n"),
+            ("tool.sh", R, b"echo hi\n"),
+            ("image.bin", R, b"\0base"),
+        ],
+    );
+    let catalog = vec![
+        world.capture("deleted", &base, &deleted),
+        world.capture("modified", &base, &modified),
+    ];
+    assert_eq!(
+        reasons(&world.compose(&base, catalog)),
+        [ConflictReason::DeleteModify]
+    );
+
+    // Add versus add, with different content.
+    let mut files = vec![
+        ("doc.txt", R, b"one\ntwo\nthree\n" as &[u8]),
+        ("tool.sh", R, b"echo hi\n"),
+        ("image.bin", R, b"\0base"),
+    ];
+    files.push(("new.txt", R, b"left\n"));
+    let left = edit(&world, &files);
+    files.pop();
+    files.push(("new.txt", R, b"right\n"));
+    let right = edit(&world, &files);
+    let catalog = vec![
+        world.capture("left", &base, &left),
+        world.capture("right", &base, &right),
+    ];
+    assert_eq!(
+        reasons(&world.compose(&base, catalog)),
+        [ConflictReason::AddAdd]
+    );
+
+    // Two different binary replacements.
+    let ours = edit(
+        &world,
+        &[
+            ("doc.txt", R, b"one\ntwo\nthree\n"),
+            ("tool.sh", R, b"echo hi\n"),
+            ("image.bin", R, b"\0ours"),
+        ],
+    );
+    let theirs = edit(
+        &world,
+        &[
+            ("doc.txt", R, b"one\ntwo\nthree\n"),
+            ("tool.sh", R, b"echo hi\n"),
+            ("image.bin", R, b"\0theirs"),
+        ],
+    );
+    let catalog = vec![
+        world.capture("ours", &base, &ours),
+        world.capture("theirs", &base, &theirs),
+    ];
+    assert_eq!(
+        reasons(&world.compose(&base, catalog)),
+        [ConflictReason::Binary]
+    );
+
+    // A mode change on one side and a content change on the other compose.
+    let executable = edit(
+        &world,
+        &[
+            ("doc.txt", R, b"one\ntwo\nthree\n"),
+            ("tool.sh", X, b"echo hi\n"),
+            ("image.bin", R, b"\0base"),
+        ],
+    );
+    let reworded = edit(
+        &world,
+        &[
+            ("doc.txt", R, b"one\ntwo\nthree\n"),
+            ("tool.sh", R, b"echo hello\n"),
+            ("image.bin", R, b"\0base"),
+        ],
+    );
+    let catalog = vec![
+        world.capture("executable", &base, &executable),
+        world.capture("reworded", &base, &reworded),
+    ];
+    let composition = world.compose(&base, catalog);
+    let candidate = composition.outcome.candidate().expect("a candidate");
+    let listing = git_in(
+        &world.repo,
+        &["ls-tree", candidate.commit.as_str(), "tool.sh"],
+        None,
+    );
+    assert!(listing.starts_with("100755 "), "{listing}");
+    let content = git_in(
+        &world.repo,
+        &["show", &format!("{}:tool.sh", candidate.commit.as_str())],
+        None,
+    );
+    assert_eq!(content, "echo hello");
+
+    // A contribution and its revert, built on it, leave the baseline as
+    // it was; a contribution based on something else is unknown.
+    let reverted = world.commit(
+        &[
+            ("doc.txt", R, b"one\ntwo\nthree\n"),
+            ("tool.sh", R, b"echo hi\n"),
+            ("image.bin", R, b"\0base"),
+        ],
+        Some(&modified),
+    );
+    let catalog = vec![
+        world.capture("modified", &base, &modified),
+        world.capture("revert", &modified, &reverted),
+    ];
+    assert_eq!(world.compose(&base, catalog).outcome.code(), "no_change");
+    let catalog = vec![world.capture("modified", &base, &modified)];
+    assert_eq!(
+        world.compose(&modified, catalog).outcome.code(),
+        "unknown_base"
+    );
+}
