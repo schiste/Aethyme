@@ -100,6 +100,16 @@ that shows which of them GC would reclaim, or `null` when there are none).
 
 `cleanup_retention.host_available_bytes` and `cleanup_retention.host_volume_probe` (introduced 2026-10-01) report free space where this repository's gates run -- the lower of the broker worktree root and host state, each read at its nearest existing directory -- and the directory read, or `null` when it cannot be read. Below the 8 GiB a gate needs to start, `advice` carries a `host.gate-headroom` row with severity `blocked`, emitted whether or not the repository retains worktrees, with `aethyme broker gc plan` and `aethyme broker gc storage plan` as its commands.
 
+`collaboration_fence` (introduced 2026-10-10, #660) is present only when this
+repository's committed config requires collaboration capture:
+`{"min_compatible_schema": 50, "reason": "collaboration capture required",
+"source": "committed", "state": "active" | "pending"}`. `active`: the
+`broker.db` floor is raised and binaries older than that schema cannot open the
+repository. `pending`: required but not yet raised, because this status ran on
+a read-only snapshot or the write failed. The advice row
+`collaboration.fence-pending` then names the next action. The floor is never
+lowered, so an `active` fence stays after `required` is turned off.
+
 `in_flight_submits` (introduced 2026-10-02) lists the `broker submit` runs in
 progress in this repository, oldest first, and is omitted when none is
 running. Each has `session_id`, `pid`, `phase` (`starting`, `auditing lease
@@ -422,6 +432,49 @@ provides provenance and recovery for the same paths. `promoted: true` means the
 integration branch advanced in this call. `no_changes: true` means replay left
 the integration tree unchanged: the queue entry is `superseded`, no gates ran,
 and no promotion commit or ref movement occurred.
+
+`collaboration_capture` (introduced 2026-10-09, #660, experimental) is present
+only when the repository opts in with `[collaboration] capture = "advisory"`
+or `"required"` in `.aethyme/config.toml`. It is the last field; every legacy
+field keeps its name, value and order. Without the opt-in the output is
+unchanged.
+
+```
+"collaboration_capture": {
+  "schema": "aethyme.submit-capture/experimental-v0",
+  "policy": "advisory" | "required" | "unsupported",
+  "config_source": "committed" | "working_copy",
+  "status": "acknowledged" | "incomplete" | "refused" | "failed" | "in_progress"
+            | "not_configured",
+  "operation_id": "submit:<40 hex>",       // omitted before inputs are known
+  "base_commit": "<full commit>",          // merge base of the head and the verification base
+  "result_commit": "<full commit>",        // session head
+  "receipt": {                             // only when acknowledged
+    "status": "retained_local",
+    "durability": "local_durable" | "local_unverified",
+    "contribution": "sha256:...",
+    "base_snapshot": "sha256:...",
+    "result_snapshot": "sha256:...",
+    "retention": "until_released" | "until_ms:<ms>",
+    "receipt_record": "sha256:..."
+  },
+  "code": "...", "detail": "<path-free>", "next_action": "..."   // when not acknowledged
+}
+```
+
+An advisory capture never changes the legacy verdict, `promoted` or the exit
+code. A required capture runs before anything is queued; when it is not
+acknowledged, submit prints `{"submitted": false, "collaboration_capture": ...}`
+and exits 3 with no queue entry, gate run or promotion. If the session head
+moves after a required capture, submit refuses with `CapturedHeadMoved` (exit
+3) before any queue entry and prints `{"submitted": false, "error": {"code":
+"captured_head_moved", "message": "..."}, "collaboration_capture": ...}`, so a
+receipt always names the submitted commit. An advisory receipt names the
+`entry.head_commit` that was submitted. Under `required`, a promotion of a head
+without an acknowledged required capture is refused with
+`CaptureRequiredForPromotion` (exit 3). A `capture` value this
+binary does not implement is reported with `policy: "unsupported"` and code
+`unsupported_policy`, and treated as a required capture that failed.
 
 ### `report list --json`
 

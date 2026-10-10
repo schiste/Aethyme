@@ -85,6 +85,16 @@ pub fn archive_use(store: &CollaborationStore) -> std::io::Result<ArchiveUse> {
     Ok(ArchiveUse { _file: file })
 }
 
+/// [`archive_use`] without waiting: `None` while a reclamation applies.
+pub fn try_archive_use(store: &CollaborationStore) -> std::io::Result<Option<ArchiveUse>> {
+    let file = open_archive_lock(store)?;
+    match file.try_lock_shared() {
+        Ok(()) => Ok(Some(ArchiveUse { _file: file })),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+        Err(std::fs::TryLockError::Error(source)) => Err(source),
+    }
+}
+
 struct ArchiveExclusive {
     /// Closing the file releases the lock.
     _file: std::fs::File,
@@ -2360,6 +2370,34 @@ mod tests {
         );
         drop(exclusive);
         reader.join().unwrap().unwrap();
+    }
+
+    /// Advisory capture never waits for a reclamation (#660): while an apply
+    /// holds the archive, `try_capture` steps aside, and it captures once the
+    /// apply is done.
+    #[test]
+    fn a_non_blocking_capture_steps_aside_for_an_apply() {
+        let host = tempfile::tempdir().unwrap();
+        let (source, base, result) = repo("x");
+        let mut store = open(host.path());
+        let request = request(
+            source.path(),
+            "op-1",
+            &base,
+            &result,
+            RetentionBoundary::UntilReleased,
+        );
+        let exclusive = try_exclusive(&store).unwrap().unwrap();
+        assert!(
+            crate::collaboration_capture::try_capture(&mut store, &request)
+                .unwrap()
+                .is_none()
+        );
+        drop(exclusive);
+        assert!(matches!(
+            crate::collaboration_capture::try_capture(&mut store, &request).unwrap(),
+            Some(CaptureOutcome::Acknowledged(_))
+        ));
     }
 
     /// Grace is never shorter than a plan's lifetime.
