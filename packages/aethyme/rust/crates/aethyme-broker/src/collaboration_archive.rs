@@ -58,6 +58,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
 use aethyme_contracts::experimental_v0::canonical_json::{Object, Value};
+use aethyme_contracts::experimental_v0::source_snapshot::{MAX_PATH_BYTES, PathRejection};
 use aethyme_contracts::experimental_v0::{
     EntryKind, FieldKind, FieldSpec, Record, RecordId, RecordSchema, SourceEntry, SourceSnapshot,
     SourceSnapshotError, SourceSnapshotId,
@@ -184,6 +185,16 @@ pub enum ArchiveError {
          fetched, which capture never does. Capture from a full clone"
     )]
     PartialClone { setting: String },
+    #[error(
+        "source {kind} {oid} is {size} bytes; commits and trees over {limit} bytes are refused \
+         rather than read into memory"
+    )]
+    SourceTooLarge {
+        oid: String,
+        kind: String,
+        size: u64,
+        limit: u64,
+    },
     #[error("source object {oid} matches its id but is not a well-formed {kind}")]
     MalformedSource { oid: String, kind: &'static str },
     #[error("{revision:?} does not name a commit in this repository")]
@@ -257,6 +268,7 @@ impl ArchiveError {
             Self::NotAnObjectId { .. } => "not_an_object_id",
             Self::NotACommit { .. } => "not_a_commit",
             Self::PartialClone { .. } => "partial_clone",
+            Self::SourceTooLarge { .. } => "source_too_large",
             Self::MalformedSource { .. } => "malformed_source",
             Self::UnknownRevision { .. } => "unknown_revision",
             Self::UnsupportedEntry { .. } => "unsupported_entry",
@@ -748,7 +760,9 @@ impl ObjectReader {
         Ok(content_hash.finalize().into())
     }
 
-    /// Read a small object whole.
+    /// Read a commit or tree whole. The size comes from the repository, so
+    /// it is capped before anything is allocated: a crafted multi-gigabyte
+    /// object must be a refusal, not an out-of-memory abort.
     fn read_whole(&mut self, oid: &str) -> Result<(String, Vec<u8>), ArchiveError> {
         let Some((kind, size)) = self.request(oid)? else {
             return Err(ArchiveError::SourceUnavailable {
@@ -756,6 +770,14 @@ impl ObjectReader {
                 detail: "missing from the repository".into(),
             });
         };
+        if size > MAX_METADATA_OBJECT_BYTES {
+            return Err(ArchiveError::SourceTooLarge {
+                oid: oid.to_string(),
+                kind,
+                size,
+                limit: MAX_METADATA_OBJECT_BYTES,
+            });
+        }
         let mut bytes = Vec::new();
         self.copy_body(oid, &kind, size, &mut bytes)?;
         Ok((kind, bytes))
@@ -794,56 +816,86 @@ fn commit_tree(commit: &str, body: &[u8], format: ObjectFormat) -> Result<String
         })
 }
 
-/// Every file under tree `oid`, reading each tree object through `reader`
-/// so it is checked against its id. `git ls-tree` would parse a damaged
-/// loose tree without noticing.
+/// The largest commit or tree object read into memory. A tree of 100,000
+/// entries is a few megabytes; real repositories stay far below this.
+const MAX_METADATA_OBJECT_BYTES: u64 = 64 * 1024 * 1024;
+
+/// List every non-tree entry under `root`, verifying each tree object
+/// against its id on the way.
+///
+/// The walk keeps its own stack rather than recursing, and refuses a path
+/// as soon as it passes the v0 snapshot's length limit, so a crafted deeply
+/// nested tree costs bounded work and can never overflow the thread stack.
 fn walk_tree(
     reader: &mut ObjectReader,
-    oid: &str,
-    prefix: &[u8],
+    root: &str,
     out: &mut Vec<TreeEntry>,
 ) -> Result<(), ArchiveError> {
-    let (kind, bytes) = reader.read_whole(oid)?;
-    if kind != "tree" {
-        return Err(ArchiveError::SourceMismatch {
-            oid: oid.to_string(),
-        });
+    // Pending work in reverse order, so entries come out in Git's tree
+    // order exactly as a recursive pre-order walk would emit them.
+    enum Item {
+        Tree(String, Vec<u8>),
+        File(TreeEntry),
     }
-    let malformed = || ArchiveError::MalformedSource {
-        oid: oid.to_string(),
-        kind: "tree",
-    };
-    let id_length = match reader.format {
-        ObjectFormat::Sha1 => 20,
-        ObjectFormat::Sha256 => 32,
-    };
-    let mut rest = bytes.as_slice();
-    while !rest.is_empty() {
-        let space = rest.iter().position(|b| *b == b' ').ok_or_else(malformed)?;
-        let mode = std::str::from_utf8(&rest[..space]).map_err(|_| malformed())?;
-        rest = &rest[space + 1..];
-        let nul = rest.iter().position(|b| *b == 0).ok_or_else(malformed)?;
-        let name = &rest[..nul];
-        rest = &rest[nul + 1..];
-        if name.is_empty() || name.contains(&b'/') || rest.len() < id_length {
-            return Err(malformed());
+    let mut pending = vec![Item::Tree(root.to_string(), Vec::new())];
+    while let Some(item) = pending.pop() {
+        let (oid, prefix) = match item {
+            Item::File(entry) => {
+                out.push(entry);
+                continue;
+            }
+            Item::Tree(oid, prefix) => (oid, prefix),
+        };
+        let (kind, bytes) = reader.read_whole(&oid)?;
+        if kind != "tree" {
+            return Err(ArchiveError::SourceMismatch { oid });
         }
-        let child = hex(&rest[..id_length]);
-        rest = &rest[id_length..];
-        let mut path = prefix.to_vec();
-        if !path.is_empty() {
-            path.push(b'/');
-        }
-        path.extend_from_slice(name);
-        if mode == "40000" {
-            walk_tree(reader, &child, &path, out)?;
-        } else {
-            out.push(TreeEntry {
-                mode: mode.to_string(),
-                oid: child,
-                path,
+        let malformed = || ArchiveError::MalformedSource {
+            oid: oid.clone(),
+            kind: "tree",
+        };
+        let id_length = match reader.format {
+            ObjectFormat::Sha1 => 20,
+            ObjectFormat::Sha256 => 32,
+        };
+        let mut children = Vec::new();
+        let mut rest = bytes.as_slice();
+        while !rest.is_empty() {
+            let space = rest.iter().position(|b| *b == b' ').ok_or_else(malformed)?;
+            let mode = std::str::from_utf8(&rest[..space]).map_err(|_| malformed())?;
+            rest = &rest[space + 1..];
+            let nul = rest.iter().position(|b| *b == 0).ok_or_else(malformed)?;
+            let name = &rest[..nul];
+            rest = &rest[nul + 1..];
+            if name.is_empty() || name.contains(&b'/') || rest.len() < id_length {
+                return Err(malformed());
+            }
+            let child = hex(&rest[..id_length]);
+            rest = &rest[id_length..];
+            let mut path = prefix.clone();
+            if !path.is_empty() {
+                path.push(b'/');
+            }
+            path.extend_from_slice(name);
+            if path.len() > MAX_PATH_BYTES {
+                return Err(ArchiveError::InvalidSnapshot(
+                    SourceSnapshotError::InvalidPath {
+                        path,
+                        reason: PathRejection::TooLong,
+                    },
+                ));
+            }
+            children.push(if mode == "40000" {
+                Item::Tree(child, path)
+            } else {
+                Item::File(TreeEntry {
+                    mode: mode.to_string(),
+                    oid: child,
+                    path,
+                })
             });
         }
+        pending.extend(children.into_iter().rev());
     }
     Ok(())
 }
@@ -1037,7 +1089,7 @@ pub(crate) fn retain_snapshot_with(
     }
     let root = commit_tree(commit.as_str(), &body, format)?;
     let mut tree = Vec::new();
-    walk_tree(&mut reader, &root, b"", &mut tree)?;
+    walk_tree(&mut reader, &root, &mut tree)?;
     for entry in &tree {
         // Gitlinks (160000) and any other non-file mode are refused here; a
         // mode #652 accepts is always a blob.
@@ -2229,6 +2281,118 @@ mod tests {
         let error = retain_snapshot(&mut store, source.path(), &head(source.path())).unwrap_err();
         assert_eq!(error.code(), "source_mismatch", "{error}");
         assert!(error.is_incomplete());
+        assert_eq!(rows(&mut store), 0);
+    }
+
+    /// Write `body` as a loose object of `kind` and return its id.
+    fn hash_object(repo: &Path, kind: &str, body: &[u8]) -> String {
+        let mut child = Command::new("git")
+            .args(["hash-object", "-w", "-t", kind, "--stdin"])
+            .current_dir(repo)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(body).unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success());
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
+    }
+
+    fn commit_object(repo: &Path, tree: &str, message: &[u8]) -> CommitOid {
+        let mut body =
+            format!("tree {tree}\nauthor t <t@t> 0 +0000\ncommitter t <t@t> 0 +0000\n\n")
+                .into_bytes();
+        body.extend_from_slice(message);
+        CommitOid::parse(&hash_object(repo, "commit", &body)).unwrap()
+    }
+
+    /// A tree nested 3,000 levels deep (`a/a/.../a/x`) would overflow the
+    /// stack of a recursive walk. It is refused as soon as its path passes
+    /// the snapshot limit, before the rest of the chain is read. (3,000 levels
+    /// overflow a recursive walk on the 256 KiB stack used here.)
+    #[test]
+    fn a_deeply_nested_tree_is_refused_without_exhausting_the_stack() {
+        use sha1::Digest as _;
+
+        let source = repo();
+        let blob = hash_object(source.path(), "blob", b"x");
+        let raw = |hex_id: &str| -> Vec<u8> {
+            (0..hex_id.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&hex_id[i..i + 2], 16).unwrap())
+                .collect()
+        };
+        // Compute the chain bottom-up, then write every tree in one call.
+        let objects = tempfile::tempdir().unwrap();
+        let mut paths = String::new();
+        let mut child = raw(&blob);
+        let mut entry = b"100644 x\0".to_vec();
+        for level in 0..3_000 {
+            let mut body = entry.clone();
+            body.extend_from_slice(&child);
+            let mut hasher = sha1::Sha1::new();
+            hasher.update(format!("tree {}\0", body.len()).as_bytes());
+            hasher.update(&body);
+            child = hasher.finalize().to_vec();
+            let file = objects.path().join(level.to_string());
+            std::fs::write(&file, &body).unwrap();
+            paths.push_str(&format!("{}\n", file.display()));
+            entry = b"40000 a\0".to_vec();
+        }
+        let mut writer = Command::new("git")
+            .args(["hash-object", "-w", "-t", "tree", "--stdin-paths"])
+            .current_dir(source.path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap();
+        writer
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(paths.as_bytes())
+            .unwrap();
+        assert!(writer.wait().unwrap().success());
+        let root: String = child.iter().map(|b| format!("{b:02x}")).collect();
+        let commit = commit_object(source.path(), &root, b"deep\n");
+
+        let (_host, mut store) = store();
+        let error = std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(move || {
+                let error = retain_snapshot(&mut store, source.path(), &commit).unwrap_err();
+                let refused = match &error {
+                    ArchiveError::InvalidSnapshot(SourceSnapshotError::InvalidPath {
+                        path,
+                        ..
+                    }) => path.len(),
+                    other => panic!("{other}"),
+                };
+                (error.code(), refused, rows(&mut store))
+            })
+            .unwrap()
+            .join()
+            .expect("the walk must not overflow a small stack");
+        assert_eq!(error.0, "invalid_snapshot");
+        // Refused at the first path over the limit, not after building the
+        // 6,000-byte path at the bottom of the chain.
+        assert!(error.1 <= MAX_PATH_BYTES + 2, "{}", error.1);
+        assert_eq!(error.2, 0);
+    }
+
+    /// Commit and tree sizes come from the repository; one over the cap is
+    /// refused before anything is allocated for it.
+    #[test]
+    fn an_oversized_commit_is_refused_before_it_is_read() {
+        let source = repo();
+        let tree = git_in(source.path(), &["rev-parse", "HEAD^{tree}"]);
+        let message = vec![b'm'; usize::try_from(MAX_METADATA_OBJECT_BYTES).unwrap() + 1];
+        let commit = commit_object(source.path(), &tree, &message);
+        let (_host, mut store) = store();
+        let error = retain_snapshot(&mut store, source.path(), &commit).unwrap_err();
+        assert_eq!(error.code(), "source_too_large", "{error}");
+        assert!(!error.is_incomplete());
         assert_eq!(rows(&mut store), 0);
     }
 

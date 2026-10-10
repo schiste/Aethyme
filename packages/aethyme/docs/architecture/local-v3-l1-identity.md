@@ -49,7 +49,7 @@ path; and the existing source digest hashes Git object ids.
 | Immutable preimage | Domain header, then per entry `mode SP sha256(content) SP path NUL`, sorted by raw path bytes. See the module docs. |
 | Encoding | `sha256:<64 lowercase hex>` |
 | Accepted | Regular `100644`, executable `100755`, symlink `120000`. Raw path bytes, including non-UTF-8 paths. |
-| Refused | Submodules and other modes; empty, absolute, `.`/`..`, `.git` (any case), NUL, `//`, trailing `/`, paths over 4096 bytes; duplicates; file/directory conflicts. Nothing is normalized. |
+| Refused | Submodules and other modes; empty, absolute, `.`/`..`, `.git` and every name a filesystem resolves to it (any case; HFS+ ignorable code points; NTFS trailing dots or spaces, `:` streams and `git~1`, as Git's `core.protectHFS`/`protectNTFS` refuse), NUL, `//`, trailing `/`, paths over 4096 bytes; duplicates; file/directory conflicts. Nothing is normalized. |
 | Case and composition | **Faithful (decided 2026-10-09).** Paths differing only by letter case or Unicode composition are distinct, valid entries, as in Git. Materialization (#670) must refuse such collisions explicitly on a case-insensitive or normalizing filesystem. |
 | Not | A Git object id, the graph manifest digest, or execution identity (#670). |
 

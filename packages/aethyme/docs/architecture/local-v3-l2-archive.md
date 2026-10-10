@@ -77,7 +77,7 @@ are harmless, and a retry reuses the object (#659 reclaims leftovers).
 |---|---|---|
 | Retained | — | — |
 | **Incomplete** (`is_incomplete()`) | `source_unavailable` (missing commit, tree or blob, including one that disappears mid-copy), `source_mismatch` (a commit, tree or blob that does not match its id), `history_unavailable` (missing parent, any shallow clone), `partial_clone` | Possibly, from a fuller source |
-| **Refused** | `unsupported_entry` (submodule or another mode #652 refuses), `unsupported_filter`, `malformed_source`, `invalid_snapshot`, `base_not_ancestor`, `not_a_commit`, `not_an_object_id` | No |
+| **Refused** | `unsupported_entry` (submodule or another mode #652 refuses), `unsupported_filter`, `malformed_source`, `source_too_large`, `invalid_snapshot`, `base_not_ancestor`, `not_a_commit`, `not_an_object_id` | No |
 
 None of these writes an index row, so none can be mistaken for a complete capture.
 
@@ -122,6 +122,14 @@ commit ids, the object format and the first-parent commit count.
   table: the filesystem reports exactly what it folds.
 
 ## Assumptions
+
+- **Bounded work for hostile repositories.** The repository decides object sizes and tree
+  shapes, so both are bounded before they cost anything. A commit or tree over 64 MiB is
+  refused (`source_too_large`) before it is read into memory. The tree walk keeps its own
+  stack and refuses a path as soon as it passes the 4096-byte snapshot limit
+  (`invalid_snapshot`), so a deeply nested tree cannot overflow the thread stack and abort
+  the process. Blob contents are streamed, never held whole. The total size of a capture
+  is bounded by #658's byte reservation.
 
 - **Source trust.** The bytes are whatever the contributor's repository holds under the
   pinned commit. Proving who authored them is not this layer's job.
