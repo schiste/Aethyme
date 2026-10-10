@@ -9,8 +9,12 @@
 //!   a valid `project`, read by the same fail-closed reader as `submit`
 //!   (#660). `status` and `enroll` always work; every other subcommand
 //!   refuses with the setting to change.
-//! - **Looking never writes.** `status` resolves and checks the state root
-//!   without creating it, and opens the store only when it already exists.
+//! - **Looking never writes.** `status` checks the state root and reads an
+//!   existing store through a read-only snapshot (no pragmas, migrations or
+//!   created files), and reads the fence without raising it. Only `broker
+//!   submit` creates collaboration state; every other subcommand refuses with
+//!   `not_initialized` until it exists, and then opens it writable (which
+//!   migrates an older store).
 //! - **No background work.** Every subcommand runs in the foreground and
 //!   exits; nothing here starts a daemon or contacts a service.
 //! - **Versioned output.** `--json` prints one object whose `schema` names
@@ -30,7 +34,8 @@ use crate::collaboration_capture::{OperationId, abort, receipt, recover};
 use crate::collaboration_context::{Budget, ContextQuery, LocalProject, Served, attach_brief};
 use crate::collaboration_gc::{GcOptions, apply as gc_apply, plan as gc_plan, resume as gc_resume};
 use crate::collaboration_state::{
-    CollaborationStore, ProjectKey, locate_for_repository, open_for_repository,
+    CollaborationStore, ProjectKey, inspect_for_repository, locate_for_repository,
+    open_for_repository,
 };
 use crate::collaboration_submit::{Setting, setting};
 use crate::exit_status;
@@ -54,20 +59,24 @@ Disabled unless the repository's .aethyme/config.toml enables it:
   [collaboration]
   capture = \"advisory\"     # or \"required\"; \"off\" or absent = disabled
   project = \"proj-...\"     # from `aethyme collab enroll`
-Any other [collaboration] setting is refused while capture is enabled.
+Under required capture any other [collaboration] setting is refused; under
+advisory it is ignored with a warning. Only `broker submit` creates
+collaboration state; until then every subcommand but status and enroll
+refuses with not_initialized.
 Every subcommand takes --json (one versioned object) and --repo <path>.
 Nothing here runs in the background or contacts a service.
 
 Usage:
   aethyme collab status [--json]
       Policy, state root, durability profile, schema, captures in flight or
-      needing attention, reservations and unfinished reclamation. Works while
-      disabled; never creates state.
+      needing attention, reservations, unfinished reclamation and the
+      required-capture fence. Works while disabled; never writes anything.
   aethyme collab enroll [--write] [--json]
       Mint a project ID and print the [collaboration] section that enables
-      advisory capture. --write appends it to .aethyme/config.toml only when
-      that file does not mention collaboration yet; commit it to take effect
-      where a committed copy exists.
+      advisory capture. --write appends it to .aethyme/config.toml in the
+      current worktree (refused in the main checkout while broker sessions
+      exist) when neither that file nor the policy in force mentions
+      collaboration; review and commit it.
   aethyme collab capture recover [--json]
       Resolve captures a crashed process left in flight. Live ones are
       skipped; per-operation failures are reported and do not stop the rest.
@@ -96,8 +105,9 @@ Usage:
       Attach a decision brief (aethyme-brief-tokens/v0, at most 150 tokens) to
       a retained contribution, replacing an earlier one.
 
-Exit codes: 0 done, 1 failed (I/O or database), 2 usage, 3 refused (disabled,
-policy, location, or a state that forbids the action).
+Exit codes: 0 done, 1 failed (I/O, database, Git, or an integrity failure
+such as a corrupt object or receipt), 2 usage, 3 refused (disabled, policy,
+location, or a state that forbids the action; do not retry unchanged).
 ";
 
 /// A refused or failed command: what to print and how to exit.
@@ -131,7 +141,18 @@ impl Failure {
     /// A domain error: I/O and database failures are failures; everything
     /// else is a refusal, with the safe next action for its code.
     fn domain(code: &str, message: String) -> Self {
-        let exit = if matches!(code, "io" | "sqlite" | "git" | "state" | "archive") {
+        let exit = if matches!(
+            code,
+            "io" | "sqlite"
+                | "git"
+                | "state"
+                | "archive"
+                | "failed"
+                | "injected"
+                | "corrupt_receipt"
+                | "corrupt_object"
+                | "missing_object"
+        ) {
             exit_status::FAILED
         } else {
             exit_status::REFUSED
@@ -188,6 +209,11 @@ fn next_action_for(code: &str) -> Option<&'static str> {
         }
         "invalid_brief" => "fix the brief file; the message lists every problem",
         "not_retained" => "check the record ID with `aethyme collab capture receipt`",
+        "not_initialized" => {
+            "nothing is retained yet: an advisory or required `aethyme broker submit` \
+             creates collaboration state"
+        }
+        "file_too_large" => "pass a smaller file; the message gives the limit",
         _ => return None,
     })
 }
@@ -223,13 +249,7 @@ pub fn run(args: &[String]) -> u8 {
         return exit_status::SUCCESS;
     }
     let json_requested = args.iter().any(|arg| arg == "--json");
-    let command = args
-        .iter()
-        .filter(|arg| !arg.starts_with('-'))
-        .take(2)
-        .cloned()
-        .collect::<Vec<_>>()
-        .join(" ");
+    let command = command_name(args);
     match options(args).and_then(dispatch) {
         Ok((value, text)) => {
             if json_requested {
@@ -266,6 +286,29 @@ pub fn run(args: &[String]) -> u8 {
     }
 }
 
+/// The subcommand verbs, for the error object's `command`: only known verbs,
+/// read before the first flag, so no path or argument value is echoed.
+fn command_name(args: &[String]) -> String {
+    const VERBS: &[&str] = &[
+        "status", "enroll", "capture", "recover", "abort", "receipt", "gc", "plan", "apply",
+        "resume", "context", "brief", "attach",
+    ];
+    let words: Vec<&str> = args
+        .iter()
+        .map(String::as_str)
+        .take_while(|arg| !arg.starts_with('-'))
+        .take(2)
+        .collect();
+    if words.is_empty() {
+        return String::new();
+    }
+    if words.iter().all(|word| VERBS.contains(word)) {
+        words.join(" ")
+    } else {
+        "unknown".into()
+    }
+}
+
 type Output = (Value, String);
 
 fn dispatch(options: Options) -> Result<Output, Failure> {
@@ -278,7 +321,11 @@ fn dispatch(options: Options) -> Result<Output, Failure> {
     }
     match words.as_slice() {
         ["status"] => status(&main_root),
-        ["enroll", rest @ ..] => enroll(&main_root, rest),
+        ["enroll", rest @ ..] => enroll(
+            &main_root,
+            &current_worktree(options.repo.as_deref())?,
+            rest,
+        ),
         ["capture", "recover"] => capture_recover(&main_root),
         ["capture", "abort", rest @ ..] => capture_abort(&main_root, rest),
         ["capture", "receipt", rest @ ..] => capture_receipt(&main_root, rest),
@@ -347,11 +394,50 @@ fn require_enabled(main_root: &Path) -> Result<Enabled, Failure> {
     }
 }
 
+/// Open the existing store. Nothing here creates collaboration state: only
+/// `broker submit` does, so a missing store is `not_initialized`.
 fn open(main_root: &Path) -> Result<CollaborationStore, Failure> {
     let enabled = require_enabled(main_root)?;
+    let (_, _, exists) = locate_for_repository(main_root, &enabled.project)
+        .map_err(|error| Failure::domain(error.code(), error.to_string()))?;
+    if !exists {
+        return Err(Failure::refused(
+            "not_initialized",
+            format!(
+                "project {} has no collaboration state yet",
+                enabled.project.as_str()
+            ),
+            next_action_for("not_initialized").unwrap_or_default(),
+        ));
+    }
     open_for_repository(main_root, &enabled.project)
         .map_err(|error| Failure::domain(error.code(), error.to_string()))
 }
+
+/// Read at most `limit` bytes of `path`; a larger file is refused before
+/// anything parses it.
+fn read_capped(path: &str, limit: u64, what: &str) -> Result<Vec<u8>, Failure> {
+    let file = std::fs::File::open(path)
+        .map_err(|error| Failure::domain("io", format!("{path}: {error}")))?;
+    let mut bytes = Vec::new();
+    file.take(limit + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| Failure::domain("io", format!("{path}: {error}")))?;
+    if bytes.len() as u64 > limit {
+        return Err(Failure::refused(
+            "file_too_large",
+            format!("{path}: a {what} may be at most {limit} bytes"),
+            next_action_for("file_too_large").unwrap_or_default(),
+        ));
+    }
+    Ok(bytes)
+}
+
+/// The largest decision file `brief attach` reads; a valid brief is far
+/// smaller (2048 prose bytes, 150 tokens).
+const MAX_BRIEF_FILE_BYTES: u64 = 64 * 1024;
+/// The largest analysis envelope `context --analysis` reads.
+const MAX_ANALYSIS_FILE_BYTES: u64 = 1024 * 1024;
 
 fn flag_value<'a>(rest: &[&'a str], name: &str) -> Result<Option<&'a str>, Failure> {
     match rest.iter().position(|word| *word == name) {
@@ -416,9 +502,16 @@ fn status(main_root: &Path) -> Result<Output, Failure> {
             next.push("fix [collaboration] in .aethyme/config.toml".into());
             None
         }
-        Setting::On { policy, project } => {
+        Setting::On {
+            policy,
+            project,
+            ignored,
+        } => {
             value["policy"] = json!(policy.as_str());
-            match project {
+            if !ignored.is_empty() {
+                value["ignored_settings"] = json!(ignored);
+            }
+            let project = match project {
                 Ok(project) => {
                     value["enabled"] = json!(true);
                     value["project"] = json!(project.as_str());
@@ -439,15 +532,27 @@ fn status(main_root: &Path) -> Result<Output, Failure> {
                     next.push("set [collaboration] project from `aethyme collab enroll`".into());
                     None
                 }
+            };
+            if !ignored.is_empty() {
+                text.push_str(&format!(
+                    "  warning: ignored [collaboration] {} this binary does not implement: {}\n",
+                    if ignored.len() == 1 {
+                        "setting"
+                    } else {
+                        "settings"
+                    },
+                    ignored.join(", ")
+                ));
             }
+            project
         }
     };
     if let Some(source) = source {
         text.push_str(&format!("  config: {source} .aethyme/config.toml\n"));
     }
-    fence_status(main_root, &setting, &mut value, &mut text, &mut next);
+    fence_status(main_root, &mut value, &mut text, &mut next);
     if let Some(project) = project {
-        state_status(main_root, &project, &mut value, &mut text, &mut next)?;
+        state_status(main_root, &project, &mut value, &mut text, &mut next);
     }
     value["next_actions"] = json!(next);
     for action in &next {
@@ -456,71 +561,86 @@ fn status(main_root: &Path) -> Result<Output, Failure> {
     Ok((value, text))
 }
 
-/// The required-capture fence on broker.db (#660), read with the same
-/// reader `broker status` uses, from a read-only snapshot: looking never
-/// raises it. A broker command raises it on its next open.
-fn fence_status(
-    main_root: &Path,
-    setting: &Setting,
-    value: &mut Value,
-    text: &mut String,
-    next: &mut Vec<String>,
-) {
-    let fence = crate::BrokerStore::open_snapshot_in_repo(main_root)
-        .ok()
-        .and_then(|store| crate::schema::collaboration_fence(store.connection()).ok())
-        .flatten();
-    value["collaboration_fence"] = serde_json::to_value(&fence).unwrap_or(Value::Null);
-    let required = matches!(
-        setting,
-        Setting::On {
-            policy: crate::collaboration_capture::CapturePolicy::Required,
-            ..
+/// The required-capture fence on broker.db (#660), computed by
+/// `broker status`'s own `collaboration_fence_state` on a read-only broker
+/// snapshot, so looking never raises it. `pending` means the committed
+/// config requires it and a writable broker command will raise it. A read
+/// that fails is reported as unknown, never as "not raised".
+fn fence_status(main_root: &Path, value: &mut Value, text: &mut String, next: &mut Vec<String>) {
+    let read = crate::Broker::open_snapshot(main_root)
+        .map_err(|error| ("broker_unavailable", error.to_string()))
+        .and_then(|broker| {
+            // The fence reader warns and returns nothing on a read error;
+            // read once directly so an error is reported, not taken as
+            // "no fence".
+            crate::schema::collaboration_fence(broker.store_ref().connection())
+                .map_err(|error| ("fence_unreadable", error.to_string()))?;
+            let config = crate::merge::repository_config_with_source(main_root);
+            Ok(broker
+                .collaboration_fence_state(crate::broker::FenceTrigger::Config(config.as_ref())))
+        });
+    match read {
+        Err((code, message)) => {
+            value["collaboration_fence"] = Value::Null;
+            value["collaboration_fence_error"] = json!({ "code": code, "message": message });
+            text.push_str(&format!("  fence: unknown ({code}: {message})\n"));
         }
-    );
-    match &fence {
-        Some(fence) => text.push_str(&format!(
-            "  fence: broker.db requires schema {} or newer ({}); older binaries cannot open \
-             this repository, and this does not lift if required capture is turned off\n",
-            fence.min_compatible_schema, fence.reason
-        )),
-        None if required => {
-            text.push_str("  fence: not raised yet; older binaries can still submit uncaptured\n");
-            next.push(
-                "run any `aethyme broker` command (e.g. `aethyme broker status`) to raise the \
-                 required-capture fence"
-                    .into(),
-            );
+        Ok(fence) => {
+            value["collaboration_fence"] = serde_json::to_value(&fence).unwrap_or(Value::Null);
+            match fence {
+                Some(fence) if fence.state == "pending" => {
+                    text.push_str(
+                        "  fence: pending (the committed config requires capture; older \
+                         binaries can still open this repository until it is raised)\n",
+                    );
+                    next.push(
+                        "run a writable broker command (e.g. `aethyme broker status`) to raise \
+                         the required-capture fence"
+                            .into(),
+                    );
+                }
+                Some(fence) => text.push_str(&format!(
+                    "  fence: broker.db requires schema {} or newer ({}, {} config); older \
+                     binaries cannot open this repository, and this does not lift if required \
+                     capture is turned off\n",
+                    fence.min_compatible_schema, fence.reason, fence.source
+                )),
+                None => {}
+            }
         }
-        None => {}
     }
 }
 
+/// The state root and, when it exists, the store read through a read-only
+/// snapshot. Every problem is reported under `state.refusal`.
 fn state_status(
     main_root: &Path,
     project: &ProjectKey,
     value: &mut Value,
     text: &mut String,
     next: &mut Vec<String>,
-) -> Result<(), Failure> {
+) {
+    let refusal = |value: &mut Value,
+                   text: &mut String,
+                   next: &mut Vec<String>,
+                   code: &str,
+                   message: String| {
+        value["state"]["refusal"] = json!({
+            "code": code,
+            "message": message,
+            "next_action": next_action_for(code),
+        });
+        text.push_str(&format!("  state: refused ({code}): {message}\n"));
+        if let Some(action) = next_action_for(code) {
+            next.push(action.into());
+        }
+    };
     let (root, project_dir, exists) = match locate_for_repository(main_root, project) {
         Ok(located) => located,
         Err(error) => {
-            value["state"] = json!({
-                "refusal": {
-                    "code": error.code(),
-                    "message": error.to_string(),
-                    "next_action": next_action_for(error.code()),
-                }
-            });
-            text.push_str(&format!(
-                "  state root: refused ({}): {error}\n",
-                error.code()
-            ));
-            if let Some(action) = next_action_for(error.code()) {
-                next.push(action.into());
-            }
-            return Ok(());
+            value["state"] = json!({});
+            refusal(value, text, next, error.code(), error.to_string());
+            return;
         }
     };
     value["state"] = json!({
@@ -541,26 +661,28 @@ fn state_status(
             .unwrap_or_else(|| "explicit".into())
     ));
     if !exists {
-        text.push_str("  state: not created yet (the first capture creates it)\n");
-        return Ok(());
+        text.push_str("  state: not created yet (the first captured submit creates it)\n");
+        return;
     }
-    let store = open_for_repository(main_root, project)
-        .map_err(|error| Failure::domain(error.code(), error.to_string()))?;
-    let profile = store.durability();
+    let snapshot = match inspect_for_repository(main_root, project) {
+        Ok(Some(snapshot)) => snapshot,
+        Ok(None) => {
+            value["state"]["initialized"] = json!(false);
+            return;
+        }
+        Err(error) => {
+            refusal(value, text, next, error.code(), error.to_string());
+            return;
+        }
+    };
+    let profile = &snapshot.durability;
     value["state"]["durability"] = serde_json::to_value(profile).unwrap_or(Value::Null);
     value["state"]["receipt_label"] = json!(profile.receipt_label());
-    value["state"]["schema_version"] = json!(store.schema_version());
-    let connection = store.read_connection();
-    let floor: Option<i64> = connection
-        .query_row(
-            "SELECT CAST(value AS INTEGER) FROM meta WHERE key = 'min_compatible_schema'",
-            [],
-            |row| row.get(0),
-        )
-        .ok();
-    value["state"]["min_compatible_schema"] = json!(floor);
+    value["state"]["schema_version"] = json!(snapshot.schema_version);
+    value["state"]["min_compatible_schema"] = json!(snapshot.min_compatible_schema);
+    value["state"]["needs_migration"] = json!(snapshot.needs_migration);
     text.push_str(&format!(
-        "  durability: {} ({}{}), schema {} (readable from {})\n",
+        "  durability: {} ({}{}), schema {} (readable from {}){}\n",
         profile.receipt_label(),
         profile.filesystem,
         profile
@@ -568,91 +690,122 @@ fn state_status(
             .as_deref()
             .map(|why| format!("; {why}"))
             .unwrap_or_default(),
-        store.schema_version(),
-        floor.map_or_else(|| "?".into(), |floor| floor.to_string())
+        snapshot.schema_version,
+        snapshot.min_compatible_schema,
+        if snapshot.needs_migration {
+            "; the next writable open migrates it"
+        } else {
+            ""
+        }
     ));
-    let sql = |error: rusqlite::Error| Failure::domain("sqlite", error.to_string());
-    let mut by_state = serde_json::Map::new();
-    let mut statement = connection
-        .prepare("SELECT state, count(*) FROM capture_operations GROUP BY state ORDER BY state")
-        .map_err(sql)?;
-    let rows = statement
-        .query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-        })
-        .map_err(sql)?;
-    for row in rows {
-        let (state, count) = row.map_err(sql)?;
-        by_state.insert(state, json!(count));
+    match capture_summary(&snapshot) {
+        Ok((captures, unfinished_gc)) => {
+            let attention = captures["attention"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            let by_state = captures["by_state"]
+                .as_object()
+                .cloned()
+                .unwrap_or_default();
+            text.push_str(&format!(
+                "  captures: {}; {} bytes reserved\n",
+                if by_state.is_empty() {
+                    "none".to_string()
+                } else {
+                    by_state
+                        .iter()
+                        .map(|(state, count)| format!("{count} {state}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                },
+                captures["reserved_bytes"]
+            ));
+            for operation in &attention {
+                text.push_str(&format!(
+                    "    {} {}{}\n",
+                    operation["operation_id"].as_str().unwrap_or("?"),
+                    operation["state"].as_str().unwrap_or("?"),
+                    operation["code"]
+                        .as_str()
+                        .map(|code| format!(" ({code})"))
+                        .unwrap_or_default()
+                ));
+            }
+            if attention.iter().any(|operation| {
+                matches!(
+                    operation["state"].as_str(),
+                    Some("intent" | "copying" | "sealed")
+                )
+            }) {
+                next.push(
+                    "`aethyme collab capture recover` resolves captures a crashed process left \
+                     in flight (live ones are skipped)"
+                        .into(),
+                );
+            }
+            if unfinished_gc > 0 {
+                text.push_str(&format!(
+                    "  reclamation: {unfinished_gc} unfinished apply\n"
+                ));
+                next.push("`aethyme collab gc resume` finishes the interrupted apply".into());
+            }
+            value["captures"] = captures;
+            value["gc"] = json!({ "unfinished_generations": unfinished_gc });
+        }
+        Err(error) => refusal(value, text, next, "sqlite", error.to_string()),
     }
-    let reserved: i64 = connection
-        .query_row(
+}
+
+/// Captures by state, reservations and captures needing attention, and the
+/// number of unfinished reclamation generations, from a read-only snapshot.
+/// Tables an older store lacks read as empty.
+fn capture_summary(
+    snapshot: &crate::collaboration_state::CollaborationSnapshot,
+) -> rusqlite::Result<(Value, i64)> {
+    let connection = snapshot.connection();
+    let mut by_state = serde_json::Map::new();
+    let mut reserved = 0_i64;
+    let mut attention = Vec::new();
+    if snapshot.has_table("capture_operations") {
+        let mut statement = connection.prepare(
+            "SELECT state, count(*) FROM capture_operations GROUP BY state ORDER BY state",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        for row in rows {
+            let (state, count) = row?;
+            by_state.insert(state, json!(count));
+        }
+        reserved = connection.query_row(
             "SELECT COALESCE(SUM(reserved_bytes), 0) FROM capture_operations
              WHERE state IN ('intent', 'copying', 'sealed')",
             [],
             |row| row.get(0),
-        )
-        .map_err(sql)?;
-    let attention = operations(
-        connection,
-        "WHERE state IN ('intent', 'copying', 'sealed', 'failed', 'incomplete')",
-    )
-    .map_err(sql)?;
-    let unfinished_gc: i64 = connection
-        .query_row(
+        )?;
+        attention = operations(
+            connection,
+            "WHERE state IN ('intent', 'copying', 'sealed', 'failed', 'incomplete')",
+        )?;
+    }
+    let unfinished_gc = if snapshot.has_table("gc_generations") {
+        connection.query_row(
             "SELECT count(*) FROM gc_generations WHERE state != 'done'",
             [],
             |row| row.get(0),
-        )
-        .map_err(sql)?;
-    text.push_str(&format!(
-        "  captures: {}; {reserved} bytes reserved\n",
-        if by_state.is_empty() {
-            "none".to_string()
-        } else {
-            by_state
-                .iter()
-                .map(|(state, count)| format!("{count} {state}"))
-                .collect::<Vec<_>>()
-                .join(", ")
-        }
-    ));
-    for operation in &attention {
-        text.push_str(&format!(
-            "    {} {}{}\n",
-            operation["operation_id"].as_str().unwrap_or("?"),
-            operation["state"].as_str().unwrap_or("?"),
-            operation["code"]
-                .as_str()
-                .map(|code| format!(" ({code})"))
-                .unwrap_or_default()
-        ));
-    }
-    if attention.iter().any(|operation| {
-        matches!(
-            operation["state"].as_str(),
-            Some("intent" | "copying" | "sealed")
-        )
-    }) {
-        next.push(
-            "`aethyme collab capture recover` resolves captures a crashed process left \
-             in flight (live ones are skipped)"
-                .into(),
-        );
-    }
-    if unfinished_gc > 0 {
-        text.push_str(&format!(
-            "  reclamation: {unfinished_gc} unfinished apply\n"
-        ));
-        next.push("`aethyme collab gc resume` finishes the interrupted apply".into());
-    }
-    value["captures"] = json!({
-        "by_state": by_state,
-        "reserved_bytes": reserved,
-        "attention": attention,
-    });
-    value["gc"] = json!({ "unfinished_generations": unfinished_gc });
-    Ok(())
+        )?
+    } else {
+        0
+    };
+    Ok((
+        json!({
+            "by_state": by_state,
+            "reserved_bytes": reserved,
+            "attention": attention,
+        }),
+        unfinished_gc,
+    ))
 }
 
 /// Up to 50 capture operations matching `filter`, most recent first.
@@ -704,7 +857,27 @@ fn base32_lower(bytes: &[u8]) -> String {
     out
 }
 
-fn enroll(main_root: &Path, rest: &[&str]) -> Result<Output, Failure> {
+/// The worktree `aethyme collab` runs in: `--repo` or the current
+/// directory's checkout (a session worktree or the main checkout).
+fn current_worktree(repo: Option<&Path>) -> Result<PathBuf, Failure> {
+    let start = match repo {
+        Some(path) => path.to_path_buf(),
+        None => std::env::current_dir().map_err(|error| {
+            Failure::domain("io", format!("cannot read the current directory: {error}"))
+        })?,
+    };
+    crate::git::GitRepo::discover(&start)
+        .map(|repo| repo.root().to_path_buf())
+        .map_err(|error| {
+            Failure::refused(
+                "not_a_repository",
+                format!("{}: {error}", start.display()),
+                "run it inside a Git repository, or pass --repo <path>",
+            )
+        })
+}
+
+fn enroll(main_root: &Path, worktree: &Path, rest: &[&str]) -> Result<Output, Failure> {
     let others: Vec<&str> = rest
         .iter()
         .copied()
@@ -733,64 +906,120 @@ fn enroll(main_root: &Path, rest: &[&str]) -> Result<Output, Failure> {
     let project_id = format!("proj:{encoded}");
     let project_key = format!("proj-{encoded}");
     let section = format!("[collaboration]\ncapture = \"advisory\"\nproject = \"{project_key}\"\n");
-    let config = main_root.join(".aethyme/config.toml");
-    let mut written = false;
-    if write {
-        let existing = match std::fs::read_to_string(&config) {
-            Ok(text) => text,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
-            Err(error) => {
-                return Err(Failure::domain(
-                    "io",
-                    format!("{}: {error}", config.display()),
-                ));
-            }
-        };
-        if existing.contains("collaboration") {
-            return Err(Failure::refused(
-                "already_configured",
-                ".aethyme/config.toml already mentions collaboration, so it is not edited",
-                "add or fix the printed [collaboration] section by hand",
-            ));
-        }
-        let separator = if existing.is_empty() || existing.ends_with("\n\n") {
-            ""
-        } else if existing.ends_with('\n') {
-            "\n"
-        } else {
-            "\n\n"
-        };
-        if let Some(parent) = config.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|error| Failure::domain("io", format!("{}: {error}", parent.display())))?;
-        }
-        std::fs::write(&config, format!("{existing}{separator}{section}"))
-            .map_err(|error| Failure::domain("io", format!("{}: {error}", config.display())))?;
-        written = true;
-    }
-    let next = if written {
-        "commit .aethyme/config.toml to the default branch: policy reads the committed copy \
-         where one exists"
+    let written = if write {
+        Some(write_section(main_root, worktree, &section)?)
     } else {
-        "add this section to .aethyme/config.toml (or rerun with --write) and commit it"
+        None
+    };
+    let next = match &written {
+        Some(path) => format!(
+            "review and commit {} on a branch that lands on the default branch: policy reads \
+             the committed copy where one exists",
+            path.display()
+        ),
+        None => "add this section to .aethyme/config.toml in a session worktree (or rerun there \
+                 with --write), review and commit it"
+            .to_string(),
     };
     let value = json!({
         "schema": ENROLL_SCHEMA,
         "project_id": project_id,
         "project_key": project_key,
         "section": section,
-        "written": written,
+        "written": written.is_some(),
+        "path": written,
         "next_action": next,
     });
     let text = format!(
         "project {project_id} (directory key {project_key})\n\n{section}\n{}next: {next}\n",
-        if written {
-            "written to .aethyme/config.toml\n"
-        } else {
-            ""
-        }
+        written
+            .as_ref()
+            .map(|path| format!("written to {}\n", path.display()))
+            .unwrap_or_default()
     );
     Ok((value, text))
+}
+
+/// Append `section` to `<worktree>/.aethyme/config.toml`, atomically, and
+/// return the path written.
+fn write_section(main_root: &Path, worktree: &Path, section: &str) -> Result<PathBuf, Failure> {
+    let same = |a: &Path, b: &Path| match (a.canonicalize(), b.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
+    };
+    if same(worktree, main_root) {
+        let sessions = crate::BrokerStore::open_snapshot_in_repo(main_root)
+            .and_then(|store| store.live_sessions())
+            .map(|sessions| sessions.len())
+            .unwrap_or(0);
+        if sessions > 0 {
+            return Err(Failure::refused(
+                "main_checkout_in_use",
+                format!(
+                    "{} is the main checkout and {sessions} broker session(s) are live; \
+                     editing its config would change policy under them",
+                    worktree.display()
+                ),
+                "run `aethyme collab enroll --write` in a session worktree, then review and \
+                 commit the change",
+            ));
+        }
+    }
+    let directory = worktree.join(".aethyme");
+    let config = directory.join("config.toml");
+    for path in [&directory, &config] {
+        if std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink()) {
+            return Err(Failure::refused(
+                "symlinked_config",
+                format!("{} is a symbolic link, so it is not edited", path.display()),
+                "add the printed section by hand",
+            ));
+        }
+    }
+    let existing = match std::fs::read_to_string(&config) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => {
+            return Err(Failure::domain(
+                "io",
+                format!("{}: {error}", config.display()),
+            ));
+        }
+    };
+    // Both the file being edited and the policy in force (the committed
+    // copy where one exists): never append a second [collaboration] table,
+    // nor shadow one the policy reader would use.
+    let in_force = crate::merge::repository_config_with_source(main_root)
+        .map(|(text, _)| text)
+        .unwrap_or_default();
+    if crate::collaboration_submit::mentions_collaboration(&existing)
+        || crate::collaboration_submit::mentions_collaboration(&in_force)
+    {
+        return Err(Failure::refused(
+            "already_configured",
+            format!(
+                "{} or the policy in force already mentions collaboration, so nothing is \
+                 appended",
+                config.display()
+            ),
+            "add or fix the printed [collaboration] section by hand",
+        ));
+    }
+    let separator = if existing.is_empty() || existing.ends_with("\n\n") {
+        ""
+    } else if existing.ends_with('\n') {
+        "\n"
+    } else {
+        "\n\n"
+    };
+    std::fs::create_dir_all(&directory)
+        .map_err(|error| Failure::domain("io", format!("{}: {error}", directory.display())))?;
+    let bytes = format!("{existing}{separator}{section}");
+    crate::atomic_file::with_synced_temporary(&config, bytes.as_bytes(), |temporary| {
+        std::fs::rename(temporary, &config)
+    })
+    .map_err(|error| Failure::domain("io", format!("{}: {error}", config.display())))?;
+    Ok(config)
 }
 
 // ---------------------------------------------------------------- capture
@@ -993,8 +1222,7 @@ fn context(main_root: &Path, rest: &[&str]) -> Result<Output, Failure> {
             ),
             "--analysis" => {
                 let file = value.ok_or_else(|| Failure::usage("--analysis needs a file"))?;
-                let bytes = std::fs::read(file)
-                    .map_err(|error| Failure::domain("io", format!("{file}: {error}")))?;
+                let bytes = read_capped(file, MAX_ANALYSIS_FILE_BYTES, "analysis envelope")?;
                 analysis.push(AnalysisEnvelope::from_record(&bytes).map_err(|error| {
                     Failure::refused(
                         "invalid_analysis",
@@ -1137,8 +1365,7 @@ fn brief_attach(main_root: &Path, rest: &[&str]) -> Result<Output, Failure> {
             "pass the contribution ID a capture receipt prints",
         )
     })?;
-    let bytes =
-        std::fs::read(file).map_err(|error| Failure::domain("io", format!("{file}: {error}")))?;
+    let bytes = read_capped(file, MAX_BRIEF_FILE_BYTES, "decision file")?;
     let brief = Brief::from_decision_file(&bytes).map_err(|errors| {
         Failure::refused(
             "invalid_brief",
@@ -1192,6 +1419,55 @@ mod tests {
         assert_eq!(encoded.len(), 26);
         ProjectKey::parse(&format!("proj-{encoded}")).unwrap();
         assert_ne!(encoded, mint_project_id().unwrap());
+    }
+
+    /// Exit 3 means "refused, do not retry unchanged"; an integrity or local
+    /// failure is exit 1.
+    #[test]
+    fn integrity_failures_exit_1_and_refusals_exit_3() {
+        for code in [
+            "io",
+            "sqlite",
+            "corrupt_receipt",
+            "corrupt_object",
+            "missing_object",
+            "failed",
+        ] {
+            assert_eq!(
+                Failure::domain(code, String::new()).exit,
+                exit_status::FAILED,
+                "{code}"
+            );
+        }
+        for code in [
+            "archive_in_use",
+            "already_committed",
+            "not_retained",
+            "blocked",
+        ] {
+            assert_eq!(
+                Failure::domain(code, String::new()).exit,
+                exit_status::REFUSED,
+                "{code}"
+            );
+        }
+    }
+
+    /// The error object's `command` is known verbs only.
+    #[test]
+    fn the_command_name_never_echoes_arguments() {
+        let words = |list: &[&str]| list.iter().map(|w| w.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            command_name(&words(&["gc", "apply", "--confirm", "x"])),
+            "gc apply"
+        );
+        assert_eq!(
+            command_name(&words(&["context", "--path", "/secret"])),
+            "context"
+        );
+        assert_eq!(command_name(&words(&["/secret/path"])), "unknown");
+        assert_eq!(command_name(&words(&["--repo", "/secret", "status"])), "");
+        assert_eq!(command_name(&words(&["status", "/secret"])), "unknown");
     }
 
     #[test]

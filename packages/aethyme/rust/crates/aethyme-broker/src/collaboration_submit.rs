@@ -58,6 +58,9 @@ pub(crate) enum Setting {
     On {
         policy: CapturePolicy,
         project: Result<ProjectKey, String>,
+        /// `[collaboration]` keys this binary does not implement, ignored
+        /// under advisory capture and reported (required refuses them).
+        ignored: Vec<String>,
     },
     /// Fails closed, as a required capture that cannot be satisfied.
     Unsupported {
@@ -76,7 +79,7 @@ pub(crate) fn setting(main_root: &Path) -> (Setting, Option<&'static str>) {
 
 /// Whether the raw text visibly opts in, read without parsing it: a
 /// `[collaboration...]` header or a `collaboration` key.
-fn mentions_collaboration(text: &str) -> bool {
+pub(crate) fn mentions_collaboration(text: &str) -> bool {
     text.lines().map(str::trim_start).any(|line| {
         line.strip_prefix('[')
             .map(|rest| rest.trim_start().starts_with("collaboration"))
@@ -159,17 +162,19 @@ pub(crate) fn setting_from_text(text: Option<&str>) -> Setting {
             };
         }
     };
-    // Every [collaboration] setting is critical: a key this binary does not
-    // implement may change what the policy means, so an enabled policy
-    // carrying one is refused rather than half-applied (§6.7). A repository
-    // that has not enabled capture is unaffected.
+    // A key this binary does not implement may change what the policy means
+    // (§6.7). Under required capture it is refused rather than half-applied,
+    // because required gates the submit. Under advisory it is ignored and
+    // reported: a typo, or a key a newer binary added, never stops a submit
+    // advisory capture cannot block anyway. A repository that has not
+    // enabled capture is unaffected.
     let mut unknown: Vec<&str> = table
         .keys()
         .map(String::as_str)
         .filter(|key| !KNOWN_SETTINGS.contains(key))
         .collect();
-    if !unknown.is_empty() {
-        unknown.sort_unstable();
+    unknown.sort_unstable();
+    if !unknown.is_empty() && policy == CapturePolicy::Required {
         return Setting::Unsupported {
             code: "unknown_setting",
             detail: format!(
@@ -190,7 +195,11 @@ pub(crate) fn setting_from_text(text: Option<&str>) -> Setting {
         Some(other) => Err(format!("project must be a string, not {other}")),
         None => Err("no project is configured".into()),
     };
-    Setting::On { policy, project }
+    Setting::On {
+        policy,
+        project,
+        ignored: unknown.into_iter().map(str::to_string).collect(),
+    }
 }
 
 /// The capture outcome reported beside a submit.
@@ -218,6 +227,10 @@ pub struct SubmitCaptureReport {
     pub detail: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_action: Option<String>,
+    /// `[collaboration]` keys this binary does not implement, ignored under
+    /// advisory capture.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub ignored_settings: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -281,6 +294,7 @@ impl SubmitCaptureReport {
             code: None,
             detail: None,
             next_action: None,
+            ignored_settings: Vec::new(),
         }
     }
 
@@ -299,6 +313,23 @@ impl SubmitCaptureReport {
 
     /// One line for the human output.
     pub fn summary(&self) -> String {
+        let line = self.outcome_line();
+        if self.ignored_settings.is_empty() {
+            return line;
+        }
+        format!(
+            "{line}\ncollaboration capture: warning: ignored [collaboration] {} this binary \
+             does not implement: {}",
+            if self.ignored_settings.len() == 1 {
+                "setting"
+            } else {
+                "settings"
+            },
+            self.ignored_settings.join(", ")
+        )
+    }
+
+    fn outcome_line(&self) -> String {
         let head = format!("collaboration capture ({})", self.policy);
         match (&self.receipt, &self.code) {
             (Some(receipt), _) => format!(
@@ -624,6 +655,8 @@ struct SubmitCapture {
     source: &'static str,
     required: bool,
     prepared: Result<Prepared, SubmitCaptureReport>,
+    /// Unknown `[collaboration]` keys advisory capture ignored.
+    ignored: Vec<String>,
 }
 
 impl SubmitCapture {
@@ -631,7 +664,7 @@ impl SubmitCapture {
     fn prepare(broker: &mut crate::Broker, session: i64) -> Option<Self> {
         let (setting, source) = setting(broker.main_root());
         let source = source.unwrap_or("working_copy");
-        let (policy, project) = match setting {
+        let (policy, project, ignored) = match setting {
             Setting::Off => return None,
             Setting::Unsupported { code, detail } => {
                 return Some(Self {
@@ -650,9 +683,14 @@ impl SubmitCapture {
                         "fix [collaboration] in .aethyme/config.toml: capture = \"off\", \
                          \"advisory\" or \"required\" (or upgrade Aethyme)",
                     )),
+                    ignored: Vec::new(),
                 });
             }
-            Setting::On { policy, project } => (policy, project),
+            Setting::On {
+                policy,
+                project,
+                ignored,
+            } => (policy, project, ignored),
         };
         let name = policy.as_str();
         let prepared = match project {
@@ -683,6 +721,7 @@ impl SubmitCapture {
             source,
             required: policy == CapturePolicy::Required,
             prepared,
+            ignored,
         })
     }
 
@@ -696,6 +735,18 @@ impl SubmitCapture {
     /// Capture `head` against `base_ref`. `wait` chooses between waiting for
     /// another holder of the operation lock and reporting `in_progress`.
     fn run(
+        &self,
+        base_ref: &str,
+        head: &str,
+        wait: bool,
+        open: &mut OpenStore<'_>,
+    ) -> SubmitCaptureReport {
+        let mut report = self.run_capture(base_ref, head, wait, open);
+        report.ignored_settings = self.ignored.clone();
+        report
+    }
+
+    fn run_capture(
         &self,
         base_ref: &str,
         head: &str,
@@ -1352,6 +1403,7 @@ mod tests {
             Setting::On {
                 policy: CapturePolicy::Advisory,
                 project: Ok(ProjectKey::parse("p").unwrap()),
+                ignored: Vec::new(),
             }
         );
         assert!(matches!(
@@ -1359,6 +1411,7 @@ mod tests {
             Setting::On {
                 policy: CapturePolicy::Required,
                 project: Err(_),
+                ..
             }
         ));
     }
@@ -1382,25 +1435,28 @@ mod tests {
         }
     }
 
-    /// Every [collaboration] setting is critical once capture is on: one
-    /// this binary does not implement is refused, never ignored. Without
-    /// capture enabled the repository keeps the legacy submit (#680).
+    /// An unknown [collaboration] key is refused under required capture and
+    /// ignored, and reported, under advisory: a typo or a newer binary's key
+    /// never stops an advisory submit (#680). Without capture it is off.
     #[test]
-    fn an_unknown_setting_is_refused_once_capture_is_on() {
-        for policy in ["advisory", "required"] {
-            let text = format!(
-                "[collaboration]\ncapture = \"{policy}\"\nproject = \"p\"\nbrief_policy = \"x\"\n"
-            );
-            assert!(
-                matches!(
-                    setting_from_text(Some(&text)),
-                    Setting::Unsupported {
-                        code: "unknown_setting",
-                        ..
-                    }
-                ),
-                "{policy}"
-            );
+    fn an_unknown_setting_is_refused_only_under_required() {
+        let text =
+            "[collaboration]\ncapture = \"required\"\nproject = \"p\"\nbrief_policy = \"x\"\n";
+        assert!(matches!(
+            setting_from_text(Some(text)),
+            Setting::Unsupported {
+                code: "unknown_setting",
+                ..
+            }
+        ));
+        let text = "[collaboration]\ncapture = \"advisory\"\nproject = \"p\"\nzeta = 1\nbrief_policy = \"x\"\n";
+        match setting_from_text(Some(text)) {
+            Setting::On {
+                policy: CapturePolicy::Advisory,
+                project: Ok(_),
+                ignored,
+            } => assert_eq!(ignored, ["brief_policy", "zeta"]),
+            other => panic!("{other:?}"),
         }
         for text in [
             "[collaboration]\nbrief_policy = \"x\"\n",
@@ -1410,8 +1466,6 @@ mod tests {
         }
     }
 
-    /// A malformed file fails closed only when it visibly opted in; a
-    /// repository that never mentions collaboration keeps the legacy submit.
     #[test]
     fn a_malformed_opt_in_fails_closed_and_other_malformed_files_stay_off() {
         for text in [

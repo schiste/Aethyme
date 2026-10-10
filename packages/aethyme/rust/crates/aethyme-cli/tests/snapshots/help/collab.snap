@@ -6,20 +6,24 @@ Disabled unless the repository's .aethyme/config.toml enables it:
   [collaboration]
   capture = "advisory"     # or "required"; "off" or absent = disabled
   project = "proj-..."     # from `aethyme collab enroll`
-Any other [collaboration] setting is refused while capture is enabled.
+Under required capture any other [collaboration] setting is refused; under
+advisory it is ignored with a warning. Only `broker submit` creates
+collaboration state; until then every subcommand but status and enroll
+refuses with not_initialized.
 Every subcommand takes --json (one versioned object) and --repo <path>.
 Nothing here runs in the background or contacts a service.
 
 Usage:
   aethyme collab status [--json]
       Policy, state root, durability profile, schema, captures in flight or
-      needing attention, reservations and unfinished reclamation. Works while
-      disabled; never creates state.
+      needing attention, reservations, unfinished reclamation and the
+      required-capture fence. Works while disabled; never writes anything.
   aethyme collab enroll [--write] [--json]
       Mint a project ID and print the [collaboration] section that enables
-      advisory capture. --write appends it to .aethyme/config.toml only when
-      that file does not mention collaboration yet; commit it to take effect
-      where a committed copy exists.
+      advisory capture. --write appends it to .aethyme/config.toml in the
+      current worktree (refused in the main checkout while broker sessions
+      exist) when neither that file nor the policy in force mentions
+      collaboration; review and commit it.
   aethyme collab capture recover [--json]
       Resolve captures a crashed process left in flight. Live ones are
       skipped; per-operation failures are reported and do not stop the rest.
@@ -48,6 +52,7 @@ Usage:
       Attach a decision brief (aethyme-brief-tokens/v0, at most 150 tokens) to
       a retained contribution, replacing an earlier one.
 
-Exit codes: 0 done, 1 failed (I/O or database), 2 usage, 3 refused (disabled,
-policy, location, or a state that forbids the action).
+Exit codes: 0 done, 1 failed (I/O, database, Git, or an integrity failure
+such as a corrupt object or receipt), 2 usage, 3 refused (disabled, policy,
+location, or a state that forbids the action; do not retry unchanged).
 --- stderr

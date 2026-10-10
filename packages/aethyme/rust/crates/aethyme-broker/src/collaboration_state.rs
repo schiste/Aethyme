@@ -568,6 +568,135 @@ pub fn locate_for_repository(
     Ok((root, project_dir, exists))
 }
 
+/// An existing project database opened read-only for inspection: no
+/// pragmas, migrations, floor changes or created files.
+#[derive(Debug)]
+pub struct CollaborationSnapshot {
+    pub project_dir: PathBuf,
+    pub schema_version: i64,
+    pub min_compatible_schema: i64,
+    /// The stored schema is older than this binary's; the next writable
+    /// open migrates it.
+    pub needs_migration: bool,
+    /// The profile writers open this database with: the filesystem, the
+    /// stored journal mode, and the per-connection flush settings every
+    /// writer applies (`synchronous=FULL`, `fullfsync`).
+    pub durability: DurabilityProfile,
+    connection: Connection,
+}
+
+impl CollaborationSnapshot {
+    pub(crate) fn connection(&self) -> &Connection {
+        &self.connection
+    }
+
+    /// Whether the stored schema has `table` (an older store may not).
+    pub(crate) fn has_table(&self, table: &str) -> bool {
+        self.connection
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                [table],
+                |_| Ok(()),
+            )
+            .optional()
+            .ok()
+            .flatten()
+            .is_some()
+    }
+}
+
+/// `project`'s database for `main_root`, opened read-only after the same
+/// location and permission checks as [`open_for_repository`], or `None`
+/// when it does not exist yet. Nothing is created, migrated or changed.
+pub fn inspect_for_repository(
+    main_root: &Path,
+    project: &ProjectKey,
+) -> Result<Option<CollaborationSnapshot>, CollaborationStateError> {
+    let (_, project_dir, exists) = locate_for_repository(main_root, project)?;
+    if !exists {
+        return Ok(None);
+    }
+    inspect_at(project_dir, project).map(Some)
+}
+
+/// [`inspect_for_repository`] for a located project directory that holds a
+/// database.
+pub(crate) fn inspect_at(
+    project_dir: PathBuf,
+    project: &ProjectKey,
+) -> Result<CollaborationSnapshot, CollaborationStateError> {
+    if let Some(root) = project_dir.parent() {
+        check_private(root)?;
+    }
+    check_private(&project_dir)?;
+    let database = project_dir.join(STATE_DATABASE);
+    let sqlite = |source| sqlite(&database, source);
+    let connection = Connection::open_with_flags(
+        &database,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(sqlite)?;
+    connection
+        .busy_timeout(std::time::Duration::from_secs(2))
+        .map_err(sqlite)?;
+    let meta = |key: &str| -> Result<Option<String>, CollaborationStateError> {
+        connection
+            .query_row("SELECT value FROM meta WHERE key = ?1", [key], |row| {
+                row.get(0)
+            })
+            .optional()
+            .map_err(|error| match error {
+                rusqlite::Error::SqliteFailure(_, Some(ref message))
+                    if message.contains("no such table") =>
+                {
+                    CollaborationStateError::NotACollaborationDatabase {
+                        path: database.clone(),
+                    }
+                }
+                other => sqlite(other),
+            })
+    };
+    let number = |key: &str| -> Result<i64, CollaborationStateError> {
+        meta(key)?
+            .and_then(|value| value.parse().ok())
+            .ok_or_else(|| CollaborationStateError::NotACollaborationDatabase {
+                path: database.clone(),
+            })
+    };
+    let schema_version = number("schema_version")?;
+    let min_compatible_schema = number("min_compatible_schema")?;
+    if min_compatible_schema > COLLABORATION_STATE_SCHEMA_VERSION {
+        return Err(CollaborationStateError::SchemaTooNew {
+            path: database,
+            found: schema_version,
+            min_compatible: min_compatible_schema,
+        });
+    }
+    match meta("project_key")? {
+        Some(owner) if owner == project.as_str() => {}
+        Some(owner) => {
+            return Err(CollaborationStateError::ProjectMismatch {
+                path: database,
+                expected: project.as_str().to_string(),
+                found: owner,
+            });
+        }
+        None => return Err(CollaborationStateError::NotACollaborationDatabase { path: database }),
+    }
+    let journal_mode: String = connection
+        .pragma_query_value(None, "journal_mode", |row| row.get(0))
+        .map_err(sqlite)?;
+    let durability = assess(&project_dir, journal_mode, 2, cfg!(target_os = "macos"));
+    Ok(CollaborationSnapshot {
+        project_dir,
+        schema_version,
+        min_compatible_schema,
+        needs_migration: schema_version < COLLABORATION_STATE_SCHEMA_VERSION,
+        durability,
+        connection,
+    })
+}
+
 /// Open `project`'s state under `<host state>/collaboration`, checked
 /// against every root [`forbidden_roots`] lists for `main_root`.
 ///
@@ -887,6 +1016,16 @@ fn configure(connection: &Connection, directory: &Path) -> rusqlite::Result<Dura
         connection.pragma_query_value(None, "journal_mode", |row| row.get(0))?;
     let synchronous: i64 = connection.pragma_query_value(None, "synchronous", |row| row.get(0))?;
     let full_fsync: bool = connection.pragma_query_value(None, "fullfsync", |row| row.get(0))?;
+    Ok(assess(directory, journal_mode, synchronous, full_fsync))
+}
+
+/// The durability profile of a database in `directory` with these settings.
+fn assess(
+    directory: &Path,
+    journal_mode: String,
+    synchronous: i64,
+    full_fsync: bool,
+) -> DurabilityProfile {
     let (filesystem, local) = filesystem_of(directory);
     let mut limitations = Vec::new();
     if !local {
@@ -909,7 +1048,7 @@ fn configure(connection: &Connection, directory: &Path) -> rusqlite::Result<Dura
         limitations
             .push("fullfsync is off, so commits are not flushed past the drive cache".into());
     }
-    Ok(DurabilityProfile {
+    DurabilityProfile {
         filesystem,
         local,
         journal_mode,
@@ -917,7 +1056,7 @@ fn configure(connection: &Connection, directory: &Path) -> rusqlite::Result<Dura
         full_fsync,
         supported: limitations.is_empty(),
         limitation: (!limitations.is_empty()).then(|| limitations.join("; ")),
-    })
+    }
 }
 
 /// Filesystems whose flush behaviour the supported profile assumes.
@@ -1417,6 +1556,53 @@ mod tests {
         // A schema 4 binary's reclamation does not keep attached briefs; a
         // schema 5 binary posts no broad-risk keys and purges no cache entry.
         const { assert!(MIN_COMPATIBLE_SCHEMA >= 6) };
+    }
+
+    /// Inspection opens read-only: it reports a store that needs migration
+    /// without migrating it, refuses a newer floor and a foreign project, and
+    /// leaves every stored byte as it was.
+    #[test]
+    fn inspection_reads_without_migrating_or_writing() {
+        let host = tempfile::tempdir().unwrap();
+        let mut store = open(host.path(), &[]).unwrap();
+        store
+            .connection()
+            .execute(
+                "UPDATE meta SET value = '2' WHERE key = 'schema_version'",
+                [],
+            )
+            .unwrap();
+        let project_dir = store.project_dir().to_path_buf();
+        drop(store);
+        let database = project_dir.join("state.db");
+        let before = std::fs::read(&database).unwrap();
+
+        let snapshot = inspect_at(project_dir.clone(), &key("proj-a")).unwrap();
+        assert_eq!(snapshot.schema_version, 2);
+        assert!(snapshot.needs_migration);
+        assert!(!snapshot.has_table("no_such_table"));
+        assert!(snapshot.has_table("meta"));
+        drop(snapshot);
+        assert_eq!(
+            std::fs::read(&database).unwrap(),
+            before,
+            "inspection wrote"
+        );
+
+        let error = inspect_at(project_dir.clone(), &key("proj-b")).unwrap_err();
+        assert_eq!(error.code(), "project_mismatch", "{error}");
+
+        let mut store = open(host.path(), &[]).unwrap();
+        store
+            .connection()
+            .execute(
+                "UPDATE meta SET value = '999' WHERE key = 'min_compatible_schema'",
+                [],
+            )
+            .unwrap();
+        drop(store);
+        let error = inspect_at(project_dir, &key("proj-a")).unwrap_err();
+        assert_eq!(error.code(), "schema_too_new", "{error}");
     }
 
     const CRASH_CHILD: &str = "AETHYME_COLLABORATION_CRASH_CHILD";

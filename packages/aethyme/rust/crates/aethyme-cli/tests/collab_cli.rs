@@ -129,6 +129,57 @@ impl Fixture {
         path
     }
 
+    /// Commit `config` on the default branch of a new `origin`, so the
+    /// policy is read from the committed copy.
+    fn with_origin(config: &str) -> (Self, tempfile::TempDir) {
+        let fixture = Self::new(None);
+        let repo = fixture.repo.path();
+        let origin = tempfile::tempdir().unwrap();
+        git(origin.path(), &["init", "-q", "--bare", "-b", "main"]);
+        fixture.configure(config);
+        git(repo, &["add", "-f", ".aethyme/config.toml"]);
+        git(repo, &["commit", "-qm", "config"]);
+        git(
+            repo,
+            &["remote", "add", "origin", origin.path().to_str().unwrap()],
+        );
+        git(repo, &["push", "-q", "-u", "origin", "main"]);
+        git(repo, &["remote", "set-head", "origin", "main"]);
+        (fixture, origin)
+    }
+
+    /// Start a broker session; its worktree.
+    fn session_worktree(&self, name: &str) -> PathBuf {
+        let (code, started) = self.json(&["broker", "start", "--task", name, "--short-name", name]);
+        assert_eq!(code, 0, "{started}");
+        PathBuf::from(started["worktree_path"].as_str().unwrap())
+    }
+
+    /// Run in `dir` instead of the main checkout.
+    fn json_in(&self, dir: &Path, args: &[&str]) -> (i32, serde_json::Value) {
+        let mut args = args.to_vec();
+        args.push("--json");
+        let output = Command::new(aethyme_bin())
+            .args(&args)
+            .current_dir(dir)
+            .env("HOME", self.home.path())
+            .env("AETHYME_HOST_STATE_DIR", self.state.path())
+            .env("AETHYME_HOST_CACHE_DIR", self.cache.path())
+            .env("AETHYME_WORKTREE_ROOT", self.worktrees.path())
+            .env(
+                "AETHYME_CHAU7_MCP_BRIDGE",
+                "/__aethyme_test_no_chau7_bridge__",
+            )
+            .env_remove("XDG_STATE_HOME")
+            .env_remove("XDG_CACHE_HOME")
+            .output()
+            .unwrap();
+        (
+            output.status.code().unwrap(),
+            serde_json::from_slice(&output.stdout).unwrap(),
+        )
+    }
+
     /// Capture a committed change the way users do: an advisory submit.
     /// Returns the operation ID and the contribution ID.
     fn capture(&self, name: &str) -> (String, String) {
@@ -218,7 +269,9 @@ fn a_malformed_or_unknown_policy_is_refused() {
             "unsupported_policy",
         ),
         (
-            &*format!("{}brief_policy = \"required\"\n", enabled_config()),
+            &*format!(
+                "[collaboration]\ncapture = \"required\"\nproject = \"{PROJECT}\"\nbrief_policy = \"x\"\n"
+            ),
             "unknown_setting",
         ),
     ] {
@@ -245,7 +298,8 @@ fn an_unknown_setting_without_capture_stays_disabled() {
 }
 
 /// Enrollment is explicit: it mints a project key, and writes the section
-/// only on --write and only into a config that does not mention it yet.
+/// only on --write, into the current worktree's config, atomically, and
+/// only when neither that file nor the policy in force mentions it.
 #[test]
 fn enroll_mints_a_key_and_writes_only_when_asked() {
     let fixture = Fixture::new(None);
@@ -261,10 +315,14 @@ fn enroll_mints_a_key_and_writes_only_when_asked() {
     assert_eq!(printed["written"], false);
     assert!(!fixture.repo.path().join(".aethyme/config.toml").exists());
 
+    // The main checkout with no live session may be edited; the exact path
+    // written is printed.
     let (code, written) = fixture.json(&["collab", "enroll", "--write"]);
-    assert_eq!(code, 0);
+    assert_eq!(code, 0, "{written}");
     assert_eq!(written["written"], true);
-    let config = std::fs::read_to_string(fixture.repo.path().join(".aethyme/config.toml")).unwrap();
+    let path = PathBuf::from(written["path"].as_str().unwrap());
+    assert!(path.ends_with(".aethyme/config.toml"), "{written}");
+    let config = std::fs::read_to_string(&path).unwrap();
     assert!(
         config.contains(written["project_key"].as_str().unwrap()),
         "{config}"
@@ -282,6 +340,57 @@ fn enroll_mints_a_key_and_writes_only_when_asked() {
     let (code, refused) = other.json(&["collab", "enroll", "--write"]);
     assert_eq!(code, 3);
     assert_eq!(refused["code"], "already_configured");
+}
+
+/// With live broker sessions the main checkout is refused; a session
+/// worktree gets the section in its own config and the main checkout is
+/// untouched. A section the policy in force already has, or a symlinked
+/// config, is never appended to.
+#[test]
+fn enroll_writes_to_the_current_worktree_not_the_main_checkout() {
+    let fixture = Fixture::new(None);
+    let worktree = fixture.session_worktree("enroll");
+    let (code, refused) = fixture.json(&["collab", "enroll", "--write"]);
+    assert_eq!(code, 3, "{refused}");
+    assert_eq!(refused["code"], "main_checkout_in_use");
+    assert!(
+        refused["next_action"]
+            .as_str()
+            .unwrap()
+            .contains("session worktree")
+    );
+    assert!(!fixture.repo.path().join(".aethyme/config.toml").exists());
+
+    let (code, written) = fixture.json_in(&worktree, &["collab", "enroll", "--write"]);
+    assert_eq!(code, 0, "{written}");
+    let path = PathBuf::from(written["path"].as_str().unwrap());
+    assert_eq!(
+        path.canonicalize().unwrap(),
+        worktree
+            .join(".aethyme/config.toml")
+            .canonicalize()
+            .unwrap()
+    );
+    assert!(!fixture.repo.path().join(".aethyme/config.toml").exists());
+
+    // The policy in force (here the main checkout's working copy) already
+    // mentions collaboration: the worktree's file is not appended to.
+    let second = fixture.session_worktree("second");
+    fixture.configure("[collaboration]\ncapture = \"off\"\n");
+    let (code, refused) = fixture.json_in(&second, &["collab", "enroll", "--write"]);
+    assert_eq!(code, 3, "{refused}");
+    assert_eq!(refused["code"], "already_configured");
+    assert!(!second.join(".aethyme/config.toml").exists());
+
+    // A symlinked config is refused, not followed.
+    let lone = Fixture::new(None);
+    let target = lone.home.path().join("elsewhere.toml");
+    std::fs::write(&target, "").unwrap();
+    std::os::unix::fs::symlink(&target, lone.repo.path().join(".aethyme/config.toml")).unwrap();
+    let (code, refused) = lone.json(&["collab", "enroll", "--write"]);
+    assert_eq!(code, 3, "{refused}");
+    assert_eq!(refused["code"], "symlinked_config");
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "");
 }
 
 /// A refused state root is reported by status and refuses every command,
@@ -479,32 +588,36 @@ fn usage_errors_are_exit_2_and_help_has_no_side_effects() {
     assert!(!fixture.collaboration_dir().exists());
 }
 
-/// Under required capture, status shows the broker.db fence #660 raises,
-/// read without raising it: before any broker command it is absent and the
-/// next action says how it is raised; afterwards it is reported.
+/// Under a committed required policy, status reports the fence #660 raises
+/// as `pending` (and the next action) until a writable broker command raises
+/// it, without raising it itself; then `active`. A working-copy-only policy
+/// never fences, and advisory shows none.
 #[test]
 fn status_reports_the_required_capture_fence_without_raising_it() {
-    let fixture = Fixture::new(Some(&format!(
-        "[collaboration]\ncapture = \"required\"\nproject = \"{PROJECT}\"\n"
-    )));
+    let required = format!("[collaboration]\ncapture = \"required\"\nproject = \"{PROJECT}\"\n");
+    let (fixture, _origin) = Fixture::with_origin(&required);
     let (code, before) = fixture.json(&["collab", "status"]);
     assert_eq!(code, 0);
-    assert_eq!(before["collaboration_fence"], serde_json::Value::Null);
-    assert!(
-        before["next_actions"]
+    assert_eq!(
+        before["collaboration_fence"]["state"], "pending",
+        "{before:#}"
+    );
+    let raise = |status: &serde_json::Value| {
+        status["next_actions"]
             .as_array()
             .unwrap()
             .iter()
-            .any(|action| action
-                .as_str()
-                .unwrap()
-                .contains("raise the required-capture fence")),
-        "{before:#}"
-    );
+            .any(|action| {
+                action
+                    .as_str()
+                    .unwrap()
+                    .contains("raise the required-capture fence")
+            })
+    };
+    assert!(raise(&before), "{before:#}");
     let (_, again) = fixture.json(&["collab", "status"]);
     assert_eq!(
-        again["collaboration_fence"],
-        serde_json::Value::Null,
+        again["collaboration_fence"]["state"], "pending",
         "status raised it"
     );
 
@@ -512,13 +625,210 @@ fn status_reports_the_required_capture_fence_without_raising_it() {
     assert_eq!(code, 0);
     let (_, after) = fixture.json(&["collab", "status"]);
     let fence = &after["collaboration_fence"];
-    assert!(
-        fence["min_compatible_schema"].as_i64().unwrap() >= 50,
-        "{after:#}"
-    );
-    assert!(fence["reason"].is_string());
+    assert_eq!(fence["state"], "active", "{after:#}");
+    assert!(fence["min_compatible_schema"].as_i64().unwrap() >= 50);
+    assert_eq!(fence["source"], "committed");
+    assert!(!raise(&after));
+
+    let uncommitted = Fixture::new(Some(&required));
+    let (_, status) = uncommitted.json(&["collab", "status"]);
+    assert_eq!(status["collaboration_fence"], serde_json::Value::Null);
+    assert!(!raise(&status));
 
     let advisory = Fixture::new(Some(&enabled_config()));
     let (_, status) = advisory.json(&["collab", "status"]);
     assert_eq!(status["collaboration_fence"], serde_json::Value::Null);
+}
+
+/// A fence that cannot be read is reported as unknown with its error, never
+/// as "not raised", and no raise is suggested.
+#[test]
+fn an_unreadable_fence_is_unknown_not_absent() {
+    let required = format!("[collaboration]\ncapture = \"required\"\nproject = \"{PROJECT}\"\n");
+    let (fixture, _origin) = Fixture::with_origin(&required);
+    std::fs::write(
+        fixture.repo.path().join(".aethyme/broker.db"),
+        "not a database",
+    )
+    .unwrap();
+    let (code, status) = fixture.json(&["collab", "status"]);
+    assert_eq!(code, 0, "{status}");
+    assert_eq!(status["collaboration_fence"], serde_json::Value::Null);
+    assert!(
+        status["collaboration_fence_error"]["code"].is_string(),
+        "{status:#}"
+    );
+    assert!(
+        !status["next_actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|action| action.as_str().unwrap().contains("raise")),
+        "{status:#}"
+    );
+    let text = fixture.run(&["collab", "status"]);
+    assert!(String::from_utf8_lossy(&text.stdout).contains("fence: unknown"));
+}
+
+/// Forward compatibility: an advisory repository whose config carries a key
+/// from a newer binary still submits and captures, and both submit and
+/// status report the ignored key. Required refuses it (above).
+#[test]
+fn an_advisory_policy_ignores_an_unknown_setting_and_says_so() {
+    let fixture = Fixture::new(Some(&format!("{}future_knob = 7\n", enabled_config())));
+    let (code, started) = fixture.json(&[
+        "broker",
+        "start",
+        "--task",
+        "forward",
+        "--short-name",
+        "forward",
+    ]);
+    assert_eq!(code, 0, "{started}");
+    let worktree = PathBuf::from(started["worktree_path"].as_str().unwrap());
+    std::fs::write(worktree.join("forward.txt"), "payload\n").unwrap();
+    git(&worktree, &["add", "-A"]);
+    git(&worktree, &["commit", "-qm", "forward"]);
+    let session = started["id"].as_i64().unwrap().to_string();
+    let output = fixture.run(&["broker", "submit", "--session", &session, "--json"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let submitted: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let capture = &submitted["collaboration_capture"];
+    assert_eq!(capture["status"], "acknowledged", "{submitted:#}");
+    assert_eq!(
+        capture["ignored_settings"],
+        serde_json::json!(["future_knob"])
+    );
+
+    let (_, status) = fixture.json(&["collab", "status"]);
+    assert_eq!(status["enabled"], true);
+    assert_eq!(
+        status["ignored_settings"],
+        serde_json::json!(["future_knob"])
+    );
+    let text = fixture.run(&["collab", "status"]);
+    assert!(
+        String::from_utf8_lossy(&text.stdout).contains("warning: ignored [collaboration] setting")
+    );
+}
+
+/// Status reads an existing store through a read-only snapshot: every byte
+/// under the collaboration root is unchanged, and a permission problem is
+/// reported under state.refusal instead of failing status.
+#[test]
+fn status_never_writes_and_embeds_store_problems() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fixture = Fixture::new(Some(&enabled_config()));
+    fixture.capture("readonly");
+    let before = tree(&fixture.collaboration_dir());
+    let (code, status) = fixture.json(&["collab", "status"]);
+    assert_eq!(code, 0);
+    assert_eq!(status["state"]["needs_migration"], false, "{status:#}");
+    assert_eq!(tree(&fixture.collaboration_dir()), before, "status wrote");
+
+    let project = fixture.collaboration_dir().join(PROJECT);
+    std::fs::set_permissions(&project, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let (code, status) = fixture.json(&["collab", "status"]);
+    assert_eq!(code, 0, "{status}");
+    assert_eq!(
+        status["state"]["refusal"]["code"], "insecure_permissions",
+        "{status:#}"
+    );
+    std::fs::set_permissions(&project, std::fs::Permissions::from_mode(0o700)).unwrap();
+}
+
+/// Every path and byte under `root`, except SQLite's transient `-wal` and
+/// `-shm` files: closing the last connection may remove an empty WAL, which
+/// changes no stored byte.
+fn tree(root: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+    let mut out = std::collections::BTreeMap::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            let name = path.to_string_lossy();
+            if name.ends_with("-wal") || name.ends_with("-shm") {
+                continue;
+            }
+            if path.is_dir() {
+                pending.push(path.clone());
+                out.insert(path, Vec::new());
+            } else {
+                out.insert(path.clone(), std::fs::read(&path).unwrap());
+            }
+        }
+    }
+    out
+}
+
+/// Nothing but a captured submit creates collaboration state; the error's
+/// `command` names verbs only; oversized argument files are refused.
+#[test]
+fn no_command_creates_state_and_errors_echo_no_arguments() {
+    let fixture = Fixture::new(Some(&enabled_config()));
+    for args in [
+        &["collab", "gc", "plan"][..],
+        &["collab", "capture", "recover"],
+        &["collab", "capture", "receipt", "--operation", "op-1"],
+        &["collab", "context", "--path", "src/lib.rs"],
+    ] {
+        let (code, refused) = fixture.json(args);
+        assert_eq!(code, 3, "{args:?}: {refused}");
+        assert_eq!(refused["code"], "not_initialized", "{args:?}");
+        assert_eq!(
+            refused["command"],
+            args[1..3.min(args.len())]
+                .join(" ")
+                .split(" --")
+                .next()
+                .unwrap(),
+            "{args:?}"
+        );
+    }
+    assert!(!fixture.collaboration_dir().exists());
+
+    let secret = fixture.home.path().join("secret-dir");
+    let (code, error) = fixture.json(&[
+        "collab",
+        "--repo",
+        fixture.repo.path().to_str().unwrap(),
+        secret.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 2, "{error}");
+    let command = error["command"].as_str().unwrap();
+    assert!(
+        !command.contains("secret") && !command.contains('/'),
+        "{error}"
+    );
+
+    fixture.capture("caps");
+    let big = fixture.repo.path().join("big.json");
+    std::fs::write(&big, vec![b' '; 64 * 1024 + 1]).unwrap();
+    let (code, refused) = fixture.json(&[
+        "collab",
+        "brief",
+        "attach",
+        "--contribution",
+        "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        big.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 3, "{refused}");
+    assert_eq!(refused["code"], "file_too_large");
+    let huge = fixture.repo.path().join("huge.json");
+    std::fs::write(&huge, vec![b' '; 1024 * 1024 + 1]).unwrap();
+    let (code, refused) = fixture.json(&[
+        "collab",
+        "context",
+        "--path",
+        "src/lib.rs",
+        "--analysis",
+        huge.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 3, "{refused}");
+    assert_eq!(refused["code"], "file_too_large");
 }
