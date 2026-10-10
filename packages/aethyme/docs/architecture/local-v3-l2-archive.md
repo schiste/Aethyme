@@ -86,6 +86,10 @@ None of these writes an index row, so none can be mistaken for a complete captur
 the committed bytes, and replay would depend on an external driver. Attributes are read
 per path with `git check-attr --source=<commit>`, so they come from the commit's own
 `.gitattributes` (not the worktree), `.git/info/attributes` and `core.attributesFile`.
+An attribute set by the commit is a refusal. One that only this clone's `info/attributes`,
+`core.attributesFile` or system attributes set is *incomplete*: another clone does not share
+it. The archive tells them apart by asking a scratch bare repository that borrows the objects
+through an alternate (for that query only) and has no attribute sources of its own.
 `check-attr` reads files and configuration only. Combined with the forced-off fsmonitor
 and hooks, it runs nothing; a test configures an fsmonitor, filter drivers, textconv and
 hooks and checks none ran. A declaration that matches no path is accepted. End-of-line
@@ -154,4 +158,4 @@ commit ids, the object format and the first-parent commit count.
 | T08 | An interrupted copy leaves orphans and no index row; a retry completes. Per-CAP-state crashes are #658's. |
 | T09 | State-root cleanup reach: #656. |
 | T10 | Retain, delete the repository, rebuild: equal to an independent reading of a Git checkout (bytes, modes, symlinks, ID); same for both ends of a contribution. |
-| Refusals | Submodule; `filter`, `working-tree-encoding`, `ident` from the tree, `info/attributes` and `core.attributesFile`; EOL attributes accepted; configured programs never run; damaged and missing archive objects; unretained or non-canonical manifests; non-empty or symlinked destination; case/composition collisions. |
+| Refusals | Submodule; `filter`, `working-tree-encoding`, `ident` from the tree (from `info/attributes` or `core.attributesFile`: incomplete); EOL attributes accepted; configured programs never run; damaged and missing archive objects; unretained or non-canonical manifests; non-empty or symlinked destination; case/composition collisions. |
