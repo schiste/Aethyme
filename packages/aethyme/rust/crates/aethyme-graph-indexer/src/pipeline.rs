@@ -167,6 +167,36 @@ pub fn index_repo_to_disk(
     index_repo_to_disk_with(ctx, options, &registry)
 }
 
+/// One file's own extraction inputs. A language indexer reads nothing but
+/// these and the repository name, so the same unit under the same indexer
+/// profile always extracts to the same fragment.
+pub struct ExtractionUnit<'a> {
+    pub source_path: &'a str,
+    pub language: &'a str,
+    pub content: &'a str,
+}
+
+/// A file's extraction before any cross-file pass (non-code relationships,
+/// linking): its fragment and how the parser fared.
+#[derive(Debug, Clone)]
+pub struct CachedExtraction {
+    pub fragment: Fragment,
+    pub status: CoverageFileStatus,
+    pub exclusion_reason: Option<ExclusionReason>,
+}
+
+/// Reuse of per-file extractions across indexing runs.
+///
+/// The pipeline asks only for files it would parse, and records every
+/// extraction it computes. Keying is the cache's job: it must cover the
+/// repository name and the indexer profile as well as the unit, because both
+/// shape the fragment. Cross-file passes always run over the full set, so a
+/// reused extraction never carries a stale relationship or link.
+pub trait ExtractionCache: Sync {
+    fn lookup(&self, unit: &ExtractionUnit<'_>) -> Option<CachedExtraction>;
+    fn record(&self, unit: &ExtractionUnit<'_>, extraction: &CachedExtraction);
+}
+
 /// Same as [`index_repo_to_disk`] but accepts an explicit registry.
 ///
 /// Source discovery, in-memory indexing, and fragment serialization are
@@ -176,6 +206,16 @@ pub fn index_repo_to_disk_with(
     ctx: &IndexerContext,
     options: &WalkOptions,
     registry: &LanguageRegistry,
+) -> Result<IndexRepoSummary, IndexRepoError> {
+    index_repo_to_disk_cached(ctx, options, registry, None)
+}
+
+/// [`index_repo_to_disk_with`], reusing per-file extractions from `cache`.
+pub fn index_repo_to_disk_cached(
+    ctx: &IndexerContext,
+    options: &WalkOptions,
+    registry: &LanguageRegistry,
+    cache: Option<&dyn ExtractionCache>,
 ) -> Result<IndexRepoSummary, IndexRepoError> {
     let discovery_started = Instant::now();
     let walk = walk_source_tree(ctx, options).map_err(IndexRepoError::Walk)?;
@@ -248,46 +288,80 @@ pub fn index_repo_to_disk_with(
                     }
                     exclusion_reason = Some(ExclusionReason::ReadError);
                 }
-                let mut combined = LanguageIndexResult::default();
-                if let (Some(indexer), Some(content)) = (language_indexer, content.as_deref()) {
-                    match indexer.index_file(ctx, indexed, content) {
-                        Ok(output) => {
-                            combined.additional_nodes.extend(output.additional_nodes);
-                            combined.additional_edges.extend(output.additional_edges);
-                        }
-                        Err(error) => {
-                            status = CoverageFileStatus::Partial;
-                            exclusion_reason = Some(language_error_reason(&error));
-                        }
+                let unit = match (cache, content.as_deref()) {
+                    (Some(_), Some(content)) if needs_parse && read_error.is_none() => {
+                        Some(ExtractionUnit {
+                            source_path: &indexed.source_path,
+                            language: &indexed.language,
+                            content,
+                        })
                     }
-                }
-                if surface_flow::should_scan(indexed)
-                    && let Some(content) = content.as_deref()
-                {
-                    match surface_flow::index_file(ctx, indexed, content) {
-                        Ok(output) => {
-                            combined.additional_nodes.extend(output.additional_nodes);
-                            combined.additional_edges.extend(output.additional_edges);
-                        }
-                        Err(error) => {
-                            if status == CoverageFileStatus::Parsed {
-                                status = CoverageFileStatus::Partial;
+                    _ => None,
+                };
+                let hit = cache
+                    .zip(unit.as_ref())
+                    .and_then(|(cache, unit)| cache.lookup(unit));
+                let built = if let Some(hit) = hit {
+                    status = hit.status;
+                    exclusion_reason = hit.exclusion_reason;
+                    BuiltFragment {
+                        source_path: indexed.source_path.clone(),
+                        fragment: hit.fragment,
+                    }
+                } else {
+                    let mut combined = LanguageIndexResult::default();
+                    if let (Some(indexer), Some(content)) = (language_indexer, content.as_deref()) {
+                        match indexer.index_file(ctx, indexed, content) {
+                            Ok(output) => {
+                                combined.additional_nodes.extend(output.additional_nodes);
+                                combined.additional_edges.extend(output.additional_edges);
                             }
-                            if exclusion_reason.is_none() {
+                            Err(error) => {
+                                status = CoverageFileStatus::Partial;
                                 exclusion_reason = Some(language_error_reason(&error));
                             }
                         }
                     }
-                }
-                let lang_output = if combined.additional_nodes.is_empty()
-                    && combined.additional_edges.is_empty()
-                {
-                    None
-                } else {
-                    Some(combined)
-                };
+                    if surface_flow::should_scan(indexed)
+                        && let Some(content) = content.as_deref()
+                    {
+                        match surface_flow::index_file(ctx, indexed, content) {
+                            Ok(output) => {
+                                combined.additional_nodes.extend(output.additional_nodes);
+                                combined.additional_edges.extend(output.additional_edges);
+                            }
+                            Err(error) => {
+                                if status == CoverageFileStatus::Parsed {
+                                    status = CoverageFileStatus::Partial;
+                                }
+                                if exclusion_reason.is_none() {
+                                    exclusion_reason = Some(language_error_reason(&error));
+                                }
+                            }
+                        }
+                    }
+                    let lang_output = if combined.additional_nodes.is_empty()
+                        && combined.additional_edges.is_empty()
+                    {
+                        None
+                    } else {
+                        Some(combined)
+                    };
 
-                let built = build_fragment(indexed, lang_output).map_err(IndexRepoError::Build)?;
+                    let built =
+                        build_fragment(indexed, lang_output).map_err(IndexRepoError::Build)?;
+                    if let Some((cache, unit)) = cache.zip(unit.as_ref()) {
+                        cache.record(
+                            unit,
+                            &CachedExtraction {
+                                fragment: built.fragment.clone(),
+                                status,
+                                exclusion_reason,
+                            },
+                        );
+                    }
+                    built
+                };
 
                 let source_bytes = content.as_ref().map_or(0, |content| content.len() as u64);
                 let pending_relationships = content.as_deref().and_then(|content| {
