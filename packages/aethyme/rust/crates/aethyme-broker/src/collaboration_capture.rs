@@ -48,8 +48,8 @@ use rusqlite::{OptionalExtension, TransactionBehavior};
 use sha2::{Digest, Sha256};
 
 use crate::collaboration_archive::{
-    ArchiveError, CommitOid, ObjectDigest, RetainedContribution, has_object, put_object,
-    retain_contribution_with,
+    ArchiveError, CommitOid, ObjectDigest, RetainedContribution, git as archive_git, has_object,
+    put_object, refuse_partial_clone, retain_contribution_with,
 };
 use crate::collaboration_state::{CollaborationStateError, CollaborationStore};
 use crate::file_lock::{ExclusiveFileLock, open_lock_file};
@@ -414,11 +414,33 @@ fn lock_operation(
         path: path.clone(),
         source,
     };
-    let file = open_lock_file(&path).map_err(io)?;
-    if wait {
-        ExclusiveFileLock::acquire(file).map(Some).map_err(io)
-    } else {
-        ExclusiveFileLock::try_acquire(file).map_err(io)
+    loop {
+        let file = open_lock_file(&path).map_err(io)?;
+        let held = file.try_clone().map_err(io)?;
+        let lock = if wait {
+            ExclusiveFileLock::acquire(file).map_err(io)?
+        } else {
+            match ExclusiveFileLock::try_acquire(file).map_err(io)? {
+                Some(lock) => lock,
+                None => return Ok(None),
+            }
+        };
+        // The holder may have unlinked the path (allowed once the operation
+        // is final) while this caller waited on the old file. A lock on an
+        // inode the path no longer names excludes nobody: start again.
+        if same_file(&held, &path) {
+            return Ok(Some(lock));
+        }
+    }
+}
+
+/// Whether the open `file` is the one `path` names now.
+fn same_file(file: &std::fs::File, path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    match (file.metadata(), std::fs::metadata(path)) {
+        (Ok(open), Ok(named)) => open.dev() == named.dev() && open.ino() == named.ino(),
+        _ => false,
     }
 }
 
@@ -462,6 +484,21 @@ fn load_operation(
         .optional()?)
 }
 
+/// Stored and reported failure details come from Git's stderr, which the
+/// repository controls: keep at most this many bytes.
+const MAX_DETAIL_BYTES: usize = 4096;
+
+fn bounded(detail: &str) -> String {
+    if detail.len() <= MAX_DETAIL_BYTES {
+        return detail.to_string();
+    }
+    let mut end = MAX_DETAIL_BYTES;
+    while !detail.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}… [truncated]", &detail[..end])
+}
+
 fn set_state(
     store: &mut CollaborationStore,
     operation_id: &OperationId,
@@ -479,7 +516,7 @@ fn set_state(
             operation_id.as_str(),
             state,
             outcome.map(|(code, _)| code),
-            outcome.map(|(_, detail)| detail),
+            outcome.map(|(_, detail)| bounded(detail)),
             now_ms()
         ],
     )?;
@@ -497,17 +534,30 @@ fn set_state(
 }
 
 /// Bytes a capture of `request` may write: every blob of both trees, before
-/// deduplication, plus overhead.
-fn estimate_bytes(request: &CaptureRequest) -> u64 {
+/// deduplication, plus overhead. Runs Git exactly as the archive does (no
+/// lazy fetch, no prompts, no caller-supplied repository variables), after
+/// refusing a partial clone, so estimating cannot fetch or read another
+/// repository. A tree Git cannot list is an error, never a small estimate.
+fn estimate_bytes(request: &CaptureRequest) -> Result<u64, ArchiveError> {
+    refuse_partial_clone(&request.repository)?;
     let mut total = RESERVATION_OVERHEAD_BYTES;
     for commit in [&request.base, &request.result] {
-        let output = std::process::Command::new("git")
-            .arg("-C")
-            .arg(&request.repository)
+        let output = archive_git(&request.repository)
             .args(["ls-tree", "-r", "-l", "-z", "--full-tree", commit.as_str()])
-            .env("GIT_NO_REPLACE_OBJECTS", "1")
-            .output();
-        let Ok(output) = output else { continue };
+            .stdin(std::process::Stdio::null())
+            .output()
+            .map_err(|error| ArchiveError::Git {
+                detail: format!("could not run git ls-tree: {error}"),
+            })?;
+        if !output.status.success() {
+            return Err(ArchiveError::SourceUnavailable {
+                oid: commit.as_str().to_string(),
+                detail: format!(
+                    "git ls-tree could not list the tree: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ),
+            });
+        }
         for record in output.stdout.split(|b| *b == 0) {
             // "<mode> <type> <oid> <size>\t<path>"
             let header = record.split(|b| *b == b'\t').next().unwrap_or_default();
@@ -520,7 +570,7 @@ fn estimate_bytes(request: &CaptureRequest) -> u64 {
             }
         }
     }
-    total
+    Ok(total)
 }
 
 fn free_bytes(path: &Path) -> Result<u64, CaptureError> {
@@ -543,13 +593,63 @@ fn free_bytes(path: &Path) -> Result<u64, CaptureError> {
     Ok((stat.f_bavail as u64).saturating_mul(stat.f_frsize as u64))
 }
 
+/// What [`begin`] found or recorded.
+enum Begun {
+    Row(OperationRow),
+    /// The preflight found the source incomplete; nothing was reserved.
+    Incomplete(CaptureOutcome),
+}
+
+/// Record a pre-intent failure on an existing row (a retry), or nothing for
+/// a new operation, and classify it like a copy failure.
+fn preflight_failure(
+    store: &mut CollaborationStore,
+    request: &CaptureRequest,
+    existing: bool,
+    error: ArchiveError,
+) -> Result<Begun, CaptureError> {
+    let (state, outcome) = if error.is_incomplete() {
+        ("incomplete", Ok(()))
+    } else if is_refusal(&error) {
+        (
+            "refused",
+            Err(CaptureError::Refused {
+                operation_id: request.operation_id.as_str().to_string(),
+                code: error.code().to_string(),
+                detail: bounded(&error.to_string()),
+            }),
+        )
+    } else {
+        (
+            "failed",
+            Err(archive_failure(&request.operation_id, &error)),
+        )
+    };
+    if existing {
+        set_state(
+            store,
+            &request.operation_id,
+            state,
+            Some((error.code(), &error.to_string())),
+        )?;
+    }
+    outcome.map(|()| {
+        Begun::Incomplete(CaptureOutcome::Incomplete {
+            operation_id: request.operation_id.clone(),
+            code: error.code().to_string(),
+            detail: bounded(&error.to_string()),
+        })
+    })
+}
+
 /// CAP_INTENT: record the operation, or find it. Returns the existing row
-/// when this operation was seen before.
+/// when this operation was seen before. A source that cannot be estimated is
+/// answered before anything is reserved; a new operation then leaves no row.
 fn begin(
     store: &mut CollaborationStore,
     request: &CaptureRequest,
     hooks: &Hooks,
-) -> Result<Option<OperationRow>, CaptureError> {
+) -> Result<Begun, CaptureError> {
     let digest = request.digest();
     let existing = load_operation(store.connection(), &request.operation_id)?;
     if let Some(row) = &existing
@@ -566,10 +666,19 @@ fn begin(
         Some(_) => false,
     };
     if !resumable {
-        return Ok(existing);
+        return Ok(Begun::Row(
+            existing.expect("only an existing row is not resumable"),
+        ));
     }
 
-    let needed = estimate_bytes(request);
+    let needed = match estimate_bytes(request) {
+        Ok(needed) => needed,
+        Err(error) => return preflight_failure(store, request, existing.is_some(), error),
+    };
+    // A crashed capture's reservation must not starve this one until someone
+    // calls `recover`: resolve every other in-flight operation no live
+    // worker holds (non-blocking, so a live one is skipped).
+    reap_crashed(store, Some(&request.operation_id));
     let available = match hooks.free_bytes {
         Some(bytes) => bytes,
         None => free_bytes(store.project_dir())?,
@@ -640,7 +749,10 @@ fn begin(
     }
     transaction.commit()?;
     fault!(hooks, FaultPoint::AfterIntent);
-    load_operation(store.connection(), &request.operation_id)
+    Ok(Begun::Row(
+        load_operation(store.connection(), &request.operation_id)?
+            .expect("the operation row was just written"),
+    ))
 }
 
 fn record_id(text: &str, operation_id: &OperationId) -> Result<RecordId, CaptureError> {
@@ -877,7 +989,7 @@ fn archive_failure(operation_id: &OperationId, error: &ArchiveError) -> CaptureE
     CaptureError::Failed {
         operation_id: operation_id.as_str().to_string(),
         code: error.code().to_string(),
-        detail: error.to_string(),
+        detail: bounded(&error.to_string()),
     }
 }
 
@@ -893,6 +1005,8 @@ fn is_refusal(error: &ArchiveError) -> bool {
             | ArchiveError::UnsupportedFilter { .. }
             | ArchiveError::InvalidSnapshot(_)
             | ArchiveError::BaseNotAncestor { .. }
+            // The same commit always produces it.
+            | ArchiveError::MalformedSource { .. }
     )
 }
 
@@ -916,7 +1030,7 @@ fn answer(
                         operation_id: operation.clone(),
                         detail: "a sealed operation has no contribution".into(),
                     })?;
-            commit(store, request, &lineage, hooks)?;
+            commit_or_fail(store, request, &lineage, hooks)?;
             acknowledge(store, &request.operation_id)
         }
         "refused" => Err(CaptureError::Refused {
@@ -969,8 +1083,9 @@ pub(crate) fn capture_with(
     // for all of them. Taken before the operation lock, always.
     let _use = archive_use(store)?;
     let _lock = lock_operation(store, &request.operation_id, true)?;
-    let Some(row) = begin(store, request, hooks)? else {
-        unreachable!("begin returns the operation it recorded");
+    let row = match begin(store, request, hooks)? {
+        Begun::Row(row) => row,
+        Begun::Incomplete(outcome) => return Ok(outcome),
     };
     if row.state != "intent" {
         return answer(store, request, &row, hooks);
@@ -1016,7 +1131,7 @@ pub(crate) fn capture_with(
             return Ok(CaptureOutcome::Incomplete {
                 operation_id: request.operation_id.clone(),
                 code: error.code().to_string(),
-                detail: error.to_string(),
+                detail: bounded(&error.to_string()),
             });
         }
         Err(error) if is_refusal(&error) => {
@@ -1029,7 +1144,7 @@ pub(crate) fn capture_with(
             return Err(CaptureError::Refused {
                 operation_id: request.operation_id.as_str().to_string(),
                 code: error.code().to_string(),
-                detail: error.to_string(),
+                detail: bounded(&error.to_string()),
             });
         }
         Err(error) => {
@@ -1061,58 +1176,129 @@ fn store_spool_hint() -> PathBuf {
     PathBuf::from("spool/archive")
 }
 
-/// After a crash: resolve every operation no live worker holds. `intent` and
-/// `copying` become `failed` (code `interrupted`, retryable); `sealed` is
-/// committed, because its source is already retained; `committed` and the
-/// terminal states are left alone.
-pub fn recover(store: &mut CollaborationStore) -> Result<Vec<Recovery>, CaptureError> {
-    let _use = archive_use(store)?;
-    let pending: Vec<(String, String, String)> = store
-        .connection()
-        .prepare(
-            "SELECT operation_id, state, request_digest FROM capture_operations
-             WHERE state IN ('intent', 'copying', 'sealed') ORDER BY operation_id",
-        )?
-        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
-        .collect::<Result<_, _>>()?;
-    let mut actions = Vec::new();
-    for (operation, state, _) in pending {
-        let operation_id = OperationId::parse(&operation)?;
-        let Some(_lock) = lock_operation(store, &operation_id, false)? else {
-            continue; // A live worker owns it.
-        };
-        // Re-read under the lock: the worker may have finished meanwhile.
-        let Some(row) = load_operation(store.connection(), &operation_id)? else {
-            continue;
-        };
-        let to = match row.state.as_str() {
-            "intent" | "copying" => {
+/// Commit a sealed operation. If its retained bytes are gone the commit can
+/// never succeed: the operation becomes `failed` (`corrupt_receipt`), which
+/// releases its reservation and intent root, and a retry copies again.
+fn commit_or_fail(
+    store: &mut CollaborationStore,
+    request: &CaptureRequest,
+    lineage: &str,
+    hooks: &Hooks,
+) -> Result<CaptureReceipt, CaptureError> {
+    match commit(store, request, lineage, hooks) {
+        Err(error @ CaptureError::CorruptReceipt { .. }) => {
+            set_state(
+                store,
+                &request.operation_id,
+                "failed",
+                Some(("corrupt_receipt", &error.to_string())),
+            )?;
+            Err(error)
+        }
+        other => other,
+    }
+}
+
+/// What [`recover`] did: the operations it resolved, and those it could not.
+#[derive(Debug, Default)]
+pub struct RecoveryReport {
+    pub recovered: Vec<Recovery>,
+    pub errors: Vec<(OperationId, CaptureError)>,
+}
+
+/// Resolve one in-flight operation if no live worker holds it.
+fn recover_one(
+    store: &mut CollaborationStore,
+    operation_id: &OperationId,
+) -> Result<Option<Recovery>, CaptureError> {
+    let Some(_lock) = lock_operation(store, operation_id, false)? else {
+        return Ok(None); // A live worker owns it.
+    };
+    // Re-read under the lock: the worker may have finished meanwhile.
+    let Some(row) = load_operation(store.connection(), operation_id)? else {
+        return Ok(None);
+    };
+    let to = match row.state.as_str() {
+        "intent" | "copying" => {
+            set_state(
+                store,
+                operation_id,
+                "failed",
+                Some((
+                    "interrupted",
+                    "the capturing process stopped before sealing",
+                )),
+            )?;
+            "failed"
+        }
+        "sealed" => {
+            let request = stored_request(store, operation_id)?;
+            let Some(lineage) = row.lineage_record_id.clone() else {
                 set_state(
                     store,
-                    &operation_id,
+                    operation_id,
                     "failed",
-                    Some((
-                        "interrupted",
-                        "the capturing process stopped before sealing",
-                    )),
+                    Some(("corrupt_receipt", "a sealed operation has no contribution")),
                 )?;
-                "failed"
+                return Ok(Some(Recovery {
+                    operation_id: operation_id.clone(),
+                    from: row.state,
+                    to: "failed".into(),
+                }));
+            };
+            match commit_or_fail(store, &request, &lineage, &Hooks::default()) {
+                Ok(_) => "committed",
+                Err(CaptureError::CorruptReceipt { .. }) => "failed",
+                Err(error) => return Err(error),
             }
-            "sealed" => {
-                let request = stored_request(store, &operation_id)?;
-                let lineage = row.lineage_record_id.clone().unwrap_or_default();
-                commit(store, &request, &lineage, &Hooks::default())?;
-                "committed"
-            }
-            _ => continue,
-        };
-        actions.push(Recovery {
-            operation_id,
-            from: state,
-            to: to.to_string(),
-        });
+        }
+        _ => return Ok(None),
+    };
+    Ok(Some(Recovery {
+        operation_id: operation_id.clone(),
+        from: row.state,
+        to: to.to_string(),
+    }))
+}
+
+fn in_flight(store: &mut CollaborationStore) -> Result<Vec<OperationId>, CaptureError> {
+    let ids: Vec<String> = store
+        .connection()
+        .prepare(
+            "SELECT operation_id FROM capture_operations
+             WHERE state IN ('intent', 'copying', 'sealed') ORDER BY operation_id",
+        )?
+        .query_map([], |row| row.get(0))?
+        .collect::<Result<_, _>>()?;
+    ids.iter().map(|id| OperationId::parse(id)).collect()
+}
+
+/// Resolve crashed operations other than `except`, ignoring failures: an
+/// operation that cannot be resolved now is left for [`recover`] to report.
+fn reap_crashed(store: &mut CollaborationStore, except: Option<&OperationId>) {
+    let Ok(ids) = in_flight(store) else { return };
+    for id in ids.iter().filter(|id| Some(*id) != except) {
+        let _ = recover_one(store, id);
     }
-    Ok(actions)
+}
+
+/// After a crash: resolve every operation no live worker holds. `intent` and
+/// `copying` become `failed` (code `interrupted`, retryable); `sealed` is
+/// committed, because its source is already retained, or becomes `failed`
+/// (`corrupt_receipt`) if those bytes are gone; `committed` and the terminal
+/// states are left alone. One operation's error does not stop the others.
+pub fn recover(store: &mut CollaborationStore) -> Result<RecoveryReport, CaptureError> {
+    // Shared with captures, exclusive with a GC apply (#659).
+    let _use = archive_use(store)?;
+    let mut report = RecoveryReport::default();
+    for operation_id in in_flight(store)? {
+        match recover_one(store, &operation_id) {
+            Ok(Some(recovery)) => report.recovered.push(recovery),
+            Ok(None) => {}
+            Err(error) => report.errors.push((operation_id, error)),
+        }
+    }
+    Ok(report)
 }
 
 fn stored_request(
@@ -1480,7 +1666,7 @@ mod tests {
         let mut store = open(host.path());
         capture_with(&mut store, &request, &faulted(FaultPoint::AfterSealed)).unwrap_err();
         drop(repo);
-        let actions = recover(&mut store).unwrap();
+        let actions = recover(&mut store).unwrap().recovered;
         assert_eq!(actions.len(), 1);
         assert_eq!(
             (actions[0].from.as_str(), actions[0].to.as_str()),
@@ -1564,6 +1750,12 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+        // It can never commit, so it stops protecting and reserving; a retry
+        // copies the source again and completes.
+        assert_eq!(state(&mut store, "op-1"), "failed");
+        assert_eq!(live_roots(&mut store, "capture_intent"), 0);
+        let receipt = acknowledged(capture(&mut store, &request).unwrap());
+        assert_reconstructs(&store, &receipt);
     }
 
     /// A receipt from an unsupported filesystem never reads like one from
@@ -1598,6 +1790,321 @@ mod tests {
         open(host.path()).durability().supported
     }
 
+    fn no_rows(store: &mut CollaborationStore) -> bool {
+        count(store, "SELECT count(*) FROM capture_operations") == 0
+    }
+
+    fn incomplete_code(outcome: CaptureOutcome) -> String {
+        match outcome {
+            CaptureOutcome::Incomplete { code, .. } => code,
+            other => panic!("expected incomplete, got {other:?}"),
+        }
+    }
+
+    /// A partial clone is answered before estimating, so the estimate never
+    /// asks Git for blobs the clone lacks; nothing is reserved or recorded.
+    #[test]
+    fn a_partial_clone_is_answered_before_anything_is_reserved() {
+        let (source, base, result) = repo();
+        git_in(source.path(), &["config", "uploadpack.allowfilter", "true"]);
+        let clone = tempfile::tempdir().unwrap();
+        let url = format!("file://{}", source.path().display());
+        git_in(
+            source.path(),
+            &[
+                "clone",
+                "-q",
+                "--filter=blob:none",
+                "--no-checkout",
+                &url,
+                clone.path().to_str().unwrap(),
+            ],
+        );
+        let host = tempfile::tempdir().unwrap();
+        let mut store = open(host.path());
+        let outcome = capture(&mut store, &request(clone.path(), "op-1", &base, &result)).unwrap();
+        assert_eq!(incomplete_code(outcome), "partial_clone");
+        assert!(no_rows(&mut store));
+    }
+
+    /// A tree Git cannot list is not a small estimate that slips past
+    /// admission: it is answered before anything is reserved.
+    #[test]
+    fn a_tree_git_cannot_list_is_not_a_small_estimate() {
+        let (repo, base, _) = repo();
+        let missing = CommitOid::parse(&"ab".repeat(20)).unwrap();
+        let host = tempfile::tempdir().unwrap();
+        let mut store = open(host.path());
+        let outcome = capture(&mut store, &request(repo.path(), "op-1", &base, &missing)).unwrap();
+        assert_eq!(incomplete_code(outcome), "source_unavailable");
+        assert!(no_rows(&mut store));
+    }
+
+    const ENV_CHILD: &str = "AETHYME_CAPTURE_ENV_CHILD";
+
+    #[test]
+    #[ignore = "child process of caller_git_variables_do_not_redirect_the_capture"]
+    fn env_child_captures_with_hostile_git_variables() {
+        let Some(spec) = std::env::var_os(ENV_CHILD) else {
+            return;
+        };
+        let spec = spec.to_string_lossy().into_owned();
+        let parts: Vec<&str> = spec.split('\n').collect();
+        let mut store = open(Path::new(parts[0]));
+        let request = request(
+            Path::new(parts[1]),
+            "op-env",
+            &CommitOid::parse(parts[2]).unwrap(),
+            &CommitOid::parse(parts[3]).unwrap(),
+        );
+        match capture(&mut store, &request) {
+            Ok(CaptureOutcome::Acknowledged(_)) => println!("RESULT ok"),
+            Ok(CaptureOutcome::Incomplete { code, .. }) => println!("RESULT incomplete {code}"),
+            Err(error) => println!("RESULT err {}", error.code()),
+        }
+    }
+
+    /// A caller's `GIT_DIR` or object-directory variables never point the
+    /// estimate (or the copy) at another repository.
+    #[test]
+    fn caller_git_variables_do_not_redirect_the_capture() {
+        let (repo, base, result) = repo();
+        let (other, _, _) = self::repo();
+        let host = tempfile::tempdir().unwrap();
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "collaboration_capture::tests::env_child_captures_with_hostile_git_variables",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(
+                ENV_CHILD,
+                format!(
+                    "{}\n{}\n{}\n{}",
+                    host.path().display(),
+                    repo.path().display(),
+                    base.as_str(),
+                    result.as_str()
+                ),
+            )
+            .env("GIT_DIR", other.path().join(".git"))
+            .env("GIT_OBJECT_DIRECTORY", other.path().join(".git/objects"))
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("RESULT ok"), "{stdout}");
+    }
+
+    /// One operation recovery cannot resolve does not stop the others.
+    #[test]
+    fn recovery_continues_past_an_operation_it_cannot_resolve() {
+        let (repo, base, result) = repo();
+        let host = tempfile::tempdir().unwrap();
+        let mut store = open(host.path());
+        let broken = request(repo.path(), "op-a", &base, &result);
+        capture_with(&mut store, &broken, &faulted(FaultPoint::AfterSealed)).unwrap_err();
+        store
+            .connection()
+            .execute(
+                "UPDATE capture_operations SET base_commit = 'not-an-oid'
+                 WHERE operation_id = 'op-a'",
+                [],
+            )
+            .unwrap();
+        let crashed = request(repo.path(), "op-b", &base, &result);
+        capture_with(&mut store, &crashed, &faulted(FaultPoint::AfterIntent)).unwrap_err();
+
+        let report = recover(&mut store).unwrap();
+        assert_eq!(report.errors.len(), 1);
+        assert_eq!(report.errors[0].0.as_str(), "op-a");
+        assert_eq!(report.recovered.len(), 1);
+        assert_eq!(report.recovered[0].operation_id.as_str(), "op-b");
+        assert_eq!(state(&mut store, "op-b"), "failed");
+    }
+
+    /// Recovery moves a sealed operation whose bytes are gone to a terminal
+    /// state, releasing what it held.
+    #[test]
+    fn recovery_fails_a_sealed_operation_whose_bytes_are_gone() {
+        let (repo, base, result) = repo();
+        let host = tempfile::tempdir().unwrap();
+        let request = request(repo.path(), "op-1", &base, &result);
+        let mut store = open(host.path());
+        capture_with(&mut store, &request, &faulted(FaultPoint::AfterSealed)).unwrap_err();
+        let manifest: String = store
+            .connection()
+            .query_row(
+                "SELECT base_snapshot FROM retained_contributions",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let digest = ObjectDigest::of_snapshot(&SourceSnapshotId::parse(&manifest).unwrap()).hex();
+        std::fs::remove_file(
+            store
+                .project_dir()
+                .join("objects/sha256")
+                .join(&digest[..2])
+                .join(&digest[2..]),
+        )
+        .unwrap();
+        let report = recover(&mut store).unwrap();
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(report.recovered[0].to, "failed");
+        assert_eq!(live_roots(&mut store, "capture_intent"), 0);
+        assert_eq!(
+            count(
+                &mut store,
+                "SELECT COALESCE(SUM(reserved_bytes), 0) FROM capture_operations
+                 WHERE state IN ('intent', 'copying', 'sealed')"
+            ),
+            0
+        );
+    }
+
+    /// A crashed capture's reservation does not starve the next capture
+    /// until someone calls `recover`.
+    #[test]
+    fn a_crashed_reservation_is_reaped_by_the_next_capture() {
+        let (repo, base, result) = repo();
+        let host = tempfile::tempdir().unwrap();
+        let mut store = open(host.path());
+        let first = request(repo.path(), "op-1", &base, &result);
+        capture_with(&mut store, &first, &faulted(FaultPoint::AfterIntent)).unwrap_err();
+        let room_for_one = Hooks {
+            free_bytes: Some(RESERVATION_FLOOR_BYTES + estimate_bytes(&first).unwrap()),
+            ..Hooks::default()
+        };
+        let second = request(repo.path(), "op-2", &base, &result);
+        acknowledged(capture_with(&mut store, &second, &room_for_one).unwrap());
+        assert_eq!(state(&mut store, "op-1"), "failed");
+    }
+
+    #[test]
+    fn malformed_source_is_a_refusal() {
+        assert!(is_refusal(&ArchiveError::MalformedSource {
+            oid: "ab".repeat(20),
+            kind: "commit",
+        }));
+    }
+
+    /// A transforming attribute from this clone's own configuration is
+    /// retryable from another clone; one the commit sets is refused for good.
+    #[test]
+    fn a_clone_local_filter_is_retryable_and_a_committed_one_is_not() {
+        let (repo, base, result) = repo();
+        let host = tempfile::tempdir().unwrap();
+        let mut store = open(host.path());
+        let request = request(repo.path(), "op-1", &base, &result);
+        std::fs::write(
+            repo.path().join(".git/info/attributes"),
+            "*.txt filter=lfs\n",
+        )
+        .unwrap();
+        assert_eq!(
+            incomplete_code(capture(&mut store, &request).unwrap()),
+            "unsupported_filter"
+        );
+        std::fs::remove_file(repo.path().join(".git/info/attributes")).unwrap();
+        acknowledged(capture(&mut store, &request).unwrap());
+
+        std::fs::write(repo.path().join(".gitattributes"), "*.txt filter=lfs\n").unwrap();
+        git_in(repo.path(), &["add", "-A"]);
+        git_in(repo.path(), &["commit", "-qm", "filter"]);
+        let filtered = pin_commit(repo.path(), "HEAD").unwrap();
+        let committed = self::request(repo.path(), "op-2", &base, &filtered);
+        for _ in 0..2 {
+            match capture(&mut store, &committed).unwrap_err() {
+                CaptureError::Refused { code, .. } => assert_eq!(code, "unsupported_filter"),
+                other => panic!("{other}"),
+            }
+        }
+    }
+
+    /// Failure details come from repository-controlled Git output.
+    #[test]
+    fn stored_failure_details_are_bounded() {
+        let (repo, base, result) = repo();
+        let host = tempfile::tempdir().unwrap();
+        let mut store = open(host.path());
+        let request = request(repo.path(), "op-1", &base, &result);
+        capture_with(&mut store, &request, &faulted(FaultPoint::AfterIntent)).unwrap_err();
+        let huge = "é".repeat(100_000);
+        set_state(
+            &mut store,
+            &request.operation_id,
+            "failed",
+            Some(("git", &huge)),
+        )
+        .unwrap();
+        let stored: String = store
+            .connection()
+            .query_row(
+                "SELECT outcome_detail FROM capture_operations WHERE operation_id = 'op-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(stored.len() <= MAX_DETAIL_BYTES + 32, "{}", stored.len());
+        assert!(stored.ends_with("[truncated]"));
+    }
+
+    /// A lock path unlinked and recreated while a waiter blocks on the old
+    /// file never yields two holders.
+    #[test]
+    fn an_unlinked_lock_path_cannot_produce_two_holders() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::Duration;
+
+        let host = tempfile::tempdir().unwrap();
+        let store = open(host.path());
+        let id = OperationId::parse("op-1").unwrap();
+        let path = locks_dir(&store).join("op-1.lock");
+        let holder = lock_operation(&store, &id, false).unwrap().unwrap();
+
+        let acquired = Arc::new(AtomicBool::new(false));
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let waiter = {
+            let acquired = Arc::clone(&acquired);
+            let host = host.path().to_path_buf();
+            let id = id.clone();
+            std::thread::spawn(move || {
+                let store = open(&host);
+                let lock = lock_operation(&store, &id, true).unwrap().unwrap();
+                acquired.store(true, Ordering::SeqCst);
+                release_rx.recv().unwrap();
+                drop(lock);
+            })
+        };
+        std::thread::sleep(Duration::from_millis(300));
+        // The holder unlinks the path (allowed once the operation is final);
+        // a newcomer creates a new file there and locks it.
+        std::fs::remove_file(&path).unwrap();
+        let newcomer = lock_operation(&store, &id, false).unwrap().unwrap();
+        drop(holder);
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(
+            !acquired.load(Ordering::SeqCst),
+            "the waiter holds the old file while the newcomer holds the new one"
+        );
+        drop(newcomer);
+        for _ in 0..100 {
+            if acquired.load(Ordering::SeqCst) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            acquired.load(Ordering::SeqCst),
+            "the waiter never acquired the lock"
+        );
+        release_tx.send(()).unwrap();
+        waiter.join().unwrap();
+    }
+
     #[test]
     fn recovery_leaves_an_operation_a_live_worker_holds() {
         let (repo, base, result) = repo();
@@ -1609,10 +2116,10 @@ mod tests {
             .unwrap()
             .unwrap();
         let mut other = open(host.path());
-        assert!(recover(&mut other).unwrap().is_empty());
+        assert!(recover(&mut other).unwrap().recovered.is_empty());
         assert_eq!(state(&mut other, "op-1"), "intent");
         drop(held);
-        assert_eq!(recover(&mut other).unwrap().len(), 1);
+        assert_eq!(recover(&mut other).unwrap().recovered.len(), 1);
         assert_eq!(state(&mut other, "op-1"), "failed");
     }
 
@@ -1687,8 +2194,12 @@ mod tests {
         );
 
         // One in-flight capture's reservation leaves no room for a second.
-        let estimate = estimate_bytes(&first);
+        let estimate = estimate_bytes(&first).unwrap();
         capture_with(&mut store, &first, &faulted(FaultPoint::AfterIntent)).unwrap_err();
+        // Its worker is still alive: it holds the operation's lock.
+        let live = lock_operation(&store, &first.operation_id, false)
+            .unwrap()
+            .unwrap();
         let room_for_one = Hooks {
             free_bytes: Some(RESERVATION_FLOOR_BYTES + 2 * estimate - 1),
             ..Hooks::default()
@@ -1700,6 +2211,7 @@ mod tests {
                 .code(),
             "insufficient_space"
         );
+        drop(live);
         abort(&mut store, &first.operation_id).unwrap();
         acknowledged(capture_with(&mut store, &second, &room_for_one).unwrap());
 

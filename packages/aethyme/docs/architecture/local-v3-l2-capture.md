@@ -29,13 +29,38 @@ Failures end in a state that says what a retry can do:
 
 | State | Meaning | Retry with the same operation |
 |---|---|---|
-| `incomplete` | The source was missing or did not match (archive `is_incomplete`). | Yes, for example from a repaired or fuller clone. |
+| `incomplete` | The source was missing or did not match, the clone is partial, or a transforming attribute comes from this clone's `info/attributes`, `core.attributesFile` or system attributes rather than the commit (archive `is_incomplete`). | Yes, for example from a repaired, fuller or clean clone. The repository path is not part of the request, so a retry may come from another clone. |
 | `failed` | A local error such as a full disk, or `interrupted` set by recovery. | Yes |
-| `refused` | Unsupported entry or filter, invalid snapshot, base not an ancestor, not a commit. | No: the same refusal is returned. |
+| `refused` | Unsupported entry, a transforming attribute the commit's own `.gitattributes` sets, malformed source, invalid snapshot, base not an ancestor, not a commit. | No: the same refusal is returned. |
 | `aborted` | Explicit `abort`. | No |
 
 Each terminal failure releases the intent root and the reservation. An operation that
-is not running protects nothing.
+is not running protects nothing. Stored failure details come from Git's stderr, which the
+repository controls, so they are capped at 4 KiB.
+
+### Preflight
+
+Before anything is reserved, the capture refuses a partial clone and lists both trees
+to estimate their size, running Git as the archive does: no lazy fetch, no prompts, and
+no caller-supplied `GIT_DIR`, object-directory or configuration variables. A tree Git
+cannot list is answered as `incomplete`, never as a small estimate. A new operation
+answered here leaves no row; a retried one records the outcome on its row.
+
+### Recovery
+
+`recover` resolves every in-flight operation that no live worker holds:
+
+- `intent` and `copying` become `failed` (`interrupted`);
+- `sealed` is committed, or becomes `failed` (`corrupt_receipt`) if its retained bytes
+  are gone, which releases what it held; a retry copies again;
+- one operation it cannot resolve is reported in `RecoveryReport.errors` and does not
+  stop the others.
+
+Every capture also resolves other crashed operations, using a non-blocking lock so a
+live worker is skipped, before it checks space. One crash therefore cannot make every
+later capture `insufficient_space` until someone calls `recover`. Callers (#660, #680)
+should still call `recover` at startup, to commit sealed operations and to surface
+errors.
 
 ### Retry key and concurrency
 
@@ -46,7 +71,10 @@ is not running protects nothing.
 - **One worker per operation.** A worker holds `spool/capture/<operation>.lock`
   (`flock`) for the whole capture, so concurrent deliveries run one after another and
   the second finds the receipt. The kernel releases the lock when a process dies, which
-  is how `recover` tells a dead worker from a live one.
+  is how `recover` tells a dead worker from a live one. After acquiring, the worker
+  checks that the path still names the file it locked, and starts again if not: a
+  waiter woken on an unlinked file must not hold a lock alongside whoever locked the new
+  one (tested).
 - **The commit transaction is idempotent.** It checks for an existing receipt, so
   committing a sealed operation twice adds no second receipt, root or outbox row
   (tested). Concurrent deliveries rely on the lock: without it they are not safe.
@@ -102,9 +130,13 @@ An archive object may be reclaimed only when **all** of these hold:
   protected only by the operation's live `capture_intent` root;
 - the operation's lock file is not held.
 
-The lock files of terminal operations, and the objects of `incomplete`, `failed`,
-`refused` and `aborted` operations that no other root reaches, are reclaimable after a
-grace period that #659 sets.
+The objects of `incomplete`, `failed`, `refused` and `aborted` operations that no other
+root reaches are reclaimable after a grace period that #659 sets.
+
+**Lock files.** A lock file may be unlinked only by a process that holds its `flock`,
+and only while the operation is in a non-retryable state: `committed`, `acknowledged`,
+`refused` or `aborted`. `failed` and `incomplete` operations are retried with the same
+lock path, so their lock files stay.
 
 ## Not decided here
 

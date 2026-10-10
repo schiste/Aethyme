@@ -32,8 +32,10 @@
 //!   missing history is *incomplete* ([`ArchiveError::is_incomplete`]). A
 //!   submodule, a mode #652 refuses, or an attribute that makes a checkout
 //!   differ from the committed bytes (`filter`, `working-tree-encoding`,
-//!   `ident`; from the tree, `.git/info/attributes` or
-//!   `core.attributesFile`) is *refused*. Either way
+//!   `ident`) set by the commit's own `.gitattributes` is *refused*. The
+//!   same attribute from this clone's `info/attributes`,
+//!   `core.attributesFile` or system attributes is *incomplete*: another
+//!   clone does not share it. Either way
 //!   no index row is written, and objects already copied stay as orphans
 //!   that a retry reuses.
 //! - **Lineage.** A contribution retains its complete base and result
@@ -204,11 +206,19 @@ pub enum ArchiveError {
     )]
     UnsupportedEntry { path: Vec<u8>, mode: String },
     #[error(
-        "{} sets {attribute}, so a Git checkout would not produce the committed bytes; the \
+        "{} sets {attribute}{}, so a Git checkout would not produce the committed bytes; the \
          archive cannot retain what replay needs",
-        String::from_utf8_lossy(path)
+        String::from_utf8_lossy(path),
+        if *from_tree { "" } else { " from this clone's or this user's configuration, not the commit" }
     )]
-    UnsupportedFilter { path: Vec<u8>, attribute: String },
+    UnsupportedFilter {
+        path: Vec<u8>,
+        attribute: String,
+        /// Set by the commit's own `.gitattributes`. Otherwise it comes from
+        /// `info/attributes`, `core.attributesFile` or system attributes,
+        /// which another clone does not share.
+        from_tree: bool,
+    },
     #[error("the commit's tree is not a valid v0 snapshot: {0}")]
     InvalidSnapshot(#[from] SourceSnapshotError),
     #[error("source object {oid} is unavailable: {detail}")]
@@ -291,6 +301,10 @@ impl ArchiveError {
                 | Self::SourceMismatch { .. }
                 | Self::HistoryUnavailable { .. }
                 | Self::PartialClone { .. }
+                | Self::UnsupportedFilter {
+                    from_tree: false,
+                    ..
+                }
         )
     }
 }
@@ -472,7 +486,7 @@ pub fn has_object(store: &CollaborationStore, digest: &ObjectDigest) -> bool {
 
 // -------------------------------------------------------------------- git
 
-fn git(repo: &Path) -> Command {
+pub(crate) fn git(repo: &Path) -> Command {
     let mut command = Command::new("git");
     command
         .arg("--no-replace-objects")
@@ -563,7 +577,7 @@ pub fn pin_commit(repo: &Path, revision: &str) -> Result<CommitOid, ArchiveError
 
 /// Refuse a partial clone: objects it omitted would otherwise surface as
 /// missing part-way through, or be fetched from a promisor remote.
-fn refuse_partial_clone(repo: &Path) -> Result<(), ArchiveError> {
+pub(crate) fn refuse_partial_clone(repo: &Path) -> Result<(), ArchiveError> {
     let output = git_output(
         repo,
         &[
@@ -965,13 +979,96 @@ fn refuse_transforming_attributes(
             && value != "unset"
             && value != "unspecified"
         {
+            let from_tree = attribute_set_by_tree(repo, commit, path, &attribute)?;
             return Err(ArchiveError::UnsupportedFilter {
                 path: path.to_vec(),
                 attribute: format!("{attribute}={value}"),
+                from_tree,
             });
         }
     }
     Ok(())
+}
+
+/// Whether `commit`'s own tree sets `attribute` on `path`, ignoring
+/// `info/attributes`, `core.attributesFile` and system attributes. Asked of a
+/// scratch bare repository that borrows the source's objects through an
+/// alternate (for this query only; nothing is retained through it) and has
+/// no attribute files of its own.
+fn attribute_set_by_tree(
+    repo: &Path,
+    commit: &CommitOid,
+    path: &[u8],
+    attribute: &str,
+) -> Result<bool, ArchiveError> {
+    let common = git_text(
+        repo,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )?;
+    let format = git_text(repo, &["rev-parse", "--show-object-format"])?;
+    let scratch = tempfile::tempdir().map_err(|source| io(Path::new("scratch"), source))?;
+    let bare = scratch.path().join("tree-only.git");
+    let init = git(scratch.path())
+        .args(["init", "-q", "--bare", &format!("--object-format={format}")])
+        .arg(&bare)
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|error| ArchiveError::Git {
+            detail: format!("could not run git init: {error}"),
+        })?;
+    if !init.status.success() {
+        return Err(ArchiveError::Git {
+            detail: format!("git init: {}", String::from_utf8_lossy(&init.stderr).trim()),
+        });
+    }
+    let alternates = bare.join("objects/info/alternates");
+    std::fs::write(&alternates, format!("{common}/objects\n"))
+        .map_err(|source| io(&alternates, source))?;
+    let mut child = git(scratch.path())
+        .arg(format!("--git-dir={}", bare.display()))
+        .args(["-c", "core.attributesFile=/dev/null"])
+        .env("GIT_ATTR_NOSYSTEM", "1")
+        .args([
+            "check-attr",
+            &format!("--source={}", commit.as_str()),
+            "-z",
+            "--stdin",
+            attribute,
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| ArchiveError::Git {
+            detail: format!("could not start git check-attr: {error}"),
+        })?;
+    let mut input = path.to_vec();
+    input.push(0);
+    child
+        .stdin
+        .take()
+        .expect("piped")
+        .write_all(&input)
+        .map_err(|error| ArchiveError::Git {
+            detail: format!("git check-attr: {error}"),
+        })?;
+    let output = child
+        .wait_with_output()
+        .map_err(|error| ArchiveError::Git {
+            detail: format!("git check-attr: {error}"),
+        })?;
+    if !output.status.success() {
+        return Err(ArchiveError::Git {
+            detail: format!(
+                "git check-attr: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ),
+        });
+    }
+    let fields: Vec<&[u8]> = output.stdout.split(|b| *b == 0).collect();
+    Ok(fields.chunks(3).any(
+        |triple| matches!(triple, [_, _, value] if *value != b"unset" && *value != b"unspecified"),
+    ))
 }
 
 // ---------------------------------------------------------------- capture
@@ -1919,6 +2016,8 @@ mod tests {
                 retain_snapshot(&mut store, source.path(), &head(source.path())).unwrap_err();
             assert_eq!(error.code(), "unsupported_filter", "{file}: {error}");
             assert!(error.to_string().contains(file), "{error}");
+            // Set by the commit itself: every clone refuses it.
+            assert!(!error.is_incomplete(), "{file}: {error}");
         }
     }
 
@@ -1935,6 +2034,8 @@ mod tests {
         write(source.path(), ".git/info/attributes", b"*.bin filter=lfs\n");
         let error = retain_snapshot(&mut store, source.path(), &head(source.path())).unwrap_err();
         assert_eq!(error.code(), "unsupported_filter", "{error}");
+        // Another clone does not share it: retryable, not a refusal.
+        assert!(error.is_incomplete(), "{error}");
         std::fs::remove_file(source.path().join(".git/info/attributes")).unwrap();
 
         let global = source.path().join("global-attributes");
@@ -1945,6 +2046,7 @@ mod tests {
         );
         let error = retain_snapshot(&mut store, source.path(), &head(source.path())).unwrap_err();
         assert_eq!(error.code(), "unsupported_filter", "{error}");
+        assert!(error.is_incomplete(), "{error}");
     }
 
     /// Capture reads the repository's configuration but runs nothing it
