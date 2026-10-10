@@ -489,7 +489,6 @@ impl Broker {
         }
         let Some(classified) = classify_automatic_entries_within(
             self.repo_handle(),
-            &plan,
             &candidates,
             upstream_head,
             deadline,
@@ -1007,12 +1006,8 @@ impl Broker {
             validate_resolution_candidates(loaded, &candidates)?;
         }
 
-        let mut classified = classify_automatic_entries(
-            self.repo_handle(),
-            &report.plan,
-            &candidates,
-            &upstream_head,
-        )?;
+        let mut classified =
+            classify_automatic_entries(self.repo_handle(), &candidates, &upstream_head)?;
 
         // Explicit operator attestations are evaluated only after every
         // conclusive automatic matcher. They cannot replace machine-derived
@@ -1438,13 +1433,12 @@ fn build_candidate_layer(
 
 fn classify_automatic_entries(
     repo: &crate::git::GitRepo,
-    plan: &IntegrationReconcilePlan,
     candidates: &[Candidate],
     upstream_head: &str,
 ) -> Result<Vec<Option<IntegrationReconcileEntry>>, BrokerOpError> {
     // Without a deadline the classification always completes.
     Ok(
-        classify_automatic_entries_within(repo, plan, candidates, upstream_head, None)?
+        classify_automatic_entries_within(repo, candidates, upstream_head, None)?
             .unwrap_or_default(),
     )
 }
@@ -1454,135 +1448,85 @@ fn classify_automatic_entries(
 /// because a partial classification must not drive a ref change.
 fn classify_automatic_entries_within(
     repo: &crate::git::GitRepo,
-    plan: &IntegrationReconcilePlan,
     candidates: &[Candidate],
     upstream_head: &str,
     deadline: Option<std::time::Instant>,
 ) -> Result<Option<Vec<Option<IntegrationReconcileEntry>>>, BrokerOpError> {
     let expired = || deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline);
-    let mut upstream_by_patch: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    for commit in plan.commits.iter().filter(|commit| {
-        commit.origin == IntegrationReconcileCommitOrigin::UpstreamOnlyExternalWork
-    }) {
-        if let Some(patch_id) = commit.patch_id.as_ref() {
-            upstream_by_patch
-                .entry(patch_id.clone())
-                .or_default()
-                .push(commit.commit.clone());
-        }
-    }
-
     let mut classified: Vec<Option<IntegrationReconcileEntry>> = vec![None; candidates.len()];
 
-    // Exact graph ancestry is conclusive and takes precedence over
-    // content matching. One `rev-list` answers it for every candidate.
-    let upstream_reach: BTreeSet<String> =
-        repo.reachable_commits(upstream_head)?.into_iter().collect();
+    // Integration reconcile asks whether each exact session HEAD is present
+    // on the selected upstream. Finish and cleanup use their configured local
+    // delivery targets; cleanup also has a separate remote-branch durability
+    // fallback for retention. Those scopes can differ intentionally. Whenever
+    // these surfaces compare the same Git target, they use this shared proof.
     for (index, candidate) in candidates.iter().enumerate() {
-        if upstream_reach.contains(&candidate.merge_commit) {
-            classified[index] = Some(entry_report(
-                candidate,
-                IntegrationReconcileClassification::AlreadyLanded,
-                Some(candidate.merge_commit.clone()),
-                None,
-                Vec::new(),
-                "promoted merge commit is reachable from upstream".into(),
-            ));
-        } else if upstream_reach.contains(&candidate.entry.head_commit) {
-            classified[index] = Some(entry_report(
-                candidate,
-                IntegrationReconcileClassification::AlreadyLanded,
-                Some(candidate.entry.head_commit.clone()),
-                None,
-                Vec::new(),
-                "submitted session head is reachable from upstream".into(),
-            ));
-        }
-    }
-
-    // Match largest contiguous groups first. This recognizes one upstream
-    // squash commit that contains several promoted entries.
-    for group_len in (1..=candidates.len()).rev() {
-        for start in 0..=candidates.len().saturating_sub(group_len) {
-            if expired() {
-                return Ok(None);
-            }
-            let end = start + group_len;
-            if classified[start..end].iter().any(Option::is_some) {
-                continue;
-            }
-            if candidates[start..end]
-                .windows(2)
-                .any(|pair| pair[1].old_parent != pair[0].merge_commit)
-            {
-                continue;
-            }
-            let Some(patch_id) = repo.patch_id_between(
-                &candidates[start].old_parent,
-                &candidates[end - 1].merge_commit,
-            )?
-            else {
-                continue;
-            };
-            let Some(matches) = upstream_by_patch.get(&patch_id) else {
-                continue;
-            };
-            if matches.len() > 1 {
-                for index in start..end {
-                    classified[index] = Some(entry_report(
-                        &candidates[index],
-                        IntegrationReconcileClassification::Ambiguous,
-                        None,
-                        None,
-                        Vec::new(),
-                        format!(
-                            "stable patch id matches multiple upstream commits: {}",
-                            matches.join(", ")
-                        ),
-                    ));
-                }
-                continue;
-            }
-            let landing = matches[0].clone();
-            for index in start..end {
-                classified[index] = Some(entry_report(
-                    &candidates[index],
-                    IntegrationReconcileClassification::AlreadyLanded,
-                    Some(landing.clone()),
-                    None,
-                    Vec::new(),
-                    if group_len == 1 {
-                        "stable patch id matches upstream commit".into()
-                    } else {
-                        format!(
-                            "stable cumulative patch id matches one upstream squash for {group_len} promoted entries"
-                        )
-                    },
-                ));
-            }
-        }
-    }
-
-    // Identical final content on every path touched by an unmatched
-    // promotion is sufficient to call it superseded, but empty deltas are
-    // ambiguous because they provide no content evidence.
-    for (index, candidate) in candidates.iter().enumerate() {
-        if classified[index].is_some() || candidate.files.is_empty() {
-            continue;
-        }
         if expired() {
             return Ok(None);
         }
-        if repo.paths_equal(&candidate.merge_commit, upstream_head, &candidate.files)? {
-            classified[index] = Some(entry_report(
-                candidate,
-                IntegrationReconcileClassification::SupersededUpstream,
-                Some(upstream_head.to_string()),
-                None,
-                Vec::new(),
-                "upstream has identical content on every path changed by the promotion".into(),
-            ));
-        }
+        let verdict = match crate::representation::work_landed_within(
+            repo,
+            &candidate.entry.head_commit,
+            upstream_head,
+            deadline,
+        ) {
+            Ok(verdict) => verdict,
+            Err(BrokerOpError::RepresentationUnavailable { reason })
+                if reason.contains("time budget") =>
+            {
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
+        let crate::LandingVerdict::Landed {
+            evidence: landing_evidence,
+            landed_by,
+        } = verdict
+        else {
+            continue;
+        };
+
+        // The shared proof distinguishes a contribution that the target
+        // already held at the common base from one carried by a later commit.
+        // Do not infer landing from only the promotion's touched paths: finish
+        // and cleanup require the session head's complete net content too.
+        let superseded = landing_evidence == crate::LandingEvidence::NoNetChange;
+        let classification = if superseded {
+            IntegrationReconcileClassification::SupersededUpstream
+        } else {
+            IntegrationReconcileClassification::AlreadyLanded
+        };
+        let upstream_landing = landed_by.clone().or_else(|| {
+            (landing_evidence == crate::LandingEvidence::Ancestry)
+                .then(|| candidate.entry.head_commit.clone())
+        });
+        let evidence = if superseded {
+            "upstream already held the session net content at the common base".into()
+        } else if repo.is_ancestor(&candidate.merge_commit, upstream_head) {
+            "promoted merge commit is reachable from upstream".into()
+        } else {
+            match landing_evidence {
+                crate::LandingEvidence::Ancestry => {
+                    "submitted session head is reachable from upstream".into()
+                }
+                evidence => format!(
+                    "shared {} landing proof{}",
+                    evidence.as_str(),
+                    landed_by
+                        .as_deref()
+                        .map(|commit| format!(" found at {commit}"))
+                        .unwrap_or_default()
+                ),
+            }
+        };
+        classified[index] = Some(entry_report(
+            candidate,
+            classification,
+            upstream_landing,
+            None,
+            Vec::new(),
+            evidence,
+        ));
     }
 
     Ok(Some(classified))

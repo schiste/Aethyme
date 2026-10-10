@@ -7,11 +7,11 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use aethyme_broker::{
-    AdoptMode, Broker, CheckpointRefusalCode, CleanupDisposition, EntryExposureState,
-    FinishOptions, FinishStatus, GitRepo, GraphIntegrityStatus, IntegrationDeliveryState,
-    IntegrationReconcileClassification, IntegrationReconcileOptions, MergeStatus, NewSession,
-    RepairAction, RepairSource, SessionOrigin, StatusAdviceSeverity, SubmissionCommitOwnership,
-    SubmissionGateVerificationStatus, SubmissionIntegrationState,
+    AdoptMode, AuditDisposition, Broker, CheckpointRefusalCode, CleanupDisposition,
+    EntryExposureState, FinishOptions, FinishStatus, GitRepo, GraphIntegrityStatus,
+    IntegrationDeliveryState, IntegrationReconcileClassification, IntegrationReconcileOptions,
+    MergeStatus, NewSession, RepairAction, RepairSource, SessionOrigin, StatusAdviceSeverity,
+    SubmissionCommitOwnership, SubmissionGateVerificationStatus, SubmissionIntegrationState,
 };
 use aethyme_graph_indexer::{IndexerContext, WalkOptions, index_repo_to_disk, link_repo};
 use aethyme_graph_storage::bootstrap_repo;
@@ -2696,6 +2696,135 @@ fn reconcile_classifies_a_promotion_upstream_kept_by_ancestry() {
 }
 
 #[test]
+fn landing_proof_agrees_when_a_later_squash_overwrites_an_earlier_contribution() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    let mut broker = Broker::open(tmp.path()).unwrap();
+
+    let worktree_a = agent_worktree(tmp.path(), "proof-overwritten-a");
+    let session_a = broker.adopt(&worktree_a, Some("set a = 2")).unwrap();
+    commit_edit(&worktree_a, "src/a.py", "a = 2\n");
+    let promoted_a = broker.submit(session_a.id).unwrap();
+    assert!(promoted_a.promoted, "{promoted_a:#?}");
+    let integration_after_a = resolve(tmp.path(), "aethyme/integration");
+    sh(tmp.path(), &["config", "branch.main.remote", "origin"]);
+    sh(
+        tmp.path(),
+        &["config", "branch.main.merge", "refs/heads/main"],
+    );
+    sh(
+        tmp.path(),
+        &[
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/main",
+        ],
+    );
+    sh(
+        tmp.path(),
+        &[
+            "update-ref",
+            "refs/remotes/origin/main",
+            &integration_after_a,
+        ],
+    );
+    let scan_a = broker.scan_session_representation(session_a.id).unwrap();
+    assert!(scan_a.search.landing().is_some(), "{scan_a:#?}");
+    let recorded_a = broker
+        .record_session_representation(session_a.id, &scan_a.digest)
+        .unwrap();
+    assert!(recorded_a.existing.is_some(), "{recorded_a:#?}");
+
+    // B starts at A's promoted integration commit and overwrites the same
+    // value. The upstream squash therefore contains B's final state but no
+    // commit or tree that ever held A's intermediate state.
+    let worktree_b = agent_worktree_at(tmp.path(), "proof-overwritten-b", "aethyme/integration");
+    let session_b = broker.adopt(&worktree_b, Some("set a = 3")).unwrap();
+    commit_edit(&worktree_b, "src/a.py", "a = 3\n");
+    let promoted_b = broker.submit(session_b.id).unwrap();
+    assert!(promoted_b.promoted, "{promoted_b:#?}");
+
+    sh(tmp.path(), &["switch", "-qc", "external-upstream", "main"]);
+    std::fs::write(tmp.path().join("src/a.py"), "a = 3\n").unwrap();
+    sh(tmp.path(), &["add", "src/a.py"]);
+    sh(tmp.path(), &["commit", "-qm", "external squash"]);
+    let upstream = resolve(tmp.path(), "HEAD");
+    sh(tmp.path(), &["switch", "main"]);
+    sh(tmp.path(), &["config", "branch.main.remote", "origin"]);
+    sh(
+        tmp.path(),
+        &["config", "branch.main.merge", "refs/heads/main"],
+    );
+    sh(
+        tmp.path(),
+        &["update-ref", "refs/remotes/origin/main", &upstream],
+    );
+
+    let assessment = broker
+        .reconcile_integration(IntegrationReconcileOptions {
+            upstream: "origin/main".into(),
+            apply: false,
+            resolution_file: None,
+            confirm: None,
+        })
+        .unwrap();
+    let earlier = assessment
+        .entries
+        .iter()
+        .find(|entry| entry.session_id == session_a.id)
+        .unwrap_or_else(|| panic!("missing A assessment: {assessment:#?}"));
+    assert_eq!(
+        earlier.classification,
+        IntegrationReconcileClassification::GenuinelyConflicting,
+        "the cumulative squash must not prove A's overwritten intermediate state: {assessment:#?}"
+    );
+    let later = assessment
+        .entries
+        .iter()
+        .find(|entry| entry.session_id == session_b.id)
+        .unwrap_or_else(|| panic!("missing B assessment: {assessment:#?}"));
+    assert!(
+        matches!(
+            later.classification,
+            IntegrationReconcileClassification::AlreadyLanded
+        ),
+        "B's final state is present on the upstream squash: {assessment:#?}"
+    );
+
+    // Point integration and the tracked default at the same proof target so
+    // finish and cleanup assess A's exact head against the same target.
+    sh(
+        tmp.path(),
+        &["update-ref", "refs/heads/aethyme/integration", &upstream],
+    );
+    let finish = broker
+        .finish_with_options(
+            session_a.id,
+            FinishOptions {
+                keep_worktree: true,
+            },
+        )
+        .unwrap();
+    assert_eq!(finish.status, FinishStatus::Blocked, "{finish:#?}");
+    assert!(finish.unsubmitted_commits > 0, "{finish:#?}");
+
+    broker.close(session_a.id).unwrap();
+    let audit = broker.cleanup_audit().unwrap();
+    let item = audit
+        .items
+        .iter()
+        .find(|item| {
+            matches!(item.owner, aethyme_broker::AuditOwner::Session { session_id, .. } if session_id == session_a.id)
+        })
+        .unwrap_or_else(|| panic!("missing cleanup audit item: {audit:#?}"));
+    assert_eq!(
+        item.disposition,
+        AuditDisposition::WorktreeOnly,
+        "{item:#?}"
+    );
+}
+
+#[test]
 fn reconcile_recognizes_squash_preserves_followups_and_replays_pending_work() {
     let tmp = tempfile::tempdir().unwrap();
     init_repo(tmp.path());
@@ -2875,17 +3004,20 @@ fn reconcile_recognizes_squash_preserves_followups_and_replays_pending_work() {
 }
 
 #[test]
-fn reconcile_blocks_ambiguous_patch_equivalence_without_mutating_state() {
+fn reconcile_uses_shared_landing_proof_when_an_equivalent_patch_repeats() {
     let tmp = tempfile::tempdir().unwrap();
     init_repo(tmp.path());
     let mut broker = Broker::open(tmp.path()).unwrap();
-    let wt = agent_worktree(tmp.path(), "ambiguous-promotion");
-    let session = broker.adopt(&wt, Some("ambiguous upstream")).unwrap();
+    let wt = agent_worktree(tmp.path(), "repeated-equivalent-promotion");
+    let session = broker
+        .adopt(&wt, Some("repeated equivalent upstream"))
+        .unwrap();
     commit_edit(&wt, "src/a.py", "a = 2\n");
     let promoted = broker.submit(session.id).unwrap();
     let old_integration = resolve(tmp.path(), "aethyme/integration");
 
-    sh(tmp.path(), &["switch", "-qc", "ambiguous-upstream", "main"]);
+    sh(tmp.path(), &["switch", "-qc", "repeated-upstream", "main"]);
+    let mut first_application = None;
     for (content, message) in [
         ("a = 2\n", "apply equivalent patch once"),
         ("a = 1\n", "revert equivalent patch"),
@@ -2894,36 +3026,61 @@ fn reconcile_blocks_ambiguous_patch_equivalence_without_mutating_state() {
         std::fs::write(tmp.path().join("src/a.py"), content).unwrap();
         sh(tmp.path(), &["add", "src/a.py"]);
         sh(tmp.path(), &["commit", "-qm", message]);
+        if first_application.is_none() && content == "a = 2\n" {
+            first_application = Some(resolve(tmp.path(), "HEAD"));
+        }
     }
+    let upstream = resolve(tmp.path(), "HEAD");
+    let first_application = first_application.unwrap();
     sh(
         tmp.path(),
-        &["update-ref", "refs/remotes/origin/main", "HEAD"],
+        &["update-ref", "refs/remotes/origin/main", &upstream],
     );
     sh(tmp.path(), &["switch", "main"]);
 
-    let report = broker
+    let dry_run = broker
         .reconcile_integration(IntegrationReconcileOptions {
             upstream: "origin/main".into(),
-            apply: true,
+            apply: false,
             resolution_file: None,
             confirm: None,
         })
         .unwrap();
-    assert!(!report.safe, "{report:#?}");
-    assert!(!report.applied);
+    assert!(dry_run.safe, "{dry_run:#?}");
+    assert!(!dry_run.applied);
+    assert_eq!(dry_run.entries.len(), 1, "{dry_run:#?}");
     assert_eq!(
-        report.entries[0].classification,
-        IntegrationReconcileClassification::Ambiguous
+        dry_run.entries[0].classification,
+        IntegrationReconcileClassification::AlreadyLanded,
+        "the shared proof selects the earliest commit carrying the session content: {dry_run:#?}"
+    );
+    assert_eq!(
+        dry_run.entries[0].upstream_landing.as_deref(),
+        Some(first_application.as_str()),
+        "{dry_run:#?}"
     );
     assert_eq!(resolve(tmp.path(), "aethyme/integration"), old_integration);
-    let queue = broker.store().merge_queue().unwrap();
+
+    let applied = broker
+        .reconcile_integration(IntegrationReconcileOptions {
+            upstream: "origin/main".into(),
+            apply: true,
+            resolution_file: None,
+            confirm: dry_run.plan_digest.clone(),
+        })
+        .unwrap();
+    assert!(applied.safe && applied.applied, "{applied:#?}");
+    assert_eq!(resolve(tmp.path(), "aethyme/integration"), upstream);
     assert_eq!(
-        queue
+        broker
+            .store()
+            .merge_queue()
+            .unwrap()
             .iter()
             .find(|entry| entry.id == promoted.entry.id)
             .unwrap()
             .status,
-        MergeStatus::Promoted
+        MergeStatus::ExternallyLanded
     );
 }
 
