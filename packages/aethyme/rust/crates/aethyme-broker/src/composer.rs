@@ -34,11 +34,14 @@
 //! merge-file`, standing in until E1 (#650) selects a structural engine
 //! (D04). Its limits are reported, never smoothed over: deleting and
 //! modifying one path, adding one path twice, changing one mode two ways,
-//! any concurrent change to a binary file or symlink, and a concurrent
-//! change to a file one side **moved a block** within are conflicts. The
-//! last one is the profile's own limit: a line merge cannot carry an edit
-//! along a moved block, and where the block has an identical twin it would
-//! put the edit on the wrong copy without any conflict (FX02).
+//! any concurrent change to a binary file or symlink, and a file left where
+//! a directory is needed are conflicts. So is a concurrent change to a file
+//! one side deleted **a twinned run** from (`ambiguous_anchor`: which copy
+//! went is the diff's guess, and a line merge would put the other change
+//! on the copy that stayed, silently) or **moved a unique block** within
+//! (`moved_block`: a line merge cannot carry the edit along). Those two are
+//! the profile's own limits; both sides of every step are checked, so the
+//! outcome does not depend on delivery order.
 //!
 //! The candidate is written as Git objects only (no ref moves), retained in
 //! the archive, and returned as a [`Candidate`] through the #663 boundary.
