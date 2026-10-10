@@ -1,0 +1,112 @@
+{
+  "schema": "aethyme.composition-expectations/provisional-v0",
+  "case": "FX03",
+  "title": "Mixed bases: an inherited contribution, duplicate delivery, and an unrecorded base",
+  "plan": "#650 FX03; plan v3 §7.2 rows 'one submission inherits a previously captured contribution' and 'unrelated or unknown bases; unrecorded intermediate integration'; §7.3 step 3",
+  "scenarios": {
+    "s1": {
+      "title": "c1 on t0 adds item-3; c2 on c1's result renames the title and edits item-3; baseline t1 carries an accepted footer change",
+      "required_outcomes": [
+        "candidate"
+      ],
+      "behaviors": [
+        {
+          "check": "count",
+          "file": "app.html",
+          "selector": "#item-3",
+          "equals": 1
+        },
+        {
+          "check": "text",
+          "file": "app.html",
+          "selector": "#item-3",
+          "equals": "Offline mode (beta)"
+        },
+        {
+          "check": "count",
+          "file": "app.html",
+          "selector": "#changes li",
+          "equals": 3
+        },
+        {
+          "check": "text",
+          "file": "app.html",
+          "selector": "#title",
+          "equals": "Release notes for 2.0"
+        },
+        {
+          "check": "text",
+          "file": "app.html",
+          "selector": "#legal",
+          "equals": "Thanks for reading, and for the bug reports."
+        },
+        {
+          "check": "text",
+          "file": "app.html",
+          "selector": "#summary",
+          "equals": "Two changes."
+        }
+      ],
+      "provisional_text": {
+        "outcome": "candidate",
+        "behavior": "passes",
+        "note": "with c2 merged against its exact base (c1's result) only its own changes apply, including its edit of c1's item; the accepted footer change in t1 survives"
+      }
+    },
+    "s2": {
+      "title": "c1 delivered again, including after c2 replaced its item text",
+      "required_outcomes": [
+        "candidate"
+      ],
+      "behaviors": [
+        {
+          "check": "count",
+          "file": "app.html",
+          "selector": "#item-3",
+          "equals": 1
+        },
+        {
+          "check": "text",
+          "file": "app.html",
+          "selector": "#item-3",
+          "equals": "Offline mode (beta)"
+        },
+        {
+          "check": "count",
+          "file": "app.html",
+          "selector": "#changes li",
+          "equals": 3
+        },
+        {
+          "check": "text",
+          "file": "app.html",
+          "selector": "#title",
+          "equals": "Release notes for 2.0"
+        },
+        {
+          "check": "text",
+          "file": "app.html",
+          "selector": "#legal",
+          "equals": "Thanks for reading, and for the bug reports."
+        }
+      ],
+      "provisional_text": {
+        "outcome": "conflict",
+        "behavior": null,
+        "note": "a redelivery of c1 after c2 edited c1's item adds c1's original item text next to c2's edit: a line merge conflicts, so idempotence must come from recognizing c1 as already applied (lineage), not from the merge"
+      }
+    },
+    "s3": {
+      "title": "c3's base is an integration no accepted tree or captured contribution explains",
+      "required_outcomes": [
+        "unknown_base"
+      ],
+      "behaviors": [],
+      "provisional_text": {
+        "outcome": null,
+        "behavior": null,
+        "note": "planning refusal: decided from lineage, selection and records before any merge engine runs, so the text profile is not measured"
+      }
+    }
+  }
+}

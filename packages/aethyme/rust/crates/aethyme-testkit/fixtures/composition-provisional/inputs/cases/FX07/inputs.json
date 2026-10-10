@@ -1,0 +1,87 @@
+{
+  "schema": "aethyme.composition-inputs/provisional-v0",
+  "case": "FX07",
+  "trees": {
+    "t0": {
+      "accepted": true
+    }
+  },
+  "contributions": [
+    {
+      "id": "c1",
+      "base": "tree:t0"
+    },
+    {
+      "id": "c2",
+      "base": "tree:t0"
+    },
+    {
+      "id": "c3",
+      "base": "tree:t0",
+      "synthesized": true,
+      "derived_from": [
+        "c1",
+        "c2"
+      ]
+    },
+    {
+      "id": "c4",
+      "base": "contribution:c3",
+      "requires": [
+        "c3"
+      ]
+    }
+  ],
+  "scenarios": [
+    {
+      "id": "s1",
+      "baseline": "t0",
+      "request": {
+        "subtract": {
+          "from": "c3",
+          "remove": [
+            "c2"
+          ],
+          "keep": []
+        }
+      },
+      "orders": [],
+      "commutative": false
+    },
+    {
+      "id": "s2",
+      "baseline": "t0",
+      "request": {
+        "subtract": {
+          "from": "c3",
+          "remove": [
+            "c2"
+          ],
+          "keep": []
+        }
+      },
+      "orders": [],
+      "commutative": false,
+      "unretained": [
+        "c1"
+      ]
+    },
+    {
+      "id": "s3",
+      "baseline": "t0",
+      "request": {
+        "subtract": {
+          "from": "c3",
+          "remove": [
+            "c2"
+          ],
+          "keep": [
+            "c4"
+          ]
+        }
+      },
+      "orders": [],
+      "commutative": false
+    }
+  ]
+}
