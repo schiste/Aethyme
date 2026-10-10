@@ -2010,14 +2010,14 @@ mod tests {
         git_in(
             source.path(),
             &[
-                "worktree",
-                "add",
-                "-q",
-                "--detach",
+                "--work-tree",
                 checkout.path().to_str().unwrap(),
+                "checkout",
+                "HEAD",
+                "--",
+                ".",
             ],
         );
-        std::fs::remove_file(checkout.path().join(".git")).unwrap();
         let snapshot = snapshot_of_commit(source.path(), &head(source.path())).unwrap();
         assert_eq!(snapshot.id().as_str(), oracle_id(checkout.path()));
         let (_host, mut store) = store();
