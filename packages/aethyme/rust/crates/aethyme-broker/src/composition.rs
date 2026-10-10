@@ -40,13 +40,16 @@ pub enum Producer {
     LegacyGitReplay,
     /// A composer running the named profile (#664).
     Composer { profile: String },
+    /// A bounded resolver's accepted proposal, under the named profile
+    /// (#665). Never a composition: its content is the resolver's.
+    Resolver { profile: String },
 }
 
 impl Producer {
     pub fn profile(&self) -> &str {
         match self {
             Self::LegacyGitReplay => LEGACY_GIT_REPLAY_PROFILE,
-            Self::Composer { profile } => profile,
+            Self::Composer { profile } | Self::Resolver { profile } => profile,
         }
     }
 }
@@ -59,6 +62,9 @@ pub enum CompositionMode {
     Text,
     Structural,
     Hybrid,
+    /// A bounded resolver wrote the content (#665). Never verified by being
+    /// produced: the candidate is checked again as its own candidate.
+    Synthesized,
 }
 
 impl CompositionMode {
@@ -67,6 +73,7 @@ impl CompositionMode {
             Self::Text => "text",
             Self::Structural => "structural",
             Self::Hybrid => "hybrid",
+            Self::Synthesized => "synthesized",
         }
     }
 }
@@ -83,6 +90,12 @@ pub struct CandidateInput {
 }
 
 /// A complete candidate: the exact source the gates would judge.
+///
+/// Every candidate is **unverified**, whoever produced it: constructing one
+/// proves nothing about behavior, and a resolver's (`Producer::Resolver`)
+/// least of all. Nothing here marks a candidate verified, and no field can
+/// be set to make it so. Acceptance (L5) must require a passing verification
+/// of this exact `subject` before it promotes or publishes anything.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Candidate {
     /// The #652 identity of the candidate's committed bytes.

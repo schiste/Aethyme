@@ -41,6 +41,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "toml",
+ "unicode-normalization",
 ]
 
 [[package]]

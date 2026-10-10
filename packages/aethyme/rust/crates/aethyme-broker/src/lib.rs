@@ -43,6 +43,7 @@ pub mod composition;
 mod disk_headroom;
 mod duplicate_work;
 pub mod exit_status;
+pub mod resolution;
 pub use disk_headroom::{
     DEFAULT_GATE_HEADROOM_BYTES, GateCacheUsage, TEST_AVAILABLE_BYTES_ENV, available_bytes,
     refusal as disk_headroom_refusal,
