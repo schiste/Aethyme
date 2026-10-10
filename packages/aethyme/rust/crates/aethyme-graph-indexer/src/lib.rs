@@ -47,9 +47,8 @@ pub use language_map::{FileClassification, classify_file, infer_language_from_ex
 pub use linker::{LinkError, LinkSummary, link_repo, link_repo_path, link_with_store};
 pub use php::PhpIndexer;
 pub use pipeline::{
-    BuildFragmentError, BuiltFragment, CachedExtraction, ExtractionCache, ExtractionUnit,
-    IndexRepoError, IndexRepoSummary, build_fragment, build_index_records, default_registry,
-    index_repo_to_disk, index_repo_to_disk_cached, index_repo_to_disk_with,
+    BuildFragmentError, BuiltFragment, IndexRepoError, IndexRepoSummary, build_fragment,
+    build_index_records, default_registry, index_repo_to_disk, index_repo_to_disk_with,
 };
 pub use python::PythonIndexer;
 pub use rust_lang::RustIndexer;

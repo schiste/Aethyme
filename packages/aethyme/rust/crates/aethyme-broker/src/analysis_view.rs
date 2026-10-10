@@ -1,53 +1,48 @@
-//! X2 prototype (#684): one immutable analysed base plus one private overlay
-//! for a retained candidate snapshot (plan §6.14–6.16; D42, D43, D49).
+//! Fresh exact-snapshot analysis views (#684, plan §6.14–6.16; D42, D49).
 //!
-//! This is an experiment, not a product surface: a library API only, built
-//! to answer whether private incremental views agree with fresh analysis and
-//! what they cost. Decision record: `local-v3-x2-private-views.md`.
+//! A view is an isolated structural analysis of one retained snapshot, kept
+//! as a sealed generation and answered through the AQ0 envelope. It is what
+//! X3 (#685) and L3 consume to ask about a candidate without touching
+//! canonical graph state.
+//!
+//! The X2 experiment also built incremental overlays: a candidate reusing an
+//! analysed base's per-file extractions. They were exactly as correct as a
+//! fresh analysis but gave no measurable gain, because walking, reading,
+//! decoding and linking cost as much as the parsing saved. The user decided
+//! to drop them (decision record: `local-v3-x2-private-views.md`). Overlays
+//! and stacking are refused explicitly, and the indexer is unchanged.
 //!
 //! ```text
 //! <collaboration project dir>/views/<view>/
 //!   .build.lock          exclusive while a generation is being built
 //!   CURRENT              "gen-<n>": the published generation
 //!   RETIRED              present once the view is retired
+//!   holds/<id>.json      consumers that rely on the view (X3 reports, L3)
 //!   gen-<n>/             sealed: never modified after publication
-//!     manifest.json      identity, base reference, mask, replacements, costs
+//!     manifest.json      identity, profile, coverage, fact digest, costs
 //!     facts/.aethyme/graph/   linked fragments for this snapshot
-//!     extractions/       per-unit extractions (all for a base, replacements
-//!                        only for an overlay)
-//!     .pin               readers hold it shared; reclamation needs it exclusive
+//!     .pin               readers hold it shared
 //!   building-<n>-<pid>/  in progress; never read
 //! ```
 //!
-//! - **Facts.** The structural indexer's per-file extraction depends only on
-//!   the repository name, the unit (path, language, content) and the indexer
-//!   profile; nothing else is read. An overlay reuses the base's extraction
-//!   for every unit whose content key matches, and extracts the rest (its
-//!   **replacements**). Base units without a matching key are its **mask**.
-//! - **Derived facts.** Non-code relationships and linking are cross-file:
-//!   they resolve names against the whole set, including names that were
-//!   absent. They are always recomputed over the merged set. That
-//!   over-invalidates on purpose (§6.15 allows it, never the reverse), so a
-//!   renamed export, a new declaration or a deleted target can never leave a
-//!   stale or ghost link behind.
 //! - **Isolation.** Nothing here writes a repository, its canonical
 //!   `.aethyme/graph` fragments or producer `_overlays`, or calls the graph
-//!   refresh, so the active-session refresh guard is never bypassed: it is
-//!   never reached. The source analysed is a retained snapshot materialised
-//!   inside the view's own build directory.
-//! - **Generations.** A generation is built in a private directory, sealed
-//!   with its manifest, published by one rename, and only then named by
-//!   `CURRENT` (temporary file plus rename). Readers pin the generation they
-//!   opened, so a crash, a newer generation or reclamation never shows a
-//!   reader a mix.
-//! - **Depth.** One base plus one overlay. An overlay on an overlay is
-//!   refused; flattening means building a new base (a fresh analysis).
+//!   refresh, so the active-session refresh guard is never reached. The
+//!   retained snapshot is materialised inside the view's build directory.
+//! - **Generations.** Built privately, sealed with a manifest, published by
+//!   one rename, and only then named by `CURRENT`. A crash before either step
+//!   publishes nothing.
+//! - **Readers** pin a generation with a shared lock on its `.pin`, taken
+//!   under the archive's store-wide shared lock like every other pin, so a
+//!   reclamation apply never races a new reader.
+//! - **Reclamation** belongs to `collaboration_gc` (the `view` class): it
+//!   removes retired and superseded generations and stale build directories,
+//!   never `CURRENT`, a pinned generation or a held view.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::time::Instant;
 
 use aethyme_contracts::experimental_v0::analysis::ANALYSIS_PROFILE_SCHEMA;
@@ -58,20 +53,17 @@ use aethyme_contracts::experimental_v0::analysis::{
 use aethyme_contracts::experimental_v0::canonical_json::{Object, Value};
 use aethyme_contracts::experimental_v0::{Record, SourceSnapshotId};
 use aethyme_graph_indexer::{
-    CachedExtraction, ExtractionCache, ExtractionUnit, IndexerContext, WalkOptions,
-    default_registry, index_repo_to_disk_cached, link_repo,
+    IndexerContext, WalkOptions, default_registry, index_repo_to_disk_with, link_repo,
 };
 use aethyme_graph_schema::{EdgeKind, NodeId, NodeKind};
-use aethyme_graph_storage::{
-    CoverageFileStatus, ExclusionReason, FragmentStore, read_fragment_bytes, write_fragment_bytes,
-};
+use aethyme_graph_storage::FragmentStore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::collaboration_state::CollaborationStore;
 
-/// The manifest schema of this prototype.
-pub const VIEW_SCHEMA: &str = "aethyme.analysis-view/x2-prototype-v0";
+/// The manifest schema of a view generation.
+pub const VIEW_SCHEMA: &str = "aethyme.analysis-view/experimental-v0";
 const PRODUCER: &str = "aethyme-structural-indexer";
 const VIEWS_DIR: &str = "views";
 /// Languages whose parser is part of the profile.
@@ -79,8 +71,8 @@ const PROFILE_LANGUAGES: &[&str] = &["javascript", "php", "python", "rust", "typ
 /// Edge kinds the queries traverse.
 const QUERY_EDGES: &[EdgeKind] = &[EdgeKind::Calls, EdgeKind::Imports, EdgeKind::References];
 
-/// What produced a view's facts. Two views compare only under equal
-/// profiles; a base under another profile is never reused.
+/// What produced a view's facts. A view answers only under the profile it
+/// was built with; another profile gets its own view.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ViewProfile {
     pub producer: String,
@@ -138,17 +130,6 @@ impl ViewProfile {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ViewKind {
-    /// A sealed full analysis that overlays may build on.
-    Base,
-    /// One private overlay on a base.
-    Overlay,
-    /// An isolated full analysis: the fallback, and AQ2's reference.
-    Fresh,
-}
-
 /// A view's published state (§6.16). Building and failed generations are
 /// never published, so a reader only ever sees these two.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -159,45 +140,26 @@ pub enum ViewState {
     Partial,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BaseRef {
-    pub view: String,
-    pub generation: u64,
-    pub snapshot: String,
-    pub manifest_sha256: String,
-}
-
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ViewCosts {
     pub build_us: u128,
     /// Materialising the retained snapshot.
     pub materialize_us: u128,
-    /// Walking, reading and extracting (parsing only the replacements).
+    /// Walking, reading and extracting.
     pub index_us: u128,
-    /// Linking: always over the whole snapshot.
+    /// Linking.
     pub link_us: u128,
-    pub units_extracted: usize,
-    pub units_reused: usize,
     pub fact_bytes: u64,
-    pub extraction_bytes: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ViewManifest {
     pub schema: String,
     pub view: String,
-    pub kind: ViewKind,
     pub generation: u64,
     pub snapshot: String,
     pub profile: ViewProfile,
     pub profile_digest: String,
-    pub base: Option<BaseRef>,
-    /// Every extracted unit: path → content key.
-    pub units: BTreeMap<String, String>,
-    /// Base units this view does not reuse (changed, moved or deleted).
-    pub mask: Vec<String>,
-    /// Units this view extracted itself.
-    pub replacements: Vec<String>,
     pub state: ViewState,
     pub coverage_mode: String,
     pub safe_to_use: bool,
@@ -214,23 +176,22 @@ pub enum ViewError {
     #[error("view {view} is retired")]
     Retired { view: String },
     #[error(
-        "view {base} is itself an overlay; one base plus one overlay is the limit, so build a \
-         new base (a fresh analysis) instead"
+        "incremental overlays and stacked views are not supported: the X2 experiment measured \
+         no gain over a fresh analysis, so analyse the candidate snapshot directly"
     )]
-    UnsupportedStacking { base: String },
-    #[error(
-        "base {base} was analysed under another profile ({found}); its facts cannot be reused \
-         under {expected}"
-    )]
+    OverlaysUnsupported,
+    #[error("view {view} was built under profile {found}, not {expected}")]
     IncompatibleProfile {
-        base: String,
+        view: String,
         expected: String,
         found: String,
     },
-    #[error("view {view} has {dependents} dependent overlay(s); retire them first")]
-    HasDependents { view: String, dependents: usize },
+    #[error("view {view} is held by {holders} consumer(s); release the holds first")]
+    Held { view: String, holders: usize },
     #[error("view {view} generation {generation} is pinned by a reader")]
     Pinned { view: String, generation: u64 },
+    #[error("holder must be 1-200 bytes")]
+    InvalidHolder,
     #[error("snapshot {snapshot} could not be materialised: {source}")]
     Source {
         snapshot: String,
@@ -255,10 +216,11 @@ impl ViewError {
         match self {
             Self::NotFound { .. } => "not_found",
             Self::Retired { .. } => "retired",
-            Self::UnsupportedStacking { .. } => "unsupported_stacking",
+            Self::OverlaysUnsupported => "overlays_unsupported",
             Self::IncompatibleProfile { .. } => "incompatible_analysis_profile",
-            Self::HasDependents { .. } => "has_dependents",
+            Self::Held { .. } => "held",
             Self::Pinned { .. } => "pinned",
+            Self::InvalidHolder => "invalid_holder",
             Self::Source { .. } => "source_unavailable",
             Self::Index(_) => "index_failed",
             Self::Corrupt { .. } => "corrupt_view",
@@ -328,25 +290,13 @@ fn short(id: &SourceSnapshotId) -> &str {
     &digest[..16]
 }
 
-fn views_root(store: &CollaborationStore) -> PathBuf {
+pub(crate) fn views_root(store: &CollaborationStore) -> PathBuf {
     store.project_dir().join(VIEWS_DIR)
 }
 
-/// The name of `kind`'s view of `snapshot` under `profile`.
-pub fn view_name(
-    kind: ViewKind,
-    snapshot: &SourceSnapshotId,
-    profile: &ViewProfile,
-    base: Option<&SourceSnapshotId>,
-) -> String {
-    let profile = &profile.digest()[..16];
-    match (kind, base) {
-        (ViewKind::Overlay, Some(base)) => {
-            format!("overlay-{}-{profile}-on-{}", short(snapshot), short(base))
-        }
-        (ViewKind::Base, _) => format!("base-{}-{profile}", short(snapshot)),
-        _ => format!("fresh-{}-{profile}", short(snapshot)),
-    }
+/// The name of `snapshot`'s view under `profile`.
+pub fn view_name(snapshot: &SourceSnapshotId, profile: &ViewProfile) -> String {
+    format!("view-{}-{}", short(snapshot), &profile.digest()[..16])
 }
 
 // ----------------------------------------------------------------- locks
@@ -402,7 +352,7 @@ fn generations(view_dir: &Path) -> Result<Vec<u64>, ViewError> {
     Ok(found)
 }
 
-fn current_generation(view_dir: &Path) -> Result<Option<u64>, ViewError> {
+pub(crate) fn current_generation(view_dir: &Path) -> Result<Option<u64>, ViewError> {
     let path = view_dir.join("CURRENT");
     match std::fs::read_to_string(&path) {
         Ok(text) => text
@@ -459,105 +409,6 @@ fn files_under(root: &Path) -> Result<Vec<(PathBuf, u64)>, ViewError> {
     Ok(out)
 }
 
-// ---------------------------------------------------- extraction reuse
-
-#[derive(Serialize, Deserialize)]
-struct ExtractionMeta {
-    status: CoverageFileStatus,
-    exclusion_reason: Option<ExclusionReason>,
-}
-
-/// Reuses a base's extractions by content key and records the rest.
-struct ViewCache {
-    profile_digest: String,
-    repo_name: String,
-    base: Option<(PathBuf, BTreeSet<String>)>,
-    out: Option<PathBuf>,
-    /// path → (key, reused)
-    units: Mutex<BTreeMap<String, (String, bool)>>,
-    errors: Mutex<Vec<String>>,
-}
-
-impl ViewCache {
-    fn key(&self, unit: &ExtractionUnit<'_>) -> String {
-        let mut hasher = Sha256::new();
-        for part in [
-            self.profile_digest.as_bytes(),
-            self.repo_name.as_bytes(),
-            unit.source_path.as_bytes(),
-            unit.language.as_bytes(),
-            unit.content.as_bytes(),
-        ] {
-            hasher.update((part.len() as u64).to_le_bytes());
-            hasher.update(part);
-        }
-        hex(&hasher.finalize())
-    }
-
-    fn load(dir: &Path, key: &str) -> Option<CachedExtraction> {
-        let fragment =
-            read_fragment_bytes(&std::fs::read(dir.join(format!("{key}.frag"))).ok()?).ok()?;
-        let meta: ExtractionMeta =
-            serde_json::from_slice(&std::fs::read(dir.join(format!("{key}.json"))).ok()?).ok()?;
-        Some(CachedExtraction {
-            fragment,
-            status: meta.status,
-            exclusion_reason: meta.exclusion_reason,
-        })
-    }
-
-    fn note(&self, unit: &ExtractionUnit<'_>, key: String, reused: bool) {
-        self.units
-            .lock()
-            .expect("unit map")
-            .insert(unit.source_path.to_string(), (key, reused));
-    }
-}
-
-impl ExtractionCache for ViewCache {
-    fn lookup(&self, unit: &ExtractionUnit<'_>) -> Option<CachedExtraction> {
-        let (dir, keys) = self.base.as_ref()?;
-        let key = self.key(unit);
-        if !keys.contains(&key) {
-            return None;
-        }
-        // An unreadable base extraction is extracted again, never trusted.
-        let hit = Self::load(dir, &key)?;
-        self.note(unit, key, true);
-        Some(hit)
-    }
-
-    fn record(&self, unit: &ExtractionUnit<'_>, extraction: &CachedExtraction) {
-        let key = self.key(unit);
-        if let Some(out) = &self.out {
-            let written = write_fragment_bytes(&extraction.fragment)
-                .map_err(|error| error.to_string())
-                .and_then(|bytes| {
-                    std::fs::write(out.join(format!("{key}.frag")), bytes)
-                        .map_err(|error| error.to_string())
-                })
-                .and_then(|()| {
-                    let meta = ExtractionMeta {
-                        status: extraction.status,
-                        exclusion_reason: extraction.exclusion_reason,
-                    };
-                    std::fs::write(
-                        out.join(format!("{key}.json")),
-                        serde_json::to_vec(&meta).expect("meta serializes"),
-                    )
-                    .map_err(|error| error.to_string())
-                });
-            if let Err(error) = written {
-                self.errors
-                    .lock()
-                    .expect("error list")
-                    .push(format!("{}: {error}", unit.source_path));
-            }
-        }
-        self.note(unit, key, false);
-    }
-}
-
 // ------------------------------------------------------------------ build
 
 /// A published, pinned generation.
@@ -568,26 +419,16 @@ pub struct ViewReader {
     _pin: File,
 }
 
-struct BuildPlan<'a> {
-    kind: ViewKind,
-    snapshot: &'a SourceSnapshotId,
-    base: Option<&'a ViewReader>,
-    options: &'a ViewOptions,
-}
-
-/// Build and publish a new generation of `plan`'s view.
-fn build(store: &CollaborationStore, plan: BuildPlan<'_>) -> Result<String, ViewError> {
+/// Build and publish a new generation of `snapshot`'s view: an isolated full
+/// analysis of the retained snapshot.
+pub fn build_view(
+    store: &CollaborationStore,
+    snapshot: &SourceSnapshotId,
+    options: &ViewOptions,
+) -> Result<String, ViewError> {
     let started = Instant::now();
-    let profile = &plan.options.profile;
-    let base_snapshot = plan
-        .base
-        .map(|base| SourceSnapshotId::parse(&base.manifest.snapshot))
-        .transpose()
-        .map_err(|error| ViewError::Corrupt {
-            view: "base".into(),
-            detail: error.to_string(),
-        })?;
-    let name = view_name(plan.kind, plan.snapshot, profile, base_snapshot.as_ref());
+    let profile = &options.profile;
+    let name = view_name(snapshot, profile);
     let view_dir = views_root(store).join(&name);
     std::fs::create_dir_all(&view_dir).map_err(io(&view_dir))?;
     let lock_path = view_dir.join(".build.lock");
@@ -612,9 +453,9 @@ fn build(store: &CollaborationStore, plan: BuildPlan<'_>) -> Result<String, View
     // The retained snapshot, materialised privately. Its own `.aethyme/`
     // is not source: the walker skips it and the indexer writes there.
     let source = building.join("source");
-    crate::collaboration_archive::reconstruct(store, plan.snapshot, &source).map_err(|source| {
+    crate::collaboration_archive::reconstruct(store, snapshot, &source).map_err(|source| {
         ViewError::Source {
-            snapshot: plan.snapshot.to_string(),
+            snapshot: snapshot.to_string(),
             source,
         }
     })?;
@@ -624,41 +465,17 @@ fn build(store: &CollaborationStore, plan: BuildPlan<'_>) -> Result<String, View
         std::fs::remove_dir_all(&committed_graph).map_err(io(&committed_graph))?;
     }
 
-    let extractions = building.join("extractions");
-    std::fs::create_dir_all(&extractions).map_err(io(&extractions))?;
-    let cache = ViewCache {
-        profile_digest: profile.digest(),
-        repo_name: profile.repo_name.clone(),
-        base: plan.base.map(|base| {
-            (
-                base.dir.join("extractions"),
-                base.manifest.units.values().cloned().collect(),
-            )
-        }),
-        out: (plan.kind != ViewKind::Fresh).then(|| extractions.clone()),
-        units: Mutex::new(BTreeMap::new()),
-        errors: Mutex::new(Vec::new()),
-    };
     let index_started = Instant::now();
     let ctx = IndexerContext::new(&profile.repo_name, &source, &profile.producer_version)
         .map_err(|error| ViewError::Index(error.to_string()))?;
-    let summary = index_repo_to_disk_cached(
-        &ctx,
-        &WalkOptions::default(),
-        &default_registry(),
-        Some(&cache),
-    )
-    .map_err(|error| ViewError::Index(error.to_string()))?;
-    let errors = cache.errors.into_inner().expect("error list");
-    if !errors.is_empty() {
-        return Err(ViewError::Index(errors.join("; ")));
-    }
+    let summary = index_repo_to_disk_with(&ctx, &WalkOptions::default(), &default_registry())
+        .map_err(|error| ViewError::Index(error.to_string()))?;
     let index_us = index_started.elapsed().as_micros();
-    fault!(plan.options, AfterIndex);
+    fault!(options, AfterIndex);
     let link_started = Instant::now();
     link_repo(&ctx).map_err(|error| ViewError::Index(error.to_string()))?;
     let link_us = link_started.elapsed().as_micros();
-    fault!(plan.options, AfterLink);
+    fault!(options, AfterLink);
 
     // Keep the linked facts; drop the materialised source.
     let facts = building.join("facts");
@@ -679,49 +496,15 @@ fn build(store: &CollaborationStore, plan: BuildPlan<'_>) -> Result<String, View
         set.update(&bytes);
         fact_bytes += len;
     }
-    let extraction_bytes = files_under(&extractions)?.iter().map(|(_, len)| len).sum();
 
-    let units_seen = cache.units.into_inner().expect("unit map");
-    let units: BTreeMap<String, String> = units_seen
-        .iter()
-        .map(|(path, (key, _))| (path.clone(), key.clone()))
-        .collect();
-    let replacements: Vec<String> = units_seen
-        .iter()
-        .filter(|(_, (_, reused))| !reused)
-        .map(|(path, _)| path.clone())
-        .collect();
-    let mask: Vec<String> = plan
-        .base
-        .map(|base| {
-            base.manifest
-                .units
-                .iter()
-                .filter(|(path, key)| units.get(*path) != Some(*key))
-                .map(|(path, _)| path.clone())
-                .collect()
-        })
-        .unwrap_or_default();
     let report = &summary.coverage.report;
     let manifest = ViewManifest {
         schema: VIEW_SCHEMA.into(),
         view: name.clone(),
-        kind: plan.kind,
         generation,
-        snapshot: plan.snapshot.to_string(),
+        snapshot: snapshot.to_string(),
         profile: profile.clone(),
         profile_digest: profile.digest(),
-        base: plan.base.map(|base| BaseRef {
-            view: base.manifest.view.clone(),
-            generation: base.manifest.generation,
-            snapshot: base.manifest.snapshot.clone(),
-            manifest_sha256: hex(&Sha256::digest(
-                std::fs::read(base.dir.join("manifest.json")).unwrap_or_default(),
-            )),
-        }),
-        units,
-        mask,
-        replacements: replacements.clone(),
         state: if report.safe_to_use && report.coverage_mode == "complete" {
             ViewState::Ready
         } else {
@@ -736,10 +519,7 @@ fn build(store: &CollaborationStore, plan: BuildPlan<'_>) -> Result<String, View
             materialize_us,
             index_us,
             link_us,
-            units_extracted: replacements.len(),
-            units_reused: units_seen.values().filter(|(_, reused)| *reused).count(),
             fact_bytes,
-            extraction_bytes,
         },
     };
     write_synced(
@@ -749,13 +529,13 @@ fn build(store: &CollaborationStore, plan: BuildPlan<'_>) -> Result<String, View
     // Readers pin through this file; it exists before the generation does.
     write_synced(&building.join(".pin"), b"")?;
     sync_dir(&building)?;
-    fault!(plan.options, BeforePublish);
+    fault!(options, BeforePublish);
 
     // Publish: one rename makes the sealed generation visible as a whole.
     let published = view_dir.join(format!("gen-{generation}"));
     std::fs::rename(&building, &published).map_err(io(&published))?;
     sync_dir(&view_dir)?;
-    fault!(plan.options, BeforeCurrent);
+    fault!(options, BeforeCurrent);
     let pointer = view_dir.join("CURRENT.tmp");
     write_synced(&pointer, format!("gen-{generation}\n").as_bytes())?;
     std::fs::rename(&pointer, view_dir.join("CURRENT")).map_err(io(&pointer))?;
@@ -770,106 +550,30 @@ fn sync_dir(dir: &Path) -> Result<(), ViewError> {
         .map_err(io(dir))
 }
 
-/// Build a base: a sealed full analysis whose extractions overlays reuse.
-pub fn build_base(
-    store: &CollaborationStore,
-    snapshot: &SourceSnapshotId,
-    options: &ViewOptions,
-) -> Result<String, ViewError> {
-    build(
-        store,
-        BuildPlan {
-            kind: ViewKind::Base,
-            snapshot,
-            base: None,
-            options,
-        },
-    )
-}
-
-/// An isolated full analysis of `snapshot`, reusing nothing.
-pub fn build_fresh(
-    store: &CollaborationStore,
-    snapshot: &SourceSnapshotId,
-    options: &ViewOptions,
-) -> Result<String, ViewError> {
-    build(
-        store,
-        BuildPlan {
-            kind: ViewKind::Fresh,
-            snapshot,
-            base: None,
-            options,
-        },
-    )
-}
-
-/// One private overlay for `snapshot` on the base view `base`.
+/// Incremental overlays were measured and dropped (X2): always refused.
 pub fn build_overlay(
-    store: &CollaborationStore,
-    base: &str,
-    snapshot: &SourceSnapshotId,
-    options: &ViewOptions,
+    _store: &CollaborationStore,
+    _base: &str,
+    _snapshot: &SourceSnapshotId,
+    _options: &ViewOptions,
 ) -> Result<String, ViewError> {
-    // The base stays pinned while its extractions are read.
-    let base = open_view(store, base)?;
-    if base.manifest.kind == ViewKind::Overlay {
-        return Err(ViewError::UnsupportedStacking {
-            base: base.manifest.view.clone(),
-        });
-    }
-    if base.manifest.profile != options.profile {
-        return Err(ViewError::IncompatibleProfile {
-            base: base.manifest.view.clone(),
-            expected: options.profile.digest(),
-            found: base.manifest.profile_digest.clone(),
-        });
-    }
-    build(
-        store,
-        BuildPlan {
-            kind: ViewKind::Overlay,
-            snapshot,
-            base: Some(&base),
-            options,
-        },
-    )
+    Err(ViewError::OverlaysUnsupported)
 }
 
-/// How a view for a candidate was obtained.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ViewOutcome {
-    Incremental {
-        view: String,
-    },
-    /// The overlay could not be built on that base; this is a fresh analysis.
-    Fresh {
-        view: String,
-        reason: &'static str,
-    },
-}
-
-/// An overlay on `base` when it can be built, otherwise a fresh analysis.
-/// Stacking, a profile mismatch or a missing base never yield a guessed
-/// incremental answer.
-pub fn view_for_candidate(
+/// The published view of `snapshot` under `options`' profile, building it
+/// first when there is none.
+pub fn view_for_snapshot(
     store: &CollaborationStore,
-    base: &str,
     snapshot: &SourceSnapshotId,
     options: &ViewOptions,
-) -> Result<ViewOutcome, ViewError> {
-    match build_overlay(store, base, snapshot, options) {
-        Ok(view) => Ok(ViewOutcome::Incremental { view }),
-        Err(
-            error @ (ViewError::UnsupportedStacking { .. }
-            | ViewError::IncompatibleProfile { .. }
-            | ViewError::NotFound { .. }
-            | ViewError::Retired { .. }),
-        ) => Ok(ViewOutcome::Fresh {
-            view: build_fresh(store, snapshot, options)?,
-            reason: error.code(),
-        }),
-        Err(error) => Err(error),
+) -> Result<ViewReader, ViewError> {
+    let name = view_name(snapshot, &options.profile);
+    match open_view_for(store, &name, &options.profile) {
+        Err(ViewError::NotFound { .. } | ViewError::Retired { .. }) => {
+            build_view(store, snapshot, options)?;
+            open_view_for(store, &name, &options.profile)
+        }
+        other => other,
     }
 }
 
@@ -878,11 +582,17 @@ pub fn view_for_candidate(
 /// Pin `view`'s published generation for reading.
 pub fn open_view(store: &CollaborationStore, view: &str) -> Result<ViewReader, ViewError> {
     let view_dir = views_root(store).join(view);
+    // Pins are taken under the archive's shared lock, like every other pin,
+    // so a reclamation apply (exclusive) never races a new reader.
+    let _use = crate::collaboration_gc::archive_use(store).map_err(|source| ViewError::Io {
+        path: crate::collaboration_gc::lock_path(store),
+        source,
+    })?;
     if view_dir.join("RETIRED").exists() {
         return Err(ViewError::Retired { view: view.into() });
     }
-    // CURRENT may move, and an old generation may be reclaimed, between
-    // reading the pointer and pinning; pin, then confirm it still exists.
+    // CURRENT may move between reading the pointer and pinning; pin, then
+    // confirm the generation still exists.
     for _ in 0..3 {
         let Some(generation) = current_generation(&view_dir)? else {
             return Err(ViewError::NotFound { view: view.into() });
@@ -905,6 +615,23 @@ pub fn open_view(store: &CollaborationStore, view: &str) -> Result<ViewReader, V
         });
     }
     Err(ViewError::NotFound { view: view.into() })
+}
+
+/// [`open_view`], refusing a view built under another profile (T90).
+pub fn open_view_for(
+    store: &CollaborationStore,
+    view: &str,
+    profile: &ViewProfile,
+) -> Result<ViewReader, ViewError> {
+    let reader = open_view(store, view)?;
+    if reader.manifest.profile != *profile {
+        return Err(ViewError::IncompatibleProfile {
+            view: view.into(),
+            expected: profile.digest(),
+            found: reader.manifest.profile_digest.clone(),
+        });
+    }
+    Ok(reader)
 }
 
 /// What a query found, before it is wrapped in the AQ0 envelope.
@@ -990,26 +717,15 @@ impl ViewReader {
             gaps,
             result,
         } = answer;
-        let mut provenance = vec![
+        let provenance = vec![
             ("view", text(&self.manifest.view)),
-            ("kind", text(kind_name(self.manifest.kind))),
             ("generation", int(self.manifest.generation)),
             (
                 "fragment_set_sha256",
                 text(&self.manifest.fragment_set_sha256),
             ),
-            (
-                "mode",
-                text(match self.manifest.kind {
-                    ViewKind::Overlay => "incremental",
-                    _ => "fresh",
-                }),
-            ),
+            ("mode", text("fresh")),
         ];
-        if let Some(base) = &self.manifest.base {
-            provenance.push(("base_view", text(&base.view)));
-            provenance.push(("base_generation", int(base.generation)));
-        }
         AnalysisEnvelope {
             operation,
             subject,
@@ -1188,14 +904,6 @@ impl ViewReader {
     }
 }
 
-fn kind_name(kind: ViewKind) -> &'static str {
-    match kind {
-        ViewKind::Base => "base",
-        ViewKind::Overlay => "overlay",
-        ViewKind::Fresh => "fresh",
-    }
-}
-
 fn text(value: &str) -> Value {
     Value::String(value.to_string())
 }
@@ -1214,81 +922,117 @@ fn object(members: impl IntoIterator<Item = (&'static str, Value)>) -> Value {
 
 // -------------------------------------------------------------- lifecycle
 
-/// What [`sweep`] removed and kept.
-#[derive(Debug, Default, PartialEq, Eq)]
-pub struct SweepReport {
-    pub removed: Vec<String>,
-    pub pinned: Vec<String>,
-    pub building: bool,
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) struct ViewHold {
+    pub holder: String,
+    pub until_ms: Option<i64>,
 }
 
-/// Reclaim `view`'s unpublished build directories and its superseded or
-/// retired generations that no reader pins. The current generation of a live
-/// view is never reclaimed.
-pub fn sweep(store: &CollaborationStore, view: &str) -> Result<SweepReport, ViewError> {
-    let view_dir = views_root(store).join(view);
-    let mut report = SweepReport::default();
-    let Some(_build) = try_exclusive(&view_dir.join(".build.lock"))? else {
-        report.building = true;
-        return Ok(report);
-    };
-    let retired = view_dir.join("RETIRED").exists();
-    let current = if retired {
-        None
-    } else {
-        current_generation(&view_dir)?
-    };
-    for entry in std::fs::read_dir(&view_dir).map_err(io(&view_dir))? {
-        let entry = entry.map_err(io(&view_dir))?;
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if name.starts_with("building-") {
-            std::fs::remove_dir_all(entry.path()).map_err(io(&entry.path()))?;
-            report.removed.push(name);
-        } else if let Some(n) = name.strip_prefix("gen-").and_then(|n| n.parse().ok()) {
-            if Some(n) == current {
-                continue;
-            }
-            match try_exclusive(&entry.path().join(".pin"))? {
-                Some(_held) => {
-                    std::fs::remove_dir_all(entry.path()).map_err(io(&entry.path()))?;
-                    report.removed.push(name);
-                }
-                None => report.pinned.push(name),
-            }
-        }
+fn holds_dir(view_dir: &Path) -> PathBuf {
+    view_dir.join("holds")
+}
+
+/// Record that `holder` (an X3 report, an L3 context) relies on `view` until
+/// `until_ms`, or until released. A held view is neither retired nor
+/// reclaimed. Taken under the archive's shared lock like other pins.
+pub fn hold_view(
+    store: &CollaborationStore,
+    view: &str,
+    holder: &str,
+    until_ms: Option<i64>,
+) -> Result<(), ViewError> {
+    if holder.is_empty() || holder.len() > 200 {
+        return Err(ViewError::InvalidHolder);
     }
-    report.removed.sort();
-    report.pinned.sort();
-    Ok(report)
+    let _use = crate::collaboration_gc::archive_use(store).map_err(|source| ViewError::Io {
+        path: crate::collaboration_gc::lock_path(store),
+        source,
+    })?;
+    let view_dir = views_root(store).join(view);
+    if current_generation(&view_dir)?.is_none() || view_dir.join("RETIRED").exists() {
+        return Err(ViewError::NotFound { view: view.into() });
+    }
+    let dir = holds_dir(&view_dir);
+    std::fs::create_dir_all(&dir).map_err(io(&dir))?;
+    let path = dir.join(format!(
+        "{}.json",
+        &hex(&Sha256::digest(holder.as_bytes()))[..32]
+    ));
+    let body = serde_json::to_vec(&ViewHold {
+        holder: holder.into(),
+        until_ms,
+    })
+    .expect("a hold serializes");
+    let temporary = dir.join(".hold.tmp");
+    write_synced(&temporary, &body)?;
+    std::fs::rename(&temporary, &path).map_err(io(&path))?;
+    sync_dir(&dir)
 }
 
-/// Retire `view`: no new reader may open it, and [`sweep`] then reclaims
-/// it. Refused while an overlay builds on it or a reader pins it (T86).
+/// Release `holder`'s hold on `view`. `false` when there was none.
+pub fn release_view_hold(
+    store: &CollaborationStore,
+    view: &str,
+    holder: &str,
+) -> Result<bool, ViewError> {
+    let dir = holds_dir(&views_root(store).join(view));
+    let path = dir.join(format!(
+        "{}.json",
+        &hex(&Sha256::digest(holder.as_bytes()))[..32]
+    ));
+    match std::fs::remove_file(&path) {
+        Ok(()) => {
+            sync_dir(&dir)?;
+            Ok(true)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(io(&path)(error)),
+    }
+}
+
+/// The holds on `view_dir` that are still live at `now_ms`. A hold file that
+/// cannot be read counts as live: an unknown dependent is protected.
+pub(crate) fn live_holds(view_dir: &Path, now_ms: i64) -> usize {
+    let Ok(entries) = std::fs::read_dir(holds_dir(view_dir)) else {
+        return 0;
+    };
+    entries
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_name().to_string_lossy().ends_with(".json"))
+        .filter(|entry| {
+            std::fs::read(entry.path())
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<ViewHold>(&bytes).ok())
+                .is_none_or(|hold| hold.until_ms.is_none_or(|until| until > now_ms))
+        })
+        .count()
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX)
+        })
+}
+
+/// Retire `view`: no new reader may open it, and reclamation
+/// (`collaboration_gc`, the `view` class) then removes its generations.
+/// Refused while a consumer holds it or a reader pins it (T86).
 ///
 /// A pin can outlive its reader by an instant when another thread of the
 /// reading process forks a child, which shares the lock until it execs; a
 /// `pinned` refusal right after a release is safe to retry.
 pub fn retire(store: &CollaborationStore, view: &str) -> Result<(), ViewError> {
-    let root = views_root(store);
-    let view_dir = root.join(view);
+    let view_dir = views_root(store).join(view);
     let Some(generation) = current_generation(&view_dir)? else {
         return Err(ViewError::NotFound { view: view.into() });
     };
-    let dependents = std::fs::read_dir(&root)
-        .map_err(io(&root))?
-        .filter_map(Result::ok)
-        .filter(|entry| !entry.path().join("RETIRED").exists())
-        .filter_map(|entry| {
-            let dir = entry.path();
-            let n = current_generation(&dir).ok().flatten()?;
-            read_manifest(&dir.join(format!("gen-{n}"))).ok()
-        })
-        .filter(|manifest| manifest.base.as_ref().is_some_and(|base| base.view == view))
-        .count();
-    if dependents > 0 {
-        return Err(ViewError::HasDependents {
+    let holders = live_holds(&view_dir, now_ms());
+    if holders > 0 {
+        return Err(ViewError::Held {
             view: view.into(),
-            dependents,
+            holders,
         });
     }
     let pin = view_dir.join(format!("gen-{generation}/.pin"));
@@ -1369,6 +1113,8 @@ mod tests {
         ViewOptions::new(ViewProfile::current("fixture"))
     }
 
+    use crate::collaboration_gc::{GcOptions, ItemKind, RetentionClass, apply, plan};
+
     const SYMBOLS: &[&str] = &["f", "g", "h", "main", "run", "unused"];
     const CHANGED: &[&[&str]] = &[&["lib/a.py"], &["app/b.py"], &["lib/a2.py"], &["app/d.py"]];
 
@@ -1433,16 +1179,64 @@ mod tests {
         }
     }
 
-    /// Independently annotated interactions on the base fixture: written
-    /// from the source, not from the indexer's output.
+    /// Make every entry under `views/` three days old, as if the grace
+    /// period had passed. Nothing is followed through a link.
+    fn age_views(store: &CollaborationStore) {
+        let then = std::time::SystemTime::now() - std::time::Duration::from_secs(3 * 86_400);
+        let mut pending = vec![views_root(store)];
+        while let Some(dir) = pending.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+                    continue;
+                };
+                if metadata.is_dir() {
+                    pending.push(path.clone());
+                }
+                if metadata.is_dir() || metadata.is_file() {
+                    File::open(&path).unwrap().set_modified(then).unwrap();
+                }
+            }
+        }
+    }
+
+    fn view_items(store: &mut CollaborationStore) -> Vec<(ItemKind, String)> {
+        plan(store, &GcOptions::default())
+            .unwrap()
+            .reclaimable
+            .into_iter()
+            .filter(|item| item.class == RetentionClass::View)
+            .map(|item| (item.kind, item.relpath))
+            .collect()
+    }
+
+    fn reclaim_views(store: &mut CollaborationStore) -> Vec<String> {
+        let plan = plan(store, &GcOptions::default()).unwrap();
+        if plan.reclaimable.is_empty() {
+            return Vec::new();
+        }
+        apply(store, &plan.digest, &GcOptions::default())
+            .unwrap()
+            .reclaimed
+            .into_iter()
+            .filter(|item| item.class == RetentionClass::View)
+            .map(|item| item.relpath)
+            .collect()
+    }
+
+    /// Independently annotated interactions on the fixture: written from
+    /// the source, not from the indexer's output.
     #[test]
-    fn known_interactions_hold_on_the_base() {
+    fn known_interactions_hold() {
         let host = tempfile::tempdir().unwrap();
         let repo = fixture();
         let mut store = store(host.path());
         let snapshot = retain(&mut store, repo.path());
-        let base = build_base(&store, &snapshot, &options()).unwrap();
-        let reader = open_view(&store, &base).unwrap();
+        let view = build_view(&store, &snapshot, &options()).unwrap();
+        let reader = open_view(&store, &view).unwrap();
         let (refs, _) = references(&reader, "f");
         assert!(
             refs.iter()
@@ -1461,103 +1255,23 @@ mod tests {
         let impact = impacted(&reader, &["lib/a.py"]);
         assert!(impact.contains(&"app/b.py".to_string()), "{impact:?}");
         assert!(impact.contains(&"app/c.py".to_string()), "{impact:?}");
-        assert_eq!(reader.manifest().kind, ViewKind::Base);
-        assert!(reader.manifest().mask.is_empty());
     }
 
-    /// AQ2, T71–T73 and the invalidation fixtures: for each mutation, the
-    /// overlay on the base and a fresh analysis of the same snapshot hold the
-    /// same linked facts byte for byte and give the same answers.
+    /// A deleted target leaves no ghost: the reference becomes an explicit
+    /// unresolved gap and coverage is partial, never complete-and-empty.
     #[test]
-    fn an_overlay_agrees_with_fresh_analysis_for_every_mutation() {
+    fn a_deleted_target_is_an_unresolved_gap_not_absence() {
         let host = tempfile::tempdir().unwrap();
         let repo = fixture();
         let mut store = store(host.path());
-        let base_snapshot = retain(&mut store, repo.path());
-        let base = build_base(&store, &base_snapshot, &options()).unwrap();
-
-        type Mutation = (
-            &'static str,
-            fn(&Path),
-            &'static [&'static str],
-            &'static [&'static str],
-        );
-        let mutations: &[Mutation] = &[
-            (
-                "body edit",
-                |r| write(r, "lib/a.py", &A.replace("return 1", "return 3")),
-                &["lib/a.py"],
-                &["lib/a.py"],
-            ),
-            // T72: the export changes; the consumer's bytes do not.
-            (
-                "export renamed",
-                |r| write(r, "lib/a.py", &A.replace("def f()", "def g()")),
-                &["lib/a.py"],
-                &["lib/a.py"],
-            ),
-            // T73: a previously absent name appears.
-            (
-                "absent name added",
-                |r| write(r, "app/d.py", "def h():\n    return 0\n"),
-                &[],
-                &["app/d.py"],
-            ),
-            // T73: the target is deleted.
-            (
-                "target deleted",
-                |r| {
-                    std::fs::remove_file(r.join("lib/a.py")).unwrap();
-                },
-                &["lib/a.py"],
-                &[],
-            ),
-            // T73: the file moves.
-            (
-                "file moved",
-                |r| {
-                    std::fs::rename(r.join("lib/a.py"), r.join("lib/a2.py")).unwrap();
-                },
-                &["lib/a.py"],
-                &["lib/a2.py"],
-            ),
-        ];
-        for (name, mutate, mask, replacements) in mutations {
-            git(repo.path(), &["checkout", "-q", "--detach", "main"]);
-            mutate(repo.path());
-            git(repo.path(), &["add", "-A"]);
-            git(repo.path(), &["commit", "-qm", name]);
-            let snapshot = retain(&mut store, repo.path());
-
-            let overlay = build_overlay(&store, &base, &snapshot, &options()).unwrap();
-            let fresh = build_fresh(&store, &snapshot, &options()).unwrap();
-            let overlay = open_view(&store, &overlay).unwrap();
-            let fresh = open_view(&store, &fresh).unwrap();
-            let (o, f) = (overlay.manifest(), fresh.manifest());
-            assert_eq!(
-                o.fragment_set_sha256, f.fragment_set_sha256,
-                "{name}: facts differ"
-            );
-            assert_eq!(answers(&overlay), answers(&fresh), "{name}: answers differ");
-            assert_eq!(o.mask, *mask, "{name}");
-            assert_eq!(o.replacements, *replacements, "{name}");
-            assert_eq!(
-                o.costs.units_reused + o.costs.units_extracted,
-                o.units.len(),
-                "{name}"
-            );
-            assert!(o.costs.units_reused > 0, "{name}: nothing was reused");
-        }
-
-        // The deleted target leaves no ghost: b's call no longer resolves.
-        git(repo.path(), &["checkout", "-q", "--detach", "main"]);
         std::fs::remove_file(repo.path().join("lib/a.py")).unwrap();
         git(repo.path(), &["add", "-A"]);
-        git(repo.path(), &["commit", "-qm", "deleted again"]);
-        let deleted = retain(&mut store, repo.path());
-        let overlay = build_overlay(&store, &base, &deleted, &options()).unwrap();
-        let overlay = open_view(&store, &overlay).unwrap();
-        let (refs, gaps) = references(&overlay, "f");
+        git(repo.path(), &["commit", "-qm", "deleted"]);
+        let snapshot = retain(&mut store, repo.path());
+        let reader = view_for_snapshot(&store, &snapshot, &options()).unwrap();
+        let envelope = reader.find_references("f", 64).unwrap();
+        assert!(!envelope.absence_is_evidence());
+        let (refs, gaps) = references(&reader, "f");
         assert!(refs.iter().all(|(_, _, to)| to != "lib/a.py"), "{refs:?}");
         assert!(
             gaps.iter()
@@ -1566,82 +1280,46 @@ mod tests {
         );
     }
 
-    /// T77: one base plus one overlay is the limit.
+    /// X2's overlays were measured and dropped; stacking with them.
     #[test]
-    fn stacking_is_refused_and_the_candidate_falls_back_to_fresh() {
+    fn overlays_and_stacking_are_refused() {
         let host = tempfile::tempdir().unwrap();
         let repo = fixture();
         let mut store = store(host.path());
-        let base_snapshot = retain(&mut store, repo.path());
-        let base = build_base(&store, &base_snapshot, &options()).unwrap();
-        write(repo.path(), "lib/a.py", "def f():\n    return 9\n");
-        git(repo.path(), &["commit", "-qam", "a"]);
-        let first = retain(&mut store, repo.path());
-        let overlay = build_overlay(&store, &base, &first, &options()).unwrap();
-        write(repo.path(), "app/b.py", "def main():\n    return 0\n");
-        git(repo.path(), &["commit", "-qam", "b"]);
-        let second = retain(&mut store, repo.path());
-
-        let error = build_overlay(&store, &overlay, &second, &options()).unwrap_err();
-        assert_eq!(error.code(), "unsupported_stacking", "{error}");
-        match view_for_candidate(&store, &overlay, &second, &options()).unwrap() {
-            ViewOutcome::Fresh { view, reason } => {
-                assert_eq!(reason, "unsupported_stacking");
-                assert_eq!(
-                    open_view(&store, &view).unwrap().manifest().kind,
-                    ViewKind::Fresh
-                );
-            }
-            other => panic!("{other:?}"),
-        }
+        let snapshot = retain(&mut store, repo.path());
+        let view = build_view(&store, &snapshot, &options()).unwrap();
+        let error = build_overlay(&store, &view, &snapshot, &options()).unwrap_err();
+        assert_eq!(error.code(), "overlays_unsupported", "{error}");
     }
 
-    /// T90: a base analysed under another producer version is never reused,
-    /// and an unrelated edit re-extracts only its own unit.
+    /// T90: a view answers only under the profile it was built with; another
+    /// producer version gets a separate view, never the old facts.
     #[test]
-    fn another_profile_is_never_reused_and_edits_stay_scoped() {
+    fn a_view_answers_only_under_its_profile() {
         let host = tempfile::tempdir().unwrap();
         let repo = fixture();
         let mut store = store(host.path());
-        let base_snapshot = retain(&mut store, repo.path());
-        let old = ViewOptions::new(ViewProfile::with_version("fixture", "0.0.0-old"));
-        let base = build_base(&store, &base_snapshot, &old).unwrap();
-        write(
-            repo.path(),
-            "app/b.py",
-            &B.replace("return f()", "return f() + 1"),
-        );
-        git(repo.path(), &["commit", "-qam", "edit"]);
         let snapshot = retain(&mut store, repo.path());
-
-        let error = build_overlay(&store, &base, &snapshot, &options()).unwrap_err();
+        let old = ViewOptions::new(ViewProfile::with_version("fixture", "0.0.0-old"));
+        let old_view = build_view(&store, &snapshot, &old).unwrap();
+        let error = open_view_for(&store, &old_view, &options().profile).unwrap_err();
         assert_eq!(error.code(), "incompatible_analysis_profile", "{error}");
-        match view_for_candidate(&store, &base, &snapshot, &options()).unwrap() {
-            ViewOutcome::Fresh { reason, .. } => {
-                assert_eq!(reason, "incompatible_analysis_profile")
-            }
-            other => panic!("{other:?}"),
-        }
-
-        let current = build_base(&store, &base_snapshot, &options()).unwrap();
-        let overlay = build_overlay(&store, &current, &snapshot, &options()).unwrap();
-        let manifest = open_view(&store, &overlay).unwrap().manifest().clone();
-        assert_eq!(manifest.replacements, ["app/b.py"]);
-        assert_eq!(manifest.costs.units_extracted, 1);
-        // The envelope names the profile; the two profiles differ.
+        let current = view_for_snapshot(&store, &snapshot, &options()).unwrap();
+        assert_ne!(current.manifest().view, old_view);
+        assert_eq!(current.manifest().profile, options().profile);
         assert_ne!(old.profile.reference(), options().profile.reference());
     }
 
-    /// T76: a build stopped at any point publishes nothing; readers keep the
-    /// previous generation, and cleanup reclaims the debris.
+    /// T76: a build stopped at any point publishes nothing, and readers keep
+    /// the previous generation; reclamation removes the debris after grace.
     #[test]
     fn a_crash_never_publishes_a_partial_generation() {
         let host = tempfile::tempdir().unwrap();
         let repo = fixture();
         let mut store = store(host.path());
         let snapshot = retain(&mut store, repo.path());
-        let base = build_base(&store, &snapshot, &options()).unwrap();
-        let before = answers(&open_view(&store, &base).unwrap());
+        let view = build_view(&store, &snapshot, &options()).unwrap();
+        let before = answers(&open_view(&store, &view).unwrap());
         for fault in [
             Fault::AfterIndex,
             Fault::AfterLink,
@@ -1650,94 +1328,234 @@ mod tests {
         ] {
             let mut crashing = options();
             crashing.fault = Some(fault);
-            let error = build_base(&store, &snapshot, &crashing).unwrap_err();
+            let error = build_view(&store, &snapshot, &crashing).unwrap_err();
             assert_eq!(error.code(), "injected", "{fault:?}");
-            let reader = open_view(&store, &base).unwrap();
+            let reader = open_view(&store, &view).unwrap();
             assert_eq!(reader.manifest().generation, 1, "{fault:?}");
             assert_eq!(answers(&reader), before, "{fault:?}");
-            drop(reader);
-            after_release(|| {
-                let swept = sweep(&store, &base).unwrap();
-                (swept.removed.len() == 1).then_some(())
-            });
         }
-        assert_eq!(generations(&views_root(&store).join(&base)).unwrap(), [1]);
+        // Debris inside the grace period is kept.
+        assert!(view_items(&mut store).is_empty());
+        age_views(&store);
+        let reclaimed = after_release(|| {
+            let reclaimed = reclaim_views(&mut store);
+            (!reclaimed.is_empty()).then_some(reclaimed)
+        });
+        // Each retry reuses `building-2-<pid>`; the last crash published
+        // gen-2 without naming it, so that is the only debris left.
+        assert_eq!(reclaimed, [format!("views/{view}/gen-2")]);
+        assert_eq!(generations(&views_root(&store).join(&view)).unwrap(), [1]);
+        assert_eq!(answers(&open_view(&store, &view).unwrap()), before);
     }
 
     /// T76: a reader keeps the generation it pinned while a newer one
-    /// publishes; that generation is reclaimed only once the reader is gone.
+    /// publishes; reclamation takes it only once the reader is gone, and
+    /// never takes `CURRENT`.
     #[test]
-    fn a_pinned_reader_keeps_its_generation() {
+    fn a_pinned_generation_and_current_are_never_reclaimed() {
         let host = tempfile::tempdir().unwrap();
         let repo = fixture();
         let mut store = store(host.path());
         let snapshot = retain(&mut store, repo.path());
-        let base = build_base(&store, &snapshot, &options()).unwrap();
-        let reader = open_view(&store, &base).unwrap();
+        let view = build_view(&store, &snapshot, &options()).unwrap();
+        let reader = open_view(&store, &view).unwrap();
         let before = answers(&reader);
-        build_base(&store, &snapshot, &options()).unwrap();
-        assert_eq!(open_view(&store, &base).unwrap().manifest().generation, 2);
-        // The finished build's lock can still be held for an instant (see
-        // `after_release`); sweep then skips the view rather than guess.
-        let swept = after_release(|| {
-            let swept = sweep(&store, &base).unwrap();
-            (!swept.building).then_some(swept)
+        build_view(&store, &snapshot, &options()).unwrap();
+        age_views(&store);
+        let items = after_release(|| {
+            let plan = plan(&mut store, &GcOptions::default()).unwrap();
+            (plan
+                .retained
+                .get(&RetentionClass::View)
+                .is_some_and(|total| total.objects == 1))
+            .then_some(view_items(&mut store))
         });
-        assert_eq!(swept.pinned, ["gen-1"], "{swept:?}");
-        assert_eq!(reader.manifest().generation, 1);
-        let after = answers(&reader);
-        for (index, (was, is)) in before.iter().zip(&after).enumerate() {
-            assert_eq!(was, is, "answer {index} changed under a pinned reader");
-        }
-        assert_eq!(after.len(), before.len());
+        assert!(items.is_empty(), "pinned or current reclaimable: {items:?}");
+        assert_eq!(answers(&reader), before);
         drop(reader);
-        after_release(|| {
-            let swept = sweep(&store, &base).unwrap();
-            (swept.removed == ["gen-1"]).then_some(())
+        let reclaimed = after_release(|| {
+            let reclaimed = reclaim_views(&mut store);
+            (!reclaimed.is_empty()).then_some(reclaimed)
         });
+        assert_eq!(reclaimed, [format!("views/{view}/gen-1")]);
+        assert_eq!(open_view(&store, &view).unwrap().manifest().generation, 2);
     }
 
-    /// T86: a base is not retired under an overlay or a reader, and
-    /// retiring views never touches retained source.
+    /// An abandoned build directory is reclaimed once it is older than grace
+    /// and nobody holds the build lock.
     #[test]
-    fn retiring_a_base_waits_for_overlays_and_readers() {
+    fn stale_build_debris_is_reclaimed_after_grace() {
         let host = tempfile::tempdir().unwrap();
         let repo = fixture();
         let mut store = store(host.path());
-        let base_snapshot = retain(&mut store, repo.path());
-        let base = build_base(&store, &base_snapshot, &options()).unwrap();
-        write(repo.path(), "lib/a.py", "def f():\n    return 5\n");
-        git(repo.path(), &["commit", "-qam", "a"]);
         let snapshot = retain(&mut store, repo.path());
-        let overlay = build_overlay(&store, &base, &snapshot, &options()).unwrap();
+        let view = build_view(&store, &snapshot, &options()).unwrap();
+        let mut crashing = options();
+        crashing.fault = Some(Fault::AfterLink);
+        build_view(&store, &snapshot, &crashing).unwrap_err();
+        assert!(view_items(&mut store).is_empty());
+        age_views(&store);
+        let items = after_release(|| {
+            let items = view_items(&mut store);
+            (!items.is_empty()).then_some(items)
+        });
+        assert_eq!(
+            items,
+            [(
+                ItemKind::ViewBuild,
+                format!("views/{view}/building-2-{}", std::process::id())
+            )]
+        );
+    }
 
-        assert_eq!(retire(&store, &base).unwrap_err().code(), "has_dependents");
-        retire(&store, &overlay).unwrap();
-        let reader = open_view(&store, &base).unwrap();
-        assert_eq!(retire(&store, &base).unwrap_err().code(), "pinned");
+    /// A superseded generation stays for the grace period after `CURRENT`
+    /// moved on.
+    #[test]
+    fn a_superseded_generation_waits_for_grace() {
+        let host = tempfile::tempdir().unwrap();
+        let repo = fixture();
+        let mut store = store(host.path());
+        let snapshot = retain(&mut store, repo.path());
+        let view = build_view(&store, &snapshot, &options()).unwrap();
+        build_view(&store, &snapshot, &options()).unwrap();
+        assert!(view_items(&mut store).is_empty());
+        age_views(&store);
+        let items = after_release(|| {
+            let items = view_items(&mut store);
+            (!items.is_empty()).then_some(items)
+        });
+        assert_eq!(
+            items,
+            [(ItemKind::ViewGeneration, format!("views/{view}/gen-1"))]
+        );
+    }
+
+    /// Nothing in a view is reclaimed while it is being built, or while a
+    /// consumer holds it.
+    #[test]
+    fn a_held_or_building_view_keeps_everything() {
+        let host = tempfile::tempdir().unwrap();
+        let repo = fixture();
+        let mut store = store(host.path());
+        let snapshot = retain(&mut store, repo.path());
+        let view = build_view(&store, &snapshot, &options()).unwrap();
+        build_view(&store, &snapshot, &options()).unwrap();
+        hold_view(&store, &view, "x3-report-1", None).unwrap();
+        age_views(&store);
+        assert!(view_items(&mut store).is_empty(), "held");
+        assert!(release_view_hold(&store, &view, "x3-report-1").unwrap());
+        // An expired hold no longer protects.
+        hold_view(&store, &view, "x3-report-2", Some(1)).unwrap();
+        age_views(&store);
+        let building = open_lock(&views_root(&store).join(&view).join(".build.lock")).unwrap();
+        building.lock().unwrap();
+        assert!(view_items(&mut store).is_empty(), "building");
+        drop(building);
+        let items = after_release(|| {
+            let items = view_items(&mut store);
+            (!items.is_empty()).then_some(items)
+        });
+        assert_eq!(items.len(), 1, "{items:?}");
+    }
+
+    /// T86: a held or pinned view is not retired; a retired view's
+    /// generations go without waiting for grace, and retained source stays.
+    #[test]
+    fn retiring_waits_for_holds_and_readers() {
+        let host = tempfile::tempdir().unwrap();
+        let repo = fixture();
+        let mut store = store(host.path());
+        let snapshot = retain(&mut store, repo.path());
+        let view = build_view(&store, &snapshot, &options()).unwrap();
+        hold_view(&store, &view, "l3-context", None).unwrap();
+        assert_eq!(retire(&store, &view).unwrap_err().code(), "held");
+        release_view_hold(&store, &view, "l3-context").unwrap();
+        let reader = open_view(&store, &view).unwrap();
+        assert_eq!(retire(&store, &view).unwrap_err().code(), "pinned");
         drop(reader);
-        after_release(|| match retire(&store, &base) {
+        after_release(|| match retire(&store, &view) {
             Ok(()) => Some(()),
             Err(error) if error.code() == "pinned" => None,
             Err(error) => panic!("{error}"),
         });
-        assert_eq!(open_view(&store, &base).unwrap_err().code(), "retired");
-        after_release(|| (sweep(&store, &base).unwrap().removed == ["gen-1"]).then_some(()));
-        // Retained source is a different lifecycle.
+        assert_eq!(open_view(&store, &view).unwrap_err().code(), "retired");
+        let reclaimed = after_release(|| {
+            let reclaimed = reclaim_views(&mut store);
+            (!reclaimed.is_empty()).then_some(reclaimed)
+        });
+        assert_eq!(reclaimed, [format!("views/{view}/gen-1")]);
         let dest = tempfile::tempdir().unwrap();
-        crate::collaboration_archive::reconstruct(&store, &base_snapshot, &dest.path().join("t"))
+        crate::collaboration_archive::reconstruct(&store, &snapshot, &dest.path().join("t"))
             .unwrap();
     }
 
-    /// T75: two worktrees' candidates from one base, built at once, stay
-    /// isolated, and no canonical graph state or repository is written.
+    /// A symlink under `views/` is unknown: reported, never followed or
+    /// removed.
+    #[test]
+    fn a_symlinked_view_is_unknown_and_untouched() {
+        let host = tempfile::tempdir().unwrap();
+        let repo = fixture();
+        let mut store = store(host.path());
+        let snapshot = retain(&mut store, repo.path());
+        let view = build_view(&store, &snapshot, &options()).unwrap();
+        retire(&store, &view).unwrap();
+        // Move the retired view elsewhere and link it back.
+        let outside = tempfile::tempdir().unwrap();
+        let moved = outside.path().join("view");
+        std::fs::rename(views_root(&store).join(&view), &moved).unwrap();
+        std::os::unix::fs::symlink(&moved, views_root(&store).join(&view)).unwrap();
+        let plan = plan(&mut store, &GcOptions::default()).unwrap();
+        assert!(
+            plan.unknown.contains(&format!("views/{view}")),
+            "{:?}",
+            plan.unknown
+        );
+        assert!(view_items(&mut store).is_empty());
+        assert!(moved.join("gen-1/manifest.json").is_file());
+    }
+
+    /// An apply interrupted while moving view directories is finished by
+    /// resume, and the view stays readable throughout.
+    #[test]
+    fn an_interrupted_view_reclamation_resumes() {
+        let host = tempfile::tempdir().unwrap();
+        let repo = fixture();
+        let mut store = store(host.path());
+        let snapshot = retain(&mut store, repo.path());
+        let view = build_view(&store, &snapshot, &options()).unwrap();
+        build_view(&store, &snapshot, &options()).unwrap();
+        build_view(&store, &snapshot, &options()).unwrap();
+        age_views(&store);
+        let plan = after_release(|| {
+            let plan = plan(&mut store, &GcOptions::default()).unwrap();
+            (plan.reclaimable.len() == 2).then_some(plan)
+        });
+        let hooks = crate::collaboration_gc::GcHooks {
+            fail_after_moves: Some(1),
+            ..Default::default()
+        };
+        let error = crate::collaboration_gc::apply_with(
+            &mut store,
+            &plan.digest,
+            &GcOptions::default(),
+            &hooks,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("injected"), "{error}");
+        assert_eq!(open_view(&store, &view).unwrap().manifest().generation, 3);
+        let resumed = crate::collaboration_gc::resume(&mut store, &GcOptions::default()).unwrap();
+        assert_eq!(resumed.len(), 1);
+        assert_eq!(generations(&views_root(&store).join(&view)).unwrap(), [3]);
+        assert_eq!(open_view(&store, &view).unwrap().manifest().generation, 3);
+    }
+
+    /// T75: two candidates' views built at once stay isolated, and no
+    /// canonical graph state or repository is written.
     #[test]
     fn views_are_isolated_and_never_write_canonical_state() {
         let host = tempfile::tempdir().unwrap();
         let repo = fixture();
         let mut store = store(host.path());
-        let base_snapshot = retain(&mut store, repo.path());
-        let base = build_base(&store, &base_snapshot, &options()).unwrap();
         let mut candidates = Vec::new();
         for (path, body) in [
             ("lib/a.py", "def f():\n    return 7\n"),
@@ -1753,10 +1571,7 @@ mod tests {
                 .iter()
                 .map(|snapshot| {
                     let host = host.path();
-                    let base = &base;
-                    scope.spawn(move || {
-                        build_overlay(&store_for(host), base, snapshot, &options()).unwrap()
-                    })
+                    scope.spawn(move || build_view(&store_for(host), snapshot, &options()).unwrap())
                 })
                 .collect();
             handles
@@ -1766,8 +1581,6 @@ mod tests {
         });
         let a = open_view(&store, &built[0]).unwrap();
         let b = open_view(&store, &built[1]).unwrap();
-        assert_eq!(a.manifest().replacements, ["lib/a.py"]);
-        assert_eq!(b.manifest().replacements, ["app/b.py"]);
         assert_ne!(
             a.manifest().fragment_set_sha256,
             b.manifest().fragment_set_sha256
@@ -1775,9 +1588,7 @@ mod tests {
         // B's candidate removed the call to f; A's did not.
         assert!(!references(&a, "f").0.is_empty());
         assert!(references(&b, "f").0.is_empty());
-        // Nothing was written into the repository.
         assert!(!repo.path().join(".aethyme").exists());
-        git(repo.path(), &["diff", "--quiet", "HEAD"]);
         let status = std::process::Command::new("/usr/bin/env")
             .args(["git", "status", "--porcelain"])
             .current_dir(repo.path())
@@ -1815,78 +1626,14 @@ mod tests {
         let repo = fixture();
         let mut store = store(host.path());
         let snapshot = retain(&mut store, repo.path());
-        let base = build_base(&store, &snapshot, &options()).unwrap();
-        let held = open_lock(&views_root(&store).join(&base).join(".build.lock")).unwrap();
+        let view = build_view(&store, &snapshot, &options()).unwrap();
+        let held = open_lock(&views_root(&store).join(&view).join(".build.lock")).unwrap();
         held.lock().unwrap();
         let started = Instant::now();
-        open_view(&store, &base)
+        open_view(&store, &view)
             .unwrap()
             .find_references("f", 8)
             .unwrap();
         assert!(started.elapsed() < std::time::Duration::from_secs(5));
-        assert!(sweep(&store, &base).unwrap().building);
-    }
-
-    /// Costs on a generated fixture, for the decision record:
-    /// `cargo test -p aethyme-broker --lib analysis_view::tests::measure -- --ignored --nocapture`
-    #[test]
-    #[ignore = "measurement, not a check"]
-    fn measure() {
-        let host = tempfile::tempdir().unwrap();
-        let dir = tempfile::tempdir().unwrap();
-        let repo = dir.path();
-        git(repo, &["init", "-q", "-b", "main"]);
-        let files = 400;
-        for i in 0..files {
-            let mut body = format!(
-                "from pkg.m{} import f{}\n\n",
-                (i + 1) % files,
-                (i + 1) % files
-            );
-            for j in 0..20 {
-                body.push_str(&format!(
-                    "def f{i}_{j}(x):\n    y = x + {j}\n    return f{}(y)\n\n",
-                    (i + 1) % files
-                ));
-            }
-            body.push_str(&format!("def f{i}(x):\n    return x\n"));
-            write(repo, &format!("pkg/m{i}.py"), &body);
-        }
-        git(repo, &["add", "-A"]);
-        git(repo, &["commit", "-qm", "base"]);
-        let mut store = store(host.path());
-        let base_snapshot = retain(&mut store, repo);
-        let base = build_base(&store, &base_snapshot, &options()).unwrap();
-        write(repo, "pkg/m7.py", "def f7(x):\n    return x * 2\n");
-        git(repo, &["commit", "-qam", "edit"]);
-        let snapshot = retain(&mut store, repo);
-        let overlay = build_overlay(&store, &base, &snapshot, &options()).unwrap();
-        let fresh = build_fresh(&store, &snapshot, &options()).unwrap();
-        for name in [&base, &overlay, &fresh] {
-            let reader = open_view(&store, name).unwrap();
-            let manifest = reader.manifest();
-            let started = Instant::now();
-            reader.explain_impact(&["pkg/m7.py"], 100_000).unwrap();
-            println!(
-                "{} {:?}: build {} ms (materialize {} ms, index {} ms, link {} ms), extracted {}, \
-                 reused {}, facts {} B, extractions {} B, impact query {} ms, agree-with-fresh {}",
-                name,
-                manifest.kind,
-                manifest.costs.build_us / 1000,
-                manifest.costs.materialize_us / 1000,
-                manifest.costs.index_us / 1000,
-                manifest.costs.link_us / 1000,
-                manifest.costs.units_extracted,
-                manifest.costs.units_reused,
-                manifest.costs.fact_bytes,
-                manifest.costs.extraction_bytes,
-                started.elapsed().as_millis(),
-                manifest.fragment_set_sha256
-                    == open_view(&store, &fresh)
-                        .unwrap()
-                        .manifest()
-                        .fragment_set_sha256
-            );
-        }
     }
 }
