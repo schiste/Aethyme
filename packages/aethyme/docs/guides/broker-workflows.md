@@ -1,6 +1,6 @@
 # Broker Follow-Up Workflows
 
-Last Updated: 2026-09-27
+Last Updated: 2026-10-10
 
 This guide covers broker workflows that matter after the basic
 start-edit-submit loop: preparing declared worktree dependencies, reusing a session worktree, choosing fresh or cached
@@ -1398,3 +1398,39 @@ Recorded PR-overlap warnings come from the last push and are invalidated when
 its session head, baseline ref/commit or cached PR listing changes, or when the
 listing expires. Routine status reads branch tips in one batch and reports the
 listing timestamp; it performs neither new PR diffs nor network requests.
+
+## Require Collaboration Capture (experimental)
+
+`[collaboration]` in `.aethyme/config.toml` makes `broker submit` keep a
+retained copy of each submission's exact source (#660). It is read like
+`[promote]`: the committed copy on the fetched default branch when there is one,
+otherwise the main checkout's working copy.
+
+```toml
+[collaboration]
+capture = "advisory"   # "off" (default), "advisory" or "required"
+project = "proj-7k2m"
+```
+
+- `advisory` reports the capture beside the submit result and never changes it.
+- `required` refuses a submit, and every promotion, whose exact head was not
+  captured.
+
+> **`required` is one-way for older binaries.** The first time a binary from
+> #660 or later opens a repository whose config says `capture = "required"`, it
+> raises `.aethyme/broker.db`'s compatibility floor to schema 50
+> (`broker status` reports it as the collaboration fence). From then on, every
+> older Aethyme refuses that repository with "schema version is newer than this
+> binary supports".
+>
+> - **Upgrade first.** Every binary that touches the repository (agents, hooks,
+>   CI, other machines sharing the checkout) must be #660 or newer before you
+>   commit `required`.
+> - **Not retroactive.** Until a new binary has opened the repository after
+>   `required` is committed, an older binary can still submit uncaptured work.
+> - **Turning `required` off does not undo it.** The floor is never lowered, so
+>   older binaries stay locked out.
+>
+> `advisory` and `off` never touch the floor.
+
+Details: `architecture/local-v3-l2-optin.md`.

@@ -85,7 +85,19 @@ fn mentions_collaboration(text: &str) -> bool {
     })
 }
 
-fn setting_from_text(text: Option<&str>) -> Setting {
+/// Whether `setting` is an explicit `capture = "required"`, the only setting
+/// that raises `broker.db`'s compatibility floor.
+pub(crate) fn requires_capture(setting: &Setting) -> bool {
+    matches!(
+        setting,
+        Setting::On {
+            policy: CapturePolicy::Required,
+            ..
+        }
+    )
+}
+
+pub(crate) fn setting_from_text(text: Option<&str>) -> Setting {
     let Some(text) = text else {
         return Setting::Off;
     };
@@ -479,6 +491,9 @@ fn submit_with(
             })),
         });
     }
+    // Raise the compatibility floor before capturing, so no pre-#660 binary
+    // can submit to this repository uncaptured from here on.
+    broker.apply_collaboration_fence(true)?;
     let main_root = broker.main_root().to_path_buf();
     let worktree = capture.worktree().map(Path::to_path_buf);
     let known = known_paths(&main_root, worktree.as_deref());
@@ -542,6 +557,9 @@ pub(crate) fn require_capture_for_promotion(
         Setting::Unsupported { code, .. } => return Err(refuse(code.to_string())),
         Setting::On { project, .. } => project.map_err(|_| refuse("no_project".into()))?,
     };
+    broker
+        .apply_collaboration_fence(true)
+        .map_err(|e| refuse(format!("fence_unavailable: {e}")))?;
     let store = broker
         .collaboration_store(&project)
         .map_err(|e| refuse(e.code().into()))?;
@@ -1091,6 +1109,64 @@ mod tests {
         let report = advisory.run_with(&main_root, &mut open);
         assert_eq!(report.status, CaptureStatus::InProgress, "{report:?}");
         assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    /// What a schema-49 binary (every release before #660) decides about
+    /// this repository's broker database.
+    fn older_binary_opens(repo: &Path) -> bool {
+        let conn = rusqlite::Connection::open(repo.join(".aethyme/broker.db")).unwrap();
+        let found = crate::schema::current_version(&conn).unwrap();
+        crate::schema::schema_is_compatible_with(&conn, found, 49).unwrap()
+    }
+
+    fn fence(repo: &Path) -> Option<crate::CollaborationFence> {
+        let conn = rusqlite::Connection::open(repo.join(".aethyme/broker.db")).unwrap();
+        crate::schema::collaboration_fence(&conn).unwrap()
+    }
+
+    /// Any open by a #660 binary of a repository that requires capture fences
+    /// older binaries out; off and advisory leave the floor alone.
+    #[test]
+    fn opening_a_required_repository_fences_older_binaries_out() {
+        let required = fixture("required");
+        assert_eq!(
+            fence(required.repo.path()),
+            Some(crate::CollaborationFence {
+                min_compatible_schema: crate::COLLABORATION_FENCE_SCHEMA,
+                reason: crate::schema::COLLABORATION_FENCE_REASON.into(),
+            })
+        );
+        assert!(!older_binary_opens(required.repo.path()));
+        for policy in ["advisory", "off"] {
+            let fixture = fixture(policy);
+            assert_eq!(fence(fixture.repo.path()), None, "{policy}");
+            assert!(older_binary_opens(fixture.repo.path()), "{policy}");
+        }
+    }
+
+    /// The fence is one-way: turning required off does not let older
+    /// binaries back in.
+    #[test]
+    fn turning_required_off_keeps_the_fence() {
+        let fixture = fixture("required");
+        std::fs::write(
+            fixture.repo.path().join(".aethyme/config.toml"),
+            "[collaboration]\ncapture = \"off\"\n",
+        )
+        .unwrap();
+        let reopened = crate::Broker::open(fixture.repo.path()).unwrap();
+        assert!(reopened.apply_collaboration_fence(true).unwrap().is_some());
+        assert!(!older_binary_opens(fixture.repo.path()));
+        assert!(fence(fixture.repo.path()).is_some());
+    }
+
+    /// A typo is refused at submit but is not a reason to lock older binaries
+    /// out for good: only an explicit required raises the floor.
+    #[test]
+    fn an_unsupported_value_does_not_raise_the_floor() {
+        let fixture = fixture("requried");
+        assert_eq!(fence(fixture.repo.path()), None);
+        assert!(older_binary_opens(fixture.repo.path()));
     }
 
     #[test]

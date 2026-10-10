@@ -100,6 +100,13 @@ that shows which of them GC would reclaim, or `null` when there are none).
 
 `cleanup_retention.host_available_bytes` and `cleanup_retention.host_volume_probe` (introduced 2026-10-01) report free space where this repository's gates run -- the lower of the broker worktree root and host state, each read at its nearest existing directory -- and the directory read, or `null` when it cannot be read. Below the 8 GiB a gate needs to start, `advice` carries a `host.gate-headroom` row with severity `blocked`, emitted whether or not the repository retains worktrees, with `aethyme broker gc plan` and `aethyme broker gc storage plan` as its commands.
 
+`collaboration_fence` (introduced 2026-10-10, #660) is present only when this
+repository's `broker.db` floor was raised because its config requires
+collaboration capture: `{"min_compatible_schema": 50, "reason": "collaboration
+capture required"}`. Binaries older than that schema cannot open the
+repository. The floor is never lowered, so the field stays after `required` is
+turned off.
+
 `in_flight_submits` (introduced 2026-10-02) lists the `broker submit` runs in
 progress in this repository, oldest first, and is omitted when none is
 running. Each has `session_id`, `pid`, `phase` (`starting`, `auditing lease

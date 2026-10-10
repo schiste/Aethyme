@@ -555,7 +555,9 @@ pub use rule_comments::{
     RuleCommentWants, own_rule_comments, plan_rule_comments, render_rule_comment,
     rule_comment_wants,
 };
-pub use schema::{EVENTS_SCHEMA_VERSION, SCHEMA_VERSION};
+pub use schema::{
+    COLLABORATION_FENCE_SCHEMA, CollaborationFence, EVENTS_SCHEMA_VERSION, SCHEMA_VERSION,
+};
 pub use scopes::{
     ScopeConflictSeverity, ScopeOverlap, classify as classify_scope_pair, detect_scope_overlaps,
     parse_scope_argument,

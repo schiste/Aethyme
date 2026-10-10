@@ -430,3 +430,36 @@ fn the_legacy_verdict_is_printed_before_the_advisory_capture() {
         .expect("capture line");
     assert!(verdict < capture, "{stdout}");
 }
+
+/// `broker status` reports the fence once a repository requires capture, in
+/// JSON and as one line of text, and says nothing for advisory.
+#[test]
+fn status_reports_the_collaboration_fence() {
+    let required = Fixture::new(Some(REQUIRED), false);
+    let output = required.cli(&["status", "--json"], None);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let status: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        status["collaboration_fence"],
+        serde_json::json!({
+            "min_compatible_schema": aethyme_broker::COLLABORATION_FENCE_SCHEMA,
+            "reason": "collaboration capture required",
+        })
+    );
+    let text = required.cli(&["status"], None);
+    assert!(
+        String::from_utf8_lossy(&text.stdout)
+            .contains("Collaboration fence: broker.db requires schema 50"),
+        "{}",
+        String::from_utf8_lossy(&text.stdout)
+    );
+
+    let advisory = Fixture::new(Some(ADVISORY), false);
+    let output = advisory.cli(&["status", "--json"], None);
+    let status: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(status.get("collaboration_fence").is_none(), "{status:#}");
+}

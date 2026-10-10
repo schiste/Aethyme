@@ -33,7 +33,7 @@ use rusqlite::Connection;
 use crate::error::BrokerError;
 
 /// Current database schema version (== `MIGRATIONS.len()`).
-pub const SCHEMA_VERSION: i64 = 49;
+pub const SCHEMA_VERSION: i64 = 50;
 
 /// The oldest schema version whose binaries can safely use a database at
 /// [`SCHEMA_VERSION`]. Before this existed every newer database locked out
@@ -65,7 +65,68 @@ pub const SCHEMA_VERSION: i64 = 49;
 /// - v49: adds nullable local operation provenance. A v48 writer names its
 ///   existing columns and can continue writing; a v48 reader safely ignores
 ///   the additional field.
+/// - v50: no schema change. It marks the first binaries that implement
+///   `[collaboration] capture = "required"` (#660). Repositories that do not
+///   require capture keep this minimum; one that does has its own floor
+///   raised to [`COLLABORATION_FENCE_SCHEMA`] (see that constant).
 pub const MIN_COMPATIBLE_SCHEMA: i64 = 47;
+
+/// The first schema whose binaries implement required collaboration capture
+/// (#660): the version of [`MIGRATION_V50`].
+///
+/// A repository whose effective config says `capture = "required"` has its
+/// `meta.min_compatible_schema` raised to this value, so every older binary
+/// refuses its database with [`BrokerError::SchemaTooNew`] instead of
+/// submitting uncaptured work. The floor is never lowered, so turning required
+/// off later does not let older binaries back in. If this migration is
+/// renumbered on rebase, this constant must follow it; a test pins the pair.
+pub const COLLABORATION_FENCE_SCHEMA: i64 = 50;
+
+/// Why a database carries the collaboration fence (`meta.collaboration_fence`).
+pub const COLLABORATION_FENCE_REASON: &str = "collaboration capture required";
+
+/// The collaboration fence on a database, when one was raised.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct CollaborationFence {
+    /// The database's current floor (at least [`COLLABORATION_FENCE_SCHEMA`]).
+    pub min_compatible_schema: i64,
+    pub reason: String,
+}
+
+/// Read the fence in one query: the floor and the recorded reason.
+pub fn collaboration_fence(conn: &Connection) -> Result<Option<CollaborationFence>, BrokerError> {
+    let (minimum, reason): (Option<String>, Option<String>) = conn.query_row(
+        "SELECT (SELECT value FROM meta WHERE key = 'min_compatible_schema'),
+                (SELECT value FROM meta WHERE key = 'collaboration_fence')",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let minimum = minimum.and_then(|value| value.parse::<i64>().ok());
+    Ok(match (minimum, reason) {
+        (Some(minimum), Some(reason)) if minimum >= COLLABORATION_FENCE_SCHEMA => {
+            Some(CollaborationFence {
+                min_compatible_schema: minimum,
+                reason,
+            })
+        }
+        _ => None,
+    })
+}
+
+/// Raise the floor to [`COLLABORATION_FENCE_SCHEMA`] and record why, in one
+/// transaction. Never lowers a higher floor and never replaces the reason.
+pub fn raise_collaboration_fence(conn: &Connection) -> Result<(), BrokerError> {
+    conn.execute_batch(&format!(
+        "BEGIN IMMEDIATE;
+         INSERT INTO meta (key, value) VALUES ('min_compatible_schema', '{COLLABORATION_FENCE_SCHEMA}')
+         ON CONFLICT (key) DO UPDATE SET value = excluded.value
+         WHERE CAST(meta.value AS INTEGER) < CAST(excluded.value AS INTEGER);
+         INSERT INTO meta (key, value) VALUES ('collaboration_fence', '{COLLABORATION_FENCE_REASON}')
+         ON CONFLICT (key) DO NOTHING;
+         COMMIT;"
+    ))?;
+    Ok(())
+}
 
 /// Whether this binary may use a database at `found`, a version newer than
 /// its own, because every migration past [`SCHEMA_VERSION`] was declared
@@ -76,7 +137,7 @@ pub fn newer_schema_is_compatible(conn: &Connection, found: i64) -> Result<bool,
 
 /// [`newer_schema_is_compatible`] for a binary whose own schema version is
 /// `supported`, so the decision an older binary makes can be tested here.
-fn schema_is_compatible_with(
+pub(crate) fn schema_is_compatible_with(
     conn: &Connection,
     found: i64,
     supported: i64,
@@ -1621,6 +1682,14 @@ const MIGRATION_V49: &str = "
 ALTER TABLE coordinated_operations ADD COLUMN agent_provenance_json TEXT;
 ";
 
+/// v50 (#660): no schema change; see [`COLLABORATION_FENCE_SCHEMA`]. The
+/// statement is a no-op on every database that reaches it.
+const MIGRATION_V50: &str = "
+-- No schema change: this version marks binaries that implement required
+-- collaboration capture, so a repository can fence older ones out.
+CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+";
+
 const MIGRATIONS: &[&str] = &[
     MIGRATION_V1,
     MIGRATION_V2,
@@ -1671,6 +1740,7 @@ const MIGRATIONS: &[&str] = &[
     MIGRATION_V47,
     MIGRATION_V48,
     MIGRATION_V49,
+    MIGRATION_V50,
 ];
 
 /// Migrations that only add columns. One is skipped when every column it adds
@@ -1940,6 +2010,57 @@ mod tests {
             migrate(&conn),
             Err(BrokerError::SchemaTooNew { .. })
         ));
+    }
+
+    /// The fence constant names migration v50, so a renumbering rebase that
+    /// moves the migration without the constant fails here.
+    #[test]
+    fn the_collaboration_fence_is_the_version_of_its_marker_migration() {
+        let index = usize::try_from(COLLABORATION_FENCE_SCHEMA - 1).unwrap();
+        assert_eq!(MIGRATIONS[index], MIGRATION_V50);
+        const { assert!(SCHEMA_VERSION >= COLLABORATION_FENCE_SCHEMA) };
+        const { assert!(MIN_COMPATIBLE_SCHEMA < COLLABORATION_FENCE_SCHEMA) };
+    }
+
+    /// Without the fence a pre-#660 binary (schema 49) still opens a v50
+    /// database; with it, that binary is refused and this one is not.
+    #[test]
+    fn the_collaboration_fence_refuses_older_binaries_and_is_never_lowered() {
+        let conn = migrated();
+        let found = current_version(&conn).unwrap();
+        assert!(schema_is_compatible_with(&conn, found, 49).unwrap());
+        assert_eq!(collaboration_fence(&conn).unwrap(), None);
+
+        raise_collaboration_fence(&conn).unwrap();
+        assert!(!schema_is_compatible_with(&conn, found, 49).unwrap());
+        assert!(schema_is_compatible_with(&conn, found, COLLABORATION_FENCE_SCHEMA).unwrap());
+        assert_eq!(
+            collaboration_fence(&conn).unwrap(),
+            Some(CollaborationFence {
+                min_compatible_schema: COLLABORATION_FENCE_SCHEMA,
+                reason: COLLABORATION_FENCE_REASON.into(),
+            })
+        );
+        // Re-opening, re-raising and re-migrating never lower it.
+        raise_collaboration_fence(&conn).unwrap();
+        migrate(&conn).unwrap();
+        record_min_compatible_schema(&conn).unwrap();
+        assert!(!schema_is_compatible_with(&conn, found, 49).unwrap());
+
+        // A higher floor from a later migration is kept.
+        set_meta(
+            &conn,
+            "min_compatible_schema",
+            COLLABORATION_FENCE_SCHEMA + 3,
+        );
+        raise_collaboration_fence(&conn).unwrap();
+        assert_eq!(
+            collaboration_fence(&conn)
+                .unwrap()
+                .unwrap()
+                .min_compatible_schema,
+            COLLABORATION_FENCE_SCHEMA + 3
+        );
     }
 
     #[test]
@@ -2285,15 +2406,15 @@ mod tests {
 
     #[test]
     fn v49_adds_agent_provenance_without_raising_the_compatibility_floor() {
-        assert_eq!(SCHEMA_VERSION, 49);
+        const { assert!(SCHEMA_VERSION >= 49) };
         assert_eq!(MIN_COMPATIBLE_SCHEMA, 47);
 
         let conn = migrated_through(48);
         assert_eq!(current_version(&conn).unwrap(), 48);
         migrate(&conn).unwrap();
-        assert_eq!(current_version(&conn).unwrap(), 49);
-        assert!(schema_is_compatible_with(&conn, 49, 47).unwrap());
-        assert!(!schema_is_compatible_with(&conn, 49, 46).unwrap());
+        assert_eq!(current_version(&conn).unwrap(), SCHEMA_VERSION);
+        assert!(schema_is_compatible_with(&conn, SCHEMA_VERSION, 47).unwrap());
+        assert!(!schema_is_compatible_with(&conn, SCHEMA_VERSION, 46).unwrap());
 
         let nullable: i64 = conn
             .query_row(
@@ -2308,8 +2429,29 @@ mod tests {
         // A v47 database, the compatibility floor, migrates straight through.
         let from_v47 = migrated_through(47);
         migrate(&from_v47).unwrap();
-        assert_eq!(current_version(&from_v47).unwrap(), 49);
-        assert!(schema_is_compatible_with(&from_v47, 49, 47).unwrap());
+        assert_eq!(current_version(&from_v47).unwrap(), SCHEMA_VERSION);
+        assert!(schema_is_compatible_with(&from_v47, SCHEMA_VERSION, 47).unwrap());
+    }
+
+    /// v50 changes nothing: a v49 database migrates to it, the floor stays at
+    /// 47, and a v49 binary still opens the result. Only the collaboration
+    /// fence, raised per repository, shuts v49 binaries out.
+    #[test]
+    fn v50_is_a_compatible_marker_that_leaves_the_floor_alone() {
+        assert_eq!(SCHEMA_VERSION, 50);
+        let conn = migrated_through(49);
+        let tables: i64 = conn
+            .query_row("SELECT count(*) FROM sqlite_master", [], |row| row.get(0))
+            .unwrap();
+        migrate(&conn).unwrap();
+        assert_eq!(current_version(&conn).unwrap(), 50);
+        let after: i64 = conn
+            .query_row("SELECT count(*) FROM sqlite_master", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(after, tables, "v50 must not change the schema");
+        assert!(schema_is_compatible_with(&conn, 50, 49).unwrap());
+        assert!(schema_is_compatible_with(&conn, 50, 47).unwrap());
+        assert_eq!(collaboration_fence(&conn).unwrap(), None);
     }
 
     #[test]

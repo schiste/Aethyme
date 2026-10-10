@@ -166,26 +166,56 @@ paths yet.
 - The receipt inside it is #658's record, with its durability label, so an
   unsupported filesystem never reads the same as a supported one.
 
-## Old binaries (D18): the limit
+## Old binaries (D18): the fence
 
 A binary that predates #660 does not know `[collaboration]` and ignores it,
-because each config section is parsed independently. In a repository with
-`capture = "required"`, such a binary submits without capturing. It writes no
-receipt, so it never claims the policy was met. But it does not enforce it
-either.
+because each config section is parsed independently. Left alone, it would
+submit to a `required` repository without capturing. The user decided that
+required capture must shut such binaries out. The only fence they honour is
+`broker.db`'s compatibility floor, so the fence is built on it:
 
-No existing mechanism lets a new repository policy stop an old binary without
-also locking it out of everything. The only fence old binaries honour is
-`broker.db`'s compatibility floor, and raising it would lock them out of the
-whole repository. So:
+- **Schema v50** is a no-op migration, declared compatible: `MIN_COMPATIBLE_SCHEMA`
+  stays 47, so repositories that do not require capture keep working with every
+  0.8.2+ binary. Its number, `COLLABORATION_FENCE_SCHEMA`, is the first schema
+  whose binaries implement required capture.
+- **A #660+ binary raises the repository's floor to 50** when its config says
+  `capture = "required"`, and records `meta.collaboration_fence =
+  "collaboration capture required"`. Every pre-#660 binary (schema 49) then
+  refuses the database with `SchemaTooNew`, for every command.
+- **When:**
+  - On every broker open, as one meta query. If the repository is not yet
+    fenced, a plain read of the main checkout's working-copy config follows,
+    with no Git, because opens run on every hook call.
+  - On `broker status`, before a required capture, and in the promotion gate,
+    under the committed-first rule those paths already read.
 
-- **Required capture holds only where every binary that submits includes #660.**
-  The plan's rule for unsupported coexistence applies: use an isolated clone
-  (D18).
-- Advisory mode has nothing to enforce: an old binary simply produces no
-  capture, which is the legacy behaviour.
-- Adding a fence later (a minimum-version line every binary checks) would itself
-  have to ship before it could protect anything. That belongs to L9 (#681).
+  The fence therefore engages at the first open by a new binary whose main
+  checkout shows `required`, or at its first status, submit or promotion,
+  whichever comes first.
+- **Never lowered.** Raising uses the same "only upward" write as
+  `record_min_compatible_schema`, and no code lowers it. **Turning `required`
+  off later does not let older binaries back in.**
+- **Only an explicit `required` raises it.** An unsupported or unreadable value
+  still refuses submits and promotions in #660+ binaries, but does not raise the
+  floor: a typo must not lock older binaries out for good.
+- `broker status` reports it: `collaboration_fence: {"min_compatible_schema": 50,
+  "reason": "collaboration capture required"}` in JSON, and one
+  `Collaboration fence:` line in text.
+
+What this means for operators:
+
+- **Every binary that touches the repository must be #660 or newer** before
+  `required` is committed: agents, plugin hooks, CI, other machines sharing the
+  checkout.
+- **Until the first new-binary open after `required` is committed, an older
+  binary can still submit uncaptured work.** The fence is not retroactive.
+- The floor belongs to this repository's `broker.db`. Other repositories, and
+  the host-level databases, are unaffected.
+- The schema number is positional. If another schema-50 migration lands first
+  (open PRs #722 and #725 both claim 50; #722 also raises the global minimum to
+  50), this migration and `COLLABORATION_FENCE_SCHEMA` move up together. A test
+  pins the pair, so a rebase that moves one without the other fails. The fence
+  must always name the first schema that implements required capture.
 
 ## Not decided here
 
@@ -205,7 +235,7 @@ whole repository. So:
 |---|---|
 | T33 (legacy outputs unchanged when disabled) | Four off spellings: legacy exit, verdict, key order, no capture line, no state written. |
 | T34 (capture failure keeps the legacy verdict) | No project; refused root; a failing gate keeps its exit code while the capture succeeds. |
-| T35 (old binaries) | Documented limit above; a cross-binary run is #681's. |
+| T35 (old binaries) | A required repository's floor is 50 after an open, and a schema-49 binary is refused (`schema_is_compatible_with(…, 49)`); off and advisory leave it at 47 and a schema-49 binary opens; required then off keeps the fence; an unsupported value does not raise it; status reports it. A real cross-binary run is #681's. |
 | T57 (required policy) | Missing project and an unsupported policy refuse with no queue entry or ref movement; an acknowledged required capture proceeds. |
 | Idempotency | A resubmit under `verify-only` returns the same operation and receipt, including after integration is refreshed onto an upstream that moved (both policies). |
 | Promotion gate | A library submit without capture verifies and is refused at promotion; `promote --entry` is refused; advisory never gates. |
