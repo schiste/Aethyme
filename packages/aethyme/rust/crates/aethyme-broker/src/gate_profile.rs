@@ -7,7 +7,6 @@
 
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
-use std::os::unix::ffi::OsStrExt;
 use std::process::Command;
 use std::time::Duration;
 
@@ -125,12 +124,13 @@ impl ExecutionProfile {
         for key in ENVIRONMENT_KEYS {
             let value = if *key == "PATH" {
                 subprocess_path
-                    .map(|path| path.as_bytes().to_vec())
+                    .map(|path| path.as_encoded_bytes().to_vec())
                     .or_else(|| {
-                        std::env::var_os("PATH").map(|path| path.as_os_str().as_bytes().to_vec())
+                        std::env::var_os("PATH")
+                            .map(|path| path.as_os_str().as_encoded_bytes().to_vec())
                     })
             } else {
-                std::env::var_os(key).map(|value| value.as_os_str().as_bytes().to_vec())
+                std::env::var_os(key).map(|value| value.as_os_str().as_encoded_bytes().to_vec())
             };
             environment.insert((*key).to_string(), value);
         }
@@ -256,6 +256,7 @@ fn digest(input: &ProfileFingerprint) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
     fn fingerprint(tool_version: &str, cargo_home: &str) -> ProfileFingerprint {
@@ -295,6 +296,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_profile_without_a_complete_probe_has_no_cache_digest() {
         let directory = tempfile::tempdir().unwrap();
