@@ -1,0 +1,22 @@
+{
+  "schema": "aethyme.composition-fixture/provisional-v0",
+  "case": "FX05",
+  "title": "Contradiction: two values for the same button label with no authorized preference",
+  "plan": "#650 FX05; plan v3 §7.2 row 'conflicting assignment to the same property'; T19",
+  "trees": { "S0": { "recorded": true } },
+  "contributions": [
+    { "id": "subscribe", "base": "tree:S0" },
+    { "id": "join", "base": "tree:S0" }
+  ],
+  "scenarios": [
+    {
+      "id": "same-property",
+      "baseline": "S0",
+      "request": { "compose": ["subscribe", "join"] },
+      "orders": [["subscribe", "join"], ["join", "subscribe"]],
+      "commutative": true,
+      "required_outcomes": ["conflict"],
+      "provisional_text": { "outcome": "conflict", "behavior": null, "note": "both sides change the same line" }
+    }
+  ]
+}

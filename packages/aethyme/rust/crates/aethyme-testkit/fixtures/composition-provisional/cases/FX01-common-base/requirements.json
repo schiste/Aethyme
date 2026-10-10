@@ -1,0 +1,16 @@
+{
+  "schema": "aethyme.composition-requirements/provisional-v0",
+  "case": "FX01",
+  "scenarios": {
+    "compose-all": [
+      { "check": "text", "file": "app.html", "selector": "label[for=email]", "equals": "Email address" },
+      { "check": "attr", "file": "app.html", "selector": "#submit", "name": "aria-label", "equals": "Send the sign-up form" },
+      { "check": "text", "file": "app.html", "selector": "#intro", "equals": "One short email a month." },
+      { "check": "inside", "file": "app.html", "selector": "#intro", "ancestor": "#app" },
+      { "check": "not_inside", "file": "app.html", "selector": "#intro", "ancestor": "#signup" },
+      { "check": "text", "file": "app.html", "selector": "#submit", "equals": "Send" },
+      { "check": "inside", "file": "app.html", "selector": "#email", "ancestor": "#signup" },
+      { "check": "text", "file": "app.html", "selector": "#legal", "equals": "No spam." }
+    ]
+  }
+}

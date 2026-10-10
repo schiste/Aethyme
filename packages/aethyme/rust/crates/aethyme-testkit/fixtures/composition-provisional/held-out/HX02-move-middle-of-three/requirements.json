@@ -1,0 +1,13 @@
+{
+  "schema": "aethyme.composition-requirements/provisional-v0",
+  "case": "HX02",
+  "scenarios": {
+    "move-and-edit": [
+      { "check": "inside", "file": "list.html", "selector": "#item-green", "ancestor": "#favorites" },
+      { "check": "attr", "file": "list.html", "selector": "#item-green button", "name": "onkeydown", "equals": "openOnEnter(event)" },
+      { "check": "attr_absent", "file": "list.html", "selector": "#item-red button", "name": "onkeydown" },
+      { "check": "attr_absent", "file": "list.html", "selector": "#item-blue button", "name": "onkeydown" },
+      { "check": "count", "file": "list.html", "selector": "#feed article.item", "equals": 2 }
+    ]
+  }
+}

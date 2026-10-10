@@ -1,0 +1,20 @@
+{
+  "schema": "aethyme.composition-requirements/provisional-v0",
+  "case": "FX03",
+  "scenarios": {
+    "inherited": [
+      { "check": "count", "file": "app.html", "selector": "#item-3", "equals": 1 },
+      { "check": "count", "file": "app.html", "selector": "#changes li", "equals": 3 },
+      { "check": "text", "file": "app.html", "selector": "#title", "equals": "Release notes for 2.0" },
+      { "check": "text", "file": "app.html", "selector": "#legal", "equals": "Thanks for reading." },
+      { "check": "text", "file": "app.html", "selector": "#summary", "equals": "Two changes." }
+    ],
+    "duplicate-delivery": [
+      { "check": "count", "file": "app.html", "selector": "#item-3", "equals": 1 },
+      { "check": "count", "file": "app.html", "selector": "#changes li", "equals": 3 },
+      { "check": "text", "file": "app.html", "selector": "#title", "equals": "Release notes for 2.0" },
+      { "check": "text", "file": "app.html", "selector": "#legal", "equals": "Thanks for reading." }
+    ],
+    "unrecorded-base": []
+  }
+}

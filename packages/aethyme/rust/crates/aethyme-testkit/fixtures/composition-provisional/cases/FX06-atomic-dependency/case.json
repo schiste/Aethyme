@@ -1,0 +1,70 @@
+{
+  "schema": "aethyme.composition-fixture/provisional-v0",
+  "case": "FX06",
+  "title": "Atomic producer/consumer change, a dependency cycle, and competing prerequisite revisions",
+  "plan": "#650 FX06; plan v3 §7.2 rows 'cross-file API/caller change' and 'cyclic prerequisites or conflicting prerequisite revisions'; §7.3 step 2; T21 stays in Q3",
+  "trees": { "S0": { "recorded": true } },
+  "contributions": [
+    { "id": "producer-r1", "base": "tree:S0", "atomic_group": "price-api" },
+    { "id": "producer-r2", "base": "tree:S0", "atomic_group": "price-api", "revision_of": "producer-r1" },
+    { "id": "consumer", "base": "tree:S0", "atomic_group": "price-api", "requires": ["producer-r1"] },
+    { "id": "cycle-a", "base": "tree:S0", "requires": ["cycle-b"] },
+    { "id": "cycle-b", "base": "tree:S0", "requires": ["cycle-a"] }
+  ],
+  "scenarios": [
+    {
+      "id": "atomic-pair",
+      "baseline": "S0",
+      "request": { "compose": ["producer-r1", "consumer"] },
+      "orders": [["producer-r1", "consumer"]],
+      "commutative": false,
+      "required_outcomes": ["candidate"],
+      "provisional_text": { "outcome": "candidate", "behavior": "passes", "note": "producer and consumer change different files" }
+    },
+    {
+      "id": "consumer-without-producer",
+      "baseline": "S0",
+      "request": { "compose": ["consumer"] },
+      "orders": [["consumer"]],
+      "commutative": false,
+      "required_outcomes": ["missing_input"],
+      "provisional_text": { "outcome": null, "behavior": null, "note": "planning refusal: decided from lineage, selection and records before any merge engine runs, so the text profile is not measured" }
+    },
+    {
+      "id": "producer-without-consumer",
+      "baseline": "S0",
+      "request": { "compose": ["producer-r1"] },
+      "orders": [["producer-r1"]],
+      "commutative": false,
+      "required_outcomes": ["missing_input"],
+      "provisional_text": { "outcome": null, "behavior": null, "note": "planning refusal: decided from lineage, selection and records before any merge engine runs, so the text profile is not measured" }
+    },
+    {
+      "id": "cycle",
+      "baseline": "S0",
+      "request": { "compose": ["cycle-a", "cycle-b"] },
+      "orders": [["cycle-a", "cycle-b"]],
+      "commutative": false,
+      "required_outcomes": ["dependency_cycle"],
+      "provisional_text": { "outcome": null, "behavior": null, "note": "planning refusal: decided from lineage, selection and records before any merge engine runs, so the text profile is not measured" }
+    },
+    {
+      "id": "competing-revisions",
+      "baseline": "S0",
+      "request": { "compose": ["producer-r1", "producer-r2", "consumer"] },
+      "orders": [["producer-r1", "producer-r2", "consumer"]],
+      "commutative": false,
+      "required_outcomes": ["competing_revisions"],
+      "provisional_text": { "outcome": null, "behavior": null, "note": "planning refusal: decided from lineage, selection and records before any merge engine runs, so the text profile is not measured" }
+    },
+    {
+      "id": "incompatible-prerequisite",
+      "baseline": "S0",
+      "request": { "compose": ["producer-r2", "consumer"] },
+      "orders": [["producer-r2", "consumer"]],
+      "commutative": false,
+      "required_outcomes": ["competing_revisions"],
+      "provisional_text": { "outcome": null, "behavior": null, "note": "planning refusal: decided from lineage, selection and records before any merge engine runs, so the text profile is not measured" }
+    }
+  ]
+}

@@ -1,0 +1,52 @@
+{
+  "schema": "aethyme.composition-fixture/provisional-v0",
+  "case": "FX03",
+  "title": "Mixed bases: an inherited contribution, duplicate delivery, and an unrecorded base",
+  "plan": "#650 FX03; plan v3 §7.2 rows 'one submission inherits a previously captured contribution' and 'unrelated or unknown bases; unrecorded intermediate integration'; §7.3 step 3",
+  "trees": {
+    "S0": { "recorded": true },
+    "unrecorded-integration": { "recorded": false, "parent": "S0" }
+  },
+  "contributions": [
+    { "id": "c1", "base": "tree:S0" },
+    { "id": "c2", "base": "contribution:c1" },
+    { "id": "c3", "base": "tree:unrecorded-integration" }
+  ],
+  "scenarios": [
+    {
+      "id": "inherited",
+      "baseline": "S0",
+      "request": { "compose": ["c1", "c2"] },
+      "orders": [["c1", "c2"]],
+      "commutative": false,
+      "required_outcomes": ["candidate"],
+      "provisional_text": {
+        "outcome": "candidate",
+        "behavior": "passes",
+        "note": "with c2 merged against its exact base (c1's result) only its own title change applies; c1's item is applied once"
+      }
+    },
+    {
+      "id": "duplicate-delivery",
+      "baseline": "S0",
+      "request": { "compose": ["c1", "c2"], "deliveries": ["c1", "c1", "c2", "c1"] },
+      "orders": [["c1", "c1", "c2", "c1"]],
+      "commutative": false,
+      "required_outcomes": ["candidate"],
+      "provisional_text": {
+        "outcome": "candidate",
+        "behavior": "passes",
+        "note": "a repeated delivery of c1 against its exact base is a no-op once its change is present"
+      }
+    },
+    {
+      "id": "unrecorded-base",
+      "baseline": "S0",
+      "request": { "compose": ["c3"] },
+      "orders": [["c3"]],
+      "commutative": false,
+      "required_outcomes": ["unknown_base"],
+      "provisional_text": { "outcome": null, "behavior": null, "note": "planning refusal: decided from lineage, selection and records before any merge engine runs, so the text profile is not measured" }
+    }
+  ]
+}
