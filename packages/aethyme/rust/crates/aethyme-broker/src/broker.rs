@@ -280,6 +280,9 @@ pub enum BrokerOpError {
          {id} --archive` and confirm the digest it prints (the digest passed, {actual}, is stale)"
     )]
     CleanupResolveConfirmationMismatch { id: i64, actual: String },
+    /// Building a candidate could not read or name its source (#663).
+    #[error("candidate source ({code}): {0}", code = .0.code())]
+    CandidateSource(crate::collaboration_archive::ArchiveError),
     #[error(
         "the recovery archive for session {id} failed verification, so its worktree was left in \
          place: {reason} (incomplete archive: {path})"
@@ -1862,6 +1865,22 @@ pub(crate) struct LeaseRefusalPolicy {
 }
 
 impl LeaseRefusalPolicy {
+    pub(crate) fn new(
+        verify_only: bool,
+        live: std::collections::HashMap<i64, SessionStatus>,
+    ) -> Self {
+        Self { verify_only, live }
+    }
+
+    pub(crate) fn is_verify_only(&self) -> bool {
+        self.verify_only
+    }
+
+    /// The derived status of a live holder; `None` once it is not live.
+    pub(crate) fn status_of(&self, session_id: i64) -> Option<SessionStatus> {
+        self.live.get(&session_id).copied()
+    }
+
     /// Only an explicit lease held by a session that is actively working may
     /// refuse, and never under verify-only. Implicit leases are telemetry
     /// derived from edits; stale, exited and closed holders are not working.

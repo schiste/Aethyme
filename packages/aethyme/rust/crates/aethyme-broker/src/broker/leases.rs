@@ -594,24 +594,14 @@ impl Broker {
             if !coordinating.contains(&session.id) {
                 continue;
             }
-            let Ok(checkout) = GitRepo::discover(Path::new(&session.worktree_path)) else {
+            let Some(paths) = implicit_lease_paths(
+                &session,
+                &rules,
+                integration.as_deref(),
+                upstream.as_deref(),
+            ) else {
                 continue;
             };
-            // #41: derive the baseline instead of trusting the stored
-            // adoption-time diff_base — after a conflict-rebase the stored
-            // value inflates the diff with everyone else's promoted work.
-            let base = integration
-                .as_ref()
-                .and_then(|tip| crate::merge::session_baseline(&checkout, tip, upstream.as_deref()))
-                .or_else(|| session.diff_base.clone())
-                .unwrap_or_else(|| "HEAD".to_string());
-            let Ok(changed) = checkout.changed_files(&base) else {
-                continue;
-            };
-            let paths: Vec<String> = changed
-                .into_iter()
-                .filter(|path| !rules.is_ignored(path))
-                .collect();
             self.store.set_implicit_leases(session.id, &paths)?;
         }
 
@@ -736,7 +726,7 @@ impl Broker {
         for session_id in self.sessions_released_by_grace()? {
             live.remove(&session_id);
         }
-        Ok(LeaseRefusalPolicy { verify_only, live })
+        Ok(LeaseRefusalPolicy::new(verify_only, live))
     }
 
     /// Record, once per holder, that a live session's holder process is
@@ -1208,28 +1198,211 @@ impl Broker {
         self.audit_paths(session_id, &base, &head, changed, true, true)
     }
 
+    /// [`Self::audit_submit_ownership`] without writing anything: the leases
+    /// are the ones its refresh would set, held in memory, and overlapping
+    /// pairs are classified without the shared cache. For building a
+    /// candidate for inspection (#663). Session liveness is read as a
+    /// snapshot, so a session `agents` would abandon on this call still
+    /// counts as live here.
+    pub(crate) fn audit_submit_ownership_read_only(
+        &self,
+        session_id: i64,
+    ) -> Result<OwnershipAuditReport, BrokerOpError> {
+        use crate::leases::detect_overlaps;
+
+        let session = self.store.session(session_id)?;
+        let checkout = GitRepo::discover(Path::new(&session.worktree_path))?;
+        let head = checkout.head_commit()?;
+        let integration = self.integration_tip();
+        let upstream = self.repo.upstream_default().map(|(_, commit)| commit);
+        let base = integration
+            .as_deref()
+            .and_then(|tip| crate::merge::session_baseline(&checkout, tip, upstream.as_deref()))
+            .or(session.diff_base.clone())
+            .unwrap_or_else(|| "HEAD".to_string());
+        let leases = self.leases_as_refreshed(session_id)?;
+        let changed = self.repo.changed_between(&base, &head)?;
+        let mut audit = self.audit_ownership_paths(session_id, &changed, &leases, true)?;
+        if !audit.conflicting.is_empty() {
+            let policy = self.lease_refusal_policy_snapshot()?;
+            let holders: std::collections::BTreeSet<i64> = audit
+                .conflicting
+                .iter()
+                .map(|blocker| blocker.session_id)
+                .chain(std::iter::once(session_id))
+                .collect();
+            let own: Vec<crate::Overlap> = detect_overlaps(
+                &leases
+                    .iter()
+                    .filter(|lease| holders.contains(&lease.session_id))
+                    .cloned()
+                    .collect::<Vec<_>>(),
+            )
+            .into_iter()
+            .filter(|overlap| overlap.session_a == session_id || overlap.session_b == session_id)
+            .collect();
+            let pairs = self.classify_overlaps_now(&own)?;
+            let pair_with = |holder: i64| {
+                let key = (session_id.min(holder), session_id.max(holder));
+                pairs
+                    .iter()
+                    .find(|pair| (pair.session_a, pair.session_b) == key)
+                    .cloned()
+            };
+            audit.judge_on_conflicts(session_id, &policy, pair_with);
+        }
+        Ok(audit.into_report(session_id, &base, &head, changed))
+    }
+
+    /// The active leases as [`Self::refresh_leases_including`] with `acting`
+    /// would leave them, computed without writing: each coordinating
+    /// session's implicit leases are replaced by the paths it changed now.
+    pub(crate) fn leases_as_refreshed(
+        &self,
+        acting: i64,
+    ) -> Result<Vec<crate::types::Lease>, BrokerOpError> {
+        use crate::leases::LeaseIgnoreRules;
+
+        let rules = LeaseIgnoreRules::load(&self.main_root);
+        let integration = self.integration_tip();
+        let upstream = self.repo.upstream_default().map(|(_, commit)| commit);
+        let mut coordinating = self.coordinating_session_ids()?;
+        coordinating.insert(acting);
+        let mut refreshed = std::collections::BTreeMap::new();
+        for session in self.store.live_sessions()? {
+            if !coordinating.contains(&session.id) {
+                continue;
+            }
+            if let Some(paths) = implicit_lease_paths(
+                &session,
+                &rules,
+                integration.as_deref(),
+                upstream.as_deref(),
+            ) {
+                refreshed.insert(session.id, paths);
+            }
+        }
+        let now = now_ms();
+        let mut leases: Vec<crate::types::Lease> = self
+            .store
+            .active_leases()?
+            .into_iter()
+            .filter(|lease| {
+                !(lease.kind == LeaseKind::Implicit && refreshed.contains_key(&lease.session_id))
+            })
+            .collect();
+        for (session_id, paths) in refreshed {
+            leases.extend(paths.into_iter().map(|path| crate::types::Lease {
+                id: 0,
+                session_id,
+                path,
+                kind: LeaseKind::Implicit,
+                created_at: now,
+                expires_at: None,
+                released_at: None,
+            }));
+        }
+        Ok(leases)
+    }
+
+    /// [`Self::lease_refusal_policy`] from a liveness snapshot, persisting no
+    /// status transition.
+    pub(crate) fn lease_refusal_policy_snapshot(
+        &self,
+    ) -> Result<LeaseRefusalPolicy, BrokerOpError> {
+        let mut live = self
+            .agents_snapshot(crate::clock::epoch_ms())?
+            .into_iter()
+            .filter(|agent| {
+                matches!(
+                    agent.derived_status,
+                    SessionStatus::Active | SessionStatus::Idle
+                )
+            })
+            .map(|agent| (agent.session.id, agent.derived_status))
+            .collect::<std::collections::HashMap<_, _>>();
+        for session_id in self.sessions_released_by_grace()? {
+            live.remove(&session_id);
+        }
+        Ok(LeaseRefusalPolicy::new(
+            LeaseRefusalPolicy::verify_only_at(&self.main_root),
+            live,
+        ))
+    }
+
     pub(super) fn audit_paths(
         &mut self,
         session_id: i64,
         base: &str,
         head: &str,
-        mut changed: Vec<String>,
+        changed: Vec<String>,
         allow_implicit: bool,
         // Submit only: another session's lease blocks when the shared
         // `LeaseRefusalPolicy` allows it AND the two sessions' edits conflict.
         // Guarded exec applies the policy alone, like a lease claim.
         block_only_on_conflicts: bool,
     ) -> Result<OwnershipAuditReport, BrokerOpError> {
+        let leases = self.store.active_leases()?;
+        let mut audit =
+            self.audit_ownership_paths(session_id, &changed, &leases, allow_implicit)?;
+        if !audit.conflicting.is_empty() {
+            let policy = self.lease_refusal_policy()?;
+            if block_only_on_conflicts {
+                // A lease refresh pairs only sessions still working, so a stale
+                // holder's pair with this session may never have been classified.
+                // Classify just this session's pairs with its blockers: bounded by
+                // the blockers, and the verdict tells the agent whether the stale
+                // work it overlaps would actually conflict.
+                let holders: std::collections::BTreeSet<i64> = audit
+                    .conflicting
+                    .iter()
+                    .map(|blocker| blocker.session_id)
+                    .chain(std::iter::once(session_id))
+                    .collect();
+                let own: Vec<crate::Overlap> = crate::detect_overlaps(
+                    &leases
+                        .iter()
+                        .filter(|lease| holders.contains(&lease.session_id))
+                        .cloned()
+                        .collect::<Vec<_>>(),
+                )
+                .into_iter()
+                .filter(|overlap| {
+                    overlap.session_a == session_id || overlap.session_b == session_id
+                })
+                .collect();
+                self.classify_overlap_subset(&own)?;
+                let overlaps = crate::detect_overlaps(&leases);
+                audit.judge_on_conflicts(session_id, &policy, |holder| {
+                    self.overlap_pair_between(&overlaps, session_id, holder)
+                });
+            } else {
+                // Guarded exec: the same rule as a claim. Leases of stale or idle
+                // holders, and every lease under verify-only, are reported only.
+                audit.judge_by_policy(session_id, &policy);
+            }
+        }
+        Ok(audit.into_report(session_id, base, head, changed))
+    }
+
+    /// The path checks of an ownership audit against `leases`. Another
+    /// session's overlapping explicit lease is collected in `conflicting`
+    /// for the caller to judge.
+    fn audit_ownership_paths(
+        &self,
+        session_id: i64,
+        changed: &[String],
+        leases: &[crate::types::Lease],
+        allow_implicit: bool,
+    ) -> Result<PathAudit, BrokerOpError> {
         use crate::leases::{LeaseIgnoreRules, paths_overlap};
 
+        let mut changed = changed.to_vec();
         changed.sort();
         changed.dedup();
         let rules = LeaseIgnoreRules::load(&self.main_root);
-        let leases = self.store.active_leases()?;
         let foreign = self.store.session_foreign_files(session_id)?;
-        let mut missing_lease_paths = Vec::new();
-        let mut conflicting_leases = Vec::new();
-        let mut foreign_paths = Vec::new();
+        let mut audit = PathAudit::default();
 
         for path in changed.iter().filter(|path| !rules.is_ignored(path)) {
             let owns = leases.iter().any(|lease| {
@@ -1238,7 +1411,7 @@ impl Broker {
                     && paths_overlap(&lease.path, path)
             });
             if !owns {
-                missing_lease_paths.push(path.clone());
+                audit.missing.push(path.clone());
             }
 
             for blocker in leases
@@ -1247,7 +1420,7 @@ impl Broker {
                 .filter(|lease| lease.kind == LeaseKind::Explicit)
                 .filter(|lease| paths_overlap(&lease.path, path))
             {
-                conflicting_leases.push(LeaseBlocker {
+                audit.conflicting.push(LeaseBlocker {
                     session_id: blocker.session_id,
                     path: blocker.path.clone(),
                     kind: blocker.kind,
@@ -1268,127 +1441,21 @@ impl Broker {
                     .iter()
                     .any(|foreign_path| paths_overlap(foreign_path, path))
             {
-                foreign_paths.push(path.clone());
+                audit.foreign.push(path.clone());
             }
         }
 
-        conflicting_leases.sort_by(|a, b| {
+        audit.conflicting.sort_by(|a, b| {
             (a.session_id, a.path.as_str(), a.kind.as_str()).cmp(&(
                 b.session_id,
                 b.path.as_str(),
                 b.kind.as_str(),
             ))
         });
-        conflicting_leases
+        audit
+            .conflicting
             .dedup_by(|a, b| a.session_id == b.session_id && a.path == b.path && a.kind == b.kind);
-        let mut warned_leases = Vec::new();
-        // Under verify-only a submit promotes nothing: each session delivers
-        // through its own pull request, so a conflict is resolved when one of
-        // them merges, and refusing here only stalls an agent. The overlap is
-        // still reported, with how to coordinate. `auto` and `manual` keep
-        // the block because they promote onto a shared integration branch.
-        let policy = if conflicting_leases.is_empty() {
-            None
-        } else {
-            Some(self.lease_refusal_policy()?)
-        };
-        if let (Some(policy), false) = (policy.as_ref(), block_only_on_conflicts) {
-            // Guarded exec: the same rule as a claim. Leases of stale or idle
-            // holders, and every lease under verify-only, are reported only.
-            let (block, warn): (Vec<_>, Vec<_>) = conflicting_leases
-                .into_iter()
-                .map(|mut blocker| {
-                    let blocks = policy.may_block(&blocker);
-                    blocker.reason = Some(if blocks {
-                        "explicitly claimed by a session that is actively working".into()
-                    } else {
-                        policy.non_blocking_reason(session_id, &blocker)
-                    });
-                    (blocker, blocks)
-                })
-                .partition(|(_, blocks)| *blocks);
-            conflicting_leases = block.into_iter().map(|(blocker, _)| blocker).collect();
-            warned_leases = warn.into_iter().map(|(blocker, _)| blocker).collect();
-        }
-        if let (Some(policy), true) = (policy.as_ref(), block_only_on_conflicts) {
-            let verify_only = policy.verify_only;
-            // A lease refresh pairs only sessions still working, so a stale
-            // holder's pair with this session may never have been classified.
-            // Classify just this session's pairs with its blockers: bounded by
-            // the blockers, and the verdict tells the agent whether the stale
-            // work it overlaps would actually conflict.
-            let holders: std::collections::BTreeSet<i64> = conflicting_leases
-                .iter()
-                .map(|blocker| blocker.session_id)
-                .chain(std::iter::once(session_id))
-                .collect();
-            let own: Vec<crate::Overlap> = crate::detect_overlaps(
-                &leases
-                    .iter()
-                    .filter(|lease| holders.contains(&lease.session_id))
-                    .cloned()
-                    .collect::<Vec<_>>(),
-            )
-            .into_iter()
-            .filter(|overlap| overlap.session_a == session_id || overlap.session_b == session_id)
-            .collect();
-            self.classify_overlap_subset(&own)?;
-            let overlaps = crate::detect_overlaps(&leases);
-            let (block, warn): (Vec<_>, Vec<_>) = conflicting_leases
-                .into_iter()
-                .map(|mut blocker| {
-                    let pair = self.overlap_pair_between(&overlaps, session_id, blocker.session_id);
-                    let conflicting = pair.as_ref().is_some_and(|pair| {
-                        pair.conflicting_paths
-                            .iter()
-                            .any(|path| paths_overlap(&blocker.path, path))
-                    });
-                    blocker.severity = Some(
-                        if conflicting { "high" } else { "low" }.to_string(),
-                    );
-                    let holder_active =
-                        policy.live.get(&blocker.session_id) == Some(&SessionStatus::Active);
-                    blocker.reason = Some(match (conflicting, holder_active) {
-                        (true, true) if verify_only => format!(
-                            "the holder is actively working and Git reports a conflict with this \
-                             session's edits; this repository delivers through pull requests \
-                             (verify-only), so the conflict is resolved when one of them merges. \
-                             Coordinate: aethyme broker advanced note send --session {session_id} \
-                             --to-session {} --message \"<who lands the shared change first>\", \
-                             or follow the shared-edit advice in aethyme broker status",
-                            blocker.session_id
-                        ),
-                        (true, true) => "the holder is actively working and Git reports a conflict with this session's edits".into(),
-                        (true, false) => "Git reports a conflict, but the holder is not actively working".into(),
-                        (false, _) => pair
-                            .map(|pair| pair.reason)
-                            .unwrap_or_else(|| "the holder has not edited this path".into()),
-                    });
-                    let blocks = conflicting && policy.may_block(&blocker);
-                    (blocker, blocks)
-                })
-                .partition(|(_, blocks)| *blocks);
-            conflicting_leases = block.into_iter().map(|(blocker, _)| blocker).collect();
-            warned_leases = warn.into_iter().map(|(blocker, _)| blocker).collect();
-        }
-        missing_lease_paths.sort();
-        missing_lease_paths.dedup();
-        foreign_paths.sort();
-        foreign_paths.dedup();
-        let ok = missing_lease_paths.is_empty()
-            && conflicting_leases.is_empty()
-            && foreign_paths.is_empty();
-        Ok(OwnershipAuditReport {
-            session_id,
-            base_commit: base.to_string(),
-            head_commit: head.to_string(),
-            changed_paths: changed,
-            missing_lease_paths,
-            conflicting_leases,
-            warned_leases,
-            foreign_paths,
-            ok,
-        })
+        Ok(audit)
     }
 
     pub(super) fn lease_blockers(
@@ -1577,5 +1644,133 @@ impl Broker {
             )?;
         }
         Ok(report)
+    }
+}
+
+/// The paths a lease refresh records as `session`'s implicit leases, or
+/// `None` where the refresh leaves them as they are.
+fn implicit_lease_paths(
+    session: &crate::types::Session,
+    rules: &crate::leases::LeaseIgnoreRules,
+    integration: Option<&str>,
+    upstream: Option<&str>,
+) -> Option<Vec<String>> {
+    let checkout = GitRepo::discover(Path::new(&session.worktree_path)).ok()?;
+    // #41: derive the baseline instead of trusting the stored
+    // adoption-time diff_base — after a conflict-rebase the stored
+    // value inflates the diff with everyone else's promoted work.
+    let base = integration
+        .and_then(|tip| crate::merge::session_baseline(&checkout, tip, upstream))
+        .or_else(|| session.diff_base.clone())
+        .unwrap_or_else(|| "HEAD".to_string());
+    let changed = checkout.changed_files(&base).ok()?;
+    Some(
+        changed
+            .into_iter()
+            .filter(|path| !rules.is_ignored(path))
+            .collect(),
+    )
+}
+
+/// An ownership audit between its path checks and its verdict.
+#[derive(Default)]
+struct PathAudit {
+    missing: Vec<String>,
+    conflicting: Vec<LeaseBlocker>,
+    warned: Vec<LeaseBlocker>,
+    foreign: Vec<String>,
+}
+
+impl PathAudit {
+    /// Guarded exec: the policy alone decides, as for a lease claim.
+    fn judge_by_policy(&mut self, session_id: i64, policy: &LeaseRefusalPolicy) {
+        let (block, warn): (Vec<_>, Vec<_>) = std::mem::take(&mut self.conflicting)
+            .into_iter()
+            .map(|mut blocker| {
+                let blocks = policy.may_block(&blocker);
+                blocker.reason = Some(if blocks {
+                    "explicitly claimed by a session that is actively working".into()
+                } else {
+                    policy.non_blocking_reason(session_id, &blocker)
+                });
+                (blocker, blocks)
+            })
+            .partition(|(_, blocks)| *blocks);
+        self.conflicting = block.into_iter().map(|(blocker, _)| blocker).collect();
+        self.warned = warn.into_iter().map(|(blocker, _)| blocker).collect();
+    }
+
+    /// Submit: a lease blocks only when the policy allows it and Git reports
+    /// a conflict between the two sessions' edits on it. `pair_with` gives
+    /// the classified pair of this session with a holder.
+    fn judge_on_conflicts(
+        &mut self,
+        session_id: i64,
+        policy: &LeaseRefusalPolicy,
+        pair_with: impl Fn(i64) -> Option<crate::OverlapPair>,
+    ) {
+        use crate::leases::paths_overlap;
+
+        let verify_only = policy.is_verify_only();
+        let (block, warn): (Vec<_>, Vec<_>) = std::mem::take(&mut self.conflicting)
+            .into_iter()
+            .map(|mut blocker| {
+                let pair = pair_with(blocker.session_id);
+                let conflicting = pair.as_ref().is_some_and(|pair| {
+                    pair.conflicting_paths
+                        .iter()
+                        .any(|path| paths_overlap(&blocker.path, path))
+                });
+                blocker.severity = Some(if conflicting { "high" } else { "low" }.to_string());
+                let holder_active = policy.status_of(blocker.session_id) == Some(SessionStatus::Active);
+                blocker.reason = Some(match (conflicting, holder_active) {
+                    (true, true) if verify_only => format!(
+                        "the holder is actively working and Git reports a conflict with this \
+                         session's edits; this repository delivers through pull requests \
+                         (verify-only), so the conflict is resolved when one of them merges. \
+                         Coordinate: aethyme broker advanced note send --session {session_id} \
+                         --to-session {} --message \"<who lands the shared change first>\", \
+                         or follow the shared-edit advice in aethyme broker status",
+                        blocker.session_id
+                    ),
+                    (true, true) => "the holder is actively working and Git reports a conflict with this session's edits".into(),
+                    (true, false) => "Git reports a conflict, but the holder is not actively working".into(),
+                    (false, _) => pair
+                        .map(|pair| pair.reason)
+                        .unwrap_or_else(|| "the holder has not edited this path".into()),
+                });
+                let blocks = conflicting && policy.may_block(&blocker);
+                (blocker, blocks)
+            })
+            .partition(|(_, blocks)| *blocks);
+        self.conflicting = block.into_iter().map(|(blocker, _)| blocker).collect();
+        self.warned = warn.into_iter().map(|(blocker, _)| blocker).collect();
+    }
+
+    fn into_report(
+        mut self,
+        session_id: i64,
+        base: &str,
+        head: &str,
+        mut changed: Vec<String>,
+    ) -> OwnershipAuditReport {
+        changed.sort();
+        changed.dedup();
+        self.missing.sort();
+        self.missing.dedup();
+        self.foreign.sort();
+        self.foreign.dedup();
+        let ok = self.missing.is_empty() && self.conflicting.is_empty() && self.foreign.is_empty();
+        OwnershipAuditReport {
+            session_id,
+            base_commit: base.to_string(),
+            head_commit: head.to_string(),
+            changed_paths: changed,
+            missing_lease_paths: self.missing,
+            conflicting_leases: self.conflicting,
+            warned_leases: self.warned,
+            foreign_paths: self.foreign,
+            ok,
+        }
     }
 }

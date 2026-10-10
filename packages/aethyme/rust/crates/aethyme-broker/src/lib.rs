@@ -38,6 +38,7 @@ pub mod collaboration_archive;
 pub mod collaboration_capture;
 pub mod collaboration_gc;
 pub mod collaboration_state;
+pub mod composition;
 mod disk_headroom;
 mod duplicate_work;
 pub mod exit_status;
