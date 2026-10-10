@@ -43,6 +43,9 @@ noyalib = { workspace = true }
 toml = { workspace = true }
 # Gate trigger globs (gates.toml). Same matcher family ripgrep uses.
 globset = { workspace = true }
+# Folding paths the way case- and normalization-insensitive file systems
+# do, so a protected path cannot be written under another spelling (#665).
+unicode-normalization = { workspace = true }
 # killpg for gate-run cancellation (the external `kill` utility parses
 # negative pgids as options on Linux).
 libc = { workspace = true }

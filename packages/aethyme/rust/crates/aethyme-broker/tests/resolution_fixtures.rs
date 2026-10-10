@@ -1,13 +1,15 @@
 //! #665: candidate manifests, bounded resolution requests and the checks on
 //! a resolver's proposal, against the provisional fixtures (#733).
 //!
-//! Fixture runs use only the fixtures' composer-facing API, as
-//! `composer_fixtures` does. The independent check of a candidate is the
-//! fixtures' public `judge`: a candidate it rejects is what trusted checks
-//! failing on a complete candidate looks like (plan §7.3 step 6), and that
-//! failure, not the composer, raises the resolution request. Nothing here
-//! reads the answer key or branches on a case or scenario id. The fake
-//! resolvers are test doubles; none ships.
+//! Fixture runs use the fixtures' composer-facing API, as `composer_fixtures`
+//! does, and never branch on a case or scenario id. One thing here does read
+//! the answer key: the stand-in for the gates. `check` asks the fixtures'
+//! oracle (`judge`) whether a candidate passes, because there are no real
+//! gates in a unit fixture. So the scenarios this adds to the composer's
+//! count measure the plumbing (a failing candidate becomes a request), not
+//! the system. Only an opaque check id and pass/fail leave `check`; the
+//! oracle's messages never reach a request or a resolver, and a test holds
+//! that. The fake resolvers are test doubles; none ships.
 
 use std::cell::Cell;
 use std::path::{Path, PathBuf};
@@ -24,7 +26,7 @@ use aethyme_broker::collaboration_state::{
 use aethyme_broker::composer::{
     self, Composition, CompositionBudget, CompositionRequest, ContributionSpec, Subtraction,
 };
-use aethyme_broker::composition::{CompositionMode, CompositionOutcome};
+use aethyme_broker::composition::{CompositionMode, CompositionOutcome, Producer};
 use aethyme_broker::resolution::{
     self, FailedCheck, MAX_SYNTHESIS_ATTEMPTS, Preference, Proposal, ProposedFile, RequirementRef,
     Resolution, ResolutionFailure, ResolutionInputs, ResolutionOutcome, ResolutionRequest,
@@ -171,17 +173,20 @@ fn reconstruct(
     dir
 }
 
-/// The independent check of one candidate, as failed checks.
-fn check(case: &CaseInput, scenario: &str, dir: &Path) -> Vec<FailedCheck> {
+/// The stand-in for the gates on one candidate: an opaque failed check
+/// when the oracle rejects it. The oracle's own messages are returned
+/// separately, only so a test can prove they never reach a request.
+fn check(case: &CaseInput, scenario: &str, dir: &Path) -> (Vec<FailedCheck>, Vec<String>) {
     let verdict = fx::judge(case, scenario, Observed::Candidate(dir));
-    verdict
-        .failures
-        .into_iter()
-        .map(|detail| FailedCheck {
+    if verdict.accepted {
+        return (Vec::new(), Vec::new());
+    }
+    (
+        vec![FailedCheck {
             check: "independent-behavior".into(),
-            detail,
-        })
-        .collect()
+        }],
+        verdict.failures,
+    )
 }
 
 fn requirements() -> Vec<RequirementRef> {
@@ -205,7 +210,7 @@ fn pipeline(
     let (observed, raised) = match &candidate {
         Some(candidate) => {
             let dir = reconstruct(world, &candidate.subject);
-            let failures = check(case, &input.id, &dir);
+            let (failures, hidden) = check(case, &input.id, &dir);
             if failures.is_empty() {
                 (Ok(dir), None)
             } else {
@@ -219,6 +224,12 @@ fn pipeline(
                     None,
                 )
                 .unwrap();
+                // The oracle's messages are not in the request.
+                let record = resolution::read_record(&world.store, raised.record()).unwrap();
+                let bytes = String::from_utf8(record.canonical_bytes()).unwrap();
+                for message in &hidden {
+                    assert!(!bytes.contains(message.as_str()), "{message}");
+                }
                 (Err(Outcome::ResolutionRequired), Some(raised))
             }
         }
@@ -294,8 +305,8 @@ fn judge(case: &CaseInput, input: &ScenarioInput) -> (fx::Verdict, Vec<String>) 
                     (Err(outcome), Some(request)) => format!(
                         "{} (group of {}, scope {:?})",
                         outcome.as_str(),
-                        request.group.members.len(),
-                        request.scope
+                        request.members().len(),
+                        request.scope()
                     ),
                     (Err(outcome), None) => outcome.as_str().to_string(),
                 }
@@ -420,8 +431,8 @@ impl Resolver for RenamePropagator {
         inputs: &ResolutionInputs<'_>,
     ) -> Result<Response, String> {
         let mut renames = Vec::new();
-        for member in &request.group.members {
-            for path in &request.scope {
+        for member in request.members() {
+            for path in request.scope() {
                 let read = |snapshot| {
                     inputs
                         .read(snapshot, path)
@@ -443,8 +454,11 @@ impl Resolver for RenamePropagator {
             brief: Some("propagate renamed element ids to their references".into()),
             ..Proposal::default()
         };
-        for path in &request.scope {
-            let Some(file) = inputs.read(&request.accumulator.snapshot_id, path).unwrap() else {
+        for path in request.scope() {
+            let Some(file) = inputs
+                .read(&request.accumulator().snapshot_id, path)
+                .unwrap()
+            else {
                 continue;
             };
             let mut text = String::from_utf8(file.bytes.clone()).unwrap();
@@ -538,14 +552,14 @@ fn failure(resolution: &Resolution) -> Option<ResolutionFailure> {
 fn a_failed_check_raises_an_exact_scoped_request() {
     let (case, input) = failing_interaction(fx::cases()).expect("a failing interaction");
     let (world, request) = raise(&case, &input);
-    let Trigger::FailedChecks { candidate, checks } = &request.trigger else {
+    let Trigger::FailedChecks { candidate, checks } = request.trigger() else {
         panic!("raised by failed checks");
     };
     assert!(!checks.is_empty());
-    assert_eq!(*candidate, request.accumulator.snapshot_id);
+    assert_eq!(*candidate, request.accumulator().snapshot_id);
     // Every member is the retained contribution, read from the archive.
-    assert_eq!(request.group.members.len(), input.request.compose.len());
-    for member in &request.group.members {
+    assert_eq!(request.members().len(), input.request.compose.len());
+    for member in request.members() {
         let lineage = world
             .catalog
             .iter()
@@ -565,12 +579,12 @@ fn a_failed_check_raises_an_exact_scoped_request() {
         .iter()
         .flat_map(|(_, base, result)| changed(&world.repo, base, result))
         .collect();
-    assert_eq!(request.scope, touched.into_iter().collect::<Vec<_>>());
-    assert_eq!(request.allowance.limit, MAX_SYNTHESIS_ATTEMPTS);
-    assert_eq!(request.allowance.used, 0);
-    assert_eq!(request.baseline.commit, world.baseline);
-    assert!(request.protected.iter().any(|p| p == ".aethyme/"));
-    resolution::read_record(&world.store, &request.record).unwrap();
+    assert_eq!(request.scope(), touched.into_iter().collect::<Vec<_>>());
+    assert_eq!(request.allowance().limit, MAX_SYNTHESIS_ATTEMPTS);
+    assert_eq!(request.allowance().used, 0);
+    assert_eq!(request.baseline().commit, world.baseline);
+    assert!(request.protected().iter().any(|p| p == "dir:.aethyme"));
+    resolution::read_record(&world.store, request.record()).unwrap();
 }
 
 fn changed(repo: &Path, base: &str, result: &str) -> Vec<String> {
@@ -587,7 +601,7 @@ fn a_correct_proposal_becomes_a_new_candidate_that_passes_its_checks() {
     let resolution = resolution::resolve(
         &mut world.store,
         &world.repo,
-        &request,
+        request.record(),
         &mut RenamePropagator,
     )
     .unwrap();
@@ -596,11 +610,14 @@ fn a_correct_proposal_becomes_a_new_candidate_that_passes_its_checks() {
     };
     assert_eq!(resolution.attempt, Some(1));
     assert_eq!(resolution.allowance.used, 1);
-    assert!(synthesized.requires_verification);
+    assert!(matches!(
+        synthesized.candidate.producer,
+        Producer::Resolver { .. }
+    ));
     assert_eq!(synthesized.candidate.mode, CompositionMode::Synthesized);
     assert_ne!(
         synthesized.candidate.subject,
-        request.accumulator.snapshot_id
+        request.accumulator().snapshot_id
     );
     assert_eq!(synthesized.candidate.baseline, world.baseline);
     // A new candidate, checked again as itself.
@@ -621,7 +638,7 @@ fn held_out_interactions_are_reported_after_resolution() {
     let resolution = resolution::resolve(
         &mut world.store,
         &world.repo,
-        &request,
+        request.record(),
         &mut RenamePropagator,
     )
     .unwrap();
@@ -688,7 +705,7 @@ fn conflict_request(
 }
 
 fn conflict_path(request: &ResolutionRequest) -> String {
-    let Trigger::Conflict(conflicts) = &request.trigger else {
+    let Trigger::Conflict(conflicts) = request.trigger() else {
         panic!("raised by a conflict");
     };
     conflicts[0].path.clone()
@@ -696,7 +713,7 @@ fn conflict_path(request: &ResolutionRequest) -> String {
 
 /// The conflicting step's own version of the conflicting path.
 fn theirs(request: &ResolutionRequest, inputs: &ResolutionInputs<'_>) -> ProposedFile {
-    let member = request.group.members.last().unwrap();
+    let member = request.members().last().unwrap();
     inputs
         .read(&member.result, &conflict_path(request))
         .unwrap()
@@ -709,17 +726,18 @@ fn without_a_preference_a_contradiction_stays_unresolved() {
 
     // The resolver itself declines.
     let (mut world, request) = conflict_request(&case, &input, None);
-    assert!(request.preference.is_none());
-    assert_eq!(
-        request.group.members.len(),
-        2,
-        "both writers are in the group"
-    );
+    assert!(request.preference().is_none());
+    assert_eq!(request.members().len(), 2, "both writers are in the group");
     let (mut declines, _) = fixed("declines", |_, _| {
         Ok(Response::Unresolved("no authorized preference".into()))
     });
-    let resolution =
-        resolution::resolve(&mut world.store, &world.repo, &request, &mut declines).unwrap();
+    let resolution = resolution::resolve(
+        &mut world.store,
+        &world.repo,
+        request.record(),
+        &mut declines,
+    )
+    .unwrap();
     assert_eq!(failure(&resolution), Some(ResolutionFailure::Unresolved));
 
     // A last writer is refused mechanically.
@@ -731,8 +749,13 @@ fn without_a_preference_a_contradiction_stays_unresolved() {
             theirs.kind,
         )))
     });
-    let resolution =
-        resolution::resolve(&mut world.store, &world.repo, &request, &mut last_writer).unwrap();
+    let resolution = resolution::resolve(
+        &mut world.store,
+        &world.repo,
+        request.record(),
+        &mut last_writer,
+    )
+    .unwrap();
     assert_eq!(failure(&resolution), Some(ResolutionFailure::Unresolved));
 
     // So is keeping the first writer by writing nothing for the path.
@@ -740,8 +763,13 @@ fn without_a_preference_a_contradiction_stays_unresolved() {
     let (mut first_writer, _) = fixed("first-writer", |_, _| {
         Ok(Response::Proposal(Proposal::default()))
     });
-    let resolution =
-        resolution::resolve(&mut world.store, &world.repo, &request, &mut first_writer).unwrap();
+    let resolution = resolution::resolve(
+        &mut world.store,
+        &world.repo,
+        request.record(),
+        &mut first_writer,
+    )
+    .unwrap();
     assert_eq!(failure(&resolution), Some(ResolutionFailure::Unresolved));
 
     // An average is new content the guard cannot tell from a resolution:
@@ -749,7 +777,7 @@ fn without_a_preference_a_contradiction_stays_unresolved() {
     let (mut averager, _) = fixed("averager", |request, inputs| {
         let path = conflict_path(request);
         let ours = inputs
-            .read(&request.accumulator.snapshot_id, &path)
+            .read(&request.accumulator().snapshot_id, &path)
             .unwrap()
             .unwrap();
         let theirs = theirs(request, inputs);
@@ -768,12 +796,20 @@ fn without_a_preference_a_contradiction_stays_unresolved() {
         }
         Ok(Response::Proposal(write(&path, &merged, ours.kind)))
     });
-    let resolution =
-        resolution::resolve(&mut world.store, &world.repo, &request, &mut averager).unwrap();
+    let resolution = resolution::resolve(
+        &mut world.store,
+        &world.repo,
+        request.record(),
+        &mut averager,
+    )
+    .unwrap();
     let ResolutionOutcome::Synthesized(synthesized) = &resolution.outcome else {
         panic!("{:?}", resolution.outcome);
     };
-    assert!(synthesized.requires_verification);
+    assert!(matches!(
+        synthesized.candidate.producer,
+        Producer::Resolver { .. }
+    ));
     let dir = reconstruct(&world, &synthesized.candidate.subject);
     assert!(!fx::judge(&case, &input.id, Observed::Candidate(&dir)).accepted);
 }
@@ -782,7 +818,7 @@ fn without_a_preference_a_contradiction_stays_unresolved() {
 fn an_authorized_preference_lets_one_side_win() {
     let (case, input) = contradiction();
     let (_, probe) = conflict_request(&case, &input, None);
-    let winner = probe.group.members.last().unwrap().id.clone();
+    let winner = probe.members().last().unwrap().id.clone();
     let (mut world, request) = conflict_request(
         &case,
         &input,
@@ -799,8 +835,13 @@ fn an_authorized_preference_lets_one_side_win() {
             theirs.kind,
         )))
     });
-    let resolution =
-        resolution::resolve(&mut world.store, &world.repo, &request, &mut last_writer).unwrap();
+    let resolution = resolution::resolve(
+        &mut world.store,
+        &world.repo,
+        request.record(),
+        &mut last_writer,
+    )
+    .unwrap();
     assert_eq!(resolution.outcome.code(), "synthesized");
 }
 
@@ -814,7 +855,7 @@ fn interaction() -> (CaseInput, ScenarioInput) {
 fn writes_outside_the_scope_are_refused() {
     let (case, input) = interaction();
     let (world, request) = raise(&case, &input);
-    let scoped = request.scope[0].clone();
+    let scoped = request.scope()[0].clone();
     let attacks: Vec<(&str, Proposal)> = vec![
         ("outside", write("README.md", b"x\n", EntryKind::Regular)),
         (
@@ -844,8 +885,13 @@ fn writes_outside_the_scope_are_refused() {
         let (mut attacker, _) = fixed("attacker", move |_, _| {
             Ok(Response::Proposal(proposal.clone()))
         });
-        let resolution =
-            resolution::resolve(&mut world.store, &world.repo, &request, &mut attacker).unwrap();
+        let resolution = resolution::resolve(
+            &mut world.store,
+            &world.repo,
+            request.record(),
+            &mut attacker,
+        )
+        .unwrap();
         assert_eq!(
             failure(&resolution),
             Some(ResolutionFailure::ScopeViolation),
@@ -865,7 +911,7 @@ fn writes_outside_the_scope_are_refused() {
         &world2.repo,
         &composition_request,
         &composition,
-        &check(&case, &input.id, &dir),
+        &check(&case, &input.id, &dir).0,
         &[RequirementRef {
             id: "harness".into(),
             path: Some(scoped.clone()),
@@ -880,8 +926,13 @@ fn writes_outside_the_scope_are_refused() {
             EntryKind::Regular,
         )))
     });
-    let resolution =
-        resolution::resolve(&mut world2.store, &world2.repo, &harnessed, &mut attacker).unwrap();
+    let resolution = resolution::resolve(
+        &mut world2.store,
+        &world2.repo,
+        harnessed.record(),
+        &mut attacker,
+    )
+    .unwrap();
     assert_eq!(
         failure(&resolution),
         Some(ResolutionFailure::ScopeViolation)
@@ -894,10 +945,10 @@ fn reads_outside_the_request_are_refused() {
     let (case, input) = interaction();
     let (mut world, request) = raise(&case, &input);
     let (mut reader, _) = fixed("reader", |request, inputs| {
-        let snapshot = &request.accumulator.snapshot_id;
+        let snapshot = &request.accumulator().snapshot_id;
         let error = inputs.read(snapshot, "README.md").unwrap_err();
         assert_eq!(error.code(), "out_of_scope_read");
-        let path = &request.scope[0];
+        let path = &request.scope()[0];
         let foreign = aethyme_contracts::experimental_v0::SourceSnapshotId::parse(
             "sha256:0000000000000000000000000000000000000000000000000000000000000000",
         )
@@ -909,7 +960,7 @@ fn reads_outside_the_request_are_refused() {
         Ok(Response::Inconclusive("probed".into()))
     });
     let resolution =
-        resolution::resolve(&mut world.store, &world.repo, &request, &mut reader).unwrap();
+        resolution::resolve(&mut world.store, &world.repo, request.record(), &mut reader).unwrap();
     assert_eq!(failure(&resolution), Some(ResolutionFailure::Inconclusive));
 }
 
@@ -918,7 +969,8 @@ fn the_allowance_is_spent_once_per_group_and_never_replenished() {
     let (case, input) = interaction();
     let (mut world, request) = raise(&case, &input);
     let (mut flaky, calls) = fixed("flaky", |_, _| Err("resolver host unreachable".into()));
-    let first = resolution::resolve(&mut world.store, &world.repo, &request, &mut flaky).unwrap();
+    let first =
+        resolution::resolve(&mut world.store, &world.repo, request.record(), &mut flaky).unwrap();
     assert_eq!(
         failure(&first),
         Some(ResolutionFailure::InfrastructureDeferred)
@@ -926,12 +978,18 @@ fn the_allowance_is_spent_once_per_group_and_never_replenished() {
     let (mut declines, _) = fixed("another-resolver", |_, _| {
         Ok(Response::Unresolved("no".into()))
     });
-    let second =
-        resolution::resolve(&mut world.store, &world.repo, &request, &mut declines).unwrap();
+    let second = resolution::resolve(
+        &mut world.store,
+        &world.repo,
+        request.record(),
+        &mut declines,
+    )
+    .unwrap();
     assert_eq!(second.allowance.used, MAX_SYNTHESIS_ATTEMPTS);
 
     // A third attempt is refused before dispatch.
-    let third = resolution::resolve(&mut world.store, &world.repo, &request, &mut flaky).unwrap();
+    let third =
+        resolution::resolve(&mut world.store, &world.repo, request.record(), &mut flaky).unwrap();
     assert_eq!(failure(&third), Some(ResolutionFailure::BudgetExhausted));
     assert_eq!(third.attempt, None);
     assert_eq!(
@@ -980,16 +1038,21 @@ fn the_allowance_is_spent_once_per_group_and_never_replenished() {
         &world.repo,
         &again,
         &composition,
-        &check(&case, &input.id, &dir),
+        &check(&case, &input.id, &dir).0,
         &requirements(),
         None,
     )
     .unwrap();
-    assert_ne!(retry.record.id, request.record.id);
-    assert_eq!(retry.group.key, request.group.key);
-    assert_eq!(retry.allowance.remaining(), 0);
-    let refused =
-        resolution::resolve(&mut world.store, &world.repo, &retry, &mut RenamePropagator).unwrap();
+    assert_ne!(retry.record().id, request.record().id);
+    assert_eq!(retry.decision_key(), request.decision_key());
+    assert_eq!(retry.allowance().remaining(), 0);
+    let refused = resolution::resolve(
+        &mut world.store,
+        &world.repo,
+        retry.record(),
+        &mut RenamePropagator,
+    )
+    .unwrap();
     assert_eq!(failure(&refused), Some(ResolutionFailure::BudgetExhausted));
 }
 
@@ -1040,7 +1103,7 @@ fn a_synthesized_result_without_one_constituent_is_recomposed_never_relabelled()
     let resolution = resolution::resolve(
         &mut world.store,
         &world.repo,
-        &request,
+        request.record(),
         &mut RenamePropagator,
     )
     .unwrap();
@@ -1054,7 +1117,7 @@ fn a_synthesized_result_without_one_constituent_is_recomposed_never_relabelled()
         world.baseline.as_str(),
         x.candidate.commit.as_str(),
     );
-    let constituents: Vec<String> = request.group.members.iter().map(|m| m.id.clone()).collect();
+    let constituents: Vec<String> = request.members().iter().map(|m| m.id.clone()).collect();
     let mut catalog = world.catalog.clone();
     catalog.push(ContributionSpec {
         id: "x".into(),
