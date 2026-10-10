@@ -27,6 +27,7 @@ aethyme-contracts = { path = "../aethyme-contracts" }
 aethyme-engine = { path = "../aethyme-engine" }
 aethyme-enhance = { path = "../aethyme-enhance" }
 aethyme-graph-indexer = { path = "../aethyme-graph-indexer" }
+aethyme-graph-schema = { path = "../aethyme-graph-schema" }
 aethyme-graph-storage = { path = "../aethyme-graph-storage" }
 # Bundled SQLite so the broker has zero system dependencies and one
 # known SQLite version across platforms (macOS/Linux are the v0 targets).

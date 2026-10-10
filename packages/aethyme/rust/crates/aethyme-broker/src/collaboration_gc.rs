@@ -123,6 +123,9 @@ pub enum RetentionClass {
     CitedEvidence,
     /// Named by nothing: a failed capture's leftovers or a temporary file.
     Orphan,
+    /// Analysis view generations and build directories under `views/`
+    /// (#684): derived, so rebuildable from retained source.
+    View,
 }
 
 /// What one plan item removes.
@@ -134,6 +137,10 @@ pub enum ItemKind {
     SpoolTemporary,
     /// The lock file of an operation that has ended.
     OperationLock,
+    /// A retired or superseded analysis view generation (a directory).
+    ViewGeneration,
+    /// An abandoned analysis view build directory.
+    ViewBuild,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
@@ -177,7 +184,7 @@ pub struct GcPlan {
     pub retained: BTreeMap<RetentionClass, ClassTotal>,
     /// Unrooted but inside the grace period, or held by a young entry.
     pub protected_bytes: u64,
-    /// Files under `objects/` or `spool/archive/` that are not archive
+    /// Files under `objects/`, `spool/` or `views/` that are not archive
     /// objects or temporaries. Never removed.
     pub unknown: Vec<String>,
     pub reclaimable: Vec<GcItem>,
@@ -666,6 +673,7 @@ fn survey(
     store: &CollaborationStore,
     options: &GcOptions,
     resuming: Option<i64>,
+    own_view_locks: &BTreeSet<String>,
 ) -> Result<Survey, GcError> {
     let now = options.now();
     let connection = store.read_connection();
@@ -1019,6 +1027,19 @@ fn survey(
         }
     }
 
+    survey_views(
+        store,
+        ViewClock {
+            now,
+            grace_ms: options.grace_ms,
+        },
+        own_view_locks,
+        &mut retained,
+        &mut protected_bytes,
+        &mut unknown,
+        &mut candidates,
+    )?;
+
     if !blockers.is_empty() {
         candidates.clear();
         entities.clear();
@@ -1032,6 +1053,167 @@ fn survey(
         candidates,
         entities,
     })
+}
+
+/// Bytes under `path`, never following a link.
+fn tree_bytes(path: &Path) -> u64 {
+    let mut total = 0;
+    let mut pending = vec![path.to_path_buf()];
+    while let Some(next) = pending.pop() {
+        let Ok(metadata) = std::fs::symlink_metadata(&next) else {
+            continue;
+        };
+        if metadata.is_dir() {
+            if let Ok(entries) = std::fs::read_dir(&next) {
+                pending.extend(entries.filter_map(Result::ok).map(|entry| entry.path()));
+            }
+        } else {
+            total += metadata.len();
+        }
+    }
+    total
+}
+
+/// Whether someone holds the lock file at `path`. A missing file is not
+/// held, and is never created here.
+fn lock_held(path: &Path) -> Result<bool, GcError> {
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(source) => return Err(io(path, source)),
+    };
+    match file.try_lock() {
+        Ok(()) => Ok(false),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(true),
+        Err(std::fs::TryLockError::Error(source)) => Err(io(path, source)),
+    }
+}
+
+/// The `view` class (#684). A live view's `CURRENT` generation is retained.
+/// Reclaimable: every generation of a retired view; a superseded generation
+/// once `CURRENT` has named a newer one for longer than grace; a build
+/// directory older than grace whose build lock nobody holds. Never: a
+/// pinned generation, `CURRENT`, anything in a held view, or anything while
+/// the view is being built. Links are unknown and never followed.
+/// The time a view survey judges age against.
+#[derive(Clone, Copy)]
+struct ViewClock {
+    now: i64,
+    grace_ms: i64,
+}
+
+fn survey_views(
+    store: &CollaborationStore,
+    clock: ViewClock,
+    own_view_locks: &BTreeSet<String>,
+    retained: &mut BTreeMap<RetentionClass, ClassTotal>,
+    protected_bytes: &mut u64,
+    unknown: &mut Vec<String>,
+    candidates: &mut BTreeMap<String, GcItem>,
+) -> Result<(), GcError> {
+    let ViewClock { now, grace_ms } = clock;
+    let views_root = crate::analysis_view::views_root(store);
+    debug_assert_eq!(views_root, store.project_dir().join("views"));
+    for view in real_dir_entries(store, "views", unknown)? {
+        let name = view
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default()
+            .to_string();
+        let relview = format!("views/{name}");
+        if !real_dir(store, &relview, unknown)? {
+            if std::fs::symlink_metadata(&view).is_ok_and(|metadata| metadata.is_file()) {
+                unknown.push(relview);
+            }
+            continue;
+        }
+        // A build lock the caller (apply) holds itself is not a build.
+        let building = !own_view_locks.contains(&name) && lock_held(&view.join(".build.lock"))?;
+        let retired = std::fs::symlink_metadata(view.join("RETIRED"))
+            .is_ok_and(|metadata| metadata.is_file());
+        let current = match crate::analysis_view::current_generation(&view) {
+            Ok(current) => current,
+            Err(_) => {
+                // An unreadable pointer: nothing in this view is judged.
+                unknown.push(format!("{relview}/CURRENT"));
+                *protected_bytes += tree_bytes(&view);
+                continue;
+            }
+        };
+        let superseded_for_grace = std::fs::symlink_metadata(view.join("CURRENT"))
+            .is_ok_and(|metadata| metadata.is_file())
+            && modified_ms(&view.join("CURRENT")).is_some_and(|ms| ms <= now - grace_ms);
+        let held = crate::analysis_view::live_holds(&view, now) > 0;
+        for entry in real_dir_entries(store, &relview, unknown)? {
+            let file = entry
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or_default()
+                .to_string();
+            let relpath = format!("{relview}/{file}");
+            let metadata =
+                std::fs::symlink_metadata(&entry).map_err(|source| io(&entry, source))?;
+            let is_dir = metadata.is_dir();
+            let generation = file
+                .strip_prefix("gen-")
+                .and_then(|n| n.parse::<u64>().ok())
+                .filter(|_| is_dir);
+            if let Some(generation) = generation {
+                let bytes = tree_bytes(&entry);
+                if Some(generation) == current && !retired {
+                    let total = retained.entry(RetentionClass::View).or_default();
+                    total.objects += 1;
+                    total.bytes += bytes;
+                    continue;
+                }
+                let pinned = lock_held(&entry.join(".pin"))?;
+                let eligible = retired || superseded_for_grace;
+                if building || held || pinned || !eligible {
+                    *protected_bytes += bytes;
+                    continue;
+                }
+                candidates.insert(
+                    relpath.clone(),
+                    GcItem {
+                        kind: ItemKind::ViewGeneration,
+                        relpath,
+                        bytes,
+                        class: RetentionClass::View,
+                    },
+                );
+            } else if file.starts_with("building-") && is_dir {
+                let bytes = tree_bytes(&entry);
+                let young = modified_ms(&entry).is_none_or(|ms| ms > now - grace_ms);
+                if building || young {
+                    *protected_bytes += bytes;
+                    continue;
+                }
+                candidates.insert(
+                    relpath.clone(),
+                    GcItem {
+                        kind: ItemKind::ViewBuild,
+                        relpath,
+                        bytes,
+                        class: RetentionClass::View,
+                    },
+                );
+            } else if matches!(
+                file.as_str(),
+                ".build.lock" | "CURRENT" | "CURRENT.tmp" | "RETIRED"
+            ) && metadata.is_file()
+                || (file == "holds" && is_dir)
+            {
+                continue;
+            } else {
+                unknown.push(relpath);
+            }
+        }
+    }
+    Ok(())
 }
 
 fn plan_digest(items: &[GcItem], entities: &[GcEntity]) -> String {
@@ -1061,13 +1243,15 @@ fn kind_name(kind: ItemKind) -> &'static str {
         ItemKind::Object => "object",
         ItemKind::SpoolTemporary => "spool_temporary",
         ItemKind::OperationLock => "operation_lock",
+        ItemKind::ViewGeneration => "view_generation",
+        ItemKind::ViewBuild => "view_build",
     }
 }
 
 /// Survey the archive and record a plan. Removes nothing.
 pub fn plan(store: &mut CollaborationStore, options: &GcOptions) -> Result<GcPlan, GcError> {
     options.validate()?;
-    let survey = survey(store, options, None)?;
+    let survey = survey(store, options, None, &BTreeSet::new())?;
     let reclaimable: Vec<GcItem> = survey.candidates.into_values().collect();
     let entities: Vec<GcEntity> = survey.entities.into_iter().collect();
     let digest = plan_digest(&reclaimable, &entities);
@@ -1268,8 +1452,34 @@ pub(crate) fn apply_with(
         digest: digest.to_string(),
     })?;
 
+    // Hold the build lock of every view the plan touches, so no build can
+    // revive or publish into it while its directories move. A view being
+    // built keeps everything (the survey sees its lock held).
+    let mut view_locks = Vec::new();
+    let mut own_view_locks = BTreeSet::new();
+    let planned_views: BTreeSet<String> = planned
+        .items
+        .iter()
+        .filter(|(kind, _, _)| kind == "view_generation" || kind == "view_build")
+        .filter_map(|(_, relpath, _)| relpath.split('/').nth(1).map(str::to_string))
+        .collect();
+    for view in planned_views {
+        let path = crate::analysis_view::views_root(store)
+            .join(&view)
+            .join(".build.lock");
+        if let Ok(file) = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            && file.try_lock().is_ok()
+        {
+            view_locks.push(file);
+            own_view_locks.insert(view);
+        }
+    }
+
     // Eligibility now, under the exclusive lock.
-    let survey = survey(store, options, None)?;
+    let survey = survey(store, options, None, &own_view_locks)?;
     if !survey.blockers.is_empty() {
         return Err(GcError::Blocked(survey.blockers));
     }
@@ -1295,6 +1505,8 @@ pub(crate) fn apply_with(
                     kind: match kind.as_str() {
                         "spool_temporary" => ItemKind::SpoolTemporary,
                         "operation_lock" => ItemKind::OperationLock,
+                        "view_generation" => ItemKind::ViewGeneration,
+                        "view_build" => ItemKind::ViewBuild,
                         _ => ItemKind::Object,
                     },
                     relpath,
@@ -1432,6 +1644,7 @@ pub(crate) fn apply_with(
         sync_directory(dir)?;
     }
     finish_generation(store, generation)?;
+    drop(view_locks);
     reclaim.extend(reclaimed_locks);
     Ok(GcReport {
         generation: Some(generation),
@@ -1555,6 +1768,12 @@ pub fn resume(
                     moved_back.insert(relpath.clone());
                     continue;
                 }
+                // A later build reused the generation's name: the trashed copy
+                // is the older one, and views are rebuildable.
+                if std::fs::symlink_metadata(&trashed).is_ok_and(|metadata| metadata.is_dir()) {
+                    std::fs::remove_dir_all(&trashed).map_err(|source| io(&trashed, source))?;
+                    continue;
+                }
                 // A later capture wrote it again. Keep whichever copy matches
                 // its name; a copy that does not is set aside, never deleted.
                 let Some(digest) = object_digest(relpath) else {
@@ -1587,7 +1806,7 @@ pub fn resume(
                     sync_directory(parent)?;
                 }
             }
-            let survey = survey(store, options, Some(generation))?;
+            let survey = survey(store, options, Some(generation), &BTreeSet::new())?;
             if !survey.blockers.is_empty() {
                 return Err(GcError::Blocked(survey.blockers));
             }
