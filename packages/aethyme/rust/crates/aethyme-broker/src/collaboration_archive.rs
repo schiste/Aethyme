@@ -32,8 +32,10 @@
 //!   missing history is *incomplete* ([`ArchiveError::is_incomplete`]). A
 //!   submodule, a mode #652 refuses, or an attribute that makes a checkout
 //!   differ from the committed bytes (`filter`, `working-tree-encoding`,
-//!   `ident`; from the tree, `.git/info/attributes` or
-//!   `core.attributesFile`) is *refused*. Either way
+//!   `ident`) set by the commit's own `.gitattributes` is *refused*. The
+//!   same attribute from this clone's `info/attributes`,
+//!   `core.attributesFile` or system attributes is *incomplete*: another
+//!   clone does not share it. Either way
 //!   no index row is written, and objects already copied stay as orphans
 //!   that a retry reuses.
 //! - **Lineage.** A contribution retains its complete base and result
@@ -127,7 +129,7 @@ impl CommitOid {
 }
 
 /// The SHA-256 naming one archive object.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ObjectDigest([u8; 32]);
 
 impl ObjectDigest {
@@ -204,11 +206,19 @@ pub enum ArchiveError {
     )]
     UnsupportedEntry { path: Vec<u8>, mode: String },
     #[error(
-        "{} sets {attribute}, so a Git checkout would not produce the committed bytes; the \
+        "{} sets {attribute}{}, so a Git checkout would not produce the committed bytes; the \
          archive cannot retain what replay needs",
-        String::from_utf8_lossy(path)
+        String::from_utf8_lossy(path),
+        if *from_tree { "" } else { " from this clone's or this user's configuration, not the commit" }
     )]
-    UnsupportedFilter { path: Vec<u8>, attribute: String },
+    UnsupportedFilter {
+        path: Vec<u8>,
+        attribute: String,
+        /// Set by the commit's own `.gitattributes`. Otherwise it comes from
+        /// `info/attributes`, `core.attributesFile` or system attributes,
+        /// which another clone does not share.
+        from_tree: bool,
+    },
     #[error("the commit's tree is not a valid v0 snapshot: {0}")]
     InvalidSnapshot(#[from] SourceSnapshotError),
     #[error("source object {oid} is unavailable: {detail}")]
@@ -291,6 +301,10 @@ impl ArchiveError {
                 | Self::SourceMismatch { .. }
                 | Self::HistoryUnavailable { .. }
                 | Self::PartialClone { .. }
+                | Self::UnsupportedFilter {
+                    from_tree: false,
+                    ..
+                }
         )
     }
 }
@@ -315,15 +329,15 @@ fn is_lower_hex(text: &str, lengths: &[usize]) -> bool {
 
 // ---------------------------------------------------------------- objects
 
-fn objects_dir(store: &CollaborationStore) -> PathBuf {
+pub(crate) fn objects_dir(store: &CollaborationStore) -> PathBuf {
     store.project_dir().join("objects/sha256")
 }
 
-fn spool_dir(store: &CollaborationStore) -> PathBuf {
+pub(crate) fn spool_dir(store: &CollaborationStore) -> PathBuf {
     store.project_dir().join("spool/archive")
 }
 
-fn object_path(store: &CollaborationStore, digest: &ObjectDigest) -> PathBuf {
+pub(crate) fn object_path(store: &CollaborationStore, digest: &ObjectDigest) -> PathBuf {
     let hex = digest.hex();
     objects_dir(store).join(&hex[..2]).join(&hex[2..])
 }
@@ -363,7 +377,7 @@ fn ensure_dir(path: &Path) -> Result<(), ArchiveError> {
 }
 
 /// SHA-256 of a file's current bytes.
-fn hash_file(path: &Path) -> Result<ObjectDigest, ArchiveError> {
+pub(crate) fn hash_file(path: &Path) -> Result<ObjectDigest, ArchiveError> {
     let mut file = std::fs::File::open(path).map_err(|source| io(path, source))?;
     let mut hasher = Sha256::new();
     let mut buffer = vec![0; 64 * 1024];
@@ -403,10 +417,21 @@ fn publish(
             // A concurrent writer may not have flushed its entry yet; a
             // caller that records this object must not outrun it.
             sync_directory(fan_out)?;
+            // Reuse counts as a write for reclamation's grace period (#659):
+            // an unindexed object a capture is about to name must not look
+            // like an old orphan.
+            touch(&target)?;
         }
         Err(error) => return Err(io(&target, error.error)),
     }
     Ok(digest)
+}
+
+/// Set `path`'s modification time to now.
+fn touch(path: &Path) -> Result<(), ArchiveError> {
+    std::fs::File::open(path)
+        .and_then(|file| file.set_modified(std::time::SystemTime::now()))
+        .map_err(|source| io(path, source))
 }
 
 fn new_temporary(store: &CollaborationStore) -> Result<tempfile::NamedTempFile, ArchiveError> {
@@ -419,7 +444,10 @@ fn new_temporary(store: &CollaborationStore) -> Result<tempfile::NamedTempFile, 
 }
 
 /// Store `bytes` and return their name.
-pub fn put_object(store: &CollaborationStore, bytes: &[u8]) -> Result<ObjectDigest, ArchiveError> {
+pub(crate) fn put_object(
+    store: &CollaborationStore,
+    bytes: &[u8],
+) -> Result<ObjectDigest, ArchiveError> {
     let mut temporary = new_temporary(store)?;
     let path = temporary.path().to_path_buf();
     temporary
@@ -458,7 +486,7 @@ pub fn has_object(store: &CollaborationStore, digest: &ObjectDigest) -> bool {
 
 // -------------------------------------------------------------------- git
 
-fn git(repo: &Path) -> Command {
+pub(crate) fn git(repo: &Path) -> Command {
     let mut command = Command::new("git");
     command
         .arg("--no-replace-objects")
@@ -549,7 +577,7 @@ pub fn pin_commit(repo: &Path, revision: &str) -> Result<CommitOid, ArchiveError
 
 /// Refuse a partial clone: objects it omitted would otherwise surface as
 /// missing part-way through, or be fetched from a promisor remote.
-fn refuse_partial_clone(repo: &Path) -> Result<(), ArchiveError> {
+pub(crate) fn refuse_partial_clone(repo: &Path) -> Result<(), ArchiveError> {
     let output = git_output(
         repo,
         &[
@@ -951,13 +979,96 @@ fn refuse_transforming_attributes(
             && value != "unset"
             && value != "unspecified"
         {
+            let from_tree = attribute_set_by_tree(repo, commit, path, &attribute)?;
             return Err(ArchiveError::UnsupportedFilter {
                 path: path.to_vec(),
                 attribute: format!("{attribute}={value}"),
+                from_tree,
             });
         }
     }
     Ok(())
+}
+
+/// Whether `commit`'s own tree sets `attribute` on `path`, ignoring
+/// `info/attributes`, `core.attributesFile` and system attributes. Asked of a
+/// scratch bare repository that borrows the source's objects through an
+/// alternate (for this query only; nothing is retained through it) and has
+/// no attribute files of its own.
+fn attribute_set_by_tree(
+    repo: &Path,
+    commit: &CommitOid,
+    path: &[u8],
+    attribute: &str,
+) -> Result<bool, ArchiveError> {
+    let common = git_text(
+        repo,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )?;
+    let format = git_text(repo, &["rev-parse", "--show-object-format"])?;
+    let scratch = tempfile::tempdir().map_err(|source| io(Path::new("scratch"), source))?;
+    let bare = scratch.path().join("tree-only.git");
+    let init = git(scratch.path())
+        .args(["init", "-q", "--bare", &format!("--object-format={format}")])
+        .arg(&bare)
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|error| ArchiveError::Git {
+            detail: format!("could not run git init: {error}"),
+        })?;
+    if !init.status.success() {
+        return Err(ArchiveError::Git {
+            detail: format!("git init: {}", String::from_utf8_lossy(&init.stderr).trim()),
+        });
+    }
+    let alternates = bare.join("objects/info/alternates");
+    std::fs::write(&alternates, format!("{common}/objects\n"))
+        .map_err(|source| io(&alternates, source))?;
+    let mut child = git(scratch.path())
+        .arg(format!("--git-dir={}", bare.display()))
+        .args(["-c", "core.attributesFile=/dev/null"])
+        .env("GIT_ATTR_NOSYSTEM", "1")
+        .args([
+            "check-attr",
+            &format!("--source={}", commit.as_str()),
+            "-z",
+            "--stdin",
+            attribute,
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| ArchiveError::Git {
+            detail: format!("could not start git check-attr: {error}"),
+        })?;
+    let mut input = path.to_vec();
+    input.push(0);
+    child
+        .stdin
+        .take()
+        .expect("piped")
+        .write_all(&input)
+        .map_err(|error| ArchiveError::Git {
+            detail: format!("git check-attr: {error}"),
+        })?;
+    let output = child
+        .wait_with_output()
+        .map_err(|error| ArchiveError::Git {
+            detail: format!("git check-attr: {error}"),
+        })?;
+    if !output.status.success() {
+        return Err(ArchiveError::Git {
+            detail: format!(
+                "git check-attr: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ),
+        });
+    }
+    let fields: Vec<&[u8]> = output.stdout.split(|b| *b == 0).collect();
+    Ok(fields.chunks(3).any(
+        |triple| matches!(triple, [_, _, value] if *value != b"unset" && *value != b"unspecified"),
+    ))
 }
 
 // ---------------------------------------------------------------- capture
@@ -965,7 +1076,11 @@ fn refuse_transforming_attributes(
 /// Retain the tree of `commit` from `repo`: every blob, the #652 manifest,
 /// and a retained-snapshot record. Idempotent: retaining the same commit
 /// again copies nothing new and returns the same snapshot.
-pub fn retain_snapshot(
+///
+/// Only capture writes the archive in production, through the `_with`
+/// form under the archive lock; this wrapper is for tests.
+#[cfg(test)]
+pub(crate) fn retain_snapshot(
     store: &mut CollaborationStore,
     repo: &Path,
     commit: &CommitOid,
@@ -1063,6 +1178,25 @@ pub(crate) fn retain_snapshot_with(
         snapshot_record(&snapshot_id, entry_count, content_bytes, commit, format);
     let record_digest = put_object(store, &record_bytes)?;
 
+    // A snapshot that reclamation removed (#659) keeps its row for the
+    // contributions and receipts that name it; retaining it again points the
+    // row at this capture's record and clears the marker.
+    store.connection().execute(
+        "UPDATE retained_snapshots
+         SET record_id = ?2, record_sha256 = ?3, commit_oid = ?4
+         WHERE snapshot_id = ?1
+           AND snapshot_id IN (SELECT snapshot_id FROM reclaimed_snapshots)",
+        rusqlite::params![
+            snapshot_id.as_str(),
+            record_id.as_str(),
+            record_digest.hex(),
+            commit.as_str(),
+        ],
+    )?;
+    store.connection().execute(
+        "DELETE FROM reclaimed_snapshots WHERE snapshot_id = ?1",
+        [snapshot_id.as_str()],
+    )?;
     store.connection().execute(
         "INSERT OR IGNORE INTO retained_snapshots
              (snapshot_id, record_id, record_sha256, commit_oid, entry_count, content_bytes)
@@ -1138,7 +1272,11 @@ fn snapshot_record(
 
 /// Retain a contribution: its base and result snapshots, after checking that
 /// `base` is an ancestor of `result`, plus a lineage record.
-pub fn retain_contribution(
+///
+/// Only capture writes the archive in production, through the `_with`
+/// form under the archive lock; this wrapper is for tests.
+#[cfg(test)]
+pub(crate) fn retain_contribution(
     store: &mut CollaborationStore,
     repo: &Path,
     base: &CommitOid,
@@ -1226,6 +1364,10 @@ pub(crate) fn retain_contribution_with(
     );
     let digest = put_object(store, &bytes)?;
     store.connection().execute(
+        "DELETE FROM reclaimed_contributions WHERE lineage_record_id = ?1",
+        [lineage_record_id.as_str()],
+    )?;
+    store.connection().execute(
         "INSERT OR IGNORE INTO retained_contributions
              (lineage_record_id, record_sha256, base_snapshot, result_snapshot)
          VALUES (?1, ?2, ?3, ?4)",
@@ -1252,7 +1394,8 @@ pub fn retained(
         .read_connection()
         .query_row(
             "SELECT record_id, commit_oid, entry_count, content_bytes
-             FROM retained_snapshots WHERE snapshot_id = ?1",
+             FROM retained_snapshots WHERE snapshot_id = ?1
+               AND snapshot_id NOT IN (SELECT snapshot_id FROM reclaimed_snapshots)",
             [id.as_str()],
             |row| {
                 Ok((
@@ -1282,7 +1425,7 @@ pub fn retained(
 
 /// Parse a #652 manifest back into a snapshot. The caller has already
 /// checked that the bytes hash to the snapshot ID.
-fn parse_manifest(bytes: &[u8]) -> Option<SourceSnapshot> {
+pub(crate) fn parse_manifest(bytes: &[u8]) -> Option<SourceSnapshot> {
     use aethyme_contracts::experimental_v0::source_snapshot::MANIFEST_HEADER;
 
     let mut rest = bytes.strip_prefix(MANIFEST_HEADER)?;
@@ -1321,6 +1464,11 @@ pub fn reconstruct(
     id: &SourceSnapshotId,
     dest: &Path,
 ) -> Result<SourceSnapshot, ArchiveError> {
+    // Reclamation cannot remove anything while this read holds the archive.
+    let _use = crate::collaboration_gc::archive_use(store).map_err(|source| ArchiveError::Io {
+        path: crate::collaboration_gc::lock_path(store),
+        source,
+    })?;
     // Only a snapshot this archive retained: any object whose bytes happen
     // to parse as a manifest (a committed file, say) is not one.
     if retained(store, id)?.is_none() {
@@ -1868,6 +2016,8 @@ mod tests {
                 retain_snapshot(&mut store, source.path(), &head(source.path())).unwrap_err();
             assert_eq!(error.code(), "unsupported_filter", "{file}: {error}");
             assert!(error.to_string().contains(file), "{error}");
+            // Set by the commit itself: every clone refuses it.
+            assert!(!error.is_incomplete(), "{file}: {error}");
         }
     }
 
@@ -1884,6 +2034,8 @@ mod tests {
         write(source.path(), ".git/info/attributes", b"*.bin filter=lfs\n");
         let error = retain_snapshot(&mut store, source.path(), &head(source.path())).unwrap_err();
         assert_eq!(error.code(), "unsupported_filter", "{error}");
+        // Another clone does not share it: retryable, not a refusal.
+        assert!(error.is_incomplete(), "{error}");
         std::fs::remove_file(source.path().join(".git/info/attributes")).unwrap();
 
         let global = source.path().join("global-attributes");
@@ -1894,6 +2046,7 @@ mod tests {
         );
         let error = retain_snapshot(&mut store, source.path(), &head(source.path())).unwrap_err();
         assert_eq!(error.code(), "unsupported_filter", "{error}");
+        assert!(error.is_incomplete(), "{error}");
     }
 
     /// Capture reads the repository's configuration but runs nothing it
