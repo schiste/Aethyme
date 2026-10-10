@@ -34,6 +34,7 @@ mod chau7_tabs;
 mod cleanup_audit;
 mod cleanup_resolve;
 mod clock;
+pub mod collaboration_archive;
 pub mod collaboration_state;
 mod disk_headroom;
 mod duplicate_work;

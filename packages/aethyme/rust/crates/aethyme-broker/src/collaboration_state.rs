@@ -37,12 +37,34 @@ use serde::Serialize;
 pub use crate::host_state::HostStateSource;
 
 /// The schema this binary writes.
-pub const COLLABORATION_STATE_SCHEMA_VERSION: i64 = 1;
+pub const COLLABORATION_STATE_SCHEMA_VERSION: i64 = 2;
 /// The oldest schema a database written by this binary can be read by.
 /// Unlike `host-operations.db`, a newer database stays readable by an older
 /// binary until a release raises this floor.
 const MIN_COMPATIBLE_SCHEMA: i64 = 1;
 const ROOT_DIRECTORY: &str = "collaboration";
+/// Additive schema steps after the version 1 layout (`meta` only), applied in
+/// order. Each only adds tables, so none raises the compatibility floor.
+const MIGRATIONS: &[(i64, &str)] = &[(
+    2,
+    // The archive index (#657). Rows are written only after every object a
+    // snapshot or contribution names has been published and verified; the
+    // objects themselves are the authority, and these rows are rebuildable.
+    "CREATE TABLE IF NOT EXISTS retained_snapshots (
+         snapshot_id TEXT PRIMARY KEY NOT NULL,
+         record_id TEXT NOT NULL,
+         record_sha256 TEXT NOT NULL,
+         commit_oid TEXT NOT NULL,
+         entry_count INTEGER NOT NULL,
+         content_bytes INTEGER NOT NULL
+     ) STRICT;
+     CREATE TABLE IF NOT EXISTS retained_contributions (
+         lineage_record_id TEXT PRIMARY KEY NOT NULL,
+         record_sha256 TEXT NOT NULL,
+         base_snapshot TEXT NOT NULL REFERENCES retained_snapshots (snapshot_id),
+         result_snapshot TEXT NOT NULL REFERENCES retained_snapshots (snapshot_id)
+     ) STRICT;",
+)];
 /// The file that marks a directory as a collaboration root.
 pub const ROOT_MARKER: &str = ".aethyme-collaboration-root.json";
 const ROOT_MARKER_KIND: &str = "aethyme-collaboration-root";
@@ -326,6 +348,11 @@ impl CollaborationStore {
 
     pub fn schema_version(&self) -> i64 {
         self.schema_version
+    }
+
+    /// The database, read-only use.
+    pub(crate) fn read_connection(&self) -> &Connection {
+        &self.connection
     }
 
     /// The database, for the capture and archive slices built on this one.
@@ -786,10 +813,8 @@ fn initialise(
             )
             .map_err(sqlite)?;
         for (key, value) in [
-            (
-                "schema_version",
-                COLLABORATION_STATE_SCHEMA_VERSION.to_string(),
-            ),
+            // The version 1 layout; MIGRATIONS bring it up to date below.
+            ("schema_version", "1".to_string()),
             ("min_compatible_schema", MIN_COMPATIBLE_SCHEMA.to_string()),
             ("project_key", project.as_str().to_string()),
         ] {
@@ -836,6 +861,34 @@ fn initialise(
             expected: project.as_str().to_string(),
             found: owner,
         });
+    }
+    let mut found = found;
+    for &(version, sql) in MIGRATIONS {
+        if version <= found {
+            continue;
+        }
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sqlite)?;
+        // Another process may have migrated while this one waited for the lock.
+        let current: i64 = transaction
+            .query_row(
+                "SELECT CAST(value AS INTEGER) FROM meta WHERE key = 'schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(sqlite)?;
+        if current < version {
+            transaction.execute_batch(sql).map_err(sqlite)?;
+            transaction
+                .execute(
+                    "UPDATE meta SET value = ?1 WHERE key = 'schema_version'",
+                    [version.to_string()],
+                )
+                .map_err(sqlite)?;
+        }
+        transaction.commit().map_err(sqlite)?;
+        found = found.max(version);
     }
     Ok(found)
 }
@@ -1096,8 +1149,8 @@ mod tests {
         store
             .connection()
             .execute(
-                "UPDATE meta SET value = '2' WHERE key = 'min_compatible_schema'",
-                [],
+                "UPDATE meta SET value = ?1 WHERE key = 'min_compatible_schema'",
+                [(COLLABORATION_STATE_SCHEMA_VERSION + 1).to_string()],
             )
             .unwrap();
         drop(store);
