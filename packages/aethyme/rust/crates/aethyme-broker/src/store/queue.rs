@@ -106,6 +106,50 @@ impl BrokerStore {
         result.transpose()
     }
 
+    /// Cache lookup bound to the exact execution profile that produced the
+    /// verdict. Rows from before profile tracking (or runs whose profile could
+    /// not be captured) cannot satisfy this lookup.
+    pub fn cached_gate_result_for_execution_profile(
+        &self,
+        gate_name: &str,
+        tree_hash: &str,
+        definition_hash: &str,
+        execution_profile_hash: &str,
+    ) -> Result<Option<GateResult>, BrokerError> {
+        let result = self
+            .conn
+            .query_row(
+                &format!(
+                    "{GATE_RESULT_SELECT}
+                    WHERE gate_name = ?1 AND tree_hash = ?2 AND definition_hash = ?3
+                      AND execution_profile_hash = ?4 AND cleared_at IS NULL
+                      AND NOT EXISTS (
+                          SELECT 1 FROM gate_results cleared
+                          WHERE cleared.gate_name = gate_results.gate_name
+                            AND cleared.tree_hash = gate_results.tree_hash
+                            AND cleared.definition_hash = gate_results.definition_hash
+                            AND cleared.execution_profile_hash = gate_results.execution_profile_hash
+                            AND cleared.cleared_at IS NOT NULL
+                            AND cleared.id > gate_results.id
+                      )
+                      AND (
+                            status = 'pass'
+                            OR (status = 'fail' AND failure_class = 'test_failure')
+                       )
+                     ORDER BY id DESC LIMIT 1"
+                ),
+                params![
+                    gate_name,
+                    tree_hash,
+                    definition_hash,
+                    execution_profile_hash
+                ],
+                gate_result_from_row,
+            )
+            .optional()?;
+        result.transpose()
+    }
+
     /// How many earlier runs of this gate definition on this tree timed out.
     ///
     /// A first timeout may be the host; a repeated one on an unchanged tree is
@@ -122,6 +166,36 @@ impl BrokerStore {
              WHERE gate_name = ?1 AND tree_hash = ?2 AND definition_hash = ?3
                AND failure_class = 'timeout'",
             params![gate_name, tree_hash, definition_hash],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// Timeout history is profile-bound for the same reason as cache hits: a
+    /// timeout in one toolchain must not classify the first timeout in a
+    /// different toolchain as a verdict.
+    pub fn gate_timeouts_for_execution_profile(
+        &self,
+        gate_name: &str,
+        tree_hash: &str,
+        definition_hash: &str,
+        execution_profile_hash: Option<&str>,
+    ) -> Result<i64, BrokerError> {
+        let Some(execution_profile_hash) = execution_profile_hash else {
+            // Unknown profiles cannot prove that a previous timeout came from
+            // the same environment, so do not turn one into a code verdict.
+            return Ok(0);
+        };
+        Ok(self.conn.query_row(
+            "SELECT COUNT(*) FROM gate_results
+             WHERE gate_name = ?1 AND tree_hash = ?2 AND definition_hash = ?3
+               AND failure_class = 'timeout'
+               AND execution_profile_hash = ?4",
+            params![
+                gate_name,
+                tree_hash,
+                definition_hash,
+                execution_profile_hash
+            ],
             |row| row.get(0),
         )?)
     }

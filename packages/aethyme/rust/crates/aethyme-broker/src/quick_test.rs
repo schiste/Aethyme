@@ -574,8 +574,10 @@ mod not_promoted_tests {
     fn gate(name: &str, status: GateStatus, class: Option<GateFailureClass>) -> GateRunOutcome {
         GateRunOutcome {
             gate: name.to_string(),
+            run_id: None,
             tree_hash: "t".into(),
             definition_hash: "d".into(),
+            cache_provenance: None,
             resource_lease: None,
             managed_cache: None,
             broker_database: None,

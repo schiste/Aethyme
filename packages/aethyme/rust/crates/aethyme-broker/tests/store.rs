@@ -4,9 +4,10 @@
 
 use aethyme_broker::{
     AdvisoryAction, AdvisoryDeliverySurface, AdvisoryEvidence, AdvisoryResolutionState,
-    AdvisorySeverity, BrokerError, BrokerStore, EntryExposureState, GateDef, GateFailureClass,
-    GateStatus, LeaseKind, MergeStatus, NewAdvisory, NewGateResult, NewPrWatchState, NewSession,
-    RepositoryContract, SessionContext, SessionOrigin, SessionStatus,
+    AdvisorySeverity, BrokerError, BrokerStore, EntryExposureState, GateCacheProvenance, GateDef,
+    GateEnvironment, GateFailureClass, GateStatus, LeaseKind, MergeStatus, NewAdvisory,
+    NewGateResult, NewPrWatchState, NewSession, RepositoryContract, SessionContext, SessionOrigin,
+    SessionStatus,
 };
 
 fn open_temp() -> (tempfile::TempDir, BrokerStore) {
@@ -733,6 +734,164 @@ fn gate_result_cache_ignores_cancelled_and_error_runs() {
             .cached_gate_result("pytest", "tree-b")
             .unwrap()
             .is_none()
+    );
+}
+
+#[test]
+fn execution_profile_cache_requires_definition_and_profile_and_names_its_source_run() {
+    let (_tmp, mut store) = open_temp();
+    let profile = |digest: &str| GateCacheProvenance {
+        execution_profile_digest: Some(digest.into()),
+        profile_scope: "test profile scope".into(),
+    };
+    let result = NewGateResult {
+        gate_name: "cargo-test".into(),
+        tree_hash: "same-tree".into(),
+        definition_hash: "definition-a".into(),
+        status: GateStatus::Pass,
+        failure_class: None,
+        exit_code: Some(0),
+        duration_ms: Some(1200),
+        wait_duration_ms: Some(0),
+        first_output_ms: Some(10),
+        output_bytes: Some(40),
+        log_path: None,
+        session_id: None,
+    };
+    let profile_a = profile("sha256:profile-a");
+    let source_run_id = store
+        .record_gate_result_with_execution_profile(
+            &result,
+            &GateEnvironment::default(),
+            Some(&profile_a),
+        )
+        .unwrap();
+
+    // Rows written before profile capture are deliberately not reusable.
+    store.record_gate_result(&result).unwrap();
+
+    let hit = store
+        .cached_gate_result_for_execution_profile(
+            "cargo-test",
+            "same-tree",
+            "definition-a",
+            "sha256:profile-a",
+        )
+        .unwrap()
+        .expect("same definition and profile should reuse the pass");
+    assert_eq!(
+        hit.id, source_run_id,
+        "the original producing run is retained"
+    );
+    assert!(
+        store
+            .cached_gate_result_for_execution_profile(
+                "cargo-test",
+                "same-tree",
+                "definition-a",
+                "sha256:profile-b",
+            )
+            .unwrap()
+            .is_none(),
+        "a changed execution profile must miss"
+    );
+    assert!(
+        store
+            .cached_gate_result_for_execution_profile(
+                "cargo-test",
+                "same-tree",
+                "definition-b",
+                "sha256:profile-a",
+            )
+            .unwrap()
+            .is_none(),
+        "a changed gate definition must miss"
+    );
+    assert!(
+        store
+            .cached_gate_result_for_execution_profile(
+                "cargo-test",
+                "same-tree",
+                "definition-a",
+                "sha256:profile-c",
+            )
+            .unwrap()
+            .is_none(),
+        "legacy rows without a profile must miss"
+    );
+}
+
+#[test]
+fn execution_profile_timeout_history_does_not_cross_profiles() {
+    let (_tmp, mut store) = open_temp();
+    let profile = |digest: &str| GateCacheProvenance {
+        execution_profile_digest: Some(digest.into()),
+        profile_scope: "test profile scope".into(),
+    };
+    let timeout = NewGateResult {
+        gate_name: "cargo-test".into(),
+        tree_hash: "same-tree".into(),
+        definition_hash: "definition-a".into(),
+        status: GateStatus::Error,
+        failure_class: Some(GateFailureClass::Timeout),
+        exit_code: None,
+        duration_ms: Some(100),
+        wait_duration_ms: Some(0),
+        first_output_ms: None,
+        output_bytes: Some(0),
+        log_path: None,
+        session_id: None,
+    };
+    for digest in ["profile-a", "profile-b"] {
+        store
+            .record_gate_result_with_execution_profile(
+                &timeout,
+                &GateEnvironment::default(),
+                Some(&profile(digest)),
+            )
+            .unwrap();
+    }
+
+    assert_eq!(
+        store
+            .gate_timeouts_for_execution_profile(
+                "cargo-test",
+                "same-tree",
+                "definition-a",
+                Some("profile-a"),
+            )
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        store
+            .gate_timeouts_for_execution_profile(
+                "cargo-test",
+                "same-tree",
+                "definition-a",
+                Some("profile-b"),
+            )
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        store
+            .gate_timeouts_for_execution_profile(
+                "cargo-test",
+                "same-tree",
+                "definition-a",
+                Some("profile-c"),
+            )
+            .unwrap(),
+        0,
+        "a timeout from a different execution profile must not classify this run"
+    );
+    assert_eq!(
+        store
+            .gate_timeouts_for_execution_profile("cargo-test", "same-tree", "definition-a", None,)
+            .unwrap(),
+        0,
+        "an unobserved profile cannot prove that an earlier timeout is comparable"
     );
 }
 

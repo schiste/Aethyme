@@ -279,6 +279,22 @@ fn session_and_full_tree_gates_record_committed_graph_authority_as_advice() {
         cached[0].cached,
         "identical verified tree reuses gate proof"
     );
+    assert_eq!(
+        cached[0].run_id, refreshed[0].run_id,
+        "the cache hit identifies the run whose verdict it reused"
+    );
+    let provenance = cached[0]
+        .cache_provenance
+        .as_ref()
+        .expect("profile-bound cache hit reports its scope");
+    assert!(
+        provenance
+            .execution_profile_digest
+            .as_deref()
+            .is_some_and(|digest| digest.starts_with("sha256:")),
+        "the execution-profile digest is reported"
+    );
+    assert!(provenance.profile_scope.contains("managed-cache contents"));
 }
 
 #[test]
@@ -742,13 +758,26 @@ triggers = ["**/*.py"]
     // Same tree, same session, run again: pure cache, no re-execution.
     // (gate-markers.txt is gitignored, so writing it did not change the
     // working-tree hash — the real-world contract for gate outputs.)
-    let outcomes = broker.run_gates(py.id).unwrap();
-    assert!(outcomes.iter().all(|o| o.cached), "all cache hits");
-    assert_eq!(outcomes[0].failure_class, None);
+    let producing_run_ids = outcomes
+        .iter()
+        .map(|outcome| outcome.run_id)
+        .collect::<Vec<_>>();
+    let cached_outcomes = broker.run_gates(py.id).unwrap();
+    assert!(cached_outcomes.iter().all(|o| o.cached), "all cache hits");
+    assert_eq!(cached_outcomes[0].failure_class, None);
     assert_eq!(
-        outcomes[1].failure_class,
+        cached_outcomes[1].failure_class,
         Some(GateFailureClass::CachedPriorFail)
     );
+    for (cached, producing_run_id) in cached_outcomes.iter().zip(producing_run_ids) {
+        assert_eq!(cached.run_id, producing_run_id);
+        assert!(cached.cache_provenance.as_ref().is_some_and(|provenance| {
+            provenance
+                .execution_profile_digest
+                .as_deref()
+                .is_some_and(|digest| digest.starts_with("sha256:"))
+        }));
+    }
     let markers_after = std::fs::read_to_string(wt_py.join("gate-markers.txt")).unwrap();
     assert_eq!(markers, markers_after, "cached rerun executed nothing");
 
