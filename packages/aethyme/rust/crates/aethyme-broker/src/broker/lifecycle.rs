@@ -21,6 +21,7 @@ impl Broker {
             graph_impact_provider: Box::new(GraphStoreImpactProvider),
             host_operation_db_path: None,
             worktree_root_override: None,
+            collaboration_state_override: None,
             landing_deadline: std::cell::Cell::new(None),
             main_common_dir: std::cell::OnceCell::new(),
         })
@@ -43,6 +44,7 @@ impl Broker {
             graph_impact_provider: Box::new(GraphStoreImpactProvider),
             host_operation_db_path: None,
             worktree_root_override: None,
+            collaboration_state_override: None,
             landing_deadline: std::cell::Cell::new(None),
             main_common_dir: std::cell::OnceCell::new(),
         };
@@ -67,6 +69,7 @@ impl Broker {
             graph_impact_provider: Box::new(graph_impact_provider),
             host_operation_db_path: None,
             worktree_root_override: None,
+            collaboration_state_override: None,
             landing_deadline: std::cell::Cell::new(None),
             main_common_dir: std::cell::OnceCell::new(),
         };
@@ -118,6 +121,32 @@ impl Broker {
     pub fn with_worktree_root(mut self, path: impl Into<PathBuf>) -> Self {
         self.worktree_root_override = Some(path.into());
         self
+    }
+
+    /// Keep collaboration state under `host_state` instead of the host state
+    /// directory, so a test never touches the real one.
+    #[doc(hidden)]
+    pub fn with_collaboration_state(mut self, host_state: impl Into<PathBuf>) -> Self {
+        self.collaboration_state_override = Some(host_state.into());
+        self
+    }
+
+    /// Open `project`'s collaboration state for this repository.
+    pub(crate) fn collaboration_store(
+        &self,
+        project: &crate::collaboration_state::ProjectKey,
+    ) -> Result<
+        crate::collaboration_state::CollaborationStore,
+        crate::collaboration_state::CollaborationStateError,
+    > {
+        match &self.collaboration_state_override {
+            Some(host_state) => crate::collaboration_state::CollaborationStore::open(
+                &crate::collaboration_state::CollaborationRoot::under_host_state(host_state),
+                project,
+                &crate::collaboration_state::forbidden_roots(&self.main_root),
+            ),
+            None => crate::collaboration_state::open_for_repository(&self.main_root, project),
+        }
     }
 
     pub(crate) fn host_operation_database_path(&self) -> Result<PathBuf, BrokerOpError> {
