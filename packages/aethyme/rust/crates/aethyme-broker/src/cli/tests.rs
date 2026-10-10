@@ -833,6 +833,26 @@ fn parse_accepts_coordinated_github_operation() {
 }
 
 #[test]
+fn parse_accepts_exact_push_remote_inspection() {
+    let parsed = match super::parse(&args(&[
+        "operations",
+        "reconcile",
+        "--operation",
+        "42",
+        "--inspect-remote",
+        "--reason",
+        "inspect the exact push refs",
+    ])) {
+        Ok(parsed) => parsed,
+        Err(_) => panic!("exact push remote inspection should parse"),
+    };
+
+    assert!(parsed.inspect_remote);
+    assert_eq!(parsed.operation.as_deref(), Some("42"));
+    assert_eq!(parsed.outcome, None);
+}
+
+#[test]
 fn parse_accepts_pr_check_routing_flags() {
     let args = vec![
         "check".to_string(),

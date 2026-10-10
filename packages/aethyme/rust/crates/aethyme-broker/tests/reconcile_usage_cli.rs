@@ -7,7 +7,7 @@ const CLI: &str = env!("CARGO_BIN_EXE_broker-cli-shim");
 const RESOURCES_USAGE: &str =
     "usage: aethyme broker advanced resources reconcile <lease-id> --confirm <generation> [--json]";
 const OPERATIONS_USAGE: &str = "usage: aethyme broker advanced operations reconcile --operation <id|host-operation-id> \
-     --outcome <succeeded|failed> --reason <text> [--json]";
+     (--outcome <succeeded|failed> | --inspect-remote) --reason <text> [--json]";
 const INTEGRATION_USAGE: &str = "usage: aethyme broker advanced integration reconcile --upstream <ref> \
      [--resolution-file <path>] [--write-resolution-template <path>] \
      [--dry-run | --apply --confirm <sha256>] [--json]";
@@ -87,6 +87,14 @@ fn every_reconcile_usage_error_includes_the_complete_required_contract() {
         &["advanced", "operations", "reconcile", "--operation"][..],
         &["advanced", "operations", "reconcile", "--outcome"][..],
         &["advanced", "operations", "reconcile", "--reason"][..],
+        &[
+            "advanced",
+            "operations",
+            "reconcile",
+            "--operation",
+            "1",
+            "--inspect-remote",
+        ][..],
         &["advanced", "operations", "reconcile", "--unexpected"][..],
         &[
             "advanced",
@@ -103,8 +111,11 @@ fn every_reconcile_usage_error_includes_the_complete_required_contract() {
             "reconcile",
             "--operation",
             "1",
+            "--inspect-remote",
             "--outcome",
-            "failed",
+            "succeeded",
+            "--reason",
+            "remote inspection must not combine with an assertion",
         ][..],
         &[
             "advanced",

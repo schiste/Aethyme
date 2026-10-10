@@ -185,6 +185,55 @@ fn plan_exact_push(
     })
 }
 
+struct ExactPushObservation {
+    classification: &'static str,
+    outcome: Option<&'static str>,
+    destinations: Vec<serde_json::Value>,
+}
+
+fn classify_exact_push_observation(
+    plan: &ExactPushPlan,
+    observed: &std::collections::BTreeMap<String, Option<String>>,
+) -> ExactPushObservation {
+    let mut all_pre_push = true;
+    let mut all_proposed = true;
+    let mut every_observation_is_expected = true;
+    let destinations = plan
+        .destinations
+        .iter()
+        .map(|destination| {
+            let observed_sha = observed
+                .get(&destination.destination_ref)
+                .cloned()
+                .flatten();
+            all_pre_push &= observed_sha == destination.pre_push_sha;
+            all_proposed &= observed_sha.as_deref() == Some(destination.proposed_sha.as_str());
+            every_observation_is_expected &= observed_sha == destination.pre_push_sha
+                || observed_sha.as_deref() == Some(destination.proposed_sha.as_str());
+            json!({
+                "destination_ref": destination.destination_ref,
+                "pre_push_sha": destination.pre_push_sha,
+                "proposed_sha": destination.proposed_sha,
+                "observed_sha": observed_sha,
+            })
+        })
+        .collect::<Vec<_>>();
+    let (classification, outcome) = if all_proposed {
+        ("succeeded", Some("succeeded"))
+    } else if all_pre_push {
+        ("failed", Some("failed"))
+    } else if every_observation_is_expected {
+        ("partial", None)
+    } else {
+        ("unknown", None)
+    };
+    ExactPushObservation {
+        classification,
+        outcome,
+        destinations,
+    }
+}
+
 fn reconcile_failed_push(
     cwd: &Path,
     planning: &PushPlanning,
@@ -221,40 +270,16 @@ fn reconcile_failed_push(
         return Some((OperationStatus::OutcomeUnknown, value));
     };
 
-    let mut all_pre_push = true;
-    let mut all_proposed = true;
-    let mut every_observation_is_expected = true;
-    let observations = plan
-        .destinations
-        .iter()
-        .map(|destination| {
-            let observed_sha = observed
-                .get(&destination.destination_ref)
-                .cloned()
-                .flatten();
-            all_pre_push &= observed_sha == destination.pre_push_sha;
-            all_proposed &= observed_sha.as_deref() == Some(destination.proposed_sha.as_str());
-            every_observation_is_expected &= observed_sha == destination.pre_push_sha
-                || observed_sha.as_deref() == Some(destination.proposed_sha.as_str());
-            json!({
-                "destination_ref": destination.destination_ref,
-                "observed_sha": observed_sha,
-            })
-        })
-        .collect::<Vec<_>>();
-    let (status, classification) = if all_proposed {
-        (OperationStatus::Succeeded, "succeeded")
-    } else if all_pre_push {
-        (OperationStatus::Failed, "failed")
-    } else if every_observation_is_expected {
-        (OperationStatus::OutcomeUnknown, "partial")
-    } else {
-        (OperationStatus::OutcomeUnknown, "unknown")
+    let observation = classify_exact_push_observation(plan, &observed);
+    let status = match observation.outcome {
+        Some("succeeded") => OperationStatus::Succeeded,
+        Some("failed") => OperationStatus::Failed,
+        _ => OperationStatus::OutcomeUnknown,
     };
     let mut value = planning.journal_value().expect("planned push");
     value["evidence"] = json!({
-        "classification": classification,
-        "destinations": observations,
+        "classification": observation.classification,
+        "destinations": observation.destinations,
     });
     if let Some(remote_contact) = remote_contact {
         value["evidence"]["remote_contact"] = json!(remote_contact.remote_contact);
@@ -2924,6 +2949,7 @@ impl Broker {
             .filter(serde_json::Value::is_object)
             .unwrap_or_else(|| json!({}));
         details["reconciliation"] = json!({
+            "source": "operator_assertion",
             "operator_reason": reason,
             "outcome": status.as_str(),
         });
@@ -2936,6 +2962,139 @@ impl Broker {
         Ok(OperationReconcileReport {
             operation,
             reason: reason.into(),
+            source: "operator_assertion",
+            outcome: Some(if succeeded { "succeeded" } else { "failed" }.into()),
+            reconciled: true,
+            evidence: None,
+        })
+    }
+
+    /// Inspect the current advertised values of an exact-ref push whose
+    /// outcome is unknown. The result is a proposal only: current remote state
+    /// cannot prove that a ref was never advanced and later rewound, so this
+    /// method records evidence without clearing the write barrier.
+    pub fn inspect_coordinated_push_operation(
+        &mut self,
+        operation_id: i64,
+        reason: &str,
+    ) -> Result<OperationReconcileReport, BrokerOpError> {
+        if reason.trim().is_empty() {
+            return Err(BrokerOpError::InvalidCoordinatedOperation {
+                reason: "remote push inspection requires a non-empty --reason".into(),
+            });
+        }
+        let operation = self.store().coordinated_operation(operation_id)?.ok_or(
+            crate::BrokerError::CoordinatedOperationNotFound(operation_id),
+        )?;
+        if operation.status != OperationStatus::OutcomeUnknown {
+            return Err(BrokerOpError::InvalidCoordinatedOperation {
+                reason: format!(
+                    "operation {} is {}, not outcome_unknown",
+                    operation_id,
+                    operation.status.as_str()
+                ),
+            });
+        }
+        if operation.provider != OperationProvider::Git
+            || operation.effect != OperationEffect::Write
+        {
+            return Err(BrokerOpError::InvalidCoordinatedOperation {
+                reason: "remote inspection only supports unknown Git write operations with an exact-ref push plan".into(),
+            });
+        }
+
+        let details = operation
+            .details_json
+            .as_deref()
+            .and_then(|details| serde_json::from_str::<serde_json::Value>(details).ok())
+            .unwrap_or_else(|| json!({}));
+        let push = details
+            .get("push_reconciliation")
+            .filter(|push| push["planning"].as_str() == Some("planned"))
+            .ok_or_else(|| BrokerOpError::InvalidCoordinatedOperation {
+                reason: "operation has no recorded exact-ref push plan; use operator reconciliation after inspecting the remote".into(),
+            })?;
+        let plan: ExactPushPlan = serde_json::from_value(push["plan"].clone()).map_err(|_| {
+            BrokerOpError::InvalidCoordinatedOperation {
+                reason: "operation's exact-ref push plan is incomplete; use operator reconciliation after inspecting the remote".into(),
+            }
+        })?;
+        if plan.remote.trim().is_empty() || plan.destinations.is_empty() {
+            return Err(BrokerOpError::InvalidCoordinatedOperation {
+                reason: "operation's exact-ref push plan has no remote or destination refs".into(),
+            });
+        }
+
+        let destination_refs = plan
+            .destinations
+            .iter()
+            .map(|destination| destination.destination_ref.clone())
+            .collect::<Vec<_>>();
+        let observed = {
+            let repo = self.repo_handle();
+            let mut seen = BTreeSet::new();
+            for destination in &plan.destinations {
+                let valid_sha =
+                    |sha: &str| sha.len() == 40 && sha.bytes().all(|byte| byte.is_ascii_hexdigit());
+                if !destination.destination_ref.starts_with("refs/")
+                    || repo
+                        .validate_push_destination(&destination.destination_ref)
+                        .is_err()
+                    || !seen.insert(destination.destination_ref.as_str())
+                    || !valid_sha(&destination.proposed_sha)
+                    || destination
+                        .pre_push_sha
+                        .as_deref()
+                        .is_some_and(|sha| !valid_sha(sha))
+                {
+                    return Err(BrokerOpError::InvalidCoordinatedOperation {
+                        reason: "operation's exact-ref push plan contains an invalid destination or object ID".into(),
+                    });
+                }
+            }
+            repo.remote_ref_oids(&plan.remote, &destination_refs)
+                .map_err(|_| BrokerOpError::InvalidCoordinatedOperation {
+                    reason: "could not inspect every exact destination on the push remote; operation remains outcome_unknown".into(),
+                })?
+        };
+
+        let observation = classify_exact_push_observation(&plan, &observed);
+        let classification = observation.classification;
+        let outcome = observation.outcome;
+        let evidence = json!({
+            "source": "remote_ref_inspection",
+            "remote": plan.remote,
+            "classification": classification,
+            "proposed_outcome": outcome,
+            "observation_scope": "current advertised refs; this is not proof of historical state",
+            "destinations": observation.destinations,
+        });
+        let mut details = details;
+        details["remote_inspection"] = json!({
+            "reason": reason,
+            "evidence": evidence,
+        });
+        let operation = self.store().transition_coordinated_operation(
+            operation_id,
+            OperationStatus::OutcomeUnknown,
+            operation.exit_code,
+            Some(&details.to_string()),
+        )?;
+        let reason = match outcome {
+            Some(outcome) => format!(
+                "remote inspection proposes {outcome}; operator reconciliation is still required"
+            ),
+            None => format!(
+                "remote inspection is inconclusive ({classification}); operation remains outcome_unknown"
+            ),
+        };
+        Ok(OperationReconcileReport {
+            operation,
+            reason,
+            source: "remote_inspection",
+            outcome: outcome.map(str::to_string),
+            reconciled: false,
+            evidence: Some(evidence),
         })
     }
 }
