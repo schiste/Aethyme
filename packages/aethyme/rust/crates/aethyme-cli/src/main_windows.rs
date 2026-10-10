@@ -20,7 +20,7 @@ fn main() -> ExitCode {
 
     match command {
         "broker" | "certify" | "init" | "hook" | "plugin" | "update" | "self-update"
-        | "upgrade" => broker_unavailable(),
+        | "upgrade" | "collab" => broker_unavailable(),
         "explore" => run_explore(&args[1..]),
         "graph" => run_graph(&args[1..]),
         "deploy" => run_deploy(&args[1..]),

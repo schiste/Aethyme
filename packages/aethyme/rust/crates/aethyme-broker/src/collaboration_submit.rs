@@ -48,6 +48,9 @@ use crate::collaboration_state::{CollaborationStateError, CollaborationStore, Pr
 /// The schema of the `collaboration_capture` report in `submit --json`.
 pub const SUBMIT_CAPTURE_SCHEMA: &str = "aethyme.submit-capture/experimental-v0";
 
+/// The `[collaboration]` settings this binary implements.
+const KNOWN_SETTINGS: &[&str] = &["capture", "project"];
+
 /// What `[collaboration] capture` asks for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Setting {
@@ -144,6 +147,32 @@ fn setting_from_text(text: Option<&str>) -> Setting {
             };
         }
     };
+    // Every [collaboration] setting is critical: a key this binary does not
+    // implement may change what the policy means, so an enabled policy
+    // carrying one is refused rather than half-applied (§6.7). A repository
+    // that has not enabled capture is unaffected.
+    let mut unknown: Vec<&str> = table
+        .keys()
+        .map(String::as_str)
+        .filter(|key| !KNOWN_SETTINGS.contains(key))
+        .collect();
+    if !unknown.is_empty() {
+        unknown.sort_unstable();
+        return Setting::Unsupported {
+            code: "unknown_setting",
+            detail: format!(
+                "[collaboration] has {} this binary does not implement ({}); only {} are \
+                 understood, so the policy is treated as required and not satisfied",
+                if unknown.len() == 1 {
+                    "a setting"
+                } else {
+                    "settings"
+                },
+                unknown.join(", "),
+                KNOWN_SETTINGS.join(" and ")
+            ),
+        };
+    }
     let project = match table.get("project") {
         Some(toml::Value::String(key)) => ProjectKey::parse(key).map_err(|error| error.to_string()),
         Some(other) => Err(format!("project must be a string, not {other}")),
@@ -1139,6 +1168,34 @@ mod tests {
                 ),
                 "{value}"
             );
+        }
+    }
+
+    /// Every [collaboration] setting is critical once capture is on: one
+    /// this binary does not implement is refused, never ignored. Without
+    /// capture enabled the repository keeps the legacy submit (#680).
+    #[test]
+    fn an_unknown_setting_is_refused_once_capture_is_on() {
+        for policy in ["advisory", "required"] {
+            let text = format!(
+                "[collaboration]\ncapture = \"{policy}\"\nproject = \"p\"\nbrief_policy = \"x\"\n"
+            );
+            assert!(
+                matches!(
+                    setting_from_text(Some(&text)),
+                    Setting::Unsupported {
+                        code: "unknown_setting",
+                        ..
+                    }
+                ),
+                "{policy}"
+            );
+        }
+        for text in [
+            "[collaboration]\nbrief_policy = \"x\"\n",
+            "[collaboration]\ncapture = \"off\"\nbrief_policy = \"x\"\n",
+        ] {
+            assert_eq!(setting_from_text(Some(text)), Setting::Off, "{text}");
         }
     }
 

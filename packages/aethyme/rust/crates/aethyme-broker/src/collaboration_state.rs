@@ -549,6 +549,28 @@ impl CollaborationStore {
     }
 }
 
+/// Where `project`'s state lives for `main_root`, after the same checks
+/// [`open_for_repository`] makes, without creating or opening anything:
+/// the root, the resolved project directory, and whether its database
+/// exists yet. Inspection commands use it so that looking never writes.
+pub fn locate_for_repository(
+    main_root: &Path,
+    project: &ProjectKey,
+) -> Result<(CollaborationRoot, PathBuf, bool), CollaborationStateError> {
+    if !crate::host_state::host_state_dir_is_explicit()
+        && crate::host_state::path_is_ephemeral(main_root)
+    {
+        return Err(CollaborationStateError::EphemeralRepository {
+            repository: main_root.to_path_buf(),
+        });
+    }
+    let root = CollaborationRoot::resolve()?;
+    let resolved = check_location(root.path(), &forbidden_roots(main_root))?;
+    let project_dir = resolved.join(project.as_str());
+    let exists = project_dir.join(STATE_DATABASE).is_file();
+    Ok((root, project_dir, exists))
+}
+
 /// Open `project`'s state under `<host state>/collaboration`, checked
 /// against every root [`forbidden_roots`] lists for `main_root`.
 ///

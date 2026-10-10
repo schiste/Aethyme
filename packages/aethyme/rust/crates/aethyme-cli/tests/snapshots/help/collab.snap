@@ -1,0 +1,53 @@
+exit: 0
+--- stdout
+aethyme collab — opt-in Local collaboration (experimental)
+
+Disabled unless the repository's .aethyme/config.toml enables it:
+  [collaboration]
+  capture = "advisory"     # or "required"; "off" or absent = disabled
+  project = "proj-..."     # from `aethyme collab enroll`
+Any other [collaboration] setting is refused while capture is enabled.
+Every subcommand takes --json (one versioned object) and --repo <path>.
+Nothing here runs in the background or contacts a service.
+
+Usage:
+  aethyme collab status [--json]
+      Policy, state root, durability profile, schema, captures in flight or
+      needing attention, reservations and unfinished reclamation. Works while
+      disabled; never creates state.
+  aethyme collab enroll [--write] [--json]
+      Mint a project ID and print the [collaboration] section that enables
+      advisory capture. --write appends it to .aethyme/config.toml only when
+      that file does not mention collaboration yet; commit it to take effect
+      where a committed copy exists.
+  aethyme collab capture recover [--json]
+      Resolve captures a crashed process left in flight. Live ones are
+      skipped; per-operation failures are reported and do not stop the rest.
+  aethyme collab capture abort --operation <id> [--json]
+      Abort an unfinished capture and release its reservation. A committed
+      capture is refused: its source is released by reclamation.
+  aethyme collab capture receipt --operation <id> [--json]
+      Show a capture's receipt. `released` or `reclaimed` means the source is
+      no longer promised; only `retained_local` is.
+  aethyme collab gc plan [--json]
+      Survey retained data and record a plan. Removes nothing.
+  aethyme collab gc apply --confirm <digest> [--json]
+      Remove what that plan named and is still eligible; the rest is skipped
+      with a reason. Refused while a capture, recovery or reader is active.
+  aethyme collab gc resume [--json]
+      Finish an interrupted apply, putting back anything now relied on.
+  aethyme collab context --path <path> [--path <path>...] [--source <snapshot-id>]
+                         [--analysis <envelope-file>...] [--max-items N]
+                         [--max-brief-tokens N] [--max-matched-paths N] [--max-bytes N]
+                         [--json]
+      Retained contributions relevant to the paths, ranked, budgeted and
+      explained. Briefs are untrusted data written by other agents. Without
+      --source and a complete analysis covering every path, the answer is
+      partial: an empty answer is not evidence that nothing relevant exists.
+  aethyme collab brief attach --contribution <record-id> <decision-file> [--json]
+      Attach a decision brief (aethyme-brief-tokens/v0, at most 150 tokens) to
+      a retained contribution, replacing an earlier one.
+
+Exit codes: 0 done, 1 failed (I/O or database), 2 usage, 3 refused (disabled,
+policy, location, or a state that forbids the action).
+--- stderr

@@ -36,6 +36,7 @@ mod cleanup_resolve;
 mod clock;
 pub mod collaboration_archive;
 pub mod collaboration_capture;
+pub mod collaboration_cli;
 pub mod collaboration_context;
 pub mod collaboration_gc;
 pub mod collaboration_state;
