@@ -89,7 +89,7 @@ pub fn archive_use(store: &CollaborationStore) -> std::io::Result<ArchiveUse> {
 pub fn try_archive_use(store: &CollaborationStore) -> std::io::Result<Option<ArchiveUse>> {
     let file = open_archive_lock(store)?;
     match file.try_lock_shared() {
-        Ok(()) => Ok(Some(ArchiveUse { file })),
+        Ok(()) => Ok(Some(ArchiveUse { _file: file })),
         Err(std::fs::TryLockError::WouldBlock) => Ok(None),
         Err(std::fs::TryLockError::Error(source)) => Err(source),
     }
