@@ -873,7 +873,24 @@ impl Broker {
         // landing proof. Finish keeps #152's explicit confirmation gate for
         // non-ancestry deliveries: a content or patch match is a candidate,
         // not permission to delete the only worktree, until it is recorded.
-        let delivery_targets = self.cleanup_delivery_targets()?;
+        // An adopted session can use the primary checkout itself. Its own
+        // HEAD must not count as proof that its commits were delivered; only
+        // independent integration and upstream refs can establish that.
+        let delivery_targets =
+            if std::path::Path::new(&session.worktree_path) == self.main_root.as_path() {
+                let mut targets = Vec::new();
+                if let Some(integration) = self.integration_tip() {
+                    targets.push(integration);
+                }
+                if let Some((_, upstream)) = self.repo.tracking_upstream() {
+                    targets.push(upstream);
+                }
+                targets.sort();
+                targets.dedup();
+                targets
+            } else {
+                self.cleanup_delivery_targets()?
+            };
         let landing = self.landing_on_delivery_targets(head, &delivery_targets)?;
 
         // Unlike a historical queue status, a representation record only
