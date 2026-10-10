@@ -800,8 +800,10 @@ impl ObjectReader {
 
 impl Drop for ObjectReader {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        // The reader is finished or failed; stop Git and reap it so no
+        // process outlives the capture. Nothing read depends on this.
+        crate::warn_unrecorded("stop the git object reader", self.child.kill());
+        crate::warn_unrecorded("reap the git object reader", self.child.wait());
     }
 }
 
