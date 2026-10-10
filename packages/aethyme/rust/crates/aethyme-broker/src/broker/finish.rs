@@ -869,27 +869,30 @@ impl Broker {
             .find(|entry| entry.session_id == session_id);
         let visible_entry = latest_for_head.or(latest_for_session);
 
-        // Promotion commonly represents the accepted session tree under a
-        // different integration commit SHA. Resetting the checkout to that
-        // recorded counterpart is delivered even without a queue row at HEAD.
-        let submitted_head_is_delivered = latest_for_head.is_some_and(|entry| {
-            matches!(
-                entry.status,
-                MergeStatus::Promoted | MergeStatus::ExternallyLanded
-            )
-        }) || session.accepted_integration_commit.as_deref()
-            == Some(head);
-        // Work merged through a reviewed pull request is on the default branch
-        // but leaves no promotion row, and ancestry cannot see it because a
-        // squash rewrites the SHA. A recorded representation is the evidence
-        // that it landed (#152); without it the session can never close.
-        let representation = self.store.session_representation(session_id, head)?;
-        let remote_default_tip = self.remote_tracking_default_tip();
-        let on_remote_default = remote_default_tip
-            .as_deref()
-            .is_some_and(|tip| self.repo.is_ancestor(head, tip));
+        // Use cleanup's exact delivery proof so a historical queue row or a
+        // stale representation record cannot make finish disagree with cleanup.
+        let delivery_targets = self.cleanup_delivery_targets()?;
+        let (delivery_provenance, _) = self.cleanup_provenance(session, head, &delivery_targets)?;
         let head_is_delivered =
-            submitted_head_is_delivered || representation.is_some() || on_remote_default;
+            delivery_provenance.representation == crate::CleanupRepresentation::Represented;
+
+        // A stored record appears in the report only when cleanup's record
+        // validation finds its carrying commit on one of the current targets.
+        let representation = if self
+            .recorded_representation_evidence(session, head, &delivery_targets)?
+            .is_some()
+        {
+            self.store.session_representation(session_id, head)?
+        } else {
+            None
+        };
+        let remote_default_tip = self.remote_tracking_default_tip();
+        let on_remote_default = if let Some(tip) = remote_default_tip.as_ref() {
+            self.landing_on_delivery_targets(head, std::slice::from_ref(tip))?
+                .is_some()
+        } else {
+            false
+        };
         let unsubmitted_commits = if head_is_delivered {
             0
         } else {
@@ -909,7 +912,7 @@ impl Broker {
                             .count() as u64
                     })
             });
-            if let Some(pending) = pending_from_plan {
+            if let Some(pending) = pending_from_plan.filter(|pending| *pending > 0) {
                 pending
             } else {
                 let upstream = self.repo.upstream_default().map(|(_, commit)| commit);
