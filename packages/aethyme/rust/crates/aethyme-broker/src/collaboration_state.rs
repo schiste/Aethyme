@@ -37,16 +37,19 @@ use serde::Serialize;
 pub use crate::host_state::HostStateSource;
 
 /// The schema this binary writes.
-pub const COLLABORATION_STATE_SCHEMA_VERSION: i64 = 4;
+pub const COLLABORATION_STATE_SCHEMA_VERSION: i64 = 5;
 /// The oldest schema a database written by this binary can be read by.
 /// Unlike `host-operations.db`, a newer database stays readable by an older
 /// binary until a release raises this floor.
 ///
 /// Raised to 4 with reclamation (#659): a schema 3 binary would capture
 /// without the archive lock, the reuse refresh or the reclaimed-marker
-/// clearing, so reclamation could remove source it had just named. No
-/// release shipped schema 2 or 3, so nothing that exists is locked out.
-const MIN_COMPATIBLE_SCHEMA: i64 = 4;
+/// clearing, so reclamation could remove source it had just named. Raised
+/// to 5 with contribution context (#661): a schema 4 binary's reclamation
+/// does not treat attached brief objects as roots, so it could remove the
+/// brief of a live contribution. No release shipped schemas 2 to 4, so
+/// nothing that exists is locked out.
+const MIN_COMPATIBLE_SCHEMA: i64 = 5;
 const ROOT_DIRECTORY: &str = "collaboration";
 /// Additive schema steps after the version 1 layout (`meta` only), applied in
 /// order. Each only adds tables; after migrating, the compatibility floor is
@@ -178,6 +181,35 @@ const MIGRATIONS: &[(i64, &str)] = &[
              relpath TEXT NOT NULL,
              bytes INTEGER NOT NULL,
              PRIMARY KEY (generation, relpath)
+         ) STRICT;",
+    ),
+    (
+        5,
+        // Contribution context (#661). `contribution_briefs` is authority:
+        // which brief explains a contribution (a revision replaces it).
+        // `context_postings`, `context_indexed` and `context_unreadable`
+        // are derived from the archive and rebuildable at any time.
+        "CREATE TABLE IF NOT EXISTS contribution_briefs (
+             lineage_record_id TEXT PRIMARY KEY NOT NULL
+                 REFERENCES retained_contributions (lineage_record_id),
+             brief_record_id TEXT NOT NULL,
+             brief_sha256 TEXT NOT NULL,
+             attached_ms INTEGER NOT NULL
+         ) STRICT;
+         CREATE TABLE IF NOT EXISTS context_postings (
+             key BLOB NOT NULL,
+             lineage_record_id TEXT NOT NULL,
+             PRIMARY KEY (key, lineage_record_id)
+         ) STRICT;
+         CREATE INDEX IF NOT EXISTS context_postings_by_contribution
+             ON context_postings (lineage_record_id);
+         CREATE TABLE IF NOT EXISTS context_indexed (
+             lineage_record_id TEXT PRIMARY KEY NOT NULL,
+             brief_record_id TEXT
+         ) STRICT;
+         CREATE TABLE IF NOT EXISTS context_unreadable (
+             lineage_record_id TEXT PRIMARY KEY NOT NULL,
+             generation INTEGER NOT NULL
          ) STRICT;",
     ),
 ];
@@ -1306,7 +1338,7 @@ mod tests {
         };
         let host = tempfile::tempdir().unwrap();
         let mut store = open(host.path(), &[]).unwrap();
-        assert_eq!(floor(&store), 4);
+        assert_eq!(floor(&store), MIN_COMPATIBLE_SCHEMA);
         // As a schema 3 binary left it.
         store
             .connection()
@@ -1317,8 +1349,21 @@ mod tests {
             .unwrap();
         drop(store);
         let store = open(host.path(), &[]).unwrap();
-        assert_eq!(store.schema_version(), 4);
-        assert_eq!(floor(&store), 4);
+        assert_eq!(store.schema_version(), COLLABORATION_STATE_SCHEMA_VERSION);
+        assert_eq!(floor(&store), MIN_COMPATIBLE_SCHEMA);
+    }
+
+    /// Migrations run in list order and skip versions at or below the
+    /// stored one, so a gap or a reordering would leave some store without
+    /// a step. They must be 2, 3, ... up to this binary's version.
+    #[test]
+    fn migrations_are_contiguous_and_end_at_this_binarys_version() {
+        let versions: Vec<i64> = MIGRATIONS.iter().map(|(version, _)| *version).collect();
+        let expected: Vec<i64> = (2..=COLLABORATION_STATE_SCHEMA_VERSION).collect();
+        assert_eq!(versions, expected);
+        const { assert!(MIN_COMPATIBLE_SCHEMA <= COLLABORATION_STATE_SCHEMA_VERSION) };
+        // A schema 4 binary's reclamation does not keep attached briefs.
+        const { assert!(MIN_COMPATIBLE_SCHEMA >= 5) };
     }
 
     const CRASH_CHILD: &str = "AETHYME_COLLABORATION_CRASH_CHILD";
