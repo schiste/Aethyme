@@ -325,27 +325,9 @@ pub(crate) fn require_trusted(
     store: Option<&mut BrokerStore>,
     session_id: Option<i64>,
 ) -> Result<TrustDecision, BrokerOpError> {
-    if !policy.runs_commands() {
-        return Ok(TrustDecision::NoCommands);
-    }
-    let path = record_path(main_root)?;
-    let record = read_record(&path)?;
-    let trusted = record.as_ref().map(|r| r.trusted.as_slice()).unwrap_or(&[]);
-    if trusted
-        .iter()
-        .any(|entry| entry.policy_sha256 == policy.policy_sha256)
-    {
-        return Ok(TrustDecision::Trusted);
-    }
-    // Before grandfathering: test fixtures build gate history in throwaway
-    // repositories, and recording trust for each of them would litter the
-    // host state directory.
-    if test_escape_enabled() {
-        return Ok(TrustDecision::TestEscape);
-    }
-    if trusted.is_empty()
+    let decision = assess_trusted(main_root, policy, store.as_deref())?;
+    if decision == TrustDecision::Grandfathered
         && let Some(store) = store
-        && has_gate_history(store)
     {
         // Everything the repository visibly declares now is what it was
         // already running: the policy being enforced, the main checkout's,
@@ -366,6 +348,37 @@ pub(crate) fn require_trusted(
                 )),
             )?;
         }
+    }
+    Ok(decision)
+}
+
+/// The decision [`require_trusted`] would reach, without recording anything:
+/// `Grandfathered` means it would record trust and proceed. For callers that
+/// must not write, such as building a candidate for inspection (#663).
+pub(crate) fn assess_trusted(
+    main_root: &Path,
+    policy: &GatePolicy,
+    store: Option<&BrokerStore>,
+) -> Result<TrustDecision, BrokerOpError> {
+    if !policy.runs_commands() {
+        return Ok(TrustDecision::NoCommands);
+    }
+    let path = record_path(main_root)?;
+    let record = read_record(&path)?;
+    let trusted = record.as_ref().map(|r| r.trusted.as_slice()).unwrap_or(&[]);
+    if trusted
+        .iter()
+        .any(|entry| entry.policy_sha256 == policy.policy_sha256)
+    {
+        return Ok(TrustDecision::Trusted);
+    }
+    // Before grandfathering: test fixtures build gate history in throwaway
+    // repositories, and recording trust for each of them would litter the
+    // host state directory.
+    if test_escape_enabled() {
+        return Ok(TrustDecision::TestEscape);
+    }
+    if trusted.is_empty() && store.is_some_and(has_gate_history) {
         return Ok(TrustDecision::Grandfathered);
     }
     Err(BrokerOpError::GatePolicyUntrusted {

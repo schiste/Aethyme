@@ -1075,6 +1075,66 @@ fn attribute_set_by_tree(
 
 // ---------------------------------------------------------------- capture
 
+/// The file entries of `commit`'s tree, in Git order. Gitlinks (160000) and
+/// any other non-file mode are refused here; a mode #652 accepts is always a
+/// blob.
+fn commit_entries(
+    reader: &mut ObjectReader,
+    commit: &CommitOid,
+) -> Result<Vec<TreeEntry>, ArchiveError> {
+    let (kind, body) = reader.read_whole(commit.as_str())?;
+    if kind != "commit" {
+        return Err(ArchiveError::NotACommit {
+            oid: commit.as_str().to_string(),
+        });
+    }
+    let root = commit_tree(commit.as_str(), &body, reader.format)?;
+    let mut tree = Vec::new();
+    walk_tree(reader, &root, &mut tree)?;
+    for entry in &tree {
+        if EntryKind::from_git_mode(&entry.mode).is_err() {
+            return Err(ArchiveError::UnsupportedEntry {
+                path: entry.path.clone(),
+                mode: entry.mode.clone(),
+            });
+        }
+    }
+    Ok(tree)
+}
+
+/// The #652 snapshot of `commit`'s committed bytes, read from the repository
+/// and retained nowhere. It names a candidate before anything decides to keep
+/// it (#663); [`retain_snapshot_with`] of the same commit yields the same ID.
+pub fn snapshot_of_commit(repo: &Path, commit: &CommitOid) -> Result<SourceSnapshot, ArchiveError> {
+    refuse_partial_clone(repo)?;
+    let mut reader = ObjectReader::open(repo)?;
+    let tree = commit_entries(&mut reader, commit)?;
+    let mut entries = Vec::with_capacity(tree.len());
+    for entry in &tree {
+        let Some((kind, size)) = reader.request(&entry.oid)? else {
+            return Err(ArchiveError::SourceUnavailable {
+                oid: entry.oid.clone(),
+                detail: format!(
+                    "blob for {} is missing from the repository",
+                    String::from_utf8_lossy(&entry.path)
+                ),
+            });
+        };
+        if kind != "blob" {
+            return Err(ArchiveError::SourceMismatch {
+                oid: entry.oid.clone(),
+            });
+        }
+        let content = reader.copy_body(&entry.oid, &kind, size, &mut std::io::sink())?;
+        entries.push(SourceEntry::from_content_digest(
+            entry.path.clone(),
+            EntryKind::from_git_mode(&entry.mode).expect("checked by commit_entries"),
+            content,
+        ));
+    }
+    Ok(SourceSnapshot::new(entries)?)
+}
+
 /// Retain the tree of `commit` from `repo`: every blob, the #652 manifest,
 /// and a retained-snapshot record. Idempotent: retaining the same commit
 /// again copies nothing new and returns the same snapshot.
@@ -1101,25 +1161,7 @@ pub(crate) fn retain_snapshot_with(
     refuse_partial_clone(repo)?;
     let mut reader = ObjectReader::open(repo)?;
     let format = reader.format;
-    let (kind, body) = reader.read_whole(commit.as_str())?;
-    if kind != "commit" {
-        return Err(ArchiveError::NotACommit {
-            oid: commit.as_str().to_string(),
-        });
-    }
-    let root = commit_tree(commit.as_str(), &body, format)?;
-    let mut tree = Vec::new();
-    walk_tree(&mut reader, &root, &mut tree)?;
-    for entry in &tree {
-        // Gitlinks (160000) and any other non-file mode are refused here; a
-        // mode #652 accepts is always a blob.
-        if EntryKind::from_git_mode(&entry.mode).is_err() {
-            return Err(ArchiveError::UnsupportedEntry {
-                path: entry.path.clone(),
-                mode: entry.mode.clone(),
-            });
-        }
-    }
+    let tree = commit_entries(&mut reader, commit)?;
     let paths: Vec<&[u8]> = tree.iter().map(|entry| entry.path.as_slice()).collect();
     refuse_transforming_attributes(repo, commit, &paths)?;
     // Validate paths before copying anything.
@@ -1956,6 +1998,50 @@ mod tests {
         assert_eq!(object_count(&store), 7);
         let dest = tempfile::tempdir().unwrap();
         reconstruct(&store, &retained.snapshot_id, dest.path()).unwrap();
+    }
+
+    /// #663 names a candidate by the snapshot it would retain, before
+    /// anything is retained: same ID as the archive and the independent
+    /// oracle, and the store untouched.
+    #[test]
+    fn a_commit_snapshot_matches_what_retaining_it_would_name() {
+        let source = repo();
+        let checkout = tempfile::tempdir().unwrap();
+        git_in(
+            source.path(),
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "--detach",
+                checkout.path().to_str().unwrap(),
+            ],
+        );
+        std::fs::remove_file(checkout.path().join(".git")).unwrap();
+        let snapshot = snapshot_of_commit(source.path(), &head(source.path())).unwrap();
+        assert_eq!(snapshot.id().as_str(), oracle_id(checkout.path()));
+        let (_host, mut store) = store();
+        assert_eq!(object_count(&store), 0);
+        let retained = retain_snapshot(&mut store, source.path(), &head(source.path())).unwrap();
+        assert_eq!(snapshot.id(), retained.snapshot_id);
+    }
+
+    #[test]
+    fn a_commit_snapshot_refuses_a_submodule() {
+        let source = repo();
+        let oid = git_in(source.path(), &["rev-parse", "HEAD"]);
+        git_in(
+            source.path(),
+            &[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                &format!("160000,{oid},vendor/sub"),
+            ],
+        );
+        git_in(source.path(), &["commit", "-qm", "add a gitlink"]);
+        let error = snapshot_of_commit(source.path(), &head(source.path())).unwrap_err();
+        assert_eq!(error.code(), "unsupported_entry", "{error}");
     }
 
     #[test]

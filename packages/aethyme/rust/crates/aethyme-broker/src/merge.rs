@@ -492,10 +492,10 @@ pub struct SubmissionConflict {
     pub commands: Vec<String>,
 }
 
-struct SubmissionReplay {
-    tree: String,
-    conflicts: Vec<String>,
-    conflict_details: Vec<SubmissionConflict>,
+pub(crate) struct SubmissionReplay {
+    pub(crate) tree: String,
+    pub(crate) conflicts: Vec<String>,
+    pub(crate) conflict_details: Vec<SubmissionConflict>,
 }
 
 impl Broker {
@@ -1249,7 +1249,7 @@ impl Broker {
         })
     }
 
-    fn replay_submission_plan(
+    pub(crate) fn replay_submission_plan(
         &self,
         plan: &SubmissionPlan,
     ) -> Result<SubmissionReplay, BrokerOpError> {
