@@ -55,6 +55,7 @@ mod file_lock;
 mod gate_admission;
 mod gate_cache_gc;
 mod gate_database;
+mod outbox;
 pub use gate_database::GateBrokerDatabase;
 mod gate_debris;
 pub use gate_debris::{

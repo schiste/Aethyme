@@ -15,7 +15,6 @@ use std::process::Command;
 
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
 
-use crate::delivery::MAX_DELIVERY_ATTEMPTS;
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -914,15 +913,14 @@ impl Broker {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let row_id: Option<i64> = tx
             .query_row(
-                "SELECT o.id
-                 FROM repository_delivery_outbox o
-                 JOIN repository_delivery_subscriptions s ON s.id = o.subscription_id
-                 WHERE s.adapter = ?1 AND s.active = 1
-                   AND ((o.status = 'pending' AND o.attempt_count = 0)
-                        OR (o.status = 'pending' AND o.attempt_count > 0
-                            AND o.updated_at + MIN(15000 * (1 << MIN(o.attempt_count - 1, 5)), 300000) <= ?2)
-                        OR (o.status = 'claimed' AND o.claim_expires_at <= ?2))
-                 ORDER BY o.id LIMIT 1",
+                &format!(
+                    "SELECT o.id
+                     FROM repository_delivery_outbox o
+                     JOIN repository_delivery_subscriptions s ON s.id = o.subscription_id
+                     WHERE s.adapter = ?1 AND s.active = 1 AND {}
+                     ORDER BY o.id LIMIT 1",
+                    crate::outbox::CLAIMABLE_PREDICATE_SQL
+                ),
                 params![adapter, now_ms],
                 |row| row.get(0),
             )
@@ -931,12 +929,10 @@ impl Broker {
             tx.commit()?;
             return Ok(None);
         };
+        let claim_update =
+            crate::outbox::claim_update_statement(crate::outbox::OutboxTable::Repository);
         tx.execute(
-            "UPDATE repository_delivery_outbox
-             SET status = 'claimed', generation = generation + 1, claimed_by = ?2,
-                 claim_expires_at = ?3, attempt_count = attempt_count + 1,
-                 last_error_code = NULL, updated_at = ?4
-             WHERE id = ?1",
+            &claim_update,
             params![
                 row_id,
                 worker,
@@ -1000,13 +996,15 @@ impl Broker {
     ) -> Result<RepositoryDeliveryItem, BrokerOpError> {
         let envelope = self.repository_delivery_envelope(public_id)?;
         let current = &envelope.item;
-        if current.status != DeliveryStatus::Claimed
-            || current.claimed_by.as_deref() != Some(worker)
-            || current.generation != generation
-            || current
-                .claim_expires_at
-                .is_none_or(|expiry| expiry <= now_ms)
-        {
+        if !crate::outbox::claim_is_current(
+            current.status,
+            current.claimed_by.as_deref(),
+            current.generation,
+            current.claim_expires_at,
+            worker,
+            generation,
+            now_ms,
+        ) {
             return Err(BrokerError::DeliveryClaimChanged {
                 id: public_id,
                 worker: worker.into(),
@@ -1014,25 +1012,18 @@ impl Broker {
             }
             .into());
         }
-        let (status, delivered_at) = match completion {
-            DeliveryCompletion::Delivered => (DeliveryStatus::Delivered, Some(now_ms)),
-            DeliveryCompletion::Retry if current.attempt_count >= MAX_DELIVERY_ATTEMPTS => {
-                (DeliveryStatus::Failed, None)
-            }
-            DeliveryCompletion::Retry => (DeliveryStatus::Pending, None),
-            DeliveryCompletion::Failed => (DeliveryStatus::Failed, None),
-        };
+        let (status, delivered_at) =
+            crate::outbox::completion_state(completion, current.attempt_count, now_ms);
         let row_id = public_id - REPOSITORY_DELIVERY_ID_BASE;
         let session_id = envelope.watch.session_id;
         let subscription_id = envelope.subscription.id;
         let adapter = envelope.subscription.adapter.clone();
         let conn = self.store().connection_mut();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let completion_update =
+            crate::outbox::completion_update_statement(crate::outbox::OutboxTable::Repository);
         let updated = tx.execute(
-            "UPDATE repository_delivery_outbox
-             SET status = ?2, claimed_by = NULL, claim_expires_at = NULL,
-                 last_error_code = ?3, delivered_at = ?4, updated_at = ?5
-             WHERE id = ?1 AND status = 'claimed' AND generation = ?6 AND claimed_by = ?7",
+            &completion_update,
             params![
                 row_id,
                 status.as_str(),

@@ -18,7 +18,7 @@ use sha2::{Digest, Sha256};
 
 use crate::delivery::{
     DELIVERY_OUTBOX_SCHEMA_VERSION, DeliveryCompletion, DeliveryOutboxItem, DeliveryPolicy,
-    DeliveryStatus, DeliverySubscription, MAX_DELIVERY_ATTEMPTS,
+    DeliveryStatus, DeliverySubscription,
 };
 use crate::error::BrokerError;
 use crate::external_events::{
