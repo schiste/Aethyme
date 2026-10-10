@@ -1465,6 +1465,68 @@ pub fn retained(
     }))
 }
 
+/// The archive's entry for the contribution whose lineage record is
+/// `lineage`, if its record and both snapshots are still retained. The
+/// lineage record is re-read and must hash to its row and decode to
+/// `lineage`, so a damaged index cannot substitute another contribution.
+pub fn retained_contribution(
+    store: &CollaborationStore,
+    lineage: &RecordId,
+) -> Result<Option<RetainedContribution>, ArchiveError> {
+    let row = store
+        .read_connection()
+        .query_row(
+            "SELECT record_sha256, base_snapshot, result_snapshot
+             FROM retained_contributions WHERE lineage_record_id = ?1
+               AND lineage_record_id NOT IN
+                   (SELECT lineage_record_id FROM reclaimed_contributions)",
+            [lineage.as_str()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((record_sha256, base, result)) = row else {
+        return Ok(None);
+    };
+    let corrupt = || ArchiveError::CorruptObject {
+        digest: record_sha256.clone(),
+    };
+    let digest = parse_digest(&record_sha256).ok_or_else(corrupt)?;
+    let bytes = read_object(store, &digest)?;
+    let record = Record::decode(&bytes, &[&CONTRIBUTION_LINEAGE_SCHEMA]).map_err(|_| corrupt())?;
+    if record.id() != *lineage {
+        return Err(corrupt());
+    }
+    let snapshot = |text: &str| SourceSnapshotId::parse(text).map_err(|_| corrupt());
+    let (Some(base), Some(result)) = (
+        retained(store, &snapshot(&base)?)?,
+        retained(store, &snapshot(&result)?)?,
+    ) else {
+        return Ok(None);
+    };
+    Ok(Some(RetainedContribution {
+        base,
+        result,
+        lineage_record_id: lineage.clone(),
+    }))
+}
+
+fn parse_digest(hex: &str) -> Option<ObjectDigest> {
+    if !is_lower_hex(hex, &[64]) {
+        return None;
+    }
+    let mut digest = [0; 32];
+    for (i, byte) in digest.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).ok()?;
+    }
+    Some(ObjectDigest(digest))
+}
+
 // ----------------------------------------------------------- reconstruct
 
 /// Parse a #652 manifest back into a snapshot. The caller has already
