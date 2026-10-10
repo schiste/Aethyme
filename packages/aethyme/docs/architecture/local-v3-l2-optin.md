@@ -77,6 +77,14 @@ path.
   treated as a required capture that cannot be satisfied. A binary must never
   treat a policy it does not implement as met. This is the forward half of "older
   clients cannot acknowledge a policy they do not implement".
+- **Unknown keys depend on the policy (#680).** Under `required`, any
+  `[collaboration]` key other than `capture` and `project` is refused
+  (`unknown_setting`), because required gates the submit and must not be
+  half-applied. Under `advisory` the key is ignored: the submit proceeds and capture
+  runs. The capture report lists it as `ignored_settings`, with a warning line. A
+  typo, or a key a newer binary added, never stops an advisory submit, which
+  advisory capture cannot block anyway. Without capture enabled the key changes
+  nothing.
 
 ### Which promotions required capture gates
 

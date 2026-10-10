@@ -575,13 +575,28 @@ be `null` for a failure with no known remedy.
 store exists `durability`, `receipt_label`, `schema_version`,
 `min_compatible_schema`; or `refusal` with `code` and `next_action`),
 `captures` (`by_state`, `reserved_bytes`, `attention`), `gc`
-(`unfinished_generations`), `collaboration_fence` (the broker.db fence #660
-raises under required capture, as `broker status` reports it, or `null`) and
-`next_actions`. It never creates state and never raises the fence: it reads
-broker.db from a read-only snapshot.
+(`unfinished_generations`), `collaboration_fence` (as `broker status` reports
+it: `state` `pending` or `active`, `source`, `min_compatible_schema`,
+`reason`; or `null`), `collaboration_fence_error` (`code`, `message`) when the
+fence cannot be read, `ignored_settings` when advisory capture ignores
+unknown `[collaboration]` keys, `state.needs_migration`, `state.refusal` for a
+store that cannot be read, and `next_actions`. It writes nothing: the store
+and broker.db are read through read-only snapshots.
 
 `collab context` wraps the `aethyme.contribution-context/experimental-v0`
 record as `context`, with `served` (`fresh` or `cache`), `stored`,
 `cache_key`, `context_id` and `absence_is_evidence`. Briefs inside it carry
 `role: untrusted_data`. `collab gc plan` adds `recorded`: only a recorded
-plan can be applied.
+plan can be applied. `collab enroll` adds `path`, the file written with
+`--write` (`null` otherwise).
+
+`command` in the error object holds only subcommand verbs, never a path or
+an argument value. Integrity failures (`corrupt_receipt`, `corrupt_object`,
+`missing_object`, `failed`) exit 1; exit 3 means refused. On Windows, where
+the broker is not yet supported, `collab --json` prints this error object
+with `code` `unsupported_platform` and exits 3.
+
+Under `capture = "advisory"`, `broker submit --json`'s `collaboration_capture`
+gains `ignored_settings` (sorted) when the config carries `[collaboration]`
+keys this binary does not implement; text output adds one warning line.
+Under `required` such a key is refused as `unknown_setting`.
