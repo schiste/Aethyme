@@ -101,7 +101,7 @@ The paths this covers:
   `Broker::submit`, `submit_with_intent` and `submit_with_policy`. A library
   submit that bypassed the capture verifies, then refuses to promote, and the
   entry stays `verified`;
-- `aethyme broker promote --entry N`;
+- `aethyme broker submit promote --entry N`;
 - `reverify_and_promote`, when the base moved after verification;
 - the queue drain inside `promote`, which re-simulates other entries after a
   promotion. Its errors are already swallowed, so an uncaptured entry stays
