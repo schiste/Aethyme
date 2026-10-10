@@ -7,17 +7,21 @@
 //!
 //! 1. **Retain.** Every input is read from the archive, never a worktree:
 //!    the lineage record is re-hashed and every manifest and blob is checked
-//!    against its digest. An input that is not retained is `missing_input`.
+//!    against its digest. An input that is not retained, or known by id
+//!    only, is `missing_input`. The baseline commit is retained first, read
+//!    from Git exactly as capture reads it.
 //! 2. **Close dependencies.** Two revisions of one contribution are
 //!    `competing_revisions`, as is a requirement satisfied only by another
 //!    revision of it, or a synthesized result selected beside one of its
 //!    constituents. A requirement, or an atomic group member, that is not
 //!    selected is `missing_input`; a cycle is `dependency_cycle`.
 //! 3. **Normalize lineage.** A contribution applies only its own change from
-//!    base to result. Its base is the baseline, or exactly the result of
-//!    another selected contribution (which then goes first). The result of a
-//!    known but unselected contribution is `missing_input`; anything else is
-//!    `unknown_base`. The same contribution delivered twice applies once.
+//!    base to result. Its base is the baseline or accepted history the
+//!    baseline descends from, or exactly the result of another selected
+//!    contribution (which then goes first). The result of a known but
+//!    unselected contribution is `missing_input`; anything else is
+//!    `unknown_base`. A contribution delivered twice, by name or by lineage,
+//!    applies once.
 //! 4. **Freeze the order.** Topological, then the order of first delivery.
 //!    The order, the profile, the engine version and every input digest go
 //!    into a composition recipe record.
@@ -110,12 +114,14 @@ pub static COMPOSITION_RECIPE_SCHEMA: RecordSchema = RecordSchema {
     capabilities: &[],
 };
 
-/// One contribution the caller knows about, by its retained lineage record.
+/// One contribution the caller knows about, by its lineage record.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContributionSpec {
     /// The caller's name for it; requirements and deliveries use it.
     pub id: String,
-    pub lineage: RecordId,
+    /// Its lineage record, or `None` when the caller knows the contribution
+    /// exists but holds no record of it: it is not retained either way.
+    pub lineage: Option<RecordId>,
     /// Contributions this one needs in the same candidate.
     pub requires: Vec<String>,
     /// Contributions sharing a group are accepted together or not at all.
@@ -163,7 +169,12 @@ pub struct BudgetUsage {
 /// to deliver, in policy order. Repeats in `deliveries` apply once.
 #[derive(Debug, Clone)]
 pub struct CompositionRequest {
-    pub baseline: SourceSnapshotId,
+    /// The accepted commit to build on. The composer retains its snapshot,
+    /// read and verified from Git as capture reads it.
+    pub baseline: CommitOid,
+    /// Accepted history the baseline descends from. A contribution based
+    /// on one of these applies its change three-way onto the baseline.
+    pub accepted: Vec<CommitOid>,
     pub catalog: Vec<ContributionSpec>,
     pub deliveries: Vec<String>,
     pub budget: CompositionBudget,
@@ -301,7 +312,7 @@ pub fn recompose_without(
         let Some(spec) = catalog.get(id.as_str()) else {
             return refuse(format!("constituent {id} is not a known contribution"));
         };
-        if collaboration_archive::retained_contribution(store, &spec.lineage)?.is_none() {
+        if retained_of(store, spec)?.is_none() {
             return refuse(format!(
                 "constituent {id} is no longer retained, so {} cannot be recomposed without {}",
                 from.id,
@@ -309,8 +320,7 @@ pub fn recompose_without(
             ));
         }
     }
-    let from_result = collaboration_archive::retained_contribution(store, &from.lineage)?
-        .map(|retained| retained.result.snapshot_id);
+    let from_result = retained_of(store, from)?.map(|retained| retained.result.snapshot_id);
     for kept in &subtraction.keep {
         if depends_on(&catalog, kept, &from.id) {
             return refuse(format!(
@@ -319,8 +329,7 @@ pub fn recompose_without(
             ));
         }
         if let (Some(spec), Some(from_result)) = (catalog.get(kept.as_str()), &from_result)
-            && let Some(retained) =
-                collaboration_archive::retained_contribution(store, &spec.lineage)?
+            && let Some(retained) = retained_of(store, spec)?
             && retained.base.snapshot_id == *from_result
         {
             return refuse(format!("{kept} was built on {}", from.id));
@@ -329,6 +338,17 @@ pub fn recompose_without(
     let mut deliveries = originals.clone();
     deliveries.extend(subtraction.keep.iter().cloned());
     compose_inner(store, repo, request, &deliveries, Some(subtraction))
+}
+
+/// The archive's entry for `spec`, if it has a lineage and it is retained.
+fn retained_of(
+    store: &CollaborationStore,
+    spec: &ContributionSpec,
+) -> Result<Option<RetainedContribution>, ArchiveError> {
+    match &spec.lineage {
+        Some(lineage) => collaboration_archive::retained_contribution(store, lineage),
+        None => Ok(None),
+    }
 }
 
 fn depends_on(catalog: &BTreeMap<&str, &ContributionSpec>, id: &str, target: &str) -> bool {
@@ -377,7 +397,70 @@ fn compose_inner(
         .map_err(|source| io(&crate::collaboration_gc::lock_path(store), source))?;
     let mut usage = BudgetUsage::default();
     let mut order = Vec::new();
-    let (candidate, plan) = match build(store, repo, request, deliveries, &mut usage, &mut order)? {
+    let unavailable = |detail: String, error: ArchiveError| -> Result<Composition, ComposeError> {
+        let outcome = match error {
+            ArchiveError::UnsupportedEntry { .. }
+            | ArchiveError::UnsupportedFilter { .. }
+            | ArchiveError::InvalidSnapshot(_) => CompositionOutcome::Unsupported {
+                reason: crate::composition::Unsupported::SnapshotEntry,
+                detail: format!("{detail}: {error}"),
+            },
+            error
+                if error.is_incomplete()
+                    || matches!(
+                        error,
+                        ArchiveError::NotACommit { .. } | ArchiveError::UnknownRevision { .. }
+                    ) =>
+            {
+                CompositionOutcome::Refused {
+                    reason: Refusal::MissingInput,
+                    detail: format!("{detail}: {error}"),
+                }
+            }
+            error => return Err(error.into()),
+        };
+        Ok(Composition {
+            outcome,
+            recipe: None,
+            order: Vec::new(),
+            usage: BudgetUsage::default(),
+        })
+    };
+    // The baseline is retained like any input, and the candidate's parent
+    // is the commit asked for, whichever commit first retained its content.
+    let baseline = match collaboration_archive::retain_snapshot_with(
+        store,
+        repo,
+        &request.baseline,
+        &mut |_| Ok(()),
+    ) {
+        Ok(retained) => RetainedSnapshot {
+            commit: request.baseline.clone(),
+            ..retained
+        },
+        Err(error) => return unavailable(format!("baseline {}", request.baseline.as_str()), error),
+    };
+    let mut accepted = Vec::with_capacity(request.accepted.len());
+    for commit in &request.accepted {
+        match collaboration_archive::snapshot_of_commit(repo, commit) {
+            Ok(snapshot) => accepted.push(snapshot.id()),
+            Err(error) => {
+                return unavailable(format!("accepted commit {}", commit.as_str()), error);
+            }
+        }
+    }
+    let (candidate, plan) = match build(
+        store,
+        repo,
+        request,
+        &Baseline {
+            retained: baseline,
+            accepted,
+        },
+        deliveries,
+        &mut usage,
+        &mut order,
+    )? {
         Ok(Built::Candidate(candidate, plan)) => (candidate, plan),
         Ok(Built::Other(outcome)) => {
             return Ok(Composition {
@@ -433,15 +516,22 @@ struct Plan {
     engine_version: String,
 }
 
+/// The baseline, retained, and the snapshots of accepted history.
+struct Baseline {
+    retained: RetainedSnapshot,
+    accepted: Vec<SourceSnapshotId>,
+}
+
 fn build(
     store: &CollaborationStore,
     repo: &Path,
     request: &CompositionRequest,
+    baseline: &Baseline,
     deliveries: &[String],
     usage: &mut BudgetUsage,
     order: &mut Vec<String>,
 ) -> Result<Result<Built, Refused>, ComposeError> {
-    let plan = match plan(store, request, deliveries, usage)? {
+    let plan = match plan(store, request, baseline, deliveries, usage)? {
         Ok(plan) => plan,
         Err(refusal) => return Ok(Err(refusal)),
     };
@@ -580,6 +670,7 @@ fn build(
 fn plan(
     store: &CollaborationStore,
     request: &CompositionRequest,
+    known: &Baseline,
     deliveries: &[String],
     usage: &mut BudgetUsage,
 ) -> Result<Result<Plan, Refused>, ComposeError> {
@@ -594,7 +685,10 @@ fn plan(
                 format!("{id} is not a known contribution"),
             )));
         };
-        if !selected.iter().any(|known| known.id == spec.id) {
+        // A repeat by name or by lineage is the same contribution.
+        if !selected.iter().any(|known| {
+            known.id == spec.id || (known.lineage.is_some() && known.lineage == spec.lineage)
+        }) {
             selected.push(spec);
         }
     }
@@ -690,20 +784,13 @@ fn plan(
 
     // Retrieve. Lineage is read from the archive, not trusted from the
     // caller.
-    let Some(baseline) = collaboration_archive::retained(store, &request.baseline)? else {
-        return Ok(Err(refused(
-            Refusal::MissingInput,
-            format!("baseline {} is not retained", request.baseline),
-        )));
-    };
+    let baseline = known.retained.clone();
     let mut retained = Vec::with_capacity(selected.len());
     for spec in &selected {
-        let Some(contribution) =
-            collaboration_archive::retained_contribution(store, &spec.lineage)?
-        else {
+        let Some(contribution) = retained_of(store, spec)? else {
             return Ok(Err(refused(
                 Refusal::MissingInput,
-                format!("{} ({}) is not retained", spec.id, spec.lineage),
+                format!("{} is not retained", spec.id),
             )));
         };
         retained.push(contribution);
@@ -713,7 +800,7 @@ fn plan(
     let mut edges: Vec<BTreeSet<usize>> = vec![BTreeSet::new(); selected.len()];
     for (index, contribution) in retained.iter().enumerate() {
         let base = &contribution.base.snapshot_id;
-        if *base == request.baseline {
+        if *base == baseline.snapshot_id || known.accepted.contains(base) {
             continue;
         }
         if let Some(parent) = retained
@@ -729,7 +816,7 @@ fn plan(
             if is_selected(&spec.id) {
                 continue;
             }
-            if let Some(known) = collaboration_archive::retained_contribution(store, &spec.lineage)?
+            if let Some(known) = retained_of(store, spec)?
                 && known.result.snapshot_id == *base
             {
                 return Ok(Err(refused(
@@ -744,7 +831,7 @@ fn plan(
         return Ok(Err(refused(
             Refusal::UnknownBase,
             format!(
-                "{} starts from {base}, which is neither the baseline nor a known result",
+                "{} starts from {base}, which is neither accepted history nor a known result",
                 selected[index].id
             ),
         )));

@@ -18,13 +18,22 @@ nothing calls the composer outside tests yet.
 
 ### Inputs come from the archive, never a worktree
 
-`compose(store, repo, request)` takes a retained baseline `SourceSnapshotId`, a catalog of
-`ContributionSpec`s (each a retained lineage record ID plus the caller's declared
-`requires`, `atomic_group`, `revision_of` and `derived_from`), the deliveries in policy
-order, and a `CompositionBudget`. Each lineage record is re-read and must hash to its row
-and decode to its ID; every manifest and blob is checked against its digest as it is read.
-The archive is held shared for the whole composition, so reclamation (#659) cannot remove
-an input mid-read. A baseline or contribution that is not retained is `missing_input`.
+`compose(store, repo, request)` takes:
+
+- the baseline **commit**, which the composer retains first, reading and verifying it from
+  Git as capture does (a baseline nobody based a contribution on is otherwise absent);
+- the accepted history the baseline descends from, as commits;
+- a catalog of `ContributionSpec`s: each a lineage record ID, or none when the caller knows
+  the contribution only by name, plus the declared `requires`, `atomic_group`,
+  `revision_of` and `derived_from`;
+- the deliveries in policy order, and a `CompositionBudget`.
+
+Each lineage record is re-read and must hash to its row and decode to its ID; every
+manifest and blob is checked against its digest as it is read. The archive is held shared
+for the whole composition, so reclamation (#659) cannot remove an input mid-read. A
+contribution that is not retained (or known by name only), or a baseline Git cannot
+supply, is `missing_input`; a baseline holding an entry a snapshot cannot name is
+`snapshot_entry`.
 
 ### Planning refusals (§7.2, §7.3 steps 2–4)
 
@@ -37,13 +46,15 @@ an input mid-read. A baseline or contribution that is not retained is `missing_i
 | A requirement, or a member of a touched atomic group, not selected | `missing_input` |
 | Requirements that form a cycle | `dependency_cycle` |
 | A base that is the result of a known but unselected contribution | `missing_input` |
-| A base that is neither the baseline nor a selected result | `unknown_base` |
+| A base that is neither accepted history nor a selected result | `unknown_base` |
 | Any budget limit exceeded | `budget_exhausted` |
 
-Lineage is read from the archive, not trusted from the caller: a contribution whose
-retained base equals another selected contribution's retained result goes after it and
-applies only its own base-to-result change (FX03). The same contribution delivered twice
-applies once. Order is topological over requirements and inherited bases, then the order
+Lineage is read from the archive, not trusted from the caller. A base in accepted history
+(the baseline or an accepted ancestor) applies three-way onto the baseline. A contribution
+whose retained base equals another selected contribution's retained result goes after it
+and applies only its own base-to-result change. A contribution delivered twice, by name or
+by lineage, applies once: re-merging it as text would conflict with the work built on it
+(FX03). Order is topological over requirements and inherited bases, then the order
 of first delivery. Nothing else is sorted, so no order independence is implied: the
 fixtures' commutativity claims are tested by permutation.
 
@@ -107,31 +118,33 @@ its result. It never returns `from`'s result under another name.
 
 ## Measured on the provisional fixtures
 
-All seven cases, every listed order, composed from the archive and judged by #733's
-independent oracle on a checkout rebuilt from the archive alone:
+The fixture test uses only the fixtures' composer-facing API (scenario inputs,
+contribution metadata, `materialize`), never their answer key, and never branches on a case
+or scenario id. Each scenario is materialized, its retained contributions captured through
+#658, composed from the archive alone, rebuilt with `reconstruct`, and judged by
+`judge_scenario` over every declared order run twice (a subtraction twice with no order),
+which also checks that outcomes and candidates are identical across runs.
 
-| Case / scenario | Outcome | Oracle |
+**15 of 17** scenarios are accepted. The two that are not:
+
+| Scenario | Outcome | Why |
 |---|---|---|
-| FX01 compose-all (6 orders) | candidate, one subject | accepted |
-| FX02 move-and-edit | conflict (`moved_block`) | **gap**: required candidate |
-| FX02 identical-twins | conflict (`moved_block`) | accepted; plain text gave a silent wrong merge |
-| FX03 inherited / duplicate-delivery | candidate | accepted |
-| FX03 unrecorded-base | `unknown_base` | accepted |
-| FX04 interaction | candidate | **gap**: behavior fails; resolution is #665 |
-| FX05 same-property | conflict | accepted |
-| FX06 atomic-pair | candidate | accepted |
-| FX06 consumer / producer alone | `missing_input` | accepted |
-| FX06 cycle | `dependency_cycle` | accepted |
-| FX06 competing / incompatible prerequisite | `competing_revisions` | accepted |
-| FX07 A without B, retained | new candidate | accepted |
-| FX07 A without B, unretained; consumer of X | `inseparable_selection` | accepted |
+| FX02 s1 (move plus edit) | conflict `moved_block` | The mandatory structural positive needs E1's engine; a line merge cannot carry the edit along the move. |
+| FX04 s1 (semantic interaction) | candidate, behavior fails | The text merge is clean but the handler keeps an id the other contribution renamed. Only the complete-candidate check sees it; resolution is #665's. |
 
-Held-out cases, run once as a check after the profile was fixed: HX01 and HX02 conflict
-(their required candidate is not met; the same as the measured text column), HX05 conflicts
-as required. None produced a candidate that fails its behaviors.
+FX02 s2 (identical twins), where plain `git merge-file` silently puts the edit on the wrong
+card, is a `moved_block` conflict and accepted. The test asserts a floor of 15 accepted
+scenarios, so a regression fails without the test naming any scenario.
 
-The two gaps are kept visible in the test (`KNOWN_GAPS`), which fails if either starts
-passing, so the record is updated rather than silently outgrown.
+**Held-out**, run once after the profile was fixed, never used for tuning: **8 of 12**
+accepted. HX01, HX02 and HX03 s1 are conflicts where a candidate is required (the same
+class as FX02 s1: the text profile is conservative), and HX04 is a clean candidate whose
+behavior fails (the same class as FX04). None is a planning error.
+
+Rules the fixtures do not isolate have their own small repositories in the same test:
+each conflict reason, mode-plus-content composition, revert to `no_change`, the twins
+layout, inherited order, accepted-history bases, repeats by name and by lineage, every
+planning refusal, recomposition, each budget limit, and no ref movement.
 
 ## Not decided here
 
