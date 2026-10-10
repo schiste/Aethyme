@@ -302,6 +302,12 @@ pub fn recompose_without(
             return refuse(format!("{removed} is not a constituent of {}", from.id));
         }
     }
+    for kept in &subtraction.keep {
+        if subtraction.remove.contains(kept) || *kept == from.id {
+            // Keeping what is removed, or X itself, would rebuild X.
+            return refuse(format!("{kept} is both kept and removed from {}", from.id));
+        }
+    }
     let originals: Vec<String> = from
         .derived_from
         .iter()
@@ -449,6 +455,21 @@ fn compose_inner(
     };
     let mut accepted = Vec::with_capacity(request.accepted.len());
     for commit in &request.accepted {
+        if !is_ancestor(repo, commit, &request.baseline)? {
+            return Ok(Composition {
+                outcome: CompositionOutcome::Refused {
+                    reason: Refusal::UnknownBase,
+                    detail: format!(
+                        "accepted commit {} is not an ancestor of the baseline {}",
+                        commit.as_str(),
+                        request.baseline.as_str()
+                    ),
+                },
+                recipe: None,
+                order: Vec::new(),
+                usage: BudgetUsage::default(),
+            });
+        }
         match collaboration_archive::snapshot_of_commit(repo, commit) {
             Ok(snapshot) => accepted.push(snapshot.id()),
             Err(error) => {
@@ -547,6 +568,8 @@ fn build(
     let mut reader = Reader {
         store,
         cache: HashMap::new(),
+        cached_bytes: 0,
+        charged: HashSet::new(),
         manifests: HashMap::new(),
         bytes: 0,
     };
@@ -595,7 +618,15 @@ fn build(
                 Err(refusal) => return Ok(Err(refusal)),
             };
             match applied {
-                Ok(entry) => staged.push((path.clone(), entry)),
+                Ok(entry) => {
+                    // What the candidate will hold is charged before it is
+                    // read or written, whether it is added, replaced or
+                    // merged.
+                    if let Some((_, digest)) = entry {
+                        reader.charge(&digest)?;
+                    }
+                    staged.push((path.clone(), entry));
+                }
                 Err(reason) => conflicts.push(CompositionConflict {
                     path: String::from_utf8_lossy(path).into_owned(),
                     input: step.retained.result.commit.clone(),
@@ -603,18 +634,35 @@ fn build(
                 }),
             }
         }
-        if !conflicts.is_empty() {
-            return Ok(Ok(Built::Other(CompositionOutcome::Conflict {
-                baseline: plan.baseline.commit.clone(),
-                conflicts,
-            })));
+        if let Err(refusal) = reader.within(usage, request) {
+            return Ok(Err(refusal));
         }
-        for (path, entry) in staged {
-            match entry {
-                Some(entry) => accumulator.insert(path, entry),
-                None => accumulator.remove(&path),
-            };
+        if conflicts.is_empty() {
+            let mut next = accumulator.clone();
+            for (path, entry) in &staged {
+                match entry {
+                    Some(entry) => next.insert(path.clone(), *entry),
+                    None => next.remove(path),
+                };
+            }
+            for (path, entry) in &staged {
+                if entry.is_some() && collides(&next, path) {
+                    conflicts.push(CompositionConflict {
+                        path: String::from_utf8_lossy(path).into_owned(),
+                        input: step.retained.result.commit.clone(),
+                        reason: ConflictReason::DirectoryFile,
+                    });
+                }
+            }
+            if conflicts.is_empty() {
+                accumulator = next;
+                continue;
+            }
         }
+        return Ok(Ok(Built::Other(CompositionOutcome::Conflict {
+            baseline: plan.baseline.commit.clone(),
+            conflicts,
+        })));
     }
     if accumulator == baseline_entries {
         return Ok(Ok(Built::Other(CompositionOutcome::NoChange {
@@ -639,6 +687,7 @@ fn build(
         &baseline_entries,
         &accumulator,
     )?;
+    usage.bytes = reader.bytes;
     let observed = collaboration_archive::snapshot_of_commit(repo, &commit)?.id();
     if observed != snapshot.id() {
         return Err(ComposeError::SubjectMismatch {
@@ -672,6 +721,23 @@ fn build(
     Ok(Ok(Built::Candidate(candidate, plan)))
 }
 
+/// Whether `path` is a file where `entries` also needs a directory: one of
+/// its parents is a file, or another path lies beneath it.
+fn collides(entries: &Entries, path: &[u8]) -> bool {
+    let parent_is_file = path
+        .iter()
+        .enumerate()
+        .filter(|(_, byte)| **byte == b'/')
+        .any(|(index, _)| entries.contains_key(&path[..index]));
+    let mut beneath = path.to_vec();
+    beneath.push(b'/');
+    let has_children = entries
+        .range(beneath.clone()..)
+        .next()
+        .is_some_and(|(other, _)| other.starts_with(&beneath));
+    parent_is_file || has_children
+}
+
 // ---------------------------------------------------------------- planning
 
 fn plan(
@@ -683,8 +749,10 @@ fn plan(
 ) -> Result<Result<Plan, Refused>, ComposeError> {
     let catalog = catalog(request)?;
 
-    // Deliveries in policy order; a repeat is the same contribution.
-    let mut selected: Vec<&ContributionSpec> = Vec::new();
+    // Deliveries in policy order. Every delivered name is checked against
+    // its own requirements and group below; a repeat by name, or by
+    // lineage under another name, then applies once.
+    let mut delivered: Vec<&ContributionSpec> = Vec::new();
     for id in deliveries {
         let Some(spec) = catalog.get(id.as_str()) else {
             return Ok(Err(refused(
@@ -692,12 +760,25 @@ fn plan(
                 format!("{id} is not a known contribution"),
             )));
         };
-        // A repeat by name or by lineage is the same contribution.
-        if !selected.iter().any(|known| {
-            known.id == spec.id || (known.lineage.is_some() && known.lineage == spec.lineage)
-        }) {
-            selected.push(spec);
+        if !delivered.iter().any(|known| known.id == spec.id) {
+            delivered.push(spec);
         }
+    }
+    let mut selected: Vec<&ContributionSpec> = Vec::new();
+    // Each delivered name to the index of the contribution it applies as.
+    let mut applies_as: BTreeMap<&str, usize> = BTreeMap::new();
+    for spec in &delivered {
+        let index = match selected
+            .iter()
+            .position(|known| known.lineage.is_some() && known.lineage == spec.lineage)
+        {
+            Some(index) => index,
+            None => {
+                selected.push(spec);
+                selected.len() - 1
+            }
+        };
+        applies_as.insert(&spec.id, index);
     }
     usage.contributions = selected.len();
     if selected.len() > request.budget.max_contributions {
@@ -710,26 +791,25 @@ fn plan(
             ),
         )));
     }
-    let is_selected = |id: &str| selected.iter().any(|spec| spec.id == id);
+    let is_selected = |id: &str| applies_as.contains_key(id);
 
     // Revisions of one contribution share a line, named by its first
-    // revision.
+    // revision, or, when `revision_of` loops, by the loop's least name.
     let line = |id: &str| -> String {
-        let mut current = id;
-        let mut seen = BTreeSet::new();
+        let mut chain: Vec<&str> = vec![id];
         while let Some(previous) = catalog
-            .get(current)
+            .get(chain[chain.len() - 1])
             .and_then(|spec| spec.revision_of.as_deref())
         {
-            if !seen.insert(current) {
-                break;
+            if let Some(start) = chain.iter().position(|seen| *seen == previous) {
+                return chain[start..].iter().min().expect("non-empty").to_string();
             }
-            current = previous;
+            chain.push(previous);
         }
-        current.to_string()
+        chain[chain.len() - 1].to_string()
     };
     let mut lines: BTreeMap<String, &str> = BTreeMap::new();
-    for spec in &selected {
+    for spec in &delivered {
         if let Some(other) = lines.insert(line(&spec.id), &spec.id) {
             return Ok(Err(refused(
                 Refusal::CompetingRevisions,
@@ -737,7 +817,7 @@ fn plan(
             )));
         }
     }
-    for spec in &selected {
+    for spec in &delivered {
         for constituent in &spec.derived_from {
             if let Some(other) = lines.get(&line(constituent)) {
                 return Ok(Err(refused(
@@ -750,7 +830,7 @@ fn plan(
             }
         }
     }
-    for spec in &selected {
+    for spec in &delivered {
         for required in &spec.requires {
             if is_selected(required) {
                 continue;
@@ -770,7 +850,7 @@ fn plan(
             )));
         }
     }
-    let groups: BTreeSet<&str> = selected
+    let groups: BTreeSet<&str> = delivered
         .iter()
         .filter_map(|spec| spec.atomic_group.as_deref())
         .collect();
@@ -843,9 +923,12 @@ fn plan(
             ),
         )));
     }
-    for (index, spec) in selected.iter().enumerate() {
+    for spec in &delivered {
+        let index = applies_as[spec.id.as_str()];
         for required in &spec.requires {
-            if let Some(parent) = selected.iter().position(|other| other.id == *required) {
+            if let Some(&parent) = applies_as.get(required.as_str())
+                && parent != index
+            {
                 edges[index].insert(parent);
             }
         }
@@ -887,11 +970,19 @@ fn plan(
 
 // ----------------------------------------------------------------- reading
 
+/// Blob bytes kept in memory at once; past this the cache starts over and
+/// later reads go back to the archive.
+const CACHE_LIMIT: u64 = 64 * 1024 * 1024;
+
 struct Reader<'a> {
     store: &'a CollaborationStore,
     cache: HashMap<[u8; 32], Vec<u8>>,
+    cached_bytes: u64,
+    /// Blobs already counted in `bytes`.
+    charged: HashSet<[u8; 32]>,
     manifests: HashMap<SourceSnapshotId, Entries>,
-    /// Bytes read from the archive so far.
+    /// Manifest bytes read plus the size of every distinct blob read,
+    /// merged or staged into the candidate.
     bytes: u64,
 }
 
@@ -927,9 +1018,52 @@ impl Reader<'_> {
         }
         let bytes =
             collaboration_archive::read_object(self.store, &ObjectDigest::from_bytes(*digest))?;
-        self.bytes += bytes.len() as u64;
-        self.cache.insert(*digest, bytes.clone());
+        if self.charged.insert(*digest) {
+            self.bytes += bytes.len() as u64;
+        }
+        self.remember(*digest, &bytes);
         Ok(bytes)
+    }
+
+    fn remember(&mut self, digest: [u8; 32], bytes: &[u8]) {
+        let size = bytes.len() as u64;
+        if size > CACHE_LIMIT {
+            return;
+        }
+        if self.cached_bytes + size > CACHE_LIMIT {
+            self.cache.clear();
+            self.cached_bytes = 0;
+        }
+        self.cached_bytes += size;
+        self.cache.insert(digest, bytes.to_vec());
+    }
+
+    /// Count a blob the candidate will hold, by its stored size, without
+    /// reading it.
+    fn charge(&mut self, digest: &[u8; 32]) -> Result<(), ComposeError> {
+        if !self.charged.insert(*digest) {
+            return Ok(());
+        }
+        let path = collaboration_archive::object_path(self.store, &ObjectDigest::from_bytes(*digest));
+        let size = std::fs::metadata(&path)
+            .map_err(|source| match source.kind() {
+                std::io::ErrorKind::NotFound => ComposeError::Archive(ArchiveError::MissingObject {
+                    digest: ObjectDigest::from_bytes(*digest).hex(),
+                }),
+                _ => io(&path, source),
+            })?
+            .len();
+        self.bytes += size;
+        Ok(())
+    }
+
+    /// Keep a merge's output in the archive, so it is read back like any
+    /// other blob and the cache can forget it.
+    fn store_merged(&mut self, bytes: &[u8]) -> Result<[u8; 32], ComposeError> {
+        let digest = collaboration_archive::put_object(self.store, bytes)?;
+        let raw = digest.raw();
+        self.remember(raw, bytes);
+        Ok(raw)
     }
 
     /// Refuse once more bytes were read than the budget allows.
@@ -1005,6 +1139,9 @@ fn apply_path(
     {
         return Ok(Ok(Err(ConflictReason::Binary)));
     }
+    if deletes_a_twin(&base_text, &current_text) || deletes_a_twin(&base_text, &result_text) {
+        return Ok(Ok(Err(ConflictReason::AmbiguousAnchor)));
+    }
     if moves_a_block(&base_text, &current_text) || moves_a_block(&base_text, &result_text) {
         return Ok(Ok(Err(ConflictReason::MovedBlock)));
     }
@@ -1021,17 +1158,60 @@ fn apply_path(
     let Some(merged) = merge_file(scratch, &base_text, &current_text, &result_text)? else {
         return Ok(Ok(Err(ConflictReason::Content)));
     };
-    let digest: [u8; 32] = {
-        use sha2::{Digest, Sha256};
-        Sha256::digest(&merged).into()
-    };
-    reader.cache.insert(digest, merged);
+    let digest = reader.store_merged(&merged)?;
     Ok(Ok(Ok(Some((kind, digest)))))
 }
 
 /// Git's own test: a NUL in the first 8000 bytes.
 fn is_binary(bytes: &[u8]) -> bool {
     bytes.iter().take(8000).any(|byte| *byte == 0)
+}
+
+/// Whether `side` deletes, with nothing put in its place, a run of `base`
+/// lines whose non-blank lines (compared without surrounding whitespace)
+/// also appear, in order and contiguously, elsewhere in `base`. Which copy
+/// went is then a guess the line diff makes, and a line merge would put
+/// another side's change inside either copy on whichever one stayed. That
+/// holds whether the deletion is half of a move, within this file or into
+/// another, or a plain removal, so any concurrent change conflicts.
+fn deletes_a_twin(base: &[u8], side: &[u8]) -> bool {
+    use similar::{DiffOp, TextDiff};
+
+    let base = String::from_utf8_lossy(base);
+    let side = String::from_utf8_lossy(side);
+    let diff = TextDiff::from_lines(base.as_ref(), side.as_ref());
+    let lines: Vec<&str> = (0..)
+        .map_while(|index| diff.old_slice(index))
+        .map(|line| line.trim())
+        .collect();
+    // Non-blank base lines, with their positions.
+    let content: Vec<(usize, &str)> = lines
+        .iter()
+        .copied()
+        .enumerate()
+        .filter(|(_, line)| !line.is_empty())
+        .collect();
+    diff.ops().iter().any(|op| {
+        let DiffOp::Delete {
+            old_index, old_len, ..
+        } = *op
+        else {
+            return false;
+        };
+        let deleted: Vec<usize> = (0..content.len())
+            .filter(|&at| (old_index..old_index + old_len).contains(&content[at].0))
+            .collect();
+        let (Some(&first), Some(&last)) = (deleted.first(), deleted.last()) else {
+            return false;
+        };
+        let run: Vec<&str> = content[first..=last].iter().map(|(_, line)| *line).collect();
+        content
+            .windows(run.len())
+            .enumerate()
+            .any(|(start, window)| {
+                start != first && window.iter().map(|(_, line)| *line).eq(run.iter().copied())
+            })
+    })
 }
 
 /// Whether `side` moves a block of `base`: [`MOVE_WINDOW`] consecutive
@@ -1094,7 +1274,7 @@ fn merge_file(
     let current = write("current", current)?;
     let base = write("base", base)?;
     let result = write("result", result)?;
-    let output = engine()
+    let output = engine(scratch)
         .args([
             "merge-file",
             "-p",
@@ -1121,11 +1301,15 @@ fn merge_file(
     }
 }
 
-/// `git` with no user or system configuration, so a configured merge driver,
-/// conflict style or attribute cannot change what the profile does.
-fn engine() -> Command {
+/// `git` run in `dir`, outside any repository (discovery stops at `dir`'s
+/// parent), with no system or global configuration, so neither a
+/// configured conflict style nor a repository's own configuration can
+/// change what the profile does.
+fn engine(dir: &Path) -> Command {
     let mut command = Command::new("git");
     command
+        .current_dir(dir)
+        .env("GIT_CEILING_DIRECTORIES", dir.parent().unwrap_or(dir))
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env_remove("GIT_CONFIG_PARAMETERS")
@@ -1136,7 +1320,7 @@ fn engine() -> Command {
 }
 
 fn git_version() -> Result<String, ComposeError> {
-    let output = engine()
+    let output = engine(&std::env::temp_dir())
         .arg("--version")
         .stdin(Stdio::null())
         .output()
@@ -1145,6 +1329,32 @@ fn git_version() -> Result<String, ComposeError> {
         return Err(ComposeError::Git("git --version failed".into()));
     }
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// Whether `ancestor` is `descendant` or one of its ancestors.
+fn is_ancestor(
+    repo: &Path,
+    ancestor: &CommitOid,
+    descendant: &CommitOid,
+) -> Result<bool, ComposeError> {
+    let output = collaboration_archive::git(repo)
+        .args([
+            "merge-base",
+            "--is-ancestor",
+            ancestor.as_str(),
+            descendant.as_str(),
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|source| io(Path::new("git"), source))?;
+    match output.status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => Err(ComposeError::Git(format!(
+            "merge-base --is-ancestor: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))),
+    }
 }
 
 // ------------------------------------------------------------ materializing
@@ -1274,7 +1484,7 @@ fn repo_git(repo: &Path, args: &[&str], file: Option<&Path>) -> Result<Vec<u8>, 
 fn repo_git_env(repo: &Path, args: &[&str]) -> Result<Vec<u8>, ComposeError> {
     let mut command = collaboration_archive::git(repo);
     command
-        .args(["-c", "commit.gpgsign=false"])
+        .args(["-c", "commit.gpgsign=false", "-c", "i18n.commitEncoding=UTF-8"])
         .args(args)
         .env("GIT_AUTHOR_NAME", "Aethyme composer")
         .env("GIT_AUTHOR_EMAIL", "composer@aethyme.invalid")

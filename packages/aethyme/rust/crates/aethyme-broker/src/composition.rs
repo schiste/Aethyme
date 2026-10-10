@@ -129,6 +129,12 @@ pub enum ConflictReason {
     /// A side moved a block of lines, which a line merge cannot carry
     /// another side's edit along (#664's text profile limit).
     MovedBlock,
+    /// A side deleted lines that have an identical twin left in the base,
+    /// so a line merge cannot tell which copy went (#664's text profile
+    /// limit).
+    AmbiguousAnchor,
+    /// The result would hold a file where another path needs a directory.
+    DirectoryFile,
 }
 
 impl ConflictReason {
@@ -140,6 +146,8 @@ impl ConflictReason {
             Self::Mode => "mode",
             Self::Binary => "binary",
             Self::MovedBlock => "moved_block",
+            Self::AmbiguousAnchor => "ambiguous_anchor",
+            Self::DirectoryFile => "directory_file",
         }
     }
 }
