@@ -916,8 +916,14 @@ impl Broker {
                 MergeStatus::Promoted | MergeStatus::ExternallyLanded
             )
         }) || session.accepted_session_head.as_deref() == Some(head);
-        let submitted_head_is_delivered =
-            queue_accepts_head && accepted_commit_is_current && landing.is_some();
+        // Exact ancestry on a current delivery target proves that this
+        // worktree HEAD is already present there. Content/patch matches remain
+        // gated on accepted queue evidence or a recorded representation.
+        let ancestry_proves_delivery = landing
+            .as_ref()
+            .is_some_and(|(_, evidence, _)| evidence == &crate::LandingEvidence::Ancestry);
+        let submitted_head_is_delivered = ancestry_proves_delivery
+            || (queue_accepts_head && accepted_commit_is_current && landing.is_some());
 
         let remote_default_tip = self.remote_tracking_default_tip();
         let on_remote_default = if let Some(tip) = remote_default_tip.as_ref() {
