@@ -87,6 +87,10 @@ pub const COMPOSITION_RECIPE_SCHEMA_NAME: &str = "aethyme.composition-recipe/exp
 /// place and reappear in another for a change to count as moving a block.
 const MOVE_WINDOW: usize = 3;
 
+/// The line diff the profile's own rules use. A test keeps the version in
+/// step with Cargo.lock.
+const DIFF_ENGINE: &str = "similar 3.2.0 (Myers, lines)";
+
 const fn field(name: &'static str, kind: FieldKind, required: bool) -> FieldSpec {
     FieldSpec {
         name,
@@ -1044,12 +1048,15 @@ impl Reader<'_> {
         if !self.charged.insert(*digest) {
             return Ok(());
         }
-        let path = collaboration_archive::object_path(self.store, &ObjectDigest::from_bytes(*digest));
+        let path =
+            collaboration_archive::object_path(self.store, &ObjectDigest::from_bytes(*digest));
         let size = std::fs::metadata(&path)
             .map_err(|source| match source.kind() {
-                std::io::ErrorKind::NotFound => ComposeError::Archive(ArchiveError::MissingObject {
-                    digest: ObjectDigest::from_bytes(*digest).hex(),
-                }),
+                std::io::ErrorKind::NotFound => {
+                    ComposeError::Archive(ArchiveError::MissingObject {
+                        digest: ObjectDigest::from_bytes(*digest).hex(),
+                    })
+                }
                 _ => io(&path, source),
             })?
             .len();
@@ -1204,7 +1211,10 @@ fn deletes_a_twin(base: &[u8], side: &[u8]) -> bool {
         let (Some(&first), Some(&last)) = (deleted.first(), deleted.last()) else {
             return false;
         };
-        let run: Vec<&str> = content[first..=last].iter().map(|(_, line)| *line).collect();
+        let run: Vec<&str> = content[first..=last]
+            .iter()
+            .map(|(_, line)| *line)
+            .collect();
         content
             .windows(run.len())
             .enumerate()
@@ -1395,7 +1405,13 @@ fn materialize(
         }
     }
 
+    // Blobs the baseline lacks are written in one hash-object, and the
+    // tree in one index: a fixed number of processes, whatever the size.
+    let blobs = scratch.join("blobs");
+    std::fs::create_dir_all(&blobs).map_err(|source| io(&blobs, source))?;
     let mut oids: BTreeMap<Vec<u8>, (EntryKind, String)> = BTreeMap::new();
+    let mut pending: Vec<(Vec<u8>, EntryKind, PathBuf)> = Vec::new();
+    let mut written: HashMap<[u8; 32], PathBuf> = HashMap::new();
     for (path, (kind, digest)) in entries {
         if baseline_entries.get(path) == Some(&(*kind, *digest))
             && let Some(oid) = known.get(path)
@@ -1403,17 +1419,49 @@ fn materialize(
             oids.insert(path.clone(), (*kind, oid.clone()));
             continue;
         }
-        let bytes = reader.blob(digest)?;
-        let file = scratch.join("blob");
-        std::fs::write(&file, &bytes).map_err(|source| io(&file, source))?;
-        let oid = repo_git(
-            repo,
-            &["hash-object", "-w", "--no-filters", "--"],
-            Some(&file),
-        )?;
-        oids.insert(path.clone(), (*kind, text_of(&oid)));
+        let file = match written.get(digest) {
+            Some(file) => file.clone(),
+            None => {
+                let file = blobs.join(written.len().to_string());
+                let bytes = reader.blob(digest)?;
+                std::fs::write(&file, &bytes).map_err(|source| io(&file, source))?;
+                written.insert(*digest, file.clone());
+                file
+            }
+        };
+        pending.push((path.clone(), *kind, file));
     }
-    let tree = write_tree(repo, &oids, b"")?;
+    if !pending.is_empty() {
+        let mut paths = Vec::new();
+        for (_, _, file) in &pending {
+            paths.extend_from_slice(file.as_os_str().as_encoded_bytes());
+            paths.push(b'\n');
+        }
+        let output = run(
+            collaboration_archive::git(repo).args([
+                "hash-object",
+                "-w",
+                "--no-filters",
+                "--stdin-paths",
+            ]),
+            Some(&paths),
+        )?;
+        let hashed: Vec<String> = String::from_utf8_lossy(&output)
+            .lines()
+            .map(str::to_string)
+            .collect();
+        if hashed.len() != pending.len() {
+            return Err(ComposeError::Git(format!(
+                "hash-object wrote {} of {} blobs",
+                hashed.len(),
+                pending.len()
+            )));
+        }
+        for ((path, kind, _), oid) in pending.into_iter().zip(hashed) {
+            oids.insert(path, (kind, oid));
+        }
+    }
+    let tree = write_tree(repo, scratch, &oids)?;
     let commit = repo_git_env(
         repo,
         &[
@@ -1428,40 +1476,31 @@ fn materialize(
     Ok((tree, CommitOid::parse(&text_of(&commit))?))
 }
 
+/// Write `entries` as one tree through a private index file, leaving the
+/// repository's own index alone.
 fn write_tree(
     repo: &Path,
+    scratch: &Path,
     entries: &BTreeMap<Vec<u8>, (EntryKind, String)>,
-    prefix: &[u8],
 ) -> Result<String, ComposeError> {
+    let index = scratch.join("index");
     let mut lines: Vec<u8> = Vec::new();
-    let mut subdirectories: BTreeSet<Vec<u8>> = BTreeSet::new();
-    for (path, (kind, oid)) in entries.range(prefix.to_vec()..) {
-        let Some(rest) = path.strip_prefix(prefix) else {
-            break;
-        };
-        match rest.iter().position(|byte| *byte == b'/') {
-            Some(slash) => {
-                subdirectories.insert(rest[..slash].to_vec());
-            }
-            None => {
-                lines.extend_from_slice(format!("{} blob {oid}\t", kind.git_mode()).as_bytes());
-                lines.extend_from_slice(rest);
-                lines.push(0);
-            }
-        }
-    }
-    for name in subdirectories {
-        let mut child = prefix.to_vec();
-        child.extend_from_slice(&name);
-        child.push(b'/');
-        let oid = write_tree(repo, entries, &child)?;
-        lines.extend_from_slice(format!("040000 tree {oid}\t").as_bytes());
-        lines.extend_from_slice(&name);
+    for (path, (kind, oid)) in entries {
+        lines.extend_from_slice(format!("{} {oid}\t", kind.git_mode()).as_bytes());
+        lines.extend_from_slice(path);
         lines.push(0);
     }
-    let output = run(
-        collaboration_archive::git(repo).args(["mktree", "-z"]),
+    run(
+        collaboration_archive::git(repo)
+            .env("GIT_INDEX_FILE", &index)
+            .args(["update-index", "-z", "--add", "--index-info"]),
         Some(&lines),
+    )?;
+    let output = run(
+        collaboration_archive::git(repo)
+            .env("GIT_INDEX_FILE", &index)
+            .args(["write-tree"]),
+        None,
     )?;
     Ok(text_of(&output))
 }
@@ -1484,7 +1523,12 @@ fn repo_git(repo: &Path, args: &[&str], file: Option<&Path>) -> Result<Vec<u8>, 
 fn repo_git_env(repo: &Path, args: &[&str]) -> Result<Vec<u8>, ComposeError> {
     let mut command = collaboration_archive::git(repo);
     command
-        .args(["-c", "commit.gpgsign=false", "-c", "i18n.commitEncoding=UTF-8"])
+        .args([
+            "-c",
+            "commit.gpgsign=false",
+            "-c",
+            "i18n.commitEncoding=UTF-8",
+        ])
         .args(args)
         .env("GIT_AUTHOR_NAME", "Aethyme composer")
         .env("GIT_AUTHOR_EMAIL", "composer@aethyme.invalid")
@@ -1583,6 +1627,7 @@ fn recipe_record(
             object(vec![
                 ("name", text("git merge-file")),
                 ("version", text(&plan.engine_version)),
+                ("diff", text(DIFF_ENGINE)),
                 ("move_window", integer(MOVE_WINDOW)),
             ]),
         ),
@@ -1684,6 +1729,50 @@ mod tests {
         let base = "p\nq\nr\ns\nt\nu\na\nb\n\nc\n";
         let side = "a\nb\n\nc\np\nq\nr\ns\nt\nu\n";
         assert!(moves_a_block(base.as_bytes(), side.as_bytes()));
+    }
+
+    #[test]
+    fn deleting_one_of_two_identical_runs_is_ambiguous() {
+        let base =
+            "<ul>\n  <li>tip</li>\n  <li>more</li>\n  <li>tip</li>\n  <li>more</li>\n</ul>\n";
+        let side = "<ul>\n  <li>tip</li>\n  <li>more</li>\n</ul>\n";
+        assert!(deletes_a_twin(base.as_bytes(), side.as_bytes()));
+        // Indentation does not make a copy distinct.
+        let indented = "<ul>\n  <li>tip</li>\n  <li>more</li>\n      <li>tip</li>\n      <li>more</li>\n</ul>\n";
+        assert!(deletes_a_twin(indented.as_bytes(), side.as_bytes()));
+    }
+
+    #[test]
+    fn deleting_a_unique_run_or_changing_a_twin_is_not_ambiguous() {
+        let base = "a\nb\nc\nb\nd\n";
+        // A unique line goes.
+        assert!(!deletes_a_twin(base.as_bytes(), b"a\nb\nb\nd\n"));
+        // A twin is changed in place, not deleted.
+        assert!(!deletes_a_twin(base.as_bytes(), b"a\nB\nc\nb\nd\n"));
+        // Only a blank line goes.
+        assert!(!deletes_a_twin(b"a\n\nb\n\nc\n", b"a\nb\n\nc\n"));
+    }
+
+    #[test]
+    fn the_recorded_diff_engine_is_the_locked_version() {
+        let lock = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../Cargo.lock"),
+        )
+        .unwrap();
+        let version = lock
+            .split("[[package]]")
+            .find(|package| package.contains("name = \"similar\""))
+            .and_then(|package| {
+                package
+                    .lines()
+                    .find_map(|line| line.strip_prefix("version = \""))
+                    .map(|rest| rest.trim_end_matches('"').to_string())
+            })
+            .expect("similar is locked");
+        assert!(
+            DIFF_ENGINE.starts_with(&format!("similar {version} ")),
+            "{DIFF_ENGINE} vs locked {version}"
+        );
     }
 
     #[test]

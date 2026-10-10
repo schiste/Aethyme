@@ -308,13 +308,41 @@ impl Adhoc {
         }
     }
 
+    /// A commit of exactly `files` (nested paths allowed), built in a
+    /// private index.
     fn commit(&self, files: &[(&str, &str, &[u8])], parent: Option<&str>) -> String {
         let mut listing = Vec::new();
         for (path, mode, content) in files {
             let oid = git_in(&self.repo, &["hash-object", "-w", "--stdin"], Some(content));
-            listing.extend_from_slice(format!("{mode} blob {oid}\t{path}\n").as_bytes());
+            listing.extend_from_slice(format!("{mode} {oid}\t{path}\n").as_bytes());
         }
-        let tree = git_in(&self.repo, &["mktree"], Some(&listing));
+        let index = self._root.path().join("commit-index");
+        let indexed = |args: &[&str], input: Option<&[u8]>| {
+            use std::io::Write as _;
+            let mut child = Command::new("git")
+                .arg("-C")
+                .arg(&self.repo)
+                .args(args)
+                .env("GIT_INDEX_FILE", &index)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(input.unwrap_or_default())
+                .unwrap();
+            let output = child.wait_with_output().unwrap();
+            assert!(output.status.success(), "git {args:?}");
+            String::from_utf8(output.stdout).unwrap().trim().to_string()
+        };
+        if index.exists() {
+            std::fs::remove_file(&index).unwrap();
+        }
+        indexed(&["update-index", "--add", "--index-info"], Some(&listing));
+        let tree = indexed(&["write-tree"], None);
         let mut args = vec!["commit-tree", tree.as_str(), "-m", "t"];
         if let Some(parent) = parent {
             args.extend(["-p", parent]);
@@ -351,7 +379,14 @@ impl Adhoc {
     }
 
     fn compose(&mut self, request: &CompositionRequest) -> Composition {
-        composer::compose(&mut self.store, &self.repo, request).unwrap()
+        self.try_compose(request).unwrap()
+    }
+
+    fn try_compose(
+        &mut self,
+        request: &CompositionRequest,
+    ) -> Result<Composition, composer::ComposeError> {
+        composer::compose(&mut self.store, &self.repo, request)
     }
 
     fn show(&self, commit: &CommitOid, path: &str) -> String {
@@ -540,6 +575,36 @@ fn identical_twins_conflict_instead_of_a_silent_wrong_merge() {
         let composition = world.compose(&world.request(&base, &order));
         assert_eq!(
             reasons(&composition),
+            [ConflictReason::AmbiguousAnchor],
+            "{order:?}"
+        );
+    }
+}
+
+#[test]
+fn a_unique_block_moved_beside_a_concurrent_edit_conflicts() {
+    let block = "    <p>alpha</p>\n    <p>beta</p>\n    <p>gamma</p>\n";
+    let page = |top: &str, bottom: &str, footer: &str| {
+        format!(
+            "<main>\n  <header>\n{top}  </header>\n  <nav>\n    <a>one</a>\n    <a>two</a>\n    <a>three</a>\n    <a>four</a>\n  </nav>\n  <section>\n{bottom}  </section>\n  <footer>{footer}</footer>\n</main>\n"
+        )
+    };
+    let mut world = Adhoc::new();
+    let base = world.commit(&[("page.html", R, page("", block, "x").as_bytes())], None);
+    let mover = world.commit(
+        &[("page.html", R, page(block, "", "x").as_bytes())],
+        Some(&base),
+    );
+    let editor = world.commit(
+        &[("page.html", R, page("", block, "y").as_bytes())],
+        Some(&base),
+    );
+    world.add("move", &base, &mover);
+    world.add("edit", &base, &editor);
+    for order in [["move", "edit"], ["edit", "move"]] {
+        let composition = world.compose(&world.request(&base, &order));
+        assert_eq!(
+            reasons(&composition),
             [ConflictReason::MovedBlock],
             "{order:?}"
         );
@@ -572,40 +637,52 @@ fn each_path_conflict_has_its_reason_and_one_side_changes_apply() {
         world.add("left", &base, &left);
         world.add("right", &base, &right);
         let request = world.request(&base, &["left", "right"]);
-        world.compose(&request)
+        world.try_compose(&request)
     };
 
     let deleted = with(&world, &[("doc.txt", R, b"")], &base);
     let modified = with(&world, &[("doc.txt", R, b"one\nTWO\nthree\n")], &base);
     assert_eq!(
-        reasons(&pair(&mut world, deleted, modified.clone())),
+        reasons(&pair(&mut world, deleted, modified.clone()).unwrap()),
         [ConflictReason::DeleteModify]
     );
     let left = with(&world, &[("new.txt", R, b"left\n")], &base);
     let right = with(&world, &[("new.txt", R, b"right\n")], &base);
     assert_eq!(
-        reasons(&pair(&mut world, left, right)),
+        reasons(&pair(&mut world, left, right).unwrap()),
         [ConflictReason::AddAdd]
     );
     let ours = with(&world, &[("image.bin", R, b"\0ours")], &base);
     let theirs = with(&world, &[("image.bin", R, b"\0theirs")], &base);
-    assert_eq!(
-        reasons(&pair(&mut world, ours, theirs)),
-        [ConflictReason::Binary]
+    // Binary content is recognized before any line merge runs.
+    let binary = pair(&mut world, ours, theirs);
+    assert!(
+        matches!(&binary, Ok(composition) if matches!(
+            &composition.outcome,
+            CompositionOutcome::Conflict { conflicts, .. }
+                if conflicts.iter().map(|conflict| conflict.reason).eq([ConflictReason::Binary])
+        )),
+        "{binary:?}"
     );
 
-    // A mode change and a content change of one file compose.
+    // A mode change and a content change of one file compose, either way
+    // round.
     let executable = with(&world, &[("tool.sh", X, b"echo hi\n")], &base);
     let reworded = with(&world, &[("tool.sh", R, b"echo hello\n")], &base);
-    let composition = pair(&mut world, executable, reworded);
-    let candidate = composition.outcome.candidate().expect("a candidate");
-    let listing = git_in(
-        &world.repo,
-        &["ls-tree", candidate.commit.as_str(), "tool.sh"],
-        None,
-    );
-    assert!(listing.starts_with("100755 "), "{listing}");
-    assert_eq!(world.show(&candidate.commit, "tool.sh"), "echo hello");
+    for (left, right) in [
+        (executable.clone(), reworded.clone()),
+        (reworded, executable),
+    ] {
+        let composition = pair(&mut world, left, right).unwrap();
+        let candidate = composition.outcome.candidate().expect("a candidate");
+        let listing = git_in(
+            &world.repo,
+            &["ls-tree", candidate.commit.as_str(), "tool.sh"],
+            None,
+        );
+        assert!(listing.starts_with("100755 "), "{listing}");
+        assert_eq!(world.show(&candidate.commit, "tool.sh"), "echo hello");
+    }
 
     // A contribution and its revert, built on it, change nothing.
     let reverted = with(&world, &[], &modified);
@@ -763,4 +840,359 @@ fn each_budget_limit_refuses_instead_of_a_partial_candidate() {
         assert_eq!(composition.outcome.code(), "budget_exhausted", "{budget:?}");
         assert!(composition.recipe.is_none());
     }
+}
+
+// ----------------------------------------- independent review regressions
+//
+// Each of these began as a reviewer's probe of #735 (P01-P11) and asserts
+// the behavior the composer must have.
+
+fn code_of(result: &Result<Composition, composer::ComposeError>) -> String {
+    match result {
+        Ok(composition) => match &composition.outcome {
+            CompositionOutcome::Conflict { conflicts, .. } => format!(
+                "conflict {:?}",
+                conflicts
+                    .iter()
+                    .map(|conflict| (conflict.path.clone(), conflict.reason.code()))
+                    .collect::<Vec<_>>()
+            ),
+            other => format!("{} usage={:?}", other.code(), composition.usage),
+        },
+        Err(error) => format!("error {}: {error}", error.code()),
+    }
+}
+
+fn is_conflict(
+    result: &Result<Composition, composer::ComposeError>,
+    reason: ConflictReason,
+) -> bool {
+    matches!(result, Ok(composition) if matches!(
+        &composition.outcome,
+        CompositionOutcome::Conflict { conflicts, .. }
+            if conflicts.iter().any(|conflict| conflict.reason == reason)
+    ))
+}
+
+fn pinned_card(indent: &str, button: &str) -> String {
+    format!(
+        "{indent}<article class=\"card\">\n{indent}  <h3>Tips</h3>\n{indent}  <button class=\"more\"{button}>More</button>\n{indent}</article>\n"
+    )
+}
+
+fn pinned_page(pinned: &str, first: &str, second: &str) -> String {
+    format!(
+        "<main id=\"app\">\n  <aside id=\"sidebar\">\n    <h2>Pinned</h2>\n    <div id=\"pinned\">\n{pinned}    </div>\n  </aside>\n  <section id=\"content\">\n{first}{second}  </section>\n</main>\n"
+    )
+}
+
+#[test]
+fn review_p01_a_file_directory_collision_is_a_conflict() {
+    let mut world = Adhoc::new();
+    let base = world.commit(&[("x.txt", R, b"x\n")], None);
+    let a = world.commit(&[("x.txt", R, b"x\n"), ("d", R, b"file\n")], Some(&base));
+    let b = world.commit(
+        &[("x.txt", R, b"x\n"), ("d/e", R, b"nested\n")],
+        Some(&base),
+    );
+    world.add("a", &base, &a);
+    world.add("b", &base, &b);
+    let result = world.try_compose(&world.request(&base, &["a", "b"]));
+    assert!(
+        is_conflict(&result, ConflictReason::DirectoryFile),
+        "{}",
+        code_of(&result)
+    );
+}
+
+#[test]
+fn review_p02_the_bytes_budget_counts_added_files() {
+    let mut world = Adhoc::new();
+    let base = world.commit(&[("x.txt", R, b"x\n")], None);
+    let big = vec![b'a'; 1 << 20];
+    let a = world.commit(&[("x.txt", R, b"x\n"), ("big.txt", R, &big)], Some(&base));
+    world.add("a", &base, &a);
+    let mut request = world.request(&base, &["a"]);
+    request.budget.max_bytes = 4096;
+    let result = world.try_compose(&request);
+    assert!(
+        matches!(&result, Ok(c) if c.outcome.code() == "budget_exhausted"),
+        "{}",
+        code_of(&result)
+    );
+    // Within budget, the recorded usage includes the added file.
+    request.budget = CompositionBudget::default();
+    let composition = world.compose(&request);
+    assert!(
+        composition.usage.bytes >= 1 << 20,
+        "{:?}",
+        composition.usage
+    );
+}
+
+#[test]
+fn review_p03_a_move_split_across_inherited_contributions_conflicts_in_any_order() {
+    let plain = pinned_card("    ", "");
+    let base_page = pinned_page("", &plain, &plain);
+    let deleted = pinned_page("", &plain, "");
+    let moved = pinned_page(&pinned_card("      ", ""), &plain, "");
+    let edited = pinned_page("", &pinned_card("    ", " onkeydown=\"go()\""), &plain);
+    let mut world = Adhoc::new();
+    let base = world.commit(&[("page.html", R, base_page.as_bytes())], None);
+    let m1 = world.commit(&[("page.html", R, deleted.as_bytes())], Some(&base));
+    let m2 = world.commit(&[("page.html", R, moved.as_bytes())], Some(&m1));
+    let edit = world.commit(&[("page.html", R, edited.as_bytes())], Some(&base));
+    world.add("m1", &base, &m1);
+    world.add("m2", &m1, &m2);
+    world.add("edit", &base, &edit);
+    for order in [["edit", "m1", "m2"], ["m1", "m2", "edit"]] {
+        let result = world.try_compose(&world.request(&base, &order));
+        assert!(
+            is_conflict(&result, ConflictReason::AmbiguousAnchor),
+            "{order:?}: {}",
+            code_of(&result)
+        );
+    }
+}
+
+#[test]
+fn review_p04_a_twin_moved_into_another_file_conflicts() {
+    let plain = pinned_card("    ", "");
+    let mut world = Adhoc::new();
+    let empty: &[u8] = b"<div>\n</div>\n";
+    let base = world.commit(
+        &[
+            ("page.html", R, pinned_page("", &plain, &plain).as_bytes()),
+            ("pinned.html", R, empty),
+        ],
+        None,
+    );
+    let pinned = format!("<div>\n{}</div>\n", pinned_card("  ", ""));
+    let mover = world.commit(
+        &[
+            ("page.html", R, pinned_page("", &plain, "").as_bytes()),
+            ("pinned.html", R, pinned.as_bytes()),
+        ],
+        Some(&base),
+    );
+    let editor = world.commit(
+        &[
+            (
+                "page.html",
+                R,
+                pinned_page("", &pinned_card("    ", " onkeydown=\"go()\""), &plain).as_bytes(),
+            ),
+            ("pinned.html", R, empty),
+        ],
+        Some(&base),
+    );
+    world.add("move", &base, &mover);
+    world.add("edit", &base, &editor);
+    for order in [["move", "edit"], ["edit", "move"]] {
+        let result = world.try_compose(&world.request(&base, &order));
+        assert!(
+            is_conflict(&result, ConflictReason::AmbiguousAnchor),
+            "{order:?}: {}",
+            code_of(&result)
+        );
+    }
+}
+
+#[test]
+fn review_p05_a_two_line_twin_move_conflicts() {
+    let item = |attribute: &str| {
+        format!("  <li class=\"tip\"{attribute}>\n    <a href=\"/more\">More</a></li>\n")
+    };
+    let list = |pinned: &str, first: &str, second: &str| {
+        format!(
+            "<nav>\n  <h2>Pinned</h2>\n{pinned}</nav>\n<ul>\n  <li>head</li>\n{first}{second}  <li>tail</li>\n</ul>\n"
+        )
+    };
+    let plain = item("");
+    let mut world = Adhoc::new();
+    let base = world.commit(&[("l.html", R, list("", &plain, &plain).as_bytes())], None);
+    let moved = list(
+        "    <li class=\"tip\">\n      <a href=\"/more\">More</a></li>\n",
+        &plain,
+        "",
+    );
+    let mover = world.commit(&[("l.html", R, moved.as_bytes())], Some(&base));
+    let editor = world.commit(
+        &[("l.html", R, list("", &item(" data-x=1"), &plain).as_bytes())],
+        Some(&base),
+    );
+    world.add("move", &base, &mover);
+    world.add("edit", &base, &editor);
+    for order in [["move", "edit"], ["edit", "move"]] {
+        let result = world.try_compose(&world.request(&base, &order));
+        assert!(
+            is_conflict(&result, ConflictReason::AmbiguousAnchor),
+            "{order:?}: {}",
+            code_of(&result)
+        );
+    }
+}
+
+#[test]
+fn review_p06_an_edited_index_row_cannot_substitute_a_snapshot() {
+    let mut world = Adhoc::new();
+    let base = world.commit(&[("f.txt", R, b"1\n2\n3\n")], None);
+    let a = world.commit(&[("f.txt", R, b"ONE\n2\n3\n")], Some(&base));
+    let b = world.commit(&[("f.txt", R, b"1\n2\nEVIL\n")], Some(&base));
+    world.add("a", &base, &a);
+    world.add("b", &base, &b);
+    let lineage = world.spec("a").lineage.clone().unwrap();
+    let connection =
+        rusqlite::Connection::open(world.store.project_dir().join("state.db")).unwrap();
+    let changed = connection
+        .execute(
+            "UPDATE retained_contributions SET result_snapshot =
+                 (SELECT result_snapshot FROM retained_contributions WHERE lineage_record_id != ?1)
+             WHERE lineage_record_id = ?1",
+            [lineage.as_str()],
+        )
+        .unwrap();
+    assert_eq!(changed, 1);
+    drop(connection);
+    let result = world.try_compose(&world.request(&base, &["a"]));
+    assert!(
+        matches!(&result, Err(composer::ComposeError::Archive(error)) if error.code() == "corrupt_object"),
+        "{}",
+        code_of(&result)
+    );
+}
+
+#[test]
+fn review_p07_a_lineage_duplicate_keeps_its_own_requirements() {
+    let mut world = Adhoc::new();
+    let base = world.commit(&[("f.txt", R, b"1\n2\n3\n")], None);
+    let a = world.commit(&[("f.txt", R, b"ONE\n2\n3\n")], Some(&base));
+    world.add("a", &base, &a);
+    let lineage = world.spec("a").lineage.clone();
+    let alias = |requires: Vec<String>, atomic_group: Option<String>| ContributionSpec {
+        id: "a2".into(),
+        lineage: lineage.clone(),
+        requires,
+        atomic_group,
+        revision_of: None,
+        derived_from: Vec::new(),
+    };
+    world.catalog.push(alias(vec!["absent".into()], None));
+    let result = world.try_compose(&world.request(&base, &["a", "a2"]));
+    assert!(
+        matches!(&result, Ok(c) if c.outcome.code() == "missing_input"),
+        "{}",
+        code_of(&result)
+    );
+    world.catalog.pop();
+    world.catalog.push(alias(Vec::new(), Some("g".into())));
+    world.catalog.push(ContributionSpec {
+        id: "g-member".into(),
+        lineage: None,
+        requires: Vec::new(),
+        atomic_group: Some("g".into()),
+        revision_of: None,
+        derived_from: Vec::new(),
+    });
+    let result = world.try_compose(&world.request(&base, &["a", "a2"]));
+    assert!(
+        matches!(&result, Ok(c) if c.outcome.code() == "missing_input"),
+        "{}",
+        code_of(&result)
+    );
+}
+
+#[test]
+fn review_p08_accepted_history_must_be_the_baseline_s() {
+    let mut world = Adhoc::new();
+    let base = world.commit(&[("f.txt", R, b"1\n2\n3\n4\n5\n")], None);
+    let unrelated = world.commit(&[("f.txt", R, b"1\nREJECTED\n3\n4\n5\n")], None);
+    let change = world.commit(
+        &[("f.txt", R, b"1\nREJECTED\n3\n4\nFIVE\n")],
+        Some(&unrelated),
+    );
+    world.add("c", &unrelated, &change);
+    let mut request = world.request(&base, &["c"]);
+    request.accepted = vec![CommitOid::parse(&unrelated).unwrap()];
+    let result = world.try_compose(&request);
+    assert!(
+        matches!(&result, Ok(c) if c.outcome.code() == "unknown_base"),
+        "{}",
+        code_of(&result)
+    );
+}
+
+#[test]
+fn review_p09_keeping_a_removed_constituent_is_refused() {
+    let mut world = Adhoc::new();
+    let base = world.commit(&[("f.txt", R, b"1\n2\n3\n4\n5\n")], None);
+    let a = world.commit(&[("f.txt", R, b"ONE\n2\n3\n4\n5\n")], Some(&base));
+    let b = world.commit(&[("f.txt", R, b"1\n2\n3\n4\nFIVE\n")], Some(&base));
+    let x = world.commit(&[("f.txt", R, b"ONE\n2\n3\n4\nFIVE\n")], Some(&base));
+    world.add("a", &base, &a);
+    world.add("b", &base, &b);
+    world.add("x", &base, &x).derived_from = vec!["a".into(), "b".into()];
+    for keep in ["b", "x"] {
+        let request = world.request(&base, &[]);
+        let result = composer::recompose_without(
+            &mut world.store,
+            &world.repo,
+            &request,
+            &Subtraction {
+                from: "x".into(),
+                remove: vec!["b".into()],
+                keep: vec![keep.into()],
+            },
+        );
+        assert!(
+            matches!(&result, Ok(c) if c.outcome.code() == "inseparable_selection"),
+            "keep {keep}: {}",
+            code_of(&result)
+        );
+    }
+}
+
+#[test]
+fn review_p10_the_candidate_commit_ignores_repository_commit_encoding() {
+    let mut world = Adhoc::new();
+    let base = world.commit(&[("f.txt", R, b"1\n2\n3\n")], None);
+    let a = world.commit(&[("f.txt", R, b"ONE\n2\n3\n")], Some(&base));
+    world.add("a", &base, &a);
+    let request = world.request(&base, &["a"]);
+    let first = world
+        .compose(&request)
+        .outcome
+        .candidate()
+        .unwrap()
+        .commit
+        .clone();
+    git_in(
+        &world.repo,
+        &["config", "i18n.commitEncoding", "ISO-8859-1"],
+        None,
+    );
+    let second = world
+        .compose(&request)
+        .outcome
+        .candidate()
+        .unwrap()
+        .commit
+        .clone();
+    assert_eq!(first, second);
+}
+
+#[test]
+fn review_p11_a_revision_loop_still_competes() {
+    let mut world = Adhoc::new();
+    let base = world.commit(&[("a.txt", R, b"a\n"), ("b.txt", R, b"b\n")], None);
+    let a = world.commit(&[("a.txt", R, b"A\n"), ("b.txt", R, b"b\n")], Some(&base));
+    let b = world.commit(&[("a.txt", R, b"a\n"), ("b.txt", R, b"B\n")], Some(&base));
+    world.add("a", &base, &a).revision_of = Some("b".into());
+    world.add("b", &base, &b).revision_of = Some("a".into());
+    let result = world.try_compose(&world.request(&base, &["a", "b"]));
+    assert!(
+        matches!(&result, Ok(c) if c.outcome.code() == "competing_revisions"),
+        "{}",
+        code_of(&result)
+    );
 }
