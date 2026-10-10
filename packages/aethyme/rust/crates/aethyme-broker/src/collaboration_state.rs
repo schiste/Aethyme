@@ -37,7 +37,7 @@ use serde::Serialize;
 pub use crate::host_state::HostStateSource;
 
 /// The schema this binary writes.
-pub const COLLABORATION_STATE_SCHEMA_VERSION: i64 = 2;
+pub const COLLABORATION_STATE_SCHEMA_VERSION: i64 = 3;
 /// The oldest schema a database written by this binary can be read by.
 /// Unlike `host-operations.db`, a newer database stays readable by an older
 /// binary until a release raises this floor.
@@ -45,12 +45,13 @@ const MIN_COMPATIBLE_SCHEMA: i64 = 1;
 const ROOT_DIRECTORY: &str = "collaboration";
 /// Additive schema steps after the version 1 layout (`meta` only), applied in
 /// order. Each only adds tables, so none raises the compatibility floor.
-const MIGRATIONS: &[(i64, &str)] = &[(
-    2,
-    // The archive index (#657). Rows are written only after every object a
-    // snapshot or contribution names has been published and verified; the
-    // objects themselves are the authority, and these rows are rebuildable.
-    "CREATE TABLE IF NOT EXISTS retained_snapshots (
+const MIGRATIONS: &[(i64, &str)] = &[
+    (
+        2,
+        // The archive index (#657). Rows are written only after every object a
+        // snapshot or contribution names has been published and verified; the
+        // objects themselves are the authority, and these rows are rebuildable.
+        "CREATE TABLE IF NOT EXISTS retained_snapshots (
          snapshot_id TEXT PRIMARY KEY NOT NULL,
          record_id TEXT NOT NULL,
          record_sha256 TEXT NOT NULL,
@@ -64,7 +65,63 @@ const MIGRATIONS: &[(i64, &str)] = &[(
          base_snapshot TEXT NOT NULL REFERENCES retained_snapshots (snapshot_id),
          result_snapshot TEXT NOT NULL REFERENCES retained_snapshots (snapshot_id)
      ) STRICT;",
-)];
+    ),
+    (
+        3,
+        // The capture journal (#658). An operation row is the retry key and
+        // the recovery owner; a receipt, its retention root and its outbox
+        // row are committed in one transaction. Retention roots, active
+        // operations and reservations are what reclamation (#659) consults.
+        "CREATE TABLE IF NOT EXISTS capture_operations (
+             operation_id TEXT PRIMARY KEY NOT NULL,
+             request_digest TEXT NOT NULL,
+             repository TEXT NOT NULL,
+             base_commit TEXT NOT NULL,
+             result_commit TEXT NOT NULL,
+             policy TEXT NOT NULL,
+             retention_until_ms INTEGER,
+             reserved_bytes INTEGER NOT NULL,
+             state TEXT NOT NULL CHECK (state IN ('intent', 'copying', 'sealed', 'committed',
+                 'acknowledged', 'incomplete', 'failed', 'refused', 'aborted')),
+             lineage_record_id TEXT,
+             outcome_code TEXT,
+             outcome_detail TEXT,
+             created_ms INTEGER NOT NULL,
+             updated_ms INTEGER NOT NULL
+         ) STRICT;
+         CREATE TABLE IF NOT EXISTS capture_receipts (
+             operation_id TEXT PRIMARY KEY NOT NULL
+                 REFERENCES capture_operations (operation_id),
+             receipt_record_id TEXT NOT NULL,
+             receipt_sha256 TEXT NOT NULL,
+             lineage_record_id TEXT NOT NULL
+                 REFERENCES retained_contributions (lineage_record_id),
+             base_snapshot TEXT NOT NULL,
+             result_snapshot TEXT NOT NULL,
+             durability TEXT NOT NULL,
+             committed_ms INTEGER NOT NULL
+         ) STRICT;
+         CREATE TABLE IF NOT EXISTS retention_roots (
+             root_id INTEGER PRIMARY KEY,
+             kind TEXT NOT NULL CHECK (kind IN ('capture_intent', 'contribution')),
+             operation_id TEXT NOT NULL REFERENCES capture_operations (operation_id),
+             lineage_record_id TEXT,
+             until_ms INTEGER,
+             created_ms INTEGER NOT NULL,
+             released_ms INTEGER
+         ) STRICT;
+         CREATE INDEX IF NOT EXISTS retention_roots_live
+             ON retention_roots (kind) WHERE released_ms IS NULL;
+         CREATE TABLE IF NOT EXISTS outbox (
+             sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+             operation_id TEXT NOT NULL UNIQUE REFERENCES capture_operations (operation_id),
+             kind TEXT NOT NULL,
+             payload_record_id TEXT NOT NULL,
+             created_ms INTEGER NOT NULL,
+             delivered_ms INTEGER
+         ) STRICT;",
+    ),
+];
 /// The file that marks a directory as a collaboration root.
 pub const ROOT_MARKER: &str = ".aethyme-collaboration-root.json";
 const ROOT_MARKER_KIND: &str = "aethyme-collaboration-root";
@@ -348,6 +405,12 @@ impl CollaborationStore {
 
     pub fn schema_version(&self) -> i64 {
         self.schema_version
+    }
+
+    /// Pretend the store sits on another filesystem profile.
+    #[cfg(test)]
+    pub(crate) fn set_durability_for_test(&mut self, profile: DurabilityProfile) {
+        self.durability = profile;
     }
 
     /// The database, read-only use.
