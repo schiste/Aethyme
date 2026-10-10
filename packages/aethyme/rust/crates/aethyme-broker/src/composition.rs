@@ -129,6 +129,13 @@ pub enum Refusal {
     UnsafePlan,
     /// The gate policy at the baseline is not trusted on this machine.
     UntrustedPolicy,
+    /// The session's checkout is on another branch than the one recorded,
+    /// or moved; submit refuses with `SessionCheckoutDrift`.
+    CheckoutDrift,
+    /// The session's changes are not its own to submit: unleased paths,
+    /// another active session's conflicting lease, or adoption-time foreign
+    /// files. Submit refuses with `OwnershipViolation`.
+    OwnershipViolation,
 }
 
 impl Refusal {
@@ -142,6 +149,8 @@ impl Refusal {
             Self::InseparableSelection => "inseparable_selection",
             Self::UnsafePlan => "unsafe_plan",
             Self::UntrustedPolicy => "untrusted_policy",
+            Self::CheckoutDrift => "checkout_drift",
+            Self::OwnershipViolation => "ownership_violation",
         }
     }
 }
@@ -149,12 +158,22 @@ impl Refusal {
 /// Inputs the producer cannot represent at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Unsupported {
-    /// A pending input commit has other than one parent; the legacy replay
+    /// A pending input commit has more than one parent; the legacy replay
     /// applies only linear history.
     MergeCommit,
     /// The candidate holds an entry a #652 snapshot cannot name (a gitlink,
     /// say), so it has no subject.
     SnapshotEntry,
+    /// A pending input commit has no parent at all (a root commit), so it
+    /// has no change of its own to apply.
+    CommitShape,
+    /// A path of the candidate has a checkout-transforming attribute
+    /// (`filter`, `working-tree-encoding`, `ident`), which the archive
+    /// refuses to retain, so no subject could ever be retained.
+    TransformingAttribute,
+    /// The repository is a partial clone: the archive reads no source from
+    /// one, so the candidate cannot be named.
+    PartialClone,
 }
 
 impl Unsupported {
@@ -162,6 +181,9 @@ impl Unsupported {
         match self {
             Self::MergeCommit => "merge_commit",
             Self::SnapshotEntry => "snapshot_entry",
+            Self::CommitShape => "commit_shape",
+            Self::TransformingAttribute => "transforming_attribute",
+            Self::PartialClone => "partial_clone",
         }
     }
 }
@@ -211,14 +233,7 @@ impl CompositionOutcome {
 }
 
 fn commit_oid(text: &str) -> Result<CommitOid, BrokerOpError> {
-    CommitOid::parse(text).map_err(archive_failure)
-}
-
-fn archive_failure(error: ArchiveError) -> BrokerOpError {
-    BrokerOpError::Store(crate::BrokerError::Io {
-        path: "<candidate snapshot>".into(),
-        source: std::io::Error::other(format!("{}: {error}", error.code())),
-    })
+    CommitOid::parse(text).map_err(BrokerOpError::CandidateSource)
 }
 
 impl Broker {
@@ -231,7 +246,26 @@ impl Broker {
     pub fn legacy_candidate(&self, session_id: i64) -> Result<CompositionOutcome, BrokerOpError> {
         let session = self.store_ref().session(session_id)?;
         let checkout = crate::git::GitRepo::discover(Path::new(&session.worktree_path))?;
-        let session_head = checkout.head_commit()?;
+        // Submit's preflight, in submit's order: checkout identity, then
+        // lease ownership, then the baseline's policy.
+        let session_head =
+            match crate::merge::require_session_checkout_identity(&session, &checkout, None) {
+                Ok(head) => head,
+                Err(error @ BrokerOpError::SessionCheckoutDrift { .. }) => {
+                    return Ok(CompositionOutcome::Refused {
+                        reason: Refusal::CheckoutDrift,
+                        detail: error.to_string(),
+                    });
+                }
+                Err(error) => return Err(error),
+            };
+        let ownership = self.audit_submit_ownership_read_only(session_id)?;
+        if !ownership.ok {
+            return Ok(CompositionOutcome::Refused {
+                reason: Refusal::OwnershipViolation,
+                detail: ownership.failure_summary(),
+            });
+        }
         let (baseline_source, base) = self.candidate_baseline()?;
 
         let policy = crate::broker::gate_trust::policy_at_commit(self.repo_handle(), &base)?;
@@ -259,9 +293,13 @@ impl Broker {
                     detail: reason,
                 });
             }
-            Err(error @ BrokerOpError::UnsupportedSubmissionCommit { .. }) => {
+            Err(error @ BrokerOpError::UnsupportedSubmissionCommit { parent_count, .. }) => {
                 return Ok(CompositionOutcome::Unsupported {
-                    reason: Unsupported::MergeCommit,
+                    reason: if parent_count == 0 {
+                        Unsupported::CommitShape
+                    } else {
+                        Unsupported::MergeCommit
+                    },
                     detail: error.to_string(),
                 });
             }
@@ -319,14 +357,21 @@ impl Broker {
         let subject =
             match collaboration_archive::snapshot_of_commit(&self.main_root_path(), &commit) {
                 Ok(snapshot) => snapshot.id(),
-                Err(error @ ArchiveError::UnsupportedEntry { .. })
-                | Err(error @ ArchiveError::InvalidSnapshot(_)) => {
+                Err(error) => {
+                    let reason = match &error {
+                        ArchiveError::UnsupportedEntry { .. }
+                        | ArchiveError::InvalidSnapshot(_) => Unsupported::SnapshotEntry,
+                        ArchiveError::UnsupportedFilter { .. } => {
+                            Unsupported::TransformingAttribute
+                        }
+                        ArchiveError::PartialClone { .. } => Unsupported::PartialClone,
+                        _ => return Err(BrokerOpError::CandidateSource(error)),
+                    };
                     return Ok(CompositionOutcome::Unsupported {
-                        reason: Unsupported::SnapshotEntry,
+                        reason,
                         detail: error.to_string(),
                     });
                 }
-                Err(error) => return Err(archive_failure(error)),
             };
         Ok(CompositionOutcome::Candidate(Candidate {
             subject,

@@ -1075,10 +1075,13 @@ fn attribute_set_by_tree(
 
 // ---------------------------------------------------------------- capture
 
-/// The file entries of `commit`'s tree, in Git order. Gitlinks (160000) and
-/// any other non-file mode are refused here; a mode #652 accepts is always a
-/// blob.
+/// The file entries of `commit`'s tree, in Git order, after every refusal
+/// the archive makes before reading a blob: gitlinks (160000) and any other
+/// non-file mode, checkout-transforming attributes, and paths #652 rejects.
+/// Shared by [`retain_snapshot_with`] and [`snapshot_of_commit`], so a
+/// snapshot one names is one the other would retain.
 fn commit_entries(
+    repo: &Path,
     reader: &mut ObjectReader,
     commit: &CommitOid,
 ) -> Result<Vec<TreeEntry>, ArchiveError> {
@@ -1099,16 +1102,33 @@ fn commit_entries(
             });
         }
     }
+    let paths: Vec<&[u8]> = tree.iter().map(|entry| entry.path.as_slice()).collect();
+    refuse_transforming_attributes(repo, commit, &paths)?;
+    // Validate paths before any blob is read.
+    let provisional = tree
+        .iter()
+        .map(|entry| {
+            SourceEntry::from_content_digest(
+                entry.path.clone(),
+                EntryKind::from_git_mode(&entry.mode).expect("checked above"),
+                [0; 32],
+            )
+        })
+        .collect::<Vec<_>>();
+    SourceSnapshot::new(provisional)?;
     Ok(tree)
 }
 
 /// The #652 snapshot of `commit`'s committed bytes, read from the repository
 /// and retained nowhere. It names a candidate before anything decides to keep
-/// it (#663); [`retain_snapshot_with`] of the same commit yields the same ID.
+/// it (#663). It makes every refusal [`retain_snapshot_with`] makes, so it
+/// names a snapshot exactly when retaining the same commit would succeed
+/// with the same ID (barring a source that disappears in between). It reads
+/// and hashes every blob: O(bytes of the tree) per call, with no cache.
 pub fn snapshot_of_commit(repo: &Path, commit: &CommitOid) -> Result<SourceSnapshot, ArchiveError> {
     refuse_partial_clone(repo)?;
     let mut reader = ObjectReader::open(repo)?;
-    let tree = commit_entries(&mut reader, commit)?;
+    let tree = commit_entries(repo, &mut reader, commit)?;
     let mut entries = Vec::with_capacity(tree.len());
     for entry in &tree {
         let Some((kind, size)) = reader.request(&entry.oid)? else {
@@ -1161,21 +1181,7 @@ pub(crate) fn retain_snapshot_with(
     refuse_partial_clone(repo)?;
     let mut reader = ObjectReader::open(repo)?;
     let format = reader.format;
-    let tree = commit_entries(&mut reader, commit)?;
-    let paths: Vec<&[u8]> = tree.iter().map(|entry| entry.path.as_slice()).collect();
-    refuse_transforming_attributes(repo, commit, &paths)?;
-    // Validate paths before copying anything.
-    let provisional = tree
-        .iter()
-        .map(|entry| {
-            SourceEntry::from_content_digest(
-                entry.path.clone(),
-                EntryKind::from_git_mode(&entry.mode).expect("checked above"),
-                [0; 32],
-            )
-        })
-        .collect::<Vec<_>>();
-    SourceSnapshot::new(provisional)?;
+    let tree = commit_entries(repo, &mut reader, commit)?;
 
     let mut entries = Vec::with_capacity(tree.len());
     let mut content_bytes: u64 = 0;
@@ -2107,6 +2113,48 @@ mod tests {
             // Set by the commit itself: every clone refuses it.
             assert!(!error.is_incomplete(), "{file}: {error}");
         }
+    }
+
+    /// #663: a commit snapshot makes every refusal retaining makes, with the
+    /// same code, so a candidate is named exactly when it could be retained.
+    #[test]
+    fn a_commit_snapshot_refuses_what_retaining_refuses() {
+        let (_host, mut store) = store();
+        let mut sources = Vec::new();
+        for (file, attributes) in [
+            ("README.md", b"README.md filter=custom\n".as_slice()),
+            ("data.bin", b"*.bin filter=lfs diff=lfs merge=lfs -text\n"),
+            ("notes.txt", b"*.txt working-tree-encoding=UTF-16\n"),
+            ("main.c", b"*.c ident\n"),
+        ] {
+            let source = repo();
+            commit_with_attributes(source.path(), &[(file, b"content\n")], attributes);
+            sources.push(source);
+        }
+        // A path #652 rejects although Git stores it: an NTFS 8.3 alias of
+        // `.git`.
+        let aliased = repo();
+        write(aliased.path(), "GIT~1/config", b"x\n");
+        git_in(
+            aliased.path(),
+            &["-c", "core.protectNTFS=false", "add", "-A"],
+        );
+        git_in(
+            aliased.path(),
+            &["-c", "core.protectNTFS=false", "commit", "-qm", "alias"],
+        );
+        sources.push(aliased);
+        for source in &sources {
+            let commit = head(source.path());
+            let named = snapshot_of_commit(source.path(), &commit).unwrap_err();
+            let retained = retain_snapshot(&mut store, source.path(), &commit).unwrap_err();
+            assert_eq!(named.code(), retained.code(), "{named} / {retained}");
+            assert!(
+                ["unsupported_filter", "invalid_snapshot"].contains(&named.code()),
+                "{named}"
+            );
+        }
+        assert_eq!(object_count(&store), 0, "refused before anything is copied");
     }
 
     /// Attributes from outside the tree change a checkout too.

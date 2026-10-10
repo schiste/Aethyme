@@ -30,7 +30,7 @@ pub const DEFAULT_INTEGRATION_BRANCH: &str = "aethyme/integration";
 pub const ACTION_REQUIRED_RELPATH: &str = ".aethyme/broker-action-required.md";
 const PROMOTION_SUBJECT_MAX_CHARS: usize = 72;
 
-fn require_session_checkout_identity(
+pub(crate) fn require_session_checkout_identity(
     session: &crate::Session,
     checkout: &GitRepo,
     expected_head: Option<&str>,
