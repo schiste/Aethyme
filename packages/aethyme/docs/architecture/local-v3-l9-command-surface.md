@@ -24,6 +24,7 @@ No command reports success for an unavailable runtime profile.
 | `target select --target NAME --issuer NAME --revision ID` | Existing exact revision selection, issuer binding and active-wave/budget refusal. |
 | `target hold --target NAME --issuer NAME --version N` | Existing compare-and-swap hold; no cancellation or acceptance. |
 | `target resume --target NAME --issuer NAME --version N` | Existing compare-and-swap resume of the recorded previous phase. |
+| `authority status` | Read the checked native witness and ledger binding without creating files, locking, initializing or rotating authority. Distinguishes unbound, active, frozen, missing witness and drift; this is an observation, never a guard. |
 | `stop --epoch EPOCH --reason TEXT` | Existing project freeze with the exact current epoch; cooperative ingress closes and authority rotates. Running processes and external effects are not assumed cancelled. |
 | `export --target NAME --issuer NAME --source ID ... --record ID@SHA256 ... --audience NAME --output PATH` | Existing bounded, closed historical bundle; exclusive output creation, exact bundle digest and explicit source/advisory-only limitations. No overwrite or automatic source release. |
 | `handoff show --id ID` | Existing retained-request integrity check and historical state/receipt identifiers. Observation never validates current agent authority. Opening the existing store can perform migrations and is disclosed. |
@@ -51,3 +52,20 @@ exclusive output creation, unsupported adapter refusal with no side effects,
 versioned JSON and help snapshots. Each fix needs a named negative and restored
 positive. Use disposable Playground repositories only. An independent reviewer
 must check the implementation in a separate read-only exact snapshot.
+
+## Appointment and exact epoch rules
+
+Only a valid explicit `target propose` may appoint a new target. Parse and
+validate the entire bounded proposal before any controller acquisition.
+Select, hold, resume and export require an existing exact target/issuer before
+acquisition; unknown targets and mismatched issuers refuse without creating a
+row or initializing authority. The ambient trusted local operator authorizes
+these commands; `--issuer` is an identity label, not authentication.
+
+`authority status` observes the existing checked read-only snapshot and the
+bounded external witness using the shared native authority reader. It does
+not open writable state or create an ingress lock. The output names whether
+the witness matches the existing ledger binding; an epoch observed here never
+grants a guard. A concurrent change is caught by the existing exact-epoch
+freeze check. Tests must cover observation then successful exact stop, stale
+old epoch refusal and byte-identical state/witness after inspection.

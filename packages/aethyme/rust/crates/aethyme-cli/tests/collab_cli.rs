@@ -832,3 +832,68 @@ fn no_command_creates_state_and_errors_echo_no_arguments() {
     assert_eq!(code, 3, "{refused}");
     assert_eq!(refused["code"], "file_too_large");
 }
+
+#[test]
+fn lifecycle_commands_refuse_disabled_policy_before_any_input_or_state_access() {
+    let f = Fixture::new(None);
+    for words in [
+        vec![
+            "target",
+            "propose",
+            "--target",
+            "T",
+            "--issuer",
+            "operator",
+            "--file",
+            "/__missing_lifecycle_spec__",
+        ],
+        vec!["target", "status", "--target", "T"],
+        vec!["authority", "status"],
+        vec!["stop", "--epoch", "invalid", "--reason", "stop"],
+        vec!["export", "--output", "/__missing_lifecycle_output__"],
+        vec!["handoff", "show", "--id", "invalid"],
+        vec!["sync", "status"],
+    ] {
+        let mut args = vec!["collab"];
+        args.extend(words);
+        let (code, value) = f.json(&args);
+        assert_eq!(code, 3, "{args:?}: {value}");
+        assert_eq!(value["schema"], "aethyme.collab-error/experimental-v0");
+        assert_eq!(value["code"], "collaboration_disabled");
+        assert!(!f.collaboration_dir().exists());
+    }
+}
+#[test]
+fn unavailable_lifecycle_adapters_refuse_without_state_creation() {
+    let f = Fixture::new(Some(&enabled_config()));
+    for args in [
+        vec!["collab", "target", "run", "--file", "/__missing_spec__"],
+        vec!["collab", "sync"],
+        vec![
+            "collab",
+            "handoff",
+            "dispatch",
+            "--file",
+            "/__missing_spec__",
+        ],
+    ] {
+        let (code, value) = f.json(&args);
+        assert_eq!(code, 3, "{args:?}: {value}");
+        assert_eq!(value["code"], "unsupported_profile");
+        assert!(!f.collaboration_dir().exists());
+    }
+}
+#[test]
+fn lifecycle_read_only_commands_leave_absent_state_absent() {
+    let f = Fixture::new(Some(&enabled_config()));
+    for args in [
+        vec!["collab", "target", "status", "--target", "T"],
+        vec!["collab", "authority", "status"],
+        vec!["collab", "sync", "status"],
+    ] {
+        let (code, value) = f.json(&args);
+        assert_eq!(code, 3, "{args:?}: {value}");
+        assert_eq!(value["code"], "not_initialized");
+        assert!(!f.collaboration_dir().exists());
+    }
+}
