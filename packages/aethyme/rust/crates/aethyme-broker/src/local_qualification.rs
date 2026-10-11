@@ -32,6 +32,7 @@ impl Drop for NativeClient {
     }
 }
 fn control(executor: &DockerExecutor, args: &[&str]) -> std::process::Output {
+    use std::io::Read;
     use std::process::{Command, Stdio};
     let stdout = tempfile::NamedTempFile::new().unwrap();
     let stderr = tempfile::NamedTempFile::new().unwrap();
@@ -49,24 +50,37 @@ fn control(executor: &DockerExecutor, args: &[&str]) -> std::process::Output {
     };
     let deadline = Instant::now() + Duration::from_secs(5);
     let status = loop {
-        if let Some(status) = client.child.try_wait().unwrap() {
-            break status;
-        }
         if Instant::now() >= deadline
             || stdout.as_file().metadata().unwrap().len() > MIB
             || stderr.as_file().metadata().unwrap().len() > MIB
         {
             panic!("bounded native qualification control did not complete");
         }
+        if let Some(status) = client.child.try_wait().unwrap() {
+            break status;
+        }
         std::thread::sleep(Duration::from_millis(20));
     };
     client.reaped = true;
     assert!(stdout.as_file().metadata().unwrap().len() <= MIB);
     assert!(stderr.as_file().metadata().unwrap().len() <= MIB);
+    let bounded = |file: &tempfile::NamedTempFile| {
+        let mut bytes = Vec::new();
+        file.reopen()
+            .unwrap()
+            .take(MIB + 1)
+            .read_to_end(&mut bytes)
+            .unwrap();
+        assert!(
+            bytes.len() as u64 <= MIB,
+            "native control output exceeded its bound"
+        );
+        bytes
+    };
     std::process::Output {
         status,
-        stdout: std::fs::read(stdout.path()).unwrap(),
-        stderr: std::fs::read(stderr.path()).unwrap(),
+        stdout: bounded(&stdout),
+        stderr: bounded(&stderr),
     }
 }
 fn journals(host: &Path) -> Vec<Journal> {
