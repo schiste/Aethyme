@@ -1,0 +1,4 @@
+{
+  "canonical": "{\"schema\":\"aethyme.generation-prepared/provisional-v0\",\"spec\":{\"generation\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"git_metadata\":\"sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\",\"local_commit\":\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\",\"profile\":\"aethyme.generation.raw-standalone-git/provisional-v0\",\"provider_commit\":\"cccccccccccccccccccccccccccccccccccccccc\",\"source\":\"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"tree\":\"dddddddddddddddddddddddddddddddddddddddd\"}}",
+  "id": "sha256:d94a1bdcf2f11b7dbdc79aff155a938c7e1f220389e426c3f4b2591236a754b1"
+}

@@ -852,6 +852,27 @@ fn survey(
                 .push(format!("unknown target root kind {kind}")),
         }
     }
+    // Fresh generations retain their own source and pending work independently
+    // of the target lifetime. Preparation or an event never retires these roots.
+    let generation_roots: Vec<(String, String)> = connection
+        .prepare("SELECT kind,reference FROM local_generation_roots")?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<Result<_, _>>()?;
+    for (kind, reference) in generation_roots {
+        match kind.as_str() {
+            "snapshot" => live.snapshot(&reference)?,
+            "contribution" => live.contribution(&reference)?,
+            "object" => match parse_hex_digest(&reference) {
+                Some(digest) => live.object(digest, RetentionClass::Record),
+                None => live
+                    .problems
+                    .push(format!("generation root {reference} is malformed")),
+            },
+            _ => live
+                .problems
+                .push(format!("unknown generation root kind {kind}")),
+        }
+    }
     for problem in std::mem::take(&mut live.problems) {
         blockers.push(GcBlocker {
             kind: "dangling_root",
