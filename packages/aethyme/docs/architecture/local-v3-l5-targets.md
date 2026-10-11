@@ -28,6 +28,12 @@ record encoding and domain. Catalog, requirement and prerequisite sets are
 normalized; selected application order stays significant. Duplicate aliases
 for the same lineage are refused.
 
+Selection uses the composer's archive-only planner, including replacement
+lines, synthesized inputs and source ancestry. A source base must match the
+target baseline or a selected predecessor result. This target format does not
+declare separate accepted history. Planning invokes no Git process and writes
+no candidate or composition recipe.
+
 The trusted issuer supplies policy and requirement references. This package
 checks their canonical IDs and freezes them; it does not attest those policy
 records, resolve external authorization, or certify their behavioral evidence.
@@ -74,8 +80,11 @@ budget reservations and unknown consumption belong to #668.
 
 Collaboration schema **7**, floor **7**, adds targets, immutable revision bodies,
 per-contribution dispositions and target roots. It follows context migrations
-5/6. Schema 6 reclamation cannot follow these roots, so older binaries must
-refuse this store. The broker DB schema and gate flow are unchanged.
+5/6. Schema 6 reclamation cannot follow these roots. The floor makes older
+binaries refuse fresh opens. Stop all existing collaboration clients before
+migration: an already-open schema 6 handle does not re-check the floor and
+cannot safely reclaim a migrated store. Live mixed-version access across the
+upgrade is unsupported. The broker DB schema and gate flow are unchanged.
 
 Migration 7 adopts the lazy `resolution_attempts` table from #665 with
 `CREATE TABLE IF NOT EXISTS`; it preserves previously charged attempts.

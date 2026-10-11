@@ -1537,12 +1537,15 @@ mod tests {
         store
             .connection()
             .execute(
-                "UPDATE meta SET value = '7' WHERE key = 'schema_version'",
-                [],
+                "UPDATE meta SET value = ?1 WHERE key = 'schema_version'",
+                [(COLLABORATION_STATE_SCHEMA_VERSION + 1).to_string()],
             )
             .unwrap();
         drop(store);
-        assert_eq!(open(host.path(), &[]).unwrap().schema_version(), 7);
+        assert_eq!(
+            open(host.path(), &[]).unwrap().schema_version(),
+            COLLABORATION_STATE_SCHEMA_VERSION + 1
+        );
 
         let mut store = open(host.path(), &[]).unwrap();
         store

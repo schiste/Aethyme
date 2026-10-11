@@ -233,6 +233,13 @@ pub enum TargetError {
     Released,
     #[error("corrupt target state: {0}")]
     Corrupt(String),
+    #[error("target selection refused: {reason:?}: {detail}")]
+    SelectionRefused {
+        reason: crate::composition::Refusal,
+        detail: String,
+    },
+    #[error(transparent)]
+    Compose(#[from] crate::composer::ComposeError),
     #[error(transparent)]
     Archive(#[from] ArchiveError),
     #[error(transparent)]
@@ -325,7 +332,7 @@ fn normalize(mut spec: TargetSpec) -> Result<TargetSpec, TargetError> {
             "require 1..1024 contributions and a nonempty selection".into(),
         ));
     }
-    fn set(values: &mut Vec<String>) -> Result<(), TargetError> {
+    fn set(values: &mut [String]) -> Result<(), TargetError> {
         values.sort();
         if values.windows(2).any(|p| p[0] == p[1]) {
             return Err(TargetError::Invalid("duplicate set member".into()));
@@ -363,48 +370,8 @@ fn normalize(mut spec: TargetSpec) -> Result<TargetSpec, TargetError> {
         return Err(TargetError::Invalid("duplicate lineage alias".into()));
     }
     for id in &selected {
-        let c = catalog
-            .get(id)
-            .ok_or_else(|| TargetError::Invalid(format!("unknown selection {id}")))?;
-        if c.requires.iter().any(|r| !selected.contains(r.as_str())) {
-            return Err(TargetError::Invalid(format!(
-                "missing prerequisite of {id}"
-            )));
-        }
-        if c.revision_of
-            .as_deref()
-            .is_some_and(|r| selected.contains(r))
-        {
-            return Err(TargetError::Invalid(format!("competing revisions of {id}")));
-        }
-        if let Some(group) = &c.atomic_group
-            && spec.contributions.iter().any(|other| {
-                other.atomic_group.as_ref() == Some(group) && !selected.contains(other.id.as_str())
-            })
-        {
-            return Err(TargetError::Invalid(format!(
-                "partial atomic group {group}"
-            )));
-        }
-    }
-    // Kahn's algorithm: a cycle cannot become perpetual waiting.
-    let mut remaining = selected;
-    while !remaining.is_empty() {
-        let ready: Vec<_> = remaining
-            .iter()
-            .copied()
-            .filter(|id| {
-                catalog[id]
-                    .requires
-                    .iter()
-                    .all(|r| !remaining.contains(r.as_str()))
-            })
-            .collect();
-        if ready.is_empty() {
-            return Err(TargetError::Invalid("dependency cycle".into()));
-        }
-        for id in ready {
-            remaining.remove(id);
+        if !catalog.contains_key(id) {
+            return Err(TargetError::Invalid(format!("unknown selection {id}")));
         }
     }
     if serde_json::to_vec(&spec)?.len() > 1024 * 1024 {
@@ -440,6 +407,31 @@ pub fn propose_revision(
         })?;
         require_snapshot(store, retained.base.snapshot_id.as_str())?;
         require_snapshot(store, retained.result.snapshot_id.as_str())?;
+    }
+    let baseline_id = SourceSnapshotId::parse(&spec.baseline)
+        .map_err(|_| TargetError::Invalid("baseline".into()))?;
+    let baseline = archive::retained(store, &baseline_id)?.ok_or(TargetError::Missing)?;
+    let catalog = spec
+        .contributions
+        .iter()
+        .map(|c| {
+            Ok(crate::composer::ContributionSpec {
+                id: c.id.clone(),
+                lineage: Some(record_id(&c.lineage)?),
+                requires: c.requires.clone(),
+                atomic_group: c.atomic_group.clone(),
+                revision_of: c.revision_of.clone(),
+                derived_from: c.derived_from.clone(),
+            })
+        })
+        .collect::<Result<Vec<_>, TargetError>>()?;
+    if let Err((reason, detail)) = crate::composer::validate_retained_selection(
+        store,
+        baseline,
+        catalog,
+        spec.selected.clone(),
+    )? {
+        return Err(TargetError::SelectionRefused { reason, detail });
     }
     let record = Record::decode(&serde_json::to_vec(&serde_json::json!({
         "schema": TARGET_REVISION_SCHEMA_NAME, "target": owner.target, "issuer": owner.issuer, "spec": spec,

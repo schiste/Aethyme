@@ -56,6 +56,25 @@ struct Fixture {
 }
 
 impl Fixture {
+    fn feature(&mut self, base: &CommitOid) -> RequestedContribution {
+        git(self._repo.path(), &["switch", "-qc", "C", base.as_str()]);
+        std::fs::write(self._repo.path().join("three.txt"), "C\n").unwrap();
+        git(self._repo.path(), &["add", "three.txt"]);
+        git(self._repo.path(), &["commit", "-qm", "C"]);
+        let commit = CommitOid::parse(&git(self._repo.path(), &["rev-parse", "HEAD"])).unwrap();
+        let retained =
+            archive::retain_contribution(&mut self.store, self._repo.path(), base, &commit)
+                .unwrap();
+        RequestedContribution {
+            id: "C".into(),
+            lineage: retained.lineage_record_id.to_string(),
+            requires: vec![],
+            atomic_group: None,
+            revision_of: None,
+            derived_from: vec![],
+        }
+    }
+
     fn new() -> Self {
         let host = tempfile::tempdir().unwrap();
         let repo = tempfile::tempdir().unwrap();
@@ -219,7 +238,7 @@ fn dependency_errors_refuse_before_creating_target_revision() {
         assert!(
             matches!(
                 propose_revision(&mut f.store, &owner, spec),
-                Err(TargetError::Invalid(_))
+                Err(TargetError::Invalid(_) | TargetError::SelectionRefused { .. })
             ),
             "case {case}"
         );
@@ -232,6 +251,140 @@ fn dependency_errors_refuse_before_creating_target_revision() {
         })
         .unwrap();
     assert_eq!(count, 0);
+}
+
+#[test]
+fn revision_lines_and_synthesis_cannot_double_apply_original_work() {
+    use crate::composition::Refusal;
+    let mut f = Fixture::new();
+    let base = f.a.base.commit.clone();
+    let c = f.feature(&base);
+    let owner = acquire_controller(&mut f.store, "target", "appointed").unwrap();
+    for case in 0..3 {
+        let mut spec = f.spec();
+        spec.selected.push("B".into());
+        match case {
+            0 => {
+                spec.contributions[0].revision_of = Some("original".into());
+                spec.contributions[1].revision_of = Some("original".into());
+            }
+            1 => {
+                spec.contributions[1].revision_of = Some("A".into());
+                let mut c = c.clone();
+                c.revision_of = Some("B".into());
+                spec.contributions.push(c);
+                spec.selected = vec!["A".into(), "C".into()];
+            }
+            _ => spec.contributions[1].derived_from.push("A".into()),
+        }
+        assert!(
+            matches!(
+                propose_revision(&mut f.store, &owner, spec),
+                Err(TargetError::SelectionRefused {
+                    reason: Refusal::CompetingRevisions,
+                    ..
+                })
+            ),
+            "case {case}"
+        );
+    }
+    let count: i64 = f
+        .store
+        .read_connection()
+        .query_row("SELECT count(*) FROM local_target_revisions", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(count, 0);
+}
+
+#[test]
+fn atomic_replacement_covers_the_original_group_member() {
+    let mut f = Fixture::new();
+    let base = f.a.base.commit.clone();
+    let mut c = f.feature(&base);
+    c.revision_of = Some("A".into());
+    c.atomic_group = Some("group".into());
+    let mut spec = f.spec();
+    for contribution in &mut spec.contributions {
+        contribution.atomic_group = Some("group".into());
+    }
+    spec.contributions.push(c);
+    spec.selected = vec!["C".into(), "B".into()];
+    let owner = acquire_controller(&mut f.store, "target", "appointed").unwrap();
+    let revision = propose_revision(&mut f.store, &owner, spec).unwrap();
+    let dispositions = dispositions(&f.store, &revision.id).unwrap();
+    assert_eq!(dispositions[0].status, Disposition::Excluded);
+    assert_eq!(dispositions[1].status, Disposition::Pending);
+    assert_eq!(dispositions[2].status, Disposition::Pending);
+}
+
+#[test]
+fn retained_lineage_requires_its_selected_predecessor_and_is_part_of_cycles() {
+    use crate::composition::Refusal;
+    let mut f = Fixture::new();
+    let inherited = f.a.result.commit.clone();
+    let c = f.feature(&inherited);
+    let owner = acquire_controller(&mut f.store, "target", "appointed").unwrap();
+    let mut spec = f.spec();
+    spec.contributions.push(c);
+    spec.selected = vec!["C".into()];
+    assert!(matches!(
+        propose_revision(&mut f.store, &owner, spec.clone()),
+        Err(TargetError::SelectionRefused {
+            reason: Refusal::MissingInput,
+            ..
+        })
+    ));
+    spec.selected.push("A".into());
+    spec.contributions[0].requires.push("C".into());
+    assert!(matches!(
+        propose_revision(&mut f.store, &owner, spec),
+        Err(TargetError::SelectionRefused {
+            reason: Refusal::DependencyCycle,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn self_requirement_is_a_dependency_cycle() {
+    let mut f = Fixture::new();
+    let mut spec = f.spec();
+    spec.contributions[0].requires.push("A".into());
+    let owner = acquire_controller(&mut f.store, "target", "appointed").unwrap();
+    assert!(matches!(
+        propose_revision(&mut f.store, &owner, spec),
+        Err(TargetError::SelectionRefused {
+            reason: crate::composition::Refusal::DependencyCycle,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn unknown_source_base_refuses_even_when_all_bytes_are_retained() {
+    let mut f = Fixture::new();
+    let mut spec = f.spec();
+    spec.baseline = f.b.result.snapshot_id.to_string();
+    let owner = acquire_controller(&mut f.store, "target", "appointed").unwrap();
+    assert!(matches!(
+        propose_revision(&mut f.store, &owner, spec),
+        Err(TargetError::SelectionRefused {
+            reason: crate::composition::Refusal::UnknownBase,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn archived_target_can_be_proposed_after_the_source_repository_is_gone() {
+    let mut f = Fixture::new();
+    let spec = f.spec();
+    std::fs::remove_dir_all(f._repo.path()).unwrap();
+    let owner = acquire_controller(&mut f.store, "target", "appointed").unwrap();
+    let revision = propose_revision(&mut f.store, &owner, spec).unwrap();
+    assert_eq!(load_revision(&f.store, &revision.id).unwrap(), revision);
 }
 
 #[test]
