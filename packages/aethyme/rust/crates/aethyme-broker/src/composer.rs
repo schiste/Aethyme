@@ -970,7 +970,12 @@ fn plan(
     for spec in &delivered {
         let index = applies_as[spec.id.as_str()];
         for required in &spec.requires {
-            if let Some(&parent) = applies_as.get(required.as_str()) {
+            // A literal self requirement is a cycle. A different delivered
+            // alias of the same retained input still satisfies a prerequisite
+            // without applying that input again.
+            if let Some(&parent) = applies_as.get(required.as_str())
+                && (parent != index || required == &spec.id)
+            {
                 edges[index].insert(parent);
             }
         }

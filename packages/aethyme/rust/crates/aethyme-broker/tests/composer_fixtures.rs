@@ -510,6 +510,27 @@ fn a_repeat_by_name_or_by_lineage_applies_once() {
 }
 
 #[test]
+fn an_alias_prerequisite_is_satisfied_but_a_literal_self_requirement_is_a_cycle() {
+    let (mut world, base) = three_files();
+    let lineage = world.spec("a").lineage.clone();
+    world.catalog.push(ContributionSpec {
+        id: "a-again".into(),
+        lineage,
+        requires: vec!["a".into()],
+        atomic_group: None,
+        revision_of: None,
+        derived_from: Vec::new(),
+    });
+    let request = world.request(&base, &["a-again", "a", "b"]);
+    let result = world.compose(&request);
+    assert_eq!(result.outcome.code(), "candidate");
+    assert_eq!(result.order, ["a-again", "b"]);
+    world.spec("a-again").requires = vec!["a-again".into()];
+    let request = world.request(&base, &["a-again", "a", "b"]);
+    assert_eq!(world.compose(&request).outcome.code(), "dependency_cycle");
+}
+
+#[test]
 fn an_inherited_contribution_goes_first_and_applies_only_its_own_change() {
     let mut world = Adhoc::new();
     let base = world.commit(&[("f.txt", R, b"1\n2\n3\n4\n5\n")], None);
