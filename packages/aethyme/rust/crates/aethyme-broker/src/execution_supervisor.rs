@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
-mod artifact;
+pub(crate) mod artifact;
 mod docker;
 
 pub const PROFILE: &str = "aethyme.docker-linux/offline-v0";
@@ -99,6 +99,8 @@ pub enum Outcome {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeDescription {
+    pub native: String,
+    pub client: String,
     pub profile: String,
     pub endpoint: String,
     pub daemon_id: String,
@@ -139,6 +141,90 @@ impl DockerExecutor {
         &self.runtime
     }
 }
+/// Observations of daemon-attached streams, never candidate result files.
+pub(crate) struct ObservedCommand {
+    pub exit: i32,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+}
+impl DockerExecutor {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn observe_cli<F, G>(
+        &self,
+        store: &CollaborationStore,
+        execution: &ExecutionSnapshot,
+        artifact: &SealedArtifact,
+        generation: &str,
+        arguments: &[String],
+        stdin: &[u8],
+        cancel: &AtomicBool,
+        authorize: F,
+    ) -> Result<ObservedCommand, SupervisorError>
+    where
+        F: FnMut() -> Result<G, SupervisorError>,
+    {
+        let spec = execution.spec();
+        if spec.profile.runtime_profile != self.runtime.id()
+            || docker::probe(&self.cli)? != self.runtime
+        {
+            return Err(SupervisorError::Unsupported("runtime/profile drift".into()));
+        }
+        docker::image(
+            &self.cli,
+            &spec.profile.verifier_image,
+            &spec.profile.architecture,
+        )?;
+        let _archive = crate::collaboration_gc::archive_use(store)?;
+        let directory = tempfile::TempDir::new()?;
+        let materialized = directory.path().join("artifact");
+        std::fs::create_dir(&materialized)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&materialized, std::fs::Permissions::from_mode(0o755))?;
+        }
+
+        let manifest = archive::reconstruct_manifest(store, &artifact.output_id(), &materialized)?;
+        if manifest != artifact.output.manifest {
+            return Err(SupervisorError::Tampered("sealed artifact mismatch".into()));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for entry in manifest.entries() {
+                let relative = std::str::from_utf8(entry.path())
+                    .map_err(|_| SupervisorError::Tampered("artifact path".into()))?;
+                let mut parent = std::path::Path::new(relative).parent();
+                while let Some(path) = parent {
+                    if path.as_os_str().is_empty() {
+                        break;
+                    }
+                    std::fs::set_permissions(
+                        materialized.join(path),
+                        std::fs::Permissions::from_mode(0o755),
+                    )?;
+                    parent = path.parent();
+                }
+            }
+        }
+        let mut job = docker::Job::new(&self.cli, generation);
+        let result = job.cli_trial(
+            spec,
+            &materialized,
+            artifact.output_id().as_str(),
+            arguments,
+            stdin,
+            cancel,
+            authorize,
+        );
+        job.cleanup()?;
+        drop(job);
+        if cancel.load(Ordering::SeqCst) {
+            return Err(SupervisorError::Cancelled);
+        }
+        result
+    }
+}
 /// Not deserializable or cloneable. Only a successfully observed, stopped build
 /// can construct this capability; an artifact descriptor alone cannot do so.
 #[derive(Debug)]
@@ -169,6 +255,23 @@ impl SealedArtifact {
     }
     pub fn runtime(&self) -> &str {
         &self.runtime
+    }
+    pub(crate) fn verify_record(
+        &self,
+        store: &CollaborationStore,
+        execution: &ExecutionSnapshot,
+    ) -> Result<(), SupervisorError> {
+        let packaging = format!(
+            "sha256:{}",
+            ObjectDigest::of(&serde_json::to_vec(&execution.spec().build)?).hex()
+        );
+        let record=Record::decode(&serde_json::to_vec(&serde_json::json!({"schema":ARTIFACT_SCHEMA,"execution":execution.id().as_str(),"target_revision":execution.target_revision().as_str(),"output":self.output_id().as_str(),"packaging":packaging,"runtime":self.runtime,"generation":self.generation}))?,&[&SCHEMA]).map_err(|e|SupervisorError::Tampered(e.to_string()))?;
+        if record.id() != self.id
+            || archive::read_object(store, &self.record)? != record.canonical_bytes()
+        {
+            return Err(SupervisorError::Tampered("artifact record mismatch".into()));
+        }
+        Ok(())
     }
     pub fn authority_epoch(&self) -> &crate::local_authority::Epoch {
         &self.epoch

@@ -1601,6 +1601,20 @@ pub fn reconstruct(
     if retained(store, id)?.is_none() {
         return Err(ArchiveError::NotRetained { id: id.to_string() });
     }
+    reconstruct_manifest(store, id, dest)
+}
+
+/// Internal raw manifest materialization. The caller must establish retention
+/// authority (a retained snapshot or a sealed artifact's exact target root).
+pub(crate) fn reconstruct_manifest(
+    store: &CollaborationStore,
+    id: &SourceSnapshotId,
+    dest: &Path,
+) -> Result<SourceSnapshot, ArchiveError> {
+    let _use = crate::collaboration_gc::archive_use(store).map_err(|source| ArchiveError::Io {
+        path: crate::collaboration_gc::lock_path(store),
+        source,
+    })?;
     let manifest = read_object(store, &ObjectDigest::of_snapshot(id))?;
     let corrupt = || ArchiveError::CorruptObject {
         digest: ObjectDigest::of_snapshot(id).hex(),
@@ -2779,7 +2793,7 @@ mod tests {
         store
             .connection()
             .execute_batch(
-                "DROP TABLE local_authority_state; DROP TABLE local_wave_arrivals; DROP TABLE local_waves;
+                "DROP TABLE local_verification_evidence; DROP TABLE local_verifier_producers; DROP TABLE local_authority_state; DROP TABLE local_wave_arrivals; DROP TABLE local_waves;
                  DROP TABLE retained_contributions; DROP TABLE retained_snapshots;
                  UPDATE meta SET value = '1' WHERE key = 'schema_version';",
             )
