@@ -196,12 +196,14 @@ pub(super) fn authority_status(root: &Path, rest: &[&str]) -> Result<Output, Fai
         format!("Local authority {} (observation only)\n", observed.state),
     ))
 }
+type TargetStatusRow = (String, Option<String>, String, Option<String>, i64);
+
 pub(super) fn target_status(root: &Path, rest: &[&str]) -> Result<Output, Failure> {
     let flags = Flags::parse(rest, &["--target"], &[])?;
     let name = flags.one("--target")?;
     let snapshot = observe(root)?;
     require_table(&snapshot, "local_targets")?;
-    let row: Option<(String,Option<String>,String,Option<String>,i64)>=snapshot.connection().query_row("SELECT issuer,active_revision,phase,resume_phase,version FROM local_targets WHERE target=?1",[name],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).optional().map_err(sqlite)?;
+    let row: Option<TargetStatusRow>=snapshot.connection().query_row("SELECT issuer,active_revision,phase,resume_phase,version FROM local_targets WHERE target=?1",[name],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).optional().map_err(sqlite)?;
     let (issuer, revision, phase, resume, version) = row.ok_or_else(|| {
         Failure::refused(
             "target_missing",
