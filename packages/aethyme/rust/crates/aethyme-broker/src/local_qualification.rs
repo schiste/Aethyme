@@ -487,3 +487,6 @@ fn actual_pressure_preserves_retained_source_and_bounded_native_cleanup() {
     }
     std::fs::remove_dir_all(&host).unwrap();
 }
+
+#[cfg(unix)]
+mod native_flow;
