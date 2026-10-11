@@ -1308,6 +1308,80 @@ fn revocation_key(visibility: &str) -> String {
     format!("context_cache_revoked:{visibility}")
 }
 
+// SQLite triggers witness every legacy marker write, including unchanged
+// timestamps from older writers. The read snapshot and store transaction
+// compare both the persisted serial and the legacy timestamp.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReaderRevocation {
+    timestamp: Option<String>,
+    serial: i64,
+}
+fn revocation_serial_key(visibility: &str) -> String {
+    format!("context_cache_revocation_serial:{visibility}")
+}
+fn reader_revocation(
+    conn: &rusqlite::Connection,
+    visibility: &str,
+) -> rusqlite::Result<ReaderRevocation> {
+    let timestamp = conn
+        .query_row(
+            "SELECT value FROM meta WHERE key=?1",
+            [revocation_key(visibility)],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()?;
+    let value = conn
+        .query_row(
+            "SELECT value FROM meta WHERE key=?1",
+            [revocation_serial_key(visibility)],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()?;
+    let serial = match value {
+        None => 0,
+        Some(value) => value
+            .parse::<i64>()
+            .map_err(|_| rusqlite::Error::InvalidQuery)?,
+    };
+    if serial < 0 {
+        return Err(rusqlite::Error::InvalidQuery);
+    }
+    Ok(ReaderRevocation { timestamp, serial })
+}
+
+// Install before the newer reader snapshot. DDL is transactional and serializes
+// with older cache writers; all subsequent legacy marker writes are witnessed.
+fn ensure_revocation_triggers(connection: &rusqlite::Connection) -> rusqlite::Result<()> {
+    let tx = rusqlite::Transaction::new_unchecked(connection, TransactionBehavior::Immediate)?;
+    for (name, event) in [
+        ("context_cache_revoke_insert", "INSERT"),
+        ("context_cache_revoke_update", "UPDATE OF value"),
+    ] {
+        let sql=format!("CREATE TRIGGER {name} AFTER {event} ON meta
+         WHEN substr(NEW.key,1,22)='context_cache_revoked:'
+         BEGIN
+           SELECT CASE WHEN EXISTS(SELECT 1 FROM meta WHERE key='context_cache_revocation_serial:'||substr(NEW.key,23)
+              AND (CAST(CAST(value AS INTEGER) AS TEXT)<>value OR CAST(value AS INTEGER)<0 OR CAST(value AS INTEGER)=9223372036854775807))
+              THEN RAISE(ABORT,'invalid context revocation serial') END;
+           INSERT INTO meta(key,value) VALUES('context_cache_revocation_serial:'||substr(NEW.key,23),'1')
+           ON CONFLICT(key) DO UPDATE SET value=CAST(CAST(value AS INTEGER)+1 AS TEXT);
+         END");
+        let existing: Option<String> = tx
+            .query_row(
+                "SELECT sql FROM sqlite_schema WHERE type='trigger' AND name=?1",
+                [name],
+                |r| r.get(0),
+            )
+            .optional()?;
+        match existing {
+            Some(existing) if existing != sql => return Err(rusqlite::Error::InvalidQuery),
+            Some(_) => {}
+            None => tx.execute_batch(&sql)?,
+        }
+    }
+    tx.commit()
+}
+
 /// [`MAX_CACHE_ENTRIES`], small under test so eviction is exercised.
 fn cache_limit() -> i64 {
     if cfg!(test) { 16 } else { MAX_CACHE_ENTRIES }
@@ -1394,7 +1468,14 @@ pub fn forget_reader(
     store: &mut CollaborationStore,
     visibility: &str,
 ) -> Result<usize, ContextError> {
-    let now = crate::clock::epoch_ms();
+    forget_reader_at(store, visibility, crate::clock::epoch_ms())
+}
+fn forget_reader_at(
+    store: &mut CollaborationStore,
+    visibility: &str,
+    now: i64,
+) -> Result<usize, ContextError> {
+    ensure_revocation_triggers(store.read_connection())?;
     let transaction = store
         .connection()
         .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1600,6 +1681,7 @@ fn store_answer(
     visibility: &dyn Visibility,
     computed_ms: i64,
     generation: i64,
+    computed_revocation: &ReaderRevocation,
 ) -> Result<bool, ContextError> {
     let now = computed_ms;
     let Some(epoch) = epoch_of(visibility) else {
@@ -1611,14 +1693,7 @@ fn store_answer(
     let transaction = store
         .connection()
         .transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let revoked: Option<i64> = transaction
-        .query_row(
-            "SELECT CAST(value AS INTEGER) FROM meta WHERE key = ?1",
-            [revocation_key(visibility.name())],
-            |row| row.get(0),
-        )
-        .optional()?;
-    if revoked.is_some_and(|at| at >= computed_ms) {
+    if reader_revocation(&transaction, visibility.name())? != *computed_revocation {
         return Ok(false);
     }
     let live_now = crate::clock::epoch_ms();
@@ -1713,6 +1788,7 @@ enum Read {
         dependencies: usize,
         broad_risk: usize,
         generation: i64,
+        revocation: ReaderRevocation,
     },
 }
 
@@ -1746,6 +1822,7 @@ fn retrieve_with(
     for path in &scope {
         validate_scope_path(path)?;
     }
+    ensure_revocation_triggers(store.read_connection())?;
     let now = crate::clock::epoch_ms();
     let unreadable: Vec<String> = refresh_index(store, now, &mut hooks)?
         .into_iter()
@@ -1986,6 +2063,7 @@ fn retrieve_with(
             dependencies,
             broad_risk: broad.len(),
             generation: computed_generation,
+            revocation: reader_revocation(connection, visibility.name())?,
         })
     })();
     connection.execute_batch("COMMIT")?;
@@ -1997,6 +2075,7 @@ fn retrieve_with(
         dependencies,
         broad_risk,
         computed_generation,
+        computed_revocation,
     ) = match read? {
         Read::Hit(hit) => {
             touch(store, &hit.cache_key, now)?;
@@ -2010,6 +2089,7 @@ fn retrieve_with(
             dependencies,
             broad_risk,
             generation,
+            revocation,
         } => (
             details,
             stale_index,
@@ -2018,6 +2098,7 @@ fn retrieve_with(
             dependencies,
             broad_risk,
             generation,
+            revocation,
         ),
     };
     let raced = !stale_index.is_empty();
@@ -2250,6 +2331,7 @@ fn retrieve_with(
                     visibility,
                     now,
                     computed_generation,
+                    &computed_revocation,
                 )?;
             return Ok(Answer::Fresh { context, stored });
         }
@@ -4044,6 +4126,153 @@ mod tests {
         assert_eq!(
             cached(&mut fixture, &["lib/none.rs"], &reader).served,
             Served::Fresh { stored: true }
+        );
+    }
+
+    #[test]
+    fn same_millisecond_reader_revocations_distinguish_before_and_after_answers() {
+        let mut fixture = Fixture::new();
+        let reader = Reader::all("all");
+        forget_reader_at(&mut fixture.store, "all", 1000).unwrap();
+        let context = fresh(&mut fixture, &["lib/none.rs"], &reader);
+        let witness = reader_revocation(fixture.store.read_connection(), "all").unwrap();
+        let generation = generation(fixture.store.read_connection()).unwrap();
+        assert!(
+            store_answer(
+                &mut fixture.store,
+                &context,
+                &[],
+                &reader,
+                1000,
+                generation,
+                &witness
+            )
+            .unwrap(),
+            "answer computed after revoke is eligible in the same tick"
+        );
+        forget_reader_at(&mut fixture.store, "all", 1000).unwrap();
+        assert!(
+            !store_answer(
+                &mut fixture.store,
+                &context,
+                &[],
+                &reader,
+                1000,
+                generation,
+                &witness
+            )
+            .unwrap(),
+            "another revoke in that same tick must fence the old answer"
+        );
+        let current = reader_revocation(fixture.store.read_connection(), "all").unwrap();
+        assert_eq!(current.timestamp, witness.timestamp);
+        assert_ne!(current.serial, witness.serial);
+        assert!(
+            store_answer(
+                &mut fixture.store,
+                &context,
+                &[],
+                &reader,
+                1000,
+                generation,
+                &current
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn unchanged_legacy_revocation_updates_fence_new_reader_snapshots() {
+        let mut fixture = Fixture::new();
+        let reader = Reader::all("all");
+        let context = fresh(&mut fixture, &["lib/none.rs"], &reader);
+        let other =
+            rusqlite::Connection::open(fixture.store.project_dir().join("state.db")).unwrap();
+        other
+            .execute_batch(
+                "INSERT INTO meta(key,value) VALUES('context_cache_revoked:all','1000');
+            DELETE FROM meta WHERE key='context_cache_revocation_serial:all';",
+            )
+            .unwrap();
+        for _ in 0..2 {
+            // Exact pre-serial protocol, first without a serial, then with it.
+            let witness = reader_revocation(fixture.store.read_connection(), "all").unwrap();
+            let generation = generation(fixture.store.read_connection()).unwrap();
+            other
+                .execute_batch(
+                    "BEGIN IMMEDIATE; DELETE FROM context_cache WHERE visibility='all';
+                UPDATE meta SET value='1000' WHERE key='context_cache_revoked:all'; ROLLBACK;",
+                )
+                .unwrap();
+            assert_eq!(
+                reader_revocation(fixture.store.read_connection(), "all").unwrap(),
+                witness,
+                "rollback also undoes the trigger"
+            );
+            other
+                .execute_batch(
+                    "BEGIN IMMEDIATE; DELETE FROM context_cache WHERE visibility='all';
+                UPDATE meta SET value='1000' WHERE key='context_cache_revoked:all'; COMMIT;",
+                )
+                .unwrap();
+            assert!(
+                !store_answer(
+                    &mut fixture.store,
+                    &context,
+                    &[],
+                    &reader,
+                    1000,
+                    generation,
+                    &witness
+                )
+                .unwrap()
+            );
+            let current = reader_revocation(fixture.store.read_connection(), "all").unwrap();
+            assert_eq!(current.timestamp, witness.timestamp);
+            assert!(
+                current.serial > witness.serial,
+                "unchanged legacy writes advance the transaction witness"
+            );
+            assert!(
+                store_answer(
+                    &mut fixture.store,
+                    &context,
+                    &[],
+                    &reader,
+                    1000,
+                    generation,
+                    &current
+                )
+                .unwrap()
+            );
+        }
+        for serial in ["9223372036854775807", "-1", "01", "broken"] {
+            other
+                .execute(
+                    "UPDATE meta SET value=?1 WHERE key='context_cache_revocation_serial:all'",
+                    [serial],
+                )
+                .unwrap();
+            assert!(
+                forget_reader_at(&mut fixture.store, "all", 1000).is_err(),
+                "invalid serial refuses without ABA"
+            );
+            let count: i64 = other
+                .query_row(
+                    "SELECT count(*) FROM context_cache WHERE visibility='all'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                count, 1,
+                "a refused revocation transaction rolls back the cache purge"
+            );
+        }
+        other.execute_batch("DROP TRIGGER context_cache_revoke_update; CREATE TRIGGER context_cache_revoke_update AFTER UPDATE ON meta BEGIN SELECT 1; END;").unwrap();
+        assert!(
+            ensure_revocation_triggers(fixture.store.read_connection()).is_err(),
+            "a mismatched restored trigger cannot satisfy the witness contract"
         );
     }
 

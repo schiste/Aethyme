@@ -125,3 +125,18 @@ all 26 exchange schedules, 149 collaboration tests, existing execution and
 publication checks, and discarded-result/spelling/documentation ratchets. Strict
 Clippy for broker library and tests passed with warnings denied. These are Local
 controlled-adapter results; live remote peer interoperability is the Q5 path.
+
+## Context cache CI correction
+
+The final workspace run exposed a same-millisecond context revocation race.
+Cache writes now compare a persisted revocation witness captured in the read
+snapshot. Transactional SQLite triggers observe both current and older writers,
+including unchanged legacy timestamps. Invalid serials or mismatched restored
+trigger definitions refuse; rollback restores the witness with the cache purge.
+This remains advisory cache handling, never acceptance or visibility authority.
+
+All 38 restored context tests, seven ratchet checks and strict Clippy passed.
+Two additional deliberate guard removals each failed the named regression with
+status 101 and exact source restoration. The earlier 26 exchange schedules,
+19 exchange guard removals and 423 selected regressions remain their separately
+recorded evidence; this correction does not add composer qualification.
