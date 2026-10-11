@@ -1609,6 +1609,31 @@ fn materialize(
         }
     }
 
+    let tree = materialize_tree(reader, repo, scratch, baseline_entries, &known, entries)?;
+    let commit = repo_git_env(
+        repo,
+        &[
+            "commit-tree",
+            &tree,
+            "-p",
+            parent,
+            "-m",
+            "chore(composer): composition candidate",
+        ],
+    )?;
+    Ok((tree, CommitOid::parse(&text_of(&commit))?))
+}
+
+/// Shared raw CAS-to-Git tree writer. Candidate composition can reuse exact
+/// baseline blobs; a standalone generation passes an empty known baseline.
+fn materialize_tree(
+    reader: &mut Reader<'_>,
+    repo: &Path,
+    scratch: &Path,
+    baseline_entries: &Entries,
+    known: &HashMap<Vec<u8>, String>,
+    entries: &Entries,
+) -> Result<String, ComposeError> {
     // Blobs the baseline lacks are written in one hash-object, and the
     // tree in one index: a fixed number of processes, whatever the size.
     let blobs = scratch.join("blobs");
@@ -1665,19 +1690,7 @@ fn materialize(
             oids.insert(path, (kind, oid));
         }
     }
-    let tree = write_tree(repo, scratch, &oids)?;
-    let commit = repo_git_env(
-        repo,
-        &[
-            "commit-tree",
-            &tree,
-            "-p",
-            parent,
-            "-m",
-            "chore(composer): composition candidate",
-        ],
-    )?;
-    Ok((tree, CommitOid::parse(&text_of(&commit))?))
+    write_tree(repo, scratch, &oids)
 }
 
 /// Write `entries` as one tree through a private index file, leaving the
@@ -1988,4 +2001,172 @@ mod tests {
         late.push(0);
         assert!(!is_binary(&late));
     }
+}
+
+/// Independent editable checkout metadata from retained bytes. This reuses the
+/// candidate writer's raw CAS/blob/private-index plumbing, with no parent or
+/// dependency on an old Git object database. The caller supplies a new root.
+pub(crate) fn generation_checkout(
+    store: &CollaborationStore,
+    repo: &Path,
+    scratch: &Path,
+    snapshot: &SourceSnapshot,
+) -> Result<(String, CommitOid), ComposeError> {
+    repo_git(
+        repo,
+        &[
+            "init",
+            "-q",
+            "--template=",
+            "--object-format=sha1",
+            "--initial-branch=agent-generation",
+        ],
+        None,
+    )?;
+    // A generated repository has no inherited user/system configuration or
+    // remote. Disable hooks/fsmonitor persistently for later ordinary Git use.
+    repo_git(repo, &["config", "core.hooksPath", "/dev/null"], None)?;
+    repo_git(repo, &["config", "core.fsmonitor", "false"], None)?;
+    repo_git(repo, &["config", "core.autocrlf", "false"], None)?;
+    repo_git(repo, &["config", "core.filemode", "true"], None)?;
+    let entries: Entries = snapshot
+        .entries()
+        .iter()
+        .map(|e| (e.path().to_vec(), (e.kind(), *e.content_sha256())))
+        .collect();
+    let mut reader = Reader {
+        store,
+        cache: HashMap::new(),
+        cached_bytes: 0,
+        charged: HashSet::new(),
+        manifests: HashMap::new(),
+        bytes: 0,
+    };
+    let tree = materialize_tree(
+        &mut reader,
+        repo,
+        scratch,
+        &Entries::new(),
+        &HashMap::new(),
+        &entries,
+    )?;
+    let commit = repo_git_env(
+        repo,
+        &[
+            "commit-tree",
+            &tree,
+            "-m",
+            "chore(generation): retained source representation",
+        ],
+    )?;
+    let commit = CommitOid::parse(&text_of(&commit))?;
+    // Only the new standalone repository's private branch/index is changed.
+    repo_git(
+        repo,
+        &["update-ref", "refs/heads/agent-generation", commit.as_str()],
+        None,
+    )?;
+    std::fs::copy(scratch.join("index"), repo.join(".git/index"))
+        .map_err(|source| io(repo, source))?;
+    Ok((tree, commit))
+}
+
+/// Capture the complete actual directory, ignoring only its own top-level .git.
+/// This is source verification, not read-only execution permission sealing.
+fn generation_files(root: &Path, omit_git: bool) -> Result<SourceSnapshot, ComposeError> {
+    fn collect(
+        root: &Path,
+        dir: &Path,
+        omit_git: bool,
+        entries: &mut Vec<SourceEntry>,
+        size: &mut usize,
+    ) -> Result<(), ComposeError> {
+        for entry in std::fs::read_dir(dir).map_err(|source| io(dir, source))? {
+            let entry = entry.map_err(|source| io(dir, source))?;
+            let path = entry.path();
+            let relative = path.strip_prefix(root).expect("directory child");
+            if omit_git && relative == Path::new(".git") {
+                continue;
+            }
+            let m = std::fs::symlink_metadata(&path).map_err(|source| io(&path, source))?;
+            if m.file_type().is_symlink() {
+                return Err(ComposeError::Git("generation contains a symlink".into()));
+            }
+            if m.is_dir() {
+                collect(root, &path, omit_git, entries, size)?;
+                continue;
+            }
+            if !m.is_file()
+                || m.len() > 64 * 1024 * 1024
+                || entries.len() >= if omit_git { 8192 } else { 32768 }
+            {
+                return Err(ComposeError::Git("generation file boundary".into()));
+            }
+            let bytes = std::fs::read(&path).map_err(|source| io(&path, source))?;
+            *size = size
+                .checked_add(bytes.len())
+                .ok_or_else(|| ComposeError::Git("generation byte limit".into()))?;
+            if *size > 256 * 1024 * 1024 {
+                return Err(ComposeError::Git("generation byte limit".into()));
+            }
+            let kind = {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    if m.permissions().mode() & 0o111 != 0 {
+                        EntryKind::Executable
+                    } else {
+                        EntryKind::Regular
+                    }
+                }
+                #[cfg(not(unix))]
+                {
+                    EntryKind::Regular
+                }
+            };
+            entries.push(SourceEntry::from_content(
+                relative.as_os_str().as_encoded_bytes().to_vec(),
+                kind,
+                &bytes,
+            ));
+        }
+        Ok(())
+    }
+    let m = std::fs::symlink_metadata(root).map_err(|source| io(root, source))?;
+    if !m.is_dir() || m.file_type().is_symlink() {
+        return Err(ComposeError::Git(
+            "generation root is not a directory".into(),
+        ));
+    }
+    let mut entries = Vec::new();
+    let mut size = 0;
+    collect(root, root, omit_git, &mut entries, &mut size)?;
+    SourceSnapshot::new(entries)
+        .map_err(|e| ComposeError::Archive(ArchiveError::InvalidSnapshot(e)))
+}
+/// Digest all private Git files before invoking Git while loading a generation.
+pub(crate) fn generation_metadata_digest(root: &Path) -> Result<String, ComposeError> {
+    Ok(generation_files(&root.join(".git"), false)?
+        .id()
+        .to_string())
+}
+pub(crate) fn verify_generation_checkout(
+    root: &Path,
+    snapshot: &SourceSnapshot,
+    tree: &str,
+    commit: &str,
+) -> Result<(), ComposeError> {
+    if generation_files(root, true)? != *snapshot {
+        return Err(ComposeError::Git("generation source differs".into()));
+    }
+    let commit = CommitOid::parse(commit)?;
+    if collaboration_archive::raw_commit_tree(root, &commit)? != tree
+        || collaboration_archive::snapshot_of_commit(root, &commit)? != *snapshot
+        || text_of(&repo_git(root, &["rev-parse", "--verify", "HEAD"], None)?) != commit.as_str()
+    {
+        return Err(ComposeError::Git(
+            "generation Git/source mapping differs".into(),
+        ));
+    }
+    Ok(())
 }

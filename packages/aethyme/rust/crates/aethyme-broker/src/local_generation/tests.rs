@@ -1,0 +1,638 @@
+use super::*;
+
+fn git(repo: &Path, args: &[&str]) -> String {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{:?}: {}",
+        args,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).trim().into()
+}
+struct Fixture {
+    v: crate::execution_verifier::tests::Subject,
+    broker: Broker,
+    carrier: GitCarrier,
+    binding: RecordId,
+    _remote: tempfile::TempDir,
+}
+impl Fixture {
+    fn new() -> Self {
+        let mut v = crate::execution_verifier::tests::Subject::acceptance_fixture();
+        v.f.store
+            .connection()
+            .execute(
+                "UPDATE local_targets SET phase='idle' WHERE target=?1",
+                [v.owner.target()],
+            )
+            .unwrap();
+        crate::local_wave::available(&mut v.f.store, &v.owner, "A", 0).unwrap();
+        let wave = match crate::local_wave::admit(
+            &mut v.f.store,
+            &v.owner,
+            crate::local_wave::WavePolicy {
+                debounce_ms: 0,
+                ..Default::default()
+            },
+            1,
+        )
+        .unwrap()
+        {
+            crate::local_wave::Admission::Frozen(w) => w,
+            _ => panic!(),
+        };
+        let wave = crate::local_wave::compose(&mut v.f.store, &v.owner, v.f._repo.path(), &wave.id)
+            .unwrap();
+        let status = target::status(&v.f.store, v.owner.target()).unwrap();
+        target::resume(&mut v.f.store, &v.owner, status.version).unwrap();
+        let remote = tempfile::tempdir().unwrap();
+        git(remote.path(), &["init", "--bare", "-q"]);
+        git(
+            v.f._repo.path(),
+            &[
+                "remote",
+                "add",
+                "publication",
+                remote.path().to_str().unwrap(),
+            ],
+        );
+        let mut broker = Broker::open(v.f._repo.path())
+            .unwrap()
+            .with_host_operation_database(v.f._host.path().join("host-operations.db"))
+            .with_worktree_root(v.f._host.path().join("worktrees"));
+        let session = broker
+            .adopt(
+                v.f._repo.path(),
+                Some("disposable Playground generation fixture"),
+            )
+            .unwrap();
+        let carrier = GitCarrier::new(
+            &mut broker,
+            session.id,
+            "publication",
+            "refs/heads/accepted",
+            30,
+            "operator authorizes disposable Playground generation",
+            true,
+        )
+        .unwrap();
+        let base = v.f.a.base.commit.clone();
+        git(
+            v.f._repo.path(),
+            &[
+                "push",
+                "-q",
+                "publication",
+                &format!("{}:refs/heads/accepted", base.as_str()),
+            ],
+        );
+        let intent = crate::local_source_transport::prepare(
+            &mut v.f.store,
+            &v.owner,
+            &carrier,
+            &wave.id,
+            &"a".repeat(64),
+            Some(&base),
+        )
+        .unwrap();
+        let binding = acceptance::appoint(
+            &mut v.f.store,
+            &v.owner,
+            &mut broker,
+            &carrier,
+            &intent.id,
+            acceptance::ProviderRoute::GenericGit,
+            "refs/heads/accepted",
+            64,
+        )
+        .unwrap();
+        crate::local_source_transport::publish(
+            &mut v.f.store,
+            &v.owner,
+            &carrier,
+            &mut broker,
+            &intent.id,
+        )
+        .unwrap();
+        Self {
+            v,
+            broker,
+            carrier,
+            binding: binding.id().clone(),
+            _remote: remote,
+        }
+    }
+    fn old(&self) -> OldWorkspace {
+        OldWorkspace {
+            session: "original-agent".into(),
+            absolute_root: self.v.f._repo.path().canonicalize().unwrap(),
+            generation: None,
+            pending_contributions: vec![self.v.f.b.lineage_record_id.to_string()],
+        }
+    }
+    fn prepare(&mut self, operation: &str) -> Result<PreparedGeneration, GenerationError> {
+        let old = self.old();
+        let evidence = self.v.evidence();
+        let grant = acceptance::qualify(
+            &mut self.v.f.store,
+            &self.v.owner,
+            &mut self.broker,
+            &self.carrier,
+            &self.binding,
+            &self.v.execution,
+            &self.v.artifact,
+            &self.v.permit,
+            &evidence,
+        )?;
+        prepare(
+            &mut self.v.f.store,
+            &self.v.owner,
+            &mut self.broker,
+            &self.carrier,
+            &grant,
+            operation,
+            old,
+        )
+    }
+}
+#[test]
+fn independent_generation_is_editable_standalone_and_leaves_old_edits_and_open_files() {
+    let mut f = Fixture::new();
+    let old = f.old();
+    let head = git(&old.absolute_root, &["rev-parse", "HEAD"]);
+    let path = old.absolute_root.join("late-dirty.txt");
+    let mut writer = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&path)
+        .unwrap();
+    writer.write_all(b"before\n").unwrap();
+    writer.sync_all().unwrap();
+    let generated = f.prepare("first-generation").unwrap();
+    writer.write_all(b"after\n").unwrap();
+    writer.sync_all().unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), b"before\nafter\n");
+    assert_eq!(git(&old.absolute_root, &["rev-parse", "HEAD"]), head);
+    assert!(!generated.absolute_root().join("late-dirty.txt").exists());
+    assert!(generated.absolute_root().is_absolute());
+    assert_ne!(generated.absolute_root(), old.absolute_root);
+    assert_eq!(
+        git(generated.absolute_root(), &["rev-parse", "--show-toplevel"]),
+        generated.absolute_root().to_str().unwrap()
+    );
+    assert!(git(generated.absolute_root(), &["remote"]).is_empty());
+    assert!(
+        !generated
+            .absolute_root()
+            .join(".git/objects/info/alternates")
+            .exists()
+    );
+    assert!(!generated.absolute_root().join(".git/hooks").exists());
+    assert_eq!(
+        git(generated.absolute_root(), &["rev-list", "--count", "HEAD"]),
+        "1"
+    );
+    assert_eq!(
+        git(generated.absolute_root(), &["status", "--porcelain"]),
+        ""
+    );
+    assert_eq!(
+        generated.mapping().provider_commit,
+        git(f._remote.path(), &["rev-parse", "refs/heads/accepted"])
+    );
+    assert_ne!(
+        generated.mapping().local_commit,
+        generated.mapping().provider_commit
+    );
+    assert_eq!(
+        target::status(&f.v.f.store, f.v.owner.target())
+            .unwrap()
+            .phase,
+        target::Phase::Verifying
+    );
+    let source = manifest_entry_path(&f.v.f.store, &generated);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_ne!(
+            std::fs::metadata(&source).unwrap().permissions().mode() & 0o200,
+            0
+        );
+    }
+    std::fs::write(source, b"agent's next edit\n").unwrap();
+    assert!(load_prepared(&f.v.f.store, generated.id()).is_err());
+}
+fn manifest_entry_path(store: &CollaborationStore, g: &PreparedGeneration) -> PathBuf {
+    let manifest = snapshot(store, &g.intent.source).unwrap();
+    g.absolute_root()
+        .join(std::str::from_utf8(manifest.entries()[0].path()).unwrap())
+}
+#[test]
+fn interrupted_source_is_preserved_and_an_event_cannot_adopt() {
+    let mut f = Fixture::new();
+    let old = f.old();
+    let evidence = f.v.evidence();
+    let grant = acceptance::qualify(
+        &mut f.v.f.store,
+        &f.v.owner,
+        &mut f.broker,
+        &f.carrier,
+        &f.binding,
+        &f.v.execution,
+        &f.v.artifact,
+        &f.v.permit,
+        &evidence,
+    )
+    .unwrap();
+    let result = prepare_with(
+        &mut f.v.f.store,
+        &f.v.owner,
+        &mut f.broker,
+        &f.carrier,
+        &grant,
+        "crashed",
+        old.clone(),
+        &mut |stage, _| {
+            if stage == Stage::Materialized {
+                Err(GenerationError::Incomplete)
+            } else {
+                Ok(())
+            }
+        },
+    );
+    assert!(matches!(result, Err(GenerationError::Incomplete)));
+    let generation: String =
+        f.v.f
+            .store
+            .read_connection()
+            .query_row(
+                "SELECT id FROM local_generations WHERE operation='crashed'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+    let path = directory(&f.v.f.store, &id(&generation).unwrap()).join("source");
+    std::fs::write(path.join("concurrent.txt"), b"retained partial evidence").unwrap();
+    assert!(matches!(
+        prepare(
+            &mut f.v.f.store,
+            &f.v.owner,
+            &mut f.broker,
+            &f.carrier,
+            &grant,
+            "crashed",
+            old
+        ),
+        Err(GenerationError::Incomplete)
+    ));
+    assert_eq!(
+        std::fs::read(path.join("concurrent.txt")).unwrap(),
+        b"retained partial evidence"
+    );
+    assert!(load_prepared(&f.v.f.store, &id(&generation).unwrap()).is_err());
+    assert_eq!(
+        target::status(&f.v.f.store, f.v.owner.target())
+            .unwrap()
+            .phase,
+        target::Phase::Verifying
+    );
+}
+#[test]
+fn changed_target_at_final_commit_refuses_a_prepared_receipt() {
+    let mut f = Fixture::new();
+    let old = f.old();
+    let evidence = f.v.evidence();
+    let grant = acceptance::qualify(
+        &mut f.v.f.store,
+        &f.v.owner,
+        &mut f.broker,
+        &f.carrier,
+        &f.binding,
+        &f.v.execution,
+        &f.v.artifact,
+        &f.v.permit,
+        &evidence,
+    )
+    .unwrap();
+    let target_name = f.v.owner.target().to_string();
+    let result = prepare_with(
+        &mut f.v.f.store,
+        &f.v.owner,
+        &mut f.broker,
+        &f.carrier,
+        &grant,
+        "stop-during-copy",
+        old,
+        &mut |stage, store| {
+            if stage == Stage::Durable {
+                store.connection().execute(
+                    "UPDATE local_targets SET phase='stop_requested' WHERE target=?1",
+                    [&target_name],
+                )?;
+            }
+            Ok(())
+        },
+    );
+    assert!(result.is_err());
+    assert_eq!(
+        f.v.f
+            .store
+            .read_connection()
+            .query_row("SELECT COUNT(*) FROM local_generation_receipts", [], |r| {
+                r.get::<_, i64>(0)
+            })
+            .unwrap(),
+        0
+    );
+}
+#[test]
+fn provider_movement_during_materialization_refuses_the_generation() {
+    let mut f = Fixture::new();
+    let old = f.old();
+    let evidence = f.v.evidence();
+    let repo = f.v.f._repo.path().to_path_buf();
+    let wrong = f.v.f.b.result.commit.as_str().to_string();
+    let grant = acceptance::qualify(
+        &mut f.v.f.store,
+        &f.v.owner,
+        &mut f.broker,
+        &f.carrier,
+        &f.binding,
+        &f.v.execution,
+        &f.v.artifact,
+        &f.v.permit,
+        &evidence,
+    )
+    .unwrap();
+    let result = prepare_with(
+        &mut f.v.f.store,
+        &f.v.owner,
+        &mut f.broker,
+        &f.carrier,
+        &grant,
+        "provider-moved",
+        old,
+        &mut |stage, _| {
+            if stage == Stage::Materialized {
+                git(
+                    &repo,
+                    &[
+                        "push",
+                        "-q",
+                        "--force",
+                        "publication",
+                        &format!("{wrong}:refs/heads/accepted"),
+                    ],
+                );
+            }
+            Ok(())
+        },
+    );
+    assert!(matches!(
+        result,
+        Err(GenerationError::Acceptance(
+            acceptance::AcceptanceError::NotAccepted
+        ))
+    ));
+    assert_eq!(
+        f.v.f
+            .store
+            .read_connection()
+            .query_row("SELECT COUNT(*) FROM local_generation_receipts", [], |r| {
+                r.get::<_, i64>(0)
+            })
+            .unwrap(),
+        0
+    );
+}
+#[test]
+fn complete_source_and_private_git_metadata_are_checked_on_load() {
+    let mut f = Fixture::new();
+    let g = f.prepare("metadata").unwrap();
+    assert_eq!(load_prepared(&f.v.f.store, g.id()).unwrap(), g);
+    std::fs::write(g.absolute_root().join("unexpected"), b"new file").unwrap();
+    assert!(load_prepared(&f.v.f.store, g.id()).is_err());
+    std::fs::remove_file(g.absolute_root().join("unexpected")).unwrap();
+    assert!(load_prepared(&f.v.f.store, g.id()).is_ok());
+    std::fs::write(
+        g.absolute_root().join(".git/config"),
+        b"[core]\n hooksPath=/tmp/untrusted\n",
+    )
+    .unwrap();
+    assert!(load_prepared(&f.v.f.store, g.id()).is_err());
+}
+
+#[test]
+fn generation_roots_survive_target_release_and_a_preexisting_gc_plan() {
+    let mut f = Fixture::new();
+    // Plan while inputs are target-rooted; then generation creation changes the
+    // root set, and target retirement cannot revoke the prepared source promise.
+    let options = collaboration_gc::GcOptions {
+        grace_ms: 0,
+        ..Default::default()
+    };
+    let plan = collaboration_gc::plan(&mut f.v.f.store, &options).unwrap();
+    let g = f.prepare("roots").unwrap();
+    f.v.f
+        .store
+        .connection()
+        .execute("DELETE FROM local_target_roots", [])
+        .unwrap();
+    let _report = collaboration_gc::apply(&mut f.v.f.store, &plan.digest, &options).unwrap();
+    assert_eq!(load_prepared(&f.v.f.store, g.id()).unwrap(), g);
+    for reference in &g.intent.old.pending_contributions {
+        assert!(
+            archive::retained_contribution(&f.v.f.store, &id(reference).unwrap())
+                .unwrap()
+                .is_some()
+        );
+    }
+    let fresh = collaboration_gc::plan(&mut f.v.f.store, &options).unwrap();
+    assert!(fresh.blockers.is_empty(), "{:?}", fresh.blockers);
+    let _report = collaboration_gc::apply(&mut f.v.f.store, &fresh.digest, &options).unwrap();
+    assert!(
+        archive::retained(
+            &f.v.f.store,
+            &SourceSnapshotId::parse(&g.intent.source).unwrap()
+        )
+        .unwrap()
+        .is_some()
+    );
+    assert_eq!(load_prepared(&f.v.f.store, g.id()).unwrap(), g);
+}
+#[test]
+fn producer_revocation_during_copy_prevents_prepared_receipt() {
+    let mut f = Fixture::new();
+    let old = f.old();
+    let evidence = f.v.evidence();
+    let grant = acceptance::qualify(
+        &mut f.v.f.store,
+        &f.v.owner,
+        &mut f.broker,
+        &f.carrier,
+        &f.binding,
+        &f.v.execution,
+        &f.v.artifact,
+        &f.v.permit,
+        &evidence,
+    )
+    .unwrap();
+    let owner = &f.v.owner;
+    let producer = f.v.permit.producer().to_string();
+    let generation = f.v.permit.generation();
+    let result = prepare_with(
+        &mut f.v.f.store,
+        owner,
+        &mut f.broker,
+        &f.carrier,
+        &grant,
+        "revoked-during-copy",
+        old,
+        &mut |stage, store| {
+            if stage == Stage::Materialized {
+                crate::execution_verifier::revoke(store, owner, &producer, generation)
+                    .map_err(acceptance::AcceptanceError::from)?;
+            }
+            Ok(())
+        },
+    );
+    assert!(matches!(
+        result,
+        Err(GenerationError::Acceptance(
+            acceptance::AcceptanceError::Verification(
+                crate::execution_verifier::VerificationError::Producer
+            )
+        ))
+    ));
+    assert_eq!(
+        f.v.f
+            .store
+            .read_connection()
+            .query_row("SELECT COUNT(*) FROM local_generation_receipts", [], |r| {
+                r.get::<_, i64>(0)
+            })
+            .unwrap(),
+        0
+    );
+}
+#[test]
+fn fresh_qualification_replays_the_same_operation_but_changed_observation_does_not() {
+    let mut f = Fixture::new();
+    let g = f.prepare("stable-operation").unwrap();
+    assert_eq!(f.prepare("stable-operation").unwrap(), g);
+    let mut old = f.old();
+    old.session = "different-agent".into();
+    let evidence = f.v.evidence();
+    let grant = acceptance::qualify(
+        &mut f.v.f.store,
+        &f.v.owner,
+        &mut f.broker,
+        &f.carrier,
+        &f.binding,
+        &f.v.execution,
+        &f.v.artifact,
+        &f.v.permit,
+        &evidence,
+    )
+    .unwrap();
+    assert!(matches!(
+        prepare(
+            &mut f.v.f.store,
+            &f.v.owner,
+            &mut f.broker,
+            &f.carrier,
+            &grant,
+            "stable-operation",
+            old
+        ),
+        Err(GenerationError::Invalid(_))
+    ));
+    assert_eq!(
+        f.v.f
+            .store
+            .read_connection()
+            .query_row("SELECT COUNT(*) FROM local_generations", [], |r| r
+                .get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+}
+#[test]
+fn raw_checkout_rebuilds_from_cas_after_original_git_repository_disappears() {
+    let mut f = Fixture::new();
+    let source = f.v.f.a.result.snapshot_id.clone();
+    let manifest = snapshot(&f.v.f.store, source.as_str()).unwrap();
+    std::fs::remove_dir_all(f.v.f._repo.path().join(".git")).unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let source_dir = workspace.path().join("source");
+    archive::reconstruct(&f.v.f.store, &source, &source_dir).unwrap();
+    let scratch = tempfile::tempdir_in(workspace.path()).unwrap();
+    let (tree, commit) =
+        crate::composer::generation_checkout(&f.v.f.store, &source_dir, scratch.path(), &manifest)
+            .unwrap();
+    crate::composer::verify_generation_checkout(&source_dir, &manifest, &tree, commit.as_str())
+        .unwrap();
+    assert_eq!(git(&source_dir, &["status", "--porcelain"]), "");
+    // This qualifies raw reconstruction only: destroyed carrier state cannot
+    // supply a new native acceptance observation and is not silently bypassed.
+    let _ = &mut f;
+}
+#[test]
+fn an_existing_symlink_destination_is_never_followed_or_overwritten() {
+    #[cfg(unix)]
+    {
+        let mut f = Fixture::new();
+        let old = f.old();
+        let evidence = f.v.evidence();
+        let grant = acceptance::qualify(
+            &mut f.v.f.store,
+            &f.v.owner,
+            &mut f.broker,
+            &f.carrier,
+            &f.binding,
+            &f.v.execution,
+            &f.v.artifact,
+            &f.v.permit,
+            &evidence,
+        )
+        .unwrap();
+        let foreign = tempfile::tempdir().unwrap();
+        let marker = foreign.path().join("keep");
+        std::fs::write(&marker, b"unrelated").unwrap();
+        let result = prepare_with(
+            &mut f.v.f.store,
+            &f.v.owner,
+            &mut f.broker,
+            &f.carrier,
+            &grant,
+            "symlink",
+            old,
+            &mut |stage, store| {
+                if stage == Stage::Intent {
+                    let generation: String = store.read_connection().query_row(
+                        "SELECT id FROM local_generations WHERE operation='symlink'",
+                        [],
+                        |r| r.get(0),
+                    )?;
+                    let parent = store.project_dir().join("generations");
+                    private_directory(&parent)?;
+                    std::os::unix::fs::symlink(
+                        foreign.path(),
+                        directory(store, &id(&generation)?),
+                    )?;
+                }
+                Ok(())
+            },
+        );
+        assert!(matches!(result, Err(GenerationError::Incomplete)));
+        assert_eq!(std::fs::read(marker).unwrap(), b"unrelated");
+        assert_eq!(std::fs::read_dir(foreign.path()).unwrap().count(), 1);
+    }
+}
