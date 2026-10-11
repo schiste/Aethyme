@@ -1,0 +1,221 @@
+{
+  "schema": "aethyme.local.qualification.commands/provisional-v0",
+  "complete_local_qualification": false,
+  "profile": "native-macos-compatibility/provisional-v0",
+  "source_commit": "2aec0fd76ed43b9588d4050f905d103cf68cd466",
+  "source_tree": "99eeb6abc29b6d6cc237692d6b3608bea6d229c8",
+  "environment": {
+    "RUSTC_WRAPPER": "",
+    "CARGO_TARGET_DIR": "external exclusive root cache",
+    "AETHYME_COMPAT_CURRENT_BINARY": "external root cache/debug/aethyme",
+    "AETHYME_COMPAT_CURRENT_SHA256": "bbc63bf01cfa22356ca8cd0ce68dee879beabbc4a1c4cac0cdd937c048df4efa",
+    "AETHYME_COMPAT_CURRENT_SOURCE": "2aec0fd76ed43b9588d4050f905d103cf68cd466",
+    "AETHYME_COMPAT_OLD_BINARY": "$HOME/.cargo/bin/aethyme"
+  },
+  "limitations": [
+    "explicit finite Playground profile only",
+    "not live GitHub/Mergify or native gate evidence",
+    "provisional composition depends on separately owned E1",
+    "paired CLI covers the declared commands only, not universal legacy parity",
+    "only status phase_timings_ms and exact executable path are normalized",
+    "old unaccepted source cleanup needs explicit operator discard",
+    "native offline peer absence does not bypass the configured acceptance policy",
+    "no whole Local Q3/Q4 or E1 qualification",
+    "strict Clippy and final-head CI recorded separately"
+  ],
+  "rows": [
+    {
+      "name": "old-status",
+      "argv": [
+        "cargo",
+        "test",
+        "--locked",
+        "-j",
+        "4",
+        "--manifest-path",
+        "packages/aethyme/rust/Cargo.toml",
+        "-p",
+        "aethyme-broker",
+        "--lib",
+        "local_compatibility::old_binary::actual_pre_stack_binary_keeps_legacy_status_but_refuses_required_capture",
+        "--",
+        "--exact",
+        "--ignored",
+        "--test-threads=1",
+        "--nocapture"
+      ],
+      "exit_status": 0,
+      "signal": null,
+      "output_bytes": 2097,
+      "output_sha256": "f5ebea9739fe9cdc64fed4ef45197c593d7d04067322983b38519566868f9ba1",
+      "output_file": "old-status.log",
+      "counts": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0
+      },
+      "credited": true
+    },
+    {
+      "name": "old-cleanup",
+      "argv": [
+        "cargo",
+        "test",
+        "--locked",
+        "-j",
+        "4",
+        "--manifest-path",
+        "packages/aethyme/rust/Cargo.toml",
+        "-p",
+        "aethyme-broker",
+        "--lib",
+        "local_compatibility::old_binary::actual_old_cleanup_cannot_remove_new_retained_source_or_history",
+        "--",
+        "--exact",
+        "--ignored",
+        "--test-threads=1",
+        "--nocapture"
+      ],
+      "exit_status": 0,
+      "signal": null,
+      "output_bytes": 1283,
+      "output_sha256": "ff5e8d6d80f3ac4d969fd25958b39dccd7b7746fa626e55989158a8f23102b2a",
+      "output_file": "old-cleanup.log",
+      "counts": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0
+      },
+      "credited": true
+    },
+    {
+      "name": "native-offline",
+      "argv": [
+        "cargo",
+        "test",
+        "--locked",
+        "-j",
+        "4",
+        "--manifest-path",
+        "packages/aethyme/rust/Cargo.toml",
+        "-p",
+        "aethyme-broker",
+        "--lib",
+        "local_compatibility::independence::actual_native_local_routes_survive_kernel_network_denial",
+        "--",
+        "--exact",
+        "--ignored",
+        "--test-threads=1",
+        "--nocapture"
+      ],
+      "exit_status": 0,
+      "signal": null,
+      "output_bytes": 1145,
+      "output_sha256": "9012699697cdf347f051b3e173fee712d504b994ea669a776804648966b8f577",
+      "output_file": "native-offline.log",
+      "counts": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0
+      },
+      "credited": true
+    },
+    {
+      "name": "paired-cli",
+      "argv": [
+        "cargo",
+        "test",
+        "--locked",
+        "-j",
+        "4",
+        "--manifest-path",
+        "packages/aethyme/rust/Cargo.toml",
+        "-p",
+        "aethyme-broker",
+        "--lib",
+        "local_compatibility::cli_parity::actual_disabled_cli_preserves_queue_errors_status_and_hook_contract",
+        "--",
+        "--exact",
+        "--ignored",
+        "--test-threads=1",
+        "--nocapture"
+      ],
+      "exit_status": 0,
+      "signal": null,
+      "output_bytes": 18874,
+      "output_sha256": "de5aa12394f0d100aeef98324490698200dda0874551661f3f9b750c9febe999",
+      "output_file": "paired-cli.log",
+      "counts": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0
+      },
+      "credited": true
+    }
+  ],
+  "ordinary_selected": {
+    "source_commit": "ba8ba02154cc842d8bacb9f8fba1641943054bf4",
+    "source_tree": "c7d01cd527629cf6b30acd2d47f6ff1e2a5756b2",
+    "argv": [
+      "cargo",
+      "test",
+      "--locked",
+      "-j",
+      "4",
+      "--manifest-path",
+      "packages/aethyme/rust/Cargo.toml",
+      "-p",
+      "aethyme-broker",
+      "--lib",
+      "local_compatibility::",
+      "--",
+      "--test-threads=1",
+      "--nocapture"
+    ],
+    "exit_status": 0,
+    "counts": {
+      "passed": 10,
+      "failed": 0,
+      "ignored": 4
+    },
+    "output_sha256": "ee9088a46e61edc094246cccfc38e09e5393fca0529343c8da89966e428086d0",
+    "output_bytes": 2640
+  },
+  "pinned_old_binary": {
+    "source": "5e8daf712e26c63f1d4082e9a617f556cf995de2",
+    "sha256": "edc1ad2829e08c6d5aa2512964e117685cc1ea4502caa765dc1e0d0b9b0a4261",
+    "verification": "SHA-256 and native version identity checked before every invocation"
+  },
+  "independent_reviews": {
+    "status": "clear",
+    "bounded_native_client": "07e37683",
+    "actual_queue_success": "11f3d90a",
+    "native_integration_baseline": "9d136416",
+    "explicit_old_cleanup_discard": "2aec0fd76ed43b9588d4050f905d103cf68cd466",
+    "execution": "read-only exact private archives; no Cargo"
+  },
+  "excluded_observations": [
+    {
+      "observation": "initial_integration_ref_assumption",
+      "credited": false,
+      "output_sha256": "69e48bd9221db9efa648aff4bfe133fd6a21b447b6beb1c996ed6f14fde48eca",
+      "output_bytes": 4739,
+      "reason": "fixture correction independently reviewed; failed trial never credited"
+    },
+    {
+      "observation": "initial_unforced_cleanup_positive",
+      "credited": false,
+      "output_sha256": "2e9e31428e941fbd26acfbfb04197f21fb4b3da4b3318d8b4a1740e35e3d358a",
+      "output_bytes": 1592,
+      "reason": "fixture correction independently reviewed; failed trial never credited"
+    }
+  ],
+  "denominator": {
+    "ordinary_passed": 10,
+    "ordinary_ignored": 4,
+    "explicit_native_profiles_passed": 4,
+    "failed_final_profiles": 0,
+    "unique_cli_command_count": null
+  },
+  "environment_location_redaction": "Only private executable/cache location text redacted; recorded source/binary hashes and parameter roles retained"
+}
