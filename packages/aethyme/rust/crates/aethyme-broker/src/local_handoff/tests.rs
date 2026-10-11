@@ -935,3 +935,61 @@ fn expiry_while_completion_guard_is_held_cannot_commit_current_classification() 
     agent(&mut f);
     assert!(g.absolute_root().exists());
 }
+
+#[cfg(unix)]
+#[test]
+fn go_deadline_is_rechecked_after_waiting_for_database_writer() {
+    let mut f = Fixture::new();
+    let g = f.prepare("source").unwrap();
+    let a = agent(&mut f);
+    let r = request(&mut f, &a, &g, "run").unwrap();
+    let grant = acceptance::qualify(
+        &mut f.v.f.store,
+        &f.v.owner,
+        &mut f.broker,
+        &f.carrier,
+        &f.binding,
+        &f.v.execution,
+        &f.v.artifact,
+        &f.v.permit,
+        &f.evidence,
+    )
+    .unwrap();
+    let database = f.v.f.store.project_dir().join("state.db");
+    let (locked_tx, locked_rx) = std::sync::mpsc::sync_channel(1);
+    let mut writer = None;
+    let mut command = shell("touch should-not-run");
+    command.acknowledgment_ms = 1_000;
+    let result = native::dispatch_with(
+        &mut f.v.f.store,
+        &f.v.owner,
+        &a,
+        &mut f.broker,
+        &f.carrier,
+        &grant,
+        &r,
+        command,
+        &mut |stage, _| {
+            if stage == native::Stage::Adopted {
+                let database = database.clone();
+                let locked = locked_tx.clone();
+                writer = Some(std::thread::spawn(move || {
+                    let conn = rusqlite::Connection::open(database).unwrap();
+                    conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+                    locked.send(()).unwrap();
+                    std::thread::sleep(Duration::from_millis(1_100));
+                    conn.execute_batch("ROLLBACK").unwrap();
+                }));
+                locked_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            }
+            Ok(())
+        },
+    );
+    writer
+        .expect("must reach adopted journal before delaying final GO lock")
+        .join()
+        .unwrap();
+    assert!(matches!(result, Err(HandoffError::Deadline)));
+    assert!(!g.absolute_root().join("should-not-run").exists());
+    assert_eq!(show(&f.v.f.store, r.id()).unwrap().state, "adopted");
+}

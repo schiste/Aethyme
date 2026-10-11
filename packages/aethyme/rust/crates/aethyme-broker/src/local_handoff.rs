@@ -552,7 +552,7 @@ fn poll_command_with(
     let code = status.code().unwrap_or(-1);
     command.settled = true;
     before(store)?;
-    match current_agent(store, owner, agent, command) {
+    let current = match current_agent(store, owner, agent, command) {
         Ok(guard) => {
             // Reuse the actual writer reservation, without a stale-currentness
             // gap. Check the clock after all fallible work at the commit point.
@@ -573,20 +573,23 @@ fn poll_command_with(
                 result
             };
             guard._transaction.commit()?;
-            Ok(result)
+            Some(result)
         }
-        Err(_) => {
-            // No current result authority is inferred from this fallback. It
-            // accounts only the exact owned leader and retains descendant roots.
-            let tx = store
-                .connection()
-                .transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let result = account_leader(&tx, owner, agent, command, code, false)?;
-            tx.commit()?;
-            Ok(result)
-        }
+        Err(_) => None,
+    };
+    if let Some(result) = current {
+        return Ok(result);
     }
+    // No current result authority is inferred from this fallback. It accounts
+    // only the exact owned leader and retains descendant roots.
+    let tx = store
+        .connection()
+        .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let result = account_leader(&tx, owner, agent, command, code, false)?;
+    tx.commit()?;
+    Ok(result)
 }
+
 fn account_leader(
     tx: &rusqlite::Connection,
     owner: &ControllerOwner,
