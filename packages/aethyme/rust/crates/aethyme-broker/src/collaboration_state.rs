@@ -1635,7 +1635,9 @@ mod tests {
         store
             .connection()
             .execute_batch(
-                "UPDATE meta SET value = '3' WHERE key = 'schema_version';
+                "DROP TABLE local_wave_arrivals;
+                 DROP TABLE local_waves;
+                 UPDATE meta SET value = '3' WHERE key = 'schema_version';
                  UPDATE meta SET value = '1' WHERE key = 'min_compatible_schema';",
             )
             .unwrap();
@@ -1668,9 +1670,10 @@ mod tests {
         let mut store = open(host.path(), &[]).unwrap();
         store
             .connection()
-            .execute(
-                "UPDATE meta SET value = '2' WHERE key = 'schema_version'",
-                [],
+            .execute_batch(
+                "DROP TABLE local_wave_arrivals;
+                 DROP TABLE local_waves;
+                 UPDATE meta SET value = '2' WHERE key = 'schema_version';",
             )
             .unwrap();
         let project_dir = store.project_dir().to_path_buf();
