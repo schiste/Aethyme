@@ -152,7 +152,6 @@ fn advisory_capture_failure_preserves_real_legacy_submission() {
     assert_eq!(report.status, CaptureStatus::NotConfigured);
     assert_eq!(report.code.as_deref(), Some("io"));
     assert!(report.receipt.is_none());
-    assert!(report.receipt.is_none());
     assert_eq!(
         std::fs::read(f.host.path().join("collaboration")).unwrap(),
         b"blocked Local state path"
@@ -163,6 +162,11 @@ fn required_capture_failure_refuses_before_queue_or_integration_movement() {
     let mut f = Fixture::new(Some(
         "[collaboration]\ncapture='required'\nproject='proj-compat'\n",
     ));
+    // Native submission may create the initial integration ref at main.
+    // Establish that baseline first so this schedule checks promotion refusal.
+    let (_, initial) = f.broker.integration_head().unwrap();
+    assert_eq!(initial, git(f.repo.path(), &["rev-parse", "main"]));
+    assert_ne!(initial, git(&f.worktree, &["rev-parse", "HEAD"]));
     std::fs::write(
         f.host.path().join("collaboration"),
         "blocked Local state path",
