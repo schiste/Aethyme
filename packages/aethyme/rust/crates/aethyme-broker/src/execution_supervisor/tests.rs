@@ -195,10 +195,176 @@ fn real_linux_build_observes_readonly_inputs_stopped_writers_and_failures() {
     assert!(stopped.artifact().is_none());
     spec.profile.build_limits.timeout_ms = 5000;
     spec.build.arguments[1] = "ln -s /etc/passwd /outputs/asset".into();
-    let execution = snapshot::freeze(&mut f.store, &owner, &revision.id, spec).unwrap();
+    let execution = snapshot::freeze(&mut f.store, &owner, &revision.id, spec.clone()).unwrap();
     let forged = executor
         .build(&mut f.store, &owner, &execution, &AtomicBool::new(false))
         .unwrap();
     assert_eq!(forged.outcome(), Outcome::TamperingDetected);
     assert!(forged.artifact().is_none());
+    // Block the real output export, latch cancellation, then let it finish.
+    // A completed build cannot survive that cancellation as a capability.
+    {
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::Arc;
+        let temp = tempfile::tempdir().unwrap();
+        let marker = temp.path().join("exporting");
+        let release = temp.path().join("release");
+        let wrapper = temp.path().join("docker-export-control");
+        let quote = |p: &Path| format!("'{}'", p.display().to_string().replace('\'', "'\\''"));
+        std::fs::write(&wrapper,format!("#!/bin/sh\nset -eu\nif test \"$3\" = cp && test \"$5\" = -; then\n case \"$4\" in *:/outputs/.) printf exporting > {}; while test ! -f {}; do sleep 0.01; done;; esac\nfi\nexec /opt/homebrew/bin/docker \"$@\"\n",quote(&marker),quote(&release))).unwrap();
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let wrapped = DockerExecutor::probe(wrapper).unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let trigger = cancel.clone();
+        let cancelling = std::thread::spawn(move || {
+            let started = Instant::now();
+            while !marker.is_file() {
+                assert!(started.elapsed() < Duration::from_secs(10));
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            trigger.store(true, Ordering::SeqCst);
+            std::fs::write(release, b"cancel latched").unwrap();
+        });
+        spec.build.arguments[1] = "printf sealed > /outputs/asset".into();
+        let execution = snapshot::freeze(&mut f.store, &owner, &revision.id, spec.clone()).unwrap();
+        let observation = wrapped
+            .build(&mut f.store, &owner, &execution, &cancel)
+            .unwrap();
+        cancelling.join().unwrap();
+        assert_eq!(observation.outcome(), Outcome::Cancelled);
+        assert!(observation.artifact().is_none());
+    }
+    // Delayed real start acknowledgement means the first status can already
+    // be stopped. An exit-zero result observed past the deadline is not Built.
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let wrapper = temp.path().join("docker-delay-control");
+        std::fs::write(&wrapper,"#!/bin/sh\nset -eu\nif test \"$3 $4\" = 'container start'; then\n name=$(/opt/homebrew/bin/docker --host \"$2\" container inspect --format '{{.Name}}' \"$5\")\n case \"$name\" in *-build) /opt/homebrew/bin/docker \"$@\"; sleep 0.4; exit 0;; esac\nfi\nexec /opt/homebrew/bin/docker \"$@\"\n").unwrap();
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let wrapped = DockerExecutor::probe(wrapper).unwrap();
+        spec.profile.build_limits.timeout_ms = 200;
+        spec.build.arguments[1] = "printf too-late > /outputs/asset".into();
+        let execution = snapshot::freeze(&mut f.store, &owner, &revision.id, spec.clone()).unwrap();
+        let observation = wrapped
+            .build(&mut f.store, &owner, &execution, &AtomicBool::new(false))
+            .unwrap();
+        assert_eq!(observation.outcome(), Outcome::TimedOut);
+        assert!(observation.artifact().is_none());
+    }
+}
+#[test]
+fn item_limits_and_truncation_are_not_successful_artifacts() {
+    let names: Vec<String> = (0..8193).map(|i| format!("file{i}")).collect();
+    let entries: Vec<_> = names
+        .iter()
+        .map(|n| (n.as_bytes(), tar::EntryType::Regular, 0o644, b"".as_slice()))
+        .collect();
+    let file = archive(&entries);
+    assert!(matches!(
+        artifact::read(file.path(), 64, Purpose::Output),
+        Err(SupervisorError::Limit)
+    ));
+    let mut file = tempfile::NamedTempFile::new().unwrap();
+    let mut header = tar::Header::new_ustar();
+    header.set_path("truncated").unwrap();
+    header.set_size(64);
+    header.set_mode(0o644);
+    header.set_cksum();
+    file.write_all(header.as_bytes()).unwrap();
+    file.write_all(b"short").unwrap();
+    assert!(artifact::read(file.path(), 64, Purpose::Output).is_err());
+}
+#[test]
+fn only_the_current_verifying_revision_and_epoch_authorize_execution() {
+    use crate::execution_snapshot::{CommandSpec, ExecutionSpec, LinuxProfile, ResourceLimits};
+    use crate::local_target::tests::Fixture;
+    let mut f = Fixture::new();
+    let owner =
+        target::acquire_controller(&mut f.store, "executor-authority", "appointed").unwrap();
+    let spec = f.spec();
+    let revision = target::propose_revision(&mut f.store, &owner, spec).unwrap();
+    target::select_revision(&mut f.store, &owner, &revision.id).unwrap();
+    let limits = ResourceLimits {
+        timeout_ms: 1000,
+        memory_bytes: 67108864,
+        output_bytes: 1048576,
+        pids: 32,
+    };
+    let command = CommandSpec {
+        program: "/bin/true".into(),
+        arguments: vec![],
+        environment: Default::default(),
+    };
+    let digest = format!("sha256:{}", "a".repeat(64));
+    let spec = ExecutionSpec {
+        candidate_source: f.a.result.snapshot_id.to_string(),
+        preparation: None,
+        dependencies: None,
+        configuration: None,
+        harness: f.b.result.snapshot_id.to_string(),
+        dataset: None,
+        assertion_inventory: digest.clone(),
+        materialization_profile: snapshot::MATERIALIZATION_PROFILE.into(),
+        profile: LinuxProfile {
+            build_image: digest.clone(),
+            verifier_image: digest.clone(),
+            architecture: "arm64".into(),
+            runtime_profile: digest,
+            build_limits: limits,
+            verifier_limits: limits,
+        },
+        build: command.clone(),
+        verify: command,
+    };
+    let execution = snapshot::freeze(&mut f.store, &owner, &revision.id, spec).unwrap();
+    assert!(matches!(
+        active(&f.store, &owner, &execution),
+        Err(SupervisorError::Cancelled)
+    ));
+    for phase in [
+        target::Phase::Admitting,
+        target::Phase::WaveFrozen,
+        target::Phase::Composing,
+        target::Phase::Verifying,
+    ] {
+        let state = target::status(&f.store, owner.target()).unwrap();
+        target::transition(&mut f.store, &owner, state.version, phase).unwrap();
+    }
+    active(&f.store, &owner, &execution).unwrap();
+    // Corrupt the selected subject while retaining a valid owner/phase: refuse.
+    f.store
+        .connection()
+        .execute(
+            "UPDATE local_targets SET active_revision=?1 WHERE target=?2",
+            (format!("sha256:{}", "b".repeat(64)), owner.target()),
+        )
+        .unwrap();
+    assert!(active(&f.store, &owner, &execution).is_err());
+    f.store
+        .connection()
+        .execute(
+            "UPDATE local_targets SET active_revision=?1 WHERE target=?2",
+            (revision.id.as_str(), owner.target()),
+        )
+        .unwrap();
+    let state = target::status(&f.store, owner.target()).unwrap();
+    target::transition(
+        &mut f.store,
+        &owner,
+        state.version,
+        target::Phase::StopRequested,
+    )
+    .unwrap();
+    assert!(matches!(
+        active(&f.store, &owner, &execution),
+        Err(SupervisorError::Cancelled)
+    ));
+    crate::local_authority::freeze(
+        &mut f.store,
+        owner.authority_epoch(),
+        "explicit test-only freeze",
+    )
+    .unwrap();
+    assert!(active(&f.store, &owner, &execution).is_err());
 }
