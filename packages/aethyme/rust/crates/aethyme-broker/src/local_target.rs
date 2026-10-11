@@ -341,10 +341,10 @@ pub(crate) fn authorize(
     store: &CollaborationStore,
     owner: &ControllerOwner,
 ) -> Result<crate::local_authority::Guard, TargetError> {
-    let guard = crate::local_authority::guard(store, &owner.epoch)?;
     if store.project_dir() != owner.project_dir {
         return Err(TargetError::Unauthorized);
     }
+    let guard = crate::local_authority::guard(store, &owner.epoch)?;
     let issuer: Option<String> = store
         .read_connection()
         .query_row(

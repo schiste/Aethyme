@@ -256,3 +256,249 @@ fn initial_witness_is_outside_the_restorable_project_directory() {
     target::propose_revision(&mut f.store, &owner, spec).unwrap();
     assert_eq!(checkpoint(f.store.read_connection()).unwrap(), before);
 }
+
+#[test]
+fn late_completion_is_historical_and_cannot_change_the_restored_target() {
+    let (mut f, owner, _w, a) = setup();
+    let receipt = RecordId::parse(&reference('e')).unwrap();
+    assert!(record_late_outcome(&f.store, &a, &receipt, "before revocation").is_err());
+    let frozen = freeze(&mut f.store, owner.authority_epoch(), "revoke").unwrap();
+    let before = checkpoint(f.store.read_connection()).unwrap();
+    let observation = record_late_outcome(
+        &f.store,
+        &a,
+        &receipt,
+        "worker reported success; unverified",
+    )
+    .unwrap();
+    assert_eq!(
+        record_late_outcome(
+            &f.store,
+            &a,
+            &receipt,
+            "worker reported success; unverified"
+        )
+        .unwrap(),
+        observation
+    );
+    assert!(
+        record_late_outcome(
+            &f.store,
+            &a,
+            &RecordId::parse(&reference('f')).unwrap(),
+            "different"
+        )
+        .is_err()
+    );
+    assert_eq!(
+        historical_outcomes(&f.store).unwrap(),
+        vec![observation.clone()]
+    );
+    assert_eq!(checkpoint(f.store.read_connection()).unwrap(), before);
+    resume(&mut f.store, &frozen.epoch).unwrap();
+    let reopened = reopen(f._host.path());
+    assert_eq!(historical_outcomes(&reopened).unwrap(), vec![observation]);
+    assert!(wave::available(&mut f.store, &owner, "A", 1).is_err());
+}
+
+#[test]
+fn first_authority_installation_excludes_previously_admitted_gc() {
+    let mut f = Fixture::new();
+    let held = archive_guard(&f.store).unwrap();
+    let path = directory(&f.store).unwrap();
+    assert!(!path.join("witness.json").exists());
+    assert!(
+        ExclusiveFileLock::try_acquire(open_lock_file(&path.join("ingress.lock")).unwrap())
+            .unwrap()
+            .is_none()
+    );
+    drop(held);
+    let owner = target::acquire_controller(&mut f.store, "target", "appointed").unwrap();
+    freeze(&mut f.store, owner.authority_epoch(), "stop after GC").unwrap();
+}
+
+#[test]
+fn real_gc_apply_holds_ingress_before_first_controller_installation() {
+    use crate::collaboration_gc as gc;
+    let mut f = Fixture::new();
+    for prefix in std::fs::read_dir(crate::collaboration_archive::objects_dir(&f.store)).unwrap() {
+        for object in std::fs::read_dir(prefix.unwrap().path()).unwrap() {
+            std::fs::File::open(object.unwrap().path())
+                .unwrap()
+                .set_times(
+                    std::fs::FileTimes::new()
+                        .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1)),
+                )
+                .unwrap();
+        }
+    }
+    let options = gc::GcOptions::default();
+    let plan = gc::plan(&mut f.store, &options).unwrap();
+    assert!(!plan.reclaimable.is_empty());
+    let mut apply_store = reopen(f._host.path());
+    let (ready_send, ready_recv) = std::sync::mpsc::channel();
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let callback_barrier = barrier.clone();
+    let hooks = gc::GcHooks {
+        after_moves: Some((
+            1,
+            Box::new(move || {
+                ready_send.send(()).unwrap();
+                callback_barrier.wait();
+            }),
+        )),
+        ..Default::default()
+    };
+    let path = directory(&f.store).unwrap();
+    let held = std::thread::scope(|scope| {
+        let work =
+            scope.spawn(move || gc::apply_with(&mut apply_store, &plan.digest, &options, &hooks));
+        ready_recv
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .unwrap();
+        let probe =
+            ExclusiveFileLock::try_acquire(open_lock_file(&path.join("ingress.lock")).unwrap())
+                .unwrap();
+        let held = probe.is_none();
+        drop(probe);
+        // Release even if the protection was neutered; never strand our worker.
+        barrier.wait();
+        work.join().unwrap().unwrap();
+        held
+    });
+    assert!(
+        held,
+        "actual reclamation must exclude first installation/freeze"
+    );
+    let owner = target::acquire_controller(&mut f.store, "target", "appointed").unwrap();
+    freeze(
+        &mut f.store,
+        owner.authority_epoch(),
+        "after completed reclamation",
+    )
+    .unwrap();
+}
+#[test]
+#[ignore = "spawned by authority_process_survives_announced_restore"]
+fn authority_worker_child() {
+    let host =
+        std::path::PathBuf::from(std::env::var_os("AETHYME_L5_AUTHORITY_CHILD_HOST").unwrap());
+    let mut store = reopen(&host);
+    let owner = target::acquire_controller(&mut store, "target", "appointed").unwrap();
+    drop(store); // A worker handle survives; SQLite is quiesced for restore.
+    std::fs::write(host.join("worker-ready"), b"ready").unwrap();
+    for _ in 0..3000 {
+        if host.join("worker-go").exists() {
+            let mut restored = reopen(&host);
+            assert!(wave::available(&mut restored, &owner, "A", 2).is_err());
+            std::fs::write(
+                host.join("worker-refused"),
+                b"old controller mutation refused",
+            )
+            .unwrap();
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    panic!("parent never released worker");
+}
+struct ChildGuard(std::process::Child);
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        if self.0.try_wait().unwrap().is_none() {
+            if let Err(e) = self.0.kill() {
+                eprintln!("own child cleanup: {e}");
+            }
+            if let Err(e) = self.0.wait() {
+                eprintln!("own child wait: {e}");
+            }
+        }
+    }
+}
+#[test]
+fn authority_process_survives_announced_restore_and_cannot_mutate_current_data() {
+    let (mut f, owner, _w, a) = setup();
+    let backup = f._host.path().join("process-before.db");
+    f.store
+        .connection()
+        .execute("VACUUM INTO ?1", [backup.to_str().unwrap()])
+        .unwrap();
+    let expected = owner.authority_epoch().clone();
+    drop(owner);
+    let mut child = ChildGuard(
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "local_authority::tests::authority_worker_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("AETHYME_L5_AUTHORITY_CHILD_HOST", f._host.path())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::inherit())
+            .spawn()
+            .unwrap(),
+    );
+    let host = f._host.path().to_owned();
+    for _ in 0..3000 {
+        if host.join("worker-ready").exists() {
+            break;
+        }
+        assert!(
+            child.0.try_wait().unwrap().is_none(),
+            "worker exited before ready"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(host.join("worker-ready").exists());
+    // Record cost after backup; a rewind must not make that history disappear.
+    let owner_epoch = status(&f.store).unwrap().epoch;
+    assert_eq!(owner_epoch, expected);
+    f.store.connection().execute("UPDATE local_budget_reservations SET detail='external outcome may have happened' WHERE reservation=?1",[a.reservation().as_str()]).unwrap();
+    let frozen = freeze(
+        &mut f.store,
+        &expected,
+        "announced restore with surviving child",
+    )
+    .unwrap();
+    assert!(child.0.try_wait().unwrap().is_none());
+    let database = f.store.project_dir().join("state.db");
+    drop(f.store);
+    std::fs::copy(backup, database).unwrap();
+    let mut restored = reopen(&host);
+    assert!(matches!(
+        resume(&mut restored, &frozen.epoch),
+        Err(AuthorityError::Stale)
+    ));
+    std::fs::write(host.join("worker-go"), b"restore finished frozen").unwrap();
+    for _ in 0..3000 {
+        if let Some(status) = child.0.try_wait().unwrap() {
+            assert!(status.success());
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(host.join("worker-refused").exists());
+    assert_eq!(status(&restored).unwrap(), frozen);
+}
+#[test]
+fn checkpoint_orders_equal_first_columns_independently_of_insertion_order() {
+    let c = Connection::open_in_memory().unwrap();
+    c.execute_batch("CREATE TABLE local_fixture(k TEXT,n INTEGER);INSERT INTO local_fixture VALUES('same',2),('same',1);").unwrap();
+    let first = checkpoint(&c).unwrap();
+    c.execute_batch(
+        "DELETE FROM local_fixture;INSERT INTO local_fixture VALUES('same',1),('same',2);",
+    )
+    .unwrap();
+    assert_eq!(checkpoint(&c).unwrap(), first);
+}
+#[test]
+fn independent_checkpoint_vector_binds_table_types_and_row_bytes() {
+    let vector: serde_json::Value =
+        serde_json::from_str(include_str!("checkpoint-vector.json")).unwrap();
+    let c = Connection::open_in_memory().unwrap();
+    c.execute_batch("CREATE TABLE local_fixture(q TEXT,n INTEGER,payload BLOB);INSERT INTO local_fixture VALUES('slot',7,x'00ff');").unwrap();
+    assert_eq!(checkpoint(&c).unwrap(), vector["id"].as_str().unwrap());
+    c.execute_batch("UPDATE local_fixture SET n=8;").unwrap();
+    assert_ne!(checkpoint(&c).unwrap(), vector["id"].as_str().unwrap());
+}

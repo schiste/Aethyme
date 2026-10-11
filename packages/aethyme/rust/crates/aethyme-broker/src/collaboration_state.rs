@@ -57,6 +57,7 @@ pub const COLLABORATION_STATE_SCHEMA_VERSION: i64 = 10;
 // controller inputs. Such a binary must refuse this store before writing.
 // Schema 8 has no budget ledger, and cannot guard retention while consumption is
 // unknown. As with prior floors, stop old open clients before migration.
+// Schema 9 does not honor external authority epochs. Quiesce it before restore.
 const MIN_COMPATIBLE_SCHEMA: i64 = 10;
 const ROOT_DIRECTORY: &str = "collaboration";
 /// Additive schema steps after the version 1 layout (`meta` only), applied in

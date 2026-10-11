@@ -234,7 +234,8 @@ pub struct Attempt {
     version: i64,
     number: u32,
     remaining: Units,
-    epoch: crate::local_authority::Epoch,
+    pub(crate) epoch: crate::local_authority::Epoch,
+    pub(crate) project_dir: std::path::PathBuf,
 }
 impl Attempt {
     pub fn reservation(&self) -> &RecordId {
@@ -936,6 +937,7 @@ pub fn begin_attempt(
         number: r.attempts + 1,
         remaining,
         epoch: owner.authority_epoch().clone(),
+        project_dir: store.project_dir().to_owned(),
     })
 }
 

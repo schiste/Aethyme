@@ -308,6 +308,9 @@ pub enum GcError {
 impl GcError {
     pub fn code(&self) -> &'static str {
         match self {
+            Self::Authority(crate::local_authority::AuthorityError::Frozen) => "authority_frozen",
+            Self::Authority(crate::local_authority::AuthorityError::Stale) => "authority_stale",
+            Self::Authority(_) => "authority_unavailable",
             Self::ArchiveInUse => "archive_in_use",
             Self::Blocked(_) => "blocked",
             Self::UnknownPlan { .. } => "unknown_plan",

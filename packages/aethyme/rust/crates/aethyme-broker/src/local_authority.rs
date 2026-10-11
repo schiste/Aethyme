@@ -353,17 +353,138 @@ mod tests;
 
 /// GC must not reclaim from restored roots while authority is frozen or stale.
 /// Archives without an initialized controller retain their existing GC behavior.
-pub(crate) fn archive_guard(store: &CollaborationStore) -> Result<Option<Guard>, AuthorityError> {
+pub(crate) fn archive_guard(store: &CollaborationStore) -> Result<Guard, AuthorityError> {
     let path = directory(store)?;
+    prepare(&path)?;
+    let file = open_lock_file(&path.join("ingress.lock"))?;
+    file.lock_shared()?;
     if !path.join("witness.json").exists() {
         if bound(store.read_connection())?.is_some() {
             return Err(AuthorityError::Invalid("lost witness".into()));
         }
-        return Ok(None);
+        // First installation must wait for already admitted reclamation.
+        return Ok(Guard { _file: file });
     }
-    let file = open_lock_file(&path.join("ingress.lock"))?;
-    file.lock_shared()?;
     let w = read(&path)?;
     matching(store.read_connection(), &w, &w.epoch)?;
-    Ok(Some(Guard { _file: file }))
+    Ok(Guard { _file: file })
+}
+
+/// An unverified historical observation. It grants no budget settlement,
+/// producer status, candidate verification, acceptance or publication authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HistoricalObservation {
+    pub version: u32,
+    pub project: String,
+    pub epoch: Epoch,
+    pub reservation: String,
+    pub attempt: u32,
+    pub receipt: String,
+    pub detail: String,
+}
+/// Retain a stale worker's observation outside restored data. Only an issued
+/// model attempt from this project can name the observation slot; duplicate
+/// bytes are idempotent and different receipts cannot overwrite its history.
+pub fn record_late_outcome(
+    store: &CollaborationStore,
+    attempt: &crate::local_budget::Attempt,
+    receipt: &RecordId,
+    detail: &str,
+) -> Result<HistoricalObservation, AuthorityError> {
+    if attempt.project_dir != store.project_dir() || detail.len() > 4096 {
+        return Err(AuthorityError::Invalid("historical scope or size".into()));
+    }
+    let path = directory(store)?;
+    let file = open_lock_file(&path.join("ingress.lock"))?;
+    file.lock_shared()?;
+    let witness = read(&path)?;
+    if witness.status == Status::Active && witness.epoch == attempt.epoch {
+        return Err(AuthorityError::Invalid(
+            "current outcome requires its accounting adapter".into(),
+        ));
+    }
+    let observation = HistoricalObservation {
+        version: 1,
+        project: store.project().as_str().into(),
+        epoch: attempt.epoch.clone(),
+        reservation: attempt.reservation().to_string(),
+        attempt: attempt.number(),
+        receipt: receipt.to_string(),
+        detail: detail.into(),
+    };
+    let history = path.join("history");
+    std::fs::create_dir_all(&history)?;
+    crate::host_state::protect_host_state_path(&history, true)?;
+    let epoch = attempt
+        .epoch
+        .as_str()
+        .strip_prefix("sha256:")
+        .ok_or_else(|| AuthorityError::Invalid("epoch".into()))?;
+    let reservation = attempt
+        .reservation()
+        .as_str()
+        .strip_prefix("sha256:")
+        .ok_or_else(|| AuthorityError::Invalid("reservation".into()))?;
+    let destination = history.join(format!("{epoch}-{reservation}-{}.json", attempt.number()));
+    let bytes = serde_json::to_vec(&observation)?;
+    let mut temporary = tempfile::Builder::new()
+        .prefix(".late-")
+        .tempfile_in(&history)?;
+    temporary.write_all(&bytes)?;
+    temporary.as_file().sync_all()?;
+    match temporary.persist_noclobber(&destination) {
+        Ok(_) => {
+            sync_directory(&history)?;
+            sync_directory(&path)?;
+        }
+        Err(e) if e.error.kind() == std::io::ErrorKind::AlreadyExists => {
+            if std::fs::read(&destination)? != bytes {
+                return Err(AuthorityError::Invalid(
+                    "historical slot already recorded differently".into(),
+                ));
+            }
+        }
+        Err(e) => return Err(e.error.into()),
+    }
+    Ok(observation)
+}
+/// Inspect bounded unverified historical slots; no controller state is changed.
+pub fn historical_outcomes(
+    store: &CollaborationStore,
+) -> Result<Vec<HistoricalObservation>, AuthorityError> {
+    let history = directory(store)?.join("history");
+    let entries = match std::fs::read_dir(history) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
+        Err(e) => return Err(e.into()),
+    };
+    let mut observations = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        if entry.file_name().to_string_lossy().starts_with(".late-") {
+            continue;
+        }
+        let meta = entry.metadata()?;
+        if !meta.is_file() || meta.len() > 16 * 1024 {
+            return Err(AuthorityError::Invalid("historical file".into()));
+        }
+        let value: HistoricalObservation = serde_json::from_slice(&std::fs::read(entry.path())?)?;
+        if value.version != 1
+            || value.project != store.project().as_str()
+            || RecordId::parse(value.epoch.as_str()).is_err()
+            || RecordId::parse(&value.reservation).is_err()
+            || RecordId::parse(&value.receipt).is_err()
+            || value.attempt == 0
+            || value.attempt > 8
+            || value.detail.len() > 4096
+        {
+            return Err(AuthorityError::Invalid("historical record".into()));
+        }
+        observations.push(value);
+    }
+    observations.sort_by(|a, b| {
+        (&a.epoch.0, &a.reservation, a.attempt).cmp(&(&b.epoch.0, &b.reservation, b.attempt))
+    });
+    Ok(observations)
 }

@@ -66,6 +66,11 @@ revision and colliding restored row/version cannot make an old handle current.
 Owner-supplied budget reconciliation remains accounting; it is not a receipt
 producer, behavior test, acceptance approval or publication authority.
 
+Late model-attempt observations can be retained in immutable historical slots
+outside restored data. Replays are idempotent; different receipts cannot replace
+a slot. These are explicitly unverified references and never alter target,
+budget, verification or acceptance state. Trusted producer sealing remains L6.
+
 ## Evidence and limits
 
 Reference tests exercise freeze/revoke, exact resume, missing/corrupt witnesses,
