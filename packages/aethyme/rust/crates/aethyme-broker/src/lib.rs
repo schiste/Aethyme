@@ -94,6 +94,7 @@ pub mod install_replacement;
 mod issue_form;
 mod lease_export;
 mod leases;
+pub mod execution_snapshot;
 pub mod local_authority;
 pub mod local_budget;
 pub mod local_target;
