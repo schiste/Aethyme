@@ -346,10 +346,12 @@ const MIGRATIONS: &[(i64, &str)] = &[
  ON local_budget_reservations(root,parent);
     "#,
     ),
-    (10, "CREATE TABLE local_authority_state (singleton INTEGER PRIMARY KEY NOT NULL CHECK(singleton=1), epoch TEXT NOT NULL) STRICT;"),
+    (
+        10,
+        "CREATE TABLE local_authority_state (singleton INTEGER PRIMARY KEY NOT NULL CHECK(singleton=1), epoch TEXT NOT NULL) STRICT;",
+    ),
 ];
-/// The file that marks
- a directory as a collaboration root.
+/// The file that marks a directory as a collaboration root.
 pub const ROOT_MARKER: &str = ".aethyme-collaboration-root.json";
 const ROOT_MARKER_KIND: &str = "aethyme-collaboration-root";
 const STATE_DATABASE: &str = "state.db";
