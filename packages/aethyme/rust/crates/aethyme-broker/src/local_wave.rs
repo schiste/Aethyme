@@ -146,6 +146,7 @@ pub fn tick(
     policy: WavePolicy,
     now_ms: i64,
 ) -> Result<Run, WaveError> {
+    let _authority = target::authorize(store, owner)?;
     let wave = match admit(store, owner, policy, now_ms)? {
         Admission::Frozen(wave) | Admission::Existing(wave) => wave,
         waiting => return Ok(Run::Waiting(waiting)),
@@ -204,6 +205,7 @@ pub fn available(
     contribution: &str,
     now_ms: i64,
 ) -> Result<(), WaveError> {
+    let _authority = target::authorize(store, owner)?;
     target::authorize(store, owner)?;
     if now_ms < 0 {
         return Err(WaveError::Invalid("negative clock".into()));
@@ -338,6 +340,7 @@ pub fn admit(
     policy: WavePolicy,
     now_ms: i64,
 ) -> Result<Admission, WaveError> {
+    let _authority = target::authorize(store, owner)?;
     target::authorize(store, owner)?;
     policy.validate()?;
     if now_ms < 0 {
@@ -550,6 +553,7 @@ pub fn compose(
     repo: &Path,
     wave_id: &RecordId,
 ) -> Result<Wave, WaveError> {
+    let _authority = target::authorize(store, owner)?;
     let wave = load(store, wave_id)?;
     let state = current(store, owner, &wave)?;
     if wave.phase == WavePhase::Verifying {
@@ -672,6 +676,7 @@ pub fn observe_target(
     wave_id: &RecordId,
     observed: &CommitOid,
 ) -> Result<Wave, WaveError> {
+    let _authority = target::authorize(store, owner)?;
     let wave = load(store, wave_id)?;
     let state = current(store, owner, &wave)?;
     let baseline =
@@ -705,6 +710,7 @@ pub fn recover_dispatch(
     owner: &ControllerOwner,
     wave_id: &RecordId,
 ) -> Result<Wave, WaveError> {
+    let _authority = target::authorize(store, owner)?;
     let wave = load(store, wave_id)?;
     target::authorize(store, owner)?;
     if wave.spec.target != owner.target() || wave.spec.issuer != owner.issuer() {
@@ -737,6 +743,7 @@ pub fn stop(
     owner: &ControllerOwner,
     wave_id: &RecordId,
 ) -> Result<Wave, WaveError> {
+    let _authority = target::authorize(store, owner)?;
     let wave = load(store, wave_id)?;
     target::authorize(store, owner)?;
     let state = target::status(store, owner.target())?;

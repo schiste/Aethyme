@@ -1,0 +1,6 @@
+{
+  "oracle": "Independent Ruby JSON/OpenSSL stream, no Aethyme imports",
+  "header": "[\"local_fixture\",[\"q\",\"n\",\"payload\"]]",
+  "row": "[[\"text\",[115,108,111,116]],[\"integer\",7],[\"blob\",[0,255]]]",
+  "id": "sha256:4ac327afe574cd429d3bb323cea83c9051cf13a7648cebdbcaef73ff65b986ba"
+}
