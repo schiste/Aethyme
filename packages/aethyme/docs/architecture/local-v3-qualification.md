@@ -24,8 +24,8 @@ associated claim; independent legacy Local operations remain available.
 | Useful bounded contribution context | L3 (#718/#730), X2 fresh views (#731) | FX08/FX17 matched correct/absent/misleading briefs with full denominator |
 | Candidate composition and bounded resolution | Provisional L4 (#733–#736) | E1 replacement and T16–T23 requalification; historical held-out trials are not rerun |
 | Target revisions, finite waves, budgets and external epoch | L5 (#737–#740) | Q4 progress, stop, arrival and restore trace bundle |
-| Exact execution, supervisor, trusted verifier, resources | L6 (#741–#745) | Q3 negatives/positives and actual bounded ENOSPC/OOM with GC/concurrent work |
-| Source transport and provider observation | L7 (#744/#746) | Native gate join after #725; actual GitHub/Mergify needs designated Playground binding |
+| Exact execution, supervisor, trusted verifier, resources | L6 (#741–#744) | Q3 negatives/positives and actual bounded ENOSPC/OOM with GC/concurrent work |
+| Source transport and provider observation | L7 (#745/#746) | Native gate join after #725; actual GitHub/Mergify needs designated Playground binding |
 | Prepared generation, exchange and controlled agent handoff | L8 (#747–#749) | Final restored test/guard artifacts and real owned process receipts |
 | Retained export and isolated source rehearsal | Export (#750) | Final guard artifacts; actual independent receiver build after origin deletion |
 | Disable/version/old binary/offline/rebind behavior | Compatibility (#751) | Full current CLI parity and actual independently pinned old process runs |
@@ -42,8 +42,10 @@ owned bounded Linux container. It proves workload-filesystem exhaustion, not
 Docker daemon-storage exhaustion or global host-disk exhaustion. Pair it with
 real retained CAS GC and an independent concurrent build; verify exact retained
 bytes, rejected pass/artifact classification, and the owned cleanup inventory.
-The same preservation/cleanup assertions apply to bounded cgroup OOM. Neither
-condition is accepted as a semantic candidate failure or verifier pass.
+The same preservation/cleanup assertions apply to bounded cgroup OOM. No
+condition may produce a verifier pass. A nonzero workload exit is reported as
+CodeFailed by the current supervisor; cgroup OOM has a native runtime witness
+and is InfrastructureDeferred. These two classifications are not equivalent.
 
 All scheduled trials count, including infrastructure-deferred and unsupported
 ones. A named test must actually run; compiler failures and zero-test runs are

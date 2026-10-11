@@ -690,3 +690,7 @@ impl Admission<'_> {
 }
 #[cfg(test)]
 pub(crate) mod tests;
+
+#[cfg(test)]
+#[path = "local_qualification.rs"]
+mod qualification;
