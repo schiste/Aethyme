@@ -624,7 +624,7 @@ exec '{}' "$@"
     )
     .unwrap();
     std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
-    let executor = DockerExecutor::probe(wrapper).unwrap();
+    let executor = DockerExecutor::probe(wrapper.clone()).unwrap();
     let mut p = policy(host.path());
     p.runtime = executor.runtime().id();
     p.daemon = executor.runtime().daemon_id.clone();
@@ -955,6 +955,179 @@ exec '{}' "$@"
             &format!("name=^{volume}$")
         ])
         .is_empty()
+    ); // Physical daemon labels are independently observed, not taken from the
+    // valid journal. Wrong labels must not authorize deletion or capacity release.
+    for kind in [ObjectKind::Container, ObjectKind::Volume] {
+        let recovery_attempt = attempt(
+            &mut f,
+            &owner,
+            &execution,
+            &w.id,
+            envelope(),
+            format!("wrong-label-{kind:?}").as_bytes(),
+        );
+        let id: String = f
+            .store
+            .read_connection()
+            .query_row("SELECT lower(hex(randomblob(32)))", [], |r| r.get(0))
+            .unwrap();
+        let mut run = Run::admit(
+            &p,
+            &f.store,
+            &owner,
+            &execution,
+            &recovery_attempt,
+            id.clone(),
+            executor.endpoint().into(),
+            envelope(),
+        )
+        .unwrap();
+        let name = format!("aethyme-{id}-wrong-label");
+        run.intent(kind, name.clone(), id.clone()).unwrap();
+        let foreign_label = "aethyme.local.generation=another-actual-generation";
+        let object = match kind {
+            ObjectKind::Container => docker(&[
+                "container",
+                "create",
+                "--name",
+                &name,
+                "--label",
+                foreign_label,
+                "--network",
+                "none",
+                &p.meter_image,
+                "/bin/true",
+            ]),
+            ObjectKind::Volume => docker(&[
+                "volume",
+                "create",
+                "--driver",
+                "local",
+                "--label",
+                foreign_label,
+                &name,
+            ]),
+        };
+        run.created(kind, &name, object.clone()).unwrap();
+        drop(run);
+        assert!(
+            executor.recover_resources(&id).is_err(),
+            "actual label mismatch must refuse cleanup for {kind:?}"
+        );
+        assert_eq!(
+            HostResourceCoordinator::open(&p.host_state)
+                .unwrap()
+                .list(false)
+                .unwrap()
+                .len(),
+            1
+        );
+        let mut recovery = Run::recover(&p, &id).unwrap();
+        assert!(!recovery.journal.objects[0].removed);
+        let original_endpoint = recovery.journal.endpoint.clone();
+        recovery.journal.endpoint = "unix:///another-docker-endpoint".into();
+        save(&recovery.root, &recovery.journal).unwrap();
+        drop(recovery);
+        assert!(executor.recover_resources(&id).is_err());
+        let mut recovery = Run::recover(&p, &id).unwrap();
+        recovery.journal.endpoint = original_endpoint;
+        save(&recovery.root, &recovery.journal).unwrap();
+        drop(recovery);
+        // The trusted fixture owns these exact IDs. Explicit manual cleanup is
+        // distinct from granting a mismatching native recovery authority.
+        match kind {
+            ObjectKind::Container => {
+                docker(&["container", "rm", &object]);
+            }
+            ObjectKind::Volume => {
+                docker(&["volume", "rm", &object]);
+            }
+        }
+        executor.recover_resources(&id).unwrap();
+        assert!(
+            HostResourceCoordinator::open(&p.host_state)
+                .unwrap()
+                .list(false)
+                .unwrap()
+                .is_empty()
+        );
+    }
+    // A cgroup OOM is an infrastructure failure, not a candidate code verdict.
+    // This allocates only inside this workload's 64 MiB cgroup.
+    let mut oom_spec = execution.spec().clone();
+    oom_spec.build.arguments[1] =
+        "awk 'BEGIN {s=\"x\";for(i=0;i<28;i++)s=s s;print length(s)}'".into();
+    let oom_execution =
+        snapshot::freeze(&mut f.store, &owner, execution.target_revision(), oom_spec).unwrap();
+    let oom_attempt = attempt(
+        &mut f,
+        &owner,
+        &oom_execution,
+        &w.id,
+        build_envelope(&oom_execution).unwrap(),
+        b"native cgroup OOM",
+    );
+    let oom = executor
+        .build(
+            &mut f.store,
+            &owner,
+            &oom_execution,
+            &oom_attempt,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+    assert_eq!(
+        oom.outcome(),
+        crate::execution_supervisor::Outcome::InfrastructureDeferred,
+        "{:?}",
+        oom.detail()
+    );
+    assert!(oom.artifact().is_none());
+    assert!(oom.detail().is_some_and(|d| d.contains("OOM")));
+    assert!(
+        HostResourceCoordinator::open(&p.host_state)
+            .unwrap()
+            .list(false)
+            .unwrap()
+            .is_empty()
+    );
+    // Exercise a daemon disk-floor failure without exhausting the real host.
+    let mut high_floor = p.clone();
+    high_floor.daemon_floor_bytes = u64::MAX / 2;
+    let constrained = DockerExecutor::probe(wrapper)
+        .unwrap()
+        .with_resources(high_floor)
+        .unwrap();
+    let floor_attempt = attempt(
+        &mut f,
+        &owner,
+        &execution,
+        &w.id,
+        build_envelope(&execution).unwrap(),
+        b"native daemon floor",
+    );
+    let failed = constrained.build(
+        &mut f.store,
+        &owner,
+        &execution,
+        &floor_attempt,
+        &AtomicBool::new(false),
+    );
+    assert!(
+        matches!(failed, Err(crate::execution_supervisor::SupervisorError::Infrastructure(ref d)) if d.contains("disk floor"))
+    );
+    assert!(
+        HostResourceCoordinator::open(&p.host_state)
+            .unwrap()
+            .list(false)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        budget::load(&f.store, floor_attempt.reservation())
+            .unwrap()
+            .spent,
+        floor_attempt.remaining()
     );
 }
 #[test]
