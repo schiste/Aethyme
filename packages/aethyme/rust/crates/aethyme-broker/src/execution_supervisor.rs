@@ -206,15 +206,15 @@ fn active(
     store: &CollaborationStore,
     owner: &ControllerOwner,
     execution: &ExecutionSnapshot,
-) -> Result<(), SupervisorError> {
-    let _guard = target::authorize(store, owner)?;
+) -> Result<crate::local_authority::Guard, SupervisorError> {
+    let guard = target::authorize(store, owner)?;
     let status = target::status(store, owner.target())?;
     if status.revision.as_ref() != Some(execution.target_revision())
         || status.phase != target::Phase::Verifying
     {
         return Err(SupervisorError::Cancelled);
     }
-    Ok(())
+    Ok(guard)
 }
 impl DockerExecutor {
     pub fn build(
@@ -251,6 +251,15 @@ impl DockerExecutor {
             .map_err(target::TargetError::from)?;
         let mut job = docker::Job::new(&self.cli, &generation);
         let result = job.build(&inputs, cancel, || active(store, owner, execution));
+        // Teardown must succeed; cancellation latched during export/cleanup
+        // invalidates the result before a capability can be constructed.
+        job.cleanup()?;
+        drop(job);
+        let result = if cancel.load(Ordering::SeqCst) {
+            Err(SupervisorError::Cancelled)
+        } else {
+            result
+        };
         let detail = result.as_ref().err().map(ToString::to_string);
         let (outcome, exit, output) = match result {
             Ok((exit, output)) if exit == 0 => (Outcome::Built, Some(exit), Some(output)),
@@ -264,9 +273,6 @@ impl DockerExecutor {
             }
             Err(error) => return Err(error),
         };
-        // Explicit teardown must succeed before emitting any successful build.
-        job.cleanup()?;
-        drop(job);
         let artifact = if let Some(output) = output {
             let _authority = target::authorize(store, owner)?;
             active(store, owner, execution)?;
@@ -287,6 +293,15 @@ impl DockerExecutor {
             let physical = archive::put_object(store, &record.canonical_bytes())?;
             objects.push(physical);
             target::retain_artifacts(store, owner, execution.target_revision(), &[], &objects)?;
+            if cancel.load(Ordering::SeqCst) {
+                return Ok(BuildObservation {
+                    outcome: Outcome::Cancelled,
+                    artifact: None,
+                    generation,
+                    exit: None,
+                    detail: Some("cancelled before sealing".into()),
+                });
+            }
             Some(SealedArtifact {
                 id: record.id(),
                 record: physical,

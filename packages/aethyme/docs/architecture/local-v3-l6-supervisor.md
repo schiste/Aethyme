@@ -60,3 +60,17 @@ Q3 and full Local qualification are not claimed from these mechanism tests.
 - [Volume mount and lifecycle behavior](https://docs.docker.com/engine/storage/volumes/)
 - [Local tmpfs volume driver](https://docs.docker.com/reference/cli/docker/volume/create/)
 - [Tar entry inspection](https://docs.rs/tar/0.4.46/tar/struct.Entry.html)
+
+## Provisional mechanism evidence
+
+Nine focused tests pass, including a real disposable-container schedule on the
+existing Linux arm64 daemon with a cached exact Debian image. The schedule
+covers read-only inputs, withheld credentials/control paths, stopped background
+writers, failing exits, timeout, cancellation, hostile output and delayed
+export/start acknowledgements. A separate real control-client process proves
+announced authority freeze waits for dispatch acknowledgement.
+
+Eleven deliberate safeguard removals each fail the intended regression; sources
+are restored. Clippy and discarded-result/deprecated-spelling ratchets pass.
+This establishes these mechanism boundaries, without claiming independent
+behavioral validation, full crash recovery, E1 evidence or Q3 qualification.

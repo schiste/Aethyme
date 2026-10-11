@@ -383,6 +383,20 @@ impl<'a> Job<'a> {
         self.containers.push(id.clone());
         Ok(id)
     }
+    fn start<F>(&self, id: &str, cancel: &AtomicBool, authorize: F) -> Result<(), SupervisorError>
+    where
+        F: FnOnce() -> Result<crate::local_authority::Guard, SupervisorError>,
+    {
+        if cancel.load(Ordering::SeqCst) {
+            return Err(SupervisorError::Cancelled);
+        }
+        // Freeze takes this lock exclusively. Dispatch and its acknowledgement
+        // therefore precede revocation, or fresh authorization refuses start.
+        let authority = authorize()?;
+        ok(self.cli, &strings(&["container", "start", id]))?;
+        drop(authority);
+        Ok(())
+    }
     fn volume(&mut self, role: &str, size: Option<u64>) -> Result<String, SupervisorError> {
         let name = format!("aethyme-{}-{role}", self.generation);
         let mut args = strings(&[
@@ -474,7 +488,7 @@ impl<'a> Job<'a> {
         mut active: F,
     ) -> Result<(i32, artifact::Output), SupervisorError>
     where
-        F: FnMut() -> Result<(), SupervisorError>,
+        F: FnMut() -> Result<crate::local_authority::Guard, SupervisorError>,
     {
         let spec = inputs.snapshot().spec();
         let image = &spec.profile.build_image;
@@ -508,6 +522,8 @@ impl<'a> Job<'a> {
             guard_limits,
         );
         args.extend(strings(&[
+            "--label",
+            &format!("aethyme.local.generation={}", self.generation),
             "--mount",
             &format!("type=volume,source={output},target=/outputs,readonly,volume-nocopy"),
             image,
@@ -524,7 +540,7 @@ impl<'a> Job<'a> {
             guard_limits,
             &BTreeMap::from([("/outputs".into(), (output.clone(), false))]),
         )?;
-        ok(self.cli, &strings(&["container", "start", &guard]))?;
+        self.start(&guard, cancel, &mut active)?;
         mounts.insert("/outputs".into(), (output, true));
         let mut args = options(&format!("aethyme-{}-build", self.generation), image, limits);
         args.extend(strings(&[
@@ -560,20 +576,19 @@ impl<'a> Job<'a> {
         if cancel.load(Ordering::SeqCst) {
             return Err(SupervisorError::Cancelled);
         }
-        active()?;
         let started = Instant::now();
-        ok(self.cli, &strings(&["container", "start", &id]))?;
+        self.start(&id, cancel, &mut active)?;
         let state = loop {
             let value = container(self.cli, &id)?;
-            if value["State"]["Running"] == false {
-                break value["State"].clone();
-            }
             if cancel.load(Ordering::SeqCst) {
                 return Err(SupervisorError::Cancelled);
             }
             active()?;
             if started.elapsed() > Duration::from_millis(limits.timeout_ms) {
                 return Err(SupervisorError::TimedOut);
+            }
+            if value["State"]["Running"] == false {
+                break value["State"].clone();
             }
             std::thread::sleep(Duration::from_millis(25));
         };
@@ -729,5 +744,65 @@ mod tests {
             serde_json::json!({"Type":"volume","Name":"extra","Destination":"/extra","RW":true}),
         );
         assert!(validate_container(&extra, "sha256:pinned", limits(), &expected).is_err());
+    }
+    #[cfg(unix)]
+    #[test]
+    fn revocation_waits_for_the_actual_dispatch_acknowledgement() {
+        use crate::collaboration_state::{CollaborationRoot, ProjectKey};
+        use crate::local_target::tests::Fixture;
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::mpsc;
+        let mut f = Fixture::new();
+        let owner = target::acquire_controller(&mut f.store, "dispatch-lock", "appointed").unwrap();
+        let epoch = owner.authority_epoch().clone();
+        let host = f._host.path().to_path_buf();
+        let temp = tempfile::tempdir().unwrap();
+        let marker = temp.path().join("started");
+        let release = temp.path().join("release");
+        let cli = temp.path().join("docker-control");
+        let quote = |p: &Path| format!("'{}'", p.display().to_string().replace('\'', "'\\''"));
+        std::fs::write(&cli,format!("#!/bin/sh\nset -eu\ntest \"$3 $4\" = 'container start'\nprintf started > {}\nwhile test ! -f {}; do sleep 0.01; done\n",quote(&marker),quote(&release))).unwrap();
+        std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let (attempted_tx, attempted_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let freezing = std::thread::spawn(move || {
+            let started = Instant::now();
+            while !marker.is_file() {
+                assert!(started.elapsed() < Duration::from_secs(5));
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let mut store = CollaborationStore::open(
+                &CollaborationRoot::under_host_state(&host),
+                &ProjectKey::parse("local-target-test").unwrap(),
+                &[],
+            )
+            .unwrap();
+            attempted_tx.send(()).unwrap();
+            crate::local_authority::freeze(&mut store, &epoch, "test dispatch interleaving")
+                .unwrap();
+            done_tx.send(()).unwrap();
+        });
+        let controlling = std::thread::spawn(move || {
+            attempted_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            let blocked = done_rx.recv_timeout(Duration::from_millis(100));
+            std::fs::write(release, b"allow acknowledged dispatch").unwrap();
+            assert!(
+                matches!(blocked, Err(mpsc::RecvTimeoutError::Timeout)),
+                "freeze completed before dispatch acknowledgement"
+            );
+            done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        });
+        let connection = Connection {
+            cli,
+            endpoint: "unix:///trusted-test".into(),
+        };
+        let job = Job::new(&connection, "test-dispatch-only");
+        job.start(&"a".repeat(64), &AtomicBool::new(false), || {
+            Ok(target::authorize(&f.store, &owner)?)
+        })
+        .unwrap();
+        controlling.join().unwrap();
+        freezing.join().unwrap();
+        assert!(target::authorize(&f.store, &owner).is_err());
     }
 }
