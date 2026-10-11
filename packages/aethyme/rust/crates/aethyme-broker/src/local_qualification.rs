@@ -217,7 +217,7 @@ fn assert_cleanup(executor: &DockerExecutor, host: &Path) {
         }
     }
     assert!(
-        HostResourceCoordinator::open(host.join("host-resources.db"))
+        HostResourceCoordinator::open(&host.join("host-resources.db"))
             .unwrap()
             .list(false)
             .unwrap()
