@@ -37,7 +37,7 @@ use serde::Serialize;
 pub use crate::host_state::HostStateSource;
 
 /// The schema this binary writes.
-pub const COLLABORATION_STATE_SCHEMA_VERSION: i64 = 12;
+pub const COLLABORATION_STATE_SCHEMA_VERSION: i64 = 13;
 /// The oldest schema a database written by this binary can be read by.
 /// Unlike `host-operations.db`, a newer database stays readable by an older
 /// binary until a release raises this floor.
@@ -60,7 +60,7 @@ pub const COLLABORATION_STATE_SCHEMA_VERSION: i64 = 12;
 // Schema 9 does not honor external authority epochs. Quiesce it before restore.
 // Schema 10 cannot enforce the configured verification producer catalogue.
 // Schema 11 cannot fence unresolved source publication against retention release.
-const MIN_COMPATIBLE_SCHEMA: i64 = 12;
+const MIN_COMPATIBLE_SCHEMA: i64 = 13;
 const ROOT_DIRECTORY: &str = "collaboration";
 /// Additive schema steps after the version 1 layout (`meta` only), applied in
 /// order. Each only adds tables; after migrating, the compatibility floor is
@@ -393,6 +393,18 @@ const MIGRATIONS: &[(i64, &str)] = &[
             body BLOB NOT NULL
         ) STRICT;",
     ),
+    (13, "CREATE TABLE local_acceptance_bindings (
+        id TEXT PRIMARY KEY NOT NULL, revision TEXT NOT NULL REFERENCES local_target_revisions(revision),
+        body BLOB NOT NULL, last_receipt TEXT
+    ) STRICT;
+    CREATE TABLE local_acceptance_receipts (
+        id TEXT PRIMARY KEY NOT NULL, binding TEXT NOT NULL REFERENCES local_acceptance_bindings(id),
+        body BLOB NOT NULL
+    ) STRICT;
+    CREATE TABLE local_acceptance_qualifications (
+        id TEXT PRIMARY KEY NOT NULL, binding TEXT NOT NULL REFERENCES local_acceptance_bindings(id),
+        body BLOB NOT NULL
+    ) STRICT;"),
 ];
 /// The file that marks a directory as a collaboration root.
 pub const ROOT_MARKER: &str = ".aethyme-collaboration-root.json";
@@ -1688,7 +1700,7 @@ mod tests {
         store
             .connection()
             .execute_batch(
-                "DROP TABLE local_source_transport_receipts; DROP TABLE local_source_transports; DROP TABLE local_verification_evidence; DROP TABLE local_verifier_producers; DROP TABLE local_authority_state; DROP TABLE local_wave_arrivals;
+                "DROP TABLE local_acceptance_qualifications; DROP TABLE local_acceptance_receipts; DROP TABLE local_acceptance_bindings; DROP TABLE local_source_transport_receipts; DROP TABLE local_source_transports; DROP TABLE local_verification_evidence; DROP TABLE local_verifier_producers; DROP TABLE local_authority_state; DROP TABLE local_wave_arrivals;
                  DROP TABLE local_waves;
                  UPDATE meta SET value = '3' WHERE key = 'schema_version';
                  UPDATE meta SET value = '1' WHERE key = 'min_compatible_schema';",
@@ -1724,7 +1736,7 @@ mod tests {
         store
             .connection()
             .execute_batch(
-                "DROP TABLE local_source_transport_receipts; DROP TABLE local_source_transports; DROP TABLE local_verification_evidence; DROP TABLE local_verifier_producers; DROP TABLE local_authority_state; DROP TABLE local_wave_arrivals;
+                "DROP TABLE local_acceptance_qualifications; DROP TABLE local_acceptance_receipts; DROP TABLE local_acceptance_bindings; DROP TABLE local_source_transport_receipts; DROP TABLE local_source_transports; DROP TABLE local_verification_evidence; DROP TABLE local_verifier_producers; DROP TABLE local_authority_state; DROP TABLE local_wave_arrivals;
                  DROP TABLE local_waves;
                  UPDATE meta SET value = '2' WHERE key = 'schema_version';",
             )

@@ -70,13 +70,13 @@ pub enum TransportError {
 /// Constructed by the native operator, not decoded from incoming records.
 /// Ordinary publication policy and cross-session ref guards remain in force.
 pub struct GitCarrier {
-    session: i64,
-    repo: GitRepo,
-    remote: String,
-    destination: String,
-    identity: crate::ResolvedRemoteTarget,
+    pub(crate) session: i64,
+    pub(crate) repo: GitRepo,
+    pub(crate) remote: String,
+    pub(crate) destination: String,
+    pub(crate) identity: crate::ResolvedRemoteTarget,
     repository_binding: String,
-    timeout: u64,
+    pub(crate) timeout: u64,
     reason: String,
     destructive_authorized: bool,
 }
@@ -136,7 +136,7 @@ impl GitCarrier {
             destructive_authorized,
         })
     }
-    fn check_broker(&self, broker: &mut Broker) -> Result<(), TransportError> {
+    pub(crate) fn check_broker(&self, broker: &mut Broker) -> Result<(), TransportError> {
         let s = broker
             .store()
             .session(self.session)
@@ -152,7 +152,7 @@ impl GitCarrier {
         }
         Ok(())
     }
-    fn check(&self) -> Result<(), TransportError> {
+    pub(crate) fn check(&self) -> Result<(), TransportError> {
         let current = crate::git::with_git_deadline(Duration::from_secs(self.timeout), || {
             self.repo.resolve_remote_target(&self.remote, None)
         })?;
@@ -163,7 +163,7 @@ impl GitCarrier {
         }
         Ok(())
     }
-    fn command(&self, intent: &Intent, args: Vec<String>) -> CoordinatedCommand {
+    pub(crate) fn command(&self, intent: &Intent, args: Vec<String>) -> CoordinatedCommand {
         CoordinatedCommand {
             session_id: self.session,
             provider: OperationProvider::Git,
@@ -311,7 +311,7 @@ fn current(
     }
     Ok(())
 }
-fn route(carrier: &GitCarrier, intent: &Intent) -> Result<(), TransportError> {
+pub(crate) fn route(carrier: &GitCarrier, intent: &Intent) -> Result<(), TransportError> {
     let s = &intent.spec;
     if s.profile != PROFILE
         || s.peer != carrier.identity.coordination_key

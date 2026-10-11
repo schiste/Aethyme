@@ -1143,6 +1143,34 @@ pub(crate) fn raw_commit_tree(repo: &Path, commit: &CommitOid) -> Result<String,
 /// names a snapshot exactly when retaining the same commit would succeed
 /// with the same ID (barring a source that disappears in between). It reads
 /// and hashes every blob: O(bytes of the tree) per call, with no cache.
+/// Read a bounded ordinary policy blob from verified raw Git objects. No
+/// replacement refs, grafts, alternate object paths, or lazy fetch can alter it.
+pub(crate) fn raw_file_at_commit(
+    repo: &Path,
+    commit: &CommitOid,
+    path: &[u8],
+) -> Result<Option<Vec<u8>>, ArchiveError> {
+    refuse_partial_clone(repo)?;
+    let mut reader = ObjectReader::open(repo)?;
+    let entries = commit_entries(repo, &mut reader, commit)?;
+    let Some(entry) = entries.iter().find(|e| e.path == path) else {
+        return Ok(None);
+    };
+    if entry.mode != "100644" && entry.mode != "100755" {
+        return Err(ArchiveError::UnsupportedEntry {
+            path: path.to_vec(),
+            mode: entry.mode.clone(),
+        });
+    }
+    let (kind, bytes) = reader.read_whole(&entry.oid)?;
+    if kind != "blob" || bytes.len() > 1024 * 1024 {
+        return Err(ArchiveError::SourceMismatch {
+            oid: entry.oid.clone(),
+        });
+    }
+    Ok(Some(bytes))
+}
+
 pub fn snapshot_of_commit(repo: &Path, commit: &CommitOid) -> Result<SourceSnapshot, ArchiveError> {
     refuse_partial_clone(repo)?;
     let mut reader = ObjectReader::open(repo)?;
@@ -2807,7 +2835,7 @@ mod tests {
         store
             .connection()
             .execute_batch(
-                "DROP TABLE local_source_transport_receipts; DROP TABLE local_source_transports; DROP TABLE local_verification_evidence; DROP TABLE local_verifier_producers; DROP TABLE local_authority_state; DROP TABLE local_wave_arrivals; DROP TABLE local_waves;
+                "DROP TABLE local_acceptance_qualifications; DROP TABLE local_acceptance_receipts; DROP TABLE local_acceptance_bindings; DROP TABLE local_source_transport_receipts; DROP TABLE local_source_transports; DROP TABLE local_verification_evidence; DROP TABLE local_verifier_producers; DROP TABLE local_authority_state; DROP TABLE local_wave_arrivals; DROP TABLE local_waves;
                  DROP TABLE retained_contributions; DROP TABLE retained_snapshots;
                  UPDATE meta SET value = '1' WHERE key = 'schema_version';",
             )

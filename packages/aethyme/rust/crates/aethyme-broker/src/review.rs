@@ -100,6 +100,11 @@ impl ReviewPolicy {
                 });
             }
         };
+        Self::from_config_text(&text)
+    }
+
+    /// Reuse the same strict policy parser for verified committed configuration.
+    pub fn from_config_text(text: &str) -> Result<Self, BrokerOpError> {
         let value =
             text.parse::<toml::Value>()
                 .map_err(|error| BrokerOpError::ReviewLifecycle {
