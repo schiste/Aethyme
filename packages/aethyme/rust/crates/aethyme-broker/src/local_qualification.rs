@@ -297,8 +297,11 @@ fn assert_cleanup(executor: &DockerExecutor, host: &Path) {
                         && String::from_utf8_lossy(&output.stderr)
                             .to_ascii_lowercase()
                             .contains("no such")
-                        && output.stdout.is_empty(),
-                    "exact owned resource remains after native confirmed cleanup"
+                        && String::from_utf8_lossy(&output.stderr)
+                            .contains(object.id.as_deref().unwrap())
+                        && serde_json::from_slice::<Vec<serde_json::Value>>(&output.stdout)
+                            .is_ok_and(|objects| objects.is_empty()),
+                    "exact owned resource remains after native confirmed cleanup: {object:?}; {output:?}"
                 );
             }
             executor.recover_resources(&journal.run).unwrap();
