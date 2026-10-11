@@ -54,7 +54,7 @@ an OS process or constrain a provider credential.
 States are `reserved`, `partly_consumed`, `completion_pending`, `consumed`,
 `released_unused` and `consumption_unknown`. A deadline or process disappearance
 never releases unresolved consumption. Excess reported usage leaves the grant
-unknown and held instead of pretending the declared cap was enforced. The observed overrun and receipt remain visible, and new project reservations are blocked, including fresh objectives and recovery. This provisional model cannot forgive an observed overrun with a smaller receipt; resolving a disputed observation needs a future trusted operator workflow.
+unknown and held instead of pretending the declared cap was enforced. The observed overrun and receipt remain visible, and new project reservations, delegated allocations and attempts are blocked, including fresh objectives, existing unused grants and recovery. This provisional model cannot forgive an observed overrun with a smaller receipt; resolving a disputed observation needs a future trusted operator workflow.
 
 Owner-supplied usage and receipt references are accounting inputs. L6 must
 validate actual producer, assignment, profile, exact attempt and usage before

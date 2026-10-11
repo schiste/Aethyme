@@ -769,3 +769,73 @@ fn repeated_overrun_reconciliation_cannot_mint_unbounded_receipt_rows() {
         .unwrap();
     assert_eq!(count, 1);
 }
+
+#[test]
+fn an_observed_overrun_blocks_new_dispatch_and_delegation_of_existing_grants() {
+    let (mut f, owner, w) = setup();
+    let bad = reserve(
+        &mut f.store,
+        &owner,
+        &w,
+        request('a', 2, WorkKind::Composition),
+        0,
+    )
+    .unwrap();
+    let pending = reserve(
+        &mut f.store,
+        &owner,
+        &w,
+        request('b', 2, WorkKind::Composition),
+        0,
+    )
+    .unwrap();
+    let a = begin_attempt(&mut f.store, &owner, &bad.id, 0).unwrap();
+    assert!(matches!(
+        settle(&mut f.store, &owner, &a, units(3), &receipt()),
+        Err(BudgetError::UsageExceeded)
+    ));
+    assert!(matches!(
+        begin_attempt(&mut f.store, &owner, &pending.id, 1),
+        Err(BudgetError::Capacity("unreconciled overrun"))
+    ));
+    assert!(matches!(
+        delegate(
+            &mut f.store,
+            &owner,
+            &pending.id,
+            request('c', 1, WorkKind::Composition),
+            1
+        ),
+        Err(BudgetError::Capacity("unreconciled overrun"))
+    ));
+    assert_eq!(load(&f.store, &pending.id).unwrap().state, State::Reserved);
+}
+#[test]
+fn an_inactive_unknown_reservation_still_pins_its_original_revision() {
+    let (mut f, owner, w) = setup();
+    let r = reserve(
+        &mut f.store,
+        &owner,
+        &w,
+        request('a', 2, WorkKind::Composition),
+        0,
+    )
+    .unwrap();
+    let a = begin_attempt(&mut f.store, &owner, &r.id, 0).unwrap();
+    let r = load(&f.store, a.reservation()).unwrap();
+    mark_unknown(&mut f.store, &owner, &r.id, r.version, "unknown worker").unwrap();
+    wave::stop(&mut f.store, &owner, &w).unwrap();
+    // Fault injection models a rewound or older caller's changed active pointer.
+    // The reservation must retain this revision independently of that pointer.
+    f.store
+        .connection()
+        .execute(
+            "UPDATE local_targets SET active_revision=NULL WHERE target='target'",
+            [],
+        )
+        .unwrap();
+    assert!(matches!(
+        target::release_revision(&mut f.store, &owner, &id(&r.spec.revision).unwrap()),
+        Err(TargetError::Frozen)
+    ));
+}
