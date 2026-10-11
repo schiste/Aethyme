@@ -32,7 +32,6 @@ impl Drop for NativeClient {
     }
 }
 fn control(executor: &DockerExecutor, args: &[&str]) -> std::process::Output {
-    use std::io::Read;
     use std::process::{Command, Stdio};
     let stdout = tempfile::NamedTempFile::new().unwrap();
     let stderr = tempfile::NamedTempFile::new().unwrap();
@@ -44,11 +43,24 @@ fn control(executor: &DockerExecutor, args: &[&str]) -> std::process::Output {
         .stderr(Stdio::from(stderr.reopen().unwrap()))
         .spawn()
         .unwrap();
-    let mut client = NativeClient {
-        child,
-        reaped: false,
-    };
-    let deadline = Instant::now() + Duration::from_secs(5);
+    observe_control(
+        NativeClient {
+            child,
+            reaped: false,
+        },
+        stdout,
+        stderr,
+        Instant::now() + Duration::from_secs(5),
+    )
+}
+fn observe_control(
+    mut client: NativeClient,
+    stdout: tempfile::NamedTempFile,
+    stderr: tempfile::NamedTempFile,
+    deadline: Instant,
+) -> std::process::Output {
+    use std::io::Read;
+
     let status = loop {
         if Instant::now() >= deadline
             || stdout.as_file().metadata().unwrap().len() > MIB
@@ -81,6 +93,72 @@ fn control(executor: &DockerExecutor, args: &[&str]) -> std::process::Output {
         status,
         stdout: bounded(&stdout),
         stderr: bounded(&stderr),
+    }
+}
+fn completed_control() -> (
+    NativeClient,
+    tempfile::NamedTempFile,
+    tempfile::NamedTempFile,
+) {
+    use std::process::{Command, Stdio};
+    let stdout = tempfile::NamedTempFile::new().unwrap();
+    let stderr = tempfile::NamedTempFile::new().unwrap();
+    let mut child = Command::new("/usr/bin/true")
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(stdout.reopen().unwrap()))
+        .stderr(Stdio::from(stderr.reopen().unwrap()))
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            assert!(status.success());
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "owned native true helper did not complete"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    (
+        NativeClient {
+            child,
+            reaped: true,
+        },
+        stdout,
+        stderr,
+    )
+}
+#[test]
+fn completed_native_control_cannot_bypass_deadline() {
+    let (client, stdout, stderr) = completed_control();
+    let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        observe_control(client, stdout, stderr, Instant::now())
+    }));
+    assert!(
+        rejected.is_err(),
+        "cached native success must not bypass the observation deadline"
+    );
+}
+#[test]
+fn completed_native_control_cannot_bypass_output_budget() {
+    for oversized_stderr in [false, true] {
+        let (client, stdout, stderr) = completed_control();
+        let oversized = if oversized_stderr { &stderr } else { &stdout };
+        oversized.as_file().set_len(MIB + 1).unwrap();
+        let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            observe_control(
+                client,
+                stdout,
+                stderr,
+                Instant::now() + Duration::from_secs(5),
+            )
+        }));
+        assert!(
+            rejected.is_err(),
+            "cached native success must not bypass either output-file budget"
+        );
     }
 }
 fn journals(host: &Path) -> Vec<Journal> {
