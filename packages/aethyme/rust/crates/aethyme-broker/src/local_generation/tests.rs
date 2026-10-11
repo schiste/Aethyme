@@ -721,6 +721,17 @@ fn independent_prepared_vector_binds_source_and_both_git_representations() {
     let bytes = v["canonical"].as_str().unwrap().as_bytes();
     let expected = id(v["id"].as_str().unwrap()).unwrap();
     let spec: PreparedSpec = decode(&PREPARED, &expected, bytes).unwrap();
+    let other = id(&format!("sha256:{}", "a".repeat(64))).unwrap();
+    assert!(decode::<PreparedSpec>(&PREPARED, &other, bytes).is_err());
+    let raw: serde_json::Value = serde_json::from_slice(bytes).unwrap();
+    assert!(
+        decode::<PreparedSpec>(
+            &PREPARED,
+            &expected,
+            &serde_json::to_vec_pretty(&raw).unwrap()
+        )
+        .is_err()
+    );
     assert_eq!(record(&PREPARED, &spec).unwrap().canonical_bytes(), bytes);
     let raw: serde_json::Value = serde_json::from_slice(bytes).unwrap();
     for key in [
@@ -886,8 +897,15 @@ fn actual_late_child_and_watcher_remain_attached_to_old_absolute_workspace() {
         &mut |stage, _| {
             if stage == Stage::Materialized {
                 std::fs::write(old_root.join("watch.txt"), b"watch-v2\n")?;
-                let mut running = child.0.take().unwrap();
-                running.stdin.as_mut().unwrap().write_all(b"continue\n")?;
+                child
+                    .0
+                    .as_mut()
+                    .unwrap()
+                    .stdin
+                    .as_mut()
+                    .unwrap()
+                    .write_all(b"continue\n")?;
+                let running = child.0.take().unwrap();
                 let output = running.wait_with_output()?;
                 assert!(output.status.success());
                 assert_eq!(output.stdout, b"watch-v2\n");
@@ -902,5 +920,34 @@ fn actual_late_child_and_watcher_remain_attached_to_old_absolute_workspace() {
     );
     assert!(!g.absolute_root().join("child.txt").exists());
     assert!(!g.absolute_root().join("watch.txt").exists());
+    assert_eq!(load_prepared(&f.v.f.store, g.id()).unwrap(), g);
+}
+
+#[test]
+fn a_valid_prepared_receipt_cannot_override_an_incomplete_journal_state() {
+    let mut f = Fixture::new();
+    let g = f.prepare("receipt-state").unwrap();
+    f.v.f
+        .store
+        .connection()
+        .execute(
+            "UPDATE local_generations SET state='intent' WHERE id=?1",
+            [g.id().as_str()],
+        )
+        .unwrap();
+    // Keep the actual receipt, all canonical bytes and directory unchanged, so
+    // this reaches the state guard independently of missing data/digest guards.
+    assert!(matches!(
+        load_prepared(&f.v.f.store, g.id()),
+        Err(GenerationError::Incomplete)
+    ));
+    f.v.f
+        .store
+        .connection()
+        .execute(
+            "UPDATE local_generations SET state='prepared' WHERE id=?1",
+            [g.id().as_str()],
+        )
+        .unwrap();
     assert_eq!(load_prepared(&f.v.f.store, g.id()).unwrap(), g);
 }
