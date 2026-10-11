@@ -4,11 +4,11 @@ use std::io::Read;
 use std::process::{Command, Output};
 const OLD_COMMIT: &str = "5e8daf712e26c63f1d4082e9a617f556cf995de2";
 const OLD_DIGEST: &str = "edc1ad2829e08c6d5aa2512964e117685cc1ea4502caa765dc1e0d0b9b0a4261";
-const CLEAN_PATH: &str = "/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin";
-const DENY_NETWORK: &str = "(version 1) (allow default) (deny network*)";
+pub(super) const CLEAN_PATH: &str = "/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin";
+pub(super) const DENY_NETWORK: &str = "(version 1) (allow default) (deny network*)";
 fn verify_binary(path: &Path) {
     assert!(path.is_absolute());
-    let mut file = std::fs::File::open(&path).unwrap();
+    let mut file = std::fs::File::open(path).unwrap();
     let mut hash = Sha256::new();
     let mut chunk = [0u8; 65536];
     loop {
@@ -23,16 +23,13 @@ fn verify_binary(path: &Path) {
         OLD_DIGEST,
         "old binary differs from the independently recorded profile"
     );
-    let version = Command::new(&path)
-        .arg("--version")
-        .env_clear()
-        .env("PATH", CLEAN_PATH)
-        .output()
-        .unwrap();
+    let mut command = Command::new(path);
+    command.arg("--version").env_clear().env("PATH", CLEAN_PATH);
+    let version = super::cli_parity::bounded(command);
     assert!(version.status.success());
     assert!(String::from_utf8_lossy(&version.stdout).contains(OLD_COMMIT));
 }
-fn binary() -> PathBuf {
+pub(super) fn binary() -> PathBuf {
     let path = PathBuf::from(
         std::env::var_os("AETHYME_COMPAT_OLD_BINARY")
             .expect("explicit independently pinned old binary required"),
@@ -40,9 +37,10 @@ fn binary() -> PathBuf {
     verify_binary(&path);
     path
 }
-fn run(binary: &Path, f: &Fixture, args: &[&str]) -> Output {
+pub(super) fn run(binary: &Path, f: &Fixture, args: &[&str]) -> Output {
     verify_binary(binary);
-    let output = Command::new("/usr/bin/sandbox-exec")
+    let mut command = Command::new("/usr/bin/sandbox-exec");
+    command
         .args(["-p", DENY_NETWORK])
         .arg(binary)
         .args(args)
@@ -50,9 +48,8 @@ fn run(binary: &Path, f: &Fixture, args: &[&str]) -> Output {
         .env_clear()
         .env("PATH", CLEAN_PATH)
         .env("AETHYME_HOST_STATE_DIR", f.host.path())
-        .env("AETHYME_WORKTREE_ROOT", f._worktrees.path())
-        .output()
-        .unwrap();
+        .env("AETHYME_WORKTREE_ROOT", f._worktrees.path());
+    let output = super::cli_parity::bounded(command);
     eprintln!(
         "compatibility native old-binary transcript {}",
         serde_json::json!({"source":OLD_COMMIT,"binary_sha256":OLD_DIGEST,"network":"kernel-denied","args":args,"status":output.status.code(),"stdout_sha256":crate::collaboration_archive::ObjectDigest::of(&output.stdout).hex(),"stderr_sha256":crate::collaboration_archive::ObjectDigest::of(&output.stderr).hex()})
@@ -63,19 +60,18 @@ pub(super) fn assert_network_denied() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let port = listener.local_addr().unwrap().port().to_string();
-    let output = Command::new("/usr/bin/sandbox-exec")
-        .args([
-            "-p",
-            DENY_NETWORK,
-            "/usr/bin/nc",
-            "-z",
-            "-w",
-            "1",
-            "127.0.0.1",
-            &port,
-        ])
-        .output()
-        .unwrap();
+    let mut command = Command::new("/usr/bin/sandbox-exec");
+    command.args([
+        "-p",
+        DENY_NETWORK,
+        "/usr/bin/nc",
+        "-z",
+        "-w",
+        "1",
+        "127.0.0.1",
+        &port,
+    ]);
+    let output = super::cli_parity::bounded(command);
     assert!(
         !output.status.success(),
         "native network-denial profile must be active"
