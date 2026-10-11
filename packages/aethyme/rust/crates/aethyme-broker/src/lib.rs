@@ -104,6 +104,7 @@ pub mod local_budget;
 pub mod local_exchange;
 pub mod local_generation;
 pub mod local_handoff;
+pub mod local_restore;
 pub mod local_source_transport;
 pub mod local_target;
 pub mod local_wave;

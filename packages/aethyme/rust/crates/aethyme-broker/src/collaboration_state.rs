@@ -37,7 +37,7 @@ use serde::Serialize;
 pub use crate::host_state::HostStateSource;
 
 /// The schema this binary writes.
-pub const COLLABORATION_STATE_SCHEMA_VERSION: i64 = 16;
+pub const COLLABORATION_STATE_SCHEMA_VERSION: i64 = 17;
 /// The oldest schema a database written by this binary can be read by.
 /// Unlike `host-operations.db`, a newer database stays readable by an older
 /// binary until a release raises this floor.
@@ -60,10 +60,10 @@ pub const COLLABORATION_STATE_SCHEMA_VERSION: i64 = 16;
 // Schema 9 does not honor external authority epochs. Quiesce it before restore.
 // Schema 10 cannot enforce the configured verification producer catalogue.
 // Schema 11 cannot fence unresolved source publication against retention release.
-const MIN_COMPATIBLE_SCHEMA: i64 = 16;
+const MIN_COMPATIBLE_SCHEMA: i64 = 17;
 const ROOT_DIRECTORY: &str = "collaboration";
 /// Schema steps after the version 1 layout (`meta` only), applied in
-/// order. Step 16 adds session-bound native handoff journals. The floor is
+/// order. Step 17 adds separately indexed historical imports and rehearsals. The floor is
 /// raised to [`MIN_COMPATIBLE_SCHEMA`].
 const MIGRATIONS: &[(i64, &str)] = &[
     (
@@ -442,6 +442,22 @@ const MIGRATIONS: &[(i64, &str)] = &[
     ) STRICT;
     CREATE TABLE local_adoption_receipts (
         id TEXT PRIMARY KEY NOT NULL, handoff TEXT NOT NULL REFERENCES local_handoffs(id), body BLOB NOT NULL
+    ) STRICT;"),
+    (17,"CREATE TABLE local_imports (
+        id TEXT PRIMARY KEY NOT NULL,bundle TEXT NOT NULL,target TEXT NOT NULL REFERENCES local_targets(target),
+        epoch TEXT NOT NULL,body BLOB NOT NULL,header_sha256 TEXT NOT NULL,
+        UNIQUE(bundle,target,epoch)
+    ) STRICT;
+    CREATE TABLE local_imported_sources (
+        import_id TEXT NOT NULL REFERENCES local_imports(id),snapshot_id TEXT NOT NULL,PRIMARY KEY(import_id,snapshot_id)
+    ) STRICT;
+    CREATE TABLE local_imported_records (
+        import_id TEXT NOT NULL REFERENCES local_imports(id),record_id TEXT NOT NULL,schema TEXT NOT NULL,object_sha256 TEXT NOT NULL,
+        PRIMARY KEY(import_id,record_id)
+    ) STRICT;
+    CREATE TABLE local_import_rehearsals (
+        id TEXT PRIMARY KEY NOT NULL,import_id TEXT NOT NULL REFERENCES local_imports(id),body BLOB NOT NULL,
+        state TEXT NOT NULL CHECK(state IN ('intent','prepared'))
     ) STRICT;"),
 
 ];
