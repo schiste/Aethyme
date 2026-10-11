@@ -396,7 +396,7 @@ fn validate_capture_envelope(
     operation: &str,
     payload: &str,
     packet: &Metadata,
-) -> Result<(), ExchangeError> {
+) -> Result<ObjectDigest, ExchangeError> {
     let operation = crate::collaboration_capture::OperationId::parse(operation)?;
     let receipt = crate::collaboration_capture::receipt(store, &operation)?
         .ok_or(ExchangeError::Incomplete)?;
@@ -432,7 +432,7 @@ fn validate_capture_envelope(
             && source == receipt.result.as_str()
             && payload == receipt.receipt_record_id.as_str() =>
         {
-            Ok(())
+            Ok(digest)
         }
         _ => Err(invalid("capture envelope subject")),
     }
@@ -456,7 +456,7 @@ pub fn stage_capture_metadata(
         return Err(ExchangeError::Unsupported);
     }
     let record = packet.record()?;
-    validate_capture_envelope(store, &operation, &payload, packet)?;
+    let receipt_digest = validate_capture_envelope(store, &operation, &payload, packet)?;
     let digest = archive::put_object(store, &record.canonical_bytes())?;
     let tx = store
         .connection()
@@ -485,6 +485,11 @@ pub fn stage_capture_metadata(
         params![sequence, record.canonical_bytes()],
     )?;
     pin(&tx, &digest, &format!("exchange-capture:{sequence}"))?;
+    pin(
+        &tx,
+        &receipt_digest,
+        &format!("exchange-capture-receipt:{sequence}"),
+    )?;
     tx.commit()?;
     Ok(record.id())
 }

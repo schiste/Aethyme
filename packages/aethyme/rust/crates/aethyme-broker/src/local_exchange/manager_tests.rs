@@ -982,3 +982,82 @@ fn capture_envelope_checks_archived_receipt_against_damaged_index_and_missing_by
     ));
     assert_eq!(count(&f.store, "local_exchange_messages"), 0);
 }
+
+#[test]
+fn staged_capture_metadata_keeps_authenticated_receipt_after_source_release_and_gc() {
+    use crate::collaboration_archive::{self as archive, ObjectDigest};
+    use crate::collaboration_capture::{
+        self as cap, CaptureOutcome, CapturePolicy, CaptureRequest, OperationId, RetentionBoundary,
+    };
+    use crate::collaboration_gc::{self as gc, GcOptions};
+    let mut f = crate::local_target::tests::Fixture::new();
+    let repo = f._repo.path().to_owned();
+    let operation = OperationId::mint().unwrap();
+    let request = CaptureRequest {
+        operation_id: operation.clone(),
+        base: archive::pin_commit(&repo, "HEAD~1").unwrap(),
+        result: archive::pin_commit(&repo, "HEAD").unwrap(),
+        repository: repo,
+        policy: CapturePolicy::Required,
+        retention: RetentionBoundary::UntilReleased,
+    };
+    let receipt = match cap::capture(&mut f.store, &request).unwrap() {
+        CaptureOutcome::Acknowledged(receipt) => receipt,
+        _ => panic!("capture did not acknowledge"),
+    };
+    let (sequence, hex): (i64, String) = f.store.read_connection().query_row(
+        "SELECT o.sequence,r.receipt_sha256 FROM outbox o JOIN capture_receipts r USING(operation_id) WHERE o.operation_id=?1",
+        [operation.as_str()], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+    let receipt_digest = archive::parse_digest(&hex).unwrap();
+    let metadata = Metadata::Contribution {
+        contribution: receipt.contribution.to_string(),
+        source: receipt.result.to_string(),
+        availability: SourceAvailability::LocalOnly,
+        scope: vec!["two.txt".into()],
+        brief: None,
+    };
+    let wire = stage_capture_metadata(&mut f.store, sequence, &metadata).unwrap();
+    let native = Peer::new();
+    let mut spec = peer();
+    spec.scope = Scope::Project;
+    let appointed = appoint(&mut f.store, spec, &native).unwrap();
+    assert!(gc::release_retention(&mut f.store, operation.as_str()).unwrap());
+    let junk = archive::put_object(&f.store, b"capture receipt gc regression junk").unwrap();
+    for prefix in std::fs::read_dir(archive::objects_dir(&f.store)).unwrap() {
+        for object in std::fs::read_dir(prefix.unwrap().path()).unwrap() {
+            std::fs::File::open(object.unwrap().path())
+                .unwrap()
+                .set_times(std::fs::FileTimes::new().set_modified(UNIX_EPOCH))
+                .unwrap();
+        }
+    }
+    let plan = gc::plan(&mut f.store, &GcOptions::default()).unwrap();
+    gc::apply(&mut f.store, &plan.digest, &GcOptions::default()).unwrap();
+    assert!(archive::read_object(&f.store, &junk).is_err());
+    assert!(archive::read_object(&f.store, &receipt_digest).is_ok());
+    assert!(
+        archive::read_object(
+            &f.store,
+            &ObjectDigest::of(&metadata.record().unwrap().canonical_bytes())
+        )
+        .is_ok()
+    );
+    // The metadata pin does not retain source authority or the source objects.
+    assert!(
+        archive::retained(&f.store, &receipt.result)
+            .unwrap()
+            .is_none()
+    );
+    assert_ne!(
+        cap::receipt(&mut f.store, &operation)
+            .unwrap()
+            .unwrap()
+            .status,
+        "retained_local"
+    );
+    assert_eq!(
+        deliver(&mut f.store, &appointed, sequence).unwrap(),
+        Delivery::Acknowledged
+    );
+    assert_eq!(native.state.borrow().sends, vec![wire.to_string()]);
+}

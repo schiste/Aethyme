@@ -248,6 +248,10 @@ pub(super) fn dispatch_with(
     if agent_current(&tx, owner, agent)? != "running" {
         return Err(HandoffError::Stale);
     }
+    guard.check_clock()?;
+    if now()? >= request.spec.expires_ms || std::time::Instant::now() >= deadline {
+        return Err(HandoffError::Deadline);
+    };
     let go = running
         .child
         .stdin

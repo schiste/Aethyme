@@ -1553,17 +1553,39 @@ mod tests {
             }
         );
 
-        // No other database is attached: there is nothing to share a
-        // transaction with.
-        let names: Vec<String> = store
+        // Schema DDL may instantiate SQLite's empty transient temp database.
+        // There is exactly one persistent database and no attached shared DB.
+        let databases: Vec<(String, String)> = store
             .connection
-            .prepare("SELECT name FROM pragma_database_list")
+            .prepare("SELECT name,file FROM pragma_database_list ORDER BY seq")
             .unwrap()
-            .query_map([], |row| row.get(0))
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
             .unwrap()
             .collect::<Result<_, _>>()
             .unwrap();
-        assert_eq!(names, ["main"]);
+        let persistent: Vec<_> = databases
+            .iter()
+            .filter(|(name, _)| name != "temp")
+            .collect();
+        assert_eq!(
+            persistent,
+            [&(
+                "main".into(),
+                store
+                    .project_dir()
+                    .join("state.db")
+                    .canonicalize()
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .to_owned()
+            )]
+        );
+        assert!(
+            databases
+                .iter()
+                .all(|(name, file)| name != "temp" || file.is_empty())
+        );
     }
 
     #[test]
