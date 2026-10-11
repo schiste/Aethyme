@@ -74,6 +74,7 @@ fn approvals_are_exact_latest_distinct_and_exclude_author() {
             &policy,
             &oid(),
             "author",
+            Some("APPROVED"),
             std::slice::from_ref(&approval),
             &[]
         )
@@ -84,6 +85,7 @@ fn approvals_are_exact_latest_distinct_and_exclude_author() {
             &policy,
             &oid(),
             "reviewer",
+            Some("APPROVED"),
             std::slice::from_ref(&approval),
             &[]
         )
@@ -91,7 +93,7 @@ fn approvals_are_exact_latest_distinct_and_exclude_author() {
     );
     let mut wrong = approval.clone();
     wrong["commit_id"] = "b".repeat(40).into();
-    assert!(!review_pass(&policy, &oid(), "author", &[wrong], &[]).unwrap());
+    assert!(!review_pass(&policy, &oid(), "author", Some("APPROVED"), &[wrong], &[]).unwrap());
     let mut dismissed = approval.clone();
     dismissed["id"] = 2.into();
     dismissed["state"] = "DISMISSED".into();
@@ -100,6 +102,7 @@ fn approvals_are_exact_latest_distinct_and_exclude_author() {
             &policy,
             &oid(),
             "author",
+            Some("APPROVED"),
             &[dismissed, approval.clone()],
             &[]
         )
@@ -110,6 +113,7 @@ fn approvals_are_exact_latest_distinct_and_exclude_author() {
             &policy,
             &oid(),
             "author",
+            Some("APPROVED"),
             &[approval.clone(), approval],
             &[]
         )
@@ -126,14 +130,34 @@ fn missing_stale_wrong_app_and_ambiguous_checks_cannot_pass() {
         ..Default::default()
     };
     let check = serde_json::json!({"name":"review","app":{"slug":"appointed"},"head_sha":oid(),"status":"completed","conclusion":"success"});
-    assert!(review_pass(&policy, &oid(), "author", &[], std::slice::from_ref(&check)).unwrap());
-    assert!(!review_pass(&policy, &oid(), "author", &[], &[]).unwrap());
+    assert!(
+        review_pass(
+            &policy,
+            &oid(),
+            "author",
+            Some("APPROVED"),
+            &[],
+            std::slice::from_ref(&check)
+        )
+        .unwrap()
+    );
+    assert!(!review_pass(&policy, &oid(), "author", Some("APPROVED"), &[], &[]).unwrap());
     for path in ["/head_sha", "/app/slug", "/status", "/conclusion"] {
         let mut bad = check.clone();
         *bad.pointer_mut(path).unwrap() = "wrong".into();
-        assert!(!review_pass(&policy, &oid(), "author", &[], &[bad]).unwrap());
+        assert!(!review_pass(&policy, &oid(), "author", Some("APPROVED"), &[], &[bad]).unwrap());
     }
-    assert!(!review_pass(&policy, &oid(), "author", &[], &[check.clone(), check]).unwrap());
+    assert!(
+        !review_pass(
+            &policy,
+            &oid(),
+            "author",
+            Some("APPROVED"),
+            &[],
+            &[check.clone(), check]
+        )
+        .unwrap()
+    );
 }
 
 use crate::local_target::tests::{Fixture, git};
@@ -193,7 +217,7 @@ impl Subject {
             &mut broker,
             session.id,
             "publication",
-            "refs/heads/main",
+            "refs/heads/accepted",
             30,
             "operator authorizes exact Playground source route",
             true,
@@ -208,7 +232,7 @@ impl Subject {
                 "push",
                 "-q",
                 "publication",
-                &format!("{baseline}:refs/heads/main"),
+                &format!("{baseline}:refs/heads/accepted"),
             ],
         );
         let intent = transport::prepare(
@@ -227,7 +251,7 @@ impl Subject {
             &carrier,
             &intent.id,
             ProviderRoute::GenericGit,
-            "refs/heads/main",
+            "refs/heads/accepted",
             8,
         )
         .unwrap();
@@ -283,10 +307,12 @@ impl Subject {
         p["head"]["sha"] = self.intent.spec.commit.clone().into();
         p["base"]["repo"]["full_name"] = self.carrier.identity.repository_path.clone().into();
         p["merge_commit_sha"] = accepted.into();
+        p["base"]["ref"] = "accepted".into();
         ProviderFixture {
             pr: p,
             reviews: vec![],
             checks: vec![],
+            aggregate: Some("APPROVED".into()),
         }
     }
 }
@@ -346,7 +372,7 @@ fn merge_squash_and_rebase_representations_require_complete_exact_source() {
                 "push",
                 "-q",
                 "publication",
-                &format!("{accepted}:refs/heads/main"),
+                &format!("{accepted}:refs/heads/accepted"),
             ],
         );
         s.fixture_route(ProviderRoute::Github { pull_request: 4 });
@@ -377,7 +403,7 @@ fn external_main_or_wrong_source_requires_revalidation_not_transferred_approval(
             "-q",
             "--force",
             "publication",
-            &format!("{wrong}:refs/heads/main"),
+            &format!("{wrong}:refs/heads/accepted"),
         ],
     );
     let fixture = s.provider(&wrong);
@@ -448,6 +474,13 @@ fn stopped_historical_observation_never_delivers_or_restarts_a_target() {
     let mut s = Subject::new();
     s.publish();
     let st = target::status(&s.f.store, s.owner.target()).unwrap();
+    let st = target::transition(
+        &mut s.f.store,
+        &s.owner,
+        st.version,
+        target::Phase::StopRequested,
+    )
+    .unwrap();
     target::transition(&mut s.f.store, &s.owner, st.version, target::Phase::Stopped).unwrap();
     assert_eq!(s.observe().spec.decision, ProviderDecision::Accepted);
     assert_eq!(
@@ -457,7 +490,7 @@ fn stopped_historical_observation_never_delivers_or_restarts_a_target() {
 }
 
 #[test]
-fn private_current_qualification_requires_verifier_and_refuses_revoke_stop_and_expiry() {
+fn private_current_qualification_requires_verifier_and_refuses_revocation() {
     let mut v = verifier::tests::Subject::acceptance_fixture();
     // The existing verifier test fixture supplies test-only sealed capabilities.
     // No production API can manufacture those capabilities from imported bytes.
@@ -508,7 +541,7 @@ fn private_current_qualification_requires_verifier_and_refuses_revoke_stop_and_e
         &mut broker,
         session.id,
         "publication",
-        "refs/heads/main",
+        "refs/heads/accepted",
         30,
         "operator authorizes disposable Playground acceptance",
         true,
@@ -521,7 +554,7 @@ fn private_current_qualification_requires_verifier_and_refuses_revoke_stop_and_e
             "push",
             "-q",
             "publication",
-            &format!("{}:refs/heads/main", base.as_str()),
+            &format!("{}:refs/heads/accepted", base.as_str()),
         ],
     );
     let intent = transport::prepare(
@@ -540,7 +573,7 @@ fn private_current_qualification_requires_verifier_and_refuses_revoke_stop_and_e
         &carrier,
         &intent.id,
         ProviderRoute::GenericGit,
-        "refs/heads/main",
+        "refs/heads/accepted",
         8,
     )
     .unwrap();
@@ -568,6 +601,24 @@ fn private_current_qualification_requires_verifier_and_refuses_revoke_stop_and_e
     .unwrap();
     assert_eq!(grant.receipt(), &receipt);
     assert_eq!(grant.expires_ms(), evidence.expires_ms());
+    let current = current_guard(&mut v.f.store, &v.owner, &mut broker, &carrier, &grant).unwrap();
+    current.check_clock().unwrap();
+    drop(current);
+    let wrong = v.f.b.result.commit.as_str();
+    git(
+        v.f._repo.path(),
+        &[
+            "push",
+            "-q",
+            "--force",
+            "publication",
+            &format!("{wrong}:refs/heads/accepted"),
+        ],
+    );
+    assert!(matches!(
+        current_guard(&mut v.f.store, &v.owner, &mut broker, &carrier, &grant),
+        Err(AcceptanceError::NotAccepted)
+    ));
     drop(grant);
     verifier::revoke(
         &mut v.f.store,
@@ -591,4 +642,129 @@ fn private_current_qualification_requires_verifier_and_refuses_revoke_stop_and_e
             verifier::VerificationError::Producer
         ))
     ));
+}
+
+#[test]
+fn aggregate_changes_requested_blocks_and_comments_do_not_erase_approval() {
+    let policy = crate::ReviewPolicy {
+        enabled: true,
+        ..Default::default()
+    };
+    let approved = serde_json::json!({"id":1,"user":{"id":10,"login":"reviewer"},"state":"APPROVED","commit_id":oid()});
+    let requested = serde_json::json!({"id":2,"user":{"id":11,"login":"other"},"state":"CHANGES_REQUESTED","commit_id":oid()});
+    assert!(
+        !review_pass(
+            &policy,
+            &oid(),
+            "author",
+            Some("CHANGES_REQUESTED"),
+            &[approved.clone(), requested],
+            &[]
+        )
+        .unwrap()
+    );
+    assert!(
+        !review_pass(
+            &policy,
+            &oid(),
+            "author",
+            None,
+            std::slice::from_ref(&approved),
+            &[]
+        )
+        .unwrap()
+    );
+    let commented = serde_json::json!({"id":3,"user":{"id":10,"login":"reviewer"},"state":"COMMENTED","commit_id":oid()});
+    assert!(
+        review_pass(
+            &policy,
+            &oid(),
+            "author",
+            Some("APPROVED"),
+            &[approved, commented],
+            &[]
+        )
+        .unwrap()
+    );
+}
+
+#[test]
+fn retained_policy_survives_unreferenced_git_commit_removal() {
+    let mut s = Subject::new();
+    s.publish();
+    let oid = s.binding.spec.policy_commit.clone();
+    let path =
+        s.f._repo
+            .path()
+            .join(".git/objects")
+            .join(&oid[..2])
+            .join(&oid[2..]);
+    assert!(path.is_file());
+    std::fs::remove_file(path).unwrap();
+    assert_eq!(s.observe().spec.decision, ProviderDecision::Accepted);
+    let object = ObjectDigest::of(b"");
+    let rooted:bool=s.f.store.read_connection().query_row("SELECT EXISTS(SELECT 1 FROM local_target_roots WHERE revision=?1 AND kind='object' AND reference=?2)",params![s.intent.spec.revision,object.hex()],|r|r.get(0)).unwrap();
+    assert!(rooted);
+}
+
+#[test]
+fn generic_git_refuses_existing_review_and_publication_policy() {
+    let mut s = Subject::new();
+    for policy in [
+        "[review]\nenabled=true\n",
+        "[publication]\nmode='review_gated'\n",
+    ] {
+        std::fs::create_dir_all(s.f._repo.path().join(".aethyme")).unwrap();
+        std::fs::write(s.f._repo.path().join(".aethyme/config.toml"), policy).unwrap();
+        git(s.f._repo.path(), &["add", ".aethyme/config.toml"]);
+        git(
+            s.f._repo.path(),
+            &["commit", "-qm", "existing operator policy"],
+        );
+        let commit = git(s.f._repo.path(), &["rev-parse", "HEAD"]);
+        git(
+            s.f._repo.path(),
+            &[
+                "push",
+                "-q",
+                "publication",
+                &format!("{commit}:refs/heads/accepted"),
+            ],
+        );
+        assert!(
+            matches!(appoint(&mut s.f.store,&s.owner,&mut s.broker,&s.carrier,&s.intent.id,ProviderRoute::GenericGit,"refs/heads/accepted",8),Err(AcceptanceError::Invalid(message)) if message.contains("mandatory review"))
+        );
+    }
+}
+
+#[test]
+fn independent_receipt_vector_binds_source_policy_provider_and_representation() {
+    let vector: serde_json::Value =
+        serde_json::from_str(include_str!("receipt-vector.json")).unwrap();
+    let bytes = vector["canonical"].as_str().unwrap().as_bytes();
+    let record = Record::decode(bytes, &[&RECEIPT]).unwrap();
+    assert_eq!(record.canonical_bytes(), bytes);
+    assert_eq!(record.id().as_str(), vector["id"].as_str().unwrap());
+    let raw: serde_json::Value = serde_json::from_slice(bytes).unwrap();
+    let spec: ReceiptSpec = serde_json::from_value(raw["spec"].clone()).unwrap();
+    assert_eq!(canonical(&RECEIPT, &spec).unwrap().canonical_bytes(), bytes);
+    for key in [
+        "source",
+        "config_digest",
+        "candidate_commit",
+        "candidate_tree",
+        "accepted_commit",
+        "base_ref",
+        "peer",
+        "binding",
+    ] {
+        let mut changed = raw.clone();
+        changed["spec"][key] = "different".into();
+        assert_ne!(
+            Record::decode(&serde_json::to_vec(&changed).unwrap(), &[&RECEIPT])
+                .unwrap()
+                .id(),
+            record.id()
+        );
+    }
 }

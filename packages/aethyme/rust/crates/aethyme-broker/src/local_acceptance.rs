@@ -187,6 +187,9 @@ pub struct QualifiedAcceptance<'a> {
     id: RecordId,
     receipt: AcceptanceReceipt,
     evidence: &'a TrustedEvidence,
+    execution: &'a ExecutionSnapshot,
+    artifact: &'a SealedArtifact,
+    permit: &'a ProducerPermit,
 }
 impl QualifiedAcceptance<'_> {
     pub fn id(&self) -> &RecordId {
@@ -200,18 +203,13 @@ impl QualifiedAcceptance<'_> {
     }
 }
 
-fn policies(
-    carrier: &GitCarrier,
-    commit: &str,
-) -> Result<
-    (
-        Vec<u8>,
-        crate::ReviewPolicy,
-        crate::ShipPublicationPolicy,
-        Option<Vec<u8>>,
-    ),
-    AcceptanceError,
-> {
+type CommittedPolicies = (
+    Vec<u8>,
+    crate::ReviewPolicy,
+    crate::ShipPublicationPolicy,
+    Option<Vec<u8>>,
+);
+fn policies(carrier: &GitCarrier, commit: &str) -> Result<CommittedPolicies, AcceptanceError> {
     let commit = sha(commit)?;
     let text = archive::raw_file_at_commit(carrier.repo.root(), &commit, b".aethyme/config.toml")?
         .unwrap_or_default();
@@ -355,7 +353,12 @@ pub fn appoint(
     let record = canonical(&BINDING, &spec)?;
     let _archive = crate::collaboration_gc::archive_use(store)?;
     let object = archive::put_object(store, &record.canonical_bytes())?;
-    target::retain_artifacts(store, owner, &id(&spec.revision)?, &[], &[object])?;
+    let config_object = archive::put_object(store, &config)?;
+    let mut objects = vec![object, config_object];
+    if let Some(bytes) = mergify {
+        objects.push(archive::put_object(store, &bytes)?);
+    }
+    target::retain_artifacts(store, owner, &id(&spec.revision)?, &[], &objects)?;
     store.connection().execute("INSERT OR IGNORE INTO local_acceptance_bindings(id,revision,body,last_receipt) VALUES(?1,?2,?3,NULL)",params![record.id().as_str(),spec.revision,record.canonical_bytes()])?;
     Ok(AcceptanceBinding {
         id: record.id(),
@@ -455,7 +458,7 @@ fn pr_subject(
     base: &str,
 ) -> Result<(), AcceptanceError> {
     if pr["number"].as_u64() != Some(number)
-        || str_at(pr, "/base/repo/full_name")?.to_ascii_lowercase() != repo.to_ascii_lowercase()
+        || !str_at(pr, "/base/repo/full_name")?.eq_ignore_ascii_case(repo)
         || str_at(pr, "/base/ref")? != base
         || str_at(pr, "/head/sha")? != head
     {
@@ -467,6 +470,7 @@ fn review_pass(
     policy: &crate::ReviewPolicy,
     head: &str,
     pr_author: &str,
+    aggregate: Option<&str>,
     reviews: &[serde_json::Value],
     checks: &[serde_json::Value],
 ) -> Result<bool, AcceptanceError> {
@@ -475,6 +479,9 @@ fn review_pass(
     }
     match policy.evidence_adapter {
         crate::ReviewEvidenceAdapter::GithubApproval => {
+            if aggregate != Some("APPROVED") {
+                return Ok(false);
+            }
             let mut latest = std::collections::BTreeMap::<u64, (u64, &serde_json::Value)>::new();
             let mut ids = std::collections::BTreeSet::new();
             for review in reviews {
@@ -484,6 +491,9 @@ fn review_pass(
                     .ok_or(AcceptanceError::Unavailable)?;
                 if !ids.insert(rid) {
                     return Err(AcceptanceError::Unavailable);
+                }
+                if review["state"] == "COMMENTED" {
+                    continue;
                 }
                 if latest.get(&user).is_none_or(|(old, _)| rid > *old) {
                     latest.insert(user, (rid, review));
@@ -537,10 +547,10 @@ fn provider_decision(
     {
         return Err(AcceptanceError::Unavailable);
     }
-    if let ProviderRoute::Mergify { merger, .. } = route {
-        if str_at(pr, "/merged_by/login")? != merger {
-            return Err(invalid("appointed Mergify merger differs"));
-        }
+    if let ProviderRoute::Mergify { merger, .. } = route
+        && str_at(pr, "/merged_by/login")? != merger
+    {
+        return Err(invalid("appointed Mergify merger differs"));
     }
     let accepted = str_at(pr, "/merge_commit_sha")?.to_string();
     sha(&accepted)?;
@@ -612,7 +622,7 @@ fn observe_with(
     )?;
     control.commit()?;
     let mut receipt = pending.clone();
-    let observed = read_provider(broker, carrier, &binding, &intent, fixture);
+    let observed = read_provider(store, broker, carrier, &binding, &intent, fixture);
     match observed {
         Ok((decision, commit, tree, digest)) => {
             receipt.decision = decision;
@@ -655,6 +665,7 @@ fn observe_with(
         spec: receipt,
     })
 }
+#[allow(clippy::too_many_arguments)]
 fn receipt_spec(
     binding: &AcceptanceBinding,
     intent: &Intent,
@@ -692,24 +703,38 @@ struct ProviderFixture {
     pr: serde_json::Value,
     reviews: Vec<serde_json::Value>,
     checks: Vec<serde_json::Value>,
+    aggregate: Option<String>,
 }
+type ProviderObservation = (
+    ProviderDecision,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
 fn read_provider(
+    store: &CollaborationStore,
     broker: &mut Broker,
     carrier: &GitCarrier,
     binding: &AcceptanceBinding,
     intent: &Intent,
     fixture: Option<&ProviderFixture>,
-) -> Result<
-    (
-        ProviderDecision,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-    ),
-    AcceptanceError,
-> {
+) -> Result<ProviderObservation, AcceptanceError> {
     let s = &binding.spec;
-    let (config, review, publication, mergify) = policies(carrier, &s.policy_commit)?;
+    let physical = |hex: &str| -> Result<ObjectDigest, AcceptanceError> {
+        let sid =
+            aethyme_contracts::experimental_v0::SourceSnapshotId::parse(&format!("sha256:{hex}"))
+                .map_err(|_| invalid("policy digest"))?;
+        Ok(ObjectDigest::of_snapshot(&sid))
+    };
+    let config = archive::read_object(store, &physical(&s.config_digest)?)?;
+    let mergify = s
+        .mergify_digest
+        .as_ref()
+        .map(|h| archive::read_object(store, &physical(h)?).map_err(AcceptanceError::from))
+        .transpose()?;
+    let utf = std::str::from_utf8(&config).map_err(|_| invalid("policy UTF-8"))?;
+    let review = crate::ReviewPolicy::from_config_text(utf)?;
+    let publication = crate::ShipPublicationPolicy::from_config_text(utf)?;
     if ObjectDigest::of(&config).hex() != s.config_digest
         || mergify.as_ref().map(|b| ObjectDigest::of(b).hex()) != s.mergify_digest
     {
@@ -774,10 +799,45 @@ fn read_provider(
                         ),
                     }
                 };
+                let aggregate = if review.evidence_adapter
+                    == crate::ReviewEvidenceAdapter::GithubApproval
+                {
+                    match fixture {
+                        Some(f) => f.aggregate.clone(),
+                        None => {
+                            let remaining =
+                                reader.deadline.saturating_duration_since(Instant::now());
+                            if remaining.is_zero() {
+                                return Err(AcceptanceError::Unavailable);
+                            }
+                            let snapshot = crate::review::load_review_provider_snapshot_bounded(
+                                carrier.repo.root(),
+                                repo,
+                                i64::try_from(*pull_request).map_err(|_| invalid("PR number"))?,
+                                &review,
+                                remaining,
+                            )
+                            .map_err(|_| AcceptanceError::Unavailable)?;
+                            if snapshot.pr_number != *pull_request as i64
+                                || snapshot.head_sha != intent.spec.commit
+                                || snapshot.target_branch
+                                    != s.base_ref.strip_prefix("refs/heads/").unwrap_or("")
+                                || snapshot.state != "MERGED"
+                                || snapshot.is_draft
+                            {
+                                return Err(invalid("aggregate review subject"));
+                            }
+                            snapshot.review_decision
+                        }
+                    }
+                } else {
+                    None
+                };
                 if !review_pass(
                     &review,
                     &intent.spec.commit,
                     str_at(&raw, "/user/login")?,
+                    aggregate.as_deref(),
                     &reviews,
                     &checks,
                 )? {
@@ -877,9 +937,9 @@ pub fn qualify<'a>(
     broker: &mut Broker,
     carrier: &GitCarrier,
     binding: &RecordId,
-    execution: &ExecutionSnapshot,
-    artifact: &SealedArtifact,
-    permit: &ProducerPermit,
+    execution: &'a ExecutionSnapshot,
+    artifact: &'a SealedArtifact,
+    permit: &'a ProducerPermit,
     evidence: &'a TrustedEvidence,
 ) -> Result<QualifiedAcceptance<'a>, AcceptanceError> {
     let receipt = observe(store, owner, broker, carrier, binding)?;
@@ -892,9 +952,9 @@ fn qualify_receipt<'a>(
     store: &mut CollaborationStore,
     owner: &ControllerOwner,
     binding: &RecordId,
-    execution: &ExecutionSnapshot,
-    artifact: &SealedArtifact,
-    permit: &ProducerPermit,
+    execution: &'a ExecutionSnapshot,
+    artifact: &'a SealedArtifact,
+    permit: &'a ProducerPermit,
     evidence: &'a TrustedEvidence,
     receipt: AcceptanceReceipt,
 ) -> Result<QualifiedAcceptance<'a>, AcceptanceError> {
@@ -950,6 +1010,61 @@ fn qualify_receipt<'a>(
         id: record.id(),
         receipt,
         evidence,
+        execution,
+        artifact,
+        permit,
+    })
+}
+
+/// Native current permission guard. Hold through a bounded generation commit;
+/// keeping a serialized receipt never preserves producer or epoch authority.
+pub struct CurrentAcceptanceGuard {
+    _verification: verifier::VerificationGuard,
+    expires_ms: i64,
+}
+impl CurrentAcceptanceGuard {
+    /// Recheck immediately before committing a generation after materialization.
+    pub fn check_clock(&self) -> Result<(), AcceptanceError> {
+        if now()? >= self.expires_ms {
+            return Err(AcceptanceError::NotAccepted);
+        }
+        Ok(())
+    }
+}
+/// Re-observe the pinned provider representation and verifier trust immediately
+/// before consuming a private grant. A receipt alone cannot enter this API.
+pub fn current_guard(
+    store: &mut CollaborationStore,
+    owner: &ControllerOwner,
+    broker: &mut Broker,
+    carrier: &GitCarrier,
+    grant: &QualifiedAcceptance<'_>,
+) -> Result<CurrentAcceptanceGuard, AcceptanceError> {
+    let guard = verifier::acceptance_guard(
+        store,
+        owner,
+        grant.execution,
+        grant.artifact,
+        grant.permit,
+        grant.evidence,
+    )?;
+    let observed = observe(
+        store,
+        owner,
+        broker,
+        carrier,
+        &id(&grant.receipt.spec.binding)?,
+    )?;
+    if observed.spec.decision != ProviderDecision::Accepted
+        || observed.spec.accepted_commit != grant.receipt.spec.accepted_commit
+        || observed.spec.accepted_tree != grant.receipt.spec.accepted_tree
+        || now()? >= grant.expires_ms()
+    {
+        return Err(AcceptanceError::NotAccepted);
+    }
+    Ok(CurrentAcceptanceGuard {
+        _verification: guard,
+        expires_ms: grant.expires_ms(),
     })
 }
 

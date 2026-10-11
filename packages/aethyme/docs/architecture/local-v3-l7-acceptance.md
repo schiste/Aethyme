@@ -76,3 +76,23 @@ are point-in-time witnesses, not a lock on external branch movement.
 - [GitHub pull request REST API](https://docs.github.com/en/rest/pulls/pulls#get-a-pull-request): merged state and landing commit representation.
 - [GitHub check-run REST API](https://docs.github.com/en/rest/checks/runs#list-check-runs-for-a-git-reference): exact head and app identity.
 - [Git fetch](https://git-scm.com/docs/git-fetch): fetch without changing tracking refs or FETCH_HEAD.
+
+## Evidence checkpoint
+
+Fourteen acceptance tests passed, including actual native conditional Git
+publication to an appointed `accepted` ref, complete-content mapping of changed
+landing commits, wrong-source drift, policy refusal, policy retention after raw
+Git commit removal, stopped historical observation, exact review evidence,
+private verifier qualification/revocation, later-source revalidation, and an
+independent Ruby receipt vector. The sealed verifier capability in the join test
+is supplied by the existing test-only verifier fixture; it is not live GitHub or
+Mergify evidence. Mutation checks and the broader restored regression pass are
+pending at this checkpoint.
+
+`current_guard` rechecks the native provider representation and current verifier
+producer before generation preparation. Its producer/epoch locks remain held;
+`check_clock` must run immediately before committing after materialization.
+Policy bytes are separately rooted CAS objects, so ordinary Git GC cannot remove
+a binding's pinned policy. Native aggregate review decision remains required;
+comments do not replace an earlier approval, and outstanding requested changes
+cannot be counted away by another approval.
