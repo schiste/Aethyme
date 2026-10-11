@@ -1,5 +1,7 @@
 # Local v3 L5 target revisions — provisional (#666)
 
+**Last Updated**: 2026-10-11
+
 The user authorized L5 against provisional L4. This internal library model
 freezes Local targets and appoints one local controller; it does not qualify
 the structural engine, execute candidate code, verify behavior or publish
