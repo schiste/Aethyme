@@ -179,9 +179,18 @@ fn actual_old_cleanup_cannot_remove_new_retained_source_or_history() {
     let refused = run(
         &binary,
         &f,
-        &["broker", "finish", "cleanup", &f.session.to_string(), "--json"],
+        &[
+            "broker",
+            "finish",
+            "cleanup",
+            &f.session.to_string(),
+            "--json",
+        ],
     );
-    assert_eq!(refused.status.code(), Some(i32::from(crate::exit_status::REFUSED)));
+    assert_eq!(
+        refused.status.code(),
+        Some(i32::from(crate::exit_status::REFUSED))
+    );
     assert!(String::from_utf8_lossy(&refused.stderr).contains("never been accepted"));
     assert!(f.worktree.exists());
     assert_eq!(git(f.repo.path(), &["rev-parse", &branch]), tip);
@@ -194,7 +203,6 @@ fn actual_old_cleanup_cannot_remove_new_retained_source_or_history() {
         manifest
     );
     let output = run(
-
         &binary,
         &f,
         &[
