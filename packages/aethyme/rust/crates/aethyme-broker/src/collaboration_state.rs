@@ -37,7 +37,7 @@ use serde::Serialize;
 pub use crate::host_state::HostStateSource;
 
 /// The schema this binary writes.
-pub const COLLABORATION_STATE_SCHEMA_VERSION: i64 = 11;
+pub const COLLABORATION_STATE_SCHEMA_VERSION: i64 = 12;
 /// The oldest schema a database written by this binary can be read by.
 /// Unlike `host-operations.db`, a newer database stays readable by an older
 /// binary until a release raises this floor.
@@ -59,7 +59,8 @@ pub const COLLABORATION_STATE_SCHEMA_VERSION: i64 = 11;
 // unknown. As with prior floors, stop old open clients before migration.
 // Schema 9 does not honor external authority epochs. Quiesce it before restore.
 // Schema 10 cannot enforce the configured verification producer catalogue.
-const MIN_COMPATIBLE_SCHEMA: i64 = 11;
+// Schema 11 cannot fence unresolved source publication against retention release.
+const MIN_COMPATIBLE_SCHEMA: i64 = 12;
 const ROOT_DIRECTORY: &str = "collaboration";
 /// Additive schema steps after the version 1 layout (`meta` only), applied in
 /// order. Each only adds tables; after migrating, the compatibility floor is
@@ -372,6 +373,23 @@ const MIGRATIONS: &[(i64, &str)] = &[
             generation INTEGER NOT NULL,
             issued_ms INTEGER NOT NULL,
             expires_ms INTEGER NOT NULL,
+            body BLOB NOT NULL
+        ) STRICT;",
+    ),
+    (
+        12,
+        "CREATE TABLE local_source_transports (
+            intent TEXT PRIMARY KEY NOT NULL,
+            revision TEXT NOT NULL REFERENCES local_target_revisions(revision),
+            target TEXT NOT NULL REFERENCES local_targets(target),
+            peer TEXT NOT NULL, destination TEXT NOT NULL,
+            body BLOB NOT NULL, dispatched INTEGER NOT NULL CHECK(dispatched IN (0,1)),
+            observation TEXT NOT NULL CHECK(observation IN ('unobserved','available','absent','other','unavailable')),
+            receipt BLOB
+        ) STRICT;
+        CREATE TABLE local_source_transport_receipts (
+            receipt TEXT PRIMARY KEY NOT NULL,
+            intent TEXT NOT NULL REFERENCES local_source_transports(intent),
             body BLOB NOT NULL
         ) STRICT;",
     ),
@@ -1670,7 +1688,7 @@ mod tests {
         store
             .connection()
             .execute_batch(
-                "DROP TABLE local_verification_evidence; DROP TABLE local_verifier_producers; DROP TABLE local_authority_state; DROP TABLE local_wave_arrivals;
+                "DROP TABLE local_source_transport_receipts; DROP TABLE local_source_transports; DROP TABLE local_verification_evidence; DROP TABLE local_verifier_producers; DROP TABLE local_authority_state; DROP TABLE local_wave_arrivals;
                  DROP TABLE local_waves;
                  UPDATE meta SET value = '3' WHERE key = 'schema_version';
                  UPDATE meta SET value = '1' WHERE key = 'min_compatible_schema';",
@@ -1706,7 +1724,7 @@ mod tests {
         store
             .connection()
             .execute_batch(
-                "DROP TABLE local_verification_evidence; DROP TABLE local_verifier_producers; DROP TABLE local_authority_state; DROP TABLE local_wave_arrivals;
+                "DROP TABLE local_source_transport_receipts; DROP TABLE local_source_transports; DROP TABLE local_verification_evidence; DROP TABLE local_verifier_producers; DROP TABLE local_authority_state; DROP TABLE local_wave_arrivals;
                  DROP TABLE local_waves;
                  UPDATE meta SET value = '2' WHERE key = 'schema_version';",
             )

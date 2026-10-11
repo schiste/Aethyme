@@ -1437,18 +1437,15 @@ impl GitRepo {
     ) -> Result<BTreeMap<String, Option<String>>, GitError> {
         let push_url = run_git(&self.root, &["remote", "get-url", "--push", remote])?;
         let display_args = format!("ls-remote --refs <push-url> {}", destinations.join(" "));
-        let output = git_command()
+        let mut command = git_command();
+        command
             .args(["ls-remote", "--refs", "aethyme-push-evidence"])
             .args(destinations)
             .current_dir(&self.root)
             .env("GIT_CONFIG_COUNT", "1")
             .env("GIT_CONFIG_KEY_0", "remote.aethyme-push-evidence.url")
-            .env("GIT_CONFIG_VALUE_0", push_url)
-            .output()
-            .map_err(|source| GitError::Spawn {
-                args: display_args.clone(),
-                source,
-            })?;
+            .env("GIT_CONFIG_VALUE_0", push_url);
+        let output = run_git_process_output(command, &[&display_args], git_timeout())?;
         if !output.status.success() {
             return Err(GitError::Git {
                 args: display_args,
