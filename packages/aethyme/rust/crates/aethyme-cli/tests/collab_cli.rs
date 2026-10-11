@@ -1160,7 +1160,10 @@ fn lifecycle_target_changes_use_actual_ownership_versions_and_exact_epoch_stop()
         "--reason",
         "operator stop",
     ]);
-    assert_eq!(code, 3, "{stale}");
+    assert_eq!(
+        code, 3,
+        "wrong epoch must not freeze native ingress: {stale}"
+    );
     assert_eq!(stale["code"], "stale_epoch");
     let (code, stopped) = f.json(&[
         "collab",
@@ -1294,7 +1297,7 @@ fn lifecycle_export_is_exclusive_and_verified_as_historical_source_only() {
         );
     }
     let (code, refused) = f.json(&args);
-    assert_eq!(code, 1, "{refused}");
+    assert_eq!(code, 1, "existing bundle must refuse overwrite: {refused}");
     assert_eq!(refused["code"], "io");
     assert_eq!(std::fs::read(&destination).unwrap(), bytes);
     let store = input.store();

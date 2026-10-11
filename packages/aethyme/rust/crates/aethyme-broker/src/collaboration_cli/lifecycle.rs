@@ -510,7 +510,11 @@ mod tests {
                 target::acquire_controller(&mut f.store, name, issuer),
                 Err(target::TargetError::Invalid(_))
             ));
-            assert_eq!(authority::inspect(&snapshot).unwrap().state, "unbound");
+            assert_eq!(
+                authority::inspect(&snapshot).unwrap().state,
+                "unbound",
+                "invalid labels must not initialize authority"
+            );
             let rows: i64 = f
                 .store
                 .read_connection()
