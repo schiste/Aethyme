@@ -392,7 +392,8 @@ fn actual_native_local_path_retains_context_and_rebinds_without_reviving_authori
     assert_eq!(std::fs::read(&old_path).unwrap(), b"before\nafter\n");
     assert!(!new.absolute_root().join("old-only.txt").exists());
     assert_eq!(
-        std::fs::read(new.absolute_root().join("new-only.txt")).unwrap(),
+        std::fs::read(new.absolute_root().join("new-only.txt"))
+            .expect("native adoption omitted unique new-root output"),
         b"adopted"
     );
     assert!(!f._repo.path().join("new-only.txt").exists());
