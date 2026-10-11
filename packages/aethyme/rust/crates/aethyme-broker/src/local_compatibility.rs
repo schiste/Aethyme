@@ -394,3 +394,5 @@ fn overlapping_shared_state_root_refuses_with_a_separate_location_action() {
 }
 #[cfg(target_os = "macos")]
 mod old_binary;
+
+mod independence;

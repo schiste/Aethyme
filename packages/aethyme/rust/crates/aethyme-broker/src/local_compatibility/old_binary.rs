@@ -59,7 +59,7 @@ fn run(binary: &Path, f: &Fixture, args: &[&str]) -> Output {
     );
     output
 }
-fn assert_network_denied() {
+pub(super) fn assert_network_denied() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let port = listener.local_addr().unwrap().port().to_string();
