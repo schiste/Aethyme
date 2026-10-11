@@ -634,7 +634,11 @@ impl<'a> Job<'a> {
             ));
         }
         if let Some(run) = self.admission.run() {
-            run.created(&name, id.clone())?;
+            run.created(
+                crate::execution_resources::ObjectKind::Container,
+                &name,
+                id.clone(),
+            )?;
         }
         self.containers.push(id.clone());
         Ok(id)
@@ -694,7 +698,11 @@ impl<'a> Job<'a> {
             ));
         }
         if let Some(run) = self.admission.run() {
-            run.created(&name, name.clone())?;
+            run.created(
+                crate::execution_resources::ObjectKind::Volume,
+                &name,
+                name.clone(),
+            )?;
         }
         self.volumes.push(name.clone());
         Ok(name)
@@ -1007,7 +1015,12 @@ impl<'a> Job<'a> {
             if cancel.load(Ordering::SeqCst) {
                 return Err(SupervisorError::Cancelled);
             }
-            authorize()?;
+            // The dispatch guard already holds current authority and the ledger
+            // transaction until acknowledgement. Re-entering it would start a
+            // second transaction on the same connection.
+            if dispatch.is_none() {
+                authorize()?;
+            }
             if started.elapsed() > Duration::from_millis(limits.timeout_ms) {
                 return Err(SupervisorError::TimedOut);
             }

@@ -437,7 +437,7 @@ impl Run {
         if file.metadata()?.len() > 1024 * 1024 {
             return Err(ResourceError::Stale);
         }
-        let journal: Journal = serde_json::from_reader(file)?;
+        let mut journal: Journal = serde_json::from_reader(file)?;
         if journal.schema != 1
             || journal.run != run
             || journal.daemon != policy.daemon
@@ -455,6 +455,14 @@ impl Run {
             }
         }
         let coordinator = HostResourceCoordinator::open(&policy.host_state)?;
+        if journal.grant.is_none() {
+            // No Docker action is allowed before the acquired grant is durable.
+            if !journal.objects.is_empty() {
+                return Err(ResourceError::Stale);
+            }
+            journal.grant = coordinator.recover_request(&journal.request)?;
+            save(&root, &journal)?;
+        }
         Ok(Self {
             root,
             _lock: lock,
@@ -469,9 +477,20 @@ impl Run {
         if !self.journal.cleaned {
             return Err(ResourceError::Stale);
         }
-        let grant = self.journal.grant.as_ref().ok_or(ResourceError::Deferred(
-            "host acquisition outcome requires reconciliation".into(),
-        ))?;
+        let Some(grant) = self.journal.grant.as_ref() else {
+            // Under the exclusive run lock, an exact request absent from the
+            // coordinator and an empty inventory prove admission never acquired.
+            if !self.journal.objects.is_empty()
+                || self
+                    .coordinator
+                    .recover_request(&self.journal.request)?
+                    .is_some()
+            {
+                return Err(ResourceError::Stale);
+            }
+            return Ok(());
+        };
+
         self.coordinator.release(
             &grant.lease.lease_id,
             grant.lease.generation,
@@ -486,7 +505,11 @@ impl Run {
         generation: String,
     ) -> Result<(), ResourceError> {
         if !name.starts_with(&format!("aethyme-{}-", self.journal.run))
-            || self.journal.objects.iter().any(|o| o.name == name)
+            || self
+                .journal
+                .objects
+                .iter()
+                .any(|o| o.kind == kind && o.name == name)
         {
             return Err(ResourceError::Stale);
         }
@@ -499,12 +522,17 @@ impl Run {
         });
         save(&self.root, &self.journal)
     }
-    pub(crate) fn created(&mut self, name: &str, id: String) -> Result<(), ResourceError> {
+    pub(crate) fn created(
+        &mut self,
+        kind: ObjectKind,
+        name: &str,
+        id: String,
+    ) -> Result<(), ResourceError> {
         let object = self
             .journal
             .objects
             .iter_mut()
-            .find(|o| o.name == name && o.id.is_none())
+            .find(|o| o.kind == kind && o.name == name && o.id.is_none())
             .ok_or(ResourceError::Stale)?;
         object.id = Some(id);
         save(&self.root, &self.journal)

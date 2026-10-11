@@ -959,6 +959,7 @@ pub(crate) fn authorize_execution(
     envelope: Units,
 ) -> Result<(), BudgetError> {
     let _authority = target::authorize(store, owner)?;
+    reject_overrun(store.read_connection())?;
     let reservation = owned(store, owner, &attempt.reservation)?;
     let (wave, state) = current(
         store,

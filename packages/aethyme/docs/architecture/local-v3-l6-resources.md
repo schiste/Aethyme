@@ -8,7 +8,7 @@ appointed resource policy, current exact wave/candidate/execution identity,
 remaining envelope and external epoch. Native dispatch keeps the ledger stable
 through daemon start acknowledgement. An attempt cannot dispatch a second run.
 
-The native and daemon memory/disk/process/job pools reserve conservative bounds
+The native memory/disk pools and daemon memory/disk/process/job pools reserve conservative bounds
 for candidate limits, helpers, materialization and archive copies. Native disk
 floors cover temporary and project filesystems. A separately pinned trusted
 capacity-tool image probes only an empty volume created by the run; source,
@@ -19,6 +19,9 @@ Unmanaged host work can still cause infrastructure failure; capacity admission
 is cooperative and does not attest the entire host's available memory.
 
 Resource policies are explicit operator appointments, not candidate input.
+All appointed processes and repositories on one host must use one stable
+coordinator database and journal root, including across native runtime upgrades.
+Changing that root creates a separate authority and is not an approved retry.
 Both the host-state parent and temporary root must be private. Host journals
 must resolve outside the collaboration project backup directory. The resource
 profile needs the operator to select floors and pools appropriate to the host;

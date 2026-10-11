@@ -217,7 +217,7 @@ fn disk_floor_and_insufficient_budget_refuse_before_daemon_intents() {
     let mut p = policy(host.path());
     let (mut f, owner, execution, wave) = subject(p.runtime.clone(), p.meter_image.clone());
     let a = attempt(&mut f, &owner, &execution, &wave, envelope(), b"floor");
-    p.host_floor_bytes = u64::MAX - 10;
+    p.host_floor_bytes = u64::MAX / 2;
     assert!(
         Run::admit(
             &p,
@@ -372,7 +372,8 @@ fn exact_cleanup_receipt_settles_once_and_does_not_replenish_budget() {
     .unwrap();
     let name = format!("aethyme-{id}-source");
     run.intent(ObjectKind::Volume, name.clone(), id).unwrap();
-    run.created(&name, name.clone()).unwrap();
+    run.created(ObjectKind::Volume, &name, name.clone())
+        .unwrap();
     assert!(run.cleaned().is_err());
     run.removed(ObjectKind::Volume, &name).unwrap();
     run.cleaned().unwrap();
@@ -420,4 +421,626 @@ fn cache_keys_are_exact_and_every_result_reuse_is_disabled() {
             key.trim_start_matches("sha256:")
         );
     }
+}
+#[test]
+fn committed_host_acquisition_is_recovered_without_reallocation() {
+    for state in ["active", "quarantined", "expired", "released"] {
+        let host = tempfile::tempdir().unwrap();
+        let p = policy(host.path());
+        let (mut f, owner, execution, wave) = subject(p.runtime.clone(), p.meter_image.clone());
+        let a = attempt(
+            &mut f,
+            &owner,
+            &execution,
+            &wave,
+            envelope(),
+            b"crash-window",
+        );
+        let id = "a".repeat(64);
+        let mut run = Run::admit(
+            &p,
+            &f.store,
+            &owner,
+            &execution,
+            &a,
+            id.clone(),
+            "unix:///test".into(),
+            envelope(),
+        )
+        .unwrap();
+        let grant = run.journal.grant.clone().unwrap();
+        if state == "released" {
+            run.coordinator
+                .release(
+                    &grant.lease.lease_id,
+                    grant.lease.generation,
+                    &grant.ownership_token,
+                )
+                .unwrap();
+        }
+        if state == "quarantined" {
+            run.coordinator
+                .quarantine(
+                    &grant.lease.lease_id,
+                    grant.lease.generation,
+                    &grant.ownership_token,
+                )
+                .unwrap();
+        }
+        if state == "expired" {
+            rusqlite::Connection::open(&p.host_state)
+                .unwrap()
+                .execute("UPDATE resource_leases SET expires_at=0", [])
+                .unwrap();
+        }
+        // Model a process dying after acquire committed but before its next
+        // durable journal save. Drop sees the pre-save journal too.
+        run.journal.grant = None;
+        save(&run.root, &run.journal).unwrap();
+        drop(run);
+        let mut recovery = Run::recover(&p, &id).unwrap();
+        let recovered = recovery.journal.grant.as_ref().unwrap();
+        assert_eq!(recovered.lease.lease_id, grant.lease.lease_id);
+        assert_eq!(recovered.lease.generation, grant.lease.generation);
+        assert_eq!(recovered.ownership_token, grant.ownership_token);
+        recovery.cleaned().unwrap();
+        recovery.release_clean().unwrap();
+        recovery.release_clean().unwrap();
+        let leases = recovery.coordinator.list(true).unwrap();
+        assert_eq!(leases.len(), 1);
+        assert_eq!(leases[0].state, crate::resources::HostLeaseState::Released);
+        // An intent that crashed before coordinator acquisition must never
+        // acquire on cleanup, or leave an invented lease to reconcile.
+        let mut missing: Journal =
+            serde_json::from_value(serde_json::to_value(&recovery.journal).unwrap()).unwrap();
+        missing.run = "b".repeat(64);
+        missing.request.run_id = missing.run.clone();
+        missing.request.request_id = format!("local-exec:{}", missing.run);
+        missing.grant = None;
+        missing.cleaned = false;
+        save(&recovery.root, &missing).unwrap();
+        let mut before_acquire = Run::recover(&p, &missing.run).unwrap();
+        assert!(before_acquire.journal.grant.is_none());
+        before_acquire.cleaned().unwrap();
+        before_acquire.release_clean().unwrap();
+        assert_eq!(before_acquire.coordinator.list(true).unwrap().len(), 1);
+    }
+}
+#[test]
+fn pending_execution_is_blocked_by_another_reservations_overrun() {
+    let host = tempfile::tempdir().unwrap();
+    let p = policy(host.path());
+    let (mut f, owner, execution, wave) = subject(p.runtime.clone(), p.meter_image.clone());
+    let pending = attempt(
+        &mut f,
+        &owner,
+        &execution,
+        &wave,
+        envelope(),
+        b"pending-before-overrun",
+    );
+    let other = attempt(
+        &mut f,
+        &owner,
+        &execution,
+        &wave,
+        envelope(),
+        b"other-overrun",
+    );
+    let mut too_much = envelope().units().unwrap();
+    too_much.time_ms += 1;
+    let receipt =
+        aethyme_contracts::experimental_v0::RecordId::parse(&digest(b"overrun receipt")).unwrap();
+    assert!(matches!(
+        budget::settle(&mut f.store, &owner, &other, too_much, &receipt),
+        Err(budget::BudgetError::UsageExceeded)
+    ));
+    assert!(matches!(
+        budget::authorize_execution(
+            &f.store,
+            &owner,
+            &pending,
+            &execution,
+            envelope().units().unwrap()
+        ),
+        Err(budget::BudgetError::Capacity("unreconciled overrun"))
+    ));
+    assert!(matches!(
+        budget::execution_guard(
+            &f.store,
+            &owner,
+            &pending,
+            &execution,
+            envelope().units().unwrap()
+        ),
+        Err(budget::BudgetError::Capacity("unreconciled overrun"))
+    ));
+    assert!(
+        Run::admit(
+            &p,
+            &f.store,
+            &owner,
+            &execution,
+            &pending,
+            "a".repeat(64),
+            "unix:///test".into(),
+            envelope()
+        )
+        .is_err()
+    );
+    assert_eq!(
+        budget::load(&f.store, pending.reservation()).unwrap().state,
+        budget::State::CompletionPending
+    );
+    assert_eq!(
+        std::fs::read_dir(host.path().join("local-execution-journal"))
+            .unwrap()
+            .count(),
+        0
+    );
+}
+#[test]
+#[ignore = "requires explicitly selected cached public Linux Docker image"]
+fn public_admitted_build_and_verifier_wait_for_delayed_start_acknowledgement() {
+    use crate::execution_supervisor::DockerExecutor;
+    use crate::execution_verifier as verifier;
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::atomic::AtomicBool;
+    let host = tempfile::tempdir().unwrap();
+    let wrapper_dir = tempfile::tempdir().unwrap();
+    let cli = std::env::var("AETHYME_DOCKER_CLI").expect("trusted cached Docker client");
+    let image = std::env::var("AETHYME_DOCKER_TEST_IMAGE").expect("cached public image digest");
+    assert!(!cli.contains('\''));
+    let wrapper = wrapper_dir.path().join("docker-delayed-start");
+    let marker = wrapper_dir.path().join("delayed");
+    let lose_remove = wrapper_dir.path().join("lose-remove-response");
+    let pre_ack = wrapper_dir.path().join("observed-before-ack");
+    std::fs::write(
+        &wrapper,
+        format!(
+            r#"#!/bin/sh
+set -eu
+if test "${{3-}} ${{4-}} ${{5-}} ${{6-}}" = 'container start --attach --interactive'; then
+  name=$('{}' --host "$2" container inspect --format '{{{{.Name}}}}' "$7")
+  case "$name" in *-check) printf delayed >> '{}'; sleep 1;; esac
+fi
+if test "${{3-}} ${{4-}}" = 'container inspect' && test -e '{}'; then
+  state=$('{}' --host "$2" container inspect --format '{{{{.State.StartedAt}}}}|{{{{.Name}}}}' "$5")
+  case "$state" in 0001-*-check) printf unacknowledged >> '{}';; esac
+fi
+if test "${{3-}} ${{4-}}" = 'container rm' && test -e '{}'; then rm '{}'; '{}' "$@"; exit 1; fi
+exec '{}' "$@"
+"#,
+            cli,
+            marker.display(),
+            marker.display(),
+            cli,
+            pre_ack.display(),
+            lose_remove.display(),
+            lose_remove.display(),
+            cli,
+            cli
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let executor = DockerExecutor::probe(wrapper).unwrap();
+    let mut p = policy(host.path());
+    p.runtime = executor.runtime().id();
+    p.daemon = executor.runtime().daemon_id.clone();
+    p.meter_image = image.clone();
+    let executor = executor.with_resources(p.clone()).unwrap();
+    let mut f = Fixture::new();
+    let inventory = verifier::AssertionInventory::new(vec![verifier::AssertionCase {
+        id: "echo".into(),
+        arguments: vec![],
+        stdin_hex: "68656c6c6f0a".into(),
+        exit_code: 0,
+        stdout: digest(b"hello\n"),
+        stderr: digest(b""),
+    }])
+    .unwrap();
+    std::fs::write(
+        f._repo.path().join("inventory.json"),
+        inventory.canonical_bytes(),
+    )
+    .unwrap();
+    crate::local_target::tests::git(f._repo.path(), &["add", "inventory.json"]);
+    crate::local_target::tests::git(
+        f._repo.path(),
+        &["commit", "-qm", "public resource fixture harness"],
+    );
+    let head = crate::collaboration_archive::CommitOid::parse(&crate::local_target::tests::git(
+        f._repo.path(),
+        &["rev-parse", "HEAD"],
+    ))
+    .unwrap();
+    let harness =
+        crate::collaboration_archive::retain_snapshot(&mut f.store, f._repo.path(), &head)
+            .unwrap()
+            .snapshot_id
+            .to_string();
+    let command = CommandSpec {
+        program: "/bin/sh".into(),
+        arguments: vec!["/artifact/app.sh".into()],
+        environment: Default::default(),
+    };
+    let verifier_policy = verifier::VerifierPolicy {
+        profile: verifier::PROFILE.into(),
+        runtime: executor.runtime().id(),
+        image: image.clone(),
+        harness: harness.clone(),
+        inventory: inventory.id().to_string(),
+        command: command.clone(),
+        max_age_ms: 60_000,
+    };
+    let owner =
+        target::acquire_controller(&mut f.store, "admitted-resource-test", "appointed").unwrap();
+    let mut ts = f.spec();
+    ts.selected = vec!["A".into()];
+    ts.acceptance_policy = verifier_policy.record().unwrap().id().to_string();
+    let revision = target::propose_revision(&mut f.store, &owner, ts).unwrap();
+    target::select_revision(&mut f.store, &owner, &revision.id).unwrap();
+    wave::available(&mut f.store, &owner, "A", 0).unwrap();
+    let wave::Admission::Frozen(w) = wave::admit(
+        &mut f.store,
+        &owner,
+        wave::WavePolicy {
+            debounce_ms: 0,
+            ..Default::default()
+        },
+        0,
+    )
+    .unwrap() else {
+        panic!("wave")
+    };
+    let w = wave::compose(&mut f.store, &owner, f._repo.path(), &w.id).unwrap();
+    let held = target::status(&f.store, owner.target()).unwrap();
+    target::resume(&mut f.store, &owner, held.version).unwrap();
+    let permit =
+        verifier::configure(&mut f.store, &owner, "native", None, verifier_policy).unwrap();
+    let limits = ResourceLimits {
+        timeout_ms: 10_000,
+        memory_bytes: 64 * MIB,
+        output_bytes: MIB,
+        pids: 32,
+    };
+    let execution = snapshot::freeze(
+        &mut f.store,
+        &owner,
+        &revision.id,
+        ExecutionSpec {
+            candidate_source: w.candidate_snapshot.clone().unwrap().to_string(),
+            preparation: None,
+            dependencies: None,
+            configuration: None,
+            harness,
+            dataset: None,
+            assertion_inventory: inventory.id().to_string(),
+            materialization_profile: snapshot::MATERIALIZATION_PROFILE.into(),
+            profile: LinuxProfile {
+                build_image: image.clone(),
+                verifier_image: image,
+                architecture: executor.runtime().architecture.clone(),
+                runtime_profile: executor.runtime().id(),
+                build_limits: limits,
+                verifier_limits: limits,
+            },
+            build: CommandSpec {
+                program: "/bin/sh".into(),
+                arguments: vec![
+                    "-c".into(),
+                    "printf '#!/bin/sh\ncat\n' > /outputs/app.sh".into(),
+                ],
+                environment: Default::default(),
+            },
+            verify: command,
+        },
+    )
+    .unwrap();
+    let cap = Units {
+        time_ms: 1_000_000_000,
+        memory_bytes: 64 * 1024 * MIB as i64,
+        disk_bytes: 64 * 1024 * MIB as i64,
+        slots: 100,
+        ..Default::default()
+    };
+    budget::configure_project(
+        &mut f.store,
+        &owner,
+        budget::ProjectPolicy {
+            authorization: digest(b"live operator"),
+            price_profile: digest(b"price"),
+            cap,
+            recovery_headroom: Units::default(),
+            mandatory_headroom: Units::default(),
+            max_root_reservations: 32,
+        },
+    )
+    .unwrap();
+    budget::authorize_objective(&mut f.store, &owner, cap).unwrap();
+    let build_attempt = attempt(
+        &mut f,
+        &owner,
+        &execution,
+        &w.id,
+        build_envelope(&execution).unwrap(),
+        b"live build",
+    );
+    let built = executor
+        .build(
+            &mut f.store,
+            &owner,
+            &execution,
+            &build_attempt,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+    assert!(
+        built.artifact().is_some(),
+        "{:?}: {:?}",
+        built.outcome(),
+        built.detail()
+    );
+    let artifact = built.into_artifact().unwrap();
+    let verification_attempt = attempt(
+        &mut f,
+        &owner,
+        &execution,
+        &w.id,
+        verify_envelope(&execution).unwrap(),
+        b"live independent verify",
+    );
+    let evidence = verifier::verify(
+        &mut f.store,
+        &owner,
+        &execution,
+        &artifact,
+        &permit,
+        &executor,
+        &verification_attempt,
+        &AtomicBool::new(false),
+    )
+    .unwrap();
+    assert_eq!(evidence.outcome(), verifier::VerificationOutcome::Passed);
+    verifier::applicable(&f.store, &owner, &execution, &artifact, &permit, &evidence).unwrap();
+    assert!(
+        marker.exists(),
+        "the controlled acknowledgement delay must execute"
+    );
+    assert!(
+        pre_ack.exists(),
+        "the native verifier must observe an unacknowledged dispatch while its ledger guard is held"
+    );
+    for a in [&build_attempt, &verification_attempt] {
+        let reservation = budget::load(&f.store, a.reservation()).unwrap();
+        assert_eq!(reservation.state, budget::State::PartlyConsumed);
+        assert_eq!(reservation.spent, a.remaining());
+    }
+    assert!(
+        HostResourceCoordinator::open(&p.host_state)
+            .unwrap()
+            .list(false)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        target::status(&f.store, owner.target()).unwrap().phase,
+        target::Phase::Verifying
+    );
+    for entry in std::fs::read_dir(host.path().join("local-execution-journal")).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().is_some_and(|e| e == "json") {
+            let journal: Journal = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            assert!(journal.cleaned && journal.settled);
+            assert!(journal.objects.iter().all(|o| o.removed && o.id.is_some()));
+            executor.recover_resources(&journal.run).unwrap();
+        }
+    } // Simulate a dead client with an acknowledged stopped container and volume,
+    // then lose a successful remove response. Only exact owned resources may
+    // disappear; retry must inspect absence, never rerun candidate work.
+    let recovery_attempt = attempt(
+        &mut f,
+        &owner,
+        &execution,
+        &w.id,
+        envelope(),
+        b"interrupted native cleanup",
+    );
+    let id: String = f
+        .store
+        .read_connection()
+        .query_row("SELECT lower(hex(randomblob(32)))", [], |r| r.get(0))
+        .unwrap();
+    let mut run = Run::admit(
+        &p,
+        &f.store,
+        &owner,
+        &execution,
+        &recovery_attempt,
+        id.clone(),
+        executor.endpoint().into(),
+        envelope(),
+    )
+    .unwrap();
+    let volume = format!("aethyme-{id}-recovery-volume");
+    let name = format!("aethyme-{id}-recovery-container");
+    let label = format!("aethyme.local.generation={id}");
+    let docker = |args: &[&str]| {
+        let output = std::process::Command::new(&cli)
+            .args(["--host", executor.endpoint()])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
+    };
+    run.intent(ObjectKind::Volume, volume.clone(), id.clone())
+        .unwrap();
+    let volume_id = docker(&[
+        "volume", "create", "--driver", "local", "--label", &label, &volume,
+    ]);
+    run.created(ObjectKind::Volume, &volume, volume_id).unwrap();
+    run.intent(ObjectKind::Container, name.clone(), id).unwrap();
+    let container_id = docker(&[
+        "container",
+        "create",
+        "--name",
+        &name,
+        "--label",
+        &label,
+        "--network",
+        "none",
+        "--mount",
+        &format!("type=volume,source={volume},target=/empty,readonly"),
+        &p.meter_image,
+        "/bin/true",
+    ]);
+    run.created(ObjectKind::Container, &name, container_id.clone())
+        .unwrap();
+    assert!(
+        executor.recover_resources(&run.journal.run).is_err(),
+        "live reader fences recovery"
+    );
+    let recovery_id = run.journal.run.clone();
+    drop(run);
+    std::fs::write(&lose_remove, b"lose only this test removal response").unwrap();
+    assert!(executor.recover_resources(&recovery_id).is_err());
+    // Container removal happened; its acknowledgement was lost. The volume and
+    // capacity remain until exact absence and subsequent cleanup are observed.
+    assert!(
+        !HostResourceCoordinator::open(&p.host_state)
+            .unwrap()
+            .list(false)
+            .unwrap()
+            .is_empty()
+    );
+    executor.recover_resources(&recovery_id).unwrap();
+    executor.recover_resources(&recovery_id).unwrap();
+    assert!(
+        HostResourceCoordinator::open(&p.host_state)
+            .unwrap()
+            .list(false)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        budget::load(&f.store, recovery_attempt.reservation())
+            .unwrap()
+            .state,
+        budget::State::CompletionPending
+    );
+    assert!(
+        docker(&[
+            "container",
+            "ls",
+            "--all",
+            "--quiet",
+            "--no-trunc",
+            "--filter",
+            &format!("id={container_id}")
+        ])
+        .is_empty()
+    );
+    assert!(
+        docker(&[
+            "volume",
+            "ls",
+            "--quiet",
+            "--filter",
+            &format!("name=^{volume}$")
+        ])
+        .is_empty()
+    );
+}
+#[test]
+fn journal_object_identity_includes_kind_and_recovery_rejects_generation_drift() {
+    let host = tempfile::tempdir().unwrap();
+    let p = policy(host.path());
+    let (mut f, owner, execution, wave) = subject(p.runtime.clone(), p.meter_image.clone());
+    let a = attempt(&mut f, &owner, &execution, &wave, envelope(), b"namespaces");
+    let id = "a".repeat(64);
+    let mut run = Run::admit(
+        &p,
+        &f.store,
+        &owner,
+        &execution,
+        &a,
+        id.clone(),
+        "unix:///test".into(),
+        envelope(),
+    )
+    .unwrap();
+    let name = format!("aethyme-{id}-same-name");
+    run.intent(ObjectKind::Volume, name.clone(), id.clone())
+        .unwrap();
+    run.intent(ObjectKind::Container, name.clone(), id.clone())
+        .unwrap();
+    assert!(
+        run.intent(ObjectKind::Container, name.clone(), id.clone())
+            .is_err()
+    );
+    run.created(ObjectKind::Container, &name, "b".repeat(64))
+        .unwrap();
+    assert!(run.journal.objects[0].id.is_none());
+    run.created(ObjectKind::Volume, &name, name.clone())
+        .unwrap();
+    assert_eq!(
+        run.journal.objects[1].id.as_deref(),
+        Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+    );
+    let original_request = run.journal.request.clone();
+    let coordinator = HostResourceCoordinator::open(&p.host_state).unwrap();
+    let mut changed_request = original_request;
+    changed_request.repository = "other project".into();
+    assert!(coordinator.recover_request(&changed_request).is_err());
+    run.journal.objects[0].generation = "another generation".into();
+    save(&run.root, &run.journal).unwrap();
+    drop(run);
+    assert!(Run::recover(&p, &id).is_err());
+}
+#[test]
+fn host_journals_cannot_enter_the_project_backup_root() {
+    use std::os::unix::fs::PermissionsExt;
+    let host = tempfile::tempdir().unwrap();
+    let mut p = policy(host.path());
+    let (mut f, owner, execution, wave) = subject(p.runtime.clone(), p.meter_image.clone());
+    let a = attempt(
+        &mut f,
+        &owner,
+        &execution,
+        &wave,
+        envelope(),
+        b"backup-root",
+    );
+    std::fs::set_permissions(
+        f.store.project_dir(),
+        std::fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    p.host_state = f.store.project_dir().join("host-resources.db");
+    assert!(
+        Run::admit(
+            &p,
+            &f.store,
+            &owner,
+            &execution,
+            &a,
+            "a".repeat(64),
+            "unix:///test".into(),
+            envelope()
+        )
+        .is_err()
+    );
+    assert!(!p.host_state.exists());
+    assert!(
+        !f.store
+            .project_dir()
+            .join("local-execution-journal")
+            .exists()
+    );
 }
