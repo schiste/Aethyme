@@ -973,10 +973,10 @@ fn charge_usage(
     if assigned {
         return Err(BudgetError::ReceiptReplay);
     }
-    if let Some(observed) = r.observed_overrun {
-        if !observed.within(usage) {
-            return Err(BudgetError::UsageExceeded);
-        }
+    // A disputed overrun has no qualified correction workflow in this model.
+    // Repeating observations cannot mint rows or erase the recorded lower bound.
+    if r.observed_overrun.is_some() {
+        return Err(BudgetError::UsageExceeded);
     }
     tx.execute(
         "INSERT INTO local_budget_receipts(receipt,reservation,attempt,usage) VALUES(?1,?2,?3,?4)",

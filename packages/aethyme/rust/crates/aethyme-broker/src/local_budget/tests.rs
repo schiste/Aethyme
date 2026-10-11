@@ -38,6 +38,9 @@ fn request(n: char, amount: i64, kind: WorkKind) -> Request {
     }
 }
 fn setup() -> (Fixture, ControllerOwner, RecordId) {
+    setup_with_cap(10)
+}
+fn setup_with_cap(cap: i64) -> (Fixture, ControllerOwner, RecordId) {
     let mut f = Fixture::new();
     let owner = target::acquire_controller(&mut f.store, "target", "appointed").unwrap();
     let spec = f.spec();
@@ -58,7 +61,7 @@ fn setup() -> (Fixture, ControllerOwner, RecordId) {
         panic!("{admission:?}")
     };
     configure_project(&mut f.store, &owner, policy(10, 1, 3)).unwrap();
-    authorize_objective(&mut f.store, &owner, units(10)).unwrap();
+    authorize_objective(&mut f.store, &owner, units(cap)).unwrap();
     (f, owner, wave.id)
 }
 fn receipt() -> RecordId {
@@ -442,24 +445,12 @@ fn concurrent_targets_and_new_objectives_share_one_project_cap() {
         let b = &barrier;
         let a = scope.spawn(move || {
             b.wait();
-            reserve(
-                &mut s1,
-                &one,
-                &w1,
-                request('a', 6, WorkKind::Composition),
-                0,
-            )
+            reserve(&mut s1, &one, &w1, request('a', 6, WorkKind::Recovery), 0)
         });
         let b = &barrier;
         let c = scope.spawn(move || {
             b.wait();
-            reserve(
-                &mut s2,
-                &two,
-                &w2,
-                request('b', 6, WorkKind::Composition),
-                0,
-            )
+            reserve(&mut s2, &two, &w2, request('b', 6, WorkKind::Recovery), 0)
         });
         [a.join().unwrap(), c.join().unwrap()]
     });
@@ -713,4 +704,68 @@ fn exact_root_and_delegation_replays_return_history_after_stop_and_expiry() {
         begin_attempt(&mut f.store, &owner, &root.id, 2000),
         Err(BudgetError::Stale)
     ));
+}
+
+#[test]
+fn objective_caps_and_each_unit_dimension_are_enforced() {
+    let (mut f, owner, w) = setup_with_cap(4);
+    let mut req = request('a', 1, WorkKind::Recovery);
+    req.units.spend_microunits = 5;
+    assert!(matches!(
+        reserve(&mut f.store, &owner, &w, req, 0),
+        Err(BudgetError::Capacity("objective"))
+    ));
+    let r = reserve(
+        &mut f.store,
+        &owner,
+        &w,
+        request('b', 4, WorkKind::Recovery),
+        0,
+    )
+    .unwrap();
+    assert_eq!(r.allocated, units(4));
+    assert!(matches!(
+        reserve(
+            &mut f.store,
+            &owner,
+            &w,
+            request('c', 1, WorkKind::Recovery),
+            0
+        ),
+        Err(BudgetError::Capacity("objective"))
+    ));
+}
+
+#[test]
+fn repeated_overrun_reconciliation_cannot_mint_unbounded_receipt_rows() {
+    let (mut f, owner, w) = setup();
+    let r = reserve(
+        &mut f.store,
+        &owner,
+        &w,
+        request('a', 2, WorkKind::Composition),
+        0,
+    )
+    .unwrap();
+    let attempt = begin_attempt(&mut f.store, &owner, &r.id, 0).unwrap();
+    assert!(matches!(
+        settle(&mut f.store, &owner, &attempt, units(3), &receipt()),
+        Err(BudgetError::UsageExceeded)
+    ));
+    let r = load(&f.store, &r.id).unwrap();
+    for _ in 0..3 {
+        assert!(matches!(
+            reconcile(&mut f.store, &owner, &r.id, r.version, units(3), &receipt()),
+            Err(BudgetError::UsageExceeded)
+        ));
+        assert_eq!(load(&f.store, &r.id).unwrap(), r);
+    }
+    let count: i64 = f
+        .store
+        .read_connection()
+        .query_row("SELECT count(*) FROM local_budget_receipts", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(count, 1);
 }
