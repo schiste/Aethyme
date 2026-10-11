@@ -4,7 +4,7 @@ Last Updated: 2026-10-11
 
 Issue #676; plan sections 6.2, 10.2, 10.6 and 15.1 L8; D23/D26/D27.
 This records the provisional Local adapter implementation contract. Controlled
-qualification is in progress; it does not implement or qualify the Coordination service.
+Local qualification is recorded below; the Coordination service is separately owned.
 
 ## One local store and explicit peer binding
 
@@ -89,6 +89,9 @@ capture operation constraints and every original row value. A real capture row
 may receive an immutable typed metadata envelope checked against its capture
 receipt. Its capture operation, sequence, payload receipt and global delivered
 marker stay intact; native peer ACKs bind the envelope identity independently.
+Staging a capture pins its authenticated receipt CAS object and immutable envelope
+in the same transaction. Releasing captured source retention can reclaim source
+bytes while those metadata records remain readable and deliverable.
 Typed metadata and incoming event objects use existing CAS/object-pin GC roots.
 Those pins retain metadata only, never offered source bytes or permissions.
 
@@ -105,7 +108,20 @@ complete durable cursor.
 `Delivery::AlreadyAcknowledged` reports retained historical acknowledgment
 without refreshing native remote authorization. It promises no current source
 access or visibility. Cached peer projections always require fresh native access.
-Twenty-three controlled schedules passed, including real capture delivery,
+Twenty-six controlled schedules passed, including real capture delivery,
 schema 14 migration, lost ACK/restart, native and Local revocation, reorder/gaps,
-forged ACKs and mixed/incomplete snapshots. Buffer exhaustion and actual metadata GC reclamation also passed. Final independent
-re-review, guard removals, restored regressions and strict Clippy are pending.
+forged ACKs, mixed/incomplete snapshots, buffer exhaustion and actual metadata GC.
+Capture readiness, archive/index integrity, optional brief omission and expected
+epoch are checked. The capture-retention schedule releases and reclaims source
+bytes while proving the receipt and envelope remain deliverable as metadata.
+
+Independent adversarial review is clear. Nineteen production guard removals each
+caused a named test failure (exit 101); compilation failures and zero-test runs
+were not credited. Exact source was restored. Separately, an attached in-memory
+database fault proved the isolation fixture still rejects an additional database;
+SQLite's transient empty-filename `temp` schema is permitted. Restored regressions
+passed 423 selected tests with six ignored helper/live-profile tests, including
+all 26 exchange schedules, 149 collaboration tests, existing execution and
+publication checks, and discarded-result/spelling/documentation ratchets. Strict
+Clippy for broker library and tests passed with warnings denied. These are Local
+controlled-adapter results; live remote peer interoperability is the Q5 path.
