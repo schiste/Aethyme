@@ -1408,10 +1408,8 @@ impl Protection {
 
 // ----------------------------------------------------------- the allowance
 
-/// The ledger is created on first use, outside the numbered migrations:
-/// it only adds a table no other reader consults, and the L3 stack claims
-/// the next schema numbers until the stacks merge. That migration must
-/// adopt a table this statement already created.
+/// Idempotent initialization for existing callers. Collaboration schema 7
+/// adopts this ledger without resetting already charged attempts (#666).
 const LEDGER: &str = "CREATE TABLE IF NOT EXISTS resolution_attempts (
      attempt_id INTEGER PRIMARY KEY,
      decision_key TEXT NOT NULL,

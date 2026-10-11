@@ -212,6 +212,16 @@ pub(super) fn run_status(parsed: Parsed) -> Result<(), UsageError> {
                 );
             }
         }
+        if let Some(fence) = &status.collaboration_fence {
+            out!();
+            out!(
+                "Collaboration fence: broker.db requires schema {} or newer ({}); binaries \
+                 older than that cannot open this repository, and this does not lift if \
+                 required capture is turned off",
+                fence.min_compatible_schema,
+                fence.reason
+            );
+        }
         if !status.outstanding_entry_exposures.is_empty() {
             out!();
             out!(

@@ -36,8 +36,11 @@ mod cleanup_resolve;
 mod clock;
 pub mod collaboration_archive;
 pub mod collaboration_capture;
+pub mod collaboration_cli;
+pub mod collaboration_context;
 pub mod collaboration_gc;
 pub mod collaboration_state;
+pub mod collaboration_submit;
 pub mod composer;
 pub mod composition;
 mod disk_headroom;
@@ -91,6 +94,7 @@ pub mod install_replacement;
 mod issue_form;
 mod lease_export;
 mod leases;
+pub mod local_target;
 mod main_drift;
 pub mod main_reconcile;
 mod measurement;
@@ -557,7 +561,9 @@ pub use rule_comments::{
     RuleCommentWants, own_rule_comments, plan_rule_comments, render_rule_comment,
     rule_comment_wants,
 };
-pub use schema::{EVENTS_SCHEMA_VERSION, SCHEMA_VERSION};
+pub use schema::{
+    COLLABORATION_FENCE_SCHEMA, CollaborationFence, EVENTS_SCHEMA_VERSION, SCHEMA_VERSION,
+};
 pub use scopes::{
     ScopeConflictSeverity, ScopeOverlap, classify as classify_scope_pair, detect_scope_overlaps,
     parse_scope_argument,

@@ -1,0 +1,1296 @@
+{
+  "note": "Independent reference implementation of #661 selection.",
+  "cases": [
+    {
+      "name": "exact path beats directory, brief and impact",
+      "query": {
+        "scope": [
+          "src/search.rs"
+        ],
+        "budget": {
+          "max_items": 8,
+          "max_brief_tokens": 600,
+          "max_matched_paths": 8
+        },
+        "analysis": [
+          {
+            "status": "complete",
+            "binding": "bound"
+          }
+        ],
+        "related": [
+          {
+            "path": "src/keys.rs",
+            "edge": "callers"
+          }
+        ]
+      },
+      "candidates": [
+        {
+          "id": "c-dir",
+          "seq": 9,
+          "changed": [
+            "src/other.rs"
+          ]
+        },
+        {
+          "id": "c-impact",
+          "seq": 8,
+          "changed": [
+            "src/keys.rs"
+          ]
+        },
+        {
+          "id": "c-path",
+          "seq": 1,
+          "changed": [
+            "src/search.rs",
+            "README.md"
+          ]
+        },
+        {
+          "id": "c-brief",
+          "seq": 7,
+          "changed": [
+            "docs/x.md"
+          ],
+          "brief": {
+            "tokens": 40,
+            "scope_refs": [
+              "src"
+            ]
+          }
+        },
+        {
+          "id": "c-none",
+          "seq": 10,
+          "changed": [
+            "lib/z.rs"
+          ]
+        }
+      ],
+      "expected": {
+        "items": [
+          {
+            "id": "c-path",
+            "rank": 1,
+            "reasons": [
+              {
+                "kind": "path_overlap",
+                "values": [
+                  "src/search.rs"
+                ],
+                "total": 1
+              }
+            ],
+            "brief_included": null
+          },
+          {
+            "id": "c-brief",
+            "rank": 2,
+            "reasons": [
+              {
+                "kind": "brief_scope_ref",
+                "values": [
+                  "src"
+                ],
+                "total": 1
+              }
+            ],
+            "brief_included": true
+          },
+          {
+            "id": "c-impact",
+            "rank": 3,
+            "reasons": [
+              {
+                "kind": "impact_edge",
+                "values": [
+                  {
+                    "path": "src/keys.rs",
+                    "edge": "callers"
+                  }
+                ],
+                "total": 1
+              },
+              {
+                "kind": "same_directory",
+                "values": [
+                  "src/keys.rs"
+                ],
+                "total": 1
+              }
+            ],
+            "brief_included": null
+          },
+          {
+            "id": "c-dir",
+            "rank": 4,
+            "reasons": [
+              {
+                "kind": "same_directory",
+                "values": [
+                  "src/other.rs"
+                ],
+                "total": 1
+              }
+            ],
+            "brief_included": null
+          }
+        ],
+        "matched": 4,
+        "brief_tokens": 40,
+        "truncated_by": [],
+        "gaps": [],
+        "coverage": "complete_within_profile",
+        "freshness": "exact",
+        "limits": "within_limits",
+        "absence_is_evidence": true
+      }
+    },
+    {
+      "name": "ties: more overlap, then most recent, then id",
+      "query": {
+        "scope": [
+          "a/1",
+          "a/2",
+          "a/3"
+        ],
+        "budget": {
+          "max_items": 8,
+          "max_brief_tokens": 600,
+          "max_matched_paths": 8
+        },
+        "analysis": [
+          {
+            "status": "complete",
+            "binding": "bound"
+          }
+        ]
+      },
+      "candidates": [
+        {
+          "id": "b",
+          "seq": 5,
+          "changed": [
+            "a/1"
+          ]
+        },
+        {
+          "id": "a",
+          "seq": 5,
+          "changed": [
+            "a/2"
+          ]
+        },
+        {
+          "id": "c",
+          "seq": 6,
+          "changed": [
+            "a/3"
+          ]
+        },
+        {
+          "id": "d",
+          "seq": 1,
+          "changed": [
+            "a/1",
+            "a/2"
+          ]
+        }
+      ],
+      "expected": {
+        "items": [
+          {
+            "id": "d",
+            "rank": 1,
+            "reasons": [
+              {
+                "kind": "path_overlap",
+                "values": [
+                  "a/1",
+                  "a/2"
+                ],
+                "total": 2
+              }
+            ],
+            "brief_included": null
+          },
+          {
+            "id": "c",
+            "rank": 2,
+            "reasons": [
+              {
+                "kind": "path_overlap",
+                "values": [
+                  "a/3"
+                ],
+                "total": 1
+              }
+            ],
+            "brief_included": null
+          },
+          {
+            "id": "a",
+            "rank": 3,
+            "reasons": [
+              {
+                "kind": "path_overlap",
+                "values": [
+                  "a/2"
+                ],
+                "total": 1
+              }
+            ],
+            "brief_included": null
+          },
+          {
+            "id": "b",
+            "rank": 4,
+            "reasons": [
+              {
+                "kind": "path_overlap",
+                "values": [
+                  "a/1"
+                ],
+                "total": 1
+              }
+            ],
+            "brief_included": null
+          }
+        ],
+        "matched": 4,
+        "brief_tokens": 0,
+        "truncated_by": [],
+        "gaps": [],
+        "coverage": "complete_within_profile",
+        "freshness": "exact",
+        "limits": "within_limits",
+        "absence_is_evidence": true
+      }
+    },
+    {
+      "name": "item budget truncates",
+      "query": {
+        "scope": [
+          "x/f"
+        ],
+        "budget": {
+          "max_items": 2,
+          "max_brief_tokens": 600,
+          "max_matched_paths": 8
+        },
+        "analysis": [
+          {
+            "status": "complete",
+            "binding": "bound"
+          }
+        ]
+      },
+      "candidates": [
+        {
+          "id": "k0",
+          "seq": 0,
+          "changed": [
+            "x/f"
+          ]
+        },
+        {
+          "id": "k1",
+          "seq": 1,
+          "changed": [
+            "x/f"
+          ]
+        },
+        {
+          "id": "k2",
+          "seq": 2,
+          "changed": [
+            "x/f"
+          ]
+        },
+        {
+          "id": "k3",
+          "seq": 3,
+          "changed": [
+            "x/f"
+          ]
+        },
+        {
+          "id": "k4",
+          "seq": 4,
+          "changed": [
+            "x/f"
+          ]
+        }
+      ],
+      "expected": {
+        "items": [
+          {
+            "id": "k4",
+            "rank": 1,
+            "reasons": [
+              {
+                "kind": "path_overlap",
+                "values": [
+                  "x/f"
+                ],
+                "total": 1
+              }
+            ],
+            "brief_included": null
+          },
+          {
+            "id": "k3",
+            "rank": 2,
+            "reasons": [
+              {
+                "kind": "path_overlap",
+                "values": [
+                  "x/f"
+                ],
+                "total": 1
+              }
+            ],
+            "brief_included": null
+          }
+        ],
+        "matched": 5,
+        "brief_tokens": 0,
+        "truncated_by": [
+          "max_items"
+        ],
+        "gaps": [],
+        "coverage": "complete_within_profile",
+        "freshness": "exact",
+        "limits": "truncated",
+        "absence_is_evidence": false
+      }
+    },
+    {
+      "name": "brief token budget omits a brief but keeps the item",
+      "query": {
+        "scope": [
+          "x/f"
+        ],
+        "budget": {
+          "max_items": 8,
+          "max_brief_tokens": 200,
+          "max_matched_paths": 8
+        },
+        "analysis": [
+          {
+            "status": "complete",
+            "binding": "bound"
+          }
+        ]
+      },
+      "candidates": [
+        {
+          "id": "p",
+          "seq": 3,
+          "changed": [
+            "x/f"
+          ],
+          "brief": {
+            "tokens": 150,
+            "scope_refs": []
+          }
+        },
+        {
+          "id": "q",
+          "seq": 2,
+          "changed": [
+            "x/f"
+          ],
+          "brief": {
+            "tokens": 100,
+            "scope_refs": []
+          }
+        },
+        {
+          "id": "r",
+          "seq": 1,
+          "changed": [
+            "x/f"
+          ],
+          "brief": {
+            "tokens": 50,
+            "scope_refs": []
+          }
+        }
+      ],
+      "expected": {
+        "items": [
+          {
+            "id": "p",
+            "rank": 1,
+            "reasons": [
+              {
+                "kind": "path_overlap",
+                "values": [
+                  "x/f"
+                ],
+                "total": 1
+              }
+            ],
+            "brief_included": true
+          },
+          {
+            "id": "q",
+            "rank": 2,
+            "reasons": [
+              {
+                "kind": "path_overlap",
+                "values": [
+                  "x/f"
+                ],
+                "total": 1
+              }
+            ],
+            "brief_included": false
+          },
+          {
+            "id": "r",
+            "rank": 3,
+            "reasons": [
+              {
+                "kind": "path_overlap",
+                "values": [
+                  "x/f"
+                ],
+                "total": 1
+              }
+            ],
+            "brief_included": true
+          }
+        ],
+        "matched": 3,
+        "brief_tokens": 200,
+        "truncated_by": [
+          "brief_tokens"
+        ],
+        "gaps": [],
+        "coverage": "complete_within_profile",
+        "freshness": "exact",
+        "limits": "truncated",
+        "absence_is_evidence": false
+      }
+    },
+    {
+      "name": "matched path lists are capped with their total",
+      "query": {
+        "scope": [
+          "m/0",
+          "m/1",
+          "m/2",
+          "m/3",
+          "m/4"
+        ],
+        "budget": {
+          "max_items": 8,
+          "max_brief_tokens": 600,
+          "max_matched_paths": 2
+        },
+        "analysis": [
+          {
+            "status": "complete",
+            "binding": "bound"
+          }
+        ]
+      },
+      "candidates": [
+        {
+          "id": "wide",
+          "seq": 1,
+          "changed": [
+            "m/0",
+            "m/1",
+            "m/2",
+            "m/3",
+            "m/4"
+          ]
+        }
+      ],
+      "expected": {
+        "items": [
+          {
+            "id": "wide",
+            "rank": 1,
+            "reasons": [
+              {
+                "kind": "path_overlap",
+                "values": [
+                  "m/0",
+                  "m/1"
+                ],
+                "total": 5
+              }
+            ],
+            "brief_included": null
+          }
+        ],
+        "matched": 1,
+        "brief_tokens": 0,
+        "truncated_by": [
+          "matched_paths"
+        ],
+        "gaps": [],
+        "coverage": "complete_within_profile",
+        "freshness": "exact",
+        "limits": "truncated",
+        "absence_is_evidence": false
+      }
+    },
+    {
+      "name": "no analysis: matches are partial, never exhaustive",
+      "query": {
+        "scope": [
+          "s/a"
+        ],
+        "budget": {
+          "max_items": 8,
+          "max_brief_tokens": 600,
+          "max_matched_paths": 8
+        }
+      },
+      "candidates": [
+        {
+          "id": "one",
+          "seq": 1,
+          "changed": [
+            "s/a"
+          ]
+        }
+      ],
+      "expected": {
+        "items": [
+          {
+            "id": "one",
+            "rank": 1,
+            "reasons": [
+              {
+                "kind": "path_overlap",
+                "values": [
+                  "s/a"
+                ],
+                "total": 1
+              }
+            ],
+            "brief_included": null
+          }
+        ],
+        "matched": 1,
+        "brief_tokens": 0,
+        "truncated_by": [],
+        "gaps": [
+          "no_dependency_analysis"
+        ],
+        "coverage": "partial",
+        "freshness": "exact",
+        "limits": "within_limits",
+        "absence_is_evidence": false
+      }
+    },
+    {
+      "name": "empty and complete: absence is evidence",
+      "query": {
+        "scope": [
+          "s/a"
+        ],
+        "budget": {
+          "max_items": 8,
+          "max_brief_tokens": 600,
+          "max_matched_paths": 8
+        },
+        "analysis": [
+          {
+            "status": "complete",
+            "binding": "bound"
+          }
+        ]
+      },
+      "candidates": [
+        {
+          "id": "far",
+          "seq": 1,
+          "changed": [
+            "t/b"
+          ]
+        }
+      ],
+      "expected": {
+        "items": [],
+        "matched": 0,
+        "brief_tokens": 0,
+        "truncated_by": [],
+        "gaps": [],
+        "coverage": "complete_within_profile",
+        "freshness": "exact",
+        "limits": "within_limits",
+        "absence_is_evidence": true
+      }
+    },
+    {
+      "name": "empty without analysis: absence is not evidence",
+      "query": {
+        "scope": [
+          "s/a"
+        ],
+        "budget": {
+          "max_items": 8,
+          "max_brief_tokens": 600,
+          "max_matched_paths": 8
+        }
+      },
+      "candidates": [],
+      "expected": {
+        "items": [],
+        "matched": 0,
+        "brief_tokens": 0,
+        "truncated_by": [],
+        "gaps": [
+          "no_dependency_analysis"
+        ],
+        "coverage": "partial",
+        "freshness": "exact",
+        "limits": "within_limits",
+        "absence_is_evidence": false
+      }
+    },
+    {
+      "name": "stale, truncated and unbound analysis are named gaps",
+      "query": {
+        "scope": [
+          "s/a"
+        ],
+        "budget": {
+          "max_items": 8,
+          "max_brief_tokens": 600,
+          "max_matched_paths": 8
+        },
+        "analysis": [
+          {
+            "status": "stale",
+            "binding": "bound"
+          },
+          {
+            "status": "truncated",
+            "binding": "bound"
+          },
+          {
+            "status": "complete",
+            "binding": "unbound"
+          }
+        ]
+      },
+      "candidates": [],
+      "expected": {
+        "items": [],
+        "matched": 0,
+        "brief_tokens": 0,
+        "truncated_by": [],
+        "gaps": [
+          "analysis_stale",
+          "analysis_subject_unbound",
+          "analysis_truncated"
+        ],
+        "coverage": "partial",
+        "freshness": "stale",
+        "limits": "within_limits",
+        "absence_is_evidence": false
+      }
+    },
+    {
+      "name": "analysis of another source is stale",
+      "query": {
+        "scope": [
+          "s/a"
+        ],
+        "budget": {
+          "max_items": 8,
+          "max_brief_tokens": 600,
+          "max_matched_paths": 8
+        },
+        "analysis": [
+          {
+            "status": "complete",
+            "binding": "other_source"
+          }
+        ]
+      },
+      "candidates": [],
+      "expected": {
+        "items": [],
+        "matched": 0,
+        "brief_tokens": 0,
+        "truncated_by": [],
+        "gaps": [
+          "analysis_other_source"
+        ],
+        "coverage": "partial",
+        "freshness": "stale",
+        "limits": "within_limits",
+        "absence_is_evidence": false
+      }
+    },
+    {
+      "name": "an unreadable contribution is a gap",
+      "query": {
+        "scope": [
+          "s/a"
+        ],
+        "budget": {
+          "max_items": 8,
+          "max_brief_tokens": 600,
+          "max_matched_paths": 8
+        },
+        "analysis": [
+          {
+            "status": "complete",
+            "binding": "bound"
+          }
+        ],
+        "unreadable": [
+          "gone"
+        ]
+      },
+      "candidates": [
+        {
+          "id": "one",
+          "seq": 1,
+          "changed": [
+            "s/a"
+          ]
+        }
+      ],
+      "expected": {
+        "items": [
+          {
+            "id": "one",
+            "rank": 1,
+            "reasons": [
+              {
+                "kind": "path_overlap",
+                "values": [
+                  "s/a"
+                ],
+                "total": 1
+              }
+            ],
+            "brief_included": null
+          }
+        ],
+        "matched": 1,
+        "brief_tokens": 0,
+        "truncated_by": [],
+        "gaps": [
+          "contribution_unreadable:gone"
+        ],
+        "coverage": "partial",
+        "freshness": "exact",
+        "limits": "within_limits",
+        "absence_is_evidence": false
+      }
+    },
+    {
+      "name": "hidden contributions are not returned",
+      "query": {
+        "scope": [
+          "s/a"
+        ],
+        "budget": {
+          "max_items": 8,
+          "max_brief_tokens": 600,
+          "max_matched_paths": 8
+        },
+        "analysis": [
+          {
+            "status": "complete",
+            "binding": "bound"
+          }
+        ]
+      },
+      "candidates": [
+        {
+          "id": "seen",
+          "seq": 1,
+          "changed": [
+            "s/a"
+          ]
+        },
+        {
+          "id": "hidden",
+          "seq": 2,
+          "changed": [
+            "s/a"
+          ],
+          "visible": false
+        }
+      ],
+      "expected": {
+        "items": [
+          {
+            "id": "seen",
+            "rank": 1,
+            "reasons": [
+              {
+                "kind": "path_overlap",
+                "values": [
+                  "s/a"
+                ],
+                "total": 1
+              }
+            ],
+            "brief_included": null
+          }
+        ],
+        "matched": 1,
+        "brief_tokens": 0,
+        "truncated_by": [],
+        "gaps": [],
+        "coverage": "complete_within_profile",
+        "freshness": "exact",
+        "limits": "within_limits",
+        "absence_is_evidence": true
+      }
+    },
+    {
+      "name": "scope refs match only the path or an ancestor directory",
+      "query": {
+        "scope": [
+          "src/ui/header.tsx"
+        ],
+        "budget": {
+          "max_items": 8,
+          "max_brief_tokens": 600,
+          "max_matched_paths": 8
+        },
+        "analysis": [
+          {
+            "status": "complete",
+            "binding": "bound"
+          }
+        ]
+      },
+      "candidates": [
+        {
+          "id": "exact",
+          "seq": 1,
+          "changed": [
+            "z/1"
+          ],
+          "brief": {
+            "tokens": 10,
+            "scope_refs": [
+              "src/ui/header.tsx"
+            ]
+          }
+        },
+        {
+          "id": "ancestor",
+          "seq": 2,
+          "changed": [
+            "z/2"
+          ],
+          "brief": {
+            "tokens": 10,
+            "scope_refs": [
+              "src/ui"
+            ]
+          }
+        },
+        {
+          "id": "prefix-only",
+          "seq": 3,
+          "changed": [
+            "z/3"
+          ],
+          "brief": {
+            "tokens": 10,
+            "scope_refs": [
+              "src/u"
+            ]
+          }
+        },
+        {
+          "id": "word",
+          "seq": 4,
+          "changed": [
+            "z/4"
+          ],
+          "brief": {
+            "tokens": 10,
+            "scope_refs": [
+              "search-control"
+            ]
+          }
+        }
+      ],
+      "expected": {
+        "items": [
+          {
+            "id": "ancestor",
+            "rank": 1,
+            "reasons": [
+              {
+                "kind": "brief_scope_ref",
+                "values": [
+                  "src/ui"
+                ],
+                "total": 1
+              }
+            ],
+            "brief_included": true
+          },
+          {
+            "id": "exact",
+            "rank": 2,
+            "reasons": [
+              {
+                "kind": "brief_scope_ref",
+                "values": [
+                  "src/ui/header.tsx"
+                ],
+                "total": 1
+              }
+            ],
+            "brief_included": true
+          }
+        ],
+        "matched": 2,
+        "brief_tokens": 20,
+        "truncated_by": [],
+        "gaps": [],
+        "coverage": "complete_within_profile",
+        "freshness": "exact",
+        "limits": "within_limits",
+        "absence_is_evidence": true
+      }
+    },
+    {
+      "name": "root-level files are not same-directory matches",
+      "query": {
+        "scope": [
+          "README.md"
+        ],
+        "budget": {
+          "max_items": 8,
+          "max_brief_tokens": 600,
+          "max_matched_paths": 8
+        },
+        "analysis": [
+          {
+            "status": "complete",
+            "binding": "bound"
+          }
+        ]
+      },
+      "candidates": [
+        {
+          "id": "root",
+          "seq": 1,
+          "changed": [
+            "LICENSE"
+          ]
+        }
+      ],
+      "expected": {
+        "items": [],
+        "matched": 0,
+        "brief_tokens": 0,
+        "truncated_by": [],
+        "gaps": [],
+        "coverage": "complete_within_profile",
+        "freshness": "exact",
+        "limits": "within_limits",
+        "absence_is_evidence": true
+      }
+    },
+    {
+      "name": "impact edges: several edges on one path count once",
+      "query": {
+        "scope": [
+          "q/a"
+        ],
+        "budget": {
+          "max_items": 8,
+          "max_brief_tokens": 600,
+          "max_matched_paths": 8
+        },
+        "analysis": [
+          {
+            "status": "complete",
+            "binding": "bound"
+          }
+        ],
+        "related": [
+          {
+            "path": "q/b",
+            "edge": "importers"
+          },
+          {
+            "path": "q/b",
+            "edge": "callers"
+          },
+          {
+            "path": "r/c",
+            "edge": "tests"
+          }
+        ]
+      },
+      "candidates": [
+        {
+          "id": "two-edges",
+          "seq": 1,
+          "changed": [
+            "q/b"
+          ]
+        },
+        {
+          "id": "two-paths",
+          "seq": 1,
+          "changed": [
+            "q/b",
+            "r/c"
+          ]
+        }
+      ],
+      "expected": {
+        "items": [
+          {
+            "id": "two-paths",
+            "rank": 1,
+            "reasons": [
+              {
+                "kind": "impact_edge",
+                "values": [
+                  {
+                    "path": "q/b",
+                    "edge": "callers"
+                  },
+                  {
+                    "path": "q/b",
+                    "edge": "importers"
+                  },
+                  {
+                    "path": "r/c",
+                    "edge": "tests"
+                  }
+                ],
+                "total": 2
+              },
+              {
+                "kind": "same_directory",
+                "values": [
+                  "q/b"
+                ],
+                "total": 1
+              }
+            ],
+            "brief_included": null
+          },
+          {
+            "id": "two-edges",
+            "rank": 2,
+            "reasons": [
+              {
+                "kind": "impact_edge",
+                "values": [
+                  {
+                    "path": "q/b",
+                    "edge": "callers"
+                  },
+                  {
+                    "path": "q/b",
+                    "edge": "importers"
+                  }
+                ],
+                "total": 1
+              },
+              {
+                "kind": "same_directory",
+                "values": [
+                  "q/b"
+                ],
+                "total": 1
+              }
+            ],
+            "brief_included": null
+          }
+        ],
+        "matched": 2,
+        "brief_tokens": 0,
+        "truncated_by": [],
+        "gaps": [],
+        "coverage": "complete_within_profile",
+        "freshness": "exact",
+        "limits": "within_limits",
+        "absence_is_evidence": true
+      }
+    },
+    {
+      "name": "no reader source: never exact or complete",
+      "query": {
+        "scope": [
+          "s/a"
+        ],
+        "budget": {
+          "max_items": 8,
+          "max_brief_tokens": 600,
+          "max_matched_paths": 8
+        },
+        "analysis": [
+          {
+            "status": "complete",
+            "binding": "bound"
+          }
+        ],
+        "has_source": false
+      },
+      "candidates": [],
+      "expected": {
+        "items": [],
+        "matched": 0,
+        "brief_tokens": 0,
+        "truncated_by": [],
+        "gaps": [
+          "no_reader_source"
+        ],
+        "coverage": "partial",
+        "freshness": null,
+        "limits": "within_limits",
+        "absence_is_evidence": false
+      }
+    },
+    {
+      "name": "an analysis not about the scope is a gap",
+      "query": {
+        "scope": [
+          "s/a"
+        ],
+        "budget": {
+          "max_items": 8,
+          "max_brief_tokens": 600,
+          "max_matched_paths": 8
+        },
+        "analysis": [
+          {
+            "status": "complete",
+            "binding": "bound",
+            "scoped": false
+          }
+        ]
+      },
+      "candidates": [],
+      "expected": {
+        "items": [],
+        "matched": 0,
+        "brief_tokens": 0,
+        "truncated_by": [],
+        "gaps": [
+          "analysis_not_scoped"
+        ],
+        "coverage": "partial",
+        "freshness": "exact",
+        "limits": "within_limits",
+        "absence_is_evidence": false
+      }
+    },
+    {
+      "name": "related paths cut by the read cap",
+      "query": {
+        "scope": [
+          "s/a"
+        ],
+        "budget": {
+          "max_items": 8,
+          "max_brief_tokens": 600,
+          "max_matched_paths": 8
+        },
+        "analysis": [
+          {
+            "status": "complete",
+            "binding": "bound"
+          }
+        ],
+        "related_truncated": true
+      },
+      "candidates": [
+        {
+          "id": "one",
+          "seq": 1,
+          "changed": [
+            "s/a"
+          ]
+        }
+      ],
+      "expected": {
+        "items": [
+          {
+            "id": "one",
+            "rank": 1,
+            "reasons": [
+              {
+                "kind": "path_overlap",
+                "values": [
+                  "s/a"
+                ],
+                "total": 1
+              }
+            ],
+            "brief_included": null
+          }
+        ],
+        "matched": 1,
+        "brief_tokens": 0,
+        "truncated_by": [
+          "related_paths"
+        ],
+        "gaps": [
+          "analysis_related_truncated"
+        ],
+        "coverage": "partial",
+        "freshness": "exact",
+        "limits": "truncated",
+        "absence_is_evidence": false
+      }
+    },
+    {
+      "name": "candidates cut by the read cap",
+      "query": {
+        "scope": [
+          "s/a"
+        ],
+        "budget": {
+          "max_items": 8,
+          "max_brief_tokens": 600,
+          "max_matched_paths": 8
+        },
+        "analysis": [
+          {
+            "status": "complete",
+            "binding": "bound"
+          }
+        ],
+        "candidates_truncated": true
+      },
+      "candidates": [],
+      "expected": {
+        "items": [],
+        "matched": 0,
+        "brief_tokens": 0,
+        "truncated_by": [
+          "candidates"
+        ],
+        "gaps": [
+          "candidates_truncated"
+        ],
+        "coverage": "partial",
+        "freshness": "exact",
+        "limits": "truncated",
+        "absence_is_evidence": false
+      }
+    }
+  ]
+}

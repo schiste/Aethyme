@@ -548,13 +548,50 @@ struct Planned {
 struct Plan {
     baseline: RetainedSnapshot,
     steps: Vec<Planned>,
-    engine_version: String,
 }
 
 /// The baseline, retained, and the snapshots of accepted history.
 struct Baseline {
     retained: RetainedSnapshot,
     accepted: Vec<SourceSnapshotId>,
+}
+
+/// Validate an archived target with the same revision, atomic group, and
+/// source-lineage rules as composition. This never invokes Git or writes a
+/// recipe, candidate, or ref. Accepted history is absent unless explicitly
+/// represented by the target's baseline or selected contributions.
+pub(crate) fn validate_retained_selection(
+    store: &CollaborationStore,
+    baseline: RetainedSnapshot,
+    catalog: Vec<ContributionSpec>,
+    deliveries: Vec<String>,
+) -> Result<Result<(), (Refusal, String)>, ComposeError> {
+    let request = CompositionRequest {
+        baseline: baseline.commit.clone(),
+        accepted: vec![],
+        catalog,
+        deliveries,
+        budget: CompositionBudget {
+            max_contributions: 1024,
+            ..CompositionBudget::default()
+        },
+    };
+    let baseline = Baseline {
+        retained: baseline,
+        accepted: vec![],
+    };
+    Ok(
+        match plan(
+            store,
+            &request,
+            &baseline,
+            &request.deliveries,
+            &mut BudgetUsage::default(),
+        )? {
+            Ok(_) => Ok(()),
+            Err(Refused(reason, detail)) => Err((reason, detail)),
+        },
+    )
 }
 
 fn build(
@@ -933,8 +970,11 @@ fn plan(
     for spec in &delivered {
         let index = applies_as[spec.id.as_str()];
         for required in &spec.requires {
+            // A literal self requirement is a cycle. A different delivered
+            // alias of the same retained input still satisfies a prerequisite
+            // without applying that input again.
             if let Some(&parent) = applies_as.get(required.as_str())
-                && parent != index
+                && (parent != index || required == &spec.id)
             {
                 edges[index].insert(parent);
             }
@@ -968,11 +1008,7 @@ fn plan(
             retained: retained[index].take().expect("each index placed once"),
         })
         .collect();
-    Ok(Ok(Plan {
-        baseline,
-        steps,
-        engine_version: git_version()?,
-    }))
+    Ok(Ok(Plan { baseline, steps }))
 }
 
 // ----------------------------------------------------------------- reading
@@ -1719,6 +1755,7 @@ fn recipe_record(
     usage: BudgetUsage,
     recomposition: Option<&Subtraction>,
 ) -> Result<(Vec<u8>, RecordId), ComposeError> {
+    let engine_version = git_version()?;
     let order = plan
         .steps
         .iter()
@@ -1747,7 +1784,7 @@ fn recipe_record(
             "engine",
             object(vec![
                 ("name", text("git merge-file")),
-                ("version", text(&plan.engine_version)),
+                ("version", text(&engine_version)),
                 ("diff", text(DIFF_ENGINE)),
                 ("move_window", integer(MOVE_WINDOW)),
             ]),
