@@ -226,31 +226,121 @@ fn unknown_policy_and_unknown_required_keys_do_not_negotiate_to_safe() {
         Setting::On { ignored, .. } => assert_eq!(ignored, vec!["future_setting"]),
         _ => panic!(),
     }
-    let mut raw = serde_json::json!({"schema":"aethyme.contrib-context/v999","authority":"accepted","coverage":"complete"});
-    assert!(
-        aethyme_contracts::experimental_v0::Record::decode(
-            &serde_json::to_vec(&raw).unwrap(),
-            &[&crate::collaboration_context::CONTEXT_SCHEMA]
-        )
-        .is_err()
-    );
-    raw["schema"] = crate::collaboration_context::CONTEXT_SCHEMA_NAME.into();
-    assert!(
-        aethyme_contracts::experimental_v0::Record::decode(
-            &serde_json::to_vec(&raw).unwrap(),
-            &[&crate::collaboration_context::CONTEXT_SCHEMA]
-        )
-        .is_err()
-    );
+}
+fn valid_context_record() -> serde_json::Value {
+    serde_json::json!({
+        "schema":crate::collaboration_context::CONTEXT_SCHEMA_NAME,
+        "authority":"advisory_context", "visibility":"local_project",
+        "query":{"scope":[],"analysis":[]}, "items":[],
+        "limit_detail":{"matched":"0","returned":"0","brief_tokens":"0","truncated_by":[]},
+        "cache":{}, "coverage":"partial", "freshness":"exact", "limits":"within_limits"
+    })
+}
+fn decode_context(
+    value: &serde_json::Value,
+) -> Result<
+    aethyme_contracts::experimental_v0::Record,
+    aethyme_contracts::experimental_v0::RecordError,
+> {
+    aethyme_contracts::experimental_v0::Record::decode(
+        &serde_json::to_vec(value).unwrap(),
+        &[&crate::collaboration_context::CONTEXT_SCHEMA],
+    )
+}
+#[test]
+fn unknown_record_schema_refuses_an_otherwise_valid_context() {
+    let mut raw = valid_context_record();
+    decode_context(&raw).unwrap();
+    raw["schema"] = "aethyme.contribution-context/v999".into();
+    assert!(matches!(
+        decode_context(&raw),
+        Err(aethyme_contracts::experimental_v0::RecordError::UnsupportedSchema { .. })
+    ));
+}
+#[test]
+fn required_unknown_capability_refuses_an_otherwise_valid_context() {
+    let mut raw = valid_context_record();
+    decode_context(&raw).unwrap();
+    raw["requires"] = serde_json::json!(["new-authority-meaning"]);
+    assert!(matches!(
+        decode_context(&raw),
+        Err(aethyme_contracts::experimental_v0::RecordError::UnsupportedCapability { .. })
+    ));
+}
+/// Logical SQLite image includes every user table, trigger and index; CAS bytes
+/// are independently hashed. WAL placement and connection bookkeeping are not
+/// product data and are deliberately excluded from this comparison.
+fn logical_state(
+    conn: &rusqlite::Connection,
+    objects: &Path,
+) -> (
+    Vec<Vec<String>>,
+    Vec<(String, Vec<Vec<String>>)>,
+    Vec<(PathBuf, String)>,
+) {
+    let schema = conn
+        .prepare("SELECT type,name,tbl_name,coalesce(sql,'') FROM sqlite_schema ORDER BY type,name")
+        .unwrap()
+        .query_map([], |r| {
+            Ok((0..4)
+                .map(|i| r.get::<_, String>(i).unwrap())
+                .collect::<Vec<_>>())
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    let names: Vec<String> = conn
+        .prepare("SELECT name FROM sqlite_schema WHERE type='table' ORDER BY name")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    let mut data = vec![];
+    for name in names {
+        let mut statement = conn
+            .prepare(&format!("SELECT * FROM \"{}\"", name.replace('"', "\"\"")))
+            .unwrap();
+        let columns = statement.column_count();
+        let mut rows = statement
+            .query_map([], |r| {
+                Ok((0..columns)
+                    .map(|i| format!("{:?}", r.get_ref(i).unwrap()))
+                    .collect::<Vec<_>>())
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        rows.sort();
+        data.push((name, rows));
+    }
+    let mut hashes = vec![];
+    for prefix in std::fs::read_dir(objects).unwrap() {
+        for entry in std::fs::read_dir(prefix.unwrap().path()).unwrap() {
+            let entry = entry.unwrap().path();
+            hashes.push((
+                entry.strip_prefix(objects).unwrap().to_owned(),
+                crate::collaboration_archive::ObjectDigest::of(&std::fs::read(&entry).unwrap())
+                    .hex(),
+            ));
+        }
+    }
+    hashes.sort();
+    (schema, data, hashes)
 }
 #[test]
 fn newer_incompatible_store_refuses_without_migration_or_data_mutation() {
-    let host = tempfile::tempdir().unwrap();
-    let root = CollaborationRoot::under_host_state(host.path());
-    let project = ProjectKey::parse("compatibility-migration").unwrap();
-    let store = CollaborationStore::open(&root, &project, &[]).unwrap();
-    let db = store.project_dir().join("state.db");
-    drop(store);
+    let mut f = crate::local_target::tests::Fixture::new();
+    let brief = aethyme_contracts::experimental_v0::brief::Brief::from_decision_file(
+        br#"{"intent":"Preserve independently retained history."}"#,
+    )
+    .unwrap();
+    crate::collaboration_context::attach_brief(&mut f.store, &f.a.lineage_record_id, &brief)
+        .unwrap();
+    let root = CollaborationRoot::under_host_state(f._host.path());
+    let project = f.store.project().clone();
+    let db = f.store.project_dir().join("state.db");
+    let objects = crate::collaboration_archive::objects_dir(&f.store);
     let conn = rusqlite::Connection::open(&db).unwrap();
     conn.execute(
         "UPDATE meta SET value='999' WHERE key IN ('schema_version','min_compatible_schema')",
@@ -262,25 +352,25 @@ fn newer_incompatible_store_refuses_without_migration_or_data_mutation() {
         [],
     )
     .unwrap();
-    let before: Vec<(String, String)> = conn
-        .prepare("SELECT key,value FROM meta ORDER BY key")
-        .unwrap()
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
-        .unwrap()
-        .collect::<Result<_, _>>()
-        .unwrap();
+    let before = logical_state(&conn, &objects);
+    assert!(!before.2.is_empty());
+    assert!(
+        before
+            .1
+            .iter()
+            .any(|(name, rows)| name == "retained_contributions" && !rows.is_empty())
+    );
+    assert!(
+        before
+            .1
+            .iter()
+            .any(|(name, rows)| name == "contribution_briefs" && !rows.is_empty())
+    );
     assert!(matches!(
         CollaborationStore::open(&root, &project, &[]),
         Err(CollaborationStateError::SchemaTooNew { .. })
     ));
-    let after: Vec<(String, String)> = conn
-        .prepare("SELECT key,value FROM meta ORDER BY key")
-        .unwrap()
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
-        .unwrap()
-        .collect::<Result<_, _>>()
-        .unwrap();
-    assert_eq!(before, after);
+    assert_eq!(before, logical_state(&conn, &objects));
 }
 #[test]
 fn overlapping_shared_state_root_refuses_with_a_separate_location_action() {

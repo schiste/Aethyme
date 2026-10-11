@@ -6,11 +6,7 @@ const OLD_COMMIT: &str = "5e8daf712e26c63f1d4082e9a617f556cf995de2";
 const OLD_DIGEST: &str = "edc1ad2829e08c6d5aa2512964e117685cc1ea4502caa765dc1e0d0b9b0a4261";
 const CLEAN_PATH: &str = "/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin";
 const DENY_NETWORK: &str = "(version 1) (allow default) (deny network*)";
-fn binary() -> PathBuf {
-    let path = PathBuf::from(
-        std::env::var_os("AETHYME_COMPAT_OLD_BINARY")
-            .expect("explicit independently pinned old binary required"),
-    );
+fn verify_binary(path: &Path) {
     assert!(path.is_absolute());
     let mut file = std::fs::File::open(&path).unwrap();
     let mut hash = Sha256::new();
@@ -35,9 +31,17 @@ fn binary() -> PathBuf {
         .unwrap();
     assert!(version.status.success());
     assert!(String::from_utf8_lossy(&version.stdout).contains(OLD_COMMIT));
+}
+fn binary() -> PathBuf {
+    let path = PathBuf::from(
+        std::env::var_os("AETHYME_COMPAT_OLD_BINARY")
+            .expect("explicit independently pinned old binary required"),
+    );
+    verify_binary(&path);
     path
 }
 fn run(binary: &Path, f: &Fixture, args: &[&str]) -> Output {
+    verify_binary(binary);
     let output = Command::new("/usr/bin/sandbox-exec")
         .args(["-p", DENY_NETWORK])
         .arg(binary)
@@ -160,21 +164,46 @@ fn actual_old_cleanup_cannot_remove_new_retained_source_or_history() {
     f.broker
         .finish_abandoning_unpushed(
             f.session,
-            crate::FinishOptions::default(),
+            crate::FinishOptions {
+                keep_worktree: true,
+            },
             "operator discards only this disposable compatibility fixture",
         )
         .unwrap();
+    assert!(
+        f.worktree.exists(),
+        "current close must retain the old cleanup fixture"
+    );
+    let branch = git(&f.worktree, &["symbolic-ref", "HEAD"]);
+    let tip = git(f.repo.path(), &["rev-parse", &branch]);
+    assert_eq!(tip, result.as_str());
     let output = run(
         &binary,
         &f,
-        &["broker", "finish", "cleanup", &f.session.to_string()],
+        &[
+            "broker",
+            "finish",
+            "cleanup",
+            &f.session.to_string(),
+            "--json",
+        ],
     );
     assert!(
         output.status.success(),
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["cleaned"], f.session);
     assert!(!f.worktree.exists());
+    assert!(
+        git(
+            f.repo.path(),
+            &["for-each-ref", "--format=%(refname)", &branch]
+        )
+        .is_empty()
+    );
+
     assert_eq!(
         crate::collaboration_archive::read_object(
             &store,
