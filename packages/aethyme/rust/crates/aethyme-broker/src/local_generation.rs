@@ -617,4 +617,4 @@ fn prepare_with(
     })
 }
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
