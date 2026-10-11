@@ -3,8 +3,9 @@
 Last Updated: 2026-10-11
 
 Issue #679; §6.8, §10.8–10.9; D16/D20/D28; T36–T40/T57. This is the
-provisional implementation contract. Implementation and qualification follow
-in this draft; no full recovery or current authority claim is made here.
+provisional source/history profile `aethyme.restore.source-history/provisional-v0`.
+It restores selected historical source and advisory records; it cannot grant
+current execution, acceptance or adoption authority.
 
 ## Portable retained history
 
@@ -67,3 +68,34 @@ round trips, tampering, revoked authority, missing objects, schema/scope mismatc
 path swaps, actual GC, interrupted import and idempotency. Independent review and
 named guard-removal failures are required. E1 remains separately owned; this work
 makes no structural-composer or held-out evidence claim.
+
+## Profile evidence
+
+The 18 focused schedules pass, including a separate-project source build after
+origin storage destruction, actual imported-object retention through GC,
+canonical source/context/CAP/brief round trips, independent receiver scope and
+wire digest, reference completeness, Git provenance, exact lineage mappings,
+unsupported analysis references, size limits, stale receiver authority, partial
+import and exclusive sealed rehearsal with unknown-effect refusal.
+
+The independent wire vector has SHA-256
+`71b8b2fc574e3d8e8ea882ef10e7f6509ab245f6365cc807f20d6b1b2566c219`.
+Twelve production guard removals each produce a named test failure with exit
+101; the original source is restored. A raw object corruption trial originally
+survived because the changed JSON object also encountered a parsing boundary.
+That outcome is excluded. The corrected negative selects an independently known
+raw file, changes its bytes without changing its length or metadata, repins the
+outer wire digest and requires the specific object-digest refusal. Removing
+that hash guard now fails the corrected test.
+
+Independent adversarial review covered closure, exact lineage and provenance,
+unsupported evidence boundaries, historical pins and rehearsal authority. The
+restored regression selection, strict Clippy and final-head CI are recorded
+separately on the draft PR; this paragraph is not an aggregate pass claim.
+
+The wire is capped at 32 MiB, decoded content at 16 MiB and one object at 8 MiB;
+there are at most 4,096 objects, 128 historical records and 64 selected sources.
+Collaboration state uses schema/floor 17. Imported source trees with symlinks
+remain portable history but receive explicit unsupported rehearsal diagnostics.
+No native gate join, live provider, E1 structural engine or authoritative
+accepted-decision reconstruction is claimed by this source/history profile.
