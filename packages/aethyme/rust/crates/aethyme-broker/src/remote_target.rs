@@ -375,6 +375,9 @@ fn option_is_flag(command: &str, option: &str) -> bool {
                 | "--dry-run"
                 | "--force"
                 | "--keep"
+                | "--no-write-fetch-head"
+                | "--no-auto-gc"
+                | "--no-recurse-submodules"
                 | "--no-tags"
                 | "--prune"
                 | "--prune-tags"
@@ -1018,5 +1021,43 @@ mod tests {
             multiple,
             RemoteTargetError::MultipleCommandRemotes { .. }
         ));
+    }
+}
+
+#[cfg(test)]
+mod exact_object_fetch_tests {
+    use super::*;
+    #[test]
+    fn nonselecting_fetch_options_preserve_exact_remote_selection() {
+        let args = [
+            "--no-write-fetch-head",
+            "--no-tags",
+            "--refmap=",
+            "--no-auto-gc",
+            "--no-recurse-submodules",
+            "publication",
+            "1234",
+        ]
+        .map(str::to_string);
+        let (remote, evidence) = command_remote_argument("fetch", &args).unwrap();
+        assert_eq!(remote.as_deref(), Some("publication"));
+        assert_eq!(evidence, RemoteCommandSelectionEvidence::ExplicitArgument);
+        let args = [
+            "--refmap",
+            "",
+            "--no-write-fetch-head",
+            "publication",
+            "1234",
+        ]
+        .map(str::to_string);
+        assert_eq!(
+            command_remote_argument("fetch", &args)
+                .unwrap()
+                .0
+                .as_deref(),
+            Some("publication")
+        );
+        let args = ["--not-supported", "publication"].map(str::to_string);
+        assert!(command_remote_argument("fetch", &args).is_err());
     }
 }

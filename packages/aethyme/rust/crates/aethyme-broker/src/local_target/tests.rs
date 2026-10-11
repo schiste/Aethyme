@@ -626,7 +626,7 @@ fn migration_adopts_charged_resolution_attempts_and_fences_schema_six() {
     drop(f.store);
     let c = rusqlite::Connection::open(&db).unwrap();
     c.execute_batch("UPDATE meta SET value = '6' WHERE key IN ('schema_version', 'min_compatible_schema');
-        DROP TABLE local_verification_evidence; DROP TABLE local_verifier_producers; DROP TABLE local_authority_state; DROP TABLE local_waves; DROP TABLE local_wave_arrivals;
+        DROP TABLE local_source_transport_receipts; DROP TABLE local_source_transports; DROP TABLE local_verification_evidence; DROP TABLE local_verifier_producers; DROP TABLE local_authority_state; DROP TABLE local_waves; DROP TABLE local_wave_arrivals;
         DROP TABLE local_target_roots; DROP TABLE local_target_dispositions; DROP TABLE local_target_revisions; DROP TABLE local_targets;
         INSERT INTO resolution_attempts VALUES (1, 'decision', 'conflict', 'A', 'one.txt', 'original-request', 'resolver', 'failed', 1);").unwrap();
     drop(c);

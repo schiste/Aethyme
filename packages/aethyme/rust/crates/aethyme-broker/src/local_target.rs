@@ -772,6 +772,13 @@ pub fn release_revision(
     if active_wave || budget_held {
         return Err(TargetError::Frozen);
     }
+    let unresolved_transport: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM local_source_transports WHERE revision=?1 AND dispatched=1 AND (observation IN ('unobserved','unavailable') OR write_outcome IS NULL OR write_outcome NOT IN ('succeeded','failed','reconciled_succeeded','reconciled_failed')))",
+        [id.as_str()], |r| r.get(0),
+    )?;
+    if unresolved_transport {
+        return Err(TargetError::Frozen);
+    }
     let active: Option<String> = tx.query_row(
         "SELECT active_revision FROM local_targets WHERE target = ?1",
         [&owner.target],
