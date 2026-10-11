@@ -559,7 +559,12 @@ fn actual_pressure_preserves_retained_source_and_bounded_native_cleanup() {
     });
     let options = gc::GcOptions::default();
     let plan = gc::plan(&mut collector, &options).unwrap();
-    gc::apply(&mut collector, &plan.digest, &options).unwrap();
+    assert!(plan.blockers.is_empty(), "post-build GC must be unblocked");
+    // The concurrent collector may already have reclaimed the exact orphan.
+    // Empty surveys are no-op plans and are deliberately not persisted for apply.
+    if !plan.reclaimable.is_empty() || !plan.entities.is_empty() {
+        gc::apply(&mut collector, &plan.digest, &options).unwrap();
+    }
     assert!(archive::read_object(&collector, &orphan).is_err());
     let restored = tempfile::tempdir().unwrap();
     let source = restored.path().join("source");
