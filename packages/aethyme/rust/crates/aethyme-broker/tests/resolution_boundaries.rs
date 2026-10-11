@@ -692,7 +692,7 @@ fn a_requirement_path_outside_the_tree_is_refused() {
 
 #[test]
 fn a_valid_archived_request_rechecks_decision_scope_and_protection() {
-    use aethyme_broker::collaboration_archive::{put_object, read_object};
+    use aethyme_broker::collaboration_archive::{ObjectDigest, read_object};
     use aethyme_contracts::experimental_v0::Record;
 
     let mut world = two_writers();
@@ -727,10 +727,29 @@ fn a_valid_archived_request_rechecks_decision_scope_and_protection() {
             &[&resolution::RESOLUTION_REQUEST_SCHEMA],
         )
         .unwrap();
+        // The adversarial fixture publishes independently constructed bytes in
+        // its own private CAS. Production exposes no arbitrary object writer.
+        let canonical = decoded.canonical_bytes();
+        let object = ObjectDigest::of(&canonical);
+        let digest = object.hex();
+        let parent = world
+            .store
+            .project_dir()
+            .join("objects/sha256")
+            .join(&digest[..2]);
+        std::fs::create_dir_all(&parent).unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(parent.join(&digest[2..]))
+            .unwrap();
+        std::io::Write::write_all(&mut file, &canonical).unwrap();
+        file.sync_all().unwrap();
         let changed = resolution::RecordRef {
             id: decoded.id(),
-            object: put_object(&world.store, &decoded.canonical_bytes()).unwrap(),
+            object,
         };
+
         assert_ne!(changed.id, raised.record().id);
         assert_eq!(
             resolution::read_record(&world.store, &changed)
