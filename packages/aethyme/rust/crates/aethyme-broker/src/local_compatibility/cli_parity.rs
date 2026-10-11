@@ -43,8 +43,19 @@ pub(super) fn bounded(mut command: Command) -> Output {
         std::thread::sleep(std::time::Duration::from_millis(20));
     };
     client.reaped = true;
-    let stdout = std::fs::read(stdout.path()).unwrap();
-    let stderr = std::fs::read(stderr.path()).unwrap();
+    assert!(stdout.as_file().metadata().unwrap().len() <= 8 * 1024 * 1024);
+    assert!(stderr.as_file().metadata().unwrap().len() <= 8 * 1024 * 1024);
+    let read = |file: &tempfile::NamedTempFile| {
+        let mut bytes = Vec::new();
+        file.reopen()
+            .unwrap()
+            .take(8 * 1024 * 1024 + 1)
+            .read_to_end(&mut bytes)
+            .unwrap();
+        bytes
+    };
+    let stdout = read(&stdout);
+    let stderr = read(&stderr);
     assert!(stdout.len() <= 8 * 1024 * 1024 && stderr.len() <= 8 * 1024 * 1024);
     Output {
         status,
