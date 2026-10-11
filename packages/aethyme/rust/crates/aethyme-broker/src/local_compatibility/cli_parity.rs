@@ -141,15 +141,38 @@ fn actual_disabled_cli_preserves_queue_errors_status_and_hook_contract() {
             CaptureSubmit::Submitted { capture: None, .. }
         ));
         for args in [
-            vec!["broker", "submit", "queue", "--json"],
-            vec!["broker", "submit", "queue"],
+            vec!["broker", "advanced", "queue", "--json"],
+            vec!["broker", "advanced", "queue"],
             vec!["broker", "submit", "--session", "999999", "--json"],
             vec!["broker", "submit", "--session", "999999"],
         ] {
-            equivalent(
-                &super::old_binary::run(&old, &f, &args),
-                &run(&new, &f, &args),
-            );
+            let old_output = super::old_binary::run(&old, &f, &args);
+            let new_output = run(&new, &f, &args);
+            if args[1] == "advanced" {
+                assert!(
+                    old_output.status.success() && new_output.status.success(),
+                    "both native queue inventories must succeed"
+                );
+                if args.last() == Some(&"--json") {
+                    for output in [&old_output, &new_output] {
+                        let inventory: serde_json::Value =
+                            serde_json::from_slice(&output.stdout).unwrap();
+                        let entries = inventory.as_array().expect("native queue JSON inventory");
+                        assert_eq!(entries.len(), 1, "real submission must appear once");
+                        assert_eq!(entries[0]["session_id"], f.session);
+                        assert_eq!(
+                            entries[0]["head_commit"],
+                            git(&f.worktree, &["rev-parse", "HEAD"])
+                        );
+                    }
+                }
+            } else {
+                assert!(
+                    !old_output.status.success() && !new_output.status.success(),
+                    "unknown session must fail in both native binaries"
+                );
+            }
+            equivalent(&old_output, &new_output);
         }
         let old_status =
             super::old_binary::run(&old, &f, &["broker", "status", "--summary", "--json"]);
