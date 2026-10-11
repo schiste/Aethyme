@@ -29,8 +29,13 @@ raises the compatibility floor to 11. Quiesce older open clients. The existing
 external-authority checkpoint includes all `local_*` tables, so announced
 restore covers these journals without silently reviving old producers.
 
-Implementation and qualification are in progress. These descriptions name the
-intended boundary; they are not Q3 or E1 composition evidence.
+Independent adversarial review is clear at `3d95c68d`. Eleven restored verifier
+regressions pass, including the real pinned-Debian Docker schedule. Fifteen
+reachable guard removals each fail their intended regression. The assertion
+inventory also inherits the canonical record decoder's stricter 1 MiB document
+limit; its later 4 MiB check is redundant and has no independent guard-removal
+claim. Host/resource and complete Q3 qualification still depend on #673 and
+the Local QA package. None of this is E1 composition evidence.
 
 The runtime descriptor hashes the native executable path and configured Docker
 client path. Deployment must keep both installations immutable while a process
@@ -47,5 +52,5 @@ are infrastructure-deferred. See [pinned Docker CLI start semantics](https://raw
 Receipt issuance checks cancellation inside its SQLite transaction before the
 journal insert and immediately before commit. Cancellation seen there rolls
 back the receipt; orphan CAS data does not satisfy the authority journal.
-Cancellation after that issuance point does not rewrite historical data; future
+The issuance linearization point is the final precommit cancellation read.\nCancellation arriving after that read can overlap commit and does not rewrite\nhistorical data; future
 applicability still requires the current target, producer and epoch.
