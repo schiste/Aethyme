@@ -37,7 +37,7 @@ use serde::Serialize;
 pub use crate::host_state::HostStateSource;
 
 /// The schema this binary writes.
-pub const COLLABORATION_STATE_SCHEMA_VERSION: i64 = 16;
+pub const COLLABORATION_STATE_SCHEMA_VERSION: i64 = 17;
 /// The oldest schema a database written by this binary can be read by.
 /// Unlike `host-operations.db`, a newer database stays readable by an older
 /// binary until a release raises this floor.
@@ -60,10 +60,10 @@ pub const COLLABORATION_STATE_SCHEMA_VERSION: i64 = 16;
 // Schema 9 does not honor external authority epochs. Quiesce it before restore.
 // Schema 10 cannot enforce the configured verification producer catalogue.
 // Schema 11 cannot fence unresolved source publication against retention release.
-const MIN_COMPATIBLE_SCHEMA: i64 = 16;
+const MIN_COMPATIBLE_SCHEMA: i64 = 17;
 const ROOT_DIRECTORY: &str = "collaboration";
 /// Schema steps after the version 1 layout (`meta` only), applied in
-/// order. Step 16 adds session-bound native handoff journals. The floor is
+/// order. Step 17 adds separately indexed historical imports and rehearsals. The floor is
 /// raised to [`MIN_COMPATIBLE_SCHEMA`].
 const MIGRATIONS: &[(i64, &str)] = &[
     (
@@ -442,6 +442,22 @@ const MIGRATIONS: &[(i64, &str)] = &[
     ) STRICT;
     CREATE TABLE local_adoption_receipts (
         id TEXT PRIMARY KEY NOT NULL, handoff TEXT NOT NULL REFERENCES local_handoffs(id), body BLOB NOT NULL
+    ) STRICT;"),
+    (17,"CREATE TABLE local_imports (
+        id TEXT PRIMARY KEY NOT NULL,bundle TEXT NOT NULL,target TEXT NOT NULL REFERENCES local_targets(target),
+        epoch TEXT NOT NULL,body BLOB NOT NULL,header_sha256 TEXT NOT NULL,
+        UNIQUE(bundle,target,epoch)
+    ) STRICT;
+    CREATE TABLE local_imported_sources (
+        import_id TEXT NOT NULL REFERENCES local_imports(id),snapshot_id TEXT NOT NULL,PRIMARY KEY(import_id,snapshot_id)
+    ) STRICT;
+    CREATE TABLE local_imported_records (
+        import_id TEXT NOT NULL REFERENCES local_imports(id),record_id TEXT NOT NULL,schema TEXT NOT NULL,object_sha256 TEXT NOT NULL,
+        PRIMARY KEY(import_id,record_id)
+    ) STRICT;
+    CREATE TABLE local_import_rehearsals (
+        id TEXT PRIMARY KEY NOT NULL,import_id TEXT NOT NULL REFERENCES local_imports(id),body BLOB NOT NULL,
+        state TEXT NOT NULL CHECK(state IN ('intent','prepared'))
     ) STRICT;"),
 
 ];
@@ -1761,7 +1777,7 @@ mod tests {
         store
             .connection()
             .execute_batch(
-                "DROP TABLE local_adoption_receipts; DROP TABLE local_agent_dispatches; DROP TABLE local_agent_reconciliations; DROP TABLE local_handoffs; DROP TABLE local_agent_sessions; DROP TABLE local_exchange_messages; DROP TABLE local_exchange_deliveries; DROP TABLE local_exchange_streams; DROP TABLE local_exchange_events; DROP TABLE local_exchange_projection; DROP TABLE local_exchange_observations; DROP TABLE local_exchange_bindings; DROP TRIGGER outbox_capture_insert; DROP TRIGGER outbox_capture_update; DROP TRIGGER outbox_capture_delete; DROP TABLE local_generation_roots; DROP TABLE local_generation_receipts; DROP TABLE local_generations; DROP TABLE local_acceptance_qualifications; DROP TABLE local_acceptance_receipts; DROP TABLE local_acceptance_bindings; DROP TABLE local_source_transport_receipts; DROP TABLE local_source_transports; DROP TABLE local_verification_evidence; DROP TABLE local_verifier_producers; DROP TABLE local_authority_state; DROP TABLE local_wave_arrivals;
+                "DROP TABLE local_import_rehearsals; DROP TABLE local_imported_records; DROP TABLE local_imported_sources; DROP TABLE local_imports; DROP TABLE local_adoption_receipts; DROP TABLE local_agent_dispatches; DROP TABLE local_agent_reconciliations; DROP TABLE local_handoffs; DROP TABLE local_agent_sessions; DROP TABLE local_exchange_messages; DROP TABLE local_exchange_deliveries; DROP TABLE local_exchange_streams; DROP TABLE local_exchange_events; DROP TABLE local_exchange_projection; DROP TABLE local_exchange_observations; DROP TABLE local_exchange_bindings; DROP TRIGGER outbox_capture_insert; DROP TRIGGER outbox_capture_update; DROP TRIGGER outbox_capture_delete; DROP TABLE local_generation_roots; DROP TABLE local_generation_receipts; DROP TABLE local_generations; DROP TABLE local_acceptance_qualifications; DROP TABLE local_acceptance_receipts; DROP TABLE local_acceptance_bindings; DROP TABLE local_source_transport_receipts; DROP TABLE local_source_transports; DROP TABLE local_verification_evidence; DROP TABLE local_verifier_producers; DROP TABLE local_authority_state; DROP TABLE local_wave_arrivals;
                  DROP TABLE local_waves;
                  UPDATE meta SET value = '3' WHERE key = 'schema_version';
                  UPDATE meta SET value = '1' WHERE key = 'min_compatible_schema';",
@@ -1797,7 +1813,7 @@ mod tests {
         store
             .connection()
             .execute_batch(
-                "DROP TABLE local_adoption_receipts; DROP TABLE local_agent_dispatches; DROP TABLE local_agent_reconciliations; DROP TABLE local_handoffs; DROP TABLE local_agent_sessions; DROP TABLE local_exchange_messages; DROP TABLE local_exchange_deliveries; DROP TABLE local_exchange_streams; DROP TABLE local_exchange_events; DROP TABLE local_exchange_projection; DROP TABLE local_exchange_observations; DROP TABLE local_exchange_bindings; DROP TRIGGER outbox_capture_insert; DROP TRIGGER outbox_capture_update; DROP TRIGGER outbox_capture_delete; DROP TABLE local_generation_roots; DROP TABLE local_generation_receipts; DROP TABLE local_generations; DROP TABLE local_acceptance_qualifications; DROP TABLE local_acceptance_receipts; DROP TABLE local_acceptance_bindings; DROP TABLE local_source_transport_receipts; DROP TABLE local_source_transports; DROP TABLE local_verification_evidence; DROP TABLE local_verifier_producers; DROP TABLE local_authority_state; DROP TABLE local_wave_arrivals;
+                "DROP TABLE local_import_rehearsals; DROP TABLE local_imported_records; DROP TABLE local_imported_sources; DROP TABLE local_imports; DROP TABLE local_adoption_receipts; DROP TABLE local_agent_dispatches; DROP TABLE local_agent_reconciliations; DROP TABLE local_handoffs; DROP TABLE local_agent_sessions; DROP TABLE local_exchange_messages; DROP TABLE local_exchange_deliveries; DROP TABLE local_exchange_streams; DROP TABLE local_exchange_events; DROP TABLE local_exchange_projection; DROP TABLE local_exchange_observations; DROP TABLE local_exchange_bindings; DROP TRIGGER outbox_capture_insert; DROP TRIGGER outbox_capture_update; DROP TRIGGER outbox_capture_delete; DROP TABLE local_generation_roots; DROP TABLE local_generation_receipts; DROP TABLE local_generations; DROP TABLE local_acceptance_qualifications; DROP TABLE local_acceptance_receipts; DROP TABLE local_acceptance_bindings; DROP TABLE local_source_transport_receipts; DROP TABLE local_source_transports; DROP TABLE local_verification_evidence; DROP TABLE local_verifier_producers; DROP TABLE local_authority_state; DROP TABLE local_wave_arrivals;
                  DROP TABLE local_waves;
                  UPDATE meta SET value = '2' WHERE key = 'schema_version';",
             )

@@ -168,7 +168,7 @@ fn directory(store: &CollaborationStore, generation: &RecordId) -> PathBuf {
             .expect("RecordId digest"),
     )
 }
-fn check_private_directory(path: &Path) -> Result<(), GenerationError> {
+pub(crate) fn check_private_directory(path: &Path) -> Result<(), GenerationError> {
     let m = std::fs::symlink_metadata(path)?;
     if !m.is_dir() || m.file_type().is_symlink() || path.canonicalize()? != path {
         return Err(GenerationError::Incomplete);
@@ -184,7 +184,7 @@ fn check_private_directory(path: &Path) -> Result<(), GenerationError> {
     }
     Ok(())
 }
-fn private_directory(path: &Path) -> Result<(), GenerationError> {
+pub(crate) fn private_directory(path: &Path) -> Result<(), GenerationError> {
     match std::fs::create_dir(path) {
         Ok(()) => crate::host_state::protect_host_state_path(path, true)?,
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
@@ -298,7 +298,7 @@ fn roots(
     )?;
     Ok(())
 }
-fn write_sync(path: &Path, bytes: &[u8]) -> Result<(), GenerationError> {
+pub(crate) fn write_sync(path: &Path, bytes: &[u8]) -> Result<(), GenerationError> {
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -311,7 +311,7 @@ fn write_sync(path: &Path, bytes: &[u8]) -> Result<(), GenerationError> {
     file.sync_all()?;
     Ok(())
 }
-fn sync_tree(path: &Path) -> Result<(), GenerationError> {
+pub(crate) fn sync_tree(path: &Path) -> Result<(), GenerationError> {
     let m = std::fs::symlink_metadata(path)?;
     if m.file_type().is_symlink() {
         return Err(GenerationError::Incomplete);
