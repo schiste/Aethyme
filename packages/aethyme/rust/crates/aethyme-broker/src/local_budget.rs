@@ -23,6 +23,7 @@ static SCHEMA: RecordSchema = RecordSchema {
     capabilities: &[],
 };
 const MAX_LINEAGE_DEPTH: usize = 8;
+const MAX_LINEAGE_RECORDS: i64 = 4096;
 
 /// Conservative cumulative envelope units. Memory/disk/slot amounts are not
 /// reclaimed automatically after a lease expires or a process disappears.
@@ -219,6 +220,9 @@ pub struct Reservation {
     pub spent: Units,
     pub attempts: u32,
     pub version: i64,
+    /// A reported overrun remains visible and blocks new project admission.
+    pub observed_overrun: Option<Units>,
+    pub receipt: Option<RecordId>,
     spec: ReservationSpec,
 }
 
@@ -259,6 +263,8 @@ pub enum BudgetError {
     Pending,
     #[error("reservation or attempt is stale")]
     Stale,
+    #[error("receipt identity was already assigned to another accounting observation")]
+    ReceiptReplay,
     #[error("retry allowance exhausted")]
     AttemptsExhausted,
     #[error("measured usage exceeded its reserved envelope; consumption remains unknown")]
@@ -410,6 +416,7 @@ pub fn authorize_objective(
     let tx = store
         .connection()
         .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    guard(&tx, owner, revision.id.as_str(), state.version)?;
     let existing: Option<String> = tx
         .query_row(
             "SELECT policy FROM local_budget_objectives WHERE objective=?1",
@@ -501,14 +508,32 @@ fn load_conn_at(
             return Err(BudgetError::Invalid("delegation authority".into()));
         }
     }
+    let (observed, receipt): (Option<Vec<u8>>, Option<String>) = conn.query_row(
+        "SELECT observed_overrun,receipt FROM local_budget_reservations WHERE reservation=?1",
+        [key.as_str()],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    let observed_overrun: Option<Units> = observed
+        .as_deref()
+        .map(serde_json::from_slice)
+        .transpose()?;
+    if let Some(usage) = observed_overrun {
+        usage.validate()?;
+        if state != State::ConsumptionUnknown || receipt.is_none() {
+            return Err(BudgetError::Invalid("overrun state".into()));
+        }
+    }
     Ok(Reservation {
         id: key.clone(),
+
         root,
         state,
         allocated: spec.request.units,
         spent,
         attempts: row.3,
         version: row.4,
+        observed_overrun,
+        receipt: receipt.as_deref().map(id).transpose()?,
         spec,
     })
 }
@@ -601,6 +626,16 @@ fn insert(
     conn.execute("INSERT INTO local_budget_reservations(reservation,nonce,target,revision,wave,root,parent,body,phase,spent) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,'reserved',?9)",params![r.id().as_str(),spec.request.nonce,spec.target,spec.revision,spec.wave,root.as_str(),spec.parent,r.canonical_bytes(),serde_json::to_vec(&Units::default())?])?;
     Ok(())
 }
+fn nonce_key(conn: &Connection, nonce: &str) -> Result<Option<RecordId>, BudgetError> {
+    let key: Option<String> = conn
+        .query_row(
+            "SELECT reservation FROM local_budget_reservations WHERE nonce=?1",
+            [nonce],
+            |r| r.get(0),
+        )
+        .optional()?;
+    key.as_deref().map(id).transpose()
+}
 fn duplicate(
     conn: &Connection,
     nonce: &str,
@@ -631,6 +666,17 @@ pub fn reserve(
     request: Request,
     now_ms: i64,
 ) -> Result<Reservation, BudgetError> {
+    target::authorize(store, owner)?;
+    if let Some(key) = nonce_key(store.read_connection(), &request.nonce)? {
+        let existing = owned(store, owner, &key)?;
+        if existing.spec.wave != wave_id.as_str()
+            || existing.spec.parent.is_some()
+            || existing.spec.request != request
+        {
+            return Err(BudgetError::Immutable);
+        }
+        return Ok(existing);
+    }
     request.validate()?;
     if now_ms < 0
         || now_ms >= request.deadline_ms
@@ -662,6 +708,15 @@ pub fn reserve(
         .connection()
         .transaction_with_behavior(TransactionBehavior::Immediate)?;
     guard(&tx, owner, &spec.revision, state.version)?;
+    let overrun: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM local_budget_reservations WHERE observed_overrun IS NOT NULL)",
+        [],
+        |row| row.get(0),
+    )?;
+    if overrun {
+        return Err(BudgetError::Capacity("unreconciled overrun"));
+    }
+
     if let Some(existing) = duplicate(&tx, &spec.request.nonce, &r)? {
         return Ok(existing);
     }
@@ -744,7 +799,17 @@ pub fn delegate(
     now_ms: i64,
 ) -> Result<Reservation, BudgetError> {
     let parent = owned(store, owner, parent)?;
+    if let Some(key) = nonce_key(store.read_connection(), &request.nonce)? {
+        let existing = owned(store, owner, &key)?;
+        if existing.spec.parent.as_deref() != Some(parent.id.as_str())
+            || existing.spec.request != request
+        {
+            return Err(BudgetError::Immutable);
+        }
+        return Ok(existing);
+    }
     request.validate()?;
+
     if !matches!(parent.state, State::Reserved | State::PartlyConsumed)
         || now_ms < 0
         || now_ms >= request.deadline_ms
@@ -789,6 +854,14 @@ pub fn delegate(
         }
         ancestor = r.spec.parent.as_deref().map(id).transpose()?;
     }
+    let records: i64 = tx.query_row(
+        "SELECT count(*) FROM local_budget_reservations WHERE root=?1",
+        [parent.root.as_str()],
+        |r| r.get(0),
+    )?;
+    if records >= MAX_LINEAGE_RECORDS {
+        return Err(BudgetError::Capacity("lineage records"));
+    }
     let used = parent
         .spent
         .add(sum(children(&tx, &parent.id)?.iter().map(charge))?)?;
@@ -830,14 +903,18 @@ pub fn begin_attempt(
     if r.attempts >= r.spec.request.max_attempts {
         return Err(BudgetError::AttemptsExhausted);
     }
-    let root = load_conn(&tx, &r.root)?;
-    let used_attempts: u32 = tx.query_row(
-        "SELECT coalesce(sum(attempts),0) FROM local_budget_reservations WHERE root=?1",
-        [r.root.as_str()],
-        |row| row.get(0),
-    )?;
-    if used_attempts >= root.spec.request.max_attempts {
-        return Err(BudgetError::AttemptsExhausted);
+    // Every subdivided ancestor retains its own retry envelope. Grandchildren
+    // share a smaller parent's allowance even when the root has more attempts.
+    let mut ancestor = Some(r.id.clone());
+    while let Some(key) = ancestor {
+        let allocation = load_conn(&tx, &key)?;
+        let used_attempts: u32 = tx.query_row(
+            "WITH RECURSIVE subtree(reservation) AS (SELECT ?1 UNION ALL SELECT r.reservation FROM local_budget_reservations r JOIN subtree s ON r.parent=s.reservation) SELECT coalesce(sum(attempts),0) FROM local_budget_reservations WHERE reservation IN (SELECT reservation FROM subtree)",
+            [key.as_str()], |row| row.get(0))?;
+        if used_attempts >= allocation.spec.request.max_attempts {
+            return Err(BudgetError::AttemptsExhausted);
+        }
+        ancestor = allocation.spec.parent.as_deref().map(id).transpose()?;
     }
     let used = r.spent.add(sum(children(&tx, key)?.iter().map(charge))?)?;
     let remaining = r.allocated.subtract(used)?;
@@ -881,10 +958,33 @@ fn charge_usage(
     if children(&tx, key)?.iter().any(|c| c.state.held()) {
         return Err(BudgetError::Pending);
     }
+    let assigned: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM local_budget_receipts WHERE receipt=?1)",
+        [receipt.as_str()],
+        |r| r.get(0),
+    )?;
+    if assigned {
+        return Err(BudgetError::ReceiptReplay);
+    }
+    if let Some(observed) = r.observed_overrun {
+        if !observed.within(usage) {
+            return Err(BudgetError::UsageExceeded);
+        }
+    }
+    tx.execute(
+        "INSERT INTO local_budget_receipts(receipt,reservation,attempt,usage) VALUES(?1,?2,?3,?4)",
+        params![
+            receipt.as_str(),
+            key.as_str(),
+            r.attempts,
+            serde_json::to_vec(&usage)?
+        ],
+    )?;
     let next = r.spent.add(usage)?;
+
     let children_spent = sum(children(&tx, key)?.iter().map(charge))?;
     if !next.add(children_spent)?.within(r.allocated) {
-        tx.execute("UPDATE local_budget_reservations SET phase='consumption_unknown',detail='usage exceeded reserved envelope',version=version+1 WHERE reservation=?1",[key.as_str()])?;
+        tx.execute("UPDATE local_budget_reservations SET phase='consumption_unknown',detail='usage exceeded reserved envelope',observed_overrun=?2,receipt=?3,version=version+1 WHERE reservation=?1",params![key.as_str(),serde_json::to_vec(&usage)?,receipt.as_str()])?;
         tx.commit()?;
         return Err(BudgetError::UsageExceeded);
     }

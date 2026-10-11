@@ -40,7 +40,7 @@ re-registering an objective creates another allowance.
 
 Delegation subdivides the parent allocation and preserves its root lineage.
 Project accounting counts each root once. The lineage's attempt allowance is
-shared by parent and descendants. A parent cannot dispatch while a child is
+shared by parent and descendants; every intermediate ancestor retains its own smaller attempt envelope. Descendant records are bounded independently of zero-spend recycling. A parent cannot dispatch while a child is
 held; consumed child cost rolls into its parent once when that parent closes.
 
 `begin_attempt` persists `completion_pending` before returning a non-cloneable
@@ -54,19 +54,19 @@ an OS process or constrain a provider credential.
 States are `reserved`, `partly_consumed`, `completion_pending`, `consumed`,
 `released_unused` and `consumption_unknown`. A deadline or process disappearance
 never releases unresolved consumption. Excess reported usage leaves the grant
-unknown and held instead of pretending the declared cap was enforced.
+unknown and held instead of pretending the declared cap was enforced. The observed overrun and receipt remain visible, and new project reservations are blocked, including fresh objectives and recovery. This provisional model cannot forgive an observed overrun with a smaller receipt; resolving a disputed observation needs a future trusted operator workflow.
 
 Owner-supplied usage and receipt references are accounting inputs. L6 must
 validate actual producer, assignment, profile, exact attempt and usage before
 calling settlement. They grant no source, acceptance or publication authority.
 An explicit reconciliation can account usage after a crash; stale attempts and
-receipt replays cannot charge again. A parent cannot close while descendants
+receipt replays cannot charge again. Receipt IDs are assigned once to an exact reservation and attempt in a persistent ledger; their contents still require the future trusted receipt adapter. A parent cannot close while descendants
 remain live or unknown. Target selection and retention release are blocked while
 any reservation under that target/revision remains held.
 
 ## Evidence and limits
 
-Model tests cover immutable caps, idempotency, aggregate accounting, finite
+Model tests also interleave concurrent admissions under distinct targets and fresh objectives, reopen pending work, and reject correctly rehashed delegation changes. Model tests cover immutable caps, idempotency, aggregate accounting, finite
 retry lineage, delegated subdivision, protected lanes, stale settlement,
 unknown consumption, deadline behavior, conservative overage and retention.
 Project identity has an independent Node canonical JSON/SHA-256 vector; Node is

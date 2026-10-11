@@ -62,7 +62,9 @@ fn setup() -> (Fixture, ControllerOwner, RecordId) {
     (f, owner, wave.id)
 }
 fn receipt() -> RecordId {
-    id(&reference('e')).unwrap()
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0x10000);
+    let sequence = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    id(&format!("sha256:{sequence:064x}")).unwrap()
 }
 
 #[test]
@@ -396,4 +398,319 @@ fn independent_project_identity_vector_binds_all_cap_dimensions() {
     let mut changed = spec;
     changed.policy.cap.spend_microunits += 1;
     assert_ne!(record(&changed).unwrap().id(), r.id());
+}
+
+fn reopen(f: &Fixture) -> CollaborationStore {
+    use crate::collaboration_state::{CollaborationRoot, ProjectKey};
+    CollaborationStore::open(
+        &CollaborationRoot::under_host_state(f._host.path()),
+        &ProjectKey::parse("local-target-test").unwrap(),
+        &[],
+    )
+    .unwrap()
+}
+fn another_target(f: &mut Fixture) -> (ControllerOwner, RecordId) {
+    let owner = target::acquire_controller(&mut f.store, "other", "appointed").unwrap();
+    let mut spec = f.spec();
+    spec.objective_authorization = reference('2');
+    let revision = target::propose_revision(&mut f.store, &owner, spec).unwrap();
+    target::select_revision(&mut f.store, &owner, &revision.id).unwrap();
+    wave::available(&mut f.store, &owner, "A", 0).unwrap();
+    let wave::Admission::Frozen(w) = wave::admit(
+        &mut f.store,
+        &owner,
+        wave::WavePolicy {
+            debounce_ms: 0,
+            ..Default::default()
+        },
+        0,
+    )
+    .unwrap() else {
+        panic!("not frozen")
+    };
+    authorize_objective(&mut f.store, &owner, units(10)).unwrap();
+    (owner, w.id)
+}
+#[test]
+fn concurrent_targets_and_new_objectives_share_one_project_cap() {
+    let (mut f, one, w1) = setup();
+    let (two, w2) = another_target(&mut f);
+    let mut s1 = reopen(&f);
+    let mut s2 = reopen(&f);
+    let barrier = std::sync::Barrier::new(2);
+    let results = std::thread::scope(|scope| {
+        let b = &barrier;
+        let a = scope.spawn(move || {
+            b.wait();
+            reserve(
+                &mut s1,
+                &one,
+                &w1,
+                request('a', 6, WorkKind::Composition),
+                0,
+            )
+        });
+        let b = &barrier;
+        let c = scope.spawn(move || {
+            b.wait();
+            reserve(
+                &mut s2,
+                &two,
+                &w2,
+                request('b', 6, WorkKind::Composition),
+                0,
+            )
+        });
+        [a.join().unwrap(), c.join().unwrap()]
+    });
+    assert_eq!(results.iter().filter(|r| r.is_ok()).count(), 1);
+    assert_eq!(
+        results
+            .iter()
+            .filter(|r| matches!(r, Err(BudgetError::Capacity("project"))))
+            .count(),
+        1
+    );
+    let total: i64 = f
+        .store
+        .read_connection()
+        .query_row("SELECT count(*) FROM local_budget_reservations", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(total, 1);
+}
+#[test]
+fn reopen_preserves_pending_consumption_and_retry_lineage() {
+    let (mut f, owner, w) = setup();
+    let r = reserve(
+        &mut f.store,
+        &owner,
+        &w,
+        request('a', 3, WorkKind::Composition),
+        0,
+    )
+    .unwrap();
+    let attempt = begin_attempt(&mut f.store, &owner, &r.id, 0).unwrap();
+    let mut restored = reopen(&f);
+    let r = load(&restored, &r.id).unwrap();
+    assert_eq!(r.state, State::CompletionPending);
+    assert_eq!(r.attempts, 1);
+    assert_eq!(charged(&restored, &owner).unwrap(), units(3));
+    assert!(matches!(
+        begin_attempt(&mut restored, &owner, &r.id, 1),
+        Err(BudgetError::Pending)
+    ));
+    let r = settle(&mut restored, &owner, &attempt, units(1), &receipt()).unwrap();
+    let r = close(&mut restored, &owner, &r.id, r.version).unwrap();
+    assert_eq!(load(&f.store, &r.id).unwrap().spent, units(1));
+    assert_eq!(charged(&f.store, &owner).unwrap(), units(1));
+}
+#[test]
+fn grandchild_siblings_share_each_ancestor_retry_allowance() {
+    let (mut f, owner, w) = setup();
+    let mut req = request('a', 8, WorkKind::Composition);
+    req.max_attempts = 8;
+    let root = reserve(&mut f.store, &owner, &w, req, 0).unwrap();
+    let child = delegate(
+        &mut f.store,
+        &owner,
+        &root.id,
+        request('b', 4, WorkKind::Composition),
+        0,
+    )
+    .unwrap();
+    let x = delegate(
+        &mut f.store,
+        &owner,
+        &child.id,
+        request('c', 2, WorkKind::Composition),
+        0,
+    )
+    .unwrap();
+    let y = delegate(
+        &mut f.store,
+        &owner,
+        &child.id,
+        request('d', 2, WorkKind::Composition),
+        0,
+    )
+    .unwrap();
+    for _ in 0..2 {
+        let a = begin_attempt(&mut f.store, &owner, &x.id, 0).unwrap();
+        settle(&mut f.store, &owner, &a, units(1), &receipt()).unwrap();
+    }
+    let x = load(&f.store, &x.id).unwrap();
+    close(&mut f.store, &owner, &x.id, x.version).unwrap();
+    assert!(matches!(
+        begin_attempt(&mut f.store, &owner, &y.id, 0),
+        Err(BudgetError::AttemptsExhausted)
+    ));
+}
+#[test]
+fn overrun_observation_cannot_be_hidden_by_a_smaller_receipt_or_new_objective() {
+    let (mut f, owner, w) = setup();
+    let r = reserve(
+        &mut f.store,
+        &owner,
+        &w,
+        request('a', 2, WorkKind::Composition),
+        0,
+    )
+    .unwrap();
+    let observed_receipt = receipt();
+    let a = begin_attempt(&mut f.store, &owner, &r.id, 0).unwrap();
+    assert!(matches!(
+        settle(&mut f.store, &owner, &a, units(3), &observed_receipt),
+        Err(BudgetError::UsageExceeded)
+    ));
+    let mut restored = reopen(&f);
+    let r = load(&restored, &r.id).unwrap();
+    assert_eq!(r.observed_overrun, Some(units(3)));
+    assert_eq!(r.receipt, Some(observed_receipt));
+    assert!(matches!(
+        reconcile(
+            &mut restored,
+            &owner,
+            &r.id,
+            r.version,
+            units(1),
+            &receipt()
+        ),
+        Err(BudgetError::UsageExceeded)
+    ));
+    let (other, w2) = another_target(&mut f);
+    assert!(matches!(
+        reserve(
+            &mut f.store,
+            &other,
+            &w2,
+            request('b', 1, WorkKind::Recovery),
+            0
+        ),
+        Err(BudgetError::Capacity("unreconciled overrun"))
+    ));
+}
+#[test]
+fn correctly_rehashed_delegation_cannot_change_pinned_authority() {
+    let (mut f, owner, w) = setup();
+    let root = reserve(
+        &mut f.store,
+        &owner,
+        &w,
+        request('a', 3, WorkKind::OptionalAnalysis),
+        0,
+    )
+    .unwrap();
+    let child = delegate(
+        &mut f.store,
+        &owner,
+        &root.id,
+        request('b', 1, WorkKind::OptionalAnalysis),
+        0,
+    )
+    .unwrap();
+    let mut spec = child.spec;
+    spec.request.kind = WorkKind::Recovery;
+    let forged = record(&spec).unwrap();
+    f.store
+        .connection()
+        .execute(
+            "UPDATE local_budget_reservations SET reservation=?2,body=?3 WHERE reservation=?1",
+            params![
+                child.id.as_str(),
+                forged.id().as_str(),
+                forged.canonical_bytes()
+            ],
+        )
+        .unwrap();
+    assert!(matches!(
+        load(&f.store, &forged.id()),
+        Err(BudgetError::Invalid(_))
+    ));
+}
+#[test]
+fn zero_spend_delegation_recycling_has_a_finite_record_limit() {
+    let (mut f, owner, w) = setup();
+    let root = reserve(
+        &mut f.store,
+        &owner,
+        &w,
+        request('a', 3, WorkKind::Composition),
+        0,
+    )
+    .unwrap();
+    // Saturate the model count directly; its rows need not grant dispatch.
+    let tx = f.store.connection().transaction().unwrap();
+    for i in 1..MAX_LINEAGE_RECORDS {
+        let mut spec = root.spec.clone();
+        spec.parent = Some(root.id.to_string());
+        spec.request.nonce = format!("sha256:{i:064x}");
+        spec.request.units = units(1);
+        let r = record(&spec).unwrap();
+        insert(&tx, &r, &spec, &root.id).unwrap();
+        tx.execute(
+            "UPDATE local_budget_reservations SET phase='released_unused' WHERE reservation=?1",
+            [r.id().as_str()],
+        )
+        .unwrap();
+    }
+    tx.commit().unwrap();
+    assert!(matches!(
+        delegate(
+            &mut f.store,
+            &owner,
+            &root.id,
+            request('f', 1, WorkKind::Composition),
+            0
+        ),
+        Err(BudgetError::Capacity("lineage records"))
+    ));
+}
+
+#[test]
+fn receipt_ids_cannot_be_reused_across_attempts_or_allocations() {
+    let (mut f, owner, w) = setup();
+    let r = reserve(
+        &mut f.store,
+        &owner,
+        &w,
+        request('a', 3, WorkKind::Composition),
+        0,
+    )
+    .unwrap();
+    let receipt = receipt();
+    let one = begin_attempt(&mut f.store, &owner, &r.id, 0).unwrap();
+    settle(&mut f.store, &owner, &one, units(1), &receipt).unwrap();
+    let two = begin_attempt(&mut f.store, &owner, &r.id, 1).unwrap();
+    assert!(matches!(
+        settle(&mut f.store, &owner, &two, units(1), &receipt),
+        Err(BudgetError::ReceiptReplay)
+    ));
+    assert_eq!(load(&f.store, &r.id).unwrap().spent, units(1));
+    assert_eq!(
+        load(&f.store, &r.id).unwrap().state,
+        State::CompletionPending
+    );
+}
+#[test]
+fn exact_root_and_delegation_replays_return_history_after_stop_and_expiry() {
+    let (mut f, owner, w) = setup();
+    let req = request('a', 3, WorkKind::Composition);
+    let root = reserve(&mut f.store, &owner, &w, req.clone(), 0).unwrap();
+    let creq = request('b', 1, WorkKind::Composition);
+    let child = delegate(&mut f.store, &owner, &root.id, creq.clone(), 0).unwrap();
+    let child = close(&mut f.store, &owner, &child.id, child.version).unwrap();
+    let root = load(&f.store, &root.id).unwrap();
+    let root = close(&mut f.store, &owner, &root.id, root.version).unwrap();
+    wave::stop(&mut f.store, &owner, &w).unwrap();
+    assert_eq!(reserve(&mut f.store, &owner, &w, req, 2000).unwrap(), root);
+    assert_eq!(
+        delegate(&mut f.store, &owner, &root.id, creq, 2000).unwrap(),
+        child
+    );
+    assert!(matches!(
+        begin_attempt(&mut f.store, &owner, &root.id, 2000),
+        Err(BudgetError::Stale)
+    ));
 }

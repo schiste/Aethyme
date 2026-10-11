@@ -335,9 +335,15 @@ const MIGRATIONS: &[(i64, &str)] = &[
             root TEXT NOT NULL, parent TEXT, body BLOB NOT NULL,
             phase TEXT NOT NULL CHECK(phase IN ('reserved','partly_consumed','completion_pending','consumed','released_unused','consumption_unknown')),
             spent BLOB NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
-            version INTEGER NOT NULL DEFAULT 0, receipt TEXT, detail TEXT
+            version INTEGER NOT NULL DEFAULT 0, receipt TEXT, detail TEXT, observed_overrun BLOB
         );
-        CREATE INDEX IF NOT EXISTS local_budget_roots ON local_budget_reservations(root,parent);
+        CREATE TABLE IF NOT EXISTS local_budget_receipts (
+            receipt TEXT PRIMARY KEY NOT NULL,
+            reservation TEXT NOT NULL REFERENCES local_budget_reservations(reservation),
+            attempt INTEGER NOT NULL, usage BLOB NOT NULL
+        ) STRICT;
+        CREATE INDEX IF NOT EXISTS local_budget_roots
+ ON local_budget_reservations(root,parent);
     "#,
     ),
 ];
