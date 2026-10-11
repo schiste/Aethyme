@@ -31,6 +31,10 @@ pub(super) fn bounded(mut command: Command) -> Output {
     };
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     let status = loop {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "native compatibility deadline"
+        );
         if let Some(status) = client.child.try_wait().unwrap() {
             break status;
         }
@@ -94,6 +98,11 @@ fn current() -> PathBuf {
     binary
 }
 fn run(binary: &Path, f: &Fixture, args: &[&str]) -> Output {
+    assert_eq!(
+        current(),
+        binary,
+        "current executable is reverified before every invocation"
+    );
     let mut command = Command::new("/usr/bin/sandbox-exec");
     command
         .args(["-p", super::old_binary::DENY_NETWORK])
@@ -107,7 +116,7 @@ fn run(binary: &Path, f: &Fixture, args: &[&str]) -> Output {
     let result = bounded(command);
     eprintln!(
         "compatibility current CLI transcript {}",
-        serde_json::json!({"argv":args,"status":result.status.code(),"stdout_sha256":crate::collaboration_archive::ObjectDigest::of(&result.stdout).hex(),"stderr_sha256":crate::collaboration_archive::ObjectDigest::of(&result.stderr).hex()})
+        serde_json::json!({"source":std::env::var("AETHYME_COMPAT_CURRENT_SOURCE").unwrap(),"binary_sha256":std::env::var("AETHYME_COMPAT_CURRENT_SHA256").unwrap(),"network":"kernel-denied","argv":args,"status":result.status.code(),"stdout_sha256":crate::collaboration_archive::ObjectDigest::of(&result.stdout).hex(),"stderr_sha256":crate::collaboration_archive::ObjectDigest::of(&result.stderr).hex()})
     );
     result
 }
@@ -178,6 +187,8 @@ fn actual_disabled_cli_preserves_queue_errors_status_and_hook_contract() {
             assert_eq!(a, b, "only exact installed executable path may differ");
             assert_eq!(old_result.stderr, new_result.stderr);
         }
+        let mut hook_witness = Vec::new();
+        let mut installed_bytes = Vec::new();
         for executable in [&old, &new] {
             let installed = if executable == &old {
                 super::old_binary::run(
@@ -195,20 +206,63 @@ fn actual_disabled_cli_preserves_queue_errors_status_and_hook_contract() {
             assert!(installed.status.success());
             let pre_commit = f.repo.path().join(".git/hooks/pre-commit");
             assert!(pre_commit.is_file());
-            let mut hook = Command::new("/usr/bin/sandbox-exec");
-            hook.args(["-p", super::old_binary::DENY_NETWORK, "/bin/sh"])
-                .arg(pre_commit)
-                .current_dir(&f.worktree)
-                .env_clear()
-                .env("PATH", super::old_binary::CLEAN_PATH)
-                .env("AETHYME_HOST_STATE_DIR", f.host.path())
-                .env("AETHYME_WORKTREE_ROOT", f._worktrees.path());
-            let output = bounded(hook);
+            let bytes = std::fs::read_to_string(&pre_commit).unwrap();
+            let binding = format!("AETHYME='{}'", executable.display());
             assert!(
-                output.status.success(),
-                "actual owned pre-commit hook failed: {:?}",
-                output
+                bytes.contains(&binding),
+                "installed hook must bind the verified executable"
             );
+            assert!(bytes.contains("\"$AETHYME\" broker hooks pre-commit || exit $?"));
+            installed_bytes.push(bytes.replace(executable.to_str().unwrap(), "<installed-binary>"));
+            if executable == &old {
+                assert_eq!(super::old_binary::binary(), old);
+            } else {
+                assert_eq!(current(), new);
+            }
+            let invoke = |cwd: &Path| {
+                let mut hook = Command::new("/usr/bin/sandbox-exec");
+                hook.args(["-p", super::old_binary::DENY_NETWORK, "/bin/sh"])
+                    .arg(&pre_commit)
+                    .current_dir(cwd)
+                    .env_clear()
+                    .env("PATH", super::old_binary::CLEAN_PATH)
+                    .env("AETHYME_HOST_STATE_DIR", f.host.path())
+                    .env("AETHYME_WORKTREE_ROOT", f._worktrees.path());
+                bounded(hook)
+            };
+            let positive = invoke(&f.worktree);
+            assert!(
+                positive.status.success(),
+                "actual owned hook failed: {:?}",
+                positive
+            );
+            let refusal = invoke(f.repo.path());
+            let require_refusal = |output: &Output| {
+                assert!(
+                    !output.status.success(),
+                    "unowned protected checkout must refuse"
+                );
+                assert!(
+                    String::from_utf8_lossy(&output.stderr).contains("not owned by a live session"),
+                    "native session boundary must be the actual refusal: {:?}",
+                    output
+                );
+            };
+            require_refusal(&refusal);
+            // An empty shim must fail that same native refusal assertion. Keep
+            // a unique private backup and restore before rechecking real bytes.
+            let backup = tempfile::NamedTempFile::new().unwrap();
+            std::fs::write(backup.path(), &bytes).unwrap();
+            std::fs::write(&pre_commit, "#!/bin/sh\nexit 0\n").unwrap();
+            let broken = invoke(f.repo.path());
+            let rejects_noop = std::panic::catch_unwind(|| require_refusal(&broken)).is_err();
+            std::fs::write(&pre_commit, std::fs::read(backup.path()).unwrap()).unwrap();
+            assert!(
+                rejects_noop,
+                "independent hook refusal oracle must reject a no-op shim"
+            );
+            require_refusal(&invoke(f.repo.path()));
+            hook_witness.push((positive, refusal));
             let removed = if executable == &old {
                 super::old_binary::run(
                     executable,
@@ -224,6 +278,9 @@ fn actual_disabled_cli_preserves_queue_errors_status_and_hook_contract() {
             };
             assert!(removed.status.success());
         }
+        assert_eq!(installed_bytes[0], installed_bytes[1]);
+        equivalent(&hook_witness[0].0, &hook_witness[1].0);
+        equivalent(&hook_witness[0].1, &hook_witness[1].1);
         assert!(!f.host.path().join("collaboration").exists());
     }
 }
