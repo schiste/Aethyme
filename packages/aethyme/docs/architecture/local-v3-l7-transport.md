@@ -1,5 +1,7 @@
 # Local v3 L7 exact Git source transport (provisional, #674)
 
+Last Updated: 2026-10-11
+
 Profile: `aethyme.source-transport.git/provisional-v0`. Existing broker coordinated
 Git operations own command liveness, authorization, hooks, locks and outcomes.
 The retained project's state.db owns exact transport intents and canonical past
@@ -58,3 +60,19 @@ This is a library boundary. CLI/controller integration is assigned to later Loca
 packages; typed gate wiring waits for #725. Composer source remains provisional
 pending E1. Bare Playground Git tests do not qualify external GitHub/Mergify
 acceptance or provider paths. No Artifacts/Workers implementation is included.
+
+## Verification
+
+Sixteen disposable Playground tests cover native conditional publication and
+exact-object reads, wrong refs/objects, caller response loss, stopped/old-epoch
+fencing, historical record integrity, unresolved retention, native operation
+identity, replacement refs, chained URL rewrites and query deadlines/failures.
+Independent review found the replacement-ref and URL-rewrite bugs; both are
+fixed and re-review cleared the implementation. Fourteen deliberate guard
+removals each failed the intended test; source was restored exactly afterwards.
+Selected regression checks are in progress.
+
+The exact-object read options follow [Git's fetch documentation](https://git-scm.com/docs/git-fetch):
+empty `--refmap` suppresses configured tracking mappings, while
+`--no-write-fetch-head` prevents FETCH_HEAD writes. No remote durability or
+provider review claim follows from these transport options.

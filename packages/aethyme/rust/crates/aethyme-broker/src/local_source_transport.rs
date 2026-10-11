@@ -390,7 +390,7 @@ pub fn prepare(
             .ok_or(TransportError::Missing)?
             .to_string(),
         commit: commit.as_str().into(),
-        tree: archive::raw_commit_tree(carrier.repo.root(), &commit)?,
+        tree: archive::raw_commit_tree(carrier.repo.root(), commit)?,
         peer: carrier.identity.coordination_key.clone(),
         remote_binding: remote_binding(carrier)?,
         repository_binding: carrier.repository_binding.clone(),
@@ -559,7 +559,7 @@ pub fn inspect(
     let observed = crate::git::with_git_deadline(Duration::from_secs(carrier.timeout), || {
         carrier
             .repo
-            .remote_fetch_ref_oids(&carrier.remote, &[carrier.destination.clone()])
+            .remote_fetch_ref_oids(&carrier.remote, std::slice::from_ref(&carrier.destination))
     });
     let (observation, oid) = match observed {
         Ok(map) => match map.get(&carrier.destination).cloned().flatten() {
