@@ -4,6 +4,90 @@ use crate::local_budget::{self as budget, ProjectPolicy, Request, State, Units, 
 use crate::local_target::{self as target, tests::Fixture};
 use crate::local_wave::{self as wave, Admission, WavePhase, WavePolicy};
 
+#[test]
+fn a_frozen_witness_blocks_even_matching_database_and_handle_epochs() {
+    let (f, owner, _w, _a) = setup();
+    let mut w = status(&f.store).unwrap();
+    w.status = Status::Frozen;
+    write(&directory(&f.store).unwrap(), &w).unwrap();
+    assert!(matches!(
+        guard(&f.store, owner.authority_epoch()),
+        Err(AuthorityError::Frozen)
+    ));
+}
+
+#[test]
+fn restored_matching_handle_and_database_cannot_bypass_the_current_witness() {
+    let (mut f, owner, _w, _a) = setup();
+    let frozen = freeze(&mut f.store, owner.authority_epoch(), "revoke").unwrap();
+    resume(&mut f.store, &frozen.epoch).unwrap();
+    f.store
+        .connection()
+        .execute(
+            "UPDATE local_authority_state SET epoch=?1",
+            [owner.authority_epoch().as_str()],
+        )
+        .unwrap();
+    assert!(matches!(
+        guard(&f.store, owner.authority_epoch()),
+        Err(AuthorityError::Stale)
+    ));
+}
+
+#[test]
+fn escaped_reasons_and_details_remain_readable_at_the_source_byte_limit() {
+    let (mut f, owner, _w, a) = setup();
+    let detail = "\0".repeat(4096);
+    let frozen = freeze(&mut f.store, owner.authority_epoch(), &detail).unwrap();
+    assert_eq!(status(&f.store).unwrap(), frozen);
+    let observation = record_late_outcome(
+        &f.store,
+        &a,
+        &RecordId::parse(&reference('e')).unwrap(),
+        &detail,
+    )
+    .unwrap();
+    assert_eq!(historical_outcomes(&f.store).unwrap(), vec![observation]);
+    resume(&mut f.store, &frozen.epoch).unwrap();
+}
+
+#[test]
+fn identical_history_retry_flushes_both_directories_after_interrupted_flush() {
+    let (mut f, owner, _w, a) = setup();
+    freeze(&mut f.store, owner.authority_epoch(), "stop").unwrap();
+    let receipt = RecordId::parse(&reference('e')).unwrap();
+    let first = record_late_outcome_with(&f.store, &a, &receipt, "late", |_| {
+        Err(std::io::Error::other("injected directory flush failure").into())
+    });
+    assert!(first.is_err());
+    assert_eq!(historical_outcomes(&f.store).unwrap().len(), 1);
+    let mut flushed = Vec::new();
+    record_late_outcome_with(&f.store, &a, &receipt, "late", |path| {
+        flushed.push(path.to_owned());
+        Ok(sync_directory(path)?)
+    })
+    .unwrap();
+    let path = directory(&f.store).unwrap();
+    assert_eq!(flushed, vec![path.join("history"), path]);
+}
+
+#[test]
+fn an_active_witness_refuses_a_database_bound_to_another_epoch() {
+    let (mut f, owner, _w, _a) = setup();
+    let wrong = fresh_epoch().unwrap();
+    f.store
+        .connection()
+        .execute(
+            "UPDATE local_authority_state SET epoch=?1",
+            [wrong.as_str()],
+        )
+        .unwrap();
+    assert!(wave::available(&mut f.store, &owner, "A", 1).is_err());
+    assert!(crate::collaboration_gc::plan(&mut f.store, &Default::default()).is_err());
+    drop(owner);
+    assert!(target::acquire_controller(&mut f.store, "target", "appointed").is_err());
+}
+
 fn reference(n: char) -> String {
     format!("sha256:{}", n.to_string().repeat(64))
 }

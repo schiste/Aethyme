@@ -13,6 +13,9 @@ use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+// A 4096-byte reason/detail may require six JSON bytes per escaped byte.
+const MAX_FILE_BYTES: usize = 32 * 1024;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct Epoch(String);
@@ -86,7 +89,7 @@ fn prepare(path: &Path) -> Result<(), AuthorityError> {
 }
 fn read(path: &Path) -> Result<Witness, AuthorityError> {
     let bytes = std::fs::read(path.join("witness.json"))?;
-    if bytes.len() > 16 * 1024 {
+    if bytes.len() > MAX_FILE_BYTES {
         return Err(AuthorityError::Invalid("witness size".into()));
     }
     let w: Witness = serde_json::from_slice(&bytes)?;
@@ -102,10 +105,14 @@ fn read(path: &Path) -> Result<Witness, AuthorityError> {
     Ok(w)
 }
 fn write(path: &Path, w: &Witness) -> Result<(), AuthorityError> {
+    let bytes = serde_json::to_vec(w)?;
+    if bytes.len() > MAX_FILE_BYTES {
+        return Err(AuthorityError::Invalid("witness size".into()));
+    }
     let mut file = tempfile::Builder::new()
         .prefix(".epoch-")
         .tempfile_in(path)?;
-    file.write_all(&serde_json::to_vec(w)?)?;
+    file.write_all(&bytes)?;
     file.as_file().sync_all()?;
     file.persist(path.join("witness.json"))
         .map_err(|e| e.error)?;
@@ -392,6 +399,17 @@ pub fn record_late_outcome(
     receipt: &RecordId,
     detail: &str,
 ) -> Result<HistoricalObservation, AuthorityError> {
+    record_late_outcome_with(store, attempt, receipt, detail, |path| {
+        Ok(sync_directory(path)?)
+    })
+}
+fn record_late_outcome_with(
+    store: &CollaborationStore,
+    attempt: &crate::local_budget::Attempt,
+    receipt: &RecordId,
+    detail: &str,
+    mut sync: impl FnMut(&Path) -> Result<(), AuthorityError>,
+) -> Result<HistoricalObservation, AuthorityError> {
     if attempt.project_dir != store.project_dir() || detail.len() > 4096 {
         return Err(AuthorityError::Invalid("historical scope or size".into()));
     }
@@ -428,16 +446,16 @@ pub fn record_late_outcome(
         .ok_or_else(|| AuthorityError::Invalid("reservation".into()))?;
     let destination = history.join(format!("{epoch}-{reservation}-{}.json", attempt.number()));
     let bytes = serde_json::to_vec(&observation)?;
+    if bytes.len() > MAX_FILE_BYTES {
+        return Err(AuthorityError::Invalid("historical size".into()));
+    }
     let mut temporary = tempfile::Builder::new()
         .prefix(".late-")
         .tempfile_in(&history)?;
     temporary.write_all(&bytes)?;
     temporary.as_file().sync_all()?;
     match temporary.persist_noclobber(&destination) {
-        Ok(_) => {
-            sync_directory(&history)?;
-            sync_directory(&path)?;
-        }
+        Ok(_) => {}
         Err(e) if e.error.kind() == std::io::ErrorKind::AlreadyExists => {
             if std::fs::read(&destination)? != bytes {
                 return Err(AuthorityError::Invalid(
@@ -447,6 +465,9 @@ pub fn record_late_outcome(
         }
         Err(e) => return Err(e.error.into()),
     }
+    // An identical replay must complete a possibly interrupted first flush.
+    sync(&history)?;
+    sync(&path)?;
     Ok(observation)
 }
 /// Inspect bounded unverified historical slots; no controller state is changed.
@@ -466,7 +487,7 @@ pub fn historical_outcomes(
             continue;
         }
         let meta = entry.metadata()?;
-        if !meta.is_file() || meta.len() > 16 * 1024 {
+        if !meta.is_file() || meta.len() > MAX_FILE_BYTES as u64 {
             return Err(AuthorityError::Invalid("historical file".into()));
         }
         let value: HistoricalObservation = serde_json::from_slice(&std::fs::read(entry.path())?)?;
