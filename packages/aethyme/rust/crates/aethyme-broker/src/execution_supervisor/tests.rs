@@ -214,6 +214,7 @@ fn real_linux_build_observes_readonly_inputs_stopped_writers_and_failures() {
         std::fs::write(&wrapper,format!("#!/bin/sh\nset -eu\nif test \"$3\" = cp && test \"$5\" = -; then\n case \"$4\" in *:/outputs/.) printf exporting > {}; while test ! -f {}; do sleep 0.01; done;; esac\nfi\nexec /opt/homebrew/bin/docker \"$@\"\n",quote(&marker),quote(&release))).unwrap();
         std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
         let wrapped = DockerExecutor::probe(wrapper).unwrap();
+        spec.profile.runtime_profile = wrapped.runtime().id();
         let cancel = Arc::new(AtomicBool::new(false));
         let trigger = cancel.clone();
         let cancelling = std::thread::spawn(move || {
@@ -243,6 +244,7 @@ fn real_linux_build_observes_readonly_inputs_stopped_writers_and_failures() {
         std::fs::write(&wrapper,"#!/bin/sh\nset -eu\nif test \"$3 $4\" = 'container start'; then\n name=$(/opt/homebrew/bin/docker --host \"$2\" container inspect --format '{{.Name}}' \"$5\")\n case \"$name\" in *-build) /opt/homebrew/bin/docker \"$@\"; sleep 0.4; exit 0;; esac\nfi\nexec /opt/homebrew/bin/docker \"$@\"\n").unwrap();
         std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
         let wrapped = DockerExecutor::probe(wrapper).unwrap();
+        spec.profile.runtime_profile = wrapped.runtime().id();
         spec.profile.build_limits.timeout_ms = 200;
         spec.build.arguments[1] = "printf too-late > /outputs/asset".into();
         let execution = snapshot::freeze(&mut f.store, &owner, &revision.id, spec.clone()).unwrap();

@@ -37,7 +37,7 @@ use serde::Serialize;
 pub use crate::host_state::HostStateSource;
 
 /// The schema this binary writes.
-pub const COLLABORATION_STATE_SCHEMA_VERSION: i64 = 10;
+pub const COLLABORATION_STATE_SCHEMA_VERSION: i64 = 11;
 /// The oldest schema a database written by this binary can be read by.
 /// Unlike `host-operations.db`, a newer database stays readable by an older
 /// binary until a release raises this floor.
@@ -58,7 +58,8 @@ pub const COLLABORATION_STATE_SCHEMA_VERSION: i64 = 10;
 // Schema 8 has no budget ledger, and cannot guard retention while consumption is
 // unknown. As with prior floors, stop old open clients before migration.
 // Schema 9 does not honor external authority epochs. Quiesce it before restore.
-const MIN_COMPATIBLE_SCHEMA: i64 = 10;
+// Schema 10 cannot enforce the configured verification producer catalogue.
+const MIN_COMPATIBLE_SCHEMA: i64 = 11;
 const ROOT_DIRECTORY: &str = "collaboration";
 /// Additive schema steps after the version 1 layout (`meta` only), applied in
 /// order. Each only adds tables; after migrating, the compatibility floor is
@@ -350,6 +351,29 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (
         10,
         "CREATE TABLE local_authority_state (singleton INTEGER PRIMARY KEY NOT NULL CHECK(singleton=1), epoch TEXT NOT NULL) STRICT;",
+    ),
+    (
+        11,
+        "CREATE TABLE local_verifier_producers (
+            target TEXT NOT NULL REFERENCES local_targets(target),
+            producer TEXT NOT NULL,
+            generation INTEGER NOT NULL CHECK(generation>0),
+            policy TEXT NOT NULL,
+            body BLOB NOT NULL,
+            epoch TEXT NOT NULL,
+            revoked INTEGER NOT NULL CHECK(revoked IN (0,1)),
+            PRIMARY KEY(target,producer)
+        ) STRICT;
+        CREATE TABLE local_verification_evidence (
+            id TEXT PRIMARY KEY NOT NULL,
+            object TEXT NOT NULL,
+            revision TEXT NOT NULL REFERENCES local_target_revisions(revision),
+            producer TEXT NOT NULL,
+            generation INTEGER NOT NULL,
+            issued_ms INTEGER NOT NULL,
+            expires_ms INTEGER NOT NULL,
+            body BLOB NOT NULL
+        ) STRICT;",
     ),
 ];
 /// The file that marks a directory as a collaboration root.

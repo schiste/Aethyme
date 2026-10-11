@@ -144,6 +144,21 @@ fn ok(cli: &Connection, args: &[String]) -> Result<String, SupervisorError> {
 fn json(cli: &Connection, args: &[String]) -> Result<serde_json::Value, SupervisorError> {
     Ok(serde_json::from_str(&ok(cli, args)?)?)
 }
+fn executable_digest(path: &Path) -> Result<String, SupervisorError> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    let mut file = std::fs::File::open(path)?;
+    let mut hash = Sha256::new();
+    let mut chunk = [0u8; 65536];
+    loop {
+        let n = file.read(&mut chunk)?;
+        if n == 0 {
+            break;
+        }
+        hash.update(&chunk[..n]);
+    }
+    Ok(format!("sha256:{:x}", hash.finalize()))
+}
 pub(super) fn probe(cli: &Connection) -> Result<RuntimeDescription, SupervisorError> {
     let version = json(cli, &strings(&["version", "--format", "{{json .Server}}"]))?;
     let info = json(
@@ -175,6 +190,8 @@ pub(super) fn probe(cli: &Connection) -> Result<RuntimeDescription, SupervisorEr
         ));
     }
     Ok(RuntimeDescription {
+        native: executable_digest(&std::env::current_exe()?)?,
+        client: executable_digest(&cli.cli)?,
         profile: PROFILE.into(),
         endpoint: cli.endpoint.clone(),
         daemon_id: get(&info, "id")?,
@@ -644,6 +661,140 @@ impl<'a> Job<'a> {
             )?,
         ))
     }
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn cli_trial<F, G>(
+        &mut self,
+        spec: &snapshot::ExecutionSpec,
+        path: &Path,
+        output_id: &str,
+        arguments: &[String],
+        stdin: &[u8],
+        cancel: &AtomicBool,
+        mut authorize: F,
+    ) -> Result<super::ObservedCommand, SupervisorError>
+    where
+        F: FnMut() -> Result<G, SupervisorError>,
+    {
+        use std::io::Write;
+        let image = &spec.profile.verifier_image;
+        let limits = spec.profile.verifier_limits;
+        let artifact = self.input(image, "artifact", path, output_id)?;
+        let mounts = BTreeMap::from([("/artifact".into(), (artifact.clone(), false))]);
+        let mut args = options(&format!("aethyme-{}-check", self.generation), image, limits);
+        args.extend(strings(&[
+            "--label",
+            &format!("aethyme.local.generation={}", self.generation),
+            "--interactive",
+            "--workdir",
+            "/artifact",
+            "--mount",
+            &format!("type=volume,source={artifact},target=/artifact,readonly,volume-nocopy"),
+            image,
+            "--signal=KILL",
+            "--kill-after=1s",
+            &format!("{}s", limits.timeout_ms.div_ceil(1000)),
+            "/usr/bin/env",
+            "-i",
+        ]));
+        for (key, value) in &spec.verify.environment {
+            args.push(format!("{key}={value}"));
+        }
+        args.push(spec.verify.program.clone());
+        args.extend(spec.verify.arguments.clone());
+        args.extend_from_slice(arguments);
+        let id = self.create(&args)?;
+        validate_container(&container(self.cli, &id)?, image, limits, &mounts)?;
+        let mut input = tempfile::NamedTempFile::new()?;
+        input.write_all(stdin)?;
+        let stdout = tempfile::NamedTempFile::new()?;
+        let stderr = tempfile::NamedTempFile::new()?;
+        if cancel.load(Ordering::SeqCst) {
+            return Err(SupervisorError::Cancelled);
+        }
+        let mut dispatch = Some(authorize()?);
+        let child = Command::new(&self.cli.cli)
+            .args(strings(&[
+                "--host",
+                &self.cli.endpoint,
+                "container",
+                "start",
+                "--attach",
+                "--interactive",
+                &id,
+            ]))
+            .stdin(Stdio::from(input.reopen()?))
+            .stdout(Stdio::from(stdout.reopen()?))
+            .stderr(Stdio::from(stderr.reopen()?))
+            .spawn()?;
+        let mut client = Client {
+            child,
+            reaped: false,
+        };
+        let started = Instant::now();
+        let state = loop {
+            let done = client.child.try_wait()?;
+            if done.is_some() {
+                client.reaped = true;
+            }
+            let observed = container(self.cli, &id)?;
+            let state = &observed["State"];
+            let acknowledged = state["StartedAt"]
+                .as_str()
+                .is_some_and(|s| !s.is_empty() && !s.starts_with("0001-"));
+            if acknowledged {
+                drop(dispatch.take());
+            }
+            if cancel.load(Ordering::SeqCst) {
+                return Err(SupervisorError::Cancelled);
+            }
+            authorize()?;
+            if started.elapsed() > Duration::from_millis(limits.timeout_ms) {
+                return Err(SupervisorError::TimedOut);
+            }
+            if !acknowledged && started.elapsed() > CONTROL_TIMEOUT {
+                return Err(SupervisorError::Infrastructure(
+                    "dispatch acknowledgement unknown".into(),
+                ));
+            }
+            if stdout.as_file().metadata()?.len() > limits.output_bytes.min(RESPONSE_LIMIT)
+                || stderr.as_file().metadata()?.len() > limits.output_bytes.min(RESPONSE_LIMIT)
+            {
+                return Err(SupervisorError::Limit);
+            }
+            if done.is_some() {
+                if !acknowledged
+                    || state["Running"] != false
+                    || state["Pid"].as_u64() != Some(0)
+                    || state["Dead"] != false
+                {
+                    return Err(SupervisorError::Inconclusive(
+                        "verifier process completion unknown".into(),
+                    ));
+                }
+                break state.clone();
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        if state["OOMKilled"] == true {
+            return Err(SupervisorError::Infrastructure(
+                "verifier workload OOM".into(),
+            ));
+        }
+        let exit = state["ExitCode"]
+            .as_i64()
+            .and_then(|n| i32::try_from(n).ok())
+            .ok_or_else(|| SupervisorError::Inconclusive("missing verifier exit".into()))?;
+        ok(self.cli, &strings(&["container", "rm", &id]))?;
+        self.containers.retain(|v| v != &id);
+        // Host capture files were never mounted into the workload. The daemon
+        // stream, not an app-written success file, determines these observations.
+        Ok(super::ObservedCommand {
+            exit,
+            stdout: std::fs::read(stdout.path())?,
+            stderr: std::fs::read(stderr.path())?,
+        })
+    }
+
     pub fn cleanup(&mut self) -> Result<(), SupervisorError> {
         // Only exact IDs created by this invocation are stopped. On failure,
         // retain the inventory so a later explicit cleanup can retry safely.
