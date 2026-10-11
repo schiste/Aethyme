@@ -110,7 +110,7 @@ fn digest(value: &str) -> Result<ObjectDigest, VerificationError> {
     Ok(ObjectDigest::of_snapshot(&id))
 }
 fn hex_bytes(value: &str) -> Result<Vec<u8>, VerificationError> {
-    if value.len() > 128 * 1024 || value.len() % 2 != 0 {
+    if value.len() > 128 * 1024 || !value.len().is_multiple_of(2) {
         return Err(VerificationError::Inventory("stdin bounds".into()));
     }
     value
@@ -164,6 +164,9 @@ impl AssertionInventory {
             &serde_json::to_vec(&serde_json::json!({"schema":INVENTORY_SCHEMA,"cases":cases}))?,
             &INVENTORY,
         )?;
+        if record.canonical_bytes().len() > 4 * 1024 * 1024 {
+            return Err(VerificationError::Inventory("inventory bytes".into()));
+        }
         Ok(Self { record, cases })
     }
     pub fn decode(bytes: &[u8]) -> Result<Self, VerificationError> {
@@ -430,7 +433,7 @@ struct AssertionObservation {
 struct EvidenceBody {
     verification: String,
     producer: String,
-    generation: i64,
+    generation: String,
     epoch: String,
     revision: String,
     execution: String,
@@ -550,7 +553,8 @@ fn inventory_from_inputs(
     Ok(inventory)
 }
 fn complete_pass(body: &EvidenceBody, inventory: &AssertionInventory) -> bool {
-    body.result == VerificationOutcome::Passed
+    inventory.cases.iter().all(|case| case.exit_code == 0)
+        && body.result == VerificationOutcome::Passed
         && body.assertions.len() == inventory.cases.len()
         && body
             .assertions
@@ -576,7 +580,7 @@ fn expected_body(
     Ok(EvidenceBody {
         verification,
         producer: permit.producer.clone(),
-        generation: permit.generation,
+        generation: permit.generation.to_string(),
         epoch: owner.authority_epoch().as_str().into(),
         revision: execution.target_revision().to_string(),
         execution: execution.id().to_string(),
@@ -598,6 +602,8 @@ fn retain_evidence(
     owner: &ControllerOwner,
     body: EvidenceBody,
     max_age_ms: u64,
+    cancel: &AtomicBool,
+    before_issue: impl FnOnce(),
 ) -> Result<TrustedEvidence, VerificationError> {
     let _authority = target::authorize(store, owner)?;
     let record = decode_record(
@@ -612,7 +618,18 @@ fn retain_evidence(
     let _archive = crate::collaboration_gc::archive_use(store)?;
     let physical = archive::put_object(store, &record.canonical_bytes())?;
     target::retain_artifacts(store, owner, &revision, &[], &[physical])?;
-    store.connection().execute("INSERT INTO local_verification_evidence(id,object,revision,producer,generation,issued_ms,expires_ms,body) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",params![record.id().as_str(),physical.hex(),body.revision,body.producer,body.generation,issued_ms,expires_ms,record.canonical_bytes()])?;
+    let tx = store
+        .connection()
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    before_issue();
+    if body.result == VerificationOutcome::Passed && cancel.load(Ordering::SeqCst) {
+        return Err(SupervisorError::Cancelled.into());
+    }
+    tx.execute("INSERT INTO local_verification_evidence(id,object,revision,producer,generation,issued_ms,expires_ms,body) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",params![record.id().as_str(),physical.hex(),body.revision,body.producer,body.generation,issued_ms,expires_ms,record.canonical_bytes()])?;
+    if body.result == VerificationOutcome::Passed && cancel.load(Ordering::SeqCst) {
+        return Err(SupervisorError::Cancelled.into());
+    }
+    tx.commit()?;
     Ok(TrustedEvidence {
         reference: EvidenceRef {
             id: record.id(),
@@ -623,6 +640,7 @@ fn retain_evidence(
         expires_ms,
     })
 }
+#[allow(clippy::too_many_arguments)]
 fn applicable_at(
     store: &CollaborationStore,
     owner: &ControllerOwner,
@@ -697,7 +715,8 @@ pub fn load_evidence(
     reference: &EvidenceRef,
 ) -> Result<TrustedEvidence, VerificationError> {
     let _authority = subject_guard(store, owner, execution, artifact, permit)?;
-    let row:Option<(String,String,String,i64,i64,i64,Vec<u8>)>=store.read_connection().query_row("SELECT object,revision,producer,generation,issued_ms,expires_ms,body FROM local_verification_evidence WHERE id=?1",[reference.id.as_str()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?))).optional()?;
+    type JournalRow = (String, String, String, i64, i64, i64, Vec<u8>);
+    let row:Option<JournalRow>=store.read_connection().query_row("SELECT object,revision,producer,generation,issued_ms,expires_ms,body FROM local_verification_evidence WHERE id=?1",[reference.id.as_str()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?))).optional()?;
     let Some((object, revision, producer, generation, issued_ms, expires_ms, bytes)) = row else {
         return Err(VerificationError::Unfulfilled);
     };
@@ -763,6 +782,11 @@ pub fn verify(
     }
     let inputs = snapshot::materialize(store, owner, execution)?;
     let inventory = inventory_from_inputs(&inputs, &permit.policy)?;
+    if inventory.cases.iter().any(|case| case.exit_code != 0) {
+        return Err(VerificationError::Unsupported(
+            "nonzero exit assertions require a separate stream-completion witness".into(),
+        ));
+    }
     let verification: String =
         store
             .read_connection()
@@ -838,7 +862,7 @@ pub fn verify(
     if body.result == VerificationOutcome::Passed && !complete_pass(&body, &inventory) {
         return Err(VerificationError::Unfulfilled);
     }
-    retain_evidence(store, owner, body, permit.policy.max_age_ms)
+    retain_evidence(store, owner, body, permit.policy.max_age_ms, cancel, || {})
 }
 #[cfg(test)]
 mod tests;

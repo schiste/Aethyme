@@ -761,7 +761,12 @@ impl<'a> Job<'a> {
             {
                 return Err(SupervisorError::Limit);
             }
-            if done.is_some() {
+            if let Some(client_status) = done {
+                if !client_status.success() || state["ExitCode"].as_i64() != Some(0) {
+                    return Err(SupervisorError::Infrastructure(
+                        "verifier stream completion is ambiguous".into(),
+                    ));
+                }
                 if !acknowledged
                     || state["Running"] != false
                     || state["Pid"].as_u64() != Some(0)

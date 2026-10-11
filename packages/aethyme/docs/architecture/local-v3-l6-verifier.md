@@ -31,3 +31,21 @@ restore covers these journals without silently reviving old producers.
 
 Implementation and qualification are in progress. These descriptions name the
 intended boundary; they are not Q3 or E1 composition evidence.
+
+The runtime descriptor hashes the native executable path and configured Docker
+client path. Deployment must keep both installations immutable while a process
+is active, and restart the supervisor after either changes. These path digests
+are not independent attestations of loaded process memory; the host and its
+administrator remain trusted. See [Rust current_exe](https://doc.rust-lang.org/std/env/fn.current_exe.html).
+
+Only exit-zero assertions can qualify in this first CLI transport profile.
+Docker's attached client can report a nonzero workload exit or an attachment
+failure with the same code, so nonzero completion is not a separate transport
+witness. Such expected assertions are unsupported; other ambiguous observations
+are infrastructure-deferred. See [pinned Docker CLI start semantics](https://raw.githubusercontent.com/docker/cli/v29.8.0/cli/command/container/start.go).
+
+Receipt issuance checks cancellation inside its SQLite transaction before the
+journal insert and immediately before commit. Cancellation seen there rolls
+back the receipt; orphan CAS data does not satisfy the authority journal.
+Cancellation after that issuance point does not rewrite historical data; future
+applicability still requires the current target, producer and epoch.

@@ -162,7 +162,7 @@ impl Subject {
         let inventory = AssertionInventory::new(vec![case()]).unwrap();
         let policy = policy();
         let mut policy = policy;
-        policy.harness = f.b.result.snapshot_id.to_string();
+        policy.harness = capture(&mut f, "inventory.json", &inventory.canonical_bytes());
         // Policy must be frozen before selecting the target; use the actual
         // harness identity in the target's appointed policy too.
         let mut ts = f.spec();
@@ -280,6 +280,8 @@ impl Subject {
             &self.owner,
             body,
             self.permit.policy.max_age_ms,
+            &AtomicBool::new(false),
+            || {},
         )
         .unwrap()
     }
@@ -308,7 +310,7 @@ fn incomplete_wrong_subject_expired_and_revoked_evidence_cannot_pass() {
         evidence.body = original.clone();
         match field {
             0 => evidence.body.producer.push('x'),
-            1 => evidence.body.generation += 1,
+            1 => evidence.body.generation.push('9'),
             2 => evidence.body.epoch = d(b"other"),
             3 => evidence.body.revision = d(b"other"),
             4 => evidence.body.execution = d(b"other"),
@@ -376,7 +378,7 @@ fn real_cli_assertions_observe_behavior_and_refuse_forged_or_stale_receipts() {
     // Independent expected digests/inventory stay on the host; the artifact is
     // the only mounted input to the app under test. A success file is ignored.
     crate::local_target::tests::git(f._repo.path(), &["rm", "inventory.json"]);
-    let source=capture(&mut f,"app.sh",b"set -eu\ntest ! -e /harness\ntest ! -e /dataset\ntest ! -e /var/run/docker.sock\ntest -z \"$HOME\"\nif printf tamper 2>/dev/null > /artifact/app.sh; then exit 77; fi\nread -r name\nprintf 'Hello,%s\\n' \"$name\"\n");
+    let source=capture(&mut f,"app.sh",b"set -eu\ntest ! -e /harness\ntest ! -e /dataset\ntest ! -e /var/run/docker.sock\ntest -z \"${HOME-}\"\nif printf tamper 2>/dev/null > /artifact/app.sh; then exit 77; fi\nread -r name\nprintf 'Hello,%s\\n' \"$name\"\n");
     let limits = snapshot::ResourceLimits {
         timeout_ms: 5000,
         memory_bytes: 67108864,
@@ -502,6 +504,7 @@ fn real_cli_assertions_observe_behavior_and_refuse_forged_or_stale_receipts() {
         "verification must not authorize acceptance"
     );
     // Self-reported passed JSON and exit zero cannot replace actual behavior.
+    let good_spec = spec.clone();
     spec.build.arguments[1] =
         "printf 'printf success > /tmp/result.json; printf wrong' > /outputs/app.sh".into();
     let wrong = snapshot::freeze(&mut f.store, &owner, &revision.id, spec).unwrap();
@@ -546,4 +549,280 @@ fn real_cli_assertions_observe_behavior_and_refuse_forged_or_stale_receipts() {
         )
         .is_err()
     );
+    // Successful daemon completion with a failed attachment is not a complete
+    // stream observation, even when the captured bytes match the inventory.
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let wrapper = directory.path().join("docker-attachment-fault");
+        std::fs::write(&wrapper,"#!/bin/sh\nset -eu\nif test \"${3-} ${4-} ${5-}\" = 'container start --attach'; then /opt/homebrew/bin/docker \"$@\"; exit 1; fi\nexec /opt/homebrew/bin/docker \"$@\"\n").unwrap();
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let wrapped = DockerExecutor::probe(wrapper).unwrap();
+        let mut policy = permit.policy().clone();
+        policy.runtime = wrapped.runtime().id();
+        let mut ts = f.spec();
+        ts.objective = "controlled stream transport failure".into();
+        ts.acceptance_policy = policy.record().unwrap().id().to_string();
+        let revision = target::propose_revision(&mut f.store, &owner, ts).unwrap();
+        for phase in [target::Phase::StopRequested, target::Phase::Stopped] {
+            let state = target::status(&f.store, owner.target()).unwrap();
+            target::transition(&mut f.store, &owner, state.version, phase).unwrap();
+        }
+        target::select_revision(&mut f.store, &owner, &revision.id).unwrap();
+        for phase in [
+            target::Phase::Admitting,
+            target::Phase::WaveFrozen,
+            target::Phase::Composing,
+            target::Phase::Verifying,
+        ] {
+            let state = target::status(&f.store, owner.target()).unwrap();
+            target::transition(&mut f.store, &owner, state.version, phase).unwrap();
+        }
+        let permit = configure(&mut f.store, &owner, "native", Some(2), policy).unwrap();
+        let mut spec = good_spec;
+        spec.profile.runtime_profile = wrapped.runtime().id();
+        let execution = snapshot::freeze(&mut f.store, &owner, &revision.id, spec).unwrap();
+        let artifact = wrapped
+            .build(&mut f.store, &owner, &execution, &AtomicBool::new(false))
+            .unwrap()
+            .into_artifact()
+            .unwrap();
+        let incomplete = verify(
+            &mut f.store,
+            &owner,
+            &execution,
+            &artifact,
+            &permit,
+            &wrapped,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(
+            incomplete.outcome(),
+            VerificationOutcome::InfrastructureDeferred
+        );
+        assert!(
+            applicable(
+                &f.store,
+                &owner,
+                &execution,
+                &artifact,
+                &permit,
+                &incomplete
+            )
+            .is_err()
+        ); // A matching nonzero daemon/client status cannot prove attachment
+        // completion, even with the expected stream prefix.
+        let mut spec = execution.spec().clone();
+        spec.build.arguments[1] = "printf 'printf Hello,A; exit 1' > /outputs/app.sh".into();
+        let nonzero = snapshot::freeze(&mut f.store, &owner, &revision.id, spec).unwrap();
+        let artifact = wrapped
+            .build(&mut f.store, &owner, &nonzero, &AtomicBool::new(false))
+            .unwrap()
+            .into_artifact()
+            .unwrap();
+        let observed = wrapped.observe_cli(
+            &f.store,
+            &nonzero,
+            &artifact,
+            "abcdef-matching-nonzero",
+            &[],
+            b"",
+            &AtomicBool::new(false),
+            || {
+                subject_guard(&f.store, &owner, &nonzero, &artifact, &permit)
+                    .map_err(|_| SupervisorError::Cancelled)
+            },
+        );
+        assert!(matches!(observed, Err(SupervisorError::Infrastructure(_))));
+    }
+}
+#[test]
+fn producer_dispatch_guard_excludes_rotation_until_acknowledgement() {
+    let s = Subject::fake();
+    let held = subject_guard(&s.f.store, &s.owner, &s.execution, &s.artifact, &s.permit).unwrap();
+    let contender = producer_lock(&s.f.store, s.owner.target(), s.permit.producer()).unwrap();
+    assert!(matches!(
+        contender.try_lock(),
+        Err(std::fs::TryLockError::WouldBlock)
+    ));
+    drop(held);
+    contender.try_lock().unwrap();
+}
+#[test]
+fn retained_journal_is_required_and_mismatches_are_refused() {
+    let mut s = Subject::fake();
+    let evidence = s.evidence();
+    load_evidence(
+        &s.f.store,
+        &s.owner,
+        &s.execution,
+        &s.artifact,
+        &s.permit,
+        evidence.reference(),
+    )
+    .unwrap();
+    s.f.store
+        .connection()
+        .execute(
+            "UPDATE local_verification_evidence SET object=?1 WHERE id=?2",
+            params![
+                ObjectDigest::of(b"wrong").hex(),
+                evidence.reference().id.as_str()
+            ],
+        )
+        .unwrap();
+    assert!(
+        load_evidence(
+            &s.f.store,
+            &s.owner,
+            &s.execution,
+            &s.artifact,
+            &s.permit,
+            evidence.reference()
+        )
+        .is_err()
+    );
+    s.f.store
+        .connection()
+        .execute("DELETE FROM local_verification_evidence", [])
+        .unwrap();
+    assert!(
+        load_evidence(
+            &s.f.store,
+            &s.owner,
+            &s.execution,
+            &s.artifact,
+            &s.permit,
+            evidence.reference()
+        )
+        .is_err()
+    );
+}
+#[test]
+fn oversized_or_escaped_inventory_is_rejected_at_construction() {
+    let cases = (0..32)
+        .map(|i| {
+            let mut c = case();
+            c.id = format!("{i}");
+            c.arguments = vec!["\\".repeat(4096); 32];
+            c
+        })
+        .collect();
+    assert!(matches!(
+        AssertionInventory::new(cases),
+        Err(VerificationError::Inventory(_))
+    ));
+}
+#[test]
+fn cancellation_at_receipt_issuance_leaves_no_recoverable_pass() {
+    use std::sync::{Arc, Barrier};
+    let mut s = Subject::fake();
+    let original = s.evidence();
+    let mut body = original.body.clone();
+    body.verification = "b".repeat(64);
+    let record = decode_record(
+        &serde_json::to_vec(&serde_json::json!({"schema":EVIDENCE_SCHEMA,"observation":body}))
+            .unwrap(),
+        &EVIDENCE,
+    )
+    .unwrap();
+    let reference = EvidenceRef {
+        id: record.id(),
+        object: ObjectDigest::of(&record.canonical_bytes()),
+    };
+    let cancel = Arc::new(AtomicBool::new(false));
+    let cancellation = cancel.clone();
+    let barrier = Arc::new(Barrier::new(2));
+    let waiting = barrier.clone();
+    let thread = std::thread::spawn(move || {
+        waiting.wait();
+        cancellation.store(true, Ordering::SeqCst);
+        waiting.wait();
+    });
+    let result = retain_evidence(
+        &mut s.f.store,
+        &s.owner,
+        body,
+        s.permit.policy.max_age_ms,
+        &cancel,
+        || {
+            barrier.wait();
+            barrier.wait();
+        },
+    );
+    thread.join().unwrap();
+    assert!(matches!(
+        result,
+        Err(VerificationError::Supervisor(SupervisorError::Cancelled))
+    ));
+    let count: i64 =
+        s.f.store
+            .read_connection()
+            .query_row(
+                "SELECT COUNT(*) FROM local_verification_evidence WHERE id=?1",
+                [reference.id.as_str()],
+                |r| r.get(0),
+            )
+            .unwrap();
+    assert_eq!(count, 0);
+    assert!(
+        load_evidence(
+            &s.f.store,
+            &s.owner,
+            &s.execution,
+            &s.artifact,
+            &s.permit,
+            &reference
+        )
+        .is_err()
+    );
+}
+#[test]
+fn stop_target_drift_and_artifact_changes_invalidate_current_evidence() {
+    let mut s = Subject::fake();
+    let evidence = s.evidence();
+    let state = target::status(&s.f.store, s.owner.target()).unwrap();
+    target::transition(
+        &mut s.f.store,
+        &s.owner,
+        state.version,
+        target::Phase::StopRequested,
+    )
+    .unwrap();
+    assert!(s.check(&evidence, evidence.issued_ms).is_err());
+    let mut s = Subject::fake();
+    let evidence = s.evidence();
+    let mut spec = s.f.spec();
+    spec.acceptance_policy = s.permit.policy.record().unwrap().id().to_string();
+    spec.objective = "changed obligation".into();
+    let revision = target::propose_revision(&mut s.f.store, &s.owner, spec).unwrap();
+    for phase in [target::Phase::StopRequested, target::Phase::Stopped] {
+        let state = target::status(&s.f.store, s.owner.target()).unwrap();
+        target::transition(&mut s.f.store, &s.owner, state.version, phase).unwrap();
+    }
+    target::select_revision(&mut s.f.store, &s.owner, &revision.id).unwrap();
+    for phase in [
+        target::Phase::Admitting,
+        target::Phase::WaveFrozen,
+        target::Phase::Composing,
+        target::Phase::Verifying,
+    ] {
+        let state = target::status(&s.f.store, s.owner.target()).unwrap();
+        target::transition(&mut s.f.store, &s.owner, state.version, phase).unwrap();
+    }
+    assert!(s.check(&evidence, evidence.issued_ms).is_err());
+    let mut s = Subject::fake();
+    s.artifact.id = RecordId::parse(&d(b"wrong record")).unwrap();
+    assert!(subject_guard(&s.f.store, &s.owner, &s.execution, &s.artifact, &s.permit).is_err());
+    let mut s = Subject::fake();
+    let evidence = s.evidence();
+    s.f.store
+        .connection()
+        .execute(
+            "DELETE FROM local_target_roots WHERE kind='object' AND reference=?1",
+            [s.artifact.record_object().hex()],
+        )
+        .unwrap();
+    assert!(s.check(&evidence, evidence.issued_ms).is_err());
 }
