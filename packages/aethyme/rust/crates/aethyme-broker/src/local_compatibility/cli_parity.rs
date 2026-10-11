@@ -141,8 +141,8 @@ fn actual_disabled_cli_preserves_queue_errors_status_and_hook_contract() {
             CaptureSubmit::Submitted { capture: None, .. }
         ));
         for args in [
-            vec!["broker", "queue", "--json"],
-            vec!["broker", "queue"],
+            vec!["broker", "submit", "queue", "--json"],
+            vec!["broker", "submit", "queue"],
             vec!["broker", "submit", "--session", "999999", "--json"],
             vec!["broker", "submit", "--session", "999999"],
         ] {
