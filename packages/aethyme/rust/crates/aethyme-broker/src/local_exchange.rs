@@ -67,6 +67,8 @@ pub enum ExchangeError {
     Archive(#[from] crate::collaboration_archive::ArchiveError),
     #[error(transparent)]
     Authority(#[from] crate::local_authority::AuthorityError),
+    #[error(transparent)]
+    Capture(#[from] crate::collaboration_capture::CaptureError),
 }
 fn invalid(why: &str) -> ExchangeError {
     ExchangeError::Invalid(why.into())
@@ -485,7 +487,8 @@ pub trait TrustedPeer {
 
 mod manager;
 pub use manager::{
-    AppointedPeer, Delivery, appoint, deliver, disable, enqueue, poll, projection, recover_snapshot,
+    AppointedPeer, Delivery, appoint, deliver, disable, enqueue, poll, projection,
+    recover_snapshot, stage_capture_metadata,
 };
 
 #[cfg(test)]

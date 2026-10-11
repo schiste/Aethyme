@@ -47,6 +47,20 @@ struct BindingBody<'a> {
     epoch: &'a str,
     peer: &'a PeerSpec,
 }
+fn operator_guard(store: &mut CollaborationStore) -> Result<(Epoch, Guard), ExchangeError> {
+    match authority::status(store) {
+        Ok(witness) => {
+            let guard = authority::guard(store, &witness.epoch)?;
+            Ok((witness.epoch, guard))
+        }
+        Err(authority::AuthorityError::Io(error))
+            if error.kind() == std::io::ErrorKind::NotFound =>
+        {
+            Ok(authority::acquire(store)?)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
 fn now() -> Result<i64, ExchangeError> {
     i64::try_from(
         SystemTime::now()
@@ -117,7 +131,7 @@ pub fn appoint<'a>(
     if adapter.profile() != spec.profile || adapter.service_id() != spec.service_id {
         return Err(ExchangeError::Unsupported);
     }
-    let (epoch, _guard) = authority::acquire(store)?;
+    let (epoch, _guard) = operator_guard(store)?;
     let _archive = gc::archive_use(store)?;
     let record = canonical(
         &BINDING,
@@ -126,7 +140,7 @@ pub fn appoint<'a>(
             peer: &spec,
         },
     )?;
-    let digest = archive::put_object(store, record.canonical_bytes())?;
+    let digest = archive::put_object(store, &record.canonical_bytes())?;
     let tx = store
         .connection()
         .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -222,6 +236,32 @@ impl CurrentPeer<'_> {
         }
         Ok(())
     }
+    fn check_in(
+        &self,
+        conn: &rusqlite::Connection,
+        peer: &AppointedPeer<'_>,
+    ) -> Result<(), ExchangeError> {
+        let (body, epoch, enabled): (Vec<u8>, String, bool) = conn.query_row(
+            "SELECT body,epoch,enabled FROM local_exchange_bindings WHERE id=?1",
+            [peer.id.as_str()],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )?;
+        let record = canonical(
+            &BINDING,
+            &BindingBody {
+                epoch: peer.epoch.as_str(),
+                peer: &peer.spec,
+            },
+        )?;
+        if !enabled
+            || epoch != peer.epoch.as_str()
+            || record.id() != peer.id
+            || body != record.canonical_bytes()
+        {
+            return Err(ExchangeError::Forbidden);
+        }
+        self.check()
+    }
     fn visible(&self, spec: &PeerSpec, packet: &Metadata) -> Result<(), ExchangeError> {
         packet.validate()?;
         if !self.lease.visible(packet) {
@@ -312,7 +352,7 @@ fn peer_lock(
 /// Queue metadata and a CAS retention pin in one durable transaction using the
 /// existing capture outbox. A queue row promises no delivery or source access.
 pub fn enqueue(store: &mut CollaborationStore, packet: &Metadata) -> Result<i64, ExchangeError> {
-    let (_epoch, _local) = authority::acquire(store)?;
+    let (_epoch, _local) = operator_guard(store)?;
     let _use = gc::archive_use(store)?;
     let record = packet.record()?;
     let operation = format!("exchange:{}", record.id().as_str());
@@ -327,11 +367,11 @@ pub fn enqueue(store: &mut CollaborationStore, packet: &Metadata) -> Result<i64,
     {
         return Ok(sequence);
     }
-    let digest = archive::put_object(store, record.canonical_bytes())?;
+    let digest = archive::put_object(store, &record.canonical_bytes())?;
     let tx = store
         .connection()
         .transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let count: i64 = tx.query_row("SELECT count(*) FROM outbox WHERE kind=?1", [KIND], |r| {
+    let count: i64 = tx.query_row("SELECT count(*) FROM local_exchange_messages", [], |r| {
         r.get(0)
     })?;
     if count >= MAX_VISIBLE_ITEMS as i64 {
@@ -351,7 +391,84 @@ pub fn enqueue(store: &mut CollaborationStore, packet: &Metadata) -> Result<i64,
     tx.commit()?;
     Ok(sequence)
 }
+fn validate_capture_envelope(
+    store: &mut CollaborationStore,
+    operation: &str,
+    payload: &str,
+    packet: &Metadata,
+) -> Result<(), ExchangeError> {
+    let operation = crate::collaboration_capture::OperationId::parse(operation)?;
+    let receipt = crate::collaboration_capture::receipt(store, &operation)?
+        .ok_or(ExchangeError::Incomplete)?;
+    match packet {
+        Metadata::Contribution {
+            contribution,
+            source,
+            ..
+        } if contribution == receipt.contribution.as_str()
+            && source == receipt.result.as_str()
+            && payload == receipt.receipt_record_id.as_str() =>
+        {
+            Ok(())
+        }
+        _ => Err(invalid("capture envelope subject")),
+    }
+}
+/// Attach one immutable metadata envelope to a real committed capture outbox
+/// row. The original sequence, capture operation, payload receipt and global
+/// delivery marker remain the capture's; the wire envelope has its own identity.
+pub fn stage_capture_metadata(
+    store: &mut CollaborationStore,
+    sequence: i64,
+    packet: &Metadata,
+) -> Result<RecordId, ExchangeError> {
+    let (_epoch, _local) = operator_guard(store)?;
+    let _use = gc::archive_use(store)?;
+    let (operation, kind, payload): (String, String, String) = store.read_connection().query_row(
+        "SELECT operation_id,kind,payload_record_id FROM outbox WHERE sequence=?1",
+        [sequence],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    )?;
+    if kind != "capture_receipt" {
+        return Err(ExchangeError::Unsupported);
+    }
+    let record = packet.record()?;
+    validate_capture_envelope(store, &operation, &payload, packet)?;
+    let digest = archive::put_object(store, &record.canonical_bytes())?;
+    let tx = store
+        .connection()
+        .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let old: Option<Vec<u8>> = tx
+        .query_row(
+            "SELECT body FROM local_exchange_messages WHERE sequence=?1",
+            [sequence],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if let Some(body) = old {
+        if body != record.canonical_bytes() {
+            return Err(invalid("capture envelope is immutable"));
+        }
+        return Ok(record.id());
+    }
+    let count: i64 = tx.query_row("SELECT count(*) FROM local_exchange_messages", [], |r| {
+        r.get(0)
+    })?;
+    if count >= MAX_VISIBLE_ITEMS as i64 {
+        return Err(ExchangeError::Limit);
+    }
+    tx.execute(
+        "INSERT INTO local_exchange_messages(sequence,body) VALUES(?1,?2)",
+        params![sequence, record.canonical_bytes()],
+    )?;
+    pin(&tx, &digest, &format!("exchange-capture:{sequence}"))?;
+    tx.commit()?;
+    Ok(record.id())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Both variants describe a historical metadata acknowledgment only.
+/// They grant no current remote visibility, source access or adoption.
 pub enum Delivery {
     Acknowledged,
     AlreadyAcknowledged,
@@ -366,12 +483,12 @@ pub fn deliver(
     let _local = authority::guard(store, &peer.epoch)?;
     let _lock = peer_lock(store, peer)?;
     let _use = gc::archive_use(store)?;
-    let (kind, payload): (String, String) = store.read_connection().query_row(
-        "SELECT kind,payload_record_id FROM outbox WHERE sequence=?1",
+    let (kind, payload, operation): (String, String, String) = store.read_connection().query_row(
+        "SELECT kind,payload_record_id,operation_id FROM outbox WHERE sequence=?1",
         [sequence],
-        |r| Ok((r.get(0)?, r.get(1)?)),
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
     )?;
-    if kind != KIND {
+    if kind != KIND && kind != "capture_receipt" {
         return Err(ExchangeError::Unsupported);
     }
     let tx = store
@@ -400,7 +517,6 @@ pub fn deliver(
     tx.commit()?;
     let proof = current(store, peer)?;
     let result = (|| {
-        let id = RecordId::parse(&payload)?;
         let queued: Vec<u8> = store.read_connection().query_row(
             "SELECT body FROM local_exchange_messages WHERE sequence=?1",
             [sequence],
@@ -408,7 +524,16 @@ pub fn deliver(
         )?;
         let digest = ObjectDigest::of(&queued);
         let body = archive::read_object(store, &digest)?;
-        let packet = packet_from(&body, &payload)?;
+        let envelope = Record::decode(&body, &[&PACKET])?;
+        let id = envelope.id();
+        let packet = packet_from(&body, id.as_str())?;
+        if kind == KIND {
+            if id.as_str() != payload {
+                return Err(invalid("outbox envelope identity"));
+            }
+        } else {
+            validate_capture_envelope(store, &operation, &payload, &packet)?;
+        }
         proof.visible(&peer.spec, &packet)?;
         let record = packet.record()?;
         let ack = peer.adapter.send(&*proof.lease, &record)?;
@@ -417,7 +542,7 @@ pub fn deliver(
             .connection()
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         tx.execute("UPDATE local_exchange_deliveries SET acknowledged=1,ack=?3 WHERE binding=?1 AND sequence=?2",params![peer.id.as_str(),sequence,serde_json::to_vec(&ack)?])?;
-        proof.check()?;
+        proof.check_in(&tx, peer)?;
         tx.commit()?;
         Ok(Delivery::Acknowledged)
     })();
@@ -574,7 +699,7 @@ pub fn poll(
                 }
             }
             let record = event.record()?;
-            retained.push(archive::put_object(store, record.canonical_bytes())?);
+            retained.push(archive::put_object(store, &record.canonical_bytes())?);
         }
         let tx = store
             .connection()
@@ -607,7 +732,7 @@ pub fn poll(
             return Err(ExchangeError::Limit);
         }
         tx.execute("INSERT INTO local_exchange_streams(binding,witness,position,snapshot_watermark,valid) VALUES(?1,?2,?3,0,1) ON CONFLICT(binding) DO UPDATE SET witness=excluded.witness,position=excluded.position,valid=1",params![peer.id.as_str(),serde_json::to_vec(&cursor.stream)?,next])?;
-        proof.check()?;
+        proof.check_in(&tx, peer)?;
         tx.commit()?;
         Ok(Cursor {
             stream: cursor.stream.clone(),
@@ -681,7 +806,7 @@ pub fn recover_snapshot(
         for event in &items {
             retained.push(archive::put_object(
                 store,
-                event.record()?.canonical_bytes(),
+                &event.record()?.canonical_bytes(),
             )?);
         }
         let tx = store
@@ -694,7 +819,7 @@ pub fn recover_snapshot(
             tx.execute("UPDATE local_exchange_events SET applied=1 WHERE binding=?1 AND stream=?2 AND sequence=?3",params![peer.id.as_str(),stream.as_str(),event.sequence])?;
         }
         tx.execute("INSERT INTO local_exchange_streams(binding,witness,position,snapshot_watermark,valid) VALUES(?1,?2,?3,?3,1) ON CONFLICT(binding) DO UPDATE SET witness=excluded.witness,position=excluded.position,snapshot_watermark=excluded.snapshot_watermark,valid=1",params![peer.id.as_str(),serde_json::to_vec(&desc.stream)?,desc.watermark])?;
-        proof.check()?;
+        proof.check_in(&tx, peer)?;
         tx.commit()?;
         Ok(Cursor {
             stream: desc.stream,
@@ -716,7 +841,10 @@ pub fn projection(
     let proof = current(store, peer)?;
     require_stream(store, peer, &proof)?;
     let result = (|| {
-        let rows:Vec<(String,Vec<u8>)>=store.read_connection().prepare("SELECT packet,body FROM local_exchange_projection WHERE binding=?1 ORDER BY packet LIMIT 1025")?.query_map([peer.id.as_str()],|r|Ok((r.get(0)?,r.get(1)?)))?.collect::<Result<_,_>>()?;
+        let tx = store
+            .connection()
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let rows:Vec<(String,Vec<u8>)>=tx.prepare("SELECT packet,body FROM local_exchange_projection WHERE binding=?1 ORDER BY packet LIMIT 1025")?.query_map([peer.id.as_str()],|r|Ok((r.get(0)?,r.get(1)?)))?.collect::<Result<_,_>>()?;
         if rows.len() > MAX_VISIBLE_ITEMS {
             return Err(ExchangeError::Limit);
         }
@@ -726,7 +854,8 @@ pub fn projection(
             proof.visible(&peer.spec, &packet)?;
             packets.push(packet);
         }
-        proof.check()?;
+        proof.check_in(&tx, peer)?;
+        tx.commit()?;
         Ok(packets)
     })();
     if result.as_ref().err().is_some_and(is_revocation) {

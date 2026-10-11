@@ -33,6 +33,7 @@ struct State {
     revoke_after_send: bool,
     revoke_after_events: bool,
     revoke_after_page: bool,
+    action: Option<Box<dyn FnMut()>>,
 }
 struct Peer {
     state: Rc<RefCell<State>>,
@@ -141,6 +142,10 @@ impl TrustedPeer for Peer {
         lease: &dyn NativeAuthorizationLease,
         message: &Record,
     ) -> Result<MetadataAck, ExchangeError> {
+        let action = self.state.borrow_mut().action.take();
+        if let Some(mut action) = action {
+            action();
+        }
         let mut s = self.state.borrow_mut();
         s.sends.push(message.id().to_string());
         if s.revoke_after_send {
@@ -163,6 +168,10 @@ impl TrustedPeer for Peer {
         _lease: &dyn NativeAuthorizationLease,
         _cursor: &Cursor,
     ) -> Result<Vec<Event>, ExchangeError> {
+        let action = self.state.borrow_mut().action.take();
+        if let Some(mut action) = action {
+            action();
+        }
         let mut s = self.state.borrow_mut();
         let events = std::mem::take(&mut s.events);
         if s.revoke_after_events {
@@ -176,6 +185,10 @@ impl TrustedPeer for Peer {
         _pinned: Option<&SnapshotDescriptor>,
         _offset: u32,
     ) -> Result<SnapshotPage, ExchangeError> {
+        let action = self.state.borrow_mut().action.take();
+        if let Some(mut action) = action {
+            action();
+        }
         let mut s = self.state.borrow_mut();
         let page = s.pages.pop_front().ok_or(ExchangeError::Incomplete)?;
         if s.revoke_after_page {
@@ -551,4 +564,321 @@ fn source_scope_native_stream_and_local_epoch_are_independent_boundaries() {
             crate::local_authority::AuthorityError::Frozen
         ))
     ));
+}
+#[test]
+fn local_disable_during_native_io_cannot_commit_ack_events_or_snapshot() {
+    for route in ["send", "events", "snapshot"] {
+        let host = tempfile::tempdir().unwrap();
+        let mut store = open(host.path());
+        let native = Peer::new();
+        let appointed = appoint(&mut store, peer(), &native).unwrap();
+        let sequence = enqueue(&mut store, &packet()).unwrap();
+        let event = native.event(appointed.spec(), appointed.id(), 1, "one");
+        native.state.borrow_mut().events = vec![event.clone()];
+        native.state.borrow_mut().pages =
+            VecDeque::from([native.page(appointed.spec(), appointed.id(), vec![event], 1)]);
+        let host_path = host.path().to_owned();
+        let spec = peer();
+        let adapter_state = native.state.clone();
+        native.state.borrow_mut().action = Some(Box::new(move || {
+            let mut second = open(&host_path);
+            let operator_adapter = Peer {
+                state: adapter_state.clone(),
+            };
+            let operator = appoint(&mut second, spec.clone(), &operator_adapter).unwrap();
+            disable(&mut second, &operator).unwrap();
+        }));
+        let denied = match route {
+            "send" => matches!(
+                deliver(&mut store, &appointed, sequence),
+                Err(ExchangeError::Forbidden)
+            ),
+            "events" => matches!(
+                poll(&mut store, &appointed, "sync"),
+                Err(ExchangeError::Forbidden)
+            ),
+            "snapshot" => matches!(
+                recover_snapshot(&mut store, &appointed, "snapshot"),
+                Err(ExchangeError::Forbidden)
+            ),
+            _ => unreachable!(),
+        };
+        assert!(denied, "{route}");
+        assert_eq!(count(&store, "local_exchange_projection"), 0);
+        assert_eq!(count(&store, "local_exchange_events"), 0);
+        assert_eq!(count(&store, "local_exchange_streams"), 0);
+        let ack: i64 = store
+            .read_connection()
+            .query_row(
+                "SELECT count(*) FROM local_exchange_deliveries WHERE acknowledged=1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(ack, 0, "{route}");
+    }
+}
+#[test]
+fn migration_preserves_capture_rows_and_operation_constraints_without_fake_captures() {
+    let host = tempfile::tempdir().unwrap();
+    let store = open(host.path());
+    let db = store.project_dir().join("state.db");
+    drop(store);
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute_batch("PRAGMA foreign_keys=ON;
+      DROP TABLE local_exchange_messages; DROP TABLE local_exchange_deliveries; DROP TABLE local_exchange_streams;
+      DROP TABLE local_exchange_events; DROP TABLE local_exchange_projection; DROP TABLE local_exchange_observations; DROP TABLE local_exchange_bindings;
+      DROP TRIGGER outbox_capture_insert; DROP TRIGGER outbox_capture_update; DROP TRIGGER outbox_capture_delete;
+      DROP TABLE outbox;
+      CREATE TABLE outbox(sequence INTEGER PRIMARY KEY AUTOINCREMENT,operation_id TEXT NOT NULL UNIQUE REFERENCES capture_operations(operation_id),kind TEXT NOT NULL,payload_record_id TEXT NOT NULL,created_ms INTEGER NOT NULL,delivered_ms INTEGER) STRICT;
+      INSERT INTO capture_operations(operation_id,request_digest,repository,base_commit,result_commit,policy,reserved_bytes,state,created_ms,updated_ms) VALUES('capture-original','digest','Playground','base','result','required',0,'committed',10,11);
+      INSERT INTO outbox VALUES(41,'capture-original','capture_receipt','original-receipt',12,25);
+      UPDATE meta SET value='14' WHERE key IN ('schema_version','min_compatible_schema');").unwrap();
+    drop(conn);
+    let mut store = open(host.path());
+    assert_eq!(store.schema_version(), 15);
+    let row: (i64, String, String, String, i64, Option<i64>) = store
+        .read_connection()
+        .query_row("SELECT * FROM outbox", [], |r| {
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+            ))
+        })
+        .unwrap();
+    assert_eq!(
+        row,
+        (
+            41,
+            "capture-original".into(),
+            "capture_receipt".into(),
+            "original-receipt".into(),
+            12,
+            Some(25)
+        )
+    );
+    assert!(
+        store
+            .connection()
+            .execute(
+                "DELETE FROM capture_operations WHERE operation_id='capture-original'",
+                []
+            )
+            .is_err()
+    );
+    assert!(store.connection().execute("INSERT INTO outbox(operation_id,kind,payload_record_id,created_ms) VALUES('missing','capture_receipt','receipt',1)",[]).is_err());
+    assert!(
+        store
+            .connection()
+            .execute(
+                "UPDATE outbox SET operation_id='missing' WHERE sequence=41",
+                []
+            )
+            .is_err()
+    );
+    let sequence = enqueue(&mut store, &packet()).unwrap();
+    assert!(sequence > 41);
+    assert_eq!(count(&store, "capture_operations"), 1);
+}
+#[test]
+fn actual_capture_outbox_delivers_immutable_metadata_without_changing_capture_identity() {
+    use crate::collaboration_capture::{
+        self as cap, CaptureOutcome, CapturePolicy, CaptureRequest, OperationId, RetentionBoundary,
+    };
+    let mut f = crate::local_target::tests::Fixture::new();
+    let repo = f._repo.path().to_owned();
+    let base = crate::collaboration_archive::pin_commit(&repo, "HEAD~1").unwrap();
+    let result = crate::collaboration_archive::pin_commit(&repo, "HEAD").unwrap();
+    let operation = OperationId::mint().unwrap();
+    let request = CaptureRequest {
+        operation_id: operation.clone(),
+        repository: repo,
+        base,
+        result,
+        policy: CapturePolicy::Required,
+        retention: RetentionBoundary::UntilReleased,
+    };
+    let receipt = match cap::capture(&mut f.store, &request).unwrap() {
+        CaptureOutcome::Acknowledged(receipt) => receipt,
+        _ => panic!("capture did not acknowledge"),
+    };
+    let sequence: i64 = f
+        .store
+        .read_connection()
+        .query_row(
+            "SELECT sequence FROM outbox WHERE operation_id=?1",
+            [operation.as_str()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let metadata = Metadata::Contribution {
+        contribution: receipt.contribution.to_string(),
+        source: receipt.result.to_string(),
+        availability: SourceAvailability::LocalOnly,
+        scope: vec!["two.txt".into()],
+        brief: Some("captured pending work".into()),
+    };
+    let native = Peer::new();
+    let mut spec = peer();
+    spec.scope = Scope::Project;
+    let appointed = appoint(&mut f.store, spec, &native).unwrap();
+    let wire = stage_capture_metadata(&mut f.store, sequence, &metadata).unwrap();
+    assert_ne!(wire, receipt.receipt_record_id);
+    assert_eq!(
+        stage_capture_metadata(&mut f.store, sequence, &metadata).unwrap(),
+        wire
+    );
+    native.state.borrow_mut().lost_ack = true;
+    assert!(matches!(
+        deliver(&mut f.store, &appointed, sequence),
+        Err(ExchangeError::Offline)
+    ));
+    let mut changed = metadata.clone();
+    if let Metadata::Contribution { brief, .. } = &mut changed {
+        *brief = Some("changed after unknown send".into());
+    }
+    assert!(matches!(
+        stage_capture_metadata(&mut f.store, sequence, &changed),
+        Err(ExchangeError::Invalid(_))
+    ));
+    native.state.borrow_mut().lost_ack = false;
+    assert_eq!(
+        deliver(&mut f.store, &appointed, sequence).unwrap(),
+        Delivery::Acknowledged
+    );
+    assert_eq!(native.state.borrow().sends, vec![wire.to_string(); 2]);
+    let row: (String, String, Option<i64>) = f
+        .store
+        .read_connection()
+        .query_row(
+            "SELECT operation_id,payload_record_id,delivered_ms FROM outbox WHERE sequence=?1",
+            [sequence],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        row,
+        (
+            operation.as_str().to_owned(),
+            receipt.receipt_record_id.to_string(),
+            None
+        )
+    );
+    native.state.borrow_mut().revoked = true;
+    assert!(matches!(
+        projection(&mut f.store, &appointed),
+        Err(ExchangeError::Forbidden)
+    ));
+    assert!(
+        crate::collaboration_archive::retained(&f.store, &receipt.result)
+            .unwrap()
+            .is_some()
+    );
+    let current = cap::receipt(&mut f.store, &operation).unwrap().unwrap();
+    assert_eq!(current.contribution, receipt.contribution);
+    assert_eq!(current.status, "retained_local");
+    let mut forged = metadata;
+    if let Metadata::Contribution { source, .. } = &mut forged {
+        *source = sha('f');
+    }
+    assert!(matches!(
+        stage_capture_metadata(&mut f.store, sequence, &forged),
+        Err(ExchangeError::Invalid(_))
+    ));
+}
+#[test]
+fn bounded_reorder_buffer_rolls_back_the_excess_batch() {
+    let host = tempfile::tempdir().unwrap();
+    let mut store = open(host.path());
+    let native = Peer::new();
+    let appointed = appoint(&mut store, peer(), &native).unwrap();
+    for batch in 0..4 {
+        native.state.borrow_mut().events = (0..64)
+            .map(|n| {
+                native.event(
+                    appointed.spec(),
+                    appointed.id(),
+                    2 + batch * 64 + n,
+                    &format!("gap-{batch}-{n}"),
+                )
+            })
+            .collect();
+        assert_eq!(
+            poll(&mut store, &appointed, &format!("batch-{batch}"))
+                .unwrap()
+                .position,
+            0
+        );
+    }
+    assert_eq!(count(&store, "local_exchange_events"), 256);
+    native.state.borrow_mut().events =
+        vec![native.event(appointed.spec(), appointed.id(), 300, "too many buffered")];
+    assert!(matches!(
+        poll(&mut store, &appointed, "overflow"),
+        Err(ExchangeError::Limit)
+    ));
+    assert_eq!(count(&store, "local_exchange_events"), 256);
+    assert!(projection(&mut store, &appointed).unwrap().is_empty());
+    native.state.borrow_mut().events =
+        vec![native.event(appointed.spec(), appointed.id(), 1, "one")];
+    assert_eq!(
+        poll(&mut store, &appointed, "fill-gap").unwrap().position,
+        257
+    );
+    assert_eq!(projection(&mut store, &appointed).unwrap().len(), 257);
+}
+#[test]
+fn explicit_empty_snapshot_is_complete_and_retained_metadata_survives_actual_gc() {
+    use crate::collaboration_archive::{self as archive, ObjectDigest};
+    use crate::collaboration_gc::{self as gc, GcOptions};
+    let host = tempfile::tempdir().unwrap();
+    let mut store = open(host.path());
+    let native = Peer::new();
+    let appointed = appoint(&mut store, peer(), &native).unwrap();
+    let queued = packet();
+    enqueue(&mut store, &queued).unwrap();
+    let event = native.event(appointed.spec(), appointed.id(), 1, "one");
+    let event_digest = ObjectDigest::of(&event.record().unwrap().canonical_bytes());
+    native.state.borrow_mut().events = vec![event];
+    poll(&mut store, &appointed, "sync").unwrap();
+    let queued_digest = ObjectDigest::of(&queued.record().unwrap().canonical_bytes());
+    let junk = archive::put_object(&store, b"unreferenced exchange fixture").unwrap();
+    for prefix in std::fs::read_dir(archive::objects_dir(&store)).unwrap() {
+        for object in std::fs::read_dir(prefix.unwrap().path()).unwrap() {
+            std::fs::File::open(object.unwrap().path())
+                .unwrap()
+                .set_times(
+                    std::fs::FileTimes::new()
+                        .set_modified(UNIX_EPOCH + std::time::Duration::from_secs(1)),
+                )
+                .unwrap();
+        }
+    }
+    let plan = gc::plan(&mut store, &GcOptions::default()).unwrap();
+    gc::apply(&mut store, &plan.digest, &GcOptions::default()).unwrap();
+    assert!(archive::read_object(&store, &junk).is_err());
+    assert!(archive::read_object(&store, &queued_digest).is_ok());
+    assert!(archive::read_object(&store, &event_digest).is_ok());
+    let page = native.page(appointed.spec(), appointed.id(), vec![], 1);
+    native.state.borrow_mut().pages = VecDeque::from([page]);
+    assert_eq!(
+        recover_snapshot(&mut store, &appointed, "empty")
+            .unwrap()
+            .position,
+        1
+    );
+    assert!(projection(&mut store, &appointed).unwrap().is_empty());
+    assert_eq!(count(&store, "local_exchange_events"), 1);
+    // An older historical event does not repopulate the empty current snapshot.
+    native.state.borrow_mut().events =
+        vec![native.event(appointed.spec(), appointed.id(), 1, "one")];
+    assert_eq!(
+        poll(&mut store, &appointed, "old-event").unwrap().position,
+        1
+    );
+    assert!(projection(&mut store, &appointed).unwrap().is_empty());
 }
