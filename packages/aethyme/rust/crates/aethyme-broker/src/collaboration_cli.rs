@@ -404,7 +404,7 @@ fn dispatch(options: Options) -> Result<Output, Failure> {
         ["export", rest @ ..] => lifecycle::export(&main_root, rest),
         ["handoff", "show", rest @ ..] => lifecycle::handoff_show(&main_root, rest),
         ["sync", "status", rest @ ..] => lifecycle::sync_status(&main_root, rest),
-        ["target", "run", ..] | ["sync"] | ["handoff", "dispatch", ..] => {
+        ["target", "run", ..] | ["sync", ..] | ["handoff", "dispatch", ..] => {
             Err(lifecycle::unsupported())
         }
 

@@ -301,9 +301,9 @@ pub fn acquire_controller(
     target: &str,
     issuer: &str,
 ) -> Result<ControllerOwner, TargetError> {
-    let (epoch, _authority) = crate::local_authority::acquire(store)?;
     nonempty(target, "target")?;
     nonempty(issuer, "issuer")?;
+    let (epoch, _authority) = crate::local_authority::acquire(store)?;
     let locks = store.project_dir().join("controller-locks");
     std::fs::create_dir_all(&locks)?;
     crate::host_state::protect_host_state_path(&locks, true)?;

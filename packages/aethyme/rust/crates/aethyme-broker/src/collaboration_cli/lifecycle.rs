@@ -22,7 +22,7 @@ impl<'a> Flags<'a> {
         for pair in rest.chunks_exact(2) {
             let (flag, value) = (pair[0], pair[1]);
             if !allowed.contains(&flag)
-                || value.is_empty()
+                || value.trim().is_empty()
                 || value.starts_with("--")
                 || value.len() > 4096
                 || value.contains('\0')
@@ -494,6 +494,32 @@ mod tests {
                 .unwrap();
             assert!(output.status.success());
             assert!(read_spec(fifo.to_str().unwrap()).is_err());
+        }
+    }
+    #[test]
+    fn whitespace_operator_labels_cannot_initialize_native_authority() {
+        let mut f = Fixture::new();
+        let snapshot = inspect_at(f.store.project_dir().into(), f.store.project()).unwrap();
+        for (name, issuer) in [("   ", "issuer"), ("T", "   ")] {
+            assert!(matches!(
+                target::acquire_controller(&mut f.store, name, issuer),
+                Err(target::TargetError::Invalid(_))
+            ));
+            assert_eq!(authority::inspect(&snapshot).unwrap().state, "unbound");
+            let rows: i64 = f
+                .store
+                .read_connection()
+                .query_row("SELECT count(*) FROM local_targets", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(rows, 0);
+            assert!(
+                Flags::parse(
+                    &["--target", name, "--issuer", issuer],
+                    &["--target", "--issuer"],
+                    &[]
+                )
+                .is_err()
+            );
         }
     }
     #[test]

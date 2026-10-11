@@ -866,8 +866,22 @@ fn lifecycle_commands_refuse_disabled_policy_before_any_input_or_state_access() 
 #[test]
 fn unavailable_lifecycle_adapters_refuse_without_state_creation() {
     let f = Fixture::new(Some(&enabled_config()));
+    let input = f.repo.path().join("remote-receipt.json");
+    let bytes = b"argument file must remain unread and unchanged";
+    std::fs::write(&input, bytes).unwrap();
+    let input_name = input.to_str().unwrap();
     for args in [
         vec!["collab", "target", "run", "--file", "/__missing_spec__"],
+        vec![
+            "collab",
+            "sync",
+            "--remote",
+            "unappointed",
+            "--file",
+            input_name,
+            "--receipt",
+            "/__missing_remote_receipt__",
+        ],
         vec!["collab", "sync"],
         vec![
             "collab",
@@ -881,6 +895,8 @@ fn unavailable_lifecycle_adapters_refuse_without_state_creation() {
         assert_eq!(code, 3, "{args:?}: {value}");
         assert_eq!(value["code"], "unsupported_profile");
         assert!(!f.collaboration_dir().exists());
+        assert_eq!(std::fs::read(&input).unwrap(), bytes);
+        assert!(!value.to_string().contains(input_name));
     }
 }
 #[test]
