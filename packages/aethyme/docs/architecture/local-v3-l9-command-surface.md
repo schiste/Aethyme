@@ -28,7 +28,7 @@ No command reports success for an unavailable runtime profile.
 | `stop --epoch EPOCH --reason TEXT` | Existing project freeze with the exact current epoch; cooperative ingress closes and authority rotates. Running processes and external effects are not assumed cancelled. |
 | `export --target NAME --issuer NAME --source ID ... --record ID@SHA256 ... --audience NAME --output PATH` | Existing bounded, closed historical bundle; exclusive output creation, exact bundle digest and explicit source/advisory-only limitations. No overwrite or automatic source release. |
 | `handoff show --id ID` | Existing retained-request integrity check and historical state/receipt identifiers. Observation never validates current agent authority. Opening the existing store can perform migrations and is disclosed. |
-| `sync status` | Read existing binding/outbox/inbox/cursor counts as local bookkeeping, without claiming remote delivery or source retention. |
+| `sync status` | Read existing binding/message/event/stream counts as local bookkeeping, without claiming remote delivery or source retention. |
 
 Read-only status commands use the existing checked read-only snapshot. Missing
 or older tables produce a typed unsupported/migration-required result; looking

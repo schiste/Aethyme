@@ -311,10 +311,13 @@ pub(super) fn handoff_show(root: &Path, rest: &[&str]) -> Result<Output, Failure
             e.to_string(),
         )
     })?;
-    Ok((
+    Ok(handoff_observation(view))
+}
+fn handoff_observation(view: handoff::HandoffView) -> Output {
+    (
         json!({"schema":"aethyme.collab-handoff-show/experimental-v0","id":view.id.as_str(),"request":view.request,"state":view.state,"receipt":view.receipt.map(|r|r.to_string()),"historical_only":true,"grants_agent_authority":false}),
         "Retained handoff observation; no current agent authority\n".into(),
-    ))
+    )
 }
 pub(super) fn sync_status(root: &Path, rest: &[&str]) -> Result<Output, Failure> {
     if !rest.is_empty() {
@@ -630,5 +633,57 @@ mod tests {
             Err(authority::AuthorityError::Stale)
         ));
         assert_eq!(authority::status(&f.store).unwrap(), frozen);
+    }
+    #[cfg(unix)]
+    #[test]
+    fn retained_handoff_projection_preserves_request_without_agent_authority() {
+        // This package fixture models trusted verifier evidence; its projection
+        // is not a live provider or native verifier qualification result.
+        let mut f = crate::local_generation::tests::Fixture::new();
+        let generation = f.prepare("cli-observation").unwrap();
+        let agent = handoff::appoint(&mut f.v.f.store, &f.v.owner, "cli-observer").unwrap();
+        let grant = crate::local_acceptance::qualify(
+            &mut f.v.f.store,
+            &f.v.owner,
+            &mut f.broker,
+            &f.carrier,
+            &f.binding,
+            &f.v.execution,
+            &f.v.artifact,
+            &f.v.permit,
+            &f.evidence,
+        )
+        .unwrap();
+        let expiry = grant.expires_ms().min(crate::clock::epoch_ms() + 120_000);
+        let request = handoff::prepare(
+            &mut f.v.f.store,
+            &f.v.owner,
+            &agent,
+            &mut f.broker,
+            &f.carrier,
+            &grant,
+            generation.id(),
+            "cli-inspection",
+            expiry,
+        )
+        .unwrap();
+        drop(grant);
+        let retained = handoff::show(&f.v.f.store, request.id()).unwrap();
+        let exact = serde_json::to_value(&retained.request).unwrap();
+        let (json, text) = handoff_observation(retained);
+        assert_eq!(json["id"], request.id().as_str());
+        assert_eq!(json["state"], "prepared");
+        assert_eq!(json["request"], exact);
+        assert!(json["receipt"].is_null());
+        assert_eq!(json["historical_only"], true);
+        assert_eq!(
+            json["grants_agent_authority"], false,
+            "retained inspection cannot grant current agent authority"
+        );
+        assert!(text.contains("no current agent authority"));
+        assert_eq!(
+            handoff::show(&f.v.f.store, request.id()).unwrap().state,
+            "prepared"
+        );
     }
 }

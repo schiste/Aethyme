@@ -1028,6 +1028,44 @@ fn lifecycle_target_changes_use_actual_ownership_versions_and_exact_epoch_stop()
     let (code, observed) = f.json(&["collab", "authority", "status"]);
     assert_eq!(code, 0, "{observed}");
     assert_eq!(observed["observation"]["state"], "unbound");
+    let missing_revision = format!("sha256:{}", "a".repeat(64));
+    let (code, missing) = f.json(&[
+        "collab",
+        "target",
+        "select",
+        "--target",
+        "unknown",
+        "--issuer",
+        "operator",
+        "--revision",
+        &missing_revision,
+    ]);
+    assert_eq!(code, 3, "{missing}");
+    assert_eq!(missing["code"], "target_missing");
+    let original_spec = std::fs::read(&input.spec).unwrap();
+    let mut invalid: serde_json::Value = serde_json::from_slice(&original_spec).unwrap();
+    invalid["objective_authorization"] = "invalid".into();
+    std::fs::write(&input.spec, serde_json::to_vec(&invalid).unwrap()).unwrap();
+    let (code, refused) = f.json(&[
+        "collab",
+        "target",
+        "propose",
+        "--target",
+        "T",
+        "--issuer",
+        "operator",
+        "--file",
+        input.spec.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 3, "{refused}");
+    assert_eq!(refused["code"], "invalid_target");
+    let (code, observed) = f.json(&["collab", "authority", "status"]);
+    assert_eq!(code, 0, "{observed}");
+    assert_eq!(
+        observed["observation"]["state"], "unbound",
+        "rejected proposal must not initialize authority"
+    );
+    std::fs::write(&input.spec, original_spec).unwrap();
     let id = input.propose_select();
     let (code, observed) = f.json(&["collab", "authority", "status"]);
     assert_eq!(code, 0, "{observed}");
