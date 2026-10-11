@@ -58,6 +58,8 @@ similar = { workspace = true }
 sha1 = { workspace = true }
 # Atomic report publication uses a sibling tempfile plus persist_noclobber.
 tempfile = { workspace = true }
+# Inspect candidate output tar entries without unpacking untrusted paths.
+tar = { workspace = true }
 # Release availability and downgrade decisions use semantic versions rather
 # than string ordering.
 semver = { workspace = true }
