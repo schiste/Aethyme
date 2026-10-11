@@ -440,11 +440,11 @@ fn real_cli_assertions_observe_behavior_and_refuse_forged_or_stale_receipts() {
     };
     let execution = snapshot::freeze(&mut f.store, &owner, &revision.id, spec.clone()).unwrap();
     let artifact = executor
-        .build(&mut f.store, &owner, &execution, &AtomicBool::new(false))
+        .test_build(&mut f.store, &owner, &execution, &AtomicBool::new(false))
         .unwrap()
         .into_artifact()
         .unwrap();
-    let evidence = verify(
+    let evidence = test_verify(
         &mut f.store,
         &owner,
         &execution,
@@ -471,7 +471,7 @@ fn real_cli_assertions_observe_behavior_and_refuse_forged_or_stale_receipts() {
         evidence.reference(),
     )
     .unwrap();
-    let again = verify(
+    let again = test_verify(
         &mut f.store,
         &owner,
         &execution,
@@ -485,7 +485,7 @@ fn real_cli_assertions_observe_behavior_and_refuse_forged_or_stale_receipts() {
     let mut fake = evidence.reference().clone();
     fake.id = RecordId::parse(&d(b"app uploaded success")).unwrap();
     assert!(load_evidence(&f.store, &owner, &execution, &artifact, &permit, &fake).is_err());
-    let cancelled = verify(
+    let cancelled = test_verify(
         &mut f.store,
         &owner,
         &execution,
@@ -509,11 +509,11 @@ fn real_cli_assertions_observe_behavior_and_refuse_forged_or_stale_receipts() {
         "printf 'printf success > /tmp/result.json; printf wrong' > /outputs/app.sh".into();
     let wrong = snapshot::freeze(&mut f.store, &owner, &revision.id, spec).unwrap();
     let wrong_artifact = executor
-        .build(&mut f.store, &owner, &wrong, &AtomicBool::new(false))
+        .test_build(&mut f.store, &owner, &wrong, &AtomicBool::new(false))
         .unwrap()
         .into_artifact()
         .unwrap();
-    let failure = verify(
+    let failure = test_verify(
         &mut f.store,
         &owner,
         &wrong,
@@ -583,11 +583,11 @@ fn real_cli_assertions_observe_behavior_and_refuse_forged_or_stale_receipts() {
         spec.profile.runtime_profile = wrapped.runtime().id();
         let execution = snapshot::freeze(&mut f.store, &owner, &revision.id, spec).unwrap();
         let artifact = wrapped
-            .build(&mut f.store, &owner, &execution, &AtomicBool::new(false))
+            .test_build(&mut f.store, &owner, &execution, &AtomicBool::new(false))
             .unwrap()
             .into_artifact()
             .unwrap();
-        let incomplete = verify(
+        let incomplete = test_verify(
             &mut f.store,
             &owner,
             &execution,
@@ -617,7 +617,7 @@ fn real_cli_assertions_observe_behavior_and_refuse_forged_or_stale_receipts() {
         spec.build.arguments[1] = "printf 'printf Hello,A; exit 1' > /outputs/app.sh".into();
         let nonzero = snapshot::freeze(&mut f.store, &owner, &revision.id, spec).unwrap();
         let artifact = wrapped
-            .build(&mut f.store, &owner, &nonzero, &AtomicBool::new(false))
+            .test_build(&mut f.store, &owner, &nonzero, &AtomicBool::new(false))
             .unwrap()
             .into_artifact()
             .unwrap();
@@ -628,6 +628,7 @@ fn real_cli_assertions_observe_behavior_and_refuse_forged_or_stale_receipts() {
             "abcdef-matching-nonzero",
             &[],
             b"",
+            crate::execution_resources::Admission::ProfileOnly,
             &AtomicBool::new(false),
             || {
                 subject_guard(&f.store, &owner, &nonzero, &artifact, &permit)

@@ -63,6 +63,10 @@ pub enum VerificationError {
     #[error(transparent)]
     Supervisor(#[from] SupervisorError),
     #[error(transparent)]
+    Resources(#[from] crate::execution_resources::ResourceError),
+    #[error(transparent)]
+    Budget(#[from] crate::local_budget::BudgetError),
+    #[error(transparent)]
     Snapshot(#[from] snapshot::SnapshotError),
     #[error(transparent)]
     Target(#[from] target::TargetError),
@@ -762,7 +766,8 @@ fn classify(error: &SupervisorError) -> VerificationOutcome {
 /// Native verifier for the offline CLI profile. Every mandatory trial runs in
 /// a new sandbox, with only its arguments/stdin and the sealed artifact. The
 /// inventory and expected observations stay in the trusted native supervisor.
-pub fn verify(
+#[allow(clippy::too_many_arguments)]
+fn verify_body(
     store: &mut CollaborationStore,
     owner: &ControllerOwner,
     execution: &ExecutionSnapshot,
@@ -770,7 +775,10 @@ pub fn verify(
     permit: &ProducerPermit,
     executor: &DockerExecutor,
     cancel: &AtomicBool,
-) -> Result<TrustedEvidence, VerificationError> {
+    verification: String,
+    mut admission: crate::execution_resources::Admission<'_>,
+    attempt: Option<&crate::local_budget::Attempt>,
+) -> Result<EvidenceBody, VerificationError> {
     subject_guard(store, owner, execution, artifact, permit)?;
     if execution.spec().preparation.is_some() || execution.spec().dataset.is_some() {
         return Err(VerificationError::Unsupported(
@@ -780,17 +788,14 @@ pub fn verify(
     if executor.runtime().id() != permit.policy.runtime {
         return Err(VerificationError::Mismatch);
     }
-    let inputs = snapshot::materialize(store, owner, execution)?;
+    let inputs =
+        snapshot::materialize_in(store, owner, execution, executor.optional_temporary_root())?;
     let inventory = inventory_from_inputs(&inputs, &permit.policy)?;
     if inventory.cases.iter().any(|case| case.exit_code != 0) {
         return Err(VerificationError::Unsupported(
             "nonzero exit assertions require a separate stream-completion witness".into(),
         ));
     }
-    let verification: String =
-        store
-            .read_connection()
-            .query_row("SELECT lower(hex(randomblob(32)))", [], |r| r.get(0))?;
     let mut assertions = Vec::new();
     let mut result = VerificationOutcome::Passed;
     for (index, case) in inventory.cases.iter().enumerate() {
@@ -806,10 +811,23 @@ pub fn verify(
             &generation,
             &case.arguments,
             &hex_bytes(&case.stdin_hex)?,
+            admission.reborrow(),
             cancel,
             || {
-                subject_guard(store, owner, execution, artifact, permit)
-                    .map_err(|_| SupervisorError::Cancelled)
+                let producer = subject_guard(store, owner, execution, artifact, permit)
+                    .map_err(|_| SupervisorError::Cancelled)?;
+                let budget = if let Some(attempt) = attempt {
+                    Some(crate::local_budget::execution_guard(
+                        store,
+                        owner,
+                        attempt,
+                        execution,
+                        crate::execution_resources::verify_envelope(execution)?.units()?,
+                    )?)
+                } else {
+                    None
+                };
+                Ok((producer, budget))
             },
         );
         let observation = match trial {
@@ -862,6 +880,100 @@ pub fn verify(
     if body.result == VerificationOutcome::Passed && !complete_pass(&body, &inventory) {
         return Err(VerificationError::Unfulfilled);
     }
+    Ok(body)
+}
+/// Native verification consumes one current exact execution budget attempt.
+#[allow(clippy::too_many_arguments)]
+pub fn verify(
+    store: &mut CollaborationStore,
+    owner: &ControllerOwner,
+    execution: &ExecutionSnapshot,
+    artifact: &SealedArtifact,
+    permit: &ProducerPermit,
+    executor: &DockerExecutor,
+    attempt: &crate::local_budget::Attempt,
+    cancel: &AtomicBool,
+) -> Result<TrustedEvidence, VerificationError> {
+    subject_guard(store, owner, execution, artifact, permit)?;
+    let policy = executor.resource_policy()?;
+    let generation: String =
+        store
+            .read_connection()
+            .query_row("SELECT lower(hex(randomblob(32)))", [], |r| r.get(0))?;
+    let mut run = crate::execution_resources::Run::admit(
+        policy,
+        store,
+        owner,
+        execution,
+        attempt,
+        generation.clone(),
+        executor.endpoint().into(),
+        crate::execution_resources::verify_envelope(execution)?,
+    )?;
+    let result = verify_body(
+        store,
+        owner,
+        execution,
+        artifact,
+        permit,
+        executor,
+        cancel,
+        generation,
+        crate::execution_resources::Admission::Bound(&mut run),
+        Some(attempt),
+    );
+    if run
+        .journal
+        .objects
+        .iter()
+        .any(|o| !o.removed || o.id.is_none())
+    {
+        crate::local_budget::execution_unknown(
+            store,
+            owner,
+            attempt,
+            "unconfirmed independent verifier teardown",
+        )?;
+        return Err(VerificationError::Unfulfilled);
+    }
+    run.cleaned()?;
+    run.finish(
+        store,
+        owner,
+        attempt,
+        &format!("{:?}", result.as_ref().map(|body| body.result)),
+    )?;
+    let body = result?;
+    let _current = subject_guard(store, owner, execution, artifact, permit)?;
+    retain_evidence(store, owner, body, permit.policy.max_age_ms, cancel, || {})
+}
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn test_verify(
+    store: &mut CollaborationStore,
+    owner: &ControllerOwner,
+    execution: &ExecutionSnapshot,
+    artifact: &SealedArtifact,
+    permit: &ProducerPermit,
+    executor: &DockerExecutor,
+    cancel: &AtomicBool,
+) -> Result<TrustedEvidence, VerificationError> {
+    let generation: String =
+        store
+            .read_connection()
+            .query_row("SELECT lower(hex(randomblob(32)))", [], |r| r.get(0))?;
+    let body = verify_body(
+        store,
+        owner,
+        execution,
+        artifact,
+        permit,
+        executor,
+        cancel,
+        generation,
+        crate::execution_resources::Admission::ProfileOnly,
+        None,
+    )?;
     retain_evidence(store, owner, body, permit.policy.max_age_ms, cancel, || {})
 }
 #[cfg(test)]
