@@ -1202,6 +1202,46 @@ fn lifecycle_export_is_exclusive_and_verified_as_historical_source_only() {
     )
     .unwrap();
     assert_eq!(bundle.scope().audience, "receiver");
+    // Delivery is proved from the actual wire in a distinct receiving store.
+    // Reconstructing the origin alone would miss source substitution in export.
+    use aethyme_broker::collaboration_state::{CollaborationRoot, CollaborationStore, ProjectKey};
+    let receiving_host = tempfile::tempdir().unwrap();
+    let mut receiving = CollaborationStore::open(
+        &CollaborationRoot::under_host_state(receiving_host.path()),
+        &ProjectKey::parse("receiver").unwrap(),
+        &[],
+    )
+    .unwrap();
+    let owner = aethyme_broker::local_target::acquire_controller(
+        &mut receiving,
+        "receiving-target",
+        "receiver-operator",
+    )
+    .unwrap();
+    let binding = restore::bind_receiver(&receiving, &owner, &bundle).unwrap();
+    let imported = restore::import(&mut receiving, &owner, &binding, &bundle).unwrap();
+    assert_eq!(
+        imported.sources,
+        vec![input.retained.result.snapshot_id.clone()],
+        "export must deliver the exact requested source"
+    );
+    assert!(
+        imported.records.is_empty(),
+        "source-only selection must not add historical records"
+    );
+    let delivered = restore::rehearse(
+        &mut receiving,
+        &owner,
+        &imported.id,
+        &input.retained.result.snapshot_id,
+        "independent-delivery",
+    )
+    .unwrap();
+    assert_eq!(
+        std::fs::read(delivered.join("feature.txt")).unwrap(),
+        b"independent source bytes\n"
+    );
+
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
