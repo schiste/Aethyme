@@ -321,14 +321,14 @@ fn actual_native_local_routes_survive_kernel_network_denial() {
         "separate_receiver_imports_history_but_requires_fresh_native_target_policy_and_epoch",
     ] {
         let full = format!("local_compatibility::independence::{test}");
-        let output = std::process::Command::new("/usr/bin/sandbox-exec")
+        let mut command = std::process::Command::new("/usr/bin/sandbox-exec");
+        command
             .args(["-p", "(version 1) (allow default) (deny network*)"])
             .arg(std::env::current_exe().unwrap())
             .args(["--exact", &full, "--nocapture", "--test-threads=1"])
             .env_clear()
-            .env("PATH", "/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin")
-            .output()
-            .unwrap();
+            .env("PATH", "/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin");
+        let output = super::cli_parity::bounded(command);
         assert!(
             output.status.success(),
             "{}\n{}",

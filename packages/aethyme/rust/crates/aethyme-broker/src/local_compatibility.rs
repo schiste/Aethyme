@@ -8,19 +8,7 @@ use crate::{Broker, CachePolicy, PromotionIntent};
 use std::path::{Path, PathBuf};
 
 fn git(repo: &Path, args: &[&str]) -> String {
-    let output = std::process::Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(args)
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "{:?}: {}",
-        args,
-        String::from_utf8_lossy(&output.stderr)
-    );
-    String::from_utf8(output.stdout).unwrap().trim().into()
+    crate::local_target::tests::git(repo, args)
 }
 struct Fixture {
     repo: tempfile::TempDir,
@@ -394,3 +382,6 @@ fn overlapping_shared_state_root_refuses_with_a_separate_location_action() {
 mod old_binary;
 
 mod independence;
+
+#[cfg(target_os = "macos")]
+mod cli_parity;
