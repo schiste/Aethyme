@@ -913,3 +913,327 @@ fn lifecycle_read_only_commands_leave_absent_state_absent() {
         assert!(!f.collaboration_dir().exists());
     }
 }
+
+struct LifecycleInput {
+    fixture: Fixture,
+    retained: aethyme_broker::collaboration_archive::RetainedContribution,
+    spec: PathBuf,
+}
+impl LifecycleInput {
+    fn store(&self) -> aethyme_broker::collaboration_state::CollaborationStore {
+        use aethyme_broker::collaboration_state::{
+            CollaborationRoot, CollaborationStore, ProjectKey,
+        };
+        CollaborationStore::open(
+            &CollaborationRoot::under_host_state(self.fixture.state.path()),
+            &ProjectKey::parse(PROJECT).unwrap(),
+            &[],
+        )
+        .unwrap()
+    }
+    fn new() -> Self {
+        use aethyme_broker::collaboration_archive::{self as archive, CommitOid};
+        let fixture = Fixture::new(Some(&enabled_config()));
+        let base = CommitOid::parse(&git(fixture.repo.path(), &["rev-parse", "HEAD"])).unwrap();
+        std::fs::write(
+            fixture.repo.path().join("feature.txt"),
+            "independent source bytes\n",
+        )
+        .unwrap();
+        git(fixture.repo.path(), &["add", "feature.txt"]);
+        git(fixture.repo.path(), &["commit", "-qm", "feature"]);
+        let result = CommitOid::parse(&git(fixture.repo.path(), &["rev-parse", "HEAD"])).unwrap();
+        use aethyme_broker::collaboration_state::{
+            CollaborationRoot, CollaborationStore, ProjectKey,
+        };
+        let mut store = CollaborationStore::open(
+            &CollaborationRoot::under_host_state(fixture.state.path()),
+            &ProjectKey::parse(PROJECT).unwrap(),
+            &[],
+        )
+        .unwrap();
+        let retained =
+            archive::retain_contribution(&mut store, fixture.repo.path(), &base, &result).unwrap();
+        let spec = fixture.repo.path().join("target.json");
+        let value = serde_json::json!({
+            "objective_authorization":format!("sha256:{}", "1".repeat(64)),
+            "objective":"retain the independent feature",
+            "baseline":retained.base.snapshot_id.to_string(),
+            "contributions":[{"id":"feature","lineage":retained.lineage_record_id.to_string(),"requires":[],"derived_from":[]}],
+            "selected":["feature"],
+            "requirements":[format!("sha256:{}", "2".repeat(64))],
+            "acceptance_policy":format!("sha256:{}", "3".repeat(64)),
+            "composer_profile":aethyme_broker::composer::PROVISIONAL_TEXT_PROFILE,
+        });
+        std::fs::write(&spec, serde_json::to_vec(&value).unwrap()).unwrap();
+        Self {
+            fixture,
+            retained,
+            spec,
+        }
+    }
+    fn propose_select(&self) -> String {
+        let f = &self.fixture;
+        let (code, proposal) = f.json(&[
+            "collab",
+            "target",
+            "propose",
+            "--target",
+            "T",
+            "--issuer",
+            "operator",
+            "--file",
+            self.spec.to_str().unwrap(),
+        ]);
+        assert_eq!(code, 0, "{proposal}");
+        assert_eq!(proposal["dispatch_started"], false);
+        assert!(proposal["status"]["revision"].is_null());
+        let id = proposal["proposal"].as_str().unwrap().to_string();
+        let (code, same) = f.json(&[
+            "collab",
+            "target",
+            "propose",
+            "--target",
+            "T",
+            "--issuer",
+            "operator",
+            "--file",
+            self.spec.to_str().unwrap(),
+        ]);
+        assert_eq!(code, 0, "{same}");
+        assert_eq!(same["proposal"], id);
+        let (code, selected) = f.json(&[
+            "collab",
+            "target",
+            "select",
+            "--target",
+            "T",
+            "--issuer",
+            "operator",
+            "--revision",
+            &id,
+        ]);
+        assert_eq!(code, 0, "{selected}");
+        assert_eq!(selected["status"]["revision"], id);
+        assert_eq!(selected["dispatch_started"], false);
+        id
+    }
+}
+
+#[test]
+fn lifecycle_target_changes_use_actual_ownership_versions_and_exact_epoch_stop() {
+    use aethyme_broker::local_target as target;
+    let input = LifecycleInput::new();
+    let f = &input.fixture;
+    let (code, observed) = f.json(&["collab", "authority", "status"]);
+    assert_eq!(code, 0, "{observed}");
+    assert_eq!(observed["observation"]["state"], "unbound");
+    let id = input.propose_select();
+    let (code, observed) = f.json(&["collab", "authority", "status"]);
+    assert_eq!(code, 0, "{observed}");
+    assert_eq!(observed["observation"]["state"], "active");
+    assert_eq!(observed["grants_authority"], false);
+    let epoch = observed["observation"]["witness"]["epoch"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let (code, wrong) = f.json(&[
+        "collab",
+        "target",
+        "select",
+        "--target",
+        "T",
+        "--issuer",
+        "other",
+        "--revision",
+        &id,
+    ]);
+    assert_eq!(code, 3, "{wrong}");
+    assert_eq!(wrong["code"], "issuer_mismatch");
+    let mut store = input.store();
+    let owner = target::acquire_controller(&mut store, "T", "operator").unwrap();
+    let status = target::status(&store, "T").unwrap();
+    let running =
+        target::transition(&mut store, &owner, status.version, target::Phase::Admitting).unwrap();
+    // A separately held real native process lock fences a CLI appointment.
+    let (code, busy) = f.json(&[
+        "collab",
+        "target",
+        "hold",
+        "--target",
+        "T",
+        "--issuer",
+        "operator",
+        "--version",
+        &running.version.to_string(),
+    ]);
+    assert_eq!(code, 3, "{busy}");
+    assert_eq!(busy["code"], "controller_busy");
+    drop(owner);
+    drop(store);
+    let (code, held) = f.json(&[
+        "collab",
+        "target",
+        "hold",
+        "--target",
+        "T",
+        "--issuer",
+        "operator",
+        "--version",
+        &running.version.to_string(),
+    ]);
+    assert_eq!(code, 0, "{held}");
+    assert_eq!(held["status"]["phase"], "waiting_for_input");
+    assert_eq!(held["status"]["resume_phase"], "admitting");
+    let (code, stale) = f.json(&[
+        "collab",
+        "target",
+        "resume",
+        "--target",
+        "T",
+        "--issuer",
+        "operator",
+        "--version",
+        &running.version.to_string(),
+    ]);
+    assert_eq!(code, 3, "{stale}");
+    assert_eq!(stale["code"], "stale_version");
+    let version = held["status"]["version"].as_i64().unwrap().to_string();
+    let (code, resumed) = f.json(&[
+        "collab",
+        "target",
+        "resume",
+        "--target",
+        "T",
+        "--issuer",
+        "operator",
+        "--version",
+        &version,
+    ]);
+    assert_eq!(code, 0, "{resumed}");
+    assert_eq!(resumed["status"]["phase"], "admitting");
+    let wrong_epoch = format!("sha256:{}", "f".repeat(64));
+    assert_ne!(wrong_epoch, epoch);
+    let (code, stale) = f.json(&[
+        "collab",
+        "stop",
+        "--epoch",
+        &wrong_epoch,
+        "--reason",
+        "operator stop",
+    ]);
+    assert_eq!(code, 3, "{stale}");
+    assert_eq!(stale["code"], "stale_epoch");
+    let (code, stopped) = f.json(&[
+        "collab",
+        "stop",
+        "--epoch",
+        &epoch,
+        "--reason",
+        "operator stop",
+    ]);
+    assert_eq!(code, 0, "{stopped}");
+    assert_eq!(stopped["witness"]["status"], "frozen");
+    assert_eq!(stopped["processes_cancelled"], false);
+    assert_eq!(stopped["live_effects"], "unknown");
+    let (code, observed) = f.json(&["collab", "authority", "status"]);
+    assert_eq!(code, 0, "{observed}");
+    assert_eq!(observed["observation"]["state"], "frozen");
+    let (code, refused) = f.json(&[
+        "collab",
+        "target",
+        "resume",
+        "--target",
+        "T",
+        "--issuer",
+        "operator",
+        "--version",
+        &version,
+    ]);
+    assert_eq!(code, 3, "{refused}");
+    assert_eq!(refused["code"], "authority_frozen");
+    let (code, status) = f.json(&["collab", "target", "status", "--target", "T"]);
+    assert_eq!(code, 0, "{status}");
+    assert_eq!(status["revision"], id);
+    assert_eq!(status["grants_authority"], false);
+}
+
+#[test]
+fn lifecycle_export_is_exclusive_and_verified_as_historical_source_only() {
+    use aethyme_broker::{collaboration_archive as archive, local_restore as restore};
+    let input = LifecycleInput::new();
+    let f = &input.fixture;
+    input.propose_select();
+    let source = input.retained.result.snapshot_id.to_string();
+    let destination = f.repo.path().join("source.bundle");
+    let args = [
+        "collab",
+        "export",
+        "--target",
+        "T",
+        "--issuer",
+        "operator",
+        "--source",
+        &source,
+        "--audience",
+        "receiver",
+        "--output",
+        destination.to_str().unwrap(),
+    ];
+    let (code, exported) = f.json(&args);
+    assert_eq!(code, 0, "{exported}");
+    assert_eq!(exported["historical_only"], true);
+    assert_eq!(exported["grants_authority"], false);
+    assert_eq!(exported["source_released"], false);
+    let bytes = std::fs::read(&destination).unwrap();
+    let digest = archive::ObjectDigest::of(&bytes);
+    assert_eq!(exported["bundle"], digest.hex());
+    assert_eq!(exported["bytes"], bytes.len());
+    let bundle = restore::verify(
+        &bytes,
+        &restore::ReceiverPolicy {
+            bundle: digest,
+            scope: restore::Scope {
+                origin: PROJECT.into(),
+                visibility: "local_project".into(),
+                audience: "receiver".into(),
+            },
+        },
+    )
+    .unwrap();
+    assert_eq!(bundle.scope().audience, "receiver");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&destination)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+    let (code, refused) = f.json(&args);
+    assert_eq!(code, 1, "{refused}");
+    assert_eq!(refused["code"], "io");
+    assert_eq!(std::fs::read(&destination).unwrap(), bytes);
+    let store = input.store();
+    let output = tempfile::tempdir().unwrap();
+    archive::reconstruct(&store, &input.retained.result.snapshot_id, output.path()).unwrap();
+    assert_eq!(
+        std::fs::read(output.path().join("feature.txt")).unwrap(),
+        b"independent source bytes\n"
+    );
+    let (code, sync) = f.json(&["collab", "sync", "status"]);
+    assert_eq!(code, 0, "{sync}");
+    assert_eq!(sync["remote_delivery_confirmed"], false);
+    assert_eq!(sync["source_retention_promised"], false);
+    for (_, count) in sync["local_bookkeeping"].as_object().unwrap() {
+        assert_eq!(count, 0);
+    }
+    let missing = format!("sha256:{}", "e".repeat(64));
+    let (code, handoff) = f.json(&["collab", "handoff", "show", "--id", &missing]);
+    assert_eq!(code, 1, "{handoff}");
+    assert_eq!(handoff["code"], "handoff_missing");
+}
