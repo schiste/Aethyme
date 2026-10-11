@@ -149,7 +149,9 @@ fn advisory_capture_failure_preserves_real_legacy_submission() {
     assert!(!outcome.no_changes);
     assert!(outcome.conflicts.is_empty());
     assert_eq!(report.policy, "advisory");
-    assert_eq!(report.status, CaptureStatus::Failed);
+    assert_eq!(report.status, CaptureStatus::NotConfigured);
+    assert_eq!(report.code.as_deref(), Some("io"));
+    assert!(report.receipt.is_none());
     assert!(report.receipt.is_none());
     assert_eq!(
         std::fs::read(f.host.path().join("collaboration")).unwrap(),
@@ -179,7 +181,9 @@ fn required_capture_failure_refuses_before_queue_or_integration_movement() {
         _ => panic!("required must refuse before legacy submit"),
     };
     assert_eq!(report.policy, "required");
-    assert_eq!(report.status, CaptureStatus::Failed);
+    assert_eq!(report.status, CaptureStatus::NotConfigured);
+    assert_eq!(report.code.as_deref(), Some("io"));
+    assert!(report.receipt.is_none());
     assert_eq!(
         before,
         git(
