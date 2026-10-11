@@ -1234,6 +1234,6 @@ fn lifecycle_export_is_exclusive_and_verified_as_historical_source_only() {
     }
     let missing = format!("sha256:{}", "e".repeat(64));
     let (code, handoff) = f.json(&["collab", "handoff", "show", "--id", &missing]);
-    assert_eq!(code, 1, "{handoff}");
+    assert_eq!(code, 3, "{handoff}");
     assert_eq!(handoff["code"], "handoff_missing");
 }
