@@ -1196,6 +1196,7 @@ fn lifecycle_target_changes_use_actual_ownership_versions_and_exact_epoch_stop()
     assert_eq!(status["grants_authority"], false);
 }
 
+#[cfg(unix)]
 #[test]
 fn lifecycle_export_is_exclusive_and_verified_as_historical_source_only() {
     use aethyme_broker::{collaboration_archive as archive, local_restore as restore};
