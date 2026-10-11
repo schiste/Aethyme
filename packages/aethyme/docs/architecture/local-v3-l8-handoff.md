@@ -2,7 +2,7 @@
 
 Last Updated: 2026-10-11
 
-Status: implementation contract for #678, based on provisional Local L4.
+Status: reviewed implementation for #678 with qualified controlled Unix schedules, based on provisional Local L4.
 
 ## Boundary
 
@@ -90,15 +90,27 @@ adoption does not mutate a prepared generation's global materialization state.
 Old roots and descendant attachments remain retained; direct leader completion
 never proves descendant quiescence.
 
-The first restored run passed 15 schedules with one ignored child helper, before
-the final completion-transaction correction. It includes actual controlled
-commands, target stop/drift/ABA at READY and stop after adoption, physical root
-acknowledgment, writer reservation, native freeze, finite command limits,
-interrupted intent/spawn/READY/adoption, explicit unknown retention, expiry and
-fresh appointment. A real parent exits while a grandchild preserves its old open
-descriptor and watcher path through a later new adoption. The independent Ruby
-adoption vector is `sha256:1a23942180fad840e1880c207986122de4ea127e2d31aaeff0e5a80755a2dc4f`.
-The corrected completion path and added stop/expiry classification schedules are
-being validated; final re-review, guard removals, regressions and Clippy remain
-pending. This profile is not a verification sandbox or a process tree cleanup
-promise. Native broker/gate integration still waits for separately owned #725.
+All 18 handoff schedules passed in the final restored selection (the one ignored
+handoff test is an owned child helper invoked by its parent schedule). These
+include actual controlled commands; target stop/drift/ABA at READY and stop after
+adoption; physical root acknowledgment; SQLite writer reservation; native
+freeze; finite command limits; interrupted intent/spawn/READY/adoption; explicit
+unknown retention; expiry and fresh appointment. A real parent exits while a
+grandchild preserves its old open descriptor and watcher path through a later
+new adoption.
+
+Ten deliberate guard removals each produced a named failing assertion and exit
+101, followed by exact source restoration. The first private-lock mutation did
+not compile and is excluded; its corrected independent trial failed the intended
+assertion. The restored regression selection passed 443 test executions with
+seven ignored helpers; these counts include overlapping module selections, not
+443 unique scenarios. Strict Clippy passed. Independent adversarial review is
+clear and the corrected implementation/parent fixture head has green CI.
+The independent Ruby adoption vector is
+`sha256:1a23942180fad840e1880c207986122de4ea127e2d31aaeff0e5a80755a2dc4f`.
+
+This profile is not a verification sandbox or a process tree cleanup promise.
+READY/adoption records dispatch admission, not proof the appointed workload ran.
+Native broker/gate integration still waits for separately owned #725. E1 must
+requalify composition-dependent assumptions before the profile is qualified
+beyond its current provisional Local boundary.
