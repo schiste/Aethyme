@@ -577,6 +577,19 @@ fn guard(
     }
     Ok(())
 }
+fn reject_overrun(conn: &Connection) -> Result<(), BudgetError> {
+    let overrun: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM local_budget_reservations WHERE observed_overrun IS NOT NULL)",
+        [],
+        |row| row.get(0),
+    )?;
+    if overrun {
+        return Err(BudgetError::Capacity("unreconciled overrun"));
+    }
+
+    Ok(())
+}
+
 fn current(
     store: &CollaborationStore,
     owner: &ControllerOwner,
@@ -708,15 +721,7 @@ pub fn reserve(
         .connection()
         .transaction_with_behavior(TransactionBehavior::Immediate)?;
     guard(&tx, owner, &spec.revision, state.version)?;
-    let overrun: bool = tx.query_row(
-        "SELECT EXISTS(SELECT 1 FROM local_budget_reservations WHERE observed_overrun IS NOT NULL)",
-        [],
-        |row| row.get(0),
-    )?;
-    if overrun {
-        return Err(BudgetError::Capacity("unreconciled overrun"));
-    }
-
+    reject_overrun(&tx)?;
     if let Some(existing) = duplicate(&tx, &spec.request.nonce, &r)? {
         return Ok(existing);
     }
@@ -834,6 +839,7 @@ pub fn delegate(
         .connection()
         .transaction_with_behavior(TransactionBehavior::Immediate)?;
     guard(&tx, owner, &spec.revision, state.version)?;
+    reject_overrun(&tx)?;
     let latest = load_conn(&tx, &parent.id)?;
     if latest.version != parent.version {
         return Err(BudgetError::Stale);
@@ -894,6 +900,7 @@ pub fn begin_attempt(
         .connection()
         .transaction_with_behavior(TransactionBehavior::Immediate)?;
     guard(&tx, owner, &r.spec.revision, state.version)?;
+    reject_overrun(&tx)?;
     let r = load_conn(&tx, key)?;
     if !matches!(r.state, State::Reserved | State::PartlyConsumed)
         || children(&tx, key)?.iter().any(|c| c.state.held())
