@@ -267,6 +267,8 @@ pub enum PinClass {
 
 #[derive(Debug, thiserror::Error)]
 pub enum GcError {
+    #[error(transparent)]
+    Authority(#[from] crate::local_authority::AuthorityError),
     #[error("the archive is in use by a capture, recovery or reader; apply again when they finish")]
     ArchiveInUse,
     #[error("reclamation is blocked: {}", .0.iter().map(|b| format!("{} ({})", b.kind, b.detail)).collect::<Vec<_>>().join("; "))]
@@ -1117,6 +1119,7 @@ fn kind_name(kind: ItemKind) -> &'static str {
 
 /// Survey the archive and record a plan. Removes nothing.
 pub fn plan(store: &mut CollaborationStore, options: &GcOptions) -> Result<GcPlan, GcError> {
+    let _authority = crate::local_authority::archive_guard(store)?;
     options.validate()?;
     let survey = survey(store, options, None)?;
     let reclaimable: Vec<GcItem> = survey.candidates.into_values().collect();
@@ -1293,6 +1296,7 @@ pub(crate) fn apply_with(
     options: &GcOptions,
     hooks: &GcHooks,
 ) -> Result<GcReport, GcError> {
+    let _authority = crate::local_authority::archive_guard(store)?;
     options.validate()?;
     let Some(_exclusive) = try_exclusive(store)? else {
         return Err(GcError::ArchiveInUse);
@@ -1570,6 +1574,7 @@ pub fn resume(
     store: &mut CollaborationStore,
     options: &GcOptions,
 ) -> Result<Vec<Resumed>, GcError> {
+    let _authority = crate::local_authority::archive_guard(store)?;
     options.validate()?;
     let Some(_exclusive) = try_exclusive(store)? else {
         return Err(GcError::ArchiveInUse);

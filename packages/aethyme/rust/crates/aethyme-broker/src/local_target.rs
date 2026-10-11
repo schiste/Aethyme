@@ -227,9 +227,13 @@ pub struct ControllerOwner {
     target: String,
     issuer: String,
     _lock: ExclusiveFileLock,
+    epoch: crate::local_authority::Epoch,
 }
 
 impl ControllerOwner {
+    pub fn authority_epoch(&self) -> &crate::local_authority::Epoch {
+        &self.epoch
+    }
     pub(crate) fn target(&self) -> &str {
         &self.target
     }
@@ -266,6 +270,8 @@ pub enum TargetError {
         detail: String,
     },
     #[error(transparent)]
+    Authority(#[from] crate::local_authority::AuthorityError),
+    #[error(transparent)]
     Compose(#[from] crate::composer::ComposeError),
     #[error(transparent)]
     Archive(#[from] ArchiveError),
@@ -295,6 +301,7 @@ pub fn acquire_controller(
     target: &str,
     issuer: &str,
 ) -> Result<ControllerOwner, TargetError> {
+    let (epoch, _authority) = crate::local_authority::acquire(store)?;
     nonempty(target, "target")?;
     nonempty(issuer, "issuer")?;
     let locks = store.project_dir().join("controller-locks");
@@ -326,13 +333,15 @@ pub fn acquire_controller(
         target: target.into(),
         issuer: issuer.into(),
         _lock: lock,
+        epoch,
     })
 }
 
 pub(crate) fn authorize(
     store: &CollaborationStore,
     owner: &ControllerOwner,
-) -> Result<(), TargetError> {
+) -> Result<crate::local_authority::Guard, TargetError> {
+    let guard = crate::local_authority::guard(store, &owner.epoch)?;
     if store.project_dir() != owner.project_dir {
         return Err(TargetError::Unauthorized);
     }
@@ -347,7 +356,7 @@ pub(crate) fn authorize(
     if issuer.as_deref() != Some(owner.issuer.as_str()) {
         return Err(TargetError::Unauthorized);
     }
-    Ok(())
+    Ok(guard)
 }
 
 fn normalize(mut spec: TargetSpec) -> Result<TargetSpec, TargetError> {
@@ -424,7 +433,7 @@ pub fn propose_revision(
     owner: &ControllerOwner,
     spec: TargetSpec,
 ) -> Result<TargetRevision, TargetError> {
-    authorize(store, owner)?;
+    let _authority = authorize(store, owner)?;
     let spec = normalize(spec)?;
     let _archive = archive_use(store)?;
     require_snapshot(store, &spec.baseline)?;
@@ -557,7 +566,7 @@ pub fn select_revision(
     owner: &ControllerOwner,
     id: &RecordId,
 ) -> Result<(), TargetError> {
-    authorize(store, owner)?;
+    let _authority = authorize(store, owner)?;
     let revision = load_revision(store, id)?;
     if revision.target != owner.target || revision.issuer != owner.issuer {
         return Err(TargetError::Unauthorized);
@@ -609,7 +618,7 @@ pub fn transition(
     expected_version: i64,
     next: Phase,
 ) -> Result<ControllerStatus, TargetError> {
-    authorize(store, owner)?;
+    let _authority = authorize(store, owner)?;
     let observed = status(store, &owner.target)?;
     if observed.version != expected_version {
         return Err(TargetError::StaleVersion);
@@ -649,7 +658,7 @@ pub fn resume(
     owner: &ControllerOwner,
     expected_version: i64,
 ) -> Result<ControllerStatus, TargetError> {
-    authorize(store, owner)?;
+    let _authority = authorize(store, owner)?;
     let observed = status(store, &owner.target)?;
     if observed.version != expected_version {
         return Err(TargetError::StaleVersion);
@@ -700,7 +709,7 @@ pub fn retain_artifacts(
     snapshots: &[SourceSnapshotId],
     objects: &[ObjectDigest],
 ) -> Result<(), TargetError> {
-    authorize(store, owner)?;
+    let _authority = authorize(store, owner)?;
     let revision = load_revision(store, id)?;
     if revision.target != owner.target {
         return Err(TargetError::Unauthorized);
@@ -746,7 +755,7 @@ pub fn release_revision(
     owner: &ControllerOwner,
     id: &RecordId,
 ) -> Result<(), TargetError> {
-    authorize(store, owner)?;
+    let _authority = authorize(store, owner)?;
     let revision = load_revision(store, id)?;
     if revision.target != owner.target {
         return Err(TargetError::Unauthorized);

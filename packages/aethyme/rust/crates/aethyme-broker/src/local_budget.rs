@@ -234,6 +234,7 @@ pub struct Attempt {
     version: i64,
     number: u32,
     remaining: Units,
+    epoch: crate::local_authority::Epoch,
 }
 impl Attempt {
     pub fn reservation(&self) -> &RecordId {
@@ -359,6 +360,7 @@ pub fn configure_project(
     owner: &ControllerOwner,
     policy: ProjectPolicy,
 ) -> Result<RecordId, BudgetError> {
+    let _authority = target::authorize(store, owner)?;
     target::authorize(store, owner)?;
     policy.validate()?;
     let r = record(&ProjectRecord {
@@ -396,6 +398,7 @@ pub fn authorize_objective(
     owner: &ControllerOwner,
     cap: Units,
 ) -> Result<RecordId, BudgetError> {
+    let _authority = target::authorize(store, owner)?;
     target::authorize(store, owner)?;
     cap.validate()?;
     let state = target::status(store, owner.target())?;
@@ -666,6 +669,7 @@ pub fn reserve(
     request: Request,
     now_ms: i64,
 ) -> Result<Reservation, BudgetError> {
+    let _authority = target::authorize(store, owner)?;
     target::authorize(store, owner)?;
     if let Some(key) = nonce_key(store.read_connection(), &request.nonce)? {
         let existing = owned(store, owner, &key)?;
@@ -798,6 +802,7 @@ pub fn delegate(
     mut request: Request,
     now_ms: i64,
 ) -> Result<Reservation, BudgetError> {
+    let _authority = target::authorize(store, owner)?;
     let parent = owned(store, owner, parent)?;
     if let Some(key) = nonce_key(store.read_connection(), &request.nonce)? {
         let existing = owned(store, owner, &key)?;
@@ -885,6 +890,7 @@ pub fn begin_attempt(
     key: &RecordId,
     now_ms: i64,
 ) -> Result<Attempt, BudgetError> {
+    let _authority = target::authorize(store, owner)?;
     let r = owned(store, owner, key)?;
     let (_, state) = current(store, owner, &id(&r.spec.wave)?, r.spec.request.kind)?;
     if now_ms < 0 || now_ms >= r.spec.request.deadline_ms {
@@ -929,6 +935,7 @@ pub fn begin_attempt(
         version: r.version + 1,
         number: r.attempts + 1,
         remaining,
+        epoch: owner.authority_epoch().clone(),
     })
 }
 
@@ -1002,6 +1009,10 @@ pub fn settle(
     usage: Units,
     receipt: &RecordId,
 ) -> Result<Reservation, BudgetError> {
+    let _authority = target::authorize(store, owner)?;
+    if &attempt.epoch != owner.authority_epoch() {
+        return Err(BudgetError::Stale);
+    }
     charge_usage(
         store,
         owner,
@@ -1020,6 +1031,7 @@ pub fn mark_unknown(
     version: i64,
     detail: &str,
 ) -> Result<Reservation, BudgetError> {
+    let _authority = target::authorize(store, owner)?;
     owned(store, owner, key)?;
     let tx = store
         .connection()
@@ -1041,6 +1053,7 @@ pub fn reconcile(
     usage: Units,
     receipt: &RecordId,
 ) -> Result<Reservation, BudgetError> {
+    let _authority = target::authorize(store, owner)?;
     charge_usage(store, owner, key, version, usage, receipt, true)
 }
 
@@ -1052,6 +1065,7 @@ pub fn close(
     key: &RecordId,
     version: i64,
 ) -> Result<Reservation, BudgetError> {
+    let _authority = target::authorize(store, owner)?;
     owned(store, owner, key)?;
     let tx = store
         .connection()
@@ -1083,6 +1097,7 @@ pub fn close(
 
 /// Ledger totals count each root once. This report is not measured throughput.
 pub fn charged(store: &CollaborationStore, owner: &ControllerOwner) -> Result<Units, BudgetError> {
+    let _authority = target::authorize(store, owner)?;
     target::authorize(store, owner)?;
     project(store.read_connection(), owner.issuer())?;
     sum(rows(

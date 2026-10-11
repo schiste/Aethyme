@@ -37,7 +37,7 @@ use serde::Serialize;
 pub use crate::host_state::HostStateSource;
 
 /// The schema this binary writes.
-pub const COLLABORATION_STATE_SCHEMA_VERSION: i64 = 9;
+pub const COLLABORATION_STATE_SCHEMA_VERSION: i64 = 10;
 /// The oldest schema a database written by this binary can be read by.
 /// Unlike `host-operations.db`, a newer database stays readable by an older
 /// binary until a release raises this floor.
@@ -57,7 +57,7 @@ pub const COLLABORATION_STATE_SCHEMA_VERSION: i64 = 9;
 // controller inputs. Such a binary must refuse this store before writing.
 // Schema 8 has no budget ledger, and cannot guard retention while consumption is
 // unknown. As with prior floors, stop old open clients before migration.
-const MIN_COMPATIBLE_SCHEMA: i64 = 9;
+const MIN_COMPATIBLE_SCHEMA: i64 = 10;
 const ROOT_DIRECTORY: &str = "collaboration";
 /// Additive schema steps after the version 1 layout (`meta` only), applied in
 /// order. Each only adds tables; after migrating, the compatibility floor is
@@ -346,8 +346,10 @@ const MIGRATIONS: &[(i64, &str)] = &[
  ON local_budget_reservations(root,parent);
     "#,
     ),
+    (10, "CREATE TABLE local_authority_state (singleton INTEGER PRIMARY KEY NOT NULL CHECK(singleton=1), epoch TEXT NOT NULL) STRICT;"),
 ];
-/// The file that marks a directory as a collaboration root.
+/// The file that marks
+ a directory as a collaboration root.
 pub const ROOT_MARKER: &str = ".aethyme-collaboration-root.json";
 const ROOT_MARKER_KIND: &str = "aethyme-collaboration-root";
 const STATE_DATABASE: &str = "state.db";
