@@ -400,6 +400,29 @@ fn validate_capture_envelope(
     let operation = crate::collaboration_capture::OperationId::parse(operation)?;
     let receipt = crate::collaboration_capture::receipt(store, &operation)?
         .ok_or(ExchangeError::Incomplete)?;
+    let hex: String = store.read_connection().query_row(
+        "SELECT receipt_sha256 FROM capture_receipts WHERE operation_id=?1",
+        [operation.as_str()],
+        |r| r.get(0),
+    )?;
+    let digest =
+        archive::parse_digest(&hex).ok_or_else(|| invalid("capture receipt object digest"))?;
+    let bytes = archive::read_object(store, &digest)?;
+    let archived = Record::decode(
+        &bytes,
+        &[&crate::collaboration_capture::CAPTURE_RECEIPT_SCHEMA],
+    )?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes)?;
+    if archived.id() != receipt.receipt_record_id
+        || archived.canonical_bytes() != bytes
+        || value["operation"].as_str() != Some(operation.as_str())
+        || value["contribution"].as_str() != Some(receipt.contribution.as_str())
+        || value["base"].as_str() != Some(receipt.base.as_str())
+        || value["result"].as_str() != Some(receipt.result.as_str())
+    {
+        return Err(invalid("capture receipt mapping"));
+    }
+
     match packet {
         Metadata::Contribution {
             contribution,
@@ -501,6 +524,14 @@ pub fn deliver(
     )?;
     if !enabled {
         return Err(ExchangeError::Forbidden);
+    }
+    let staged: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM local_exchange_messages WHERE sequence=?1)",
+        [sequence],
+        |r| r.get(0),
+    )?;
+    if !staged {
+        return Err(ExchangeError::Incomplete);
     }
     tx.execute("INSERT INTO local_exchange_deliveries(binding,sequence,attempts,acknowledged) VALUES(?1,?2,0,0) ON CONFLICT DO NOTHING",params![peer.id.as_str(),sequence])?;
     let (attempts,ack):(i64,bool)=tx.query_row("SELECT attempts,acknowledged FROM local_exchange_deliveries WHERE binding=?1 AND sequence=?2",params![peer.id.as_str(),sequence],|r|Ok((r.get(0)?,r.get(1)?)))?;

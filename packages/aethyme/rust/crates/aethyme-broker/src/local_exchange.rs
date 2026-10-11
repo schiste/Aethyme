@@ -220,6 +220,7 @@ pub enum Metadata {
         source: String,
         availability: SourceAvailability,
         scope: Vec<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
         brief: Option<String>,
     },
     GenerationOffer {

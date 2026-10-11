@@ -274,3 +274,18 @@ fn metadata_acknowledgment_is_exact_and_stale_cursors_are_bounded_data() {
 
 #[path = "manager_tests.rs"]
 mod durable;
+
+#[test]
+fn absent_optional_brief_is_canonical_and_roundtrips() {
+    let mut metadata = packet();
+    if let Metadata::Contribution { brief, .. } = &mut metadata {
+        *brief = None;
+    }
+    let record = metadata.record().unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&record.canonical_bytes()).unwrap();
+    assert!(value["spec"].get("brief").is_none());
+    assert_eq!(
+        serde_json::from_value::<Metadata>(value["spec"].clone()).unwrap(),
+        metadata
+    );
+}

@@ -557,13 +557,24 @@ fn source_scope_native_stream_and_local_epoch_are_independent_boundaries() {
     ));
     assert_eq!(count(&store, "local_exchange_events"), 0);
     let epoch = crate::local_authority::status(&store).unwrap().epoch;
-    crate::local_authority::freeze(&mut store, &epoch, "controlled restore").unwrap();
+    let frozen = crate::local_authority::freeze(&mut store, &epoch, "controlled restore").unwrap();
     assert!(matches!(
         projection(&mut store, &appointed),
         Err(ExchangeError::Authority(
             crate::local_authority::AuthorityError::Frozen
         ))
     ));
+    let resumed = crate::local_authority::resume(&mut store, &frozen.epoch).unwrap();
+    assert_ne!(resumed.epoch, epoch);
+    assert!(matches!(
+        projection(&mut store, &appointed),
+        Err(ExchangeError::Authority(
+            crate::local_authority::AuthorityError::Stale
+        ))
+    ));
+    let fresh = appoint(&mut store, peer(), &native).unwrap();
+    assert_ne!(fresh.id(), appointed.id());
+    assert!(projection(&mut store, &fresh).unwrap().is_empty());
 }
 #[test]
 fn local_disable_during_native_io_cannot_commit_ack_events_or_snapshot() {
@@ -726,6 +737,14 @@ fn actual_capture_outbox_delivers_immutable_metadata_without_changing_capture_id
     let mut spec = peer();
     spec.scope = Scope::Project;
     let appointed = appoint(&mut f.store, spec, &native).unwrap();
+    for _ in 0..appointed.spec().max_attempts {
+        assert!(matches!(
+            deliver(&mut f.store, &appointed, sequence),
+            Err(ExchangeError::Incomplete)
+        ));
+    }
+    assert!(native.state.borrow().sends.is_empty());
+    assert_eq!(count(&f.store, "local_exchange_deliveries"), 0);
     let wire = stage_capture_metadata(&mut f.store, sequence, &metadata).unwrap();
     assert_ne!(wire, receipt.receipt_record_id);
     assert_eq!(
@@ -881,4 +900,85 @@ fn explicit_empty_snapshot_is_complete_and_retained_metadata_survives_actual_gc(
         1
     );
     assert!(projection(&mut store, &appointed).unwrap().is_empty());
+}
+#[test]
+fn capture_envelope_checks_archived_receipt_against_damaged_index_and_missing_bytes() {
+    use crate::collaboration_archive as archive;
+    use crate::collaboration_capture::{
+        self as cap, CaptureOutcome, CapturePolicy, CaptureRequest, OperationId, RetentionBoundary,
+    };
+    let mut f = crate::local_target::tests::Fixture::new();
+    let repo = f._repo.path().to_owned();
+    let base = archive::pin_commit(&repo, "HEAD~1").unwrap();
+    let result = archive::pin_commit(&repo, "HEAD").unwrap();
+    let operation = OperationId::mint().unwrap();
+    let request = CaptureRequest {
+        operation_id: operation.clone(),
+        repository: repo,
+        base,
+        result,
+        policy: CapturePolicy::Required,
+        retention: RetentionBoundary::UntilReleased,
+    };
+    let receipt = match cap::capture(&mut f.store, &request).unwrap() {
+        CaptureOutcome::Acknowledged(receipt) => receipt,
+        _ => panic!("capture did not acknowledge"),
+    };
+    let sequence: i64 = f
+        .store
+        .read_connection()
+        .query_row(
+            "SELECT sequence FROM outbox WHERE operation_id=?1",
+            [operation.as_str()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let mut metadata = Metadata::Contribution {
+        contribution: receipt.contribution.to_string(),
+        source: sha('f'),
+        availability: SourceAvailability::LocalOnly,
+        scope: vec!["two.txt".into()],
+        brief: None,
+    };
+    f.store
+        .connection()
+        .execute(
+            "UPDATE capture_receipts SET result_snapshot=?2 WHERE operation_id=?1",
+            rusqlite::params![operation.as_str(), sha('f')],
+        )
+        .unwrap();
+    let damaged = stage_capture_metadata(&mut f.store, sequence, &metadata);
+    assert!(
+        matches!(&damaged, Err(ExchangeError::Invalid(_))),
+        "{damaged:?}"
+    );
+    assert_eq!(count(&f.store, "local_exchange_messages"), 0);
+    f.store
+        .connection()
+        .execute(
+            "UPDATE capture_receipts SET result_snapshot=?2 WHERE operation_id=?1",
+            rusqlite::params![operation.as_str(), receipt.result.as_str()],
+        )
+        .unwrap();
+    if let Metadata::Contribution { source, .. } = &mut metadata {
+        *source = receipt.result.to_string();
+    }
+    let hex: String = f
+        .store
+        .read_connection()
+        .query_row(
+            "SELECT receipt_sha256 FROM capture_receipts WHERE operation_id=?1",
+            [operation.as_str()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let digest = archive::parse_digest(&hex).unwrap();
+    std::fs::remove_file(archive::object_path(&f.store, &digest)).unwrap();
+    assert!(matches!(
+        stage_capture_metadata(&mut f.store, sequence, &metadata),
+        Err(ExchangeError::Archive(
+            archive::ArchiveError::MissingObject { .. }
+        ))
+    ));
+    assert_eq!(count(&f.store, "local_exchange_messages"), 0);
 }

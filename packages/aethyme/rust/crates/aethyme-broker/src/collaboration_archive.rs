@@ -1579,7 +1579,7 @@ pub fn retained_contribution(
     }))
 }
 
-fn parse_digest(hex: &str) -> Option<ObjectDigest> {
+pub(crate) fn parse_digest(hex: &str) -> Option<ObjectDigest> {
     if !is_lower_hex(hex, &[64]) {
         return None;
     }
