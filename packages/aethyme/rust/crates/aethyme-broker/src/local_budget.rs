@@ -1,7 +1,7 @@
 //! Provisional Local budget reservation model (#668).
 //! This records declared envelopes, not enforced process limits or invoices.
 //! The future trusted executor must enforce a grant and provide usage receipts.
-//! Host capacity grants remain in `resources::HostResourceStore`.
+//! Host capacity grants remain in `resources::HostResourceCoordinator`.
 
 use aethyme_contracts::experimental_v0::{FieldKind, FieldSpec, Record, RecordId, RecordSchema};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
@@ -948,6 +948,81 @@ pub fn begin_attempt(
     })
 }
 
+/// Native execution adapter: a live pending attempt must name this exact frozen
+/// execution recipe, current wave/revision/epoch and sufficient finite envelope.
+/// Reading a reservation or importing an attempt's JSON cannot mint this permit.
+pub(crate) fn authorize_execution(
+    store: &CollaborationStore,
+    owner: &ControllerOwner,
+    attempt: &Attempt,
+    execution: &crate::execution_snapshot::ExecutionSnapshot,
+    envelope: Units,
+) -> Result<(), BudgetError> {
+    let _authority = target::authorize(store, owner)?;
+    let reservation = owned(store, owner, &attempt.reservation)?;
+    let (wave, state) = current(
+        store,
+        owner,
+        &id(&reservation.spec.wave)?,
+        WorkKind::Verification,
+    )?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| BudgetError::Stale)?
+        .as_millis();
+    envelope.validate()?;
+    if attempt.project_dir != store.project_dir()
+        || &attempt.epoch != owner.authority_epoch()
+        || reservation.state != State::CompletionPending
+        || reservation.version != attempt.version
+        || reservation.attempts != attempt.number
+        || reservation.spec.request.kind != WorkKind::Verification
+        || reservation.spec.request.recipe != execution.id().as_str()
+        || reservation.spec.revision != execution.target_revision().as_str()
+        || wave.candidate_snapshot.as_ref().map(|id| id.as_str())
+            != Some(execution.spec().candidate_source.as_str())
+        || state.phase != Phase::Verifying
+        || now >= reservation.spec.request.deadline_ms as u128
+        || !envelope.within(attempt.remaining)
+    {
+        return Err(BudgetError::Stale);
+    }
+    Ok(())
+}
+
+pub(crate) struct ExecutionGuard<'a> {
+    _authority: crate::local_authority::Guard,
+    _transaction: rusqlite::Transaction<'a>,
+}
+pub(crate) fn execution_guard<'a>(
+    store: &'a CollaborationStore,
+    owner: &ControllerOwner,
+    attempt: &Attempt,
+    execution: &crate::execution_snapshot::ExecutionSnapshot,
+    envelope: Units,
+) -> Result<ExecutionGuard<'a>, BudgetError> {
+    let authority = target::authorize(store, owner)?;
+    // Settlement, stop and producer changes cannot race the dispatch decision
+    // between its final ledger read and daemon start acknowledgement.
+    let transaction = rusqlite::Transaction::new_unchecked(
+        store.read_connection(),
+        TransactionBehavior::Immediate,
+    )?;
+    authorize_execution(store, owner, attempt, execution, envelope)?;
+    Ok(ExecutionGuard {
+        _authority: authority,
+        _transaction: transaction,
+    })
+}
+pub(crate) fn execution_unknown(
+    store: &mut CollaborationStore,
+    owner: &ControllerOwner,
+    attempt: &Attempt,
+    detail: &str,
+) -> Result<(), BudgetError> {
+    mark_unknown(store, owner, &attempt.reservation, attempt.version, detail)?;
+    Ok(())
+}
 fn charge_usage(
     store: &mut CollaborationStore,
     owner: &ControllerOwner,

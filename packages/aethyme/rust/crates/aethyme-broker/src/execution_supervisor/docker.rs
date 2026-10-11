@@ -375,34 +375,278 @@ fn validate_container(
     }
     Ok(())
 }
+fn inspect_owned(
+    cli: &Connection,
+    object: &crate::execution_resources::Object,
+    generation: &str,
+) -> Result<bool, SupervisorError> {
+    use crate::execution_resources::ObjectKind;
+    let id = object.id.as_ref().ok_or_else(|| {
+        SupervisorError::Inconclusive(
+            "unacknowledged daemon creation; capacity remains reserved".into(),
+        )
+    })?;
+    let (kind, filter, format) = match object.kind {
+        ObjectKind::Container => ("container", format!("id={id}"), "{{.ID}}"),
+        ObjectKind::Volume => ("volume", format!("name={id}"), "{{.Name}}"),
+    };
+    let mut args = strings(&[kind, "ls"]);
+    if object.kind == ObjectKind::Container {
+        args.extend(strings(&["--all", "--no-trunc"]));
+    }
+    args.extend(strings(&["--filter", &filter, "--format", format]));
+    let list = ok(cli, &args)?;
+    if !list.lines().any(|value| value == id) {
+        return Ok(false);
+    }
+    let value = if object.kind == ObjectKind::Container {
+        container(cli, id)?
+    } else {
+        let value: serde_json::Value =
+            serde_json::from_str(&ok(cli, &strings(&["volume", "inspect", id]))?)?;
+        value
+            .as_array()
+            .and_then(|v| v.first())
+            .cloned()
+            .ok_or_else(|| SupervisorError::Tampered("volume inspection".into()))?
+    };
+    let valid = match object.kind {
+        ObjectKind::Container => {
+            value["Id"].as_str() == Some(id)
+                && value["Name"].as_str() == Some(&format!("/{}", object.name))
+                && value["Config"]["Labels"]["aethyme.local.generation"].as_str()
+                    == Some(generation)
+        }
+        ObjectKind::Volume => {
+            value["Name"].as_str() == Some(id)
+                && value["Driver"].as_str() == Some("local")
+                && value["Labels"]["aethyme.local.generation"].as_str() == Some(generation)
+        }
+    };
+    if !valid {
+        return Err(SupervisorError::Tampered(
+            "cleanup identity/generation changed".into(),
+        ));
+    }
+    Ok(true)
+}
+pub(super) fn recover(
+    cli: &Connection,
+    run: &mut crate::execution_resources::Run,
+) -> Result<(), SupervisorError> {
+    if run.journal.endpoint != cli.endpoint {
+        return Err(SupervisorError::Tampered("cleanup endpoint changed".into()));
+    }
+    let mut objects = run.journal.objects.clone();
+    // Containers precede volumes so attached readers cannot outlive removal.
+    objects.sort_by_key(|o| {
+        if o.kind == crate::execution_resources::ObjectKind::Container {
+            0
+        } else {
+            1
+        }
+    });
+    for object in objects {
+        if object.removed {
+            continue;
+        }
+        let id = object.id.as_ref().ok_or_else(|| {
+            SupervisorError::Inconclusive(
+                "creation acknowledgement missing; explicit quiescence reconciliation required"
+                    .into(),
+            )
+        })?;
+        if inspect_owned(cli, &object, &object.generation)? {
+            match object.kind {
+                crate::execution_resources::ObjectKind::Container => {
+                    ok(cli, &strings(&["container", "rm", "--force", id]))?;
+                }
+                crate::execution_resources::ObjectKind::Volume => {
+                    ok(cli, &strings(&["volume", "rm", id]))?;
+                }
+            }
+        }
+        run.removed(object.kind, id)?;
+    }
+    run.cleaned()?;
+    run.release_clean()?;
+    Ok(())
+}
 pub(super) struct Job<'a> {
     cli: &'a Connection,
     generation: &'a str,
     containers: Vec<String>,
     volumes: Vec<String>,
+    admission: crate::execution_resources::Admission<'a>,
+    next: u32,
 }
 impl<'a> Job<'a> {
-    pub fn new(cli: &'a Connection, generation: &'a str) -> Self {
+    pub fn new(
+        cli: &'a Connection,
+        generation: &'a str,
+        admission: crate::execution_resources::Admission<'a>,
+    ) -> Self {
         Self {
             cli,
             generation,
             containers: vec![],
             volumes: vec![],
+            admission,
+            next: 0,
         }
     }
+    pub(super) fn capacity<F, G>(
+        &mut self,
+        policy: &crate::execution_resources::ResourcePolicy,
+        cancel: &AtomicBool,
+        mut authorize: F,
+    ) -> Result<(), SupervisorError>
+    where
+        F: FnMut() -> Result<G, SupervisorError>,
+    {
+        let info: serde_json::Value = serde_json::from_str(&ok(
+            self.cli,
+            &strings(&["info", "--format", "{{json .}}"]),
+        )?)?;
+        if info["ID"].as_str() != Some(&policy.daemon)
+            || info["MemTotal"]
+                .as_u64()
+                .is_none_or(|bytes| bytes < u64::from(policy.memory_mib) * 1024 * 1024)
+        {
+            return Err(SupervisorError::Infrastructure(
+                "daemon memory admission cannot be witnessed".into(),
+            ));
+        }
+        // Only an empty volume owned by this run is mounted. Candidate input
+        // volumes use the same default local driver without custom options.
+        let volume = self.volume("meter", None)?;
+        let limits = ResourceLimits {
+            timeout_ms: 10_000,
+            memory_bytes: 64 * 1024 * 1024,
+            output_bytes: 1024 * 1024,
+            pids: 8,
+        };
+        let mut args = options(
+            &format!("aethyme-{}-meter", self.generation),
+            &policy.meter_image,
+            limits,
+        );
+        args.extend(strings(&[
+            "--label",
+            &format!("aethyme.local.generation={}", self.generation),
+            "--mount",
+            &format!("type=volume,source={volume},target=/meter,readonly,volume-nocopy"),
+            &policy.meter_image,
+            "--signal=KILL",
+            "--kill-after=1s",
+            "10s",
+            "/usr/bin/df",
+            "--output=avail",
+            "-B1",
+            "/meter",
+        ]));
+        let id = self.create(&args)?;
+        if cancel.load(Ordering::SeqCst) {
+            return Err(SupervisorError::Cancelled);
+        }
+        // The operator pins this immutable capacity-tool image separately from
+        // the candidate build image. No source, secrets or expected answers.
+        let guard = authorize()?;
+        let output = ok(self.cli, &strings(&["container", "start", "--attach", &id]))?;
+        drop(guard);
+        let available = output
+            .lines()
+            .last()
+            .and_then(|line| line.trim().parse::<u64>().ok())
+            .ok_or_else(|| SupervisorError::Infrastructure("daemon disk meter response".into()))?;
+        self.remove_container(&id, false)?;
+        if let Some(run) = self.admission.run() {
+            run.removed(crate::execution_resources::ObjectKind::Container, &id)?;
+        }
+        self.containers.retain(|value| value != &id);
+        if self.removal_owned(crate::execution_resources::ObjectKind::Volume, &volume)? {
+            ok(self.cli, &strings(&["volume", "rm", &volume]))?;
+        }
+        if let Some(run) = self.admission.run() {
+            run.removed(crate::execution_resources::ObjectKind::Volume, &volume)?;
+        }
+        self.volumes.retain(|value| value != &volume);
+        if available
+            < policy
+                .daemon_floor_bytes
+                .checked_add(u64::from(policy.disk_mib) * 1024 * 1024)
+                .ok_or(SupervisorError::Limit)?
+        {
+            return Err(SupervisorError::Infrastructure("daemon disk floor".into()));
+        }
+        Ok(())
+    }
+    fn removal_owned(
+        &self,
+        kind: crate::execution_resources::ObjectKind,
+        id: &str,
+    ) -> Result<bool, SupervisorError> {
+        let Some(journal) = self.admission.journal() else {
+            return Ok(true);
+        };
+        let object = journal
+            .objects
+            .iter()
+            .find(|o| o.kind == kind && o.id.as_deref() == Some(id))
+            .ok_or_else(|| SupervisorError::Tampered("cleanup inventory mismatch".into()))?;
+        inspect_owned(self.cli, object, &object.generation)
+    }
+    fn remove_container(&self, id: &str, force: bool) -> Result<(), SupervisorError> {
+        if self.removal_owned(crate::execution_resources::ObjectKind::Container, id)? {
+            let mut args = strings(&["container", "rm"]);
+            if force {
+                args.push("--force".into())
+            }
+            args.push(id.into());
+            ok(self.cli, &args)?;
+        }
+        Ok(())
+    }
     fn create(&mut self, args: &[String]) -> Result<String, SupervisorError> {
-        let id = ok(self.cli, args)?;
+        let mut args = args.to_vec();
+        let name = if let Some(index) = args.iter().position(|v| v == "--name") {
+            args.get(index + 1)
+                .ok_or_else(|| SupervisorError::Tampered("container name missing".into()))?
+                .clone()
+        } else {
+            let name = format!("aethyme-{}-import-{}", self.generation, self.next);
+            self.next += 1;
+            args.splice(2..2, ["--name".into(), name.clone()]);
+            name
+        };
+        if let Some(run) = self.admission.run() {
+            run.intent(
+                crate::execution_resources::ObjectKind::Container,
+                name.clone(),
+                self.generation.into(),
+            )?;
+        }
+        let id = ok(self.cli, &args)?;
+
         if !identity(&id) {
             return Err(SupervisorError::Infrastructure(
                 "ambiguous container creation".into(),
             ));
         }
+        if let Some(run) = self.admission.run() {
+            run.created(&name, id.clone())?;
+        }
         self.containers.push(id.clone());
         Ok(id)
     }
-    fn start<F>(&self, id: &str, cancel: &AtomicBool, authorize: F) -> Result<(), SupervisorError>
+    fn start<F, G>(
+        &self,
+        id: &str,
+        cancel: &AtomicBool,
+        authorize: F,
+    ) -> Result<(), SupervisorError>
     where
-        F: FnOnce() -> Result<crate::local_authority::Guard, SupervisorError>,
+        F: FnOnce() -> Result<G, SupervisorError>,
     {
         if cancel.load(Ordering::SeqCst) {
             return Err(SupervisorError::Cancelled);
@@ -437,10 +681,20 @@ impl<'a> Job<'a> {
             ]));
         }
         args.push(name.clone());
+        if let Some(run) = self.admission.run() {
+            run.intent(
+                crate::execution_resources::ObjectKind::Volume,
+                name.clone(),
+                self.generation.into(),
+            )?;
+        }
         if ok(self.cli, &args)? != name {
             return Err(SupervisorError::Infrastructure(
                 "volume creation identity".into(),
             ));
+        }
+        if let Some(run) = self.admission.run() {
+            run.created(&name, name.clone())?;
         }
         self.volumes.push(name.clone());
         Ok(name)
@@ -494,18 +748,21 @@ impl<'a> Job<'a> {
                 "transferred input differs".into(),
             ));
         }
-        ok(self.cli, &strings(&["container", "rm", &id]))?;
+        self.remove_container(&id, false)?;
+        if let Some(run) = self.admission.run() {
+            run.removed(crate::execution_resources::ObjectKind::Container, &id)?;
+        }
         self.containers.retain(|v| v != &id);
         Ok(volume)
     }
-    pub fn build<F>(
+    pub fn build<F, G>(
         &mut self,
         inputs: &MaterializedInputs,
         cancel: &AtomicBool,
         mut active: F,
     ) -> Result<(i32, artifact::Output), SupervisorError>
     where
-        F: FnMut() -> Result<crate::local_authority::Guard, SupervisorError>,
+        F: FnMut() -> Result<G, SupervisorError>,
     {
         let spec = inputs.snapshot().spec();
         let image = &spec.profile.build_image;
@@ -623,7 +880,10 @@ impl<'a> Job<'a> {
             .as_i64()
             .and_then(|v| i32::try_from(v).ok())
             .ok_or_else(|| SupervisorError::Inconclusive("missing exit status".into()))?;
-        ok(self.cli, &strings(&["container", "rm", &id]))?;
+        self.remove_container(&id, false)?;
+        if let Some(run) = self.admission.run() {
+            run.removed(crate::execution_resources::ObjectKind::Container, &id)?;
+        }
         self.containers.retain(|v| v != &id);
         if exit != 0 {
             return Ok((
@@ -789,7 +1049,10 @@ impl<'a> Job<'a> {
             .as_i64()
             .and_then(|n| i32::try_from(n).ok())
             .ok_or_else(|| SupervisorError::Inconclusive("missing verifier exit".into()))?;
-        ok(self.cli, &strings(&["container", "rm", &id]))?;
+        self.remove_container(&id, false)?;
+        if let Some(run) = self.admission.run() {
+            run.removed(crate::execution_resources::ObjectKind::Container, &id)?;
+        }
         self.containers.retain(|v| v != &id);
         // Host capture files were never mounted into the workload. The daemon
         // stream, not an app-written success file, determines these observations.
@@ -804,11 +1067,19 @@ impl<'a> Job<'a> {
         // Only exact IDs created by this invocation are stopped. On failure,
         // retain the inventory so a later explicit cleanup can retry safely.
         while let Some(id) = self.containers.last() {
-            ok(self.cli, &strings(&["container", "rm", "--force", id]))?;
+            self.remove_container(id, true)?;
+            if let Some(run) = self.admission.run() {
+                run.removed(crate::execution_resources::ObjectKind::Container, id)?;
+            }
             self.containers.truncate(self.containers.len() - 1);
         }
         while let Some(volume) = self.volumes.last() {
-            ok(self.cli, &strings(&["volume", "rm", volume]))?;
+            if self.removal_owned(crate::execution_resources::ObjectKind::Volume, volume)? {
+                ok(self.cli, &strings(&["volume", "rm", volume]))?;
+            }
+            if let Some(run) = self.admission.run() {
+                run.removed(crate::execution_resources::ObjectKind::Volume, volume)?;
+            }
             self.volumes.truncate(self.volumes.len() - 1);
         }
         Ok(())
@@ -952,7 +1223,11 @@ mod tests {
             cli,
             endpoint: "unix:///trusted-test".into(),
         };
-        let job = Job::new(&connection, "test-dispatch-only");
+        let job = Job::new(
+            &connection,
+            "test-dispatch-only",
+            crate::execution_resources::Admission::ProfileOnly,
+        );
         job.start(&"a".repeat(64), &AtomicBool::new(false), || {
             Ok(target::authorize(&f.store, &owner)?)
         })

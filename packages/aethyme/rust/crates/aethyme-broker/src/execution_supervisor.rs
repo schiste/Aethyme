@@ -74,6 +74,10 @@ pub enum SupervisorError {
     #[error("execution timed out")]
     TimedOut,
     #[error(transparent)]
+    Resources(#[from] crate::execution_resources::ResourceError),
+    #[error(transparent)]
+    Budget(#[from] crate::local_budget::BudgetError),
+    #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error(transparent)]
     Json(#[from] serde_json::Error),
@@ -123,6 +127,7 @@ impl RuntimeDescription {
 pub struct DockerExecutor {
     cli: docker::Connection,
     runtime: RuntimeDescription,
+    resources: Option<crate::execution_resources::ResourcePolicy>,
 }
 impl DockerExecutor {
     /// Capture a runtime descriptor for operator approval and the frozen spec.
@@ -135,7 +140,49 @@ impl DockerExecutor {
         }
         let cli = docker::Connection::local(cli)?;
         let runtime = docker::probe(&cli)?;
-        Ok(Self { cli, runtime })
+        Ok(Self {
+            cli,
+            runtime,
+            resources: None,
+        })
+    }
+    /// Reclaim only the named journal's exact resources after its reader lock
+    /// is available. Unacknowledged creation stays held for explicit review.
+    pub fn recover_resources(&self, run: &str) -> Result<(), SupervisorError> {
+        let policy = self.resource_policy()?;
+        if docker::probe(&self.cli)? != self.runtime {
+            return Err(SupervisorError::Unsupported(
+                "recovery runtime drift".into(),
+            ));
+        }
+        let mut run = crate::execution_resources::Run::recover(policy, run)?;
+        docker::recover(&self.cli, &mut run)
+    }
+    pub fn with_resources(
+        mut self,
+        policy: crate::execution_resources::ResourcePolicy,
+    ) -> Result<Self, SupervisorError> {
+        if policy.runtime != self.runtime.id() || policy.daemon != self.runtime.daemon_id {
+            return Err(SupervisorError::Unsupported(
+                "resource policy/runtime mismatch".into(),
+            ));
+        }
+        docker::image(&self.cli, &policy.meter_image, &self.runtime.architecture)?;
+        self.resources = Some(policy);
+        Ok(self)
+    }
+    pub(crate) fn optional_temporary_root(&self) -> Option<&Path> {
+        self.resources.as_ref().map(|p| p.temporary_root.as_path())
+    }
+    pub(crate) fn endpoint(&self) -> &str {
+        &self.cli.endpoint
+    }
+    pub(crate) fn resource_policy(
+        &self,
+    ) -> Result<&crate::execution_resources::ResourcePolicy, SupervisorError> {
+        self.resources.as_ref().ok_or_else(|| {
+            SupervisorError::Infrastructure("explicit host resource policy required".into())
+        })
     }
     pub fn runtime(&self) -> &RuntimeDescription {
         &self.runtime
@@ -157,6 +204,7 @@ impl DockerExecutor {
         generation: &str,
         arguments: &[String],
         stdin: &[u8],
+        admission: crate::execution_resources::Admission<'_>,
         cancel: &AtomicBool,
         authorize: F,
     ) -> Result<ObservedCommand, SupervisorError>
@@ -175,7 +223,11 @@ impl DockerExecutor {
             &spec.profile.architecture,
         )?;
         let _archive = crate::collaboration_gc::archive_use(store)?;
-        let directory = tempfile::TempDir::new()?;
+        let directory = if let Some(policy) = &self.resources {
+            tempfile::TempDir::new_in(&policy.temporary_root)?
+        } else {
+            tempfile::TempDir::new()?
+        };
         let materialized = directory.path().join("artifact");
         std::fs::create_dir(&materialized)?;
         #[cfg(unix)]
@@ -207,7 +259,11 @@ impl DockerExecutor {
                 }
             }
         }
-        let mut job = docker::Job::new(&self.cli, generation);
+        let mut job = docker::Job::new(&self.cli, generation, admission);
+        let mut authorize = authorize;
+        if self.resources.is_some() {
+            job.capacity(self.resource_policy()?, cancel, &mut authorize)?;
+        }
         let result = job.cli_trial(
             spec,
             &materialized,
@@ -320,12 +376,96 @@ fn active(
     Ok(guard)
 }
 impl DockerExecutor {
+    /// Execute once under a current finite budget attempt and host admission.
     pub fn build(
         &self,
         store: &mut CollaborationStore,
         owner: &ControllerOwner,
         execution: &ExecutionSnapshot,
+        attempt: &crate::local_budget::Attempt,
         cancel: &AtomicBool,
+    ) -> Result<BuildObservation, SupervisorError> {
+        active(store, owner, execution)?;
+        let policy = self.resource_policy()?;
+        let generation: String = store
+            .read_connection()
+            .query_row("SELECT lower(hex(randomblob(32)))", [], |r| r.get(0))
+            .map_err(target::TargetError::from)?;
+        let envelope = crate::execution_resources::build_envelope(execution)?;
+        let mut run = crate::execution_resources::Run::admit(
+            policy,
+            store,
+            owner,
+            execution,
+            attempt,
+            generation.clone(),
+            self.cli.endpoint.clone(),
+            envelope,
+        )?;
+        let result = self.build_inner(
+            store,
+            owner,
+            execution,
+            cancel,
+            generation,
+            crate::execution_resources::Admission::Bound(&mut run),
+            Some(attempt),
+        );
+        if run
+            .journal
+            .objects
+            .iter()
+            .all(|object| object.removed && object.id.is_some())
+        {
+            run.cleaned()?;
+            run.finish(
+                store,
+                owner,
+                attempt,
+                &format!("{:?}", result.as_ref().map(|v| v.outcome())),
+            )?;
+        } else {
+            crate::local_budget::execution_unknown(
+                store,
+                owner,
+                attempt,
+                "unconfirmed exact execution teardown",
+            )?;
+        }
+        result
+    }
+    #[cfg(test)]
+    pub(crate) fn test_build(
+        &self,
+        store: &mut CollaborationStore,
+        owner: &ControllerOwner,
+        execution: &ExecutionSnapshot,
+        cancel: &AtomicBool,
+    ) -> Result<BuildObservation, SupervisorError> {
+        let generation: String = store
+            .read_connection()
+            .query_row("SELECT lower(hex(randomblob(32)))", [], |r| r.get(0))
+            .map_err(target::TargetError::from)?;
+        self.build_inner(
+            store,
+            owner,
+            execution,
+            cancel,
+            generation,
+            crate::execution_resources::Admission::ProfileOnly,
+            None,
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn build_inner(
+        &self,
+        store: &mut CollaborationStore,
+        owner: &ControllerOwner,
+        execution: &ExecutionSnapshot,
+        cancel: &AtomicBool,
+        generation: String,
+        admission: crate::execution_resources::Admission<'_>,
+        attempt: Option<&crate::local_budget::Attempt>,
     ) -> Result<BuildObservation, SupervisorError> {
         active(store, owner, execution)?;
         let spec = execution.spec();
@@ -347,13 +487,32 @@ impl DockerExecutor {
             &spec.profile.build_image,
             &spec.profile.architecture,
         )?;
-        let inputs = snapshot::materialize(store, owner, execution)?;
-        let generation: String = store
-            .read_connection()
-            .query_row("SELECT lower(hex(randomblob(32)))", [], |r| r.get(0))
-            .map_err(target::TargetError::from)?;
-        let mut job = docker::Job::new(&self.cli, &generation);
-        let result = job.build(&inputs, cancel, || active(store, owner, execution));
+        let inputs = snapshot::materialize_in(
+            store,
+            owner,
+            execution,
+            self.resources.as_ref().map(|p| p.temporary_root.as_path()),
+        )?;
+        let mut job = docker::Job::new(&self.cli, &generation, admission);
+        let mut authorize = || {
+            let authority = active(store, owner, execution)?;
+            let budget = if let Some(attempt) = attempt {
+                Some(crate::local_budget::execution_guard(
+                    store,
+                    owner,
+                    attempt,
+                    execution,
+                    crate::execution_resources::build_envelope(execution)?.units()?,
+                )?)
+            } else {
+                None
+            };
+            Ok((authority, budget))
+        };
+        if self.resources.is_some() {
+            job.capacity(self.resource_policy()?, cancel, &mut authorize)?;
+        }
+        let result = job.build(&inputs, cancel, &mut authorize);
         // Teardown must succeed; cancellation latched during export/cleanup
         // invalidates the result before a capability can be constructed.
         job.cleanup()?;

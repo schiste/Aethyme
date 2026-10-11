@@ -166,7 +166,7 @@ fn real_linux_build_observes_readonly_inputs_stopped_writers_and_failures() {
     spec.build.arguments[1]="set -e; test ! -e /var/run/docker.sock; test ! -e /harness; test ! -e /dataset; test -z \"$HOME\"; if echo bad > /source/one.txt; then exit 99; fi; printf sealed > /outputs/asset; (sleep 1; echo late > /outputs/late) >/dev/null 2>&1 & exit 0".into();
     let execution = snapshot::freeze(&mut f.store, &owner, &revision.id, spec.clone()).unwrap();
     let result = executor
-        .build(&mut f.store, &owner, &execution, &AtomicBool::new(false))
+        .test_build(&mut f.store, &owner, &execution, &AtomicBool::new(false))
         .unwrap();
     assert_eq!(result.outcome(), Outcome::Built);
     let sealed = result.into_artifact().unwrap();
@@ -175,7 +175,7 @@ fn real_linux_build_observes_readonly_inputs_stopped_writers_and_failures() {
     spec.build.arguments[1] = "exit 42".into();
     let execution = snapshot::freeze(&mut f.store, &owner, &revision.id, spec.clone()).unwrap();
     let failed = executor
-        .build(&mut f.store, &owner, &execution, &AtomicBool::new(false))
+        .test_build(&mut f.store, &owner, &execution, &AtomicBool::new(false))
         .unwrap();
     assert_eq!(failed.outcome(), Outcome::CodeFailed);
     assert_eq!(failed.exit_code(), Some(42));
@@ -184,12 +184,12 @@ fn real_linux_build_observes_readonly_inputs_stopped_writers_and_failures() {
     spec.profile.build_limits.timeout_ms = 200;
     let execution = snapshot::freeze(&mut f.store, &owner, &revision.id, spec.clone()).unwrap();
     let timed = executor
-        .build(&mut f.store, &owner, &execution, &AtomicBool::new(false))
+        .test_build(&mut f.store, &owner, &execution, &AtomicBool::new(false))
         .unwrap();
     assert_eq!(timed.outcome(), Outcome::TimedOut);
     assert!(timed.artifact().is_none());
     let stopped = executor
-        .build(&mut f.store, &owner, &execution, &AtomicBool::new(true))
+        .test_build(&mut f.store, &owner, &execution, &AtomicBool::new(true))
         .unwrap();
     assert_eq!(stopped.outcome(), Outcome::Cancelled);
     assert!(stopped.artifact().is_none());
@@ -197,7 +197,7 @@ fn real_linux_build_observes_readonly_inputs_stopped_writers_and_failures() {
     spec.build.arguments[1] = "ln -s /etc/passwd /outputs/asset".into();
     let execution = snapshot::freeze(&mut f.store, &owner, &revision.id, spec.clone()).unwrap();
     let forged = executor
-        .build(&mut f.store, &owner, &execution, &AtomicBool::new(false))
+        .test_build(&mut f.store, &owner, &execution, &AtomicBool::new(false))
         .unwrap();
     assert_eq!(forged.outcome(), Outcome::TamperingDetected);
     assert!(forged.artifact().is_none());
@@ -229,7 +229,7 @@ fn real_linux_build_observes_readonly_inputs_stopped_writers_and_failures() {
         spec.build.arguments[1] = "printf sealed > /outputs/asset".into();
         let execution = snapshot::freeze(&mut f.store, &owner, &revision.id, spec.clone()).unwrap();
         let observation = wrapped
-            .build(&mut f.store, &owner, &execution, &cancel)
+            .test_build(&mut f.store, &owner, &execution, &cancel)
             .unwrap();
         cancelling.join().unwrap();
         assert_eq!(observation.outcome(), Outcome::Cancelled);
@@ -249,7 +249,7 @@ fn real_linux_build_observes_readonly_inputs_stopped_writers_and_failures() {
         spec.build.arguments[1] = "printf too-late > /outputs/asset".into();
         let execution = snapshot::freeze(&mut f.store, &owner, &revision.id, spec.clone()).unwrap();
         let observation = wrapped
-            .build(&mut f.store, &owner, &execution, &AtomicBool::new(false))
+            .test_build(&mut f.store, &owner, &execution, &AtomicBool::new(false))
             .unwrap();
         assert_eq!(observation.outcome(), Outcome::TimedOut);
         assert!(observation.artifact().is_none());

@@ -426,6 +426,14 @@ pub fn materialize(
     owner: &ControllerOwner,
     snapshot: &ExecutionSnapshot,
 ) -> Result<MaterializedInputs, SnapshotError> {
+    materialize_in(store, owner, snapshot, None)
+}
+pub(crate) fn materialize_in(
+    store: &CollaborationStore,
+    owner: &ControllerOwner,
+    snapshot: &ExecutionSnapshot,
+    temporary_root: Option<&Path>,
+) -> Result<MaterializedInputs, SnapshotError> {
     let _authority = target::authorize(store, owner)?;
     current(store, owner, snapshot.target_revision())?;
     // Never trust a caller-edited descriptor or a stale retained ref.
@@ -435,9 +443,13 @@ pub fn materialize(
     }
     let _archive = crate::collaboration_gc::archive_use(store)?;
     let spec = snapshot.spec();
-    let workspace = tempfile::Builder::new()
-        .prefix("aethyme-execution-")
-        .tempdir()?;
+    let mut builder = tempfile::Builder::new();
+    builder.prefix("aethyme-execution-");
+    let workspace = if let Some(root) = temporary_root {
+        builder.tempdir_in(root)?
+    } else {
+        builder.tempdir()?
+    };
     for (role, id, manifest) in inspect_roles(store, spec, MAX_INPUT_BYTES)? {
         let path = workspace.path().join(role);
         archive::reconstruct(store, &id, &path)?;
