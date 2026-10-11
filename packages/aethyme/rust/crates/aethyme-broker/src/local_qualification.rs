@@ -103,15 +103,20 @@ fn completed_control() -> (
     use std::process::{Command, Stdio};
     let stdout = tempfile::NamedTempFile::new().unwrap();
     let stderr = tempfile::NamedTempFile::new().unwrap();
-    let mut child = Command::new("/usr/bin/true")
+    let child = Command::new("/usr/bin/true")
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout.reopen().unwrap()))
         .stderr(Stdio::from(stderr.reopen().unwrap()))
         .spawn()
         .unwrap();
+    let mut client = NativeClient {
+        child,
+        reaped: false,
+    };
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        if let Some(status) = child.try_wait().unwrap() {
+        if let Some(status) = client.child.try_wait().unwrap() {
+            client.reaped = true;
             assert!(status.success());
             break;
         }
@@ -121,14 +126,7 @@ fn completed_control() -> (
         );
         std::thread::sleep(Duration::from_millis(1));
     }
-    (
-        NativeClient {
-            child,
-            reaped: true,
-        },
-        stdout,
-        stderr,
-    )
+    (client, stdout, stderr)
 }
 #[test]
 fn completed_native_control_cannot_bypass_deadline() {
