@@ -15,16 +15,16 @@ fn git(repo: &Path, args: &[&str]) -> String {
     );
     String::from_utf8_lossy(&output.stdout).trim().into()
 }
-struct Fixture {
-    v: crate::execution_verifier::tests::Subject,
-    broker: Broker,
-    carrier: GitCarrier,
-    binding: RecordId,
-    evidence: crate::execution_verifier::TrustedEvidence,
+pub(crate) struct Fixture {
+    pub(crate) v: crate::execution_verifier::tests::Subject,
+    pub(crate) broker: Broker,
+    pub(crate) carrier: GitCarrier,
+    pub(crate) binding: RecordId,
+    pub(crate) evidence: crate::execution_verifier::TrustedEvidence,
     _remote: tempfile::TempDir,
 }
 impl Fixture {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let mut v = crate::execution_verifier::tests::Subject::acceptance_fixture();
         v.f.store
             .connection()
@@ -139,7 +139,10 @@ impl Fixture {
             pending_contributions: vec![self.v.f.b.lineage_record_id.to_string()],
         }
     }
-    fn prepare(&mut self, operation: &str) -> Result<PreparedGeneration, GenerationError> {
+    pub(crate) fn prepare(
+        &mut self,
+        operation: &str,
+    ) -> Result<PreparedGeneration, GenerationError> {
         let old = self.old();
         let evidence = &self.evidence;
         let grant = acceptance::qualify(

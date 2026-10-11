@@ -37,7 +37,7 @@ use serde::Serialize;
 pub use crate::host_state::HostStateSource;
 
 /// The schema this binary writes.
-pub const COLLABORATION_STATE_SCHEMA_VERSION: i64 = 15;
+pub const COLLABORATION_STATE_SCHEMA_VERSION: i64 = 16;
 /// The oldest schema a database written by this binary can be read by.
 /// Unlike `host-operations.db`, a newer database stays readable by an older
 /// binary until a release raises this floor.
@@ -60,10 +60,10 @@ pub const COLLABORATION_STATE_SCHEMA_VERSION: i64 = 15;
 // Schema 9 does not honor external authority epochs. Quiesce it before restore.
 // Schema 10 cannot enforce the configured verification producer catalogue.
 // Schema 11 cannot fence unresolved source publication against retention release.
-const MIN_COMPATIBLE_SCHEMA: i64 = 15;
+const MIN_COMPATIBLE_SCHEMA: i64 = 16;
 const ROOT_DIRECTORY: &str = "collaboration";
 /// Schema steps after the version 1 layout (`meta` only), applied in
-/// order. Step 15 preserves and generalizes the capture outbox; the floor is
+/// order. Step 16 adds session-bound native handoff journals. The floor is
 /// raised to [`MIN_COMPATIBLE_SCHEMA`].
 const MIGRATIONS: &[(i64, &str)] = &[
     (
@@ -420,6 +420,29 @@ const MIGRATIONS: &[(i64, &str)] = &[
         PRIMARY KEY(generation,kind,reference)
     ) STRICT;"),
     (15, "DROP TRIGGER IF EXISTS outbox_capture_insert; DROP TRIGGER IF EXISTS outbox_capture_update; DROP TRIGGER IF EXISTS outbox_capture_delete; CREATE TABLE local_exchange_bindings (\n id TEXT PRIMARY KEY NOT NULL, epoch TEXT NOT NULL, body BLOB NOT NULL,\n enabled INTEGER NOT NULL CHECK(enabled IN (0,1))\n) STRICT;\nALTER TABLE outbox RENAME TO outbox_capture_v3;\nCREATE TABLE outbox (\n sequence INTEGER PRIMARY KEY AUTOINCREMENT, operation_id TEXT NOT NULL UNIQUE,\n kind TEXT NOT NULL, payload_record_id TEXT NOT NULL, created_ms INTEGER NOT NULL,\n delivered_ms INTEGER\n) STRICT;\nINSERT INTO outbox SELECT * FROM outbox_capture_v3;\nDROP TABLE outbox_capture_v3;\nCREATE TRIGGER outbox_capture_insert BEFORE INSERT ON outbox\n WHEN NEW.kind != 'exchange_metadata_v0' AND NOT EXISTS\n (SELECT 1 FROM capture_operations WHERE operation_id=NEW.operation_id)\n BEGIN SELECT RAISE(ABORT,'capture outbox operation is missing'); END;\nCREATE TRIGGER outbox_capture_update BEFORE UPDATE OF operation_id,kind ON outbox\n WHEN NEW.kind != 'exchange_metadata_v0' AND NOT EXISTS\n (SELECT 1 FROM capture_operations WHERE operation_id=NEW.operation_id)\n BEGIN SELECT RAISE(ABORT,'capture outbox operation is missing'); END;\nCREATE TRIGGER outbox_capture_delete BEFORE DELETE ON capture_operations\n WHEN EXISTS (SELECT 1 FROM outbox WHERE operation_id=OLD.operation_id AND kind != 'exchange_metadata_v0')\n BEGIN SELECT RAISE(ABORT,'capture operation has an outbox message'); END;\nCREATE TABLE local_exchange_deliveries (\n binding TEXT NOT NULL REFERENCES local_exchange_bindings(id),\n sequence INTEGER NOT NULL REFERENCES outbox(sequence), attempts INTEGER NOT NULL CHECK(attempts>=0),\n acknowledged INTEGER NOT NULL CHECK(acknowledged IN (0,1)), ack BLOB,\n PRIMARY KEY(binding,sequence)\n) STRICT;\nCREATE TABLE local_exchange_streams (\n binding TEXT PRIMARY KEY NOT NULL REFERENCES local_exchange_bindings(id),\n witness BLOB NOT NULL, position INTEGER NOT NULL, snapshot_watermark INTEGER NOT NULL,\n valid INTEGER NOT NULL CHECK(valid IN (0,1))\n) STRICT;\nCREATE TABLE local_exchange_events (\n binding TEXT NOT NULL REFERENCES local_exchange_bindings(id), stream TEXT NOT NULL,\n sequence INTEGER NOT NULL, id TEXT NOT NULL, body BLOB NOT NULL, applied INTEGER NOT NULL CHECK(applied IN (0,1,2)),\n PRIMARY KEY(binding,stream,sequence)\n) STRICT;\nCREATE TABLE local_exchange_projection (\n binding TEXT NOT NULL REFERENCES local_exchange_bindings(id),\n packet TEXT NOT NULL, body BLOB NOT NULL, PRIMARY KEY(binding,packet)\n) STRICT;\nCREATE TABLE local_exchange_observations (\n binding TEXT NOT NULL REFERENCES local_exchange_bindings(id), operation TEXT NOT NULL,\n attempts INTEGER NOT NULL CHECK(attempts>=0), PRIMARY KEY(binding,operation)\n) STRICT;\n\nCREATE TABLE local_exchange_messages(sequence INTEGER PRIMARY KEY NOT NULL REFERENCES outbox(sequence),body BLOB NOT NULL) STRICT;\n"),
+    (16, "CREATE TABLE local_agent_sessions (
+        target TEXT NOT NULL REFERENCES local_targets(target), session TEXT NOT NULL,
+        nonce TEXT NOT NULL, epoch TEXT NOT NULL, current_handoff TEXT,
+        phase TEXT NOT NULL CHECK(phase IN ('paused','running','unknown')),
+        PRIMARY KEY(target,session)
+    ) STRICT;
+    CREATE TABLE local_handoffs (
+        id TEXT PRIMARY KEY NOT NULL, target TEXT NOT NULL REFERENCES local_targets(target),
+        session TEXT NOT NULL, operation TEXT NOT NULL, generation TEXT NOT NULL REFERENCES local_generations(id),
+        body BLOB NOT NULL, state TEXT NOT NULL CHECK(state IN ('prepared','dispatching','adopted')),
+        receipt TEXT, UNIQUE(target,session,operation)
+    ) STRICT;
+    CREATE TABLE local_agent_dispatches (
+        id TEXT PRIMARY KEY NOT NULL, handoff TEXT NOT NULL REFERENCES local_handoffs(id),
+        command BLOB NOT NULL, state TEXT NOT NULL CHECK(state IN ('intent','acknowledged','leader_completed','leader_completed_old','attached_old','unknown')),
+        pid INTEGER, completion INTEGER
+    ) STRICT;
+    CREATE TABLE local_agent_reconciliations (
+        id TEXT PRIMARY KEY NOT NULL, handoff TEXT NOT NULL REFERENCES local_handoffs(id), body BLOB NOT NULL
+    ) STRICT;
+    CREATE TABLE local_adoption_receipts (
+        id TEXT PRIMARY KEY NOT NULL, handoff TEXT NOT NULL REFERENCES local_handoffs(id), body BLOB NOT NULL
+    ) STRICT;"),
 
 ];
 /// The file that marks a directory as a collaboration root.
@@ -1738,7 +1761,7 @@ mod tests {
         store
             .connection()
             .execute_batch(
-                "DROP TABLE local_exchange_messages; DROP TABLE local_exchange_deliveries; DROP TABLE local_exchange_streams; DROP TABLE local_exchange_events; DROP TABLE local_exchange_projection; DROP TABLE local_exchange_observations; DROP TABLE local_exchange_bindings; DROP TRIGGER outbox_capture_insert; DROP TRIGGER outbox_capture_update; DROP TRIGGER outbox_capture_delete; DROP TABLE local_generation_roots; DROP TABLE local_generation_receipts; DROP TABLE local_generations; DROP TABLE local_acceptance_qualifications; DROP TABLE local_acceptance_receipts; DROP TABLE local_acceptance_bindings; DROP TABLE local_source_transport_receipts; DROP TABLE local_source_transports; DROP TABLE local_verification_evidence; DROP TABLE local_verifier_producers; DROP TABLE local_authority_state; DROP TABLE local_wave_arrivals;
+                "DROP TABLE local_adoption_receipts; DROP TABLE local_agent_dispatches; DROP TABLE local_agent_reconciliations; DROP TABLE local_handoffs; DROP TABLE local_agent_sessions; DROP TABLE local_exchange_messages; DROP TABLE local_exchange_deliveries; DROP TABLE local_exchange_streams; DROP TABLE local_exchange_events; DROP TABLE local_exchange_projection; DROP TABLE local_exchange_observations; DROP TABLE local_exchange_bindings; DROP TRIGGER outbox_capture_insert; DROP TRIGGER outbox_capture_update; DROP TRIGGER outbox_capture_delete; DROP TABLE local_generation_roots; DROP TABLE local_generation_receipts; DROP TABLE local_generations; DROP TABLE local_acceptance_qualifications; DROP TABLE local_acceptance_receipts; DROP TABLE local_acceptance_bindings; DROP TABLE local_source_transport_receipts; DROP TABLE local_source_transports; DROP TABLE local_verification_evidence; DROP TABLE local_verifier_producers; DROP TABLE local_authority_state; DROP TABLE local_wave_arrivals;
                  DROP TABLE local_waves;
                  UPDATE meta SET value = '3' WHERE key = 'schema_version';
                  UPDATE meta SET value = '1' WHERE key = 'min_compatible_schema';",
@@ -1774,7 +1797,7 @@ mod tests {
         store
             .connection()
             .execute_batch(
-                "DROP TABLE local_exchange_messages; DROP TABLE local_exchange_deliveries; DROP TABLE local_exchange_streams; DROP TABLE local_exchange_events; DROP TABLE local_exchange_projection; DROP TABLE local_exchange_observations; DROP TABLE local_exchange_bindings; DROP TRIGGER outbox_capture_insert; DROP TRIGGER outbox_capture_update; DROP TRIGGER outbox_capture_delete; DROP TABLE local_generation_roots; DROP TABLE local_generation_receipts; DROP TABLE local_generations; DROP TABLE local_acceptance_qualifications; DROP TABLE local_acceptance_receipts; DROP TABLE local_acceptance_bindings; DROP TABLE local_source_transport_receipts; DROP TABLE local_source_transports; DROP TABLE local_verification_evidence; DROP TABLE local_verifier_producers; DROP TABLE local_authority_state; DROP TABLE local_wave_arrivals;
+                "DROP TABLE local_adoption_receipts; DROP TABLE local_agent_dispatches; DROP TABLE local_agent_reconciliations; DROP TABLE local_handoffs; DROP TABLE local_agent_sessions; DROP TABLE local_exchange_messages; DROP TABLE local_exchange_deliveries; DROP TABLE local_exchange_streams; DROP TABLE local_exchange_events; DROP TABLE local_exchange_projection; DROP TABLE local_exchange_observations; DROP TABLE local_exchange_bindings; DROP TRIGGER outbox_capture_insert; DROP TRIGGER outbox_capture_update; DROP TRIGGER outbox_capture_delete; DROP TABLE local_generation_roots; DROP TABLE local_generation_receipts; DROP TABLE local_generations; DROP TABLE local_acceptance_qualifications; DROP TABLE local_acceptance_receipts; DROP TABLE local_acceptance_bindings; DROP TABLE local_source_transport_receipts; DROP TABLE local_source_transports; DROP TABLE local_verification_evidence; DROP TABLE local_verifier_producers; DROP TABLE local_authority_state; DROP TABLE local_wave_arrivals;
                  DROP TABLE local_waves;
                  UPDATE meta SET value = '2' WHERE key = 'schema_version';",
             )
