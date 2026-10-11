@@ -437,7 +437,7 @@ pub fn verify(bytes: &[u8], policy: &ReceiverPolicy) -> Result<VerifiedBundle, R
     }
     check_graph(&header, &objects)?;
     Ok(VerifiedBundle {
-        digest: policy.bundle.clone(),
+        digest: policy.bundle,
         header,
         objects,
     })
