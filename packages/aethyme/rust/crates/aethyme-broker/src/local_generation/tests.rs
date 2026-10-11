@@ -714,3 +714,193 @@ fn a_symlinked_generation_ancestor_cannot_reuse_a_prepared_receipt() {
         assert!(moved.join("source/.git").exists());
     }
 }
+
+#[test]
+fn independent_prepared_vector_binds_source_and_both_git_representations() {
+    let v: serde_json::Value = serde_json::from_str(include_str!("prepared-vector.json")).unwrap();
+    let bytes = v["canonical"].as_str().unwrap().as_bytes();
+    let expected = id(v["id"].as_str().unwrap()).unwrap();
+    let spec: PreparedSpec = decode(&PREPARED, &expected, bytes).unwrap();
+    assert_eq!(record(&PREPARED, &spec).unwrap().canonical_bytes(), bytes);
+    let raw: serde_json::Value = serde_json::from_slice(bytes).unwrap();
+    for key in [
+        "profile",
+        "generation",
+        "source",
+        "provider_commit",
+        "tree",
+        "local_commit",
+        "git_metadata",
+    ] {
+        let mut changed = raw.clone();
+        changed["spec"][key] = "changed".into();
+        assert_ne!(
+            Record::decode(&serde_json::to_vec(&changed).unwrap(), &[&PREPARED])
+                .unwrap()
+                .id(),
+            expected,
+            "{key}"
+        );
+    }
+}
+
+#[test]
+fn crash_before_source_and_after_durable_files_never_implies_preparation_or_adoption() {
+    let mut f = Fixture::new();
+    for (stage, operation) in [
+        (Stage::Intent, "crash-intent"),
+        (Stage::Durable, "crash-durable"),
+    ] {
+        let old = f.old();
+        let grant = acceptance::qualify(
+            &mut f.v.f.store,
+            &f.v.owner,
+            &mut f.broker,
+            &f.carrier,
+            &f.binding,
+            &f.v.execution,
+            &f.v.artifact,
+            &f.v.permit,
+            &f.evidence,
+        )
+        .unwrap();
+        let result = prepare_with(
+            &mut f.v.f.store,
+            &f.v.owner,
+            &mut f.broker,
+            &f.carrier,
+            &grant,
+            operation,
+            old.clone(),
+            &mut |at, _| {
+                if at == stage {
+                    Err(GenerationError::Incomplete)
+                } else {
+                    Ok(())
+                }
+            },
+        );
+        assert!(matches!(result, Err(GenerationError::Incomplete)));
+        let (generation, state): (String, String) =
+            f.v.f
+                .store
+                .read_connection()
+                .query_row(
+                    "SELECT id,state FROM local_generations WHERE operation=?1",
+                    [operation],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+        assert_eq!(state, "intent");
+        let generation = id(&generation).unwrap();
+        assert!(load_prepared(&f.v.f.store, &generation).is_err());
+        let dir = directory(&f.v.f.store, &generation);
+        if stage == Stage::Intent {
+            assert!(!dir.exists());
+            // An INTENT without any source writes can resume the exact request.
+            let g = prepare(
+                &mut f.v.f.store,
+                &f.v.owner,
+                &mut f.broker,
+                &f.carrier,
+                &grant,
+                operation,
+                old,
+            )
+            .unwrap();
+            assert_eq!(g.id(), &generation);
+        } else {
+            assert!(dir.join("prepared.json").is_file());
+            let marker = dir.join("source/partial-evidence");
+            std::fs::write(&marker, b"preserve").unwrap();
+            assert!(matches!(
+                prepare(
+                    &mut f.v.f.store,
+                    &f.v.owner,
+                    &mut f.broker,
+                    &f.carrier,
+                    &grant,
+                    operation,
+                    old
+                ),
+                Err(GenerationError::Incomplete)
+            ));
+            assert_eq!(std::fs::read(marker).unwrap(), b"preserve");
+        }
+        assert_eq!(
+            target::status(&f.v.f.store, f.v.owner.target())
+                .unwrap()
+                .phase,
+            target::Phase::Verifying
+        );
+    }
+}
+
+#[test]
+fn actual_late_child_and_watcher_remain_attached_to_old_absolute_workspace() {
+    use std::io::{BufRead, BufReader};
+    use std::process::{Child, Command, Stdio};
+    struct OwnedChild(Option<Child>);
+    impl Drop for OwnedChild {
+        fn drop(&mut self) {
+            if let Some(child) = self.0.as_mut() {
+                if let Err(e) = child.kill() {
+                    eprintln!("child cleanup: {e}");
+                }
+                if let Err(e) = child.wait() {
+                    eprintln!("child reap: {e}");
+                }
+            }
+        }
+    }
+    let mut f = Fixture::new();
+    let old = f.old();
+    std::fs::write(old.absolute_root.join("watch.txt"), b"watch-v1\n").unwrap();
+    let mut child=OwnedChild(Some(Command::new("/bin/sh").arg("-c").arg("printf 'ready\\n'; IFS= read -r command; printf 'late child edit\\n' >> child.txt; cat watch.txt").current_dir(&old.absolute_root).stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap()));
+    let mut line = String::new();
+    BufReader::new(child.0.as_mut().unwrap().stdout.as_mut().unwrap())
+        .read_line(&mut line)
+        .unwrap();
+    assert_eq!(line, "ready\n");
+    let grant = acceptance::qualify(
+        &mut f.v.f.store,
+        &f.v.owner,
+        &mut f.broker,
+        &f.carrier,
+        &f.binding,
+        &f.v.execution,
+        &f.v.artifact,
+        &f.v.permit,
+        &f.evidence,
+    )
+    .unwrap();
+    let old_root = old.absolute_root.clone();
+    let g = prepare_with(
+        &mut f.v.f.store,
+        &f.v.owner,
+        &mut f.broker,
+        &f.carrier,
+        &grant,
+        "child-watcher",
+        old,
+        &mut |stage, _| {
+            if stage == Stage::Materialized {
+                std::fs::write(old_root.join("watch.txt"), b"watch-v2\n")?;
+                let mut running = child.0.take().unwrap();
+                running.stdin.as_mut().unwrap().write_all(b"continue\n")?;
+                let output = running.wait_with_output()?;
+                assert!(output.status.success());
+                assert_eq!(output.stdout, b"watch-v2\n");
+            }
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        std::fs::read(old_root.join("child.txt")).unwrap(),
+        b"late child edit\n"
+    );
+    assert!(!g.absolute_root().join("child.txt").exists());
+    assert!(!g.absolute_root().join("watch.txt").exists());
+    assert_eq!(load_prepared(&f.v.f.store, g.id()).unwrap(), g);
+}
