@@ -1,6 +1,6 @@
 use super::*;
 use crate::collaboration_archive::CommitOid;
-use crate::local_target::tests::{git, Fixture};
+use crate::local_target::tests::{Fixture, git};
 
 fn digest(c: char) -> String {
     format!("sha256:{}", c.to_string().repeat(64))
@@ -429,4 +429,40 @@ fn a_new_target_revision_changes_execution_even_when_source_matches() {
         changed.spec().candidate_source
     );
     assert_ne!(original.id(), changed.id());
+}
+
+#[test]
+fn freeze_checks_each_materialized_role_even_when_retention_is_deduplicated() {
+    let mut f = Fixture::new();
+    let (owner, revision) = active(&mut f);
+    let mut s = spec(&f);
+    s.harness = s.candidate_source.clone(); // Each contains exactly two bytes.
+    assert!(matches!(
+        freeze_bounded(&mut f.store, &owner, &revision, s.clone(), 3),
+        Err(SnapshotError::Limit)
+    ));
+    let snapshot = freeze_bounded(&mut f.store, &owner, &revision, s, 4).unwrap();
+    assert!(materialize(&f.store, &owner, &snapshot).is_ok());
+}
+#[test]
+fn noncanonical_lfs_pointer_variants_are_refused() {
+    for version in [
+        "https://git-lfs.github.com/spec/v1",
+        "https://hawser.github.com/spec/v1",
+        "http://git-media.io/v/2",
+    ] {
+        let mut f = Fixture::new();
+        let pointer = format!(
+            " \t\r\nversion {version}\r\noid sha256:{}\r\nsize 12\r\n \t",
+            "a".repeat(64)
+        );
+        let id = capture(&mut f, &[("pointer", pointer.as_bytes())]);
+        let (owner, revision) = active(&mut f);
+        let mut s = spec(&f);
+        s.candidate_source = id.to_string();
+        assert!(matches!(
+            freeze(&mut f.store, &owner, &revision, s),
+            Err(SnapshotError::Unsupported(_))
+        ));
+    }
 }
