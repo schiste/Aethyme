@@ -129,6 +129,18 @@ fn completed_control() -> (
     (client, stdout, stderr)
 }
 #[test]
+fn completed_native_control_accepts_finite_native_success() {
+    let (client, stdout, stderr) = completed_control();
+    let output = observe_control(
+        client,
+        stdout,
+        stderr,
+        Instant::now() + Duration::from_secs(5),
+    );
+    assert!(output.status.success());
+    assert!(output.stdout.is_empty() && output.stderr.is_empty());
+}
+#[test]
 fn completed_native_control_cannot_bypass_deadline() {
     let (client, stdout, stderr) = completed_control();
     let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
