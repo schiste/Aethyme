@@ -261,6 +261,21 @@ fn receiver_digest_origin_visibility_and_audience_are_independently_pinned() {
 fn changed_objects_missing_payloads_trailing_bytes_and_duplicates_refuse() {
     let f = Fixture::new();
     let bundle = f.verified();
+    // Mutate a raw source file, not JSON metadata that has additional parsers.
+    // Re-pin the whole wire so the object's own digest is the sole integrity
+    // barrier under test; keep manifest/reference bytes and lengths unchanged.
+    let mut raw_objects = bundle.objects.clone();
+    let raw_file = raw_objects
+        .get_mut(&ObjectDigest::of(b"A\n").hex())
+        .unwrap();
+    assert_eq!(raw_file.as_slice(), b"A\n");
+    raw_file[0] = b'X';
+    let wrong_file = wire(&bundle.header, &raw_objects);
+    assert!(matches!(
+        verify(&wrong_file, &ReceiverPolicy { bundle: ObjectDigest::of(&wrong_file), scope: f.scope.clone() }),
+        Err(RestoreError::Invalid(detail)) if detail == "object digest"
+    ));
+
     let mut changed = f.wire.clone();
     *changed.last_mut().unwrap() ^= 1;
     assert!(
