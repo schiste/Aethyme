@@ -391,6 +391,10 @@ fn actual_native_local_path_retains_context_and_rebinds_without_reviving_authori
     );
     assert_eq!(std::fs::read(&old_path).unwrap(), b"before\nafter\n");
     assert!(!new.absolute_root().join("old-only.txt").exists());
+    assert_eq!(
+        std::fs::read(new.absolute_root().join("new-only.txt")).unwrap(),
+        b"adopted"
+    );
     assert!(!f._repo.path().join("new-only.txt").exists());
     handoff::current_agent(&mut f.store, &owner, &agent, &running)
         .unwrap()
@@ -450,12 +454,65 @@ fn actual_native_local_path_retains_context_and_rebinds_without_reviving_authori
     let receiver_owner =
         target::acquire_controller(&mut receiver, "receive", "appointed-new-native-receiver")
             .unwrap();
+    assert_ne!(
+        receiver_owner.authority_epoch().as_str(),
+        owner.authority_epoch().as_str()
+    );
     let receiver_binding = restore::bind_receiver(&receiver, &receiver_owner, &bundle).unwrap();
     let historical =
         restore::import(&mut receiver, &receiver_owner, &receiver_binding, &bundle).unwrap();
     assert_eq!(
         restore::show(&receiver, &historical.id).unwrap().bundle,
         *bundle.digest()
+    );
+    let shown = restore::show(&receiver, &historical.id).unwrap();
+    let mut expected_sources = selection
+        .sources
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    expected_sources.sort();
+    let mut actual_sources = shown
+        .sources
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    actual_sources.sort();
+    assert_eq!(
+        actual_sources, expected_sources,
+        "historical receive omitted selected sources"
+    );
+    let mut expected_records = selection
+        .records
+        .iter()
+        .map(|r| (r.id.to_string(), r.object.hex()))
+        .collect::<Vec<_>>();
+    expected_records.sort();
+    let mut actual_records = shown
+        .records
+        .iter()
+        .map(|r| (r.id.to_string(), r.object.hex()))
+        .collect::<Vec<_>>();
+    actual_records.sort();
+    assert_eq!(
+        actual_records, expected_records,
+        "historical receive omitted selected CAP/context/brief/lineage"
+    );
+    assert_eq!(
+        shown.records.len(),
+        4,
+        "native path must actually carry all four historical records"
+    );
+    for record in &selection.records {
+        assert_eq!(
+            archive::read_object(&receiver, &record.object).unwrap(),
+            archive::read_object(&f.store, &record.object).unwrap(),
+            "selected historical record bytes changed"
+        );
+    }
+    assert_eq!(
+        archive::read_object(&receiver, &context_object).unwrap(),
+        advisory.record
     );
     let restored = restore::rehearse(
         &mut receiver,
@@ -472,6 +529,9 @@ fn actual_native_local_path_retains_context_and_rebinds_without_reviving_authori
         "local_verifier_producers",
         "local_agent_sessions",
         "local_target_revisions",
+        "local_acceptance_bindings",
+        "local_acceptance_receipts",
+        "local_acceptance_qualifications",
     ] {
         let count: i64 = receiver
             .read_connection()
