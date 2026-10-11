@@ -5,7 +5,7 @@ use crate::collaboration_state::{CollaborationRoot, ProjectKey};
 use std::path::Path;
 use std::process::{Command, Stdio};
 
-fn git(repo: &Path, args: &[&str]) -> String {
+pub(crate) fn git(repo: &Path, args: &[&str]) -> String {
     let output = Command::new("git")
         .current_dir(repo)
         .args(["-c", "commit.gpgsign=false", "-c", "core.autocrlf=false"])

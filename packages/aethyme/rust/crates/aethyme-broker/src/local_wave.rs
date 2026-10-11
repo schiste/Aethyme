@@ -233,10 +233,11 @@ pub fn load(store: &CollaborationStore, wave: &RecordId) -> Result<Wave, WaveErr
         u32,
         String,
         String,
+        i64,
     );
     let row: Row = store.read_connection().query_row(
-        "SELECT body, phase, candidate_snapshot, candidate_commit, recipe_object, detail, composition_ms, drift_count, target, revision FROM local_waves WHERE wave = ?1", [wave.as_str()],
-        |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?,r.get(8)?,r.get(9)?)),
+        "SELECT body, phase, candidate_snapshot, candidate_commit, recipe_object, detail, composition_ms, drift_count, target, revision, sequence FROM local_waves WHERE wave = ?1", [wave.as_str()],
+        |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?,r.get(8)?,r.get(9)?,r.get(10)?)),
     ).optional()?.ok_or(TargetError::Missing)?;
     let record =
         Record::decode(&row.0, &[&SCHEMA]).map_err(|e| WaveError::Invalid(e.to_string()))?;
@@ -246,8 +247,26 @@ pub fn load(store: &CollaborationStore, wave: &RecordId) -> Result<Wave, WaveErr
     let body: serde_json::Value = serde_json::from_slice(&row.0)?;
     let spec: WaveSpec = serde_json::from_value(body["spec"].clone())?;
     spec.policy.validate()?;
-    if spec.target != row.8 || spec.revision != row.9 {
-        return Err(WaveError::Invalid("wave scope".into()));
+    let pinned = target::load_revision(store, &id(&spec.revision)?)?;
+    let unique: std::collections::BTreeSet<_> = spec.selected.iter().collect();
+    if spec.target != row.8
+        || spec.revision != row.9
+        || spec.sequence != row.10
+        || spec.sequence <= 0
+        || spec.target != pinned.target
+        || spec.issuer != pinned.issuer
+        || spec.baseline != pinned.spec.baseline
+        || spec.objective_authorization != pinned.spec.objective_authorization
+        || spec.selected.is_empty()
+        || unique.len() != spec.selected.len()
+        || spec.selected.len() > spec.policy.max_group
+        || spec
+            .selected
+            .iter()
+            .any(|c| !pinned.spec.selected.contains(c))
+        || pinned.spec.composer_profile != composer::PROVISIONAL_TEXT_PROFILE
+    {
+        return Err(WaveError::Invalid("wave authorization or scope".into()));
     }
     Ok(Wave {
         id: wave.clone(),
@@ -473,7 +492,7 @@ fn current(
     store: &CollaborationStore,
     owner: &ControllerOwner,
     wave: &Wave,
-) -> Result<(), WaveError> {
+) -> Result<target::ControllerStatus, WaveError> {
     target::authorize(store, owner)?;
     let state = target::status(store, owner.target())?;
     if wave.spec.target != owner.target()
@@ -483,8 +502,41 @@ fn current(
             state.phase,
             Phase::WaveFrozen | Phase::Composing | Phase::Verifying
         ) || (state.phase == Phase::WaitingForInput
-            && state.resume_phase == Some(Phase::Verifying)))
+            && state.resume_phase == Some(Phase::Verifying))
+            || (wave.phase == WavePhase::OutcomeUnknown
+                && matches!(
+                    state.phase,
+                    Phase::OutcomeUnknown | Phase::BlockedTargetDrift
+                )))
     {
+        return Err(WaveError::Stale);
+    }
+    if !active_identity(store.read_connection(), owner, wave)? {
+        return Err(WaveError::Stale);
+    }
+    Ok(state)
+}
+
+fn active_identity(
+    conn: &rusqlite::Connection,
+    owner: &ControllerOwner,
+    wave: &Wave,
+) -> Result<bool, WaveError> {
+    Ok(conn.query_row("SELECT EXISTS(SELECT 1 FROM local_waves WHERE wave=?1 AND target=?2 AND revision=?3 AND phase IN ('frozen','composing','verifying','outcome_unknown'))", params![wave.id.as_str(),owner.target(),wave.spec.revision], |r| r.get(0))?)
+}
+
+// Recheck the exact wave and observed controller generation under the write
+// transaction. A stop based on a pre-dispatch read must not terminalize work
+// that became composing while the caller was waiting for the database lock.
+fn guard_current(
+    conn: &rusqlite::Connection,
+    owner: &ControllerOwner,
+    wave: &Wave,
+    version: i64,
+) -> Result<(), WaveError> {
+    let phase = serde_json::to_value(wave.phase)?;
+    let valid: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM local_targets t JOIN local_waves w ON w.target=t.target WHERE t.target=?1 AND t.issuer=?2 AND t.active_revision=?3 AND t.version=?4 AND w.wave=?5 AND w.phase=?6 AND w.phase IN ('frozen','composing','verifying','outcome_unknown'))", params![owner.target(),owner.issuer(),wave.spec.revision,version,wave.id.as_str(),phase.as_str()], |r| r.get(0))?;
+    if !valid {
         return Err(WaveError::Stale);
     }
     Ok(())
@@ -499,7 +551,7 @@ pub fn compose(
     wave_id: &RecordId,
 ) -> Result<Wave, WaveError> {
     let wave = load(store, wave_id)?;
-    current(store, owner, &wave)?;
+    let state = current(store, owner, &wave)?;
     if wave.phase == WavePhase::Verifying {
         return Ok(wave);
     }
@@ -513,6 +565,7 @@ pub fn compose(
     let tx = store
         .connection()
         .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    guard_current(&tx, owner, &wave, state.version)?;
     let changed = tx.execute(
         "UPDATE local_waves SET phase = 'composing' WHERE wave = ?1 AND phase = 'frozen'",
         [wave_id.as_str()],
@@ -620,24 +673,23 @@ pub fn observe_target(
     observed: &CommitOid,
 ) -> Result<Wave, WaveError> {
     let wave = load(store, wave_id)?;
-    current(store, owner, &wave)?;
+    let state = current(store, owner, &wave)?;
     let baseline =
         archive::retained(store, &snapshot(&wave.spec.baseline)?)?.ok_or(TargetError::Missing)?;
-    if baseline.commit == *observed {
-        return Ok(wave);
-    }
     let tx = store
         .connection()
         .transaction_with_behavior(TransactionBehavior::Immediate)?;
-    tx.execute("UPDATE local_waves SET drift_count = drift_count + 1, last_observed_commit = ?2 WHERE wave = ?1 AND (last_observed_commit IS NULL OR last_observed_commit != ?2)", params![wave_id.as_str(), observed.as_str()])?;
+    guard_current(&tx, owner, &wave, state.version)?;
+    tx.execute("UPDATE local_waves SET drift_count = drift_count + ?3, last_observed_commit = ?2 WHERE wave = ?1 AND (last_observed_commit IS NULL OR last_observed_commit != ?2)", params![wave_id.as_str(), observed.as_str(), u32::from(baseline.commit != *observed)])?;
     let count: u32 = tx.query_row(
         "SELECT drift_count FROM local_waves WHERE wave = ?1",
         [wave_id.as_str()],
         |r| r.get(0),
     )?;
     if count > wave.spec.policy.drift_rechecks {
-        tx.execute("UPDATE local_waves SET phase='target_drift', detail='external target movement exceeded the frozen recheck allowance' WHERE wave=?1", [wave_id.as_str()])?;
-        tx.execute("UPDATE local_targets SET phase='blocked_target_drift', version=version+1 WHERE target=?1 AND active_revision=?2", params![owner.target(),wave.spec.revision])?;
+        let live = matches!(wave.phase, WavePhase::Composing | WavePhase::OutcomeUnknown);
+        tx.execute("UPDATE local_waves SET phase=?2, detail='external target movement exceeded the frozen recheck allowance' WHERE wave=?1", params![wave_id.as_str(),if live { "outcome_unknown" } else { "target_drift" }])?;
+        tx.execute("UPDATE local_targets SET phase='blocked_target_drift', resume_phase=NULL, version=version+1 WHERE target=?1 AND active_revision=?2", params![owner.target(),wave.spec.revision])?;
         for contribution in &wave.spec.selected {
             tx.execute("UPDATE local_target_dispositions SET status='blocked', detail='external target drift' WHERE revision=?1 AND contribution=?2", params![wave.spec.revision,contribution])?;
         }
@@ -661,9 +713,11 @@ pub fn recover_dispatch(
     if wave.phase != WavePhase::Composing {
         return Ok(wave);
     }
+    let state = current(store, owner, &wave)?;
     let tx = store
         .connection()
         .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    guard_current(&tx, owner, &wave, state.version)?;
     tx.execute("UPDATE local_waves SET phase='outcome_unknown', detail='compose dispatch interrupted; reconcile retained output before retry' WHERE wave=?1 AND phase='composing'", [wave_id.as_str()])?;
     tx.execute("UPDATE local_targets SET phase='outcome_unknown', version=version+1 WHERE target=?1 AND active_revision=?2 AND phase='composing'", params![owner.target(),wave.spec.revision])?;
     tx.commit()?;
@@ -691,6 +745,7 @@ pub fn stop(
     let tx = store
         .connection()
         .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    guard_current(&tx, owner, &wave, state.version)?;
     tx.execute(
         "UPDATE local_waves SET phase=?2, detail=?3 WHERE wave=?1",
         params![

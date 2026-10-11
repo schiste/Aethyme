@@ -34,6 +34,9 @@ later arrivals do not slide the deadline. Exact selected inputs, baseline,
 objective authorization, issuer, target revision, sequence and scheduling
 policy become a canonical immutable wave record. A partial unique index allows
 one active wave per target. Admission and in-wave dispositions commit together.
+Loading a wave checks its canonical identity, SQL sequence and exact selected
+subset, baseline, objective authorization, issuer and composer profile against
+the pinned target revision. A matching hash alone does not establish authority.
 
 ## Dispatch and honest results
 
@@ -74,6 +77,10 @@ movement reaches `blocked_target_drift` after the wave's finite allowance.
 The caller must retain the existing provider guard; these observations are
 not acceptance evidence. Automatic re-simulation against a newly authorized
 baseline and provider integration remain pending #725/L6.
+Returning to the baseline is recorded without a drift charge; a later departure
+consumes a new allowance. Drift during composing or an unknown dispatch keeps
+the wave active as `outcome_unknown`, so selection and retention release remain
+blocked until reconciliation.
 
 Stop prevents a frozen or verification-held wave from dispatching again. An
 in-flight or interrupted compose remains unknown and active; stop is not proof
@@ -94,6 +101,10 @@ dedicated long/aged groups, active-wave protection, source prerequisites,
 atomic replacement, real composition and archive reconstruction, no ref writes,
 duplicate dispatch, external drift, unknown crash intent, stop and stale
 revision guards, explicit dispositions and corrupt-record refusal. Wave identity
+and authorization checks include correctly rehashed forged records. Delayed
+stop/drift calls for a terminal wave cannot mutate a later active wave under the
+same revision. Stop rechecks wave phase and controller generation inside its
+write transaction before changing liveness state. Wave identity
 has an independent Node canonical JSON/SHA-256 vector; Node is not a product
 dependency. `composition_ms` measures the actual local composer call.
 

@@ -519,3 +519,251 @@ fn missing_or_corrupt_wave_is_not_an_execution_order() {
     assert!(load(&f.store, &wave.id).is_err());
     assert!(compose(&mut f.store, &owner, f._repo.path(), &wave.id).is_err());
 }
+
+#[test]
+fn a_terminal_conflict_cannot_stop_or_drift_a_later_independent_wave() {
+    let mut f = Fixture::new();
+    let base = f.a.base.commit.clone();
+    let git = crate::local_target::tests::git;
+    git(
+        f._repo.path(),
+        &["switch", "-qc", "conflict", base.as_str()],
+    );
+    std::fs::write(f._repo.path().join("one.txt"), "incompatible\n").unwrap();
+    git(f._repo.path(), &["commit", "-qam", "independent conflict"]);
+    let tip = CommitOid::parse(&git(f._repo.path(), &["rev-parse", "HEAD"])).unwrap();
+    let conflict = archive::retain_contribution(&mut f.store, f._repo.path(), &base, &tip).unwrap();
+    let mut spec = f.spec();
+    spec.contributions[0].atomic_group = Some("collision".into());
+    spec.contributions.push(target::RequestedContribution {
+        id: "C".into(),
+        lineage: conflict.lineage_record_id.to_string(),
+        requires: vec![],
+        atomic_group: Some("collision".into()),
+        revision_of: None,
+        derived_from: vec![],
+    });
+    spec.selected = vec!["A".into(), "B".into(), "C".into()];
+    let owner = target::acquire_controller(&mut f.store, "target", "appointed").unwrap();
+    let revision = target::propose_revision(&mut f.store, &owner, spec).unwrap();
+    target::select_revision(&mut f.store, &owner, &revision.id).unwrap();
+    for (i, c) in ["A", "C", "B"].iter().enumerate() {
+        available(&mut f.store, &owner, c, i as i64).unwrap();
+    }
+    let p = WavePolicy {
+        batch_width: 1,
+        ..policy()
+    };
+    let older = frozen(admit(&mut f.store, &owner, p, 2).unwrap());
+    assert_eq!(older.spec.selected, ["A", "C"]);
+    assert_eq!(
+        compose(&mut f.store, &owner, f._repo.path(), &older.id)
+            .unwrap()
+            .phase,
+        WavePhase::Blocked
+    );
+    let newer = frozen(admit(&mut f.store, &owner, p, 3).unwrap());
+    assert_eq!(newer.spec.selected, ["B"]);
+    assert_eq!(newer.spec.sequence, 2);
+    let state = target::status(&f.store, owner.target()).unwrap();
+    assert!(matches!(
+        stop(&mut f.store, &owner, &older.id),
+        Err(WaveError::Stale)
+    ));
+    let moved = CommitOid::parse(&"4".repeat(40)).unwrap();
+    assert!(matches!(
+        observe_target(&mut f.store, &owner, &older.id, &moved),
+        Err(WaveError::Stale)
+    ));
+    assert_eq!(target::status(&f.store, owner.target()).unwrap(), state);
+    assert_eq!(load(&f.store, &newer.id).unwrap(), newer);
+    assert_eq!(
+        compose(&mut f.store, &owner, f._repo.path(), &newer.id)
+            .unwrap()
+            .phase,
+        WavePhase::Verifying
+    );
+}
+
+#[test]
+fn drift_cannot_release_a_composing_or_recovered_unknown_dispatch() {
+    for recovered in [false, true] {
+        let mut f = Fixture::new();
+        let (owner, revision) = setup(&mut f, &["A"]);
+        available(&mut f.store, &owner, "A", 0).unwrap();
+        let wave = frozen(admit(&mut f.store, &owner, policy(), 0).unwrap());
+        f.store
+            .connection()
+            .execute(
+                "UPDATE local_waves SET phase='composing' WHERE wave=?1",
+                [wave.id.as_str()],
+            )
+            .unwrap();
+        f.store.connection().execute("UPDATE local_targets SET phase='composing', version=version+1 WHERE target='target'", []).unwrap();
+        if recovered {
+            recover_dispatch(&mut f.store, &owner, &wave.id).unwrap();
+        }
+        for digit in ["4", "5", "6"] {
+            let moved = CommitOid::parse(&digit.repeat(40)).unwrap();
+            observe_target(&mut f.store, &owner, &wave.id, &moved).unwrap();
+        }
+        assert_eq!(
+            load(&f.store, &wave.id).unwrap().phase,
+            WavePhase::OutcomeUnknown
+        );
+        assert_eq!(
+            target::status(&f.store, owner.target()).unwrap().phase,
+            Phase::BlockedTargetDrift
+        );
+        let mut spec = f.spec();
+        spec.selected = vec!["B".into()];
+        let next = target::propose_revision(&mut f.store, &owner, spec).unwrap();
+        assert!(matches!(
+            target::select_revision(&mut f.store, &owner, &next.id),
+            Err(TargetError::Frozen)
+        ));
+        assert!(matches!(
+            target::release_revision(&mut f.store, &owner, &revision),
+            Err(TargetError::Frozen)
+        ));
+        assert!(matches!(
+            admit(&mut f.store, &owner, policy(), 1).unwrap(),
+            Admission::Existing(_)
+        ));
+        assert!(matches!(
+            compose(&mut f.store, &owner, f._repo.path(), &wave.id),
+            Err(WaveError::OutcomeUnknown)
+        ));
+        assert_eq!(
+            stop(&mut f.store, &owner, &wave.id).unwrap().phase,
+            WavePhase::OutcomeUnknown
+        );
+    }
+}
+
+#[test]
+fn a_dispatch_state_change_invalidates_a_pre_dispatch_stop_observation() {
+    let mut f = Fixture::new();
+    let (owner, _) = setup(&mut f, &["A"]);
+    available(&mut f.store, &owner, "A", 0).unwrap();
+    let wave = frozen(admit(&mut f.store, &owner, policy(), 0).unwrap());
+    let read_before_dispatch = target::status(&f.store, owner.target()).unwrap();
+    f.store
+        .connection()
+        .execute(
+            "UPDATE local_waves SET phase='composing' WHERE wave=?1",
+            [wave.id.as_str()],
+        )
+        .unwrap();
+    f.store
+        .connection()
+        .execute(
+            "UPDATE local_targets SET phase='composing', version=version+1 WHERE target='target'",
+            [],
+        )
+        .unwrap();
+    let tx = f
+        .store
+        .connection()
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .unwrap();
+    assert!(matches!(
+        guard_current(&tx, &owner, &wave, read_before_dispatch.version),
+        Err(WaveError::Stale)
+    ));
+    tx.commit().unwrap();
+    assert_eq!(
+        stop(&mut f.store, &owner, &wave.id).unwrap().phase,
+        WavePhase::OutcomeUnknown
+    );
+}
+
+#[test]
+fn returning_to_the_baseline_does_not_reset_or_bypass_drift_allowance() {
+    let mut f = Fixture::new();
+    let (owner, _) = setup(&mut f, &["A"]);
+    available(&mut f.store, &owner, "A", 0).unwrap();
+    let wave = frozen(admit(&mut f.store, &owner, policy(), 0).unwrap());
+    let base = f.a.base.commit.clone();
+    let moved = CommitOid::parse(&"4".repeat(40)).unwrap();
+    for expected in 1..=3 {
+        let departure = observe_target(&mut f.store, &owner, &wave.id, &moved).unwrap();
+        assert_eq!(departure.drift_count, expected);
+        if expected < 3 {
+            assert_eq!(
+                observe_target(&mut f.store, &owner, &wave.id, &base)
+                    .unwrap()
+                    .drift_count,
+                expected
+            );
+        } else {
+            assert_eq!(departure.phase, WavePhase::TargetDrift);
+        }
+    }
+}
+
+#[test]
+fn rehashed_wave_records_cannot_expand_the_pinned_authorization() {
+    for change in [
+        "excluded",
+        "baseline",
+        "objective",
+        "sequence",
+        "duplicate",
+        "issuer",
+        "profile",
+    ] {
+        let mut f = Fixture::new();
+        let (owner, _) = setup(&mut f, &["A"]);
+        available(&mut f.store, &owner, "A", 0).unwrap();
+        let wave = frozen(admit(&mut f.store, &owner, policy(), 0).unwrap());
+        let mut spec = wave.spec.clone();
+        match change {
+            "excluded" => spec.selected = vec!["B".into()],
+            "baseline" => spec.baseline = f.b.result.snapshot_id.to_string(),
+            "objective" => spec.objective_authorization = format!("sha256:{}", "8".repeat(64)),
+            "sequence" => spec.sequence += 1,
+            "duplicate" => spec.selected.push("A".into()),
+            "issuer" => spec.issuer = "other".into(),
+            "profile" => {
+                let mut target = f.spec();
+                target.composer_profile = "unknown".into();
+                spec.revision = target::propose_revision(&mut f.store, &owner, target)
+                    .unwrap()
+                    .id
+                    .to_string();
+            }
+            _ => unreachable!(),
+        }
+        let bytes =
+            serde_json::to_vec(&serde_json::json!({"schema":SCHEMA_NAME,"spec":spec})).unwrap();
+        let record = Record::decode(&bytes, &[&SCHEMA]).unwrap();
+        f.store
+            .connection()
+            .execute(
+                "UPDATE local_waves SET wave=?2, body=?3, revision=?4 WHERE wave=?1",
+                params![
+                    wave.id.as_str(),
+                    record.id().as_str(),
+                    record.canonical_bytes(),
+                    spec.revision
+                ],
+            )
+            .unwrap();
+        assert!(
+            matches!(load(&f.store, &record.id()), Err(WaveError::Invalid(_))),
+            "{change}"
+        );
+        assert!(
+            matches!(
+                compose(&mut f.store, &owner, f._repo.path(), &record.id()),
+                Err(WaveError::Invalid(_))
+            ),
+            "{change}"
+        );
+        assert_eq!(
+            target::status(&f.store, owner.target()).unwrap().phase,
+            Phase::WaveFrozen
+        );
+    }
+}
