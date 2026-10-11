@@ -334,7 +334,7 @@ fn source(
     let oid = CommitOid::parse(&intent.spec.commit)?;
     let actual = archive::snapshot_of_commit(carrier.repo.root(), &oid)?;
     if actual.id().as_str() != intent.spec.source
-        || carrier.repo.commit_tree_id(oid.as_str())? != intent.spec.tree
+        || archive::raw_commit_tree(carrier.repo.root(), &oid)? != intent.spec.tree
     {
         return Err(TransportError::Invalid(
             "Git objects differ from retained source".into(),
@@ -390,7 +390,7 @@ pub fn prepare(
             .ok_or(TransportError::Missing)?
             .to_string(),
         commit: commit.as_str().into(),
-        tree: carrier.repo.commit_tree_id(commit.as_str())?,
+        tree: archive::raw_commit_tree(carrier.repo.root(), &commit)?,
         peer: carrier.identity.coordination_key.clone(),
         remote_binding: remote_binding(carrier)?,
         repository_binding: carrier.repository_binding.clone(),
@@ -559,7 +559,7 @@ pub fn inspect(
     let observed = crate::git::with_git_deadline(Duration::from_secs(carrier.timeout), || {
         carrier
             .repo
-            .remote_ref_oids(&carrier.remote, &[carrier.destination.clone()])
+            .remote_fetch_ref_oids(&carrier.remote, &[carrier.destination.clone()])
     });
     let (observation, oid) = match observed {
         Ok(map) => match map.get(&carrier.destination).cloned().flatten() {

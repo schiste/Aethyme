@@ -1435,16 +1435,39 @@ impl GitRepo {
         remote: &str,
         destinations: &[String],
     ) -> Result<BTreeMap<String, Option<String>>, GitError> {
-        let push_url = run_git(&self.root, &["remote", "get-url", "--push", remote])?;
-        let display_args = format!("ls-remote --refs <push-url> {}", destinations.join(" "));
+        self.observe_remote_ref_oids(remote, destinations, true)
+    }
+
+    /// Observe a configured fetch endpoint directly. Git expands its URL once,
+    /// so chained `insteadOf` rules cannot rewrite an already-expanded URL.
+    /// Callers observing publication must first establish equal fetch/push URLs.
+    pub(crate) fn remote_fetch_ref_oids(
+        &self,
+        remote: &str,
+        destinations: &[String],
+    ) -> Result<BTreeMap<String, Option<String>>, GitError> {
+        self.observe_remote_ref_oids(remote, destinations, false)
+    }
+
+    fn observe_remote_ref_oids(
+        &self,
+        remote: &str,
+        destinations: &[String],
+        push_endpoint: bool,
+    ) -> Result<BTreeMap<String, Option<String>>, GitError> {
+        let display_args = format!("ls-remote --refs <endpoint> {}", destinations.join(" "));
         let mut command = git_command();
-        command
-            .args(["ls-remote", "--refs", "aethyme-push-evidence"])
-            .args(destinations)
-            .current_dir(&self.root)
-            .env("GIT_CONFIG_COUNT", "1")
-            .env("GIT_CONFIG_KEY_0", "remote.aethyme-push-evidence.url")
-            .env("GIT_CONFIG_VALUE_0", push_url);
+        if push_endpoint {
+            let push_url = run_git(&self.root, &["remote", "get-url", "--push", remote])?;
+            command
+                .args(["ls-remote", "--refs", "aethyme-push-evidence"])
+                .env("GIT_CONFIG_COUNT", "1")
+                .env("GIT_CONFIG_KEY_0", "remote.aethyme-push-evidence.url")
+                .env("GIT_CONFIG_VALUE_0", push_url);
+        } else {
+            command.args(["ls-remote", "--refs", remote]);
+        }
+        command.args(destinations).current_dir(&self.root);
         let output = run_git_process_output(command, &[&display_args], git_timeout())?;
         if !output.status.success() {
             return Err(GitError::Git {

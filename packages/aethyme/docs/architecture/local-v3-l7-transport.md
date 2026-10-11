@@ -17,7 +17,7 @@ session, stopped targets and stale authority epochs refuse dispatch.
 `prepare` binds the canonical intent to project, issuer, authority epoch, active
 revision, composed wave, SHA-256 source snapshot, Git commit/tree, native repository
 binding, remote identity, ref and expected old object (or absence). Git source and
-retained bytes are checked. Source roots land before the intent is returned.
+retained bytes are checked against raw objects, ignoring replacement refs and caller object overrides. Source roots land before the intent is returned.
 Missing Git history is reported rather than synthesized.
 
 `publish` marks the intent dispatched before invoking the broker. Each intent
@@ -26,7 +26,7 @@ prepared intent on an uncertain route cannot dispatch before inspection. Local
 control mutations wait for the bounded native operation. The returned dispatch
 outcome comes from the native journal and grants no acceptance.
 
-`inspect` queries the exact push endpoint without tracking-ref writes. A successful
+`inspect` queries the configured fetch remote directly after establishing identical fetch/push endpoints. This avoids rewriting an already expanded URL a second time and writes no tracking refs. A successful
 omitted ref means absent; query errors mean unavailable. Objects on another ref do
 not count. A matching advertised ref is availability at observation time, separate
 from its historical write outcome. An exact-object fetch writes neither FETCH_HEAD
@@ -41,6 +41,10 @@ Existing explicit reconciliation remains required for unresolved broker operatio
 before another authorized write. Historical receipts cannot authorize acceptance.
 Configured source acceptance belongs to #675. Transport changes neither target
 acceptance nor behavioral verification state.
+
+Carrier timeouts bound provider operations and remote identity/ref queries.
+Local archive hashing uses the existing raw source reader and is outside that
+timeout; this profile does not claim a deadline for the entire API call.
 
 ## Storage and limits
 

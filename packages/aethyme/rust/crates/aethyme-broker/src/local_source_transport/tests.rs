@@ -539,3 +539,159 @@ fn native_operation_reference_cannot_point_to_another_operation() {
         Err(TransportError::Invalid(_))
     ));
 }
+
+#[test]
+fn replacement_refs_cannot_change_the_retained_commit_tree() {
+    let mut t = TransportFixture::new();
+    let original = t.prepare('1', None);
+    let replacement = t.f.a.base.commit.as_str();
+    let replacement_tree = git(
+        t.f._repo.path(),
+        &["rev-parse", &format!("{replacement}^{{tree}}")],
+    );
+    assert_ne!(original.spec.tree, replacement_tree);
+    git(
+        t.f._repo.path(),
+        &["replace", &original.spec.commit, replacement],
+    );
+    assert_eq!(
+        git(
+            t.f._repo.path(),
+            &["rev-parse", &format!("{}^{{tree}}", original.spec.commit)]
+        ),
+        replacement_tree
+    );
+    let i = t.prepare('2', None);
+    assert_eq!(i.spec.tree, original.spec.tree);
+    assert_eq!(i.spec.source, original.spec.source);
+    assert_eq!(
+        publish(&mut t.f.store, &t.owner, &t.carrier, &mut t.broker, &i.id)
+            .unwrap()
+            .outcome,
+        OperationStatus::Succeeded
+    );
+    let receipt = t.inspect(&i);
+    assert_eq!(receipt.spec.observation, Observation::Available);
+    assert!(receipt.spec.content_checked);
+    assert_eq!(receipt.spec.tree, original.spec.tree);
+    assert_eq!(
+        git(
+            t._remote.path(),
+            &["rev-parse", &format!("{}^{{tree}}", i.spec.commit)]
+        ),
+        original.spec.tree
+    );
+}
+
+#[test]
+fn chained_url_rewrites_inspect_the_configured_peer_once() {
+    let mut t = TransportFixture::new();
+    let second = tempfile::tempdir().unwrap();
+    git(second.path(), &["init", "--bare", "-q"]);
+    let first_url = t._remote.path().to_str().unwrap();
+    let second_url = second.path().to_str().unwrap();
+    git(
+        t.f._repo.path(),
+        &[
+            "config",
+            &format!("url.{first_url}.insteadOf"),
+            "transport-origin",
+        ],
+    );
+    git(
+        t.f._repo.path(),
+        &["config", &format!("url.{second_url}.insteadOf"), first_url],
+    );
+    git(
+        t.f._repo.path(),
+        &["remote", "set-url", "publication", "transport-origin"],
+    );
+    assert_eq!(
+        git(
+            t.f._repo.path(),
+            &["remote", "get-url", "--push", "publication"]
+        ),
+        first_url
+    );
+    t.carrier = GitCarrier::new(
+        &mut t.broker,
+        t.carrier.session,
+        "publication",
+        "refs/heads/candidate",
+        30,
+        "fixture operator authorizes exact conditional candidate publication",
+        true,
+    )
+    .unwrap();
+    let i = t.prepare('1', None);
+    assert_eq!(
+        publish(&mut t.f.store, &t.owner, &t.carrier, &mut t.broker, &i.id)
+            .unwrap()
+            .outcome,
+        OperationStatus::Succeeded
+    );
+    assert_eq!(
+        git(t._remote.path(), &["rev-parse", "refs/heads/candidate"]),
+        i.spec.commit
+    );
+    assert!(
+        git(
+            second.path(),
+            &[
+                "for-each-ref",
+                "--format=%(objectname)",
+                "refs/heads/candidate"
+            ]
+        )
+        .is_empty()
+    );
+    let receipt = t.inspect(&i);
+    assert_eq!(receipt.spec.observation, Observation::Available);
+    assert!(receipt.spec.content_checked);
+}
+
+#[test]
+fn remote_query_deadline_and_failures_never_mean_absent() {
+    use std::os::unix::fs::PermissionsExt;
+    let mut t = TransportFixture::new();
+    let i = t.prepare('1', None);
+    let helper = t.f._host.path().join("upload-pack-probe");
+    let marker = t.f._host.path().join("query-started");
+    std::fs::write(
+        &helper,
+        format!(
+            "#!/bin/sh\nprintf started > '{}'\nexec /bin/sleep 4\n",
+            marker.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700)).unwrap();
+    git(
+        t.f._repo.path(),
+        &[
+            "config",
+            "remote.publication.uploadpack",
+            helper.to_str().unwrap(),
+        ],
+    );
+    let result = crate::git::with_git_deadline(Duration::from_secs(2), || {
+        t.carrier
+            .repo
+            .remote_fetch_ref_oids("publication", &["refs/heads/candidate".into()])
+    });
+    assert!(
+        marker.exists(),
+        "the actual remote query must run before timeout"
+    );
+    assert!(
+        matches!(result, Err(crate::GitError::TimedOut { .. })),
+        "{result:?}"
+    );
+    // A deterministic provider failure is unavailable even when the remote has
+    // no candidate ref. It cannot count as evidence of absence.
+    std::fs::write(&helper, "#!/bin/sh\nexit 1\n").unwrap();
+    let receipt = t.inspect(&i);
+    assert_eq!(receipt.spec.observation, Observation::Unavailable);
+    assert!(receipt.spec.observed_oid.is_none());
+    assert!(!receipt.spec.content_checked);
+}

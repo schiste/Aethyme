@@ -1123,6 +1123,20 @@ fn commit_entries(
     Ok(tree)
 }
 
+/// Read the tree named by the verified raw commit object. Replacement refs,
+/// grafts and caller object-directory overrides cannot change this binding.
+pub(crate) fn raw_commit_tree(repo: &Path, commit: &CommitOid) -> Result<String, ArchiveError> {
+    refuse_partial_clone(repo)?;
+    let mut reader = ObjectReader::open(repo)?;
+    let (kind, body) = reader.read_whole(commit.as_str())?;
+    if kind != "commit" {
+        return Err(ArchiveError::NotACommit {
+            oid: commit.as_str().to_string(),
+        });
+    }
+    commit_tree(commit.as_str(), &body, reader.format)
+}
+
 /// The #652 snapshot of `commit`'s committed bytes, read from the repository
 /// and retained nowhere. It names a candidate before anything decides to keep
 /// it (#663). It makes every refusal [`retain_snapshot_with`] makes, so it
