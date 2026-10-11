@@ -86,8 +86,19 @@ Git commit removal, stopped historical observation, exact review evidence,
 private verifier qualification/revocation, later-source revalidation, and an
 independent Ruby receipt vector. The sealed verifier capability in the join test
 is supplied by the existing test-only verifier fixture; it is not live GitHub or
-Mergify evidence. Mutation checks and the broader restored regression pass are
-pending at this checkpoint.
+Mergify evidence. Thirteen deliberate guard removals each compiled and failed
+their exact named test. The source was restored after every trial. Removing only
+one of the current-source checks survived because the commit/tree checks still
+refused drift; the complete source barrier was then checked together. The
+revocation fixture restores a fresh accepted provider receipt before revocation,
+so another stale-history check cannot mask that guard.
+
+Restored checks passed: 119 Local, 149 collaboration, 14 execution snapshots,
+10 verifier, 14 review, 10 ship, 36 Git, and 21 ratchet/documentation tests
+(373 total; six child-process or opt-in helpers ignored). Strict Clippy for
+lib and tests passed. Independent adversarial re-review cleared the production
+fixes. CI on production head `8b9a1264` passed all checks; the final test and
+documentation heads receive fresh CI.
 
 `current_guard` rechecks the native provider representation and current verifier
 producer before generation preparation. Its producer/epoch locks remain held;

@@ -620,6 +620,27 @@ fn private_current_qualification_requires_verifier_and_refuses_revocation() {
         Err(AcceptanceError::NotAccepted)
     ));
     drop(grant);
+    // Restore the exact accepted provider representation and obtain its fresh
+    // receipt, so stale source history cannot mask the producer revocation gate.
+    git(
+        v.f._repo.path(),
+        &[
+            "push",
+            "-q",
+            "--force",
+            "publication",
+            &format!("{}:refs/heads/accepted", intent.spec.commit),
+        ],
+    );
+    let receipt = observe(
+        &mut v.f.store,
+        &v.owner,
+        &mut broker,
+        &carrier,
+        binding.id(),
+    )
+    .unwrap();
+    assert_eq!(receipt.spec.decision, ProviderDecision::Accepted);
     verifier::revoke(
         &mut v.f.store,
         &v.owner,
