@@ -4,7 +4,7 @@ Last Updated: 2026-10-11
 
 Issue: #677. Plan: sections 6.6, 10.5 GEN and 15.1 L8; D21/D28.
 This document records the independently reviewed implementation contract. The
-implementation and its executable qualification are in progress.
+provisional profile is implemented and qualified against the controlled Local schedules below.
 
 ## Authority and source
 
@@ -60,7 +60,28 @@ target-root release, reconstruction after original Git objects disappear, and
 unexpected files/modes/symlink destinations. Golden identities come from an
 independent oracle. Each deliberate guard removal must fail its named test.
 
-This checkpoint claims design review only. Live GitHub/Mergify qualification
+The profile `aethyme.generation.raw-standalone-git/provisional-v0` has sixteen
+passing generation schedules. These cover complete source and Git metadata
+checks, prior dirty generation mapping, symlink ancestors, raw CAS reconstruction
+after the original Git repository disappears, current provider/producer/target
+checks, retained roots during real GC reclamation, and actual late child writes
+and watcher reads attached to the old absolute workspace. Crash injection covers
+interruptions before source writes and after synced files; this is an in-process
+injection, not process-kill or power-loss evidence. The GC test explicitly removes
+target roots to simulate their release; it does not claim the target release API
+accepts a verifying target.
+
+The prepared identity vector was produced independently with Ruby and has digest
+`sha256:d94a1bdcf2f11b7dbdc79aff155a938c7e1f220389e426c3f4b2591236a754b1`.
+Independent adversarial review cleared the production fixes. Nine deliberate
+removals each failed their named regression: canonical identity, journal state,
+prior-generation support, ancestor checks, complete source, Git metadata,
+partial-directory refusal, generation GC roots and the final native guard.
+Exact sources were restored; 397 selected tests passed with six intentionally
+ignored helpers, along with strict Clippy. Collaboration schema/floor is 14.
+No held-out composition cases were rerun.
+
+Prepared records remain historical offers. Live GitHub/Mergify qualification
 awaits the designated Playground repository and policy. E1 remains junior-owned;
 composition profiles remain provisional until its evidence lands. Native gate
 integration waits for #725. Full L8 adoption and Q4 are not claimed here.
