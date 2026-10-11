@@ -270,14 +270,12 @@ fn required_unknown_capability_refuses_an_otherwise_valid_context() {
 /// Logical SQLite image includes every user table, trigger and index; CAS bytes
 /// are independently hashed. WAL placement and connection bookkeeping are not
 /// product data and are deliberately excluded from this comparison.
-fn logical_state(
-    conn: &rusqlite::Connection,
-    objects: &Path,
-) -> (
+type CompatibilityStateImage = (
     Vec<Vec<String>>,
     Vec<(String, Vec<Vec<String>>)>,
     Vec<(PathBuf, String)>,
-) {
+);
+fn logical_state(conn: &rusqlite::Connection, objects: &Path) -> CompatibilityStateImage {
     let schema = conn
         .prepare("SELECT type,name,tbl_name,coalesce(sql,'') FROM sqlite_schema ORDER BY type,name")
         .unwrap()
