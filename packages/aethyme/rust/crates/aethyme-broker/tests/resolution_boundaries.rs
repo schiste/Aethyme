@@ -733,7 +733,9 @@ fn a_valid_archived_request_rechecks_decision_scope_and_protection() {
         };
         assert_ne!(changed.id, raised.record().id);
         assert_eq!(
-            resolution::read_record(&world.store, &changed).unwrap().id(),
+            resolution::read_record(&world.store, &changed)
+                .unwrap()
+                .id(),
             changed.id,
             "the negative is a valid independently identified archive record"
         );
