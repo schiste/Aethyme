@@ -569,7 +569,8 @@ pub fn select_revision(
         "SELECT EXISTS (SELECT 1 FROM local_waves WHERE target=?1 AND phase IN ('frozen','composing','verifying','outcome_unknown'))",
         [&owner.target], |r| r.get(0),
     )?;
-    if active_wave {
+    let budget_held: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM local_budget_reservations WHERE target=?1 AND phase IN ('reserved','partly_consumed','completion_pending','consumption_unknown'))", [owner.target()], |r|r.get(0))?;
+    if active_wave || budget_held {
         return Err(TargetError::Frozen);
     }
     let released: bool = tx.query_row(
@@ -758,7 +759,8 @@ pub fn release_revision(
         "SELECT EXISTS (SELECT 1 FROM local_waves WHERE revision=?1 AND phase IN ('frozen','composing','verifying','outcome_unknown'))",
         [id.as_str()], |r| r.get(0),
     )?;
-    if active_wave {
+    let budget_held: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM local_budget_reservations WHERE revision=?1 AND phase IN ('reserved','partly_consumed','completion_pending','consumption_unknown'))", [revision.id.as_str()], |r|r.get(0))?;
+    if active_wave || budget_held {
         return Err(TargetError::Frozen);
     }
     let active: Option<String> = tx.query_row(

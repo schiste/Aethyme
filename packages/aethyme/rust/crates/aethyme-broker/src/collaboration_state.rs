@@ -37,7 +37,7 @@ use serde::Serialize;
 pub use crate::host_state::HostStateSource;
 
 /// The schema this binary writes.
-pub const COLLABORATION_STATE_SCHEMA_VERSION: i64 = 8;
+pub const COLLABORATION_STATE_SCHEMA_VERSION: i64 = 9;
 /// The oldest schema a database written by this binary can be read by.
 /// Unlike `host-operations.db`, a newer database stays readable by an older
 /// binary until a release raises this floor.
@@ -55,9 +55,9 @@ pub const COLLABORATION_STATE_SCHEMA_VERSION: i64 = 8;
 /// is locked out.
 // Schema 6 reclamation cannot see local target roots and would delete live
 // controller inputs. Such a binary must refuse this store before writing.
-// Schema 7 has no wave ledger, and cannot guard retention while a dispatch is
+// Schema 8 has no budget ledger, and cannot guard retention while consumption is
 // unknown. As with prior floors, stop old open clients before migration.
-const MIN_COMPATIBLE_SCHEMA: i64 = 8;
+const MIN_COMPATIBLE_SCHEMA: i64 = 9;
 const ROOT_DIRECTORY: &str = "collaboration";
 /// Additive schema steps after the version 1 layout (`meta` only), applied in
 /// order. Each only adds tables; after migrating, the compatibility floor is
@@ -316,6 +316,35 @@ const MIGRATIONS: &[(i64, &str)] = &[
          ) STRICT;
          CREATE UNIQUE INDEX local_waves_one_active ON local_waves (target)
              WHERE phase IN ('frozen', 'composing', 'verifying', 'outcome_unknown');",
+    ),
+    (
+        9,
+        r#"
+        CREATE TABLE IF NOT EXISTS local_budget_project (
+            singleton INTEGER PRIMARY KEY CHECK(singleton=1), issuer TEXT NOT NULL,
+            policy TEXT NOT NULL, body BLOB NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS local_budget_objectives (
+            objective TEXT PRIMARY KEY, issuer TEXT NOT NULL, policy TEXT NOT NULL, body BLOB NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS local_budget_reservations (
+            reservation TEXT PRIMARY KEY, nonce TEXT NOT NULL UNIQUE,
+            target TEXT NOT NULL REFERENCES local_targets(target),
+            revision TEXT NOT NULL REFERENCES local_target_revisions(revision),
+            wave TEXT NOT NULL REFERENCES local_waves(wave),
+            root TEXT NOT NULL, parent TEXT, body BLOB NOT NULL,
+            phase TEXT NOT NULL CHECK(phase IN ('reserved','partly_consumed','completion_pending','consumed','released_unused','consumption_unknown')),
+            spent BLOB NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
+            version INTEGER NOT NULL DEFAULT 0, receipt TEXT, detail TEXT, observed_overrun BLOB
+        );
+        CREATE TABLE IF NOT EXISTS local_budget_receipts (
+            receipt TEXT PRIMARY KEY NOT NULL,
+            reservation TEXT NOT NULL REFERENCES local_budget_reservations(reservation),
+            attempt INTEGER NOT NULL, usage BLOB NOT NULL
+        ) STRICT;
+        CREATE INDEX IF NOT EXISTS local_budget_roots
+ ON local_budget_reservations(root,parent);
+    "#,
     ),
 ];
 /// The file that marks a directory as a collaboration root.
