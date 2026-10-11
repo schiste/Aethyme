@@ -24,11 +24,15 @@
     "--nocapture"
   ],
   "source_file": "packages/aethyme/rust/crates/aethyme-broker/src/resolution.rs",
+  "process_status_provenance": {
+    "method": "Runner enforced Process::Status: exit 101 for negatives and success for positives. Root terminal reported 0/101/101/101/0. Numeric process statuses were not persisted separately; row fields therefore state expected statuses, and the retained logs independently support named test counts only.",
+    "runner_sha256": "dfa6c9604e2afb5f2176ef666ef9aa70fbeb46996bd377686016257ef5b3b0c5"
+  },
   "restored_source_sha256": "a6d2631891bd13a5a886622e88a79da402de0d213fdd26a7039537f7832888c1",
   "rows": [
     {
       "name": "original-positive",
-      "exit_status": 0,
+      "expected_exit_status": 0,
       "counts": {
         "passed": 1,
         "failed": 0,
@@ -40,7 +44,7 @@
     },
     {
       "name": "decision",
-      "exit_status": 101,
+      "expected_exit_status": 101,
       "counts": {
         "passed": 0,
         "failed": 1,
@@ -52,7 +56,7 @@
     },
     {
       "name": "scope",
-      "exit_status": 101,
+      "expected_exit_status": 101,
       "counts": {
         "passed": 0,
         "failed": 1,
@@ -64,7 +68,7 @@
     },
     {
       "name": "protection",
-      "exit_status": 101,
+      "expected_exit_status": 101,
       "counts": {
         "passed": 0,
         "failed": 1,
@@ -76,7 +80,7 @@
     },
     {
       "name": "restored-positive",
-      "exit_status": 0,
+      "expected_exit_status": 0,
       "counts": {
         "passed": 1,
         "failed": 0,

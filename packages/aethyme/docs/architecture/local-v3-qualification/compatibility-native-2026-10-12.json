@@ -184,7 +184,7 @@
   "pinned_old_binary": {
     "source": "5e8daf712e26c63f1d4082e9a617f556cf995de2",
     "sha256": "edc1ad2829e08c6d5aa2512964e117685cc1ea4502caa765dc1e0d0b9b0a4261",
-    "verification": "SHA-256 and native version identity checked before every invocation"
+    "verification": "SHA-256 and native version identity checked before every direct CLI run and before each installed-hook group"
   },
   "independent_reviews": {
     "status": "clear",
