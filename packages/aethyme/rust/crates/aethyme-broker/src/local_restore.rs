@@ -50,6 +50,8 @@ pub enum RestoreError {
     #[error(transparent)]
     Json(#[from] serde_json::Error),
     #[error(transparent)]
+    State(#[from] crate::collaboration_state::CollaborationStateError),
+    #[error(transparent)]
     Sqlite(#[from] rusqlite::Error),
     #[error(transparent)]
     Io(#[from] std::io::Error),
@@ -244,9 +246,16 @@ fn check_graph(header: &Header, objects: &BTreeMap<String, Vec<u8>>) -> Result<(
                 {
                     return Err(invalid("source record counts"));
                 }
-                archive::CommitOid::parse(text(&value["source"], "commit")?)?;
-                if !matches!(text(&value["source"], "object_format")?, "sha1" | "sha256") {
-                    return Err(invalid("Git provenance format"));
+                let commit = archive::CommitOid::parse(text(&value["source"], "commit")?)?;
+                let expected = match text(&value["source"], "object_format")? {
+                    "sha1" => 40,
+                    "sha256" => 64,
+                    _ => return Err(invalid("Git provenance format")),
+                };
+                if commit.as_str().len() != expected
+                    || text(&value["source"], "kind")? != "git_commit"
+                {
+                    return Err(invalid("Git provenance mapping"));
                 }
             }
             archive::CONTRIBUTION_LINEAGE_SCHEMA_NAME => {

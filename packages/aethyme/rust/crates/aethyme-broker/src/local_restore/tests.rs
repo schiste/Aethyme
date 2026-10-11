@@ -46,6 +46,10 @@ impl Fixture {
             },
         )
         .unwrap();
+        let capture = match capture {
+            capture::CaptureOutcome::Acknowledged(receipt) => receipt,
+            other => panic!("capture incomplete: {other:?}"),
+        };
         let brief = brief::Brief::from_decision_file(
             br#"{"intent":"Preserve the independently edited source."}"#,
         )
@@ -312,15 +316,22 @@ fn source_and_record_reference_graph_must_be_complete() {
         brief::BRIEF_SCHEMA_NAME,
     ] {
         let mut header = bundle.header.clone();
-        header.records.retain(|r| r.schema != schema);
+        let mut objects = bundle.objects.clone();
+        let removed = remove_record(&mut header, &mut objects, schema);
         assert!(
-            verify_changed(&header, &bundle.objects, &f.scope).is_err(),
-            "missing referenced {schema}"
+            matches!(verify_changed(&header,&objects,&f.scope),Err(RestoreError::Missing(id)) if id==removed.id),
+            "missing {schema} must reach its reference check without unused-payload masking"
         );
     }
     let mut header = bundle.header.clone();
-    header.sources.remove(0);
-    assert!(verify_changed(&header, &bundle.objects, &f.scope).is_err());
+    let mut objects = bundle.objects.clone();
+    let missing = header.sources.remove(0);
+    let manifest = ObjectDigest::of_snapshot(&SourceSnapshotId::parse(&missing).unwrap()).hex();
+    objects.remove(&manifest);
+    header.objects.retain(|o| o.digest != manifest);
+    assert!(
+        matches!(verify_changed(&header,&objects,&f.scope),Err(RestoreError::Missing(id)) if id==missing)
+    );
     let mut objects = bundle.objects.clone();
     let mut header = bundle.header.clone();
     let bytes = b"unselected host credentials".to_vec();
@@ -336,6 +347,123 @@ fn source_and_record_reference_graph_must_be_complete() {
         Err(RestoreError::Invalid(_))
     ));
 }
+fn remove_record(
+    header: &mut Header,
+    objects: &mut BTreeMap<String, Vec<u8>>,
+    schema: &str,
+) -> HistoricalRef {
+    let index = header
+        .records
+        .iter()
+        .position(|r| r.schema == schema)
+        .unwrap();
+    let removed = header.records.remove(index);
+    objects.remove(&removed.object);
+    header.objects.retain(|o| o.digest != removed.object);
+    removed
+}
+fn replace_record(
+    header: &mut Header,
+    objects: &mut BTreeMap<String, Vec<u8>>,
+    schema_name: &str,
+    change: impl FnOnce(&mut serde_json::Value),
+) {
+    let original = header
+        .records
+        .iter()
+        .find(|r| r.schema == schema_name)
+        .unwrap();
+    let bytes = objects[&original.object].clone();
+    remove_record(header, objects, schema_name);
+    let mut value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    change(&mut value);
+    let decoder = super::schema(schema_name).unwrap();
+    let record = Record::decode(&serde_json::to_vec(&value).unwrap(), &[decoder]).unwrap();
+    let bytes = record.canonical_bytes();
+    let digest = ObjectDigest::of(&bytes).hex();
+    header.records.push(HistoricalRef {
+        id: record.id().to_string(),
+        object: digest.clone(),
+        schema: schema_name.into(),
+    });
+    header.records.sort_by(|a, b| a.id.cmp(&b.id));
+    header.objects.push(ObjectRef {
+        digest: digest.clone(),
+        bytes: bytes.len() as u64,
+    });
+    header.objects.sort_by(|a, b| a.digest.cmp(&b.digest));
+    objects.insert(digest, bytes);
+}
+#[test]
+fn canonical_capture_and_context_records_with_wrong_mapping_refuse() {
+    let f = Fixture::new();
+    let bundle = f.verified();
+    let mut header = bundle.header.clone();
+    let mut objects = bundle.objects.clone();
+    remove_record(&mut header, &mut objects, context::CONTEXT_SCHEMA_NAME);
+    replace_record(
+        &mut header,
+        &mut objects,
+        capture::CAPTURE_RECEIPT_SCHEMA_NAME,
+        |v| {
+            v["base"] = v["result"].clone();
+        },
+    );
+    assert!(
+        matches!(verify_changed(&header,&objects,&f.scope),Err(RestoreError::Invalid(reason)) if reason=="capture lineage mapping")
+    );
+    let mut header = bundle.header.clone();
+    let mut objects = bundle.objects.clone();
+    replace_record(
+        &mut header,
+        &mut objects,
+        context::CONTEXT_SCHEMA_NAME,
+        |v| {
+            v["items"][0]["base"] = v["items"][0]["result"].clone();
+        },
+    );
+    assert!(
+        matches!(verify_changed(&header,&objects,&f.scope),Err(RestoreError::Invalid(reason)) if reason=="context lineage mapping")
+    );
+}
+#[test]
+fn retained_git_provenance_format_must_match_the_commit_identity() {
+    let f = Fixture::new();
+    let bundle = f.verified();
+    let mut header = bundle.header.clone();
+    let mut objects = bundle.objects.clone();
+    replace_record(
+        &mut header,
+        &mut objects,
+        archive::RETAINED_SNAPSHOT_SCHEMA_NAME,
+        |v| {
+            assert_eq!(v["source"]["object_format"], "sha1");
+            v["source"]["object_format"] = "sha256".into();
+        },
+    );
+    assert!(
+        matches!(verify_changed(&header,&objects,&f.scope),Err(RestoreError::Invalid(reason)) if reason=="Git provenance mapping")
+    );
+}
+#[test]
+fn analysis_references_are_explicitly_unsupported_by_source_history_profile() {
+    let f = Fixture::new();
+    let bundle = f.verified();
+    let mut header = bundle.header.clone();
+    let mut objects = bundle.objects.clone();
+    replace_record(
+        &mut header,
+        &mut objects,
+        context::CONTEXT_SCHEMA_NAME,
+        |v| {
+            v["query"]["analysis"] = serde_json::json!([format!("sha256:{}", "1".repeat(64))]);
+        },
+    );
+    assert!(
+        matches!(verify_changed(&header,&objects,&f.scope),Err(RestoreError::Unsupported(reason)) if reason.contains("analysis evidence"))
+    );
+}
+
 #[test]
 fn unsupported_native_records_never_become_a_restore_policy() {
     let f = Fixture::new();
