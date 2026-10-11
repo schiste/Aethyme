@@ -892,7 +892,10 @@ fn unavailable_lifecycle_adapters_refuse_without_state_creation() {
         ],
     ] {
         let (code, value) = f.json(&args);
-        assert_eq!(code, 3, "{args:?}: {value}");
+        assert_eq!(
+            code, 3,
+            "unavailable lifecycle adapter must explicitly refuse: {args:?}: {value}"
+        );
         assert_eq!(value["code"], "unsupported_profile");
         assert!(!f.collaboration_dir().exists());
         assert_eq!(std::fs::read(&input).unwrap(), bytes);
