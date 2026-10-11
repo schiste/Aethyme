@@ -50,3 +50,19 @@ Experimental schemas and composition qualification still depend on E1 #650.
 No broker schema, queue, gate or legacy publication behavior is changed. Typed
 candidate integration waits for #725. End-to-end Local qualification follows
 L6/L7 and the remaining Local packages; these records alone do not close Q3.
+
+## Verification evidence
+
+Fourteen focused tests pass, including an identity vector computed independently
+with Ruby's JSON encoder and SHA-256, raw CRLF/binary/mode preservation, fresh
+private directories, ignored-file exclusion, missing inputs, stale revisions,
+CAS tampering, retention-root checks, and folded file/directory aliases.
+Role copies are budgeted before freeze as well as before materialization.
+Recognized LFS headers are conservatively refused with surrounding whitespace,
+CRLF and the legacy aliases accepted by the [Git LFS decoder](https://raw.githubusercontent.com/git-lfs/git-lfs/main/lfs/pointer.go).
+
+Independent adversarial review found the shared-role accounting and LFS variant
+issues; both were fixed. Nine deliberate removals of those and other new guards
+failed their intended tests. Restored-source tests, warning-free broker clippy,
+and the discarded-result and deprecated-spelling ratchets pass. These checks
+establish the descriptor/materializer boundary, not E1 or Q3 qualification.

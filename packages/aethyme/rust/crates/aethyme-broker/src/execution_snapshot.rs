@@ -252,6 +252,15 @@ pub fn freeze(
     revision: &RecordId,
     spec: ExecutionSpec,
 ) -> Result<ExecutionSnapshot, SnapshotError> {
+    freeze_bounded(store, owner, revision, spec, MAX_INPUT_BYTES)
+}
+fn freeze_bounded(
+    store: &mut CollaborationStore,
+    owner: &ControllerOwner,
+    revision: &RecordId,
+    spec: ExecutionSpec,
+    materialized_limit: u64,
+) -> Result<ExecutionSnapshot, SnapshotError> {
     let _authority = target::authorize(store, owner)?;
     current(store, owner, revision)?;
     let inputs = validate(&spec)?;
@@ -260,6 +269,7 @@ pub fn freeze(
     for id in &inputs {
         inspect(store, id, &mut total)?;
     }
+    inspect_roles(store, &spec, materialized_limit)?;
     let record = record(revision, &spec)?;
     let bytes = record.canonical_bytes();
     if bytes.len() > 1024 * 1024 {
@@ -336,6 +346,27 @@ fn inspect(
     if snapshot.entries().len() > MAX_FILES {
         return Err(SnapshotError::Limit);
     }
+    portable(&snapshot)?;
+    for entry in snapshot.entries() {
+        let digest = ObjectDigest::from_bytes(*entry.content_sha256());
+        if std::fs::metadata(archive::object_path(store, &digest))?.len() > MAX_FILE_BYTES {
+            return Err(SnapshotError::Limit);
+        }
+        let contents =
+            archive::read_object(store, &ObjectDigest::from_bytes(*entry.content_sha256()))?;
+        if unresolved_lfs(&contents) {
+            return Err(SnapshotError::Unsupported("unresolved LFS pointer".into()));
+        }
+        *total = total
+            .checked_add(contents.len() as u64)
+            .ok_or(SnapshotError::Limit)?;
+        if contents.len() as u64 > MAX_FILE_BYTES || *total > MAX_INPUT_BYTES {
+            return Err(SnapshotError::Limit);
+        }
+    }
+    Ok(snapshot)
+}
+pub(crate) fn portable(snapshot: &SourceSnapshot) -> Result<(), SnapshotError> {
     let mut prefixes = BTreeMap::new();
     let mut files = BTreeSet::new();
     for entry in snapshot.entries() {
@@ -366,23 +397,8 @@ fn inspect(
             prefixes.insert(folded.clone(), original.clone());
         }
         files.insert(folded);
-        let digest = ObjectDigest::from_bytes(*entry.content_sha256());
-        if std::fs::metadata(archive::object_path(store, &digest))?.len() > MAX_FILE_BYTES {
-            return Err(SnapshotError::Limit);
-        }
-        let contents =
-            archive::read_object(store, &ObjectDigest::from_bytes(*entry.content_sha256()))?;
-        if contents.starts_with(b"version https://git-lfs.github.com/spec/v1\n") {
-            return Err(SnapshotError::Unsupported("unresolved LFS pointer".into()));
-        }
-        *total = total
-            .checked_add(contents.len() as u64)
-            .ok_or(SnapshotError::Limit)?;
-        if contents.len() as u64 > MAX_FILE_BYTES || *total > MAX_INPUT_BYTES {
-            return Err(SnapshotError::Limit);
-        }
     }
-    Ok(snapshot)
+    Ok(())
 }
 /// An owned, fresh input generation. Host permissions are defense in depth;
 /// the workload must still receive enforced read-only mounts in #671.
@@ -422,12 +438,28 @@ pub fn materialize(
     let workspace = tempfile::Builder::new()
         .prefix("aethyme-execution-")
         .tempdir()?;
+    for (role, id, manifest) in inspect_roles(store, spec, MAX_INPUT_BYTES)? {
+        let path = workspace.path().join(role);
+        archive::reconstruct(store, &id, &path)?;
+        verify_materialized(&path, &manifest)?;
+    }
+    Ok(MaterializedInputs {
+        workspace,
+        snapshot: snapshot.clone(),
+    })
+}
+fn inspect_roles(
+    store: &CollaborationStore,
+    spec: &ExecutionSpec,
+    limit: u64,
+) -> Result<Vec<(&'static str, SourceSnapshotId, SourceSnapshot)>, SnapshotError> {
     let raw = spec
         .preparation
         .as_ref()
         .map(|p| p.materialized_source.as_str())
         .unwrap_or(&spec.candidate_source);
     let mut total = 0;
+    let mut roles = Vec::new();
     for (role, id) in [
         ("source", Some(raw)),
         ("harness", Some(spec.harness.as_str())),
@@ -438,15 +470,28 @@ pub fn materialize(
         if let Some(id) = id {
             let id = source(id)?;
             let manifest = inspect(store, &id, &mut total)?;
-            let path = workspace.path().join(role);
-            archive::reconstruct(store, &id, &path)?;
-            verify_materialized(&path, &manifest)?;
+            if total > limit {
+                return Err(SnapshotError::Limit);
+            }
+            roles.push((role, id, manifest));
         }
     }
-    Ok(MaterializedInputs {
-        workspace,
-        snapshot: snapshot.clone(),
-    })
+    Ok(roles)
+}
+fn unresolved_lfs(bytes: &[u8]) -> bool {
+    // Git LFS trims surrounding Unicode whitespace and accepts legacy version
+    // aliases. Refuse recognized pointer headers conservatively, even malformed
+    // metadata; this raw profile has no LFS resolver.
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return false;
+    };
+    let first = text.trim().lines().next().unwrap_or("");
+    matches!(
+        first,
+        "version https://git-lfs.github.com/spec/v1"
+            | "version https://hawser.github.com/spec/v1"
+            | "version http://git-media.io/v/2"
+    )
 }
 fn verify_materialized(path: &Path, manifest: &SourceSnapshot) -> Result<(), SnapshotError> {
     for entry in manifest.entries() {
