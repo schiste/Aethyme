@@ -713,13 +713,18 @@ pub fn recover_dispatch(
     if wave.phase != WavePhase::Composing {
         return Ok(wave);
     }
-    let state = current(store, owner, &wave)?;
+    let state = target::status(store, owner.target())?;
+    let next = match state.phase {
+        Phase::StopRequested | Phase::Stopped => "stop_requested",
+        Phase::BlockedTargetDrift => "blocked_target_drift",
+        _ => "outcome_unknown",
+    };
     let tx = store
         .connection()
         .transaction_with_behavior(TransactionBehavior::Immediate)?;
     guard_current(&tx, owner, &wave, state.version)?;
     tx.execute("UPDATE local_waves SET phase='outcome_unknown', detail='compose dispatch interrupted; reconcile retained output before retry' WHERE wave=?1 AND phase='composing'", [wave_id.as_str()])?;
-    tx.execute("UPDATE local_targets SET phase='outcome_unknown', version=version+1 WHERE target=?1 AND active_revision=?2 AND phase='composing'", params![owner.target(),wave.spec.revision])?;
+    tx.execute("UPDATE local_targets SET phase=?3, resume_phase=NULL, version=version+1 WHERE target=?1 AND active_revision=?2", params![owner.target(),wave.spec.revision,next])?;
     tx.commit()?;
     load(store, wave_id)
 }
@@ -741,15 +746,24 @@ pub fn stop(
     {
         return Err(WaveError::Stale);
     }
+    commit_stop(store, owner, &wave, &state)
+}
+
+fn commit_stop(
+    store: &mut CollaborationStore,
+    owner: &ControllerOwner,
+    wave: &Wave,
+    state: &target::ControllerStatus,
+) -> Result<Wave, WaveError> {
     let live = matches!(wave.phase, WavePhase::Composing | WavePhase::OutcomeUnknown);
     let tx = store
         .connection()
         .transaction_with_behavior(TransactionBehavior::Immediate)?;
-    guard_current(&tx, owner, &wave, state.version)?;
+    guard_current(&tx, owner, wave, state.version)?;
     tx.execute(
         "UPDATE local_waves SET phase=?2, detail=?3 WHERE wave=?1",
         params![
-            wave_id.as_str(),
+            wave.id.as_str(),
             if live { "outcome_unknown" } else { "stopped" },
             if live {
                 "stop requested; compose liveness or output unknown"
@@ -760,7 +774,7 @@ pub fn stop(
     )?;
     tx.execute("UPDATE local_targets SET phase=?3, version=version+1 WHERE target=?1 AND active_revision=?2", params![owner.target(),wave.spec.revision,if live { "stop_requested" } else { "stopped" }])?;
     tx.commit()?;
-    load(store, wave_id)
+    load(store, &wave.id)
 }
 
 #[cfg(test)]

@@ -281,6 +281,11 @@ fn a_real_composer_dispatch_retains_a_candidate_without_verification_or_ref_writ
         )
         .unwrap();
     assert_eq!(roots, 1);
+    let candidate_roots: i64 = f.store.read_connection().query_row(
+        "SELECT count(*) FROM local_target_roots WHERE revision=?1 AND kind='snapshot' AND reference=?2",
+        params![revision.as_str(),complete.candidate_snapshot.as_ref().unwrap().as_str()], |r| r.get(0),
+    ).unwrap();
+    assert_eq!(candidate_roots, 1);
     let state = target::status(&f.store, owner.target()).unwrap();
     assert_eq!(state.phase, Phase::WaitingForInput);
     assert_eq!(state.resume_phase, Some(Phase::Verifying));
@@ -662,16 +667,14 @@ fn a_dispatch_state_change_invalidates_a_pre_dispatch_stop_observation() {
             [],
         )
         .unwrap();
-    let tx = f
-        .store
-        .connection()
-        .transaction_with_behavior(TransactionBehavior::Immediate)
-        .unwrap();
     assert!(matches!(
-        guard_current(&tx, &owner, &wave, read_before_dispatch.version),
+        commit_stop(&mut f.store, &owner, &wave, &read_before_dispatch),
         Err(WaveError::Stale)
     ));
-    tx.commit().unwrap();
+    assert_eq!(
+        load(&f.store, &wave.id).unwrap().phase,
+        WavePhase::Composing
+    );
     assert_eq!(
         stop(&mut f.store, &owner, &wave.id).unwrap().phase,
         WavePhase::OutcomeUnknown
@@ -765,5 +768,67 @@ fn rehashed_wave_records_cannot_expand_the_pinned_authorization() {
             target::status(&f.store, owner.target()).unwrap().phase,
             Phase::WaveFrozen
         );
+    }
+}
+
+#[test]
+fn interrupted_dispatch_recovers_after_generic_stop_or_drift_without_clearing_intent() {
+    for phase in [
+        Phase::StopRequested,
+        Phase::Stopped,
+        Phase::BlockedTargetDrift,
+    ] {
+        let mut f = Fixture::new();
+        let (owner, revision) = setup(&mut f, &["A"]);
+        available(&mut f.store, &owner, "A", 0).unwrap();
+        let wave = frozen(admit(&mut f.store, &owner, policy(), 0).unwrap());
+        f.store
+            .connection()
+            .execute(
+                "UPDATE local_waves SET phase='composing' WHERE wave=?1",
+                [wave.id.as_str()],
+            )
+            .unwrap();
+        let state = target::status(&f.store, owner.target()).unwrap();
+        let composing =
+            target::transition(&mut f.store, &owner, state.version, Phase::Composing).unwrap();
+        let next = if phase == Phase::Stopped {
+            Phase::StopRequested
+        } else {
+            phase
+        };
+        let intent = target::transition(&mut f.store, &owner, composing.version, next).unwrap();
+        if phase == Phase::Stopped {
+            target::transition(&mut f.store, &owner, intent.version, Phase::Stopped).unwrap();
+        }
+        assert_eq!(
+            recover_dispatch(&mut f.store, &owner, &wave.id)
+                .unwrap()
+                .phase,
+            WavePhase::OutcomeUnknown
+        );
+        let expected = if phase == Phase::Stopped {
+            Phase::StopRequested
+        } else {
+            phase
+        };
+        assert_eq!(
+            target::status(&f.store, owner.target()).unwrap().phase,
+            expected
+        );
+        assert_eq!(
+            recover_dispatch(&mut f.store, &owner, &wave.id)
+                .unwrap()
+                .phase,
+            WavePhase::OutcomeUnknown
+        );
+        assert!(matches!(
+            target::release_revision(&mut f.store, &owner, &revision),
+            Err(TargetError::Frozen)
+        ));
+        assert!(matches!(
+            admit(&mut f.store, &owner, policy(), 1).unwrap(),
+            Admission::Existing(_)
+        ));
     }
 }
