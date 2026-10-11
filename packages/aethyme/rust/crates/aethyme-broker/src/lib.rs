@@ -98,6 +98,7 @@ pub mod install_replacement;
 mod issue_form;
 mod lease_export;
 mod leases;
+pub mod local_acceptance;
 pub mod local_authority;
 pub mod local_budget;
 pub mod local_source_transport;

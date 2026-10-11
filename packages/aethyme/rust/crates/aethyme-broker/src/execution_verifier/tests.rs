@@ -145,16 +145,22 @@ fn producer_policy_profile_bounds_and_target_policy_must_match() {
         Err(VerificationError::Mismatch)
     ));
 }
-struct Subject {
-    f: Fixture,
-    owner: ControllerOwner,
-    execution: ExecutionSnapshot,
-    artifact: SealedArtifact,
-    permit: ProducerPermit,
-    inventory: AssertionInventory,
+pub(crate) struct Subject {
+    pub(crate) f: Fixture,
+    pub(crate) owner: ControllerOwner,
+    pub(crate) execution: ExecutionSnapshot,
+    pub(crate) artifact: SealedArtifact,
+    pub(crate) permit: ProducerPermit,
+    pub(crate) inventory: AssertionInventory,
 }
 impl Subject {
     fn fake() -> Self {
+        Self::with_max_age(1000)
+    }
+    pub(crate) fn acceptance_fixture() -> Self {
+        Self::with_max_age(60000)
+    }
+    fn with_max_age(max_age_ms: u64) -> Self {
         use aethyme_contracts::experimental_v0::SourceSnapshot;
         use aethyme_contracts::experimental_v0::source_snapshot::{EntryKind, SourceEntry};
         let mut f = Fixture::new();
@@ -162,6 +168,7 @@ impl Subject {
         let inventory = AssertionInventory::new(vec![case()]).unwrap();
         let policy = policy();
         let mut policy = policy;
+        policy.max_age_ms = max_age_ms;
         policy.harness = capture(&mut f, "inventory.json", &inventory.canonical_bytes());
         // Policy must be frozen before selecting the target; use the actual
         // harness identity in the target's appointed policy too.
@@ -252,7 +259,7 @@ impl Subject {
             inventory,
         }
     }
-    fn evidence(&mut self) -> TrustedEvidence {
+    pub(crate) fn evidence(&mut self) -> TrustedEvidence {
         let assertions = self
             .inventory
             .cases

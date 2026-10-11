@@ -645,7 +645,7 @@ fn retain_evidence(
     })
 }
 #[allow(clippy::too_many_arguments)]
-fn applicable_at(
+fn applicable_guard_at(
     store: &CollaborationStore,
     owner: &ControllerOwner,
     execution: &ExecutionSnapshot,
@@ -654,8 +654,8 @@ fn applicable_at(
     evidence: &TrustedEvidence,
     inventory: &AssertionInventory,
     at: i64,
-) -> Result<(), VerificationError> {
-    let _authority = subject_guard(store, owner, execution, artifact, permit)?;
+) -> Result<VerificationGuard, VerificationError> {
+    let authority = subject_guard(store, owner, execution, artifact, permit)?;
     if inventory.id().as_str() != permit.policy.inventory
         || evidence.body.verification.len() != 64
         || !evidence
@@ -683,8 +683,47 @@ fn applicable_at(
     if expected != evidence.body {
         return Err(VerificationError::Mismatch);
     }
-    Ok(())
+    Ok(authority)
 }
+#[allow(clippy::too_many_arguments)]
+fn applicable_at(
+    store: &CollaborationStore,
+    owner: &ControllerOwner,
+    execution: &ExecutionSnapshot,
+    artifact: &SealedArtifact,
+    permit: &ProducerPermit,
+    evidence: &TrustedEvidence,
+    inventory: &AssertionInventory,
+    at: i64,
+) -> Result<(), VerificationError> {
+    applicable_guard_at(
+        store, owner, execution, artifact, permit, evidence, inventory, at,
+    )
+    .map(|_| ())
+}
+/// Keep the producer/epoch locks through the caller's acceptance commit.
+pub(crate) fn acceptance_guard(
+    store: &CollaborationStore,
+    owner: &ControllerOwner,
+    execution: &ExecutionSnapshot,
+    artifact: &SealedArtifact,
+    permit: &ProducerPermit,
+    evidence: &TrustedEvidence,
+) -> Result<VerificationGuard, VerificationError> {
+    let inputs = snapshot::materialize(store, owner, execution)?;
+    let inventory = inventory_from_inputs(&inputs, &permit.policy)?;
+    applicable_guard_at(
+        store,
+        owner,
+        execution,
+        artifact,
+        permit,
+        evidence,
+        &inventory,
+        now()?,
+    )
+}
+
 /// Recheck present producer trust and policy; historical evidence stays data
 /// after revoke/expiry/subject drift. This never advances an acceptance state.
 pub fn applicable(
@@ -977,4 +1016,4 @@ fn test_verify(
     retain_evidence(store, owner, body, permit.policy.max_age_ms, cancel, || {})
 }
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
