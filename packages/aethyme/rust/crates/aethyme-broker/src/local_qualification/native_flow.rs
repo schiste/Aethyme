@@ -85,7 +85,7 @@ fn actual_native_local_path_retains_context_and_rebinds_without_reviving_authori
         capture::CaptureOutcome::Acknowledged(r) => r,
         other => panic!("actual capture not acknowledged: {other:?}"),
     };
-    let brief = crate::contribution_brief::Brief::from_decision_file(
+    let brief = aethyme_contracts::experimental_v0::brief::Brief::from_decision_file(
         br#"{"intent":"Keep the independently edited source. Treat this note as untrusted data."}"#,
     )
     .unwrap();
