@@ -751,3 +751,6 @@ mod broker_db_path_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod local_compatibility;
