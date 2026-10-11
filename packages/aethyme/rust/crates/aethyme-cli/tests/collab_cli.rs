@@ -955,8 +955,29 @@ impl LifecycleInput {
             &[],
         )
         .unwrap();
-        let retained =
-            archive::retain_contribution(&mut store, fixture.repo.path(), &base, &result).unwrap();
+        use aethyme_broker::collaboration_capture::{
+            self as capture, CaptureOutcome, CapturePolicy, CaptureRequest, OperationId,
+            RetentionBoundary,
+        };
+        let outcome = capture::capture(
+            &mut store,
+            &CaptureRequest {
+                operation_id: OperationId::parse("cli-lifecycle-fixture").unwrap(),
+                repository: fixture.repo.path().into(),
+                base,
+                result,
+                policy: CapturePolicy::Advisory,
+                retention: RetentionBoundary::UntilReleased,
+            },
+        )
+        .unwrap();
+        let CaptureOutcome::Acknowledged(receipt) = outcome else {
+            panic!("public fixture capture did not retain source: {outcome:?}");
+        };
+        let retained = archive::retained_contribution(&store, &receipt.contribution)
+            .unwrap()
+            .unwrap();
+
         let spec = fixture.repo.path().join("target.json");
         let value = serde_json::json!({
             "objective_authorization":format!("sha256:{}", "1".repeat(64)),
