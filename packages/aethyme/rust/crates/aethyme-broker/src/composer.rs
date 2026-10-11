@@ -548,6 +548,7 @@ struct Planned {
 struct Plan {
     baseline: RetainedSnapshot,
     steps: Vec<Planned>,
+    coupled: Vec<Vec<String>>,
 }
 
 /// The baseline, retained, and the snapshots of accepted history.
@@ -560,12 +561,14 @@ struct Baseline {
 /// source-lineage rules as composition. This never invokes Git or writes a
 /// recipe, candidate, or ref. Accepted history is absent unless explicitly
 /// represented by the target's baseline or selected contributions.
+pub(crate) type RetainedSelection = Result<Vec<Vec<String>>, (Refusal, String)>;
+
 pub(crate) fn validate_retained_selection(
     store: &CollaborationStore,
     baseline: RetainedSnapshot,
     catalog: Vec<ContributionSpec>,
     deliveries: Vec<String>,
-) -> Result<Result<(), (Refusal, String)>, ComposeError> {
+) -> Result<RetainedSelection, ComposeError> {
     let request = CompositionRequest {
         baseline: baseline.commit.clone(),
         accepted: vec![],
@@ -588,7 +591,7 @@ pub(crate) fn validate_retained_selection(
             &request.deliveries,
             &mut BudgetUsage::default(),
         )? {
-            Ok(_) => Ok(()),
+            Ok(plan) => Ok(plan.coupled),
             Err(Refused(reason, detail)) => Err((reason, detail)),
         },
     )
@@ -981,6 +984,39 @@ fn plan(
         }
     }
 
+    // Admission groups include dependency closure and atomic replacements.
+    // Grouping is conservative: coupled work receives service together.
+    let mut roots: Vec<usize> = (0..selected.len()).collect();
+    fn root(roots: &[usize], mut index: usize) -> usize {
+        while roots[index] != index {
+            index = roots[index];
+        }
+        index
+    }
+    fn join(roots: &mut [usize], a: usize, b: usize) {
+        let a = root(roots, a);
+        let b = root(roots, b);
+        roots[b] = a;
+    }
+    for (child, parents) in edges.iter().enumerate() {
+        for &parent in parents {
+            join(&mut roots, child, parent);
+        }
+    }
+    let mut atomic: BTreeMap<&str, usize> = BTreeMap::new();
+    for member in &request.catalog {
+        if let Some(group) = member.atomic_group.as_deref()
+            && let Some(delivered) = lines.get(&line(&member.id))
+            && let Some(&index) = applies_as.get(delivered)
+        {
+            if let Some(&other) = atomic.get(group) {
+                join(&mut roots, other, index);
+            } else {
+                atomic.insert(group, index);
+            }
+        }
+    }
+
     // Topological order; ties keep the order of first delivery.
     let mut placed = vec![false; selected.len()];
     let mut steps = Vec::with_capacity(selected.len());
@@ -1000,6 +1036,13 @@ fn plan(
         placed[next] = true;
         steps.push(next);
     }
+    let mut coupled: BTreeMap<usize, Vec<String>> = BTreeMap::new();
+    for &index in &steps {
+        coupled
+            .entry(root(&roots, index))
+            .or_default()
+            .push(selected[index].id.clone());
+    }
     let mut retained: Vec<Option<RetainedContribution>> = retained.into_iter().map(Some).collect();
     let steps = steps
         .into_iter()
@@ -1008,7 +1051,11 @@ fn plan(
             retained: retained[index].take().expect("each index placed once"),
         })
         .collect();
-    Ok(Ok(Plan { baseline, steps }))
+    Ok(Ok(Plan {
+        baseline,
+        steps,
+        coupled: coupled.into_values().collect(),
+    }))
 }
 
 // ----------------------------------------------------------------- reading

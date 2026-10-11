@@ -79,6 +79,24 @@ pub struct TargetSpec {
     pub composer_profile: String,
 }
 
+impl TargetSpec {
+    pub(crate) fn catalog(&self) -> Result<Vec<crate::composer::ContributionSpec>, TargetError> {
+        self.contributions
+            .iter()
+            .map(|c| {
+                Ok(crate::composer::ContributionSpec {
+                    id: c.id.clone(),
+                    lineage: Some(record_id(&c.lineage)?),
+                    requires: c.requires.clone(),
+                    atomic_group: c.atomic_group.clone(),
+                    revision_of: c.revision_of.clone(),
+                    derived_from: c.derived_from.clone(),
+                })
+            })
+            .collect()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TargetRevision {
     pub id: RecordId,
@@ -211,6 +229,15 @@ pub struct ControllerOwner {
     _lock: ExclusiveFileLock,
 }
 
+impl ControllerOwner {
+    pub(crate) fn target(&self) -> &str {
+        &self.target
+    }
+    pub(crate) fn issuer(&self) -> &str {
+        &self.issuer
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum TargetError {
     #[error("invalid target: {0}")]
@@ -302,7 +329,10 @@ pub fn acquire_controller(
     })
 }
 
-fn authorize(store: &CollaborationStore, owner: &ControllerOwner) -> Result<(), TargetError> {
+pub(crate) fn authorize(
+    store: &CollaborationStore,
+    owner: &ControllerOwner,
+) -> Result<(), TargetError> {
     if store.project_dir() != owner.project_dir {
         return Err(TargetError::Unauthorized);
     }
@@ -411,20 +441,7 @@ pub fn propose_revision(
     let baseline_id = SourceSnapshotId::parse(&spec.baseline)
         .map_err(|_| TargetError::Invalid("baseline".into()))?;
     let baseline = archive::retained(store, &baseline_id)?.ok_or(TargetError::Missing)?;
-    let catalog = spec
-        .contributions
-        .iter()
-        .map(|c| {
-            Ok(crate::composer::ContributionSpec {
-                id: c.id.clone(),
-                lineage: Some(record_id(&c.lineage)?),
-                requires: c.requires.clone(),
-                atomic_group: c.atomic_group.clone(),
-                revision_of: c.revision_of.clone(),
-                derived_from: c.derived_from.clone(),
-            })
-        })
-        .collect::<Result<Vec<_>, TargetError>>()?;
+    let catalog = spec.catalog()?;
     if let Err((reason, detail)) = crate::composer::validate_retained_selection(
         store,
         baseline,
@@ -548,6 +565,13 @@ pub fn select_revision(
     let tx = store
         .connection()
         .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let active_wave: bool = tx.query_row(
+        "SELECT EXISTS (SELECT 1 FROM local_waves WHERE target=?1 AND phase IN ('frozen','composing','verifying','outcome_unknown'))",
+        [&owner.target], |r| r.get(0),
+    )?;
+    if active_wave {
+        return Err(TargetError::Frozen);
+    }
     let released: bool = tx.query_row(
         "SELECT released FROM local_target_revisions WHERE revision = ?1",
         [id.as_str()],
@@ -730,6 +754,13 @@ pub fn release_revision(
     let tx = store
         .connection()
         .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let active_wave: bool = tx.query_row(
+        "SELECT EXISTS (SELECT 1 FROM local_waves WHERE revision=?1 AND phase IN ('frozen','composing','verifying','outcome_unknown'))",
+        [id.as_str()], |r| r.get(0),
+    )?;
+    if active_wave {
+        return Err(TargetError::Frozen);
+    }
     let active: Option<String> = tx.query_row(
         "SELECT active_revision FROM local_targets WHERE target = ?1",
         [&owner.target],
@@ -751,4 +782,4 @@ pub fn release_revision(
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

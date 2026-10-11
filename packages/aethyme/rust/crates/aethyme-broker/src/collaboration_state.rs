@@ -37,7 +37,7 @@ use serde::Serialize;
 pub use crate::host_state::HostStateSource;
 
 /// The schema this binary writes.
-pub const COLLABORATION_STATE_SCHEMA_VERSION: i64 = 7;
+pub const COLLABORATION_STATE_SCHEMA_VERSION: i64 = 8;
 /// The oldest schema a database written by this binary can be read by.
 /// Unlike `host-operations.db`, a newer database stays readable by an older
 /// binary until a release raises this floor.
@@ -55,7 +55,9 @@ pub const COLLABORATION_STATE_SCHEMA_VERSION: i64 = 7;
 /// is locked out.
 // Schema 6 reclamation cannot see local target roots and would delete live
 // controller inputs. Such a binary must refuse this store before writing.
-const MIN_COMPATIBLE_SCHEMA: i64 = 7;
+// Schema 7 has no wave ledger, and cannot guard retention while a dispatch is
+// unknown. As with prior floors, stop old open clients before migration.
+const MIN_COMPATIBLE_SCHEMA: i64 = 8;
 const ROOT_DIRECTORY: &str = "collaboration";
 /// Additive schema steps after the version 1 layout (`meta` only), applied in
 /// order. Each only adds tables; after migrating, the compatibility floor is
@@ -286,6 +288,34 @@ const MIGRATIONS: &[(i64, &str)] = &[
              outcome TEXT,
              charged_ms INTEGER NOT NULL
          ) STRICT;",
+    ),
+    (
+        8,
+        "CREATE TABLE local_wave_arrivals (
+             sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+             revision TEXT NOT NULL REFERENCES local_target_revisions (revision),
+             contribution TEXT NOT NULL,
+             first_seen_ms INTEGER NOT NULL CHECK (first_seen_ms >= 0),
+             UNIQUE (revision, contribution)
+         ) STRICT;
+         CREATE TABLE local_waves (
+             wave TEXT PRIMARY KEY NOT NULL,
+             target TEXT NOT NULL REFERENCES local_targets (target),
+             revision TEXT NOT NULL REFERENCES local_target_revisions (revision),
+             sequence INTEGER NOT NULL,
+             body BLOB NOT NULL,
+             phase TEXT NOT NULL,
+             candidate_snapshot TEXT,
+             candidate_commit TEXT,
+             recipe_object TEXT,
+             detail TEXT,
+             composition_ms INTEGER NOT NULL DEFAULT 0,
+             drift_count INTEGER NOT NULL DEFAULT 0,
+             last_observed_commit TEXT,
+             UNIQUE (target, sequence)
+         ) STRICT;
+         CREATE UNIQUE INDEX local_waves_one_active ON local_waves (target)
+             WHERE phase IN ('frozen', 'composing', 'verifying', 'outcome_unknown');",
     ),
 ];
 /// The file that marks a directory as a collaboration root.

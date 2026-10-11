@@ -95,6 +95,7 @@ mod issue_form;
 mod lease_export;
 mod leases;
 pub mod local_target;
+pub mod local_wave;
 mod main_drift;
 pub mod main_reconcile;
 mod measurement;
