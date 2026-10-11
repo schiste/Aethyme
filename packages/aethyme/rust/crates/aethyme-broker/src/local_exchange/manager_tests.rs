@@ -636,6 +636,21 @@ fn migration_preserves_capture_rows_and_operation_constraints_without_fake_captu
     let db = store.project_dir().join("state.db");
     drop(store);
     let conn = rusqlite::Connection::open(&db).unwrap();
+    // Reconstruct schema 14, including removal of later stack-owned tables.
+    // A current store marker alone is not a historical schema fixture.
+    conn.execute_batch(
+        "PRAGMA foreign_keys=ON;
+        DROP TABLE IF EXISTS local_import_rehearsals;
+        DROP TABLE IF EXISTS local_imported_records;
+        DROP TABLE IF EXISTS local_imported_sources;
+        DROP TABLE IF EXISTS local_imports;
+        DROP TABLE IF EXISTS local_adoption_receipts;
+        DROP TABLE IF EXISTS local_agent_reconciliations;
+        DROP TABLE IF EXISTS local_agent_dispatches;
+        DROP TABLE IF EXISTS local_handoffs;
+        DROP TABLE IF EXISTS local_agent_sessions;",
+    )
+    .unwrap();
     conn.execute_batch("PRAGMA foreign_keys=ON;
       DROP TABLE local_exchange_messages; DROP TABLE local_exchange_deliveries; DROP TABLE local_exchange_streams;
       DROP TABLE local_exchange_events; DROP TABLE local_exchange_projection; DROP TABLE local_exchange_observations; DROP TABLE local_exchange_bindings;
@@ -647,7 +662,10 @@ fn migration_preserves_capture_rows_and_operation_constraints_without_fake_captu
       UPDATE meta SET value='14' WHERE key IN ('schema_version','min_compatible_schema');").unwrap();
     drop(conn);
     let mut store = open(host.path());
-    assert_eq!(store.schema_version(), 15);
+    assert_eq!(
+        store.schema_version(),
+        crate::collaboration_state::COLLABORATION_STATE_SCHEMA_VERSION
+    );
     let row: (i64, String, String, String, i64, Option<i64>) = store
         .read_connection()
         .query_row("SELECT * FROM outbox", [], |r| {
