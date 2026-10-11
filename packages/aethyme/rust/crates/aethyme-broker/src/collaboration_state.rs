@@ -37,16 +37,23 @@ use serde::Serialize;
 pub use crate::host_state::HostStateSource;
 
 /// The schema this binary writes.
-pub const COLLABORATION_STATE_SCHEMA_VERSION: i64 = 4;
+pub const COLLABORATION_STATE_SCHEMA_VERSION: i64 = 6;
 /// The oldest schema a database written by this binary can be read by.
 /// Unlike `host-operations.db`, a newer database stays readable by an older
 /// binary until a release raises this floor.
 ///
 /// Raised to 4 with reclamation (#659): a schema 3 binary would capture
 /// without the archive lock, the reuse refresh or the reclaimed-marker
-/// clearing, so reclamation could remove source it had just named. No
-/// release shipped schema 2 or 3, so nothing that exists is locked out.
-const MIN_COMPATIBLE_SCHEMA: i64 = 4;
+/// clearing, so reclamation could remove source it had just named. Raised
+/// to 5 with contribution context (#661): a schema 4 binary's reclamation
+/// does not treat attached brief objects as roots, so it could remove the
+/// brief of a live contribution. Raised to 6 with the context cache (#662):
+/// a schema 5 binary indexes contributions without broad-risk postings and
+/// purges no cached answer when a contribution stops being live, so a newer
+/// binary could serve a cached answer a broad change should have
+/// invalidated. No release shipped schemas 2 to 5, so nothing that exists
+/// is locked out.
+const MIN_COMPATIBLE_SCHEMA: i64 = 6;
 const ROOT_DIRECTORY: &str = "collaboration";
 /// Additive schema steps after the version 1 layout (`meta` only), applied in
 /// order. Each only adds tables; after migrating, the compatibility floor is
@@ -179,6 +186,61 @@ const MIGRATIONS: &[(i64, &str)] = &[
              bytes INTEGER NOT NULL,
              PRIMARY KEY (generation, relpath)
          ) STRICT;",
+    ),
+    (
+        5,
+        // Contribution context (#661). `contribution_briefs` is authority:
+        // which brief explains a contribution (a revision replaces it).
+        // `context_postings`, `context_indexed` and `context_unreadable`
+        // are derived from the archive and rebuildable at any time.
+        "CREATE TABLE IF NOT EXISTS contribution_briefs (
+             lineage_record_id TEXT PRIMARY KEY NOT NULL
+                 REFERENCES retained_contributions (lineage_record_id),
+             brief_record_id TEXT NOT NULL,
+             brief_sha256 TEXT NOT NULL,
+             attached_ms INTEGER NOT NULL
+         ) STRICT;
+         CREATE TABLE IF NOT EXISTS context_postings (
+             key BLOB NOT NULL,
+             lineage_record_id TEXT NOT NULL,
+             PRIMARY KEY (key, lineage_record_id)
+         ) STRICT;
+         CREATE INDEX IF NOT EXISTS context_postings_by_contribution
+             ON context_postings (lineage_record_id);
+         CREATE TABLE IF NOT EXISTS context_indexed (
+             lineage_record_id TEXT PRIMARY KEY NOT NULL,
+             brief_record_id TEXT
+         ) STRICT;
+         CREATE TABLE IF NOT EXISTS context_unreadable (
+             lineage_record_id TEXT PRIMARY KEY NOT NULL,
+             generation INTEGER NOT NULL
+         ) STRICT;",
+    ),
+    (
+        6,
+        // The context cache (#662). Every table here is derived: answers are
+        // stored under their cache key, which commits to every input that can
+        // change them. The derived index is rebuilt on first use, because it
+        // carries no `context_index_format` stamp yet (collaboration_context).
+        "CREATE TABLE IF NOT EXISTS context_cache (
+             cache_key TEXT PRIMARY KEY NOT NULL,
+             visibility TEXT NOT NULL,
+             epoch INTEGER NOT NULL,
+             record BLOB NOT NULL,
+             record_id TEXT NOT NULL,
+             contributions TEXT NOT NULL,
+             refetch_after_ms INTEGER,
+             computed_ms INTEGER NOT NULL,
+             generation INTEGER NOT NULL,
+             last_used_ms INTEGER NOT NULL
+         ) STRICT;
+         CREATE TABLE IF NOT EXISTS context_cache_members (
+             cache_key TEXT NOT NULL REFERENCES context_cache (cache_key) ON DELETE CASCADE,
+             lineage_record_id TEXT NOT NULL,
+             PRIMARY KEY (cache_key, lineage_record_id)
+         ) STRICT;
+         CREATE INDEX IF NOT EXISTS context_cache_members_by_contribution
+             ON context_cache_members (lineage_record_id);",
     ),
 ];
 /// The file that marks a directory as a collaboration root.
@@ -482,6 +544,157 @@ impl CollaborationStore {
     pub(crate) fn connection(&mut self) -> &mut Connection {
         &mut self.connection
     }
+}
+
+/// Where `project`'s state lives for `main_root`, after the same checks
+/// [`open_for_repository`] makes, without creating or opening anything:
+/// the root, the resolved project directory, and whether its database
+/// exists yet. Inspection commands use it so that looking never writes.
+pub fn locate_for_repository(
+    main_root: &Path,
+    project: &ProjectKey,
+) -> Result<(CollaborationRoot, PathBuf, bool), CollaborationStateError> {
+    if !crate::host_state::host_state_dir_is_explicit()
+        && crate::host_state::path_is_ephemeral(main_root)
+    {
+        return Err(CollaborationStateError::EphemeralRepository {
+            repository: main_root.to_path_buf(),
+        });
+    }
+    let root = CollaborationRoot::resolve()?;
+    let resolved = check_location(root.path(), &forbidden_roots(main_root))?;
+    let project_dir = resolved.join(project.as_str());
+    let exists = project_dir.join(STATE_DATABASE).is_file();
+    Ok((root, project_dir, exists))
+}
+
+/// An existing project database opened read-only for inspection: no
+/// pragmas, migrations, floor changes or created files.
+#[derive(Debug)]
+pub struct CollaborationSnapshot {
+    pub project_dir: PathBuf,
+    pub schema_version: i64,
+    pub min_compatible_schema: i64,
+    /// The stored schema is older than this binary's; the next writable
+    /// open migrates it.
+    pub needs_migration: bool,
+    /// The profile writers open this database with: the filesystem, the
+    /// stored journal mode, and the per-connection flush settings every
+    /// writer applies (`synchronous=FULL`, `fullfsync`).
+    pub durability: DurabilityProfile,
+    connection: Connection,
+}
+
+impl CollaborationSnapshot {
+    pub(crate) fn connection(&self) -> &Connection {
+        &self.connection
+    }
+
+    /// Whether the stored schema has `table` (an older store may not).
+    pub(crate) fn has_table(&self, table: &str) -> bool {
+        self.connection
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                [table],
+                |_| Ok(()),
+            )
+            .optional()
+            .ok()
+            .flatten()
+            .is_some()
+    }
+}
+
+/// `project`'s database for `main_root`, opened read-only after the same
+/// location and permission checks as [`open_for_repository`], or `None`
+/// when it does not exist yet. Nothing is created, migrated or changed.
+pub fn inspect_for_repository(
+    main_root: &Path,
+    project: &ProjectKey,
+) -> Result<Option<CollaborationSnapshot>, CollaborationStateError> {
+    let (_, project_dir, exists) = locate_for_repository(main_root, project)?;
+    if !exists {
+        return Ok(None);
+    }
+    inspect_at(project_dir, project).map(Some)
+}
+
+/// [`inspect_for_repository`] for a located project directory that holds a
+/// database.
+pub(crate) fn inspect_at(
+    project_dir: PathBuf,
+    project: &ProjectKey,
+) -> Result<CollaborationSnapshot, CollaborationStateError> {
+    if let Some(root) = project_dir.parent() {
+        check_private(root)?;
+    }
+    check_private(&project_dir)?;
+    let database = project_dir.join(STATE_DATABASE);
+    let sqlite = |source| sqlite(&database, source);
+    let connection = Connection::open_with_flags(
+        &database,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(sqlite)?;
+    connection
+        .busy_timeout(std::time::Duration::from_secs(2))
+        .map_err(sqlite)?;
+    let meta = |key: &str| -> Result<Option<String>, CollaborationStateError> {
+        connection
+            .query_row("SELECT value FROM meta WHERE key = ?1", [key], |row| {
+                row.get(0)
+            })
+            .optional()
+            .map_err(|error| match error {
+                rusqlite::Error::SqliteFailure(_, Some(ref message))
+                    if message.contains("no such table") =>
+                {
+                    CollaborationStateError::NotACollaborationDatabase {
+                        path: database.clone(),
+                    }
+                }
+                other => sqlite(other),
+            })
+    };
+    let number = |key: &str| -> Result<i64, CollaborationStateError> {
+        meta(key)?
+            .and_then(|value| value.parse().ok())
+            .ok_or_else(|| CollaborationStateError::NotACollaborationDatabase {
+                path: database.clone(),
+            })
+    };
+    let schema_version = number("schema_version")?;
+    let min_compatible_schema = number("min_compatible_schema")?;
+    if min_compatible_schema > COLLABORATION_STATE_SCHEMA_VERSION {
+        return Err(CollaborationStateError::SchemaTooNew {
+            path: database,
+            found: schema_version,
+            min_compatible: min_compatible_schema,
+        });
+    }
+    match meta("project_key")? {
+        Some(owner) if owner == project.as_str() => {}
+        Some(owner) => {
+            return Err(CollaborationStateError::ProjectMismatch {
+                path: database,
+                expected: project.as_str().to_string(),
+                found: owner,
+            });
+        }
+        None => return Err(CollaborationStateError::NotACollaborationDatabase { path: database }),
+    }
+    let journal_mode: String = connection
+        .pragma_query_value(None, "journal_mode", |row| row.get(0))
+        .map_err(sqlite)?;
+    let durability = assess(&project_dir, journal_mode, 2, cfg!(target_os = "macos"));
+    Ok(CollaborationSnapshot {
+        project_dir,
+        schema_version,
+        min_compatible_schema,
+        needs_migration: schema_version < COLLABORATION_STATE_SCHEMA_VERSION,
+        durability,
+        connection,
+    })
 }
 
 /// Open `project`'s state under `<host state>/collaboration`, checked
@@ -803,6 +1016,16 @@ fn configure(connection: &Connection, directory: &Path) -> rusqlite::Result<Dura
         connection.pragma_query_value(None, "journal_mode", |row| row.get(0))?;
     let synchronous: i64 = connection.pragma_query_value(None, "synchronous", |row| row.get(0))?;
     let full_fsync: bool = connection.pragma_query_value(None, "fullfsync", |row| row.get(0))?;
+    Ok(assess(directory, journal_mode, synchronous, full_fsync))
+}
+
+/// The durability profile of a database in `directory` with these settings.
+fn assess(
+    directory: &Path,
+    journal_mode: String,
+    synchronous: i64,
+    full_fsync: bool,
+) -> DurabilityProfile {
     let (filesystem, local) = filesystem_of(directory);
     let mut limitations = Vec::new();
     if !local {
@@ -825,7 +1048,7 @@ fn configure(connection: &Connection, directory: &Path) -> rusqlite::Result<Dura
         limitations
             .push("fullfsync is off, so commits are not flushed past the drive cache".into());
     }
-    Ok(DurabilityProfile {
+    DurabilityProfile {
         filesystem,
         local,
         journal_mode,
@@ -833,7 +1056,7 @@ fn configure(connection: &Connection, directory: &Path) -> rusqlite::Result<Dura
         full_fsync,
         supported: limitations.is_empty(),
         limitation: (!limitations.is_empty()).then(|| limitations.join("; ")),
-    })
+    }
 }
 
 /// Filesystems whose flush behaviour the supported profile assumes.
@@ -1306,7 +1529,7 @@ mod tests {
         };
         let host = tempfile::tempdir().unwrap();
         let mut store = open(host.path(), &[]).unwrap();
-        assert_eq!(floor(&store), 4);
+        assert_eq!(floor(&store), MIN_COMPATIBLE_SCHEMA);
         // As a schema 3 binary left it.
         store
             .connection()
@@ -1317,8 +1540,69 @@ mod tests {
             .unwrap();
         drop(store);
         let store = open(host.path(), &[]).unwrap();
-        assert_eq!(store.schema_version(), 4);
-        assert_eq!(floor(&store), 4);
+        assert_eq!(store.schema_version(), COLLABORATION_STATE_SCHEMA_VERSION);
+        assert_eq!(floor(&store), MIN_COMPATIBLE_SCHEMA);
+    }
+
+    /// Migrations run in list order and skip versions at or below the
+    /// stored one, so a gap or a reordering would leave some store without
+    /// a step. They must be 2, 3, ... up to this binary's version.
+    #[test]
+    fn migrations_are_contiguous_and_end_at_this_binarys_version() {
+        let versions: Vec<i64> = MIGRATIONS.iter().map(|(version, _)| *version).collect();
+        let expected: Vec<i64> = (2..=COLLABORATION_STATE_SCHEMA_VERSION).collect();
+        assert_eq!(versions, expected);
+        const { assert!(MIN_COMPATIBLE_SCHEMA <= COLLABORATION_STATE_SCHEMA_VERSION) };
+        // A schema 4 binary's reclamation does not keep attached briefs; a
+        // schema 5 binary posts no broad-risk keys and purges no cache entry.
+        const { assert!(MIN_COMPATIBLE_SCHEMA >= 6) };
+    }
+
+    /// Inspection opens read-only: it reports a store that needs migration
+    /// without migrating it, refuses a newer floor and a foreign project, and
+    /// leaves every stored byte as it was.
+    #[test]
+    fn inspection_reads_without_migrating_or_writing() {
+        let host = tempfile::tempdir().unwrap();
+        let mut store = open(host.path(), &[]).unwrap();
+        store
+            .connection()
+            .execute(
+                "UPDATE meta SET value = '2' WHERE key = 'schema_version'",
+                [],
+            )
+            .unwrap();
+        let project_dir = store.project_dir().to_path_buf();
+        drop(store);
+        let database = project_dir.join("state.db");
+        let before = std::fs::read(&database).unwrap();
+
+        let snapshot = inspect_at(project_dir.clone(), &key("proj-a")).unwrap();
+        assert_eq!(snapshot.schema_version, 2);
+        assert!(snapshot.needs_migration);
+        assert!(!snapshot.has_table("no_such_table"));
+        assert!(snapshot.has_table("meta"));
+        drop(snapshot);
+        assert_eq!(
+            std::fs::read(&database).unwrap(),
+            before,
+            "inspection wrote"
+        );
+
+        let error = inspect_at(project_dir.clone(), &key("proj-b")).unwrap_err();
+        assert_eq!(error.code(), "project_mismatch", "{error}");
+
+        let mut store = open(host.path(), &[]).unwrap();
+        store
+            .connection()
+            .execute(
+                "UPDATE meta SET value = '999' WHERE key = 'min_compatible_schema'",
+                [],
+            )
+            .unwrap();
+        drop(store);
+        let error = inspect_at(project_dir, &key("proj-a")).unwrap_err();
+        assert_eq!(error.code(), "schema_too_new", "{error}");
     }
 
     const CRASH_CHILD: &str = "AETHYME_COLLABORATION_CRASH_CHILD";

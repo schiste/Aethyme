@@ -21,6 +21,7 @@ impl Broker {
             graph_impact_provider: Box::new(GraphStoreImpactProvider),
             host_operation_db_path: None,
             worktree_root_override: None,
+            collaboration_state_override: None,
             landing_deadline: std::cell::Cell::new(None),
             main_common_dir: std::cell::OnceCell::new(),
         })
@@ -43,6 +44,7 @@ impl Broker {
             graph_impact_provider: Box::new(GraphStoreImpactProvider),
             host_operation_db_path: None,
             worktree_root_override: None,
+            collaboration_state_override: None,
             landing_deadline: std::cell::Cell::new(None),
             main_common_dir: std::cell::OnceCell::new(),
         };
@@ -67,9 +69,14 @@ impl Broker {
             graph_impact_provider: Box::new(graph_impact_provider),
             host_operation_db_path: None,
             worktree_root_override: None,
+            collaboration_state_override: None,
             landing_deadline: std::cell::Cell::new(None),
             main_common_dir: std::cell::OnceCell::new(),
         };
+        // Fence pre-#660 binaries out of a repository whose committed config
+        // requires collaboration capture. Best effort: the open never fails
+        // because of it.
+        broker.collaboration_fence_state(FenceTrigger::Open);
         broker.backfill_live_repository_contracts()?;
         broker.reap_abandoned_prepared_operations()?;
         broker.recover_interrupted_promotion()?;
@@ -118,6 +125,105 @@ impl Broker {
     pub fn with_worktree_root(mut self, path: impl Into<PathBuf>) -> Self {
         self.worktree_root_override = Some(path.into());
         self
+    }
+
+    /// Keep collaboration state under `host_state` instead of the host state
+    /// directory, so a test never touches the real one.
+    #[doc(hidden)]
+    pub fn with_collaboration_state(mut self, host_state: impl Into<PathBuf>) -> Self {
+        self.collaboration_state_override = Some(host_state.into());
+        self
+    }
+
+    /// The collaboration fence for this repository (#660): raise
+    /// `broker.db`'s compatibility floor to [`crate::COLLABORATION_FENCE_SCHEMA`]
+    /// when the **committed** config requires capture, and report it.
+    ///
+    /// - Only the copy committed on the fetched default branch counts. An
+    ///   uncommitted or experimental `required`, or a feature branch checked
+    ///   out in the main checkout, never fences: the floor is never lowered.
+    /// - Once fenced, this is one meta query.
+    /// - Read-only stores (`query_only`: snapshot opens, the missing-database
+    ///   in-memory store, migrated temporary copies) never write; a fence the
+    ///   committed config requires is reported as `pending`.
+    /// - Never fails: a read or write error is warned about, and a raise that
+    ///   could not be written is reported as `pending`. The next writable
+    ///   status, submit or promotion retries.
+    pub(crate) fn collaboration_fence_state(
+        &self,
+        trigger: FenceTrigger<'_>,
+    ) -> Option<crate::CollaborationFence> {
+        let conn = self.store.connection();
+        match crate::schema::collaboration_fence(conn) {
+            Ok(Some(fence)) => return Some(fence),
+            Ok(None) => {}
+            Err(error) => {
+                crate::warn_unrecorded("read the collaboration fence", Err::<(), _>(error));
+                return None;
+            }
+        }
+        let loaded;
+        let config = match trigger {
+            // Opens run on every hook call: reach Git only when the working
+            // copy says required, then confirm against the committed copy.
+            FenceTrigger::Open => {
+                let text =
+                    std::fs::read_to_string(self.main_root.join(".aethyme/config.toml")).ok()?;
+                if !crate::collaboration_submit::requires_capture(
+                    &crate::collaboration_submit::setting_from_text(Some(&text)),
+                ) {
+                    return None;
+                }
+                loaded = crate::merge::repository_config_with_source(&self.main_root);
+                loaded.as_ref()
+            }
+            FenceTrigger::Config(config) => config,
+        };
+        let (text, "committed") = config.map(|(text, source)| (text.as_str(), *source))? else {
+            return None;
+        };
+        if !crate::collaboration_submit::requires_capture(
+            &crate::collaboration_submit::setting_from_text(Some(text)),
+        ) {
+            return None;
+        }
+        let read_only = conn
+            .pragma_query_value(None, "query_only", |row| row.get::<_, bool>(0))
+            .unwrap_or(true);
+        if read_only {
+            return Some(crate::CollaborationFence::pending());
+        }
+        match crate::schema::raise_collaboration_fence(conn, "committed")
+            .and_then(|()| crate::schema::collaboration_fence(conn))
+        {
+            Ok(Some(fence)) => Some(fence),
+            Ok(None) => Some(crate::CollaborationFence::pending()),
+            Err(error) => {
+                crate::warn_unrecorded(
+                    "raise the collaboration fence (the next status or submit retries)",
+                    Err::<(), _>(error),
+                );
+                Some(crate::CollaborationFence::pending())
+            }
+        }
+    }
+
+    /// Open `project`'s collaboration state for this repository.
+    pub(crate) fn collaboration_store(
+        &self,
+        project: &crate::collaboration_state::ProjectKey,
+    ) -> Result<
+        crate::collaboration_state::CollaborationStore,
+        crate::collaboration_state::CollaborationStateError,
+    > {
+        match &self.collaboration_state_override {
+            Some(host_state) => crate::collaboration_state::CollaborationStore::open(
+                &crate::collaboration_state::CollaborationRoot::under_host_state(host_state),
+                project,
+                &crate::collaboration_state::forbidden_roots(&self.main_root),
+            ),
+            None => crate::collaboration_state::open_for_repository(&self.main_root, project),
+        }
     }
 
     pub(crate) fn host_operation_database_path(&self) -> Result<PathBuf, BrokerOpError> {

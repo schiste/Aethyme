@@ -25,7 +25,11 @@ Kept, with everything they reach:
 | An object pin (`pin_object`), class `analysis_view` or `cited_evidence` | That one object |
 
 A snapshot reaches its manifest, its snapshot record and every blob. A contribution
-reaches its lineage record and both snapshots. If a live root cannot be resolved (its index
+reaches its lineage record, both snapshots, and its attached decision brief (#661, class
+`record`). A brief replaced by a later one is named by nothing and goes as an orphan. A
+reclaimed contribution's `contribution_briefs` row stays, like its other index rows,
+behind the reclaimed marker, so the foreign key always holds (tested with
+`foreign_key_check` after apply). If a live root cannot be resolved (its index
 row, manifest or any object is missing), reclamation is **blocked**, with blocker
 `dangling_root`. It never shrinks what is kept to fit.
 

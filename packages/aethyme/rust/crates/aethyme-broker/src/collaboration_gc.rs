@@ -85,6 +85,16 @@ pub fn archive_use(store: &CollaborationStore) -> std::io::Result<ArchiveUse> {
     Ok(ArchiveUse { _file: file })
 }
 
+/// [`archive_use`] without waiting: `None` while a reclamation applies.
+pub fn try_archive_use(store: &CollaborationStore) -> std::io::Result<Option<ArchiveUse>> {
+    let file = open_archive_lock(store)?;
+    match file.try_lock_shared() {
+        Ok(()) => Ok(Some(ArchiveUse { _file: file })),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+        Err(std::fs::TryLockError::Error(source)) => Err(source),
+    }
+}
+
 struct ArchiveExclusive {
     /// Closing the file releases the lock.
     _file: std::fs::File,
@@ -644,6 +654,26 @@ impl<'a> Closure<'a> {
             None => self
                 .problems
                 .push(format!("contribution {lineage} has a malformed record")),
+        }
+        // The decision brief attached to it (#661) is part of it: kept
+        // while it is, reclaimed with it. A superseded brief is named by
+        // nothing and goes as an orphan.
+        let brief: Option<String> = self
+            .store
+            .read_connection()
+            .query_row(
+                "SELECT brief_sha256 FROM contribution_briefs WHERE lineage_record_id = ?1",
+                [lineage],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(brief) = brief {
+            match parse_hex_digest(&brief) {
+                Some(digest) => self.object(digest, RetentionClass::Record),
+                None => self.problems.push(format!(
+                    "contribution {lineage} has a malformed brief digest"
+                )),
+            }
         }
         self.snapshot(&base)?;
         self.snapshot(&result)
@@ -1864,6 +1894,97 @@ mod tests {
         );
     }
 
+    /// An attached brief is part of its contribution: kept while the
+    /// contribution is live, reclaimed with it, and its row never breaks
+    /// the foreign key. A superseded brief is an orphan.
+    #[test]
+    fn an_attached_brief_lives_and_goes_with_its_contribution() {
+        use crate::collaboration_context::{LocalProject, attach_brief};
+        use aethyme_contracts::experimental_v0::brief::{Brief, Decision};
+        let brief = |reason: &str| Brief {
+            intent: "Keep keyboard search working".into(),
+            decisions: vec![Decision {
+                scope_ref: "a.txt".into(),
+                choice: "kept the id".into(),
+                reason: reason.into(),
+            }],
+            ..Brief::default()
+        };
+        let relpath = |brief: &Brief| object_relpath(&ObjectDigest::of(&brief.to_record().0));
+        let host = tempfile::tempdir().unwrap();
+        let (source, base, result) = repo("x");
+        let mut store = open(host.path());
+        let one = captured(
+            &mut store,
+            &request(
+                source.path(),
+                "op-1",
+                &base,
+                &result,
+                RetentionBoundary::UntilReleased,
+            ),
+        );
+        let (old, new) = (brief("old"), brief("new"));
+        attach_brief(&mut store, &one.contribution, &old).unwrap();
+        attach_brief(&mut store, &one.contribution, &new).unwrap();
+        age(&store);
+        let plan = plan(&mut store, &defaults()).unwrap();
+        let listed: Vec<&str> = objects(&plan)
+            .iter()
+            .map(|item| item.relpath.as_str())
+            .collect();
+        assert_eq!(
+            listed,
+            [relpath(&old).as_str()],
+            "only the superseded brief"
+        );
+        apply(&mut store, &plan.digest, &defaults()).unwrap();
+        assert!(store.project_dir().join(relpath(&new)).is_file());
+        let context = crate::collaboration_context::retrieve(
+            &mut store,
+            &crate::collaboration_context::ContextQuery {
+                scope: vec![b"a.txt".to_vec()],
+                source: None,
+                analysis: Vec::new(),
+                budget: Default::default(),
+            },
+            &LocalProject,
+        )
+        .unwrap();
+        assert_eq!(
+            context.contributions,
+            [one.contribution.as_str().to_string()]
+        );
+        assert!(context.selection.items[0].brief_included == Some(true));
+
+        assert!(release_retention(&mut store, "op-1").unwrap());
+        age(&store);
+        let plan = super::plan(&mut store, &defaults()).unwrap();
+        assert!(
+            objects(&plan)
+                .iter()
+                .any(|item| item.relpath == relpath(&new)),
+            "{:?}",
+            plan.reclaimable
+        );
+        apply(&mut store, &plan.digest, &defaults()).unwrap();
+        assert!(!store.project_dir().join(relpath(&new)).exists());
+        let rows: i64 = store
+            .read_connection()
+            .query_row("SELECT count(*) FROM contribution_briefs", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(rows, 1, "index rows stay behind the reclaimed marker");
+        let violations: i64 = store
+            .read_connection()
+            .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(violations, 0);
+    }
+
     /// T46: another root keeps shared source when one root is released.
     #[test]
     fn releasing_one_root_keeps_what_another_root_reaches() {
@@ -2360,6 +2481,34 @@ mod tests {
         );
         drop(exclusive);
         reader.join().unwrap().unwrap();
+    }
+
+    /// Advisory capture never waits for a reclamation (#660): while an apply
+    /// holds the archive, `try_capture` steps aside, and it captures once the
+    /// apply is done.
+    #[test]
+    fn a_non_blocking_capture_steps_aside_for_an_apply() {
+        let host = tempfile::tempdir().unwrap();
+        let (source, base, result) = repo("x");
+        let mut store = open(host.path());
+        let request = request(
+            source.path(),
+            "op-1",
+            &base,
+            &result,
+            RetentionBoundary::UntilReleased,
+        );
+        let exclusive = try_exclusive(&store).unwrap().unwrap();
+        assert!(
+            crate::collaboration_capture::try_capture(&mut store, &request)
+                .unwrap()
+                .is_none()
+        );
+        drop(exclusive);
+        assert!(matches!(
+            crate::collaboration_capture::try_capture(&mut store, &request).unwrap(),
+            Some(CaptureOutcome::Acknowledged(_))
+        ));
     }
 
     /// Grace is never shorter than a plan's lifetime.
