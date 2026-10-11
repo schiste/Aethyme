@@ -141,7 +141,7 @@ fn release(executor: &DockerExecutor, object: &Object) {
             object.id.as_deref().unwrap(),
             "/bin/sh",
             "-c",
-            "printf release > /tmp/qa-release",
+            "printf release > /outputs/qa-release",
         ],
     );
     assert!(output.status.success(), "release failed: {:?}", output);
@@ -239,7 +239,7 @@ fn actual_pressure_preserves_retained_source_and_bounded_native_cleanup() {
         tests::subject(executor.runtime().id(), image.clone());
     let mut stable_spec = stable_execution.spec().clone();
     stable_spec.build.arguments[1] =
-        "while ! test -f /tmp/qa-release; do sleep 0.05; done; printf actual > /outputs/artifact"
+        "while ! test -f /outputs/qa-release; do sleep 0.05; done; printf actual > /outputs/artifact"
             .into();
     stable_spec.profile.build_limits.timeout_ms = 300000;
     let stable_execution = snapshot::freeze(
@@ -315,7 +315,7 @@ fn actual_pressure_preserves_retained_source_and_bounded_native_cleanup() {
             for (label, command, expected) in [
                 (
                     "bounded-tmpfs-enospc",
-                    "dd if=/dev/zero of=/tmp/pressure bs=1048576 count=20 2>/outputs/pressure-proof; code=$?; test \"$code\" -ne 0 || exit 99; while ! test -f /tmp/qa-release; do sleep 0.05; done; exit 28",
+                    "dd if=/dev/zero of=/tmp/pressure bs=1048576 count=20 2>/outputs/pressure-proof; code=$?; test \"$code\" -ne 0 || exit 99; while ! test -f /outputs/qa-release; do sleep 0.05; done; exit 28",
                     Outcome::CodeFailed,
                 ),
                 (
