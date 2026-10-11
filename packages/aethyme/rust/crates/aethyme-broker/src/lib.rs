@@ -74,6 +74,7 @@ pub use gate_debris::{
     RuntimeResource, RuntimeResourceKind,
 };
 mod auto_cleanup;
+pub mod execution_snapshot;
 mod gate_doctor;
 mod gates;
 mod gc;
