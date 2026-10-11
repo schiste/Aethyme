@@ -1910,99 +1910,6 @@ pub fn read_recipe(store: &CollaborationStore, recipe: &RecipeRef) -> Result<Rec
     Ok(record)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_block_moved_elsewhere_is_a_move_even_reindented() {
-        let base = "a\nb\nc\nd\ne\nf\n";
-        let side = "a\n    d\n    e\n    f\nb\nc\n";
-        assert!(moves_a_block(base.as_bytes(), side.as_bytes()));
-    }
-
-    #[test]
-    fn edits_insertions_and_deletions_are_not_moves() {
-        let base = "a\nb\nc\nd\ne\n";
-        for side in [
-            "a\nB\nc\nd\ne\n",
-            "a\nb\nc\nd\ne\nf\ng\nh\n",
-            "a\ne\n",
-            "x\ny\nz\na\nb\nc\nd\ne\n",
-        ] {
-            assert!(!moves_a_block(base.as_bytes(), side.as_bytes()), "{side:?}");
-        }
-    }
-
-    #[test]
-    fn re_adding_fewer_lines_than_the_window_is_not_a_move() {
-        let base = "<ul>\n  <li>one</li>\n</ul>\n<p>text</p>\n";
-        let side = "<p>text</p>\n<ul>\n  <li>two</li>\n</ul>\n";
-        assert!(!moves_a_block(base.as_bytes(), side.as_bytes()));
-    }
-
-    #[test]
-    fn blank_lines_do_not_split_or_pad_a_moved_block() {
-        // The diff keeps the longer run p..u and moves a, b, (blank), c.
-        let base = "p\nq\nr\ns\nt\nu\na\nb\n\nc\n";
-        let side = "a\nb\n\nc\np\nq\nr\ns\nt\nu\n";
-        assert!(moves_a_block(base.as_bytes(), side.as_bytes()));
-    }
-
-    #[test]
-    fn deleting_one_of_two_identical_runs_is_ambiguous() {
-        let base =
-            "<ul>\n  <li>tip</li>\n  <li>more</li>\n  <li>tip</li>\n  <li>more</li>\n</ul>\n";
-        let side = "<ul>\n  <li>tip</li>\n  <li>more</li>\n</ul>\n";
-        assert!(deletes_a_twin(base.as_bytes(), side.as_bytes()));
-        // Indentation does not make a copy distinct.
-        let indented = "<ul>\n  <li>tip</li>\n  <li>more</li>\n      <li>tip</li>\n      <li>more</li>\n</ul>\n";
-        assert!(deletes_a_twin(indented.as_bytes(), side.as_bytes()));
-    }
-
-    #[test]
-    fn deleting_a_unique_run_or_changing_a_twin_is_not_ambiguous() {
-        let base = "a\nb\nc\nb\nd\n";
-        // A unique line goes.
-        assert!(!deletes_a_twin(base.as_bytes(), b"a\nb\nb\nd\n"));
-        // A twin is changed in place, not deleted.
-        assert!(!deletes_a_twin(base.as_bytes(), b"a\nB\nc\nb\nd\n"));
-        // Only a blank line goes.
-        assert!(!deletes_a_twin(b"a\n\nb\n\nc\n", b"a\nb\n\nc\n"));
-    }
-
-    #[test]
-    fn the_recorded_diff_engine_is_the_locked_version() {
-        let lock = std::fs::read_to_string(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../Cargo.lock"),
-        )
-        .unwrap();
-        let version = lock
-            .split("[[package]]")
-            .find(|package| package.contains("name = \"similar\""))
-            .and_then(|package| {
-                package
-                    .lines()
-                    .find_map(|line| line.strip_prefix("version = \""))
-                    .map(|rest| rest.trim_end_matches('"').to_string())
-            })
-            .expect("similar is locked");
-        assert!(
-            DIFF_ENGINE.starts_with(&format!("similar {version} ")),
-            "{DIFF_ENGINE} vs locked {version}"
-        );
-    }
-
-    #[test]
-    fn binary_is_git_s_nul_test() {
-        assert!(is_binary(b"abc\0def"));
-        assert!(!is_binary(b"plain text\n"));
-        let mut late = vec![b'a'; 8000];
-        late.push(0);
-        assert!(!is_binary(&late));
-    }
-}
-
 /// Independent editable checkout metadata from retained bytes. This reuses the
 /// candidate writer's raw CAS/blob/private-index plumbing, with no parent or
 /// dependency on an old Git object database. The caller supplies a new root.
@@ -2023,7 +1930,7 @@ pub(crate) fn generation_checkout(
         ],
         None,
     )?;
-    // A generated repository has no inherited user/system configuration or
+    // A generated repository copies no configuration from the old checkout or
     // remote. Disable hooks/fsmonitor persistently for later ordinary Git use.
     repo_git(repo, &["config", "core.hooksPath", "/dev/null"], None)?;
     repo_git(repo, &["config", "core.fsmonitor", "false"], None)?;
@@ -2169,4 +2076,97 @@ pub(crate) fn verify_generation_checkout(
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_block_moved_elsewhere_is_a_move_even_reindented() {
+        let base = "a\nb\nc\nd\ne\nf\n";
+        let side = "a\n    d\n    e\n    f\nb\nc\n";
+        assert!(moves_a_block(base.as_bytes(), side.as_bytes()));
+    }
+
+    #[test]
+    fn edits_insertions_and_deletions_are_not_moves() {
+        let base = "a\nb\nc\nd\ne\n";
+        for side in [
+            "a\nB\nc\nd\ne\n",
+            "a\nb\nc\nd\ne\nf\ng\nh\n",
+            "a\ne\n",
+            "x\ny\nz\na\nb\nc\nd\ne\n",
+        ] {
+            assert!(!moves_a_block(base.as_bytes(), side.as_bytes()), "{side:?}");
+        }
+    }
+
+    #[test]
+    fn re_adding_fewer_lines_than_the_window_is_not_a_move() {
+        let base = "<ul>\n  <li>one</li>\n</ul>\n<p>text</p>\n";
+        let side = "<p>text</p>\n<ul>\n  <li>two</li>\n</ul>\n";
+        assert!(!moves_a_block(base.as_bytes(), side.as_bytes()));
+    }
+
+    #[test]
+    fn blank_lines_do_not_split_or_pad_a_moved_block() {
+        // The diff keeps the longer run p..u and moves a, b, (blank), c.
+        let base = "p\nq\nr\ns\nt\nu\na\nb\n\nc\n";
+        let side = "a\nb\n\nc\np\nq\nr\ns\nt\nu\n";
+        assert!(moves_a_block(base.as_bytes(), side.as_bytes()));
+    }
+
+    #[test]
+    fn deleting_one_of_two_identical_runs_is_ambiguous() {
+        let base =
+            "<ul>\n  <li>tip</li>\n  <li>more</li>\n  <li>tip</li>\n  <li>more</li>\n</ul>\n";
+        let side = "<ul>\n  <li>tip</li>\n  <li>more</li>\n</ul>\n";
+        assert!(deletes_a_twin(base.as_bytes(), side.as_bytes()));
+        // Indentation does not make a copy distinct.
+        let indented = "<ul>\n  <li>tip</li>\n  <li>more</li>\n      <li>tip</li>\n      <li>more</li>\n</ul>\n";
+        assert!(deletes_a_twin(indented.as_bytes(), side.as_bytes()));
+    }
+
+    #[test]
+    fn deleting_a_unique_run_or_changing_a_twin_is_not_ambiguous() {
+        let base = "a\nb\nc\nb\nd\n";
+        // A unique line goes.
+        assert!(!deletes_a_twin(base.as_bytes(), b"a\nb\nb\nd\n"));
+        // A twin is changed in place, not deleted.
+        assert!(!deletes_a_twin(base.as_bytes(), b"a\nB\nc\nb\nd\n"));
+        // Only a blank line goes.
+        assert!(!deletes_a_twin(b"a\n\nb\n\nc\n", b"a\nb\n\nc\n"));
+    }
+
+    #[test]
+    fn the_recorded_diff_engine_is_the_locked_version() {
+        let lock = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../Cargo.lock"),
+        )
+        .unwrap();
+        let version = lock
+            .split("[[package]]")
+            .find(|package| package.contains("name = \"similar\""))
+            .and_then(|package| {
+                package
+                    .lines()
+                    .find_map(|line| line.strip_prefix("version = \""))
+                    .map(|rest| rest.trim_end_matches('"').to_string())
+            })
+            .expect("similar is locked");
+        assert!(
+            DIFF_ENGINE.starts_with(&format!("similar {version} ")),
+            "{DIFF_ENGINE} vs locked {version}"
+        );
+    }
+
+    #[test]
+    fn binary_is_git_s_nul_test() {
+        assert!(is_binary(b"abc\0def"));
+        assert!(!is_binary(b"plain text\n"));
+        let mut late = vec![b'a'; 8000];
+        late.push(0);
+        assert!(!is_binary(&late));
+    }
 }

@@ -20,6 +20,7 @@ struct Fixture {
     broker: Broker,
     carrier: GitCarrier,
     binding: RecordId,
+    evidence: crate::execution_verifier::TrustedEvidence,
     _remote: tempfile::TempDir,
 }
 impl Fixture {
@@ -120,8 +121,10 @@ impl Fixture {
             &intent.id,
         )
         .unwrap();
+        let evidence = v.evidence();
         Self {
             v,
+            evidence,
             broker,
             carrier,
             binding: binding.id().clone(),
@@ -138,7 +141,7 @@ impl Fixture {
     }
     fn prepare(&mut self, operation: &str) -> Result<PreparedGeneration, GenerationError> {
         let old = self.old();
-        let evidence = self.v.evidence();
+        let evidence = &self.evidence;
         let grant = acceptance::qualify(
             &mut self.v.f.store,
             &self.v.owner,
@@ -148,7 +151,7 @@ impl Fixture {
             &self.v.execution,
             &self.v.artifact,
             &self.v.permit,
-            &evidence,
+            evidence,
         )?;
         prepare(
             &mut self.v.f.store,
@@ -238,7 +241,7 @@ fn manifest_entry_path(store: &CollaborationStore, g: &PreparedGeneration) -> Pa
 fn interrupted_source_is_preserved_and_an_event_cannot_adopt() {
     let mut f = Fixture::new();
     let old = f.old();
-    let evidence = f.v.evidence();
+    let evidence = &f.evidence;
     let grant = acceptance::qualify(
         &mut f.v.f.store,
         &f.v.owner,
@@ -248,7 +251,7 @@ fn interrupted_source_is_preserved_and_an_event_cannot_adopt() {
         &f.v.execution,
         &f.v.artifact,
         &f.v.permit,
-        &evidence,
+        evidence,
     )
     .unwrap();
     let result = prepare_with(
@@ -308,7 +311,7 @@ fn interrupted_source_is_preserved_and_an_event_cannot_adopt() {
 fn changed_target_at_final_commit_refuses_a_prepared_receipt() {
     let mut f = Fixture::new();
     let old = f.old();
-    let evidence = f.v.evidence();
+    let evidence = &f.evidence;
     let grant = acceptance::qualify(
         &mut f.v.f.store,
         &f.v.owner,
@@ -318,7 +321,7 @@ fn changed_target_at_final_commit_refuses_a_prepared_receipt() {
         &f.v.execution,
         &f.v.artifact,
         &f.v.permit,
-        &evidence,
+        evidence,
     )
     .unwrap();
     let target_name = f.v.owner.target().to_string();
@@ -356,7 +359,7 @@ fn changed_target_at_final_commit_refuses_a_prepared_receipt() {
 fn provider_movement_during_materialization_refuses_the_generation() {
     let mut f = Fixture::new();
     let old = f.old();
-    let evidence = f.v.evidence();
+    let evidence = &f.evidence;
     let repo = f.v.f._repo.path().to_path_buf();
     let wrong = f.v.f.b.result.commit.as_str().to_string();
     let grant = acceptance::qualify(
@@ -368,7 +371,7 @@ fn provider_movement_during_materialization_refuses_the_generation() {
         &f.v.execution,
         &f.v.artifact,
         &f.v.permit,
-        &evidence,
+        evidence,
     )
     .unwrap();
     let result = prepare_with(
@@ -435,10 +438,12 @@ fn generation_roots_survive_target_release_and_a_preexisting_gc_plan() {
     // Plan while inputs are target-rooted; then generation creation changes the
     // root set, and target retirement cannot revoke the prepared source promise.
     let options = collaboration_gc::GcOptions {
-        grace_ms: 0,
-        ..Default::default()
+        grace_ms: collaboration_gc::PLAN_TTL_MS,
     };
+    let garbage = archive::put_object(&f.v.f.store, b"generation-gc-unreferenced-before").unwrap();
+    age_objects(&f.v.f.store);
     let plan = collaboration_gc::plan(&mut f.v.f.store, &options).unwrap();
+    assert!(!plan.reclaimable.is_empty());
     let g = f.prepare("roots").unwrap();
     f.v.f
         .store
@@ -454,6 +459,9 @@ fn generation_roots_survive_target_release_and_a_preexisting_gc_plan() {
                 .is_some()
         );
     }
+    assert!(archive::read_object(&f.v.f.store, &garbage).is_err());
+    archive::put_object(&f.v.f.store, b"generation-gc-unreferenced-after").unwrap();
+    age_objects(&f.v.f.store);
     let fresh = collaboration_gc::plan(&mut f.v.f.store, &options).unwrap();
     assert!(fresh.blockers.is_empty(), "{:?}", fresh.blockers);
     let _report = collaboration_gc::apply(&mut f.v.f.store, &fresh.digest, &options).unwrap();
@@ -471,7 +479,7 @@ fn generation_roots_survive_target_release_and_a_preexisting_gc_plan() {
 fn producer_revocation_during_copy_prevents_prepared_receipt() {
     let mut f = Fixture::new();
     let old = f.old();
-    let evidence = f.v.evidence();
+    let evidence = &f.evidence;
     let grant = acceptance::qualify(
         &mut f.v.f.store,
         &f.v.owner,
@@ -481,7 +489,7 @@ fn producer_revocation_during_copy_prevents_prepared_receipt() {
         &f.v.execution,
         &f.v.artifact,
         &f.v.permit,
-        &evidence,
+        evidence,
     )
     .unwrap();
     let owner = &f.v.owner;
@@ -529,7 +537,7 @@ fn fresh_qualification_replays_the_same_operation_but_changed_observation_does_n
     assert_eq!(f.prepare("stable-operation").unwrap(), g);
     let mut old = f.old();
     old.session = "different-agent".into();
-    let evidence = f.v.evidence();
+    let evidence = &f.evidence;
     let grant = acceptance::qualify(
         &mut f.v.f.store,
         &f.v.owner,
@@ -539,7 +547,7 @@ fn fresh_qualification_replays_the_same_operation_but_changed_observation_does_n
         &f.v.execution,
         &f.v.artifact,
         &f.v.permit,
-        &evidence,
+        evidence,
     )
     .unwrap();
     assert!(matches!(
@@ -590,7 +598,7 @@ fn an_existing_symlink_destination_is_never_followed_or_overwritten() {
     {
         let mut f = Fixture::new();
         let old = f.old();
-        let evidence = f.v.evidence();
+        let evidence = &f.evidence;
         let grant = acceptance::qualify(
             &mut f.v.f.store,
             &f.v.owner,
@@ -600,7 +608,7 @@ fn an_existing_symlink_destination_is_never_followed_or_overwritten() {
             &f.v.execution,
             &f.v.artifact,
             &f.v.permit,
-            &evidence,
+            evidence,
         )
         .unwrap();
         let foreign = tempfile::tempdir().unwrap();
@@ -634,5 +642,75 @@ fn an_existing_symlink_destination_is_never_followed_or_overwritten() {
         assert!(matches!(result, Err(GenerationError::Incomplete)));
         assert_eq!(std::fs::read(marker).unwrap(), b"unrelated");
         assert_eq!(std::fs::read_dir(foreign.path()).unwrap().count(), 1);
+    }
+}
+fn age_objects(store: &CollaborationStore) {
+    let root = archive::objects_dir(store);
+    for prefix in std::fs::read_dir(root).unwrap() {
+        for object in std::fs::read_dir(prefix.unwrap().path()).unwrap() {
+            File::open(object.unwrap().path())
+                .unwrap()
+                .set_times(
+                    std::fs::FileTimes::new().set_modified(std::time::SystemTime::UNIX_EPOCH),
+                )
+                .unwrap();
+        }
+    }
+}
+#[test]
+fn a_prepared_generation_can_be_the_old_dirty_workspace_of_the_next() {
+    let mut f = Fixture::new();
+    let g1 = f.prepare("g1").unwrap();
+    let dirty = g1.absolute_root().join("next-unsubmitted.txt");
+    std::fs::write(&dirty, b"agent's ongoing work").unwrap();
+    let old = OldWorkspace {
+        session: "agent-g1".into(),
+        absolute_root: g1.absolute_root().to_path_buf(),
+        generation: Some(g1.id().to_string()),
+        pending_contributions: g1.intent.old.pending_contributions.clone(),
+    };
+    let grant = acceptance::qualify(
+        &mut f.v.f.store,
+        &f.v.owner,
+        &mut f.broker,
+        &f.carrier,
+        &f.binding,
+        &f.v.execution,
+        &f.v.artifact,
+        &f.v.permit,
+        &f.evidence,
+    )
+    .unwrap();
+    let g2 = prepare(
+        &mut f.v.f.store,
+        &f.v.owner,
+        &mut f.broker,
+        &f.carrier,
+        &grant,
+        "g2",
+        old.clone(),
+    )
+    .unwrap();
+    assert_ne!(g1.absolute_root(), g2.absolute_root());
+    assert_eq!(g2.intent.old, old);
+    assert_eq!(std::fs::read(&dirty).unwrap(), b"agent's ongoing work");
+    assert!(!g2.absolute_root().join("next-unsubmitted.txt").exists());
+    assert_eq!(load_prepared(&f.v.f.store, g2.id()).unwrap(), g2);
+}
+#[test]
+fn a_symlinked_generation_ancestor_cannot_reuse_a_prepared_receipt() {
+    #[cfg(unix)]
+    {
+        let mut f = Fixture::new();
+        let g = f.prepare("ancestor").unwrap();
+        let original = g.absolute_root().parent().unwrap();
+        let moved = original.with_extension("moved");
+        std::fs::rename(original, &moved).unwrap();
+        std::os::unix::fs::symlink(&moved, original).unwrap();
+        assert!(matches!(
+            load_prepared(&f.v.f.store, g.id()),
+            Err(GenerationError::Incomplete)
+        ));
+        assert!(moved.join("source/.git").exists());
     }
 }

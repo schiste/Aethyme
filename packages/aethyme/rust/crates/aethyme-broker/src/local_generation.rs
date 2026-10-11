@@ -168,24 +168,36 @@ fn directory(store: &CollaborationStore, generation: &RecordId) -> PathBuf {
             .expect("RecordId digest"),
     )
 }
+fn check_private_directory(path: &Path) -> Result<(), GenerationError> {
+    let m = std::fs::symlink_metadata(path)?;
+    if !m.is_dir() || m.file_type().is_symlink() || path.canonicalize()? != path {
+        return Err(GenerationError::Incomplete);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        // SAFETY: geteuid takes no pointers and only reads the process identity.
+        let uid = unsafe { libc::geteuid() };
+        if m.mode() & 0o077 != 0 || m.uid() != uid {
+            return Err(invalid("generation directory ownership or permissions"));
+        }
+    }
+    Ok(())
+}
 fn private_directory(path: &Path) -> Result<(), GenerationError> {
     match std::fs::create_dir(path) {
         Ok(()) => crate::host_state::protect_host_state_path(path, true)?,
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
         Err(e) => return Err(e.into()),
     }
-    let m = std::fs::symlink_metadata(path)?;
-    if !m.is_dir() || m.file_type().is_symlink() {
-        return Err(invalid("generation directory is not a real directory"));
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        if m.mode() & 0o077 != 0 || m.uid() != unsafe { libc::geteuid() } {
-            return Err(invalid("generation directory ownership or permissions"));
-        }
-    }
-    Ok(())
+    check_private_directory(path)
+}
+fn check_generation_path(
+    store: &CollaborationStore,
+    generation: &RecordId,
+) -> Result<(), GenerationError> {
+    check_private_directory(&store.project_dir().join("generations"))?;
+    check_private_directory(&directory(store, generation))
 }
 fn unchanged_old(
     store: &CollaborationStore,
@@ -200,9 +212,11 @@ fn unchanged_old(
     let canonical = old.absolute_root.canonicalize()?;
     if canonical != old.absolute_root
         || !std::fs::symlink_metadata(&canonical)?.is_dir()
-        || canonical.starts_with(store.project_dir())
         || store.project_dir().starts_with(&canonical)
     {
+        return Err(invalid("old workspace aliases generation storage"));
+    }
+    if canonical.starts_with(store.project_dir()) && old.generation.is_none() {
         return Err(invalid("old workspace aliases generation storage"));
     }
     let mut pending = BTreeSet::new();
@@ -320,6 +334,7 @@ pub fn load_prepared(
     store: &CollaborationStore,
     generation: &RecordId,
 ) -> Result<PreparedGeneration, GenerationError> {
+    let _archive = collaboration_gc::archive_use(store)?;
     let result = inspect_prepared(store, generation)?;
     let manifest = snapshot(store, &result.intent.source)?;
     verify_checkout(&result.root, &manifest, &result.mapping)?;
@@ -351,6 +366,7 @@ fn inspect_prepared(
     {
         return Err(invalid("prepared source mapping"));
     }
+    check_generation_path(store, generation)?;
     let root = directory(store, generation).join("source");
     if archive::read_object(store, &ObjectDigest::of(&body))? != body
         || archive::read_object(store, &ObjectDigest::of(&prepared))? != prepared
@@ -519,6 +535,10 @@ fn prepare_with(
         } else {
             tx.execute("INSERT INTO local_generations(id,target,operation,revision,epoch,state,body) VALUES(?1,?2,?3,?4,?5,'intent',?6)",params![generation.as_str(),owner.target(),operation,spec.revision,spec.epoch,intent.canonical_bytes()])?;
         }
+        // Retain complete native provenance, including evidence/input/policy
+        // records already rooted by this exact revision. These are historical
+        // source promises, not copied current permissions or executable leases.
+        tx.execute("INSERT OR IGNORE INTO local_generation_roots(generation,kind,reference) SELECT ?1,kind,reference FROM local_target_roots WHERE revision=?2",params![generation.as_str(),spec.revision])?;
         roots(&tx, &generation, "snapshot", &spec.source)?;
         for contribution in &spec.old.pending_contributions {
             roots(&tx, &generation, "contribution", contribution)?;
@@ -563,10 +583,12 @@ fn prepare_with(
     let receipt = record(&PREPARED, &mapping)?;
     write_sync(&dir.join("intent.json"), &intent.canonical_bytes())?;
     write_sync(&dir.join("prepared.json"), &receipt.canonical_bytes())?;
+    check_generation_path(store, &generation)?;
     sync_tree(&dir)?;
     File::open(&generations)?.sync_all()?;
     hook(Stage::Durable, store)?;
     let guard = acceptance::current_guard(store, owner, broker, carrier, grant)?;
+    check_generation_path(store, &generation)?;
     // Independent checks use the same held native owner and its original grant.
     verify_checkout(&root, &manifest, &mapping)?;
     let object = archive::put_object(store, &receipt.canonical_bytes())?;
