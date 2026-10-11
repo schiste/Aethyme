@@ -826,6 +826,27 @@ fn survey(
             None => live.problems.push(format!("pin of {digest} is malformed")),
         }
     }
+    // L5 roots do not expire with a worker or capture lease. Explicit owner
+    // release of an inactive revision is their only reclamation boundary.
+    let target_roots: Vec<(String, String)> = connection
+        .prepare("SELECT kind, reference FROM local_target_roots")?
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<Result<_, _>>()?;
+    for (kind, reference) in target_roots {
+        match kind.as_str() {
+            "snapshot" => live.snapshot(&reference)?,
+            "contribution" => live.contribution(&reference)?,
+            "object" => match parse_hex_digest(&reference) {
+                Some(digest) => live.object(digest, RetentionClass::Record),
+                None => live
+                    .problems
+                    .push(format!("target root {reference} is malformed")),
+            },
+            _ => live
+                .problems
+                .push(format!("unknown target root kind {kind}")),
+        }
+    }
     for problem in std::mem::take(&mut live.problems) {
         blockers.push(GcBlocker {
             kind: "dangling_root",

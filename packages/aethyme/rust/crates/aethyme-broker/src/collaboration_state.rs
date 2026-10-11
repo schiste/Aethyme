@@ -37,7 +37,7 @@ use serde::Serialize;
 pub use crate::host_state::HostStateSource;
 
 /// The schema this binary writes.
-pub const COLLABORATION_STATE_SCHEMA_VERSION: i64 = 6;
+pub const COLLABORATION_STATE_SCHEMA_VERSION: i64 = 7;
 /// The oldest schema a database written by this binary can be read by.
 /// Unlike `host-operations.db`, a newer database stays readable by an older
 /// binary until a release raises this floor.
@@ -53,7 +53,9 @@ pub const COLLABORATION_STATE_SCHEMA_VERSION: i64 = 6;
 /// binary could serve a cached answer a broad change should have
 /// invalidated. No release shipped schemas 2 to 5, so nothing that exists
 /// is locked out.
-const MIN_COMPATIBLE_SCHEMA: i64 = 6;
+// Schema 6 reclamation cannot see local target roots and would delete live
+// controller inputs. Such a binary must refuse this store before writing.
+const MIN_COMPATIBLE_SCHEMA: i64 = 7;
 const ROOT_DIRECTORY: &str = "collaboration";
 /// Additive schema steps after the version 1 layout (`meta` only), applied in
 /// order. Each only adds tables; after migrating, the compatibility floor is
@@ -241,6 +243,49 @@ const MIGRATIONS: &[(i64, &str)] = &[
          ) STRICT;
          CREATE INDEX IF NOT EXISTS context_cache_members_by_contribution
              ON context_cache_members (lineage_record_id);",
+    ),
+    (
+        7,
+        // L5 targets and their permanent roots. Adopt #665's existing lazy
+        // attempt ledger without replacing rows or replenishing allowances.
+        "CREATE TABLE IF NOT EXISTS local_targets (
+             target TEXT PRIMARY KEY NOT NULL,
+             issuer TEXT NOT NULL,
+             active_revision TEXT,
+             phase TEXT NOT NULL DEFAULT 'disabled',
+             resume_phase TEXT,
+             version INTEGER NOT NULL DEFAULT 0
+         ) STRICT;
+         CREATE TABLE IF NOT EXISTS local_target_revisions (
+             revision TEXT PRIMARY KEY NOT NULL,
+             target TEXT NOT NULL REFERENCES local_targets (target),
+             body BLOB NOT NULL,
+             released INTEGER NOT NULL DEFAULT 0 CHECK (released IN (0, 1))
+         ) STRICT;
+         CREATE TABLE IF NOT EXISTS local_target_dispositions (
+             revision TEXT NOT NULL REFERENCES local_target_revisions (revision),
+             contribution TEXT NOT NULL,
+             status TEXT NOT NULL,
+             detail TEXT,
+             PRIMARY KEY (revision, contribution)
+         ) STRICT;
+         CREATE TABLE IF NOT EXISTS local_target_roots (
+             revision TEXT NOT NULL REFERENCES local_target_revisions (revision),
+             kind TEXT NOT NULL CHECK (kind IN ('snapshot', 'contribution', 'object')),
+             reference TEXT NOT NULL,
+             PRIMARY KEY (revision, kind, reference)
+         ) STRICT;
+         CREATE TABLE IF NOT EXISTS resolution_attempts (
+             attempt_id INTEGER PRIMARY KEY,
+             decision_key TEXT NOT NULL,
+             kind TEXT NOT NULL,
+             members TEXT NOT NULL,
+             paths TEXT NOT NULL,
+             request_record_id TEXT NOT NULL,
+             resolver TEXT NOT NULL,
+             outcome TEXT,
+             charged_ms INTEGER NOT NULL
+         ) STRICT;",
     ),
 ];
 /// The file that marks a directory as a collaboration root.

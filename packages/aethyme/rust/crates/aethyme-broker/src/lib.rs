@@ -94,6 +94,7 @@ pub mod install_replacement;
 mod issue_form;
 mod lease_export;
 mod leases;
+pub mod local_target;
 mod main_drift;
 pub mod main_reconcile;
 mod measurement;
