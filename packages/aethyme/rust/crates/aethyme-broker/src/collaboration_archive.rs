@@ -1579,7 +1579,7 @@ pub fn retained_contribution(
     }))
 }
 
-fn parse_digest(hex: &str) -> Option<ObjectDigest> {
+pub(crate) fn parse_digest(hex: &str) -> Option<ObjectDigest> {
     if !is_lower_hex(hex, &[64]) {
         return None;
     }
@@ -2835,7 +2835,7 @@ mod tests {
         store
             .connection()
             .execute_batch(
-                "DROP TABLE local_generation_roots; DROP TABLE local_generation_receipts; DROP TABLE local_generations; DROP TABLE local_acceptance_qualifications; DROP TABLE local_acceptance_receipts; DROP TABLE local_acceptance_bindings; DROP TABLE local_source_transport_receipts; DROP TABLE local_source_transports; DROP TABLE local_verification_evidence; DROP TABLE local_verifier_producers; DROP TABLE local_authority_state; DROP TABLE local_wave_arrivals; DROP TABLE local_waves;
+                "DROP TABLE local_exchange_messages; DROP TABLE local_exchange_deliveries; DROP TABLE local_exchange_streams; DROP TABLE local_exchange_events; DROP TABLE local_exchange_projection; DROP TABLE local_exchange_observations; DROP TABLE local_exchange_bindings; DROP TRIGGER outbox_capture_insert; DROP TRIGGER outbox_capture_update; DROP TRIGGER outbox_capture_delete; DROP TABLE local_generation_roots; DROP TABLE local_generation_receipts; DROP TABLE local_generations; DROP TABLE local_acceptance_qualifications; DROP TABLE local_acceptance_receipts; DROP TABLE local_acceptance_bindings; DROP TABLE local_source_transport_receipts; DROP TABLE local_source_transports; DROP TABLE local_verification_evidence; DROP TABLE local_verifier_producers; DROP TABLE local_authority_state; DROP TABLE local_wave_arrivals; DROP TABLE local_waves;
                  DROP TABLE retained_contributions; DROP TABLE retained_snapshots;
                  UPDATE meta SET value = '1' WHERE key = 'schema_version';",
             )
