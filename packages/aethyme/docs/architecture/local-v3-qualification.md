@@ -1,73 +1,115 @@
 # Local v3 qualification (#682)
 
-Last Updated: 2026-10-11
+Last Updated: 2026-10-12
 
 ## Scope and status
 
-This package assembles Local qualification against plan v3 §15.1/§15.2. It
-records exact source, execution environment, fixture profile, command, output
-digest, denominator, failure classification, limitations and independent review
-for each claim. It does not grant remote acceptance, adoption or publication.
-The shared records and all composition-dependent runtime profiles remain
-experimental/provisional until E1 (#650) replaces the provisional evidence.
+This ledger covers the Local work packages in plan v3 §15.1/§15.2. It records
+source commit and tree, finite execution profile, exact command, actual exit,
+output digest, denominator, failure classification and remaining requirements.
+An observation or transcript never grants current execution, provider, agent or
+publication authority.
 
-The current checkpoint is a contract and evidence inventory. Q3 and Q4 are not
-closed by this document. A failed or missing required positive blocks its
-associated claim; independent legacy Local operations remain available.
+The pinned native operator profile passed before and after three deliberate
+proof removals. It joined retained capture and advisory context, a finite
+provisional candidate wave, native Docker build, an independent artifact-only
+verifier, private generic Git acceptance, controlled new-root adoption and an
+isolated historical receiver. This is evidence for the declared finite profile.
+Q3, Q4 and the whole Local plan remain open: structural composition requires E1,
+native gate integration requires #725, live GitHub/Mergify requires an appointed
+Playground binding, and matched context trials require reviewed FX08 tasks.
+The command surface also has its own separate draft and validation.
 
-## Qualification rows
+## Evidence inventory
 
-| Local surface | Reviewable implementation | Qualification still to assemble |
+| Local surface | Implementations | Evidence and remaining qualification |
 |---|---|---|
-| Revision-bound identity, records, briefs and analysis | L0/L1 (#704–#710) | Exact source and independent vector artifacts; AQ0 baseline only |
-| Retained source, crash capture, roots and GC | L2 (#714–#719) | Cleanup/crash traces and resource-pressure preservation |
-| Useful bounded contribution context | L3 (#718/#730), X2 fresh views (#731) | FX08/FX17 matched correct/absent/misleading briefs with full denominator |
-| Candidate composition and bounded resolution | Provisional L4 (#733–#736) | E1 replacement and T16–T23 requalification; historical held-out trials are not rerun |
-| Target revisions, finite waves, budgets and external epoch | L5 (#737–#740) | Q4 progress, stop, arrival and restore trace bundle |
-| Exact execution, supervisor, trusted verifier, resources | L6 (#741–#744) | Q3 negatives/positives and actual bounded ENOSPC/OOM with GC/concurrent work |
-| Source transport and provider observation | L7 (#745/#746) | Native gate join after #725; actual GitHub/Mergify needs designated Playground binding |
-| Prepared generation, exchange and controlled agent handoff | L8 (#747–#749) | Final restored test/guard artifacts and real owned process receipts |
-| Retained export and isolated source rehearsal | Export (#750) | Final guard artifacts; actual independent receiver build after origin deletion |
-| Disable/version/old binary/offline/rebind behavior | Compatibility (#751) | Full current CLI parity and actual independently pinned old process runs |
+| Revision identities, records, briefs and analysis envelope | #704–#710 | Independent canonical vectors and baseline AQ0 fixtures; records remain experimental |
+| Retained source, capture, roots and GC | #714–#719 | Capture/crash/cleanup schedules; native workload-pressure preservation below; global capture/hydration ENOSPC unqualified |
+| Bounded context and fresh analysis views | #718/#730/#731 | Scoped invalidation schedules; [FX08 proposed tasks](local-v3-qualification/fx08-task-proposal.md) await review before construction and freeze |
+| Composition and bounded resolution | #733–#736 | Provisional frozen fixtures; E1 must replace evidence and requalify T16–T23; held-outs are not rerun; [reachable request guards](local-v3-qualification/resolution-guards-2026-10-12.json) |
+| Targets, finite waves, budgets and native epoch | #737–#740 | Transition, arrival, reservation, stop and stale-authority schedules; finite native joined path below |
+| Exact execution, supervisor, verifier and resources | #741–#744 | Independent negative profiles and artifact checks; actual bounded tmpfs ENOSPC and cgroup OOM below; native gate join pending |
+| Source publication and acceptance | #745/#746 | Real private generic Git and native appointed observations; live GitHub/Mergify binding pending |
+| Generation, exchange and controlled handoff | #747–#749 | Real child/open-file schedules; [handoff regression ledger](local-v3-qualification/handoff-restored-2026-10-11.json); real controlled native joined path below |
+| Retained export and isolated rehearsal | #750 | Independent receiver build after origin deletion; [restore regression and guard ledger](local-v3-qualification/restore-restored-2026-10-11.json); source/history only |
+| Disable, old binary, offline and paired CLI behavior | #751 | [Native compatibility ledger](local-v3-qualification/compatibility-native-2026-10-12.json); one pinned old binary and a declared finite paired-command set |
+| Explicit lifecycle commands | #732 and #753 | Earlier retained-state commands and new target/authority/stop/export/inspection commands; separate CLI execution and help validation pending |
 
-## Runtime and pressure protocol
+Each artifact names its tested source. A later parent fix does not turn
+historical evidence into evidence for a newer tree. Selected regression
+executions overlap; totals are executions, not unique tests.
 
-Use disposable Playground source fixtures and only owned temporary roots,
-containers, volumes and child PIDs. Pin native executable, daemon, image,
-execution and verifier policy identities. Keep finite candidate/job/byte/time
-budgets. Preserve unacknowledged and unknown effects until native reconciliation.
+## Restored selected regressions
 
-Actual ENOSPC qualification may fill only a small owned tmpfs mount inside an
-owned bounded Linux container. It proves workload-filesystem exhaustion, not
-Docker daemon-storage exhaustion or global host-disk exhaustion. Pair it with
-real retained CAS GC and an independent concurrent build; verify exact retained
-bytes, rejected pass/artifact classification, and the owned cleanup inventory.
-The same preservation/cleanup assertions apply to bounded cgroup OOM. No
-condition may produce a verifier pass. A nonzero workload exit is reported as
-CodeFailed by the current supervisor; cgroup OOM has a native runtime witness
-and is InfrastructureDeferred. These two classifications are not equivalent.
+The [restored Local ledger](local-v3-qualification/local-restored-2026-10-12.json)
+records 500 passing selected executions, zero failures, 13 explicit ignores and
+strict Clippy with `--lib --tests -D warnings`, all at source
+`f61a6de32de4284269dc0e739df8f3193e3cfb65`. Counts overlap across selections.
+Ignored native profiles are credited only by their separately recorded explicit
+invocations. Final-head CI and independent review remain separate checks.
 
-All scheduled trials count, including infrastructure-deferred and unsupported
-ones. A named test must actually run; compiler failures and zero-test runs are
-not evidence. Guard-removal trials count only when the intended assertion fails
-and exact source restoration is followed by passing checks. Reviewers use
-separate read-only snapshots; review clearance is distinct from runtime evidence.
+## Native operator and pressure profile
 
-## Claim records
+[Native commands and proof ledger](local-v3-qualification/native-pressure-flow-2026-10-12.json)
+records four scheduled profile attempts: 12 command runs, 10 executed and two
+unrun after failed pressure assertions. The positive-test denominator is 20:
+16 passed, two failed and two unrun. The final two attempts each passed all
+five tests (three bounded native-control helpers, one pressure schedule and one
+joined-path schedule). Neither failed attempt is credited as a pressure pass.
 
-The evidence ledger will store independent per-command records with source
-commit/tree, fixture/profile, host/runtime identities, exact argv and environment
-names, exit status, output SHA-256, passed/failed/ignored counts, and explicit
-claim boundaries. No credentials or private exploit details belong in public
-artifacts. A transcript digest alone is not a test result or authority receipt.
-A later parent fix requires applicable rows to be rerun or explicitly retained as
-historical evidence of their old source version.
+The Docker CLI, Linux/aarch64 daemon and cached image are pinned in the ledger.
+The pressure schedule performs an actual write past a 16 MiB owned tmpfs limit,
+observes the kernel ENOSPC diagnostic, and separately exhausts an owned 64 MiB
+cgroup. A concurrently running independent build uses its own retained source
+and survives both pressure trials. Real retained CAS GC runs alongside it;
+retained source bytes, execution classifications and exact owned cleanup are
+checked afterward. Native absence checks parse Docker's empty JSON collection
+and require a failed inspect naming the exact owned ID. No global prune runs.
 
-## Required rechecks
+ENOSPC produces CodeFailed with exit 28 and no artifact; native cgroup OOM
+produces InfrastructureDeferred and no artifact. Neither is a verifier pass.
+This qualifies only workload tmpfs and bounded cgroup pressure. Docker daemon
+storage, global host disk and source capture/hydration disk exhaustion remain
+unqualified under D25.
 
-E1 must requalify all composition-dependent L1–L9 claims. #725 must land before
-native verification candidate/gate integration. The operator must supply the
-intended disposable GitHub/Mergify repository, branch and policy before live
-provider qualification. Existing source receipts, provider observations,
-metadata receipts, prepared roots, READY/adoption receipts and imported history
-retain their separate meanings throughout these rechecks.
+The joined path uses an independent assertion inventory selected before the
+build and an external verifier with artifact-only access. Its source provider
+is a private bare Git repository. An actual controlled child acknowledges the
+new physical root and writes a file unique to it; an old open file remains in
+the old root. The isolated receiver verifies the selected source IDs and four
+historical CAP/context/brief/lineage records, then binds a fresh native epoch.
+Its imported history supplies no current verifier, provider or agent authority.
+This path does not qualify a background daemon, an autonomous CLI runner or a
+live GitHub/Mergify integration.
+
+## Proof removals and provenance
+
+Three deliberate removals each failed the intended named assertion with actual
+exit 101: a cached native result bypassing the deadline, omission of the unique
+new-root output, and omission of the four selected historical records. The
+recorder persisted numeric process status, counts and output/source hashes.
+Exact source bytes were restored before the final positive profile. Compiler
+failures, zero-test runs and unrelated assertion failures are not credited.
+
+The resolution guard ledger separately covers schema-valid archived requests
+with changed decision kind, scope or protected paths. Its numeric status
+provenance is the serial runner and root-observed terminal results; complete
+output hashes independently establish the named outcomes. It does not claim
+every decision-key/path comparison arm was removed.
+
+## Remaining Local requirements
+
+E1 (#650) is separately owned. When it lands, replace provisional fixture
+claims, adopt the selected structural engine as a new profile and requalify
+composition-dependent Local claims. Frozen fixtures are not edited to improve
+results. #725 must land before native verification candidate/gate integration;
+its schema collision with #719/#722 also requires integration-time reconciliation.
+
+The operator must designate the disposable GitHub/Mergify repository, branch
+and policy before live-provider trials. FX08 task descriptions must be reviewed
+before their fixtures are constructed and frozen; the matched correct,
+absent and misleading brief trials retain every scheduled outcome. Optional
+analysis profiles require their separate decisions and applicable qualification.
+These outstanding requirements are not replaced by unit success or private
+provider traces.
