@@ -705,27 +705,16 @@ fn independent_source_build_survives_contributor_storage_destruction() {
         "fn main() { println!(\"restored Playground\"); }\n",
     )
     .unwrap();
-    for args in [
-        vec!["add", "main.rs"],
-        vec!["commit", "-qm", "ordinary Playground Rust source"],
-    ] {
-        let status = std::process::Command::new("git")
-            .arg("-C")
-            .arg(f.f._repo.path())
-            .args(args)
-            .status()
-            .unwrap();
-        assert!(status.success());
-    }
-    let commit = std::process::Command::new("git")
-        .arg("-C")
-        .arg(f.f._repo.path())
-        .args(["rev-parse", "HEAD"])
-        .output()
-        .unwrap();
-    assert!(commit.status.success());
-    let commit =
-        archive::CommitOid::parse(std::str::from_utf8(&commit.stdout).unwrap().trim()).unwrap();
+    crate::local_target::tests::git(f.f._repo.path(), &["add", "main.rs"]);
+    crate::local_target::tests::git(
+        f.f._repo.path(),
+        &["commit", "-qm", "ordinary Playground Rust source"],
+    );
+    let commit = archive::CommitOid::parse(&crate::local_target::tests::git(
+        f.f._repo.path(),
+        &["rev-parse", "HEAD"],
+    ))
+    .unwrap();
     let retained = archive::retain_snapshot(&mut f.f.store, f.f._repo.path(), &commit).unwrap();
     let bytes = export(
         &f.f.store,
