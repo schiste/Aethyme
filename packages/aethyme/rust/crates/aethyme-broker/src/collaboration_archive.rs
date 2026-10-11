@@ -2779,7 +2779,8 @@ mod tests {
         store
             .connection()
             .execute_batch(
-                "DROP TABLE retained_contributions; DROP TABLE retained_snapshots;
+                "DROP TABLE local_wave_arrivals; DROP TABLE local_waves;
+                 DROP TABLE retained_contributions; DROP TABLE retained_snapshots;
                  UPDATE meta SET value = '1' WHERE key = 'schema_version';",
             )
             .unwrap();

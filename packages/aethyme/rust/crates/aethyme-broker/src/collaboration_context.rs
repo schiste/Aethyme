@@ -3840,7 +3840,8 @@ mod tests {
             .store
             .connection()
             .execute_batch(
-                "DELETE FROM context_postings WHERE key = x'62';
+                "DROP TABLE local_wave_arrivals; DROP TABLE local_waves;
+                 DELETE FROM context_postings WHERE key = x'62';
                  DELETE FROM meta WHERE key = 'context_index_format';
                  UPDATE meta SET value = '5' WHERE key = 'schema_version';
                  UPDATE meta SET value = '5' WHERE key = 'min_compatible_schema';",
