@@ -59,6 +59,14 @@ pub enum ExchangeError {
     Record(#[from] aethyme_contracts::experimental_v0::RecordError),
     #[error(transparent)]
     Json(#[from] serde_json::Error),
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    #[error(transparent)]
+    Sqlite(#[from] rusqlite::Error),
+    #[error(transparent)]
+    Archive(#[from] crate::collaboration_archive::ArchiveError),
+    #[error(transparent)]
+    Authority(#[from] crate::local_authority::AuthorityError),
 }
 fn invalid(why: &str) -> ExchangeError {
     ExchangeError::Invalid(why.into())
@@ -474,6 +482,11 @@ pub trait TrustedPeer {
         offset: u32,
     ) -> Result<SnapshotPage, ExchangeError>;
 }
+
+mod manager;
+pub use manager::{
+    AppointedPeer, Delivery, appoint, deliver, disable, enqueue, poll, projection, recover_snapshot,
+};
 
 #[cfg(test)]
 mod tests;

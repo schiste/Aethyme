@@ -271,3 +271,6 @@ fn metadata_acknowledgment_is_exact_and_stale_cursors_are_bounded_data() {
         .is_err()
     );
 }
+
+#[path = "manager_tests.rs"]
+mod durable;
