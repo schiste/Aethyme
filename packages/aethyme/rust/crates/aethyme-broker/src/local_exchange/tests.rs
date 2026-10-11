@@ -189,3 +189,85 @@ fn finite_peer_limits_and_supported_profile_are_explicit() {
     p.scope = Scope::Paths(vec![]);
     assert!(p.validate().is_err());
 }
+
+#[test]
+fn snapshots_require_exact_count_page_continuity_and_pinned_subject() {
+    let witness = stream();
+    let event = Event {
+        stream: witness.clone(),
+        sequence: 4,
+        packet: packet(),
+    };
+    let good = SnapshotPage {
+        snapshot: SnapshotDescriptor {
+            stream: witness.clone(),
+            identity: sha('c'),
+            item_count: 1,
+            watermark: 4,
+        },
+        offset: 0,
+        items: vec![event],
+        next_offset: None,
+    };
+    assert!(good.validate_for(&witness, Some(&good.snapshot), 0).is_ok());
+    for changed in 0..6 {
+        let mut bad = good.clone();
+        match changed {
+            0 => bad.snapshot.item_count = 2,
+            1 => bad.next_offset = Some(1),
+            2 => bad.offset = 1,
+            3 => bad.snapshot.identity = sha('d'),
+            4 => bad.items[0].stream.incarnation = "replayed".into(),
+            _ => bad.items[0].sequence = 5,
+        }
+        assert!(
+            bad.validate_for(&witness, Some(&good.snapshot), 0).is_err(),
+            "{changed}"
+        );
+    }
+    let mut duplicate = good.clone();
+    duplicate.snapshot.item_count = 2;
+    duplicate.items.push(duplicate.items[0].clone());
+    assert!(duplicate.validate_for(&witness, None, 0).is_err());
+    let mut empty = good;
+    empty.items.clear();
+    empty.snapshot.item_count = 0;
+    assert!(empty.validate_for(&witness, None, 0).is_ok());
+    empty.snapshot.item_count = 1;
+    assert!(empty.validate_for(&witness, None, 0).is_err());
+}
+#[test]
+fn metadata_acknowledgment_is_exact_and_stale_cursors_are_bounded_data() {
+    let witness = stream();
+    let message = packet().record().unwrap().id();
+    let ack = MetadataAck {
+        stream: witness.clone(),
+        message: message.to_string(),
+    };
+    assert!(ack.validate_for(&witness, &message).is_ok());
+    let mut wrong = ack.clone();
+    wrong.message = sha('c');
+    assert!(wrong.validate_for(&witness, &message).is_err());
+    wrong = ack;
+    wrong.stream.visibility_generation = "revoked-version".into();
+    assert!(matches!(
+        wrong.validate_for(&witness, &message),
+        Err(ExchangeError::Stale)
+    ));
+    assert!(
+        Cursor {
+            stream: witness.clone(),
+            position: 0
+        }
+        .validate()
+        .is_ok()
+    );
+    assert!(
+        Cursor {
+            stream: witness,
+            position: MAX_STREAM_POSITION + 1
+        }
+        .validate()
+        .is_err()
+    );
+}

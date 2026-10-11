@@ -351,6 +351,90 @@ pub struct MetadataAck {
     pub message: String,
 }
 
+impl Cursor {
+    /// Validate historical data only; this does not grant current peer access.
+    pub fn validate(&self) -> Result<(), ExchangeError> {
+        self.stream.validate()?;
+        if self.position > MAX_STREAM_POSITION {
+            return Err(invalid("cursor position"));
+        }
+        Ok(())
+    }
+}
+impl SnapshotDescriptor {
+    pub fn validate(&self) -> Result<(), ExchangeError> {
+        self.stream.validate()?;
+        record_id(&self.identity)?;
+        if self.item_count as usize > MAX_VISIBLE_ITEMS || self.watermark > MAX_STREAM_POSITION {
+            return Err(ExchangeError::Limit);
+        }
+        Ok(())
+    }
+}
+impl SnapshotPage {
+    /// Check page consistency against explicit data expectations. A separate
+    /// native lease is still required for authorization and completeness trust.
+    pub fn validate_for(
+        &self,
+        current: &StreamWitness,
+        pinned: Option<&SnapshotDescriptor>,
+        offset: u32,
+    ) -> Result<(), ExchangeError> {
+        current.validate()?;
+        self.snapshot.validate()?;
+        if &self.snapshot.stream != current || pinned.is_some_and(|s| s != &self.snapshot) {
+            return Err(ExchangeError::Stale);
+        }
+        if self.offset != offset || self.items.len() > MAX_BATCH_ITEMS {
+            return Err(ExchangeError::Limit);
+        }
+        let end = self
+            .offset
+            .checked_add(u32::try_from(self.items.len()).map_err(|_| ExchangeError::Limit)?)
+            .ok_or(ExchangeError::Limit)?;
+        if end > self.snapshot.item_count {
+            return Err(ExchangeError::Incomplete);
+        }
+        match self.next_offset {
+            Some(next)
+                if next == end && end < self.snapshot.item_count && !self.items.is_empty() => {}
+            None if end == self.snapshot.item_count => {}
+            _ => return Err(ExchangeError::Incomplete),
+        }
+        let mut positions = BTreeSet::new();
+        let mut records = BTreeSet::new();
+        for event in &self.items {
+            if event.stream != self.snapshot.stream || event.sequence > self.snapshot.watermark {
+                return Err(ExchangeError::Stale);
+            }
+            event.record()?;
+            if !positions.insert(event.sequence) || !records.insert(event.packet.record()?.id()) {
+                return Err(invalid("duplicate snapshot item"));
+            }
+        }
+        Ok(())
+    }
+}
+impl MetadataAck {
+    /// A subject check is not source retention, adoption or a native lease.
+    pub fn validate_for(
+        &self,
+        current: &StreamWitness,
+        message: &RecordId,
+    ) -> Result<(), ExchangeError> {
+        self.stream.validate()?;
+        current.validate()?;
+        record_id(&self.message)?;
+        if &self.stream != current {
+            return Err(ExchangeError::Stale);
+        }
+        if self.message != message.as_str() {
+            return Err(invalid("acknowledgment subject"));
+        }
+        Ok(())
+    }
+}
+
 /// A trusted native adapter supplies and owns this lease. A deserialized event,
 /// receipt, JWT-looking string or cached cursor is never an implementation of it.
 /// Revocation/freshness checks and the deadline must use the adapter's real
