@@ -420,7 +420,7 @@ pub fn prepare(
     if uncertain {
         return Err(TransportError::Unresolved);
     }
-    tx.execute("INSERT OR IGNORE INTO local_source_transports VALUES (?1,?2,?3,?4,?5,?6,0,'unobserved',NULL)",
+    tx.execute("INSERT OR IGNORE INTO local_source_transports (intent,revision,target,peer,destination,body,dispatched,observation,receipt) VALUES (?1,?2,?3,?4,?5,?6,0,'unobserved',NULL)",
         params![intent.id.as_str(),intent.spec.revision,intent.spec.target,intent.spec.peer,intent.spec.destination,record.canonical_bytes()])?;
     tx.commit()?;
     load(store, &intent.id)
@@ -482,7 +482,7 @@ pub fn publish(
         return Err(TransportError::Unresolved);
     }
     if tx.execute(
-        "UPDATE local_source_transports SET dispatched=1,observation='unobserved',receipt=NULL WHERE intent=?1 AND dispatched=0",
+        "UPDATE local_source_transports SET dispatched=1,observation='unobserved',receipt=NULL,operation=NULL,write_outcome=NULL WHERE intent=?1 AND dispatched=0",
         [id.as_str()],
     )? != 1
     {
@@ -507,10 +507,21 @@ pub fn publish(
         |_, _| Ok(None),
     );
     match result {
-        Ok(report) => Ok(Dispatch {
-            operation: report.operation.id,
-            outcome: report.operation.status,
-        }),
+        Ok(report) => {
+            store.read_connection().execute(
+                "UPDATE local_source_transports SET operation=?2,write_outcome=?3 WHERE intent=?1",
+                params![
+                    id.as_str(),
+                    report.operation.id,
+                    report.operation.status.as_str()
+                ],
+            )?;
+            _control.commit()?;
+            Ok(Dispatch {
+                operation: report.operation.id,
+                outcome: report.operation.status,
+            })
+        }
         Err(e) => Err(e.into()),
     }
 }
@@ -544,7 +555,7 @@ pub fn inspect(
         store.read_connection(),
         TransactionBehavior::Immediate,
     )?;
-    let op = find_operation(broker, carrier, &intent)?;
+    let op = find_operation(store, broker, carrier, &intent)?;
     let observed = crate::git::with_git_deadline(Duration::from_secs(carrier.timeout), || {
         carrier
             .repo
@@ -613,8 +624,8 @@ pub fn inspect(
         params![record.id().as_str(), id.as_str(), record.canonical_bytes()],
     )?;
     store.read_connection().execute(
-        "UPDATE local_source_transports SET observation=?2,receipt=?3 WHERE intent=?1",
-        params![id.as_str(), observation.code(), record.canonical_bytes()],
+        "UPDATE local_source_transports SET observation=?2,receipt=?3,write_outcome=?4,operation=?5 WHERE intent=?1",
+        params![id.as_str(), observation.code(), record.canonical_bytes(),s.write_outcome,s.write_operation],
     )?;
     _control.commit()?;
     Ok(Receipt {
@@ -636,6 +647,7 @@ fn push_args(carrier: &GitCarrier, intent: &Intent) -> Vec<String> {
     ]
 }
 fn find_operation(
+    store: &CollaborationStore,
     broker: &Broker,
     carrier: &GitCarrier,
     intent: &Intent,
@@ -643,6 +655,34 @@ fn find_operation(
     let mut before = None;
     let mut found = None;
     let expected = push_args(carrier, intent);
+    let saved: Option<i64> = store.read_connection().query_row(
+        "SELECT operation FROM local_source_transports WHERE intent=?1",
+        [intent.id.as_str()],
+        |r| r.get(0),
+    )?;
+    if let Some(saved) = saved {
+        let op = broker
+            .store_ref()
+            .coordinated_operation(saved)
+            .map_err(crate::BrokerOpError::from)?
+            .ok_or_else(|| {
+                TransportError::Invalid(
+                    "recorded native operation is missing; reconcile journal loss".into(),
+                )
+            })?;
+        let args: Vec<String> = serde_json::from_str(&op.command_json)?;
+        if op.provider != OperationProvider::Git
+            || op.session_id != carrier.session
+            || op.scope != scope(&intent.id)
+            || op.repository != intent.spec.peer
+            || args.get(1..) != Some(expected.as_slice())
+        {
+            return Err(TransportError::Invalid(
+                "recorded native operation binding differs".into(),
+            ));
+        }
+        return Ok(Some(op));
+    }
     for _ in 0..128 {
         let page = broker
             .store_ref()

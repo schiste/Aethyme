@@ -385,7 +385,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
             peer TEXT NOT NULL, destination TEXT NOT NULL,
             body BLOB NOT NULL, dispatched INTEGER NOT NULL CHECK(dispatched IN (0,1)),
             observation TEXT NOT NULL CHECK(observation IN ('unobserved','available','absent','other','unavailable')),
-            receipt BLOB
+            receipt BLOB, operation INTEGER, write_outcome TEXT
         ) STRICT;
         CREATE TABLE local_source_transport_receipts (
             receipt TEXT PRIMARY KEY NOT NULL,

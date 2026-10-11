@@ -487,3 +487,55 @@ fn prewrite_observation_cannot_reconcile_a_later_dispatch() {
     assert_eq!(count, 2);
     assert_ne!(old.id, receipt.id);
 }
+
+#[test]
+fn stopped_revision_roots_wait_for_native_outcome_and_exact_inspection() {
+    let mut t = TransportFixture::new();
+    let i = t.prepare('1', None);
+    let old_revision = parse_id(&i.spec.revision).unwrap();
+    publish(&mut t.f.store, &t.owner, &t.carrier, &mut t.broker, &i.id).unwrap();
+    wave::stop(&mut t.f.store, &t.owner, &t.wave).unwrap();
+    let mut spec = t.f.spec();
+    spec.objective = "new authorized objective".into();
+    let next = target::propose_revision(&mut t.f.store, &t.owner, spec).unwrap();
+    target::select_revision(&mut t.f.store, &t.owner, &next.id).unwrap();
+    assert!(matches!(
+        target::release_revision(&mut t.f.store, &t.owner, &old_revision),
+        Err(target::TargetError::Frozen)
+    ));
+    let receipt = t.inspect(&i);
+    assert_eq!(receipt.spec.observation, Observation::Available);
+    assert_eq!(receipt.spec.write_outcome.as_deref(), Some("succeeded"));
+    t.f.store
+        .read_connection()
+        .execute(
+            "UPDATE local_source_transports SET write_outcome='outcome_unknown' WHERE intent=?1",
+            [i.id.as_str()],
+        )
+        .unwrap();
+    assert!(matches!(
+        target::release_revision(&mut t.f.store, &t.owner, &old_revision),
+        Err(target::TargetError::Frozen)
+    ));
+    t.inspect(&i); // Native journal, rather than a Local flag, settles the copy.
+    target::release_revision(&mut t.f.store, &t.owner, &old_revision).unwrap();
+}
+
+#[test]
+fn native_operation_reference_cannot_point_to_another_operation() {
+    let mut t = TransportFixture::new();
+    let i = t.prepare('1', None);
+    publish(&mut t.f.store, &t.owner, &t.carrier, &mut t.broker, &i.id).unwrap();
+    let r = t.inspect(&i);
+    t.f.store
+        .read_connection()
+        .execute(
+            "UPDATE local_source_transports SET operation=?2 WHERE intent=?1",
+            params![i.id.as_str(), r.spec.read_operation.unwrap()],
+        )
+        .unwrap();
+    assert!(matches!(
+        inspect(&mut t.f.store, &t.owner, &t.carrier, &mut t.broker, &i.id),
+        Err(TransportError::Invalid(_))
+    ));
+}
