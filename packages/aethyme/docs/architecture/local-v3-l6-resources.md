@@ -50,9 +50,30 @@ harness/collection, authority epoch, target revision and result class. Immutable
 execution identity covers configuration/dependencies/dataset/toolchain inputs.
 There is no writable shared execution cache or uploaded pass upgrade.
 
-Six focused regressions pass on the initial draft. Live resource/cost schedules,
-interrupted cleanup, dispatch races, deliberate guard removal, independent
-review and final CI are pending. Older supervisor/verifier component schedules
-use explicit `cfg(test)` profile-only paths and do not claim resource evidence.
-Production has only admitted execution paths. Full Q3/Q4 qualification, E1
-composition evidence and candidate-to-gate wiring remain dependent work.
+Eleven resource regressions pass, including a public admitted build/independent
+verifier through the cached Linux profile. Controlled schedules observe delayed
+startup before acknowledgement, lost successful removal responses, live-reader
+fencing, mismatching actual container and volume generation labels, cgroup OOM
+and daemon disk-floor failure. Crash-window recovery preserves exact lease
+identity/generation/token across active, quarantined, expired and released
+states; a pre-acquisition intent never mints a lease during cleanup. Accounting
+is conservative and financial ambiguity remains pending after resource recovery.
+
+Independent adversarial review cleared the production fixes and reviewed the
+actual label/OOM/floor schedules. Seventeen guard-removal checks each failed
+their intended test; exact source restoration then passed 11 resource, 14 snapshot,
+9 supervisor, 11 verifier, 89 Local and 149 collaboration tests, plus 3 discarded
+result and 4 deprecated-spelling ratchets. Clippy library/tests passed with warnings
+denied. CI is fully green on production/test checkpoint 58b7e30c; this final
+documentation checkpoint receives its own CI. The early replay precheck alone is
+redundant with atomic claim-file creation; mutation coverage checks the complete
+barrier. The endpoint-drift assertion in the wrong-label schedule is masked by
+the invalid label and makes no independent endpoint-mutation claim.
+
+Older supervisor/verifier component schedules use explicit `cfg(test)`
+profile-only paths and do not claim resource evidence. Production has only
+admitted execution paths. D25 remains open for actual ENOSPC with GC/concurrent
+builds and the broader no-orphan schedules; these focused mechanisms do not
+close it. This Local cleanup work contributes to D29 without claiming its
+release/deployment qualification. Full Q3/Q4 qualification, E1 composition
+evidence and candidate-to-gate wiring remain dependent work.
