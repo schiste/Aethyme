@@ -56,3 +56,20 @@ Adversarial review and deliberate guard-removal checks qualify the Local contrac
 Real C1/C2 integration remains the separately owned Q5 path. No remote service,
 credential rotation, native provider migration or handoff execution is implemented
 here; #678 owns controlled executor acknowledgment.
+
+## Review constraints fixed before implementation
+
+Delivery attempts and acknowledgments are per `(peer binding, outbox message)`;
+the old capture row's global `delivered_ms` is not remote delivery authority.
+Generalized rows preserve existing capture operations without synthetic captures.
+Cursor and snapshot witnesses bind reader, requested scope, visibility generation,
+peer stream incarnation and authority epoch. A consistent snapshot pins identity,
+item count and watermark; neither a short page nor a notification implies
+completeness. Same-stream watermark rollback and mixed pages are refused.
+
+The operator-appointed trusted adapter supplies a native current authorization
+lease. The manager's witness is private and not deserializable; the native lease
+must remain held and valid through local commit. Cached projection reads acquire
+fresh authorization too. Known revocation atomically invalidates that binding's
+projection, pending events and partial snapshots. Independently retained Local
+source stays owned locally when the remote peer is offline or access is revoked.
