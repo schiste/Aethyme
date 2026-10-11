@@ -75,6 +75,7 @@ pub use gate_debris::{
 };
 mod auto_cleanup;
 pub mod execution_snapshot;
+pub mod execution_supervisor;
 mod gate_doctor;
 mod gates;
 mod gc;
