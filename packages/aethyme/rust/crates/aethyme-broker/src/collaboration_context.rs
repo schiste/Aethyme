@@ -3840,7 +3840,8 @@ mod tests {
             .store
             .connection()
             .execute_batch(
-                "DELETE FROM context_postings WHERE key = x'62';
+                "DROP TABLE local_wave_arrivals; DROP TABLE local_waves;
+                 DELETE FROM context_postings WHERE key = x'62';
                  DELETE FROM meta WHERE key = 'context_index_format';
                  UPDATE meta SET value = '5' WHERE key = 'schema_version';
                  UPDATE meta SET value = '5' WHERE key = 'min_compatible_schema';",
@@ -4077,7 +4078,7 @@ mod tests {
         let expected = fresh(&mut fixture, &["src/search.rs"], &reader);
         for tamper in [
             "UPDATE context_cache SET record = CAST('{\"schema\":\"aethyme.contribution-context/experimental-v9\"}' AS BLOB)",
-            "UPDATE context_cache SET record_id = 'sha256:' || substr(record_id, 8, 63) || '0'",
+            "UPDATE context_cache SET record_id = substr(record_id, 1, 70) || CASE substr(record_id, 71, 1) WHEN '0' THEN '1' ELSE '0' END",
         ] {
             cached(&mut fixture, &["src/search.rs"], &reader);
             fixture.store.connection().execute(tamper, []).unwrap();

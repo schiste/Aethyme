@@ -5,7 +5,7 @@ use crate::collaboration_state::{CollaborationRoot, ProjectKey};
 use std::path::Path;
 use std::process::{Command, Stdio};
 
-fn git(repo: &Path, args: &[&str]) -> String {
+pub(crate) fn git(repo: &Path, args: &[&str]) -> String {
     let output = Command::new("git")
         .current_dir(repo)
         .args(["-c", "commit.gpgsign=false", "-c", "core.autocrlf=false"])
@@ -47,16 +47,16 @@ fn age_objects(store: &CollaborationStore) {
     }
 }
 
-struct Fixture {
-    _host: tempfile::TempDir,
-    _repo: tempfile::TempDir,
-    store: CollaborationStore,
-    a: RetainedContribution,
-    b: RetainedContribution,
+pub(crate) struct Fixture {
+    pub(crate) _host: tempfile::TempDir,
+    pub(crate) _repo: tempfile::TempDir,
+    pub(crate) store: CollaborationStore,
+    pub(crate) a: RetainedContribution,
+    pub(crate) b: RetainedContribution,
 }
 
 impl Fixture {
-    fn feature(&mut self, base: &CommitOid) -> RequestedContribution {
+    pub(crate) fn feature(&mut self, base: &CommitOid) -> RequestedContribution {
         git(self._repo.path(), &["switch", "-qc", "C", base.as_str()]);
         std::fs::write(self._repo.path().join("three.txt"), "C\n").unwrap();
         git(self._repo.path(), &["add", "three.txt"]);
@@ -75,7 +75,7 @@ impl Fixture {
         }
     }
 
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let host = tempfile::tempdir().unwrap();
         let repo = tempfile::tempdir().unwrap();
         git(repo.path(), &["init", "-q", "-b", "main"]);
@@ -104,7 +104,7 @@ impl Fixture {
         }
     }
 
-    fn spec(&self) -> TargetSpec {
+    pub(crate) fn spec(&self) -> TargetSpec {
         let requested = |id: &str, c: &RetainedContribution| RequestedContribution {
             id: id.into(),
             lineage: c.lineage_record_id.to_string(),
@@ -626,11 +626,15 @@ fn migration_adopts_charged_resolution_attempts_and_fences_schema_six() {
     drop(f.store);
     let c = rusqlite::Connection::open(&db).unwrap();
     c.execute_batch("UPDATE meta SET value = '6' WHERE key IN ('schema_version', 'min_compatible_schema');
+        DROP TABLE local_waves; DROP TABLE local_wave_arrivals;
         DROP TABLE local_target_roots; DROP TABLE local_target_dispositions; DROP TABLE local_target_revisions; DROP TABLE local_targets;
         INSERT INTO resolution_attempts VALUES (1, 'decision', 'conflict', 'A', 'one.txt', 'original-request', 'resolver', 'failed', 1);").unwrap();
     drop(c);
     let store = open(&host);
-    assert_eq!(store.schema_version(), 7);
+    assert_eq!(
+        store.schema_version(),
+        crate::collaboration_state::COLLABORATION_STATE_SCHEMA_VERSION
+    );
     let count: i64 = store
         .read_connection()
         .query_row(
@@ -648,7 +652,10 @@ fn migration_adopts_charged_resolution_attempts_and_fences_schema_six() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(floor, "7");
+    assert_eq!(
+        floor,
+        crate::collaboration_state::COLLABORATION_STATE_SCHEMA_VERSION.to_string()
+    );
 }
 
 // Run in a real child process with a dedicated host root. The parent kills
