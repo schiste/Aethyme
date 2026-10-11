@@ -77,7 +77,7 @@ pinned binaries. The old executable is source
 `edc1ad2829e08c6d5aa2512964e117685cc1ea4502caa765dc1e0d0b9b0a4261`.
 The current executable is source `2aec0fd76ed43b9588d4050f905d103cf68cd466`,
 SHA-256 `bbc63bf01cfa22356ca8cd0ce68dee879beabbc4a1c4cac0cdd937c048df4efa`.
-Each native invocation verifies its executable identity first. Command records
+Each direct CLI run and each installed-hook group verifies its executable identity first. Command records
 retain exact argv, exit, output digests and source/tree separately.
 
 The old status process preserves legacy-only/advisory access and refuses the
