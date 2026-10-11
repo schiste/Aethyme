@@ -70,7 +70,8 @@ identity, replacement refs, chained URL rewrites and query deadlines/failures.
 Independent review found the replacement-ref and URL-rewrite bugs; both are
 fixed and re-review cleared the implementation. Fourteen deliberate guard
 removals each failed the intended test; source was restored exactly afterwards.
-Selected regression checks are in progress.
+The restored Local/archive/materialization/Git/ratchet/docs pass ran 333 tests
+with five ignored, and strict Clippy passed.
 
 The exact-object read options follow [Git's fetch documentation](https://git-scm.com/docs/git-fetch):
 empty `--refmap` suppresses configured tracking mappings, while
