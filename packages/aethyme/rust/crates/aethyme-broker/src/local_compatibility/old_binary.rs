@@ -173,6 +173,35 @@ fn actual_old_cleanup_cannot_remove_new_retained_source_or_history() {
     let branch = git(&f.worktree, &["symbolic-ref", "HEAD"]);
     let tip = git(f.repo.path(), &["rev-parse", &branch]);
     assert_eq!(tip, result.as_str());
+    // The pinned old process does not treat current abandonment as acceptance.
+    // It must preserve this unaccepted fixture until the operator explicitly
+    // authorizes discarding its exact session with the native --force option.
+    let refused = run(
+        &binary,
+        &f,
+        &[
+            "broker",
+            "finish",
+            "cleanup",
+            &f.session.to_string(),
+            "--json",
+        ],
+    );
+    assert_eq!(
+        refused.status.code(),
+        Some(i32::from(crate::exit_status::REFUSED))
+    );
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("never been accepted"));
+    assert!(f.worktree.exists());
+    assert_eq!(git(f.repo.path(), &["rev-parse", &branch]), tip);
+    assert_eq!(
+        crate::collaboration_archive::read_object(
+            &store,
+            &crate::collaboration_archive::ObjectDigest::of_snapshot(&retained.result.snapshot_id),
+        )
+        .unwrap(),
+        manifest
+    );
     let output = run(
         &binary,
         &f,
@@ -181,6 +210,7 @@ fn actual_old_cleanup_cannot_remove_new_retained_source_or_history() {
             "finish",
             "cleanup",
             &f.session.to_string(),
+            "--force",
             "--json",
         ],
     );
