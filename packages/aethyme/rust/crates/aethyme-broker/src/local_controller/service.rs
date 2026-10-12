@@ -168,22 +168,17 @@ pub fn serve(
             break;
         }
         report.ticks += 1;
-        let mut appointed = policy.drive.clone();
-        appointed.max_wall_ms = appointed.max_wall_ms.min(deadline - now()?);
-        if appointed.max_wall_ms <= 0 {
-            report.outcome = ServiceOutcome::Deadline;
-            break;
-        }
-        match drive(
+        match super::drive::drive_until(
             store,
             owner,
             broker,
             carrier,
             executor,
             permit,
-            &appointed,
+            &policy.drive,
             cancel,
             now()?,
+            Some(deadline),
         ) {
             Ok(DriveResult::Completed {
                 completion,
