@@ -26,7 +26,7 @@ qualification; autonomous target execution remains unsupported.
 | Local surface | Implementations | Evidence and remaining qualification |
 |---|---|---|
 | Revision identities, records, briefs and analysis envelope | #704–#710 | Independent canonical vectors and baseline AQ0 fixtures; records remain experimental |
-| Retained source, capture, roots and GC | #714–#719 | Capture/crash/cleanup schedules; native workload-pressure preservation below; global capture/hydration ENOSPC unqualified |
+| Retained source, capture, roots and GC | #714–#719 | Capture/crash/cleanup schedules; bounded native workload and APFS retained-source pressure below; host/daemon and mid-journal exhaustion remain unqualified |
 | Bounded context and fresh analysis views | #718/#730/#731 | Scoped invalidation schedules; [FX08 proposed tasks](local-v3-qualification/fx08-task-proposal.md) await review before construction and freeze |
 | Composition and bounded resolution | #733–#736 | Provisional frozen fixtures; E1 must replace evidence and requalify T16–T23; held-outs are not rerun; [reachable request guards](local-v3-qualification/resolution-guards-2026-10-12.json) |
 | Targets, finite waves, budgets and native epoch | #737–#740 | Transition, arrival, reservation, stop and stale-authority schedules; finite native joined path below |
@@ -88,9 +88,10 @@ and require a failed inspect naming the exact owned ID. No global prune runs.
 
 ENOSPC produces CodeFailed with exit 28 and no artifact; native cgroup OOM
 produces InfrastructureDeferred and no artifact. Neither is a verifier pass.
-This qualifies only workload tmpfs and bounded cgroup pressure. Docker daemon
-storage, global host disk and source capture/hydration disk exhaustion remain
-unqualified under D25.
+This Docker profile qualifies workload tmpfs and bounded cgroup pressure.
+Docker daemon storage and global host disk remain unqualified under D25.
+The separate APFS profile below exercises finite retained-source storage
+boundaries; native mid-capture journal exhaustion remains unqualified.
 
 The joined path uses an independent assertion inventory selected before the
 build and an external verifier with artifact-only access. Its source provider
@@ -101,6 +102,37 @@ historical CAP/context/brief/lineage records, then binds a fresh native epoch.
 Its imported history supplies no current verifier, provider or agent authority.
 This path does not qualify a background daemon, an autonomous CLI runner or a
 live GitHub/Mergify integration.
+
+## Native retained-source filesystem profile
+
+The [bounded source filesystem ledger](https://github.com/schiste/Aethyme/blob/6a3f37414f1b8c2390db1b9725e996304c6d2797/packages/aethyme/docs/architecture/local-v3-qualification/native-source-filesystem-2026-10-12.json)
+and its [declared contract](https://github.com/schiste/Aethyme/blob/6a3f37414f1b8c2390db1b9725e996304c6d2797/packages/aethyme/docs/architecture/local-v3-qualification/native-source-filesystem-profile.md)
+record a separate macOS profile at source
+`f2c28c55a9a7e296652d6e9c1a425b088d5a4345`. One private 512 MiB APFS image
+reaches actual kernel ENOSPC while host admission preserves 2 GiB headroom plus
+remaining image capacity. Required capture refuses at its unchanged 256 MiB
+floor without an acknowledged receipt; CAS and exact materialization observe
+typed storage failure without a valid object or usable inputs/artifact.
+Previously retained bytes remain reconstructable outside the pressure volume.
+
+Releasing the checked owned pressure entry permits actual capture recovery,
+idempotent replay, exact materialization and real retained GC. The profile
+checks orphan removal, retained source and exact owned non-force eject, then
+requires both image inventory and independent device/mount absence. All images,
+source repositories and independent journals remain preserved for inspection.
+
+Five positive-profile trials were scheduled: two passed, two failed and one
+was unrun after Clippy failed. Both failed physical trials and the separate
+native GC guard failure confirmed cleanup. Eight deliberate guard removals
+failed their named assertions with actual exit 101; source was restored before
+124 passing selected executions, zero failures, five explicit ignores and
+strict broker Clippy. These executions overlap across selections.
+
+This is a private single-writer profile. Host admission is not a global
+reservation; the ownership check followed by unlink is not atomic against a
+concurrent path change. This does not qualify native mid-capture journal IO,
+full host/daemon storage, another backend, power loss or build/verifier authority.
+Q3, Q4 and whole Local qualification remain open.
 
 ## Proof removals and provenance
 
