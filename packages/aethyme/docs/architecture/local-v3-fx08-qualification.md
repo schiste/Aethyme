@@ -45,8 +45,8 @@ completed harness run as passing qualification.
 The actual L3 bridge has exported all 24 task/arm contexts with exact source,
 advisory authority and 150-token briefs. Independent oracle calibration passed
 six positives and six named semantic negatives; the initial pagination control
-failure and its independent, pre-trial amendment remain in evidence. Model
-trials have not run.
+failure and its independent, pre-trial amendment remain in evidence. The first scheduled model campaign has no behavior evidence; all rows refused
+locally before model dispatch.
 
 The evaluator compiles model source as a separate safe Rust 2024,
 standard-library-only library. A trusted API adapter exposes its real results
@@ -67,8 +67,7 @@ all ten earlier failed admission attempts remain uncredited. The separate
 transport calibration then passed all six positives and all six named semantic
 negatives from unchanged independent vectors. Its first failed attempt exposed
 the appointed serde runtime's optional Result feature; the adapter now uses an
-explicit ok/error wire representation while preserving exact signatures. No paid row has
-run. The host SDK/compiler and frozen trusted templates are part of this
+explicit ok/error wire representation while preserving exact signatures. No task-bearing model row has completed. The host SDK/compiler and frozen trusted templates are part of this
 profile, and metadata/ancestor directory reads are intentionally permitted.
 Trusted adapters check exact public signatures. One dependency and transport
 template snapshot is validated and frozen before model admission, and reused
@@ -92,3 +91,22 @@ Report all 56 scheduled rows, failures, null differences and harm.
 Limit conclusions to the actual pinned model, budget, Local retrieval profile
 and six-task distribution. E1, native gates and FX17's twenty accepted changes
 have separate required evidence.
+
+## Retained startup failure and configuration amendment
+
+The first frozen 56-row schedule at `7cb0bffc` ended with 56 local CLI
+configuration refusals: exit 1, zero stdout, and the same required rollout
+reminder field error. Its complete denominator and log digest audit remain in
+`packages/aethyme-eval/fx08/startup-observations`. These rows provide no behavior,
+brief usefulness or sealed-model evidence. Provider usage and charges remain
+unknown, rather than being reported as zero.
+
+The pinned CLI requires `reminder_at_remaining_tokens` when rollout accounting
+is enabled. The amendment supplies an empty list, preserving the original
+no-reminder prompt policy, 128,000 allowance and unit weights. It changes no
+source, task, oracle, brief arm, product behavior or acceptance threshold.
+A separate readiness-only request with no task/brief/oracle payload passed
+using the amended configuration: exit 0, ready true, 9,784 input and 15 output
+tokens, no command tools; invoiced charges and returned model remain unknown.
+An independent pre-model amendment review is required before a new frozen task
+schedule. The original failed schedule will remain reported separately.
