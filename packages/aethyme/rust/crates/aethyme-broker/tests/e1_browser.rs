@@ -21,6 +21,9 @@ use sha2::{Digest, Sha256};
 
 const SOURCE_FILE: &str = "page.html";
 
+#[path = "e1_browser/model.rs"]
+mod model;
+
 fn fixtures() -> PathBuf {
     aethyme_testkit::rust_workspace_root()
         .join("crates/aethyme-testkit/fixtures/composition-e1/browser")
