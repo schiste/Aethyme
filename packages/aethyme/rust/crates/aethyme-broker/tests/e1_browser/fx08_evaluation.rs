@@ -193,7 +193,7 @@ pub(super) fn evaluate(
         compiler,
         sysroot,
         &subject,
-        &libs,
+        libs,
         &[
             "--edition=2024",
             "--crate-type=rlib",
@@ -218,7 +218,7 @@ pub(super) fn evaluate(
         compiler,
         sysroot,
         &subject,
-        &libs,
+        libs,
         &[
             "--edition=2024",
             "adapter.rs",
@@ -247,7 +247,7 @@ pub(super) fn evaluate(
         compiler,
         sysroot,
         &private,
-        &libs,
+        libs,
         &[
             "--edition=2024",
             "--test",

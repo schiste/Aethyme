@@ -265,18 +265,16 @@ fn external_observed(
                         break;
                     }
                     bytes.extend_from_slice(&buffer[..count]);
-                    if index == 0 && model_tools.is_some() {
+                    if let Some(tool_limit) = model_tools.filter(|_| index == 0) {
                         for byte in &buffer[..count] {
                             if *byte == b'\n' {
-                                if let Ok(event) = serde_json::from_slice::<Value>(&line) {
-                                    if event["type"] == "item.started"
-                                        && event["item"]["type"] == "command_execution"
-                                    {
-                                        let count =
-                                            observed_tools.fetch_add(1, Ordering::SeqCst) + 1;
-                                        if count > model_tools.unwrap() {
-                                            exceeded.store(true, Ordering::SeqCst);
-                                        }
+                                if let Ok(event) = serde_json::from_slice::<Value>(&line)
+                                    && event["type"] == "item.started"
+                                    && event["item"]["type"] == "command_execution"
+                                {
+                                    let count = observed_tools.fetch_add(1, Ordering::SeqCst) + 1;
+                                    if count > tool_limit {
+                                        exceeded.store(true, Ordering::SeqCst);
                                     }
                                 }
                                 line.clear();

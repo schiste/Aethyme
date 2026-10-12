@@ -113,7 +113,7 @@ schedule. The original failed schedule will remain reported separately.
 
 ## Once-final task campaign
 
-The independently approved amendment was frozen at `6671a4ed`, executable
+The independently approved amendment was frozen at `6671a4ed`, campaign harness executable
 SHA-256 `5b36d9c4e33722187cb76d0d0b3ea60793dcb885d5ecb23656900175872a1f0d`.
 All 56 rows completed with 37 passing proposals, 18 empty source proposals and
 one independently enforced API signature refusal. Each passing row passed all
