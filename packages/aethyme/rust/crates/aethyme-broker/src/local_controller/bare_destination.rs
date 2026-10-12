@@ -21,6 +21,7 @@ const MAX_PROBE_STREAM_BYTES: usize = 4 * 1024;
 /// configuration after the final check.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BareDestination {
+    requested_path: PathBuf,
     path: PathBuf,
     identity: FileIdentity,
 }
@@ -33,7 +34,10 @@ impl BareDestination {
     /// Re-run the bounded Git probe and reject a path replaced since the
     /// destination was first accepted.
     pub(crate) fn revalidate(&self) -> Result<(), ControllerError> {
-        let current = validate_path(&self.path)?;
+        // Keep checking the original path the caller will use for the
+        // publication URL. Rechecking only the canonical path would miss an
+        // ancestor symlink retargeting to another receiver.
+        let current = validate_path(&self.requested_path)?;
         if current.path != self.path || current.identity != self.identity {
             return Err(rejected("endpoint changed after it was verified"));
         }
@@ -152,6 +156,7 @@ fn validate_path(path: &Path) -> Result<BareDestination, ControllerError> {
     }
 
     Ok(BareDestination {
+        requested_path: path.to_path_buf(),
         path: canonical,
         identity,
     })
@@ -241,6 +246,23 @@ mod tests {
         run_git(path, &["init", "--bare", "-q"]);
     }
 
+    fn init_update_instead_checkout(path: &Path) {
+        fs::create_dir(path).unwrap();
+        run_git(path, &["init", "-q"]);
+        fs::write(path.join("tracked.txt"), "original checkout content\n").unwrap();
+        run_git(path, &["add", "tracked.txt"]);
+        run_git(path, &["commit", "-q", "-m", "baseline"]);
+        run_git(
+            path,
+            &[
+                "config",
+                "--local",
+                "receive.denyCurrentBranch",
+                "updateInstead",
+            ],
+        );
+    }
+
     fn err(raw: &str) -> String {
         validate_endpoint(raw).unwrap_err().to_string()
     }
@@ -270,20 +292,7 @@ mod tests {
     fn rejects_update_instead_checkout_without_changing_its_ref_or_worktree() {
         let temp = tempfile::tempdir().unwrap();
         let checkout = temp.path().join("checkout");
-        fs::create_dir(&checkout).unwrap();
-        run_git(&checkout, &["init", "-q"]);
-        fs::write(checkout.join("tracked.txt"), "original checkout content\n").unwrap();
-        run_git(&checkout, &["add", "tracked.txt"]);
-        run_git(&checkout, &["commit", "-q", "-m", "baseline"]);
-        run_git(
-            &checkout,
-            &[
-                "config",
-                "--local",
-                "receive.denyCurrentBranch",
-                "updateInstead",
-            ],
-        );
+        init_update_instead_checkout(&checkout);
         assert_eq!(
             run_git_text(&checkout, &["config", "--get", "receive.denyCurrentBranch"]),
             "updateInstead"
@@ -321,6 +330,32 @@ mod tests {
         let accepted = validate_endpoint(first.to_str().unwrap()).unwrap();
         fs::rename(&first, &retired).unwrap();
         fs::rename(&second, &first).unwrap();
+        assert!(accepted.revalidate().is_err());
+    }
+
+    #[test]
+    fn revalidation_detects_an_ancestor_symlink_retarget() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let parent_a = temp.path().join("parent-a");
+        let parent_b = temp.path().join("parent-b");
+        let parent_link = temp.path().join("publication-parent");
+        fs::create_dir(&parent_a).unwrap();
+        fs::create_dir(&parent_b).unwrap();
+
+        let first_receiver = parent_a.join("publication.git");
+        let second_receiver = parent_b.join("publication.git");
+        init_bare(&first_receiver);
+        init_update_instead_checkout(&second_receiver);
+        symlink(&parent_a, &parent_link).unwrap();
+
+        let requested_path = parent_link.join("publication.git");
+        let accepted = validate_endpoint(requested_path.to_str().unwrap()).unwrap();
+        assert_eq!(accepted.path(), first_receiver.canonicalize().unwrap());
+
+        fs::remove_file(&parent_link).unwrap();
+        symlink(&parent_b, &parent_link).unwrap();
         assert!(accepted.revalidate().is_err());
     }
 }
