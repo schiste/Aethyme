@@ -13,7 +13,8 @@ fn rpc(op:&str,args:serde_json::Value)->serde_json::Value{
     let writer=unsafe{std::fs::File::from_raw_fd(fds[1])};
     let mut command=Command::new("/usr/bin/sandbox-exec");
     command.args(["-p",&policy,&binary]).env_clear().env("PATH","/usr/bin:/bin:/usr/sbin:/sbin")
-        .stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null());
+        .current_dir(std::path::Path::new(&binary).parent().unwrap())
+        .stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::inherit());
     unsafe{command.pre_exec(move||{close(fds[0]);if dup2(fds[1],3)<0{return Err(std::io::Error::last_os_error());}if fds[1]!=3{close(fds[1]);}Ok(())});}
     let mut child=command.spawn().unwrap();drop(writer);
     child.stdin.take().unwrap().write_all(serde_json::to_string(&serde_json::json!({"op":op,"args":args})).unwrap().as_bytes()).unwrap();
@@ -31,7 +32,7 @@ fn rpc(op:&str,args:serde_json::Value)->serde_json::Value{
         std::thread::sleep(Duration::from_millis(5));
     };
     let (read,bytes)=output.unwrap_or_else(||rx.recv_timeout(Duration::from_secs(1)).unwrap());
-    read.unwrap();assert!(bytes.len()<=65536 && status.success(),"subject API did not complete");
+    read.unwrap();assert!(bytes.len()<=65536 && status.success(),"subject API did not complete: {status}");
     let value:serde_json::Value=serde_json::from_slice(&bytes).expect("subject output must be one complete API reply, never printed test results");
     assert_eq!(value["schema"],"aethyme.fx08.api-reply/v1");
     value.get("result").expect("API result").clone()

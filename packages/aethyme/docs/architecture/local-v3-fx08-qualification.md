@@ -48,12 +48,28 @@ six positives and six named semantic negatives; the initial pagination control
 failure and its independent, pre-trial amendment remain in evidence. Model
 trials have not run.
 
-The proposed evaluator compiles model source as a separate safe Rust 2024,
+The evaluator compiles model source as a separate safe Rust 2024,
 standard-library-only library. A trusted API adapter exposes its real results
 through a private control pipe to a separately compiled private oracle process.
 Model stdout, process exit and exported assertion macros cannot supply oracle
-results. Compiler and subject sandboxes deny private fixture reads; admission
-and tampering controls must pass before paid trials.
+results. Compiler and subject sandboxes deny private fixture data reads. The
+independent oracle and transport run as trusted host code; only the separately
+sandboxed child links proposed source. Subject stdout is discarded; stderr is
+retained in the bounded diagnostic stream and never parsed as a verdict. The
+user explicitly approved this independently reviewed boundary after macOS
+refused nested sandbox initialization.
+
+Actual unpaid admission passed all eight controls: one positive, four named
+behavior/spoofing failures, two compiler refusals (private include and unsafe
+code), and exact-signature drift refusal. Each runtime control also verifies
+private-oracle data reads are denied. The four ordinary harness guards pass;
+all ten earlier failed admission attempts remain uncredited. No paid row has
+run. The host SDK/compiler and frozen trusted templates are part of this
+profile, and metadata/ancestor directory reads are intentionally permitted.
+Trusted adapters check exact public signatures. One dependency and transport
+template snapshot is validated and frozen before model admission, and reused
+for every arm. Each API call uses a fresh subject process; this profile checks
+value and signature contracts and does not measure cross-call global state.
 
 The runner allows one CLI invocation, 150 seconds, 1 MiB per output stream and
 a 64 KiB final JSON proposal. It stops on the ninth observed command dispatch;
