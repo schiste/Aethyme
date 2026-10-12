@@ -1,0 +1,80 @@
+{
+  "schema": "aethyme.e1.browser-freeze/v1",
+  "files": [
+    {
+      "name": "accessible.html",
+      "bytes": 1524,
+      "sha256": "c35767471e4ddaec12b1d56b501983ce3ffe12f00ea70da0af95331cb337fa11"
+    },
+    {
+      "name": "analytics.html",
+      "bytes": 1432,
+      "sha256": "bf7bcef143446a54c9e12cca3bbb8aa2f3b6b38c57d9b4d6c47b21ad325333f6"
+    },
+    {
+      "name": "base.html",
+      "bytes": 1311,
+      "sha256": "e7b7b35d4b6914b17484a275dde1022b184c54d2395114d9a78e24582fe40500"
+    },
+    {
+      "name": "cases.json",
+      "bytes": 8807,
+      "sha256": "f6e053c2732183ae35c46ebb7d09adbb86432c1bbd721f570721d0360e4c5adc"
+    },
+    {
+      "name": "consumer.html",
+      "bytes": 1312,
+      "sha256": "42eeb1975b8f7167fe908ab113f80ff297aa1bd6aaffa2a8600b10eabe39ba19"
+    },
+    {
+      "name": "expectations.json",
+      "bytes": 1676,
+      "sha256": "67a4f0c68c7f4e613fd6e1a19082ed08d404301eff6ed10fdd6e0ee0f38add39"
+    },
+    {
+      "name": "inherited.html",
+      "bytes": 1317,
+      "sha256": "5d45cd10526773a00e9b503736fd8a00d6a2bcf75aab431f070a55e528844672"
+    },
+    {
+      "name": "label.html",
+      "bytes": 1318,
+      "sha256": "3d9b63d3d123a6b5f61a18754190bdc29546f10318ae44240ebaa992dabab413"
+    },
+    {
+      "name": "left-timeout.html",
+      "bytes": 1311,
+      "sha256": "3467d6e8367a87cf84095453ac20cba13746c48e7420bc1f294f1da08b3c0f5b"
+    },
+    {
+      "name": "mobile.html",
+      "bytes": 1426,
+      "sha256": "d4063b3c591cfa18ac4ce82a66c06f2d8e0cd7501aabb800955a3362f0e5ffd3"
+    },
+    {
+      "name": "moved.html",
+      "bytes": 1312,
+      "sha256": "44ad5a2f32a10bc643c914d7af8cd7cf99a1311bb5e24fc05ebe8bc2b621a514"
+    },
+    {
+      "name": "privacy.html",
+      "bytes": 1431,
+      "sha256": "87c334d370516eb895e4fda8c7528c8f052390991b2fc248ed9d8a0532bcae0c"
+    },
+    {
+      "name": "producer.html",
+      "bytes": 1312,
+      "sha256": "4916a70b9bcaa83cf0efb6a845cc0821a750409bbe20f4b8f931a32cbb54dd1f"
+    },
+    {
+      "name": "requirements.md",
+      "bytes": 1799,
+      "sha256": "c6ca07af3cdeae66706af81d080459096967c2b605a5dbca342c466444d85cb8"
+    },
+    {
+      "name": "right-timeout.html",
+      "bytes": 1311,
+      "sha256": "bdb3fc58fd5fdc315f2299aadb5b0a751797e21d6ee648c72b65beebc387f210"
+    }
+  ]
+}

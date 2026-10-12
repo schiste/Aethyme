@@ -1,0 +1,96 @@
+{
+  "schema": "aethyme.e1.browser-expectations/v1",
+  "cases": [
+    {
+      "id": "FX01-browser",
+      "outcome": "candidate",
+      "requirements": [
+        "search",
+        "label",
+        "accessible",
+        "keyboard",
+        "mobile",
+        "navigation"
+      ]
+    },
+    {
+      "id": "FX02-browser",
+      "outcome": "candidate",
+      "requirements": [
+        "search",
+        "accessible",
+        "keyboard",
+        "mobile",
+        "navigation",
+        "moved"
+      ]
+    },
+    {
+      "id": "FX03-browser",
+      "outcome": "candidate",
+      "requirements": [
+        "search",
+        "label",
+        "accessible",
+        "mobile",
+        "navigation"
+      ]
+    },
+    {
+      "id": "FX04-browser",
+      "outcome": "synthesis_required",
+      "requirements": [
+        "search",
+        "consent",
+        "privacy",
+        "navigation"
+      ]
+    },
+    {
+      "id": "FX05-browser",
+      "outcome": "conflict",
+      "requirements": [
+        "search"
+      ]
+    },
+    {
+      "id": "FX06-browser",
+      "outcome": "candidate",
+      "requirements": [
+        "search",
+        "navigation"
+      ]
+    },
+    {
+      "id": "FX06-partial",
+      "outcome": "missing_input",
+      "requirements": [
+
+      ]
+    },
+    {
+      "id": "FX06-cycle",
+      "outcome": "dependency_cycle",
+      "requirements": [
+
+      ]
+    },
+    {
+      "id": "FX03-unknown",
+      "outcome": "unknown_base",
+      "requirements": [
+
+      ]
+    },
+    {
+      "id": "FX07-browser",
+      "outcome": "recompose_or_inseparable",
+      "requirements": [
+        "search",
+        "consent",
+        "privacy",
+        "navigation"
+      ]
+    }
+  ]
+}
