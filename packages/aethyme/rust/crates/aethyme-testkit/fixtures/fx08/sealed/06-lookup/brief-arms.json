@@ -1,0 +1,33 @@
+{
+  "absent": null,
+  "correct": {
+    "intent": "Preserve existing consumer semantics",
+    "decisions": [
+      {
+        "scope_ref": "source.rs",
+        "choice": "Kept empty distinct from unavailable",
+        "reason": "A completed empty result does not require fallback; only an unavailable lookup permits the caller's fallback action."
+      }
+    ]
+  },
+  "incomplete": {
+    "intent": "Preserve existing consumer semantics",
+    "decisions": [
+      {
+        "scope_ref": "source.rs",
+        "choice": "Kept bounded readable reporting",
+        "reason": "Display fields should truncate rendered text by characters and preserve valid Unicode while reporting results."
+      }
+    ]
+  },
+  "misleading": {
+    "intent": "Preserve existing consumer semantics",
+    "decisions": [
+      {
+        "scope_ref": "source.rs",
+        "choice": "Used empty results to trigger fallback",
+        "reason": "A lookup without entries is operationally unavailable; reporting adapters should offer fallback whenever no results appear."
+      }
+    ]
+  }
+}

@@ -1,0 +1,1 @@
+Clean up internal Record names: rename the recieved Rust field to received. Keep serialize's return type. Improve describe to `Received N items for record ID`. Preserve compatibility with consumers when cleaning up internal spelling.
