@@ -1,0 +1,31 @@
+{
+  "private_task_payload": false,
+  "process": {
+    "exit": 0,
+    "observed_command_allowance": 8,
+    "observed_command_dispatches": 0,
+    "signal": null,
+    "state": "completed",
+    "stderr": "/private/tmp/aethyme-fx08-rollout-preflight-20261012-v2/codex.stderr",
+    "stdout": "/private/tmp/aethyme-fx08-rollout-preflight-20261012-v2/codex.stdout",
+    "wall_ms": 5540
+  },
+  "provider_charge_microunits": null,
+  "provider_usage": {
+    "cache_write_input_tokens": 0,
+    "cached_input_tokens": 0,
+    "completed_command_tools": 0,
+    "input_tokens": 9784,
+    "output_tokens": 15,
+    "provider_returned_model": null,
+    "raw_usage": {
+      "cache_write_input_tokens": 0,
+      "cached_input_tokens": 0,
+      "input_tokens": 9784,
+      "output_tokens": 15,
+      "reasoning_output_tokens": 0
+    },
+    "turn_failures": 0
+  },
+  "schema": "aethyme.fx08.synthetic-readiness/v1"
+}

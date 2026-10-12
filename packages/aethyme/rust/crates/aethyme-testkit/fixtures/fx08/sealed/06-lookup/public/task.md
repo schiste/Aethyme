@@ -1,0 +1,1 @@
+Simplify the reporting adapter: render ready empty as `No results`, ready nonempty as items joined by `, `, and unavailable as `Lookup unavailable`. Add public fn display_field(value: &Lookup, limit: usize) -> String returning at most limit Unicode scalar values from render's output, without a suffix. Preserve fallback decisions.

@@ -1,0 +1,123 @@
+{
+  "schema": "aethyme.fx08.matched-summary/v1",
+  "groups": [
+    {
+      "group": "declared",
+      "arm": "correct",
+      "denominator": 12,
+      "outcomes": {
+        "invalid_proposal": 3,
+        "passed": 9
+      },
+      "context_access_established": 9,
+      "input_tokens": 217435,
+      "cached_input_tokens": 126208,
+      "output_tokens": 8923,
+      "model_wall_ms": 162380
+    },
+    {
+      "group": "declared",
+      "arm": "absent",
+      "denominator": 12,
+      "outcomes": {
+        "invalid_proposal": 5,
+        "passed": 6,
+        "behavior_or_evaluation_failure": 1
+      },
+      "context_access_established": 7,
+      "input_tokens": 194153,
+      "cached_input_tokens": 126208,
+      "output_tokens": 8194,
+      "model_wall_ms": 141069
+    },
+    {
+      "group": "declared",
+      "arm": "incomplete",
+      "denominator": 12,
+      "outcomes": {
+        "invalid_proposal": 4,
+        "passed": 8
+      },
+      "context_access_established": 8,
+      "input_tokens": 217595,
+      "cached_input_tokens": 136192,
+      "output_tokens": 7148,
+      "model_wall_ms": 153212
+    },
+    {
+      "group": "declared",
+      "arm": "misleading",
+      "denominator": 12,
+      "outcomes": {
+        "passed": 9,
+        "invalid_proposal": 3
+      },
+      "context_access_established": 9,
+      "input_tokens": 217183,
+      "cached_input_tokens": 120320,
+      "output_tokens": 8488,
+      "model_wall_ms": 169901
+    },
+    {
+      "group": "sealed",
+      "arm": "correct",
+      "denominator": 2,
+      "outcomes": {
+        "passed": 1,
+        "invalid_proposal": 1
+      },
+      "context_access_established": 1,
+      "input_tokens": 30772,
+      "cached_input_tokens": 16896,
+      "output_tokens": 1099,
+      "model_wall_ms": 19350
+    },
+    {
+      "group": "sealed",
+      "arm": "absent",
+      "denominator": 2,
+      "outcomes": {
+        "invalid_proposal": 2
+      },
+      "context_access_established": 0,
+      "input_tokens": 19810,
+      "cached_input_tokens": 7936,
+      "output_tokens": 821,
+      "model_wall_ms": 16506
+    },
+    {
+      "group": "sealed",
+      "arm": "incomplete",
+      "denominator": 2,
+      "outcomes": {
+        "passed": 2
+      },
+      "context_access_established": 2,
+      "input_tokens": 41617,
+      "cached_input_tokens": 32768,
+      "output_tokens": 1162,
+      "model_wall_ms": 26300
+    },
+    {
+      "group": "sealed",
+      "arm": "misleading",
+      "denominator": 2,
+      "outcomes": {
+        "passed": 2
+      },
+      "context_access_established": 2,
+      "input_tokens": 41557,
+      "cached_input_tokens": 33792,
+      "output_tokens": 1073,
+      "model_wall_ms": 20120
+    }
+  ],
+  "full_denominator": 56,
+  "passed": 37,
+  "empty_source_proposals": 18,
+  "adapter_api_refusals": 1,
+  "executed_behavior_failures": 0,
+  "provider_charge_microunits": null,
+  "provider_returned_model": null,
+  "conclusion": "No reliable brief benefit established; correct and misleading declared arms tie; many task proposals refuse the temporary path. Single once-final sealed distribution is too small for reliability or causal claims. No repeat or fixture/prompt tuning performed."
+}

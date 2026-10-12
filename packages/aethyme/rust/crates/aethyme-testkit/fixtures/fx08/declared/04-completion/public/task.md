@@ -1,0 +1,1 @@
+Improve status_text to `In progress`, `Completion unknown`, `Completed`, `Failed`. Deduplicate notifications by exact (operation id, status), retaining the first occurrence in input order. Keep signatures and the existing recovery contract. This change only formats status and deduplicates notices.
