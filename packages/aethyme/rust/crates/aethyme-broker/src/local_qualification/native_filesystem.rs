@@ -503,7 +503,10 @@ impl Drop for OwnedImage {
 }
 
 fn enospc(error: &std::io::Error) -> bool {
-    error.raw_os_error() == Some(libc::ENOSPC)
+    // tempfile preserves ErrorKind while its private path wrapper hides the
+    // raw errno and exposes no underlying raw-OS cause. Keep the typed kind;
+    // never classify storage failure by matching its display text.
+    error.raw_os_error() == Some(libc::ENOSPC) || error.kind() == std::io::ErrorKind::StorageFull
 }
 
 fn inventory(image: &str, mount: &str) -> Value {
@@ -600,6 +603,19 @@ fn native_volume_uuid_and_enospc_classification_are_exact() {
         "same device number cannot transfer image ownership"
     );
     assert!(enospc(&std::io::Error::from_raw_os_error(libc::ENOSPC)));
+    assert!(
+        enospc(&std::io::Error::new(
+            std::io::ErrorKind::StorageFull,
+            "wrapped path context"
+        )),
+        "typed wrapped storage-full must remain classified"
+    );
+    assert!(
+        !enospc(&std::io::Error::other(
+            "No space left on device (os error 28)"
+        )),
+        "display text cannot qualify storage failure"
+    );
     assert!(
         !enospc(&std::io::Error::from_raw_os_error(libc::EIO)),
         "generic IO cannot qualify kernel ENOSPC"
@@ -789,7 +805,7 @@ fn run_pressure(disk: &mut OwnedImage) {
         }
     };
     assert!(
-        enospc(&error),
+        error.raw_os_error() == Some(libc::ENOSPC),
         "pressure must observe actual native kernel ENOSPC: {error}"
     );
     if let Err(e) = pressure.sync_all() {
@@ -888,10 +904,14 @@ fn run_pressure(disk: &mut OwnedImage) {
     assert!(
         plan.reclaimable
             .iter()
-            .any(|e| project_directory.join(&e.relpath) == object_path)
+            .any(|e| project_directory.join(&e.relpath) == object_path),
+        "actual GC must select independently published orphan"
     );
     crate::collaboration_gc::apply(&mut f.store, &plan.digest, &options).unwrap();
-    assert!(!archive::object_path(&f.store, &orphan).exists());
+    assert!(
+        !archive::object_path(&f.store, &orphan).exists(),
+        "actual GC must remove the selected orphan"
+    );
     let final_source = disk.root.join("source-after-gc");
     archive::reconstruct(&f.store, &first.result, &final_source).unwrap();
     assert_eq!(
