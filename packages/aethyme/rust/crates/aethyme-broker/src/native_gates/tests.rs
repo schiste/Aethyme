@@ -300,3 +300,28 @@ fn native_gate_roots_survive_revision_root_release() {
     )
     .unwrap();
 }
+
+#[test]
+fn fresh_dispatch_refuses_a_job_completed_after_the_callers_snapshot() {
+    let mut s = setup(None);
+    let stale_prepared = prepare(&mut s.f.store, &s.owner, &mut s.broker, &s.wave).unwrap();
+    assert_eq!(stale_prepared.state, "prepared");
+    let done = run_fresh(&mut s.f.store, &s.owner, &mut s.broker, &stale_prepared.id).unwrap();
+    assert_eq!(done.state, "completed");
+    assert_eq!(
+        done.observation.as_ref().unwrap()["current_authority"],
+        true
+    );
+    assert!(
+        matches!(
+            run_fresh(&mut s.f.store, &s.owner, &mut s.broker, &stale_prepared.id),
+            Err(NativeGateError::Unknown)
+        ),
+        "fresh dispatch rechecks actual durable state, not a callers prepared snapshot"
+    );
+    let historical = run(&mut s.f.store, &s.owner, &mut s.broker, &stale_prepared.id).unwrap();
+    assert_eq!(
+        historical.observation, done.observation,
+        "explicit history access remains read only"
+    );
+}

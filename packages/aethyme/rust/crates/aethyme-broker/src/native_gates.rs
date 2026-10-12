@@ -660,13 +660,35 @@ pub fn run(
     broker: &mut Broker,
     key: &RecordId,
 ) -> Result<Job, NativeGateError> {
+    run_inner(store, owner, broker, key, false)
+}
+
+/// Dispatch only a prepared job. Historical completion never becomes fresh
+/// gate authority; the existing prepared-to-dispatching CAS closes races.
+pub fn run_fresh(
+    store: &mut CollaborationStore,
+    owner: &ControllerOwner,
+    broker: &mut Broker,
+    key: &RecordId,
+) -> Result<Job, NativeGateError> {
+    run_inner(store, owner, broker, key, true)
+}
+
+fn run_inner(
+    store: &mut CollaborationStore,
+    owner: &ControllerOwner,
+    broker: &mut Broker,
+    key: &RecordId,
+    fresh: bool,
+) -> Result<Job, NativeGateError> {
     let _authority = target::authorize(store, owner)?;
     let _archive = crate::collaboration_gc::archive_use(store)?;
     let job = load(store, key)?;
     repository_binding(broker, &job.spec)?;
     current(store, owner, &job.spec)?;
     match job.state.as_str() {
-        "completed" => return Ok(job),
+        "completed" if !fresh => return Ok(job),
+        "completed" => return Err(NativeGateError::Unknown),
         "dispatching" | "unknown" => return Err(NativeGateError::Unknown),
         "prepared" => (),
         _ => return Err(NativeGateError::Mismatch),
