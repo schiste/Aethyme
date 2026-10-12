@@ -869,10 +869,22 @@ fn run_pressure(disk: &mut OwnedImage) {
         Some(first.clone())
     );
     disk.assert_mounted();
-    pressure.set_len(0).unwrap();
-    pressure.sync_all().unwrap();
-    drop(pressure);
+    // A failed APFS write may also make ftruncate fail. Unlink the exact
+    // create_new owned entry while its descriptor pins its inode, then close
+    // the last owned descriptor to release its blocks. Never truncate or
+    // remove a replaced path merely because it has the same spelling.
+    let owned = pressure.metadata().unwrap();
+    let entry = std::fs::symlink_metadata(&pressure_path).unwrap();
+    assert!(entry.is_file() && !entry.file_type().is_symlink());
+    assert_eq!(
+        (entry.dev(), entry.ino()),
+        (owned.dev(), owned.ino()),
+        "capacity release must retain exact pressure ownership"
+    );
     std::fs::remove_file(&pressure_path).unwrap();
+    drop(pressure);
+    File::open(&disk.mount).unwrap().sync_all().unwrap();
+    disk.note("owned-pressure-released",json!({"only_owned_entry_unlinked":true,"owned_descriptor_closed":true,"previous_inode":owned.ino(),"previous_bytes":owned.len()}));
     let recovered = capture::capture(&mut f.store, &request).unwrap();
     assert!(
         matches!(recovered, capture::CaptureOutcome::Acknowledged(_)),
