@@ -689,3 +689,81 @@ fn a_requirement_path_outside_the_tree_is_refused() {
         assert_eq!(error.code(), "invalid_request", "{path}");
     }
 }
+
+#[test]
+fn a_valid_archived_request_rechecks_decision_scope_and_protection() {
+    use aethyme_broker::collaboration_archive::{ObjectDigest, read_object};
+    use aethyme_contracts::experimental_v0::Record;
+
+    let mut world = two_writers();
+    let raised = raise(&mut world, &["A", "B"], false, &[], None);
+    let original = read_object(&world.store, &raised.record().object).unwrap();
+    let loaded = resolution::load_request(&mut world.store, &world.repo, raised.record()).unwrap();
+    assert_eq!(loaded.decision_key(), raised.decision_key());
+    assert_eq!(loaded.scope(), raised.scope());
+    assert_eq!(loaded.protected(), raised.protected());
+
+    for (field, value, expected_detail) in [
+        (
+            "kind",
+            serde_json::json!("unrelated-decision"),
+            "the decision does not match its contributions",
+        ),
+        (
+            "scope",
+            serde_json::json!(["u.txt"]),
+            "the scope does not match the members' changes",
+        ),
+        (
+            "protected",
+            serde_json::json!(["u.txt"]),
+            "the protected paths do not match the baseline's policy",
+        ),
+    ] {
+        let mut value_of_record: serde_json::Value = serde_json::from_slice(&original).unwrap();
+        value_of_record[field] = value;
+        let decoded = Record::decode(
+            &serde_json::to_vec(&value_of_record).unwrap(),
+            &[&resolution::RESOLUTION_REQUEST_SCHEMA],
+        )
+        .unwrap();
+        // The adversarial fixture publishes independently constructed bytes in
+        // its own private CAS. Production exposes no arbitrary object writer.
+        let canonical = decoded.canonical_bytes();
+        let object = ObjectDigest::of(&canonical);
+        let digest = object.hex();
+        let parent = world
+            .store
+            .project_dir()
+            .join("objects/sha256")
+            .join(&digest[..2]);
+        std::fs::create_dir_all(&parent).unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(parent.join(&digest[2..]))
+            .unwrap();
+        std::io::Write::write_all(&mut file, &canonical).unwrap();
+        file.sync_all().unwrap();
+        let changed = resolution::RecordRef {
+            id: decoded.id(),
+            object,
+        };
+
+        assert_ne!(changed.id, raised.record().id);
+        assert_eq!(
+            resolution::read_record(&world.store, &changed)
+                .unwrap()
+                .id(),
+            changed.id,
+            "the negative is a valid independently identified archive record"
+        );
+        match resolution::load_request(&mut world.store, &world.repo, &changed) {
+            Err(resolution::ResolutionError::RecordMismatch { record, detail }) => {
+                assert_eq!(record, changed.id.as_str());
+                assert_eq!(detail, expected_detail, "{field}");
+            }
+            other => panic!("{field} must reach its semantic recheck: {other:?}"),
+        }
+    }
+}

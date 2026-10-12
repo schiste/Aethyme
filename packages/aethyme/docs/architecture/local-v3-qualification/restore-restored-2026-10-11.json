@@ -1,0 +1,635 @@
+{
+  "schema": "aethyme.local.qualification.evidence/provisional-v0",
+  "status": "selected_restore_checks_passed",
+  "complete_local_qualification": false,
+  "source_commit": "98ac4152a670a48b4652fd2f19d23f79c0f5c978",
+  "source_tree": "863ce9cd7a6260443aaac3ecc1933c3f5713a1c1",
+  "profile": "aethyme.restore.source-history/provisional-v0",
+  "environment": {
+    "PATH": "/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:$HOME/.cargo/bin",
+    "RUSTC_WRAPPER": "",
+    "CARGO_TARGET_DIR": "external exclusive root cache",
+    "cargo_jobs": 4
+  },
+  "independent_review": {
+    "status": "clear",
+    "implementation_commit": "086d08f7",
+    "ci_fixture_commit": "9a27d6f66af2",
+    "corrected_raw_integrity_test_commit": "904cb871a4d7a13d98c19e731215eb8913acd3e9",
+    "execution": "read-only private exact snapshots; no Cargo"
+  },
+  "denominator": {
+    "selected_passed_executions": 461,
+    "selected_ignored_executions": 7,
+    "named_guard_failures": 12,
+    "unique_scenario_count": null
+  },
+  "limitations": [
+    "source and advisory history only; no current execution/acceptance/adoption authority",
+    "independent receiver source build and actual GC are focused tests, not live provider evidence",
+    "no E1 composition evidence or held-out reruns",
+    "native gates wait for other-owned #725"
+  ],
+  "rows": [
+    {
+      "kind": "restored_selected_test",
+      "source_commit": "98ac4152a670a48b4652fd2f19d23f79c0f5c978",
+      "source_tree": "863ce9cd7a6260443aaac3ecc1933c3f5713a1c1",
+      "argv": [
+        "cargo",
+        "test",
+        "--locked",
+        "-j",
+        "4",
+        "--manifest-path",
+        "packages/aethyme/rust/Cargo.toml",
+        "-p",
+        "aethyme-broker",
+        "--lib",
+        "local_",
+        "--",
+        "--test-threads=4"
+      ],
+      "exit_status": 0,
+      "output_sha256": "5c9407de2a7fb11e20d93a395a100cd8bfd9b8cee43dedfc9523d09d12da6753",
+      "output_bytes": 21283,
+      "counts": {
+        "passed": 197,
+        "failed": 0,
+        "ignored": 2
+      },
+      "limitations": [
+        "overlapping selections count executions, not unique scenarios",
+        "ignored cases are not passing runtime evidence",
+        "not whole Local Q3/Q4 qualification"
+      ]
+    },
+    {
+      "kind": "restored_selected_test",
+      "source_commit": "98ac4152a670a48b4652fd2f19d23f79c0f5c978",
+      "source_tree": "863ce9cd7a6260443aaac3ecc1933c3f5713a1c1",
+      "argv": [
+        "cargo",
+        "test",
+        "--locked",
+        "-j",
+        "4",
+        "--manifest-path",
+        "packages/aethyme/rust/Cargo.toml",
+        "-p",
+        "aethyme-broker",
+        "--lib",
+        "collaboration_",
+        "--",
+        "--test-threads=4"
+      ],
+      "exit_status": 0,
+      "output_sha256": "467c11ead1a458a801b0e280a16bc7c6774d1cb2aeafa4973028138fea181bf2",
+      "output_bytes": 15057,
+      "counts": {
+        "passed": 151,
+        "failed": 0,
+        "ignored": 4
+      },
+      "limitations": [
+        "overlapping selections count executions, not unique scenarios",
+        "ignored cases are not passing runtime evidence",
+        "not whole Local Q3/Q4 qualification"
+      ]
+    },
+    {
+      "kind": "restored_selected_test",
+      "source_commit": "98ac4152a670a48b4652fd2f19d23f79c0f5c978",
+      "source_tree": "863ce9cd7a6260443aaac3ecc1933c3f5713a1c1",
+      "argv": [
+        "cargo",
+        "test",
+        "--locked",
+        "-j",
+        "4",
+        "--manifest-path",
+        "packages/aethyme/rust/Cargo.toml",
+        "-p",
+        "aethyme-broker",
+        "--lib",
+        "execution_snapshot::tests",
+        "--",
+        "--test-threads=4"
+      ],
+      "exit_status": 0,
+      "output_sha256": "b559db3f03eb571ff0b6f778bc6a840526cdb60d9f40e1e0056f74e1682ccc7a",
+      "output_bytes": 1648,
+      "counts": {
+        "passed": 14,
+        "failed": 0,
+        "ignored": 0
+      },
+      "limitations": [
+        "overlapping selections count executions, not unique scenarios",
+        "ignored cases are not passing runtime evidence",
+        "not whole Local Q3/Q4 qualification"
+      ]
+    },
+    {
+      "kind": "restored_selected_test",
+      "source_commit": "98ac4152a670a48b4652fd2f19d23f79c0f5c978",
+      "source_tree": "863ce9cd7a6260443aaac3ecc1933c3f5713a1c1",
+      "argv": [
+        "cargo",
+        "test",
+        "--locked",
+        "-j",
+        "4",
+        "--manifest-path",
+        "packages/aethyme/rust/Cargo.toml",
+        "-p",
+        "aethyme-broker",
+        "--lib",
+        "execution_verifier::tests",
+        "--",
+        "--test-threads=4"
+      ],
+      "exit_status": 0,
+      "output_sha256": "a7e13924edcd4353c198750c287bc4df8753de831a2fd00bf02d2bd9db9f8166",
+      "output_bytes": 1491,
+      "counts": {
+        "passed": 10,
+        "failed": 0,
+        "ignored": 1
+      },
+      "limitations": [
+        "overlapping selections count executions, not unique scenarios",
+        "ignored cases are not passing runtime evidence",
+        "not whole Local Q3/Q4 qualification"
+      ]
+    },
+    {
+      "kind": "restored_selected_test",
+      "source_commit": "98ac4152a670a48b4652fd2f19d23f79c0f5c978",
+      "source_tree": "863ce9cd7a6260443aaac3ecc1933c3f5713a1c1",
+      "argv": [
+        "cargo",
+        "test",
+        "--locked",
+        "-j",
+        "4",
+        "--manifest-path",
+        "packages/aethyme/rust/Cargo.toml",
+        "-p",
+        "aethyme-broker",
+        "--lib",
+        "review::tests",
+        "--",
+        "--test-threads=4"
+      ],
+      "exit_status": 0,
+      "output_sha256": "b5875248e3f430273dc9135ddfda7ccd9d2c44ec12e59ec5f3421e0c8cca28eb",
+      "output_bytes": 1398,
+      "counts": {
+        "passed": 14,
+        "failed": 0,
+        "ignored": 0
+      },
+      "limitations": [
+        "overlapping selections count executions, not unique scenarios",
+        "ignored cases are not passing runtime evidence",
+        "not whole Local Q3/Q4 qualification"
+      ]
+    },
+    {
+      "kind": "restored_selected_test",
+      "source_commit": "98ac4152a670a48b4652fd2f19d23f79c0f5c978",
+      "source_tree": "863ce9cd7a6260443aaac3ecc1933c3f5713a1c1",
+      "argv": [
+        "cargo",
+        "test",
+        "--locked",
+        "-j",
+        "4",
+        "--manifest-path",
+        "packages/aethyme/rust/Cargo.toml",
+        "-p",
+        "aethyme-broker",
+        "--lib",
+        "ship::tests",
+        "--",
+        "--test-threads=4"
+      ],
+      "exit_status": 0,
+      "output_sha256": "02bd393507eb2fb98a6e2c3cfe5abac7b76348773782333c8aaf39fbe781944b",
+      "output_bytes": 1117,
+      "counts": {
+        "passed": 10,
+        "failed": 0,
+        "ignored": 0
+      },
+      "limitations": [
+        "overlapping selections count executions, not unique scenarios",
+        "ignored cases are not passing runtime evidence",
+        "not whole Local Q3/Q4 qualification"
+      ]
+    },
+    {
+      "kind": "restored_selected_test",
+      "source_commit": "98ac4152a670a48b4652fd2f19d23f79c0f5c978",
+      "source_tree": "863ce9cd7a6260443aaac3ecc1933c3f5713a1c1",
+      "argv": [
+        "cargo",
+        "test",
+        "--locked",
+        "-j",
+        "4",
+        "--manifest-path",
+        "packages/aethyme/rust/Cargo.toml",
+        "-p",
+        "aethyme-broker",
+        "--lib",
+        "git::",
+        "--",
+        "--test-threads=4"
+      ],
+      "exit_status": 0,
+      "output_sha256": "d074333e2c743ee9ac93f9cc217bad94411051f52b58b5a1f69dfacf2124930b",
+      "output_bytes": 3439,
+      "counts": {
+        "passed": 36,
+        "failed": 0,
+        "ignored": 0
+      },
+      "limitations": [
+        "overlapping selections count executions, not unique scenarios",
+        "ignored cases are not passing runtime evidence",
+        "not whole Local Q3/Q4 qualification"
+      ]
+    },
+    {
+      "kind": "restored_selected_test",
+      "source_commit": "98ac4152a670a48b4652fd2f19d23f79c0f5c978",
+      "source_tree": "863ce9cd7a6260443aaac3ecc1933c3f5713a1c1",
+      "argv": [
+        "cargo",
+        "test",
+        "--locked",
+        "-j",
+        "4",
+        "--manifest-path",
+        "packages/aethyme/rust/Cargo.toml",
+        "-p",
+        "aethyme-broker",
+        "--lib",
+        "composer::tests",
+        "--",
+        "--test-threads=4"
+      ],
+      "exit_status": 0,
+      "output_sha256": "318897a4847e12853147f6fb435da062b755ba5647fc44473f88d01097363531",
+      "output_bytes": 901,
+      "counts": {
+        "passed": 8,
+        "failed": 0,
+        "ignored": 0
+      },
+      "limitations": [
+        "overlapping selections count executions, not unique scenarios",
+        "ignored cases are not passing runtime evidence",
+        "not whole Local Q3/Q4 qualification"
+      ]
+    },
+    {
+      "kind": "restored_selected_test",
+      "source_commit": "98ac4152a670a48b4652fd2f19d23f79c0f5c978",
+      "source_tree": "863ce9cd7a6260443aaac3ecc1933c3f5713a1c1",
+      "argv": [
+        "cargo",
+        "test",
+        "--locked",
+        "-j",
+        "4",
+        "--manifest-path",
+        "packages/aethyme/rust/Cargo.toml",
+        "-p",
+        "aethyme-testkit",
+        "--test",
+        "broker_discarded_results",
+        "--",
+        "--test-threads=4"
+      ],
+      "exit_status": 0,
+      "output_sha256": "0f7bf109c186b9f514f648e6484ba36b78d083dac9d864cb26ea28618ca8ff6b",
+      "output_bytes": 709,
+      "counts": {
+        "passed": 3,
+        "failed": 0,
+        "ignored": 0
+      },
+      "limitations": [
+        "overlapping selections count executions, not unique scenarios",
+        "ignored cases are not passing runtime evidence",
+        "not whole Local Q3/Q4 qualification"
+      ]
+    },
+    {
+      "kind": "restored_selected_test",
+      "source_commit": "98ac4152a670a48b4652fd2f19d23f79c0f5c978",
+      "source_tree": "863ce9cd7a6260443aaac3ecc1933c3f5713a1c1",
+      "argv": [
+        "cargo",
+        "test",
+        "--locked",
+        "-j",
+        "4",
+        "--manifest-path",
+        "packages/aethyme/rust/Cargo.toml",
+        "-p",
+        "aethyme-testkit",
+        "--test",
+        "deprecated_spelling_callers",
+        "--",
+        "--test-threads=4"
+      ],
+      "exit_status": 0,
+      "output_sha256": "9703c6f427150fc1f1ab2dc63cc8f987f99930eb114d0d32045e2f8ce949e5a1",
+      "output_bytes": 807,
+      "counts": {
+        "passed": 4,
+        "failed": 0,
+        "ignored": 0
+      },
+      "limitations": [
+        "overlapping selections count executions, not unique scenarios",
+        "ignored cases are not passing runtime evidence",
+        "not whole Local Q3/Q4 qualification"
+      ]
+    },
+    {
+      "kind": "restored_selected_test",
+      "source_commit": "98ac4152a670a48b4652fd2f19d23f79c0f5c978",
+      "source_tree": "863ce9cd7a6260443aaac3ecc1933c3f5713a1c1",
+      "argv": [
+        "cargo",
+        "test",
+        "--locked",
+        "-j",
+        "4",
+        "--manifest-path",
+        "packages/aethyme/rust/Cargo.toml",
+        "-p",
+        "aethyme-testkit",
+        "--test",
+        "docs_hygiene",
+        "--",
+        "--test-threads=4"
+      ],
+      "exit_status": 0,
+      "output_sha256": "cbcd623440f2bc76278bb2298446be0762b2732db20d64e0de374d9666dcd397",
+      "output_bytes": 1047,
+      "counts": {
+        "passed": 14,
+        "failed": 0,
+        "ignored": 0
+      },
+      "limitations": [
+        "overlapping selections count executions, not unique scenarios",
+        "ignored cases are not passing runtime evidence",
+        "not whole Local Q3/Q4 qualification"
+      ]
+    },
+    {
+      "kind": "strict_clippy",
+      "source_commit": "98ac4152a670a48b4652fd2f19d23f79c0f5c978",
+      "source_tree": "863ce9cd7a6260443aaac3ecc1933c3f5713a1c1",
+      "argv": [
+        "cargo",
+        "clippy",
+        "--locked",
+        "-j",
+        "4",
+        "--manifest-path",
+        "packages/aethyme/rust/Cargo.toml",
+        "-p",
+        "aethyme-broker",
+        "--lib",
+        "--tests",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "exit_status": 0,
+      "output_sha256": "4845c8e3d95bbbd0cee0dc917cb5868984b8915ef0748ce9256b20503f9763ae",
+      "output_bytes": 495,
+      "limitations": [
+        "static lint, not runtime evidence"
+      ]
+    }
+  ],
+  "guard_trials": [
+    {
+      "kind": "named_guard_removal",
+      "base_commit": "904cb871a4d7a13d98c19e731215eb8913acd3e9",
+      "mutated_worktree": true,
+      "guard": "receiver_digest",
+      "test": "local_restore::tests::receiver_digest_origin_visibility_and_audience_are_independently_pinned",
+      "exit_status": 101,
+      "exit_status_source": "serial runner accepts only 101 with named assertion failure and no compiler error",
+      "output_sha256": "c17b1f8bec57c7fb58df3e5252cfbec62885bdc37c937e9b5bc454347a577e49",
+      "output_bytes": 1468,
+      "original_source_sha256": {
+        "local_restore.rs": "4b358326cd57032b603354f9917681fdd47401241e88b769ff1cad537940f00b",
+        "local_restore/manager.rs": "e044eda7c76df63f3b17cdb35eeda3858632abda4d9ebd6e8bf99058e6eb6d2a"
+      },
+      "exact_source_restored": true
+    },
+    {
+      "kind": "named_guard_removal",
+      "base_commit": "904cb871a4d7a13d98c19e731215eb8913acd3e9",
+      "mutated_worktree": true,
+      "guard": "receiver_scope",
+      "test": "local_restore::tests::receiver_digest_origin_visibility_and_audience_are_independently_pinned",
+      "exit_status": 101,
+      "exit_status_source": "serial runner accepts only 101 with named assertion failure and no compiler error",
+      "output_sha256": "d4dcbe8977672d3b3b7b9030dfaf7551ae2ce795f08fef5680b402efcbbf0843",
+      "output_bytes": 1257,
+      "original_source_sha256": {
+        "local_restore.rs": "4b358326cd57032b603354f9917681fdd47401241e88b769ff1cad537940f00b",
+        "local_restore/manager.rs": "e044eda7c76df63f3b17cdb35eeda3858632abda4d9ebd6e8bf99058e6eb6d2a"
+      },
+      "exact_source_restored": true
+    },
+    {
+      "kind": "named_guard_removal",
+      "base_commit": "904cb871a4d7a13d98c19e731215eb8913acd3e9",
+      "mutated_worktree": true,
+      "guard": "object_integrity",
+      "test": "local_restore::tests::changed_objects_missing_payloads_trailing_bytes_and_duplicates_refuse",
+      "exit_status": 101,
+      "exit_status_source": "serial runner accepts only 101 with named assertion failure and no compiler error",
+      "output_sha256": "f1fea23489b6c83e00fa3f907c72ab6e2889bdd02144275146feb5ece4150842",
+      "output_bytes": 1372,
+      "original_source_sha256": {
+        "local_restore.rs": "4b358326cd57032b603354f9917681fdd47401241e88b769ff1cad537940f00b",
+        "local_restore/manager.rs": "e044eda7c76df63f3b17cdb35eeda3858632abda4d9ebd6e8bf99058e6eb6d2a"
+      },
+      "exact_source_restored": true
+    },
+    {
+      "kind": "named_guard_removal",
+      "base_commit": "904cb871a4d7a13d98c19e731215eb8913acd3e9",
+      "mutated_worktree": true,
+      "guard": "git_provenance",
+      "test": "local_restore::tests::retained_git_provenance_format_must_match_the_commit_identity",
+      "exit_status": 101,
+      "exit_status_source": "serial runner accepts only 101 with named assertion failure and no compiler error",
+      "output_sha256": "3ea845382416ad718808fefdaccd3e6c95aded4293af57227e0813813c4d919d",
+      "output_bytes": 1281,
+      "original_source_sha256": {
+        "local_restore.rs": "4b358326cd57032b603354f9917681fdd47401241e88b769ff1cad537940f00b",
+        "local_restore/manager.rs": "e044eda7c76df63f3b17cdb35eeda3858632abda4d9ebd6e8bf99058e6eb6d2a"
+      },
+      "exact_source_restored": true
+    },
+    {
+      "kind": "named_guard_removal",
+      "base_commit": "904cb871a4d7a13d98c19e731215eb8913acd3e9",
+      "mutated_worktree": true,
+      "guard": "capture_mapping",
+      "test": "local_restore::tests::canonical_capture_and_context_records_with_wrong_mapping_refuse",
+      "exit_status": 101,
+      "exit_status_source": "serial runner accepts only 101 with named assertion failure and no compiler error",
+      "output_sha256": "bc76c2ef019af5fba5abdf5d4f17775b93e9d24b37046b20861c279555166086",
+      "output_bytes": 1290,
+      "original_source_sha256": {
+        "local_restore.rs": "4b358326cd57032b603354f9917681fdd47401241e88b769ff1cad537940f00b",
+        "local_restore/manager.rs": "e044eda7c76df63f3b17cdb35eeda3858632abda4d9ebd6e8bf99058e6eb6d2a"
+      },
+      "exact_source_restored": true
+    },
+    {
+      "kind": "named_guard_removal",
+      "base_commit": "904cb871a4d7a13d98c19e731215eb8913acd3e9",
+      "mutated_worktree": true,
+      "guard": "context_mapping",
+      "test": "local_restore::tests::canonical_capture_and_context_records_with_wrong_mapping_refuse",
+      "exit_status": 101,
+      "exit_status_source": "serial runner accepts only 101 with named assertion failure and no compiler error",
+      "output_sha256": "045e8c81ffe4705e052a0d0c8b60148b230270ed92d8050bc9b24aeb2bb5f62e",
+      "output_bytes": 1290,
+      "original_source_sha256": {
+        "local_restore.rs": "4b358326cd57032b603354f9917681fdd47401241e88b769ff1cad537940f00b",
+        "local_restore/manager.rs": "e044eda7c76df63f3b17cdb35eeda3858632abda4d9ebd6e8bf99058e6eb6d2a"
+      },
+      "exact_source_restored": true
+    },
+    {
+      "kind": "named_guard_removal",
+      "base_commit": "904cb871a4d7a13d98c19e731215eb8913acd3e9",
+      "mutated_worktree": true,
+      "guard": "analysis_boundary",
+      "test": "local_restore::tests::analysis_references_are_explicitly_unsupported_by_source_history_profile",
+      "exit_status": 101,
+      "exit_status_source": "serial runner accepts only 101 with named assertion failure and no compiler error",
+      "output_sha256": "f8fddcec0bd6fc12df8d82c405d1aee113092df93b4fae7f3459f2793bf79321",
+      "output_bytes": 1333,
+      "original_source_sha256": {
+        "local_restore.rs": "4b358326cd57032b603354f9917681fdd47401241e88b769ff1cad537940f00b",
+        "local_restore/manager.rs": "e044eda7c76df63f3b17cdb35eeda3858632abda4d9ebd6e8bf99058e6eb6d2a"
+      },
+      "exact_source_restored": true
+    },
+    {
+      "kind": "named_guard_removal",
+      "base_commit": "904cb871a4d7a13d98c19e731215eb8913acd3e9",
+      "mutated_worktree": true,
+      "guard": "record_allowlist",
+      "test": "local_restore::tests::unsupported_native_records_never_become_a_restore_policy",
+      "exit_status": 101,
+      "exit_status_source": "serial runner accepts only 101 with named assertion failure and no compiler error",
+      "output_sha256": "88696cce228c3c19cf449a8106556365e0f0ebaed8fafb6609fb64c6a92776e1",
+      "output_bytes": 1234,
+      "original_source_sha256": {
+        "local_restore.rs": "4b358326cd57032b603354f9917681fdd47401241e88b769ff1cad537940f00b",
+        "local_restore/manager.rs": "e044eda7c76df63f3b17cdb35eeda3858632abda4d9ebd6e8bf99058e6eb6d2a"
+      },
+      "exact_source_restored": true
+    },
+    {
+      "kind": "named_guard_removal",
+      "base_commit": "904cb871a4d7a13d98c19e731215eb8913acd3e9",
+      "mutated_worktree": true,
+      "guard": "receiver_binding",
+      "test": "local_restore::tests::stale_receiving_binding_and_revoked_exporter_cannot_copy_bytes",
+      "exit_status": 101,
+      "exit_status_source": "serial runner accepts only 101 with named assertion failure and no compiler error",
+      "output_sha256": "b6bff66072b10ae9eea41da7f10af06785ecfcccbac06e292550f7243208b039",
+      "output_bytes": 1204,
+      "original_source_sha256": {
+        "local_restore.rs": "4b358326cd57032b603354f9917681fdd47401241e88b769ff1cad537940f00b",
+        "local_restore/manager.rs": "e044eda7c76df63f3b17cdb35eeda3858632abda4d9ebd6e8bf99058e6eb6d2a"
+      },
+      "exact_source_restored": true
+    },
+    {
+      "kind": "named_guard_removal",
+      "base_commit": "904cb871a4d7a13d98c19e731215eb8913acd3e9",
+      "mutated_worktree": true,
+      "guard": "historical_pins",
+      "test": "local_restore::tests::durable_historical_object_pins_survive_real_gc",
+      "exit_status": 101,
+      "exit_status_source": "serial runner accepts only 101 with named assertion failure and no compiler error",
+      "output_sha256": "9030aec08ec79b0ba4a39f6e22c6dac973fe621c503562da535aff02632be826",
+      "output_bytes": 1195,
+      "original_source_sha256": {
+        "local_restore.rs": "4b358326cd57032b603354f9917681fdd47401241e88b769ff1cad537940f00b",
+        "local_restore/manager.rs": "e044eda7c76df63f3b17cdb35eeda3858632abda4d9ebd6e8bf99058e6eb6d2a"
+      },
+      "exact_source_restored": true
+    },
+    {
+      "kind": "named_guard_removal",
+      "base_commit": "904cb871a4d7a13d98c19e731215eb8913acd3e9",
+      "mutated_worktree": true,
+      "guard": "rehearsal_recheck",
+      "test": "local_restore::tests::prepared_rehearsal_is_exact_exclusive_and_rechecked",
+      "exit_status": 101,
+      "exit_status_source": "serial runner accepts only 101 with named assertion failure and no compiler error",
+      "output_sha256": "faee6941425a69543797eba52c7eac7c10e6d155997f322977342289f2b48fb5",
+      "output_bytes": 1188,
+      "original_source_sha256": {
+        "local_restore.rs": "4b358326cd57032b603354f9917681fdd47401241e88b769ff1cad537940f00b",
+        "local_restore/manager.rs": "e044eda7c76df63f3b17cdb35eeda3858632abda4d9ebd6e8bf99058e6eb6d2a"
+      },
+      "exact_source_restored": true
+    },
+    {
+      "kind": "named_guard_removal",
+      "base_commit": "904cb871a4d7a13d98c19e731215eb8913acd3e9",
+      "mutated_worktree": true,
+      "guard": "rehearsal_replay",
+      "test": "local_restore::tests::interrupted_rehearsal_is_unknown_and_does_not_replay",
+      "exit_status": 101,
+      "exit_status_source": "serial runner accepts only 101 with named assertion failure and no compiler error",
+      "output_sha256": "b418cad3ff3d3f04015e6c2c5def5ee56cc59db866fcaf754c1ca4bac02e0983",
+      "output_bytes": 1221,
+      "original_source_sha256": {
+        "local_restore.rs": "4b358326cd57032b603354f9917681fdd47401241e88b769ff1cad537940f00b",
+        "local_restore/manager.rs": "e044eda7c76df63f3b17cdb35eeda3858632abda4d9ebd6e8bf99058e6eb6d2a"
+      },
+      "exact_source_restored": true
+    }
+  ],
+  "excluded_observations": [
+    {
+      "observation": "surviving_initial_raw_object_mutation",
+      "credited": false,
+      "reason": "A parsing boundary masked the removed hash check; corrected raw-file negative is separately qualified",
+      "output_sha256": "979ef98a92aad5c2cb56ca8a14c0d2c0b70d6679fb1d7994cd56725d6ff629b9",
+      "output_bytes": 613
+    },
+    {
+      "observation": "zero_test_wrong_cached_worktree",
+      "credited": false,
+      "reason": "Shared target reused another worktree binary; forced current broker rebuild and reran 18 actual tests",
+      "output_sha256": "003439271e5ce30499ba324dd482098d41b083f4521ace80563e985c859c8285",
+      "output_bytes": 298
+    }
+  ]
+}

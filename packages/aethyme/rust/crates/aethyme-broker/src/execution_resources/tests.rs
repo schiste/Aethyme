@@ -22,7 +22,7 @@ fn envelope() -> Envelope {
         time_ms: 1000,
     }
 }
-fn policy(host: &Path) -> ResourcePolicy {
+pub(super) fn policy(host: &Path) -> ResourcePolicy {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -42,7 +42,7 @@ fn policy(host: &Path) -> ResourcePolicy {
         daemon_floor_bytes: 1,
     }
 }
-fn subject(
+pub(super) fn subject(
     runtime: String,
     image: String,
 ) -> (
@@ -135,7 +135,7 @@ fn subject(
     budget::authorize_objective(&mut f.store, &owner, cap).unwrap();
     (f, owner, execution, w.id)
 }
-fn attempt(
+pub(super) fn attempt(
     f: &mut Fixture,
     owner: &ControllerOwner,
     execution: &ExecutionSnapshot,
