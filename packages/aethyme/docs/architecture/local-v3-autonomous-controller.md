@@ -95,3 +95,28 @@ Validation before this checkpoint: 20 composer guard tests, 21 wave regression t
 and seven ordinary controller tests passed. The updated two-wave Docker/provider
 positive is compiled but has not run; sustained service, FX17, final CI and mutation
 checks remain outstanding. This checkpoint does not qualify autonomous reliability.
+
+
+## Finite service and CLI checkpoint
+
+A native appointment now freezes cycle/completion/time allowances, exact revision
+and epoch, the already configured verifier generation, runtime, execution recipe
+and local source destination. It journals dispatch before timed polling of durable
+arrivals. Unknown appointments never resume automatically; project budgets persist
+across appointments. The CLI accepts explicit operator appointment/resource files
+and an existing broker session, producer generation and local bare Git destination.
+It does not configure or revive verifier trust. State schema/floor is 22.
+
+Accepted-baseline composition retains all constituents for dependency validation,
+independent obligations and provenance while applying only new deltas. Recipes carry
+the required accepted-baseline-v1 capability; older readers refuse them, and the
+existing bounded resolver explicitly refuses this separately appointed profile.
+Native recipe validation binds its prior completion/member list to the exact wave.
+Native run_fresh checks durable prepared state inside dispatch and uses the existing
+CAS; a caller's earlier snapshot cannot turn historical gates into fresh authority.
+
+Current local validation: eleven ordinary controller controls pass, including the
+three-wave same-line progression, current-generation verifier recovery/revocation,
+finite appointment bounds and preserving-row migration. The actual sustained-arrival
+Docker/provider test is compiled but remains unrun pending independent review. FX17,
+strict final lint/ratchets, CLI snapshot and full CI remain outstanding.

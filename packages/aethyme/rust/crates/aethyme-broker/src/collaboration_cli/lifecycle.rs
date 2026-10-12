@@ -441,6 +441,167 @@ pub(super) fn export(root: &Path, rest: &[&str]) -> Result<Output, Failure> {
         "Historical source bundle written exclusively; source remains retained\n".into(),
     ))
 }
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ResourceAppointment {
+    host_state: std::path::PathBuf,
+    temporary_root: std::path::PathBuf,
+    meter_image: String,
+    memory_mib: u32,
+    disk_mib: u32,
+    process_slots: u32,
+    job_slots: u32,
+    host_floor_bytes: u64,
+    daemon_floor_bytes: u64,
+}
+fn read_operator<T: serde::de::DeserializeOwned>(path: &str) -> Result<T, Failure> {
+    use std::io::Read;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = options.open(path).map_err(io)?;
+    let metadata = file.metadata().map_err(io)?;
+    if !metadata.is_file() || metadata.len() > MAX_SPEC {
+        return Err(Failure::usage(
+            "bounded regular operator specification required",
+        ));
+    }
+    let mut bytes = vec![];
+    file.take(MAX_SPEC + 1)
+        .read_to_end(&mut bytes)
+        .map_err(io)?;
+    if bytes.len() as u64 > MAX_SPEC {
+        return Err(Failure::usage("operator specification too large"));
+    }
+    serde_json::from_slice(&bytes).map_err(|e| Failure::usage(e.to_string()))
+}
+pub(super) fn target_run(root: &Path, rest: &[&str]) -> Result<Output, Failure> {
+    use crate::execution_supervisor::DockerExecutor;
+    use crate::execution_verifier;
+    use crate::local_controller::{self as controller, ServicePolicy};
+    let flags = Flags::parse(
+        rest,
+        &[
+            "--target",
+            "--issuer",
+            "--appointment",
+            "--resources",
+            "--producer",
+            "--generation",
+            "--session",
+            "--remote",
+            "--destination",
+            "--docker",
+            "--timeout",
+            "--authorization",
+            "--allow-replacement",
+        ],
+        &[],
+    )?;
+    let policy: ServicePolicy = read_operator(flags.one("--appointment")?)?;
+    let resources: ResourceAppointment = read_operator(flags.one("--resources")?)?;
+    let generation = flags
+        .one("--generation")?
+        .parse::<i64>()
+        .map_err(|_| Failure::usage("positive producer generation required"))?;
+    let session = flags
+        .one("--session")?
+        .parse::<i64>()
+        .map_err(|_| Failure::usage("positive broker session required"))?;
+    let timeout = flags
+        .one("--timeout")?
+        .parse::<u64>()
+        .map_err(|_| Failure::usage("finite transport timeout required"))?;
+    let replacement = match flags.one("--allow-replacement")? {
+        "yes" => true,
+        "no" => false,
+        _ => return Err(Failure::usage("--allow-replacement requires yes or no")),
+    };
+    if generation < 1 || session < 1 || !(1..=60).contains(&timeout) {
+        return Err(Failure::usage(
+            "positive identities and timeout at most60 seconds required",
+        ));
+    }
+    let cli = std::path::PathBuf::from(flags.one("--docker")?);
+    if !cli.is_absolute()
+        || !resources.host_state.is_absolute()
+        || !resources.temporary_root.is_absolute()
+    {
+        return Err(Failure::usage(
+            "absolute native client and resource paths required",
+        ));
+    }
+    let mut store = open(root)?;
+    let owner = existing_owner(&mut store, flags.one("--target")?, flags.one("--issuer")?)?;
+    let permit =
+        execution_verifier::existing_permit(&store, &owner, flags.one("--producer")?, generation)
+            .map_err(|e| Failure::domain("verifier_authority", e.to_string()))?;
+    let native =
+        DockerExecutor::probe(cli).map_err(|e| Failure::domain("native_runtime", e.to_string()))?;
+    let resource_policy = crate::execution_resources::ResourcePolicy {
+        host_state: resources.host_state,
+        temporary_root: resources.temporary_root,
+        runtime: native.runtime().id(),
+        daemon: native.runtime().daemon_id.clone(),
+        meter_image: resources.meter_image,
+        memory_mib: resources.memory_mib,
+        disk_mib: resources.disk_mib,
+        process_slots: resources.process_slots,
+        job_slots: resources.job_slots,
+        host_floor_bytes: resources.host_floor_bytes,
+        daemon_floor_bytes: resources.daemon_floor_bytes,
+    };
+    let executor = native
+        .with_resources(resource_policy)
+        .map_err(|e| Failure::domain("host_resources", e.to_string()))?;
+    let mut broker =
+        crate::Broker::open(root).map_err(|e| Failure::domain("broker", e.to_string()))?;
+    let carrier = crate::local_source_transport::GitCarrier::new(
+        &mut broker,
+        session,
+        flags.one("--remote")?,
+        flags.one("--destination")?,
+        timeout,
+        flags.one("--authorization")?,
+        replacement,
+    )
+    .map_err(|e| Failure::domain("transport", e.to_string()))?;
+    if !std::path::Path::new(&carrier.identity.push_url).is_absolute() {
+        return Err(Failure::refused(
+            "unsupported_profile",
+            "this appointed CLI profile supports an explicit local bare Git destination",
+            "use the separate qualified provider API for other transports",
+        ));
+    }
+    let report = controller::serve(
+        &mut store,
+        &owner,
+        &mut broker,
+        &carrier,
+        &executor,
+        &permit,
+        &policy,
+        &std::sync::atomic::AtomicBool::new(false),
+    )
+    .map_err(|e| Failure::domain("controller", e.to_string()))?;
+    let text = format!(
+        "Local appointment {}: {:?}; {} accepted wave(s) in {} tick(s)\n",
+        report.appointment,
+        report.outcome,
+        report.completions.len(),
+        report.ticks
+    );
+    Ok((
+        serde_json::to_value(report)
+            .map_err(|e| Failure::domain("controller_report", e.to_string()))?,
+        text,
+    ))
+}
+
 pub(super) fn unsupported() -> Failure {
     Failure::refused(
         "unsupported_profile",

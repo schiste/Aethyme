@@ -5,7 +5,7 @@ use crate::local_target::tests::{Fixture, git};
 fn digest(bytes: &[u8]) -> String {
     format!("sha256:{}", ObjectDigest::of(bytes).hex())
 }
-fn policy() -> DrivePolicy {
+pub(crate) fn policy() -> DrivePolicy {
     let command = CommandSpec {
         program: "/bin/sh".into(),
         arguments: vec!["/artifact/app.sh".into()],
@@ -282,25 +282,56 @@ fn actual_appointed_driver_completes_without_a_manufactured_receipt() {
     )
     .unwrap();
     wave::available(&mut f.store, &owner, "A", 0).unwrap();
-    let result = drive(
-        &mut f.store,
-        &owner,
-        &mut broker,
-        &carrier,
-        &executor,
-        &permit,
-        &p,
-        &AtomicBool::new(false),
-        0,
-    )
-    .unwrap();
-    let DriveResult::Completed {
-        completion,
-        historical: false,
-    } = result
-    else {
-        panic!("actual controller did not complete: {result:?}")
+    let appointment = super::super::service::ServicePolicy {
+        nonce: "sustained-arrival-1".into(),
+        drive: p.clone(),
+        max_ticks: 4096,
+        max_completions: 2,
+        poll_ms: 20,
+        max_elapsed_ms: 600000,
     };
+    let arrival_host = source_host.clone();
+    let service = std::thread::scope(|scope| {
+        let owner_ref = &owner;
+        let sender=scope.spawn(move || {
+            let mut observer=CollaborationStore::open(&crate::collaboration_state::CollaborationRoot::under_host_state(&arrival_host),&crate::collaboration_state::ProjectKey::parse("local-target-test").unwrap(),&[]).unwrap();
+            let until=std::time::Instant::now()+std::time::Duration::from_secs(300);
+            loop {
+                let completed:i64=observer.read_connection().query_row("SELECT count(*) FROM local_controller_completions WHERE target='native-controller'",[],|r|r.get(0)).unwrap();
+                if completed==1 {
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                    wave::available(&mut observer,owner_ref,"B",1).unwrap();
+                    return;
+                }
+                if std::time::Instant::now()>=until {panic!("bounded arrival observer did not see first completion");}
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        });
+        let report = super::super::service::serve(
+            &mut f.store,
+            &owner,
+            &mut broker,
+            &carrier,
+            &executor,
+            &permit,
+            &appointment,
+            &AtomicBool::new(false),
+        );
+        sender.join().unwrap();
+        report.unwrap()
+    });
+    assert_eq!(
+        service.outcome,
+        super::super::service::ServiceOutcome::CompletionAllowance,
+        "finite service must accept both separate arrivals"
+    );
+    assert_eq!(service.completions.len(), 2);
+    assert!(
+        service.ticks > 2,
+        "timed service waits for the later durable arrival without redispatch"
+    );
+    let completion = service.completions[0].clone();
+    let second = service.completions[1].clone();
     assert_eq!(
         target::status(&f.store, owner.target()).unwrap().phase,
         Phase::PublicationConfirmed,
@@ -317,7 +348,7 @@ fn actual_appointed_driver_completes_without_a_manufactured_receipt() {
     );
     assert_eq!(
         git(&remote, &["rev-parse", "refs/heads/accepted"]),
-        completion.accepted_commit
+        second.accepted_commit
     );
     assert_eq!(
         git(&repo, &["rev-parse", "HEAD"]),
@@ -328,43 +359,6 @@ fn actual_appointed_driver_completes_without_a_manufactured_receipt() {
         load(&f.store, &completion.record().unwrap().id()).unwrap(),
         completion
     );
-    // A timed call with no pending arrival stays quiescent and cannot rerun A.
-    let idle = drive(
-        &mut f.store,
-        &owner,
-        &mut broker,
-        &carrier,
-        &executor,
-        &permit,
-        &p,
-        &AtomicBool::new(false),
-        0,
-    )
-    .unwrap();
-    assert!(
-        matches!(idle, DriveResult::Waiting(_)),
-        "accepted wave cannot redispatch"
-    );
-    wave::available(&mut f.store, &owner, "B", 1).unwrap();
-    let next = drive(
-        &mut f.store,
-        &owner,
-        &mut broker,
-        &carrier,
-        &executor,
-        &permit,
-        &p,
-        &AtomicBool::new(false),
-        1,
-    )
-    .unwrap();
-    let DriveResult::Completed {
-        completion: second,
-        historical: false,
-    } = next
-    else {
-        panic!("second actual wave did not complete: {next:?}")
-    };
     let second_wave = wave::load(&f.store, &RecordId::parse(&second.wave).unwrap()).unwrap();
     assert_eq!(
         second_wave.spec.prior_completion.as_deref(),
@@ -409,7 +403,7 @@ fn actual_appointed_driver_completes_without_a_manufactured_receipt() {
     assert_eq!(runs, 2);
     let pending:i64=f.store.read_connection().query_row("SELECT count(*) FROM local_budget_reservations WHERE phase IN ('reserved','partly_consumed','completion_pending','consumption_unknown')",[],|r|r.get(0)).unwrap();
     assert_eq!(pending, 0, "no unconfirmed budget released");
-    let bytes=serde_json::to_vec_pretty(&json!({"profile":"aethyme.local-controller/experimental-v1","completion":completion,"second_completion":second,"source_host":source_host,"source_repository":repo,"remote":remote,"host":host,"runtime":executor.runtime(),"completed_runs":runs,"pending_reservations":pending,"original_head":original})).unwrap();
+    let bytes=serde_json::to_vec_pretty(&json!({"profile":"aethyme.local-controller/experimental-v1","completion":completion,"second_completion":second,"service":service,"source_host":source_host,"source_repository":repo,"remote":remote,"host":host,"runtime":executor.runtime(),"completed_runs":runs,"pending_reservations":pending,"original_head":original})).unwrap();
     std::fs::write(host.join("report.json"), bytes).unwrap();
 }
 
@@ -525,4 +519,132 @@ fn controller_migrations_adopt_existing_journals_without_erasing_rows() {
     );
     let roots:i64=reopened.read_connection().query_row("SELECT count(*) FROM local_controller_completion_roots WHERE completion='migration-sentinel' AND reference='retained-sentinel'",[],|r|r.get(0)).unwrap();
     assert_eq!(roots, 1, "migration preserves independent retention roots");
+}
+
+#[test]
+fn later_same_line_edit_then_third_wave_does_not_replay_accepted_deltas() {
+    use crate::composer::{self, CompositionBudget, CompositionRequest, ContributionSpec};
+    let mut f = Fixture::new();
+    let repo = f._repo.path();
+    git(
+        repo,
+        &["checkout", "-q", "--detach", f.a.result.commit.as_str()],
+    );
+    std::fs::write(repo.join("one.txt"), "B\n").unwrap();
+    git(repo, &["commit", "-qam", "dependent same-line edit"]);
+    let b_commit = archive::pin_commit(repo, "HEAD").unwrap();
+    let b =
+        archive::retain_contribution(&mut f.store, repo, &f.a.result.commit, &b_commit).unwrap();
+    git(
+        repo,
+        &["checkout", "-q", "--detach", f.a.base.commit.as_str()],
+    );
+    std::fs::write(repo.join("three.txt"), "C\n").unwrap();
+    git(repo, &["add", "three.txt"]);
+    git(repo, &["commit", "-qm", "later independent arrival"]);
+    let c_commit = archive::pin_commit(repo, "HEAD").unwrap();
+    let c = archive::retain_contribution(&mut f.store, repo, &f.a.base.commit, &c_commit).unwrap();
+    let contribution =
+        |id: &str, c: &archive::RetainedContribution, requires: Vec<String>| ContributionSpec {
+            id: id.into(),
+            lineage: Some(c.lineage_record_id.clone()),
+            requires,
+            atomic_group: None,
+            revision_of: None,
+            derived_from: vec![],
+        };
+    let mut request = CompositionRequest {
+        baseline: f.a.base.commit.clone(),
+        accepted: vec![],
+        catalog: vec![
+            contribution("A", &f.a, vec![]),
+            contribution("B", &b, vec!["A".into()]),
+            contribution("C", &c, vec![]),
+        ],
+        deliveries: vec!["A".into()],
+        budget: CompositionBudget::default(),
+    };
+    let first = composer::compose(&mut f.store, repo, &request)
+        .unwrap()
+        .outcome
+        .candidate()
+        .unwrap()
+        .clone();
+    request.baseline = first.commit.clone();
+    request.accepted = vec![f.a.base.commit.clone()];
+    request.deliveries.push("B".into());
+    let controlled_proof = RecordId::parse(&digest(b"synthetic composition-only proof")).unwrap();
+    let second = composer::compose_after_accepted(
+        &mut f.store,
+        repo,
+        &request,
+        controlled_proof.clone(),
+        vec!["A".into()],
+    )
+    .unwrap()
+    .outcome
+    .candidate()
+    .unwrap()
+    .clone();
+    assert_eq!(
+        git(
+            repo,
+            &["show", &format!("{}:one.txt", second.commit.as_str())]
+        ),
+        "B"
+    );
+    request.baseline = second.commit.clone();
+    request.deliveries.push("C".into());
+    let third = composer::compose_after_accepted(
+        &mut f.store,
+        repo,
+        &request,
+        controlled_proof,
+        vec!["A".into(), "B".into()],
+    )
+    .unwrap();
+    let candidate = third
+        .outcome
+        .candidate()
+        .expect("third wave must not replay the accepted A delta onto B");
+    assert_eq!(
+        git(
+            repo,
+            &["show", &format!("{}:one.txt", candidate.commit.as_str())]
+        ),
+        "B"
+    );
+    assert_eq!(
+        git(
+            repo,
+            &["show", &format!("{}:three.txt", candidate.commit.as_str())]
+        ),
+        "C"
+    );
+    assert_eq!(
+        git(
+            repo,
+            &["rev-parse", &format!("{}^", candidate.commit.as_str())]
+        ),
+        second.commit.as_str()
+    );
+    assert_eq!(
+        third.order,
+        vec!["A", "B", "C"],
+        "all surviving constituents remain in provenance"
+    );
+    let recipe = composer::read_recipe(&f.store, third.recipe.as_ref().unwrap()).unwrap();
+    assert!(
+        recipe.get("accepted_baseline").is_some(),
+        "recipe records the private wave adapter input"
+    );
+    static LEGACY: RecordSchema = RecordSchema {
+        name: composer::COMPOSITION_RECIPE_SCHEMA_NAME,
+        fields: &[],
+        capabilities: &[],
+    };
+    assert!(
+        Record::decode(&recipe.canonical_bytes(), &[&LEGACY]).is_err(),
+        "old readers must refuse incremental recipes they cannot interpret"
+    );
 }

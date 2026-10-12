@@ -88,12 +88,21 @@ struct MergeProfile<'a> {
     engine: Option<&'a MergirafEngine>,
     observations: Vec<MergeObservation>,
     text_merges: usize,
+    accepted_baseline: Option<AcceptedBaseline>,
+}
+
+struct AcceptedBaseline {
+    completion: RecordId,
+    members: Vec<String>,
+    lineages: BTreeSet<RecordId>,
 }
 
 impl MergeProfile<'_> {
     fn name(&self) -> &'static str {
         if self.engine.is_some() {
             structural::HTML_PROFILE
+        } else if self.accepted_baseline.is_some() {
+            "aethyme.compose.git-merge-file/accepted-baseline-v0"
         } else {
             PROVISIONAL_TEXT_PROFILE
         }
@@ -137,6 +146,7 @@ pub fn compose_structural(
         engine: Some(engine),
         observations: Vec::new(),
         text_merges: 0,
+        accepted_baseline: None,
     };
     let composition = compose_inner(
         store,
@@ -188,8 +198,14 @@ pub static COMPOSITION_RECIPE_SCHEMA: RecordSchema = RecordSchema {
         field("deliveries", FieldKind::Integer, true),
         field("budget", FieldKind::Opaque, true),
         field("recomposition", FieldKind::Opaque, false),
+        FieldSpec {
+            name: "accepted_baseline",
+            kind: FieldKind::Opaque,
+            required: false,
+            capability: Some("accepted-baseline-v1"),
+        },
     ],
-    capabilities: &[],
+    capabilities: &["accepted-baseline-v1"],
 };
 
 /// One contribution the caller knows about, by its lineage record.
@@ -353,6 +369,53 @@ pub fn compose(
             engine: None,
             observations: Vec::new(),
             text_merges: 0,
+            accepted_baseline: None,
+        },
+    )
+}
+
+/// Internal wave adapter only: the caller has rechecked a private completion
+/// and its accepted wave against the exact baseline. All constituents remain
+/// in the lineage/dependency plan and recipe; delivered deltas are not replayed.
+pub(crate) fn compose_after_accepted(
+    store: &mut CollaborationStore,
+    repo: &Path,
+    request: &CompositionRequest,
+    completion: RecordId,
+    members: Vec<String>,
+) -> Result<Composition, ComposeError> {
+    let mut lineages = BTreeSet::new();
+    for member in &members {
+        if !request.deliveries.contains(member) {
+            return Err(ComposeError::InvalidRequest(
+                "accepted member is absent from cumulative delivery".into(),
+            ));
+        }
+        let lineage = request
+            .catalog
+            .iter()
+            .find(|s| &s.id == member)
+            .and_then(|s| s.lineage.clone())
+            .ok_or_else(|| {
+                ComposeError::InvalidRequest("accepted lineage is unavailable".into())
+            })?;
+        lineages.insert(lineage);
+    }
+    compose_inner(
+        store,
+        repo,
+        request,
+        &request.deliveries,
+        None,
+        &mut MergeProfile {
+            engine: None,
+            observations: Vec::new(),
+            text_merges: 0,
+            accepted_baseline: Some(AcceptedBaseline {
+                completion,
+                members,
+                lineages,
+            }),
         },
     )
 }
@@ -377,6 +440,7 @@ pub fn recompose_without(
             engine: None,
             observations: Vec::new(),
             text_merges: 0,
+            accepted_baseline: None,
         },
     )
 }
@@ -392,6 +456,7 @@ pub fn recompose_structural_without(
         engine: Some(engine),
         observations: Vec::new(),
         text_merges: 0,
+        accepted_baseline: None,
     };
     let composition = recompose_inner(store, repo, request, subtraction, &mut profile)?;
     Ok(StructuralComposition {
@@ -768,6 +833,13 @@ fn build(
     let mut accumulator = baseline_entries.clone();
     let scratch = tempfile::tempdir().map_err(|source| io(Path::new("<tempdir>"), source))?;
     for step in &plan.steps {
+        if profile
+            .accepted_baseline
+            .as_ref()
+            .is_some_and(|accepted| accepted.lineages.contains(&step.retained.lineage_record_id))
+        {
+            continue;
+        }
         let base = reader.entries(&step.retained.base.snapshot_id)?;
         let result = reader.entries(&step.retained.result.snapshot_id)?;
         if let Err(refusal) = reader.within(usage, request) {
@@ -2158,6 +2230,28 @@ fn recipe_record(
             ]),
         ),
     ];
+    if let Some(accepted) = &profile.accepted_baseline {
+        members.push((
+            "accepted_baseline",
+            object(vec![
+                ("completion", text(accepted.completion.as_str())),
+                (
+                    "members",
+                    Value::Array(accepted.members.iter().map(|s| text(s)).collect()),
+                ),
+            ]),
+        ));
+        members.push((
+            "requires",
+            Value::Array(
+                COMPOSITION_RECIPE_SCHEMA
+                    .required_capabilities(members.iter().map(|(key, _)| *key))
+                    .iter()
+                    .map(|s| text(s))
+                    .collect(),
+            ),
+        ));
+    }
     if let Some(subtraction) = recomposition {
         members.push((
             "recomposition",

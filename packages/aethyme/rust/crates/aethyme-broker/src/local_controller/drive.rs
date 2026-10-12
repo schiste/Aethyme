@@ -35,7 +35,7 @@ pub struct DrivePolicy {
     pub allow_empty_native_gates: bool,
 }
 impl DrivePolicy {
-    fn validate(&self) -> Result<(), ControllerError> {
+    pub(super) fn validate(&self) -> Result<(), ControllerError> {
         if !(1..=900_000).contains(&self.max_wall_ms)
             || self.execution.profile.build_limits.timeout_ms > 60_000
             || self.execution.profile.verifier_limits.timeout_ms > 60_000
@@ -331,7 +331,7 @@ fn run(
     if native.spec.graph_config_sha256.is_some() {
         return Err(ControllerError::Mismatch);
     }
-    let native = native_gates::run(store, owner, broker, &native.id)?;
+    let native = native_gates::run_fresh(store, owner, broker, &native.id)?;
     budget::settle(
         store,
         owner,
@@ -459,4 +459,4 @@ fn run(
 
 #[cfg(all(test, unix))]
 #[path = "drive_tests.rs"]
-mod tests;
+pub(crate) mod tests;

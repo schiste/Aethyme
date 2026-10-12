@@ -285,6 +285,25 @@ fn validate_source(
         ));
     }
     let w = wave::load(store, &id(&spec.wave)?)?;
+    match &w.spec.prior_completion {
+        Some(key) => {
+            let (_, prior) = wave::previous(store, &id(key)?, w.spec.sequence)?;
+            if body["accepted_baseline"]["completion"] != *key
+                || body["accepted_baseline"]["members"] != serde_json::to_value(prior.selected)?
+                || body["profile"] != "aethyme.compose.git-merge-file/accepted-baseline-v0"
+            {
+                return Err(NativeGateError::Binding(
+                    "accepted-baseline recipe differs from prior private completion",
+                ));
+            }
+        }
+        None if !body["accepted_baseline"].is_null() => {
+            return Err(NativeGateError::Binding(
+                "unexpected accepted-baseline recipe",
+            ));
+        }
+        None => (),
+    }
     let revision = target::load_revision(store, &id(&spec.revision)?)?;
     let mut ordered = Vec::new();
     for row in body["order"].as_array().ok_or(NativeGateError::Mismatch)? {

@@ -16,6 +16,8 @@ use crate::local_wave::{self as wave, WavePhase};
 
 pub mod drive;
 pub use drive::{DrivePolicy, DriveResult, drive};
+pub mod service;
+pub use service::{ServiceOutcome, ServicePolicy, ServiceReport, serve};
 
 const SCHEMA: RecordSchema = RecordSchema {
     name: "aethyme.local-controller-completion/experimental-v1",

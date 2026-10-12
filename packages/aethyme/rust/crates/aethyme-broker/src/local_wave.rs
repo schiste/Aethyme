@@ -689,16 +689,18 @@ pub fn compose(
     }
     tx.commit()?;
     let started = std::time::Instant::now();
-    let (base_commit, accepted) = if let Some(key) = &wave.spec.prior_completion {
-        let (completion, _) = previous(store, &id(key)?, wave.spec.sequence)?;
+    let (base_commit, accepted, already_delivered) = if let Some(key) = &wave.spec.prior_completion
+    {
+        let (completion, prior) = previous(store, &id(key)?, wave.spec.sequence)?;
         let original = archive::retained(store, &snapshot(&pinned.spec.baseline)?)?
             .ok_or(TargetError::Missing)?;
         (
             CommitOid::parse(&completion.accepted_commit)?,
             vec![original.commit],
+            Some((id(key)?, prior.selected)),
         )
     } else {
-        (baseline.commit, vec![])
+        (baseline.commit, vec![], None)
     };
     let request = CompositionRequest {
         baseline: base_commit,
@@ -710,7 +712,11 @@ pub fn compose(
             ..CompositionBudget::default()
         },
     };
-    let result = composer::compose(store, repo, &request);
+    let result = if let Some((completion, members)) = already_delivered {
+        composer::compose_after_accepted(store, repo, &request, completion, members)
+    } else {
+        composer::compose(store, repo, &request)
+    };
     let elapsed = i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX);
     // State may have been stopped while the external Git tool ran. Retain the
     // bytes as historical work, but reject changing the current generation.
