@@ -1,0 +1,15 @@
+{
+  "source_revision": "6671a4ed17dc",
+  "executable_sha256": "5b36d9c4e33722187cb76d0d0b3ea60793dcb885d5ecb23656900175872a1f0d",
+  "independent_amendment_review": "CLEAR; original56 localconfigrefusals before prompt loading/turn dispatch; all failedschedule retained separately",
+  "source_files": {
+    "packages/aethyme/rust/crates/aethyme-broker/tests/e1_browser/fx08.rs": "6d981dc07cebe4cd92f3576229c459bc0e8b9858f5a404e35b3ff7294fc65086",
+    "packages/aethyme/rust/crates/aethyme-broker/tests/e1_browser/fx08_evaluation.rs": "c1688c96c24bcb439745cebdfa4f8b8ab316bf9dc7a4da552152aa5c717b67b7",
+    "packages/aethyme-eval/fx08/api-adapters.json": "72d2260b3117a03c17f3c3b6350fb7943209ea2004ff5e28f197ebf8c9544507",
+    "packages/aethyme-eval/fx08/proxy-runtime.rs": "37a718e1e9975f5db107a367fcf2b8cef97bb2b661c418c9d4f06b7beb3ab3f5",
+    "packages/aethyme-eval/fx08/subject-runtime.rs": "97f22629c5374e4f6220aa7746bf4d0c03580591b3277532d56f253b96b56638",
+    "packages/aethyme-eval/fx08/context-observations/contexts.json": "d1f29f01c3330bc6af7c8804fff3f081fa6649620dfb61881df4900fae7d0a1c"
+  },
+  "prior_campaign": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc",
+  "readiness": "/private/tmp/aethyme-fx08-rollout-preflight-20261012-v2"
+}

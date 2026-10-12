@@ -67,7 +67,7 @@ all ten earlier failed admission attempts remain uncredited. The separate
 transport calibration then passed all six positives and all six named semantic
 negatives from unchanged independent vectors. Its first failed attempt exposed
 the appointed serde runtime's optional Result feature; the adapter now uses an
-explicit ok/error wire representation while preserving exact signatures. No task-bearing model row has completed. The host SDK/compiler and frozen trusted templates are part of this
+explicit ok/error wire representation while preserving exact signatures. At that admission checkpoint, no task-bearing model row had completed. The host SDK/compiler and frozen trusted templates are part of this
 profile, and metadata/ancestor directory reads are intentionally permitted.
 Trusted adapters check exact public signatures. One dependency and transport
 template snapshot is validated and frozen before model admission, and reused
@@ -110,3 +110,36 @@ using the amended configuration: exit 0, ready true, 9,784 input and 15 output
 tokens, no command tools; invoiced charges and returned model remain unknown.
 An independent pre-model amendment review is required before a new frozen task
 schedule. The original failed schedule will remain reported separately.
+
+## Once-final task campaign
+
+The independently approved amendment was frozen at `6671a4ed`, executable
+SHA-256 `5b36d9c4e33722187cb76d0d0b3ea60793dcb885d5ecb23656900175872a1f0d`.
+All 56 rows completed with 37 passing proposals, 18 empty source proposals and
+one independently enforced API signature refusal. Each passing row passed all
+requested behavior and surviving-obligation checks. No task or sealed row was
+rerun, and no prompt, product, fixture, oracle or criterion was changed to
+improve these results. The original startup-failed schedule remains separate.
+
+| Arm | Declared passes / 12 | Sealed passes / 2 | Declared context access / 12 |
+| --- | ---: | ---: | ---: |
+| Correct | 9 | 1 | 9 |
+| Absent | 6 | 0 | 7 |
+| Incomplete | 8 | 2 | 8 |
+| Misleading | 9 | 2 | 9 |
+
+The eighteen empty-source decisions report inability to inspect the temporary
+fixture directory; they remain failures in each assigned denominator. They
+provide no successful preservation evidence. The remaining failed proposal
+kept the former protocol field after the task requested its public rename; the
+independent adapter refused it before behavior execution. Thus that row is an
+API compatibility refusal, not a measured semantic regression. Actual context
+access is recorded from completed tool output, separately from delivery.
+
+This campaign does not establish reliable brief usefulness. Correct and
+misleading arms tied on the declared cases; access and refusal differences
+confound a causal claim, and the sealed sample is small. Reported token totals,
+cached tokens and process wall times are in `model-observations/summary.json`;
+invoiced charges, actual provider retry counts and returned model stay unknown.
+This result qualifies only the recorded experiment and its narrow safe-Rust
+value/signature profile, not reliability across projects, models or task families.
