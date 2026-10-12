@@ -1,8 +1,8 @@
 //! Explicit E1 Playground experiments. No trials run in ordinary CI.
 use std::collections::BTreeMap;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use aethyme_broker::collaboration_archive::{self, CommitOid};
@@ -145,57 +145,342 @@ fn persist(root: &Path, report: &Value) {
     std::fs::File::open(root).unwrap().sync_all().unwrap();
 }
 
-/// Files avoid pipe deadlocks; own child, time and file growth are bounded.
+struct OwnedChild {
+    child: Child,
+    cleaned: bool,
+}
+impl OwnedChild {
+    fn stop(&mut self) -> std::process::ExitStatus {
+        assert!(!self.cleaned);
+        #[cfg(unix)]
+        unsafe {
+            libc::kill(-(self.child.id() as i32), libc::SIGKILL);
+        }
+        let _ = self.child.kill();
+        let status = self.child.wait().expect("reap owned experiment child");
+        self.cleaned = true;
+        status
+    }
+    fn exited(&mut self) -> bool {
+        #[cfg(unix)]
+        {
+            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            let result = unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    self.child.id(),
+                    &mut info,
+                    libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                )
+            };
+            assert_eq!(
+                result, 0,
+                "observe own child without reaping its group identity"
+            );
+            info.si_signo != 0
+        }
+        #[cfg(not(unix))]
+        {
+            self.child.try_wait().unwrap().is_some()
+        }
+    }
+}
+impl Drop for OwnedChild {
+    fn drop(&mut self) {
+        // The group was created only for this trial. Stop its descendants too,
+        // including when setup/polling unwinds. Never match processes by name.
+        if !self.cleaned {
+            self.stop();
+        }
+    }
+}
+
+const LOG_LIMIT: usize = 1024 * 1024;
+
+/// Bounded pipe readers retain at most limit+1 bytes. Descendants are confined
+/// to an owned process group under this cooperative experiment profile.
 fn external(command: &mut Command, root: &Path, label: &str, seconds: u64) -> Value {
     let stdout = root.join(format!("{label}.stdout"));
     let stderr = root.join(format!("{label}.stderr"));
     command
-        .stdout(Stdio::from(std::fs::File::create(&stdout).unwrap()))
-        .stderr(Stdio::from(std::fs::File::create(&stderr).unwrap()))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .stdin(Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
     let started = Instant::now();
     let mut child = match command.spawn() {
-        Ok(child) => child,
+        Ok(child) => OwnedChild {
+            child,
+            cleaned: false,
+        },
         Err(error) => return json!({"state":"infrastructure_error","error":error.to_string()}),
     };
+    let streams: Vec<Box<dyn Read + Send>> = vec![
+        Box::new(child.child.stdout.take().unwrap()),
+        Box::new(child.child.stderr.take().unwrap()),
+    ];
+    let (sender, receiver) = std::sync::mpsc::channel();
+    for (index, stream) in streams.into_iter().enumerate() {
+        let sender = sender.clone();
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let result = stream
+                .take((LOG_LIMIT + 1) as u64)
+                .read_to_end(&mut bytes)
+                .map(|_| bytes);
+            let _ = sender.send((index, result));
+        });
+    }
+    drop(sender);
+    let mut logs: [Option<Vec<u8>>; 2] = [None, None];
+    let mut state = "completed";
     loop {
-        if [&stdout, &stderr]
-            .iter()
-            .any(|path| std::fs::metadata(path).unwrap().len() > 1024 * 1024)
+        for (index, bytes) in receiver.try_iter() {
+            match bytes {
+                Ok(bytes) => logs[index] = Some(bytes),
+                Err(_) => state = "infrastructure_error",
+            }
+        }
+        if state != "completed"
+            || logs.iter().flatten().any(|bytes| bytes.len() > LOG_LIMIT)
             || started.elapsed() > Duration::from_secs(seconds)
         {
-            child.kill().expect("kill only owned child");
-            child.wait().expect("reap owned child");
-            return json!({"state":"limit_exhausted","wall_ms":started.elapsed().as_millis(),"stdout":stdout,"stderr":stderr});
+            if state == "completed" {
+                state = "limit_exhausted";
+            }
+            break;
         }
-        if let Some(status) = child.try_wait().unwrap() {
-            return json!({"state":"completed","exit":status.code(),"wall_ms":started.elapsed().as_millis(),"stdout":stdout,"stderr":stderr});
+        if child.exited() {
+            break;
         }
         std::thread::sleep(Duration::from_millis(20));
     }
+    let status = child.stop();
+    let exit = status.code();
+    #[cfg(unix)]
+    let signal = {
+        use std::os::unix::process::ExitStatusExt;
+        status.signal()
+    };
+    #[cfg(not(unix))]
+    let signal: Option<i32> = None;
+    drop(child);
+    for _ in 0..2 {
+        if logs.iter().all(Option::is_some) {
+            break;
+        }
+        match receiver.recv_timeout(Duration::from_secs(1)) {
+            Ok((index, Ok(bytes))) => logs[index] = Some(bytes),
+            _ => {
+                state = "infrastructure_error";
+                break;
+            }
+        }
+    }
+    if logs.iter().flatten().any(|bytes| bytes.len() > LOG_LIMIT) {
+        state = "limit_exhausted";
+    }
+    for (path, bytes) in [&stdout, &stderr].into_iter().zip(logs) {
+        let mut bytes = bytes.unwrap_or_default();
+        bytes.truncate(LOG_LIMIT);
+        std::fs::write(path, bytes).unwrap();
+    }
+    json!({"state":state,"exit":exit,"signal":signal,"wall_ms":started.elapsed().as_millis(),"stdout":stdout,"stderr":stderr})
+}
+
+fn requirement_argument(requirements: &Value) -> String {
+    requirements
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|value| {
+            let value = value.as_str().unwrap();
+            assert!(!value.contains(','));
+            value
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn runtime_profile() -> Value {
+    let workspace = aethyme_testkit::rust_workspace_root();
+    let path = workspace
+        .ancestors()
+        .nth(3)
+        .unwrap()
+        .join("packages/aethyme-eval/e1/browser-runtime-profile.json");
+    serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
+}
+
+fn inventory_directory(path: &Path, paths: &mut Vec<String>) {
+    assert!(paths.len() < 50_000, "runtime file-count budget");
+    let metadata = std::fs::symlink_metadata(path).unwrap();
+    assert!(
+        !metadata.file_type().is_symlink(),
+        "runtime inventory rejects symlinks"
+    );
+    if metadata.is_dir() {
+        for entry in std::fs::read_dir(path).unwrap() {
+            inventory_directory(&entry.unwrap().path(), paths);
+        }
+    } else {
+        assert!(metadata.is_file(), "regular runtime file required");
+        paths.push(path.to_str().unwrap().to_string());
+    }
+}
+
+fn verify_runtime(profile: &Value) {
+    assert_eq!(profile["schema"], "aethyme.e1.appointed-browser-runtime/v1");
+    let mut actual = Vec::new();
+    for root in profile["roots"].as_array().unwrap() {
+        inventory_directory(Path::new(root.as_str().unwrap()), &mut actual);
+    }
+    let files = profile["files"].as_array().unwrap();
+    actual.push(profile["node"].as_str().unwrap().to_string());
+    let observer = files
+        .iter()
+        .find(|file| {
+            file["path"]
+                .as_str()
+                .unwrap()
+                .ends_with("/e1/browser-oracle.mjs")
+        })
+        .unwrap();
+    actual.push(observer["path"].as_str().unwrap().to_string());
+    actual.sort();
+    assert_eq!(
+        actual,
+        files
+            .iter()
+            .map(|file| file["path"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>(),
+        "complete runtime inventory differs"
+    );
+    for file in files {
+        let expected_size = file["bytes"].as_u64().unwrap();
+        assert!(
+            expected_size <= 512 * 1024 * 1024,
+            "runtime per-file budget"
+        );
+        let mut source = std::fs::File::open(file["path"].as_str().unwrap())
+            .unwrap()
+            .take(expected_size + 1);
+        let mut hasher = Sha256::new();
+        let mut bytes = 0u64;
+        let mut buffer = [0u8; 65536];
+        loop {
+            let count = source.read(&mut buffer).unwrap();
+            if count == 0 {
+                break;
+            }
+            hasher.update(&buffer[..count]);
+            bytes += count as u64;
+        }
+        assert_eq!(bytes, expected_size, "runtime size changed");
+        assert_eq!(
+            format!("{:x}", hasher.finalize()),
+            file["sha256"].as_str().unwrap(),
+            "runtime bytes changed"
+        );
+    }
+}
+
+fn required_check_names(requirements: &Value) -> Vec<&'static str> {
+    let selected: Vec<&str> = requirements
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|value| value.as_str().unwrap())
+        .collect();
+    let mut checks = vec![
+        "unique DOM identities",
+        "no WebSocket egress",
+        "no runtime page errors",
+    ];
+    for (requirement, check) in [
+        ("label", "selected heading appears exactly once"),
+        ("accessible", "query has selected accessible name"),
+        ("moved", "unique panel moved to sidebar"),
+        ("mobile", "mobile control focuses the same query"),
+        ("keyboard", "Escape clears the query"),
+        ("navigation", "existing navigation survives"),
+        (
+            "no_analytics",
+            "subtraction has no analytics even with consent",
+        ),
+        ("consumer_footer", "actual retained consumer survives"),
+    ] {
+        if selected.contains(&requirement) {
+            checks.push(check);
+        }
+    }
+    if selected.contains(&"search") {
+        checks.extend([
+            "Enter preserves directory search",
+            "pointer preserves directory search",
+        ]);
+    }
+    if selected
+        .iter()
+        .any(|value| ["privacy", "consent", "no_analytics"].contains(value))
+    {
+        checks.push("consent is initially false");
+    }
+    if selected.contains(&"privacy") || selected.contains(&"consent") {
+        checks.extend([
+            "no telemetry without affirmative consent",
+            "one anonymous event with consent",
+            "consent transport is independent of query",
+            "revoked consent stops later events",
+        ]);
+    } else {
+        checks.push("ordinary compositions emit no telemetry");
+    }
+    checks
 }
 
 fn observe(file: &Path, requirements: &Value, root: &Path, label: &str) -> Value {
     let workspace = aethyme_testkit::rust_workspace_root();
     let monorepo = workspace.ancestors().nth(3).unwrap();
     let observer = monorepo.join("packages/aethyme-eval/e1/browser-oracle.mjs");
+    let profile = runtime_profile();
     let mut command = Command::new("/usr/bin/sandbox-exec");
     command
-        .args([
-            "-p",
-            "(version 1)(allow default)(deny network*)",
-            "/opt/homebrew/bin/node",
-        ])
+        .args(["-p", "(version 1)(allow default)(deny network*)"])
+        .arg(profile["node"].as_str().unwrap())
         .arg(observer)
         .arg(file)
-        .arg(serde_json::to_string(requirements).unwrap())
-        .arg(std::env::var_os("AETHYME_E1_PLAYWRIGHT").expect("pinned Playwright module"))
-        .arg(std::env::var_os("AETHYME_E1_CHROMIUM").expect("pinned Chromium executable"));
+        .arg(requirement_argument(requirements))
+        .arg(profile["playwright"].as_str().unwrap())
+        .arg(profile["chromium"].as_str().unwrap());
     let mut result = external(&mut command, root, label, 45);
     if result["state"] == "completed" {
-        let bytes = std::fs::read(result["stdout"].as_str().unwrap()).unwrap();
+        let mut bytes = Vec::new();
+        std::fs::File::open(result["stdout"].as_str().unwrap())
+            .unwrap()
+            .take((LOG_LIMIT + 1) as u64)
+            .read_to_end(&mut bytes)
+            .unwrap();
         result["observation"] = serde_json::from_slice(&bytes)
             .unwrap_or(json!({"passed":false,"error":"invalid observer output"}));
+        if result["exit"] != 0
+            || result["observation"]["schema"] != "aethyme.e1.browser-observation/v1"
+            || result["observation"]["requirements"] != *requirements
+            || result["observation"]["browser_version"] != profile["versions"]["chromium"]
+            || !required_check_names(requirements).iter().all(|name| {
+                result["observation"]["checks"]
+                    .as_array()
+                    .is_some_and(|checks| checks.iter().any(|check| check["name"] == *name))
+            })
+        {
+            result["observation"]["passed"] = json!(false);
+            result["evidence_error"] =
+                json!("observer completion/schema/selected requirements differ");
+        }
     }
     result
 }
@@ -275,6 +560,10 @@ fn compare_browser_inputs() {
     }
     let mut report =
         json!({"schema":"aethyme.e1.browser-campaign/v1","state":"planned","rows":rows});
+    persist(&root, &report);
+    let profile = runtime_profile();
+    verify_runtime(&profile);
+    report["runtime_profile"] = profile;
     persist(&root, &report);
     let engine = MergirafEngine::pin(
         &PathBuf::from(std::env::var_os("AETHYME_E1_ENGINE").unwrap()),
@@ -356,5 +645,147 @@ fn compare_browser_inputs() {
         persist(&root, &report);
     }
     report["state"] = json!("completed");
+    // Private answer selection happens only after all composer observations.
+    let expected: Value =
+        serde_json::from_slice(&std::fs::read(fixtures().join("expectations.json")).unwrap())
+            .unwrap();
+    let mut verdicts = Vec::new();
+    for profile in [
+        "plain-git-unmanaged",
+        "git-text-baseline",
+        "mergiraf-html-candidate",
+    ] {
+        for expectation in expected["cases"].as_array().unwrap() {
+            if expectation["outcome"] == "recompose_or_inseparable" {
+                continue;
+            }
+            let runs: Vec<&Value> = report["rows"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|row| row["profile"] == profile && row["case"] == expectation["id"])
+                .collect();
+            let all_completed =
+                !runs.is_empty() && runs.iter().all(|row| row["state"] == "completed");
+            let hashes: std::collections::BTreeSet<&str> = runs
+                .iter()
+                .filter_map(|row| row["candidate"]["sha256"].as_str())
+                .collect();
+            let identical_bytes = hashes.len() == 1
+                && runs
+                    .iter()
+                    .all(|row| row["candidate"]["sha256"].is_string());
+            let accepted = all_completed
+                && match expectation["outcome"].as_str().unwrap() {
+                    "candidate" => {
+                        identical_bytes
+                            && runs
+                                .iter()
+                                .all(|row| row["browser"]["observation"]["passed"] == true)
+                    }
+                    "synthesis_required" => false, // Genuine bounded synthesis is a separate required phase.
+                    outcome => runs
+                        .iter()
+                        .all(|row| row["outcome"] == outcome && row["candidate"].is_null()),
+                };
+            verdicts.push(json!({"profile":profile,"case":expectation["id"],"expected":expectation["outcome"],"all_completed":all_completed,"byte_identical":identical_bytes,"accepted":accepted,"runs":runs.len()}));
+        }
+    }
+    report["verdicts"] = json!(verdicts);
     persist(&root, &report);
+}
+
+#[test]
+fn requirement_selection_round_trips_cli_and_names_required_checks() {
+    let requirements = json!(["search", "consent", "privacy", "navigation"]);
+    let argument = requirement_argument(&requirements);
+    assert_eq!(
+        argument.split(',').collect::<Vec<_>>(),
+        vec!["search", "consent", "privacy", "navigation"]
+    );
+    assert!(required_check_names(&requirements).contains(&"one anonymous event with consent"));
+    assert!(required_check_names(&requirements).contains(&"Enter preserves directory search"));
+}
+
+#[test]
+#[ignore = "explicit appointed Node runtime parser check; no browser trial"]
+fn appointed_observer_cli_parser_round_trips_selected_requirements() {
+    let requirements = json!(["search", "consent", "privacy", "navigation"]);
+    let argument = requirement_argument(&requirements);
+    let workspace = aethyme_testkit::rust_workspace_root();
+    let observer = workspace
+        .ancestors()
+        .nth(3)
+        .unwrap()
+        .join("packages/aethyme-eval/e1/browser-oracle.mjs");
+    let module_url = format!("file://{}", observer.display());
+    let script = "const {parseRequirements}=await import(process.argv[1]); console.log(JSON.stringify(parseRequirements(process.argv[2]))); try { parseRequirements('[\"search\"]'); process.exitCode=3; } catch {}";
+    let result = Command::new(runtime_profile()["node"].as_str().unwrap())
+        .args(["--input-type=module", "-e", script, &module_url, &argument])
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(
+        serde_json::from_slice::<Value>(&result.stdout).unwrap(),
+        requirements
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn owned_process_group_stops_descendant_after_leader_exit_and_deadline() {
+    for (label, script, seconds, expected) in [
+        (
+            "leader-exit",
+            "sleep 60 & echo $! > descendant.pid",
+            5,
+            "completed",
+        ),
+        (
+            "deadline",
+            "sleep 60 & echo $! > descendant.pid; wait",
+            1,
+            "limit_exhausted",
+        ),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let mut command = Command::new("/bin/sh");
+        command.current_dir(root.path()).args(["-c", script]);
+        let result = external(&mut command, root.path(), label, seconds);
+        assert_eq!(result["state"], expected);
+        assert!(result["exit"].is_number() || result["signal"].is_number());
+        let pid = std::fs::read_to_string(root.path().join("descendant.pid")).unwrap();
+        let pid: i32 = pid.trim().parse().unwrap();
+        // A killed orphan may remain as a zombie until init reaps it. It must
+        // not execute or retain an open pipe after the guardian returns.
+        let status = Command::new("/bin/ps")
+            .args(["-p", &pid.to_string(), "-o", "stat="])
+            .output()
+            .unwrap();
+        let state = String::from_utf8(status.stdout).unwrap();
+        assert!(
+            state.trim().is_empty() || state.trim().starts_with('Z'),
+            "owned descendant still executes: {pid} {state}"
+        );
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn retained_child_logs_have_a_hard_byte_cap() {
+    let root = tempfile::tempdir().unwrap();
+    let mut command = Command::new("/bin/sh");
+    command.args(["-c", "yes bounded-output"]);
+    let result = external(&mut command, root.path(), "flood", 5);
+    assert_eq!(result["state"], "limit_exhausted");
+    assert!(
+        std::fs::metadata(result["stdout"].as_str().unwrap())
+            .unwrap()
+            .len()
+            <= LOG_LIMIT as u64
+    );
 }

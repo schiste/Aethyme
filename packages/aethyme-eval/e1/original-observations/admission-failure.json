@@ -1,0 +1,1134 @@
+{
+  "engine_sha256": "cda5175440f474b4f887c8e6e39878911d15e1a4825d70b4e949a0841820cc3c",
+  "infrastructure_error": "structural executable size or digest mismatch",
+  "rows": [
+    {
+      "accepted": false,
+      "case": "FX01",
+      "profile": "git-text-baseline",
+      "runs": [
+        {
+          "order": [
+            "c1",
+            "c2",
+            "c3"
+          ],
+          "repeat": 0,
+          "state": "unrun"
+        },
+        {
+          "order": [
+            "c1",
+            "c2",
+            "c3"
+          ],
+          "repeat": 1,
+          "state": "unrun"
+        },
+        {
+          "order": [
+            "c1",
+            "c3",
+            "c2"
+          ],
+          "repeat": 0,
+          "state": "unrun"
+        },
+        {
+          "order": [
+            "c1",
+            "c3",
+            "c2"
+          ],
+          "repeat": 1,
+          "state": "unrun"
+        },
+        {
+          "order": [
+            "c2",
+            "c1",
+            "c3"
+          ],
+          "repeat": 0,
+          "state": "unrun"
+        },
+        {
+          "order": [
+            "c2",
+            "c1",
+            "c3"
+          ],
+          "repeat": 1,
+          "state": "unrun"
+        },
+        {
+          "order": [
+            "c2",
+            "c3",
+            "c1"
+          ],
+          "repeat": 0,
+          "state": "unrun"
+        },
+        {
+          "order": [
+            "c2",
+            "c3",
+            "c1"
+          ],
+          "repeat": 1,
+          "state": "unrun"
+        },
+        {
+          "order": [
+            "c3",
+            "c1",
+            "c2"
+          ],
+          "repeat": 0,
+          "state": "unrun"
+        },
+        {
+          "order": [
+            "c3",
+            "c1",
+            "c2"
+          ],
+          "repeat": 1,
+          "state": "unrun"
+        },
+        {
+          "order": [
+            "c3",
+            "c2",
+            "c1"
+          ],
+          "repeat": 0,
+          "state": "unrun"
+        },
+        {
+          "order": [
+            "c3",
+            "c2",
+            "c1"
+          ],
+          "repeat": 1,
+          "state": "unrun"
+        }
+      ],
+      "scenario": "s1",
+      "state": "unrun"
+    },
+    {
+      "accepted": false,
+      "case": "FX02",
+      "profile": "git-text-baseline",
+      "runs": [
+        {
+          "order": [
+            "c1",
+            "c2"
+          ],
+          "repeat": 0,
+          "state": "unrun"
+        },
+        {
+          "order": [
+            "c1",
+            "c2"
+          ],
+          "repeat": 1,
+          "state": "unrun"
+        },
+        {
+          "order": [
+            "c2",
+            "c1"
+          ],
+          "repeat": 0,
+          "state": "unrun"
+        },
+        {
+          "order": [
+            "c2",
+            "c1"
+          ],
+          "repeat": 1,
+          "state": "unrun"
+        }
+      ],
+      "scenario": "s1",
+      "state": "unrun"
+    },
+    {
+      "accepted": false,
+      "case": "FX02",
+      "profile": "git-text-baseline",
+      "runs": [
+        {
+          "order": [
+            "c3",
+            "c4"
+          ],
+          "repeat": 0,
+          "state": "unrun"
+        },
+        {
+          "order": [
+            "c3",
+            "c4"
+          ],
+          "repeat": 1,
+          "state": "unrun"
+        },
+        {
+          "order": [
+            "c4",
+            "c3"
+          ],
+          "repeat": 0,
+          "state": "unrun"
+        },
+        {
+          "order": [
+            "c4",
+            "c3"
+          ],
+          "repeat": 1,
+          "state": "unrun"
+        }
+      ],
+      "scenario": "s2",
+      "state": "unrun"
+    },
+    {
+      "accepted": false,
+      "case": "FX03",
+      "profile": "git-text-baseline",
+      "runs": [
+        {
+          "order": [
+            "c1",
+            "c2"
+          ],
+          "repeat": 0,
+          "state": "unrun"
+        },
+        {
+          "order": [
+            "c1",
+            "c2"
+          ],
+          "repeat": 1,
+          "state": "unrun"
+        }
+      ],
+      "scenario": "s1",
+      "state": "unrun"
+    },
+    {
+      "accepted": false,
+      "case": "FX03",
+      "profile": "git-text-baseline",
+      "runs": [
+        {
+          "order": [
+            "c1",
+            "c1",
+            "c2",
+            "c1"
+          ],
+          "repeat": 0,
+          "state": "unrun"
+        },
+        {
+          "order": [
+            "c1",
+            "c1",
+            "c2",
+            "c1"
+          ],
+          "repeat": 1,
+          "state": "unrun"
+        }
+      ],
+      "scenario": "s2",
+      "state": "unrun"
+    },
+    {
+      "accepted": false,
+      "case": "FX03",
+      "profile": "git-text-baseline",
+      "runs": [
+        {
+          "order": [
+            "c3"
+          ],
+          "repeat": 0,
+          "state": "unrun"
+        },
+        {
+          "order": [
+            "c3"
+          ],
+          "repeat": 1,
+          "state": "unrun"
+        }
+      ],
+      "scenario": "s3",
+      "state": "unrun"
+    },
+    {
+      "accepted": false,
+      "case": "FX04",
+      "profile": "git-text-baseline",
+      "runs": [
+        {
+          "order": [
+            "c1",
+            "c2"
+          ],
+          "repeat": 0,
+          "state": "unrun"
+        },
+        {
+          "order": [
+            "c1",
+            "c2"
+          ],
+          "repeat": 1,
+          "state": "unrun"
+        },
+        {
+          "order": [
+            "c2",
+            "c1"
+          ],
+          "repeat": 0,
+          "state": "unrun"
+        },
+        {
+          "order": [
+            "c2",
+            "c1"
+          ],
+          "repeat": 1,
+          "state": "unrun"
+        }
+      ],
+      "scenario": "s1",
+      "state": "unrun"
+    },
+    {
+      "accepted": false,
+      "case": "FX05",
+      "profile": "git-text-baseline",
+      "runs": [
+        {
+          "order": [
+            "c1",
+            "c2"
+          ],
+          "repeat": 0,
+          "state": "unrun"
+        },
+        {
+          "order": [
+            "c1",
+            "c2"
+          ],
+          "repeat": 1,
+          "state": "unrun"
+        },
+        {
+          "order": [
+            "c2",
+            "c1"
+          ],
+          "repeat": 0,
+          "state": "unrun"
+        },
+        {
+          "order": [
+            "c2",
+            "c1"
+          ],
+          "repeat": 1,
+          "state": "unrun"
+        }
+      ],
+      "scenario": "s1",
+      "state": "unrun"
+    },
+    {
+      "accepted": false,
+      "case": "FX06",
+      "profile": "git-text-baseline",
+      "runs": [
+        {
+          "order": [
+            "c1",
+            "c3"
+          ],
+          "repeat": 0,
+          "state": "unrun"
+        },
+        {
+          "order": [
+            "c1",
+            "c3"
+          ],
+          "repeat": 1,
+          "state": "unrun"
+        }
+      ],
+      "scenario": "s1",
+      "state": "unrun"
+    },
+    {
+      "accepted": false,
+      "case": "FX06",
+      "profile": "git-text-baseline",
+      "runs": [
+        {
+          "order": [
+            "c3"
+          ],
+          "repeat": 0,
+          "state": "unrun"
+        },
+        {
+          "order": [
+            "c3"
+          ],
+          "repeat": 1,
+          "state": "unrun"
+        }
+      ],
+      "scenario": "s2",
+      "state": "unrun"
+    },
+    {
+      "accepted": false,
+      "case": "FX06",
+      "profile": "git-text-baseline",
+      "runs": [
+        {
+          "order": [
+            "c1"
+          ],
+          "repeat": 0,
+          "state": "unrun"
+        },
+        {
+          "order": [
+            "c1"
+          ],
+          "repeat": 1,
+          "state": "unrun"
+        }
+      ],
+      "scenario": "s3",
+      "state": "unrun"
+    },
+    {
+      "accepted": false,
+      "case": "FX06",
+      "profile": "git-text-baseline",
+      "runs": [
+        {
+          "order": [
+            "c4",
+            "c5"
+          ],
+          "repeat": 0,
+          "state": "unrun"
+        },
+        {
+          "order": [
+            "c4",
+            "c5"
+          ],
+          "repeat": 1,
+          "state": "unrun"
+        }
+      ],
+      "scenario": "s4",
+      "state": "unrun"
+    },
+    {
+      "accepted": false,
+      "case": "FX06",
+      "profile": "git-text-baseline",
+      "runs": [
+        {
+          "order": [
+            "c1",
+            "c2",
+            "c3"
+          ],
+          "repeat": 0,
+          "state": "unrun"
+        },
+        {
+          "order": [
+            "c1",
+            "c2",
+            "c3"
+          ],
+          "repeat": 1,
+          "state": "unrun"
+        }
+      ],
+      "scenario": "s5",
+      "state": "unrun"
+    },
+    {
+      "accepted": false,
+      "case": "FX06",
+      "profile": "git-text-baseline",
+      "runs": [
+        {
+          "order": [
+            "c2",
+            "c3"
+          ],
+          "repeat": 0,
+          "state": "unrun"
+        },
+        {
+          "order": [
+            "c2",
+            "c3"
+          ],
+          "repeat": 1,
+          "state": "unrun"
+        }
+      ],
+      "scenario": "s6",
+      "state": "unrun"
+    },
+    {
+      "accepted": false,
+      "case": "FX07",
+      "profile": "git-text-baseline",
+      "runs": [
+        {
+          "order": [],
+          "repeat": 0,
+          "state": "unrun"
+        },
+        {
+          "order": [],
+          "repeat": 1,
+          "state": "unrun"
+        }
+      ],
+      "scenario": "s1",
+      "state": "unrun"
+    },
+    {
+      "accepted": false,
+      "case": "FX07",
+      "profile": "git-text-baseline",
+      "runs": [
+        {
+          "order": [],
+          "repeat": 0,
+          "state": "unrun"
+        },
+        {
+          "order": [],
+          "repeat": 1,
+          "state": "unrun"
+        }
+      ],
+      "scenario": "s2",
+      "state": "unrun"
+    },
+    {
+      "accepted": false,
+      "case": "FX07",
+      "profile": "git-text-baseline",
+      "runs": [
+        {
+          "order": [],
+          "repeat": 0,
+          "state": "unrun"
+        },
+        {
+          "order": [],
+          "repeat": 1,
+          "state": "unrun"
+        }
+      ],
+      "scenario": "s3",
+      "state": "unrun"
+    },
+    {
+      "accepted": false,
+      "case": "FX01",
+      "profile": "mergiraf-html-candidate",
+      "runs": [
+        {
+          "order": [
+            "c1",
+            "c2",
+            "c3"
+          ],
+          "repeat": 0,
+          "state": "unrun"
+        },
+        {
+          "order": [
+            "c1",
+            "c2",
+            "c3"
+          ],
+          "repeat": 1,
+          "state": "unrun"
+        },
+        {
+          "order": [
+            "c1",
+            "c3",
+            "c2"
+          ],
+          "repeat": 0,
+          "state": "unrun"
+        },
+        {
+          "order": [
+            "c1",
+            "c3",
+            "c2"
+          ],
+          "repeat": 1,
+          "state": "unrun"
+        },
+        {
+          "order": [
+            "c2",
+            "c1",
+            "c3"
+          ],
+          "repeat": 0,
+          "state": "unrun"
+        },
+        {
+          "order": [
+            "c2",
+            "c1",
+            "c3"
+          ],
+          "repeat": 1,
+          "state": "unrun"
+        },
+        {
+          "order": [
+            "c2",
+            "c3",
+            "c1"
+          ],
+          "repeat": 0,
+          "state": "unrun"
+        },
+        {
+          "order": [
+            "c2",
+            "c3",
+            "c1"
+          ],
+          "repeat": 1,
+          "state": "unrun"
+        },
+        {
+          "order": [
+            "c3",
+            "c1",
+            "c2"
+          ],
+          "repeat": 0,
+          "state": "unrun"
+        },
+        {
+          "order": [
+            "c3",
+            "c1",
+            "c2"
+          ],
+          "repeat": 1,
+          "state": "unrun"
+        },
+        {
+          "order": [
+            "c3",
+            "c2",
+            "c1"
+          ],
+          "repeat": 0,
+          "state": "unrun"
+        },
+        {
+          "order": [
+            "c3",
+            "c2",
+            "c1"
+          ],
+          "repeat": 1,
+          "state": "unrun"
+        }
+      ],
+      "scenario": "s1",
+      "state": "unrun"
+    },
+    {
+      "accepted": false,
+      "case": "FX02",
+      "profile": "mergiraf-html-candidate",
+      "runs": [
+        {
+          "order": [
+            "c1",
+            "c2"
+          ],
+          "repeat": 0,
+          "state": "unrun"
+        },
+        {
+          "order": [
+            "c1",
+            "c2"
+          ],
+          "repeat": 1,
+          "state": "unrun"
+        },
+        {
+          "order": [
+            "c2",
+            "c1"
+          ],
+          "repeat": 0,
+          "state": "unrun"
+        },
+        {
+          "order": [
+            "c2",
+            "c1"
+          ],
+          "repeat": 1,
+          "state": "unrun"
+        }
+      ],
+      "scenario": "s1",
+      "state": "unrun"
+    },
+    {
+      "accepted": false,
+      "case": "FX02",
+      "profile": "mergiraf-html-candidate",
+      "runs": [
+        {
+          "order": [
+            "c3",
+            "c4"
+          ],
+          "repeat": 0,
+          "state": "unrun"
+        },
+        {
+          "order": [
+            "c3",
+            "c4"
+          ],
+          "repeat": 1,
+          "state": "unrun"
+        },
+        {
+          "order": [
+            "c4",
+            "c3"
+          ],
+          "repeat": 0,
+          "state": "unrun"
+        },
+        {
+          "order": [
+            "c4",
+            "c3"
+          ],
+          "repeat": 1,
+          "state": "unrun"
+        }
+      ],
+      "scenario": "s2",
+      "state": "unrun"
+    },
+    {
+      "accepted": false,
+      "case": "FX03",
+      "profile": "mergiraf-html-candidate",
+      "runs": [
+        {
+          "order": [
+            "c1",
+            "c2"
+          ],
+          "repeat": 0,
+          "state": "unrun"
+        },
+        {
+          "order": [
+            "c1",
+            "c2"
+          ],
+          "repeat": 1,
+          "state": "unrun"
+        }
+      ],
+      "scenario": "s1",
+      "state": "unrun"
+    },
+    {
+      "accepted": false,
+      "case": "FX03",
+      "profile": "mergiraf-html-candidate",
+      "runs": [
+        {
+          "order": [
+            "c1",
+            "c1",
+            "c2",
+            "c1"
+          ],
+          "repeat": 0,
+          "state": "unrun"
+        },
+        {
+          "order": [
+            "c1",
+            "c1",
+            "c2",
+            "c1"
+          ],
+          "repeat": 1,
+          "state": "unrun"
+        }
+      ],
+      "scenario": "s2",
+      "state": "unrun"
+    },
+    {
+      "accepted": false,
+      "case": "FX03",
+      "profile": "mergiraf-html-candidate",
+      "runs": [
+        {
+          "order": [
+            "c3"
+          ],
+          "repeat": 0,
+          "state": "unrun"
+        },
+        {
+          "order": [
+            "c3"
+          ],
+          "repeat": 1,
+          "state": "unrun"
+        }
+      ],
+      "scenario": "s3",
+      "state": "unrun"
+    },
+    {
+      "accepted": false,
+      "case": "FX04",
+      "profile": "mergiraf-html-candidate",
+      "runs": [
+        {
+          "order": [
+            "c1",
+            "c2"
+          ],
+          "repeat": 0,
+          "state": "unrun"
+        },
+        {
+          "order": [
+            "c1",
+            "c2"
+          ],
+          "repeat": 1,
+          "state": "unrun"
+        },
+        {
+          "order": [
+            "c2",
+            "c1"
+          ],
+          "repeat": 0,
+          "state": "unrun"
+        },
+        {
+          "order": [
+            "c2",
+            "c1"
+          ],
+          "repeat": 1,
+          "state": "unrun"
+        }
+      ],
+      "scenario": "s1",
+      "state": "unrun"
+    },
+    {
+      "accepted": false,
+      "case": "FX05",
+      "profile": "mergiraf-html-candidate",
+      "runs": [
+        {
+          "order": [
+            "c1",
+            "c2"
+          ],
+          "repeat": 0,
+          "state": "unrun"
+        },
+        {
+          "order": [
+            "c1",
+            "c2"
+          ],
+          "repeat": 1,
+          "state": "unrun"
+        },
+        {
+          "order": [
+            "c2",
+            "c1"
+          ],
+          "repeat": 0,
+          "state": "unrun"
+        },
+        {
+          "order": [
+            "c2",
+            "c1"
+          ],
+          "repeat": 1,
+          "state": "unrun"
+        }
+      ],
+      "scenario": "s1",
+      "state": "unrun"
+    },
+    {
+      "accepted": false,
+      "case": "FX06",
+      "profile": "mergiraf-html-candidate",
+      "runs": [
+        {
+          "order": [
+            "c1",
+            "c3"
+          ],
+          "repeat": 0,
+          "state": "unrun"
+        },
+        {
+          "order": [
+            "c1",
+            "c3"
+          ],
+          "repeat": 1,
+          "state": "unrun"
+        }
+      ],
+      "scenario": "s1",
+      "state": "unrun"
+    },
+    {
+      "accepted": false,
+      "case": "FX06",
+      "profile": "mergiraf-html-candidate",
+      "runs": [
+        {
+          "order": [
+            "c3"
+          ],
+          "repeat": 0,
+          "state": "unrun"
+        },
+        {
+          "order": [
+            "c3"
+          ],
+          "repeat": 1,
+          "state": "unrun"
+        }
+      ],
+      "scenario": "s2",
+      "state": "unrun"
+    },
+    {
+      "accepted": false,
+      "case": "FX06",
+      "profile": "mergiraf-html-candidate",
+      "runs": [
+        {
+          "order": [
+            "c1"
+          ],
+          "repeat": 0,
+          "state": "unrun"
+        },
+        {
+          "order": [
+            "c1"
+          ],
+          "repeat": 1,
+          "state": "unrun"
+        }
+      ],
+      "scenario": "s3",
+      "state": "unrun"
+    },
+    {
+      "accepted": false,
+      "case": "FX06",
+      "profile": "mergiraf-html-candidate",
+      "runs": [
+        {
+          "order": [
+            "c4",
+            "c5"
+          ],
+          "repeat": 0,
+          "state": "unrun"
+        },
+        {
+          "order": [
+            "c4",
+            "c5"
+          ],
+          "repeat": 1,
+          "state": "unrun"
+        }
+      ],
+      "scenario": "s4",
+      "state": "unrun"
+    },
+    {
+      "accepted": false,
+      "case": "FX06",
+      "profile": "mergiraf-html-candidate",
+      "runs": [
+        {
+          "order": [
+            "c1",
+            "c2",
+            "c3"
+          ],
+          "repeat": 0,
+          "state": "unrun"
+        },
+        {
+          "order": [
+            "c1",
+            "c2",
+            "c3"
+          ],
+          "repeat": 1,
+          "state": "unrun"
+        }
+      ],
+      "scenario": "s5",
+      "state": "unrun"
+    },
+    {
+      "accepted": false,
+      "case": "FX06",
+      "profile": "mergiraf-html-candidate",
+      "runs": [
+        {
+          "order": [
+            "c2",
+            "c3"
+          ],
+          "repeat": 0,
+          "state": "unrun"
+        },
+        {
+          "order": [
+            "c2",
+            "c3"
+          ],
+          "repeat": 1,
+          "state": "unrun"
+        }
+      ],
+      "scenario": "s6",
+      "state": "unrun"
+    },
+    {
+      "accepted": false,
+      "case": "FX07",
+      "profile": "mergiraf-html-candidate",
+      "runs": [
+        {
+          "order": [],
+          "repeat": 0,
+          "state": "unrun"
+        },
+        {
+          "order": [],
+          "repeat": 1,
+          "state": "unrun"
+        }
+      ],
+      "scenario": "s1",
+      "state": "unrun"
+    },
+    {
+      "accepted": false,
+      "case": "FX07",
+      "profile": "mergiraf-html-candidate",
+      "runs": [
+        {
+          "order": [],
+          "repeat": 0,
+          "state": "unrun"
+        },
+        {
+          "order": [],
+          "repeat": 1,
+          "state": "unrun"
+        }
+      ],
+      "scenario": "s2",
+      "state": "unrun"
+    },
+    {
+      "accepted": false,
+      "case": "FX07",
+      "profile": "mergiraf-html-candidate",
+      "runs": [
+        {
+          "order": [],
+          "repeat": 0,
+          "state": "unrun"
+        },
+        {
+          "order": [],
+          "repeat": 1,
+          "state": "unrun"
+        }
+      ],
+      "scenario": "s3",
+      "state": "unrun"
+    }
+  ],
+  "schema": "aethyme.e1.original-fixture-campaign/v1",
+  "state": "engine_admission_failed"
+}

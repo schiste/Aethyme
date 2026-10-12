@@ -4,6 +4,14 @@ import fs from 'node:fs';
 import assert from 'node:assert/strict';
 import { pathToFileURL, fileURLToPath } from 'node:url';
 
+const allowedRequirements = new Set(['search','label','accessible','keyboard','mobile','navigation','moved','consent','privacy','no_analytics','consumer_footer']);
+export function parseRequirements(argument) {
+  const requirements = argument.split(',').filter(Boolean);
+  assert(requirements.every(value=>allowedRequirements.has(value)), 'unknown browser requirement');
+  assert.equal(new Set(requirements).size,requirements.length,'duplicate browser requirement');
+  return requirements;
+}
+
 export async function observe(file, requirements, modulePath, executablePath) {
   const source = fs.readFileSync(file);
   assert(source.length <= 256 * 1024, 'candidate byte limit');
@@ -159,12 +167,12 @@ export async function observe(file, requirements, modulePath, executablePath) {
     }
     await check('no WebSocket egress', async () => assert.deepEqual(sockets,[]));
     await check('no runtime page errors', async () => assert.deepEqual(errors,[]));
-    return {schema:'aethyme.e1.browser-observation/v1',passed:checks.every(c=>c.passed),checks,requests,sockets,errors,observation_window_ms:500,wall_ms:performance.now()-start,browser_version:browser.version()};
+    return {schema:'aethyme.e1.browser-observation/v1',requirements,passed:checks.every(c=>c.passed),checks,requests,sockets,errors,observation_window_ms:500,wall_ms:performance.now()-start,browser_version:browser.version()};
   } finally { await browser.close(); }
 }
-if (process.argv[1] && fs.realpathSync(process.argv[1]) === fs.realpathSync(fileURLToPath(import.meta.url))) {
+if (process.argv[1] && fs.existsSync(process.argv[1]) && fs.realpathSync(process.argv[1]) === fs.realpathSync(fileURLToPath(import.meta.url))) {
   try {
-    const result = await observe(process.argv[2],process.argv[3].split(',').filter(Boolean),process.argv[4],process.argv[5]);
+    const result = await observe(process.argv[2],parseRequirements(process.argv[3]),process.argv[4],process.argv[5]);
     process.stdout.write(JSON.stringify(result)+'\n');
     process.exitCode = result.passed ? 0 : 1;
   } catch (error) {
