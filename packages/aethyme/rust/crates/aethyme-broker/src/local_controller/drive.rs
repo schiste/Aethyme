@@ -92,6 +92,39 @@ fn clock() -> Result<i64, ControllerError> {
     )
     .map_err(|_| ControllerError::Mismatch)
 }
+fn dispatch_deadline(
+    started_ms: i64,
+    max_wall_ms: i64,
+    appointment_deadline: Option<i64>,
+) -> Result<i64, ControllerError> {
+    let local = started_ms
+        .checked_add(max_wall_ms)
+        .ok_or(ControllerError::Mismatch)?;
+    let deadline = appointment_deadline.map_or(local, |appointed| local.min(appointed));
+    if started_ms >= deadline {
+        return Err(ControllerError::Mismatch);
+    }
+    Ok(deadline)
+}
+fn admit_before_deadline(
+    store: &mut CollaborationStore,
+    owner: &ControllerOwner,
+    policy: wave::WavePolicy,
+    now_ms: i64,
+    deadline_ms: i64,
+    cancel: &AtomicBool,
+) -> Result<wave::Admission, ControllerError> {
+    if clock()? >= deadline_ms || cancel.load(Ordering::SeqCst) {
+        return Err(ControllerError::Mismatch);
+    }
+    let admission = wave::admit(store, owner, policy, now_ms)?;
+    // A concurrent writer can delay admission beyond the frozen expiry.
+    // Its durable wave is preserved, but no execution journal or effect follows.
+    if clock()? >= deadline_ms || cancel.load(Ordering::SeqCst) {
+        return Err(ControllerError::Mismatch);
+    }
+    Ok(admission)
+}
 fn check(
     store: &CollaborationStore,
     owner: &ControllerOwner,
@@ -181,12 +214,39 @@ pub fn drive(
     cancel: &AtomicBool,
     now_ms: i64,
 ) -> Result<DriveResult, ControllerError> {
-    let _authority = target::authorize(store, owner)?;
+    drive_until(
+        store, owner, broker, carrier, executor, permit, policy, cancel, now_ms, None,
+    )
+}
+
+/// The service supplies its frozen absolute expiry; admission cannot extend it.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn drive_until(
+    store: &mut CollaborationStore,
+    owner: &ControllerOwner,
+    broker: &mut Broker,
+    carrier: &GitCarrier,
+    executor: &DockerExecutor,
+    permit: &ProducerPermit,
+    policy: &DrivePolicy,
+    cancel: &AtomicBool,
+    now_ms: i64,
+    appointment_deadline: Option<i64>,
+) -> Result<DriveResult, ControllerError> {
     policy.validate()?;
-    if cancel.load(Ordering::SeqCst) {
+    let deadline_ms = dispatch_deadline(clock()?, policy.max_wall_ms, appointment_deadline)?;
+    let _authority = target::authorize(store, owner)?;
+    if cancel.load(Ordering::SeqCst) || clock()? >= deadline_ms {
         return Err(ControllerError::Mismatch);
     }
-    let admission = wave::admit(store, owner, policy.wave_policy, now_ms)?;
+    let admission = admit_before_deadline(
+        store,
+        owner,
+        policy.wave_policy,
+        now_ms,
+        deadline_ms,
+        cancel,
+    )?;
     let active = match admission {
         wave::Admission::Frozen(w) | wave::Admission::Existing(w) => w,
         other => return Ok(DriveResult::Waiting(other)),
@@ -230,9 +290,7 @@ pub fn drive(
         epoch: owner.authority_epoch().as_str().into(),
         wave: active.id.to_string(),
         policy: policy.clone(),
-        deadline_ms: clock()?
-            .checked_add(policy.max_wall_ms)
-            .ok_or(ControllerError::Mismatch)?,
+        deadline_ms,
     };
     let record = canonical(&spec)?;
     let _archive = archive_use(store)?;
