@@ -2,6 +2,8 @@ use super::*;
 use crate::execution_snapshot::{CommandSpec, LinuxProfile, ResourceLimits};
 use crate::execution_verifier::{AssertionCase, AssertionInventory, VerifierPolicy};
 use crate::local_target::tests::{Fixture, git};
+#[path = "fx17_tests.rs"]
+mod fx17;
 fn digest(bytes: &[u8]) -> String {
     format!("sha256:{}", ObjectDigest::of(bytes).hex())
 }
