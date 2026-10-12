@@ -111,3 +111,15 @@ other formats: original FX04 still requires semantic resolution, and the origina
 held-out cases were not rerun. The default text profile remains available. Native
 gate integration, FX08 usefulness and autonomous operation require their own
 qualification.
+
+## Upstream source and licenses
+
+`packages/aethyme-eval/e1/upstream-license-inventory.json` records the official
+0.19.1 source archive, its checksum and upstream commit, the complete Cargo.lock
+checksum, and all 202 locked package license declarations. This is a conservative
+superset including development and platform dependencies. Exact cached archives
+were checksum-verified; missing cached packages use exact-version crates.io
+metadata with matching archive checksums. No license is unknown in that inventory.
+It does not attest how the upstream release executable was built. The appointed
+GPL-3.0-only executable remains an external opt-in dependency, neither linked nor
+bundled by Aethyme.
