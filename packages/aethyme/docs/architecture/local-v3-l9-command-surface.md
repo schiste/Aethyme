@@ -42,16 +42,37 @@ as authority. Native gate integration still waits for independently owned #725;
 structural composition qualification still waits for E1 #650. Neither dependency
 is implemented or claimed by this slice.
 
-## Validation required before implementation delivery
+## Qualified finite CLI profile
 
-The draft contract is not runtime evidence. Required tests cover disabled and
-malformed policy before file access, read-only state/epoch byte preservation,
-strict finite input parsing, stale versions/epochs, issuer/controller ownership,
-active-wave refusal, actual historical export and retained request integrity,
-exclusive output creation, unsupported adapter refusal with no side effects,
-versioned JSON and help snapshots. Each fix needs a named negative and restored
-positive. Use disposable Playground repositories only. An independent reviewer
-must check the implementation in a separate read-only exact snapshot.
+The [CLI command and guard ledger](local-v3-qualification/cli-restored-2026-10-12.json)
+records tested source `ece13cebd381ada85fa649a40b6b0e38eec209fb`.
+Eight lifecycle unit tests and 18 built-router tests passed. Ordinary help
+snapshot comparison passed separately from snapshot regeneration. Seven
+deliberate guard removals each failed its intended named assertion with actual
+exit 101; the three affected source files were restored byte for byte.
+
+The restored selections record 527 passing executions, zero test failures and
+13 explicit ignores. These overlapping counts include the lifecycle/router/help
+cases. Strict broker Clippy (`--lib --tests`) and CLI Clippy (`--bins --tests`)
+passed with `-D warnings`. One earlier CLI `--lib` invocation failed because the
+package has no library target; it is retained and uncredited. The initial router
+compile failure and a later shell-wrapper exit 127 are likewise preserved as
+separate outcomes, rather than credited as successful runs.
+
+The real router cases prove explicit proposal/selection/hold/resume, actual
+issuer and controller ownership, read-only observation, stale-version/epoch
+refusal, exact native freeze, unavailable-adapter refusal and exclusive export.
+Export is verified and imported in a fresh receiver, where the exact requested
+source is reconstructed from the delivered bytes. Origin source remains retained.
+
+Historical handoff projection is covered by a unit fixture using modeled
+trusted-verifier evidence. This is not a built-CLI positive retained-handoff or
+real-provider qualification claim. The router covers its missing-entry refusal.
+The finite current macOS/Unix profile does not qualify a daemon, an autonomous
+CLI runner, remote synchronization, live GitHub/Mergify or native gate wiring.
+E1 and #725 remain separate prerequisites. Independent review and final-head CI
+are separate checks; neither an ignored profile nor a historical ledger grants
+current authority.
 
 ## Appointment and exact epoch rules
 
