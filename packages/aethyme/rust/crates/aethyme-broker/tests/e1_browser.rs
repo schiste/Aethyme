@@ -158,6 +158,7 @@ impl OwnedChild {
     fn stop(&mut self) -> std::process::ExitStatus {
         assert!(!self.cleaned);
         #[cfg(unix)]
+        // SAFETY: this unreaped child owns the process group created at spawn.
         unsafe {
             libc::kill(-(self.child.id() as i32), libc::SIGKILL);
         }
@@ -169,7 +170,10 @@ impl OwnedChild {
     fn exited(&mut self) -> bool {
         #[cfg(unix)]
         {
+            // SAFETY: all-zero siginfo_t is a valid output buffer for waitid.
             let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            // SAFETY: the live child ID and writable output buffer remain valid;
+            // WNOWAIT observes status without releasing the owned group identity.
             let result = unsafe {
                 libc::waitid(
                     libc::P_PID,

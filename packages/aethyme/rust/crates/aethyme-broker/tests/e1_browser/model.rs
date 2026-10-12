@@ -13,7 +13,98 @@ const RESPONSE_LIMIT: usize = 256 * 1024;
 
 struct CodexResolver {
     root: PathBuf,
+    executable: PathBuf,
     invocations: Vec<Value>,
+}
+
+// These permissions apply to model tools. The CLI parent authenticates through
+// its normal host credentials; those paths are never tool-readable roots.
+fn permission_arguments(root: &Path) -> Vec<String> {
+    let path = serde_json::to_string(root.to_str().unwrap()).unwrap();
+    vec![
+        "-c".into(),
+        "default_permissions=\"e1-fixtures\"".into(),
+        "-c".into(),
+        format!(
+            "permissions.e1-fixtures.filesystem={{\":minimal\"=\"read\", \"/private/tmp\"=\"deny\", \"/private/var/folders\"=\"deny\", \":slash_tmp\"=\"deny\", \":tmpdir\"=\"deny\", {path}=\"read\"}}"
+        ),
+        "-c".into(),
+        "permissions.e1-fixtures.network.enabled=false".into(),
+        "-c".into(),
+        "approval_policy=\"never\"".into(),
+        "-c".into(),
+        "allow_login_shell=false".into(),
+        "-c".into(),
+        "web_search=\"disabled\"".into(),
+    ]
+}
+
+struct PinnedCodex {
+    _root: tempfile::TempDir,
+    executable: PathBuf,
+}
+
+impl PinnedCodex {
+    fn acquire(source: &Path, expected: &str) -> Result<Self, String> {
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
+        }
+        let file = options.open(source).map_err(|e| e.to_string())?;
+        if !file.metadata().map_err(|e| e.to_string())?.is_file() {
+            return Err("Codex must be a regular file".into());
+        }
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let result = file
+                .take(256 * 1024 * 1024 + 1)
+                .read_to_end(&mut bytes)
+                .map(|_| bytes);
+            if sender.send(result).is_err() {
+                eprintln!("bounded Codex acquisition completed after its deadline");
+            }
+        });
+        let bytes = receiver
+            .recv_timeout(Duration::from_secs(3))
+            .map_err(|_| "Codex acquisition deadline")?
+            .map_err(|e| e.to_string())?;
+        if bytes.len() > 256 * 1024 * 1024 || digest(&bytes) != expected {
+            return Err("Codex size or digest mismatch".into());
+        }
+        let root = tempfile::tempdir().map_err(|e| e.to_string())?;
+        let executable = root.path().join("codex");
+        std::fs::write(&executable, bytes).map_err(|e| e.to_string())?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o500))
+                .map_err(|e| e.to_string())?;
+        }
+        let pinned = Self {
+            _root: root,
+            executable,
+        };
+        let mut command = Command::new(&pinned.executable);
+        command
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+            .current_dir(pinned._root.path())
+            .arg("--version");
+        let observed = external(&mut command, pinned._root.path(), "version", 3);
+        if observed["state"] != "completed"
+            || observed["exit"] != 0
+            || std::fs::read(pinned._root.path().join("version.stdout"))
+                .map_err(|e| e.to_string())?
+                != b"codex-cli 0.162.1\n"
+        {
+            return Err(format!("Codex version admission failed: {observed}"));
+        }
+        Ok(pinned)
+    }
 }
 
 impl Resolver for CodexResolver {
@@ -92,18 +183,17 @@ impl Resolver for CodexResolver {
             .args([
                 "-p",
                 &policy,
-                CODEX,
+                self.executable.to_str().unwrap(),
                 "exec",
                 "--ephemeral",
                 "--ignore-user-config",
                 "--skip-git-repo-check",
-                "--sandbox",
-                "read-only",
                 "--color",
                 "never",
                 "--json",
                 "--output-schema",
             ])
+            .args(permission_arguments(&root))
             .arg(root.join("response-schema.json"))
             .arg("-o")
             .arg(root.join("response.json"))
@@ -163,24 +253,6 @@ impl Resolver for CodexResolver {
         }
         Ok(Response::Proposal(proposal))
     }
-}
-
-fn verify_codex() {
-    let mut file = std::fs::File::open(CODEX).unwrap();
-    let mut hasher = Sha256::new();
-    let mut bytes = [0u8; 65536];
-    loop {
-        let count = file.read(&mut bytes).unwrap();
-        if count == 0 {
-            break;
-        }
-        hasher.update(&bytes[..count]);
-    }
-    assert_eq!(
-        format!("{:x}", hasher.finalize()),
-        CODEX_SHA,
-        "appointed Codex executable changed"
-    );
 }
 
 fn dynamic_subtraction(
@@ -464,12 +536,37 @@ fn recover_report(
     result
 }
 
+fn failed_semantic_witness(observation: &Value, requirements: &Value) -> bool {
+    observation["state"] == "completed"
+        && observation["exit"] == 1
+        && observation["observation"]["passed"] == false
+        && observation["observation"]["schema"] == "aethyme.e1.browser-observation/v1"
+        && observation["observation"]["requirements"] == *requirements
+        && observation["observation"]["checks"]
+            .as_array()
+            .is_some_and(|checks| {
+                checks.iter().any(|check| check["passed"] == false)
+                    && required_check_names(requirements)
+                        .iter()
+                        .all(|name| checks.iter().any(|check| check["name"] == *name))
+            })
+}
+
+fn block_missing_candidate(report: &mut Value, candidate_present: bool) -> bool {
+    if candidate_present {
+        return false;
+    }
+    report["phases"][0]["state"] = json!("blocked_no_candidate");
+    report["state"] = json!("blocked_no_candidate");
+    true
+}
+
 fn run_synthesis(root: &Path, report: &mut Value) {
     let runtime = runtime_profile();
     verify_runtime(&runtime);
-    verify_codex();
+    let codex = PinnedCodex::acquire(Path::new(CODEX), CODEX_SHA).unwrap();
     report["runtime_profile"] = runtime;
-    persist(&root, &report);
+    persist(root, report);
     let cases: Value =
         serde_json::from_slice(&std::fs::read(fixtures().join("cases.json")).unwrap()).unwrap();
     let case = cases["cases"]
@@ -479,8 +576,8 @@ fn run_synthesis(root: &Path, report: &mut Value) {
         .find(|case| case["id"] == "FX04-browser")
         .unwrap();
     report["phases"][0]["state"] = json!("admitted");
-    persist(&root, &report);
-    let mut world = world(case, &root);
+    persist(root, report);
+    let mut world = world(case, root);
     report["retained_playground"] = json!(world.root);
     world.request.deliveries = vec!["c1".into(), "c2".into()];
     let engine = MergirafEngine::pin(
@@ -492,7 +589,12 @@ fn run_synthesis(root: &Path, report: &mut Value) {
         composer::compose_structural(&mut world.store, &world.repo, &world.request, &engine)
             .unwrap()
             .composition;
-    if let Some(candidate) = composition.outcome.candidate() {
+    if block_missing_candidate(report, composition.outcome.candidate().is_some()) {
+        persist(root, report);
+        return;
+    }
+    let candidate = composition.outcome.candidate().unwrap();
+    {
         let output = world.root.join("failed-check-input");
         collaboration_archive::reconstruct(&world.store, &candidate.subject, &output).unwrap();
         report["initial_observation"] = observe(
@@ -503,22 +605,10 @@ fn run_synthesis(root: &Path, report: &mut Value) {
         );
         if report["initial_observation"]["observation"]["passed"] == true {
             report["state"] = json!("unexpected_no_failed_check");
-            persist(&root, &report);
+            persist(root, report);
             return;
         }
-        if report["initial_observation"]["state"] != "completed"
-            || report["initial_observation"]["exit"] != 1
-            || report["initial_observation"]["observation"]["schema"]
-                != "aethyme.e1.browser-observation/v1"
-            || report["initial_observation"]["observation"]["requirements"] != case["requirements"]
-            || !required_check_names(&case["requirements"])
-                .iter()
-                .all(|name| {
-                    report["initial_observation"]["observation"]["checks"]
-                        .as_array()
-                        .is_some_and(|checks| checks.iter().any(|check| check["name"] == *name))
-                })
-        {
+        if !failed_semantic_witness(&report["initial_observation"], &case["requirements"]) {
             report["phases"][0]["state"] = json!("infrastructure_error");
             report["state"] = json!("initial_check_infrastructure_error");
             persist(root, report);
@@ -526,13 +616,9 @@ fn run_synthesis(root: &Path, report: &mut Value) {
         }
     }
     report["phases"][0]["state"] = json!("completed");
-    let checks = if composition.outcome.candidate().is_some() {
-        vec![FailedCheck {
-            check: "public-browser-contract".into(),
-        }]
-    } else {
-        Vec::new()
-    };
+    let checks = vec![FailedCheck {
+        check: "public-browser-contract".into(),
+    }];
     let request = resolution::request_resolution(
         &mut world.store,
         &world.repo,
@@ -548,16 +634,17 @@ fn run_synthesis(root: &Path, report: &mut Value) {
     .unwrap();
     report["request"] =
         json!({"id":request.record().id.as_str(),"decision":request.decision_key()});
-    persist(&root, &report);
+    persist(root, report);
     let mut resolver = CodexResolver {
         root: world.root.clone(),
+        executable: codex.executable.clone(),
         invocations: Vec::new(),
     };
     let mut qualified = None;
     for attempt in 0..2 {
         report["phases"][1]["state"] = json!("admitted");
         report["attempts"][attempt] = json!({"index":attempt,"state":"admitted"});
-        persist(&root, &report);
+        persist(root, report);
         let resolution = resolution::resolve(
             &mut world.store,
             &world.repo,
@@ -586,7 +673,7 @@ fn run_synthesis(root: &Path, report: &mut Value) {
             }
         }
         report["attempts"][attempt] = row;
-        persist(&root, &report);
+        persist(root, report);
         if qualified.is_some() {
             break;
         }
@@ -601,7 +688,7 @@ fn run_synthesis(root: &Path, report: &mut Value) {
     } else {
         "synthesis_failed"
     });
-    persist(&root, &report);
+    persist(root, report);
     if let Some(synthesis) = qualified {
         dynamic_subtraction(&mut world, &synthesis, &case["requirements"], report, root);
     }
@@ -625,4 +712,110 @@ fn interrupted_model_journal_preserves_completed_unknown_and_unrun_slots() {
     assert_eq!(saved["phases"][2]["state"], "unrun");
     assert_eq!(saved["attempts"][0]["state"], "unknown_after_interruption");
     assert_eq!(saved["attempts"][1]["state"], "unrun");
+}
+
+#[test]
+fn noncandidate_and_invalid_witness_do_not_admit_model_attempts() {
+    let mut report = json!({"phases":[{"state":"admitted"},{"state":"unrun"}],"attempts":[{"state":"unrun"},{"state":"unrun"}]});
+    let mut calls = 0;
+    if !block_missing_candidate(&mut report, false) {
+        calls += 1;
+    }
+    assert_eq!(calls, 0);
+    assert_eq!(report["phases"][0]["state"], "blocked_no_candidate");
+    assert!(
+        report["attempts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|row| row["state"] == "unrun")
+    );
+    let requirements = json!(["search"]);
+    let checks: Vec<Value> = required_check_names(&requirements)
+        .into_iter()
+        .map(|name| json!({"name":name,"passed":false}))
+        .collect();
+    let valid = json!({"state":"completed","exit":1,"observation":{"passed":false,"schema":"aethyme.e1.browser-observation/v1","requirements":requirements,"checks":checks}});
+    assert!(failed_semantic_witness(&valid, &requirements));
+    for change in ["exit", "passed", "schema", "requirements", "checks"] {
+        let mut invalid = valid.clone();
+        match change {
+            "exit" => invalid["exit"] = json!(2),
+            "passed" => invalid["observation"]["passed"] = json!(true),
+            "schema" => invalid["observation"]["schema"] = json!("wrong"),
+            "requirements" => invalid["observation"]["requirements"] = json!([]),
+            _ => invalid["observation"]["checks"] = json!([]),
+        }
+        if failed_semantic_witness(&invalid, &requirements) {
+            calls += 1;
+        }
+    }
+    assert_eq!(calls, 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn pinned_codex_uses_admitted_bytes_after_source_replacement() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("source");
+    let bytes = b"#!/bin/sh\necho 'codex-cli 0.162.1'\n";
+    std::fs::write(&source, bytes).unwrap();
+    std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let pinned = PinnedCodex::acquire(&source, &digest(bytes)).unwrap();
+    std::fs::write(&source, b"#!/bin/sh\necho substituted\n").unwrap();
+    assert_eq!(std::fs::read(&pinned.executable).unwrap(), bytes);
+    assert_eq!(
+        Command::new(&pinned.executable).output().unwrap().stdout,
+        b"codex-cli 0.162.1\n"
+    );
+    assert!(PinnedCodex::acquire(&source, &digest(bytes)).is_err());
+    let link = root.path().join("link");
+    std::os::unix::fs::symlink(&source, &link).unwrap();
+    assert!(PinnedCodex::acquire(&link, &digest(bytes)).is_err());
+}
+
+#[test]
+#[ignore = "appointed native Codex sandbox probe; opens protected files without reading data"]
+fn appointed_model_permissions_deny_source_oracle_and_credentials() {
+    let pinned = PinnedCodex::acquire(Path::new(CODEX), CODEX_SHA).unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let public = root.path().join("public");
+    std::fs::create_dir(&public).unwrap();
+    std::fs::write(public.join("inputs.json"), b"synthetic public input").unwrap();
+    let mut paths = vec![public.join("inputs.json")];
+    for name in [
+        "AETHYME_E1_DENY_MAIN",
+        "AETHYME_E1_DENY_SIBLING",
+        "AETHYME_E1_DENY_ORACLE",
+        "AETHYME_E1_DENY_EVIDENCE",
+        "AETHYME_E1_DENY_AUTH",
+    ] {
+        let path = PathBuf::from(std::env::var_os(name).expect("explicit protected probe path"));
+        assert!(
+            path.is_file(),
+            "probe must not mistake missing paths for denied reads"
+        );
+        paths.push(path);
+    }
+    let literal = serde_json::to_string(&paths).unwrap();
+    let script = format!(
+        "paths={literal}; paths.each_with_index {{|path,i| begin; File.open(path,\"r\") {{}}; puts \"#{{i}}:allowed\"; rescue Errno::EPERM, Errno::EACCES; puts \"#{{i}}:denied\"; end }}"
+    );
+    let mut command = Command::new(&pinned.executable);
+    command
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+        .env("HOME", "/Users/christophehenner")
+        .current_dir(&public)
+        .args(["sandbox", "-P", "e1-fixtures"])
+        .args(permission_arguments(&public))
+        .args(["--", "/usr/bin/ruby", "--disable-gems", "-e", &script]);
+    let process = external(&mut command, root.path(), "permissions", 15);
+    assert_eq!(process["state"], "completed");
+    assert_eq!(process["exit"], 0);
+    assert_eq!(
+        std::fs::read(root.path().join("permissions.stdout")).unwrap(),
+        b"0:allowed\n1:denied\n2:denied\n3:denied\n4:denied\n5:denied\n"
+    );
 }
