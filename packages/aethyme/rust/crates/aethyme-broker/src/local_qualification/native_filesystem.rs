@@ -502,6 +502,40 @@ impl Drop for OwnedImage {
     }
 }
 
+fn pressure_entry_matches(entry: &std::fs::Metadata, held: &std::fs::Metadata) -> bool {
+    entry.is_file()
+        && !entry.file_type().is_symlink()
+        && (entry.dev(), entry.ino()) == (held.dev(), held.ino())
+}
+
+#[test]
+fn replacement_pressure_entry_cannot_authorize_capacity_release() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("owned-pressure");
+    let held = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .unwrap();
+    let metadata = held.metadata().unwrap();
+    assert!(pressure_entry_matches(
+        &std::fs::symlink_metadata(&path).unwrap(),
+        &metadata
+    ));
+    std::fs::rename(&path, root.path().join("pinned-original")).unwrap();
+    std::fs::write(&path, b"unrelated replacement").unwrap();
+    assert!(
+        !pressure_entry_matches(&std::fs::symlink_metadata(&path).unwrap(), &metadata),
+        "replaced pressure path cannot authorize capacity release"
+    );
+    std::fs::remove_file(&path).unwrap();
+    std::os::unix::fs::symlink(root.path().join("pinned-original"), &path).unwrap();
+    assert!(
+        !pressure_entry_matches(&std::fs::symlink_metadata(&path).unwrap(), &metadata),
+        "symlink pressure path cannot authorize capacity release"
+    );
+}
+
 fn enospc(error: &std::io::Error) -> bool {
     // tempfile preserves ErrorKind while its private path wrapper hides the
     // raw errno and exposes no underlying raw-OS cause. Keep the typed kind;
@@ -875,10 +909,8 @@ fn run_pressure(disk: &mut OwnedImage) {
     // remove a replaced path merely because it has the same spelling.
     let owned = pressure.metadata().unwrap();
     let entry = std::fs::symlink_metadata(&pressure_path).unwrap();
-    assert!(entry.is_file() && !entry.file_type().is_symlink());
-    assert_eq!(
-        (entry.dev(), entry.ino()),
-        (owned.dev(), owned.ino()),
+    assert!(
+        pressure_entry_matches(&entry, &owned),
         "capacity release must retain exact pressure ownership"
     );
     std::fs::remove_file(&pressure_path).unwrap();
