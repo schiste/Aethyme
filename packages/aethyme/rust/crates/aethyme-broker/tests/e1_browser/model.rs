@@ -10,23 +10,52 @@ use aethyme_contracts::experimental_v0::EntryKind;
 const CODEX_SHA: &str = "74c6a6d263f40d65f99c27a815275f5b4ed0bcc2baecc396b4cf3255498bdfc0";
 const CODEX: &str = "/Users/christophehenner/.local/lib/node_modules/@openai/codex/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/bin/codex";
 const RESPONSE_LIMIT: usize = 256 * 1024;
+const CODEX_HELPER_SHA: &str = "0960435a104cf926e18bb938b8f6f8fcdf7e27be0c8d88e1911bc22a1de7d3e6";
+const CODEX_RUNTIME: &[(&str, &str)] = &[
+    ("bin/codex-code-mode-host", CODEX_HELPER_SHA),
+    (
+        "codex-package.json",
+        "d932d8aed7d2cd6aee5dedccad6c30ddfa8ca10bce945f19c5780ab21291eb29",
+    ),
+    (
+        "codex-path/rg",
+        "cdd3c7bcc328730ac6bfbc04d19c0cfa1d23c1a3a838a8dc45ea7d84fda11b15",
+    ),
+    (
+        "codex-resources/zsh/bin/zsh",
+        "78baefdeac8715fe8a99b60d112f45daa2feaeb5068cd7b116c75300f1402d50",
+    ),
+];
 
 struct CodexResolver {
     root: PathBuf,
     executable: PathBuf,
+    home: PathBuf,
     invocations: Vec<Value>,
 }
 
 // These permissions apply to model tools. The CLI parent authenticates through
 // its normal host credentials; those paths are never tool-readable roots.
 fn permission_arguments(root: &Path) -> Vec<String> {
+    permission_arguments_for_runtime(root, None)
+}
+
+fn permission_arguments_for_runtime(root: &Path, runtime: Option<&Path>) -> Vec<String> {
     let path = serde_json::to_string(root.to_str().unwrap()).unwrap();
+    let runtime = runtime
+        .map(|path| {
+            format!(
+                ", {}=\"read\"",
+                serde_json::to_string(path.to_str().unwrap()).unwrap()
+            )
+        })
+        .unwrap_or_default();
     vec![
         "-c".into(),
         "default_permissions=\"e1-fixtures\"".into(),
         "-c".into(),
         format!(
-            "permissions.e1-fixtures.filesystem={{\":minimal\"=\"read\", \"/private/tmp\"=\"deny\", \"/private/var/folders\"=\"deny\", \":slash_tmp\"=\"deny\", \":tmpdir\"=\"deny\", {path}=\"read\"}}"
+            "permissions.e1-fixtures.filesystem={{\":minimal\"=\"read\", \"/private/tmp\"=\"deny\", \"/private/var/folders\"=\"deny\", \":slash_tmp\"=\"deny\", \":tmpdir\"=\"deny\", {path}=\"read\"{runtime}}}"
         ),
         "-c".into(),
         "permissions.e1-fixtures.network.enabled=false".into(),
@@ -36,7 +65,42 @@ fn permission_arguments(root: &Path) -> Vec<String> {
         "allow_login_shell=false".into(),
         "-c".into(),
         "web_search=\"disabled\"".into(),
+        "-c".into(),
+        "project_doc_max_bytes=0".into(),
+        "-c".into(),
+        "apps._default.enabled=false".into(),
     ]
+}
+
+fn isolated_home(root: &Path) -> PathBuf {
+    let home = root.join("runner-home");
+    std::fs::create_dir(&home).unwrap();
+    let codex = home.join(".codex");
+    std::fs::create_dir(&codex).unwrap();
+    // A local pointer preserves normal CLI authentication without copying or
+    // reading credential bytes. The model command profile denies both this
+    // private home and the original credential path. Global instructions and
+    // skill catalogs are absent from this newly created home.
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(
+        "/Users/christophehenner/.codex/auth.json",
+        codex.join("auth.json"),
+    )
+    .unwrap();
+    #[cfg(not(unix))]
+    panic!("appointed model trials require the reviewed macOS profile");
+    home
+}
+
+fn model_command(executable: &Path, home: &Path, public: &Path) -> Command {
+    let mut command = Command::new(executable);
+    command
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+        .env("HOME", home)
+        .env("CODEX_HOME", home.join(".codex"))
+        .current_dir(public);
+    command
 }
 
 struct PinnedCodex {
@@ -45,45 +109,38 @@ struct PinnedCodex {
 }
 
 impl PinnedCodex {
-    fn acquire(source: &Path, expected: &str) -> Result<Self, String> {
-        let mut options = std::fs::OpenOptions::new();
-        options.read(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
+    fn appointed() -> Result<Self, String> {
+        let pinned = Self::acquire(Path::new(CODEX), CODEX_SHA)?;
+        let source_root = Path::new(CODEX).parent().unwrap().parent().unwrap();
+        for (relative, expected) in CODEX_RUNTIME {
+            let bytes = acquired_bytes(&source_root.join(relative), expected)?;
+            let copied = pinned._root.path().join(relative);
+            std::fs::create_dir_all(copied.parent().unwrap()).map_err(|e| e.to_string())?;
+            write_pinned(&copied, &bytes)?;
         }
-        let file = options.open(source).map_err(|e| e.to_string())?;
-        if !file.metadata().map_err(|e| e.to_string())?.is_file() {
-            return Err("Codex must be a regular file".into());
-        }
-        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
-        std::thread::spawn(move || {
-            let mut bytes = Vec::new();
-            let result = file
-                .take(256 * 1024 * 1024 + 1)
-                .read_to_end(&mut bytes)
-                .map(|_| bytes);
-            if sender.send(result).is_err() {
-                eprintln!("bounded Codex acquisition completed after its deadline");
-            }
-        });
-        let bytes = receiver
-            .recv_timeout(Duration::from_secs(3))
-            .map_err(|_| "Codex acquisition deadline")?
+        let mut helper = Command::new(pinned._root.path().join("bin/codex-code-mode-host"));
+        helper
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+            .current_dir(pinned._root.path())
+            .arg("--help");
+        let observed = external(&mut helper, pinned._root.path(), "helper-admission", 3);
+        let help = std::fs::read(pinned._root.path().join("helper-admission.stdout"))
             .map_err(|e| e.to_string())?;
-        if bytes.len() > 256 * 1024 * 1024 || digest(&bytes) != expected {
-            return Err("Codex size or digest mismatch".into());
-        }
-        let root = tempfile::tempdir().map_err(|e| e.to_string())?;
-        let executable = root.path().join("codex");
-        std::fs::write(&executable, bytes).map_err(|e| e.to_string())?;
-        #[cfg(unix)]
+        if observed["state"] != "completed"
+            || observed["exit"] != 0
+            || !String::from_utf8_lossy(&help).contains("codex-code-mode-host")
         {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o500))
-                .map_err(|e| e.to_string())?;
+            return Err(format!("Codex tool helper admission failed: {observed}"));
         }
+        Ok(pinned)
+    }
+    fn acquire(source: &Path, expected: &str) -> Result<Self, String> {
+        let bytes = acquired_bytes(source, expected)?;
+        let root = tempfile::tempdir().map_err(|e| e.to_string())?;
+        let executable = root.path().join("bin/codex");
+        std::fs::create_dir(executable.parent().unwrap()).map_err(|e| e.to_string())?;
+        write_pinned(&executable, &bytes)?;
         let pinned = Self {
             _root: root,
             executable,
@@ -107,11 +164,55 @@ impl PinnedCodex {
     }
 }
 
+fn acquired_bytes(source: &Path, expected: &str) -> Result<Vec<u8>, String> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
+    }
+    let file = options.open(source).map_err(|e| e.to_string())?;
+    if !file.metadata().map_err(|e| e.to_string())?.is_file() {
+        return Err("Codex must be a regular file".into());
+    }
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let result = file
+            .take(256 * 1024 * 1024 + 1)
+            .read_to_end(&mut bytes)
+            .map(|_| bytes);
+        if sender.send(result).is_err() {
+            eprintln!("bounded Codex acquisition completed after its deadline");
+        }
+    });
+    let bytes = receiver
+        .recv_timeout(Duration::from_secs(3))
+        .map_err(|_| "Codex acquisition deadline")?
+        .map_err(|e| e.to_string())?;
+    if bytes.len() > 256 * 1024 * 1024 || digest(&bytes) != expected {
+        return Err("Codex size or digest mismatch".into());
+    }
+    Ok(bytes)
+}
+
+fn write_pinned(executable: &Path, bytes: &[u8]) -> Result<(), String> {
+    std::fs::write(executable, bytes).map_err(|e| e.to_string())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(executable, std::fs::Permissions::from_mode(0o500))
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
 impl Resolver for CodexResolver {
     fn identity(&self) -> ResolverIdentity {
         ResolverIdentity {
             name: "codex:gpt-6-luna".into(),
-            version: format!("0.162.1;medium;sha256={CODEX_SHA}"),
+            version: format!("0.162.1;medium;sha256={CODEX_SHA};helper={CODEX_HELPER_SHA}"),
         }
     }
     fn propose(
@@ -163,27 +264,10 @@ impl Resolver for CodexResolver {
             serde_json::to_vec(&schema).unwrap(),
         )
         .map_err(|e| e.to_string())?;
-        let workspace = aethyme_testkit::rust_workspace_root();
-        let monorepo = workspace.ancestors().nth(3).unwrap();
-        let quoted = |path: &Path| serde_json::to_string(path.to_str().unwrap()).unwrap();
-        let policy = format!(
-            "(version 1)(allow default)(deny file-read* (subpath {}))(deny file-read* (subpath {}))(allow file-read* (subpath {}))",
-            quoted(monorepo),
-            quoted(&self.root),
-            quoted(&root)
-        );
         let prompt = "Read inputs.json and requirements.md with tools. Propose complete UTF-8 files only within the declared scope that jointly preserve the selected input changes and meet the public requirements. There is no authorized preference to discard one input. Return the response schema; do not edit files or inspect other directories. If no acceptable change exists, return an empty writes list and explain the unresolved choice. No answer key or observer is available.";
-        let mut command = Command::new("/usr/bin/sandbox-exec");
+        let mut command = model_command(&self.executable, &self.home, &root);
         command
-            .env_clear()
-            .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
-            .env("HOME", "/Users/christophehenner")
-            .env("TMPDIR", &root)
-            .current_dir(&root)
             .args([
-                "-p",
-                &policy,
-                self.executable.to_str().unwrap(),
                 "exec",
                 "--ephemeral",
                 "--ignore-user-config",
@@ -193,8 +277,11 @@ impl Resolver for CodexResolver {
                 "--json",
                 "--output-schema",
             ])
-            .args(permission_arguments(&root))
             .arg(root.join("response-schema.json"))
+            .args(permission_arguments_for_runtime(
+                &root,
+                self.executable.parent().and_then(Path::parent),
+            ))
             .arg("-o")
             .arg(root.join("response.json"))
             .args([
@@ -206,8 +293,9 @@ impl Resolver for CodexResolver {
             ])
             .arg(&root)
             .arg(prompt);
+        verify_model_arguments(&command, &root)?;
         let process = external(&mut command, &root, "codex", 150);
-        self.invocations.push(json!({"process":process,"requested_model":"gpt-6-luna","reasoning":"medium","executable_sha256":CODEX_SHA,"public_input_sha256":digest(&serde_json::to_vec(&public).unwrap()),"root":root}));
+        self.invocations.push(json!({"process":process,"requested_model":"gpt-6-luna","reasoning":"medium","executable_sha256":CODEX_SHA,"runtime_files":CODEX_RUNTIME,"public_input_sha256":digest(&serde_json::to_vec(&public).unwrap()),"root":root}));
         if process["state"] != "completed" || process["exit"] != 0 {
             return Err(format!("bounded model process failed: {process}"));
         }
@@ -253,6 +341,33 @@ impl Resolver for CodexResolver {
         }
         Ok(Response::Proposal(proposal))
     }
+}
+
+fn verify_model_arguments(command: &Command, root: &Path) -> Result<(), String> {
+    let args: Vec<_> = command
+        .get_args()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+    for (flag, expected) in [
+        ("--output-schema", root.join("response-schema.json")),
+        ("-o", root.join("response.json")),
+        ("-C", root.to_path_buf()),
+    ] {
+        let index = args
+            .iter()
+            .position(|arg| arg == flag)
+            .ok_or("required runner argument missing")?;
+        if args.get(index + 1).map(String::as_str) != expected.to_str() {
+            return Err(format!("runner option {flag} lost its value"));
+        }
+    }
+    if args
+        .iter()
+        .any(|arg| arg == "--sandbox" || arg == "--dangerously-bypass-approvals-and-sandbox")
+    {
+        return Err("runner would override the appointed permission profile".into());
+    }
+    Ok(())
 }
 
 fn dynamic_subtraction(
@@ -564,7 +679,7 @@ fn block_missing_candidate(report: &mut Value, candidate_present: bool) -> bool 
 fn run_synthesis(root: &Path, report: &mut Value) {
     let runtime = runtime_profile();
     verify_runtime(&runtime);
-    let codex = PinnedCodex::acquire(Path::new(CODEX), CODEX_SHA).unwrap();
+    let codex = PinnedCodex::appointed().unwrap();
     report["runtime_profile"] = runtime;
     persist(root, report);
     let cases: Value =
@@ -638,6 +753,7 @@ fn run_synthesis(root: &Path, report: &mut Value) {
     let mut resolver = CodexResolver {
         root: world.root.clone(),
         executable: codex.executable.clone(),
+        home: isolated_home(&world.root),
         invocations: Vec::new(),
     };
     let mut qualified = None;
@@ -753,6 +869,31 @@ fn noncandidate_and_invalid_witness_do_not_admit_model_attempts() {
     assert_eq!(calls, 0);
 }
 
+#[test]
+fn runner_options_keep_adjacent_values_when_permissions_are_added() {
+    let root = Path::new("/private/tmp/synthetic-public");
+    let mut command = Command::new("codex");
+    command
+        .arg("--output-schema")
+        .arg(root.join("response-schema.json"))
+        .args(permission_arguments(root))
+        .arg("-o")
+        .arg(root.join("response.json"))
+        .arg("-C")
+        .arg(root);
+    assert!(verify_model_arguments(&command, root).is_ok());
+    let mut broken = Command::new("codex");
+    broken
+        .arg("--output-schema")
+        .args(permission_arguments(root))
+        .arg(root.join("response-schema.json"))
+        .arg("-o")
+        .arg(root.join("response.json"))
+        .arg("-C")
+        .arg(root);
+    assert!(verify_model_arguments(&broken, root).is_err());
+}
+
 #[cfg(unix)]
 #[test]
 fn pinned_codex_uses_admitted_bytes_after_source_replacement() {
@@ -778,7 +919,7 @@ fn pinned_codex_uses_admitted_bytes_after_source_replacement() {
 #[test]
 #[ignore = "appointed native Codex sandbox probe; opens protected files without reading data"]
 fn appointed_model_permissions_deny_source_oracle_and_credentials() {
-    let pinned = PinnedCodex::acquire(Path::new(CODEX), CODEX_SHA).unwrap();
+    let pinned = PinnedCodex::appointed().unwrap();
     let root = tempfile::tempdir().unwrap();
     let public = root.path().join("public");
     std::fs::create_dir(&public).unwrap();
@@ -802,20 +943,64 @@ fn appointed_model_permissions_deny_source_oracle_and_credentials() {
     let script = format!(
         "paths={literal}; paths.each_with_index {{|path,i| begin; File.open(path,\"r\") {{}}; puts \"#{{i}}:allowed\"; rescue Errno::EPERM, Errno::EACCES; puts \"#{{i}}:denied\"; end }}"
     );
-    let mut command = Command::new(&pinned.executable);
+    let home = isolated_home(root.path());
+    assert!(!home.join(".codex/AGENTS.md").exists());
+    assert!(!home.join(".codex/config.toml").exists());
+    assert!(!home.join(".codex/skills").exists());
+    assert!(!home.join(".agents").exists());
+    assert_eq!(std::fs::read_dir(home.join(".codex")).unwrap().count(), 1);
+    let mut command = model_command(&pinned.executable, &home, &public);
     command
-        .env_clear()
-        .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
-        .env("HOME", "/Users/christophehenner")
-        .current_dir(&public)
         .args(["sandbox", "-P", "e1-fixtures"])
-        .args(permission_arguments(&public))
+        .args(permission_arguments_for_runtime(
+            &public,
+            Some(pinned._root.path()),
+        ))
         .args(["--", "/usr/bin/ruby", "--disable-gems", "-e", &script]);
     let process = external(&mut command, root.path(), "permissions", 15);
     assert_eq!(process["state"], "completed");
-    assert_eq!(process["exit"], 0);
+    assert_eq!(
+        process["exit"],
+        0,
+        "{}",
+        String::from_utf8_lossy(&std::fs::read(root.path().join("permissions.stderr")).unwrap())
+    );
     assert_eq!(
         std::fs::read(root.path().join("permissions.stdout")).unwrap(),
         b"0:allowed\n1:denied\n2:denied\n3:denied\n4:denied\n5:denied\n"
+    );
+    // Actual pinned shell and search executable must run under the SAME tool
+    // profile. A successful system Ruby probe alone misses runtime denials.
+    let shell = pinned._root.path().join("codex-resources/zsh/bin/zsh");
+    let rg = pinned._root.path().join("codex-path/rg");
+    let mut command = model_command(&pinned.executable, &home, &public);
+    command
+        .args(["sandbox", "-P", "e1-fixtures"])
+        .args(permission_arguments_for_runtime(
+            &public,
+            Some(pinned._root.path()),
+        ))
+        .arg("--")
+        .arg(&shell)
+        .args([
+            "-f",
+            "-c",
+            "exec \"$1\" --fixed-strings synthetic inputs.json",
+            "probe",
+        ])
+        .arg(&rg);
+    let process = external(&mut command, root.path(), "runtime-permissions", 15);
+    assert_eq!(process["state"], "completed");
+    assert_eq!(
+        process["exit"],
+        0,
+        "{}",
+        String::from_utf8_lossy(
+            &std::fs::read(root.path().join("runtime-permissions.stderr")).unwrap()
+        )
+    );
+    assert_eq!(
+        std::fs::read(root.path().join("runtime-permissions.stdout")).unwrap(),
+        b"synthetic public input\n"
     );
 }

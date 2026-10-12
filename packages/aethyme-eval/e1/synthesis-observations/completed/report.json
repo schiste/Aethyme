@@ -1,0 +1,2083 @@
+{
+  "attempts": [
+    {
+      "allowance_used": 1,
+      "attempt": 1,
+      "browser": {
+        "exit": 0,
+        "observation": {
+          "browser_version": "149.0.7827.55",
+          "checks": [
+            {
+              "name": "consent is initially false",
+              "passed": true
+            },
+            {
+              "name": "unique DOM identities",
+              "passed": true
+            },
+            {
+              "name": "Enter preserves directory search",
+              "passed": true
+            },
+            {
+              "name": "pointer preserves directory search",
+              "passed": true
+            },
+            {
+              "name": "no telemetry without affirmative consent",
+              "passed": true
+            },
+            {
+              "name": "one anonymous event with consent",
+              "passed": true
+            },
+            {
+              "name": "consent transport is independent of query",
+              "passed": true
+            },
+            {
+              "name": "revoked consent stops later events",
+              "passed": true
+            },
+            {
+              "name": "existing navigation survives",
+              "passed": true
+            },
+            {
+              "name": "no WebSocket egress",
+              "passed": true
+            },
+            {
+              "name": "no runtime page errors",
+              "passed": true
+            }
+          ],
+          "errors": [],
+          "observation_window_ms": 500,
+          "passed": true,
+          "requests": [
+            {
+              "body": "{\"event\":\"search\"}",
+              "headers": {
+                "accept": "*/*",
+                "accept-language": "en-US",
+                "content-type": "text/plain;charset=UTF-8",
+                "origin": "null",
+                "sec-ch-ua": "\"HeadlessChrome\";v=\"149\", \"Chromium\";v=\"149\", \"Not)A;Brand\";v=\"24\"",
+                "sec-ch-ua-mobile": "?0",
+                "sec-ch-ua-platform": "\"macOS\"",
+                "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/149.0.7827.55 Safari/537.36"
+              },
+              "method": "POST",
+              "url": "https://telemetry.invalid/event"
+            },
+            {
+              "body": "{\"event\":\"search\"}",
+              "headers": {
+                "accept": "*/*",
+                "accept-language": "en-US",
+                "content-type": "text/plain;charset=UTF-8",
+                "origin": "null",
+                "sec-ch-ua": "\"HeadlessChrome\";v=\"149\", \"Chromium\";v=\"149\", \"Not)A;Brand\";v=\"24\"",
+                "sec-ch-ua-mobile": "?0",
+                "sec-ch-ua-platform": "\"macOS\"",
+                "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/149.0.7827.55 Safari/537.36"
+              },
+              "method": "POST",
+              "url": "https://telemetry.invalid/event"
+            }
+          ],
+          "requirements": [
+            "search",
+            "consent",
+            "privacy",
+            "navigation"
+          ],
+          "schema": "aethyme.e1.browser-observation/v1",
+          "sockets": [],
+          "wall_ms": 4310.011082999999
+        },
+        "signal": null,
+        "state": "completed",
+        "stderr": "/private/tmp/aethyme-e1-synthesis-20261012-97a152-frozen/Playground-E1-browser-cndo9O/after-synthesis-0.stderr",
+        "stdout": "/private/tmp/aethyme-e1-synthesis-20261012-97a152-frozen/Playground-E1-browser-cndo9O/after-synthesis-0.stdout",
+        "wall_ms": 11167
+      },
+      "candidate": {
+        "commit": "456e1e0f6aca6dfacc1f2d7a7445387a1eed6b53",
+        "directory": "/private/tmp/aethyme-e1-synthesis-20261012-97a152-frozen/Playground-E1-browser-cndo9O/synthesized-0",
+        "group": "sha256:543a9c85abb9ca7a890f34ecae5ce80fdf4fc1513a0eda2ed81beca51339e970",
+        "snapshot": "sha256:26bb14156bf27edb3d40bab0a3201f09abd889f59599001f3e0be0fd67237def",
+        "tree": "7fd7fcadc22795a99e8afc77dd669e022ac2b96e"
+      },
+      "index": 0,
+      "model": {
+        "executable_sha256": "74c6a6d263f40d65f99c27a815275f5b4ed0bcc2baecc396b4cf3255498bdfc0",
+        "process": {
+          "exit": 0,
+          "signal": null,
+          "state": "completed",
+          "stderr": "/private/tmp/aethyme-e1-synthesis-20261012-97a152-frozen/Playground-E1-browser-cndo9O/model-inputs-0/codex.stderr",
+          "stdout": "/private/tmp/aethyme-e1-synthesis-20261012-97a152-frozen/Playground-E1-browser-cndo9O/model-inputs-0/codex.stdout",
+          "wall_ms": 19338
+        },
+        "public_input_sha256": "7797f476362b9cb76e584e5911d7aa8a31aa1ccd5711de520294b9ec54f6626c",
+        "reasoning": "medium",
+        "requested_model": "gpt-6-luna",
+        "root": "/private/tmp/aethyme-e1-synthesis-20261012-97a152-frozen/Playground-E1-browser-cndo9O/model-inputs-0",
+        "runtime_files": [
+          [
+            "bin/codex-code-mode-host",
+            "0960435a104cf926e18bb938b8f6f8fcdf7e27be0c8d88e1911bc22a1de7d3e6"
+          ],
+          [
+            "codex-package.json",
+            "d932d8aed7d2cd6aee5dedccad6c30ddfa8ca10bce945f19c5780ab21291eb29"
+          ],
+          [
+            "codex-path/rg",
+            "cdd3c7bcc328730ac6bfbc04d19c0cfa1d23c1a3a838a8dc45ea7d84fda11b15"
+          ],
+          [
+            "codex-resources/zsh/bin/zsh",
+            "78baefdeac8715fe8a99b60d112f45daa2feaeb5068cd7b116c75300f1402d50"
+          ]
+        ]
+      },
+      "outcome": "synthesized",
+      "state": "completed"
+    },
+    {
+      "index": 1,
+      "state": "unrun"
+    }
+  ],
+  "consumer": {
+    "base": "456e1e0f6aca6dfacc1f2d7a7445387a1eed6b53",
+    "base_snapshot": "sha256:26bb14156bf27edb3d40bab0a3201f09abd889f59599001f3e0be0fd67237def",
+    "result": "91ed187ea7cba57a8f7a33405c2498c8a46062dc",
+    "result_sha256": "9cef32f5c9b6d7c8f131360c1eeb731a88f04847aee387e45e96421e3ed3a825",
+    "source_sha256": "a743ddf4c4dae450edc2de764458fba2390666694deea313356c0e6210b2a1fe"
+  },
+  "initial_observation": {
+    "evidence_error": "observer completion/schema/selected requirements differ",
+    "exit": 1,
+    "observation": {
+      "browser_version": "149.0.7827.55",
+      "checks": [
+        {
+          "name": "consent is initially false",
+          "passed": true
+        },
+        {
+          "name": "unique DOM identities",
+          "passed": true
+        },
+        {
+          "name": "Enter preserves directory search",
+          "passed": true
+        },
+        {
+          "name": "pointer preserves directory search",
+          "passed": true
+        },
+        {
+          "name": "no telemetry without affirmative consent",
+          "passed": true
+        },
+        {
+          "error": "AssertionError [ERR_ASSERTION]: Expected values to be strictly deep-equal:\n+ actual - expected\n\n  [\n    'event',\n+   'query'\n  ]\n",
+          "name": "one anonymous event with consent",
+          "passed": false
+        },
+        {
+          "error": "AssertionError [ERR_ASSERTION]: Expected values to be strictly deep-equal:\n+ actual - expected\n\n  {\n+   body: '{\"event\":\"search\",\"query\":\"For\"}',\n-   body: '{\"event\":\"search\",\"query\":\"La\"}',\n    headers: {\n      'accept-language': 'en-US',\n      'content-type': 'text/plain;charset=UTF-8',\n      'sec-ch-ua': '\"HeadlessChrome\";v=\"149\", \"Chromium\";v=\"149\", \"Not)A;Brand\";v=\"24\"',\n      'sec-ch-ua-mobile': '?0',\n",
+          "name": "consent transport is independent of query",
+          "passed": false
+        },
+        {
+          "name": "revoked consent stops later events",
+          "passed": true
+        },
+        {
+          "name": "existing navigation survives",
+          "passed": true
+        },
+        {
+          "name": "no WebSocket egress",
+          "passed": true
+        },
+        {
+          "name": "no runtime page errors",
+          "passed": true
+        }
+      ],
+      "errors": [],
+      "observation_window_ms": 500,
+      "passed": false,
+      "requests": [
+        {
+          "body": "{\"event\":\"search\",\"query\":\"La\"}",
+          "headers": {
+            "accept": "*/*",
+            "accept-language": "en-US",
+            "content-type": "text/plain;charset=UTF-8",
+            "origin": "null",
+            "sec-ch-ua": "\"HeadlessChrome\";v=\"149\", \"Chromium\";v=\"149\", \"Not)A;Brand\";v=\"24\"",
+            "sec-ch-ua-mobile": "?0",
+            "sec-ch-ua-platform": "\"macOS\"",
+            "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/149.0.7827.55 Safari/537.36"
+          },
+          "method": "POST",
+          "url": "https://telemetry.invalid/event"
+        },
+        {
+          "body": "{\"event\":\"search\",\"query\":\"For\"}",
+          "headers": {
+            "accept": "*/*",
+            "accept-language": "en-US",
+            "content-type": "text/plain;charset=UTF-8",
+            "origin": "null",
+            "sec-ch-ua": "\"HeadlessChrome\";v=\"149\", \"Chromium\";v=\"149\", \"Not)A;Brand\";v=\"24\"",
+            "sec-ch-ua-mobile": "?0",
+            "sec-ch-ua-platform": "\"macOS\"",
+            "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/149.0.7827.55 Safari/537.36"
+          },
+          "method": "POST",
+          "url": "https://telemetry.invalid/event"
+        }
+      ],
+      "requirements": [
+        "search",
+        "consent",
+        "privacy",
+        "navigation"
+      ],
+      "schema": "aethyme.e1.browser-observation/v1",
+      "sockets": [],
+      "wall_ms": 3851.022375
+    },
+    "signal": null,
+    "state": "completed",
+    "stderr": "/private/tmp/aethyme-e1-synthesis-20261012-97a152-frozen/Playground-E1-browser-cndo9O/before-synthesis.stderr",
+    "stdout": "/private/tmp/aethyme-e1-synthesis-20261012-97a152-frozen/Playground-E1-browser-cndo9O/before-synthesis.stdout",
+    "wall_ms": 9453
+  },
+  "phases": [
+    {
+      "id": "independent-failed-check",
+      "state": "completed"
+    },
+    {
+      "id": "genuine-synthesis",
+      "state": "completed"
+    },
+    {
+      "id": "actual-consumer",
+      "runs": [
+        {
+          "browser": {
+            "exit": 0,
+            "observation": {
+              "browser_version": "149.0.7827.55",
+              "checks": [
+                {
+                  "name": "consent is initially false",
+                  "passed": true
+                },
+                {
+                  "name": "unique DOM identities",
+                  "passed": true
+                },
+                {
+                  "name": "Enter preserves directory search",
+                  "passed": true
+                },
+                {
+                  "name": "pointer preserves directory search",
+                  "passed": true
+                },
+                {
+                  "name": "no telemetry without affirmative consent",
+                  "passed": true
+                },
+                {
+                  "name": "one anonymous event with consent",
+                  "passed": true
+                },
+                {
+                  "name": "consent transport is independent of query",
+                  "passed": true
+                },
+                {
+                  "name": "revoked consent stops later events",
+                  "passed": true
+                },
+                {
+                  "name": "existing navigation survives",
+                  "passed": true
+                },
+                {
+                  "name": "actual retained consumer survives",
+                  "passed": true
+                },
+                {
+                  "name": "no WebSocket egress",
+                  "passed": true
+                },
+                {
+                  "name": "no runtime page errors",
+                  "passed": true
+                }
+              ],
+              "errors": [],
+              "observation_window_ms": 500,
+              "passed": true,
+              "requests": [
+                {
+                  "body": "{\"event\":\"search\"}",
+                  "headers": {
+                    "accept": "*/*",
+                    "accept-language": "en-US",
+                    "content-type": "text/plain;charset=UTF-8",
+                    "origin": "null",
+                    "sec-ch-ua": "\"HeadlessChrome\";v=\"149\", \"Chromium\";v=\"149\", \"Not)A;Brand\";v=\"24\"",
+                    "sec-ch-ua-mobile": "?0",
+                    "sec-ch-ua-platform": "\"macOS\"",
+                    "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/149.0.7827.55 Safari/537.36"
+                  },
+                  "method": "POST",
+                  "url": "https://telemetry.invalid/event"
+                },
+                {
+                  "body": "{\"event\":\"search\"}",
+                  "headers": {
+                    "accept": "*/*",
+                    "accept-language": "en-US",
+                    "content-type": "text/plain;charset=UTF-8",
+                    "origin": "null",
+                    "sec-ch-ua": "\"HeadlessChrome\";v=\"149\", \"Chromium\";v=\"149\", \"Not)A;Brand\";v=\"24\"",
+                    "sec-ch-ua-mobile": "?0",
+                    "sec-ch-ua-platform": "\"macOS\"",
+                    "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/149.0.7827.55 Safari/537.36"
+                  },
+                  "method": "POST",
+                  "url": "https://telemetry.invalid/event"
+                }
+              ],
+              "requirements": [
+                "search",
+                "consent",
+                "privacy",
+                "navigation",
+                "consumer_footer"
+              ],
+              "schema": "aethyme.e1.browser-observation/v1",
+              "sockets": [],
+              "wall_ms": 3306.3307919999997
+            },
+            "signal": null,
+            "state": "completed",
+            "stderr": "/private/tmp/aethyme-e1-synthesis-20261012-97a152-frozen/Playground-E1-browser-cndo9O/actual-consumer-0.stderr",
+            "stdout": "/private/tmp/aethyme-e1-synthesis-20261012-97a152-frozen/Playground-E1-browser-cndo9O/actual-consumer-0.stdout",
+            "wall_ms": 7789
+          },
+          "candidate": "sha256:b0e0145b8f5f348e67d8b06b7e5d3180219ad982be70b9e4d7f29aa9c49d136e",
+          "order": [
+            "S",
+            "consumer-footer"
+          ],
+          "outcome": "candidate",
+          "repeat": 0,
+          "state": "completed"
+        },
+        {
+          "browser": {
+            "exit": 0,
+            "observation": {
+              "browser_version": "149.0.7827.55",
+              "checks": [
+                {
+                  "name": "consent is initially false",
+                  "passed": true
+                },
+                {
+                  "name": "unique DOM identities",
+                  "passed": true
+                },
+                {
+                  "name": "Enter preserves directory search",
+                  "passed": true
+                },
+                {
+                  "name": "pointer preserves directory search",
+                  "passed": true
+                },
+                {
+                  "name": "no telemetry without affirmative consent",
+                  "passed": true
+                },
+                {
+                  "name": "one anonymous event with consent",
+                  "passed": true
+                },
+                {
+                  "name": "consent transport is independent of query",
+                  "passed": true
+                },
+                {
+                  "name": "revoked consent stops later events",
+                  "passed": true
+                },
+                {
+                  "name": "existing navigation survives",
+                  "passed": true
+                },
+                {
+                  "name": "actual retained consumer survives",
+                  "passed": true
+                },
+                {
+                  "name": "no WebSocket egress",
+                  "passed": true
+                },
+                {
+                  "name": "no runtime page errors",
+                  "passed": true
+                }
+              ],
+              "errors": [],
+              "observation_window_ms": 500,
+              "passed": true,
+              "requests": [
+                {
+                  "body": "{\"event\":\"search\"}",
+                  "headers": {
+                    "accept": "*/*",
+                    "accept-language": "en-US",
+                    "content-type": "text/plain;charset=UTF-8",
+                    "origin": "null",
+                    "sec-ch-ua": "\"HeadlessChrome\";v=\"149\", \"Chromium\";v=\"149\", \"Not)A;Brand\";v=\"24\"",
+                    "sec-ch-ua-mobile": "?0",
+                    "sec-ch-ua-platform": "\"macOS\"",
+                    "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/149.0.7827.55 Safari/537.36"
+                  },
+                  "method": "POST",
+                  "url": "https://telemetry.invalid/event"
+                },
+                {
+                  "body": "{\"event\":\"search\"}",
+                  "headers": {
+                    "accept": "*/*",
+                    "accept-language": "en-US",
+                    "content-type": "text/plain;charset=UTF-8",
+                    "origin": "null",
+                    "sec-ch-ua": "\"HeadlessChrome\";v=\"149\", \"Chromium\";v=\"149\", \"Not)A;Brand\";v=\"24\"",
+                    "sec-ch-ua-mobile": "?0",
+                    "sec-ch-ua-platform": "\"macOS\"",
+                    "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/149.0.7827.55 Safari/537.36"
+                  },
+                  "method": "POST",
+                  "url": "https://telemetry.invalid/event"
+                }
+              ],
+              "requirements": [
+                "search",
+                "consent",
+                "privacy",
+                "navigation",
+                "consumer_footer"
+              ],
+              "schema": "aethyme.e1.browser-observation/v1",
+              "sockets": [],
+              "wall_ms": 2838.3893750000007
+            },
+            "signal": null,
+            "state": "completed",
+            "stderr": "/private/tmp/aethyme-e1-synthesis-20261012-97a152-frozen/Playground-E1-browser-cndo9O/actual-consumer-1.stderr",
+            "stdout": "/private/tmp/aethyme-e1-synthesis-20261012-97a152-frozen/Playground-E1-browser-cndo9O/actual-consumer-1.stdout",
+            "wall_ms": 7735
+          },
+          "candidate": "sha256:b0e0145b8f5f348e67d8b06b7e5d3180219ad982be70b9e4d7f29aa9c49d136e",
+          "order": [
+            "S",
+            "consumer-footer"
+          ],
+          "outcome": "candidate",
+          "repeat": 1,
+          "state": "completed"
+        },
+        {
+          "browser": {
+            "exit": 0,
+            "observation": {
+              "browser_version": "149.0.7827.55",
+              "checks": [
+                {
+                  "name": "consent is initially false",
+                  "passed": true
+                },
+                {
+                  "name": "unique DOM identities",
+                  "passed": true
+                },
+                {
+                  "name": "Enter preserves directory search",
+                  "passed": true
+                },
+                {
+                  "name": "pointer preserves directory search",
+                  "passed": true
+                },
+                {
+                  "name": "no telemetry without affirmative consent",
+                  "passed": true
+                },
+                {
+                  "name": "one anonymous event with consent",
+                  "passed": true
+                },
+                {
+                  "name": "consent transport is independent of query",
+                  "passed": true
+                },
+                {
+                  "name": "revoked consent stops later events",
+                  "passed": true
+                },
+                {
+                  "name": "existing navigation survives",
+                  "passed": true
+                },
+                {
+                  "name": "actual retained consumer survives",
+                  "passed": true
+                },
+                {
+                  "name": "no WebSocket egress",
+                  "passed": true
+                },
+                {
+                  "name": "no runtime page errors",
+                  "passed": true
+                }
+              ],
+              "errors": [],
+              "observation_window_ms": 500,
+              "passed": true,
+              "requests": [
+                {
+                  "body": "{\"event\":\"search\"}",
+                  "headers": {
+                    "accept": "*/*",
+                    "accept-language": "en-US",
+                    "content-type": "text/plain;charset=UTF-8",
+                    "origin": "null",
+                    "sec-ch-ua": "\"HeadlessChrome\";v=\"149\", \"Chromium\";v=\"149\", \"Not)A;Brand\";v=\"24\"",
+                    "sec-ch-ua-mobile": "?0",
+                    "sec-ch-ua-platform": "\"macOS\"",
+                    "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/149.0.7827.55 Safari/537.36"
+                  },
+                  "method": "POST",
+                  "url": "https://telemetry.invalid/event"
+                },
+                {
+                  "body": "{\"event\":\"search\"}",
+                  "headers": {
+                    "accept": "*/*",
+                    "accept-language": "en-US",
+                    "content-type": "text/plain;charset=UTF-8",
+                    "origin": "null",
+                    "sec-ch-ua": "\"HeadlessChrome\";v=\"149\", \"Chromium\";v=\"149\", \"Not)A;Brand\";v=\"24\"",
+                    "sec-ch-ua-mobile": "?0",
+                    "sec-ch-ua-platform": "\"macOS\"",
+                    "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/149.0.7827.55 Safari/537.36"
+                  },
+                  "method": "POST",
+                  "url": "https://telemetry.invalid/event"
+                }
+              ],
+              "requirements": [
+                "search",
+                "consent",
+                "privacy",
+                "navigation",
+                "consumer_footer"
+              ],
+              "schema": "aethyme.e1.browser-observation/v1",
+              "sockets": [],
+              "wall_ms": 2355.19025
+            },
+            "signal": null,
+            "state": "completed",
+            "stderr": "/private/tmp/aethyme-e1-synthesis-20261012-97a152-frozen/Playground-E1-browser-cndo9O/actual-consumer-2.stderr",
+            "stdout": "/private/tmp/aethyme-e1-synthesis-20261012-97a152-frozen/Playground-E1-browser-cndo9O/actual-consumer-2.stdout",
+            "wall_ms": 4054
+          },
+          "candidate": "sha256:b0e0145b8f5f348e67d8b06b7e5d3180219ad982be70b9e4d7f29aa9c49d136e",
+          "order": [
+            "consumer-footer",
+            "S"
+          ],
+          "outcome": "candidate",
+          "repeat": 0,
+          "state": "completed"
+        },
+        {
+          "browser": {
+            "exit": 0,
+            "observation": {
+              "browser_version": "149.0.7827.55",
+              "checks": [
+                {
+                  "name": "consent is initially false",
+                  "passed": true
+                },
+                {
+                  "name": "unique DOM identities",
+                  "passed": true
+                },
+                {
+                  "name": "Enter preserves directory search",
+                  "passed": true
+                },
+                {
+                  "name": "pointer preserves directory search",
+                  "passed": true
+                },
+                {
+                  "name": "no telemetry without affirmative consent",
+                  "passed": true
+                },
+                {
+                  "name": "one anonymous event with consent",
+                  "passed": true
+                },
+                {
+                  "name": "consent transport is independent of query",
+                  "passed": true
+                },
+                {
+                  "name": "revoked consent stops later events",
+                  "passed": true
+                },
+                {
+                  "name": "existing navigation survives",
+                  "passed": true
+                },
+                {
+                  "name": "actual retained consumer survives",
+                  "passed": true
+                },
+                {
+                  "name": "no WebSocket egress",
+                  "passed": true
+                },
+                {
+                  "name": "no runtime page errors",
+                  "passed": true
+                }
+              ],
+              "errors": [],
+              "observation_window_ms": 500,
+              "passed": true,
+              "requests": [
+                {
+                  "body": "{\"event\":\"search\"}",
+                  "headers": {
+                    "accept": "*/*",
+                    "accept-language": "en-US",
+                    "content-type": "text/plain;charset=UTF-8",
+                    "origin": "null",
+                    "sec-ch-ua": "\"HeadlessChrome\";v=\"149\", \"Chromium\";v=\"149\", \"Not)A;Brand\";v=\"24\"",
+                    "sec-ch-ua-mobile": "?0",
+                    "sec-ch-ua-platform": "\"macOS\"",
+                    "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/149.0.7827.55 Safari/537.36"
+                  },
+                  "method": "POST",
+                  "url": "https://telemetry.invalid/event"
+                },
+                {
+                  "body": "{\"event\":\"search\"}",
+                  "headers": {
+                    "accept": "*/*",
+                    "accept-language": "en-US",
+                    "content-type": "text/plain;charset=UTF-8",
+                    "origin": "null",
+                    "sec-ch-ua": "\"HeadlessChrome\";v=\"149\", \"Chromium\";v=\"149\", \"Not)A;Brand\";v=\"24\"",
+                    "sec-ch-ua-mobile": "?0",
+                    "sec-ch-ua-platform": "\"macOS\"",
+                    "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/149.0.7827.55 Safari/537.36"
+                  },
+                  "method": "POST",
+                  "url": "https://telemetry.invalid/event"
+                }
+              ],
+              "requirements": [
+                "search",
+                "consent",
+                "privacy",
+                "navigation",
+                "consumer_footer"
+              ],
+              "schema": "aethyme.e1.browser-observation/v1",
+              "sockets": [],
+              "wall_ms": 2800.326833
+            },
+            "signal": null,
+            "state": "completed",
+            "stderr": "/private/tmp/aethyme-e1-synthesis-20261012-97a152-frozen/Playground-E1-browser-cndo9O/actual-consumer-3.stderr",
+            "stdout": "/private/tmp/aethyme-e1-synthesis-20261012-97a152-frozen/Playground-E1-browser-cndo9O/actual-consumer-3.stdout",
+            "wall_ms": 4981
+          },
+          "candidate": "sha256:b0e0145b8f5f348e67d8b06b7e5d3180219ad982be70b9e4d7f29aa9c49d136e",
+          "order": [
+            "consumer-footer",
+            "S"
+          ],
+          "outcome": "candidate",
+          "repeat": 1,
+          "state": "completed"
+        }
+      ],
+      "state": "completed"
+    },
+    {
+      "id": "subtract-no-consumer",
+      "runs": [
+        {
+          "accepted": true,
+          "browser": {
+            "exit": 0,
+            "observation": {
+              "browser_version": "149.0.7827.55",
+              "checks": [
+                {
+                  "name": "consent is initially false",
+                  "passed": true
+                },
+                {
+                  "name": "unique DOM identities",
+                  "passed": true
+                },
+                {
+                  "name": "Enter preserves directory search",
+                  "passed": true
+                },
+                {
+                  "name": "pointer preserves directory search",
+                  "passed": true
+                },
+                {
+                  "name": "existing navigation survives",
+                  "passed": true
+                },
+                {
+                  "name": "subtraction has no analytics even with consent",
+                  "passed": true
+                },
+                {
+                  "name": "ordinary compositions emit no telemetry",
+                  "passed": true
+                },
+                {
+                  "name": "no WebSocket egress",
+                  "passed": true
+                },
+                {
+                  "name": "no runtime page errors",
+                  "passed": true
+                }
+              ],
+              "errors": [],
+              "observation_window_ms": 500,
+              "passed": true,
+              "requests": [],
+              "requirements": [
+                "search",
+                "navigation",
+                "no_analytics"
+              ],
+              "schema": "aethyme.e1.browser-observation/v1",
+              "sockets": [],
+              "wall_ms": 2028.649459
+            },
+            "signal": null,
+            "state": "completed",
+            "stderr": "/private/tmp/aethyme-e1-synthesis-20261012-97a152-frozen/Playground-E1-browser-cndo9O/subtraction-without-consumer-0.stderr",
+            "stdout": "/private/tmp/aethyme-e1-synthesis-20261012-97a152-frozen/Playground-E1-browser-cndo9O/subtraction-without-consumer-0.stdout",
+            "wall_ms": 3798
+          },
+          "candidate": {
+            "commit": "4308a581c848101b0f5c87295f801c60d0a228b1",
+            "sha256": "87c334d370516eb895e4fda8c7528c8f052390991b2fc248ed9d8a0532bcae0c",
+            "snapshot": "sha256:7b956f060f165a7afd363f54410ac92b5d83ef2b91f2900f75cedbf9bfbb93c3"
+          },
+          "candidate_present": true,
+          "exact_retained_c2_inputs": true,
+          "order": [
+            "c2"
+          ],
+          "outcome": "candidate",
+          "recipe": {
+            "baseline": "sha256:d77bc79be411944893cf4353639f95d6e6eb8dedd9c7139f80a99112385070d2",
+            "baseline_commit": "68830b7dc7c229402fc0e305e9404239b166d1a8",
+            "budget": {
+              "limits": {
+                "bytes": "268435456",
+                "contributions": 64,
+                "merges": 1000,
+                "paths": 10000
+              },
+              "used": {
+                "bytes": "1649",
+                "contributions": 1,
+                "merges": 0,
+                "paths": 1
+              }
+            },
+            "candidate": "sha256:7b956f060f165a7afd363f54410ac92b5d83ef2b91f2900f75cedbf9bfbb93c3",
+            "candidate_commit": "4308a581c848101b0f5c87295f801c60d0a228b1",
+            "deliveries": 1,
+            "engine": {
+              "grammar": "html",
+              "license": "GPL-3.0-only; external executable",
+              "max_input_bytes": 4194304,
+              "max_stream_bytes": 8388608,
+              "name": "mergiraf",
+              "observations": [],
+              "sha256": "cda5175440f474b4f887c8e6e39878911d15e1a4825d70b4e949a0841820cc3c",
+              "structural_timeout_ms": 2000,
+              "text_fallback_version": "git version 2.55.0",
+              "text_merges": 0,
+              "version": "0.19.1",
+              "wall_ms": 5000
+            },
+            "order": [
+              {
+                "base": "sha256:d77bc79be411944893cf4353639f95d6e6eb8dedd9c7139f80a99112385070d2",
+                "id": "c2",
+                "lineage": "sha256:056e020445f9fb7835f52f8a814a37db3133980934d24acbc32acdbf0ee89885",
+                "result": "sha256:7b956f060f165a7afd363f54410ac92b5d83ef2b91f2900f75cedbf9bfbb93c3"
+              }
+            ],
+            "profile": "aethyme.compose.mergiraf-html/experimental-v1",
+            "recomposition": {
+              "from": "S",
+              "keep": [],
+              "remove": [
+                "c1"
+              ]
+            },
+            "schema": "aethyme.composition-recipe/experimental-v0"
+          },
+          "recipe_present": true,
+          "repeat": 0,
+          "state": "completed"
+        },
+        {
+          "accepted": true,
+          "browser": {
+            "exit": 0,
+            "observation": {
+              "browser_version": "149.0.7827.55",
+              "checks": [
+                {
+                  "name": "consent is initially false",
+                  "passed": true
+                },
+                {
+                  "name": "unique DOM identities",
+                  "passed": true
+                },
+                {
+                  "name": "Enter preserves directory search",
+                  "passed": true
+                },
+                {
+                  "name": "pointer preserves directory search",
+                  "passed": true
+                },
+                {
+                  "name": "existing navigation survives",
+                  "passed": true
+                },
+                {
+                  "name": "subtraction has no analytics even with consent",
+                  "passed": true
+                },
+                {
+                  "name": "ordinary compositions emit no telemetry",
+                  "passed": true
+                },
+                {
+                  "name": "no WebSocket egress",
+                  "passed": true
+                },
+                {
+                  "name": "no runtime page errors",
+                  "passed": true
+                }
+              ],
+              "errors": [],
+              "observation_window_ms": 500,
+              "passed": true,
+              "requests": [],
+              "requirements": [
+                "search",
+                "navigation",
+                "no_analytics"
+              ],
+              "schema": "aethyme.e1.browser-observation/v1",
+              "sockets": [],
+              "wall_ms": 1935.765833
+            },
+            "signal": null,
+            "state": "completed",
+            "stderr": "/private/tmp/aethyme-e1-synthesis-20261012-97a152-frozen/Playground-E1-browser-cndo9O/subtraction-without-consumer-1.stderr",
+            "stdout": "/private/tmp/aethyme-e1-synthesis-20261012-97a152-frozen/Playground-E1-browser-cndo9O/subtraction-without-consumer-1.stdout",
+            "wall_ms": 3675
+          },
+          "candidate": {
+            "commit": "4308a581c848101b0f5c87295f801c60d0a228b1",
+            "sha256": "87c334d370516eb895e4fda8c7528c8f052390991b2fc248ed9d8a0532bcae0c",
+            "snapshot": "sha256:7b956f060f165a7afd363f54410ac92b5d83ef2b91f2900f75cedbf9bfbb93c3"
+          },
+          "candidate_present": true,
+          "exact_retained_c2_inputs": true,
+          "order": [
+            "c2"
+          ],
+          "outcome": "candidate",
+          "recipe": {
+            "baseline": "sha256:d77bc79be411944893cf4353639f95d6e6eb8dedd9c7139f80a99112385070d2",
+            "baseline_commit": "68830b7dc7c229402fc0e305e9404239b166d1a8",
+            "budget": {
+              "limits": {
+                "bytes": "268435456",
+                "contributions": 64,
+                "merges": 1000,
+                "paths": 10000
+              },
+              "used": {
+                "bytes": "1649",
+                "contributions": 1,
+                "merges": 0,
+                "paths": 1
+              }
+            },
+            "candidate": "sha256:7b956f060f165a7afd363f54410ac92b5d83ef2b91f2900f75cedbf9bfbb93c3",
+            "candidate_commit": "4308a581c848101b0f5c87295f801c60d0a228b1",
+            "deliveries": 1,
+            "engine": {
+              "grammar": "html",
+              "license": "GPL-3.0-only; external executable",
+              "max_input_bytes": 4194304,
+              "max_stream_bytes": 8388608,
+              "name": "mergiraf",
+              "observations": [],
+              "sha256": "cda5175440f474b4f887c8e6e39878911d15e1a4825d70b4e949a0841820cc3c",
+              "structural_timeout_ms": 2000,
+              "text_fallback_version": "git version 2.55.0",
+              "text_merges": 0,
+              "version": "0.19.1",
+              "wall_ms": 5000
+            },
+            "order": [
+              {
+                "base": "sha256:d77bc79be411944893cf4353639f95d6e6eb8dedd9c7139f80a99112385070d2",
+                "id": "c2",
+                "lineage": "sha256:056e020445f9fb7835f52f8a814a37db3133980934d24acbc32acdbf0ee89885",
+                "result": "sha256:7b956f060f165a7afd363f54410ac92b5d83ef2b91f2900f75cedbf9bfbb93c3"
+              }
+            ],
+            "profile": "aethyme.compose.mergiraf-html/experimental-v1",
+            "recomposition": {
+              "from": "S",
+              "keep": [],
+              "remove": [
+                "c1"
+              ]
+            },
+            "schema": "aethyme.composition-recipe/experimental-v0"
+          },
+          "recipe_present": true,
+          "repeat": 1,
+          "state": "completed"
+        }
+      ],
+      "state": "completed"
+    },
+    {
+      "id": "subtract-kept-consumer",
+      "runs": [
+        {
+          "accepted": true,
+          "candidate_present": false,
+          "order": [],
+          "outcome": "inseparable_selection",
+          "recipe_present": false,
+          "repeat": 0,
+          "state": "completed"
+        },
+        {
+          "accepted": true,
+          "candidate_present": false,
+          "order": [],
+          "outcome": "inseparable_selection",
+          "recipe_present": false,
+          "repeat": 1,
+          "state": "completed"
+        }
+      ],
+      "state": "completed"
+    }
+  ],
+  "request": {
+    "decision": "4b08a5b7ab28cb4db926944098a11271126afd03cd47a3a5831906e7e9fdfc9c",
+    "id": "sha256:2fe3fd050536f1f1346602f13ad71e3e2ad1f9b5aed6ed1fb0905255055c353d"
+  },
+  "retained_originals_after_subtraction": [
+    {
+      "id": "c1",
+      "role": "base",
+      "sha256": "e7b7b35d4b6914b17484a275dde1022b184c54d2395114d9a78e24582fe40500",
+      "snapshot": "sha256:d77bc79be411944893cf4353639f95d6e6eb8dedd9c7139f80a99112385070d2"
+    },
+    {
+      "id": "c1",
+      "role": "result",
+      "sha256": "bf7bcef143446a54c9e12cca3bbb8aa2f3b6b38c57d9b4d6c47b21ad325333f6",
+      "snapshot": "sha256:5aa96cfbce53b7bd8b22cfcbe6bc8b0d761f68875f25ba04f031f8ab52f50e23"
+    },
+    {
+      "id": "c2",
+      "role": "base",
+      "sha256": "e7b7b35d4b6914b17484a275dde1022b184c54d2395114d9a78e24582fe40500",
+      "snapshot": "sha256:d77bc79be411944893cf4353639f95d6e6eb8dedd9c7139f80a99112385070d2"
+    },
+    {
+      "id": "c2",
+      "role": "result",
+      "sha256": "87c334d370516eb895e4fda8c7528c8f052390991b2fc248ed9d8a0532bcae0c",
+      "snapshot": "sha256:7b956f060f165a7afd363f54410ac92b5d83ef2b91f2900f75cedbf9bfbb93c3"
+    },
+    {
+      "id": "S",
+      "role": "base",
+      "sha256": "e7b7b35d4b6914b17484a275dde1022b184c54d2395114d9a78e24582fe40500",
+      "snapshot": "sha256:d77bc79be411944893cf4353639f95d6e6eb8dedd9c7139f80a99112385070d2"
+    },
+    {
+      "id": "S",
+      "role": "result",
+      "sha256": "a743ddf4c4dae450edc2de764458fba2390666694deea313356c0e6210b2a1fe",
+      "snapshot": "sha256:26bb14156bf27edb3d40bab0a3201f09abd889f59599001f3e0be0fd67237def"
+    },
+    {
+      "id": "consumer-footer",
+      "role": "base",
+      "sha256": "a743ddf4c4dae450edc2de764458fba2390666694deea313356c0e6210b2a1fe",
+      "snapshot": "sha256:26bb14156bf27edb3d40bab0a3201f09abd889f59599001f3e0be0fd67237def"
+    },
+    {
+      "id": "consumer-footer",
+      "role": "result",
+      "sha256": "9cef32f5c9b6d7c8f131360c1eeb731a88f04847aee387e45e96421e3ed3a825",
+      "snapshot": "sha256:b0e0145b8f5f348e67d8b06b7e5d3180219ad982be70b9e4d7f29aa9c49d136e"
+    }
+  ],
+  "retained_playground": "/private/tmp/aethyme-e1-synthesis-20261012-97a152-frozen/Playground-E1-browser-cndo9O",
+  "runtime_profile": {
+    "chromium": "/Users/christophehenner/Library/Caches/ms-playwright/chromium_headless_shell-1228/chrome-headless-shell-mac-arm64/chrome-headless-shell",
+    "deployment_contract": "Appointed cooperative macOS host; operator preserves this full inventory unchanged between verification and launch. Host OS and dynamic system/Homebrew libraries are trusted, not sandboxed supply-chain subjects.",
+    "files": [
+      {
+        "bytes": 11601,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright-core/LICENSE",
+        "sha256": "45873d00a0dd243596deb4aa23b2493b3d1f0671921bf2538ea431d7380220eb"
+      },
+      {
+        "bytes": 254,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright-core/NOTICE",
+        "sha256": "6d602191187b35b9b01d2cffa01c8469c2c8d9de8a96f1bf868e0f264f51c81d"
+      },
+      {
+        "bytes": 120,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright-core/README.md",
+        "sha256": "d16ff7f8e38fa1fc954f695ad551cdc118d9c9bdd5f3d83203901f4c317d7d7e"
+      },
+      {
+        "bytes": 676,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright-core/ThirdPartyNotices.txt",
+        "sha256": "a549d329bad8806fe279f0ecae0fc0270dec7e7c2dc8ec10f90e394f7c32b144"
+      },
+      {
+        "bytes": 174,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright-core/bin/install_media_pack.ps1",
+        "sha256": "bc20f049badf021e3a53bdb4156603caa5ef482c9a9a251f927605e676a44171"
+      },
+      {
+        "bytes": 1464,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright-core/bin/install_webkit_wsl.ps1",
+        "sha256": "bc61beda37a808eef27d39ce684baa792f6d17737a25a432b1a84d3b591ab815"
+      },
+      {
+        "bytes": 1217,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright-core/bin/reinstall_chrome_beta_linux.sh",
+        "sha256": "dc8c22b9dde76583cece2857575b88094299615f3136a3c598149710c45dee3a"
+      },
+      {
+        "bytes": 563,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright-core/bin/reinstall_chrome_beta_mac.sh",
+        "sha256": "a92eaeb4ebcf5633a4e9c981481e14c80764fc81b6fcbc0565398e50ff319433"
+      },
+      {
+        "bytes": 957,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright-core/bin/reinstall_chrome_beta_win.ps1",
+        "sha256": "b6d9e44742feafb98d5edc56fa20042949973cf30d141a1c5b4fb384096967c5"
+      },
+      {
+        "bytes": 1212,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright-core/bin/reinstall_chrome_stable_linux.sh",
+        "sha256": "dc72ab3567a4ce43bd8353d4ecf41f1d9c03e870169367cd3ed9043aabf67dd1"
+      },
+      {
+        "bytes": 519,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright-core/bin/reinstall_chrome_stable_mac.sh",
+        "sha256": "bb43a96c192a6cc81524ade0264686fff7809c019a89f7db0a9849635879c3be"
+      },
+      {
+        "bytes": 923,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright-core/bin/reinstall_chrome_stable_win.ps1",
+        "sha256": "3d96c4e2f4ebbb3fad44cf3ba58d9cf90af1c9fb3073e3b27d45a74cf005515b"
+      },
+      {
+        "bytes": 1494,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright-core/bin/reinstall_msedge_beta_linux.sh",
+        "sha256": "10b26f35dbc2000b94edf1172d803a29c5873a4eb8d523afbc687997b642767e"
+      },
+      {
+        "bytes": 377,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright-core/bin/reinstall_msedge_beta_mac.sh",
+        "sha256": "0036d738bc90d686100d81f328ba0003bf07863f5500b792c8da391d149750fa"
+      },
+      {
+        "bytes": 874,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright-core/bin/reinstall_msedge_beta_win.ps1",
+        "sha256": "b173c378a59f0cc38033cee702de1f44f09276c9b2270d1a650ebe66ee312433"
+      },
+      {
+        "bytes": 1489,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright-core/bin/reinstall_msedge_dev_linux.sh",
+        "sha256": "00e4947e7a4f8339c6db09c87976d808583c07f9179e4aa7694d88614b82fe95"
+      },
+      {
+        "bytes": 372,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright-core/bin/reinstall_msedge_dev_mac.sh",
+        "sha256": "6f899e3b311f742c24ca37ff9e32298e8290514ffc14bf588cc51556a29da4c0"
+      },
+      {
+        "bytes": 869,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright-core/bin/reinstall_msedge_dev_win.ps1",
+        "sha256": "46f7f98c81cb0abe687d7f4a5afea9b897a38d2a6dd6f6662fbd847f7a22bd51"
+      },
+      {
+        "bytes": 1507,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright-core/bin/reinstall_msedge_stable_linux.sh",
+        "sha256": "ec0a31a5f09c565e108473a1850895a4458ab00c713ac1de3aa2001912e4668f"
+      },
+      {
+        "bytes": 371,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright-core/bin/reinstall_msedge_stable_mac.sh",
+        "sha256": "3af1e893527ff2257aa2dbc3b259a053b92f45c3eadb13e38eba46e87902655d"
+      },
+      {
+        "bytes": 856,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright-core/bin/reinstall_msedge_stable_win.ps1",
+        "sha256": "40bb5fcbfcebbbe2ce43c6e736e7c5deefc5be03b6e9c6914423c06ec1f591be"
+      },
+      {
+        "bytes": 1137,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright-core/browsers.json",
+        "sha256": "f8a818e27de670929765493bb92715c0253336b5b99fd59918318305e84ef17c"
+      },
+      {
+        "bytes": 839,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright-core/cli.js",
+        "sha256": "f1c4075aef116c766092250d7f37b3249a7cee6465d953207fc38c8f6145becd"
+      },
+      {
+        "bytes": 634,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright-core/index.d.ts",
+        "sha256": "7a8ec10b0834eb7183e4bfcd929838ac77583828e343211bb73676d1e47f6f01"
+      },
+      {
+        "bytes": 697,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright-core/index.js",
+        "sha256": "a58fb2cec4293e7dcf73c58a179898a4f3986666451a19da4e731fa3af63265b"
+      },
+      {
+        "bytes": 1063,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright-core/index.mjs",
+        "sha256": "3d36e2132d3c8b62397d23f0bb4177336aaee503203ae2a2c90fbeb5bf3317dd"
+      },
+      {
+        "bytes": 3481,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright-core/lib/bootstrap.js",
+        "sha256": "4637f4dbfef9cfc01baeb5f5d2cb63fa0901522c96915ea2227290558d27123e"
+      },
+      {
+        "bytes": 3573451,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright-core/lib/coreBundle.js",
+        "sha256": "cd6730be1bbcff00771a0fc1390f200306d28428ce68e305420ca623cb39cdeb"
+      },
+      {
+        "bytes": 197,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright-core/lib/entry/cliDaemon.js",
+        "sha256": "062f256fb29a7bf91793a014b9c3f1f9cf2dc6b12e40a8a2ebba88a630ae16a0"
+      },
+      {
+        "bytes": 108,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright-core/lib/entry/dashboardApp.js",
+        "sha256": "209962c6eaeef11629f226d6a2ab33ec7a2480754242b6e19590a9e6eb71d126"
+      },
+      {
+        "bytes": 442,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright-core/lib/entry/mcp.js",
+        "sha256": "cc87dc0020cb41caebbf04f50e42bc7835b033a6d80e9c3f0a3d0b3dbdf341c7"
+      },
+      {
+        "bytes": 120,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright-core/lib/entry/oopBrowserDownload.js",
+        "sha256": "87567cdbd67dd2f50bb232d47d3784701ece7c81e39c0287bb7d1b466b68cf06"
+      },
+      {
+        "bytes": 2112,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright-core/lib/package.js",
+        "sha256": "9f938e1d44a0dd231b1660ca62f7dae964859b79cbdc370b8542c5d375ca3c05"
+      },
+      {
+        "bytes": 16565,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright-core/lib/server/chromium/appIcon.png",
+        "sha256": "6ba994f05c5cf18e22d9b6bef9898fbdec6ad4d4d77f5187d0609cb42d72d01e"
+      },
+      {
+        "bytes": 5185,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright-core/lib/server/electron/loader.js",
+        "sha256": "3fd50baa5d6742970f2e15eedeabd6e615eda987afd72a8be0839607cac3712c"
+      },
+      {
+        "bytes": 57039,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright-core/lib/serverRegistry.js",
+        "sha256": "38025f08f335705b099b9f188bf45b5908a56a722825fe895b1e90f56d5595b6"
+      },
+      {
+        "bytes": 2982,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright-core/lib/serverRegistry.js.LICENSE",
+        "sha256": "3098a6efcbc11752cbdf6075fa65480f5470f78c8d981fab9c0796dc9a41cefe"
+      },
+      {
+        "bytes": 7087,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright-core/lib/tools/cli-client/channelSessions.js",
+        "sha256": "6b9c613e87340f48ad7182addd7495a8ff3fbe55feb1bbd0ce04f59f1552e126"
+      },
+      {
+        "bytes": 153,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright-core/lib/tools/cli-client/cli.js",
+        "sha256": "dfde8e9dfde30c4b3914eb25ba1c5a8524ec64651d866171d75cd7b41a827180"
+      },
+      {
+        "bytes": 43853,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright-core/lib/tools/cli-client/help.json",
+        "sha256": "0a644b07ed326d10b1a39bbdd236d0a79a1e854dfbefea3810ebde9c10997553"
+      },
+      {
+        "bytes": 4109,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright-core/lib/tools/cli-client/minimist.js",
+        "sha256": "9430489ebc06fd02231dccfe844516f743e812a9ac4fe8e6748a67718738851c"
+      },
+      {
+        "bytes": 11972,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright-core/lib/tools/cli-client/output.js",
+        "sha256": "b4c3ebab965e73d621971cd3c76b60c22cf460a0921f14c5c6c51e46e06f02d2"
+      },
+      {
+        "bytes": 16461,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright-core/lib/tools/cli-client/program.js",
+        "sha256": "7f661c00acf56f894a93d32917aa3e2af7d339f60be2cc79fe9d71b6605e51fc"
+      },
+      {
+        "bytes": 6768,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright-core/lib/tools/cli-client/registry.js",
+        "sha256": "4976cd5b2b3a25572cc1a4b5f055a756dacd4cc1b19d48987ee3253428e759b8"
+      },
+      {
+        "bytes": 9650,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright-core/lib/tools/cli-client/session.js",
+        "sha256": "8c3f9aff3fab537771cb560e1bad3e417e16b3315b7a3dc10a305faeca3f6024"
+      },
+      {
+        "bytes": 18945,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright-core/lib/tools/dashboard/appIcon.png",
+        "sha256": "38037bcf18c7f9b950da2e1a2d8800d38fb27637ccda293d38368a3704b67f18"
+      },
+      {
+        "bytes": 15428,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright-core/lib/tools/skills/playwright-cli/SKILL.md",
+        "sha256": "9bba755285a4c9ad72a4a41b9c7baef6fb516d329c0b44ed0573715f4479b906"
+      },
+      {
+        "bytes": 665,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright-core/lib/tools/skills/playwright-cli/references/element-attributes.md",
+        "sha256": "bf19aa4671e0a50a0fefa9c790f39124e803060eefe395042b723c29fcb7faa2"
+      },
+      {
+        "bytes": 1690,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright-core/lib/tools/skills/playwright-cli/references/playwright-tests.md",
+        "sha256": "c5b0719fef2cfdff50bd744051b2f9afc119775db4b48e9b2882c1cf3886797c"
+      },
+      {
+        "bytes": 2830,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright-core/lib/tools/skills/playwright-cli/references/pr-attachments.md",
+        "sha256": "24b118e74598be72e73e24fe223d295b9099c85b1860a7c8f6e5690c9038fa2a"
+      },
+      {
+        "bytes": 2182,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright-core/lib/tools/skills/playwright-cli/references/request-mocking.md",
+        "sha256": "54e801c9663fc2b6d68ceb058cb1c360724c2499f42acc7852a68e83e5b5f37c"
+      },
+      {
+        "bytes": 5913,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright-core/lib/tools/skills/playwright-cli/references/running-code.md",
+        "sha256": "3029569ed6ddaeffc0b87badde967efdc2973b1677f078830098146eb3b78ebe"
+      },
+      {
+        "bytes": 5929,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright-core/lib/tools/skills/playwright-cli/references/session-management.md",
+        "sha256": "a4f16271f95d3eec7bc56e659d8adbb8f6ad7d603a6fa15efdcdd071a50c6ce3"
+      },
+      {
+        "bytes": 5198,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright-core/lib/tools/skills/playwright-cli/references/storage-state.md",
+        "sha256": "9ac47f9ae4a1aedcd2077f8ac9ab1ba6bee1962cb83ff51adcd36fb6d83b5ec6"
+      },
+      {
+        "bytes": 16070,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright-core/lib/tools/skills/playwright-cli/references/test-generation.md",
+        "sha256": "27ecb11ef647999bd7486695bb1aacc3682097e6bb5742804cb6c8769c2b5364"
+      },
+      {
+        "bytes": 3456,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright-core/lib/tools/skills/playwright-cli/references/tracing.md",
+        "sha256": "ef73e71bee792e341df9cd4f60529c929ade48b538ac76e033f4f20843e8dbda"
+      },
+      {
+        "bytes": 9388,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright-core/lib/tools/skills/playwright-cli/references/video-recording.md",
+        "sha256": "1c800b897824cb54394c34265d8ebffdbb530adfc8d612c5d798b667a1799f48"
+      },
+      {
+        "bytes": 10404,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright-core/lib/tools/skills/playwright-component-testing/SKILL.md",
+        "sha256": "60f57b31767d562c30cc5332081418c2945f4d9c998efa6e09191333654dd429"
+      },
+      {
+        "bytes": 6199,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright-core/lib/tools/skills/playwright-component-testing/references/gallery-spec.md",
+        "sha256": "0ca25dde6112eb379f56eb618585b64dc2dfd13c2f7f956ac7eabbd76a68912b"
+      },
+      {
+        "bytes": 5031,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright-core/lib/tools/skills/playwright-component-testing/references/migration.md",
+        "sha256": "bc3a336f7970bb7455fa5a38f937e45b35fb0c18d6c3b9f37916a4ff757b7acc"
+      },
+      {
+        "bytes": 3115,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright-core/lib/tools/skills/playwright-component-testing/references/react.md",
+        "sha256": "54af9cc1cdb6d4ccdb8e811c0abb29b960d5c9304f4df7d1dcf9b8df3f973102"
+      },
+      {
+        "bytes": 6883,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright-core/lib/tools/skills/playwright-component-testing/references/typing.md",
+        "sha256": "c511025b5c9b02d7f49034a5613c8b478193bf60c90ea6dddb3faf9c6985c82b"
+      },
+      {
+        "bytes": 3374,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright-core/lib/tools/skills/playwright-component-testing/references/vue.md",
+        "sha256": "d1b129f126c700702a3c00ad8eb6c86898bc941c29a656c1191eb7230650bf8b"
+      },
+      {
+        "bytes": 4862,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright-core/lib/tools/skills/playwright-trace/SKILL.md",
+        "sha256": "c76d28244c05a6474f6030213127cd62253208b06430ea2378576f0669db2c9a"
+      },
+      {
+        "bytes": 4689,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright-core/lib/tools/utils/extension.js",
+        "sha256": "404ae19e57a7c7c5ed3e6ecf9df26a3fcf95867250732f954823078ccb879e63"
+      },
+      {
+        "bytes": 3317,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright-core/lib/tools/utils/socketConnection.js",
+        "sha256": "973c2bea70a1f1445f4673f99e9fa351e50a2ec9fd93d7381b2c41bb4de764dd"
+      },
+      {
+        "bytes": 3063951,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright-core/lib/utilsBundle.js",
+        "sha256": "04d045bf5693937b95327fb031714536019a74472a7bd71bf1ea10a9ef112b3a"
+      },
+      {
+        "bytes": 106591,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright-core/lib/utilsBundle.js.LICENSE",
+        "sha256": "bbdb64d9b0d1e22e44c3371557b36e7c592386dbfa966dedd493ee8b871070f2"
+      },
+      {
+        "bytes": 6251,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright-core/lib/vite/dashboard/assets/codeMirrorModule--QdMvsKi.css",
+        "sha256": "20be824a82832b62cc04642d31da3c609fd280b23f1cdcb1e622c4f40aac5ab8"
+      },
+      {
+        "bytes": 307374,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright-core/lib/vite/dashboard/assets/codeMirrorModule-CQ8RZGBm.js",
+        "sha256": "56b9c6a50c09dfac28eea5ec3e76c8ae85a26009b20ebac9928959cf3c3312bb"
+      },
+      {
+        "bytes": 80340,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright-core/lib/vite/dashboard/assets/codicon-DCmgc-ay.ttf",
+        "sha256": "0f1d5219934e96e83b8db162d60b4d8c09b5de1e7d38031cbafe4a3c0f2889c9"
+      },
+      {
+        "bytes": 7488,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright-core/lib/vite/dashboard/assets/firefox-1bWoP6pv.svg",
+        "sha256": "3f3742d1e78c0db6c2d3531250f70c30675ee5310de32fa89befaf738c54efd0"
+      },
+      {
+        "bytes": 9280,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright-core/lib/vite/dashboard/assets/firefox-beta-k3eOH_eK.svg",
+        "sha256": "7eab5ffdc25903ba33a7202f7fffa1999f119c7be45a39e9e703c118904f917a"
+      },
+      {
+        "bytes": 9143,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright-core/lib/vite/dashboard/assets/firefox-nightly-Cp5nfeDT.svg",
+        "sha256": "f311c074b0fa999fcd6b73441301fb54ee87a48ff3bf05f318647928110476da"
+      },
+      {
+        "bytes": 139111,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright-core/lib/vite/dashboard/assets/index-AwgwcYie.css",
+        "sha256": "82d06f291a7d0860e1b1e1803ab6f2e49c637541779a37168652e10b062b67f9"
+      },
+      {
+        "bytes": 336491,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright-core/lib/vite/dashboard/assets/index-hRvO4yU2.js",
+        "sha256": "3a05ed0b026442a1459952df25b9a836d4fa1a917838cf6f9357daefc0e42285"
+      },
+      {
+        "bytes": 5254,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright-core/lib/vite/dashboard/assets/safari-na3_-uQk.svg",
+        "sha256": "80fd72ca5eb8545f1981277b31f4f92951d469d4efebd078e4086b676fe517dc"
+      },
+      {
+        "bytes": 1078,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright-core/lib/vite/dashboard/index.html",
+        "sha256": "202903aad66040604bc1a0c85615dda4bfc7e6f4a4674e60d9eda4d44f6faea7"
+      },
+      {
+        "bytes": 5645,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright-core/lib/vite/dashboard/playwright-logo.svg",
+        "sha256": "511524a1c145819303a18fb71870a4307c3e740f9e9722f7686a2b42b0995b6c"
+      },
+      {
+        "bytes": 464,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright-core/lib/vite/htmlReport/index.html",
+        "sha256": "ce7c098020a0eb9ce10edd416245ea6da50dfeaab18dfd0a2176979d22643be6"
+      },
+      {
+        "bytes": 100452,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright-core/lib/vite/htmlReport/report.css",
+        "sha256": "d98a244bf950333ade383b109e97d396f970f650b20f2e5ef5ecc2740205dff7"
+      },
+      {
+        "bytes": 415889,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright-core/lib/vite/htmlReport/report.js",
+        "sha256": "0ecf5329ce34f0b809753392b8715521c30eeb46e24f7749d2537c06aa5bcea4"
+      },
+      {
+        "bytes": 6251,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright-core/lib/vite/recorder/assets/codeMirrorModule--QdMvsKi.css",
+        "sha256": "20be824a82832b62cc04642d31da3c609fd280b23f1cdcb1e622c4f40aac5ab8"
+      },
+      {
+        "bytes": 307374,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright-core/lib/vite/recorder/assets/codeMirrorModule-DK72OMRi.js",
+        "sha256": "44cc2e8413f941b4ce136fae229ce375a0bfe15e9f1172dc0deb0230791149f4"
+      },
+      {
+        "bytes": 80340,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright-core/lib/vite/recorder/assets/codicon-DCmgc-ay.ttf",
+        "sha256": "0f1d5219934e96e83b8db162d60b4d8c09b5de1e7d38031cbafe4a3c0f2889c9"
+      },
+      {
+        "bytes": 85502,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright-core/lib/vite/recorder/assets/index-BZpYJZ-P.css",
+        "sha256": "cc24563b96f286614b88f74da413e9984de263227971c4cdfabe1f73be095514"
+      },
+      {
+        "bytes": 358646,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright-core/lib/vite/recorder/assets/index-Cn0mmDuv.js",
+        "sha256": "b57add9e1086d2b7058a66f77a1c19ba8bfbcf1f76831565e7662892c68d601a"
+      },
+      {
+        "bytes": 1078,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright-core/lib/vite/recorder/index.html",
+        "sha256": "8338faa7d5856d725400a1c1aa37541bf45ad0e9ca0391b05d622118a47d5bc0"
+      },
+      {
+        "bytes": 5033,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright-core/lib/vite/recorder/playwright-logo.svg",
+        "sha256": "6b0a4367bdeab10995bc239278f04c68c10e48adbec15e799e01909a0d66dcb9"
+      },
+      {
+        "bytes": 307393,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright-core/lib/vite/traceViewer/assets/codeMirrorModule-CvGugYRj.js",
+        "sha256": "fc01eeb62bc7c084093b88ba649d0d86a026a4faade8a31028e0a596b4f3aa3f"
+      },
+      {
+        "bytes": 663842,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright-core/lib/vite/traceViewer/assets/defaultSettingsView-Q1daMRpG.js",
+        "sha256": "8cb103e8bd8a9c37c203ad480f17b6840913917be56d3520c895ac5d1d3ca63a"
+      },
+      {
+        "bytes": 2510,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright-core/lib/vite/traceViewer/assets/urlMatch-L3liM589.js",
+        "sha256": "1bc6321e32d11c31a452bc75896f0b344e6153321854d9f1658818be7f845c16"
+      },
+      {
+        "bytes": 288730,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright-core/lib/vite/traceViewer/assets/xtermModule-BRMEnLTX.js",
+        "sha256": "c598422590277f9448899c2ffa9964b845eac6f077e54f1b153d3f3798eafc94"
+      },
+      {
+        "bytes": 6251,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright-core/lib/vite/traceViewer/codeMirrorModule.-QdMvsKi.css",
+        "sha256": "20be824a82832b62cc04642d31da3c609fd280b23f1cdcb1e622c4f40aac5ab8"
+      },
+      {
+        "bytes": 80340,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright-core/lib/vite/traceViewer/codicon.DCmgc-ay.ttf",
+        "sha256": "0f1d5219934e96e83b8db162d60b4d8c09b5de1e7d38031cbafe4a3c0f2889c9"
+      },
+      {
+        "bytes": 107270,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright-core/lib/vite/traceViewer/defaultSettingsView.C8BeHuxd.css",
+        "sha256": "278101b68ab48ee6323a6afbf4e0e629324e10e96902a62a0875643a1bba3d94"
+      },
+      {
+        "bytes": 2055,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright-core/lib/vite/traceViewer/index.B_TqY17P.css",
+        "sha256": "08a212fcacae1866f44f065654afcc4c7d03409c68c74b3315c5bda17a0ca003"
+      },
+      {
+        "bytes": 6633,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright-core/lib/vite/traceViewer/index.D66TeX8E.js",
+        "sha256": "2ed26a06cdb9833eac4be9c1f5a80cac94da165e3736b5bdc23071467a901ec7"
+      },
+      {
+        "bytes": 2363,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright-core/lib/vite/traceViewer/index.html",
+        "sha256": "00337e6c931d008ac449393025bd8ba701082d1a474be3f6eca58895d269afae"
+      },
+      {
+        "bytes": 429,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright-core/lib/vite/traceViewer/manifest.webmanifest",
+        "sha256": "d8540500603a32a39fe7e5a0375dc0f9ebafd11118e06a846db7efc608223ab9"
+      },
+      {
+        "bytes": 5033,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright-core/lib/vite/traceViewer/playwright-logo.svg",
+        "sha256": "6b0a4367bdeab10995bc239278f04c68c10e48adbec15e799e01909a0d66dcb9"
+      },
+      {
+        "bytes": 650,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright-core/lib/vite/traceViewer/snapshot.B_Jk1wbt.js",
+        "sha256": "d4d09e05451d107d8e1a6bbd041405fe518b9fd2833890e4ebaaad83b7f554f5"
+      },
+      {
+        "bytes": 389,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright-core/lib/vite/traceViewer/snapshot.html",
+        "sha256": "c608c8899c95c5a74d3f556e20146c3d852b9df85ae2854c659a7cc773c9b727"
+      },
+      {
+        "bytes": 96737,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright-core/lib/vite/traceViewer/sw.bundle.js",
+        "sha256": "d1d6fec6687eb3fd93a8990bd9daa3951422695afffae2382f97f10811cf1c30"
+      },
+      {
+        "bytes": 38121,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright-core/lib/vite/traceViewer/uiMode.B1pSYCuG.js",
+        "sha256": "82f9b4ae9237b219aa93057c8e3d5070e293754a26fc8ef93b6fb6d21bff6e23"
+      },
+      {
+        "bytes": 54590,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright-core/lib/vite/traceViewer/uiMode.CyMfwkXJ.css",
+        "sha256": "fb403cf0b07007bc1d771e29737f7408924da300e2fab8b289a3ef2e8fc08d7b"
+      },
+      {
+        "bytes": 727,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright-core/lib/vite/traceViewer/uiMode.html",
+        "sha256": "95012f6dba94db74bd55c125f0f9a86f24657cc89c52c661537d6a060c8e13fe"
+      },
+      {
+        "bytes": 2853,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright-core/lib/vite/traceViewer/xtermModule.kHJ-D0s7.css",
+        "sha256": "0dd60056134e6a2994a86b59a1e9789b9f04e92924da109aef8c923acaf08ce5"
+      },
+      {
+        "bytes": 8841,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright-core/lib/webp_codec.LICENSE",
+        "sha256": "995c7ee35aceb7666829b7a501ca89c0864e12b493c1174b155774ab1e03d831"
+      },
+      {
+        "bytes": 565369,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright-core/lib/webp_codec.wasm",
+        "sha256": "164cd9583a3e4d081f767d3b41ff0a730443dc7535fcc5caff83561463384b79"
+      },
+      {
+        "bytes": 32416,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright-core/lib/xdg-open",
+        "sha256": "7d759d54f0d4ce1beeb34ee62c587985b5042374e8de237b0dcb8cd47aa698cf"
+      },
+      {
+        "bytes": 896,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright-core/package.json",
+        "sha256": "2bd07b7443af06d1b836219e64f7fb40b722ee7764c9e1b1cc11147a601083fb"
+      },
+      {
+        "bytes": 811257,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright-core/types/protocol.d.ts",
+        "sha256": "766832e159885b5ee9f97503ea5eb7811cedb323f436e5f0e20fa0f1086f978c"
+      },
+      {
+        "bytes": 2691,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright-core/types/structs.d.ts",
+        "sha256": "3fdc4ec82503160f5277d9f6537308620b4fa710135a999e82c4531bf147ca11"
+      },
+      {
+        "bytes": 1144271,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright-core/types/types.d.ts",
+        "sha256": "386ae7c15bc41064d6495cb64a10aea6cd139df28c78b28dde281b2643df67a1"
+      },
+      {
+        "bytes": 11601,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright/LICENSE",
+        "sha256": "45873d00a0dd243596deb4aa23b2493b3d1f0671921bf2538ea431d7380220eb"
+      },
+      {
+        "bytes": 254,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright/NOTICE",
+        "sha256": "6d602191187b35b9b01d2cffa01c8469c2c8d9de8a96f1bf868e0f264f51c81d"
+      },
+      {
+        "bytes": 11282,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright/README.md",
+        "sha256": "36be602c00c09ffd3d52a2d8934fb5c4c3671eab597593fdbd15e53a49888a9f"
+      },
+      {
+        "bytes": 705,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright/ThirdPartyNotices.txt",
+        "sha256": "b17ac0bd6f4b8207e440639cc8e0ba1bf1d9eaf9b12236764ab93b346c7abd8e"
+      },
+      {
+        "bytes": 698,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright/cli.js",
+        "sha256": "5e79302a6aad7d835d92d5ae6b4244c91cf61b28e94d7917279090e6c231f7a1"
+      },
+      {
+        "bytes": 636,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright/index.d.ts",
+        "sha256": "b07f64ff6ec710998a62b07377fbda0ab4c313ba1f0055bfe9faa22cffedd47c"
+      },
+      {
+        "bytes": 648,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright/index.js",
+        "sha256": "4e98f65f0a9d9bcab8cffc0c5cfdd87fd3f5b0be74fc494ff166a466b204cd44"
+      },
+      {
+        "bytes": 704,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright/index.mjs",
+        "sha256": "a0f5715ea22354f922791a9c53dc012d5d5c067ff9cc4cd35ffb7cd272071a9f"
+      },
+      {
+        "bytes": 3475,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright/lib/agents/agentParser.js",
+        "sha256": "a2f630c1c2c9eafa0a3ca9cdbeaa26e74801615bc572e3fce226acb662ceb0eb"
+      },
+      {
+        "bytes": 646,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright/lib/agents/copilot-setup-steps.yml",
+        "sha256": "7483c252e2225d90cf7b66b461772a9e16e189cd45f689f48519872571e1a345"
+      },
+      {
+        "bytes": 16958,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright/lib/agents/generateAgents.js",
+        "sha256": "3bae7bde1d05c0fbaaa1a82ce7a39732ff52904de575fe88e69c391a6c41478e"
+      },
+      {
+        "bytes": 1294,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright/lib/agents/playwright-test-coverage.prompt.md",
+        "sha256": "8e8a32e98c7069c8af29a088a91999c81dafbeb09a144b143ebe888b48b94355"
+      },
+      {
+        "bytes": 175,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright/lib/agents/playwright-test-generate.prompt.md",
+        "sha256": "6031c3eacf1e55d527a0397066b64d134d9f925fd7286bcc78646e714611da10"
+      },
+      {
+        "bytes": 3338,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright/lib/agents/playwright-test-generator.agent.md",
+        "sha256": "3ba34ef877c6d8c1d0fb70975d96062b33c0ba138a8bbe9eb837585d31ffb045"
+      },
+      {
+        "bytes": 105,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright/lib/agents/playwright-test-heal.prompt.md",
+        "sha256": "19f2bea9648ddac89b90b40a3f87b50c276d416677f8bb2fbcdac894cdb6946b"
+      },
+      {
+        "bytes": 2891,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright/lib/agents/playwright-test-healer.agent.md",
+        "sha256": "b3e1d85219df5ead7e3ef0dc69959b0263cc16e885f71d5b64bafdf97e6f9215"
+      },
+      {
+        "bytes": 196,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright/lib/agents/playwright-test-plan.prompt.md",
+        "sha256": "6ce2c51b356b4e89ac1e3c2b8b3ff0a390c7b518c1d4d24f019f9eb179cd6669"
+      },
+      {
+        "bytes": 2808,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright/lib/agents/playwright-test-planner.agent.md",
+        "sha256": "bf4baa68205aa04c4512a80bcc6a5362d3aaa76ae9165f05a9d5a29e1d34c0fd"
+      },
+      {
+        "bytes": 3603,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright/lib/cli/reportActions.js",
+        "sha256": "4eeceedf9588d69a153f018aa548e00b73e5f61cb39bb05f0fc87c06131af2b3"
+      },
+      {
+        "bytes": 9665,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright/lib/cli/testActions.js",
+        "sha256": "1c1d2a5a3eb229097e83ac8ca2d7ae9c25694ced1472e2388cb78b8ab23a0d99"
+      },
+      {
+        "bytes": 116578,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright/lib/common/index.js",
+        "sha256": "c1a4147d76012f7a980ab3c7906139296abfd42c7053af5a7330ff302cffa266"
+      },
+      {
+        "bytes": 1386,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright/lib/common/index.js.txt",
+        "sha256": "391ff4a37ce8cb28fc21bb33edf9ca1200a286335752148d251ba7db4132dc98"
+      },
+      {
+        "bytes": 4552,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright/lib/errorContext.js",
+        "sha256": "ffc1843cebb3e90e1674c07ee2607a4a63152eff609e5f9865bbb2f9eb02e9a1"
+      },
+      {
+        "bytes": 1935,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright/lib/globals.js",
+        "sha256": "f5922eb1fb6051900157492eb9c218e62d07378eed135bca4b2f173ed1184d1c"
+      },
+      {
+        "bytes": 36934,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright/lib/index.js",
+        "sha256": "653c33bea6f8a3eae8e1af19d26777544e0bb3ff07aa5534cba5199c20d25a3e"
+      },
+      {
+        "bytes": 8191,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright/lib/isomorphic.js",
+        "sha256": "3d61508f951aa9518adb4bf6594d61dfd1099c95a1a4f0af809a58ccebc59025"
+      },
+      {
+        "bytes": 267,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright/lib/isomorphic.js.txt",
+        "sha256": "36c16ae5721dfe8ac2555e84d26b5895b7ca113e7304bd3735a16d56b5a71b3c"
+      },
+      {
+        "bytes": 1262,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright/lib/loader/loaderProcessEntry.js",
+        "sha256": "45681332f4178770c204b33e5b8dcbba940baf3bc6fc86506bab24027cb513f3"
+      },
+      {
+        "bytes": 234,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright/lib/loader/loaderProcessEntry.js.txt",
+        "sha256": "0fc4ad550d17a23e9f1cbc78f646e57461f4feb22253dd5220034ef44091005c"
+      },
+      {
+        "bytes": 547100,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright/lib/matchers/expect.js",
+        "sha256": "6f6d406a411e9a3e0cdecff94dd3ffe4e42309c52fe422849bfc6ebc933fea57"
+      },
+      {
+        "bytes": 36528,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright/lib/matchers/expect.js.LICENSE",
+        "sha256": "78b2f60563d28cb3f9ea17e4cdc0657681e641e2f72766771d9e2da9ca94c065"
+      },
+      {
+        "bytes": 3357,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright/lib/matchers/expect.js.txt",
+        "sha256": "79e1ab4ec0aa5ed6b13a37139ad80a7ca96c78624ab57baf4f6dd2d41429a44c"
+      },
+      {
+        "bytes": 5241,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright/lib/mcp/test/browserBackend.js",
+        "sha256": "703f307d1c3e746291b625f886af3d3d28fc0a868b8b2a66173a75bd895ccddc"
+      },
+      {
+        "bytes": 5427,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright/lib/mcp/test/generatorTools.js",
+        "sha256": "3c53feaeb9fc2ff728f334cb31f9b7211e65b20c692c7585459c3c97bdd13a12"
+      },
+      {
+        "bytes": 6379,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright/lib/mcp/test/plannerTools.js",
+        "sha256": "715abc888d9ea30b532b75c6f09aa34101ab15c1eeb959c50cf9dedcf3a459ac"
+      },
+      {
+        "bytes": 3239,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright/lib/mcp/test/seed.js",
+        "sha256": "f36f7fb76d4ed33225e80be208cccc9757d363a9d1527cf560736c0f1e5edd31"
+      },
+      {
+        "bytes": 1577,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright/lib/mcp/test/streams.js",
+        "sha256": "8affc240a6a90ee2dbdedcde9927018efe426ec0d390bcd1ee4f0464e75adc0f"
+      },
+      {
+        "bytes": 4067,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright/lib/mcp/test/testBackend.js",
+        "sha256": "dcd8d09366617f13213ce544efb5fe47df5a87258ae93545d4d0738623f43ad1"
+      },
+      {
+        "bytes": 11637,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright/lib/mcp/test/testContext.js",
+        "sha256": "74ff4273ea12e6353d4860c9452387b643d7d8899fbd4951389ba94d18df5e37"
+      },
+      {
+        "bytes": 1104,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright/lib/mcp/test/testTool.js",
+        "sha256": "2a8f17d0a61ccb8a4ca9c52a3255d624deca989c0b06281d579629c664f8cc8e"
+      },
+      {
+        "bytes": 3714,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright/lib/mcp/test/testTools.js",
+        "sha256": "14710b5f34246005d974762b83a2a50e5cc17130af841cd3bc447811d69c6af7"
+      },
+      {
+        "bytes": 2013,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright/lib/package.js",
+        "sha256": "544a18417ea51dd4c8a9f3dbc4e2b47e46c80f452e0cd23d55e9b3680bc6241e"
+      },
+      {
+        "bytes": 14674,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright/lib/program.js",
+        "sha256": "2b30a16dad83631a0783f7863ac1ce0ff78bcd27869f8a1059ac2595d21580b0"
+      },
+      {
+        "bytes": 324977,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright/lib/runner/index.js",
+        "sha256": "180f2838167cfc106a09930652e5ebaa4354e0f27c59b32e1e3269fb8972ebd4"
+      },
+      {
+        "bytes": 3032,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright/lib/runner/index.js.txt",
+        "sha256": "a3d05c5e55fddf0f998ddc1fc0b2bae322e04e691d354e78e68bbe3703e8f139"
+      },
+      {
+        "bytes": 2825513,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright/lib/transform/babelBundle.js",
+        "sha256": "cd656ca6a9857b3efbbb7e015a2fa3abd4bc0e88956661cc9b14d9d7f142f093"
+      },
+      {
+        "bytes": 123004,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright/lib/transform/babelBundle.js.LICENSE",
+        "sha256": "2018f402988d0cff56531005b77bce7c2816a34d0c157ecb510043abd41b1ad3"
+      },
+      {
+        "bytes": 21852,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright/lib/transform/babelBundle.js.txt",
+        "sha256": "378bb160b7c981551aba70a5f50c404fcd3cd11d27eaa344d0b00872513ab81d"
+      },
+      {
+        "bytes": 289806,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright/lib/transform/esmLoader.js",
+        "sha256": "57039f70e2f357e7c7bce4a40aebf543b0ecad77958e0a0a923f2f180f82cd61"
+      },
+      {
+        "bytes": 17406,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright/lib/transform/esmLoader.js.LICENSE",
+        "sha256": "3cec0c446526a449e4613b0defee0adb585f88f1d7fdba919421226d69be078e"
+      },
+      {
+        "bytes": 2725,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright/lib/transform/esmLoader.js.txt",
+        "sha256": "6cf67693d4aa70088d6368f5b0c7ba8df51374e941f147df88f8a5da9d051b36"
+      },
+      {
+        "bytes": 14295,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright/lib/util.js",
+        "sha256": "874c55495773da8c5a2ec46551c2265937bf08446231c09a8b5966e8bea2b1f7"
+      },
+      {
+        "bytes": 76015,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright/lib/worker/workerProcessEntry.js",
+        "sha256": "c47455901d1b3ec799e122a02467f00f0eb966fb7bb0e89261e196bd5e7e31e3"
+      },
+      {
+        "bytes": 661,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright/lib/worker/workerProcessEntry.js.txt",
+        "sha256": "7b4f3a6e64023f52319739dd1026636d0e769edecf1eccd4b7f03bf8a4b54865"
+      },
+      {
+        "bytes": 1259,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright/package.json",
+        "sha256": "4289ada283f77263a17f5b5690a72be41f1ed39224f9a97745fd794938af2942"
+      },
+      {
+        "bytes": 673,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright/test.d.ts",
+        "sha256": "3f00324f263189b385c3a9383b1f4dae6237697bcf0801f96aa35c340512d79c"
+      },
+      {
+        "bytes": 806,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright/test.js",
+        "sha256": "b97fa53a6ab864f51c9c48b5e4647d0acae45ba2948c5d78e38bfeb56755d974"
+      },
+      {
+        "bytes": 1400,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright/test.mjs",
+        "sha256": "1deb265617d0e87b6d05bf8b3d5bf73cd4b788665c249c609a01b94ceff2eea1"
+      },
+      {
+        "bytes": 406959,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright/types/test.d.ts",
+        "sha256": "2b71f5b45decd99d8d18f2f41f533072bb6701f50ba3a80af11472b6bc935a3f"
+      },
+      {
+        "bytes": 33453,
+        "path": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright/types/testReporter.d.ts",
+        "sha256": "0304f69294f8221b82ec6b4c75511dd6d824f04b1a0999409c79931cd33219e3"
+      },
+      {
+        "bytes": 248,
+        "path": "/Users/christophehenner/Library/Caches/ms-playwright/chromium_headless_shell-1228/chrome-headless-shell-mac-arm64/ABOUT",
+        "sha256": "34d078ce3003087a8374e7c6156fda374769b8047d6ddaf419d66414aa48edfb"
+      },
+      {
+        "bytes": 1766857,
+        "path": "/Users/christophehenner/Library/Caches/ms-playwright/chromium_headless_shell-1228/chrome-headless-shell-mac-arm64/LICENSE.headless_shell",
+        "sha256": "ea614f3494514366b3ee83db6e3e6ded39e0060c9ff3fb283ffb9a2f60ce59c5"
+      },
+      {
+        "bytes": 122,
+        "path": "/Users/christophehenner/Library/Caches/ms-playwright/chromium_headless_shell-1228/chrome-headless-shell-mac-arm64/PrivacySandboxAttestationsPreloaded/manifest.json",
+        "sha256": "51c311a4ba03140bcd1c827f8d93dba50cadda736925903b26e95609275dbffd"
+      },
+      {
+        "bytes": 7624,
+        "path": "/Users/christophehenner/Library/Caches/ms-playwright/chromium_headless_shell-1228/chrome-headless-shell-mac-arm64/PrivacySandboxAttestationsPreloaded/privacy-sandbox-attestations.dat",
+        "sha256": "59e345dc13aedee9ea46b92e58300ecaca944aaea9384c7af885400ac2ae8806"
+      },
+      {
+        "bytes": 159293248,
+        "path": "/Users/christophehenner/Library/Caches/ms-playwright/chromium_headless_shell-1228/chrome-headless-shell-mac-arm64/chrome-headless-shell",
+        "sha256": "11e393326c7d20a7c56641a7c65def33ea9c280da3b0b74cf8563b07989a0ee3"
+      },
+      {
+        "bytes": 3033,
+        "path": "/Users/christophehenner/Library/Caches/ms-playwright/chromium_headless_shell-1228/chrome-headless-shell-mac-arm64/headless_command_resources.pak",
+        "sha256": "e5ad233191a0a9ea161601e8f28408bd6b0b8552b3237d3060ffd7da3831fd5a"
+      },
+      {
+        "bytes": 755119,
+        "path": "/Users/christophehenner/Library/Caches/ms-playwright/chromium_headless_shell-1228/chrome-headless-shell-mac-arm64/headless_lib_data.pak",
+        "sha256": "eaefc972b70658e2bca2223e06ac76d7d0ae6ca5c92679703bbf3e5a2b80d65c"
+      },
+      {
+        "bytes": 4585707,
+        "path": "/Users/christophehenner/Library/Caches/ms-playwright/chromium_headless_shell-1228/chrome-headless-shell-mac-arm64/headless_lib_strings.pak",
+        "sha256": "ca3b423880ae7799ada4b6fb53ead7ed5ac58f9465cce494c689276ea83dafbc"
+      },
+      {
+        "bytes": 10876560,
+        "path": "/Users/christophehenner/Library/Caches/ms-playwright/chromium_headless_shell-1228/chrome-headless-shell-mac-arm64/icudtl.dat",
+        "sha256": "bd8c145abdf3f8383276ce01dfa4ae48709bef9fef1c0711eb7c3fab4f6eb7c2"
+      },
+      {
+        "bytes": 91952,
+        "path": "/Users/christophehenner/Library/Caches/ms-playwright/chromium_headless_shell-1228/chrome-headless-shell-mac-arm64/libEGL.dylib",
+        "sha256": "65deb3410894d2a8dbc2a8aa2070d9e25a39090c674f10e4a56cd935e2f5998e"
+      },
+      {
+        "bytes": 6856320,
+        "path": "/Users/christophehenner/Library/Caches/ms-playwright/chromium_headless_shell-1228/chrome-headless-shell-mac-arm64/libGLESv2.dylib",
+        "sha256": "9c91f896b46d5e0352cd99b007798508f08322d3bb570b6787a4b1b50a8ece5b"
+      },
+      {
+        "bytes": 16491696,
+        "path": "/Users/christophehenner/Library/Caches/ms-playwright/chromium_headless_shell-1228/chrome-headless-shell-mac-arm64/libvk_swiftshader.dylib",
+        "sha256": "fe7eff2206a4fbf51b9cc55155370579330371e9619e2013fba7e3ca281463dc"
+      },
+      {
+        "bytes": 439,
+        "path": "/Users/christophehenner/Library/Caches/ms-playwright/chromium_headless_shell-1228/chrome-headless-shell-mac-arm64/resources/accessibility/reading_mode_gdocs_helper/content.js",
+        "sha256": "6c0aeaaf9a71ad68aa45764c111e70bb23aa0fbf406644a375b6b709cbbe4b6e"
+      },
+      {
+        "bytes": 1425,
+        "path": "/Users/christophehenner/Library/Caches/ms-playwright/chromium_headless_shell-1228/chrome-headless-shell-mac-arm64/resources/accessibility/reading_mode_gdocs_helper/gdocs_script.js",
+        "sha256": "d291adabcfcb1a4a4a2ffacdd9d04fdb473ab0d6903556bef7446be9c3646d86"
+      },
+      {
+        "bytes": 2375,
+        "path": "/Users/christophehenner/Library/Caches/ms-playwright/chromium_headless_shell-1228/chrome-headless-shell-mac-arm64/resources/accessibility/reading_mode_gdocs_helper_manifest.json",
+        "sha256": "1802c49a283f5239e9efff8d638a9cbc09566583d4f88263818c3ce7403895f9"
+      },
+      {
+        "bytes": 740912,
+        "path": "/Users/christophehenner/Library/Caches/ms-playwright/chromium_headless_shell-1228/chrome-headless-shell-mac-arm64/v8_context_snapshot.arm64.bin",
+        "sha256": "8d0a6f9130ac740d4a20fd50c0fd8712f642095100b35f0b9f62022743097849"
+      },
+      {
+        "bytes": 110,
+        "path": "/Users/christophehenner/Library/Caches/ms-playwright/chromium_headless_shell-1228/chrome-headless-shell-mac-arm64/vk_swiftshader_icd.json",
+        "sha256": "d717d915e31e7c27948b80b36ab34e2d897888114c5c7d0af835f93eb53e58f5"
+      },
+      {
+        "bytes": 10585,
+        "path": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/650-e1-composition-feasibility-and-struc/packages/aethyme-eval/e1/browser-oracle.mjs",
+        "sha256": "7748f1da9351ce0b4485455488de07c74713323c47bcbdaac151b801794834a8"
+      },
+      {
+        "bytes": 50288,
+        "path": "/opt/homebrew/Cellar/node/26.8.2/bin/node",
+        "sha256": "3e401401d90e7f0367b7737a613801242c9a6b2966fb50c2e48eb1c45d701c6a"
+      }
+    ],
+    "node": "/opt/homebrew/Cellar/node/26.8.2/bin/node",
+    "playwright": "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright/index.mjs",
+    "roots": [
+      "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright",
+      "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright-core",
+      "/Users/christophehenner/Library/Caches/ms-playwright/chromium_headless_shell-1228/chrome-headless-shell-mac-arm64"
+    ],
+    "schema": "aethyme.e1.appointed-browser-runtime/v1",
+    "versions": {
+      "chromium": "149.0.7827.55",
+      "node": "v26.8.2",
+      "playwright": "1.64.0-alpha-1790635538000"
+    }
+  },
+  "schema": "aethyme.e1.actual-synthesis/v1",
+  "state": "completed"
+}
