@@ -11,12 +11,14 @@ use crate::local_target::{
 use serde_json::{Value, json};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 const IMAGE_BYTES: u64 = 512 * 1024 * 1024;
+const HOST_HEADROOM: u64 = 2 * 1024 * 1024 * 1024;
 const PROFILE: &str = "owned-apfs-source-pressure/provisional-v0";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -126,6 +128,51 @@ fn check_volume(
     Ok(current.into())
 }
 
+fn host_capacity_admitted(available: u64, remaining: u64) -> bool {
+    available >= HOST_HEADROOM.saturating_add(remaining)
+}
+
+fn backing_available(root: &Path) -> std::io::Result<u64> {
+    let directory = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(root)?;
+    // SAFETY: integer-only statvfs is zero-initializable; the live descriptor
+    // and writable output remain valid throughout this synchronous call.
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstatvfs(directory.as_raw_fd(), &mut stat) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(stat.f_bavail.saturating_mul(stat.f_frsize))
+}
+
+fn independent_absence(
+    value: &Value,
+    binding: Option<&OwnedMount>,
+    mounted: bool,
+) -> Result<(), String> {
+    if mounted {
+        return Err("private mount remains on a different filesystem".into());
+    }
+    let devices = value
+        .get("AllDisks")
+        .and_then(Value::as_array)
+        .ok_or("unknown native device inventory cannot prove absence")?;
+    for entry in devices {
+        let identifier = entry.as_str().ok_or("unknown native device identity")?;
+        if !device(&format!("/dev/{identifier}"), false) {
+            return Err("invalid native device inventory identity".into());
+        }
+        if binding.is_some_and(|b| {
+            identifier == b.device.trim_start_matches("/dev/")
+                || identifier == b.volume.trim_start_matches("/dev/")
+        }) {
+            return Err("owned native device remains present".into());
+        }
+    }
+    Ok(())
+}
+
 struct OwnedImage {
     root: PathBuf,
     image: PathBuf,
@@ -138,6 +185,7 @@ struct OwnedImage {
     volume_device: Option<u64>,
     cleanup_confirmed: bool,
     mutation_unknown: bool,
+    attachment_attempted: bool,
 }
 impl OwnedImage {
     fn new() -> Self {
@@ -158,6 +206,7 @@ impl OwnedImage {
             volume_device: None,
             cleanup_confirmed: false,
             mutation_unknown: false,
+            attachment_attempted: false,
         };
         this.note("contract", json!({"profile":PROFILE,"capacity_bytes":IMAGE_BYTES,"image":this.image,"mount":this.mount,"cleanup_confirmed":false}));
         this
@@ -256,7 +305,39 @@ impl OwnedImage {
         let inventory = self.plist("/usr/bin/hdiutil", &["info", "-plist"])?;
         inventory_owner(&inventory, &self.image, &self.mount)
     }
+    fn assert_backing_capacity(&self, remaining: u64) {
+        let available = backing_available(&self.root).expect("observe host backing space");
+        assert!(
+            host_capacity_admitted(available, remaining),
+            "host backing headroom admission failed; pressure is unqualified"
+        );
+    }
+    fn confirm_absence(&mut self) -> Result<(), String> {
+        if self.attachment_attempted && self.binding.is_none() {
+            return Err(
+                "attachment lacks confirmed ownership; operator reconciliation required".into(),
+            );
+        }
+        let host_device = std::fs::metadata(&self.root)
+            .map_err(|e| e.to_string())?
+            .dev();
+        let mounted = match std::fs::symlink_metadata(&self.mount) {
+            Ok(m) => {
+                if !m.is_dir() || m.file_type().is_symlink() {
+                    return Err("private mount path changed".into());
+                }
+                m.dev() != host_device
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+            Err(e) => return Err(e.to_string()),
+        };
+        let devices = self.plist("/usr/sbin/diskutil", &["list", "-plist"])?;
+        independent_absence(&devices, self.binding.as_ref(), mounted)
+    }
     fn attach(&mut self) {
+        self.assert_backing_capacity(IMAGE_BYTES);
+        self.note("host-admission", json!({"available_bytes":backing_available(&self.root).unwrap(),"minimum_headroom_bytes":HOST_HEADROOM,"maximum_backing_bytes":IMAGE_BYTES}));
+
         let image = self.image.to_str().unwrap().to_owned();
         let mount = self.mount.to_str().unwrap().to_owned();
         let out = self
@@ -272,7 +353,7 @@ impl OwnedImage {
                     "536870912",
                     "--volumeName",
                     "AethymeSourcePressure",
-                    "--fs",
+                    "-fs",
                     "APFS",
                     &image,
                 ],
@@ -288,6 +369,8 @@ impl OwnedImage {
         let meta = std::fs::symlink_metadata(&self.image).unwrap();
         assert!(meta.is_file() && !meta.file_type().is_symlink());
         self.image_inode = Some((meta.dev(), meta.ino()));
+        self.assert_backing_capacity(IMAGE_BYTES);
+        self.attachment_attempted = true;
         let out = self
             .native(
                 "/usr/sbin/diskutil",
@@ -390,6 +473,7 @@ impl OwnedImage {
         if self.observe()?.is_some() {
             return Err("owned image remains attached".into());
         }
+        self.confirm_absence()?;
         self.cleanup_confirmed = true;
         self.note(
             "cleanup",
@@ -471,10 +555,34 @@ fn owned_image_inventory_requires_unique_path_mount_and_native_device() {
 }
 #[test]
 fn native_volume_uuid_and_enospc_classification_are_exact() {
+    assert!(host_capacity_admitted(
+        HOST_HEADROOM + IMAGE_BYTES,
+        IMAGE_BYTES
+    ));
+    assert!(
+        !host_capacity_admitted(HOST_HEADROOM + IMAGE_BYTES - 1, IMAGE_BYTES),
+        "insufficient backing capacity must refuse"
+    );
+    assert!(
+        !host_capacity_admitted(HOST_HEADROOM - 1, 0),
+        "host headroom must remain preserved"
+    );
+    let absent = json!({"AllDisks":["disk0", "disk0s1"]});
+    assert!(independent_absence(&absent, None, false).is_ok());
+    assert!(
+        independent_absence(&absent, None, true).is_err(),
+        "inventory absence cannot settle a live mount"
+    );
+    assert!(independent_absence(&json!({}), None, false).is_err());
+
     let binding = OwnedMount {
         device: "/dev/disk17".into(),
         volume: "/dev/disk18s1".into(),
     };
+    assert!(
+        independent_absence(&json!({"AllDisks":["disk17"]}), Some(&binding), false).is_err(),
+        "owned device presence cannot settle cleanup"
+    );
     let mount = Path::new("/private/owned-volume");
     let info = json!({"DeviceNode":binding.volume,"MountPoint":mount,"FilesystemType":"apfs","VolumeUUID":"owned-volume-uuid"});
     assert!(check_volume(&info, &binding, mount, Some("owned-volume-uuid")).is_ok());
@@ -583,8 +691,12 @@ fn run_pressure(disk: &mut OwnedImage) {
     );
     disk.assert_mounted();
     let project = f.store.project().clone();
-    f.store = CollaborationStore::open(&CollaborationRoot::under_host_state(&disk.mount), &project)
-        .unwrap();
+    f.store = CollaborationStore::open(
+        &CollaborationRoot::under_host_state(&disk.mount),
+        &project,
+        &[],
+    )
+    .unwrap();
     let base = f.a.base.commit.clone();
     git(&repo, &["switch", "--detach", f.a.result.commit.as_str()]);
     // An independent byte oracle and a payload too large for residual metadata
@@ -595,11 +707,15 @@ fn run_pressure(disk: &mut OwnedImage) {
     git(&repo, &["commit", "-qm", "source pressure payload"]);
     let result = archive::CommitOid::parse(&git(&repo, &["rev-parse", "HEAD"])).unwrap();
     let first = capture_actual(&mut f, &repo, &base, &result, "apfs-retained-a");
-    f.a = archive::retained_contribution(&f.store, &first.contribution).unwrap();
+    f.a = archive::retained_contribution(&f.store, &first.contribution)
+        .unwrap()
+        .expect("acknowledged source retained");
     let b_base = f.b.base.commit.clone();
     let b_result = f.b.result.commit.clone();
     let second = capture_actual(&mut f, &repo, &b_base, &b_result, "apfs-retained-b");
-    f.b = archive::retained_contribution(&f.store, &second.contribution).unwrap();
+    f.b = archive::retained_contribution(&f.store, &second.contribution)
+        .unwrap()
+        .expect("acknowledged source retained");
     let before = disk.root.join("source-before");
     archive::reconstruct(&f.store, &first.result, &before).unwrap();
     assert_eq!(
@@ -657,6 +773,7 @@ fn run_pressure(disk: &mut OwnedImage) {
             written <= IMAGE_BYTES,
             "pressure exceeded logical image capacity without ENOSPC"
         );
+        disk.assert_backing_capacity(IMAGE_BYTES.saturating_sub(written));
         match pressure.write_all(&block) {
             Ok(()) => written += block.len() as u64,
             Err(e) => break e,
@@ -670,6 +787,7 @@ fn run_pressure(disk: &mut OwnedImage) {
         assert!(enospc(&e), "unexpected pressure sync error: {e}");
     }
     disk.note("kernel-enospc",json!({"raw_os_error":error.raw_os_error(),"completed_block_bytes":written,"pressure_file_bytes":pressure.metadata().unwrap().len()}));
+    disk.assert_backing_capacity(0);
     disk.assert_mounted();
     let capture_error = capture::capture(&mut f.store, &request)
         .expect_err("full filesystem cannot acknowledge new capture");
@@ -757,10 +875,7 @@ fn run_pressure(disk: &mut OwnedImage) {
     let options = crate::collaboration_gc::GcOptions::default();
     let plan = crate::collaboration_gc::plan(&mut f.store, &options).unwrap();
     let object_path = archive::object_path(&f.store, &orphan);
-    let project_directory = archive::objects_dir(&f.store)
-        .parent()
-        .unwrap()
-        .to_path_buf();
+    let project_directory = f.store.project_dir();
     assert!(
         plan.reclaimable
             .iter()
