@@ -587,3 +587,7 @@ fn actual_pressure_preserves_retained_source_and_bounded_native_cleanup() {
 #[cfg(unix)]
 #[path = "local_qualification/native_flow.rs"]
 mod native_flow;
+
+#[cfg(target_os = "macos")]
+#[path = "local_qualification/native_filesystem.rs"]
+mod native_filesystem;
