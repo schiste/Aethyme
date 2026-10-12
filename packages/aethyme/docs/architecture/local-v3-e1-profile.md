@@ -91,4 +91,23 @@ The shared build directory initially supplied a stale engine artifact; the final
 campaign used a copied, hashed executable. These results qualify this synthetic
 repair and its consumer/subtraction plumbing, rather than arbitrary semantic
 repairs. The independently sealed variant and upstream source inventory remain
-pending. Evidence is under `packages/aethyme-eval/e1/synthesis-observations/`.
+pending at that checkpoint. Evidence is under
+`packages/aethyme-eval/e1/synthesis-observations/`.
+
+## Independently sealed final variant
+
+The frozen independent SH01 variant ran once after the engine/profile and caller
+review were frozen. Both orders ran twice: all four actual browser observations
+passed, with byte-identical candidate source. The native archive independently
+reconstructed and compared every c1/c2 base/result role after all compositions.
+The observer stayed private and no synthesized expected result was supplied.
+The caller captured asynchronous activity for 250 ms after inspection and through
+browser cleanup. Evidence is retained under
+`packages/aethyme-eval/e1/sealed-observations/completed/`.
+
+This supports opting into the external HTML structural profile on this retained
+move/edit distribution. It does not establish a general structural engine for
+other formats: original FX04 still requires semantic resolution, and the original
+held-out cases were not rerun. The default text profile remains available. Native
+gate integration, FX08 usefulness and autonomous operation require their own
+qualification.
