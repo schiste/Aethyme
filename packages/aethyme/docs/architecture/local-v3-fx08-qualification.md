@@ -63,7 +63,11 @@ Actual unpaid admission passed all eight controls: one positive, four named
 behavior/spoofing failures, two compiler refusals (private include and unsafe
 code), and exact-signature drift refusal. Each runtime control also verifies
 private-oracle data reads are denied. The four ordinary harness guards pass;
-all ten earlier failed admission attempts remain uncredited. No paid row has
+all ten earlier failed admission attempts remain uncredited. The separate
+transport calibration then passed all six positives and all six named semantic
+negatives from unchanged independent vectors. Its first failed attempt exposed
+the appointed serde runtime's optional Result feature; the adapter now uses an
+explicit ok/error wire representation while preserving exact signatures. No paid row has
 run. The host SDK/compiler and frozen trusted templates are part of this
 profile, and metadata/ancestor directory reads are intentionally permitted.
 Trusted adapters check exact public signatures. One dependency and transport

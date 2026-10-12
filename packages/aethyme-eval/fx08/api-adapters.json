@@ -6,8 +6,8 @@
     "signatures": "let _:fn()->u32=subject::answer;let _:fn()->bool=subject::private_read;"
   },
   "01-optional": {
-    "server": "match op {\"parse_entry\"=>serde_json::to_value(subject::parse_entry(a[0].as_str().unwrap(),a[1].as_u64().unwrap() as usize)).unwrap(),\"parse_feature\"=>serde_json::to_value(subject::parse_feature(a[0].as_str())).unwrap(),_=>panic!(\"unknown op\")}",
-    "proxy": "pub fn parse_entry(entry:&str,index:usize)->Result<String,String>{serde_json::from_value(rpc(\"parse_entry\",serde_json::json!([entry,index]))).unwrap()} pub fn parse_feature(setting:Option<&str>)->Result<Vec<String>,String>{serde_json::from_value(rpc(\"parse_feature\",serde_json::json!([setting]))).unwrap()}",
+    "server": "match op {\"parse_entry\"=>match subject::parse_entry(a[0].as_str().unwrap(),a[1].as_u64().unwrap() as usize){Ok(value)=>serde_json::json!({\"ok\":value}),Err(error)=>serde_json::json!({\"error\":error})},\"parse_feature\"=>match subject::parse_feature(a[0].as_str()){Ok(value)=>serde_json::json!({\"ok\":value}),Err(error)=>serde_json::json!({\"error\":error})},_=>panic!(\"unknown op\")}",
+    "proxy": "pub fn parse_entry(entry:&str,index:usize)->Result<String,String>{let value=rpc(\"parse_entry\",serde_json::json!([entry,index]));if let Some(result)=value.get(\"ok\"){Ok(serde_json::from_value(result.clone()).unwrap())}else{Err(value[\"error\"].as_str().unwrap().into())}} pub fn parse_feature(setting:Option<&str>)->Result<Vec<String>,String>{let value=rpc(\"parse_feature\",serde_json::json!([setting]));if let Some(result)=value.get(\"ok\"){Ok(serde_json::from_value(result.clone()).unwrap())}else{Err(value[\"error\"].as_str().unwrap().into())}}",
     "signatures": "let _:fn(&str,usize)->Result<String,String>=subject::parse_entry;let _:fn(Option<&str>)->Result<Vec<String>,String>=subject::parse_feature;"
   },
   "02-pagination": {
