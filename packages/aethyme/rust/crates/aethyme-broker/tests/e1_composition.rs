@@ -1,5 +1,6 @@
 //! E1 uses retained Playground inputs, public composer metadata and an
 //! independent oracle. Original held-outs are deliberately not invoked here.
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use aethyme_broker::collaboration_archive::{self, CommitOid};
@@ -45,7 +46,7 @@ fn capture_lineage(
 }
 
 struct World {
-    root: tempfile::TempDir,
+    root: PathBuf,
     repo: PathBuf,
     store: CollaborationStore,
     request: CompositionRequest,
@@ -56,10 +57,11 @@ fn world(case: &CaseInput, scenario: &ScenarioInput, evidence: &Path) -> World {
         .prefix("Playground-E1-")
         .tempdir_in(evidence)
         .unwrap();
-    let materialized = case.materialize(&scenario.id, &root.path().join("repos"));
+    let root = root.keep();
+    let materialized = case.materialize(&scenario.id, &root.join("repos"));
     let repo = materialized.repo;
     let mut store = CollaborationStore::open(
-        &CollaborationRoot::under_host_state(&root.path().join("state")),
+        &CollaborationRoot::under_host_state(&root.join("state")),
         &ProjectKey::parse("e1").unwrap(),
         &forbidden_roots(&repo),
     )
@@ -163,6 +165,7 @@ fn judge(
     scenario: &ScenarioInput,
     evidence: &Path,
     engine: Option<&MergirafEngine>,
+    checkpoint: &mut dyn FnMut(usize, Value),
 ) -> Value {
     let mut world = world(case, scenario, evidence);
     let orders = if scenario.orders.is_empty() {
@@ -175,6 +178,10 @@ fn judge(
     let mut errors = 0;
     for order in orders {
         for repeat in 0..2 {
+            checkpoint(
+                seen.len(),
+                json!({"order":order,"repeat":repeat,"state":"admitted","retained_playground":world.root}),
+            );
             let started = std::time::Instant::now();
             match run(&mut world, scenario, &order, engine) {
                 Ok((composition, observations)) => {
@@ -186,7 +193,7 @@ fn judge(
                     let observed = if let CompositionOutcome::Candidate(candidate) =
                         &composition.outcome
                     {
-                        let output = world.root.path().join(format!("candidate-{}", seen.len()));
+                        let output = world.root.join(format!("candidate-{}", seen.len()));
                         collaboration_archive::reconstruct(
                             &world.store,
                             &candidate.subject,
@@ -200,11 +207,15 @@ fn judge(
                         Err(oracle_outcome(composition.outcome.code()))
                     };
                     seen.push((order.clone(), observed));
+                    row["state"] = json!("completed");
+                    checkpoint(rows.len(), row.clone());
                     rows.push(row);
                 }
                 Err(error) => {
                     errors += 1;
-                    rows.push(json!({"order":order,"repeat":repeat,"infrastructure_error":error.to_string(),"code":error.code(),"wall_ms":started.elapsed().as_millis()}));
+                    let row = json!({"order":order,"repeat":repeat,"state":"infrastructure_error","infrastructure_error":error.to_string(),"code":error.code(),"wall_ms":started.elapsed().as_millis()});
+                    checkpoint(rows.len(), row.clone());
+                    rows.push(row);
                     seen.push((order.clone(), Err(Outcome::Unsupported)));
                 }
             }
@@ -223,12 +234,118 @@ fn judge(
         })
         .collect::<Vec<_>>();
     let verdict = fx::judge_scenario(case, &scenario.id, &runs);
-    let archive = world.root.keep();
+    let archive = world.root;
     json!({"case":case.case,"scenario":scenario.id,"accepted":verdict.accepted&&errors==0,"oracle_failures":verdict.failures,"infrastructure_errors":errors,"runs":rows,"retained_playground":archive})
 }
 
 fn fixture_root() -> PathBuf {
     aethyme_testkit::rust_workspace_root().join("crates/aethyme-testkit/fixtures/composition-e1")
+}
+
+fn planned_campaign() -> Value {
+    let mut rows = Vec::new();
+    for profile in ["git-text-baseline", "mergiraf-html-candidate"] {
+        for case in fx::cases() {
+            for scenario in &case.scenarios {
+                let orders = if scenario.orders.is_empty() {
+                    vec![Vec::new()]
+                } else {
+                    scenario.orders.clone()
+                };
+                let runs = orders
+                    .iter()
+                    .flat_map(|order| {
+                        (0..2).map(
+                            move |repeat| json!({"order":order,"repeat":repeat,"state":"unrun"}),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                rows.push(json!({"profile":profile,"case":case.case,"scenario":scenario.id,"state":"unrun","accepted":false,"runs":runs}));
+            }
+        }
+    }
+    json!({"schema":"aethyme.e1.original-fixture-campaign/v1","state":"planned","rows":rows})
+}
+
+fn persist_campaign(evidence: &Path, report: &Value) -> std::io::Result<()> {
+    let mut file = tempfile::NamedTempFile::new_in(evidence)?;
+    file.write_all(&serde_json::to_vec_pretty(report)?)?;
+    file.as_file().sync_all()?;
+    file.persist(evidence.join("report.json"))
+        .map_err(|error| error.error)?;
+    #[cfg(unix)]
+    std::fs::File::open(evidence)?.sync_all()?;
+    Ok(())
+}
+
+fn campaign_case(
+    report: &mut Value,
+    index: usize,
+    evidence: &Path,
+    body: impl FnOnce(&mut dyn FnMut(usize, Value)) -> Value,
+) {
+    report["rows"][index]["state"] = json!("setup_admitted");
+    persist_campaign(evidence, report).expect("durable setup admission");
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        body(&mut |run_index, row| {
+            report["rows"][index]["runs"][run_index] = row;
+            persist_campaign(evidence, report).expect("durable run checkpoint");
+        })
+    }));
+    match outcome {
+        Ok(mut row) => {
+            row["profile"] = report["rows"][index]["profile"].clone();
+            row["state"] = json!("completed");
+            report["rows"][index] = row;
+        }
+        Err(panic) => {
+            let detail = panic
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| panic.downcast_ref::<&str>().map(|text| text.to_string()))
+                .unwrap_or_else(|| "campaign preparation or observation panicked".into());
+            let row = &mut report["rows"][index];
+            row["state"] = json!("infrastructure_error");
+            row["accepted"] = json!(false);
+            row["infrastructure_error"] = json!(detail);
+            for run in row["runs"].as_array_mut().unwrap() {
+                if run["state"] == "admitted" {
+                    run["state"] = json!("unknown_after_interruption");
+                }
+            }
+        }
+    }
+    persist_campaign(evidence, report).expect("durable case outcome");
+}
+
+#[test]
+fn campaign_journal_preserves_completed_unknown_and_unrun_rows() {
+    let evidence = tempfile::tempdir().unwrap();
+    let mut report = planned_campaign();
+    persist_campaign(evidence.path(), &report).unwrap();
+    let saved: Value =
+        serde_json::from_slice(&std::fs::read(evidence.path().join("report.json")).unwrap())
+            .unwrap();
+    assert_eq!(saved, report);
+    campaign_case(&mut report, 0, evidence.path(), |checkpoint| {
+        checkpoint(0, json!({"state":"completed","outcome":"candidate"}));
+        checkpoint(1, json!({"state":"admitted"}));
+        panic!("independent preparation failure after an actual durable checkpoint");
+    });
+    let saved: Value =
+        serde_json::from_slice(&std::fs::read(evidence.path().join("report.json")).unwrap())
+            .unwrap();
+    assert_eq!(saved["rows"][0]["state"], "infrastructure_error");
+    assert_eq!(saved["rows"][0]["runs"][0]["state"], "completed");
+    assert_eq!(
+        saved["rows"][0]["runs"][1]["state"],
+        "unknown_after_interruption"
+    );
+    assert_eq!(saved["rows"][1]["state"], "unrun");
+    assert_eq!(
+        saved["rows"].as_array().unwrap().len(),
+        report["rows"].as_array().unwrap().len()
+    );
 }
 
 #[test]
@@ -269,26 +386,38 @@ fn compare_original_inputs_with_pinned_structural_engine() {
         std::env::var_os("AETHYME_E1_EVIDENCE_DIR").expect("fresh evidence directory"),
     );
     std::fs::create_dir(&evidence).expect("evidence directory must be new");
-    let engine = MergirafEngine::pin(&executable, &digest).unwrap();
-    let mut rows = Vec::new();
+    let mut report = planned_campaign();
+    report["engine_sha256"] = json!(digest);
+    report["state"] = json!("engine_admission");
+    persist_campaign(&evidence, &report).unwrap();
+    let engine = match MergirafEngine::pin(&executable, &digest) {
+        Ok(engine) => engine,
+        Err(error) => {
+            report["state"] = json!("engine_admission_failed");
+            report["infrastructure_error"] = json!(error.to_string());
+            persist_campaign(&evidence, &report).unwrap();
+            panic!("engine admission failed: {error}");
+        }
+    };
+    report["state"] = json!("running");
+    persist_campaign(&evidence, &report).unwrap();
+    let mut index = 0;
     for (name, profile) in [
         ("git-text-baseline", None),
         ("mergiraf-html-candidate", Some(&engine)),
     ] {
         for case in fx::cases() {
             for scenario in &case.scenarios {
-                let mut row = judge(&case, scenario, &evidence, profile);
-                row["profile"] = json!(name);
-                rows.push(row);
+                assert_eq!(report["rows"][index]["profile"], name);
+                campaign_case(&mut report, index, &evidence, |checkpoint| {
+                    judge(&case, scenario, &evidence, profile, checkpoint)
+                });
+                index += 1;
             }
         }
     }
-    let report = json!({"schema":"aethyme.e1.original-fixture-campaign/v1","engine_sha256":engine.sha256(),"rows":rows});
-    std::fs::write(
-        evidence.join("report.json"),
-        serde_json::to_vec_pretty(&report).unwrap(),
-    )
-    .unwrap();
+    report["state"] = json!("completed");
+    persist_campaign(&evidence, &report).unwrap();
     for row in report["rows"].as_array().unwrap() {
         eprintln!(
             "{} {} {} accepted={} {:?}",
