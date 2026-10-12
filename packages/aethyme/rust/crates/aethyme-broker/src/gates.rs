@@ -2990,6 +2990,77 @@ fn command_completion_is_late(deadline: Option<Instant>) -> bool {
     deadline.is_some_and(|cutoff| Instant::now() >= cutoff)
 }
 
+fn wait_gate_child(
+    child: &mut std::process::Child,
+    context: &GateCommandContext<'_>,
+    process_group: i32,
+) -> (Result<std::process::ExitStatus, std::io::Error>, bool) {
+    let deadline = context.timeout_seconds.map(Duration::from_secs);
+    let mut timed_out = false;
+    let status = 'wait: loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                timed_out = command_completion_is_late(context.absolute_deadline);
+                break Ok(status);
+            }
+            Ok(None)
+                if deadline.is_some_and(|deadline| context.started.elapsed() >= deadline)
+                    || context
+                        .absolute_deadline
+                        .is_some_and(|cutoff| Instant::now() >= cutoff) =>
+            {
+                timed_out = true;
+                let seconds = context.timeout_seconds.unwrap_or_default();
+                let load_at_timeout = load_average_1m()
+                    .zip(logical_cpu_count())
+                    .filter(|(load_1m, cpus)| load_1m.is_finite() && *load_1m >= 0.0 && *cpus > 0)
+                    .map(|(load_1m, cpus)| crate::gate_admission::LoadSample { load_1m, cpus });
+                let _ = append_gate_log(
+                    context.log_path,
+                    &format_gate_timeout_diagnostic(
+                        context.configured_timeout_seconds,
+                        seconds,
+                        context.environment,
+                        load_at_timeout,
+                    ),
+                );
+                // SAFETY: killpg has no memory-safety preconditions; the
+                // leader is unreaped, so the group cannot have been reused.
+                unsafe {
+                    libc::killpg(process_group, libc::SIGTERM);
+                }
+                let grace_deadline = Instant::now() + Duration::from_secs(1);
+                let final_status = loop {
+                    match child.try_wait() {
+                        Ok(Some(status)) => break Ok(status),
+                        Ok(None) if Instant::now() >= grace_deadline => {
+                            // SAFETY: as for the SIGTERM above.
+                            unsafe {
+                                libc::killpg(process_group, libc::SIGKILL);
+                            }
+                            break child.wait();
+                        }
+                        Ok(None) => std::thread::sleep(Duration::from_millis(25)),
+                        Err(error) => break Err(error),
+                    }
+                };
+                break 'wait final_status;
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(25)),
+            Err(error) => break Err(error),
+        }
+    };
+    (status, timed_out)
+}
+
+fn spawn_gate_command(
+    command: &mut std::process::Command,
+    deadline: Option<Instant>,
+) -> Result<std::process::Child, std::io::Error> {
+    require_command_allowance(deadline)?;
+    command.spawn()
+}
+
 fn run_gate_command(
     command: &str,
     context: GateCommandContext<'_>,
@@ -3134,8 +3205,7 @@ fn run_gate_command(
     if let Some(path) = crate::git::sanitized_subprocess_path() {
         process.env("PATH", path);
     }
-    require_command_allowance(context.absolute_deadline)?;
-    let mut child = process.spawn()?;
+    let mut child = spawn_gate_command(&mut process, context.absolute_deadline)?;
 
     let pidfile = context.session_id.map(|sid| {
         context
@@ -3249,63 +3319,7 @@ fn run_gate_command(
                 }
             }
         });
-        let deadline = context.timeout_seconds.map(Duration::from_secs);
-        let mut timed_out = false;
-        let status = 'wait: loop {
-            match child.try_wait() {
-                Ok(Some(status)) => {
-                    timed_out = command_completion_is_late(context.absolute_deadline);
-                    break Ok(status);
-                }
-                Ok(None)
-                    if deadline.is_some_and(|deadline| context.started.elapsed() >= deadline)
-                        || context
-                            .absolute_deadline
-                            .is_some_and(|cutoff| Instant::now() >= cutoff) =>
-                {
-                    timed_out = true;
-                    let seconds = context.timeout_seconds.unwrap_or_default();
-                    let load_at_timeout = load_average_1m()
-                        .zip(logical_cpu_count())
-                        .filter(|(load_1m, cpus)| {
-                            load_1m.is_finite() && *load_1m >= 0.0 && *cpus > 0
-                        })
-                        .map(|(load_1m, cpus)| crate::gate_admission::LoadSample { load_1m, cpus });
-                    let _ = append_gate_log(
-                        context.log_path,
-                        &format_gate_timeout_diagnostic(
-                            context.configured_timeout_seconds,
-                            seconds,
-                            context.environment,
-                            load_at_timeout,
-                        ),
-                    );
-                    // SAFETY: killpg has no memory-safety preconditions; the
-                    // leader is unreaped, so the group cannot have been reused.
-                    unsafe {
-                        libc::killpg(process_group, libc::SIGTERM);
-                    }
-                    let grace_deadline = Instant::now() + Duration::from_secs(1);
-                    let final_status = loop {
-                        match child.try_wait() {
-                            Ok(Some(status)) => break Ok(status),
-                            Ok(None) if Instant::now() >= grace_deadline => {
-                                // SAFETY: as for the SIGTERM above.
-                                unsafe {
-                                    libc::killpg(process_group, libc::SIGKILL);
-                                }
-                                break child.wait();
-                            }
-                            Ok(None) => std::thread::sleep(Duration::from_millis(25)),
-                            Err(error) => break Err(error),
-                        }
-                    };
-                    break 'wait final_status;
-                }
-                Ok(None) => std::thread::sleep(Duration::from_millis(25)),
-                Err(error) => break Err(error),
-            }
-        };
+        let (status, timed_out) = wait_gate_child(&mut child, &context, process_group);
         output_monitor_done.store(true, std::sync::atomic::Ordering::Release);
         let _ = done_tx.send(());
         (status, timed_out)
@@ -3506,43 +3520,57 @@ mod tests {
         let labels = crate::gate_debris::GateRunLabels::new("deadline", None, "synthetic");
         let lines = Lines::default();
         let log = root.path().join("log");
-        let result = run_gate_command(
-            "touch dispatched",
-            GateCommandContext {
-                cwd: root.path(),
-                available_bytes: None,
-                available_inodes: None,
-                environment: &environment,
-                log_path: &log,
-                run_dir: root.path(),
-                session_id: None,
-                gate_name: "deadline",
-                tree: "synthetic",
-                worker_id: "deadline",
-                owner_paths: &[],
-                configured_timeout_seconds: Some(1),
-                timeout_seconds: Some(1),
-                absolute_deadline: deadline,
-                started: Instant::now(),
-                progress: &lines,
-                resources: None,
-                managed_cache: None,
-                broker_database: &database,
-                run_labels: &labels,
-            },
-        );
+        let context = || GateCommandContext {
+            cwd: root.path(),
+            available_bytes: None,
+            available_inodes: None,
+            environment: &environment,
+            log_path: &log,
+            run_dir: root.path(),
+            session_id: None,
+            gate_name: "deadline",
+            tree: "synthetic",
+            worker_id: "deadline",
+            owner_paths: &[],
+            configured_timeout_seconds: Some(1),
+            timeout_seconds: Some(1),
+            absolute_deadline: deadline,
+            started: Instant::now(),
+            progress: &lines,
+            resources: None,
+            managed_cache: None,
+            broker_database: &database,
+            run_labels: &labels,
+        };
+        let result = run_gate_command("touch dispatched", context());
         assert_eq!(result.err().unwrap().kind(), std::io::ErrorKind::TimedOut);
         assert!(!root.path().join("dispatched").exists());
         let mut child = std::process::Command::new("/usr/bin/true").spawn().unwrap();
         assert!(child.wait().unwrap().success());
+        let group = i32::try_from(child.id()).unwrap();
+        let (result, late) = wait_gate_child(&mut child, &context(), group);
+        assert!(result.unwrap().success());
         assert!(
-            command_completion_is_late(deadline),
-            "late success must not become a passing observation"
+            late,
+            "production completion observer must reject late success"
         );
         assert!(
             !command_completion_is_late(None),
             "ordinary legacy completion keeps its existing semantics"
         );
+    }
+
+    #[test]
+    fn bounded_prepared_command_rechecks_deadline_before_spawn() {
+        let root = tempfile::tempdir().unwrap();
+        let mut command = std::process::Command::new("/bin/sh");
+        command
+            .args(["-c", "touch dispatched"])
+            .current_dir(root.path());
+        let allowance = Some(Instant::now() - Duration::from_secs(1));
+        let result = spawn_gate_command(&mut command, allowance);
+        assert_eq!(result.err().unwrap().kind(), std::io::ErrorKind::TimedOut);
+        assert!(!root.path().join("dispatched").exists());
     }
 
     #[derive(Default)]
