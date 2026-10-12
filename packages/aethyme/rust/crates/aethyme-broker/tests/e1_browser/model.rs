@@ -212,8 +212,8 @@ impl Resolver for CodexResolver {
                 "--json",
                 "--output-schema",
             ])
-            .args(permission_arguments(&root))
             .arg(root.join("response-schema.json"))
+            .args(permission_arguments(&root))
             .arg("-o")
             .arg(root.join("response.json"))
             .args([
@@ -225,6 +225,7 @@ impl Resolver for CodexResolver {
             ])
             .arg(&root)
             .arg(prompt);
+        verify_model_arguments(&command, &root)?;
         let process = external(&mut command, &root, "codex", 150);
         self.invocations.push(json!({"process":process,"requested_model":"gpt-6-luna","reasoning":"medium","executable_sha256":CODEX_SHA,"public_input_sha256":digest(&serde_json::to_vec(&public).unwrap()),"root":root}));
         if process["state"] != "completed" || process["exit"] != 0 {
@@ -272,6 +273,33 @@ impl Resolver for CodexResolver {
         }
         Ok(Response::Proposal(proposal))
     }
+}
+
+fn verify_model_arguments(command: &Command, root: &Path) -> Result<(), String> {
+    let args: Vec<_> = command
+        .get_args()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+    for (flag, expected) in [
+        ("--output-schema", root.join("response-schema.json")),
+        ("-o", root.join("response.json")),
+        ("-C", root.to_path_buf()),
+    ] {
+        let index = args
+            .iter()
+            .position(|arg| arg == flag)
+            .ok_or("required runner argument missing")?;
+        if args.get(index + 1).map(String::as_str) != expected.to_str() {
+            return Err(format!("runner option {flag} lost its value"));
+        }
+    }
+    if args
+        .iter()
+        .any(|arg| arg == "--sandbox" || arg == "--dangerously-bypass-approvals-and-sandbox")
+    {
+        return Err("runner would override the appointed permission profile".into());
+    }
+    Ok(())
 }
 
 fn dynamic_subtraction(
@@ -771,6 +799,31 @@ fn noncandidate_and_invalid_witness_do_not_admit_model_attempts() {
         }
     }
     assert_eq!(calls, 0);
+}
+
+#[test]
+fn runner_options_keep_adjacent_values_when_permissions_are_added() {
+    let root = Path::new("/private/tmp/synthetic-public");
+    let mut command = Command::new("codex");
+    command
+        .arg("--output-schema")
+        .arg(root.join("response-schema.json"))
+        .args(permission_arguments(root))
+        .arg("-o")
+        .arg(root.join("response.json"))
+        .arg("-C")
+        .arg(root);
+    assert!(verify_model_arguments(&command, root).is_ok());
+    let mut broken = Command::new("codex");
+    broken
+        .arg("--output-schema")
+        .args(permission_arguments(root))
+        .arg(root.join("response-schema.json"))
+        .arg("-o")
+        .arg(root.join("response.json"))
+        .arg("-C")
+        .arg(root);
+    assert!(verify_model_arguments(&broken, root).is_err());
 }
 
 #[cfg(unix)]
