@@ -141,6 +141,9 @@ pub enum BrokerError {
         source: serde_json::Error,
     },
 
+    #[error("invalid inputs JSON for verification candidate queue entry {id}: {source}")]
+    InvalidVerificationCandidateInputsJson { id: i64, source: serde_json::Error },
+
     #[error("operation history --limit must be between 1 and {maximum}, got {limit}")]
     InvalidOperationHistoryLimit { limit: u32, maximum: u32 },
 
