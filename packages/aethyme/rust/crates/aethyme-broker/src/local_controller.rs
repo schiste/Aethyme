@@ -107,6 +107,38 @@ pub fn complete(
     wave_id: &RecordId,
     grant: &QualifiedAcceptance<'_>,
 ) -> Result<CompletionSpec, ControllerError> {
+    complete_inner(store, owner, broker, carrier, wave_id, grant, None)
+}
+
+fn control_check(
+    control: Option<(i64, &std::sync::atomic::AtomicBool)>,
+) -> Result<(), ControllerError> {
+    if let Some((deadline, cancel)) = control {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| ControllerError::Canonical(e.to_string()))?
+            .as_millis();
+        if cancel.load(std::sync::atomic::Ordering::SeqCst)
+            || deadline <= 0
+            || now >= deadline as u128
+        {
+            return Err(ControllerError::Mismatch);
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn complete_inner(
+    store: &mut CollaborationStore,
+    owner: &ControllerOwner,
+    broker: &mut Broker,
+    carrier: &GitCarrier,
+    wave_id: &RecordId,
+    grant: &QualifiedAcceptance<'_>,
+    control: Option<(i64, &std::sync::atomic::AtomicBool)>,
+) -> Result<CompletionSpec, ControllerError> {
+    control_check(control)?;
     let _authority = target::authorize(store, owner)?;
     let _archive = archive_use(store)?;
     let current = acceptance::current_guard(store, owner, broker, carrier, grant)?;
@@ -160,6 +192,21 @@ pub fn complete(
     };
     let record = spec.record()?;
     let object = archive::put_object(store, &record.canonical_bytes())?;
+    let prior_members = active
+        .spec
+        .prior_completion
+        .as_ref()
+        .map(|key| {
+            RecordId::parse(key)
+                .map_err(|_| ControllerError::Mismatch)
+                .and_then(|key| {
+                    wave::previous(store, &key, active.spec.sequence)
+                        .map(|(_, w)| w.selected)
+                        .map_err(Into::into)
+                })
+        })
+        .transpose()?
+        .unwrap_or_default();
     let tx = store
         .connection()
         .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -178,6 +225,13 @@ pub fn complete(
         return Err(ControllerError::Mismatch);
     }
     for member in &active.spec.selected {
+        if prior_members.contains(member) {
+            let delivered:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM local_target_dispositions WHERE revision=?1 AND contribution=?2 AND status='delivered')",params![active.spec.revision,member],|r|r.get(0))?;
+            if !delivered {
+                return Err(ControllerError::Mismatch);
+            }
+            continue;
+        }
         if tx.execute("UPDATE local_target_dispositions SET status='delivered',detail=?3 WHERE revision=?1 AND contribution=?2 AND status='in_wave'", params![active.spec.revision,member,record.id().as_str()])? != 1 {
             return Err(ControllerError::Mismatch);
         }
@@ -195,6 +249,7 @@ pub fn complete(
         )?;
     }
     current.check_clock()?;
+    control_check(control)?;
     tx.commit()?;
     Ok(spec)
 }

@@ -120,6 +120,7 @@ fn check(
     }
     Ok(())
 }
+#[allow(clippy::too_many_arguments)]
 fn reserve(
     store: &mut CollaborationStore,
     owner: &ControllerOwner,
@@ -256,6 +257,16 @@ pub fn drive(
     if store.connection().execute("UPDATE local_controller_runs SET state=?2,observation=?3 WHERE wave=?1 AND state='dispatching'",params![active.id.as_str(),state,detail])?!=1 {return Err(ControllerError::Mismatch);}
     result
 }
+fn require_fresh_native(job: &native_gates::Job) -> Result<(), ControllerError> {
+    if job.state != "prepared" {
+        return Err(ControllerError::DispatchHeld(format!(
+            "native job {}",
+            job.state
+        )));
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run(
     store: &mut CollaborationStore,
@@ -314,6 +325,7 @@ fn run(
     }
     check(store, owner, spec, cancel)?;
     let native = native_gates::prepare(store, owner, broker, wave_id)?;
+    require_fresh_native(&native)?;
     // Graph regeneration does not have this profile's process deadline.
     // Refuse that optional configuration before dispatching the native job.
     if native.spec.graph_config_sha256.is_some() {
@@ -429,7 +441,16 @@ fn run(
         permit,
         &evidence,
     )?;
-    let completion = complete(store, owner, broker, carrier, wave_id, &grant)?;
+    check(store, owner, spec, cancel)?;
+    let completion = complete_inner(
+        store,
+        owner,
+        broker,
+        carrier,
+        wave_id,
+        &grant,
+        Some((spec.deadline_ms, cancel)),
+    )?;
     Ok(DriveResult::Completed {
         completion,
         historical: false,

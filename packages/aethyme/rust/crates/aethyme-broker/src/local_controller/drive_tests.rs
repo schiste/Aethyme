@@ -207,6 +207,8 @@ fn actual_appointed_driver_completes_without_a_manufactured_receipt() {
     };
     let mut selected = f.spec();
     selected.acceptance_policy = verifier_policy.record().unwrap().id().to_string();
+    selected.selected = vec!["A".into(), "B".into()];
+    p.wave_policy.batch_width = 1;
     let revision = target::propose_revision(&mut f.store, &owner, selected).unwrap();
     target::select_revision(&mut f.store, &owner, &revision.id).unwrap();
     let permit = verifier::configure(
@@ -326,21 +328,75 @@ fn actual_appointed_driver_completes_without_a_manufactured_receipt() {
         load(&f.store, &completion.record().unwrap().id()).unwrap(),
         completion
     );
+    // A timed call with no pending arrival stays quiescent and cannot rerun A.
+    let idle = drive(
+        &mut f.store,
+        &owner,
+        &mut broker,
+        &carrier,
+        &executor,
+        &permit,
+        &p,
+        &AtomicBool::new(false),
+        0,
+    )
+    .unwrap();
     assert!(
-        drive(
-            &mut f.store,
-            &owner,
-            &mut broker,
-            &carrier,
-            &executor,
-            &permit,
-            &p,
-            &AtomicBool::new(false),
-            0
-        )
-        .is_err(),
+        matches!(idle, DriveResult::Waiting(_)),
         "accepted wave cannot redispatch"
     );
+    wave::available(&mut f.store, &owner, "B", 1).unwrap();
+    let next = drive(
+        &mut f.store,
+        &owner,
+        &mut broker,
+        &carrier,
+        &executor,
+        &permit,
+        &p,
+        &AtomicBool::new(false),
+        1,
+    )
+    .unwrap();
+    let DriveResult::Completed {
+        completion: second,
+        historical: false,
+    } = next
+    else {
+        panic!("second actual wave did not complete: {next:?}")
+    };
+    let second_wave = wave::load(&f.store, &RecordId::parse(&second.wave).unwrap()).unwrap();
+    assert_eq!(
+        second_wave.spec.prior_completion.as_deref(),
+        Some(completion.record().unwrap().id().as_str()),
+        "prior private completion is baseline authority"
+    );
+    assert_eq!(second_wave.spec.baseline, completion.source);
+    assert_eq!(
+        git(
+            &repo,
+            &["show", &format!("{}:one.txt", second.candidate_commit)]
+        ),
+        "A",
+        "later arrival retains earlier active obligation"
+    );
+    assert_eq!(
+        git(
+            &repo,
+            &["show", &format!("{}:two.txt", second.candidate_commit)]
+        ),
+        "B",
+        "later arrival delivers its own change"
+    );
+    assert_eq!(
+        git(
+            &repo,
+            &["rev-parse", &format!("{}^", second.candidate_commit)]
+        ),
+        completion.accepted_commit,
+        "candidate parent is exact prior acceptance"
+    );
+    assert_eq!(git(&repo, &["rev-parse", "HEAD"]), original);
     let runs: i64 = f
         .store
         .read_connection()
@@ -350,9 +406,123 @@ fn actual_appointed_driver_completes_without_a_manufactured_receipt() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(runs, 1);
+    assert_eq!(runs, 2);
     let pending:i64=f.store.read_connection().query_row("SELECT count(*) FROM local_budget_reservations WHERE phase IN ('reserved','partly_consumed','completion_pending','consumption_unknown')",[],|r|r.get(0)).unwrap();
     assert_eq!(pending, 0, "no unconfirmed budget released");
-    let bytes=serde_json::to_vec_pretty(&json!({"profile":"aethyme.local-controller/experimental-v1","completion":completion,"source_host":source_host,"source_repository":repo,"remote":remote,"host":host,"runtime":executor.runtime(),"completed_runs":runs,"pending_reservations":pending,"original_head":original})).unwrap();
+    let bytes=serde_json::to_vec_pretty(&json!({"profile":"aethyme.local-controller/experimental-v1","completion":completion,"second_completion":second,"source_host":source_host,"source_repository":repo,"remote":remote,"host":host,"runtime":executor.runtime(),"completed_runs":runs,"pending_reservations":pending,"original_head":original})).unwrap();
     std::fs::write(host.join("report.json"), bytes).unwrap();
+}
+
+#[test]
+fn completion_control_checks_cancel_and_expiry_at_commit_boundary() {
+    control_check(None).unwrap();
+    control_check(Some((clock().unwrap() + 300000, &AtomicBool::new(false)))).unwrap();
+    assert!(
+        control_check(Some((clock().unwrap() - 1, &AtomicBool::new(false)))).is_err(),
+        "expired completion control"
+    );
+    assert!(
+        control_check(Some((clock().unwrap() + 300000, &AtomicBool::new(true)))).is_err(),
+        "cancelled completion control"
+    );
+}
+
+#[test]
+fn completed_native_job_is_history_and_cannot_approve_controller_dispatch() {
+    let mut f = Fixture::new();
+    let owner = target::acquire_controller(&mut f.store, "completed-gate", "operator").unwrap();
+    let selected = f.spec();
+    let revision = target::propose_revision(&mut f.store, &owner, selected).unwrap();
+    target::select_revision(&mut f.store, &owner, &revision.id).unwrap();
+    wave::available(&mut f.store, &owner, "A", 0).unwrap();
+    let wave::Admission::Frozen(w) =
+        wave::admit(&mut f.store, &owner, policy().wave_policy, 0).unwrap()
+    else {
+        panic!("missing wave")
+    };
+    wave::compose(&mut f.store, &owner, f._repo.path(), &w.id).unwrap();
+    let mut broker = Broker::open(f._repo.path())
+        .unwrap()
+        .with_host_operation_database(f._host.path().join("operations.db"))
+        .with_worktree_root(f._host.path().join("worktrees"));
+    let job = native_gates::prepare(&mut f.store, &owner, &mut broker, &w.id).unwrap();
+    require_fresh_native(&job).unwrap();
+    let job = native_gates::run(&mut f.store, &owner, &mut broker, &job.id).unwrap();
+    assert_eq!(job.state, "completed");
+    assert_eq!(job.observation.as_ref().unwrap()["current_authority"], true);
+    assert!(
+        require_fresh_native(&job).is_err(),
+        "historical native result cannot approve new controller dispatch"
+    );
+    let mut restarted = job;
+    restarted.state = "dispatching".into();
+    assert!(
+        require_fresh_native(&restarted).is_err(),
+        "ambiguous native dispatch cannot be retried"
+    );
+}
+
+#[test]
+fn controller_migrations_adopt_existing_journals_without_erasing_rows() {
+    let mut f = Fixture::new();
+    let owner = target::acquire_controller(&mut f.store, "adoption", "fixture-operator").unwrap();
+    let selected = f.spec();
+    let revision = target::propose_revision(&mut f.store, &owner, selected).unwrap();
+    target::select_revision(&mut f.store, &owner, &revision.id).unwrap();
+    wave::available(&mut f.store, &owner, "A", 0).unwrap();
+    let wave::Admission::Frozen(w) =
+        wave::admit(&mut f.store, &owner, policy().wave_policy, 0).unwrap()
+    else {
+        panic!("real wave missing");
+    };
+    let connection = f.store.connection();
+    connection.execute("INSERT INTO local_controller_completions(id,wave,revision,target,body) VALUES('migration-sentinel',?1,?2,'adoption',?3)",params![w.id.as_str(),revision.id.as_str(),b"completion-preserved".as_slice()]).unwrap();
+    connection.execute("INSERT INTO local_controller_completion_roots(completion,kind,reference) VALUES('migration-sentinel','source','retained-sentinel')",[]).unwrap();
+    connection.execute("INSERT INTO local_controller_runs(wave,id,epoch,body,state,observation) VALUES(?1,'run-sentinel',?2,?3,'unknown',?4)",params![w.id.as_str(),owner.authority_epoch().as_str(),b"dispatch-preserved".as_slice(),b"unknown-preserved".as_slice()]).unwrap();
+    connection
+        .execute(
+            "UPDATE meta SET value='18' WHERE key IN ('schema_version','min_compatible_schema')",
+            [],
+        )
+        .unwrap();
+    drop(owner);
+    let host = f._host.path().to_path_buf();
+    drop(f.store);
+    let reopened = CollaborationStore::open(
+        &crate::collaboration_state::CollaborationRoot::under_host_state(&host),
+        &crate::collaboration_state::ProjectKey::parse("local-target-test").unwrap(),
+        &[],
+    )
+    .unwrap();
+    assert_eq!(
+        reopened.schema_version(),
+        crate::collaboration_state::COLLABORATION_STATE_SCHEMA_VERSION
+    );
+    let completion: Vec<u8> = reopened
+        .read_connection()
+        .query_row(
+            "SELECT body FROM local_controller_completions WHERE id='migration-sentinel'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(completion, b"completion-preserved");
+    let run: (Vec<u8>, String, Vec<u8>) = reopened
+        .read_connection()
+        .query_row(
+            "SELECT body,state,observation FROM local_controller_runs WHERE id='run-sentinel'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        run,
+        (
+            b"dispatch-preserved".to_vec(),
+            "unknown".into(),
+            b"unknown-preserved".to_vec()
+        )
+    );
+    let roots:i64=reopened.read_connection().query_row("SELECT count(*) FROM local_controller_completion_roots WHERE completion='migration-sentinel' AND reference='retained-sentinel'",[],|r|r.get(0)).unwrap();
+    assert_eq!(roots, 1, "migration preserves independent retention roots");
 }

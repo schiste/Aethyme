@@ -78,3 +78,20 @@ service, cumulative accepted-baseline progression, the CLI controller binding
 nor FX17 is qualified at this checkpoint. Existing no-command native policies
 require explicit `allow_empty_native_gates`; passing independent verification
 and provider acceptance remain mandatory.
+
+
+## Continuation checkpoint
+
+The controller now admits later finite waves against the last privately accepted
+source and exact accepted commit. Each wave includes previously delivered members,
+so composition and independent verification retain earlier obligations. A prior
+completion is historical data and must match its accepted canonical wave; it does
+not grant fresh native gate authority. Completed native jobs require reconciliation,
+and cancellation/deadline checks remain active through the completion transaction.
+State schema/floor 21 prevents earlier binaries interpreting cumulative waves.
+Migrations 19/20 adopt existing controller tables without dropping retained rows.
+
+Validation before this checkpoint: 20 composer guard tests, 21 wave regression tests,
+and seven ordinary controller tests passed. The updated two-wave Docker/provider
+positive is compiled but has not run; sustained service, FX17, final CI and mutation
+checks remain outstanding. This checkpoint does not qualify autonomous reliability.
