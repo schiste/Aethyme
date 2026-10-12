@@ -1,0 +1,30 @@
+[
+  {
+    "attempt": 0,
+    "usage": [
+      {
+        "input_tokens": 22998,
+        "cached_input_tokens": 11008,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 178,
+        "reasoning_output_tokens": 49
+      }
+    ],
+    "known_infrastructure_failure": "code-mode host missing; no tool dispatch",
+    "candidate": false
+  },
+  {
+    "attempt": 1,
+    "usage": [
+      {
+        "input_tokens": 34582,
+        "cached_input_tokens": 22016,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 248,
+        "reasoning_output_tokens": 67
+      }
+    ],
+    "known_infrastructure_failure": "code-mode host missing; no tool dispatch",
+    "candidate": false
+  }
+]
