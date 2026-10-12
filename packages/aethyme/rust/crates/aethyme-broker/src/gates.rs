@@ -3568,8 +3568,16 @@ mod tests {
             .args(["-c", "touch dispatched"])
             .current_dir(root.path());
         let allowance = Some(Instant::now() - Duration::from_secs(1));
-        let result = spawn_gate_command(&mut command, allowance);
-        assert_eq!(result.err().unwrap().kind(), std::io::ErrorKind::TimedOut);
+        let error = match spawn_gate_command(&mut command, allowance) {
+            Err(error) => error,
+            Ok(mut child) => {
+                let status = child
+                    .wait()
+                    .expect("reap the test-owned unexpected dispatch");
+                panic!("expired allowance dispatched a child: {status}");
+            }
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
         assert!(!root.path().join("dispatched").exists());
     }
 
