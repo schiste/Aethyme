@@ -1525,6 +1525,7 @@ impl GateOwnerLocks {
     /// worker that wrote itself into the lock file) and re-reported every
     /// `report_every` until it frees, so a gate queued behind another never
     /// sits silent for minutes.
+    #[cfg(test)]
     fn acquire(
         owner_dir: &Path,
         gate_name: &str,
