@@ -18,7 +18,8 @@ isolated historical receiver. This is evidence for the declared finite profile.
 Q3, Q4 and the whole Local plan remain open: structural composition requires E1,
 native gate integration requires #725, live GitHub/Mergify requires an appointed
 Playground binding, and matched context trials require reviewed FX08 tasks.
-The command surface also has its own separate draft and validation.
+The explicit command surface has its own separately reviewed draft and finite
+qualification; autonomous target execution remains unsupported.
 
 ## Evidence inventory
 
@@ -34,7 +35,7 @@ The command surface also has its own separate draft and validation.
 | Generation, exchange and controlled handoff | #747–#749 | Real child/open-file schedules; [handoff regression ledger](local-v3-qualification/handoff-restored-2026-10-11.json); real controlled native joined path below |
 | Retained export and isolated rehearsal | #750 | Independent receiver build after origin deletion; [restore regression and guard ledger](local-v3-qualification/restore-restored-2026-10-11.json); source/history only |
 | Disable, old binary, offline and paired CLI behavior | #751 | [Native compatibility ledger](local-v3-qualification/compatibility-native-2026-10-12.json); one pinned old binary and a declared finite paired-command set |
-| Explicit lifecycle commands | #732 and #753 | Earlier retained-state commands and new target/authority/stop/export/inspection commands; separate CLI execution and help validation pending |
+| Explicit lifecycle commands | #732 and #753 | [CLI qualification ledger](https://github.com/schiste/Aethyme/blob/97fd3ecaee36b110fda842eb93ba5d3aba0118cd/packages/aethyme/docs/architecture/local-v3-qualification/cli-restored-2026-10-12.json): 527 overlapping passing executions, 13 ignores, seven named guard failures and two strict Clippy checks; finite explicit commands only |
 
 Each artifact names its tested source. A later parent fix does not turn
 historical evidence into evidence for a newer tree. Selected regression
@@ -49,7 +50,25 @@ strict Clippy with `--lib --tests -D warnings`, all at source
 Ignored native profiles are credited only by their separately recorded explicit
 invocations. Final-head CI and independent review remain separate checks.
 
+## Explicit command qualification
+
+The separately reviewed #753 command profile tested source
+`ece13cebd381ada85fa649a40b6b0e38eec209fb`: 18 built-router cases, eight
+lifecycle units within the selected collaboration suite, checked help and
+selected regressions. Its 527 passing executions overlap across selections.
+Seven deliberate removals each failed their named assertion with actual exit
+101; exact source was restored. Both strict broker and CLI Clippy passed.
+Earlier compiler, wrapper and unsupported CLI `--lib` invocations stay
+explicitly uncredited in its ledger. Final delivery CI is green at
+`97fd3ecaee36b110fda842eb93ba5d3aba0118cd`.
+
+Built CLI target transitions, exact epoch stop and exclusive historical export
+are qualified only for this finite profile. Handoff's projection unit uses
+modeled verifier evidence, without a built CLI positive handoff claim. Target
+run, remote sync and handoff dispatch still refuse unbound profiles.
+
 ## Native operator and pressure profile
+
 
 [Native commands and proof ledger](local-v3-qualification/native-pressure-flow-2026-10-12.json)
 records four scheduled profile attempts: 12 command runs, 10 executed and two
