@@ -36,6 +36,9 @@ export async function observe(file, requirements, modulePath, executablePath) {
       }
     });
     await page.setContent(source.toString('utf8'), {waitUntil:'load',timeout:3000});
+    if (requirements.some(requirement=>['consent','privacy','no_analytics'].includes(requirement))) {
+      await check('consent is initially false', async () => assert.equal(await page.locator('#consent').isChecked(),false));
+    }
     await check('unique DOM identities', async () => {
       const ids = await page.locator('[id]').evaluateAll(elements => elements.map(e => e.id));
       assert.equal(new Set(ids).size, ids.length);
@@ -85,8 +88,9 @@ export async function observe(file, requirements, modulePath, executablePath) {
       await check('one anonymous event with consent', async () => {
         await page.locator('#consent').check();
         const before = requests.length;
-        await page.locator('#query').fill('observer private search');
+        await page.locator('#query').fill('La');
         await page.locator('#query').press('Enter');
+        assert.equal(await page.locator('#results').textContent(),'Lake');
         await page.waitForTimeout(500);
         assert.equal(requests.length-before,1);
         const event = requests[before];
@@ -111,8 +115,9 @@ export async function observe(file, requirements, modulePath, executablePath) {
       await check('consent transport is independent of query', async () => {
         const previous = requests.at(-1);
         const before = requests.length;
-        await page.locator('#query').fill('a different independent search');
-        await page.locator('#query').press('Enter');
+        await page.locator('#query').fill('For');
+        await page.getByRole('button',{name:'Search',exact:true}).click();
+        assert.equal(await page.locator('#results').textContent(),'Forest');
         await page.waitForTimeout(500);
         assert.equal(requests.length-before,1);
         const current = requests[before];
@@ -121,7 +126,9 @@ export async function observe(file, requirements, modulePath, executablePath) {
       await check('revoked consent stops later events', async () => {
         await page.locator('#consent').uncheck();
         const before = requests.length;
+        await page.locator('#query').fill('Mu');
         await page.locator('#query').press('Enter');
+        assert.equal(await page.locator('#results').textContent(),'Museum');
         await page.waitForTimeout(250);
         assert.equal(requests.length,before);
       });
@@ -135,8 +142,10 @@ export async function observe(file, requirements, modulePath, executablePath) {
       assert.deepEqual(requests,[]);
       for (const consent of [true,false]) {
         await page.locator('#consent').setChecked(consent);
-        await page.locator('#query').fill('independent subtraction search');
-        await page.locator('#query').press('Enter');
+        await page.locator('#query').fill(consent?'La':'For');
+        if(consent) await page.locator('#query').press('Enter');
+        else await page.getByRole('button',{name:'Search',exact:true}).click();
+        assert.equal(await page.locator('#results').textContent(),consent?'Lake':'Forest');
         await page.waitForTimeout(500);
         assert.deepEqual(requests,[]);
       }
@@ -145,6 +154,9 @@ export async function observe(file, requirements, modulePath, executablePath) {
       assert.equal(await page.locator('#consumer-note').count(),1);
       assert.equal(await page.locator('#consumer-note').textContent(),'Consumer observes the consent-aware search revision.');
     });
+    if (!requirements.includes('consent') && !requirements.includes('privacy')) {
+      await check('ordinary compositions emit no telemetry', async () => assert.deepEqual(requests,[]));
+    }
     await check('no WebSocket egress', async () => assert.deepEqual(sockets,[]));
     await check('no runtime page errors', async () => assert.deepEqual(errors,[]));
     return {schema:'aethyme.e1.browser-observation/v1',passed:checks.every(c=>c.passed),checks,requests,sockets,errors,observation_window_ms:500,wall_ms:performance.now()-start,browser_version:browser.version()};

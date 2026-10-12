@@ -1,0 +1,833 @@
+{
+  "schema": "aethyme.e1.browser-calibration/v1",
+  "rows": [
+    {
+      "name": "positive-anonymous-consent",
+      "command": [
+        "/usr/bin/sandbox-exec",
+        "-p",
+        "(version 1)(allow default)(deny network*)",
+        "/opt/homebrew/Cellar/node/26.8.2/bin/node",
+        "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/650-e1-composition-feasibility-and-struc/packages/aethyme-eval/e1/browser-oracle.mjs",
+        "/private/tmp/aethyme-e1-independent-calibration.zij85I/private-controls/positive-anonymous-consent.html",
+        "search,consent,privacy,navigation",
+        "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright/index.mjs",
+        "/Users/christophehenner/Library/Caches/ms-playwright/chromium_headless_shell-1228/chrome-headless-shell-mac-arm64/chrome-headless-shell"
+      ],
+      "status": 0,
+      "signal": null,
+      "expected_pass": true,
+      "observation": {
+        "schema": "aethyme.e1.browser-observation/v1",
+        "passed": true,
+        "checks": [
+          {
+            "name": "consent is initially false",
+            "passed": true
+          },
+          {
+            "name": "unique DOM identities",
+            "passed": true
+          },
+          {
+            "name": "Enter preserves directory search",
+            "passed": true
+          },
+          {
+            "name": "pointer preserves directory search",
+            "passed": true
+          },
+          {
+            "name": "no telemetry without affirmative consent",
+            "passed": true
+          },
+          {
+            "name": "one anonymous event with consent",
+            "passed": true
+          },
+          {
+            "name": "consent transport is independent of query",
+            "passed": true
+          },
+          {
+            "name": "revoked consent stops later events",
+            "passed": true
+          },
+          {
+            "name": "existing navigation survives",
+            "passed": true
+          },
+          {
+            "name": "no WebSocket egress",
+            "passed": true
+          },
+          {
+            "name": "no runtime page errors",
+            "passed": true
+          }
+        ],
+        "requests": [
+          {
+            "url": "https://telemetry.invalid/event",
+            "method": "POST",
+            "headers": {
+              "accept": "*/*",
+              "accept-language": "en-US",
+              "content-type": "text/plain;charset=UTF-8",
+              "origin": "null",
+              "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/149.0.7827.55 Safari/537.36",
+              "sec-ch-ua": "\"HeadlessChrome\";v=\"149\", \"Chromium\";v=\"149\", \"Not)A;Brand\";v=\"24\"",
+              "sec-ch-ua-mobile": "?0",
+              "sec-ch-ua-platform": "\"macOS\""
+            },
+            "body": "{\"event\":\"search\"}"
+          },
+          {
+            "url": "https://telemetry.invalid/event",
+            "method": "POST",
+            "headers": {
+              "accept": "*/*",
+              "accept-language": "en-US",
+              "content-type": "text/plain;charset=UTF-8",
+              "origin": "null",
+              "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/149.0.7827.55 Safari/537.36",
+              "sec-ch-ua": "\"HeadlessChrome\";v=\"149\", \"Chromium\";v=\"149\", \"Not)A;Brand\";v=\"24\"",
+              "sec-ch-ua-mobile": "?0",
+              "sec-ch-ua-platform": "\"macOS\""
+            },
+            "body": "{\"event\":\"search\"}"
+          }
+        ],
+        "sockets": [],
+        "errors": [],
+        "observation_window_ms": 500,
+        "wall_ms": 1863.0504999999998,
+        "browser_version": "149.0.7827.55"
+      }
+    },
+    {
+      "name": "negative-early-load-event",
+      "command": [
+        "/usr/bin/sandbox-exec",
+        "-p",
+        "(version 1)(allow default)(deny network*)",
+        "/opt/homebrew/Cellar/node/26.8.2/bin/node",
+        "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/650-e1-composition-feasibility-and-struc/packages/aethyme-eval/e1/browser-oracle.mjs",
+        "/private/tmp/aethyme-e1-independent-calibration.zij85I/private-controls/negative-early-load-event.html",
+        "search,consent,privacy,navigation",
+        "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright/index.mjs",
+        "/Users/christophehenner/Library/Caches/ms-playwright/chromium_headless_shell-1228/chrome-headless-shell-mac-arm64/chrome-headless-shell"
+      ],
+      "status": 1,
+      "signal": null,
+      "expected_pass": false,
+      "observation": {
+        "schema": "aethyme.e1.browser-observation/v1",
+        "passed": false,
+        "checks": [
+          {
+            "name": "consent is initially false",
+            "passed": true
+          },
+          {
+            "name": "unique DOM identities",
+            "passed": true
+          },
+          {
+            "name": "Enter preserves directory search",
+            "passed": true
+          },
+          {
+            "name": "pointer preserves directory search",
+            "passed": true
+          },
+          {
+            "name": "no telemetry without affirmative consent",
+            "passed": false,
+            "error": "AssertionError [ERR_ASSERTION]: load and earlier searches require consent too\n+ actual - expected\n\n+ [\n+   {\n+     body: '{\"event\":\"search\"}',\n+     headers: {\n+       'accept-language': 'en-US',\n+       'content-type': 'text/plain;charset=UTF-8',\n+       'sec-ch-ua': '\"HeadlessChrome\";v=\"149\", \"Chromium\";v=\"149\", \"Not)A;Brand\";v=\"24\"',\n+       'sec-ch-ua-mobile': '?0',\n+       'sec-ch-ua-platform': '\"macOS\"',\n+       'user-agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/149.0.7827.55 Safari/537.36',\n+       accept: '*/*',\n+       origin: 'null'\n+     },\n+     method: 'POST',\n+     url: 'https://telemetry.invalid/event'\n+   }\n+ ]\n- []\n"
+          },
+          {
+            "name": "one anonymous event with consent",
+            "passed": true
+          },
+          {
+            "name": "consent transport is independent of query",
+            "passed": true
+          },
+          {
+            "name": "revoked consent stops later events",
+            "passed": true
+          },
+          {
+            "name": "existing navigation survives",
+            "passed": true
+          },
+          {
+            "name": "no WebSocket egress",
+            "passed": true
+          },
+          {
+            "name": "no runtime page errors",
+            "passed": true
+          }
+        ],
+        "requests": [
+          {
+            "url": "https://telemetry.invalid/event",
+            "method": "POST",
+            "headers": {
+              "accept": "*/*",
+              "accept-language": "en-US",
+              "content-type": "text/plain;charset=UTF-8",
+              "origin": "null",
+              "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/149.0.7827.55 Safari/537.36",
+              "sec-ch-ua": "\"HeadlessChrome\";v=\"149\", \"Chromium\";v=\"149\", \"Not)A;Brand\";v=\"24\"",
+              "sec-ch-ua-mobile": "?0",
+              "sec-ch-ua-platform": "\"macOS\""
+            },
+            "body": "{\"event\":\"search\"}"
+          },
+          {
+            "url": "https://telemetry.invalid/event",
+            "method": "POST",
+            "headers": {
+              "accept": "*/*",
+              "accept-language": "en-US",
+              "content-type": "text/plain;charset=UTF-8",
+              "origin": "null",
+              "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/149.0.7827.55 Safari/537.36",
+              "sec-ch-ua": "\"HeadlessChrome\";v=\"149\", \"Chromium\";v=\"149\", \"Not)A;Brand\";v=\"24\"",
+              "sec-ch-ua-mobile": "?0",
+              "sec-ch-ua-platform": "\"macOS\""
+            },
+            "body": "{\"event\":\"search\"}"
+          },
+          {
+            "url": "https://telemetry.invalid/event",
+            "method": "POST",
+            "headers": {
+              "accept": "*/*",
+              "accept-language": "en-US",
+              "content-type": "text/plain;charset=UTF-8",
+              "origin": "null",
+              "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/149.0.7827.55 Safari/537.36",
+              "sec-ch-ua": "\"HeadlessChrome\";v=\"149\", \"Chromium\";v=\"149\", \"Not)A;Brand\";v=\"24\"",
+              "sec-ch-ua-mobile": "?0",
+              "sec-ch-ua-platform": "\"macOS\""
+            },
+            "body": "{\"event\":\"search\"}"
+          }
+        ],
+        "sockets": [],
+        "errors": [],
+        "observation_window_ms": 500,
+        "wall_ms": 1441.846417,
+        "browser_version": "149.0.7827.55"
+      }
+    },
+    {
+      "name": "negative-percent-path-query",
+      "command": [
+        "/usr/bin/sandbox-exec",
+        "-p",
+        "(version 1)(allow default)(deny network*)",
+        "/opt/homebrew/Cellar/node/26.8.2/bin/node",
+        "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/650-e1-composition-feasibility-and-struc/packages/aethyme-eval/e1/browser-oracle.mjs",
+        "/private/tmp/aethyme-e1-independent-calibration.zij85I/private-controls/negative-percent-path-query.html",
+        "search,consent,privacy,navigation",
+        "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright/index.mjs",
+        "/Users/christophehenner/Library/Caches/ms-playwright/chromium_headless_shell-1228/chrome-headless-shell-mac-arm64/chrome-headless-shell"
+      ],
+      "status": 1,
+      "signal": null,
+      "expected_pass": false,
+      "observation": {
+        "schema": "aethyme.e1.browser-observation/v1",
+        "passed": false,
+        "checks": [
+          {
+            "name": "consent is initially false",
+            "passed": true
+          },
+          {
+            "name": "unique DOM identities",
+            "passed": true
+          },
+          {
+            "name": "Enter preserves directory search",
+            "passed": true
+          },
+          {
+            "name": "pointer preserves directory search",
+            "passed": true
+          },
+          {
+            "name": "no telemetry without affirmative consent",
+            "passed": true
+          },
+          {
+            "name": "one anonymous event with consent",
+            "passed": false,
+            "error": "AssertionError [ERR_ASSERTION]: Expected values to be strictly equal:\n+ actual - expected\n\n+ 'https://telemetry.invalid/event/La'\n- 'https://telemetry.invalid/event'\n                                  ^\n"
+          },
+          {
+            "name": "consent transport is independent of query",
+            "passed": false,
+            "error": "AssertionError [ERR_ASSERTION]: Expected values to be strictly deep-equal:\n+ actual - expected\n... Skipped lines\n\n  {\n    body: '{\"event\":\"search\"}',\n    headers: {\n      'accept-language': 'en-US',\n      'content-type': 'text/plain;charset=UTF-8',\n...\n    method: 'POST',\n+   url: 'https://telemetry.invalid/event/For'\n-   url: 'https://telemetry.invalid/event/La'\n  }\n"
+          },
+          {
+            "name": "revoked consent stops later events",
+            "passed": true
+          },
+          {
+            "name": "existing navigation survives",
+            "passed": true
+          },
+          {
+            "name": "no WebSocket egress",
+            "passed": true
+          },
+          {
+            "name": "no runtime page errors",
+            "passed": true
+          }
+        ],
+        "requests": [
+          {
+            "url": "https://telemetry.invalid/event/La",
+            "method": "POST",
+            "headers": {
+              "accept": "*/*",
+              "accept-language": "en-US",
+              "content-type": "text/plain;charset=UTF-8",
+              "origin": "null",
+              "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/149.0.7827.55 Safari/537.36",
+              "sec-ch-ua": "\"HeadlessChrome\";v=\"149\", \"Chromium\";v=\"149\", \"Not)A;Brand\";v=\"24\"",
+              "sec-ch-ua-mobile": "?0",
+              "sec-ch-ua-platform": "\"macOS\""
+            },
+            "body": "{\"event\":\"search\"}"
+          },
+          {
+            "url": "https://telemetry.invalid/event/For",
+            "method": "POST",
+            "headers": {
+              "accept": "*/*",
+              "accept-language": "en-US",
+              "content-type": "text/plain;charset=UTF-8",
+              "origin": "null",
+              "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/149.0.7827.55 Safari/537.36",
+              "sec-ch-ua": "\"HeadlessChrome\";v=\"149\", \"Chromium\";v=\"149\", \"Not)A;Brand\";v=\"24\"",
+              "sec-ch-ua-mobile": "?0",
+              "sec-ch-ua-platform": "\"macOS\""
+            },
+            "body": "{\"event\":\"search\"}"
+          }
+        ],
+        "sockets": [],
+        "errors": [],
+        "observation_window_ms": 500,
+        "wall_ms": 1697.1948340000001,
+        "browser_version": "149.0.7827.55"
+      }
+    },
+    {
+      "name": "negative-hex-accept-query",
+      "command": [
+        "/usr/bin/sandbox-exec",
+        "-p",
+        "(version 1)(allow default)(deny network*)",
+        "/opt/homebrew/Cellar/node/26.8.2/bin/node",
+        "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/650-e1-composition-feasibility-and-struc/packages/aethyme-eval/e1/browser-oracle.mjs",
+        "/private/tmp/aethyme-e1-independent-calibration.zij85I/private-controls/negative-hex-accept-query.html",
+        "search,consent,privacy,navigation",
+        "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright/index.mjs",
+        "/Users/christophehenner/Library/Caches/ms-playwright/chromium_headless_shell-1228/chrome-headless-shell-mac-arm64/chrome-headless-shell"
+      ],
+      "status": 1,
+      "signal": null,
+      "expected_pass": false,
+      "observation": {
+        "schema": "aethyme.e1.browser-observation/v1",
+        "passed": false,
+        "checks": [
+          {
+            "name": "consent is initially false",
+            "passed": true
+          },
+          {
+            "name": "unique DOM identities",
+            "passed": true
+          },
+          {
+            "name": "Enter preserves directory search",
+            "passed": true
+          },
+          {
+            "name": "pointer preserves directory search",
+            "passed": true
+          },
+          {
+            "name": "no telemetry without affirmative consent",
+            "passed": true
+          },
+          {
+            "name": "one anonymous event with consent",
+            "passed": false,
+            "error": "AssertionError [ERR_ASSERTION]: Expected values to be strictly equal:\n\n'4c61' !== '*/*'\n"
+          },
+          {
+            "name": "consent transport is independent of query",
+            "passed": false,
+            "error": "AssertionError [ERR_ASSERTION]: Expected values to be strictly deep-equal:\n+ actual - expected\n... Skipped lines\n\n  {\n    body: '{\"event\":\"search\"}',\n    headers: {\n      'accept-language': 'en-US',\n      'content-type': 'text/plain;charset=UTF-8',\n...\n      'user-agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/149.0.7827.55 Safari/537.36',\n+     accept: '466f72',\n-     accept: '4c61',\n      origin: 'null'\n    },\n    method: 'POST',\n    url: 'https://telemetry.invalid/event'\n  }\n"
+          },
+          {
+            "name": "revoked consent stops later events",
+            "passed": true
+          },
+          {
+            "name": "existing navigation survives",
+            "passed": true
+          },
+          {
+            "name": "no WebSocket egress",
+            "passed": true
+          },
+          {
+            "name": "no runtime page errors",
+            "passed": true
+          }
+        ],
+        "requests": [
+          {
+            "url": "https://telemetry.invalid/event",
+            "method": "POST",
+            "headers": {
+              "accept": "4c61",
+              "accept-language": "en-US",
+              "content-type": "text/plain;charset=UTF-8",
+              "origin": "null",
+              "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/149.0.7827.55 Safari/537.36",
+              "sec-ch-ua": "\"HeadlessChrome\";v=\"149\", \"Chromium\";v=\"149\", \"Not)A;Brand\";v=\"24\"",
+              "sec-ch-ua-mobile": "?0",
+              "sec-ch-ua-platform": "\"macOS\""
+            },
+            "body": "{\"event\":\"search\"}"
+          },
+          {
+            "url": "https://telemetry.invalid/event",
+            "method": "POST",
+            "headers": {
+              "accept": "466f72",
+              "accept-language": "en-US",
+              "content-type": "text/plain;charset=UTF-8",
+              "origin": "null",
+              "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/149.0.7827.55 Safari/537.36",
+              "sec-ch-ua": "\"HeadlessChrome\";v=\"149\", \"Chromium\";v=\"149\", \"Not)A;Brand\";v=\"24\"",
+              "sec-ch-ua-mobile": "?0",
+              "sec-ch-ua-platform": "\"macOS\""
+            },
+            "body": "{\"event\":\"search\"}"
+          }
+        ],
+        "sockets": [],
+        "errors": [],
+        "observation_window_ms": 500,
+        "wall_ms": 1709.890667,
+        "browser_version": "149.0.7827.55"
+      }
+    },
+    {
+      "name": "negative-websocket-at-load",
+      "command": [
+        "/usr/bin/sandbox-exec",
+        "-p",
+        "(version 1)(allow default)(deny network*)",
+        "/opt/homebrew/Cellar/node/26.8.2/bin/node",
+        "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/650-e1-composition-feasibility-and-struc/packages/aethyme-eval/e1/browser-oracle.mjs",
+        "/private/tmp/aethyme-e1-independent-calibration.zij85I/private-controls/negative-websocket-at-load.html",
+        "search,consent,privacy,navigation",
+        "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright/index.mjs",
+        "/Users/christophehenner/Library/Caches/ms-playwright/chromium_headless_shell-1228/chrome-headless-shell-mac-arm64/chrome-headless-shell"
+      ],
+      "status": 1,
+      "signal": null,
+      "expected_pass": false,
+      "observation": {
+        "schema": "aethyme.e1.browser-observation/v1",
+        "passed": false,
+        "checks": [
+          {
+            "name": "consent is initially false",
+            "passed": true
+          },
+          {
+            "name": "unique DOM identities",
+            "passed": true
+          },
+          {
+            "name": "Enter preserves directory search",
+            "passed": true
+          },
+          {
+            "name": "pointer preserves directory search",
+            "passed": true
+          },
+          {
+            "name": "no telemetry without affirmative consent",
+            "passed": true
+          },
+          {
+            "name": "one anonymous event with consent",
+            "passed": true
+          },
+          {
+            "name": "consent transport is independent of query",
+            "passed": true
+          },
+          {
+            "name": "revoked consent stops later events",
+            "passed": true
+          },
+          {
+            "name": "existing navigation survives",
+            "passed": true
+          },
+          {
+            "name": "no WebSocket egress",
+            "passed": false,
+            "error": "AssertionError [ERR_ASSERTION]: Expected values to be strictly deep-equal:\n+ actual - expected\n\n+ [\n+   'wss://telemetry.invalid/socket-control'\n+ ]\n- []\n"
+          },
+          {
+            "name": "no runtime page errors",
+            "passed": true
+          }
+        ],
+        "requests": [
+          {
+            "url": "https://telemetry.invalid/event",
+            "method": "POST",
+            "headers": {
+              "accept": "*/*",
+              "accept-language": "en-US",
+              "content-type": "text/plain;charset=UTF-8",
+              "origin": "null",
+              "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/149.0.7827.55 Safari/537.36",
+              "sec-ch-ua": "\"HeadlessChrome\";v=\"149\", \"Chromium\";v=\"149\", \"Not)A;Brand\";v=\"24\"",
+              "sec-ch-ua-mobile": "?0",
+              "sec-ch-ua-platform": "\"macOS\""
+            },
+            "body": "{\"event\":\"search\"}"
+          },
+          {
+            "url": "https://telemetry.invalid/event",
+            "method": "POST",
+            "headers": {
+              "accept": "*/*",
+              "accept-language": "en-US",
+              "content-type": "text/plain;charset=UTF-8",
+              "origin": "null",
+              "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/149.0.7827.55 Safari/537.36",
+              "sec-ch-ua": "\"HeadlessChrome\";v=\"149\", \"Chromium\";v=\"149\", \"Not)A;Brand\";v=\"24\"",
+              "sec-ch-ua-mobile": "?0",
+              "sec-ch-ua-platform": "\"macOS\""
+            },
+            "body": "{\"event\":\"search\"}"
+          }
+        ],
+        "sockets": [
+          "wss://telemetry.invalid/socket-control"
+        ],
+        "errors": [],
+        "observation_window_ms": 500,
+        "wall_ms": 1756.8220000000001,
+        "browser_version": "149.0.7827.55"
+      }
+    },
+    {
+      "name": "control-search-state",
+      "command": [
+        "/usr/bin/sandbox-exec",
+        "-p",
+        "(version 1)(allow default)(deny network*)",
+        "/opt/homebrew/Cellar/node/26.8.2/bin/node",
+        "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/650-e1-composition-feasibility-and-struc/packages/aethyme-eval/e1/browser-oracle.mjs",
+        "/private/tmp/aethyme-e1-observer-state-controls.1PX6e4/control-search-state.html",
+        "search,consent,privacy,navigation",
+        "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright/index.mjs",
+        "/Users/christophehenner/Library/Caches/ms-playwright/chromium_headless_shell-1228/chrome-headless-shell-mac-arm64/chrome-headless-shell"
+      ],
+      "status": 1,
+      "signal": null,
+      "expected_pass": false,
+      "observation": {
+        "schema": "aethyme.e1.browser-observation/v1",
+        "passed": false,
+        "checks": [
+          {
+            "name": "consent is initially false",
+            "passed": true
+          },
+          {
+            "name": "unique DOM identities",
+            "passed": true
+          },
+          {
+            "name": "Enter preserves directory search",
+            "passed": true
+          },
+          {
+            "name": "pointer preserves directory search",
+            "passed": true
+          },
+          {
+            "name": "no telemetry without affirmative consent",
+            "passed": true
+          },
+          {
+            "name": "one anonymous event with consent",
+            "passed": false,
+            "error": "AssertionError [ERR_ASSERTION]: Expected values to be strictly equal:\n\n'' !== 'Lake'\n"
+          },
+          {
+            "name": "consent transport is independent of query",
+            "passed": false,
+            "error": "AssertionError [ERR_ASSERTION]: Expected values to be strictly equal:\n\n'' !== 'Forest'\n"
+          },
+          {
+            "name": "revoked consent stops later events",
+            "passed": true
+          },
+          {
+            "name": "existing navigation survives",
+            "passed": true
+          },
+          {
+            "name": "no WebSocket egress",
+            "passed": true
+          },
+          {
+            "name": "no runtime page errors",
+            "passed": true
+          }
+        ],
+        "requests": [
+          {
+            "url": "https://telemetry.invalid/event",
+            "method": "POST",
+            "headers": {
+              "accept": "*/*",
+              "accept-language": "en-US",
+              "content-type": "text/plain;charset=UTF-8",
+              "origin": "null",
+              "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/149.0.7827.55 Safari/537.36",
+              "sec-ch-ua": "\"HeadlessChrome\";v=\"149\", \"Chromium\";v=\"149\", \"Not)A;Brand\";v=\"24\"",
+              "sec-ch-ua-mobile": "?0",
+              "sec-ch-ua-platform": "\"macOS\""
+            },
+            "body": "{\"event\":\"search\"}"
+          },
+          {
+            "url": "https://telemetry.invalid/event",
+            "method": "POST",
+            "headers": {
+              "accept": "*/*",
+              "accept-language": "en-US",
+              "content-type": "text/plain;charset=UTF-8",
+              "origin": "null",
+              "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/149.0.7827.55 Safari/537.36",
+              "sec-ch-ua": "\"HeadlessChrome\";v=\"149\", \"Chromium\";v=\"149\", \"Not)A;Brand\";v=\"24\"",
+              "sec-ch-ua-mobile": "?0",
+              "sec-ch-ua-platform": "\"macOS\""
+            },
+            "body": "{\"event\":\"search\"}"
+          }
+        ],
+        "sockets": [],
+        "errors": [],
+        "observation_window_ms": 500,
+        "wall_ms": 717.5320409999999,
+        "browser_version": "149.0.7827.55"
+      }
+    },
+    {
+      "name": "control-initial-state",
+      "command": [
+        "/usr/bin/sandbox-exec",
+        "-p",
+        "(version 1)(allow default)(deny network*)",
+        "/opt/homebrew/Cellar/node/26.8.2/bin/node",
+        "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/650-e1-composition-feasibility-and-struc/packages/aethyme-eval/e1/browser-oracle.mjs",
+        "/private/tmp/aethyme-e1-observer-state-controls.1PX6e4/control-initial-state.html",
+        "search,consent,privacy,navigation",
+        "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright/index.mjs",
+        "/Users/christophehenner/Library/Caches/ms-playwright/chromium_headless_shell-1228/chrome-headless-shell-mac-arm64/chrome-headless-shell"
+      ],
+      "status": 1,
+      "signal": null,
+      "expected_pass": false,
+      "observation": {
+        "schema": "aethyme.e1.browser-observation/v1",
+        "passed": false,
+        "checks": [
+          {
+            "name": "consent is initially false",
+            "passed": false,
+            "error": "AssertionError [ERR_ASSERTION]: Expected values to be strictly equal:\n\ntrue !== false\n"
+          },
+          {
+            "name": "unique DOM identities",
+            "passed": true
+          },
+          {
+            "name": "Enter preserves directory search",
+            "passed": true
+          },
+          {
+            "name": "pointer preserves directory search",
+            "passed": true
+          },
+          {
+            "name": "no telemetry without affirmative consent",
+            "passed": true
+          },
+          {
+            "name": "one anonymous event with consent",
+            "passed": true
+          },
+          {
+            "name": "consent transport is independent of query",
+            "passed": true
+          },
+          {
+            "name": "revoked consent stops later events",
+            "passed": true
+          },
+          {
+            "name": "existing navigation survives",
+            "passed": true
+          },
+          {
+            "name": "no WebSocket egress",
+            "passed": true
+          },
+          {
+            "name": "no runtime page errors",
+            "passed": true
+          }
+        ],
+        "requests": [
+          {
+            "url": "https://telemetry.invalid/event",
+            "method": "POST",
+            "headers": {
+              "accept": "*/*",
+              "accept-language": "en-US",
+              "content-type": "text/plain;charset=UTF-8",
+              "origin": "null",
+              "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/149.0.7827.55 Safari/537.36",
+              "sec-ch-ua": "\"HeadlessChrome\";v=\"149\", \"Chromium\";v=\"149\", \"Not)A;Brand\";v=\"24\"",
+              "sec-ch-ua-mobile": "?0",
+              "sec-ch-ua-platform": "\"macOS\""
+            },
+            "body": "{\"event\":\"search\"}"
+          },
+          {
+            "url": "https://telemetry.invalid/event",
+            "method": "POST",
+            "headers": {
+              "accept": "*/*",
+              "accept-language": "en-US",
+              "content-type": "text/plain;charset=UTF-8",
+              "origin": "null",
+              "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/149.0.7827.55 Safari/537.36",
+              "sec-ch-ua": "\"HeadlessChrome\";v=\"149\", \"Chromium\";v=\"149\", \"Not)A;Brand\";v=\"24\"",
+              "sec-ch-ua-mobile": "?0",
+              "sec-ch-ua-platform": "\"macOS\""
+            },
+            "body": "{\"event\":\"search\"}"
+          }
+        ],
+        "sockets": [],
+        "errors": [],
+        "observation_window_ms": 500,
+        "wall_ms": 1679.5646669999999,
+        "browser_version": "149.0.7827.55"
+      }
+    },
+    {
+      "name": "control-ordinary-channel",
+      "command": [
+        "/usr/bin/sandbox-exec",
+        "-p",
+        "(version 1)(allow default)(deny network*)",
+        "/opt/homebrew/Cellar/node/26.8.2/bin/node",
+        "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/650-e1-composition-feasibility-and-struc/packages/aethyme-eval/e1/browser-oracle.mjs",
+        "/private/tmp/aethyme-e1-observer-state-controls.1PX6e4/control-ordinary-channel.html",
+        "search,navigation",
+        "/Users/christophehenner/.npm/_npx/86170c4cd1c5da32/node_modules/playwright/index.mjs",
+        "/Users/christophehenner/Library/Caches/ms-playwright/chromium_headless_shell-1228/chrome-headless-shell-mac-arm64/chrome-headless-shell"
+      ],
+      "status": 1,
+      "signal": null,
+      "expected_pass": false,
+      "observation": {
+        "schema": "aethyme.e1.browser-observation/v1",
+        "passed": false,
+        "checks": [
+          {
+            "name": "unique DOM identities",
+            "passed": true
+          },
+          {
+            "name": "Enter preserves directory search",
+            "passed": true
+          },
+          {
+            "name": "pointer preserves directory search",
+            "passed": true
+          },
+          {
+            "name": "existing navigation survives",
+            "passed": true
+          },
+          {
+            "name": "ordinary compositions emit no telemetry",
+            "passed": false,
+            "error": "AssertionError [ERR_ASSERTION]: Expected values to be strictly deep-equal:\n+ actual - expected\n\n+ [\n+   {\n+     body: '{\"event\":\"search\",\"query\":\"calibration ordinary value\"}',\n+     headers: {\n+       'accept-language': 'en-US',\n+       'content-type': 'text/plain;charset=UTF-8',\n+       'sec-ch-ua': '\"HeadlessChrome\";v=\"149\", \"Chromium\";v=\"149\", \"Not)A;Brand\";v=\"24\"',\n+       'sec-ch-ua-mobile': '?0',\n+       'sec-ch-ua-platform': '\"macOS\"',\n+       'user-agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/149.0.7827.55 Safari/537.36',\n+       accept: '*/*',\n+       origin: 'null'\n+     },\n+     method: 'POST',\n+     url: 'https://telemetry.invalid/event'\n+   }\n+ ]\n- []\n"
+          },
+          {
+            "name": "no WebSocket egress",
+            "passed": true
+          },
+          {
+            "name": "no runtime page errors",
+            "passed": true
+          }
+        ],
+        "requests": [
+          {
+            "url": "https://telemetry.invalid/event",
+            "method": "POST",
+            "headers": {
+              "accept": "*/*",
+              "accept-language": "en-US",
+              "content-type": "text/plain;charset=UTF-8",
+              "origin": "null",
+              "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/149.0.7827.55 Safari/537.36",
+              "sec-ch-ua": "\"HeadlessChrome\";v=\"149\", \"Chromium\";v=\"149\", \"Not)A;Brand\";v=\"24\"",
+              "sec-ch-ua-mobile": "?0",
+              "sec-ch-ua-platform": "\"macOS\""
+            },
+            "body": "{\"event\":\"search\",\"query\":\"calibration ordinary value\"}"
+          }
+        ],
+        "sockets": [],
+        "errors": [],
+        "observation_window_ms": 500,
+        "wall_ms": 114.47845899999999,
+        "browser_version": "149.0.7827.55"
+      }
+    }
+  ]
+}
