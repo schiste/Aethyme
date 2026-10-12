@@ -140,6 +140,8 @@ fn backing_available(root: &Path) -> std::io::Result<u64> {
     // SAFETY: integer-only statvfs is zero-initializable; the live descriptor
     // and writable output remain valid throughout this synchronous call.
     let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    // SAFETY: directory owns a live descriptor and stat is a valid writable
+    // output pointer for the duration of this synchronous native call.
     if unsafe { libc::fstatvfs(directory.as_raw_fd(), &mut stat) } != 0 {
         return Err(std::io::Error::last_os_error());
     }
