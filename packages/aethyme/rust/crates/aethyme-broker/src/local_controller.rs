@@ -16,7 +16,7 @@ use crate::local_wave::{self as wave, WavePhase};
 
 pub mod drive;
 pub use drive::{DrivePolicy, DriveResult, drive};
-pub(crate) mod bare_destination;
+pub mod bare_destination;
 pub mod service;
 pub use service::{ServiceOutcome, ServicePolicy, ServiceReport, serve};
 
