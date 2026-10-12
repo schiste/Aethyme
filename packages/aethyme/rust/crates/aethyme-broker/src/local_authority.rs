@@ -10,7 +10,7 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs::File;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 // A 4096-byte reason/detail may require six JSON bytes per escaped byte.
@@ -88,7 +88,28 @@ fn prepare(path: &Path) -> Result<(), AuthorityError> {
     Ok(())
 }
 fn read(path: &Path) -> Result<Witness, AuthorityError> {
-    let bytes = std::fs::read(path.join("witness.json"))?;
+    let witness = path.join("witness.json");
+    if !std::fs::symlink_metadata(&witness)?.file_type().is_file() {
+        return Err(AuthorityError::Invalid(
+            "witness must be a regular file".into(),
+        ));
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = options.open(&witness)?;
+    if !file.metadata()?.is_file() {
+        return Err(AuthorityError::Invalid(
+            "witness must be a regular file".into(),
+        ));
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_FILE_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)?;
     if bytes.len() > MAX_FILE_BYTES {
         return Err(AuthorityError::Invalid("witness size".into()));
     }
@@ -204,6 +225,48 @@ pub(crate) fn guard(store: &CollaborationStore, epoch: &Epoch) -> Result<Guard, 
 /// Reading status grants no mutation authority.
 pub fn status(store: &CollaborationStore) -> Result<Witness, AuthorityError> {
     read(&directory(store)?)
+}
+
+/// Historical status only. Serialized observation cannot acquire a guard.
+#[derive(Debug, Serialize)]
+pub(crate) struct AuthorityObservation {
+    pub state: &'static str,
+    pub witness: Option<Witness>,
+    pub bound_epoch: Option<String>,
+    pub binding_matches: bool,
+}
+/// Inspect a checked read-only snapshot without initializing authority, opening
+/// an ingress lock, changing pragmas, or creating files. Concurrent changes can
+/// make this observation stale; the mutation APIs still require their guards.
+pub(crate) fn inspect(
+    snapshot: &crate::collaboration_state::CollaborationSnapshot,
+) -> Result<AuthorityObservation, AuthorityError> {
+    let binding = if snapshot.has_table("local_authority_state") {
+        bound(snapshot.connection())?
+    } else {
+        None
+    };
+    let witness = match read(&directory_for(&snapshot.project_dir)?) {
+        Ok(witness) => Some(witness),
+        Err(AuthorityError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error),
+    };
+    let binding_matches = witness
+        .as_ref()
+        .is_some_and(|w| binding.as_ref() == Some(&w.epoch));
+    let state = match (&witness, &binding) {
+        (None, None) => "unbound",
+        (None, Some(_)) => "witness_missing",
+        (Some(w), _) if w.status == Status::Frozen => "frozen",
+        (Some(_), _) if binding_matches => "active",
+        (Some(_), _) => "drift",
+    };
+    Ok(AuthorityObservation {
+        state,
+        witness,
+        bound_epoch: binding.map(|epoch| epoch.0),
+        binding_matches,
+    })
 }
 
 // Stream a stable checkpoint of authority, roots, wave and budget ledgers.

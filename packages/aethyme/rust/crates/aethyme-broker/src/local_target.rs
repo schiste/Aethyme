@@ -301,9 +301,9 @@ pub fn acquire_controller(
     target: &str,
     issuer: &str,
 ) -> Result<ControllerOwner, TargetError> {
-    let (epoch, _authority) = crate::local_authority::acquire(store)?;
     nonempty(target, "target")?;
     nonempty(issuer, "issuer")?;
+    let (epoch, _authority) = crate::local_authority::acquire(store)?;
     let locks = store.project_dir().join("controller-locks");
     std::fs::create_dir_all(&locks)?;
     crate::host_state::protect_host_state_path(&locks, true)?;
@@ -426,14 +426,12 @@ fn require_snapshot(store: &CollaborationStore, value: &str) -> Result<(), Targe
     Ok(())
 }
 
-/// Persist a proposal and retention roots in one transaction. It does not
-/// select it or change a running target. Repeating identical input is idempotent.
-pub fn propose_revision(
-    store: &mut CollaborationStore,
-    owner: &ControllerOwner,
+/// Validate operator input and retained subjects before a new appointment.
+/// This is a bounded preflight observation; publication rechecks under guards.
+pub(crate) fn validate_proposal(
+    store: &CollaborationStore,
     spec: TargetSpec,
-) -> Result<TargetRevision, TargetError> {
-    let _authority = authorize(store, owner)?;
+) -> Result<TargetSpec, TargetError> {
     let spec = normalize(spec)?;
     let _archive = archive_use(store)?;
     require_snapshot(store, &spec.baseline)?;
@@ -459,6 +457,19 @@ pub fn propose_revision(
     )? {
         return Err(TargetError::SelectionRefused { reason, detail });
     }
+    Ok(spec)
+}
+
+/// Persist a proposal and retention roots in one transaction. It does not
+/// select it or change a running target. Repeating identical input is idempotent.
+pub fn propose_revision(
+    store: &mut CollaborationStore,
+    owner: &ControllerOwner,
+    spec: TargetSpec,
+) -> Result<TargetRevision, TargetError> {
+    let _authority = authorize(store, owner)?;
+    let _archive = archive_use(store)?;
+    let spec = validate_proposal(store, spec)?;
     let record = Record::decode(&serde_json::to_vec(&serde_json::json!({
         "schema": TARGET_REVISION_SCHEMA_NAME, "target": owner.target, "issuer": owner.issuer, "spec": spec,
     }))?, &[&TARGET_REVISION_SCHEMA]).map_err(|e| TargetError::Invalid(e.to_string()))?;

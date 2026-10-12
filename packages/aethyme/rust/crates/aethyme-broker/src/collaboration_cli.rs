@@ -2,7 +2,8 @@
 //! §6.7-6.8; D18, D32). This first slice covers what the L2/L3 packages
 //! provide: inspection, capture recovery, reclamation, context retrieval,
 //! decision briefs and explicit enrollment. Target, sync, handoff, stop and
-//! export arrive with the packages that implement them, and are not listed.
+//! export are extended by the lifecycle slice below; unavailable native profiles
+//! refuse without dispatching work.
 //!
 //! - **Disabled by default.** Collaboration is enabled exactly when the
 //!   repository's `[collaboration] capture` is `advisory` or `required` with
@@ -39,6 +40,9 @@ use crate::collaboration_state::{
 };
 use crate::collaboration_submit::{Setting, setting};
 use crate::exit_status;
+
+#[path = "collaboration_cli/lifecycle.rs"]
+mod lifecycle;
 
 pub const STATUS_SCHEMA: &str = "aethyme.collab-status/experimental-v0";
 pub const CAPTURE_RECOVER_SCHEMA: &str = "aethyme.collab-capture-recover/experimental-v0";
@@ -104,6 +108,38 @@ Usage:
   aethyme collab brief attach --contribution <record-id> <decision-file> [--json]
       Attach a decision brief (aethyme-brief-tokens/v0, at most 150 tokens) to
       a retained contribution, replacing an earlier one.
+
+Additional explicit lifecycle commands (provisional Local packages):
+  aethyme collab authority status [--json]
+      Read the native epoch/witness and ledger binding without changing state.
+      Observation grants no authority; unbound, frozen and drift remain distinct.
+  aethyme collab target status --target NAME [--json]
+      Existing target revision, issuer, phase and version. Read-only.
+  aethyme collab target propose --target NAME --issuer NAME --file PATH [--json]
+      Strict regular-file TargetSpec, at most 256 KiB. Only valid explicit
+      proposals may appoint a new target; no selection or dispatch follows.
+  aethyme collab target select --target NAME --issuer NAME --revision ID [--json]
+      Select an existing immutable revision. Active waves/budgets refuse.
+  aethyme collab target hold --target NAME --issuer NAME --version N [--json]
+      Hold an active phase waiting for operator input at the exact version.
+  aethyme collab target resume --target NAME --issuer NAME --version N [--json]
+      Resume the recorded held phase, without skipping checks.
+  aethyme collab stop --epoch EPOCH --reason TEXT [--json]
+      Freeze project ingress and rotate native authority. Running processes
+      and external effects are not assumed cancelled; reconcile them.
+  aethyme collab export --target NAME --issuer NAME --source ID [--source ID...]
+                       [--record ID@sha256:HEX...] --audience NAME --output PATH [--json]
+      Closed source/advisory historical bundle. Exclusive private output;
+      never overwrites, releases retained source or restores authority.
+  aethyme collab handoff show --id ID [--json]
+      Verify a retained request and display historical state/receipt IDs.
+      Opens existing state (which may migrate it); grants no current agent guard.
+  aethyme collab sync status [--json]
+      Read local exchange bookkeeping, with no remote delivery/source promise.
+  aethyme collab target run / sync / handoff dispatch
+      Refused with unsupported_profile: this CLI has no qualified appointed
+      execution, remote peer or agent adapter. No state or argument file is read.
+      Native gate integration and structural composition qualification are pending.
 
 Exit codes: 0 done, 1 failed (I/O, database, Git, or an integrity failure
 such as a corrupt object or receipt), 2 usage, 3 refused (disabled, policy,
@@ -290,8 +326,31 @@ pub fn run(args: &[String]) -> u8 {
 /// read before the first flag, so no path or argument value is echoed.
 fn command_name(args: &[String]) -> String {
     const VERBS: &[&str] = &[
-        "status", "enroll", "capture", "recover", "abort", "receipt", "gc", "plan", "apply",
-        "resume", "context", "brief", "attach",
+        "status",
+        "enroll",
+        "capture",
+        "recover",
+        "abort",
+        "receipt",
+        "gc",
+        "plan",
+        "apply",
+        "resume",
+        "context",
+        "brief",
+        "attach",
+        "target",
+        "propose",
+        "select",
+        "hold",
+        "run",
+        "authority",
+        "stop",
+        "export",
+        "handoff",
+        "show",
+        "dispatch",
+        "sync",
     ];
     let words: Vec<&str> = args
         .iter()
@@ -334,6 +393,21 @@ fn dispatch(options: Options) -> Result<Output, Failure> {
         ["gc", "resume"] => gc_resume_command(&main_root),
         ["context", rest @ ..] => context(&main_root, rest),
         ["brief", "attach", rest @ ..] => brief_attach(&main_root, rest),
+        ["authority", "status", rest @ ..] => lifecycle::authority_status(&main_root, rest),
+        ["target", "status", rest @ ..] => lifecycle::target_status(&main_root, rest),
+        [
+            "target",
+            verb @ ("propose" | "select" | "hold" | "resume"),
+            rest @ ..,
+        ] => lifecycle::target_change(&main_root, verb, rest),
+        ["stop", rest @ ..] => lifecycle::stop(&main_root, rest),
+        ["export", rest @ ..] => lifecycle::export(&main_root, rest),
+        ["handoff", "show", rest @ ..] => lifecycle::handoff_show(&main_root, rest),
+        ["sync", "status", rest @ ..] => lifecycle::sync_status(&main_root, rest),
+        ["target", "run", ..] | ["sync", ..] | ["handoff", "dispatch", ..] => {
+            Err(lifecycle::unsupported())
+        }
+
         _ => Err(Failure::usage(format!(
             "unknown collab command `{}`",
             options.rest.join(" ")

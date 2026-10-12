@@ -1,0 +1,999 @@
+{
+  "schema": "aethyme.local.cli-qualification/provisional-v0",
+  "complete_local_qualification": false,
+  "issue": 680,
+  "draft_pr": 753,
+  "tested_source": "ece13cebd381ada85fa649a40b6b0e38eec209fb",
+  "tested_tree": "75a1f778e16da5d160b1cf7115411c59b8487e02",
+  "profile": "explicit-local-cli/provisional-v0",
+  "restored_commands": {
+    "schema": "aethyme.local.qualification.commands/provisional-v0",
+    "complete_local_qualification": false,
+    "profile": "restored-local-cli-selections/provisional-v0",
+    "source_commit": "ece13cebd381ada85fa649a40b6b0e38eec209fb",
+    "source_tree": "75a1f778e16da5d160b1cf7115411c59b8487e02",
+    "environment": {
+      "RUSTC_WRAPPER": "",
+      "CARGO_TARGET_DIR": "/private/tmp/aethyme-l5-cargo"
+    },
+    "limitations": [
+      "explicit finite Playground profile only",
+      "not live GitHub/Mergify or native gate evidence",
+      "provisional composition depends on separately owned E1"
+    ],
+    "rows": [
+      {
+        "name": "router",
+        "argv": [
+          "cargo",
+          "test",
+          "--locked",
+          "-j",
+          "4",
+          "--manifest-path",
+          "packages/aethyme/rust/Cargo.toml",
+          "-p",
+          "aethyme-cli",
+          "--test",
+          "collab_cli",
+          "--",
+          "--test-threads=4"
+        ],
+        "exit_status": 0,
+        "signal": null,
+        "output_bytes": 2302,
+        "output_sha256": "0e0bd777d3a27b6e4200273b38857e0422133a48a896233c598a41f5497b2e35",
+        "output_file": "router.log",
+        "counts": {
+          "passed": 18,
+          "failed": 0,
+          "ignored": 0
+        },
+        "credited": true
+      },
+      {
+        "name": "help",
+        "argv": [
+          "cargo",
+          "test",
+          "--locked",
+          "-j",
+          "4",
+          "--manifest-path",
+          "packages/aethyme/rust/Cargo.toml",
+          "-p",
+          "aethyme-cli",
+          "--test",
+          "help_snapshots",
+          "--",
+          "--test-threads=4"
+        ],
+        "exit_status": 0,
+        "signal": null,
+        "output_bytes": 544,
+        "output_sha256": "cf4dc9f559692b79690f51f7ee573c1067a212afc9ed4f798a23ebd6f194d05f",
+        "output_file": "help.log",
+        "counts": {
+          "passed": 1,
+          "failed": 0,
+          "ignored": 0
+        },
+        "credited": true
+      },
+      {
+        "name": "local",
+        "argv": [
+          "cargo",
+          "test",
+          "--locked",
+          "-j",
+          "4",
+          "--manifest-path",
+          "packages/aethyme/rust/Cargo.toml",
+          "-p",
+          "aethyme-broker",
+          "--lib",
+          "local_",
+          "--",
+          "--test-threads=4"
+        ],
+        "exit_status": 0,
+        "signal": null,
+        "output_bytes": 23131,
+        "output_sha256": "b34d0dcba18ad693703dfdb3d37dad5e18ec9a0a50c3a232fe4d92f8c5f957a5",
+        "output_file": "local.log",
+        "counts": {
+          "passed": 207,
+          "failed": 0,
+          "ignored": 7
+        },
+        "credited": true
+      },
+      {
+        "name": "collaboration",
+        "argv": [
+          "cargo",
+          "test",
+          "--locked",
+          "-j",
+          "4",
+          "--manifest-path",
+          "packages/aethyme/rust/Cargo.toml",
+          "-p",
+          "aethyme-broker",
+          "--lib",
+          "collaboration_",
+          "--",
+          "--test-threads=4"
+        ],
+        "exit_status": 0,
+        "signal": null,
+        "output_bytes": 16242,
+        "output_sha256": "2ad0d7c4e19368b67014aa888d927c9e3ac0daf62027e21fdd39730580c4e065",
+        "output_file": "collaboration.log",
+        "counts": {
+          "passed": 160,
+          "failed": 0,
+          "ignored": 4
+        },
+        "credited": true
+      },
+      {
+        "name": "snapshot",
+        "argv": [
+          "cargo",
+          "test",
+          "--locked",
+          "-j",
+          "4",
+          "--manifest-path",
+          "packages/aethyme/rust/Cargo.toml",
+          "-p",
+          "aethyme-broker",
+          "--lib",
+          "execution_snapshot::tests",
+          "--",
+          "--test-threads=4"
+        ],
+        "exit_status": 0,
+        "signal": null,
+        "output_bytes": 1648,
+        "output_sha256": "0083d073ca24346ca8a8fb34bc8687daa2daaf6844185a5c0ad8973b1ab7f099",
+        "output_file": "snapshot.log",
+        "counts": {
+          "passed": 14,
+          "failed": 0,
+          "ignored": 0
+        },
+        "credited": true
+      },
+      {
+        "name": "verifier",
+        "argv": [
+          "cargo",
+          "test",
+          "--locked",
+          "-j",
+          "4",
+          "--manifest-path",
+          "packages/aethyme/rust/Cargo.toml",
+          "-p",
+          "aethyme-broker",
+          "--lib",
+          "execution_verifier::tests",
+          "--",
+          "--test-threads=4"
+        ],
+        "exit_status": 0,
+        "signal": null,
+        "output_bytes": 1491,
+        "output_sha256": "c8bc26f19f867526ee1c72a12f5bc1e45ca5d5d69a74e5246c8f6e4eb56907c0",
+        "output_file": "verifier.log",
+        "counts": {
+          "passed": 10,
+          "failed": 0,
+          "ignored": 1
+        },
+        "credited": true
+      },
+      {
+        "name": "resources",
+        "argv": [
+          "cargo",
+          "test",
+          "--locked",
+          "-j",
+          "4",
+          "--manifest-path",
+          "packages/aethyme/rust/Cargo.toml",
+          "-p",
+          "aethyme-broker",
+          "--lib",
+          "execution_resources::tests",
+          "--",
+          "--test-threads=4"
+        ],
+        "exit_status": 0,
+        "signal": null,
+        "output_bytes": 1515,
+        "output_sha256": "2ed12c5c3d7aa6adb4a02e3f507def103b7efb8edf92fa65f66607f19d7cf09e",
+        "output_file": "resources.log",
+        "counts": {
+          "passed": 10,
+          "failed": 0,
+          "ignored": 1
+        },
+        "credited": true
+      },
+      {
+        "name": "review",
+        "argv": [
+          "cargo",
+          "test",
+          "--locked",
+          "-j",
+          "4",
+          "--manifest-path",
+          "packages/aethyme/rust/Cargo.toml",
+          "-p",
+          "aethyme-broker",
+          "--lib",
+          "review::tests",
+          "--",
+          "--test-threads=4"
+        ],
+        "exit_status": 0,
+        "signal": null,
+        "output_bytes": 1398,
+        "output_sha256": "badf699a5c547b0485730c9de4a22ce10b5a29fe17975888bf66af3ea2bab075",
+        "output_file": "review.log",
+        "counts": {
+          "passed": 14,
+          "failed": 0,
+          "ignored": 0
+        },
+        "credited": true
+      },
+      {
+        "name": "ship",
+        "argv": [
+          "cargo",
+          "test",
+          "--locked",
+          "-j",
+          "4",
+          "--manifest-path",
+          "packages/aethyme/rust/Cargo.toml",
+          "-p",
+          "aethyme-broker",
+          "--lib",
+          "ship::tests",
+          "--",
+          "--test-threads=4"
+        ],
+        "exit_status": 0,
+        "signal": null,
+        "output_bytes": 1117,
+        "output_sha256": "3642fc164ce439c9085384459b96e49907850fcf7674579af39ff08e6f49f9b5",
+        "output_file": "ship.log",
+        "counts": {
+          "passed": 10,
+          "failed": 0,
+          "ignored": 0
+        },
+        "credited": true
+      },
+      {
+        "name": "git",
+        "argv": [
+          "cargo",
+          "test",
+          "--locked",
+          "-j",
+          "4",
+          "--manifest-path",
+          "packages/aethyme/rust/Cargo.toml",
+          "-p",
+          "aethyme-broker",
+          "--lib",
+          "git::",
+          "--",
+          "--test-threads=4"
+        ],
+        "exit_status": 0,
+        "signal": null,
+        "output_bytes": 3439,
+        "output_sha256": "b91f90aab76a82f4f385ebadf8db1feb2ed8e82f88f3f0bf9cdf9d80649d9e84",
+        "output_file": "git.log",
+        "counts": {
+          "passed": 36,
+          "failed": 0,
+          "ignored": 0
+        },
+        "credited": true
+      },
+      {
+        "name": "composer",
+        "argv": [
+          "cargo",
+          "test",
+          "--locked",
+          "-j",
+          "4",
+          "--manifest-path",
+          "packages/aethyme/rust/Cargo.toml",
+          "-p",
+          "aethyme-broker",
+          "--lib",
+          "composer::tests",
+          "--",
+          "--test-threads=4"
+        ],
+        "exit_status": 0,
+        "signal": null,
+        "output_bytes": 901,
+        "output_sha256": "9afe556e214821f82969a220ee849374e1049bb10805bdf7b7ce3dc3497fad00",
+        "output_file": "composer.log",
+        "counts": {
+          "passed": 8,
+          "failed": 0,
+          "ignored": 0
+        },
+        "credited": true
+      },
+      {
+        "name": "resolution",
+        "argv": [
+          "cargo",
+          "test",
+          "--locked",
+          "-j",
+          "4",
+          "--manifest-path",
+          "packages/aethyme/rust/Cargo.toml",
+          "-p",
+          "aethyme-broker",
+          "--test",
+          "resolution_boundaries",
+          "--",
+          "--test-threads=4"
+        ],
+        "exit_status": 0,
+        "signal": null,
+        "output_bytes": 1609,
+        "output_sha256": "6653e67d4d138f315cd5d4ef948b82ce995440e78a6aadfaf1aa4ee5fe922440",
+        "output_file": "resolution.log",
+        "counts": {
+          "passed": 18,
+          "failed": 0,
+          "ignored": 0
+        },
+        "credited": true
+      },
+      {
+        "name": "discarded",
+        "argv": [
+          "cargo",
+          "test",
+          "--locked",
+          "-j",
+          "4",
+          "--manifest-path",
+          "packages/aethyme/rust/Cargo.toml",
+          "-p",
+          "aethyme-testkit",
+          "--test",
+          "broker_discarded_results",
+          "--",
+          "--test-threads=4"
+        ],
+        "exit_status": 0,
+        "signal": null,
+        "output_bytes": 708,
+        "output_sha256": "364fd82b00fda683508c96b410479a47e364f97dfa500387b07e82af66053a63",
+        "output_file": "discarded.log",
+        "counts": {
+          "passed": 3,
+          "failed": 0,
+          "ignored": 0
+        },
+        "credited": true
+      },
+      {
+        "name": "deprecated",
+        "argv": [
+          "cargo",
+          "test",
+          "--locked",
+          "-j",
+          "4",
+          "--manifest-path",
+          "packages/aethyme/rust/Cargo.toml",
+          "-p",
+          "aethyme-testkit",
+          "--test",
+          "deprecated_spelling_callers",
+          "--",
+          "--test-threads=4"
+        ],
+        "exit_status": 0,
+        "signal": null,
+        "output_bytes": 806,
+        "output_sha256": "26db906885164950ad971271e8643df753d1e06a1135644139bbf0746b793269",
+        "output_file": "deprecated.log",
+        "counts": {
+          "passed": 4,
+          "failed": 0,
+          "ignored": 0
+        },
+        "credited": true
+      },
+      {
+        "name": "docs",
+        "argv": [
+          "cargo",
+          "test",
+          "--locked",
+          "-j",
+          "4",
+          "--manifest-path",
+          "packages/aethyme/rust/Cargo.toml",
+          "-p",
+          "aethyme-testkit",
+          "--test",
+          "docs_hygiene",
+          "--",
+          "--test-threads=4"
+        ],
+        "exit_status": 0,
+        "signal": null,
+        "output_bytes": 1046,
+        "output_sha256": "a6d70854a01afa33e2463ebe57954f66bbf2a318cfb4f68c171c84dbbb167e4b",
+        "output_file": "docs.log",
+        "counts": {
+          "passed": 14,
+          "failed": 0,
+          "ignored": 0
+        },
+        "credited": true
+      },
+      {
+        "name": "aethyme-broker-clippy",
+        "argv": [
+          "cargo",
+          "clippy",
+          "--locked",
+          "-j",
+          "4",
+          "--manifest-path",
+          "packages/aethyme/rust/Cargo.toml",
+          "-p",
+          "aethyme-broker",
+          "--lib",
+          "--tests",
+          "--",
+          "-D",
+          "warnings"
+        ],
+        "exit_status": 0,
+        "signal": null,
+        "output_bytes": 2018,
+        "output_sha256": "43cf2f57407bee90e63bc142967b77b8c5d75a7ada49ee51cbf128b3a5764d23",
+        "output_file": "aethyme-broker-clippy.log",
+        "counts": null,
+        "credited": null
+      },
+      {
+        "name": "aethyme-cli-clippy",
+        "argv": [
+          "cargo",
+          "clippy",
+          "--locked",
+          "-j",
+          "4",
+          "--manifest-path",
+          "packages/aethyme/rust/Cargo.toml",
+          "-p",
+          "aethyme-cli",
+          "--lib",
+          "--tests",
+          "--",
+          "-D",
+          "warnings"
+        ],
+        "exit_status": 101,
+        "signal": null,
+        "output_bytes": 57,
+        "output_sha256": "06a861d262d40668e635c8bf4ae3219ca0fe045bdd14a46b119b502cc21c85a1",
+        "output_file": "aethyme-cli-clippy.log",
+        "counts": null,
+        "credited": false
+      }
+    ],
+    "evidence_directory": "/var/folders/f2/krjzd4c15nn491pm37zrkp1h0000gn/T/aethyme-1098-qualification-20261012-22758-ybaza8"
+  },
+  "restored_summary": {
+    "passing_selected_executions": 527,
+    "ignored": 13,
+    "failed": 0,
+    "unique_tests_claimed": false,
+    "strict_clippy_commands": 2
+  },
+  "guard_removals": {
+    "source_commit": "ece13cebd381ada85fa649a40b6b0e38eec209fb",
+    "rows": [
+      {
+        "name": "label-order",
+        "file": "packages/aethyme/rust/crates/aethyme-broker/src/local_target.rs",
+        "test": "collaboration_cli::lifecycle::tests::whitespace_operator_labels_cannot_initialize_native_authority",
+        "argv": [
+          "cargo",
+          "test",
+          "--locked",
+          "-j",
+          "4",
+          "--manifest-path",
+          "packages/aethyme/rust/Cargo.toml",
+          "-p",
+          "aethyme-broker",
+          "--lib",
+          "collaboration_cli::lifecycle::tests::whitespace_operator_labels_cannot_initialize_native_authority",
+          "--",
+          "--exact",
+          "--test-threads=1",
+          "--nocapture"
+        ],
+        "exit_status": 101,
+        "signal": null,
+        "output_sha256": "2f9bec8547becc3a0d04c61f9dcd5464c422691ffebab386d642a9bc9617b01f",
+        "output_bytes": 1410,
+        "mutated_source_sha256": "6e7849b15a322267de03442bc797dc1356f69889f0166e0843c79080ad2afee3",
+        "intended_assertion": "invalid labels must not initialize authority",
+        "counts": {
+          "passed": 0,
+          "failed": 1,
+          "ignored": 0
+        }
+      },
+      {
+        "name": "sync-profile",
+        "file": "packages/aethyme/rust/crates/aethyme-broker/src/collaboration_cli.rs",
+        "test": "unavailable_lifecycle_adapters_refuse_without_state_creation",
+        "argv": [
+          "cargo",
+          "test",
+          "--locked",
+          "-j",
+          "4",
+          "--manifest-path",
+          "packages/aethyme/rust/Cargo.toml",
+          "-p",
+          "aethyme-cli",
+          "--test",
+          "collab_cli",
+          "unavailable_lifecycle_adapters_refuse_without_state_creation",
+          "--",
+          "--exact",
+          "--test-threads=1",
+          "--nocapture"
+        ],
+        "exit_status": 101,
+        "signal": null,
+        "output_sha256": "bf95fa086be713823f0c69d712d5ae105c9bb9ba81a9a174951332b8b27b1bc2",
+        "output_bytes": 1976,
+        "mutated_source_sha256": "c503340a9b65fedbf5758d036b6da421ac40ec27d38788062dea0b7fdb9ded9d",
+        "intended_assertion": "unavailable lifecycle adapter must explicitly refuse",
+        "counts": {
+          "passed": 0,
+          "failed": 1,
+          "ignored": 0
+        }
+      },
+      {
+        "name": "proposal-preflight",
+        "file": "packages/aethyme/rust/crates/aethyme-broker/src/collaboration_cli/lifecycle.rs",
+        "test": "lifecycle_target_changes_use_actual_ownership_versions_and_exact_epoch_stop",
+        "argv": [
+          "cargo",
+          "test",
+          "--locked",
+          "-j",
+          "4",
+          "--manifest-path",
+          "packages/aethyme/rust/Cargo.toml",
+          "-p",
+          "aethyme-cli",
+          "--test",
+          "collab_cli",
+          "lifecycle_target_changes_use_actual_ownership_versions_and_exact_epoch_stop",
+          "--",
+          "--exact",
+          "--test-threads=1",
+          "--nocapture"
+        ],
+        "exit_status": 101,
+        "signal": null,
+        "output_sha256": "88b149b7ab5ffe734d5392d665818e2d299343442b1bbd77de5bff8e4005cb37",
+        "output_bytes": 1803,
+        "mutated_source_sha256": "e87583413c662dc0ad5d0d6f98a4891b3616e26623c8c18a7b7362367961b73e",
+        "intended_assertion": "rejected proposal must not initialize authority",
+        "counts": {
+          "passed": 0,
+          "failed": 1,
+          "ignored": 0
+        }
+      },
+      {
+        "name": "requested-source",
+        "file": "packages/aethyme/rust/crates/aethyme-broker/src/collaboration_cli/lifecycle.rs",
+        "test": "lifecycle_export_is_exclusive_and_verified_as_historical_source_only",
+        "argv": [
+          "cargo",
+          "test",
+          "--locked",
+          "-j",
+          "4",
+          "--manifest-path",
+          "packages/aethyme/rust/Cargo.toml",
+          "-p",
+          "aethyme-cli",
+          "--test",
+          "collab_cli",
+          "lifecycle_export_is_exclusive_and_verified_as_historical_source_only",
+          "--",
+          "--exact",
+          "--test-threads=1",
+          "--nocapture"
+        ],
+        "exit_status": 101,
+        "signal": null,
+        "output_sha256": "86ca6d6a39a0f121f4f4d30c41f4b82b572b10eec9abf4c1fb0d4c136750fdf5",
+        "output_bytes": 1523,
+        "mutated_source_sha256": "b74cbab4a1acf261cf3fb6312bf45fe672812de79b6d9904dd2412e3417ba236",
+        "intended_assertion": "export must deliver the exact requested source",
+        "counts": {
+          "passed": 0,
+          "failed": 1,
+          "ignored": 0
+        }
+      },
+      {
+        "name": "handoff-authority",
+        "file": "packages/aethyme/rust/crates/aethyme-broker/src/collaboration_cli/lifecycle.rs",
+        "test": "collaboration_cli::lifecycle::tests::retained_handoff_projection_preserves_request_without_agent_authority",
+        "argv": [
+          "cargo",
+          "test",
+          "--locked",
+          "-j",
+          "4",
+          "--manifest-path",
+          "packages/aethyme/rust/Cargo.toml",
+          "-p",
+          "aethyme-broker",
+          "--lib",
+          "collaboration_cli::lifecycle::tests::retained_handoff_projection_preserves_request_without_agent_authority",
+          "--",
+          "--exact",
+          "--test-threads=1",
+          "--nocapture"
+        ],
+        "exit_status": 101,
+        "signal": null,
+        "output_sha256": "9a8eed45d137afe3f817bf6f7557fcef30914e648ac8df91b1e70b9b1523ff04",
+        "output_bytes": 1234,
+        "mutated_source_sha256": "a7eb8ebce9253d7e8428c4f9de0d5cb5305afb6a8312407b7f81bac241b21da8",
+        "intended_assertion": "retained inspection cannot grant current agent authority",
+        "counts": {
+          "passed": 0,
+          "failed": 1,
+          "ignored": 0
+        }
+      },
+      {
+        "name": "exclusive-output",
+        "file": "packages/aethyme/rust/crates/aethyme-broker/src/collaboration_cli/lifecycle.rs",
+        "test": "lifecycle_export_is_exclusive_and_verified_as_historical_source_only",
+        "argv": [
+          "cargo",
+          "test",
+          "--locked",
+          "-j",
+          "4",
+          "--manifest-path",
+          "packages/aethyme/rust/Cargo.toml",
+          "-p",
+          "aethyme-cli",
+          "--test",
+          "collab_cli",
+          "lifecycle_export_is_exclusive_and_verified_as_historical_source_only",
+          "--",
+          "--exact",
+          "--test-threads=1",
+          "--nocapture"
+        ],
+        "exit_status": 101,
+        "signal": null,
+        "output_sha256": "72689172aef1abd5ed7e94986c70dc4e0b439578c7ca26048a27d2d878db3a85",
+        "output_bytes": 1548,
+        "mutated_source_sha256": "4c46558feb99cb7bcc868ec6e13a3f5f0b5c9cdb84f1d6413fcdccc3df316da5",
+        "intended_assertion": "existing bundle must refuse overwrite",
+        "counts": {
+          "passed": 0,
+          "failed": 1,
+          "ignored": 0
+        }
+      },
+      {
+        "name": "exact-stop",
+        "file": "packages/aethyme/rust/crates/aethyme-broker/src/collaboration_cli/lifecycle.rs",
+        "test": "lifecycle_target_changes_use_actual_ownership_versions_and_exact_epoch_stop",
+        "argv": [
+          "cargo",
+          "test",
+          "--locked",
+          "-j",
+          "4",
+          "--manifest-path",
+          "packages/aethyme/rust/Cargo.toml",
+          "-p",
+          "aethyme-cli",
+          "--test",
+          "collab_cli",
+          "lifecycle_target_changes_use_actual_ownership_versions_and_exact_epoch_stop",
+          "--",
+          "--exact",
+          "--test-threads=1",
+          "--nocapture"
+        ],
+        "exit_status": 101,
+        "signal": null,
+        "output_sha256": "af4d479b0900d48d047a815c622f9aef518b9a46929271cfd1695297d4aae6e3",
+        "output_bytes": 1642,
+        "mutated_source_sha256": "95cc87446cbb6d493062ebf664450f186418ac26f0704e98861f60fccffaa197",
+        "intended_assertion": "wrong epoch must not freeze native ingress",
+        "counts": {
+          "passed": 0,
+          "failed": 1,
+          "ignored": 0
+        }
+      }
+    ],
+    "evidence_directory": "/var/folders/f2/krjzd4c15nn491pm37zrkp1h0000gn/T/aethyme-1098-neuter-20261012-67583-1nu9byw"
+  },
+  "source_restoration": [
+    {
+      "path": "packages/aethyme/rust/crates/aethyme-broker/src/local_target.rs",
+      "source_sha256": "b315f4844847d49449034323ce6e619f3a297076e91314b584a0ad7a8e5600ef",
+      "byte_restored": true
+    },
+    {
+      "path": "packages/aethyme/rust/crates/aethyme-broker/src/collaboration_cli.rs",
+      "source_sha256": "3af90ee2ce906a17fbc3dcd79438283cb18b72936f9e540bb6bf1babdc42bd0e",
+      "byte_restored": true
+    },
+    {
+      "path": "packages/aethyme/rust/crates/aethyme-broker/src/collaboration_cli/lifecycle.rs",
+      "source_sha256": "e302096922a8ea3719bd31196f33dbe978f70fa774648e4dc63e8d3670f73647",
+      "byte_restored": true
+    }
+  ],
+  "earlier_attempts": [
+    {
+      "schema": "aethyme.local.qualification.commands/provisional-v0",
+      "complete_local_qualification": false,
+      "profile": "explicit-local-cli/provisional-v0",
+      "source_commit": "2de74de3d50825b7c0a5678a757efa781a707495",
+      "source_tree": "768f886f4af49f8776c9805c59d8abf67c714302",
+      "environment": {
+        "RUSTC_WRAPPER": "",
+        "CARGO_TARGET_DIR": "/private/tmp/aethyme-l5-cargo"
+      },
+      "limitations": [
+        "explicit finite Playground profile only",
+        "not live GitHub/Mergify or native gate evidence",
+        "provisional composition depends on separately owned E1"
+      ],
+      "rows": [
+        {
+          "name": "lifecycle",
+          "argv": [
+            "cargo",
+            "test",
+            "--locked",
+            "-j",
+            "4",
+            "--manifest-path",
+            "packages/aethyme/rust/Cargo.toml",
+            "-p",
+            "aethyme-broker",
+            "--lib",
+            "collaboration_cli::lifecycle::tests",
+            "--",
+            "--test-threads=4"
+          ],
+          "exit_status": 0,
+          "signal": null,
+          "output_bytes": 3162,
+          "output_sha256": "7f6a2eeef71830bf9f8302cac18a7b73c4b62a66c6393dc07ba0ae8cf7120f91",
+          "output_file": "lifecycle.log",
+          "counts": {
+            "passed": 8,
+            "failed": 0,
+            "ignored": 0
+          },
+          "credited": true
+        },
+        {
+          "name": "router",
+          "argv": [
+            "cargo",
+            "test",
+            "--locked",
+            "-j",
+            "4",
+            "--manifest-path",
+            "packages/aethyme/rust/Cargo.toml",
+            "-p",
+            "aethyme-cli",
+            "--test",
+            "collab_cli",
+            "--",
+            "--test-threads=4"
+          ],
+          "exit_status": 101,
+          "signal": null,
+          "output_bytes": 4495,
+          "output_sha256": "b2d2f959d5ab91c4a5731b9ee7359d417af4d5deb220e1f9c020fd9ad54467bd",
+          "output_file": "router.log",
+          "counts": null,
+          "credited": false
+        }
+      ],
+      "evidence_directory": "/var/folders/f2/krjzd4c15nn491pm37zrkp1h0000gn/T/aethyme-1098-qualification-20261012-93828-u154jg"
+    },
+    {
+      "schema": "aethyme.local.qualification.commands/provisional-v0",
+      "complete_local_qualification": false,
+      "profile": "explicit-local-cli/provisional-v0",
+      "source_commit": "636a2dfdd11be63f16542f737ab1c5af480fe905",
+      "source_tree": "8afe114fb9e699abd92eb424f4cf89ad640e1655",
+      "environment": {
+        "RUSTC_WRAPPER": "",
+        "CARGO_TARGET_DIR": "/private/tmp/aethyme-l5-cargo"
+      },
+      "limitations": [
+        "explicit finite Playground profile only",
+        "not live GitHub/Mergify or native gate evidence",
+        "provisional composition depends on separately owned E1"
+      ],
+      "rows": [
+        {
+          "name": "lifecycle",
+          "argv": [
+            "cargo",
+            "test",
+            "--locked",
+            "-j",
+            "4",
+            "--manifest-path",
+            "packages/aethyme/rust/Cargo.toml",
+            "-p",
+            "aethyme-broker",
+            "--lib",
+            "collaboration_cli::lifecycle::tests",
+            "--",
+            "--test-threads=4"
+          ],
+          "exit_status": 0,
+          "signal": null,
+          "output_bytes": 1637,
+          "output_sha256": "f2d9c9c94726b0bd76f9d3b7e8fa26600499f2d6a31faf98a8458af6a094180e",
+          "output_file": "lifecycle.log",
+          "counts": {
+            "passed": 8,
+            "failed": 0,
+            "ignored": 0
+          },
+          "credited": true
+        },
+        {
+          "name": "router",
+          "argv": [
+            "cargo",
+            "test",
+            "--locked",
+            "-j",
+            "4",
+            "--manifest-path",
+            "packages/aethyme/rust/Cargo.toml",
+            "-p",
+            "aethyme-cli",
+            "--test",
+            "collab_cli",
+            "--",
+            "--test-threads=4"
+          ],
+          "exit_status": 0,
+          "signal": null,
+          "output_bytes": 2140,
+          "output_sha256": "0f40f612bbe3c4ec9cd69f01848a8604cf02e72ddfe42b2a2abaf96e30b73f0f",
+          "output_file": "router.log",
+          "counts": {
+            "passed": 18,
+            "failed": 0,
+            "ignored": 0
+          },
+          "credited": true
+        }
+      ],
+      "evidence_directory": "/var/folders/f2/krjzd4c15nn491pm37zrkp1h0000gn/T/aethyme-1098-qualification-20261012-28756-8kkfpk"
+    }
+  ],
+  "earlier_attempt_limits": [
+    "First router attempt failed compilation because its fixture called a unit-test-only private archive helper; no router runtime credit. Corrected fixture uses public capture and its acknowledged receipt.",
+    "Second attempt recorded eight lifecycle and eighteen router passes; outer shell wrapper then exited127 after command recording. No successful wrapper claim; final restored runner is separate.",
+    "Snapshot update ran through the broker guard and changed only collab.snap. It is not credited as snapshot comparison; ordinary comparison appears in restored_commands.",
+    "The full restored runner passed fifteen selected test commands and broker Clippy, then CLI Clippy failed with no library targets found. Its actual exit101 is retained and uncredited; corrected --bins --tests CLI Clippy is separately recorded."
+  ],
+  "qualification_limits": [
+    "Finite disposable Playground repositories, current macOS Unix profile only; selected counts overlap and are not unique tests.",
+    "Historical handoff projection unit uses modeled trusted-verifier evidence; no built CLI positive retained-handoff or real-provider qualification credit.",
+    "Real CLI export transports the requested source into a fresh receiver, reconstructs exact bytes, preserves origin source and refuses overwrite. No serialized bundle grants current agent authority.",
+    "target run, remote sync and handoff dispatch refuse unsupported_profile; no appointed adapters, daemon or autonomous runtime claim.",
+    "E1 structural composition and separately owned #725 native gate boundary remain pending.",
+    "No live GitHub/Mergify or remote Coordination qualification; whole Local Q3/Q4 remains open."
+  ],
+  "corrected_cli_clippy": {
+    "schema": "aethyme.local.qualification.commands/provisional-v0",
+    "complete_local_qualification": false,
+    "profile": "corrected-cli-clippy/provisional-v0",
+    "source_commit": "ece13cebd381ada85fa649a40b6b0e38eec209fb",
+    "source_tree": "75a1f778e16da5d160b1cf7115411c59b8487e02",
+    "environment": {
+      "RUSTC_WRAPPER": "",
+      "CARGO_TARGET_DIR": "/private/tmp/aethyme-l5-cargo"
+    },
+    "limitations": [
+      "explicit finite Playground profile only",
+      "not live GitHub/Mergify or native gate evidence",
+      "provisional composition depends on separately owned E1"
+    ],
+    "rows": [
+      {
+        "name": "cli-clippy",
+        "argv": [
+          "cargo",
+          "clippy",
+          "--locked",
+          "-j",
+          "4",
+          "--manifest-path",
+          "packages/aethyme/rust/Cargo.toml",
+          "-p",
+          "aethyme-cli",
+          "--bins",
+          "--tests",
+          "--",
+          "-D",
+          "warnings"
+        ],
+        "exit_status": 0,
+        "signal": null,
+        "output_bytes": 3170,
+        "output_sha256": "1487a2811ee9d43687b67a90ad6ab40e4e4b31c7e22255ce68f717f53bddc33f",
+        "output_file": "cli-clippy.log",
+        "counts": null,
+        "credited": null
+      }
+    ],
+    "evidence_directory": "/var/folders/f2/krjzd4c15nn491pm37zrkp1h0000gn/T/aethyme-1098-qualification-20261012-87711-73abas"
+  },
+  "command_denominator": {
+    "scheduled": 18,
+    "executed": 18,
+    "successful": 17,
+    "unsupported_cli_target_invocation": 1,
+    "unrun": 0
+  }
+}
