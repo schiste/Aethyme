@@ -855,7 +855,7 @@ fn survey(
     // Native gate jobs retain exact source and records independently of target
     // release. A crash or observation never relinquishes these roots.
     let native_roots: Vec<(String, String)> = connection
-        .prepare("SELECT kind,reference FROM local_native_gate_roots")?
+        .prepare("SELECT kind,reference FROM local_native_gate_roots UNION SELECT kind,reference FROM local_controller_completion_roots")?
         .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
         .collect::<Result<_, _>>()?;
     for (kind, reference) in native_roots {
@@ -864,9 +864,13 @@ fn survey(
             "contribution" => live.contribution(&reference)?,
             "object" => match parse_hex_digest(&reference) {
                 Some(digest) => live.object(digest, RetentionClass::Record),
-                None => live.problems.push(format!("native gate root {reference} is malformed")),
+                None => live
+                    .problems
+                    .push(format!("native gate root {reference} is malformed")),
             },
-            _ => live.problems.push(format!("unknown native gate root kind {kind}")),
+            _ => live
+                .problems
+                .push(format!("unknown native gate root kind {kind}")),
         }
     }
     // Fresh generations retain their own source and pending work independently

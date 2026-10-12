@@ -91,6 +91,7 @@ pub enum WavePhase {
     Frozen,
     Composing,
     Verifying,
+    Accepted,
     Blocked,
     Unsupported,
     NoChange,
