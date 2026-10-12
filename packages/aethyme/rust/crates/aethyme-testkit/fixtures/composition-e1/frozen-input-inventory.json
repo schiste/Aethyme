@@ -1,0 +1,298 @@
+{
+  "schema": "aethyme.e1.frozen-input-inventory/v1",
+  "status": "frozen_before_structural_trials",
+  "prior_fixture_revision": "6a3f37414f1b8c2390db1b9725e996304c6d2797",
+  "inputs": [
+    {
+      "path": "packages/aethyme/rust/crates/aethyme-testkit/fixtures/composition-provisional/inputs/cases/FX01/contributions/c1/app.html",
+      "bytes": 265,
+      "sha256": "976101ce75b3d28213b2f4ae635baf922c488d8cca61d6d6ea0482a0fe06c0a2"
+    },
+    {
+      "path": "packages/aethyme/rust/crates/aethyme-testkit/fixtures/composition-provisional/inputs/cases/FX01/contributions/c2/app.html",
+      "bytes": 292,
+      "sha256": "9578ffc6d68c3dd9fcd1c2568b6e83b53f8a43b2af72811e968e6e2bb0e9b884"
+    },
+    {
+      "path": "packages/aethyme/rust/crates/aethyme-testkit/fixtures/composition-provisional/inputs/cases/FX01/contributions/c3/app.html",
+      "bytes": 302,
+      "sha256": "ee42ce5a2e1100f384ec4e3e97d174ff10ffa8cc9099f2cf637ab82dda085449"
+    },
+    {
+      "path": "packages/aethyme/rust/crates/aethyme-testkit/fixtures/composition-provisional/inputs/cases/FX01/inputs.json",
+      "bytes": 969,
+      "sha256": "0af6612985ad885d1edeb4c606f76670db6748f8d5b4a1707ec3b42b49226747"
+    },
+    {
+      "path": "packages/aethyme/rust/crates/aethyme-testkit/fixtures/composition-provisional/inputs/cases/FX01/trees/t0/app.html",
+      "bytes": 257,
+      "sha256": "510313da8dcfa24402598d7282d435cd8a7f7f8b2a938720b94d7909a77c95bc"
+    },
+    {
+      "path": "packages/aethyme/rust/crates/aethyme-testkit/fixtures/composition-provisional/inputs/cases/FX02/contributions/c1/app.html",
+      "bytes": 444,
+      "sha256": "79796c120e6791be287327c1ef385d037e8b59feaf7ef586336d5db92bf3b7bb"
+    },
+    {
+      "path": "packages/aethyme/rust/crates/aethyme-testkit/fixtures/composition-provisional/inputs/cases/FX02/contributions/c2/app.html",
+      "bytes": 490,
+      "sha256": "4c32490bdc5bc88b011b1a69791e0e83fd8697142189745bb03559874d040339"
+    },
+    {
+      "path": "packages/aethyme/rust/crates/aethyme-testkit/fixtures/composition-provisional/inputs/cases/FX02/contributions/c3/app.html",
+      "bytes": 410,
+      "sha256": "696d298da278192ec8f90d04d1825a80e13fcf581d1a9b447f38470ddc3d621c"
+    },
+    {
+      "path": "packages/aethyme/rust/crates/aethyme-testkit/fixtures/composition-provisional/inputs/cases/FX02/contributions/c4/app.html",
+      "bytes": 433,
+      "sha256": "f06644a27b45a823c7945ef9b4ad54df0fee310e405be8c9fd57fc286313dc3b"
+    },
+    {
+      "path": "packages/aethyme/rust/crates/aethyme-testkit/fixtures/composition-provisional/inputs/cases/FX02/inputs.json",
+      "bytes": 1047,
+      "sha256": "38c4794fd773dd60a0eb942cce3e9e7a1c239d7cff6a140e04d54b77477a9087"
+    },
+    {
+      "path": "packages/aethyme/rust/crates/aethyme-testkit/fixtures/composition-provisional/inputs/cases/FX02/trees/t0/app.html",
+      "bytes": 436,
+      "sha256": "a5a7f9d4b8916e4b92c7701d638e76f41da66158682348127fd9d3f5edd6cdea"
+    },
+    {
+      "path": "packages/aethyme/rust/crates/aethyme-testkit/fixtures/composition-provisional/inputs/cases/FX02/trees/t1/app.html",
+      "bytes": 402,
+      "sha256": "354b3335e813141d219e48157b3bfab1f29bb205c91794078e3719138ea69d23"
+    },
+    {
+      "path": "packages/aethyme/rust/crates/aethyme-testkit/fixtures/composition-provisional/inputs/cases/FX03/contributions/c1/app.html",
+      "bytes": 292,
+      "sha256": "ddbf30059f87a8f51364ad08be4d1140ebc80e6dea593594f49c1f5789b58c1d"
+    },
+    {
+      "path": "packages/aethyme/rust/crates/aethyme-testkit/fixtures/composition-provisional/inputs/cases/FX03/contributions/c2/app.html",
+      "bytes": 307,
+      "sha256": "8617122f618235de1fc71a235e28830e45d2c438f1d059341df2ceaadfba3031"
+    },
+    {
+      "path": "packages/aethyme/rust/crates/aethyme-testkit/fixtures/composition-provisional/inputs/cases/FX03/contributions/c3/app.html",
+      "bytes": 253,
+      "sha256": "db9485658cf2d8bd80caa3462d98f7208f6319ffaad23055540a2b7a3bf90fdc"
+    },
+    {
+      "path": "packages/aethyme/rust/crates/aethyme-testkit/fixtures/composition-provisional/inputs/cases/FX03/inputs.json",
+      "bytes": 1333,
+      "sha256": "f62dade7eed1d95ad6b58df62bd590da019dbb8e6e9818993b3f5879f2259489"
+    },
+    {
+      "path": "packages/aethyme/rust/crates/aethyme-testkit/fixtures/composition-provisional/inputs/cases/FX03/trees/t0/app.html",
+      "bytes": 254,
+      "sha256": "7a790be65a8fd3068fa58ff74e741c83b619fea756995f95f9f7e7780bc0f7f4"
+    },
+    {
+      "path": "packages/aethyme/rust/crates/aethyme-testkit/fixtures/composition-provisional/inputs/cases/FX03/trees/t1/app.html",
+      "bytes": 279,
+      "sha256": "7781840299334ff8af015aba75d782ef8c90a84d32745a4a7913bcfe21c87e1b"
+    },
+    {
+      "path": "packages/aethyme/rust/crates/aethyme-testkit/fixtures/composition-provisional/inputs/cases/FX03/trees/t2/app.html",
+      "bytes": 251,
+      "sha256": "b792de376519eeb4088bc6d8b29e8a1ea801af6ba4dc5b2869edeba2f0b47c39"
+    },
+    {
+      "path": "packages/aethyme/rust/crates/aethyme-testkit/fixtures/composition-provisional/inputs/cases/FX04/contributions/c1/app.html",
+      "bytes": 185,
+      "sha256": "3eefb4584043e8ec9165cdd8ccc166180e91dd2a0a39ed4fb9da5386776d981d"
+    },
+    {
+      "path": "packages/aethyme/rust/crates/aethyme-testkit/fixtures/composition-provisional/inputs/cases/FX04/contributions/c1/app.ts",
+      "bytes": 241,
+      "sha256": "c31a5e52de719f9aaf9195d24c98be2d18640d6468e6c17ae7732b2ac29ec987"
+    },
+    {
+      "path": "packages/aethyme/rust/crates/aethyme-testkit/fixtures/composition-provisional/inputs/cases/FX04/contributions/c2/app.html",
+      "bytes": 180,
+      "sha256": "6c4450d4f170d681ca923d1c9278d2e956b5bf3e1b7dc800f3bf2ad7260c89da"
+    },
+    {
+      "path": "packages/aethyme/rust/crates/aethyme-testkit/fixtures/composition-provisional/inputs/cases/FX04/contributions/c2/app.ts",
+      "bytes": 407,
+      "sha256": "a61735ef23b08f43ccc36af654739cd2fddad77810346b3840fc7dc3267d4e85"
+    },
+    {
+      "path": "packages/aethyme/rust/crates/aethyme-testkit/fixtures/composition-provisional/inputs/cases/FX04/inputs.json",
+      "bytes": 594,
+      "sha256": "88f32d8a9d2754b43b641afd7aa40d8e4720e75d110bf3b18a90b20b7d36cd50"
+    },
+    {
+      "path": "packages/aethyme/rust/crates/aethyme-testkit/fixtures/composition-provisional/inputs/cases/FX04/trees/t0/app.html",
+      "bytes": 180,
+      "sha256": "6c4450d4f170d681ca923d1c9278d2e956b5bf3e1b7dc800f3bf2ad7260c89da"
+    },
+    {
+      "path": "packages/aethyme/rust/crates/aethyme-testkit/fixtures/composition-provisional/inputs/cases/FX04/trees/t0/app.ts",
+      "bytes": 236,
+      "sha256": "9e6678db3eb0190182b2ff7ed2cef488a516f0fb2285464b9f69a9518dd00d48"
+    },
+    {
+      "path": "packages/aethyme/rust/crates/aethyme-testkit/fixtures/composition-provisional/inputs/cases/FX05/contributions/c1/app.html",
+      "bytes": 151,
+      "sha256": "a7a6207b076ad2791ed21d12118ddebd365b32a9aa5d5ebd5cf2e3aa79682eef"
+    },
+    {
+      "path": "packages/aethyme/rust/crates/aethyme-testkit/fixtures/composition-provisional/inputs/cases/FX05/contributions/c2/app.html",
+      "bytes": 146,
+      "sha256": "d19020c984b815f8f1736e7925cd8e38e3f01794d072a4dfe0b1a35ccdb82aa6"
+    },
+    {
+      "path": "packages/aethyme/rust/crates/aethyme-testkit/fixtures/composition-provisional/inputs/cases/FX05/inputs.json",
+      "bytes": 594,
+      "sha256": "87ae5d5ac2dba9e13e0c15db7035e136cea55dc32e21e12be78e678d6f75ae56"
+    },
+    {
+      "path": "packages/aethyme/rust/crates/aethyme-testkit/fixtures/composition-provisional/inputs/cases/FX05/trees/t0/app.html",
+      "bytes": 146,
+      "sha256": "56582938538c0616546fbd10da7f935098f48083f6994b9027b1b661df607cb9"
+    },
+    {
+      "path": "packages/aethyme/rust/crates/aethyme-testkit/fixtures/composition-provisional/inputs/cases/FX06/contributions/c1/cart.ts",
+      "bytes": 122,
+      "sha256": "87aa335d770952c49aa484106ddb7ade9ce00ff49bb5845bfad40ba6db3bb834"
+    },
+    {
+      "path": "packages/aethyme/rust/crates/aethyme-testkit/fixtures/composition-provisional/inputs/cases/FX06/contributions/c1/labels.ts",
+      "bytes": 74,
+      "sha256": "775e8cd5ac5ad4936b93957b651e7abb54a5d937a705710d4399abc179f4ce0e"
+    },
+    {
+      "path": "packages/aethyme/rust/crates/aethyme-testkit/fixtures/composition-provisional/inputs/cases/FX06/contributions/c1/price.ts",
+      "bytes": 119,
+      "sha256": "ac129b1cf27a685e678b59615da642f92f8369a2e4a4d27ba727d6629e911f70"
+    },
+    {
+      "path": "packages/aethyme/rust/crates/aethyme-testkit/fixtures/composition-provisional/inputs/cases/FX06/contributions/c2/cart.ts",
+      "bytes": 122,
+      "sha256": "87aa335d770952c49aa484106ddb7ade9ce00ff49bb5845bfad40ba6db3bb834"
+    },
+    {
+      "path": "packages/aethyme/rust/crates/aethyme-testkit/fixtures/composition-provisional/inputs/cases/FX06/contributions/c2/labels.ts",
+      "bytes": 74,
+      "sha256": "775e8cd5ac5ad4936b93957b651e7abb54a5d937a705710d4399abc179f4ce0e"
+    },
+    {
+      "path": "packages/aethyme/rust/crates/aethyme-testkit/fixtures/composition-provisional/inputs/cases/FX06/contributions/c2/price.ts",
+      "bytes": 178,
+      "sha256": "0da61eba4a8516ea10afecadc9324ca812cedfe9755690c1104890ffe9948bd4"
+    },
+    {
+      "path": "packages/aethyme/rust/crates/aethyme-testkit/fixtures/composition-provisional/inputs/cases/FX06/contributions/c3/cart.ts",
+      "bytes": 129,
+      "sha256": "1fa272df240f1d0fe9abc45986be6fb96eeda578a9609ee76c84a028db9dcc58"
+    },
+    {
+      "path": "packages/aethyme/rust/crates/aethyme-testkit/fixtures/composition-provisional/inputs/cases/FX06/contributions/c3/labels.ts",
+      "bytes": 74,
+      "sha256": "775e8cd5ac5ad4936b93957b651e7abb54a5d937a705710d4399abc179f4ce0e"
+    },
+    {
+      "path": "packages/aethyme/rust/crates/aethyme-testkit/fixtures/composition-provisional/inputs/cases/FX06/contributions/c3/price.ts",
+      "bytes": 84,
+      "sha256": "b9868b394e9b8cdd9351818e563e0802d6343ce01456b0717e3311f7da0206d1"
+    },
+    {
+      "path": "packages/aethyme/rust/crates/aethyme-testkit/fixtures/composition-provisional/inputs/cases/FX06/contributions/c4/cart.ts",
+      "bytes": 122,
+      "sha256": "87aa335d770952c49aa484106ddb7ade9ce00ff49bb5845bfad40ba6db3bb834"
+    },
+    {
+      "path": "packages/aethyme/rust/crates/aethyme-testkit/fixtures/composition-provisional/inputs/cases/FX06/contributions/c4/labels.ts",
+      "bytes": 79,
+      "sha256": "a97962a9eae9888e71850ad05393dbd7f7b7e108455adb408d989b1ab11e25c0"
+    },
+    {
+      "path": "packages/aethyme/rust/crates/aethyme-testkit/fixtures/composition-provisional/inputs/cases/FX06/contributions/c4/price.ts",
+      "bytes": 84,
+      "sha256": "b9868b394e9b8cdd9351818e563e0802d6343ce01456b0717e3311f7da0206d1"
+    },
+    {
+      "path": "packages/aethyme/rust/crates/aethyme-testkit/fixtures/composition-provisional/inputs/cases/FX06/contributions/c5/cart.ts",
+      "bytes": 122,
+      "sha256": "87aa335d770952c49aa484106ddb7ade9ce00ff49bb5845bfad40ba6db3bb834"
+    },
+    {
+      "path": "packages/aethyme/rust/crates/aethyme-testkit/fixtures/composition-provisional/inputs/cases/FX06/contributions/c5/labels.ts",
+      "bytes": 72,
+      "sha256": "4b57b19a5ac6de6671bd618f6b19f265790d7de87576626f279fbf1cc1dea01f"
+    },
+    {
+      "path": "packages/aethyme/rust/crates/aethyme-testkit/fixtures/composition-provisional/inputs/cases/FX06/contributions/c5/price.ts",
+      "bytes": 84,
+      "sha256": "b9868b394e9b8cdd9351818e563e0802d6343ce01456b0717e3311f7da0206d1"
+    },
+    {
+      "path": "packages/aethyme/rust/crates/aethyme-testkit/fixtures/composition-provisional/inputs/cases/FX06/inputs.json",
+      "bytes": 2163,
+      "sha256": "0eef58f3c39bf5d09113db6cfe9b68743345f559d6ce2e3f03d922ed56a70332"
+    },
+    {
+      "path": "packages/aethyme/rust/crates/aethyme-testkit/fixtures/composition-provisional/inputs/cases/FX06/trees/t0/cart.ts",
+      "bytes": 122,
+      "sha256": "87aa335d770952c49aa484106ddb7ade9ce00ff49bb5845bfad40ba6db3bb834"
+    },
+    {
+      "path": "packages/aethyme/rust/crates/aethyme-testkit/fixtures/composition-provisional/inputs/cases/FX06/trees/t0/labels.ts",
+      "bytes": 74,
+      "sha256": "775e8cd5ac5ad4936b93957b651e7abb54a5d937a705710d4399abc179f4ce0e"
+    },
+    {
+      "path": "packages/aethyme/rust/crates/aethyme-testkit/fixtures/composition-provisional/inputs/cases/FX06/trees/t0/price.ts",
+      "bytes": 84,
+      "sha256": "b9868b394e9b8cdd9351818e563e0802d6343ce01456b0717e3311f7da0206d1"
+    },
+    {
+      "path": "packages/aethyme/rust/crates/aethyme-testkit/fixtures/composition-provisional/inputs/cases/FX07/contributions/c1/app.html",
+      "bytes": 232,
+      "sha256": "aa683ad7a1867222f05b9f7453b5208ffe5444751a1fc17d15dfcc620fa5fceb"
+    },
+    {
+      "path": "packages/aethyme/rust/crates/aethyme-testkit/fixtures/composition-provisional/inputs/cases/FX07/contributions/c2/app.html",
+      "bytes": 210,
+      "sha256": "8b3e07e2f599905e8565cc6d56e06e7cf4072716d90a8ddf7a84b7e9e1b4f737"
+    },
+    {
+      "path": "packages/aethyme/rust/crates/aethyme-testkit/fixtures/composition-provisional/inputs/cases/FX07/contributions/c3/app.html",
+      "bytes": 251,
+      "sha256": "6da5cf6dbc38d1b286ec9ce429a0072df5c4ebaea365877127e3f61b231fd3fd"
+    },
+    {
+      "path": "packages/aethyme/rust/crates/aethyme-testkit/fixtures/composition-provisional/inputs/cases/FX07/contributions/c4/app.html",
+      "bytes": 270,
+      "sha256": "cbb6afd26f929b23cc34ed035d3025855c00b9b55e7386700fdc115fc5690f58"
+    },
+    {
+      "path": "packages/aethyme/rust/crates/aethyme-testkit/fixtures/composition-provisional/inputs/cases/FX07/inputs.json",
+      "bytes": 1389,
+      "sha256": "64b172d68bd37bc875302ff3c2ff2ae512498b3db4117d3acfa4af05dd3a6b68"
+    },
+    {
+      "path": "packages/aethyme/rust/crates/aethyme-testkit/fixtures/composition-provisional/inputs/cases/FX07/trees/t0/app.html",
+      "bytes": 205,
+      "sha256": "01be9d8f45f16a472acc98e318ae6b480d2aecfbfd4b50f78017017c8849654f"
+    }
+  ],
+  "held_out_policy": "Earlier HX variants remain sealed from this experiment and are not rerun. New E1 supplemental browser fixtures must freeze before their engine/resolver trials.",
+  "allowed_composer_api": [
+    "CaseInput",
+    "ScenarioInput",
+    "materialize"
+  ],
+  "observer": "independent frozen fixture oracle plus separately frozen real-browser assertions",
+  "candidate_engine": {
+    "name": "mergiraf",
+    "version": "0.19.1",
+    "binary_sha256": "cda5175440f474b4f887c8e6e39878911d15e1a4825d70b4e949a0841820cc3c",
+    "license": "GPL-3.0-only",
+    "mode": "standalone CLI, opt-in; no linking or bundled distribution",
+    "grammar_under_test": "HTML; other paths keep explicitly observed text merging",
+    "status": "not_selected_pending_positive_behavior_evidence"
+  }
+}
