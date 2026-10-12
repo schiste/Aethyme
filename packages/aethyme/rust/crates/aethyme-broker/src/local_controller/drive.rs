@@ -215,7 +215,7 @@ pub fn drive(
     now_ms: i64,
 ) -> Result<DriveResult, ControllerError> {
     drive_until(
-        store, owner, broker, carrier, executor, permit, policy, cancel, now_ms, None,
+        store, owner, broker, carrier, executor, permit, policy, cancel, now_ms, None, None,
     )
 }
 
@@ -232,9 +232,14 @@ pub(super) fn drive_until(
     cancel: &AtomicBool,
     now_ms: i64,
     appointment_deadline: Option<i64>,
+    destination: Option<&super::bare_destination::BareDestination>,
 ) -> Result<DriveResult, ControllerError> {
     policy.validate()?;
     let deadline_ms = dispatch_deadline(clock()?, policy.max_wall_ms, appointment_deadline)?;
+    if let Some(destination) = destination {
+        carrier.check()?;
+        destination.revalidate()?;
+    }
     let _authority = target::authorize(store, owner)?;
     if cancel.load(Ordering::SeqCst) || clock()? >= deadline_ms {
         return Err(ControllerError::Mismatch);
@@ -298,7 +303,16 @@ pub(super) fn drive_until(
     target::retain_artifacts(store, owner, &revision, &[], &[object])?;
     store.connection().execute("INSERT INTO local_controller_runs(wave,id,epoch,state,body) VALUES(?1,?2,?3,'dispatching',?4)",params![active.id.as_str(),record.id().as_str(),spec.epoch,record.canonical_bytes()])?;
     let result = run(
-        store, owner, broker, carrier, executor, permit, &spec, &active.id, cancel,
+        store,
+        owner,
+        broker,
+        carrier,
+        executor,
+        permit,
+        &spec,
+        &active.id,
+        cancel,
+        destination,
     );
     let (state, detail) = match &result {
         Ok(DriveResult::Completed { completion, .. }) => {
@@ -336,6 +350,7 @@ fn run(
     spec: &RunSpec,
     wave_id: &RecordId,
     cancel: &AtomicBool,
+    destination: Option<&super::bare_destination::BareDestination>,
 ) -> Result<DriveResult, ControllerError> {
     check(store, owner, spec, cancel)?;
     // Reserve the trusted native/control allowance before any external work.
@@ -486,6 +501,11 @@ fn run(
         64,
     )?;
     check(store, owner, spec, cancel)?;
+    if let Some(destination) = destination {
+        carrier.check()?;
+        destination.revalidate()?;
+        check(store, owner, spec, cancel)?;
+    }
     transport::publish(store, owner, carrier, broker, &intent.id)?;
     check(store, owner, spec, cancel)?;
     let grant = acceptance::qualify(
