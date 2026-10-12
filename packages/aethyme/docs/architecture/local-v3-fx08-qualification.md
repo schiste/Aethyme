@@ -42,7 +42,33 @@ completed harness run as passing qualification.
 
 ## Evidence status
 
-Not run. Report all 56 scheduled rows, failures, null differences and harm.
+The actual L3 bridge has exported all 24 task/arm contexts with exact source,
+advisory authority and 150-token briefs. Independent oracle calibration passed
+six positives and six named semantic negatives; the initial pagination control
+failure and its independent, pre-trial amendment remain in evidence. Model
+trials have not run.
+
+The proposed evaluator compiles model source as a separate safe Rust 2024,
+standard-library-only library. A trusted API adapter exposes its real results
+through a private control pipe to a separately compiled private oracle process.
+Model stdout, process exit and exported assertion macros cannot supply oracle
+results. Compiler and subject sandboxes deny private fixture reads; admission
+and tampering controls must pass before paid trials.
+
+The runner allows one CLI invocation, 150 seconds, 1 MiB per output stream and
+a 64 KiB final JSON proposal. It stops on the ninth observed command dispatch;
+this is an observed allowance, not prevention of the ninth dispatch. The
+pinned CLI receives a 128,000 weighted token rollout budget, with unit weights;
+the CLI checks response usage after completion and may overshoot within the
+final response. Provider retries retain the pinned built-in finite defaults of
+four request retries and five stream reconnect retries; actual retry counts and
+invoiced monetary charges remain unknown when the CLI does not report them.
+These are experiment limits, not a hard provider billing cap. Configuration
+provenance is the official pinned [Codex schema](https://github.com/openai/codex/blob/rust-v0.162.1/codex-rs/core/config.schema.json),
+[rollout accounting](https://github.com/openai/codex/blob/rust-v0.162.1/codex-rs/core/src/rollout_budget.rs)
+and [provider defaults](https://github.com/openai/codex/blob/rust-v0.162.1/codex-rs/model-provider-info/src/lib.rs).
+
+Report all 56 scheduled rows, failures, null differences and harm.
 Limit conclusions to the actual pinned model, budget, Local retrieval profile
 and six-task distribution. E1, native gates and FX17's twenty accepted changes
 have separate required evidence.
