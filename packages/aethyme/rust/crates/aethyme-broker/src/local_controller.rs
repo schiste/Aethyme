@@ -14,6 +14,9 @@ use crate::local_source_transport::GitCarrier;
 use crate::local_target::{self as target, ControllerOwner, Phase};
 use crate::local_wave::{self as wave, WavePhase};
 
+pub mod drive;
+pub use drive::{DrivePolicy, DriveResult, drive};
+
 const SCHEMA: RecordSchema = RecordSchema {
     name: "aethyme.local-controller-completion/experimental-v1",
     fields: &[FieldSpec {
@@ -29,6 +32,20 @@ const SCHEMA: RecordSchema = RecordSchema {
 pub enum ControllerError {
     #[error("controller completion does not match the exact current wave")]
     Mismatch,
+    #[error("controller dispatch is held: {0}; explicit reconciliation is required")]
+    DispatchHeld(String),
+    #[error(transparent)]
+    Snapshot(#[from] crate::execution_snapshot::SnapshotError),
+    #[error(transparent)]
+    Budget(#[from] crate::local_budget::BudgetError),
+    #[error(transparent)]
+    Supervisor(#[from] crate::execution_supervisor::SupervisorError),
+    #[error(transparent)]
+    Verification(#[from] crate::execution_verifier::VerificationError),
+    #[error(transparent)]
+    Resources(#[from] crate::execution_resources::ResourceError),
+    #[error(transparent)]
+    Native(#[from] crate::native_gates::NativeGateError),
     #[error("controller record is not canonical: {0}")]
     Canonical(String),
     #[error(transparent)]

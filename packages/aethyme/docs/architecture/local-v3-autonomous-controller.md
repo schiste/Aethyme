@@ -50,3 +50,31 @@ first compile/test failures are retained. This is a foundation checkpoint:
 the automatic dispatch/service loop and FX17 are still unrun and unqualified.
 Generation preparation currently consumes its private grant before completion
 because existing generation/verifier APIs require the verifying phase. Coordination and Git Platform remain outside this Local package.
+
+## Appointed driver checkpoint
+
+`local_controller::drive` now invokes actual wave admission/composition, the
+native typed gate job, a budgeted Docker build, the independent external
+verifier, broker-authorized source transport, fresh GenericGit acceptance and
+proof-bound completion. It has no successful callback or public receipt path.
+A schema-20 dispatch journal is written before external work; a previous run,
+including an interrupted dispatch, requires explicit reconciliation and never
+replays automatically. Unknown resource consumption retains its existing
+reservations. Build and verification use the real shared host coordinator.
+
+Control work reserves and charges a complete conservative 512 MiB memory,
+768 MiB disk, one-slot and appointed time envelope. This is accounting rather
+than measured native host consumption or a hard host process quota. Docker
+build/verification have their separate enforced resource envelopes. The driver
+checks its deadline/cancel/current epoch and revision between stages; individual
+legacy native gate commands retain their existing deadline. Optional graph
+configuration is refused because its preparation lacks this process deadline.
+This checkpoint does not advertise a hard end-to-end deadline.
+
+Five ordinary completion/driver guards passed; the real-runtime positive is
+still ignored and unrun, pending independent review. The first compile failure
+(missing digest import) is retained and not credited. Neither sustained-arrival
+service, cumulative accepted-baseline progression, the CLI controller binding
+nor FX17 is qualified at this checkpoint. Existing no-command native policies
+require explicit `allow_empty_native_gates`; passing independent verification
+and provider acceptance remain mandatory.

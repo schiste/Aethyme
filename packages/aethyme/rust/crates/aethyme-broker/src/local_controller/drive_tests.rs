@@ -1,0 +1,358 @@
+use super::*;
+use crate::execution_snapshot::{CommandSpec, LinuxProfile, ResourceLimits};
+use crate::execution_verifier::{AssertionCase, AssertionInventory, VerifierPolicy};
+use crate::local_target::tests::{Fixture, git};
+fn digest(bytes: &[u8]) -> String {
+    format!("sha256:{}", ObjectDigest::of(bytes).hex())
+}
+fn policy() -> DrivePolicy {
+    let command = CommandSpec {
+        program: "/bin/sh".into(),
+        arguments: vec!["/artifact/app.sh".into()],
+        environment: Default::default(),
+    };
+    let limits = ResourceLimits {
+        timeout_ms: 30000,
+        memory_bytes: 64 * 1024 * 1024,
+        output_bytes: 1024 * 1024,
+        pids: 32,
+    };
+    DrivePolicy {execution:ExecutionSpec {candidate_source:digest(b"placeholder"),preparation:None,dependencies:None,configuration:None,harness:digest(b"harness"),dataset:None,assertion_inventory:digest(b"inventory"),materialization_profile:snapshot::MATERIALIZATION_PROFILE.into(),profile:LinuxProfile {build_image:digest(b"image"),verifier_image:digest(b"image"),architecture:"aarch64".into(),runtime_profile:digest(b"runtime"),build_limits:limits,verifier_limits:limits},build:CommandSpec {program:"/bin/sh".into(),arguments:vec!["-c".into(),"set -eu; cp /source/one.txt /outputs/value; printf 'set -eu\\ntest ! -e /harness\\ntest ! -e /dataset\\ntest ! -e /var/run/docker.sock\\ncat /artifact/value\\n' > /outputs/app.sh".into()],environment:Default::default()},verify:command},wave_policy:wave::WavePolicy {debounce_ms:0,..Default::default()},max_wall_ms:300000,allow_empty_native_gates:true}
+}
+fn spec() -> RunSpec {
+    RunSpec {
+        target: "appointed".into(),
+        revision: digest(b"revision"),
+        epoch: digest(b"epoch"),
+        wave: digest(b"wave"),
+        policy: policy(),
+        deadline_ms: 300000,
+    }
+}
+#[test]
+fn driver_configuration_is_finite_and_preparation_is_explicitly_refused() {
+    let p = policy();
+    p.validate().unwrap();
+    for limit in [0, -1, 900001] {
+        let mut bad = p.clone();
+        bad.max_wall_ms = limit;
+        assert!(bad.validate().is_err(), "controller deadline bound {limit}");
+    }
+    let mut bad = p.clone();
+    bad.execution.profile.build_limits.timeout_ms = 60001;
+    assert!(bad.validate().is_err(), "build deadline bound");
+    let mut bad = p;
+    bad.execution.profile.verifier_limits.timeout_ms = 60001;
+    assert!(bad.validate().is_err(), "verifier deadline bound");
+}
+#[test]
+fn dispatch_record_binds_every_operator_choice() {
+    let s = spec();
+    let old = canonical(&s).unwrap().id();
+    let mut changes = Vec::new();
+    let mut v = s.clone();
+    v.target.push('x');
+    changes.push(v);
+    let mut v = s.clone();
+    v.revision = digest(b"other-revision");
+    changes.push(v);
+    let mut v = s.clone();
+    v.epoch = digest(b"other-epoch");
+    changes.push(v);
+    let mut v = s.clone();
+    v.wave = digest(b"other-wave");
+    changes.push(v);
+    let mut v = s.clone();
+    v.deadline_ms += 1;
+    changes.push(v);
+    let mut v = s.clone();
+    v.policy.max_wall_ms += 1;
+    changes.push(v);
+    let mut v = s.clone();
+    v.policy.allow_empty_native_gates = false;
+    changes.push(v);
+    let mut v = s.clone();
+    v.policy.execution.build.arguments.push("changed".into());
+    changes.push(v);
+    let mut v = s.clone();
+    v.policy.execution.harness = digest(b"changed-harness");
+    changes.push(v);
+    let mut v = s.clone();
+    v.policy.wave_policy.batch_width += 1;
+    changes.push(v);
+    for v in changes {
+        assert_ne!(
+            old,
+            canonical(&v).unwrap().id(),
+            "dispatch identity changed"
+        );
+    }
+}
+#[test]
+fn live_dispatch_guard_rejects_cancel_deadline_epoch_and_revision() {
+    let mut f = Fixture::new();
+    let owner = target::acquire_controller(&mut f.store, "appointed", "fixture-operator").unwrap();
+    let revision_spec = f.spec();
+    let revision = target::propose_revision(&mut f.store, &owner, revision_spec).unwrap();
+    target::select_revision(&mut f.store, &owner, &revision.id).unwrap();
+    wave::available(&mut f.store, &owner, "A", 0).unwrap();
+    let wave::Admission::Frozen(w) =
+        wave::admit(&mut f.store, &owner, policy().wave_policy, 0).unwrap()
+    else {
+        panic!("actual wave not frozen")
+    };
+    let mut s = spec();
+    s.revision = revision.id.to_string();
+    s.epoch = owner.authority_epoch().as_str().into();
+    s.wave = w.id.to_string();
+    s.deadline_ms = clock().unwrap() + 300000;
+    check(&f.store, &owner, &s, &AtomicBool::new(false)).unwrap();
+    assert!(
+        check(&f.store, &owner, &s, &AtomicBool::new(true)).is_err(),
+        "cancel dispatch"
+    );
+    let mut v = s.clone();
+    v.deadline_ms = clock().unwrap() - 1;
+    assert!(
+        check(&f.store, &owner, &v, &AtomicBool::new(false)).is_err(),
+        "expired dispatch"
+    );
+    let mut v = s.clone();
+    v.epoch = digest(b"stale");
+    assert!(
+        check(&f.store, &owner, &v, &AtomicBool::new(false)).is_err(),
+        "stale epoch dispatch"
+    );
+    let mut v = s;
+    v.revision = digest(b"stale-revision");
+    assert!(
+        check(&f.store, &owner, &v, &AtomicBool::new(false)).is_err(),
+        "stale revision dispatch"
+    );
+}
+#[test]
+#[ignore = "actual appointed cached Docker build, independent verifier, native gates and disposable GenericGit acceptance"]
+fn actual_appointed_driver_completes_without_a_manufactured_receipt() {
+    let host = tempfile::tempdir().unwrap().keep();
+    eprintln!("Controller actual native recovery root {}", host.display());
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&host, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let cli = std::env::var("AETHYME_DOCKER_CLI").expect("appointed actual Docker client");
+    let image = std::env::var("AETHYME_DOCKER_TEST_IMAGE").expect("appointed cached image");
+    assert_eq!(
+        image,
+        "sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251"
+    );
+    let native = DockerExecutor::probe(cli.into()).unwrap();
+    let resources = crate::execution_resources::ResourcePolicy {
+        host_state: host.join("resources.db"),
+        temporary_root: host.clone(),
+        runtime: native.runtime().id(),
+        daemon: native.runtime().daemon_id.clone(),
+        meter_image: image.clone(),
+        memory_mib: 2048,
+        disk_mib: 2048,
+        process_slots: 1024,
+        job_slots: 2,
+        host_floor_bytes: 1,
+        daemon_floor_bytes: 1,
+    };
+    let executor = native.with_resources(resources).unwrap();
+    let mut f = Fixture::new();
+    let source_host = std::mem::replace(&mut f._host, tempfile::tempdir().unwrap()).keep();
+    let repo = std::mem::replace(&mut f._repo, tempfile::tempdir().unwrap()).keep();
+    eprintln!(
+        "Controller retained source host {}, repository {}",
+        source_host.display(),
+        repo.display()
+    );
+    let owner = target::acquire_controller(
+        &mut f.store,
+        "native-controller",
+        "appointed-local-operator",
+    )
+    .unwrap();
+    let inventory = AssertionInventory::new(vec![AssertionCase {
+        id: "retained-one".into(),
+        arguments: vec![],
+        stdin_hex: String::new(),
+        exit_code: 0,
+        stdout: digest(b"A\n"),
+        stderr: digest(b""),
+    }])
+    .unwrap();
+    std::fs::write(repo.join("inventory.json"), inventory.canonical_bytes()).unwrap();
+    git(&repo, &["add", "inventory.json"]);
+    git(
+        &repo,
+        &["commit", "-qm", "independent controller behavior inventory"],
+    );
+    let harness_commit = CommitOid::parse(&git(&repo, &["rev-parse", "HEAD"])).unwrap();
+    let harness = archive::retain_snapshot(&mut f.store, &repo, &harness_commit).unwrap();
+    let mut p = policy();
+    p.execution.harness = harness.snapshot_id.to_string();
+    p.execution.assertion_inventory = inventory.id().to_string();
+    p.execution.profile.build_image = image.clone();
+    p.execution.profile.verifier_image = image.clone();
+    p.execution.profile.runtime_profile = executor.runtime().id();
+    p.execution.profile.architecture = executor.runtime().architecture.clone();
+    let verifier_policy = VerifierPolicy {
+        profile: verifier::PROFILE.into(),
+        runtime: executor.runtime().id(),
+        image,
+        harness: harness.snapshot_id.to_string(),
+        inventory: inventory.id().to_string(),
+        command: p.execution.verify.clone(),
+        max_age_ms: 300000,
+    };
+    let mut selected = f.spec();
+    selected.acceptance_policy = verifier_policy.record().unwrap().id().to_string();
+    let revision = target::propose_revision(&mut f.store, &owner, selected).unwrap();
+    target::select_revision(&mut f.store, &owner, &revision.id).unwrap();
+    let permit = verifier::configure(
+        &mut f.store,
+        &owner,
+        "controller-native",
+        None,
+        verifier_policy,
+    )
+    .unwrap();
+    let cap = budget::Units {
+        time_ms: 1000000000,
+        memory_bytes: 64 * 1024 * 1024 * 1024,
+        disk_bytes: 64 * 1024 * 1024 * 1024,
+        slots: 100,
+        ..Default::default()
+    };
+    budget::configure_project(
+        &mut f.store,
+        &owner,
+        budget::ProjectPolicy {
+            authorization: digest(b"controller authorization"),
+            price_profile: digest(b"unpriced native execution"),
+            cap,
+            recovery_headroom: Default::default(),
+            mandatory_headroom: Default::default(),
+            max_root_reservations: 32,
+        },
+    )
+    .unwrap();
+    budget::authorize_objective(&mut f.store, &owner, cap).unwrap();
+    let remote = tempfile::tempdir().unwrap().keep();
+    git(&remote, &["init", "--bare", "-q"]);
+    git(
+        &repo,
+        &[
+            "remote",
+            "add",
+            "controller-accepted",
+            remote.to_str().unwrap(),
+        ],
+    );
+    git(
+        &repo,
+        &[
+            "push",
+            "-q",
+            "controller-accepted",
+            &format!("{}:refs/heads/accepted", f.a.base.commit.as_str()),
+        ],
+    );
+    let original = git(&repo, &["rev-parse", "HEAD"]);
+    let mut broker = Broker::open(&repo)
+        .unwrap()
+        .with_host_operation_database(host.join("operations.db"))
+        .with_worktree_root(host.join("worktrees"));
+    let session = broker
+        .adopt(
+            &repo,
+            Some("appointed disposable Local controller Playground"),
+        )
+        .unwrap();
+    let carrier = GitCarrier::new(
+        &mut broker,
+        session.id,
+        "controller-accepted",
+        "refs/heads/accepted",
+        30,
+        "Operator authorizes exact disposable local bare Git controller target",
+        true,
+    )
+    .unwrap();
+    wave::available(&mut f.store, &owner, "A", 0).unwrap();
+    let result = drive(
+        &mut f.store,
+        &owner,
+        &mut broker,
+        &carrier,
+        &executor,
+        &permit,
+        &p,
+        &AtomicBool::new(false),
+        0,
+    )
+    .unwrap();
+    let DriveResult::Completed {
+        completion,
+        historical: false,
+    } = result
+    else {
+        panic!("actual controller did not complete: {result:?}")
+    };
+    assert_eq!(
+        target::status(&f.store, owner.target()).unwrap().phase,
+        Phase::PublicationConfirmed,
+        "private grant required for completion"
+    );
+    let wave_id = RecordId::parse(&completion.wave).unwrap();
+    assert_eq!(
+        wave::load(&f.store, &wave_id).unwrap().phase,
+        WavePhase::Accepted
+    );
+    assert_eq!(
+        target::dispositions(&f.store, &revision.id).unwrap()[0].status,
+        target::Disposition::Delivered
+    );
+    assert_eq!(
+        git(&remote, &["rev-parse", "refs/heads/accepted"]),
+        completion.accepted_commit
+    );
+    assert_eq!(
+        git(&repo, &["rev-parse", "HEAD"]),
+        original,
+        "no original checkout/ref writes"
+    );
+    assert_eq!(
+        load(&f.store, &completion.record().unwrap().id()).unwrap(),
+        completion
+    );
+    assert!(
+        drive(
+            &mut f.store,
+            &owner,
+            &mut broker,
+            &carrier,
+            &executor,
+            &permit,
+            &p,
+            &AtomicBool::new(false),
+            0
+        )
+        .is_err(),
+        "accepted wave cannot redispatch"
+    );
+    let runs: i64 = f
+        .store
+        .read_connection()
+        .query_row(
+            "SELECT count(*) FROM local_controller_runs WHERE state='completed'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(runs, 1);
+    let pending:i64=f.store.read_connection().query_row("SELECT count(*) FROM local_budget_reservations WHERE phase IN ('reserved','partly_consumed','completion_pending','consumption_unknown')",[],|r|r.get(0)).unwrap();
+    assert_eq!(pending, 0, "no unconfirmed budget released");
+    let bytes=serde_json::to_vec_pretty(&json!({"profile":"aethyme.local-controller/experimental-v1","completion":completion,"source_host":source_host,"source_repository":repo,"remote":remote,"host":host,"runtime":executor.runtime(),"completed_runs":runs,"pending_reservations":pending,"original_head":original})).unwrap();
+    std::fs::write(host.join("report.json"), bytes).unwrap();
+}
