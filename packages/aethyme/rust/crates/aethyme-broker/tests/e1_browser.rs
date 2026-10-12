@@ -24,6 +24,9 @@ const SOURCE_FILE: &str = "page.html";
 #[path = "e1_browser/model.rs"]
 mod model;
 
+#[path = "e1_browser/sealed.rs"]
+mod sealed;
+
 fn fixtures() -> PathBuf {
     aethyme_testkit::rust_workspace_root()
         .join("crates/aethyme-testkit/fixtures/composition-e1/browser")
@@ -80,6 +83,10 @@ struct World {
 }
 
 fn world(case: &Value, evidence: &Path) -> World {
+    world_at(case, evidence, &fixtures())
+}
+
+fn world_at(case: &Value, evidence: &Path, inputs: &Path) -> World {
     let root = tempfile::Builder::new()
         .prefix("Playground-E1-browser-")
         .tempdir_in(evidence)
@@ -93,8 +100,9 @@ fn world(case: &Value, evidence: &Path) -> World {
         &repo,
         &["config", "user.email", "playground@example.invalid"],
     );
-    let baseline = commit_file(&repo, &std::fs::read(fixtures().join("base.html")).unwrap());
-    let mut commits = BTreeMap::from([("base.html".to_string(), baseline.clone())]);
+    let baseline_name = case["baseline"].as_str().unwrap_or("base.html");
+    let baseline = commit_file(&repo, &std::fs::read(inputs.join(baseline_name)).unwrap());
+    let mut commits = BTreeMap::from([(baseline_name.to_string(), baseline.clone())]);
     let mut store = CollaborationStore::open(
         &CollaborationRoot::under_host_state(&root.join("state")),
         &ProjectKey::parse("e1-browser").unwrap(),
@@ -108,21 +116,30 @@ fn world(case: &Value, evidence: &Path) -> World {
             commit.clone()
         } else {
             git(&repo, &["checkout", "-q", "--detach", &baseline]);
-            let commit = commit_file(&repo, &std::fs::read(fixtures().join(base_name)).unwrap());
+            let commit = commit_file(&repo, &std::fs::read(inputs.join(base_name)).unwrap());
             commits.insert(base_name.into(), commit.clone());
             commit
         };
         git(&repo, &["checkout", "-q", "--detach", &base]);
         let result_name = contribution["result"].as_str().unwrap();
-        let result = commit_file(&repo, &std::fs::read(fixtures().join(result_name)).unwrap());
+        let result = commit_file(&repo, &std::fs::read(inputs.join(result_name)).unwrap());
         commits.insert(result_name.into(), result.clone());
         catalog.push(ContributionSpec {
             id: contribution["id"].as_str().unwrap().into(),
             lineage: Some(captured(&mut store, &repo, &base, &result)),
-            requires: serde_json::from_value(contribution["requires"].clone()).unwrap(),
+            requires: serde_json::from_value(
+                contribution.get("requires").cloned().unwrap_or(json!([])),
+            )
+            .unwrap(),
             atomic_group: contribution["atomic_group"].as_str().map(str::to_string),
             revision_of: None,
-            derived_from: serde_json::from_value(contribution["derived_from"].clone()).unwrap(),
+            derived_from: serde_json::from_value(
+                contribution
+                    .get("derived_from")
+                    .cloned()
+                    .unwrap_or(json!([])),
+            )
+            .unwrap(),
         });
     }
     git(&repo, &["checkout", "-q", "--detach", &baseline]);
