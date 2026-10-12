@@ -2,10 +2,14 @@
 
 Last Updated: 2026-10-12
 
-## Proposed qualification contract
+## Qualified finite profile contract
 
-This is an implemented macOS test profile, pending successful compilation,
-final independent review and explicit execution. It supplies no current execution or acceptance authority.
+This finite macOS test profile passed at source
+`f2c28c55a9a7e296652d6e9c1a425b088d5a4345`, before and after eight named
+guard removals. Static independent review is clear for the declared private,
+single-writer fixture. The [exact evidence ledger](native-source-filesystem-2026-10-12.json)
+records every command, output digest, native journal and failed attempt.
+It supplies no current execution or acceptance authority.
 Existing Docker workload tmpfs/cgroup evidence remains a separate profile.
 
 Use one private temporary APFS image with a fixed 512 MiB logical capacity.
@@ -14,7 +18,8 @@ repository. The sparse backing image requires 2 GiB of host free headroom
 plus its remaining logical capacity before creation/attachment and before
 each bounded pressure block; insufficient host capacity aborts without a
 qualified pressure result. This is an admission and observation guard, not
-a global reservation against concurrent external host writers. Never fill the host filesystem or a Docker daemon store. Preserve
+a global reservation against concurrent external host writers. Never fill
+the host filesystem or a Docker daemon store. Preserve
 the production capture reservation floor (256 MiB); no free-space override or
 success-shaped simulated disk error qualifies this profile.
 
@@ -39,7 +44,11 @@ kernel ENOSPC error. With the same physical full filesystem, require:
 After removing only the owned pressure file, retry/recover with the existing
 capture APIs, materialize the exact snapshot, and run actual retained CAS GC.
 Check source bytes, absence of a false receipt, bounded temporary objects and
-recovery idempotence. Each deliberate guard removal must fail its named
+recovery idempotence. Capacity release checks the create-new entry against its
+held descriptor before unlinking it, then closes that descriptor. Replacement
+and symlink negatives qualify the check in this private single-writer fixture;
+it does not qualify an atomic inode-conditional unlink or a concurrent actor
+changing the path between observation and unlink. Each deliberate guard removal must fail its named
 assertion; restore exact source before a final positive profile.
 
 ## Native client and cleanup boundaries
@@ -67,3 +76,27 @@ refusals must remain distinguishable from actual object/materialization IO.
 Every scheduled attempt, compiler failure, assertion failure and cleanup
 outcome stays in the denominator. No Q3/Q4 or whole Local completion claim
 follows from a contract, an ignored test, or an isolated successful write.
+
+## Recorded outcome and denominator
+
+Restored selected qualification passed 124 overlapping test executions, zero
+failures and five explicit ignores, plus strict broker Clippy. The physical
+profile passed twice, including the final restored run. Seven ordinary guard
+removals and one real-pressure GC path break each failed the named assertion
+with actual exit 101. Source bytes were restored against both the unique backup
+and the exact committed source before the final positive run.
+
+Five positive-profile trials were scheduled: two passed, two failed and one
+was unrun after Clippy failed. The two physical failures are retained: first,
+the classifier missed tempfile's typed wrapped StorageFull; second, truncating
+the full APFS pressure file failed. Both attempts confirmed exact owned cleanup
+and preserved their images, source repositories and independent journals.
+Compiler and Clippy failures remain explicitly uncredited. The separate native
+GC guard failure also confirmed cleanup. No global sweep or forced eject ran.
+
+Capture in this profile exercises actual full-volume admission refusal while
+preserving the production reservation floor. It does not qualify native
+mid-capture journal exhaustion. CAS and materialization observe actual storage
+failure after a separate raw kernel ENOSPC witness. No artifact or successful
+receipt is invented from those failures. Broader D25 and Q3/Q4 requirements
+remain open as described in the Local qualification ledger.
