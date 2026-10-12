@@ -37,7 +37,7 @@ use serde::Serialize;
 pub use crate::host_state::HostStateSource;
 
 /// The schema this binary writes.
-pub const COLLABORATION_STATE_SCHEMA_VERSION: i64 = 18;
+pub const COLLABORATION_STATE_SCHEMA_VERSION: i64 = 22;
 /// The oldest schema a database written by this binary can be read by.
 /// Unlike `host-operations.db`, a newer database stays readable by an older
 /// binary until a release raises this floor.
@@ -61,7 +61,8 @@ pub const COLLABORATION_STATE_SCHEMA_VERSION: i64 = 18;
 // Schema 10 cannot enforce the configured verification producer catalogue.
 // Schema 11 cannot fence unresolved source publication against retention release.
 // Schema 17 reclamation cannot see independently retained native gate jobs.
-const MIN_COMPATIBLE_SCHEMA: i64 = 18;
+// Schema 21 cannot interpret finite controller service appointments.
+const MIN_COMPATIBLE_SCHEMA: i64 = 22;
 const ROOT_DIRECTORY: &str = "collaboration";
 /// Schema steps after the version 1 layout (`meta` only), applied in
 /// order. Step 17 adds separately indexed historical imports and rehearsals. The floor is
@@ -470,6 +471,29 @@ const MIGRATIONS: &[(i64, &str)] = &[
     CREATE TABLE IF NOT EXISTS local_native_gate_roots (
         job TEXT NOT NULL REFERENCES local_native_gate_jobs(id),kind TEXT NOT NULL,
         reference TEXT NOT NULL,PRIMARY KEY(job,kind,reference)
+    ) STRICT;"),
+    (19, "CREATE TABLE IF NOT EXISTS local_controller_completions (
+        id TEXT PRIMARY KEY NOT NULL, wave TEXT NOT NULL UNIQUE REFERENCES local_waves(wave),
+        revision TEXT NOT NULL REFERENCES local_target_revisions(revision),
+        target TEXT NOT NULL REFERENCES local_targets(target), body BLOB NOT NULL
+    ) STRICT;
+    CREATE TABLE IF NOT EXISTS local_controller_completion_roots (
+        completion TEXT NOT NULL REFERENCES local_controller_completions(id),
+        kind TEXT NOT NULL, reference TEXT NOT NULL,
+        PRIMARY KEY(completion,kind,reference)
+    ) STRICT;"),
+    (20, "CREATE TABLE IF NOT EXISTS local_controller_runs (
+        wave TEXT PRIMARY KEY NOT NULL REFERENCES local_waves(wave),
+        id TEXT NOT NULL UNIQUE, epoch TEXT NOT NULL, body BLOB NOT NULL,
+        state TEXT NOT NULL CHECK(state IN ('dispatching','completed','held','unknown')),
+        observation BLOB
+    ) STRICT;"),
+    (21, "SELECT 1;"),
+    (22, "CREATE TABLE IF NOT EXISTS local_controller_services (
+        id TEXT PRIMARY KEY NOT NULL,target TEXT NOT NULL REFERENCES local_targets(target),
+        revision TEXT NOT NULL REFERENCES local_target_revisions(revision),epoch TEXT NOT NULL,
+        nonce TEXT NOT NULL,body BLOB NOT NULL,state TEXT NOT NULL CHECK(state IN ('dispatching','completed','held')),
+        report BLOB,UNIQUE(target,revision,epoch,nonce)
     ) STRICT;"),
 ];
 /// The file that marks a directory as a collaboration root.

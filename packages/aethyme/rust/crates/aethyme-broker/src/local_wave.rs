@@ -81,6 +81,8 @@ pub struct WaveSpec {
     pub objective_authorization: String,
     pub sequence: i64,
     pub baseline: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prior_completion: Option<String>,
     pub selected: Vec<String>,
     pub policy: WavePolicy,
 }
@@ -91,6 +93,7 @@ pub enum WavePhase {
     Frozen,
     Composing,
     Verifying,
+    Accepted,
     Blocked,
     Unsupported,
     NoChange,
@@ -257,7 +260,7 @@ pub fn load(store: &CollaborationStore, wave: &RecordId) -> Result<Wave, WaveErr
         || spec.sequence <= 0
         || spec.target != pinned.target
         || spec.issuer != pinned.issuer
-        || spec.baseline != pinned.spec.baseline
+        || (spec.prior_completion.is_none() && spec.baseline != pinned.spec.baseline)
         || spec.objective_authorization != pinned.spec.objective_authorization
         || spec.selected.is_empty()
         || unique.len() != spec.selected.len()
@@ -270,6 +273,21 @@ pub fn load(store: &CollaborationStore, wave: &RecordId) -> Result<Wave, WaveErr
     {
         return Err(WaveError::Invalid("wave authorization or scope".into()));
     }
+    if let Some(key) = &spec.prior_completion {
+        let (completion, previous) = previous(store, &id(key)?, spec.sequence)?;
+        if completion.target != spec.target
+            || completion.revision != spec.revision
+            || completion.source != spec.baseline
+            || previous
+                .selected
+                .iter()
+                .any(|member| !spec.selected.contains(member))
+        {
+            return Err(WaveError::Invalid(
+                "prior acceptance baseline or cumulative selection".into(),
+            ));
+        }
+    }
     Ok(Wave {
         id: wave.clone(),
         spec,
@@ -281,6 +299,39 @@ pub fn load(store: &CollaborationStore, wave: &RecordId) -> Result<Wave, WaveErr
         composition_ms: row.6,
         drift_count: row.7,
     })
+}
+
+pub(crate) fn previous(
+    store: &CollaborationStore,
+    key: &RecordId,
+    sequence: i64,
+) -> Result<(crate::local_controller::CompletionSpec, WaveSpec), WaveError> {
+    let completion =
+        crate::local_controller::load(store, key).map_err(|e| WaveError::Invalid(e.to_string()))?;
+    let (body, phase, detail, old_sequence): (Vec<u8>, String, Option<String>, i64) =
+        store.read_connection().query_row(
+            "SELECT body,phase,detail,sequence FROM local_waves WHERE wave=?1",
+            [completion.wave.as_str()],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )?;
+    let record =
+        Record::decode(&body, &[&SCHEMA]).map_err(|e| WaveError::Invalid(e.to_string()))?;
+    let spec: WaveSpec = serde_json::from_value(
+        serde_json::from_slice::<serde_json::Value>(&body)?["spec"].clone(),
+    )?;
+    if record.id().as_str() != completion.wave
+        || record.canonical_bytes() != body
+        || phase != "accepted"
+        || detail.as_deref() != Some(key.as_str())
+        || old_sequence != spec.sequence
+        || old_sequence <= 0
+        || old_sequence >= sequence
+        || spec.target != completion.target
+        || spec.revision != completion.revision
+    {
+        return Err(WaveError::Invalid("prior proof-bound accepted wave".into()));
+    }
+    Ok((completion, spec))
 }
 
 fn admission_phase(
@@ -359,7 +410,7 @@ pub fn admit(
     }
     if !matches!(
         observed.phase,
-        Phase::Idle | Phase::Admitting | Phase::WaitingForInput
+        Phase::Idle | Phase::Admitting | Phase::WaitingForInput | Phase::PublicationConfirmed
     ) {
         return Err(TargetError::Frozen.into());
     }
@@ -394,10 +445,19 @@ pub fn admit(
     let mut ready = Vec::new();
     let mut missing = Vec::new();
     for group in groups {
-        if group
-            .iter()
-            .any(|c| dispositions.get(c) != Some(&target::Disposition::Pending))
-        {
+        if group.iter().any(|c| {
+            !matches!(
+                dispositions.get(c),
+                Some(target::Disposition::Pending | target::Disposition::Delivered)
+            )
+        }) {
+            continue;
+        }
+        let group: Vec<_> = group
+            .into_iter()
+            .filter(|c| dispositions.get(c) == Some(&target::Disposition::Pending))
+            .collect();
+        if group.is_empty() {
             continue;
         }
         if group.iter().all(|c| arrivals.contains_key(c)) {
@@ -418,7 +478,9 @@ pub fn admit(
     }
     ready.sort_by_key(|(sequence, _, _)| *sequence);
     let Some((_, ready_at, oldest)) = ready.first() else {
-        return if missing.is_empty() {
+        return if missing.is_empty() && observed.phase == Phase::PublicationConfirmed {
+            Ok(Admission::WaitingForInput { missing })
+        } else if missing.is_empty() {
             block_admission(
                 store,
                 owner,
@@ -457,6 +519,50 @@ pub fn admit(
             }
         }
     }
+    let prior_completion:Option<String>=store.read_connection().query_row(
+        "SELECT c.id FROM local_controller_completions c JOIN local_waves w ON w.wave=c.wave WHERE c.target=?1 AND c.revision=?2 ORDER BY w.sequence DESC LIMIT 1",params![owner.target(),revision.as_str()],|r|r.get(0)).optional()?;
+    if let Some(key) = &prior_completion {
+        let (completion, previous) = previous(store, &id(key)?, i64::MAX)?;
+        if completion.target != owner.target() || completion.revision != revision.as_str() {
+            return Err(WaveError::Stale);
+        }
+        let delivered: Vec<_> = dispositions
+            .iter()
+            .filter(|(_, d)| **d == target::Disposition::Delivered)
+            .map(|(c, _)| c.clone())
+            .collect();
+        if delivered.iter().any(|c| !previous.selected.contains(c))
+            || previous.selected.iter().any(|c| !delivered.contains(c))
+        {
+            return Err(WaveError::Invalid(
+                "delivered members do not match prior accepted wave".into(),
+            ));
+        }
+        selected.extend(delivered);
+    } else if dispositions
+        .values()
+        .any(|d| *d == target::Disposition::Delivered)
+    {
+        return Err(WaveError::Invalid(
+            "delivered members have no private completion".into(),
+        ));
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    selected.retain(|member| seen.insert(member.clone()));
+    if selected.len() > policy.max_group {
+        return Err(WaveError::Invalid(
+            "cumulative selection exceeds finite allowance".into(),
+        ));
+    }
+    let next_baseline = prior_completion
+        .as_ref()
+        .map(|key| {
+            crate::local_controller::load(store, &id(key)?)
+                .map(|c| c.source)
+                .map_err(|e| WaveError::Invalid(e.to_string()))
+        })
+        .transpose()?
+        .unwrap_or_else(|| pinned.spec.baseline.clone());
     let tx = store
         .connection()
         .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -471,7 +577,8 @@ pub fn admit(
         revision: revision.to_string(),
         objective_authorization: pinned.spec.objective_authorization,
         sequence,
-        baseline: pinned.spec.baseline,
+        baseline: next_baseline,
+        prior_completion,
         selected,
         policy,
     };
@@ -582,9 +689,22 @@ pub fn compose(
     }
     tx.commit()?;
     let started = std::time::Instant::now();
+    let (base_commit, accepted, already_delivered) = if let Some(key) = &wave.spec.prior_completion
+    {
+        let (completion, prior) = previous(store, &id(key)?, wave.spec.sequence)?;
+        let original = archive::retained(store, &snapshot(&pinned.spec.baseline)?)?
+            .ok_or(TargetError::Missing)?;
+        (
+            CommitOid::parse(&completion.accepted_commit)?,
+            vec![original.commit],
+            Some((id(key)?, prior.selected)),
+        )
+    } else {
+        (baseline.commit, vec![], None)
+    };
     let request = CompositionRequest {
-        baseline: baseline.commit,
-        accepted: vec![],
+        baseline: base_commit,
+        accepted,
         catalog: pinned.spec.catalog()?,
         deliveries: wave.spec.selected.clone(),
         budget: CompositionBudget {
@@ -592,7 +712,11 @@ pub fn compose(
             ..CompositionBudget::default()
         },
     };
-    let result = composer::compose(store, repo, &request);
+    let result = if let Some((completion, members)) = already_delivered {
+        composer::compose_after_accepted(store, repo, &request, completion, members)
+    } else {
+        composer::compose(store, repo, &request)
+    };
     let elapsed = i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX);
     // State may have been stopped while the external Git tool ran. Retain the
     // bytes as historical work, but reject changing the current generation.
@@ -660,7 +784,7 @@ pub fn compose(
     tx.execute("UPDATE local_targets SET phase=?3, resume_phase=?4, version=version+1 WHERE target=?1 AND active_revision=?2 AND phase='composing'", params![owner.target(),wave.spec.revision,next,if phase == "verifying" { Some("verifying") } else { None }])?;
     if !matches!(phase, "verifying" | "outcome_unknown") {
         for contribution in &wave.spec.selected {
-            tx.execute("UPDATE local_target_dispositions SET status=?3, detail=?4 WHERE revision=?1 AND contribution=?2", params![wave.spec.revision,contribution,if phase == "unsupported" { "unsupported" } else { "blocked" },detail])?;
+            tx.execute("UPDATE local_target_dispositions SET status=?3, detail=?4 WHERE revision=?1 AND contribution=?2 AND status='in_wave'", params![wave.spec.revision,contribution,if phase == "unsupported" { "unsupported" } else { "blocked" },detail])?;
         }
     }
     tx.commit()?;

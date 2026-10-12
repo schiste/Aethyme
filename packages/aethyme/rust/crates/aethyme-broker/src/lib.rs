@@ -102,6 +102,7 @@ mod leases;
 pub mod local_acceptance;
 pub mod local_authority;
 pub mod local_budget;
+pub mod local_controller;
 pub mod local_exchange;
 pub mod local_generation;
 pub mod local_handoff;

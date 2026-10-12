@@ -200,6 +200,7 @@ impl Phase {
 pub enum Disposition {
     Pending,
     InWave,
+    Delivered,
     Blocked,
     Unsupported,
     Excluded,

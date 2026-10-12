@@ -248,6 +248,11 @@ fn validate(
         return Err(invalid("a candidate without its recipe"));
     };
     let record = composer::read_recipe(store, recipe)?;
+    if record.get("accepted_baseline").is_some() {
+        return Err(invalid(
+            "incremental accepted-baseline resolution needs its own appointed profile",
+        ));
+    }
     let field = |name: &str| match record.get(name) {
         Some(Value::String(text)) => text.clone(),
         _ => String::new(),

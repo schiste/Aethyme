@@ -360,6 +360,52 @@ pub fn revoke(
     }
     Ok(())
 }
+/// Recover an already configured native producer at an explicit generation.
+/// This never configures, rotates or revives producer authority. Dispatch
+/// rechecks the catalogue under its existing shared producer guard.
+pub fn existing_permit(
+    store: &CollaborationStore,
+    owner: &ControllerOwner,
+    producer: &str,
+    expected: i64,
+) -> Result<ProducerPermit, VerificationError> {
+    let _authority = target::authorize(store, owner)?;
+    if !valid_name(producer) || expected < 1 {
+        return Err(VerificationError::Producer);
+    }
+    let file = producer_lock(store, owner.target(), producer)?;
+    file.lock_shared()?;
+    let row:Option<(i64,String,Vec<u8>,String,bool)>=store.read_connection().query_row("SELECT generation,policy,body,epoch,revoked FROM local_verifier_producers WHERE target=?1 AND producer=?2",params![owner.target(),producer],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).optional()?;
+    let (generation, identity, body, epoch, revoked) = row.ok_or(VerificationError::Producer)?;
+    if generation != expected || revoked || epoch != owner.authority_epoch().as_str() {
+        return Err(VerificationError::Stale);
+    }
+    let record = decode_record(&body, &POLICY)?;
+    let policy: VerifierPolicy = serde_json::from_value(
+        serde_json::from_slice::<serde_json::Value>(&body)?["policy"].clone(),
+    )?;
+    let revision = target::status(store, owner.target())?
+        .revision
+        .ok_or(VerificationError::Mismatch)?;
+    if record.canonical_bytes() != body
+        || record.id().as_str() != identity
+        || policy.record()?.id() != record.id()
+        || target::load_revision(store, &revision)?
+            .spec
+            .acceptance_policy
+            != identity
+    {
+        return Err(VerificationError::Mismatch);
+    }
+    Ok(ProducerPermit {
+        producer: producer.into(),
+        generation,
+        policy,
+        epoch: owner.authority_epoch().clone(),
+        target: owner.target().into(),
+    })
+}
+
 /// Shared producer lock spans dispatch acknowledgement; catalogue changes take
 /// it exclusively. External epoch authority is acquired first everywhere.
 pub(crate) struct VerificationGuard {
