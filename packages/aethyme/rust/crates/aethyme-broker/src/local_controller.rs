@@ -38,6 +38,8 @@ pub enum ControllerError {
     #[error(transparent)]
     Acceptance(#[from] acceptance::AcceptanceError),
     #[error(transparent)]
+    Transport(#[from] crate::local_source_transport::TransportError),
+    #[error(transparent)]
     Archive(#[from] archive::ArchiveError),
     #[error(transparent)]
     Sqlite(#[from] rusqlite::Error),
@@ -94,6 +96,8 @@ pub fn complete(
     let state = target::status(store, owner.target())?;
     let active = wave::load(store, wave_id)?;
     let receipt = grant.receipt();
+    let intent_id = RecordId::parse(&receipt.spec.intent).map_err(|_| ControllerError::Mismatch)?;
+    let intent = crate::local_source_transport::load(store, &intent_id)?;
     let source = active
         .candidate_snapshot
         .as_ref()
@@ -108,6 +112,7 @@ pub fn complete(
         || active.phase != WavePhase::Verifying
         || active.spec.target != owner.target()
         || receipt.spec.decision != acceptance::ProviderDecision::Accepted
+        || intent.spec.wave != wave_id.as_str()
         || receipt.spec.revision != active.spec.revision
         || receipt.spec.source != source.as_str()
         || receipt.spec.candidate_commit != commit.as_str()

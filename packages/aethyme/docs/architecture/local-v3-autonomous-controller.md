@@ -38,5 +38,15 @@ and separate final held-out model cases. Preserve the complete schedule,
 attempts, exclusions, failures, unknown consumption and actual costs. State
 tests or a manually driven native path do not qualify autonomy.
 
-No controller implementation or FX17 result is claimed by this contract
-checkpoint. Coordination and Git Platform remain outside this Local package.
+The completion integration consumes the existing private acceptance grant,
+rechecks its current verifier/provider guards, binds its transport intent to
+the exact wave, and atomically records publication confirmation and delivered
+members. Its historical record confers no future authority. Schema 19 adds
+independent completion roots; the compatibility floor is also 19.
+
+Two local controls pass: every historical identity changes the canonical
+record ID, and public transitions still cannot manufacture delivery. The
+first compile/test failures are retained. This is a foundation checkpoint:
+the automatic dispatch/service loop and FX17 are still unrun and unqualified.
+Generation preparation currently consumes its private grant before completion
+because existing generation/verifier APIs require the verifying phase. Coordination and Git Platform remain outside this Local package.
