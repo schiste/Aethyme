@@ -2575,4 +2575,73 @@ mod tests {
         late.push(0);
         assert!(!is_binary(&late));
     }
+    #[test]
+    #[cfg(unix)]
+    fn unsupported_grammar_never_dispatches_the_structural_tool() {
+        use std::os::unix::fs::PermissionsExt;
+        let f = crate::local_target::tests::Fixture::new();
+        let root = tempfile::tempdir().unwrap();
+        let tool = root.path().join("control");
+        let bytes=b"#!/bin/sh\nif [ \"$1\" = --version ]; then printf 'mergiraf 0.19.1\\n'; exit 0; fi\nprintf 'Selected best merge: fully_structured\\n' >&2\nprintf 'wrong-control-output\\n'\n";
+        std::fs::write(&tool, bytes).unwrap();
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let hash = ObjectDigest::of(bytes).hex();
+        let engine = MergirafEngine::pin(&tool, &hash).unwrap();
+        let mut profile = MergeProfile {
+            engine: Some(&engine),
+            observations: Vec::new(),
+            text_merges: 0,
+        };
+        let mut reader = Reader {
+            store: &f.store,
+            cache: HashMap::new(),
+            cached_bytes: 0,
+            charged: HashSet::new(),
+            manifests: HashMap::new(),
+            bytes: 0,
+        };
+        let entry = |bytes: &[u8]| {
+            Some((
+                EntryKind::Regular,
+                collaboration_archive::put_object(&f.store, bytes)
+                    .unwrap()
+                    .raw(),
+            ))
+        };
+        let request = CompositionRequest {
+            baseline: f.a.base.commit.clone(),
+            accepted: vec![],
+            catalog: vec![],
+            deliveries: vec![],
+            budget: Default::default(),
+        };
+        let mut usage = BudgetUsage::default();
+        let merged = apply_path(
+            &mut reader,
+            PathMerge {
+                scratch: root.path(),
+                path: b"source.rs",
+                profile: &mut profile,
+            },
+            entry(b"alpha\nbeta\ngamma\ndelta\nomega\n"),
+            entry(b"ALPHA\nbeta\ngamma\ndelta\nomega\n"),
+            entry(b"alpha\nbeta\ngamma\ndelta\nOMEGA\n"),
+            &mut usage,
+            &request,
+        )
+        .unwrap()
+        .unwrap_or_else(|error| panic!("control merge refused: {}", error.1))
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            reader.blob(&merged.1).unwrap(),
+            b"ALPHA\nbeta\ngamma\ndelta\nOMEGA\n",
+            "unsupported grammar uses exact text merge"
+        );
+        assert!(
+            profile.observations.is_empty(),
+            "unsupported grammar must never dispatch external engine"
+        );
+        assert_eq!(profile.text_merges, 1);
+    }
 }

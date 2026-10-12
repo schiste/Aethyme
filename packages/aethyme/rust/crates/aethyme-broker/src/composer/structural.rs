@@ -98,14 +98,7 @@ impl MergirafEngine {
             // A stalled filesystem reader may finish after admission expires.
             crate::warn_unrecorded("deliver bounded executable bytes", sender.send(result));
         });
-        let bytes = receiver
-            .recv_timeout(Duration::from_secs(3))
-            .map_err(|_| {
-                ComposeError::InvalidRequest(
-                    "structural executable acquisition deadline exhausted".into(),
-                )
-            })?
-            .map_err(|source| io(executable, source))?;
+        let bytes = receive_tool_bytes(receiver, Duration::from_secs(3), executable)?;
         if bytes.len() > TOOL_LIMIT || digest(&bytes) != expected_sha256 {
             return Err(ComposeError::InvalidRequest(
                 "structural executable size or digest mismatch".into(),
@@ -255,6 +248,21 @@ impl MergirafEngine {
     }
 }
 
+fn receive_tool_bytes(
+    receiver: std::sync::mpsc::Receiver<Result<Vec<u8>, std::io::Error>>,
+    allowance: Duration,
+    path: &Path,
+) -> Result<Vec<u8>, ComposeError> {
+    receiver
+        .recv_timeout(allowance)
+        .map_err(|_| {
+            ComposeError::InvalidRequest(
+                "structural executable acquisition deadline exhausted".into(),
+            )
+        })?
+        .map_err(|source| io(path, source))
+}
+
 pub(crate) fn supports(path: &[u8]) -> bool {
     path.rsplit(|byte| *byte == b'.')
         .next()
@@ -358,10 +366,151 @@ mod tests {
         let started = std::time::Instant::now();
         let (sender, receiver) = std::sync::mpsc::sync_channel(1);
         std::thread::spawn(move || {
-            let result = MergirafEngine::pin(&fifo, &"0".repeat(64)).is_err();
+            let result = MergirafEngine::pin(&fifo, &"0".repeat(64))
+                .err()
+                .map(|e| e.to_string());
             crate::warn_unrecorded("deliver FIFO admission test result", sender.send(result));
         });
-        assert!(receiver.recv_timeout(Duration::from_secs(2)).unwrap());
+        assert!(
+            receiver
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap()
+                .unwrap()
+                .contains("must be a regular file"),
+            "FIFO regular-file admission guard"
+        );
         assert!(started.elapsed() < Duration::from_secs(1));
+    }
+    #[cfg(unix)]
+    fn control_tool(root: &Path, diagnostic: &str, version: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let tool = root.join("synthetic-tool");
+        let script = format!(
+            "#!/bin/sh\nif [ \"$1\" = --version ]; then printf '%s\\n' '{version}'; exit 0; fi\nprintf '%s\\n' '{diagnostic}' >&2\nprintf 'control-output\\n'\n"
+        );
+        std::fs::write(&tool, script).unwrap();
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o700)).unwrap();
+        tool
+    }
+    #[test]
+    #[cfg(unix)]
+    fn wrong_digest_of_a_runnable_tool_is_refused() {
+        let root = tempfile::tempdir().unwrap();
+        let tool = control_tool(
+            root.path(),
+            "Selected best merge: fully_structured",
+            "mergiraf 0.19.1",
+        );
+        let good = digest(&std::fs::read(&tool).unwrap());
+        MergirafEngine::pin(&tool, &good).unwrap();
+        assert!(
+            MergirafEngine::pin(&tool, &"0".repeat(64)).is_err(),
+            "runnable tool wrong digest must refuse"
+        );
+    }
+    #[test]
+    fn acquisition_deadline_precedes_a_finite_delayed_reader() {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(80));
+            crate::warn_unrecorded("deliver delayed control bytes", sender.send(Ok(vec![1])));
+        });
+        let observed = receive_tool_bytes(
+            receiver,
+            Duration::from_millis(5),
+            Path::new("<delayed-control>"),
+        );
+        worker.join().unwrap();
+        assert!(
+            observed.is_err(),
+            "tool acquisition deadline must refuse delayed bytes"
+        );
+    }
+    #[test]
+    #[cfg(unix)]
+    fn acquired_copy_survives_original_path_replacement() {
+        let root = tempfile::tempdir().unwrap();
+        let tool = control_tool(
+            root.path(),
+            "Selected best merge: line_based",
+            "mergiraf 0.19.1",
+        );
+        let good = digest(&std::fs::read(&tool).unwrap());
+        let engine = MergirafEngine::pin(&tool, &good).unwrap();
+        std::fs::write(&tool, "#!/bin/sh\nexit 77\n").unwrap();
+        let merged = engine
+            .merge(b"page.html", b"base", b"current", b"result")
+            .unwrap();
+        assert_eq!(
+            merged.bytes.unwrap(),
+            b"control-output\n",
+            "acquired bytes remain executable identity"
+        );
+        assert_eq!(merged.observation.method, MergeMethod::LineBased);
+    }
+    #[test]
+    #[cfg(unix)]
+    fn actual_observation_binds_selected_diagnostic_and_all_roles() {
+        for (diagnostic, method) in [
+            ("Selected best merge: line_based", MergeMethod::LineBased),
+            (
+                "Selected best merge: fully_structured",
+                MergeMethod::FullyStructured,
+            ),
+            ("attempted fully_structured", MergeMethod::Unknown),
+            (
+                "Selected best merge: line_based\nSelected best merge: fully_structured",
+                MergeMethod::Unknown,
+            ),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let tool = control_tool(root.path(), diagnostic, "mergiraf 0.19.1");
+            let good = digest(&std::fs::read(&tool).unwrap());
+            let engine = MergirafEngine::pin(&tool, &good).unwrap();
+            let merged = engine
+                .merge(b"page.html", b"base", b"current", b"result")
+                .unwrap();
+            let o = merged.observation;
+            assert_eq!(
+                o.method, method,
+                "actual method comes from selected diagnostic"
+            );
+            assert!(!o.timed_fallback, "unrelated control is not timed fallback");
+            assert_eq!(o.base_sha256, digest(b"base"));
+            assert_eq!(o.current_sha256, digest(b"current"));
+            assert_eq!(o.result_sha256, digest(b"result"));
+            assert_eq!(o.output_sha256, digest(b"control-output\n"));
+            assert_eq!(
+                o.diagnostic_sha256,
+                digest(format!("{diagnostic}\n").as_bytes())
+            );
+        }
+    }
+    #[test]
+    #[cfg(unix)]
+    fn wrong_version_and_symlink_cannot_admit_a_control_tool() {
+        let root = tempfile::tempdir().unwrap();
+        let tool = control_tool(
+            root.path(),
+            "Selected best merge: fully_structured",
+            "mergiraf 99.0.0",
+        );
+        let good = digest(&std::fs::read(&tool).unwrap());
+        assert!(
+            MergirafEngine::pin(&tool, &good).is_err(),
+            "correct hash wrong version must refuse"
+        );
+        let tool = control_tool(
+            root.path(),
+            "Selected best merge: fully_structured",
+            "mergiraf 0.19.1",
+        );
+        let good = digest(&std::fs::read(&tool).unwrap());
+        let link = root.path().join("tool-link");
+        std::os::unix::fs::symlink(&tool, &link).unwrap();
+        assert!(
+            MergirafEngine::pin(&link, &good).is_err(),
+            "tool symlink must refuse"
+        );
     }
 }
