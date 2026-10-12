@@ -66,7 +66,7 @@ pub enum GateConfigError {
 }
 
 /// One configured gate, with its compiled trigger set.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Gate {
     pub name: String,
     pub command: String,
@@ -910,6 +910,7 @@ pub(crate) struct GateExecutionContext<'a> {
 struct GateRuntimeContext<'a> {
     progress: &'a dyn GateProgressSink,
     admission_host: &'a dyn crate::gate_admission::AdmissionHost,
+    deadline: Option<Instant>,
 }
 
 pub(crate) fn heartbeat_interval() -> Duration {
@@ -1358,6 +1359,32 @@ pub(crate) fn run_affected_for_submit(
     )
 }
 
+/// Same executor as native submit, with one finite admission/command allowance.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_affected_bounded(
+    store: &mut BrokerStore,
+    main_root: &Path,
+    checkout: &GitRepo,
+    gates: &[Gate],
+    changed: &[String],
+    allowance: Duration,
+) -> Result<Vec<GateRunOutcome>, crate::broker::BrokerOpError> {
+    let progress = StderrGateProgressSink;
+    run_selections(
+        store,
+        main_root,
+        checkout,
+        select_gates(gates, changed),
+        None,
+        CachePolicy::Bypass,
+        GateRuntimeContext {
+            progress: &progress,
+            admission_host: &crate::gate_admission::SystemAdmissionHost,
+            deadline: Some(Instant::now() + allowance),
+        },
+    )
+}
+
 /// Like [`run_affected`], with an injectable progress sink.
 pub(crate) fn run_affected_with_progress(
     store: &mut BrokerStore,
@@ -1379,6 +1406,7 @@ pub(crate) fn run_affected_with_progress(
         GateRuntimeContext {
             progress: context.progress,
             admission_host: &crate::gate_admission::SystemAdmissionHost,
+            deadline: None,
         },
     )
 }
@@ -1438,6 +1466,7 @@ pub(crate) fn run_all_with_progress(
         GateRuntimeContext {
             progress,
             admission_host: &crate::gate_admission::SystemAdmissionHost,
+            deadline: None,
         },
     )
 }
@@ -1480,6 +1509,7 @@ pub(crate) fn run_named(
         GateRuntimeContext {
             progress: &progress,
             admission_host: &crate::gate_admission::SystemAdmissionHost,
+            deadline: None,
         },
     )
 }
@@ -1504,6 +1534,29 @@ impl GateOwnerLocks {
         progress: &dyn GateProgressSink,
         waits: (&Path, Option<i64>),
     ) -> Result<Self, std::io::Error> {
+        Self::acquire_bounded(
+            owner_dir,
+            gate_name,
+            owner_paths,
+            holder,
+            report_every,
+            progress,
+            waits,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn acquire_bounded(
+        owner_dir: &Path,
+        gate_name: &str,
+        owner_paths: &[String],
+        holder: &str,
+        report_every: Duration,
+        progress: &dyn GateProgressSink,
+        waits: (&Path, Option<i64>),
+        deadline: Option<Instant>,
+    ) -> Result<Self, std::io::Error> {
         std::fs::create_dir_all(owner_dir)?;
         let mut paths = gate_owner_lock_paths(owner_dir, gate_name, owner_paths);
         paths.sort();
@@ -1517,6 +1570,12 @@ impl GateOwnerLocks {
             // this gate as waiting; removed when the lock is taken.
             let mut registration: Option<crate::waiters::WaitRegistration> = None;
             let lock = loop {
+                if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "gate owner admission deadline exhausted",
+                    ));
+                }
                 let file = crate::file_lock::open_lock_file(&path)?;
                 if let Some(lock) = crate::file_lock::ExclusiveFileLock::try_acquire(file)? {
                     break lock;
@@ -1548,7 +1607,13 @@ impl GateOwnerLocks {
                     }
                     next_report = waited + report_every;
                 }
-                std::thread::sleep(OWNER_LOCK_POLL);
+                let sleep = deadline
+                    .map(|d| {
+                        d.saturating_duration_since(Instant::now())
+                            .min(OWNER_LOCK_POLL)
+                    })
+                    .unwrap_or(OWNER_LOCK_POLL);
+                std::thread::sleep(sleep);
             };
             lock.record_holder(holder)?;
             locks.push(lock);
@@ -1697,6 +1762,7 @@ fn acquire_gate_resources(
     tree: &str,
     worker_id: &str,
     progress: &dyn GateProgressSink,
+    deadline: Option<Instant>,
 ) -> Result<Option<GateResourceRuntime>, String> {
     if gate.resources.is_empty() && gate.managed_cache.is_none() {
         return Ok(None);
@@ -1736,7 +1802,12 @@ fn acquire_gate_resources(
     let grant = coordinator
         .acquire_with_wait(
             &request,
-            std::time::Duration::from_secs(gate.resource_wait_seconds),
+            deadline
+                .map(|d| {
+                    d.saturating_duration_since(Instant::now())
+                        .min(Duration::from_secs(gate.resource_wait_seconds))
+                })
+                .unwrap_or(Duration::from_secs(gate.resource_wait_seconds)),
             |message| {
                 let now = std::time::Instant::now();
                 if now >= next_report {
@@ -1989,7 +2060,19 @@ fn run_selections(
     let mut outcomes = Vec::new();
     let mut expensive_advisories_surfaced = false;
     for selection in selections {
-        let gate = selection.gate;
+        let bounded_gate;
+        let gate = if let Some(deadline) = runtime.deadline {
+            bounded_gate = {
+                let mut gate = selection.gate.clone();
+                gate.resource_wait_seconds = gate
+                    .resource_wait_seconds
+                    .min(deadline.saturating_duration_since(Instant::now()).as_secs());
+                gate
+            };
+            &bounded_gate
+        } else {
+            selection.gate
+        };
         let worker_id = gate_worker_id(session_id, &gate.name);
         if cache_policy == CachePolicy::Bypass {
             crate::warn_unrecorded(
@@ -2117,7 +2200,7 @@ fn run_selections(
             break;
         }
         let owner_dir = run_dir.join("owners");
-        let owner_locks = GateOwnerLocks::acquire(
+        let owner_locks = GateOwnerLocks::acquire_bounded(
             &owner_dir,
             &gate.name,
             &selection.owner_paths,
@@ -2125,33 +2208,53 @@ fn run_selections(
             heartbeat_interval(),
             progress,
             (main_root, session_id),
-        )
-        .map_err(|source| crate::BrokerError::Io {
-            path: owner_dir,
-            source,
-        })?;
-        let mut resource_runtime =
-            match acquire_gate_resources(gate, checkout, &tree, &worker_id, progress) {
-                Ok(runtime) => runtime,
-                Err(message) => {
-                    drop(owner_locks);
-                    let diagnostic = format!("host resource acquisition failed: {message}");
-                    let outcome = record_gate_preflight_resource_failure(
-                        store,
-                        GatePreflightResourceFailure {
-                            gate,
-                            tree: &tree,
-                            session_id,
-                            wait_duration_ms: wait_started.elapsed().as_millis() as i64,
-                            log_path: &log_path,
-                            diagnostic: &diagnostic,
-                            progress,
-                        },
-                    )?;
-                    outcomes.push(outcome);
-                    break;
+            runtime.deadline,
+        );
+        let owner_locks = match owner_locks {
+            Ok(locks) => locks,
+            Err(source) if source.kind() == std::io::ErrorKind::TimedOut => {
+                outcomes.push(record_gate_preflight_resource_failure(store,GatePreflightResourceFailure {
+                    gate,tree:&tree,session_id,wait_duration_ms:wait_started.elapsed().as_millis() as i64,
+                    log_path:&log_path,diagnostic:"native gate admission deadline exhausted before command dispatch",progress,
+                })?);
+                break;
+            }
+            Err(source) => {
+                return Err(crate::BrokerError::Io {
+                    path: owner_dir,
+                    source,
                 }
-            };
+                .into());
+            }
+        };
+        let mut resource_runtime = match acquire_gate_resources(
+            gate,
+            checkout,
+            &tree,
+            &worker_id,
+            progress,
+            runtime.deadline,
+        ) {
+            Ok(runtime) => runtime,
+            Err(message) => {
+                drop(owner_locks);
+                let diagnostic = format!("host resource acquisition failed: {message}");
+                let outcome = record_gate_preflight_resource_failure(
+                    store,
+                    GatePreflightResourceFailure {
+                        gate,
+                        tree: &tree,
+                        session_id,
+                        wait_duration_ms: wait_started.elapsed().as_millis() as i64,
+                        log_path: &log_path,
+                        diagnostic: &diagnostic,
+                        progress,
+                    },
+                )?;
+                outcomes.push(outcome);
+                break;
+            }
+        };
         let resource_provenance = resource_runtime
             .as_ref()
             .map(|runtime| GateResourceProvenance {
@@ -2241,13 +2344,38 @@ fn run_selections(
                 .and_then(|headroom| i64::try_from(headroom.bytes).ok()),
             free_disk_bytes_end: None,
         };
-        let timeout_seconds = crate::gate_admission::timeout_seconds_for_load(
+        let mut timeout_seconds = crate::gate_admission::timeout_seconds_for_load(
             gate.timeout_seconds,
             gate.cost,
             gate.max_load_per_cpu,
             environment.load_avg_1m_start,
             environment.cpu_count,
         );
+        if let Some(deadline) = runtime.deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now()).as_secs();
+            if remaining == 0 {
+                if let Some(resource) = resource_runtime.as_mut() {
+                    crate::warn_unrecorded(
+                        "release expired native gate resources",
+                        resource.release(),
+                    );
+                }
+                outcomes.push(record_gate_preflight_resource_failure(
+                    store,
+                    GatePreflightResourceFailure {
+                        gate,
+                        tree: &tree,
+                        session_id,
+                        wait_duration_ms: wait_started.elapsed().as_millis() as i64,
+                        log_path: &log_path,
+                        diagnostic: "native gate allowance exhausted before command dispatch",
+                        progress,
+                    },
+                )?);
+                break;
+            }
+            timeout_seconds = Some(timeout_seconds.unwrap_or(remaining).min(remaining));
+        }
         let started = Instant::now();
         let broker_database = std::cell::OnceCell::new();
         let run_labels =
@@ -2268,6 +2396,7 @@ fn run_selections(
                 owner_paths: &selection.owner_paths,
                 configured_timeout_seconds: gate.timeout_seconds,
                 timeout_seconds,
+                absolute_deadline: runtime.deadline,
                 started,
                 progress,
                 resources: resource_runtime.as_ref(),
@@ -2782,6 +2911,7 @@ struct GateCommandContext<'a> {
     owner_paths: &'a [String],
     configured_timeout_seconds: Option<u64>,
     timeout_seconds: Option<u64>,
+    absolute_deadline: Option<Instant>,
     started: Instant,
     progress: &'a dyn GateProgressSink,
     resources: Option<&'a GateResourceRuntime>,
@@ -2846,11 +2976,27 @@ fn isolated_broker_db_dir(run_dir: &Path, owner_pid: u32) -> std::io::Result<tem
         .tempdir_in(run_dir)
 }
 
+fn require_command_allowance(deadline: Option<Instant>) -> Result<(), std::io::Error> {
+    if deadline.is_some_and(|cutoff| Instant::now() >= cutoff) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "native gate allowance exhausted before command dispatch",
+        ));
+    }
+    Ok(())
+}
+
+fn command_completion_is_late(deadline: Option<Instant>) -> bool {
+    deadline.is_some_and(|cutoff| Instant::now() >= cutoff)
+}
+
 fn run_gate_command(
     command: &str,
     context: GateCommandContext<'_>,
 ) -> Result<GateCommandOutcome, std::io::Error> {
     use std::os::unix::process::CommandExt;
+
+    require_command_allowance(context.absolute_deadline)?;
 
     // Before anything is spawned. A build that runs out of space reports link
     // failures and unrelated test failures rather than a disk error, and that
@@ -2988,6 +3134,7 @@ fn run_gate_command(
     if let Some(path) = crate::git::sanitized_subprocess_path() {
         process.env("PATH", path);
     }
+    require_command_allowance(context.absolute_deadline)?;
     let mut child = process.spawn()?;
 
     let pidfile = context.session_id.map(|sid| {
@@ -3106,9 +3253,15 @@ fn run_gate_command(
         let mut timed_out = false;
         let status = 'wait: loop {
             match child.try_wait() {
-                Ok(Some(status)) => break Ok(status),
+                Ok(Some(status)) => {
+                    timed_out = command_completion_is_late(context.absolute_deadline);
+                    break Ok(status);
+                }
                 Ok(None)
-                    if deadline.is_some_and(|deadline| context.started.elapsed() >= deadline) =>
+                    if deadline.is_some_and(|deadline| context.started.elapsed() >= deadline)
+                        || context
+                            .absolute_deadline
+                            .is_some_and(|cutoff| Instant::now() >= cutoff) =>
                 {
                     timed_out = true;
                     let seconds = context.timeout_seconds.unwrap_or_default();
@@ -3344,6 +3497,54 @@ fn preserve_failed_gate_log(log_path: &Path, status: GateStatus) -> PathBuf {
 mod tests {
     use super::*;
 
+    #[test]
+    fn bounded_command_refuses_expired_dispatch_and_late_success() {
+        let root = tempfile::tempdir().unwrap();
+        let deadline = Some(Instant::now() - Duration::from_secs(1));
+        let environment = GateEnvironment::default();
+        let database = std::cell::OnceCell::new();
+        let labels = crate::gate_debris::GateRunLabels::new("deadline", None, "synthetic");
+        let lines = Lines::default();
+        let log = root.path().join("log");
+        let result = run_gate_command(
+            "touch dispatched",
+            GateCommandContext {
+                cwd: root.path(),
+                available_bytes: None,
+                available_inodes: None,
+                environment: &environment,
+                log_path: &log,
+                run_dir: root.path(),
+                session_id: None,
+                gate_name: "deadline",
+                tree: "synthetic",
+                worker_id: "deadline",
+                owner_paths: &[],
+                configured_timeout_seconds: Some(1),
+                timeout_seconds: Some(1),
+                absolute_deadline: deadline,
+                started: Instant::now(),
+                progress: &lines,
+                resources: None,
+                managed_cache: None,
+                broker_database: &database,
+                run_labels: &labels,
+            },
+        );
+        assert_eq!(result.err().unwrap().kind(), std::io::ErrorKind::TimedOut);
+        assert!(!root.path().join("dispatched").exists());
+        let mut child = std::process::Command::new("/usr/bin/true").spawn().unwrap();
+        assert!(child.wait().unwrap().success());
+        assert!(
+            command_completion_is_late(deadline),
+            "late success must not become a passing observation"
+        );
+        assert!(
+            !command_completion_is_late(None),
+            "ordinary legacy completion keeps its existing semantics"
+        );
+    }
+
     #[derive(Default)]
     struct Lines(std::sync::Mutex<Vec<String>>);
 
@@ -3544,6 +3745,50 @@ mod tests {
     }
 
     #[test]
+    fn bounded_native_owner_wait_defers_without_starting_a_command() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("app");
+        init_repo(&root);
+        let gates = parse_gates("[[gate]]\nname='bounded'\ncommand='touch .gate-started'\ntimeout_seconds=1\ncache=false\n").unwrap();
+        let checkout = GitRepo::discover(&root).unwrap();
+        let mut store = BrokerStore::open(&root.join(".aethyme/broker.db")).unwrap();
+        let changed = vec!["file.txt".to_string()];
+        let selections = select_gates(&gates, &changed);
+        let progress = Lines::default();
+        let owners = running_dir(&root).join("owners");
+        let held = GateOwnerLocks::acquire(
+            &owners,
+            "bounded",
+            &selections[0].owner_paths,
+            "another live native run",
+            Duration::from_secs(1),
+            &progress,
+            (&root, None),
+        )
+        .unwrap();
+        let start = Instant::now();
+        let outcome = run_affected_bounded(
+            &mut store,
+            &root,
+            &checkout,
+            &gates,
+            &changed,
+            Duration::from_millis(150),
+        )
+        .unwrap();
+        assert!(
+            start.elapsed() < Duration::from_secs(3),
+            "owner admission was not bounded"
+        );
+        assert_eq!(outcome.len(), 1);
+        assert!(outcome[0].is_host_fault());
+        assert_eq!(outcome[0].exit_code, None);
+        assert!(!root.join(".gate-started").exists());
+        drop(held);
+        assert!(crate::waiters::current_waiters(&root, crate::clock::epoch_ms()).is_empty());
+    }
+
+    #[test]
     fn sustained_host_load_defers_without_spawning_and_retry_runs_after_recovery() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("app");
@@ -3573,6 +3818,7 @@ mod tests {
             GateRuntimeContext {
                 progress: &progress,
                 admission_host: &host,
+                deadline: None,
             },
         )
         .unwrap();
@@ -3613,6 +3859,7 @@ mod tests {
             GateRuntimeContext {
                 progress: &progress,
                 admission_host: &recovered_host,
+                deadline: None,
             },
         )
         .unwrap();
@@ -3658,6 +3905,7 @@ mod tests {
             GateRuntimeContext {
                 progress: &progress,
                 admission_host: &host,
+                deadline: None,
             },
         )
         .unwrap();

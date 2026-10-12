@@ -1128,7 +1128,7 @@ impl Broker {
         Ok(Some(gates))
     }
 
-    pub(super) fn sync_gate_definitions(
+    pub(crate) fn sync_gate_definitions(
         &mut self,
         gates: &[crate::gates::Gate],
     ) -> Result<(), BrokerOpError> {

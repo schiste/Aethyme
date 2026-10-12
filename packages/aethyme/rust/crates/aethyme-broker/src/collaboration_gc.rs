@@ -852,6 +852,23 @@ fn survey(
                 .push(format!("unknown target root kind {kind}")),
         }
     }
+    // Native gate jobs retain exact source and records independently of target
+    // release. A crash or observation never relinquishes these roots.
+    let native_roots: Vec<(String, String)> = connection
+        .prepare("SELECT kind,reference FROM local_native_gate_roots")?
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<Result<_, _>>()?;
+    for (kind, reference) in native_roots {
+        match kind.as_str() {
+            "snapshot" => live.snapshot(&reference)?,
+            "contribution" => live.contribution(&reference)?,
+            "object" => match parse_hex_digest(&reference) {
+                Some(digest) => live.object(digest, RetentionClass::Record),
+                None => live.problems.push(format!("native gate root {reference} is malformed")),
+            },
+            _ => live.problems.push(format!("unknown native gate root kind {kind}")),
+        }
+    }
     // Fresh generations retain their own source and pending work independently
     // of the target lifetime. Preparation or an event never retires these roots.
     let generation_roots: Vec<(String, String)> = connection

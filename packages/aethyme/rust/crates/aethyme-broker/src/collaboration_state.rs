@@ -37,7 +37,7 @@ use serde::Serialize;
 pub use crate::host_state::HostStateSource;
 
 /// The schema this binary writes.
-pub const COLLABORATION_STATE_SCHEMA_VERSION: i64 = 17;
+pub const COLLABORATION_STATE_SCHEMA_VERSION: i64 = 18;
 /// The oldest schema a database written by this binary can be read by.
 /// Unlike `host-operations.db`, a newer database stays readable by an older
 /// binary until a release raises this floor.
@@ -60,7 +60,8 @@ pub const COLLABORATION_STATE_SCHEMA_VERSION: i64 = 17;
 // Schema 9 does not honor external authority epochs. Quiesce it before restore.
 // Schema 10 cannot enforce the configured verification producer catalogue.
 // Schema 11 cannot fence unresolved source publication against retention release.
-const MIN_COMPATIBLE_SCHEMA: i64 = 17;
+// Schema 17 reclamation cannot see independently retained native gate jobs.
+const MIN_COMPATIBLE_SCHEMA: i64 = 18;
 const ROOT_DIRECTORY: &str = "collaboration";
 /// Schema steps after the version 1 layout (`meta` only), applied in
 /// order. Step 17 adds separately indexed historical imports and rehearsals. The floor is
@@ -460,6 +461,16 @@ const MIGRATIONS: &[(i64, &str)] = &[
         state TEXT NOT NULL CHECK(state IN ('intent','prepared'))
     ) STRICT;"),
 
+    (18, "CREATE TABLE IF NOT EXISTS local_native_gate_jobs (
+        id TEXT PRIMARY KEY NOT NULL, wave TEXT NOT NULL UNIQUE REFERENCES local_waves(wave),
+        target TEXT NOT NULL, revision TEXT NOT NULL, epoch TEXT NOT NULL, body BLOB NOT NULL,
+        state TEXT NOT NULL CHECK(state IN ('prepared','dispatching','completed','unknown')),
+        observation BLOB
+    ) STRICT;
+    CREATE TABLE IF NOT EXISTS local_native_gate_roots (
+        job TEXT NOT NULL REFERENCES local_native_gate_jobs(id),kind TEXT NOT NULL,
+        reference TEXT NOT NULL,PRIMARY KEY(job,kind,reference)
+    ) STRICT;"),
 ];
 /// The file that marks a directory as a collaboration root.
 pub const ROOT_MARKER: &str = ".aethyme-collaboration-root.json";
