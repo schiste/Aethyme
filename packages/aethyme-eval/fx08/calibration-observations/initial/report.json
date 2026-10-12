@@ -1,0 +1,51 @@
+{
+  "schema": "aethyme.fx08.oracle-calibration/v1",
+  "state": "failed",
+  "manifest_sha256": "a7277d5e0ed9ed55b55fda18dafb507665b8622ed560c9f97e6c5b8b6252bb32",
+  "rows": [
+    {
+      "task": "01-optional",
+      "kind": "positive",
+      "state": "completed",
+      "oracle_sha256": "54fdd15bdf077d84a2a0c3a9d7a025ed3ac7630e6f5572bc2045249e91835571",
+      "source_sha256": "cd47b13ca632371c3704d846db0b2ad1a140c388c2da79fb8dc2f62e14203b0b",
+      "compile_exit": 0,
+      "exit": 0,
+      "named_survivor_failure": false,
+      "accepted": true
+    },
+    {
+      "task": "01-optional",
+      "kind": "survivor-break",
+      "state": "completed",
+      "oracle_sha256": "54fdd15bdf077d84a2a0c3a9d7a025ed3ac7630e6f5572bc2045249e91835571",
+      "source_sha256": "b5c09031c3c382af720f40d6d3fbecafac4d478bcd5ac7f4a33fb587616393f1",
+      "compile_exit": 0,
+      "exit": 101,
+      "named_survivor_failure": true,
+      "accepted": true
+    },
+    {
+      "task": "02-pagination",
+      "kind": "positive",
+      "state": "completed",
+      "oracle_sha256": "14a630b31c1b1aae60ecb2fbdd26ff7fe3c4c0cf5c403d45db2d6fd03a692798",
+      "source_sha256": "416bd6658105a2b2a808e11da8599f31191135577b27013c722305ec87b4b36a",
+      "compile_exit": 0,
+      "exit": 0,
+      "named_survivor_failure": false,
+      "accepted": true
+    },
+    {
+      "task": "02-pagination",
+      "kind": "survivor-break",
+      "state": "unknown",
+      "oracle_sha256": "14a630b31c1b1aae60ecb2fbdd26ff7fe3c4c0cf5c403d45db2d6fd03a692798",
+      "source_sha256": "b291c93808b313eef5de0cbb6b05250767bcba6555d10472c5b6fe098b2cfc86",
+      "compile_exit": 0,
+      "exit": 0,
+      "named_survivor_failure": false,
+      "accepted": false
+    }
+  ]
+}

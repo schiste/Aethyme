@@ -1,0 +1,139 @@
+{
+  "schema": "aethyme.fx08.oracle-calibration/v1",
+  "state": "completed",
+  "manifest_sha256": "646ee4c11443256981fc999d8fe3f2f4bca06a09f9f9f28570284a59f5180ba4",
+  "rows": [
+    {
+      "task": "01-optional",
+      "kind": "positive",
+      "state": "completed",
+      "oracle_sha256": "54fdd15bdf077d84a2a0c3a9d7a025ed3ac7630e6f5572bc2045249e91835571",
+      "source_sha256": "cd47b13ca632371c3704d846db0b2ad1a140c388c2da79fb8dc2f62e14203b0b",
+      "compile_exit": 0,
+      "exit": 0,
+      "named_survivor_failure": false,
+      "accepted": true
+    },
+    {
+      "task": "01-optional",
+      "kind": "survivor-break",
+      "state": "completed",
+      "oracle_sha256": "54fdd15bdf077d84a2a0c3a9d7a025ed3ac7630e6f5572bc2045249e91835571",
+      "source_sha256": "b5c09031c3c382af720f40d6d3fbecafac4d478bcd5ac7f4a33fb587616393f1",
+      "compile_exit": 0,
+      "exit": 101,
+      "named_survivor_failure": true,
+      "accepted": true
+    },
+    {
+      "task": "02-pagination",
+      "kind": "positive",
+      "state": "completed",
+      "oracle_sha256": "234e5d5ec12e4d619ee7f61fece106ef874705934db02f9dbdd1d68b54995cd6",
+      "source_sha256": "416bd6658105a2b2a808e11da8599f31191135577b27013c722305ec87b4b36a",
+      "compile_exit": 0,
+      "exit": 0,
+      "named_survivor_failure": false,
+      "accepted": true
+    },
+    {
+      "task": "02-pagination",
+      "kind": "survivor-break",
+      "state": "completed",
+      "oracle_sha256": "234e5d5ec12e4d619ee7f61fece106ef874705934db02f9dbdd1d68b54995cd6",
+      "source_sha256": "b291c93808b313eef5de0cbb6b05250767bcba6555d10472c5b6fe098b2cfc86",
+      "compile_exit": 0,
+      "exit": 101,
+      "named_survivor_failure": true,
+      "accepted": true
+    },
+    {
+      "task": "03-protocol",
+      "kind": "positive",
+      "state": "completed",
+      "oracle_sha256": "c643f771d539f6df742b86d68f581b81890bfa3f67b22ddf4a01af9e80a45c2b",
+      "source_sha256": "e072a20b01bc291805c3b8d212c27f15d0063ca6a89aff9ea1d7b27f13841ec3",
+      "compile_exit": 0,
+      "exit": 0,
+      "named_survivor_failure": false,
+      "accepted": true
+    },
+    {
+      "task": "03-protocol",
+      "kind": "survivor-break",
+      "state": "completed",
+      "oracle_sha256": "c643f771d539f6df742b86d68f581b81890bfa3f67b22ddf4a01af9e80a45c2b",
+      "source_sha256": "4d72e49730611c3f0c36a12da17e69942b07225375dbbe30e22059a0ef26e0ad",
+      "compile_exit": 0,
+      "exit": 101,
+      "named_survivor_failure": true,
+      "accepted": true
+    },
+    {
+      "task": "04-completion",
+      "kind": "positive",
+      "state": "completed",
+      "oracle_sha256": "9832b84d367c4309838df62ca282bc626aaff458a53499ac2a142e84f1063636",
+      "source_sha256": "66f9125e34789f8b9fb2e770d24a07565628a9b82d18e227e34110f10d2fb4aa",
+      "compile_exit": 0,
+      "exit": 0,
+      "named_survivor_failure": false,
+      "accepted": true
+    },
+    {
+      "task": "04-completion",
+      "kind": "survivor-break",
+      "state": "completed",
+      "oracle_sha256": "9832b84d367c4309838df62ca282bc626aaff458a53499ac2a142e84f1063636",
+      "source_sha256": "73e8e3a929ea2c601d9edadf8dc3b650adec8689b4d02a172fe395ef699533ca",
+      "compile_exit": 0,
+      "exit": 101,
+      "named_survivor_failure": true,
+      "accepted": true
+    },
+    {
+      "task": "05-identifiers",
+      "kind": "positive",
+      "state": "completed",
+      "oracle_sha256": "aa5d5f8a5ff2d22d9d33ee1b9303a340aa4589fad2bf05e58453e1389dbb57bb",
+      "source_sha256": "8ec2c020a09c654cf9def661a8351d27cd5a0bdf660785bc0cf05dc5bddeff39",
+      "compile_exit": 0,
+      "exit": 0,
+      "named_survivor_failure": false,
+      "accepted": true
+    },
+    {
+      "task": "05-identifiers",
+      "kind": "survivor-break",
+      "state": "completed",
+      "oracle_sha256": "aa5d5f8a5ff2d22d9d33ee1b9303a340aa4589fad2bf05e58453e1389dbb57bb",
+      "source_sha256": "8e4fdd8a8475c9617ee39bde3453efa50713be26ab9ea9181fa840f157834599",
+      "compile_exit": 0,
+      "exit": 101,
+      "named_survivor_failure": true,
+      "accepted": true
+    },
+    {
+      "task": "06-lookup",
+      "kind": "positive",
+      "state": "completed",
+      "oracle_sha256": "4fd892bbf4b85862b354b0050cc2eaca150c1fcf3b0396716b23b57ce3aec171",
+      "source_sha256": "768ad41c4a5bd2242e2bed915868b02a5d469ece39a2653b5c8343cae3887f70",
+      "compile_exit": 0,
+      "exit": 0,
+      "named_survivor_failure": false,
+      "accepted": true
+    },
+    {
+      "task": "06-lookup",
+      "kind": "survivor-break",
+      "state": "completed",
+      "oracle_sha256": "4fd892bbf4b85862b354b0050cc2eaca150c1fcf3b0396716b23b57ce3aec171",
+      "source_sha256": "82b8e9e0a0369474fd18041ba4b890207004c37b67ff4f198294fd75ae666e00",
+      "compile_exit": 0,
+      "exit": 101,
+      "named_survivor_failure": true,
+      "accepted": true
+    }
+  ]
+}
