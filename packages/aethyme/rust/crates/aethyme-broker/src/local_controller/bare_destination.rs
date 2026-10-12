@@ -2,6 +2,10 @@
 //! endpoint. A receiver must be the bare repository itself: Git otherwise
 //! discovers a parent repository and may update an ordinary checkout when
 //! `receive.denyCurrentBranch=updateInstead` is configured.
+//!
+//! This module provides read-only repository-layout checks. A successful check
+//! does not authorize publication; callers must apply their own policy and
+//! revalidate immediately before performing a publication action.
 
 use std::fs::{self, Metadata};
 use std::path::{Path, PathBuf};
@@ -15,26 +19,34 @@ use crate::git::git_command;
 const PROBE_BUDGET: Duration = Duration::from_secs(4);
 const MAX_PROBE_STREAM_BYTES: usize = 4 * 1024;
 
-/// Canonical path and filesystem identity for a verified bare Git endpoint.
-/// Recheck this value immediately before publication. This detects ordinary
-/// replacement of the directory between acceptance and publication; it does
-/// not lock out a trusted host process that races Git or changes repository
-/// configuration after the final check.
+/// Read-only observation of a bare Git endpoint's path and filesystem
+/// identity. This value does not grant publication authority. Recheck it
+/// immediately before publication to detect ordinary replacement of the
+/// directory; this does not lock out a trusted host process that races Git or
+/// changes repository configuration after the final check.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct BareDestination {
+pub struct BareDestination {
     requested_path: PathBuf,
     path: PathBuf,
     identity: FileIdentity,
 }
 
 impl BareDestination {
-    pub(crate) fn path(&self) -> &Path {
+    /// Return the canonical endpoint path observed by the checker.
+    ///
+    /// The returned path is informational and does not authorize its use as a
+    /// publication destination.
+    pub fn path(&self) -> &Path {
         &self.path
     }
 
-    /// Re-run the bounded Git probe and reject a path replaced since the
-    /// destination was first accepted.
-    pub(crate) fn revalidate(&self) -> Result<(), ControllerError> {
+    /// Re-run the bounded read-only probes and reject a path changed since the
+    /// endpoint was checked.
+    ///
+    /// Success reports that the endpoint still matches the recorded layout
+    /// and filesystem identity at check time. It does not authorize
+    /// publication or prevent later changes.
+    pub fn revalidate(&self) -> Result<(), ControllerError> {
         // Keep checking the original path the caller will use for the
         // publication URL. Rechecking only the canonical path would miss an
         // ancestor symlink retargeting to another receiver.
@@ -50,7 +62,13 @@ impl BareDestination {
 /// itself Git's bare git-dir, with no linked worktrees. Git is invoked through
 /// the broker's trusted binary, with inherited environment and global/system
 /// configuration removed, a finite output cap and a short deadline.
-pub(crate) fn validate_endpoint(raw: &str) -> Result<BareDestination, ControllerError> {
+/// Check that `raw` names an absolute path to an exact bare Git repository
+/// root with no linked worktrees.
+///
+/// This bounded read-only check is suitable for validating repository layout;
+/// it does not grant publication authority. Call [`BareDestination::revalidate`]
+/// immediately before any operation that depends on the observed path.
+pub fn validate_endpoint(raw: &str) -> Result<BareDestination, ControllerError> {
     let path = Path::new(raw);
     if !path.is_absolute() {
         return Err(rejected("endpoint must be an absolute local path"));
