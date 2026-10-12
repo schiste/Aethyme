@@ -143,7 +143,7 @@ fn backing_available(root: &Path) -> std::io::Result<u64> {
     if unsafe { libc::fstatvfs(directory.as_raw_fd(), &mut stat) } != 0 {
         return Err(std::io::Error::last_os_error());
     }
-    Ok(stat.f_bavail.saturating_mul(stat.f_frsize))
+    Ok(u64::from(stat.f_bavail).saturating_mul(stat.f_frsize))
 }
 
 fn independent_absence(
@@ -160,7 +160,14 @@ fn independent_absence(
         .ok_or("unknown native device inventory cannot prove absence")?;
     for entry in devices {
         let identifier = entry.as_str().ok_or("unknown native device identity")?;
-        if !device(&format!("/dev/{identifier}"), false) {
+        if !identifier.strip_prefix("disk").is_some_and(|rest| {
+            let parts: Vec<_> = rest.split('s').collect();
+            !parts.is_empty()
+                && parts.len() <= 4
+                && parts
+                    .iter()
+                    .all(|part| !part.is_empty() && part.bytes().all(|c| c.is_ascii_digit()))
+        }) {
             return Err("invalid native device inventory identity".into());
         }
         if binding.is_some_and(|b| {
@@ -567,7 +574,7 @@ fn native_volume_uuid_and_enospc_classification_are_exact() {
         !host_capacity_admitted(HOST_HEADROOM - 1, 0),
         "host headroom must remain preserved"
     );
-    let absent = json!({"AllDisks":["disk0", "disk0s1"]});
+    let absent = json!({"AllDisks":["disk0", "disk0s1", "disk0s1s1"]});
     assert!(independent_absence(&absent, None, false).is_ok());
     assert!(
         independent_absence(&absent, None, true).is_err(),

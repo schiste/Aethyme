@@ -4,13 +4,17 @@ Last Updated: 2026-10-12
 
 ## Proposed qualification contract
 
-This is a macOS test profile, pending implementation, independent review and
-explicit execution. It supplies no current execution or acceptance authority.
+This is an implemented macOS test profile, pending successful compilation,
+final independent review and explicit execution. It supplies no current execution or acceptance authority.
 Existing Docker workload tmpfs/cgroup evidence remains a separate profile.
 
 Use one private temporary APFS image with a fixed 512 MiB logical capacity.
 The native image client mounts it at an exact private directory outside the
-repository. Never fill the host filesystem or a Docker daemon store. Preserve
+repository. The sparse backing image requires 2 GiB of host free headroom
+plus its remaining logical capacity before creation/attachment and before
+each bounded pressure block; insufficient host capacity aborts without a
+qualified pressure result. This is an admission and observation guard, not
+a global reservation against concurrent external host writers. Never fill the host filesystem or a Docker daemon store. Preserve
 the production capture reservation floor (256 MiB); no free-space override or
 success-shaped simulated disk error qualifies this profile.
 
@@ -49,7 +53,9 @@ Eject only the device freshly observed as belonging to this exact image and
 mountpoint. Do not force eject, run global sweeps, or remove unrelated mounts.
 Retain the independent recovery journal and image on an unconfirmed cleanup;
 the profile remains failed/unqualified. A verified successful cleanup records
-native absence. No failure erases the evidence needed to reconcile it.
+native image absence plus independent device inventory and mount filesystem
+absence. An attempted attachment without established ownership remains
+unconfirmed and requires reconciliation. No failure erases the evidence needed to reconcile it.
 
 ## Claim limits
 
