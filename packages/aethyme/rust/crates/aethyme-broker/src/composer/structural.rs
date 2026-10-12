@@ -13,7 +13,9 @@ use crate::bounded_output::{LimitedOutput, output_limited};
 
 pub const HTML_PROFILE: &str = "aethyme.compose.mergiraf-html/experimental-v1";
 pub const MERGIRAF_VERSION: &str = "0.19.1";
-const TOOL_LIMIT: usize = 32 * 1024 * 1024;
+// Released macOS binaries include the supported grammars and exceed 64 MiB.
+// Acquisition still reads at most this finite limit plus one byte.
+const TOOL_LIMIT: usize = 128 * 1024 * 1024;
 const INPUT_LIMIT: usize = 4 * 1024 * 1024;
 const OUTPUT_LIMIT: usize = 8 * 1024 * 1024;
 
@@ -354,7 +356,12 @@ mod tests {
                 .success()
         );
         let started = std::time::Instant::now();
-        assert!(MergirafEngine::pin(&fifo, &"0".repeat(64)).is_err());
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            let result = MergirafEngine::pin(&fifo, &"0".repeat(64)).is_err();
+            crate::warn_unrecorded("deliver FIFO admission test result", sender.send(result));
+        });
+        assert!(receiver.recv_timeout(Duration::from_secs(2)).unwrap());
         assert!(started.elapsed() < Duration::from_secs(1));
     }
 }

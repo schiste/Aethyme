@@ -4,6 +4,14 @@ import fs from 'node:fs';
 import assert from 'node:assert/strict';
 import { pathToFileURL, fileURLToPath } from 'node:url';
 
+const allowedRequirements = new Set(['search','label','accessible','keyboard','mobile','navigation','moved','consent','privacy','no_analytics','consumer_footer']);
+export function parseRequirements(argument) {
+  const requirements = argument.split(',').filter(Boolean);
+  assert(requirements.every(value=>allowedRequirements.has(value)), 'unknown browser requirement');
+  assert.equal(new Set(requirements).size,requirements.length,'duplicate browser requirement');
+  return requirements;
+}
+
 export async function observe(file, requirements, modulePath, executablePath) {
   const source = fs.readFileSync(file);
   assert(source.length <= 256 * 1024, 'candidate byte limit');
@@ -36,6 +44,9 @@ export async function observe(file, requirements, modulePath, executablePath) {
       }
     });
     await page.setContent(source.toString('utf8'), {waitUntil:'load',timeout:3000});
+    if (requirements.some(requirement=>['consent','privacy','no_analytics'].includes(requirement))) {
+      await check('consent is initially false', async () => assert.equal(await page.locator('#consent').isChecked(),false));
+    }
     await check('unique DOM identities', async () => {
       const ids = await page.locator('[id]').evaluateAll(elements => elements.map(e => e.id));
       assert.equal(new Set(ids).size, ids.length);
@@ -85,8 +96,9 @@ export async function observe(file, requirements, modulePath, executablePath) {
       await check('one anonymous event with consent', async () => {
         await page.locator('#consent').check();
         const before = requests.length;
-        await page.locator('#query').fill('observer private search');
+        await page.locator('#query').fill('La');
         await page.locator('#query').press('Enter');
+        assert.equal(await page.locator('#results').textContent(),'Lake');
         await page.waitForTimeout(500);
         assert.equal(requests.length-before,1);
         const event = requests[before];
@@ -111,8 +123,9 @@ export async function observe(file, requirements, modulePath, executablePath) {
       await check('consent transport is independent of query', async () => {
         const previous = requests.at(-1);
         const before = requests.length;
-        await page.locator('#query').fill('a different independent search');
-        await page.locator('#query').press('Enter');
+        await page.locator('#query').fill('For');
+        await page.getByRole('button',{name:'Search',exact:true}).click();
+        assert.equal(await page.locator('#results').textContent(),'Forest');
         await page.waitForTimeout(500);
         assert.equal(requests.length-before,1);
         const current = requests[before];
@@ -121,7 +134,9 @@ export async function observe(file, requirements, modulePath, executablePath) {
       await check('revoked consent stops later events', async () => {
         await page.locator('#consent').uncheck();
         const before = requests.length;
+        await page.locator('#query').fill('Mu');
         await page.locator('#query').press('Enter');
+        assert.equal(await page.locator('#results').textContent(),'Museum');
         await page.waitForTimeout(250);
         assert.equal(requests.length,before);
       });
@@ -135,8 +150,10 @@ export async function observe(file, requirements, modulePath, executablePath) {
       assert.deepEqual(requests,[]);
       for (const consent of [true,false]) {
         await page.locator('#consent').setChecked(consent);
-        await page.locator('#query').fill('independent subtraction search');
-        await page.locator('#query').press('Enter');
+        await page.locator('#query').fill(consent?'La':'For');
+        if(consent) await page.locator('#query').press('Enter');
+        else await page.getByRole('button',{name:'Search',exact:true}).click();
+        assert.equal(await page.locator('#results').textContent(),consent?'Lake':'Forest');
         await page.waitForTimeout(500);
         assert.deepEqual(requests,[]);
       }
@@ -145,14 +162,17 @@ export async function observe(file, requirements, modulePath, executablePath) {
       assert.equal(await page.locator('#consumer-note').count(),1);
       assert.equal(await page.locator('#consumer-note').textContent(),'Consumer observes the consent-aware search revision.');
     });
+    if (!requirements.includes('consent') && !requirements.includes('privacy')) {
+      await check('ordinary compositions emit no telemetry', async () => assert.deepEqual(requests,[]));
+    }
     await check('no WebSocket egress', async () => assert.deepEqual(sockets,[]));
     await check('no runtime page errors', async () => assert.deepEqual(errors,[]));
-    return {schema:'aethyme.e1.browser-observation/v1',passed:checks.every(c=>c.passed),checks,requests,sockets,errors,observation_window_ms:500,wall_ms:performance.now()-start,browser_version:browser.version()};
+    return {schema:'aethyme.e1.browser-observation/v1',requirements,passed:checks.every(c=>c.passed),checks,requests,sockets,errors,observation_window_ms:500,wall_ms:performance.now()-start,browser_version:browser.version()};
   } finally { await browser.close(); }
 }
-if (process.argv[1] && fs.realpathSync(process.argv[1]) === fs.realpathSync(fileURLToPath(import.meta.url))) {
+if (process.argv[1] && fs.existsSync(process.argv[1]) && fs.realpathSync(process.argv[1]) === fs.realpathSync(fileURLToPath(import.meta.url))) {
   try {
-    const result = await observe(process.argv[2],process.argv[3].split(',').filter(Boolean),process.argv[4],process.argv[5]);
+    const result = await observe(process.argv[2],parseRequirements(process.argv[3]),process.argv[4],process.argv[5]);
     process.stdout.write(JSON.stringify(result)+'\n');
     process.exitCode = result.passed ? 0 : 1;
   } catch (error) {

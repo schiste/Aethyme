@@ -48,7 +48,23 @@ authority.
 
 ## Qualification record
 
-Not run yet. The final evidence must retain every scheduled outcome, actual exit,
+The original-fixture campaign completed at d1910b14: the structural candidate
+passed 16/17 scenarios; the existing text composer passed 15/17. The structural
+move/edit case passed; the cross-file FX04 behavior still failed. All 34
+case/profile outcomes and actual diagnostics are retained under
+`packages/aethyme-eval/e1/original-observations/`. The preceding executable-size
+admission failure retains its full unrun schedule separately. No original
+held-outs were invoked. These results do not qualify Q1 or browser behavior.
+
+The appointed browser profile hashes the complete Playwright/core and Chromium
+bundles, actual Node executable and observer before admission. Its contract is
+a cooperative macOS host whose operator preserves the verified inventory
+through launch; host OS and dynamic system/Homebrew libraries are trusted.
+Child groups are owned per trial; cleanup stops descendants before reaping the
+leader. Bounded pipe readers retain at most 1 MiB per stream. CI checks use no
+appointed browser installation; browser/model experiments are explicit.
+
+The final evidence must retain every scheduled outcome, actual exit,
 complete candidate/input digests, observed mode/fallback, independent assertions,
 bounded costs and cleanup status. Required positive move/edit, inherited-base
 and semantic-interaction evidence precede selecting the profile. Native gate
