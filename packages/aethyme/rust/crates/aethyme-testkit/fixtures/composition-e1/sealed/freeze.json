@@ -1,0 +1,41 @@
+{
+  "schema": "aethyme.e1.independent-sealed-freeze/v1",
+  "status": "design_only_unrun",
+  "files": [
+    {
+      "path": "private/contract.md",
+      "bytes": 763,
+      "sha256": "2c69ef14d096d986005a039655dff13a14f7cc1626d51f2d75c3f2dfd35e8c77"
+    },
+    {
+      "path": "private/observer.mjs",
+      "bytes": 3147,
+      "sha256": "3279ce5d9546134984c224e9b0c845463e672a39efa131f11af51525bb8ca39d"
+    },
+    {
+      "path": "public/case.json",
+      "bytes": 647,
+      "sha256": "ed1bb864cb8961c1be711ee48fc0561ebe1222c357b8228eb1de559db1e66662"
+    },
+    {
+      "path": "public/inputs/base.html",
+      "bytes": 1598,
+      "sha256": "0864a98f307a759ff144a2ef41e2bb7232fbdb503c49707ad4ac3bafe545ff79"
+    },
+    {
+      "path": "public/inputs/edit.html",
+      "bytes": 1864,
+      "sha256": "83e41d3af49504c8e54a432e6544077bfb7052a97d7a723c4c5fdfced2c7b077"
+    },
+    {
+      "path": "public/inputs/move.html",
+      "bytes": 1599,
+      "sha256": "b0d8dd6f78198a2fa5795087acc8e0386294e7674e4ad567799ad771cef20fb3"
+    },
+    {
+      "path": "public/task.md",
+      "bytes": 599,
+      "sha256": "82c675a8e6f563e44381bc3275e9ad4f6e8b4dec5d3ff765270961fa542b78ee"
+    }
+  ]
+}

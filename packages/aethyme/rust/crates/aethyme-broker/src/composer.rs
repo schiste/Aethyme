@@ -81,6 +81,77 @@ use crate::composition::{
 /// `git merge-file`, with the limits in the module documentation.
 pub const PROVISIONAL_TEXT_PROFILE: &str = "aethyme.compose.git-merge-file/provisional-v0";
 
+pub mod structural;
+use structural::{MergeMethod, MergeObservation, MergirafEngine};
+
+struct MergeProfile<'a> {
+    engine: Option<&'a MergirafEngine>,
+    observations: Vec<MergeObservation>,
+    text_merges: usize,
+}
+
+impl MergeProfile<'_> {
+    fn name(&self) -> &'static str {
+        if self.engine.is_some() {
+            structural::HTML_PROFILE
+        } else {
+            PROVISIONAL_TEXT_PROFILE
+        }
+    }
+
+    fn mode(&self) -> CompositionMode {
+        let structural = self
+            .observations
+            .iter()
+            .filter(|o| {
+                matches!(
+                    o.method,
+                    MergeMethod::StructuredResolution | MergeMethod::FullyStructured
+                )
+            })
+            .count();
+        if structural == 0 {
+            CompositionMode::Text
+        } else if self.text_merges > 0 || structural < self.observations.len() {
+            CompositionMode::Hybrid
+        } else {
+            CompositionMode::Structural
+        }
+    }
+}
+
+/// The opt-in external profile and its actual merge observations, including
+/// refused/conflicting attempts. Default text composition remains unchanged.
+pub struct StructuralComposition {
+    pub composition: Composition,
+    pub observations: Vec<MergeObservation>,
+}
+
+pub fn compose_structural(
+    store: &mut CollaborationStore,
+    repo: &Path,
+    request: &CompositionRequest,
+    engine: &MergirafEngine,
+) -> Result<StructuralComposition, ComposeError> {
+    let mut profile = MergeProfile {
+        engine: Some(engine),
+        observations: Vec::new(),
+        text_merges: 0,
+    };
+    let composition = compose_inner(
+        store,
+        repo,
+        request,
+        &request.deliveries,
+        None,
+        &mut profile,
+    )?;
+    Ok(StructuralComposition {
+        composition,
+        observations: profile.observations,
+    })
+}
+
 /// Where a composer candidate's baseline came from.
 pub const COMPOSER_BASELINE_SOURCE: &str = "retained";
 
@@ -220,6 +291,8 @@ pub enum ComposeError {
     Archive(#[from] ArchiveError),
     #[error("{0}")]
     InvalidRequest(String),
+    #[error("engine budget: {0}")]
+    EngineBudget(String),
     #[error("git: {0}")]
     Git(String),
     #[error("{path}: {source}")]
@@ -240,6 +313,7 @@ impl ComposeError {
         match self {
             Self::Archive(error) => error.code(),
             Self::InvalidRequest(_) => "invalid_request",
+            Self::EngineBudget(_) => "budget_exhausted",
             Self::Git(_) => "git",
             Self::Io { .. } => "io",
             Self::SubjectMismatch { .. } => "subject_mismatch",
@@ -269,7 +343,18 @@ pub fn compose(
     repo: &Path,
     request: &CompositionRequest,
 ) -> Result<Composition, ComposeError> {
-    compose_inner(store, repo, request, &request.deliveries, None)
+    compose_inner(
+        store,
+        repo,
+        request,
+        &request.deliveries,
+        None,
+        &mut MergeProfile {
+            engine: None,
+            observations: Vec::new(),
+            text_merges: 0,
+        },
+    )
 }
 
 /// Recompose `subtraction.from` without `subtraction.remove` from its
@@ -282,6 +367,45 @@ pub fn recompose_without(
     repo: &Path,
     request: &CompositionRequest,
     subtraction: &Subtraction,
+) -> Result<Composition, ComposeError> {
+    recompose_inner(
+        store,
+        repo,
+        request,
+        subtraction,
+        &mut MergeProfile {
+            engine: None,
+            observations: Vec::new(),
+            text_merges: 0,
+        },
+    )
+}
+
+pub fn recompose_structural_without(
+    store: &mut CollaborationStore,
+    repo: &Path,
+    request: &CompositionRequest,
+    subtraction: &Subtraction,
+    engine: &MergirafEngine,
+) -> Result<StructuralComposition, ComposeError> {
+    let mut profile = MergeProfile {
+        engine: Some(engine),
+        observations: Vec::new(),
+        text_merges: 0,
+    };
+    let composition = recompose_inner(store, repo, request, subtraction, &mut profile)?;
+    Ok(StructuralComposition {
+        composition,
+        observations: profile.observations,
+    })
+}
+
+fn recompose_inner(
+    store: &mut CollaborationStore,
+    repo: &Path,
+    request: &CompositionRequest,
+    subtraction: &Subtraction,
+    profile: &mut MergeProfile<'_>,
 ) -> Result<Composition, ComposeError> {
     let catalog = catalog(request)?;
     let refuse = |detail: String| {
@@ -350,7 +474,14 @@ pub fn recompose_without(
     }
     let mut deliveries = originals.clone();
     deliveries.extend(subtraction.keep.iter().cloned());
-    compose_inner(store, repo, request, &deliveries, Some(subtraction))
+    compose_inner(
+        store,
+        repo,
+        request,
+        &deliveries,
+        Some(subtraction),
+        profile,
+    )
 }
 
 /// The archive's entry for `spec`, if it has a lineage and it is retained.
@@ -404,6 +535,7 @@ fn compose_inner(
     request: &CompositionRequest,
     deliveries: &[String],
     recomposition: Option<&Subtraction>,
+    profile: &mut MergeProfile<'_>,
 ) -> Result<Composition, ComposeError> {
     // Reclamation cannot remove an input while this composition reads it.
     let _use = crate::collaboration_gc::archive_use(store)
@@ -493,8 +625,8 @@ fn compose_inner(
             accepted,
         },
         deliveries,
-        &mut usage,
-        &mut order,
+        (&mut usage, &mut order),
+        profile,
     )? {
         Ok(Built::Candidate(candidate, plan)) => (candidate, plan),
         Ok(Built::Other(outcome)) => {
@@ -525,7 +657,15 @@ fn compose_inner(
             observed: retained.snapshot_id.to_string(),
         });
     }
-    let (bytes, id) = recipe_record(&candidate, &plan, request, deliveries, usage, recomposition)?;
+    let (bytes, id) = recipe_record(
+        &candidate,
+        &plan,
+        request,
+        deliveries,
+        usage,
+        recomposition,
+        profile,
+    )?;
     let object = collaboration_archive::put_object(store, &bytes)?;
     Ok(Composition {
         outcome: CompositionOutcome::Candidate(candidate),
@@ -603,9 +743,10 @@ fn build(
     request: &CompositionRequest,
     baseline: &Baseline,
     deliveries: &[String],
-    usage: &mut BudgetUsage,
-    order: &mut Vec<String>,
+    progress: (&mut BudgetUsage, &mut Vec<String>),
+    profile: &mut MergeProfile<'_>,
 ) -> Result<Result<Built, Refused>, ComposeError> {
+    let (usage, order) = progress;
     let plan = match plan(store, request, baseline, deliveries, usage)? {
         Ok(plan) => plan,
         Err(refusal) => return Ok(Err(refusal)),
@@ -654,7 +795,11 @@ fn build(
         for path in paths {
             let applied = match apply_path(
                 &mut reader,
-                scratch.path(),
+                PathMerge {
+                    scratch: scratch.path(),
+                    path,
+                    profile,
+                },
                 base.get(path).copied(),
                 accumulator.get(path).copied(),
                 result.get(path).copied(),
@@ -761,9 +906,9 @@ fn build(
         baseline_source: COMPOSER_BASELINE_SOURCE,
         inputs,
         producer: Producer::Composer {
-            profile: PROVISIONAL_TEXT_PROFILE.to_string(),
+            profile: profile.name().to_string(),
         },
-        mode: CompositionMode::Text,
+        mode: profile.mode(),
     };
     Ok(Ok(Built::Candidate(candidate, plan)))
 }
@@ -1179,11 +1324,17 @@ impl Reader<'_> {
 
 pub(crate) type Entry = (EntryKind, [u8; 32]);
 
+struct PathMerge<'a, 'engine> {
+    scratch: &'a Path,
+    path: &'a [u8],
+    profile: &'a mut MergeProfile<'engine>,
+}
+
 /// Apply one contribution's change to one path: `Ok(Ok(new entry or
 /// removal))`, `Ok(Err(reason))` for a conflict.
 fn apply_path(
     reader: &mut Reader<'_>,
-    scratch: &Path,
+    merger: PathMerge<'_, '_>,
     base: Option<Entry>,
     current: Option<Entry>,
     result: Option<Entry>,
@@ -1235,7 +1386,12 @@ fn apply_path(
     if deletes_a_twin(&base_text, &current_text) || deletes_a_twin(&base_text, &result_text) {
         return Ok(Ok(Err(ConflictReason::AmbiguousAnchor)));
     }
-    if moves_a_block(&base_text, &current_text) || moves_a_block(&base_text, &result_text) {
+    let moved = moves_a_block(&base_text, &current_text) || moves_a_block(&base_text, &result_text);
+    let html_engine = merger
+        .profile
+        .engine
+        .filter(|_| structural::supports(merger.path));
+    if moved && html_engine.is_none() {
         return Ok(Ok(Err(ConflictReason::MovedBlock)));
     }
     usage.merges += 1;
@@ -1248,7 +1404,54 @@ fn apply_path(
             ),
         )));
     }
-    let Some(merged) = merge_file(scratch, &base_text, &current_text, &result_text)? else {
+    let merged = if let Some(engine) = html_engine {
+        let merged = match engine.merge(merger.path, &base_text, &current_text, &result_text) {
+            Ok(merged) => merged,
+            Err(ComposeError::EngineBudget(detail)) => {
+                return Ok(Err(refused(Refusal::BudgetExhausted, detail)));
+            }
+            Err(error) => return Err(error),
+        };
+        let observed_structural = matches!(
+            merged.observation.method,
+            MergeMethod::StructuredResolution | MergeMethod::FullyStructured
+        );
+        let retained_diagnostics: usize = merger
+            .profile
+            .observations
+            .iter()
+            .map(|observation| observation.diagnostic.len())
+            .sum();
+        if retained_diagnostics.saturating_add(merged.observation.diagnostic.len())
+            > 16 * 1024 * 1024
+        {
+            return Ok(Err(refused(
+                Refusal::BudgetExhausted,
+                "composition diagnostic allowance exhausted",
+            )));
+        }
+        merger.profile.observations.push(merged.observation);
+        if moved && !observed_structural {
+            return Ok(Ok(Err(ConflictReason::MovedBlock)));
+        }
+        merged.bytes
+    } else {
+        merger.profile.text_merges += 1;
+        match merge_file(
+            merger.scratch,
+            &base_text,
+            &current_text,
+            &result_text,
+            merger.profile.engine.is_some(),
+        ) {
+            Ok(merged) => merged,
+            Err(ComposeError::EngineBudget(detail)) => {
+                return Ok(Err(refused(Refusal::BudgetExhausted, detail)));
+            }
+            Err(error) => return Err(error),
+        }
+    };
+    let Some(merged) = merged else {
         return Ok(Ok(Err(ConflictReason::Content)));
     };
     let digest = reader.store_merged(&merged)?;
@@ -1361,6 +1564,7 @@ fn merge_file(
     base: &[u8],
     current: &[u8],
     result: &[u8],
+    bounded: bool,
 ) -> Result<Option<Vec<u8>>, ComposeError> {
     let write = |name: &str, bytes: &[u8]| -> Result<PathBuf, ComposeError> {
         let path = scratch.join(name);
@@ -1370,7 +1574,8 @@ fn merge_file(
     let current = write("current", current)?;
     let base = write("base", base)?;
     let result = write("result", result)?;
-    let output = engine(scratch)
+    let mut command = engine(scratch);
+    command
         .args([
             "merge-file",
             "-p",
@@ -1384,9 +1589,32 @@ fn merge_file(
         .arg(&current)
         .arg(&base)
         .arg(&result)
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|source| io(Path::new("git"), source))?;
+        .stdin(Stdio::null());
+    let output = if bounded {
+        match crate::bounded_output::output_limited(
+            &mut command,
+            std::time::Duration::from_secs(5),
+            8 * 1024 * 1024,
+        )
+        .map_err(|source| io(Path::new("git"), source))?
+        {
+            crate::bounded_output::LimitedOutput::Completed(output) => output,
+            crate::bounded_output::LimitedOutput::Deadline => {
+                return Err(ComposeError::EngineBudget(
+                    "text fallback deadline exhausted".into(),
+                ));
+            }
+            crate::bounded_output::LimitedOutput::OutputLimit => {
+                return Err(ComposeError::EngineBudget(
+                    "text fallback output limit exhausted".into(),
+                ));
+            }
+        }
+    } else {
+        command
+            .output()
+            .map_err(|source| io(Path::new("git"), source))?
+    };
     match output.status.code() {
         Some(0) => Ok(Some(output.stdout)),
         Some(code) if (1..=127).contains(&code) => Ok(None),
@@ -1807,6 +2035,35 @@ fn object(members: Vec<(&str, Value)>) -> Value {
     )
 }
 
+fn merge_observation_record(observation: &MergeObservation) -> Value {
+    object(vec![
+        ("path", text(&observation.path)),
+        (
+            "method",
+            text(match observation.method {
+                MergeMethod::LineBased => "line_based",
+                MergeMethod::StructuredResolution => "structured_resolution",
+                MergeMethod::FullyStructured => "fully_structured",
+                MergeMethod::Unknown => "unknown",
+            }),
+        ),
+        ("timed_fallback", Value::Bool(observation.timed_fallback)),
+        (
+            "exit_code",
+            text(
+                &observation
+                    .exit_code
+                    .map(|code| code.to_string())
+                    .unwrap_or_else(|| "unknown".into()),
+            ),
+        ),
+        ("base_sha256", text(&observation.base_sha256)),
+        ("current_sha256", text(&observation.current_sha256)),
+        ("result_sha256", text(&observation.result_sha256)),
+        ("output_sha256", text(&observation.output_sha256)),
+    ])
+}
+
 fn recipe_record(
     candidate: &Candidate,
     plan: &Plan,
@@ -1814,6 +2071,7 @@ fn recipe_record(
     deliveries: &[String],
     usage: BudgetUsage,
     recomposition: Option<&Subtraction>,
+    profile: &MergeProfile<'_>,
 ) -> Result<(Vec<u8>, RecordId), ComposeError> {
     let engine_version = git_version()?;
     let order = plan
@@ -1839,15 +2097,41 @@ fn recipe_record(
     let limits = request.budget;
     let mut members = vec![
         ("schema", text(COMPOSITION_RECIPE_SCHEMA_NAME)),
-        ("profile", text(PROVISIONAL_TEXT_PROFILE)),
+        ("profile", text(profile.name())),
         (
             "engine",
-            object(vec![
-                ("name", text("git merge-file")),
-                ("version", text(&engine_version)),
-                ("diff", text(DIFF_ENGINE)),
-                ("move_window", integer(MOVE_WINDOW)),
-            ]),
+            if let Some(engine) = profile.engine {
+                object(vec![
+                    ("name", text("mergiraf")),
+                    ("version", text(structural::MERGIRAF_VERSION)),
+                    ("sha256", text(engine.sha256())),
+                    ("grammar", text("html")),
+                    ("license", text("GPL-3.0-only; external executable")),
+                    ("wall_ms", integer(5000)),
+                    ("structural_timeout_ms", integer(2000)),
+                    ("max_input_bytes", integer(4 * 1024 * 1024)),
+                    ("max_stream_bytes", integer(8 * 1024 * 1024)),
+                    ("text_merges", integer(profile.text_merges)),
+                    (
+                        "observations",
+                        Value::Array(
+                            profile
+                                .observations
+                                .iter()
+                                .map(merge_observation_record)
+                                .collect(),
+                        ),
+                    ),
+                    ("text_fallback_version", text(&engine_version)),
+                ])
+            } else {
+                object(vec![
+                    ("name", text("git merge-file")),
+                    ("version", text(&engine_version)),
+                    ("diff", text(DIFF_ENGINE)),
+                    ("move_window", integer(MOVE_WINDOW)),
+                ])
+            },
         ),
         ("baseline", text(plan.baseline.snapshot_id.as_str())),
         ("baseline_commit", text(plan.baseline.commit.as_str())),
@@ -2083,6 +2367,34 @@ mod tests {
     use super::*;
 
     #[test]
+    fn replay_observations_do_not_depend_on_diagnostic_timing() {
+        let first = MergeObservation {
+            path: "component.html".into(),
+            method: MergeMethod::FullyStructured,
+            timed_fallback: false,
+            exit_code: Some(0),
+            base_sha256: "a".repeat(64),
+            current_sha256: "b".repeat(64),
+            result_sha256: "c".repeat(64),
+            output_sha256: "d".repeat(64),
+            diagnostic_sha256: "e".repeat(64),
+            diagnostic: "merge took 1ms".into(),
+        };
+        let mut second = first.clone();
+        second.diagnostic_sha256 = "f".repeat(64);
+        second.diagnostic = "merge took 2ms".into();
+        assert_eq!(
+            merge_observation_record(&first),
+            merge_observation_record(&second)
+        );
+        second.output_sha256 = "0".repeat(64);
+        assert_ne!(
+            merge_observation_record(&first),
+            merge_observation_record(&second)
+        );
+    }
+
+    #[test]
     fn a_block_moved_elsewhere_is_a_move_even_reindented() {
         let base = "a\nb\nc\nd\ne\nf\n";
         let side = "a\n    d\n    e\n    f\nb\nc\n";
@@ -2168,5 +2480,74 @@ mod tests {
         let mut late = vec![b'a'; 8000];
         late.push(0);
         assert!(!is_binary(&late));
+    }
+    #[test]
+    #[cfg(unix)]
+    fn unsupported_grammar_never_dispatches_the_structural_tool() {
+        use std::os::unix::fs::PermissionsExt;
+        let f = crate::local_target::tests::Fixture::new();
+        let root = tempfile::tempdir().unwrap();
+        let tool = root.path().join("control");
+        let bytes=b"#!/bin/sh\nif [ \"$1\" = --version ]; then printf 'mergiraf 0.19.1\\n'; exit 0; fi\nprintf 'Selected best merge: fully_structured\\n' >&2\nprintf 'wrong-control-output\\n'\n";
+        std::fs::write(&tool, bytes).unwrap();
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let hash = ObjectDigest::of(bytes).hex();
+        let engine = MergirafEngine::pin(&tool, &hash).unwrap();
+        let mut profile = MergeProfile {
+            engine: Some(&engine),
+            observations: Vec::new(),
+            text_merges: 0,
+        };
+        let mut reader = Reader {
+            store: &f.store,
+            cache: HashMap::new(),
+            cached_bytes: 0,
+            charged: HashSet::new(),
+            manifests: HashMap::new(),
+            bytes: 0,
+        };
+        let entry = |bytes: &[u8]| {
+            Some((
+                EntryKind::Regular,
+                collaboration_archive::put_object(&f.store, bytes)
+                    .unwrap()
+                    .raw(),
+            ))
+        };
+        let request = CompositionRequest {
+            baseline: f.a.base.commit.clone(),
+            accepted: vec![],
+            catalog: vec![],
+            deliveries: vec![],
+            budget: Default::default(),
+        };
+        let mut usage = BudgetUsage::default();
+        let merged = apply_path(
+            &mut reader,
+            PathMerge {
+                scratch: root.path(),
+                path: b"source.rs",
+                profile: &mut profile,
+            },
+            entry(b"alpha\nbeta\ngamma\ndelta\nomega\n"),
+            entry(b"ALPHA\nbeta\ngamma\ndelta\nomega\n"),
+            entry(b"alpha\nbeta\ngamma\ndelta\nOMEGA\n"),
+            &mut usage,
+            &request,
+        )
+        .unwrap()
+        .unwrap_or_else(|error| panic!("control merge refused: {}", error.1))
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            reader.blob(&merged.1).unwrap(),
+            b"ALPHA\nbeta\ngamma\ndelta\nOMEGA\n",
+            "unsupported grammar uses exact text merge"
+        );
+        assert!(
+            profile.observations.is_empty(),
+            "unsupported grammar must never dispatch external engine"
+        );
+        assert_eq!(profile.text_merges, 1);
     }
 }

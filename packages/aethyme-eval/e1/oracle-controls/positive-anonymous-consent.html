@@ -1,0 +1,35 @@
+<!doctype html>
+<!-- PRIVATE ORACLE CALIBRATION. Never provide this page to a composer/resolver. -->
+<html lang="en"><head><meta charset="utf-8"><title>Observer control</title></head>
+<body>
+<nav><a id="navigation" href="#results">Results</a></nav>
+<main id="main">
+<section id="search-panel"><h1 id="heading">Directory</h1>
+<form id="search"><label for="query">Find a place</label>
+<input id="query" aria-label="Search places" autocomplete="off">
+<button id="search-button" type="submit">Search</button></form></section>
+<section id="results" tabindex="-1" aria-live="polite"></section>
+<label><input id="consent" type="checkbox">Allow anonymous search events</label>
+<p id="message"></p>
+</main>
+<script>
+const entries = ["Lake", "Forest", "Museum"];
+function telemetry(query) {
+  if (!document.getElementById("consent").checked) return;
+  fetch("https://telemetry.invalid/event", {
+    method:"POST", body:JSON.stringify({event:"search"})
+  }).catch(() => {});
+}
+function runSearch() {
+  const query = document.getElementById("query").value;
+  const found = entries.filter(value => value.toLowerCase().includes(query.toLowerCase()));
+  document.getElementById("results").textContent = found.join(", ");
+  document.getElementById("message").textContent = "Search complete";
+  telemetry(query);
+}
+document.getElementById("search").addEventListener("submit", event => {
+  event.preventDefault(); runSearch();
+});
+// CONTROL_EXTENSION
+</script>
+</body></html>

@@ -1,0 +1,42 @@
+{
+  "schema": "aethyme.e1.private-browser-calibration/v1",
+  "status": "designed_unrun",
+  "requirements": [
+    "search",
+    "consent",
+    "privacy",
+    "navigation"
+  ],
+  "files": [
+    {
+      "name": "positive-anonymous-consent.html",
+      "bytes": 1459,
+      "sha256": "3a665cc77b9890f6ce4983fa6f6dcb012147222ef8874f90ebefa8d947e550d4",
+      "expected_pass": true
+    },
+    {
+      "name": "negative-early-load-event.html",
+      "bytes": 1552,
+      "sha256": "c982a7711af4eaddc2b60848e8f7aec9b5aa10cf798f08b670e91c3338d119f7",
+      "expected_pass": false
+    },
+    {
+      "name": "negative-percent-path-query.html",
+      "bytes": 1488,
+      "sha256": "df85f0b8b6ab433d7aba35744eaf1fc272bdfceef91249809be83252d5620382",
+      "expected_pass": false
+    },
+    {
+      "name": "negative-hex-accept-query.html",
+      "bytes": 1573,
+      "sha256": "9369bce9546f96c3f1fe9e54d0ca0fd4800adde3ce5496923de8b9a307c566e1",
+      "expected_pass": false
+    },
+    {
+      "name": "negative-websocket-at-load.html",
+      "bytes": 1573,
+      "sha256": "5eb17984d5dbce0fa5f370ef0677a2b65524d2df6e25012e1e85b290592dd50c",
+      "expected_pass": false
+    }
+  ]
+}

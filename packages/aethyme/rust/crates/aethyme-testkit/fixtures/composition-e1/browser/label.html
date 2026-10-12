@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Public directory</title></head>
+<body>
+<nav><a id="navigation" href="#results">Results</a></nav>
+<aside id="sidebar"><h2>Quick tools</h2></aside>
+<main id="main">
+  <section id="search-panel">
+    <h1 id="heading">Directory search</h1>
+    <form id="search">
+      <label for="query">Find a place</label>
+      <input id="query" aria-label="Search places" autocomplete="off">
+      <button id="search-button" type="submit">Search</button>
+    </form>
+  </section>
+  <section id="results" tabindex="-1" aria-live="polite"></section>
+  <p id="message"></p>
+</main>
+<script>
+const timeoutMs = 1500;
+const entries = ["Lake", "Forest", "Museum"];
+function hasConsent() { return false; }
+function telemetry(query) { }
+function resultLabel(value) { return value; }
+function runSearch() {
+  const query = document.getElementById("query").value;
+  const found = entries.filter(value => value.toLowerCase().includes(query.toLowerCase()));
+  document.getElementById("results").textContent = found.map(resultLabel).join(", ");
+  document.getElementById("message").textContent = "Search complete";
+  telemetry(query);
+}
+document.getElementById("search").addEventListener("submit", event => {
+  event.preventDefault();
+  runSearch();
+});
+</script>
+</body>
+</html>

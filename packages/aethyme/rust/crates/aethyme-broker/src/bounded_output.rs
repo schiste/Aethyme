@@ -18,6 +18,127 @@ use std::time::{Duration, Instant};
 /// how late a child that exits without closing them is noticed.
 const POLL: Duration = Duration::from_millis(50);
 
+/// A finite process observation. Limits apply independently to both streams.
+#[derive(Debug)]
+pub(crate) enum LimitedOutput {
+    Completed(Output),
+    Deadline,
+    OutputLimit,
+}
+
+/// Bound memory and elapsed time even if a descendant holds a pipe open.
+/// Only this invocation's direct child is killed; no process-name matching.
+pub(crate) fn output_limited(
+    command: &mut Command,
+    budget: Duration,
+    max_stream_bytes: usize,
+) -> io::Result<LimitedOutput> {
+    let started = Instant::now();
+    let deadline = started
+        .checked_add(budget)
+        .ok_or_else(|| io::Error::other("process deadline overflow"))?;
+    let cap = max_stream_bytes
+        .checked_add(1)
+        .and_then(|value| u64::try_from(value).ok())
+        .ok_or_else(|| io::Error::other("process output limit overflow"))?;
+    if Instant::now() >= deadline {
+        return Ok(LimitedOutput::Deadline);
+    }
+    let mut child = LimitedChild(
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?,
+    );
+    let stdout = child
+        .0
+        .stdout
+        .take()
+        .ok_or_else(|| io::Error::other("missing stdout"))?;
+    let stderr = child
+        .0
+        .stderr
+        .take()
+        .ok_or_else(|| io::Error::other("missing stderr"))?;
+    let (sender, receiver) = mpsc::channel();
+    for (is_stdout, stream) in [
+        (true, Box::new(stdout) as Box<dyn Read + Send>),
+        (false, Box::new(stderr) as Box<dyn Read + Send>),
+    ] {
+        let sender = sender.clone();
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let result = stream.take(cap).read_to_end(&mut bytes).map(|_| bytes);
+            // The receiver can disappear when the invocation expires.
+            crate::warn_unrecorded(
+                "deliver bounded process output",
+                sender.send((is_stdout, result)),
+            );
+        });
+    }
+    drop(sender);
+    let mut stdout = None;
+    let mut stderr = None;
+    let mut status = None;
+    loop {
+        // A cached exit must never turn an expired observation into success.
+        if Instant::now() >= deadline {
+            return Ok(LimitedOutput::Deadline);
+        }
+        if status.is_none() {
+            status = child.0.try_wait()?;
+        }
+        if let (Some(status), Some(stdout), Some(stderr)) =
+            (status, stdout.as_mut(), stderr.as_mut())
+        {
+            if Instant::now() >= deadline {
+                return Ok(LimitedOutput::Deadline);
+            }
+            return Ok(LimitedOutput::Completed(Output {
+                status,
+                stdout: std::mem::take(stdout),
+                stderr: std::mem::take(stderr),
+            }));
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match receiver.recv_timeout(remaining.min(Duration::from_millis(10))) {
+            Ok((is_stdout, result)) => {
+                let bytes = result?;
+                if bytes.len() > max_stream_bytes {
+                    return Ok(LimitedOutput::OutputLimit);
+                }
+                if is_stdout {
+                    stdout = Some(bytes);
+                } else {
+                    stderr = Some(bytes);
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                if stdout.is_none() || stderr.is_none() {
+                    return Err(io::Error::other("process output reader disconnected"));
+                }
+                std::thread::sleep(remaining.min(Duration::from_millis(1)));
+            }
+        }
+    }
+}
+
+struct LimitedChild(std::process::Child);
+
+impl Drop for LimitedChild {
+    fn drop(&mut self) {
+        match self.0.try_wait() {
+            Ok(Some(_)) => {}
+            Ok(None) | Err(_) => {
+                crate::warn_unrecorded("kill bounded child", self.0.kill());
+                crate::warn_unrecorded("reap bounded child", self.0.wait());
+            }
+        }
+    }
+}
+
 /// Run `command` like [`Command::output`], but kill it once `budget` elapses.
 ///
 /// `Ok(None)` means the budget expired: the child was killed and reaped, and
@@ -112,6 +233,64 @@ fn join_reader(reader: JoinHandle<io::Result<Vec<u8>>>) -> io::Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn limited_output_retains_status_and_both_streams() {
+        let LimitedOutput::Completed(output) = output_limited(
+            Command::new("sh").args(["-c", "printf out; printf err >&2; exit 7"]),
+            Duration::from_secs(5),
+            3,
+        )
+        .unwrap() else {
+            panic!("finite child must complete");
+        };
+        assert_eq!(output.status.code(), Some(7));
+        assert_eq!(output.stdout, b"out");
+        assert_eq!(output.stderr, b"err");
+    }
+
+    #[test]
+    fn limited_output_refuses_either_stream_overflow() {
+        for script in ["printf four", "printf four >&2"] {
+            assert!(matches!(
+                output_limited(
+                    Command::new("sh").args(["-c", script]),
+                    Duration::from_secs(5),
+                    3,
+                )
+                .unwrap(),
+                LimitedOutput::OutputLimit
+            ));
+        }
+    }
+
+    #[test]
+    fn limited_output_refuses_zero_budget_without_launching() {
+        assert!(matches!(
+            output_limited(
+                &mut Command::new("aethyme-must-not-exist"),
+                Duration::ZERO,
+                32,
+            )
+            .unwrap(),
+            LimitedOutput::Deadline
+        ));
+    }
+
+    #[test]
+    fn limited_output_kills_only_its_own_expired_child() {
+        let started = Instant::now();
+        assert!(matches!(
+            output_limited(
+                Command::new("sh").args(["-c", "exec sleep 30"]),
+                Duration::from_millis(100),
+                32,
+            )
+            .unwrap(),
+            LimitedOutput::Deadline
+        ));
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
 
     #[test]
     fn a_child_that_finishes_in_time_returns_its_output_and_status() {
