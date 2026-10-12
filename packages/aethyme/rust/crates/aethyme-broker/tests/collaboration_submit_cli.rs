@@ -455,8 +455,10 @@ fn status_reports_the_collaboration_fence() {
     );
     let text = required.cli(&["status"], None);
     assert!(
-        String::from_utf8_lossy(&text.stdout)
-            .contains("Collaboration fence: broker.db requires schema 50"),
+        String::from_utf8_lossy(&text.stdout).contains(&format!(
+            "Collaboration fence: broker.db requires schema {}",
+            aethyme_broker::COLLABORATION_FENCE_SCHEMA
+        )),
         "{}",
         String::from_utf8_lossy(&text.stdout)
     );
