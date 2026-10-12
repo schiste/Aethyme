@@ -19,6 +19,8 @@ use aethyme_contracts::experimental_v0::RecordId;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
+const SOURCE_FILE: &str = "page.html";
+
 fn fixtures() -> PathBuf {
     aethyme_testkit::rust_workspace_root()
         .join("crates/aethyme-testkit/fixtures/composition-e1/browser")
@@ -43,8 +45,8 @@ fn git(repo: &Path, args: &[&str]) -> String {
 }
 
 fn commit_file(repo: &Path, bytes: &[u8]) -> String {
-    std::fs::write(repo.join("index.html"), bytes).unwrap();
-    git(repo, &["add", "index.html"]);
+    std::fs::write(repo.join(SOURCE_FILE), bytes).unwrap();
+    git(repo, &["add", SOURCE_FILE]);
     git(repo, &["commit", "-qm", "fixture input"]);
     git(repo, &["rev-parse", "HEAD"])
 }
@@ -340,6 +342,12 @@ fn verify_runtime(profile: &Value) {
         inventory_directory(Path::new(root.as_str().unwrap()), &mut actual);
     }
     let files = profile["files"].as_array().unwrap();
+    for field in ["node", "chromium", "playwright"] {
+        assert!(
+            files.iter().any(|file| file["path"] == profile[field]),
+            "launched runtime file must occur in appointed inventory"
+        );
+    }
     actual.push(profile["node"].as_str().unwrap().to_string());
     let observer = files
         .iter()
@@ -443,12 +451,30 @@ fn required_check_names(requirements: &Value) -> Vec<&'static str> {
     checks
 }
 
+fn appointed_environment(command: &mut Command, root: &Path) {
+    command
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+        .env("HOME", root)
+        .env("TMPDIR", root)
+        .current_dir(root);
+}
+
 fn observe(file: &Path, requirements: &Value, root: &Path, label: &str) -> Value {
     let workspace = aethyme_testkit::rust_workspace_root();
     let monorepo = workspace.ancestors().nth(3).unwrap();
     let observer = monorepo.join("packages/aethyme-eval/e1/browser-oracle.mjs");
     let profile = runtime_profile();
+    assert!(
+        profile["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["path"].as_str() == observer.to_str()),
+        "actual observer must match the verified appointed path"
+    );
     let mut command = Command::new("/usr/bin/sandbox-exec");
+    appointed_environment(&mut command, root);
     command
         .args(["-p", "(version 1)(allow default)(deny network*)"])
         .arg(profile["node"].as_str().unwrap())
@@ -621,7 +647,7 @@ fn compare_browser_inputs() {
                 let output = world.root.join(format!("candidate-{index}"));
                 collaboration_archive::reconstruct(&world.store, &candidate.subject, &output)
                     .unwrap();
-                let file = output.join("index.html");
+                let file = output.join(SOURCE_FILE);
                 row["candidate"] = json!({"file":file,"sha256":digest(&std::fs::read(&file).unwrap()),"snapshot":candidate.subject.as_str(),"commit":candidate.commit.as_str(),"tree":candidate.tree.as_str(),"mode":format!("{:?}",candidate.mode)});
                 row["recipe"] = json!(composition.recipe.as_ref().unwrap().id.as_str());
                 row["browser"] = observe(
@@ -788,4 +814,31 @@ fn retained_child_logs_have_a_hard_byte_cap() {
             .len()
             <= LOG_LIMIT as u64
     );
+}
+
+#[test]
+#[ignore = "explicit appointed Node runtime environment check; no browser trial"]
+fn appointed_node_cannot_run_an_ambient_preload() {
+    let root = tempfile::tempdir().unwrap();
+    let hook = root.path().join("preload.cjs");
+    let marker = root.path().join("injected-marker");
+    std::fs::write(
+        &hook,
+        format!(
+            "require('node:fs').writeFileSync({},'injected');",
+            serde_json::to_string(marker.to_str().unwrap()).unwrap()
+        ),
+    )
+    .unwrap();
+    let mut command = Command::new(runtime_profile()["node"].as_str().unwrap());
+    command
+        .env("NODE_OPTIONS", format!("--require {}", hook.display()))
+        .env("NODE_PATH", root.path())
+        .env("DYLD_INSERT_LIBRARIES", &hook)
+        .args(["-e", "console.log('appointed')"]);
+    appointed_environment(&mut command, root.path());
+    let outcome = external(&mut command, root.path(), "preload", 5);
+    assert_eq!(outcome["state"], "completed");
+    assert_eq!(outcome["exit"], 0);
+    assert!(!marker.exists(), "ambient preload must not execute");
 }
