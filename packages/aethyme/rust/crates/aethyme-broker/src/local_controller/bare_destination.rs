@@ -5,6 +5,7 @@
 
 use std::fs::{self, Metadata};
 use std::path::{Path, PathBuf};
+use std::process::Output;
 use std::time::Duration;
 
 use super::ControllerError;
@@ -46,9 +47,9 @@ impl BareDestination {
 }
 
 /// Accept only an absolute local filesystem path whose canonical directory is
-/// itself Git's bare git-dir. Git is invoked through the broker's trusted
-/// binary, with inherited environment and global/system configuration removed,
-/// a finite output cap and a short deadline.
+/// itself Git's bare git-dir, with no linked worktrees. Git is invoked through
+/// the broker's trusted binary, with inherited environment and global/system
+/// configuration removed, a finite output cap and a short deadline.
 pub(crate) fn validate_endpoint(raw: &str) -> Result<BareDestination, ControllerError> {
     let path = Path::new(raw);
     if !path.is_absolute() {
@@ -91,34 +92,11 @@ fn validate_path(path: &Path) -> Result<BareDestination, ControllerError> {
     }
     let identity = file_identity(&metadata)?;
 
-    let mut command = git_command();
-    command
-        .env_clear()
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_SYSTEM", null_config_path())
-        .env("GIT_CONFIG_GLOBAL", null_config_path())
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .arg("-C")
-        .arg(&canonical)
-        .args(["rev-parse", "--is-bare-repository", "--absolute-git-dir"]);
-    let output = match output_limited(&mut command, PROBE_BUDGET, MAX_PROBE_STREAM_BYTES)
-        .map_err(|error| rejected(format!("could not run trusted Git probe: {error}")))?
-    {
-        LimitedOutput::Completed(output) if output.status.success() => output,
-        LimitedOutput::Completed(output) => {
-            return Err(rejected(format!(
-                "Git did not recognize a repository endpoint: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            )));
-        }
-        LimitedOutput::Deadline => {
-            return Err(rejected("Git endpoint probe exceeded its deadline"));
-        }
-        LimitedOutput::OutputLimit => {
-            return Err(rejected("Git endpoint probe exceeded its output limit"));
-        }
-    };
+    let output = trusted_git_probe(
+        &canonical,
+        &["rev-parse", "--is-bare-repository", "--absolute-git-dir"],
+        "repository endpoint probe",
+    )?;
 
     let stdout = String::from_utf8(output.stdout)
         .map_err(|_| rejected("Git endpoint probe returned non-UTF-8 output"))?;
@@ -147,6 +125,17 @@ fn validate_path(path: &Path) -> Result<BareDestination, ControllerError> {
         ));
     }
 
+    let worktrees = trusted_git_probe(
+        &canonical,
+        &["worktree", "list", "--porcelain", "-z"],
+        "bare endpoint worktree inventory",
+    )?;
+    if worktrees.stdout != single_bare_worktree_record(&canonical)? {
+        return Err(rejected(
+            "bare endpoint has linked worktrees or an unexpected worktree inventory",
+        ));
+    }
+
     // Catch ordinary replacement while Git was inspecting the path. The
     // caller rechecks the same identity immediately before publication.
     let after = fs::symlink_metadata(&canonical)
@@ -160,6 +149,47 @@ fn validate_path(path: &Path) -> Result<BareDestination, ControllerError> {
         path: canonical,
         identity,
     })
+}
+
+fn trusted_git_probe(
+    repository: &Path,
+    args: &[&str],
+    operation: &str,
+) -> Result<Output, ControllerError> {
+    let mut command = git_command();
+    command
+        .env_clear()
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_SYSTEM", null_config_path())
+        .env("GIT_CONFIG_GLOBAL", null_config_path())
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .arg("-C")
+        .arg(repository)
+        .args(args);
+    match output_limited(&mut command, PROBE_BUDGET, MAX_PROBE_STREAM_BYTES)
+        .map_err(|error| rejected(format!("could not run trusted Git {operation}: {error}")))?
+    {
+        LimitedOutput::Completed(output) if output.status.success() => Ok(output),
+        LimitedOutput::Completed(output) => Err(rejected(format!(
+            "Git {operation} failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))),
+        LimitedOutput::Deadline => Err(rejected(format!("Git {operation} exceeded its deadline"))),
+        LimitedOutput::OutputLimit => Err(rejected(format!(
+            "Git {operation} exceeded its output limit"
+        ))),
+    }
+}
+
+fn single_bare_worktree_record(path: &Path) -> Result<Vec<u8>, ControllerError> {
+    let path = path
+        .to_str()
+        .ok_or_else(|| rejected("canonical endpoint path is not UTF-8"))?;
+    let mut expected = b"worktree ".to_vec();
+    expected.extend_from_slice(path.as_bytes());
+    expected.extend_from_slice(b"\0bare\0\0");
+    Ok(expected)
 }
 
 fn rejected(reason: impl std::fmt::Display) -> ControllerError {
@@ -204,8 +234,6 @@ fn file_identity(_: &Metadata) -> Result<FileIdentity, ControllerError> {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use crate::git::git_command;
-    use std::process::Output;
 
     fn run_git(repo: &Path, args: &[&str]) -> Output {
         let mut command = git_command();
@@ -261,6 +289,32 @@ mod tests {
                 "updateInstead",
             ],
         );
+    }
+
+    fn init_bare_with_checked_out_linked_worktree(root: &Path, bare: &Path, linked: &Path) {
+        init_bare(bare);
+        let seed = root.join("seed");
+        fs::create_dir(&seed).unwrap();
+        run_git(&seed, &["init", "-q"]);
+        run_git(&seed, &["symbolic-ref", "HEAD", "refs/heads/main"]);
+        fs::write(seed.join("tracked.txt"), "linked worktree baseline\n").unwrap();
+        run_git(&seed, &["add", "tracked.txt"]);
+        run_git(&seed, &["commit", "-q", "-m", "baseline"]);
+
+        run_git(bare, &["remote", "add", "seed", seed.to_str().unwrap()]);
+        run_git(bare, &["fetch", "-q", "seed", "main"]);
+        run_git(bare, &["branch", "main", "FETCH_HEAD"]);
+        run_git(bare, &["symbolic-ref", "HEAD", "refs/heads/main"]);
+        run_git(
+            bare,
+            &[
+                "config",
+                "--local",
+                "receive.denyCurrentBranch",
+                "updateInstead",
+            ],
+        );
+        run_git(bare, &["worktree", "add", linked.to_str().unwrap(), "main"]);
     }
 
     fn err(raw: &str) -> String {
@@ -357,5 +411,32 @@ mod tests {
         fs::remove_file(&parent_link).unwrap();
         symlink(&parent_b, &parent_link).unwrap();
         assert!(accepted.revalidate().is_err());
+    }
+
+    #[test]
+    fn rejects_bare_endpoint_with_update_instead_linked_worktree_unchanged() {
+        let temp = tempfile::tempdir().unwrap();
+        let bare = temp.path().join("publication.git");
+        let linked = temp.path().join("linked");
+        init_bare_with_checked_out_linked_worktree(temp.path(), &bare, &linked);
+
+        let head_before = run_git_text(&linked, &["rev-parse", "HEAD"]);
+        let branch_before = run_git_text(&bare, &["rev-parse", "refs/heads/main"]);
+        let status_before = run_git_text(&linked, &["status", "--porcelain"]);
+        let content_before = fs::read(linked.join("tracked.txt")).unwrap();
+        assert!(err(bare.to_str().unwrap()).contains("linked worktrees"));
+        assert_eq!(head_before, run_git_text(&linked, &["rev-parse", "HEAD"]));
+        assert_eq!(
+            branch_before,
+            run_git_text(&bare, &["rev-parse", "refs/heads/main"])
+        );
+        assert_eq!(
+            status_before,
+            run_git_text(&linked, &["status", "--porcelain"])
+        );
+        assert_eq!(
+            content_before,
+            fs::read(linked.join("tracked.txt")).unwrap()
+        );
     }
 }
