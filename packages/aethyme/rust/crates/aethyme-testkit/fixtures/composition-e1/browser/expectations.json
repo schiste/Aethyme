@@ -33,7 +33,8 @@
         "label",
         "accessible",
         "mobile",
-        "navigation"
+        "navigation",
+        "keyboard"
       ]
     },
     {

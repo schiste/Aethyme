@@ -248,7 +248,8 @@
         "label",
         "accessible",
         "mobile",
-        "navigation"
+        "navigation",
+        "keyboard"
       ]
     },
     {
@@ -523,7 +524,27 @@
       ],
       "synthesis": "FX04-browser",
       "exclude": "c1",
-      "consumer_requires_synthesis": true
+      "consumer_task": "fx07-consumer-declaration.json",
+      "subtraction_paths": [
+        {
+          "keep": [
+
+          ],
+          "requirements": [
+            "search",
+            "navigation",
+            "no_analytics"
+          ]
+        },
+        {
+          "keep": [
+            "consumer-footer"
+          ],
+          "requirements": [
+
+          ]
+        }
+      ]
     }
   ]
 }

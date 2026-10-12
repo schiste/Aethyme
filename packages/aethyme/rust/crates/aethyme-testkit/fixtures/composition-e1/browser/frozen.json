@@ -1,5 +1,6 @@
 {
   "schema": "aethyme.e1.browser-freeze/v1",
+  "review_correction": "Independent pretrial review f319986f: inherited keyboard and actual archived synthesis-consumer",
   "files": [
     {
       "name": "accessible.html",
@@ -18,8 +19,8 @@
     },
     {
       "name": "cases.json",
-      "bytes": 8807,
-      "sha256": "f6e053c2732183ae35c46ebb7d09adbb86432c1bbd721f570721d0360e4c5adc"
+      "bytes": 9173,
+      "sha256": "e496e92af21d256ab0375b9540488d2afba9cc5668fa8ebdbb07aafea3373f9f"
     },
     {
       "name": "consumer.html",
@@ -28,13 +29,23 @@
     },
     {
       "name": "expectations.json",
-      "bytes": 1676,
-      "sha256": "67a4f0c68c7f4e613fd6e1a19082ed08d404301eff6ed10fdd6e0ee0f38add39"
+      "bytes": 1696,
+      "sha256": "e4444f153d4f7534878de3fd6cf6c312ce03bcca9871f8a895a59d9d3c2a0a74"
+    },
+    {
+      "name": "fx07-consumer-declaration.json",
+      "bytes": 3277,
+      "sha256": "5bcadf165582ee5a010fdddf15c0f7b783f891eeca84968fe0bebace9244e9f2"
+    },
+    {
+      "name": "fx07-review.md",
+      "bytes": 1416,
+      "sha256": "83f7bee94d6a6fcbeda5f3726e77b39a4525b5e4a3ef4795b1cf20056618a430"
     },
     {
       "name": "inherited.html",
-      "bytes": 1317,
-      "sha256": "5d45cd10526773a00e9b503736fd8a00d6a2bcf75aab431f070a55e528844672"
+      "bytes": 1531,
+      "sha256": "ff0bde0fb6dad2424b03bfb2c2ed139abf0fbcf8378a4467e290506456024d1a"
     },
     {
       "name": "label.html",
