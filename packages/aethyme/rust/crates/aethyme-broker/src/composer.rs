@@ -2591,6 +2591,7 @@ mod tests {
             engine: Some(&engine),
             observations: Vec::new(),
             text_merges: 0,
+            accepted_baseline: None,
         };
         let mut reader = Reader {
             store: &f.store,
