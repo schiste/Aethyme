@@ -69,3 +69,26 @@ complete candidate/input digests, observed mode/fallback, independent assertions
 bounded costs and cleanup status. Required positive move/edit, inherited-base
 and semantic-interaction evidence precede selecting the profile. Native gate
 integration and autonomous execution are separately reviewed Local steps.
+
+## Actual synthesis, consumer and subtraction
+
+The frozen 97a152f1 harness (SHA-256
+`76a6cb9b54fc06db9b808e5340e665d3419c84d668bc6d7943e429425863dde9`)
+ran a genuine failed semantic check through the bounded ResolutionRequest path.
+The appointed gpt-6-luna model read the synthetic inputs and public requirements
+through successful tools and synthesized a repair on its first attempt. The
+independent browser accepted it. Its consumer then passed both declared orders
+twice. Removing the original contribution and its consumer passed twice; keeping
+the dependent consumer refused twice with `inseparable_selection`. All original
+sources remained reconstructable. The unused second allowance is recorded as
+unrun, rather than another successful trial.
+
+The process reported 25,971 input tokens (11,008 cached) and 1,212 output tokens,
+and took 19,338 ms. Dollar charges are unavailable. Complete actual tool output
+establishes access to both public files. Earlier argument, helper and engine
+admission failures retain their full schedules and available costs separately.
+The shared build directory initially supplied a stale engine artifact; the final
+campaign used a copied, hashed executable. These results qualify this synthetic
+repair and its consumer/subtraction plumbing, rather than arbitrary semantic
+repairs. The independently sealed variant and upstream source inventory remain
+pending. Evidence is under `packages/aethyme-eval/e1/synthesis-observations/`.

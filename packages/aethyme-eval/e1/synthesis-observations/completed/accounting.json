@@ -1,0 +1,44 @@
+[
+  {
+    "attempt": 0,
+    "state": "completed",
+    "outcome": "synthesized",
+    "provider_usage": {
+      "input_tokens": 25971,
+      "output_tokens": 1212,
+      "cached_input_tokens": 11008,
+      "uncached_input_tokens": 14963,
+      "uncached_plus_output_tokens": 16175,
+      "cache_write_input_tokens": 0,
+      "retries": 0
+    },
+    "provider_charge_microunits": null,
+    "model_process_wall_ms": 19338,
+    "actual_completed_command_tools": 2,
+    "public_access": [
+      {
+        "file": "inputs.json",
+        "sha256": "74d37fdb4cb46b5206efd0d41f98235e0671da4d3f271f14a8589dc6259edcc4",
+        "bytes": 7829,
+        "complete_tool_output_item_ids": [
+          "item_1"
+        ],
+        "access_established": true
+      },
+      {
+        "file": "requirements.md",
+        "sha256": "c6ca07af3cdeae66706af81d080459096967c2b605a5dbca342c466444d85cb8",
+        "bytes": 1799,
+        "complete_tool_output_item_ids": [
+          "item_2"
+        ],
+        "access_established": true
+      }
+    ]
+  },
+  {
+    "attempt": 1,
+    "state": "unrun",
+    "provider_usage": null
+  }
+]
