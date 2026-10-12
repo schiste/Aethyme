@@ -44,6 +44,8 @@ pub struct MergeObservation {
     pub result_sha256: String,
     pub output_sha256: String,
     pub diagnostic_sha256: String,
+    /// Bounded execution evidence, separate from the deterministic recipe.
+    pub diagnostic: String,
 }
 
 pub(crate) struct EngineMerge {
@@ -65,11 +67,42 @@ impl MergirafEngine {
                 "absolute executable and lowercase SHA-256 required".into(),
             ));
         }
-        let mut bytes = Vec::new();
-        std::fs::File::open(executable)
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
+        }
+        let file = options
+            .open(executable)
+            .map_err(|source| io(executable, source))?;
+        if !file
+            .metadata()
             .map_err(|source| io(executable, source))?
-            .take((TOOL_LIMIT + 1) as u64)
-            .read_to_end(&mut bytes)
+            .is_file()
+        {
+            return Err(ComposeError::InvalidRequest(
+                "structural executable must be a regular file".into(),
+            ));
+        }
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let result = file
+                .take((TOOL_LIMIT + 1) as u64)
+                .read_to_end(&mut bytes)
+                .map(|_| bytes);
+            // A stalled filesystem reader may finish after admission expires.
+            crate::warn_unrecorded("deliver bounded executable bytes", sender.send(result));
+        });
+        let bytes = receiver
+            .recv_timeout(Duration::from_secs(3))
+            .map_err(|_| {
+                ComposeError::InvalidRequest(
+                    "structural executable acquisition deadline exhausted".into(),
+                )
+            })?
             .map_err(|source| io(executable, source))?;
         if bytes.len() > TOOL_LIMIT || digest(&bytes) != expected_sha256 {
             return Err(ComposeError::InvalidRequest(
@@ -140,7 +173,7 @@ impl MergirafEngine {
             .iter()
             .any(|bytes| bytes.len() > INPUT_LIMIT)
         {
-            return Err(ComposeError::InvalidRequest(
+            return Err(ComposeError::EngineBudget(
                 "structural input exceeds 4 MiB".into(),
             ));
         }
@@ -184,12 +217,12 @@ impl MergirafEngine {
         let output = match observed {
             LimitedOutput::Completed(output) => output,
             LimitedOutput::Deadline => {
-                return Err(ComposeError::InvalidRequest(
+                return Err(ComposeError::EngineBudget(
                     "structural process deadline exhausted".into(),
                 ));
             }
             LimitedOutput::OutputLimit => {
-                return Err(ComposeError::InvalidRequest(
+                return Err(ComposeError::EngineBudget(
                     "structural process output limit exhausted".into(),
                 ));
             }
@@ -198,13 +231,14 @@ impl MergirafEngine {
         let observation = MergeObservation {
             path: String::from_utf8_lossy(path).into_owned(),
             method: selected_method(&diagnostic),
-            timed_fallback: diagnostic.contains("falling back to Git"),
+            timed_fallback: timed_fallback(&diagnostic),
             exit_code: output.status.code(),
             base_sha256: digest(base),
             current_sha256: digest(current),
             result_sha256: digest(result),
             output_sha256: digest(&output.stdout),
             diagnostic_sha256: digest(&output.stderr),
+            diagnostic: diagnostic.into_owned(),
         };
         let bytes = match output.status.code() {
             Some(0) if std::str::from_utf8(&output.stdout).is_ok() => Some(output.stdout),
@@ -245,6 +279,10 @@ fn selected_method(diagnostic: &str) -> MergeMethod {
     }
 }
 
+fn timed_fallback(diagnostic: &str) -> bool {
+    diagnostic.contains("structured merge took too long, falling back to Git")
+}
+
 fn digest(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
@@ -276,6 +314,19 @@ mod tests {
     }
 
     #[test]
+    fn only_a_timeout_diagnostic_is_timed_fallback() {
+        assert!(timed_fallback(
+            "WARN structured merge took too long, falling back to Git"
+        ));
+        assert!(!timed_fallback(
+            "input is not valid UTF-8, falling back to Git"
+        ));
+        assert!(!timed_fallback(
+            "conflict markers present, falling back to Git"
+        ));
+    }
+
+    #[test]
     fn grammar_boundary_is_only_html_extensions() {
         assert!(supports(b"src/component.HTML"));
         assert!(!supports(b"src/component.ts"));
@@ -288,5 +339,22 @@ mod tests {
         std::fs::write(executable.path(), b"not an engine").unwrap();
         assert!(MergirafEngine::pin(executable.path(), &"0".repeat(64)).is_err());
         assert!(MergirafEngine::pin(Path::new("mergiraf"), &"0".repeat(64)).is_err());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn executable_fifo_is_refused_without_waiting_for_a_writer() {
+        let root = tempfile::tempdir().unwrap();
+        let fifo = root.path().join("engine");
+        assert!(
+            Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let started = std::time::Instant::now();
+        assert!(MergirafEngine::pin(&fifo, &"0".repeat(64)).is_err());
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 }

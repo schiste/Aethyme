@@ -291,6 +291,8 @@ pub enum ComposeError {
     Archive(#[from] ArchiveError),
     #[error("{0}")]
     InvalidRequest(String),
+    #[error("engine budget: {0}")]
+    EngineBudget(String),
     #[error("git: {0}")]
     Git(String),
     #[error("{path}: {source}")]
@@ -311,6 +313,7 @@ impl ComposeError {
         match self {
             Self::Archive(error) => error.code(),
             Self::InvalidRequest(_) => "invalid_request",
+            Self::EngineBudget(_) => "budget_exhausted",
             Self::Git(_) => "git",
             Self::Io { .. } => "io",
             Self::SubjectMismatch { .. } => "subject_mismatch",
@@ -1402,11 +1405,31 @@ fn apply_path(
         )));
     }
     let merged = if let Some(engine) = html_engine {
-        let merged = engine.merge(merger.path, &base_text, &current_text, &result_text)?;
+        let merged = match engine.merge(merger.path, &base_text, &current_text, &result_text) {
+            Ok(merged) => merged,
+            Err(ComposeError::EngineBudget(detail)) => {
+                return Ok(Err(refused(Refusal::BudgetExhausted, detail)));
+            }
+            Err(error) => return Err(error),
+        };
         let observed_structural = matches!(
             merged.observation.method,
             MergeMethod::StructuredResolution | MergeMethod::FullyStructured
         );
+        let retained_diagnostics: usize = merger
+            .profile
+            .observations
+            .iter()
+            .map(|observation| observation.diagnostic.len())
+            .sum();
+        if retained_diagnostics.saturating_add(merged.observation.diagnostic.len())
+            > 16 * 1024 * 1024
+        {
+            return Ok(Err(refused(
+                Refusal::BudgetExhausted,
+                "composition diagnostic allowance exhausted",
+            )));
+        }
         merger.profile.observations.push(merged.observation);
         if moved && !observed_structural {
             return Ok(Ok(Err(ConflictReason::MovedBlock)));
@@ -1414,7 +1437,19 @@ fn apply_path(
         merged.bytes
     } else {
         merger.profile.text_merges += 1;
-        merge_file(merger.scratch, &base_text, &current_text, &result_text)?
+        match merge_file(
+            merger.scratch,
+            &base_text,
+            &current_text,
+            &result_text,
+            merger.profile.engine.is_some(),
+        ) {
+            Ok(merged) => merged,
+            Err(ComposeError::EngineBudget(detail)) => {
+                return Ok(Err(refused(Refusal::BudgetExhausted, detail)));
+            }
+            Err(error) => return Err(error),
+        }
     };
     let Some(merged) = merged else {
         return Ok(Ok(Err(ConflictReason::Content)));
@@ -1529,6 +1564,7 @@ fn merge_file(
     base: &[u8],
     current: &[u8],
     result: &[u8],
+    bounded: bool,
 ) -> Result<Option<Vec<u8>>, ComposeError> {
     let write = |name: &str, bytes: &[u8]| -> Result<PathBuf, ComposeError> {
         let path = scratch.join(name);
@@ -1538,7 +1574,8 @@ fn merge_file(
     let current = write("current", current)?;
     let base = write("base", base)?;
     let result = write("result", result)?;
-    let output = engine(scratch)
+    let mut command = engine(scratch);
+    command
         .args([
             "merge-file",
             "-p",
@@ -1552,9 +1589,32 @@ fn merge_file(
         .arg(&current)
         .arg(&base)
         .arg(&result)
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|source| io(Path::new("git"), source))?;
+        .stdin(Stdio::null());
+    let output = if bounded {
+        match crate::bounded_output::output_limited(
+            &mut command,
+            std::time::Duration::from_secs(5),
+            8 * 1024 * 1024,
+        )
+        .map_err(|source| io(Path::new("git"), source))?
+        {
+            crate::bounded_output::LimitedOutput::Completed(output) => output,
+            crate::bounded_output::LimitedOutput::Deadline => {
+                return Err(ComposeError::EngineBudget(
+                    "text fallback deadline exhausted".into(),
+                ));
+            }
+            crate::bounded_output::LimitedOutput::OutputLimit => {
+                return Err(ComposeError::EngineBudget(
+                    "text fallback output limit exhausted".into(),
+                ));
+            }
+        }
+    } else {
+        command
+            .output()
+            .map_err(|source| io(Path::new("git"), source))?
+    };
     match output.status.code() {
         Some(0) => Ok(Some(output.stdout)),
         Some(code) if (1..=127).contains(&code) => Ok(None),
@@ -1975,6 +2035,35 @@ fn object(members: Vec<(&str, Value)>) -> Value {
     )
 }
 
+fn merge_observation_record(observation: &MergeObservation) -> Value {
+    object(vec![
+        ("path", text(&observation.path)),
+        (
+            "method",
+            text(match observation.method {
+                MergeMethod::LineBased => "line_based",
+                MergeMethod::StructuredResolution => "structured_resolution",
+                MergeMethod::FullyStructured => "fully_structured",
+                MergeMethod::Unknown => "unknown",
+            }),
+        ),
+        ("timed_fallback", Value::Bool(observation.timed_fallback)),
+        (
+            "exit_code",
+            text(
+                &observation
+                    .exit_code
+                    .map(|code| code.to_string())
+                    .unwrap_or_else(|| "unknown".into()),
+            ),
+        ),
+        ("base_sha256", text(&observation.base_sha256)),
+        ("current_sha256", text(&observation.current_sha256)),
+        ("result_sha256", text(&observation.result_sha256)),
+        ("output_sha256", text(&observation.output_sha256)),
+    ])
+}
+
 fn recipe_record(
     candidate: &Candidate,
     plan: &Plan,
@@ -2025,9 +2114,12 @@ fn recipe_record(
                     ("text_merges", integer(profile.text_merges)),
                     (
                         "observations",
-                        text(
-                            &serde_json::to_string(&profile.observations)
-                                .map_err(|error| ComposeError::InvalidRequest(error.to_string()))?,
+                        Value::Array(
+                            profile
+                                .observations
+                                .iter()
+                                .map(merge_observation_record)
+                                .collect(),
                         ),
                     ),
                     ("text_fallback_version", text(&engine_version)),
@@ -2273,6 +2365,34 @@ pub(crate) fn verify_generation_checkout(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replay_observations_do_not_depend_on_diagnostic_timing() {
+        let first = MergeObservation {
+            path: "component.html".into(),
+            method: MergeMethod::FullyStructured,
+            timed_fallback: false,
+            exit_code: Some(0),
+            base_sha256: "a".repeat(64),
+            current_sha256: "b".repeat(64),
+            result_sha256: "c".repeat(64),
+            output_sha256: "d".repeat(64),
+            diagnostic_sha256: "e".repeat(64),
+            diagnostic: "merge took 1ms".into(),
+        };
+        let mut second = first.clone();
+        second.diagnostic_sha256 = "f".repeat(64);
+        second.diagnostic = "merge took 2ms".into();
+        assert_eq!(
+            merge_observation_record(&first),
+            merge_observation_record(&second)
+        );
+        second.output_sha256 = "0".repeat(64);
+        assert_ne!(
+            merge_observation_record(&first),
+            merge_observation_record(&second)
+        );
+    }
 
     #[test]
     fn a_block_moved_elsewhere_is_a_move_even_reindented() {

@@ -71,9 +71,10 @@ pub(crate) fn output_limited(
             let mut bytes = Vec::new();
             let result = stream.take(cap).read_to_end(&mut bytes).map(|_| bytes);
             // The receiver can disappear when the invocation expires.
-            if sender.send((is_stdout, result)).is_err() {
-                return;
-            }
+            crate::warn_unrecorded(
+                "deliver bounded process output",
+                sender.send((is_stdout, result)),
+            );
         });
     }
     drop(sender);
@@ -88,14 +89,16 @@ pub(crate) fn output_limited(
         if status.is_none() {
             status = child.0.try_wait()?;
         }
-        if status.is_some() && stdout.is_some() && stderr.is_some() {
+        if let (Some(status), Some(stdout), Some(stderr)) =
+            (status, stdout.as_mut(), stderr.as_mut())
+        {
             if Instant::now() >= deadline {
                 return Ok(LimitedOutput::Deadline);
             }
             return Ok(LimitedOutput::Completed(Output {
-                status: status.expect("checked status"),
-                stdout: stdout.expect("checked stdout"),
-                stderr: stderr.expect("checked stderr"),
+                status,
+                stdout: std::mem::take(stdout),
+                stderr: std::mem::take(stderr),
             }));
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
