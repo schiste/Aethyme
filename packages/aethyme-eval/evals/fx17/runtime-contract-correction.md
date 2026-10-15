@@ -45,22 +45,26 @@ parent process. Its child receives only the candidate script and each exact
 literal argv vector. Each sandboxed subject starts with `/` as its working
 directory. Attempt 003 showed that the `/bin/sh` selector starts Bash on this
 host, and Bash's startup `getcwd` check emitted a denial diagnostic when the
-child inherited the private candidate directory. The runner now uses the root
-directory entry already allowed by the profile; it grants no reads to the
-private temporary-directory ancestors. The candidate script remains in a
-private `0700` directory as a `0400` file, and only its exact absolute path
-is allowlisted. Before the controls harness runs, an independent reviewer
-must acknowledge the exact runner, control-harness, and subject-profile hashes.
-The deny-default subject profile permits process execution and file reads only
-for the exact `/bin/sh` and `/bin/bash` shell bootstrap executables. It permits
-metadata access only for the exact `/private/var/select/sh` selector, which
-resolves `/bin/sh` to `/bin/bash` on this host. Other read allowances are the
-root directory entry, `/System/Library`, `/usr/lib`, `/usr/share/locale`, the
+child inherited the private candidate directory. Moving the child to `/`
+removed that private working directory, but attempt 004 still recorded the
+same diagnostic. The actual shell processes were denied `file-read-metadata /`
+during startup. The current profile therefore permits file data and metadata
+for the exact literal `/`; it does not grant reads under any root descendant.
+The candidate script remains in a private `0700` directory as a `0400` file,
+and only its exact absolute path is allowlisted. Before the controls harness
+runs, an independent reviewer must acknowledge the exact runner,
+control-harness, and subject-profile hashes. The deny-default subject profile
+permits process execution and file reads only for the exact `/bin/sh` and
+`/bin/bash` shell bootstrap executables. It permits metadata access for the
+exact `/private/var/select/sh` selector, which resolves `/bin/sh` to `/bin/bash`
+on this host, and for the exact `/` root entry for Bash's `getcwd` check. Other
+read allowances are `/System/Library`, `/usr/lib`, `/usr/share/locale`, the
 exact `/System/Volumes/Preboot/Cryptexes/OS/System/Library/dyld` cache
 directory, and the candidate app file for the current probe. The profile
 continues to deny process-fork, network, and file writes. It allows no general
 executable directory, no general `/private/var` read, and no general
 `/System/Volumes` read.
+
 The final-proposal evaluator then requires a matching passing controls report.
 Control evidence records the canaries, exact per-probe profile, argv, exit
 status, bounded stdout/stderr bytes and hashes, and observed
