@@ -1,0 +1,19 @@
+   Compiling aethyme-broker v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/integrate-reviewed-local-bare-git-servic/packages/aethyme/rust/crates/aethyme-broker)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 7m 48s
+     Running unittests src/lib.rs (target/local-resume/cargo/debug/deps/aethyme_broker-20bbfe5c0b2dd5c0)
+
+running 1 test
+test local_controller::drive::tests::only_known_successful_publication_dispatch_can_reach_qualification ... 
+thread 'local_controller::drive::tests::only_known_successful_publication_dispatch_can_reach_qualification' (20637878) panicked at crates/aethyme-broker/src/local_controller/drive_tests.rs:742:9:
+fresh publication status OutcomeUnknown must hold regardless of later source availability
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+
+failures:
+    local_controller::drive::tests::only_known_successful_publication_dispatch_can_reach_qualification
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1793 filtered out; finished in 0.01s
+
+error: test failed, to rerun pass `-p aethyme-broker --lib`
