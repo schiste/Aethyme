@@ -1,0 +1,25 @@
+run=FX10 monolithic actual trial after independent source review
+session=1123
+branch=agent/implement-fx10-actual-sustained-arrival
+source_commit=1f7b226660dbef8f036e5e10c1c301fe7a38d50a
+worktree=/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/implement-fx10-actual-sustained-arrival
+working_directory=/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/implement-fx10-actual-sustained-arrival/packages/aethyme/rust
+source=crates/aethyme-broker/src/local_controller/drive_tests/sustained_arrivals.rs
+source_sha256=5b46a4281c56518c361643563e602d084f820b12a7ebec37614489a1b183ed32
+fixture_manifest=../../aethyme-eval/fx10/proposal-manifest.json
+fixture_manifest_sha256=01aa466182a9054f5f4f0bd1f71fa1a3f2869ea731cee0f69ed0098a2b679ae1
+frozen_fixture_count=19
+frozen_fixture_status=unchanged from prior table; monolithic test revalidates every pinned byte before Docker/Git acceptance
+PATH=/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/christophehenner/.cargo/bin
+CARGO_TARGET_DIR=/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/integrate-reviewed-local-bare-git-servic/target/local-resume/cargo
+RUSTC_WRAPPER=
+AETHYME_DOCKER_CLI=/opt/homebrew/bin/docker
+AETHYME_DOCKER_TEST_IMAGE=sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251
+command=caffeinate -i cargo test --locked -j4 -p aethyme-broker actual_fx10_sustained_arrivals_serve_old_group_before_later_features -- --ignored --nocapture
+No fixture inputs were edited. Only environment variables listed above are set explicitly; inherited environment was not copied to the artifact.
+started_utc=2026-10-15T09:39:24Z
+commit=1f7b226660dbef8f036e5e10c1c301fe7a38d50a
+branch=agent/implement-fx10-actual-sustained-arrival
+source_sha256=5b46a4281c56518c361643563e602d084f820b12a7ebec37614489a1b183ed32  crates/aethyme-broker/src/local_controller/drive_tests/sustained_arrivals.rs
+manifest_sha256=01aa466182a9054f5f4f0bd1f71fa1a3f2869ea731cee0f69ed0098a2b679ae1  ../../aethyme-eval/fx10/proposal-manifest.json
+changed_since_fix_commit=?? ../../aethyme-eval/fx10/evidence/

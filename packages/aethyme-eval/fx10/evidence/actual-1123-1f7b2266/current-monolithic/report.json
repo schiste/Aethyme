@@ -1,0 +1,1654 @@
+{
+  "accounting": {
+    "first_completion_roots": [
+      {
+        "kind": "contribution",
+        "reference": "sha256:03bbe84a20cd530907faec081708f615c4e15c3aee2903a359d1b8681f2b5ec5"
+      },
+      {
+        "kind": "contribution",
+        "reference": "sha256:0feaff4389b25e3682ef77fba85d758e4d4a52ee7b9ef49052dd94a09f355d9c"
+      },
+      {
+        "kind": "contribution",
+        "reference": "sha256:272b692ab9f6574636bce606b332a6fcf1d52f149316eef4cda60da4df08fe45"
+      },
+      {
+        "kind": "contribution",
+        "reference": "sha256:57d0bb2f863d3927f6a5fd6d3b129b604bea2b6d50213a5bcdf1c315d41daf69"
+      },
+      {
+        "kind": "contribution",
+        "reference": "sha256:881e2ab5ec09d2a79606659c85ea7fab4467442cec42c242eeb6cdd32db254f0"
+      },
+      {
+        "kind": "contribution",
+        "reference": "sha256:cb7b77286275c6ba5966bb7f4c20c244ad79304ec756bdb4be12fe9d1a99ab2d"
+      },
+      {
+        "kind": "object",
+        "reference": "03566c965b5414ae65b7c0df9f3f35c30f77d63f8a85c0a2f385174b6dc48c24"
+      },
+      {
+        "kind": "object",
+        "reference": "0c1557a37cdb3d3346bb84a5d270d3f0d538e2d0cf56c76debe55675d4e9ec50"
+      },
+      {
+        "kind": "object",
+        "reference": "115041e8f57408a6763d8b7704430c5ae3e92f8fb34930753b1055cc352dedaf"
+      },
+      {
+        "kind": "object",
+        "reference": "1910a823a0701a9255bb4d60519f7f3c3b0ab1483221d9aacb56a05a3f12428b"
+      },
+      {
+        "kind": "object",
+        "reference": "1cae0929dc52338987de830d0f1065f87e2a415eb681ebe5c765c482d6a4b89c"
+      },
+      {
+        "kind": "object",
+        "reference": "24c49d85ce8c407b8640e3f390a05985a2d27ae1ff9ef181c53a81908c5c3f16"
+      },
+      {
+        "kind": "object",
+        "reference": "28b12b37d732c5eea077186174b87a25503005ad6452116ca98c8502f0850673"
+      },
+      {
+        "kind": "object",
+        "reference": "2b9bee59d675bf2724bf04a35c4e5f420a33543697424f3319bbe18a4c19d90c"
+      },
+      {
+        "kind": "object",
+        "reference": "4a59152e70ad2a56584c35eec36f46885c76d6abf3aa04c2e45d7b5bcbbd64d1"
+      },
+      {
+        "kind": "object",
+        "reference": "5a1146148381de80136157fd0a058883167b6a6ec732dd992cc6c6c9507fd61a"
+      },
+      {
+        "kind": "object",
+        "reference": "74b91c5d993bdb9e8620fce6d7c05a7c29e4d3cb7092d77fb5701c2247124f58"
+      },
+      {
+        "kind": "object",
+        "reference": "780d52b3f4101fff1cbfb12b27a71406229a59b69fbf6e6773cdb6c6d7702dbb"
+      },
+      {
+        "kind": "object",
+        "reference": "7a23fead071fed44cbb6811da72153472af5ab6633afd712e977c3aa48ebdefd"
+      },
+      {
+        "kind": "object",
+        "reference": "98aaa1eb38133b258986cc3e5cfbd853c4663c9a81722e8a59a292c9292e7afb"
+      },
+      {
+        "kind": "object",
+        "reference": "aa282ec6c09d9e6ee9c5c17bcdd16ebef0be9140c5a4fd9cd0bfbc1551a00f68"
+      },
+      {
+        "kind": "object",
+        "reference": "ab9a1f18ee35c56f9120f5d33db5805d7b00926e4ec4e698d7970cf9c49bc8e3"
+      },
+      {
+        "kind": "object",
+        "reference": "afc563e262f55fa05c830153656c181a4004598dd029d22c9d7ba39cf109bfe9"
+      },
+      {
+        "kind": "object",
+        "reference": "b9f6e0a5bd76c1e148e9c59c481019178431b94bf770e9e2fef2afbbf237c1cf"
+      },
+      {
+        "kind": "object",
+        "reference": "c9bc4e2994c3802576df9208fb67e7f35338b4880dfbb1dc0f7640026baa6941"
+      },
+      {
+        "kind": "object",
+        "reference": "df3b98286b33b0f29dfd3e7597a90ed11f4b6c22b997f642a76ff18298be1c38"
+      },
+      {
+        "kind": "object",
+        "reference": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      {
+        "kind": "object",
+        "reference": "f18e6790bb45c2bf96a85a69e3a61a5cfe72c45f86f33fbe115379ec17c59794"
+      },
+      {
+        "kind": "snapshot",
+        "reference": "sha256:115041e8f57408a6763d8b7704430c5ae3e92f8fb34930753b1055cc352dedaf"
+      },
+      {
+        "kind": "snapshot",
+        "reference": "sha256:6561e8917dd0a21dfb015fb8381c4bfe3303d7226dfc25fc25bcd7a6d744a541"
+      },
+      {
+        "kind": "snapshot",
+        "reference": "sha256:a8b6955b8ddf8e1428d81b834f56fca8fe9bf5d00be05021625b60733a4368d6"
+      }
+    ],
+    "first_wave_allocated": {
+      "disk_bytes": 2961178624,
+      "input_tokens": 0,
+      "memory_bytes": 1887436800,
+      "model_requests": 0,
+      "output_tokens": 0,
+      "previews": 0,
+      "slots": 5,
+      "spend_microunits": 0,
+      "time_ms": 10980000
+    },
+    "first_wave_reservations": [
+      {
+        "allocated": {
+          "disk_bytes": 805306368,
+          "input_tokens": 0,
+          "memory_bytes": 536870912,
+          "model_requests": 0,
+          "output_tokens": 0,
+          "previews": 0,
+          "slots": 1,
+          "spend_microunits": 0,
+          "time_ms": 120000
+        },
+        "attempts": 1,
+        "id": "sha256:12e3387e581226165e9f2640c07d26c101a1d9245851a882018ce19bdfb06b23",
+        "observed_overrun": null,
+        "receipt": "sha256:f631ad0a19194139525dd5c8c3b3cdd0dfe299006658b8a352435e04ac81fee4",
+        "root": "sha256:12e3387e581226165e9f2640c07d26c101a1d9245851a882018ce19bdfb06b23",
+        "spent": {
+          "disk_bytes": 805306368,
+          "input_tokens": 0,
+          "memory_bytes": 536870912,
+          "model_requests": 0,
+          "output_tokens": 0,
+          "previews": 0,
+          "slots": 1,
+          "spend_microunits": 0,
+          "time_ms": 120000
+        },
+        "state": "consumed"
+      },
+      {
+        "allocated": {
+          "disk_bytes": 1077936128,
+          "input_tokens": 0,
+          "memory_bytes": 675282944,
+          "model_requests": 0,
+          "output_tokens": 0,
+          "previews": 0,
+          "slots": 2,
+          "spend_microunits": 0,
+          "time_ms": 10200000
+        },
+        "attempts": 1,
+        "id": "sha256:861aedb10fb8a81979dca5f2b34ef2eda38dc181f1a619732d4c0837f02b8244",
+        "observed_overrun": null,
+        "receipt": "sha256:4298db987ed363a2ed0a63d7af32da78ee12c72f819b0673f7cad86feb43397f",
+        "root": "sha256:861aedb10fb8a81979dca5f2b34ef2eda38dc181f1a619732d4c0837f02b8244",
+        "spent": {
+          "disk_bytes": 1077936128,
+          "input_tokens": 0,
+          "memory_bytes": 675282944,
+          "model_requests": 0,
+          "output_tokens": 0,
+          "previews": 0,
+          "slots": 2,
+          "spend_microunits": 0,
+          "time_ms": 10200000
+        },
+        "state": "consumed"
+      },
+      {
+        "allocated": {
+          "disk_bytes": 1077936128,
+          "input_tokens": 0,
+          "memory_bytes": 675282944,
+          "model_requests": 0,
+          "output_tokens": 0,
+          "previews": 0,
+          "slots": 2,
+          "spend_microunits": 0,
+          "time_ms": 660000
+        },
+        "attempts": 1,
+        "id": "sha256:cd3fd56bc5737d6561ea0024ce87bdc968e25032355e33eb7f0ed24a4bcf5280",
+        "observed_overrun": null,
+        "receipt": "sha256:d79bec36d446f5fdbd0693fb90673010917d0d5d306ba07fdea813c63ef8cf60",
+        "root": "sha256:cd3fd56bc5737d6561ea0024ce87bdc968e25032355e33eb7f0ed24a4bcf5280",
+        "spent": {
+          "disk_bytes": 1077936128,
+          "input_tokens": 0,
+          "memory_bytes": 675282944,
+          "model_requests": 0,
+          "output_tokens": 0,
+          "previews": 0,
+          "slots": 2,
+          "spend_microunits": 0,
+          "time_ms": 660000
+        },
+        "state": "consumed"
+      }
+    ],
+    "first_wave_spent": {
+      "disk_bytes": 2961178624,
+      "input_tokens": 0,
+      "memory_bytes": 1887436800,
+      "model_requests": 0,
+      "output_tokens": 0,
+      "previews": 0,
+      "slots": 5,
+      "spend_microunits": 0,
+      "time_ms": 10980000
+    },
+    "pending_reservations": 0,
+    "second_completion_roots": [
+      {
+        "kind": "contribution",
+        "reference": "sha256:03bbe84a20cd530907faec081708f615c4e15c3aee2903a359d1b8681f2b5ec5"
+      },
+      {
+        "kind": "contribution",
+        "reference": "sha256:0feaff4389b25e3682ef77fba85d758e4d4a52ee7b9ef49052dd94a09f355d9c"
+      },
+      {
+        "kind": "contribution",
+        "reference": "sha256:272b692ab9f6574636bce606b332a6fcf1d52f149316eef4cda60da4df08fe45"
+      },
+      {
+        "kind": "contribution",
+        "reference": "sha256:57d0bb2f863d3927f6a5fd6d3b129b604bea2b6d50213a5bcdf1c315d41daf69"
+      },
+      {
+        "kind": "contribution",
+        "reference": "sha256:881e2ab5ec09d2a79606659c85ea7fab4467442cec42c242eeb6cdd32db254f0"
+      },
+      {
+        "kind": "contribution",
+        "reference": "sha256:cb7b77286275c6ba5966bb7f4c20c244ad79304ec756bdb4be12fe9d1a99ab2d"
+      },
+      {
+        "kind": "object",
+        "reference": "0022e192d3d3c41be32d9d54fe91791f1c2617369a09f3c819fbebbf7cc115d9"
+      },
+      {
+        "kind": "object",
+        "reference": "03566c965b5414ae65b7c0df9f3f35c30f77d63f8a85c0a2f385174b6dc48c24"
+      },
+      {
+        "kind": "object",
+        "reference": "0c1557a37cdb3d3346bb84a5d270d3f0d538e2d0cf56c76debe55675d4e9ec50"
+      },
+      {
+        "kind": "object",
+        "reference": "10885f882aec0664f82ce91b8006bf5c05f33dece4302279ec87b98a0e50cd9b"
+      },
+      {
+        "kind": "object",
+        "reference": "115041e8f57408a6763d8b7704430c5ae3e92f8fb34930753b1055cc352dedaf"
+      },
+      {
+        "kind": "object",
+        "reference": "1cae0929dc52338987de830d0f1065f87e2a415eb681ebe5c765c482d6a4b89c"
+      },
+      {
+        "kind": "object",
+        "reference": "1e57d4bd0dce1275b59494017f9497638406ea6e0b71142bb5e36c1fb11d2e2a"
+      },
+      {
+        "kind": "object",
+        "reference": "1ed4b9080d6e882c217ac4e3dc43d4fd0444761a2f08c2f2d0c70aac5fdd85de"
+      },
+      {
+        "kind": "object",
+        "reference": "24c49d85ce8c407b8640e3f390a05985a2d27ae1ff9ef181c53a81908c5c3f16"
+      },
+      {
+        "kind": "object",
+        "reference": "2636043f00e08e5071a94ef0ec762b9170ea2be9af6559dde0f072fa62081018"
+      },
+      {
+        "kind": "object",
+        "reference": "28b12b37d732c5eea077186174b87a25503005ad6452116ca98c8502f0850673"
+      },
+      {
+        "kind": "object",
+        "reference": "2b9bee59d675bf2724bf04a35c4e5f420a33543697424f3319bbe18a4c19d90c"
+      },
+      {
+        "kind": "object",
+        "reference": "369bd4cd6a7829fe5a7655deca588e2bcd639e30546d2ba8609d7f4982d0b3fe"
+      },
+      {
+        "kind": "object",
+        "reference": "4a59152e70ad2a56584c35eec36f46885c76d6abf3aa04c2e45d7b5bcbbd64d1"
+      },
+      {
+        "kind": "object",
+        "reference": "5a1146148381de80136157fd0a058883167b6a6ec732dd992cc6c6c9507fd61a"
+      },
+      {
+        "kind": "object",
+        "reference": "67e534a546dc319035433f239f912709b577ceb51a20ce84b13ec551ed17cfc0"
+      },
+      {
+        "kind": "object",
+        "reference": "6a4dc9cf5a2817d66d2e91414b0eeebc634575eea6a320d1753405a6f4af546d"
+      },
+      {
+        "kind": "object",
+        "reference": "70a3927ac70ebc4d7b2a6048fb8bf7317fec57e16de08247f6c5d3d474a61428"
+      },
+      {
+        "kind": "object",
+        "reference": "74b91c5d993bdb9e8620fce6d7c05a7c29e4d3cb7092d77fb5701c2247124f58"
+      },
+      {
+        "kind": "object",
+        "reference": "780d52b3f4101fff1cbfb12b27a71406229a59b69fbf6e6773cdb6c6d7702dbb"
+      },
+      {
+        "kind": "object",
+        "reference": "7a23fead071fed44cbb6811da72153472af5ab6633afd712e977c3aa48ebdefd"
+      },
+      {
+        "kind": "object",
+        "reference": "98aaa1eb38133b258986cc3e5cfbd853c4663c9a81722e8a59a292c9292e7afb"
+      },
+      {
+        "kind": "object",
+        "reference": "aa282ec6c09d9e6ee9c5c17bcdd16ebef0be9140c5a4fd9cd0bfbc1551a00f68"
+      },
+      {
+        "kind": "object",
+        "reference": "ab9a1f18ee35c56f9120f5d33db5805d7b00926e4ec4e698d7970cf9c49bc8e3"
+      },
+      {
+        "kind": "object",
+        "reference": "afc563e262f55fa05c830153656c181a4004598dd029d22c9d7ba39cf109bfe9"
+      },
+      {
+        "kind": "object",
+        "reference": "b9f6e0a5bd76c1e148e9c59c481019178431b94bf770e9e2fef2afbbf237c1cf"
+      },
+      {
+        "kind": "object",
+        "reference": "bf94bf4b501c4ce974ad770581396702dce91e938bfd61f7e03bc7bc8bdc3cb7"
+      },
+      {
+        "kind": "object",
+        "reference": "c9bc4e2994c3802576df9208fb67e7f35338b4880dfbb1dc0f7640026baa6941"
+      },
+      {
+        "kind": "object",
+        "reference": "cb9a765915b8555886193dd8ed11e4069932a41fe5cadf386771d0d8de78d2ee"
+      },
+      {
+        "kind": "object",
+        "reference": "d608ae60a4c5cb3b958476efd01f204035338782c53892eac4fa04f0a8ae89bd"
+      },
+      {
+        "kind": "object",
+        "reference": "df3b98286b33b0f29dfd3e7597a90ed11f4b6c22b997f642a76ff18298be1c38"
+      },
+      {
+        "kind": "object",
+        "reference": "e33f9aa9a86a95eabeb19f2c3a7f87575cd459cde913d192b5d0a61f69032a5a"
+      },
+      {
+        "kind": "object",
+        "reference": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      {
+        "kind": "object",
+        "reference": "f18e6790bb45c2bf96a85a69e3a61a5cfe72c45f86f33fbe115379ec17c59794"
+      },
+      {
+        "kind": "object",
+        "reference": "f73befc2500c60a1c6361ab7e707fc8bb53c6c82a26c267d0ba5532d9af93138"
+      },
+      {
+        "kind": "snapshot",
+        "reference": "sha256:115041e8f57408a6763d8b7704430c5ae3e92f8fb34930753b1055cc352dedaf"
+      },
+      {
+        "kind": "snapshot",
+        "reference": "sha256:6561e8917dd0a21dfb015fb8381c4bfe3303d7226dfc25fc25bcd7a6d744a541"
+      },
+      {
+        "kind": "snapshot",
+        "reference": "sha256:a8b6955b8ddf8e1428d81b834f56fca8fe9bf5d00be05021625b60733a4368d6"
+      },
+      {
+        "kind": "snapshot",
+        "reference": "sha256:bf94bf4b501c4ce974ad770581396702dce91e938bfd61f7e03bc7bc8bdc3cb7"
+      }
+    ],
+    "second_wave_allocated": {
+      "disk_bytes": 2961178624,
+      "input_tokens": 0,
+      "memory_bytes": 1887436800,
+      "model_requests": 0,
+      "output_tokens": 0,
+      "previews": 0,
+      "slots": 5,
+      "spend_microunits": 0,
+      "time_ms": 10980000
+    },
+    "second_wave_reservations": [
+      {
+        "allocated": {
+          "disk_bytes": 1077936128,
+          "input_tokens": 0,
+          "memory_bytes": 675282944,
+          "model_requests": 0,
+          "output_tokens": 0,
+          "previews": 0,
+          "slots": 2,
+          "spend_microunits": 0,
+          "time_ms": 660000
+        },
+        "attempts": 1,
+        "id": "sha256:3e0ac654fe702fa046bba3f77f3d02b158e3014857103043d8eb41ea2e2ae72d",
+        "observed_overrun": null,
+        "receipt": "sha256:1e72969d35eef85f092e0bb5d34f0eb5e50aac25afa28b22b8fb85886bafac4c",
+        "root": "sha256:3e0ac654fe702fa046bba3f77f3d02b158e3014857103043d8eb41ea2e2ae72d",
+        "spent": {
+          "disk_bytes": 1077936128,
+          "input_tokens": 0,
+          "memory_bytes": 675282944,
+          "model_requests": 0,
+          "output_tokens": 0,
+          "previews": 0,
+          "slots": 2,
+          "spend_microunits": 0,
+          "time_ms": 660000
+        },
+        "state": "consumed"
+      },
+      {
+        "allocated": {
+          "disk_bytes": 1077936128,
+          "input_tokens": 0,
+          "memory_bytes": 675282944,
+          "model_requests": 0,
+          "output_tokens": 0,
+          "previews": 0,
+          "slots": 2,
+          "spend_microunits": 0,
+          "time_ms": 10200000
+        },
+        "attempts": 1,
+        "id": "sha256:59ccc977bb0af154d327269ee5cde4e19343a057c5f9a897be32d06671f72dcc",
+        "observed_overrun": null,
+        "receipt": "sha256:7e372cb66172e545f81d8aeb7c765a62cb2dbc6268730bd9d4248c2552f4f0e5",
+        "root": "sha256:59ccc977bb0af154d327269ee5cde4e19343a057c5f9a897be32d06671f72dcc",
+        "spent": {
+          "disk_bytes": 1077936128,
+          "input_tokens": 0,
+          "memory_bytes": 675282944,
+          "model_requests": 0,
+          "output_tokens": 0,
+          "previews": 0,
+          "slots": 2,
+          "spend_microunits": 0,
+          "time_ms": 10200000
+        },
+        "state": "consumed"
+      },
+      {
+        "allocated": {
+          "disk_bytes": 805306368,
+          "input_tokens": 0,
+          "memory_bytes": 536870912,
+          "model_requests": 0,
+          "output_tokens": 0,
+          "previews": 0,
+          "slots": 1,
+          "spend_microunits": 0,
+          "time_ms": 120000
+        },
+        "attempts": 1,
+        "id": "sha256:98eb5deac897463d58af41266554f161b658a1c6b12a8987c94f96957e5d9589",
+        "observed_overrun": null,
+        "receipt": "sha256:21aab96c7dccd83ecdb6c733698323c9117afd9d2c93c9b4f751d3428fa63704",
+        "root": "sha256:98eb5deac897463d58af41266554f161b658a1c6b12a8987c94f96957e5d9589",
+        "spent": {
+          "disk_bytes": 805306368,
+          "input_tokens": 0,
+          "memory_bytes": 536870912,
+          "model_requests": 0,
+          "output_tokens": 0,
+          "previews": 0,
+          "slots": 1,
+          "spend_microunits": 0,
+          "time_ms": 120000
+        },
+        "state": "consumed"
+      }
+    ],
+    "second_wave_spent": {
+      "disk_bytes": 2961178624,
+      "input_tokens": 0,
+      "memory_bytes": 1887436800,
+      "model_requests": 0,
+      "output_tokens": 0,
+      "previews": 0,
+      "slots": 5,
+      "spend_microunits": 0,
+      "time_ms": 10980000
+    }
+  },
+  "actual_profile": {
+    "budget_cap": {
+      "disk_bytes": 137438953472,
+      "input_tokens": 0,
+      "memory_bytes": 68719476736,
+      "model_requests": 0,
+      "output_tokens": 0,
+      "previews": 0,
+      "slots": 200,
+      "spend_microunits": 0,
+      "time_ms": 1000000000
+    },
+    "build": "copy the exact retained source tree into isolated Docker outputs",
+    "drive_max_wall_ms": 120000,
+    "image": "sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251",
+    "native_gate": {
+      "measured_wait_ms": 288,
+      "policy_sha256": "0d254f191a55f07494c3cce2c628d3536687f51ab5e6483ccf6aa8467d86fcd2",
+      "resource_wait_seconds": 5
+    },
+    "network": "none",
+    "resource_policy": {
+      "disk_mib": 2048,
+      "job_slots": 2,
+      "memory_mib": 2048,
+      "process_slots": 1024
+    },
+    "runtime": {
+      "api": "1.54",
+      "architecture": "arm64",
+      "client": "sha256:95e661f587166c7b3cd6b5877e6f23a2fc8e423c7466e26d289660fbd83c886b",
+      "components": [
+        {
+          "Details": {
+            "ApiVersion": "1.54",
+            "Arch": "arm64",
+            "BuildTime": "Wed May 20 14:39:25 2026",
+            "Experimental": "false",
+            "GitCommit": "568f755",
+            "GoVersion": "go1.26.3",
+            "KernelVersion": "6.8.0-117-generic",
+            "MinAPIVersion": "1.40",
+            "Module": "github.com/moby/moby/v2",
+            "ModuleVersion": "v2.0.0+unknown",
+            "Os": "linux"
+          },
+          "Name": "Engine",
+          "Version": "29.5.2"
+        },
+        {
+          "Details": {
+            "GitCommit": "193637f7ee8ae5f5aa5248f49e7baa3e6164966e"
+          },
+          "Name": "containerd",
+          "Version": "v2.2.4"
+        },
+        {
+          "Details": {
+            "GitCommit": "v1.3.5-0-g488fc13e"
+          },
+          "Name": "runc",
+          "Version": "1.3.5"
+        },
+        {
+          "Details": {
+            "GitCommit": "de40ad0"
+          },
+          "Name": "docker-init",
+          "Version": "0.19.0"
+        }
+      ],
+      "daemon_id": "9c943a04-41ca-4943-a8f5-c5734144b14b",
+      "endpoint": "unix:///Volumes/T7-repositories/Colima/home/default/docker.sock",
+      "engine": "29.5.2",
+      "kernel": "6.8.0-117-generic",
+      "native": "sha256:780504f6b4e7354927382a7c8b516e92441d0c9b6c26d4fa95e9b9f28a1a72d1",
+      "policy": "rootfs-ro;uid65534;caps-none;nnp;seccomp-builtin;network-none;private-pid-ipc-cgroup;cpu1;swap-none;pids-bounded;tmpfs-output-bounded;no-logs;no-healthcheck;env-clear;no-cache;timeout-pid1-v0",
+      "profile": "aethyme.docker-linux/offline-v0"
+    },
+    "service": {
+      "drive": {
+        "allow_empty_native_gates": false,
+        "execution": {
+          "assertion_inventory": "sha256:c2d5535e419d71505a0de1799fd34b7f0c7d27ed82117e32c8f795c42e400e06",
+          "build": {
+            "arguments": [
+              "-c",
+              "set -eu; cp -R /source/. /outputs/"
+            ],
+            "environment": {},
+            "program": "/bin/sh"
+          },
+          "candidate_source": "sha256:a8b6955b8ddf8e1428d81b834f56fca8fe9bf5d00be05021625b60733a4368d6",
+          "harness": "sha256:6561e8917dd0a21dfb015fb8381c4bfe3303d7226dfc25fc25bcd7a6d744a541",
+          "materialization_profile": "aethyme.raw-linux-inputs/provisional-v0",
+          "profile": {
+            "architecture": "arm64",
+            "build_image": "sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251",
+            "build_limits": {
+              "memory_bytes": 67108864,
+              "output_bytes": 1048576,
+              "pids": 32,
+              "timeout_ms": 60000
+            },
+            "runtime_profile": "sha256:ffa98e27733eb577949cc035b6717254d4559d4820931f153dcef663d3c6de22",
+            "verifier_image": "sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251",
+            "verifier_limits": {
+              "memory_bytes": 67108864,
+              "output_bytes": 1048576,
+              "pids": 32,
+              "timeout_ms": 60000
+            }
+          },
+          "verify": {
+            "arguments": [
+              "-c",
+              "#!/bin/sh\n# FX10 fixed independent route and CLI contract proxy.\nset -eu\nPATH=/usr/bin:/bin\nLC_ALL=C\nexport PATH LC_ALL\numask 077\ntmp=$(mktemp -d /tmp/fx10-proxy.XXXXXX)\ntrap 'rm -rf \"$tmp\"' EXIT HUP INT TERM\nrun_case() {\n  id=$1\n  shift\n  if /bin/sh /artifact/app.sh \"$@\" >\"$tmp/stdout\" 2>\"$tmp/stderr\"; then code=0; else code=$?; fi\n  out=$(od -An -v -tx1 \"$tmp/stdout\" | tr -d ' \\n')\n  err=$(od -An -v -tx1 \"$tmp/stderr\" | tr -d ' \\n')\n  if [ -z \"$out\" ]; then out=-; fi\n  if [ -z \"$err\" ]; then err=-; fi\n  printf '%s\\t%s\\t%s\\t%s\\n' \"$id\" \"$code\" \"$out\" \"$err\"\n}\nprintf 'FX10V1\\n'\nrun_case lookup_alpha lookup alpha\nrun_case lookup_beta lookup beta\nrun_case lookup_gamma lookup gamma\nrun_case lookup_delta lookup delta\nrun_case lookup_epsilon lookup epsilon\nrun_case lookup_zeta lookup zeta\nrun_case list list\nrun_case arity_zero\nrun_case lookup_missing lookup\nrun_case lookup_extra lookup alpha extra\nrun_case mode_unknown route\nrun_case lookup_unknown lookup eta\nrun_case lookup_shell_sequence lookup 'alpha; printf INJECTED'\nrun_case lookup_command_substitution lookup '$(printf alpha)'\nrun_case mode_upper_lookup LOOKUP alpha\nrun_case list_extra list alpha\n"
+            ],
+            "environment": {},
+            "program": "/bin/sh"
+          }
+        },
+        "max_wall_ms": 120000,
+        "wave_policy": {
+          "age_promotion_ms": 60000,
+          "batch_width": 3,
+          "debounce_ms": 0,
+          "drift_rechecks": 1,
+          "max_group": 6
+        }
+      },
+      "max_completions": 2,
+      "max_elapsed_ms": 180000,
+      "max_ticks": 8,
+      "nonce": "fx10-sustained-arrivals",
+      "poll_ms": 20
+    },
+    "verifier_vectors": 16,
+    "wave_policy": {
+      "age_promotion_ms": 60000,
+      "batch_width": 3,
+      "debounce_ms": 0,
+      "drift_rechecks": 1,
+      "max_group": 6
+    }
+  },
+  "completed_at_unix_ms": 1792057337732,
+  "cumulative_elapsed_ms": 67882,
+  "events": [
+    {
+      "at": "preflight",
+      "result": "frozen FX10 inputs and oracle-derived transcript verified"
+    },
+    {
+      "at": "sustained-arrivals",
+      "result": "the older A-C wave completed before the later D-F wave with all obligations retained"
+    },
+    {
+      "at": "external-target-update.prepared",
+      "availability_events": [
+        [
+          "A",
+          1792057324089
+        ],
+        [
+          "B",
+          1792057324092
+        ],
+        [
+          "C",
+          1792057324096
+        ]
+      ],
+      "baseline_tree": "8ef66dddb617a4cbe12743e63878adbafb595b3b",
+      "epoch": "sha256:f10d7b6cbc3db0b6a8961cadaa3dc45a659c98d3f3627a6d97fabd2778365a75",
+      "external_update_count": 1,
+      "proposed_ref_advance": "38a6421dda5142e955f0f01ce49955724d4ded0e",
+      "remote_tip_before_service": "ac503d7f90ca8eaf4b7794b66c9b2895e62a2b9c",
+      "revision": "sha256:e32016e10cc734c91a8a32127d2454ab9830d65dbdfb94829328820a26b9a560",
+      "target": "fx10-external-target-update",
+      "target_ref": "refs/heads/accepted"
+    },
+    {
+      "at": "external-target-update.controller-created-dispatch",
+      "facts": {
+        "arrival_sequences": [
+          [
+            "A",
+            7,
+            1792057324089
+          ],
+          [
+            "B",
+            8,
+            1792057324092
+          ],
+          [
+            "C",
+            9,
+            1792057324096
+          ]
+        ],
+        "completions_before_update": 0,
+        "dispatch_seen_unix_ms": 1792057325172,
+        "epoch": "sha256:f10d7b6cbc3db0b6a8961cadaa3dc45a659c98d3f3627a6d97fabd2778365a75",
+        "group_ready_unix_ms": 1792057324096,
+        "native_job": "sha256:121be968d01dcc32a38d443a6ec8a480f7814840b646b244926b5f74f9ba1b60",
+        "native_job_state": "dispatching",
+        "oldest_member_first_seen_unix_ms": 1792057324089,
+        "ready_group_age_at_dispatch_ms": 1076,
+        "revision": "sha256:e32016e10cc734c91a8a32127d2454ab9830d65dbdfb94829328820a26b9a560",
+        "selected": [
+          "A",
+          "B",
+          "C"
+        ],
+        "target": "fx10-external-target-update",
+        "target_phase": "Verifying",
+        "typed_holder": {
+          "lease": {
+            "allocations": [
+              {
+                "capacity_limit": 1,
+                "key": "fx10_sustained_arrival_slot",
+                "kind": "capacity",
+                "units": 1,
+                "value": "fx10-sustained-arrival-v1"
+              }
+            ],
+            "created_at": 1792057324314,
+            "expires_at": 1792057384314,
+            "generation": 4,
+            "holder_pid": 17608,
+            "lease_id": "747556c764e6ae9f88434537971f31e3",
+            "released_at": null,
+            "repository": "fx10-sustained-arrivals",
+            "request_id": "fx10-test-holder-external-ref-update-71e188a6bbd253dcff9c9fcd",
+            "run_id": "fx10-holder-external-ref-update-71e188a6bbd253dcff9c9fcd",
+            "state": "active",
+            "worktree_fingerprint": "71e188a6bbd253dcff9c9fcda94dd96be8d9429d9d69dd21bc74bb89b12e65da"
+          },
+          "request": {
+            "holder_pid": 17608,
+            "repository": "fx10-sustained-arrivals",
+            "request_id": "fx10-test-holder-external-ref-update-71e188a6bbd253dcff9c9fcd",
+            "resources": [
+              {
+                "key": "fx10_sustained_arrival_slot",
+                "kind": "capacity",
+                "limit": 1,
+                "pool": "fx10-sustained-arrival-v1",
+                "units": 1
+              }
+            ],
+            "run_id": "fx10-holder-external-ref-update-71e188a6bbd253dcff9c9fcd",
+            "schema_version": 1,
+            "ttl_seconds": 60,
+            "worktree_fingerprint": "71e188a6bbd253dcff9c9fcda94dd96be8d9429d9d69dd21bc74bb89b12e65da"
+          },
+          "resource": {
+            "key": "fx10_sustained_arrival_slot",
+            "kind": "capacity",
+            "limit": 1,
+            "pool": "fx10-sustained-arrival-v1",
+            "ttl_seconds": 60,
+            "units": 1
+          }
+        },
+        "wave": "sha256:6bc31be50238b3f6a7c7136f928e82b57f83364f9295ceba0e180818bdb10733"
+      }
+    },
+    {
+      "at": "external-target-update.capacity-holder-released",
+      "facts": {
+        "holder": {
+          "allocations": [
+            {
+              "capacity_limit": 1,
+              "key": "fx10_sustained_arrival_slot",
+              "kind": "capacity",
+              "units": 1,
+              "value": "fx10-sustained-arrival-v1"
+            }
+          ],
+          "created_at": 1792057324314,
+          "expires_at": 1792057384314,
+          "generation": 4,
+          "holder_pid": 17608,
+          "lease_id": "747556c764e6ae9f88434537971f31e3",
+          "released_at": 1792057325439,
+          "repository": "fx10-sustained-arrivals",
+          "request_id": "fx10-test-holder-external-ref-update-71e188a6bbd253dcff9c9fcd",
+          "run_id": "fx10-holder-external-ref-update-71e188a6bbd253dcff9c9fcd",
+          "state": "released",
+          "worktree_fingerprint": "71e188a6bbd253dcff9c9fcda94dd96be8d9429d9d69dd21bc74bb89b12e65da"
+        },
+        "holder_release_unix_ms": 1792057325439,
+        "measured_contention_ms": 255,
+        "minimum_contention_ms": 250,
+        "native_job": "sha256:121be968d01dcc32a38d443a6ec8a480f7814840b646b244926b5f74f9ba1b60",
+        "polls_while_resource_held": 35,
+        "wave": "sha256:6bc31be50238b3f6a7c7136f928e82b57f83364f9295ceba0e180818bdb10733"
+      }
+    },
+    {
+      "at": "external-target-update.native-gate-child-running",
+      "facts": {
+        "gate_child_pid": 27622,
+        "gate_child_started_unix_ms": 1792057325600,
+        "holder_release_unix_ms": 1792057325439,
+        "native_job": "sha256:121be968d01dcc32a38d443a6ec8a480f7814840b646b244926b5f74f9ba1b60",
+        "native_job_state": "dispatching",
+        "resource_lease": {
+          "allocations": [
+            {
+              "capacity_limit": 1,
+              "key": "fx10_sustained_arrival_slot",
+              "kind": "capacity",
+              "units": 1,
+              "value": "fx10-sustained-arrival-v1"
+            }
+          ],
+          "created_at": 1792057325557,
+          "expires_at": 1792057385557,
+          "generation": 5,
+          "holder_pid": 17608,
+          "lease_id": "4ef9eb38a00fca6c4e9478d2e45ce99c",
+          "released_at": null,
+          "repository": "b4e9c6358705b74055efaa5338e89f76f0e5380cd0a17e5e8e8afa4de58e13c4",
+          "request_id": "ee7f4eefcd7bc4ca973e05bd6b9c51c2828c5da43f10da26fe05f16b086f87ec",
+          "run_id": "p17608-fx10-source-integrity-77ce984c8293",
+          "state": "active",
+          "worktree_fingerprint": "28abf067649a70509bbc7c73a0e50f483094a99453c26d768217fdba53806a41"
+        },
+        "wave": "sha256:6bc31be50238b3f6a7c7136f928e82b57f83364f9295ceba0e180818bdb10733"
+      }
+    },
+    {
+      "at": "external-target-update.ref-state-before-update",
+      "facts": {
+        "expected_baseline_tip": "ac503d7f90ca8eaf4b7794b66c9b2895e62a2b9c",
+        "matches_expected_baseline": true,
+        "ref": "refs/heads/accepted",
+        "remote_tip_before": "ac503d7f90ca8eaf4b7794b66c9b2895e62a2b9c"
+      }
+    },
+    {
+      "at": "external-target-update.native-gate-child-running-before-ref-advance-started",
+      "facts": {
+        "confirmed_remote_tip": "ac503d7f90ca8eaf4b7794b66c9b2895e62a2b9c",
+        "gate_child_pid": 27622,
+        "minimum_running_window_ms": 250,
+        "native_job": "sha256:121be968d01dcc32a38d443a6ec8a480f7814840b646b244926b5f74f9ba1b60",
+        "started_unix_ms": 1792057325631,
+        "wave": "sha256:6bc31be50238b3f6a7c7136f928e82b57f83364f9295ceba0e180818bdb10733"
+      }
+    },
+    {
+      "at": "external-target-update.native-gate-child-running-before-ref-advance",
+      "facts": {
+        "gate_child_pid": 27622,
+        "heartbeat_updates": 16,
+        "minimum_running_window_ms": 250,
+        "native_job": "sha256:121be968d01dcc32a38d443a6ec8a480f7814840b646b244926b5f74f9ba1b60",
+        "polls": 34,
+        "running_window_ms": 253,
+        "wave": "sha256:6bc31be50238b3f6a7c7136f928e82b57f83364f9295ceba0e180818bdb10733"
+      }
+    },
+    {
+      "at": "external-target-update.ref-advance-attempt-started",
+      "facts": {
+        "attempt_started_unix_ms": 1792057325904,
+        "compare_and_swap_expected": "ac503d7f90ca8eaf4b7794b66c9b2895e62a2b9c",
+        "gate_child_pid": 27622,
+        "gate_child_running": true,
+        "proposed_remote_tip": "38a6421dda5142e955f0f01ce49955724d4ded0e",
+        "ref": "refs/heads/accepted",
+        "remote_tip_before": "ac503d7f90ca8eaf4b7794b66c9b2895e62a2b9c"
+      }
+    },
+    {
+      "at": "external-target-update.ref-advance-observed-after-command",
+      "facts": {
+        "confirmed_ref_advance_unix_ms": 1792057325940,
+        "proposed_remote_tip": "38a6421dda5142e955f0f01ce49955724d4ded0e",
+        "ref_update_command_error": null,
+        "ref_update_command_succeeded": true,
+        "remote_tip_after": "38a6421dda5142e955f0f01ce49955724d4ded0e",
+        "remote_tip_before": "ac503d7f90ca8eaf4b7794b66c9b2895e62a2b9c",
+        "remote_tip_read_error": null,
+        "update_count": 1
+      }
+    },
+    {
+      "at": "external-target-update.same-tree-fast-forward-verified",
+      "facts": {
+        "confirmed_ref_advance_unix_ms": 1792057325940,
+        "remote_tip_after": "38a6421dda5142e955f0f01ce49955724d4ded0e",
+        "remote_tip_before": "ac503d7f90ca8eaf4b7794b66c9b2895e62a2b9c",
+        "remote_tree_after": "8ef66dddb617a4cbe12743e63878adbafb595b3b",
+        "remote_tree_before": "8ef66dddb617a4cbe12743e63878adbafb595b3b",
+        "same_tree_fast_forward": true
+      }
+    },
+    {
+      "at": "external-target-update.native-gate-child-running-after-ref-advance",
+      "facts": {
+        "confirmed_ref_advance_unix_ms": 1792057325940,
+        "gate_child_pid": 27622,
+        "heartbeat_updates": 16,
+        "minimum_running_window_ms": 250,
+        "native_job": "sha256:121be968d01dcc32a38d443a6ec8a480f7814840b646b244926b5f74f9ba1b60",
+        "polls": 35,
+        "running_window_ms": 254,
+        "wave": "sha256:6bc31be50238b3f6a7c7136f928e82b57f83364f9295ceba0e180818bdb10733"
+      }
+    },
+    {
+      "at": "external-target-update.gate-child-released-after-ref-update",
+      "facts": {
+        "confirmed_ref_advance_unix_ms": 1792057325940,
+        "gate_child_pid": 27622,
+        "gate_child_release_unix_ms": 1792057326274,
+        "in_flight_check": {
+          "completions": 0,
+          "result": "active",
+          "target_phase": "Verifying",
+          "wave_phase": "Verifying"
+        },
+        "native_job": "sha256:121be968d01dcc32a38d443a6ec8a480f7814840b646b244926b5f74f9ba1b60",
+        "wave": "sha256:6bc31be50238b3f6a7c7136f928e82b57f83364f9295ceba0e180818bdb10733"
+      }
+    },
+    {
+      "at": "external-target-update.gate-child-completed",
+      "facts": {
+        "gate_child_completed_unix_ms": 1792057326303,
+        "gate_child_pid": 27622,
+        "integrity_check": "passed",
+        "native_job": "sha256:121be968d01dcc32a38d443a6ec8a480f7814840b646b244926b5f74f9ba1b60"
+      }
+    },
+    {
+      "at": "external-target-update.service-returned",
+      "facts": {
+        "completions": 0,
+        "detail": "publication dispatch Failed; explicit reconciliation required",
+        "finished_unix_ms": 1792057337666,
+        "outcome": "Held",
+        "result": "returned",
+        "ticks": 1
+      }
+    },
+    {
+      "at": "external-target-update.native-result",
+      "facts": {
+        "epoch": "sha256:f10d7b6cbc3db0b6a8961cadaa3dc45a659c98d3f3627a6d97fabd2778365a75",
+        "native_job": "sha256:121be968d01dcc32a38d443a6ec8a480f7814840b646b244926b5f74f9ba1b60",
+        "observation": {
+          "candidate": {
+            "base_commit": "ac503d7f90ca8eaf4b7794b66c9b2895e62a2b9c",
+            "baseline": "sha256:a8b6955b8ddf8e1428d81b834f56fca8fe9bf5d00be05021625b60733a4368d6",
+            "commit": "dea65e48b830fb480389bbf0add49731058c5dd0",
+            "epoch": "sha256:f10d7b6cbc3db0b6a8961cadaa3dc45a659c98d3f3627a6d97fabd2778365a75",
+            "execution_allowance_seconds": 300,
+            "gate_config_sha256": "c9bc4e2994c3802576df9208fb67e7f35338b4880dfbb1dc0f7640026baa6941",
+            "inputs": [
+              "4ead6a71b7813092310cf70dea3726430968ce6a",
+              "cc7c56b6de4b9aeb86015af00d6dbf1fcd9e1eb7",
+              "87fb370430d2a4123829ad1766ee2cb42f3c4998"
+            ],
+            "max_dispatches": 1,
+            "policy_sha256": "0d254f191a55f07494c3cce2c628d3536687f51ab5e6483ccf6aa8467d86fcd2",
+            "profile": "aethyme.native-local-gates/experimental-v1",
+            "recipe": "5a1146148381de80136157fd0a058883167b6a6ec732dd992cc6c6c9507fd61a",
+            "repository_common_dir": "/private/var/folders/f2/krjzd4c15nn491pm37zrkp1h0000gn/T/.tmpq6Vauv/.git",
+            "repository_root": "/private/var/folders/f2/krjzd4c15nn491pm37zrkp1h0000gn/T/.tmpq6Vauv",
+            "revision": "sha256:e32016e10cc734c91a8a32127d2454ab9830d65dbdfb94829328820a26b9a560",
+            "subject": "sha256:115041e8f57408a6763d8b7704430c5ae3e92f8fb34930753b1055cc352dedaf",
+            "target": "fx10-external-target-update",
+            "tree": "77ce984c8293f16d9348f369560361ff25592800",
+            "wave": "sha256:6bc31be50238b3f6a7c7136f928e82b57f83364f9295ceba0e180818bdb10733"
+          },
+          "configured_gates": 1,
+          "current_authority": true,
+          "gates": [
+            {
+              "broker_database": {
+                "kind": "disposable",
+                "path": "/private/var/folders/f2/krjzd4c15nn491pm37zrkp1h0000gn/T/.tmpq6Vauv/.aethyme/run/gates/broker-db-17608-m9Fems/broker.db",
+                "protected_repositories": [
+                  "/private/var/folders/f2/krjzd4c15nn491pm37zrkp1h0000gn/T/.tmpvg01ea"
+                ],
+                "retention": "removed_on_gate_exit"
+              },
+              "cached": false,
+              "cpu_count": 10,
+              "definition_hash": "ef09eaae58ee9d0de9b9a48c226730d45c5d8f478eb36dcb8e7307bcaa150916",
+              "duration_ms": 742,
+              "exit_code": 0,
+              "failure_class": null,
+              "first_output_ms": 9,
+              "free_disk_bytes_start": 1099511627776,
+              "gate": "fx10-source-integrity",
+              "load_avg_1m_end": 10.3359375,
+              "load_avg_1m_start": 10.3359375,
+              "log_path": "/private/var/folders/f2/krjzd4c15nn491pm37zrkp1h0000gn/T/.tmpq6Vauv/.aethyme/logs/gates/fx10-source-integrity-77ce984c-p17608-fx10-source-integrity.log",
+              "output_bytes": 479,
+              "resource_lease": {
+                "allocations": [
+                  {
+                    "capacity_limit": 1,
+                    "key": "fx10_sustained_arrival_slot",
+                    "kind": "capacity",
+                    "units": 1,
+                    "value": "fx10-sustained-arrival-v1"
+                  }
+                ],
+                "expires_at": 1792057385557,
+                "generation": 5,
+                "lease_id": "4ef9eb38a00fca6c4e9478d2e45ce99c"
+              },
+              "status": "pass",
+              "tree_hash": "77ce984c8293f16d9348f369560361ff25592800",
+              "wait_duration_ms": 292
+            }
+          ],
+          "graph": {
+            "changed_paths": [],
+            "enforced": false,
+            "policy_digest": "7f6a2dd9801f81a7682b6d838c49e6e929d8dce2535e4fc21216fd4ba4c51ded",
+            "reason": "repository does not declare committed graph fragments authoritative",
+            "status": "disabled",
+            "tree_hash": "77ce984c8293f16d9348f369560361ff25592800",
+            "verdict": "disabled"
+          },
+          "policy_sha256": "0d254f191a55f07494c3cce2c628d3536687f51ab5e6483ccf6aa8467d86fcd2",
+          "profile": "aethyme.native-local-gates/experimental-v1",
+          "provider_acceptance": false,
+          "selected_gates": 1,
+          "status": "passed",
+          "trusted_evidence": false,
+          "wall_ms": 1179
+        },
+        "revision": "sha256:e32016e10cc734c91a8a32127d2454ab9830d65dbdfb94829328820a26b9a560",
+        "state": "completed",
+        "target": "fx10-external-target-update",
+        "wave": "sha256:6bc31be50238b3f6a7c7136f928e82b57f83364f9295ceba0e180818bdb10733"
+      }
+    },
+    {
+      "at": "external-target-update.verifier-receipt",
+      "facts": {
+        "issued_after_confirmed_ref_advance": true,
+        "issued_unix_ms": 1792057337015,
+        "observation": {
+          "artifact": "sha256:9b51ef6991656f6fec1866f53ddd012d6ac2fc96893bff2fbca5fb4ed4b90007",
+          "assertions": [
+            {
+              "exit_code": 0,
+              "id": "fx10-independent-route-contract",
+              "outcome": "passed",
+              "stderr": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+              "stdout": "sha256:56d15d1c702fabd891f2764a8c68d9d96da4f99f1c039801678637151f9a503e"
+            }
+          ],
+          "candidate": "sha256:115041e8f57408a6763d8b7704430c5ae3e92f8fb34930753b1055cc352dedaf",
+          "epoch": "sha256:f10d7b6cbc3db0b6a8961cadaa3dc45a659c98d3f3627a6d97fabd2778365a75",
+          "execution": "sha256:828f3bd95a971b2d78e87d2b915d96887cbe454bf92c5ea5fc1f06bfabaf834a",
+          "generation": "1",
+          "harness": "sha256:6561e8917dd0a21dfb015fb8381c4bfe3303d7226dfc25fc25bcd7a6d744a541",
+          "image": "sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251",
+          "inventory": "sha256:c2d5535e419d71505a0de1799fd34b7f0c7d27ed82117e32c8f795c42e400e06",
+          "output": "sha256:115041e8f57408a6763d8b7704430c5ae3e92f8fb34930753b1055cc352dedaf",
+          "policy": "sha256:ea7c0787750cedf38c4d17f59daaa06bf8509a0a22aa6c39a00870bfe3f0ab78",
+          "producer": "fx10-native",
+          "profile": "aethyme.verify.offline-cli/provisional-v0",
+          "result": "passed",
+          "revision": "sha256:e32016e10cc734c91a8a32127d2454ab9830d65dbdfb94829328820a26b9a560",
+          "runtime": "sha256:ffa98e27733eb577949cc035b6717254d4559d4820931f153dcef663d3c6de22",
+          "verification": "48483bf7d08d5e08d87231508f048c76af38d59b80246683324bda6864d0f841"
+        },
+        "receipt_count": 1
+      }
+    },
+    {
+      "at": "external-target-update.publication-transport",
+      "facts": {
+        "dispatched": 1,
+        "observation": "unobserved",
+        "operation": 12,
+        "transport_count": 1,
+        "write_outcome": "failed"
+      }
+    },
+    {
+      "at": "external-target-update.final-remote-ref",
+      "facts": {
+        "expected_competing_tip": "38a6421dda5142e955f0f01ce49955724d4ded0e",
+        "observed_tip": "38a6421dda5142e955f0f01ce49955724d4ded0e"
+      }
+    },
+    {
+      "at": "external-target-update",
+      "result": "one controlled ref advance during a real gate child produced a measured stale verifier and held known-failed publication"
+    }
+  ],
+  "external_target_update": {
+    "arrival_sequences": [
+      [
+        "A",
+        7,
+        1792057324089
+      ],
+      [
+        "B",
+        8,
+        1792057324092
+      ],
+      [
+        "C",
+        9,
+        1792057324096
+      ]
+    ],
+    "cumulative_elapsed_ms": 67873,
+    "epoch": "sha256:f10d7b6cbc3db0b6a8961cadaa3dc45a659c98d3f3627a6d97fabd2778365a75",
+    "finite_allowance": {
+      "cumulative_selected_max": 6,
+      "gate_resource_wait_seconds": 5,
+      "holder_limit": 1,
+      "holder_ttl_seconds": 60,
+      "holder_units": 1,
+      "max_drive_wall_seconds": 120,
+      "max_elapsed_seconds": 180,
+      "minimum_contention_ms": 250,
+      "minimum_gate_child_running_after_ref_advance_ms": 250,
+      "minimum_gate_child_running_before_ref_advance_ms": 250,
+      "minimum_gate_child_running_ms": 250,
+      "new_wave_width": 3,
+      "observer_timeout_seconds": 30,
+      "service_completions": 1,
+      "service_ticks": 1
+    },
+    "group_ready_unix_ms": 1792057324096,
+    "native_job": "sha256:121be968d01dcc32a38d443a6ec8a480f7814840b646b244926b5f74f9ba1b60",
+    "oldest_member_first_seen_unix_ms": 1792057324089,
+    "publication": {
+      "detail": "publication dispatch Failed; explicit reconciliation required",
+      "dispatched_once": true,
+      "final_remote_tip": "38a6421dda5142e955f0f01ce49955724d4ded0e",
+      "observation": "unobserved",
+      "operation": 12,
+      "private_completion_count": 0,
+      "replays": 0,
+      "service_outcome": "held",
+      "service_ticks": 1,
+      "unknown_run_count": 0,
+      "write_outcome": "failed"
+    },
+    "ready_group_age_at_native_dispatch_ms": 1076,
+    "resource_contention": {
+      "actual_second_admission": {
+        "admission": "actual-native-gate",
+        "grant_created_after_holder_release_ms": 118,
+        "lease": {
+          "allocations": [
+            {
+              "capacity_limit": 1,
+              "key": "fx10_sustained_arrival_slot",
+              "kind": "capacity",
+              "units": 1,
+              "value": "fx10-sustained-arrival-v1"
+            }
+          ],
+          "created_at": 1792057325557,
+          "expires_at": 1792057385557,
+          "generation": 5,
+          "holder_pid": 17608,
+          "lease_id": "4ef9eb38a00fca6c4e9478d2e45ce99c",
+          "released_at": 1792057326318,
+          "repository": "b4e9c6358705b74055efaa5338e89f76f0e5380cd0a17e5e8e8afa4de58e13c4",
+          "request_id": "ee7f4eefcd7bc4ca973e05bd6b9c51c2828c5da43f10da26fe05f16b086f87ec",
+          "run_id": "p17608-fx10-source-integrity-77ce984c8293",
+          "state": "released",
+          "worktree_fingerprint": "28abf067649a70509bbc7c73a0e50f483094a99453c26d768217fdba53806a41"
+        },
+        "typed_request": {
+          "key": "fx10_sustained_arrival_slot",
+          "kind": "capacity",
+          "limit": 1,
+          "pool": "fx10-sustained-arrival-v1",
+          "units": 1
+        },
+        "wait_duration_ms": 292
+      },
+      "holder_lease_released": {
+        "allocations": [
+          {
+            "capacity_limit": 1,
+            "key": "fx10_sustained_arrival_slot",
+            "kind": "capacity",
+            "units": 1,
+            "value": "fx10-sustained-arrival-v1"
+          }
+        ],
+        "created_at": 1792057324314,
+        "expires_at": 1792057384314,
+        "generation": 4,
+        "holder_pid": 17608,
+        "lease_id": "747556c764e6ae9f88434537971f31e3",
+        "released_at": 1792057325439,
+        "repository": "fx10-sustained-arrivals",
+        "request_id": "fx10-test-holder-external-ref-update-71e188a6bbd253dcff9c9fcd",
+        "run_id": "fx10-holder-external-ref-update-71e188a6bbd253dcff9c9fcd",
+        "state": "released",
+        "worktree_fingerprint": "71e188a6bbd253dcff9c9fcda94dd96be8d9429d9d69dd21bc74bb89b12e65da"
+      },
+      "holder_release_unix_ms": 1792057325439,
+      "holder_to_update_elapsed_ms": 255,
+      "observer_polls": 264,
+      "polls_while_resource_held": 35,
+      "second_admission_blocked_until_holder_release": true,
+      "typed_holder": {
+        "lease": {
+          "allocations": [
+            {
+              "capacity_limit": 1,
+              "key": "fx10_sustained_arrival_slot",
+              "kind": "capacity",
+              "units": 1,
+              "value": "fx10-sustained-arrival-v1"
+            }
+          ],
+          "created_at": 1792057324314,
+          "expires_at": 1792057384314,
+          "generation": 4,
+          "holder_pid": 17608,
+          "lease_id": "747556c764e6ae9f88434537971f31e3",
+          "released_at": null,
+          "repository": "fx10-sustained-arrivals",
+          "request_id": "fx10-test-holder-external-ref-update-71e188a6bbd253dcff9c9fcd",
+          "run_id": "fx10-holder-external-ref-update-71e188a6bbd253dcff9c9fcd",
+          "state": "active",
+          "worktree_fingerprint": "71e188a6bbd253dcff9c9fcda94dd96be8d9429d9d69dd21bc74bb89b12e65da"
+        },
+        "request": {
+          "holder_pid": 17608,
+          "repository": "fx10-sustained-arrivals",
+          "request_id": "fx10-test-holder-external-ref-update-71e188a6bbd253dcff9c9fcd",
+          "resources": [
+            {
+              "key": "fx10_sustained_arrival_slot",
+              "kind": "capacity",
+              "limit": 1,
+              "pool": "fx10-sustained-arrival-v1",
+              "units": 1
+            }
+          ],
+          "run_id": "fx10-holder-external-ref-update-71e188a6bbd253dcff9c9fcd",
+          "schema_version": 1,
+          "ttl_seconds": 60,
+          "worktree_fingerprint": "71e188a6bbd253dcff9c9fcda94dd96be8d9429d9d69dd21bc74bb89b12e65da"
+        },
+        "resource": {
+          "key": "fx10_sustained_arrival_slot",
+          "kind": "capacity",
+          "limit": 1,
+          "pool": "fx10-sustained-arrival-v1",
+          "ttl_seconds": 60,
+          "units": 1
+        }
+      }
+    },
+    "retained_roots": {
+      "bare_remote": "/var/folders/f2/krjzd4c15nn491pm37zrkp1h0000gn/T/.tmpBwqcBG",
+      "host_state": "/var/folders/f2/krjzd4c15nn491pm37zrkp1h0000gn/T/.tmpA2vk0u",
+      "project": "/private/var/folders/f2/krjzd4c15nn491pm37zrkp1h0000gn/T/.tmpA2vk0u/collaboration/fx10-sustained-arrivals",
+      "source_repository": "/var/folders/f2/krjzd4c15nn491pm37zrkp1h0000gn/T/.tmpq6Vauv"
+    },
+    "revision": "sha256:e32016e10cc734c91a8a32127d2454ab9830d65dbdfb94829328820a26b9a560",
+    "selected_older_group": [
+      "A",
+      "B",
+      "C"
+    ],
+    "stale_verification": {
+      "candidate": "sha256:115041e8f57408a6763d8b7704430c5ae3e92f8fb34930753b1055cc352dedaf",
+      "issued_at_unix_ms": 1792057337015,
+      "ref_advance_to_held_service_result_ms": 11726,
+      "result": "passed",
+      "stale_candidate_elapsed_to_receipt_ms": 11075,
+      "stale_candidate_verification_attempts": 1,
+      "target_advance_to_passing_verifier_receipt_ms": 11075
+    },
+    "target": "fx10-external-target-update",
+    "target_update": {
+      "completions_after_update_before_release": 0,
+      "completions_before_update": 0,
+      "external_ref_updates": 1,
+      "final_target_phase": "Verifying",
+      "final_wave_phase": "Verifying",
+      "gate_child_completed_unix_ms": 1792057326303,
+      "gate_child_heartbeat_updates_after_ref_update": 16,
+      "gate_child_heartbeat_updates_before_ref_update": 16,
+      "gate_child_pid": 27622,
+      "gate_child_release_unix_ms": 1792057326274,
+      "gate_child_resource_lease": {
+        "allocations": [
+          {
+            "capacity_limit": 1,
+            "key": "fx10_sustained_arrival_slot",
+            "kind": "capacity",
+            "units": 1,
+            "value": "fx10-sustained-arrival-v1"
+          }
+        ],
+        "created_at": 1792057325557,
+        "expires_at": 1792057385557,
+        "generation": 5,
+        "holder_pid": 17608,
+        "lease_id": "4ef9eb38a00fca6c4e9478d2e45ce99c",
+        "released_at": null,
+        "repository": "b4e9c6358705b74055efaa5338e89f76f0e5380cd0a17e5e8e8afa4de58e13c4",
+        "request_id": "ee7f4eefcd7bc4ca973e05bd6b9c51c2828c5da43f10da26fe05f16b086f87ec",
+        "run_id": "p17608-fx10-source-integrity-77ce984c8293",
+        "state": "active",
+        "worktree_fingerprint": "28abf067649a70509bbc7c73a0e50f483094a99453c26d768217fdba53806a41"
+      },
+      "gate_child_running_after_ref_update_ms": 254,
+      "gate_child_running_before_ref_update_ms": 253,
+      "gate_child_started_unix_ms": 1792057325600,
+      "kind": "external_fast_forward_of_disposable_bare_ref",
+      "local_target_phase_after": "Verifying",
+      "local_wave_phase_after": "Verifying",
+      "native_job_dispatch_seen_unix_ms": 1792057325172,
+      "native_job_state_during_update": "dispatching",
+      "ref_advanced_at_unix_ms": 1792057325940,
+      "ref_update_attempt_started_unix_ms": 1792057325904,
+      "remote_tip_after": "38a6421dda5142e955f0f01ce49955724d4ded0e",
+      "remote_tip_before": "ac503d7f90ca8eaf4b7794b66c9b2895e62a2b9c",
+      "remote_tree_after": "8ef66dddb617a4cbe12743e63878adbafb595b3b",
+      "remote_tree_before": "8ef66dddb617a4cbe12743e63878adbafb595b3b",
+      "same_tree_fast_forward": true
+    },
+    "wave": "sha256:6bc31be50238b3f6a7c7136f928e82b57f83364f9295ceba0e180818bdb10733"
+  },
+  "failures": [],
+  "frozen_inputs": {
+    "contribution_count": 6,
+    "expected_transcript_sha256": "56d15d1c702fabd891f2764a8c68d9d96da4f99f1c039801678637151f9a503e",
+    "manifest_sha256": "01aa466182a9054f5f4f0bd1f71fa1a3f2869ea731cee0f69ed0098a2b679ae1",
+    "oracle_sha256": "0caede81a00be34dc3dcb171bfbb714dca3fc0c10fa49f72c39437f728532954",
+    "oracle_vector_count": 16,
+    "proxy_sha256": "a8b7bd9e7269868883f679b1158c519dba44a374ca6f5f9a3c675470345b0f97",
+    "public_contract_sha256": "0baf3b085357267128927d85658af9abd759e420795008b83209b683f0855339"
+  },
+  "model_requests": 0,
+  "profile": "aethyme.fx10-sustained-arrivals-actual/v1",
+  "retained_roots": {
+    "bare_remote": "/var/folders/f2/krjzd4c15nn491pm37zrkp1h0000gn/T/.tmpNN8hAG",
+    "baseline_commit": "ac503d7f90ca8eaf4b7794b66c9b2895e62a2b9c",
+    "baseline_snapshot": "sha256:a8b6955b8ddf8e1428d81b834f56fca8fe9bf5d00be05021625b60733a4368d6",
+    "drift_bare_remote": "/var/folders/f2/krjzd4c15nn491pm37zrkp1h0000gn/T/.tmpBwqcBG",
+    "harness_commit": "47a11fd413e0b2021dfb1598e411c7f06d048181",
+    "harness_snapshot": "sha256:6561e8917dd0a21dfb015fb8381c4bfe3303d7226dfc25fc25bcd7a6d744a541",
+    "host_state": "/var/folders/f2/krjzd4c15nn491pm37zrkp1h0000gn/T/.tmpA2vk0u",
+    "project": "/private/var/folders/f2/krjzd4c15nn491pm37zrkp1h0000gn/T/.tmpA2vk0u/collaboration/fx10-sustained-arrivals",
+    "source_repository": "/var/folders/f2/krjzd4c15nn491pm37zrkp1h0000gn/T/.tmpq6Vauv"
+  },
+  "sealed_task_executions": 0,
+  "started_unix_ms": 1792057269850,
+  "status": "completed",
+  "sustained_arrivals": {
+    "active_wave_phase_before_release": "Verifying",
+    "active_wave_selection_after_arrivals": [
+      "A",
+      "B",
+      "C"
+    ],
+    "all_six_final_obligations": true,
+    "arrival_wave_waited": 1,
+    "automatic_uncertain_retries": 0,
+    "blocked_waves": 0,
+    "bounded_contention_window_ms": 251,
+    "completions": [
+      {
+        "acceptance_receipt": "sha256:dc7f05fd9438f58e0c154d7d9ca157d82faa83158f0d2d096cd9a6b54a3677ab",
+        "accepted_commit": "dea65e48b830fb480389bbf0add49731058c5dd0",
+        "accepted_tree": "77ce984c8293f16d9348f369560361ff25592800",
+        "candidate_commit": "dea65e48b830fb480389bbf0add49731058c5dd0",
+        "candidate_tree": "77ce984c8293f16d9348f369560361ff25592800",
+        "epoch": "sha256:f10d7b6cbc3db0b6a8961cadaa3dc45a659c98d3f3627a6d97fabd2778365a75",
+        "qualification": "sha256:1dbabde0ee6113f32ffea52190a45a9cc0596779c9a1b8a0f08a5dc2c06e4255",
+        "revision": "sha256:5d2af18a210e38cec08bb979301dab04a67a3c25f2e03a318bc36ade40f48e60",
+        "source": "sha256:115041e8f57408a6763d8b7704430c5ae3e92f8fb34930753b1055cc352dedaf",
+        "target": "fx10-sustained-arrivals",
+        "wave": "sha256:4feba4966c89468780369bb6bbd41968f865c115ef63c416da34e7d2366525db"
+      },
+      {
+        "acceptance_receipt": "sha256:76e7656aedca1b59c3c4b616091bfec8b70acf58a15a78165066bb19cb738327",
+        "accepted_commit": "2d0696888de9ad2f24adec518e5b635b3fa18d85",
+        "accepted_tree": "63372f03cdd5d891f6ef49ff1f24de79c9629b2a",
+        "candidate_commit": "2d0696888de9ad2f24adec518e5b635b3fa18d85",
+        "candidate_tree": "63372f03cdd5d891f6ef49ff1f24de79c9629b2a",
+        "epoch": "sha256:f10d7b6cbc3db0b6a8961cadaa3dc45a659c98d3f3627a6d97fabd2778365a75",
+        "qualification": "sha256:86735756fb1551032710dd3f0ed7224c1ed0b1e956c7aa43ba8afd5194533c94",
+        "revision": "sha256:5d2af18a210e38cec08bb979301dab04a67a3c25f2e03a318bc36ade40f48e60",
+        "source": "sha256:bf94bf4b501c4ce974ad770581396702dce91e938bfd61f7e03bc7bc8bdc3cb7",
+        "target": "fx10-sustained-arrivals",
+        "wave": "sha256:253622ae861ced3e0fae7ebf748297bcbc509116f9fe28481c55b1e90064c4d6"
+      }
+    ],
+    "completions_before_release": 0,
+    "finite_allowance": {
+      "batch_width_new": 3,
+      "cumulative_max_group": 6,
+      "minimum_contention_ms": 250,
+      "minimum_gate_child_running_ms": 250,
+      "observer_timeout_seconds": 30,
+      "resource_wait_seconds": 5,
+      "service_completions": 2,
+      "service_ticks": 8
+    },
+    "first_gate_reported_wait_ms": 288,
+    "gate_child": {
+      "completed_unix_ms": 1792057296797,
+      "heartbeat_updates_during_window": 16,
+      "integrity_check": "passed",
+      "minimum_running_window_ms": 250,
+      "pid": 23460,
+      "release_unix_ms": 1792057296778,
+      "running_window_ms": 254,
+      "started_unix_ms": 1792057296497
+    },
+    "invalidated_verification_attempts": 0,
+    "invalidated_verification_time_ms": 0,
+    "later_arrivals": [
+      {
+        "contribution": "D",
+        "gate_child_heartbeat_count": 1,
+        "observed_while_gate_child_running_unix_ms": 1792057296504,
+        "persisted_first_seen_unix_ms": 1792057296498,
+        "persisted_sequence": 4
+      },
+      {
+        "contribution": "E",
+        "gate_child_heartbeat_count": 2,
+        "observed_while_gate_child_running_unix_ms": 1792057296510,
+        "persisted_first_seen_unix_ms": 1792057296505,
+        "persisted_sequence": 5
+      },
+      {
+        "contribution": "F",
+        "gate_child_heartbeat_count": 2,
+        "observed_while_gate_child_running_unix_ms": 1792057296517,
+        "persisted_first_seen_unix_ms": 1792057296512,
+        "persisted_sequence": 6
+      }
+    ],
+    "observer_polls": 224,
+    "old_group": [
+      "A",
+      "B",
+      "C"
+    ],
+    "old_group_ready_at_ms": 1792057276772,
+    "old_native_job": "sha256:08c06be10f86b675f656418c68cf8ee653de589d11fb863ee0a5e77ecf7a49d4",
+    "old_native_job_dispatch_seen_unix_ms": 1792057296081,
+    "old_wave": "sha256:4feba4966c89468780369bb6bbd41968f865c115ef63c416da34e7d2366525db",
+    "old_wave_sequence": 1,
+    "oldest_member_age_ms_at_dispatch": 19319,
+    "oldest_member_first_seen_unix_ms": 1792057276762,
+    "polls_while_gate_child_running": 35,
+    "polls_while_resource_held": 34,
+    "ready_group_age_ms_at_dispatch": 19309,
+    "resource_contention": {
+      "active_gate_child_lease": {
+        "allocations": [
+          {
+            "capacity_limit": 1,
+            "key": "fx10_sustained_arrival_slot",
+            "kind": "capacity",
+            "units": 1,
+            "value": "fx10-sustained-arrival-v1"
+          }
+        ],
+        "created_at": 1792057296457,
+        "expires_at": 1792057356457,
+        "generation": 2,
+        "holder_pid": 17608,
+        "lease_id": "d120ba8a2cbbb7d3b59a31b57b9addb1",
+        "released_at": null,
+        "repository": "b4e9c6358705b74055efaa5338e89f76f0e5380cd0a17e5e8e8afa4de58e13c4",
+        "request_id": "dac2a9a7ca77da7353a79f2449ad8c1a2eeff1e47cd45524b01ae94a657cab05",
+        "run_id": "p17608-fx10-source-integrity-77ce984c8293",
+        "state": "active",
+        "worktree_fingerprint": "cb9725c1f366d3cb4499f90496e0f20c23f8782959649f2a61d83285028414a8"
+      },
+      "actual_second_admission": {
+        "admission": "actual-native-gate",
+        "grant_created_after_holder_release_ms": 124,
+        "lease": {
+          "allocations": [
+            {
+              "capacity_limit": 1,
+              "key": "fx10_sustained_arrival_slot",
+              "kind": "capacity",
+              "units": 1,
+              "value": "fx10-sustained-arrival-v1"
+            }
+          ],
+          "created_at": 1792057296457,
+          "expires_at": 1792057356457,
+          "generation": 2,
+          "holder_pid": 17608,
+          "lease_id": "d120ba8a2cbbb7d3b59a31b57b9addb1",
+          "released_at": 1792057296799,
+          "repository": "b4e9c6358705b74055efaa5338e89f76f0e5380cd0a17e5e8e8afa4de58e13c4",
+          "request_id": "dac2a9a7ca77da7353a79f2449ad8c1a2eeff1e47cd45524b01ae94a657cab05",
+          "run_id": "p17608-fx10-source-integrity-77ce984c8293",
+          "state": "released",
+          "worktree_fingerprint": "cb9725c1f366d3cb4499f90496e0f20c23f8782959649f2a61d83285028414a8"
+        },
+        "typed_request": {
+          "key": "fx10_sustained_arrival_slot",
+          "kind": "capacity",
+          "limit": 1,
+          "pool": "fx10-sustained-arrival-v1",
+          "units": 1
+        },
+        "wait_duration_ms": 288
+      },
+      "holder_lease_released": {
+        "allocations": [
+          {
+            "capacity_limit": 1,
+            "key": "fx10_sustained_arrival_slot",
+            "kind": "capacity",
+            "units": 1,
+            "value": "fx10-sustained-arrival-v1"
+          }
+        ],
+        "created_at": 1792057295071,
+        "expires_at": 1792057355071,
+        "generation": 1,
+        "holder_pid": 17608,
+        "lease_id": "a0e895b685a5d441fffdce86c584499c",
+        "released_at": 1792057296333,
+        "repository": "fx10-sustained-arrivals",
+        "request_id": "fx10-test-holder-positive-71e188a6bbd253dcff9c9fcd",
+        "run_id": "fx10-holder-positive-71e188a6bbd253dcff9c9fcd",
+        "state": "released",
+        "worktree_fingerprint": "71e188a6bbd253dcff9c9fcda94dd96be8d9429d9d69dd21bc74bb89b12e65da"
+      },
+      "holder_release_unix_ms": 1792057296333,
+      "typed_holder": {
+        "lease": {
+          "allocations": [
+            {
+              "capacity_limit": 1,
+              "key": "fx10_sustained_arrival_slot",
+              "kind": "capacity",
+              "units": 1,
+              "value": "fx10-sustained-arrival-v1"
+            }
+          ],
+          "created_at": 1792057295071,
+          "expires_at": 1792057355071,
+          "generation": 1,
+          "holder_pid": 17608,
+          "lease_id": "a0e895b685a5d441fffdce86c584499c",
+          "released_at": null,
+          "repository": "fx10-sustained-arrivals",
+          "request_id": "fx10-test-holder-positive-71e188a6bbd253dcff9c9fcd",
+          "run_id": "fx10-holder-positive-71e188a6bbd253dcff9c9fcd",
+          "state": "active",
+          "worktree_fingerprint": "71e188a6bbd253dcff9c9fcda94dd96be8d9429d9d69dd21bc74bb89b12e65da"
+        },
+        "request": {
+          "holder_pid": 17608,
+          "repository": "fx10-sustained-arrivals",
+          "request_id": "fx10-test-holder-positive-71e188a6bbd253dcff9c9fcd",
+          "resources": [
+            {
+              "key": "fx10_sustained_arrival_slot",
+              "kind": "capacity",
+              "limit": 1,
+              "pool": "fx10-sustained-arrival-v1",
+              "units": 1
+            }
+          ],
+          "run_id": "fx10-holder-positive-71e188a6bbd253dcff9c9fcd",
+          "schema_version": 1,
+          "ttl_seconds": 60,
+          "worktree_fingerprint": "71e188a6bbd253dcff9c9fcda94dd96be8d9429d9d69dd21bc74bb89b12e65da"
+        },
+        "resource": {
+          "key": "fx10_sustained_arrival_slot",
+          "kind": "capacity",
+          "limit": 1,
+          "pool": "fx10-sustained-arrival-v1",
+          "ttl_seconds": 60,
+          "units": 1
+        }
+      }
+    },
+    "service_rescans_ticks": 2,
+    "target_phase_after_release": "Verifying",
+    "target_phase_before_release": "Verifying",
+    "unknown_runs": 0
+  }
+}
