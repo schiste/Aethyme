@@ -104,8 +104,8 @@ Windows smoke and the product path.
 This finite result supplies an actual autonomous positive and later-arrival
 continuation. It does not establish sustained-load reliability.
 
-The receiver-timeout control passed at `b16af023`: one explicit native test,
-zero failures, exit 0. The receiver actually updated its ref before the managed
+The [receiver-timeout control](local-v3-qualification/unknown-publication-2026-10-15/ledger.json)
+passed at `b16af023`: one explicit native test, zero failures, exit 0. The receiver actually updated its ref before the managed
 push timed out. The service held, classified the run as unknown and refused
 replay; no private acceptance receipt, qualification or completion was issued.
 Retained roots and charged reservations remained visible, and both owned hook

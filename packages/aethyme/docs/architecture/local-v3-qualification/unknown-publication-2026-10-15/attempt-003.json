@@ -1,0 +1,101 @@
+{
+  "argv": [
+    "/usr/bin/caffeinate",
+    "-i",
+    "/Users/christophehenner/.cargo/bin/cargo",
+    "test",
+    "--locked",
+    "-j",
+    "4",
+    "-p",
+    "aethyme-broker",
+    "--lib",
+    "--",
+    "--ignored",
+    "--exact",
+    "local_controller::drive::tests::outcome_unknown::actual_unknown_publication_after_receiver_ref_update_never_completes",
+    "--nocapture"
+  ],
+  "attempt": "actual-unknown-publication-attempt3",
+  "cargo_started_at_utc": "2026-10-15T07:22:29.565327+00:00",
+  "elapsed_seconds": 61.975,
+  "environment": {
+    "AETHYME_DOCKER_CLI": "/opt/homebrew/bin/docker",
+    "AETHYME_DOCKER_TEST_IMAGE": "sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251",
+    "CARGO_TARGET_DIR": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/integrate-reviewed-local-bare-git-servic/target/local-resume/cargo",
+    "HOME": "/Users/christophehenner",
+    "PATH": "/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/christophehenner/.cargo/bin",
+    "RUSTC_WRAPPER": "",
+    "TMPDIR": "/var/folders/f2/krjzd4c15nn491pm37zrkp1h0000gn/T/"
+  },
+  "finished_at_utc": "2026-10-15T07:23:31.584444+00:00",
+  "finite_profile": {
+    "cargo_jobs": 4,
+    "cargo_profile": "test (default, non-release)",
+    "case": "single retained assertion; receiver post-receive hook delays 5 seconds after ref update",
+    "docker_resources": {
+      "daemon_floor_bytes": 1,
+      "disk_mib": 2048,
+      "host_floor_bytes": 1,
+      "job_slots": 2,
+      "memory_mib": 2048,
+      "process_slots": 1024
+    },
+    "git_carrier": {
+      "operation_timeout_seconds": 2,
+      "target": "disposable local bare Git receiver"
+    },
+    "project_budget": {
+      "disk_bytes": 68719476736,
+      "max_root_reservations": 32,
+      "memory_bytes": 68719476736,
+      "slots": 100,
+      "time_ms": 1000000000
+    },
+    "service": {
+      "max_completions": 1,
+      "max_elapsed_ms": 600000,
+      "max_ticks": 32,
+      "poll_ms": 20
+    },
+    "test_threads": "Rust test harness default; exact filter selects one test"
+  },
+  "log": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/implement-the-actual-fx17-20-controlled/target/local-resume/actual-unknown-publication-attempt3.log",
+  "numeric_exit_code": 0,
+  "pinned_image": {
+    "inspect_argv": [
+      "/opt/homebrew/bin/docker",
+      "image",
+      "inspect",
+      "--format={{.Id}}",
+      "sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251"
+    ],
+    "inspect_status": 0,
+    "inspect_stderr": "",
+    "inspect_stdout": "sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251",
+    "inspected_id": "sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251",
+    "requested": "sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251"
+  },
+  "preflight": "passed",
+  "report_copied": true,
+  "report_copy": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/implement-the-actual-fx17-20-controlled/target/local-resume/actual-unknown-publication-attempt3-report.json",
+  "report_copy_sha256": "f27346d8bd50273cb386d7b3050797bf244b5a5bec242fb797d779a30b0c7e8c",
+  "report_source": "/var/folders/f2/krjzd4c15nn491pm37zrkp1h0000gn/T/.tmprAe1Yv/report.json",
+  "source": {
+    "head": "b16af023c07f22817fb8bb11abe464e916507850",
+    "status_porcelain": "",
+    "tree": "7e857b8e50e28f4b62acb8ed71a5070215061c95"
+  },
+  "source_unchanged": {
+    "head": "b16af023c07f22817fb8bb11abe464e916507850",
+    "status_porcelain": "",
+    "tree": "7e857b8e50e28f4b62acb8ed71a5070215061c95"
+  },
+  "started_at_utc": "2026-10-15T07:22:29.564289+00:00",
+  "status_file": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/implement-the-actual-fx17-20-controlled/target/local-resume/actual-unknown-publication-attempt3.status",
+  "test_result_lines": [
+    "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1795 filtered out; finished in 23.53s"
+  ],
+  "workspace": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/implement-the-actual-fx17-20-controlled/packages/aethyme/rust",
+  "worktree": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/implement-the-actual-fx17-20-controlled"
+}

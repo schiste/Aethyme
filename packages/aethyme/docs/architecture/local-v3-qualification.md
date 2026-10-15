@@ -189,8 +189,8 @@ C01 and held C02 after exposing an incorrect baseline commit across target
 revisions. Both failures remain in the denominator. The generic repair and a
 complete native sequence remain required.
 
-The [controller record](local-v3-autonomous-controller.md) separately records a
-passing actual receiver-timeout control at `b16af023`: the remote ref moved,
+The [receiver-timeout ledger](local-v3-qualification/unknown-publication-2026-10-15/ledger.json)
+separately records a passing actual control at `b16af023`: the remote ref moved,
 the managed write stayed unknown, replay was refused and no private completion
 was issued. This is one ambiguous-publication schedule. Sustained-arrival load
 and integrated final checks remain explicit qualification work.

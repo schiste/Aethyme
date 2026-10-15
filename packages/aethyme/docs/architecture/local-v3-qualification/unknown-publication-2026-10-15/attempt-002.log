@@ -1,0 +1,22 @@
+   Compiling aethyme-engine v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/implement-the-actual-fx17-20-controlled/packages/aethyme/rust/crates/aethyme-engine)
+   Compiling aethyme-broker v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/implement-the-actual-fx17-20-controlled/packages/aethyme/rust/crates/aethyme-broker)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 42.70s
+     Running unittests src/lib.rs (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/integrate-reviewed-local-bare-git-servic/target/local-resume/cargo/debug/deps/aethyme_broker-20bbfe5c0b2dd5c0)
+
+running 1 test
+Controller actual unknown-publication evidence root /var/folders/f2/krjzd4c15nn491pm37zrkp1h0000gn/T/.tmpF2whr3
+Controller unknown-publication source host /var/folders/f2/krjzd4c15nn491pm37zrkp1h0000gn/T/.tmpW34Zlq, repository /var/folders/f2/krjzd4c15nn491pm37zrkp1h0000gn/T/.tmplAFgol
+
+thread 'local_controller::drive::tests::outcome_unknown::actual_unknown_publication_after_receiver_ref_update_never_completes' (21477998) panicked at crates/aethyme-broker/src/local_controller/drive_tests/outcome_unknown.rs:402:10:
+receiver hook recorded completion and both owned processes exited: "could not prove receiver hook \"receiver-.tmpweASev\" exited within its 15-second cleanup bound: receiver hook has not recorded its process identities"
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test local_controller::drive::tests::outcome_unknown::actual_unknown_publication_after_receiver_ref_update_never_completes ... FAILED
+
+failures:
+
+failures:
+    local_controller::drive::tests::outcome_unknown::actual_unknown_publication_after_receiver_ref_update_never_completes
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1795 filtered out; finished in 50.59s
+
+error: test failed, to rerun pass `-p aethyme-broker --lib`
