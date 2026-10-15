@@ -1,6 +1,6 @@
 {
   "schema": "aethyme.local-native-job-lifecycle/v1",
-  "recorded_at": "2026-10-15T14:26:46Z",
+  "recorded_at": "2026-10-15T14:53:01Z",
   "scope": "Explicit release of prepared/completed native-job roots, retention of dispatching/unknown jobs, and safe reopened status/GC behavior.",
   "artifact_roots": {
     "session_worktree": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/reconcile-retention-of-inactive-native-g",
@@ -51,19 +51,19 @@
     "complete_passing_commands": 2,
     "credited_native_gates_passes": 16,
     "ci_checks_without_test_execution": 3,
-    "ci_test_cases_executed": 4557,
+    "ci_test_cases_executed": 9114,
     "returned_environment_failures": 15,
-    "ci_workspace_checks": 1,
-    "ci_test_cases_passed": 4548,
-    "ci_test_cases_failed": 9,
-    "ci_test_cases_skipped": 31,
+    "ci_workspace_checks": 2,
+    "ci_test_cases_passed": 9104,
+    "ci_test_cases_failed": 10,
+    "ci_test_cases_skipped": 62,
     "incomplete_commands_without_numeric_status": 2,
     "unresolved_slots_from_incomplete_commands": 10,
     "abandoned_attempts_without_numeric_status": 2,
     "complete_native_gates_suite_passes": 1,
     "focused_restored_sanity_passes": 1,
     "mutation_guard_confirmations": 6,
-    "interpretation": "The local native_gates denominator includes four original commands and eleven resumed focused, mutation, and restored-sanity commands. Slots reconcile as 51 returned ok + 8 assertion failures + 15 environment failures + 1 stopped before result + 10 unresolved = 85. The two complete passing native commands were the 15-test suite and one restored-source sanity check. Mutation assertions confirm guards and are not baseline passes."
+    "interpretation": "The local native_gates denominator includes four original commands and eleven resumed focused, mutation, and restored-sanity commands. Slots reconcile as 51 returned ok + 8 assertion failures + 15 environment failures + 1 stopped before result + 10 unresolved = 85. The two complete passing native commands were the 15-test suite and one restored-source sanity check. Mutation assertions confirm guards and are not baseline passes. The two recorded GitHub Actions workspace jobs executed 9,114 tests total: 9,104 passed, 10 failed, and 62 were skipped. The later PR 782 check on head 166f50ff91edab18636ec60743aca64bd6f0ea7a failed only the docs-hygiene test for the preserved original note copy; after its byte-preserving rename to .txt, no new CI result is recorded."
   },
   "attempts": [
     {
@@ -1408,6 +1408,39 @@
           "kind": "original numeric status, copied unchanged"
         }
       ]
+    },
+    {
+      "id": "ci-pr782-workspace-166f-evidence-packaging",
+      "source_commit": "166f50ff91edab18636ec60743aca64bd6f0ea7a",
+      "source_tree": "8dfa038eb4ee36e5480e53d5fd41efd1ecf6d1f0",
+      "base_commit": "ca871706c78fcf2fa14ef4f12280dcfc398d4246",
+      "tested_merge_commit": "e79cf215ab9a1b37001f322e9e09ab1b20d7324b",
+      "tested_merge_tree": "8dfa038eb4ee36e5480e53d5fd41efd1ecf6d1f0",
+      "kind": "GitHub Actions full Rust workspace test job",
+      "workflow_run_id": 38752441026,
+      "check_run_id": 116482035155,
+      "check_run_name": "Rust workspace tests",
+      "check_run_url": "https://github.com/schiste/Aethyme/actions/runs/38752441026/job/116482035155",
+      "started_at_utc": "2026-10-15T14:33:24Z",
+      "finished_at_utc": "2026-10-15T14:46:31Z",
+      "numeric_exit": 100,
+      "tests_executed": 4557,
+      "results": {
+        "passed": 4556,
+        "failed": 1,
+        "skipped": 31
+      },
+      "failure": "The sole failed test was aethyme-testkit::docs_hygiene::documentation_has_last_updated, which reported missing last-updated metadata at evidence/notes/attempts-ledger-original.md. The original note bytes are preserved unchanged under the .txt extension. This CI result remains failed; no post-rename CI result is recorded.",
+      "credited": false,
+      "artifacts": [
+        {
+          "path": "evidence/ci/pr782-116482035155-166f-workspace.log",
+          "artifact_root": "review_worktree",
+          "bytes": 980131,
+          "sha256": "d6422dad63a24f151cfaddcf80e8b2e62967c355e70a4de2815474699936629d",
+          "kind": "complete raw GitHub Actions CI log, copied unchanged"
+        }
+      ]
     }
   ],
   "pending_checks_as_of_record": [],
@@ -1417,7 +1450,7 @@
     "A stale-binary restore attempt failed after Cargo reused an existing test binary; a later mtime-invalidated run compiled the restored crate but has no final status or result. Both receive no restored-source pass credit.",
     "The later clean restored-source attempt first failed setup because HOME and AETHYME_HOST_STATE_DIR were absent; the successful run used an isolated private host-state directory.",
     "The off-tree cached-binary retry at 11:16:55Z has six completed ok lines and ends during the ninth test without numeric status; nine selected cases are unresolved. The separate reconciliation records no matching process and no exact log writer. No exit or outcome is inferred.",
-    "The d524 full workspace CI run remains historical: 4,557 cases, 4,548 passed, 9 failed, 31 skipped (exit 100). Its migration fixture, CLI snapshot, and discarded-results findings are preserved; this package did not rerun the full workspace.",
+    "The d524 full workspace CI run remains historical: 4,557 cases, 4,548 passed, 9 failed, 31 skipped (exit 100). Its migration fixture, CLI snapshot, and discarded-results findings are preserved; this package did not rerun the full workspace. A later PR 782 workspace CI run on head 166f50ff91edab18636ec60743aca64bd6f0ea7a (synthetic merge e79cf215ab9a1b37001f322e9e09ab1b20d7324b) executed 4,557 tests: 4,556 passed, 1 failed, and 31 skipped (exit 100). Its sole failure was the docs-hygiene check on the original attempts note's Markdown extension. That payload is now preserved byte-for-byte as .txt; no post-rename CI result is recorded.",
     "The initial nested-TMPDIR run returned one pass and 14 environmental failures before intended lifecycle assertions. It remains in the denominator with zero qualification credit.",
     "Compile, formatting, wrong-working-directory Clippy and CI checks that executed no tests receive no test credit. Correct-cwd strict broker Clippy passed.",
     "No model calls, sealed evaluation or private oracle use is part of this lifecycle qualification."
@@ -1464,6 +1497,11 @@
       "path": "evidence/ci/pr782-116370216652-622.log",
       "bytes": 49095,
       "sha256": "3c9b16d9b5b7a75df9f80d4f07dae085f37fde68144584ce291ee73265af89a7"
+    },
+    {
+      "path": "evidence/ci/pr782-116482035155-166f-workspace.log",
+      "bytes": 980131,
+      "sha256": "d6422dad63a24f151cfaddcf80e8b2e62967c355e70a4de2815474699936629d"
     },
     {
       "path": "evidence/ci/pr782-lint-346001.log",
@@ -1566,7 +1604,7 @@
       "sha256": "e17607f4b349556be3eb38651e8bd270087c84d3023c7b767b3308293aa838b5"
     },
     {
-      "path": "evidence/notes/attempts-ledger-original.md",
+      "path": "evidence/notes/attempts-ledger-original.txt",
       "bytes": 11210,
       "sha256": "ea1f9d27c6ac00bbbfdbb842ec3c1b035fb15ce235ac1d3ff2de4a21f0559704"
     },
@@ -1998,8 +2036,8 @@
       "bytes": "exact byte count",
       "sha256": "SHA-256"
     },
-    "file_count": 108,
-    "total_bytes": 1821074,
+    "file_count": 109,
+    "total_bytes": 2801205,
     "ledger_itself_excluded": true
   }
 }
