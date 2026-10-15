@@ -78,6 +78,14 @@ approval matches all frozen and runtime hashes, the once-only runner can be
 invoked with explicit hash acknowledgements. Trial output must be outside the
 repository and in a new, empty directory.
 
+The candidate profile keeps deny-default, process-fork, network, and
+file-write denials. Its system bootstrap reads are limited to the root
+directory entry, the exact `/bin/sh` executable, the system library and
+`/usr/lib` trees, locale data, and the exact macOS dyld cache directory at
+`/System/Volumes/Preboot/Cryptexes/OS/System/Library/dyld`. The candidate app
+file is separately allowlisted per probe. It does not allow general reads
+under `/System/Volumes` or other Preboot paths.
+
 The trial approval must name an existing absolute `consumption_registry_path`
 outside the repository. The runner creates an exclusive marker in that fixed
 directory keyed by the frozen campaign schedule and payload hashes before the
