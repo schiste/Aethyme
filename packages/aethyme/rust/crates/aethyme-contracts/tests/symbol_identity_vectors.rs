@@ -56,22 +56,22 @@ fn vectors() -> Vectors {
 
 #[test]
 fn frozen_vectors_bind_the_independent_canonical_profile_and_domain() {
-    let vectors = vectors();
+    let vector_set = vectors();
     assert_eq!(
-        vectors.schema,
+        vector_set.schema,
         "aethyme.symbol-identity-vectors/experimental-v0"
     );
     assert_eq!(
-        vectors.independent_reference.canonical_json,
+        vector_set.independent_reference.canonical_json,
         "RFC 8785 restricted profile; object keys ordered by UTF-16 code units"
     );
     assert_eq!(
-        hex(&vectors.independent_reference.record_domain_hex),
+        hex(&vector_set.independent_reference.record_domain_hex),
         RECORD_DOMAIN
     );
 
     let mut by_name = BTreeMap::new();
-    for case in vectors.valid {
+    for case in vector_set.valid {
         let record = decode_symbol_identity_record(&hex(&case.input.hex))
             .unwrap_or_else(|error| panic!("{}: {error}", case.name));
         assert_eq!(

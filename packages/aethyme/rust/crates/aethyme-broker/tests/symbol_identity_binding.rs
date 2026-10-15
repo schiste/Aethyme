@@ -89,7 +89,7 @@ fn git_command(cwd: &Path, args: &[&str]) -> std::process::Output {
         ])
         .args(args)
         .output()
-        .expect("start git");
+        .expect("start git")
 }
 
 fn command(cwd: &Path, args: &[&str]) {
@@ -546,6 +546,7 @@ fn identical_local_names_need_document_and_producer_scope_and_package_versions_s
 fn path_moves_renames_copies_and_historical_overload_collisions_stay_unknown() {
     let clones = actual_clones();
     let fixture = mapping_fixture(&clones, RecordScenario::Exact);
+    let overloaded = mapping_fixture_named(&clones, RecordScenario::Exact, "convert");
     let old_move = node_ids(&clones.right, "src/lib.ts", "move_me");
     let old_rename = node_ids(&clones.right, "src/lib.ts", "rename_me");
     let old_copy = node_ids(&clones.right, "src/lib.ts", "copy_me");
@@ -593,7 +594,6 @@ fn path_moves_renames_copies_and_historical_overload_collisions_stay_unknown() {
         .collect();
     assert_eq!(overload_ids.len(), 3, "synthetic Playground has three overloads");
     assert!(overload_ids.windows(2).all(|pair| pair[0] == pair[1]));
-    let overloaded = mapping_fixture_named(&clones, RecordScenario::Exact, "convert");
     let claim = claim_with_state(&overloaded.claim, "unknown");
     let records: Vec<&[u8]> = overloaded.records.iter().map(Vec::as_slice).collect();
     assert!(matches!(
@@ -683,7 +683,7 @@ fn mismatched_or_incomplete_mapping_records_never_establish() {
         resolve_within_binding(&fixture.binding, &duplicate_claim, &records),
         MappingResolution::Unknown("invalid_or_non_claim_record")
     ));
-    let mut duplicate = records.clone();
+    let mut duplicate = records[..records.len() - 1].to_vec();
     duplicate.push(records[0]);
     assert!(matches!(
         resolve_within_binding(&fixture.binding, &fixture.claim, &duplicate),
