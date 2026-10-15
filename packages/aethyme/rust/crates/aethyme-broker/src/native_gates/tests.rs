@@ -1052,7 +1052,9 @@ fn root_release_waits_for_an_in_progress_gc_generation() {
         let mut store = open_store(&release_host);
         let _probe = gc::observe_archive_use(probe_tx.clone());
         let result = release_roots(&mut store, &owner, &key).unwrap().status;
-        let _ = probe_tx.send(gc::ArchiveUseProbeEvent::Finished);
+        probe_tx
+            .send(gc::ArchiveUseProbeEvent::Finished)
+            .expect("GC completion probe receiver remains open");
         result
     });
     // The release thread's own archive acquisition must observe the kernel's

@@ -692,7 +692,8 @@ fn migration_adopts_charged_resolution_attempts_and_fences_schema_six() {
     let db = f.store.project_dir().join("state.db");
     drop(f.store);
     let c = rusqlite::Connection::open(&db).unwrap();
-    c.execute_batch("UPDATE meta SET value = '6' WHERE key IN ('schema_version', 'min_compatible_schema');
+    c.execute_batch("DROP TABLE local_native_gate_roots; DROP TABLE local_native_gate_jobs;
+        UPDATE meta SET value = '6' WHERE key IN ('schema_version', 'min_compatible_schema');
         DROP TABLE local_adoption_receipts; DROP TABLE local_agent_dispatches; DROP TABLE local_agent_reconciliations; DROP TABLE local_handoffs; DROP TABLE local_agent_sessions; DROP TABLE local_import_rehearsals; DROP TABLE local_imported_records; DROP TABLE local_imported_sources; DROP TABLE local_imports; DROP TABLE local_exchange_messages; DROP TABLE local_exchange_deliveries; DROP TABLE local_exchange_streams; DROP TABLE local_exchange_events; DROP TABLE local_exchange_projection; DROP TABLE local_exchange_observations; DROP TABLE local_exchange_bindings; DROP TRIGGER outbox_capture_insert; DROP TRIGGER outbox_capture_update; DROP TRIGGER outbox_capture_delete; DROP TABLE local_generation_roots; DROP TABLE local_generation_receipts; DROP TABLE local_generations; DROP TABLE local_acceptance_qualifications; DROP TABLE local_acceptance_receipts; DROP TABLE local_acceptance_bindings; DROP TABLE local_source_transport_receipts; DROP TABLE local_source_transports; DROP TABLE local_verification_evidence; DROP TABLE local_verifier_producers; DROP TABLE local_authority_state; DROP TABLE local_waves; DROP TABLE local_wave_arrivals;
         DROP TABLE local_target_roots; DROP TABLE local_target_dispositions; DROP TABLE local_target_revisions; DROP TABLE local_targets;
         INSERT INTO resolution_attempts VALUES (1, 'decision', 'conflict', 'A', 'one.txt', 'original-request', 'resolver', 'failed', 1);").unwrap();
