@@ -40,6 +40,7 @@ pub mod collaboration_capture;
 pub mod collaboration_cli;
 pub mod collaboration_context;
 pub mod collaboration_gc;
+pub mod collaboration_sensitive;
 pub mod collaboration_state;
 pub mod collaboration_submit;
 pub mod composer;

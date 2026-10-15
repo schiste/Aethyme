@@ -43,6 +43,8 @@ use crate::exit_status;
 
 #[path = "collaboration_cli/lifecycle.rs"]
 mod lifecycle;
+#[path = "collaboration_cli/sensitive.rs"]
+mod sensitive;
 
 pub const STATUS_SCHEMA: &str = "aethyme.collab-status/experimental-v0";
 pub const CAPTURE_RECOVER_SCHEMA: &str = "aethyme.collab-capture-recover/experimental-v0";
@@ -134,6 +136,15 @@ Additional explicit lifecycle commands (provisional Local packages):
   aethyme collab stop --epoch EPOCH --reason TEXT [--json]
       Freeze project ingress and rotate native authority. Running processes
       and external effects are not assumed cancelled; reconcile them.
+  aethyme collab sensitive quarantine --incident ID --issuer LABEL --epoch FROZEN_EPOCH
+                       --reason CODE --scope project [--json]
+      Permanently block project-local retrieval after authority has been
+      frozen. LABEL is audit text, not authentication.
+  aethyme collab sensitive purge|resume --incident ID --confirm DIGEST [--json]
+      Attempt or resume managed-store purge. Active/unknown work and readers
+      keep the project quarantined; external copies remain explicit residuals.
+  aethyme collab sensitive status --incident ID [--json]
+      Show managed purge progress and unmanaged residual classes.
   aethyme collab export --target NAME --issuer NAME --source ID [--source ID...]
                        [--record ID@sha256:HEX...] --audience NAME --output PATH [--json]
       Closed source/advisory historical bundle. Exclusive private output;
@@ -407,6 +418,11 @@ fn dispatch(options: Options) -> Result<Output, Failure> {
         ["gc", "resume"] => gc_resume_command(&main_root),
         ["context", rest @ ..] => context(&main_root, rest),
         ["brief", "attach", rest @ ..] => brief_attach(&main_root, rest),
+        [
+            "sensitive",
+            verb @ ("quarantine" | "purge" | "resume" | "status"),
+            rest @ ..,
+        ] => sensitive::command(&main_root, verb, rest),
         ["authority", "status", rest @ ..] => lifecycle::authority_status(&main_root, rest),
         ["target", "status", rest @ ..] => lifecycle::target_status(&main_root, rest),
         ["target", "native-gates", rest @ ..] => lifecycle::native_gate_retention(&main_root, rest),
