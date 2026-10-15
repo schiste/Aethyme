@@ -55,5 +55,11 @@ compile/runtime failures remain historical failures, rather than passing evidenc
 The separately appointed [Local controller](local-v3-autonomous-controller.md)
 now consumes this native job boundary on its actual finite two-wave path. That
 path explicitly allows empty native commands and still runs independent artifact
-verification and fresh private GenericGit acceptance. It does not extend the
-native profile's host trust or deadline guarantees, or qualify FX17.
+verification and fresh private GenericGit acceptance. A later controlled
+FX17 profile at `c45d4096` accepted twenty changes with a nonempty fresh native
+gate and independent artifact verification per stage; all 65 frozen obligations
+were checked at every stage. Its full attempt history is recorded in the
+[controller documentation](local-v3-autonomous-controller.md). This does not
+extend the native profile's host trust or deadline guarantees. The separate
+once-final model campaign produced no candidates, so held-out model behavior
+remains unqualified.

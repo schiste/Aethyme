@@ -16,11 +16,14 @@ provisional candidate wave, native Docker build, an independent artifact-only
 verifier, private generic Git acceptance, controlled new-root adoption and an
 isolated historical receiver. This is evidence for the declared finite profile.
 E1, the native gate join and FX08 now have separate reviewed implementations and
-bounded results. The appointed controller also completed an actual two-wave
-Local service run. These advances do not close whole Local qualification: FX17,
-sustained-load autonomy and an appointed live GitHub/Mergify provider profile
-remain separate requirements. All results below name their source and finite
-profile; earlier operator profiles retain their original limits.
+bounded results. The appointed controller completed the actual two-wave profile
+and a separate twenty-change controlled evolution run with nonempty native gates.
+All six once-final FX17 model rows failed at the provider's response-schema
+boundary, before producing candidates; none supplies behavioral evidence.
+Sustained-arrival service and final integration checks remain in progress. These
+finite observations do not establish reliable autonomous operation. All results
+below name their source and profile; earlier operator profiles retain their
+original limits.
 
 ## Evidence inventory
 
@@ -30,7 +33,7 @@ profile; earlier operator profiles retain their original limits.
 | Retained source, capture, roots and GC | #714–#719 | Capture/crash/cleanup schedules; bounded native workload and APFS retained-source pressure below; host/daemon and mid-journal exhaustion remain unqualified |
 | Bounded context and fresh analysis views | #718/#730/#731/#756 | Scoped invalidation schedules and [once-final FX08 campaign](local-v3-fx08-qualification.md): all 56 outcomes retained; reliable brief usefulness was not established |
 | Composition and bounded resolution | #733–#736/#755 | Historical provisional text profile plus [bounded external HTML structural profile](local-v3-e1-profile.md); semantic repair/consumer/subtraction evidence; original held-outs are not rerun; [reachable request guards](local-v3-qualification/resolution-guards-2026-10-12.json) |
-| Targets, finite waves, budgets and native epoch | #737–#740/#759/#763 | Transition, arrival, reservation, stop and stale-authority schedules; [actual appointed two-wave service](local-v3-autonomous-controller.md); FX17 and sustained-load reliability remain open |
+| Targets, finite waves, budgets and native epoch | #737–#740/#759/#763 | Transition, arrival, reservation, stop and stale-authority schedules; [actual appointed service and twenty-change evolution](local-v3-autonomous-controller.md); sustained-arrival qualification in progress; no general reliability claim |
 | Exact execution, supervisor, verifier and resources | #741–#744/#758 | Independent negative profiles and artifact checks; actual bounded tmpfs ENOSPC and cgroup OOM below; [typed native candidate/gate join](local-v3-native-gates.md) implemented on the Local branch |
 | Source publication and acceptance | #745/#746 | Real private generic Git and native appointed observations; live GitHub/Mergify binding pending |
 | Generation, exchange and controlled handoff | #747–#749 | Real child/open-file schedules; [handoff regression ledger](local-v3-qualification/handoff-restored-2026-10-11.json); real controlled native joined path below |
@@ -181,16 +184,24 @@ every decision-key/path comparison arm was removed.
 
 ## Remaining Local requirements
 
-FX17 requires twenty accepted controlled changes with surviving independent
-obligations and separate once-final held-out model cases. The reviewed harness
-and frozen payload preparation do not qualify that sequence. The first actual
-native attempt stopped on fixture directory permissions; the second accepted
-C01 and held C02 after exposing an incorrect baseline commit across target
-revisions. Both failures remain in the denominator. The generic repair's
-[cross-revision regression ledger](local-v3-qualification/cross-revision-baseline-2026-10-15/ledger.json)
-retains three focused passing tests, both intended guard failures with exact
-source restoration, and all earlier compiler/test failures. The complete native
-sequence remains required.
+FX17 has a passing twenty-change controlled native run at `c45d4096`, after two
+unsuccessful runs. Its [complete attempt ledger](../../../../target/local-resume/attempts-ledger.md)
+retains all three runs: 60 scheduled stage positions, 23 executed, 21 accepted,
+two held and 37 unrun. The successful run accepted C01–C20 with one fresh passing
+native gate and independent artifact verification per stage; all 65 earlier
+active obligations remained checked at every stage. It ran no model or sealed
+case. The [generic baseline repair's ledger](local-v3-qualification/cross-revision-baseline-2026-10-15/ledger.json)
+retains the earlier compiler/test failures, three focused passing controls, two
+named guard failures with exact source restoration, and source-bound follow-up
+checks. Those overlapping test executions are separate from the FX17 vectors.
+
+The separate once-final six-row model campaign produced six provider/CLI errors
+and zero candidate outputs. The provider rejected its response schema before
+model generation was observed. No held-out evaluator ran, and no baseline was
+substituted. All six assigned rows remain in the denominator; their consumed
+campaign is not retried. Correct/absent/misleading brief usefulness and held-out
+behavior remain unqualified. Provider retries and invoiced cost are unknown.
+A corrected generic schema adapter cannot retrospectively qualify those rows.
 
 The [receiver-timeout ledger](local-v3-qualification/unknown-publication-2026-10-15/ledger.json)
 separately records a passing actual control at `b16af023`: the remote ref moved,
