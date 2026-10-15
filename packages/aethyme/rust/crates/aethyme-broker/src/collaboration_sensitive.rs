@@ -3539,6 +3539,24 @@ mod tests {
     }
 
     #[test]
+    fn capture_lock_control_inventory_refuses_held_lock_then_retries_after_release() {
+        let root = tempfile::tempdir().unwrap();
+        let capture_root = root.path().join("spool/capture");
+        std::fs::create_dir_all(&capture_root).unwrap();
+        let lock = capture_root.join("cap-0123456789abcdef0123456789abcdef.lock");
+        std::fs::write(&lock, b"").unwrap();
+
+        let held = crate::file_lock::ExclusiveFileLock::acquire(
+            crate::file_lock::open_lock_file(&lock).unwrap(),
+        )
+        .unwrap();
+        assert!(capture_lock_control_paths(root.path()).is_err());
+
+        drop(held);
+        assert!(capture_lock_control_paths(root.path()).is_ok());
+    }
+
+    #[test]
     fn capture_lock_control_inventory_rejects_unknown_children() {
         let root = tempfile::tempdir().unwrap();
         let capture_root = root.path().join("spool/capture");
