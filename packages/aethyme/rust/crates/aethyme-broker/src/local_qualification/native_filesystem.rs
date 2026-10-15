@@ -1309,7 +1309,7 @@ fn run_t45_capture_hydration_interleavings(disk: &mut OwnedImage) {
             let before_copy_write = Box::new(move |commit: &archive::CommitOid, bytes: u64| {
                 if commit.as_str() == expected_commit && bytes == PRESSURE_BLOB_BYTES as u64 {
                     ready_gate.pause(InterleaveEvent::CaptureAtLargeBlob {
-                        commit: commit.to_string(),
+                        commit: commit.as_str().to_owned(),
                         bytes,
                     });
                 }
