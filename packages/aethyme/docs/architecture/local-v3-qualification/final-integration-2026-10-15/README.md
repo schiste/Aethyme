@@ -8,6 +8,9 @@ numeric status, exact source commit/tree, tracked working-tree status and diff
 hash before and after execution. Inventory SHA-256 and byte counts cover every
 copied payload. Copies preserve original output, including blank lines at EOF
 that `git diff --check` may report; raw logs are not normalized.
+Byte-exact recorder metadata, logs, JUnit reports and retained runner scripts
+include host-specific absolute paths, including the local account name, worktree,
+shared target and temporary directories.
 
 ## Recorded source and results
 
@@ -62,16 +65,36 @@ Several other first-run failures involved older shell fixtures and temporary
 paths containing spaces. A subsequent full retry uses a whitespace-free,
 off-Git temporary root; the official runner, Git isolation, assertions, limits
 and failure behavior remain intact. This does not qualify arbitrary paths with
-spaces. The retry and the remaining four checks are pending.
+spaces.
 
-## Remaining integration work
+## Clean-source workspace retry
+
+At clean source `1d0ce2647f277a7246d0994d4f935f1ca1bc183d` (tree
+`8bdefa81de7f2b628eeed0ee505e1294fd3fb762`), all five sequential checks exited
+0 with unchanged, clean source. The official full suite ran 4,569 tests: all
+4,569 passed, 38 were skipped. Formatting and strict workspace/all-target Clippy
+passed. Workspace examples passed seven tests. The documentation command passed
+with zero documentation cases. The complete original logs, numeric statuses,
+fresh JUnit report, driver, recorder, environment and batch record are retained.
+These workspace checks overlap selected earlier executions and do not execute
+the separately ignored native or once-final model profiles.
+
+This source predates the Local sensitive-content response and fresh command-line
+integration work. It supplies no passing evidence for those later changes.
+
+## Source-bound native results and remaining integration work
 
 The separately reviewed [native-job release and schema-23 qualification](../native-job-lifecycle-2026-10-15/README.md)
 retains its successful checks, deliberate guard failures and failed or incomplete
 attempts. The separately [reviewed T45 interleaving](../t45-pressure-gc-interleaving-2026-10-15/README.md)
 records four bounded pressure cases in two passing native invocations and five
 intended guard failures, with their source and environmental limits.
-No later combined tree is credited by these earlier source-bound runs.
+The Local T56/D29 sensitive-content response and fresh independent reviewer rehearsal
+remain open. Review found that the existing native fixture constructs its two
+contributors serially and supplies wave availability and verifier policy through
+library APIs. It does not qualify fresh independent contributor processes through
+the command line. No later combined tree is credited by these earlier
+source-bound runs.
 No model, provider trial or private held-out evaluator ran in this selection.
 The six consumed FX17 provider errors remain unchanged; this ledger does not
 establish brief usefulness or reliable autonomous operation.

@@ -25,8 +25,11 @@ failure. The aggregate view/context selections passed 61 selected executions at 
 recorded source. Native-job retention cleanup passed its bounded local checks
 and six guard-removal controls. The [bounded T45 interleaving](local-v3-qualification/t45-pressure-gc-interleaving-2026-10-15/README.md)
 passed APFS capture/hydration ENOSPC and Docker build ENOSPC/OOM with explicit GC
-lock witnesses; five deliberate guard breaks failed as intended. Final combined-tree
-checks remain in progress. These finite observations do not establish reliable autonomous operation. All results
+lock witnesses; five deliberate guard breaks failed as intended. The clean-source
+workspace check at `1d0ce264` passed all 4,569 executed tests, with 38 skipped;
+formatting, strict workspace Clippy, examples and documentation commands also
+passed. Local sensitive-content response and fresh command-line integration
+qualification remain open. These finite observations do not establish reliable autonomous operation. All results
 below name their source and profile; earlier operator profiles retain their
 original limits.
 
@@ -244,7 +247,11 @@ verification passed 11,075 ms later, but the single publication attempt failed
 safely and the service held with zero private completions or replay, preserving
 the competing remote tip. This qualifies one finite arrival/contention/drift
 profile. It does not establish repeated-drift or sustained-load reliability.
-Final combined-tree checks remain open. The [native retention lifecycle](local-v3-qualification/native-job-lifecycle-2026-10-15/README.md)
+The clean-source workspace checks and their exact scope are recorded in the
+[aggregate ledger](local-v3-qualification/final-integration-2026-10-15/README.md).
+Local sensitive-content response and a fresh reviewer command-line path remain
+open; the existing native fixture does not constitute independent contributor
+processes through that path. The [native retention lifecycle](local-v3-qualification/native-job-lifecycle-2026-10-15/README.md)
 passed all 15 selected native-gate tests, seven migration fixtures and a separate
 restored-source sanity check at their recorded heads. Six deliberate guard
 removals each failed the intended assertion; exact source restoration, help

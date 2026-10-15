@@ -569,6 +569,186 @@
       ],
       "log_sha256": "8234bb8ee91bd1b6b0af1fc0b5b61ae95d1795737fe846922df841991df075ad",
       "scope": "Restored helper exact test passes under official injected GIT configuration; exact backup hash restoration corroborates source recording."
+    },
+    {
+      "id": "clean-1d-workspace-full",
+      "metadata": "runs/clean-1d-workspace-full.json",
+      "source_before": {
+        "diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "head": "1d0ce2647f277a7246d0994d4f935f1ca1bc183d",
+        "status": "",
+        "tree": "8bdefa81de7f2b628eeed0ee505e1294fd3fb762",
+        "untracked_content_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "source_after": {
+        "diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "head": "1d0ce2647f277a7246d0994d4f935f1ca1bc183d",
+        "status": "",
+        "tree": "8bdefa81de7f2b628eeed0ee505e1294fd3fb762",
+        "untracked_content_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "source_unchanged": true,
+      "command": [
+        "packages/aethyme/scripts/test-like-ci.sh",
+        "--full"
+      ],
+      "exit_code": 0,
+      "wall_seconds": 1019.052618,
+      "result_lines": [
+        "     Summary [ 879.613s] 4569 tests run: 4569 passed (8 slow), 38 skipped",
+        "Wall time: 16m59s (full)"
+      ],
+      "log_sha256": "7889802bc30667c3f3ddd7d87cd636a22b4020bb8c03174446615826e808e348",
+      "scope": "Clean source1d0ce264 aggregate workspace check; whitespace-free private temporary root; official Git isolation unchanged; not later T56 or CLI integration qualification."
+    },
+    {
+      "id": "clean-1d-workspace-fmt",
+      "metadata": "runs/clean-1d-workspace-fmt.json",
+      "source_before": {
+        "diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "head": "1d0ce2647f277a7246d0994d4f935f1ca1bc183d",
+        "status": "",
+        "tree": "8bdefa81de7f2b628eeed0ee505e1294fd3fb762",
+        "untracked_content_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "source_after": {
+        "diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "head": "1d0ce2647f277a7246d0994d4f935f1ca1bc183d",
+        "status": "",
+        "tree": "8bdefa81de7f2b628eeed0ee505e1294fd3fb762",
+        "untracked_content_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "source_unchanged": true,
+      "command": [
+        "cargo",
+        "fmt",
+        "--all",
+        "--",
+        "--check"
+      ],
+      "exit_code": 0,
+      "wall_seconds": 9.804514,
+      "result_lines": [],
+      "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "scope": "Clean source1d0ce264 aggregate workspace check; whitespace-free private temporary root; official Git isolation unchanged; not later T56 or CLI integration qualification."
+    },
+    {
+      "id": "clean-1d-workspace-clippy",
+      "metadata": "runs/clean-1d-workspace-clippy.json",
+      "source_before": {
+        "diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "head": "1d0ce2647f277a7246d0994d4f935f1ca1bc183d",
+        "status": "",
+        "tree": "8bdefa81de7f2b628eeed0ee505e1294fd3fb762",
+        "untracked_content_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "source_after": {
+        "diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "head": "1d0ce2647f277a7246d0994d4f935f1ca1bc183d",
+        "status": "",
+        "tree": "8bdefa81de7f2b628eeed0ee505e1294fd3fb762",
+        "untracked_content_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "source_unchanged": true,
+      "command": [
+        "cargo",
+        "clippy",
+        "--locked",
+        "-j",
+        "4",
+        "--workspace",
+        "--all-targets",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "exit_code": 0,
+      "wall_seconds": 127.227283,
+      "result_lines": [],
+      "log_sha256": "f507aa41fc406b91652b6ff7d9fd288f91a387a1f66337155a3a8a6be65adde8",
+      "scope": "Clean source1d0ce264 aggregate workspace check; whitespace-free private temporary root; official Git isolation unchanged; not later T56 or CLI integration qualification."
+    },
+    {
+      "id": "clean-1d-workspace-examples",
+      "metadata": "runs/clean-1d-workspace-examples.json",
+      "source_before": {
+        "diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "head": "1d0ce2647f277a7246d0994d4f935f1ca1bc183d",
+        "status": "",
+        "tree": "8bdefa81de7f2b628eeed0ee505e1294fd3fb762",
+        "untracked_content_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "source_after": {
+        "diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "head": "1d0ce2647f277a7246d0994d4f935f1ca1bc183d",
+        "status": "",
+        "tree": "8bdefa81de7f2b628eeed0ee505e1294fd3fb762",
+        "untracked_content_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "source_unchanged": true,
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-j",
+        "4",
+        "--workspace",
+        "--examples"
+      ],
+      "exit_code": 0,
+      "wall_seconds": 4.107988,
+      "result_lines": [
+        "test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+        "test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s",
+        "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+        "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s"
+      ],
+      "log_sha256": "037efb1fa4c17117ecd765ec5fe90c04cd43e8d7463ad10d9da5b44295b9f8e8",
+      "scope": "Clean source1d0ce264 aggregate workspace check; whitespace-free private temporary root; official Git isolation unchanged; not later T56 or CLI integration qualification."
+    },
+    {
+      "id": "clean-1d-workspace-doc",
+      "metadata": "runs/clean-1d-workspace-doc.json",
+      "source_before": {
+        "diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "head": "1d0ce2647f277a7246d0994d4f935f1ca1bc183d",
+        "status": "",
+        "tree": "8bdefa81de7f2b628eeed0ee505e1294fd3fb762",
+        "untracked_content_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "source_after": {
+        "diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "head": "1d0ce2647f277a7246d0994d4f935f1ca1bc183d",
+        "status": "",
+        "tree": "8bdefa81de7f2b628eeed0ee505e1294fd3fb762",
+        "untracked_content_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "source_unchanged": true,
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-j",
+        "4",
+        "--workspace",
+        "--doc"
+      ],
+      "exit_code": 0,
+      "wall_seconds": 10.433678,
+      "result_lines": [
+        "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+        "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+        "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+        "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+        "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+        "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+        "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+        "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+        "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+        "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s"
+      ],
+      "log_sha256": "cd7fa6ea7fcaab1cdb0254b9e34a054889fba356bfdb7f38d03efe6265fe9edf",
+      "scope": "Clean source1d0ce264 aggregate workspace check; whitespace-free private temporary root; official Git isolation unchanged; not later T56 or CLI integration qualification."
     }
   ],
   "files": [
@@ -799,9 +979,129 @@
       "source_path": "target/local-resume/native-git-child-checks/20261015T164659Z-native-git-child-restored-db8857ef/command.status",
       "bytes": 2,
       "sha256": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa"
+    },
+    {
+      "path": "runs/clean-1d-workspace-full.json",
+      "source_path": "target/local-resume/final-workspace-batches/20261015T165406Z-1d0ce2647f27/runs/20261015T165406Z-workspace-full-1d0ce2647f27-d8d4d6af/command.json",
+      "bytes": 3971,
+      "sha256": "907dda2d03df9cce6f555eb88028ed0884080b9b3a9166747c214476db5379d6"
+    },
+    {
+      "path": "runs/clean-1d-workspace-full.log",
+      "source_path": "target/local-resume/final-workspace-batches/20261015T165406Z-1d0ce2647f27/runs/20261015T165406Z-workspace-full-1d0ce2647f27-d8d4d6af/command.log",
+      "bytes": 513367,
+      "sha256": "7889802bc30667c3f3ddd7d87cd636a22b4020bb8c03174446615826e808e348"
+    },
+    {
+      "path": "runs/clean-1d-workspace-full.status",
+      "source_path": "target/local-resume/final-workspace-batches/20261015T165406Z-1d0ce2647f27/runs/20261015T165406Z-workspace-full-1d0ce2647f27-d8d4d6af/command.status",
+      "bytes": 2,
+      "sha256": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa"
+    },
+    {
+      "path": "runs/clean-1d-workspace-full-extra-0-batch.json",
+      "source_path": "target/local-resume/final-workspace-batches/20261015T165406Z-1d0ce2647f27/batch.json",
+      "bytes": 5775,
+      "sha256": "36442feb506a7b0680c9bb132425846fe69f84048a7e2c296967a6ec5cc1513b"
+    },
+    {
+      "path": "runs/clean-1d-workspace-full-extra-1-workspace-full.junit.xml",
+      "source_path": "target/local-resume/final-workspace-batches/20261015T165406Z-1d0ce2647f27/workspace-full.junit.xml",
+      "bytes": 939961,
+      "sha256": "0eb620153ec3d37324baf24189f2579a317be0de6fdab6fb4d3a95eaf1685757"
+    },
+    {
+      "path": "runs/clean-1d-workspace-full-extra-2-run-final-workspace-checks-v3.py",
+      "source_path": "target/local-resume/run-final-workspace-checks-v3.py",
+      "bytes": 6684,
+      "sha256": "6b0c4332fddceabe89dc0dcb4cae947fe6f972be847fcd5ec82de1fd4feb815b"
+    },
+    {
+      "path": "runs/clean-1d-workspace-full-extra-3-record-final-local-check-v2.py",
+      "source_path": "target/local-resume/record-final-local-check-v2.py",
+      "bytes": 11719,
+      "sha256": "29d2319c55cea24d6a1c76d7038b4bfd96cc105ae17e7ef4c00ef927d19286bc"
+    },
+    {
+      "path": "runs/clean-1d-workspace-full-extra-4-final-workspace-runtime-handoff.json",
+      "source_path": "target/local-resume/final-workspace-runtime-handoff.json",
+      "bytes": 481,
+      "sha256": "939e8730c4743b61014caed83427f28943f9f574af62a6db4418b4378b309132"
+    },
+    {
+      "path": "runs/clean-1d-workspace-fmt.json",
+      "source_path": "target/local-resume/final-workspace-batches/20261015T165406Z-1d0ce2647f27/runs/20261015T171106Z-workspace-fmt-1d0ce2647f27-4d579ba8/command.json",
+      "bytes": 3980,
+      "sha256": "163d91d9704e293a9fea98f6c10350accf16465ac357621f695f823b94f07afb"
+    },
+    {
+      "path": "runs/clean-1d-workspace-fmt.log",
+      "source_path": "target/local-resume/final-workspace-batches/20261015T165406Z-1d0ce2647f27/runs/20261015T171106Z-workspace-fmt-1d0ce2647f27-4d579ba8/command.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "runs/clean-1d-workspace-fmt.status",
+      "source_path": "target/local-resume/final-workspace-batches/20261015T165406Z-1d0ce2647f27/runs/20261015T171106Z-workspace-fmt-1d0ce2647f27-4d579ba8/command.status",
+      "bytes": 2,
+      "sha256": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa"
+    },
+    {
+      "path": "runs/clean-1d-workspace-clippy.json",
+      "source_path": "target/local-resume/final-workspace-batches/20261015T165406Z-1d0ce2647f27/runs/20261015T171116Z-workspace-clippy-1d0ce2647f27-90f50720/command.json",
+      "bytes": 4076,
+      "sha256": "38d1d954b5b20c54b1990995072a289ebdfb246d8aa4df5a4f58c705692d9538"
+    },
+    {
+      "path": "runs/clean-1d-workspace-clippy.log",
+      "source_path": "target/local-resume/final-workspace-batches/20261015T165406Z-1d0ce2647f27/runs/20261015T171116Z-workspace-clippy-1d0ce2647f27-90f50720/command.log",
+      "bytes": 3419,
+      "sha256": "f507aa41fc406b91652b6ff7d9fd288f91a387a1f66337155a3a8a6be65adde8"
+    },
+    {
+      "path": "runs/clean-1d-workspace-clippy.status",
+      "source_path": "target/local-resume/final-workspace-batches/20261015T165406Z-1d0ce2647f27/runs/20261015T171116Z-workspace-clippy-1d0ce2647f27-90f50720/command.status",
+      "bytes": 2,
+      "sha256": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa"
+    },
+    {
+      "path": "runs/clean-1d-workspace-examples.json",
+      "source_path": "target/local-resume/final-workspace-batches/20261015T165406Z-1d0ce2647f27/runs/20261015T171324Z-workspace-examples-1d0ce2647f27-f5c8d9bb/command.json",
+      "bytes": 4043,
+      "sha256": "b8c5a666c728a6e33cbcd7725bc6d06e4f96d6cb739bb1f6cfc217661d57bfb1"
+    },
+    {
+      "path": "runs/clean-1d-workspace-examples.log",
+      "source_path": "target/local-resume/final-workspace-batches/20261015T165406Z-1d0ce2647f27/runs/20261015T171324Z-workspace-examples-1d0ce2647f27-f5c8d9bb/command.log",
+      "bytes": 2700,
+      "sha256": "037efb1fa4c17117ecd765ec5fe90c04cd43e8d7463ad10d9da5b44295b9f8e8"
+    },
+    {
+      "path": "runs/clean-1d-workspace-examples.status",
+      "source_path": "target/local-resume/final-workspace-batches/20261015T165406Z-1d0ce2647f27/runs/20261015T171324Z-workspace-examples-1d0ce2647f27-f5c8d9bb/command.status",
+      "bytes": 2,
+      "sha256": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa"
+    },
+    {
+      "path": "runs/clean-1d-workspace-doc.json",
+      "source_path": "target/local-resume/final-workspace-batches/20261015T165406Z-1d0ce2647f27/runs/20261015T171329Z-workspace-doc-1d0ce2647f27-554ddfc8/command.json",
+      "bytes": 4014,
+      "sha256": "52cefa5537f903b6002779bc0f4701eedcb6b8de97016be9bcbc9118e309903b"
+    },
+    {
+      "path": "runs/clean-1d-workspace-doc.log",
+      "source_path": "target/local-resume/final-workspace-batches/20261015T165406Z-1d0ce2647f27/runs/20261015T171329Z-workspace-doc-1d0ce2647f27-554ddfc8/command.log",
+      "bytes": 1512,
+      "sha256": "cd7fa6ea7fcaab1cdb0254b9e34a054889fba356bfdb7f38d03efe6265fe9edf"
+    },
+    {
+      "path": "runs/clean-1d-workspace-doc.status",
+      "source_path": "target/local-resume/final-workspace-batches/20261015T165406Z-1d0ce2647f27/runs/20261015T171329Z-workspace-doc-1d0ce2647f27-554ddfc8/command.status",
+      "bytes": 2,
+      "sha256": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa"
     }
   ],
-  "updated_at_utc": "2026-10-15T16:48:49.007478+00:00",
+  "updated_at_utc": "2026-10-15T17:14:55.207901+00:00",
   "preflight_failures": [
     {
       "metadata": "runs/aggregate-offline-fx17-recorder-preflight-failure.json",
