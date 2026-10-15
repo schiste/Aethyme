@@ -18,6 +18,15 @@ library tests and two public context-selection vectors. These are 61 passing
 selected executions. They overlap earlier branch qualification and do not
 replace independent adversarial review, final-head CI or held-out behavior.
 
+At clean source `e105edc81a4cdf9464e7bbfdca54540cea2f7bfb` (tree
+`5cef88b29c2a669c0669edef0f2dbde1c2d6b714`), six offline FX17 model-protocol
+and disposable campaign-marker controls also passed, with unchanged source. These
+use mocks: zero model requests, private evaluator runs or changes to the consumed
+live campaign marker. An earlier recorder preflight rejected an unsupported
+environment argument before launching tests; its separate failure record is
+retained without test credit. These executions do not qualify the failed live
+FX17 campaign.
+
 ## Remaining integration work
 
 Native-job release and schema-23 qualification are recorded separately once
