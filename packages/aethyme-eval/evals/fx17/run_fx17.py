@@ -85,11 +85,13 @@ RESPONSE_SCHEMA = {
     "required": ["app_sh", "refusal"],
     "properties": {"app_sh": {"type": ["string", "null"]},
                    "refusal": {"type": ["string", "null"]}},
-    "oneOf": [
-        {"properties": {"app_sh": {"type": "string"}, "refusal": {"type": "null"}}},
-        {"properties": {"app_sh": {"type": "null"}, "refusal": {"type": "string"}}},
-    ],
 }
+TOOL_ITEM_TYPES = frozenset({
+    "command_execution", "file_change", "mcp_call", "mcp_tool_call",
+    "web_search", "web_search_call", "image_generation_call", "computer_call",
+    "code_interpreter_call", "file_search_call", "function_call",
+    "custom_tool_call", "local_shell_call", "apply_patch_call", "tool_call",
+})
 
 
 class Fx17Error(RuntimeError):
@@ -98,6 +100,64 @@ class Fx17Error(RuntimeError):
 
 def digest(raw):
     return hashlib.sha256(raw).hexdigest()
+
+
+def validate_response_schema(schema=None):
+    """Check the strict provider subset; response exclusivity is parsed locally."""
+    schema = RESPONSE_SCHEMA if schema is None else schema
+    if (not isinstance(schema, dict)
+            or set(schema) != {"type", "additionalProperties", "required", "properties"}
+            or schema.get("type") != "object"
+            or schema.get("additionalProperties") is not False
+            or schema.get("required") != ["app_sh", "refusal"]):
+        raise Fx17Error("Response schema must be a strict root object with both required fields")
+    properties = schema.get("properties")
+    if (not isinstance(properties, dict)
+            or set(properties) != {"app_sh", "refusal"}
+            or any(properties[name] != {"type": ["string", "null"]}
+                   for name in ("app_sh", "refusal"))):
+        raise Fx17Error("Response schema fields must be nullable strings with no extra properties")
+
+
+def observed_tool_call_ids(events):
+    """Count unique known tool-call items, ignoring errors and ordinary messages."""
+    tool_ids = set()
+    for index, event in enumerate(events):
+        if not isinstance(event, dict):
+            continue
+        item = event.get("item")
+        if not isinstance(item, dict) or item.get("type") not in TOOL_ITEM_TYPES:
+            continue
+        item_type = item["type"]
+        item_id = item.get("id")
+        key = (item_type, item_id) if isinstance(item_id, str) and item_id else (
+            item_type, "event", index)
+        tool_ids.add(key)
+    return tool_ids
+
+
+def parse_model_response(raw, tool_call_ids=()):
+    """Parse a bounded response and enforce the candidate/refusal XOR locally."""
+    try:
+        response = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        response = None
+    if not isinstance(response, dict) or set(response) != {"app_sh", "refusal"}:
+        return {"status": "invalid_response"}
+    if tool_call_ids:
+        return {"status": "tool_access_violation"}
+    if response.get("app_sh") is None and isinstance(response.get("refusal"), str):
+        return {"status": "refusal", "refusal": response["refusal"]}
+    if not isinstance(response.get("app_sh"), str) or response.get("refusal") is not None:
+        return {"status": "invalid_response"}
+    try:
+        candidate = response["app_sh"].encode("utf-8")
+    except UnicodeEncodeError:
+        return {"status": "invalid_response"}
+    if len(candidate) > MAX_CANDIDATE_BYTES or b"\0" in candidate:
+        return {"status": "invalid_response"}
+    return {"status": "response_received", "candidate": candidate,
+            "candidate_sha256": digest(candidate), "candidate_utf8_bytes": len(candidate)}
 
 
 def jbytes(value):
@@ -496,6 +556,7 @@ def claim_campaign_consumption(registry_path, schedule_hash, payload_hash,
 
 
 def gate(freeze_root, approval_path, controls_path, ack_schedule, ack_payloads):
+    validate_response_schema()
     payloads, freeze, schedule, schedule_hash, payload_hash = verify_frozen(freeze_root)
     if (ack_schedule, ack_payloads) != (schedule_hash, payload_hash):
         raise Fx17Error("Explicit schedule and payload hash acknowledgements are required")
@@ -816,9 +877,8 @@ def run_row(payload, output):
             result["response_file_size_bytes_observed"] = capture["watched_file_sizes"].get("response_file")
             events = []
             usage = None
-            tool_ids = set()
             if "stdout" not in capture["overflow_streams"]:
-                for n, line in enumerate(stdout.decode("utf-8", "replace").splitlines()):
+                for line in stdout.decode("utf-8", "replace").splitlines():
                     try:
                         event = json.loads(line)
                     except json.JSONDecodeError:
@@ -828,9 +888,7 @@ def run_row(payload, output):
                     events.append(event)
                     if event.get("type") == "turn.completed" and isinstance(event.get("usage"), dict):
                         usage = event["usage"]
-                    item = event.get("item")
-                    if isinstance(item, dict) and item.get("type") not in (None, "agent_message", "reasoning"):
-                        tool_ids.add(str(item.get("id", n)))
+            tool_ids = observed_tool_call_ids(events)
             result["cli_exit_code"] = proc.returncode
             result["provider_usage"] = usage
             result["tool_calls_observed"] = len(tool_ids) if events else None
@@ -876,26 +934,15 @@ def run_row(payload, output):
                             (rowdir / "response.json").write_bytes(raw)
                             result["response_file_size_bytes_observed"] = len(raw)
                             result["response_file_sha256"] = digest(raw)
-                            try:
-                                response = json.loads(raw)
-                            except (UnicodeDecodeError, json.JSONDecodeError):
-                                response = None
-                            if not isinstance(response, dict) or set(response) != {"app_sh", "refusal"}:
-                                result["status"] = "invalid_response"
-                            elif response.get("app_sh") is None and isinstance(response.get("refusal"), str):
-                                result["status"], result["refusal"] = "refusal", response["refusal"]
-                            elif (not isinstance(response.get("app_sh"), str)
-                                  or response.get("refusal") is not None or tool_ids):
-                                result["status"] = "tool_access_violation" if tool_ids else "invalid_response"
-                            else:
-                                candidate = response["app_sh"].encode("utf-8")
-                                if len(candidate) > MAX_CANDIDATE_BYTES or b"\0" in candidate:
-                                    result["status"] = "invalid_response"
-                                else:
-                                    result["status"] = "response_received"
-                                    result["candidate_sha256"] = digest(candidate)
-                                    result["candidate_utf8_bytes"] = len(candidate)
-                                    (rowdir / "candidate.app.sh").write_bytes(candidate)
+                            parsed = parse_model_response(raw, tool_ids)
+                            result["status"] = parsed["status"]
+                            if parsed["status"] == "refusal":
+                                result["refusal"] = parsed["refusal"]
+                            elif parsed["status"] == "response_received":
+                                candidate = parsed["candidate"]
+                                result["candidate_sha256"] = parsed["candidate_sha256"]
+                                result["candidate_utf8_bytes"] = parsed["candidate_utf8_bytes"]
+                                (rowdir / "candidate.app.sh").write_bytes(candidate)
             output_tokens = result["provider_output_tokens"]
             result["output_tokens_exceeded_nominal_threshold"] = (
                 output_tokens > TOKEN_MAX if output_tokens is not None else None)
@@ -918,7 +965,7 @@ def run(freeze_root, approval_path, controls_path, output, ack_schedule, ack_pay
     if output.exists():
         raise Fx17Error("Refusing to reuse a trial output directory")
     consumption = claim_campaign_consumption(
-        registry, schedule_hash, payload_hash, approval_raw)
+        str(registry), schedule_hash, payload_hash, approval_raw)
     output.mkdir(mode=0o700, parents=True)
     state = {"schema": "aethyme.fx17.results/v1", "assigned_denominator": 6,
              "original_core_denominator": 4, "supplemental_misleading_denominator": 2,

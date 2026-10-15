@@ -125,7 +125,17 @@ is not a filesystem quota. Output-token ceilings and provider retries are not
 claimed as enforced controls. Invoiced cost, usage, provider request count,
 retry count, and token fields remain unknown unless actually reported.
 
-No FX17 model trial has been approved or run in this worktree.
+### First approved launcher preflight
+
+The first approved six-row invocation exited with status 2 before consuming the
+campaign marker or creating `results.json`. The gate returned the validated
+registry as a `Path`, then the once-only claim helper rejected that value
+because its strict validator accepts the approval's canonical string. The
+preflight stopped before marker creation and before any model CLI child
+launch. All six assigned rows remain unstarted; no row credit is recorded and
+no private evaluator was run. The repo-safe preflight evidence SHA256 is
+`b36f8bedbccb14847c11cd40fe7e07cfd28c6f770fa4710a27f2dbbd5bbcb59c`. Raw
+logs and the approval record remain in private qualification storage.
 
 ## Final-proposal evaluation
 
@@ -154,6 +164,7 @@ never staged or included in the model payloads.
 
 - `briefs/`: exact independently frozen public briefs.
 - `frozen/`: public six-row payload, schedule, manifests, and freeze hashes.
+- `model-trial-attempts.md`: shareable outcome ledger for the once-only six-row trial.
 - The private oracle bundle is supplied externally to the trusted evaluator.
   The model payload generator does not read it.
 - `run_fx17.py`: public-payload preparation, integrity verification, bounded
