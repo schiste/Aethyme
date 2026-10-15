@@ -52,3 +52,4 @@ The first discarded-results ratchet run on `d819d17` failed at 144 production `l
 ## Artifact map
 
 `runs/` contains the pre-cleanup focused baselines, all five guard mutations, the initial ratchet failure, and every final selection. `artifact-inventory.json` enumerates the copied metadata, status, log, and mutation-audit artifacts with byte-level SHA-256 hashes.
+Eleven captured Cargo logs contain an extra blank line at EOF, which `git diff --check` reports as trailing whitespace. The logs are retained byte-for-byte as command output; they were not normalized.
