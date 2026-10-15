@@ -258,6 +258,38 @@ pub fn response_use(store: &CollaborationStore) -> Result<ResponseUse, Sensitive
     Ok(guard)
 }
 
+/// Hold the shared response barrier for metadata-only release of a view hold.
+/// Unlike content readers, this narrow operation remains allowed after a
+/// permanent tombstone so an operator can release a named hold; it does not
+/// expose or inspect project content.
+pub(crate) fn response_use_for_view_hold_release(
+    store: &CollaborationStore,
+) -> Result<ResponseUse, SensitiveError> {
+    let path = lock_path(store);
+    if let Some(state) = RESPONSE_READERS.with(|readers| readers.borrow().get(&path).cloned()) {
+        state.count.set(state.count.get().saturating_add(1));
+        return Ok(ResponseUse {
+            path,
+            state,
+            _not_send: PhantomData,
+        });
+    }
+    let file = open_response_lock(store)?;
+    file.lock_shared()?;
+    let state = Rc::new(SharedLockState {
+        _file: file,
+        count: Cell::new(1),
+    });
+    RESPONSE_READERS.with(|readers| {
+        readers.borrow_mut().insert(path.clone(), state.clone());
+    });
+    Ok(ResponseUse {
+        path,
+        state,
+        _not_send: PhantomData,
+    })
+}
+
 /// Hold the same barrier when a long-lived reader has only retained its
 /// immutable project directory. This is used by analysis readers, which cannot
 /// own a CollaborationStore or retain a !Send guard between calls.
@@ -376,10 +408,7 @@ fn read_marker(store: &CollaborationStore) -> Result<Option<Marker>, SensitiveEr
     read_marker_at(store.project_dir(), store.project().as_str())
 }
 
-fn read_marker_at(
-    project_dir: &Path,
-    project_key: &str,
-) -> Result<Option<Marker>, SensitiveError> {
+fn read_marker_at(project_dir: &Path, project_key: &str) -> Result<Option<Marker>, SensitiveError> {
     let path = marker_path_for_project_dir(project_dir)?;
     let metadata = match fs::symlink_metadata(&path) {
         Ok(metadata) => metadata,
@@ -438,10 +467,7 @@ pub fn ensure_available(store: &CollaborationStore) -> Result<(), SensitiveError
     Ok(())
 }
 
-fn ensure_available_at(
-    project_dir: &Path,
-    project_key: &str,
-) -> Result<(), SensitiveError> {
+fn ensure_available_at(project_dir: &Path, project_key: &str) -> Result<(), SensitiveError> {
     if read_marker_at(project_dir, project_key)?.is_some() {
         return Err(SensitiveError::Quarantined);
     }
@@ -576,6 +602,10 @@ pub fn quarantine(
     // Recheck under the authority ingress lock after both content barriers.
     // This serializes marker publication with a concurrent resume.
     let _frozen = crate::local_authority::frozen_guard(store, &witness.epoch)?;
+    let current_witness = crate::local_authority::status(store)?;
+    if current_witness != witness {
+        return Err(SensitiveError::NotFrozen);
+    }
     let uid = operator_uid()?;
     let digest = request_digest(
         store.project().as_str(),
@@ -606,8 +636,25 @@ pub fn quarantine(
         {
             return Err(SensitiveError::Mismatch);
         }
+        let other_incidents: bool = store.read_connection().query_row(
+            "SELECT EXISTS(SELECT 1 FROM local_sensitive_incidents WHERE id<>?1)",
+            [&existing.incident_id],
+            |row| row.get(0),
+        )?;
+        if other_incidents {
+            return Err(SensitiveError::Mismatch);
+        }
         existing
     } else {
+        let any_incident: bool = store.read_connection().query_row(
+            "SELECT EXISTS(SELECT 1 FROM local_sensitive_incidents)",
+            [],
+            |row| row.get(0),
+        )?;
+        if any_incident {
+            return Err(SensitiveError::Mismatch);
+        }
+        crate::local_authority::verify_frozen_checkpoint(store, &witness)?;
         create_marker(store, &marker)?;
         marker
     };
@@ -722,7 +769,7 @@ pub fn status(
     })?;
     items.extend(rows.collect::<Result<Vec<_>, _>>()?);
     let mut database_tables = Vec::new();
-    let mut statement = store.connection().prepare(
+    let mut statement = store.read_connection().prepare(
         "SELECT table_name,row_count,bytes,sha256,state
          FROM local_sensitive_table_inventory
          WHERE incident_id=?1 ORDER BY table_name",
@@ -740,7 +787,7 @@ pub fn status(
     })?;
     database_tables.extend(rows.collect::<Result<Vec<_>, _>>()?);
     let mut external_exports = Vec::new();
-    let mut statement = store.connection().prepare(
+    let mut statement = store.read_connection().prepare(
         "SELECT path,kind,sha256,bytes,state FROM local_sensitive_exports ORDER BY path",
     )?;
     let rows = statement.query_map([], |row| {
@@ -994,8 +1041,10 @@ fn database_inventory(store: &CollaborationStore) -> Result<Vec<DatabaseItem>, S
         if PRESERVED_TABLES.contains(&table_name.as_str()) {
             continue;
         }
-        let mut columns_statement =
-            connection.prepare(&format!("PRAGMA table_info({})", quote_identifier(&table_name)))?;
+        let mut columns_statement = connection.prepare(&format!(
+            "PRAGMA table_info({})",
+            quote_identifier(&table_name)
+        ))?;
         let columns = columns_statement
             .query_map([], |row| row.get::<_, String>(1))?
             .collect::<Result<Vec<_>, _>>()?;
@@ -1073,11 +1122,7 @@ fn database_inventory(store: &CollaborationStore) -> Result<Vec<DatabaseItem>, S
     Ok(inventory)
 }
 
-fn inventory_digest(
-    files: &[FileItem],
-    tables: &[DatabaseItem],
-    exports: &[ExportItem],
-) -> String {
+fn inventory_digest(files: &[FileItem], tables: &[DatabaseItem], exports: &[ExportItem]) -> String {
     let mut hash = Sha256::new();
     hash.update(b"aethyme-local-sensitive-inventory-v2\0");
     for item in files {
@@ -1160,7 +1205,10 @@ fn external_exports(
         }
         let metadata = fs::symlink_metadata(&path)?;
         if !metadata.file_type().is_file() {
-            unknown.push(format!("<unclassified-authority-history:{}>", path.display()));
+            unknown.push(format!(
+                "<unclassified-authority-history:{}>",
+                path.display()
+            ));
             continue;
         }
         let (sha256, bytes) = hash_file(&path)?;
@@ -1260,7 +1308,8 @@ fn prepare_inventory(
     let tables = database_inventory(store)?;
     let exports = external_exports(store, &mut unknown)?;
     let digest = inventory_digest(&files, &tables, &exports);
-    let root_entries = fs::read_dir(store.project_dir())?.collect::<Result<Vec<_>, _>>()?;
+    let project_dir = store.project_dir().to_path_buf();
+    let root_entries = fs::read_dir(&project_dir)?.collect::<Result<Vec<_>, _>>()?;
     let tx = store
         .connection()
         .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1344,7 +1393,7 @@ fn prepare_inventory(
         )?;
     }
     for name in ["controller-locks", "agent-locks", "verifier-authority"] {
-        let path = store.project_dir().join(name);
+        let path = project_dir.join(name);
         if fs::symlink_metadata(&path).is_ok() {
             tx.execute(
                 "INSERT OR IGNORE INTO local_sensitive_residuals
@@ -1498,7 +1547,8 @@ fn clear_managed_database(
     store: &mut CollaborationStore,
     incident_id: &str,
 ) -> Result<(), SensitiveError> {
-    let database = store.project_dir().join("state.db");
+    let project_dir = store.project_dir().to_path_buf();
+    let database = project_dir.join("state.db");
     let connection = store.connection();
     connection.pragma_update(None, "secure_delete", "ON")?;
     connection.pragma_update(None, "foreign_keys", "OFF")?;
@@ -1511,8 +1561,7 @@ fn clear_managed_database(
             let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
             rows.collect::<Result<Vec<_>, _>>()?
         };
-        let transaction =
-            connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         for table in tables {
             if matches!(
                 table.as_str(),
@@ -1538,8 +1587,8 @@ fn clear_managed_database(
         // cleanup; inspect the frame counts as well as SQLite's busy flag.
         checkpoint_truncated(connection)?;
         sync_file_if_present(&database)?;
-        sync_file_if_present(&store.project_dir().join("state.db-wal"))?;
-        sync_directory(store.project_dir())?;
+        sync_file_if_present(&project_dir.join("state.db-wal"))?;
+        sync_directory(&project_dir)?;
 
         // Receipt and cleared-state rows are committed only after content
         // deletion, checkpoint, VACUUM, and file/directory sync succeeded.
@@ -1567,11 +1616,10 @@ fn clear_managed_database(
 }
 
 fn checkpoint_truncated(connection: &rusqlite::Connection) -> Result<(), SensitiveError> {
-    let (busy, log_frames, checkpointed_frames): (i64, i64, i64) = connection.query_row(
-        "PRAGMA wal_checkpoint(TRUNCATE)",
-        [],
-        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-    )?;
+    let (busy, log_frames, checkpointed_frames): (i64, i64, i64) =
+        connection.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?;
     if busy != 0 || (log_frames >= 0 && checkpointed_frames < log_frames) {
         return Err(SensitiveError::Busy);
     }
@@ -1752,3 +1800,65 @@ pub fn purge(
     })
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_durable_marker_blocks_resume_and_quarantine_retry_repairs_missing_row() {
+        let fixture = crate::local_target::tests::Fixture::new();
+        let mut store = fixture.store;
+        let owner =
+            crate::local_target::acquire_controller(&mut store, "target", "appointed").unwrap();
+        let frozen = crate::local_authority::freeze(
+            &mut store,
+            owner.authority_epoch(),
+            "sensitive response",
+        )
+        .unwrap();
+        let incident_id = format!("sha256:{}", "c".repeat(64));
+        let issuer_label = "local-operator";
+        let reason_code = ReasonCode::SuspectedTestSecretExposure;
+        let uid = operator_uid().unwrap();
+        let digest = request_digest(
+            store.project().as_str(),
+            &incident_id,
+            issuer_label,
+            uid,
+            frozen.epoch.as_str(),
+            reason_code,
+        );
+        create_marker(
+            &store,
+            &Marker {
+                version: 1,
+                project_key: store.project().as_str().into(),
+                incident_id: incident_id.clone(),
+                issuer_label: issuer_label.into(),
+                operator_uid: uid,
+                authority_epoch: frozen.epoch.as_str().into(),
+                scope_kind: SCOPE_KIND.into(),
+                scope_id: store.project().as_str().into(),
+                reason_code,
+                request_digest: digest.clone(),
+                created_ms: now_ms(),
+            },
+        )
+        .unwrap();
+
+        assert!(matches!(
+            crate::local_authority::resume(&mut store, &frozen.epoch),
+            Err(crate::local_authority::AuthorityError::Frozen)
+        ));
+        let status = quarantine(
+            &mut store,
+            &incident_id,
+            issuer_label,
+            frozen.epoch.as_str(),
+            reason_code,
+        )
+        .unwrap();
+        assert_eq!(status.request_digest, digest);
+        assert_eq!(status.state, "quarantined");
+    }
+}

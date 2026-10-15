@@ -49,6 +49,8 @@ pub enum GenerationError {
     #[error(transparent)]
     Archive(#[from] archive::ArchiveError),
     #[error(transparent)]
+    SensitiveResponse(#[from] crate::collaboration_sensitive::SensitiveError),
+    #[error(transparent)]
     Compose(#[from] crate::composer::ComposeError),
     #[error(transparent)]
     Snapshot(#[from] crate::execution_snapshot::SnapshotError),

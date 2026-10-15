@@ -237,10 +237,31 @@ pub(crate) fn frozen_guard(
     if witness.status != Status::Frozen {
         return Err(AuthorityError::Frozen);
     }
-    if &witness.epoch != epoch || bound(store.read_connection())?.as_ref() != Some(epoch) {
+    if witness.checkpoint.is_none()
+        || &witness.epoch != epoch
+        || bound(store.read_connection())?.as_ref() != Some(epoch)
+    {
         return Err(AuthorityError::Stale);
     }
     Ok(Guard { _file: file })
+}
+
+/// Verify the original freeze checkpoint before the first permanent sensitive
+/// marker is published. After that marker exists, idempotent recovery is bound
+/// to the marker/request digest instead; quarantine and purge intentionally
+/// mutate rows included in this checkpoint.
+pub(crate) fn verify_frozen_checkpoint(
+    store: &CollaborationStore,
+    witness: &Witness,
+) -> Result<(), AuthorityError> {
+    if witness.status != Status::Frozen || witness.checkpoint.is_none() {
+        return Err(AuthorityError::Stale);
+    }
+    let actual = checkpoint(store.read_connection())?;
+    if witness.checkpoint.as_deref() != Some(actual.as_str()) {
+        return Err(AuthorityError::Stale);
+    }
+    Ok(())
 }
 /// Reading status grants no mutation authority.
 pub fn status(store: &CollaborationStore) -> Result<Witness, AuthorityError> {
@@ -363,6 +384,13 @@ pub fn freeze(
     let tx = store
         .connection()
         .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    if bound(&tx)?.as_ref() != Some(expected) {
+        return Err(AuthorityError::Stale);
+    }
+    tx.execute(
+        "UPDATE local_authority_state SET epoch=?1 WHERE singleton=1",
+        [next.epoch.as_str()],
+    )?;
     quarantine(&tx)?;
     next.checkpoint = Some(checkpoint(&tx)?);
     tx.commit()?;
@@ -436,6 +464,13 @@ pub fn complete_interrupted_freeze(
     let tx = store
         .connection()
         .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    if bound(&tx)?.is_none() {
+        return Err(AuthorityError::Stale);
+    }
+    tx.execute(
+        "UPDATE local_authority_state SET epoch=?1 WHERE singleton=1",
+        [current.epoch.as_str()],
+    )?;
     quarantine(&tx)?;
     current.checkpoint = Some(checkpoint(&tx)?);
     tx.commit()?;
