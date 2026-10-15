@@ -451,8 +451,9 @@ pub fn configure(
     expected: Option<i64>,
     policy: VerifierPolicy,
 ) -> Result<ProducerPermit, VerificationError> {
+    let archive_guard = crate::collaboration_gc::archive_use(store)?;
     let _response = crate::collaboration_sensitive::response_use(store)?;
-    let _authority = target::authorize(store, owner)?;
+    let authority_guard = target::authorize(store, owner)?;
     if !valid_name(producer) {
         return Err(VerificationError::Producer);
     }
@@ -461,14 +462,22 @@ pub fn configure(
     let record = policy.record()?;
     let state = target::status(store, owner.target())?;
     let revision = state.revision.ok_or(VerificationError::Mismatch)?;
-    let target_revision = target::load_revision(store, &revision)?;
+    let target_revision = target::load_revision_under_response(store, &revision, &_response)?;
     if target_revision.spec.acceptance_policy != record.id().as_str() {
         return Err(VerificationError::Mismatch);
     }
-    let _archive = crate::collaboration_gc::archive_use(store)?;
     let harness = retained_harness_inventory(store, &policy)?;
     let physical = archive::put_object(store, &record.canonical_bytes())?;
-    target::retain_artifacts(store, owner, &revision, &[harness], &[physical])?;
+    target::retain_artifacts_under_guards(
+        store,
+        owner,
+        &revision,
+        &[harness],
+        &[physical],
+        &archive_guard,
+        &_response,
+        &authority_guard,
+    )?;
     let tx = store
         .connection()
         .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -817,7 +826,6 @@ fn retain_evidence(
     cancel: &AtomicBool,
     before_issue: impl FnOnce(),
 ) -> Result<TrustedEvidence, VerificationError> {
-    let _authority = target::authorize(store, owner)?;
     let record = decode_record(
         &serde_json::to_vec(&serde_json::json!({"schema":EVIDENCE_SCHEMA,"observation":body}))?,
         &EVIDENCE,
@@ -827,9 +835,20 @@ fn retain_evidence(
         .checked_add(i64::try_from(max_age_ms).map_err(|_| VerificationError::Unfulfilled)?)
         .ok_or(VerificationError::Unfulfilled)?;
     let revision = RecordId::parse(&body.revision).map_err(|_| VerificationError::Mismatch)?;
-    let _archive = crate::collaboration_gc::archive_use(store)?;
+    let archive_guard = crate::collaboration_gc::archive_use(store)?;
+    let response_guard = crate::collaboration_sensitive::response_use(store)?;
+    let authority_guard = target::authorize(store, owner)?;
     let physical = archive::put_object(store, &record.canonical_bytes())?;
-    target::retain_artifacts(store, owner, &revision, &[], &[physical])?;
+    target::retain_artifacts_under_guards(
+        store,
+        owner,
+        &revision,
+        &[],
+        &[physical],
+        &archive_guard,
+        &response_guard,
+        &authority_guard,
+    )?;
     let tx = store
         .connection()
         .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;

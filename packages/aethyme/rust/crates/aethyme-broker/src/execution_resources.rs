@@ -582,16 +582,30 @@ impl Run {
             }],
             capabilities: &[],
         };
-        let _authority = target::authorize(store, owner)?;
-        let _archive = crate::collaboration_gc::archive_use(store)
+        let archive_guard = crate::collaboration_gc::archive_use(store)
             .map_err(|e| ResourceError::Deferred(e.to_string()))?;
+        let response_guard = crate::collaboration_sensitive::response_use(store)
+            .map_err(|e| ResourceError::Deferred(e.to_string()))?;
+        let authority_guard = target::authorize(store, owner)?;
         let record=Record::decode(&serde_json::to_vec(&serde_json::json!({"schema":SCHEMA.name,"observation":{"run":self.journal.run,"execution":self.journal.execution,"reservation":self.journal.reservation,"attempt":self.journal.attempt,"epoch":self.journal.epoch,"envelope":self.journal.envelope,"result":result,"accounting":"conservative-reserved-envelope"}}))?,&[&SCHEMA]).map_err(|e|ResourceError::Deferred(e.to_string()))?;
         let object = crate::collaboration_archive::put_object(store, &record.canonical_bytes())
             .map_err(|e| ResourceError::Deferred(e.to_string()))?;
         let revision = target::status(store, owner.target())?
             .revision
             .ok_or(ResourceError::Stale)?;
-        target::retain_artifacts(store, owner, &revision, &[], &[object])?;
+        target::retain_artifacts_under_guards(
+            store,
+            owner,
+            &revision,
+            &[],
+            &[object],
+            &archive_guard,
+            &response_guard,
+            &authority_guard,
+        )?;
+        drop(authority_guard);
+        drop(response_guard);
+        drop(archive_guard);
         self.settle(store, owner, attempt, &record.id())
     }
     pub(crate) fn settle(

@@ -244,6 +244,22 @@ fn current(
     }
     Ok(())
 }
+fn current_under_response(
+    store: &CollaborationStore,
+    owner: &ControllerOwner,
+    revision: &RecordId,
+    response: &crate::collaboration_sensitive::ResponseUse,
+) -> Result<(), SnapshotError> {
+    let r = target::load_revision_under_response(store, revision, response)?;
+    let state = target::status(store, owner.target())?;
+    if r.target != owner.target()
+        || r.issuer != owner.issuer()
+        || state.revision.as_ref() != Some(revision)
+    {
+        return Err(SnapshotError::Stale);
+    }
+    Ok(())
+}
 /// Freeze and retain every declared input. This creates no execution permission,
 /// successful result or acceptance evidence. Old descriptors remain readable.
 pub fn freeze(
@@ -261,10 +277,11 @@ fn freeze_bounded(
     spec: ExecutionSpec,
     materialized_limit: u64,
 ) -> Result<ExecutionSnapshot, SnapshotError> {
-    let _authority = target::authorize(store, owner)?;
-    current(store, owner, revision)?;
     let inputs = validate(&spec)?;
-    let _archive = crate::collaboration_gc::archive_use(store)?;
+    let archive_guard = crate::collaboration_gc::archive_use(store)?;
+    let response_guard = crate::collaboration_sensitive::response_use(store)?;
+    let authority_guard = target::authorize(store, owner)?;
+    current_under_response(store, owner, revision, &response_guard)?;
     let mut total = 0u64;
     for id in &inputs {
         inspect(store, id, &mut total)?;
@@ -277,7 +294,16 @@ fn freeze_bounded(
     }
     let digest = archive::put_object(store, &bytes)?;
     // Pin under one retained revision and the same archive lock as reclamation.
-    target::retain_artifacts(store, owner, revision, &inputs, &[digest])?;
+    target::retain_artifacts_under_guards(
+        store,
+        owner,
+        revision,
+        &inputs,
+        &[digest],
+        &archive_guard,
+        &response_guard,
+        &authority_guard,
+    )?;
     Ok(ExecutionSnapshot {
         reference: SnapshotRef {
             id: record.id(),

@@ -87,6 +87,8 @@ pub enum SupervisorError {
     Target(#[from] target::TargetError),
     #[error(transparent)]
     Archive(#[from] archive::ArchiveError),
+    #[error(transparent)]
+    Sensitive(#[from] crate::collaboration_sensitive::SensitiveError),
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -428,13 +430,23 @@ fn active(
     execution: &ExecutionSnapshot,
 ) -> Result<crate::local_authority::Guard, SupervisorError> {
     let guard = target::authorize(store, owner)?;
+    require_active(store, owner, execution, &guard)?;
+    Ok(guard)
+}
+
+fn require_active(
+    store: &CollaborationStore,
+    owner: &ControllerOwner,
+    execution: &ExecutionSnapshot,
+    _authority: &crate::local_authority::Guard,
+) -> Result<(), SupervisorError> {
     let status = target::status(store, owner.target())?;
     if status.revision.as_ref() != Some(execution.target_revision())
         || status.phase != target::Phase::Verifying
     {
         return Err(SupervisorError::Cancelled);
     }
-    Ok(guard)
+    Ok(())
 }
 impl DockerExecutor {
     /// Execute once under a current finite budget attempt and host admission.
@@ -638,9 +650,10 @@ impl DockerExecutor {
             Err(error) => return Err(error),
         };
         let artifact = if let Some(output) = output {
-            let _authority = target::authorize(store, owner)?;
-            active(store, owner, execution)?;
-            let _archive = crate::collaboration_gc::archive_use(store)?;
+            let archive_guard = crate::collaboration_gc::archive_use(store)?;
+            let response_guard = crate::collaboration_sensitive::response_use(store)?;
+            let authority_guard = target::authorize(store, owner)?;
+            require_active(store, owner, execution, &authority_guard)?;
             let packaging = format!(
                 "sha256:{}",
                 ObjectDigest::of(&serde_json::to_vec(&spec.build)?).hex()
@@ -656,7 +669,16 @@ impl DockerExecutor {
             )?);
             let physical = archive::put_object(store, &record.canonical_bytes())?;
             objects.push(physical);
-            target::retain_artifacts(store, owner, execution.target_revision(), &[], &objects)?;
+            target::retain_artifacts_under_guards(
+                store,
+                owner,
+                execution.target_revision(),
+                &[],
+                &objects,
+                &archive_guard,
+                &response_guard,
+                &authority_guard,
+            )?;
             if cancel.load(Ordering::SeqCst) {
                 return Ok(BuildObservation {
                     outcome: Outcome::Cancelled,
