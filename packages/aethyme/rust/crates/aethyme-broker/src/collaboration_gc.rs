@@ -76,8 +76,15 @@ fn open_archive_lock(store: &CollaborationStore) -> std::io::Result<std::fs::Fil
 /// The archive held shared: reclamation cannot apply until it drops.
 #[derive(Debug)]
 pub struct ArchiveUse {
+    project_dir: PathBuf,
     /// Closing the file releases the lock.
     _file: std::fs::File,
+}
+
+impl ArchiveUse {
+    pub(crate) fn covers(&self, store: &CollaborationStore) -> bool {
+        self.project_dir == store.project_dir()
+    }
 }
 
 #[cfg(test)]
@@ -142,19 +149,28 @@ pub fn archive_use(store: &CollaborationStore) -> std::io::Result<ArchiveUse> {
     let file = open_archive_lock(store)?;
     #[cfg(test)]
     if probe_archive_use(&file)? == Some(true) {
-        return Ok(ArchiveUse { _file: file });
+        return Ok(ArchiveUse {
+            project_dir: store.project_dir().into(),
+            _file: file,
+        });
     }
     file.lock_shared()?;
     #[cfg(test)]
     report_archive_use_acquired();
-    Ok(ArchiveUse { _file: file })
+    Ok(ArchiveUse {
+        project_dir: store.project_dir().into(),
+        _file: file,
+    })
 }
 
 /// [`archive_use`] without waiting: `None` while a reclamation applies.
 pub fn try_archive_use(store: &CollaborationStore) -> std::io::Result<Option<ArchiveUse>> {
     let file = open_archive_lock(store)?;
     match file.try_lock_shared() {
-        Ok(()) => Ok(Some(ArchiveUse { _file: file })),
+        Ok(()) => Ok(Some(ArchiveUse {
+            project_dir: store.project_dir().into(),
+            _file: file,
+        })),
         Err(std::fs::TryLockError::WouldBlock) => Ok(None),
         Err(std::fs::TryLockError::Error(source)) => Err(source),
     }

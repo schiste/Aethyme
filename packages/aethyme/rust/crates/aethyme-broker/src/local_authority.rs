@@ -73,7 +73,16 @@ pub enum AuthorityError {
 /// library operations to finish, then closes ingress before changing the DB.
 #[derive(Debug)]
 pub(crate) struct Guard {
+    project_dir: PathBuf,
+    epoch: Option<Epoch>,
+    active: bool,
     _file: File,
+}
+
+impl Guard {
+    pub(crate) fn covers_active(&self, store: &CollaborationStore, epoch: &Epoch) -> bool {
+        self.project_dir == store.project_dir() && self.active && self.epoch.as_ref() == Some(epoch)
+    }
 }
 fn directory(store: &CollaborationStore) -> Result<PathBuf, AuthorityError> {
     directory_for(store.project_dir())
@@ -233,7 +242,12 @@ pub(crate) fn guard(store: &CollaborationStore, epoch: &Epoch) -> Result<Guard, 
     file.lock_shared()?;
     let w = read(&path)?;
     matching(store.read_connection(), &w, epoch)?;
-    Ok(Guard { _file: file })
+    Ok(Guard {
+        project_dir: store.project_dir().into(),
+        epoch: Some(epoch.clone()),
+        active: true,
+        _file: file,
+    })
 }
 
 /// Guard a sensitive-response operation while authority is deliberately
@@ -256,7 +270,12 @@ pub(crate) fn frozen_guard(
     {
         return Err(AuthorityError::Stale);
     }
-    Ok(Guard { _file: file })
+    Ok(Guard {
+        project_dir: store.project_dir().into(),
+        epoch: Some(epoch.clone()),
+        active: false,
+        _file: file,
+    })
 }
 
 /// Verify the original freeze checkpoint before the first permanent sensitive
@@ -530,11 +549,21 @@ pub(crate) fn archive_guard(store: &CollaborationStore) -> Result<Guard, Authori
             return Err(AuthorityError::Invalid("lost witness".into()));
         }
         // First installation must wait for already admitted reclamation.
-        return Ok(Guard { _file: file });
+        return Ok(Guard {
+            project_dir: store.project_dir().into(),
+            epoch: None,
+            active: false,
+            _file: file,
+        });
     }
     let w = read(&path)?;
     matching(store.read_connection(), &w, &w.epoch)?;
-    Ok(Guard { _file: file })
+    Ok(Guard {
+        project_dir: store.project_dir().into(),
+        epoch: Some(w.epoch),
+        active: true,
+        _file: file,
+    })
 }
 
 /// An unverified historical observation. It grants no budget settlement,

@@ -255,60 +255,80 @@ pub(super) fn drive_until(
         wave::Admission::Frozen(w) | wave::Admission::Existing(w) => w,
         other => return Ok(DriveResult::Waiting(other)),
     };
-    // Admission owns its authority guard while it drains and freezes under the
-    // notice-ingress barrier. Reacquire here before any execution-side reads or
-    // dispatch so a freeze between those phases fails closed without nesting a
-    // second shared authority lock beneath the ingress lock.
-    let _authority = target::authorize(store, owner)?;
-    if cancel.load(Ordering::SeqCst) || clock()? >= deadline_ms {
-        return Err(ControllerError::Mismatch);
-    }
-    let revision = RecordId::parse(&active.spec.revision).map_err(|_| ControllerError::Mismatch)?;
-    let pinned = target::load_revision(store, &revision)?;
-    if permit.policy().record()?.id().as_str() != pinned.spec.acceptance_policy
-        || policy.execution.harness != permit.policy().harness
-        || policy.execution.assertion_inventory != permit.policy().inventory
-        || policy.execution.verify != permit.policy().command
-        || policy.execution.profile.runtime_profile != executor.runtime().id()
-        || policy.execution.profile.verifier_image != permit.policy().image
-    {
-        return Err(ControllerError::Mismatch);
-    }
-    let existing: Option<(String, Vec<u8>)> = store
-        .read_connection()
-        .query_row(
-            "SELECT state,body FROM local_controller_runs WHERE wave=?1",
-            [active.id.as_str()],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .optional()?;
-    if let Some((state, body)) = existing {
-        let record = Record::decode(&body, &[&RUN_SCHEMA])
-            .map_err(|e| ControllerError::Canonical(e.to_string()))?;
-        let old: RunSpec = serde_json::from_value(
-            serde_json::from_slice::<serde_json::Value>(&body)?["spec"].clone(),
-        )?;
-        if record.canonical_bytes() != body
-            || old.wave != active.id.as_str()
-            || old.policy != *policy
+    // Revalidate and persist the dispatch record in one short, correctly
+    // ordered guard scope. The external native/build/verify/Git work below
+    // runs with no authority or archive flock held; each effect reacquires its
+    // own current-epoch guard through `check` and its operation API.
+    let spec = {
+        let archive_guard = archive_use(store)?;
+        let response_guard = crate::collaboration_sensitive::response_use(store)?;
+        let authority_guard = target::authorize(store, owner)?;
+        if cancel.load(Ordering::SeqCst) || clock()? >= deadline_ms {
+            return Err(ControllerError::Mismatch);
+        }
+        let revision =
+            RecordId::parse(&active.spec.revision).map_err(|_| ControllerError::Mismatch)?;
+        let pinned = target::load_revision_under_response(store, &revision, &response_guard)?;
+        if pinned.target != owner.target()
+            || pinned.issuer != owner.issuer()
+            || permit.policy().record()?.id().as_str() != pinned.spec.acceptance_policy
+            || policy.execution.harness != permit.policy().harness
+            || policy.execution.assertion_inventory != permit.policy().inventory
+            || policy.execution.verify != permit.policy().command
+            || policy.execution.profile.runtime_profile != executor.runtime().id()
+            || policy.execution.profile.verifier_image != permit.policy().image
+            || target::status(store, owner.target())?.revision.as_ref() != Some(&revision)
         {
             return Err(ControllerError::Mismatch);
         }
-        return Err(ControllerError::DispatchHeld(state));
-    }
-    let spec = RunSpec {
-        target: owner.target().into(),
-        revision: revision.to_string(),
-        epoch: owner.authority_epoch().as_str().into(),
-        wave: active.id.to_string(),
-        policy: policy.clone(),
-        deadline_ms,
+        let existing: Option<(String, Vec<u8>)> = store
+            .read_connection()
+            .query_row(
+                "SELECT state,body FROM local_controller_runs WHERE wave=?1",
+                [active.id.as_str()],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        if let Some((state, body)) = existing {
+            let record = Record::decode(&body, &[&RUN_SCHEMA])
+                .map_err(|e| ControllerError::Canonical(e.to_string()))?;
+            let old: RunSpec = serde_json::from_value(
+                serde_json::from_slice::<serde_json::Value>(&body)?["spec"].clone(),
+            )?;
+            if record.canonical_bytes() != body
+                || old.wave != active.id.as_str()
+                || old.policy != *policy
+            {
+                return Err(ControllerError::Mismatch);
+            }
+            return Err(ControllerError::DispatchHeld(state));
+        }
+        let spec = RunSpec {
+            target: owner.target().into(),
+            revision: revision.to_string(),
+            epoch: owner.authority_epoch().as_str().into(),
+            wave: active.id.to_string(),
+            policy: policy.clone(),
+            deadline_ms,
+        };
+        let record = canonical(&spec)?;
+        let object = archive::put_object(store, &record.canonical_bytes())?;
+        target::retain_artifacts_under_guards(
+            store,
+            owner,
+            &revision,
+            &[],
+            &[object],
+            &archive_guard,
+            &response_guard,
+            &authority_guard,
+        )?;
+        store.connection().execute(
+            "INSERT INTO local_controller_runs(wave,id,epoch,state,body) VALUES(?1,?2,?3,'dispatching',?4)",
+            params![active.id.as_str(), record.id().as_str(), spec.epoch, record.canonical_bytes()],
+        )?;
+        spec
     };
-    let record = canonical(&spec)?;
-    let _archive = archive_use(store)?;
-    let object = archive::put_object(store, &record.canonical_bytes())?;
-    target::retain_artifacts(store, owner, &revision, &[], &[object])?;
-    store.connection().execute("INSERT INTO local_controller_runs(wave,id,epoch,state,body) VALUES(?1,?2,?3,'dispatching',?4)",params![active.id.as_str(),record.id().as_str(),spec.epoch,record.canonical_bytes()])?;
     let result = run(
         store,
         owner,

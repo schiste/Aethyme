@@ -344,10 +344,31 @@ pub(crate) fn authorize(
     store: &CollaborationStore,
     owner: &ControllerOwner,
 ) -> Result<crate::local_authority::Guard, TargetError> {
+    validate_owner_project(store, owner)?;
+    let guard = crate::local_authority::guard(store, &owner.epoch)?;
+    validate_owner_issuer(store, owner)?;
+    Ok(guard)
+}
+
+fn validate_owner(store: &CollaborationStore, owner: &ControllerOwner) -> Result<(), TargetError> {
+    validate_owner_project(store, owner)?;
+    validate_owner_issuer(store, owner)
+}
+
+fn validate_owner_project(
+    store: &CollaborationStore,
+    owner: &ControllerOwner,
+) -> Result<(), TargetError> {
     if store.project_dir() != owner.project_dir {
         return Err(TargetError::Unauthorized);
     }
-    let guard = crate::local_authority::guard(store, &owner.epoch)?;
+    Ok(())
+}
+
+fn validate_owner_issuer(
+    store: &CollaborationStore,
+    owner: &ControllerOwner,
+) -> Result<(), TargetError> {
     let issuer: Option<String> = store
         .read_connection()
         .query_row(
@@ -359,7 +380,7 @@ pub(crate) fn authorize(
     if issuer.as_deref() != Some(owner.issuer.as_str()) {
         return Err(TargetError::Unauthorized);
     }
-    Ok(guard)
+    Ok(())
 }
 
 fn normalize(mut spec: TargetSpec) -> Result<TargetSpec, TargetError> {
@@ -528,6 +549,19 @@ pub fn load_revision(
     id: &RecordId,
 ) -> Result<TargetRevision, TargetError> {
     let _response = crate::collaboration_sensitive::response_use(store)?;
+    load_revision_under_response(store, id, &_response)
+}
+
+/// Read a revision while the caller already holds the response-use barrier.
+/// This avoids reopening a content barrier underneath a higher-level guard.
+pub(crate) fn load_revision_under_response(
+    store: &CollaborationStore,
+    id: &RecordId,
+    response: &crate::collaboration_sensitive::ResponseUse,
+) -> Result<TargetRevision, TargetError> {
+    if !response.covers(store) {
+        return Err(TargetError::Unauthorized);
+    }
     let (target, body): (String, Vec<u8>) = store
         .read_connection()
         .query_row(
@@ -725,12 +759,70 @@ pub fn retain_artifacts(
     snapshots: &[SourceSnapshotId],
     objects: &[ObjectDigest],
 ) -> Result<(), TargetError> {
-    let _authority = authorize(store, owner)?;
-    let revision = load_revision(store, id)?;
+    // Retention touches both archive objects and revision content. Keep the
+    // shared guards in the documented archive -> response -> authority order.
+    let archive_guard = archive_use(store)?;
+    let response_guard = crate::collaboration_sensitive::response_use(store)?;
+    let authority_guard = authorize(store, owner)?;
+    retain_artifacts_under_guards(
+        store,
+        owner,
+        id,
+        snapshots,
+        objects,
+        &archive_guard,
+        &response_guard,
+        &authority_guard,
+    )
+}
+
+struct ArtifactRetentionPermit<'a> {
+    _archive: &'a crate::collaboration_gc::ArchiveUse,
+    response: &'a crate::collaboration_sensitive::ResponseUse,
+    _authority: &'a crate::local_authority::Guard,
+}
+
+impl<'a> ArtifactRetentionPermit<'a> {
+    fn new(
+        store: &CollaborationStore,
+        owner: &ControllerOwner,
+        archive: &'a crate::collaboration_gc::ArchiveUse,
+        response: &'a crate::collaboration_sensitive::ResponseUse,
+        authority: &'a crate::local_authority::Guard,
+    ) -> Result<Self, TargetError> {
+        if !archive.covers(store)
+            || !response.covers(store)
+            || !authority.covers_active(store, &owner.epoch)
+        {
+            return Err(TargetError::Unauthorized);
+        }
+        validate_owner(store, owner)?;
+        Ok(Self {
+            _archive: archive,
+            response,
+            _authority: authority,
+        })
+    }
+}
+
+/// Attach artifacts when the caller already owns all three shared guards in
+/// archive -> response -> authority order. The guard arguments make the lock
+/// lifetime explicit and avoid recursively opening the archive flock.
+pub(crate) fn retain_artifacts_under_guards(
+    store: &mut CollaborationStore,
+    owner: &ControllerOwner,
+    id: &RecordId,
+    snapshots: &[SourceSnapshotId],
+    objects: &[ObjectDigest],
+    _archive: &crate::collaboration_gc::ArchiveUse,
+    response: &crate::collaboration_sensitive::ResponseUse,
+    _authority: &crate::local_authority::Guard,
+) -> Result<(), TargetError> {
+    let permit = ArtifactRetentionPermit::new(store, owner, _archive, response, _authority)?;
+    let revision = load_revision_under_response(store, id, permit.response)?;
     if revision.target != owner.target {
         return Err(TargetError::Unauthorized);
     }
-    let _archive = archive_use(store)?;
     for snapshot in snapshots {
         require_snapshot(store, snapshot.as_str())?;
     }

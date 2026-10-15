@@ -170,6 +170,12 @@ impl std::fmt::Debug for ResponseUse {
     }
 }
 
+impl ResponseUse {
+    pub(crate) fn covers(&self, store: &CollaborationStore) -> bool {
+        self.path == lock_path(store)
+    }
+}
+
 impl Drop for ResponseUse {
     fn drop(&mut self) {
         let last = self.state.count.get() == 1;
