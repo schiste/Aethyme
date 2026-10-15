@@ -79,10 +79,17 @@ invoked with explicit hash acknowledgements. Trial output must be outside the
 repository and in a new, empty directory.
 
 The candidate profile keeps deny-default, process-fork, network, and
-file-write denials. Its system bootstrap reads are limited to the root
-directory entry, the exact `/bin/sh` and `/bin/bash` executables, metadata for
-the exact `/private/var/select/sh` selector, the system library and `/usr/lib`
-trees, locale data, and the exact macOS dyld cache directory at
+file-write denials. Each sandboxed subject starts with `/` as its working
+directory. Attempt 003 showed that Bash's startup `getcwd` check could not
+traverse the hidden ancestors of the inherited private candidate directory
+and added a diagnostic to stderr. The root directory entry is already
+allowed, so the runner now uses `/` without adding profile access. The
+candidate script stays in a private `0700` directory as a `0400` file, and
+only its exact absolute path is allowlisted. The profile's system bootstrap
+reads remain limited to the root directory entry, the exact `/bin/sh` and
+`/bin/bash` executables, metadata for the exact `/private/var/select/sh`
+selector, the system library and `/usr/lib` trees, locale data, and the exact
+macOS dyld cache directory at
 `/System/Volumes/Preboot/Cryptexes/OS/System/Library/dyld`. On this host, the
 system selector resolves `/bin/sh` to `/bin/bash`; both exact executables are
 therefore permitted as the shell bootstrap chain. The candidate app file is

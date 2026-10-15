@@ -34,7 +34,7 @@ TOKEN_MAX = 32768
 CODEX_BIN = Path("/Users/christophehenner/.local/lib/node_modules/@openai/codex/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/bin/codex")
 CODEX_VERSION = "0.162.1"
 CODEX_SHA256 = "74c6a6d263f40d65f99c27a815275f5b4ed0bcc2baecc396b4cf3255498bdfc0"
-RUNTIME_CORRECTION_SHA256 = "96b0346c554d2c87513eedda8880a1ddfee870322b10fa943b6ca65bf5df7590"
+RUNTIME_CORRECTION_SHA256 = "09b9aec0d11989a8602531351851aec7e32248bf02ce9833e6510220f4a9737f"
 SUBJECT_STDOUT_MAX = 1024 * 1024
 SUBJECT_STDERR_MAX = 1024 * 1024
 MODEL_STDOUT_MAX = 8 * 1024 * 1024
@@ -984,7 +984,10 @@ def _run_subject(source, argv, timeout=2):
         profile = SUBJECT_PROFILE.replace("__FX17_SUBJECT_APP__", app_text)
         cmd = ["/usr/bin/sandbox-exec", "-p", profile,
                "/bin/sh", app_text, *args]
-        proc = subprocess.Popen(cmd, cwd=tmp,
+        # On this host /bin/sh selects Bash; inheriting this private temp cwd
+        # made its startup getcwd traverse denied ancestors and emit stderr.
+        # The root directory entry is already allowed by the subject profile.
+        proc = subprocess.Popen(cmd, cwd="/",
                                 env={"LC_ALL": "C", "PATH": "/usr/bin:/bin"},
                                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE, start_new_session=True,
