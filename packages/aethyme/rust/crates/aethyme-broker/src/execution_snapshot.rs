@@ -136,6 +136,8 @@ pub enum SnapshotError {
     #[error(transparent)]
     Target(#[from] target::TargetError),
     #[error(transparent)]
+    Sensitive(#[from] crate::collaboration_sensitive::SensitiveError),
+    #[error(transparent)]
     Archive(#[from] archive::ArchiveError),
     #[error(transparent)]
     Io(#[from] std::io::Error),
@@ -319,6 +321,7 @@ pub fn load(
     locator: &SnapshotRef,
 ) -> Result<ExecutionSnapshot, SnapshotError> {
     let _archive = crate::collaboration_gc::archive_use(store)?;
+    let _response = crate::collaboration_sensitive::response_use(store)?;
     let path = archive::object_path(store, &locator.object);
     if std::fs::metadata(path)?.len() > 1024 * 1024 {
         return Err(SnapshotError::Limit);
