@@ -3567,15 +3567,26 @@ mod tests {
                 && residual.path == format!("views/{view}/")
                 && residual.resolved_ms.is_none()
         }));
-        assert!(refused.status.items.iter().all(|item| {
-            !item.path.starts_with(&format!("views/{view}/"))
-                || item.state != "deleted"
-                || item.path
-                    == format!(
-                        "views/{view}/holds/{}.json",
-                        hold_filename("t56-pin-control-holder")
-                    )
-        }));
+        let view_item_states = refused
+            .status
+            .items
+            .iter()
+            .filter(|item| item.path.starts_with(&format!("views/{view}/")))
+            .map(|item| format!("{}={}", item.path, item.state))
+            .collect::<Vec<_>>();
+        assert!(
+            refused.status.items.iter().all(|item| {
+                !item.path.starts_with(&format!("views/{view}/"))
+                    || item.state != "deleted"
+                    || item.path
+                        == format!(
+                            "views/{view}/holds/{}",
+                            hold_filename("t56-pin-control-holder")
+                        )
+            }),
+            "view item states after refusal: {view_item_states:?}; residuals: {:?}",
+            refused.status.residuals
+        );
         assert_eq!(
             view_snapshot_except_path(store, &view, excluded_relative),
             after_mutation
@@ -4076,7 +4087,32 @@ mod tests {
 
         let resumed = purge(store, &incident_id, &quarantined.request_digest).unwrap();
         assert!(!resumed.completed);
-        assert!(resumed.status.managed_cleanup_complete);
+        let pending_items = resumed
+            .status
+            .items
+            .iter()
+            .filter(|item| item.state != "deleted")
+            .map(|item| format!("{}={}", item.path, item.state))
+            .collect::<Vec<_>>();
+        let unclassified_residuals = resumed
+            .status
+            .residuals
+            .iter()
+            .filter(|residual| residual.permanence == "unclassified")
+            .map(|residual| format!("{}:{}", residual.code, residual.path))
+            .collect::<Vec<_>>();
+        let uncleared_tables = resumed
+            .status
+            .database_tables
+            .iter()
+            .filter(|table| table.state != "cleared")
+            .map(|table| format!("{}={}", table.table, table.state))
+            .collect::<Vec<_>>();
+        assert!(
+            resumed.status.managed_cleanup_complete,
+            "managed cleanup incomplete: pending_items={pending_items:?}, unclassified={unclassified_residuals:?}, uncleared_tables={uncleared_tables:?}, cleanup_receipt={:?}",
+            resumed.status.database_cleanup_completed_ms
+        );
         assert!(!store.project_dir().join("views").join(&view).exists());
         assert!(!store.project_dir().join("views").exists());
         assert!(
@@ -4429,7 +4465,28 @@ mod tests {
             .unwrap();
         let first_purge = purge(store, &incident_id, &quarantined.request_digest).unwrap();
         assert!(!first_purge.completed);
-        assert!(!generation_root.exists());
+        assert!(
+            !generation_root.exists(),
+            "retained generated source root {}; generation inventory states: {:?}; unclassified residuals: {:?}",
+            generation_root
+                .strip_prefix(&project_dir)
+                .unwrap_or(&generation_root)
+                .display(),
+            first_purge
+                .status
+                .items
+                .iter()
+                .filter(|item| item.path.starts_with("generations/"))
+                .map(|item| format!("{}={}", item.path, item.state))
+                .collect::<Vec<_>>(),
+            first_purge
+                .status
+                .residuals
+                .iter()
+                .filter(|residual| residual.permanence == "unclassified")
+                .map(|residual| format!("{}:{}", residual.code, residual.path))
+                .collect::<Vec<_>>()
+        );
         assert!(!rehearsed_root.exists());
         assert!(host_root.exists());
         assert!(project_dir.join("views").join(&view).exists());
