@@ -274,14 +274,20 @@ pub fn load(store: &CollaborationStore, wave: &RecordId) -> Result<Wave, WaveErr
         return Err(WaveError::Invalid("wave authorization or scope".into()));
     }
     if let Some(key) = &spec.prior_completion {
-        let (completion, previous) = previous(store, &id(key)?, spec.sequence)?;
+        let (completion, previous) = accepted_completion(store, &id(key)?, spec.sequence)?;
+        let same_revision = completion.revision == spec.revision;
+        let baseline_matches = if same_revision {
+            completion.source == spec.baseline
+        } else {
+            completion.source == pinned.spec.baseline && spec.baseline == pinned.spec.baseline
+        };
         if completion.target != spec.target
-            || completion.revision != spec.revision
-            || completion.source != spec.baseline
-            || previous
-                .selected
-                .iter()
-                .any(|member| !spec.selected.contains(member))
+            || !baseline_matches
+            || (same_revision
+                && previous
+                    .selected
+                    .iter()
+                    .any(|member| !spec.selected.contains(member)))
         {
             return Err(WaveError::Invalid(
                 "prior acceptance baseline or cumulative selection".into(),
@@ -301,37 +307,106 @@ pub fn load(store: &CollaborationStore, wave: &RecordId) -> Result<Wave, WaveErr
     })
 }
 
-pub(crate) fn previous(
+struct AcceptedCompletionRow {
+    body: Vec<u8>,
+    phase: String,
+    detail: Option<String>,
+    sequence: i64,
+    target: String,
+    revision: String,
+    candidate: Option<String>,
+    commit: Option<String>,
+}
+
+/// Load a canonical private completion and its accepted wave. Cross-revision
+/// callers must additionally bind the completion's source to the new
+/// revision's explicitly selected baseline before using its commit as history.
+pub(crate) fn accepted_completion(
     store: &CollaborationStore,
     key: &RecordId,
     sequence: i64,
 ) -> Result<(crate::local_controller::CompletionSpec, WaveSpec), WaveError> {
     let completion =
         crate::local_controller::load(store, key).map_err(|e| WaveError::Invalid(e.to_string()))?;
-    let (body, phase, detail, old_sequence): (Vec<u8>, String, Option<String>, i64) =
-        store.read_connection().query_row(
-            "SELECT body,phase,detail,sequence FROM local_waves WHERE wave=?1",
-            [completion.wave.as_str()],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-        )?;
+    let row: AcceptedCompletionRow = store.read_connection().query_row(
+        "SELECT body,phase,detail,sequence,target,revision,candidate_snapshot,candidate_commit FROM local_waves WHERE wave=?1",
+        [completion.wave.as_str()],
+        |r| {
+            Ok(AcceptedCompletionRow {
+                body: r.get(0)?,
+                phase: r.get(1)?,
+                detail: r.get(2)?,
+                sequence: r.get(3)?,
+                target: r.get(4)?,
+                revision: r.get(5)?,
+                candidate: r.get(6)?,
+                commit: r.get(7)?,
+            })
+        },
+    )?;
     let record =
-        Record::decode(&body, &[&SCHEMA]).map_err(|e| WaveError::Invalid(e.to_string()))?;
+        Record::decode(&row.body, &[&SCHEMA]).map_err(|e| WaveError::Invalid(e.to_string()))?;
     let spec: WaveSpec = serde_json::from_value(
-        serde_json::from_slice::<serde_json::Value>(&body)?["spec"].clone(),
+        serde_json::from_slice::<serde_json::Value>(&row.body)?["spec"].clone(),
     )?;
     if record.id().as_str() != completion.wave
-        || record.canonical_bytes() != body
-        || phase != "accepted"
-        || detail.as_deref() != Some(key.as_str())
-        || old_sequence != spec.sequence
-        || old_sequence <= 0
-        || old_sequence >= sequence
+        || record.canonical_bytes() != row.body
+        || row.phase != "accepted"
+        || row.detail.as_deref() != Some(key.as_str())
+        || row.sequence != spec.sequence
+        || row.sequence <= 0
+        || row.sequence >= sequence
+        || row.target != completion.target
+        || row.revision != completion.revision
         || spec.target != completion.target
         || spec.revision != completion.revision
+        || row.candidate.as_deref() != Some(completion.source.as_str())
+        || row.commit.as_deref() != Some(completion.candidate_commit.as_str())
+        || completion.accepted_tree != completion.candidate_tree
     {
         return Err(WaveError::Invalid("prior proof-bound accepted wave".into()));
     }
     Ok((completion, spec))
+}
+
+/// Find the newest canonical accepted completion for this target and exact
+/// epoch. The sequence and record ID ordering make repeated source snapshots
+/// resolve deterministically; the source comparison is still exact.
+pub(crate) fn latest_completion_for(
+    store: &CollaborationStore,
+    target: &str,
+    epoch: &str,
+    revision: Option<&str>,
+    source: Option<&str>,
+) -> Result<Option<RecordId>, WaveError> {
+    if revision.is_some() == source.is_some() {
+        return Err(WaveError::Invalid(
+            "completion lookup requires exactly one revision or source binding".into(),
+        ));
+    }
+    let ids: Vec<String> = store
+        .read_connection()
+        .prepare(
+            "SELECT c.id FROM local_controller_completions c JOIN local_waves w ON w.wave=c.wave WHERE c.target=?1 ORDER BY w.sequence DESC,c.id DESC",
+        )?
+        .query_map([target], |row| row.get(0))?
+        .collect::<Result<_, _>>()?;
+    for raw_id in ids {
+        let key = id(&raw_id)?;
+        let (completion, _) = accepted_completion(store, &key, i64::MAX)?;
+        if completion.target != target || completion.epoch != epoch {
+            continue;
+        }
+        let matches = match (revision, source) {
+            (Some(revision), None) => completion.revision == revision,
+            (None, Some(source)) => completion.source == source,
+            _ => unreachable!("lookup mode validated above"),
+        };
+        if matches {
+            return Ok(Some(key));
+        }
+    }
+    Ok(None)
 }
 
 fn admission_phase(
@@ -519,11 +594,30 @@ pub fn admit(
             }
         }
     }
-    let prior_completion:Option<String>=store.read_connection().query_row(
-        "SELECT c.id FROM local_controller_completions c JOIN local_waves w ON w.wave=c.wave WHERE c.target=?1 AND c.revision=?2 ORDER BY w.sequence DESC LIMIT 1",params![owner.target(),revision.as_str()],|r|r.get(0)).optional()?;
+    let same_revision_completion = latest_completion_for(
+        store,
+        owner.target(),
+        owner.authority_epoch().as_str(),
+        Some(revision.as_str()),
+        None,
+    )?;
+    let prior_completion = match same_revision_completion {
+        Some(key) => Some(key),
+        None => latest_completion_for(
+            store,
+            owner.target(),
+            owner.authority_epoch().as_str(),
+            None,
+            Some(&pinned.spec.baseline),
+        )?,
+    };
     if let Some(key) = &prior_completion {
-        let (completion, previous) = previous(store, &id(key)?, i64::MAX)?;
-        if completion.target != owner.target() || completion.revision != revision.as_str() {
+        let (completion, previous) = accepted_completion(store, key, i64::MAX)?;
+        let same_revision = completion.revision == revision.as_str();
+        if completion.target != owner.target()
+            || completion.epoch != owner.authority_epoch().as_str()
+            || (!same_revision && completion.source != pinned.spec.baseline)
+        {
             return Err(WaveError::Stale);
         }
         let delivered: Vec<_> = dispositions
@@ -531,14 +625,20 @@ pub fn admit(
             .filter(|(_, d)| **d == target::Disposition::Delivered)
             .map(|(c, _)| c.clone())
             .collect();
-        if delivered.iter().any(|c| !previous.selected.contains(c))
-            || previous.selected.iter().any(|c| !delivered.contains(c))
-        {
+        if same_revision {
+            if delivered.iter().any(|c| !previous.selected.contains(c))
+                || previous.selected.iter().any(|c| !delivered.contains(c))
+            {
+                return Err(WaveError::Invalid(
+                    "delivered members do not match prior accepted wave".into(),
+                ));
+            }
+            selected.extend(delivered);
+        } else if !delivered.is_empty() {
             return Err(WaveError::Invalid(
-                "delivered members do not match prior accepted wave".into(),
+                "new revision cannot inherit delivered contribution identities".into(),
             ));
         }
-        selected.extend(delivered);
     } else if dispositions
         .values()
         .any(|d| *d == target::Disposition::Delivered)
@@ -554,6 +654,7 @@ pub fn admit(
             "cumulative selection exceeds finite allowance".into(),
         ));
     }
+    let prior_completion = prior_completion.map(|key| key.to_string());
     let next_baseline = prior_completion
         .as_ref()
         .map(|key| {
@@ -673,6 +774,34 @@ pub fn compose(
     let pinned = target::load_revision(store, &id(&wave.spec.revision)?)?;
     let baseline =
         archive::retained(store, &snapshot(&wave.spec.baseline)?)?.ok_or(TargetError::Missing)?;
+    let (base_commit, accepted, already_delivered) = if let Some(key) = &wave.spec.prior_completion
+    {
+        let (completion, prior) = accepted_completion(store, &id(key)?, wave.spec.sequence)?;
+        if completion.target != owner.target()
+            || completion.epoch != owner.authority_epoch().as_str()
+        {
+            return Err(WaveError::Stale);
+        }
+        let original = archive::retained(store, &snapshot(&pinned.spec.baseline)?)?
+            .ok_or(TargetError::Missing)?;
+        let members = if completion.revision == wave.spec.revision {
+            prior.selected
+        } else {
+            Vec::new()
+        };
+        let accepted = if completion.revision == wave.spec.revision {
+            vec![original.commit]
+        } else {
+            Vec::new()
+        };
+        (
+            CommitOid::parse(&completion.accepted_commit)?,
+            accepted,
+            Some((id(key)?, members)),
+        )
+    } else {
+        (baseline.commit, vec![], None)
+    };
     let tx = store
         .connection()
         .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -689,19 +818,6 @@ pub fn compose(
     }
     tx.commit()?;
     let started = std::time::Instant::now();
-    let (base_commit, accepted, already_delivered) = if let Some(key) = &wave.spec.prior_completion
-    {
-        let (completion, prior) = previous(store, &id(key)?, wave.spec.sequence)?;
-        let original = archive::retained(store, &snapshot(&pinned.spec.baseline)?)?
-            .ok_or(TargetError::Missing)?;
-        (
-            CommitOid::parse(&completion.accepted_commit)?,
-            vec![original.commit],
-            Some((id(key)?, prior.selected)),
-        )
-    } else {
-        (baseline.commit, vec![], None)
-    };
     let request = CompositionRequest {
         baseline: base_commit,
         accepted,

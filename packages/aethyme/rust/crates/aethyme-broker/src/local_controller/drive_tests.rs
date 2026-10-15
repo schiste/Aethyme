@@ -1,4 +1,5 @@
 use super::*;
+use crate::collaboration_archive::CommitOid;
 use crate::execution_snapshot::{CommandSpec, LinuxProfile, ResourceLimits};
 use crate::execution_verifier::{AssertionCase, AssertionInventory, VerifierPolicy};
 use crate::local_target::tests::{Fixture, git};
@@ -31,6 +32,564 @@ fn spec() -> RunSpec {
         deadline_ms: 300000,
     }
 }
+
+fn seed_private_completion(
+    f: &mut Fixture,
+    owner: &ControllerOwner,
+    completed_wave: &wave::Wave,
+    accepted_commit: &CommitOid,
+    epoch: &str,
+) -> CompletionSpec {
+    let candidate = completed_wave.candidate_commit.as_ref().unwrap();
+    let source = completed_wave.candidate_snapshot.as_ref().unwrap();
+    let tree = archive::raw_commit_tree(f._repo.path(), candidate).unwrap();
+    let completion = CompletionSpec {
+        target: owner.target().into(),
+        revision: completed_wave.spec.revision.clone(),
+        epoch: epoch.into(),
+        wave: completed_wave.id.to_string(),
+        source: source.to_string(),
+        candidate_commit: candidate.as_str().into(),
+        candidate_tree: tree.clone(),
+        qualification: digest(b"fixture qualification"),
+        acceptance_receipt: digest(b"fixture acceptance receipt"),
+        accepted_commit: accepted_commit.as_str().into(),
+        accepted_tree: tree,
+    };
+    let record = completion.record().unwrap();
+    let connection = f.store.connection();
+    connection
+        .execute(
+            "UPDATE local_waves SET phase='accepted',detail=?2 WHERE wave=?1 AND phase='verifying'",
+            rusqlite::params![completed_wave.id.as_str(), record.id().as_str()],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE local_targets SET phase='publication_confirmed',resume_phase=NULL,version=version+1 WHERE target=?1 AND active_revision=?2",
+            rusqlite::params![owner.target(), completed_wave.spec.revision],
+        )
+        .unwrap();
+    for member in &completed_wave.spec.selected {
+        connection
+            .execute(
+                "UPDATE local_target_dispositions SET status='delivered',detail=?3 WHERE revision=?1 AND contribution=?2 AND status='in_wave'",
+                rusqlite::params![completed_wave.spec.revision, member, record.id().as_str()],
+            )
+            .unwrap();
+    }
+    connection
+        .execute(
+            "INSERT INTO local_controller_completions(id,wave,revision,target,body) VALUES(?1,?2,?3,?4,?5)",
+            rusqlite::params![
+                record.id().as_str(),
+                completed_wave.id.as_str(),
+                completion.revision,
+                completion.target,
+                record.canonical_bytes(),
+            ],
+        )
+        .unwrap();
+    completion
+}
+
+fn attach_prior_completion(
+    f: &mut Fixture,
+    admitted: &wave::Wave,
+    completion: &CompletionSpec,
+) -> RecordId {
+    use aethyme_contracts::experimental_v0::{FieldKind, FieldSpec, Record, RecordSchema};
+
+    static WAVE_SCHEMA: RecordSchema = RecordSchema {
+        name: "aethyme.local-wave/provisional-v0",
+        fields: &[FieldSpec {
+            name: "spec",
+            required: true,
+            kind: FieldKind::Opaque,
+            capability: None,
+        }],
+        capabilities: &[],
+    };
+
+    let mut spec = admitted.spec.clone();
+    spec.prior_completion = Some(completion.record().unwrap().id().to_string());
+    let record = Record::decode(
+        &serde_json::to_vec(&json!({"schema":WAVE_SCHEMA.name,"spec":spec})).unwrap(),
+        &[&WAVE_SCHEMA],
+    )
+    .unwrap();
+    let id = record.id();
+    let changed = f
+        .store
+        .connection()
+        .execute(
+            "UPDATE local_waves SET wave=?2,body=?3 WHERE wave=?1 AND phase='frozen'",
+            rusqlite::params![admitted.id.as_str(), id.as_str(), record.canonical_bytes()],
+        )
+        .unwrap();
+    assert_eq!(changed, 1);
+    id
+}
+
+fn feature_b_based_on(
+    f: &mut Fixture,
+    base: &CommitOid,
+) -> crate::collaboration_archive::RetainedContribution {
+    git(
+        f._repo.path(),
+        &["checkout", "-q", "--detach", base.as_str()],
+    );
+    std::fs::write(f._repo.path().join("two.txt"), "B\n").unwrap();
+    git(f._repo.path(), &["add", "two.txt"]);
+    git(
+        f._repo.path(),
+        &["commit", "-qm", "B based on accepted source"],
+    );
+    let result = archive::pin_commit(f._repo.path(), "HEAD").unwrap();
+    let retained =
+        archive::retain_contribution(&mut f.store, f._repo.path(), base, &result).unwrap();
+    git(
+        f._repo.path(),
+        &["checkout", "-q", "--detach", base.as_str()],
+    );
+    retained
+}
+
+fn seed_same_source_completion(
+    f: &mut Fixture,
+    previous: &CompletionSpec,
+    accepted_commit: &CommitOid,
+) -> CompletionSpec {
+    use aethyme_contracts::experimental_v0::{FieldKind, FieldSpec, Record, RecordSchema};
+
+    static WAVE_SCHEMA: RecordSchema = RecordSchema {
+        name: "aethyme.local-wave/provisional-v0",
+        fields: &[FieldSpec {
+            name: "spec",
+            required: true,
+            kind: FieldKind::Opaque,
+            capability: None,
+        }],
+        capabilities: &[],
+    };
+
+    let prior_id = previous.record().unwrap().id();
+    let prior_wave_id = RecordId::parse(&previous.wave).unwrap();
+    let prior_wave = wave::load(&f.store, &prior_wave_id).unwrap();
+    let sequence = prior_wave.spec.sequence + 1;
+    let mut spec = prior_wave.spec.clone();
+    spec.sequence = sequence;
+    spec.baseline = previous.source.clone();
+    spec.prior_completion = Some(prior_id.to_string());
+    let wave_record = Record::decode(
+        &serde_json::to_vec(&json!({"schema":WAVE_SCHEMA.name,"spec":spec})).unwrap(),
+        &[&WAVE_SCHEMA],
+    )
+    .unwrap();
+    let wave_id = wave_record.id();
+    let mut completion = previous.clone();
+    completion.wave = wave_id.to_string();
+    completion.accepted_commit = accepted_commit.as_str().into();
+    let completion_record = completion.record().unwrap();
+    let connection = f.store.connection();
+    connection
+        .execute(
+            "INSERT INTO local_waves (wave,target,revision,sequence,body,phase,candidate_snapshot,candidate_commit,detail) VALUES (?1,?2,?3,?4,?5,'accepted',?6,?7,?8)",
+            rusqlite::params![
+                wave_id.as_str(),
+                completion.target,
+                completion.revision,
+                sequence,
+                wave_record.canonical_bytes(),
+                completion.source,
+                completion.candidate_commit,
+                completion_record.id().as_str(),
+            ],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO local_controller_completions(id,wave,revision,target,body) VALUES(?1,?2,?3,?4,?5)",
+            rusqlite::params![
+                completion_record.id().as_str(),
+                wave_id.as_str(),
+                completion.revision,
+                completion.target,
+                completion_record.canonical_bytes(),
+            ],
+        )
+        .unwrap();
+    completion
+}
+
+#[test]
+fn cross_revision_completion_anchor_binds_candidate_parent_and_publication_lease() {
+    let mut f = Fixture::new();
+    let owner = target::acquire_controller(&mut f.store, "cross-revision", "operator").unwrap();
+    let mut first_spec = f.spec();
+    first_spec.selected = vec!["A".into()];
+    let first_revision = target::propose_revision(&mut f.store, &owner, first_spec).unwrap();
+    target::select_revision(&mut f.store, &owner, &first_revision.id).unwrap();
+    wave::available(&mut f.store, &owner, "A", 0).unwrap();
+    let wave::Admission::Frozen(first_wave) =
+        wave::admit(&mut f.store, &owner, policy().wave_policy, 0).unwrap()
+    else {
+        panic!("first revision wave was not frozen")
+    };
+    let first_wave = wave::compose(&mut f.store, &owner, f._repo.path(), &first_wave.id).unwrap();
+    let first_candidate = first_wave.candidate_commit.as_ref().unwrap();
+    let first_tree = archive::raw_commit_tree(f._repo.path(), first_candidate).unwrap();
+    let accepted_commit = CommitOid::parse(&git(
+        f._repo.path(),
+        &[
+            "commit-tree",
+            &first_tree,
+            "-p",
+            first_candidate.as_str(),
+            "-m",
+            "fixture accepted source with distinct provenance",
+        ],
+    ))
+    .unwrap();
+    assert_ne!(accepted_commit, f.a.result.commit);
+    let first_completion = seed_private_completion(
+        &mut f,
+        &owner,
+        &first_wave,
+        &accepted_commit,
+        owner.authority_epoch().as_str(),
+    );
+
+    let latest_commit = CommitOid::parse(&git(
+        f._repo.path(),
+        &[
+            "commit-tree",
+            &first_tree,
+            "-p",
+            accepted_commit.as_str(),
+            "-m",
+            "fixture later acceptance of identical source",
+        ],
+    ))
+    .unwrap();
+    let latest_completion = seed_same_source_completion(&mut f, &first_completion, &latest_commit);
+    let latest_id = latest_completion.record().unwrap().id();
+    assert_eq!(
+        wave::latest_completion_for(
+            &f.store,
+            owner.target(),
+            owner.authority_epoch().as_str(),
+            None,
+            Some(&first_completion.source),
+        )
+        .unwrap(),
+        Some(latest_id.clone()),
+        "identical accepted source snapshots select the newest historical commit deterministically"
+    );
+
+    let state = target::status(&f.store, owner.target()).unwrap();
+    target::transition(&mut f.store, &owner, state.version, Phase::Idle).unwrap();
+    let latest_accepted = CommitOid::parse(&latest_completion.accepted_commit).unwrap();
+    let next_b = feature_b_based_on(&mut f, &latest_accepted);
+    let mut second_spec = f.spec();
+    second_spec.baseline = first_completion.source.clone();
+    second_spec.selected = vec!["B".into()];
+    second_spec
+        .contributions
+        .iter_mut()
+        .find(|contribution| contribution.id == "B")
+        .unwrap()
+        .lineage = next_b.lineage_record_id.to_string();
+    let second_revision = target::propose_revision(&mut f.store, &owner, second_spec).unwrap();
+    target::select_revision(&mut f.store, &owner, &second_revision.id).unwrap();
+    wave::available(&mut f.store, &owner, "B", 1).unwrap();
+    let wave::Admission::Frozen(second_wave) =
+        wave::admit(&mut f.store, &owner, policy().wave_policy, 1).unwrap()
+    else {
+        panic!("cross-revision wave was not frozen")
+    };
+    assert_eq!(
+        second_wave.spec.prior_completion.as_deref(),
+        Some(latest_id.as_str())
+    );
+    assert_eq!(second_wave.spec.baseline, first_completion.source);
+    let second_wave = wave::compose(&mut f.store, &owner, f._repo.path(), &second_wave.id).unwrap();
+    assert_eq!(
+        second_wave.phase,
+        wave::WavePhase::Verifying,
+        "cross-revision composition did not produce a candidate: {second_wave:#?}"
+    );
+    let candidate = second_wave.candidate_commit.as_ref().unwrap();
+    assert_eq!(
+        git(
+            f._repo.path(),
+            &["rev-parse", &format!("{}^", candidate.as_str())],
+        ),
+        latest_completion.accepted_commit,
+        "the candidate must descend from the actual latest accepted commit"
+    );
+    assert_eq!(
+        git(
+            f._repo.path(),
+            &["show", &format!("{}:one.txt", candidate.as_str())],
+        ),
+        "A"
+    );
+    assert_eq!(
+        git(
+            f._repo.path(),
+            &["show", &format!("{}:two.txt", candidate.as_str())],
+        ),
+        "B"
+    );
+    let recipe_bytes = archive::read_object(
+        &f.store,
+        &second_wave.recipe_object.as_ref().unwrap().clone(),
+    )
+    .unwrap();
+    let recipe: serde_json::Value = serde_json::from_slice(&recipe_bytes).unwrap();
+    assert_eq!(
+        recipe["accepted_baseline"]["completion"],
+        latest_id.as_str()
+    );
+    assert_eq!(recipe["accepted_baseline"]["members"], json!([]));
+
+    let status = target::status(&f.store, owner.target()).unwrap();
+    target::resume(&mut f.store, &owner, status.version).unwrap();
+    let mut broker = Broker::open(f._repo.path())
+        .unwrap()
+        .with_host_operation_database(f._host.path().join("operations.db"))
+        .with_worktree_root(f._host.path().join("worktrees"));
+    let native = native_gates::prepare(&mut f.store, &owner, &mut broker, &second_wave.id).unwrap();
+    assert_eq!(native.spec.base_commit, latest_completion.accepted_commit);
+
+    let remote = tempfile::tempdir().unwrap();
+    git(
+        remote.path(),
+        &["init", "--bare", "-q", "--initial-branch=accepted"],
+    );
+    git(
+        f._repo.path(),
+        &[
+            "remote",
+            "add",
+            "cross-revision-accepted",
+            remote.path().to_str().unwrap(),
+        ],
+    );
+    git(
+        f._repo.path(),
+        &[
+            "push",
+            "-q",
+            "cross-revision-accepted",
+            &format!("{}:refs/heads/accepted", latest_completion.accepted_commit),
+        ],
+    );
+    let session = broker
+        .adopt(
+            f._repo.path(),
+            Some("cross-revision accepted-baseline fixture"),
+        )
+        .unwrap();
+    let carrier = GitCarrier::new(
+        &mut broker,
+        session.id,
+        "cross-revision-accepted",
+        "refs/heads/accepted",
+        30,
+        "fixture authorizes one conditional local publication intent",
+        true,
+    )
+    .unwrap();
+    let expected_old = CommitOid::parse(&native.spec.base_commit).unwrap();
+    let mut wrong_epoch = native.spec.clone();
+    wrong_epoch.epoch = format!("sha256:{}", "f".repeat(64));
+    assert!(matches!(
+        crate::native_gates::validate_source(&f.store, f._repo.path(), &wrong_epoch),
+        Err(crate::native_gates::NativeGateError::Binding(
+            "accepted-baseline recipe differs from prior private completion"
+        ))
+    ));
+    let intent = transport::prepare(
+        &mut f.store,
+        &owner,
+        &carrier,
+        &second_wave.id,
+        &"a".repeat(64),
+        Some(&expected_old),
+    )
+    .unwrap();
+    assert_eq!(
+        intent.spec.expected_old.as_deref(),
+        Some(latest_completion.accepted_commit.as_str())
+    );
+}
+
+#[test]
+fn cross_revision_lookup_rejects_wrong_source_target_and_epoch() {
+    let mut f = Fixture::new();
+    let owner = target::acquire_controller(&mut f.store, "scope-filter", "operator").unwrap();
+    let mut selected = f.spec();
+    selected.selected = vec!["A".into()];
+    let revision = target::propose_revision(&mut f.store, &owner, selected).unwrap();
+    target::select_revision(&mut f.store, &owner, &revision.id).unwrap();
+    wave::available(&mut f.store, &owner, "A", 0).unwrap();
+    let wave::Admission::Frozen(first_wave) =
+        wave::admit(&mut f.store, &owner, policy().wave_policy, 0).unwrap()
+    else {
+        panic!("first revision wave was not frozen")
+    };
+    let first_wave = wave::compose(&mut f.store, &owner, f._repo.path(), &first_wave.id).unwrap();
+    let candidate = first_wave.candidate_commit.as_ref().unwrap();
+    let tree = archive::raw_commit_tree(f._repo.path(), candidate).unwrap();
+    let accepted = CommitOid::parse(&git(
+        f._repo.path(),
+        &[
+            "commit-tree",
+            &tree,
+            "-p",
+            candidate.as_str(),
+            "-m",
+            "scope fixture acceptance",
+        ],
+    ))
+    .unwrap();
+    let completion = seed_private_completion(
+        &mut f,
+        &owner,
+        &first_wave,
+        &accepted,
+        owner.authority_epoch().as_str(),
+    );
+
+    assert!(
+        wave::latest_completion_for(
+            &f.store,
+            owner.target(),
+            owner.authority_epoch().as_str(),
+            None,
+            Some(&completion.source),
+        )
+        .unwrap()
+        .is_some()
+    );
+    assert_eq!(
+        wave::latest_completion_for(
+            &f.store,
+            owner.target(),
+            owner.authority_epoch().as_str(),
+            None,
+            Some(&f.a.base.snapshot_id.to_string()),
+        )
+        .unwrap(),
+        None,
+        "content from a different source snapshot is not a historical baseline"
+    );
+    assert_eq!(
+        wave::latest_completion_for(
+            &f.store,
+            "another-target",
+            owner.authority_epoch().as_str(),
+            None,
+            Some(&completion.source),
+        )
+        .unwrap(),
+        None,
+        "another target's private completion is not authority here"
+    );
+    assert_eq!(
+        wave::latest_completion_for(
+            &f.store,
+            owner.target(),
+            &format!("sha256:{}", "f".repeat(64)),
+            None,
+            Some(&completion.source),
+        )
+        .unwrap(),
+        None,
+        "a prior authority epoch is not current authority"
+    );
+
+    let state = target::status(&f.store, owner.target()).unwrap();
+    target::transition(&mut f.store, &owner, state.version, Phase::Idle).unwrap();
+    let mut wrong_source = f.spec();
+    wrong_source.baseline = f.a.base.snapshot_id.to_string();
+    wrong_source.selected = vec!["B".into()];
+    let next = target::propose_revision(&mut f.store, &owner, wrong_source).unwrap();
+    target::select_revision(&mut f.store, &owner, &next.id).unwrap();
+    wave::available(&mut f.store, &owner, "B", 1).unwrap();
+    let wave::Admission::Frozen(next_wave) =
+        wave::admit(&mut f.store, &owner, policy().wave_policy, 1).unwrap()
+    else {
+        panic!("wrong-source revision wave was not frozen")
+    };
+    assert!(next_wave.spec.prior_completion.is_none());
+}
+
+#[test]
+fn cross_revision_stale_completion_epoch_is_rechecked_at_composition_and_completion_use() {
+    let mut f = Fixture::new();
+    let owner =
+        target::acquire_controller(&mut f.store, "stale-baseline-epoch", "operator").unwrap();
+    let mut first_spec = f.spec();
+    first_spec.selected = vec!["A".into()];
+    let first_revision = target::propose_revision(&mut f.store, &owner, first_spec).unwrap();
+    target::select_revision(&mut f.store, &owner, &first_revision.id).unwrap();
+    wave::available(&mut f.store, &owner, "A", 0).unwrap();
+    let wave::Admission::Frozen(first_wave) =
+        wave::admit(&mut f.store, &owner, policy().wave_policy, 0).unwrap()
+    else {
+        panic!("first revision wave was not frozen")
+    };
+    let first_wave = wave::compose(&mut f.store, &owner, f._repo.path(), &first_wave.id).unwrap();
+    let accepted = first_wave.candidate_commit.as_ref().unwrap().clone();
+    let old_epoch = format!("sha256:{}", "f".repeat(64));
+    let completion = seed_private_completion(&mut f, &owner, &first_wave, &accepted, &old_epoch);
+
+    let state = target::status(&f.store, owner.target()).unwrap();
+    target::transition(&mut f.store, &owner, state.version, Phase::Idle).unwrap();
+    let accepted_commit = CommitOid::parse(&completion.accepted_commit).unwrap();
+    let next_b = feature_b_based_on(&mut f, &accepted_commit);
+    let mut next_spec = f.spec();
+    next_spec.baseline = completion.source.clone();
+    next_spec.selected = vec!["B".into()];
+    next_spec
+        .contributions
+        .iter_mut()
+        .find(|contribution| contribution.id == "B")
+        .unwrap()
+        .lineage = next_b.lineage_record_id.to_string();
+    let next_revision = target::propose_revision(&mut f.store, &owner, next_spec).unwrap();
+    target::select_revision(&mut f.store, &owner, &next_revision.id).unwrap();
+    wave::available(&mut f.store, &owner, "B", 1).unwrap();
+    let wave::Admission::Frozen(admitted) =
+        wave::admit(&mut f.store, &owner, policy().wave_policy, 1).unwrap()
+    else {
+        panic!("new revision wave was not frozen")
+    };
+    assert!(
+        admitted.spec.prior_completion.is_none(),
+        "an old authority epoch cannot be selected as a current baseline"
+    );
+
+    let wave_id = attach_prior_completion(&mut f, &admitted, &completion);
+    let stale_wave = wave::load(&f.store, &wave_id).unwrap();
+    assert!(matches!(
+        completion_prior_members(&f.store, &stale_wave, owner.authority_epoch().as_str()),
+        Err(ControllerError::Mismatch)
+    ));
+    assert!(matches!(
+        wave::compose(&mut f.store, &owner, f._repo.path(), &wave_id),
+        Err(wave::WaveError::Stale)
+    ));
+    assert_eq!(
+        wave::load(&f.store, &wave_id).unwrap().phase,
+        wave::WavePhase::Frozen,
+        "composition rejects an epoch mismatch before recording a dispatch"
+    );
+}
+
 #[test]
 fn driver_configuration_is_finite_and_preparation_is_explicitly_refused() {
     let p = policy();
