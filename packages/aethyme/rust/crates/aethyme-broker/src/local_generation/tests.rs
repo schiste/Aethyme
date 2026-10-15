@@ -153,12 +153,6 @@ impl Fixture {
             _remote: remote,
         }
     }
-    pub(crate) fn preserve_roots(&mut self) -> (PathBuf, PathBuf, PathBuf) {
-        let (host, repository) = self.v.f.preserve_roots();
-        let remote = std::mem::replace(&mut self._remote, tempfile::tempdir().unwrap()).keep();
-        (host, repository, remote)
-    }
-
     pub(crate) fn root_paths(&self) -> (PathBuf, PathBuf, PathBuf) {
         (
             self.v.f._host.path().to_path_buf(),

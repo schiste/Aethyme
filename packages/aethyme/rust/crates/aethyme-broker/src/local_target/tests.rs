@@ -207,12 +207,6 @@ impl Fixture {
         }
     }
 
-    pub(crate) fn preserve_roots(&mut self) -> (PathBuf, PathBuf) {
-        let host = std::mem::replace(&mut self._host, tempfile::tempdir().unwrap()).keep();
-        let repository = std::mem::replace(&mut self._repo, tempfile::tempdir().unwrap()).keep();
-        (host, repository)
-    }
-
     pub(crate) fn spec(&self) -> TargetSpec {
         let requested = |id: &str, c: &RetainedContribution| RequestedContribution {
             id: id.into(),

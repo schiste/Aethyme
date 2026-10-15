@@ -3301,7 +3301,7 @@ mod tests {
             path: view_root.clone(),
             mode,
         };
-        std::fs::set_permissions(&view_root, std::fs::Permissions::from_mode(0)).unwrap();
+        std::fs::set_permissions(&view_root, std::fs::Permissions::from_mode(0o0)).unwrap();
         assert!(std::fs::read_dir(&view_root).is_err());
         let result = purge(store, &incident_id, &quarantined.request_digest);
         drop(restore_permissions);
@@ -3676,6 +3676,37 @@ mod tests {
             run_root.path(),
         );
         let prepared = fixture.prepare("t56-generation").unwrap();
+        // Generation preparation intentionally leaves this accepted fixture's
+        // controller wave in `verifying`. Complete that exact fixture wave via
+        // the supported controller path so the independent synthetic unknown
+        // job below is the only unresolved-work witness exercised by purge.
+        let binding =
+            crate::local_acceptance::load(&fixture.v.f.store, &fixture.binding).unwrap();
+        let intent_id = RecordId::parse(&binding.spec.intent).unwrap();
+        let intent =
+            crate::local_source_transport::load(&fixture.v.f.store, &intent_id).unwrap();
+        let wave_id = RecordId::parse(&intent.spec.wave).unwrap();
+        let completion_grant = crate::local_acceptance::qualify(
+            &mut fixture.v.f.store,
+            &fixture.v.owner,
+            &mut fixture.broker,
+            &fixture.carrier,
+            &fixture.binding,
+            &fixture.v.execution,
+            &fixture.v.artifact,
+            &fixture.v.permit,
+            &fixture.evidence,
+        )
+        .unwrap();
+        crate::local_controller::complete(
+            &mut fixture.v.f.store,
+            &fixture.v.owner,
+            &mut fixture.broker,
+            &fixture.carrier,
+            &wave_id,
+            &completion_grant,
+        )
+        .unwrap();
         let generation_root = prepared.absolute_root().to_path_buf();
         assert!(
             contains_bytes(

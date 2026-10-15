@@ -160,9 +160,6 @@ impl Subject {
     pub(crate) fn acceptance_fixture() -> Self {
         Self::with_max_age(60000)
     }
-    pub(crate) fn acceptance_fixture_with_source_marker(marker: &[u8]) -> Self {
-        Self::with_max_age_and_source_marker(60000, Some(marker))
-    }
     pub(crate) fn acceptance_fixture_with_source_marker_in(
         marker: &[u8],
         parent: &std::path::Path,
