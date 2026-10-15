@@ -725,3 +725,22 @@ fn actual_delayed_database_admission_refuses_dispatch_after_frozen_expiry() {
         "expired admission cannot start or complete execution"
     );
 }
+
+#[test]
+fn only_known_successful_publication_dispatch_can_reach_qualification() {
+    use crate::OperationStatus;
+    assert!(dispatch_succeeded(OperationStatus::Succeeded));
+    for outcome in [
+        OperationStatus::Prepared,
+        OperationStatus::Running,
+        OperationStatus::Failed,
+        OperationStatus::OutcomeUnknown,
+        OperationStatus::ReconciledSucceeded,
+        OperationStatus::ReconciledFailed,
+    ] {
+        assert!(
+            !dispatch_succeeded(outcome),
+            "fresh publication status {outcome:?} must hold regardless of later source availability"
+        );
+    }
+}
