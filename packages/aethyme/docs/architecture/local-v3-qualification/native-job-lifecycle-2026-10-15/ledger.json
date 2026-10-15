@@ -1,6 +1,6 @@
 {
   "schema": "aethyme.local-native-job-lifecycle/v1",
-  "recorded_at": "2026-10-15",
+  "recorded_at": "2026-10-15T13:20:31Z",
   "scope": "Explicit release of prepared/completed native-job roots, retention of dispatching/unknown jobs, and safe reopened status/GC behavior.",
   "artifact_roots": {
     "session_worktree": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/reconcile-retention-of-inactive-native-g",
@@ -43,9 +43,9 @@
     "--nocapture"
   ],
   "attempt_denominator": {
-    "local_native_gates_commands": 3,
-    "selected_slots": 45,
-    "returned_ok": 29,
+    "local_native_gates_commands": 4,
+    "selected_slots": 60,
+    "returned_ok": 35,
     "returned_assertion_failures": 1,
     "not_returned_before_termination": 1,
     "complete_passing_commands": 0,
@@ -56,7 +56,10 @@
     "ci_workspace_checks": 1,
     "ci_test_cases_passed": 4548,
     "ci_test_cases_failed": 9,
-    "ci_test_cases_skipped": 31
+    "ci_test_cases_skipped": 31,
+    "incomplete_commands_without_numeric_status": 1,
+    "unresolved_slots_from_incomplete_commands": 9,
+    "abandoned_attempts_without_numeric_status": 1
   },
   "attempts": [
     {
@@ -269,13 +272,72 @@
           "kind": "numeric status file; content 101 plus newline"
         }
       ]
+    },
+    {
+      "id": "local-native-gates-cached-serial-d524-offtree-no-final-status",
+      "source_commit": "27d1b2e9de6a3b09bb0dcf9bc598c22d8f39b52a",
+      "source_tree": "d0822c4484f37efdf90ff039fe6c13a08f293aa3",
+      "source_diff_sha256": "5cb3b142fb06fa39181a37496ad5ab84267b93c277980f40aca26cbf3688a94b",
+      "equivalent_rust_source_commit": "d524f3e695baa26a14302e68e3040fc61cef61d0",
+      "kind": "serial focused native-gates tests using cached binary; abandoned without final status",
+      "working_directory": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/reconcile-retention-of-inactive-native-g/packages/aethyme/rust",
+      "argv": [
+        "/usr/bin/caffeinate",
+        "-i",
+        "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/integrate-reviewed-local-bare-git-servic/target/local-resume/cargo/debug/deps/aethyme_broker-0f278e0d02146111",
+        "native_gates::tests",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "source_worktree_clean_before": false,
+      "source_worktree_clean_after": null,
+      "binary_sha256": "4b2376a7f628100d52b2b28d0f60511917c42a7d306a7eb88a6d4f599c8b6945",
+      "started_at_utc": "2026-10-15T11:16:55.344673+00:00",
+      "metadata_state_at_reconciliation": "running",
+      "numeric_exit": null,
+      "results": {
+        "selected": 15,
+        "observed_ok_lines": 6,
+        "final_failed": null,
+        "ignored": null,
+        "unresolved_without_result": 9
+      },
+      "final_status_present": false,
+      "credited": false,
+      "failure": "No matching test-binary process or open log writer remained at reconciliation. The preserved metadata still says running, the raw log ends during the ninth test, and no numeric status file exists. No exit code or complete-command result is inferred.",
+      "artifacts": [
+        {
+          "path": "target/local-resume/final-integration-20261015T111655Z/native-gates-cached-serial-d524-offtree-tmp-20261015.json",
+          "bytes": 1575,
+          "sha256": "8a5b5cf3d7680f78d58cfc0ffdaf187393620ca8c1729e57e3bb0b8960133f56",
+          "kind": "original recorder metadata, preserved unchanged"
+        },
+        {
+          "path": "target/local-resume/final-integration-20261015T111655Z/native-gates-cached-serial-d524-offtree-tmp-20261015.log",
+          "bytes": 1156,
+          "sha256": "4f1ad62cc55c2c0994e626607321cc764ea1025f274fc6ad621c12156dd2d30f",
+          "kind": "original partial raw test output, preserved unchanged"
+        },
+        {
+          "path": "target/local-resume/final-integration-20261015T111655Z/native-gates-cached-serial-d524-offtree-tmp-20261015-reconciliation.json",
+          "bytes": 3964,
+          "sha256": "b5b29e7edf4954c170fc222fb3354079720fdd5e81508f9c97f97c688f93dae7",
+          "kind": "separate abandoned-run ownership and status reconciliation"
+        }
+      ],
+      "missing_artifacts": [
+        {
+          "path": "target/local-resume/final-integration-20261015T111655Z/native-gates-cached-serial-d524-offtree-tmp-20261015.status",
+          "reason": "No status file was created before the recorder stopped."
+        }
+      ]
     }
   ],
   "pending_checks_as_of_record": [
     {
       "id": "cached-serial-native-gates",
-      "status": "failed environmental preflight; authorized rerun pending with TMPDIR outside all worktrees",
-      "scope": "All 15 native_gates tests from the exact d524 cached binary, serialized; prior attempt had TMPDIR inside the enclosing repository and is retained as a zero-credit failure."
+      "status": "prior nested-TMPDIR attempt failed before lifecycle assertions; later off-tree cached-binary retry was abandoned without final numeric status; clean rerun pending after source fixes",
+      "scope": "All 15 native_gates tests, rebuilt from the corrected source with a unique TMPDIR outside every worktree; preserve prior failed and incomplete attempts without command-pass credit."
     },
     {
       "id": "migration-cli-and-regression-matrix",
@@ -298,6 +360,21 @@
     "The cached-binary 1-pass/14-fail attempt is environmental only: its temporary root was inside the Git worktree; it does not establish native-gate behavior.",
     "Compile, format and Clippy CI failures executed no tests and receive no test credit.",
     "The interrupted d524 command receives no test credit although 14 selected tests returned ok.",
-    "No model calls, sealed evaluation or private oracle use is part of this lifecycle qualification."
+    "No model calls, sealed evaluation or private oracle use is part of this lifecycle qualification.",
+    "The off-tree cached-binary retry logged eight completed ok lines, then ended during the ninth test without a numeric status; seven selected cases have no result in the log. The separate reconciliation records that no exact log writer or matching binary process remained. The attempt receives no complete-command or qualification credit, and no exit code or other result is inferred."
+  ],
+  "reconciliations": [
+    {
+      "id": "reconcile-cached-serial-d524-offtree-20261015",
+      "recorded_at_utc": "2026-10-15T13:20:31Z",
+      "attempt_id": "local-native-gates-cached-serial-d524-offtree-no-final-status",
+      "record": "target/local-resume/final-integration-20261015T111655Z/native-gates-cached-serial-d524-offtree-tmp-20261015-reconciliation.json",
+      "record_bytes": 3964,
+      "record_sha256": "b5b29e7edf4954c170fc222fb3354079720fdd5e81508f9c97f97c688f93dae7",
+      "state": "abandoned_without_final_status",
+      "numeric_exit": null,
+      "complete_command_pass": false,
+      "original_artifacts_modified": false
+    }
   ]
 }
