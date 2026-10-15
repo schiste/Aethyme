@@ -2,10 +2,11 @@
 
 ## Scope and status
 
-This folder freezes the finite T45 pressure assertions before any native
-trial. The implementation is source-only and static-reviewed at this point;
-the Cargo, APFS, and Docker trials are **UNRUN**. No model calls or held-out
-evaluations are part of this profile.
+This folder freezes the finite T45 pressure assertions for source commit
+`0cc24dc3c18157084cc5af50a98792f3cd67ab81`, which received independent static
+review. The bounded Local checks are authorized and remain **UNRUN** while host
+headroom recovers. No Cargo, APFS, or Docker trial has run. No model calls or
+held-out evaluations are part of this profile.
 
 T45 requires ENOSPC/OOM during capture, hydration, and build while GC runs,
 with no lost retained source, partial success, or false verification pass.
@@ -35,5 +36,5 @@ the pathname entry.
 The frozen source assertions are in the ignored tests
 `actual_native_t45_capture_and_hydration_enospc_interleave_with_gc` and
 `actual_pressure_preserves_retained_source_and_bounded_native_cleanup`.
-Runtime results, if authorized later, must be appended as new source-bound
-attempt records and must preserve every failure and unrun stage.
+Runtime results must be appended as new source-bound attempt records and must
+preserve every failure and unrun stage.

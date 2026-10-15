@@ -2568,7 +2568,7 @@ mod tests {
         crate::collaboration_archive::put_object(&store, b"orphan").unwrap();
         let hooks = Hooks {
             fault: Some(FaultPoint::DuringCopy(1)),
-            free_bytes: None,
+            ..Hooks::default()
         };
         capture_with(
             &mut store,
@@ -3006,7 +3006,7 @@ mod tests {
         );
         let hooks = Hooks {
             fault: Some(FaultPoint::DuringCopy(0)),
-            free_bytes: None,
+            ..Hooks::default()
         };
         capture_with(
             &mut store,
