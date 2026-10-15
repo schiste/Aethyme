@@ -125,9 +125,10 @@ Additional explicit lifecycle commands (provisional Local packages):
   aethyme collab target run (without --appointment) / sync / handoff dispatch
       Refused with unsupported_profile. No state or argument file is read.
       These commands require their own appointed native adapters.
-  aethyme collab target run status --target NAME --issuer NAME --appointment ID [--json]
-      Inspect one finite appointment after a lost response. Dispatching is
-      reported as unknown and never resumed or replayed.
+  aethyme collab target run status --target NAME --issuer NAME
+       (--appointment ID | --nonce NONCE) [--json]
+      Inspect one finite appointment after a lost response. Nonce lookup is
+      bounded across revisions/epochs; dispatching is unknown and never replayed.
 
 Exit codes: 0 done, 1 failed (I/O, database, Git, or an integrity failure
 such as a corrupt object or receipt), 2 usage, 3 refused (disabled, policy,

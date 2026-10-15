@@ -610,6 +610,12 @@ fn usage_errors_are_exit_2_and_help_has_no_side_effects() {
             "{args:?} did not show {route}"
         );
     }
+    let service_status_help = fixture.run(&["collab", "target", "run", "status", "--help"]);
+    assert!(service_status_help.status.success());
+    assert!(
+        String::from_utf8_lossy(&service_status_help.stdout)
+            .contains("(--appointment ID | --nonce NONCE)")
+    );
     assert!(!fixture.collaboration_dir().exists());
 }
 
