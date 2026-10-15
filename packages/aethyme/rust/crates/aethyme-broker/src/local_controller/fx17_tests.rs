@@ -745,6 +745,7 @@ fn run_fx17(
     let mut verifier_generation = None;
     let mut previous_accepted_commit = baseline_commit.clone();
     let mut previous_source = baseline_snapshot.snapshot_id.to_string();
+    let mut previous_completion: Option<String> = None;
     let mut accepted_parent_chain = Vec::with_capacity(20);
     let index = host.join("source.index");
     let cancelled = AtomicBool::new(false);
@@ -989,7 +990,7 @@ fn run_fx17(
             || active_wave.spec.baseline != previous_source
             || active_wave.spec.selected.len() != 1
             || active_wave.spec.selected[0] != id
-            || active_wave.spec.prior_completion.is_some()
+            || active_wave.spec.prior_completion.as_deref() != previous_completion.as_deref()
             || active_wave.candidate_commit.as_ref().map(CommitOid::as_str)
                 != Some(completion.candidate_commit.as_str())
         {
@@ -1129,6 +1130,11 @@ fn run_fx17(
                 .id()
                 .to_string(),
         )?;
+        let completion_id = completion
+            .record()
+            .map_err(|error| error.to_string())?
+            .id()
+            .to_string();
         let (reservations, allocated, spent) = reservation_rows(&store, &completion.wave)?;
         if reservations.len() != 3 {
             return Err(format!(
@@ -1179,6 +1185,7 @@ fn run_fx17(
 
         previous_accepted_commit = completion.accepted_commit.clone();
         previous_source = completion.source.clone();
+        previous_completion = Some(completion_id);
         if ordinal < 20 {
             let status =
                 target::status(&store, owner.target()).map_err(|error| error.to_string())?;
