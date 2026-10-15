@@ -1,0 +1,174 @@
+{
+  "schema": "aethyme.local-final-integration-evidence/v1",
+  "scope": "Local only; selected source-bound regression executions, not held-out evaluations",
+  "runs": [
+    {
+      "id": "aggregate-analysis-view-b734",
+      "metadata": "runs/aggregate-analysis-view-b734.json",
+      "source_before": {
+        "head": "b73452b4ce99f4f05dc026625c659d0d6f13bbce",
+        "tree": "bf1629aa1b0c43129636212cf86c41af98ed5bdc",
+        "status": "",
+        "diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "source_after": {
+        "head": "b73452b4ce99f4f05dc026625c659d0d6f13bbce",
+        "tree": "bf1629aa1b0c43129636212cf86c41af98ed5bdc",
+        "status": "",
+        "diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "source_unchanged": true,
+      "command": [
+        "/usr/bin/caffeinate",
+        "-i",
+        "/Users/christophehenner/.cargo/bin/cargo",
+        "test",
+        "--locked",
+        "-j4",
+        "-p",
+        "aethyme-broker",
+        "--lib",
+        "analysis_view::",
+        "--",
+        "--nocapture"
+      ],
+      "exit_code": 0,
+      "wall_seconds": 57.329,
+      "result_lines": [
+        "test result: ok. 21 passed; 0 failed; 0 ignored; 0 measured; 1802 filtered out; finished in 5.96s"
+      ],
+      "log_sha256": "b1b296e9aa94c7e69e10edd941538faf4bf46d45b10663292b81081dca25212a"
+    },
+    {
+      "id": "aggregate-context-b734",
+      "metadata": "runs/aggregate-context-b734.json",
+      "source_before": {
+        "head": "b73452b4ce99f4f05dc026625c659d0d6f13bbce",
+        "tree": "bf1629aa1b0c43129636212cf86c41af98ed5bdc",
+        "status": "",
+        "diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "source_after": {
+        "head": "b73452b4ce99f4f05dc026625c659d0d6f13bbce",
+        "tree": "bf1629aa1b0c43129636212cf86c41af98ed5bdc",
+        "status": "",
+        "diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "source_unchanged": true,
+      "command": [
+        "/usr/bin/caffeinate",
+        "-i",
+        "/Users/christophehenner/.cargo/bin/cargo",
+        "test",
+        "--locked",
+        "-j4",
+        "-p",
+        "aethyme-broker",
+        "--lib",
+        "collaboration_context::",
+        "--",
+        "--nocapture"
+      ],
+      "exit_code": 0,
+      "wall_seconds": 23.651,
+      "result_lines": [
+        "test result: ok. 38 passed; 0 failed; 0 ignored; 0 measured; 1785 filtered out; finished in 22.91s"
+      ],
+      "log_sha256": "85287ac3aa2109842bc8b2714cc993a2b7858ce544dc2271b7566e79e4f8d314"
+    },
+    {
+      "id": "aggregate-context-vectors-b734",
+      "metadata": "runs/aggregate-context-vectors-b734.json",
+      "source_before": {
+        "head": "b73452b4ce99f4f05dc026625c659d0d6f13bbce",
+        "tree": "bf1629aa1b0c43129636212cf86c41af98ed5bdc",
+        "status": "",
+        "diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "source_after": {
+        "head": "b73452b4ce99f4f05dc026625c659d0d6f13bbce",
+        "tree": "bf1629aa1b0c43129636212cf86c41af98ed5bdc",
+        "status": "",
+        "diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "source_unchanged": true,
+      "command": [
+        "/usr/bin/caffeinate",
+        "-i",
+        "/Users/christophehenner/.cargo/bin/cargo",
+        "test",
+        "--locked",
+        "-j4",
+        "-p",
+        "aethyme-broker",
+        "--test",
+        "context_selection_vectors",
+        "--",
+        "--nocapture"
+      ],
+      "exit_code": 0,
+      "wall_seconds": 58.572,
+      "result_lines": [
+        "test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s"
+      ],
+      "log_sha256": "241b5b79062ce00e67c03daa5532e699b75570dfcaf634c0d8042b16e19cec6c"
+    }
+  ],
+  "files": [
+    {
+      "path": "runs/aggregate-analysis-view-b734.json",
+      "source_path": "target/local-resume/final-integration-20261015T103424Z/aggregate-analysis-view-b734.json",
+      "bytes": 1695,
+      "sha256": "eb2df6b4a8c98cfc1047f1c3749c387701ae61420d922b81e49dc17f0c758fd2"
+    },
+    {
+      "path": "runs/aggregate-analysis-view-b734.log",
+      "source_path": "target/local-resume/final-integration-20261015T103424Z/aggregate-analysis-view-b734.log",
+      "bytes": 2479,
+      "sha256": "b1b296e9aa94c7e69e10edd941538faf4bf46d45b10663292b81081dca25212a"
+    },
+    {
+      "path": "runs/aggregate-analysis-view-b734.status",
+      "source_path": "target/local-resume/final-integration-20261015T103424Z/aggregate-analysis-view-b734.status",
+      "bytes": 2,
+      "sha256": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa"
+    },
+    {
+      "path": "runs/aggregate-context-b734.json",
+      "source_path": "target/local-resume/final-integration-20261015T103530Z/aggregate-context-b734.json",
+      "bytes": 1697,
+      "sha256": "42a8c8d68bacade4c486c21dfcf74ece4be846218f7f4e399f644f200818c3f8"
+    },
+    {
+      "path": "runs/aggregate-context-b734.log",
+      "source_path": "target/local-resume/final-integration-20261015T103530Z/aggregate-context-b734.log",
+      "bytes": 4075,
+      "sha256": "85287ac3aa2109842bc8b2714cc993a2b7858ce544dc2271b7566e79e4f8d314"
+    },
+    {
+      "path": "runs/aggregate-context-b734.status",
+      "source_path": "target/local-resume/final-integration-20261015T103530Z/aggregate-context-b734.status",
+      "bytes": 2,
+      "sha256": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa"
+    },
+    {
+      "path": "runs/aggregate-context-vectors-b734.json",
+      "source_path": "target/local-resume/final-integration-20261015T103606Z/aggregate-context-vectors-b734.json",
+      "bytes": 1707,
+      "sha256": "e724a758e92adececb95ed86dbb25ecdf67cdf57017af252db9aa5e836a891b5"
+    },
+    {
+      "path": "runs/aggregate-context-vectors-b734.log",
+      "source_path": "target/local-resume/final-integration-20261015T103606Z/aggregate-context-vectors-b734.log",
+      "bytes": 752,
+      "sha256": "241b5b79062ce00e67c03daa5532e699b75570dfcaf634c0d8042b16e19cec6c"
+    },
+    {
+      "path": "runs/aggregate-context-vectors-b734.status",
+      "source_path": "target/local-resume/final-integration-20261015T103606Z/aggregate-context-vectors-b734.status",
+      "bytes": 2,
+      "sha256": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa"
+    }
+  ],
+  "updated_at_utc": "2026-10-15T10:39:09.750887+00:00"
+}
