@@ -1099,9 +1099,63 @@
       "source_path": "target/local-resume/final-workspace-batches/20261015T165406Z-1d0ce2647f27/runs/20261015T171329Z-workspace-doc-1d0ce2647f27-554ddfc8/command.status",
       "bytes": 2,
       "sha256": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa"
+    },
+    {
+      "path": "runs/ci-785-65f-workspace-failure.json",
+      "source_path": "source-bound CI metadata derived from complete original job log and GitHub git-commit response",
+      "bytes": 2033,
+      "sha256": "f03e7a0cb6d0d1cd001e5f0508c85bbdf930cb87c52be74dfff83b45203c99f1"
+    },
+    {
+      "path": "runs/ci-785-65f-workspace-failure.log",
+      "source_path": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/682-reconcile-final-local-qualification/target/local-resume/resumed-ci-20261015/local-pr785-65f-job-116601635249.log",
+      "bytes": 1224800,
+      "sha256": "433b200449210baeeb95a1401c32db4b8ea89780329521ab3f74140464da8c48"
+    },
+    {
+      "path": "runs/ci-785-65f-workspace-failure-checkout.json",
+      "source_path": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/682-reconcile-final-local-qualification/target/local-resume/resumed-ci-20261015/local-pr785-65f-116601635249-ci-commit.json",
+      "bytes": 2616,
+      "sha256": "8f141dac0d010b9678b6f6c8158c2a6541064687c94c9816d302b5b45d8013fc"
+    },
+    {
+      "path": "runs/ci-784-58c-workspace-compile-failure.json",
+      "source_path": "source-bound CI metadata derived from complete original job log and GitHub git-commit response",
+      "bytes": 1132,
+      "sha256": "8619e247bfb0bbe37bbed94373ce6fe9bd3de07ffb7c1295665155c8b8f131d8"
+    },
+    {
+      "path": "runs/ci-784-58c-workspace-compile-failure.log",
+      "source_path": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/682-reconcile-final-local-qualification/target/local-resume/resumed-ci-20261015/local-pr784-58c-job-116607348821.log",
+      "bytes": 80345,
+      "sha256": "b85a8e06a907effabd77826adfe67bb74faf33abd3449b4c53192defc88967f4"
+    },
+    {
+      "path": "runs/ci-784-58c-workspace-compile-failure-checkout.json",
+      "source_path": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/682-reconcile-final-local-qualification/target/local-resume/resumed-ci-20261015/local-pr784-58c-116607348821-ci-commit.json",
+      "bytes": 2616,
+      "sha256": "7d3cef5d8dd497d98aab4adb83b65f6580222beffb296dc265415b914121d1fa"
+    },
+    {
+      "path": "runs/ci-784-58c-lint-compile-failure.json",
+      "source_path": "source-bound CI metadata derived from complete original job log and GitHub git-commit response",
+      "bytes": 1127,
+      "sha256": "da18e76e1c768a4387de21d98f81be562a3e4f0cba308f4b9fc1c33fcdbc5f2b"
+    },
+    {
+      "path": "runs/ci-784-58c-lint-compile-failure.log",
+      "source_path": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/682-reconcile-final-local-qualification/target/local-resume/resumed-ci-20261015/local-pr784-58c-job-116607349478.log",
+      "bytes": 89877,
+      "sha256": "000c26226723da5044b412d3b37f8241cbfde6aaa092042e0b34ed374cedb485"
+    },
+    {
+      "path": "runs/ci-784-58c-lint-compile-failure-checkout.json",
+      "source_path": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/682-reconcile-final-local-qualification/target/local-resume/resumed-ci-20261015/local-pr784-58c-116607349478-ci-commit.json",
+      "bytes": 2616,
+      "sha256": "7d3cef5d8dd497d98aab4adb83b65f6580222beffb296dc265415b914121d1fa"
     }
   ],
-  "updated_at_utc": "2026-10-15T17:14:55.207901+00:00",
+  "updated_at_utc": "2026-10-15T18:58:35.171752+00:00",
   "preflight_failures": [
     {
       "metadata": "runs/aggregate-offline-fx17-recorder-preflight-failure.json",
@@ -1122,6 +1176,24 @@
       "id": "ci-777-f47-ratchet",
       "metadata": "runs/ci-777-f47-ratchet.json",
       "exit_code": 100,
+      "passing_command": false
+    },
+    {
+      "id": "ci-785-65f-workspace-failure",
+      "metadata": "runs/ci-785-65f-workspace-failure.json",
+      "exit_code": 100,
+      "passing_command": false
+    },
+    {
+      "id": "ci-784-58c-workspace-compile-failure",
+      "metadata": "runs/ci-784-58c-workspace-compile-failure.json",
+      "exit_code": 101,
+      "passing_command": false
+    },
+    {
+      "id": "ci-784-58c-lint-compile-failure",
+      "metadata": "runs/ci-784-58c-lint-compile-failure.json",
+      "exit_code": 101,
       "passing_command": false
     }
   ]

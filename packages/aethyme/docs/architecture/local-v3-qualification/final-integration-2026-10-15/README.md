@@ -40,6 +40,15 @@ The records name the actual CI merge commit and tree, separate from the PR head.
 These failed commands receive no passing-command or ignored native-profile
 credit. Their complete original logs are retained.
 
+The later sensitive-content draft #785 at `65f0bce9` ran 4,575 tests in its CI
+merge-ref checkout: 4,566 passed, nine failed and 32 were skipped (exit 100).
+Eight failures came from historical-schema test fixtures retaining the new
+schema-24 tables, and one from the changed command help snapshot. The fresh CLI
+draft #784 at `58c47074` failed compilation in its workspace and lint jobs
+(exit 101); neither job supplies an executed-test result. The complete logs and
+actual checkout commit/tree/parents are preserved. These remain failed attempts
+even after subsequent source repairs.
+
 ## Initial full workspace run and native fixture repair
 
 At clean aggregate `86c982eeecd92e473e309bf0f13dfdde1379e6ac`, the official
