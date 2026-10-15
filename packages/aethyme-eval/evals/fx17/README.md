@@ -164,6 +164,7 @@ never staged or included in the model payloads.
 
 - `briefs/`: exact independently frozen public briefs.
 - `frozen/`: public six-row payload, schedule, manifests, and freeze hashes.
+- `model-trial-attempts.md`: shareable outcome ledger for the once-only six-row trial.
 - The private oracle bundle is supplied externally to the trusted evaluator.
   The model payload generator does not read it.
 - `run_fx17.py`: public-payload preparation, integrity verification, bounded
