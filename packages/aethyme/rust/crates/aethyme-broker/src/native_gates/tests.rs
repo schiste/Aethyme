@@ -2,6 +2,7 @@ use super::*;
 use crate::collaboration_gc::{self as gc, GcHooks};
 use crate::collaboration_state::{CollaborationRoot, ProjectKey};
 use crate::local_target::tests::{Fixture, git};
+use rusqlite::OptionalExtension;
 use std::path::Path;
 
 struct Setup {
@@ -122,22 +123,46 @@ fn assert_native_job_sources_retained(
     store: &CollaborationStore,
     plan: &gc::GcPlan,
     job: &Job,
-    expected_snapshots: &[String],
-    expected_contributions: &[String],
+    expected_snapshots: &[(String, SourceSnapshot)],
+    expected_contributions: &[&archive::RetainedContribution],
     phase: &str,
 ) {
-    let expected_snapshots: std::collections::BTreeSet<_> =
-        expected_snapshots.iter().cloned().collect();
-    let expected_contributions: std::collections::BTreeSet<_> =
-        expected_contributions.iter().cloned().collect();
-    let missing_snapshots: Vec<_> = expected_snapshots
+    let expected_snapshot_ids: std::collections::BTreeSet<_> = expected_snapshots
+        .iter()
+        .map(|(id, source)| {
+            assert_eq!(
+                source.id().as_str(),
+                id.as_str(),
+                "{phase}: fixture snapshot ID"
+            );
+            id.clone()
+        })
+        .collect();
+    let expected_contribution_ids: std::collections::BTreeSet<_> = expected_contributions
+        .iter()
+        .map(|contribution| contribution.lineage_record_id.to_string())
+        .collect();
+    assert!(
+        expected_snapshot_ids.contains(&job.spec.subject)
+            && expected_snapshot_ids.contains(&job.spec.baseline),
+        "{phase}: expected closure does not contain the frozen subject and baseline"
+    );
+    for contribution in expected_contributions {
+        assert!(
+            expected_snapshot_ids.contains(&contribution.base.snapshot_id.to_string())
+                && expected_snapshot_ids.contains(&contribution.result.snapshot_id.to_string()),
+            "{phase}: expected closure omits a selected contribution snapshot"
+        );
+    }
+
+    let missing_snapshots: Vec<_> = expected_snapshot_ids
         .iter()
         .filter(|id| {
             plan.entities
                 .contains(&gc::GcEntity::Snapshot((*id).clone()))
         })
         .collect();
-    let missing_contributions: Vec<_> = expected_contributions
+    let missing_contributions: Vec<_> = expected_contribution_ids
         .iter()
         .filter(|id| {
             plan.entities
@@ -149,21 +174,132 @@ fn assert_native_job_sources_retained(
         "{phase}: native job source entities became reclaimable; missing snapshots={missing_snapshots:?}, missing contributions={missing_contributions:?}; full GC plan={plan:#?}"
     );
 
-    for id in &expected_snapshots {
-        let manifest = ObjectDigest::of_snapshot(&snapshot(id).expect("expected snapshot id"));
-        let relpath = object_relpath(store, &manifest);
-        assert!(
-            !plan.reclaimable.iter().any(|item| item.relpath == relpath),
-            "{phase}: native job source manifest {id} became reclaimable at {relpath}; full GC plan={plan:#?}"
+    let mut expected_objects = std::collections::BTreeMap::<ObjectDigest, String>::new();
+    for (snapshot_id, source) in expected_snapshots {
+        let manifest = ObjectDigest::of(&source.manifest_bytes());
+        assert_eq!(
+            manifest,
+            ObjectDigest::of_snapshot(&source.id()),
+            "{phase}: source manifest digest"
         );
+        assert_eq!(
+            archive::read_object(store, &manifest).unwrap(),
+            source.manifest_bytes(),
+            "{phase}: archived manifest differs from frozen fixture snapshot"
+        );
+        expected_objects
+            .entry(manifest)
+            .or_insert_with(|| format!("snapshot {snapshot_id} manifest"));
+        for entry in source.entries() {
+            let blob = ObjectDigest::from_bytes(*entry.content_sha256());
+            archive::read_object(store, &blob).unwrap();
+            expected_objects.entry(blob).or_insert_with(|| {
+                format!(
+                    "snapshot {snapshot_id} entry {} blob",
+                    String::from_utf8_lossy(entry.path())
+                )
+            });
+        }
+
+        let (record_id, record_sha256): (String, String) = store
+            .read_connection()
+            .query_row(
+                "SELECT record_id,record_sha256 FROM retained_snapshots WHERE snapshot_id=?1",
+                [snapshot_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let record_digest = digest(&record_sha256).unwrap();
+        let record_bytes = archive::read_object(store, &record_digest).unwrap();
+        let record = Record::decode(&record_bytes, &[&archive::RETAINED_SNAPSHOT_SCHEMA]).unwrap();
+        let encoded_snapshot =
+            aethyme_contracts::experimental_v0::canonical_json::Value::String(snapshot_id.clone());
+        assert_eq!(record.canonical_bytes(), record_bytes);
+        assert_eq!(record.id().as_str(), record_id.as_str());
+        assert_eq!(record.get("snapshot"), Some(&encoded_snapshot));
+        expected_objects
+            .entry(record_digest)
+            .or_insert_with(|| format!("snapshot {snapshot_id} metadata record"));
     }
+
+    for contribution in expected_contributions {
+        let lineage = &contribution.lineage_record_id;
+        let (record_sha256, base_snapshot, result_snapshot): (String, String, String) = store
+            .read_connection()
+            .query_row(
+                "SELECT record_sha256,base_snapshot,result_snapshot FROM retained_contributions WHERE lineage_record_id=?1",
+                [lineage.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            base_snapshot.as_str(),
+            contribution.base.snapshot_id.as_str()
+        );
+        assert_eq!(
+            result_snapshot.as_str(),
+            contribution.result.snapshot_id.as_str()
+        );
+        let record_digest = digest(&record_sha256).unwrap();
+        let record_bytes = archive::read_object(store, &record_digest).unwrap();
+        let record =
+            Record::decode(&record_bytes, &[&archive::CONTRIBUTION_LINEAGE_SCHEMA]).unwrap();
+        let encoded_base = aethyme_contracts::experimental_v0::canonical_json::Value::String(
+            contribution.base.snapshot_id.to_string(),
+        );
+        let encoded_result = aethyme_contracts::experimental_v0::canonical_json::Value::String(
+            contribution.result.snapshot_id.to_string(),
+        );
+        assert_eq!(record.canonical_bytes(), record_bytes);
+        assert_eq!(record.id().as_str(), lineage.as_str());
+        assert_eq!(record.get("base"), Some(&encoded_base));
+        assert_eq!(record.get("result"), Some(&encoded_result));
+        expected_objects
+            .entry(record_digest)
+            .or_insert_with(|| format!("contribution {lineage} lineage record"));
+
+        let brief: Option<(String, String)> = store
+            .read_connection()
+            .query_row(
+                "SELECT brief_record_id,brief_sha256 FROM contribution_briefs WHERE lineage_record_id=?1",
+                [lineage.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .unwrap();
+        if let Some((brief_id, brief_sha256)) = brief {
+            let brief_digest = digest(&brief_sha256).unwrap();
+            let brief_bytes = archive::read_object(store, &brief_digest).unwrap();
+            let brief_record = Record::decode(
+                &brief_bytes,
+                &[&aethyme_contracts::experimental_v0::brief::BRIEF_SCHEMA],
+            )
+            .unwrap();
+            assert_eq!(brief_record.canonical_bytes(), brief_bytes);
+            assert_eq!(brief_record.id().as_str(), brief_id.as_str());
+            expected_objects
+                .entry(brief_digest)
+                .or_insert_with(|| format!("contribution {lineage} brief record"));
+        }
+    }
+
     let job_record = ObjectDigest::of(&record(&job.spec).unwrap().canonical_bytes());
     let recipe_record = digest(&job.spec.recipe).unwrap();
-    for (name, object) in [("job record", job_record), ("recipe record", recipe_record)] {
+    archive::read_object(store, &job_record).unwrap();
+    archive::read_object(store, &recipe_record).unwrap();
+    expected_objects
+        .entry(job_record)
+        .or_insert_with(|| "native job record".into());
+    expected_objects
+        .entry(recipe_record)
+        .or_insert_with(|| "composition recipe record".into());
+
+    for (object, label) in expected_objects {
         let relpath = object_relpath(store, &object);
         assert!(
             !plan.reclaimable.iter().any(|item| item.relpath == relpath),
-            "{phase}: native job {name} became reclaimable at {relpath}; full GC plan={plan:#?}"
+            "{phase}: retained native job closure object {label} ({}) became reclaimable at {relpath}; full GC plan={plan:#?}",
+            object.hex()
         );
     }
 }
@@ -638,18 +774,35 @@ fn dispatching_and_unknown_jobs_stay_rooted_without_a_process_tree_proof() {
     let owner = s.owner.as_ref().expect("setup owner is present");
     let job = prepare(&mut s.f.store, owner, &mut s.broker, &s.wave).unwrap();
     let roots_before = root_count(&s.f.store, &job.id);
+    let repo = s.f._repo.path();
+    let candidate_source =
+        archive::snapshot_of_commit(repo, &commit(&job.spec.commit).unwrap()).unwrap();
+    let baseline_source = archive::snapshot_of_commit(repo, &s.f.a.base.commit).unwrap();
+    let a_base_source = archive::snapshot_of_commit(repo, &s.f.a.base.commit).unwrap();
+    let a_result_source = archive::snapshot_of_commit(repo, &s.f.a.result.commit).unwrap();
+    let b_base_source = archive::snapshot_of_commit(repo, &s.f.b.base.commit).unwrap();
+    let b_result_source = archive::snapshot_of_commit(repo, &s.f.b.result.commit).unwrap();
     let expected_snapshots = [
-        job.spec.subject.clone(),
-        job.spec.baseline.clone(),
-        s.f.a.base.snapshot_id.to_string(),
-        s.f.a.result.snapshot_id.to_string(),
-        s.f.b.base.snapshot_id.to_string(),
-        s.f.b.result.snapshot_id.to_string(),
+        (job.spec.subject.clone(), candidate_source),
+        (job.spec.baseline.clone(), baseline_source),
+        (s.f.a.base.snapshot_id.to_string(), a_base_source),
+        (s.f.a.result.snapshot_id.to_string(), a_result_source),
+        (s.f.b.base.snapshot_id.to_string(), b_base_source),
+        (s.f.b.result.snapshot_id.to_string(), b_result_source),
     ];
-    let expected_contributions = [
-        s.f.a.lineage_record_id.to_string(),
-        s.f.b.lineage_record_id.to_string(),
+    let expected_contributions = [&s.f.a, &s.f.b];
+    let mut expected_inputs = [
+        s.f.a.result.commit.as_str().to_owned(),
+        s.f.b.result.commit.as_str().to_owned(),
     ];
+    expected_inputs.sort();
+    let mut actual_inputs = job.spec.inputs.clone();
+    actual_inputs.sort();
+    assert_eq!(
+        actual_inputs, expected_inputs,
+        "fixture lineages must match the frozen native job inputs"
+    );
+
     s.f.store
         .connection()
         .execute(
@@ -658,8 +811,8 @@ fn dispatching_and_unknown_jobs_stay_rooted_without_a_process_tree_proof() {
         )
         .unwrap();
 
-    // Remove target ownership and age the source. These assertions name the
-    // expected job closure from its frozen spec and selected fixture lineages;
+    // Remove target ownership and age the source. The expected closure is
+    // derived from Git snapshots and the known fixture contribution records;
     // unrelated orphaned fixture history can still be collectible.
     s.f.store
         .connection()
