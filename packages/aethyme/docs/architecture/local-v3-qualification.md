@@ -21,8 +21,10 @@ and a separate twenty-change controlled evolution run with nonempty native gates
 All six once-final FX17 model rows failed at the provider's response-schema
 boundary, before producing candidates; none supplies behavioral evidence.
 A separate bounded sustained-arrival trial passed after one retained harness
-failure. Final integration checks and native-job retention cleanup remain in
-progress. These finite observations do not establish reliable autonomous operation. All results
+failure. The aggregate view/context selections passed 61 selected executions at their
+recorded source. Native-job retention cleanup, the exact T45 pressure/GC
+interleaving and final combined-tree checks remain in progress. These finite
+observations do not establish reliable autonomous operation. All results
 below name their source and profile; earlier operator profiles retain their
 original limits.
 
@@ -32,7 +34,7 @@ original limits.
 |---|---|---|
 | Revision identities, records, briefs and analysis envelope | #704–#710 | Independent canonical vectors and baseline AQ0 fixtures; records remain experimental |
 | Retained source, capture, roots and GC | #714–#719 | Capture/crash/cleanup schedules; bounded native workload and APFS retained-source pressure below; host/daemon and mid-journal exhaustion remain unqualified |
-| Bounded context and fresh analysis views | #718/#730/#731/#756 | Scoped invalidation schedules and [once-final FX08 campaign](local-v3-fx08-qualification.md): all 56 outcomes retained; reliable brief usefulness was not established |
+| Bounded context and fresh analysis views | #718/#730/#731/#756/#781 | Scoped invalidation schedules, [reviewed lifecycle fixes](local-v3-qualification/analysis-view-lifecycle-2026-10-15/README.md), and [once-final FX08 campaign](local-v3-fx08-qualification.md): all 56 outcomes retained; reliable brief usefulness was not established |
 | Composition and bounded resolution | #733–#736/#755 | Historical provisional text profile plus [bounded external HTML structural profile](local-v3-e1-profile.md); semantic repair/consumer/subtraction evidence; original held-outs are not rerun; [reachable request guards](local-v3-qualification/resolution-guards-2026-10-12.json) |
 | Targets, finite waves, budgets and native epoch | #737–#740/#759/#763 | Transition, arrival, reservation, stop and stale-authority schedules; [actual appointed service and twenty-change evolution](local-v3-autonomous-controller.md); [bounded sustained-arrival trial](../../../aethyme-eval/fx10/evidence/actual-1123-1f7b2266/README.md) passed after one retained harness failure; no general reliability claim |
 | Exact execution, supervisor, verifier and resources | #741–#744/#758 | Independent negative profiles and artifact checks; actual bounded tmpfs ENOSPC and cgroup OOM below; [typed native candidate/gate join](local-v3-native-gates.md) implemented on the Local branch |
@@ -83,6 +85,18 @@ strict Clippy with `--lib --tests -D warnings`, all at source
 `f61a6de32de4284269dc0e739df8f3193e3cfb65`. Counts overlap across selections.
 Ignored native profiles are credited only by their separately recorded explicit
 invocations. Final-head CI and independent review remain separate checks.
+
+## Aggregate view and context checks
+
+The [aggregate check ledger](local-v3-qualification/final-integration-2026-10-15/README.md)
+records three sequential local commands at clean source
+`b73452b4ce99f4f05dc026625c659d0d6f13bbce`: 21 analysis-view tests, 38 context
+tests and two public context-selection vectors passed, with zero failures and
+unchanged source during each command. The 61 selected executions overlap earlier
+branch checks; they do not qualify a later combined tree or any model behavior.
+The [lifecycle evidence](local-v3-qualification/analysis-view-lifecycle-2026-10-15/README.md)
+separately retains five intended guard failures, the initial ratchet failure,
+exact source restoration and the passing corrected branch checks.
 
 ## Explicit command qualification
 
@@ -227,7 +241,13 @@ verification passed 11,075 ms later, but the single publication attempt failed
 safely and the service held with zero private completions or replay, preserving
 the competing remote tip. This qualifies one finite arrival/contention/drift
 profile. It does not establish repeated-drift or sustained-load reliability.
-Final integrated checks and explicit native-job retention cleanup remain open.
+Final combined-tree checks and explicit native-job retention cleanup remain open.
+
+Plan T45 also requires pressure during capture, hydration and build while GC
+runs. The earlier APFS and Docker profiles exercised their pressure and GC
+phases separately; those records are not credited as the required interleaving.
+A bounded schedule with explicit operation/lock witnesses is being implemented.
+This requirement does not imply a full-host, daemon-storage or power-loss claim.
 
 The operator must designate the disposable GitHub/Mergify repository, branch
 and policy before live-provider trials. Actual private GenericGit acceptance
