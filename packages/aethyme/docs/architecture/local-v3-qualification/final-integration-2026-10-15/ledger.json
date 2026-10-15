@@ -1153,9 +1153,27 @@
       "source_path": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/682-reconcile-final-local-qualification/target/local-resume/resumed-ci-20261015/local-pr784-58c-116607349478-ci-commit.json",
       "bytes": 2616,
       "sha256": "7d3cef5d8dd497d98aab4adb83b65f6580222beffb296dc265415b914121d1fa"
+    },
+    {
+      "path": "runs/ci-785-cc31-workspace-failure.log",
+      "source_path": "target/local-resume/resumed-ci-20261015/local-pr785-cc31-workspace-job-116620358510.log",
+      "bytes": 1039054,
+      "sha256": "b9d330aec884da8be74ef62bc4143539204e9e5ba84050ccf0d73aca0014bf49"
+    },
+    {
+      "path": "runs/ci-785-cc31-workspace-failure-checkout.json",
+      "source_path": "target/local-resume/resumed-ci-20261015/local-pr785-cc31-workspace-checkout.json",
+      "bytes": 2616,
+      "sha256": "d0c922ad6606c6fd045e51f7d9703e6f1c3ec32ff395de04567d8ecdeff743dd"
+    },
+    {
+      "path": "runs/ci-785-cc31-workspace-failure.json",
+      "source_path": "target/local-resume/resumed-ci-20261015/ci-785-cc31-workspace-failure.json",
+      "bytes": 1536,
+      "sha256": "b41b91304dc6dc4459e4f4295b4eaffba214e3ff89975d1520f124d9f38e4927"
     }
   ],
-  "updated_at_utc": "2026-10-15T19:08:22.989813+00:00",
+  "updated_at_utc": "2026-10-15T19:44:28.653762+00:00",
   "preflight_failures": [
     {
       "metadata": "runs/aggregate-offline-fx17-recorder-preflight-failure.json",
@@ -1194,6 +1212,12 @@
       "id": "ci-784-58c-lint-compile-failure",
       "metadata": "runs/ci-784-58c-lint-compile-failure.json",
       "exit_code": 101,
+      "passing_command": false
+    },
+    {
+      "id": "ci-785-cc31-workspace-failure",
+      "metadata": "runs/ci-785-cc31-workspace-failure.json",
+      "exit_code": 100,
       "passing_command": false
     }
   ]

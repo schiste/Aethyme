@@ -49,6 +49,14 @@ draft #784 at `58c47074` failed compilation in its workspace and lint jobs
 actual checkout commit/tree/parents are preserved. These remain failed attempts
 even after subsequent source repairs.
 
+The subsequent #785 CI checkout at `cc31a0de` ran 4,576 tests: 4,573 passed,
+three failed and 32 were skipped (exit 100). The synthetic-content composite
+failed its retrieved-record token assertion; the native-job test expected
+schema 23 but observed 24; and the help snapshot was stale. Its exact CI
+checkout/tree, complete raw log and failure metadata are retained. This was
+the earlier composite, and supplies no evidence for the later frozen v4
+view-cleanup protocol or its controls.
+
 ## Initial full workspace run and native fixture repair
 
 At clean aggregate `86c982eeecd92e473e309bf0f13dfdde1379e6ac`, the official
