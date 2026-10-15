@@ -918,7 +918,7 @@ def run(freeze_root, approval_path, controls_path, output, ack_schedule, ack_pay
     if output.exists():
         raise Fx17Error("Refusing to reuse a trial output directory")
     consumption = claim_campaign_consumption(
-        registry, schedule_hash, payload_hash, approval_raw)
+        str(registry), schedule_hash, payload_hash, approval_raw)
     output.mkdir(mode=0o700, parents=True)
     state = {"schema": "aethyme.fx17.results/v1", "assigned_denominator": 6,
              "original_core_denominator": 4, "supplemental_misleading_denominator": 2,
