@@ -1,0 +1,20 @@
+{
+  "schema": "aethyme.local-ci-command-result/v1",
+  "id": "ci-785-8387-lint",
+  "pr": 785,
+  "branch_head": "8387fd9f78e53c5a66c76938b10020b67c3cdbe6",
+  "ci_checkout_commit": "31501311435e1d9fc534e18996df0d69049633e6",
+  "ci_checkout_tree": "eb89e29c54256b10463f5fb3de1ddea66790df44",
+  "ci_checkout_parents": [
+    "8daffab2bb80ae0cce8286c530d70fad42c033f5",
+    "8387fd9f78e53c5a66c76938b10020b67c3cdbe6"
+  ],
+  "job_url": "https://github.com/schiste/Aethyme/actions/runs/38803465516/job/116658462492",
+  "conclusion": "FAILURE",
+  "numeric_exit": 101,
+  "test_commands_completed": 0,
+  "failure": "Strict Clippy rejected a needless borrow in the new managed-directory test helper. No test cases executed.",
+  "credited_as_passing_command": false,
+  "log_sha256": "5eb8c639645e31b28954fb21fd45921e18198e38d4eccefbd3f7a4eba15620fb",
+  "scope": "Actual GitHub merge-ref checkout and full original log, distinct from a completed passing run or later fixed source."
+}

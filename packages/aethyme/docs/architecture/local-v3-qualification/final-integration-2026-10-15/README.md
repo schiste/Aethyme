@@ -63,6 +63,14 @@ path. Two updated callers lacked typed error conversions for wave loading and
 archive I/O. Their complete logs and actual merge checkout `ef470cc8` are
 retained. These jobs executed no qualifying tests and receive no passing credit.
 
+At #785 head `69e8202a`, strict lint failed with exit 101 for three unused
+test helpers and a non-octal permissions literal. The workspace job was cancelled
+before completion; its raw log retains fifteen distinct first-attempt failures
+reporting `UnknownWork` from fixtures that had left their wave verifying. No
+completed-suite denominator or passing-command credit is assigned. At later head
+`8387fd9f`, strict lint failed with exit 101 for one needless borrow in a new test
+helper. These complete logs and exact checkout metadata remain preserved.
+
 ## Initial full workspace run and native fixture repair
 
 At clean aggregate `86c982eeecd92e473e309bf0f13dfdde1379e6ac`, the official

@@ -1207,9 +1207,49 @@
       "source_path": "target/local-resume/resumed-ci-20261015/local-pr784-3f14-workspace-116631062734.raw.log",
       "bytes": 77835,
       "sha256": "80b409128b46783494d26129b1234d8cd118f1bcfa3c519fecc382812ca02a6f"
+    },
+    {
+      "path": "ci/785-69e820-checkout.json",
+      "bytes": 2616,
+      "sha256": "52aea5530f2463c578f38c9fe439eacc328549d82e5e53f5df66c7bde3229b83"
+    },
+    {
+      "path": "ci/785-8387-checkout.json",
+      "bytes": 2616,
+      "sha256": "19cc09526f74893ad6c2e64036ed107d5bcb78ebba336a1a69fe949e248f709d"
+    },
+    {
+      "path": "ci/ci-785-69e820-lint.raw.log",
+      "bytes": 87441,
+      "sha256": "c7274153b8c5d190b9a4ca1d3a27d500de7cb66c643dab4f185da154bda55b44"
+    },
+    {
+      "path": "runs/ci-785-69e820-lint.json",
+      "bytes": 988,
+      "sha256": "a97bbd7a638dafd2f0cc8aaf655120021c13f7510aee195e1740d135777e93a5"
+    },
+    {
+      "path": "ci/ci-785-69e820-workspace-cancelled.raw.log",
+      "bytes": 766208,
+      "sha256": "7d764d325c60d09c6fad76191f21cb38bc67404743d45704f15c773f2c8ef90f"
+    },
+    {
+      "path": "runs/ci-785-69e820-workspace-cancelled.json",
+      "bytes": 1324,
+      "sha256": "81ff26a60c4caba9d78c0236435c6f694988d5a05925cce065959785c1d801ce"
+    },
+    {
+      "path": "ci/ci-785-8387-lint.raw.log",
+      "bytes": 81573,
+      "sha256": "5eb8c639645e31b28954fb21fd45921e18198e38d4eccefbd3f7a4eba15620fb"
+    },
+    {
+      "path": "runs/ci-785-8387-lint.json",
+      "bytes": 969,
+      "sha256": "4ed429e52e99ff2d35c7a55993d894049fb496dcbafd1f2a62d7bc0b04d12c91"
     }
   ],
-  "updated_at_utc": "2026-10-15T19:56:33.734851+00:00",
+  "updated_at_utc": "2026-10-15T20:46:30.870208+00:00",
   "preflight_failures": [
     {
       "metadata": "runs/aggregate-offline-fx17-recorder-preflight-failure.json",
@@ -1260,6 +1300,27 @@
       "id": "ci-784-3f14-compile-failure",
       "metadata": "runs/ci-784-3f14-compile-failure.json",
       "exit_code": 101,
+      "passing_command": false
+    },
+    {
+      "id": "ci-785-69e820-lint",
+      "metadata": "runs/ci-785-69e820-lint.json",
+      "exit_code": 101,
+      "conclusion": "FAILURE",
+      "passing_command": false
+    },
+    {
+      "id": "ci-785-69e820-workspace-cancelled",
+      "metadata": "runs/ci-785-69e820-workspace-cancelled.json",
+      "exit_code": null,
+      "conclusion": "CANCELLED",
+      "passing_command": false
+    },
+    {
+      "id": "ci-785-8387-lint",
+      "metadata": "runs/ci-785-8387-lint.json",
+      "exit_code": 101,
+      "conclusion": "FAILURE",
       "passing_command": false
     }
   ]
