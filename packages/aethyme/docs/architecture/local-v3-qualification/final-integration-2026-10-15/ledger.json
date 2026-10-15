@@ -1171,9 +1171,45 @@
       "source_path": "target/local-resume/resumed-ci-20261015/ci-785-cc31-workspace-failure.json",
       "bytes": 1536,
       "sha256": "b41b91304dc6dc4459e4f4295b4eaffba214e3ff89975d1520f124d9f38e4927"
+    },
+    {
+      "path": "runs/ci-784-3f14-compile-failure.json",
+      "source_path": "target/local-resume/resumed-ci-20261015/local-pr784-3f14-compile-failure.json",
+      "bytes": 1779,
+      "sha256": "ee9ed203346837391cfbb3a76e3da0f19e961000979801b4e7a036ac3c7adc55"
+    },
+    {
+      "path": "runs/ci-784-3f14-compile-failure-checkout.json",
+      "source_path": "target/local-resume/resumed-ci-20261015/local-pr784-3f14-checkout.json",
+      "bytes": 2616,
+      "sha256": "1343627ed0c6897711e04c49462d259d73255c60484ccb217150cec8e66843ba"
+    },
+    {
+      "path": "runs/ci-784-3f14-compile-failure-examples-116631061910.raw.log",
+      "source_path": "target/local-resume/resumed-ci-20261015/local-pr784-3f14-examples-116631061910.raw.log",
+      "bytes": 73293,
+      "sha256": "a6afc9dc6342cd154650d94a01eb655de91c6a3d9b2d7cadd7cb93a69a850851"
+    },
+    {
+      "path": "runs/ci-784-3f14-compile-failure-lint-116631062401.raw.log",
+      "source_path": "target/local-resume/resumed-ci-20261015/local-pr784-3f14-lint-116631062401.raw.log",
+      "bytes": 85548,
+      "sha256": "da72285f5239cbdd226ed0a384a030eac7f95ce8e439c4cf1db3353b47fce973"
+    },
+    {
+      "path": "runs/ci-784-3f14-compile-failure-product-116631062235.raw.log",
+      "source_path": "target/local-resume/resumed-ci-20261015/local-pr784-3f14-product-116631062235.raw.log",
+      "bytes": 73901,
+      "sha256": "626f5797f226a66fd1c9c63bd9aea44eb128bef45b995ab3e9366a9af15bdc18"
+    },
+    {
+      "path": "runs/ci-784-3f14-compile-failure-workspace-116631062734.raw.log",
+      "source_path": "target/local-resume/resumed-ci-20261015/local-pr784-3f14-workspace-116631062734.raw.log",
+      "bytes": 77835,
+      "sha256": "80b409128b46783494d26129b1234d8cd118f1bcfa3c519fecc382812ca02a6f"
     }
   ],
-  "updated_at_utc": "2026-10-15T19:44:28.653762+00:00",
+  "updated_at_utc": "2026-10-15T19:56:33.734851+00:00",
   "preflight_failures": [
     {
       "metadata": "runs/aggregate-offline-fx17-recorder-preflight-failure.json",
@@ -1218,6 +1254,12 @@
       "id": "ci-785-cc31-workspace-failure",
       "metadata": "runs/ci-785-cc31-workspace-failure.json",
       "exit_code": 100,
+      "passing_command": false
+    },
+    {
+      "id": "ci-784-3f14-compile-failure",
+      "metadata": "runs/ci-784-3f14-compile-failure.json",
+      "exit_code": 101,
       "passing_command": false
     }
   ]

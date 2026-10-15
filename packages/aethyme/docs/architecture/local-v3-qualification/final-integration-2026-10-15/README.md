@@ -57,6 +57,12 @@ checkout/tree, complete raw log and failure metadata are retained. This was
 the earlier composite, and supplies no evidence for the later frozen v4
 view-cleanup protocol or its controls.
 
+At #784 head `3f14f83d`, all four OSS jobs failed compilation (exit 101):
+workspace tests, strict lint, examples/documentation, and the native product
+path. Two updated callers lacked typed error conversions for wave loading and
+archive I/O. Their complete logs and actual merge checkout `ef470cc8` are
+retained. These jobs executed no qualifying tests and receive no passing credit.
+
 ## Initial full workspace run and native fixture repair
 
 At clean aggregate `86c982eeecd92e473e309bf0f13dfdde1379e6ac`, the official
