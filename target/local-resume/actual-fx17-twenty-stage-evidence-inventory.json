@@ -183,8 +183,8 @@
     {
       "mode_octal": "0644",
       "path": "target/local-resume/attempts-ledger.md",
-      "sha256": "1d51d9bc9383d1a49a5e6ad894f83e362611983932c6a83dc495ba3e3229739d",
-      "size_bytes": 10996
+      "sha256": "ea1f9d27c6ac00bbbfdbb842ec3c1b035fb15ce235ac1d3ff2de4a21f0559704",
+      "size_bytes": 11210
     }
   ],
   "source_head": "c45d4096f9d0238b800ccadbeb07f9b93ae30a3e",
