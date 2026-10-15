@@ -1174,6 +1174,7 @@ struct DriftObservation {
     target_phase_after: String,
     active_wave_phase_after: String,
     completions_before_update: i64,
+    completions_after_update: i64,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1493,9 +1494,9 @@ fn observe_external_ref_advance(
         let (target_phase, completions) =
             assert_active_older_dispatch(&observer, owner, &revision, &active_wave, &job_id)?;
         if completions != 0 {
-            return Err(
-                "FX10 external ref update coincided with an older private completion".into(),
-            );
+            return Err(format!(
+                "FX10 external ref update coincided with {completions} older private completion(s)"
+            ));
         }
         let active = wave::load(&observer, &active_wave).map_err(|error| error.to_string())?;
         Ok::<_, String>((target_phase, completions, active))
@@ -1589,6 +1590,7 @@ fn observe_external_ref_advance(
         target_phase_after,
         active_wave_phase_after: format!("{:?}", active_after.phase),
         completions_before_update,
+        completions_after_update,
     })
 }
 
@@ -2013,7 +2015,7 @@ fn run_external_target_update(
             "outcome":format!("{:?}",service.outcome),
             "ticks":service.ticks,
             "completions":service.completions.len(),
-            "detail":service.detail.as_str(),
+            "detail":service.detail.as_deref(),
             "finished_unix_ms":service_finished_unix_ms,
         }),
         Err(error) => json!({
@@ -2182,6 +2184,7 @@ fn run_external_target_update(
         || drift.gate_child_heartbeat_updates_before_ref_update == 0
         || drift.gate_child_running_after_ref_update_ms < u128::from(FX10_MIN_GATE_CHILD_RUNNING_MS)
         || drift.gate_child_heartbeat_updates_after_ref_update == 0
+        || drift.completions_after_update != 0
     {
         return Err("FX10 target-ref update did not preserve one fresh real native pass after the confirmed ref advance".into());
     }
@@ -2271,6 +2274,7 @@ fn run_external_target_update(
             "local_target_phase_after": drift.target_phase_after,
             "local_wave_phase_after": drift.active_wave_phase_after,
             "completions_before_update": drift.completions_before_update,
+            "completions_after_update_before_release": drift.completions_after_update,
             "final_target_phase": format!("{:?}", status.phase),
             "final_wave_phase": format!("{:?}", wave.phase)
         },
