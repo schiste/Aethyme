@@ -862,6 +862,7 @@ pub fn status(
             "external exports, Git worktrees/remotes, backups, process memory, and filesystem snapshots are unmanaged residuals",
             "older binaries and readers that already opened the store cannot be proven quiescent; state remains quarantined after managed deletion",
             "same-OS-user direct filesystem access is outside the cooperative boundary",
+            "validated capture-operation lock files and authority lock roots remain unmanaged control-state residuals",
             "a database replacement from an older schema is unsupported and must remain frozen",
             "physical storage remapping and SSD wear-leveling are not verified erasure",
         ],
@@ -1133,6 +1134,102 @@ fn collect_managed_copy_tree(
         unknown.push(relative.to_string_lossy().into_owned());
     }
     Ok(())
+}
+
+/// Recognize only the empty lock files left by cooperative capture operations.
+/// The archive and response barriers exclude active capture entry points while
+/// this inventory is prepared; these control paths are retained as unmanaged
+/// residuals and are never removed by purge.
+fn capture_lock_control_paths(project_dir: &Path) -> Result<Option<Vec<String>>, ()> {
+    let root = project_dir.join("spool/capture");
+    let before = match fs::symlink_metadata(&root) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(()),
+    };
+    if before.file_type().is_symlink() || !before.is_dir() {
+        return Err(());
+    }
+
+    let mut entries = fs::read_dir(&root)
+        .map_err(|_| ())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| ())?;
+    entries.sort_by_key(|entry| entry.file_name());
+
+    let mut paths = vec!["spool/capture".to_owned()];
+    for entry in entries {
+        let name = entry.file_name().into_string().map_err(|_| ())?;
+        let operation = name.strip_suffix(".lock").ok_or(())?;
+        crate::collaboration_capture::OperationId::parse(operation).map_err(|_| ())?;
+        let path = root.join(&name);
+        let before_file = fs::symlink_metadata(&path).map_err(|_| ())?;
+        if before_file.file_type().is_symlink()
+            || !before_file.file_type().is_file()
+            || before_file.len() != 0
+        {
+            return Err(());
+        }
+
+        let mut options = OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        }
+        #[cfg(not(unix))]
+        {
+            // This profile cannot prove that opening a child will not follow a
+            // concurrently substituted link, so preserve the root as unknown.
+            return Err(());
+        }
+        let file = options.open(&path).map_err(|_| ())?;
+        let opened = file.metadata().map_err(|_| ())?;
+        if !opened.is_file() || opened.len() != 0 {
+            return Err(());
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if opened.dev() != before_file.dev() || opened.ino() != before_file.ino() {
+                return Err(());
+            }
+        }
+        let Some(_unlocked) =
+            crate::file_lock::ExclusiveFileLock::try_acquire(file).map_err(|_| ())?
+        else {
+            return Err(());
+        };
+        let after_file = fs::symlink_metadata(&path).map_err(|_| ())?;
+        if after_file.file_type().is_symlink()
+            || !after_file.file_type().is_file()
+            || after_file.len() != 0
+        {
+            return Err(());
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if after_file.dev() != opened.dev() || after_file.ino() != opened.ino() {
+                return Err(());
+            }
+        }
+        paths.push(format!("spool/capture/{name}"));
+    }
+
+    let after = fs::symlink_metadata(&root).map_err(|_| ())?;
+    if after.file_type().is_symlink() || !after.is_dir() {
+        return Err(());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if after.dev() != before.dev() || after.ino() != before.ino() {
+            return Err(());
+        }
+    }
+    Ok(Some(paths))
 }
 
 fn is_directory_item(relative_path: &str) -> bool {
@@ -1513,6 +1610,14 @@ fn prepare_inventory(
         files.retain(|item| !item.relative_path.starts_with("views/"));
         unknown.push("views/".into());
     }
+    let capture_control_paths = match capture_lock_control_paths(store.project_dir()) {
+        Ok(Some(paths)) => paths,
+        Ok(None) => Vec::new(),
+        Err(()) => {
+            unknown.push("spool/capture".into());
+            Vec::new()
+        }
+    };
     // Lock and verifier-authority state is control state, not archived source.
     // Leave it in place and report the exact roots as unmanaged residuals.
     for name in ["objects", "spool"] {
@@ -1542,7 +1647,7 @@ fn prepare_inventory(
                 matches!(
                     child.as_str(),
                     "archive" | "gc" | "gc.lock" | "sensitive-response.lock"
-                )
+                ) || (child == "capture" && !capture_control_paths.is_empty())
             } else {
                 child == "sha256"
             };
@@ -1599,6 +1704,14 @@ fn prepare_inventory(
         tx.execute(
             "INSERT OR IGNORE INTO local_sensitive_residuals
              (incident_id,code,relative_path,permanence) VALUES (?1,'unclassified_managed_path',?2,'unclassified')",
+            rusqlite::params![marker.incident_id, path],
+        )?;
+    }
+    for path in &capture_control_paths {
+        tx.execute(
+            "INSERT OR IGNORE INTO local_sensitive_residuals
+             (incident_id,code,relative_path,permanence)
+             VALUES (?1,'capture_operation_lock_control',?2,'unmanaged')",
             rusqlite::params![marker.incident_id, path],
         )?;
     }
@@ -3389,6 +3502,69 @@ mod tests {
                 rusqlite::params![incident_id, project_key, "0".repeat(64), created_ms],
             )
             .unwrap();
+    }
+
+    #[test]
+    fn capture_lock_control_inventory_accepts_only_empty_root_and_closed_zero_byte_locks() {
+        let root = tempfile::tempdir().unwrap();
+        let capture_root = root.path().join("spool/capture");
+        std::fs::create_dir_all(&capture_root).unwrap();
+        assert_eq!(
+            capture_lock_control_paths(root.path()).unwrap(),
+            Some(vec!["spool/capture".into()])
+        );
+
+        let operation = "cap-0123456789abcdef0123456789abcdef";
+        let lock = capture_root.join(format!("{operation}.lock"));
+        std::fs::write(&lock, b"").unwrap();
+        assert_eq!(
+            capture_lock_control_paths(root.path()).unwrap(),
+            Some(vec![
+                "spool/capture".into(),
+                format!("spool/capture/{operation}.lock")
+            ])
+        );
+    }
+
+    #[test]
+    fn capture_lock_control_inventory_rejects_nonempty_lock_files() {
+        let root = tempfile::tempdir().unwrap();
+        let capture_root = root.path().join("spool/capture");
+        std::fs::create_dir_all(&capture_root).unwrap();
+        let lock = capture_root.join("cap-0123456789abcdef0123456789abcdef.lock");
+        std::fs::write(&lock, b"unclassified bytes").unwrap();
+
+        assert!(capture_lock_control_paths(root.path()).is_err());
+        assert_eq!(std::fs::read(&lock).unwrap(), b"unclassified bytes");
+    }
+
+    #[test]
+    fn capture_lock_control_inventory_rejects_unknown_children() {
+        let root = tempfile::tempdir().unwrap();
+        let capture_root = root.path().join("spool/capture");
+        std::fs::create_dir_all(&capture_root).unwrap();
+        std::fs::write(capture_root.join("notes"), b"").unwrap();
+
+        assert!(capture_lock_control_paths(root.path()).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn capture_lock_control_inventory_rejects_symlinked_lock_children() {
+        let root = tempfile::tempdir().unwrap();
+        let capture_root = root.path().join("spool/capture");
+        std::fs::create_dir_all(&capture_root).unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let sentinel = outside.path().join("sentinel");
+        std::fs::write(&sentinel, b"outside managed tree").unwrap();
+        std::os::unix::fs::symlink(
+            &sentinel,
+            capture_root.join("cap-0123456789abcdef0123456789abcdef.lock"),
+        )
+        .unwrap();
+
+        assert!(capture_lock_control_paths(root.path()).is_err());
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"outside managed tree");
     }
 
     fn create_managed_copy_file(store: &CollaborationStore, relative_path: &str) {
