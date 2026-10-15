@@ -1272,9 +1272,19 @@
       "path": "runs/ci-785-942-lint.json",
       "bytes": 988,
       "sha256": "9f452fa4549ac1db8b3d9fbc625bebf2e658ef34a6fc1339ab7b0a6996c7c40c"
+    },
+    {
+      "path": "ci/ci-785-942-workspace.raw.log",
+      "bytes": 1030034,
+      "sha256": "86e5778934a60ecf28370d4a10d21284628f0038589d9a69400a7a9aa291fda5"
+    },
+    {
+      "path": "runs/ci-785-942-workspace.json",
+      "bytes": 1136,
+      "sha256": "a7d5c0560a52569a65ca43f62071638101a9ff83b3464018eacffc5b38f8713e"
     }
   ],
-  "updated_at_utc": "2026-10-15T21:20:32.349256+00:00",
+  "updated_at_utc": "2026-10-15T21:23:43.976703+00:00",
   "preflight_failures": [
     {
       "metadata": "runs/aggregate-offline-fx17-recorder-preflight-failure.json",
@@ -1359,6 +1369,13 @@
       "id": "ci-785-942-lint",
       "metadata": "runs/ci-785-942-lint.json",
       "exit_code": 101,
+      "conclusion": "FAILURE",
+      "passing_command": false
+    },
+    {
+      "id": "ci-785-942-workspace",
+      "metadata": "runs/ci-785-942-workspace.json",
+      "exit_code": 100,
       "conclusion": "FAILURE",
       "passing_command": false
     }

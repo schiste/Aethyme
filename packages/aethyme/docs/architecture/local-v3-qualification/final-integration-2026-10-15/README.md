@@ -73,7 +73,10 @@ helper. Its workspace command was cancelled with eight distinct first-attempt
 failures: six view-residual assertions, terminal view cleanup and the synthetic
 composite. No completed-suite denominator is assigned. At head `94282330`,
 strict lint failed for a needless borrow in a generation-directory test
-(exit 101). These complete logs and exact checkout metadata remain preserved.
+(exit 101). That head’s completed workspace command ran 4,601 tests:
+4,600 passed, one failed and 32 were skipped (exit 100). Its sole failure was
+the changed `collab` help snapshot. These complete logs and exact checkout
+metadata remain preserved.
 
 ## Initial full workspace run and native fixture repair
 
