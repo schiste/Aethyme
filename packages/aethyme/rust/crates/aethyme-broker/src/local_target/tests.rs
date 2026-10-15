@@ -686,40 +686,45 @@ fn candidate_and_request_objects_are_pinned_atomically_with_their_source() {
 }
 
 #[test]
-fn artifact_retention_permit_rejects_foreign_project_and_epoch_guards() {
+fn artifact_retention_permit_requires_each_exact_guard_and_owner_epoch() {
     let mut f = Fixture::new();
-    let owner = acquire_controller(&mut f.store, "target", "appointed").unwrap();
+    let mut owner = acquire_controller(&mut f.store, "target", "appointed").unwrap();
+    let archive = gc::archive_use(&f.store).unwrap();
+    let response = crate::collaboration_sensitive::response_use(&f.store).unwrap();
+    let authority = authorize(&f.store, &owner).unwrap();
+
+    assert!(
+        ArtifactRetentionPermit::new(&f.store, &owner, &archive, &response, &authority,).is_ok()
+    );
+
     let mut foreign = Fixture::new();
     let foreign_owner = acquire_controller(&mut foreign.store, "target", "appointed").unwrap();
     let foreign_archive = gc::archive_use(&foreign.store).unwrap();
     let foreign_response = crate::collaboration_sensitive::response_use(&foreign.store).unwrap();
     let foreign_authority = authorize(&foreign.store, &foreign_owner).unwrap();
+
+    // Keep every other proof input valid in each negative case so a failure
+    // identifies the individual guard check rather than merely a foreign
+    // project tuple.
     assert!(matches!(
-        ArtifactRetentionPermit::new(
-            &f.store,
-            &owner,
-            &foreign_archive,
-            &foreign_response,
-            &foreign_authority,
-        ),
+        ArtifactRetentionPermit::new(&f.store, &owner, &foreign_archive, &response, &authority,),
         Err(TargetError::Unauthorized)
     ));
 
-    let archive = gc::archive_use(&f.store).unwrap();
-    let response = crate::collaboration_sensitive::response_use(&f.store).unwrap();
-    let mut wrong_epoch_owner =
-        acquire_controller(&mut f.store, "other-target", "appointed").unwrap();
-    let authority = authorize(&f.store, &owner).unwrap();
-    wrong_epoch_owner.epoch =
+    assert!(matches!(
+        ArtifactRetentionPermit::new(&f.store, &owner, &archive, &foreign_response, &authority,),
+        Err(TargetError::Unauthorized)
+    ));
+
+    assert!(matches!(
+        ArtifactRetentionPermit::new(&f.store, &owner, &archive, &response, &foreign_authority,),
+        Err(TargetError::Unauthorized)
+    ));
+
+    owner.epoch =
         serde_json::from_value(serde_json::json!(format!("sha256:{}", "f".repeat(64)))).unwrap();
     assert!(matches!(
-        ArtifactRetentionPermit::new(
-            &f.store,
-            &wrong_epoch_owner,
-            &archive,
-            &response,
-            &authority,
-        ),
+        ArtifactRetentionPermit::new(&f.store, &owner, &archive, &response, &authority,),
         Err(TargetError::Unauthorized)
     ));
 }

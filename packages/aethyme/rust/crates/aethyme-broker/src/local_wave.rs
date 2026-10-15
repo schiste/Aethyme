@@ -796,87 +796,133 @@ pub fn compose(
     repo: &Path,
     wave_id: &RecordId,
 ) -> Result<Wave, WaveError> {
-    let archive_guard = archive_use(store)?;
-    let response_guard = crate::collaboration_sensitive::response_use(store)?;
-    let authority_guard = target::authorize(store, owner)?;
-    let wave = load(store, wave_id)?;
-    let state = current(store, owner, &wave)?;
-    if wave.phase == WavePhase::Verifying {
-        return Ok(wave);
-    }
-    if wave.phase != WavePhase::Frozen {
-        return Err(WaveError::OutcomeUnknown);
-    }
-    let pinned =
-        target::load_revision_under_response(store, &id(&wave.spec.revision)?, &response_guard)?;
-    let baseline =
-        archive::retained(store, &snapshot(&wave.spec.baseline)?)?.ok_or(TargetError::Missing)?;
-    let (base_commit, accepted, already_delivered) = if let Some(key) = &wave.spec.prior_completion
-    {
-        let (completion, prior) = accepted_completion(store, &id(key)?, wave.spec.sequence)?;
-        if completion.target != owner.target()
-            || completion.epoch != owner.authority_epoch().as_str()
+    let (wave, request, already_delivered) = {
+        let _archive_guard = archive_use(store)?;
+        let response_guard = crate::collaboration_sensitive::response_use(store)?;
+        let _authority_guard = target::authorize(store, owner)?;
+        let wave = load(store, wave_id)?;
+        let state = current(store, owner, &wave)?;
+        if wave.phase == WavePhase::Verifying {
+            return Ok(wave);
+        }
+        if wave.phase != WavePhase::Frozen {
+            return Err(WaveError::OutcomeUnknown);
+        }
+        let pinned = target::load_revision_under_response(
+            store,
+            &id(&wave.spec.revision)?,
+            &response_guard,
+        )?;
+        let baseline = archive::retained(store, &snapshot(&wave.spec.baseline)?)?
+            .ok_or(TargetError::Missing)?;
+        let (base_commit, accepted, already_delivered) = if let Some(key) =
+            &wave.spec.prior_completion
         {
+            let (completion, prior) = accepted_completion(store, &id(key)?, wave.spec.sequence)?;
+            if completion.target != owner.target()
+                || completion.epoch != owner.authority_epoch().as_str()
+            {
+                return Err(WaveError::Stale);
+            }
+            let original = archive::retained(store, &snapshot(&pinned.spec.baseline)?)?
+                .ok_or(TargetError::Missing)?;
+            let members = if completion.revision == wave.spec.revision {
+                prior.selected
+            } else {
+                Vec::new()
+            };
+            let accepted = if completion.revision == wave.spec.revision {
+                vec![original.commit]
+            } else {
+                Vec::new()
+            };
+            (
+                CommitOid::parse(&completion.accepted_commit)?,
+                accepted,
+                Some((id(key)?, members)),
+            )
+        } else {
+            (baseline.commit, vec![], None)
+        };
+        let tx = store
+            .connection()
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        guard_current(&tx, owner, &wave, state.version)?;
+        let changed = tx.execute(
+            "UPDATE local_waves SET phase = 'composing' WHERE wave = ?1 AND phase = 'frozen'",
+            [wave_id.as_str()],
+        )?;
+        if changed != 1 {
             return Err(WaveError::Stale);
         }
-        let original = archive::retained(store, &snapshot(&pinned.spec.baseline)?)?
-            .ok_or(TargetError::Missing)?;
-        let members = if completion.revision == wave.spec.revision {
-            prior.selected
-        } else {
-            Vec::new()
-        };
-        let accepted = if completion.revision == wave.spec.revision {
-            vec![original.commit]
-        } else {
-            Vec::new()
-        };
-        (
-            CommitOid::parse(&completion.accepted_commit)?,
+        if tx.execute("UPDATE local_targets SET phase = 'composing', version = version + 1 WHERE target = ?1 AND active_revision = ?2 AND phase = 'wave_frozen'", params![owner.target(),wave.spec.revision])? != 1 {
+            return Err(WaveError::Stale);
+        }
+        tx.commit()?;
+        let request = CompositionRequest {
+            baseline: base_commit,
             accepted,
-            Some((id(key)?, members)),
+            catalog: pinned.spec.catalog()?,
+            deliveries: wave.spec.selected.clone(),
+            budget: CompositionBudget {
+                max_contributions: wave.spec.policy.max_group,
+                ..CompositionBudget::default()
+            },
+        };
+        (wave, request, already_delivered)
+    };
+    let started = std::time::Instant::now();
+    let revision_id = id(&wave.spec.revision)?;
+    let mut retain_candidate =
+        |store: &mut CollaborationStore,
+         candidate: &crate::composition::Candidate,
+         recipe: &composer::RecipeRef,
+         archive_guard: &crate::collaboration_gc::ArchiveUse| {
+            #[cfg(test)]
+            if crate::collaboration_gc::exclusive_available_for_test(store)
+                .map_err(|error| composer::ComposeError::CandidateRetention(error.to_string()))?
+            {
+                return Err(composer::ComposeError::CandidateRetention(
+                    "archive became exclusively available before candidate retention".into(),
+                ));
+            }
+            let response_guard = crate::collaboration_sensitive::response_use(store)
+                .map_err(|error| composer::ComposeError::CandidateRetention(error.to_string()))?;
+            let authority_guard = target::authorize(store, owner)
+                .map_err(|error| composer::ComposeError::CandidateRetention(error.to_string()))?;
+            let retention = target::ArtifactRetentionPermit::new(
+                store,
+                owner,
+                archive_guard,
+                &response_guard,
+                &authority_guard,
+            )
+            .map_err(|error| composer::ComposeError::CandidateRetention(error.to_string()))?;
+            target::retain_artifacts_under_guards(
+                store,
+                &revision_id,
+                std::slice::from_ref(&candidate.subject),
+                std::slice::from_ref(&recipe.object),
+                &retention,
+            )
+            .map_err(|error| composer::ComposeError::CandidateRetention(error.to_string()))
+        };
+    let result = if let Some((completion, members)) = already_delivered {
+        composer::compose_after_accepted_with_candidate_retainer(
+            store,
+            repo,
+            &request,
+            completion,
+            members,
+            &mut retain_candidate,
         )
     } else {
-        (baseline.commit, vec![], None)
-    };
-    let tx = store
-        .connection()
-        .transaction_with_behavior(TransactionBehavior::Immediate)?;
-    guard_current(&tx, owner, &wave, state.version)?;
-    let changed = tx.execute(
-        "UPDATE local_waves SET phase = 'composing' WHERE wave = ?1 AND phase = 'frozen'",
-        [wave_id.as_str()],
-    )?;
-    if changed != 1 {
-        return Err(WaveError::Stale);
-    }
-    if tx.execute("UPDATE local_targets SET phase = 'composing', version = version + 1 WHERE target = ?1 AND active_revision = ?2 AND phase = 'wave_frozen'", params![owner.target(),wave.spec.revision])? != 1 {
-        return Err(WaveError::Stale);
-    }
-    tx.commit()?;
-    drop(authority_guard);
-    drop(response_guard);
-    drop(archive_guard);
-    let started = std::time::Instant::now();
-    let request = CompositionRequest {
-        baseline: base_commit,
-        accepted,
-        catalog: pinned.spec.catalog()?,
-        deliveries: wave.spec.selected.clone(),
-        budget: CompositionBudget {
-            max_contributions: wave.spec.policy.max_group,
-            ..CompositionBudget::default()
-        },
-    };
-    let result = if let Some((completion, members)) = already_delivered {
-        composer::compose_after_accepted(store, repo, &request, completion, members)
-    } else {
-        composer::compose(store, repo, &request)
+        composer::compose_with_candidate_retainer(store, repo, &request, &mut retain_candidate)
     };
     let elapsed = i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX);
     // State may have been stopped while the external Git tool ran. Retain the
     // bytes as historical work, but reject changing the current generation.
-    let (phase, detail, candidate, commit, recipe, candidate_source, recipe_object) = match result {
+    let (phase, detail, candidate, commit, recipe) = match result {
         Ok(composition) => match composition.outcome {
             crate::composition::CompositionOutcome::Candidate(candidate) => {
                 let recipe = composition
@@ -888,8 +934,6 @@ pub fn compose(
                     Some(candidate.subject.to_string()),
                     Some(candidate.commit.as_str().to_string()),
                     Some(recipe.object.hex()),
-                    Some(candidate.subject),
-                    Some(recipe.object),
                 )
             }
             outcome => {
@@ -906,48 +950,14 @@ pub fn compose(
                 } else {
                     "blocked"
                 };
-                (
-                    phase,
-                    outcome.code().to_string(),
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                )
+                (phase, outcome.code().to_string(), None, None, None)
             }
         },
-        Err(error) => (
-            "outcome_unknown",
-            error.to_string(),
-            None,
-            None,
-            None,
-            None,
-            None,
-        ),
+        Err(error) => ("outcome_unknown", error.to_string(), None, None, None),
     };
-    let archive_guard = archive_use(store)?;
-    let response_guard = crate::collaboration_sensitive::response_use(store)?;
-    let authority_guard = target::authorize(store, owner)?;
-    let retention = target::ArtifactRetentionPermit::new(
-        store,
-        owner,
-        &archive_guard,
-        &response_guard,
-        &authority_guard,
-    )?;
-    if let (Some(candidate_source), Some(recipe_object)) =
-        (candidate_source.as_ref(), recipe_object.as_ref())
-    {
-        target::retain_artifacts_under_guards(
-            store,
-            &id(&wave.spec.revision)?,
-            std::slice::from_ref(candidate_source),
-            std::slice::from_ref(recipe_object),
-            &retention,
-        )?;
-    }
+    let _archive_guard = archive_use(store)?;
+    let _response_guard = crate::collaboration_sensitive::response_use(store)?;
+    let _authority_guard = target::authorize(store, owner)?;
     let tx = store
         .connection()
         .transaction_with_behavior(TransactionBehavior::Immediate)?;

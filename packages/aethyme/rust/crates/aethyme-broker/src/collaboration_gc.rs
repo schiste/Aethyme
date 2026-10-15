@@ -196,6 +196,11 @@ fn try_exclusive(store: &CollaborationStore) -> Result<Option<ArchiveExclusive>,
     }
 }
 
+#[cfg(test)]
+pub(crate) fn exclusive_available_for_test(store: &CollaborationStore) -> Result<bool, GcError> {
+    Ok(try_exclusive(store)?.is_some())
+}
+
 /// Administrative sensitive-content purge takes the same exclusive archive
 /// barrier as GC, but does not require an ordinary GC plan.
 pub(crate) fn try_admin_exclusive(
