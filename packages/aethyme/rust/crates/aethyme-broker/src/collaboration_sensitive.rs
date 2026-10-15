@@ -1075,8 +1075,72 @@ fn collect_tree(
     Ok(())
 }
 
+fn managed_copy_directory_digest(relative_path: &str) -> String {
+    let mut hash = Sha256::new();
+    hash.update(b"aethyme-local-sensitive-managed-copy-directory-v1\0");
+    hash.update(relative_path.as_bytes());
+    format!("sha256:{:x}", hash.finalize())
+}
+
+/// Inventory generation and import trees with their exact directory shape as
+/// well as file bytes. Their Git metadata contains empty directories, which
+/// cannot be safely removed from a file-only inventory.
+fn collect_managed_copy_tree(
+    store: &CollaborationStore,
+    relative: &Path,
+    files: &mut Vec<FileItem>,
+    unknown: &mut Vec<String>,
+) -> Result<(), SensitiveError> {
+    let path = store.project_dir().join(relative);
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    if metadata.file_type().is_symlink() {
+        unknown.push(relative.to_string_lossy().into_owned());
+        return Ok(());
+    }
+    if metadata.is_dir() {
+        let Some(relative_path) = directory_item_path(relative) else {
+            unknown.push(relative.to_string_lossy().into_owned());
+            return Ok(());
+        };
+        files.push(FileItem {
+            sha256: managed_copy_directory_digest(&relative_path),
+            relative_path,
+            bytes: 0,
+        });
+        let mut entries = fs::read_dir(&path)?.collect::<Result<Vec<_>, _>>()?;
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            collect_managed_copy_tree(store, &relative.join(entry.file_name()), files, unknown)?;
+        }
+        return Ok(());
+    }
+    if metadata.is_file() {
+        let Some(relative_path) = relative.to_str().map(str::to_owned) else {
+            unknown.push(relative.to_string_lossy().into_owned());
+            return Ok(());
+        };
+        let (sha256, bytes) = hash_file(&path)?;
+        files.push(FileItem {
+            relative_path,
+            sha256,
+            bytes,
+        });
+    } else {
+        unknown.push(relative.to_string_lossy().into_owned());
+    }
+    Ok(())
+}
+
 fn is_directory_item(relative_path: &str) -> bool {
     relative_path.ends_with('/')
+}
+
+fn is_managed_copy_tree_item(relative_path: &str) -> bool {
+    relative_path.starts_with("generations/") || relative_path.starts_with("import-rehearsals/")
 }
 
 fn directory_item_path(relative_path: &Path) -> Option<String> {
@@ -1428,10 +1492,19 @@ fn prepare_inventory(
         Path::new("objects"),
         Path::new("spool/archive"),
         Path::new("spool/gc"),
-        Path::new("generations"),
-        Path::new("import-rehearsals"),
     ] {
         collect_tree(store, path, &mut files, &mut unknown)?;
+    }
+    for path in [Path::new("generations"), Path::new("import-rehearsals")] {
+        let root = path.to_string_lossy().into_owned();
+        let prefix = format!("{root}/");
+        if collect_managed_copy_tree(store, path, &mut files, &mut unknown).is_err() {
+            // Keep no partial per-file inventory when a source tree could not
+            // be inspected completely. The durable root residual blocks a
+            // managed-cleanup completion claim while preserving visibility.
+            files.retain(|item| !item.relative_path.starts_with(&prefix));
+            unknown.push(prefix);
+        }
     }
     if collect_view_tree(store, Path::new("views"), &mut files, &mut unknown).is_err() {
         // Do not create a partial per-file inventory for a view tree that could
@@ -2158,7 +2231,7 @@ fn open_and_lock_view_pin(_path: &Path, _item: &FileItem) -> Result<File, ViewBl
     Err(ViewBlock::Unclassified)
 }
 
-fn set_view_item_deleted(
+fn set_inventory_item_deleted(
     store: &mut CollaborationStore,
     incident_id: &str,
     item: &FileItem,
@@ -2180,7 +2253,7 @@ fn set_view_item_deleted(
             .optional()?;
         if state.as_deref() != Some("deleted") {
             return Err(SensitiveError::Invalid(
-                "view item state could not be durably advanced".into(),
+                "managed item state could not be durably advanced".into(),
             ));
         }
     }
@@ -2227,7 +2300,7 @@ fn delete_view_file(
             if let Some(parent) = path.parent() {
                 sync_directory(parent)?;
             }
-            set_view_item_deleted(store, incident_id, item)?;
+            set_inventory_item_deleted(store, incident_id, item)?;
         }
     }
     Ok(())
@@ -2272,7 +2345,7 @@ fn delete_view_directory(
             if let Some(parent) = path.parent() {
                 sync_directory(parent)?;
             }
-            set_view_item_deleted(store, incident_id, item)?;
+            set_inventory_item_deleted(store, incident_id, item)?;
         }
     }
     Ok(())
@@ -2548,7 +2621,7 @@ fn delete_views_root(
             }
             fs::remove_dir(&path)?;
             sync_directory(store.project_dir())?;
-            set_view_item_deleted(store, incident_id, item)?;
+            set_inventory_item_deleted(store, incident_id, item)?;
             Ok(true)
         }
         Ok(_) => record_view_block(store, incident_id, "views/", ViewBlock::Unclassified),
@@ -2607,12 +2680,11 @@ fn delete_inventory_item(
     Ok(true)
 }
 
-/// Remove only empty generation/import parent directories that are proven by
-/// the immutable file inventory. Directories are metadata, but leaving them
-/// behind would make a successful file purge look like a complete tree purge.
-/// An untracked entry, changed type, symlink, or inspection/sync error records
-/// an unclassified residual and prevents a completion claim.
-fn delete_empty_managed_copy_directories(
+/// Remove only empty generation/import directories present in the immutable
+/// typed inventory. An untracked entry, changed type, symlink, or inspection/
+/// sync error records an unclassified residual and prevents a completion
+/// claim.
+fn delete_managed_copy_directories(
     store: &mut CollaborationStore,
     incident_id: &str,
     inventory: &[FileItem],
@@ -2624,8 +2696,8 @@ fn delete_empty_managed_copy_directories(
             .iter()
             .filter(|item| item.relative_path.starts_with(&prefix))
             .collect::<Vec<_>>();
-        let root_path = store.project_dir().join(root);
         if items.is_empty() {
+            let root_path = store.project_dir().join(root);
             match fs::symlink_metadata(&root_path) {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 _ => {
@@ -2642,8 +2714,27 @@ fn delete_empty_managed_copy_directories(
             continue;
         }
 
-        let mut files_deleted = true;
+        let mut known = BTreeMap::<String, &FileItem>::new();
+        let mut directories = BTreeSet::new();
+        let mut states = BTreeMap::<String, String>::new();
+        let mut blocked_path = None;
         for item in &items {
+            if !item.relative_path.starts_with(&prefix)
+                || known.insert(item.relative_path.clone(), item).is_some()
+            {
+                blocked_path = Some(item.relative_path.clone());
+                break;
+            }
+            let is_directory = is_directory_item(&item.relative_path);
+            if is_directory {
+                if item.bytes != 0
+                    || item.sha256 != managed_copy_directory_digest(&item.relative_path)
+                {
+                    blocked_path = Some(item.relative_path.clone());
+                    break;
+                }
+                directories.insert(item.relative_path.clone());
+            }
             let state: Option<String> = store
                 .read_connection()
                 .query_row(
@@ -2653,8 +2744,17 @@ fn delete_empty_managed_copy_directories(
                     |row| row.get(0),
                 )
                 .optional()?;
-            if state.as_deref() != Some("deleted") {
-                if state.is_none() {
+            match (is_directory, state.as_deref()) {
+                (true, Some("pending")) => {
+                    states.insert(item.relative_path.clone(), "pending".into());
+                }
+                (true, Some("deleted")) => {
+                    states.insert(item.relative_path.clone(), "deleted".into());
+                }
+                (false, Some("deleted")) => {
+                    states.insert(item.relative_path.clone(), "deleted".into());
+                }
+                (_, None) => {
                     add_residual(
                         store,
                         incident_id,
@@ -2662,110 +2762,142 @@ fn delete_empty_managed_copy_directories(
                         &item.relative_path,
                         "unclassified",
                     )?;
-                }
-                files_deleted = false;
-            }
-        }
-        if !files_deleted {
-            complete = false;
-            continue;
-        }
-
-        let mut directories = BTreeSet::new();
-        for item in &items {
-            let mut parent = Path::new(&item.relative_path).parent();
-            while let Some(path) = parent {
-                if path.as_os_str().is_empty() || path == Path::new(".") {
+                    blocked_path = Some(item.relative_path.clone());
                     break;
                 }
-                let Some(relative) = path.to_str() else {
-                    add_residual(
-                        store,
-                        incident_id,
-                        "unclassified_managed_path",
-                        root,
-                        "unclassified",
-                    )?;
-                    complete = false;
-                    directories.clear();
+                _ => {
+                    blocked_path = Some(item.relative_path.clone());
+                    break;
+                }
+            }
+        }
+        if blocked_path.is_none() && !directories.contains(&format!("{root}/")) {
+            blocked_path = Some(format!("{root}/"));
+        }
+
+        // Every inventoried path must have its inventoried parent directory.
+        if blocked_path.is_none() {
+            for item in &items {
+                if item.relative_path == format!("{root}/") {
+                    continue;
+                }
+                let Some(parent) = Path::new(&item.relative_path).parent() else {
+                    blocked_path = Some(item.relative_path.clone());
                     break;
                 };
-                if relative != root && !relative.starts_with(&prefix) {
+                let Some(parent) = directory_item_path(parent) else {
+                    blocked_path = Some(item.relative_path.clone());
+                    break;
+                };
+                if !directories.contains(&parent) {
+                    blocked_path = Some(item.relative_path.clone());
                     break;
                 }
-                directories.insert(relative.to_owned());
-                parent = path.parent();
             }
-        }
-        if directories.is_empty() {
-            add_residual(
-                store,
-                incident_id,
-                "unclassified_managed_path",
-                root,
-                "unclassified",
-            )?;
-            complete = false;
-            continue;
         }
 
-        // Preflight the whole candidate tree before removing any directory.
-        // Every present child must be another inventoried parent directory;
-        // files, symlinks, and newly added directories remain untouched.
-        let mut blocked_path = None;
-        for relative in &directories {
-            let path = match safe_managed_path(store.project_dir(), relative) {
-                Ok(path) => path,
-                Err(_) => {
-                    blocked_path = Some(relative.clone());
-                    break;
+        // Files must already have a durable deletion state and must be absent.
+        if blocked_path.is_none() {
+            for item in &items {
+                if is_directory_item(&item.relative_path) {
+                    continue;
                 }
-            };
-            match fs::symlink_metadata(&path) {
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(_) => {
-                    blocked_path = Some(relative.clone());
-                    break;
-                }
-                Ok(metadata) if metadata.file_type().is_dir() => {}
-                Ok(_) => {
-                    blocked_path = Some(relative.clone());
-                    break;
-                }
-            }
-            let entries = match fs::read_dir(&path) {
-                Ok(entries) => entries,
-                Err(_) => {
-                    blocked_path = Some(relative.clone());
-                    break;
-                }
-            };
-            for entry in entries {
-                let entry = match entry {
-                    Ok(entry) => entry,
+                let path = match safe_managed_path(store.project_dir(), &item.relative_path) {
+                    Ok(path) => path,
                     Err(_) => {
-                        blocked_path = Some(relative.clone());
+                        blocked_path = Some(item.relative_path.clone());
                         break;
                     }
                 };
-                let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
-                    blocked_path = Some(relative.clone());
-                    break;
+                match fs::symlink_metadata(&path) {
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    _ => {
+                        blocked_path = Some(item.relative_path.clone());
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Preflight every inventoried directory before unlinking any. Every
+        // present child must have an exact file or directory inventory row.
+        if blocked_path.is_none() {
+            for item in &items {
+                if !is_directory_item(&item.relative_path) {
+                    continue;
+                }
+                let path = match safe_managed_path(store.project_dir(), &item.relative_path) {
+                    Ok(path) => path,
+                    Err(_) => {
+                        blocked_path = Some(item.relative_path.clone());
+                        break;
+                    }
                 };
-                let child = Path::new(relative).join(name);
-                let Some(child) = child.to_str() else {
-                    blocked_path = Some(relative.clone());
-                    break;
+                let metadata = match fs::symlink_metadata(&path) {
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(_) => {
+                        blocked_path = Some(item.relative_path.clone());
+                        break;
+                    }
+                    Ok(metadata) if metadata.file_type().is_dir() => {}
+                    Ok(_) => {
+                        blocked_path = Some(item.relative_path.clone());
+                        break;
+                    }
                 };
-                if !directories.contains(child) {
-                    blocked_path = Some(child.to_owned());
+                if states
+                    .get(&item.relative_path)
+                    .is_some_and(|state| state == "deleted")
+                {
+                    blocked_path = Some(item.relative_path.clone());
+                    break;
+                }
+                let entries = match fs::read_dir(&path) {
+                    Ok(entries) => entries,
+                    Err(_) => {
+                        blocked_path = Some(item.relative_path.clone());
+                        break;
+                    }
+                };
+                for entry in entries {
+                    let entry = match entry {
+                        Ok(entry) => entry,
+                        Err(_) => {
+                            blocked_path = Some(item.relative_path.clone());
+                            break;
+                        }
+                    };
+                    let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                        blocked_path = Some(item.relative_path.clone());
+                        break;
+                    };
+                    let child_path = path.join(&name);
+                    let child_metadata = match fs::symlink_metadata(&child_path) {
+                        Ok(metadata) => metadata,
+                        Err(_) => {
+                            blocked_path = Some(item.relative_path.clone());
+                            break;
+                        }
+                    };
+                    let child_relative = if child_metadata.file_type().is_dir() {
+                        format!("{}{name}/", item.relative_path)
+                    } else if child_metadata.file_type().is_file() {
+                        format!("{}{name}", item.relative_path)
+                    } else {
+                        blocked_path = Some(item.relative_path.clone());
+                        break;
+                    };
+                    if !known.contains_key(&child_relative) {
+                        blocked_path = Some(child_relative);
+                        break;
+                    }
+                }
+                if blocked_path.is_some() {
                     break;
                 }
             }
-            if blocked_path.is_some() {
-                break;
-            }
         }
+
         if let Some(relative) = blocked_path {
             add_residual(
                 store,
@@ -2786,69 +2918,127 @@ fn delete_empty_managed_copy_directories(
                 .cmp(&Path::new(left).components().count())
                 .then_with(|| right.cmp(left))
         });
-        let mut removal_failure = None;
         for relative in ordered {
+            let Some(item) = known.get(&relative).copied() else {
+                complete = false;
+                break;
+            };
             let path = match safe_managed_path(store.project_dir(), &relative) {
                 Ok(path) => path,
                 Err(_) => {
-                    removal_failure = Some(relative.clone());
+                    add_residual(
+                        store,
+                        incident_id,
+                        "unclassified_managed_path",
+                        &relative,
+                        "unclassified",
+                    )?;
+                    complete = false;
                     break;
                 }
             };
             match fs::symlink_metadata(&path) {
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    set_inventory_item_deleted(store, incident_id, item)?;
+                }
                 Err(_) => {
-                    removal_failure = Some(relative.clone());
+                    add_residual(
+                        store,
+                        incident_id,
+                        "unclassified_managed_path",
+                        &relative,
+                        "unclassified",
+                    )?;
+                    complete = false;
                     break;
                 }
-                Ok(metadata) if metadata.file_type().is_dir() => {}
+                Ok(metadata) if metadata.file_type().is_dir() => {
+                    let mut entries = match fs::read_dir(&path) {
+                        Ok(entries) => entries,
+                        Err(_) => {
+                            add_residual(
+                                store,
+                                incident_id,
+                                "unclassified_managed_path",
+                                &relative,
+                                "unclassified",
+                            )?;
+                            complete = false;
+                            break;
+                        }
+                    };
+                    match entries.next() {
+                        None => {}
+                        Some(Ok(entry)) => {
+                            let child = entry.file_name().to_string_lossy().into_owned();
+                            add_residual(
+                                store,
+                                incident_id,
+                                "unclassified_managed_path",
+                                &format!("{}{child}", relative),
+                                "unclassified",
+                            )?;
+                            complete = false;
+                            break;
+                        }
+                        Some(Err(_)) => {
+                            add_residual(
+                                store,
+                                incident_id,
+                                "unclassified_managed_path",
+                                &relative,
+                                "unclassified",
+                            )?;
+                            complete = false;
+                            break;
+                        }
+                    }
+                    if fs::remove_dir(&path).is_err() {
+                        add_residual(
+                            store,
+                            incident_id,
+                            "unclassified_managed_path",
+                            &relative,
+                            "unclassified",
+                        )?;
+                        complete = false;
+                        break;
+                    }
+                    let Some(parent) = path.parent() else {
+                        add_residual(
+                            store,
+                            incident_id,
+                            "unclassified_managed_path",
+                            &relative,
+                            "unclassified",
+                        )?;
+                        complete = false;
+                        break;
+                    };
+                    if sync_directory(parent).is_err() {
+                        add_residual(
+                            store,
+                            incident_id,
+                            "unclassified_managed_path",
+                            &relative,
+                            "unclassified",
+                        )?;
+                        complete = false;
+                        break;
+                    }
+                    set_inventory_item_deleted(store, incident_id, item)?;
+                }
                 Ok(_) => {
-                    removal_failure = Some(relative.clone());
+                    add_residual(
+                        store,
+                        incident_id,
+                        "unclassified_managed_path",
+                        &relative,
+                        "unclassified",
+                    )?;
+                    complete = false;
                     break;
                 }
-            }
-            let empty = match fs::read_dir(&path) {
-                Ok(mut entries) => match entries.next() {
-                    None => true,
-                    Some(Ok(_)) | Some(Err(_)) => false,
-                },
-                Err(_) => false,
-            };
-            if !empty || fs::remove_dir(&path).is_err() {
-                removal_failure = Some(relative.clone());
-                break;
-            }
-            let Some(parent) = path.parent() else {
-                removal_failure = Some(relative.clone());
-                break;
-            };
-            if sync_directory(parent).is_err() {
-                removal_failure = Some(relative);
-                break;
-            }
-        }
-        if let Some(relative) = removal_failure {
-            add_residual(
-                store,
-                incident_id,
-                "unclassified_managed_path",
-                &relative,
-                "unclassified",
-            )?;
-            complete = false;
-            continue;
-        }
-        match fs::symlink_metadata(&root_path) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            _ => {
-                add_residual(
-                    store,
-                    incident_id,
-                    "unclassified_managed_path",
-                    root,
-                    "unclassified",
-                )?;
-                complete = false;
             }
         }
     }
@@ -3050,6 +3240,10 @@ pub fn purge(
         if item.relative_path == "views/" || item.relative_path.starts_with("views/") {
             continue;
         }
+        if is_managed_copy_tree_item(&item.relative_path) && is_directory_item(&item.relative_path)
+        {
+            continue;
+        }
         let item_state: Option<String> = store
             .read_connection()
             .query_row(
@@ -3069,7 +3263,7 @@ pub fn purge(
             completed = false;
         }
     }
-    if !delete_empty_managed_copy_directories(store, incident_id, &inventory)? {
+    if !delete_managed_copy_directories(store, incident_id, &inventory)? {
         completed = false;
     }
     if groups_complete {
@@ -3197,31 +3391,48 @@ mod tests {
             .unwrap();
     }
 
-    fn register_deleted_managed_file(
-        store: &mut CollaborationStore,
-        incident_id: &str,
-        relative_path: &str,
-    ) -> FileItem {
+    fn create_managed_copy_file(store: &CollaborationStore, relative_path: &str) {
         let path = store.project_dir().join(relative_path);
         let parent = path.parent().unwrap();
         std::fs::create_dir_all(parent).unwrap();
         std::fs::write(&path, b"synthetic managed fixture bytes").unwrap();
-        let (sha256, bytes) = hash_file(&path).unwrap();
-        std::fs::remove_file(&path).unwrap();
-        store
-            .connection()
-            .execute(
-                "INSERT INTO local_sensitive_items
-                 (incident_id,relative_path,sha256,bytes,state)
-                 VALUES (?1,?2,?3,?4,'deleted')",
-                rusqlite::params![incident_id, relative_path, sha256, bytes],
-            )
-            .unwrap();
-        FileItem {
-            relative_path: relative_path.into(),
-            sha256,
-            bytes,
+    }
+
+    fn register_deleted_managed_tree(
+        store: &mut CollaborationStore,
+        incident_id: &str,
+    ) -> Vec<FileItem> {
+        let mut items = Vec::new();
+        let mut unknown = Vec::new();
+        for root in [Path::new("generations"), Path::new("import-rehearsals")] {
+            collect_managed_copy_tree(store, root, &mut items, &mut unknown).unwrap();
         }
+        assert!(unknown.is_empty(), "unexpected fixture paths: {unknown:?}");
+        items.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+        for item in &items {
+            let state = if is_directory_item(&item.relative_path) {
+                "pending"
+            } else {
+                std::fs::remove_file(store.project_dir().join(&item.relative_path)).unwrap();
+                "deleted"
+            };
+            store
+                .connection()
+                .execute(
+                    "INSERT INTO local_sensitive_items
+                     (incident_id,relative_path,sha256,bytes,state)
+                     VALUES (?1,?2,?3,?4,?5)",
+                    rusqlite::params![
+                        incident_id,
+                        item.relative_path,
+                        item.sha256,
+                        item.bytes,
+                        state
+                    ],
+                )
+                .unwrap();
+        }
+        items
     }
 
     #[test]
@@ -3230,18 +3441,15 @@ mod tests {
         let store = &mut fixture.v.f.store;
         let incident_id = format!("sha256:{}", "a".repeat(64));
         insert_purging_incident(store, &incident_id);
-        let inventory = vec![
-            register_deleted_managed_file(
-                store,
-                &incident_id,
-                "generations/t56-generation/source/src/file.txt",
-            ),
-            register_deleted_managed_file(
-                store,
-                &incident_id,
-                "import-rehearsals/t56-import/source/src/file.txt",
-            ),
-        ];
+        create_managed_copy_file(store, "generations/t56-generation/source/src/file.txt");
+        create_managed_copy_file(store, "import-rehearsals/t56-import/source/src/file.txt");
+        std::fs::create_dir_all(
+            store
+                .project_dir()
+                .join("generations/t56-generation/source/.git/objects/info"),
+        )
+        .unwrap();
+        let inventory = register_deleted_managed_tree(store, &incident_id);
         // Model a restart after the deepest empty child was already removed.
         std::fs::remove_dir(
             &store
@@ -3250,9 +3458,50 @@ mod tests {
         )
         .unwrap();
 
-        assert!(delete_empty_managed_copy_directories(store, &incident_id, &inventory).unwrap());
+        assert!(delete_managed_copy_directories(store, &incident_id, &inventory).unwrap());
         assert!(!store.project_dir().join("generations").exists());
         assert!(!store.project_dir().join("import-rehearsals").exists());
+        let pending: i64 = store
+            .read_connection()
+            .query_row(
+                "SELECT count(*) FROM local_sensitive_items
+                 WHERE incident_id=?1 AND state='pending'",
+                [&incident_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(pending, 0);
+    }
+
+    #[test]
+    fn managed_copy_cleanup_removes_inventory_of_empty_roots() {
+        let mut fixture = crate::local_generation::tests::Fixture::new();
+        let store = &mut fixture.v.f.store;
+        let incident_id = format!("sha256:{}", "e".repeat(64));
+        insert_purging_incident(store, &incident_id);
+        std::fs::create_dir_all(store.project_dir().join("generations")).unwrap();
+        std::fs::create_dir_all(store.project_dir().join("import-rehearsals")).unwrap();
+        let inventory = register_deleted_managed_tree(store, &incident_id);
+
+        assert_eq!(inventory.len(), 2);
+        assert!(
+            inventory
+                .iter()
+                .all(|item| is_directory_item(&item.relative_path))
+        );
+        assert!(delete_managed_copy_directories(store, &incident_id, &inventory).unwrap());
+        assert!(!store.project_dir().join("generations").exists());
+        assert!(!store.project_dir().join("import-rehearsals").exists());
+        let deleted: i64 = store
+            .read_connection()
+            .query_row(
+                "SELECT count(*) FROM local_sensitive_items
+                 WHERE incident_id=?1 AND state='deleted'",
+                [&incident_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(deleted, 2);
     }
 
     #[test]
@@ -3261,17 +3510,14 @@ mod tests {
         let store = &mut fixture.v.f.store;
         let incident_id = format!("sha256:{}", "b".repeat(64));
         insert_purging_incident(store, &incident_id);
-        let inventory = vec![register_deleted_managed_file(
-            store,
-            &incident_id,
-            "generations/t56-generation/source/src/file.txt",
-        )];
+        create_managed_copy_file(store, "generations/t56-generation/source/src/file.txt");
+        let inventory = register_deleted_managed_tree(store, &incident_id);
         let untracked = store
             .project_dir()
             .join("generations/t56-generation/source/untracked.txt");
         std::fs::write(&untracked, b"unclassified fixture entry").unwrap();
 
-        assert!(!delete_empty_managed_copy_directories(store, &incident_id, &inventory).unwrap());
+        assert!(!delete_managed_copy_directories(store, &incident_id, &inventory).unwrap());
         assert!(untracked.exists());
         assert!(
             store
@@ -3297,7 +3543,7 @@ mod tests {
         );
 
         std::fs::remove_file(&untracked).unwrap();
-        assert!(delete_empty_managed_copy_directories(store, &incident_id, &inventory).unwrap());
+        assert!(delete_managed_copy_directories(store, &incident_id, &inventory).unwrap());
         assert!(!store.project_dir().join("generations").exists());
         let unresolved: bool = store
             .read_connection()
@@ -3317,24 +3563,21 @@ mod tests {
         let store = &mut fixture.v.f.store;
         let incident_id = format!("sha256:{}", "c".repeat(64));
         insert_purging_incident(store, &incident_id);
-        let inventory = vec![register_deleted_managed_file(
-            store,
-            &incident_id,
-            "generations/t56-generation/source/nested/file.txt",
-        )];
+        create_managed_copy_file(store, "generations/t56-generation/source/nested/file.txt");
+        let inventory = register_deleted_managed_tree(store, &incident_id);
         let changed = store
             .project_dir()
             .join("generations/t56-generation/source/nested");
         std::fs::remove_dir(&changed).unwrap();
         std::fs::write(&changed, b"changed type").unwrap();
 
-        assert!(!delete_empty_managed_copy_directories(store, &incident_id, &inventory).unwrap());
+        assert!(!delete_managed_copy_directories(store, &incident_id, &inventory).unwrap());
         assert!(changed.is_file());
         assert_eq!(std::fs::read(&changed).unwrap(), b"changed type");
 
         std::fs::remove_file(&changed).unwrap();
         std::fs::create_dir(&changed).unwrap();
-        assert!(delete_empty_managed_copy_directories(store, &incident_id, &inventory).unwrap());
+        assert!(delete_managed_copy_directories(store, &incident_id, &inventory).unwrap());
         assert!(!store.project_dir().join("generations").exists());
         let unresolved: bool = store
             .read_connection()
@@ -3355,11 +3598,8 @@ mod tests {
         let store = &mut fixture.v.f.store;
         let incident_id = format!("sha256:{}", "d".repeat(64));
         insert_purging_incident(store, &incident_id);
-        let inventory = vec![register_deleted_managed_file(
-            store,
-            &incident_id,
-            "generations/t56-generation/source/nested/file.txt",
-        )];
+        create_managed_copy_file(store, "generations/t56-generation/source/nested/file.txt");
+        let inventory = register_deleted_managed_tree(store, &incident_id);
         let changed = store
             .project_dir()
             .join("generations/t56-generation/source/nested");
@@ -3369,7 +3609,7 @@ mod tests {
         std::fs::write(&sentinel, b"outside managed tree").unwrap();
         std::os::unix::fs::symlink(target.path(), &changed).unwrap();
 
-        assert!(!delete_empty_managed_copy_directories(store, &incident_id, &inventory).unwrap());
+        assert!(!delete_managed_copy_directories(store, &incident_id, &inventory).unwrap());
         assert!(
             std::fs::symlink_metadata(&changed)
                 .unwrap()
@@ -3380,7 +3620,7 @@ mod tests {
 
         std::fs::remove_file(&changed).unwrap();
         std::fs::create_dir(&changed).unwrap();
-        assert!(delete_empty_managed_copy_directories(store, &incident_id, &inventory).unwrap());
+        assert!(delete_managed_copy_directories(store, &incident_id, &inventory).unwrap());
         assert!(!store.project_dir().join("generations").exists());
         assert_eq!(std::fs::read(&sentinel).unwrap(), b"outside managed tree");
         let unresolved: bool = store
