@@ -3646,7 +3646,7 @@ mod tests {
         let inventory = register_deleted_managed_tree(store, &incident_id);
         // Model a restart after the deepest empty child was already removed.
         std::fs::remove_dir(
-            &store
+            store
                 .project_dir()
                 .join("generations/t56-generation/source/src"),
         )
