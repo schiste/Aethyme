@@ -1,0 +1,22 @@
+{
+  "schema": "aethyme.local-t64-static-review-attestation/v1",
+  "recorded_at_utc": "2026-10-15T22:24:45.614616+00:00",
+  "reviewer": "/root/recover_review_local (gpt-6-luna, max, independent read-only agent)",
+  "reviewed_artifact": {
+    "path": "/private/tmp/aethyme-t64-phase-clarification-v3-8wa1pv3o/clarification.json",
+    "sha256": "7b3e65ab82e53526646483cca2f299d8d8792ef80d05e9ed86afca9c248f990a",
+    "frozen_state_preserved": "proposed-unexecuted-review-required"
+  },
+  "result": "static-review-clear-unexecuted",
+  "finding": "The correction freezes file inputs, source/harness identity, oracle, public briefs, verifier plan and runtime/policy bounds before contributors edit. Required public submits and verifier prepare return opaque IDs later; every returned binding must match before selection, availability or dispatch. Native host state is the fixed regular-file child of the frozen directory, with the derived adjacent journal. Limits, endpoint, case selection, no-replay constraints and contributor oracle exclusion are unchanged.",
+  "execution": {
+    "cli": false,
+    "checker": false,
+    "bootstrap": false,
+    "cargo": false,
+    "tests": false,
+    "docker": false,
+    "private_oracle_contents_accessed": false
+  },
+  "authority": "Static review only; this attestation does not authorize dispatch, replace the runtime handoff, grant current authority, or claim a T64 pass."
+}

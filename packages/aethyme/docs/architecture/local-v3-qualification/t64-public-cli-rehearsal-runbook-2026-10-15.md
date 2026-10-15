@@ -29,7 +29,7 @@ Use the following byte-frozen, unexecuted inputs. Hash the files again at launch
 | `source/lib/math.sh` | `e89cb7689486c429f6f0df217d377962f860e3f93f3fb0f4feceb25ebcbe6ac8` | Frozen seed source |
 | public brief A | `d644536d7b72906b8a116a6968dcafc481f09bc761ae842bf114c9ba885a8313` | Copy to contributor A only |
 | public brief B | `1a235f96bb823a9ce3dc6fa12b5b2d1a2567d900a3d36bab4135f4000b1a6482` | Copy to contributor B only |
-| public task profile | `c5d09a86672fb71780d0164b62805e0017d60b1b89b8a87d4f1b683076777f3f` | Frozen task constraints |
+| public task profile (`$INPUTS/PROFILE.md`) | `c5d09a86672fb71780d0164b62805e0017d60b1b89b8a87d4f1b683076777f3f` | Frozen task constraints |
 | private expected-literals file | `cef37d37e111ca5f0a02312cc867240b2d650a917503e72c989c4d0e78744308` | Operator only; never give to contributors |
 | full original 15-case inventory | `da860fc490fc28a48418711d8555708a1789a84b21a1df4e6f93a3a728a5b947` | Retain unchanged in harness repository |
 | frozen native gate script | `166674592bb5ea0c17fc57bacdf0bbeae0a91d70747d71475b763e695264bfcf` | Install into baseline before freezing it |
@@ -60,6 +60,17 @@ The eight payload directories must be empty at prebootstrap. Any error, unexpect
 The fixed gate-control root is `/private/tmp/aethyme-local-t64-operator-v3-d4cbdvtq/control`; the frozen gate embeds it. The prebootstrap directory checker below records this root's initial empty state before any receipt is written. Only after that receipt succeeds, perform the separate checked control-root inspection and preserve its output/status. Repeat the same check immediately before arming. Do not use the superseded `/private/tmp/aethyme-local-t64-operator-k3igk063/control` path.
 
 Use the independently cleared v3 clarification's append-only phase-manifest chain; never edit an earlier frozen file to add facts learned later:
+
+Store phase manifests under `$RUN_ROOT/receipts/phases/`. Create that directory
+only after the prebootstrap checker succeeds; write every phase with `O_EXCL`
+and fsync the file and parent directory before continuing. Bind each preceding
+phase's exact bytes and SHA-256. In particular,
+`receipts/phases/03-arm.json` is the phase manifest, while
+`receipts/03-arm.json` is the distinct arm-script receipt. Preserve the frozen
+v3 clarification's original proposed-state field and bind its separate independent
+review attestation in `receipts/phases/00-prebootstrap.json`.
+The separate [static review attestation](t64-phase-v3-review-attestation-2026-10-15.json)
+clears that exact frozen clarification; it makes no execution or dispatch claim.
 
 1. `00-prebootstrap.json`, before any Playground CLI call or contributor launch, binds the reviewed Aethyme source commit/tree/clean status and built binary SHA/recipe/cache limitation; every frozen source, inventory, oracle, public-brief, gate and profile hash; exact prepared run/control paths; runtime/resource/budget bounds; intended repository/carrier names; and operator identity. It contains no generated ID or claim of successful work.
 2. `01-precontributor.json`, after the baseline and separate harness commits exist but before either contributor edits, binds both commits/trees/file hashes, both new contributor sessions and their separate worktree paths, the identical source baseline, private bare carrier, public briefs, frozen inventory/oracle/verifier-plan bytes, and task assignments. Session paths/IDs are generated before contributor edits; do not invent them.
@@ -103,6 +114,11 @@ export OPERATOR_AGENT_IDENTITY='<operator Name <operator@example.com>>'
 ```
 
 Run the shell blocks in one `/bin/bash` operator session with `set -euo pipefail` and `umask 077`. A block that reports an error ends the attempt; do not repeat a write into the same fixed receipt path.
+For every command whose status is part of a phase, preserve its literal argv,
+complete stdout/stderr and numeric status in uniquely named receipt files.
+Capture a nonzero status with an `if` branch before recording it, then end the
+phase; status capture never authorizes retrying a failed write. Record the
+failed phase and residual resources in the results/teardown manifest.
 
 The profile files are at `$RUN_ROOT/run-profile-v3.json`, `$RUN_ROOT/prelaunch-checklist-v2.json`, and `$RUN_ROOT/operator-completion-v1.json`; the frozen selection inputs are in `/private/tmp/aethyme-local-t64-zero-exit-v1-kx19p4p_`, public briefs and source/oracle inputs are in `/private/tmp/aethyme-local-t64-inputs-v2-qqslzo4a`, and gate inputs are in `/private/tmp/aethyme-local-t64-operator-v3-d4cbdvtq`. Do not copy the binary or either brief into the prepared run root before the prebootstrap checker succeeds. Only the operator reads or copies `harness/expected-literals.json`.
 
@@ -270,7 +286,7 @@ check_control_root() {
 check_control_root control-initial
 ```
 
-If any check fails, stop; do not edit the frozen script, change this path, delete entries, or rerun with a different control root. The second inspection has separate output/status/stat receipts bound by `03-predispatch.json`.
+If any check fails, stop; do not edit the frozen script, change this path, delete entries, or rerun with a different control root. The second inspection has separate output/status/stat receipts bound by `receipts/phases/03-arm.json`.
 
 Use the frozen existing directories without replacement: `PLAYGROUND=$RUN_ROOT/source`, `HARNESS_REPO=$RUN_ROOT/harness`, Aethyme state at `$RUN_ROOT/state`, output/artifact and bare carrier under `$RUN_ROOT/artifacts`, native temporary files at `$RUN_ROOT/native-temporary`, and receipts at `$RUN_ROOT/receipts`. Clarification v3 explicitly interprets the frozen `native-host` directory as the parent of `ResourcePolicy.host_state=$RUN_ROOT/native-host/host-resources.db` and journal directory `$RUN_ROOT/native-host/local-execution-journal`; this was independently cleared without changing limits or the parent path. Verify the DB file and journal directory are absent at prebootstrap. Do not create extra top-level profile paths or replace any frozen payload directory. Record the path and parent device/inode identities in `00-prebootstrap.json`.
 
@@ -287,7 +303,7 @@ cp "$INPUTS/source/lib/math.sh" "$PLAYGROUND/lib/math.sh"
 git -C "$PLAYGROUND" add app.sh lib
 git -C "$PLAYGROUND" commit -m 'seed(t64): add frozen shell fixture'
 cd "$PLAYGROUND"
-"$AETHYME_BIN" broker scaffold --json > "$RUN_ROOT/receipts/scaffold.json"
+"$AETHYME_BIN" broker advanced scaffold --json > "$RUN_ROOT/receipts/scaffold.json"
 "$AETHYME_BIN" collab enroll --write --json > "$RUN_ROOT/receipts/enroll.json"
 ```
 
@@ -329,15 +345,15 @@ git -C "$PLAYGROUND" status --porcelain=v1
 Require exact gate-file hashes from the frozen table and an empty final status; record the base commit/tree in `00-precontributor.json`. Before starting contributors, inspect and approve the committed gate policy on this machine. The public trust command is interactive and requires a TTY; an agent must not approve its own commands. Preserve both status outputs and require the committed baseline policy digest to be trusted:
 
 ```sh
-"$AETHYME_BIN" broker trust status --repo "$PLAYGROUND" --json \
+"$AETHYME_BIN" broker advanced trust status --repo "$PLAYGROUND" --json \
   > "$RUN_ROOT/receipts/gate-trust-before.json"
 # Run in the operator's terminal, after reviewing the exact printed command.
-"$AETHYME_BIN" broker trust --repo "$PLAYGROUND"
-"$AETHYME_BIN" broker trust status --repo "$PLAYGROUND" --json \
+"$AETHYME_BIN" broker advanced trust --repo "$PLAYGROUND"
+"$AETHYME_BIN" broker advanced trust status --repo "$PLAYGROUND" --json \
   > "$RUN_ROOT/receipts/gate-trust-after.json"
 ```
 
-Check every exit status and the exact policy digest in the final status. A missing, changed, or untrusted policy stops the rehearsal. Do not use `broker advanced trust`, the test-only noninteractive escape, or an agent session to approve it.
+Check every exit status and the exact policy digest in the final status. A missing, changed, or untrusted policy stops the rehearsal. Use the canonical interactive `broker advanced trust` command shown above. Do not use the test-only noninteractive escape or an agent session to approve it.
 
 Freeze the baseline commit only after required-capture config and gate files are committed. Freeze the external behavior inventory and both bounded task briefs before contributor edits; no task brief contains private expected literals. Start both sessions from the same exact base before either submits. Give each a separate, disjoint, behavior-preserving source task. Each contributor works in its own broker worktree and records the prepared HEAD/tree.
 
@@ -692,211 +708,12 @@ test "$?" -eq 0 || exit 1
 
 Freeze `watch-b.py` below into `$RUN_ROOT/bin` and record its SHA-256 and exact argv in `03-predispatch.json`. The B contributor process runs this watcher itself after both submits and target setup. It writes a startup receipt followed by a separate, durable waiting-state receipt immediately before polling for the gate marker. It waits up to 305 seconds: the service's 300-second elapsed horizon plus the dispatcher's maximum five-second ready/waiting receipt window. An absent marker at expiry is unresolved and leaves `release-a` absent. After observing and validating the exact live A gate PID, it invokes the B notice command once with a five-second subprocess deadline and records timeout as unknown. It terminates only its exact owned CLI process group on notice timeout. Its `finally` path creates and syncs `release-a` only after exact gate-PID validation and only while that same child remains live. It never retries the notice or signals A.
 
-```python
-#!/usr/bin/python3
-import datetime, json, os, pathlib, re, shlex, signal, stat, subprocess, sys, time
+The public operator helper is [watch-b.py](../../../../aethyme-eval/t64/watch-b.py), SHA-256 `a4037449f1684098794bbca3dd282142c02dad80bafd73008315c717d0053b5b`. Install its exact reviewed bytes and verify the destination digest; it is an evaluation utility outside the Rust product package.
 
-os.umask(0o077)
-if len(sys.argv) != 9:
-    raise SystemExit("expected control, cli, repo, target, issuer, revision, operation, receipts")
-control, cli, repo, target, issuer, revision, operation, receipts = map(pathlib.Path, sys.argv[1:])
-target, issuer, revision, operation = map(str, (target, issuer, revision, operation))
-uid = os.getuid()
-started = time.monotonic()
-marker_deadline = started + 305.0
-report = {"schema": "aethyme.t64-live-child-watcher/v1", "notice_attempts": 0}
-exit_status = 1
-gate_pid = None
-gate_validated = False
-
-def checked_control():
-    st = os.lstat(control)
-    if not stat.S_ISDIR(st.st_mode) or stat.S_ISLNK(st.st_mode):
-        raise RuntimeError("control root is not a real directory")
-    if st.st_uid != uid or stat.S_IMODE(st.st_mode) != 0o700:
-        raise RuntimeError("control root owner/mode changed")
-
-def verify_arm():
-    fd = os.open(control / "arm-a", os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
-    try:
-        st = os.fstat(fd)
-        raw = os.read(fd, 17)
-    finally:
-        os.close(fd)
-    if (not stat.S_ISREG(st.st_mode) or st.st_uid != uid
-            or stat.S_IMODE(st.st_mode) != 0o600 or st.st_size != 6):
-        raise RuntimeError("arm-a type/owner/mode refused")
-    if raw != b"armed\n":
-        raise RuntimeError("arm-a contents refused")
-
-def sync_directory(path):
-    fd = os.open(path, os.O_RDONLY)
-    try:
-        os.fsync(fd)
-    finally:
-        os.close(fd)
-
-def create_once(path, data):
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
-    fd = os.open(path, flags, 0o600)
-    with os.fdopen(fd, "wb") as stream:
-        stream.write(data)
-        stream.flush()
-        os.fsync(stream.fileno())
-    sync_directory(path.parent)
-
-def read_marker(path):
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-    fd = os.open(path, flags)
-    try:
-        st = os.fstat(fd)
-        if (not stat.S_ISREG(st.st_mode) or st.st_uid != uid
-                or stat.S_IMODE(st.st_mode) != 0o600 or st.st_size > 256):
-            raise RuntimeError("gate marker type/owner/size refused")
-        raw = os.read(fd, 257)
-    finally:
-        os.close(fd)
-    match = re.fullmatch(rb"native-gate-child-active pid=([1-9][0-9]*)\n", raw)
-    if match is None:
-        raise RuntimeError("gate marker format refused")
-    return int(match.group(1))
-
-def child_identity(pid):
-    result = subprocess.run(
-        ["/bin/ps", "-p", str(pid), "-o", "pid=,uid=,stat=,command="],
-        capture_output=True, text=True, timeout=2, check=False)
-    if result.returncode != 0:
-        return None
-    fields = result.stdout.strip().split(maxsplit=3)
-    if len(fields) != 4:
-        return None
-    got_pid, got_uid, state, command = fields
-    argv = shlex.split(command)
-    if int(got_pid) != pid or int(got_uid) != uid or "Z" in state:
-        return None
-    if argv not in (["sh", ".aethyme/t64-native-gate.sh"],
-                    ["/bin/sh", ".aethyme/t64-native-gate.sh"]):
-        return None
-    return {"pid": pid, "uid": uid, "state": state, "command": command}
-
-def record_file(path, value):
-    create_once(path, (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode())
-
-def check_private_dir(path):
-    st = os.lstat(path)
-    if (not stat.S_ISDIR(st.st_mode) or stat.S_ISLNK(st.st_mode)
-            or st.st_uid != uid or stat.S_IMODE(st.st_mode) != 0o700):
-        raise RuntimeError("private receipt directory type/owner/mode refused")
-
-marker = control / "gate-a-started"
-release = control / "release-a"
-notice_out = receipts / "notice-b.stdout"
-notice_err = receipts / "notice-b.stderr"
-ready_path = receipts / "watch-b-ready.json"
-waiting_path = receipts / "watch-b-waiting.json"
-report_path = receipts / "watch-b.json"
-proc = None
-try:
-    checked_control()
-    check_private_dir(receipts)
-    verify_arm()
-    if set(os.listdir(control)) != {"arm-a"}:
-        raise RuntimeError("unexpected control-root entries before service dispatch")
-    report["started_utc"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
-    report["watcher_pid"] = os.getpid()
-    record_file(ready_path, {"schema": "aethyme.t64-live-child-watcher-ready/v1",
-                             "watcher_pid": os.getpid(), "uid": uid,
-                             "started_utc": report["started_utc"],
-                             "phase": "starting_marker_wait", "argv": sys.argv,
-                             "control": str(control), "cli": str(cli), "repo": str(repo),
-                             "target": target, "issuer": issuer, "revision": revision,
-                             "operation": operation})
-    record_file(waiting_path, {"schema": "aethyme.t64-live-child-watcher-waiting/v1",
-                               "watcher_pid": os.getpid(), "uid": uid,
-                               "waiting_for": "gate-a-started", "argv": sys.argv,
-                               "control": str(control), "cli": str(cli), "repo": str(repo),
-                               "target": target, "issuer": issuer, "revision": revision,
-                               "operation": operation})
-    while time.monotonic() < marker_deadline:
-        try:
-            pid = read_marker(marker)
-            break
-        except FileNotFoundError:
-            time.sleep(min(0.1, max(0.0, marker_deadline - time.monotonic())))
-    else:
-        report["gate_marker_result"] = "not_observed_within_305s_unknown"
-        raise TimeoutError("A gate marker was not observed within 305 seconds")
-    report["gate_marker_result"] = "observed"
-    gate_pid = pid
-    report["gate_pid"] = pid
-    report["gate_before"] = child_identity(pid)
-    if report["gate_before"] is None:
-        raise RuntimeError("exact A gate child is not live before B notice")
-    gate_validated = True
-    report["before_notice_utc"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
-    argv = [str(cli), "collab", "target", "capture-notice", "ingest",
-            "--target", target, "--issuer", issuer, "--revision", revision,
-            "--alias", "B", "--operation", operation, "--repo", str(repo), "--json"]
-    report["notice_argv"] = argv
-    with open(notice_out, "xb") as out, open(notice_err, "xb") as err:
-        proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=out, stderr=err,
-                                start_new_session=True)
-        report["notice_pid"] = proc.pid
-        report["notice_attempts"] = 1
-        try:
-            report["notice_exit"] = proc.wait(timeout=5.0)
-            report["notice_result"] = "completed"
-        except subprocess.TimeoutExpired:
-            report["notice_result"] = "timed_out_unknown"
-            try:
-                os.killpg(proc.pid, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
-            try:
-                proc.wait(timeout=1.0)
-            except subprocess.TimeoutExpired:
-                try:
-                    os.killpg(proc.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-                proc.wait(timeout=1.0)
-            report["notice_exit"] = proc.returncode
-    report["after_notice_utc"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
-    report["gate_after"] = child_identity(pid)
-    if report["notice_result"] != "completed" or report["notice_exit"] != 0:
-        raise RuntimeError("B notice did not complete successfully; no retry")
-    if report["gate_after"] is None:
-        raise RuntimeError("exact A gate child ended before B notice post-check")
-    exit_status = 0
-except Exception as exc:
-    report["failure"] = type(exc).__name__ + ": " + str(exc)
-finally:
-    report["finished_utc"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
-    try:
-        checked_control()
-        if not gate_validated or gate_pid is None:
-            report["release_a_created_and_synced"] = False
-            report["release_result"] = "withheld_no_validated_gate"
-        elif (set(os.listdir(control)) != {"arm-a", "gate-a-started"}
-              or read_marker(marker) != gate_pid or child_identity(gate_pid) is None):
-            report["release_a_created_and_synced"] = False
-            report["release_result"] = "withheld_gate_marker_or_exact_child_changed_unknown"
-            exit_status = 1
-        else:
-            create_once(release, b"release\n")
-            report["release_a_created_and_synced"] = True
-            report["release_result"] = "created_after_exact_live_gate_validation"
-    except Exception as exc:
-        report["release_a_created_and_synced"] = False
-        report["release_failure"] = type(exc).__name__ + ": " + str(exc)
-        exit_status = 1
-    try:
-        record_file(report_path, report)
-    except Exception as exc:
-        print("watch report could not be persisted: " + str(exc), file=sys.stderr)
-        exit_status = 1
-print(json.dumps(report, sort_keys=True, separators=(",", ":")))
-raise SystemExit(exit_status)
+```sh
+/usr/bin/install -m 0700 "$AETHYME_SOURCE/packages/aethyme-eval/t64/watch-b.py" \
+  "$RUN_ROOT/bin/watch-b.py"
+test "$(shasum -a 256 "$RUN_ROOT/bin/watch-b.py" | awk '{print $1}')" = a4037449f1684098794bbca3dd282142c02dad80bafd73008315c717d0053b5b
 ```
 
 The watcher itself is a process launched by contributor B, not by the operator. After receiving an explicit START, B runs this exact command once from its contributor tool process. It uses the reviewed source-pinned CLI and run-scoped state, creates `watch-b-ready.json` and then `watch-b-waiting.json` immediately before polling for the gate marker. Do not wait for this command to finish before starting the service; the operator dispatcher waits for both receipts, then verifies the waiting receipt, exact live PID/argv, and control-root contents. B reports the eventual process exit and does not retry:
@@ -915,175 +732,18 @@ After arming, the operator starts one bounded dispatcher. It waits at most five 
 
 Freeze `dispatch-service.py` under `$RUN_ROOT/bin` and record its hash with the phase manifest. The script accepts the service argv after `--`, uses only the listed environment variables, creates logs exclusively, and never signals the service:
 
-```python
-#!/usr/bin/python3
-import datetime, json, os, pathlib, shlex, stat, subprocess, sys, time
+The public operator helper is [dispatch-service.py](../../../../aethyme-eval/t64/dispatch-service.py), SHA-256 `dc19164242307e571cf7b9528a284afcc8487e5fd951831d622c33b6af482e18`. Install its exact reviewed bytes and verify the destination digest; it is an evaluation utility outside the Rust product package.
 
-os.umask(0o077)
-if len(sys.argv) < 8 or sys.argv[6] != "--":
-    raise SystemExit("usage: dispatch-service.py RUN_ROOT TARGET ISSUER REVISION NOTICE_OPERATION -- SERVICE_ARG...")
-root = pathlib.Path(sys.argv[1])
-target, issuer, revision, notice_operation = sys.argv[2:6]
-argv = sys.argv[7:]
-uid = os.getuid()
-receipts = root / "receipts"
-control = pathlib.Path(os.environ.get("CONTROL_ROOT", ""))
-ready_path = receipts / "watch-b-ready.json"
-waiting_path = receipts / "watch-b-waiting.json"
-watcher_script = str(root / "bin" / "watch-b.py")
-deadline = time.monotonic() + 5.0
-
-def check_private_dir(path):
-    st = os.lstat(path)
-    if (not stat.S_ISDIR(st.st_mode) or stat.S_ISLNK(st.st_mode)
-            or st.st_uid != uid or stat.S_IMODE(st.st_mode) != 0o700):
-        raise RuntimeError("private directory type/owner/mode refused")
-
-check_private_dir(root)
-check_private_dir(receipts)
-if not control.is_absolute():
-    raise SystemExit("CONTROL_ROOT must be set to the reviewed absolute path")
-check_private_dir(control)
-if set(os.listdir(control)) != {"arm-a"}:
-    raise SystemExit("control root changed before service dispatch")
-arm_fd = os.open(control / "arm-a", os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
-try:
-    arm_stat = os.fstat(arm_fd)
-    arm_bytes = os.read(arm_fd, 7)
-finally:
-    os.close(arm_fd)
-if (not stat.S_ISREG(arm_stat.st_mode) or arm_stat.st_uid != uid
-        or stat.S_IMODE(arm_stat.st_mode) != 0o600 or arm_bytes != b"armed\n"):
-    raise SystemExit("arm-a identity/content changed; no service dispatched")
-
-def read_private_json(path, max_bytes=8192):
-    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
-    try:
-        st = os.fstat(fd)
-        if (not stat.S_ISREG(st.st_mode) or st.st_uid != uid
-                or stat.S_IMODE(st.st_mode) != 0o600
-                or st.st_size > max_bytes):
-            raise RuntimeError("receipt type/owner/mode/size refused")
-        raw = os.read(fd, max_bytes + 1)
-    finally:
-        os.close(fd)
-    return json.loads(raw)
-
-def write_once(path, value):
-    raw = (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode()
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
-    with os.fdopen(fd, "wb") as stream:
-        stream.write(raw)
-        stream.flush()
-        os.fsync(stream.fileno())
-    dirfd = os.open(path.parent, os.O_RDONLY)
-    try:
-        os.fsync(dirfd)
-    finally:
-        os.close(dirfd)
-
-while time.monotonic() < deadline:
-    try:
-        ready = read_private_json(ready_path)
-        waiting = read_private_json(waiting_path)
-        break
-    except FileNotFoundError:
-        time.sleep(0.05)
-else:
-    raise SystemExit("watcher ready receipt not observed within five seconds; no service dispatched")
-if ready.get("schema") != "aethyme.t64-live-child-watcher-ready/v1":
-    raise SystemExit("watcher ready receipt schema mismatch; no service dispatched")
-if waiting.get("schema") != "aethyme.t64-live-child-watcher-waiting/v1":
-    raise SystemExit("watcher waiting receipt schema mismatch; no service dispatched")
-if not argv or argv[0] != str(root / "bin" / "aethyme"):
-    raise SystemExit("service must use the run-pinned CLI; no service dispatched")
-
-watcher_pid = int(ready["watcher_pid"])
-expected_watcher_argv = [watcher_script, str(control), argv[0], str(root / "source"),
-                         target, issuer, revision, notice_operation, str(receipts)]
-if (ready.get("uid") != uid or ready.get("phase") != "starting_marker_wait"
-        or ready.get("target") != target or ready.get("issuer") != issuer
-        or ready.get("revision") != revision or ready.get("operation") != notice_operation
-        or ready.get("control") != str(control) or ready.get("repo") != str(root / "source")
-        or ready.get("argv") != expected_watcher_argv
-        or waiting.get("watcher_pid") != watcher_pid or waiting.get("uid") != uid
-        or waiting.get("waiting_for") != "gate-a-started"
-        or waiting.get("target") != target or waiting.get("issuer") != issuer
-        or waiting.get("revision") != revision or waiting.get("operation") != notice_operation
-        or waiting.get("control") != str(control) or waiting.get("repo") != str(root / "source")
-        or waiting.get("argv") != expected_watcher_argv):
-    raise SystemExit("watcher startup/waiting receipt identity mismatch; no service dispatched")
-def option(name):
-    try:
-        return argv[argv.index(name) + 1]
-    except (ValueError, IndexError):
-        raise SystemExit("service argv is missing " + name + "; no service dispatched")
-repo = option("--repo")
-if (option("--target") != target or option("--issuer") != issuer
-        or pathlib.Path(repo) != root / "source"
-        or option("--endpoint") != "unix:///Volumes/T7-repositories/Colima/home/default/docker.sock"
-        or option("--docker") != "/opt/homebrew/bin/docker"):
-    raise SystemExit("service target/issuer/repository binding mismatch; no service dispatched")
-ps = subprocess.run(["/bin/ps", "-p", str(watcher_pid), "-o", "pid=,uid=,stat=,command="],
-                    capture_output=True, text=True, timeout=2, check=False)
-fields = ps.stdout.strip().split(maxsplit=3)
-if ps.returncode != 0 or len(fields) != 4:
-    raise SystemExit("watcher is not live; no service dispatched")
-pid_text, uid_text, state, command = fields
-watcher_argv = shlex.split(command)
-if (int(pid_text) != watcher_pid or int(uid_text) != uid or "Z" in state
-        or len(watcher_argv) < 2
-        or watcher_argv[0] not in ("/usr/bin/python3", "python3")
-        or watcher_argv[1:] != expected_watcher_argv):
-    raise SystemExit("watcher PID does not match exact run-owned script; no service dispatched")
-if (set(os.listdir(control)) != {"arm-a"}
-        or (control / "gate-a-started").exists()
-        or (control / "release-a").exists()):
-    raise SystemExit("watcher no longer waits for the gate marker; no service dispatched")
-
-env_names = ("HOME", "PATH", "DOCKER_HOST", "AETHYME_HOST_STATE_DIR", "TMPDIR")
-if any(name not in os.environ for name in env_names):
-    raise SystemExit("required clean service environment is incomplete")
-env = {name: os.environ[name] for name in env_names}
-started = datetime.datetime.now(datetime.timezone.utc).isoformat()
-stdout_fd = os.open(receipts / "service.stdout", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-stderr_fd = os.open(receipts / "service.stderr", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-with os.fdopen(stdout_fd, "wb") as out, os.fdopen(stderr_fd, "wb") as err:
-    child = subprocess.Popen(argv, cwd=root, env=env, stdin=subprocess.DEVNULL,
-                             stdout=out, stderr=err, start_new_session=True)
-    print(json.dumps({"service_pid": child.pid, "watcher_pid": watcher_pid,
-                      "started_utc": started, "argv": argv}, sort_keys=True), flush=True)
-    write_once(receipts / "service-started.json", {
-        "schema": "aethyme.t64-service-process/v1", "pid": child.pid,
-        "uid": uid, "process_group": child.pid, "argv": argv,
-        "watcher_pid": watcher_pid, "started_utc": started,
-        "observation_timeout_seconds": 360
-    })
-    stop_at = time.monotonic() + 360.0
-    while child.poll() is None and time.monotonic() < stop_at:
-        time.sleep(0.2)
-    if child.poll() is None:
-        observation = {"schema": "aethyme.t64-service-observation/v1",
-                       "state": "running_unknown", "pid": child.pid,
-                       "uid": uid, "observed_utc": datetime.datetime.now(
-                           datetime.timezone.utc).isoformat(),
-                       "signal_sent": False}
-        write_once(receipts / "service-observation.json", observation)
-        raise SystemExit(124)
-    status = child.wait()
-    observation = {"schema": "aethyme.t64-service-observation/v1",
-                   "state": "exited", "pid": child.pid, "uid": uid,
-                   "exit_status": status,
-                   "observed_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-                   "signal_sent": False}
-    write_once(receipts / "service-observation.json", observation)
-raise SystemExit(status)
+```sh
+/usr/bin/install -m 0700 "$AETHYME_SOURCE/packages/aethyme-eval/t64/dispatch-service.py" \
+  "$RUN_ROOT/bin/dispatch-service.py"
+test "$(shasum -a 256 "$RUN_ROOT/bin/dispatch-service.py" | awk '{print $1}')" = dc19164242307e571cf7b9528a284afcc8487e5fd951831d622c33b6af482e18
 ```
 
 Invoke the dispatcher with the complete explicit-endpoint command; do not wrap it in shell `&`, `wait`, `timeout`, or a retry loop:
 
 ```sh
-/usr/bin/python3 "$RUN_ROOT/bin/dispatch-service.py" \
+if /usr/bin/python3 "$RUN_ROOT/bin/dispatch-service.py" \
   "$RUN_ROOT" "$TARGET" "$ISSUER" "$REVISION" "$NOTICE_OPERATION_B" -- \
   "$AETHYME_BIN" collab target run \
   --target "$TARGET" --issuer "$ISSUER" \
@@ -1096,10 +756,17 @@ Invoke the dispatcher with the complete explicit-endpoint command; do not wrap i
   --timeout 30 --authorization "T64 private finite Local publication" \
   --allow-replacement no --repo "$PLAYGROUND" --json \
   > "$RUN_ROOT/receipts/dispatcher.stdout" \
-  2> "$RUN_ROOT/receipts/dispatcher.stderr"
+  2> "$RUN_ROOT/receipts/dispatcher.stderr"; then
+  dispatcher_status=0
+else
+  dispatcher_status=$?
+fi
+(set -o noclobber; printf '%s\n' "$dispatcher_status" \
+  > "$RUN_ROOT/receipts/dispatcher.status")
+test "$dispatcher_status" -eq 0
 ```
 
-Preserve the dispatcher exit status, `service-started.json`, `service-observation.json` when present, service stdout/stderr, and B's watcher report/status. A missing file or still-running PID is unresolved, not a successful empty result. After the exact gate child has been observed and validated, the watcher attempts at most one `release-a` create even if the B notice fails; before that validation it withholds release. If release could not be durably created or the exact child changed, preserve the gate/job roots and report the result as unknown. Never kill by process name or touch another run's control root. No process or resource is declared absent based only on an empty global Docker list.
+Preserve `dispatcher.status` and bind its numeric exit in the results phase even on failure; do not repeat the dispatcher. Preserve `service-started.json`, `service-observation.json` when present, service stdout/stderr, and B's watcher report/status. A missing file or still-running PID is unresolved, not a successful empty result. After the exact gate child has been observed and validated, the watcher attempts at most one `release-a` create even if the B notice fails; before that validation it withholds release. If release could not be durably created or the exact child changed, preserve the gate/job roots and report the result as unknown. Never kill by process name or touch another run's control root. No process or resource is declared absent based only on an empty global Docker list.
 
 The service's own 300-second elapsed bound and this operator's 360-second observation deadline have different purposes. If the operator deadline wins, do not kill or settle; inspect the exact nonce/job state read-only and keep all unknown roots. All files remain private raw evidence.
 
