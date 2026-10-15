@@ -380,9 +380,8 @@ fn assert_archive_exclusive_observed(lock_path: &std::path::Path, label: &str, s
 impl ResumeGc {
     fn release(&mut self) {
         if let Some(sender) = self.0.take() {
-            if sender.send(()).is_err() {
-                eprintln!("GC worker already exited; no pause remains to release.");
-            }
+            // A closed receiver means the GC worker exited; no pause remains.
+            sender.send(()).unwrap_or(());
         }
     }
 }
