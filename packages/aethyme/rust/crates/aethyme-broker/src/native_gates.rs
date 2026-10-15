@@ -62,6 +62,8 @@ pub enum NativeGateError {
     Gates(#[from] crate::gates::GateConfigError),
     #[error(transparent)]
     Preparation(#[from] crate::preparation::PreparationError),
+    #[error(transparent)]
+    Sensitive(#[from] crate::collaboration_sensitive::SensitiveError),
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -179,6 +181,7 @@ struct StoredJobRow {
 
 /// Durable historical read. Dispatch separately requires current authority.
 pub fn load(store: &CollaborationStore, key: &RecordId) -> Result<Job, NativeGateError> {
+    let _response = crate::collaboration_sensitive::response_use(store)?;
     let row = store
         .read_connection()
         .query_row(

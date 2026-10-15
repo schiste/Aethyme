@@ -530,6 +530,7 @@ fn request_digest(
 fn operator_uid() -> Result<u32, SensitiveError> {
     #[cfg(unix)]
     {
+        // SAFETY: `geteuid` has no preconditions and only reads the effective UID.
         Ok(unsafe { libc::geteuid() })
     }
     #[cfg(not(unix))]
