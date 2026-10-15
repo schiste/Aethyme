@@ -118,6 +118,56 @@ fn object_relpath(store: &CollaborationStore, digest: &ObjectDigest) -> String {
         .into_owned()
 }
 
+fn assert_native_job_sources_retained(
+    store: &CollaborationStore,
+    plan: &gc::GcPlan,
+    job: &Job,
+    expected_snapshots: &[String],
+    expected_contributions: &[String],
+    phase: &str,
+) {
+    let expected_snapshots: std::collections::BTreeSet<_> =
+        expected_snapshots.iter().cloned().collect();
+    let expected_contributions: std::collections::BTreeSet<_> =
+        expected_contributions.iter().cloned().collect();
+    let missing_snapshots: Vec<_> = expected_snapshots
+        .iter()
+        .filter(|id| {
+            plan.entities
+                .contains(&gc::GcEntity::Snapshot((*id).clone()))
+        })
+        .collect();
+    let missing_contributions: Vec<_> = expected_contributions
+        .iter()
+        .filter(|id| {
+            plan.entities
+                .contains(&gc::GcEntity::Contribution((*id).clone()))
+        })
+        .collect();
+    assert!(
+        missing_snapshots.is_empty() && missing_contributions.is_empty(),
+        "{phase}: native job source entities became reclaimable; missing snapshots={missing_snapshots:?}, missing contributions={missing_contributions:?}; full GC plan={plan:#?}"
+    );
+
+    for id in &expected_snapshots {
+        let manifest = ObjectDigest::of_snapshot(&snapshot(id).expect("expected snapshot id"));
+        let relpath = object_relpath(store, &manifest);
+        assert!(
+            !plan.reclaimable.iter().any(|item| item.relpath == relpath),
+            "{phase}: native job source manifest {id} became reclaimable at {relpath}; full GC plan={plan:#?}"
+        );
+    }
+    let job_record = ObjectDigest::of(&record(&job.spec).unwrap().canonical_bytes());
+    let recipe_record = digest(&job.spec.recipe).unwrap();
+    for (name, object) in [("job record", job_record), ("recipe record", recipe_record)] {
+        let relpath = object_relpath(store, &object);
+        assert!(
+            !plan.reclaimable.iter().any(|item| item.relpath == relpath),
+            "{phase}: native job {name} became reclaimable at {relpath}; full GC plan={plan:#?}"
+        );
+    }
+}
+
 fn age_object(store: &CollaborationStore, digest: &ObjectDigest) {
     std::fs::File::open(archive::object_path(store, digest))
         .unwrap()
@@ -588,8 +638,18 @@ fn dispatching_and_unknown_jobs_stay_rooted_without_a_process_tree_proof() {
     let owner = s.owner.as_ref().expect("setup owner is present");
     let job = prepare(&mut s.f.store, owner, &mut s.broker, &s.wave).unwrap();
     let roots_before = root_count(&s.f.store, &job.id);
-    let subject_object = ObjectDigest::of_snapshot(&snapshot(&job.spec.subject).unwrap());
-    let subject_relpath = object_relpath(&s.f.store, &subject_object);
+    let expected_snapshots = [
+        job.spec.subject.clone(),
+        job.spec.baseline.clone(),
+        s.f.a.base.snapshot_id.to_string(),
+        s.f.a.result.snapshot_id.to_string(),
+        s.f.b.base.snapshot_id.to_string(),
+        s.f.b.result.snapshot_id.to_string(),
+    ];
+    let expected_contributions = [
+        s.f.a.lineage_record_id.to_string(),
+        s.f.b.lineage_record_id.to_string(),
+    ];
     s.f.store
         .connection()
         .execute(
@@ -598,26 +658,14 @@ fn dispatching_and_unknown_jobs_stay_rooted_without_a_process_tree_proof() {
         )
         .unwrap();
 
-    // Inspect while the durable state is dispatching. It must still retain
-    // the exact candidate manifest before any transition to unknown.
+    // Remove target ownership and age the source. These assertions name the
+    // expected job closure from its frozen spec and selected fixture lineages;
+    // unrelated orphaned fixture history can still be collectible.
     s.f.store
         .connection()
         .execute("DELETE FROM local_target_roots", [])
         .unwrap();
     age_archive_objects(&s.f.store);
-    let dispatching_plan = gc::plan(&mut s.f.store, &gc::GcOptions::default()).unwrap();
-    assert!(
-        dispatching_plan.blockers.is_empty(),
-        "{:?}",
-        dispatching_plan.blockers
-    );
-    assert!(
-        !dispatching_plan
-            .reclaimable
-            .iter()
-            .any(|item| item.relpath == subject_relpath)
-    );
-    assert!(dispatching_plan.entities.is_empty());
 
     for state in ["dispatching", "unknown"] {
         if state == "unknown" {
@@ -629,6 +677,17 @@ fn dispatching_and_unknown_jobs_stay_rooted_without_a_process_tree_proof() {
                 )
                 .unwrap();
         }
+        let plan = gc::plan(&mut s.f.store, &gc::GcOptions::default()).unwrap();
+        assert!(plan.blockers.is_empty(), "{:?}", plan.blockers);
+        assert_native_job_sources_retained(
+            &s.f.store,
+            &plan,
+            &job,
+            &expected_snapshots,
+            &expected_contributions,
+            state,
+        );
+
         let result = release_roots(&mut s.f.store, owner, &job.id).unwrap();
         assert_eq!(result.status, RootReleaseStatus::UnknownHeld);
         assert_eq!(result.job.state, state);
@@ -636,18 +695,6 @@ fn dispatching_and_unknown_jobs_stay_rooted_without_a_process_tree_proof() {
         assert_eq!(root_count(&s.f.store, &job.id), roots_before);
     }
 
-    let plan = gc::plan(&mut s.f.store, &gc::GcOptions::default()).unwrap();
-    assert!(plan.blockers.is_empty(), "{:?}", plan.blockers);
-    assert!(
-        plan.reclaimable.is_empty(),
-        "unknown native job lost source roots: {:?}",
-        plan.reclaimable
-    );
-    assert!(
-        plan.entities.is_empty(),
-        "unknown native job lost retained records: {:?}",
-        plan.entities
-    );
     assert_eq!(load(&s.f.store, &job.id).unwrap().state, "unknown");
 }
 

@@ -166,33 +166,63 @@ fn repository_binding(broker: &Broker, spec: &Spec) -> Result<(), NativeGateErro
     }
     Ok(())
 }
+struct StoredJobRow {
+    body: Vec<u8>,
+    state: String,
+    observation: Option<Vec<u8>>,
+    target: String,
+    revision: String,
+    epoch: String,
+    wave: String,
+    roots_released_ms: Option<i64>,
+}
+
 /// Durable historical read. Dispatch separately requires current authority.
 pub fn load(store: &CollaborationStore, key: &RecordId) -> Result<Job, NativeGateError> {
-    let row:(Vec<u8>,String,Option<Vec<u8>>,String,String,String,String,Option<i64>)=store.read_connection()
-        .query_row("SELECT body,state,observation,target,revision,epoch,wave,roots_released_ms FROM local_native_gate_jobs WHERE id=?1",
-        [key.as_str()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?)))
-        .optional()?.ok_or(NativeGateError::Mismatch)?;
-    let rec = Record::decode(&row.0, &[&SCHEMA]).map_err(|_| NativeGateError::Mismatch)?;
-    let body: Value = serde_json::from_slice(&row.0)?;
+    let row = store
+        .read_connection()
+        .query_row(
+            "SELECT body,state,observation,target,revision,epoch,wave,roots_released_ms FROM local_native_gate_jobs WHERE id=?1",
+            [key.as_str()],
+            |row| {
+                Ok(StoredJobRow {
+                    body: row.get(0)?,
+                    state: row.get(1)?,
+                    observation: row.get(2)?,
+                    target: row.get(3)?,
+                    revision: row.get(4)?,
+                    epoch: row.get(5)?,
+                    wave: row.get(6)?,
+                    roots_released_ms: row.get(7)?,
+                })
+            },
+        )
+        .optional()?
+        .ok_or(NativeGateError::Mismatch)?;
+    let rec = Record::decode(&row.body, &[&SCHEMA]).map_err(|_| NativeGateError::Mismatch)?;
+    let body: Value = serde_json::from_slice(&row.body)?;
     let spec: Spec = serde_json::from_value(body["spec"].clone())?;
     if rec.id() != *key
-        || rec.canonical_bytes() != row.0
+        || rec.canonical_bytes() != row.body
         || spec.profile != PROFILE
         || spec.max_dispatches != 1
         || spec.execution_allowance_seconds != 300
-        || spec.target != row.3
-        || spec.revision != row.4
-        || spec.epoch != row.5
-        || spec.wave != row.6
+        || spec.target != row.target
+        || spec.revision != row.revision
+        || spec.epoch != row.epoch
+        || spec.wave != row.wave
     {
         return Err(NativeGateError::Mismatch);
     }
     Ok(Job {
         id: key.clone(),
         spec,
-        state: row.1,
-        observation: row.2.map(|b| serde_json::from_slice(&b)).transpose()?,
-        roots_released_ms: row.7,
+        state: row.state,
+        observation: row
+            .observation
+            .map(|bytes| serde_json::from_slice(&bytes))
+            .transpose()?,
+        roots_released_ms: row.roots_released_ms,
     })
 }
 
