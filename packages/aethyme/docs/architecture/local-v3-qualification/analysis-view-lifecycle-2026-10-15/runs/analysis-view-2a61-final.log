@@ -1,0 +1,30 @@
+   Compiling aethyme-engine v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/fix-analysis-view-hold-retire-and-public/packages/aethyme/rust/crates/aethyme-engine)
+   Compiling aethyme-broker v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/fix-analysis-view-hold-retire-and-public/packages/aethyme/rust/crates/aethyme-broker)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 33.22s
+     Running unittests src/lib.rs (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/integrate-reviewed-local-bare-git-servic/target/local-resume/cargo/debug/deps/aethyme_broker-0f278e0d02146111)
+
+running 21 tests
+test analysis_view::tests::a_reader_does_not_wait_for_a_build ... ok
+test analysis_view::tests::a_deleted_target_is_an_unresolved_gap_not_absence ... ok
+test analysis_view::tests::a_symlinked_view_is_unknown_and_untouched ... ok
+test analysis_view::tests::a_view_answers_only_under_its_profile ... ok
+test analysis_view::tests::hold_publications_allocate_distinct_exclusive_temporaries ... ok
+test analysis_view::tests::build_publication_waits_for_retirement_lock ... ok
+test analysis_view::tests::a_superseded_generation_waits_for_grace ... ok
+test analysis_view::tests::a_pinned_generation_and_current_are_never_reclaimed ... ok
+test analysis_view::tests::a_held_or_building_view_keeps_everything ... ok
+test analysis_view::tests::an_interrupted_view_reclamation_resumes ... ok
+test analysis_view::tests::a_crash_never_publishes_a_partial_generation ... ok
+test analysis_view::tests::hold_and_retire_wait_for_the_same_lifecycle_lock ... ok
+test analysis_view::tests::concurrent_holds_preserve_each_holder_and_expiry ... ok
+test analysis_view::tests::opening_a_view_pins_before_retirement_can_finish ... ok
+test analysis_view::tests::hold_publication_preserves_another_temporary_file ... ok
+test analysis_view::tests::overlays_and_stacking_are_refused ... ok
+test analysis_view::tests::known_interactions_hold ... ok
+test analysis_view::tests::retiring_waits_for_holds_and_readers ... ok
+test analysis_view::tests::stale_build_debris_is_reclaimed_after_grace ... ok
+test analysis_view::tests::unknown_holds_keep_views_during_plan_and_apply ... ok
+test analysis_view::tests::views_are_isolated_and_never_write_canonical_state ... ok
+
+test result: ok. 21 passed; 0 failed; 0 ignored; 0 measured; 1799 filtered out; finished in 5.35s
+

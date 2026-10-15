@@ -43,6 +43,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use aethyme_contracts::experimental_v0::analysis::ANALYSIS_PROFILE_SCHEMA;
@@ -61,6 +62,29 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::collaboration_state::CollaborationStore;
+
+#[cfg(test)]
+#[derive(Debug)]
+enum LifecycleLockEvent {
+    Blocked(PathBuf),
+    Finished(&'static str),
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static LIFECYCLE_LOCK_EVENTS: std::cell::RefCell<
+        Option<std::sync::mpsc::Sender<LifecycleLockEvent>>
+    > = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn send_lifecycle_lock_event(event: LifecycleLockEvent) {
+    LIFECYCLE_LOCK_EVENTS.with(|events| {
+        if let Some(sender) = events.borrow().as_ref() {
+            let _ = sender.send(event);
+        }
+    });
+}
 
 /// The manifest schema of a view generation.
 pub const VIEW_SCHEMA: &str = "aethyme.analysis-view/experimental-v0";
@@ -310,6 +334,90 @@ fn open_lock(path: &Path) -> Result<File, ViewError> {
         .map_err(io(path))
 }
 
+fn lifecycle_lock_path(view_dir: &Path) -> PathBuf {
+    view_dir.join(".lifecycle.lock")
+}
+
+fn lock_lifecycle(view_dir: &Path) -> Result<File, ViewError> {
+    let path = lifecycle_lock_path(view_dir);
+    let file = open_lock(&path)?;
+    #[cfg(test)]
+    let lock_result = match file.try_lock() {
+        Ok(()) => Ok(()),
+        Err(std::fs::TryLockError::WouldBlock) => {
+            send_lifecycle_lock_event(LifecycleLockEvent::Blocked(path.clone()));
+            file.lock()
+        }
+        Err(std::fs::TryLockError::Error(source)) => Err(source),
+    };
+    #[cfg(not(test))]
+    let lock_result = file.lock();
+    lock_result.map_err(io(&path))?;
+    Ok(file)
+}
+
+fn lock_lifecycle_shared(view_dir: &Path) -> Result<File, ViewError> {
+    let path = lifecycle_lock_path(view_dir);
+    let file = open_lock(&path)?;
+    #[cfg(test)]
+    let lock_result = match file.try_lock_shared() {
+        Ok(()) => Ok(()),
+        Err(std::fs::TryLockError::WouldBlock) => {
+            send_lifecycle_lock_event(LifecycleLockEvent::Blocked(path.clone()));
+            file.lock_shared()
+        }
+        Err(std::fs::TryLockError::Error(source)) => Err(source),
+    };
+    #[cfg(not(test))]
+    let lock_result = file.lock_shared();
+    lock_result.map_err(io(&path))?;
+    Ok(file)
+}
+
+fn archive_use(
+    store: &CollaborationStore,
+) -> Result<crate::collaboration_gc::ArchiveUse, ViewError> {
+    crate::collaboration_gc::archive_use(store).map_err(|source| ViewError::Io {
+        path: crate::collaboration_gc::lock_path(store),
+        source,
+    })
+}
+
+fn is_retired(view_dir: &Path) -> Result<bool, ViewError> {
+    let path = view_dir.join("RETIRED");
+    match std::fs::symlink_metadata(&path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(source) => Err(ViewError::Io { path, source }),
+    }
+}
+
+fn remove_retired(view_dir: &Path) -> Result<(), ViewError> {
+    let path = view_dir.join("RETIRED");
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(ViewError::Io { path, source }),
+    }
+}
+
+fn publish_current(
+    store: &CollaborationStore,
+    view_dir: &Path,
+    generation: u64,
+) -> Result<(), ViewError> {
+    let _archive = archive_use(store)?;
+    let _lifecycle = lock_lifecycle(view_dir)?;
+    let pointer = view_dir.join("CURRENT.tmp");
+    write_synced(&pointer, format!("gen-{generation}\n").as_bytes())?;
+    std::fs::rename(&pointer, view_dir.join("CURRENT")).map_err(io(&pointer))?;
+    sync_dir(view_dir)?;
+    // Revive only after a successful new generation is current. If anything
+    // before this point fails, a retired view remains retired.
+    remove_retired(view_dir)?;
+    sync_dir(view_dir)
+}
+
 /// Try to hold `path` exclusively; `None` while anyone holds it.
 fn try_exclusive(path: &Path) -> Result<Option<File>, ViewError> {
     let file = open_lock(path)?;
@@ -434,14 +542,6 @@ pub fn build_view(
     let lock_path = view_dir.join(".build.lock");
     let lock = open_lock(&lock_path)?;
     lock.lock().map_err(io(&lock_path))?;
-    // Building revives a retired view. A marker that cannot be removed would
-    // leave the new generation looking retired, so that is an error.
-    let retired = view_dir.join("RETIRED");
-    match std::fs::remove_file(&retired) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(io(&retired)(error)),
-    }
 
     let generation = generations(&view_dir)?.last().copied().unwrap_or(0) + 1;
     let building = view_dir.join(format!("building-{generation}-{}", std::process::id()));
@@ -536,10 +636,11 @@ pub fn build_view(
     std::fs::rename(&building, &published).map_err(io(&published))?;
     sync_dir(&view_dir)?;
     fault!(options, BeforeCurrent);
-    let pointer = view_dir.join("CURRENT.tmp");
-    write_synced(&pointer, format!("gen-{generation}\n").as_bytes())?;
-    std::fs::rename(&pointer, view_dir.join("CURRENT")).map_err(io(&pointer))?;
-    sync_dir(&view_dir)?;
+
+    // Readers, holders, retirement, and publication share this short lock.
+    // The build lock remains held while archive access is reacquired here;
+    // GC probes build locks nonblocking under its archive-exclusive lock.
+    publish_current(store, &view_dir, generation)?;
     drop(lock);
     Ok(name)
 }
@@ -582,13 +683,17 @@ pub fn view_for_snapshot(
 /// Pin `view`'s published generation for reading.
 pub fn open_view(store: &CollaborationStore, view: &str) -> Result<ViewReader, ViewError> {
     let view_dir = views_root(store).join(view);
-    // Pins are taken under the archive's shared lock, like every other pin,
-    // so a reclamation apply (exclusive) never races a new reader.
-    let _use = crate::collaboration_gc::archive_use(store).map_err(|source| ViewError::Io {
-        path: crate::collaboration_gc::lock_path(store),
-        source,
-    })?;
-    if view_dir.join("RETIRED").exists() {
+    // Archive first, then lifecycle, so reclamation and retirement cannot
+    // cross a reader's retired check and generation pin.
+    let _archive = archive_use(store)?;
+    if is_retired(&view_dir)? {
+        return Err(ViewError::Retired { view: view.into() });
+    }
+    if current_generation(&view_dir)?.is_none() {
+        return Err(ViewError::NotFound { view: view.into() });
+    }
+    let _lifecycle = lock_lifecycle_shared(&view_dir)?;
+    if is_retired(&view_dir)? {
         return Err(ViewError::Retired { view: view.into() });
     }
     // CURRENT may move between reading the pointer and pinning; pin, then
@@ -928,13 +1033,136 @@ pub(crate) struct ViewHold {
     pub until_ms: Option<i64>,
 }
 
+#[derive(Debug, Default)]
+pub(crate) struct LiveHolds {
+    pub count: usize,
+    pub unknown: Vec<String>,
+}
+
+static HOLD_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
 fn holds_dir(view_dir: &Path) -> PathBuf {
     view_dir.join("holds")
 }
 
+fn hold_filename(holder: &str) -> String {
+    format!("{}.json", &hex(&Sha256::digest(holder.as_bytes()))[..32])
+}
+
+fn is_hold_temporary(filename: &str) -> bool {
+    let Some(identifier) = filename
+        .strip_prefix(".hold-")
+        .and_then(|name| name.strip_suffix(".tmp"))
+    else {
+        return false;
+    };
+    let Some((pid, sequence)) = identifier.split_once('-') else {
+        return false;
+    };
+    pid.parse::<u32>().is_ok() && sequence.parse::<u64>().is_ok()
+}
+
+fn ensure_holds_dir(view_dir: &Path) -> Result<PathBuf, ViewError> {
+    let dir = holds_dir(view_dir);
+    match std::fs::symlink_metadata(&dir) {
+        Ok(metadata) if metadata.file_type().is_dir() => Ok(dir),
+        Ok(_) => Err(ViewError::Corrupt {
+            view: view_dir.display().to_string(),
+            detail: "holds path is not a real directory".into(),
+        }),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::create_dir(&dir).map_err(io(&dir))?;
+            Ok(dir)
+        }
+        Err(source) => Err(ViewError::Io { path: dir, source }),
+    }
+}
+
+fn create_hold_temporary(dir: &Path) -> Result<(PathBuf, File), ViewError> {
+    for _ in 0..1024 {
+        let sequence = HOLD_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let path = dir.join(format!(".hold-{}-{sequence}.tmp", std::process::id()));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(file) => return Ok((path, file)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(source) => return Err(ViewError::Io { path, source }),
+        }
+    }
+    Err(ViewError::Io {
+        path: dir.to_path_buf(),
+        source: std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "could not allocate a unique hold temporary file",
+        ),
+    })
+}
+
+struct HoldTemporary(PathBuf);
+
+impl Drop for HoldTemporary {
+    fn drop(&mut self) {
+        match std::fs::remove_file(&self.0) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => crate::warn_unrecorded(
+                &format!("remove temporary view hold {}", self.0.display()),
+                Err::<(), _>(error),
+            ),
+        }
+    }
+}
+
+fn write_hold_atomic(dir: &Path, path: &Path, body: &[u8]) -> Result<(), ViewError> {
+    let (temporary, mut file) = create_hold_temporary(dir)?;
+    let _cleanup = HoldTemporary(temporary.clone());
+    file.write_all(body).map_err(io(&temporary))?;
+    file.sync_all().map_err(io(&temporary))?;
+    drop(file);
+    std::fs::rename(&temporary, path).map_err(io(path))?;
+    sync_dir(dir)
+}
+
+fn ensure_existing_hold_belongs_to(path: &Path, holder: &str) -> Result<(), ViewError> {
+    match std::fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(ViewError::Io {
+            path: path.to_path_buf(),
+            source,
+        }),
+        Ok(metadata) if !metadata.file_type().is_file() => Err(ViewError::Corrupt {
+            view: path.display().to_string(),
+            detail: "hold path is not a regular file".into(),
+        }),
+        Ok(_) => {
+            let bytes = std::fs::read(path).map_err(io(path))?;
+            let existing: ViewHold =
+                serde_json::from_slice(&bytes).map_err(|error| ViewError::Corrupt {
+                    view: path.display().to_string(),
+                    detail: error.to_string(),
+                })?;
+            let expected = hold_filename(&existing.holder);
+            if existing.holder == holder
+                && path.file_name().and_then(|name| name.to_str()) == Some(expected.as_str())
+            {
+                Ok(())
+            } else {
+                Err(ViewError::Corrupt {
+                    view: path.display().to_string(),
+                    detail: "hold identity does not match its path".into(),
+                })
+            }
+        }
+    }
+}
+
 /// Record that `holder` (an X3 report, an L3 context) relies on `view` until
 /// `until_ms`, or until released. A held view is neither retired nor
-/// reclaimed. Taken under the archive's shared lock like other pins.
+/// reclaimed. The lock order is the archive's shared lock, then the view
+/// lifecycle lock, matching readers and retirement.
 pub fn hold_view(
     store: &CollaborationStore,
     view: &str,
@@ -944,29 +1172,24 @@ pub fn hold_view(
     if holder.is_empty() || holder.len() > 200 {
         return Err(ViewError::InvalidHolder);
     }
-    let _use = crate::collaboration_gc::archive_use(store).map_err(|source| ViewError::Io {
-        path: crate::collaboration_gc::lock_path(store),
-        source,
-    })?;
+    let _archive = archive_use(store)?;
     let view_dir = views_root(store).join(view);
-    if current_generation(&view_dir)?.is_none() || view_dir.join("RETIRED").exists() {
+    if current_generation(&view_dir)?.is_none() || is_retired(&view_dir)? {
         return Err(ViewError::NotFound { view: view.into() });
     }
-    let dir = holds_dir(&view_dir);
-    std::fs::create_dir_all(&dir).map_err(io(&dir))?;
-    let path = dir.join(format!(
-        "{}.json",
-        &hex(&Sha256::digest(holder.as_bytes()))[..32]
-    ));
+    let _lifecycle = lock_lifecycle(&view_dir)?;
+    if current_generation(&view_dir)?.is_none() || is_retired(&view_dir)? {
+        return Err(ViewError::NotFound { view: view.into() });
+    }
+    let dir = ensure_holds_dir(&view_dir)?;
+    let path = dir.join(hold_filename(holder));
+    ensure_existing_hold_belongs_to(&path, holder)?;
     let body = serde_json::to_vec(&ViewHold {
         holder: holder.into(),
         until_ms,
     })
     .expect("a hold serializes");
-    let temporary = dir.join(".hold.tmp");
-    write_synced(&temporary, &body)?;
-    std::fs::rename(&temporary, &path).map_err(io(&path))?;
-    sync_dir(&dir)
+    write_hold_atomic(&dir, &path, &body)
 }
 
 /// Release `holder`'s hold on `view`. `false` when there was none.
@@ -975,11 +1198,28 @@ pub fn release_view_hold(
     view: &str,
     holder: &str,
 ) -> Result<bool, ViewError> {
-    let dir = holds_dir(&views_root(store).join(view));
-    let path = dir.join(format!(
-        "{}.json",
-        &hex(&Sha256::digest(holder.as_bytes()))[..32]
-    ));
+    let _archive = archive_use(store)?;
+    let view_dir = views_root(store).join(view);
+    if std::fs::symlink_metadata(&view_dir)
+        .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+    {
+        return Ok(false);
+    }
+    let _lifecycle = lock_lifecycle(&view_dir)?;
+    let dir = holds_dir(&view_dir);
+    match std::fs::symlink_metadata(&dir) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(source) => return Err(ViewError::Io { path: dir, source }),
+        Ok(metadata) if !metadata.file_type().is_dir() => {
+            return Err(ViewError::Corrupt {
+                view: view_dir.display().to_string(),
+                detail: "holds path is not a real directory".into(),
+            });
+        }
+        Ok(_) => {}
+    };
+    let path = dir.join(hold_filename(holder));
+    ensure_existing_hold_belongs_to(&path, holder)?;
     match std::fs::remove_file(&path) {
         Ok(()) => {
             sync_dir(&dir)?;
@@ -990,22 +1230,56 @@ pub fn release_view_hold(
     }
 }
 
-/// The holds on `view_dir` that are still live at `now_ms`. A hold file that
-/// cannot be read counts as live: an unknown dependent is protected.
-pub(crate) fn live_holds(view_dir: &Path, now_ms: i64) -> usize {
-    let Ok(entries) = std::fs::read_dir(holds_dir(view_dir)) else {
-        return 0;
-    };
-    entries
-        .filter_map(Result::ok)
-        .filter(|entry| entry.file_name().to_string_lossy().ends_with(".json"))
-        .filter(|entry| {
-            std::fs::read(entry.path())
-                .ok()
-                .and_then(|bytes| serde_json::from_slice::<ViewHold>(&bytes).ok())
-                .is_none_or(|hold| hold.until_ms.is_none_or(|until| until > now_ms))
-        })
-        .count()
+/// The holds on `view_dir` that are still live at `now_ms`. Malformed or
+/// unreadable entries are reported as unknown and count as live.
+pub(crate) fn live_holds(view_dir: &Path, now_ms: i64) -> Result<LiveHolds, ViewError> {
+    let dir = holds_dir(view_dir);
+    match std::fs::symlink_metadata(&dir) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(LiveHolds::default());
+        }
+        Err(source) => return Err(ViewError::Io { path: dir, source }),
+        Ok(metadata) if !metadata.file_type().is_dir() => {
+            return Err(ViewError::Corrupt {
+                view: view_dir.display().to_string(),
+                detail: "holds path is not a real directory".into(),
+            });
+        }
+        Ok(_) => {}
+    }
+    let entries = std::fs::read_dir(&dir).map_err(io(&dir))?;
+    let mut scan = LiveHolds::default();
+    for entry in entries {
+        let entry = entry.map_err(io(&dir))?;
+        let filename = entry.file_name().to_string_lossy().into_owned();
+        if is_hold_temporary(&filename) && entry.file_type().is_ok_and(|kind| kind.is_file()) {
+            continue;
+        }
+        if !filename.ends_with(".json") {
+            scan.count += 1;
+            scan.unknown.push(filename);
+            continue;
+        }
+        let path = entry.path();
+        let parsed = entry
+            .file_type()
+            .ok()
+            .filter(|kind| kind.is_file())
+            .and_then(|_| std::fs::read(&path).ok())
+            .and_then(|bytes| serde_json::from_slice::<ViewHold>(&bytes).ok());
+        match parsed {
+            Some(hold) if filename == hold_filename(&hold.holder) => {
+                if hold.until_ms.is_none_or(|until| until > now_ms) {
+                    scan.count += 1;
+                }
+            }
+            Some(_) | None => {
+                scan.count += 1;
+                scan.unknown.push(filename);
+            }
+        }
+    }
+    Ok(scan)
 }
 
 fn now_ms() -> i64 {
@@ -1024,15 +1298,20 @@ fn now_ms() -> i64 {
 /// reading process forks a child, which shares the lock until it execs; a
 /// `pinned` refusal right after a release is safe to retry.
 pub fn retire(store: &CollaborationStore, view: &str) -> Result<(), ViewError> {
+    let _archive = archive_use(store)?;
     let view_dir = views_root(store).join(view);
+    if current_generation(&view_dir)?.is_none() {
+        return Err(ViewError::NotFound { view: view.into() });
+    }
+    let _lifecycle = lock_lifecycle(&view_dir)?;
     let Some(generation) = current_generation(&view_dir)? else {
         return Err(ViewError::NotFound { view: view.into() });
     };
-    let holders = live_holds(&view_dir, now_ms());
-    if holders > 0 {
+    let holders = live_holds(&view_dir, now_ms())?;
+    if holders.count > 0 {
         return Err(ViewError::Held {
             view: view.into(),
-            holders,
+            holders: holders.count,
         });
     }
     let pin = view_dir.join(format!("gen-{generation}/.pin"));
@@ -1051,6 +1330,13 @@ mod tests {
     use super::*;
     use crate::collaboration_archive::{pin_commit, retain_snapshot};
     use crate::collaboration_state::{CollaborationRoot, ProjectKey};
+    use std::sync::{Arc, Barrier, mpsc};
+    use std::thread;
+    use std::time::Duration;
+
+    fn track_lifecycle_lock_events(sender: mpsc::Sender<LifecycleLockEvent>) {
+        LIFECYCLE_LOCK_EVENTS.with(|events| *events.borrow_mut() = Some(sender));
+    }
 
     fn git(repo: &Path, args: &[&str]) {
         let output = std::process::Command::new("/usr/bin/env")
@@ -1456,6 +1742,331 @@ mod tests {
             (!items.is_empty()).then_some(items)
         });
         assert_eq!(items.len(), 1, "{items:?}");
+    }
+
+    #[test]
+    fn hold_publications_allocate_distinct_exclusive_temporaries() {
+        let dir = tempfile::tempdir().unwrap();
+        let (first_path, first) = create_hold_temporary(dir.path()).unwrap();
+        let (second_path, second) = create_hold_temporary(dir.path()).unwrap();
+        assert_ne!(first_path, second_path);
+        assert!(first_path.is_file());
+        assert!(second_path.is_file());
+        drop((first, second));
+    }
+
+    #[test]
+    fn hold_publication_preserves_another_temporary_file() {
+        let host = tempfile::tempdir().unwrap();
+        let repo = fixture();
+        let mut store = store(host.path());
+        let snapshot = retain(&mut store, repo.path());
+        let view = build_view(&store, &snapshot, &options()).unwrap();
+        let holds = holds_dir(&views_root(&store).join(&view));
+        std::fs::create_dir(&holds).unwrap();
+        let other_temporary = holds.join(".hold.tmp");
+        std::fs::write(&other_temporary, b"another publisher's temporary bytes").unwrap();
+
+        hold_view(&store, &view, "new-holder", None).unwrap();
+
+        assert_eq!(
+            std::fs::read(&other_temporary).unwrap(),
+            b"another publisher's temporary bytes"
+        );
+        let published: ViewHold = serde_json::from_slice(
+            &std::fs::read(holds.join(hold_filename("new-holder"))).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(published.holder, "new-holder");
+        assert_eq!(published.until_ms, None);
+    }
+
+    #[test]
+    fn concurrent_holds_preserve_each_holder_and_expiry() {
+        let host = tempfile::tempdir().unwrap();
+        let repo = fixture();
+        let mut setup = store(host.path());
+        let snapshot = retain(&mut setup, repo.path());
+        let view = build_view(&setup, &snapshot, &options()).unwrap();
+        let barrier = Arc::new(Barrier::new(3));
+        let (done_tx, done_rx) = mpsc::channel();
+        let expiry = now_ms() + 60_000;
+
+        for (holder, until_ms) in [("holder-a", None), ("holder-b", Some(expiry))] {
+            let barrier = Arc::clone(&barrier);
+            let tx = done_tx.clone();
+            let store = store(host.path());
+            let view = view.clone();
+            thread::spawn(move || {
+                barrier.wait();
+                tx.send(hold_view(&store, &view, holder, until_ms).map_err(|error| error.code()))
+                    .unwrap();
+            });
+        }
+        drop(done_tx);
+        barrier.wait();
+        for _ in 0..2 {
+            done_rx
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .unwrap();
+        }
+
+        let dir = holds_dir(&views_root(&setup).join(&view));
+        let first: ViewHold =
+            serde_json::from_slice(&std::fs::read(dir.join(hold_filename("holder-a"))).unwrap())
+                .unwrap();
+        let second: ViewHold =
+            serde_json::from_slice(&std::fs::read(dir.join(hold_filename("holder-b"))).unwrap())
+                .unwrap();
+        assert_eq!(first.holder, "holder-a");
+        assert_eq!(first.until_ms, None);
+        assert_eq!(second.holder, "holder-b");
+        assert_eq!(second.until_ms, Some(expiry));
+        let scan = live_holds(&views_root(&setup).join(&view), now_ms()).unwrap();
+        assert_eq!(scan.count, 2);
+        assert!(scan.unknown.is_empty(), "{:?}", scan.unknown);
+    }
+
+    #[test]
+    fn unknown_holds_keep_views_during_plan_and_apply() {
+        let host = tempfile::tempdir().unwrap();
+        let repo = fixture();
+        let mut store = store(host.path());
+        let snapshot = retain(&mut store, repo.path());
+        let view = build_view(&store, &snapshot, &options()).unwrap();
+        build_view(&store, &snapshot, &options()).unwrap();
+        let view_dir = views_root(&store).join(&view);
+        let holds = holds_dir(&view_dir);
+        std::fs::create_dir(&holds).unwrap();
+        let broken = hold_filename("broken-json");
+        std::fs::write(holds.join(&broken), b"{").unwrap();
+        let mismatched = hold_filename("expected-holder");
+        std::fs::write(
+            holds.join(&mismatched),
+            serde_json::to_vec(&ViewHold {
+                holder: "different-holder".into(),
+                until_ms: Some(1),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let scan = live_holds(&view_dir, now_ms()).unwrap();
+        assert_eq!(scan.count, 2);
+        assert!(scan.unknown.contains(&broken));
+        assert!(scan.unknown.contains(&mismatched));
+        assert_eq!(retire(&store, &view).unwrap_err().code(), "held");
+
+        age_views(&store);
+        let protected = plan(&mut store, &GcOptions::default()).unwrap();
+        assert!(
+            protected
+                .unknown
+                .contains(&format!("views/{view}/holds/{broken}"))
+        );
+        assert!(
+            protected
+                .unknown
+                .contains(&format!("views/{view}/holds/{mismatched}"))
+        );
+        assert!(
+            protected
+                .reclaimable
+                .iter()
+                .all(|item| item.relpath != format!("views/{view}/gen-1"))
+        );
+
+        std::fs::remove_dir_all(&holds).unwrap();
+        let clean_plan = plan(&mut store, &GcOptions::default()).unwrap();
+        assert!(
+            clean_plan
+                .reclaimable
+                .iter()
+                .any(|item| item.relpath == format!("views/{view}/gen-1"))
+        );
+        std::fs::write(&holds, b"not a directory").unwrap();
+        assert_eq!(retire(&store, &view).unwrap_err().code(), "corrupt_view");
+        assert!(!view_dir.join("RETIRED").exists());
+
+        let report = apply(&mut store, &clean_plan.digest, &GcOptions::default()).unwrap();
+        assert!(
+            report
+                .reclaimed
+                .iter()
+                .all(|item| item.relpath != format!("views/{view}/gen-1"))
+        );
+        assert!(view_dir.join("gen-1").is_dir());
+    }
+
+    #[test]
+    fn hold_and_retire_wait_for_the_same_lifecycle_lock() {
+        let host = tempfile::tempdir().unwrap();
+        let repo = fixture();
+        let mut setup = store(host.path());
+        let snapshot = retain(&mut setup, repo.path());
+        let view = build_view(&setup, &snapshot, &options()).unwrap();
+        let view_dir = views_root(&setup).join(&view);
+        let lifecycle = lock_lifecycle(&view_dir).unwrap();
+        let (event_tx, event_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+
+        let hold_events = event_tx.clone();
+        let hold_done = done_tx.clone();
+        let hold_store = store(host.path());
+        let hold_view_name = view.clone();
+        let hold_thread = thread::spawn(move || {
+            track_lifecycle_lock_events(hold_events);
+            hold_done
+                .send((
+                    "hold",
+                    hold_view(&hold_store, &hold_view_name, "race-holder", None)
+                        .map_err(|error| error.code()),
+                ))
+                .unwrap();
+            send_lifecycle_lock_event(LifecycleLockEvent::Finished("hold"));
+        });
+
+        let retire_events = event_tx.clone();
+        let retire_done = done_tx;
+        let retire_store = store(host.path());
+        let retire_view_name = view.clone();
+        let retire_thread = thread::spawn(move || {
+            track_lifecycle_lock_events(retire_events);
+            retire_done
+                .send((
+                    "retire",
+                    retire(&retire_store, &retire_view_name).map_err(|error| error.code()),
+                ))
+                .unwrap();
+            send_lifecycle_lock_event(LifecycleLockEvent::Finished("retire"));
+        });
+
+        let expected = lifecycle_lock_path(&view_dir);
+        let mut blocked_paths = Vec::new();
+        let mut early_finishes = Vec::new();
+        while blocked_paths.len() < 2 && early_finishes.is_empty() {
+            match event_rx.recv_timeout(Duration::from_secs(5)) {
+                Ok(LifecycleLockEvent::Blocked(path)) => blocked_paths.push(path),
+                Ok(LifecycleLockEvent::Finished(operation)) => early_finishes.push(operation),
+                Err(mpsc::RecvTimeoutError::Timeout | mpsc::RecvTimeoutError::Disconnected) => {
+                    break;
+                }
+            }
+        }
+        drop(lifecycle);
+
+        let mut outcomes = Vec::new();
+        while outcomes.len() < 2 {
+            outcomes.push(done_rx.recv_timeout(Duration::from_secs(5)).unwrap());
+        }
+        hold_thread.join().unwrap();
+        retire_thread.join().unwrap();
+        assert_eq!(blocked_paths, vec![expected.clone(), expected.clone()]);
+        assert!(
+            early_finishes.is_empty(),
+            "an operation finished before locking"
+        );
+        let first = outcomes.remove(0);
+        let second = outcomes.remove(0);
+        let hold_result = if first.0 == "hold" { first.1 } else { second.1 };
+        let retire_result = if first.0 == "retire" {
+            first.1
+        } else {
+            second.1
+        };
+        assert_ne!(hold_result.is_ok(), retire_result.is_ok());
+        if hold_result.is_ok() {
+            assert!(!view_dir.join("RETIRED").exists());
+            assert_eq!(live_holds(&view_dir, now_ms()).unwrap().count, 1);
+        } else {
+            assert!(view_dir.join("RETIRED").is_file());
+        }
+    }
+
+    #[test]
+    fn opening_a_view_pins_before_retirement_can_finish() {
+        let host = tempfile::tempdir().unwrap();
+        let repo = fixture();
+        let mut setup = store(host.path());
+        let snapshot = retain(&mut setup, repo.path());
+        let view = build_view(&setup, &snapshot, &options()).unwrap();
+        let view_dir = views_root(&setup).join(&view);
+        let lifecycle = lock_lifecycle(&view_dir).unwrap();
+        let reader_store = store(host.path());
+        let reader_view_name = view.clone();
+        let (event_tx, event_rx) = mpsc::channel();
+        let (reader_tx, reader_rx) = mpsc::channel();
+        let reader_thread = thread::spawn(move || {
+            track_lifecycle_lock_events(event_tx);
+            reader_tx
+                .send(open_view(&reader_store, &reader_view_name))
+                .unwrap();
+            send_lifecycle_lock_event(LifecycleLockEvent::Finished("open"));
+        });
+        let blocked_path = match event_rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(LifecycleLockEvent::Blocked(path)) => Some(path),
+            Ok(LifecycleLockEvent::Finished(_))
+            | Err(mpsc::RecvTimeoutError::Timeout | mpsc::RecvTimeoutError::Disconnected) => None,
+        };
+        drop(lifecycle);
+        let reader_result = reader_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        reader_thread.join().unwrap();
+        assert_eq!(blocked_path, Some(lifecycle_lock_path(&view_dir)));
+        let reader = reader_result.unwrap();
+        assert_eq!(retire(&setup, &view).unwrap_err().code(), "pinned");
+        drop(reader);
+    }
+
+    #[test]
+    fn build_publication_waits_for_retirement_lock() {
+        let host = tempfile::tempdir().unwrap();
+        let repo = fixture();
+        let mut setup = store(host.path());
+        let snapshot = retain(&mut setup, repo.path());
+        let view = build_view(&setup, &snapshot, &options()).unwrap();
+        let survey = plan(&mut setup, &GcOptions::default()).unwrap();
+        assert!(
+            !survey
+                .unknown
+                .contains(&format!("views/{view}/.lifecycle.lock"))
+        );
+        retire(&setup, &view).unwrap();
+        let view_dir = views_root(&setup).join(&view);
+        let second_generation = view_dir.join("gen-2");
+        std::fs::create_dir(&second_generation).unwrap();
+        std::fs::write(second_generation.join(".pin"), b"").unwrap();
+        let lifecycle = lock_lifecycle(&view_dir).unwrap();
+        let publish_store = store(host.path());
+        let publish_view_dir = view_dir.clone();
+        let (event_tx, event_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let publish_thread = thread::spawn(move || {
+            track_lifecycle_lock_events(event_tx);
+            done_tx
+                .send(
+                    publish_current(&publish_store, &publish_view_dir, 2)
+                        .map_err(|error| error.code()),
+                )
+                .unwrap();
+            send_lifecycle_lock_event(LifecycleLockEvent::Finished("publish"));
+        });
+        let event = event_rx.recv_timeout(Duration::from_secs(5));
+        let blocked_path = match event {
+            Ok(LifecycleLockEvent::Blocked(path)) => Some(path),
+            Ok(LifecycleLockEvent::Finished(_))
+            | Err(mpsc::RecvTimeoutError::Timeout | mpsc::RecvTimeoutError::Disconnected) => None,
+        };
+        assert_eq!(current_generation(&view_dir).unwrap(), Some(1));
+        assert!(view_dir.join("RETIRED").is_file());
+        drop(lifecycle);
+        done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        publish_thread.join().unwrap();
+        assert_eq!(blocked_path, Some(lifecycle_lock_path(&view_dir)));
+        assert_eq!(current_generation(&view_dir).unwrap(), Some(2));
+        assert!(!is_retired(&view_dir).unwrap());
     }
 
     /// T86: a held or pinned view is not retired; a retired view's
