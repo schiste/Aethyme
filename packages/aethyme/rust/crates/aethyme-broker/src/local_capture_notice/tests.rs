@@ -214,7 +214,7 @@ fn pending_notice_limit_accepts_512_and_refuses_513_without_effects() {
     // capacity check without making 512 unrelated capture operations. These
     // deliberately never reach an owner tick; only the pending counter is
     // under test here.
-    let capture_receipt = capture::receipt(&f.store, &operation).unwrap().unwrap();
+    let capture_receipt = capture::receipt(&mut f.store, &operation).unwrap().unwrap();
     let retained = archive::retained_contribution(&f.store, &capture_receipt.contribution)
         .unwrap()
         .unwrap();
