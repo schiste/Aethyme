@@ -1,0 +1,10 @@
+--- a/packages/aethyme/rust/crates/aethyme-broker/src/local_capture_notice.rs
++++ b/packages/aethyme/rust/crates/aethyme-broker/src/local_capture_notice.rs
+@@ -428,7 +428,6 @@
+         let current = target::status(store, owner.target())?;
+         let stale_reason = if body.target != owner.target()
+             || body.issuer != owner.issuer()
+-            || body.authority_epoch != owner.authority_epoch().as_str()
+             || current.revision.as_ref() != Some(&revision_id)
+         {
+             Some("authority epoch or selected target revision changed")

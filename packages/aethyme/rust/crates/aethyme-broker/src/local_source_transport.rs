@@ -67,6 +67,8 @@ pub enum TransportError {
     Sqlite(#[from] rusqlite::Error),
     #[error(transparent)]
     Json(#[from] serde_json::Error),
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
 }
 
 /// Constructed by the native operator, not decoded from incoming records.
@@ -359,7 +361,16 @@ pub fn prepare(
     nonce: &str,
     expected_old: Option<&CommitOid>,
 ) -> Result<Intent, TransportError> {
-    let _authority = target::authorize(store, owner)?;
+    let archive_guard = crate::collaboration_gc::archive_use(store)?;
+    let response_guard = crate::collaboration_sensitive::response_use(store)?;
+    let authority_guard = target::authorize(store, owner)?;
+    let retention = target::ArtifactRetentionPermit::new(
+        store,
+        owner,
+        &archive_guard,
+        &response_guard,
+        &authority_guard,
+    )?;
     if nonce.len() != 64
         || !nonce
             .bytes()
@@ -407,13 +418,13 @@ pub fn prepare(
     };
     current(store, owner, &intent)?;
     source(store, carrier, &intent)?;
-    target::retain_artifacts(
+    target::retain_artifacts_under_guards(
         store,
-        owner,
         &parse_id(&intent.spec.revision)?,
         &[SourceSnapshotId::parse(&intent.spec.source)
             .map_err(|e| TransportError::Invalid(e.to_string()))?],
         &[],
+        &retention,
     )?;
     let tx = store
         .connection()

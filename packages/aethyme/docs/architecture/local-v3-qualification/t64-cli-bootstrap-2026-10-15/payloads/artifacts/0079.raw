@@ -1,0 +1,103 @@
+{
+  "argv": [
+    "caffeinate",
+    "-i",
+    "cargo",
+    "test",
+    "--locked",
+    "-j4",
+    "-p",
+    "aethyme-cli",
+    "--test",
+    "help_snapshots",
+    "help_surface_matches_snapshots",
+    "--",
+    "--exact"
+  ],
+  "duration_seconds": 30.093542,
+  "ended_at_utc": "2026-10-15T22:32:15.536141Z",
+  "environment": {
+    "explicit_profile_keys": [
+      "AETHYME_UPDATE_SNAPSHOTS"
+    ],
+    "values": {
+      "AETHYME_UPDATE_SNAPSHOTS": "1",
+      "CARGO_BUILD_JOBS": "4",
+      "CARGO_HOME": "/Users/christophehenner/.cargo",
+      "CARGO_TARGET_DIR": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/integrate-reviewed-local-bare-git-servic/target/local-resume/cargo",
+      "HOME": "/Users/christophehenner",
+      "LANG": "C.UTF-8",
+      "LC_ALL": "C.UTF-8",
+      "PATH": "/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/christophehenner/.cargo/bin",
+      "RUSTC_WRAPPER": "",
+      "RUSTUP_HOME": "/Users/christophehenner/.rustup",
+      "TMPDIR": "/private/tmp/20261016T1129-help-snapshot-update-workspace-tmp-m3fxmj5o"
+    }
+  },
+  "execution_context": {
+    "host": {
+      "hostname": "Mac.lan",
+      "machine": "arm64",
+      "platform": "macOS-27.2-arm64-arm-64bit-Mach-O",
+      "python": "3.14.7 (main, Aug  5 2026, 10:29:49) [Clang 17.0.0 (clang-1700.6.4.2)]"
+    },
+    "tmp_volume": {
+      "free_bytes_before": 12508024832,
+      "path": "/private/tmp",
+      "total_bytes": 494384795648
+    },
+    "tool_versions": {
+      "aethyme": {
+        "executable": "/Users/christophehenner/.cargo/bin/aethyme",
+        "exit_code": 0,
+        "version": "aethyme 0.8.26 (v0.8.26 build_commit=5e8daf712e26c63f1d4082e9a617f556cf995de2) build_date=2026-10-08T19:30:03Z"
+      },
+      "cargo": {
+        "executable": "/Users/christophehenner/.cargo/bin/cargo",
+        "exit_code": 0,
+        "version": "cargo 1.96.0 (30a34c682 2026-05-25)"
+      },
+      "git": {
+        "executable": "/opt/homebrew/bin/git",
+        "exit_code": 0,
+        "version": "git version 2.55.0"
+      },
+      "rustc": {
+        "executable": "/Users/christophehenner/.cargo/bin/rustc",
+        "exit_code": 0,
+        "version": "rustc 1.96.0 (ac68faa20 2026-05-25)"
+      }
+    }
+  },
+  "label": "20261016T1129-help-snapshot-update-workspace",
+  "launcher_error": null,
+  "log_bytes": 1093,
+  "log_path": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/complete-fresh-local-cli-bootstrap-and-c/target/local-resume/retention-checks/20261015T223145Z-20261016T1129-help-snapshot-update-workspace-07bd0c0f/command.log",
+  "log_sha256": "e955e2417db2dc4c44d7234c4f6e67a9ae1657036d6d4ed162b5aae199b22e0a",
+  "numeric_exit": 0,
+  "root": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/complete-fresh-local-cli-bootstrap-and-c",
+  "schema": "aethyme.local-check/v1",
+  "source_after": {
+    "diff_sha256": "685cc590595c4becc19c3d89427d779f093f493ed7f72057dd72d0aa6d5aa5c0",
+    "head": "6b0b7a047825558a4f8714ce6a3524dd115a0299",
+    "status": " M packages/aethyme/rust/crates/aethyme-cli/tests/snapshots/help/collab.snap\n",
+    "tree": "9221feea0c8ef6ce301062dd535c38a4fb2233d6",
+    "untracked_content_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  "source_before": {
+    "diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "head": "6b0b7a047825558a4f8714ce6a3524dd115a0299",
+    "status": "",
+    "tree": "9221feea0c8ef6ce301062dd535c38a4fb2233d6",
+    "untracked_content_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  "source_unchanged": false,
+  "started_at_utc": "2026-10-15T22:31:45.508714Z",
+  "state": "completed",
+  "status_bytes": 2,
+  "status_path": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/complete-fresh-local-cli-bootstrap-and-c/target/local-resume/retention-checks/20261015T223145Z-20261016T1129-help-snapshot-update-workspace-07bd0c0f/command.status",
+  "status_sha256": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa",
+  "termination_signal": null,
+  "tmpdir": "/private/tmp/20261016T1129-help-snapshot-update-workspace-tmp-m3fxmj5o",
+  "working_directory": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/complete-fresh-local-cli-bootstrap-and-c/packages/aethyme/rust"
+}

@@ -78,11 +78,63 @@ fn missing_duplicate_invalid_and_oversized_inventories_are_refused() {
         .collect();
     assert!(AssertionInventory::new(cases).is_err());
 }
+
+#[test]
+fn verifier_prepare_refuses_sensitive_tombstone_before_harness_or_runtime_access() {
+    let mut fixture = Fixture::new();
+    let owner = target::acquire_controller(&mut fixture.store, "T", "issuer").unwrap();
+    let epoch = owner.authority_epoch().clone();
+    drop(owner);
+    let frozen =
+        crate::local_authority::freeze(&mut fixture.store, &epoch, "test quarantine").unwrap();
+    crate::collaboration_sensitive::quarantine(
+        &mut fixture.store,
+        &d(b"test incident"),
+        "test-operator",
+        frozen.epoch.as_str(),
+        crate::collaboration_sensitive::ReasonCode::OperatorRequestedPurge,
+    )
+    .unwrap();
+
+    let result = prepare(
+        &mut fixture.store,
+        VerifierPreparationRequest {
+            operation_id: OperationId::mint().unwrap(),
+            harness_repository: std::path::Path::new("/no-such-harness"),
+            harness_commit: "not-a-commit",
+            inventory_bytes: b"not-an-inventory",
+            plan: VerifierPlan {
+                image: "not-an-image".into(),
+                command: CommandSpec {
+                    program: "/no-such-runtime".into(),
+                    arguments: vec![],
+                    environment: Default::default(),
+                },
+                max_age_ms: 1,
+            },
+            docker_cli: std::path::PathBuf::from("/no-such-docker"),
+            endpoint: "unix:///no-such-endpoint",
+        },
+    );
+    assert!(matches!(
+        result,
+        Err(VerificationError::Sensitive(
+            crate::collaboration_sensitive::SensitiveError::Quarantined
+        ))
+    ));
+}
 #[test]
 fn trusted_operator_rotates_and_revokes_exact_producer_generations() {
     let mut f = Fixture::new();
     let owner = target::acquire_controller(&mut f.store, "verifier", "appointed").unwrap();
-    let policy = policy();
+    let inventory = AssertionInventory::new(vec![case()]).unwrap();
+    let mut policy = policy();
+    policy.harness = capture(
+        &mut f,
+        "harness/inventory.json",
+        &inventory.canonical_bytes(),
+    );
+    policy.inventory = inventory.id().to_string();
     let mut spec = f.spec();
     spec.acceptance_policy = policy.record().unwrap().id().to_string();
     let revision = target::propose_revision(&mut f.store, &owner, spec).unwrap();
@@ -190,7 +242,11 @@ impl Subject {
         let policy = policy();
         let mut policy = policy;
         policy.max_age_ms = max_age_ms;
-        policy.harness = capture(&mut f, "inventory.json", &inventory.canonical_bytes());
+        policy.harness = capture(
+            &mut f,
+            "harness/inventory.json",
+            &inventory.canonical_bytes(),
+        );
         // Policy must be frozen before selecting the target; use the actual
         // harness identity in the target's appointed policy too.
         let mut ts = f.spec();
@@ -327,6 +383,24 @@ impl Subject {
     }
 }
 #[test]
+fn materialized_inventory_uses_retained_harness_role_and_refuses_wrong_policy_digest() {
+    let s = Subject::fake();
+    let inputs = snapshot::materialize(&s.f.store, &s.owner, &s.execution).unwrap();
+    let inventory_path = inputs.harness_dir().join("harness/inventory.json");
+    assert!(inventory_path.is_file());
+    assert!(!inputs.root().join("harness/inventory.json").exists());
+    assert_eq!(
+        inventory_from_inputs(&inputs, s.permit.policy()).unwrap(),
+        s.inventory
+    );
+    let mut wrong_policy = s.permit.policy().clone();
+    wrong_policy.inventory = d(b"different inventory");
+    assert!(matches!(
+        inventory_from_inputs(&inputs, &wrong_policy),
+        Err(VerificationError::Mismatch)
+    ));
+}
+#[test]
 fn incomplete_wrong_subject_expired_and_revoked_evidence_cannot_pass() {
     let mut s = Subject::fake();
     let mut evidence = s.evidence();
@@ -373,7 +447,9 @@ fn incomplete_wrong_subject_expired_and_revoked_evidence_cannot_pass() {
 }
 fn capture(f: &mut Fixture, path: &str, bytes: &[u8]) -> String {
     use crate::local_target::tests::git;
-    std::fs::write(f._repo.path().join(path), bytes).unwrap();
+    let input = f._repo.path().join(path);
+    std::fs::create_dir_all(input.parent().unwrap()).unwrap();
+    std::fs::write(&input, bytes).unwrap();
     git(f._repo.path(), &["add", path]);
     git(f._repo.path(), &["commit", "-qm", "verifier fixture input"]);
     let head = archive::CommitOid::parse(&git(f._repo.path(), &["rev-parse", "HEAD"])).unwrap();
@@ -402,10 +478,14 @@ fn real_cli_assertions_observe_behavior_and_refuse_forged_or_stale_receipts() {
     second.stdin_hex = "420a".into();
     second.stdout = d(b"Hello,B\n");
     let inventory = AssertionInventory::new(vec![hello, second]).unwrap();
-    let harness = capture(&mut f, "inventory.json", &inventory.canonical_bytes());
+    let harness = capture(
+        &mut f,
+        "harness/inventory.json",
+        &inventory.canonical_bytes(),
+    );
     // Independent expected digests/inventory stay on the host; the artifact is
     // the only mounted input to the app under test. A success file is ignored.
-    crate::local_target::tests::git(f._repo.path(), &["rm", "inventory.json"]);
+    crate::local_target::tests::git(f._repo.path(), &["rm", "harness/inventory.json"]);
     let source=capture(&mut f,"app.sh",b"set -eu\ntest ! -e /harness\ntest ! -e /dataset\ntest ! -e /var/run/docker.sock\ntest -z \"${HOME-}\"\nif printf tamper 2>/dev/null > /artifact/app.sh; then exit 77; fi\nread -r name\nprintf 'Hello,%s\\n' \"$name\"\n");
     let limits = snapshot::ResourceLimits {
         timeout_ms: 5000,

@@ -7,7 +7,7 @@ use crate::execution_verifier::ProducerPermit;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-const SERVICE_SCHEMA: RecordSchema = RecordSchema {
+pub(crate) const SERVICE_SCHEMA: RecordSchema = RecordSchema {
     name: "aethyme.local-controller-service/experimental-v1",
     fields: &[FieldSpec {
         name: "spec",
@@ -17,6 +17,45 @@ const SERVICE_SCHEMA: RecordSchema = RecordSchema {
     }],
     capabilities: &[],
 };
+
+/// Validate the immutable appointment body against its indexed service row.
+/// This is used by lost-response status lookup, including lookups that span
+/// revisions or authority epochs. The row is not a dispatch capability.
+pub(crate) fn validate_status_binding(
+    appointment: &str,
+    target: &str,
+    revision: &str,
+    epoch: &str,
+    nonce: &str,
+    body: &[u8],
+) -> Result<(), ControllerError> {
+    let record = Record::decode(body, &[&SERVICE_SCHEMA])
+        .map_err(|error| ControllerError::Canonical(error.to_string()))?;
+    if record.canonical_bytes() != body {
+        return Err(ControllerError::Canonical(
+            "stored service appointment body is not canonical".into(),
+        ));
+    }
+    let value: serde_json::Value = serde_json::from_slice(body)?;
+    let spec = value
+        .get("spec")
+        .and_then(serde_json::Value::as_object)
+        .ok_or(ControllerError::Mismatch)?;
+    let policy_nonce = spec
+        .get("policy")
+        .and_then(serde_json::Value::as_object)
+        .and_then(|policy| policy.get("nonce"))
+        .and_then(serde_json::Value::as_str);
+    if record.id().as_str() != appointment
+        || spec.get("target").and_then(serde_json::Value::as_str) != Some(target)
+        || spec.get("revision").and_then(serde_json::Value::as_str) != Some(revision)
+        || spec.get("epoch").and_then(serde_json::Value::as_str) != Some(epoch)
+        || policy_nonce != Some(nonce)
+    {
+        return Err(ControllerError::Mismatch);
+    }
+    Ok(())
+}
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServicePolicy {
@@ -262,7 +301,43 @@ mod permit_tests {
         let mut f = Fixture::new();
         let owner =
             target::acquire_controller(&mut f.store, "existing-verifier", "operator").unwrap();
-        let execution = super::super::drive::tests::policy().execution;
+        let mut execution = super::super::drive::tests::policy().execution;
+        let inventory = verifier::AssertionInventory::new(vec![verifier::AssertionCase {
+            id: "existing-producer".into(),
+            arguments: vec![],
+            stdin_hex: String::new(),
+            exit_code: 0,
+            stdout: format!(
+                "sha256:{}",
+                crate::collaboration_archive::ObjectDigest::of(b"").hex()
+            ),
+            stderr: format!(
+                "sha256:{}",
+                crate::collaboration_archive::ObjectDigest::of(b"").hex()
+            ),
+        }])
+        .unwrap();
+        let repository = f._repo.path();
+        let inventory_path = repository.join("harness/inventory.json");
+        std::fs::create_dir_all(inventory_path.parent().unwrap()).unwrap();
+        std::fs::write(&inventory_path, inventory.canonical_bytes()).unwrap();
+        crate::local_target::tests::git(repository, &["add", "harness/inventory.json"]);
+        crate::local_target::tests::git(
+            repository,
+            &["commit", "-qm", "existing producer verifier inventory"],
+        );
+        let harness_commit = crate::collaboration_archive::CommitOid::parse(
+            &crate::local_target::tests::git(repository, &["rev-parse", "HEAD"]),
+        )
+        .unwrap();
+        let harness = crate::collaboration_archive::retain_snapshot(
+            &mut f.store,
+            repository,
+            &harness_commit,
+        )
+        .unwrap();
+        execution.harness = harness.snapshot_id.to_string();
+        execution.assertion_inventory = inventory.id().to_string();
         let policy = VerifierPolicy {
             profile: verifier::PROFILE.into(),
             runtime: execution.profile.runtime_profile.clone(),

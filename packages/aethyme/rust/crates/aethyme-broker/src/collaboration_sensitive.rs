@@ -26,6 +26,7 @@ use crate::file_lock::open_lock_file;
 const MARKER_NAME: &str = "sensitive-response.json";
 const MAX_MARKER_BYTES: usize = 16 * 1024;
 const SCOPE_KIND: &str = "project";
+const CAPTURE_NOTICE_INGRESS_LOCK_PATH: &str = "spool/capture-notice-ingress.lock";
 
 #[cfg(test)]
 thread_local! {
@@ -189,6 +190,12 @@ impl std::fmt::Debug for ResponseUse {
         f.debug_struct("ResponseUse")
             .field("path", &self.path)
             .finish()
+    }
+}
+
+impl ResponseUse {
+    pub(crate) fn covers(&self, store: &CollaborationStore) -> bool {
+        self.path == lock_path(store)
     }
 }
 
@@ -1141,10 +1148,65 @@ fn collect_managed_copy_tree(
     Ok(())
 }
 
-/// Recognize only the empty lock files left by cooperative capture operations.
-/// The archive and response barriers exclude active capture entry points while
-/// this inventory is prepared; these control paths are retained as unmanaged
-/// residuals and are never removed by purge.
+/// Prove that a known capture-control path is an empty, regular, unlocked
+/// file whose identity stayed stable while it was opened and checked.
+fn empty_unheld_control_lock(path: &Path) -> Result<bool, ()> {
+    let before = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(_) => return Err(()),
+    };
+    if before.file_type().is_symlink() || !before.file_type().is_file() || before.len() != 0 {
+        return Err(());
+    }
+
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(not(unix))]
+    {
+        // This profile cannot prove that opening a child will not follow a
+        // concurrently substituted link, so preserve the path as unknown.
+        return Err(());
+    }
+    let file = options.open(path).map_err(|_| ())?;
+    let opened = file.metadata().map_err(|_| ())?;
+    if !opened.is_file() || opened.len() != 0 {
+        return Err(());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if opened.dev() != before.dev() || opened.ino() != before.ino() {
+            return Err(());
+        }
+    }
+    let Some(_unlocked) = crate::file_lock::ExclusiveFileLock::try_acquire(file).map_err(|_| ())?
+    else {
+        return Err(());
+    };
+    let after = fs::symlink_metadata(path).map_err(|_| ())?;
+    if after.file_type().is_symlink() || !after.file_type().is_file() || after.len() != 0 {
+        return Err(());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if after.dev() != opened.dev() || after.ino() != opened.ino() {
+            return Err(());
+        }
+    }
+    Ok(true)
+}
+
+/// Recognize only empty, unlocked capture-control files. The archive and
+/// response barriers exclude active capture entry points while this inventory
+/// is prepared; control paths remain as unmanaged residuals and are never
+/// removed by purge.
 fn capture_lock_control_paths(project_dir: &Path) -> Result<Option<Vec<String>>, ()> {
     let root = project_dir.join("spool/capture");
     let before = match fs::symlink_metadata(&root) {
@@ -1168,57 +1230,8 @@ fn capture_lock_control_paths(project_dir: &Path) -> Result<Option<Vec<String>>,
         let operation = name.strip_suffix(".lock").ok_or(())?;
         crate::collaboration_capture::OperationId::parse(operation).map_err(|_| ())?;
         let path = root.join(&name);
-        let before_file = fs::symlink_metadata(&path).map_err(|_| ())?;
-        if before_file.file_type().is_symlink()
-            || !before_file.file_type().is_file()
-            || before_file.len() != 0
-        {
+        if !empty_unheld_control_lock(&path)? {
             return Err(());
-        }
-
-        let mut options = OpenOptions::new();
-        options.read(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
-        }
-        #[cfg(not(unix))]
-        {
-            // This profile cannot prove that opening a child will not follow a
-            // concurrently substituted link, so preserve the root as unknown.
-            return Err(());
-        }
-        let file = options.open(&path).map_err(|_| ())?;
-        let opened = file.metadata().map_err(|_| ())?;
-        if !opened.is_file() || opened.len() != 0 {
-            return Err(());
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            if opened.dev() != before_file.dev() || opened.ino() != before_file.ino() {
-                return Err(());
-            }
-        }
-        let Some(_unlocked) =
-            crate::file_lock::ExclusiveFileLock::try_acquire(file).map_err(|_| ())?
-        else {
-            return Err(());
-        };
-        let after_file = fs::symlink_metadata(&path).map_err(|_| ())?;
-        if after_file.file_type().is_symlink()
-            || !after_file.file_type().is_file()
-            || after_file.len() != 0
-        {
-            return Err(());
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            if after_file.dev() != opened.dev() || after_file.ino() != opened.ino() {
-                return Err(());
-            }
         }
         paths.push(format!("spool/capture/{name}"));
     }
@@ -1235,6 +1248,34 @@ fn capture_lock_control_paths(project_dir: &Path) -> Result<Option<Vec<String>>,
         }
     }
     Ok(Some(paths))
+}
+
+/// The notice-ingress lock lives directly under spool. Validate the parent
+/// before examining the fixed child so a symlinked spool root is never followed.
+fn capture_notice_ingress_lock_control_path(project_dir: &Path) -> Result<bool, ()> {
+    let spool = project_dir.join("spool");
+    let before = match fs::symlink_metadata(&spool) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(_) => return Err(()),
+    };
+    if before.file_type().is_symlink() || !before.is_dir() {
+        return Err(());
+    }
+    let recognized =
+        empty_unheld_control_lock(&project_dir.join(CAPTURE_NOTICE_INGRESS_LOCK_PATH))?;
+    let after = fs::symlink_metadata(&spool).map_err(|_| ())?;
+    if after.file_type().is_symlink() || !after.is_dir() {
+        return Err(());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if after.dev() != before.dev() || after.ino() != before.ino() {
+            return Err(());
+        }
+    }
+    Ok(recognized)
 }
 
 fn is_directory_item(relative_path: &str) -> bool {
@@ -1623,6 +1664,14 @@ fn prepare_inventory(
             Vec::new()
         }
     };
+    let capture_notice_ingress_lock_control =
+        match capture_notice_ingress_lock_control_path(store.project_dir()) {
+            Ok(present) => present,
+            Err(()) => {
+                unknown.push(CAPTURE_NOTICE_INGRESS_LOCK_PATH.into());
+                false
+            }
+        };
     // Lock and verifier-authority state is control state, not archived source.
     // Leave it in place and report the exact roots as unmanaged residuals.
     for name in ["objects", "spool"] {
@@ -1653,6 +1702,8 @@ fn prepare_inventory(
                     child.as_str(),
                     "archive" | "gc" | "gc.lock" | "sensitive-response.lock"
                 ) || (child == "capture" && !capture_control_paths.is_empty())
+                    || (child == "capture-notice-ingress.lock"
+                        && capture_notice_ingress_lock_control)
             } else {
                 child == "sha256"
             };
@@ -1718,6 +1769,14 @@ fn prepare_inventory(
              (incident_id,code,relative_path,permanence)
              VALUES (?1,'capture_operation_lock_control',?2,'unmanaged')",
             rusqlite::params![marker.incident_id, path],
+        )?;
+    }
+    if capture_notice_ingress_lock_control {
+        tx.execute(
+            "INSERT OR IGNORE INTO local_sensitive_residuals
+             (incident_id,code,relative_path,permanence)
+             VALUES (?1,'capture_notice_ingress_lock_control',?2,'unmanaged')",
+            rusqlite::params![marker.incident_id, CAPTURE_NOTICE_INGRESS_LOCK_PATH],
         )?;
     }
     let view_roots = unknown
@@ -3584,6 +3643,11 @@ mod tests {
         let interrupted_status = status(store, &incident_id).unwrap();
         assert_eq!(interrupted_status.database_cleanup_completed_ms, None);
         assert!(!interrupted_status.managed_cleanup_complete);
+        assert!(interrupted_status.residuals.iter().any(|residual| {
+            residual.code == "capture_notice_ingress_lock_control"
+                && residual.path == CAPTURE_NOTICE_INGRESS_LOCK_PATH
+                && residual.permanence == "unmanaged"
+        }));
         let object_items = interrupted_status
             .items
             .iter()
@@ -3611,6 +3675,130 @@ mod tests {
         let retried = purge(store, &incident_id, &quarantined.request_digest).unwrap();
         assert!(retried.status.database_cleanup_completed_ms.is_some());
         assert!(retried.status.managed_cleanup_complete);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn capture_notice_ingress_lock_control_accepts_only_empty_unheld_file() {
+        let root = tempfile::tempdir().unwrap();
+        let spool = root.path().join("spool");
+        std::fs::create_dir(&spool).unwrap();
+        let lock = spool.join("capture-notice-ingress.lock");
+        std::fs::write(&lock, b"").unwrap();
+
+        assert!(capture_notice_ingress_lock_control_path(root.path()).unwrap());
+        assert_eq!(std::fs::read(&lock).unwrap(), b"");
+    }
+
+    #[test]
+    fn capture_notice_ingress_lock_control_refuses_nonempty_file() {
+        let root = tempfile::tempdir().unwrap();
+        let spool = root.path().join("spool");
+        std::fs::create_dir(&spool).unwrap();
+        let lock = spool.join("capture-notice-ingress.lock");
+        std::fs::write(&lock, b"unclassified bytes").unwrap();
+
+        assert!(capture_notice_ingress_lock_control_path(root.path()).is_err());
+        assert_eq!(std::fs::read(&lock).unwrap(), b"unclassified bytes");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn capture_notice_ingress_lock_control_refuses_held_file_then_retries_after_release() {
+        let root = tempfile::tempdir().unwrap();
+        let spool = root.path().join("spool");
+        std::fs::create_dir(&spool).unwrap();
+        let lock = spool.join("capture-notice-ingress.lock");
+        std::fs::write(&lock, b"").unwrap();
+
+        let held = crate::file_lock::ExclusiveFileLock::acquire(
+            crate::file_lock::open_lock_file(&lock).unwrap(),
+        )
+        .unwrap();
+        assert!(capture_notice_ingress_lock_control_path(root.path()).is_err());
+
+        drop(held);
+        assert!(capture_notice_ingress_lock_control_path(root.path()).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn capture_notice_ingress_lock_control_refuses_symlink_without_following() {
+        let root = tempfile::tempdir().unwrap();
+        let spool = root.path().join("spool");
+        std::fs::create_dir(&spool).unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let sentinel = outside.path().join("sentinel");
+        std::fs::write(&sentinel, b"outside managed tree").unwrap();
+        std::os::unix::fs::symlink(&sentinel, spool.join("capture-notice-ingress.lock")).unwrap();
+
+        assert!(capture_notice_ingress_lock_control_path(root.path()).is_err());
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"outside managed tree");
+    }
+
+    #[test]
+    fn invalid_capture_notice_ingress_lock_blocks_database_cleanup() {
+        use crate::collaboration_archive::ObjectDigest;
+        use crate::collaboration_capture as capture;
+
+        let mut fixture = crate::local_generation::tests::Fixture::new();
+        complete_fixture_wave(&mut fixture);
+        let source_repository = fixture.v.f._repo.path().to_path_buf();
+        let capture_request = capture::CaptureRequest {
+            operation_id: capture::OperationId::mint().unwrap(),
+            repository: source_repository,
+            base: fixture.v.f.a.base.commit.clone(),
+            result: fixture.v.f.a.result.commit.clone(),
+            policy: capture::CapturePolicy::Required,
+            retention: capture::RetentionBoundary::UntilReleased,
+        };
+        assert!(matches!(
+            capture::capture(&mut fixture.v.f.store, &capture_request).unwrap(),
+            capture::CaptureOutcome::Acknowledged(_)
+        ));
+
+        let store = &mut fixture.v.f.store;
+        let frozen = crate::local_authority::freeze(
+            store,
+            fixture.v.owner.authority_epoch(),
+            "T56 invalid capture notice ingress lock control",
+        )
+        .unwrap();
+        let incident_id = format!(
+            "sha256:{}",
+            ObjectDigest::of(b"invalid-capture-notice-ingress-lock-control").hex()
+        );
+        let quarantined = quarantine(
+            store,
+            &incident_id,
+            "local-test-operator",
+            frozen.epoch.as_str(),
+            ReasonCode::SuspectedTestSecretExposure,
+        )
+        .unwrap();
+
+        let lock = store.project_dir().join(CAPTURE_NOTICE_INGRESS_LOCK_PATH);
+        std::fs::create_dir_all(lock.parent().unwrap()).unwrap();
+        std::fs::write(&lock, b"unclassified bytes").unwrap();
+
+        let refused = purge(store, &incident_id, &quarantined.request_digest).unwrap();
+        assert!(!refused.completed);
+        assert_eq!(refused.status.database_cleanup_completed_ms, None);
+        assert!(!refused.status.managed_cleanup_complete);
+        assert!(!refused.status.database_tables.is_empty());
+        assert!(
+            refused
+                .status
+                .database_tables
+                .iter()
+                .all(|table| table.state == "pending")
+        );
+        assert!(refused.status.residuals.iter().any(|residual| {
+            residual.code == "unclassified_managed_path"
+                && residual.path == CAPTURE_NOTICE_INGRESS_LOCK_PATH
+                && residual.resolved_ms.is_none()
+        }));
+        assert_eq!(std::fs::read(&lock).unwrap(), b"unclassified bytes");
     }
 
     #[test]

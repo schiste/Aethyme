@@ -45,6 +45,8 @@ pub enum AcceptanceError {
     #[error(transparent)]
     Transport(#[from] transport::TransportError),
     #[error(transparent)]
+    Wave(#[from] crate::local_wave::WaveError),
+    #[error(transparent)]
     Target(#[from] target::TargetError),
     #[error(transparent)]
     Archive(#[from] archive::ArchiveError),
@@ -296,7 +298,6 @@ pub fn appoint(
     base_ref: &str,
     max_observations: u8,
 ) -> Result<AcceptanceBinding, AcceptanceError> {
-    let _authority = target::authorize(store, owner)?;
     let intent = transport::load(store, intent_id)?;
     check_owner(store, owner, &intent)?;
     transport::route(carrier, &intent)?;
@@ -338,7 +339,41 @@ pub fn appoint(
     if matches!(route, ProviderRoute::Mergify { .. }) && mergify.is_none() {
         return Err(invalid("committed Mergify policy required"));
     }
-    let revision = target::load_revision(store, &id(&intent.spec.revision)?)?;
+    let archive_guard = crate::collaboration_gc::archive_use(store)?;
+    let response_guard = crate::collaboration_sensitive::response_use(store)?;
+    let authority_guard = target::authorize(store, owner)?;
+    let retention = target::ArtifactRetentionPermit::new(
+        store,
+        owner,
+        &archive_guard,
+        &response_guard,
+        &authority_guard,
+    )?;
+    let intent = transport::load(store, intent_id)?;
+    check_owner(store, owner, &intent)?;
+    let state = target::status(store, owner.target())?;
+    let wave = crate::local_wave::load(store, &id(&intent.spec.wave)?)?;
+    if state.phase != target::Phase::Verifying
+        || state.revision.as_ref().map(RecordId::as_str) != Some(intent.spec.revision.as_str())
+        || wave.phase != crate::local_wave::WavePhase::Verifying
+        || wave.spec.revision != intent.spec.revision
+        || wave.candidate_snapshot.as_ref().map(ToString::to_string)
+            != Some(intent.spec.source.clone())
+        || wave.candidate_commit.as_ref().map(CommitOid::as_str)
+            != Some(intent.spec.commit.as_str())
+    {
+        return Err(invalid(
+            "target or candidate wave changed during policy discovery",
+        ));
+    }
+    let revision_id = id(&intent.spec.revision)?;
+    let revision = target::load_revision_under_response(store, &revision_id, &response_guard)?;
+    if revision.target != owner.target()
+        || revision.issuer != owner.issuer()
+        || revision.id != revision_id
+    {
+        return Err(invalid("current target revision owner"));
+    }
     let spec = BindingSpec {
         profile: PROFILE.into(),
         intent: intent_id.to_string(),
@@ -353,14 +388,13 @@ pub fn appoint(
         max_observations,
     };
     let record = canonical(&BINDING, &spec)?;
-    let _archive = crate::collaboration_gc::archive_use(store)?;
     let object = archive::put_object(store, &record.canonical_bytes())?;
     let config_object = archive::put_object(store, &config)?;
     let mut objects = vec![object, config_object];
     if let Some(bytes) = mergify {
         objects.push(archive::put_object(store, &bytes)?);
     }
-    target::retain_artifacts(store, owner, &id(&spec.revision)?, &[], &objects)?;
+    target::retain_artifacts_under_guards(store, &revision_id, &[], &objects, &retention)?;
     store.connection().execute("INSERT OR IGNORE INTO local_acceptance_bindings(id,revision,body,last_receipt) VALUES(?1,?2,?3,NULL)",params![record.id().as_str(),spec.revision,record.canonical_bytes()])?;
     Ok(AcceptanceBinding {
         id: record.id(),

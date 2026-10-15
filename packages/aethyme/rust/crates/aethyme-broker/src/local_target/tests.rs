@@ -722,6 +722,50 @@ fn candidate_and_request_objects_are_pinned_atomically_with_their_source() {
 }
 
 #[test]
+fn artifact_retention_permit_requires_each_exact_guard_and_owner_epoch() {
+    let mut f = Fixture::new();
+    let mut owner = acquire_controller(&mut f.store, "target", "appointed").unwrap();
+    let archive = gc::archive_use(&f.store).unwrap();
+    let response = crate::collaboration_sensitive::response_use(&f.store).unwrap();
+    let authority = authorize(&f.store, &owner).unwrap();
+
+    assert!(
+        ArtifactRetentionPermit::new(&f.store, &owner, &archive, &response, &authority,).is_ok()
+    );
+
+    let mut foreign = Fixture::new();
+    let foreign_owner = acquire_controller(&mut foreign.store, "target", "appointed").unwrap();
+    let foreign_archive = gc::archive_use(&foreign.store).unwrap();
+    let foreign_response = crate::collaboration_sensitive::response_use(&foreign.store).unwrap();
+    let foreign_authority = authorize(&foreign.store, &foreign_owner).unwrap();
+
+    // Keep every other proof input valid in each negative case so a failure
+    // identifies the individual guard check rather than merely a foreign
+    // project tuple.
+    assert!(matches!(
+        ArtifactRetentionPermit::new(&f.store, &owner, &foreign_archive, &response, &authority,),
+        Err(TargetError::Unauthorized)
+    ));
+
+    assert!(matches!(
+        ArtifactRetentionPermit::new(&f.store, &owner, &archive, &foreign_response, &authority,),
+        Err(TargetError::Unauthorized)
+    ));
+
+    assert!(matches!(
+        ArtifactRetentionPermit::new(&f.store, &owner, &archive, &response, &foreign_authority,),
+        Err(TargetError::Unauthorized)
+    ));
+
+    owner.epoch =
+        serde_json::from_value(serde_json::json!(format!("sha256:{}", "f".repeat(64)))).unwrap();
+    assert!(matches!(
+        ArtifactRetentionPermit::new(&f.store, &owner, &archive, &response, &authority,),
+        Err(TargetError::Unauthorized)
+    ));
+}
+
+#[test]
 fn migration_adopts_charged_resolution_attempts_and_fences_schema_six() {
     let f = Fixture::new();
     let host = f._host.path().to_path_buf();
@@ -729,7 +773,7 @@ fn migration_adopts_charged_resolution_attempts_and_fences_schema_six() {
     drop(f.store);
     let c = rusqlite::Connection::open(&db).unwrap();
     crate::collaboration_sensitive::drop_sensitive_response_tables_for_legacy_fixture(&c).unwrap();
-    c.execute_batch("DROP TABLE local_native_gate_roots; DROP TABLE local_native_gate_jobs;
+    c.execute_batch("DROP TABLE IF EXISTS local_capture_notice_outcomes; DROP TABLE IF EXISTS local_capture_notices; DROP TABLE local_native_gate_roots; DROP TABLE local_native_gate_jobs;
         UPDATE meta SET value = '6' WHERE key IN ('schema_version', 'min_compatible_schema');
         DROP TABLE local_adoption_receipts; DROP TABLE local_agent_dispatches; DROP TABLE local_agent_reconciliations; DROP TABLE local_handoffs; DROP TABLE local_agent_sessions; DROP TABLE local_import_rehearsals; DROP TABLE local_imported_records; DROP TABLE local_imported_sources; DROP TABLE local_imports; DROP TABLE local_exchange_messages; DROP TABLE local_exchange_deliveries; DROP TABLE local_exchange_streams; DROP TABLE local_exchange_events; DROP TABLE local_exchange_projection; DROP TABLE local_exchange_observations; DROP TABLE local_exchange_bindings; DROP TRIGGER outbox_capture_insert; DROP TRIGGER outbox_capture_update; DROP TRIGGER outbox_capture_delete; DROP TABLE local_generation_roots; DROP TABLE local_generation_receipts; DROP TABLE local_generations; DROP TABLE local_acceptance_qualifications; DROP TABLE local_acceptance_receipts; DROP TABLE local_acceptance_bindings; DROP TABLE local_source_transport_receipts; DROP TABLE local_source_transports; DROP TABLE local_verification_evidence; DROP TABLE local_verifier_producers; DROP TABLE local_authority_state; DROP TABLE local_waves; DROP TABLE local_wave_arrivals;
         DROP TABLE local_target_roots; DROP TABLE local_target_dispositions; DROP TABLE local_target_revisions; DROP TABLE local_targets;

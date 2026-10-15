@@ -238,7 +238,7 @@ fn atomic_replacements_keep_the_original_group_in_one_wave() {
 }
 
 #[test]
-fn a_real_composer_dispatch_retains_a_candidate_without_verification_or_ref_writes() {
+fn a_real_composer_dispatch_roots_candidate_before_releasing_archive_guard() {
     let mut f = Fixture::new();
     let (owner, revision) = setup(&mut f, &["A", "B"]);
     available(&mut f.store, &owner, "A", 0).unwrap();

@@ -56,6 +56,8 @@ pub enum ControllerError {
     #[error(transparent)]
     Wave(#[from] wave::WaveError),
     #[error(transparent)]
+    CaptureNotice(#[from] crate::local_capture_notice::NoticeError),
+    #[error(transparent)]
     Sensitive(#[from] crate::collaboration_sensitive::SensitiveError),
     #[error(transparent)]
     Acceptance(#[from] acceptance::AcceptanceError),

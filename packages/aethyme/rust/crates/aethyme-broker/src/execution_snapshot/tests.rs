@@ -138,6 +138,36 @@ fn canonical_descriptor_roundtrip_and_each_input_identity_changes_execution() {
         Err(SnapshotError::Tampered)
     ));
 }
+
+#[test]
+fn load_refuses_snapshot_after_sensitive_quarantine() {
+    let mut f = Fixture::new();
+    let (owner, revision) = active(&mut f);
+    let execution_spec = spec(&f);
+    let snapshot = freeze(&mut f.store, &owner, &revision, execution_spec).unwrap();
+    assert_eq!(load(&f.store, snapshot.reference()).unwrap(), snapshot);
+
+    let epoch = owner.authority_epoch().clone();
+    drop(owner);
+    let frozen = crate::local_authority::freeze(&mut f.store, &epoch, "test quarantine").unwrap();
+    let incident = format!("sha256:{}", "a".repeat(64));
+    crate::collaboration_sensitive::quarantine(
+        &mut f.store,
+        &incident,
+        "test-operator",
+        frozen.epoch.as_str(),
+        crate::collaboration_sensitive::ReasonCode::OperatorRequestedPurge,
+    )
+    .unwrap();
+
+    assert!(matches!(
+        load(&f.store, snapshot.reference()),
+        Err(SnapshotError::Sensitive(
+            crate::collaboration_sensitive::SensitiveError::Quarantined
+        ))
+    ));
+}
+
 #[test]
 fn raw_bytes_modes_and_fresh_generations_ignore_ambient_worktree_files() {
     let mut f = Fixture::new();
