@@ -255,7 +255,9 @@ pub(super) fn native_gate_retention(root: &Path, rest: &[&str]) -> Result<Output
         return Err(Failure::usage("native-gates list does not take --job"));
     }
     if verb != "list" && !flags.0.contains_key("--job") {
-        return Err(Failure::usage("native-gates status and release require --job"));
+        return Err(Failure::usage(
+            "native-gates status and release require --job",
+        ));
     }
     let key = if verb == "list" {
         None
@@ -283,7 +285,15 @@ pub(super) fn native_gate_retention(root: &Path, rest: &[&str]) -> Result<Output
             let job_count = jobs.len();
             Ok((
                 json!({"schema":"aethyme.native-gate-retention/experimental-v1","action":"list","jobs":jobs,"truncated":listing.truncated}),
-                format!("{} native gate job(s) listed{}\n", job_count, if listing.truncated { "; list truncated at 500" } else { "" }),
+                format!(
+                    "{} native gate job(s) listed{}\n",
+                    job_count,
+                    if listing.truncated {
+                        "; list truncated at 500"
+                    } else {
+                        ""
+                    }
+                ),
             ))
         }
         "status" => {
@@ -294,7 +304,14 @@ pub(super) fn native_gate_retention(root: &Path, rest: &[&str]) -> Result<Output
             let state = job.state.clone();
             Ok((
                 json!({"schema":"aethyme.native-gate-retention/experimental-v1","action":"status","job":job,"roots_retained":roots_retained}),
-                format!("native gate job {job_id}: {state}, roots {}\n", if roots_retained { "retained" } else { "released" }),
+                format!(
+                    "native gate job {job_id}: {state}, roots {}\n",
+                    if roots_retained {
+                        "retained"
+                    } else {
+                        "released"
+                    }
+                ),
             ))
         }
         "release" => {
@@ -305,7 +322,14 @@ pub(super) fn native_gate_retention(root: &Path, rest: &[&str]) -> Result<Output
             let status = release.status;
             Ok((
                 json!({"schema":"aethyme.native-gate-retention/experimental-v1","action":"release","result":release,"roots_retained":roots_retained,"dispatch_authority_granted":false}),
-                format!("native gate job {job_id}: {status:?}; roots {}\n", if roots_retained { "retained" } else { "released" }),
+                format!(
+                    "native gate job {job_id}: {status:?}; roots {}\n",
+                    if roots_retained {
+                        "retained"
+                    } else {
+                        "released"
+                    }
+                ),
             ))
         }
         _ => unreachable!(),
@@ -729,6 +753,42 @@ mod tests {
         .unwrap();
         assert_eq!(valid.many("--source"), vec!["A", "B"]);
         assert_eq!(valid.one("--target").unwrap(), "T");
+    }
+    #[test]
+    fn native_gate_retention_cli_rejects_invalid_and_incomplete_arguments() {
+        let root = tempfile::tempdir().unwrap();
+        let too_many: Vec<&str> = (0..=MAX_ARGUMENTS / 2)
+            .flat_map(|_| ["--target", "T"])
+            .collect();
+        for (args, expected) in [
+            (
+                &["unknown"][..],
+                "native-gates requires list, status, or release",
+            ),
+            (&["list"][..], "--target is required"),
+            (&["list", "--target", "T"][..], "--issuer is required"),
+            (
+                &["list", "--target", "T", "--issuer", "I", "--job", "bad"][..],
+                "native-gates list does not take --job",
+            ),
+            (
+                &["status", "--target", "T", "--issuer", "I"][..],
+                "native-gates status and release require --job",
+            ),
+            (
+                &["release", "--target", "T", "--issuer", "I", "--job", "bad"][..],
+                "malformed record id \"bad\": expected sha256:<64 lowercase hex>",
+            ),
+        ] {
+            let failure = native_gate_retention(root.path(), args).unwrap_err();
+            assert_eq!(failure.exit, exit_status::USAGE, "args: {args:?}");
+            assert_eq!(failure.message, expected, "args: {args:?}");
+        }
+        let mut oversized = vec!["list"];
+        oversized.extend(too_many);
+        let failure = native_gate_retention(root.path(), &oversized).unwrap_err();
+        assert_eq!(failure.exit, exit_status::USAGE);
+        assert_eq!(failure.message, "expected a finite set of flag/value pairs");
     }
     #[test]
     fn malformed_regular_target_input_and_symlinks_are_rejected() {

@@ -409,9 +409,7 @@ fn dispatch(options: Options) -> Result<Output, Failure> {
         ["brief", "attach", rest @ ..] => brief_attach(&main_root, rest),
         ["authority", "status", rest @ ..] => lifecycle::authority_status(&main_root, rest),
         ["target", "status", rest @ ..] => lifecycle::target_status(&main_root, rest),
-        ["target", "native-gates", rest @ ..] => {
-            lifecycle::native_gate_retention(&main_root, rest)
-        }
+        ["target", "native-gates", rest @ ..] => lifecycle::native_gate_retention(&main_root, rest),
         [
             "target",
             verb @ ("propose" | "select" | "hold" | "resume"),
@@ -1505,6 +1503,20 @@ mod tests {
             assert_eq!(base32_lower(input.as_bytes()), expected, "{input}");
         }
         assert_eq!(base32_lower(&[0xff; 16]).len(), 26);
+    }
+
+    #[test]
+    fn native_gate_retention_route_is_named_and_documented() {
+        let command = [
+            "target".to_string(),
+            "native-gates".to_string(),
+            "release".to_string(),
+        ];
+        assert_eq!(command_name(&command), "target native-gates");
+        for verb in ["list", "status", "release"] {
+            let route = format!("aethyme collab target native-gates {verb}");
+            assert!(USAGE.contains(route.as_str()));
+        }
     }
 
     #[test]

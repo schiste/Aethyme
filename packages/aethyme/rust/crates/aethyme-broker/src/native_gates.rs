@@ -223,17 +223,14 @@ pub fn list_retention(
          WHERE target=?1 ORDER BY rowid DESC LIMIT ?2",
     )?;
     let rows = statement
-        .query_map(
-            params![owner.target(), RETENTION_LIST_LIMIT + 1],
-            |row| {
-                Ok(retention_status(
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                ))
-            },
-        )?
+        .query_map(params![owner.target(), RETENTION_LIST_LIMIT + 1], |row| {
+            Ok(retention_status(
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+            ))
+        })?
         .collect::<Result<Vec<_>, _>>()?;
     let truncated = rows.len() as i64 > RETENTION_LIST_LIMIT;
     Ok(RetentionListing {

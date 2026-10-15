@@ -110,6 +110,14 @@ fn root_count(store: &CollaborationStore, job: &RecordId) -> i64 {
         .unwrap()
 }
 
+fn object_relpath(store: &CollaborationStore, digest: &ObjectDigest) -> String {
+    archive::object_path(store, digest)
+        .strip_prefix(store.project_dir())
+        .unwrap()
+        .to_string_lossy()
+        .into_owned()
+}
+
 fn age_object(store: &CollaborationStore, digest: &ObjectDigest) {
     std::fs::File::open(archive::object_path(store, digest))
         .unwrap()
@@ -508,41 +516,68 @@ fn released_prepared_job_remains_readable_but_cannot_be_dispatched_or_replayed()
     let mut s = setup(None);
     let owner = s.owner.as_ref().expect("setup owner is present");
     let job = prepare(&mut s.f.store, owner, &mut s.broker, &s.wave).unwrap();
+    // Reopen the durable store as a schema-22 client would see it, then keep
+    // that connection open while a new client adopts migration 23. The old
+    // state update uses only columns that existed before the migration.
+    s.f.store
+        .connection()
+        .execute_batch(
+            "DROP TRIGGER local_native_gate_no_dispatch_after_root_release;
+             ALTER TABLE local_native_gate_jobs DROP COLUMN roots_released_ms;
+             UPDATE meta SET value='22' WHERE key='schema_version';
+             UPDATE meta SET value='22' WHERE key='min_compatible_schema';",
+        )
+        .unwrap();
+    let database = s.f.store.project_dir().join("state.db");
+    let old_client = rusqlite::Connection::open(database).unwrap();
+    let host = s.f._host.path().to_owned();
+    let mut migrated = open_store(&host);
+    assert_eq!(
+        migrated.schema_version(),
+        crate::collaboration_state::COLLABORATION_STATE_SCHEMA_VERSION
+    );
+    let migrated_floor: i64 = migrated
+        .read_connection()
+        .query_row(
+            "SELECT CAST(value AS INTEGER) FROM meta WHERE key='min_compatible_schema'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(migrated_floor, 23);
     let roots_before = root_count(&s.f.store, &job.id);
     assert!(roots_before > 0);
 
-    let released = release_roots(&mut s.f.store, owner, &job.id).unwrap();
+    let released = release_roots(&mut migrated, owner, &job.id).unwrap();
     assert_eq!(released.status, RootReleaseStatus::Released);
     assert_eq!(released.job.state, "prepared");
     assert!(released.job.roots_released_ms.is_some());
-    assert_eq!(root_count(&s.f.store, &job.id), roots_before);
-    assert_eq!(load(&s.f.store, &job.id).unwrap().state, "prepared");
+    assert_eq!(root_count(&migrated, &job.id), roots_before);
+    assert_eq!(load(&migrated, &job.id).unwrap().state, "prepared");
 
     assert!(matches!(
-        run_fresh(&mut s.f.store, owner, &mut s.broker, &job.id),
+        run_fresh(&mut migrated, owner, &mut s.broker, &job.id),
         Err(NativeGateError::RootsReleased)
     ));
     assert!(matches!(
-        prepare(&mut s.f.store, owner, &mut s.broker, &s.wave),
+        prepare(&mut migrated, owner, &mut s.broker, &s.wave),
         Err(NativeGateError::RootsReleased)
     ));
     assert_eq!(
-        release_roots(&mut s.f.store, owner, &job.id)
-            .unwrap()
-            .status,
+        release_roots(&mut migrated, owner, &job.id).unwrap().status,
         RootReleaseStatus::AlreadyReleased
     );
 
-    let old_client_update = s.f.store.connection().execute(
+    let old_client_update = old_client.execute(
         "UPDATE local_native_gate_jobs SET state='dispatching' WHERE id=?1",
         [job.id.as_str()],
     );
     assert!(
         old_client_update.is_err(),
-        "migration trigger must fence an older open client"
+        "migration 23 trigger must fence a connection opened on schema 22"
     );
     assert_eq!(
-        load(&s.f.store, &job.id).unwrap().roots_released_ms,
+        load(&migrated, &job.id).unwrap().roots_released_ms,
         released.job.roots_released_ms
     );
 }
@@ -553,6 +588,8 @@ fn dispatching_and_unknown_jobs_stay_rooted_without_a_process_tree_proof() {
     let owner = s.owner.as_ref().expect("setup owner is present");
     let job = prepare(&mut s.f.store, owner, &mut s.broker, &s.wave).unwrap();
     let roots_before = root_count(&s.f.store, &job.id);
+    let subject_object = ObjectDigest::of_snapshot(&snapshot(&job.spec.subject).unwrap());
+    let subject_relpath = object_relpath(&s.f.store, &subject_object);
     s.f.store
         .connection()
         .execute(
@@ -560,6 +597,27 @@ fn dispatching_and_unknown_jobs_stay_rooted_without_a_process_tree_proof() {
             [job.id.as_str()],
         )
         .unwrap();
+
+    // Inspect while the durable state is dispatching. It must still retain
+    // the exact candidate manifest before any transition to unknown.
+    s.f.store
+        .connection()
+        .execute("DELETE FROM local_target_roots", [])
+        .unwrap();
+    age_archive_objects(&s.f.store);
+    let dispatching_plan = gc::plan(&mut s.f.store, &gc::GcOptions::default()).unwrap();
+    assert!(
+        dispatching_plan.blockers.is_empty(),
+        "{:?}",
+        dispatching_plan.blockers
+    );
+    assert!(
+        !dispatching_plan
+            .reclaimable
+            .iter()
+            .any(|item| item.relpath == subject_relpath)
+    );
+    assert!(dispatching_plan.entities.is_empty());
 
     for state in ["dispatching", "unknown"] {
         if state == "unknown" {
@@ -578,11 +636,6 @@ fn dispatching_and_unknown_jobs_stay_rooted_without_a_process_tree_proof() {
         assert_eq!(root_count(&s.f.store, &job.id), roots_before);
     }
 
-    s.f.store
-        .connection()
-        .execute("DELETE FROM local_target_roots", [])
-        .unwrap();
-    age_archive_objects(&s.f.store);
     let plan = gc::plan(&mut s.f.store, &gc::GcOptions::default()).unwrap();
     assert!(plan.blockers.is_empty(), "{:?}", plan.blockers);
     assert!(
@@ -629,8 +682,17 @@ fn stale_owner_cannot_release_but_current_owner_can_release_old_epoch_history() 
         .is_err()
     );
 
-    drop(s.take_owner());
     crate::local_authority::resume(&mut s.f.store, &frozen.epoch).unwrap();
+    assert!(
+        release_roots(
+            &mut s.f.store,
+            s.owner.as_ref().expect("stale setup owner is retained"),
+            &job.id
+        )
+        .is_err(),
+        "the old owner remains stale after authority resumes"
+    );
+    drop(s.take_owner());
     let current = target::acquire_controller(&mut s.f.store, "native-gates", "appointed").unwrap();
     let released = release_roots(&mut s.f.store, &current, &job.id).unwrap();
     assert_eq!(released.status, RootReleaseStatus::Released);
@@ -649,58 +711,85 @@ fn completed_job_release_survives_real_gc_and_reopened_status_reads() {
     assert_eq!(observation["status"], "passed");
     assert_eq!(observation["selected_gates"], 1);
 
+    // With the target revision roots removed, the completed job is the only
+    // owner of this exact subject-manifest object until its explicit release.
+    s.f.store
+        .connection()
+        .execute("DELETE FROM local_target_roots", [])
+        .unwrap();
+    age_archive_objects(&s.f.store);
+    let subject_object = ObjectDigest::of_snapshot(&snapshot(&job.spec.subject).unwrap());
+    let subject_relpath = object_relpath(&s.f.store, &subject_object);
+    let orphan = archive::put_object(&s.f.store, b"unrelated orphan").unwrap();
+    age_object(&s.f.store, &orphan);
+    let before_release_plan = gc::plan(&mut s.f.store, &gc::GcOptions::default()).unwrap();
+    assert!(
+        before_release_plan.blockers.is_empty(),
+        "{:?}",
+        before_release_plan.blockers
+    );
+    assert!(
+        !before_release_plan
+            .reclaimable
+            .iter()
+            .any(|item| item.relpath == subject_relpath),
+        "the exact job-owned subject manifest must remain retained before release"
+    );
+    let before_release_gc = gc::apply(
+        &mut s.f.store,
+        &before_release_plan.digest,
+        &gc::GcOptions::default(),
+    )
+    .unwrap();
+    assert!(
+        before_release_gc
+            .reclaimed
+            .iter()
+            .any(|item| item.class == gc::RetentionClass::Orphan)
+    );
+    assert!(
+        !before_release_gc
+            .reclaimed
+            .iter()
+            .any(|item| item.relpath == subject_relpath)
+    );
+    assert!(archive::object_path(&s.f.store, &subject_object).exists());
+
     let released = release_roots(&mut s.f.store, owner, &job.id).unwrap();
     assert_eq!(released.status, RootReleaseStatus::Released);
     assert_eq!(released.job.state, "completed");
     assert!(released.job.roots_released_ms.is_some());
     assert_eq!(
         load(&s.f.store, &job.id).unwrap().observation,
-        Some(observation)
+        Some(observation.clone())
     );
 
-    // The target still independently owns its source. A real GC pass may
-    // remove an unrelated orphan, but must preserve the native candidate.
-    let orphan = archive::put_object(&s.f.store, b"unrelated orphan").unwrap();
-    age_object(&s.f.store, &orphan);
-    let first_plan = gc::plan(&mut s.f.store, &gc::GcOptions::default()).unwrap();
-    assert!(first_plan.blockers.is_empty(), "{:?}", first_plan.blockers);
-    let first_gc = gc::apply(
-        &mut s.f.store,
-        &first_plan.digest,
-        &gc::GcOptions::default(),
-    )
-    .unwrap();
-    assert!(
-        first_gc
-            .reclaimed
-            .iter()
-            .any(|item| item.class == gc::RetentionClass::Orphan)
-    );
-    let source_root = tempfile::tempdir().unwrap();
-    archive::reconstruct(
-        &s.f.store,
-        &snapshot(&job.spec.subject).unwrap(),
-        &source_root.path().join("subject"),
-    )
-    .unwrap();
-
-    // Once that separate owner releases its revision roots, the job's
-    // released edges no longer retain their former source objects.
-    s.f.store
-        .connection()
-        .execute("DELETE FROM local_target_roots", [])
-        .unwrap();
-    age_archive_objects(&s.f.store);
     let final_plan = gc::plan(&mut s.f.store, &gc::GcOptions::default()).unwrap();
     assert!(final_plan.blockers.is_empty(), "{:?}", final_plan.blockers);
-    assert!(!final_plan.reclaimable.is_empty());
+    assert!(
+        final_plan
+            .reclaimable
+            .iter()
+            .any(|item| item.relpath == subject_relpath),
+        "the same job-owned subject manifest must become reclaimable after release"
+    );
     let final_gc = gc::apply(
         &mut s.f.store,
         &final_plan.digest,
         &gc::GcOptions::default(),
     )
     .unwrap();
-    assert!(!final_gc.entities.is_empty());
+    assert!(final_gc.entities.iter().any(|entity| match entity {
+        gc::GcEntity::Snapshot(id) => id == &job.spec.subject,
+        gc::GcEntity::Contribution(_) => false,
+    }));
+    assert!(
+        final_gc
+            .reclaimed
+            .iter()
+            .any(|item| item.relpath == subject_relpath)
+    );
+    assert!(!archive::object_path(&s.f.store, &subject_object).exists());
 
     let host = s.f._host.path().to_owned();
     drop(s.take_owner());
@@ -758,33 +847,18 @@ fn root_release_waits_for_an_in_progress_gc_generation() {
     let owner = s.take_owner();
     let release_host = host.clone();
     let key = job.id.clone();
-    let (started_tx, started_rx) = std::sync::mpsc::channel();
-    let (done_tx, done_rx) = std::sync::mpsc::channel();
     let release_thread = std::thread::spawn(move || {
         let mut store = open_store(&release_host);
-        started_tx.send(()).unwrap();
-        let released = release_roots(&mut store, &owner, &key).unwrap();
-        done_tx.send(released.status).unwrap();
+        release_roots(&mut store, &owner, &key).unwrap().status
     });
-    started_rx
-        .recv_timeout(std::time::Duration::from_secs(5))
-        .expect("release thread should start");
-    assert!(
-        matches!(
-            done_rx.recv_timeout(std::time::Duration::from_millis(100)),
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
-        ),
-        "release must wait while GC owns the archive exclusively"
-    );
+    // Probe the actual archive lock from another open file description. None
+    // is returned only when the kernel reports the exclusive GC lock as held.
+    let lock_probe = open_store(&host);
+    assert!(gc::try_archive_use(&lock_probe).unwrap().is_none());
 
     continue_tx.send(()).unwrap();
     let gc_report = gc_thread.join().unwrap();
     assert_eq!(gc_report.reclaimed.len(), 1);
-    assert_eq!(
-        done_rx
-            .recv_timeout(std::time::Duration::from_secs(5))
-            .unwrap(),
-        RootReleaseStatus::Released
-    );
-    release_thread.join().unwrap();
+    assert!(gc::try_archive_use(&lock_probe).unwrap().is_some());
+    assert_eq!(release_thread.join().unwrap(), RootReleaseStatus::Released);
 }

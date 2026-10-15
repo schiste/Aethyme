@@ -1838,6 +1838,7 @@ mod tests {
         let versions: Vec<i64> = MIGRATIONS.iter().map(|(version, _)| *version).collect();
         let expected: Vec<i64> = (2..=COLLABORATION_STATE_SCHEMA_VERSION).collect();
         assert_eq!(versions, expected);
+        assert_eq!(MIN_COMPATIBLE_SCHEMA, 23);
         const { assert!(MIN_COMPATIBLE_SCHEMA <= COLLABORATION_STATE_SCHEMA_VERSION) };
         // A schema 4 binary's reclamation does not keep attached briefs; a
         // schema 5 binary posts no broad-risk keys and purges no cache entry.
