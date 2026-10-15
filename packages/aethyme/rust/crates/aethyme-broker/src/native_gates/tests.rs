@@ -847,18 +847,32 @@ fn root_release_waits_for_an_in_progress_gc_generation() {
     let owner = s.take_owner();
     let release_host = host.clone();
     let key = job.id.clone();
+    let (probe_tx, probe_rx) = std::sync::mpsc::channel();
     let release_thread = std::thread::spawn(move || {
         let mut store = open_store(&release_host);
-        release_roots(&mut store, &owner, &key).unwrap().status
+        let _probe = gc::observe_archive_use(probe_tx.clone());
+        let result = release_roots(&mut store, &owner, &key).unwrap().status;
+        let _ = probe_tx.send(gc::ArchiveUseProbeEvent::Finished);
+        result
     });
-    // Probe the actual archive lock from another open file description. None
-    // is returned only when the kernel reports the exclusive GC lock as held.
-    let lock_probe = open_store(&host);
-    assert!(gc::try_archive_use(&lock_probe).unwrap().is_none());
+    // The release thread's own archive acquisition must observe the kernel's
+    // exclusive GC lock before blocking. It reports Acquired only after the
+    // shared lock becomes available, then Finished after release_roots returns.
+    let first_event = probe_rx.recv_timeout(std::time::Duration::from_secs(5));
 
     continue_tx.send(()).unwrap();
     let gc_report = gc_thread.join().unwrap();
     assert_eq!(gc_report.reclaimed.len(), 1);
-    assert!(gc::try_archive_use(&lock_probe).unwrap().is_some());
     assert_eq!(release_thread.join().unwrap(), RootReleaseStatus::Released);
+    let mut events: Vec<_> = first_event.into_iter().collect();
+    events.extend(probe_rx.try_iter());
+    assert_eq!(
+        events,
+        [
+            gc::ArchiveUseProbeEvent::Blocked,
+            gc::ArchiveUseProbeEvent::Acquired,
+            gc::ArchiveUseProbeEvent::Finished,
+        ],
+        "release_roots must wait for GC at its own archive lock"
+    );
 }
