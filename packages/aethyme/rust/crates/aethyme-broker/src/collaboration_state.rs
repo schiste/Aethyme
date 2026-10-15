@@ -1928,6 +1928,10 @@ mod tests {
         let mut store = open(host.path(), &[]).unwrap();
         assert_eq!(floor(&store), MIN_COMPATIBLE_SCHEMA);
         // As a schema 3 binary left it.
+        crate::collaboration_sensitive::drop_sensitive_response_tables_for_legacy_fixture(
+            store.connection(),
+        )
+        .unwrap();
         store
             .connection()
             .execute_batch(
@@ -1965,6 +1969,10 @@ mod tests {
     fn inspection_reads_without_migrating_or_writing() {
         let host = tempfile::tempdir().unwrap();
         let mut store = open(host.path(), &[]).unwrap();
+        crate::collaboration_sensitive::drop_sensitive_response_tables_for_legacy_fixture(
+            store.connection(),
+        )
+        .unwrap();
         store
             .connection()
             .execute_batch(

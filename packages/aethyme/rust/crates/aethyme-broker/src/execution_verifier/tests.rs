@@ -160,10 +160,34 @@ impl Subject {
     pub(crate) fn acceptance_fixture() -> Self {
         Self::with_max_age(60000)
     }
+    pub(crate) fn acceptance_fixture_with_source_marker(marker: &[u8]) -> Self {
+        Self::with_max_age_and_source_marker(60000, Some(marker))
+    }
+    pub(crate) fn acceptance_fixture_with_source_marker_in(
+        marker: &[u8],
+        parent: &std::path::Path,
+    ) -> Self {
+        Self::with_max_age_and_source_marker_in(60000, Some(marker), Some(parent))
+    }
     fn with_max_age(max_age_ms: u64) -> Self {
+        Self::with_max_age_and_source_marker(max_age_ms, None)
+    }
+    fn with_max_age_and_source_marker(max_age_ms: u64, source_marker: Option<&[u8]>) -> Self {
+        Self::with_max_age_and_source_marker_in(max_age_ms, source_marker, None)
+    }
+    fn with_max_age_and_source_marker_in(
+        max_age_ms: u64,
+        source_marker: Option<&[u8]>,
+        parent: Option<&std::path::Path>,
+    ) -> Self {
         use aethyme_contracts::experimental_v0::SourceSnapshot;
         use aethyme_contracts::experimental_v0::source_snapshot::{EntryKind, SourceEntry};
-        let mut f = Fixture::new();
+        let mut f = match parent {
+            Some(parent) => {
+                Fixture::new_with_source_marker_in(source_marker.unwrap_or_default(), parent)
+            }
+            None => source_marker.map_or_else(Fixture::new, Fixture::new_with_source_marker),
+        };
         let owner = target::acquire_controller(&mut f.store, "evidence", "appointed").unwrap();
         let inventory = AssertionInventory::new(vec![case()]).unwrap();
         let policy = policy();

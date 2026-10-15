@@ -27,6 +27,22 @@ const MARKER_NAME: &str = "sensitive-response.json";
 const MAX_MARKER_BYTES: usize = 16 * 1024;
 const SCOPE_KIND: &str = "project";
 
+/// Remove only schema-24 administrative-response tables from a synthetic
+/// pre-24 database used by historical-migration tests. Production migrations
+/// remain responsible for creating these tables on open.
+#[cfg(test)]
+pub(crate) fn drop_sensitive_response_tables_for_legacy_fixture(
+    connection: &rusqlite::Connection,
+) -> rusqlite::Result<()> {
+    connection.execute_batch(
+        "DROP TABLE IF EXISTS local_sensitive_table_inventory;
+         DROP TABLE IF EXISTS local_sensitive_residuals;
+         DROP TABLE IF EXISTS local_sensitive_items;
+         DROP TABLE IF EXISTS local_sensitive_exports;
+         DROP TABLE IF EXISTS local_sensitive_incidents;",
+    )
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReasonCode {
@@ -1308,6 +1324,13 @@ fn prepare_inventory(
     unknown.dedup();
     let tables = database_inventory(store)?;
     let exports = external_exports(store, &mut unknown)?;
+    let source_repositories = {
+        let mut statement = store
+            .read_connection()
+            .prepare("SELECT DISTINCT repository FROM capture_operations ORDER BY repository")?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
     let digest = inventory_digest(&files, &tables, &exports);
     let project_dir = store.project_dir().to_path_buf();
     let root_entries = fs::read_dir(&project_dir)?.collect::<Result<Vec<_>, _>>()?;
@@ -1345,6 +1368,14 @@ fn prepare_inventory(
             "INSERT OR IGNORE INTO local_sensitive_residuals
              (incident_id,code,relative_path,permanence) VALUES (?1,'unclassified_managed_path',?2,'unclassified')",
             rusqlite::params![marker.incident_id, path],
+        )?;
+    }
+    for source_path in &source_repositories {
+        tx.execute(
+            "INSERT OR IGNORE INTO local_sensitive_residuals
+             (incident_id,code,relative_path,permanence)
+             VALUES (?1,'captured_source_repository_copy',?2,'unmanaged')",
+            rusqlite::params![marker.incident_id, source_path],
         )?;
     }
     for item in &exports {
@@ -1805,6 +1836,13 @@ pub fn purge(
 mod tests {
     use super::*;
 
+    fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+        !needle.is_empty()
+            && haystack
+                .windows(needle.len())
+                .any(|window| window == needle)
+    }
+
     #[test]
     fn a_durable_marker_blocks_resume_and_quarantine_retry_repairs_missing_row() {
         let fixture = crate::local_target::tests::Fixture::new();
@@ -1861,5 +1899,308 @@ mod tests {
         .unwrap();
         assert_eq!(status.request_digest, digest);
         assert_eq!(status.state, "quarantined");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn synthetic_source_token_is_blocked_and_managed_copies_are_removed_with_residuals() {
+        use crate::collaboration_archive::{self as archive, ObjectDigest};
+        use crate::collaboration_capture as capture;
+        use crate::collaboration_context as context;
+
+        let playground_parent = std::path::Path::new("/private/tmp");
+        let playground = tempfile::Builder::new().prefix("aethyme-t56-playground-");
+        let run_root = if playground_parent.is_dir() {
+            playground.tempdir_in(playground_parent).unwrap().keep()
+        } else {
+            tempfile::Builder::new()
+                .prefix("aethyme-t56-playground-")
+                .tempdir()
+                .unwrap()
+                .keep()
+        };
+        let nonce = capture::OperationId::mint().unwrap();
+        let token = format!("secret_{}", nonce.as_str().trim_start_matches("cap-"));
+        let token_bytes = token.as_bytes();
+        let mut fixture =
+            crate::local_generation::tests::Fixture::with_source_marker_in(token_bytes, &run_root);
+        let prepared = fixture.prepare("t56-generation").unwrap();
+        let generation_root = prepared.absolute_root().to_path_buf();
+        assert!(
+            contains_bytes(
+                &std::fs::read(generation_root.join("src/credential.rs")).unwrap(),
+                token_bytes
+            ),
+            "prepared generation omitted the synthetic source marker"
+        );
+
+        let source_repository = fixture.v.f._repo.path().to_path_buf();
+        let capture_request = capture::CaptureRequest {
+            operation_id: capture::OperationId::mint().unwrap(),
+            repository: source_repository.clone(),
+            base: fixture.v.f.a.base.commit.clone(),
+            result: fixture.v.f.a.result.commit.clone(),
+            policy: capture::CapturePolicy::Required,
+            retention: capture::RetentionBoundary::UntilReleased,
+        };
+        let capture_receipt =
+            match capture::capture(&mut fixture.v.f.store, &capture_request).unwrap() {
+                capture::CaptureOutcome::Acknowledged(receipt) => receipt,
+                _ => panic!("capture did not acknowledge"),
+            };
+        let snapshot =
+            archive::snapshot_of_commit(&source_repository, &fixture.v.f.a.result.commit).unwrap();
+        let credential = snapshot
+            .entries()
+            .iter()
+            .find(|entry| entry.path() == b"src/credential.rs")
+            .expect("source snapshot contains the synthetic source file");
+        let content_digest = ObjectDigest::from_bytes(*credential.content_sha256());
+        assert!(contains_bytes(
+            &archive::read_object(&fixture.v.f.store, &content_digest).unwrap(),
+            token_bytes
+        ));
+
+        let brief_bytes = format!(r#"{{"intent":"retain {token}"}}"#);
+        let brief = aethyme_contracts::experimental_v0::brief::Brief::from_decision_file(
+            brief_bytes.as_bytes(),
+        )
+        .unwrap();
+        context::attach_brief(
+            &mut fixture.v.f.store,
+            &capture_receipt.contribution,
+            &brief,
+        )
+        .unwrap();
+        let query = context::ContextQuery {
+            scope: vec![b"src/credential.rs".to_vec()],
+            source: Some(capture_receipt.result.clone()),
+            analysis: Vec::new(),
+            budget: Default::default(),
+        };
+        let cached =
+            context::retrieve_cached(&mut fixture.v.f.store, &query, &context::LocalProject)
+                .unwrap();
+        assert!(contains_bytes(&cached.record, token_bytes));
+
+        let view_options = crate::analysis_view::ViewOptions::new(
+            crate::analysis_view::ViewProfile::current("t56-fixture"),
+        );
+        let view = crate::analysis_view::build_view(
+            &fixture.v.f.store,
+            &capture_receipt.result,
+            &view_options,
+        )
+        .unwrap();
+        let reader = crate::analysis_view::open_view(&fixture.v.f.store, &view).unwrap();
+        let references = reader.find_references(&token, 16).unwrap();
+        assert!(contains_bytes(&references.to_record().0, token_bytes));
+        crate::analysis_view::hold_view(&fixture.v.f.store, &view, "t56-synthetic-holder", None)
+            .unwrap();
+
+        let scope = crate::local_restore::Scope {
+            origin: fixture.v.f.store.project().as_str().to_string(),
+            visibility: "local_project".into(),
+            audience: "t56-fixture-receiver".into(),
+        };
+        let selection = crate::local_restore::Selection {
+            sources: vec![capture_receipt.result.clone()],
+            records: Vec::new(),
+        };
+        let export_path = run_root.join("external-export.bundle");
+        crate::local_restore::export_to_path(
+            &mut fixture.v.f.store,
+            &fixture.v.owner,
+            &scope,
+            &selection,
+            &export_path,
+        )
+        .unwrap();
+        let exported = std::fs::read(&export_path).unwrap();
+        assert!(contains_bytes(&exported, token_bytes));
+        let verified = crate::local_restore::verify(
+            &exported,
+            &crate::local_restore::ReceiverPolicy {
+                bundle: ObjectDigest::of(&exported),
+                scope: scope.clone(),
+            },
+        )
+        .unwrap();
+        let binding =
+            crate::local_restore::bind_receiver(&fixture.v.f.store, &fixture.v.owner, &verified)
+                .unwrap();
+        let imported = crate::local_restore::import(
+            &mut fixture.v.f.store,
+            &fixture.v.owner,
+            &binding,
+            &verified,
+        )
+        .unwrap();
+        crate::local_restore::show(&fixture.v.f.store, &imported.id).unwrap();
+        let rehearsed_root = crate::local_restore::rehearse(
+            &mut fixture.v.f.store,
+            &fixture.v.owner,
+            &imported.id,
+            &capture_receipt.result,
+            "t56-rehearsal",
+        )
+        .unwrap();
+        assert!(contains_bytes(
+            &std::fs::read(rehearsed_root.join("src/credential.rs")).unwrap(),
+            token_bytes
+        ));
+
+        let source_worktree_copy = source_repository.join("sensitive-test-material.txt");
+        std::fs::write(&source_worktree_copy, token_bytes).unwrap();
+        let project_dir = fixture.v.f.store.project_dir().to_path_buf();
+        let (host_root, preserved_repository, remote_root) = fixture.preserve_roots();
+        assert_eq!(source_repository, preserved_repository);
+        let store = &mut fixture.v.f.store;
+        let wave: String = store
+            .read_connection()
+            .query_row(
+                "SELECT wave FROM local_waves WHERE target=?1 LIMIT 1",
+                [fixture.v.owner.target()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let synthetic_job = "t56-synthetic-unknown-job";
+        store
+            .connection()
+            .execute(
+                "INSERT INTO local_controller_runs(wave,id,epoch,state,body,observation)
+                 VALUES(?1,?2,?3,'unknown',?4,?5)",
+                rusqlite::params![
+                    wave,
+                    synthetic_job,
+                    fixture.v.owner.authority_epoch().as_str(),
+                    b"synthetic unknown-work witness".as_slice(),
+                    b"test-only; no native dispatch".as_slice(),
+                ],
+            )
+            .unwrap();
+
+        let incident_id = format!("sha256:{}", ObjectDigest::of(token_bytes).hex());
+        let frozen = crate::local_authority::freeze(
+            store,
+            fixture.v.owner.authority_epoch(),
+            "T56 synthetic fixture",
+        )
+        .unwrap();
+        let quarantined = quarantine(
+            store,
+            &incident_id,
+            "local-test-operator",
+            frozen.epoch.as_str(),
+            ReasonCode::SuspectedTestSecretExposure,
+        )
+        .unwrap();
+        assert!(matches!(
+            ensure_available(store),
+            Err(SensitiveError::Quarantined)
+        ));
+        assert!(archive::read_object(store, &content_digest).is_err());
+        assert!(archive::has_object(store, &content_digest).is_err());
+        assert!(capture::receipt(store, &capture_request.operation_id).is_err());
+        assert!(capture::recover(store).is_err());
+        assert!(capture::abort(store, &capture_request.operation_id).is_err());
+        assert!(capture::capture(store, &capture_request).is_err());
+        assert!(context::retrieve_cached(store, &query, &context::LocalProject).is_err());
+        assert!(
+            crate::analysis_view::build_view(store, &capture_receipt.result, &view_options)
+                .is_err()
+        );
+        assert!(crate::analysis_view::open_view(store, &view).is_err());
+        assert!(reader.find_references(&token, 16).is_err());
+        assert!(crate::local_generation::load_prepared(store, prepared.id()).is_err());
+        assert!(crate::local_restore::show(store, &imported.id).is_err());
+        assert!(crate::local_restore::bind_receiver(store, &fixture.v.owner, &verified).is_err());
+        assert!(
+            crate::local_restore::import(store, &fixture.v.owner, &binding, &verified).is_err()
+        );
+        assert!(
+            crate::local_restore::rehearse(
+                store,
+                &fixture.v.owner,
+                &imported.id,
+                &capture_receipt.result,
+                "t56-after-quarantine"
+            )
+            .is_err()
+        );
+        assert!(
+            crate::local_restore::export_to_path(
+                store,
+                &fixture.v.owner,
+                &scope,
+                &selection,
+                &run_root.join("blocked-export.bundle")
+            )
+            .is_err()
+        );
+        assert_eq!(quarantined.state, "quarantined");
+
+        assert!(matches!(
+            purge(store, &incident_id, &quarantined.request_digest),
+            Err(SensitiveError::UnknownWork)
+        ));
+        store
+            .connection()
+            .execute(
+                "UPDATE local_controller_runs SET state='completed' WHERE id=?1",
+                [synthetic_job],
+            )
+            .unwrap();
+        let first_purge = purge(store, &incident_id, &quarantined.request_digest).unwrap();
+        assert!(!first_purge.completed);
+        assert!(!generation_root.exists());
+        assert!(!rehearsed_root.exists());
+        assert!(host_root.exists());
+        assert!(project_dir.join("views").join(&view).exists());
+        assert!(source_worktree_copy.is_file());
+        assert!(contains_bytes(
+            &std::fs::read(&source_worktree_copy).unwrap(),
+            token_bytes
+        ));
+        assert!(contains_bytes(
+            &std::fs::read(&export_path).unwrap(),
+            token_bytes
+        ));
+        assert!(remote_root.exists());
+        let remote_source = archive::git(&remote_root)
+            .args(["show", "refs/heads/accepted:src/credential.rs"])
+            .output()
+            .unwrap();
+        assert!(
+            remote_source.status.success(),
+            "provider mirror source is present"
+        );
+        assert!(contains_bytes(&remote_source.stdout, token_bytes));
+        assert!(first_purge.status.residuals.iter().any(|residual| {
+            residual.code == "captured_source_repository_copy"
+                && residual.path == source_repository.to_string_lossy().to_string()
+        }));
+        assert!(first_purge.status.residuals.iter().any(|residual| {
+            residual.code == "git_worktrees_and_remotes" && residual.path.is_empty()
+        }));
+        assert!(first_purge.status.residuals.iter().any(|residual| {
+            residual.code == "previous_external_export_copy"
+                && residual.path == export_path.to_string_lossy().to_string()
+        }));
+        assert!(!first_purge.status.managed_cleanup_complete);
+
+        assert!(
+            crate::analysis_view::release_view_hold(store, &view, "t56-synthetic-holder").unwrap()
+        );
+        drop(reader);
+        let final_purge = purge(store, &incident_id, &quarantined.request_digest).unwrap();
+        assert!(!final_purge.completed);
+        assert!(!final_purge.status.managed_cleanup_complete);
+        assert!(project_dir.join("views").join(&view).exists());
+        assert!(contains_bytes(
+            &std::fs::read(&export_path).unwrap(),
+            token_bytes
+        ));
+        assert_eq!(final_purge.status.state, "quarantined");
     }
 }

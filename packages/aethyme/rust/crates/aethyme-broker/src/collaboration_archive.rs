@@ -2980,6 +2980,10 @@ mod tests {
     #[test]
     fn a_version_one_database_is_migrated() {
         let (host, mut store) = store();
+        crate::collaboration_sensitive::drop_sensitive_response_tables_for_legacy_fixture(
+            store.connection(),
+        )
+        .unwrap();
         store
             .connection()
             .execute_batch(

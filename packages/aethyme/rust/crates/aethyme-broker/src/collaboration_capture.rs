@@ -302,6 +302,8 @@ pub enum CaptureError {
     Sqlite(#[from] rusqlite::Error),
     #[error(transparent)]
     State(#[from] CollaborationStateError),
+    #[error(transparent)]
+    Sensitive(#[from] crate::collaboration_sensitive::SensitiveError),
 }
 
 impl CaptureError {
@@ -321,6 +323,7 @@ impl CaptureError {
             Self::Io { .. } => "io",
             Self::Sqlite(_) => "sqlite",
             Self::State(_) => "state",
+            Self::Sensitive(_) => "sensitive_response_quarantined",
         }
     }
 }
@@ -785,6 +788,7 @@ pub fn receipt(
     store: &mut CollaborationStore,
     operation_id: &OperationId,
 ) -> Result<Option<CaptureReceipt>, CaptureError> {
+    let _response = crate::collaboration_sensitive::response_use(store)?;
     let row = store
         .connection()
         .query_row(
@@ -1388,6 +1392,7 @@ fn reap_crashed(store: &mut CollaborationStore, except: Option<&OperationId>) {
 pub fn recover(store: &mut CollaborationStore) -> Result<RecoveryReport, CaptureError> {
     // Shared with captures, exclusive with a GC apply (#659).
     let _use = archive_use(store)?;
+    let _response = crate::collaboration_sensitive::response_use(store)?;
     let mut report = RecoveryReport::default();
     for operation_id in in_flight(store)? {
         match recover_one(store, &operation_id) {
@@ -1441,6 +1446,8 @@ pub fn abort(
     store: &mut CollaborationStore,
     operation_id: &OperationId,
 ) -> Result<(), CaptureError> {
+    let _archive = archive_use(store)?;
+    let _response = crate::collaboration_sensitive::response_use(store)?;
     let _lock = lock_operation(store, operation_id, true)?;
     let row = load_operation(store.connection(), operation_id)?.ok_or_else(|| {
         CaptureError::UnknownOperation {
