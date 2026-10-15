@@ -162,6 +162,7 @@ fn empty_initial_installation_recovers_witness_written_before_first_binding() {
     let mut store = fixture.store;
     let epoch = fresh_epoch().unwrap();
     let witness_path = directory(&store).unwrap();
+    prepare(&witness_path).unwrap();
     write(
         &witness_path,
         &Witness {
