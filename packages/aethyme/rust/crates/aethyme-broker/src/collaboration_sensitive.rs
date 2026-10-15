@@ -3682,7 +3682,7 @@ mod tests {
         // job below is the only unresolved-work witness exercised by purge.
         let binding =
             crate::local_acceptance::load(&fixture.v.f.store, &fixture.binding).unwrap();
-        let intent_id = RecordId::parse(&binding.spec.intent).unwrap();
+        let intent_id = RecordId::parse(&binding.spec().intent).unwrap();
         let intent =
             crate::local_source_transport::load(&fixture.v.f.store, &intent_id).unwrap();
         let wave_id = RecordId::parse(&intent.spec.wave).unwrap();
