@@ -24,6 +24,8 @@ The runner exited with numeric status 0 after invoking the Codex CLI exactly onc
 
 Each event stream reported the same provider rejection: HTTP 400, invalid_request_error, code invalid_json_schema, parameter text.format.schema. The provider rejected codex_output_schema because its root uses oneOf; the root schema must instead be an object without top-level oneOf, anyOf, allOf, enum, or not. No model response was returned. Provider request count, usage, retry count, and invoiced cost remain unknown.
 
+The private raw results file reports `tool_calls_observed: 1` on all six rows. This is an overcount from the then-pinned runner: it counted the provider's `item.type: error` event as a tool call. The event streams contain no recognized tool-call items, and each row records `effective_tools_available: 0`; therefore the observed tool-call count for these rows is zero. The raw results and event files remain unchanged. A follow-up runner change narrows the classifier to known tool-call item types and has local no-model regression coverage; it does not alter or re-interpret the recorded provider outcomes.
+
 | Frozen row | Status | CLI exit | Event bytes | Event-stream SHA256 |
 | --- | --- | ---: | ---: | --- |
 | original-core:SX01-alias:correct | cli_or_provider_error | 1 | 1,083 | c48bc47ca04c78e2b99bf8245fc1c4c8834bc87c064d41d127fe2c877df41f35 |
