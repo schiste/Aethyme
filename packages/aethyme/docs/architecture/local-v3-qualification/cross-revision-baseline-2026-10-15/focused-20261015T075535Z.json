@@ -1,0 +1,43 @@
+{
+  "profile": "focused-cross-revision-baseline-regressions",
+  "started_unix_ns": 1792050935266477000,
+  "worktree": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/implement-the-actual-fx17-20-controlled",
+  "rust_workspace": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/implement-the-actual-fx17-20-controlled/packages/aethyme/rust",
+  "source_head": "4e741407e3473e39183114cf748b25df1f242751",
+  "source_tree": "f2dedb161daedb9b23e23aec9766e7884d0e939d",
+  "source_status_porcelain_v2": "1 .M N... 100644 100644 100644 e1e1bc6b8f9ad80db7817ad14c5ccdd9acda2441 e1e1bc6b8f9ad80db7817ad14c5ccdd9acda2441 packages/aethyme/rust/crates/aethyme-broker/src/local_controller.rs\n1 .M N... 100644 100644 100644 16939113b8061bad55a46b794ad65cc53185216d 16939113b8061bad55a46b794ad65cc53185216d packages/aethyme/rust/crates/aethyme-broker/src/local_controller/drive_tests.rs\n1 .M N... 100644 100644 100644 d97fd91aad8125ac7f34449a62b03be6cfdcc327 d97fd91aad8125ac7f34449a62b03be6cfdcc327 packages/aethyme/rust/crates/aethyme-broker/src/local_controller/fx17_tests.rs\n1 .M N... 100644 100644 100644 36b3fa318208762c1f597c0187b8612c11582cef 36b3fa318208762c1f597c0187b8612c11582cef packages/aethyme/rust/crates/aethyme-broker/src/local_wave.rs\n1 .M N... 100644 100644 100644 0fc671895c7409ac7407b0a661e8e084425dffce 0fc671895c7409ac7407b0a661e8e084425dffce packages/aethyme/rust/crates/aethyme-broker/src/native_gates.rs",
+  "source_diff_sha256": "2dfdb9c8a0f78a7ce3417f4de781e8d9c13fe4ebe5110aa1d6edb8173795dd23",
+  "source_diff_bytes": 29867,
+  "cargo_target_dir": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/integrate-reviewed-local-bare-git-servic/target/local-resume/cargo",
+  "environment": {
+    "PATH": "/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/christophehenner/.cargo/bin",
+    "RUSTC_WRAPPER": "",
+    "CARGO_TARGET_DIR": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/integrate-reviewed-local-bare-git-servic/target/local-resume/cargo"
+  },
+  "argv": [
+    "/usr/bin/caffeinate",
+    "-i",
+    "/Users/christophehenner/.cargo/bin/cargo",
+    "test",
+    "--locked",
+    "-j4",
+    "-p",
+    "aethyme-broker",
+    "--lib",
+    "cross_revision_",
+    "--",
+    "--nocapture",
+    "--test-threads=1"
+  ],
+  "library_mtime_ns_before_touch": 1792047594751391000,
+  "library_mtime_ns_after_touch": 1792050935266285000,
+  "full_output_log": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/integrate-reviewed-local-bare-git-servic/target/local-resume/cross-revision-baseline/focused-20261015T075535Z.log",
+  "numeric_status_file": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/integrate-reviewed-local-bare-git-servic/target/local-resume/cross-revision-baseline/focused-20261015T075535Z.status",
+  "finished_unix_ns": 1792050969169838000,
+  "wall_elapsed_ns": 33871934042,
+  "numeric_exit_status": 101,
+  "source_diff_sha256_after": "2dfdb9c8a0f78a7ce3417f4de781e8d9c13fe4ebe5110aa1d6edb8173795dd23",
+  "source_unchanged_during_run": true,
+  "log_bytes": 1064,
+  "log_sha256": "0f203bbdbf8f3f63c5a9d19a0d21ec95a4fdde0556a258513d5a246ae9eab1f4"
+}

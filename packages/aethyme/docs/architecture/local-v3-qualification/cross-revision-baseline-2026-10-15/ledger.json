@@ -1,0 +1,370 @@
+{
+  "schema": "aethyme.local-qualification.cross-revision-baseline/v1",
+  "recorded_at": "2026-10-15",
+  "reviewed_commit": "9677dc7f98e44f0f504fb88a7e1a46d091102726",
+  "reviewed_commit_tree": "d2bd88b5df49a6495f90e399ebc37741856c153c",
+  "source_binding": "Metadata source_head/source_tree name the parent HEAD. The latest passing run used uncommitted changes in session1105; its recorded unstaged diff SHA256 equals the complete parent-to-reviewed-commit patch. Mutation backups match that commit source. Earlier failed patches retain their own distinct digests.",
+  "passing_patch_sha256": "431688240ded9666787e69365e170fd8de27de267cdf0feeccb61512c9e5a211",
+  "focused": {
+    "command_attempts": 5,
+    "compile_failures": 1,
+    "executed_test_commands": 4,
+    "passing_test_commands": 1,
+    "failing_test_commands": 3,
+    "test_executions": 12,
+    "passing_test_executions": 8,
+    "failing_test_executions": 4,
+    "unique_tests": 3,
+    "latest_result": "3 passed; 0 failed"
+  },
+  "mutations": {
+    "attempts": 2,
+    "intended_named_test_failures": 2,
+    "exit_codes": [
+      101,
+      101
+    ],
+    "exact_restoration_verified": true
+  },
+  "limitations": [
+    "Focused results and mutations are separate from the actual twenty-change native sequence.",
+    "The reviewed commit failed strict CI Clippy for an eight-field tuple; the named-row cleanup and its checks are recorded separately.",
+    "Earlier compile/test failures receive no passing credit. Overlapping executions are not unique tests.",
+    "No model call, private held-out evaluation, provider publication authority or reliability claim comes from these regressions."
+  ],
+  "runs": [
+    {
+      "id": "focused-20261015T075535Z",
+      "kind": "focused",
+      "numeric_exit": 101,
+      "source_head": "4e741407e3473e39183114cf748b25df1f242751",
+      "source_head_tree": "f2dedb161daedb9b23e23aec9766e7884d0e939d",
+      "worktree_diff_sha256": "2dfdb9c8a0f78a7ce3417f4de781e8d9c13fe4ebe5110aa1d6edb8173795dd23",
+      "argv": [
+        "/usr/bin/caffeinate",
+        "-i",
+        "/Users/christophehenner/.cargo/bin/cargo",
+        "test",
+        "--locked",
+        "-j4",
+        "-p",
+        "aethyme-broker",
+        "--lib",
+        "cross_revision_",
+        "--",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "test_results": [
+
+      ],
+      "compiler_errors": [
+        "error[E0609]: no field `epoch` on type `local_wave::WaveSpec`",
+        "error[E0609]: no field `epoch` on type `local_wave::WaveSpec`"
+      ]
+    },
+    {
+      "id": "focused-20261015T080220Z",
+      "kind": "focused",
+      "numeric_exit": 101,
+      "source_head": "4e741407e3473e39183114cf748b25df1f242751",
+      "source_head_tree": "f2dedb161daedb9b23e23aec9766e7884d0e939d",
+      "worktree_diff_sha256": "c6909b3964776c898a427579fd39b91b8a2957e32df2d20a92d5cbe9f652999a",
+      "argv": [
+        "/usr/bin/caffeinate",
+        "-i",
+        "cargo",
+        "test",
+        "--locked",
+        "-j4",
+        "-p",
+        "aethyme-broker",
+        "--lib",
+        "cross_revision_",
+        "--",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "test_results": [
+        "test result: FAILED. 1 passed; 2 failed; 0 ignored; 0 measured; 1796 filtered out; finished in 5.48s"
+      ],
+      "compiler_errors": [
+
+      ]
+    },
+    {
+      "id": "focused-20261015T080414Z",
+      "kind": "focused",
+      "numeric_exit": 101,
+      "source_head": "4e741407e3473e39183114cf748b25df1f242751",
+      "source_head_tree": "f2dedb161daedb9b23e23aec9766e7884d0e939d",
+      "worktree_diff_sha256": "20d55b05899473e22e620c9f6bfefaef5fbb4efda26b0855da14b17b75a5f3df",
+      "argv": [
+        "/usr/bin/caffeinate",
+        "-i",
+        "cargo",
+        "test",
+        "--locked",
+        "-j4",
+        "-p",
+        "aethyme-broker",
+        "--lib",
+        "cross_revision_",
+        "--",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "test_results": [
+        "test result: FAILED. 2 passed; 1 failed; 0 ignored; 0 measured; 1796 filtered out; finished in 3.75s"
+      ],
+      "compiler_errors": [
+
+      ]
+    },
+    {
+      "id": "focused-20261015T080552Z",
+      "kind": "focused",
+      "numeric_exit": 101,
+      "source_head": "4e741407e3473e39183114cf748b25df1f242751",
+      "source_head_tree": "f2dedb161daedb9b23e23aec9766e7884d0e939d",
+      "worktree_diff_sha256": "643dd22a3a9ba60c1bbbb1c7a6f37ebf54f0883ae193578011b93e53a0b6a2a3",
+      "argv": [
+        "/usr/bin/caffeinate",
+        "-i",
+        "cargo",
+        "test",
+        "--locked",
+        "-j4",
+        "-p",
+        "aethyme-broker",
+        "--lib",
+        "cross_revision_",
+        "--",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "test_results": [
+        "test result: FAILED. 2 passed; 1 failed; 0 ignored; 0 measured; 1796 filtered out; finished in 3.99s"
+      ],
+      "compiler_errors": [
+
+      ]
+    },
+    {
+      "id": "focused-20261015T080739Z",
+      "kind": "focused",
+      "numeric_exit": 0,
+      "source_head": "4e741407e3473e39183114cf748b25df1f242751",
+      "source_head_tree": "f2dedb161daedb9b23e23aec9766e7884d0e939d",
+      "worktree_diff_sha256": "431688240ded9666787e69365e170fd8de27de267cdf0feeccb61512c9e5a211",
+      "argv": [
+        "/usr/bin/caffeinate",
+        "-i",
+        "cargo",
+        "test",
+        "--locked",
+        "-j4",
+        "-p",
+        "aethyme-broker",
+        "--lib",
+        "cross_revision_",
+        "--",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "test_results": [
+        "test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 1796 filtered out; finished in 25.60s"
+      ],
+      "compiler_errors": [
+
+      ]
+    },
+    {
+      "id": "guard-mutation-20261015T081000Z",
+      "kind": "deliberate mutation",
+      "numeric_exit": 101,
+      "source_head": "4e741407e3473e39183114cf748b25df1f242751",
+      "source_head_tree": "f2dedb161daedb9b23e23aec9766e7884d0e939d",
+      "worktree_diff_sha256": "8fca0f007bcb658510fb0f82a4ebfc3c3b34fb06a56e0441456e4cae032f3c8a",
+      "argv": [
+        "/usr/bin/caffeinate",
+        "-i",
+        "cargo",
+        "test",
+        "--locked",
+        "-j4",
+        "-p",
+        "aethyme-broker",
+        "--lib",
+        "cross_revision_lookup_rejects_wrong_source_target_and_epoch",
+        "--",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "test_results": [
+        "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1798 filtered out; finished in 1.08s"
+      ],
+      "compiler_errors": [
+
+      ],
+      "mutation": {
+        "file": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/implement-the-actual-fx17-20-controlled/packages/aethyme/rust/crates/aethyme-broker/src/local_wave.rs",
+        "anchor": "(None, Some(source)) => completion.source == source,",
+        "replacement": "(None, Some(_source)) => true,",
+        "original_sha256": "98db152a45a287bc30ea3c5086b5ce4e76b37b020f61a39db62888ea9cdbeed6",
+        "mutated_sha256": "5458556137716b02cc28ed23d4736d81ae13ba7480d403196a368702d4606cce"
+      },
+      "backup_sha256": "98db152a45a287bc30ea3c5086b5ce4e76b37b020f61a39db62888ea9cdbeed6",
+      "restored_exact_bytes": true,
+      "restored_sha256": "98db152a45a287bc30ea3c5086b5ce4e76b37b020f61a39db62888ea9cdbeed6",
+      "expected_named_failure": "local_controller::drive::tests::cross_revision_lookup_rejects_wrong_source_target_and_epoch"
+    },
+    {
+      "id": "anchor-mutation-20261015T081115Z",
+      "kind": "deliberate mutation",
+      "numeric_exit": 101,
+      "source_head": "4e741407e3473e39183114cf748b25df1f242751",
+      "source_head_tree": "f2dedb161daedb9b23e23aec9766e7884d0e939d",
+      "worktree_diff_sha256": "a610a296c28d81801637fe61e981d40891658d43afaa5eebe3bfd871ca6438c6",
+      "argv": [
+        "/usr/bin/caffeinate",
+        "-i",
+        "cargo",
+        "test",
+        "--locked",
+        "-j4",
+        "-p",
+        "aethyme-broker",
+        "--lib",
+        "cross_revision_completion_anchor_binds_candidate_parent_and_publication_lease",
+        "--",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "test_results": [
+        "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1798 filtered out; finished in 1.91s"
+      ],
+      "compiler_errors": [
+
+      ],
+      "mutation": {
+        "file": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/implement-the-actual-fx17-20-controlled/packages/aethyme/rust/crates/aethyme-broker/src/local_wave.rs",
+        "anchor": "None => latest_completion_for(\n            store,\n            owner.target(),\n            owner.authority_epoch().as_str(),\n            None,\n            Some(&pinned.spec.baseline),\n        )?,",
+        "replacement": "None => None,",
+        "original_sha256": "98db152a45a287bc30ea3c5086b5ce4e76b37b020f61a39db62888ea9cdbeed6",
+        "mutated_sha256": "acdc4eda64bd8b8856936df7eab869537f408c9399a9a1c82d52726c19cd7f5d"
+      },
+      "backup_sha256": "98db152a45a287bc30ea3c5086b5ce4e76b37b020f61a39db62888ea9cdbeed6",
+      "restored_exact_bytes": true,
+      "restored_sha256": "98db152a45a287bc30ea3c5086b5ce4e76b37b020f61a39db62888ea9cdbeed6",
+      "expected_named_failure": "local_controller::drive::tests::cross_revision_completion_anchor_binds_candidate_parent_and_publication_lease"
+    }
+  ],
+  "raw_artifacts": [
+    {
+      "path": "focused-20261015T075535Z.json",
+      "bytes": 3312,
+      "sha256": "704fc16ed77414d5c1eca069df75303e4f95ac563cdc4d95b15239bbd3cd0dc8"
+    },
+    {
+      "path": "focused-20261015T075535Z.log",
+      "bytes": 1064,
+      "sha256": "0f203bbdbf8f3f63c5a9d19a0d21ec95a4fdde0556a258513d5a246ae9eab1f4"
+    },
+    {
+      "path": "focused-20261015T075535Z.status",
+      "bytes": 4,
+      "sha256": "39b8dc3fc8b44765c8e6f1adee04c5b465e555ab791cc42d0d9e810d5b64297c"
+    },
+    {
+      "path": "focused-20261015T080220Z.json",
+      "bytes": 2718,
+      "sha256": "1f15b8d2455fcd55eb01bce876d45559d62e2d4a2936ecb5f9cbc7664d814225"
+    },
+    {
+      "path": "focused-20261015T080220Z.log",
+      "bytes": 2295,
+      "sha256": "97798dd83e87e9a44b51a172b4423307813924584ac5429b9d8eb3cb87eb32e8"
+    },
+    {
+      "path": "focused-20261015T080220Z.status",
+      "bytes": 4,
+      "sha256": "39b8dc3fc8b44765c8e6f1adee04c5b465e555ab791cc42d0d9e810d5b64297c"
+    },
+    {
+      "path": "focused-20261015T080414Z.json",
+      "bytes": 2719,
+      "sha256": "4eefbce4e2302eef64556866132db36ff34d090c35299629f8449d748d8bc733"
+    },
+    {
+      "path": "focused-20261015T080414Z.log",
+      "bytes": 1524,
+      "sha256": "9ef404002f1b70e5e996ca99029368b3ce756a58ba268035f9be38ae391d173f"
+    },
+    {
+      "path": "focused-20261015T080414Z.status",
+      "bytes": 4,
+      "sha256": "39b8dc3fc8b44765c8e6f1adee04c5b465e555ab791cc42d0d9e810d5b64297c"
+    },
+    {
+      "path": "focused-20261015T080552Z.json",
+      "bytes": 2709,
+      "sha256": "0c4fb1612294655dd5f9ce38bbc98f6b717fa091f75cc624b35c22bd8889d49f"
+    },
+    {
+      "path": "focused-20261015T080552Z.log",
+      "bytes": 2691,
+      "sha256": "8fc1ce8cb992ae7ee405f4a42365d9c87ff444de13717256fbd39fc7f1f96be7"
+    },
+    {
+      "path": "focused-20261015T080552Z.status",
+      "bytes": 4,
+      "sha256": "39b8dc3fc8b44765c8e6f1adee04c5b465e555ab791cc42d0d9e810d5b64297c"
+    },
+    {
+      "path": "focused-20261015T080739Z.json",
+      "bytes": 2706,
+      "sha256": "af9c42ca76e716700483d52cb8afe69996bd4f212c37774795955534051e1ae2"
+    },
+    {
+      "path": "focused-20261015T080739Z.log",
+      "bytes": 990,
+      "sha256": "9da2e66779ef99e86633948742e9d9223632c9920ad84fc75fce494c0e6199aa"
+    },
+    {
+      "path": "focused-20261015T080739Z.status",
+      "bytes": 2,
+      "sha256": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa"
+    },
+    {
+      "path": "guard-mutation-20261015T081000Z.json",
+      "bytes": 3647,
+      "sha256": "aeaac9f8d85c28692c8c96c94a05a77e1c2d5fc6ff1d5724c4582be51123e5c3"
+    },
+    {
+      "path": "guard-mutation-20261015T081000Z.log",
+      "bytes": 1406,
+      "sha256": "c474efe4449f9f4c0ec0d1fde6c0c2f5e03ceb0164be6c68f68b0dc68146f37d"
+    },
+    {
+      "path": "guard-mutation-20261015T081000Z.status",
+      "bytes": 4,
+      "sha256": "39b8dc3fc8b44765c8e6f1adee04c5b465e555ab791cc42d0d9e810d5b64297c"
+    },
+    {
+      "path": "anchor-mutation-20261015T081115Z.json",
+      "bytes": 3819,
+      "sha256": "bf7be960a5096843a5fe75be70519682cc5a077b92d4ee53b329212ed07dc79d"
+    },
+    {
+      "path": "anchor-mutation-20261015T081115Z.log",
+      "bytes": 1379,
+      "sha256": "f9b2df0863b5b9a6c6dcd3285936488e3aaf3f7a979d8b1a73cd4df58a033c98"
+    },
+    {
+      "path": "anchor-mutation-20261015T081115Z.status",
+      "bytes": 4,
+      "sha256": "39b8dc3fc8b44765c8e6f1adee04c5b465e555ab791cc42d0d9e810d5b64297c"
+    }
+  ]
+}
