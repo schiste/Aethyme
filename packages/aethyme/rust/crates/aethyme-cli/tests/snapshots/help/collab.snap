@@ -79,10 +79,16 @@ Additional explicit lifecycle commands (provisional Local packages):
       Opens existing state (which may migrate it); grants no current agent guard.
   aethyme collab sync status [--json]
       Read local exchange bookkeeping, with no remote delivery/source promise.
-  aethyme collab target run / sync / handoff dispatch
-      Refused with unsupported_profile: this CLI has no qualified appointed
-      execution, remote peer or agent adapter. No state or argument file is read.
-      Native gate integration and structural composition qualification are pending.
+  aethyme collab target run --target NAME --issuer NAME --appointment PATH
+       --resources PATH --producer NAME --generation N --session N --remote NAME
+       --destination refs/heads/NAME --docker ABSOLUTE_PATH --timeout SECONDS
+       --authorization TEXT --allow-replacement yes|no [--json]
+      Explicit finite native controller appointment; existing target, budget,
+      producer and pinned recipe required. Supports local bare Git only.
+      A durable interrupted appointment requires reconciliation; no auto-replay.
+  aethyme collab target run (without --appointment) / sync / handoff dispatch
+      Refused with unsupported_profile. No state or argument file is read.
+      These commands require their own appointed native adapters.
 
 Exit codes: 0 done, 1 failed (I/O, database, Git, or an integrity failure
 such as a corrupt object or receipt), 2 usage, 3 refused (disabled, policy,

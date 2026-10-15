@@ -92,6 +92,39 @@ fn clock() -> Result<i64, ControllerError> {
     )
     .map_err(|_| ControllerError::Mismatch)
 }
+fn dispatch_deadline(
+    started_ms: i64,
+    max_wall_ms: i64,
+    appointment_deadline: Option<i64>,
+) -> Result<i64, ControllerError> {
+    let local = started_ms
+        .checked_add(max_wall_ms)
+        .ok_or(ControllerError::Mismatch)?;
+    let deadline = appointment_deadline.map_or(local, |appointed| local.min(appointed));
+    if started_ms >= deadline {
+        return Err(ControllerError::Mismatch);
+    }
+    Ok(deadline)
+}
+fn admit_before_deadline(
+    store: &mut CollaborationStore,
+    owner: &ControllerOwner,
+    policy: wave::WavePolicy,
+    now_ms: i64,
+    deadline_ms: i64,
+    cancel: &AtomicBool,
+) -> Result<wave::Admission, ControllerError> {
+    if clock()? >= deadline_ms || cancel.load(Ordering::SeqCst) {
+        return Err(ControllerError::Mismatch);
+    }
+    let admission = wave::admit(store, owner, policy, now_ms)?;
+    // A concurrent writer can delay admission beyond the frozen expiry.
+    // Its durable wave is preserved, but no execution journal or effect follows.
+    if clock()? >= deadline_ms || cancel.load(Ordering::SeqCst) {
+        return Err(ControllerError::Mismatch);
+    }
+    Ok(admission)
+}
 fn check(
     store: &CollaborationStore,
     owner: &ControllerOwner,
@@ -181,12 +214,44 @@ pub fn drive(
     cancel: &AtomicBool,
     now_ms: i64,
 ) -> Result<DriveResult, ControllerError> {
-    let _authority = target::authorize(store, owner)?;
+    drive_until(
+        store, owner, broker, carrier, executor, permit, policy, cancel, now_ms, None, None,
+    )
+}
+
+/// The service supplies its frozen absolute expiry; admission cannot extend it.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn drive_until(
+    store: &mut CollaborationStore,
+    owner: &ControllerOwner,
+    broker: &mut Broker,
+    carrier: &GitCarrier,
+    executor: &DockerExecutor,
+    permit: &ProducerPermit,
+    policy: &DrivePolicy,
+    cancel: &AtomicBool,
+    now_ms: i64,
+    appointment_deadline: Option<i64>,
+    destination: Option<&super::bare_destination::BareDestination>,
+) -> Result<DriveResult, ControllerError> {
     policy.validate()?;
-    if cancel.load(Ordering::SeqCst) {
+    let deadline_ms = dispatch_deadline(clock()?, policy.max_wall_ms, appointment_deadline)?;
+    if let Some(destination) = destination {
+        carrier.check()?;
+        destination.revalidate()?;
+    }
+    let _authority = target::authorize(store, owner)?;
+    if cancel.load(Ordering::SeqCst) || clock()? >= deadline_ms {
         return Err(ControllerError::Mismatch);
     }
-    let admission = wave::admit(store, owner, policy.wave_policy, now_ms)?;
+    let admission = admit_before_deadline(
+        store,
+        owner,
+        policy.wave_policy,
+        now_ms,
+        deadline_ms,
+        cancel,
+    )?;
     let active = match admission {
         wave::Admission::Frozen(w) | wave::Admission::Existing(w) => w,
         other => return Ok(DriveResult::Waiting(other)),
@@ -230,9 +295,7 @@ pub fn drive(
         epoch: owner.authority_epoch().as_str().into(),
         wave: active.id.to_string(),
         policy: policy.clone(),
-        deadline_ms: clock()?
-            .checked_add(policy.max_wall_ms)
-            .ok_or(ControllerError::Mismatch)?,
+        deadline_ms,
     };
     let record = canonical(&spec)?;
     let _archive = archive_use(store)?;
@@ -240,7 +303,16 @@ pub fn drive(
     target::retain_artifacts(store, owner, &revision, &[], &[object])?;
     store.connection().execute("INSERT INTO local_controller_runs(wave,id,epoch,state,body) VALUES(?1,?2,?3,'dispatching',?4)",params![active.id.as_str(),record.id().as_str(),spec.epoch,record.canonical_bytes()])?;
     let result = run(
-        store, owner, broker, carrier, executor, permit, &spec, &active.id, cancel,
+        store,
+        owner,
+        broker,
+        carrier,
+        executor,
+        permit,
+        &spec,
+        &active.id,
+        cancel,
+        destination,
     );
     let (state, detail) = match &result {
         Ok(DriveResult::Completed { completion, .. }) => {
@@ -256,6 +328,11 @@ pub fn drive(
     };
     if store.connection().execute("UPDATE local_controller_runs SET state=?2,observation=?3 WHERE wave=?1 AND state='dispatching'",params![active.id.as_str(),state,detail])?!=1 {return Err(ControllerError::Mismatch);}
     result
+}
+fn dispatch_succeeded(outcome: crate::OperationStatus) -> bool {
+    // A later availability observation cannot settle an unknown managed write.
+    // Reconciled history is not the outcome of this fresh dispatch either.
+    outcome == crate::OperationStatus::Succeeded
 }
 fn require_fresh_native(job: &native_gates::Job) -> Result<(), ControllerError> {
     if job.state != "prepared" {
@@ -278,6 +355,7 @@ fn run(
     spec: &RunSpec,
     wave_id: &RecordId,
     cancel: &AtomicBool,
+    destination: Option<&super::bare_destination::BareDestination>,
 ) -> Result<DriveResult, ControllerError> {
     check(store, owner, spec, cancel)?;
     // Reserve the trusted native/control allowance before any external work.
@@ -428,8 +506,36 @@ fn run(
         64,
     )?;
     check(store, owner, spec, cancel)?;
-    transport::publish(store, owner, carrier, broker, &intent.id)?;
+    if let Some(destination) = destination {
+        carrier.check()?;
+        destination.revalidate()?;
+        check(store, owner, spec, cancel)?;
+    }
+    let dispatch = transport::publish(store, owner, carrier, broker, &intent.id)?;
     check(store, owner, spec, cancel)?;
+    if !dispatch_succeeded(dispatch.outcome) {
+        return Ok(DriveResult::Held {
+            wave: wave_id.clone(),
+            detail: format!(
+                "publication dispatch {:?}; explicit reconciliation required",
+                dispatch.outcome
+            ),
+        });
+    }
+    // A successful write remains unobserved until the exact route is read.
+    // Preserve that journal distinction before accepting or scheduling another
+    // wave. This inspection never retries a write or reconciles broker ambiguity.
+    let receipt = transport::inspect(store, owner, carrier, broker, &intent.id)?;
+    check(store, owner, spec, cancel)?;
+    if receipt.spec.observation != transport::Observation::Available
+        || !receipt.spec.content_checked
+        || receipt.spec.observed_oid.as_deref() != Some(intent.spec.commit.as_str())
+    {
+        return Ok(DriveResult::Held {
+            wave: wave_id.clone(),
+            detail: format!("publication observation {:?}", receipt.spec.observation),
+        });
+    }
     let grant = acceptance::qualify(
         store,
         owner,

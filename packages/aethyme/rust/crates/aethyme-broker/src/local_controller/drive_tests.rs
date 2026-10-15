@@ -298,9 +298,10 @@ fn actual_appointed_driver_completes_without_a_manufactured_receipt() {
             let until=std::time::Instant::now()+std::time::Duration::from_secs(300);
             loop {
                 let completed:i64=observer.read_connection().query_row("SELECT count(*) FROM local_controller_completions WHERE target='native-controller'",[],|r|r.get(0)).unwrap();
-                if completed==1 {
-                    std::thread::sleep(std::time::Duration::from_millis(200));
-                    wave::available(&mut observer,owner_ref,"B",1).unwrap();
+                if completed==1 && target::status(&observer,owner_ref.target()).unwrap().phase==Phase::WaitingForInput {
+                    // This persisted state witnesses an actual missing-input tick.
+                    // A delay after completion alone can expire during cleanup.
+                    wave::available(&mut observer,owner_ref,"B",clock().unwrap()).unwrap();
                     return;
                 }
                 if std::time::Instant::now()>=until {panic!("bounded arrival observer did not see first completion");}
@@ -647,4 +648,100 @@ fn later_same_line_edit_then_third_wave_does_not_replay_accepted_deltas() {
         Record::decode(&recipe.canonical_bytes(), &[&LEGACY]).is_err(),
         "old readers must refuse incremental recipes they cannot interpret"
     );
+}
+
+#[test]
+fn delayed_admission_cannot_extend_an_appointed_absolute_deadline() {
+    // Exercise the exact helper used before admission and stored in RunSpec.
+    // A later admission time still uses the original frozen expiry.
+    let frozen = dispatch_deadline(1000, 300000, Some(1010)).unwrap();
+    assert_eq!(frozen, 1010);
+    assert_eq!(dispatch_deadline(1008, 300000, Some(1010)).unwrap(), frozen);
+    assert!(dispatch_deadline(1010, 300000, Some(1010)).is_err());
+    assert!(dispatch_deadline(1011, 300000, Some(1010)).is_err());
+    assert_eq!(dispatch_deadline(1000, 5, Some(1010)).unwrap(), 1005);
+    assert_eq!(dispatch_deadline(1000, 5, None).unwrap(), 1005);
+}
+
+#[test]
+fn actual_delayed_database_admission_refuses_dispatch_after_frozen_expiry() {
+    let mut f = Fixture::new();
+    let owner = target::acquire_controller(&mut f.store, "delayed-admission", "operator").unwrap();
+    let selected = f.spec();
+    let revision = target::propose_revision(&mut f.store, &owner, selected).unwrap();
+    target::select_revision(&mut f.store, &owner, &revision.id).unwrap();
+    wave::available(&mut f.store, &owner, "A", 0).unwrap();
+    let path = f.store.project_dir().join("state.db");
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let writer = std::thread::spawn(move || {
+        let db = rusqlite::Connection::open(path).unwrap();
+        db.execute_batch("BEGIN IMMEDIATE").unwrap();
+        sender.send(()).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        db.execute_batch("COMMIT").unwrap();
+    });
+    receiver
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .unwrap();
+    let deadline = clock().unwrap() + 75;
+    let result = admit_before_deadline(
+        &mut f.store,
+        &owner,
+        policy().wave_policy,
+        0,
+        deadline,
+        &AtomicBool::new(false),
+    );
+    writer.join().unwrap();
+    assert!(clock().unwrap() >= deadline);
+    assert!(
+        matches!(result, Err(ControllerError::Mismatch)),
+        "actual delayed admission must refuse, got {result:?}"
+    );
+    let waves: i64 = f
+        .store
+        .read_connection()
+        .query_row("SELECT count(*) FROM local_waves", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(waves, 1, "the delayed actual wave is retained");
+    let runs: i64 = f
+        .store
+        .read_connection()
+        .query_row("SELECT count(*) FROM local_controller_runs", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    let completions: i64 = f
+        .store
+        .read_connection()
+        .query_row(
+            "SELECT count(*) FROM local_controller_completions",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        (runs, completions),
+        (0, 0),
+        "expired admission cannot start or complete execution"
+    );
+}
+
+#[test]
+fn only_known_successful_publication_dispatch_can_reach_qualification() {
+    use crate::OperationStatus;
+    assert!(dispatch_succeeded(OperationStatus::Succeeded));
+    for outcome in [
+        OperationStatus::Prepared,
+        OperationStatus::Running,
+        OperationStatus::Failed,
+        OperationStatus::OutcomeUnknown,
+        OperationStatus::ReconciledSucceeded,
+        OperationStatus::ReconciledFailed,
+    ] {
+        assert!(
+            !dispatch_succeeded(outcome),
+            "fresh publication status {outcome:?} must hold regardless of later source availability"
+        );
+    }
 }

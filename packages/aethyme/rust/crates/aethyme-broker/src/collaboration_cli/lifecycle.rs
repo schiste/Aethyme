@@ -537,6 +537,26 @@ pub(super) fn target_run(root: &Path, rest: &[&str]) -> Result<Output, Failure> 
     }
     let mut store = open(root)?;
     let owner = existing_owner(&mut store, flags.one("--target")?, flags.one("--issuer")?)?;
+    let mut broker =
+        crate::Broker::open(root).map_err(|e| Failure::domain("broker", e.to_string()))?;
+    let carrier = crate::local_source_transport::GitCarrier::new(
+        &mut broker,
+        session,
+        flags.one("--remote")?,
+        flags.one("--destination")?,
+        timeout,
+        flags.one("--authorization")?,
+        replacement,
+    )
+    .map_err(|e| Failure::domain("transport", e.to_string()))?;
+    crate::local_controller::bare_destination::validate_endpoint(&carrier.identity.push_url)
+        .map_err(|e| {
+            Failure::refused(
+                "unsupported_profile",
+                e.to_string(),
+                "appoint an exact local bare Git destination without linked worktrees",
+            )
+        })?;
     let permit =
         execution_verifier::existing_permit(&store, &owner, flags.one("--producer")?, generation)
             .map_err(|e| Failure::domain("verifier_authority", e.to_string()))?;
@@ -558,25 +578,6 @@ pub(super) fn target_run(root: &Path, rest: &[&str]) -> Result<Output, Failure> 
     let executor = native
         .with_resources(resource_policy)
         .map_err(|e| Failure::domain("host_resources", e.to_string()))?;
-    let mut broker =
-        crate::Broker::open(root).map_err(|e| Failure::domain("broker", e.to_string()))?;
-    let carrier = crate::local_source_transport::GitCarrier::new(
-        &mut broker,
-        session,
-        flags.one("--remote")?,
-        flags.one("--destination")?,
-        timeout,
-        flags.one("--authorization")?,
-        replacement,
-    )
-    .map_err(|e| Failure::domain("transport", e.to_string()))?;
-    if !std::path::Path::new(&carrier.identity.push_url).is_absolute() {
-        return Err(Failure::refused(
-            "unsupported_profile",
-            "this appointed CLI profile supports an explicit local bare Git destination",
-            "use the separate qualified provider API for other transports",
-        ));
-    }
     let report = controller::serve(
         &mut store,
         &owner,
