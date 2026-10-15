@@ -187,7 +187,11 @@ and frozen payload preparation do not qualify that sequence. The first actual
 native attempt stopped on fixture directory permissions; the second accepted
 C01 and held C02 after exposing an incorrect baseline commit across target
 revisions. Both failures remain in the denominator. The generic repair and a
-complete native sequence remain required.
+complete native sequence have separate evidence: the
+[cross-revision regression ledger](local-v3-qualification/cross-revision-baseline-2026-10-15/ledger.json)
+retains three focused passing tests, both intended guard failures with exact
+source restoration, and all earlier compiler/test failures. The complete native
+sequence remains required.
 
 The [receiver-timeout ledger](local-v3-qualification/unknown-publication-2026-10-15/ledger.json)
 separately records a passing actual control at `b16af023`: the remote ref moved,

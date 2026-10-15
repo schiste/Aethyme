@@ -16,3 +16,7 @@ passing patch digest equals the complete patch from that parent to `9677dc7f`.
 Independent review found no additional source blocker within its requested
 scope. Strict CI Clippy rejected the eight-field tuple in that commit. The
 private named-row cleanup and subsequent checks require their own evidence.
+
+The original Rust test logs contain trailing spaces on interrupted test-status
+lines and one blank line at EOF. Those raw artifacts are preserved byte-for-byte;
+the whitespace checker reports them. Documentation and JSON are checked separately.
