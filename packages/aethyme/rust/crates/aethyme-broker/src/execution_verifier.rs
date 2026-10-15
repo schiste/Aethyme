@@ -19,6 +19,8 @@ pub const PROFILE: &str = "aethyme.verify.offline-cli/provisional-v0";
 pub const INVENTORY_SCHEMA: &str = "aethyme.assertion-inventory/provisional-v0";
 pub const POLICY_SCHEMA: &str = "aethyme.verifier-policy/provisional-v0";
 pub const EVIDENCE_SCHEMA: &str = "aethyme.verification-evidence/provisional-v0";
+const NONZERO_EXIT_UNSUPPORTED: &str =
+    "nonzero exit assertions require a separate stream-completion witness";
 static INVENTORY: RecordSchema = RecordSchema {
     name: INVENTORY_SCHEMA,
     fields: &[FieldSpec {
@@ -262,6 +264,7 @@ pub fn prepare(
 ) -> Result<PreparedVerifier, VerificationError> {
     let _response = crate::collaboration_sensitive::response_use(store)?;
     let inventory = AssertionInventory::decode(inventory_bytes)?;
+    ensure_supported_inventory(&inventory)?;
     let commit = CommitOid::parse(harness_commit).map_err(|_| VerificationError::Mismatch)?;
     let pinned = archive::pin_commit(harness_repository, commit.as_str())?;
     if pinned != commit {
@@ -324,6 +327,16 @@ pub fn prepare(
         inventory_sha256: ObjectDigest::of(inventory_bytes).hex(),
     })
 }
+
+fn ensure_supported_inventory(inventory: &AssertionInventory) -> Result<(), VerificationError> {
+    if inventory.cases().iter().any(|case| case.exit_code != 0) {
+        return Err(VerificationError::Unsupported(
+            NONZERO_EXIT_UNSUPPORTED.into(),
+        ));
+    }
+    Ok(())
+}
+
 impl VerifierPolicy {
     pub fn record(&self) -> Result<Record, VerificationError> {
         if self.profile != PROFILE
@@ -1025,11 +1038,7 @@ fn verify_body(
     let inputs =
         snapshot::materialize_in(store, owner, execution, executor.optional_temporary_root())?;
     let inventory = inventory_from_inputs(&inputs, &permit.policy)?;
-    if inventory.cases.iter().any(|case| case.exit_code != 0) {
-        return Err(VerificationError::Unsupported(
-            "nonzero exit assertions require a separate stream-completion witness".into(),
-        ));
-    }
+    ensure_supported_inventory(&inventory)?;
     let mut assertions = Vec::new();
     let mut result = VerificationOutcome::Passed;
     for (index, case) in inventory.cases.iter().enumerate() {
@@ -1212,3 +1221,88 @@ fn test_verify(
 }
 #[cfg(test)]
 pub(crate) mod tests;
+
+#[cfg(test)]
+mod prepare_preflight_tests {
+    use super::*;
+
+    #[test]
+    fn prepare_rejects_nonzero_exit_before_runtime_or_capture_side_effects() {
+        let mut fixture = crate::local_target::tests::Fixture::new();
+        let inventory = AssertionInventory::new(vec![AssertionCase {
+            id: "expected-failure".into(),
+            arguments: vec![],
+            stdin_hex: String::new(),
+            exit_code: 2,
+            stdout: format!("sha256:{}", ObjectDigest::of(b"").hex()),
+            stderr: format!("sha256:{}", ObjectDigest::of(b"").hex()),
+        }])
+        .unwrap();
+        let before = {
+            let connection = fixture.store.connection();
+            (
+                connection
+                    .query_row("SELECT count(*) FROM capture_operations", [], |row| {
+                        row.get::<_, i64>(0)
+                    })
+                    .unwrap(),
+                connection
+                    .query_row("SELECT count(*) FROM retention_roots", [], |row| {
+                        row.get::<_, i64>(0)
+                    })
+                    .unwrap(),
+                connection
+                    .query_row("SELECT count(*) FROM outbox", [], |row| {
+                        row.get::<_, i64>(0)
+                    })
+                    .unwrap(),
+            )
+        };
+
+        let result = prepare(
+            &mut fixture.store,
+            OperationId::mint().unwrap(),
+            Path::new("/no-such-harness"),
+            "not-a-commit",
+            &inventory.canonical_bytes(),
+            VerifierPlan {
+                image: "not-an-image".into(),
+                command: CommandSpec {
+                    program: "/bin/sh".into(),
+                    arguments: vec![],
+                    environment: Default::default(),
+                },
+                max_age_ms: 1000,
+            },
+            PathBuf::from("/no-such-docker"),
+            "unix:///no-such-endpoint",
+        );
+        assert!(matches!(
+            result,
+            Err(VerificationError::Unsupported(detail))
+                if detail == NONZERO_EXIT_UNSUPPORTED
+        ));
+
+        let after = {
+            let connection = fixture.store.connection();
+            (
+                connection
+                    .query_row("SELECT count(*) FROM capture_operations", [], |row| {
+                        row.get::<_, i64>(0)
+                    })
+                    .unwrap(),
+                connection
+                    .query_row("SELECT count(*) FROM retention_roots", [], |row| {
+                        row.get::<_, i64>(0)
+                    })
+                    .unwrap(),
+                connection
+                    .query_row("SELECT count(*) FROM outbox", [], |row| {
+                        row.get::<_, i64>(0)
+                    })
+                    .unwrap(),
+            )
+        };
+        assert_eq!(after, before);
+    }
+}
