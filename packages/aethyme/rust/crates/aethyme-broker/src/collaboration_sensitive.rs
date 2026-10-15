@@ -3182,6 +3182,8 @@ mod tests {
     }
 
     fn insert_purging_incident(store: &mut CollaborationStore, incident_id: &str) {
+        let project_key = store.project().as_str().to_owned();
+        let created_ms = now_ms();
         store
             .connection()
             .execute(
@@ -3190,12 +3192,7 @@ mod tests {
                   reason_code,request_digest,state,created_ms,updated_ms)
                  VALUES (?1,?2,'test-operator',0,'test-epoch','project',?2,
                          'operator_requested_purge',?3,'purging',?4,?4)",
-                rusqlite::params![
-                    incident_id,
-                    store.project().as_str(),
-                    "0".repeat(64),
-                    now_ms()
-                ],
+                rusqlite::params![incident_id, project_key, "0".repeat(64), created_ms],
             )
             .unwrap();
     }
