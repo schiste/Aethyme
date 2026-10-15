@@ -749,6 +749,7 @@ fn volume_available(path: &Path) -> u64 {
     let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
     // SAFETY: statvfs writes a plain integer struct and receives a valid path.
     let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    // SAFETY: The CString stays alive and NUL-terminated; `stat` is writable.
     assert_eq!(unsafe { libc::statvfs(c_path.as_ptr(), &mut stat) }, 0);
     #[allow(clippy::unnecessary_cast)]
     (stat.f_bavail as u64).saturating_mul(stat.f_frsize as u64)
