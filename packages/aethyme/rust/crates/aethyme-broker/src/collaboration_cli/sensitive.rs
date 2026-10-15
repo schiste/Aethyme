@@ -1,5 +1,37 @@
 use super::*;
 use crate::collaboration_sensitive::{self as response, ReasonCode};
+use std::collections::BTreeMap;
+
+struct SensitiveFlags<'a>(BTreeMap<&'a str, &'a str>);
+
+impl<'a> SensitiveFlags<'a> {
+    fn parse(rest: &[&'a str], allowed: &[&str]) -> Result<Self, Failure> {
+        if rest.len() > 32 || !rest.len().is_multiple_of(2) {
+            return Err(Failure::usage("expected a finite set of flag/value pairs"));
+        }
+        let mut values = BTreeMap::new();
+        for pair in rest.chunks_exact(2) {
+            let (flag, value) = (pair[0], pair[1]);
+            if !allowed.contains(&flag)
+                || value.trim().is_empty()
+                || value.starts_with("--")
+                || value.len() > 4096
+                || value.contains('\0')
+                || values.insert(flag, value).is_some()
+            {
+                return Err(Failure::usage("unknown, duplicate, or invalid flag value"));
+            }
+        }
+        Ok(Self(values))
+    }
+
+    fn one(&self, name: &str) -> Result<&'a str, Failure> {
+        self.0
+            .get(name)
+            .copied()
+            .ok_or_else(|| Failure::usage(format!("{name} is required")))
+    }
+}
 
 fn response_error(error: response::SensitiveError) -> Failure {
     let code = match &error {
@@ -35,10 +67,9 @@ pub(super) fn command(root: &Path, verb: &str, rest: &[&str]) -> Result<Output, 
     let mut store = open(root)?;
     match verb {
         "quarantine" => {
-            let flags = Flags::parse(
+            let flags = SensitiveFlags::parse(
                 rest,
                 &["--incident", "--issuer", "--epoch", "--reason", "--scope"],
-                &[],
             )?;
             let scope = flags.one("--scope")?;
             if scope != "project" {
@@ -69,7 +100,7 @@ pub(super) fn command(root: &Path, verb: &str, rest: &[&str]) -> Result<Output, 
             ))
         }
         "status" => {
-            let flags = Flags::parse(rest, &["--incident"], &[])?;
+            let flags = SensitiveFlags::parse(rest, &["--incident"])?;
             let result =
                 response::status(&store, flags.one("--incident")?).map_err(response_error)?;
             Ok((
@@ -78,7 +109,7 @@ pub(super) fn command(root: &Path, verb: &str, rest: &[&str]) -> Result<Output, 
             ))
         }
         "purge" | "resume" => {
-            let flags = Flags::parse(rest, &["--incident", "--confirm"], &[])?;
+            let flags = SensitiveFlags::parse(rest, &["--incident", "--confirm"])?;
             let result = response::purge(
                 &mut store,
                 flags.one("--incident")?,

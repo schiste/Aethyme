@@ -1115,7 +1115,7 @@ pub fn try_capture(
     let Some(_response) =
         crate::collaboration_sensitive::try_response_use(store).map_err(|error| {
             CaptureError::Refused {
-                operation_id: request.operation_id.to_string(),
+                operation_id: request.operation_id.as_str().to_owned(),
                 code: "sensitive_response_quarantined".into(),
                 detail: error.to_string(),
             }
@@ -1139,7 +1139,7 @@ pub(crate) fn capture_with(
     let _use = archive_use(store)?;
     let _response = crate::collaboration_sensitive::response_use(store).map_err(|error| {
         CaptureError::Refused {
-            operation_id: request.operation_id.to_string(),
+            operation_id: request.operation_id.as_str().to_owned(),
             code: "sensitive_response_quarantined".into(),
             detail: error.to_string(),
         }

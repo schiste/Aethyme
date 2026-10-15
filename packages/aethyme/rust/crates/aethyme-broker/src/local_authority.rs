@@ -222,6 +222,26 @@ pub(crate) fn guard(store: &CollaborationStore, epoch: &Epoch) -> Result<Guard, 
     matching(store.read_connection(), &w, epoch)?;
     Ok(Guard { _file: file })
 }
+
+/// Guard a sensitive-response operation while authority is deliberately
+/// frozen. The ingress lock serializes this check with resume; the database
+/// epoch must still match the exact frozen witness.
+pub(crate) fn frozen_guard(
+    store: &CollaborationStore,
+    epoch: &Epoch,
+) -> Result<Guard, AuthorityError> {
+    let path = directory(store)?;
+    let file = open_lock_file(&path.join("ingress.lock"))?;
+    file.lock_shared()?;
+    let witness = read(&path)?;
+    if witness.status != Status::Frozen {
+        return Err(AuthorityError::Frozen);
+    }
+    if &witness.epoch != epoch || bound(store.read_connection())?.as_ref() != Some(epoch) {
+        return Err(AuthorityError::Stale);
+    }
+    Ok(Guard { _file: file })
+}
 /// Reading status grants no mutation authority.
 pub fn status(store: &CollaborationStore) -> Result<Witness, AuthorityError> {
     read(&directory(store)?)
@@ -365,6 +385,11 @@ fn quarantine(conn: &Connection) -> Result<(), AuthorityError> {
 pub fn resume(store: &mut CollaborationStore, expected: &Epoch) -> Result<Witness, AuthorityError> {
     let path = directory(store)?;
     let _exclusive = ExclusiveFileLock::acquire(open_lock_file(&path.join("ingress.lock"))?)?;
+    if crate::collaboration_sensitive::tombstone_present_for_project_dir(store.project_dir())
+        .map_err(|error| AuthorityError::Invalid(error.to_string()))?
+    {
+        return Err(AuthorityError::Frozen);
+    }
     let current = read(&path)?;
     if current.status != Status::Frozen || &current.epoch != expected {
         return Err(AuthorityError::Stale);
@@ -476,6 +501,10 @@ fn record_late_outcome_with(
     if attempt.project_dir != store.project_dir() || detail.len() > 4096 {
         return Err(AuthorityError::Invalid("historical scope or size".into()));
     }
+    // Take the response barrier before ingress: quarantine's lock order is
+    // archive -> response -> ingress, so historical writes must not invert it.
+    let _response = crate::collaboration_sensitive::response_use(store)
+        .map_err(|error| AuthorityError::Invalid(error.to_string()))?;
     let path = directory(store)?;
     let file = open_lock_file(&path.join("ingress.lock"))?;
     file.lock_shared()?;
@@ -537,6 +566,8 @@ fn record_late_outcome_with(
 pub fn historical_outcomes(
     store: &CollaborationStore,
 ) -> Result<Vec<HistoricalObservation>, AuthorityError> {
+    let _response = crate::collaboration_sensitive::response_use(store)
+        .map_err(|error| AuthorityError::Invalid(error.to_string()))?;
     let history = directory(store)?.join("history");
     let entries = match std::fs::read_dir(history) {
         Ok(entries) => entries,

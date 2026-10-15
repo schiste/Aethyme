@@ -221,6 +221,8 @@ pub enum ViewError {
         snapshot: String,
         source: crate::collaboration_archive::ArchiveError,
     },
+    #[error(transparent)]
+    Sensitive(#[from] crate::collaboration_sensitive::SensitiveError),
     #[error("indexing failed: {0}")]
     Index(String),
     #[error("corrupt view {view}: {detail}")]
@@ -246,6 +248,10 @@ impl ViewError {
             Self::Pinned { .. } => "pinned",
             Self::InvalidHolder => "invalid_holder",
             Self::Source { .. } => "source_unavailable",
+            Self::Sensitive(crate::collaboration_sensitive::SensitiveError::Quarantined) => {
+                "quarantined"
+            }
+            Self::Sensitive(_) => "sensitive_response",
             Self::Index(_) => "index_failed",
             Self::Corrupt { .. } => "corrupt_view",
             Self::Io { .. } => "io",
@@ -523,6 +529,7 @@ fn files_under(root: &Path) -> Result<Vec<(PathBuf, u64)>, ViewError> {
 #[derive(Debug)]
 pub struct ViewReader {
     dir: PathBuf,
+    project_dir: PathBuf,
     manifest: ViewManifest,
     _pin: File,
 }
@@ -534,6 +541,8 @@ pub fn build_view(
     snapshot: &SourceSnapshotId,
     options: &ViewOptions,
 ) -> Result<String, ViewError> {
+    let _archive = archive_use(store)?;
+    let _response = crate::collaboration_sensitive::response_use(store)?;
     let started = Instant::now();
     let profile = &options.profile;
     let name = view_name(snapshot, profile);
@@ -686,6 +695,7 @@ pub fn open_view(store: &CollaborationStore, view: &str) -> Result<ViewReader, V
     // Archive first, then lifecycle, so reclamation and retirement cannot
     // cross a reader's retired check and generation pin.
     let _archive = archive_use(store)?;
+    let _response = crate::collaboration_sensitive::response_use(store)?;
     if is_retired(&view_dir)? {
         return Err(ViewError::Retired { view: view.into() });
     }
@@ -715,6 +725,7 @@ pub fn open_view(store: &CollaborationStore, view: &str) -> Result<ViewReader, V
         let manifest = read_manifest(&dir)?;
         return Ok(ViewReader {
             dir,
+            project_dir: store.project_dir().to_path_buf(),
             manifest,
             _pin: pin,
         });
@@ -886,6 +897,8 @@ impl ViewReader {
         symbol: &str,
         budget: usize,
     ) -> Result<AnalysisEnvelope, ViewError> {
+        let _response =
+            crate::collaboration_sensitive::response_use_for_project_dir(&self.project_dir)?;
         let facts = self.facts()?;
         let named = |id: &NodeId| {
             facts
@@ -953,6 +966,8 @@ impl ViewReader {
         changed_paths: &[&str],
         budget: usize,
     ) -> Result<AnalysisEnvelope, ViewError> {
+        let _response =
+            crate::collaboration_sensitive::response_use_for_project_dir(&self.project_dir)?;
         let facts = self.facts()?;
         let mut paths: Vec<&str> = changed_paths.to_vec();
         paths.sort_unstable();
@@ -1173,6 +1188,7 @@ pub fn hold_view(
         return Err(ViewError::InvalidHolder);
     }
     let _archive = archive_use(store)?;
+    let _response = crate::collaboration_sensitive::response_use(store)?;
     let view_dir = views_root(store).join(view);
     if current_generation(&view_dir)?.is_none() || is_retired(&view_dir)? {
         return Err(ViewError::NotFound { view: view.into() });
@@ -1199,6 +1215,7 @@ pub fn release_view_hold(
     holder: &str,
 ) -> Result<bool, ViewError> {
     let _archive = archive_use(store)?;
+    let _response = crate::collaboration_sensitive::response_use(store)?;
     let view_dir = views_root(store).join(view);
     if std::fs::symlink_metadata(&view_dir)
         .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
@@ -1299,6 +1316,7 @@ fn now_ms() -> i64 {
 /// `pinned` refusal right after a release is safe to retry.
 pub fn retire(store: &CollaborationStore, view: &str) -> Result<(), ViewError> {
     let _archive = archive_use(store)?;
+    let _response = crate::collaboration_sensitive::response_use(store)?;
     let view_dir = views_root(store).join(view);
     if current_generation(&view_dir)?.is_none() {
         return Err(ViewError::NotFound { view: view.into() });
