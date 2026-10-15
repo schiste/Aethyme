@@ -113,8 +113,8 @@ remains `401b20db9bea3af2f0d3c096ad4532b37416790732805658ca168519d65c2aff`.
 This runner correction awaits independent review. Controls attempt 004 has not
 run, and no model call or private held-out evaluation occurred.
 
-- Runner SHA256: `57dcc867a8088ef9b2f8c83ff5fe38e2dd0738f6dec4db66fbb09dfef181dbc9`
+- Runner SHA256: `fb7cf8e21bea136356b0df578073547eae546b46dd56a52dc8a5b04c52a416e6`
 - Control harness SHA256: `56572eb5bbe886de9c610b2836eceefbac54eb4faccf49f2d738ef96a63c98a0`
 - Subject profile SHA256: `401b20db9bea3af2f0d3c096ad4532b37416790732805658ca168519d65c2aff`
 - Runtime profile SHA256: `344525a875713778fae5344c053692db5b4aa21e8bd2a55929f18b2c5261940e`
-- Runtime correction SHA256: `09b9aec0d11989a8602531351851aec7e32248bf02ce9833e6510220f4a9737f`
+- Runtime correction SHA256: `050feab619b4b78503956dfa7a71e2b0550f936bd5048d9761d6e1d0509a5826`
