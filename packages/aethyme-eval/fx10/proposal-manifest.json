@@ -1,0 +1,163 @@
+{
+  "profile": "aethyme.fx10-sustained-arrivals/actual-v1",
+  "contract": "public-contract.md",
+  "files": {
+    "public-contract.md": "02ba1653f0017dabb2f92c896113d4b597af612da9c89d492e30a38a791b24c6",
+    "source/app.sh": "4a59152e70ad2a56584c35eec36f46885c76d6abf3aa04c2e45d7b5bcbbd64d1",
+    "source/.aethyme/gates.toml": "c943ade1eeb885845a8b2cf3765a1219975e99cb8f6cdd69e2f11604120959f0",
+    "source/features/alpha.sh": "f3c5c1e2039583172fa5bca713586c06b154d5d641671a8b8014bd2f51cadbf0",
+    "source/features/beta.sh": "a338d9ea96e5ab46f80f5eae83827153df63ebe4e775b7c7b9024fcbe5656bfa",
+    "source/features/gamma.sh": "83a72368425e38d875c16fe58c50aa94b0cdf258d4417bb9304e3c148eec98f9",
+    "source/features/delta.sh": "ab9a1f18ee35c56f9120f5d33db5805d7b00926e4ec4e698d7970cf9c49bc8e3",
+    "source/features/epsilon.sh": "780d52b3f4101fff1cbfb12b27a71406229a59b69fbf6e6773cdb6c6d7702dbb",
+    "source/features/zeta.sh": "2b9bee59d675bf2724bf04a35c4e5f420a33543697424f3319bbe18a4c19d90c",
+    "contributions/A-alpha.sh": "0c1557a37cdb3d3346bb84a5d270d3f0d538e2d0cf56c76debe55675d4e9ec50",
+    "contributions/B-beta.sh": "98aaa1eb38133b258986cc3e5cfbd853c4663c9a81722e8a59a292c9292e7afb",
+    "contributions/C-gamma.sh": "74b91c5d993bdb9e8620fce6d7c05a7c29e4d3cb7092d77fb5701c2247124f58",
+    "contributions/D-delta.sh": "67e534a546dc319035433f239f912709b577ceb51a20ce84b13ec551ed17cfc0",
+    "contributions/E-epsilon.sh": "1ed4b9080d6e882c217ac4e3dc43d4fd0444761a2f08c2f2d0c70aac5fdd85de",
+    "contributions/F-zeta.sh": "cb9a765915b8555886193dd8ed11e4069932a41fe5cadf386771d0d8de78d2ee",
+    "oracle/proxy.sh": "a8b7bd9e7269868883f679b1158c519dba44a374ca6f5f9a3c675470345b0f97",
+    "oracle/cases.json": "0caede81a00be34dc3dcb171bfbb714dca3fc0c10fa49f72c39437f728532954",
+    "oracle/expected-transcript.txt": "56d15d1c702fabd891f2764a8c68d9d96da4f99f1c039801678637151f9a503e"
+  },
+  "contributions": [
+    {
+      "id": "A",
+      "module": "features/alpha.sh",
+      "patch": "contributions/A-alpha.sh",
+      "requires": [],
+      "atomic_group": "older-route-group",
+      "arrival_wave": 1
+    },
+    {
+      "id": "B",
+      "module": "features/beta.sh",
+      "patch": "contributions/B-beta.sh",
+      "requires": [
+        "A"
+      ],
+      "atomic_group": "older-route-group",
+      "arrival_wave": 1
+    },
+    {
+      "id": "C",
+      "module": "features/gamma.sh",
+      "patch": "contributions/C-gamma.sh",
+      "requires": [
+        "B"
+      ],
+      "atomic_group": "older-route-group",
+      "arrival_wave": 1
+    },
+    {
+      "id": "D",
+      "module": "features/delta.sh",
+      "patch": "contributions/D-delta.sh",
+      "requires": [],
+      "atomic_group": null,
+      "arrival_wave": 2
+    },
+    {
+      "id": "E",
+      "module": "features/epsilon.sh",
+      "patch": "contributions/E-epsilon.sh",
+      "requires": [],
+      "atomic_group": null,
+      "arrival_wave": 2
+    },
+    {
+      "id": "F",
+      "module": "features/zeta.sh",
+      "patch": "contributions/F-zeta.sh",
+      "requires": [],
+      "atomic_group": null,
+      "arrival_wave": 2
+    }
+  ],
+  "arrival_schedule": {
+    "before_service": [
+      "A",
+      "B",
+      "C"
+    ],
+    "while_old_native_gate_job_state_is_dispatching": [
+      "D",
+      "E",
+      "F"
+    ],
+    "required_old_wave_selection": [
+      "A",
+      "B",
+      "C"
+    ],
+    "required_next_wave_new_selection": [
+      "D",
+      "E",
+      "F"
+    ],
+    "new_contributions_per_wave_max": 3,
+    "cumulative_selected_max": 6,
+    "ordinary_arrivals_may_cancel_active_wave": false,
+    "heldout_or_automatic_retries": 0
+  },
+  "wave_policy": {
+    "batch_width": 3,
+    "max_group": 6,
+    "debounce_ms": 0,
+    "age_promotion_ms": 60000,
+    "drift_rechecks": 1
+  },
+  "service_allowance": {
+    "max_ticks": 8,
+    "max_completions": 2,
+    "poll_ms": 20,
+    "max_elapsed_ms": 180000,
+    "max_drive_wall_ms": 120000
+  },
+  "resource_contention": {
+    "pool": "fx10-sustained-arrival-v1",
+    "units_held": 1,
+    "limit": 1,
+    "gate_wait_seconds": 5,
+    "holder_ttl_seconds": 60,
+    "minimum_wait_while_native_dispatching_ms": 250,
+    "observer_timeout_seconds": 30,
+    "second_admission_required": true,
+    "release_after_all_late_arrivals": true
+  },
+  "target_update_schedule": {
+    "target": "fx10-external-target-update",
+    "separate_target_and_bare_remote": true,
+    "initial_remote_ref": "frozen baseline commit",
+    "external_update_count": 1,
+    "external_update": "one ordinary fast-forward to a child commit with the same tree",
+    "external_update_keeps_tree_unchanged": true,
+    "trigger": "exact A-C native gate job is dispatching behind its typed one-unit capacity hold",
+    "minimum_resource_contention_ms": 250,
+    "observer_timeout_seconds": 30,
+    "holder_ttl_seconds": 60,
+    "gate_resource_wait_seconds": 5,
+    "required_stale_verification": "one real passing receipt issued after the external ref advance",
+    "required_publication_outcome": "one known failed compare-and-swap push; retain the competing ref",
+    "private_completions": 0,
+    "automatic_retries": 0,
+    "service": {
+      "max_ticks": 1,
+      "max_completions": 1,
+      "poll_ms": 20,
+      "max_elapsed_ms": 180000,
+      "max_drive_wall_ms": 120000
+    }
+  },
+  "oracle": {
+    "case_count": 16,
+    "transcript_sha256": "56d15d1c702fabd891f2764a8c68d9d96da4f99f1c039801678637151f9a503e"
+  },
+  "scope": {
+    "model_requests": 0,
+    "network": false,
+    "candidate_host_execution": false,
+    "publication_target": "disposable local bare Git only"
+  }
+}

@@ -20,6 +20,9 @@ use std::process::{Command, Output, Stdio};
 use std::sync::atomic::AtomicBool;
 use std::time::Instant;
 
+#[path = "drive_tests/sustained_arrivals.rs"]
+mod sustained_arrivals;
+
 const FX17_IMAGE: &str = "sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251";
 const FX17_MANIFEST_SHA: &str = "b3846f2fcca9bc8fb3bbcad26c0adedbc96fba723eddbbb174a9f3545ba11abc";
 const FX17_CONTRACT_SHA: &str = "81d22e805fe6fa48424b1c83fe3bf54d1c9d0e76e5bb14d9cc8c20e84f3be13a";

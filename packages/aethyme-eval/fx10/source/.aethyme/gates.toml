@@ -1,0 +1,14 @@
+[[gate]]
+name = "fx10-source-integrity"
+command = "test -f app.sh && git diff --check HEAD^ HEAD"
+timeout_seconds = 20
+cache = false
+resource_ttl_seconds = 60
+resource_wait_seconds = 5
+
+[[gate.resources]]
+key = "fx10_sustained_arrival_slot"
+kind = "capacity"
+pool = "fx10-sustained-arrival-v1"
+units = 1
+limit = 1
