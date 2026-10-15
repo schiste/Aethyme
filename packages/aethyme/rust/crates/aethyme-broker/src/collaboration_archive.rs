@@ -1236,25 +1236,6 @@ pub(crate) fn retain_snapshot_with(
     )
 }
 
-#[cfg(test)]
-pub(crate) fn retain_snapshot_observed(
-    store: &mut CollaborationStore,
-    repo: &Path,
-    commit: &CommitOid,
-    before_blob: &mut dyn FnMut(usize) -> Result<(), ArchiveError>,
-    before_copy_write: &mut dyn FnMut(&CommitOid, u64),
-    on_copy_error: &mut dyn FnMut(&ArchiveError),
-) -> Result<RetainedSnapshot, ArchiveError> {
-    retain_snapshot_inner(
-        store,
-        repo,
-        commit,
-        before_blob,
-        before_copy_write,
-        on_copy_error,
-    )
-}
-
 fn retain_snapshot_inner(
     store: &mut CollaborationStore,
     repo: &Path,
