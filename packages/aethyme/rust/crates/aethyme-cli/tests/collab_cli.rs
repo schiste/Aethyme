@@ -585,6 +585,31 @@ fn usage_errors_are_exit_2_and_help_has_no_side_effects() {
         assert!(output.status.success());
         assert!(String::from_utf8_lossy(&output.stdout).contains("aethyme collab status"));
     }
+    for (args, route) in [
+        (
+            &["collab", "target", "budget", "status", "--help"][..],
+            "aethyme collab target budget status",
+        ),
+        (
+            &["collab", "target", "verifier", "prepare", "--help"][..],
+            "aethyme collab target verifier prepare",
+        ),
+        (
+            &["collab", "target", "capture-notice", "ingest", "--help"][..],
+            "aethyme collab target capture-notice ingest",
+        ),
+        (
+            &["collab", "target", "run", "status", "--help"][..],
+            "aethyme collab target run status",
+        ),
+    ] {
+        let output = fixture.run(args);
+        assert!(output.status.success(), "{args:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains(route),
+            "{args:?} did not show {route}"
+        );
+    }
     assert!(!fixture.collaboration_dir().exists());
 }
 

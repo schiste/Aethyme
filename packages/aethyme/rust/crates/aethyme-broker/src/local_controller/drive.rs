@@ -117,8 +117,7 @@ fn admit_before_deadline(
     if clock()? >= deadline_ms || cancel.load(Ordering::SeqCst) {
         return Err(ControllerError::Mismatch);
     }
-    crate::local_capture_notice::consume_for_owner(store, owner)?;
-    let admission = wave::admit(store, owner, policy, now_ms)?;
+    let admission = crate::local_capture_notice::admit_for_owner(store, owner, policy, now_ms)?;
     // A concurrent writer can delay admission beyond the frozen expiry.
     // Its durable wave is preserved, but no execution journal or effect follows.
     if clock()? >= deadline_ms || cancel.load(Ordering::SeqCst) {

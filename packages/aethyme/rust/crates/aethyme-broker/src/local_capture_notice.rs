@@ -7,9 +7,7 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use aethyme_contracts::experimental_v0::{
-    FieldKind, FieldSpec, Record, RecordId, RecordSchema,
-};
+use aethyme_contracts::experimental_v0::{FieldKind, FieldSpec, Record, RecordId, RecordSchema};
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 
@@ -160,7 +158,10 @@ fn selected_alias<'a>(revision: &'a TargetRevision, alias: &str) -> Result<&'a s
         .iter()
         .find(|contribution| contribution.id == alias)
         .ok_or(NoticeError::Stale)?;
-    contribution.lineage.as_deref().ok_or(NoticeError::Stale)
+    if contribution.lineage.is_empty() {
+        return Err(NoticeError::Stale);
+    }
+    Ok(contribution.lineage.as_str())
 }
 
 /// Verify the operation row, receipt, archive lineage and exact selected
@@ -266,11 +267,11 @@ pub fn ingest(
     alias: &str,
     operation: &OperationId,
 ) -> Result<NoticeReceipt, NoticeError> {
+    let _archive = crate::collaboration_gc::archive_use(store)?;
+    let _response = crate::collaboration_sensitive::response_use(store)?;
     let witness = crate::local_authority::status(store)?;
     let _authority = crate::local_authority::guard(store, &witness.epoch)?;
-    let _response = crate::collaboration_sensitive::response_use(store)?;
     let _ingress = ingress_lock(store)?;
-    let _archive = crate::collaboration_gc::archive_use(store)?;
     let revision = target::load_revision(store, revision_id)?;
     if revision.target != target_name || revision.issuer != issuer {
         return Err(NoticeError::Stale);
@@ -372,17 +373,32 @@ pub fn ingest(
     })
 }
 
-/// Consume queued notices at the selected target's owner tick. Every source
-/// tuple is re-read while the response and archive barriers are held; a stale
-/// notice is durably classified and cannot manufacture an arrival.
-pub(crate) fn consume_for_owner(
+/// Drain, revalidate, and admit as one serialized owner tick. An ingress
+/// writer cannot enqueue between the drain and the wave freeze.
+pub(crate) fn admit_for_owner(
+    store: &mut CollaborationStore,
+    owner: &ControllerOwner,
+    policy: crate::local_wave::WavePolicy,
+    now_ms: i64,
+) -> Result<crate::local_wave::Admission, NoticeError> {
+    // All owner ticks and notice writers follow archive -> response ->
+    // authority -> ingress. The ingress lock remains held through admission.
+    let _archive = crate::collaboration_gc::archive_use(store)?;
+    let _response = crate::collaboration_sensitive::response_use(store)?;
+    let _authority = crate::local_authority::guard(store, owner.authority_epoch())?;
+    let _ingress = ingress_lock(store)?;
+    consume_pending_locked(store, owner)?;
+    owner_tick_hook();
+    crate::local_wave::admit_after_notices(store, owner, policy, now_ms).map_err(Into::into)
+}
+
+/// Consume queued notices while the caller owns archive, response, authority,
+/// and ingress barriers. Every source tuple is re-read before making an
+/// arrival available.
+fn consume_pending_locked(
     store: &mut CollaborationStore,
     owner: &ControllerOwner,
 ) -> Result<ConsumeReport, NoticeError> {
-    let _authority = crate::local_authority::guard(store, owner.authority_epoch())?;
-    let _response = crate::collaboration_sensitive::response_use(store)?;
-    let _ingress = ingress_lock(store)?;
-    let _archive = crate::collaboration_gc::archive_use(store)?;
     let mut statement = store.read_connection().prepare(
         "SELECT n.notice_id,n.body FROM local_capture_notices n
          JOIN local_capture_notice_outcomes o USING(notice_id)
@@ -438,6 +454,47 @@ pub(crate) fn consume_for_owner(
     }
     Ok(report)
 }
+
+#[cfg(test)]
+thread_local! {
+    static OWNER_TICK_HOOK: std::cell::RefCell<Option<(std::sync::mpsc::SyncSender<()>, std::sync::mpsc::Receiver<()>)>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) struct OwnerTickProbe;
+
+#[cfg(test)]
+impl Drop for OwnerTickProbe {
+    fn drop(&mut self) {
+        OWNER_TICK_HOOK.with(|hook| *hook.borrow_mut() = None);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn observe_owner_tick(
+    reached: std::sync::mpsc::SyncSender<()>,
+    resume: std::sync::mpsc::Receiver<()>,
+) -> OwnerTickProbe {
+    OWNER_TICK_HOOK.with(|hook| *hook.borrow_mut() = Some((reached, resume)));
+    OwnerTickProbe
+}
+
+#[cfg(test)]
+fn owner_tick_hook() {
+    OWNER_TICK_HOOK.with(|hook| {
+        if let Some((reached, resume)) = hook.borrow_mut().take() {
+            let _ = reached.send(());
+            let _ = resume.recv_timeout(std::time::Duration::from_secs(5));
+        }
+    });
+}
+
+#[cfg(not(test))]
+fn owner_tick_hook() {}
+
+#[cfg(test)]
+#[path = "local_capture_notice/tests.rs"]
+mod tests;
 
 /// Read the bounded durable notice history for operator reconciliation.
 pub fn list_for_target(

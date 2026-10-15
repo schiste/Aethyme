@@ -149,7 +149,6 @@ pub fn tick(
     policy: WavePolicy,
     now_ms: i64,
 ) -> Result<Run, WaveError> {
-    let _authority = target::authorize(store, owner)?;
     let wave = match admit(store, owner, policy, now_ms)? {
         Admission::Frozen(wave) | Admission::Existing(wave) => wave,
         waiting => return Ok(Run::Waiting(waiting)),
@@ -174,6 +173,8 @@ pub enum WaveError {
     Stale,
     #[error("an earlier dispatch has an unknown outcome; reconcile it before retrying")]
     OutcomeUnknown,
+    #[error("capture notice admission failed: {0}")]
+    CaptureNotice(String),
     #[error(transparent)]
     Target(#[from] TargetError),
     #[error(transparent)]
@@ -202,7 +203,7 @@ fn object(value: &str) -> Result<ObjectDigest, WaveError> {
 
 /// Idempotent availability for an exact selected input. This is not execution
 /// authorization and cannot add a new input to the target.
-pub fn available(
+pub(crate) fn available(
     store: &mut CollaborationStore,
     owner: &ControllerOwner,
     contribution: &str,
@@ -466,8 +467,23 @@ pub fn admit(
     policy: WavePolicy,
     now_ms: i64,
 ) -> Result<Admission, WaveError> {
+    crate::local_capture_notice::admit_for_owner(store, owner, policy, now_ms).map_err(|error| {
+        match error {
+            crate::local_capture_notice::NoticeError::Wave(wave) => wave,
+            other => WaveError::CaptureNotice(other.to_string()),
+        }
+    })
+}
+
+/// Admission primitive for the owner tick after capture notices have been
+/// drained while the ingress lock remains held.
+pub(crate) fn admit_after_notices(
+    store: &mut CollaborationStore,
+    owner: &ControllerOwner,
+    policy: WavePolicy,
+    now_ms: i64,
+) -> Result<Admission, WaveError> {
     let _authority = target::authorize(store, owner)?;
-    target::authorize(store, owner)?;
     policy.validate()?;
     if now_ms < 0 {
         return Err(WaveError::Invalid("negative clock".into()));

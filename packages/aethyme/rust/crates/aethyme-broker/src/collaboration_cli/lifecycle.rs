@@ -950,7 +950,7 @@ pub(super) fn service_status(root: &Path, rest: &[&str]) -> Result<Output, Failu
     if !matches!(state.as_str(), "dispatching" | "held" | "completed") {
         return Err(Failure::domain(
             "appointment_corrupt",
-            "service appointment has an unknown persisted state",
+            "service appointment has an unknown persisted state".into(),
         ));
     }
     let report = match bytes {
@@ -971,7 +971,7 @@ pub(super) fn service_status(root: &Path, rest: &[&str]) -> Result<Output, Failu
             {
                 return Err(Failure::domain(
                     "appointment_corrupt",
-                    "stored service report does not match its appointment identity",
+                    "stored service report does not match its appointment identity".into(),
                 ));
             }
             Some(
@@ -983,7 +983,7 @@ pub(super) fn service_status(root: &Path, rest: &[&str]) -> Result<Output, Failu
         None => {
             return Err(Failure::domain(
                 "appointment_corrupt",
-                "terminal service appointment has no stored report",
+                "terminal service appointment has no stored report".into(),
             ));
         }
     };

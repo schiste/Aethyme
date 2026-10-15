@@ -184,7 +184,8 @@ Additional explicit lifecycle commands (provisional Local packages):
       Read local exchange bookkeeping, with no remote delivery/source promise.
   aethyme collab target run --target NAME --issuer NAME --appointment PATH
        --resources PATH --producer NAME --generation N --session N --remote NAME
-       --destination refs/heads/NAME --docker ABSOLUTE_PATH --timeout SECONDS
+       --destination refs/heads/NAME --docker ABSOLUTE_PATH --endpoint UNIX_SOCKET
+       --timeout SECONDS
        --authorization TEXT --allow-replacement yes|no [--json]
       Explicit finite native controller appointment; existing target, budget,
       producer and pinned recipe required. Supports local bare Git only.
@@ -1599,6 +1600,66 @@ mod tests {
         for verb in ["list", "status", "release"] {
             let route = format!("aethyme collab target native-gates {verb}");
             assert!(USAGE.contains(route.as_str()));
+        }
+    }
+
+    #[test]
+    fn bootstrap_routes_are_named_and_documented() {
+        for (verbs, command, usage) in [
+            (
+                &["target", "budget", "project"][..],
+                "target budget",
+                "aethyme collab target budget project",
+            ),
+            (
+                &["target", "budget", "objective"][..],
+                "target budget",
+                "aethyme collab target budget objective",
+            ),
+            (
+                &["target", "budget", "status"][..],
+                "target budget",
+                "aethyme collab target budget status",
+            ),
+            (
+                &["target", "verifier", "prepare"][..],
+                "target verifier",
+                "aethyme collab target verifier prepare",
+            ),
+            (
+                &["target", "verifier", "configure"][..],
+                "target verifier",
+                "aethyme collab target verifier configure",
+            ),
+            (
+                &["target", "verifier", "status"][..],
+                "target verifier",
+                "aethyme collab target verifier status",
+            ),
+            (
+                &["target", "verifier", "revoke"][..],
+                "target verifier",
+                "aethyme collab target verifier revoke",
+            ),
+            (
+                &["target", "capture-notice", "ingest"][..],
+                "target capture-notice",
+                "aethyme collab target capture-notice ingest",
+            ),
+            (
+                &["target", "capture-notice", "list"][..],
+                "target capture-notice",
+                "aethyme collab target capture-notice list",
+            ),
+            (
+                &["target", "run", "status"][..],
+                "target run",
+                "aethyme collab target run status",
+            ),
+        ] {
+            let args: Vec<String> = verbs.iter().map(|verb| (*verb).into()).collect();
+            assert_eq!(command_name(&args), command, "{verbs:?}");
+            assert!(USAGE.contains(usage), "missing help route {usage}");
         }
     }
 
