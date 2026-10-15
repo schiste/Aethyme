@@ -1,12 +1,13 @@
 # FX17 unpaid isolation-control attempts
 
-These records summarize four unpaid local isolation-control attempts. They do
-not authorize or report a model trial. The complete argv, source snapshot,
-profile, runtime profile, stdout, stderr, exit status, reports, and checksums
-are retained in durable operator-controlled qualification storage. Raw macOS
-kernel logs and diagnostic reports remain private there and are not committed.
+These records summarize five unpaid local isolation-control attempts: attempts
+001–004 failed, and attempt 005 passed. A passing controls run does not authorize
+a model trial. The complete argv, source snapshot, profile, runtime profile,
+stdout, stderr, exit status, reports, and checksums are retained in durable
+operator-controlled qualification storage. Raw macOS kernel logs and diagnostic reports remain private there and are not
+committed.
 
-The public frozen inputs remained unchanged in all four attempts:
+The public frozen inputs remained unchanged in all five attempts:
 
 - Payload SHA256: `e733e0183b5bc9d54ba65c3437109b170b9c348d13defd8fb7bcfc91c7bacd28`
 - Schedule SHA256: `8d1474930397a2ce7c0bae1c6fccde6db5c32aba26ef5ad845945a91b150f065`
@@ -17,12 +18,14 @@ The public frozen inputs remained unchanged in all four attempts:
 | 002 | `9dfaecd4d9593a2ce339d69e76a1155d4fb7630a` | `981f56e86362230ffd7e842a647acb981c3bb985` | `a41457470c0aded5aee8ea91ca2e1ecd6bb076485de962322d59142d0c24a63a` | `5a0f572ee35e942b5ede27d4319825fe85e9d5a6dc251d48e77a330ce7e578f5` | fail, CLI status 2 | `9619dc731b193ea56d5a78439f02f73f33230b0be692376bc16ea827dd13ea26` |
 | 003 | `dae783cfbf6837af69cf0ca8546fea0c98963ef9` | `deea88b2c517273ee4b1d36648a57df4992ccccc` | `4cfbc930140fcc00b6771287dd7dcd9053be871ba5bec5ae0c57ff3fe1c965a5` | `401b20db9bea3af2f0d3c096ad4532b37416790732805658ca168519d65c2aff` | fail, CLI status 2 | `e498cb252c1ba13636f8646df9c95ba01d48d363b605467af89ca332de6fe9f6` |
 | 004 | `802f8f2ee0ace1620f36bba65f876d10e682cf1e` | `a84fe3c2fb9555a572ff79e1e88449124f424234` | `fb7cf8e21bea136356b0df578073547eae546b46dd56a52dc8a5b04c52a416e6` | `401b20db9bea3af2f0d3c096ad4532b37416790732805658ca168519d65c2aff` | fail, CLI status 2 | `4be5edffe5316153e9efb0ace02195a19b1c5ffc59e817482aba6f88215960c6` |
+| 005 | `c52ca24090a16b5c287aa4cca8cec5338ddd0a80` | `19cce64377540b4bc1ca8ea61eb60d40c8e56990` | `fe92d4b47e47dabb9596d156c6fc1e9adeb4a44656fe53f44d103a4270791479` | `cb3db0c407c33e7199908b2885ca037fc41c001c81eef30156ca907a75e985ee` | pass, CLI status 0 | `8b3c8d80a460f40a124b81298f0790529000bf4b408e9cf15905cf84d7e6792a` |
 
 The raw report SHA256 values, in attempt order, are
 `03be93bfc87710a0c3d94839d96576d987004468db33aa086fa5038085bb55b2`,
 `428c0056fff97b1acc01db8076d76dd9145457353e2e932c88c6f1333582563e`, and
-`359a70a21941803d20f2bf05d6f1e32dd5cb00cfdacf3b6ab9240b531b966c2c`, and
-`4d85909598d67f4197c65ff2e7a64fd9d875570249f609e1a60b3dab0f6be385`. All four
+`359a70a21941803d20f2bf05d6f1e32dd5cb00cfdacf3b6ab9240b531b966c2c`,
+`4d85909598d67f4197c65ff2e7a64fd9d875570249f609e1a60b3dab0f6be385`, and
+`1325418b4990260a67f3986dd810c46484cc54b99beca862afdfd83a51f492c0`. All five
 attempts used control harness SHA256
 `56572eb5bbe886de9c610b2836eceefbac54eb4faccf49f2d738ef96a63c98a0` and
 runtime profile SHA256
@@ -164,11 +167,69 @@ one exact metadata allowance for `/`, which the attempt 004 kernel log showed
 Bash requires for `getcwd` after starting in `/`. This does not permit reads under
 any root descendant. All other profile rules remain unchanged. The source
 profile hash, runner hash, and runtime-correction document hash below describe
-this pending-reviewed change; the runtime-profile hash is unchanged. No
-controls attempt 005 has run.
+this independently reviewed change; the runtime-profile hash is unchanged.
+Attempt 005 ran against these pins and is documented below; the control result
+does not authorize a model trial.
 
 - Runner SHA256 with the profile and verified runtime-correction pin: `fe92d4b47e47dabb9596d156c6fc1e9adeb4a44656fe53f44d103a4270791479`
 - Control harness SHA256: `56572eb5bbe886de9c610b2836eceefbac54eb4faccf49f2d738ef96a63c98a0`
 - Subject profile SHA256 with the correction: `cb3db0c407c33e7199908b2885ca037fc41c001c81eef30156ca907a75e985ee`
 - Runtime profile SHA256 (unchanged): `344525a875713778fae5344c053692db5b4aa21e8bd2a55929f18b2c5261940e`
 - Runtime correction SHA256 with the correction: `a6d2cd8289ef646cf281f6ef02c6d9bec0d0c8cc08a211fc8c492ed275d43d89`
+
+## Attempt 005
+
+The one unpaid controls attempt ran against reviewed source commit
+`c52ca24090a16b5c287aa4cca8cec5338ddd0a80` (tree
+`19cce64377540b4bc1ca8ea61eb60d40c8e56990`). The CLI returned status 0 and the
+report status was `pass`. Its runner, subject-profile, control-harness,
+runtime-profile, and runtime-correction SHA256 values were respectively
+`fe92d4b47e47dabb9596d156c6fc1e9adeb4a44656fe53f44d103a4270791479`,
+`cb3db0c407c33e7199908b2885ca037fc41c001c81eef30156ca907a75e985ee`,
+`56572eb5bbe886de9c610b2836eceefbac54eb4faccf49f2d738ef96a63c98a0`,
+`344525a875713778fae5344c053692db5b4aa21e8bd2a55929f18b2c5261940e`, and
+`a6d2cd8289ef646cf281f6ef02c6d9bec0d0c8cc08a211fc8c492ed275d43d89`.
+The payload and schedule remained frozen at their hashes listed above.
+
+All eight sandboxed subject probes passed, and each temporary candidate script
+remained stable as a `0400` file. The literal-argv probe received the exact six
+arguments, returned exit 23, and matched the expected exact streams: stdout was
+105 bytes (SHA256
+`7cddc1430e65af9a6010fc97a955daaa1a21d0117dde539e0d82267edbdd465b`) and
+stderr was 16 bytes, `stderr-sentinel\n` (SHA256
+`4803a905ffb0e1e73f8d93028214d7f2c2aad32df705c28c5008e52865bb6627`). The
+read and write canary files were unchanged. The local listener's 46-byte
+positive-control message matched exactly, and no candidate connection was
+observed. The remaining probes showed that canary reads and writes, self-write, network
+connection attempts, process fork, and foreign executable access were denied,
+plus bounded timeout and reaping for recursive shell execution.
+
+All five trusted-runner capture probes passed. Stdout and stderr overflow each
+retained exactly 65,536 bytes before process-group termination. The watched
+response file was observed at 65,537 bytes against its 65,536-byte threshold.
+The timeout and overflow process-tree probes killed their owned process groups
+and reaped both the leader and child; the report records their PID/nonce
+identities before termination and confirms both identities gone after bounded
+waits. Both negative controls passed: a synthetic failed-controls CLI returned
+2, persisted its full report, and made zero trial-runner calls; a copied
+approval retry was rejected and the consumed marker hash remained unchanged.
+
+The complete private evidence is retained at
+`/Volumes/T7-repositories/Application Support/Aethyme/qualification/fx17-controls-run-c52ca240/attempt-005/`.
+The report's raw SHA256 is
+`1325418b4990260a67f3986dd810c46484cc54b99beca862afdfd83a51f492c0`; its
+canonical evidence SHA256 is
+`8b3c8d80a460f40a124b81298f0790529000bf4b408e9cf15905cf84d7e6792a`. The
+attempt summary SHA256 is
+`ac21ca14d1b16243ea38e7d7000ee9e90258fdd321d9d2411c79e4f291e44093`, and the
+private SHA256 manifest is
+`cb09bd91ac879415680352c8cc2515110524e82752cc7de1d2b8e527c4a382b3`. The
+private inventory includes the raw report, complete CLI stdout/stderr and
+numeric exit status, exact argv and clean environment in `preflight.json`,
+source snapshots, profile template, canonical runtime profile, attempt
+summary, and checksum manifest. The manifest was verified against every
+listed artifact. Attempts 001–004 and their failed reports remain preserved.
+
+No model call, private held-out evaluation, or FX17 export occurred. Passing
+these unpaid local controls does not approve the six-row model trial or a
+held-out evaluation.
