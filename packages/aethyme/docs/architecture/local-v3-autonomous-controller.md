@@ -10,8 +10,8 @@ retains the successful run, the earlier failed scheduling attempt and two
 intentional guard failures. A separate controlled FX17 run accepted twenty
 changes with nonempty native gates and independent artifact checks at every
 stage. Its once-final model campaign produced six provider errors and no
-candidates. Sustained-arrival qualification is in progress; broader autonomous
-reliability remains unqualified.
+candidates. A separate bounded sustained-arrival trial passed after one retained
+harness failure; broader autonomous reliability remains unqualified.
 
 ## Appointment and authority
 
@@ -142,6 +142,40 @@ The six separate [once-final FX17 model attempts](../../../aethyme-eval/evals/fx
 all failed with provider/CLI errors before any candidate output. Their private behavioral evaluator had
 nothing to execute. The campaign remains consumed and is not rerun. Thus the
 controlled evolution profile passed, while held-out model behavior and brief
-usefulness remain unqualified. Sustained-arrival service and integrated final
-checks remain separate work. This finite result supplies no general reliability
+usefulness remain unqualified. These finite results supply no general reliability
 claim; conservative budget units are not invoiced provider cost.
+
+## Bounded sustained arrivals and external ref movement
+
+The [FX10 evidence](../../../aethyme-eval/fx10/evidence/actual-1123-1f7b2266/README.md)
+retains both actual combined attempts. At `143d9952`, the positive two-wave phase
+completed all six obligations, but the negative phase failed its harness
+heartbeat handshake before advancing the ref. Its one legitimate completion
+does not count as drift validation. At reviewed source `1f7b2266`, the corrected
+combined trial passed with exit 0 and one selected test. The frozen 19 inputs
+and independent oracle did not change.
+
+The successful positive schedule admitted the oldest A-C group and persisted
+D/E/F during its live host gate child, with the original wave still verifying
+and zero private completions. The ready group age was 19,309 ms; real capacity
+admission waited 288 ms. Two accepted waves preserved all six obligations.
+The child stayed in a release-controlled heartbeat wait loop during arrivals;
+`test -f app.sh` and `git diff --check` executed only after release. This is
+process-level liveness evidence, without check-computation overlap or an
+in-container Docker heartbeat claim.
+
+The separate drift control advanced a disposable bare ref once by same-tree
+fast-forward while the child was live. Its independent verifier passed
+11,075 ms afterward. The sole publication attempt failed, the service held
+for reconciliation, the competing tip remained, and no private completion,
+replay or unknown run was recorded. This finite same-tree drift schedule does
+not establish repeated external-movement reliability.
+
+Follow-up checks at `1f7b2266` passed 24 controller tests (four ignored),
+19 target tests, five gate-policy tests, three discarded-result tests and
+strict broker Clippy. The earlier heartbeat regression and intended mutation
+record HEAD `143d9952` with individual source hashes matching the corrected
+file or its mutation. They did not record full working-tree status or diff
+and are not evidence of a clean `1f7b2266` test tree. Their raw preflights
+and failed setup attempts remain unchanged. Final integrated checks and
+explicit native-job retention cleanup remain separate work.
