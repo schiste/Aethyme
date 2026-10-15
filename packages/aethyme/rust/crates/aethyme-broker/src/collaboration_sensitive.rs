@@ -3237,6 +3237,95 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn unreadable_view_inventory_discards_partial_items_and_persists_root_residual() {
+        use crate::collaboration_archive::ObjectDigest;
+        use crate::collaboration_capture as capture;
+        use std::os::unix::fs::PermissionsExt;
+
+        struct RestorePermissions {
+            path: PathBuf,
+            mode: u32,
+        }
+
+        impl Drop for RestorePermissions {
+            fn drop(&mut self) {
+                let _ = std::fs::set_permissions(
+                    &self.path,
+                    std::fs::Permissions::from_mode(self.mode),
+                );
+            }
+        }
+
+        let mut fixture = crate::local_generation::tests::Fixture::new();
+        let source_repository = fixture.v.f._repo.path().to_path_buf();
+        let capture_request = capture::CaptureRequest {
+            operation_id: capture::OperationId::mint().unwrap(),
+            repository: source_repository.clone(),
+            base: fixture.v.f.a.base.commit.clone(),
+            result: fixture.v.f.a.result.commit.clone(),
+            policy: capture::CapturePolicy::Required,
+            retention: capture::RetentionBoundary::UntilReleased,
+        };
+        let receipt = match capture::capture(&mut fixture.v.f.store, &capture_request).unwrap() {
+            capture::CaptureOutcome::Acknowledged(receipt) => receipt,
+            _ => panic!("capture did not acknowledge"),
+        };
+        let options = crate::analysis_view::ViewOptions::new(
+            crate::analysis_view::ViewProfile::current("t56-unreadable-view-fixture"),
+        );
+        let view = crate::analysis_view::build_view(&fixture.v.f.store, &receipt.result, &options)
+            .unwrap();
+        let view_root = fixture.v.f.store.project_dir().join("views").join(&view);
+        let store = &mut fixture.v.f.store;
+        let frozen = crate::local_authority::freeze(
+            store,
+            fixture.v.owner.authority_epoch(),
+            "T56 unreadable view inventory control",
+        )
+        .unwrap();
+        let incident_id = format!(
+            "sha256:{}",
+            ObjectDigest::of(b"t56-unreadable-view-control").hex()
+        );
+        let quarantined = quarantine(
+            store,
+            &incident_id,
+            "local-test-operator",
+            frozen.epoch.as_str(),
+            ReasonCode::SuspectedTestSecretExposure,
+        )
+        .unwrap();
+
+        let mode = std::fs::metadata(&view_root).unwrap().permissions().mode();
+        let restore_permissions = RestorePermissions {
+            path: view_root.clone(),
+            mode,
+        };
+        std::fs::set_permissions(&view_root, std::fs::Permissions::from_mode(0)).unwrap();
+        assert!(std::fs::read_dir(&view_root).is_err());
+        let result = purge(store, &incident_id, &quarantined.request_digest);
+        drop(restore_permissions);
+
+        let refused = result.unwrap();
+        assert!(!refused.completed);
+        assert!(!refused.status.managed_cleanup_complete);
+        assert!(view_root.exists());
+        assert!(
+            refused
+                .status
+                .items
+                .iter()
+                .all(|item| !item.path.starts_with("views/"))
+        );
+        assert!(refused.status.residuals.iter().any(|residual| {
+            residual.code == "analysis_view_layout_unclassified"
+                && residual.path == "views/"
+                && residual.resolved_ms.is_none()
+        }));
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn missing_view_pin_with_content_is_a_refusal_only_residual() {
         view_layout_refusal_case("missing-pin");
     }
