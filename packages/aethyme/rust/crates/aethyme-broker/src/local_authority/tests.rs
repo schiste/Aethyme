@@ -216,7 +216,7 @@ fn historical_local_records_survive_exact_initial_installation_recovery() {
     assert_eq!(status(&f.store).unwrap().status, Status::Frozen);
     assert_eq!(
         target::status(&f.store, "target").unwrap().phase,
-        Phase::Stopped
+        target::Phase::Stopped
     );
 }
 
