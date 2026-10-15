@@ -198,12 +198,14 @@ fn actual_unknown_publication_after_receiver_ref_update_never_completes() {
     let image = std::env::var("AETHYME_DOCKER_TEST_IMAGE").expect("appointed cached image");
     assert_eq!(image, PINNED_IMAGE, "use the reviewed image digest");
     let native = DockerExecutor::probe(cli.into()).unwrap();
+    let runtime = native.runtime().id();
+    let daemon = native.runtime().daemon_id.clone();
     let executor = native
         .with_resources(ResourcePolicy {
             host_state: host.join("resources.db"),
             temporary_root: host.clone(),
-            runtime: native.runtime().id(),
-            daemon: native.runtime().daemon_id.clone(),
+            runtime,
+            daemon,
             meter_image: image.clone(),
             memory_mib: 2048,
             disk_mib: 2048,
