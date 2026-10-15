@@ -1,0 +1,16 @@
+ARGV: ["/usr/bin/caffeinate", "-i", "/Users/christophehenner/.cargo/bin/cargo", "test", "--locked", "-j", "4", "-p", "aethyme-broker", "--lib", "--", "--ignored", "--exact", "local_controller::drive::tests::outcome_unknown::actual_unknown_publication_after_receiver_ref_update_never_completes", "--nocapture"]
+SOURCE: {"head": "b16af023c07f22817fb8bb11abe464e916507850", "status_porcelain": "", "tree": "7e857b8e50e28f4b62acb8ed71a5070215061c95"}
+PINNED_IMAGE: {"inspect_argv": ["/opt/homebrew/bin/docker", "image", "inspect", "--format={{.Id}}", "sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251"], "inspect_status": 0, "inspect_stderr": "", "inspect_stdout": "sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251", "inspected_id": "sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251", "requested": "sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251"}
+   Compiling aethyme-engine v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/implement-the-actual-fx17-20-controlled/packages/aethyme/rust/crates/aethyme-engine)
+   Compiling aethyme-broker v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/implement-the-actual-fx17-20-controlled/packages/aethyme/rust/crates/aethyme-broker)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 37.70s
+     Running unittests src/lib.rs (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/integrate-reviewed-local-bare-git-servic/target/local-resume/cargo/debug/deps/aethyme_broker-20bbfe5c0b2dd5c0)
+
+running 1 test
+Controller actual unknown-publication evidence root /var/folders/f2/krjzd4c15nn491pm37zrkp1h0000gn/T/.tmprAe1Yv
+Controller unknown-publication source host /var/folders/f2/krjzd4c15nn491pm37zrkp1h0000gn/T/.tmpif4YvL, repository /var/folders/f2/krjzd4c15nn491pm37zrkp1h0000gn/T/.tmpT5ijmz
+Controller actual unknown-publication report /var/folders/f2/krjzd4c15nn491pm37zrkp1h0000gn/T/.tmprAe1Yv/report.json
+test local_controller::drive::tests::outcome_unknown::actual_unknown_publication_after_receiver_ref_update_never_completes ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1795 filtered out; finished in 23.53s
+

@@ -1,0 +1,28 @@
+{
+  "run": "local-controller-selection",
+  "started_utc": "2026-10-15T08:29:51.741912+00:00",
+  "cwd": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/implement-the-actual-fx17-20-controlled/packages/aethyme/rust",
+  "head": "c45d4096f9d0238b800ccadbeb07f9b93ae30a3e",
+  "head_tree": "874654af26ac7fd9bbaa9bedbc7a04fa8a834e40",
+  "worktree_status": "",
+  "diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "local_wave_sha256": "c5f8bc4e98e87dcb0a069f6f1b4a301c4557b705c2a258d8f58b823139883a09",
+  "argv": [
+    "/usr/bin/caffeinate",
+    "-i",
+    "cargo",
+    "test",
+    "--locked",
+    "-j4",
+    "-p",
+    "aethyme-broker",
+    "--lib",
+    "local_controller::"
+  ],
+  "env": {
+    "PATH": "/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/christophehenner/.cargo/bin",
+    "RUSTC_WRAPPER": "",
+    "CARGO_TARGET_DIR": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/integrate-reviewed-local-bare-git-servic/target/local-resume/cargo"
+  },
+  "foreground_caffeinate": true
+}

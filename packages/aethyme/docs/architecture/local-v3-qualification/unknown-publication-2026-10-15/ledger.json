@@ -1,0 +1,227 @@
+{
+  "attempts": [
+    {
+      "argv": [
+        "/usr/bin/caffeinate",
+        "-i",
+        "/Users/christophehenner/.cargo/bin/cargo",
+        "test",
+        "--locked",
+        "-j",
+        "4",
+        "-p",
+        "aethyme-broker",
+        "--lib",
+        "--",
+        "--ignored",
+        "--exact",
+        "local_controller::drive::tests::outcome_unknown::actual_unknown_publication_after_receiver_ref_update_never_completes",
+        "--nocapture"
+      ],
+      "id": "attempt-001",
+      "numeric_exit_code": 101,
+      "report_present": false,
+      "source": {
+        "head": "e55abfc23324d4eec72697a7fea5aebb474f0bcb",
+        "status_porcelain": "",
+        "tree": "913d2a91cf7c284c1bdcbc0012557f605aafdd9c"
+      },
+      "test_result_lines": [
+        "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1795 filtered out; finished in 4.55s"
+      ],
+      "wall_seconds": 5.216
+    },
+    {
+      "argv": [
+        "/usr/bin/caffeinate",
+        "-i",
+        "/Users/christophehenner/.cargo/bin/cargo",
+        "test",
+        "--locked",
+        "-j",
+        "4",
+        "-p",
+        "aethyme-broker",
+        "--lib",
+        "--",
+        "--ignored",
+        "--exact",
+        "local_controller::drive::tests::outcome_unknown::actual_unknown_publication_after_receiver_ref_update_never_completes",
+        "--nocapture"
+      ],
+      "id": "attempt-002",
+      "numeric_exit_code": 101,
+      "report_present": false,
+      "source": {
+        "head": "dafca2995069420fd75fb82a2496a05ffe93ef5a",
+        "status_porcelain": "",
+        "tree": "52836ed2a724d83d08c8b10d9d471789f2af1d1b"
+      },
+      "test_result_lines": [
+        "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1795 filtered out; finished in 50.59s"
+      ],
+      "wall_seconds": 94.086
+    },
+    {
+      "argv": [
+        "/usr/bin/caffeinate",
+        "-i",
+        "/Users/christophehenner/.cargo/bin/cargo",
+        "test",
+        "--locked",
+        "-j",
+        "4",
+        "-p",
+        "aethyme-broker",
+        "--lib",
+        "--",
+        "--ignored",
+        "--exact",
+        "local_controller::drive::tests::outcome_unknown::actual_unknown_publication_after_receiver_ref_update_never_completes",
+        "--nocapture"
+      ],
+      "id": "attempt-003",
+      "numeric_exit_code": 0,
+      "report_present": true,
+      "source": {
+        "head": "b16af023c07f22817fb8bb11abe464e916507850",
+        "status_porcelain": "",
+        "tree": "7e857b8e50e28f4b62acb8ed71a5070215061c95"
+      },
+      "test_result_lines": [
+        "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1795 filtered out; finished in 23.53s"
+      ],
+      "wall_seconds": 61.975
+    }
+  ],
+  "classifications": {
+    "attempt-001": "Fixture setup failed before service dispatch: empty Git templates did not create hooks directory. No ambiguous-publication evidence.",
+    "attempt-002": "Fixture hook lacked /usr/bin/cat on this host; process identities were not recorded. Actual push succeeded, so this does not exercise an unknown write.",
+    "attempt-003": "Actual receiver ref updated; managed write timed out with unknown outcome; service held, replay refused, zero private acceptance/completion. Both owned hook processes exited."
+  },
+  "failed_executions": 2,
+  "limits": [
+    "Only one successful ambiguous-publication schedule; two failed fixture attempts retained.",
+    "No reconciliation was performed and no historical receipt granted new authority.",
+    "Local temporary source/receiver/host roots are recorded in raw metadata; durable private root archiving is tracked separately.",
+    "No model call, invoice, repeated-drift reliability or twenty-change FX17 qualification is claimed."
+  ],
+  "passing_executions": 1,
+  "profile": {
+    "cargo_jobs": 4,
+    "cargo_profile": "test (default, non-release)",
+    "case": "single retained assertion; receiver post-receive hook delays 5 seconds after ref update",
+    "docker_resources": {
+      "daemon_floor_bytes": 1,
+      "disk_mib": 2048,
+      "host_floor_bytes": 1,
+      "job_slots": 2,
+      "memory_mib": 2048,
+      "process_slots": 1024
+    },
+    "git_carrier": {
+      "operation_timeout_seconds": 2,
+      "target": "disposable local bare Git receiver"
+    },
+    "project_budget": {
+      "disk_bytes": 68719476736,
+      "max_root_reservations": 32,
+      "memory_bytes": 68719476736,
+      "slots": 100,
+      "time_ms": 1000000000
+    },
+    "service": {
+      "max_completions": 1,
+      "max_elapsed_ms": 600000,
+      "max_ticks": 32,
+      "poll_ms": 20
+    },
+    "test_threads": "Rust test harness default; exact filter selects one test"
+  },
+  "raw_artifacts": [
+    {
+      "bytes": 3783,
+      "path": "attempt-001.json",
+      "sha256": "b04a604e5d781d996f8523ca47ecf99b41bdbf2c791e4aee5a01eeaff1074a8b"
+    },
+    {
+      "bytes": 1475,
+      "path": "attempt-001.log",
+      "sha256": "6ee0d45bd3496ee4df2aa0016f9cb920fbf785d054b445a1c1f1ba3c068dd15c"
+    },
+    {
+      "bytes": 14,
+      "path": "attempt-001.status",
+      "sha256": "969d42b90d1dbe5e8b2498c065a3163bff1081ea80c3ca79727acb8e43ae733f"
+    },
+    {
+      "bytes": 4545,
+      "path": "attempt-002.json",
+      "sha256": "9bfc62616bd45abe7a091fc46ca3c9363791a1e7556a67b096f40c611868f3c7"
+    },
+    {
+      "bytes": 2004,
+      "path": "attempt-002.log",
+      "sha256": "bb086cd42125ad657b1cd4617554c76a1662e19b35c87da9ba6f95688bd16ca7"
+    },
+    {
+      "bytes": 14,
+      "path": "attempt-002.status",
+      "sha256": "969d42b90d1dbe5e8b2498c065a3163bff1081ea80c3ca79727acb8e43ae733f"
+    },
+    {
+      "bytes": 4359,
+      "path": "attempt-003.json",
+      "sha256": "f15a09dc6456a9b12355d5c4222560fdb7f3d86d9e29bcc1a93edd430c859efb"
+    },
+    {
+      "bytes": 2316,
+      "path": "attempt-003.log",
+      "sha256": "ad98b509ebaa7746ab2965458a92b1ecacfe5f197404aee41103d23ba851a9c5"
+    },
+    {
+      "bytes": 2,
+      "path": "attempt-003.status",
+      "sha256": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa"
+    },
+    {
+      "bytes": 11983,
+      "path": "attempt-003-report.json",
+      "sha256": "f27346d8bd50273cb386d7b3050797bf244b5a5bec242fb797d779a30b0c7e8c"
+    }
+  ],
+  "recorded_at_utc": "2026-10-15",
+  "scheduled_attempts": 3,
+  "schema": "aethyme.local-qualification.actual-unknown-publication/v1",
+  "scope": "One actual receiver update before a managed local bare-Git push timeout; not repeated external drift or FX17",
+  "success_observations": {
+    "budget": {
+      "attempts": 3,
+      "consumed": 3,
+      "pending": 0,
+      "receipts": 3,
+      "reservations": 3
+    },
+    "managed_exit_code": null,
+    "managed_operation_status": "outcome_unknown",
+    "private_acceptance": {
+      "completions": 0,
+      "qualifications": 0,
+      "receipts": 0
+    },
+    "receiver_equals_exact_candidate": true,
+    "receiver_owned_processes_exited": true,
+    "replay_refused": true,
+    "retained_root_counts": {
+      "native": 5,
+      "objects": 13,
+      "targets": 18
+    },
+    "run_state": "unknown",
+    "service_outcome": "held",
+    "transport_observation": "unobserved",
+    "transport_receipt_present": false
+  },
+  "test_executions": 3,
+  "unique_test_cases": 1
+}

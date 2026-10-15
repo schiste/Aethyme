@@ -1,6 +1,13 @@
 # Local v3 — L4 resolution requests and candidate manifests (#665)
 
-Last Updated: 2026-10-10
+Last Updated: 2026-10-15
+
+> Historical checkpoint: the implementation and pending-work statements below
+> describe the original provisional profile. Current bounded E1, FX08, native-gate
+> and appointed-controller results are recorded in the
+> [Local qualification ledger](local-v3-qualification.md). Each original fixture
+> and profile keeps its own evidence and limits.
+
 
 This record covers plan §7.3 steps 6–9, §7.4 and §7.5 on top of the provisional composer
 (#664, `local-v3-l4-composer.md`). It is **provisional**. E1 (#650) has not run, so D06

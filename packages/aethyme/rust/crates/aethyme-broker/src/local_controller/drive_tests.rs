@@ -1036,6 +1036,12 @@ fn controller_migrations_adopt_existing_journals_without_erasing_rows() {
     connection.execute("INSERT INTO local_controller_completion_roots(completion,kind,reference) VALUES('migration-sentinel','source','retained-sentinel')",[]).unwrap();
     connection.execute("INSERT INTO local_controller_runs(wave,id,epoch,body,state,observation) VALUES(?1,'run-sentinel',?2,?3,'unknown',?4)",params![w.id.as_str(),owner.authority_epoch().as_str(),b"dispatch-preserved".as_slice(),b"unknown-preserved".as_slice()]).unwrap();
     connection
+        .execute_batch(
+            "DROP TRIGGER local_native_gate_no_dispatch_after_root_release;
+             ALTER TABLE local_native_gate_jobs DROP COLUMN roots_released_ms;",
+        )
+        .unwrap();
+    connection
         .execute(
             "UPDATE meta SET value='18' WHERE key IN ('schema_version','min_compatible_schema')",
             [],

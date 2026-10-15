@@ -25,6 +25,7 @@ dependencies = [
  "aethyme-engine",
  "aethyme-enhance",
  "aethyme-graph-indexer",
+ "aethyme-graph-schema",
  "aethyme-graph-storage",
  "aethyme-testkit",
  "fastrand",

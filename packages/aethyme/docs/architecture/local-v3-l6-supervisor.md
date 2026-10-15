@@ -1,6 +1,13 @@
 # Local v3 Linux supervisor (#671)
 
-Last Updated: 2026-10-11
+Last Updated: 2026-10-15
+
+> Historical checkpoint: the implementation and pending-work statements below
+> describe the original provisional profile. Current bounded E1, FX08, native-gate
+> and appointed-controller results are recorded in the
+> [Local qualification ledger](local-v3-qualification.md). Each original fixture
+> and profile keeps its own evidence and limits.
+
 
 ## Selected provisional mechanism
 

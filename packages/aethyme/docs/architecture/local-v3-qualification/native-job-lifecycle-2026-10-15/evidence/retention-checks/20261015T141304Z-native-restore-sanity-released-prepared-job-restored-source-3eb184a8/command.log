@@ -1,0 +1,20 @@
+   Compiling aethyme-engine v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/reconcile-retention-of-inactive-native-g/packages/aethyme/rust/crates/aethyme-engine)
+   Compiling aethyme-broker v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/reconcile-retention-of-inactive-native-g/packages/aethyme/rust/crates/aethyme-broker)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1m 06s
+     Running unittests src/lib.rs (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/integrate-reviewed-local-bare-git-servic/target/local-resume/cargo/debug/deps/aethyme_broker-0f278e0d02146111)
+
+running 1 test
+test native_gates::tests::released_prepared_job_remains_readable_but_cannot_be_dispatched_or_replayed ... 
+thread 'native_gates::tests::released_prepared_job_remains_readable_but_cannot_be_dispatched_or_replayed' (812458) panicked at crates/aethyme-broker/src/native_gates/tests.rs:83:6:
+called `Result::unwrap()` on an `Err` value: Store(Io { path: "gate-trust", source: Custom { kind: NotFound, error: "no host state directory: set HOME or AETHYME_HOST_STATE_DIR" } })
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+
+failures:
+    native_gates::tests::released_prepared_job_remains_readable_but_cannot_be_dispatched_or_replayed
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1819 filtered out; finished in 2.66s
+
+error: test failed, to rerun pass `-p aethyme-broker --lib`

@@ -124,6 +124,13 @@ Additional explicit lifecycle commands (provisional Local packages):
       Hold an active phase waiting for operator input at the exact version.
   aethyme collab target resume --target NAME --issuer NAME --version N [--json]
       Resume the recorded held phase, without skipping checks.
+  aethyme collab target native-gates list --target NAME --issuer NAME [--json]
+      List up to 500 native-job retention records for the current target owner.
+  aethyme collab target native-gates status --target NAME --issuer NAME --job ID [--json]
+      Inspect native-job state and whether its roots remain retained.
+  aethyme collab target native-gates release --target NAME --issuer NAME --job ID [--json]
+      Abandon a prepared job or release completed-job roots. Dispatching and
+      unknown jobs remain held because process-tree inactivity is unproven.
   aethyme collab stop --epoch EPOCH --reason TEXT [--json]
       Freeze project ingress and rotate native authority. Running processes
       and external effects are not assumed cancelled; reconcile them.
@@ -346,6 +353,7 @@ fn command_name(args: &[String]) -> String {
         "brief",
         "attach",
         "target",
+        "native-gates",
         "propose",
         "select",
         "hold",
@@ -401,6 +409,7 @@ fn dispatch(options: Options) -> Result<Output, Failure> {
         ["brief", "attach", rest @ ..] => brief_attach(&main_root, rest),
         ["authority", "status", rest @ ..] => lifecycle::authority_status(&main_root, rest),
         ["target", "status", rest @ ..] => lifecycle::target_status(&main_root, rest),
+        ["target", "native-gates", rest @ ..] => lifecycle::native_gate_retention(&main_root, rest),
         [
             "target",
             verb @ ("propose" | "select" | "hold" | "resume"),
@@ -1494,6 +1503,20 @@ mod tests {
             assert_eq!(base32_lower(input.as_bytes()), expected, "{input}");
         }
         assert_eq!(base32_lower(&[0xff; 16]).len(), 26);
+    }
+
+    #[test]
+    fn native_gate_retention_route_is_named_and_documented() {
+        let command = [
+            "target".to_string(),
+            "native-gates".to_string(),
+            "release".to_string(),
+        ];
+        assert_eq!(command_name(&command), "target native-gates");
+        for verb in ["list", "status", "release"] {
+            let route = format!("aethyme collab target native-gates {verb}");
+            assert!(USAGE.contains(route.as_str()));
+        }
     }
 
     #[test]

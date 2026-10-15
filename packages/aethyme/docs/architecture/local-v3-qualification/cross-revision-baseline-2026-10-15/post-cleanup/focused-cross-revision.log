@@ -1,0 +1,46 @@
+SOURCE_BOUND_METADATA
+{
+  "run": "focused-cross-revision",
+  "started_utc": "2026-10-15T08:28:02.483865+00:00",
+  "cwd": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/implement-the-actual-fx17-20-controlled/packages/aethyme/rust",
+  "head": "c45d4096f9d0238b800ccadbeb07f9b93ae30a3e",
+  "head_tree": "874654af26ac7fd9bbaa9bedbc7a04fa8a834e40",
+  "worktree_status": "",
+  "diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "local_wave_sha256": "c5f8bc4e98e87dcb0a069f6f1b4a301c4557b705c2a258d8f58b823139883a09",
+  "argv": [
+    "/usr/bin/caffeinate",
+    "-i",
+    "cargo",
+    "test",
+    "--locked",
+    "-j4",
+    "-p",
+    "aethyme-broker",
+    "--lib",
+    "cross_revision"
+  ],
+  "env": {
+    "PATH": "/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/christophehenner/.cargo/bin",
+    "RUSTC_WRAPPER": "",
+    "CARGO_TARGET_DIR": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/integrate-reviewed-local-bare-git-servic/target/local-resume/cargo"
+  },
+  "foreground_caffeinate": true
+}
+CARGO_OUTPUT_BEGIN
+   Compiling aethyme-engine v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/implement-the-actual-fx17-20-controlled/packages/aethyme/rust/crates/aethyme-engine)
+   Compiling aethyme-broker v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/implement-the-actual-fx17-20-controlled/packages/aethyme/rust/crates/aethyme-broker)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 55.92s
+     Running unittests src/lib.rs (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/integrate-reviewed-local-bare-git-servic/target/local-resume/cargo/debug/deps/aethyme_broker-20bbfe5c0b2dd5c0)
+
+running 3 tests
+test local_controller::drive::tests::cross_revision_lookup_rejects_wrong_source_target_and_epoch ... ok
+test local_controller::drive::tests::cross_revision_stale_completion_epoch_is_rechecked_at_composition_and_completion_use ... ok
+test local_controller::drive::tests::cross_revision_completion_anchor_binds_candidate_parent_and_publication_lease ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 1796 filtered out; finished in 36.43s
+
+
+CARGO_OUTPUT_END
+NUMERIC_EXIT_STATUS=0
+WALL_SECONDS=93.224

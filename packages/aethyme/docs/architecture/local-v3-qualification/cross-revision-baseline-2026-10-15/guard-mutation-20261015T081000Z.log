@@ -1,0 +1,21 @@
+   Compiling aethyme-broker v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/implement-the-actual-fx17-20-controlled/packages/aethyme/rust/crates/aethyme-broker)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1m 14s
+     Running unittests src/lib.rs (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/integrate-reviewed-local-bare-git-servic/target/local-resume/cargo/debug/deps/aethyme_broker-20bbfe5c0b2dd5c0)
+
+running 1 test
+test local_controller::drive::tests::cross_revision_lookup_rejects_wrong_source_target_and_epoch ... 
+thread 'local_controller::drive::tests::cross_revision_lookup_rejects_wrong_source_target_and_epoch' (22834070) panicked at crates/aethyme-broker/src/local_controller/drive_tests.rs:477:5:
+assertion `left == right` failed: content from a different source snapshot is not a historical baseline
+  left: Some(RecordId("sha256:264be87b6e5e11d7315c62532b111061d7eaea2c47121e6c206d035b1abdbbc2"))
+ right: None
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+
+failures:
+    local_controller::drive::tests::cross_revision_lookup_rejects_wrong_source_target_and_epoch
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1798 filtered out; finished in 1.08s
+
+error: test failed, to rerun pass `-p aethyme-broker --lib`

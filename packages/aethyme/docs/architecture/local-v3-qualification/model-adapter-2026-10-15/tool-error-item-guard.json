@@ -1,0 +1,38 @@
+{
+  "source_head": "caef9cc94ca47b6f75f1d712e3e85359ccad55e1",
+  "source_runner_sha256": "2e3a93668a6aeae8c61e2579e909a91e1b17c50ee1a1b9e33ed615a94d3f2df8",
+  "named_test": "test_event_classifier_ignores_error_and_counts_unique_tool_items",
+  "started_at_utc": "2026-10-15T09:31:45.392689+00:00",
+  "wall_seconds": 0.329,
+  "command": [
+    "/opt/homebrew/bin/uv",
+    "--cache-dir",
+    "/private/tmp/aethyme-fx17-pytest-e6e3109a-20261015/uv-cache",
+    "run",
+    "--offline",
+    "--no-project",
+    "--with",
+    "pytest",
+    "--",
+    "python",
+    "-m",
+    "pytest",
+    "-q",
+    "-p",
+    "no:cacheprovider",
+    "/private/tmp/aethyme-fx17-mutation-im5s7mp2/tests/test_fx17_model_protocol.py::test_event_classifier_ignores_error_and_counts_unique_tool_items"
+  ],
+  "working_directory": "/private/tmp/aethyme-fx17-mutation-im5s7mp2",
+  "mutation": {
+    "old": "or item.get(\"type\") not in TOOL_ITEM_TYPES",
+    "new": "or item.get(\"type\") == \"agent_message\"",
+    "runner_sha256": "a2e97e8f1593db8a4492ce57deb65c50d62f18454196700e114b1e1d21961d66"
+  },
+  "exit_code": 1,
+  "expected_exit_code": 1,
+  "source_exactly_restored": true,
+  "log_sha256": "9234ce5fcf902fe6d84951c5b2358f95301dc4bb90292f9f94626af9b77cb488",
+  "log_bytes": 1404,
+  "provider_calls": 0,
+  "evaluator_calls": 0
+}

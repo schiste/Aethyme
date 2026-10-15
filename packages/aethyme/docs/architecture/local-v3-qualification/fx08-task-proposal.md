@@ -1,8 +1,12 @@
 # FX08 Local brief usefulness: task review proposal
 
-Last Updated: 2026-10-11
+Last Updated: 2026-10-15
 
-Status: proposed task descriptions; no fixtures frozen or trials run.
+> Historical task proposal. The approved tasks were constructed, frozen and run;
+> see the [once-final FX08 results](../local-v3-fx08-qualification.md).
+
+
+Status: historical proposal; completed fixture and trial evidence is linked above.
 
 Issue #709 requires these descriptions to be reviewed before fixture construction.
 This proposal covers Local cold-start tasks and real L3 retrieval. It does not

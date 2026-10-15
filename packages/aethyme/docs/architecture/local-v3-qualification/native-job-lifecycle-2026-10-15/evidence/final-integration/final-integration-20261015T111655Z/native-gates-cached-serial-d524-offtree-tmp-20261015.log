@@ -1,0 +1,15 @@
+
+running 15 tests
+test native_gates::tests::a_dispatched_job_reopens_unknown_without_any_retry ... ok
+test native_gates::tests::actual_composer_candidate_runs_native_gates_without_legacy_queue_or_ref_writes ... gate retained-features started (cost 0, tree 1e128ff5b7d8)
+gate retained-features pass in 0s (tree 1e128ff5b7d8) at load 1m 5.2/10 cpus
+ok
+test native_gates::tests::budget_capacity_and_requirement_holds_do_not_dispatch_prepared_jobs ... ok
+test native_gates::tests::checkout_placement_refuses_upward_project_discovery ... ok
+test native_gates::tests::completed_job_release_survives_real_gc_and_reopened_status_reads ... gate retained-features started (cost 0, tree 1e128ff5b7d8)
+gate retained-features pass in 0s (tree 1e128ff5b7d8) at load 1m 8.3/10 cpus
+ok
+test native_gates::tests::corrupt_projected_job_identity_and_source_binding_refuse_before_dispatch ... ok
+test native_gates::tests::dispatching_and_unknown_jobs_stay_rooted_without_a_process_tree_proof ... ok
+test native_gates::tests::fresh_dispatch_refuses_a_job_completed_after_the_callers_snapshot ... ok
+test native_gates::tests::native_gate_roots_survive_revision_root_release ... 

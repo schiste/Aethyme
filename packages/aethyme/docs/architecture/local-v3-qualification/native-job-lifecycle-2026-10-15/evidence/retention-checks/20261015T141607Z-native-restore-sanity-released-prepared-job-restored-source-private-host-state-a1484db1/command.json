@@ -1,0 +1,99 @@
+{
+  "argv": [
+    "/usr/bin/caffeinate",
+    "-i",
+    "/Users/christophehenner/.cargo/bin/cargo",
+    "test",
+    "--locked",
+    "-j",
+    "4",
+    "-p",
+    "aethyme-broker",
+    "--lib",
+    "released_prepared_job_remains_readable_but_cannot_be_dispatched_or_replayed",
+    "--",
+    "--nocapture",
+    "--test-threads=1"
+  ],
+  "duration_seconds": 4.529217,
+  "ended_at_utc": "2026-10-15T14:16:12.681309Z",
+  "environment": {
+    "explicit_profile_keys": [
+      "AETHYME_HOST_STATE_DIR"
+    ],
+    "values": {
+      "AETHYME_HOST_STATE_DIR": "/Volumes/T7-repositories/Application Support/Aethyme/qualification/local-check-temporaries/native-host-state-1414-z66l18hq",
+      "CARGO_BUILD_JOBS": "4",
+      "CARGO_TARGET_DIR": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/integrate-reviewed-local-bare-git-servic/target/local-resume/cargo",
+      "PATH": "/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/christophehenner/.cargo/bin",
+      "RUSTC_WRAPPER": "",
+      "TMPDIR": "/Volumes/T7-repositories/Application Support/Aethyme/qualification/local-check-temporaries/native-restore-sanity-released-prepared-job-restored-source-private-host-state-tmp-nkm0t4jt"
+    }
+  },
+  "execution_context": {
+    "host": {
+      "hostname": "Mac.lan",
+      "machine": "arm64",
+      "platform": "macOS-27.2-arm64-arm-64bit",
+      "python": "3.9.6 (default, Aug 25 2026, 21:26:21) "
+    },
+    "tmp_volume": {
+      "free_bytes_before": 102385246208,
+      "path": "/Volumes/T7-repositories/Application Support/Aethyme/qualification/local-check-temporaries",
+      "total_bytes": 899994554368
+    },
+    "tool_versions": {
+      "aethyme": {
+        "executable": "/Users/christophehenner/.cargo/bin/aethyme",
+        "exit_code": 0,
+        "version": "aethyme 0.8.26 (v0.8.26 build_commit=5e8daf712e26c63f1d4082e9a617f556cf995de2) build_date=2026-10-08T19:30:03Z"
+      },
+      "cargo": {
+        "executable": "/Users/christophehenner/.cargo/bin/cargo",
+        "exit_code": 0,
+        "version": "cargo 1.96.0 (30a34c682 2026-05-25)"
+      },
+      "git": {
+        "executable": "/opt/homebrew/bin/git",
+        "exit_code": 0,
+        "version": "git version 2.55.0"
+      },
+      "rustc": {
+        "executable": "/Users/christophehenner/.cargo/bin/rustc",
+        "exit_code": 0,
+        "version": "rustc 1.96.0 (ac68faa20 2026-05-25)"
+      }
+    }
+  },
+  "label": "native-restore-sanity-released-prepared-job-restored-source-private-host-state",
+  "launcher_error": null,
+  "log_bytes": 531,
+  "log_path": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/reconcile-retention-of-inactive-native-g/target/local-resume/retention-checks/20261015T141607Z-native-restore-sanity-released-prepared-job-restored-source-private-host-state-a1484db1/command.log",
+  "log_sha256": "ed8b43c6c5621688230e7f7e03545b45cae42c3c29233954b095e22809c3f33f",
+  "numeric_exit": 0,
+  "root": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/reconcile-retention-of-inactive-native-g",
+  "schema": "aethyme.local-check/v1",
+  "source_after": {
+    "diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "head": "3df43525dafede5f5c0119b9e8444ed9730dea9f",
+    "status": "",
+    "tree": "04d4728e2f5a92c8e6928197d26fb743b2269ac8",
+    "untracked_content_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  "source_before": {
+    "diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "head": "3df43525dafede5f5c0119b9e8444ed9730dea9f",
+    "status": "",
+    "tree": "04d4728e2f5a92c8e6928197d26fb743b2269ac8",
+    "untracked_content_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  "source_unchanged": true,
+  "started_at_utc": "2026-10-15T14:16:08.305782Z",
+  "state": "completed",
+  "status_bytes": 2,
+  "status_path": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/reconcile-retention-of-inactive-native-g/target/local-resume/retention-checks/20261015T141607Z-native-restore-sanity-released-prepared-job-restored-source-private-host-state-a1484db1/command.status",
+  "status_sha256": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa",
+  "termination_signal": null,
+  "tmpdir": "/Volumes/T7-repositories/Application Support/Aethyme/qualification/local-check-temporaries/native-restore-sanity-released-prepared-job-restored-source-private-host-state-tmp-nkm0t4jt",
+  "working_directory": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/reconcile-retention-of-inactive-native-g/packages/aethyme/rust"
+}

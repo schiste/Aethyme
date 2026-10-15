@@ -1,0 +1,79 @@
+{
+  "actions": {
+    "exit_status_or_test_results_inferred": false,
+    "original_metadata_log_or_status_modified": false,
+    "signal_sent": false
+  },
+  "attempt_id": "local-native-gates-cached-serial-d524-offtree-no-final-status",
+  "binary": {
+    "expected_sha256": "4b2376a7f628100d52b2b28d0f60511917c42a7d306a7eb88a6d4f599c8b6945",
+    "hash_matches_expected": true,
+    "matching_process_argv_count_at_reconciliation": 0,
+    "observed_sha256": "4b2376a7f628100d52b2b28d0f60511917c42a7d306a7eb88a6d4f599c8b6945",
+    "path": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/integrate-reviewed-local-bare-git-servic/target/local-resume/cargo/debug/deps/aethyme_broker-0f278e0d02146111",
+    "process_lookup": "ps argv scan for the exact binary basename; zero matches"
+  },
+  "command": [
+    "/usr/bin/caffeinate",
+    "-i",
+    "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/integrate-reviewed-local-bare-git-servic/target/local-resume/cargo/debug/deps/aethyme_broker-0f278e0d02146111",
+    "native_gates::tests",
+    "--nocapture",
+    "--test-threads=1"
+  ],
+  "complete_command_pass": false,
+  "log_writer_lookup": {
+    "command": [
+      "/usr/sbin/lsof",
+      "-nP",
+      "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/reconcile-retention-of-inactive-native-g/target/local-resume/final-integration-20261015T111655Z/native-gates-cached-serial-d524-offtree-tmp-20261015.log"
+    ],
+    "conclusion": "No process had the exact preserved log open at reconciliation time.",
+    "exit_code": 1,
+    "stderr_bytes": 0,
+    "stdout_bytes": 0
+  },
+  "metadata_state": "running",
+  "numeric_exit": null,
+  "observed_log_progress": {
+    "completed_ok_lines_observed": 8,
+    "interpretation": "These are raw log observations only; the command has no final status and no complete-pass credit.",
+    "last_test_line": "native_gates::tests::native_gate_roots_survive_revision_root_release ...",
+    "last_test_line_has_result": false,
+    "remaining_selected_cases_without_result_in_log": 7,
+    "selected_tests_reported_by_harness": 15
+  },
+  "original_artifacts": [
+    {
+      "bytes": 1575,
+      "path": "target/local-resume/final-integration-20261015T111655Z/native-gates-cached-serial-d524-offtree-tmp-20261015.json",
+      "preserved_unchanged": true,
+      "sha256": "8a5b5cf3d7680f78d58cfc0ffdaf187393620ca8c1729e57e3bb0b8960133f56"
+    },
+    {
+      "bytes": 1156,
+      "path": "target/local-resume/final-integration-20261015T111655Z/native-gates-cached-serial-d524-offtree-tmp-20261015.log",
+      "preserved_unchanged": true,
+      "sha256": "4f1ad62cc55c2c0994e626607321cc764ea1025f274fc6ad621c12156dd2d30f"
+    }
+  ],
+  "outcome": "abandoned_without_final_status",
+  "qualification_credit": false,
+  "reconciliation_id": "native-gates-cached-serial-d524-offtree-tmp-20261015",
+  "recorded_at_utc": "2026-10-15T13:14:37Z",
+  "schema": "aethyme.local-check-reconciliation/v1",
+  "source_at_launch": {
+    "diff_sha256": "5cb3b142fb06fa39181a37496ad5ab84267b93c277980f40aca26cbf3688a94b",
+    "head": "27d1b2e9de6a3b09bb0dcf9bc598c22d8f39b52a",
+    "post_run_source_snapshot_present": false,
+    "status": " M packages/aethyme/docs/architecture/local-v3-qualification/native-job-lifecycle-2026-10-15/README.md\n M packages/aethyme/docs/architecture/local-v3-qualification/native-job-lifecycle-2026-10-15/ledger.json",
+    "tree": "d0822c4484f37efdf90ff039fe6c13a08f293aa3"
+  },
+  "started_at_utc": "2026-10-15T11:16:55.344673+00:00",
+  "status_artifact": {
+    "exists": false,
+    "numeric_exit_known": false,
+    "path": "target/local-resume/final-integration-20261015T111655Z/native-gates-cached-serial-d524-offtree-tmp-20261015.status"
+  },
+  "working_directory": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/reconcile-retention-of-inactive-native-g/packages/aethyme/rust"
+}

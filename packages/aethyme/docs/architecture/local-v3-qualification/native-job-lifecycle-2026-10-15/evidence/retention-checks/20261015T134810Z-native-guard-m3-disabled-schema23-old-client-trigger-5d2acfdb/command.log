@@ -1,0 +1,49 @@
+MUTATION_RUNNER_SHA256=b78af5398d30f7302854271b4228648e4cc30e8c66c4593759622ce7c9d7f1f3
+MUTATOR_SHA256=0b2e660db3c4b5bf39faada40c15205768cfa23e08b8cad54f011417a9cd0d8a
+MUTANT=m3-disabled-schema23-old-client-trigger
+TEST_FILTER=released_prepared_job_remains_readable_but_cannot_be_dispatched_or_replayed
+SOURCE=/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/reconcile-retention-of-inactive-native-g/packages/aethyme/rust/crates/aethyme-broker/src/collaboration_state.rs
+ORIGINAL_SHA256=998d698813a6ea3091e8445db54cc155b9b041633748c7c7cb86ee78761f0cd8
+MUTATION_BACKUP=/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/reconcile-retention-of-inactive-native-g/target/local-resume/mutation-backups/m3-disabled-schema23-old-client-trigger.Mqpbij
+ORIGINAL_SHA256=998d698813a6ea3091e8445db54cc155b9b041633748c7c7cb86ee78761f0cd8
+MUTANT_SHA256=8d7d3b37a4042e308d4290232673c1d785a34ec0a8a81de4b75b665eea3c8f0a
+APPLIED_SHA256=8d7d3b37a4042e308d4290232673c1d785a34ec0a8a81de4b75b665eea3c8f0a
+DIFF_BEGIN
+--- /Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/reconcile-retention-of-inactive-native-g/target/local-resume/mutation-backups/m3-disabled-schema23-old-client-trigger.Mqpbij	2026-10-15 15:25:02
++++ /Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/reconcile-retention-of-inactive-native-g/packages/aethyme/rust/crates/aethyme-broker/src/collaboration_state.rs	2026-10-15 15:48:10
+@@ -499,7 +499,7 @@
+     (23, "ALTER TABLE local_native_gate_jobs ADD COLUMN roots_released_ms INTEGER;
+     CREATE TRIGGER local_native_gate_no_dispatch_after_root_release
+     BEFORE UPDATE OF state ON local_native_gate_jobs
+-    WHEN OLD.roots_released_ms IS NOT NULL AND NEW.state<>OLD.state
++    WHEN 0
+     BEGIN SELECT RAISE(ABORT, 'native gate roots were released'); END;"),
+ ];
+ /// The file that marks a directory as a collaboration root.
+DIFF_END
+MUTANT_SOURCE_SHA256=8d7d3b37a4042e308d4290232673c1d785a34ec0a8a81de4b75b665eea3c8f0a
+CARGO_LOG_PATH=/Volumes/T7-repositories/Application Support/Aethyme/qualification/local-check-temporaries/native-guard-m3-disabled-schema23-old-client-trigger-tmp-bjtfj2h4/native-retention-m3-disabled-schema23-old-client-trigger-cargo.J0GaBB
+CARGO_EXIT=101
+   Compiling aethyme-broker v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/reconcile-retention-of-inactive-native-g/packages/aethyme/rust/crates/aethyme-broker)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 24.20s
+     Running unittests src/lib.rs (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/integrate-reviewed-local-bare-git-servic/target/local-resume/cargo/debug/deps/aethyme_broker-0f278e0d02146111)
+
+running 1 test
+test native_gates::tests::released_prepared_job_remains_readable_but_cannot_be_dispatched_or_replayed ... 
+thread 'native_gates::tests::released_prepared_job_remains_readable_but_cannot_be_dispatched_or_replayed' (504491) panicked at crates/aethyme-broker/src/native_gates/tests.rs:761:5:
+migration 23 trigger must fence a connection opened on schema 22
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+
+failures:
+    native_gates::tests::released_prepared_job_remains_readable_but_cannot_be_dispatched_or_replayed
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1819 filtered out; finished in 20.45s
+
+error: test failed, to rerun pass `-p aethyme-broker --lib`
+NAMED_ASSERTION_FAILURE_CONFIRMED=native_gates::tests::released_prepared_job_remains_readable_but_cannot_be_dispatched_or_replayed
+RESTORED_SHA256=998d698813a6ea3091e8445db54cc155b9b041633748c7c7cb86ee78761f0cd8
+BACKUP_PATH=/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/reconcile-retention-of-inactive-native-g/target/local-resume/mutation-backups/m3-disabled-schema23-old-client-trigger.Mqpbij
+BACKUP_SHA256=998d698813a6ea3091e8445db54cc155b9b041633748c7c7cb86ee78761f0cd8

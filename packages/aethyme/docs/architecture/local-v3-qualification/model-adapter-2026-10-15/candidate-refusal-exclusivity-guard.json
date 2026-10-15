@@ -1,0 +1,38 @@
+{
+  "source_head": "caef9cc94ca47b6f75f1d712e3e85359ccad55e1",
+  "source_runner_sha256": "2e3a93668a6aeae8c61e2579e909a91e1b17c50ee1a1b9e33ed615a94d3f2df8",
+  "named_test": "test_response_parser_accepts_exact_candidate_or_refusal_and_rejects_invalid",
+  "started_at_utc": "2026-10-15T09:31:45.725347+00:00",
+  "wall_seconds": 0.385,
+  "command": [
+    "/opt/homebrew/bin/uv",
+    "--cache-dir",
+    "/private/tmp/aethyme-fx17-pytest-e6e3109a-20261015/uv-cache",
+    "run",
+    "--offline",
+    "--no-project",
+    "--with",
+    "pytest",
+    "--",
+    "python",
+    "-m",
+    "pytest",
+    "-q",
+    "-p",
+    "no:cacheprovider",
+    "/private/tmp/aethyme-fx17-mutation-iz49pav8/tests/test_fx17_model_protocol.py::test_response_parser_accepts_exact_candidate_or_refusal_and_rejects_invalid"
+  ],
+  "working_directory": "/private/tmp/aethyme-fx17-mutation-iz49pav8",
+  "mutation": {
+    "old": "or response.get(\"refusal\") is not None",
+    "new": "or False",
+    "runner_sha256": "915c5c0f9c2d9f9a8c4f496c3bf773eee244f9ad6a4d63809ce00061ee8895d8"
+  },
+  "exit_code": 1,
+  "expected_exit_code": 1,
+  "source_exactly_restored": true,
+  "log_sha256": "36ba88e7e546cbc02ca5cbc12f83dded1c5202dbcf0708959f5861c9f0d26df1",
+  "log_bytes": 1759,
+  "provider_calls": 0,
+  "evaluator_calls": 0
+}
