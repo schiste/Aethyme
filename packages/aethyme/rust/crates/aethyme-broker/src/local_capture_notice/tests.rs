@@ -41,6 +41,180 @@ fn wave_policy() -> crate::local_wave::WavePolicy {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AdmissionEffects {
+    notices: i64,
+    outcomes: i64,
+    arrivals: i64,
+    waves: i64,
+    budget_projects: i64,
+    budget_objectives: i64,
+    budget_reservations: i64,
+    budget_receipts: i64,
+}
+
+fn admission_effects(store: &CollaborationStore) -> AdmissionEffects {
+    let connection = store.read_connection();
+    let count = |table: &str| {
+        connection
+            .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .unwrap()
+    };
+    AdmissionEffects {
+        notices: count("local_capture_notices"),
+        outcomes: count("local_capture_notice_outcomes"),
+        arrivals: count("local_wave_arrivals"),
+        waves: count("local_waves"),
+        budget_projects: count("local_budget_project"),
+        budget_objectives: count("local_budget_objectives"),
+        budget_reservations: count("local_budget_reservations"),
+        budget_receipts: count("local_budget_receipts"),
+    }
+}
+
+#[test]
+fn notice_ingress_refuses_unbound_issuer_revision_and_capture_without_effects() {
+    let mut f = Fixture::new();
+    let owner = target::acquire_controller(&mut f.store, "target", "appointed").unwrap();
+    let spec = f.spec();
+    let revision = target::propose_revision(&mut f.store, &owner, spec).unwrap();
+    target::select_revision(&mut f.store, &owner, &revision.id).unwrap();
+    let retained_a = f.a.clone();
+    let retained_b = f.b.clone();
+    let operation_a = capture(&mut f, &retained_a);
+    let operation_b = capture(&mut f, &retained_b);
+
+    let before = admission_effects(&f.store);
+    let wrong_target = ingest(
+        &mut f.store,
+        "other-target",
+        owner.issuer(),
+        &revision.id,
+        "A",
+        &operation_a,
+    );
+    assert!(matches!(wrong_target, Err(NoticeError::Stale)));
+    assert_eq!(admission_effects(&f.store), before);
+
+    let wrong_issuer = ingest(
+        &mut f.store,
+        owner.target(),
+        "different-issuer",
+        &revision.id,
+        "A",
+        &operation_a,
+    );
+    assert!(matches!(wrong_issuer, Err(NoticeError::Stale)));
+    assert_eq!(admission_effects(&f.store), before);
+
+    // B is retained and present in the revision catalog, but only A is
+    // selected. A retained object alone cannot make an unselected alias
+    // available to the target.
+    let unselected_alias = ingest(
+        &mut f.store,
+        owner.target(),
+        owner.issuer(),
+        &revision.id,
+        "B",
+        &operation_b,
+    );
+    assert!(matches!(unselected_alias, Err(NoticeError::Stale)));
+    assert_eq!(admission_effects(&f.store), before);
+
+    // A valid capture for B cannot be relabeled as the selected A input.
+    let mismatched_capture = ingest(
+        &mut f.store,
+        owner.target(),
+        owner.issuer(),
+        &revision.id,
+        "A",
+        &operation_b,
+    );
+    assert!(matches!(mismatched_capture, Err(NoticeError::Stale)));
+    assert_eq!(admission_effects(&f.store), before);
+
+    let mut next_spec = f.spec();
+    next_spec.objective = "reject notices for a superseded revision".into();
+    let next_revision = target::propose_revision(&mut f.store, &owner, next_spec).unwrap();
+    target::select_revision(&mut f.store, &owner, &next_revision.id).unwrap();
+    let before_stale_revision = admission_effects(&f.store);
+    let stale_revision = ingest(
+        &mut f.store,
+        owner.target(),
+        owner.issuer(),
+        &revision.id,
+        "A",
+        &operation_a,
+    );
+    assert!(matches!(stale_revision, Err(NoticeError::Stale)));
+    assert_eq!(admission_effects(&f.store), before_stale_revision);
+    assert_eq!(before_stale_revision.notices, 0);
+    assert_eq!(before_stale_revision.outcomes, 0);
+    assert_eq!(before_stale_revision.arrivals, 0);
+    assert_eq!(before_stale_revision.waves, 0);
+    assert_eq!(before_stale_revision.budget_reservations, 0);
+}
+
+#[test]
+fn owner_tick_marks_notice_from_old_epoch_stale_without_admission_effects() {
+    let mut f = Fixture::new();
+    let owner = target::acquire_controller(&mut f.store, "target", "appointed").unwrap();
+    let spec = f.spec();
+    let revision = target::propose_revision(&mut f.store, &owner, spec).unwrap();
+    target::select_revision(&mut f.store, &owner, &revision.id).unwrap();
+    let retained_a = f.a.clone();
+    let operation = capture(&mut f, &retained_a);
+    let receipt = ingest(
+        &mut f.store,
+        owner.target(),
+        owner.issuer(),
+        &revision.id,
+        "A",
+        &operation,
+    )
+    .unwrap();
+    assert_eq!(receipt.status, "pending");
+    let old_epoch = crate::local_authority::status(&f.store).unwrap().epoch;
+    drop(owner);
+
+    let frozen = crate::local_authority::freeze(
+        &mut f.store,
+        &old_epoch,
+        "exercise stale retained capture notice after epoch rotation",
+    )
+    .unwrap();
+    let resumed = crate::local_authority::resume(&mut f.store, &frozen.epoch).unwrap();
+    assert_ne!(resumed.epoch, old_epoch);
+
+    let next_owner = target::acquire_controller(&mut f.store, "target", "appointed").unwrap();
+    let admission = admit_for_owner(&mut f.store, &next_owner, wave_policy(), 0).unwrap();
+    assert!(matches!(
+        admission,
+        crate::local_wave::Admission::WaitingForInput { ref missing }
+            if missing.iter().any(|alias| alias == "A")
+    ));
+
+    let notices = list_for_target(&f.store, "target", 16).unwrap();
+    assert_eq!(notices.len(), 1);
+    assert_eq!(notices[0].id, receipt.id.as_str());
+    assert_eq!(notices[0].status, "stale");
+    assert_eq!(
+        notices[0].detail.as_deref(),
+        Some("authority epoch or selected target revision changed")
+    );
+    let after = admission_effects(&f.store);
+    assert_eq!(after.notices, 1);
+    assert_eq!(after.outcomes, 1);
+    assert_eq!(after.arrivals, 0);
+    assert_eq!(after.waves, 0);
+    assert_eq!(after.budget_projects, 0);
+    assert_eq!(after.budget_objectives, 0);
+    assert_eq!(after.budget_reservations, 0);
+    assert_eq!(after.budget_receipts, 0);
+}
+
 #[test]
 fn ingress_cannot_interleave_between_notice_drain_and_wave_admission() {
     let mut f = Fixture::new();
