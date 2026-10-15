@@ -1,0 +1,6 @@
+run=fx10-1123-heartbeat-regression-normal-approved-target
+command=cargo test --locked -j4 -p aethyme-broker --lib fx10_gate_child_start_waits_for_first_heartbeat -- --nocapture
+started=2026-10-15T09:31:31Z
+143d995220334d426934b330c54b9ba2f9a329db
+5b46a4281c56518c361643563e602d084f820b12a7ebec37614489a1b183ed32  crates/aethyme-broker/src/local_controller/drive_tests/sustained_arrivals.rs
+01aa466182a9054f5f4f0bd1f71fa1a3f2869ea731cee0f69ed0098a2b679ae1  ../../aethyme-eval/fx10/proposal-manifest.json
