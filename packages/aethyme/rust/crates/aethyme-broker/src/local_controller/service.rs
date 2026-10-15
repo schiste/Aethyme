@@ -113,11 +113,13 @@ pub fn serve(
         return Err(ControllerError::Mismatch);
     }
     carrier.check_broker(broker)?;
+    carrier.check()?;
+    let destination = super::bare_destination::validate_endpoint(&carrier.identity.push_url)?;
     let started = now()?;
     let deadline = started
         .checked_add(policy.max_elapsed_ms)
         .ok_or(ControllerError::Mismatch)?;
-    let record=Record::decode(&serde_json::to_vec(&json!({"schema":SERVICE_SCHEMA.name,"spec":{"target":owner.target(),"revision":revision.as_str(),"epoch":owner.authority_epoch().as_str(),"producer":permit.producer(),"producer_generation":permit.generation(),"verifier_policy":permit.policy().record()?.id().as_str(),"runtime":executor.runtime().id(),"transport":{"session":carrier.session,"remote_alias":carrier.remote,"destination":carrier.destination,"endpoint_sha256":ObjectDigest::of(carrier.identity.push_url.as_bytes()).hex()},"policy":policy,"started_ms":started,"deadline_ms":deadline}}))?,&[&SERVICE_SCHEMA]).map_err(|e|ControllerError::Canonical(e.to_string()))?;
+    let record=Record::decode(&serde_json::to_vec(&json!({"schema":SERVICE_SCHEMA.name,"spec":{"target":owner.target(),"revision":revision.as_str(),"epoch":owner.authority_epoch().as_str(),"producer":permit.producer(),"producer_generation":permit.generation(),"verifier_policy":permit.policy().record()?.id().as_str(),"runtime":executor.runtime().id(),"transport":{"session":carrier.session,"remote_alias":carrier.remote,"destination":carrier.destination,"endpoint_sha256":ObjectDigest::of(carrier.identity.push_url.as_bytes()).hex(),"bare_path_sha256":ObjectDigest::of(destination.path().as_os_str().as_encoded_bytes()).hex()},"policy":policy,"started_ms":started,"deadline_ms":deadline}}))?,&[&SERVICE_SCHEMA]).map_err(|e|ControllerError::Canonical(e.to_string()))?;
     let tx = store
         .connection()
         .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -168,22 +170,18 @@ pub fn serve(
             break;
         }
         report.ticks += 1;
-        let mut appointed = policy.drive.clone();
-        appointed.max_wall_ms = appointed.max_wall_ms.min(deadline - now()?);
-        if appointed.max_wall_ms <= 0 {
-            report.outcome = ServiceOutcome::Deadline;
-            break;
-        }
-        match drive(
+        match super::drive::drive_until(
             store,
             owner,
             broker,
             carrier,
             executor,
             permit,
-            &appointed,
+            &policy.drive,
             cancel,
             now()?,
+            Some(deadline),
+            Some(&destination),
         ) {
             Ok(DriveResult::Completed {
                 completion,
