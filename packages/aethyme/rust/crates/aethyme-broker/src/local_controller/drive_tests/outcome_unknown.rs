@@ -19,8 +19,9 @@ use crate::{
 use aethyme_contracts::experimental_v0::RecordId;
 use rusqlite::params;
 use serde_json::{Value, json};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
+use std::time::{Duration, Instant};
 
 const PINNED_IMAGE: &str =
     "sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251";
@@ -53,7 +54,133 @@ fn publication_operations(
 
 fn shell_quote(path: &Path) -> String {
     let path = path.to_str().expect("temporary path is UTF-8");
-    format!("'{}'", path.replace('\'', "'\\''"))
+    shell_quote_text(path)
+}
+
+fn shell_quote_text(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReceiverHookPids {
+    hook: libc::pid_t,
+    delay: libc::pid_t,
+}
+
+struct ReceiverHookProcess {
+    started: PathBuf,
+    finished: PathBuf,
+    marker: String,
+    armed: bool,
+    attempted: bool,
+    confirmed_exit: bool,
+}
+
+impl ReceiverHookProcess {
+    fn new(started: PathBuf, finished: PathBuf, marker: String) -> Self {
+        Self {
+            started,
+            finished,
+            marker,
+            armed: false,
+            attempted: false,
+            confirmed_exit: false,
+        }
+    }
+
+    fn arm(&mut self) {
+        self.armed = true;
+    }
+
+    fn wait_for_exit(&mut self) -> Result<ReceiverHookPids, String> {
+        if self.confirmed_exit {
+            return Err("receiver hook exit was already confirmed".into());
+        }
+        if !self.armed {
+            return Err("receiver hook cleanup guard was not armed".into());
+        }
+        if self.attempted {
+            return Err("receiver hook cleanup wait already exhausted its bound".into());
+        }
+        self.attempted = true;
+
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let mut last_problem = "receiver hook has not recorded its process identities".to_owned();
+        while Instant::now() < deadline {
+            let start_record = std::fs::read_to_string(&self.started)
+                .ok()
+                .and_then(|record| parse_hook_pids(&record, &self.marker).ok());
+            let finish_record = std::fs::read_to_string(&self.finished)
+                .ok()
+                .and_then(|record| parse_hook_pids(&record, &self.marker).ok());
+            match (start_record, finish_record) {
+                (Some(start), Some(finish)) if start == finish => {
+                    if !process_is_alive(start.hook) && !process_is_alive(start.delay) {
+                        self.confirmed_exit = true;
+                        return Ok(start);
+                    }
+                    last_problem = format!(
+                        "receiver hook recorded completion, but process IDs {} and {} remain present",
+                        start.hook, start.delay
+                    );
+                }
+                (Some(start), Some(finish)) => {
+                    last_problem = format!(
+                        "receiver hook start/completion identities differ: {start:?} vs {finish:?}"
+                    );
+                }
+                (Some(start), None) => {
+                    last_problem = format!(
+                        "receiver hook process IDs {} and {} have no matching completion record",
+                        start.hook, start.delay
+                    );
+                }
+                _ => {}
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        Err(format!(
+            "could not prove receiver hook {:?} exited within its 15-second cleanup bound: {last_problem}",
+            self.marker
+        ))
+    }
+}
+
+impl Drop for ReceiverHookProcess {
+    fn drop(&mut self) {
+        if self.armed && !self.attempted {
+            if let Err(error) = self.wait_for_exit() {
+                eprintln!("receiver hook cleanup was not proven: {error}");
+            }
+        }
+    }
+}
+
+fn parse_hook_pids(record: &str, expected_marker: &str) -> Result<ReceiverHookPids, String> {
+    let fields: Vec<_> = record.split_whitespace().collect();
+    if fields.len() != 3 || fields[2] != expected_marker {
+        return Err("receiver hook marker record is malformed or belongs to another hook".into());
+    }
+    let hook = fields[0]
+        .parse::<libc::pid_t>()
+        .map_err(|error| format!("receiver hook pid is invalid: {error}"))?;
+    let delay = fields[1]
+        .parse::<libc::pid_t>()
+        .map_err(|error| format!("receiver hook delay pid is invalid: {error}"))?;
+    if hook <= 1 || delay <= 1 || hook == delay {
+        return Err("receiver hook process IDs are not distinct child process IDs".into());
+    }
+    Ok(ReceiverHookPids { hook, delay })
+}
+
+fn process_is_alive(pid: libc::pid_t) -> bool {
+    // Observe only the two PIDs recorded by the unique receiver hook. Never
+    // send a signal: signal 0 probes existence, and PID reuse fails closed.
+    // SAFETY: `pid` is a parsed positive PID and signal 0 has no process effect.
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
 }
 
 #[test]
@@ -195,16 +322,34 @@ fn actual_unknown_publication_after_receiver_ref_update_never_completes() {
         ],
     );
     let hook_record = remote.join("hooks/post-receive-record");
+    let hook_started = remote.join("hooks/post-receive-started");
+    let hook_finished = remote.join("hooks/post-receive-finished");
     let hook = remote.join("hooks/post-receive");
+    let hook_marker = format!(
+        "receiver-{}",
+        remote
+            .file_name()
+            .expect("temporary receiver has a directory name")
+            .to_string_lossy()
+    );
     std::fs::write(
         &hook,
         format!(
-            "#!/bin/sh\nset -eu\n/usr/bin/cat > {}\nexec /bin/sleep 5\n",
-            shell_quote(&hook_record)
+            "#!/bin/sh\nset -eu\n/usr/bin/cat > {}\nhook_pid=$$\n/bin/sleep 5 &\ndelay_pid=$!\nprintf '%s %s %s\\n' \"$hook_pid\" \"$delay_pid\" {} > {}\nwait \"$delay_pid\"\nprintf '%s %s %s\\n' \"$hook_pid\" \"$delay_pid\" {} > {}\n",
+            shell_quote(&hook_record),
+            shell_quote_text(&hook_marker),
+            shell_quote(&hook_started),
+            shell_quote_text(&hook_marker),
+            shell_quote(&hook_finished),
         ),
     )
     .unwrap();
     std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let mut hook_process = ReceiverHookProcess::new(
+        hook_started.clone(),
+        hook_finished.clone(),
+        hook_marker.clone(),
+    );
 
     let mut broker = Broker::open(&repo)
         .unwrap()
@@ -236,6 +381,7 @@ fn actual_unknown_publication_after_receiver_ref_update_never_completes() {
         poll_ms: 20,
         max_elapsed_ms: 600000,
     };
+    hook_process.arm();
     let service = controller_service::serve(
         &mut f.store,
         &owner,
@@ -247,6 +393,9 @@ fn actual_unknown_publication_after_receiver_ref_update_never_completes() {
         &AtomicBool::new(false),
     )
     .unwrap();
+    let hook_pids = hook_process
+        .wait_for_exit()
+        .expect("receiver hook recorded completion and both owned processes exited");
 
     assert_eq!(service.outcome, ServiceOutcome::Held);
     assert!(service.completions.is_empty());
@@ -489,7 +638,7 @@ fn actual_unknown_publication_after_receiver_ref_update_never_completes() {
         "service": service,
         "operation": operation,
         "native_job": {
-            "id": native_job.id,
+            "id": native_job.id.to_string(),
             "spec": native_job.spec,
             "state": native_job.state,
             "observation": native_job.observation,
@@ -502,6 +651,14 @@ fn actual_unknown_publication_after_receiver_ref_update_never_completes() {
             "candidate": intent.spec.commit,
         },
         "receiver_update": receiver_record.trim(),
+        "receiver_process_cleanup": {
+            "marker": hook_marker,
+            "hook_pid": hook_pids.hook,
+            "delay_pid": hook_pids.delay,
+            "start_record": hook_started,
+            "finish_record": hook_finished,
+            "exited": true,
+        },
         "remote_ref": remote_commit,
         "run_state": run_state,
         "native_roots": native_roots,
