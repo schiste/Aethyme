@@ -1,0 +1,30 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.36s
+     Running unittests src/lib.rs (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/integrate-reviewed-local-bare-git-servic/target/local-resume/cargo/debug/deps/aethyme_broker-0f278e0d02146111)
+
+running 23 tests
+test collaboration_gc::tests::a_grace_shorter_than_a_plan_is_refused ... ok
+test collaboration_gc::tests::a_capture_without_an_outcome_blocks_reclamation_until_recovered ... ok
+test collaboration_gc::tests::a_non_blocking_capture_steps_aside_for_an_apply ... ok
+test collaboration_gc::tests::a_pin_keeps_one_object_as_cited_evidence ... ok
+test collaboration_gc::tests::a_reader_waits_for_an_apply_to_finish ... ok
+test collaboration_gc::tests::a_live_reader_lease_outlasts_an_expired_root ... ok
+test collaboration_gc::tests::gc_child_stalls_mid_apply ... ignored, child process of a_killed_apply_is_resumed
+test collaboration_gc::tests::a_receipt_reports_release_and_reclamation ... ok
+test collaboration_gc::tests::a_capture_racing_an_apply_waits_and_keeps_its_source ... ok
+test collaboration_gc::tests::apply_needs_the_archive_to_itself_and_a_current_plan ... ok
+test collaboration_gc::tests::a_released_contribution_is_reclaimed_as_a_unit_and_can_be_captured_again ... ok
+test collaboration_gc::tests::an_entry_created_after_the_plan_keeps_what_it_names ... ok
+test collaboration_gc::tests::a_killed_apply_is_resumed ... ok
+test collaboration_gc::tests::reusing_an_object_restarts_its_grace_period ... ok
+test collaboration_gc::tests::a_failure_mid_apply_resumes_without_losing_retained_source ... ok
+test collaboration_gc::tests::a_stale_plan_skips_what_became_rooted ... ok
+test collaboration_gc::tests::an_attached_brief_lives_and_goes_with_its_contribution ... ok
+test collaboration_gc::tests::lock_files_go_only_when_held_by_gc_and_not_retryable ... ok
+test collaboration_gc::tests::young_orphans_and_unrecognised_files_are_protected ... ok
+test collaboration_gc::tests::releasing_one_root_keeps_what_another_root_reaches ... ok
+test collaboration_gc::tests::rooted_source_is_never_reclaimed_and_every_receipt_reconstructs ... ok
+test collaboration_gc::tests::resume_keeps_the_copy_that_matches_its_name ... ok
+test collaboration_gc::tests::symlinked_directories_are_never_followed ... ok
+
+test result: ok. 22 passed; 0 failed; 1 ignored; 0 measured; 1797 filtered out; finished in 6.97s
+

@@ -1,6 +1,13 @@
 # Local v3 — L4 provisional composition fixtures (#664)
 
-Last Updated: 2026-10-10
+Last Updated: 2026-10-15
+
+> Historical checkpoint: the implementation and pending-work statements below
+> describe the original provisional profile. Current bounded E1, FX08, native-gate
+> and appointed-controller results are recorded in the
+> [Local qualification ledger](local-v3-qualification.md). Each original fixture
+> and profile keeps its own evidence and limits.
+
 
 L4 (#663–#665) depends on E1 (#650), which selects the composition profile and freezes
 the FX01–FX07 requirements and their behavior oracle. E1 has not run yet. To start L4

@@ -1,0 +1,129 @@
+{
+  "schema": "aethyme.analysis-view-mutation/v1",
+  "state": "complete",
+  "label": "mutation-unknown-holds-fail-closed",
+  "mode": "unknown-holds-fail-closed",
+  "expected_test_name": "unknown_holds_keep_views_during_plan_and_apply",
+  "source_path": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/fix-analysis-view-hold-retire-and-public/packages/aethyme/rust/crates/aethyme-broker/src/analysis_view.rs",
+  "source_before": {
+    "head": "d819d1758a341ee90fb7f6640865859295befef0",
+    "tree": "ddbf3de65d28a80321146d07462236d00248c710",
+    "status": "",
+    "diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  "source_file_sha256_before": "894a7eabef74810a95cfbdf333389356599f16e9a69ce8af1583e0c151d0ea08",
+  "source_file_mode_before": "0o644",
+  "backup_path": "/private/tmp/mutation-unknown-holds-fail-closed-k11tw1ko.bak",
+  "backup_sha256": "894a7eabef74810a95cfbdf333389356599f16e9a69ce8af1583e0c151d0ea08",
+  "started_at_utc": "2026-10-15T10:08:23.426479+00:00",
+  "mutator_stdout": "applied mutation unknown-holds-fail-closed to /Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/fix-analysis-view-hold-retire-and-public/packages/aethyme/rust/crates/aethyme-broker/src/analysis_view.rs\n",
+  "mutator_stderr": "",
+  "mutator_exit_code": 0,
+  "source_file_sha256_mutated": "d2eea4839fec23c7cf19b8cc8eef6c9d97e8a02407f31c7c29abf7a106d5d1ca",
+  "mutated_diff_sha256": "a37046f7e7301b91e06dc38e5a5caa85a0392829d8b1fc04edaef06770044ee8",
+  "command": [
+    "/usr/bin/python3",
+    "/private/tmp/aethyme-record-final-local-check.py",
+    "--root",
+    "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/fix-analysis-view-hold-retire-and-public",
+    "--label",
+    "mutation-unknown-holds-fail-closed",
+    "--target",
+    "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/integrate-reviewed-local-bare-git-servic/target/local-resume/cargo",
+    "--",
+    "cargo",
+    "test",
+    "--locked",
+    "-j4",
+    "-p",
+    "aethyme-broker",
+    "--lib",
+    "analysis_view::tests::unknown_holds_keep_views_during_plan_and_apply",
+    "--",
+    "--nocapture"
+  ],
+  "recorder_stdout": "{\"metadata\": \"/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/fix-analysis-view-hold-retire-and-public/target/local-resume/final-integration-20261015T100823Z/mutation-unknown-holds-fail-closed.json\", \"status\": 101, \"source_unchanged\": true, \"wall_seconds\": 36.794, \"summary_lines\": [\"    Finished `test` profile [unoptimized + debuginfo] target(s) in 35.50s\", \"     Running unittests src/lib.rs (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/integrate-reviewed-local-bare-git-servic/target/local-resume/cargo/debug/deps/aethyme_broker-0f278e0d02146111)\", \"running 1 test\", \"test analysis_view::tests::unknown_holds_keep_views_during_plan_and_apply ... FAILED\", \"test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1819 filtered out; finished in 0.50s\", \"error: test failed, to rerun pass `-p aethyme-broker --lib`\"]}\n",
+  "recorder_stderr": "",
+  "cargo_exit_code": 101,
+  "recorder_summary": {
+    "metadata": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/fix-analysis-view-hold-retire-and-public/target/local-resume/final-integration-20261015T100823Z/mutation-unknown-holds-fail-closed.json",
+    "status": 101,
+    "source_unchanged": true,
+    "wall_seconds": 36.794,
+    "summary_lines": [
+      "    Finished `test` profile [unoptimized + debuginfo] target(s) in 35.50s",
+      "     Running unittests src/lib.rs (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/integrate-reviewed-local-bare-git-servic/target/local-resume/cargo/debug/deps/aethyme_broker-0f278e0d02146111)",
+      "running 1 test",
+      "test analysis_view::tests::unknown_holds_keep_views_during_plan_and_apply ... FAILED",
+      "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1819 filtered out; finished in 0.50s",
+      "error: test failed, to rerun pass `-p aethyme-broker --lib`"
+    ]
+  },
+  "cargo_metadata_path": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/fix-analysis-view-hold-retire-and-public/target/local-resume/final-integration-20261015T100823Z/mutation-unknown-holds-fail-closed.json",
+  "cargo_metadata": {
+    "schema": "aethyme.local-check/v1",
+    "state": "complete",
+    "started_at_utc": "2026-10-15T10:08:23.513406+00:00",
+    "command": [
+      "/usr/bin/caffeinate",
+      "-i",
+      "/Users/christophehenner/.cargo/bin/cargo",
+      "test",
+      "--locked",
+      "-j4",
+      "-p",
+      "aethyme-broker",
+      "--lib",
+      "analysis_view::tests::unknown_holds_keep_views_during_plan_and_apply",
+      "--",
+      "--nocapture"
+    ],
+    "working_directory": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/fix-analysis-view-hold-retire-and-public/packages/aethyme/rust",
+    "environment": {
+      "PATH": "/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/christophehenner/.cargo/bin",
+      "RUSTC_WRAPPER": "",
+      "CARGO_TARGET_DIR": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/integrate-reviewed-local-bare-git-servic/target/local-resume/cargo"
+    },
+    "source_before": {
+      "head": "d819d1758a341ee90fb7f6640865859295befef0",
+      "tree": "ddbf3de65d28a80321146d07462236d00248c710",
+      "status": " M packages/aethyme/rust/crates/aethyme-broker/src/analysis_view.rs",
+      "diff_sha256": "a37046f7e7301b91e06dc38e5a5caa85a0392829d8b1fc04edaef06770044ee8"
+    },
+    "exit_code": 101,
+    "wall_seconds": 36.794,
+    "finished_at_utc": "2026-10-15T10:09:00.363636+00:00",
+    "source_after": {
+      "head": "d819d1758a341ee90fb7f6640865859295befef0",
+      "tree": "ddbf3de65d28a80321146d07462236d00248c710",
+      "status": " M packages/aethyme/rust/crates/aethyme-broker/src/analysis_view.rs",
+      "diff_sha256": "a37046f7e7301b91e06dc38e5a5caa85a0392829d8b1fc04edaef06770044ee8"
+    },
+    "log": {
+      "path": "target/local-resume/final-integration-20261015T100823Z/mutation-unknown-holds-fail-closed.log",
+      "bytes": 1161,
+      "sha256": "605b0140cdc88563812025aa33d14cc249effbade7fa6a8ca392ab48bfc82100"
+    },
+    "source_unchanged": true
+  },
+  "cargo_log_path": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/fix-analysis-view-hold-retire-and-public/target/local-resume/final-integration-20261015T100823Z/mutation-unknown-holds-fail-closed.log",
+  "cargo_log_sha256": "605b0140cdc88563812025aa33d14cc249effbade7fa6a8ca392ab48bfc82100",
+  "named_test_line": "test analysis_view::tests::unknown_holds_keep_views_during_plan_and_apply ... FAILED",
+  "log_has_compilation_error": false,
+  "log_has_test_binary": true,
+  "log_test_summary": "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1819 filtered out; finished in 0.50s",
+  "mutation_detected": true,
+  "source_file_sha256_restored": "894a7eabef74810a95cfbdf333389356599f16e9a69ce8af1583e0c151d0ea08",
+  "source_after_restore": {
+    "head": "d819d1758a341ee90fb7f6640865859295befef0",
+    "tree": "ddbf3de65d28a80321146d07462236d00248c710",
+    "status": "",
+    "diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  "restore_exact": true,
+  "finished_at_utc": "2026-10-15T10:09:00.471501+00:00",
+  "evidence_directory": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/fix-analysis-view-hold-retire-and-public/target/local-resume/final-integration-20261015T100823Z",
+  "mutation_detection_note": "First wrapper verdict was false because it selected the panic detail line containing the test name; raw harness line confirms the expected named test FAILED. Wrapper corrected to select lines beginning with test.",
+  "initial_wrapper_exit_code": 1,
+  "initial_wrapper_verdict": false
+}

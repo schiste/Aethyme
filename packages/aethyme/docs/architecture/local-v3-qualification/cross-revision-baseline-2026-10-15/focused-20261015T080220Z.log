@@ -1,0 +1,25 @@
+   Compiling aethyme-broker v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/implement-the-actual-fx17-20-controlled/packages/aethyme/rust/crates/aethyme-broker)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 32.03s
+     Running unittests src/lib.rs (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/integrate-reviewed-local-bare-git-servic/target/local-resume/cargo/debug/deps/aethyme_broker-20bbfe5c0b2dd5c0)
+
+running 3 tests
+test local_controller::drive::tests::cross_revision_completion_anchor_binds_candidate_parent_and_publication_lease ... 
+thread 'local_controller::drive::tests::cross_revision_completion_anchor_binds_candidate_parent_and_publication_lease' (22638462) panicked at crates/aethyme-broker/src/local_controller/drive_tests.rs:271:87:
+called `Result::unwrap()` on an `Err` value: SelectionRefused { reason: UnknownBase, detail: "B starts from sha256:75c049621a1d62d8db20d042bf4b6c7aa4d1e7518d66cd7e5891e175d99fb2d8, which is neither accepted history nor a known result" }
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+test local_controller::drive::tests::cross_revision_lookup_rejects_wrong_source_target_and_epoch ... ok
+test local_controller::drive::tests::cross_revision_stale_completion_epoch_is_rechecked_at_composition_and_completion_use ... 
+thread 'local_controller::drive::tests::cross_revision_stale_completion_epoch_is_rechecked_at_composition_and_completion_use' (22639981) panicked at crates/aethyme-broker/src/local_controller/drive_tests.rs:518:83:
+called `Result::unwrap()` on an `Err` value: SelectionRefused { reason: UnknownBase, detail: "B starts from sha256:75c049621a1d62d8db20d042bf4b6c7aa4d1e7518d66cd7e5891e175d99fb2d8, which is neither accepted history nor a known result" }
+FAILED
+
+failures:
+
+failures:
+    local_controller::drive::tests::cross_revision_completion_anchor_binds_candidate_parent_and_publication_lease
+    local_controller::drive::tests::cross_revision_stale_completion_epoch_is_rechecked_at_composition_and_completion_use
+
+test result: FAILED. 1 passed; 2 failed; 0 ignored; 0 measured; 1796 filtered out; finished in 5.48s
+
+error: test failed, to rerun pass `-p aethyme-broker --lib`

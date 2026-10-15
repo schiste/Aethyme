@@ -1,6 +1,13 @@
 # Local v3 finite candidate waves — provisional (#667)
 
-Last Updated: 2026-10-11
+Last Updated: 2026-10-15
+
+> Historical checkpoint: the implementation and pending-work statements below
+> describe the original provisional profile. Current bounded E1, FX08, native-gate
+> and appointed-controller results are recorded in the
+> [Local qualification ledger](local-v3-qualification.md). Each original fixture
+> and profile keeps its own evidence and limits.
+
 
 This internal reference driver builds on the provisional target model in #666
 and the provisional text composer in #664. It composes exact retained inputs;

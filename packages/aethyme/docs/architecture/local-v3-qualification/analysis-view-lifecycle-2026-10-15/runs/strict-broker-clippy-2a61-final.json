@@ -1,0 +1,47 @@
+{
+  "schema": "aethyme.local-check/v1",
+  "state": "complete",
+  "started_at_utc": "2026-10-15T10:21:25.073408+00:00",
+  "command": [
+    "/usr/bin/caffeinate",
+    "-i",
+    "/Users/christophehenner/.cargo/bin/cargo",
+    "clippy",
+    "--locked",
+    "-j4",
+    "-p",
+    "aethyme-broker",
+    "--lib",
+    "--tests",
+    "--",
+    "-D",
+    "warnings"
+  ],
+  "working_directory": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/fix-analysis-view-hold-retire-and-public/packages/aethyme/rust",
+  "environment": {
+    "PATH": "/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/christophehenner/.cargo/bin",
+    "RUSTC_WRAPPER": "",
+    "CARGO_TARGET_DIR": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/integrate-reviewed-local-bare-git-servic/target/local-resume/cargo"
+  },
+  "source_before": {
+    "head": "2a61bcf69759662a0014b6edb54d133163c97338",
+    "tree": "a4ec0df4b43ba81ce690a97160a816b4837ac68c",
+    "status": "",
+    "diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  "exit_code": 0,
+  "wall_seconds": 42.658,
+  "finished_at_utc": "2026-10-15T10:22:07.789602+00:00",
+  "source_after": {
+    "head": "2a61bcf69759662a0014b6edb54d133163c97338",
+    "tree": "a4ec0df4b43ba81ce690a97160a816b4837ac68c",
+    "status": "",
+    "diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  "log": {
+    "path": "target/local-resume/final-integration-20261015T102125Z/strict-broker-clippy-2a61-final.log",
+    "bytes": 2027,
+    "sha256": "dfbd15a6bec530cbeef00bb90e7e353d44f9484abc24b3c6033c25ba9f302f3a"
+  },
+  "source_unchanged": true
+}

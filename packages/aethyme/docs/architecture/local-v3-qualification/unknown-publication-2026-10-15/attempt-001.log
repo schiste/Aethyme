@@ -1,0 +1,20 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.57s
+     Running unittests src/lib.rs (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/integrate-reviewed-local-bare-git-servic/target/local-resume/cargo/debug/deps/aethyme_broker-20bbfe5c0b2dd5c0)
+
+running 1 test
+Controller actual unknown-publication evidence root /var/folders/f2/krjzd4c15nn491pm37zrkp1h0000gn/T/.tmpn7Ac8q
+Controller unknown-publication source host /var/folders/f2/krjzd4c15nn491pm37zrkp1h0000gn/T/.tmpUDE86p, repository /var/folders/f2/krjzd4c15nn491pm37zrkp1h0000gn/T/.tmpme5gnL
+
+thread 'local_controller::drive::tests::outcome_unknown::actual_unknown_publication_after_receiver_ref_update_never_completes' (21416112) panicked at crates/aethyme-broker/src/local_controller/drive_tests/outcome_unknown.rs:348:6:
+called `Result::unwrap()` on an `Err` value: Os { code: 2, kind: NotFound, message: "No such file or directory" }
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test local_controller::drive::tests::outcome_unknown::actual_unknown_publication_after_receiver_ref_update_never_completes ... FAILED
+
+failures:
+
+failures:
+    local_controller::drive::tests::outcome_unknown::actual_unknown_publication_after_receiver_ref_update_never_completes
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1795 filtered out; finished in 4.55s
+
+error: test failed, to rerun pass `-p aethyme-broker --lib`

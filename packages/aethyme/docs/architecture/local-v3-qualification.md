@@ -1,6 +1,6 @@
 # Local v3 qualification (#682)
 
-Last Updated: 2026-10-12
+Last Updated: 2026-10-15
 
 ## Scope and status
 
@@ -15,11 +15,15 @@ proof removals. It joined retained capture and advisory context, a finite
 provisional candidate wave, native Docker build, an independent artifact-only
 verifier, private generic Git acceptance, controlled new-root adoption and an
 isolated historical receiver. This is evidence for the declared finite profile.
-Q3, Q4 and the whole Local plan remain open: structural composition requires E1,
-native gate integration requires #725, live GitHub/Mergify requires an appointed
-Playground binding, and matched context trials require reviewed FX08 tasks.
-The explicit command surface has its own separately reviewed draft and finite
-qualification; autonomous target execution remains unsupported.
+E1, the native gate join and FX08 now have separate reviewed implementations and
+bounded results. The appointed controller completed the actual two-wave profile
+and a separate twenty-change controlled evolution run with nonempty native gates.
+All six once-final FX17 model rows failed at the provider's response-schema
+boundary, before producing candidates; none supplies behavioral evidence.
+Sustained-arrival service and final integration checks remain in progress. These
+finite observations do not establish reliable autonomous operation. All results
+below name their source and profile; earlier operator profiles retain their
+original limits.
 
 ## Evidence inventory
 
@@ -27,10 +31,10 @@ qualification; autonomous target execution remains unsupported.
 |---|---|---|
 | Revision identities, records, briefs and analysis envelope | #704–#710 | Independent canonical vectors and baseline AQ0 fixtures; records remain experimental |
 | Retained source, capture, roots and GC | #714–#719 | Capture/crash/cleanup schedules; bounded native workload and APFS retained-source pressure below; host/daemon and mid-journal exhaustion remain unqualified |
-| Bounded context and fresh analysis views | #718/#730/#731 | Scoped invalidation schedules; [FX08 proposed tasks](local-v3-qualification/fx08-task-proposal.md) await review before construction and freeze |
-| Composition and bounded resolution | #733–#736 | Provisional frozen fixtures; E1 must replace evidence and requalify T16–T23; held-outs are not rerun; [reachable request guards](local-v3-qualification/resolution-guards-2026-10-12.json) |
-| Targets, finite waves, budgets and native epoch | #737–#740 | Transition, arrival, reservation, stop and stale-authority schedules; finite native joined path below |
-| Exact execution, supervisor, verifier and resources | #741–#744 | Independent negative profiles and artifact checks; actual bounded tmpfs ENOSPC and cgroup OOM below; native gate join pending |
+| Bounded context and fresh analysis views | #718/#730/#731/#756 | Scoped invalidation schedules and [once-final FX08 campaign](local-v3-fx08-qualification.md): all 56 outcomes retained; reliable brief usefulness was not established |
+| Composition and bounded resolution | #733–#736/#755 | Historical provisional text profile plus [bounded external HTML structural profile](local-v3-e1-profile.md); semantic repair/consumer/subtraction evidence; original held-outs are not rerun; [reachable request guards](local-v3-qualification/resolution-guards-2026-10-12.json) |
+| Targets, finite waves, budgets and native epoch | #737–#740/#759/#763 | Transition, arrival, reservation, stop and stale-authority schedules; [actual appointed service and twenty-change evolution](local-v3-autonomous-controller.md); sustained-arrival qualification in progress; no general reliability claim |
+| Exact execution, supervisor, verifier and resources | #741–#744/#758 | Independent negative profiles and artifact checks; actual bounded tmpfs ENOSPC and cgroup OOM below; [typed native candidate/gate join](local-v3-native-gates.md) implemented on the Local branch |
 | Source publication and acceptance | #745/#746 | Real private generic Git and native appointed observations; live GitHub/Mergify binding pending |
 | Generation, exchange and controlled handoff | #747–#749 | Real child/open-file schedules; [handoff regression ledger](local-v3-qualification/handoff-restored-2026-10-11.json); real controlled native joined path below |
 | Retained export and isolated rehearsal | #750 | Independent receiver build after origin deletion; [restore regression and guard ledger](local-v3-qualification/restore-restored-2026-10-11.json); source/history only |
@@ -40,6 +44,35 @@ qualification; autonomous target execution remains unsupported.
 Each artifact names its tested source. A later parent fix does not turn
 historical evidence into evidence for a newer tree. Selected regression
 executions overlap; totals are executions, not unique tests.
+
+## Completed E1, FX08 and native integration
+
+[E1's profile record](local-v3-e1-profile.md) retains the original 34 outcomes:
+text 15/17 and structural 16/17. The separate browser matrix has 168 completed
+observations and verdicts of 8/9 text, 8/9 structural and 4/9 unmanaged Git. A
+real model-synthesized repair passed its independent consumer checks; subtraction
+passed without its dependent consumer and refused inseparable selections. The
+once-final sealed SH01 profile passed all four declared order/repeat runs.
+This supports the explicit external HTML profile, with its recorded license,
+source and fallback limits. It does not establish structural support for other
+formats or solve original FX04 without semantic resolution.
+
+[FX08's final campaign](local-v3-fx08-qualification.md) retains all 56 scheduled
+rows: 37 passes, 18 empty-source invalid proposals and one API-adapter refusal.
+All 37 executed proposals passed their required behavior checks. The results do
+not establish reliable brief usefulness; provider access/refusal confounds and
+unknown returned-model, retries and invoiced charges remain visible. Earlier
+startup failures are retained separately. Final held-out campaigns are complete
+and must not be rerun.
+
+The [native gate join](local-v3-native-gates.md) uses #725's typed candidate
+contract on the Local branch without changing that owner's original draft.
+Native observations remain separate from independent artifact verification and
+fresh provider acceptance. The [controller ledger](local-v3-qualification/controller-2026-10-15/ledger.json)
+records 19 passing ordinary controls, the failed first native scheduling attempt,
+the corrected actual two-wave pass and two named guard failures with actual exit
+101 and exact source restoration. Two waves do not establish sustained-load
+reliability or FX17. Later source changes require their own applicable checks.
 
 ## Restored selected regressions
 
@@ -151,16 +184,34 @@ every decision-key/path comparison arm was removed.
 
 ## Remaining Local requirements
 
-E1 (#650) is separately owned. When it lands, replace provisional fixture
-claims, adopt the selected structural engine as a new profile and requalify
-composition-dependent Local claims. Frozen fixtures are not edited to improve
-results. #725 must land before native verification candidate/gate integration;
-its schema collision with #719/#722 also requires integration-time reconciliation.
+FX17 has a passing twenty-change controlled native run at `c45d4096`, after two
+unsuccessful runs. Its [complete attempt ledger](../../../../target/local-resume/attempts-ledger.md)
+retains all three runs: 60 scheduled stage positions, 23 executed, 21 accepted,
+two held and 37 unrun. The successful run accepted C01–C20 with one fresh passing
+native gate and independent artifact verification per stage; all 65 earlier
+active obligations remained checked at every stage. It ran no model or sealed
+case. The [generic baseline repair's ledger](local-v3-qualification/cross-revision-baseline-2026-10-15/ledger.json)
+retains the earlier compiler/test failures, three focused passing controls, two
+named guard failures with exact source restoration, and source-bound follow-up
+checks. Those overlapping test executions are separate from the FX17 vectors.
+
+The separate once-final six-row model campaign produced six provider/CLI errors
+and zero candidate outputs. The provider rejected its response schema before
+model generation was observed. No held-out evaluator ran, and no baseline was
+substituted. All six assigned rows remain in the denominator; their consumed
+campaign is not retried. Correct/absent/misleading brief usefulness and held-out
+behavior remain unqualified. Provider retries and invoiced cost are unknown.
+A corrected generic schema adapter cannot retrospectively qualify those rows.
+
+The [receiver-timeout ledger](local-v3-qualification/unknown-publication-2026-10-15/ledger.json)
+separately records a passing actual control at `b16af023`: the remote ref moved,
+the managed write stayed unknown, replay was refused and no private completion
+was issued. This is one ambiguous-publication schedule. Sustained-arrival load
+and integrated final checks remain explicit qualification work.
 
 The operator must designate the disposable GitHub/Mergify repository, branch
-and policy before live-provider trials. FX08 task descriptions must be reviewed
-before their fixtures are constructed and frozen; the matched correct,
-absent and misleading brief trials retain every scheduled outcome. Optional
-analysis profiles require their separate decisions and applicable qualification.
-These outstanding requirements are not replaced by unit success or private
-provider traces.
+and policy before live-provider trials. Actual private GenericGit acceptance
+does not qualify that provider. Optional analysis profiles require their own
+execution decisions and applicable qualification; disabled optional profiles do
+not expand this Local claim. Neither historical receipts nor test success grant
+current execution, verifier, provider or publication authority.

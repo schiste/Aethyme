@@ -1,6 +1,13 @@
 # Local v3 — L4 provisional composer (#664)
 
-Last Updated: 2026-10-10
+Last Updated: 2026-10-15
+
+> Historical checkpoint: the implementation and pending-work statements below
+> describe the original provisional profile. Current bounded E1, FX08, native-gate
+> and appointed-controller results are recorded in the
+> [Local qualification ledger](local-v3-qualification.md). Each original fixture
+> and profile keeps its own evidence and limits.
+
 
 This record covers the first composer: plan §7.3 steps 1–5 over contributions the archive
 retained, emitting through the #663 candidate boundary. It is **provisional**. E1 (#650)

@@ -1,0 +1,227 @@
+{
+  "budget": {
+    "attempts": 3,
+    "consumed": 3,
+    "pending": 0,
+    "receipts": 3,
+    "reservations": 3
+  },
+  "evidence_root": "/var/folders/f2/krjzd4c15nn491pm37zrkp1h0000gn/T/.tmprAe1Yv",
+  "native_job": {
+    "id": "sha256:71640038628733f1080f33f5a9c0f8ccf2e2b24035413611bd80cd4b2325533d",
+    "observation": {
+      "candidate": {
+        "base_commit": "8d7f3c3b6b230b7a9425a10b49d8ad5dca912d81",
+        "baseline": "sha256:75c049621a1d62d8db20d042bf4b6c7aa4d1e7518d66cd7e5891e175d99fb2d8",
+        "commit": "cd72316f8ba5e502e169cfd4ac718717ba1648cb",
+        "epoch": "sha256:ba0d5ae63e8d7ded85a4cbaa880b52274ca36927242220b814b4f27e1ff1a525",
+        "execution_allowance_seconds": 300,
+        "inputs": [
+          "dda6bb2609a886f87a490208a96e12e0a615c13f"
+        ],
+        "max_dispatches": 1,
+        "policy_sha256": "c55f044e5dfea2f68d04eb878e31038e9883af3e711a7524633ba27816616089",
+        "profile": "aethyme.native-local-gates/experimental-v1",
+        "recipe": "75a7e1df7d4cc76c292339ecfe04e5b523a7945683dd2cb93a5de250d003a719",
+        "repository_common_dir": "/private/var/folders/f2/krjzd4c15nn491pm37zrkp1h0000gn/T/.tmpT5ijmz/.git",
+        "repository_root": "/private/var/folders/f2/krjzd4c15nn491pm37zrkp1h0000gn/T/.tmpT5ijmz",
+        "revision": "sha256:8e96f8440c4b78c51847e3f8eab1505122c43646151aa0758df8b80740998c01",
+        "subject": "sha256:d837f77f12ebf1ce4d434bf360b63dba754c3ba3b990be49295791ad85671bc9",
+        "target": "native-unknown-publication",
+        "tree": "4712a345780702b88d8aece2a47a1fa9fa55175f",
+        "wave": "sha256:4b45c418ff9c54452ae4fd307b4be708c5f44b89fab890df422e47efd875d15a"
+      },
+      "configured_gates": 0,
+      "current_authority": true,
+      "gates": [],
+      "graph": {
+        "changed_paths": [],
+        "enforced": false,
+        "policy_digest": "7f6a2dd9801f81a7682b6d838c49e6e929d8dce2535e4fc21216fd4ba4c51ded",
+        "reason": "repository does not declare committed graph fragments authoritative",
+        "status": "disabled",
+        "tree_hash": "4712a345780702b88d8aece2a47a1fa9fa55175f",
+        "verdict": "disabled"
+      },
+      "policy_sha256": "c55f044e5dfea2f68d04eb878e31038e9883af3e711a7524633ba27816616089",
+      "profile": "aethyme.native-local-gates/experimental-v1",
+      "provider_acceptance": false,
+      "selected_gates": 0,
+      "status": "no_configuration",
+      "trusted_evidence": false,
+      "wall_ms": 228
+    },
+    "spec": {
+      "base_commit": "8d7f3c3b6b230b7a9425a10b49d8ad5dca912d81",
+      "baseline": "sha256:75c049621a1d62d8db20d042bf4b6c7aa4d1e7518d66cd7e5891e175d99fb2d8",
+      "commit": "cd72316f8ba5e502e169cfd4ac718717ba1648cb",
+      "epoch": "sha256:ba0d5ae63e8d7ded85a4cbaa880b52274ca36927242220b814b4f27e1ff1a525",
+      "execution_allowance_seconds": 300,
+      "inputs": [
+        "dda6bb2609a886f87a490208a96e12e0a615c13f"
+      ],
+      "max_dispatches": 1,
+      "policy_sha256": "c55f044e5dfea2f68d04eb878e31038e9883af3e711a7524633ba27816616089",
+      "profile": "aethyme.native-local-gates/experimental-v1",
+      "recipe": "75a7e1df7d4cc76c292339ecfe04e5b523a7945683dd2cb93a5de250d003a719",
+      "repository_common_dir": "/private/var/folders/f2/krjzd4c15nn491pm37zrkp1h0000gn/T/.tmpT5ijmz/.git",
+      "repository_root": "/private/var/folders/f2/krjzd4c15nn491pm37zrkp1h0000gn/T/.tmpT5ijmz",
+      "revision": "sha256:8e96f8440c4b78c51847e3f8eab1505122c43646151aa0758df8b80740998c01",
+      "subject": "sha256:d837f77f12ebf1ce4d434bf360b63dba754c3ba3b990be49295791ad85671bc9",
+      "target": "native-unknown-publication",
+      "tree": "4712a345780702b88d8aece2a47a1fa9fa55175f",
+      "wave": "sha256:4b45c418ff9c54452ae4fd307b4be708c5f44b89fab890df422e47efd875d15a"
+    },
+    "state": "completed"
+  },
+  "native_roots": 5,
+  "object_roots": 13,
+  "operation": {
+    "agent_provenance": {
+      "caller": {
+        "pid": 95423,
+        "program": "node",
+        "started": "Thu Oct 15 08:40:13 2026"
+      },
+      "caller_process_chain": [
+        {
+          "pid": 800,
+          "program": "Application",
+          "started": "Thu Oct 15 09:23:07 2026"
+        },
+        {
+          "pid": 73859,
+          "program": "cargo",
+          "started": "Thu Oct 15 09:22:29 2026"
+        },
+        {
+          "pid": 73853,
+          "program": "Python",
+          "started": "Thu Oct 15 09:22:29 2026"
+        },
+        {
+          "pid": 95462,
+          "program": "codex",
+          "started": "Thu Oct 15 08:40:13 2026"
+        },
+        {
+          "pid": 95423,
+          "program": "node",
+          "started": "Thu Oct 15 08:40:13 2026"
+        }
+      ],
+      "holder": null,
+      "holder_binding_event_id": null,
+      "schema_version": 1,
+      "session_agent_identity": null
+    },
+    "authorization_reason": "Operator authorizes exact disposable local bare Git controller target",
+    "command_json": "[\"git\",\"push\",\"--porcelain\",\"--force-with-lease=refs/heads/accepted:8d7f3c3b6b230b7a9425a10b49d8ad5dca912d81\",\"controller-accepted\",\"cd72316f8ba5e502e169cfd4ac718717ba1648cb:refs/heads/accepted\"]",
+    "created_at": 1792049006066,
+    "details_json": "{\"budget\":\"2s\",\"classification\":\"inferred\",\"coordination_timing\":{\"hooks_outside_lock\":false,\"lock_acquired_at\":1792049006066,\"lock_hold_ms\":1943,\"lock_key\":\"local:/var/folders/f2/krjzd4c15nn491pm37zrkp1h0000gn/T/.tmpP239DH\",\"lock_released_at\":1792049008010,\"lock_wait_started_at\":1792049006066,\"queue_wait_ms\":0,\"ref_determination_ms\":null,\"ref_determination_succeeded\":null,\"schema_version\":1},\"failure_class\":\"coordinated_operation_timeout\",\"operation_liveness\":{\"heartbeat_at\":1792049008010,\"heartbeat_interval_ms\":10000,\"output_bytes\":0,\"phase\":\"executing coordinated operation\",\"progress\":\"executing coordinated operation\",\"progress_at\":1792049008010,\"schema_version\":1,\"stall_after_ms\":60000},\"preparation_ms\":172,\"provider_wait_ms\":1868,\"push_reconciliation\":{\"plan\":{\"destinations\":[{\"destination_ref\":\"refs/heads/accepted\",\"pre_push_sha\":\"8d7f3c3b6b230b7a9425a10b49d8ad5dca912d81\",\"proposed_sha\":\"cd72316f8ba5e502e169cfd4ac718717ba1648cb\"}],\"remote\":\"controller-accepted\"},\"planning\":\"planned\"},\"remote_outcome\":\"unknown\",\"resolved_target\":{\"coordination_key\":\"local:/var/folders/f2/krjzd4c15nn491pm37zrkp1h0000gn/T/.tmpP239DH\",\"display_slug\":\"/var/folders/f2/krjzd4c15nn491pm37zrkp1h0000gn/T/.tmpP239DH\",\"evidence\":{\"caller_assertion\":\"not_supplied\",\"command_selection\":\"explicit_argument\",\"fetch\":{\"source\":\"git_remote_get_url\",\"syntax\":\"local_path\"},\"identity\":\"fetch_and_push_matched\",\"push\":{\"source\":\"git_remote_get_push_url\",\"syntax\":\"local_path\"}},\"fetch_url\":\"/var/folders/f2/krjzd4c15nn491pm37zrkp1h0000gn/T/.tmpP239DH\",\"normalized_host\":\"local\",\"push_url\":\"/var/folders/f2/krjzd4c15nn491pm37zrkp1h0000gn/T/.tmpP239DH\",\"remote_name\":\"controller-accepted\",\"repository_path\":\"/var/folders/f2/krjzd4c15nn491pm37zrkp1h0000gn/T/.tmpP239DH\"},\"stage\":\"executing coordinated operation\"}",
+    "effect": "destructive",
+    "exit_code": null,
+    "finished_at": 1792049008010,
+    "host_operation_id": "c9c5fbc7dcd05d766d08a9420f3a9423",
+    "id": 2,
+    "identity_provenance": "verified_canonical",
+    "pid": 800,
+    "provider": "git",
+    "repository": "local:/var/folders/f2/krjzd4c15nn491pm37zrkp1h0000gn/T/.tmpP239DH",
+    "scope": "local-source-transport:sha256:d6aad220970384f83c6969da2b673e0ef4ffff91205ee6487820460a36b71961",
+    "session_id": 1,
+    "status": "outcome_unknown",
+    "updated_at": 1792049008010
+  },
+  "private_acceptance": {
+    "completions": 0,
+    "qualifications": 0,
+    "receipts": 0
+  },
+  "profile": "aethyme.local-controller/actual-publication-outcome-unknown-v1",
+  "receiver": "/var/folders/f2/krjzd4c15nn491pm37zrkp1h0000gn/T/.tmpP239DH",
+  "receiver_process_cleanup": {
+    "delay_pid": 12410,
+    "exited": true,
+    "finish_record": "/var/folders/f2/krjzd4c15nn491pm37zrkp1h0000gn/T/.tmpP239DH/hooks/post-receive-finished",
+    "hook_pid": 12391,
+    "marker": "receiver-.tmpP239DH",
+    "start_record": "/var/folders/f2/krjzd4c15nn491pm37zrkp1h0000gn/T/.tmpP239DH/hooks/post-receive-started"
+  },
+  "receiver_update": "8d7f3c3b6b230b7a9425a10b49d8ad5dca912d81 cd72316f8ba5e502e169cfd4ac718717ba1648cb refs/heads/accepted",
+  "remote_ref": "cd72316f8ba5e502e169cfd4ac718717ba1648cb",
+  "replay_refused": true,
+  "repository": "/var/folders/f2/krjzd4c15nn491pm37zrkp1h0000gn/T/.tmpT5ijmz",
+  "run_state": "unknown",
+  "runtime": {
+    "api": "1.54",
+    "architecture": "arm64",
+    "client": "sha256:95e661f587166c7b3cd6b5877e6f23a2fc8e423c7466e26d289660fbd83c886b",
+    "components": [
+      {
+        "Details": {
+          "ApiVersion": "1.54",
+          "Arch": "arm64",
+          "BuildTime": "Wed May 20 14:39:25 2026",
+          "Experimental": "false",
+          "GitCommit": "568f755",
+          "GoVersion": "go1.26.3",
+          "KernelVersion": "6.8.0-117-generic",
+          "MinAPIVersion": "1.40",
+          "Module": "github.com/moby/moby/v2",
+          "ModuleVersion": "v2.0.0+unknown",
+          "Os": "linux"
+        },
+        "Name": "Engine",
+        "Version": "29.5.2"
+      },
+      {
+        "Details": {
+          "GitCommit": "193637f7ee8ae5f5aa5248f49e7baa3e6164966e"
+        },
+        "Name": "containerd",
+        "Version": "v2.2.4"
+      },
+      {
+        "Details": {
+          "GitCommit": "v1.3.5-0-g488fc13e"
+        },
+        "Name": "runc",
+        "Version": "1.3.5"
+      },
+      {
+        "Details": {
+          "GitCommit": "de40ad0"
+        },
+        "Name": "docker-init",
+        "Version": "0.19.0"
+      }
+    ],
+    "daemon_id": "9c943a04-41ca-4943-a8f5-c5734144b14b",
+    "endpoint": "unix:///Volumes/T7-repositories/Colima/home/default/docker.sock",
+    "engine": "29.5.2",
+    "kernel": "6.8.0-117-generic",
+    "native": "sha256:46b0804ec5818e721b3aa1aeccce8e7e8bcb81e9ed3cb5c4ff8d198e30f61ceb",
+    "policy": "rootfs-ro;uid65534;caps-none;nnp;seccomp-builtin;network-none;private-pid-ipc-cgroup;cpu1;swap-none;pids-bounded;tmpfs-output-bounded;no-logs;no-healthcheck;env-clear;no-cache;timeout-pid1-v0",
+    "profile": "aethyme.docker-linux/offline-v0"
+  },
+  "service": {
+    "appointment": "sha256:7a128975eecd316f102a68d15e65728cd1d33601bc1e65fde2017697731cbac4",
+    "completions": [],
+    "detail": "Canonical repository local:/var/folders/f2/krjzd4c15nn491pm37zrkp1h0000gn/T/.tmpP239DH is now write-blocked because a coordinated write has an unknown outcome.\nOperation ID: 2\nInspect remote Git refs for canonical repository local:/var/folders/f2/krjzd4c15nn491pm37zrkp1h0000gn/T/.tmpP239DH at scope local-source-transport:sha256:d6aad220970384f83c6969da2b673e0ef4ffff91205ee6487820460a36b71961 to determine whether the write took effect.\nIf external inspection proves the write succeeded, run:\n  aethyme broker advanced operations reconcile --operation 2 --outcome succeeded --reason \"external inspection confirmed operation 2 took effect\"\nIf external inspection proves the write failed, run:\n  aethyme broker advanced operations reconcile --operation 2 --outcome failed --reason \"external inspection confirmed operation 2 did not take effect\"\nBlind retry is forbidden until operation 2 is reconciled.",
+    "epoch": "sha256:ba0d5ae63e8d7ded85a4cbaa880b52274ca36927242220b814b4f27e1ff1a525",
+    "outcome": "held",
+    "revision": "sha256:8e96f8440c4b78c51847e3f8eab1505122c43646151aa0758df8b80740998c01",
+    "target": "native-unknown-publication",
+    "ticks": 1
+  },
+  "source_host": "/var/folders/f2/krjzd4c15nn491pm37zrkp1h0000gn/T/.tmpif4YvL",
+  "source_transport": {
+    "candidate": "cd72316f8ba5e502e169cfd4ac718717ba1648cb",
+    "dispatched": 1,
+    "intent": "sha256:d6aad220970384f83c6969da2b673e0ef4ffff91205ee6487820460a36b71961",
+    "observation": "unobserved",
+    "receipt_present": false
+  },
+  "target_roots": 18
+}

@@ -1,0 +1,100 @@
+{
+  "attempt": "actual-unknown-publication-repair1",
+  "previous_attempt": {
+    "name": "actual-unknown-publication-1",
+    "exit_code": 101,
+    "result": "0 passed; 1 failed; ENOENT writing remote/hooks/post-receive before service dispatch",
+    "log": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/implement-the-actual-fx17-20-controlled/target/local-resume/actual-unknown-publication.log",
+    "source_root": "/var/folders/f2/krjzd4c15nn491pm37zrkp1h0000gn/T/.tmpUDE86p",
+    "repository_root": "/var/folders/f2/krjzd4c15nn491pm37zrkp1h0000gn/T/.tmpme5gnL",
+    "evidence_root": "/var/folders/f2/krjzd4c15nn491pm37zrkp1h0000gn/T/.tmpn7Ac8q",
+    "root_cause": "empty fixture templates do not create bare receiver hooks directory"
+  },
+  "worktree": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/implement-the-actual-fx17-20-controlled",
+  "workspace": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/implement-the-actual-fx17-20-controlled/packages/aethyme/rust",
+  "source": {
+    "head": "dafca2995069420fd75fb82a2496a05ffe93ef5a",
+    "tree": "52836ed2a724d83d08c8b10d9d471789f2af1d1b",
+    "status_porcelain": ""
+  },
+  "argv": [
+    "/usr/bin/caffeinate",
+    "-i",
+    "/Users/christophehenner/.cargo/bin/cargo",
+    "test",
+    "--locked",
+    "-j",
+    "4",
+    "-p",
+    "aethyme-broker",
+    "--lib",
+    "--",
+    "--ignored",
+    "--exact",
+    "local_controller::drive::tests::outcome_unknown::actual_unknown_publication_after_receiver_ref_update_never_completes",
+    "--nocapture"
+  ],
+  "environment": {
+    "HOME": "/Users/christophehenner",
+    "TMPDIR": "/var/folders/f2/krjzd4c15nn491pm37zrkp1h0000gn/T/",
+    "PATH": "/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/christophehenner/.cargo/bin",
+    "RUSTC_WRAPPER": "",
+    "CARGO_TARGET_DIR": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/integrate-reviewed-local-bare-git-servic/target/local-resume/cargo",
+    "AETHYME_DOCKER_CLI": "/opt/homebrew/bin/docker",
+    "AETHYME_DOCKER_TEST_IMAGE": "sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251"
+  },
+  "pinned_image": {
+    "requested": "sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251",
+    "inspected_id": "sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251",
+    "inspect_status": 0
+  },
+  "finite_profile": {
+    "cargo_profile": "test (default, non-release)",
+    "cargo_jobs": 4,
+    "test_threads": "Rust test harness default; exact filter selects one test",
+    "service": {
+      "max_ticks": 32,
+      "max_completions": 1,
+      "poll_ms": 20,
+      "max_elapsed_ms": 600000
+    },
+    "git_carrier": {
+      "operation_timeout_seconds": 2,
+      "target": "disposable local bare Git receiver"
+    },
+    "docker_resources": {
+      "memory_mib": 2048,
+      "disk_mib": 2048,
+      "process_slots": 1024,
+      "job_slots": 2,
+      "host_floor_bytes": 1,
+      "daemon_floor_bytes": 1
+    },
+    "project_budget": {
+      "time_ms": 1000000000,
+      "memory_bytes": 68719476736,
+      "disk_bytes": 68719476736,
+      "slots": 100,
+      "max_root_reservations": 32
+    },
+    "case": "single retained assertion; receiver post-receive hook delays 5 seconds after ref update"
+  },
+  "log": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/implement-the-actual-fx17-20-controlled/target/local-resume/actual-unknown-publication-repair1.log",
+  "status_file": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/implement-the-actual-fx17-20-controlled/target/local-resume/actual-unknown-publication-repair1.status",
+  "report_copy": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/implement-the-actual-fx17-20-controlled/target/local-resume/actual-unknown-publication-repair1-report.json",
+  "preflight": "passed",
+  "started_at_utc": "2026-10-15T07:09:28.196383+00:00",
+  "finished_at_utc": "2026-10-15T07:11:02.351527+00:00",
+  "elapsed_seconds": 94.086,
+  "numeric_exit_code": 101,
+  "test_result_lines": [
+    "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1795 filtered out; finished in 50.59s"
+  ],
+  "source_unchanged": {
+    "head": "dafca2995069420fd75fb82a2496a05ffe93ef5a",
+    "tree": "52836ed2a724d83d08c8b10d9d471789f2af1d1b",
+    "status_porcelain": ""
+  },
+  "report_source": null,
+  "report_copied": false
+}

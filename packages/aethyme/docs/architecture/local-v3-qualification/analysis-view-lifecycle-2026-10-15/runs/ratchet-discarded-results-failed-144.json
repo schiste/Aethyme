@@ -1,0 +1,44 @@
+{
+  "schema": "aethyme.local-check/v1",
+  "state": "complete",
+  "started_at_utc": "2026-10-15T10:13:47.243406+00:00",
+  "command": [
+    "/usr/bin/caffeinate",
+    "-i",
+    "/Users/christophehenner/.cargo/bin/cargo",
+    "test",
+    "--locked",
+    "-j4",
+    "-p",
+    "aethyme-testkit",
+    "--test",
+    "broker_discarded_results"
+  ],
+  "working_directory": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/fix-analysis-view-hold-retire-and-public/packages/aethyme/rust",
+  "environment": {
+    "PATH": "/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/christophehenner/.cargo/bin",
+    "RUSTC_WRAPPER": "",
+    "CARGO_TARGET_DIR": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/integrate-reviewed-local-bare-git-servic/target/local-resume/cargo"
+  },
+  "source_before": {
+    "head": "d819d1758a341ee90fb7f6640865859295befef0",
+    "tree": "ddbf3de65d28a80321146d07462236d00248c710",
+    "status": "",
+    "diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  "exit_code": 101,
+  "wall_seconds": 1.9,
+  "finished_at_utc": "2026-10-15T10:13:49.193056+00:00",
+  "source_after": {
+    "head": "d819d1758a341ee90fb7f6640865859295befef0",
+    "tree": "ddbf3de65d28a80321146d07462236d00248c710",
+    "status": "",
+    "diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  "log": {
+    "path": "target/local-resume/final-integration-20261015T101347Z/ratchet-discarded-results.log",
+    "bytes": 7915,
+    "sha256": "779d66636098377dc28196cff690ee0cc1bbd093b8814e1eef34ec48e4b32991"
+  },
+  "source_unchanged": true
+}

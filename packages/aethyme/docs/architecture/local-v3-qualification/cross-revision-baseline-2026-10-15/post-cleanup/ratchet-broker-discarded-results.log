@@ -1,0 +1,64 @@
+SOURCE_BOUND_METADATA
+{
+  "run": "ratchet-broker-discarded-results",
+  "started_utc": "2026-10-15T08:34:22.781090+00:00",
+  "cwd": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/implement-the-actual-fx17-20-controlled/packages/aethyme/rust",
+  "head": "c45d4096f9d0238b800ccadbeb07f9b93ae30a3e",
+  "head_tree": "874654af26ac7fd9bbaa9bedbc7a04fa8a834e40",
+  "worktree_status": "",
+  "diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "local_wave_sha256": "c5f8bc4e98e87dcb0a069f6f1b4a301c4557b705c2a258d8f58b823139883a09",
+  "argv": [
+    "/usr/bin/caffeinate",
+    "-i",
+    "cargo",
+    "test",
+    "--locked",
+    "-j4",
+    "-p",
+    "aethyme-testkit",
+    "--test",
+    "broker_discarded_results"
+  ],
+  "env": {
+    "PATH": "/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/christophehenner/.cargo/bin",
+    "RUSTC_WRAPPER": "",
+    "CARGO_TARGET_DIR": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/integrate-reviewed-local-bare-git-servic/target/local-resume/cargo"
+  },
+  "foreground_caffeinate": true
+}
+CARGO_OUTPUT_BEGIN
+   Compiling proc-macro2 v1.0.106
+   Compiling quote v1.0.45
+   Compiling libc v0.2.190
+   Compiling serde_core v1.0.229
+   Compiling once_cell v1.21.4
+   Compiling syn v3.0.6
+   Compiling errno v0.3.14
+   Compiling getrandom v0.4.2
+   Compiling rustix v1.1.4
+   Compiling cpufeatures v0.2.17
+   Compiling sha2 v0.10.9
+   Compiling tempfile v3.27.0
+   Compiling serde_json v1.0.151
+   Compiling serde_derive v1.0.229
+   Compiling serde v1.0.229
+   Compiling serde_spanned v0.6.9
+   Compiling toml_datetime v0.6.11
+   Compiling aethyme-testkit v0.1.0 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/implement-the-actual-fx17-20-controlled/packages/aethyme/rust/crates/aethyme-testkit)
+   Compiling toml_edit v0.22.27
+   Compiling toml v0.8.23
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 7.00s
+     Running tests/broker_discarded_results.rs (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/integrate-reviewed-local-bare-git-servic/target/local-resume/cargo/debug/deps/broker_discarded_results-442fcffc8b5f3902)
+
+running 3 tests
+test out_of_line_test_modules_are_not_counted_and_plain_modules_are ... ok
+test test_items_are_not_counted ... ok
+test broker_production_code_does_not_discard_more_results ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.27s
+
+
+CARGO_OUTPUT_END
+NUMERIC_EXIT_STATUS=0
+WALL_SECONDS=7.503

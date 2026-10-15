@@ -7,8 +7,11 @@ composition, native gates, Docker build, independent artifact verification,
 private GenericGit acceptance and proof-bound completion. The actual two-wave
 profile passed locally. Its [qualification ledger](local-v3-qualification/controller-2026-10-15/ledger.json)
 retains the successful run, the earlier failed scheduling attempt and two
-intentional guard failures. FX17 and broader autonomous reliability remain
-separate qualification requirements.
+intentional guard failures. A separate controlled FX17 run accepted twenty
+changes with nonempty native gates and independent artifact checks at every
+stage. Its once-final model campaign produced six provider errors and no
+candidates. Sustained-arrival qualification is in progress; broader autonomous
+reliability remains unqualified.
 
 ## Appointment and authority
 
@@ -102,7 +105,43 @@ no credit. CI at `0d72131d` passed workspace tests, lint, examples/doctests,
 Windows smoke and the product path.
 
 This finite result supplies an actual autonomous positive and later-arrival
-continuation. It does not establish sustained-load reliability. The actual
-receiver-timeout control, FX17's twenty accepted controlled changes and separate
-held-out model cases require their own reviewed runs and complete denominators.
-Retain failures, blocks, exclusions, budget uncertainty and observed costs.
+continuation. It does not establish sustained-load reliability.
+
+The [receiver-timeout control](local-v3-qualification/unknown-publication-2026-10-15/ledger.json)
+passed at `b16af023`: one explicit native test, zero failures, exit 0. The receiver actually updated its ref before the managed
+push timed out. The service held, classified the run as unknown and refused
+replay; no private acceptance receipt, qualification or completion was issued.
+Retained roots and charged reservations remained visible, and both owned hook
+processes exited. Two earlier fixture failures remain part of the attempt
+history. This demonstrates one ambiguous publication schedule; it does not
+establish behavior under repeated external ref movement.
+
+The first FX17 native attempt stopped before execution because its owned host
+resource directory was not private. After correcting only that fixture's mode,
+the second attempt accepted C01 and held C02. Its journal exposed an incorrect
+baseline commit across immutable target revisions: candidate ancestry and the
+publication lease used an older provenance commit despite selecting the accepted
+source bytes. The stale lease correctly refused publication. That sequence is
+failed, with one accepted change out of twenty required. The generic baseline
+repair received focused regression and guard-removal checks plus independent
+review. At clean source `c45d4096`, the third complete native attempt passed:
+C01–C20 each accepted in one tick, with one current-authority native gate, one
+independent artifact-verifier receipt and one private completion. Each candidate
+has the immediately previous accepted commit as its actual parent and publication
+lease. All 65 frozen obligations were checked per stage (1,300 expected vector
+comparisons). The [attempt ledger](../../../../target/local-resume/attempts-ledger.md)
+retains source, command, image, reports and every unsuccessful attempt.
+
+Across the three actual runs, 60 stage positions were scheduled: 23 executed,
+21 accepted, two held and 37 unrun. A separate launcher-path error started no
+Cargo process or stage. The original disposable checkout retained its `main`
+HEAD and clean tracked status; controlled contribution refs were created and
+runtime paths remained untracked. This is not a claim of no ref writes.
+
+The six separate once-final FX17 model attempts all failed with provider/CLI
+errors before any candidate output. Their private behavioral evaluator had
+nothing to execute. The campaign remains consumed and is not rerun. Thus the
+controlled evolution profile passed, while held-out model behavior and brief
+usefulness remain unqualified. Sustained-arrival service and integrated final
+checks remain separate work. This finite result supplies no general reliability
+claim; conservative budget units are not invoiced provider cost.
