@@ -1,0 +1,22 @@
+   Compiling aethyme-broker v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/implement-deterministic-t45-gc-and-stora/packages/aethyme/rust/crates/aethyme-broker)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 29.31s
+     Running unittests src/lib.rs (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/integrate-reviewed-local-bare-git-servic/target/local-resume/cargo/debug/deps/aethyme_broker-0f278e0d02146111)
+
+running 1 test
+test execution_resources::qualification::actual_pressure_preserves_retained_source_and_bounded_native_cleanup ... Local QA durable host journal /Volumes/T7-repositories/Application Support/Aethyme/qualification/local-check-temporaries/t45-gc-docker-bounded-positive-4b5f3bc-tmp-f1wibzbt/.tmpXaZLL0
+Local QA retained stable source root /Volumes/T7-repositories/Application Support/Aethyme/qualification/local-check-temporaries/t45-gc-docker-bounded-positive-4b5f3bc-tmp-f1wibzbt/.tmp1Zz62w
+
+thread 'execution_resources::qualification::actual_pressure_preserves_retained_source_and_bounded_native_cleanup' (2176535) panicked at crates/aethyme-broker/src/local_qualification.rs:229:9:
+exact native builder never became running
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+Local QA recovery preserved at /Volumes/T7-repositories/Application Support/Aethyme/qualification/local-check-temporaries/t45-gc-docker-bounded-positive-4b5f3bc-tmp-f1wibzbt/.tmpXaZLL0; source roots ["/Volumes/T7-repositories/Application Support/Aethyme/qualification/local-check-temporaries/t45-gc-docker-bounded-positive-4b5f3bc-tmp-f1wibzbt/.tmp1Zz62w"]
+FAILED
+
+failures:
+
+failures:
+    execution_resources::qualification::actual_pressure_preserves_retained_source_and_bounded_native_cleanup
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1830 filtered out; finished in 73.19s
+
+error: test failed, to rerun pass `-p aethyme-broker --lib`

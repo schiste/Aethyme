@@ -1,0 +1,7 @@
+{
+  "archive_shared_reader_held": true,
+  "errno": 28,
+  "error": "/Volumes/T7-repositories/Application Support/Aethyme/qualification/local-check-temporaries/t45-gc-apfs-source-pressure-positive-4b5f3bc-tmp-m7bukujf/.tmp8VK9Y3/owned-volume/aethyme-execution-K1tVeH/source/pressure-bytes.bin: No space left on device (os error 28)",
+  "gc_apply": "pending_at_error_gate",
+  "journal_headroom_bytes": 16777216
+}

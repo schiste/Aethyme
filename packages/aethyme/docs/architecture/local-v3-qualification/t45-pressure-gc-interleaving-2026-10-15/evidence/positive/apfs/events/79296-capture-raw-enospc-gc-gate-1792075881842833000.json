@@ -1,0 +1,7 @@
+{
+  "archive_shared_reader_held": true,
+  "errno": 28,
+  "error": "<archive temporary>: No space left on device (os error 28)",
+  "gc_apply": "pending_at_error_gate",
+  "journal_headroom_bytes": 16777216
+}

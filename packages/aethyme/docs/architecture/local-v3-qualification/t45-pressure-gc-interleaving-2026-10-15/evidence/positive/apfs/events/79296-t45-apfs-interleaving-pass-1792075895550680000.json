@@ -1,0 +1,17 @@
+{
+  "build_or_verifier_claimed": false,
+  "capture_fault": "raw_mid_copy_enospc",
+  "capture_gc_contentions": 2,
+  "capture_preflight": "passed_real_floor",
+  "capture_receipt": false,
+  "execution_temp_residue": 0,
+  "host_or_daemon_pressure": false,
+  "hydration_fault": "raw_reconstruction_enospc",
+  "hydration_gc_contentions": 2,
+  "materialized_inputs_returned": false,
+  "partial_result_objects": false,
+  "post_fault_gc": "actual_apply_reclaimed_named_orphans",
+  "profile": "owned-apfs-source-pressure/provisional-v0",
+  "retained_a_exact": true,
+  "retained_b_exact": true
+}

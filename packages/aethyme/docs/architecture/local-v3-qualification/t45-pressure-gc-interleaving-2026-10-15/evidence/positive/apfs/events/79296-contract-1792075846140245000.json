@@ -1,0 +1,7 @@
+{
+  "capacity_bytes": 536870912,
+  "cleanup_confirmed": false,
+  "image": "/Volumes/T7-repositories/Application Support/Aethyme/qualification/local-check-temporaries/t45-gc-apfs-source-pressure-positive-4b5f3bc-tmp-m7bukujf/.tmp8VK9Y3/owned-source.asif",
+  "mount": "/Volumes/T7-repositories/Application Support/Aethyme/qualification/local-check-temporaries/t45-gc-apfs-source-pressure-positive-4b5f3bc-tmp-m7bukujf/.tmp8VK9Y3/owned-volume",
+  "profile": "owned-apfs-source-pressure/provisional-v0"
+}
