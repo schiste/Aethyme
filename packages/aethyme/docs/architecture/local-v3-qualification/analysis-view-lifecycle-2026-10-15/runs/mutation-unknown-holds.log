@@ -1,0 +1,19 @@
+   Compiling aethyme-broker v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/fix-analysis-view-hold-retire-and-public/packages/aethyme/rust/crates/aethyme-broker)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 35.50s
+     Running unittests src/lib.rs (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/integrate-reviewed-local-bare-git-servic/target/local-resume/cargo/debug/deps/aethyme_broker-0f278e0d02146111)
+
+running 1 test
+
+thread 'analysis_view::tests::unknown_holds_keep_views_during_plan_and_apply' (25503820) panicked at crates/aethyme-broker/src/analysis_view.rs:1878:42:
+called `Result::unwrap_err()` on an `Ok` value: ()
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test analysis_view::tests::unknown_holds_keep_views_during_plan_and_apply ... FAILED
+
+failures:
+
+failures:
+    analysis_view::tests::unknown_holds_keep_views_during_plan_and_apply
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1819 filtered out; finished in 0.50s
+
+error: test failed, to rerun pass `-p aethyme-broker --lib`
