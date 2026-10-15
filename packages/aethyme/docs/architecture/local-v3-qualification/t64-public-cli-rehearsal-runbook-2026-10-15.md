@@ -23,7 +23,7 @@ Use the following byte-frozen, unexecuted inputs. Hash the files again at launch
 | run-profile authorization digest | `97141fc4726634b958525e24142e7b148c97c4c9db8352bca786cf339c4e5629` | External project-budget authorization label |
 | objective authorization label | `b4f3c4f1455da88b58924dce2fd8487f4f3afd3d935f584bfcfbffc71f346a9c` | External target label, not permission |
 | phase/path clarification v2 | `57e057476b25e7b5bdb2cf797e8794371509fbf373ee20dca3338cb23acd93e5` | Superseded by v3; retained unchanged |
-| phase/path clarification v3 (`/private/tmp/aethyme-t64-phase-clarification-v3-8wa1pv3o/clarification.json`) | `7b3e65ab82e53526646483cca2f299d8d8792ef80d05e9ed86afca9c248f990a` | Independently reviewed pretrial ordering and host-state child-path interpretation; byte-identical copy at `target/local-resume/frozen-pretrial-20261015/t64-phase-clarification-20261015/clarification-v3.json` |
+| phase/path clarification v3 (`/private/tmp/aethyme-t64-phase-clarification-v3-8wa1pv3o/clarification.json`) | `7b3e65ab82e53526646483cca2f299d8d8792ef80d05e9ed86afca9c248f990a` | Independently reviewed pretrial ordering and host-state child-path interpretation |
 | application `source/app.sh` | `8851e393268aae2a0007acecbdc56050276b3de586a3e79c7236ee2a592a8e2d` | Frozen seed source |
 | `source/lib/greeting.sh` | `fb1f2cd7900b03a00648ddbaf8f18dce61b5cff27a1caeec14873de6c2ae409c` | Frozen seed source |
 | `source/lib/math.sh` | `e89cb7689486c429f6f0df217d377962f860e3f93f3fb0f4feceb25ebcbe6ac8` | Frozen seed source |
@@ -41,7 +41,21 @@ Frozen runtime identity: Docker CLI `/opt/homebrew/bin/docker`; endpoint `unix:/
 
 ## Operator isolation and launch manifest
 
-The run root is the exact already-prepared, never-used directory `/private/tmp/aethyme-local-t64-run-hn4e6o_5`; do not create a substitute or clean/reset it. The independently reviewed phase/path clarification v3 explicitly binds this path and its child paths without changing the frozen profile. At prebootstrap, independently `lstat` the root and each profile-bound payload directory (`source`, `harness`, `state`, `native-host`, `native-temporary`, `artifacts`, `bin`, `receipts`): require current non-root uid, mode `0700`, no symlink, and no entries. Record each status, device, inode, uid, mode, and checked enumeration status. Any error or existing payload ends the trial; never erase or reuse contents. Frozen profile/checklist/completion files at the root are the documented metadata exception.
+The run root is the exact already-prepared, never-used directory `/private/tmp/aethyme-local-t64-run-hn4e6o_5`; do not create a substitute or clean/reset it. The independently reviewed phase/path clarification v3 explicitly binds this path and its child paths without changing the frozen profile. Its external file is `/private/tmp/aethyme-t64-phase-clarification-v3-8wa1pv3o/clarification.json`; do not expect a second copy in this worktree. At prebootstrap, independently `lstat` the root and each profile-bound payload directory (`source`, `harness`, `state`, `native-host`, `native-temporary`, `artifacts`, `bin`, `receipts`): require current non-root uid, mode `0700`, no symlink, and no entries. Record each status, device, inode, uid, mode, and checked enumeration status. The root itself may contain only those eight payload directories and the nine byte-frozen metadata files listed below; reject missing or extra root entries. Each metadata file must be a regular non-symlink owned by the current uid, mode `0644`, and match its expected SHA-256. In particular, preserve superseded `filesystem-preflight.json` and `prepared-manifest.json` byte-exact; do not overwrite or treat them as current preflight evidence.
+
+| Exact root metadata entry | SHA-256 |
+|---|---|
+| `filesystem-preflight.json` (superseded) | `c6a30fd6e4aa2d8111c2a2d65bb1bc91dae03e7fa0cbb3b304b04a70e03b2a70` |
+| `prepared-manifest.json` (superseded) | `ba0d3f282a58166d59501ce8509541c62ec069f0693a972e3193079b7ee5fe49` |
+| `run-profile.json` (superseded) | `c424342e1405286a023072332521b36c94550b26b253404366f8348868f85719` |
+| `run-profile-v2.json` (superseded) | `97141fc4726634b958525e24142e7b148c97c4c9db8352bca786cf339c4e5629` |
+| `prelaunch-checklist.json` (superseded) | `c08155cdc69819413cfff104e4a438f0ef521930afe7a02be74f829d771d272f` |
+| `run-profile-v3.json` | `c5b6887b680bd136622f6728a9fad430ba3c31cbfa44da2cd72a2efa836eccc1` |
+| `prelaunch-checklist-v2.json` | `c159fcd6a69c3e76bee44bead99733af6a7ede6702461900b9591231419c1782` |
+| `operator-completion-v1.json` | `6e106d8a9164b0c8cd149d7627657653cca996dcb8ac4ba7148749a254cfddcb` |
+| `operator-labels-v1.json` | `fa4df5e8737560d5c52a39f99d1c76648970fd7cfa2edeb18c39fd8d15bd80cb` |
+
+The eight payload directories must be empty at prebootstrap. Any error, unexpected root entry, hash mismatch, or existing payload ends the trial; never erase or reuse contents.
 
 The fixed gate-control root is `/private/tmp/aethyme-local-t64-operator-v3-d4cbdvtq/control`; the frozen gate embeds it. The prebootstrap directory checker below records this root's initial empty state before any receipt is written. Only after that receipt succeeds, perform the separate checked control-root inspection and preserve its output/status. Repeat the same check immediately before arming. Do not use the superseded `/private/tmp/aethyme-local-t64-operator-k3igk063/control` path.
 
@@ -90,7 +104,7 @@ export OPERATOR_AGENT_IDENTITY='<operator Name <operator@example.com>>'
 
 Run the shell blocks in one `/bin/bash` operator session with `set -euo pipefail` and `umask 077`. A block that reports an error ends the attempt; do not repeat a write into the same fixed receipt path.
 
-The profile files are at `$RUN_ROOT/run-profile-v3.json`, `$RUN_ROOT/prelaunch-checklist-v2.json`, and `$RUN_ROOT/operator-completion-v1.json`; the frozen selection inputs are in `/private/tmp/aethyme-local-t64-zero-exit-v1-kx19p4p_`, public briefs and source/oracle inputs are in `/private/tmp/aethyme-local-t64-inputs-v2-qqslzo4a`, and gate inputs are in `/private/tmp/aethyme-local-t64-operator-v3-d4cbdvtq`. Copy the public briefs to the private receipts directory and verify them against the table above. Only the operator reads or copies `harness/expected-literals.json`.
+The profile files are at `$RUN_ROOT/run-profile-v3.json`, `$RUN_ROOT/prelaunch-checklist-v2.json`, and `$RUN_ROOT/operator-completion-v1.json`; the frozen selection inputs are in `/private/tmp/aethyme-local-t64-zero-exit-v1-kx19p4p_`, public briefs and source/oracle inputs are in `/private/tmp/aethyme-local-t64-inputs-v2-qqslzo4a`, and gate inputs are in `/private/tmp/aethyme-local-t64-operator-v3-d4cbdvtq`. Do not copy the binary or either brief into the prepared run root before the prebootstrap checker succeeds. Only the operator reads or copies `harness/expected-literals.json`.
 
 Build the exact reviewed commit before any Playground command. Record `git -C "$AETHYME_SOURCE" rev-parse HEAD`, tree, and full status; require a clean worktree. Do not run this block until the exclusive runtime handoff names a shared T7 `CARGO_TARGET_DIR`; never place a Rust target under `/private/tmp`. The target path must be written literally into `00-prebootstrap.json`. Use four jobs, an empty compiler wrapper and the workspace lockfile:
 
@@ -100,13 +114,13 @@ export RUSTC_WRAPPER=''
 cd "$AETHYME_SOURCE/packages/aethyme/rust"
 /usr/bin/caffeinate -i cargo build --locked -j4 -p aethyme-cli --bin aethyme
 test -x "$CARGO_TARGET_DIR/debug/aethyme" || exit 1
-/usr/bin/install -m 0700 "$CARGO_TARGET_DIR/debug/aethyme" "$AETHYME_BIN"
-shasum -a 256 "$AETHYME_BIN"
-"$AETHYME_BIN" --version
+CLI_SHA256="$(shasum -a 256 "$CARGO_TARGET_DIR/debug/aethyme" | awk '{print $1}')"
+printf 'built_cli_sha256=%s\n' "$CLI_SHA256"
+"$CARGO_TARGET_DIR/debug/aethyme" --version
 git -C "$AETHYME_SOURCE" status --porcelain=v1
 ```
 
-The final launch manifest records the exact build command, source before/after status, binary SHA-256, and warmed compiler-cache limitation. Do not claim a source-pinned binary until the build and checks are completed. The rehearsal itself uses this binary and does not compile. Keep the real `HOME`; do not copy credentials into the run root.
+The final launch manifest records the exact build command, source before/after status, binary SHA-256, and warmed compiler-cache limitation. Do not claim a source-pinned binary until the build and checks are completed. The rehearsal itself uses this binary and does not compile. Keep the real `HOME`; do not copy credentials into the run root. The build writes only to the authorized shared T7 Cargo target; it does not install into `$RUN_ROOT/bin` before prebootstrap.
 
 Before any Playground CLI call, make a checked preflight receipt. Record `id -u`, `/usr/bin/stat -f '%d %i %u %Lp'` for all eight prepared paths and the fixed control root, and checked `find` status/emptiness. Confirm `/private/tmp` and the T7 endpoint are mounted as expected; do not clear or repurpose anything. Record versions of `/usr/bin/python3`, `/usr/bin/git`, `jq`, the pinned Docker CLI, and the Rust toolchain used by the already-reviewed build. Read-only Docker and disk capacity checks use only the pinned CLI/endpoint:
 
@@ -122,16 +136,61 @@ Require daemon `9c943a04-41ca-4943-a8f5-c5734144b14b`, Docker 29.5.2, Linux/aarc
 
 Run a checked preflight over every prepared directory before writing into any payload directory. This checker is an operator utility, not part of Aethyme. Preserve the exact checker bytes/hash, stdout, and exit status. It checks ownership/mode and enumerates each directory; it writes its result only after the initially empty `receipts` directory has been checked:
 
-```python
+```sh
+CHECKER_DIR="$(/usr/bin/mktemp -d /private/tmp/aethyme-t64-prebootstrap.XXXXXX)"
+CHECKER="$CHECKER_DIR/checker.py"
+cat > "$CHECKER" <<'PY'
 #!/usr/bin/python3
-import json, os, pathlib, stat, sys
+import hashlib, json, os, pathlib, stat, sys
 
 root = pathlib.Path(sys.argv[1])
+expected_root = pathlib.Path("/private/tmp/aethyme-local-t64-run-hn4e6o_5")
+if root != expected_root:
+    raise SystemExit(f"refuse unexpected run root: {root}")
 payloads = ("source", "harness", "state", "native-host", "native-temporary",
             "artifacts", "bin", "receipts")
+metadata_sha256 = {
+    "filesystem-preflight.json": "c6a30fd6e4aa2d8111c2a2d65bb1bc91dae03e7fa0cbb3b304b04a70e03b2a70",
+    "prepared-manifest.json": "ba0d3f282a58166d59501ce8509541c62ec069f0693a972e3193079b7ee5fe49",
+    "run-profile.json": "c424342e1405286a023072332521b36c94550b26b253404366f8348868f85719",
+    "run-profile-v2.json": "97141fc4726634b958525e24142e7b148c97c4c9db8352bca786cf339c4e5629",
+    "prelaunch-checklist.json": "c08155cdc69819413cfff104e4a438f0ef521930afe7a02be74f829d771d272f",
+    "run-profile-v3.json": "c5b6887b680bd136622f6728a9fad430ba3c31cbfa44da2cd72a2efa836eccc1",
+    "prelaunch-checklist-v2.json": "c159fcd6a69c3e76bee44bead99733af6a7ede6702461900b9591231419c1782",
+    "operator-completion-v1.json": "6e106d8a9164b0c8cd149d7627657653cca996dcb8ac4ba7148749a254cfddcb",
+    "operator-labels-v1.json": "fa4df5e8737560d5c52a39f99d1c76648970fd7cfa2edeb18c39fd8d15bd80cb",
+}
+if root.is_symlink() or not root.is_absolute():
+    raise SystemExit("refuse symlink or non-absolute run root")
+uid = os.getuid()
+if uid == 0:
+    raise SystemExit("refuse root operator uid")
+root_st = os.lstat(root)
+if not stat.S_ISDIR(root_st.st_mode) or root_st.st_uid != uid or stat.S_IMODE(root_st.st_mode) != 0o700:
+    raise SystemExit(f"refuse run-root owner/mode/type: {root}")
+expected_root_entries = set(payloads) | set(metadata_sha256)
+actual_root_entries = {entry.name for entry in os.scandir(root)}
+if actual_root_entries != expected_root_entries:
+    missing = sorted(expected_root_entries - actual_root_entries)
+    extra = sorted(actual_root_entries - expected_root_entries)
+    raise SystemExit(f"refuse unexpected run-root entries: missing={missing} extra={extra}")
+metadata_rows = []
+for name, expected_sha256 in sorted(metadata_sha256.items()):
+    path = root / name
+    st = os.lstat(path)
+    if not stat.S_ISREG(st.st_mode) or stat.S_ISLNK(st.st_mode):
+        raise SystemExit(f"refuse non-regular metadata or symlink: {path}")
+    mode = stat.S_IMODE(st.st_mode)
+    if st.st_uid != uid or mode != 0o644:
+        raise SystemExit(f"refuse metadata owner/mode mismatch: {path}")
+    actual_sha256 = hashlib.sha256(path.read_bytes()).hexdigest()
+    if actual_sha256 != expected_sha256:
+        raise SystemExit(f"refuse metadata hash mismatch: {path}")
+    metadata_rows.append({"name": name, "device": st.st_dev, "inode": st.st_ino,
+                          "uid": st.st_uid, "mode": format(mode, "04o"),
+                          "sha256": actual_sha256})
 paths = [root, *(root / name for name in payloads),
          pathlib.Path("/private/tmp/aethyme-local-t64-operator-v3-d4cbdvtq/control")]
-uid = os.getuid()
 rows = []
 for path in paths:
     st = os.lstat(path)
@@ -149,15 +208,47 @@ for path in paths:
 out = root / "receipts" / "prebootstrap-paths.json"
 fd = os.open(out, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
 with os.fdopen(fd, "w", encoding="utf-8") as stream:
-    json.dump({"uid": uid, "paths": rows}, stream, sort_keys=True, separators=(",", ":"))
+    json.dump({"uid": uid, "paths": rows, "metadata": metadata_rows},
+              stream, sort_keys=True, separators=(",", ":"))
     stream.write("\n")
     stream.flush()
     os.fsync(stream.fileno())
+dir_fd = os.open(out.parent, os.O_RDONLY)
+try:
+    os.fsync(dir_fd)
+finally:
+    os.close(dir_fd)
+PY
+chmod 0600 "$CHECKER"
+CHECKER_SHA256="$(shasum -a 256 "$CHECKER" | awk '{print $1}')"
+printf 'checker_sha256=%s\n' "$CHECKER_SHA256"
+if /usr/bin/python3 "$CHECKER" "$RUN_ROOT" >"$CHECKER_DIR/stdout.txt" 2>"$CHECKER_DIR/stderr.txt"; then
+  CHECKER_STATUS=0
+else
+  CHECKER_STATUS=$?
+fi
+printf '%s\n' "$CHECKER_STATUS" >"$CHECKER_DIR/status"
+test "$CHECKER_STATUS" -eq 0
 ```
 
-Invoke it with `/usr/bin/python3 checker.py "$RUN_ROOT"`; check and preserve the command status rather than suppressing errors. The root may contain frozen profile/checklist/completion/clarification metadata and the historical `filesystem-preflight.json` and `prepared-manifest.json`; preserve those two files byte-exact as superseded preparation metadata and do not treat them as current preflight evidence. The run root's `run-profile.json`, `run-profile-v2.json`, and `prelaunch-checklist.json` are also superseded; v3 profile, checklist v2, completion v1 and the independently reviewed clarification v3 govern this rehearsal. Each of the eight payload directories and the fixed gate-control directory must be empty. Any failure ends the trial without cleanup, substitution or reset.
+Record `CHECKER_DIR`, `CHECKER_SHA256`, stdout, stderr, and status in `00-prebootstrap.json`. The checker rejects any missing or extra root entry, validates all nine metadata files against the pinned hashes and metadata, checks all eight payload directories and the fixed gate-control directory empty, and only then creates `receipts/prebootstrap-paths.json`. The receipt file and its parent directory are fsynced before success is reported. The historical `filesystem-preflight.json` and `prepared-manifest.json` remain byte-exact superseded metadata; `run-profile.json`, `run-profile-v2.json`, and `prelaunch-checklist.json` are also superseded. The v3 profile, checklist v2, completion v1 and independently reviewed clarification v3 govern this rehearsal. Any failure ends the trial without cleanup, substitution or reset.
 
-After `receipts/prebootstrap-paths.json` has been durably written, define and run this checked control-root inspection. This ordering keeps `receipts` empty for the prebootstrap checker while retaining the control-root inspection. Run `check_control_root control-prearm` after setup and immediately before freezing `03-predispatch.json`; after that phase is frozen, run `check_control_root control-arm-boundary` immediately before the arm script. Bind the first check into `03-predispatch.json` and the second check's files/status into `03-arm.json`:
+After `receipts/prebootstrap-paths.json` has been durably written, the eight payload directories have been checked empty. Now install the previously built CLI and copy the public briefs into their designated receipt files; verify every copied byte before continuing. These are the first writes into `bin` and the brief files are not needed to run the checker:
+
+```sh
+test ! -e "$AETHYME_BIN"
+/usr/bin/install -m 0700 "$CARGO_TARGET_DIR/debug/aethyme" "$AETHYME_BIN"
+test "$(shasum -a 256 "$AETHYME_BIN" | awk '{print $1}')" = "$CLI_SHA256"
+"$AETHYME_BIN" --version
+test ! -e "$RUN_ROOT/receipts/public-brief-A.md"
+test ! -e "$RUN_ROOT/receipts/public-brief-B.md"
+/usr/bin/install -m 0600 "$INPUTS/CONTRIBUTOR-A.md" "$RUN_ROOT/receipts/public-brief-A.md"
+/usr/bin/install -m 0600 "$INPUTS/CONTRIBUTOR-B.md" "$RUN_ROOT/receipts/public-brief-B.md"
+test "$(shasum -a 256 "$RUN_ROOT/receipts/public-brief-A.md" | awk '{print $1}')" = d644536d7b72906b8a116a6968dcafc481f09bc761ae842bf114c9ba885a8313
+test "$(shasum -a 256 "$RUN_ROOT/receipts/public-brief-B.md" | awk '{print $1}')" = 1a235f96bb823a9ce3dc6fa12b5b2d1a2567d900a3d36bab4135f4000b1a6482
+```
+
+Then define and run this checked control-root inspection. This ordering keeps `receipts` empty for the prebootstrap checker while retaining the control-root inspection. Run `check_control_root control-prearm` after setup and immediately before freezing `03-predispatch.json`; after that phase is frozen, run `check_control_root control-arm-boundary` immediately before the arm script. Bind the first check into `03-predispatch.json` and the second check's files/status into `03-arm.json`:
 
 ```sh
 check_control_root() {
