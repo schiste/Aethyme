@@ -37,6 +37,14 @@ fn completed_freeze_rebinds_the_frozen_epoch_and_allows_sensitive_quarantine() {
     .unwrap();
     assert_eq!(status.state, "quarantined");
     assert_eq!(status.incident_id, incident);
+    let archive_probe = crate::collaboration_gc::try_admin_exclusive(&f.store)
+        .unwrap()
+        .expect("archive barrier should be released after quarantine");
+    drop(archive_probe);
+    let response_probe = crate::collaboration_sensitive::try_response_exclusive(&f.store)
+        .unwrap()
+        .expect("response barrier should be released after quarantine");
+    drop(response_probe);
     let retry = crate::collaboration_sensitive::quarantine(
         &mut f.store,
         &incident,
