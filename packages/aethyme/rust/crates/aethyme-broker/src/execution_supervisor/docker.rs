@@ -64,7 +64,15 @@ impl Connection {
             ));
         }
         let path = Path::new(endpoint.strip_prefix("unix://").expect("checked prefix"));
+        let raw_path = path.as_os_str().to_string_lossy();
+        let mut components = raw_path.split('/');
+        let has_canonical_components = components.next() == Some("")
+            && components.clone().next().is_some()
+            && components.all(|part| !part.is_empty() && part != "." && part != "..");
         if !path.is_absolute()
+            || raw_path.contains('%')
+            || raw_path.ends_with('/')
+            || !has_canonical_components
             || path.components().any(|part| {
                 matches!(
                     part,
