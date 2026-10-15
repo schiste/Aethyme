@@ -1,0 +1,11 @@
+--- a/packages/aethyme/rust/crates/aethyme-broker/src/collaboration_sensitive.rs
++++ b/packages/aethyme/rust/crates/aethyme-broker/src/collaboration_sensitive.rs
+@@ -1597,7 +1597,7 @@
+     ] {
+         collect_tree(store, path, &mut files, &mut unknown)?;
+     }
+-    for path in [Path::new("generations"), Path::new("import-rehearsals")] {
++    for path in [Path::new("import-rehearsals")] {
+         let root = path.to_string_lossy().into_owned();
+         let prefix = format!("{root}/");
+         if collect_managed_copy_tree(store, path, &mut files, &mut unknown).is_err() {

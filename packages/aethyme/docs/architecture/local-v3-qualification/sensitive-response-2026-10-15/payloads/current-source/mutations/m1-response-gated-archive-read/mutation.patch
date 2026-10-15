@@ -1,0 +1,10 @@
+--- a/packages/aethyme/rust/crates/aethyme-broker/src/collaboration_archive.rs
++++ b/packages/aethyme/rust/crates/aethyme-broker/src/collaboration_archive.rs
+@@ -470,7 +470,6 @@
+     store: &CollaborationStore,
+     digest: &ObjectDigest,
+ ) -> Result<Vec<u8>, ArchiveError> {
+-    let _response = crate::collaboration_sensitive::response_use(store)?;
+     read_object_unlocked(store, digest, None)
+ }
+ 

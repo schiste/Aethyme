@@ -1,0 +1,11 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.47s
+     Running unittests src/lib.rs (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/integrate-reviewed-local-bare-git-servic/target/local-resume/cargo/debug/deps/aethyme_broker-0f278e0d02146111)
+
+running 4 tests
+test collaboration_sensitive::tests::managed_copy_cleanup_preserves_and_records_an_untracked_entry_then_retries ... ok
+test collaboration_sensitive::tests::managed_copy_cleanup_recovers_partial_removal_and_cleans_generation_and_import_parents ... ok
+test collaboration_sensitive::tests::managed_copy_cleanup_refuses_changed_directory_type_and_retries_after_restoration ... ok
+test collaboration_sensitive::tests::managed_copy_cleanup_refuses_symlink_without_following_and_retries_after_restoration ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 1856 filtered out; finished in 8.18s
+

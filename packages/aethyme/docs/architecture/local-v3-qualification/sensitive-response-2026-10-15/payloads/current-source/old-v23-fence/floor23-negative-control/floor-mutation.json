@@ -1,0 +1,18 @@
+{
+  "after": {
+    "min_compatible_schema": "23",
+    "schema_version": "24"
+  },
+  "before": {
+    "min_compatible_schema": "24",
+    "schema_version": "24"
+  },
+  "database_path": "/private/tmp/t56-old23-fence-425a0bc/floor23-negative-control/host-state/collaboration/local-target-test/state.db",
+  "floor_only_mutation": true,
+  "rows_updated": 1,
+  "wal_checkpoint_result": [
+    0,
+    0,
+    0
+  ]
+}

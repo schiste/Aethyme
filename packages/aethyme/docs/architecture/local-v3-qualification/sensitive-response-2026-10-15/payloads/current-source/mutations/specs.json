@@ -1,0 +1,90 @@
+[
+  {
+    "id": "m1-response-gated-archive-read",
+    "case_dir": "/private/tmp/t56-final-mutants-425a0bc/m1-response-gated-archive-read",
+    "selector": "collaboration_sensitive::tests::synthetic_source_token_is_blocked_and_managed_copies_are_removed_with_residuals",
+    "expected_failure_fragment": "assertion failed: archive::read_object(store, &content_digest).is_err()",
+    "mutations": [{
+      "path": "packages/aethyme/rust/crates/aethyme-broker/src/collaboration_archive.rs",
+      "old": "    let _response = crate::collaboration_sensitive::response_use(store)?;\n    read_object_unlocked(store, digest, None)",
+      "new": "    read_object_unlocked(store, digest, None)"
+    }]
+  },
+  {
+    "id": "m2-omit-generations-root",
+    "case_dir": "/private/tmp/t56-final-mutants-425a0bc/m2-omit-generations-root",
+    "selector": "collaboration_sensitive::tests::synthetic_source_token_is_blocked_and_managed_copies_are_removed_with_residuals",
+    "expected_failure_fragment": "retained generated source root generations/",
+    "mutations": [{
+      "path": "packages/aethyme/rust/crates/aethyme-broker/src/collaboration_sensitive.rs",
+      "old": "    for path in [Path::new(\"generations\"), Path::new(\"import-rehearsals\")] {",
+      "new": "    for path in [Path::new(\"import-rehearsals\")] {"
+    }]
+  },
+  {
+    "id": "m3-omit-import-rehearsals-root",
+    "case_dir": "/private/tmp/t56-final-mutants-425a0bc/m3-omit-import-rehearsals-root",
+    "selector": "collaboration_sensitive::tests::synthetic_source_token_is_blocked_and_managed_copies_are_removed_with_residuals",
+    "expected_failure_fragment": "assertion failed: !rehearsed_root.exists()",
+    "mutations": [{
+      "path": "packages/aethyme/rust/crates/aethyme-broker/src/collaboration_sensitive.rs",
+      "old": "    for path in [Path::new(\"generations\"), Path::new(\"import-rehearsals\")] {",
+      "new": "    for path in [Path::new(\"generations\")] {"
+    }]
+  },
+  {
+    "id": "m4-publish-database-receipt-before-table-delete",
+    "case_dir": "/private/tmp/t56-final-mutants-425a0bc/m4-publish-database-receipt-before-table-delete",
+    "selector": "collaboration_sensitive::tests::interrupted_database_cleanup_does_not_publish_early_completion_receipt",
+    "expected_failure_fragment": "left: Some(",
+    "mutations": [{
+      "path": "packages/aethyme/rust/crates/aethyme-broker/src/collaboration_sensitive.rs",
+      "old": "        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;",
+      "new": "        connection.execute(\n            \"UPDATE local_sensitive_incidents\n             SET database_cleanup_completed_ms=?2,updated_ms=?2\n             WHERE id=?1 AND database_cleanup_completed_ms IS NULL\",\n            rusqlite::params![incident_id, now_ms()],\n        )?;\n        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;"
+    }]
+  },
+  {
+    "id": "m5-delete-view-despite-live-hold",
+    "case_dir": "/private/tmp/t56-final-mutants-425a0bc/m5-delete-view-despite-live-hold",
+    "selector": "collaboration_sensitive::tests::expired_view_hold_remains_a_blocker_until_explicit_release",
+    "expected_failure_fragment": "assertion failed: view_root.exists()",
+    "mutations": [{
+      "path": "packages/aethyme/rust/crates/aethyme-broker/src/collaboration_sensitive.rs",
+      "old": "        Ok(Some(true)) => {\n            return record_view_block(store, incident_id, &group.relative_root, ViewBlock::Busy);\n        }",
+      "new": "        Ok(Some(true)) => {}"
+    }]
+  },
+  {
+    "id": "m6-lower-minimum-compatible-schema",
+    "case_dir": "/private/tmp/t56-final-mutants-425a0bc/m6-lower-minimum-compatible-schema",
+    "selector": "collaboration_state::tests::migrations_are_contiguous_and_end_at_this_binarys_version",
+    "expected_failure_fragment": "right: 24",
+    "mutations": [{
+      "path": "packages/aethyme/rust/crates/aethyme-broker/src/collaboration_state.rs",
+      "old": "const MIN_COMPATIBLE_SCHEMA: i64 = 24;",
+      "new": "const MIN_COMPATIBLE_SCHEMA: i64 = 23;"
+    }]
+  },
+  {
+    "id": "m7-accept-nonempty-capture-locks",
+    "case_dir": "/private/tmp/t56-final-mutants-425a0bc/m7-accept-nonempty-capture-locks",
+    "selector": "collaboration_sensitive::tests::capture_lock_control_inventory_rejects_nonempty_lock_files",
+    "expected_failure_fragment": "assertion failed: capture_lock_control_paths(root.path()).is_err()",
+    "mutations": [
+      {"path": "packages/aethyme/rust/crates/aethyme-broker/src/collaboration_sensitive.rs", "old": "            || before_file.len() != 0\n", "new": ""},
+      {"path": "packages/aethyme/rust/crates/aethyme-broker/src/collaboration_sensitive.rs", "old": "        if !opened.is_file() || opened.len() != 0 {\n", "new": "        if !opened.is_file() {\n"},
+      {"path": "packages/aethyme/rust/crates/aethyme-broker/src/collaboration_sensitive.rs", "old": "            || after_file.len() != 0\n", "new": ""}
+    ]
+  },
+  {
+    "id": "m8-skip-typed-directory-removal",
+    "case_dir": "/private/tmp/t56-final-mutants-425a0bc/m8-skip-typed-directory-removal",
+    "selector": "collaboration_sensitive::tests::managed_copy_cleanup_recovers_partial_removal_and_cleans_generation_and_import_parents",
+    "expected_failure_fragment": "assertion failed: !store.project_dir().join(\"generations\").exists()",
+    "mutations": [{
+      "path": "packages/aethyme/rust/crates/aethyme-broker/src/collaboration_sensitive.rs",
+      "old": ") -> Result<bool, SensitiveError> {\n    let mut complete = true;",
+      "new": ") -> Result<bool, SensitiveError> {\n    return Ok(true);\n    let mut complete = true;"
+    }]
+  }
+]

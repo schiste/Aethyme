@@ -1,0 +1,27 @@
+--- a/packages/aethyme/rust/crates/aethyme-broker/src/collaboration_sensitive.rs
++++ b/packages/aethyme/rust/crates/aethyme-broker/src/collaboration_sensitive.rs
+@@ -1171,7 +1171,6 @@
+         let before_file = fs::symlink_metadata(&path).map_err(|_| ())?;
+         if before_file.file_type().is_symlink()
+             || !before_file.file_type().is_file()
+-            || before_file.len() != 0
+         {
+             return Err(());
+         }
+@@ -1191,7 +1190,7 @@
+         }
+         let file = options.open(&path).map_err(|_| ())?;
+         let opened = file.metadata().map_err(|_| ())?;
+-        if !opened.is_file() || opened.len() != 0 {
++        if !opened.is_file() {
+             return Err(());
+         }
+         #[cfg(unix)]
+@@ -1209,7 +1208,6 @@
+         let after_file = fs::symlink_metadata(&path).map_err(|_| ())?;
+         if after_file.file_type().is_symlink()
+             || !after_file.file_type().is_file()
+-            || after_file.len() != 0
+         {
+             return Err(());
+         }

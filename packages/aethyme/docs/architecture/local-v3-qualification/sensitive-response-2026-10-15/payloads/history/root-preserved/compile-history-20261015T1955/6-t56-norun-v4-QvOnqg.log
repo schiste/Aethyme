@@ -1,0 +1,4 @@
+error: failed to open: /Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/integrate-reviewed-local-bare-git-servic/target/local-resume/cargo/debug/.cargo-build-lock
+
+Caused by:
+  Operation not permitted (os error 1)

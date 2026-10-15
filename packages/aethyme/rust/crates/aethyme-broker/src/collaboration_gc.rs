@@ -2349,8 +2349,18 @@ mod tests {
         age(&store);
         let plan = plan(&mut store, &defaults()).unwrap();
         assert!(plan.blockers.is_empty(), "{:?}", plan.blockers);
-        assert!(objects(&plan).is_empty(), "{:?}", plan.reclaimable);
         assert!(plan.entities.is_empty());
+        assert_eq!(plan.reclaimable.len(), 2, "{:?}", plan.reclaimable);
+        let objects = objects(&plan);
+        assert_eq!(objects.len(), 1, "{:?}", plan.reclaimable);
+        assert_eq!(objects[0].class, RetentionClass::Receipt);
+        let operation_lock = plan
+            .reclaimable
+            .iter()
+            .find(|item| item.kind == ItemKind::OperationLock)
+            .unwrap();
+        assert_eq!(operation_lock.relpath, "spool/capture/op-target-root.lock");
+        assert_eq!(operation_lock.class, RetentionClass::Orphan);
         apply(&mut store, &plan.digest, &defaults()).unwrap();
         assert_reconstructs(&store, &receipt);
     }

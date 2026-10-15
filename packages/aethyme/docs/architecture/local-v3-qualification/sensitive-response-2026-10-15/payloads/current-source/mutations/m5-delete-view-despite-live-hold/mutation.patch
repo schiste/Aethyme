@@ -1,0 +1,13 @@
+--- a/packages/aethyme/rust/crates/aethyme-broker/src/collaboration_sensitive.rs
++++ b/packages/aethyme/rust/crates/aethyme-broker/src/collaboration_sensitive.rs
+@@ -2520,9 +2520,7 @@
+         .project_dir()
+         .join(group.relative_root.trim_end_matches('/'));
+     match hold_state(&view_path) {
+-        Ok(Some(true)) => {
+-            return record_view_block(store, incident_id, &group.relative_root, ViewBlock::Busy);
+-        }
++        Ok(Some(true)) => {}
+         Err(()) => {
+             return record_view_block(
+                 store,

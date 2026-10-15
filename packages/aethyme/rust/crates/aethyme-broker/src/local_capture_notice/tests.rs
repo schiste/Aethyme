@@ -337,11 +337,17 @@ fn owner_tick_marks_notice_from_old_epoch_stale_without_admission_effects() {
     assert_ne!(resumed.epoch, old_epoch);
 
     let next_owner = target::acquire_controller(&mut f.store, "target", "appointed").unwrap();
-    let admission = admit_for_owner(&mut f.store, &next_owner, wave_policy(), 0).unwrap();
+    let admission = admit_for_owner(
+        &mut f.store,
+        &next_owner,
+        wave_policy(),
+        receipt.received_ms,
+    );
     assert!(matches!(
         admission,
-        crate::local_wave::Admission::WaitingForInput { ref missing }
-            if missing.iter().any(|alias| alias == "A")
+        Err(NoticeError::Wave(crate::local_wave::WaveError::Target(
+            target::TargetError::Frozen
+        )))
     ));
 
     let notices = list_for_target(&f.store, "target", 16).unwrap();
@@ -375,7 +381,7 @@ fn ingress_cannot_interleave_between_notice_drain_and_wave_admission() {
     let retained_b = f.b.clone();
     let operation_a = capture(&mut f, &retained_a);
     let operation_b = capture(&mut f, &retained_b);
-    ingest(
+    let receipt_a = ingest(
         &mut f.store,
         owner.target(),
         owner.issuer(),
@@ -397,7 +403,7 @@ fn ingress_cannot_interleave_between_notice_drain_and_wave_admission() {
         let tick = scope.spawn(|| {
             let _probe = observe_owner_tick(drained_tx, resume_rx);
             let mut store = open_store(&host);
-            let result = admit_for_owner(&mut store, &owner, wave_policy(), 0);
+            let result = admit_for_owner(&mut store, &owner, wave_policy(), receipt_a.received_ms);
             admission_tx.send(result).unwrap();
         });
 

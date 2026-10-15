@@ -1,0 +1,6 @@
+{
+  "repo": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/implement-local-administrative-sensitive",
+  "run_dir": "/private/tmp/t56-strict-clippy-425a0bc/run-20261015",
+  "cwd": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/implement-local-administrative-sensitive/packages/aethyme/rust",
+  "argv": ["cargo", "clippy", "--locked", "-j4", "-p", "aethyme-broker", "--all-targets", "--", "-D", "warnings"]
+}

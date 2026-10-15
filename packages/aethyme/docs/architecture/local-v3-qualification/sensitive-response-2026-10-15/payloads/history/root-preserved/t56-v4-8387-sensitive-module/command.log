@@ -1,0 +1,125 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.62s
+     Running unittests src/lib.rs (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/integrate-reviewed-local-bare-git-servic/target/local-resume/cargo/debug/deps/aethyme_broker-0f278e0d02146111)
+
+running 21 tests
+test collaboration_sensitive::tests::a_durable_marker_blocks_resume_and_quarantine_retry_repairs_missing_row ... ok
+test collaboration_sensitive::tests::expired_view_hold_remains_a_blocker_until_explicit_release ... ok
+test collaboration_sensitive::tests::malformed_current_with_content_is_a_refusal_only_residual ... FAILED
+test collaboration_sensitive::tests::malformed_view_hold_is_a_refusal_only_residual ... ok
+test collaboration_sensitive::tests::managed_copy_cleanup_preserves_and_records_an_untracked_entry_then_retries ... ok
+test collaboration_sensitive::tests::managed_copy_cleanup_recovers_partial_removal_and_cleans_generation_and_import_parents ... ok
+test collaboration_sensitive::tests::managed_copy_cleanup_refuses_changed_directory_type_and_retries_after_restoration ... ok
+test collaboration_sensitive::tests::managed_copy_cleanup_refuses_symlink_without_following_and_retries_after_restoration ... ok
+test collaboration_sensitive::tests::missing_current_with_content_is_a_refusal_only_residual ... FAILED
+test collaboration_sensitive::tests::missing_view_pin_with_content_is_a_refusal_only_residual ... FAILED
+test collaboration_sensitive::tests::non_regular_view_pin_with_content_is_a_refusal_only_residual ... FAILED
+test collaboration_sensitive::tests::oversized_current_control_file_is_rejected_before_parsing ... ok
+test collaboration_sensitive::tests::preinventory_malformed_current_is_recorded_as_a_root_residual ... ok
+test collaboration_sensitive::tests::preinventory_oversized_current_is_recorded_as_a_root_residual ... ok
+test collaboration_sensitive::tests::preinventory_symlinked_current_is_recorded_as_a_root_residual ... ok
+test collaboration_sensitive::tests::preinventory_symlinked_view_pin_is_recorded_as_a_root_residual ... ok
+test collaboration_sensitive::tests::symlinked_current_with_content_is_a_refusal_only_residual ... FAILED
+test collaboration_sensitive::tests::symlinked_view_pin_with_content_is_a_refusal_only_residual ... FAILED
+test collaboration_sensitive::tests::synthetic_source_token_is_blocked_and_managed_copies_are_removed_with_residuals ... FAILED
+test collaboration_sensitive::tests::terminal_view_state_after_last_pin_unlink_finishes_directory_cleanup ... FAILED
+test collaboration_sensitive::tests::unreadable_view_inventory_discards_partial_items_and_persists_root_residual ... ok
+
+failures:
+
+---- collaboration_sensitive::tests::malformed_current_with_content_is_a_refusal_only_residual stdout ----
+
+thread 'collaboration_sensitive::tests::malformed_current_with_content_is_a_refusal_only_residual' (10332696) panicked at crates/aethyme-broker/src/collaboration_sensitive.rs:3570:9:
+assertion failed: refused.status.items.iter().all(|item|
+        {
+            !item.path.starts_with(&format!("views/{view}/")) ||
+                    item.state != "deleted" ||
+                item.path ==
+                    format!("views/{view}/holds/{}.json",
+                        hold_filename("t56-pin-control-holder"))
+        })
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- collaboration_sensitive::tests::missing_current_with_content_is_a_refusal_only_residual stdout ----
+
+thread 'collaboration_sensitive::tests::missing_current_with_content_is_a_refusal_only_residual' (10336242) panicked at crates/aethyme-broker/src/collaboration_sensitive.rs:3570:9:
+assertion failed: refused.status.items.iter().all(|item|
+        {
+            !item.path.starts_with(&format!("views/{view}/")) ||
+                    item.state != "deleted" ||
+                item.path ==
+                    format!("views/{view}/holds/{}.json",
+                        hold_filename("t56-pin-control-holder"))
+        })
+
+---- collaboration_sensitive::tests::missing_view_pin_with_content_is_a_refusal_only_residual stdout ----
+
+thread 'collaboration_sensitive::tests::missing_view_pin_with_content_is_a_refusal_only_residual' (10337828) panicked at crates/aethyme-broker/src/collaboration_sensitive.rs:3570:9:
+assertion failed: refused.status.items.iter().all(|item|
+        {
+            !item.path.starts_with(&format!("views/{view}/")) ||
+                    item.state != "deleted" ||
+                item.path ==
+                    format!("views/{view}/holds/{}.json",
+                        hold_filename("t56-pin-control-holder"))
+        })
+
+---- collaboration_sensitive::tests::non_regular_view_pin_with_content_is_a_refusal_only_residual stdout ----
+
+thread 'collaboration_sensitive::tests::non_regular_view_pin_with_content_is_a_refusal_only_residual' (10339386) panicked at crates/aethyme-broker/src/collaboration_sensitive.rs:3570:9:
+assertion failed: refused.status.items.iter().all(|item|
+        {
+            !item.path.starts_with(&format!("views/{view}/")) ||
+                    item.state != "deleted" ||
+                item.path ==
+                    format!("views/{view}/holds/{}.json",
+                        hold_filename("t56-pin-control-holder"))
+        })
+
+---- collaboration_sensitive::tests::symlinked_current_with_content_is_a_refusal_only_residual stdout ----
+
+thread 'collaboration_sensitive::tests::symlinked_current_with_content_is_a_refusal_only_residual' (10345866) panicked at crates/aethyme-broker/src/collaboration_sensitive.rs:3570:9:
+assertion failed: refused.status.items.iter().all(|item|
+        {
+            !item.path.starts_with(&format!("views/{view}/")) ||
+                    item.state != "deleted" ||
+                item.path ==
+                    format!("views/{view}/holds/{}.json",
+                        hold_filename("t56-pin-control-holder"))
+        })
+
+---- collaboration_sensitive::tests::symlinked_view_pin_with_content_is_a_refusal_only_residual stdout ----
+
+thread 'collaboration_sensitive::tests::symlinked_view_pin_with_content_is_a_refusal_only_residual' (10346649) panicked at crates/aethyme-broker/src/collaboration_sensitive.rs:3570:9:
+assertion failed: refused.status.items.iter().all(|item|
+        {
+            !item.path.starts_with(&format!("views/{view}/")) ||
+                    item.state != "deleted" ||
+                item.path ==
+                    format!("views/{view}/holds/{}.json",
+                        hold_filename("t56-pin-control-holder"))
+        })
+
+---- collaboration_sensitive::tests::synthetic_source_token_is_blocked_and_managed_copies_are_removed_with_residuals stdout ----
+
+thread 'collaboration_sensitive::tests::synthetic_source_token_is_blocked_and_managed_copies_are_removed_with_residuals' (10347504) panicked at crates/aethyme-broker/src/collaboration_sensitive.rs:4432:9:
+assertion failed: !generation_root.exists()
+
+---- collaboration_sensitive::tests::terminal_view_state_after_last_pin_unlink_finishes_directory_cleanup stdout ----
+
+thread 'collaboration_sensitive::tests::terminal_view_state_after_last_pin_unlink_finishes_directory_cleanup' (10350542) panicked at crates/aethyme-broker/src/collaboration_sensitive.rs:4079:9:
+assertion failed: resumed.status.managed_cleanup_complete
+
+
+failures:
+    collaboration_sensitive::tests::malformed_current_with_content_is_a_refusal_only_residual
+    collaboration_sensitive::tests::missing_current_with_content_is_a_refusal_only_residual
+    collaboration_sensitive::tests::missing_view_pin_with_content_is_a_refusal_only_residual
+    collaboration_sensitive::tests::non_regular_view_pin_with_content_is_a_refusal_only_residual
+    collaboration_sensitive::tests::symlinked_current_with_content_is_a_refusal_only_residual
+    collaboration_sensitive::tests::symlinked_view_pin_with_content_is_a_refusal_only_residual
+    collaboration_sensitive::tests::synthetic_source_token_is_blocked_and_managed_copies_are_removed_with_residuals
+    collaboration_sensitive::tests::terminal_view_state_after_last_pin_unlink_finishes_directory_cleanup
+
+test result: FAILED. 13 passed; 8 failed; 0 ignored; 0 measured; 1839 filtered out; finished in 67.47s
+
+error: test failed, to rerun pass `-p aethyme-broker --lib`

@@ -1,0 +1,6 @@
+{
+  "actual_status": "/private/tmp/t56-old23-fence-425a0bc/floor23-negative-control/old-v23-floor23-control-status.json",
+  "classification": "floor23_negative_control",
+  "exact_schema_too_new_refusal_must_be_absent": true,
+  "oracle_credit": true
+}

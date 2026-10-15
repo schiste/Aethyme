@@ -1,0 +1,7 @@
+{
+  "code": "not_initialized",
+  "command": "capture recover",
+  "message": "project local-target-test has no collaboration state yet",
+  "next_action": "nothing is retained yet: an advisory or required `aethyme broker submit` creates collaboration state",
+  "schema": "aethyme.collab-error/experimental-v0"
+}

@@ -1,0 +1,36 @@
+   Compiling aethyme-engine v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/implement-local-administrative-sensitive/packages/aethyme/rust/crates/aethyme-engine)
+   Compiling aethyme-broker v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/implement-local-administrative-sensitive/packages/aethyme/rust/crates/aethyme-broker)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 31.50s
+     Running unittests src/lib.rs (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/integrate-reviewed-local-bare-git-servic/target/local-resume/cargo/debug/deps/aethyme_broker-0f278e0d02146111)
+
+running 27 tests
+test collaboration_sensitive::tests::a_durable_marker_blocks_resume_and_quarantine_retry_repairs_missing_row ... ok
+test collaboration_sensitive::tests::capture_lock_control_inventory_accepts_only_empty_root_and_closed_zero_byte_locks ... ok
+test collaboration_sensitive::tests::capture_lock_control_inventory_refuses_held_lock_then_retries_after_release ... ok
+test collaboration_sensitive::tests::capture_lock_control_inventory_rejects_nonempty_lock_files ... ok
+test collaboration_sensitive::tests::capture_lock_control_inventory_rejects_symlinked_lock_children ... ok
+test collaboration_sensitive::tests::capture_lock_control_inventory_rejects_unknown_children ... ok
+test collaboration_sensitive::tests::expired_view_hold_remains_a_blocker_until_explicit_release ... ok
+test collaboration_sensitive::tests::malformed_current_with_content_is_a_refusal_only_residual ... ok
+test collaboration_sensitive::tests::malformed_view_hold_is_a_refusal_only_residual ... ok
+test collaboration_sensitive::tests::managed_copy_cleanup_preserves_and_records_an_untracked_entry_then_retries ... ok
+test collaboration_sensitive::tests::managed_copy_cleanup_recovers_partial_removal_and_cleans_generation_and_import_parents ... ok
+test collaboration_sensitive::tests::managed_copy_cleanup_refuses_changed_directory_type_and_retries_after_restoration ... ok
+test collaboration_sensitive::tests::managed_copy_cleanup_refuses_symlink_without_following_and_retries_after_restoration ... ok
+test collaboration_sensitive::tests::managed_copy_cleanup_removes_inventory_of_empty_roots ... ok
+test collaboration_sensitive::tests::missing_current_with_content_is_a_refusal_only_residual ... ok
+test collaboration_sensitive::tests::missing_view_pin_with_content_is_a_refusal_only_residual ... ok
+test collaboration_sensitive::tests::non_regular_view_pin_with_content_is_a_refusal_only_residual ... ok
+test collaboration_sensitive::tests::oversized_current_control_file_is_rejected_before_parsing ... ok
+test collaboration_sensitive::tests::preinventory_malformed_current_is_recorded_as_a_root_residual ... ok
+test collaboration_sensitive::tests::preinventory_oversized_current_is_recorded_as_a_root_residual ... ok
+test collaboration_sensitive::tests::preinventory_symlinked_current_is_recorded_as_a_root_residual ... ok
+test collaboration_sensitive::tests::preinventory_symlinked_view_pin_is_recorded_as_a_root_residual ... ok
+test collaboration_sensitive::tests::symlinked_current_with_content_is_a_refusal_only_residual ... ok
+test collaboration_sensitive::tests::symlinked_view_pin_with_content_is_a_refusal_only_residual ... ok
+test collaboration_sensitive::tests::synthetic_source_token_is_blocked_and_managed_copies_are_removed_with_residuals ... ok
+test collaboration_sensitive::tests::terminal_view_state_after_last_pin_unlink_finishes_directory_cleanup ... ok
+test collaboration_sensitive::tests::unreadable_view_inventory_discards_partial_items_and_persists_root_residual ... ok
+
+test result: ok. 27 passed; 0 failed; 0 ignored; 0 measured; 1839 filtered out; finished in 69.96s
+

@@ -1,0 +1,25 @@
+{
+  "collaboration_fence": null,
+  "config_source": "working_copy",
+  "enabled": true,
+  "next_actions": [
+    "upgrade Aethyme (`aethyme self-update`)"
+  ],
+  "policy": "required",
+  "project": "local-target-test",
+  "schema": "aethyme.collab-status/experimental-v0",
+  "state": {
+    "initialized": true,
+    "project_dir": "/private/tmp/t56-old23-fence-425a0bc/host-state/collaboration/local-target-test",
+    "refusal": {
+      "code": "schema_too_new",
+      "message": "/private/tmp/t56-old23-fence-425a0bc/host-state/collaboration/local-target-test/state.db has schema 24, readable only by binaries supporting schema 24 or later; this binary supports 23. Upgrade Aethyme",
+      "next_action": "upgrade Aethyme (`aethyme self-update`)"
+    },
+    "root": "/private/tmp/t56-old23-fence-425a0bc/host-state/collaboration",
+    "root_source": {
+      "kind": "host_state",
+      "setting": "aethyme_host_state_dir"
+    }
+  }
+}

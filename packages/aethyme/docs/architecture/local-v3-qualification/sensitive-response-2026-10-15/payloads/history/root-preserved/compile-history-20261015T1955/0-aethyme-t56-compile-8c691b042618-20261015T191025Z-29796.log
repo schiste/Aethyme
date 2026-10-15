@@ -1,0 +1,22 @@
+   Compiling aethyme-engine v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/implement-local-administrative-sensitive/packages/aethyme/rust/crates/aethyme-engine)
+   Compiling aethyme-broker v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/implement-local-administrative-sensitive/packages/aethyme/rust/crates/aethyme-broker)
+error[E0716]: temporary value dropped while borrowed
+    --> crates/aethyme-broker/src/collaboration_sensitive.rs:1912:26
+     |
+1912 |         let playground = tempfile::Builder::new().prefix("aethyme-t56-playground-");
+     |                          ^^^^^^^^^^^^^^^^^^^^^^^^                                  - temporary value is freed at the end of this statement
+     |                          |
+     |                          creates a temporary value which is freed while still in use
+1913 |         let run_root = if playground_parent.is_dir() {
+1914 |             playground.tempdir_in(playground_parent).unwrap().keep()
+     |             ---------- borrow later used here
+     |
+help: consider using a `let` binding to create a longer lived value
+     |
+1912 ~         let mut binding = tempfile::Builder::new();
+1913 ~         let playground = binding.prefix("aethyme-t56-playground-");
+     |
+
+For more information about this error, try `rustc --explain E0716`.
+error: could not compile `aethyme-broker` (lib test) due to 1 previous error
+warning: build failed, waiting for other jobs to finish...

@@ -1,0 +1,45 @@
+{
+  "exact_schema_floor_refusal": true,
+  "exit_code": 0,
+  "expected_old_binary_sha256": "1268402c5d49ac303b61bc28b4e4726bf95b1d17d64d7099850f2f67950f7e6f",
+  "finished_at_utc": "2026-10-15T21:59:02.140008+00:00",
+  "host_state_changed_paths": [],
+  "host_state_inventory_after_sha256": "b5a40a51e5a1dd3dc48c2f528322397a4e5c47214d013eaf5c9e7e1c9f074b18",
+  "host_state_inventory_before_sha256": "b5a40a51e5a1dd3dc48c2f528322397a4e5c47214d013eaf5c9e7e1c9f074b18",
+  "json_parse_error": null,
+  "label": "old-v23-status",
+  "log_bytes": 930,
+  "log_sha256": "3dfb03d23005627e20d6f64eb8422bc73eacce170e35109ef2aa1075a6ac2ac8",
+  "old_binary_sha256_after": "1268402c5d49ac303b61bc28b4e4726bf95b1d17d64d7099850f2f67950f7e6f",
+  "parsed_json": {
+    "collaboration_fence": null,
+    "config_source": "working_copy",
+    "enabled": true,
+    "next_actions": [
+      "upgrade Aethyme (`aethyme self-update`)"
+    ],
+    "policy": "required",
+    "project": "local-target-test",
+    "schema": "aethyme.collab-status/experimental-v0",
+    "state": {
+      "initialized": true,
+      "project_dir": "/private/tmp/t56-old23-fence-425a0bc/host-state/collaboration/local-target-test",
+      "refusal": {
+        "code": "schema_too_new",
+        "message": "/private/tmp/t56-old23-fence-425a0bc/host-state/collaboration/local-target-test/state.db has schema 24, readable only by binaries supporting schema 24 or later; this binary supports 23. Upgrade Aethyme",
+        "next_action": "upgrade Aethyme (`aethyme self-update`)"
+      },
+      "root": "/private/tmp/t56-old23-fence-425a0bc/host-state/collaboration",
+      "root_source": {
+        "kind": "host_state",
+        "setting": "aethyme_host_state_dir"
+      }
+    }
+  },
+  "pid": 26383,
+  "project_binding_matches_exact_copy": true,
+  "repository_inventory_after_sha256": "d38a9874938abdea0f226fee6af0205883ba74668f0067c0f8a92590d7766ce0",
+  "repository_inventory_before_sha256": "d38a9874938abdea0f226fee6af0205883ba74668f0067c0f8a92590d7766ce0",
+  "repository_unchanged": true,
+  "started_at_utc": "2026-10-15T21:59:01.872330+00:00"
+}

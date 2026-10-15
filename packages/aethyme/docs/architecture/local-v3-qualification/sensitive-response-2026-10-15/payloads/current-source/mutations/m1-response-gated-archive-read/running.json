@@ -1,0 +1,7 @@
+{
+  "mutation_id": "m1-response-gated-archive-read",
+  "pid": 89486,
+  "source_head": "425a0bc8e41031cea6b0ff8b5bc0e9cc80748b31",
+  "source_tree": "01f8a9f6a51818732cf6feb38125a34c81745d5b",
+  "started_at_utc": "2026-10-15T21:50:03.625265+00:00"
+}
