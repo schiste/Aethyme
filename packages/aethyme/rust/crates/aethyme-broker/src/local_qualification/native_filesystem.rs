@@ -1251,7 +1251,8 @@ fn run_t45_capture_hydration_interleavings(disk: &mut OwnedImage) {
     )
     .unwrap();
     let descriptor = execution_spec(&fixture);
-    let revision = target::propose_revision(&mut fixture.store, &owner, fixture.spec()).unwrap();
+    let target_spec = fixture.spec();
+    let revision = target::propose_revision(&mut fixture.store, &owner, target_spec).unwrap();
     target::select_revision(&mut fixture.store, &owner, &revision.id).unwrap();
     let execution = snapshot::freeze(&mut fixture.store, &owner, &revision.id, descriptor).unwrap();
 
@@ -1442,7 +1443,7 @@ fn run_t45_capture_hydration_interleavings(disk: &mut OwnedImage) {
 
     let (hydrate_orphan, hydrate_plan) =
         t45_gc_plan(&fixture.store, &mut collector, &options, "hydration");
-    let mut materialize_store = CollaborationStore::open(&root, &project, &[]).unwrap();
+    let materialize_store = CollaborationStore::open(&root, &project, &[]).unwrap();
     let (events, event_rx) = mpsc::channel();
     let hydrate_ready = Arc::new(InterleaveGate {
         event: events.clone(),
