@@ -734,7 +734,10 @@ fn released_prepared_job_remains_readable_but_cannot_be_dispatched_or_replayed()
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(migrated_floor, 23);
+    assert_eq!(
+        migrated_floor,
+        crate::collaboration_state::COLLABORATION_STATE_SCHEMA_VERSION
+    );
     let roots_before = root_count(&s.f.store, &job.id);
     assert!(roots_before > 0);
 

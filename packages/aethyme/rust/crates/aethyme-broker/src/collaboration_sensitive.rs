@@ -10,7 +10,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, Write};
 use std::marker::PhantomData;
 use std::path::{Component, Path, PathBuf};
 use std::rc::Rc;
@@ -114,6 +114,7 @@ pub struct ExportStatus {
 #[derive(Debug, Clone, Serialize)]
 pub struct ItemStatus {
     pub path: String,
+    pub kind: String,
     pub sha256: String,
     pub bytes: u64,
     pub state: String,
@@ -777,8 +778,15 @@ pub fn status(
                 )),
             )
         })?;
+        let path: String = row.get(0)?;
         Ok(ItemStatus {
-            path: row.get(0)?,
+            kind: if is_directory_item(&path) {
+                "directory"
+            } else {
+                "file"
+            }
+            .into(),
+            path,
             sha256: row.get(1)?,
             bytes,
             state: row.get(3)?,
@@ -903,6 +911,61 @@ fn add_residual(
     Ok(())
 }
 
+/// Record a hold file removed by the narrow post-tombstone metadata operation.
+/// This is a no-op before an incident inventory exists. Once inventoried, a
+/// missing file is accepted only after this durable state transition.
+pub(crate) fn record_released_view_hold(
+    store: &mut CollaborationStore,
+    path: &Path,
+) -> Result<(), SensitiveError> {
+    let Some(marker) = read_marker(store)? else {
+        return Ok(());
+    };
+    let relative = path
+        .strip_prefix(store.project_dir())
+        .ok()
+        .and_then(Path::to_str)
+        .ok_or_else(|| {
+            SensitiveError::Invalid("released view hold path is outside project".into())
+        })?;
+    let parts = relative.split('/').collect::<Vec<_>>();
+    if parts.len() != 4 || parts[0] != "views" || parts[2] != "holds" || parts[3].is_empty() {
+        return Err(SensitiveError::Invalid(
+            "released view hold path is not a single inventoried hold entry".into(),
+        ));
+    }
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+        Ok(_) => {
+            return Err(SensitiveError::Invalid(
+                "released view hold still exists after removal".into(),
+            ));
+        }
+    }
+    let state: Option<String> = store
+        .read_connection()
+        .query_row(
+            "SELECT state FROM local_sensitive_items
+             WHERE incident_id=?1 AND relative_path=?2",
+            rusqlite::params![marker.incident_id, relative],
+            |row| row.get(0),
+        )
+        .optional()?;
+    match state.as_deref() {
+        None | Some("deleted") => Ok(()),
+        Some("pending") => {
+            store.connection().execute(
+                "UPDATE local_sensitive_items SET state='deleted'
+                 WHERE incident_id=?1 AND relative_path=?2 AND state='pending'",
+                rusqlite::params![marker.incident_id, relative],
+            )?;
+            Ok(())
+        }
+        Some("residual") | Some(_) => Err(SensitiveError::Mismatch),
+    }
+}
+
 fn unresolved_work(store: &CollaborationStore) -> Result<bool, SensitiveError> {
     let checks = [
         "SELECT EXISTS(SELECT 1 FROM local_native_gate_jobs WHERE state IN ('dispatching','unknown'))",
@@ -992,6 +1055,80 @@ fn collect_tree(
         for entry in entries {
             let child = relative.join(entry.file_name());
             collect_tree(store, &child, files, unknown)?;
+        }
+        return Ok(());
+    }
+    if metadata.is_file() {
+        let Some(relative_path) = relative.to_str().map(str::to_owned) else {
+            unknown.push(relative.to_string_lossy().into_owned());
+            return Ok(());
+        };
+        let (sha256, bytes) = hash_file(&path)?;
+        files.push(FileItem {
+            relative_path,
+            sha256,
+            bytes,
+        });
+    } else {
+        unknown.push(relative.to_string_lossy().into_owned());
+    }
+    Ok(())
+}
+
+fn is_directory_item(relative_path: &str) -> bool {
+    relative_path.ends_with('/')
+}
+
+fn directory_item_path(relative_path: &Path) -> Option<String> {
+    let mut value = relative_path.to_str()?.to_owned();
+    if !value.ends_with('/') {
+        value.push('/');
+    }
+    Some(value)
+}
+
+fn directory_item_digest(relative_path: &str) -> String {
+    let mut hash = Sha256::new();
+    hash.update(b"aethyme-local-sensitive-view-directory-v1\0");
+    hash.update(relative_path.as_bytes());
+    format!("sha256:{:x}", hash.finalize())
+}
+
+/// Inventory every entry under the analysis-view root. Directories are stored
+/// in the existing immutable item table with trailing-slash paths and a
+/// path/type digest; regular file bytes retain their ordinary SHA-256. This is
+/// intentionally limited to views, where restart-safe pin deletion requires
+/// an exact original directory layout.
+fn collect_view_tree(
+    store: &CollaborationStore,
+    relative: &Path,
+    files: &mut Vec<FileItem>,
+    unknown: &mut Vec<String>,
+) -> Result<(), SensitiveError> {
+    let path = store.project_dir().join(relative);
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    if metadata.file_type().is_symlink() {
+        unknown.push(relative.to_string_lossy().into_owned());
+        return Ok(());
+    }
+    if metadata.is_dir() {
+        let Some(relative_path) = directory_item_path(relative) else {
+            unknown.push(relative.to_string_lossy().into_owned());
+            return Ok(());
+        };
+        files.push(FileItem {
+            sha256: directory_item_digest(&relative_path),
+            relative_path,
+            bytes: 0,
+        });
+        let mut entries = fs::read_dir(&path)?.collect::<Result<Vec<_>, _>>()?;
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            collect_view_tree(store, &relative.join(entry.file_name()), files, unknown)?;
         }
         return Ok(());
     }
@@ -1141,9 +1278,13 @@ fn database_inventory(store: &CollaborationStore) -> Result<Vec<DatabaseItem>, S
 
 fn inventory_digest(files: &[FileItem], tables: &[DatabaseItem], exports: &[ExportItem]) -> String {
     let mut hash = Sha256::new();
-    hash.update(b"aethyme-local-sensitive-inventory-v2\0");
+    hash.update(b"aethyme-local-sensitive-inventory-v3\0");
     for item in files {
-        hash.update([b'f']);
+        hash.update([if is_directory_item(&item.relative_path) {
+            b'g'
+        } else {
+            b'f'
+        }]);
         hash.update((item.relative_path.len() as u64).to_be_bytes());
         hash.update(item.relative_path.as_bytes());
         hash.update(item.sha256.as_bytes());
@@ -1275,12 +1416,12 @@ fn prepare_inventory(
         Path::new("objects"),
         Path::new("spool/archive"),
         Path::new("spool/gc"),
-        Path::new("views"),
         Path::new("generations"),
         Path::new("import-rehearsals"),
     ] {
         collect_tree(store, path, &mut files, &mut unknown)?;
     }
+    collect_view_tree(store, Path::new("views"), &mut files, &mut unknown)?;
     // Lock and verifier-authority state is control state, not archived source.
     // Leave it in place and report the exact roots as unmanaged residuals.
     for name in ["objects", "spool"] {
@@ -1508,26 +1649,830 @@ fn safe_managed_path(root: &Path, relative: &str) -> Result<PathBuf, SensitiveEr
     Ok(current)
 }
 
+#[derive(Debug)]
+struct ViewGroup {
+    relative_root: String,
+    items: Vec<FileItem>,
+}
+
+struct LockedViewPin {
+    item: FileItem,
+    _file: File,
+}
+
+#[derive(Debug)]
+enum ViewBlock {
+    Busy,
+    Unclassified,
+}
+
+fn split_view_item(relative_path: &str) -> Option<(&str, &str)> {
+    let suffix = relative_path.strip_prefix("views/")?;
+    let (name, suffix) = suffix.split_once('/')?;
+    if name.is_empty() || name == "." || name == ".." {
+        return None;
+    }
+    Some((name, suffix))
+}
+
+fn view_groups(items: &[FileItem]) -> (Vec<ViewGroup>, Vec<String>) {
+    let mut grouped = BTreeMap::<String, Vec<FileItem>>::new();
+    let mut unknown = Vec::new();
+    for item in items {
+        if item.relative_path == "views/" {
+            continue;
+        }
+        if !item.relative_path.starts_with("views/") {
+            continue;
+        }
+        let Some((name, _)) = split_view_item(&item.relative_path) else {
+            unknown.push(item.relative_path.clone());
+            continue;
+        };
+        grouped
+            .entry(name.to_owned())
+            .or_default()
+            .push(item.clone());
+    }
+    let groups = grouped
+        .into_iter()
+        .map(|(name, mut items)| {
+            items.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+            ViewGroup {
+                relative_root: format!("views/{name}/"),
+                items,
+            }
+        })
+        .collect();
+    (groups, unknown)
+}
+
+fn parse_generation_component(component: &str) -> Option<u64> {
+    let number = component.strip_prefix("gen-")?.parse::<u64>().ok()?;
+    (number > 0 && component == format!("gen-{number}")).then_some(number)
+}
+
+fn validate_view_inventory(group: &ViewGroup) -> Result<BTreeSet<u64>, ()> {
+    let mut generations = BTreeSet::new();
+    let mut has_root = false;
+    let mut has_current = false;
+    let mut has_holds = false;
+    let mut has_hold_entries = false;
+    let mut generation_rows = BTreeSet::new();
+    let mut pin_rows = BTreeSet::new();
+    let mut manifest_rows = BTreeSet::new();
+    let mut facts_rows = BTreeSet::new();
+
+    for item in &group.items {
+        let Some(relative) = item.relative_path.strip_prefix(&group.relative_root) else {
+            return Err(());
+        };
+        if relative.is_empty() {
+            if !is_directory_item(&item.relative_path) {
+                return Err(());
+            }
+            has_root = true;
+            continue;
+        }
+        let trimmed = relative.strip_suffix('/').unwrap_or(relative);
+        let components = trimmed.split('/').collect::<Vec<_>>();
+        if components
+            .iter()
+            .any(|part| part.is_empty() || *part == "." || *part == "..")
+        {
+            return Err(());
+        }
+        match components.as_slice() {
+            ["CURRENT"] if !is_directory_item(&item.relative_path) => has_current = true,
+            [".lifecycle.lock"] | [".build.lock"] | ["RETIRED"]
+                if !is_directory_item(&item.relative_path) => {}
+            ["holds"] if is_directory_item(&item.relative_path) => has_holds = true,
+            ["holds", _] if !is_directory_item(&item.relative_path) => {
+                has_hold_entries = true;
+            }
+            [generation] if is_directory_item(&item.relative_path) => {
+                let number = parse_generation_component(generation).ok_or(())?;
+                generations.insert(number);
+                generation_rows.insert(number);
+            }
+            [generation, ".pin"] if !is_directory_item(&item.relative_path) => {
+                let number = parse_generation_component(generation).ok_or(())?;
+                generations.insert(number);
+                pin_rows.insert(number);
+            }
+            [generation, "manifest.json"] if !is_directory_item(&item.relative_path) => {
+                let number = parse_generation_component(generation).ok_or(())?;
+                generations.insert(number);
+                manifest_rows.insert(number);
+            }
+            [generation, "facts"] if is_directory_item(&item.relative_path) => {
+                let number = parse_generation_component(generation).ok_or(())?;
+                generations.insert(number);
+                facts_rows.insert(number);
+            }
+            [generation, "facts", ..] if components.len() > 2 => {
+                let number = parse_generation_component(generation).ok_or(())?;
+                generations.insert(number);
+            }
+            _ => return Err(()),
+        }
+    }
+    if !has_root || !has_current || generations.is_empty() || has_hold_entries && !has_holds {
+        return Err(());
+    }
+    if generations.iter().any(|number| {
+        !generation_rows.contains(number)
+            || !pin_rows.contains(number)
+            || !manifest_rows.contains(number)
+            || !facts_rows.contains(number)
+    }) {
+        return Err(());
+    }
+    Ok(generations)
+}
+
+fn view_item_states(
+    store: &CollaborationStore,
+    incident_id: &str,
+    items: &[FileItem],
+) -> Result<BTreeMap<String, String>, SensitiveError> {
+    let mut states = BTreeMap::new();
+    let mut statement = store
+        .read_connection()
+        .prepare("SELECT relative_path,state FROM local_sensitive_items WHERE incident_id=?1")?;
+    let rows = statement.query_map([incident_id], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    for row in rows {
+        let (path, state) = row?;
+        if items.iter().any(|item| item.relative_path == path) {
+            states.insert(path, state);
+        }
+    }
+    if items
+        .iter()
+        .any(|item| !states.contains_key(&item.relative_path))
+    {
+        return Err(SensitiveError::Invalid(
+            "view item is absent from the immutable inventory state".into(),
+        ));
+    }
+    Ok(states)
+}
+
+fn has_prior_view_refusal(
+    store: &CollaborationStore,
+    incident_id: &str,
+    relative_root: &str,
+) -> Result<bool, SensitiveError> {
+    Ok(store.read_connection().query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM local_sensitive_residuals
+             WHERE incident_id=?1 AND permanence='unclassified'
+               AND (relative_path=?2 OR substr(relative_path,1,length(?2))=?2)
+         )",
+        rusqlite::params![incident_id, relative_root],
+        |row| row.get(0),
+    )?)
+}
+
+fn record_view_block(
+    store: &mut CollaborationStore,
+    incident_id: &str,
+    relative_root: &str,
+    block: ViewBlock,
+) -> Result<bool, SensitiveError> {
+    match block {
+        ViewBlock::Busy => add_residual(
+            store,
+            incident_id,
+            "analysis_view_reader_or_hold_active",
+            relative_root,
+            "transient",
+        )?,
+        ViewBlock::Unclassified => add_residual(
+            store,
+            incident_id,
+            "analysis_view_layout_unclassified",
+            relative_root,
+            "unclassified",
+        )?,
+    }
+    Ok(false)
+}
+
+fn strict_current_generation(path: &Path) -> Result<u64, ()> {
+    let bytes = fs::read(path).map_err(|_| ())?;
+    let text = bytes.strip_suffix(b"\n").ok_or(())?;
+    let text = std::str::from_utf8(text).map_err(|_| ())?;
+    let number = text
+        .strip_prefix("gen-")
+        .ok_or(())?
+        .parse::<u64>()
+        .map_err(|_| ())?;
+    if number == 0 || text != format!("gen-{number}") {
+        return Err(());
+    }
+    Ok(number)
+}
+
+fn scan_view_tree(
+    store: &CollaborationStore,
+    group: &ViewGroup,
+) -> Result<(BTreeMap<String, FileItem>, Vec<String>), SensitiveError> {
+    let mut actual = Vec::new();
+    let mut unknown = Vec::new();
+    collect_view_tree(
+        store,
+        Path::new(group.relative_root.trim_end_matches('/')),
+        &mut actual,
+        &mut unknown,
+    )?;
+    Ok((
+        actual
+            .into_iter()
+            .map(|item| (item.relative_path.clone(), item))
+            .collect(),
+        unknown,
+    ))
+}
+
+fn actual_view_matches_inventory(
+    group: &ViewGroup,
+    states: &BTreeMap<String, String>,
+    actual: &BTreeMap<String, FileItem>,
+    unknown: &[String],
+) -> bool {
+    if !unknown.is_empty() {
+        return false;
+    }
+    if actual
+        .keys()
+        .any(|path| !group.items.iter().any(|item| item.relative_path == *path))
+    {
+        return false;
+    }
+    for item in &group.items {
+        let Some(state) = states.get(&item.relative_path) else {
+            return false;
+        };
+        match (actual.get(&item.relative_path), state.as_str()) {
+            (Some(found), "pending")
+                if found.sha256 == item.sha256
+                    && found.bytes == item.bytes
+                    && is_directory_item(&found.relative_path)
+                        == is_directory_item(&item.relative_path) => {}
+            (None, "deleted") => {}
+            _ => return false,
+        }
+    }
+    true
+}
+
+fn hold_state(view_path: &Path) -> Result<Option<bool>, ()> {
+    let holds = view_path.join("holds");
+    match fs::symlink_metadata(&holds) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(()),
+        Ok(metadata) if metadata.file_type().is_dir() => {}
+        Ok(_) => return Err(()),
+    }
+    let entries = fs::read_dir(&holds).map_err(|_| ())?;
+    let mut has_hold = false;
+    let mut has_unknown = false;
+    for entry in entries {
+        let entry = entry.map_err(|_| ())?;
+        let metadata = entry.file_type().map_err(|_| ())?;
+        let filename = entry.file_name().to_string_lossy().into_owned();
+        let entry_metadata = fs::symlink_metadata(entry.path()).map_err(|_| ())?;
+        if !metadata.is_file()
+            || metadata.is_symlink()
+            || !entry_metadata.file_type().is_file()
+            || entry_metadata.len() > 4096
+        {
+            has_unknown = true;
+            continue;
+        }
+        let mut options = OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        }
+        let bytes = match options.open(entry.path()).and_then(|file| {
+            let opened = file.metadata()?;
+            if !opened.is_file() || opened.len() != entry_metadata.len() {
+                return Err(std::io::Error::other("view hold changed during open"));
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                if opened.dev() != entry_metadata.dev() || opened.ino() != entry_metadata.ino() {
+                    return Err(std::io::Error::other("view hold changed during open"));
+                }
+            }
+            let mut bytes = Vec::new();
+            let mut limited = file.take(4097);
+            limited.read_to_end(&mut bytes)?;
+            if bytes.len() > 4096 {
+                return Err(std::io::Error::other("view hold exceeds metadata limit"));
+            }
+            Ok(bytes)
+        }) {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                has_unknown = true;
+                continue;
+            }
+        };
+        match serde_json::from_slice::<crate::analysis_view::ViewHold>(&bytes) {
+            Ok(hold)
+                if !hold.holder.is_empty()
+                    && hold.holder.len() <= 200
+                    && filename == hold_filename(&hold.holder) =>
+            {
+                // Even expired holds remain blockers until explicitly released.
+                has_hold = true;
+            }
+            _ => has_unknown = true,
+        }
+    }
+    if has_unknown {
+        Err(())
+    } else {
+        Ok(has_hold.then_some(true))
+    }
+}
+
+fn hold_filename(holder: &str) -> String {
+    let digest = format!("{:x}", Sha256::digest(holder.as_bytes()));
+    format!("{}.json", &digest[..32])
+}
+
+#[cfg(unix)]
+fn open_and_lock_view_pin(path: &Path, item: &FileItem) -> Result<File, ViewBlock> {
+    let before = fs::symlink_metadata(path).map_err(|_| ViewBlock::Unclassified)?;
+    if !before.file_type().is_file() {
+        return Err(ViewBlock::Unclassified);
+    }
+    let (before_digest, before_bytes) = hash_file(path).map_err(|_| ViewBlock::Unclassified)?;
+    if before_digest != item.sha256 || before_bytes != item.bytes {
+        return Err(ViewBlock::Unclassified);
+    }
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let mut file = options.open(path).map_err(|_| ViewBlock::Unclassified)?;
+    let opened = file.metadata().map_err(|_| ViewBlock::Unclassified)?;
+    if !opened.is_file() || opened.len() != before.len() {
+        return Err(ViewBlock::Unclassified);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if opened.dev() != before.dev() || opened.ino() != before.ino() {
+            return Err(ViewBlock::Unclassified);
+        }
+    }
+    match file.try_lock() {
+        Ok(()) => {}
+        Err(std::fs::TryLockError::WouldBlock) => return Err(ViewBlock::Busy),
+        Err(std::fs::TryLockError::Error(_)) => return Err(ViewBlock::Unclassified),
+    }
+    file.rewind().map_err(|_| ViewBlock::Unclassified)?;
+    let mut hash = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|_| ViewBlock::Unclassified)?;
+        if read == 0 {
+            break;
+        }
+        hash.update(&buffer[..read]);
+    }
+    if format!("sha256:{:x}", hash.finalize()) != item.sha256 {
+        return Err(ViewBlock::Unclassified);
+    }
+    Ok(file)
+}
+
+#[cfg(not(unix))]
+fn open_and_lock_view_pin(_path: &Path, _item: &FileItem) -> Result<File, ViewBlock> {
+    Err(ViewBlock::Unclassified)
+}
+
+fn set_view_item_deleted(
+    store: &mut CollaborationStore,
+    incident_id: &str,
+    item: &FileItem,
+) -> Result<(), SensitiveError> {
+    let changed = store.connection().execute(
+        "UPDATE local_sensitive_items SET state='deleted'
+         WHERE incident_id=?1 AND relative_path=?2 AND state='pending'",
+        rusqlite::params![incident_id, item.relative_path],
+    )?;
+    if changed == 0 {
+        let state: Option<String> = store
+            .read_connection()
+            .query_row(
+                "SELECT state FROM local_sensitive_items
+                 WHERE incident_id=?1 AND relative_path=?2",
+                rusqlite::params![incident_id, item.relative_path],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if state.as_deref() != Some("deleted") {
+            return Err(SensitiveError::Invalid(
+                "view item state could not be durably advanced".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn delete_view_file(
+    store: &mut CollaborationStore,
+    incident_id: &str,
+    item: &FileItem,
+) -> Result<(), SensitiveError> {
+    let path = safe_managed_path(store.project_dir(), &item.relative_path)?;
+    match fs::symlink_metadata(&path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let state: Option<String> = store
+                .read_connection()
+                .query_row(
+                    "SELECT state FROM local_sensitive_items
+                     WHERE incident_id=?1 AND relative_path=?2",
+                    rusqlite::params![incident_id, item.relative_path],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if state.as_deref() != Some("deleted") {
+                return Err(SensitiveError::Invalid(
+                    "pending view file disappeared before durable state".into(),
+                ));
+            }
+        }
+        Err(error) => return Err(error.into()),
+        Ok(metadata) => {
+            if !metadata.file_type().is_file() {
+                return Err(SensitiveError::Invalid(
+                    "view file changed type after preflight".into(),
+                ));
+            }
+            let (digest, bytes) = hash_file(&path)?;
+            if digest != item.sha256 || bytes != item.bytes {
+                return Err(SensitiveError::Invalid(
+                    "view file changed after preflight".into(),
+                ));
+            }
+            fs::remove_file(&path)?;
+            if let Some(parent) = path.parent() {
+                sync_directory(parent)?;
+            }
+            set_view_item_deleted(store, incident_id, item)?;
+        }
+    }
+    Ok(())
+}
+
+fn delete_view_directory(
+    store: &mut CollaborationStore,
+    incident_id: &str,
+    item: &FileItem,
+) -> Result<(), SensitiveError> {
+    let path = safe_managed_path(store.project_dir(), &item.relative_path)?;
+    match fs::symlink_metadata(&path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let state: Option<String> = store
+                .read_connection()
+                .query_row(
+                    "SELECT state FROM local_sensitive_items
+                     WHERE incident_id=?1 AND relative_path=?2",
+                    rusqlite::params![incident_id, item.relative_path],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if state.as_deref() != Some("deleted") {
+                return Err(SensitiveError::Invalid(
+                    "pending view directory disappeared before durable state".into(),
+                ));
+            }
+        }
+        Err(error) => return Err(error.into()),
+        Ok(metadata) => {
+            if !metadata.file_type().is_dir() {
+                return Err(SensitiveError::Invalid(
+                    "view directory changed type after preflight".into(),
+                ));
+            }
+            if fs::read_dir(&path)?.next().transpose()?.is_some() {
+                return Err(SensitiveError::Invalid(
+                    "view directory is not empty after child deletion".into(),
+                ));
+            }
+            fs::remove_dir(&path)?;
+            if let Some(parent) = path.parent() {
+                sync_directory(parent)?;
+            }
+            set_view_item_deleted(store, incident_id, item)?;
+        }
+    }
+    Ok(())
+}
+
+fn delete_view_group(
+    store: &mut CollaborationStore,
+    incident_id: &str,
+    group: &ViewGroup,
+) -> Result<bool, SensitiveError> {
+    if has_prior_view_refusal(store, incident_id, &group.relative_root)? {
+        return Ok(false);
+    }
+    let states = view_item_states(store, incident_id, &group.items)?;
+    let generations = match validate_view_inventory(group) {
+        Ok(generations) => generations,
+        Err(()) => {
+            return record_view_block(
+                store,
+                incident_id,
+                &group.relative_root,
+                ViewBlock::Unclassified,
+            );
+        }
+    };
+    let (actual, unknown) = match scan_view_tree(store, group) {
+        Ok(found) => found,
+        Err(_) => {
+            return record_view_block(
+                store,
+                incident_id,
+                &group.relative_root,
+                ViewBlock::Unclassified,
+            );
+        }
+    };
+    if !actual_view_matches_inventory(group, &states, &actual, &unknown) {
+        return record_view_block(
+            store,
+            incident_id,
+            &group.relative_root,
+            ViewBlock::Unclassified,
+        );
+    }
+    if group.items.iter().all(|item| {
+        states
+            .get(&item.relative_path)
+            .is_some_and(|state| state == "deleted")
+    }) {
+        return Ok(true);
+    }
+
+    let view_path = store
+        .project_dir()
+        .join(group.relative_root.trim_end_matches('/'));
+    match hold_state(&view_path) {
+        Ok(Some(true)) => {
+            return record_view_block(store, incident_id, &group.relative_root, ViewBlock::Busy);
+        }
+        Err(()) => {
+            return record_view_block(
+                store,
+                incident_id,
+                &group.relative_root,
+                ViewBlock::Unclassified,
+            );
+        }
+        Ok(None | Some(false)) => {}
+    }
+
+    let current_item = group
+        .items
+        .iter()
+        .find(|item| item.relative_path == format!("{}CURRENT", group.relative_root))
+        .ok_or_else(|| SensitiveError::Invalid("view inventory has no CURRENT row".into()))?;
+    let current_present = actual.contains_key(&current_item.relative_path);
+    if current_present {
+        match strict_current_generation(&store.project_dir().join(&current_item.relative_path)) {
+            Ok(current) if generations.contains(&current) => {}
+            _ => {
+                return record_view_block(
+                    store,
+                    incident_id,
+                    &group.relative_root,
+                    ViewBlock::Unclassified,
+                );
+            }
+        }
+    }
+    let non_pin_files_deleted = group
+        .items
+        .iter()
+        .filter(|item| {
+            !is_directory_item(&item.relative_path) && !item.relative_path.ends_with("/.pin")
+        })
+        .all(|item| {
+            states
+                .get(&item.relative_path)
+                .is_some_and(|state| state == "deleted")
+                && !actual.contains_key(&item.relative_path)
+        });
+    let terminal_metadata_only = !current_present
+        && states
+            .get(&current_item.relative_path)
+            .is_some_and(|state| state == "deleted")
+        && non_pin_files_deleted;
+    if !current_present && !terminal_metadata_only {
+        return record_view_block(
+            store,
+            incident_id,
+            &group.relative_root,
+            ViewBlock::Unclassified,
+        );
+    }
+
+    let mut pins = Vec::new();
+    for generation in &generations {
+        let pin_path = format!("{}gen-{generation}/.pin", group.relative_root);
+        let Some(pin_item) = group
+            .items
+            .iter()
+            .find(|item| item.relative_path == pin_path)
+        else {
+            return record_view_block(
+                store,
+                incident_id,
+                &group.relative_root,
+                ViewBlock::Unclassified,
+            );
+        };
+        match actual.get(&pin_path) {
+            Some(_)
+                if states
+                    .get(&pin_path)
+                    .is_some_and(|state| state == "pending") =>
+            {
+                let path = store.project_dir().join(&pin_path);
+                match open_and_lock_view_pin(&path, pin_item) {
+                    Ok(file) => pins.push(LockedViewPin {
+                        item: pin_item.clone(),
+                        _file: file,
+                    }),
+                    Err(block) => {
+                        return record_view_block(store, incident_id, &group.relative_root, block);
+                    }
+                }
+            }
+            None if states
+                .get(&pin_path)
+                .is_some_and(|state| state == "deleted")
+                && terminal_metadata_only => {}
+            _ => {
+                return record_view_block(
+                    store,
+                    incident_id,
+                    &group.relative_root,
+                    ViewBlock::Unclassified,
+                );
+            }
+        }
+    }
+
+    let deletion = (|| -> Result<(), SensitiveError> {
+        // Content files go first, with CURRENT and every pin still in place.
+        for item in &group.items {
+            if !is_directory_item(&item.relative_path)
+                && item
+                    .relative_path
+                    .starts_with(&format!("{}gen-", group.relative_root))
+                && !item.relative_path.ends_with("/.pin")
+            {
+                delete_view_file(store, incident_id, item)?;
+            }
+        }
+        // Other inventoried metadata files are removed only after generation
+        // content, while CURRENT and pins still protect the old view shape.
+        for item in &group.items {
+            if is_directory_item(&item.relative_path)
+                || item.relative_path == current_item.relative_path
+                || item.relative_path.ends_with("/.pin")
+                || item
+                    .relative_path
+                    .starts_with(&format!("{}gen-", group.relative_root))
+            {
+                continue;
+            }
+            delete_view_file(store, incident_id, item)?;
+        }
+        if current_present {
+            delete_view_file(store, incident_id, current_item)?;
+        }
+        // All extant pin locks remain held through the last pin unlink.
+        for pin in &pins {
+            delete_view_file(store, incident_id, &pin.item)?;
+        }
+        let mut directories = group
+            .items
+            .iter()
+            .filter(|item| is_directory_item(&item.relative_path))
+            .collect::<Vec<_>>();
+        directories.sort_by_key(|item| std::cmp::Reverse(item.relative_path.matches('/').count()));
+        for item in directories {
+            delete_view_directory(store, incident_id, item)?;
+        }
+        Ok(())
+    })();
+    match deletion {
+        Ok(()) => Ok(true),
+        Err(SensitiveError::Sqlite(error)) => Err(SensitiveError::Sqlite(error)),
+        Err(SensitiveError::State(error)) => Err(SensitiveError::State(error)),
+        Err(error) => record_view_block(
+            store,
+            incident_id,
+            &group.relative_root,
+            if matches!(error, SensitiveError::Io(_)) {
+                ViewBlock::Busy
+            } else {
+                ViewBlock::Unclassified
+            },
+        ),
+    }
+}
+
+fn delete_views_root(
+    store: &mut CollaborationStore,
+    incident_id: &str,
+    inventory: &[FileItem],
+    states: &BTreeMap<String, String>,
+    groups_complete: bool,
+) -> Result<bool, SensitiveError> {
+    let Some(item) = inventory.iter().find(|item| item.relative_path == "views/") else {
+        let child_views = inventory
+            .iter()
+            .any(|candidate| candidate.relative_path.starts_with("views/"));
+        let root = store.project_dir().join("views");
+        if child_views || fs::symlink_metadata(root).is_ok() {
+            add_residual(
+                store,
+                incident_id,
+                "analysis_view_inventory_incomplete",
+                "views/",
+                "unclassified",
+            )?;
+            return Ok(false);
+        }
+        return Ok(true);
+    };
+    let child_views = inventory
+        .iter()
+        .filter(|candidate| {
+            candidate.relative_path.starts_with("views/") && candidate.relative_path != "views/"
+        })
+        .collect::<Vec<_>>();
+    if child_views.is_empty() {
+        return record_view_block(store, incident_id, "views/", ViewBlock::Unclassified);
+    }
+    if !groups_complete {
+        return Ok(false);
+    }
+    let Some(state) = states.get("views/") else {
+        return Err(SensitiveError::Invalid(
+            "views root is absent from the immutable state map".into(),
+        ));
+    };
+    let path = safe_managed_path(store.project_dir(), "views/")?;
+    match fs::symlink_metadata(&path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && state == "deleted" => {
+            Ok(true)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            record_view_block(store, incident_id, "views/", ViewBlock::Unclassified)
+        }
+        Err(error) => Err(error.into()),
+        Ok(metadata) if metadata.file_type().is_dir() && state == "pending" => {
+            if fs::read_dir(&path)?.next().transpose()?.is_some() {
+                return record_view_block(store, incident_id, "views/", ViewBlock::Unclassified);
+            }
+            fs::remove_dir(&path)?;
+            sync_directory(store.project_dir())?;
+            set_view_item_deleted(store, incident_id, item)?;
+            Ok(true)
+        }
+        Ok(_) => record_view_block(store, incident_id, "views/", ViewBlock::Unclassified),
+    }
+}
+
 fn delete_inventory_item(
     store: &mut CollaborationStore,
     incident_id: &str,
     item: &FileItem,
 ) -> Result<bool, SensitiveError> {
-    if item.relative_path == "views" || item.relative_path.starts_with("views/") {
-        add_residual(
-            store,
-            incident_id,
-            "analysis_view_retained_for_reader_safety",
-            &item.relative_path,
-            "unmanaged",
-        )?;
-        store.connection().execute(
-            "UPDATE local_sensitive_items SET state='residual'
-             WHERE incident_id=?1 AND relative_path=?2",
-            rusqlite::params![incident_id, item.relative_path],
-        )?;
-        return Ok(false);
-    }
     let path = safe_managed_path(store.project_dir(), &item.relative_path)?;
     match fs::symlink_metadata(&path) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -1750,7 +2695,26 @@ pub fn purge(
     )?;
     let inventory = prepare_inventory(store, &marker)?;
     let mut completed = true;
+    let (groups, malformed_view_paths) = view_groups(&inventory);
+    let has_views_root = inventory.iter().any(|item| item.relative_path == "views/");
+    let has_view_items = inventory
+        .iter()
+        .any(|item| item.relative_path.starts_with("views/"));
+    let mut groups_complete = true;
+    if !malformed_view_paths.is_empty() || (has_view_items && !has_views_root) {
+        add_residual(
+            store,
+            incident_id,
+            "analysis_view_inventory_incomplete",
+            "views/",
+            "unclassified",
+        )?;
+        groups_complete = false;
+    }
     for item in &inventory {
+        if item.relative_path == "views/" || item.relative_path.starts_with("views/") {
+            continue;
+        }
         let item_state: Option<String> = store
             .read_connection()
             .query_row(
@@ -1769,6 +2733,20 @@ pub fn purge(
         if !delete_inventory_item(store, incident_id, item)? {
             completed = false;
         }
+    }
+    if groups_complete {
+        for group in &groups {
+            if !delete_view_group(store, incident_id, group)? {
+                completed = false;
+                groups_complete = false;
+            }
+        }
+    } else if !groups.is_empty() {
+        completed = false;
+    }
+    let states = view_item_states(store, incident_id, &inventory)?;
+    if !delete_views_root(store, incident_id, &inventory, &states, groups_complete)? {
+        completed = false;
     }
     let unclassified: bool = store.read_connection().query_row(
         "SELECT EXISTS(SELECT 1 FROM local_sensitive_residuals WHERE incident_id=?1 AND permanence='unclassified')",
@@ -1813,7 +2791,7 @@ pub fn purge(
             )?;
             return Err(error);
         }
-        // Schema 23 readers and already-materialized process copies cannot be
+        // Older readers and already-materialized process copies cannot be
         // observed or revoked by this cooperative lock. Keep the permanent
         // quarantine state even after exact managed bytes have been removed.
         store.connection().execute(
@@ -1841,6 +2819,21 @@ mod tests {
             && haystack
                 .windows(needle.len())
                 .any(|window| window == needle)
+    }
+
+    fn view_snapshot(store: &CollaborationStore, view: &str) -> Vec<FileItem> {
+        let mut items = Vec::new();
+        let mut unknown = Vec::new();
+        collect_view_tree(
+            store,
+            Path::new(&format!("views/{view}")),
+            &mut items,
+            &mut unknown,
+        )
+        .unwrap();
+        assert!(unknown.is_empty());
+        items.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+        items
     }
 
     #[test]
@@ -1976,7 +2969,9 @@ mod tests {
         )
         .unwrap();
         let query = context::ContextQuery {
-            scope: vec![b"src/credential.rs".to_vec()],
+            // The captured contribution changes one.txt; credential.rs is
+            // present in both source snapshots and therefore is not a match.
+            scope: vec![b"one.txt".to_vec()],
             source: Some(capture_receipt.result.clone()),
             analysis: Vec::new(),
             budget: Default::default(),
@@ -2160,6 +3155,12 @@ mod tests {
         assert!(!rehearsed_root.exists());
         assert!(host_root.exists());
         assert!(project_dir.join("views").join(&view).exists());
+        let held_view = view_snapshot(store, &view);
+        assert!(first_purge.status.residuals.iter().any(|residual| {
+            residual.code == "analysis_view_reader_or_hold_active"
+                && residual.path == format!("views/{view}/")
+                && residual.resolved_ms.is_none()
+        }));
         assert!(source_worktree_copy.is_file());
         assert!(contains_bytes(
             &std::fs::read(&source_worktree_copy).unwrap(),
@@ -2181,25 +3182,36 @@ mod tests {
         assert!(contains_bytes(&remote_source.stdout, token_bytes));
         assert!(first_purge.status.residuals.iter().any(|residual| {
             residual.code == "captured_source_repository_copy"
-                && residual.path == source_repository.to_string_lossy().to_string()
+                && residual.path == source_repository.to_string_lossy()
         }));
         assert!(first_purge.status.residuals.iter().any(|residual| {
             residual.code == "git_worktrees_and_remotes" && residual.path.is_empty()
         }));
         assert!(first_purge.status.residuals.iter().any(|residual| {
             residual.code == "previous_external_export_copy"
-                && residual.path == export_path.to_string_lossy().to_string()
+                && residual.path == export_path.to_string_lossy()
         }));
         assert!(!first_purge.status.managed_cleanup_complete);
 
         assert!(
             crate::analysis_view::release_view_hold(store, &view, "t56-synthetic-holder").unwrap()
         );
+        let released_hold_view = view_snapshot(store, &view);
+        assert_ne!(held_view, released_hold_view);
+        let pin_busy_purge = purge(store, &incident_id, &quarantined.request_digest).unwrap();
+        assert!(!pin_busy_purge.completed);
+        assert_eq!(view_snapshot(store, &view), released_hold_view);
+        assert!(pin_busy_purge.status.residuals.iter().any(|residual| {
+            residual.code == "analysis_view_reader_or_hold_active"
+                && residual.path == format!("views/{view}/")
+                && residual.resolved_ms.is_none()
+        }));
         drop(reader);
         let final_purge = purge(store, &incident_id, &quarantined.request_digest).unwrap();
         assert!(!final_purge.completed);
-        assert!(!final_purge.status.managed_cleanup_complete);
-        assert!(project_dir.join("views").join(&view).exists());
+        assert!(final_purge.status.managed_cleanup_complete);
+        assert!(!project_dir.join("views").join(&view).exists());
+        assert!(!project_dir.join("views").exists());
         assert!(contains_bytes(
             &std::fs::read(&export_path).unwrap(),
             token_bytes

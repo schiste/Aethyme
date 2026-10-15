@@ -1210,7 +1210,7 @@ pub fn hold_view(
 
 /// Release `holder`'s hold on `view`. `false` when there was none.
 pub fn release_view_hold(
-    store: &CollaborationStore,
+    store: &mut CollaborationStore,
     view: &str,
     holder: &str,
 ) -> Result<bool, ViewError> {
@@ -1240,6 +1240,7 @@ pub fn release_view_hold(
     match std::fs::remove_file(&path) {
         Ok(()) => {
             sync_dir(&dir)?;
+            crate::collaboration_sensitive::record_released_view_hold(store, &path)?;
             Ok(true)
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
@@ -1747,7 +1748,7 @@ mod tests {
         hold_view(&store, &view, "x3-report-1", None).unwrap();
         age_views(&store);
         assert!(view_items(&mut store).is_empty(), "held");
-        assert!(release_view_hold(&store, &view, "x3-report-1").unwrap());
+        assert!(release_view_hold(&mut store, &view, "x3-report-1").unwrap());
         // An expired hold no longer protects.
         hold_view(&store, &view, "x3-report-2", Some(1)).unwrap();
         age_views(&store);
@@ -1790,7 +1791,7 @@ mod tests {
         .unwrap();
 
         assert!(open_view(&store, &view).is_err());
-        assert!(release_view_hold(&store, &view, "operator").unwrap());
+        assert!(release_view_hold(&mut store, &view, "operator").unwrap());
         assert!(open_view(&store, &view).is_err());
     }
 
@@ -2130,7 +2131,7 @@ mod tests {
         let view = build_view(&store, &snapshot, &options()).unwrap();
         hold_view(&store, &view, "l3-context", None).unwrap();
         assert_eq!(retire(&store, &view).unwrap_err().code(), "held");
-        release_view_hold(&store, &view, "l3-context").unwrap();
+        release_view_hold(&mut store, &view, "l3-context").unwrap();
         let reader = open_view(&store, &view).unwrap();
         assert_eq!(retire(&store, &view).unwrap_err().code(), "pinned");
         drop(reader);
