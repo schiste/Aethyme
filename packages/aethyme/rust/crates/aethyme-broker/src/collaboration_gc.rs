@@ -1245,7 +1245,21 @@ fn survey_views(
         let superseded_for_grace = std::fs::symlink_metadata(view.join("CURRENT"))
             .is_ok_and(|metadata| metadata.is_file())
             && modified_ms(&view.join("CURRENT")).is_some_and(|ms| ms <= now - grace_ms);
-        let held = crate::analysis_view::live_holds(&view, now) > 0;
+        let held = match crate::analysis_view::live_holds(&view, now) {
+            Ok(holds) => {
+                unknown.extend(
+                    holds
+                        .unknown
+                        .into_iter()
+                        .map(|file| format!("{relview}/holds/{file}")),
+                );
+                holds.count > 0
+            }
+            Err(_) => {
+                unknown.push(format!("{relview}/holds"));
+                true
+            }
+        };
         for entry in real_dir_entries(store, &relview, unknown)? {
             let file = entry
                 .file_name()
@@ -1301,7 +1315,7 @@ fn survey_views(
                 );
             } else if matches!(
                 file.as_str(),
-                ".build.lock" | "CURRENT" | "CURRENT.tmp" | "RETIRED"
+                ".build.lock" | ".lifecycle.lock" | "CURRENT" | "CURRENT.tmp" | "RETIRED"
             ) && metadata.is_file()
                 || (file == "holds" && is_dir)
             {
