@@ -1,0 +1,19 @@
+   Compiling aethyme-broker v0.8.26 (/private/tmp/t56-final-mutants-425a0bc/source/packages/aethyme/rust/crates/aethyme-broker)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 13.96s
+     Running unittests src/lib.rs (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/integrate-reviewed-local-bare-git-servic/target/local-resume/cargo/debug/deps/aethyme_broker-fafff990a47ccea3)
+
+running 1 test
+test collaboration_sensitive::tests::expired_view_hold_remains_a_blocker_until_explicit_release ... 
+thread 'collaboration_sensitive::tests::expired_view_hold_remains_a_blocker_until_explicit_release' (10986010) panicked at crates/aethyme-broker/src/collaboration_sensitive.rs:4474:9:
+assertion failed: view_root.exists()
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+
+failures:
+    collaboration_sensitive::tests::expired_view_hold_remains_a_blocker_until_explicit_release
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1866 filtered out; finished in 3.57s
+
+error: test failed, to rerun pass `-p aethyme-broker --lib`

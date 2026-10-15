@@ -1,0 +1,49 @@
+   Compiling aethyme-engine v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/implement-local-administrative-sensitive/packages/aethyme/rust/crates/aethyme-engine)
+   Compiling aethyme-broker v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/implement-local-administrative-sensitive/packages/aethyme/rust/crates/aethyme-broker)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1m 06s
+     Running unittests src/lib.rs (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/integrate-reviewed-local-bare-git-servic/target/local-resume/cargo/debug/deps/aethyme_broker-0f278e0d02146111)
+
+running 27 tests
+test local_authority::tests::authority_worker_child ... ignored, spawned by authority_process_survives_announced_restore
+test local_authority::tests::checkpoint_orders_equal_first_columns_independently_of_insertion_order ... ok
+test local_authority::tests::empty_initial_installation_recovers_witness_written_before_first_binding ... ok
+test local_authority::tests::an_active_witness_refuses_a_database_bound_to_another_epoch ... ok
+test local_authority::tests::a_mutation_guard_excludes_freeze_until_it_is_dropped ... ok
+test local_authority::tests::exact_resume_does_not_revive_an_old_owner_or_attempt_even_with_aba_state ... ok
+test local_authority::tests::a_frozen_witness_blocks_even_matching_database_and_handle_epochs ... ok
+test local_authority::tests::independent_checkpoint_vector_binds_table_types_and_row_bytes ... ok
+test local_authority::tests::completed_freeze_rebinds_the_frozen_epoch_and_allows_sensitive_quarantine ... FAILED
+test local_authority::tests::checkpoint_is_stable_across_reopen_and_detects_changed_budget_policy ... ok
+test local_authority::tests::escaped_reasons_and_details_remain_readable_at_the_source_byte_limit ... ok
+test local_authority::tests::announced_restore_behind_the_checkpoint_stays_frozen_with_old_handles_alive ... ok
+test local_authority::tests::authority_process_survives_announced_restore_and_cannot_mutate_current_data ... ok
+test local_authority::tests::first_authority_installation_excludes_previously_admitted_gc ... ok
+test local_authority::tests::identical_history_retry_flushes_both_directories_after_interrupted_flush ... ok
+test local_authority::tests::historical_local_records_survive_exact_initial_installation_recovery ... ok
+test local_authority::tests::freeze_rotates_external_authority_and_preserves_unknown_liveness_and_cost ... ok
+test local_authority::tests::initial_witness_is_outside_the_restorable_project_directory ... ok
+test local_authority::tests::interrupted_freeze_requires_explicit_completion_before_sensitive_response ... ok
+test local_authority::tests::interrupted_freeze_requires_exact_token_and_explicit_completion ... ok
+test local_authority::tests::legacy_version_one_active_witness_remains_readable ... ok
+test local_authority::tests::missing_or_corrupt_witness_cannot_be_reinitialized_from_restored_db ... ok
+test local_authority::tests::late_completion_is_historical_and_cannot_change_the_restored_target ... ok
+test local_authority::tests::populated_store_with_generic_missing_binding_stays_stale ... ok
+test local_authority::tests::real_gc_apply_holds_ingress_before_first_controller_installation ... ok
+test local_authority::tests::restored_matching_handle_and_database_cannot_bypass_the_current_witness ... ok
+test local_authority::tests::public_freeze_cannot_claim_initial_installation_origin_with_reserved_reason ... ok
+
+failures:
+
+---- local_authority::tests::completed_freeze_rebinds_the_frozen_epoch_and_allows_sensitive_quarantine stdout ----
+
+thread 'local_authority::tests::completed_freeze_rebinds_the_frozen_epoch_and_allows_sensitive_quarantine' (8280365) panicked at crates/aethyme-broker/src/local_authority/tests.rs:47:6:
+called `Result::unwrap()` on an `Err` value: Busy
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    local_authority::tests::completed_freeze_rebinds_the_frozen_epoch_and_allows_sensitive_quarantine
+
+test result: FAILED. 25 passed; 1 failed; 1 ignored; 0 measured; 1813 filtered out; finished in 10.58s
+
+error: test failed, to rerun pass `-p aethyme-broker --lib`

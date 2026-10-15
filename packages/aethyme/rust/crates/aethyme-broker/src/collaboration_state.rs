@@ -37,7 +37,7 @@ use serde::Serialize;
 pub use crate::host_state::HostStateSource;
 
 /// The schema this binary writes.
-pub const COLLABORATION_STATE_SCHEMA_VERSION: i64 = 23;
+pub const COLLABORATION_STATE_SCHEMA_VERSION: i64 = 24;
 /// The oldest schema a database written by this binary can be read by.
 /// Unlike `host-operations.db`, a newer database stays readable by an older
 /// binary until a release raises this floor.
@@ -63,7 +63,9 @@ pub const COLLABORATION_STATE_SCHEMA_VERSION: i64 = 23;
 // Schema 17 reclamation cannot see independently retained native gate jobs.
 // Schema 21 cannot interpret finite controller service appointments.
 // Schema 22 cannot interpret explicit native-job root release.
-const MIN_COMPATIBLE_SCHEMA: i64 = 23;
+// Schema 23 does not honor the permanent sensitive-response tombstone and
+// could read, recapture, or export data after administrative removal.
+const MIN_COMPATIBLE_SCHEMA: i64 = 24;
 const ROOT_DIRECTORY: &str = "collaboration";
 /// Schema steps after the version 1 layout (`meta` only), applied in
 /// order. Step 17 adds separately indexed historical imports and rehearsals. The floor is
@@ -501,6 +503,117 @@ const MIGRATIONS: &[(i64, &str)] = &[
     BEFORE UPDATE OF state ON local_native_gate_jobs
     WHEN OLD.roots_released_ms IS NOT NULL AND NEW.state<>OLD.state
     BEGIN SELECT RAISE(ABORT, 'native gate roots were released'); END;"),
+    (24, "CREATE TABLE local_sensitive_incidents (
+        id TEXT PRIMARY KEY NOT NULL,
+        project_key TEXT NOT NULL,
+        issuer_label TEXT NOT NULL,
+        operator_uid INTEGER NOT NULL CHECK(operator_uid >= 0),
+        authority_epoch TEXT NOT NULL,
+        scope_kind TEXT NOT NULL CHECK(scope_kind='project'),
+        scope_id TEXT NOT NULL,
+        reason_code TEXT NOT NULL CHECK(reason_code IN
+            ('suspected_test_secret_exposure','misrouted_context','operator_requested_purge')),
+        request_digest TEXT NOT NULL,
+        state TEXT NOT NULL CHECK(state IN ('quarantined','purging','purged')),
+        inventory_digest TEXT,
+        database_cleanup_completed_ms INTEGER,
+        created_ms INTEGER NOT NULL,
+        updated_ms INTEGER NOT NULL,
+        UNIQUE(scope_kind, scope_id)
+    ) STRICT;
+    CREATE TABLE local_sensitive_items (
+        incident_id TEXT NOT NULL REFERENCES local_sensitive_incidents(id),
+        relative_path TEXT NOT NULL,
+        sha256 TEXT NOT NULL,
+        bytes INTEGER NOT NULL CHECK(bytes >= 0),
+        state TEXT NOT NULL CHECK(state IN ('pending','deleted','residual')),
+        PRIMARY KEY(incident_id, relative_path)
+    ) STRICT;
+    CREATE TABLE local_sensitive_residuals (
+        incident_id TEXT NOT NULL REFERENCES local_sensitive_incidents(id),
+        code TEXT NOT NULL,
+        relative_path TEXT NOT NULL DEFAULT '',
+        permanence TEXT NOT NULL CHECK(permanence IN ('transient','unmanaged','unclassified')),
+        resolved_ms INTEGER,
+        PRIMARY KEY(incident_id, code, relative_path)
+    ) STRICT;
+    CREATE TABLE local_sensitive_exports (
+        path TEXT PRIMARY KEY NOT NULL,
+        kind TEXT NOT NULL CHECK(kind IN ('export','authority_history')),
+        sha256 TEXT NOT NULL,
+        bytes INTEGER NOT NULL CHECK(bytes >= 0),
+        state TEXT NOT NULL CHECK(state IN ('intent','present')),
+        created_ms INTEGER NOT NULL
+    ) STRICT;
+    CREATE TABLE local_sensitive_table_inventory (
+        incident_id TEXT NOT NULL REFERENCES local_sensitive_incidents(id),
+        table_name TEXT NOT NULL,
+        row_count INTEGER NOT NULL CHECK(row_count >= 0),
+        bytes INTEGER NOT NULL CHECK(bytes >= 0),
+        sha256 TEXT NOT NULL,
+        state TEXT NOT NULL CHECK(state IN ('pending','cleared')),
+        PRIMARY KEY(incident_id,table_name)
+    ) STRICT;
+    CREATE TRIGGER local_sensitive_incident_no_delete
+    BEFORE DELETE ON local_sensitive_incidents
+    BEGIN SELECT RAISE(ABORT, 'sensitive-response tombstones are permanent'); END;
+    CREATE TRIGGER local_sensitive_incident_scope_immutable
+    BEFORE UPDATE OF id,project_key,issuer_label,operator_uid,authority_epoch,
+        scope_kind,scope_id,reason_code,request_digest,created_ms
+    ON local_sensitive_incidents
+    BEGIN SELECT RAISE(ABORT, 'sensitive-response scope is immutable'); END;
+    CREATE TRIGGER local_sensitive_incident_state_monotone
+    BEFORE UPDATE OF state ON local_sensitive_incidents
+    WHEN NOT ((OLD.state='quarantined' AND NEW.state IN ('quarantined','purging')) OR
+        (OLD.state='purging' AND NEW.state IN ('quarantined','purging','purged')) OR
+        (OLD.state='purged' AND NEW.state='purged'))
+    BEGIN SELECT RAISE(ABORT, 'sensitive-response state cannot be reopened'); END;
+    CREATE TRIGGER local_sensitive_item_scope_immutable
+    BEFORE UPDATE OF incident_id,relative_path,sha256,bytes ON local_sensitive_items
+    BEGIN SELECT RAISE(ABORT, 'sensitive-response inventory is immutable'); END;
+    CREATE TRIGGER local_sensitive_item_no_delete
+    BEFORE DELETE ON local_sensitive_items
+    BEGIN SELECT RAISE(ABORT, 'sensitive-response inventory is permanent'); END;
+    CREATE TRIGGER local_sensitive_inventory_digest_immutable
+    BEFORE UPDATE OF inventory_digest ON local_sensitive_incidents
+    WHEN OLD.inventory_digest IS NOT NULL AND NEW.inventory_digest IS NOT OLD.inventory_digest
+    BEGIN SELECT RAISE(ABORT, 'sensitive-response inventory digest is immutable'); END;
+    CREATE TRIGGER local_sensitive_item_state_monotone
+    BEFORE UPDATE OF state ON local_sensitive_items
+    WHEN NOT (OLD.state=NEW.state OR (OLD.state='pending' AND NEW.state IN ('deleted','residual')))
+    BEGIN SELECT RAISE(ABORT, 'sensitive-response item state cannot be reopened'); END;
+    CREATE TRIGGER local_sensitive_residual_scope_immutable
+    BEFORE UPDATE OF incident_id,code,relative_path,permanence ON local_sensitive_residuals
+    BEGIN SELECT RAISE(ABORT, 'sensitive-response residual identity is immutable'); END;
+    CREATE TRIGGER local_sensitive_residual_no_delete
+    BEFORE DELETE ON local_sensitive_residuals
+    BEGIN SELECT RAISE(ABORT, 'sensitive-response residual history is permanent'); END;
+    CREATE TRIGGER local_sensitive_export_no_delete
+    BEFORE DELETE ON local_sensitive_exports
+    BEGIN SELECT RAISE(ABORT, 'sensitive-response export inventory is permanent'); END;
+    CREATE TRIGGER local_sensitive_export_identity_immutable
+    BEFORE UPDATE OF path,kind,sha256,bytes,created_ms ON local_sensitive_exports
+    BEGIN SELECT RAISE(ABORT, 'sensitive-response export identity is immutable'); END;
+    CREATE TRIGGER local_sensitive_export_state_monotone
+    BEFORE UPDATE OF state ON local_sensitive_exports
+    WHEN NOT (OLD.state=NEW.state OR (OLD.state='intent' AND NEW.state='present'))
+    BEGIN SELECT RAISE(ABORT, 'sensitive-response export state cannot be reopened'); END;
+    CREATE TRIGGER local_sensitive_table_inventory_identity_immutable
+    BEFORE UPDATE OF incident_id,table_name,row_count,bytes,sha256
+    ON local_sensitive_table_inventory
+    BEGIN SELECT RAISE(ABORT, 'sensitive-response table inventory is immutable'); END;
+    CREATE TRIGGER local_sensitive_table_inventory_no_delete
+    BEFORE DELETE ON local_sensitive_table_inventory
+    BEGIN SELECT RAISE(ABORT, 'sensitive-response table inventory is permanent'); END;
+    CREATE TRIGGER local_sensitive_table_inventory_state_monotone
+    BEFORE UPDATE OF state ON local_sensitive_table_inventory
+    WHEN NOT (OLD.state=NEW.state OR (OLD.state='pending' AND NEW.state='cleared'))
+    BEGIN SELECT RAISE(ABORT, 'sensitive-response table inventory state cannot be reopened'); END;
+    CREATE TRIGGER local_sensitive_database_cleanup_receipt_immutable
+    BEFORE UPDATE OF database_cleanup_completed_ms ON local_sensitive_incidents
+    WHEN OLD.database_cleanup_completed_ms IS NOT NULL
+        OR NEW.database_cleanup_completed_ms IS NULL
+    BEGIN SELECT RAISE(ABORT, 'sensitive-response database cleanup receipt is immutable'); END;"),
 ];
 /// The file that marks a directory as a collaboration root.
 pub const ROOT_MARKER: &str = ".aethyme-collaboration-root.json";
@@ -1815,6 +1928,10 @@ mod tests {
         let mut store = open(host.path(), &[]).unwrap();
         assert_eq!(floor(&store), MIN_COMPATIBLE_SCHEMA);
         // As a schema 3 binary left it.
+        crate::collaboration_sensitive::drop_sensitive_response_tables_for_legacy_fixture(
+            store.connection(),
+        )
+        .unwrap();
         store
             .connection()
             .execute_batch(
@@ -1838,7 +1955,7 @@ mod tests {
         let versions: Vec<i64> = MIGRATIONS.iter().map(|(version, _)| *version).collect();
         let expected: Vec<i64> = (2..=COLLABORATION_STATE_SCHEMA_VERSION).collect();
         assert_eq!(versions, expected);
-        assert_eq!(MIN_COMPATIBLE_SCHEMA, 23);
+        assert_eq!(MIN_COMPATIBLE_SCHEMA, 24);
         const { assert!(MIN_COMPATIBLE_SCHEMA <= COLLABORATION_STATE_SCHEMA_VERSION) };
         // A schema 4 binary's reclamation does not keep attached briefs; a
         // schema 5 binary posts no broad-risk keys and purges no cache entry.
@@ -1852,6 +1969,10 @@ mod tests {
     fn inspection_reads_without_migrating_or_writing() {
         let host = tempfile::tempdir().unwrap();
         let mut store = open(host.path(), &[]).unwrap();
+        crate::collaboration_sensitive::drop_sensitive_response_tables_for_legacy_fixture(
+            store.connection(),
+        )
+        .unwrap();
         store
             .connection()
             .execute_batch(

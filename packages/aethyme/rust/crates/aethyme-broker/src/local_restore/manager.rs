@@ -62,6 +62,7 @@ fn native_spec(
     bundle: &VerifiedBundle,
 ) -> Result<ImportSpec, RestoreError> {
     let _guard = target::authorize(store, owner)?;
+    let _response = crate::collaboration_sensitive::response_use(store)?;
     Ok(ImportSpec {
         profile: PROFILE.into(),
         bundle: bundle.digest.hex(),
@@ -116,6 +117,7 @@ pub(super) fn import_with(
 ) -> Result<HistoricalImport, RestoreError> {
     let _guard = target::authorize(store, owner)?;
     let _archive = gc::archive_use(store)?;
+    let _response = crate::collaboration_sensitive::response_use(store)?;
     if native_spec(store, owner, bundle)? != binding.spec {
         return Err(RestoreError::Binding);
     }
@@ -249,6 +251,7 @@ fn load(
 }
 pub fn show(store: &CollaborationStore, id: &RecordId) -> Result<HistoricalImport, RestoreError> {
     let _archive = gc::archive_use(store)?;
+    let _response = crate::collaboration_sensitive::response_use(store)?;
     let (_, bundle) = load(store, id)?;
     Ok(HistoricalImport {
         id: id.clone(),
@@ -372,6 +375,7 @@ pub(super) fn rehearse_with(
     }
     let _guard = target::authorize(store, owner)?;
     let _archive = gc::archive_use(store)?;
+    let _response = crate::collaboration_sensitive::response_use(store)?;
     let (_, bundle) = load(store, import_id)?;
     if !bundle.header.sources.contains(&source.to_string()) {
         return Err(RestoreError::Missing(source.to_string()));

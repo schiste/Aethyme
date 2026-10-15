@@ -1,0 +1,17 @@
+{
+  "source": "/private/tmp/t56-cb857-norun-tmp",
+  "captured_at_utc": "2026-10-15T21:09:13.427244+00:00",
+  "scope": "Source-bound attempts preserved including setup denial and compile-only without test credit",
+  "files": [
+    {
+      "path": "command-escalated.log",
+      "bytes": 730,
+      "sha256": "16873633492994dac2aae2186c968cdf89a08c7a16450569539f0c6b657cf088"
+    },
+    {
+      "path": "command.log",
+      "bytes": 253,
+      "sha256": "6b3912d83b92ec44f1b105e6b6f715cc4d7cf55a9b13bec14f40dff30c37d786"
+    }
+  ]
+}

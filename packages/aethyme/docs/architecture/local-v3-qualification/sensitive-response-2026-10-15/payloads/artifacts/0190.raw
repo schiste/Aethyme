@@ -1,0 +1,17 @@
+   Compiling aethyme-graph-schema v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/implement-local-administrative-sensitive/packages/aethyme/rust/crates/aethyme-graph-schema)
+   Compiling aethyme-testkit v0.1.0 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/implement-local-administrative-sensitive/packages/aethyme/rust/crates/aethyme-testkit)
+   Compiling aethyme-enhance v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/implement-local-administrative-sensitive/packages/aethyme/rust/crates/aethyme-enhance)
+   Compiling aethyme-contracts v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/implement-local-administrative-sensitive/packages/aethyme/rust/crates/aethyme-contracts)
+   Compiling aethyme-graph-storage v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/implement-local-administrative-sensitive/packages/aethyme/rust/crates/aethyme-graph-storage)
+   Compiling aethyme-producers v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/implement-local-administrative-sensitive/packages/aethyme/rust/crates/aethyme-producers)
+   Compiling aethyme-graph-indexer v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/implement-local-administrative-sensitive/packages/aethyme/rust/crates/aethyme-graph-indexer)
+   Compiling aethyme-engine v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/implement-local-administrative-sensitive/packages/aethyme/rust/crates/aethyme-engine)
+   Compiling aethyme-broker v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/implement-local-administrative-sensitive/packages/aethyme/rust/crates/aethyme-broker)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1m 09s
+     Running unittests src/lib.rs (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/integrate-reviewed-local-bare-git-servic/target/local-resume/cargo/debug/deps/aethyme_broker-0f278e0d02146111)
+
+running 1 test
+test local_authority::tests::completed_freeze_rebinds_the_frozen_epoch_and_allows_sensitive_quarantine ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1834 filtered out; finished in 0.88s
+

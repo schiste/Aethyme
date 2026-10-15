@@ -1,0 +1,9 @@
+{
+  "copied_at_utc": "2026-10-15T20:16:56.044608+00:00",
+  "source": "/private/tmp/t56-norun-v4-readerror-pJmaeC/compile.log",
+  "copy": "target/local-resume/t56-compile-history-20261015T1955/t56-69e820-readerror-compile.log",
+  "bytes": 1882,
+  "sha256": "f2f34442da601225e00da32b4ca514ff955d25fb3feef8c6195ce925b62106a8",
+  "kind": "compile-only PASS0, no test execution",
+  "source_commit": "69e8202a64dea2d2aa45d64ce89b223fc76b48a1"
+}

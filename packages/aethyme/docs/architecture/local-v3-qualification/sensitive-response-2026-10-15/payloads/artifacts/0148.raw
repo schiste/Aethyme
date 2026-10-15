@@ -1,0 +1,38 @@
+{
+  "captures": {
+    "attention": [],
+    "by_state": {},
+    "reserved_bytes": 0
+  },
+  "collaboration_fence": null,
+  "config_source": "working_copy",
+  "enabled": true,
+  "gc": {
+    "unfinished_generations": 0
+  },
+  "next_actions": [],
+  "policy": "required",
+  "project": "local-target-test",
+  "schema": "aethyme.collab-status/experimental-v0",
+  "state": {
+    "durability": {
+      "filesystem": "apfs",
+      "full_fsync": true,
+      "journal_mode": "wal",
+      "local": true,
+      "supported": true,
+      "synchronous": 2
+    },
+    "initialized": true,
+    "min_compatible_schema": 24,
+    "needs_migration": false,
+    "project_dir": "/private/tmp/t56-old23-fence-94282330/host-source/collaboration/local-target-test",
+    "receipt_label": "local_durable",
+    "root": "/private/tmp/t56-old23-fence-94282330/host-source/collaboration",
+    "root_source": {
+      "kind": "host_state",
+      "setting": "aethyme_host_state_dir"
+    },
+    "schema_version": 24
+  }
+}

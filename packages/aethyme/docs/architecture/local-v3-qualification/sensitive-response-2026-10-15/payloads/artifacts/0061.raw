@@ -1,0 +1,50 @@
+   Compiling aethyme-broker v0.8.26 (/private/tmp/t56-final-mutants-425a0bc/source/packages/aethyme/rust/crates/aethyme-broker)
+warning: unreachable statement
+    --> crates/aethyme-broker/src/collaboration_sensitive.rs:2811:5
+     |
+2810 |     return Ok(true);
+     |     --------------- any code following this expression is unreachable
+2811 |     let mut complete = true;
+     |     ^^^^^^^^^^^^^^^^^^^^^^^^ unreachable statement
+     |
+     = note: `#[warn(unreachable_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `store`
+    --> crates/aethyme-broker/src/collaboration_sensitive.rs:2806:5
+     |
+2806 |     store: &mut CollaborationStore,
+     |     ^^^^^ help: if this is intentional, prefix it with an underscore: `_store`
+     |
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `incident_id`
+    --> crates/aethyme-broker/src/collaboration_sensitive.rs:2807:5
+     |
+2807 |     incident_id: &str,
+     |     ^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_incident_id`
+
+warning: unused variable: `inventory`
+    --> crates/aethyme-broker/src/collaboration_sensitive.rs:2808:5
+     |
+2808 |     inventory: &[FileItem],
+     |     ^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_inventory`
+
+warning: `aethyme-broker` (lib test) generated 4 warnings (run `cargo fix --lib -p aethyme-broker --tests` to apply 3 suggestions)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 13.55s
+     Running unittests src/lib.rs (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/integrate-reviewed-local-bare-git-servic/target/local-resume/cargo/debug/deps/aethyme_broker-fafff990a47ccea3)
+
+running 1 test
+test collaboration_sensitive::tests::managed_copy_cleanup_recovers_partial_removal_and_cleans_generation_and_import_parents ... 
+thread 'collaboration_sensitive::tests::managed_copy_cleanup_recovers_partial_removal_and_cleans_generation_and_import_parents' (10996929) panicked at crates/aethyme-broker/src/collaboration_sensitive.rs:3766:9:
+assertion failed: !store.project_dir().join("generations").exists()
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+
+failures:
+    collaboration_sensitive::tests::managed_copy_cleanup_recovers_partial_removal_and_cleans_generation_and_import_parents
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1866 filtered out; finished in 2.18s
+
+error: test failed, to rerun pass `-p aethyme-broker --lib`

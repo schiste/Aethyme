@@ -241,6 +241,8 @@ pub enum ArchiveError {
     CorruptObject { digest: String },
     #[error("archive object {digest} is missing")]
     MissingObject { digest: String },
+    #[error(transparent)]
+    SensitiveResponse(#[from] crate::collaboration_sensitive::SensitiveError),
     #[error("snapshot {id} is not retained in this archive")]
     NotRetained { id: String },
     #[error("{} must be absent or an empty directory", path.display())]
@@ -284,6 +286,7 @@ impl ArchiveError {
             Self::BaseNotAncestor { .. } => "base_not_ancestor",
             Self::CorruptObject { .. } => "corrupt_object",
             Self::MissingObject { .. } => "missing_object",
+            Self::SensitiveResponse(_) => "sensitive_response_quarantined",
             Self::NotRetained { .. } => "not_retained",
             Self::DestinationNotEmpty { .. } => "destination_not_empty",
             Self::DestinationIsSymlink { .. } => "destination_is_symlink",
@@ -452,6 +455,7 @@ pub(crate) fn put_object(
     store: &CollaborationStore,
     bytes: &[u8],
 ) -> Result<ObjectDigest, ArchiveError> {
+    let _response = crate::collaboration_sensitive::response_use(store)?;
     let mut temporary = new_temporary(store)?;
     let path = temporary.path().to_path_buf();
     temporary
@@ -466,9 +470,35 @@ pub fn read_object(
     store: &CollaborationStore,
     digest: &ObjectDigest,
 ) -> Result<Vec<u8>, ArchiveError> {
+    let _response = crate::collaboration_sensitive::response_use(store)?;
+    read_object_unlocked(store, digest, None)
+}
+
+/// Read an object through the response barrier with a caller-specific budget.
+pub(crate) fn read_object_bounded(
+    store: &CollaborationStore,
+    digest: &ObjectDigest,
+    max_bytes: usize,
+) -> Result<Vec<u8>, ArchiveError> {
+    let _response = crate::collaboration_sensitive::response_use(store)?;
+    read_object_unlocked(store, digest, Some(max_bytes))
+}
+
+fn read_object_unlocked(
+    store: &CollaborationStore,
+    digest: &ObjectDigest,
+    max_bytes: Option<usize>,
+) -> Result<Vec<u8>, ArchiveError> {
     let path = object_path(store, digest);
-    let bytes = match std::fs::read(&path) {
-        Ok(bytes) => bytes,
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = match options.open(&path) {
+        Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return Err(ArchiveError::MissingObject {
                 digest: digest.hex(),
@@ -476,6 +506,33 @@ pub fn read_object(
         }
         Err(source) => return Err(io(&path, source)),
     };
+    if !file
+        .metadata()
+        .map_err(|source| io(&path, source))?
+        .is_file()
+    {
+        return Err(io(
+            &path,
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "object is not a regular file",
+            ),
+        ));
+    }
+    let limit = max_bytes.map(|size| size as u64 + 1).unwrap_or(u64::MAX);
+    let mut bytes = Vec::new();
+    file.take(limit)
+        .read_to_end(&mut bytes)
+        .map_err(|source| io(&path, source))?;
+    if max_bytes.is_some_and(|max| bytes.len() > max) {
+        return Err(io(
+            &path,
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "object exceeds caller budget",
+            ),
+        ));
+    }
     if ObjectDigest::of(&bytes) != *digest {
         return Err(ArchiveError::CorruptObject {
             digest: digest.hex(),
@@ -484,8 +541,13 @@ pub fn read_object(
     Ok(bytes)
 }
 
-pub fn has_object(store: &CollaborationStore, digest: &ObjectDigest) -> bool {
-    object_path(store, digest).is_file()
+pub fn has_object(store: &CollaborationStore, digest: &ObjectDigest) -> Result<bool, ArchiveError> {
+    let _response = crate::collaboration_sensitive::response_use(store)?;
+    match std::fs::symlink_metadata(object_path(store, digest)) {
+        Ok(metadata) => Ok(metadata.file_type().is_file()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(io(&object_path(store, digest), error)),
+    }
 }
 
 // -------------------------------------------------------------------- git
@@ -1571,6 +1633,7 @@ pub fn retained(
     store: &CollaborationStore,
     id: &SourceSnapshotId,
 ) -> Result<Option<RetainedSnapshot>, ArchiveError> {
+    let _response = crate::collaboration_sensitive::response_use(store)?;
     let row = store
         .read_connection()
         .query_row(
@@ -1611,6 +1674,7 @@ pub fn retained_contribution(
     store: &CollaborationStore,
     lineage: &RecordId,
 ) -> Result<Option<RetainedContribution>, ArchiveError> {
+    let _response = crate::collaboration_sensitive::response_use(store)?;
     let row = store
         .read_connection()
         .query_row(
@@ -1723,6 +1787,7 @@ pub fn reconstruct(
         path: crate::collaboration_gc::lock_path(store),
         source,
     })?;
+    let _response = crate::collaboration_sensitive::response_use(store)?;
     // Only a snapshot this archive retained: any object whose bytes happen
     // to parse as a manifest (a committed file, say) is not one.
     if retained(store, id)?.is_none() {
@@ -1742,6 +1807,7 @@ pub(crate) fn reconstruct_manifest(
         path: crate::collaboration_gc::lock_path(store),
         source,
     })?;
+    let _response = crate::collaboration_sensitive::response_use(store)?;
     let manifest = read_object(store, &ObjectDigest::of_snapshot(id))?;
     let corrupt = || ArchiveError::CorruptObject {
         digest: ObjectDigest::of_snapshot(id).hex(),
@@ -2860,10 +2926,7 @@ mod tests {
             &["commit", "-qm", "a blob that is a manifest"],
         );
         retain_snapshot(&mut store, source.path(), &head(source.path())).unwrap();
-        assert!(has_object(
-            &store,
-            &ObjectDigest::of_snapshot(&crafted.id())
-        ));
+        assert!(has_object(&store, &ObjectDigest::of_snapshot(&crafted.id())).unwrap());
         let dest = tempfile::tempdir().unwrap();
         let error = reconstruct(&store, &crafted.id(), dest.path()).unwrap_err();
         assert_eq!(error.code(), "not_retained", "{error}");
@@ -2917,6 +2980,10 @@ mod tests {
     #[test]
     fn a_version_one_database_is_migrated() {
         let (host, mut store) = store();
+        crate::collaboration_sensitive::drop_sensitive_response_tables_for_legacy_fixture(
+            store.connection(),
+        )
+        .unwrap();
         store
             .connection()
             .execute_batch(

@@ -273,6 +273,8 @@ pub enum TargetError {
     #[error(transparent)]
     Authority(#[from] crate::local_authority::AuthorityError),
     #[error(transparent)]
+    Sensitive(#[from] crate::collaboration_sensitive::SensitiveError),
+    #[error(transparent)]
     Compose(#[from] crate::composer::ComposeError),
     #[error(transparent)]
     Archive(#[from] ArchiveError),
@@ -525,6 +527,7 @@ pub fn load_revision(
     store: &CollaborationStore,
     id: &RecordId,
 ) -> Result<TargetRevision, TargetError> {
+    let _response = crate::collaboration_sensitive::response_use(store)?;
     let (target, body): (String, Vec<u8>) = store
         .read_connection()
         .query_row(
@@ -696,6 +699,7 @@ pub fn dispositions(
     store: &CollaborationStore,
     id: &RecordId,
 ) -> Result<Vec<ContributionDisposition>, TargetError> {
+    let _response = crate::collaboration_sensitive::response_use(store)?;
     load_revision(store, id)?;
     let raw: Vec<(String, String, Option<String>)> = store.read_connection().prepare(
         "SELECT contribution, status, detail FROM local_target_dispositions WHERE revision = ?1 ORDER BY contribution",

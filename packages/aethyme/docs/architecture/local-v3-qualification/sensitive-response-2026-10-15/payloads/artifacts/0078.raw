@@ -1,0 +1,22 @@
+{
+  "argv": [
+    "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/682-reconcile-final-local-qualification/target/local-resume/old-state23-cli/aethyme-1d0ce264-state23",
+    "collab",
+    "status",
+    "--json"
+  ],
+  "cwd": "/private/tmp/t56-old23-fence-425a0bc/playground",
+  "environment": {
+    "AETHYME_HOST_STATE_DIR": "/private/tmp/t56-old23-fence-425a0bc/host-state",
+    "HOME": "/Users/christophehenner",
+    "LANG": "en_US.UTF-8",
+    "LC_ALL": "en_US.UTF-8",
+    "PATH": "/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/christophehenner/.cargo/bin",
+    "TMPDIR": "/private/tmp/t56-old23-fence-425a0bc/floor24-positive/old-v23-status-tmp"
+  },
+  "old_binary_commit": "1d0ce264",
+  "old_binary_sha256": "1268402c5d49ac303b61bc28b4e4726bf95b1d17d64d7099850f2f67950f7e6f",
+  "source_head": "425a0bc8e41031cea6b0ff8b5bc0e9cc80748b31",
+  "source_tree": "01f8a9f6a51818732cf6feb38125a34c81745d5b",
+  "started_at_utc": "2026-10-15T21:59:01.870137+00:00"
+}

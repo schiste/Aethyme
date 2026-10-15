@@ -1,0 +1,8 @@
+{
+  "actual_status": "/private/tmp/t56-old23-fence-425a0bc/floor24-positive/old-v23-status-status.json",
+  "classification": "positive_floor24_refusal",
+  "oracle_credit": true,
+  "required_exact_schema_too_new_refusal": true,
+  "required_exit_code": 0,
+  "required_project_binding": true
+}

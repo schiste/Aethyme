@@ -221,6 +221,8 @@ pub enum ViewError {
         snapshot: String,
         source: crate::collaboration_archive::ArchiveError,
     },
+    #[error(transparent)]
+    Sensitive(#[from] crate::collaboration_sensitive::SensitiveError),
     #[error("indexing failed: {0}")]
     Index(String),
     #[error("corrupt view {view}: {detail}")]
@@ -246,6 +248,10 @@ impl ViewError {
             Self::Pinned { .. } => "pinned",
             Self::InvalidHolder => "invalid_holder",
             Self::Source { .. } => "source_unavailable",
+            Self::Sensitive(crate::collaboration_sensitive::SensitiveError::Quarantined) => {
+                "quarantined"
+            }
+            Self::Sensitive(_) => "sensitive_response",
             Self::Index(_) => "index_failed",
             Self::Corrupt { .. } => "corrupt_view",
             Self::Io { .. } => "io",
@@ -523,6 +529,7 @@ fn files_under(root: &Path) -> Result<Vec<(PathBuf, u64)>, ViewError> {
 #[derive(Debug)]
 pub struct ViewReader {
     dir: PathBuf,
+    project_dir: PathBuf,
     manifest: ViewManifest,
     _pin: File,
 }
@@ -534,6 +541,8 @@ pub fn build_view(
     snapshot: &SourceSnapshotId,
     options: &ViewOptions,
 ) -> Result<String, ViewError> {
+    let _archive = archive_use(store)?;
+    let _response = crate::collaboration_sensitive::response_use(store)?;
     let started = Instant::now();
     let profile = &options.profile;
     let name = view_name(snapshot, profile);
@@ -686,6 +695,7 @@ pub fn open_view(store: &CollaborationStore, view: &str) -> Result<ViewReader, V
     // Archive first, then lifecycle, so reclamation and retirement cannot
     // cross a reader's retired check and generation pin.
     let _archive = archive_use(store)?;
+    let _response = crate::collaboration_sensitive::response_use(store)?;
     if is_retired(&view_dir)? {
         return Err(ViewError::Retired { view: view.into() });
     }
@@ -715,6 +725,7 @@ pub fn open_view(store: &CollaborationStore, view: &str) -> Result<ViewReader, V
         let manifest = read_manifest(&dir)?;
         return Ok(ViewReader {
             dir,
+            project_dir: store.project_dir().to_path_buf(),
             manifest,
             _pin: pin,
         });
@@ -886,6 +897,8 @@ impl ViewReader {
         symbol: &str,
         budget: usize,
     ) -> Result<AnalysisEnvelope, ViewError> {
+        let _response =
+            crate::collaboration_sensitive::response_use_for_project_dir(&self.project_dir)?;
         let facts = self.facts()?;
         let named = |id: &NodeId| {
             facts
@@ -953,6 +966,8 @@ impl ViewReader {
         changed_paths: &[&str],
         budget: usize,
     ) -> Result<AnalysisEnvelope, ViewError> {
+        let _response =
+            crate::collaboration_sensitive::response_use_for_project_dir(&self.project_dir)?;
         let facts = self.facts()?;
         let mut paths: Vec<&str> = changed_paths.to_vec();
         paths.sort_unstable();
@@ -1173,6 +1188,7 @@ pub fn hold_view(
         return Err(ViewError::InvalidHolder);
     }
     let _archive = archive_use(store)?;
+    let _response = crate::collaboration_sensitive::response_use(store)?;
     let view_dir = views_root(store).join(view);
     if current_generation(&view_dir)?.is_none() || is_retired(&view_dir)? {
         return Err(ViewError::NotFound { view: view.into() });
@@ -1194,11 +1210,12 @@ pub fn hold_view(
 
 /// Release `holder`'s hold on `view`. `false` when there was none.
 pub fn release_view_hold(
-    store: &CollaborationStore,
+    store: &mut CollaborationStore,
     view: &str,
     holder: &str,
 ) -> Result<bool, ViewError> {
     let _archive = archive_use(store)?;
+    let _response = crate::collaboration_sensitive::response_use_for_view_hold_release(store)?;
     let view_dir = views_root(store).join(view);
     if std::fs::symlink_metadata(&view_dir)
         .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
@@ -1223,6 +1240,7 @@ pub fn release_view_hold(
     match std::fs::remove_file(&path) {
         Ok(()) => {
             sync_dir(&dir)?;
+            crate::collaboration_sensitive::record_released_view_hold(store, &path)?;
             Ok(true)
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
@@ -1299,6 +1317,7 @@ fn now_ms() -> i64 {
 /// `pinned` refusal right after a release is safe to retry.
 pub fn retire(store: &CollaborationStore, view: &str) -> Result<(), ViewError> {
     let _archive = archive_use(store)?;
+    let _response = crate::collaboration_sensitive::response_use(store)?;
     let view_dir = views_root(store).join(view);
     if current_generation(&view_dir)?.is_none() {
         return Err(ViewError::NotFound { view: view.into() });
@@ -1729,7 +1748,7 @@ mod tests {
         hold_view(&store, &view, "x3-report-1", None).unwrap();
         age_views(&store);
         assert!(view_items(&mut store).is_empty(), "held");
-        assert!(release_view_hold(&store, &view, "x3-report-1").unwrap());
+        assert!(release_view_hold(&mut store, &view, "x3-report-1").unwrap());
         // An expired hold no longer protects.
         hold_view(&store, &view, "x3-report-2", Some(1)).unwrap();
         age_views(&store);
@@ -1742,6 +1761,38 @@ mod tests {
             (!items.is_empty()).then_some(items)
         });
         assert_eq!(items.len(), 1, "{items:?}");
+    }
+
+    #[test]
+    fn a_quarantined_project_allows_only_metadata_hold_release() {
+        let host = tempfile::tempdir().unwrap();
+        let repo = fixture();
+        let mut store = store(host.path());
+        let snapshot = retain(&mut store, repo.path());
+        let view = build_view(&store, &snapshot, &options()).unwrap();
+        hold_view(&store, &view, "operator", None).unwrap();
+
+        let owner =
+            crate::local_target::acquire_controller(&mut store, "target", "appointed").unwrap();
+        let frozen = crate::local_authority::freeze(
+            &mut store,
+            owner.authority_epoch(),
+            "sensitive response",
+        )
+        .unwrap();
+        let incident = format!("sha256:{}", "b".repeat(64));
+        crate::collaboration_sensitive::quarantine(
+            &mut store,
+            &incident,
+            "local-operator",
+            frozen.epoch.as_str(),
+            crate::collaboration_sensitive::ReasonCode::SuspectedTestSecretExposure,
+        )
+        .unwrap();
+
+        assert!(open_view(&store, &view).is_err());
+        assert!(release_view_hold(&mut store, &view, "operator").unwrap());
+        assert!(open_view(&store, &view).is_err());
     }
 
     #[test]
@@ -2080,7 +2131,7 @@ mod tests {
         let view = build_view(&store, &snapshot, &options()).unwrap();
         hold_view(&store, &view, "l3-context", None).unwrap();
         assert_eq!(retire(&store, &view).unwrap_err().code(), "held");
-        release_view_hold(&store, &view, "l3-context").unwrap();
+        release_view_hold(&mut store, &view, "l3-context").unwrap();
         let reader = open_view(&store, &view).unwrap();
         assert_eq!(retire(&store, &view).unwrap_err().code(), "pinned");
         drop(reader);

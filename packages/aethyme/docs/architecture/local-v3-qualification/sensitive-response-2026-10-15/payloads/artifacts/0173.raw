@@ -1,0 +1,18 @@
+{
+  "captured_at_utc": "2026-10-15T20:43:08.402334+00:00",
+  "source": "/private/tmp/t56-v4-8387-sensitive-module",
+  "source_head": "8387fd9f78e53c5a66c76938b10020b67c3cdbe6",
+  "result": "21run13PASS8FAIL exit101, overlapping earlier4directorycontrols",
+  "files": [
+    {
+      "path": "command.log",
+      "bytes": 8279,
+      "sha256": "d7096f9d8167f69e74b9294556b86c6a108e83a7451d10f6c16ba02d506ecc21"
+    },
+    {
+      "path": "status",
+      "bytes": 4,
+      "sha256": "39b8dc3fc8b44765c8e6f1adee04c5b465e555ab791cc42d0d9e810d5b64297c"
+    }
+  ]
+}

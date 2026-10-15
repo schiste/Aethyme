@@ -1,0 +1,10 @@
+{
+  "archive_bytes": 39168000,
+  "archive_path": "/private/tmp/t56-final-mutants-425a0bc/source.tar",
+  "archive_sha256": "936399325d06221e9eb553e578e6b4569b6be65a816513a4e681b9f3b066bae8",
+  "created_at_utc": "2026-10-15T21:47:37.332648+00:00",
+  "head": "425a0bc8e41031cea6b0ff8b5bc0e9cc80748b31",
+  "source_path": "/private/tmp/t56-final-mutants-425a0bc/source",
+  "tree": "01f8a9f6a51818732cf6feb38125a34c81745d5b",
+  "worktree_was_clean": true
+}

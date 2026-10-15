@@ -1035,6 +1035,8 @@ fn controller_migrations_adopt_existing_journals_without_erasing_rows() {
     connection.execute("INSERT INTO local_controller_completions(id,wave,revision,target,body) VALUES('migration-sentinel',?1,?2,'adoption',?3)",params![w.id.as_str(),revision.id.as_str(),b"completion-preserved".as_slice()]).unwrap();
     connection.execute("INSERT INTO local_controller_completion_roots(completion,kind,reference) VALUES('migration-sentinel','source','retained-sentinel')",[]).unwrap();
     connection.execute("INSERT INTO local_controller_runs(wave,id,epoch,body,state,observation) VALUES(?1,'run-sentinel',?2,?3,'unknown',?4)",params![w.id.as_str(),owner.authority_epoch().as_str(),b"dispatch-preserved".as_slice(),b"unknown-preserved".as_slice()]).unwrap();
+    crate::collaboration_sensitive::drop_sensitive_response_tables_for_legacy_fixture(connection)
+        .unwrap();
     connection
         .execute_batch(
             "DROP TRIGGER local_native_gate_no_dispatch_after_root_release;

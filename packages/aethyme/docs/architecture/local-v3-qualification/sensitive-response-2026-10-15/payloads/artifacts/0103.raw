@@ -1,0 +1,8 @@
+{
+  "captured_at_utc": "2026-10-15T20:02:26.085058+00:00",
+  "source": "/private/tmp/t56-norun-view-controls.QvjMXT/compile.log",
+  "copy": "target/local-resume/t56-compile-history-20261015T1955/4-t56-norun-view-controls.QvjMXT.log",
+  "bytes": 2092,
+  "sha256": "fc8145ba28d1a2630832742d9dcf9c7913482cc58c3ec6e704f5afeaa0737614",
+  "scope": "Compile-only author dirtydiff6452b7a8 partialprefixreported; latercontrols notincluded; zero fixture/test execution credit"
+}

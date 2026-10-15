@@ -302,6 +302,8 @@ pub enum CaptureError {
     Sqlite(#[from] rusqlite::Error),
     #[error(transparent)]
     State(#[from] CollaborationStateError),
+    #[error(transparent)]
+    Sensitive(#[from] crate::collaboration_sensitive::SensitiveError),
 }
 
 impl CaptureError {
@@ -321,6 +323,7 @@ impl CaptureError {
             Self::Io { .. } => "io",
             Self::Sqlite(_) => "sqlite",
             Self::State(_) => "state",
+            Self::Sensitive(_) => "sensitive_response_quarantined",
         }
     }
 }
@@ -785,6 +788,7 @@ pub fn receipt(
     store: &mut CollaborationStore,
     operation_id: &OperationId,
 ) -> Result<Option<CaptureReceipt>, CaptureError> {
+    let _response = crate::collaboration_sensitive::response_use(store)?;
     let row = store
         .connection()
         .query_row(
@@ -915,7 +919,9 @@ fn commit(
     // keys; check that the manifests themselves are still on disk.
     for snapshot in [&base, &result] {
         let id = snapshot_id(snapshot, operation_id)?;
-        if !has_object(store, &ObjectDigest::of_snapshot(&id)) {
+        let manifest_exists = has_object(store, &ObjectDigest::of_snapshot(&id))
+            .map_err(|error| archive_failure(operation_id, &error))?;
+        if !manifest_exists {
             return Err(CaptureError::CorruptReceipt {
                 operation_id: operation_id.as_str().to_string(),
                 detail: format!("the manifest of snapshot {snapshot} is missing from the archive"),
@@ -1110,6 +1116,17 @@ pub fn try_capture(
     else {
         return Ok(None);
     };
+    let Some(_response) =
+        crate::collaboration_sensitive::try_response_use(store).map_err(|error| {
+            CaptureError::Refused {
+                operation_id: request.operation_id.as_str().to_owned(),
+                code: "sensitive_response_quarantined".into(),
+                detail: error.to_string(),
+            }
+        })?
+    else {
+        return Ok(None);
+    };
     let Some(_lock) = lock_operation(store, &request.operation_id, false)? else {
         return Ok(None);
     };
@@ -1124,6 +1141,13 @@ pub(crate) fn capture_with(
     // Shared with every other capture and reader; reclamation (#659) waits
     // for all of them. Taken before the operation lock, always.
     let _use = archive_use(store)?;
+    let _response = crate::collaboration_sensitive::response_use(store).map_err(|error| {
+        CaptureError::Refused {
+            operation_id: request.operation_id.as_str().to_owned(),
+            code: "sensitive_response_quarantined".into(),
+            detail: error.to_string(),
+        }
+    })?;
     let _lock = lock_operation(store, &request.operation_id, true)?;
     capture_locked(store, request, hooks)
 }
@@ -1368,6 +1392,7 @@ fn reap_crashed(store: &mut CollaborationStore, except: Option<&OperationId>) {
 pub fn recover(store: &mut CollaborationStore) -> Result<RecoveryReport, CaptureError> {
     // Shared with captures, exclusive with a GC apply (#659).
     let _use = archive_use(store)?;
+    let _response = crate::collaboration_sensitive::response_use(store)?;
     let mut report = RecoveryReport::default();
     for operation_id in in_flight(store)? {
         match recover_one(store, &operation_id) {
@@ -1421,6 +1446,8 @@ pub fn abort(
     store: &mut CollaborationStore,
     operation_id: &OperationId,
 ) -> Result<(), CaptureError> {
+    let _archive = archive_use(store)?;
+    let _response = crate::collaboration_sensitive::response_use(store)?;
     let _lock = lock_operation(store, operation_id, true)?;
     let row = load_operation(store.connection(), operation_id)?.ok_or_else(|| {
         CaptureError::UnknownOperation {

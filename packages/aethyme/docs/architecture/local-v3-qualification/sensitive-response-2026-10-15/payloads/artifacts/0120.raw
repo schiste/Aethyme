@@ -1,0 +1,12 @@
+{
+  "source": "/private/tmp/t56-dbfb8df-norun-tmp",
+  "captured_at_utc": "2026-10-15T20:56:15.236321+00:00",
+  "scope": "dbfbcompile-onlyPASSwithonewarning,zerotests",
+  "files": [
+    {
+      "path": "command.log",
+      "bytes": 1245,
+      "sha256": "f39ff7ce32db98537b091e89d0d5f35c79b1ee99f0d2521c8b6f534aac0669b1"
+    }
+  ]
+}
