@@ -138,8 +138,8 @@ Cargo process or stage. The original disposable checkout retained its `main`
 HEAD and clean tracked status; controlled contribution refs were created and
 runtime paths remained untracked. This is not a claim of no ref writes.
 
-The six separate once-final FX17 model attempts all failed with provider/CLI
-errors before any candidate output. Their private behavioral evaluator had
+The six separate [once-final FX17 model attempts](../../../aethyme-eval/evals/fx17/model-trial-attempts.md)
+all failed with provider/CLI errors before any candidate output. Their private behavioral evaluator had
 nothing to execute. The campaign remains consumed and is not rerun. Thus the
 controlled evolution profile passed, while held-out model behavior and brief
 usefulness remain unqualified. Sustained-arrival service and integrated final

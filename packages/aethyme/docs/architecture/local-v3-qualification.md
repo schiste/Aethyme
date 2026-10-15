@@ -195,8 +195,8 @@ retains the earlier compiler/test failures, three focused passing controls, two
 named guard failures with exact source restoration, and source-bound follow-up
 checks. Those overlapping test executions are separate from the FX17 vectors.
 
-The separate once-final six-row model campaign produced six provider/CLI errors
-and zero candidate outputs. The provider rejected its response schema before
+The separate [once-final six-row model campaign](../../../aethyme-eval/evals/fx17/model-trial-attempts.md)
+produced six provider/CLI errors and zero candidate outputs. The provider rejected its response schema before
 model generation was observed. No held-out evaluator ran, and no baseline was
 substituted. All six assigned rows remain in the denominator; their consumed
 campaign is not retried. Correct/absent/misleading brief usefulness and held-out
