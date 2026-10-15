@@ -562,6 +562,7 @@ pub(crate) fn load_revision_under_response(
     if !response.covers(store) {
         return Err(TargetError::Unauthorized);
     }
+    crate::collaboration_sensitive::ensure_available(store)?;
     let (target, body): (String, Vec<u8>) = store
         .read_connection()
         .query_row(
@@ -796,6 +797,7 @@ impl<'a> ArtifactRetentionPermit<'a> {
         {
             return Err(TargetError::Unauthorized);
         }
+        crate::collaboration_sensitive::ensure_available(store)?;
         validate_owner(store, owner)?;
         Ok(Self {
             _archive: archive,

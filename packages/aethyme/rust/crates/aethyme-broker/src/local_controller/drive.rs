@@ -353,7 +353,23 @@ pub(super) fn drive_until(
             serde_json::to_vec(&json!({"error":result.as_ref().err().map(ToString::to_string)}))?,
         ),
     };
-    if store.connection().execute("UPDATE local_controller_runs SET state=?2,observation=?3 WHERE wave=?1 AND state='dispatching'",params![active.id.as_str(),state,detail])?!=1 {return Err(ControllerError::Mismatch);}
+    // The external work may finish after an operator freezes or quarantines
+    // this project. Record its observation only while the exact active epoch
+    // and response barrier still authorize a project-database write. A lost
+    // guard leaves the durable `dispatching` row as an explicit unknown.
+    let _archive = archive_use(store)?;
+    let _response = crate::collaboration_sensitive::response_use(store)?;
+    let _authority = target::authorize(store, owner)?;
+    let revision = RecordId::parse(&spec.revision).map_err(|_| ControllerError::Mismatch)?;
+    if spec.epoch != owner.authority_epoch().as_str()
+        || target::status(store, owner.target())?.revision.as_ref() != Some(&revision)
+        || store.connection().execute(
+            "UPDATE local_controller_runs SET state=?2,observation=?3 WHERE wave=?1 AND state='dispatching' AND epoch=?4",
+            params![active.id.as_str(), state, detail, spec.epoch],
+        )? != 1
+    {
+        return Err(ControllerError::Mismatch);
+    }
     result
 }
 fn dispatch_succeeded(outcome: crate::OperationStatus) -> bool {
