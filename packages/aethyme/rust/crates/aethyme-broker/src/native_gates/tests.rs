@@ -718,12 +718,16 @@ fn released_prepared_job_remains_readable_but_cannot_be_dispatched_or_replayed()
     let owner = s.owner.as_ref().expect("setup owner is present");
     let job = prepare(&mut s.f.store, owner, &mut s.broker, &s.wave).unwrap();
     // Reopen the durable store as a schema-22 client would see it, then keep
-    // that connection open while a new client adopts migration 23. The old
-    // state update uses only columns that existed before the migration.
+    // that connection open while a new client adopts migrations 23 through 25.
+    // The old state update uses only columns that existed before migration 23.
+    crate::collaboration_sensitive::drop_sensitive_response_tables_for_legacy_fixture(
+        s.f.store.connection(),
+    )
+    .unwrap();
     s.f.store
         .connection()
         .execute_batch(
-            "DROP TRIGGER local_native_gate_no_dispatch_after_root_release;
+            "DROP TABLE IF EXISTS local_capture_notice_outcomes; DROP TABLE IF EXISTS local_capture_notices; DROP TRIGGER local_native_gate_no_dispatch_after_root_release;
              ALTER TABLE local_native_gate_jobs DROP COLUMN roots_released_ms;
              UPDATE meta SET value='22' WHERE key='schema_version';
              UPDATE meta SET value='22' WHERE key='min_compatible_schema';",
@@ -745,7 +749,10 @@ fn released_prepared_job_remains_readable_but_cannot_be_dispatched_or_replayed()
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(migrated_floor, 23);
+    assert_eq!(
+        migrated_floor,
+        crate::collaboration_state::COLLABORATION_STATE_SCHEMA_VERSION
+    );
     let roots_before = root_count(&s.f.store, &job.id);
     assert!(roots_before > 0);
 

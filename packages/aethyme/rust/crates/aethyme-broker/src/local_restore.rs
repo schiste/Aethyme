@@ -10,6 +10,9 @@ use aethyme_contracts::experimental_v0::{Record, RecordId, RecordSchema, SourceS
 use aethyme_contracts::experimental_v0::{brief, canonical_json};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 
 pub const PROFILE: &str = "aethyme.restore.source-history/provisional-v0";
 const MAGIC: &[u8] = b"AETHYME-LOCAL-EXPORT-v0\n";
@@ -57,6 +60,8 @@ pub enum RestoreError {
     Io(#[from] std::io::Error),
     #[error(transparent)]
     Generation(#[from] crate::local_generation::GenerationError),
+    #[error(transparent)]
+    Sensitive(#[from] crate::collaboration_sensitive::SensitiveError),
 }
 fn invalid(s: &str) -> RestoreError {
     RestoreError::Invalid(s.into())
@@ -446,31 +451,7 @@ fn read_bounded(
     store: &CollaborationStore,
     digest: &ObjectDigest,
 ) -> Result<Vec<u8>, RestoreError> {
-    use std::io::Read;
-    let path = archive::object_path(store, digest);
-    let metadata = std::fs::symlink_metadata(&path)?;
-    if !metadata.is_file()
-        || metadata.file_type().is_symlink()
-        || metadata.len() > MAX_OBJECT as u64
-    {
-        return Err(invalid("object file profile or budget"));
-    }
-    let mut options = std::fs::OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW);
-    }
-    let mut bytes = Vec::new();
-    options
-        .open(path)?
-        .take(MAX_OBJECT as u64 + 1)
-        .read_to_end(&mut bytes)?;
-    if bytes.len() > MAX_OBJECT || ObjectDigest::of(&bytes) != *digest {
-        return Err(invalid("retained object digest or budget"));
-    }
-    Ok(bytes)
+    archive::read_object_bounded(store, digest, MAX_OBJECT).map_err(RestoreError::from)
 }
 fn collect(
     store: &CollaborationStore,
@@ -504,6 +485,15 @@ pub fn export(
 ) -> Result<Vec<u8>, RestoreError> {
     let _epoch = target::authorize(store, owner)?;
     let _archive = gc::archive_use(store)?;
+    let _response = crate::collaboration_sensitive::response_use(store)?;
+    export_inner(store, scope, selection)
+}
+
+fn export_inner(
+    store: &CollaborationStore,
+    scope: &Scope,
+    selection: &Selection,
+) -> Result<Vec<u8>, RestoreError> {
     scope.validate()?;
     if scope.origin != store.project().as_str() {
         return Err(RestoreError::Binding);
@@ -596,6 +586,77 @@ pub fn export(
     )?;
     Ok(bytes)
 }
+
+/// Export a validated bundle to an exclusive 0600 file while holding fresh
+/// native authority and both archive/response read barriers. An intent is
+/// durable before file creation; a crash leaves an inspectable intent record.
+pub fn export_to_path(
+    store: &mut CollaborationStore,
+    owner: &ControllerOwner,
+    scope: &Scope,
+    selection: &Selection,
+    output: &Path,
+) -> Result<u64, RestoreError> {
+    let _epoch = target::authorize(store, owner)?;
+    let _archive = gc::archive_use(store)?;
+    let _response = crate::collaboration_sensitive::response_use(store)?;
+    let bytes = export_inner(store, scope, selection)?;
+    let path = canonical_output_path(output)?;
+    if std::fs::symlink_metadata(&path).is_ok() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "export destination already exists",
+        )
+        .into());
+    }
+    let path_text = path
+        .to_str()
+        .ok_or_else(|| invalid("export destination is not valid UTF-8"))?;
+    let digest = format!("sha256:{}", ObjectDigest::of(&bytes).hex());
+    let byte_count = u64::try_from(bytes.len()).map_err(|_| invalid("export byte count"))?;
+    store.connection().execute(
+        "INSERT INTO local_sensitive_exports(path,kind,sha256,bytes,state,created_ms)
+         VALUES (?1,'export',?2,?3,'intent',?4)",
+        rusqlite::params![path_text, digest, byte_count, crate::clock::epoch_ms()],
+    )?;
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut file = options.open(&path)?;
+    file.write_all(&bytes)?;
+    file.sync_all()?;
+    let parent = path.parent().ok_or_else(|| invalid("export parent"))?;
+    crate::collaboration_state::sync_directory(parent)?;
+    store.connection().execute(
+        "UPDATE local_sensitive_exports SET state='present' WHERE path=?1 AND state='intent'",
+        [path_text],
+    )?;
+    Ok(byte_count)
+}
+
+fn canonical_output_path(output: &Path) -> Result<PathBuf, RestoreError> {
+    let file_name = output
+        .file_name()
+        .ok_or_else(|| invalid("export destination filename"))?;
+    if file_name == "." || file_name == ".." {
+        return Err(invalid("export destination filename"));
+    }
+    let raw_parent = output.parent().unwrap_or_else(|| Path::new("."));
+    let parent = if raw_parent.as_os_str().is_empty() {
+        Path::new(".").canonicalize()?
+    } else {
+        raw_parent.canonicalize()?
+    };
+    if !parent.is_dir() {
+        return Err(invalid("export destination parent"));
+    }
+    Ok(parent.join(file_name))
+}
+
 mod manager;
 pub use manager::{HistoricalImport, ReceivingBinding, bind_receiver, import, rehearse, show};
 #[cfg(test)]

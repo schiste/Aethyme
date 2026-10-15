@@ -680,6 +680,8 @@ pub fn attach_brief(
     contribution: &RecordId,
     brief: &Brief,
 ) -> Result<RecordId, ContextError> {
+    let _response = crate::collaboration_sensitive::response_use(store)
+        .map_err(crate::collaboration_archive::ArchiveError::from)?;
     let errors = brief.validate();
     if !errors.is_empty() {
         return Err(ContextError::InvalidBrief(
@@ -1803,6 +1805,8 @@ fn retrieve_with(
     mut hooks: Hooks<'_>,
     use_cache: bool,
 ) -> Result<Answer, ContextError> {
+    let _response = crate::collaboration_sensitive::response_use(store)
+        .map_err(crate::collaboration_archive::ArchiveError::from)?;
     query.budget.check()?;
     if query.scope.is_empty() {
         return Err(ContextError::EmptyScope);
@@ -3918,11 +3922,15 @@ mod tests {
         fixture.contribute(&[("Cargo.toml", "[workspace]\n")]);
         fresh(&mut fixture, &["src/search.rs"], &reader);
         // As a schema 5 binary would have left it.
+        crate::collaboration_sensitive::drop_sensitive_response_tables_for_legacy_fixture(
+            fixture.store.connection(),
+        )
+        .unwrap();
         fixture
             .store
             .connection()
             .execute_batch(
-                "DROP TABLE local_native_gate_roots; DROP TABLE local_native_gate_jobs; DROP TABLE local_adoption_receipts; DROP TABLE local_agent_dispatches; DROP TABLE local_agent_reconciliations; DROP TABLE local_handoffs; DROP TABLE local_agent_sessions; DROP TABLE local_import_rehearsals; DROP TABLE local_imported_records; DROP TABLE local_imported_sources; DROP TABLE local_imports; DROP TABLE local_exchange_messages; DROP TABLE local_exchange_deliveries; DROP TABLE local_exchange_streams; DROP TABLE local_exchange_events; DROP TABLE local_exchange_projection; DROP TABLE local_exchange_observations; DROP TABLE local_exchange_bindings; DROP TRIGGER outbox_capture_insert; DROP TRIGGER outbox_capture_update; DROP TRIGGER outbox_capture_delete; DROP TABLE local_generation_roots; DROP TABLE local_generation_receipts; DROP TABLE local_generations; DROP TABLE local_acceptance_qualifications; DROP TABLE local_acceptance_receipts; DROP TABLE local_acceptance_bindings; DROP TABLE local_source_transport_receipts; DROP TABLE local_source_transports; DROP TABLE local_verification_evidence; DROP TABLE local_verifier_producers; DROP TABLE local_authority_state; DROP TABLE local_wave_arrivals; DROP TABLE local_waves;
+                "DROP TABLE IF EXISTS local_capture_notice_outcomes; DROP TABLE IF EXISTS local_capture_notices; DROP TABLE local_native_gate_roots; DROP TABLE local_native_gate_jobs; DROP TABLE local_adoption_receipts; DROP TABLE local_agent_dispatches; DROP TABLE local_agent_reconciliations; DROP TABLE local_handoffs; DROP TABLE local_agent_sessions; DROP TABLE local_import_rehearsals; DROP TABLE local_imported_records; DROP TABLE local_imported_sources; DROP TABLE local_imports; DROP TABLE local_exchange_messages; DROP TABLE local_exchange_deliveries; DROP TABLE local_exchange_streams; DROP TABLE local_exchange_events; DROP TABLE local_exchange_projection; DROP TABLE local_exchange_observations; DROP TABLE local_exchange_bindings; DROP TRIGGER outbox_capture_insert; DROP TRIGGER outbox_capture_update; DROP TRIGGER outbox_capture_delete; DROP TABLE local_generation_roots; DROP TABLE local_generation_receipts; DROP TABLE local_generations; DROP TABLE local_acceptance_qualifications; DROP TABLE local_acceptance_receipts; DROP TABLE local_acceptance_bindings; DROP TABLE local_source_transport_receipts; DROP TABLE local_source_transports; DROP TABLE local_verification_evidence; DROP TABLE local_verifier_producers; DROP TABLE local_authority_state; DROP TABLE local_wave_arrivals; DROP TABLE local_waves;
                  DELETE FROM context_postings WHERE key = x'62';
                  DELETE FROM meta WHERE key = 'context_index_format';
                  UPDATE meta SET value = '5' WHERE key = 'schema_version';

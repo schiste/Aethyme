@@ -636,6 +636,8 @@ fn migration_preserves_capture_rows_and_operation_constraints_without_fake_captu
     let db = store.project_dir().join("state.db");
     drop(store);
     let conn = rusqlite::Connection::open(&db).unwrap();
+    crate::collaboration_sensitive::drop_sensitive_response_tables_for_legacy_fixture(&conn)
+        .unwrap();
     // Reconstruct schema 14, including removal of later stack-owned tables.
     // A current store marker alone is not a historical schema fixture.
     conn.execute_batch(
@@ -652,7 +654,7 @@ fn migration_preserves_capture_rows_and_operation_constraints_without_fake_captu
     )
     .unwrap();
     conn.execute_batch("PRAGMA foreign_keys=ON;
-      DROP TABLE local_native_gate_roots; DROP TABLE local_native_gate_jobs;
+      DROP TABLE IF EXISTS local_capture_notice_outcomes; DROP TABLE IF EXISTS local_capture_notices; DROP TABLE local_native_gate_roots; DROP TABLE local_native_gate_jobs;
       DROP TABLE local_exchange_messages; DROP TABLE local_exchange_deliveries; DROP TABLE local_exchange_streams;
       DROP TABLE local_exchange_events; DROP TABLE local_exchange_projection; DROP TABLE local_exchange_observations; DROP TABLE local_exchange_bindings;
       DROP TRIGGER outbox_capture_insert; DROP TRIGGER outbox_capture_update; DROP TRIGGER outbox_capture_delete;

@@ -1272,7 +1272,7 @@ fn run_t45_capture_hydration_interleavings(disk: &mut OwnedImage) {
     git(&repo, &["commit", "-qm", "T45 new capture payload"]);
     let capture_commit = archive::CommitOid::parse(&git(&repo, &["rev-parse", "HEAD"])).unwrap();
     let failed_digest = ObjectDigest::of(&capture_payload);
-    assert!(!archive::has_object(&fixture.store, &failed_digest));
+    assert!(!archive::has_object(&fixture.store, &failed_digest).unwrap());
     let operation = capture::OperationId::parse("t45-capture-enospc").unwrap();
     let archive_temporaries_before = std::fs::read_dir(archive::spool_dir(&fixture.store))
         .unwrap()
@@ -1431,7 +1431,7 @@ fn run_t45_capture_hydration_interleavings(disk: &mut OwnedImage) {
         partial_result_rows, 0,
         "failed capture cannot retain a partial result"
     );
-    assert!(!archive::has_object(&fixture.store, &failed_digest));
+    assert!(!archive::has_object(&fixture.store, &failed_digest).unwrap());
     apply_after_pressure(&mut collector, &capture_orphan, &capture_plan, &options);
     verify_retained_ab(
         &fixture.store,

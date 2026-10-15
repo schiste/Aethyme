@@ -49,7 +49,7 @@ use sha2::{Digest, Sha256};
 
 use crate::collaboration_archive::{
     ArchiveError, CommitOid, ObjectDigest, RetainedContribution, git as archive_git, has_object,
-    put_object, refuse_partial_clone,
+    put_object, read_object, refuse_partial_clone,
 };
 use crate::collaboration_state::{CollaborationStateError, CollaborationStore};
 use crate::file_lock::{ExclusiveFileLock, open_lock_file};
@@ -243,6 +243,15 @@ pub struct Recovery {
     pub to: String,
 }
 
+/// The exact contribution root released for a committed capture operation.
+/// Other roots may still retain the same source objects.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetentionRelease {
+    pub operation_id: OperationId,
+    pub receipt_record_id: RecordId,
+    pub released_now: bool,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum CaptureError {
     #[error(
@@ -290,6 +299,10 @@ pub enum CaptureError {
         operation_id: String,
         detail: String,
     },
+    #[error("capture {operation_id} has no committed receipt")]
+    NoCommittedReceipt { operation_id: String },
+    #[error("confirmation does not match the committed receipt for capture {operation_id}")]
+    ConfirmationMismatch { operation_id: String },
     #[cfg(test)]
     #[error("injected fault at {0:?}")]
     Injected(FaultPoint),
@@ -302,6 +315,14 @@ pub enum CaptureError {
     Sqlite(#[from] rusqlite::Error),
     #[error(transparent)]
     State(#[from] CollaborationStateError),
+    #[error(transparent)]
+    Archive(#[from] ArchiveError),
+    #[error(transparent)]
+    Authority(#[from] crate::local_authority::AuthorityError),
+    #[error(transparent)]
+    Sensitive(#[from] crate::collaboration_sensitive::SensitiveError),
+    #[error(transparent)]
+    Gc(#[from] crate::collaboration_gc::GcError),
 }
 
 impl CaptureError {
@@ -316,6 +337,17 @@ impl CaptureError {
             Self::AlreadyCommitted { .. } => "already_committed",
             Self::UnknownOperation { .. } => "unknown_operation",
             Self::CorruptReceipt { .. } => "corrupt_receipt",
+            Self::NoCommittedReceipt { .. } => "no_receipt",
+            Self::ConfirmationMismatch { .. } => "confirmation_mismatch",
+            Self::Authority(crate::local_authority::AuthorityError::Frozen) => "authority_frozen",
+            Self::Authority(crate::local_authority::AuthorityError::Stale) => "authority_stale",
+            Self::Authority(_) => "authority_unavailable",
+            Self::Sensitive(crate::collaboration_sensitive::SensitiveError::Quarantined) => {
+                "quarantined"
+            }
+            Self::Sensitive(_) => "sensitive_response",
+            Self::Gc(error) => error.code(),
+            Self::Archive(error) => error.code(),
             #[cfg(test)]
             Self::Injected(_) => "injected",
             Self::Io { .. } => "io",
@@ -785,6 +817,7 @@ pub fn receipt(
     store: &mut CollaborationStore,
     operation_id: &OperationId,
 ) -> Result<Option<CaptureReceipt>, CaptureError> {
+    let _response = crate::collaboration_sensitive::response_use(store)?;
     let row = store
         .connection()
         .query_row(
@@ -838,6 +871,168 @@ pub fn receipt(
         retention: RetentionBoundary::from_until_ms(until),
         receipt_record_id: record_id(&receipt_id, operation_id)?,
     }))
+}
+
+/// Release only the contribution root created by one committed capture.
+/// Reclamation remains a separate operation, and other roots may keep the
+/// same source objects reachable.
+pub fn release_retention(
+    store: &mut CollaborationStore,
+    operation_id: &OperationId,
+    confirmation: &RecordId,
+) -> Result<RetentionRelease, CaptureError> {
+    let archive_path = store.project_dir().join("spool/gc.lock");
+    let _archive =
+        crate::collaboration_gc::archive_use(store).map_err(|source| CaptureError::Io {
+            path: archive_path,
+            source,
+        })?;
+    let _response = crate::collaboration_sensitive::response_use(store)?;
+    let _operation =
+        lock_operation(store, operation_id, true)?.ok_or_else(|| CaptureError::Refused {
+            operation_id: operation_id.as_str().into(),
+            code: "operation_lock_unavailable".into(),
+            detail: "the blocking capture-operation lock was not acquired".into(),
+        })?;
+    let witness = crate::local_authority::status(store)?;
+    if witness.status != crate::local_authority::Status::Active {
+        return Err(crate::local_authority::AuthorityError::Frozen.into());
+    }
+    let _authority = crate::local_authority::guard(store, &witness.epoch)?;
+
+    let state: Option<String> = store
+        .read_connection()
+        .query_row(
+            "SELECT state FROM capture_operations WHERE operation_id=?1",
+            [operation_id.as_str()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(state) = state else {
+        return Err(CaptureError::UnknownOperation {
+            operation_id: operation_id.as_str().into(),
+        });
+    };
+    if !matches!(state.as_str(), "committed" | "acknowledged") {
+        return Err(CaptureError::NoCommittedReceipt {
+            operation_id: operation_id.as_str().into(),
+        });
+    }
+
+    let row: Option<(
+        Option<String>,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        Option<i64>,
+    )> = store
+        .read_connection()
+        .query_row(
+            "SELECT o.lineage_record_id, r.receipt_record_id, r.receipt_sha256,
+                    r.lineage_record_id, r.base_snapshot, r.result_snapshot,
+                    r.durability, o.retention_until_ms
+             FROM capture_operations o JOIN capture_receipts r USING(operation_id)
+             WHERE o.operation_id=?1",
+            [operation_id.as_str()],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((
+        op_lineage,
+        receipt_id,
+        digest_hex,
+        receipt_lineage,
+        receipt_base,
+        receipt_result,
+        durability,
+        until,
+    )) = row
+    else {
+        return Err(CaptureError::CorruptReceipt {
+            operation_id: operation_id.as_str().into(),
+            detail: "committed operation has no receipt row".into(),
+        });
+    };
+    if op_lineage.as_deref() != Some(receipt_lineage.as_str()) {
+        return Err(CaptureError::CorruptReceipt {
+            operation_id: operation_id.as_str().into(),
+            detail: "operation and receipt indexes differ".into(),
+        });
+    }
+    let receipt_record_id = record_id(&receipt_id, operation_id)?;
+    if confirmation != &receipt_record_id {
+        return Err(CaptureError::ConfirmationMismatch {
+            operation_id: operation_id.as_str().into(),
+        });
+    }
+    let digest = crate::collaboration_archive::parse_digest(&digest_hex).ok_or_else(|| {
+        CaptureError::CorruptReceipt {
+            operation_id: operation_id.as_str().into(),
+            detail: "receipt object digest is malformed".into(),
+        }
+    })?;
+    let bytes = read_object(store, &digest)?;
+    let expected = receipt_record(
+        operation_id,
+        &durability,
+        &receipt_lineage,
+        &receipt_base,
+        &receipt_result,
+        RetentionBoundary::from_until_ms(until),
+    );
+    let decoded = Record::decode(&bytes, &[&CAPTURE_RECEIPT_SCHEMA]).map_err(|error| {
+        CaptureError::CorruptReceipt {
+            operation_id: operation_id.as_str().into(),
+            detail: error.to_string(),
+        }
+    })?;
+    if ObjectDigest::of(&bytes) != digest
+        || decoded.id() != receipt_record_id
+        || decoded.canonical_bytes() != bytes
+        || expected.0 != bytes
+        || expected.1 != receipt_record_id
+    {
+        return Err(CaptureError::CorruptReceipt {
+            operation_id: operation_id.as_str().into(),
+            detail: "receipt object does not match its committed binding".into(),
+        });
+    }
+
+    let roots: Vec<String> = store
+        .read_connection()
+        .prepare(
+            "SELECT lineage_record_id FROM retention_roots
+             WHERE operation_id=?1 AND kind='contribution' ORDER BY rowid",
+        )?
+        .query_map([operation_id.as_str()], |row| row.get(0))?
+        .collect::<Result<_, _>>()?;
+    if roots.len() != 1 || roots[0] != receipt_lineage {
+        return Err(CaptureError::CorruptReceipt {
+            operation_id: operation_id.as_str().into(),
+            detail: "contribution root does not match the committed receipt".into(),
+        });
+    }
+
+    let released_now = crate::collaboration_gc::release_retention(store, operation_id.as_str())?;
+    Ok(RetentionRelease {
+        operation_id: operation_id.clone(),
+        receipt_record_id,
+        released_now,
+    })
 }
 
 fn text(value: &str) -> Value {
@@ -915,7 +1110,9 @@ fn commit(
     // keys; check that the manifests themselves are still on disk.
     for snapshot in [&base, &result] {
         let id = snapshot_id(snapshot, operation_id)?;
-        if !has_object(store, &ObjectDigest::of_snapshot(&id)) {
+        let manifest_exists = has_object(store, &ObjectDigest::of_snapshot(&id))
+            .map_err(|error| archive_failure(operation_id, &error))?;
+        if !manifest_exists {
             return Err(CaptureError::CorruptReceipt {
                 operation_id: operation_id.as_str().to_string(),
                 detail: format!("the manifest of snapshot {snapshot} is missing from the archive"),
@@ -1110,6 +1307,17 @@ pub fn try_capture(
     else {
         return Ok(None);
     };
+    let Some(_response) =
+        crate::collaboration_sensitive::try_response_use(store).map_err(|error| {
+            CaptureError::Refused {
+                operation_id: request.operation_id.as_str().to_owned(),
+                code: "sensitive_response_quarantined".into(),
+                detail: error.to_string(),
+            }
+        })?
+    else {
+        return Ok(None);
+    };
     let Some(_lock) = lock_operation(store, &request.operation_id, false)? else {
         return Ok(None);
     };
@@ -1124,6 +1332,13 @@ pub(crate) fn capture_with(
     // Shared with every other capture and reader; reclamation (#659) waits
     // for all of them. Taken before the operation lock, always.
     let _use = archive_use(store)?;
+    let _response = crate::collaboration_sensitive::response_use(store).map_err(|error| {
+        CaptureError::Refused {
+            operation_id: request.operation_id.as_str().to_owned(),
+            code: "sensitive_response_quarantined".into(),
+            detail: error.to_string(),
+        }
+    })?;
     let _lock = lock_operation(store, &request.operation_id, true)?;
     capture_locked(store, request, hooks)
 }
@@ -1368,6 +1583,7 @@ fn reap_crashed(store: &mut CollaborationStore, except: Option<&OperationId>) {
 pub fn recover(store: &mut CollaborationStore) -> Result<RecoveryReport, CaptureError> {
     // Shared with captures, exclusive with a GC apply (#659).
     let _use = archive_use(store)?;
+    let _response = crate::collaboration_sensitive::response_use(store)?;
     let mut report = RecoveryReport::default();
     for operation_id in in_flight(store)? {
         match recover_one(store, &operation_id) {
@@ -1421,6 +1637,8 @@ pub fn abort(
     store: &mut CollaborationStore,
     operation_id: &OperationId,
 ) -> Result<(), CaptureError> {
+    let _archive = archive_use(store)?;
+    let _response = crate::collaboration_sensitive::response_use(store)?;
     let _lock = lock_operation(store, operation_id, true)?;
     let row = load_operation(store.connection(), operation_id)?.ok_or_else(|| {
         CaptureError::UnknownOperation {
@@ -1443,6 +1661,20 @@ mod tests {
     use crate::collaboration_state::{CollaborationRoot, ProjectKey};
     use std::io::BufRead;
     use std::process::Command;
+
+    #[test]
+    fn sensitive_capture_error_codes_distinguish_quarantine_from_other_errors() {
+        assert_eq!(
+            CaptureError::Sensitive(crate::collaboration_sensitive::SensitiveError::Quarantined)
+                .code(),
+            "quarantined"
+        );
+        assert_eq!(
+            CaptureError::Sensitive(crate::collaboration_sensitive::SensitiveError::Mismatch)
+                .code(),
+            "sensitive_response"
+        );
+    }
 
     fn git_in(repo: &Path, args: &[&str]) -> String {
         let output = Command::new("git")
@@ -1618,6 +1850,74 @@ mod tests {
         // T10: the contributor's repository is gone; the receipt still holds.
         drop(repo);
         assert_reconstructs(&store, &receipt);
+    }
+
+    #[test]
+    fn contribution_root_release_requires_exact_committed_receipt_and_is_idempotent() {
+        let (repo, base, result) = repo();
+        let host = tempfile::tempdir().unwrap();
+        let mut store = open(host.path());
+        let captured = acknowledged(
+            capture(
+                &mut store,
+                &request(repo.path(), "op-release", &base, &result),
+            )
+            .unwrap(),
+        );
+        let (_epoch, authority_guard) = crate::local_authority::acquire(&mut store).unwrap();
+        drop(authority_guard);
+
+        let wrong = RecordId::parse(&format!("sha256:{}", "0".repeat(64))).unwrap();
+        assert!(matches!(
+            release_retention(&mut store, &captured.operation_id, &wrong),
+            Err(CaptureError::ConfirmationMismatch { .. })
+        ));
+        assert_eq!(live_roots(&mut store, "contribution"), 1);
+
+        let released = release_retention(
+            &mut store,
+            &captured.operation_id,
+            &captured.receipt_record_id,
+        )
+        .unwrap();
+        assert!(released.released_now);
+        assert_eq!(released.receipt_record_id, captured.receipt_record_id);
+        assert_eq!(live_roots(&mut store, "contribution"), 0);
+
+        let repeated = release_retention(
+            &mut store,
+            &captured.operation_id,
+            &captured.receipt_record_id,
+        )
+        .unwrap();
+        assert!(!repeated.released_now);
+        assert_eq!(live_roots(&mut store, "contribution"), 0);
+    }
+
+    #[test]
+    fn contribution_root_release_refuses_missing_or_uncommitted_receipts() {
+        let (repo, base, result) = repo();
+        let host = tempfile::tempdir().unwrap();
+        let mut store = open(host.path());
+        let request = request(repo.path(), "op-pending", &base, &result);
+        capture_with(&mut store, &request, &faulted(FaultPoint::AfterIntent)).unwrap_err();
+        let (_epoch, authority_guard) = crate::local_authority::acquire(&mut store).unwrap();
+        drop(authority_guard);
+        let confirmation = RecordId::parse(&format!("sha256:{}", "1".repeat(64))).unwrap();
+
+        assert!(matches!(
+            release_retention(&mut store, &request.operation_id, &confirmation),
+            Err(CaptureError::NoCommittedReceipt { .. })
+        ));
+        assert!(matches!(
+            release_retention(
+                &mut store,
+                &OperationId::parse("missing-operation").unwrap(),
+                &confirmation,
+            ),
+            Err(CaptureError::UnknownOperation { .. })
+        ));
+        assert_eq!(live_roots(&mut store, "capture_intent"), 1);
     }
 
     #[test]

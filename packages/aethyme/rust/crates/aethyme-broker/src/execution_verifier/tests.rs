@@ -78,6 +78,51 @@ fn missing_duplicate_invalid_and_oversized_inventories_are_refused() {
         .collect();
     assert!(AssertionInventory::new(cases).is_err());
 }
+
+#[test]
+fn verifier_prepare_refuses_sensitive_tombstone_before_harness_or_runtime_access() {
+    let mut fixture = Fixture::new();
+    let owner = target::acquire_controller(&mut fixture.store, "T", "issuer").unwrap();
+    let epoch = owner.authority_epoch().clone();
+    drop(owner);
+    let frozen =
+        crate::local_authority::freeze(&mut fixture.store, &epoch, "test quarantine").unwrap();
+    crate::collaboration_sensitive::quarantine(
+        &mut fixture.store,
+        &d(b"test incident"),
+        "test-operator",
+        frozen.epoch.as_str(),
+        crate::collaboration_sensitive::ReasonCode::OperatorRequestedPurge,
+    )
+    .unwrap();
+
+    let result = prepare(
+        &mut fixture.store,
+        VerifierPreparationRequest {
+            operation_id: OperationId::mint().unwrap(),
+            harness_repository: std::path::Path::new("/no-such-harness"),
+            harness_commit: "not-a-commit",
+            inventory_bytes: b"not-an-inventory",
+            plan: VerifierPlan {
+                image: "not-an-image".into(),
+                command: CommandSpec {
+                    program: "/no-such-runtime".into(),
+                    arguments: vec![],
+                    environment: Default::default(),
+                },
+                max_age_ms: 1,
+            },
+            docker_cli: std::path::PathBuf::from("/no-such-docker"),
+            endpoint: "unix:///no-such-endpoint",
+        },
+    );
+    assert!(matches!(
+        result,
+        Err(VerificationError::Sensitive(
+            crate::collaboration_sensitive::SensitiveError::Quarantined
+        ))
+    ));
+}
 #[test]
 fn trusted_operator_rotates_and_revokes_exact_producer_generations() {
     let mut f = Fixture::new();
@@ -160,10 +205,31 @@ impl Subject {
     pub(crate) fn acceptance_fixture() -> Self {
         Self::with_max_age(60000)
     }
+    pub(crate) fn acceptance_fixture_with_source_marker_in(
+        marker: &[u8],
+        parent: &std::path::Path,
+    ) -> Self {
+        Self::with_max_age_and_source_marker_in(60000, Some(marker), Some(parent))
+    }
     fn with_max_age(max_age_ms: u64) -> Self {
+        Self::with_max_age_and_source_marker(max_age_ms, None)
+    }
+    fn with_max_age_and_source_marker(max_age_ms: u64, source_marker: Option<&[u8]>) -> Self {
+        Self::with_max_age_and_source_marker_in(max_age_ms, source_marker, None)
+    }
+    fn with_max_age_and_source_marker_in(
+        max_age_ms: u64,
+        source_marker: Option<&[u8]>,
+        parent: Option<&std::path::Path>,
+    ) -> Self {
         use aethyme_contracts::experimental_v0::SourceSnapshot;
         use aethyme_contracts::experimental_v0::source_snapshot::{EntryKind, SourceEntry};
-        let mut f = Fixture::new();
+        let mut f = match parent {
+            Some(parent) => {
+                Fixture::new_with_source_marker_in(source_marker.unwrap_or_default(), parent)
+            }
+            None => source_marker.map_or_else(Fixture::new, Fixture::new_with_source_marker),
+        };
         let owner = target::acquire_controller(&mut f.store, "evidence", "appointed").unwrap();
         let inventory = AssertionInventory::new(vec![case()]).unwrap();
         let policy = policy();

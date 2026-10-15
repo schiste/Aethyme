@@ -2,12 +2,13 @@
 use super::*;
 use crate::collaboration_state::{CollaborationSnapshot, inspect_for_repository};
 use crate::{
-    local_authority as authority, local_handoff as handoff, local_restore as restore,
+    collaboration_capture as capture, collaboration_sensitive as response,
+    execution_verifier as verifier, local_authority as authority, local_budget as budget,
+    local_capture_notice as notices, local_handoff as handoff, local_restore as restore,
     local_target as target,
 };
 use rusqlite::OptionalExtension;
 use std::collections::BTreeMap;
-use std::io::Write;
 
 const MAX_ARGUMENTS: usize = 512;
 const MAX_SPEC: u64 = 256 * 1024;
@@ -394,6 +395,787 @@ pub(super) fn target_change(root: &Path, verb: &str, rest: &[&str]) -> Result<Ou
         format!("target {name}: {verb}; no work dispatched\n"),
     ))
 }
+
+/// Configure the immutable project-wide budget before any objective is
+/// admitted. The policy is a bounded operator file and the stored ID is the
+/// canonical policy identity, so a lost response can be checked by retrying
+/// the same file without replenishing the cap.
+pub(super) fn budget_project_configure(root: &Path, rest: &[&str]) -> Result<Output, Failure> {
+    let flags = Flags::parse(rest, &["--target", "--issuer", "--file"], &[])?;
+    let policy: budget::ProjectPolicy = read_operator(flags.one("--file")?)?;
+    let mut store = open(root)?;
+    let owner = existing_owner(&mut store, flags.one("--target")?, flags.one("--issuer")?)?;
+    let id = budget::configure_project(&mut store, &owner, policy)
+        .map_err(|e| Failure::domain("budget_configuration", e.to_string()))?;
+    Ok((
+        json!({"schema":"aethyme.collab-budget-project-configure/experimental-v0","target":owner.target(),"policy":id.as_str(),"immutable":true,"grants_model_dispatch":false}),
+        format!(
+            "project budget policy {} recorded; no work dispatched\n",
+            id.as_str()
+        ),
+    ))
+}
+
+/// Authorize one immutable objective cap for the selected target revision.
+pub(super) fn budget_objective_authorize(root: &Path, rest: &[&str]) -> Result<Output, Failure> {
+    let flags = Flags::parse(rest, &["--target", "--issuer", "--file"], &[])?;
+    let cap: budget::Units = read_operator(flags.one("--file")?)?;
+    let mut store = open(root)?;
+    let owner = existing_owner(&mut store, flags.one("--target")?, flags.one("--issuer")?)?;
+    let id = budget::authorize_objective(&mut store, &owner, cap)
+        .map_err(|e| Failure::domain("budget_configuration", e.to_string()))?;
+    Ok((
+        json!({"schema":"aethyme.collab-budget-objective-authorize/experimental-v0","target":owner.target(),"authorization":id.as_str(),"immutable":true,"grants_model_dispatch":false}),
+        format!(
+            "objective cap {} recorded; no work dispatched\n",
+            id.as_str()
+        ),
+    ))
+}
+
+/// Read immutable budget appointments and ledger status after a lost response.
+pub(super) fn budget_status(root: &Path, rest: &[&str]) -> Result<Output, Failure> {
+    let flags = Flags::parse(
+        rest,
+        &["--target", "--issuer", "--reservation", "--nonce"],
+        &[],
+    )?;
+    if flags.0.contains_key("--reservation") && flags.0.contains_key("--nonce") {
+        return Err(Failure::usage(
+            "--reservation and --nonce are mutually exclusive",
+        ));
+    }
+    let reservation = flags
+        .0
+        .get("--reservation")
+        .and_then(|values| values.first())
+        .map(|value| parse_record(value))
+        .transpose()?;
+    let nonce = flags
+        .0
+        .get("--nonce")
+        .and_then(|values| values.first())
+        .copied();
+    let store = open(root)?;
+    let status = budget::status(
+        &store,
+        flags.one("--target")?,
+        flags.one("--issuer")?,
+        reservation.as_ref(),
+        nonce,
+    )
+    .map_err(|error| Failure::domain("budget_status", error.to_string()))?;
+    let reservations_shown = status.reservations.len();
+    let omitted = status
+        .reservation_count
+        .saturating_sub(reservations_shown as u64);
+    let target_name = status.target.clone();
+    let nonce_summary = status.nonce_lookup.as_ref().map(|lookup| {
+        match lookup.outcome {
+            budget::NonceLookupOutcome::NotFound => "no reservation matches this target and nonce",
+            budget::NonceLookupOutcome::Found => {
+                "one matching reservation found; no work was retried"
+            }
+            budget::NonceLookupOutcome::Ambiguous => {
+                "multiple matching reservations; inspect ledger before acting"
+            }
+        }
+        .to_owned()
+    });
+    Ok((
+        json!({
+            "schema":"aethyme.collab-budget-status/experimental-v0",
+            "status":status,
+            "reservation_page_limit":budget::STATUS_RESERVATION_LIMIT,
+            "reservation_rows_omitted":omitted,
+            "charged_is_root_ledger_amount_not_measured_usage":true,
+            "grants_dispatch":false
+        }),
+        format!(
+            "budget status for {target_name}: {} of {} reservation rows shown{}{}; no dispatch authority granted\n",
+            reservations_shown,
+            status.reservation_count,
+            if omitted > 0 {
+                format!("; {omitted} older rows omitted")
+            } else {
+                String::new()
+            },
+            nonce_summary
+                .map(|summary| format!("; {summary}"))
+                .unwrap_or_default()
+        ),
+    ))
+}
+
+/// Release only the contribution root of an exact committed capture receipt.
+pub(super) fn capture_release(root: &Path, rest: &[&str]) -> Result<Output, Failure> {
+    let flags = Flags::parse(rest, &["--operation", "--confirm"], &[])?;
+    let operation_text = flags.one("--operation")?;
+    let operation = capture::OperationId::parse(operation_text)
+        .map_err(|error| Failure::usage(error.to_string()))?;
+    let confirmation = parse_record(flags.one("--confirm")?)?;
+    let mut store = open(root)?;
+    let result = capture::release_retention(&mut store, &operation, &confirmation)
+        .map_err(|error| Failure::domain(error.code(), error.to_string()))?;
+    let action = if result.released_now {
+        "released_now"
+    } else {
+        "already_released_or_not_live"
+    };
+    Ok((
+        json!({
+            "schema":super::CAPTURE_RELEASE_SCHEMA,
+            "operation_id":result.operation_id.as_str(),
+            "receipt_record_id":result.receipt_record_id.as_str(),
+            "released_now":result.released_now,
+            "result":action,
+            "root_kind":"contribution",
+            "other_roots_may_retain_source":true,
+            "source_erasure_claimed":false,
+            "grants_dispatch":false
+        }),
+        format!(
+            "capture {} contribution root: {}; other roots may retain source; this does not erase source\n",
+            result.operation_id.as_str(),
+            action
+        ),
+    ))
+}
+
+/// Append an idempotent notice for an already retained selected contribution.
+/// The ingress path intentionally does not acquire the target owner lock.
+pub(super) fn capture_notice(root: &Path, verb: &str, rest: &[&str]) -> Result<Output, Failure> {
+    match verb {
+        "ingest" => {
+            let flags = Flags::parse(
+                rest,
+                &[
+                    "--target",
+                    "--issuer",
+                    "--revision",
+                    "--alias",
+                    "--operation",
+                ],
+                &[],
+            )?;
+            let revision = parse_record(flags.one("--revision")?)?;
+            let operation = OperationId::parse(flags.one("--operation")?)
+                .map_err(|error| Failure::usage(error.to_string()))?;
+            let mut store = open(root)?;
+            let receipt = notices::ingest(
+                &mut store,
+                flags.one("--target")?,
+                flags.one("--issuer")?,
+                &revision,
+                flags.one("--alias")?,
+                &operation,
+            )
+            .map_err(|error| Failure::domain("capture_notice", error.to_string()))?;
+            Ok((
+                json!({
+                    "schema":"aethyme.collab-capture-notice/experimental-v0",
+                    "action":"ingest",
+                    "notice":receipt.id.as_str(),
+                    "status":receipt.status,
+                    "received_ms":receipt.received_ms,
+                    "idempotent_retry_safe":true,
+                    "available_to_wave":false,
+                    "dispatch_authority_granted":false
+                }),
+                format!(
+                    "capture notice {}: {}; the owner tick must revalidate it before wave admission\n",
+                    receipt.id.as_str(),
+                    receipt.status
+                ),
+            ))
+        }
+        "list" => {
+            let flags = Flags::parse(rest, &["--target", "--limit"], &[])?;
+            let limit = flags
+                .0
+                .get("--limit")
+                .and_then(|values| values.first())
+                .map(|value| {
+                    value
+                        .parse::<usize>()
+                        .map_err(|_| Failure::usage("--limit must be an integer from 1 to 512"))
+                })
+                .transpose()?
+                .unwrap_or(100);
+            let store = open(root)?;
+            let rows = notices::list_for_target(&store, flags.one("--target")?, limit)
+                .map_err(|error| Failure::domain("capture_notice", error.to_string()))?;
+            let count = rows.len();
+            Ok((
+                json!({
+                    "schema":"aethyme.collab-capture-notice/experimental-v0",
+                    "action":"list",
+                    "notices":rows,
+                    "limit":limit,
+                    "may_be_truncated":count == limit,
+                    "dispatch_authority_granted":false
+                }),
+                format!(
+                    "{count} capture notice row(s) listed; statuses are not dispatch authority\n"
+                ),
+            ))
+        }
+        _ => Err(Failure::usage("capture-notice requires ingest or list")),
+    }
+}
+
+/// Compute an acceptance-policy ID before writing it into an immutable target
+/// proposal. This is pure validation and does not appoint a producer.
+pub(super) fn verifier_policy_id(_root: &Path, rest: &[&str]) -> Result<Output, Failure> {
+    let flags = Flags::parse(rest, &["--file"], &[])?;
+    let policy: verifier::VerifierPolicy = read_operator(flags.one("--file")?)?;
+    let record = policy
+        .record()
+        .map_err(|e| Failure::domain("verifier_policy", e.to_string()))?;
+    Ok((
+        json!({"schema":"aethyme.collab-verifier-policy-id/experimental-v0","policy":record.id().as_str(),"profile":policy.profile,"runtime":policy.runtime,"image":policy.image,"harness":policy.harness,"inventory":policy.inventory,"appoints_producer":false}),
+        format!(
+            "verifier policy {} validated; no producer appointed\n",
+            record.id().as_str()
+        ),
+    ))
+}
+
+/// Retain an exact harness commit and its canonical literal inventory, then
+/// derive the runtime and policy identities from the explicit Docker endpoint.
+/// This produces no verifier authority or workload dispatch.
+pub(super) fn verifier_prepare(root: &Path, rest: &[&str]) -> Result<Output, Failure> {
+    let flags = Flags::parse(
+        rest,
+        &[
+            "--harness-repo",
+            "--commit",
+            "--inventory",
+            "--operation",
+            "--docker",
+            "--endpoint",
+            "--file",
+        ],
+        &[],
+    )?;
+    let plan: verifier::VerifierPlan = read_operator(flags.one("--file")?)?;
+    let inventory = read_operator_bytes(flags.one("--inventory")?, 4 * 1024 * 1024)?;
+    let repository = std::path::PathBuf::from(flags.one("--harness-repo")?);
+    let docker = std::path::PathBuf::from(flags.one("--docker")?);
+    if !repository.is_absolute() || !docker.is_absolute() {
+        return Err(Failure::usage(
+            "absolute harness repository and Docker CLI paths are required",
+        ));
+    }
+    let operation = OperationId::parse(flags.one("--operation")?)
+        .map_err(|error| Failure::usage(error.to_string()))?;
+    let mut store = open(root)?;
+    let prepared = verifier::prepare(
+        &mut store,
+        verifier::VerifierPreparationRequest {
+            operation_id: operation,
+            harness_repository: &repository,
+            harness_commit: flags.one("--commit")?,
+            inventory_bytes: &inventory,
+            plan,
+            docker_cli: docker,
+            endpoint: flags.one("--endpoint")?,
+        },
+    )
+    .map_err(|error| Failure::domain("verifier_preparation", error.to_string()))?;
+    let capture = &prepared.capture;
+    let policy = serde_json::to_value(&prepared.policy)
+        .map_err(|error| Failure::domain("verifier_preparation", error.to_string()))?;
+    let runtime = serde_json::to_value(&prepared.runtime)
+        .map_err(|error| Failure::domain("verifier_preparation", error.to_string()))?;
+    Ok((
+        json!({
+            "schema":"aethyme.collab-verifier-prepare/experimental-v0",
+            "policy":policy,
+            "policy_id":prepared.policy_id.as_str(),
+            "runtime":runtime,
+            "runtime_id":prepared.policy.runtime,
+            "harness_snapshot":prepared.policy.harness,
+            "inventory_id":prepared.policy.inventory,
+            "inventory_sha256":prepared.inventory_sha256,
+            "inventory_cases":prepared.inventory_cases,
+            "capture":{
+                "operation":capture.operation_id.as_str(),
+                "status":capture.status,
+                "durability":capture.durability,
+                "contribution":capture.contribution.as_str(),
+                "base":capture.base.as_str(),
+                "result":capture.result.as_str(),
+                "retention":"until_released"
+            },
+            "producer_configured":false,
+            "dispatch_started":false
+        }),
+        format!(
+            "verifier policy {} prepared from retained harness {}; no producer appointed and no work dispatched\n",
+            prepared.policy_id.as_str(),
+            prepared.policy.harness
+        ),
+    ))
+}
+
+/// Appoint or rotate a producer with an explicit compare-and-swap generation.
+pub(super) fn verifier_configure(root: &Path, rest: &[&str]) -> Result<Output, Failure> {
+    let flags = Flags::parse(
+        rest,
+        &[
+            "--target",
+            "--issuer",
+            "--producer",
+            "--expected-generation",
+            "--file",
+        ],
+        &[],
+    )?;
+    let policy: verifier::VerifierPolicy = read_operator(flags.one("--file")?)?;
+    let expected = match flags.one("--expected-generation")? {
+        "none" => None,
+        value => {
+            let generation = value
+                .parse::<i64>()
+                .map_err(|_| Failure::usage("--expected-generation must be `none` or positive"))?;
+            if generation < 1 {
+                return Err(Failure::usage(
+                    "--expected-generation must be `none` or positive",
+                ));
+            }
+            Some(generation)
+        }
+    };
+    let mut store = open(root)?;
+    let owner = existing_owner(&mut store, flags.one("--target")?, flags.one("--issuer")?)?;
+    let permit = verifier::configure(
+        &mut store,
+        &owner,
+        flags.one("--producer")?,
+        expected,
+        policy,
+    )
+    .map_err(|e| Failure::domain("verifier_configuration", e.to_string()))?;
+    let policy_id = permit
+        .policy()
+        .record()
+        .map_err(|e| Failure::domain("verifier_policy", e.to_string()))?
+        .id();
+    Ok((
+        json!({"schema":"aethyme.collab-verifier-configure/experimental-v0","target":owner.target(),"producer":permit.producer(),"generation":permit.generation(),"policy":policy_id.as_str(),"dispatch_started":false}),
+        format!(
+            "producer {} appointed at generation {}; no dispatch started\n",
+            permit.producer(),
+            permit.generation()
+        ),
+    ))
+}
+
+/// Read producer generation without changing authority.
+pub(super) fn verifier_status(root: &Path, rest: &[&str]) -> Result<Output, Failure> {
+    let flags = Flags::parse(rest, &["--target", "--issuer", "--producer"], &[])?;
+    let target_name = flags.one("--target")?;
+    let issuer = flags.one("--issuer")?;
+    let producer = flags.one("--producer")?;
+    let snapshot = observe(root)?;
+    require_table(&snapshot, "local_verifier_producers")?;
+    let _response = response::response_use_for_project_dir(&snapshot.project_dir)
+        .map_err(|error| Failure::domain("sensitive_response", error.to_string()))?;
+    let target_issuer: Option<String> = snapshot
+        .connection()
+        .query_row(
+            "SELECT issuer FROM local_targets WHERE target=?1",
+            [target_name],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(sqlite)?;
+    if target_issuer.as_deref() != Some(issuer) {
+        return Err(Failure::refused(
+            if target_issuer.is_none() {
+                "target_missing"
+            } else {
+                "issuer_mismatch"
+            },
+            "target and issuer must match before producer status is read",
+            "inspect the appointed target and use its issuer label",
+        ));
+    }
+    let row: Option<(i64, String, String, bool)> = snapshot
+        .connection()
+        .query_row(
+            "SELECT generation,policy,epoch,revoked FROM local_verifier_producers WHERE target=?1 AND producer=?2",
+            rusqlite::params![target_name, producer],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()
+        .map_err(sqlite)?;
+    let Some((generation, policy, epoch, revoked)) = row else {
+        return Err(Failure::refused(
+            "producer_missing",
+            "no verifier producer is appointed under this name",
+            "configure a producer for the selected target revision",
+        ));
+    };
+    require_table(&snapshot, "local_target_revisions")?;
+    let current: Option<(String, Option<String>, Option<Vec<u8>>)> = snapshot
+        .connection()
+        .query_row(
+            "SELECT t.issuer,t.active_revision,r.body
+             FROM local_targets t
+             LEFT JOIN local_target_revisions r ON r.revision=t.active_revision
+             WHERE t.target=?1",
+            [target_name],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()
+        .map_err(sqlite)?;
+    let Some((current_issuer, current_revision, revision_body)) = current else {
+        return Err(Failure::refused(
+            "target_missing",
+            "target disappeared while verifier status was read",
+            "inspect target status again",
+        ));
+    };
+    if current_issuer != issuer {
+        return Err(Failure::refused(
+            "issuer_mismatch",
+            "target issuer changed while verifier status was read",
+            "inspect target status and use its current issuer label",
+        ));
+    }
+    let selected_policy = match (current_revision.as_deref(), revision_body) {
+        (None, None) => None,
+        (Some(revision), Some(body)) => {
+            let revision_id = parse_record(revision)?;
+            let record = aethyme_contracts::experimental_v0::Record::decode(
+                &body,
+                &[&target::TARGET_REVISION_SCHEMA],
+            )
+            .map_err(|error| Failure::domain("corrupt_target", error.to_string()))?;
+            if record.id() != revision_id || record.canonical_bytes() != body {
+                return Err(Failure::domain(
+                    "corrupt_target",
+                    "selected revision record identity differs".into(),
+                ));
+            }
+            let value: Value = serde_json::from_slice(&body)
+                .map_err(|error| Failure::domain("corrupt_target", error.to_string()))?;
+            if value["target"].as_str() != Some(target_name)
+                || value["issuer"].as_str() != Some(issuer)
+            {
+                return Err(Failure::domain(
+                    "corrupt_target",
+                    "selected revision target binding differs".into(),
+                ));
+            }
+            let spec: target::TargetSpec = serde_json::from_value(value["spec"].clone())
+                .map_err(|error| Failure::domain("corrupt_target", error.to_string()))?;
+            Some(spec.acceptance_policy)
+        }
+        _ => {
+            return Err(Failure::domain(
+                "corrupt_target",
+                "selected target revision record is incomplete".into(),
+            ));
+        }
+    };
+    let authority = authority::inspect(&snapshot).map_err(authority_error)?;
+    let witness_epoch = authority
+        .witness
+        .as_ref()
+        .map(|witness| witness.epoch.as_str());
+    let appointment_state = if revoked {
+        "revoked"
+    } else if authority.state != "active" || !authority.binding_matches {
+        match authority.state {
+            "frozen" => "authority_frozen",
+            "drift" => "authority_drift",
+            "unbound" | "witness_missing" => "authority_unavailable",
+            _ => "authority_unavailable",
+        }
+    } else if witness_epoch != Some(epoch.as_str()) {
+        "stale_epoch"
+    } else if selected_policy.as_deref() != Some(policy.as_str()) {
+        "stale_selected_policy"
+    } else {
+        "appointed_current"
+    };
+    Ok((
+        json!({
+            "schema":"aethyme.collab-verifier-status/experimental-v0",
+            "target":target_name,
+            "producer":producer,
+            "generation":generation,
+            "policy":policy,
+            "appointed_epoch":epoch,
+            "authority_state":authority.state,
+            "authority_binding_matches":authority.binding_matches,
+            "selected_revision":current_revision,
+            "selected_acceptance_policy":selected_policy,
+            "revoked":revoked,
+            "appointment_state":appointment_state,
+            "dispatch_authority_granted":false
+        }),
+        format!("producer {producer}: generation {generation}, appointment {appointment_state}\n"),
+    ))
+}
+
+/// Revoke exactly the currently observed producer generation. Run this before
+/// freezing project authority; a later generation is never guessed.
+pub(super) fn verifier_revoke(root: &Path, rest: &[&str]) -> Result<Output, Failure> {
+    let flags = Flags::parse(
+        rest,
+        &["--target", "--issuer", "--producer", "--generation"],
+        &[],
+    )?;
+    let generation = flags
+        .one("--generation")?
+        .parse::<i64>()
+        .map_err(|_| Failure::usage("--generation must be positive"))?;
+    if generation < 1 {
+        return Err(Failure::usage("--generation must be positive"));
+    }
+    let next_generation = generation
+        .checked_add(1)
+        .ok_or_else(|| Failure::usage("--generation is too large"))?;
+    let mut store = open(root)?;
+    let owner = existing_owner(&mut store, flags.one("--target")?, flags.one("--issuer")?)?;
+    verifier::revoke(&mut store, &owner, flags.one("--producer")?, generation)
+        .map_err(|e| Failure::domain("verifier_revocation", e.to_string()))?;
+    Ok((
+        json!({"schema":"aethyme.collab-verifier-revoke/experimental-v0","target":owner.target(),"producer":flags.one("--producer")?,"revoked_generation":generation,"next_generation":next_generation,"dispatch_started":false}),
+        format!(
+            "producer {} generation {generation} revoked; no dispatch started\n",
+            flags.one("--producer")?
+        ),
+    ))
+}
+
+/// Inspect one durable finite-service appointment after a lost process or
+/// stdout response. A dispatching row is intentionally reported as unknown;
+/// this command never resumes or replays it.
+pub(super) fn service_status(root: &Path, rest: &[&str]) -> Result<Output, Failure> {
+    let flags = Flags::parse(
+        rest,
+        &["--target", "--issuer", "--appointment", "--nonce"],
+        &[],
+    )?;
+    let appointment_arg = flags
+        .0
+        .get("--appointment")
+        .and_then(|values| values.first());
+    let nonce_arg = flags.0.get("--nonce").and_then(|values| values.first());
+    if appointment_arg.is_some() == nonce_arg.is_some() {
+        return Err(Failure::usage(
+            "exactly one of --appointment and --nonce is required",
+        ));
+    }
+    let target_name = flags.one("--target")?;
+    let issuer = flags.one("--issuer")?;
+    let appointment_arg = appointment_arg.copied();
+    let nonce_arg = nonce_arg.copied();
+    if let Some(nonce) = nonce_arg
+        && (nonce.is_empty()
+            || nonce.len() > 128
+            || !nonce
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"-_.".contains(&byte)))
+    {
+        return Err(Failure::usage(
+            "--nonce must be a 1..=128 character service nonce",
+        ));
+    }
+    let appointment_id = appointment_arg.map(parse_record).transpose()?;
+    let store = open(root)?;
+    service_status_for_store(
+        &store,
+        target_name,
+        issuer,
+        appointment_id.as_ref(),
+        nonce_arg,
+    )
+}
+
+fn service_status_for_store(
+    store: &CollaborationStore,
+    target_name: &str,
+    issuer: &str,
+    appointment_id: Option<&RecordId>,
+    nonce_arg: Option<&str>,
+) -> Result<Output, Failure> {
+    let _response = response::response_use(store)
+        .map_err(|e| Failure::domain("sensitive_response", e.to_string()))?;
+    let actual_issuer: Option<String> = store
+        .read_connection()
+        .query_row(
+            "SELECT issuer FROM local_targets WHERE target=?1",
+            [target_name],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(sqlite)?;
+    if actual_issuer.as_deref() != Some(issuer) {
+        return Err(Failure::refused(
+            if actual_issuer.is_none() {
+                "target_missing"
+            } else {
+                "issuer_mismatch"
+            },
+            "target and issuer must match before service status is read",
+            "inspect the appointed target and use its issuer label",
+        ));
+    }
+    #[derive(Debug)]
+    struct ServiceStatusRow {
+        id: String,
+        target: String,
+        revision: String,
+        epoch: String,
+        nonce: String,
+        state: String,
+        body: Vec<u8>,
+        report: Option<Vec<u8>>,
+    }
+    let decode_row = |row: &rusqlite::Row<'_>| -> rusqlite::Result<ServiceStatusRow> {
+        Ok(ServiceStatusRow {
+            id: row.get(0)?,
+            target: row.get(1)?,
+            revision: row.get(2)?,
+            epoch: row.get(3)?,
+            nonce: row.get(4)?,
+            state: row.get(5)?,
+            body: row.get(6)?,
+            report: row.get(7)?,
+        })
+    };
+    let status_row = if let Some(appointment) = appointment_id {
+        store
+            .read_connection()
+            .query_row(
+                "SELECT id,target,revision,epoch,nonce,state,body,report FROM local_controller_services WHERE id=?1",
+                [appointment.as_str()],
+                decode_row,
+            )
+            .optional()
+            .map_err(sqlite)?
+    } else {
+        let nonce = nonce_arg.expect("selector checked above");
+        let mut statement = store
+            .read_connection()
+            .prepare(
+                "SELECT id,target,revision,epoch,nonce,state,body,report FROM local_controller_services WHERE target=?1 AND nonce=?2 ORDER BY rowid LIMIT 2",
+            )
+            .map_err(sqlite)?;
+        let matches = statement
+            .query_map([target_name, nonce], decode_row)
+            .map_err(sqlite)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(sqlite)?;
+        match matches.len() {
+            0 => None,
+            1 => matches.into_iter().next(),
+            _ => {
+                return Err(Failure::refused(
+                    "appointment_ambiguous",
+                    "more than one appointment matches this target and nonce across its history",
+                    "use a unique nonce or an observed appointment ID; no work was resumed",
+                ));
+            }
+        }
+    };
+    let Some(status_row) = status_row else {
+        return Err(Failure::refused(
+            "appointment_missing",
+            if nonce_arg.is_some() {
+                "no service appointment matches this target and nonce"
+            } else {
+                "no service appointment has this ID"
+            },
+            "inspect the target and use its exact appointment ID or nonce",
+        ));
+    };
+    if status_row.target != target_name {
+        return Err(Failure::refused(
+            "appointment_target_mismatch",
+            "appointment belongs to a different target",
+            "inspect only the target named by the original run command",
+        ));
+    }
+    if nonce_arg.is_some_and(|nonce| nonce != status_row.nonce.as_str()) {
+        return Err(Failure::domain(
+            "appointment_corrupt",
+            "stored service nonce does not match the requested nonce".into(),
+        ));
+    }
+    crate::local_controller::service::validate_status_binding(
+        &status_row.id,
+        &status_row.target,
+        &status_row.revision,
+        &status_row.epoch,
+        &status_row.nonce,
+        &status_row.body,
+    )
+    .map_err(|error| Failure::domain("appointment_corrupt", error.to_string()))?;
+    if !matches!(
+        status_row.state.as_str(),
+        "dispatching" | "held" | "completed"
+    ) {
+        return Err(Failure::domain(
+            "appointment_corrupt",
+            "service appointment has an unknown persisted state".into(),
+        ));
+    }
+    let report = match status_row.report {
+        Some(bytes) => {
+            let report: crate::local_controller::ServiceReport = serde_json::from_slice(&bytes)
+                .map_err(|e| Failure::domain("appointment_corrupt", e.to_string()))?;
+            let expected_state = if report.outcome == crate::local_controller::ServiceOutcome::Held
+            {
+                "held"
+            } else {
+                "completed"
+            };
+            if report.appointment != status_row.id
+                || report.target != status_row.target
+                || report.revision != status_row.revision
+                || report.epoch != status_row.epoch
+                || status_row.state != expected_state
+            {
+                return Err(Failure::domain(
+                    "appointment_corrupt",
+                    "stored service report does not match its appointment identity".into(),
+                ));
+            }
+            Some(
+                serde_json::to_value(report)
+                    .map_err(|e| Failure::domain("appointment_corrupt", e.to_string()))?,
+            )
+        }
+        None if status_row.state == "dispatching" => None,
+        None => {
+            return Err(Failure::domain(
+                "appointment_corrupt",
+                "terminal service appointment has no stored report".into(),
+            ));
+        }
+    };
+    let unknown = status_row.state == "dispatching";
+    let reconciliation_required = unknown || status_row.state == "held";
+    Ok((
+        json!({"schema":"aethyme.collab-service-status/experimental-v0","appointment":status_row.id.as_str(),"nonce":status_row.nonce.as_str(),"lookup":if nonce_arg.is_some() {"nonce"} else {"appointment"},"target":status_row.target.as_str(),"revision":status_row.revision.as_str(),"epoch":status_row.epoch.as_str(),"state":if unknown { "unknown" } else { status_row.state.as_str() },"report":report,"reconciliation_required":reconciliation_required,"automatic_replay":false}),
+        format!(
+            "appointment {}: {}; automatic replay is disabled\n",
+            status_row.id,
+            if unknown {
+                "outcome unknown"
+            } else {
+                status_row.state.as_str()
+            }
+        ),
+    ))
+}
 pub(super) fn stop(root: &Path, rest: &[&str]) -> Result<Output, Failure> {
     let flags = Flags::parse(rest, &["--epoch", "--reason"], &[])?;
     let expected = flags.one("--epoch")?;
@@ -521,11 +1303,12 @@ pub(super) fn export(root: &Path, rest: &[&str]) -> Result<Output, Failure> {
         visibility: "local_project".into(),
         audience: audience.into(),
     };
-    let bytes = restore::export(
-        &store,
+    let bytes = restore::export_to_path(
+        &mut store,
         &owner,
         &scope,
         &restore::Selection { sources, records },
+        Path::new(output),
     )
     .map_err(|e| {
         let code = match &e {
@@ -540,24 +1323,8 @@ pub(super) fn export(root: &Path, rest: &[&str]) -> Result<Output, Failure> {
         };
         Failure::domain(code, e.to_string())
     })?;
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = options.open(output).map_err(io)?;
-    file.write_all(&bytes).map_err(io)?;
-    file.sync_all().map_err(io)?;
-    let parent = Path::new(output)
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    crate::collaboration_state::sync_directory(parent)
-        .map_err(|e| Failure::domain(e.code(), e.to_string()))?;
     Ok((
-        json!({"schema":"aethyme.collab-export/experimental-v0","profile":restore::PROFILE,"bundle":crate::collaboration_archive::ObjectDigest::of(&bytes).hex(),"bytes":bytes.len(),"historical_only":true,"grants_authority":false,"source_released":false}),
+        json!({"schema":"aethyme.collab-export/experimental-v0","profile":restore::PROFILE,"bytes":bytes,"historical_only":true,"grants_authority":false,"source_released":false,"publication_guard_held_through_sync":true}),
         "Historical source bundle written exclusively; source remains retained\n".into(),
     ))
 }
@@ -599,6 +1366,30 @@ fn read_operator<T: serde::de::DeserializeOwned>(path: &str) -> Result<T, Failur
     }
     serde_json::from_slice(&bytes).map_err(|e| Failure::usage(e.to_string()))
 }
+
+fn read_operator_bytes(path: &str, max_bytes: u64) -> Result<Vec<u8>, Failure> {
+    use std::io::Read;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = options.open(path).map_err(io)?;
+    let metadata = file.metadata().map_err(io)?;
+    if !metadata.is_file() || metadata.len() > max_bytes {
+        return Err(Failure::usage("bounded regular operator file required"));
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take(max_bytes + 1)
+        .read_to_end(&mut bytes)
+        .map_err(io)?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(Failure::usage("operator file too large"));
+    }
+    Ok(bytes)
+}
 pub(super) fn target_run(root: &Path, rest: &[&str]) -> Result<Output, Failure> {
     use crate::execution_supervisor::DockerExecutor;
     use crate::execution_verifier;
@@ -616,6 +1407,7 @@ pub(super) fn target_run(root: &Path, rest: &[&str]) -> Result<Output, Failure> 
             "--remote",
             "--destination",
             "--docker",
+            "--endpoint",
             "--timeout",
             "--authorization",
             "--allow-replacement",
@@ -647,6 +1439,7 @@ pub(super) fn target_run(root: &Path, rest: &[&str]) -> Result<Output, Failure> 
         ));
     }
     let cli = std::path::PathBuf::from(flags.one("--docker")?);
+    let endpoint = flags.one("--endpoint")?;
     if !cli.is_absolute()
         || !resources.host_state.is_absolute()
         || !resources.temporary_root.is_absolute()
@@ -680,8 +1473,8 @@ pub(super) fn target_run(root: &Path, rest: &[&str]) -> Result<Output, Failure> 
     let permit =
         execution_verifier::existing_permit(&store, &owner, flags.one("--producer")?, generation)
             .map_err(|e| Failure::domain("verifier_authority", e.to_string()))?;
-    let native =
-        DockerExecutor::probe(cli).map_err(|e| Failure::domain("native_runtime", e.to_string()))?;
+    let native = DockerExecutor::probe_at(cli, endpoint)
+        .map_err(|e| Failure::domain("native_runtime", e.to_string()))?;
     let resource_policy = crate::execution_resources::ResourcePolicy {
         host_state: resources.host_state,
         temporary_root: resources.temporary_root,
@@ -736,6 +1529,125 @@ mod tests {
     use super::*;
     use crate::collaboration_state::inspect_at;
     use crate::local_target::tests::Fixture;
+    use aethyme_contracts::experimental_v0::Record;
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct ServiceStatusSnapshot {
+        id: String,
+        target: String,
+        revision: String,
+        epoch: String,
+        nonce: String,
+        state: String,
+        body: Vec<u8>,
+        report: Option<Vec<u8>>,
+    }
+
+    fn service_status_snapshot(store: &CollaborationStore) -> Vec<ServiceStatusSnapshot> {
+        let mut statement = store
+            .read_connection()
+            .prepare(
+                "SELECT id,target,revision,epoch,nonce,state,body,report FROM local_controller_services ORDER BY id",
+            )
+            .unwrap();
+        statement
+            .query_map([], |row| {
+                Ok(ServiceStatusSnapshot {
+                    id: row.get(0)?,
+                    target: row.get(1)?,
+                    revision: row.get(2)?,
+                    epoch: row.get(3)?,
+                    nonce: row.get(4)?,
+                    state: row.get(5)?,
+                    body: row.get(6)?,
+                    report: row.get(7)?,
+                })
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    }
+
+    fn service_status_record(
+        target_name: &str,
+        revision: &str,
+        epoch: &str,
+        nonce: &str,
+        marker: Option<&str>,
+    ) -> Record {
+        let mut value = json!({
+            "schema": crate::local_controller::service::SERVICE_SCHEMA.name,
+            "spec": {
+                "target": target_name,
+                "revision": revision,
+                "epoch": epoch,
+                "policy": {"nonce": nonce},
+            }
+        });
+        if let Some(marker) = marker {
+            value["spec"]["status_test_marker"] = json!(marker);
+        }
+        Record::decode(
+            &serde_json::to_vec(&value).unwrap(),
+            &[&crate::local_controller::service::SERVICE_SCHEMA],
+        )
+        .unwrap()
+    }
+
+    fn insert_service_status_row(
+        store: &mut CollaborationStore,
+        target_name: &str,
+        revision: &str,
+        epoch: &str,
+        nonce: &str,
+        state: &str,
+    ) -> String {
+        let record = service_status_record(target_name, revision, epoch, nonce, None);
+        let id = record.id().to_string();
+        let report = match state {
+            "dispatching" => None,
+            "held" | "completed" => Some(
+                serde_json::to_vec(&json!({
+                    "appointment": id,
+                    "target": target_name,
+                    "revision": revision,
+                    "epoch": epoch,
+                    "ticks": 1,
+                    "completions": [],
+                    "outcome": if state == "held" { "held" } else { "completion_allowance" },
+                    "detail": null,
+                }))
+                .unwrap(),
+            ),
+            _ => panic!("test service state must be a known persisted state"),
+        };
+        store
+            .connection()
+            .execute(
+                "INSERT INTO local_controller_services(id,target,revision,epoch,nonce,body,state,report) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+                (
+                    id.as_str(),
+                    target_name,
+                    revision,
+                    epoch,
+                    nonce,
+                    record.canonical_bytes(),
+                    state,
+                    report,
+                ),
+            )
+            .unwrap();
+        id
+    }
+
+    fn select_initial_target(fixture: &mut Fixture) -> (String, crate::local_authority::Epoch) {
+        let owner = target::acquire_controller(&mut fixture.store, "T", "operator").unwrap();
+        let spec = fixture.spec();
+        let proposal = target::propose_revision(&mut fixture.store, &owner, spec).unwrap();
+        target::select_revision(&mut fixture.store, &owner, &proposal.id).unwrap();
+        let epoch = authority::status(&fixture.store).unwrap().epoch;
+        (proposal.id.to_string(), epoch)
+    }
 
     #[test]
     fn lifecycle_flags_reject_duplicates_unknowns_and_unbounded_input() {
@@ -753,6 +1665,609 @@ mod tests {
         .unwrap();
         assert_eq!(valid.many("--source"), vec!["A", "B"]);
         assert_eq!(valid.one("--target").unwrap(), "T");
+    }
+
+    #[test]
+    fn service_status_nonce_recovers_unknown_appointment_after_lost_output_without_replay() {
+        let mut fixture = Fixture::new();
+        let (first_revision, first_epoch) = select_initial_target(&mut fixture);
+        let lost_output_nonce = "lost-output-appointment-v1";
+        let lost_output_appointment = insert_service_status_row(
+            &mut fixture.store,
+            "T",
+            &first_revision,
+            first_epoch.as_str(),
+            lost_output_nonce,
+            "dispatching",
+        );
+
+        let before_lookup = service_status_snapshot(&fixture.store);
+        let unknown = service_status_for_store(
+            &fixture.store,
+            "T",
+            "operator",
+            None,
+            Some(lost_output_nonce),
+        )
+        .unwrap()
+        .0;
+        assert_eq!(unknown["appointment"], lost_output_appointment);
+        assert_eq!(unknown["lookup"], "nonce");
+        assert_eq!(unknown["nonce"], lost_output_nonce);
+        assert_eq!(unknown["state"], "unknown");
+        assert_eq!(unknown["report"], serde_json::Value::Null);
+        assert_eq!(unknown["reconciliation_required"], true);
+        assert_eq!(unknown["automatic_replay"], false);
+        assert_eq!(service_status_snapshot(&fixture.store), before_lookup);
+
+        let by_id = service_status_for_store(
+            &fixture.store,
+            "T",
+            "operator",
+            Some(&RecordId::parse(&lost_output_appointment).unwrap()),
+            None,
+        )
+        .unwrap()
+        .0;
+        assert_eq!(by_id["appointment"], lost_output_appointment);
+        assert_eq!(by_id["lookup"], "appointment");
+        let other_owner =
+            target::acquire_controller(&mut fixture.store, "other-target", "operator").unwrap();
+        drop(other_owner);
+        assert_eq!(
+            service_status_for_store(
+                &fixture.store,
+                "other-target",
+                "operator",
+                Some(&RecordId::parse(&lost_output_appointment).unwrap()),
+                None,
+            )
+            .unwrap_err()
+            .code,
+            "appointment_target_mismatch"
+        );
+
+        assert_eq!(
+            service_status_for_store(
+                &fixture.store,
+                "T",
+                "operator",
+                None,
+                Some("missing-appointment"),
+            )
+            .unwrap_err()
+            .code,
+            "appointment_missing"
+        );
+        assert_eq!(
+            service_status_for_store(
+                &fixture.store,
+                "T",
+                "wrong-issuer",
+                None,
+                Some(lost_output_nonce),
+            )
+            .unwrap_err()
+            .code,
+            "issuer_mismatch"
+        );
+        assert_eq!(
+            service_status_for_store(
+                &fixture.store,
+                "missing-target",
+                "operator",
+                None,
+                Some(lost_output_nonce),
+            )
+            .unwrap_err()
+            .code,
+            "target_missing"
+        );
+        let selector_error = service_status(
+            Path::new("/unused-before-selector-validation"),
+            &[
+                "--target",
+                "T",
+                "--issuer",
+                "operator",
+                "--appointment",
+                &lost_output_appointment,
+                "--nonce",
+                lost_output_nonce,
+            ],
+        )
+        .unwrap_err();
+        assert_eq!(selector_error.exit, exit_status::USAGE);
+        assert_eq!(
+            selector_error.message,
+            "exactly one of --appointment and --nonce is required"
+        );
+        let missing_selector = service_status(
+            Path::new("/unused-before-selector-validation"),
+            &["--target", "T", "--issuer", "operator"],
+        )
+        .unwrap_err();
+        assert_eq!(missing_selector.exit, exit_status::USAGE);
+        let invalid_nonce = service_status(
+            Path::new("/unused-before-selector-validation"),
+            &[
+                "--target",
+                "T",
+                "--issuer",
+                "operator",
+                "--nonce",
+                "contains space",
+            ],
+        )
+        .unwrap_err();
+        assert_eq!(invalid_nonce.exit, exit_status::USAGE);
+        assert_eq!(
+            invalid_nonce.message,
+            "--nonce must be a 1..=128 character service nonce"
+        );
+
+        let frozen = authority::freeze(
+            &mut fixture.store,
+            &first_epoch,
+            "test historical service status after authority rotation",
+        )
+        .unwrap();
+        assert_ne!(frozen.epoch, first_epoch);
+        let historical = service_status_for_store(
+            &fixture.store,
+            "T",
+            "operator",
+            None,
+            Some(lost_output_nonce),
+        )
+        .unwrap()
+        .0;
+        assert_eq!(historical["appointment"], lost_output_appointment);
+        assert_eq!(historical["revision"], first_revision);
+        assert_eq!(historical["epoch"], first_epoch.as_str());
+        assert_eq!(historical["state"], "unknown");
+        assert_eq!(historical["automatic_replay"], false);
+    }
+
+    #[test]
+    fn service_status_nonce_reads_completed_history_across_revisions_and_epochs() {
+        let mut fixture = Fixture::new();
+        let (first_revision, first_epoch) = select_initial_target(&mut fixture);
+        let history_nonce = "completed-historical-service-v1";
+        insert_service_status_row(
+            &mut fixture.store,
+            "T",
+            &first_revision,
+            first_epoch.as_str(),
+            history_nonce,
+            "completed",
+        );
+
+        let owner = target::acquire_controller(&mut fixture.store, "T", "operator").unwrap();
+        let mut next_spec = fixture.spec();
+        next_spec.objective = "historical status after a new revision".into();
+        next_spec.selected.push("B".into());
+        let next_revision =
+            target::propose_revision(&mut fixture.store, &owner, next_spec).unwrap();
+        target::select_revision(&mut fixture.store, &owner, &next_revision.id).unwrap();
+        assert_ne!(next_revision.id.as_str(), first_revision);
+
+        let ambiguous_nonce = "same-nonce-across-revisions-and-epochs";
+        insert_service_status_row(
+            &mut fixture.store,
+            "T",
+            &first_revision,
+            first_epoch.as_str(),
+            ambiguous_nonce,
+            "completed",
+        );
+        let second_epoch = format!("sha256:{}", "9".repeat(64));
+        insert_service_status_row(
+            &mut fixture.store,
+            "T",
+            next_revision.id.as_str(),
+            &second_epoch,
+            ambiguous_nonce,
+            "completed",
+        );
+        assert_eq!(
+            service_status_for_store(&fixture.store, "T", "operator", None, Some(ambiguous_nonce),)
+                .unwrap_err()
+                .code,
+            "appointment_ambiguous"
+        );
+        drop(owner);
+
+        let frozen = authority::freeze(
+            &mut fixture.store,
+            &first_epoch,
+            "test completed historical service status after authority rotation",
+        )
+        .unwrap();
+        assert_ne!(frozen.epoch, first_epoch);
+        let current = target::status(&fixture.store, "T").unwrap();
+        assert_eq!(
+            current.revision.unwrap().as_str(),
+            next_revision.id.as_str()
+        );
+        let historical =
+            service_status_for_store(&fixture.store, "T", "operator", None, Some(history_nonce))
+                .unwrap()
+                .0;
+        assert_eq!(historical["revision"], first_revision);
+        assert_eq!(historical["epoch"], first_epoch.as_str());
+        assert_eq!(historical["state"], "completed");
+        assert_eq!(historical["report"]["outcome"], "completion_allowance");
+        assert_eq!(historical["automatic_replay"], false);
+    }
+
+    #[test]
+    fn service_status_rejects_corrupt_body_index_bindings_without_writes() {
+        let mut fixture = Fixture::new();
+        let (first_revision, first_epoch) = select_initial_target(&mut fixture);
+        let owner = target::acquire_controller(&mut fixture.store, "T", "operator").unwrap();
+        let mut next_spec = fixture.spec();
+        next_spec.objective = "second revision for status corruption control".into();
+        let next_revision =
+            target::propose_revision(&mut fixture.store, &owner, next_spec).unwrap();
+        target::select_revision(&mut fixture.store, &owner, &next_revision.id).unwrap();
+        drop(owner);
+        let other_owner =
+            target::acquire_controller(&mut fixture.store, "other-target", "operator").unwrap();
+        drop(other_owner);
+
+        let nonce = "corrupt-binding-status-v1";
+        let appointment = insert_service_status_row(
+            &mut fixture.store,
+            "T",
+            &first_revision,
+            first_epoch.as_str(),
+            nonce,
+            "dispatching",
+        );
+        let alternate_id = service_status_record(
+            "T",
+            &first_revision,
+            first_epoch.as_str(),
+            nonce,
+            Some("different canonical body"),
+        )
+        .id()
+        .to_string();
+
+        let canonical_body = service_status_snapshot(&fixture.store)[0].body.clone();
+        let corruptions = [
+            (
+                "target",
+                "UPDATE local_controller_services SET target='other-target' WHERE id=?1",
+            ),
+            (
+                "noncanonical_body",
+                "UPDATE local_controller_services SET body=?2 WHERE id=?1",
+            ),
+            (
+                "revision",
+                "UPDATE local_controller_services SET revision=?2 WHERE id=?1",
+            ),
+            (
+                "epoch",
+                "UPDATE local_controller_services SET epoch=?2 WHERE id=?1",
+            ),
+            (
+                "nonce",
+                "UPDATE local_controller_services SET nonce=?2 WHERE id=?1",
+            ),
+            (
+                "id",
+                "UPDATE local_controller_services SET id=?2 WHERE id=?1",
+            ),
+        ];
+        for (field, update) in corruptions {
+            match field {
+                "target" => {
+                    fixture
+                        .store
+                        .connection()
+                        .execute(update, [appointment.as_str()])
+                        .unwrap();
+                }
+                "noncanonical_body" => {
+                    let parsed: serde_json::Value =
+                        serde_json::from_slice(&canonical_body).unwrap();
+                    let noncanonical_body = serde_json::to_vec_pretty(&parsed).unwrap();
+                    let decoded = Record::decode(
+                        &noncanonical_body,
+                        &[&crate::local_controller::service::SERVICE_SCHEMA],
+                    )
+                    .unwrap();
+                    assert_eq!(decoded.id().as_str(), appointment);
+                    assert_ne!(decoded.canonical_bytes(), noncanonical_body);
+                    fixture
+                        .store
+                        .connection()
+                        .execute(update, (appointment.as_str(), noncanonical_body))
+                        .unwrap();
+                }
+                "revision" => {
+                    fixture
+                        .store
+                        .connection()
+                        .execute(update, (appointment.as_str(), next_revision.id.as_str()))
+                        .unwrap();
+                }
+                "epoch" => {
+                    fixture
+                        .store
+                        .connection()
+                        .execute(
+                            update,
+                            (appointment.as_str(), format!("sha256:{}", "8".repeat(64))),
+                        )
+                        .unwrap();
+                }
+                "nonce" => {
+                    fixture
+                        .store
+                        .connection()
+                        .execute(update, (appointment.as_str(), "different-status-nonce"))
+                        .unwrap();
+                }
+                "id" => {
+                    fixture
+                        .store
+                        .connection()
+                        .execute(update, (appointment.as_str(), alternate_id.as_str()))
+                        .unwrap();
+                }
+                _ => unreachable!(),
+            }
+
+            let before = service_status_snapshot(&fixture.store);
+            assert_eq!(before.len(), 1, "corrupted {field} row count");
+            assert_eq!(before[0].state, "dispatching", "corrupted {field} state");
+            assert_eq!(before[0].report, None, "corrupted {field} report");
+            let lookup_id = if field == "id" {
+                alternate_id.as_str()
+            } else {
+                appointment.as_str()
+            };
+            let error = service_status_for_store(
+                &fixture.store,
+                if field == "target" {
+                    "other-target"
+                } else {
+                    "T"
+                },
+                "operator",
+                Some(&RecordId::parse(lookup_id).unwrap()),
+                None,
+            )
+            .unwrap_err();
+            assert_eq!(
+                error.code, "appointment_corrupt",
+                "corrupted {field} binding"
+            );
+            assert_eq!(
+                service_status_snapshot(&fixture.store),
+                before,
+                "read-only status changed the {field} row"
+            );
+
+            match field {
+                "target" => {
+                    fixture
+                        .store
+                        .connection()
+                        .execute(
+                            "UPDATE local_controller_services SET target='T' WHERE id=?1",
+                            [appointment.as_str()],
+                        )
+                        .unwrap();
+                }
+                "noncanonical_body" => {
+                    fixture
+                        .store
+                        .connection()
+                        .execute(
+                            "UPDATE local_controller_services SET body=?2 WHERE id=?1",
+                            (appointment.as_str(), canonical_body.as_slice()),
+                        )
+                        .unwrap();
+                }
+                "revision" => {
+                    fixture
+                        .store
+                        .connection()
+                        .execute(
+                            "UPDATE local_controller_services SET revision=?2 WHERE id=?1",
+                            (appointment.as_str(), first_revision.as_str()),
+                        )
+                        .unwrap();
+                }
+                "epoch" => {
+                    fixture
+                        .store
+                        .connection()
+                        .execute(
+                            "UPDATE local_controller_services SET epoch=?2 WHERE id=?1",
+                            (appointment.as_str(), first_epoch.as_str()),
+                        )
+                        .unwrap();
+                }
+                "nonce" => {
+                    fixture
+                        .store
+                        .connection()
+                        .execute(
+                            "UPDATE local_controller_services SET nonce=?2 WHERE id=?1",
+                            (appointment.as_str(), nonce),
+                        )
+                        .unwrap();
+                }
+                "id" => {
+                    fixture
+                        .store
+                        .connection()
+                        .execute(
+                            "UPDATE local_controller_services SET id=?2 WHERE id=?1",
+                            (alternate_id.as_str(), appointment.as_str()),
+                        )
+                        .unwrap();
+                }
+                _ => unreachable!(),
+            }
+        }
+
+        let completed_nonce = "corrupt-report-status-v1";
+        let completed_appointment = insert_service_status_row(
+            &mut fixture.store,
+            "T",
+            &first_revision,
+            first_epoch.as_str(),
+            completed_nonce,
+            "completed",
+        );
+        let original_report = service_status_snapshot(&fixture.store)
+            .into_iter()
+            .find(|row| row.id == completed_appointment)
+            .unwrap()
+            .report
+            .unwrap();
+        let report_corruptions = [
+            "invalid_json",
+            "wrong_appointment",
+            "wrong_target",
+            "wrong_revision",
+            "wrong_epoch",
+            "wrong_state",
+        ];
+        for corruption in report_corruptions {
+            match corruption {
+                "invalid_json" => {
+                    fixture
+                        .store
+                        .connection()
+                        .execute(
+                            "UPDATE local_controller_services SET report=?2 WHERE id=?1",
+                            (completed_appointment.as_str(), b"{".as_slice()),
+                        )
+                        .unwrap();
+                }
+                "wrong_state" => {
+                    fixture
+                        .store
+                        .connection()
+                        .execute(
+                            "UPDATE local_controller_services SET state='dispatching' WHERE id=?1",
+                            [completed_appointment.as_str()],
+                        )
+                        .unwrap();
+                }
+                _ => {
+                    let mut report: serde_json::Value =
+                        serde_json::from_slice(&original_report).unwrap();
+                    match corruption {
+                        "wrong_appointment" => {
+                            report["appointment"] = json!(format!("sha256:{}", "9".repeat(64)));
+                        }
+                        "wrong_target" => report["target"] = json!("other-target"),
+                        "wrong_revision" => report["revision"] = json!(next_revision.id.as_str()),
+                        "wrong_epoch" => {
+                            report["epoch"] = json!(format!("sha256:{}", "7".repeat(64)));
+                        }
+                        _ => unreachable!(),
+                    }
+                    fixture
+                        .store
+                        .connection()
+                        .execute(
+                            "UPDATE local_controller_services SET report=?2 WHERE id=?1",
+                            (
+                                completed_appointment.as_str(),
+                                serde_json::to_vec(&report).unwrap(),
+                            ),
+                        )
+                        .unwrap();
+                }
+            }
+            let before = service_status_snapshot(&fixture.store);
+            let error = service_status_for_store(
+                &fixture.store,
+                "T",
+                "operator",
+                None,
+                Some(completed_nonce),
+            )
+            .unwrap_err();
+            assert_eq!(
+                error.code, "appointment_corrupt",
+                "corrupted report {corruption}"
+            );
+            assert_eq!(service_status_snapshot(&fixture.store), before);
+            match corruption {
+                "wrong_state" => {
+                    fixture
+                        .store
+                        .connection()
+                        .execute(
+                            "UPDATE local_controller_services SET state='completed' WHERE id=?1",
+                            [completed_appointment.as_str()],
+                        )
+                        .unwrap();
+                }
+                _ => {
+                    fixture
+                        .store
+                        .connection()
+                        .execute(
+                            "UPDATE local_controller_services SET report=?2 WHERE id=?1",
+                            (completed_appointment.as_str(), original_report.as_slice()),
+                        )
+                        .unwrap();
+                }
+            }
+        }
+    }
+    #[test]
+    fn verifier_prepare_refuses_oversized_literal_inventory_before_opening_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let plan = directory.path().join("plan.json");
+        std::fs::write(
+            &plan,
+            serde_json::to_vec(&verifier::VerifierPlan {
+                image: format!("sha256:{}", "0".repeat(64)),
+                command: crate::execution_snapshot::CommandSpec {
+                    program: "/bin/sh".into(),
+                    arguments: vec!["/artifact/app.sh".into()],
+                    environment: Default::default(),
+                },
+                max_age_ms: 1000,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let inventory = directory.path().join("inventory.json");
+        std::fs::write(&inventory, vec![b'x'; 4 * 1024 * 1024 + 1]).unwrap();
+        let operation = OperationId::mint().unwrap().as_str().to_owned();
+        let args = [
+            "--harness-repo",
+            "/no-such-harness",
+            "--commit",
+            "not-a-commit",
+            "--inventory",
+            inventory.to_str().unwrap(),
+            "--operation",
+            operation.as_str(),
+            "--docker",
+            "/no-such-docker",
+            "--endpoint",
+            "unix:///no-such-endpoint",
+            "--file",
+            plan.to_str().unwrap(),
+        ];
+        let failure = verifier_prepare(directory.path(), &args).unwrap_err();
+        assert_eq!(failure.exit, exit_status::USAGE);
+        assert_eq!(failure.message, "operator file too large");
     }
     #[test]
     fn native_gate_retention_cli_rejects_invalid_and_incomplete_arguments() {

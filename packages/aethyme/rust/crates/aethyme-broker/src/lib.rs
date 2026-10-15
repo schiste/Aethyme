@@ -40,6 +40,7 @@ pub mod collaboration_capture;
 pub mod collaboration_cli;
 pub mod collaboration_context;
 pub mod collaboration_gc;
+pub mod collaboration_sensitive;
 pub mod collaboration_state;
 pub mod collaboration_submit;
 pub mod composer;
@@ -47,6 +48,7 @@ pub mod composition;
 mod disk_headroom;
 mod duplicate_work;
 pub mod exit_status;
+pub mod local_capture_notice;
 pub mod native_gates;
 pub mod resolution;
 pub use disk_headroom::{

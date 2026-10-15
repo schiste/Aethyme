@@ -49,6 +49,8 @@ pub enum GenerationError {
     #[error(transparent)]
     Archive(#[from] archive::ArchiveError),
     #[error(transparent)]
+    SensitiveResponse(#[from] crate::collaboration_sensitive::SensitiveError),
+    #[error(transparent)]
     Compose(#[from] crate::composer::ComposeError),
     #[error(transparent)]
     Snapshot(#[from] crate::execution_snapshot::SnapshotError),
@@ -335,6 +337,7 @@ pub fn load_prepared(
     generation: &RecordId,
 ) -> Result<PreparedGeneration, GenerationError> {
     let _archive = collaboration_gc::archive_use(store)?;
+    let _response = crate::collaboration_sensitive::response_use(store)?;
     let result = inspect_prepared(store, generation)?;
     let manifest = snapshot(store, &result.intent.source)?;
     verify_checkout(&result.root, &manifest, &result.mapping)?;
@@ -345,6 +348,7 @@ fn inspect_prepared(
     generation: &RecordId,
 ) -> Result<PreparedGeneration, GenerationError> {
     let _archive = collaboration_gc::archive_use(store)?;
+    let _response = crate::collaboration_sensitive::response_use(store)?;
     let row:Option<(Vec<u8>,String,String,Vec<u8>)>=store.read_connection().query_row(
         "SELECT g.body,g.state,r.id,r.body FROM local_generations g JOIN local_generation_receipts r ON r.id=g.prepared_receipt AND r.generation=g.id WHERE g.id=?1",
         [generation.as_str()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?;
@@ -442,6 +446,7 @@ fn prepare_with(
         return Err(invalid("operation token"));
     }
     let _archive = collaboration_gc::archive_use(store)?;
+    let _response = crate::collaboration_sensitive::response_use(store)?;
     unchanged_old(store, &mut old)?;
     let mut spec = IntentSpec {
         profile: PROFILE.into(),

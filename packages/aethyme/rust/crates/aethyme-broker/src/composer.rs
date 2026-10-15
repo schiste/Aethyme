@@ -154,6 +154,7 @@ pub fn compose_structural(
         request,
         &request.deliveries,
         None,
+        None,
         &mut profile,
     )?;
     Ok(StructuralComposition {
@@ -322,6 +323,8 @@ pub enum ComposeError {
         expected: String,
         observed: String,
     },
+    #[error("candidate retention: {0}")]
+    CandidateRetention(String),
 }
 
 impl ComposeError {
@@ -333,6 +336,7 @@ impl ComposeError {
             Self::Git(_) => "git",
             Self::Io { .. } => "io",
             Self::SubjectMismatch { .. } => "subject_mismatch",
+            Self::CandidateRetention(_) => "candidate_retention",
         }
     }
 }
@@ -365,6 +369,33 @@ pub fn compose(
         request,
         &request.deliveries,
         None,
+        None,
+        &mut MergeProfile {
+            engine: None,
+            observations: Vec::new(),
+            text_merges: 0,
+            accepted_baseline: None,
+        },
+    )
+}
+
+/// Compose a candidate and let the caller attach its retention roots while
+/// this composition's archive-use guard is still held. This closes the GC
+/// window between writing an unrooted candidate and making it durable to a
+/// target. Ordinary composer callers keep the unretained [`compose`] contract.
+pub(crate) fn compose_with_candidate_retainer(
+    store: &mut CollaborationStore,
+    repo: &Path,
+    request: &CompositionRequest,
+    retainer: &mut CandidateRetainer<'_>,
+) -> Result<Composition, ComposeError> {
+    compose_inner(
+        store,
+        repo,
+        request,
+        &request.deliveries,
+        None,
+        Some(retainer),
         &mut MergeProfile {
             engine: None,
             observations: Vec::new(),
@@ -383,6 +414,28 @@ pub(crate) fn compose_after_accepted(
     request: &CompositionRequest,
     completion: RecordId,
     members: Vec<String>,
+) -> Result<Composition, ComposeError> {
+    compose_after_accepted_inner(store, repo, request, completion, members, None)
+}
+
+pub(crate) fn compose_after_accepted_with_candidate_retainer(
+    store: &mut CollaborationStore,
+    repo: &Path,
+    request: &CompositionRequest,
+    completion: RecordId,
+    members: Vec<String>,
+    retainer: &mut CandidateRetainer<'_>,
+) -> Result<Composition, ComposeError> {
+    compose_after_accepted_inner(store, repo, request, completion, members, Some(retainer))
+}
+
+fn compose_after_accepted_inner(
+    store: &mut CollaborationStore,
+    repo: &Path,
+    request: &CompositionRequest,
+    completion: RecordId,
+    members: Vec<String>,
+    retainer: Option<&mut CandidateRetainer<'_>>,
 ) -> Result<Composition, ComposeError> {
     let mut lineages = BTreeSet::new();
     for member in &members {
@@ -407,6 +460,7 @@ pub(crate) fn compose_after_accepted(
         request,
         &request.deliveries,
         None,
+        retainer,
         &mut MergeProfile {
             engine: None,
             observations: Vec::new(),
@@ -545,6 +599,7 @@ fn recompose_inner(
         request,
         &deliveries,
         Some(subtraction),
+        None,
         profile,
     )
 }
@@ -600,6 +655,7 @@ fn compose_inner(
     request: &CompositionRequest,
     deliveries: &[String],
     recomposition: Option<&Subtraction>,
+    mut candidate_retainer: Option<&mut CandidateRetainer<'_>>,
     profile: &mut MergeProfile<'_>,
 ) -> Result<Composition, ComposeError> {
     // Reclamation cannot remove an input while this composition reads it.
@@ -732,13 +788,25 @@ fn compose_inner(
         profile,
     )?;
     let object = collaboration_archive::put_object(store, &bytes)?;
+    let recipe = RecipeRef { id, object };
+    if let Some(retain) = candidate_retainer.as_deref_mut() {
+        retain(store, &candidate, &recipe, &_use)?;
+    }
     Ok(Composition {
         outcome: CompositionOutcome::Candidate(candidate),
-        recipe: Some(RecipeRef { id, object }),
+        recipe: Some(recipe),
         order,
         usage,
     })
 }
+
+pub(crate) type CandidateRetainer<'a> = dyn FnMut(
+        &mut CollaborationStore,
+        &Candidate,
+        &RecipeRef,
+        &crate::collaboration_gc::ArchiveUse,
+    ) -> Result<(), ComposeError>
+    + 'a;
 
 enum Built {
     Candidate(Candidate, Plan),

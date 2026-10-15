@@ -50,6 +50,45 @@ impl Connection {
         }
         Ok(Self { cli, endpoint })
     }
+
+    pub fn pinned(cli: PathBuf, endpoint: &str) -> Result<Self, SupervisorError> {
+        if !cli.is_absolute()
+            || endpoint.len() > 4096
+            || !endpoint.starts_with("unix:///")
+            || endpoint.contains('\0')
+            || endpoint.contains('?')
+            || endpoint.contains('#')
+        {
+            return Err(SupervisorError::Unsupported(
+                "absolute Docker CLI and explicit Unix endpoint required".into(),
+            ));
+        }
+        let path = Path::new(endpoint.strip_prefix("unix://").expect("checked prefix"));
+        let raw_path = path.as_os_str().to_string_lossy();
+        let mut components = raw_path.split('/');
+        let has_canonical_components = components.next() == Some("")
+            && components.clone().next().is_some()
+            && components.all(|part| !part.is_empty() && part != "." && part != "..");
+        if !path.is_absolute()
+            || raw_path.contains('%')
+            || raw_path.ends_with('/')
+            || !has_canonical_components
+            || path.components().any(|part| {
+                matches!(
+                    part,
+                    std::path::Component::CurDir | std::path::Component::ParentDir
+                )
+            })
+        {
+            return Err(SupervisorError::Unsupported(
+                "explicit Unix Docker endpoint must be an absolute normalized path".into(),
+            ));
+        }
+        Ok(Self {
+            cli,
+            endpoint: endpoint.into(),
+        })
+    }
 }
 struct Client {
     child: std::process::Child,

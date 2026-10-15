@@ -7,7 +7,7 @@ use crate::execution_verifier::ProducerPermit;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-const SERVICE_SCHEMA: RecordSchema = RecordSchema {
+pub(crate) const SERVICE_SCHEMA: RecordSchema = RecordSchema {
     name: "aethyme.local-controller-service/experimental-v1",
     fields: &[FieldSpec {
         name: "spec",
@@ -17,6 +17,45 @@ const SERVICE_SCHEMA: RecordSchema = RecordSchema {
     }],
     capabilities: &[],
 };
+
+/// Validate the immutable appointment body against its indexed service row.
+/// This is used by lost-response status lookup, including lookups that span
+/// revisions or authority epochs. The row is not a dispatch capability.
+pub(crate) fn validate_status_binding(
+    appointment: &str,
+    target: &str,
+    revision: &str,
+    epoch: &str,
+    nonce: &str,
+    body: &[u8],
+) -> Result<(), ControllerError> {
+    let record = Record::decode(body, &[&SERVICE_SCHEMA])
+        .map_err(|error| ControllerError::Canonical(error.to_string()))?;
+    if record.canonical_bytes() != body {
+        return Err(ControllerError::Canonical(
+            "stored service appointment body is not canonical".into(),
+        ));
+    }
+    let value: serde_json::Value = serde_json::from_slice(body)?;
+    let spec = value
+        .get("spec")
+        .and_then(serde_json::Value::as_object)
+        .ok_or(ControllerError::Mismatch)?;
+    let policy_nonce = spec
+        .get("policy")
+        .and_then(serde_json::Value::as_object)
+        .and_then(|policy| policy.get("nonce"))
+        .and_then(serde_json::Value::as_str);
+    if record.id().as_str() != appointment
+        || spec.get("target").and_then(serde_json::Value::as_str) != Some(target)
+        || spec.get("revision").and_then(serde_json::Value::as_str) != Some(revision)
+        || spec.get("epoch").and_then(serde_json::Value::as_str) != Some(epoch)
+        || policy_nonce != Some(nonce)
+    {
+        return Err(ControllerError::Mismatch);
+    }
+    Ok(())
+}
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServicePolicy {

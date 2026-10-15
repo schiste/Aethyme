@@ -56,6 +56,10 @@ pub enum ControllerError {
     #[error(transparent)]
     Wave(#[from] wave::WaveError),
     #[error(transparent)]
+    CaptureNotice(#[from] crate::local_capture_notice::NoticeError),
+    #[error(transparent)]
+    Sensitive(#[from] crate::collaboration_sensitive::SensitiveError),
+    #[error(transparent)]
     Acceptance(#[from] acceptance::AcceptanceError),
     #[error(transparent)]
     Transport(#[from] crate::local_source_transport::TransportError),
@@ -266,6 +270,7 @@ fn complete_inner(
 /// Read a historical completion. Canonical records and their SQL projections
 /// must agree; this function cannot return a current private acceptance grant.
 pub fn load(store: &CollaborationStore, key: &RecordId) -> Result<CompletionSpec, ControllerError> {
+    let _response = crate::collaboration_sensitive::response_use(store)?;
     let row: (Vec<u8>, String, String, String) = store.read_connection().query_row(
         "SELECT body,wave,revision,target FROM local_controller_completions WHERE id=?1",
         [key.as_str()],
