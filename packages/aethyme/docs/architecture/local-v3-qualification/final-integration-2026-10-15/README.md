@@ -37,11 +37,40 @@ The records name the actual CI merge commit and tree, separate from the PR head.
 These failed commands receive no passing-command or ignored native-profile
 credit. Their complete original logs are retained.
 
+## Initial full workspace run and native fixture repair
+
+At clean aggregate `86c982eeecd92e473e309bf0f13dfdde1379e6ac`, the official
+`test-like-ci.sh --full` command completed with exit 100: 4,569 tests ran,
+4,489 passed, 80 failed, and 38 were skipped. Source stayed unchanged. The complete
+raw log and JUnit report are preserved. The original driver probed the shared
+Cargo target for JUnit; a separate reconciliation record binds the fresh actual
+workspace report without rewriting that original batch record. The remaining
+four planned stages were unrun after the full-suite failure.
+
+Five valid native-dispatch fixtures inherited the official runner's `GIT_*`
+configuration. A test-only child wrapper gives those fixtures private HOME,
+XDG and temporary roots and removes inherited Git variables only in the child;
+the production environment refusal remains strict. Sixteen selected native and
+controller tests passed under the same injected configuration. Removing the
+wrapper's environment cleanup caused the exact child assertion and parent test
+to fail (exit 101); the unique backup was restored byte-for-byte, and the restored
+exact test passed. Their metadata records the precise working-tree diff at
+source `86c982`; these are 17 overlapping positive executions and one negative
+control, not a successful full workspace run.
+
+Several other first-run failures involved older shell fixtures and temporary
+paths containing spaces. A subsequent full retry uses a whitespace-free,
+off-Git temporary root; the official runner, Git isolation, assertions, limits
+and failure behavior remain intact. This does not qualify arbitrary paths with
+spaces. The retry and the remaining four checks are pending.
+
 ## Remaining integration work
 
 The separately reviewed [native-job release and schema-23 qualification](../native-job-lifecycle-2026-10-15/README.md)
 retains its successful checks, deliberate guard failures and failed or incomplete
-attempts. The exact T45 pressure/GC interleaving is still pending.
+attempts. The separately [reviewed T45 interleaving](../t45-pressure-gc-interleaving-2026-10-15/README.md)
+records four bounded pressure cases in two passing native invocations and five
+intended guard failures, with their source and environmental limits.
 No later combined tree is credited by these earlier source-bound runs.
 No model, provider trial or private held-out evaluator ran in this selection.
 The six consumed FX17 provider errors remain unchanged; this ledger does not

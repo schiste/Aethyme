@@ -23,9 +23,10 @@ boundary, before producing candidates; none supplies behavioral evidence.
 A separate bounded sustained-arrival trial passed after one retained harness
 failure. The aggregate view/context selections passed 61 selected executions at their
 recorded source. Native-job retention cleanup passed its bounded local checks
-and six guard-removal controls. The exact T45 pressure/GC interleaving and final
-combined-tree checks remain in progress. These finite
-observations do not establish reliable autonomous operation. All results
+and six guard-removal controls. The [bounded T45 interleaving](local-v3-qualification/t45-pressure-gc-interleaving-2026-10-15/README.md)
+passed APFS capture/hydration ENOSPC and Docker build ENOSPC/OOM with explicit GC
+lock witnesses; five deliberate guard breaks failed as intended. Final combined-tree
+checks remain in progress. These finite observations do not establish reliable autonomous operation. All results
 below name their source and profile; earlier operator profiles retain their
 original limits.
 
@@ -252,12 +253,15 @@ The ledger preserves every failed and incomplete attempt: its 85 selected
 native test slots overlap and include unresolved outcomes. Dispatching and
 unknown jobs remain rooted; this does not establish process-tree quiescence.
 
-Plan T45 also requires pressure during capture, hydration and build while GC
-runs. The earlier APFS and Docker profiles exercised their pressure and GC
-phases separately; those records are not credited as the required interleaving.
-A bounded schedule with explicit operation/lock witnesses is implemented;
-its physical interleaving qualification is still in progress.
-This requirement does not imply a full-host, daemon-storage or power-loss claim.
+The [T45 interleaving evidence](local-v3-qualification/t45-pressure-gc-interleaving-2026-10-15/README.md)
+records one passing APFS invocation covering capture and hydration ENOSPC at
+`4b5f3bc3`, plus one passing Docker invocation covering build tmpfs ENOSPC and
+build-cgroup OOM at `bc0b03d0`. Shared/exclusive archive-lock witnesses bind the
+actual pressure operations to real same-store GC. Five deliberate guard changes
+failed their named assertions with exact source restoration. Admission failure,
+an interrupted harness attempt and parser corrections remain explicit. The four
+finite cases do not cover capture/hydration OOM, full-host or daemon-storage
+exhaustion, power loss, or arbitrary storage backends.
 
 The live GitHub/Mergify route remains unbound in this Local profile. Actual
 private GenericGit acceptance does not qualify that provider. Optional analysis
