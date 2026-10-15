@@ -129,7 +129,11 @@ fn trusted_operator_rotates_and_revokes_exact_producer_generations() {
     let owner = target::acquire_controller(&mut f.store, "verifier", "appointed").unwrap();
     let inventory = AssertionInventory::new(vec![case()]).unwrap();
     let mut policy = policy();
-    policy.harness = capture(&mut f, "harness/inventory.json", &inventory.canonical_bytes());
+    policy.harness = capture(
+        &mut f,
+        "harness/inventory.json",
+        &inventory.canonical_bytes(),
+    );
     policy.inventory = inventory.id().to_string();
     let mut spec = f.spec();
     spec.acceptance_policy = policy.record().unwrap().id().to_string();
@@ -238,7 +242,11 @@ impl Subject {
         let policy = policy();
         let mut policy = policy;
         policy.max_age_ms = max_age_ms;
-        policy.harness = capture(&mut f, "harness/inventory.json", &inventory.canonical_bytes());
+        policy.harness = capture(
+            &mut f,
+            "harness/inventory.json",
+            &inventory.canonical_bytes(),
+        );
         // Policy must be frozen before selecting the target; use the actual
         // harness identity in the target's appointed policy too.
         let mut ts = f.spec();
@@ -470,7 +478,11 @@ fn real_cli_assertions_observe_behavior_and_refuse_forged_or_stale_receipts() {
     second.stdin_hex = "420a".into();
     second.stdout = d(b"Hello,B\n");
     let inventory = AssertionInventory::new(vec![hello, second]).unwrap();
-    let harness = capture(&mut f, "harness/inventory.json", &inventory.canonical_bytes());
+    let harness = capture(
+        &mut f,
+        "harness/inventory.json",
+        &inventory.canonical_bytes(),
+    );
     // Independent expected digests/inventory stay on the host; the artifact is
     // the only mounted input to the app under test. A success file is ignored.
     crate::local_target::tests::git(f._repo.path(), &["rm", "harness/inventory.json"]);
