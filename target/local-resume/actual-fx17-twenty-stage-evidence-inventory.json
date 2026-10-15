@@ -1,0 +1,193 @@
+{
+  "attempt3_checks": {
+    "actual_stages": 20,
+    "candidate_parent_and_tree_checks": 20,
+    "completion_receipts": 20,
+    "expected_vector_checks": 1300,
+    "frozen_input_files": 29,
+    "frozen_input_hashes_unchanged": true,
+    "model_exports": 0,
+    "original_source_checkout_head_unchanged": true,
+    "original_source_checkout_refs_changed": true,
+    "pinned_image": "sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251",
+    "sealed_task_executions": 0,
+    "session_worktree_unchanged": true,
+    "vectors_per_stage": 65
+  },
+  "attempt_accounting": {
+    "attempt1": {
+      "accepted": 0,
+      "executed": 1,
+      "exit": 101,
+      "held": 1,
+      "scheduled": 20,
+      "unrun": 19
+    },
+    "attempt2": {
+      "accepted": 1,
+      "executed": 2,
+      "exit": 101,
+      "held": 1,
+      "scheduled": 20,
+      "unrun": 18
+    },
+    "attempt3": {
+      "accepted": 20,
+      "executed": 20,
+      "exit": 0,
+      "held": 0,
+      "scheduled": 20,
+      "unrun": 0
+    },
+    "launcher_path_error": {
+      "cargo_started": false,
+      "exit": 2,
+      "scheduled": 0
+    },
+    "total": {
+      "accepted": 21,
+      "executed": 23,
+      "held": 2,
+      "scheduled": 60,
+      "unrun": 37
+    }
+  },
+  "created_at_utc": "2026-10-15T08:54:47.782471+00:00",
+  "evidence_files": [
+    {
+      "mode_octal": "0644",
+      "path": "target/local-resume/actual-fx17-twenty-stage-launcher-path-error.log",
+      "sha256": "1e89a64eef09bebdcd6a4a09de806977875f88623bd5cb1b9e5cfa1f3b138486",
+      "size_bytes": 328
+    },
+    {
+      "mode_octal": "0644",
+      "path": "target/local-resume/actual-fx17-twenty-stage-launcher-path-error.json",
+      "sha256": "a40b1628df752ed8ddc682b8c1d766c42e0564a1e5da6aad859dde3d12af6e13",
+      "size_bytes": 1421
+    },
+    {
+      "mode_octal": "0644",
+      "path": "target/local-resume/actual-fx17-twenty-stage-launcher-path-error.status",
+      "sha256": "53c234e5e8472b6ac51c1ae1cab3fe06fad053beb8ebfd8977b010655bfdd3c3",
+      "size_bytes": 2
+    },
+    {
+      "mode_octal": "0644",
+      "path": "target/local-resume/actual-fx17-twenty-stage-attempt1.log",
+      "sha256": "131e6878a591c60f2f6aa2f9bbfcd51a3a83f70466a9e3fc696c65ecc872d36f",
+      "size_bytes": 2558
+    },
+    {
+      "mode_octal": "0644",
+      "path": "target/local-resume/actual-fx17-twenty-stage-attempt1.status",
+      "sha256": "39b8dc3fc8b44765c8e6f1adee04c5b465e555ab791cc42d0d9e810d5b64297c",
+      "size_bytes": 4
+    },
+    {
+      "mode_octal": "0644",
+      "path": "target/local-resume/actual-fx17-twenty-stage-attempt1.json",
+      "sha256": "b909bae206d03e6c4615ae68cbcae9882f301e5174c5b77caf3576e1e60f7270",
+      "size_bytes": 4475
+    },
+    {
+      "mode_octal": "0644",
+      "path": "target/local-resume/actual-fx17-twenty-stage-attempt1-report.json",
+      "sha256": "cfb6493750718d9cc92f90c5c32db5201a10194063b17c2051740de4c50d0d78",
+      "size_bytes": 16183
+    },
+    {
+      "mode_octal": "0644",
+      "path": "target/local-resume/actual-fx17-twenty-stage-attempt2-private-root-fix.log",
+      "sha256": "d240c0451b69528381cbbd2ce24de60eb73dc1da64959cf918675a302115a7d4",
+      "size_bytes": 3118
+    },
+    {
+      "mode_octal": "0644",
+      "path": "target/local-resume/actual-fx17-twenty-stage-attempt2-private-root-fix.status",
+      "sha256": "39b8dc3fc8b44765c8e6f1adee04c5b465e555ab791cc42d0d9e810d5b64297c",
+      "size_bytes": 4
+    },
+    {
+      "mode_octal": "0644",
+      "path": "target/local-resume/actual-fx17-twenty-stage-attempt2-private-root-fix.json",
+      "sha256": "f48258e54039114db2d550a4e9e50f19125d6823b61eeda5aabffe81871a3ed2",
+      "size_bytes": 4546
+    },
+    {
+      "mode_octal": "0644",
+      "path": "target/local-resume/actual-fx17-twenty-stage-attempt2-private-root-fix-report.json",
+      "sha256": "0372082fdd56e51d0358a6ce8284417889d9ca863f55a8d6cbd6e9b183ce7e40",
+      "size_bytes": 38042
+    },
+    {
+      "mode_octal": "0644",
+      "path": "target/local-resume/actual-fx17-twenty-stage-attempt2-private-root-fix-roots-inventory.json",
+      "sha256": "e352134c5094e5bc5b84a6131fbf500f6e9f56935d21a6eb22c5b7398ef0b08e",
+      "size_bytes": 1744
+    },
+    {
+      "mode_octal": "0644",
+      "path": "target/local-resume/actual-fx17-twenty-stage-attempt3.log",
+      "sha256": "46c3395de4d87ccaad944c98f0805d6e6d1f3fd7f4a4f7e7d82c3d6fd08240e4",
+      "size_bytes": 4919
+    },
+    {
+      "mode_octal": "0644",
+      "path": "target/local-resume/actual-fx17-twenty-stage-attempt3.status",
+      "sha256": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa",
+      "size_bytes": 2
+    },
+    {
+      "mode_octal": "0644",
+      "path": "target/local-resume/actual-fx17-twenty-stage-attempt3.json",
+      "sha256": "9f032458c29304b2642cc407e02b107adbab9a897550fd718a2d6a29526312f8",
+      "size_bytes": 4474
+    },
+    {
+      "mode_octal": "0644",
+      "path": "target/local-resume/actual-fx17-twenty-stage-attempt3-report.json",
+      "sha256": "2b6fbc67bf093b1e248bedba3e8117b950d2fe9eb8983a31b3dfe8bf6420cec4",
+      "size_bytes": 498754
+    },
+    {
+      "mode_octal": "0644",
+      "path": "target/local-resume/actual-fx17-twenty-stage-attempt3-frozen-inputs-before.json",
+      "sha256": "be8bb4af3f7ea58dca2d77636174b8ed9604451aa1e1f435085a60400f6c9771",
+      "size_bytes": 5818
+    },
+    {
+      "mode_octal": "0644",
+      "path": "target/local-resume/actual-fx17-twenty-stage-attempt3-frozen-inputs-after.json",
+      "sha256": "f521534541cc311dc2edcb69af25abd8ffed11f01a43360595f4bcd3ca3aea03",
+      "size_bytes": 5949
+    },
+    {
+      "mode_octal": "0644",
+      "path": "target/local-resume/actual-fx17-twenty-stage-attempt3-verification-summary.json",
+      "sha256": "6d93e5f1e0430b9f2af572cfbbd3761f4f341c656f18fbc2b3e663eb62610685",
+      "size_bytes": 40760
+    },
+    {
+      "mode_octal": "0644",
+      "path": "target/local-resume/actual-fx17-twenty-stage-attempt3-roots-inventory.json",
+      "sha256": "4324babbff838a0cb7bf65971b80e9167819be65a1b0592a3d09fed345b3cf69",
+      "size_bytes": 316983
+    },
+    {
+      "mode_octal": "0644",
+      "path": "target/local-resume/retained-roots-inventory.json",
+      "sha256": "e1f8041530d3c7a40386dea1784c264d6abdfeb6f9a44d25b2acbfed0ad58c20",
+      "size_bytes": 180849
+    },
+    {
+      "mode_octal": "0644",
+      "path": "target/local-resume/attempts-ledger.md",
+      "sha256": "1d51d9bc9383d1a49a5e6ad894f83e362611983932c6a83dc495ba3e3229739d",
+      "size_bytes": 10996
+    }
+  ],
+  "source_head": "c45d4096f9d0238b800ccadbeb07f9b93ae30a3e",
+  "source_status_porcelain": "",
+  "source_tree": "874654af26ac7fd9bbaa9bedbc7a04fa8a834e40"
+}
