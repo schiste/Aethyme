@@ -127,7 +127,10 @@ fn verifier_prepare_refuses_sensitive_tombstone_before_harness_or_runtime_access
 fn trusted_operator_rotates_and_revokes_exact_producer_generations() {
     let mut f = Fixture::new();
     let owner = target::acquire_controller(&mut f.store, "verifier", "appointed").unwrap();
-    let policy = policy();
+    let inventory = AssertionInventory::new(vec![case()]).unwrap();
+    let mut policy = policy();
+    policy.harness = capture(&mut f, "harness/inventory.json", &inventory.canonical_bytes());
+    policy.inventory = inventory.id().to_string();
     let mut spec = f.spec();
     spec.acceptance_policy = policy.record().unwrap().id().to_string();
     let revision = target::propose_revision(&mut f.store, &owner, spec).unwrap();
@@ -370,6 +373,24 @@ impl Subject {
             at,
         )
     }
+}
+#[test]
+fn materialized_inventory_uses_retained_harness_role_and_refuses_wrong_policy_digest() {
+    let s = Subject::fake();
+    let inputs = snapshot::materialize(&s.f.store, &s.owner, &s.execution).unwrap();
+    let inventory_path = inputs.harness_dir().join("harness/inventory.json");
+    assert!(inventory_path.is_file());
+    assert!(!inputs.root().join("harness/inventory.json").exists());
+    assert_eq!(
+        inventory_from_inputs(&inputs, s.permit.policy()).unwrap(),
+        s.inventory
+    );
+    let mut wrong_policy = s.permit.policy().clone();
+    wrong_policy.inventory = d(b"different inventory");
+    assert!(matches!(
+        inventory_from_inputs(&inputs, &wrong_policy),
+        Err(VerificationError::Mismatch)
+    ));
 }
 #[test]
 fn incomplete_wrong_subject_expired_and_revoked_evidence_cannot_pass() {

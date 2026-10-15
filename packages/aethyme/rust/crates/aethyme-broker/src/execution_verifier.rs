@@ -772,7 +772,7 @@ fn inventory_from_inputs(
     inputs: &snapshot::MaterializedInputs,
     policy: &VerifierPolicy,
 ) -> Result<AssertionInventory, VerificationError> {
-    let path = inputs.root().join("harness/inventory.json");
+    let path = inputs.harness_dir().join("harness/inventory.json");
     let mut file = std::fs::File::open(path)?;
     use std::io::Read;
     let mut bytes = Vec::new();
