@@ -722,7 +722,7 @@ pub fn status(
     })?;
     items.extend(rows.collect::<Result<Vec<_>, _>>()?);
     let mut database_tables = Vec::new();
-    let mut statement = store.connection().prepare(
+    let mut statement = store.read_connection().prepare(
         "SELECT table_name,row_count,bytes,sha256,state
          FROM local_sensitive_table_inventory
          WHERE incident_id=?1 ORDER BY table_name",
@@ -740,7 +740,7 @@ pub fn status(
     })?;
     database_tables.extend(rows.collect::<Result<Vec<_>, _>>()?);
     let mut external_exports = Vec::new();
-    let mut statement = store.connection().prepare(
+    let mut statement = store.read_connection().prepare(
         "SELECT path,kind,sha256,bytes,state FROM local_sensitive_exports ORDER BY path",
     )?;
     let rows = statement.query_map([], |row| {
@@ -1260,7 +1260,8 @@ fn prepare_inventory(
     let tables = database_inventory(store)?;
     let exports = external_exports(store, &mut unknown)?;
     let digest = inventory_digest(&files, &tables, &exports);
-    let root_entries = fs::read_dir(store.project_dir())?.collect::<Result<Vec<_>, _>>()?;
+    let project_dir = store.project_dir().to_path_buf();
+    let root_entries = fs::read_dir(&project_dir)?.collect::<Result<Vec<_>, _>>()?;
     let tx = store
         .connection()
         .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1344,7 +1345,7 @@ fn prepare_inventory(
         )?;
     }
     for name in ["controller-locks", "agent-locks", "verifier-authority"] {
-        let path = store.project_dir().join(name);
+        let path = project_dir.join(name);
         if fs::symlink_metadata(&path).is_ok() {
             tx.execute(
                 "INSERT OR IGNORE INTO local_sensitive_residuals
@@ -1498,7 +1499,8 @@ fn clear_managed_database(
     store: &mut CollaborationStore,
     incident_id: &str,
 ) -> Result<(), SensitiveError> {
-    let database = store.project_dir().join("state.db");
+    let project_dir = store.project_dir().to_path_buf();
+    let database = project_dir.join("state.db");
     let connection = store.connection();
     connection.pragma_update(None, "secure_delete", "ON")?;
     connection.pragma_update(None, "foreign_keys", "OFF")?;
@@ -1538,8 +1540,8 @@ fn clear_managed_database(
         // cleanup; inspect the frame counts as well as SQLite's busy flag.
         checkpoint_truncated(connection)?;
         sync_file_if_present(&database)?;
-        sync_file_if_present(&store.project_dir().join("state.db-wal"))?;
-        sync_directory(store.project_dir())?;
+        sync_file_if_present(&project_dir.join("state.db-wal"))?;
+        sync_directory(&project_dir)?;
 
         // Receipt and cleared-state rows are committed only after content
         // deletion, checkpoint, VACUUM, and file/directory sync succeeded.

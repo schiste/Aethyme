@@ -10,7 +10,7 @@ use aethyme_contracts::experimental_v0::{Record, RecordId, RecordSchema, SourceS
 use aethyme_contracts::experimental_v0::{brief, canonical_json};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{File, OpenOptions};
+use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
