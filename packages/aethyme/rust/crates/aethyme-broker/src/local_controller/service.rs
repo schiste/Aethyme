@@ -301,7 +301,43 @@ mod permit_tests {
         let mut f = Fixture::new();
         let owner =
             target::acquire_controller(&mut f.store, "existing-verifier", "operator").unwrap();
-        let execution = super::super::drive::tests::policy().execution;
+        let mut execution = super::super::drive::tests::policy().execution;
+        let inventory = verifier::AssertionInventory::new(vec![verifier::AssertionCase {
+            id: "existing-producer".into(),
+            arguments: vec![],
+            stdin_hex: String::new(),
+            exit_code: 0,
+            stdout: format!(
+                "sha256:{}",
+                crate::collaboration_archive::ObjectDigest::of(b"").hex()
+            ),
+            stderr: format!(
+                "sha256:{}",
+                crate::collaboration_archive::ObjectDigest::of(b"").hex()
+            ),
+        }])
+        .unwrap();
+        let repository = f._repo.path();
+        let inventory_path = repository.join("harness/inventory.json");
+        std::fs::create_dir_all(inventory_path.parent().unwrap()).unwrap();
+        std::fs::write(&inventory_path, inventory.canonical_bytes()).unwrap();
+        crate::local_target::tests::git(repository, &["add", "harness/inventory.json"]);
+        crate::local_target::tests::git(
+            repository,
+            &["commit", "-qm", "existing producer verifier inventory"],
+        );
+        let harness_commit = crate::collaboration_archive::CommitOid::parse(
+            &crate::local_target::tests::git(repository, &["rev-parse", "HEAD"]),
+        )
+        .unwrap();
+        let harness = crate::collaboration_archive::retain_snapshot(
+            &mut f.store,
+            repository,
+            &harness_commit,
+        )
+        .unwrap();
+        execution.harness = harness.snapshot_id.to_string();
+        execution.assertion_inventory = inventory.id().to_string();
         let policy = VerifierPolicy {
             profile: verifier::PROFILE.into(),
             runtime: execution.profile.runtime_profile.clone(),
