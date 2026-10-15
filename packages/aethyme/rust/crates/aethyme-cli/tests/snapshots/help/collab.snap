@@ -105,6 +105,15 @@ Additional explicit lifecycle commands (provisional Local packages):
   aethyme collab stop --epoch EPOCH --reason TEXT [--json]
       Freeze project ingress and rotate native authority. Running processes
       and external effects are not assumed cancelled; reconcile them.
+  aethyme collab sensitive quarantine --incident ID --issuer LABEL --epoch FROZEN_EPOCH
+                       --reason CODE --scope project [--json]
+      Permanently block project-local retrieval after authority has been
+      frozen. LABEL is audit text, not authentication.
+  aethyme collab sensitive purge|resume --incident ID --confirm DIGEST [--json]
+      Attempt or resume managed-store purge. Active/unknown work and readers
+      keep the project quarantined; external copies remain explicit residuals.
+  aethyme collab sensitive status --incident ID [--json]
+      Show managed purge progress and unmanaged residual classes.
   aethyme collab export --target NAME --issuer NAME --source ID [--source ID...]
                        [--record ID@sha256:HEX...] --audience NAME --output PATH [--json]
       Closed source/advisory historical bundle. Exclusive private output;

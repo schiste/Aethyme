@@ -143,14 +143,50 @@ impl Fixture {
     }
 
     pub(crate) fn new() -> Self {
-        let host = tempfile::tempdir().unwrap();
-        let repo = tempfile::tempdir().unwrap();
+        Self::new_with_source_marker(&[])
+    }
+
+    pub(crate) fn new_with_source_marker(marker: &[u8]) -> Self {
+        Self::new_with_source_marker_under(marker, None)
+    }
+
+    pub(crate) fn new_with_source_marker_in(marker: &[u8], parent: &Path) -> Self {
+        Self::new_with_source_marker_under(marker, Some(parent))
+    }
+
+    fn new_with_source_marker_under(marker: &[u8], parent: Option<&Path>) -> Self {
+        let host = parent.map_or_else(
+            || tempfile::tempdir().unwrap(),
+            |parent| tempfile::tempdir_in(parent).unwrap(),
+        );
+        let repo = parent.map_or_else(
+            || tempfile::tempdir().unwrap(),
+            |parent| tempfile::tempdir_in(parent).unwrap(),
+        );
         git(repo.path(), &["init", "-q", "-b", "main"]);
-        std::fs::write(repo.path().join("one.txt"), "base\n").unwrap();
+        let mut base_bytes = b"base\n".to_vec();
+        if !marker.is_empty() {
+            base_bytes.extend_from_slice(marker);
+            base_bytes.push(b'\n');
+            let marker_text =
+                std::str::from_utf8(marker).expect("synthetic source marker is UTF-8");
+            let source = format!(
+                "pub fn {marker_text}() -> &'static str {{ \"{marker_text}\" }}\npub fn use_secret() -> &'static str {{ {marker_text}() }}\n"
+            );
+            std::fs::create_dir_all(repo.path().join("src")).unwrap();
+            std::fs::write(repo.path().join("src/credential.rs"), source).unwrap();
+            git(repo.path(), &["add", "src/credential.rs"]);
+        }
+        std::fs::write(repo.path().join("one.txt"), base_bytes).unwrap();
         git(repo.path(), &["add", "one.txt"]);
         git(repo.path(), &["commit", "-qm", "base"]);
         let base = CommitOid::parse(&git(repo.path(), &["rev-parse", "HEAD"])).unwrap();
-        std::fs::write(repo.path().join("one.txt"), "A\n").unwrap();
+        let mut result_bytes = b"A\n".to_vec();
+        if !marker.is_empty() {
+            result_bytes.extend_from_slice(marker);
+            result_bytes.push(b'\n');
+        }
+        std::fs::write(repo.path().join("one.txt"), result_bytes).unwrap();
         git(repo.path(), &["commit", "-qam", "A"]);
         let a = CommitOid::parse(&git(repo.path(), &["rev-parse", "HEAD"])).unwrap();
         // B starts from base, independently, without resetting any shared repo.
@@ -736,6 +772,7 @@ fn migration_adopts_charged_resolution_attempts_and_fences_schema_six() {
     let db = f.store.project_dir().join("state.db");
     drop(f.store);
     let c = rusqlite::Connection::open(&db).unwrap();
+    crate::collaboration_sensitive::drop_sensitive_response_tables_for_legacy_fixture(&c).unwrap();
     c.execute_batch("DROP TABLE IF EXISTS local_capture_notice_outcomes; DROP TABLE IF EXISTS local_capture_notices; DROP TABLE local_native_gate_roots; DROP TABLE local_native_gate_jobs;
         UPDATE meta SET value = '6' WHERE key IN ('schema_version', 'min_compatible_schema');
         DROP TABLE local_adoption_receipts; DROP TABLE local_agent_dispatches; DROP TABLE local_agent_reconciliations; DROP TABLE local_handoffs; DROP TABLE local_agent_sessions; DROP TABLE local_import_rehearsals; DROP TABLE local_imported_records; DROP TABLE local_imported_sources; DROP TABLE local_imports; DROP TABLE local_exchange_messages; DROP TABLE local_exchange_deliveries; DROP TABLE local_exchange_streams; DROP TABLE local_exchange_events; DROP TABLE local_exchange_projection; DROP TABLE local_exchange_observations; DROP TABLE local_exchange_bindings; DROP TRIGGER outbox_capture_insert; DROP TRIGGER outbox_capture_update; DROP TRIGGER outbox_capture_delete; DROP TABLE local_generation_roots; DROP TABLE local_generation_receipts; DROP TABLE local_generations; DROP TABLE local_acceptance_qualifications; DROP TABLE local_acceptance_receipts; DROP TABLE local_acceptance_bindings; DROP TABLE local_source_transport_receipts; DROP TABLE local_source_transports; DROP TABLE local_verification_evidence; DROP TABLE local_verifier_producers; DROP TABLE local_authority_state; DROP TABLE local_waves; DROP TABLE local_wave_arrivals;

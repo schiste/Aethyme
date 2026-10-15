@@ -25,7 +25,26 @@ pub(crate) struct Fixture {
 }
 impl Fixture {
     pub(crate) fn new() -> Self {
-        let mut v = crate::execution_verifier::tests::Subject::acceptance_fixture();
+        Self::with_subject(crate::execution_verifier::tests::Subject::acceptance_fixture())
+    }
+
+    pub(crate) fn with_source_marker_in(marker: &[u8], parent: &Path) -> Self {
+        Self::with_subject_in(
+            crate::execution_verifier::tests::Subject::acceptance_fixture_with_source_marker_in(
+                marker, parent,
+            ),
+            Some(parent),
+        )
+    }
+
+    fn with_subject(v: crate::execution_verifier::tests::Subject) -> Self {
+        Self::with_subject_in(v, None)
+    }
+
+    fn with_subject_in(
+        mut v: crate::execution_verifier::tests::Subject,
+        parent: Option<&Path>,
+    ) -> Self {
         v.f.store
             .connection()
             .execute(
@@ -52,7 +71,10 @@ impl Fixture {
             .unwrap();
         let status = target::status(&v.f.store, v.owner.target()).unwrap();
         target::resume(&mut v.f.store, &v.owner, status.version).unwrap();
-        let remote = tempfile::tempdir().unwrap();
+        let remote = parent.map_or_else(
+            || tempfile::tempdir().unwrap(),
+            |parent| tempfile::tempdir_in(parent).unwrap(),
+        );
         git(remote.path(), &["init", "--bare", "-q"]);
         git(
             v.f._repo.path(),
@@ -131,6 +153,14 @@ impl Fixture {
             _remote: remote,
         }
     }
+    pub(crate) fn root_paths(&self) -> (PathBuf, PathBuf, PathBuf) {
+        (
+            self.v.f._host.path().to_path_buf(),
+            self.v.f._repo.path().to_path_buf(),
+            self._remote.path().to_path_buf(),
+        )
+    }
+
     fn old(&self) -> OldWorkspace {
         OldWorkspace {
             session: "original-agent".into(),

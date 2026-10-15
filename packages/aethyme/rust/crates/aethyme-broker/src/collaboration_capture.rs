@@ -817,6 +817,7 @@ pub fn receipt(
     store: &mut CollaborationStore,
     operation_id: &OperationId,
 ) -> Result<Option<CaptureReceipt>, CaptureError> {
+    let _response = crate::collaboration_sensitive::response_use(store)?;
     let row = store
         .connection()
         .query_row(
@@ -1582,6 +1583,7 @@ fn reap_crashed(store: &mut CollaborationStore, except: Option<&OperationId>) {
 pub fn recover(store: &mut CollaborationStore) -> Result<RecoveryReport, CaptureError> {
     // Shared with captures, exclusive with a GC apply (#659).
     let _use = archive_use(store)?;
+    let _response = crate::collaboration_sensitive::response_use(store)?;
     let mut report = RecoveryReport::default();
     for operation_id in in_flight(store)? {
         match recover_one(store, &operation_id) {
@@ -1635,6 +1637,8 @@ pub fn abort(
     store: &mut CollaborationStore,
     operation_id: &OperationId,
 ) -> Result<(), CaptureError> {
+    let _archive = archive_use(store)?;
+    let _response = crate::collaboration_sensitive::response_use(store)?;
     let _lock = lock_operation(store, operation_id, true)?;
     let row = load_operation(store.connection(), operation_id)?.ok_or_else(|| {
         CaptureError::UnknownOperation {
@@ -1657,6 +1661,20 @@ mod tests {
     use crate::collaboration_state::{CollaborationRoot, ProjectKey};
     use std::io::BufRead;
     use std::process::Command;
+
+    #[test]
+    fn sensitive_capture_error_codes_distinguish_quarantine_from_other_errors() {
+        assert_eq!(
+            CaptureError::Sensitive(crate::collaboration_sensitive::SensitiveError::Quarantined)
+                .code(),
+            "quarantined"
+        );
+        assert_eq!(
+            CaptureError::Sensitive(crate::collaboration_sensitive::SensitiveError::Mismatch)
+                .code(),
+            "sensitive_response"
+        );
+    }
 
     fn git_in(repo: &Path, args: &[&str]) -> String {
         let output = Command::new("git")
