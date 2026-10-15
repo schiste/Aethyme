@@ -34,7 +34,7 @@ TOKEN_MAX = 32768
 CODEX_BIN = Path("/Users/christophehenner/.local/lib/node_modules/@openai/codex/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/bin/codex")
 CODEX_VERSION = "0.162.1"
 CODEX_SHA256 = "74c6a6d263f40d65f99c27a815275f5b4ed0bcc2baecc396b4cf3255498bdfc0"
-RUNTIME_CORRECTION_SHA256 = "d0ca2ba868bedf2fd684da7063c48a44891893ed19dede68c3210672df7eea5b"
+RUNTIME_CORRECTION_SHA256 = "96b0346c554d2c87513eedda8880a1ddfee870322b10fa943b6ca65bf5df7590"
 SUBJECT_STDOUT_MAX = 1024 * 1024
 SUBJECT_STDERR_MAX = 1024 * 1024
 MODEL_STDOUT_MAX = 8 * 1024 * 1024
@@ -65,11 +65,14 @@ DISABLE = (
 SUBJECT_PROFILE = """(version 1)
 (deny default)
 (allow process-exec (literal "/bin/sh"))
+(allow process-exec (literal "/bin/bash"))
 (deny process-fork)
 (deny network*)
 (deny file-write*)
 (allow file-read-data (literal "/"))
 (allow file-read* (literal "/bin/sh"))
+(allow file-read* (literal "/bin/bash"))
+(allow file-read-metadata (literal "/private/var/select/sh"))
 (allow file-read* (subpath "/System/Library"))
 (allow file-read* (subpath "/System/Volumes/Preboot/Cryptexes/OS/System/Library/dyld"))
 (allow file-read* (subpath "/usr/lib"))
