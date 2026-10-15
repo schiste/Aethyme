@@ -86,6 +86,14 @@ primary checkout metadata bind these failures to merge commits `c71540b1` and
 `ab07afac`, respectively. No test result or passing-command credit is assigned
 to these lint failures; their other jobs are reported separately.
 
+The #777 `f1abe252` workspace job was cancelled after 65 distinct first-attempt
+failures; no numeric command exit or completed-suite denominator is assigned.
+The #784 `0ec6d692` workspace job completed with exit 100: 4,623 tests ran,
+4,554 passed, 69 failed and 32 were skipped. Complete raw logs, first-attempt
+failure lists, retry observations, API snapshots and actual merge-ref checkout
+metadata are preserved byte-for-byte. These failed attempts do not qualify
+later fixture repairs or supply passing-command credit.
+
 ## Initial full workspace run and native fixture repair
 
 At clean aggregate `86c982eeecd92e473e309bf0f13dfdde1379e6ac`, the official

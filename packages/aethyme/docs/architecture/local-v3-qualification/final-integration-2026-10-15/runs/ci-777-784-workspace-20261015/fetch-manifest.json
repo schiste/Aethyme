@@ -1,0 +1,141 @@
+{
+  "schema": "aethyme.local-ci-evidence-fetch-bundle/v1",
+  "created_at_utc": "2026-10-15T22:17:05.175203+00:00",
+  "repo": "schiste/Aethyme",
+  "pull_requests": [
+    777,
+    784
+  ],
+  "temporary_directory": "/private/tmp/aethyme-ci-777-784-20261016-1yiyyg3s",
+  "clean_path": "/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/christophehenner/.cargo/bin",
+  "fetches": [
+    {
+      "schema": "aethyme.local-gh-read-fetch/v1",
+      "request": "job-116693225763.json",
+      "argv": [
+        "gh",
+        "api",
+        "repos/schiste/Aethyme/actions/jobs/116693225763"
+      ],
+      "exit": 0,
+      "started_at_utc": "2026-10-15T22:17:01.567688+00:00",
+      "finished_at_utc": "2026-10-15T22:17:02.121775+00:00",
+      "bytes": 2825,
+      "sha256": "b4df6d9e8bfa2d75e0babb9b56cb3cdf5fc8304618fae99a65ddd694577b0cd2",
+      "stderr_bytes": 0,
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "schema": "aethyme.local-gh-read-fetch/v1",
+      "request": "run-38813772970.json",
+      "argv": [
+        "gh",
+        "api",
+        "repos/schiste/Aethyme/actions/runs/38813772970"
+      ],
+      "exit": 0,
+      "started_at_utc": "2026-10-15T22:17:02.122273+00:00",
+      "finished_at_utc": "2026-10-15T22:17:02.515193+00:00",
+      "bytes": 12200,
+      "sha256": "190268c8a5f194c7f78a2f62d861e3e3972051e7468af2e8888c5f7d0b145e3d",
+      "stderr_bytes": 0,
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "schema": "aethyme.local-gh-read-fetch/v1",
+      "request": "job-116691584220.json",
+      "argv": [
+        "gh",
+        "api",
+        "repos/schiste/Aethyme/actions/jobs/116691584220"
+      ],
+      "exit": 0,
+      "started_at_utc": "2026-10-15T22:17:02.515661+00:00",
+      "finished_at_utc": "2026-10-15T22:17:02.945512+00:00",
+      "bytes": 2822,
+      "sha256": "3c5092ff48ac51cbd57eeca910e26d8496ea5b4b8ebc0363127b2d6f4b0c34e1",
+      "stderr_bytes": 0,
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "schema": "aethyme.local-gh-read-fetch/v1",
+      "request": "run-38813286501.json",
+      "argv": [
+        "gh",
+        "api",
+        "repos/schiste/Aethyme/actions/runs/38813286501"
+      ],
+      "exit": 0,
+      "started_at_utc": "2026-10-15T22:17:02.945995+00:00",
+      "finished_at_utc": "2026-10-15T22:17:03.453034+00:00",
+      "bytes": 12194,
+      "sha256": "056423366314d5928d00c5a25e64fd5f1f32e8fe1e3b8f6d4292ca69b2c09d45",
+      "stderr_bytes": 0,
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+  ],
+  "log_fetch": {
+    "schema": "aethyme.local-gh-read-fetch/v1",
+    "request": "job-116691584220.logs.raw",
+    "argv": [
+      "gh",
+      "api",
+      "--allow-escape-sequences",
+      "repos/schiste/Aethyme/actions/jobs/116691584220/logs"
+    ],
+    "exit": 0,
+    "started_at_utc": "2026-10-15T22:17:03.453523+00:00",
+    "finished_at_utc": "2026-10-15T22:17:05.140154+00:00",
+    "bytes": 1355302,
+    "sha256": "c52d7ac9c7f7e8cc523c5e48c748b5665099e7fa9d0c9469a2cbce4a051c2d2d",
+    "stderr_bytes": 0,
+    "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "signature": "text-or-other"
+  },
+  "observed_current_status": {
+    "777_job": {
+      "id": 116693225763,
+      "run_id": 38813772970,
+      "status": "completed",
+      "conclusion": "cancelled",
+      "head_sha": "f1abe252b6f339ca28891c252dd360a0a527fa1f",
+      "created_at": "2026-10-15T21:57:59Z",
+      "started_at": "2026-10-15T21:58:02Z",
+      "completed_at": "2026-10-15T22:07:06Z",
+      "html_url": "https://github.com/schiste/Aethyme/actions/runs/38813772970/job/116693225763"
+    },
+    "777_run": {
+      "id": 38813772970,
+      "status": "completed",
+      "conclusion": "cancelled",
+      "head_sha": "f1abe252b6f339ca28891c252dd360a0a527fa1f",
+      "run_attempt": 1,
+      "created_at": "2026-10-15T21:57:59Z",
+      "run_started_at": "2026-10-15T21:57:59Z",
+      "updated_at": "2026-10-15T22:07:08Z",
+      "html_url": "https://github.com/schiste/Aethyme/actions/runs/38813772970"
+    },
+    "784_job": {
+      "id": 116691584220,
+      "run_id": 38813286501,
+      "status": "completed",
+      "conclusion": "failure",
+      "head_sha": "0ec6d692054c979fad42d47dc36c0bb229e5f5ba",
+      "created_at": "2026-10-15T21:53:52Z",
+      "started_at": "2026-10-15T21:53:55Z",
+      "completed_at": "2026-10-15T22:08:34Z",
+      "html_url": "https://github.com/schiste/Aethyme/actions/runs/38813286501/job/116691584220"
+    },
+    "784_run": {
+      "id": 38813286501,
+      "status": "completed",
+      "conclusion": "failure",
+      "head_sha": "0ec6d692054c979fad42d47dc36c0bb229e5f5ba",
+      "run_attempt": 1,
+      "created_at": "2026-10-15T21:53:51Z",
+      "run_started_at": "2026-10-15T21:53:51Z",
+      "updated_at": "2026-10-15T22:08:34Z",
+      "html_url": "https://github.com/schiste/Aethyme/actions/runs/38813286501"
+    }
+  }
+}
