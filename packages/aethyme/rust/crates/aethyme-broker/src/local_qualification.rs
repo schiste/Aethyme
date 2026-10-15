@@ -365,6 +365,18 @@ fn signal_pressure(executor: &DockerExecutor, object: &Object) {
 
 struct ResumeGc(Option<mpsc::Sender<()>>);
 
+fn assert_archive_exclusive_observed(lock_path: &std::path::Path, label: &str, stage: &str) {
+    let lock = std::fs::File::open(lock_path)
+        .unwrap_or_else(|error| panic!("{label}: open canonical archive lock for probe: {error}"));
+    assert!(
+        matches!(
+            lock.try_lock_shared(),
+            Err(std::fs::TryLockError::WouldBlock)
+        ),
+        "{label}: canonical archive shared try-lock must report WouldBlock {stage}; GC must still hold archive EX"
+    );
+}
+
 impl ResumeGc {
     fn release(&mut self) {
         if let Some(sender) = self.0.take() {
@@ -526,6 +538,7 @@ fn actual_pressure_preserves_retained_source_and_bounded_native_cleanup() {
                 let pressure_project = pressure.store.project().clone();
                 let mut pressure_collector =
                     CollaborationStore::open(&pressure_root, &pressure_project, &[]).unwrap();
+                let archive_lock_path = gc::lock_path(&pressure_collector);
                 let gc_options = gc::GcOptions::default();
                 let gc_plan = gc::plan(&mut pressure_collector, &gc_options).unwrap();
                 let orphan_path = archive::object_path(&pressure_collector, &pressure_orphan);
@@ -587,6 +600,11 @@ fn actual_pressure_preserves_retained_source_and_bounded_native_cleanup() {
                                 entered_rx.recv_timeout(Duration::from_secs(60)).unwrap(),
                                 "GC hook must acknowledge after moving the exact named orphan"
                             );
+                            assert_archive_exclusive_observed(
+                                &archive_lock_path,
+                                label,
+                                "after the named move and before the pressure signal",
+                            );
                             signal_pressure(executor_ref, &object);
 
                             if label == "bounded-tmpfs-enospc" {
@@ -608,6 +626,11 @@ fn actual_pressure_preserves_retained_source_and_bounded_native_cleanup() {
                                         && String::from_utf8_lossy(&proof.stdout)
                                             .contains("No space left on device")
                                     {
+                                        assert_archive_exclusive_observed(
+                                            &archive_lock_path,
+                                            label,
+                                            "after observing the actual kernel ENOSPC diagnostic",
+                                        );
                                         eprintln!(
                                             "Local QA kernel ENOSPC diagnostic SHA-256 {} while GC holds archive EX",
                                             ObjectDigest::of(&proof.stdout).hex()
@@ -643,6 +666,11 @@ fn actual_pressure_preserves_retained_source_and_bounded_native_cleanup() {
                                         .is_some_and(|detail| detail.contains("OOM"))
                                 );
                             }
+                            assert_archive_exclusive_observed(
+                                &archive_lock_path,
+                                label,
+                                "through the actual failed build observation",
+                            );
                             resume_gc.release();
                             let (report, collector) = gc_worker.join().unwrap();
                             (observation, report.unwrap(), collector)
