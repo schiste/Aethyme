@@ -329,6 +329,11 @@ pub(super) fn drive_until(
     if store.connection().execute("UPDATE local_controller_runs SET state=?2,observation=?3 WHERE wave=?1 AND state='dispatching'",params![active.id.as_str(),state,detail])?!=1 {return Err(ControllerError::Mismatch);}
     result
 }
+fn dispatch_succeeded(outcome: crate::OperationStatus) -> bool {
+    // A later availability observation cannot settle an unknown managed write.
+    // Reconciled history is not the outcome of this fresh dispatch either.
+    outcome == crate::OperationStatus::Succeeded
+}
 fn require_fresh_native(job: &native_gates::Job) -> Result<(), ControllerError> {
     if job.state != "prepared" {
         return Err(ControllerError::DispatchHeld(format!(
@@ -506,8 +511,31 @@ fn run(
         destination.revalidate()?;
         check(store, owner, spec, cancel)?;
     }
-    transport::publish(store, owner, carrier, broker, &intent.id)?;
+    let dispatch = transport::publish(store, owner, carrier, broker, &intent.id)?;
     check(store, owner, spec, cancel)?;
+    if !dispatch_succeeded(dispatch.outcome) {
+        return Ok(DriveResult::Held {
+            wave: wave_id.clone(),
+            detail: format!(
+                "publication dispatch {:?}; explicit reconciliation required",
+                dispatch.outcome
+            ),
+        });
+    }
+    // A successful write remains unobserved until the exact route is read.
+    // Preserve that journal distinction before accepting or scheduling another
+    // wave. This inspection never retries a write or reconciles broker ambiguity.
+    let receipt = transport::inspect(store, owner, carrier, broker, &intent.id)?;
+    check(store, owner, spec, cancel)?;
+    if receipt.spec.observation != transport::Observation::Available
+        || !receipt.spec.content_checked
+        || receipt.spec.observed_oid.as_deref() != Some(intent.spec.commit.as_str())
+    {
+        return Ok(DriveResult::Held {
+            wave: wave_id.clone(),
+            detail: format!("publication observation {:?}", receipt.spec.observation),
+        });
+    }
     let grant = acceptance::qualify(
         store,
         owner,
