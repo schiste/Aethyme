@@ -1284,6 +1284,27 @@ fn run_fx17(
 fn actual_fx17_twenty_controlled_changes_preserve_all_65_vectors() {
     let started = Instant::now();
     let host = tempfile::tempdir().expect("FX17 report root").keep();
+    #[cfg(unix)]
+    let resource_root_permissions = {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let before = fs::metadata(&host).expect("FX17 resource root metadata before restriction");
+        let before_mode = before.permissions().mode() & 0o7777;
+        let before_uid = before.uid();
+        let before_gid = before.gid();
+        fs::set_permissions(&host, fs::Permissions::from_mode(0o700))
+            .expect("restrict FX17 resource root to owner-only access");
+        let after = fs::metadata(&host).expect("FX17 resource root metadata after restriction");
+        let after_mode = after.permissions().mode() & 0o7777;
+        assert_eq!(after_mode & 0o077, 0, "FX17 resource root must be private");
+        assert_eq!(after.uid(), before_uid, "FX17 resource root owner changed");
+        assert_eq!(after.gid(), before_gid, "FX17 resource root group changed");
+        json!({
+            "before": {"mode_octal": format!("{before_mode:04o}"), "uid": before_uid, "gid": before_gid},
+            "after": {"mode_octal": format!("{after_mode:04o}"), "uid": after.uid(), "gid": after.gid()}
+        })
+    };
+    #[cfg(not(unix))]
+    let resource_root_permissions = json!({"supported": false});
     let repo = tempfile::tempdir()
         .expect("FX17 source repository root")
         .keep();
@@ -1301,6 +1322,7 @@ fn actual_fx17_twenty_controlled_changes_preserve_all_65_vectors() {
             .duration_since(std::time::UNIX_EPOCH)
             .expect("system clock")
             .as_millis(),
+        "resource_root_permissions": resource_root_permissions,
         "retained_roots": {
             "host_state": host.display().to_string(),
             "source_repository": repo.display().to_string(),
