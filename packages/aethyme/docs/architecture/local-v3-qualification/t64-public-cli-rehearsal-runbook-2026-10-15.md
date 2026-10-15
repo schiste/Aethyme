@@ -1134,6 +1134,13 @@ Run the public, read-only status routes and save each output/status before and a
   --job "$JOB_ID" --repo "$PLAYGROUND" --json
 ```
 
+The notice `--limit 512` bounds only the returned page. Pending notices are
+capped at 512 across the project and one owner tick examines at most 512 notices;
+terminal notice and outcome rows remain append-only with no automatic pruning
+or total-history cap. Treat the database's lifetime audit history as potentially
+growing, and preserve storage-full errors as failures rather than assuming these
+queue and response bounds cap total storage.
+
 For budget reconciliation use the exact reservation ID when known, or the exact budget nonce returned by the relevant appointment/ledger output, adding exactly one of `--reservation ID` or `--nonce NONCE`. Budget status pages at most 500 newest reservation rows; it reports `reservation_rows_omitted` and exact ID/nonce lookup independent of that page. Root totals cover the complete ledger, but the displayed page is not a complete historical row listing. A status label does not itself grant dispatch. Preserve full private command transcripts and statuses; do not publish raw global Docker event streams, host inventories, grant databases, journals, or environment dumps.
 
 ## Exact release and teardown

@@ -1,4 +1,7 @@
-//! Bounded, append-only ingress for a previously retained contribution.
+//! Append-only ingress for a previously retained contribution with bounded
+//! pending work, owner-tick batches, and status responses. Terminal audit rows
+//! are retained without automatic pruning, so total history can grow over the
+//! lifetime of a project; these bounds are not a total-storage cap.
 //!
 //! A notice is data, not execution authority. Ingress never acquires a target
 //! controller lock or makes an input available. The appointed driver's next
@@ -507,7 +510,11 @@ fn owner_tick_hook() {}
 #[path = "local_capture_notice/tests.rs"]
 mod tests;
 
-/// Read the bounded durable notice history for operator reconciliation.
+/// Read at most `limit` durable notice rows for operator reconciliation.
+///
+/// The limit bounds this response only. Terminal notice and outcome rows are
+/// append-only and are not automatically pruned, so total project history can
+/// grow over time.
 pub fn list_for_target(
     store: &CollaborationStore,
     target_name: &str,

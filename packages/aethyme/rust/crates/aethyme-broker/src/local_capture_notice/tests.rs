@@ -75,7 +75,7 @@ fn admission_effects(store: &CollaborationStore) -> AdmissionEffects {
 }
 
 #[test]
-fn notice_ingress_refuses_unbound_issuer_revision_and_capture_without_effects() {
+fn notice_ingress_refuses_unbound_issuer_revision_and_capture_without_admission_effects() {
     let mut f = Fixture::new();
     let owner = target::acquire_controller(&mut f.store, "target", "appointed").unwrap();
     let spec = f.spec();
@@ -155,6 +155,154 @@ fn notice_ingress_refuses_unbound_issuer_revision_and_capture_without_effects() 
     assert_eq!(before_stale_revision.arrivals, 0);
     assert_eq!(before_stale_revision.waves, 0);
     assert_eq!(before_stale_revision.budget_reservations, 0);
+}
+
+#[test]
+fn duplicate_ingress_and_owner_ticks_are_idempotent_for_one_arrival() {
+    let mut f = Fixture::new();
+    let owner = target::acquire_controller(&mut f.store, "target", "appointed").unwrap();
+    let spec = f.spec();
+    let revision = target::propose_revision(&mut f.store, &owner, spec).unwrap();
+    target::select_revision(&mut f.store, &owner, &revision.id).unwrap();
+    let retained_a = f.a.clone();
+    let operation = capture(&mut f, &retained_a);
+
+    let first = ingest(
+        &mut f.store,
+        owner.target(),
+        owner.issuer(),
+        &revision.id,
+        "A",
+        &operation,
+    )
+    .unwrap();
+    let duplicate = ingest(
+        &mut f.store,
+        owner.target(),
+        owner.issuer(),
+        &revision.id,
+        "A",
+        &operation,
+    )
+    .unwrap();
+    assert_eq!(duplicate, first);
+    assert_eq!(first.status, "pending");
+    assert_eq!(admission_effects(&f.store).notices, 1);
+    assert_eq!(admission_effects(&f.store).outcomes, 1);
+
+    let _ = admit_for_owner(&mut f.store, &owner, wave_policy(), 0).unwrap();
+    let after_first_tick = admission_effects(&f.store);
+    assert_eq!(after_first_tick.notices, 1);
+    assert_eq!(after_first_tick.outcomes, 1);
+    assert_eq!(after_first_tick.arrivals, 1);
+    let _ = admit_for_owner(&mut f.store, &owner, wave_policy(), 1).unwrap();
+    assert_eq!(admission_effects(&f.store), after_first_tick);
+}
+
+#[test]
+fn pending_notice_limit_accepts_512_and_refuses_513_without_effects() {
+    let mut f = Fixture::new();
+    let owner = target::acquire_controller(&mut f.store, "target", "appointed").unwrap();
+    let spec = f.spec();
+    let revision = target::propose_revision(&mut f.store, &owner, spec).unwrap();
+    target::select_revision(&mut f.store, &owner, &revision.id).unwrap();
+    let retained_a = f.a.clone();
+    let operation = capture(&mut f, &retained_a);
+    let duplicate_operation = capture(&mut f, &retained_a);
+
+    // Seed canonical, schema-valid pending rows to isolate the project-wide
+    // capacity check without making 512 unrelated capture operations. These
+    // deliberately never reach an owner tick; only the pending counter is
+    // under test here.
+    let capture_receipt = capture::receipt(&f.store, &operation).unwrap().unwrap();
+    let retained = archive::retained_contribution(&f.store, &capture_receipt.contribution)
+        .unwrap()
+        .unwrap();
+    let epoch = crate::local_authority::status(&f.store)
+        .unwrap()
+        .epoch
+        .as_str()
+        .to_owned();
+    let tx = f
+        .store
+        .connection()
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .unwrap();
+    for index in 0..MAX_PENDING_NOTICES - 1 {
+        let body = NoticeBody {
+            target: owner.target().into(),
+            issuer: owner.issuer().into(),
+            revision: revision.id.as_str().into(),
+            alias: format!("seed-{index:03}"),
+            operation: operation.as_str().into(),
+            lineage: capture_receipt.contribution.as_str().into(),
+            receipt: capture_receipt.receipt_record_id.as_str().into(),
+            authority_epoch: epoch.clone(),
+            base_snapshot: capture_receipt.base.as_str().into(),
+            base_commit: retained.base.commit.as_str().into(),
+            result_snapshot: capture_receipt.result.as_str().into(),
+            result_commit: retained.result.commit.as_str().into(),
+            received_ms: index,
+        };
+        let body_record = record(&body).unwrap();
+        let notice_id = body_record.id().as_str().to_owned();
+        tx.execute(
+            "INSERT INTO local_capture_notices
+             (notice_id,target,revision,operation_id,alias,lineage_record_id,receipt_record_id,
+              authority_epoch,base_snapshot,base_commit,result_snapshot,result_commit,received_ms,body)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+            params![
+                notice_id,
+                body.target,
+                body.revision,
+                body.operation,
+                body.alias,
+                body.lineage,
+                body.receipt,
+                body.authority_epoch,
+                body.base_snapshot,
+                body.base_commit,
+                body.result_snapshot,
+                body.result_commit,
+                body.received_ms,
+                body_record.canonical_bytes(),
+            ],
+        )
+        .unwrap();
+        tx.execute(
+            "INSERT INTO local_capture_notice_outcomes(notice_id,status,detail,changed_ms)
+             VALUES (?1,'pending',NULL,?2)",
+            params![notice_id, body.received_ms],
+        )
+        .unwrap();
+    }
+    tx.commit().unwrap();
+    assert_eq!(admission_effects(&f.store).notices, MAX_PENDING_NOTICES - 1);
+
+    let receipt = ingest(
+        &mut f.store,
+        owner.target(),
+        owner.issuer(),
+        &revision.id,
+        "A",
+        &operation,
+    )
+    .unwrap();
+    assert_eq!(receipt.status, "pending");
+    let at_limit = admission_effects(&f.store);
+    assert_eq!(at_limit.notices, MAX_PENDING_NOTICES);
+    assert_eq!(at_limit.outcomes, MAX_PENDING_NOTICES);
+
+    let over_limit = ingest(
+        &mut f.store,
+        owner.target(),
+        owner.issuer(),
+        &revision.id,
+        "A",
+        &duplicate_operation,
+    );
+    assert!(matches!(over_limit, Err(NoticeError::Full)));
+    assert_eq!(admission_effects(&f.store), at_limit);
 }
 
 #[test]
