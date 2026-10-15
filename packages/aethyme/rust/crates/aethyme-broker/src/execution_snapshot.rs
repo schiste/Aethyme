@@ -434,6 +434,45 @@ pub(crate) fn materialize_in(
     snapshot: &ExecutionSnapshot,
     temporary_root: Option<&Path>,
 ) -> Result<MaterializedInputs, SnapshotError> {
+    let mut before_reconstruct = |_: &str, _: &Path| {};
+    let mut on_reconstruct_error = |_: &archive::ArchiveError| {};
+    materialize_in_inner(
+        store,
+        owner,
+        snapshot,
+        temporary_root,
+        &mut before_reconstruct,
+        &mut on_reconstruct_error,
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn materialize_in_observed(
+    store: &CollaborationStore,
+    owner: &ControllerOwner,
+    snapshot: &ExecutionSnapshot,
+    temporary_root: Option<&Path>,
+    before_reconstruct: &mut dyn FnMut(&str, &Path),
+    on_reconstruct_error: &mut dyn FnMut(&archive::ArchiveError),
+) -> Result<MaterializedInputs, SnapshotError> {
+    materialize_in_inner(
+        store,
+        owner,
+        snapshot,
+        temporary_root,
+        before_reconstruct,
+        on_reconstruct_error,
+    )
+}
+
+fn materialize_in_inner(
+    store: &CollaborationStore,
+    owner: &ControllerOwner,
+    snapshot: &ExecutionSnapshot,
+    temporary_root: Option<&Path>,
+    before_reconstruct: &mut dyn FnMut(&str, &Path),
+    on_reconstruct_error: &mut dyn FnMut(&archive::ArchiveError),
+) -> Result<MaterializedInputs, SnapshotError> {
     let _authority = target::authorize(store, owner)?;
     current(store, owner, snapshot.target_revision())?;
     // Never trust a caller-edited descriptor or a stale retained ref.
@@ -452,7 +491,11 @@ pub(crate) fn materialize_in(
     };
     for (role, id, manifest) in inspect_roles(store, spec, MAX_INPUT_BYTES)? {
         let path = workspace.path().join(role);
-        archive::reconstruct(store, &id, &path)?;
+        before_reconstruct(role, &path);
+        if let Err(error) = archive::reconstruct(store, &id, &path) {
+            on_reconstruct_error(&error);
+            return Err(error.into());
+        }
         verify_materialized(&path, &manifest)?;
     }
     Ok(MaterializedInputs {
