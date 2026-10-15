@@ -23,7 +23,7 @@ Use the following byte-frozen, unexecuted inputs. Hash the files again at launch
 | run-profile authorization digest | `97141fc4726634b958525e24142e7b148c97c4c9db8352bca786cf339c4e5629` | External project-budget authorization label |
 | objective authorization label | `b4f3c4f1455da88b58924dce2fd8487f4f3afd3d935f584bfcfbffc71f346a9c` | External target label, not permission |
 | phase/path clarification v2 | `57e057476b25e7b5bdb2cf797e8794371509fbf373ee20dca3338cb23acd93e5` | Superseded by v3; retained unchanged |
-| phase/path clarification v3 | `7b3e65ab82e53526646483cca2f299d8d8792ef80d05e9ed86afca9c248f990a` | Independently reviewed pretrial ordering and host-state child-path interpretation |
+| phase/path clarification v3 (`/private/tmp/aethyme-t64-phase-clarification-v3-8wa1pv3o/clarification.json`) | `7b3e65ab82e53526646483cca2f299d8d8792ef80d05e9ed86afca9c248f990a` | Independently reviewed pretrial ordering and host-state child-path interpretation; byte-identical copy at `target/local-resume/frozen-pretrial-20261015/t64-phase-clarification-20261015/clarification-v3.json` |
 | application `source/app.sh` | `8851e393268aae2a0007acecbdc56050276b3de586a3e79c7236ee2a592a8e2d` | Frozen seed source |
 | `source/lib/greeting.sh` | `fb1f2cd7900b03a00648ddbaf8f18dce61b5cff27a1caeec14873de6c2ae409c` | Frozen seed source |
 | `source/lib/math.sh` | `e89cb7689486c429f6f0df217d377962f860e3f93f3fb0f4feceb25ebcbe6ac8` | Frozen seed source |
@@ -43,27 +43,15 @@ Frozen runtime identity: Docker CLI `/opt/homebrew/bin/docker`; endpoint `unix:/
 
 The run root is the exact already-prepared, never-used directory `/private/tmp/aethyme-local-t64-run-hn4e6o_5`; do not create a substitute or clean/reset it. The independently reviewed phase/path clarification v3 explicitly binds this path and its child paths without changing the frozen profile. At prebootstrap, independently `lstat` the root and each profile-bound payload directory (`source`, `harness`, `state`, `native-host`, `native-temporary`, `artifacts`, `bin`, `receipts`): require current non-root uid, mode `0700`, no symlink, and no entries. Record each status, device, inode, uid, mode, and checked enumeration status. Any error or existing payload ends the trial; never erase or reuse contents. Frozen profile/checklist/completion files at the root are the documented metadata exception.
 
-The fixed gate-control root is `/private/tmp/aethyme-local-t64-operator-v3-d4cbdvtq/control`; the frozen gate embeds it. Before any setup, and again immediately before arming, require a real directory (not a symlink), current uid, mode `0700`, and zero entries. Check emptiness without a command substitution whose failure can look empty:
-
-```sh
-test -d "$CONTROL_ROOT" && test ! -L "$CONTROL_ROOT" || exit 1
-test "$(/usr/bin/stat -f %u "$CONTROL_ROOT")" = "$(/usr/bin/id -u)" || exit 1
-test "$(/usr/bin/stat -f %Lp "$CONTROL_ROOT")" = 700 || exit 1
-/usr/bin/find "$CONTROL_ROOT" -mindepth 1 -maxdepth 1 -print -quit \
-  > "$RUN_ROOT/receipts/control-first-entry.txt"
-find_status=$?
-test "$find_status" -eq 0 && test ! -s "$RUN_ROOT/receipts/control-first-entry.txt" || exit 1
-```
-
-Record the command status and control directory device/inode/uid/mode. If any check fails, stop; do not edit the frozen script, change this path, delete entries, or rerun with a different control root.
+The fixed gate-control root is `/private/tmp/aethyme-local-t64-operator-v3-d4cbdvtq/control`; the frozen gate embeds it. The prebootstrap directory checker below records this root's initial empty state before any receipt is written. Only after that receipt succeeds, perform the separate checked control-root inspection and preserve its output/status. Repeat the same check immediately before arming. Do not use the superseded `/private/tmp/aethyme-local-t64-operator-k3igk063/control` path.
 
 Use the independently cleared v3 clarification's append-only phase-manifest chain; never edit an earlier frozen file to add facts learned later:
 
 1. `00-prebootstrap.json`, before any Playground CLI call or contributor launch, binds the reviewed Aethyme source commit/tree/clean status and built binary SHA/recipe/cache limitation; every frozen source, inventory, oracle, public-brief, gate and profile hash; exact prepared run/control paths; runtime/resource/budget bounds; intended repository/carrier names; and operator identity. It contains no generated ID or claim of successful work.
 2. `01-precontributor.json`, after the baseline and separate harness commits exist but before either contributor edits, binds both commits/trees/file hashes, both new contributor sessions and their separate worktree paths, the identical source baseline, private bare carrier, public briefs, frozen inventory/oracle/verifier-plan bytes, and task assignments. Session paths/IDs are generated before contributor edits; do not invent them.
 3. `02-capture-and-prepare.json`, after both verify-only submits and public verifier prepare, binds their exact output/status, source heads and required-capture receipts/operations/base/result/lineage, unchanged integration baseline, acknowledged harness receipt, and canonical inventory/runtime/policy IDs returned by prepare. Compare all returned values to `01-precontributor.json`; any mismatch fails the trial. Never hand-compute these IDs. Freeze and validate this phase before target selection or availability.
-4. `03-predispatch.json`, before B's watcher starts and target-run dispatches, binds target revision/current epoch, project/objective policy IDs, producer generation, returned verifier IDs, exact resource/appointment JSON, carrier session/remote/destination, reviewed watcher/dispatcher hashes and argv, pre-arm control-root check and runtime/capacity outputs, plus all preceding manifest hashes.
-5. `03-arm.json`, after the checked O_EXCL `arm-a` creation but before B's watcher starts, binds the arm receipt, control-root identity and exact directory contents. Never amend `03-predispatch.json` after it is frozen.
+4. `03-predispatch.json`, before B's watcher starts and target-run dispatches, binds target revision/current epoch, project/objective policy IDs, producer generation, returned verifier IDs, exact resource/appointment JSON, carrier session/remote/destination, reviewed watcher/dispatcher hashes and argv, the pre-arm control-root check and runtime/capacity outputs, plus all preceding manifest hashes.
+5. `03-arm.json`, after the checked O_EXCL `arm-a` creation but before B's watcher starts, binds the immediate pre-arm check receipt, arm receipt, control-root identity and exact directory contents. Never amend `03-predispatch.json` after it is frozen.
 6. `04-results-and-teardown.json`, after reconciliation, records service nonce/status results, all failed or unrun stages, exact revoke/release/freeze outputs and exact-owned-resource absence or unknown/residual state. Earlier phase bytes remain unchanged.
 
 Clarification v3 is a pretrial timing and path interpretation only. Source/harness commits, full/selected inventories, private oracle, public briefs, verifier plan, endpoint identity and all policy/budget bounds are frozen before contributors edit. The first successful required submit may initialize Local state; public prepare then returns canonical runtime and policy IDs. Compare them to the frozen bytes before target selection/dispatch. A mismatch fails closed; it never authorizes adapting the oracle, profile or policy. Never fill a missing ID by calculating an internal RecordId or editing Local state.
@@ -81,14 +69,20 @@ export CONTROL_ROOT='/private/tmp/aethyme-local-t64-operator-v3-d4cbdvtq/control
 export DOCKER_HOST='unix:///Volumes/T7-repositories/Colima/home/default/docker.sock'
 export DOCKER_CLI='/opt/homebrew/bin/docker'
 export IMAGE='sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251'
-export TARGET='t64-two-refactors-v1'
-export ISSUER='t64-operator'
+export TARGET='t64-two-refactors'
+export ISSUER='t64-independent-operator'
 export INPUTS='/private/tmp/aethyme-local-t64-inputs-v2-qqslzo4a'
 export ZERO_EXIT_ROOT='/private/tmp/aethyme-local-t64-zero-exit-v1-kx19p4p_'
 export GATE_ROOT='/private/tmp/aethyme-local-t64-operator-v3-d4cbdvtq'
-export PATH="/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin"
 export CARGO_HOME='/Users/christophehenner/.cargo'
 export RUSTUP_HOME='/Users/christophehenner/.rustup'
+export PATH="$CARGO_HOME/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin"
+# Copy the literal target directory from the exclusive source-build handoff.
+export CARGO_TARGET_DIR='<copy exact shared T7 target path from runtime handoff>'
+case "$CARGO_TARGET_DIR" in
+  /Volumes/T7-repositories/*) ;;
+  *) printf '%s\n' 'CARGO_TARGET_DIR must be the exact authorized T7 path' >&2; exit 1 ;;
+esac
 # Set from the separately reviewed source-pinned build manifest.
 export AETHYME_SOURCE='<reviewed-clean-Aethyme-worktree>'
 export OPERATOR_AGENT_IDENTITY='<operator Name <operator@example.com>>'
@@ -98,7 +92,21 @@ Run the shell blocks in one `/bin/bash` operator session with `set -euo pipefail
 
 The profile files are at `$RUN_ROOT/run-profile-v3.json`, `$RUN_ROOT/prelaunch-checklist-v2.json`, and `$RUN_ROOT/operator-completion-v1.json`; the frozen selection inputs are in `/private/tmp/aethyme-local-t64-zero-exit-v1-kx19p4p_`, public briefs and source/oracle inputs are in `/private/tmp/aethyme-local-t64-inputs-v2-qqslzo4a`, and gate inputs are in `/private/tmp/aethyme-local-t64-operator-v3-d4cbdvtq`. Copy the public briefs to the private receipts directory and verify them against the table above. Only the operator reads or copies `harness/expected-literals.json`.
 
-Build the exact reviewed commit before any Playground command. Record `git -C "$AETHYME_SOURCE" rev-parse HEAD`, tree, and full status; require a clean worktree. Use the approved shared T7 Cargo target from the exclusive runtime handoff (never place a Rust target under `/private/tmp`), `CARGO_BUILD_JOBS=4`, `RUSTC_WRAPPER=''`, and the workspace lockfile. The final launch manifest records the exact build command and notes that the compiler cache is warmed. Force the broker library to rebuild from the pinned source without changing its contents, verify clean source before and after, then copy only the resulting CLI executable to `$AETHYME_BIN` and record its SHA-256. Do not claim a source-pinned binary until the build and checks are completed. The rehearsal itself uses this binary and does not compile. Keep the real `HOME`; do not copy credentials into the run root.
+Build the exact reviewed commit before any Playground command. Record `git -C "$AETHYME_SOURCE" rev-parse HEAD`, tree, and full status; require a clean worktree. Do not run this block until the exclusive runtime handoff names a shared T7 `CARGO_TARGET_DIR`; never place a Rust target under `/private/tmp`. The target path must be written literally into `00-prebootstrap.json`. Use four jobs, an empty compiler wrapper and the workspace lockfile:
+
+```sh
+export CARGO_BUILD_JOBS=4
+export RUSTC_WRAPPER=''
+cd "$AETHYME_SOURCE/packages/aethyme/rust"
+/usr/bin/caffeinate -i cargo build --locked -j4 -p aethyme-cli --bin aethyme
+test -x "$CARGO_TARGET_DIR/debug/aethyme" || exit 1
+/usr/bin/install -m 0700 "$CARGO_TARGET_DIR/debug/aethyme" "$AETHYME_BIN"
+shasum -a 256 "$AETHYME_BIN"
+"$AETHYME_BIN" --version
+git -C "$AETHYME_SOURCE" status --porcelain=v1
+```
+
+The final launch manifest records the exact build command, source before/after status, binary SHA-256, and warmed compiler-cache limitation. Do not claim a source-pinned binary until the build and checks are completed. The rehearsal itself uses this binary and does not compile. Keep the real `HOME`; do not copy credentials into the run root.
 
 Before any Playground CLI call, make a checked preflight receipt. Record `id -u`, `/usr/bin/stat -f '%d %i %u %Lp'` for all eight prepared paths and the fixed control root, and checked `find` status/emptiness. Confirm `/private/tmp` and the T7 endpoint are mounted as expected; do not clear or repurpose anything. Record versions of `/usr/bin/python3`, `/usr/bin/git`, `jq`, the pinned Docker CLI, and the Rust toolchain used by the already-reviewed build. Read-only Docker and disk capacity checks use only the pinned CLI/endpoint:
 
@@ -147,7 +155,31 @@ with os.fdopen(fd, "w", encoding="utf-8") as stream:
     os.fsync(stream.fileno())
 ```
 
-Invoke it with `/usr/bin/python3 checker.py "$RUN_ROOT"`; check and preserve the command status rather than suppressing errors. The root may contain the frozen profile/checklist/completion/clarification metadata; each of the eight payload directories and the fixed gate-control directory must be empty. Any failure ends the trial without cleanup, substitution or reset.
+Invoke it with `/usr/bin/python3 checker.py "$RUN_ROOT"`; check and preserve the command status rather than suppressing errors. The root may contain frozen profile/checklist/completion/clarification metadata and the historical `filesystem-preflight.json` and `prepared-manifest.json`; preserve those two files byte-exact as superseded preparation metadata and do not treat them as current preflight evidence. The run root's `run-profile.json`, `run-profile-v2.json`, and `prelaunch-checklist.json` are also superseded; v3 profile, checklist v2, completion v1 and the independently reviewed clarification v3 govern this rehearsal. Each of the eight payload directories and the fixed gate-control directory must be empty. Any failure ends the trial without cleanup, substitution or reset.
+
+After `receipts/prebootstrap-paths.json` has been durably written, define and run this checked control-root inspection. This ordering keeps `receipts` empty for the prebootstrap checker while retaining the control-root inspection. Run `check_control_root control-prearm` after setup and immediately before freezing `03-predispatch.json`; after that phase is frozen, run `check_control_root control-arm-boundary` immediately before the arm script. Bind the first check into `03-predispatch.json` and the second check's files/status into `03-arm.json`:
+
+```sh
+check_control_root() {
+  local label="$1"
+  test -d "$CONTROL_ROOT" && test ! -L "$CONTROL_ROOT" || return 1
+  test "$(/usr/bin/stat -f %u "$CONTROL_ROOT")" = "$(/usr/bin/id -u)" || return 1
+  test "$(/usr/bin/stat -f %Lp "$CONTROL_ROOT")" = 700 || return 1
+  if /usr/bin/find "$CONTROL_ROOT" -mindepth 1 -maxdepth 1 -print -quit \
+    > "$RUN_ROOT/receipts/$label-first-entry.txt"; then
+    find_status=0
+  else
+    find_status=$?
+  fi
+  printf '%s\n' "$find_status" > "$RUN_ROOT/receipts/$label-first-entry.status"
+  /usr/bin/stat -f '%d %i %u %Lp' "$CONTROL_ROOT" \
+    > "$RUN_ROOT/receipts/$label.stat"
+  test "$find_status" -eq 0 && test ! -s "$RUN_ROOT/receipts/$label-first-entry.txt"
+}
+check_control_root control-initial
+```
+
+If any check fails, stop; do not edit the frozen script, change this path, delete entries, or rerun with a different control root. The second inspection has separate output/status/stat receipts bound by `03-predispatch.json`.
 
 Use the frozen existing directories without replacement: `PLAYGROUND=$RUN_ROOT/source`, `HARNESS_REPO=$RUN_ROOT/harness`, Aethyme state at `$RUN_ROOT/state`, output/artifact and bare carrier under `$RUN_ROOT/artifacts`, native temporary files at `$RUN_ROOT/native-temporary`, and receipts at `$RUN_ROOT/receipts`. Clarification v3 explicitly interprets the frozen `native-host` directory as the parent of `ResourcePolicy.host_state=$RUN_ROOT/native-host/host-resources.db` and journal directory `$RUN_ROOT/native-host/local-execution-journal`; this was independently cleared without changing limits or the parent path. Verify the DB file and journal directory are absent at prebootstrap. Do not create extra top-level profile paths or replace any frozen payload directory. Record the path and parent device/inode identities in `00-prebootstrap.json`.
 
@@ -498,7 +530,7 @@ test -n "$NOTICE_OPERATION_A" && test -n "$NOTICE_OPERATION_B" || exit 1
 test "$NOTICE_OPERATION_A" != "$NOTICE_OPERATION_B" || exit 1
 ```
 
-Record target `t64-two-refactors-v1`, issuer `t64-operator`, the returned revision/current epoch/producer generation, and both operation IDs before ingesting A's notice:
+Record target `t64-two-refactors`, issuer `t64-independent-operator`, service nonce `t64-two-refactors-v1`, the returned revision/current epoch/producer generation, and both operation IDs before ingesting A's notice:
 
 ```sh
 "$AETHYME_BIN" collab target capture-notice ingest \
@@ -506,11 +538,16 @@ Record target `t64-two-refactors-v1`, issuer `t64-operator`, the returned revisi
   --alias A --operation "$NOTICE_OPERATION_A" --repo "$PLAYGROUND" --json
 ```
 
-The notice receipt is not availability. The owner tick must revalidate the exact alias's complete retained input (base/result snapshot and lineage), current/tombstone state and selected revision before admission. The launch manifest records the notice ID and the subsequent owner status.
-
-After all submit gates have completed, verify and arm the control root with a checked, exclusive create. Run this only after both captures, target configuration, A notice, and the reviewed `03-predispatch.json` are frozen. The script creates a separate immutable `03-arm.json` receipt; if either creation fails, do not dispatch or retry:
+The notice receipt is not availability. The owner tick must revalidate the exact alias's complete retained input (base/result snapshot and lineage), current/tombstone state and selected revision before admission. The launch manifest records the notice ID and the subsequent owner status. After all predispatch setup is fixed, run the checked control inspection, then freeze `03-predispatch.json` with its status/stat/empty-output receipt hashes:
 
 ```sh
+check_control_root control-prearm
+```
+
+After all submit gates have completed, verify and arm the control root with a checked, exclusive create. Run this only after both captures, target configuration, A notice, and the reviewed `03-predispatch.json` are frozen. Immediately before the script, run the second checked inspection; the script then creates the separate immutable arm receipt. If either creation fails, do not dispatch or retry:
+
+```sh
+check_control_root control-arm-boundary
 /usr/bin/python3 - "$CONTROL_ROOT" "$RUN_ROOT/receipts/03-arm.json" <<'PY'
 import hashlib, json, os, pathlib, stat, sys
 
@@ -562,7 +599,7 @@ PY
 test "$?" -eq 0 || exit 1
 ```
 
-Freeze `watch-b.py` below into `$RUN_ROOT/bin` and record its SHA-256 and exact argv in `03-predispatch.json`. The B contributor process runs this watcher itself after both submits and target setup. It writes a ready receipt, waits at most 30 seconds for the exact A gate marker, invokes the B notice command once with a five-second subprocess deadline, and records a timeout as unknown. It terminates only its exact owned CLI process group on notice timeout. Its `finally` path attempts one O_EXCL `release-a` create and directory sync, including failures before marker observation. It never retries the notice or signals A.
+Freeze `watch-b.py` below into `$RUN_ROOT/bin` and record its SHA-256 and exact argv in `03-predispatch.json`. The B contributor process runs this watcher itself after both submits and target setup. It writes a startup receipt followed by a separate, durable waiting-state receipt immediately before polling for the gate marker. It waits up to 305 seconds: the service's 300-second elapsed horizon plus the dispatcher's maximum five-second ready/waiting receipt window. An absent marker at expiry is unresolved and leaves `release-a` absent. After observing and validating the exact live A gate PID, it invokes the B notice command once with a five-second subprocess deadline and records timeout as unknown. It terminates only its exact owned CLI process group on notice timeout. Its `finally` path creates and syncs `release-a` only after exact gate-PID validation and only while that same child remains live. It never retries the notice or signals A.
 
 ```python
 #!/usr/bin/python3
@@ -575,10 +612,11 @@ control, cli, repo, target, issuer, revision, operation, receipts = map(pathlib.
 target, issuer, revision, operation = map(str, (target, issuer, revision, operation))
 uid = os.getuid()
 started = time.monotonic()
-deadline = started + 40.0
-marker_deadline = started + 30.0
+marker_deadline = started + 305.0
 report = {"schema": "aethyme.t64-live-child-watcher/v1", "notice_attempts": 0}
 exit_status = 1
+gate_pid = None
+gate_validated = False
 
 def checked_control():
     st = os.lstat(control)
@@ -664,6 +702,7 @@ release = control / "release-a"
 notice_out = receipts / "notice-b.stdout"
 notice_err = receipts / "notice-b.stderr"
 ready_path = receipts / "watch-b-ready.json"
+waiting_path = receipts / "watch-b-waiting.json"
 report_path = receipts / "watch-b.json"
 proc = None
 try:
@@ -677,10 +716,16 @@ try:
     record_file(ready_path, {"schema": "aethyme.t64-live-child-watcher-ready/v1",
                              "watcher_pid": os.getpid(), "uid": uid,
                              "started_utc": report["started_utc"],
-                             "waiting_for": "gate-a-started", "argv": sys.argv,
+                             "phase": "starting_marker_wait", "argv": sys.argv,
                              "control": str(control), "cli": str(cli), "repo": str(repo),
                              "target": target, "issuer": issuer, "revision": revision,
                              "operation": operation})
+    record_file(waiting_path, {"schema": "aethyme.t64-live-child-watcher-waiting/v1",
+                               "watcher_pid": os.getpid(), "uid": uid,
+                               "waiting_for": "gate-a-started", "argv": sys.argv,
+                               "control": str(control), "cli": str(cli), "repo": str(repo),
+                               "target": target, "issuer": issuer, "revision": revision,
+                               "operation": operation})
     while time.monotonic() < marker_deadline:
         try:
             pid = read_marker(marker)
@@ -688,11 +733,15 @@ try:
         except FileNotFoundError:
             time.sleep(min(0.1, max(0.0, marker_deadline - time.monotonic())))
     else:
-        raise TimeoutError("A gate marker was not observed within 30 seconds")
+        report["gate_marker_result"] = "not_observed_within_305s_unknown"
+        raise TimeoutError("A gate marker was not observed within 305 seconds")
+    report["gate_marker_result"] = "observed"
+    gate_pid = pid
     report["gate_pid"] = pid
     report["gate_before"] = child_identity(pid)
     if report["gate_before"] is None:
         raise RuntimeError("exact A gate child is not live before B notice")
+    gate_validated = True
     report["before_notice_utc"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
     argv = [str(cli), "collab", "target", "capture-notice", "ingest",
             "--target", target, "--issuer", issuer, "--revision", revision,
@@ -703,9 +752,8 @@ try:
                                 start_new_session=True)
         report["notice_pid"] = proc.pid
         report["notice_attempts"] = 1
-        remaining = min(5.0, max(0.0, deadline - time.monotonic()))
         try:
-            report["notice_exit"] = proc.wait(timeout=remaining)
+            report["notice_exit"] = proc.wait(timeout=5.0)
             report["notice_result"] = "completed"
         except subprocess.TimeoutExpired:
             report["notice_result"] = "timed_out_unknown"
@@ -735,8 +783,18 @@ finally:
     report["finished_utc"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
     try:
         checked_control()
-        create_once(release, b"release\n")
-        report["release_a_created_and_synced"] = True
+        if not gate_validated or gate_pid is None:
+            report["release_a_created_and_synced"] = False
+            report["release_result"] = "withheld_no_validated_gate"
+        elif (set(os.listdir(control)) != {"arm-a", "gate-a-started"}
+              or read_marker(marker) != gate_pid or child_identity(gate_pid) is None):
+            report["release_a_created_and_synced"] = False
+            report["release_result"] = "withheld_gate_marker_or_exact_child_changed_unknown"
+            exit_status = 1
+        else:
+            create_once(release, b"release\n")
+            report["release_a_created_and_synced"] = True
+            report["release_result"] = "created_after_exact_live_gate_validation"
     except Exception as exc:
         report["release_a_created_and_synced"] = False
         report["release_failure"] = type(exc).__name__ + ": " + str(exc)
@@ -750,7 +808,7 @@ print(json.dumps(report, sort_keys=True, separators=(",", ":")))
 raise SystemExit(exit_status)
 ```
 
-The watcher itself is a process launched by contributor B, not by the operator. After receiving an explicit START, B runs this exact command once from its contributor tool process. It uses the reviewed source-pinned CLI and run-scoped state, creates `watch-b-ready.json`, then waits for the gate marker. Do not wait for this command to finish before starting the service; wait only for the ready file described below. B reports the eventual process exit and does not retry:
+The watcher itself is a process launched by contributor B, not by the operator. After receiving an explicit START, B runs this exact command once from its contributor tool process. It uses the reviewed source-pinned CLI and run-scoped state, creates `watch-b-ready.json` and then `watch-b-waiting.json` immediately before polling for the gate marker. Do not wait for this command to finish before starting the service; the operator dispatcher waits for both receipts, then verifies the waiting receipt, exact live PID/argv, and control-root contents. B reports the eventual process exit and does not retry:
 
 ```sh
 env HOME="$HOME" PATH="/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin" \
@@ -762,7 +820,7 @@ env HOME="$HOME" PATH="/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin" \
   2> "$RUN_ROOT/receipts/watch-b.stderr"
 ```
 
-After arming, the operator starts one bounded dispatcher. It waits at most five seconds for a valid watcher-ready receipt and live exact watcher PID, then launches the service command once. It records the exact argv and child PID before waiting. The 360-second observation deadline does not kill the child: if it is still running, record `running_unknown`, leave it and its resources alone, and use the read-only nonce status route. Never rerun a timed-out or output-lost service command.
+After arming, the operator starts one bounded dispatcher. It waits at most five seconds for both watcher receipts, then verifies that the waiting receipt has the exact process, argv, revision and operation bindings, checks the exact watcher PID remains live, and immediately rechecks that the control root contains only `arm-a` and neither `gate-a-started` nor `release-a` exists. Only a watcher proven to be waiting for the marker permits service launch. It records the exact argv and child PID before waiting. The 360-second observation deadline does not kill the child: if it is still running, record `running_unknown`, leave it and its resources alone, and use the read-only nonce status route. Never rerun a timed-out or output-lost service command.
 
 Freeze `dispatch-service.py` under `$RUN_ROOT/bin` and record its hash with the phase manifest. The script accepts the service argv after `--`, uses only the listed environment variables, creates logs exclusively, and never signals the service:
 
@@ -780,6 +838,7 @@ uid = os.getuid()
 receipts = root / "receipts"
 control = pathlib.Path(os.environ.get("CONTROL_ROOT", ""))
 ready_path = receipts / "watch-b-ready.json"
+waiting_path = receipts / "watch-b-waiting.json"
 watcher_script = str(root / "bin" / "watch-b.py")
 deadline = time.monotonic() + 5.0
 
@@ -835,6 +894,7 @@ def write_once(path, value):
 while time.monotonic() < deadline:
     try:
         ready = read_private_json(ready_path)
+        waiting = read_private_json(waiting_path)
         break
     except FileNotFoundError:
         time.sleep(0.05)
@@ -842,12 +902,26 @@ else:
     raise SystemExit("watcher ready receipt not observed within five seconds; no service dispatched")
 if ready.get("schema") != "aethyme.t64-live-child-watcher-ready/v1":
     raise SystemExit("watcher ready receipt schema mismatch; no service dispatched")
-
-watcher_pid = int(ready["watcher_pid"])
-if ready.get("uid") != uid or ready.get("waiting_for") != "gate-a-started":
-    raise SystemExit("watcher ready receipt identity/state mismatch; no service dispatched")
+if waiting.get("schema") != "aethyme.t64-live-child-watcher-waiting/v1":
+    raise SystemExit("watcher waiting receipt schema mismatch; no service dispatched")
 if not argv or argv[0] != str(root / "bin" / "aethyme"):
     raise SystemExit("service must use the run-pinned CLI; no service dispatched")
+
+watcher_pid = int(ready["watcher_pid"])
+expected_watcher_argv = [watcher_script, str(control), argv[0], str(root / "source"),
+                         target, issuer, revision, notice_operation, str(receipts)]
+if (ready.get("uid") != uid or ready.get("phase") != "starting_marker_wait"
+        or ready.get("target") != target or ready.get("issuer") != issuer
+        or ready.get("revision") != revision or ready.get("operation") != notice_operation
+        or ready.get("control") != str(control) or ready.get("repo") != str(root / "source")
+        or ready.get("argv") != expected_watcher_argv
+        or waiting.get("watcher_pid") != watcher_pid or waiting.get("uid") != uid
+        or waiting.get("waiting_for") != "gate-a-started"
+        or waiting.get("target") != target or waiting.get("issuer") != issuer
+        or waiting.get("revision") != revision or waiting.get("operation") != notice_operation
+        or waiting.get("control") != str(control) or waiting.get("repo") != str(root / "source")
+        or waiting.get("argv") != expected_watcher_argv):
+    raise SystemExit("watcher startup/waiting receipt identity mismatch; no service dispatched")
 def option(name):
     try:
         return argv[argv.index(name) + 1]
@@ -855,12 +929,10 @@ def option(name):
         raise SystemExit("service argv is missing " + name + "; no service dispatched")
 repo = option("--repo")
 if (option("--target") != target or option("--issuer") != issuer
-        or pathlib.Path(repo) != root / "source"):
+        or pathlib.Path(repo) != root / "source"
+        or option("--endpoint") != "unix:///Volumes/T7-repositories/Colima/home/default/docker.sock"
+        or option("--docker") != "/opt/homebrew/bin/docker"):
     raise SystemExit("service target/issuer/repository binding mismatch; no service dispatched")
-expected_watcher_argv = [watcher_script, str(control), argv[0], repo, target,
-                         issuer, revision, notice_operation, str(receipts)]
-if ready.get("argv") != expected_watcher_argv:
-    raise SystemExit("watcher command bindings differ from the service; no service dispatched")
 ps = subprocess.run(["/bin/ps", "-p", str(watcher_pid), "-o", "pid=,uid=,stat=,command="],
                     capture_output=True, text=True, timeout=2, check=False)
 fields = ps.stdout.strip().split(maxsplit=3)
@@ -869,8 +941,14 @@ if ps.returncode != 0 or len(fields) != 4:
 pid_text, uid_text, state, command = fields
 watcher_argv = shlex.split(command)
 if (int(pid_text) != watcher_pid or int(uid_text) != uid or "Z" in state
-        or len(watcher_argv) < 2 or watcher_argv[1] != watcher_script):
+        or len(watcher_argv) < 2
+        or watcher_argv[0] not in ("/usr/bin/python3", "python3")
+        or watcher_argv[1:] != expected_watcher_argv):
     raise SystemExit("watcher PID does not match exact run-owned script; no service dispatched")
+if (set(os.listdir(control)) != {"arm-a"}
+        or (control / "gate-a-started").exists()
+        or (control / "release-a").exists()):
+    raise SystemExit("watcher no longer waits for the gate marker; no service dispatched")
 
 env_names = ("HOME", "PATH", "DOCKER_HOST", "AETHYME_HOST_STATE_DIR", "TMPDIR")
 if any(name not in os.environ for name in env_names):
@@ -930,7 +1008,7 @@ Invoke the dispatcher with the complete explicit-endpoint command; do not wrap i
   2> "$RUN_ROOT/receipts/dispatcher.stderr"
 ```
 
-Preserve the dispatcher exit status, `service-started.json`, `service-observation.json` when present, service stdout/stderr, and B's watcher report/status. A missing file or still-running PID is unresolved, not a successful empty result. The watcher attempts only one `release-a` create, including its failure path; if the release file could not be durably created, preserve the gate/job roots and report the result as unknown. Never kill by process name or touch another run's control root. No process or resource is declared absent based only on an empty global Docker list.
+Preserve the dispatcher exit status, `service-started.json`, `service-observation.json` when present, service stdout/stderr, and B's watcher report/status. A missing file or still-running PID is unresolved, not a successful empty result. After the exact gate child has been observed and validated, the watcher attempts at most one `release-a` create even if the B notice fails; before that validation it withholds release. If release could not be durably created or the exact child changed, preserve the gate/job roots and report the result as unknown. Never kill by process name or touch another run's control root. No process or resource is declared absent based only on an empty global Docker list.
 
 The service's own 300-second elapsed bound and this operator's 360-second observation deadline have different purposes. If the operator deadline wins, do not kill or settle; inspect the exact nonce/job state read-only and keep all unknown roots. All files remain private raw evidence.
 
@@ -1015,10 +1093,13 @@ While the authority is still Active:
 For each gate PID from `watch-b.json`, save this exact-PID observation and exit status; do not signal it:
 
 ```sh
-/bin/ps -p "$GATE_PID" -o pid=,uid=,stat=,command= \
+if /bin/ps -p "$GATE_PID" -o pid=,uid=,stat=,command= \
   > "$RUN_ROOT/receipts/gate-pid-$GATE_PID.stdout" \
-  2> "$RUN_ROOT/receipts/gate-pid-$GATE_PID.stderr"
-ps_status=$?
+  2> "$RUN_ROOT/receipts/gate-pid-$GATE_PID.stderr"; then
+  ps_status=0
+else
+  ps_status=$?
+fi
 printf '%s\n' "$ps_status" > "$RUN_ROOT/receipts/gate-pid-$GATE_PID.status"
 ```
 
@@ -1027,16 +1108,22 @@ An exit 0 must still match the exact PID, current uid, and frozen `sh .aethyme/t
 For each exact container or volume ID returned in this run's native-job status, use only ID-scoped read-only inspect calls and preserve stdout, stderr and status:
 
 ```sh
-"$DOCKER_CLI" --host "$DOCKER_HOST" inspect --type container "$OWNED_CONTAINER_ID" \
+if "$DOCKER_CLI" --host "$DOCKER_HOST" inspect --type container "$OWNED_CONTAINER_ID" \
   > "$RUN_ROOT/receipts/container-$OWNED_CONTAINER_ID.stdout" \
-  2> "$RUN_ROOT/receipts/container-$OWNED_CONTAINER_ID.stderr"
-container_inspect_status=$?
+  2> "$RUN_ROOT/receipts/container-$OWNED_CONTAINER_ID.stderr"; then
+  container_inspect_status=0
+else
+  container_inspect_status=$?
+fi
 printf '%s\n' "$container_inspect_status" > \
   "$RUN_ROOT/receipts/container-$OWNED_CONTAINER_ID.status"
-"$DOCKER_CLI" --host "$DOCKER_HOST" volume inspect "$OWNED_VOLUME_ID" \
+if "$DOCKER_CLI" --host "$DOCKER_HOST" volume inspect "$OWNED_VOLUME_ID" \
   > "$RUN_ROOT/receipts/volume-$OWNED_VOLUME_ID.stdout" \
-  2> "$RUN_ROOT/receipts/volume-$OWNED_VOLUME_ID.stderr"
-volume_inspect_status=$?
+  2> "$RUN_ROOT/receipts/volume-$OWNED_VOLUME_ID.stderr"; then
+  volume_inspect_status=0
+else
+  volume_inspect_status=$?
+fi
 printf '%s\n' "$volume_inspect_status" > \
   "$RUN_ROOT/receipts/volume-$OWNED_VOLUME_ID.status"
 ```
