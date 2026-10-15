@@ -1,4 +1,3 @@
-use super::*;
 use crate::Broker;
 use crate::broker::gate_trust::{self, GatePolicy};
 use crate::collaboration_archive::{self as archive, CommitOid, ObjectDigest};
@@ -810,7 +809,7 @@ fn run_fx17(
                 "--name-only".into(),
                 "-r".into(),
                 previous_accepted_commit.clone(),
-                source_commit.to_string(),
+                source_commit.as_str().to_owned(),
             ],
             None,
             None,
