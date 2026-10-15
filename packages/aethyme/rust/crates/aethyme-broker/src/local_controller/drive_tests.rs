@@ -300,9 +300,10 @@ fn actual_appointed_driver_completes_without_a_manufactured_receipt() {
             let until=std::time::Instant::now()+std::time::Duration::from_secs(300);
             loop {
                 let completed:i64=observer.read_connection().query_row("SELECT count(*) FROM local_controller_completions WHERE target='native-controller'",[],|r|r.get(0)).unwrap();
-                if completed==1 {
-                    std::thread::sleep(std::time::Duration::from_millis(200));
-                    wave::available(&mut observer,owner_ref,"B",1).unwrap();
+                if completed==1 && target::status(&observer,owner_ref.target()).unwrap().phase==Phase::WaitingForInput {
+                    // This persisted state witnesses an actual missing-input tick.
+                    // A delay after completion alone can expire during cleanup.
+                    wave::available(&mut observer,owner_ref,"B",clock().unwrap()).unwrap();
                     return;
                 }
                 if std::time::Instant::now()>=until {panic!("bounded arrival observer did not see first completion");}
