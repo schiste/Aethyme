@@ -775,7 +775,7 @@ struct OwnedPressure {
 fn fill_to_headroom(disk: &mut OwnedImage, label: &str) -> OwnedPressure {
     disk.assert_mounted();
     let path = disk.mount.join(format!("owned-{label}-pressure.bin"));
-    let file = OpenOptions::new()
+    let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
@@ -1268,7 +1268,7 @@ fn run_t45_capture_hydration_interleavings(disk: &mut OwnedImage) {
     std::fs::write(repo.join("00-capture-pressure.bin"), &capture_payload).unwrap();
     git(&repo, &["add", "00-capture-pressure.bin"]);
     git(&repo, &["commit", "-qm", "T45 new capture payload"]);
-    let capture_result = archive::CommitOid::parse(&git(&repo, &["rev-parse", "HEAD"])).unwrap();
+    let capture_commit = archive::CommitOid::parse(&git(&repo, &["rev-parse", "HEAD"])).unwrap();
     let failed_digest = ObjectDigest::of(&capture_payload);
     assert!(!archive::has_object(&fixture.store, &failed_digest));
     let operation = capture::OperationId::parse("t45-capture-enospc").unwrap();
@@ -1285,7 +1285,7 @@ fn run_t45_capture_hydration_interleavings(disk: &mut OwnedImage) {
         operation_id: operation.clone(),
         repository: repo.clone(),
         base: capture_base,
-        result: capture_result.clone(),
+        result: capture_commit.clone(),
         policy: capture::CapturePolicy::Required,
         retention: capture::RetentionBoundary::UntilReleased,
     };
@@ -1304,7 +1304,7 @@ fn run_t45_capture_hydration_interleavings(disk: &mut OwnedImage) {
         let _release_error = ReleaseGate(capture_error.clone());
         let ready_gate = capture_ready.clone();
         let error_gate = capture_error.clone();
-        let expected_commit = capture_result.to_string();
+        let expected_commit = capture_commit.as_str().to_owned();
         let worker = scope.spawn(move || {
             let before_copy_write = Box::new(move |commit: &archive::CommitOid, bytes: u64| {
                 if commit.as_str() == expected_commit && bytes == PRESSURE_BLOB_BYTES as u64 {
@@ -1334,7 +1334,7 @@ fn run_t45_capture_hydration_interleavings(disk: &mut OwnedImage) {
 
         match interleave_event(&event_rx) {
             InterleaveEvent::CaptureAtLargeBlob { commit, bytes } => {
-                assert_eq!(commit, capture_result.as_str());
+                assert_eq!(commit, capture_commit.as_str());
                 assert_eq!(bytes, PRESSURE_BLOB_BYTES as u64);
             }
             other => panic!("unexpected pre-pressure capture event {other:?}"),
@@ -1421,7 +1421,7 @@ fn run_t45_capture_hydration_interleavings(disk: &mut OwnedImage) {
         .connection()
         .query_row(
             "SELECT count(*) FROM retained_snapshots WHERE commit_oid = ?1",
-            [capture_result.as_str()],
+            [capture_commit.as_str()],
             |row| row.get(0),
         )
         .unwrap();
