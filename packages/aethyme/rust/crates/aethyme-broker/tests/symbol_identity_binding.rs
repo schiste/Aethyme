@@ -37,6 +37,7 @@ enum RecordScenario {
     Exact,
     CrossProject,
     SameClone,
+    CloneBindingMismatch,
     SourceMismatch,
     ProfileMismatch,
     OriginMismatch,
@@ -288,10 +289,10 @@ fn mapping_fixture_named(
     } else {
         RecordId::parse(PROFILE).unwrap()
     };
-    let right_clone_in_records = if matches!(scenario, RecordScenario::SameClone) {
-        left_clone.clone()
-    } else {
-        right_clone.clone()
+    let right_clone_in_records = match scenario {
+        RecordScenario::SameClone => left_clone.clone(),
+        RecordScenario::CloneBindingMismatch => rid("clone-c"),
+        _ => right_clone.clone(),
     };
     let right_source_id = if matches!(scenario, RecordScenario::SourceMismatch) {
         SourceSnapshot::new(std::iter::empty::<SourceEntry>())
@@ -430,8 +431,18 @@ fn mapping_fixture_named(
             right_origin_id.as_str()
         }
     });
-    let (mapping, mapping_bytes) = canonical_record(mapping_value);
-    let mapping_id = record_id(&mapping);
+    let (mapping_id, mapping_bytes) = if matches!(
+        scenario,
+        RecordScenario::SameClone | RecordScenario::AliasedOrigin
+    ) {
+        (
+            rid("invalid mapping record"),
+            serde_json::to_vec(&mapping_value).unwrap(),
+        )
+    } else {
+        let (mapping, bytes) = canonical_record(mapping_value);
+        (record_id(&mapping), bytes)
+    };
     let mut origin_ids = [left_origin_id, right_origin_id];
     origin_ids.sort();
     let (_claim, claim_bytes) = canonical_record(json!({
@@ -596,14 +607,18 @@ fn mismatched_or_incomplete_mapping_records_never_establish() {
     let clones = actual_clones();
     for (scenario, expected) in [
         (RecordScenario::CrossProject, "binding_scope_mismatch"),
-        (RecordScenario::SameClone, "captured_clone_binding_mismatch"),
+        (RecordScenario::SameClone, "invalid_evidence_record"),
+        (
+            RecordScenario::CloneBindingMismatch,
+            "captured_clone_binding_mismatch",
+        ),
         (RecordScenario::SourceMismatch, "captured_clone_binding_mismatch"),
         (RecordScenario::ProfileMismatch, "captured_clone_binding_mismatch"),
         (RecordScenario::OriginMismatch, "origin_binding_mismatch"),
         (RecordScenario::MalformedNodeId, "symbol_scope_mismatch"),
         (RecordScenario::WrongNodeIdRepo, "symbol_scope_mismatch"),
         (RecordScenario::UnknownScope, "symbol_scope_mismatch"),
-        (RecordScenario::AliasedOrigin, "evidence_set_not_exact"),
+        (RecordScenario::AliasedOrigin, "invalid_evidence_record"),
         (
             RecordScenario::ExternalPackageVersionMismatch,
             "cross_version_mapping_unproven",
@@ -620,6 +635,25 @@ fn mismatched_or_incomplete_mapping_records_never_establish() {
 
     let fixture = mapping_fixture(&clones, RecordScenario::Exact);
     let records: Vec<&[u8]> = fixture.records.iter().map(Vec::as_slice).collect();
+    let right_observation = decode_symbol_identity_record(&fixture.records[2]).unwrap();
+    let right_observation_id = right_observation.id();
+    let mut wrong_evidence_claim: Value = serde_json::from_slice(&fixture.claim).unwrap();
+    let first_origin = wrong_evidence_claim["evidence"][0]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let mut wrong_evidence_refs = [
+        first_origin,
+        right_observation_id.as_str().to_owned(),
+    ];
+    wrong_evidence_refs.sort();
+    wrong_evidence_claim["evidence"] = json!(wrong_evidence_refs);
+    let wrong_evidence_claim = serde_json::to_vec(&wrong_evidence_claim).unwrap();
+    assert!(matches!(
+        resolve_within_binding(&fixture.binding, &wrong_evidence_claim, &records),
+        MappingResolution::Unknown("evidence_set_not_exact")
+    ));
+
     let malformed: &[u8] = b"not-json";
     assert!(matches!(
         resolve_within_binding(&fixture.binding, &fixture.claim, &[malformed]),
