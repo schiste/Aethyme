@@ -361,6 +361,50 @@ impl BuildObservation {
         self.exit
     }
 }
+
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct BuildObservationWitness {
+    pub(crate) kind: BuildObservationWitnessKind,
+    pub(crate) run_id: String,
+    pub(crate) outcome: Option<Outcome>,
+    pub(crate) exit_code: Option<i32>,
+    pub(crate) detail: Option<String>,
+    pub(crate) artifact_present: bool,
+}
+
+#[cfg(test)]
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum BuildObservationWitnessKind {
+    Observation,
+    Error,
+}
+
+#[cfg(test)]
+impl BuildObservationWitness {
+    fn capture(result: &Result<BuildObservation, SupervisorError>, run_id: &str) -> Self {
+        let bounded = |text: &str| text.chars().take(512).collect();
+        match result {
+            Ok(observation) => Self {
+                kind: BuildObservationWitnessKind::Observation,
+                run_id: run_id.to_owned(),
+                outcome: Some(observation.outcome()),
+                exit_code: observation.exit_code(),
+                detail: observation.detail().map(bounded),
+                artifact_present: observation.artifact().is_some(),
+            },
+            Err(error) => Self {
+                kind: BuildObservationWitnessKind::Error,
+                run_id: run_id.to_owned(),
+                outcome: None,
+                exit_code: None,
+                detail: Some(bounded(&error.to_string())),
+                artifact_present: false,
+            },
+        }
+    }
+}
+
 fn active(
     store: &CollaborationStore,
     owner: &ControllerOwner,
@@ -385,6 +429,46 @@ impl DockerExecutor {
         attempt: &crate::local_budget::Attempt,
         cancel: &AtomicBool,
     ) -> Result<BuildObservation, SupervisorError> {
+        self.build_with_pre_finish_observer(store, owner, execution, attempt, cancel, |_, _| {})
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_build_with_pre_finish_observer(
+        &self,
+        store: &mut CollaborationStore,
+        owner: &ControllerOwner,
+        execution: &ExecutionSnapshot,
+        attempt: &crate::local_budget::Attempt,
+        cancel: &AtomicBool,
+        witness: std::sync::mpsc::SyncSender<BuildObservationWitness>,
+    ) -> Result<BuildObservation, SupervisorError> {
+        self.build_with_pre_finish_observer(
+            store,
+            owner,
+            execution,
+            attempt,
+            cancel,
+            move |result, run_id| {
+                witness
+                    .send(BuildObservationWitness::capture(result, run_id))
+                    .unwrap_or(());
+            },
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_with_pre_finish_observer<F>(
+        &self,
+        store: &mut CollaborationStore,
+        owner: &ControllerOwner,
+        execution: &ExecutionSnapshot,
+        attempt: &crate::local_budget::Attempt,
+        cancel: &AtomicBool,
+        before_finish: F,
+    ) -> Result<BuildObservation, SupervisorError>
+    where
+        F: FnOnce(&Result<BuildObservation, SupervisorError>, &str),
+    {
         active(store, owner, execution)?;
         let policy = self.resource_policy()?;
         let generation: String = store
@@ -418,6 +502,7 @@ impl DockerExecutor {
             .all(|object| object.removed && object.id.is_some())
         {
             run.cleaned()?;
+            before_finish(&result, &run.journal.run);
             run.finish(
                 store,
                 owner,
