@@ -1,0 +1,20 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.78s
+     Running unittests src/lib.rs (target/local-resume/cargo/debug/deps/aethyme_broker-20bbfe5c0b2dd5c0)
+
+running 1 test
+test local_controller::drive::tests::actual_appointed_driver_completes_without_a_manufactured_receipt ... Controller actual native recovery root /var/folders/f2/krjzd4c15nn491pm37zrkp1h0000gn/T/.tmpChoQUm
+Controller retained source host /var/folders/f2/krjzd4c15nn491pm37zrkp1h0000gn/T/.tmpozyQuc, repository /var/folders/f2/krjzd4c15nn491pm37zrkp1h0000gn/T/.tmpyYgg9Z
+
+thread 'local_controller::drive::tests::actual_appointed_driver_completes_without_a_manufactured_receipt' (20078892) panicked at crates/aethyme-broker/src/local_controller/drive_tests.rs:329:5:
+timed service waits for the later durable arrival without redispatch
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+
+failures:
+    local_controller::drive::tests::actual_appointed_driver_completes_without_a_manufactured_receipt
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1793 filtered out; finished in 219.23s
+
+error: test failed, to rerun pass `-p aethyme-broker --lib`

@@ -1,0 +1,61 @@
+{
+  "original_sha256": "504c98fdaed40777a21bf1b4c3abdf5cfdaedf40e3c736925be1033d5b8b6831",
+  "restored": true,
+  "mutations": [
+    {
+      "name": "unknown-dispatch-status",
+      "test": "local_controller::drive::tests::only_known_successful_publication_dispatch_can_reach_qualification",
+      "argv": [
+        "cargo",
+        "test",
+        "--locked",
+        "-j",
+        "4",
+        "--manifest-path",
+        "packages/aethyme/rust/Cargo.toml",
+        "-p",
+        "aethyme-broker",
+        "--lib",
+        "local_controller::drive::tests::only_known_successful_publication_dispatch_can_reach_qualification",
+        "--",
+        "--exact",
+        "--test-threads=1",
+        "--nocapture"
+      ],
+      "exit_status": 101,
+      "wall_seconds": 472.009,
+      "credited": true,
+      "log_sha256": "8d7c12a1cd901e8408f34392c408ab0ebbde6134b2d35d85fc9625921dc1a4b0",
+      "log_bytes": 1174,
+      "source_sha256": "07b651d8955df36ce611b23acaf7e6604a9f9c34326cb8431d2db41065c2a02f"
+    },
+    {
+      "name": "missing-publication-observation",
+      "test": "local_controller::drive::tests::actual_appointed_driver_completes_without_a_manufactured_receipt",
+      "argv": [
+        "cargo",
+        "test",
+        "--locked",
+        "-j",
+        "4",
+        "--manifest-path",
+        "packages/aethyme/rust/Cargo.toml",
+        "-p",
+        "aethyme-broker",
+        "--lib",
+        "local_controller::drive::tests::actual_appointed_driver_completes_without_a_manufactured_receipt",
+        "--",
+        "--exact",
+        "--test-threads=1",
+        "--nocapture",
+        "--ignored"
+      ],
+      "exit_status": 101,
+      "wall_seconds": 550.976,
+      "credited": true,
+      "log_sha256": "d9987fa9c0a013b069c4386f55653e67d2359902cf5c35460434ed3090286a7c",
+      "log_bytes": 1565,
+      "source_sha256": "38485cb6f06da9d1e7f236ba23c7757dcce099334395fff3d5c70fa5344d036e"
+    }
+  ]
+}
