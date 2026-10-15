@@ -1,0 +1,57 @@
+MUTATION_RUNNER_SHA256=b78af5398d30f7302854271b4228648e4cc30e8c66c4593759622ce7c9d7f1f3
+MUTATOR_SHA256=0b2e660db3c4b5bf39faada40c15205768cfa23e08b8cad54f011417a9cd0d8a
+MUTANT=m4-release-dispatching-unknown-roots
+TEST_FILTER=dispatching_and_unknown_jobs_stay_rooted_without_a_process_tree_proof
+SOURCE=/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/reconcile-retention-of-inactive-native-g/packages/aethyme/rust/crates/aethyme-broker/src/native_gates.rs
+ORIGINAL_SHA256=e17607f4b349556be3eb38651e8bd270087c84d3023c7b767b3308293aa838b5
+MUTATION_BACKUP=/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/reconcile-retention-of-inactive-native-g/target/local-resume/mutation-backups/m4-release-dispatching-unknown-roots.7vJKeT
+ORIGINAL_SHA256=e17607f4b349556be3eb38651e8bd270087c84d3023c7b767b3308293aa838b5
+MUTANT_SHA256=d755b651893413bd28221bc75acdc000138c9b725943acf393ad799056b603af
+APPLIED_SHA256=d755b651893413bd28221bc75acdc000138c9b725943acf393ad799056b603af
+DIFF_BEGIN
+--- /Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/reconcile-retention-of-inactive-native-g/target/local-resume/mutation-backups/m4-release-dispatching-unknown-roots.7vJKeT	2026-10-15 12:48:30
++++ /Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/reconcile-retention-of-inactive-native-g/packages/aethyme/rust/crates/aethyme-broker/src/native_gates.rs	2026-10-15 15:49:09
+@@ -345,7 +345,13 @@
+                 }
+                 RootReleaseStatus::Released
+             }
+-            "dispatching" | "unknown" => RootReleaseStatus::UnknownHeld,
++            "dispatching" | "unknown" => {
++                tx.execute(
++                    "UPDATE local_native_gate_jobs SET roots_released_ms=0 WHERE id=?1 AND roots_released_ms IS NULL",
++                    [key.as_str()],
++                )?;
++                RootReleaseStatus::Released
++            }
+             _ => return Err(NativeGateError::Mismatch),
+         }
+     };
+DIFF_END
+MUTANT_SOURCE_SHA256=d755b651893413bd28221bc75acdc000138c9b725943acf393ad799056b603af
+CARGO_LOG_PATH=/Volumes/T7-repositories/Application Support/Aethyme/qualification/local-check-temporaries/native-guard-m4-release-dispatching-unknown-roots-tmp-v0lda3qc/native-retention-m4-release-dispatching-unknown-roots-cargo.1vknd3
+CARGO_EXIT=101
+   Compiling aethyme-broker v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/reconcile-retention-of-inactive-native-g/packages/aethyme/rust/crates/aethyme-broker)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 22.59s
+     Running unittests src/lib.rs (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/integrate-reviewed-local-bare-git-servic/target/local-resume/cargo/debug/deps/aethyme_broker-0f278e0d02146111)
+
+running 1 test
+test native_gates::tests::dispatching_and_unknown_jobs_stay_rooted_without_a_process_tree_proof ... 
+thread 'native_gates::tests::dispatching_and_unknown_jobs_stay_rooted_without_a_process_tree_proof' (510101) panicked at crates/aethyme-broker/src/native_gates/tests.rs:845:9:
+assertion `left == right` failed
+  left: Released
+ right: UnknownHeld
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+
+failures:
+    native_gates::tests::dispatching_and_unknown_jobs_stay_rooted_without_a_process_tree_proof
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1819 filtered out; finished in 21.44s
+
+error: test failed, to rerun pass `-p aethyme-broker --lib`
+NAMED_ASSERTION_FAILURE_CONFIRMED=native_gates::tests::dispatching_and_unknown_jobs_stay_rooted_without_a_process_tree_proof
+RESTORED_SHA256=e17607f4b349556be3eb38651e8bd270087c84d3023c7b767b3308293aa838b5
+BACKUP_PATH=/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/reconcile-retention-of-inactive-native-g/target/local-resume/mutation-backups/m4-release-dispatching-unknown-roots.7vJKeT
+BACKUP_SHA256=e17607f4b349556be3eb38651e8bd270087c84d3023c7b767b3308293aa838b5

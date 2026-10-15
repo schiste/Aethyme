@@ -1,0 +1,46 @@
+{
+  "schema": "aethyme.local-check/v1",
+  "state": "complete",
+  "started_at_utc": "2026-10-15T10:40:55.101816+00:00",
+  "command": [
+    "/usr/bin/caffeinate",
+    "-i",
+    "/Users/christophehenner/.cargo/bin/cargo",
+    "test",
+    "--locked",
+    "-j4",
+    "-p",
+    "aethyme-broker",
+    "--lib",
+    "native_gates::",
+    "--",
+    "--nocapture"
+  ],
+  "working_directory": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/reconcile-retention-of-inactive-native-g/packages/aethyme/rust",
+  "environment": {
+    "PATH": "/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/christophehenner/.cargo/bin",
+    "RUSTC_WRAPPER": "",
+    "CARGO_TARGET_DIR": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/integrate-reviewed-local-bare-git-servic/target/local-resume/cargo"
+  },
+  "source_before": {
+    "head": "346001298a2db1467b2807610dd04006f4b76889",
+    "tree": "d758e054309073ef99deb46360e362de98fb2271",
+    "status": "",
+    "diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  "exit_code": 101,
+  "wall_seconds": 197.643,
+  "finished_at_utc": "2026-10-15T10:44:12.806987+00:00",
+  "source_after": {
+    "head": "346001298a2db1467b2807610dd04006f4b76889",
+    "tree": "d758e054309073ef99deb46360e362de98fb2271",
+    "status": "",
+    "diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  "log": {
+    "path": "target/local-resume/final-integration-20261015T104055Z/native-gates-all.log",
+    "bytes": 4362,
+    "sha256": "421db81263b95501477ac23084cae46b2c6d012c67500f83e3d9fbaac04e0892"
+  },
+  "source_unchanged": true
+}

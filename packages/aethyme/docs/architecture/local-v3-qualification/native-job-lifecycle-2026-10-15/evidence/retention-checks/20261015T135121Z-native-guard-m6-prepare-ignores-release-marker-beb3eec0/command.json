@@ -1,0 +1,85 @@
+{
+  "argv": [
+    "/bin/bash",
+    "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/reconcile-retention-of-inactive-native-g/target/local-resume/run-native-retention-guard-mutation.sh",
+    "m6-prepare-ignores-released-marker",
+    "released_prepared_job_remains_readable_but_cannot_be_dispatched_or_replayed"
+  ],
+  "duration_seconds": 59.261809,
+  "ended_at_utc": "2026-10-15T13:52:20.537787Z",
+  "environment": {
+    "explicit_profile_keys": [],
+    "values": {
+      "CARGO_BUILD_JOBS": "4",
+      "CARGO_TARGET_DIR": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/integrate-reviewed-local-bare-git-servic/target/local-resume/cargo",
+      "PATH": "/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/christophehenner/.cargo/bin",
+      "TMPDIR": "/Volumes/T7-repositories/Application Support/Aethyme/qualification/local-check-temporaries/native-guard-m6-prepare-ignores-release-marker-tmp-pmyf5ggg"
+    }
+  },
+  "execution_context": {
+    "host": {
+      "hostname": "Mac.lan",
+      "machine": "arm64",
+      "platform": "macOS-27.2-arm64-arm-64bit-Mach-O",
+      "python": "3.14.7 (main, Aug  5 2026, 10:29:49) [Clang 17.0.0 (clang-1700.6.4.2)]"
+    },
+    "tmp_volume": {
+      "free_bytes_before": 103705313280,
+      "path": "/Volumes/T7-repositories/Application Support/Aethyme/qualification/local-check-temporaries",
+      "total_bytes": 899994554368
+    },
+    "tool_versions": {
+      "aethyme": {
+        "executable": "/Users/christophehenner/.cargo/bin/aethyme",
+        "exit_code": 0,
+        "version": "aethyme 0.8.26 (v0.8.26 build_commit=5e8daf712e26c63f1d4082e9a617f556cf995de2) build_date=2026-10-08T19:30:03Z"
+      },
+      "cargo": {
+        "executable": "/Users/christophehenner/.cargo/bin/cargo",
+        "exit_code": 0,
+        "version": "cargo 1.96.0 (30a34c682 2026-05-25)"
+      },
+      "git": {
+        "executable": "/opt/homebrew/bin/git",
+        "exit_code": 0,
+        "version": "git version 2.55.0"
+      },
+      "rustc": {
+        "executable": "/Users/christophehenner/.cargo/bin/rustc",
+        "exit_code": 0,
+        "version": "rustc 1.96.0 (ac68faa20 2026-05-25)"
+      }
+    }
+  },
+  "label": "native-guard-m6-prepare-ignores-release-marker",
+  "launcher_error": null,
+  "log_bytes": 4208,
+  "log_path": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/reconcile-retention-of-inactive-native-g/target/local-resume/retention-checks/20261015T135121Z-native-guard-m6-prepare-ignores-release-marker-beb3eec0/command.log",
+  "log_sha256": "0b5fd4b60d5a37f530d7502076c3defccc00acfaa3058a76b1be77d2ecf97c38",
+  "numeric_exit": 101,
+  "root": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/reconcile-retention-of-inactive-native-g",
+  "schema": "aethyme.local-check/v1",
+  "source_after": {
+    "diff_sha256": "cae12d642517bdf0215aaf9fa6a2aa6910cd32ee01ac46e08dea122d83c3c023",
+    "head": "d52bc0a514fc5035fe143b97208a9e328f6a5d8e",
+    "status": " M packages/aethyme/docs/architecture/local-v3-qualification/native-job-lifecycle-2026-10-15/ledger.json\n",
+    "tree": "8840983777e2bc46dac1a2b5c748935955cb7be6",
+    "untracked_content_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  "source_before": {
+    "diff_sha256": "cae12d642517bdf0215aaf9fa6a2aa6910cd32ee01ac46e08dea122d83c3c023",
+    "head": "d52bc0a514fc5035fe143b97208a9e328f6a5d8e",
+    "status": " M packages/aethyme/docs/architecture/local-v3-qualification/native-job-lifecycle-2026-10-15/ledger.json\n",
+    "tree": "8840983777e2bc46dac1a2b5c748935955cb7be6",
+    "untracked_content_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  "source_unchanged": true,
+  "started_at_utc": "2026-10-15T13:51:21.334954Z",
+  "state": "completed",
+  "status_bytes": 4,
+  "status_path": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/reconcile-retention-of-inactive-native-g/target/local-resume/retention-checks/20261015T135121Z-native-guard-m6-prepare-ignores-release-marker-beb3eec0/command.status",
+  "status_sha256": "39b8dc3fc8b44765c8e6f1adee04c5b465e555ab791cc42d0d9e810d5b64297c",
+  "termination_signal": null,
+  "tmpdir": "/Volumes/T7-repositories/Application Support/Aethyme/qualification/local-check-temporaries/native-guard-m6-prepare-ignores-release-marker-tmp-pmyf5ggg",
+  "working_directory": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/reconcile-retention-of-inactive-native-g/packages/aethyme/rust"
+}

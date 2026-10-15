@@ -1,0 +1,48 @@
+   Compiling aethyme-engine v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/reconcile-retention-of-inactive-native-g/packages/aethyme/rust/crates/aethyme-engine)
+   Compiling aethyme-broker v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/reconcile-retention-of-inactive-native-g/packages/aethyme/rust/crates/aethyme-broker)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1m 12s
+     Running unittests src/lib.rs (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/integrate-reviewed-local-bare-git-servic/target/local-resume/cargo/debug/deps/aethyme_broker-0f278e0d02146111)
+
+running 15 tests
+test native_gates::tests::checkout_placement_refuses_upward_project_discovery ... ok
+test native_gates::tests::physical_subject_includes_mode_symlink_target_and_untracked_source ... ok
+test native_gates::tests::a_dispatched_job_reopens_unknown_without_any_retry has been running for over 60 seconds
+test native_gates::tests::actual_composer_candidate_runs_native_gates_without_legacy_queue_or_ref_writes has been running for over 60 seconds
+test native_gates::tests::budget_capacity_and_requirement_holds_do_not_dispatch_prepared_jobs has been running for over 60 seconds
+test native_gates::tests::completed_job_release_survives_real_gc_and_reopened_status_reads has been running for over 60 seconds
+test native_gates::tests::corrupt_projected_job_identity_and_source_binding_refuse_before_dispatch has been running for over 60 seconds
+test native_gates::tests::dispatching_and_unknown_jobs_stay_rooted_without_a_process_tree_proof has been running for over 60 seconds
+test native_gates::tests::fresh_dispatch_refuses_a_job_completed_after_the_callers_snapshot has been running for over 60 seconds
+test native_gates::tests::native_gate_roots_survive_revision_root_release has been running for over 60 seconds
+test native_gates::tests::no_gate_configuration_is_explicitly_not_verification has been running for over 60 seconds
+test native_gates::tests::prepared_job_cannot_borrow_another_repository_trust_or_survive_revocation has been running for over 60 seconds
+
+thread 'native_gates::tests::dispatching_and_unknown_jobs_stay_rooted_without_a_process_tree_proof' (26278162) panicked at crates/aethyme-broker/src/native_gates/tests.rs:620:5:
+assertion failed: dispatching_plan.entities.is_empty()
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test native_gates::tests::native_gate_roots_survive_revision_root_release ... ok
+test native_gates::tests::a_dispatched_job_reopens_unknown_without_any_retry ... ok
+test native_gates::tests::dispatching_and_unknown_jobs_stay_rooted_without_a_process_tree_proof ... FAILED
+test native_gates::tests::corrupt_projected_job_identity_and_source_binding_refuse_before_dispatch ... ok
+test native_gates::tests::fresh_dispatch_refuses_a_job_completed_after_the_callers_snapshot ... ok
+test native_gates::tests::no_gate_configuration_is_explicitly_not_verification ... ok
+gate retained-features started (cost 0, tree 1e128ff5b7d8)
+gate retained-features started (cost 0, tree 1e128ff5b7d8)
+gate retained-features pass in 0s (tree 1e128ff5b7d8) at load 1m 15.0/10 cpus
+gate retained-features pass in 0s (tree 1e128ff5b7d8) at load 1m 15.0/10 cpus
+test native_gates::tests::actual_composer_candidate_runs_native_gates_without_legacy_queue_or_ref_writes ... ok
+test native_gates::tests::completed_job_release_survives_real_gc_and_reopened_status_reads ... ok
+test native_gates::tests::prepared_job_cannot_borrow_another_repository_trust_or_survive_revocation ... ok
+test native_gates::tests::released_prepared_job_remains_readable_but_cannot_be_dispatched_or_replayed ... ok
+test native_gates::tests::root_release_waits_for_an_in_progress_gc_generation ... ok
+test native_gates::tests::stale_owner_cannot_release_but_current_owner_can_release_old_epoch_history ... ok
+test native_gates::tests::budget_capacity_and_requirement_holds_do_not_dispatch_prepared_jobs ... ok
+
+failures:
+
+failures:
+    native_gates::tests::dispatching_and_unknown_jobs_stay_rooted_without_a_process_tree_proof
+
+test result: FAILED. 14 passed; 1 failed; 0 ignored; 0 measured; 1805 filtered out; finished in 124.11s
+
+error: test failed, to rerun pass `-p aethyme-broker --lib`
