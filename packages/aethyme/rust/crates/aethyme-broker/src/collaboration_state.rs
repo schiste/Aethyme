@@ -37,7 +37,7 @@ use serde::Serialize;
 pub use crate::host_state::HostStateSource;
 
 /// The schema this binary writes.
-pub const COLLABORATION_STATE_SCHEMA_VERSION: i64 = 24;
+pub const COLLABORATION_STATE_SCHEMA_VERSION: i64 = 25;
 /// The oldest schema a database written by this binary can be read by.
 /// Unlike `host-operations.db`, a newer database stays readable by an older
 /// binary until a release raises this floor.
@@ -65,7 +65,9 @@ pub const COLLABORATION_STATE_SCHEMA_VERSION: i64 = 24;
 // Schema 22 cannot interpret explicit native-job root release.
 // Schema 23 does not honor the permanent sensitive-response tombstone and
 // could read, recapture, or export data after administrative removal.
-const MIN_COMPATIBLE_SCHEMA: i64 = 24;
+// Schema 24 does not consume retained-capture notices at the appointed owner
+// tick and could run a target while an accepted notice remains queued.
+const MIN_COMPATIBLE_SCHEMA: i64 = 25;
 const ROOT_DIRECTORY: &str = "collaboration";
 /// Schema steps after the version 1 layout (`meta` only), applied in
 /// order. Step 17 adds separately indexed historical imports and rehearsals. The floor is
@@ -614,6 +616,37 @@ const MIGRATIONS: &[(i64, &str)] = &[
     WHEN OLD.database_cleanup_completed_ms IS NOT NULL
         OR NEW.database_cleanup_completed_ms IS NULL
     BEGIN SELECT RAISE(ABORT, 'sensitive-response database cleanup receipt is immutable'); END;"),
+    (25, "CREATE TABLE local_capture_notices (
+        notice_id TEXT PRIMARY KEY NOT NULL,
+        target TEXT NOT NULL REFERENCES local_targets(target),
+        revision TEXT NOT NULL REFERENCES local_target_revisions(revision),
+        operation_id TEXT NOT NULL REFERENCES capture_operations(operation_id),
+        alias TEXT NOT NULL,
+        lineage_record_id TEXT NOT NULL,
+        receipt_record_id TEXT NOT NULL,
+        authority_epoch TEXT NOT NULL,
+        base_snapshot TEXT NOT NULL,
+        base_commit TEXT NOT NULL,
+        result_snapshot TEXT NOT NULL,
+        result_commit TEXT NOT NULL,
+        received_ms INTEGER NOT NULL CHECK(received_ms >= 0),
+        body BLOB NOT NULL,
+        UNIQUE(target,revision,operation_id,alias,authority_epoch)
+    ) STRICT;
+    CREATE INDEX local_capture_notices_pending
+        ON local_capture_notices(target,received_ms,notice_id);
+    CREATE TABLE local_capture_notice_outcomes (
+        notice_id TEXT PRIMARY KEY NOT NULL REFERENCES local_capture_notices(notice_id),
+        status TEXT NOT NULL CHECK(status IN ('pending','available','stale')),
+        detail TEXT,
+        changed_ms INTEGER NOT NULL CHECK(changed_ms >= 0)
+    ) STRICT;
+    CREATE TRIGGER local_capture_notice_outcome_monotone
+    BEFORE UPDATE OF status ON local_capture_notice_outcomes
+    WHEN NOT ((OLD.status='pending' AND NEW.status IN ('pending','available','stale')) OR
+        (OLD.status='available' AND NEW.status='available') OR
+        (OLD.status='stale' AND NEW.status='stale'))
+    BEGIN SELECT RAISE(ABORT, 'capture notice outcome cannot be reopened'); END;"),
 ];
 /// The file that marks a directory as a collaboration root.
 pub const ROOT_MARKER: &str = ".aethyme-collaboration-root.json";

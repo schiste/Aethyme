@@ -1,15 +1,18 @@
 //! Independent offline CLI assertions (#672), checked outside candidate authority.
 //! The first profile observes sealed executable artifacts through fresh sandbox
 //! invocations. Uploaded descriptors/result files never create TrustedEvidence.
-use crate::collaboration_archive::{self as archive, ObjectDigest};
+use crate::collaboration_archive::{self as archive, CommitOid, ObjectDigest};
+use crate::collaboration_capture::{self as capture, CaptureReceipt, OperationId};
 use crate::collaboration_state::CollaborationStore;
 use crate::execution_snapshot::{self as snapshot, CommandSpec, ExecutionSnapshot};
 use crate::execution_supervisor::{DockerExecutor, SealedArtifact, SupervisorError};
 use crate::local_target::{self as target, ControllerOwner};
+use aethyme_contracts::experimental_v0::source_snapshot::{EntryKind, SourceSnapshotId};
 use aethyme_contracts::experimental_v0::{FieldKind, FieldSpec, Record, RecordId, RecordSchema};
 use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 pub const PROFILE: &str = "aethyme.verify.offline-cli/provisional-v0";
@@ -60,6 +63,8 @@ pub enum VerificationError {
     Unfulfilled,
     #[error("verification catalogue changed")]
     Stale,
+    #[error("verifier harness capture is incomplete ({code}): {detail}")]
+    CaptureIncomplete { code: String, detail: String },
     #[error(transparent)]
     Supervisor(#[from] SupervisorError),
     #[error(transparent)]
@@ -72,6 +77,10 @@ pub enum VerificationError {
     Target(#[from] target::TargetError),
     #[error(transparent)]
     Archive(#[from] archive::ArchiveError),
+    #[error(transparent)]
+    Capture(#[from] capture::CaptureError),
+    #[error(transparent)]
+    Sensitive(#[from] crate::collaboration_sensitive::SensitiveError),
     #[error(transparent)]
     Sqlite(#[from] rusqlite::Error),
     #[error(transparent)]
@@ -211,6 +220,110 @@ pub struct VerifierPolicy {
     pub command: CommandSpec,
     pub max_age_ms: u64,
 }
+
+/// Inputs that can be chosen before the retained harness and canonical
+/// inventory identities are known. The runtime profile is derived from the
+/// explicitly probed Docker endpoint; the profile name is fixed by this
+/// adapter rather than accepted from an operator file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VerifierPlan {
+    pub image: String,
+    pub command: CommandSpec,
+    pub max_age_ms: u64,
+}
+
+/// Durable result of preparing a verifier policy. The capture receipt roots
+/// the exact harness tree until the selected target revision takes its own
+/// root during configure/freeze.
+#[derive(Debug, Clone)]
+pub struct PreparedVerifier {
+    pub policy: VerifierPolicy,
+    pub policy_id: RecordId,
+    pub runtime: crate::execution_supervisor::RuntimeDescription,
+    pub capture: CaptureReceipt,
+    pub inventory_cases: usize,
+    pub inventory_sha256: String,
+}
+
+/// Retain and bind an exact offline verifier input set before target proposal.
+/// The caller supplies a full Git commit and the canonical literal inventory
+/// bytes. This command creates a durable capture root, but grants no producer
+/// authority and starts no workload.
+pub fn prepare(
+    store: &mut CollaborationStore,
+    operation_id: OperationId,
+    harness_repository: &Path,
+    harness_commit: &str,
+    inventory_bytes: &[u8],
+    plan: VerifierPlan,
+    docker_cli: PathBuf,
+    endpoint: &str,
+) -> Result<PreparedVerifier, VerificationError> {
+    let _response = crate::collaboration_sensitive::response_use(store)?;
+    let inventory = AssertionInventory::decode(inventory_bytes)?;
+    let commit = CommitOid::parse(harness_commit).map_err(|_| VerificationError::Mismatch)?;
+    let pinned = archive::pin_commit(harness_repository, commit.as_str())?;
+    if pinned != commit {
+        return Err(VerificationError::Mismatch);
+    }
+    let source = archive::snapshot_of_commit(harness_repository, &commit)?;
+    let inventory_entry = source
+        .entries()
+        .iter()
+        .find(|entry| entry.path() == b"harness/inventory.json")
+        .ok_or(VerificationError::Mismatch)?;
+    if inventory_entry.kind() != EntryKind::Regular
+        || inventory_entry.content_sha256() != &ObjectDigest::of(inventory_bytes).raw()
+    {
+        return Err(VerificationError::Mismatch);
+    }
+
+    let executor = DockerExecutor::probe_at(docker_cli, endpoint)?;
+    let runtime = executor.runtime().clone();
+    let harness_id = source.id();
+    let policy = VerifierPolicy {
+        profile: PROFILE.into(),
+        runtime: runtime.id(),
+        image: plan.image,
+        harness: harness_id.as_str().into(),
+        inventory: inventory.id().as_str().into(),
+        command: plan.command,
+        max_age_ms: plan.max_age_ms,
+    };
+    let policy_record = policy.record()?;
+
+    let request = capture::CaptureRequest {
+        operation_id,
+        repository: harness_repository.to_path_buf(),
+        base: commit.clone(),
+        result: commit,
+        policy: capture::CapturePolicy::Required,
+        retention: capture::RetentionBoundary::UntilReleased,
+    };
+    let receipt = match capture::capture(store, &request)? {
+        capture::CaptureOutcome::Acknowledged(receipt) => receipt,
+        capture::CaptureOutcome::Incomplete { code, detail, .. } => {
+            return Err(VerificationError::CaptureIncomplete { code, detail });
+        }
+    };
+    if receipt.status != "retained_local"
+        || receipt.retention != capture::RetentionBoundary::UntilReleased
+        || receipt.base != harness_id
+        || receipt.result != harness_id
+    {
+        return Err(VerificationError::Mismatch);
+    }
+
+    Ok(PreparedVerifier {
+        policy,
+        policy_id: policy_record.id(),
+        runtime,
+        capture: receipt,
+        inventory_cases: inventory.cases().len(),
+        inventory_sha256: ObjectDigest::of(inventory_bytes).hex(),
+    })
+}
 impl VerifierPolicy {
     pub fn record(&self) -> Result<Record, VerificationError> {
         if self.profile != PROFILE
@@ -282,6 +395,40 @@ fn valid_name(value: &str) -> bool {
             .bytes()
             .all(|c| c.is_ascii_alphanumeric() || b"-_.".contains(&c))
 }
+
+/// Re-open the exact retained verifier source and its canonical literal
+/// inventory. A syntactically valid policy cannot appoint an unretained or
+/// mismatched harness.
+fn retained_harness_inventory(
+    store: &CollaborationStore,
+    policy: &VerifierPolicy,
+) -> Result<SourceSnapshotId, VerificationError> {
+    let harness =
+        SourceSnapshotId::parse(&policy.harness).map_err(|_| VerificationError::Mismatch)?;
+    if archive::retained(store, &harness)?.is_none() {
+        return Err(VerificationError::Mismatch);
+    }
+    let manifest_bytes = archive::read_object(store, &ObjectDigest::of_snapshot(&harness))?;
+    let source = archive::parse_manifest(&manifest_bytes).ok_or(VerificationError::Mismatch)?;
+    if source.id() != harness || source.manifest_bytes() != manifest_bytes {
+        return Err(VerificationError::Mismatch);
+    }
+    let entry = source
+        .entries()
+        .iter()
+        .find(|entry| entry.path() == b"harness/inventory.json")
+        .ok_or(VerificationError::Mismatch)?;
+    if entry.kind() != EntryKind::Regular {
+        return Err(VerificationError::Mismatch);
+    }
+    let bytes = archive::read_object(store, &ObjectDigest::from_bytes(*entry.content_sha256()))?;
+    let inventory = AssertionInventory::decode(&bytes)?;
+    if inventory.id().as_str() != policy.inventory {
+        return Err(VerificationError::Mismatch);
+    }
+    Ok(harness)
+}
+
 /// Trusted local operator entry. Compare-and-swap rotation prevents a lost
 /// response or stale configurator from silently reviving revoked authority.
 pub fn configure(
@@ -291,6 +438,7 @@ pub fn configure(
     expected: Option<i64>,
     policy: VerifierPolicy,
 ) -> Result<ProducerPermit, VerificationError> {
+    let _response = crate::collaboration_sensitive::response_use(store)?;
     let _authority = target::authorize(store, owner)?;
     if !valid_name(producer) {
         return Err(VerificationError::Producer);
@@ -305,8 +453,9 @@ pub fn configure(
         return Err(VerificationError::Mismatch);
     }
     let _archive = crate::collaboration_gc::archive_use(store)?;
+    let harness = retained_harness_inventory(store, &policy)?;
     let physical = archive::put_object(store, &record.canonical_bytes())?;
-    target::retain_artifacts(store, owner, &revision, &[], &[physical])?;
+    target::retain_artifacts(store, owner, &revision, &[harness], &[physical])?;
     let tx = store
         .connection()
         .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;

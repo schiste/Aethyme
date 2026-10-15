@@ -133,6 +133,34 @@ Additional explicit lifecycle commands (provisional Local packages):
   aethyme collab target native-gates release --target NAME --issuer NAME --job ID [--json]
       Abandon a prepared job or release completed-job roots. Dispatching and
       unknown jobs remain held because process-tree inactivity is unproven.
+  aethyme collab target budget project --target NAME --issuer NAME --file PATH [--json]
+      Appoint the immutable project budget policy from a strict bounded file.
+  aethyme collab target budget objective --target NAME --issuer NAME --file PATH [--json]
+      Appoint the immutable cap for the current target objective authorization.
+  aethyme collab target budget status --target NAME --issuer NAME [--reservation ID] [--json]
+      Reconcile immutable policies, totals, and up to 500 newest reservation rows.
+      An exact reservation lookup is included even when older than that page.
+  aethyme collab target verifier prepare --harness-repo PATH --commit OID
+       --inventory PATH --operation ID --docker ABSOLUTE_PATH --endpoint UNIX_SOCKET
+       --file PLAN.json [--json]
+      Retain the exact harness commit and canonical inventory, derive the runtime
+      identity at the pinned Docker endpoint, and print the policy ID. This
+      configures no producer and dispatches no work.
+  aethyme collab target verifier configure --target NAME --issuer NAME
+       --producer NAME --expected-generation none|N --file POLICY.json [--json]
+      Appoint a producer by compare-and-swap after validating the retained roots.
+  aethyme collab target verifier status --target NAME --issuer NAME --producer NAME [--json]
+      Read appointment, authority, and selected-policy status; grants no dispatch.
+  aethyme collab target verifier revoke --target NAME --issuer NAME
+       --producer NAME --generation N [--json]
+      Revoke exactly the observed producer generation.
+  aethyme collab target capture-notice ingest --target NAME --issuer NAME
+       --revision ID --alias ALIAS --operation ID [--json]
+      Append an idempotent notice for an already retained selected contribution.
+      The owner tick revalidates it before wave admission; notice receipt alone
+      does not make the alias available.
+  aethyme collab target capture-notice list --target NAME [--limit 1..512] [--json]
+      Read notice outcomes for lost-response reconciliation.
   aethyme collab stop --epoch EPOCH --reason TEXT [--json]
       Freeze project ingress and rotate native authority. Running processes
       and external effects are not assumed cancelled; reconcile them.
@@ -164,6 +192,9 @@ Additional explicit lifecycle commands (provisional Local packages):
   aethyme collab target run (without --appointment) / sync / handoff dispatch
       Refused with unsupported_profile. No state or argument file is read.
       These commands require their own appointed native adapters.
+  aethyme collab target run status --target NAME --issuer NAME --appointment ID [--json]
+      Inspect one finite appointment after a lost response. Dispatching is
+      reported as unknown and never resumed or replayed.
 
 Exit codes: 0 done, 1 failed (I/O, database, Git, or an integrity failure
 such as a corrupt object or receipt), 2 usage, 3 refused (disabled, policy,
@@ -364,6 +395,17 @@ fn command_name(args: &[String]) -> String {
         "brief",
         "attach",
         "target",
+        "budget",
+        "verifier",
+        "prepare",
+        "configure",
+        "objective",
+        "project",
+        "capture-notice",
+        "ingest",
+        "list",
+        "revoke",
+        "policy-id",
         "native-gates",
         "propose",
         "select",
@@ -425,6 +467,31 @@ fn dispatch(options: Options) -> Result<Output, Failure> {
         ] => sensitive::command(&main_root, verb, rest),
         ["authority", "status", rest @ ..] => lifecycle::authority_status(&main_root, rest),
         ["target", "status", rest @ ..] => lifecycle::target_status(&main_root, rest),
+        ["target", "budget", "project", rest @ ..] => {
+            lifecycle::budget_project_configure(&main_root, rest)
+        }
+        ["target", "budget", "objective", rest @ ..] => {
+            lifecycle::budget_objective_authorize(&main_root, rest)
+        }
+        ["target", "budget", "status", rest @ ..] => lifecycle::budget_status(&main_root, rest),
+        ["target", "verifier", "policy-id", rest @ ..] => {
+            lifecycle::verifier_policy_id(&main_root, rest)
+        }
+        ["target", "verifier", "prepare", rest @ ..] => {
+            lifecycle::verifier_prepare(&main_root, rest)
+        }
+        ["target", "verifier", "configure", rest @ ..] => {
+            lifecycle::verifier_configure(&main_root, rest)
+        }
+        ["target", "verifier", "status", rest @ ..] => lifecycle::verifier_status(&main_root, rest),
+        ["target", "verifier", "revoke", rest @ ..] => lifecycle::verifier_revoke(&main_root, rest),
+        [
+            "target",
+            "capture-notice",
+            verb @ ("ingest" | "list"),
+            rest @ ..,
+        ] => lifecycle::capture_notice(&main_root, verb, rest),
+        ["target", "run", "status", rest @ ..] => lifecycle::service_status(&main_root, rest),
         ["target", "native-gates", rest @ ..] => lifecycle::native_gate_retention(&main_root, rest),
         [
             "target",

@@ -78,6 +78,49 @@ fn missing_duplicate_invalid_and_oversized_inventories_are_refused() {
         .collect();
     assert!(AssertionInventory::new(cases).is_err());
 }
+
+#[test]
+fn verifier_prepare_refuses_sensitive_tombstone_before_harness_or_runtime_access() {
+    let mut fixture = Fixture::new();
+    let owner = target::acquire_controller(&mut fixture.store, "T", "issuer").unwrap();
+    let epoch = owner.authority_epoch().clone();
+    drop(owner);
+    let frozen =
+        crate::local_authority::freeze(&mut fixture.store, &epoch, "test quarantine").unwrap();
+    crate::collaboration_sensitive::quarantine(
+        &mut fixture.store,
+        &d(b"test incident"),
+        "test-operator",
+        frozen.epoch.as_str(),
+        crate::collaboration_sensitive::ReasonCode::OperatorRequestedPurge,
+    )
+    .unwrap();
+
+    let result = prepare(
+        &mut fixture.store,
+        OperationId::mint().unwrap(),
+        std::path::Path::new("/no-such-harness"),
+        "not-a-commit",
+        b"not-an-inventory",
+        VerifierPlan {
+            image: "not-an-image".into(),
+            command: CommandSpec {
+                program: "/no-such-runtime".into(),
+                arguments: vec![],
+                environment: Default::default(),
+            },
+            max_age_ms: 1,
+        },
+        std::path::PathBuf::from("/no-such-docker"),
+        "unix:///no-such-endpoint",
+    );
+    assert!(matches!(
+        result,
+        Err(VerificationError::Sensitive(
+            crate::collaboration_sensitive::SensitiveError::Quarantined
+        ))
+    ));
+}
 #[test]
 fn trusted_operator_rotates_and_revokes_exact_producer_generations() {
     let mut f = Fixture::new();

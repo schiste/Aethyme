@@ -781,7 +781,14 @@ pub fn release_revision(
         [id.as_str()], |r| r.get(0),
     )?;
     let budget_held: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM local_budget_reservations WHERE revision=?1 AND phase IN ('reserved','partly_consumed','completion_pending','consumption_unknown'))", [revision.id.as_str()], |r|r.get(0))?;
-    if active_wave || budget_held {
+    let capture_notice_pending: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM local_capture_notices n
+         JOIN local_capture_notice_outcomes o USING(notice_id)
+         WHERE n.revision=?1 AND o.status='pending')",
+        [revision.id.as_str()],
+        |row| row.get(0),
+    )?;
+    if active_wave || budget_held || capture_notice_pending {
         return Err(TargetError::Frozen);
     }
     let unresolved_transport: bool = tx.query_row(

@@ -3,12 +3,11 @@ use super::*;
 use crate::collaboration_state::{CollaborationSnapshot, inspect_for_repository};
 use crate::{
     collaboration_sensitive as response, execution_verifier as verifier,
-    local_authority as authority, local_budget as budget, local_handoff as handoff,
-    local_restore as restore, local_target as target,
+    local_authority as authority, local_budget as budget, local_capture_notice as notices,
+    local_handoff as handoff, local_restore as restore, local_target as target,
 };
 use rusqlite::OptionalExtension;
 use std::collections::BTreeMap;
-use std::io::Write;
 
 const MAX_ARGUMENTS: usize = 512;
 const MAX_SPEC: u64 = 256 * 1024;
@@ -433,6 +432,132 @@ pub(super) fn budget_objective_authorize(root: &Path, rest: &[&str]) -> Result<O
     ))
 }
 
+/// Read immutable budget appointments and ledger status after a lost response.
+pub(super) fn budget_status(root: &Path, rest: &[&str]) -> Result<Output, Failure> {
+    let flags = Flags::parse(rest, &["--target", "--issuer", "--reservation"], &[])?;
+    let reservation = flags
+        .0
+        .get("--reservation")
+        .and_then(|values| values.first())
+        .map(|value| parse_record(value))
+        .transpose()?;
+    let store = open(root)?;
+    let status = budget::status(
+        &store,
+        flags.one("--target")?,
+        flags.one("--issuer")?,
+        reservation.as_ref(),
+    )
+    .map_err(|error| Failure::domain("budget_status", error.to_string()))?;
+    let reservations_shown = status.reservations.len();
+    let omitted = status
+        .reservation_count
+        .saturating_sub(reservations_shown as u64);
+    let target_name = status.target.clone();
+    Ok((
+        json!({
+            "schema":"aethyme.collab-budget-status/experimental-v0",
+            "status":status,
+            "reservation_page_limit":budget::STATUS_RESERVATION_LIMIT,
+            "reservation_rows_omitted":omitted,
+            "charged_is_root_ledger_amount_not_measured_usage":true,
+            "grants_dispatch":false
+        }),
+        format!(
+            "budget status for {target_name}: {} of {} reservation rows shown{}; no dispatch authority granted\n",
+            reservations_shown,
+            status.reservation_count,
+            if omitted > 0 {
+                format!("; {omitted} older rows omitted")
+            } else {
+                String::new()
+            }
+        ),
+    ))
+}
+
+/// Append an idempotent notice for an already retained selected contribution.
+/// The ingress path intentionally does not acquire the target owner lock.
+pub(super) fn capture_notice(root: &Path, verb: &str, rest: &[&str]) -> Result<Output, Failure> {
+    match verb {
+        "ingest" => {
+            let flags = Flags::parse(
+                rest,
+                &[
+                    "--target",
+                    "--issuer",
+                    "--revision",
+                    "--alias",
+                    "--operation",
+                ],
+                &[],
+            )?;
+            let revision = parse_record(flags.one("--revision")?)?;
+            let operation = OperationId::parse(flags.one("--operation")?)
+                .map_err(|error| Failure::usage(error.to_string()))?;
+            let mut store = open(root)?;
+            let receipt = notices::ingest(
+                &mut store,
+                flags.one("--target")?,
+                flags.one("--issuer")?,
+                &revision,
+                flags.one("--alias")?,
+                &operation,
+            )
+            .map_err(|error| Failure::domain("capture_notice", error.to_string()))?;
+            Ok((
+                json!({
+                    "schema":"aethyme.collab-capture-notice/experimental-v0",
+                    "action":"ingest",
+                    "notice":receipt.id.as_str(),
+                    "status":receipt.status,
+                    "received_ms":receipt.received_ms,
+                    "idempotent_retry_safe":true,
+                    "available_to_wave":false,
+                    "dispatch_authority_granted":false
+                }),
+                format!(
+                    "capture notice {}: {}; the owner tick must revalidate it before wave admission\n",
+                    receipt.id.as_str(),
+                    receipt.status
+                ),
+            ))
+        }
+        "list" => {
+            let flags = Flags::parse(rest, &["--target", "--limit"], &[])?;
+            let limit = flags
+                .0
+                .get("--limit")
+                .and_then(|values| values.first())
+                .map(|value| {
+                    value
+                        .parse::<usize>()
+                        .map_err(|_| Failure::usage("--limit must be an integer from 1 to 512"))
+                })
+                .transpose()?
+                .unwrap_or(100);
+            let store = open(root)?;
+            let rows = notices::list_for_target(&store, flags.one("--target")?, limit)
+                .map_err(|error| Failure::domain("capture_notice", error.to_string()))?;
+            let count = rows.len();
+            Ok((
+                json!({
+                    "schema":"aethyme.collab-capture-notice/experimental-v0",
+                    "action":"list",
+                    "notices":rows,
+                    "limit":limit,
+                    "may_be_truncated":count == limit,
+                    "dispatch_authority_granted":false
+                }),
+                format!(
+                    "{count} capture notice row(s) listed; statuses are not dispatch authority\n"
+                ),
+            ))
+        }
+        _ => Err(Failure::usage("capture-notice requires ingest or list")),
+    }
+}
+
 /// Compute an acceptance-policy ID before writing it into an immutable target
 /// proposal. This is pure validation and does not appoint a producer.
 pub(super) fn verifier_policy_id(_root: &Path, rest: &[&str]) -> Result<Output, Failure> {
@@ -446,6 +571,82 @@ pub(super) fn verifier_policy_id(_root: &Path, rest: &[&str]) -> Result<Output, 
         format!(
             "verifier policy {} validated; no producer appointed\n",
             record.id().as_str()
+        ),
+    ))
+}
+
+/// Retain an exact harness commit and its canonical literal inventory, then
+/// derive the runtime and policy identities from the explicit Docker endpoint.
+/// This produces no verifier authority or workload dispatch.
+pub(super) fn verifier_prepare(root: &Path, rest: &[&str]) -> Result<Output, Failure> {
+    let flags = Flags::parse(
+        rest,
+        &[
+            "--harness-repo",
+            "--commit",
+            "--inventory",
+            "--operation",
+            "--docker",
+            "--endpoint",
+            "--file",
+        ],
+        &[],
+    )?;
+    let plan: verifier::VerifierPlan = read_operator(flags.one("--file")?)?;
+    let inventory = read_operator_bytes(flags.one("--inventory")?, 4 * 1024 * 1024)?;
+    let repository = std::path::PathBuf::from(flags.one("--harness-repo")?);
+    let docker = std::path::PathBuf::from(flags.one("--docker")?);
+    if !repository.is_absolute() || !docker.is_absolute() {
+        return Err(Failure::usage(
+            "absolute harness repository and Docker CLI paths are required",
+        ));
+    }
+    let operation = OperationId::parse(flags.one("--operation")?)
+        .map_err(|error| Failure::usage(error.to_string()))?;
+    let mut store = open(root)?;
+    let prepared = verifier::prepare(
+        &mut store,
+        operation,
+        &repository,
+        flags.one("--commit")?,
+        &inventory,
+        plan,
+        docker,
+        flags.one("--endpoint")?,
+    )
+    .map_err(|error| Failure::domain("verifier_preparation", error.to_string()))?;
+    let capture = &prepared.capture;
+    let policy = serde_json::to_value(&prepared.policy)
+        .map_err(|error| Failure::domain("verifier_preparation", error.to_string()))?;
+    let runtime = serde_json::to_value(&prepared.runtime)
+        .map_err(|error| Failure::domain("verifier_preparation", error.to_string()))?;
+    Ok((
+        json!({
+            "schema":"aethyme.collab-verifier-prepare/experimental-v0",
+            "policy":policy,
+            "policy_id":prepared.policy_id.as_str(),
+            "runtime":runtime,
+            "runtime_id":prepared.policy.runtime,
+            "harness_snapshot":prepared.policy.harness,
+            "inventory_id":prepared.policy.inventory,
+            "inventory_sha256":prepared.inventory_sha256,
+            "inventory_cases":prepared.inventory_cases,
+            "capture":{
+                "operation":capture.operation_id.as_str(),
+                "status":capture.status,
+                "durability":capture.durability,
+                "contribution":capture.contribution.as_str(),
+                "base":capture.base.as_str(),
+                "result":capture.result.as_str(),
+                "retention":"until_released"
+            },
+            "producer_configured":false,
+            "dispatch_started":false
+        }),
+        format!(
+            "verifier policy {} prepared from retained harness {}; no producer appointed and no work dispatched\n",
+            prepared.policy_id.as_str(),
+            prepared.policy.harness
         ),
     ))
 }
@@ -511,6 +712,8 @@ pub(super) fn verifier_status(root: &Path, rest: &[&str]) -> Result<Output, Fail
     let producer = flags.one("--producer")?;
     let snapshot = observe(root)?;
     require_table(&snapshot, "local_verifier_producers")?;
+    let _response = response::response_use_for_project_dir(&snapshot.project_dir)
+        .map_err(|error| Failure::domain("sensitive_response", error.to_string()))?;
     let target_issuer: Option<String> = snapshot
         .connection()
         .query_row(
@@ -547,12 +750,107 @@ pub(super) fn verifier_status(root: &Path, rest: &[&str]) -> Result<Output, Fail
             "configure a producer for the selected target revision",
         ));
     };
+    require_table(&snapshot, "local_target_revisions")?;
+    let current: Option<(String, Option<String>, Option<Vec<u8>>)> = snapshot
+        .connection()
+        .query_row(
+            "SELECT t.issuer,t.active_revision,r.body
+             FROM local_targets t
+             LEFT JOIN local_target_revisions r ON r.revision=t.active_revision
+             WHERE t.target=?1",
+            [target_name],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()
+        .map_err(sqlite)?;
+    let Some((current_issuer, current_revision, revision_body)) = current else {
+        return Err(Failure::refused(
+            "target_missing",
+            "target disappeared while verifier status was read",
+            "inspect target status again",
+        ));
+    };
+    if current_issuer != issuer {
+        return Err(Failure::refused(
+            "issuer_mismatch",
+            "target issuer changed while verifier status was read",
+            "inspect target status and use its current issuer label",
+        ));
+    }
+    let selected_policy = match (current_revision.as_deref(), revision_body) {
+        (None, None) => None,
+        (Some(revision), Some(body)) => {
+            let revision_id = parse_record(revision)?;
+            let record = aethyme_contracts::experimental_v0::Record::decode(
+                &body,
+                &[&target::TARGET_REVISION_SCHEMA],
+            )
+            .map_err(|error| Failure::domain("corrupt_target", error.to_string()))?;
+            if record.id() != revision_id || record.canonical_bytes() != body {
+                return Err(Failure::domain(
+                    "corrupt_target",
+                    "selected revision record identity differs".into(),
+                ));
+            }
+            let value: Value = serde_json::from_slice(&body)
+                .map_err(|error| Failure::domain("corrupt_target", error.to_string()))?;
+            if value["target"].as_str() != Some(target_name)
+                || value["issuer"].as_str() != Some(issuer)
+            {
+                return Err(Failure::domain(
+                    "corrupt_target",
+                    "selected revision target binding differs".into(),
+                ));
+            }
+            let spec: target::TargetSpec = serde_json::from_value(value["spec"].clone())
+                .map_err(|error| Failure::domain("corrupt_target", error.to_string()))?;
+            Some(spec.acceptance_policy)
+        }
+        _ => {
+            return Err(Failure::domain(
+                "corrupt_target",
+                "selected target revision record is incomplete".into(),
+            ));
+        }
+    };
+    let authority = authority::inspect(&snapshot).map_err(authority_error)?;
+    let witness_epoch = authority
+        .witness
+        .as_ref()
+        .map(|witness| witness.epoch.as_str());
+    let appointment_state = if revoked {
+        "revoked"
+    } else if authority.state != "active" || !authority.binding_matches {
+        match authority.state {
+            "frozen" => "authority_frozen",
+            "drift" => "authority_drift",
+            "unbound" | "witness_missing" => "authority_unavailable",
+            _ => "authority_unavailable",
+        }
+    } else if witness_epoch != Some(epoch.as_str()) {
+        "stale_epoch"
+    } else if selected_policy.as_deref() != Some(policy.as_str()) {
+        "stale_selected_policy"
+    } else {
+        "appointed_current"
+    };
     Ok((
-        json!({"schema":"aethyme.collab-verifier-status/experimental-v0","target":target_name,"producer":producer,"generation":generation,"policy":policy,"epoch":epoch,"revoked":revoked,"dispatch_authority_granted":false}),
-        format!(
-            "producer {producer}: generation {generation}, {}\n",
-            if revoked { "revoked" } else { "active" }
-        ),
+        json!({
+            "schema":"aethyme.collab-verifier-status/experimental-v0",
+            "target":target_name,
+            "producer":producer,
+            "generation":generation,
+            "policy":policy,
+            "appointed_epoch":epoch,
+            "authority_state":authority.state,
+            "authority_binding_matches":authority.binding_matches,
+            "selected_revision":current_revision,
+            "selected_acceptance_policy":selected_policy,
+            "revoked":revoked,
+            "appointment_state":appointment_state,
+            "dispatch_authority_granted":false
+        }),
+        format!("producer {producer}: generation {generation}, appointment {appointment_state}\n"),
     ))
 }
 
@@ -831,11 +1129,12 @@ pub(super) fn export(root: &Path, rest: &[&str]) -> Result<Output, Failure> {
         visibility: "local_project".into(),
         audience: audience.into(),
     };
-    let bytes = restore::export(
-        &store,
+    let bytes = restore::export_to_path(
+        &mut store,
         &owner,
         &scope,
         &restore::Selection { sources, records },
+        Path::new(output),
     )
     .map_err(|e| {
         let code = match &e {
@@ -850,24 +1149,8 @@ pub(super) fn export(root: &Path, rest: &[&str]) -> Result<Output, Failure> {
         };
         Failure::domain(code, e.to_string())
     })?;
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = options.open(output).map_err(io)?;
-    file.write_all(&bytes).map_err(io)?;
-    file.sync_all().map_err(io)?;
-    let parent = Path::new(output)
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    crate::collaboration_state::sync_directory(parent)
-        .map_err(|e| Failure::domain(e.code(), e.to_string()))?;
     Ok((
-        json!({"schema":"aethyme.collab-export/experimental-v0","profile":restore::PROFILE,"bundle":crate::collaboration_archive::ObjectDigest::of(&bytes).hex(),"bytes":bytes.len(),"historical_only":true,"grants_authority":false,"source_released":false}),
+        json!({"schema":"aethyme.collab-export/experimental-v0","profile":restore::PROFILE,"bytes":bytes,"historical_only":true,"grants_authority":false,"source_released":false,"publication_guard_held_through_sync":true}),
         "Historical source bundle written exclusively; source remains retained\n".into(),
     ))
 }
@@ -908,6 +1191,30 @@ fn read_operator<T: serde::de::DeserializeOwned>(path: &str) -> Result<T, Failur
         return Err(Failure::usage("operator specification too large"));
     }
     serde_json::from_slice(&bytes).map_err(|e| Failure::usage(e.to_string()))
+}
+
+fn read_operator_bytes(path: &str, max_bytes: u64) -> Result<Vec<u8>, Failure> {
+    use std::io::Read;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = options.open(path).map_err(io)?;
+    let metadata = file.metadata().map_err(io)?;
+    if !metadata.is_file() || metadata.len() > max_bytes {
+        return Err(Failure::usage("bounded regular operator file required"));
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take(max_bytes + 1)
+        .read_to_end(&mut bytes)
+        .map_err(io)?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(Failure::usage("operator file too large"));
+    }
+    Ok(bytes)
 }
 pub(super) fn target_run(root: &Path, rest: &[&str]) -> Result<Output, Failure> {
     use crate::execution_supervisor::DockerExecutor;
@@ -1065,6 +1372,47 @@ mod tests {
         .unwrap();
         assert_eq!(valid.many("--source"), vec!["A", "B"]);
         assert_eq!(valid.one("--target").unwrap(), "T");
+    }
+    #[test]
+    fn verifier_prepare_refuses_oversized_literal_inventory_before_opening_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let plan = directory.path().join("plan.json");
+        std::fs::write(
+            &plan,
+            serde_json::to_vec(&verifier::VerifierPlan {
+                image: format!("sha256:{}", "0".repeat(64)),
+                command: crate::execution_snapshot::CommandSpec {
+                    program: "/bin/sh".into(),
+                    arguments: vec!["/artifact/app.sh".into()],
+                    environment: Default::default(),
+                },
+                max_age_ms: 1000,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let inventory = directory.path().join("inventory.json");
+        std::fs::write(&inventory, vec![b'x'; 4 * 1024 * 1024 + 1]).unwrap();
+        let operation = OperationId::mint().unwrap().to_string();
+        let args = [
+            "--harness-repo",
+            "/no-such-harness",
+            "--commit",
+            "not-a-commit",
+            "--inventory",
+            inventory.to_str().unwrap(),
+            "--operation",
+            operation.as_str(),
+            "--docker",
+            "/no-such-docker",
+            "--endpoint",
+            "unix:///no-such-endpoint",
+            "--file",
+            plan.to_str().unwrap(),
+        ];
+        let failure = verifier_prepare(directory.path(), &args).unwrap_err();
+        assert_eq!(failure.exit, exit_status::USAGE);
+        assert_eq!(failure.message, "operator file too large");
     }
     #[test]
     fn native_gate_retention_cli_rejects_invalid_and_incomplete_arguments() {
