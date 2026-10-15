@@ -1,3 +1,4 @@
+#![cfg(unix)]
 //! Advisory symbol mapping is exercised against two real disposable clones of
 //! the checked-in synthetic Playground seed. The tests do not infer mappings
 //! from names or existing NodeIds: a positive result needs the exact records.
@@ -429,20 +430,8 @@ fn mapping_fixture_named(
             right_origin_id.as_str()
         }
     });
-    let (mapping_id, mapping_bytes) = if matches!(
-        scenario,
-        RecordScenario::SameClone | RecordScenario::AliasedOrigin
-    ) {
-        // Preserve a canonical but semantically invalid input so the resolver
-        // must reject the evidence at its trust boundary.
-        (
-            rid("invalid mapping record"),
-            serde_json::to_vec(&mapping_value).unwrap(),
-        )
-    } else {
-        let (mapping, bytes) = canonical_record(mapping_value);
-        (record_id(&mapping), bytes)
-    };
+    let (mapping, mapping_bytes) = canonical_record(mapping_value);
+    let mapping_id = record_id(&mapping);
     let mut origin_ids = [left_origin_id, right_origin_id];
     origin_ids.sort();
     let (_claim, claim_bytes) = canonical_record(json!({
@@ -607,14 +596,14 @@ fn mismatched_or_incomplete_mapping_records_never_establish() {
     let clones = actual_clones();
     for (scenario, expected) in [
         (RecordScenario::CrossProject, "binding_scope_mismatch"),
-        (RecordScenario::SameClone, "invalid_evidence_record"),
+        (RecordScenario::SameClone, "captured_clone_binding_mismatch"),
         (RecordScenario::SourceMismatch, "captured_clone_binding_mismatch"),
         (RecordScenario::ProfileMismatch, "captured_clone_binding_mismatch"),
         (RecordScenario::OriginMismatch, "origin_binding_mismatch"),
         (RecordScenario::MalformedNodeId, "symbol_scope_mismatch"),
         (RecordScenario::WrongNodeIdRepo, "symbol_scope_mismatch"),
         (RecordScenario::UnknownScope, "symbol_scope_mismatch"),
-        (RecordScenario::AliasedOrigin, "invalid_evidence_record"),
+        (RecordScenario::AliasedOrigin, "evidence_set_not_exact"),
         (
             RecordScenario::ExternalPackageVersionMismatch,
             "cross_version_mapping_unproven",
@@ -631,6 +620,11 @@ fn mismatched_or_incomplete_mapping_records_never_establish() {
 
     let fixture = mapping_fixture(&clones, RecordScenario::Exact);
     let records: Vec<&[u8]> = fixture.records.iter().map(Vec::as_slice).collect();
+    let malformed: &[u8] = b"not-json";
+    assert!(matches!(
+        resolve_within_binding(&fixture.binding, &fixture.claim, &[malformed]),
+        MappingResolution::Unknown("invalid_evidence_record")
+    ));
     assert!(matches!(
         resolve_within_binding(&fixture.binding, &fixture.claim, &[]),
         MappingResolution::Unknown("missing_binding_evidence")
@@ -660,6 +654,12 @@ fn mismatched_or_incomplete_mapping_records_never_establish() {
     assert!(matches!(
         resolve_within_binding(&fixture.binding, &fixture.claim, &duplicate),
         MappingResolution::Unknown("duplicate_evidence_record")
+    ));
+
+    let oversized = vec![malformed; 8];
+    assert!(matches!(
+        resolve_within_binding(&fixture.binding, &fixture.claim, &oversized),
+        MappingResolution::Unknown("evidence_set_not_exact")
     ));
 
     let established_wire = claim_with_state(&fixture.claim, "established");

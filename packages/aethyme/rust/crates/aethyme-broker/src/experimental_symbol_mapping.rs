@@ -158,6 +158,9 @@ pub fn resolve_within_binding(
     let Some(binding_id) = record_id(&claim, "binding") else {
         return MappingResolution::Unknown("invalid_binding_reference");
     };
+    if evidence_bytes.len() > 7 {
+        return MappingResolution::Unknown("evidence_set_not_exact");
+    }
     let mut records = BTreeMap::new();
     for bytes in evidence_bytes {
         let record = match decode_symbol_identity_record(bytes) {
