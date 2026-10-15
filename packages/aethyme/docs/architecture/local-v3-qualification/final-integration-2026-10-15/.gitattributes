@@ -1,0 +1,2 @@
+# Frozen artifacts preserve their recorded bytes on every checkout.
+runs/**/artifacts/*.raw -text

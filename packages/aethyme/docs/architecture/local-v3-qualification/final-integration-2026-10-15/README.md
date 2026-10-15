@@ -152,3 +152,30 @@ source-bound runs.
 No model, provider trial or private held-out evaluator ran in this selection.
 The six consumed FX17 provider errors remain unchanged; this ledger does not
 establish brief usefulness or reliable autonomous operation.
+
+## Later checkout, formatting and artifact-index failures
+
+The preserved CI bundle for #784 head `3f5e23ad` and #785 head `5e7fe7bf`
+binds the actual Actions merge checkouts, complete trees, source blobs, API
+responses and full raw logs. Both Windows jobs failed checkout with exit 128
+because nested frozen evidence paths exceeded Git for Windows path limits;
+no build or native smoke ran. The #784 formatting check failed before Clippy.
+The #785 workspace command completed 4,602 tests: 4,601 passed, one failed
+and 32 were skipped (exit 100), with missing dates in three frozen Markdown
+payloads. The #784 workspace job was cancelled after 50 distinct first-attempt
+failures; observed progress 2,274/4,623 is not a completed-suite denominator.
+Its numeric command exit and completed counts remain unknown. Early log API
+404 and ANSI-output refusals are preserved alongside the later successful GET.
+
+The CI payloads use short opaque `.raw` storage names with original logical
+paths, media types, byte counts and hashes in `ledger.json`. Frozen source and
+Markdown bytes are preserved as evidence, rather than edited as maintained
+documentation. The T56 package separately uses the same portable representation.
+
+The original artifact verifier at `9795ec1b` also failed: its 424 errors came
+from resolving 212 valid T56 payload paths against the wrong base. Its complete
+output and script are retained. An independently reviewed exact-schema adapter
+uses that package's documented `payloads/` root; at the same source it checked
+753 unique payloads and 37 links with zero errors. The later portable package
+adds the byte-exact original ledger as one further artifact. These checks
+verify retained evidence and do not qualify runtime behavior.

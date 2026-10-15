@@ -1480,9 +1480,721 @@
       "source_path": "/private/tmp/aethyme-ci-777-784-20261016-1yiyyg3s/prior-snapshots/ci-784-0ec-run.json.fetch.json",
       "bytes": 221,
       "sha256": "e4e562c973ea5a306fb6f9d9f4a4d0bafa4e07af983e02ea41faeb74d5941c9e"
+    },
+    {
+      "path": "runs/ci-784-785-3f5e-5e7-final/artifacts/0001.raw",
+      "logical_path": "README.md",
+      "source_path": "/private/tmp/aethyme-pr-784-785-ci-evidence-QPLQGM/README.md",
+      "media_type": "application/octet-stream",
+      "bytes": 8296,
+      "sha256": "dd60d30360fac7157057c4345849f3b6961aeab5387e984b28f62ef92c17974b"
+    },
+    {
+      "path": "runs/ci-784-785-3f5e-5e7-final/artifacts/0002.raw",
+      "logical_path": "SHA256SUMS",
+      "source_path": "/private/tmp/aethyme-pr-784-785-ci-evidence-QPLQGM/SHA256SUMS",
+      "media_type": "application/octet-stream",
+      "bytes": 7232,
+      "sha256": "f55744232dc82a292244a30e9d60eaeb75217a70113dec3731b2ed42acd650d4"
+    },
+    {
+      "path": "runs/ci-784-785-3f5e-5e7-final/artifacts/0003.raw",
+      "logical_path": "api-log-784-lint.bin",
+      "source_path": "/private/tmp/aethyme-pr-784-785-ci-evidence-QPLQGM/api-log-784-lint.bin",
+      "media_type": "application/octet-stream",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "runs/ci-784-785-3f5e-5e7-final/artifacts/0004.raw",
+      "logical_path": "api-log-784-lint.stderr",
+      "source_path": "/private/tmp/aethyme-pr-784-785-ci-evidence-QPLQGM/api-log-784-lint.stderr",
+      "media_type": "application/octet-stream",
+      "bytes": 99,
+      "sha256": "8b6407b2fdbca54bf3d53fb93e79a3560dbe59567fa5044cfee4bed1b5b6e467"
+    },
+    {
+      "path": "runs/ci-784-785-3f5e-5e7-final/artifacts/0005.raw",
+      "logical_path": "api-log-785-workspace.raw",
+      "source_path": "/private/tmp/aethyme-pr-784-785-ci-evidence-QPLQGM/api-log-785-workspace.raw",
+      "media_type": "application/octet-stream",
+      "bytes": 1024027,
+      "sha256": "fcd9c41024e5c660bc091f7a53f74a0ba747b70a5444b4b8e6f8efd843cf1a69"
+    },
+    {
+      "path": "runs/ci-784-785-3f5e-5e7-final/artifacts/0006.raw",
+      "logical_path": "api-log-785-workspace.stderr",
+      "source_path": "/private/tmp/aethyme-pr-784-785-ci-evidence-QPLQGM/api-log-785-workspace.stderr",
+      "media_type": "application/octet-stream",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "runs/ci-784-785-3f5e-5e7-final/artifacts/0007.raw",
+      "logical_path": "blob-784-verifier-tests.json",
+      "source_path": "/private/tmp/aethyme-pr-784-785-ci-evidence-QPLQGM/blob-784-verifier-tests.json",
+      "media_type": "application/json",
+      "bytes": 46216,
+      "sha256": "54fcdc6147ca55c845c3c00de41df443c435cf5e1f511d8f67ad889027f62239"
+    },
+    {
+      "path": "runs/ci-784-785-3f5e-5e7-final/artifacts/0008.raw",
+      "logical_path": "blob-docs-hygiene.json",
+      "source_path": "/private/tmp/aethyme-pr-784-785-ci-evidence-QPLQGM/blob-docs-hygiene.json",
+      "media_type": "application/json",
+      "bytes": 25480,
+      "sha256": "4448a77e33d6b8c46216869aa6018148f9d264e92df280b1af0d6f9d46977331"
+    },
+    {
+      "path": "runs/ci-784-785-3f5e-5e7-final/artifacts/0009.raw",
+      "logical_path": "blob-docs-hygiene.json.stderr",
+      "source_path": "/private/tmp/aethyme-pr-784-785-ci-evidence-QPLQGM/blob-docs-hygiene.json.stderr",
+      "media_type": "application/octet-stream",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "runs/ci-784-785-3f5e-5e7-final/artifacts/0010.raw",
+      "logical_path": "blob-longpath-m4.json",
+      "source_path": "/private/tmp/aethyme-pr-784-785-ci-evidence-QPLQGM/blob-longpath-m4.json",
+      "media_type": "application/json",
+      "bytes": 267437,
+      "sha256": "74793b339fa4e49ac9c5cc856e5ae586afb78f5fc442857016dd31e6e54a1d83"
+    },
+    {
+      "path": "runs/ci-784-785-3f5e-5e7-final/artifacts/0011.raw",
+      "logical_path": "blob-longpath-m4.json.stderr",
+      "source_path": "/private/tmp/aethyme-pr-784-785-ci-evidence-QPLQGM/blob-longpath-m4.json.stderr",
+      "media_type": "application/octet-stream",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "runs/ci-784-785-3f5e-5e7-final/artifacts/0012.raw",
+      "logical_path": "blob-missing-v3.json",
+      "source_path": "/private/tmp/aethyme-pr-784-785-ci-evidence-QPLQGM/blob-missing-v3.json",
+      "media_type": "application/json",
+      "bytes": 18316,
+      "sha256": "b035de1c88b50eece27aad6637c76663c384c5dcd570074e4b45678e07035801"
+    },
+    {
+      "path": "runs/ci-784-785-3f5e-5e7-final/artifacts/0013.raw",
+      "logical_path": "blob-missing-v3.json.stderr",
+      "source_path": "/private/tmp/aethyme-pr-784-785-ci-evidence-QPLQGM/blob-missing-v3.json.stderr",
+      "media_type": "application/octet-stream",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "runs/ci-784-785-3f5e-5e7-final/artifacts/0014.raw",
+      "logical_path": "blob-missing-v4.json",
+      "source_path": "/private/tmp/aethyme-pr-784-785-ci-evidence-QPLQGM/blob-missing-v4.json",
+      "media_type": "application/json",
+      "bytes": 24930,
+      "sha256": "cdaaba0b70174fd465713e4a4cdf2c8d0b3c95c2c29b5084657a7514530b74f6"
+    },
+    {
+      "path": "runs/ci-784-785-3f5e-5e7-final/artifacts/0015.raw",
+      "logical_path": "blob-missing-v4.json.stderr",
+      "source_path": "/private/tmp/aethyme-pr-784-785-ci-evidence-QPLQGM/blob-missing-v4.json.stderr",
+      "media_type": "application/octet-stream",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "runs/ci-784-785-3f5e-5e7-final/artifacts/0016.raw",
+      "logical_path": "blob-missing-v4draft.json",
+      "source_path": "/private/tmp/aethyme-pr-784-785-ci-evidence-QPLQGM/blob-missing-v4draft.json",
+      "media_type": "application/json",
+      "bytes": 20392,
+      "sha256": "0f7e2dd2364b600241da93b985d2189ef5bd444bbd57b5bc7fccd5fbd7a65108"
+    },
+    {
+      "path": "runs/ci-784-785-3f5e-5e7-final/artifacts/0017.raw",
+      "logical_path": "blob-missing-v4draft.json.stderr",
+      "source_path": "/private/tmp/aethyme-pr-784-785-ci-evidence-QPLQGM/blob-missing-v4draft.json.stderr",
+      "media_type": "application/octet-stream",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "runs/ci-784-785-3f5e-5e7-final/artifacts/0018.raw",
+      "logical_path": "branch-784-runs.json",
+      "source_path": "/private/tmp/aethyme-pr-784-785-ci-evidence-QPLQGM/branch-784-runs.json",
+      "media_type": "application/json",
+      "bytes": 11370,
+      "sha256": "9d9ffc8ac55c29daee471b19fae0bd0ce03f6b071f521bf2740778e537f4fba8"
+    },
+    {
+      "path": "runs/ci-784-785-3f5e-5e7-final/artifacts/0019.raw",
+      "logical_path": "branch-785-runs.json",
+      "source_path": "/private/tmp/aethyme-pr-784-785-ci-evidence-QPLQGM/branch-785-runs.json",
+      "media_type": "application/json",
+      "bytes": 11200,
+      "sha256": "0a3bb4b149e59ad69cd197b51a73ae624e4e8969ec5df277d627cca808f4374c"
+    },
+    {
+      "path": "runs/ci-784-785-3f5e-5e7-final/artifacts/0020.raw",
+      "logical_path": "bundle-inventory.json",
+      "source_path": "/private/tmp/aethyme-pr-784-785-ci-evidence-QPLQGM/bundle-inventory.json",
+      "media_type": "application/json",
+      "bytes": 18528,
+      "sha256": "443fd30e313d6aad048697aced42b85ffd2b7aff8bcfd7e0bdd08418c44bddaa"
+    },
+    {
+      "path": "runs/ci-784-785-3f5e-5e7-final/artifacts/0021.raw",
+      "logical_path": "log-784-lint.txt",
+      "source_path": "/private/tmp/aethyme-pr-784-785-ci-evidence-QPLQGM/log-784-lint.txt",
+      "media_type": "text/plain",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "runs/ci-784-785-3f5e-5e7-final/artifacts/0022.raw",
+      "logical_path": "log-784-lint.txt.stderr",
+      "source_path": "/private/tmp/aethyme-pr-784-785-ci-evidence-QPLQGM/log-784-lint.txt.stderr",
+      "media_type": "application/octet-stream",
+      "bytes": 81,
+      "sha256": "58d4ae49f05cf43b62999c3d311b1ff3bba363c9d51219c9ff53136784dba438"
+    },
+    {
+      "path": "runs/ci-784-785-3f5e-5e7-final/artifacts/0023.raw",
+      "logical_path": "log-784-win.txt",
+      "source_path": "/private/tmp/aethyme-pr-784-785-ci-evidence-QPLQGM/log-784-win.txt",
+      "media_type": "text/plain",
+      "bytes": 101237,
+      "sha256": "223a90828761d6dd451acfa1fd3a796584d8380ce422b7528b3896c929e3d94e"
+    },
+    {
+      "path": "runs/ci-784-785-3f5e-5e7-final/artifacts/0024.raw",
+      "logical_path": "log-784-win.txt.stderr",
+      "source_path": "/private/tmp/aethyme-pr-784-785-ci-evidence-QPLQGM/log-784-win.txt.stderr",
+      "media_type": "application/octet-stream",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "runs/ci-784-785-3f5e-5e7-final/artifacts/0025.raw",
+      "logical_path": "log-784-workspace-current.txt",
+      "source_path": "/private/tmp/aethyme-pr-784-785-ci-evidence-QPLQGM/log-784-workspace-current.txt",
+      "media_type": "text/plain",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "runs/ci-784-785-3f5e-5e7-final/artifacts/0026.raw",
+      "logical_path": "log-784-workspace-current.txt.stderr",
+      "source_path": "/private/tmp/aethyme-pr-784-785-ci-evidence-QPLQGM/log-784-workspace-current.txt.stderr",
+      "media_type": "application/octet-stream",
+      "bytes": 82,
+      "sha256": "a859481989f3c63c52761f8140ed2d2343c7bb56838a685590c8d34118479d7f"
+    },
+    {
+      "path": "runs/ci-784-785-3f5e-5e7-final/artifacts/0027.raw",
+      "logical_path": "log-785-win.txt",
+      "source_path": "/private/tmp/aethyme-pr-784-785-ci-evidence-QPLQGM/log-785-win.txt",
+      "media_type": "text/plain",
+      "bytes": 101237,
+      "sha256": "4feeff59a51a3ce31705afb3e8b44397e3a5c9add7faea7ccde6e44c1b619475"
+    },
+    {
+      "path": "runs/ci-784-785-3f5e-5e7-final/artifacts/0028.raw",
+      "logical_path": "log-785-win.txt.stderr",
+      "source_path": "/private/tmp/aethyme-pr-784-785-ci-evidence-QPLQGM/log-785-win.txt.stderr",
+      "media_type": "application/octet-stream",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "runs/ci-784-785-3f5e-5e7-final/artifacts/0029.raw",
+      "logical_path": "log-785-workspace.txt",
+      "source_path": "/private/tmp/aethyme-pr-784-785-ci-evidence-QPLQGM/log-785-workspace.txt",
+      "media_type": "text/plain",
+      "bytes": 1312129,
+      "sha256": "6f21e2d044cf2eb253b9737800cd5d4a27c1acc22ae31b3d83fd6d0e0b839375"
+    },
+    {
+      "path": "runs/ci-784-785-3f5e-5e7-final/artifacts/0030.raw",
+      "logical_path": "log-785-workspace.txt.stderr",
+      "source_path": "/private/tmp/aethyme-pr-784-785-ci-evidence-QPLQGM/log-785-workspace.txt.stderr",
+      "media_type": "application/octet-stream",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "runs/ci-784-785-3f5e-5e7-final/artifacts/0031.raw",
+      "logical_path": "merge-784.json",
+      "source_path": "/private/tmp/aethyme-pr-784-785-ci-evidence-QPLQGM/merge-784.json",
+      "media_type": "application/json",
+      "bytes": 2616,
+      "sha256": "031bef8ad667a7791e7240dd1feb1a0e431e66542ffaf1f246aef27c35c03b89"
+    },
+    {
+      "path": "runs/ci-784-785-3f5e-5e7-final/artifacts/0032.raw",
+      "logical_path": "merge-784.json.stderr",
+      "source_path": "/private/tmp/aethyme-pr-784-785-ci-evidence-QPLQGM/merge-784.json.stderr",
+      "media_type": "application/octet-stream",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "runs/ci-784-785-3f5e-5e7-final/artifacts/0033.raw",
+      "logical_path": "merge-785.json",
+      "source_path": "/private/tmp/aethyme-pr-784-785-ci-evidence-QPLQGM/merge-785.json",
+      "media_type": "application/json",
+      "bytes": 2616,
+      "sha256": "cb4ceb3254331024045a06cc5422f76e32b068f660b9e02d625346c7adc26991"
+    },
+    {
+      "path": "runs/ci-784-785-3f5e-5e7-final/artifacts/0034.raw",
+      "logical_path": "merge-785.json.stderr",
+      "source_path": "/private/tmp/aethyme-pr-784-785-ci-evidence-QPLQGM/merge-785.json.stderr",
+      "media_type": "application/octet-stream",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "runs/ci-784-785-3f5e-5e7-final/artifacts/0035.raw",
+      "logical_path": "pr-784.json",
+      "source_path": "/private/tmp/aethyme-pr-784-785-ci-evidence-QPLQGM/pr-784.json",
+      "media_type": "application/json",
+      "bytes": 15892,
+      "sha256": "b3fa3683799b0fda660648829fd66b661c9b6fd965c4de4df3a25044e6f1501b"
+    },
+    {
+      "path": "runs/ci-784-785-3f5e-5e7-final/artifacts/0036.raw",
+      "logical_path": "pr-785.json",
+      "source_path": "/private/tmp/aethyme-pr-784-785-ci-evidence-QPLQGM/pr-785.json",
+      "media_type": "application/json",
+      "bytes": 16410,
+      "sha256": "92a20336baf708223e0f9f56c5e966cafc8c06773cc15f2fa89668932367591f"
+    },
+    {
+      "path": "runs/ci-784-785-3f5e-5e7-final/artifacts/0037.raw",
+      "logical_path": "raw-784-lint.log",
+      "source_path": "/private/tmp/aethyme-pr-784-785-ci-evidence-QPLQGM/raw-784-lint.log",
+      "media_type": "text/plain",
+      "bytes": 46968,
+      "sha256": "16b406dbfa87f4018b3df2467957d25a6e0e7710b1ee8a5b7d6ee4e0ad6253df"
+    },
+    {
+      "path": "runs/ci-784-785-3f5e-5e7-final/artifacts/0038.raw",
+      "logical_path": "raw-784-lint.log.stderr",
+      "source_path": "/private/tmp/aethyme-pr-784-785-ci-evidence-QPLQGM/raw-784-lint.log.stderr",
+      "media_type": "application/octet-stream",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "runs/ci-784-785-3f5e-5e7-final/artifacts/0039.raw",
+      "logical_path": "raw-784-win.log",
+      "source_path": "/private/tmp/aethyme-pr-784-785-ci-evidence-QPLQGM/raw-784-win.log",
+      "media_type": "text/plain",
+      "bytes": 76445,
+      "sha256": "7c7c228df1ac102dd9ccc9ea5a382414c9b1eed924f9b2eb1cd6a3537ecce4d4"
+    },
+    {
+      "path": "runs/ci-784-785-3f5e-5e7-final/artifacts/0040.raw",
+      "logical_path": "raw-784-win.log.stderr",
+      "source_path": "/private/tmp/aethyme-pr-784-785-ci-evidence-QPLQGM/raw-784-win.log.stderr",
+      "media_type": "application/octet-stream",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "runs/ci-784-785-3f5e-5e7-final/artifacts/0041.raw",
+      "logical_path": "raw-784-workspace-after-cancel.log",
+      "source_path": "/private/tmp/aethyme-pr-784-785-ci-evidence-QPLQGM/raw-784-workspace-after-cancel.log",
+      "media_type": "text/plain",
+      "bytes": 740774,
+      "sha256": "eb776897c96aff0c072e74552a75af82cd1f9a806ad6a6c15f0737e80297c5ed"
+    },
+    {
+      "path": "runs/ci-784-785-3f5e-5e7-final/artifacts/0042.raw",
+      "logical_path": "raw-784-workspace-after-cancel.stderr",
+      "source_path": "/private/tmp/aethyme-pr-784-785-ci-evidence-QPLQGM/raw-784-workspace-after-cancel.stderr",
+      "media_type": "application/octet-stream",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "runs/ci-784-785-3f5e-5e7-final/artifacts/0043.raw",
+      "logical_path": "raw-785-win.log",
+      "source_path": "/private/tmp/aethyme-pr-784-785-ci-evidence-QPLQGM/raw-785-win.log",
+      "media_type": "text/plain",
+      "bytes": 76445,
+      "sha256": "4b707208b909e67941d6f89493cc01a140cb3f4202d0ac26dbac8a1f35ac1891"
+    },
+    {
+      "path": "runs/ci-784-785-3f5e-5e7-final/artifacts/0044.raw",
+      "logical_path": "raw-785-win.log.stderr",
+      "source_path": "/private/tmp/aethyme-pr-784-785-ci-evidence-QPLQGM/raw-785-win.log.stderr",
+      "media_type": "application/octet-stream",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "runs/ci-784-785-3f5e-5e7-final/artifacts/0045.raw",
+      "logical_path": "raw-785-workspace.log",
+      "source_path": "/private/tmp/aethyme-pr-784-785-ci-evidence-QPLQGM/raw-785-workspace.log",
+      "media_type": "text/plain",
+      "bytes": 1024027,
+      "sha256": "fcd9c41024e5c660bc091f7a53f74a0ba747b70a5444b4b8e6f8efd843cf1a69"
+    },
+    {
+      "path": "runs/ci-784-785-3f5e-5e7-final/artifacts/0046.raw",
+      "logical_path": "raw-785-workspace.log.stderr",
+      "source_path": "/private/tmp/aethyme-pr-784-785-ci-evidence-QPLQGM/raw-785-workspace.log.stderr",
+      "media_type": "application/octet-stream",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "runs/ci-784-785-3f5e-5e7-final/artifacts/0047.raw",
+      "logical_path": "refresh-jobs-784-oss-final.json",
+      "source_path": "/private/tmp/aethyme-pr-784-785-ci-evidence-QPLQGM/refresh-jobs-784-oss-final.json",
+      "media_type": "application/json",
+      "bytes": 12047,
+      "sha256": "3a9c7539f67dda50b3e76b9f64406be0289afe2b7ac819977dab15a759805884"
+    },
+    {
+      "path": "runs/ci-784-785-3f5e-5e7-final/artifacts/0048.raw",
+      "logical_path": "refresh-jobs-784-oss.json",
+      "source_path": "/private/tmp/aethyme-pr-784-785-ci-evidence-QPLQGM/refresh-jobs-784-oss.json",
+      "media_type": "application/json",
+      "bytes": 10876,
+      "sha256": "9816eb4fee7666d0be6094fe6c41bf99a1d8a15b82819fb353aaa89a3749bfe7"
+    },
+    {
+      "path": "runs/ci-784-785-3f5e-5e7-final/artifacts/0049.raw",
+      "logical_path": "refresh-jobs-784-oss.json.stderr",
+      "source_path": "/private/tmp/aethyme-pr-784-785-ci-evidence-QPLQGM/refresh-jobs-784-oss.json.stderr",
+      "media_type": "application/octet-stream",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "runs/ci-784-785-3f5e-5e7-final/artifacts/0050.raw",
+      "logical_path": "refresh-log-784-workspace-after-cancel.raw",
+      "source_path": "/private/tmp/aethyme-pr-784-785-ci-evidence-QPLQGM/refresh-log-784-workspace-after-cancel.raw",
+      "media_type": "application/octet-stream",
+      "bytes": 1001,
+      "sha256": "08c961bb087844e680c550565467aa455a85b5550c3f9e581d2075652c6cea0d"
+    },
+    {
+      "path": "runs/ci-784-785-3f5e-5e7-final/artifacts/0051.raw",
+      "logical_path": "refresh-log-784-workspace-after-cancel.stderr",
+      "source_path": "/private/tmp/aethyme-pr-784-785-ci-evidence-QPLQGM/refresh-log-784-workspace-after-cancel.stderr",
+      "media_type": "application/octet-stream",
+      "bytes": 99,
+      "sha256": "8b6407b2fdbca54bf3d53fb93e79a3560dbe59567fa5044cfee4bed1b5b6e467"
+    },
+    {
+      "path": "runs/ci-784-785-3f5e-5e7-final/artifacts/0052.raw",
+      "logical_path": "refresh-pr-784.json",
+      "source_path": "/private/tmp/aethyme-pr-784-785-ci-evidence-QPLQGM/refresh-pr-784.json",
+      "media_type": "application/json",
+      "bytes": 15892,
+      "sha256": "d4dd52110a8716cb10fb4209a2f676e124923c8a155c18af39a26f2de291b513"
+    },
+    {
+      "path": "runs/ci-784-785-3f5e-5e7-final/artifacts/0053.raw",
+      "logical_path": "refresh-pr-784.json.stderr",
+      "source_path": "/private/tmp/aethyme-pr-784-785-ci-evidence-QPLQGM/refresh-pr-784.json.stderr",
+      "media_type": "application/octet-stream",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "runs/ci-784-785-3f5e-5e7-final/artifacts/0054.raw",
+      "logical_path": "refresh-pr-785.json",
+      "source_path": "/private/tmp/aethyme-pr-784-785-ci-evidence-QPLQGM/refresh-pr-785.json",
+      "media_type": "application/json",
+      "bytes": 16410,
+      "sha256": "e1c077a8918dffb2273eec1033af92c3330fde9b814febd15b133f8c3db191d6"
+    },
+    {
+      "path": "runs/ci-784-785-3f5e-5e7-final/artifacts/0055.raw",
+      "logical_path": "refresh-pr-785.json.stderr",
+      "source_path": "/private/tmp/aethyme-pr-784-785-ci-evidence-QPLQGM/refresh-pr-785.json.stderr",
+      "media_type": "application/octet-stream",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "runs/ci-784-785-3f5e-5e7-final/artifacts/0056.raw",
+      "logical_path": "refresh-run-784-oss-final.json",
+      "source_path": "/private/tmp/aethyme-pr-784-785-ci-evidence-QPLQGM/refresh-run-784-oss-final.json",
+      "media_type": "application/json",
+      "bytes": 12252,
+      "sha256": "a145e3332452e3c8f2e955d7a091a2335b5e091a9ee6a56114ef2f896d30eb63"
+    },
+    {
+      "path": "runs/ci-784-785-3f5e-5e7-final/artifacts/0057.raw",
+      "logical_path": "refresh-run-784-oss-final.stderr",
+      "source_path": "/private/tmp/aethyme-pr-784-785-ci-evidence-QPLQGM/refresh-run-784-oss-final.stderr",
+      "media_type": "application/octet-stream",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "runs/ci-784-785-3f5e-5e7-final/artifacts/0058.raw",
+      "logical_path": "refresh-run-784-oss.json",
+      "source_path": "/private/tmp/aethyme-pr-784-785-ci-evidence-QPLQGM/refresh-run-784-oss.json",
+      "media_type": "application/json",
+      "bytes": 12247,
+      "sha256": "ee0d9e7700c783c9c48d31c85e524f23fdb88a514cf7970c39dad4594e92152a"
+    },
+    {
+      "path": "runs/ci-784-785-3f5e-5e7-final/artifacts/0059.raw",
+      "logical_path": "refresh-run-784-oss.json.stderr",
+      "source_path": "/private/tmp/aethyme-pr-784-785-ci-evidence-QPLQGM/refresh-run-784-oss.json.stderr",
+      "media_type": "application/octet-stream",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "runs/ci-784-785-3f5e-5e7-final/artifacts/0060.raw",
+      "logical_path": "root-ci-snapshot.raw.json",
+      "source_path": "/private/tmp/aethyme-pr-784-785-ci-evidence-QPLQGM/root-ci-snapshot.raw.json",
+      "media_type": "application/json",
+      "bytes": 205217,
+      "sha256": "fa02a8cd9757af42ea8e7b0d64b7c8c086b47d4047aa70df1ef9db76792b602e"
+    },
+    {
+      "path": "runs/ci-784-785-3f5e-5e7-final/artifacts/0061.raw",
+      "logical_path": "root-ci-snapshot.summary.json",
+      "source_path": "/private/tmp/aethyme-pr-784-785-ci-evidence-QPLQGM/root-ci-snapshot.summary.json",
+      "media_type": "application/json",
+      "bytes": 178026,
+      "sha256": "931c1f977a98ceb5292c0eb514ff2c61d55a65a3b8e157395f7b9d856805f467"
+    },
+    {
+      "path": "runs/ci-784-785-3f5e-5e7-final/artifacts/0062.raw",
+      "logical_path": "run-784-oss-jobs.json",
+      "source_path": "/private/tmp/aethyme-pr-784-785-ci-evidence-QPLQGM/run-784-oss-jobs.json",
+      "media_type": "application/json",
+      "bytes": 10876,
+      "sha256": "9816eb4fee7666d0be6094fe6c41bf99a1d8a15b82819fb353aaa89a3749bfe7"
+    },
+    {
+      "path": "runs/ci-784-785-3f5e-5e7-final/artifacts/0063.raw",
+      "logical_path": "run-784-oss.json",
+      "source_path": "/private/tmp/aethyme-pr-784-785-ci-evidence-QPLQGM/run-784-oss.json",
+      "media_type": "application/json",
+      "bytes": 12247,
+      "sha256": "110e2c71297277f5690819100b15e354dbdb992940fa44862f12b0898594becd"
+    },
+    {
+      "path": "runs/ci-784-785-3f5e-5e7-final/artifacts/0064.raw",
+      "logical_path": "run-784-win-jobs.json",
+      "source_path": "/private/tmp/aethyme-pr-784-785-ci-evidence-QPLQGM/run-784-win-jobs.json",
+      "media_type": "application/json",
+      "bytes": 2060,
+      "sha256": "dd4b9259dfe3b2f89335a8c80293192616118c6ab04d947c2aaab5ab57cdb774"
+    },
+    {
+      "path": "runs/ci-784-785-3f5e-5e7-final/artifacts/0065.raw",
+      "logical_path": "run-784-win.json",
+      "source_path": "/private/tmp/aethyme-pr-784-785-ci-evidence-QPLQGM/run-784-win.json",
+      "media_type": "application/json",
+      "bytes": 12273,
+      "sha256": "a05dcded20d0881f74491bf1ddf96eef90692ceb2a16787ebdcd0b4f313fa3c1"
+    },
+    {
+      "path": "runs/ci-784-785-3f5e-5e7-final/artifacts/0066.raw",
+      "logical_path": "run-785-oss-jobs.json",
+      "source_path": "/private/tmp/aethyme-pr-784-785-ci-evidence-QPLQGM/run-785-oss-jobs.json",
+      "media_type": "application/json",
+      "bytes": 12041,
+      "sha256": "25ea63f659e38c7a3823dfcc4f5bc236e0d1bebd7ba872bc934668b60b39e858"
+    },
+    {
+      "path": "runs/ci-784-785-3f5e-5e7-final/artifacts/0067.raw",
+      "logical_path": "run-785-oss.json",
+      "source_path": "/private/tmp/aethyme-pr-784-785-ci-evidence-QPLQGM/run-785-oss.json",
+      "media_type": "application/json",
+      "bytes": 12179,
+      "sha256": "0e2db0dac6cd1dd8791c1d32964ab68ee44927fc82de85175dfea0ee8084f32e"
+    },
+    {
+      "path": "runs/ci-784-785-3f5e-5e7-final/artifacts/0068.raw",
+      "logical_path": "run-785-win-jobs.json",
+      "source_path": "/private/tmp/aethyme-pr-784-785-ci-evidence-QPLQGM/run-785-win-jobs.json",
+      "media_type": "application/json",
+      "bytes": 2060,
+      "sha256": "6d947eb4af384fb635c03e8d8a4ef938a3735e23abac398b87d96ca8ce1aaff3"
+    },
+    {
+      "path": "runs/ci-784-785-3f5e-5e7-final/artifacts/0069.raw",
+      "logical_path": "run-785-win.json",
+      "source_path": "/private/tmp/aethyme-pr-784-785-ci-evidence-QPLQGM/run-785-win.json",
+      "media_type": "application/json",
+      "bytes": 12202,
+      "sha256": "b26734ee2580567fd98f463449b633a293b8151c51a2fae0b2a4d7cdfc782bec"
+    },
+    {
+      "path": "runs/ci-784-785-3f5e-5e7-final/artifacts/0070.raw",
+      "logical_path": "src-784-execution-verifier-tests.rs",
+      "source_path": "/private/tmp/aethyme-pr-784-785-ci-evidence-QPLQGM/src-784-execution-verifier-tests.rs",
+      "media_type": "application/rls-services+xml",
+      "bytes": 33338,
+      "sha256": "623a93eb1a074893bd4adf9040de11f42fe9bd8eed0e34b14a1f59f21250ddfe"
+    },
+    {
+      "path": "runs/ci-784-785-3f5e-5e7-final/artifacts/0071.raw",
+      "logical_path": "src-docs_hygiene.rs",
+      "source_path": "/private/tmp/aethyme-pr-784-785-ci-evidence-QPLQGM/src-docs_hygiene.rs",
+      "media_type": "application/rls-services+xml",
+      "bytes": 18286,
+      "sha256": "08fddec5c743a477849aa05961ec7948ebff68e79a5ebeba4ad9c716e0c69d87"
+    },
+    {
+      "path": "runs/ci-784-785-3f5e-5e7-final/artifacts/0072.raw",
+      "logical_path": "src-longpath-collaboration_sensitive.rs",
+      "source_path": "/private/tmp/aethyme-pr-784-785-ci-evidence-QPLQGM/src-longpath-collaboration_sensitive.rs",
+      "media_type": "application/rls-services+xml",
+      "bytes": 193900,
+      "sha256": "aa2c1761aac4624fed9dffcdbec3bf8e438cccc26012ea7b3742cc5317db5788"
+    },
+    {
+      "path": "runs/ci-784-785-3f5e-5e7-final/artifacts/0073.raw",
+      "logical_path": "src-t56-v3.md",
+      "source_path": "/private/tmp/aethyme-pr-784-785-ci-evidence-QPLQGM/src-t56-v3.md",
+      "media_type": "application/octet-stream",
+      "bytes": 13088,
+      "sha256": "ee53ad7b76828f2c303fdf548598b57e190947bdea358ff5674d32f138926a43"
+    },
+    {
+      "path": "runs/ci-784-785-3f5e-5e7-final/artifacts/0074.raw",
+      "logical_path": "src-t56-v4-draft.md",
+      "source_path": "/private/tmp/aethyme-pr-784-785-ci-evidence-QPLQGM/src-t56-v4-draft.md",
+      "media_type": "application/octet-stream",
+      "bytes": 14595,
+      "sha256": "0988d7ef8228553c4d09e7289bf80198398aa4fa88be179273a114bb91d8f142"
+    },
+    {
+      "path": "runs/ci-784-785-3f5e-5e7-final/artifacts/0075.raw",
+      "logical_path": "src-t56-v4.md",
+      "source_path": "/private/tmp/aethyme-pr-784-785-ci-evidence-QPLQGM/src-t56-v4.md",
+      "media_type": "application/octet-stream",
+      "bytes": 17888,
+      "sha256": "e2ccd66349a0968fa9c3c2ab112aa763649662ced0b6ed7a11c46f29d0c94ccf"
+    },
+    {
+      "path": "runs/ci-784-785-3f5e-5e7-final/artifacts/0076.raw",
+      "logical_path": "tree-784.json",
+      "source_path": "/private/tmp/aethyme-pr-784-785-ci-evidence-QPLQGM/tree-784.json",
+      "media_type": "application/json",
+      "bytes": 919977,
+      "sha256": "11c8fe683a89b89ff4f6f68bc7063b32d8c7a4ba4e72677748ec0b9d39331c7a"
+    },
+    {
+      "path": "runs/ci-784-785-3f5e-5e7-final/artifacts/0077.raw",
+      "logical_path": "tree-784.json.stderr",
+      "source_path": "/private/tmp/aethyme-pr-784-785-ci-evidence-QPLQGM/tree-784.json.stderr",
+      "media_type": "application/octet-stream",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "runs/ci-784-785-3f5e-5e7-final/artifacts/0078.raw",
+      "logical_path": "tree-785.json",
+      "source_path": "/private/tmp/aethyme-pr-784-785-ci-evidence-QPLQGM/tree-785.json",
+      "media_type": "application/json",
+      "bytes": 917810,
+      "sha256": "286262055f18803efc5f6cec27b62c561b3e4500305e12d0712b0617e216b0d1"
+    },
+    {
+      "path": "runs/ci-784-785-3f5e-5e7-final/artifacts/0079.raw",
+      "logical_path": "tree-785.json.stderr",
+      "source_path": "/private/tmp/aethyme-pr-784-785-ci-evidence-QPLQGM/tree-785.json.stderr",
+      "media_type": "application/octet-stream",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "runs/ci-784-785-3f5e-5e7-final/artifacts/0080.raw",
+      "logical_path": "unavailable-784-workspace-log-response.stderr",
+      "source_path": "/private/tmp/aethyme-pr-784-785-ci-evidence-QPLQGM/unavailable-784-workspace-log-response.stderr",
+      "media_type": "application/octet-stream",
+      "bytes": 13,
+      "sha256": "6c5ec582d3b25e97273d17fd4088d0e13837c8384ee94aba555afc35856ec3ae"
+    },
+    {
+      "path": "runs/ci-784-785-3f5e-5e7-final/artifacts/0081.raw",
+      "logical_path": "unavailable-784-workspace-log-response.xml",
+      "source_path": "/private/tmp/aethyme-pr-784-785-ci-evidence-QPLQGM/unavailable-784-workspace-log-response.xml",
+      "media_type": "application/xml",
+      "bytes": 215,
+      "sha256": "5d2393b2bf25703e8c20740654bf739fe7fd27fa3565e71e42fcad0ec485e44e"
+    },
+    {
+      "path": "runs/artifact-verifier-reconciliation-9795/artifacts/0001.raw",
+      "logical_path": "final-local-validation-plan-v3.json",
+      "source_path": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/682-reconcile-final-local-qualification/target/local-resume/final-local-validation-plan-v3.json",
+      "media_type": "application/json",
+      "bytes": 4051,
+      "sha256": "7e16508fe753b7d454540c494cc8bf32ef488a3d097756fa7c8ed41f57e30417"
+    },
+    {
+      "path": "runs/artifact-verifier-reconciliation-9795/artifacts/0002.raw",
+      "logical_path": "reconciliation.json",
+      "source_path": "/private/tmp/1122-artifact-verifier-reconcile-hocludzi/reconciliation.json",
+      "media_type": "application/json",
+      "bytes": 627,
+      "sha256": "8e37d85b84daace3f62b8e480d179f2e83f29bd4c98dcd33456e701b1d73169c"
+    },
+    {
+      "path": "runs/artifact-verifier-reconciliation-9795/artifacts/0003.raw",
+      "logical_path": "v1.stderr",
+      "source_path": "/private/tmp/1122-artifact-verifier-reconcile-hocludzi/v1.stderr",
+      "media_type": "application/octet-stream",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "runs/artifact-verifier-reconciliation-9795/artifacts/0004.raw",
+      "logical_path": "v1.stdout.json",
+      "source_path": "/private/tmp/1122-artifact-verifier-reconcile-hocludzi/v1.stdout.json",
+      "media_type": "application/json",
+      "bytes": 155964,
+      "sha256": "00029518f417e5aabbd619dd8d4ebc57eb95e691bc19af72256c5fea81d6524a"
+    },
+    {
+      "path": "runs/artifact-verifier-reconciliation-9795/artifacts/0005.raw",
+      "logical_path": "v2.stderr",
+      "source_path": "/private/tmp/1122-artifact-verifier-reconcile-hocludzi/v2.stderr",
+      "media_type": "application/octet-stream",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "runs/artifact-verifier-reconciliation-9795/artifacts/0006.raw",
+      "logical_path": "v2.stdout.json",
+      "source_path": "/private/tmp/1122-artifact-verifier-reconcile-hocludzi/v2.stdout.json",
+      "media_type": "application/json",
+      "bytes": 1688,
+      "sha256": "89ccb867d5ad349b7eeb377306ad3e39b92cafa2346b52c33e3e2de395d07fc5"
+    },
+    {
+      "path": "runs/artifact-verifier-reconciliation-9795/artifacts/0007.raw",
+      "logical_path": "verifier-v1.py",
+      "source_path": "/private/tmp/1122-artifact-verifier-reconcile-hocludzi/verifier-v1.py",
+      "media_type": "text/x-python",
+      "bytes": 4040,
+      "sha256": "472838764e798fd8e3c4b9a44a83598093b8413e1419613d3397772c017ba7ed"
+    },
+    {
+      "path": "runs/artifact-verifier-reconciliation-9795/artifacts/0008.raw",
+      "logical_path": "verifier-v2.py",
+      "source_path": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/682-reconcile-final-local-qualification/target/local-resume/verify-final-local-artifacts-v2.py",
+      "media_type": "text/x-python",
+      "bytes": 4256,
+      "sha256": "a95da50d4b266d551f1d7bf61a737c0338c4b9f951ddd1a905ea00bb6f489efa"
     }
   ],
-  "updated_at_utc": "2026-10-15T22:21:33.966442+00:00",
+  "updated_at_utc": "2026-10-15T22:55:23.267470+00:00",
   "preflight_failures": [
     {
       "metadata": "runs/aggregate-offline-fx17-recorder-preflight-failure.json",
@@ -1490,6 +2202,17 @@
       "test_commands_launched": 0,
       "model_requests": 0,
       "credit": false
+    },
+    {
+      "id": "artifact-verifier-v1-t56-base-9795",
+      "source_head": "9795ec1be5d9d6ec6e9248467320c8efba49520c",
+      "reconciliation": "runs/artifact-verifier-reconciliation-9795/artifacts/0002.raw",
+      "original_stdout": "runs/artifact-verifier-reconciliation-9795/artifacts/0004.raw",
+      "original_stderr": "runs/artifact-verifier-reconciliation-9795/artifacts/0003.raw",
+      "numeric_exit": 1,
+      "error_count": 424,
+      "passing_command": false,
+      "scope": "Verifier bug:212validT56files were resolved relative ledgerparent instead of documentedpayloadsroot. No payload changed; originalfailure retained."
     }
   ],
   "ci_runs": [
@@ -1634,6 +2357,204 @@
       "exit_code": 100,
       "conclusion": "FAILURE",
       "passing_command": false
+    },
+    {
+      "id": "ci-784-3f5e-windows",
+      "metadata": "runs/ci-784-785-3f5e-5e7-final/artifacts/0064.raw",
+      "log": "runs/ci-784-785-3f5e-5e7-final/artifacts/0039.raw",
+      "checkout": "runs/ci-784-785-3f5e-5e7-final/artifacts/0031.raw",
+      "checkout_source": {
+        "actions_run_head_sha": "3f5e23adb49a50230eec28f287a8f2060d6e3f05",
+        "actions_run_id": 38817965846,
+        "complete_recursive_tree": true,
+        "merge_commit_api_response": "merge-784.json",
+        "merge_commit_sha": "732c8fbff708a52b627fd1b58be63ae95f9dca73",
+        "merge_parent_shas": [
+          "5e7fe7bf533ad269e03b8baa6e0afbfc38694f06",
+          "3f5e23adb49a50230eec28f287a8f2060d6e3f05"
+        ],
+        "merge_tree_sha": "35c5d2b64e51b240fa18253e190aa9abbd2d1b75",
+        "pr": 784,
+        "raw_checkout_logs": [
+          "raw-784-win.log"
+        ],
+        "recursive_tree_api_response": "tree-784.json",
+        "recursive_tree_entry_count": 3050,
+        "run_api_response": "run-784-win.json"
+      },
+      "exit_code": 128,
+      "conclusion": "FAILURE",
+      "passing_command": false,
+      "completed_counts": null,
+      "scope": "Checkout failed Filename too long before build/native smoke; no tests executed.",
+      "bundle_inventory": "runs/ci-784-785-3f5e-5e7-final/artifacts/0020.raw",
+      "metadata_scope": "Exact job_id within the final GitHub jobs API snapshot; workflow status is recorded separately in run_metadata.",
+      "run_metadata": "runs/ci-784-785-3f5e-5e7-final/artifacts/0065.raw",
+      "workflow_run_id": 38817965846,
+      "job_id": 116707273781
+    },
+    {
+      "id": "ci-785-5e7-windows",
+      "metadata": "runs/ci-784-785-3f5e-5e7-final/artifacts/0068.raw",
+      "log": "runs/ci-784-785-3f5e-5e7-final/artifacts/0043.raw",
+      "checkout": "runs/ci-784-785-3f5e-5e7-final/artifacts/0033.raw",
+      "checkout_source": {
+        "actions_run_head_sha": "5e7fe7bf533ad269e03b8baa6e0afbfc38694f06",
+        "actions_run_id": 38815529979,
+        "complete_recursive_tree": true,
+        "merge_commit_api_response": "merge-785.json",
+        "merge_commit_sha": "c72d80af88e6957be50adb2b45dfd70051b5ab58",
+        "merge_parent_shas": [
+          "8daffab2bb80ae0cce8286c530d70fad42c033f5",
+          "5e7fe7bf533ad269e03b8baa6e0afbfc38694f06"
+        ],
+        "merge_tree_sha": "bb712b8f6baa06bc52cd2ad726fc3bf3cb5e35a1",
+        "pr": 785,
+        "raw_checkout_logs": [
+          "raw-785-win.log"
+        ],
+        "recursive_tree_api_response": "tree-785.json",
+        "recursive_tree_entry_count": 3042,
+        "run_api_response": "run-785-win.json"
+      },
+      "exit_code": 128,
+      "conclusion": "FAILURE",
+      "passing_command": false,
+      "completed_counts": null,
+      "scope": "Checkout failed Filename too long before build/native smoke; no tests executed.",
+      "bundle_inventory": "runs/ci-784-785-3f5e-5e7-final/artifacts/0020.raw",
+      "metadata_scope": "Exact job_id within the final GitHub jobs API snapshot; workflow status is recorded separately in run_metadata.",
+      "run_metadata": "runs/ci-784-785-3f5e-5e7-final/artifacts/0069.raw",
+      "workflow_run_id": 38815529979,
+      "job_id": 116699117084
+    },
+    {
+      "id": "ci-784-3f5e-lint",
+      "metadata": "runs/ci-784-785-3f5e-5e7-final/artifacts/0047.raw",
+      "log": "runs/ci-784-785-3f5e-5e7-final/artifacts/0037.raw",
+      "checkout": "runs/ci-784-785-3f5e-5e7-final/artifacts/0031.raw",
+      "checkout_source": {
+        "actions_run_head_sha": "3f5e23adb49a50230eec28f287a8f2060d6e3f05",
+        "actions_run_id": 38817965918,
+        "complete_recursive_tree": true,
+        "merge_commit_api_response": "merge-784.json",
+        "merge_commit_sha": "732c8fbff708a52b627fd1b58be63ae95f9dca73",
+        "merge_parent_shas": [
+          "5e7fe7bf533ad269e03b8baa6e0afbfc38694f06",
+          "3f5e23adb49a50230eec28f287a8f2060d6e3f05"
+        ],
+        "merge_tree_sha": "35c5d2b64e51b240fa18253e190aa9abbd2d1b75",
+        "pr": 784,
+        "raw_checkout_logs": [
+          "raw-784-lint.log"
+        ],
+        "recursive_tree_api_response": "tree-784.json",
+        "recursive_tree_entry_count": 3050,
+        "run_api_response": "refresh-run-784-oss-final.json"
+      },
+      "exit_code": 1,
+      "conclusion": "FAILURE",
+      "passing_command": false,
+      "completed_counts": null,
+      "scope": "Formatting check failed on two capture call layouts; Clippy and dependency audit skipped.",
+      "bundle_inventory": "runs/ci-784-785-3f5e-5e7-final/artifacts/0020.raw",
+      "metadata_scope": "Exact job_id within the final GitHub jobs API snapshot; workflow status is recorded separately in run_metadata.",
+      "run_metadata": "runs/ci-784-785-3f5e-5e7-final/artifacts/0056.raw",
+      "workflow_run_id": 38817965918,
+      "job_id": 116707658905
+    },
+    {
+      "id": "ci-785-5e7-workspace",
+      "metadata": "runs/ci-784-785-3f5e-5e7-final/artifacts/0066.raw",
+      "log": "runs/ci-784-785-3f5e-5e7-final/artifacts/0045.raw",
+      "checkout": "runs/ci-784-785-3f5e-5e7-final/artifacts/0033.raw",
+      "checkout_source": {
+        "actions_run_head_sha": "5e7fe7bf533ad269e03b8baa6e0afbfc38694f06",
+        "actions_run_id": 38815530375,
+        "complete_recursive_tree": true,
+        "merge_commit_api_response": "merge-785.json",
+        "merge_commit_sha": "c72d80af88e6957be50adb2b45dfd70051b5ab58",
+        "merge_parent_shas": [
+          "8daffab2bb80ae0cce8286c530d70fad42c033f5",
+          "5e7fe7bf533ad269e03b8baa6e0afbfc38694f06"
+        ],
+        "merge_tree_sha": "bb712b8f6baa06bc52cd2ad726fc3bf3cb5e35a1",
+        "pr": 785,
+        "raw_checkout_logs": [
+          "raw-785-workspace.log"
+        ],
+        "recursive_tree_api_response": "tree-785.json",
+        "recursive_tree_entry_count": 3042,
+        "run_api_response": "run-785-oss.json"
+      },
+      "exit_code": 100,
+      "conclusion": "FAILURE",
+      "passing_command": false,
+      "completed_counts": {
+        "tests_run": 4602,
+        "passed": 4601,
+        "failed": 1,
+        "skipped": 32
+      },
+      "scope": "Completed workspace: missing date metadata in three frozen Markdown payloads; no passing-command credit.",
+      "bundle_inventory": "runs/ci-784-785-3f5e-5e7-final/artifacts/0020.raw",
+      "metadata_scope": "Exact job_id within the final GitHub jobs API snapshot; workflow status is recorded separately in run_metadata.",
+      "run_metadata": "runs/ci-784-785-3f5e-5e7-final/artifacts/0067.raw",
+      "workflow_run_id": 38815530375,
+      "job_id": 116699119785
+    },
+    {
+      "id": "ci-784-3f5e-workspace-cancelled",
+      "metadata": "runs/ci-784-785-3f5e-5e7-final/artifacts/0047.raw",
+      "log": "runs/ci-784-785-3f5e-5e7-final/artifacts/0041.raw",
+      "checkout": "runs/ci-784-785-3f5e-5e7-final/artifacts/0031.raw",
+      "checkout_source": {
+        "actions_run_head_sha": "3f5e23adb49a50230eec28f287a8f2060d6e3f05",
+        "actions_run_id": 38817965918,
+        "complete_recursive_tree": true,
+        "merge_commit_api_response": "merge-784.json",
+        "merge_commit_sha": "732c8fbff708a52b627fd1b58be63ae95f9dca73",
+        "merge_parent_shas": [
+          "5e7fe7bf533ad269e03b8baa6e0afbfc38694f06",
+          "3f5e23adb49a50230eec28f287a8f2060d6e3f05"
+        ],
+        "merge_tree_sha": "35c5d2b64e51b240fa18253e190aa9abbd2d1b75",
+        "pr": 784,
+        "raw_checkout_logs": [
+          "raw-784-workspace-after-cancel.log"
+        ],
+        "recursive_tree_api_response": "tree-784.json",
+        "recursive_tree_entry_count": 3050,
+        "run_api_response": "refresh-run-784-oss-final.json"
+      },
+      "exit_code": null,
+      "conclusion": "CANCELLED",
+      "passing_command": false,
+      "completed_counts": null,
+      "scope": "Cancelled after observed progress2274/4623 and50 distinct TRY1 failures. Progress is not a completed denominator; final counts/numeric commandexit unknown.",
+      "bundle_inventory": "runs/ci-784-785-3f5e-5e7-final/artifacts/0020.raw",
+      "metadata_scope": "Exact job_id within the final GitHub jobs API snapshot; workflow status is recorded separately in run_metadata.",
+      "run_metadata": "runs/ci-784-785-3f5e-5e7-final/artifacts/0056.raw",
+      "workflow_run_id": 38817965918,
+      "job_id": 116707659366
+    }
+  ],
+  "artifact_bundles": [
+    {
+      "id": "ci-784-785-3f5e-5e7-final",
+      "imported_at_source_head": "eb31a3c51b8b295abaccaf19e6294c468df41558",
+      "storage": "Opaque byte-preserved evidence payloads; resolve each original logical path through files[].logical_path. Original formats, hashes and contents are unchanged.",
+      "files": 81,
+      "bytes": 7669597,
+      "scope": "Read-only exact CI capture: old7843f cancelled workspace, formatting and Windows checkout failures; old7855e completed workspace1failure and Windows checkoutfailure. No workflow reruns or passing qualification for later fixes."
+    },
+    {
+      "id": "artifact-verifier-reconciliation-9795",
+      "imported_at_source_head": "eb31a3c51b8b295abaccaf19e6294c468df41558",
+      "storage": "Opaque byte-preserved evidence payloads; resolve each original logical path through files[].logical_path. Original formats, hashes and contents are unchanged.",
+      "files": 8,
+      "bytes": 170626,
+      "scope": "Original v1 failed at root9795 with424 T56 payload-root resolution errors. Original outputs and v1 script preserved; independently reviewed exact-schema v2 base adapter yielded753payloads37links0errors at that same source. Later flatpackage addsone preserved oldledger artifact. v3validationplan only changes permitted runtime order, no tests/runner predicates."
     }
   ]
 }

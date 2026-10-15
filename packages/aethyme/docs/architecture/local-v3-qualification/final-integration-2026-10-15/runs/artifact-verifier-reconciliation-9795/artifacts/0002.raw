@@ -1,0 +1,12 @@
+{
+  "created_at_utc": "2026-10-15T22:35:08.209123+00:00",
+  "reason": "The generic verifier interpreted T56 payload-relative inventory entries as ledger-relative. The files and ledger are unchanged; v2 uses the documented payload root for this exact versioned schema, retaining all hash/byte/tracked/path checks.",
+  "old_verifier_sha256": "472838764e798fd8e3c4b9a44a83598093b8413e1419613d3397772c017ba7ed",
+  "old_exit": 1,
+  "old_errors": 424,
+  "new_verifier_sha256": "a95da50d4b266d551f1d7bf61a737c0338c4b9f951ddd1a905ea00bb6f489efa",
+  "new_exit": 0,
+  "new_selected_payloads": 753,
+  "new_links": 37,
+  "new_errors": 0
+}
