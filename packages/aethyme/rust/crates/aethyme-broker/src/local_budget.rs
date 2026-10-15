@@ -276,6 +276,34 @@ pub struct BudgetStatus {
     pub reservation_count: u64,
     pub reservations_truncated: bool,
     pub selected_reservation: Option<ReservationStatus>,
+    pub nonce_lookup: Option<NonceLookupStatus>,
+}
+
+/// Bounded, read-only reconciliation for a dispatch command whose stdout was
+/// lost. A nonce lookup never retries or resumes the associated work.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct NonceLookupStatus {
+    pub nonce: String,
+    pub outcome: NonceLookupOutcome,
+    /// At most two rows are returned. The schema makes nonce unique; an
+    /// ambiguous result is a defensive signal for a corrupt or legacy ledger.
+    pub matches: Vec<ReservationStatus>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NonceLookupOutcome {
+    NotFound,
+    Found,
+    Ambiguous,
+}
+
+fn nonce_lookup_outcome(matches: usize) -> NonceLookupOutcome {
+    match matches {
+        0 => NonceLookupOutcome::NotFound,
+        1 => NonceLookupOutcome::Found,
+        _ => NonceLookupOutcome::Ambiguous,
+    }
 }
 
 /// A non-cloneable attempt identity. This is a model dispatch permit, not an
@@ -1290,7 +1318,16 @@ pub fn status(
     target_name: &str,
     issuer: &str,
     reservation: Option<&RecordId>,
+    nonce: Option<&str>,
 ) -> Result<BudgetStatus, BudgetError> {
+    if reservation.is_some() && nonce.is_some() {
+        return Err(BudgetError::Invalid(
+            "reservation and nonce lookups are mutually exclusive".into(),
+        ));
+    }
+    if let Some(nonce) = nonce {
+        id(nonce)?;
+    }
     let _response = crate::collaboration_sensitive::response_use(store)?;
     let actual_issuer: Option<String> = store
         .read_connection()
@@ -1417,6 +1454,36 @@ pub fn status(
         })
         .transpose()?;
 
+    let nonce_lookup = if let Some(nonce) = nonce {
+        let keys: Vec<String> = store
+            .read_connection()
+            .prepare(
+                "SELECT reservation FROM local_budget_reservations WHERE nonce=?1 AND target=?2 ORDER BY rowid LIMIT 2",
+            )?
+            .query_map(params![nonce, target_name], |row| row.get(0))?
+            .collect::<Result<_, _>>()?;
+        let reservations = keys
+            .iter()
+            .map(|key| load(store, &id(key)?))
+            .collect::<Result<Vec<_>, _>>()?;
+        if reservations.iter().any(|row| {
+            row.spec.target != target_name
+                || row.spec.issuer != issuer
+                || row.spec.request.nonce != nonce
+        }) {
+            return Err(BudgetError::Invalid("nonce lookup binding".into()));
+        }
+        let outcome = nonce_lookup_outcome(reservations.len());
+        let matches = reservations.iter().map(reservation_status).collect();
+        Some(NonceLookupStatus {
+            nonce: nonce.into(),
+            outcome,
+            matches,
+        })
+    } else {
+        None
+    };
+
     Ok(BudgetStatus {
         target: target_name.into(),
         issuer: issuer.into(),
@@ -1432,6 +1499,7 @@ pub fn status(
         reservation_count: reservation_count as u64,
         reservations_truncated: reservation_count > STATUS_RESERVATION_LIMIT,
         selected_reservation,
+        nonce_lookup,
     })
 }
 

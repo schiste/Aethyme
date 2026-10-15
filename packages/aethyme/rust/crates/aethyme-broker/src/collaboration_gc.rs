@@ -2293,6 +2293,68 @@ mod tests {
         );
     }
 
+    #[test]
+    fn releasing_capture_root_does_not_reclaim_a_target_rooted_contribution() {
+        let host = tempfile::tempdir().unwrap();
+        let (source, base, result) = repo("target-root");
+        let mut store = open(host.path());
+        let request = request(
+            source.path(),
+            "op-target-root",
+            &base,
+            &result,
+            RetentionBoundary::UntilReleased,
+        );
+        let receipt = captured(&mut store, &request);
+
+        let owner =
+            crate::local_target::acquire_controller(&mut store, "target", "issuer").unwrap();
+        let spec = crate::local_target::TargetSpec {
+            objective_authorization: format!("sha256:{}", "1".repeat(64)),
+            objective: "retain captured contribution".into(),
+            baseline: receipt.base.as_str().into(),
+            contributions: vec![crate::local_target::RequestedContribution {
+                id: "captured".into(),
+                lineage: receipt.contribution.as_str().into(),
+                requires: vec![],
+                atomic_group: None,
+                revision_of: None,
+                derived_from: vec![],
+            }],
+            selected: vec!["captured".into()],
+            requirements: vec![],
+            acceptance_policy: format!("sha256:{}", "2".repeat(64)),
+            composer_profile: crate::composer::PROVISIONAL_TEXT_PROFILE.into(),
+        };
+        let revision = crate::local_target::propose_revision(&mut store, &owner, spec).unwrap();
+        crate::local_target::select_revision(&mut store, &owner, &revision.id).unwrap();
+
+        let released = crate::collaboration_capture::release_retention(
+            &mut store,
+            &receipt.operation_id,
+            &receipt.receipt_record_id,
+        )
+        .unwrap();
+        assert!(released.released_now);
+        let target_roots: i64 = store
+            .read_connection()
+            .query_row(
+                "SELECT count(*) FROM local_target_roots WHERE revision=?1 AND kind='contribution' AND reference=?2",
+                rusqlite::params![revision.id.as_str(), receipt.contribution.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(target_roots, 1);
+
+        age(&store);
+        let plan = plan(&mut store, &defaults()).unwrap();
+        assert!(plan.blockers.is_empty(), "{:?}", plan.blockers);
+        assert!(objects(&plan).is_empty(), "{:?}", plan.reclaimable);
+        assert!(plan.entities.is_empty());
+        apply(&mut store, &plan.digest, &defaults()).unwrap();
+        assert_reconstructs(&store, &receipt);
+    }
+
     /// An attached brief is part of its contribution: kept while the
     /// contribution is live, reclaimed with it, and its row never breaks
     /// the foreign key. A superseded brief is an orphan.

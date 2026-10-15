@@ -2,9 +2,10 @@
 use super::*;
 use crate::collaboration_state::{CollaborationSnapshot, inspect_for_repository};
 use crate::{
-    collaboration_sensitive as response, execution_verifier as verifier,
-    local_authority as authority, local_budget as budget, local_capture_notice as notices,
-    local_handoff as handoff, local_restore as restore, local_target as target,
+    collaboration_capture as capture, collaboration_sensitive as response,
+    execution_verifier as verifier, local_authority as authority, local_budget as budget,
+    local_capture_notice as notices, local_handoff as handoff, local_restore as restore,
+    local_target as target,
 };
 use rusqlite::OptionalExtension;
 use std::collections::BTreeMap;
@@ -434,19 +435,34 @@ pub(super) fn budget_objective_authorize(root: &Path, rest: &[&str]) -> Result<O
 
 /// Read immutable budget appointments and ledger status after a lost response.
 pub(super) fn budget_status(root: &Path, rest: &[&str]) -> Result<Output, Failure> {
-    let flags = Flags::parse(rest, &["--target", "--issuer", "--reservation"], &[])?;
+    let flags = Flags::parse(
+        rest,
+        &["--target", "--issuer", "--reservation", "--nonce"],
+        &[],
+    )?;
+    if flags.0.contains_key("--reservation") && flags.0.contains_key("--nonce") {
+        return Err(Failure::usage(
+            "--reservation and --nonce are mutually exclusive",
+        ));
+    }
     let reservation = flags
         .0
         .get("--reservation")
         .and_then(|values| values.first())
         .map(|value| parse_record(value))
         .transpose()?;
+    let nonce = flags
+        .0
+        .get("--nonce")
+        .and_then(|values| values.first())
+        .copied();
     let store = open(root)?;
     let status = budget::status(
         &store,
         flags.one("--target")?,
         flags.one("--issuer")?,
         reservation.as_ref(),
+        nonce,
     )
     .map_err(|error| Failure::domain("budget_status", error.to_string()))?;
     let reservations_shown = status.reservations.len();
@@ -454,6 +470,18 @@ pub(super) fn budget_status(root: &Path, rest: &[&str]) -> Result<Output, Failur
         .reservation_count
         .saturating_sub(reservations_shown as u64);
     let target_name = status.target.clone();
+    let nonce_summary = status.nonce_lookup.as_ref().map(|lookup| {
+        match lookup.outcome {
+            budget::NonceLookupOutcome::NotFound => "no reservation matches this target and nonce",
+            budget::NonceLookupOutcome::Found => {
+                "one matching reservation found; no work was retried"
+            }
+            budget::NonceLookupOutcome::Ambiguous => {
+                "multiple matching reservations; inspect ledger before acting"
+            }
+        }
+        .to_owned()
+    });
     Ok((
         json!({
             "schema":"aethyme.collab-budget-status/experimental-v0",
@@ -464,14 +492,52 @@ pub(super) fn budget_status(root: &Path, rest: &[&str]) -> Result<Output, Failur
             "grants_dispatch":false
         }),
         format!(
-            "budget status for {target_name}: {} of {} reservation rows shown{}; no dispatch authority granted\n",
+            "budget status for {target_name}: {} of {} reservation rows shown{}{}; no dispatch authority granted\n",
             reservations_shown,
             status.reservation_count,
             if omitted > 0 {
                 format!("; {omitted} older rows omitted")
             } else {
                 String::new()
-            }
+            },
+            nonce_summary
+                .map(|summary| format!("; {summary}"))
+                .unwrap_or_default()
+        ),
+    ))
+}
+
+/// Release only the contribution root of an exact committed capture receipt.
+pub(super) fn capture_release(root: &Path, rest: &[&str]) -> Result<Output, Failure> {
+    let flags = Flags::parse(rest, &["--operation", "--confirm"], &[])?;
+    let operation_text = flags.one("--operation")?;
+    let operation = capture::OperationId::parse(operation_text)
+        .map_err(|error| Failure::usage(error.to_string()))?;
+    let confirmation = parse_record(flags.one("--confirm")?)?;
+    let mut store = open(root)?;
+    let result = capture::release_retention(&mut store, &operation, &confirmation)
+        .map_err(|error| Failure::domain(error.code(), error.to_string()))?;
+    let action = if result.released_now {
+        "released_now"
+    } else {
+        "already_released_or_not_live"
+    };
+    Ok((
+        json!({
+            "schema":super::CAPTURE_RELEASE_SCHEMA,
+            "operation_id":result.operation_id.as_str(),
+            "receipt_record_id":result.receipt_record_id.as_str(),
+            "released_now":result.released_now,
+            "result":action,
+            "root_kind":"contribution",
+            "other_roots_may_retain_source":true,
+            "source_erasure_claimed":false,
+            "grants_dispatch":false
+        }),
+        format!(
+            "capture {} contribution root: {}; other roots may retain source; this does not erase source\n",
+            result.operation_id.as_str(),
+            action
         ),
     ))
 }

@@ -71,6 +71,113 @@ fn receipt() -> RecordId {
 }
 
 #[test]
+fn nonce_status_recovers_pending_dispatch_without_replaying_it() {
+    let (mut f, owner, wave) = setup();
+    let request = request('a', 3, WorkKind::Composition);
+    let reserved = reserve(&mut f.store, &owner, &wave, request.clone(), 0).unwrap();
+    let attempt = begin_attempt(&mut f.store, &owner, &reserved.id, 0).unwrap();
+
+    let status = status(
+        &f.store,
+        owner.target(),
+        owner.issuer(),
+        None,
+        Some(&request.nonce),
+    )
+    .unwrap();
+    let lookup = status.nonce_lookup.unwrap();
+    assert_eq!(lookup.outcome, NonceLookupOutcome::Found);
+    assert_eq!(lookup.matches.len(), 1);
+    assert_eq!(lookup.matches[0].id, reserved.id.as_str());
+    assert_eq!(lookup.matches[0].phase, State::CompletionPending);
+    assert_eq!(lookup.matches[0].attempts, 1);
+    assert_eq!(lookup.matches[0].version, attempt.version);
+
+    // Reconciliation is read-only: a second lookup reports the same pending
+    // attempt and does not begin another attempt or change its version.
+    let repeated = status(
+        &f.store,
+        owner.target(),
+        owner.issuer(),
+        None,
+        Some(&request.nonce),
+    )
+    .unwrap()
+    .nonce_lookup
+    .unwrap();
+    assert_eq!(repeated, lookup);
+
+    let absent = status(
+        &f.store,
+        owner.target(),
+        owner.issuer(),
+        None,
+        Some(&reference('f')),
+    )
+    .unwrap()
+    .nonce_lookup
+    .unwrap();
+    assert_eq!(absent.outcome, NonceLookupOutcome::NotFound);
+    assert!(absent.matches.is_empty());
+}
+
+#[test]
+fn duplicate_nonce_matches_are_classified_as_ambiguous() {
+    assert_eq!(nonce_lookup_outcome(0), NonceLookupOutcome::NotFound);
+    assert_eq!(nonce_lookup_outcome(1), NonceLookupOutcome::Found);
+    assert_eq!(nonce_lookup_outcome(2), NonceLookupOutcome::Ambiguous);
+}
+
+#[test]
+fn nonce_status_finds_historical_reservation_after_revision_and_epoch_change() {
+    let (mut f, owner, wave_id) = setup();
+    let request = request('a', 3, WorkKind::Composition);
+    let reservation = reserve(&mut f.store, &owner, &wave_id, request.clone(), 0).unwrap();
+    let original_revision = reservation.spec.revision.clone();
+    let attempt = begin_attempt(&mut f.store, &owner, &reservation.id, 0).unwrap();
+    let settled = settle(&mut f.store, &owner, &attempt, units(1), &receipt()).unwrap();
+    close(&mut f.store, &owner, &reservation.id, settled.version).unwrap();
+
+    crate::local_wave::stop(&mut f.store, &owner, &wave_id).unwrap();
+    let previous = target::status(&f.store, owner.target())
+        .unwrap()
+        .revision
+        .unwrap();
+    let mut next_spec = f.spec();
+    next_spec.objective = "a later target revision".into();
+    let next = target::propose_revision(&mut f.store, &owner, next_spec).unwrap();
+    target::select_revision(&mut f.store, &owner, &next.id).unwrap();
+    assert_ne!(previous, next.id);
+
+    let witness = crate::local_authority::status(&f.store).unwrap();
+    let frozen = crate::local_authority::freeze(
+        &mut f.store,
+        &witness.epoch,
+        "rotate the target authority epoch",
+    )
+    .unwrap();
+    crate::local_authority::resume(&mut f.store, &frozen.epoch).unwrap();
+
+    let status = status(
+        &f.store,
+        owner.target(),
+        owner.issuer(),
+        None,
+        Some(&request.nonce),
+    )
+    .unwrap();
+    let lookup = status.nonce_lookup.unwrap();
+    assert_eq!(lookup.outcome, NonceLookupOutcome::Found);
+    assert_eq!(lookup.matches.len(), 1);
+    assert_eq!(lookup.matches[0].id, reservation.id.as_str());
+    assert_eq!(lookup.matches[0].revision, original_revision);
+    assert_eq!(
+        target::status(&f.store, owner.target()).unwrap().revision,
+        Some(next.id)
+    );
+}
+
+#[test]
 fn immutable_project_and_objective_caps_cannot_replenish_spending() {
     let (mut f, owner, wave) = setup();
     assert!(matches!(

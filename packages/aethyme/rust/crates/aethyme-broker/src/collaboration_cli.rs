@@ -50,6 +50,7 @@ pub const STATUS_SCHEMA: &str = "aethyme.collab-status/experimental-v0";
 pub const CAPTURE_RECOVER_SCHEMA: &str = "aethyme.collab-capture-recover/experimental-v0";
 pub const CAPTURE_ABORT_SCHEMA: &str = "aethyme.collab-capture-abort/experimental-v0";
 pub const CAPTURE_RECEIPT_SCHEMA: &str = "aethyme.collab-capture-receipt/experimental-v0";
+pub const CAPTURE_RELEASE_SCHEMA: &str = "aethyme.collab-capture-release/experimental-v0";
 pub const GC_PLAN_SCHEMA: &str = "aethyme.collab-gc-plan/experimental-v0";
 pub const GC_APPLY_SCHEMA: &str = "aethyme.collab-gc-apply/experimental-v0";
 pub const GC_RESUME_SCHEMA: &str = "aethyme.collab-gc-resume/experimental-v0";
@@ -92,6 +93,9 @@ Usage:
   aethyme collab capture receipt --operation <id> [--json]
       Show a capture's receipt. `released` or `reclaimed` means the source is
       no longer promised; only `retained_local` is.
+  aethyme collab capture release --operation <id> --confirm <receipt-record-id> [--json]
+      Release only that committed capture's contribution root. Other roots may
+      still retain source; this command does not reclaim or erase it.
   aethyme collab gc plan [--json]
       Survey retained data and record a plan. Removes nothing.
   aethyme collab gc apply --confirm <digest> [--json]
@@ -137,9 +141,11 @@ Additional explicit lifecycle commands (provisional Local packages):
       Appoint the immutable project budget policy from a strict bounded file.
   aethyme collab target budget objective --target NAME --issuer NAME --file PATH [--json]
       Appoint the immutable cap for the current target objective authorization.
-  aethyme collab target budget status --target NAME --issuer NAME [--reservation ID] [--json]
+  aethyme collab target budget status --target NAME --issuer NAME
+       [--reservation ID | --nonce NONCE] [--json]
       Reconcile immutable policies, totals, and up to 500 newest reservation rows.
-      An exact reservation lookup is included even when older than that page.
+      Exact reservation or nonce lookup is included even when older than that
+      page; nonce lookup is read-only and never retries or resumes work.
   aethyme collab target verifier prepare --harness-repo PATH --commit OID
        --inventory PATH --operation ID --docker ABSOLUTE_PATH --endpoint UNIX_SOCKET
        --file PLAN.json [--json]
@@ -456,6 +462,7 @@ fn dispatch(options: Options) -> Result<Output, Failure> {
         ["capture", "recover"] => capture_recover(&main_root),
         ["capture", "abort", rest @ ..] => capture_abort(&main_root, rest),
         ["capture", "receipt", rest @ ..] => capture_receipt(&main_root, rest),
+        ["capture", "release", rest @ ..] => lifecycle::capture_release(&main_root, rest),
         ["gc", "plan"] => gc_plan_command(&main_root),
         ["gc", "apply", rest @ ..] => gc_apply_command(&main_root, rest),
         ["gc", "resume"] => gc_resume_command(&main_root),
