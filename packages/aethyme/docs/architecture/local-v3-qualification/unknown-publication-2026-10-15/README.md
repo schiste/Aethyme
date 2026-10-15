@@ -16,3 +16,7 @@ This is one finite schedule. It supplies no repeated external-drift or FX17
 reliability claim. Private temporary-root archiving is recorded separately;
 these repository artifacts preserve the original observations. No experiment
 was rerun to prepare this record.
+
+The original attempt 003 log ends with an extra blank line. It is retained
+byte-for-byte to preserve its recorded digest; that raw artifact is the sole
+whitespace-check exception in this evidence addition.
