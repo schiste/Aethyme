@@ -1,0 +1,33 @@
+{
+  "actual_log": {
+    "bytes": 8044,
+    "command_json_agrees_with_bytes": true,
+    "command_json_reported_sha256": "cfaa178eb8a1c2e3a55c5bbc130a5f54463106ad3140da9734e4552023f654a8",
+    "origin_path": "target/local-resume/retention-checks/20261015T224817Z-1129-fixed-sensitive-module-b65b979b/command.log",
+    "path": "payloads/artifacts/0009.raw",
+    "sha256_recomputed_from_bytes": "cfaa178eb8a1c2e3a55c5bbc130a5f54463106ad3140da9734e4552023f654a8"
+  },
+  "checks": {
+    "command_json_hash_matches_actual_log": true,
+    "final_success_source_commit": "3af335ab87618cc7fcb92a4a5b01ad23edb633d9",
+    "manifest_claim_matches_actual_log": false,
+    "payload_bytes_and_sha_recomputed": true,
+    "source_commit_for_failed_attempt": "cc72eba185b4736a10af555a7f88448daa514ed3"
+  },
+  "command_json": {
+    "bytes": 4111,
+    "origin_path": "target/local-resume/retention-checks/20261015T224817Z-1129-fixed-sensitive-module-b65b979b/command.json",
+    "path": "payloads/artifacts/0070.raw",
+    "sha256_recomputed_from_bytes": "e4b8b1464d185713de1ffc797a1c2a9870747ae02fc0c7ea95e38002a559ff13"
+  },
+  "interpretation": "This historical failed-attempt manifest mismatch does not affect the final positive or mutation-control records, each of which remains bound to clean source commit 3af335ab87618cc7fcb92a4a5b01ad23edb633d9 and its own verified raw command log.",
+  "manifest": {
+    "origin_path": "/private/tmp/1129-focused-positive-manifest-v2.json",
+    "path": "payloads/artifacts/0057.raw",
+    "reported_log_sha256": "cfaa178eb8a1c2e3a55c5bbc130a5f544024c49ef8901dbd8f665c59c0e413ecf",
+    "run": "20261015T224817Z-1129-fixed-sensitive-module-b65b979b",
+    "sha256": "276cc956987d1631d9e6b983b1f4c67c551e5df2462025701fc18f1f7f449730"
+  },
+  "reason": "The immutable v2 positive manifest has one incorrect SHA-256 for a preserved failed run. Preserve both stated and independently recomputed values.",
+  "schema": "aethyme.evidence-hash-reconciliation/v1"
+}

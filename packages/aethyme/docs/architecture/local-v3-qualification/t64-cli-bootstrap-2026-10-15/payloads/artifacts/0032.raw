@@ -1,0 +1,36 @@
+   Compiling serde v1.0.229
+   Compiling indexmap v2.14.0
+   Compiling bitflags v2.11.0
+   Compiling regex-automata v0.4.18
+   Compiling oxc_regular_expression v0.125.0
+   Compiling oxc_index v4.1.0
+   Compiling ordermap v1.2.0
+   Compiling get-size2 v0.7.4
+   Compiling oxc_syntax v0.125.0
+   Compiling rustpython-ruff_text_size v0.15.8
+   Compiling toml_datetime v0.6.11
+   Compiling serde_spanned v0.6.9
+   Compiling toml_edit v0.22.27
+   Compiling oxc_ast v0.125.0
+   Compiling rustpython-ruff_source_file v0.15.8
+   Compiling aethyme-graph-schema v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/complete-fresh-local-cli-bootstrap-and-c/packages/aethyme/rust/crates/aethyme-graph-schema)
+   Compiling toml v0.8.23
+   Compiling rustpython-ruff_python_trivia v0.15.8
+   Compiling serde_json v1.0.151
+   Compiling bincode v1.3.3
+   Compiling hashbrown v0.14.5
+   Compiling rustpython-ruff_python_ast v0.15.8
+   Compiling rowan v0.15.18
+   Compiling aethyme-graph-storage v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/complete-fresh-local-cli-bootstrap-and-c/packages/aethyme/rust/crates/aethyme-graph-storage)
+   Compiling regex v1.12.4
+   Compiling oxc_ecmascript v0.125.0
+   Compiling bstr v1.12.1
+   Compiling tree-sitter v0.25.10
+   Compiling rustpython-ruff_python_parser v0.15.8
+   Compiling ra_ap_syntax v0.0.331
+   Compiling oxc_parser v0.125.0
+   Compiling oxc_ast_visit v0.125.0
+   Compiling aethyme-producers v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/complete-fresh-local-cli-bootstrap-and-c/packages/aethyme/rust/crates/aethyme-producers)
+   Compiling aethyme-graph-indexer v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/complete-fresh-local-cli-bootstrap-and-c/packages/aethyme/rust/crates/aethyme-graph-indexer)
+   Compiling aethyme-engine v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/complete-fresh-local-cli-bootstrap-and-c/packages/aethyme/rust/crates/aethyme-engine)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 9.92s

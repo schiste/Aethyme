@@ -1,0 +1,39 @@
+   Compiling aethyme-broker v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/complete-fresh-local-cli-bootstrap-and-c/packages/aethyme/rust/crates/aethyme-broker)
+warning: function `compose_after_accepted` is never used
+   --> crates/aethyme-broker/src/composer.rs:411:15
+    |
+411 | pub(crate) fn compose_after_accepted(
+    |               ^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `aethyme-broker` (lib) generated 1 warning
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 55.89s
+     Running unittests src/lib.rs (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/integrate-reviewed-local-bare-git-servic/target/local-resume/cargo/debug/deps/aethyme_broker-0f278e0d02146111)
+
+running 5 tests
+
+thread 'local_capture_notice::tests::owner_tick_marks_notice_from_old_epoch_stale_without_admission_effects' (11137615) panicked at crates/aethyme-broker/src/local_capture_notice/tests.rs:340:82:
+called `Result::unwrap()` on an `Err` value: Wave(Target(Frozen))
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test local_capture_notice::tests::duplicate_ingress_and_owner_ticks_are_idempotent_for_one_arrival ... ok
+test local_capture_notice::tests::owner_tick_marks_notice_from_old_epoch_stale_without_admission_effects ... FAILED
+
+thread 'local_capture_notice::tests::ingress_cannot_interleave_between_notice_drain_and_wave_admission' (11137613) panicked at crates/aethyme-broker/src/local_capture_notice/tests.rs:447:9:
+assertion failed: matches!(admission, crate::local_wave::Admission::Frozen(_))
+test local_capture_notice::tests::notice_ingress_refuses_unbound_issuer_revision_and_capture_without_admission_effects ... ok
+
+thread '<unnamed>' (11138373) panicked at crates/aethyme-broker/src/local_capture_notice/tests.rs:422:38:
+called `Result::unwrap()` on an `Err` value: SendError { .. }
+test local_capture_notice::tests::ingress_cannot_interleave_between_notice_drain_and_wave_admission ... FAILED
+test local_capture_notice::tests::pending_notice_limit_accepts_512_and_refuses_513_without_effects ... ok
+
+failures:
+
+failures:
+    local_capture_notice::tests::ingress_cannot_interleave_between_notice_drain_and_wave_admission
+    local_capture_notice::tests::owner_tick_marks_notice_from_old_epoch_stale_without_admission_effects
+
+test result: FAILED. 3 passed; 2 failed; 0 ignored; 0 measured; 1883 filtered out; finished in 2.56s
+
+error: test failed, to rerun pass `-p aethyme-broker --lib`

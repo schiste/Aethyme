@@ -1,0 +1,94 @@
+{
+  "argv": [
+    "cargo",
+    "test",
+    "--locked",
+    "-j4",
+    "-p",
+    "aethyme-broker",
+    "local_capture_notice::tests::",
+    "--",
+    "--nocapture"
+  ],
+  "duration_seconds": 26.314077,
+  "ended_at_utc": "2026-10-15T21:39:22.575620Z",
+  "environment": {
+    "explicit_profile_keys": [],
+    "values": {
+      "CARGO_BUILD_JOBS": "4",
+      "CARGO_TARGET_DIR": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/integrate-reviewed-local-bare-git-servic/target/local-resume/cargo",
+      "HOME": "/Users/christophehenner",
+      "LANG": "C.UTF-8",
+      "LC_ALL": "C.UTF-8",
+      "PATH": "/Users/christophehenner/.local/bin:/Users/christophehenner/.volta/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/System/Cryptexes/App/usr/bin:/usr/bin:/bin:/usr/sbin:/sbin:/var/run/com.apple.security.cryptexd/codex.system/bootstrap/usr/local/bin:/var/run/com.apple.security.cryptexd/codex.system/bootstrap/usr/bin:/var/run/com.apple.security.cryptexd/codex.system/bootstrap/usr/appleinternal/bin:/pkg/env/global/bin:/Library/Apple/usr/bin:/opt/homebrew/bin:/Users/christophehenner/.codex/packages/app-server-daemon/releases/0.162.1-aarch64-apple-darwin/codex-path:/Users/christophehenner/.codex/tmp/arg0/codex-arg0pOGKw8:/Users/christophehenner/.codex/tmp/arg0/codex-arg0EMP1XZ:/Users/christophehenner/.volta/tools/image/node/24.15.0/lib/node_modules/@openai/codex/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/codex-path:/Users/christophehenner/.volta/tools/image/node/24.15.0/bin:/Users/christophehenner/.local/bin:/Users/christophehenner/.bun/bin:/Users/christophehenner/.volta/bin:/opt/homebrew/sbin:/Users/christophehenner/.antigravity/antigravity/bin:/opt/homebrew/share/google-cloud-sdk/bin:/Users/christophehenner/bin:/Users/christophehenner/.cargo/bin",
+      "RUSTC_WRAPPER": "",
+      "TMPDIR": "/Volumes/T7-repositories/Application Support/Aethyme/qualification/local-check-temporaries/local-capture-notice-bed926d-focused-tmp-jv9buwah"
+    }
+  },
+  "execution_context": {
+    "host": {
+      "hostname": "Mac.lan",
+      "machine": "arm64",
+      "platform": "macOS-27.2-arm64-arm-64bit-Mach-O",
+      "python": "3.14.7 (main, Aug  5 2026, 10:29:49) [Clang 17.0.0 (clang-1700.6.4.2)]"
+    },
+    "tmp_volume": {
+      "free_bytes_before": 95274606592,
+      "path": "/Volumes/T7-repositories/Application Support/Aethyme/qualification/local-check-temporaries",
+      "total_bytes": 899994554368
+    },
+    "tool_versions": {
+      "aethyme": {
+        "executable": "/Users/christophehenner/.cargo/bin/aethyme",
+        "exit_code": 0,
+        "version": "aethyme 0.8.26 (v0.8.26 build_commit=5e8daf712e26c63f1d4082e9a617f556cf995de2) build_date=2026-10-08T19:30:03Z"
+      },
+      "cargo": {
+        "executable": "/Users/christophehenner/.cargo/bin/cargo",
+        "exit_code": 0,
+        "version": "cargo 1.96.0 (30a34c682 2026-05-25)"
+      },
+      "git": {
+        "executable": "/opt/homebrew/bin/git",
+        "exit_code": 0,
+        "version": "git version 2.55.0"
+      },
+      "rustc": {
+        "executable": "/Users/christophehenner/.cargo/bin/rustc",
+        "exit_code": 0,
+        "version": "rustc 1.96.0 (ac68faa20 2026-05-25)"
+      }
+    }
+  },
+  "label": "local-capture-notice-bed926d-focused",
+  "launcher_error": null,
+  "log_bytes": 9092,
+  "log_path": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/complete-fresh-local-cli-bootstrap-and-c/target/local-resume/retention-checks/20261015T213856Z-local-capture-notice-bed926d-focused-eccac07f/command.log",
+  "log_sha256": "6c86378c59bf0f0280da0435cee92ded57aed9fd36e2d67a3121235e4762aa18",
+  "numeric_exit": 101,
+  "root": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/complete-fresh-local-cli-bootstrap-and-c",
+  "schema": "aethyme.local-check/v1",
+  "source_after": {
+    "diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "head": "bed926dba51aa8f9aa269109408ddb5c6713fbea",
+    "status": "",
+    "tree": "566828bc346524a4e2961eb52a5999e887652cf6",
+    "untracked_content_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  "source_before": {
+    "diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "head": "bed926dba51aa8f9aa269109408ddb5c6713fbea",
+    "status": "",
+    "tree": "566828bc346524a4e2961eb52a5999e887652cf6",
+    "untracked_content_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  "source_unchanged": true,
+  "started_at_utc": "2026-10-15T21:38:56.397132Z",
+  "state": "completed",
+  "status_bytes": 4,
+  "status_path": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/complete-fresh-local-cli-bootstrap-and-c/target/local-resume/retention-checks/20261015T213856Z-local-capture-notice-bed926d-focused-eccac07f/command.status",
+  "status_sha256": "39b8dc3fc8b44765c8e6f1adee04c5b465e555ab791cc42d0d9e810d5b64297c",
+  "termination_signal": null,
+  "tmpdir": "/Volumes/T7-repositories/Application Support/Aethyme/qualification/local-check-temporaries/local-capture-notice-bed926d-focused-tmp-jv9buwah",
+  "working_directory": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/complete-fresh-local-cli-bootstrap-and-c/packages/aethyme/rust"
+}
