@@ -1,0 +1,67 @@
+SOURCE_BOUND_METADATA
+{
+  "run": "local-controller-selection",
+  "started_utc": "2026-10-15T08:29:51.741912+00:00",
+  "cwd": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/implement-the-actual-fx17-20-controlled/packages/aethyme/rust",
+  "head": "c45d4096f9d0238b800ccadbeb07f9b93ae30a3e",
+  "head_tree": "874654af26ac7fd9bbaa9bedbc7a04fa8a834e40",
+  "worktree_status": "",
+  "diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "local_wave_sha256": "c5f8bc4e98e87dcb0a069f6f1b4a301c4557b705c2a258d8f58b823139883a09",
+  "argv": [
+    "/usr/bin/caffeinate",
+    "-i",
+    "cargo",
+    "test",
+    "--locked",
+    "-j4",
+    "-p",
+    "aethyme-broker",
+    "--lib",
+    "local_controller::"
+  ],
+  "env": {
+    "PATH": "/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/christophehenner/.cargo/bin",
+    "RUSTC_WRAPPER": "",
+    "CARGO_TARGET_DIR": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/integrate-reviewed-local-bare-git-servic/target/local-resume/cargo"
+  },
+  "foreground_caffeinate": true
+}
+CARGO_OUTPUT_BEGIN
+   Compiling aethyme-broker v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/implement-the-actual-fx17-20-controlled/packages/aethyme/rust/crates/aethyme-broker)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1m 04s
+     Running unittests src/lib.rs (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/integrate-reviewed-local-bare-git-servic/target/local-resume/cargo/debug/deps/aethyme_broker-20bbfe5c0b2dd5c0)
+
+running 25 tests
+test local_controller::drive::tests::actual_appointed_driver_completes_without_a_manufactured_receipt ... ignored, actual appointed cached Docker build, independent verifier, native gates and disposable GenericGit acceptance
+test local_controller::drive::tests::completion_control_checks_cancel_and_expiry_at_commit_boundary ... ok
+test local_controller::bare_destination::tests::rejects_symlinked_endpoint_and_replacement_after_validation ... ok
+test local_controller::bare_destination::tests::accepts_only_the_exact_canonical_bare_git_directory ... ok
+test local_controller::drive::tests::delayed_admission_cannot_extend_an_appointed_absolute_deadline ... ok
+test local_controller::drive::tests::dispatch_record_binds_every_operator_choice ... ok
+test local_controller::drive::tests::driver_configuration_is_finite_and_preparation_is_explicitly_refused ... ok
+test local_controller::drive::tests::fx17::actual_fx17_twenty_controlled_changes_preserve_all_65_vectors ... ignored, actual 20-appointment FX17 Docker, native gate, verifier and disposable local bare-Git evolution
+test local_controller::bare_destination::tests::revalidation_detects_an_ancestor_symlink_retarget ... ok
+test local_controller::bare_destination::tests::rejects_update_instead_checkout_without_changing_its_ref_or_worktree ... ok
+test local_controller::drive::tests::only_known_successful_publication_dispatch_can_reach_qualification ... ok
+test local_controller::drive::tests::outcome_unknown::actual_unknown_publication_after_receiver_ref_update_never_completes ... ignored, actual appointed Docker build, independent verifier, native gates, and timed disposable bare-Git publication
+test local_controller::bare_destination::tests::rejects_bare_endpoint_with_update_instead_linked_worktree_unchanged ... ok
+test local_controller::service::tests::service_appointment_refuses_unbounded_or_ambiguous_limits ... ok
+test local_controller::tests::historical_completion_encoding_binds_every_identity ... ok
+test local_controller::drive::tests::actual_delayed_database_admission_refuses_dispatch_after_frozen_expiry ... ok
+test local_controller::drive::tests::controller_migrations_adopt_existing_journals_without_erasing_rows ... ok
+test local_controller::drive::tests::cross_revision_lookup_rejects_wrong_source_target_and_epoch ... ok
+test local_controller::drive::tests::live_dispatch_guard_rejects_cancel_deadline_epoch_and_revision ... ok
+test local_controller::service::permit_tests::existing_producer_appointment_preserves_generation_and_refuses_revocation ... ok
+test local_controller::tests::public_transition_cannot_manufacture_delivery ... ok
+test local_controller::drive::tests::cross_revision_stale_completion_epoch_is_rechecked_at_composition_and_completion_use ... ok
+test local_controller::drive::tests::later_same_line_edit_then_third_wave_does_not_replay_accepted_deltas ... ok
+test local_controller::drive::tests::completed_native_job_is_history_and_cannot_approve_controller_dispatch ... ok
+test local_controller::drive::tests::cross_revision_completion_anchor_binds_candidate_parent_and_publication_lease ... ok
+
+test result: ok. 22 passed; 0 failed; 3 ignored; 0 measured; 1774 filtered out; finished in 40.95s
+
+
+CARGO_OUTPUT_END
+NUMERIC_EXIT_STATUS=0
+WALL_SECONDS=106.083

@@ -1,0 +1,61 @@
+SOURCE_BOUND_METADATA
+{
+  "run": "local-target-selection",
+  "started_utc": "2026-10-15T08:31:48.767522+00:00",
+  "cwd": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/implement-the-actual-fx17-20-controlled/packages/aethyme/rust",
+  "head": "c45d4096f9d0238b800ccadbeb07f9b93ae30a3e",
+  "head_tree": "874654af26ac7fd9bbaa9bedbc7a04fa8a834e40",
+  "worktree_status": "",
+  "diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "local_wave_sha256": "c5f8bc4e98e87dcb0a069f6f1b4a301c4557b705c2a258d8f58b823139883a09",
+  "argv": [
+    "/usr/bin/caffeinate",
+    "-i",
+    "cargo",
+    "test",
+    "--locked",
+    "-j4",
+    "-p",
+    "aethyme-broker",
+    "--lib",
+    "local_target::"
+  ],
+  "env": {
+    "PATH": "/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/christophehenner/.cargo/bin",
+    "RUSTC_WRAPPER": "",
+    "CARGO_TARGET_DIR": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/integrate-reviewed-local-bare-git-servic/target/local-resume/cargo"
+  },
+  "foreground_caffeinate": true
+}
+CARGO_OUTPUT_BEGIN
+   Compiling aethyme-broker v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/implement-the-actual-fx17-20-controlled/packages/aethyme/rust/crates/aethyme-broker)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 57.15s
+     Running unittests src/lib.rs (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/integrate-reviewed-local-bare-git-servic/target/local-resume/cargo/debug/deps/aethyme_broker-20bbfe5c0b2dd5c0)
+
+running 19 tests
+test local_target::tests::controller_child ... ok
+test local_target::tests::independent_canonical_identity_vector ... ok
+test local_target::tests::archived_target_can_be_proposed_after_the_source_repository_is_gone ... ok
+test local_target::tests::corrupt_record_and_missing_source_refuse_without_partial_roots ... ok
+test local_target::tests::controller_process_death_releases_lock_but_preserves_revision ... ok
+test local_target::tests::candidate_and_request_objects_are_pinned_atomically_with_their_source ... ok
+test local_target::tests::immutable_revisions_and_arrivals_do_not_change_frozen_target ... ok
+test local_target::tests::dependency_errors_refuse_before_creating_target_revision ... ok
+test local_target::tests::migration_adopts_charged_resolution_attempts_and_fences_schema_six ... ok
+test local_target::tests::duplicate_controller_issuer_and_project_cannot_gain_authority ... ok
+test local_target::tests::identities_pin_policy_objective_requirements_dependencies_and_order ... ok
+test local_target::tests::atomic_replacement_covers_the_original_group_member ... ok
+test local_target::tests::self_requirement_is_a_dependency_cycle ... ok
+test local_target::tests::stale_transition_duplicate_listener_and_hold_cannot_skip_a_phase ... ok
+test local_target::tests::unknown_source_base_refuses_even_when_all_bytes_are_retained ... ok
+test local_target::tests::target_retention_outlives_controller_and_old_gc_plan ... ok
+test local_target::tests::unverified_candidate_never_becomes_accepted_or_complete ... ok
+test local_target::tests::revision_lines_and_synthesis_cannot_double_apply_original_work ... ok
+test local_target::tests::retained_lineage_requires_its_selected_predecessor_and_is_part_of_cycles ... ok
+
+test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 1780 filtered out; finished in 6.98s
+
+
+CARGO_OUTPUT_END
+NUMERIC_EXIT_STATUS=0
+WALL_SECONDS=64.799
