@@ -1,0 +1,7 @@
+run=fx10-1123-heartbeat-regression-premature-error-mutation
+command=cargo test --locked -j4 -p aethyme-broker --lib fx10_gate_child_start_waits_for_first_heartbeat -- --nocapture
+mutation=return error immediately when the first heartbeat marker is absent or zero
+started=2026-10-15T09:33:03Z
+143d995220334d426934b330c54b9ba2f9a329db
+84426abe9ff80a34f99bdf7ec37dc20eed768b14d5962303599ad56d49a1d1d8  crates/aethyme-broker/src/local_controller/drive_tests/sustained_arrivals.rs
+01aa466182a9054f5f4f0bd1f71fa1a3f2869ea731cee0f69ed0098a2b679ae1  ../../aethyme-eval/fx10/proposal-manifest.json
