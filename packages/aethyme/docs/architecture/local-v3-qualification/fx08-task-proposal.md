@@ -6,7 +6,7 @@ Last Updated: 2026-10-15
 > see the [once-final FX08 results](../local-v3-fx08-qualification.md).
 
 
-Status: proposed task descriptions; no fixtures frozen or trials run.
+Status: historical proposal; completed fixture and trial evidence is linked above.
 
 Issue #709 requires these descriptions to be reviewed before fixture construction.
 This proposal covers Local cold-start tasks and real L3 retrieval. It does not
