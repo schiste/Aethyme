@@ -672,13 +672,15 @@ pub(super) fn verifier_prepare(root: &Path, rest: &[&str]) -> Result<Output, Fai
     let mut store = open(root)?;
     let prepared = verifier::prepare(
         &mut store,
-        operation,
-        &repository,
-        flags.one("--commit")?,
-        &inventory,
-        plan,
-        docker,
-        flags.one("--endpoint")?,
+        verifier::VerifierPreparationRequest {
+            operation_id: operation,
+            harness_repository: &repository,
+            harness_commit: flags.one("--commit")?,
+            inventory_bytes: &inventory,
+            plan,
+            docker_cli: docker,
+            endpoint: flags.one("--endpoint")?,
+        },
     )
     .map_err(|error| Failure::domain("verifier_preparation", error.to_string()))?;
     let capture = &prepared.capture;

@@ -248,20 +248,34 @@ pub struct PreparedVerifier {
     pub inventory_sha256: String,
 }
 
+/// Inputs for retaining an exact offline verifier input set.
+pub struct VerifierPreparationRequest<'a> {
+    pub operation_id: OperationId,
+    pub harness_repository: &'a Path,
+    pub harness_commit: &'a str,
+    pub inventory_bytes: &'a [u8],
+    pub plan: VerifierPlan,
+    pub docker_cli: PathBuf,
+    pub endpoint: &'a str,
+}
+
 /// Retain and bind an exact offline verifier input set before target proposal.
 /// The caller supplies a full Git commit and the canonical literal inventory
 /// bytes. This command creates a durable capture root, but grants no producer
 /// authority and starts no workload.
 pub fn prepare(
     store: &mut CollaborationStore,
-    operation_id: OperationId,
-    harness_repository: &Path,
-    harness_commit: &str,
-    inventory_bytes: &[u8],
-    plan: VerifierPlan,
-    docker_cli: PathBuf,
-    endpoint: &str,
+    request: VerifierPreparationRequest<'_>,
 ) -> Result<PreparedVerifier, VerificationError> {
+    let VerifierPreparationRequest {
+        operation_id,
+        harness_repository,
+        harness_commit,
+        inventory_bytes,
+        plan,
+        docker_cli,
+        endpoint,
+    } = request;
     let _response = crate::collaboration_sensitive::response_use(store)?;
     let inventory = AssertionInventory::decode(inventory_bytes)?;
     ensure_supported_inventory(&inventory)?;
@@ -1276,21 +1290,23 @@ mod prepare_preflight_tests {
 
         let result = prepare(
             &mut fixture.store,
-            OperationId::mint().unwrap(),
-            Path::new("/no-such-harness"),
-            "not-a-commit",
-            &inventory.canonical_bytes(),
-            VerifierPlan {
-                image: "not-an-image".into(),
-                command: CommandSpec {
-                    program: "/bin/sh".into(),
-                    arguments: vec![],
-                    environment: Default::default(),
+            VerifierPreparationRequest {
+                operation_id: OperationId::mint().unwrap(),
+                harness_repository: Path::new("/no-such-harness"),
+                harness_commit: "not-a-commit",
+                inventory_bytes: &inventory.canonical_bytes(),
+                plan: VerifierPlan {
+                    image: "not-an-image".into(),
+                    command: CommandSpec {
+                        program: "/bin/sh".into(),
+                        arguments: vec![],
+                        environment: Default::default(),
+                    },
+                    max_age_ms: 1000,
                 },
-                max_age_ms: 1000,
+                docker_cli: PathBuf::from("/no-such-docker"),
+                endpoint: "unix:///no-such-endpoint",
             },
-            PathBuf::from("/no-such-docker"),
-            "unix:///no-such-endpoint",
         );
         assert!(matches!(
             result,

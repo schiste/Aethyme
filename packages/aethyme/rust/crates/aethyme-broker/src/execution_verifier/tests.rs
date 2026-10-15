@@ -98,21 +98,23 @@ fn verifier_prepare_refuses_sensitive_tombstone_before_harness_or_runtime_access
 
     let result = prepare(
         &mut fixture.store,
-        OperationId::mint().unwrap(),
-        std::path::Path::new("/no-such-harness"),
-        "not-a-commit",
-        b"not-an-inventory",
-        VerifierPlan {
-            image: "not-an-image".into(),
-            command: CommandSpec {
-                program: "/no-such-runtime".into(),
-                arguments: vec![],
-                environment: Default::default(),
+        VerifierPreparationRequest {
+            operation_id: OperationId::mint().unwrap(),
+            harness_repository: std::path::Path::new("/no-such-harness"),
+            harness_commit: "not-a-commit",
+            inventory_bytes: b"not-an-inventory",
+            plan: VerifierPlan {
+                image: "not-an-image".into(),
+                command: CommandSpec {
+                    program: "/no-such-runtime".into(),
+                    arguments: vec![],
+                    environment: Default::default(),
+                },
+                max_age_ms: 1,
             },
-            max_age_ms: 1,
+            docker_cli: std::path::PathBuf::from("/no-such-docker"),
+            endpoint: "unix:///no-such-endpoint",
         },
-        std::path::PathBuf::from("/no-such-docker"),
-        "unix:///no-such-endpoint",
     );
     assert!(matches!(
         result,
