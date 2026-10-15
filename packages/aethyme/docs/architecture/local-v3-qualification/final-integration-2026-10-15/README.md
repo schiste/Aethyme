@@ -78,6 +78,14 @@ strict lint failed for a needless borrow in a generation-directory test
 the changed `collab` help snapshot. These complete logs and exact checkout
 metadata remain preserved.
 
+The reviewed cleanup/CLI merge at #784 head `0ec6d692` and aggregate #777
+head `f1abe252` both failed strict lint (exit 101): the old composition wrapper
+became unused in production, the capture retention row needed a named type,
+and the final retainer use had an unnecessary dereference. Complete logs and
+primary checkout metadata bind these failures to merge commits `c71540b1` and
+`ab07afac`, respectively. No test result or passing-command credit is assigned
+to these lint failures; their other jobs are reported separately.
+
 ## Initial full workspace run and native fixture repair
 
 At clean aggregate `86c982eeecd92e473e309bf0f13dfdde1379e6ac`, the official

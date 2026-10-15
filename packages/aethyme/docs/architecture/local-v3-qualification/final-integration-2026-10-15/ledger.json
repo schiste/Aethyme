@@ -1282,9 +1282,39 @@
       "path": "runs/ci-785-942-workspace.json",
       "bytes": 1136,
       "sha256": "a7d5c0560a52569a65ca43f62071638101a9ff83b3464018eacffc5b38f8713e"
+    },
+    {
+      "path": "ci/ci-784-0ec-lint.raw.log",
+      "bytes": 82767,
+      "sha256": "d5fbf9c81a1fdf0ee6216dc4a68880f194a38815fdf76a84a741970c086ede3e"
+    },
+    {
+      "path": "ci/784-0ec-checkout.json",
+      "bytes": 2616,
+      "sha256": "605af38099a29201b526b4cf424c710647fc8ba2f98953c61ff6e01d85b5ed57"
+    },
+    {
+      "path": "runs/ci-784-0ec-lint.json",
+      "bytes": 1074,
+      "sha256": "170712a901b36935074cb5bc1c4de037232762b01599feb923f341277aad16fe"
+    },
+    {
+      "path": "ci/ci-777-f1abe-lint.raw.log",
+      "bytes": 83312,
+      "sha256": "50b379b43027e96236a91968953f1de47206f4ad60d95d013836717785474895"
+    },
+    {
+      "path": "ci/777-f1abe-checkout.json",
+      "bytes": 2616,
+      "sha256": "d0f3d11a325b401f96e11d81f082f95f82d2ebf2c138223ebdf654087d2b2768"
+    },
+    {
+      "path": "runs/ci-777-f1abe-lint.json",
+      "bytes": 1076,
+      "sha256": "84cd7f02de4e59cbb27ad7a834ef201ce58ab4b8ea859f2e72e7039f877db040"
     }
   ],
-  "updated_at_utc": "2026-10-15T21:23:43.976703+00:00",
+  "updated_at_utc": "2026-10-15T22:05:12.475343+00:00",
   "preflight_failures": [
     {
       "metadata": "runs/aggregate-offline-fx17-recorder-preflight-failure.json",
@@ -1378,6 +1408,46 @@
       "exit_code": 100,
       "conclusion": "FAILURE",
       "passing_command": false
+    },
+    {
+      "schema": "aethyme.local-ci-command-result/v1",
+      "id": "ci-784-0ec-lint",
+      "pr": 784,
+      "branch_head": "0ec6d692054c979fad42d47dc36c0bb229e5f5ba",
+      "ci_checkout_commit": "c71540b15a97ee039a040494d0ccbca6f6b2c09b",
+      "ci_checkout_tree": "3626a11c679f4b9e09910139c124b2abda048ec0",
+      "ci_checkout_parents": [
+        "425a0bc8e41031cea6b0ff8b5bc0e9cc80748b31",
+        "0ec6d692054c979fad42d47dc36c0bb229e5f5ba"
+      ],
+      "job_url": "https://github.com/schiste/Aethyme/actions/runs/38813286501/job/116691583401",
+      "conclusion": "FAILURE",
+      "numeric_exit": 101,
+      "test_commands_completed": 0,
+      "failure": "Strict Clippy rejected unused production compose_after_accepted, a complex capture retention row tuple, and needless_option_as_deref on the final candidate-retainer use. Exit 101; the lint command executed no test cases.",
+      "credited_as_passing_command": false,
+      "log_sha256": "d5fbf9c81a1fdf0ee6216dc4a68880f194a38815fdf76a84a741970c086ede3e",
+      "scope": "Complete original raw log and primary GitHub checkout metadata; no passing command credit for later repairs."
+    },
+    {
+      "schema": "aethyme.local-ci-command-result/v1",
+      "id": "ci-777-f1abe-lint",
+      "pr": 777,
+      "branch_head": "f1abe252b6f339ca28891c252dd360a0a527fa1f",
+      "ci_checkout_commit": "ab07afac77547161b7a1c5d511541447d55cc434",
+      "ci_checkout_tree": "8af0dd15be48da29ddf5c8251d8c0968cc9a7874",
+      "ci_checkout_parents": [
+        "8daffab2bb80ae0cce8286c530d70fad42c033f5",
+        "f1abe252b6f339ca28891c252dd360a0a527fa1f"
+      ],
+      "job_url": "https://github.com/schiste/Aethyme/actions/runs/38813772970/job/116693225556",
+      "conclusion": "FAILURE",
+      "numeric_exit": 101,
+      "test_commands_completed": 0,
+      "failure": "Strict Clippy rejected unused production compose_after_accepted, a complex capture retention row tuple, and needless_option_as_deref on the final candidate-retainer use. Exit 101; the lint command executed no test cases.",
+      "credited_as_passing_command": false,
+      "log_sha256": "50b379b43027e96236a91968953f1de47206f4ad60d95d013836717785474895",
+      "scope": "Complete original raw log and primary GitHub checkout metadata; no passing command credit for later repairs."
     }
   ]
 }

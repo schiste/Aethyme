@@ -1,0 +1,20 @@
+{
+  "schema": "aethyme.local-ci-command-result/v1",
+  "id": "ci-784-0ec-lint",
+  "pr": 784,
+  "branch_head": "0ec6d692054c979fad42d47dc36c0bb229e5f5ba",
+  "ci_checkout_commit": "c71540b15a97ee039a040494d0ccbca6f6b2c09b",
+  "ci_checkout_tree": "3626a11c679f4b9e09910139c124b2abda048ec0",
+  "ci_checkout_parents": [
+    "425a0bc8e41031cea6b0ff8b5bc0e9cc80748b31",
+    "0ec6d692054c979fad42d47dc36c0bb229e5f5ba"
+  ],
+  "job_url": "https://github.com/schiste/Aethyme/actions/runs/38813286501/job/116691583401",
+  "conclusion": "FAILURE",
+  "numeric_exit": 101,
+  "test_commands_completed": 0,
+  "failure": "Strict Clippy rejected unused production compose_after_accepted, a complex capture retention row tuple, and needless_option_as_deref on the final candidate-retainer use. Exit 101; the lint command executed no test cases.",
+  "credited_as_passing_command": false,
+  "log_sha256": "d5fbf9c81a1fdf0ee6216dc4a68880f194a38815fdf76a84a741970c086ede3e",
+  "scope": "Complete original raw log and primary GitHub checkout metadata; no passing command credit for later repairs."
+}
