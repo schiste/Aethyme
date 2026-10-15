@@ -1,76 +1,36 @@
 # Native job lifecycle qualification checkpoint
 
-Recorded 2026-10-15 for explicit native-job root release and retention.
-Production and test changes have independent static review, but no complete
-local native-gates command has passed.
+Recorded 2026-10-15 for native-job root release, retention, reopened status, and GC behavior.
 
-## Reviewed source
+## Source binding
 
-- Production review clear: d6518745a1df9d75dc77ab2e44af35d5ef3ef470,
-  tree 88bf1707e1bac7925e8b453e5f676c11c4ef8dda.
-- Typed StoredJobRow mapping and independently selected fixture/spec roots
-  reviewed: 1a799a3eead55b9ed2380661c517d2ab0a8b4ce5,
-  tree 128a07026ffd8ccf2e3215b4ddfaff6362082949.
-- Complete fixture-derived closure oracle reviewed clear:
-  d524f3e695baa26a14302e68e3040fc61cef61d0,
-  tree 8b8302ffd16f6893bcd0fc8e67478b22728f3fa2.
+The final restored native source is byte-identical at the three tested heads:
 
-These are review results, not runtime qualification.
+- e9a62f328db011d00def7a40ffccbe2da4c82967, tree 61a3bceeb876587819222cca6344574e04d77857: full native-gates suite, migration fixtures, snapshot checks, and strict Clippy.
+- d52bc0a514fc5035fe143b97208a9e328f6a5d8e, tree 8840983777e2bc46dac1a2b5c748935955cb7be6: M1-M6 guard mutations and initial restored-source attempts.
+- 3df43525dafede5f5c0119b9e8444ed9730dea9f, tree 04d4728e2f5a92c8e6928197d26fb743b2269ac8: final restored-source sanity, snapshot matcher, and discarded-results ratchet.
 
-## Attempt history
+source-bindings.json records repository-relative file paths, bytes, SHA-256 values, commit relationships, and byte-for-byte restoration checks for all six mutation backups.
 
-At 622c633eb9c34b762ba795d2edf2b604b5b29c5b, tree
-be1a2a78620362549570002e1020f777babc22f5, CI reported an E0382 moved-value
-compile error before tests and a separate rustfmt failure. At
-346001298a2db1467b2807610dd04006f4b76889, tree
-d758e054309073ef99deb46360e362de98fb2271, the 15-test native_gates filter
-returned 14 passes and one overbroad dispatching/unknown GC assertion failure.
-Strict Clippy also rejected the retained-row tuple. Full CI logs and local
-recorder files remain retained; ledger.json binds exact sizes, hashes and
-T7 paths.
+## Results
 
-At full-closure source d524f3e695baa26a14302e68e3040fc61cef61d0, the same
-15-test filter began. Fourteen tests returned ok; the
-budget_capacity_and_requirement_holds_do_not_dispatch_prepared_jobs test
-did not return before the process was stopped while temporary SQLite fixtures
-were using host Data storage near capacity. Cargo recorded status 101; source
-remained unchanged. This attempt is incomplete and receives zero qualification
-credit.
+- Focused native_gates::tests: 15 passed, 0 failed, 0 ignored; exit 0.
+- Seven migration fixture tests: 7 passed.
+- Restored-source released-prepared-job sanity test: 1 passed.
+- CLI help snapshot matcher and discarded-results ratchet both passed again after source restoration.
+- Strict broker Clippy from the Rust workspace: exit 0.
+- Six guard-removal mutations each produced the expected named assertion failure against mutated source. All six source files were restored byte-for-byte. M1's classification correction changed metadata only and did not rerun the command.
 
-Across both local commands, 30 test slots were scheduled: 28 returned ok,
-one returned an assertion failure in the earlier test oracle, and one did
-not return before SIGTERM. No complete local command passed. CI compile,
-format and Clippy checks executed no tests. The complete denominator is in
-ledger.json.
+## Denominator and incomplete attempts
 
-At d524f3e695baa26a14302e68e3040fc61cef61d0, full workspace CI ran 4,557
-cases: 4,548 passed, 9 failed and 31 skipped (exit 100). Seven failures are
-old-schema fixtures that leave the schema-23 `roots_released_ms` column in a
-current database before rewinding its version; the schema-18 fixture must
-retain schema-18 native-job tables and remove only the schema-23 column and
-trigger. The other failures are the CLI help snapshot and a discarded-results
-ratchet (144 sites versus 143). The raw CI log is retained and hash-bound in
-ledger.json.
+The 15 local native_gates commands scheduled 85 selected test slots: 51 returned ok, 8 returned assertion failures, 15 failed environmental preflight or setup, 1 did not return before SIGTERM, and 10 remain unresolved in two commands without numeric status. The two complete passing native commands are the 15-test suite and the restored-source one-test sanity check; 16 baseline native-gate passes receive credit. Mutation failures are expected guard confirmations, not baseline passes.
 
-A cached serial run of all 15 d524 native-gates tests used the previously built
-binary (SHA-256 `4b2376a7f628100d52b2b28d0f60511917c42a7d306a7eb88a6d4f599c8b6945`).
-It returned 1 pass and 14 failures because its per-run TMPDIR was placed inside
-the checked-out Git worktree, so temporary repositories were rejected as
-nested. This is an environmental preflight failure and receives zero test
-credit. Its complete command, status and raw output are preserved in the
-ledger. A rerun is pending with a unique T7 temporary root outside all
-worktrees.
+The 11:16:55Z off-tree cached-binary run has six completed ok lines and ends during the ninth test without final status; nine selected cases have no result. The 13:55:42Z restored-source run compiled the broker and began one selected test but has no result or numeric status. Its recorder metadata and raw log remain unchanged; a separate reconciliation records the observed lack of a remaining process and open log writer. Neither attempt has an inferred exit or outcome.
 
-## Remaining checks
+A stale cached mutant binary caused the first restored-source sanity attempt to fail. A later clean-source attempt failed setup because no host-state directory was configured. The successful sanity run used a private per-run host-state directory.
 
-Pending checks are the cached serial native-gates suite, migration/state
-adoption and floor, touched CLI lifecycle/help, controller/target/GC
-regressions, ratchets, strict Clippy, and exact guard-removal checks with
-source restoration. No guard mutation or final native qualification pass is
-claimed here. Append later results to ledger.json with source commit/tree,
-numeric status, complete denominator and raw artifact hashes; retain all
-failed and interrupted attempts.
+Historical full workspace CI at d524 recorded 4,557 cases: 4,548 passed, 9 failed, 31 skipped (exit 100). Those historical fixture, snapshot, and discarded-results findings remain in the raw CI log and are not presented as a current full-workspace result. The full workspace was not rerun in this package.
 
-Raw CI and recorder outputs remain outside Git under the listed T7 target
-directories. Their hashes bind this ledger to the complete outputs; raw files
-were not normalized or rewritten.
+## Evidence
+
+ledger.json contains historical and resumed attempt records, reconciliations, denominators, limits, and a top-level artifacts inventory. Every inventory path is relative to this folder and binds the copied payload's byte count and SHA-256. Original raw logs, metadata, status files, mutation backups, CI logs, and the initial ledger are preserved under evidence/; no raw output was normalized or rewritten.

@@ -1,0 +1,50 @@
+   Compiling serde v1.0.229
+   Compiling zerocopy v0.8.42
+   Compiling zerocopy-derive v0.8.42
+   Compiling ciborium-io v0.2.2
+   Compiling itertools v0.10.5
+   Compiling cast v0.3.0
+   Compiling aethyme-cli v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/reconcile-retention-of-inactive-native-g/packages/aethyme/rust/crates/aethyme-cli)
+   Compiling criterion-plot v0.5.0
+   Compiling oxc_index v4.1.0
+   Compiling toml_datetime v0.6.11
+   Compiling serde_spanned v0.6.9
+   Compiling oxc_syntax v0.125.0
+   Compiling toml_edit v0.22.27
+   Compiling bincode v1.3.3
+   Compiling aethyme-graph-schema v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/reconcile-retention-of-inactive-native-g/packages/aethyme/rust/crates/aethyme-graph-schema)
+   Compiling oxc_ast v0.125.0
+   Compiling toml v0.8.23
+   Compiling aethyme-graph-storage v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/reconcile-retention-of-inactive-native-g/packages/aethyme/rust/crates/aethyme-graph-storage)
+   Compiling aethyme-enhance v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/reconcile-retention-of-inactive-native-g/packages/aethyme/rust/crates/aethyme-enhance)
+   Compiling ahash v0.8.12
+   Compiling hashbrown v0.14.5
+   Compiling rowan v0.15.18
+   Compiling ra_ap_syntax v0.0.331
+   Compiling oxc_ecmascript v0.125.0
+   Compiling oxc_ast_visit v0.125.0
+   Compiling oxc_parser v0.125.0
+   Compiling hashlink v0.9.1
+   Compiling aethyme-producers v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/reconcile-retention-of-inactive-native-g/packages/aethyme/rust/crates/aethyme-producers)
+   Compiling half v2.7.1
+   Compiling ciborium-ll v0.2.2
+   Compiling rusqlite v0.32.1
+   Compiling ciborium v0.2.2
+   Compiling aethyme-graph-indexer v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/reconcile-retention-of-inactive-native-g/packages/aethyme/rust/crates/aethyme-graph-indexer)
+   Compiling aethyme-quality v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/reconcile-retention-of-inactive-native-g/packages/aethyme/rust/crates/aethyme-quality)
+   Compiling tinytemplate v1.2.1
+   Compiling is-terminal v0.4.17
+   Compiling oorandom v11.1.5
+   Compiling anes v0.1.6
+   Compiling aethyme-testkit v0.1.0 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/reconcile-retention-of-inactive-native-g/packages/aethyme/rust/crates/aethyme-testkit)
+   Compiling criterion v0.5.1
+   Compiling aethyme-engine v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/reconcile-retention-of-inactive-native-g/packages/aethyme/rust/crates/aethyme-engine)
+   Compiling aethyme-broker v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/reconcile-retention-of-inactive-native-g/packages/aethyme/rust/crates/aethyme-broker)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 32.35s
+     Running tests/help_snapshots.rs (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/integrate-reviewed-local-bare-git-servic/target/local-resume/cargo/debug/deps/help_snapshots-d590986b11cd8d3e)
+
+running 1 test
+test help_surface_matches_snapshots ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.66s
+

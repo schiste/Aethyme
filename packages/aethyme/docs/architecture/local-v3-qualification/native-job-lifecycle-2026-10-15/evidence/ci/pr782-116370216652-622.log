@@ -1,0 +1,586 @@
+﻿2026-10-15T10:19:53.9287642Z Current runner version: '2.337.0'
+2026-10-15T10:19:53.9307065Z ##[group]Runner Image Provisioner
+2026-10-15T10:19:53.9307810Z Hosted Compute Agent
+2026-10-15T10:19:53.9308289Z Version: 20261002.596
+2026-10-15T10:19:53.9308847Z Commit: c3d12f3313a95f25162a1503be624f3b0617f8c0
+2026-10-15T10:19:53.9309470Z Build Date: 2026-10-02T22:28:27Z
+2026-10-15T10:19:53.9310235Z Worker ID: {bcd575b4-3df3-4ab6-8eb0-b9d724908ab2}
+2026-10-15T10:19:53.9310858Z Region: westus3
+2026-10-15T10:19:53.9311311Z Cloud: Azure
+2026-10-15T10:19:53.9311789Z ##[endgroup]
+2026-10-15T10:19:53.9312988Z ##[group]Operating System
+2026-10-15T10:19:53.9313489Z Ubuntu
+2026-10-15T10:19:53.9314027Z 24.04.5
+2026-10-15T10:19:53.9314451Z LTS
+2026-10-15T10:19:53.9314896Z ##[endgroup]
+2026-10-15T10:19:53.9315395Z ##[group]Runner Image
+2026-10-15T10:19:53.9315887Z Image: ubuntu-24.04
+2026-10-15T10:19:53.9316435Z Version: 20261004.327.1
+2026-10-15T10:19:53.9317436Z Included Software: https://github.com/actions/runner-images/blob/ubuntu24/20261004.327/images/ubuntu/Ubuntu2404-Readme.md
+2026-10-15T10:19:53.9318678Z Image Release: https://github.com/actions/runner-images/releases/tag/ubuntu24%2F20261004.327
+2026-10-15T10:19:53.9319431Z ##[endgroup]
+2026-10-15T10:19:53.9320675Z ##[group]GITHUB_TOKEN Permissions
+2026-10-15T10:19:53.9322189Z Contents: read
+2026-10-15T10:19:53.9322763Z Metadata: read
+2026-10-15T10:19:53.9323210Z ##[endgroup]
+2026-10-15T10:19:53.9324868Z Secret source: Actions
+2026-10-15T10:19:53.9325683Z Cache mode: write
+2026-10-15T10:19:53.9326267Z Prepare workflow directory
+2026-10-15T10:19:53.9649131Z Prepare all required actions
+2026-10-15T10:19:53.9687820Z Getting action download info
+2026-10-15T10:19:54.2722312Z Download action repository 'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1' (SHA:3d3c42e5aac5ba805825da76410c181273ba90b1)
+2026-10-15T10:19:54.4342481Z Download action repository 'dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87' (SHA:6bed0761d98439e5a578e2877258200ad565ba87)
+2026-10-15T10:19:54.6794082Z Download action repository 'Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6' (SHA:6323deb102c322ba6fcbdcafc7e3dddab59af2b6)
+2026-10-15T10:19:55.4771652Z Download action repository 'taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0' (SHA:e407f7bafb71fd004bc5c2da3032e5470cbb6ef0)
+2026-10-15T10:19:56.1980286Z Download action repository 'actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a' (SHA:043fb46d1a93c77aae656e7c1c64a875d1fc6a0a)
+2026-10-15T10:19:56.3980215Z Complete job name: Rust workspace tests
+2026-10-15T10:19:56.4564366Z ##[group]Run actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+2026-10-15T10:19:56.4565183Z with:
+2026-10-15T10:19:56.4565466Z   repository: schiste/Aethyme
+2026-10-15T10:19:56.4567839Z   token: ***
+2026-10-15T10:19:56.4568116Z   ssh-strict: true
+2026-10-15T10:19:56.4568395Z   ssh-user: git
+2026-10-15T10:19:56.4568681Z   persist-credentials: true
+2026-10-15T10:19:56.4568984Z   clean: true
+2026-10-15T10:19:56.4569270Z   sparse-checkout-cone-mode: true
+2026-10-15T10:19:56.4569659Z   fetch-depth: 1
+2026-10-15T10:19:56.4570056Z   fetch-tags: false
+2026-10-15T10:19:56.4570351Z   show-progress: true
+2026-10-15T10:19:56.4570635Z   lfs: false
+2026-10-15T10:19:56.4570896Z   submodules: false
+2026-10-15T10:19:56.4571179Z   set-safe-directory: true
+2026-10-15T10:19:56.4571498Z   allow-unsafe-pr-checkout: false
+2026-10-15T10:19:56.4572007Z env:
+2026-10-15T10:19:56.4572258Z   CARGO_NET_RETRY: 10
+2026-10-15T10:19:56.4572524Z ##[endgroup]
+2026-10-15T10:19:56.5379459Z Syncing repository: schiste/Aethyme
+2026-10-15T10:19:56.5381109Z ##[group]Getting Git version info
+2026-10-15T10:19:56.5381552Z Working directory is '/home/runner/work/Aethyme/Aethyme'
+2026-10-15T10:19:56.5382186Z [command]/usr/bin/git version
+2026-10-15T10:19:56.5530613Z git version 2.55.0
+2026-10-15T10:19:56.5547971Z ##[endgroup]
+2026-10-15T10:19:56.5558059Z Temporarily overriding HOME='/home/runner/work/_temp/60bf4daf-a7a2-43bb-9eb6-62da7edd2314' before making global git config changes
+2026-10-15T10:19:56.5559426Z Adding repository directory to the temporary git global config as a safe directory
+2026-10-15T10:19:56.5563201Z [command]/usr/bin/git config --global --add safe.directory /home/runner/work/Aethyme/Aethyme
+2026-10-15T10:19:56.5608555Z Deleting the contents of '/home/runner/work/Aethyme/Aethyme'
+2026-10-15T10:19:56.5611897Z ##[group]Determining repository object format
+2026-10-15T10:19:56.5613239Z ##[endgroup]
+2026-10-15T10:19:56.5614123Z ##[group]Initializing the repository
+2026-10-15T10:19:56.5617164Z [command]/usr/bin/git init /home/runner/work/Aethyme/Aethyme
+2026-10-15T10:19:56.5707906Z hint: Using 'master' as the name for the initial branch. This default branch name
+2026-10-15T10:19:56.5715349Z hint: will change to "main" in Git 3.0. To configure the initial branch name
+2026-10-15T10:19:56.5716238Z hint: to use in all of your new repositories, which will suppress this warning,
+2026-10-15T10:19:56.5716927Z hint: call:
+2026-10-15T10:19:56.5717324Z hint:
+2026-10-15T10:19:56.5717832Z hint: 	git config --global init.defaultBranch <name>
+2026-10-15T10:19:56.5718410Z hint:
+2026-10-15T10:19:56.5718822Z hint: Names commonly chosen instead of 'master' are 'main', 'trunk' and
+2026-10-15T10:19:56.5719331Z hint: 'development'. The just-created branch can be renamed via this command:
+2026-10-15T10:19:56.5719888Z hint:
+2026-10-15T10:19:56.5720234Z hint: 	git branch -m <name>
+2026-10-15T10:19:56.5720515Z hint:
+2026-10-15T10:19:56.5720871Z hint: Disable this message with "git config set advice.defaultBranchName false"
+2026-10-15T10:19:56.5721782Z Initialized empty Git repository in /home/runner/work/Aethyme/Aethyme/.git/
+2026-10-15T10:19:56.5723308Z [command]/usr/bin/git remote add origin https://github.com/schiste/Aethyme
+2026-10-15T10:19:56.5762446Z ##[endgroup]
+2026-10-15T10:19:56.5763161Z ##[group]Disabling automatic garbage collection
+2026-10-15T10:19:56.5770504Z [command]/usr/bin/git config --local gc.auto 0
+2026-10-15T10:19:56.5796317Z ##[endgroup]
+2026-10-15T10:19:56.5796788Z ##[group]Setting up auth
+2026-10-15T10:19:56.5797160Z Removing SSH command configuration
+2026-10-15T10:19:56.5804598Z [command]/usr/bin/git config --local --name-only --get-regexp core\.sshCommand
+2026-10-15T10:19:56.5827847Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :"
+2026-10-15T10:19:56.6138575Z Removing HTTP extra header
+2026-10-15T10:19:56.6143504Z [command]/usr/bin/git config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
+2026-10-15T10:19:56.6173293Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :"
+2026-10-15T10:19:56.6355740Z Removing includeIf entries pointing to credentials config files
+2026-10-15T10:19:56.6365484Z [command]/usr/bin/git config --local --name-only --get-regexp ^includeIf\.gitdir:
+2026-10-15T10:19:56.6394399Z [command]/usr/bin/git submodule foreach --recursive git config --local --show-origin --name-only --get-regexp remote.origin.url
+2026-10-15T10:19:56.6582286Z [command]/usr/bin/git config --file /home/runner/work/_temp/git-credentials-77b007ed-14e7-49ee-bc1d-23b19bf64cad.config http.https://github.com/.extraheader AUTHORIZATION: basic ***
+2026-10-15T10:19:56.6614424Z [command]/usr/bin/git config --local includeIf.gitdir:/home/runner/work/Aethyme/Aethyme/.git.path /home/runner/work/_temp/git-credentials-77b007ed-14e7-49ee-bc1d-23b19bf64cad.config
+2026-10-15T10:19:56.6645883Z [command]/usr/bin/git config --local includeIf.gitdir:/home/runner/work/Aethyme/Aethyme/.git/worktrees/*.path /home/runner/work/_temp/git-credentials-77b007ed-14e7-49ee-bc1d-23b19bf64cad.config
+2026-10-15T10:19:56.6680365Z [command]/usr/bin/git config --local includeIf.gitdir:/github/workspace/.git.path /github/runner_temp/git-credentials-77b007ed-14e7-49ee-bc1d-23b19bf64cad.config
+2026-10-15T10:19:56.6710651Z [command]/usr/bin/git config --local includeIf.gitdir:/github/workspace/.git/worktrees/*.path /github/runner_temp/git-credentials-77b007ed-14e7-49ee-bc1d-23b19bf64cad.config
+2026-10-15T10:19:56.6737249Z ##[endgroup]
+2026-10-15T10:19:56.6737940Z ##[group]Fetching the repository
+2026-10-15T10:19:56.6743124Z [command]/usr/bin/git -c protocol.version=2 fetch --no-tags --prune --no-recurse-submodules --depth=1 origin +f815b909f9b47e4859bc804c0a6bb02a63285328:refs/remotes/pull/782/merge
+2026-10-15T10:19:58.7759079Z From https://github.com/schiste/Aethyme
+2026-10-15T10:19:58.7759909Z  * [new ref]         f815b909f9b47e4859bc804c0a6bb02a63285328 -> pull/782/merge
+2026-10-15T10:19:58.7762632Z ##[endgroup]
+2026-10-15T10:19:58.7763037Z ##[group]Determining the checkout info
+2026-10-15T10:19:58.7763692Z ##[endgroup]
+2026-10-15T10:19:58.7767637Z [command]/usr/bin/git sparse-checkout disable
+2026-10-15T10:19:58.7815072Z [command]/usr/bin/git config --local --unset-all extensions.worktreeConfig
+2026-10-15T10:19:58.7842868Z ##[group]Checking out the ref
+2026-10-15T10:19:58.7846033Z [command]/usr/bin/git checkout --progress --force refs/remotes/pull/782/merge
+2026-10-15T10:19:58.9351370Z Note: switching to 'refs/remotes/pull/782/merge'.
+2026-10-15T10:19:58.9351702Z 
+2026-10-15T10:19:58.9351949Z You are in 'detached HEAD' state. You can look around, make experimental
+2026-10-15T10:19:58.9352548Z changes and commit them, and you can discard any commits you make in this
+2026-10-15T10:19:58.9353038Z state without impacting any branches by switching back to a branch.
+2026-10-15T10:19:58.9353273Z 
+2026-10-15T10:19:58.9353463Z If you want to create a new branch to retain commits you create, you may
+2026-10-15T10:19:58.9353823Z do so (now or later) by using -c with the switch command. Example:
+2026-10-15T10:19:58.9354021Z 
+2026-10-15T10:19:58.9354120Z   git switch -c <new-branch-name>
+2026-10-15T10:19:58.9354273Z 
+2026-10-15T10:19:58.9354380Z Or undo this operation with:
+2026-10-15T10:19:58.9354520Z 
+2026-10-15T10:19:58.9354609Z   git switch -
+2026-10-15T10:19:58.9354744Z 
+2026-10-15T10:19:58.9354933Z Turn off this advice by setting config variable advice.detachedHead to false
+2026-10-15T10:19:58.9359664Z 
+2026-10-15T10:19:58.9360280Z HEAD is now at f815b90 Merge 622c633eb9c34b762ba795d2edf2b604b5b29c5b into ca871706c78fcf2fa14ef4f12280dcfc398d4246
+2026-10-15T10:19:58.9363057Z ##[endgroup]
+2026-10-15T10:19:58.9406038Z [command]/usr/bin/git log -1 --format=%H
+2026-10-15T10:19:58.9430305Z f815b909f9b47e4859bc804c0a6bb02a63285328
+2026-10-15T10:19:58.9714286Z ##[group]Run dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
+2026-10-15T10:19:58.9714638Z with:
+2026-10-15T10:19:58.9714817Z   toolchain: stable
+2026-10-15T10:19:58.9715005Z env:
+2026-10-15T10:19:58.9715168Z   CARGO_NET_RETRY: 10
+2026-10-15T10:19:58.9715351Z ##[endgroup]
+2026-10-15T10:19:58.9766115Z ##[start-action display=Parse toolchain version;id=__dtolnay_rust-toolchain.parse]
+2026-10-15T10:19:58.9815607Z ##[group]Run if [[ -z $toolchain ]]; then
+2026-10-15T10:19:58.9815954Z [36;1mif [[ -z $toolchain ]]; then[0m
+2026-10-15T10:19:58.9816394Z [36;1m  # GitHub does not enforce `required: true` inputs itself. https://github.com/actions/runner/issues/1070[0m
+2026-10-15T10:19:58.9816855Z [36;1m  echo "'toolchain' is a required input" >&2[0m
+2026-10-15T10:19:58.9817109Z [36;1m  exit 1[0m
+2026-10-15T10:19:58.9817394Z [36;1melif [[ $toolchain =~ ^stable' '[0-9]+' '(year|month|week|day)s?' 'ago$ ]]; then[0m
+2026-10-15T10:19:58.9817750Z [36;1m  if [[ Linux == macOS ]]; then[0m
+2026-10-15T10:19:58.9818187Z [36;1m    echo "toolchain=1.$((($(date -v-$(sed 's/stable \([0-9]*\) \(.\).*/\1\2/' <<< $toolchain) +%s)/60/60/24-16569)/7/6))" >> $GITHUB_OUTPUT[0m
+2026-10-15T10:19:58.9818588Z [36;1m  else[0m
+2026-10-15T10:19:58.9818912Z [36;1m    echo "toolchain=1.$((($(date --date "${toolchain#stable }" +%s)/60/60/24-16569)/7/6))" >> $GITHUB_OUTPUT[0m
+2026-10-15T10:19:58.9819263Z [36;1m  fi[0m
+2026-10-15T10:19:58.9819508Z [36;1melif [[ $toolchain =~ ^stable' 'minus' '[0-9]+' 'releases?$ ]]; then[0m
+2026-10-15T10:19:58.9820221Z [36;1m  echo "toolchain=1.$((($(date +%s)/60/60/24-16569)/7/6-${toolchain//[^0-9]/}))" >> $GITHUB_OUTPUT[0m
+2026-10-15T10:19:58.9820584Z [36;1melif [[ $toolchain =~ ^1\.[0-9]+$ ]]; then[0m
+2026-10-15T10:19:58.9821000Z [36;1m  echo "toolchain=1.$((i=${toolchain#1.}, c=($(date +%s)/60/60/24-16569)/7/6, i+9*i*(10*i<=c)+90*i*(100*i<=c)))" >> $GITHUB_OUTPUT[0m
+2026-10-15T10:19:58.9821378Z [36;1melse[0m
+2026-10-15T10:19:58.9821585Z [36;1m  echo "toolchain=$toolchain" >> $GITHUB_OUTPUT[0m
+2026-10-15T10:19:58.9821823Z [36;1mfi[0m
+2026-10-15T10:19:59.0038586Z shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+2026-10-15T10:19:59.0038893Z env:
+2026-10-15T10:19:59.0039061Z   CARGO_NET_RETRY: 10
+2026-10-15T10:19:59.0039248Z   toolchain: stable
+2026-10-15T10:19:59.0039428Z ##[endgroup]
+2026-10-15T10:19:59.0151487Z ##[end-action id=__dtolnay_rust-toolchain.parse;outcome=success;conclusion=success;duration_ms=38]
+2026-10-15T10:19:59.0161022Z ##[start-action display=Construct rustup command line;id=__dtolnay_rust-toolchain.flags]
+2026-10-15T10:19:59.0190037Z ##[group]Run echo "targets=$(for t in ${targets//,/ }; do echo -n ' --target' $t; done)" >> $GITHUB_OUTPUT
+2026-10-15T10:19:59.0190579Z [36;1mecho "targets=$(for t in ${targets//,/ }; do echo -n ' --target' $t; done)" >> $GITHUB_OUTPUT[0m
+2026-10-15T10:19:59.0191077Z [36;1mecho "components=$(for c in ${components//,/ }; do echo -n ' --component' $c; done)" >> $GITHUB_OUTPUT[0m
+2026-10-15T10:19:59.0191469Z [36;1mecho "downgrade=" >> $GITHUB_OUTPUT[0m
+2026-10-15T10:19:59.0239948Z shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+2026-10-15T10:19:59.0240239Z env:
+2026-10-15T10:19:59.0240410Z   CARGO_NET_RETRY: 10
+2026-10-15T10:19:59.0240591Z   targets: 
+2026-10-15T10:19:59.0240752Z   components: 
+2026-10-15T10:19:59.0240919Z ##[endgroup]
+2026-10-15T10:19:59.0318199Z ##[end-action id=__dtolnay_rust-toolchain.flags;outcome=success;conclusion=success;duration_ms=15]
+2026-10-15T10:19:59.0320238Z ##[start-action display=Set $CARGO_HOME;id=__dtolnay_rust-toolchain.__run]
+2026-10-15T10:19:59.0341787Z ##[group]Run echo CARGO_HOME=${CARGO_HOME:-"$HOME/.cargo"} >> $GITHUB_ENV
+2026-10-15T10:19:59.0342169Z [36;1mecho CARGO_HOME=${CARGO_HOME:-"$HOME/.cargo"} >> $GITHUB_ENV[0m
+2026-10-15T10:19:59.0389665Z shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+2026-10-15T10:19:59.0390120Z env:
+2026-10-15T10:19:59.0390286Z   CARGO_NET_RETRY: 10
+2026-10-15T10:19:59.0390471Z ##[endgroup]
+2026-10-15T10:19:59.0462723Z ##[end-action id=__dtolnay_rust-toolchain.__run;outcome=success;conclusion=success;duration_ms=14]
+2026-10-15T10:19:59.0464511Z ##[start-action display=Install rustup if needed;id=__dtolnay_rust-toolchain.__run_2]
+2026-10-15T10:19:59.0490840Z ##[group]Run if ! command -v rustup &>/dev/null; then
+2026-10-15T10:19:59.0491151Z [36;1mif ! command -v rustup &>/dev/null; then[0m
+2026-10-15T10:19:59.0491740Z [36;1m  curl --proto '=https' --tlsv1.2 --retry 10 --retry-connrefused --location --silent --show-error --fail https://sh.rustup.rs | sh -s -- --default-toolchain none -y[0m
+2026-10-15T10:19:59.0492347Z [36;1m  echo "$CARGO_HOME/bin" >> $GITHUB_PATH[0m
+2026-10-15T10:19:59.0492593Z [36;1mfi[0m
+2026-10-15T10:19:59.0540375Z shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+2026-10-15T10:19:59.0540649Z env:
+2026-10-15T10:19:59.0540813Z   CARGO_NET_RETRY: 10
+2026-10-15T10:19:59.0541006Z   CARGO_HOME: /home/runner/.cargo
+2026-10-15T10:19:59.0541210Z ##[endgroup]
+2026-10-15T10:19:59.0610134Z ##[end-action id=__dtolnay_rust-toolchain.__run_2;outcome=success;conclusion=success;duration_ms=14]
+2026-10-15T10:19:59.0611973Z ##[start-action display=Install rustup if needed on windows;id=__dtolnay_rust-toolchain.__run_3]
+2026-10-15T10:19:59.0632931Z ##[end-action id=__dtolnay_rust-toolchain.__run_3;outcome=skipped;conclusion=skipped;duration_ms=0]
+2026-10-15T10:19:59.0643119Z ##[start-action display=rustup toolchain install stable;id=__dtolnay_rust-toolchain.__run_4]
+2026-10-15T10:19:59.0665205Z ##[group]Run rustup toolchain install stable --profile minimal --no-self-update
+2026-10-15T10:19:59.0665639Z [36;1mrustup toolchain install stable --profile minimal --no-self-update[0m
+2026-10-15T10:19:59.0713933Z shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+2026-10-15T10:19:59.0714219Z env:
+2026-10-15T10:19:59.0714390Z   CARGO_NET_RETRY: 10
+2026-10-15T10:19:59.0714581Z   CARGO_HOME: /home/runner/.cargo
+2026-10-15T10:19:59.0714793Z   RUSTUP_PERMIT_COPY_RENAME: 1
+2026-10-15T10:19:59.0715006Z ##[endgroup]
+2026-10-15T10:19:59.4636198Z info: syncing channel updates for stable-x86_64-unknown-linux-gnu
+2026-10-15T10:19:59.5849865Z 
+2026-10-15T10:19:59.5919964Z   stable-x86_64-unknown-linux-gnu unchanged - rustc 1.99.0 (b940084d7 2026-09-28)
+2026-10-15T10:19:59.5920324Z 
+2026-10-15T10:19:59.5944821Z ##[end-action id=__dtolnay_rust-toolchain.__run_4;outcome=success;conclusion=success;duration_ms=530]
+2026-10-15T10:19:59.5949064Z ##[start-action display=rustup default stable;id=__dtolnay_rust-toolchain.__run_5]
+2026-10-15T10:19:59.5970403Z ##[group]Run rustup default stable
+2026-10-15T10:19:59.5970649Z [36;1mrustup default stable[0m
+2026-10-15T10:19:59.6026085Z shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+2026-10-15T10:19:59.6026360Z env:
+2026-10-15T10:19:59.6026528Z   CARGO_NET_RETRY: 10
+2026-10-15T10:19:59.6026723Z   CARGO_HOME: /home/runner/.cargo
+2026-10-15T10:19:59.6026929Z ##[endgroup]
+2026-10-15T10:19:59.6129302Z info: using existing install for stable-x86_64-unknown-linux-gnu
+2026-10-15T10:19:59.6138420Z info: default toolchain set to stable-x86_64-unknown-linux-gnu
+2026-10-15T10:19:59.6138768Z 
+2026-10-15T10:19:59.6203601Z   stable-x86_64-unknown-linux-gnu unchanged - rustc 1.99.0 (b940084d7 2026-09-28)
+2026-10-15T10:19:59.6203976Z 
+2026-10-15T10:19:59.6204390Z info: note that the toolchain '1.96.0-x86_64-unknown-linux-gnu' is currently in use (overridden by '/home/runner/work/Aethyme/Aethyme/rust-toolchain.toml')
+2026-10-15T10:19:59.6218150Z ##[end-action id=__dtolnay_rust-toolchain.__run_5;outcome=success;conclusion=success;duration_ms=26]
+2026-10-15T10:19:59.6220492Z ##[start-action display=Create cachekey;id=__dtolnay_rust-toolchain.rustc-version]
+2026-10-15T10:19:59.6242374Z ##[group]Run DATE=$(rustc +stable --version --verbose | sed -ne 's/^commit-date: \(20[0-9][0-9]\)-\([01][0-9]\)-\([0-3][0-9]\)$/\1\2\3/p')
+2026-10-15T10:19:59.6243159Z [36;1mDATE=$(rustc +stable --version --verbose | sed -ne 's/^commit-date: \(20[0-9][0-9]\)-\([01][0-9]\)-\([0-3][0-9]\)$/\1\2\3/p')[0m
+2026-10-15T10:19:59.6243646Z [36;1mHASH=$(rustc +stable --version --verbose | sed -ne 's/^commit-hash: //p')[0m
+2026-10-15T10:19:59.6244026Z [36;1mecho "cachekey=$(echo $DATE$HASH | head -c12)" >> $GITHUB_OUTPUT[0m
+2026-10-15T10:19:59.6295806Z shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+2026-10-15T10:19:59.6296085Z env:
+2026-10-15T10:19:59.6296258Z   CARGO_NET_RETRY: 10
+2026-10-15T10:19:59.6296445Z   CARGO_HOME: /home/runner/.cargo
+2026-10-15T10:19:59.6296650Z ##[endgroup]
+2026-10-15T10:19:59.6612381Z ##[end-action id=__dtolnay_rust-toolchain.rustc-version;outcome=success;conclusion=success;duration_ms=39]
+2026-10-15T10:19:59.6614622Z ##[start-action display=Disable incremental compilation;id=__dtolnay_rust-toolchain.__run_6]
+2026-10-15T10:19:59.6636674Z ##[group]Run if [ -z "${CARGO_INCREMENTAL+set}" ]; then
+2026-10-15T10:19:59.6636985Z [36;1mif [ -z "${CARGO_INCREMENTAL+set}" ]; then[0m
+2026-10-15T10:19:59.6637252Z [36;1m  echo CARGO_INCREMENTAL=0 >> $GITHUB_ENV[0m
+2026-10-15T10:19:59.6637506Z [36;1mfi[0m
+2026-10-15T10:19:59.6692586Z shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+2026-10-15T10:19:59.6692871Z env:
+2026-10-15T10:19:59.6693037Z   CARGO_NET_RETRY: 10
+2026-10-15T10:19:59.6693224Z   CARGO_HOME: /home/runner/.cargo
+2026-10-15T10:19:59.6693435Z ##[endgroup]
+2026-10-15T10:19:59.6766142Z ##[end-action id=__dtolnay_rust-toolchain.__run_6;outcome=success;conclusion=success;duration_ms=15]
+2026-10-15T10:19:59.6767938Z ##[start-action display=Enable colors in Cargo output;id=__dtolnay_rust-toolchain.__run_7]
+2026-10-15T10:19:59.6789193Z ##[group]Run if [ -z "${CARGO_TERM_COLOR+set}" ]; then
+2026-10-15T10:19:59.6789500Z [36;1mif [ -z "${CARGO_TERM_COLOR+set}" ]; then[0m
+2026-10-15T10:19:59.6789929Z [36;1m  echo CARGO_TERM_COLOR=always >> $GITHUB_ENV[0m
+2026-10-15T10:19:59.6790178Z [36;1mfi[0m
+2026-10-15T10:19:59.6838513Z shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+2026-10-15T10:19:59.6838801Z env:
+2026-10-15T10:19:59.6838978Z   CARGO_NET_RETRY: 10
+2026-10-15T10:19:59.6839169Z   CARGO_HOME: /home/runner/.cargo
+2026-10-15T10:19:59.6839373Z   CARGO_INCREMENTAL: 0
+2026-10-15T10:19:59.6839547Z ##[endgroup]
+2026-10-15T10:19:59.6908157Z ##[end-action id=__dtolnay_rust-toolchain.__run_7;outcome=success;conclusion=success;duration_ms=13]
+2026-10-15T10:19:59.6910071Z ##[start-action display=Enable Cargo sparse registry;id=__dtolnay_rust-toolchain.__run_8]
+2026-10-15T10:19:59.6931066Z ##[group]Run # implemented in 1.66, stabilized in 1.68, made default in 1.70
+2026-10-15T10:19:59.6931463Z [36;1m# implemented in 1.66, stabilized in 1.68, made default in 1.70[0m
+2026-10-15T10:19:59.6932022Z [36;1mif [ -z "${CARGO_REGISTRIES_CRATES_IO_PROTOCOL+set}" -o -f "/home/runner/work/_temp"/.implicit_cargo_registries_crates_io_protocol ]; then[0m
+2026-10-15T10:19:59.6932578Z [36;1m  if rustc +stable --version --verbose | grep -q '^release: 1\.6[89]\.'; then[0m
+2026-10-15T10:19:59.6933030Z [36;1m    touch "/home/runner/work/_temp"/.implicit_cargo_registries_crates_io_protocol || true[0m
+2026-10-15T10:19:59.6933439Z [36;1m    echo CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse >> $GITHUB_ENV[0m
+2026-10-15T10:19:59.6933819Z [36;1m  elif rustc +stable --version --verbose | grep -q '^release: 1\.6[67]\.'; then[0m
+2026-10-15T10:19:59.6934240Z [36;1m    touch "/home/runner/work/_temp"/.implicit_cargo_registries_crates_io_protocol || true[0m
+2026-10-15T10:19:59.6934634Z [36;1m    echo CARGO_REGISTRIES_CRATES_IO_PROTOCOL=git >> $GITHUB_ENV[0m
+2026-10-15T10:19:59.6934907Z [36;1m  fi[0m
+2026-10-15T10:19:59.6935077Z [36;1mfi[0m
+2026-10-15T10:19:59.6982353Z shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+2026-10-15T10:19:59.6982623Z env:
+2026-10-15T10:19:59.6982789Z   CARGO_NET_RETRY: 10
+2026-10-15T10:19:59.6982981Z   CARGO_HOME: /home/runner/.cargo
+2026-10-15T10:19:59.6983189Z   CARGO_INCREMENTAL: 0
+2026-10-15T10:19:59.6983370Z   CARGO_TERM_COLOR: always
+2026-10-15T10:19:59.6983554Z ##[endgroup]
+2026-10-15T10:19:59.7279107Z ##[end-action id=__dtolnay_rust-toolchain.__run_8;outcome=success;conclusion=success;duration_ms=36]
+2026-10-15T10:19:59.7281564Z ##[start-action display=Work around spurious network errors in curl 8.0;id=__dtolnay_rust-toolchain.__run_9]
+2026-10-15T10:19:59.7303173Z ##[group]Run # https://rust-lang.zulipchat.com/#narrow/stream/246057-t-cargo/topic/timeout.20investigation
+2026-10-15T10:19:59.7303754Z [36;1m# https://rust-lang.zulipchat.com/#narrow/stream/246057-t-cargo/topic/timeout.20investigation[0m
+2026-10-15T10:19:59.7304226Z [36;1mif rustc +stable --version --verbose | grep -q '^release: 1\.7[01]\.'; then[0m
+2026-10-15T10:19:59.7304611Z [36;1m  echo CARGO_HTTP_MULTIPLEXING=false >> $GITHUB_ENV[0m
+2026-10-15T10:19:59.7304869Z [36;1mfi[0m
+2026-10-15T10:19:59.7359346Z shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+2026-10-15T10:19:59.7359626Z env:
+2026-10-15T10:19:59.7360004Z   CARGO_NET_RETRY: 10
+2026-10-15T10:19:59.7360208Z   CARGO_HOME: /home/runner/.cargo
+2026-10-15T10:19:59.7360414Z   CARGO_INCREMENTAL: 0
+2026-10-15T10:19:59.7360599Z   CARGO_TERM_COLOR: always
+2026-10-15T10:19:59.7360789Z ##[endgroup]
+2026-10-15T10:19:59.7542043Z ##[end-action id=__dtolnay_rust-toolchain.__run_9;outcome=success;conclusion=success;duration_ms=25]
+2026-10-15T10:19:59.7544908Z ##[start-action display=rustc +stable --version --verbose;id=__dtolnay_rust-toolchain.__run_10]
+2026-10-15T10:19:59.7563964Z ##[group]Run rustc +stable --version --verbose
+2026-10-15T10:19:59.7564249Z [36;1mrustc +stable --version --verbose[0m
+2026-10-15T10:19:59.7614963Z shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+2026-10-15T10:19:59.7615383Z env:
+2026-10-15T10:19:59.7615544Z   CARGO_NET_RETRY: 10
+2026-10-15T10:19:59.7615732Z   CARGO_HOME: /home/runner/.cargo
+2026-10-15T10:19:59.7615935Z   CARGO_INCREMENTAL: 0
+2026-10-15T10:19:59.7616113Z   CARGO_TERM_COLOR: always
+2026-10-15T10:19:59.7616297Z ##[endgroup]
+2026-10-15T10:19:59.7778058Z rustc 1.99.0 (b940084d7 2026-09-28)
+2026-10-15T10:19:59.7778809Z binary: rustc
+2026-10-15T10:19:59.7779492Z commit-hash: b940084d7eb6a299eb4bfeb8e34901bc051e7ac4
+2026-10-15T10:19:59.7780023Z commit-date: 2026-09-28
+2026-10-15T10:19:59.7780319Z host: x86_64-unknown-linux-gnu
+2026-10-15T10:19:59.7780624Z release: 1.99.0
+2026-10-15T10:19:59.7780900Z LLVM version: 23.1.1
+2026-10-15T10:19:59.7798916Z ##[end-action id=__dtolnay_rust-toolchain.__run_10;outcome=success;conclusion=success;duration_ms=25]
+2026-10-15T10:19:59.7896170Z ##[group]Run Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+2026-10-15T10:19:59.7896482Z with:
+2026-10-15T10:19:59.7896672Z   workspaces: packages/aethyme/rust
+2026-10-15T10:19:59.7896892Z   shared-key: rust-tests
+2026-10-15T10:19:59.7897078Z   save-if: false
+2026-10-15T10:19:59.7897248Z   prefix-key: v0-rust
+2026-10-15T10:19:59.7897427Z   add-job-id-key: true
+2026-10-15T10:19:59.7897622Z   add-rust-environment-hash-key: true
+2026-10-15T10:19:59.7897842Z   cache-targets: true
+2026-10-15T10:19:59.7898029Z   cache-all-crates: false
+2026-10-15T10:19:59.7898226Z   cache-workspace-crates: false
+2026-10-15T10:19:59.7898427Z   cache-provider: github
+2026-10-15T10:19:59.7898604Z   cache-bin: true
+2026-10-15T10:19:59.7898772Z   lookup-only: false
+2026-10-15T10:19:59.7898945Z   cmd-format: {0}
+2026-10-15T10:19:59.7899101Z env:
+2026-10-15T10:19:59.7899252Z   CARGO_NET_RETRY: 10
+2026-10-15T10:19:59.7899432Z   CARGO_HOME: /home/runner/.cargo
+2026-10-15T10:19:59.7899675Z   CARGO_INCREMENTAL: 0
+2026-10-15T10:19:59.7899999Z   CARGO_TERM_COLOR: always
+2026-10-15T10:19:59.7900189Z ##[endgroup]
+2026-10-15T10:20:07.2749587Z ##[group]Cache Configuration
+2026-10-15T10:20:07.2750161Z Cache Provider:
+2026-10-15T10:20:07.2750428Z     github
+2026-10-15T10:20:07.2750651Z Workspaces:
+2026-10-15T10:20:07.2751002Z     /home/runner/work/Aethyme/Aethyme/packages/aethyme/rust
+2026-10-15T10:20:07.2751420Z Cache Paths:
+2026-10-15T10:20:07.2751671Z     /home/runner/.cargo/bin
+2026-10-15T10:20:07.2751982Z     /home/runner/.cargo/.crates.toml
+2026-10-15T10:20:07.2752229Z     /home/runner/.cargo/.crates2.json
+2026-10-15T10:20:07.2752443Z     /home/runner/.cargo/registry
+2026-10-15T10:20:07.2752650Z     /home/runner/.cargo/git
+2026-10-15T10:20:07.2752923Z     /home/runner/work/Aethyme/Aethyme/packages/aethyme/rust/target
+2026-10-15T10:20:07.2753288Z Restore Key:
+2026-10-15T10:20:07.2753475Z     v0-rust-rust-tests-Linux-x64-dac38cff
+2026-10-15T10:20:07.2753693Z Cache Key:
+2026-10-15T10:20:07.2753919Z     v0-rust-rust-tests-Linux-x64-dac38cff-418c313b
+2026-10-15T10:20:07.2754159Z .. Prefix:
+2026-10-15T10:20:07.2754332Z   - v0-rust-rust-tests-Linux-x64
+2026-10-15T10:20:07.2754571Z .. Environment considered:
+2026-10-15T10:20:07.2754759Z   - Rust Versions:
+2026-10-15T10:20:07.2755020Z     - 1.96.0 x86_64-unknown-linux-gnu ac68faa20c58cbccd01ee7208bf3b6e93a7d7f96
+2026-10-15T10:20:07.2755397Z     - 1.99.0 x86_64-unknown-linux-gnu b940084d7eb6a299eb4bfeb8e34901bc051e7ac4
+2026-10-15T10:20:07.2755694Z   - CARGO_HOME
+2026-10-15T10:20:07.2755898Z   - CARGO_INCREMENTAL
+2026-10-15T10:20:07.2756183Z   - CARGO_NET_RETRY
+2026-10-15T10:20:07.2756352Z   - CARGO_TERM_COLOR
+2026-10-15T10:20:07.2756528Z .. Lockfiles considered:
+2026-10-15T10:20:07.2756754Z   - /home/runner/work/Aethyme/Aethyme/.cargo/config.toml
+2026-10-15T10:20:07.2757082Z   - /home/runner/work/Aethyme/Aethyme/packages/aethyme/rust/Cargo.lock
+2026-10-15T10:20:07.2757544Z   - /home/runner/work/Aethyme/Aethyme/packages/aethyme/rust/crates/aethyme-broker/Cargo.toml
+2026-10-15T10:20:07.2758025Z   - /home/runner/work/Aethyme/Aethyme/packages/aethyme/rust/crates/aethyme-cli/Cargo.toml
+2026-10-15T10:20:07.2758789Z   - /home/runner/work/Aethyme/Aethyme/packages/aethyme/rust/crates/aethyme-contracts/Cargo.toml
+2026-10-15T10:20:07.2759267Z   - /home/runner/work/Aethyme/Aethyme/packages/aethyme/rust/crates/aethyme-engine/Cargo.toml
+2026-10-15T10:20:07.2759857Z   - /home/runner/work/Aethyme/Aethyme/packages/aethyme/rust/crates/aethyme-enhance/Cargo.toml
+2026-10-15T10:20:07.2760668Z   - /home/runner/work/Aethyme/Aethyme/packages/aethyme/rust/crates/aethyme-graph-indexer/Cargo.toml
+2026-10-15T10:20:07.2761302Z   - /home/runner/work/Aethyme/Aethyme/packages/aethyme/rust/crates/aethyme-graph-schema/Cargo.toml
+2026-10-15T10:20:07.2761831Z   - /home/runner/work/Aethyme/Aethyme/packages/aethyme/rust/crates/aethyme-graph-storage/Cargo.toml
+2026-10-15T10:20:07.2762324Z   - /home/runner/work/Aethyme/Aethyme/packages/aethyme/rust/crates/aethyme-producers/Cargo.toml
+2026-10-15T10:20:07.2762996Z   - /home/runner/work/Aethyme/Aethyme/packages/aethyme/rust/crates/aethyme-quality/Cargo.toml
+2026-10-15T10:20:07.2763728Z   - /home/runner/work/Aethyme/Aethyme/packages/aethyme/rust/crates/aethyme-testkit/Cargo.toml
+2026-10-15T10:20:07.2764358Z   - /home/runner/work/Aethyme/Aethyme/rust-toolchain.toml
+2026-10-15T10:20:07.2764827Z ##[endgroup]
+2026-10-15T10:20:07.2764924Z 
+2026-10-15T10:20:07.2765005Z ... Restoring cache ...
+2026-10-15T10:20:07.5086689Z Cache hit for restore-key: v0-rust-rust-tests-Linux-x64-dac38cff-846f2684
+2026-10-15T10:20:08.7125134Z Received 37748736 of 261139415 (14.5%), 36.0 MBs/sec
+2026-10-15T10:20:09.7129114Z Received 192937984 of 261139415 (73.9%), 92.0 MBs/sec
+2026-10-15T10:20:10.0609669Z Received 261139415 of 261139415 (100.0%), 106.0 MBs/sec
+2026-10-15T10:20:10.0610324Z Cache Size: ~249 MB (261139415 B)
+2026-10-15T10:20:10.0662132Z [command]/usr/bin/tar -xf /home/runner/work/_temp/55cdb8b1-e226-4b1a-9bd1-0fc562c4dbfb/cache.tzst -P -C /home/runner/work/Aethyme/Aethyme --use-compress-program unzstd
+2026-10-15T10:20:11.1469923Z Cache restored successfully
+2026-10-15T10:20:11.1570941Z Restored from cache key "v0-rust-rust-tests-Linux-x64-dac38cff-846f2684" full match: false.
+2026-10-15T10:20:11.2287667Z ##[group]Run taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0
+2026-10-15T10:20:11.2288168Z with:
+2026-10-15T10:20:11.2288444Z   tool: cargo-nextest@0.9.146
+2026-10-15T10:20:11.2288758Z   checksum: true
+2026-10-15T10:20:11.2289044Z   fallback: cargo-binstall
+2026-10-15T10:20:11.2289327Z env:
+2026-10-15T10:20:11.2289585Z   CARGO_NET_RETRY: 10
+2026-10-15T10:20:11.2290021Z   CARGO_HOME: /home/runner/.cargo
+2026-10-15T10:20:11.2290360Z   CARGO_INCREMENTAL: 0
+2026-10-15T10:20:11.2290637Z   CARGO_TERM_COLOR: always
+2026-10-15T10:20:11.2290939Z   CACHE_ON_FAILURE: false
+2026-10-15T10:20:11.2291230Z ##[endgroup]
+2026-10-15T10:20:11.2297304Z ##[start-action display=Run bail() {;id=__taiki-e_install-action.__run]
+2026-10-15T10:20:11.3481703Z ##[group]Run bail() {
+2026-10-15T10:20:11.3481965Z [36;1mbail() {[0m
+2026-10-15T10:20:11.3482198Z [36;1m  printf '::error::install-action: %s\n' "$*"[0m
+2026-10-15T10:20:11.3482482Z [36;1m  exit 1[0m
+2026-10-15T10:20:11.3482696Z [36;1m}[0m
+2026-10-15T10:20:11.3483000Z [36;1m# If /bin/sh is dash, environment variable containing % is not imported, but is fine[0m
+2026-10-15T10:20:11.3483428Z [36;1m# because it also means that it will not be exposed to subprocess.[0m
+2026-10-15T10:20:11.3483784Z [36;1mif /usr/bin/env | grep -Eq '^BASH_FUNC_'; then[0m
+2026-10-15T10:20:11.3484215Z [36;1m  bail 'bash function injection via BASH_FUNC_ environment variable is not allowed for security reasons'[0m
+2026-10-15T10:20:11.3484606Z [36;1mfi[0m
+2026-10-15T10:20:11.3484800Z [36;1mif ! command -v bash >/dev/null; then[0m
+2026-10-15T10:20:11.3485083Z [36;1m  if grep -Eq '^ID=alpine' /etc/os-release; then[0m
+2026-10-15T10:20:11.3485434Z [36;1m    printf '::group::Install packages required for install-action (bash)\n'[0m
+2026-10-15T10:20:11.3485788Z [36;1m    # NB: sync with apk_install in main.sh[0m
+2026-10-15T10:20:11.3486048Z [36;1m    if command -v sudo >/dev/null; then[0m
+2026-10-15T10:20:11.3486479Z [36;1m      sudo apk --no-cache add bash[0m
+2026-10-15T10:20:11.3486734Z [36;1m    elif command -v doas >/dev/null; then[0m
+2026-10-15T10:20:11.3486985Z [36;1m      doas apk --no-cache add bash[0m
+2026-10-15T10:20:11.3487210Z [36;1m    else[0m
+2026-10-15T10:20:11.3487400Z [36;1m      apk --no-cache add bash[0m
+2026-10-15T10:20:11.3487609Z [36;1m    fi[0m
+2026-10-15T10:20:11.3487789Z [36;1m    printf '::endgroup::\n'[0m
+2026-10-15T10:20:11.3487996Z [36;1m  else[0m
+2026-10-15T10:20:11.3488190Z [36;1m    bail 'this action requires bash'[0m
+2026-10-15T10:20:11.3488413Z [36;1m  fi[0m
+2026-10-15T10:20:11.3488571Z [36;1mfi[0m
+2026-10-15T10:20:11.3488801Z [36;1mbash --noprofile --norc "${GITHUB_ACTION_PATH:?}/main.sh"[0m
+2026-10-15T10:20:11.3490364Z shell: /usr/bin/env -u ENV -u BASH_ENV -u CDPATH -u SHELLOPTS -u BASHOPTS /bin/sh -eu {0}
+2026-10-15T10:20:11.3490700Z env:
+2026-10-15T10:20:11.3490869Z   CARGO_NET_RETRY: 10
+2026-10-15T10:20:11.3491071Z   CARGO_HOME: /home/runner/.cargo
+2026-10-15T10:20:11.3491297Z   CARGO_INCREMENTAL: 0
+2026-10-15T10:20:11.3491489Z   CARGO_TERM_COLOR: always
+2026-10-15T10:20:11.3491689Z   CACHE_ON_FAILURE: false
+2026-10-15T10:20:11.3491902Z   INPUT_TOOL: cargo-nextest@0.9.146
+2026-10-15T10:20:11.3492128Z   INPUT_CHECKSUM: true
+2026-10-15T10:20:11.3492325Z   INPUT_FALLBACK: cargo-binstall
+2026-10-15T10:20:11.3494724Z   DEFAULT_GITHUB_TOKEN: ***
+2026-10-15T10:20:11.3495075Z   ACTION_USER_AGENT: taiki-e/install-action (e407f7bafb71fd004bc5c2da3032e5470cbb6ef0)
+2026-10-15T10:20:11.3495411Z   RUNNER_OS: Linux
+2026-10-15T10:20:11.3495594Z   RUNNER_ARCH: X64
+2026-10-15T10:20:11.3495776Z ##[endgroup]
+2026-10-15T10:20:11.4710737Z info: host platform: x86_64_linux
+2026-10-15T10:20:11.4901161Z info: installing cargo-nextest@0.9.146
+2026-10-15T10:20:11.5073438Z info: downloading https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-0.9.146/cargo-nextest-0.9.146-x86_64-unknown-linux-gnu.tar.gz
+2026-10-15T10:20:11.7282486Z info: verifying sha256 checksum for cargo-nextest-0.9.146-x86_64-unknown-linux-gnu.tar.gz
+2026-10-15T10:20:12.2079668Z info: cargo-nextest installed at /home/runner/.cargo/bin/cargo-nextest
+2026-10-15T10:20:12.2083171Z + cargo-nextest nextest --version
+2026-10-15T10:20:12.2106456Z cargo-nextest 0.9.146 (8af696ddc 2026-09-21)
+2026-10-15T10:20:12.2106815Z release: 0.9.146
+2026-10-15T10:20:12.2107153Z commit-hash: 8af696ddcce8fff2962d6a5168b6d138b8616a35
+2026-10-15T10:20:12.2107446Z commit-date: 2026-09-21
+2026-10-15T10:20:12.2107653Z host: x86_64-unknown-linux-gnu
+2026-10-15T10:20:12.2110051Z 
+2026-10-15T10:20:12.2120357Z ##[end-action id=__taiki-e_install-action.__run;outcome=success;conclusion=success;duration_ms=982]
+2026-10-15T10:20:12.2124744Z ##[start-action display=Run Set-StrictMode -Version Latest;id=__taiki-e_install-action.__run_2]
+2026-10-15T10:20:12.2128019Z ##[end-action id=__taiki-e_install-action.__run_2;outcome=skipped;conclusion=skipped;duration_ms=0]
+2026-10-15T10:20:12.2213448Z ##[group]Run cargo build --locked --workspace --bins
+2026-10-15T10:20:12.2213781Z [36;1mcargo build --locked --workspace --bins[0m
+2026-10-15T10:20:12.2268981Z shell: /usr/bin/bash -e {0}
+2026-10-15T10:20:12.2269208Z env:
+2026-10-15T10:20:12.2269378Z   CARGO_NET_RETRY: 10
+2026-10-15T10:20:12.2269573Z   CARGO_HOME: /home/runner/.cargo
+2026-10-15T10:20:12.2269990Z   CARGO_INCREMENTAL: 0
+2026-10-15T10:20:12.2270189Z   CARGO_TERM_COLOR: always
+2026-10-15T10:20:12.2270383Z   CACHE_ON_FAILURE: false
+2026-10-15T10:20:12.2270572Z ##[endgroup]
+2026-10-15T10:20:12.2793432Z [1m[92m    Updating[0m crates.io index
+2026-10-15T10:20:12.5613599Z [1m[92m Downloading[0m crates ...
+2026-10-15T10:20:13.2445771Z [1m[92m  Downloaded[0m filetime v0.2.29
+2026-10-15T10:20:13.2461973Z [1m[92m  Downloaded[0m sha1 v0.10.7
+2026-10-15T10:20:13.2545514Z [1m[92m  Downloaded[0m tar v0.4.46
+2026-10-15T10:20:13.4173282Z [1m[92m   Compiling[0m serde v1.0.229
+2026-10-15T10:20:13.4208698Z [1m[92m   Compiling[0m dragonbox_ecma v0.1.12
+2026-10-15T10:20:13.4247025Z [1m[92m   Compiling[0m tinyvec_macros v0.1.1
+2026-10-15T10:20:13.4300349Z [1m[92m   Compiling[0m aethyme-engine v0.8.26 (/home/runner/work/Aethyme/Aethyme/packages/aethyme/rust/crates/aethyme-engine)
+2026-10-15T10:20:13.4505191Z [1m[92m   Compiling[0m tinyvec v1.11.0
+2026-10-15T10:20:13.6937994Z [1m[92m   Compiling[0m unicode-normalization v0.1.25
+2026-10-15T10:20:13.7409588Z [1m[92m   Compiling[0m oxc_index v4.1.0
+2026-10-15T10:20:13.8028099Z [1m[92m   Compiling[0m toml_datetime v0.6.11
+2026-10-15T10:20:13.9053424Z [1m[92m   Compiling[0m serde_spanned v0.6.9
+2026-10-15T10:20:13.9431642Z [1m[92m   Compiling[0m aethyme-graph-schema v0.8.26 (/home/runner/work/Aethyme/Aethyme/packages/aethyme/rust/crates/aethyme-graph-schema)
+2026-10-15T10:20:13.9521080Z [1m[92m   Compiling[0m toml_edit v0.22.27
+2026-10-15T10:20:14.0519682Z [1m[92m   Compiling[0m oxc_syntax v0.125.0
+2026-10-15T10:20:14.0562578Z [1m[92m   Compiling[0m bincode v1.3.3
+2026-10-15T10:20:14.3311495Z [1m[92m   Compiling[0m rustpython-ruff_python_parser v0.15.8
+2026-10-15T10:20:14.6851059Z [1m[92m   Compiling[0m oxc_ast v0.125.0
+2026-10-15T10:20:15.3341293Z [1m[92m   Compiling[0m toml v0.8.23
+2026-10-15T10:20:15.6628661Z [1m[92m   Compiling[0m aethyme-graph-storage v0.8.26 (/home/runner/work/Aethyme/Aethyme/packages/aethyme/rust/crates/aethyme-graph-storage)
+2026-10-15T10:20:15.9731372Z [1m[92m   Compiling[0m filetime v0.2.29
+2026-10-15T10:20:16.0591702Z [1m[92m   Compiling[0m aethyme-broker v0.8.26 (/home/runner/work/Aethyme/Aethyme/packages/aethyme/rust/crates/aethyme-broker)
+2026-10-15T10:20:16.1931462Z [1m[92m   Compiling[0m tar v0.4.46
+2026-10-15T10:20:16.2020322Z [1m[92m   Compiling[0m aethyme-enhance v0.8.26 (/home/runner/work/Aethyme/Aethyme/packages/aethyme/rust/crates/aethyme-enhance)
+2026-10-15T10:20:16.8211799Z [1m[92m   Compiling[0m aethyme-producers v0.8.26 (/home/runner/work/Aethyme/Aethyme/packages/aethyme/rust/crates/aethyme-producers)
+2026-10-15T10:20:17.5192195Z [1m[92m   Compiling[0m aethyme-contracts v0.8.26 (/home/runner/work/Aethyme/Aethyme/packages/aethyme/rust/crates/aethyme-contracts)
+2026-10-15T10:20:17.9651256Z [1m[92m   Compiling[0m sha1 v0.10.7
+2026-10-15T10:20:18.0661433Z [1m[92m   Compiling[0m aethyme-cli v0.8.26 (/home/runner/work/Aethyme/Aethyme/packages/aethyme/rust/crates/aethyme-cli)
+2026-10-15T10:20:18.2191456Z [1m[92m   Compiling[0m aethyme-quality v0.8.26 (/home/runner/work/Aethyme/Aethyme/packages/aethyme/rust/crates/aethyme-quality)
+2026-10-15T10:20:18.6969596Z [1m[92m   Compiling[0m oxc_ecmascript v0.125.0
+2026-10-15T10:20:18.6971064Z [1m[92m   Compiling[0m oxc_ast_visit v0.125.0
+2026-10-15T10:20:19.2341307Z [1m[92m   Compiling[0m oxc_parser v0.125.0
+2026-10-15T10:20:20.4121699Z [1m[92m   Compiling[0m aethyme-graph-indexer v0.8.26 (/home/runner/work/Aethyme/Aethyme/packages/aethyme/rust/crates/aethyme-graph-indexer)
+2026-10-15T10:21:00.0356427Z [1m[92m    Finished[0m `dev` profile [unoptimized + debuginfo] target(s) in 47.78s
+2026-10-15T10:21:00.0626148Z ##[group]Run cargo test --locked --workspace --no-run --timings
+2026-10-15T10:21:00.0626754Z [36;1mcargo test --locked --workspace --no-run --timings[0m
+2026-10-15T10:21:00.0683801Z shell: /usr/bin/bash -e {0}
+2026-10-15T10:21:00.0684108Z env:
+2026-10-15T10:21:00.0684350Z   CARGO_NET_RETRY: 10
+2026-10-15T10:21:00.0684642Z   CARGO_HOME: /home/runner/.cargo
+2026-10-15T10:21:00.0684969Z   CARGO_INCREMENTAL: 0
+2026-10-15T10:21:00.0685265Z   CARGO_TERM_COLOR: always
+2026-10-15T10:21:00.0685570Z   CACHE_ON_FAILURE: false
+2026-10-15T10:21:00.0685872Z ##[endgroup]
+2026-10-15T10:21:00.3537665Z [1m[92m   Compiling[0m aethyme-graph-schema v0.8.26 (/home/runner/work/Aethyme/Aethyme/packages/aethyme/rust/crates/aethyme-graph-schema)
+2026-10-15T10:21:00.3628662Z [1m[92m   Compiling[0m oxc_syntax v0.125.0
+2026-10-15T10:21:00.3710388Z [1m[92m   Compiling[0m aethyme-testkit v0.1.0 (/home/runner/work/Aethyme/Aethyme/packages/aethyme/rust/crates/aethyme-testkit)
+2026-10-15T10:21:00.3712328Z [1m[92m   Compiling[0m aethyme-engine v0.8.26 (/home/runner/work/Aethyme/Aethyme/packages/aethyme/rust/crates/aethyme-engine)
+2026-10-15T10:21:00.3972025Z [1m[92m   Compiling[0m aethyme-enhance v0.8.26 (/home/runner/work/Aethyme/Aethyme/packages/aethyme/rust/crates/aethyme-enhance)
+2026-10-15T10:21:00.9251023Z [1m[92m   Compiling[0m oxc_ast v0.125.0
+2026-10-15T10:21:01.7851877Z [1m[92m   Compiling[0m aethyme-graph-storage v0.8.26 (/home/runner/work/Aethyme/Aethyme/packages/aethyme/rust/crates/aethyme-graph-storage)
+2026-10-15T10:21:02.3681337Z [1m[92m   Compiling[0m aethyme-broker v0.8.26 (/home/runner/work/Aethyme/Aethyme/packages/aethyme/rust/crates/aethyme-broker)
+2026-10-15T10:21:02.3981737Z [1m[92m   Compiling[0m aethyme-quality v0.8.26 (/home/runner/work/Aethyme/Aethyme/packages/aethyme/rust/crates/aethyme-quality)
+2026-10-15T10:21:03.1576987Z [1m[92m   Compiling[0m aethyme-producers v0.8.26 (/home/runner/work/Aethyme/Aethyme/packages/aethyme/rust/crates/aethyme-producers)
+2026-10-15T10:21:03.7771608Z [1m[92m   Compiling[0m aethyme-cli v0.8.26 (/home/runner/work/Aethyme/Aethyme/packages/aethyme/rust/crates/aethyme-cli)
+2026-10-15T10:21:05.1835420Z [1m[92m   Compiling[0m oxc_ecmascript v0.125.0
+2026-10-15T10:21:05.2805025Z [1m[92m   Compiling[0m oxc_ast_visit v0.125.0
+2026-10-15T10:21:05.8073508Z [1m[92m   Compiling[0m oxc_parser v0.125.0
+2026-10-15T10:21:07.2714908Z [1m[92m   Compiling[0m aethyme-graph-indexer v0.8.26 (/home/runner/work/Aethyme/Aethyme/packages/aethyme/rust/crates/aethyme-graph-indexer)
+2026-10-15T10:21:17.4871922Z [1m[92m   Compiling[0m aethyme-contracts v0.8.26 (/home/runner/work/Aethyme/Aethyme/packages/aethyme/rust/crates/aethyme-contracts)
+2026-10-15T10:21:43.9120895Z [1m[91merror[E0382][0m[1m: use of moved value: `observation`[0m
+2026-10-15T10:21:43.9122039Z    [1m[94m--> [0mcrates/aethyme-broker/src/native_gates/tests.rs:714:45
+2026-10-15T10:21:43.9122757Z     [1m[94m|[0m
+2026-10-15T10:21:43.9123487Z [1m[94m648[0m [1m[94m|[0m     let observation = completed.observation.clone().unwrap();
+2026-10-15T10:21:43.9132076Z     [1m[94m|[0m         [1m[94m-----------[0m [1m[94mmove occurs because `observation` has type `serde_json::Value`, which does not implement the `Copy` trait[0m
+2026-10-15T10:21:43.9133629Z [1m[94m...[0m
+2026-10-15T10:21:43.9134175Z [1m[94m658[0m [1m[94m|[0m         Some(observation)
+2026-10-15T10:21:43.9134878Z     [1m[94m|[0m              [1m[94m-----------[0m [1m[94mvalue moved here[0m
+2026-10-15T10:21:43.9135478Z [1m[94m...[0m
+2026-10-15T10:21:43.9136142Z [1m[94m714[0m [1m[94m|[0m     assert_eq!(historical.observation, Some(observation));
+2026-10-15T10:21:43.9136977Z     [1m[94m|[0m                                             [1m[91m^^^^^^^^^^^[0m [1m[91mvalue used here after move[0m
+2026-10-15T10:21:43.9137683Z     [1m[94m|[0m
+2026-10-15T10:21:43.9138308Z [1m[96mhelp[0m: consider cloning the value if the performance cost is acceptable
+2026-10-15T10:21:43.9139309Z     [1m[94m|[0m
+2026-10-15T10:21:43.9140073Z [1m[94m658[0m [1m[94m| [0m        Some(observation[92m.clone()[0m)
+2026-10-15T10:21:43.9140738Z     [1m[94m|[0m                         [92m++++++++[0m
+2026-10-15T10:21:43.9141192Z 
+2026-10-15T10:21:55.2612764Z [1mFor more information about this error, try `rustc --explain E0382`.[0m
+2026-10-15T10:21:55.2861073Z [1m[91merror[0m: could not compile `aethyme-broker` (lib test) due to 1 previous error
+2026-10-15T10:21:55.2862550Z [1m[33mwarning[0m: build failed, waiting for other jobs to finish...
+2026-10-15T10:21:55.9846531Z [1m[92m      Timing[0m report saved to /home/runner/work/Aethyme/Aethyme/packages/aethyme/rust/target/cargo-timings/cargo-timing-20261015T102100106Z-83d4c1692405474b.html
+2026-10-15T10:21:56.0255967Z ##[error]Process completed with exit code 101.
+2026-10-15T10:21:56.0358983Z Post job cleanup.
+2026-10-15T10:21:56.1031903Z [command]/usr/bin/git version
+2026-10-15T10:21:56.1077750Z git version 2.55.0
+2026-10-15T10:21:56.1138354Z Temporarily overriding HOME='/home/runner/work/_temp/b269e32a-2b04-4c20-8085-3c36e324de12' before making global git config changes
+2026-10-15T10:21:56.1139348Z Adding repository directory to the temporary git global config as a safe directory
+2026-10-15T10:21:56.1143763Z [command]/usr/bin/git config --global --add safe.directory /home/runner/work/Aethyme/Aethyme
+2026-10-15T10:21:56.1177968Z Removing SSH command configuration
+2026-10-15T10:21:56.1184570Z [command]/usr/bin/git config --local --name-only --get-regexp core\.sshCommand
+2026-10-15T10:21:56.1219613Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :"
+2026-10-15T10:21:56.1437532Z Removing HTTP extra header
+2026-10-15T10:21:56.1443323Z [command]/usr/bin/git config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
+2026-10-15T10:21:56.1479542Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :"
+2026-10-15T10:21:56.1698592Z Removing includeIf entries pointing to credentials config files
+2026-10-15T10:21:56.1705661Z [command]/usr/bin/git config --local --name-only --get-regexp ^includeIf\.gitdir:
+2026-10-15T10:21:56.1742077Z includeif.gitdir:/home/runner/work/Aethyme/Aethyme/.git.path
+2026-10-15T10:21:56.1742753Z includeif.gitdir:/home/runner/work/Aethyme/Aethyme/.git/worktrees/*.path
+2026-10-15T10:21:56.1743458Z includeif.gitdir:/github/workspace/.git.path
+2026-10-15T10:21:56.1743909Z includeif.gitdir:/github/workspace/.git/worktrees/*.path
+2026-10-15T10:21:56.1750368Z [command]/usr/bin/git config --local --get-all includeif.gitdir:/home/runner/work/Aethyme/Aethyme/.git.path
+2026-10-15T10:21:56.1777636Z /home/runner/work/_temp/git-credentials-77b007ed-14e7-49ee-bc1d-23b19bf64cad.config
+2026-10-15T10:21:56.1786901Z [command]/usr/bin/git config --local --unset includeif.gitdir:/home/runner/work/Aethyme/Aethyme/.git.path \/home\/runner\/work\/_temp\/git\-credentials\-77b007ed\-14e7\-49ee\-bc1d\-23b19bf64cad\.config
+2026-10-15T10:21:56.1825488Z [command]/usr/bin/git config --local --get-all includeif.gitdir:/home/runner/work/Aethyme/Aethyme/.git/worktrees/*.path
+2026-10-15T10:21:56.1852697Z /home/runner/work/_temp/git-credentials-77b007ed-14e7-49ee-bc1d-23b19bf64cad.config
+2026-10-15T10:21:56.1867394Z [command]/usr/bin/git config --local --unset includeif.gitdir:/home/runner/work/Aethyme/Aethyme/.git/worktrees/*.path \/home\/runner\/work\/_temp\/git\-credentials\-77b007ed\-14e7\-49ee\-bc1d\-23b19bf64cad\.config
+2026-10-15T10:21:56.1902306Z [command]/usr/bin/git config --local --get-all includeif.gitdir:/github/workspace/.git.path
+2026-10-15T10:21:56.1928205Z /github/runner_temp/git-credentials-77b007ed-14e7-49ee-bc1d-23b19bf64cad.config
+2026-10-15T10:21:56.1934862Z [command]/usr/bin/git config --local --unset includeif.gitdir:/github/workspace/.git.path \/github\/runner_temp\/git\-credentials\-77b007ed\-14e7\-49ee\-bc1d\-23b19bf64cad\.config
+2026-10-15T10:21:56.1968921Z [command]/usr/bin/git config --local --get-all includeif.gitdir:/github/workspace/.git/worktrees/*.path
+2026-10-15T10:21:56.1993661Z /github/runner_temp/git-credentials-77b007ed-14e7-49ee-bc1d-23b19bf64cad.config
+2026-10-15T10:21:56.2000212Z [command]/usr/bin/git config --local --unset includeif.gitdir:/github/workspace/.git/worktrees/*.path \/github\/runner_temp\/git\-credentials\-77b007ed\-14e7\-49ee\-bc1d\-23b19bf64cad\.config
+2026-10-15T10:21:56.2036026Z [command]/usr/bin/git submodule foreach --recursive git config --local --show-origin --name-only --get-regexp remote.origin.url
+2026-10-15T10:21:56.2229292Z Removing credentials config '/home/runner/work/_temp/git-credentials-77b007ed-14e7-49ee-bc1d-23b19bf64cad.config'
+2026-10-15T10:21:56.2378685Z Cleaning up orphan processes
