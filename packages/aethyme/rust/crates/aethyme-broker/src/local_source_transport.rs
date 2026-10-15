@@ -67,6 +67,8 @@ pub enum TransportError {
     Sqlite(#[from] rusqlite::Error),
     #[error(transparent)]
     Json(#[from] serde_json::Error),
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
 }
 
 /// Constructed by the native operator, not decoded from incoming records.

@@ -45,6 +45,8 @@ pub enum AcceptanceError {
     #[error(transparent)]
     Transport(#[from] transport::TransportError),
     #[error(transparent)]
+    Wave(#[from] crate::local_wave::WaveError),
+    #[error(transparent)]
     Target(#[from] target::TargetError),
     #[error(transparent)]
     Archive(#[from] archive::ArchiveError),
