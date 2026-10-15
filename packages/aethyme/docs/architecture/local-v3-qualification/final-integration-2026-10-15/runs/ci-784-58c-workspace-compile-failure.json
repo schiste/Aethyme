@@ -16,7 +16,7 @@
   "tests_failed": null,
   "tests_skipped": null,
   "failed_tests": [],
-  "failure": "Rust compilation failed: duplicated BudgetError::Sensitive after stacking; test OperationId has no Display. Cascading derive diagnostics are retained.",
+  "failure": "Rust compilation failed: duplicated BudgetError::Sensitive after stacking, plus cascading derive diagnostics. This workspace log contains no OperationId diagnostic; that separate diagnostic is retained in the lint job.",
   "credited_as_passing_command": false,
   "log_sha256": "b85a8e06a907effabd77826adfe67bb74faf33abd3449b4c53192defc88967f4",
   "scope": "Actual GitHub merge-ref source, separate from PR head. Compile failures supply no executed-test credit. Full original job log preserved without normalization."

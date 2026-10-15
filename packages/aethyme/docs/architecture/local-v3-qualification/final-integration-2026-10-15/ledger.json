@@ -1121,8 +1121,8 @@
     {
       "path": "runs/ci-784-58c-workspace-compile-failure.json",
       "source_path": "source-bound CI metadata derived from complete original job log and GitHub git-commit response",
-      "bytes": 1132,
-      "sha256": "8619e247bfb0bbe37bbed94373ce6fe9bd3de07ffb7c1295665155c8b8f131d8"
+      "bytes": 1200,
+      "sha256": "3caffb2e10ab245cb05d28fe7fe3df8625db4f2af666828f9c7f38dfb6beca9e"
     },
     {
       "path": "runs/ci-784-58c-workspace-compile-failure.log",
@@ -1155,7 +1155,7 @@
       "sha256": "7d3cef5d8dd497d98aab4adb83b65f6580222beffb296dc265415b914121d1fa"
     }
   ],
-  "updated_at_utc": "2026-10-15T18:58:35.171752+00:00",
+  "updated_at_utc": "2026-10-15T19:08:22.989813+00:00",
   "preflight_failures": [
     {
       "metadata": "runs/aggregate-offline-fx17-recorder-preflight-failure.json",
