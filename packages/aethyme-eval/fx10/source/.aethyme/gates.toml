@@ -1,6 +1,6 @@
 [[gate]]
 name = "fx10-source-integrity"
-command = "test -f app.sh && git diff --check HEAD^ HEAD"
+command = "sh .aethyme/fx10-gate-child.sh"
 timeout_seconds = 20
 cache = false
 resource_ttl_seconds = 60
