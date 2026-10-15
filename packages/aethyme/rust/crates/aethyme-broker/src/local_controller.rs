@@ -131,6 +131,26 @@ fn control_check(
     Ok(())
 }
 
+fn completion_prior_members(
+    store: &CollaborationStore,
+    active: &wave::Wave,
+    current_epoch: &str,
+) -> Result<Vec<String>, ControllerError> {
+    let Some(key) = active.spec.prior_completion.as_ref() else {
+        return Ok(Vec::new());
+    };
+    let key = RecordId::parse(key).map_err(|_| ControllerError::Mismatch)?;
+    let (completion, prior) = wave::accepted_completion(store, &key, active.spec.sequence)?;
+    if completion.target != active.spec.target || completion.epoch != current_epoch {
+        return Err(ControllerError::Mismatch);
+    }
+    Ok(if completion.revision == active.spec.revision {
+        prior.selected
+    } else {
+        Vec::new()
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn complete_inner(
     store: &mut CollaborationStore,
@@ -195,21 +215,7 @@ fn complete_inner(
     };
     let record = spec.record()?;
     let object = archive::put_object(store, &record.canonical_bytes())?;
-    let prior_members = active
-        .spec
-        .prior_completion
-        .as_ref()
-        .map(|key| {
-            RecordId::parse(key)
-                .map_err(|_| ControllerError::Mismatch)
-                .and_then(|key| {
-                    wave::previous(store, &key, active.spec.sequence)
-                        .map(|(_, w)| w.selected)
-                        .map_err(Into::into)
-                })
-        })
-        .transpose()?
-        .unwrap_or_default();
+    let prior_members = completion_prior_members(store, &active, owner.authority_epoch().as_str())?;
     let tx = store
         .connection()
         .transaction_with_behavior(TransactionBehavior::Immediate)?;

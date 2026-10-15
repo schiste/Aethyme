@@ -252,7 +252,7 @@ fn current(
     }
     Ok(())
 }
-fn validate_source(
+pub(crate) fn validate_source(
     store: &CollaborationStore,
     repo: &Path,
     spec: &Spec,
@@ -287,9 +287,16 @@ fn validate_source(
     let w = wave::load(store, &id(&spec.wave)?)?;
     match &w.spec.prior_completion {
         Some(key) => {
-            let (_, prior) = wave::previous(store, &id(key)?, w.spec.sequence)?;
+            let (completion, prior) = wave::accepted_completion(store, &id(key)?, w.spec.sequence)?;
+            let members = if completion.revision == w.spec.revision {
+                prior.selected
+            } else {
+                Vec::new()
+            };
             if body["accepted_baseline"]["completion"] != *key
-                || body["accepted_baseline"]["members"] != serde_json::to_value(prior.selected)?
+                || body["accepted_baseline"]["members"] != serde_json::to_value(members)?
+                || completion.epoch != spec.epoch
+                || completion.accepted_commit != spec.base_commit
                 || body["profile"] != "aethyme.compose.git-merge-file/accepted-baseline-v0"
             {
                 return Err(NativeGateError::Binding(
