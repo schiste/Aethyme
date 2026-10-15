@@ -44,13 +44,16 @@ The final-proposal evaluator loads the externally supplied frozen oracle in the
 parent process. Its child receives only the candidate script and each exact
 literal argv vector. Before the controls harness runs, an independent reviewer
 must acknowledge the exact runner, control-harness, and subject-profile hashes.
-The deny-default subject profile permits read access to the exact `/bin/sh`
-executable, the root directory entry, `/System/Library`, `/usr/lib`,
-`/usr/share/locale`, the exact
-`/System/Volumes/Preboot/Cryptexes/OS/System/Library/dyld` cache directory,
-and the candidate app file for the current probe. It continues to deny
-process-fork, network, and file writes. No general `/System/Volumes` read
-allowance is present.
+The deny-default subject profile permits process execution and file reads only
+for the exact `/bin/sh` and `/bin/bash` shell bootstrap executables. It permits
+metadata access only for the exact `/private/var/select/sh` selector, which
+resolves `/bin/sh` to `/bin/bash` on this host. Other read allowances are the
+root directory entry, `/System/Library`, `/usr/lib`, `/usr/share/locale`, the
+exact `/System/Volumes/Preboot/Cryptexes/OS/System/Library/dyld` cache
+directory, and the candidate app file for the current probe. The profile
+continues to deny process-fork, network, and file writes. It allows no general
+executable directory, no general `/private/var` read, and no general
+`/System/Volumes` read.
 The final-proposal evaluator then requires a matching passing controls report.
 Control evidence records the canaries, exact per-probe profile, argv, exit
 status, bounded stdout/stderr bytes and hashes, and observed

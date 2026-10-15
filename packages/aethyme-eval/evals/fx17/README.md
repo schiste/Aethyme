@@ -80,10 +80,14 @@ repository and in a new, empty directory.
 
 The candidate profile keeps deny-default, process-fork, network, and
 file-write denials. Its system bootstrap reads are limited to the root
-directory entry, the exact `/bin/sh` executable, the system library and
-`/usr/lib` trees, locale data, and the exact macOS dyld cache directory at
-`/System/Volumes/Preboot/Cryptexes/OS/System/Library/dyld`. The candidate app
-file is separately allowlisted per probe. It does not allow general reads
+directory entry, the exact `/bin/sh` and `/bin/bash` executables, metadata for
+the exact `/private/var/select/sh` selector, the system library and `/usr/lib`
+trees, locale data, and the exact macOS dyld cache directory at
+`/System/Volumes/Preboot/Cryptexes/OS/System/Library/dyld`. On this host, the
+system selector resolves `/bin/sh` to `/bin/bash`; both exact executables are
+therefore permitted as the shell bootstrap chain. The candidate app file is
+separately allowlisted per probe. The profile does not allow general
+executable directories, general reads under `/private/var`, or general reads
 under `/System/Volumes` or other Preboot paths.
 
 The trial approval must name an existing absolute `consumption_registry_path`
