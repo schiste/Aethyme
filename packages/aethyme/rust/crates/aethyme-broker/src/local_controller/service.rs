@@ -31,6 +31,11 @@ pub(crate) fn validate_status_binding(
 ) -> Result<(), ControllerError> {
     let record = Record::decode(body, &[&SERVICE_SCHEMA])
         .map_err(|error| ControllerError::Canonical(error.to_string()))?;
+    if record.canonical_bytes() != body {
+        return Err(ControllerError::Canonical(
+            "stored service appointment body is not canonical".into(),
+        ));
+    }
     let value: serde_json::Value = serde_json::from_slice(body)?;
     let spec = value
         .get("spec")

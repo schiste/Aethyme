@@ -1529,6 +1529,69 @@ mod tests {
     use crate::local_target::tests::Fixture;
     use aethyme_contracts::experimental_v0::Record;
 
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct ServiceStatusSnapshot {
+        id: String,
+        target: String,
+        revision: String,
+        epoch: String,
+        nonce: String,
+        state: String,
+        body: Vec<u8>,
+        report: Option<Vec<u8>>,
+    }
+
+    fn service_status_snapshot(store: &CollaborationStore) -> Vec<ServiceStatusSnapshot> {
+        let mut statement = store
+            .read_connection()
+            .prepare(
+                "SELECT id,target,revision,epoch,nonce,state,body,report FROM local_controller_services ORDER BY id",
+            )
+            .unwrap();
+        statement
+            .query_map([], |row| {
+                Ok(ServiceStatusSnapshot {
+                    id: row.get(0)?,
+                    target: row.get(1)?,
+                    revision: row.get(2)?,
+                    epoch: row.get(3)?,
+                    nonce: row.get(4)?,
+                    state: row.get(5)?,
+                    body: row.get(6)?,
+                    report: row.get(7)?,
+                })
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    }
+
+    fn service_status_record(
+        target_name: &str,
+        revision: &str,
+        epoch: &str,
+        nonce: &str,
+        marker: Option<&str>,
+    ) -> Record {
+        let mut value = json!({
+            "schema": crate::local_controller::service::SERVICE_SCHEMA.name,
+            "spec": {
+                "target": target_name,
+                "revision": revision,
+                "epoch": epoch,
+                "policy": {"nonce": nonce},
+            }
+        });
+        if let Some(marker) = marker {
+            value["spec"]["status_test_marker"] = json!(marker);
+        }
+        Record::decode(
+            &serde_json::to_vec(&value).unwrap(),
+            &[&crate::local_controller::service::SERVICE_SCHEMA],
+        )
+        .unwrap()
+    }
+
     fn insert_service_status_row(
         store: &mut CollaborationStore,
         target_name: &str,
@@ -1537,20 +1600,7 @@ mod tests {
         nonce: &str,
         state: &str,
     ) -> String {
-        let record = Record::decode(
-            &serde_json::to_vec(&json!({
-                "schema": crate::local_controller::service::SERVICE_SCHEMA.name,
-                "spec": {
-                    "target": target_name,
-                    "revision": revision,
-                    "epoch": epoch,
-                    "policy": {"nonce": nonce},
-                }
-            }))
-            .unwrap(),
-            &[&crate::local_controller::service::SERVICE_SCHEMA],
-        )
-        .unwrap();
+        let record = service_status_record(target_name, revision, epoch, nonce, None);
         let id = record.id().to_string();
         let report = match state {
             "dispatching" => None,
@@ -1629,6 +1679,7 @@ mod tests {
             "dispatching",
         );
 
+        let before_lookup = service_status_snapshot(&fixture.store);
         let unknown = service_status_for_store(
             &fixture.store,
             "T",
@@ -1645,6 +1696,7 @@ mod tests {
         assert_eq!(unknown["report"], serde_json::Value::Null);
         assert_eq!(unknown["reconciliation_required"], true);
         assert_eq!(unknown["automatic_replay"], false);
+        assert_eq!(service_status_snapshot(&fixture.store), before_lookup);
 
         let by_id = service_status_for_store(
             &fixture.store,
@@ -1845,6 +1897,334 @@ mod tests {
         assert_eq!(historical["state"], "completed");
         assert_eq!(historical["report"]["outcome"], "completion_allowance");
         assert_eq!(historical["automatic_replay"], false);
+    }
+
+    #[test]
+    fn service_status_rejects_corrupt_body_index_bindings_without_writes() {
+        let mut fixture = Fixture::new();
+        let (first_revision, first_epoch) = select_initial_target(&mut fixture);
+        let owner = target::acquire_controller(&mut fixture.store, "T", "operator").unwrap();
+        let mut next_spec = fixture.spec();
+        next_spec.objective = "second revision for status corruption control".into();
+        let next_revision =
+            target::propose_revision(&mut fixture.store, &owner, next_spec).unwrap();
+        target::select_revision(&mut fixture.store, &owner, &next_revision.id).unwrap();
+        drop(owner);
+        let other_owner =
+            target::acquire_controller(&mut fixture.store, "other-target", "operator").unwrap();
+        drop(other_owner);
+
+        let nonce = "corrupt-binding-status-v1";
+        let appointment = insert_service_status_row(
+            &mut fixture.store,
+            "T",
+            &first_revision,
+            first_epoch.as_str(),
+            nonce,
+            "dispatching",
+        );
+        let alternate_id = service_status_record(
+            "T",
+            &first_revision,
+            first_epoch.as_str(),
+            nonce,
+            Some("different canonical body"),
+        )
+        .id()
+        .to_string();
+
+        let canonical_body = service_status_snapshot(&fixture.store)[0].body.clone();
+        let corruptions = [
+            (
+                "target",
+                "UPDATE local_controller_services SET target='other-target' WHERE id=?1",
+            ),
+            (
+                "noncanonical_body",
+                "UPDATE local_controller_services SET body=?2 WHERE id=?1",
+            ),
+            (
+                "revision",
+                "UPDATE local_controller_services SET revision=?2 WHERE id=?1",
+            ),
+            (
+                "epoch",
+                "UPDATE local_controller_services SET epoch=?2 WHERE id=?1",
+            ),
+            (
+                "nonce",
+                "UPDATE local_controller_services SET nonce=?2 WHERE id=?1",
+            ),
+            (
+                "id",
+                "UPDATE local_controller_services SET id=?2 WHERE id=?1",
+            ),
+        ];
+        for (field, update) in corruptions {
+            match field {
+                "target" => {
+                    fixture
+                        .store
+                        .connection()
+                        .execute(update, [appointment.as_str()])
+                        .unwrap();
+                }
+                "noncanonical_body" => {
+                    let parsed: serde_json::Value =
+                        serde_json::from_slice(&canonical_body).unwrap();
+                    let noncanonical_body = serde_json::to_vec_pretty(&parsed).unwrap();
+                    let decoded = Record::decode(
+                        &noncanonical_body,
+                        &[&crate::local_controller::service::SERVICE_SCHEMA],
+                    )
+                    .unwrap();
+                    assert_eq!(decoded.id().as_str(), appointment);
+                    assert_ne!(decoded.canonical_bytes(), noncanonical_body);
+                    fixture
+                        .store
+                        .connection()
+                        .execute(update, (appointment.as_str(), noncanonical_body))
+                        .unwrap();
+                }
+                "revision" => {
+                    fixture
+                        .store
+                        .connection()
+                        .execute(update, (appointment.as_str(), next_revision.id.as_str()))
+                        .unwrap();
+                }
+                "epoch" => {
+                    fixture
+                        .store
+                        .connection()
+                        .execute(
+                            update,
+                            (appointment.as_str(), format!("sha256:{}", "8".repeat(64))),
+                        )
+                        .unwrap();
+                }
+                "nonce" => {
+                    fixture
+                        .store
+                        .connection()
+                        .execute(update, (appointment.as_str(), "different-status-nonce"))
+                        .unwrap();
+                }
+                "id" => {
+                    fixture
+                        .store
+                        .connection()
+                        .execute(update, (appointment.as_str(), alternate_id.as_str()))
+                        .unwrap();
+                }
+                _ => unreachable!(),
+            }
+
+            let before = service_status_snapshot(&fixture.store);
+            assert_eq!(before.len(), 1, "corrupted {field} row count");
+            assert_eq!(before[0].state, "dispatching", "corrupted {field} state");
+            assert_eq!(before[0].report, None, "corrupted {field} report");
+            let lookup_id = if field == "id" {
+                alternate_id.as_str()
+            } else {
+                appointment.as_str()
+            };
+            let error = service_status_for_store(
+                &fixture.store,
+                if field == "target" {
+                    "other-target"
+                } else {
+                    "T"
+                },
+                "operator",
+                Some(&RecordId::parse(lookup_id).unwrap()),
+                None,
+            )
+            .unwrap_err();
+            assert_eq!(
+                error.code, "appointment_corrupt",
+                "corrupted {field} binding"
+            );
+            assert_eq!(
+                service_status_snapshot(&fixture.store),
+                before,
+                "read-only status changed the {field} row"
+            );
+
+            match field {
+                "target" => {
+                    fixture
+                        .store
+                        .connection()
+                        .execute(
+                            "UPDATE local_controller_services SET target='T' WHERE id=?1",
+                            [appointment.as_str()],
+                        )
+                        .unwrap();
+                }
+                "noncanonical_body" => {
+                    fixture
+                        .store
+                        .connection()
+                        .execute(
+                            "UPDATE local_controller_services SET body=?2 WHERE id=?1",
+                            (appointment.as_str(), canonical_body.as_slice()),
+                        )
+                        .unwrap();
+                }
+                "revision" => {
+                    fixture
+                        .store
+                        .connection()
+                        .execute(
+                            "UPDATE local_controller_services SET revision=?2 WHERE id=?1",
+                            (appointment.as_str(), first_revision.as_str()),
+                        )
+                        .unwrap();
+                }
+                "epoch" => {
+                    fixture
+                        .store
+                        .connection()
+                        .execute(
+                            "UPDATE local_controller_services SET epoch=?2 WHERE id=?1",
+                            (appointment.as_str(), first_epoch.as_str()),
+                        )
+                        .unwrap();
+                }
+                "nonce" => {
+                    fixture
+                        .store
+                        .connection()
+                        .execute(
+                            "UPDATE local_controller_services SET nonce=?2 WHERE id=?1",
+                            (appointment.as_str(), nonce),
+                        )
+                        .unwrap();
+                }
+                "id" => {
+                    fixture
+                        .store
+                        .connection()
+                        .execute(
+                            "UPDATE local_controller_services SET id=?2 WHERE id=?1",
+                            (alternate_id.as_str(), appointment.as_str()),
+                        )
+                        .unwrap();
+                }
+                _ => unreachable!(),
+            }
+        }
+
+        let completed_nonce = "corrupt-report-status-v1";
+        let completed_appointment = insert_service_status_row(
+            &mut fixture.store,
+            "T",
+            &first_revision,
+            first_epoch.as_str(),
+            completed_nonce,
+            "completed",
+        );
+        let original_report = service_status_snapshot(&fixture.store)
+            .into_iter()
+            .find(|row| row.id == completed_appointment)
+            .unwrap()
+            .report
+            .unwrap();
+        let report_corruptions = [
+            "invalid_json",
+            "wrong_appointment",
+            "wrong_target",
+            "wrong_revision",
+            "wrong_epoch",
+            "wrong_state",
+        ];
+        for corruption in report_corruptions {
+            match corruption {
+                "invalid_json" => {
+                    fixture
+                        .store
+                        .connection()
+                        .execute(
+                            "UPDATE local_controller_services SET report=?2 WHERE id=?1",
+                            (completed_appointment.as_str(), b"{".as_slice()),
+                        )
+                        .unwrap();
+                }
+                "wrong_state" => {
+                    fixture
+                        .store
+                        .connection()
+                        .execute(
+                            "UPDATE local_controller_services SET state='dispatching' WHERE id=?1",
+                            [completed_appointment.as_str()],
+                        )
+                        .unwrap();
+                }
+                _ => {
+                    let mut report: serde_json::Value =
+                        serde_json::from_slice(&original_report).unwrap();
+                    match corruption {
+                        "wrong_appointment" => {
+                            report["appointment"] = json!(format!("sha256:{}", "9".repeat(64)));
+                        }
+                        "wrong_target" => report["target"] = json!("other-target"),
+                        "wrong_revision" => report["revision"] = json!(next_revision.id.as_str()),
+                        "wrong_epoch" => {
+                            report["epoch"] = json!(format!("sha256:{}", "7".repeat(64)));
+                        }
+                        _ => unreachable!(),
+                    }
+                    fixture
+                        .store
+                        .connection()
+                        .execute(
+                            "UPDATE local_controller_services SET report=?2 WHERE id=?1",
+                            (
+                                completed_appointment.as_str(),
+                                serde_json::to_vec(&report).unwrap(),
+                            ),
+                        )
+                        .unwrap();
+                }
+            }
+            let before = service_status_snapshot(&fixture.store);
+            let error = service_status_for_store(
+                &fixture.store,
+                "T",
+                "operator",
+                None,
+                Some(completed_nonce),
+            )
+            .unwrap_err();
+            assert_eq!(
+                error.code, "appointment_corrupt",
+                "corrupted report {corruption}"
+            );
+            assert_eq!(service_status_snapshot(&fixture.store), before);
+            match corruption {
+                "wrong_state" => {
+                    fixture
+                        .store
+                        .connection()
+                        .execute(
+                            "UPDATE local_controller_services SET state='completed' WHERE id=?1",
+                            [completed_appointment.as_str()],
+                        )
+                        .unwrap();
+                }
+                _ => {
+                    fixture
+                        .store
+                        .connection()
+                        .execute(
+                            "UPDATE local_controller_services SET report=?2 WHERE id=?1",
+                            (completed_appointment.as_str(), original_report.as_slice()),
+                        )
+                        .unwrap();
+                }
+            }
+        }
     }
     #[test]
     fn verifier_prepare_refuses_oversized_literal_inventory_before_opening_state() {
