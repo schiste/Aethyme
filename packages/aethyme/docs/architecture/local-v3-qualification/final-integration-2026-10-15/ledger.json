@@ -1247,9 +1247,34 @@
       "path": "runs/ci-785-8387-lint.json",
       "bytes": 969,
       "sha256": "4ed429e52e99ff2d35c7a55993d894049fb496dcbafd1f2a62d7bc0b04d12c91"
+    },
+    {
+      "path": "ci/ci-785-8387-workspace-cancelled.raw.log",
+      "bytes": 565044,
+      "sha256": "1a164d791b6670ee2996f031a140388dcfaf56726c3bf3c941943c2bee55c4f7"
+    },
+    {
+      "path": "runs/ci-785-8387-workspace-cancelled.json",
+      "bytes": 1264,
+      "sha256": "b52b9ef081db59cc438afe657ceec1e47493f7a0e426e7c343896b1ceebc60cf"
+    },
+    {
+      "path": "ci/785-942-checkout.json",
+      "bytes": 2616,
+      "sha256": "d95d8fee6bb260fc2b15d8a4febb60ed3dda9105232ddf863f0629f1933ab73f"
+    },
+    {
+      "path": "ci/ci-785-942-lint.raw.log",
+      "bytes": 81338,
+      "sha256": "613a05eb543e6827f114cab61d76cf99b7e33ee5c4d5158174635da93651a94c"
+    },
+    {
+      "path": "runs/ci-785-942-lint.json",
+      "bytes": 988,
+      "sha256": "9f452fa4549ac1db8b3d9fbc625bebf2e658ef34a6fc1339ab7b0a6996c7c40c"
     }
   ],
-  "updated_at_utc": "2026-10-15T20:46:30.870208+00:00",
+  "updated_at_utc": "2026-10-15T21:20:32.349256+00:00",
   "preflight_failures": [
     {
       "metadata": "runs/aggregate-offline-fx17-recorder-preflight-failure.json",
@@ -1319,6 +1344,20 @@
     {
       "id": "ci-785-8387-lint",
       "metadata": "runs/ci-785-8387-lint.json",
+      "exit_code": 101,
+      "conclusion": "FAILURE",
+      "passing_command": false
+    },
+    {
+      "id": "ci-785-8387-workspace-cancelled",
+      "metadata": "runs/ci-785-8387-workspace-cancelled.json",
+      "exit_code": null,
+      "conclusion": "CANCELLED",
+      "passing_command": false
+    },
+    {
+      "id": "ci-785-942-lint",
+      "metadata": "runs/ci-785-942-lint.json",
       "exit_code": 101,
       "conclusion": "FAILURE",
       "passing_command": false

@@ -69,7 +69,11 @@ before completion; its raw log retains fifteen distinct first-attempt failures
 reporting `UnknownWork` from fixtures that had left their wave verifying. No
 completed-suite denominator or passing-command credit is assigned. At later head
 `8387fd9f`, strict lint failed with exit 101 for one needless borrow in a new test
-helper. These complete logs and exact checkout metadata remain preserved.
+helper. Its workspace command was cancelled with eight distinct first-attempt
+failures: six view-residual assertions, terminal view cleanup and the synthetic
+composite. No completed-suite denominator is assigned. At head `94282330`,
+strict lint failed for a needless borrow in a generation-directory test
+(exit 101). These complete logs and exact checkout metadata remain preserved.
 
 ## Initial full workspace run and native fixture repair
 
