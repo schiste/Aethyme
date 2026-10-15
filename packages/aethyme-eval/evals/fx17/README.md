@@ -56,10 +56,18 @@ bind the current runner, control harness, and subject-profile hashes. The
 `controls` command requires those exact reviewed hashes, the reviewer identity,
 and explicit acknowledgement. It runs actual macOS probes for literal argv,
 read/write/self-write canaries, a local network listener and positive control,
-fork and foreign-executable denial, stream bounds, and recursive-shell timeout.
-It records exact per-probe profile text and hashes, argv, exit status, bounded
-stdout/stderr bytes and hashes, canary state, and process outcomes in a private
-report. Keep that report outside the repository.
+fork and foreign-executable denial, and recursive-shell timeout. Separate
+unpaid host-side stress probes drive synthetic stdout, stderr, and watched
+response-file overflow through the trusted bounded-capture loop. Owned Python
+leader/child process groups exercise both timeout and overflow termination;
+the harness records PID/nonce identities before termination and waits a bounded
+period to confirm both identities are gone. These synthetic processes run
+outside the candidate sandbox and do not call a model or access the network.
+The controls report records exact per-probe profile text and hashes, argv, exit
+status, retained stdout/stderr bytes and hashes, canary state, capture limits,
+watched-file threshold observations, and process outcomes. Keep that report
+outside the repository. If findings fail, the command still persists the full
+report and returns a nonzero exit status.
 
 The controls report is derived from the actual probe runs: it includes bounded
 captured stream bytes and hashes, exact exit and process-reap observations,
@@ -69,6 +77,15 @@ and subject-profile hashes. After this report exists and a separate trial
 approval matches all frozen and runtime hashes, the once-only runner can be
 invoked with explicit hash acknowledgements. Trial output must be outside the
 repository and in a new, empty directory.
+
+The trial approval must name an existing absolute `consumption_registry_path`
+outside the repository. The runner creates an exclusive marker in that fixed
+directory keyed by the frozen campaign schedule and payload hashes before the
+trial starts. Copying the approval file does not reset that marker, and a failed
+attempt leaves the marker consumed. This is a cooperative local-host control:
+an operator who can change the approval, registry directory, or its contents
+can bypass it; it is not a PKI-backed attestation system. Keep the registry on
+durable storage and do not remove campaign markers.
 
 ```sh
 python3 packages/aethyme-eval/evals/fx17/run_fx17.py run \

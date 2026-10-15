@@ -347,7 +347,7 @@ def require_controls(path):
         raise Fx17Error("Isolation-control evidence is not valid UTF-8 JSON") from exc
     if not isinstance(controls, dict):
         raise Fx17Error("Isolation-control evidence must be a JSON object")
-    if (controls.get("schema") != "aethyme.fx17.independent-isolation-controls/v2"
+    if (controls.get("schema") != "aethyme.fx17.independent-isolation-controls/v3"
             or controls.get("status") != "pass"
             or controls.get("platform") != "darwin"):
         raise Fx17Error("Independent effects/isolation controls have not passed")
@@ -424,6 +424,70 @@ def verify_frozen(freeze_root):
     return payloads, freeze, schedule, schedule_hash, payload_hash
 
 
+def validate_consumption_registry(value):
+    if not isinstance(value, str) or not value:
+        raise Fx17Error("Trial approval must name a durable consumption registry directory")
+    registry = Path(value)
+    if not registry.is_absolute() or str(registry) != os.path.normpath(str(registry)):
+        raise Fx17Error("The consumption registry path must be an absolute canonical path")
+    try:
+        info = registry.lstat()
+    except OSError as exc:
+        raise Fx17Error("The approved consumption registry directory is unavailable") from exc
+    if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
+        raise Fx17Error("The approved consumption registry must be a real directory")
+    resolved = registry.resolve(strict=True)
+    if resolved != registry:
+        raise Fx17Error("The approved consumption registry path must not traverse symlinks")
+    repo_root = HERE.parents[3].resolve(strict=True)
+    if under(repo_root, registry):
+        raise Fx17Error("Keep the trial consumption registry outside the repository")
+    return registry
+
+
+def campaign_consumption_key(schedule_hash, payload_hash):
+    return digest(jbytes({
+        "schema": "aethyme.fx17.campaign-consumption-key/v1",
+        "combined_schedule_sha256": schedule_hash,
+        "payloads_sha256": payload_hash,
+    }))
+
+
+def claim_campaign_consumption(registry_path, schedule_hash, payload_hash,
+                               approval_bytes):
+    registry = validate_consumption_registry(registry_path)
+    key = campaign_consumption_key(schedule_hash, payload_hash)
+    marker = registry / ("fx17-" + key + ".consumed.json")
+    record = {
+        "schema": "aethyme.fx17.consumed-campaign/v1",
+        "campaign_consumption_key_sha256": key,
+        "combined_schedule_sha256": schedule_hash,
+        "payloads_sha256": payload_hash,
+        "approval_sha256": digest(approval_bytes),
+        "consumed_at": now(),
+        "state": "started",
+    }
+    raw = jbytes(record)
+    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(marker, flags, 0o600)
+    except FileExistsError as exc:
+        raise Fx17Error("This FX17 campaign was already consumed in the approved registry") from exc
+    with os.fdopen(fd, "wb") as stream:
+        stream.write(raw)
+        stream.flush()
+        os.fsync(stream.fileno())
+    directory_fd = os.open(registry, os.O_RDONLY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+    return {"campaign_consumption_key_sha256": key,
+            "marker_sha256": digest(raw), "approval_sha256": digest(approval_bytes)}
+
+
 def gate(freeze_root, approval_path, controls_path, ack_schedule, ack_payloads):
     payloads, freeze, schedule, schedule_hash, payload_hash = verify_frozen(freeze_root)
     if (ack_schedule, ack_payloads) != (schedule_hash, payload_hash):
@@ -431,7 +495,11 @@ def gate(freeze_root, approval_path, controls_path, ack_schedule, ack_payloads):
     approval_path = Path(approval_path)
     if approval_path.is_symlink() or not approval_path.is_file():
         raise Fx17Error("Trial approval must be a regular file, not a symlink")
-    approval = json.loads(approval_path.read_text(encoding="utf-8"))
+    with approval_path.open("rb") as stream:
+        approval_raw = stream.read(64 * 1024 + 1)
+    if len(approval_raw) > 64 * 1024:
+        raise Fx17Error("Trial approval exceeds the 64 KiB read bound")
+    approval = json.loads(approval_raw)
     runtime_correction = HERE / "runtime-contract-correction.md"
     if (not runtime_correction.is_file()
             or runtime_correction.is_symlink()
@@ -453,8 +521,9 @@ def gate(freeze_root, approval_path, controls_path, ack_schedule, ack_payloads):
     }
     if any(approval.get(k) != v for k, v in required.items()) or not approval.get("approved_by"):
         raise Fx17Error("Explicit trial approval does not match the frozen six-row profile")
+    registry = validate_consumption_registry(approval.get("consumption_registry_path"))
     controls = require_controls(controls_path)
-    return payloads, freeze, approval, controls, schedule_hash, payload_hash
+    return payloads, freeze, approval, controls, schedule_hash, payload_hash, approval_raw, registry
 
 
 def now():
@@ -833,7 +902,7 @@ def run_row(payload, output):
 
 
 def run(freeze_root, approval_path, controls_path, output, ack_schedule, ack_payloads):
-    payloads, freeze, approval, controls, schedule_hash, payload_hash = gate(
+    payloads, freeze, approval, controls, schedule_hash, payload_hash, approval_raw, registry = gate(
         freeze_root, approval_path, controls_path, ack_schedule, ack_payloads)
     if sys.platform != "darwin":
         raise Fx17Error("macOS subject isolation is required; no model calls started")
@@ -841,10 +910,8 @@ def run(freeze_root, approval_path, controls_path, output, ack_schedule, ack_pay
     output = external_output(output, "private trial results")
     if output.exists():
         raise Fx17Error("Refusing to reuse a trial output directory")
-    consumed = approval_path.with_name(approval_path.name + ".fx17-consumed")
-    fd = os.open(consumed, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-    with os.fdopen(fd, "w") as file:
-        file.write(schedule_hash + "\n" + payload_hash + "\n")
+    consumption = claim_campaign_consumption(
+        registry, schedule_hash, payload_hash, approval_raw)
     output.mkdir(mode=0o700, parents=True)
     state = {"schema": "aethyme.fx17.results/v1", "assigned_denominator": 6,
              "original_core_denominator": 4, "supplemental_misleading_denominator": 2,
@@ -852,6 +919,9 @@ def run(freeze_root, approval_path, controls_path, output, ack_schedule, ack_pay
              "runtime_profile": runtime_profile(),
              "runtime_profile_sha256": runtime_profile_hash(),
              "runtime_contract_correction_sha256": RUNTIME_CORRECTION_SHA256,
+             "approval_sha256": consumption["approval_sha256"],
+             "campaign_consumption_key_sha256": consumption["campaign_consumption_key_sha256"],
+             "consumption_marker_sha256": consumption["marker_sha256"],
              "controls_reviewer": controls["independent_review"]["reviewer"],
              "controls_runner_sha256": controls["runner_sha256"],
              "controls_harness_sha256": controls["control_harness_sha256"],
@@ -998,6 +1068,8 @@ def main():
             result = run(args.freeze_root, args.approval, args.controls, args.output_root,
                          args.ack_schedule_sha256, args.ack_payloads_sha256)
         print(json.dumps(result, sort_keys=True))
+        if args.cmd == "controls" and result.get("status") != "pass":
+            return 2
         return 0
     except (Fx17Error, OSError, ValueError, json.JSONDecodeError) as exc:
         print(json.dumps({"error": str(exc)}, sort_keys=True), file=sys.stderr)

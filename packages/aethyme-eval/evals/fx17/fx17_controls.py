@@ -2,16 +2,20 @@
 from __future__ import annotations
 
 import base64
+import contextlib
+import io
 import json
 import math
 import os
 import secrets
 import signal
 import socket
+import subprocess
 import sys
 import tempfile
 import time
 from pathlib import Path
+from unittest import mock
 
 import run_fx17 as fx17
 
@@ -30,6 +34,44 @@ CONTROL_SOURCES = {
 }
 CONTROL_PROBE_NAMES = set(CONTROL_SOURCES)
 RECURSIVE_TIMEOUT = 0.25
+CAPTURE_PROBE_NAMES = {
+    "stdout_overflow", "stderr_overflow", "response_file_overflow",
+    "process_tree_timeout", "process_tree_overflow",
+}
+CAPTURE_PROBE_LIMIT_BYTES = 64 * 1024
+CAPTURE_PROBE_TIMEOUT = 3.0
+PROCESS_TREE_TIMEOUT = 0.25
+PROCESS_IDENTITY_WAIT = 3.0
+CAPTURE_SOURCES = {
+    "stdout_overflow": "import os\nblock = b'O' * 4096\nwhile True: os.write(1, block)\n",
+    "stderr_overflow": "import os\nblock = b'E' * 4096\nwhile True: os.write(2, block)\n",
+    "response_file_overflow": (
+        "import os, sys, time\n"
+        "with open(sys.argv[1], 'wb') as response:\n"
+        "    response.write(b'R' * int(sys.argv[2]))\n"
+        "    response.flush()\n"
+        "    os.fsync(response.fileno())\n"
+        "while True: time.sleep(60)\n"),
+}
+PROCESS_TREE_CHILD_SOURCE = (
+    "import sys, time\n"
+    "if len(sys.argv[1]) != 32: raise SystemExit(2)\n"
+    "while True: time.sleep(60)\n")
+PROCESS_TREE_SOURCE = (
+    "import os, subprocess, sys, time\n"
+    "pid_path, child_nonce, mode, leader_nonce = sys.argv[1:5]\n"
+    "if len(child_nonce) != 32 or len(leader_nonce) != 32: raise SystemExit(2)\n"
+    "child = subprocess.Popen([sys.executable, '-I', '-c', "
+    + repr(PROCESS_TREE_CHILD_SOURCE) + ", child_nonce], "
+    "env={'PATH': '/usr/bin:/bin', 'LC_ALL': 'C'}, close_fds=True)\n"
+    "with open(pid_path, 'x', encoding='ascii') as marker:\n"
+    "    marker.write(f'{child.pid} {os.getpgid(child.pid)} {child_nonce}\\n')\n"
+    "    marker.flush()\n"
+    "    os.fsync(marker.fileno())\n"
+    "if mode == 'overflow':\n"
+    "    block = b'T' * 4096\n"
+    "    while True: os.write(1, block)\n"
+    "while True: time.sleep(60)\n")
 
 
 def control_harness_hash():
@@ -97,9 +139,593 @@ def _probe_record(source, argv, timeout, result):
     }
 
 
+def _capture_probe_record(source, argv, timeout, result, proc,
+                         stdout_limit=CAPTURE_PROBE_LIMIT_BYTES,
+                         stderr_limit=CAPTURE_PROBE_LIMIT_BYTES,
+                         watch_file_limit=None, watch_file_path=None,
+                         wall_seconds=None):
+    stdout = result["stdout"]
+    stderr = result["stderr"]
+    return {
+        "source": source,
+        "source_sha256": fx17.digest(source.encode("utf-8")),
+        "argv": list(argv),
+        "python_executable": sys.executable,
+        "command_sha256": fx17.digest(fx17.jbytes(
+            [sys.executable, "-I", "-c", source, *argv])),
+        "runner_sha256": fx17.runner_hash(),
+        "control_harness_sha256": control_harness_hash(),
+        "timeout_seconds": timeout,
+        "stdout_limit_bytes": stdout_limit,
+        "stderr_limit_bytes": stderr_limit,
+        "stdout_bytes_retained": len(stdout),
+        "stderr_bytes_retained": len(stderr),
+        "stdout": _artifact(stdout),
+        "stderr": _artifact(stderr),
+        "exit_code": proc.returncode,
+        "overflow_streams": result["overflow_streams"],
+        "timed_out": result["timed_out"],
+        "stream_drain_timed_out": result["stream_drain_timed_out"],
+        "process_group_killed": result["process_group_killed"],
+        "process_reaped": result["reaped"],
+        "wall_seconds": wall_seconds,
+        "watch_file_limit_bytes": watch_file_limit,
+        "watch_file_size_observed": (
+            result["watched_file_sizes"].get("response_file")
+            if watch_file_path is not None else None),
+        "watch_file_name": Path(watch_file_path).name if watch_file_path else None,
+    }
+
+
+def _capture_environment():
+    return {"PATH": "/usr/bin:/bin", "LC_ALL": "C"}
+
+
+def _process_snapshot(pid):
+    if type(pid) is not int or pid <= 0:
+        raise fx17.Fx17Error("Capture probe attempted to inspect an invalid PID")
+    try:
+        result = subprocess.run(
+            ["/bin/ps", "-p", str(pid), "-o", "pgid=,state=,command="],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            timeout=1.0, check=False, env=_capture_environment())
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise fx17.Fx17Error("Could not inspect an owned capture-probe process") from exc
+    lines = result.stdout.splitlines()
+    if not lines:
+        if result.returncode == 1 and not result.stderr:
+            return None
+        raise fx17.Fx17Error("Process inspection could not establish whether the PID is gone")
+    fields = lines[0].split(None, 2)
+    if result.returncode != 0 or len(fields) != 3:
+        raise fx17.Fx17Error("Process inspection returned an incomplete capture-probe identity")
+    try:
+        group = int(fields[0])
+    except ValueError as exc:
+        raise fx17.Fx17Error("Process inspection returned an invalid process-group ID") from exc
+    return {"pid": pid, "process_group_id": group,
+            "state": fields[1], "command": fields[2]}
+
+
+def _snapshot_matches(snapshot, pid, process_group_id, nonce):
+    return (isinstance(snapshot, dict)
+            and type(snapshot.get("pid")) is int
+            and snapshot.get("pid") == pid
+            and type(snapshot.get("process_group_id")) is int
+            and snapshot.get("process_group_id") == process_group_id
+            and isinstance(snapshot.get("command"), str)
+            and nonce in snapshot["command"])
+
+
+def _wait_identity_gone(pid, process_group_id, nonce):
+    started = time.monotonic()
+    deadline = started + PROCESS_IDENTITY_WAIT
+    last = None
+    while True:
+        last = _process_snapshot(pid)
+        if last is None or nonce not in last["command"]:
+            return True, round(time.monotonic() - started, 4), last
+        if last["process_group_id"] != process_group_id:
+            return False, round(time.monotonic() - started, 4), last
+        now = time.monotonic()
+        if now >= deadline:
+            return False, round(now - started, 4), last
+        time.sleep(min(0.025, deadline - now))
+
+
+def _wait_owned_tree_ready(proc, marker_path, leader_nonce, child_nonce):
+    deadline = time.monotonic() + PROCESS_IDENTITY_WAIT
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            raise fx17.Fx17Error("Synthetic owned process-tree leader exited before readiness")
+        if marker_path.is_file() and not marker_path.is_symlink():
+            try:
+                fields = marker_path.read_text(encoding="ascii").strip().split()
+                child_pid, recorded_group = int(fields[0]), int(fields[1])
+            except (OSError, IndexError, ValueError) as exc:
+                raise fx17.Fx17Error("Synthetic child identity record is invalid") from exc
+            if len(fields) != 3 or fields[2] != child_nonce:
+                raise fx17.Fx17Error("Synthetic child identity nonce did not match")
+            try:
+                leader_group = os.getpgid(proc.pid)
+                child_group = os.getpgid(child_pid)
+            except ProcessLookupError:
+                time.sleep(0.01)
+                continue
+            leader = _process_snapshot(proc.pid)
+            child = _process_snapshot(child_pid)
+            if (proc.pid != leader_group or recorded_group != proc.pid
+                    or child_group != proc.pid):
+                raise fx17.Fx17Error("Synthetic process tree is outside its owned process group")
+            if (_snapshot_matches(leader, proc.pid, proc.pid, leader_nonce)
+                    and _snapshot_matches(child, child_pid, proc.pid, child_nonce)):
+                return child_pid, leader, child
+        time.sleep(0.01)
+    raise fx17.Fx17Error("Synthetic owned process tree did not become observable in time")
+
+
+def _cleanup_owned_group(proc):
+    if proc.poll() is None:
+        fx17.kill_tree(proc)
+        try:
+            proc.wait(timeout=fx17.REAP_GRACE_SECONDS)
+        except subprocess.TimeoutExpired as exc:
+            raise fx17.Fx17Error("Could not clean up a synthetic owned process group") from exc
+
+
+def _owned_child_from_marker(marker_path, group_id, child_nonce):
+    if not marker_path.is_file() or marker_path.is_symlink():
+        return None
+    try:
+        fields = marker_path.read_text(encoding="ascii").strip().split()
+        if len(fields) != 3 or fields[2] != child_nonce:
+            return None
+        child_pid, recorded_group = int(fields[0]), int(fields[1])
+    except (OSError, UnicodeDecodeError, ValueError):
+        return None
+    if child_pid <= 0 or recorded_group != group_id:
+        return None
+    snapshot = _process_snapshot(child_pid)
+    if _snapshot_matches(snapshot, child_pid, group_id, child_nonce):
+        return child_pid
+    return None
+
+
+def _cleanup_owned_tree(proc, child_pid, child_nonce):
+    if proc.poll() is None:
+        fx17.kill_tree(proc)
+    elif (type(child_pid) is int
+          and _snapshot_matches(_process_snapshot(child_pid), child_pid,
+                               proc.pid, child_nonce)):
+        # The leader has exited, so kill only after the recorded child still
+        # proves membership in the process group this harness created.
+        fx17.kill_tree(proc)
+    try:
+        proc.wait(timeout=fx17.REAP_GRACE_SECONDS)
+    except subprocess.TimeoutExpired as exc:
+        raise fx17.Fx17Error("Could not reap a synthetic process-tree leader") from exc
+    if type(child_pid) is int:
+        gone, _, _ = _wait_identity_gone(child_pid, proc.pid, child_nonce)
+        if not gone:
+            raise fx17.Fx17Error("Could not clean up the synthetic owned child process")
+
+
+def _run_capture_probe(root, name):
+    source = CAPTURE_SOURCES[name]
+    stdout_limit = CAPTURE_PROBE_LIMIT_BYTES
+    stderr_limit = CAPTURE_PROBE_LIMIT_BYTES
+    watch_file = None
+    watch_paths = None
+    if name == "response_file_overflow":
+        watch_file = root / "synthetic-response.json"
+        argv = [str(watch_file), str(CAPTURE_PROBE_LIMIT_BYTES + 1)]
+        watch_paths = {"response_file": (watch_file, CAPTURE_PROBE_LIMIT_BYTES)}
+    else:
+        argv = []
+    cmd = [sys.executable, "-I", "-c", source, *argv]
+    proc = subprocess.Popen(
+        cmd, cwd=root, env=_capture_environment(), stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True,
+        close_fds=True)
+    started = time.monotonic()
+    try:
+        result = fx17.bounded_communicate(
+            proc, None, CAPTURE_PROBE_TIMEOUT, stdout_limit, stderr_limit,
+            watch_paths=watch_paths)
+    finally:
+        _cleanup_owned_group(proc)
+    return _capture_probe_record(
+        source, argv, CAPTURE_PROBE_TIMEOUT, result, proc,
+        stdout_limit, stderr_limit,
+        CAPTURE_PROBE_LIMIT_BYTES if watch_file is not None else None,
+        watch_file, round(time.monotonic() - started, 4))
+
+
+def _run_process_tree_probe(root, mode):
+    leader_nonce = secrets.token_hex(16)
+    child_nonce = secrets.token_hex(16)
+    marker_path = root / ("owned-child-" + mode + ".pid")
+    argv = [str(marker_path), child_nonce, mode, leader_nonce]
+    cmd = [sys.executable, "-I", "-c", PROCESS_TREE_SOURCE, *argv]
+    proc = subprocess.Popen(
+        cmd, cwd=root, env=_capture_environment(), stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True,
+        close_fds=True)
+    started = time.monotonic()
+    child_pid = None
+    try:
+        child_pid, leader_before, child_before = _wait_owned_tree_ready(
+            proc, marker_path, leader_nonce, child_nonce)
+        timeout = PROCESS_TREE_TIMEOUT if mode == "timeout" else CAPTURE_PROBE_TIMEOUT
+        result = fx17.bounded_communicate(
+            proc, None, timeout, CAPTURE_PROBE_LIMIT_BYTES,
+            CAPTURE_PROBE_LIMIT_BYTES)
+        leader_gone, leader_wait, leader_after = _wait_identity_gone(
+            proc.pid, proc.pid, leader_nonce)
+        child_gone, child_wait, child_after = _wait_identity_gone(
+            child_pid, proc.pid, child_nonce)
+    finally:
+        if child_pid is None:
+            child_pid = _owned_child_from_marker(marker_path, proc.pid, child_nonce)
+        _cleanup_owned_tree(proc, child_pid, child_nonce)
+    record = _capture_probe_record(
+        PROCESS_TREE_SOURCE, argv, timeout, result, proc,
+        CAPTURE_PROBE_LIMIT_BYTES, CAPTURE_PROBE_LIMIT_BYTES,
+        wall_seconds=round(time.monotonic() - started, 4))
+    record["process_tree"] = {
+        "process_group_id": proc.pid,
+        "leader_pid": proc.pid,
+        "leader_nonce": leader_nonce,
+        "leader_before": leader_before,
+        "leader_after": leader_after,
+        "leader_identity_gone": leader_gone,
+        "leader_gone_wait_seconds": leader_wait,
+        "child_pid": child_pid,
+        "child_nonce": child_nonce,
+        "child_before": child_before,
+        "child_after": child_after,
+        "child_identity_gone": child_gone,
+        "child_gone_wait_seconds": child_wait,
+    }
+    return record
+
+
+def _run_unpaid_capture_probes(root):
+    return {
+        "stdout_overflow": _run_capture_probe(root, "stdout_overflow"),
+        "stderr_overflow": _run_capture_probe(root, "stderr_overflow"),
+        "response_file_overflow": _run_capture_probe(root, "response_file_overflow"),
+        "process_tree_timeout": _run_process_tree_probe(root, "timeout"),
+        "process_tree_overflow": _run_process_tree_probe(root, "overflow"),
+    }
+
+
+def _write_control_report(output, report):
+    report["evidence_sha256"] = fx17.digest(fx17.jbytes(report))
+    raw = fx17.jbytes(report)
+    fd = os.open(output, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    with os.fdopen(fd, "wb") as stream:
+        stream.write(raw)
+        stream.flush()
+        os.fsync(stream.fileno())
+    return raw
+
+
+def _run_failed_cli_negative_control(root):
+    output = root / "synthetic-controls-cli-failure.json"
+    failure = "synthetic unpaid control failure used to check CLI exit behavior"
+    trial_calls = []
+
+    def failed_controls_runner(path, reviewer, reviewed_runner, reviewed_harness,
+                               reviewed_profile, acknowledge):
+        report = {
+            "schema": "aethyme.fx17.independent-isolation-controls/v3",
+            "status": "fail",
+            "created_at": fx17.now(),
+            "platform": "darwin",
+            "runner_sha256": fx17.runner_hash(),
+            "control_harness_sha256": control_harness_hash(),
+            "subject_profile_template_sha256": fx17.profile_hash(),
+            "independent_review": {
+                "reviewer": reviewer,
+                "reviewed_at": fx17.now(),
+                "review_acknowledged": acknowledge,
+                "runner_sha256": reviewed_runner,
+                "control_harness_sha256": reviewed_harness,
+                "subject_profile_template_sha256": reviewed_profile,
+            },
+            "canaries": {}, "probes": {}, "capture_probes": {},
+            "approval_consumption_negative_control": {},
+            "cli_failure_negative_control": {},
+            "failures": [failure],
+        }
+        raw = _write_control_report(path, report)
+        persisted_report = json.loads(raw)
+        return {"output": str(path), "status": "fail", "failures": [failure],
+                "evidence_sha256": persisted_report["evidence_sha256"]}
+
+    def unexpected_trial(*args, **kwargs):
+        trial_calls.append(True)
+        raise fx17.Fx17Error("The failed-controls negative control reached the trial runner")
+
+    argv = [
+        "run_fx17.py", "controls", "--output", str(output),
+        "--reviewer", "synthetic-negative-control",
+        "--reviewed-runner-sha256", fx17.runner_hash(),
+        "--reviewed-control-harness-sha256", control_harness_hash(),
+        "--reviewed-profile-sha256", fx17.profile_hash(),
+        "--acknowledge-local-control-execution",
+    ]
+    stdout, stderr = io.StringIO(), io.StringIO()
+    module = sys.modules[__name__]
+    try:
+        with (mock.patch.object(module, "run_controls", failed_controls_runner),
+              mock.patch.object(fx17, "run", unexpected_trial),
+              mock.patch.object(sys, "argv", argv),
+              contextlib.redirect_stdout(stdout),
+              contextlib.redirect_stderr(stderr)):
+            raise SystemExit(fx17.main())
+    except SystemExit as exc:
+        exit_code = exc.code
+    if not output.is_file() or output.is_symlink():
+        raise fx17.Fx17Error("Failed-controls negative control did not persist its full report")
+    persisted = output.read_bytes()
+    return {
+        "exit_code": exit_code,
+        "stdout": _artifact(stdout.getvalue().encode("utf-8")),
+        "stderr": _artifact(stderr.getvalue().encode("utf-8")),
+        "persisted_report": _artifact(persisted),
+        "trial_runner_calls": len(trial_calls),
+    }
+
+
+def _run_consumption_registry_negative_control(root):
+    registry = root / "campaign-consumption-registry"
+    registry.mkdir(mode=0o700)
+    schedule_hash = "a" * 64
+    payload_hash = "b" * 64
+    first_path = root / "approval-original.json"
+    copied_path = root / "approval-copy.json"
+    first_approval = {"approved_by": "synthetic-original",
+                      "consumption_registry_path": str(registry)}
+    copied_approval = {"approved_by": "synthetic-copy",
+                       "consumption_registry_path": str(registry)}
+    fx17.save_json(first_path, first_approval)
+    fx17.save_json(copied_path, copied_approval)
+    first_raw = first_path.read_bytes()
+    copied_raw = copied_path.read_bytes()
+    first_claim = fx17.claim_campaign_consumption(
+        first_approval["consumption_registry_path"], schedule_hash,
+        payload_hash, first_raw)
+    marker = registry / ("fx17-" + first_claim["campaign_consumption_key_sha256"]
+                         + ".consumed.json")
+    before_failure = marker.read_bytes()
+    try:
+        raise fx17.Fx17Error("synthetic unpaid interruption after campaign consumption")
+    except fx17.Fx17Error as exc:
+        simulated_failure = str(exc)
+    try:
+        fx17.claim_campaign_consumption(
+            copied_approval["consumption_registry_path"], schedule_hash,
+            payload_hash, copied_raw)
+    except fx17.Fx17Error as exc:
+        duplicate_error = str(exc)
+    else:
+        duplicate_error = ""
+    after_retry = marker.read_bytes()
+    return {
+        "schedule_sha256": schedule_hash,
+        "payloads_sha256": payload_hash,
+        "campaign_consumption_key_sha256": first_claim["campaign_consumption_key_sha256"],
+        "registry_path": str(registry),
+        "original_approval_path": str(first_path),
+        "copied_approval_path": str(copied_path),
+        "original_approval_sha256": fx17.digest(first_raw),
+        "copied_approval_sha256": fx17.digest(copied_raw),
+        "marker_before_retry": _artifact(before_failure),
+        "marker_after_retry": _artifact(after_retry),
+        "simulated_failure": simulated_failure,
+        "duplicate_error": duplicate_error,
+    }
+
+
+def _capture_probe_findings(capture_probes):
+    failures = []
+    if not isinstance(capture_probes, dict) or set(capture_probes) != CAPTURE_PROBE_NAMES:
+        return ["trusted capture stress probes are incomplete or unexpected"]
+    expected_sources = dict(CAPTURE_SOURCES)
+    expected_sources["process_tree_timeout"] = PROCESS_TREE_SOURCE
+    expected_sources["process_tree_overflow"] = PROCESS_TREE_SOURCE
+    for name, record in capture_probes.items():
+        if not isinstance(record, dict):
+            failures.append(name + " capture probe record is invalid")
+            continue
+        source = expected_sources[name]
+        if (record.get("source") != source
+                or record.get("source_sha256") != fx17.digest(source.encode("utf-8"))
+                or record.get("runner_sha256") != fx17.runner_hash()
+                or record.get("control_harness_sha256") != control_harness_hash()):
+            failures.append(name + " capture probe source or code hashes differ")
+        executable = record.get("python_executable")
+        argv = record.get("argv")
+        if (not isinstance(executable, str) or not Path(executable).is_absolute()
+                or not isinstance(argv, list) or any(not isinstance(arg, str) for arg in argv)
+                or record.get("command_sha256") != fx17.digest(fx17.jbytes(
+                    [executable, "-I", "-c", source, *argv]))):
+            failures.append(name + " capture command evidence is invalid")
+        if name in ("stdout_overflow", "stderr_overflow") and argv != []:
+            failures.append(name + " capture probe argv is unexpected")
+        if name == "response_file_overflow":
+            if (not isinstance(argv, list) or len(argv) != 2
+                    or not argv[0].startswith("/private/tmp/aethyme-fx17-control-canaries-")
+                    or Path(argv[0]).name != "synthetic-response.json"
+                    or argv[1] != str(CAPTURE_PROBE_LIMIT_BYTES + 1)):
+                failures.append("response-file overflow probe inputs are invalid")
+        if name.startswith("process_tree_"):
+            tree = record.get("process_tree")
+            expected_mode = "timeout" if name == "process_tree_timeout" else "overflow"
+            if (not isinstance(tree, dict) or not isinstance(argv, list) or len(argv) != 4
+                    or argv[2] != expected_mode
+                    or argv[0] != str(Path(argv[0]))
+                    or not argv[0].startswith("/private/tmp/aethyme-fx17-control-canaries-")
+                    or not argv[0].endswith("owned-child-" + expected_mode + ".pid")
+                    or argv[1] != tree.get("child_nonce")
+                    or argv[3] != tree.get("leader_nonce")):
+                failures.append(name + " owned process-tree inputs are invalid")
+                tree = None
+            if tree is not None:
+                leader_pid = tree.get("leader_pid")
+                child_pid = tree.get("child_pid")
+                group = tree.get("process_group_id")
+                leader_nonce = tree.get("leader_nonce")
+                child_nonce = tree.get("child_nonce")
+                if (type(leader_pid) is not int or type(child_pid) is not int
+                        or type(group) is not int or leader_pid <= 0 or child_pid <= 0
+                        or leader_pid == child_pid or group != leader_pid
+                        or not isinstance(leader_nonce, str) or len(leader_nonce) != 32
+                        or not isinstance(child_nonce, str) or len(child_nonce) != 32
+                        or not _snapshot_matches(tree.get("leader_before"), leader_pid,
+                                                 group, leader_nonce)
+                        or not _snapshot_matches(tree.get("child_before"), child_pid,
+                                                 group, child_nonce)
+                        or tree.get("leader_identity_gone") is not True
+                        or tree.get("child_identity_gone") is not True):
+                    failures.append(name + " did not observe its owned leader and child identities")
+                for identity, nonce in (("leader", leader_nonce), ("child", child_nonce)):
+                    after = tree.get(identity + "_after")
+                    waited = tree.get(identity + "_gone_wait_seconds")
+                    if (after is not None and (not isinstance(after, dict)
+                            or (isinstance(nonce, str)
+                                and nonce in after.get("command", "")))):
+                        failures.append(name + " still has the owned " + identity + " process")
+                    if (isinstance(waited, bool) or not isinstance(waited, (int, float))
+                            or not math.isfinite(waited) or waited < 0
+                            or waited > PROCESS_IDENTITY_WAIT):
+                        failures.append(name + " process identity wait exceeded its bound")
+        try:
+            stdout = _artifact_bytes(record, "stdout")
+            stderr = _artifact_bytes(record, "stderr")
+        except fx17.Fx17Error as exc:
+            failures.append(str(exc))
+            continue
+        stdout_limit = record.get("stdout_limit_bytes")
+        stderr_limit = record.get("stderr_limit_bytes")
+        if (type(stdout_limit) is not int or stdout_limit != CAPTURE_PROBE_LIMIT_BYTES
+                or type(stderr_limit) is not int or stderr_limit != CAPTURE_PROBE_LIMIT_BYTES
+                or type(record.get("stdout_bytes_retained")) is not int
+                or record.get("stdout_bytes_retained") != len(stdout)
+                or type(record.get("stderr_bytes_retained")) is not int
+                or record.get("stderr_bytes_retained") != len(stderr)
+                or len(stdout) > CAPTURE_PROBE_LIMIT_BYTES
+                or len(stderr) > CAPTURE_PROBE_LIMIT_BYTES):
+            failures.append(name + " retained more than its per-stream capture bound")
+        if (type(record.get("exit_code")) is not int
+                or record.get("exit_code") != -signal.SIGKILL
+                or record.get("process_group_killed") is not True
+                or record.get("process_reaped") is not True
+                or record.get("stream_drain_timed_out") is not False):
+            failures.append(name + " did not kill its process group and reap the leader")
+        wall = record.get("wall_seconds")
+        timeout = record.get("timeout_seconds")
+        if (isinstance(wall, bool) or not isinstance(wall, (int, float))
+                or not math.isfinite(wall) or isinstance(timeout, bool)
+                or not isinstance(timeout, (int, float)) or not math.isfinite(timeout)
+                or wall > timeout + fx17.REAP_GRACE_SECONDS + 1):
+            failures.append(name + " exceeded its bounded capture deadline")
+        expected_overflow = {
+            "stdout_overflow": ["stdout"],
+            "stderr_overflow": ["stderr"],
+            "response_file_overflow": ["response_file"],
+            "process_tree_timeout": [],
+            "process_tree_overflow": ["stdout"],
+        }[name]
+        if (record.get("overflow_streams") != expected_overflow
+                or record.get("timed_out") is not (name == "process_tree_timeout")):
+            failures.append(name + " did not observe its typed overflow or timeout outcome")
+        if name == "stdout_overflow" and (len(stdout) != stdout_limit or stderr):
+            failures.append("stdout overflow did not retain exactly its cap")
+        if name == "stderr_overflow" and (len(stderr) != stderr_limit or stdout):
+            failures.append("stderr overflow did not retain exactly its cap")
+        if name == "response_file_overflow":
+            observed = record.get("watch_file_size_observed")
+            threshold = record.get("watch_file_limit_bytes")
+            if (record.get("watch_file_name") != "synthetic-response.json"
+                    or type(threshold) is not int or threshold != CAPTURE_PROBE_LIMIT_BYTES
+                    or type(observed) is not int or observed <= threshold
+                    or stdout or stderr):
+                failures.append("watched response-file threshold was not exceeded and observed")
+        elif (record.get("watch_file_limit_bytes") is not None
+              or record.get("watch_file_size_observed") is not None
+              or record.get("watch_file_name") is not None):
+            failures.append(name + " unexpectedly reports a watched response file")
+    return failures
+
+
+def _negative_control_findings(report):
+    failures = []
+    cli = report.get("cli_failure_negative_control")
+    registry = report.get("approval_consumption_negative_control")
+    if not isinstance(cli, dict):
+        failures.append("failed-controls CLI negative control is missing")
+    else:
+        try:
+            persisted = _artifact_bytes(cli, "persisted_report")
+            stdout = _artifact_bytes(cli, "stdout")
+            stderr = _artifact_bytes(cli, "stderr")
+            persisted_report = json.loads(persisted)
+            stdout_result = json.loads(stdout)
+        except (fx17.Fx17Error, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            failures.append("failed-controls CLI negative control evidence is invalid: " + str(exc))
+        else:
+            if (cli.get("exit_code") != 2 or type(cli.get("exit_code")) is not int
+                    or cli.get("trial_runner_calls") != 0
+                    or type(cli.get("trial_runner_calls")) is not int
+                    or stderr != b""
+                    or persisted_report.get("schema") != "aethyme.fx17.independent-isolation-controls/v3"
+                    or persisted_report.get("status") != "fail"
+                    or not persisted_report.get("failures")
+                    or stdout_result.get("status") != "fail"):
+                failures.append("failed-controls CLI did not persist its report and exit nonzero")
+            unhashed_report = dict(persisted_report)
+            report_hash = unhashed_report.pop("evidence_sha256", None)
+            if report_hash != fx17.digest(fx17.jbytes(unhashed_report)):
+                failures.append("failed-controls CLI persisted an invalid report hash")
+    if not isinstance(registry, dict):
+        failures.append("campaign-consumption registry negative control is missing")
+    else:
+        schedule_hash = registry.get("schedule_sha256")
+        payload_hash = registry.get("payloads_sha256")
+        key = registry.get("campaign_consumption_key_sha256")
+        try:
+            before = _artifact_bytes(registry, "marker_before_retry")
+            after = _artifact_bytes(registry, "marker_after_retry")
+            marker_record = json.loads(before)
+        except (fx17.Fx17Error, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            failures.append("campaign-consumption marker evidence is invalid: " + str(exc))
+        else:
+            first_path = registry.get("original_approval_path")
+            copied_path = registry.get("copied_approval_path")
+            registry_path = registry.get("registry_path")
+            if (not isinstance(first_path, str) or not isinstance(copied_path, str)
+                    or first_path == copied_path
+                    or not isinstance(registry_path, str)
+                    or not registry_path.startswith("/private/tmp/aethyme-fx17-control-canaries-")
+                    or registry.get("original_approval_sha256") == registry.get("copied_approval_sha256")
+                    or marker_record.get("schema") != "aethyme.fx17.consumed-campaign/v1"
+                    or marker_record.get("campaign_consumption_key_sha256") != key
+                    or marker_record.get("combined_schedule_sha256") != schedule_hash
+                    or marker_record.get("payloads_sha256") != payload_hash
+                    or key != fx17.campaign_consumption_key(schedule_hash, payload_hash)
+                    or registry.get("simulated_failure", "").find("interruption") < 0
+                    or "already consumed" not in registry.get("duplicate_error", "")
+                    or before != after):
+                failures.append("copied approval path bypassed the one-shot campaign registry")
+    return failures
+
+
 def controls_findings(report):
     failures = []
-    if (report.get("schema") != "aethyme.fx17.independent-isolation-controls/v2"
+    if (report.get("schema") != "aethyme.fx17.independent-isolation-controls/v3"
             or report.get("platform") != "darwin"
             or not isinstance(report.get("created_at"), str)):
         failures.append("control report schema, platform, or timestamp is invalid")
@@ -128,6 +754,8 @@ def controls_findings(report):
     if not isinstance(probes, dict) or set(probes) != CONTROL_PROBE_NAMES:
         failures.append("control probes are incomplete or unexpected")
         return failures
+    failures.extend(_capture_probe_findings(report.get("capture_probes")))
+    failures.extend(_negative_control_findings(report))
     canaries = report.get("canaries")
     if not isinstance(canaries, dict):
         failures.append("canary observations are missing")
@@ -458,9 +1086,13 @@ def run_controls(output, reviewer, reviewed_runner, reviewed_harness,
                                     "sha256": fx17.digest(foreign_raw),
                                     "bytes": len(foreign_raw)},
         }
+        capture_probes = _run_unpaid_capture_probes(root)
+        cli_failure_negative_control = _run_failed_cli_negative_control(root)
+        approval_consumption_negative_control = (
+            _run_consumption_registry_negative_control(root))
 
     report = {
-        "schema": "aethyme.fx17.independent-isolation-controls/v2",
+        "schema": "aethyme.fx17.independent-isolation-controls/v3",
         "status": "pending",
         "created_at": fx17.now(),
         "platform": sys.platform,
@@ -475,15 +1107,15 @@ def run_controls(output, reviewer, reviewed_runner, reviewed_harness,
                                "subject_profile_template_sha256": reviewed_profile},
         "canaries": canaries,
         "probes": probes,
+        "capture_probes": capture_probes,
+        "cli_failure_negative_control": cli_failure_negative_control,
+        "approval_consumption_negative_control": approval_consumption_negative_control,
     }
     failures = controls_findings(report)
     report["status"] = "pass" if not failures else "fail"
     if failures:
         report["failures"] = failures
-    report["evidence_sha256"] = fx17.digest(fx17.jbytes(report))
-    fd = os.open(output, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-    with os.fdopen(fd, "wb") as stream:
-        stream.write(fx17.jbytes(report))
+    _write_control_report(output, report)
     return {"output": str(output), "status": report["status"],
             "runner_sha256": current_runner,
             "control_harness_sha256": current_harness,
