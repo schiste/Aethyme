@@ -68,10 +68,31 @@ pub struct IncidentStatus {
     pub state: String,
     pub request_digest: String,
     pub managed_inventory_digest: Option<String>,
+    pub database_cleanup_completed_ms: Option<i64>,
     pub managed_cleanup_complete: bool,
     pub items: Vec<ItemStatus>,
+    pub database_tables: Vec<TableStatus>,
+    pub external_exports: Vec<ExportStatus>,
     pub residuals: Vec<ResidualStatus>,
     pub limitations: Vec<&'static str>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TableStatus {
+    pub table: String,
+    pub row_count: u64,
+    pub bytes: u64,
+    pub sha256: String,
+    pub state: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ExportStatus {
+    pub path: String,
+    pub kind: String,
+    pub sha256: String,
+    pub bytes: u64,
+    pub state: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -167,12 +188,15 @@ pub(crate) struct ResponseExclusive {
     _file: File,
 }
 
-fn lock_path(store: &CollaborationStore) -> PathBuf {
-    store.project_dir().join("spool/sensitive-response.lock")
+fn lock_path_for_project_dir(project_dir: &Path) -> PathBuf {
+    project_dir.join("spool/sensitive-response.lock")
 }
 
-fn marker_path(store: &CollaborationStore) -> Result<PathBuf, SensitiveError> {
-    let project_dir = store.project_dir();
+fn lock_path(store: &CollaborationStore) -> PathBuf {
+    lock_path_for_project_dir(store.project_dir())
+}
+
+fn marker_path_for_project_dir(project_dir: &Path) -> Result<PathBuf, SensitiveError> {
     let parent = project_dir
         .parent()
         .ok_or_else(|| SensitiveError::Invalid("project directory has no parent".into()))?;
@@ -182,14 +206,22 @@ fn marker_path(store: &CollaborationStore) -> Result<PathBuf, SensitiveError> {
     Ok(parent.join(".local-authority").join(name).join(MARKER_NAME))
 }
 
-fn open_response_lock(store: &CollaborationStore) -> Result<File, SensitiveError> {
-    let path = lock_path(store);
+fn marker_path(store: &CollaborationStore) -> Result<PathBuf, SensitiveError> {
+    marker_path_for_project_dir(store.project_dir())
+}
+
+fn open_response_lock_at(project_dir: &Path) -> Result<File, SensitiveError> {
+    let path = lock_path_for_project_dir(project_dir);
     let parent = path
         .parent()
         .ok_or_else(|| SensitiveError::Invalid("response lock directory".into()))?;
     fs::create_dir_all(parent)?;
     crate::host_state::protect_host_state_path(parent, true)?;
     Ok(open_lock_file(&path)?)
+}
+
+fn open_response_lock(store: &CollaborationStore) -> Result<File, SensitiveError> {
+    open_response_lock_at(store.project_dir())
 }
 
 /// Hold a shared response barrier and reject a tombstoned project.
@@ -220,6 +252,50 @@ pub fn response_use(store: &CollaborationStore) -> Result<ResponseUse, Sensitive
         _not_send: PhantomData,
     };
     if let Err(error) = ensure_available(store) {
+        drop(guard);
+        return Err(error);
+    }
+    Ok(guard)
+}
+
+/// Hold the same barrier when a long-lived reader has only retained its
+/// immutable project directory. This is used by analysis readers, which cannot
+/// own a CollaborationStore or retain a !Send guard between calls.
+pub(crate) fn response_use_for_project_dir(
+    project_dir: &Path,
+) -> Result<ResponseUse, SensitiveError> {
+    let project_key = project_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| SensitiveError::Invalid("project key is missing".into()))?;
+    crate::collaboration_state::ProjectKey::parse(project_key)
+        .map_err(|error| SensitiveError::Invalid(error.to_string()))?;
+    let path = lock_path_for_project_dir(project_dir);
+    if let Some(state) = RESPONSE_READERS.with(|readers| readers.borrow().get(&path).cloned()) {
+        state.count.set(state.count.get().saturating_add(1));
+        let guard = ResponseUse {
+            path,
+            state,
+            _not_send: PhantomData,
+        };
+        ensure_available_at(project_dir, project_key)?;
+        return Ok(guard);
+    }
+    let file = open_response_lock_at(project_dir)?;
+    file.lock_shared()?;
+    let state = Rc::new(SharedLockState {
+        _file: file,
+        count: Cell::new(1),
+    });
+    RESPONSE_READERS.with(|readers| {
+        readers.borrow_mut().insert(path.clone(), state.clone());
+    });
+    let guard = ResponseUse {
+        path,
+        state,
+        _not_send: PhantomData,
+    };
+    if let Err(error) = ensure_available_at(project_dir, project_key) {
         drop(guard);
         return Err(error);
     }
@@ -284,8 +360,27 @@ pub(crate) fn try_response_exclusive(
     }
 }
 
+pub(crate) fn tombstone_present_for_project_dir(
+    project_dir: &Path,
+) -> Result<bool, SensitiveError> {
+    let project_key = project_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| SensitiveError::Invalid("project key is missing".into()))?;
+    crate::collaboration_state::ProjectKey::parse(project_key)
+        .map_err(|error| SensitiveError::Invalid(error.to_string()))?;
+    Ok(read_marker_at(project_dir, project_key)?.is_some())
+}
+
 fn read_marker(store: &CollaborationStore) -> Result<Option<Marker>, SensitiveError> {
-    let path = marker_path(store)?;
+    read_marker_at(store.project_dir(), store.project().as_str())
+}
+
+fn read_marker_at(
+    project_dir: &Path,
+    project_key: &str,
+) -> Result<Option<Marker>, SensitiveError> {
+    let path = marker_path_for_project_dir(project_dir)?;
     let metadata = match fs::symlink_metadata(&path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -314,8 +409,8 @@ fn read_marker(store: &CollaborationStore) -> Result<Option<Marker>, SensitiveEr
     let marker: Marker = serde_json::from_slice(&bytes)?;
     if marker.version != 1
         || marker.scope_kind != SCOPE_KIND
-        || marker.scope_id != store.project().as_str()
-        || marker.project_key != store.project().as_str()
+        || marker.scope_id != project_key
+        || marker.project_key != project_key
         || RecordId::parse(&marker.incident_id).is_err()
         || !marker.request_digest.starts_with("sha256:")
         || !marker.authority_epoch.starts_with("sha256:")
@@ -333,6 +428,35 @@ pub fn ensure_available(store: &CollaborationStore) -> Result<(), SensitiveError
         return Err(SensitiveError::Quarantined);
     }
     let active: bool = store.read_connection().query_row(
+        "SELECT EXISTS(SELECT 1 FROM local_sensitive_incidents)",
+        [],
+        |row| row.get(0),
+    )?;
+    if active {
+        return Err(SensitiveError::Quarantined);
+    }
+    Ok(())
+}
+
+fn ensure_available_at(
+    project_dir: &Path,
+    project_key: &str,
+) -> Result<(), SensitiveError> {
+    if read_marker_at(project_dir, project_key)?.is_some() {
+        return Err(SensitiveError::Quarantined);
+    }
+    let database = project_dir.join("state.db");
+    let metadata = fs::symlink_metadata(&database)?;
+    if !metadata.file_type().is_file() {
+        return Err(SensitiveError::Invalid(
+            "collaboration database is not a regular file".into(),
+        ));
+    }
+    let connection = rusqlite::Connection::open_with_flags(
+        &database,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    let active: bool = connection.query_row(
         "SELECT EXISTS(SELECT 1 FROM local_sensitive_incidents)",
         [],
         |row| row.get(0),
@@ -449,6 +573,9 @@ pub fn quarantine(
     let Some(_response) = try_response_exclusive(store)? else {
         return Err(SensitiveError::Busy);
     };
+    // Recheck under the authority ingress lock after both content barriers.
+    // This serializes marker publication with a concurrent resume.
+    let _frozen = crate::local_authority::frozen_guard(store, &witness.epoch)?;
     let uid = operator_uid()?;
     let digest = request_digest(
         store.project().as_str(),
@@ -525,6 +652,24 @@ pub fn quarantine(
     status(store, &marker.incident_id)
 }
 
+fn nonnegative_u64(
+    row: &rusqlite::Row<'_>,
+    column: usize,
+    message: &'static str,
+) -> rusqlite::Result<u64> {
+    let value = row.get::<_, i64>(column)?;
+    u64::try_from(value).map_err(|_| {
+        rusqlite::Error::FromSqlConversionFailure(
+            column,
+            rusqlite::types::Type::Integer,
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                message,
+            )),
+        )
+    })
+}
+
 pub fn status(
     store: &CollaborationStore,
     incident_id: &str,
@@ -533,12 +678,18 @@ pub fn status(
     if marker.incident_id != incident_id {
         return Err(SensitiveError::Mismatch);
     }
-    let (state, digest, inventory): (String, String, Option<String>) = store
+    let (state, digest, inventory, database_cleanup_completed_ms): (
+        String,
+        String,
+        Option<String>,
+        Option<i64>,
+    ) = store
         .read_connection()
         .query_row(
-            "SELECT state,request_digest,inventory_digest FROM local_sensitive_incidents WHERE id=?1",
+            "SELECT state,request_digest,inventory_digest,database_cleanup_completed_ms
+             FROM local_sensitive_incidents WHERE id=?1",
             [incident_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .optional()?
         .ok_or(SensitiveError::Quarantined)?;
@@ -570,6 +721,38 @@ pub fn status(
         })
     })?;
     items.extend(rows.collect::<Result<Vec<_>, _>>()?);
+    let mut database_tables = Vec::new();
+    let mut statement = store.connection().prepare(
+        "SELECT table_name,row_count,bytes,sha256,state
+         FROM local_sensitive_table_inventory
+         WHERE incident_id=?1 ORDER BY table_name",
+    )?;
+    let rows = statement.query_map([incident_id], |row| {
+        let row_count = nonnegative_u64(row, 1, "negative sensitive table row count")?;
+        let bytes = nonnegative_u64(row, 2, "negative sensitive table byte count")?;
+        Ok(TableStatus {
+            table: row.get(0)?,
+            row_count,
+            bytes,
+            sha256: row.get(3)?,
+            state: row.get(4)?,
+        })
+    })?;
+    database_tables.extend(rows.collect::<Result<Vec<_>, _>>()?);
+    let mut external_exports = Vec::new();
+    let mut statement = store.connection().prepare(
+        "SELECT path,kind,sha256,bytes,state FROM local_sensitive_exports ORDER BY path",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok(ExportStatus {
+            path: row.get(0)?,
+            kind: row.get(1)?,
+            sha256: row.get(2)?,
+            bytes: nonnegative_u64(row, 3, "negative export byte count")?,
+            state: row.get(4)?,
+        })
+    })?;
+    external_exports.extend(rows.collect::<Result<Vec<_>, _>>()?);
     let mut residuals = Vec::new();
     let mut statement = store.read_connection().prepare(
         "SELECT code,relative_path,permanence,resolved_ms FROM local_sensitive_residuals
@@ -585,6 +768,8 @@ pub fn status(
     })?;
     residuals.extend(rows.collect::<Result<Vec<_>, _>>()?);
     let managed_cleanup_complete = inventory.is_some()
+        && database_cleanup_completed_ms.is_some()
+        && database_tables.iter().all(|table| table.state == "cleared")
         && items.iter().all(|item| item.state == "deleted")
         && !residuals
             .iter()
@@ -595,8 +780,11 @@ pub fn status(
         state,
         request_digest: digest,
         managed_inventory_digest: inventory,
+        database_cleanup_completed_ms,
         managed_cleanup_complete,
         items,
+        database_tables,
+        external_exports,
         residuals,
         limitations: vec![
             "external exports, Git worktrees/remotes, backups, process memory, and filesystem snapshots are unmanaged residuals",
@@ -744,7 +932,10 @@ fn collect_tree(
         return Ok(());
     }
     if metadata.is_file() {
-        let relative_path = relative.to_string_lossy().into_owned();
+        let Some(relative_path) = relative.to_str().map(str::to_owned) else {
+            unknown.push(relative.to_string_lossy().into_owned());
+            return Ok(());
+        };
         let (sha256, bytes) = hash_file(&path)?;
         files.push(FileItem {
             relative_path,
@@ -757,16 +948,232 @@ fn collect_tree(
     Ok(())
 }
 
-fn inventory_digest(items: &[FileItem]) -> String {
+#[derive(Debug, Clone)]
+struct DatabaseItem {
+    table_name: String,
+    row_count: u64,
+    bytes: u64,
+    sha256: String,
+}
+
+#[derive(Debug, Clone)]
+struct ExportItem {
+    path: String,
+    kind: String,
+    sha256: String,
+    bytes: u64,
+    state: String,
+}
+
+fn quote_identifier(identifier: &str) -> String {
+    format!("\"{}\"", identifier.replace('"', "\"\""))
+}
+
+fn database_inventory(store: &CollaborationStore) -> Result<Vec<DatabaseItem>, SensitiveError> {
+    const PRESERVED_TABLES: &[&str] = &[
+        "meta",
+        "local_authority_state",
+        "local_sensitive_incidents",
+        "local_sensitive_items",
+        "local_sensitive_residuals",
+        "local_sensitive_exports",
+        "local_sensitive_table_inventory",
+    ];
+    let connection = store.read_connection();
+    let mut statement = connection.prepare(
+        "SELECT name FROM sqlite_master
+         WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+    )?;
+    let names = statement
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(statement);
+
+    let mut inventory = Vec::new();
+    for table_name in names {
+        if PRESERVED_TABLES.contains(&table_name.as_str()) {
+            continue;
+        }
+        let mut columns_statement =
+            connection.prepare(&format!("PRAGMA table_info({})", quote_identifier(&table_name)))?;
+        let columns = columns_statement
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(columns_statement);
+        if columns.is_empty() {
+            return Err(SensitiveError::Invalid(format!(
+                "managed database table has no columns: {table_name}"
+            )));
+        }
+
+        let sql = format!("SELECT * FROM {}", quote_identifier(&table_name));
+        let mut rows_statement = connection.prepare(&sql)?;
+        let column_count = rows_statement.column_count();
+        let mut rows = rows_statement.query([])?;
+        let mut hasher = Sha256::new();
+        hasher.update(b"aethyme-local-sensitive-table-v1\0");
+        hasher.update((table_name.len() as u64).to_be_bytes());
+        hasher.update(table_name.as_bytes());
+        for column in &columns {
+            hasher.update((column.len() as u64).to_be_bytes());
+            hasher.update(column.as_bytes());
+        }
+        let mut row_count = 0u64;
+        let mut bytes = 0u64;
+        while let Some(row) = rows.next()? {
+            row_count = row_count
+                .checked_add(1)
+                .ok_or_else(|| SensitiveError::Invalid("table row count overflow".into()))?;
+            hasher.update([0xff]);
+            for index in 0..column_count {
+                use rusqlite::types::ValueRef;
+                let value = row.get_ref(index)?;
+                match value {
+                    ValueRef::Null => hasher.update([0]),
+                    ValueRef::Integer(value) => {
+                        hasher.update([1]);
+                        hasher.update(value.to_be_bytes());
+                        bytes = bytes.checked_add(8).ok_or_else(|| {
+                            SensitiveError::Invalid("table byte count overflow".into())
+                        })?;
+                    }
+                    ValueRef::Real(value) => {
+                        hasher.update([2]);
+                        hasher.update(value.to_bits().to_be_bytes());
+                        bytes = bytes.checked_add(8).ok_or_else(|| {
+                            SensitiveError::Invalid("table byte count overflow".into())
+                        })?;
+                    }
+                    ValueRef::Text(value) => {
+                        hasher.update([3]);
+                        hasher.update((value.len() as u64).to_be_bytes());
+                        hasher.update(value);
+                        bytes = bytes.checked_add(value.len() as u64).ok_or_else(|| {
+                            SensitiveError::Invalid("table byte count overflow".into())
+                        })?;
+                    }
+                    ValueRef::Blob(value) => {
+                        hasher.update([4]);
+                        hasher.update((value.len() as u64).to_be_bytes());
+                        hasher.update(value);
+                        bytes = bytes.checked_add(value.len() as u64).ok_or_else(|| {
+                            SensitiveError::Invalid("table byte count overflow".into())
+                        })?;
+                    }
+                }
+            }
+        }
+        inventory.push(DatabaseItem {
+            table_name,
+            row_count,
+            bytes,
+            sha256: format!("sha256:{:x}", hasher.finalize()),
+        });
+    }
+    Ok(inventory)
+}
+
+fn inventory_digest(
+    files: &[FileItem],
+    tables: &[DatabaseItem],
+    exports: &[ExportItem],
+) -> String {
     let mut hash = Sha256::new();
-    hash.update(b"aethyme-local-sensitive-inventory-v1\0");
-    for item in items {
+    hash.update(b"aethyme-local-sensitive-inventory-v2\0");
+    for item in files {
+        hash.update([b'f']);
         hash.update((item.relative_path.len() as u64).to_be_bytes());
         hash.update(item.relative_path.as_bytes());
         hash.update(item.sha256.as_bytes());
         hash.update(item.bytes.to_be_bytes());
     }
+    for item in tables {
+        hash.update([b'd']);
+        hash.update((item.table_name.len() as u64).to_be_bytes());
+        hash.update(item.table_name.as_bytes());
+        hash.update(item.sha256.as_bytes());
+        hash.update(item.row_count.to_be_bytes());
+        hash.update(item.bytes.to_be_bytes());
+    }
+    for item in exports {
+        hash.update([b'e']);
+        hash.update((item.path.len() as u64).to_be_bytes());
+        hash.update(item.path.as_bytes());
+        hash.update((item.kind.len() as u64).to_be_bytes());
+        hash.update(item.kind.as_bytes());
+        hash.update(item.sha256.as_bytes());
+        hash.update(item.bytes.to_be_bytes());
+        hash.update((item.state.len() as u64).to_be_bytes());
+        hash.update(item.state.as_bytes());
+    }
     format!("sha256:{:x}", hash.finalize())
+}
+
+fn external_exports(
+    store: &CollaborationStore,
+    unknown: &mut Vec<String>,
+) -> Result<Vec<ExportItem>, SensitiveError> {
+    let connection = store.read_connection();
+    let mut statement = connection.prepare(
+        "SELECT path,kind,sha256,bytes,state FROM local_sensitive_exports ORDER BY path",
+    )?;
+    let mut exports = statement
+        .query_map([], |row| {
+            Ok(ExportItem {
+                path: row.get(0)?,
+                kind: row.get(1)?,
+                sha256: row.get(2)?,
+                bytes: nonnegative_u64(row, 3, "negative export byte count")?,
+                state: row.get(4)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(statement);
+
+    let marker = marker_path(store)?;
+    let authority_dir = marker
+        .parent()
+        .ok_or_else(|| SensitiveError::Invalid("authority marker directory".into()))?;
+    let history = authority_dir.join("history");
+    let history_metadata = match fs::symlink_metadata(&history) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(exports),
+        Err(error) => return Err(error.into()),
+    };
+    if history_metadata.file_type().is_symlink() || !history_metadata.is_dir() {
+        unknown.push("<unclassified-authority-history-root>".into());
+        return Ok(exports);
+    }
+    let entries = match fs::read_dir(&history) {
+        Ok(entries) => entries.collect::<Result<Vec<_>, _>>()?,
+        Err(error) => return Err(error.into()),
+    };
+    let known: BTreeSet<String> = exports.iter().map(|item| item.path.clone()).collect();
+    for entry in entries {
+        let path = entry.path();
+        let Some(path_text) = path.to_str().map(str::to_owned) else {
+            unknown.push("<non-utf8-authority-history-path>".into());
+            continue;
+        };
+        if known.contains(&path_text) {
+            continue;
+        }
+        let metadata = fs::symlink_metadata(&path)?;
+        if !metadata.file_type().is_file() {
+            unknown.push(format!("<unclassified-authority-history:{}>", path.display()));
+            continue;
+        }
+        let (sha256, bytes) = hash_file(&path)?;
+        exports.push(ExportItem {
+            path: path_text,
+            kind: "authority_history".into(),
+            sha256,
+            bytes,
+            state: "present".into(),
+        });
+    }
+    exports.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(exports)
 }
 
 fn prepare_inventory(
@@ -791,7 +1198,7 @@ fn prepare_inventory(
             Ok(FileItem {
                 relative_path: row.get(0)?,
                 sha256: row.get(1)?,
-                bytes: row.get::<_, i64>(2)?.try_into().unwrap_or(0),
+                bytes: nonnegative_u64(row, 2, "negative sensitive inventory byte count")?,
             })
         })?;
         return Ok(rows.collect::<Result<Vec<_>, _>>()?);
@@ -799,42 +1206,60 @@ fn prepare_inventory(
 
     let mut files = Vec::new();
     let mut unknown = Vec::new();
-    collect_tree(store, Path::new("objects"), &mut files, &mut unknown)?;
-    collect_tree(store, Path::new("spool/archive"), &mut files, &mut unknown)?;
-    collect_tree(store, Path::new("spool/gc"), &mut files, &mut unknown)?;
-    collect_tree(store, Path::new("views"), &mut files, &mut unknown)?;
-    // The archive and response barrier lock files must remain at stable paths.
-    // Other store roots are outside this managed profile and are reported.
-    for name in ["objects", "spool", "views"] {
+    for path in [
+        Path::new("objects"),
+        Path::new("spool/archive"),
+        Path::new("spool/gc"),
+        Path::new("views"),
+        Path::new("generations"),
+        Path::new("import-rehearsals"),
+    ] {
+        collect_tree(store, path, &mut files, &mut unknown)?;
+    }
+    // Lock and verifier-authority state is control state, not archived source.
+    // Leave it in place and report the exact roots as unmanaged residuals.
+    for name in ["objects", "spool"] {
         let path = store.project_dir().join(name);
-        let entries = match fs::read_dir(&path) {
-            Ok(entries) => entries.collect::<Result<Vec<_>, _>>()?,
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
             Err(error) => return Err(error.into()),
         };
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            unknown.push(name.to_string());
+            continue;
+        }
+        let entries = match fs::read_dir(&path) {
+            Ok(entries) => entries.collect::<Result<Vec<_>, _>>()?,
+            Err(error) => return Err(error.into()),
+        };
         for entry in entries {
-            let child = entry.file_name().to_string_lossy().into_owned();
-            if name == "spool"
-                && matches!(
+            let child = match entry.file_name().into_string() {
+                Ok(child) => child,
+                Err(_) => {
+                    unknown.push(format!("{name}/<non-utf8-name>"));
+                    continue;
+                }
+            };
+            let expected = if name == "spool" {
+                matches!(
                     child.as_str(),
                     "archive" | "gc" | "gc.lock" | "sensitive-response.lock"
                 )
-            {
-                continue;
+            } else {
+                child == "sha256"
+            };
+            if !expected {
+                unknown.push(format!("{name}/{child}"));
             }
-            if name == "objects" && child == "sha256" {
-                continue;
-            }
-            if name == "views" {
-                continue;
-            }
-            unknown.push(format!("{name}/{child}"));
         }
     }
     files.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
     unknown.sort();
     unknown.dedup();
-    let digest = inventory_digest(&files);
+    let tables = database_inventory(store)?;
+    let exports = external_exports(store, &mut unknown)?;
+    let digest = inventory_digest(&files, &tables, &exports);
     let root_entries = fs::read_dir(store.project_dir())?.collect::<Result<Vec<_>, _>>()?;
     let tx = store
         .connection()
@@ -851,6 +1276,20 @@ fn prepare_inventory(
             ],
         )?;
     }
+    for item in &tables {
+        tx.execute(
+            "INSERT INTO local_sensitive_table_inventory
+             (incident_id,table_name,row_count,bytes,sha256,state)
+             VALUES (?1,?2,?3,?4,?5,'pending')",
+            rusqlite::params![
+                marker.incident_id,
+                item.table_name,
+                item.row_count,
+                item.bytes,
+                item.sha256
+            ],
+        )?;
+    }
     for path in &unknown {
         tx.execute(
             "INSERT OR IGNORE INTO local_sensitive_residuals
@@ -858,11 +1297,45 @@ fn prepare_inventory(
             rusqlite::params![marker.incident_id, path],
         )?;
     }
+    for item in &exports {
+        tx.execute(
+            "INSERT OR IGNORE INTO local_sensitive_exports
+             (path,kind,sha256,bytes,state,created_ms)
+             VALUES (?1,?2,?3,?4,?5,?6)",
+            rusqlite::params![
+                item.path,
+                item.kind,
+                item.sha256,
+                item.bytes,
+                item.state,
+                now_ms()
+            ],
+        )?;
+        let recorded: (String, String, i64, String) = tx.query_row(
+            "SELECT kind,sha256,bytes,state FROM local_sensitive_exports WHERE path=?1",
+            [&item.path],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+        if recorded.0 != item.kind
+            || recorded.1 != item.sha256
+            || u64::try_from(recorded.2).ok() != Some(item.bytes)
+            || recorded.3 != item.state
+        {
+            return Err(SensitiveError::Mismatch);
+        }
+        tx.execute(
+            "INSERT OR IGNORE INTO local_sensitive_residuals
+             (incident_id,code,relative_path,permanence)
+             VALUES (?1,'previous_external_export_copy',?2,'unmanaged')",
+            rusqlite::params![marker.incident_id, item.path],
+        )?;
+    }
     for (code, permanence) in [
         ("unregistered_external_exports", "unmanaged"),
         ("git_worktrees_and_remotes", "unmanaged"),
         ("host_backups_and_filesystem_snapshots", "unmanaged"),
         ("logs_previews_and_process_memory", "unmanaged"),
+        ("legacy_binary_readers_and_process_memory", "unmanaged"),
     ] {
         tx.execute(
             "INSERT OR IGNORE INTO local_sensitive_residuals
@@ -870,13 +1343,40 @@ fn prepare_inventory(
             rusqlite::params![marker.incident_id, code, permanence],
         )?;
     }
+    for name in ["controller-locks", "agent-locks", "verifier-authority"] {
+        let path = store.project_dir().join(name);
+        if fs::symlink_metadata(&path).is_ok() {
+            tx.execute(
+                "INSERT OR IGNORE INTO local_sensitive_residuals
+                 (incident_id,code,relative_path,permanence)
+                 VALUES (?1,'preserved_authority_or_lock_state',?2,'unmanaged')",
+                rusqlite::params![marker.incident_id, name],
+            )?;
+        }
+    }
     for entry in root_entries {
-        let name = entry.file_name().to_string_lossy().into_owned();
+        let name = match entry.file_name().into_string() {
+            Ok(name) => name,
+            Err(_) => {
+                tx.execute(
+                    "INSERT OR IGNORE INTO local_sensitive_residuals
+                     (incident_id,code,relative_path,permanence)
+                     VALUES (?1,'unclassified_managed_path','<non-utf8-name>','unclassified')",
+                    [&marker.incident_id],
+                )?;
+                continue;
+            }
+        };
         if matches!(
             name.as_str(),
             "objects"
                 | "spool"
                 | "views"
+                | "generations"
+                | "import-rehearsals"
+                | "controller-locks"
+                | "agent-locks"
+                | "verifier-authority"
                 | "state.db"
                 | "state.db-wal"
                 | "state.db-shm"
@@ -886,7 +1386,8 @@ fn prepare_inventory(
         }
         tx.execute(
             "INSERT OR IGNORE INTO local_sensitive_residuals
-             (incident_id,code,relative_path,permanence) VALUES (?1,'unclassified_managed_path',?2,'unclassified')",
+             (incident_id,code,relative_path,permanence)
+             VALUES (?1,'unclassified_managed_path',?2,'unclassified')",
             rusqlite::params![marker.incident_id, name],
         )?;
     }
@@ -931,6 +1432,21 @@ fn delete_inventory_item(
     incident_id: &str,
     item: &FileItem,
 ) -> Result<bool, SensitiveError> {
+    if item.relative_path == "views" || item.relative_path.starts_with("views/") {
+        add_residual(
+            store,
+            incident_id,
+            "analysis_view_retained_for_reader_safety",
+            &item.relative_path,
+            "unmanaged",
+        )?;
+        store.connection().execute(
+            "UPDATE local_sensitive_items SET state='residual'
+             WHERE incident_id=?1 AND relative_path=?2",
+            rusqlite::params![incident_id, item.relative_path],
+        )?;
+        return Ok(false);
+    }
     let path = safe_managed_path(store.project_dir(), &item.relative_path)?;
     match fs::symlink_metadata(&path) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -978,45 +1494,116 @@ fn delete_inventory_item(
     Ok(true)
 }
 
-fn clear_managed_database(store: &mut CollaborationStore) -> Result<(), SensitiveError> {
+fn clear_managed_database(
+    store: &mut CollaborationStore,
+    incident_id: &str,
+) -> Result<(), SensitiveError> {
     let database = store.project_dir().join("state.db");
     let connection = store.connection();
     connection.pragma_update(None, "secure_delete", "ON")?;
     connection.pragma_update(None, "foreign_keys", "OFF")?;
-    let tables = {
-        let mut statement = connection.prepare(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name DESC",
-        )?;
-        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
-        rows.collect::<Result<Vec<_>, _>>()?
-    };
-    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    for table in tables {
-        if matches!(
-            table.as_str(),
-            "meta"
-                | "local_authority_state"
-                | "local_sensitive_incidents"
-                | "local_sensitive_items"
-                | "local_sensitive_residuals"
-        ) {
-            continue;
+    let result = (|| {
+        let tables = {
+            let mut statement = connection.prepare(
+                "SELECT name FROM sqlite_master
+                 WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name DESC",
+            )?;
+            let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        let transaction =
+            connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        for table in tables {
+            if matches!(
+                table.as_str(),
+                "meta"
+                    | "local_authority_state"
+                    | "local_sensitive_incidents"
+                    | "local_sensitive_items"
+                    | "local_sensitive_residuals"
+                    | "local_sensitive_exports"
+                    | "local_sensitive_table_inventory"
+            ) {
+                continue;
+            }
+            let quoted = quote_identifier(&table);
+            transaction.execute(&format!("DELETE FROM {quoted}"), [])?;
         }
-        let quoted = table.replace('"', "\"\"");
-        transaction.execute(&format!("DELETE FROM \"{quoted}\""), [])?;
+        transaction.commit()?;
+
+        checkpoint_truncated(connection)?;
+        connection.execute_batch("VACUUM")?;
+        // In WAL mode VACUUM may commit pages to the WAL. The post-VACUUM
+        // truncate checkpoint is part of the deletion proof, not optional
+        // cleanup; inspect the frame counts as well as SQLite's busy flag.
+        checkpoint_truncated(connection)?;
+        sync_file_if_present(&database)?;
+        sync_file_if_present(&store.project_dir().join("state.db-wal"))?;
+        sync_directory(store.project_dir())?;
+
+        // Receipt and cleared-state rows are committed only after content
+        // deletion, checkpoint, VACUUM, and file/directory sync succeeded.
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
+            "UPDATE local_sensitive_table_inventory SET state='cleared'
+             WHERE incident_id=?1 AND state='pending'",
+            [incident_id],
+        )?;
+        tx.execute(
+            "UPDATE local_sensitive_incidents
+             SET database_cleanup_completed_ms=?2,updated_ms=?2
+             WHERE id=?1 AND database_cleanup_completed_ms IS NULL",
+            rusqlite::params![incident_id, now_ms()],
+        )?;
+        tx.commit()?;
+        Ok(())
+    })();
+    let foreign_keys = connection.pragma_update(None, "foreign_keys", "ON");
+    match (result, foreign_keys) {
+        (Err(error), _) => Err(error),
+        (Ok(()), Err(error)) => Err(SensitiveError::Sqlite(error)),
+        (Ok(()), Ok(())) => Ok(()),
     }
-    transaction.commit()?;
-    connection.pragma_update(None, "foreign_keys", "ON")?;
-    let (busy, _, _): (i64, i64, i64) =
-        connection.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-        })?;
-    if busy != 0 {
+}
+
+fn checkpoint_truncated(connection: &rusqlite::Connection) -> Result<(), SensitiveError> {
+    let (busy, log_frames, checkpointed_frames): (i64, i64, i64) = connection.query_row(
+        "PRAGMA wal_checkpoint(TRUNCATE)",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    if busy != 0 || (log_frames >= 0 && checkpointed_frames < log_frames) {
         return Err(SensitiveError::Busy);
     }
-    connection.execute_batch("VACUUM")?;
-    File::open(&database)?.sync_all()?;
-    sync_directory(store.project_dir())?;
+    Ok(())
+}
+
+fn sync_file_if_present(path: &Path) -> Result<(), SensitiveError> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    if !metadata.file_type().is_file() {
+        return Err(SensitiveError::Invalid(format!(
+            "database durability path is not a regular file: {}",
+            path.display()
+        )));
+    }
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = options.open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(SensitiveError::Invalid(
+            "database durability path changed while opening".into(),
+        ));
+    }
+    file.sync_all()?;
     Ok(())
 }
 
@@ -1059,6 +1646,13 @@ pub fn purge(
         )?;
         return Err(SensitiveError::Busy);
     };
+    let witness = crate::local_authority::status(store)?;
+    if witness.status != crate::local_authority::Status::Frozen
+        || witness.epoch.as_str() != marker.authority_epoch
+    {
+        return Err(SensitiveError::NotFrozen);
+    }
+    let _frozen = crate::local_authority::frozen_guard(store, &witness.epoch)?;
     if unresolved_work(store)? {
         add_residual(
             store,
@@ -1101,6 +1695,22 @@ pub fn purge(
         [incident_id],
         |row| row.get(0),
     )?;
+    // Views are inventoried but preserved because a reader from an older
+    // process can retain a generation pin without holding the response lock.
+    let undeleted_non_view_files: bool = store.read_connection().query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM local_sensitive_items
+             WHERE incident_id=?1 AND state<>'deleted'
+               AND relative_path<>'views' AND relative_path NOT LIKE 'views/%'
+         )",
+        [incident_id],
+        |row| row.get(0),
+    )?;
+    let cleanup_receipt: Option<i64> = store.read_connection().query_row(
+        "SELECT database_cleanup_completed_ms FROM local_sensitive_incidents WHERE id=?1",
+        [incident_id],
+        |row| row.get(0),
+    )?;
     let legacy_readers_unresolved: bool = store.read_connection().query_row(
         "SELECT EXISTS(SELECT 1 FROM local_sensitive_residuals
          WHERE incident_id=?1 AND code='legacy_binary_readers_and_process_memory'
@@ -1108,8 +1718,8 @@ pub fn purge(
         [incident_id],
         |row| row.get(0),
     )?;
-    if completed && !unclassified {
-        if let Err(error) = clear_managed_database(store) {
+    if !undeleted_non_view_files && !unclassified && cleanup_receipt.is_none() {
+        if let Err(error) = clear_managed_database(store, incident_id) {
             add_residual(
                 store,
                 incident_id,
