@@ -25,6 +25,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::mpsc::Sender;
 
 use aethyme_contracts::experimental_v0::SourceSnapshotId;
 use rusqlite::{OptionalExtension, TransactionBehavior};
@@ -78,10 +80,73 @@ pub struct ArchiveUse {
     _file: std::fs::File,
 }
 
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ArchiveUseProbeEvent {
+    Acquired,
+    Blocked,
+    Finished,
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static ARCHIVE_USE_PROBE: std::cell::RefCell<Option<Sender<ArchiveUseProbeEvent>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) struct ArchiveUseProbe;
+
+#[cfg(test)]
+impl Drop for ArchiveUseProbe {
+    fn drop(&mut self) {
+        ARCHIVE_USE_PROBE.with(|probe| *probe.borrow_mut() = None);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn observe_archive_use(sender: Sender<ArchiveUseProbeEvent>) -> ArchiveUseProbe {
+    ARCHIVE_USE_PROBE.with(|probe| *probe.borrow_mut() = Some(sender));
+    ArchiveUseProbe
+}
+
+#[cfg(test)]
+fn probe_archive_use(file: &std::fs::File) -> std::io::Result<Option<bool>> {
+    let sender = ARCHIVE_USE_PROBE.with(|probe| probe.borrow().clone());
+    let Some(sender) = sender else {
+        return Ok(None);
+    };
+    match file.try_lock_shared() {
+        Ok(()) => {
+            let _ = sender.send(ArchiveUseProbeEvent::Acquired);
+            Ok(Some(true))
+        }
+        Err(std::fs::TryLockError::WouldBlock) => {
+            let _ = sender.send(ArchiveUseProbeEvent::Blocked);
+            Ok(Some(false))
+        }
+        Err(std::fs::TryLockError::Error(source)) => Err(source),
+    }
+}
+
+#[cfg(test)]
+fn report_archive_use_acquired() {
+    ARCHIVE_USE_PROBE.with(|probe| {
+        if let Some(sender) = probe.borrow().as_ref() {
+            let _ = sender.send(ArchiveUseProbeEvent::Acquired);
+        }
+    });
+}
+
 /// Hold the archive shared, waiting while a reclamation applies.
 pub fn archive_use(store: &CollaborationStore) -> std::io::Result<ArchiveUse> {
     let file = open_archive_lock(store)?;
+    #[cfg(test)]
+    if probe_archive_use(&file)? == Some(true) {
+        return Ok(ArchiveUse { _file: file });
+    }
     file.lock_shared()?;
+    #[cfg(test)]
+    report_archive_use_acquired();
     Ok(ArchiveUse { _file: file })
 }
 
@@ -861,9 +926,10 @@ fn survey(
         }
     }
     // Native gate jobs retain exact source and records independently of target
-    // release. A crash or observation never relinquishes these roots.
+    // release. Only an explicit release for a prepared (abandoned) or completed
+    // job retires these edges; dispatching and unknown jobs remain rooted.
     let native_roots: Vec<(String, String)> = connection
-        .prepare("SELECT kind,reference FROM local_native_gate_roots UNION SELECT kind,reference FROM local_controller_completion_roots")?
+        .prepare("SELECT roots.kind,roots.reference FROM local_native_gate_roots AS roots JOIN local_native_gate_jobs AS jobs ON jobs.id=roots.job WHERE jobs.roots_released_ms IS NULL UNION SELECT kind,reference FROM local_controller_completion_roots")?
         .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
         .collect::<Result<_, _>>()?;
     for (kind, reference) in native_roots {
