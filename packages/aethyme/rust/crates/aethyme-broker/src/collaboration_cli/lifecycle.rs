@@ -2,8 +2,9 @@
 use super::*;
 use crate::collaboration_state::{CollaborationSnapshot, inspect_for_repository};
 use crate::{
-    local_authority as authority, local_handoff as handoff, local_restore as restore,
-    local_target as target,
+    collaboration_sensitive as response, execution_verifier as verifier,
+    local_authority as authority, local_budget as budget, local_handoff as handoff,
+    local_restore as restore, local_target as target,
 };
 use rusqlite::OptionalExtension;
 use std::collections::BTreeMap;
@@ -394,6 +395,315 @@ pub(super) fn target_change(root: &Path, verb: &str, rest: &[&str]) -> Result<Ou
         format!("target {name}: {verb}; no work dispatched\n"),
     ))
 }
+
+/// Configure the immutable project-wide budget before any objective is
+/// admitted. The policy is a bounded operator file and the stored ID is the
+/// canonical policy identity, so a lost response can be checked by retrying
+/// the same file without replenishing the cap.
+pub(super) fn budget_project_configure(root: &Path, rest: &[&str]) -> Result<Output, Failure> {
+    let flags = Flags::parse(rest, &["--target", "--issuer", "--file"], &[])?;
+    let policy: budget::ProjectPolicy = read_operator(flags.one("--file")?)?;
+    let mut store = open(root)?;
+    let owner = existing_owner(&mut store, flags.one("--target")?, flags.one("--issuer")?)?;
+    let id = budget::configure_project(&mut store, &owner, policy)
+        .map_err(|e| Failure::domain("budget_configuration", e.to_string()))?;
+    Ok((
+        json!({"schema":"aethyme.collab-budget-project-configure/experimental-v0","target":owner.target(),"policy":id.as_str(),"immutable":true,"grants_model_dispatch":false}),
+        format!(
+            "project budget policy {} recorded; no work dispatched\n",
+            id.as_str()
+        ),
+    ))
+}
+
+/// Authorize one immutable objective cap for the selected target revision.
+pub(super) fn budget_objective_authorize(root: &Path, rest: &[&str]) -> Result<Output, Failure> {
+    let flags = Flags::parse(rest, &["--target", "--issuer", "--file"], &[])?;
+    let cap: budget::Units = read_operator(flags.one("--file")?)?;
+    let mut store = open(root)?;
+    let owner = existing_owner(&mut store, flags.one("--target")?, flags.one("--issuer")?)?;
+    let id = budget::authorize_objective(&mut store, &owner, cap)
+        .map_err(|e| Failure::domain("budget_configuration", e.to_string()))?;
+    Ok((
+        json!({"schema":"aethyme.collab-budget-objective-authorize/experimental-v0","target":owner.target(),"authorization":id.as_str(),"immutable":true,"grants_model_dispatch":false}),
+        format!(
+            "objective cap {} recorded; no work dispatched\n",
+            id.as_str()
+        ),
+    ))
+}
+
+/// Compute an acceptance-policy ID before writing it into an immutable target
+/// proposal. This is pure validation and does not appoint a producer.
+pub(super) fn verifier_policy_id(_root: &Path, rest: &[&str]) -> Result<Output, Failure> {
+    let flags = Flags::parse(rest, &["--file"], &[])?;
+    let policy: verifier::VerifierPolicy = read_operator(flags.one("--file")?)?;
+    let record = policy
+        .record()
+        .map_err(|e| Failure::domain("verifier_policy", e.to_string()))?;
+    Ok((
+        json!({"schema":"aethyme.collab-verifier-policy-id/experimental-v0","policy":record.id().as_str(),"profile":policy.profile,"runtime":policy.runtime,"image":policy.image,"harness":policy.harness,"inventory":policy.inventory,"appoints_producer":false}),
+        format!(
+            "verifier policy {} validated; no producer appointed\n",
+            record.id().as_str()
+        ),
+    ))
+}
+
+/// Appoint or rotate a producer with an explicit compare-and-swap generation.
+pub(super) fn verifier_configure(root: &Path, rest: &[&str]) -> Result<Output, Failure> {
+    let flags = Flags::parse(
+        rest,
+        &[
+            "--target",
+            "--issuer",
+            "--producer",
+            "--expected-generation",
+            "--file",
+        ],
+        &[],
+    )?;
+    let policy: verifier::VerifierPolicy = read_operator(flags.one("--file")?)?;
+    let expected = match flags.one("--expected-generation")? {
+        "none" => None,
+        value => {
+            let generation = value
+                .parse::<i64>()
+                .map_err(|_| Failure::usage("--expected-generation must be `none` or positive"))?;
+            if generation < 1 {
+                return Err(Failure::usage(
+                    "--expected-generation must be `none` or positive",
+                ));
+            }
+            Some(generation)
+        }
+    };
+    let mut store = open(root)?;
+    let owner = existing_owner(&mut store, flags.one("--target")?, flags.one("--issuer")?)?;
+    let permit = verifier::configure(
+        &mut store,
+        &owner,
+        flags.one("--producer")?,
+        expected,
+        policy,
+    )
+    .map_err(|e| Failure::domain("verifier_configuration", e.to_string()))?;
+    let policy_id = permit
+        .policy()
+        .record()
+        .map_err(|e| Failure::domain("verifier_policy", e.to_string()))?
+        .id();
+    Ok((
+        json!({"schema":"aethyme.collab-verifier-configure/experimental-v0","target":owner.target(),"producer":permit.producer(),"generation":permit.generation(),"policy":policy_id.as_str(),"dispatch_started":false}),
+        format!(
+            "producer {} appointed at generation {}; no dispatch started\n",
+            permit.producer(),
+            permit.generation()
+        ),
+    ))
+}
+
+/// Read producer generation without changing authority.
+pub(super) fn verifier_status(root: &Path, rest: &[&str]) -> Result<Output, Failure> {
+    let flags = Flags::parse(rest, &["--target", "--issuer", "--producer"], &[])?;
+    let target_name = flags.one("--target")?;
+    let issuer = flags.one("--issuer")?;
+    let producer = flags.one("--producer")?;
+    let snapshot = observe(root)?;
+    require_table(&snapshot, "local_verifier_producers")?;
+    let target_issuer: Option<String> = snapshot
+        .connection()
+        .query_row(
+            "SELECT issuer FROM local_targets WHERE target=?1",
+            [target_name],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(sqlite)?;
+    if target_issuer.as_deref() != Some(issuer) {
+        return Err(Failure::refused(
+            if target_issuer.is_none() {
+                "target_missing"
+            } else {
+                "issuer_mismatch"
+            },
+            "target and issuer must match before producer status is read",
+            "inspect the appointed target and use its issuer label",
+        ));
+    }
+    let row: Option<(i64, String, String, bool)> = snapshot
+        .connection()
+        .query_row(
+            "SELECT generation,policy,epoch,revoked FROM local_verifier_producers WHERE target=?1 AND producer=?2",
+            rusqlite::params![target_name, producer],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()
+        .map_err(sqlite)?;
+    let Some((generation, policy, epoch, revoked)) = row else {
+        return Err(Failure::refused(
+            "producer_missing",
+            "no verifier producer is appointed under this name",
+            "configure a producer for the selected target revision",
+        ));
+    };
+    Ok((
+        json!({"schema":"aethyme.collab-verifier-status/experimental-v0","target":target_name,"producer":producer,"generation":generation,"policy":policy,"epoch":epoch,"revoked":revoked,"dispatch_authority_granted":false}),
+        format!(
+            "producer {producer}: generation {generation}, {}\n",
+            if revoked { "revoked" } else { "active" }
+        ),
+    ))
+}
+
+/// Revoke exactly the currently observed producer generation. Run this before
+/// freezing project authority; a later generation is never guessed.
+pub(super) fn verifier_revoke(root: &Path, rest: &[&str]) -> Result<Output, Failure> {
+    let flags = Flags::parse(
+        rest,
+        &["--target", "--issuer", "--producer", "--generation"],
+        &[],
+    )?;
+    let generation = flags
+        .one("--generation")?
+        .parse::<i64>()
+        .map_err(|_| Failure::usage("--generation must be positive"))?;
+    if generation < 1 {
+        return Err(Failure::usage("--generation must be positive"));
+    }
+    let next_generation = generation
+        .checked_add(1)
+        .ok_or_else(|| Failure::usage("--generation is too large"))?;
+    let mut store = open(root)?;
+    let owner = existing_owner(&mut store, flags.one("--target")?, flags.one("--issuer")?)?;
+    verifier::revoke(&mut store, &owner, flags.one("--producer")?, generation)
+        .map_err(|e| Failure::domain("verifier_revocation", e.to_string()))?;
+    Ok((
+        json!({"schema":"aethyme.collab-verifier-revoke/experimental-v0","target":owner.target(),"producer":flags.one("--producer")?,"revoked_generation":generation,"next_generation":next_generation,"dispatch_started":false}),
+        format!(
+            "producer {} generation {generation} revoked; no dispatch started\n",
+            flags.one("--producer")?
+        ),
+    ))
+}
+
+/// Inspect one durable finite-service appointment after a lost process or
+/// stdout response. A dispatching row is intentionally reported as unknown;
+/// this command never resumes or replays it.
+pub(super) fn service_status(root: &Path, rest: &[&str]) -> Result<Output, Failure> {
+    let flags = Flags::parse(rest, &["--target", "--issuer", "--appointment"], &[])?;
+    let target_name = flags.one("--target")?;
+    let issuer = flags.one("--issuer")?;
+    let appointment = parse_record(flags.one("--appointment")?)?;
+    let store = open(root)?;
+    let _response = response::response_use(&store)
+        .map_err(|e| Failure::domain("sensitive_response", e.to_string()))?;
+    let actual_issuer: Option<String> = store
+        .read_connection()
+        .query_row(
+            "SELECT issuer FROM local_targets WHERE target=?1",
+            [target_name],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(sqlite)?;
+    if actual_issuer.as_deref() != Some(issuer) {
+        return Err(Failure::refused(
+            if actual_issuer.is_none() {
+                "target_missing"
+            } else {
+                "issuer_mismatch"
+            },
+            "target and issuer must match before service status is read",
+            "inspect the appointed target and use its issuer label",
+        ));
+    }
+    let row: Option<(String, String, String, String, Option<Vec<u8>>)> = store
+        .read_connection()
+        .query_row(
+            "SELECT target,revision,epoch,state,report FROM local_controller_services WHERE id=?1",
+            [appointment.as_str()],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(sqlite)?;
+    let Some((target, revision, epoch, state, bytes)) = row else {
+        return Err(Failure::refused(
+            "appointment_missing",
+            "no service appointment has this ID",
+            "use the appointment ID returned by target run",
+        ));
+    };
+    if target != target_name {
+        return Err(Failure::refused(
+            "appointment_target_mismatch",
+            "appointment belongs to a different target",
+            "inspect only the target named by the original run command",
+        ));
+    }
+    if !matches!(state.as_str(), "dispatching" | "held" | "completed") {
+        return Err(Failure::domain(
+            "appointment_corrupt",
+            "service appointment has an unknown persisted state",
+        ));
+    }
+    let report = match bytes {
+        Some(bytes) => {
+            let report: crate::local_controller::ServiceReport = serde_json::from_slice(&bytes)
+                .map_err(|e| Failure::domain("appointment_corrupt", e.to_string()))?;
+            let expected_state = if report.outcome == crate::local_controller::ServiceOutcome::Held
+            {
+                "held"
+            } else {
+                "completed"
+            };
+            if report.appointment != appointment.as_str()
+                || report.target != target
+                || report.revision != revision
+                || report.epoch != epoch
+                || state != expected_state
+            {
+                return Err(Failure::domain(
+                    "appointment_corrupt",
+                    "stored service report does not match its appointment identity",
+                ));
+            }
+            Some(
+                serde_json::to_value(report)
+                    .map_err(|e| Failure::domain("appointment_corrupt", e.to_string()))?,
+            )
+        }
+        None if state == "dispatching" => None,
+        None => {
+            return Err(Failure::domain(
+                "appointment_corrupt",
+                "terminal service appointment has no stored report",
+            ));
+        }
+    };
+    let unknown = state == "dispatching";
+    let reconciliation_required = unknown || state == "held";
+    Ok((
+        json!({"schema":"aethyme.collab-service-status/experimental-v0","appointment":appointment.as_str(),"target":target,"revision":revision,"epoch":epoch,"state":if unknown { "unknown" } else { state.as_str() },"report":report,"reconciliation_required":reconciliation_required,"automatic_replay":false}),
+        format!(
+            "appointment {}: {}; automatic replay is disabled\n",
+            appointment.as_str(),
+            if unknown {
+                "outcome unknown"
+            } else {
+                state.as_str()
+            }
+        ),
+    ))
+}
 pub(super) fn stop(root: &Path, rest: &[&str]) -> Result<Output, Failure> {
     let flags = Flags::parse(rest, &["--epoch", "--reason"], &[])?;
     let expected = flags.one("--epoch")?;
@@ -616,6 +926,7 @@ pub(super) fn target_run(root: &Path, rest: &[&str]) -> Result<Output, Failure> 
             "--remote",
             "--destination",
             "--docker",
+            "--endpoint",
             "--timeout",
             "--authorization",
             "--allow-replacement",
@@ -647,6 +958,7 @@ pub(super) fn target_run(root: &Path, rest: &[&str]) -> Result<Output, Failure> 
         ));
     }
     let cli = std::path::PathBuf::from(flags.one("--docker")?);
+    let endpoint = flags.one("--endpoint")?;
     if !cli.is_absolute()
         || !resources.host_state.is_absolute()
         || !resources.temporary_root.is_absolute()
@@ -680,8 +992,8 @@ pub(super) fn target_run(root: &Path, rest: &[&str]) -> Result<Output, Failure> 
     let permit =
         execution_verifier::existing_permit(&store, &owner, flags.one("--producer")?, generation)
             .map_err(|e| Failure::domain("verifier_authority", e.to_string()))?;
-    let native =
-        DockerExecutor::probe(cli).map_err(|e| Failure::domain("native_runtime", e.to_string()))?;
+    let native = DockerExecutor::probe_at(cli, endpoint)
+        .map_err(|e| Failure::domain("native_runtime", e.to_string()))?;
     let resource_policy = crate::execution_resources::ResourcePolicy {
         host_state: resources.host_state,
         temporary_root: resources.temporary_root,
