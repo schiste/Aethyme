@@ -4799,7 +4799,26 @@ mod tests {
         drop(superseded_reader);
         let final_purge = purge(store, &incident_id, &quarantined.request_digest).unwrap();
         assert!(!final_purge.completed);
-        assert!(final_purge.status.managed_cleanup_complete);
+        let final_pending_items = final_purge
+            .status
+            .items
+            .iter()
+            .filter(|item| item.state != "deleted")
+            .map(|item| format!("{}={}", item.path, item.state))
+            .collect::<Vec<_>>();
+        let final_unclassified = final_purge
+            .status
+            .residuals
+            .iter()
+            .filter(|residual| residual.permanence == "unclassified")
+            .map(|residual| format!("{}:{}", residual.code, residual.path))
+            .collect::<Vec<_>>();
+        assert!(
+            final_purge.status.managed_cleanup_complete,
+            "final managed cleanup incomplete: inventory={:?}, pending_items={final_pending_items:?}, unclassified={final_unclassified:?}, cleanup_receipt={:?}",
+            final_purge.status.managed_inventory_digest,
+            final_purge.status.database_cleanup_completed_ms
+        );
         assert!(!project_dir.join("views").join(&view).exists());
         assert!(!project_dir.join("views").exists());
         assert!(contains_bytes(
