@@ -15,7 +15,10 @@ passing patch digest equals the complete patch from that parent to `9677dc7f`.
 
 Independent review found no additional source blocker within its requested
 scope. Strict CI Clippy rejected the eight-field tuple in that commit. The
-private named-row cleanup and subsequent checks require their own evidence.
+private named-row cleanup at `c45d4096` then passed strict local Clippy and six
+recorded test selections: 65 overlapping passing executions and three explicit
+ignores. Their 21 original artifacts and exact source bindings are retained in
+`post-cleanup/` and the ledger; these are not 65 FX17 stage vectors.
 
 The original Rust test logs contain trailing spaces on interrupted test-status
 lines and one blank line at EOF. Those raw artifacts are preserved byte-for-byte;
