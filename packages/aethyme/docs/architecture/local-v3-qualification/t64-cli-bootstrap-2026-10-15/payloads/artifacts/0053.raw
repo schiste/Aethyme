@@ -1,0 +1,10 @@
+--- a/packages/aethyme/rust/crates/aethyme-broker/src/execution_verifier.rs
++++ b/packages/aethyme/rust/crates/aethyme-broker/src/execution_verifier.rs
+@@ -278,7 +278,6 @@
+     } = request;
+     let _response = crate::collaboration_sensitive::response_use(store)?;
+     let inventory = AssertionInventory::decode(inventory_bytes)?;
+-    ensure_supported_inventory(&inventory)?;
+     let commit = CommitOid::parse(harness_commit).map_err(|_| VerificationError::Mismatch)?;
+     let pinned = archive::pin_commit(harness_repository, commit.as_str())?;
+     if pinned != commit {

@@ -1,0 +1,207 @@
+{
+  "baseline_commit": "3af335ab87618cc7fcb92a4a5b01ad23edb633d9",
+  "baseline_tree": "efc3977fd9078d37b66b0519394e76b51a03f659",
+  "branch": "agent/complete-fresh-local-cli-bootstrap-and-c",
+  "files_sha256": {
+    "packages/aethyme/rust/crates/aethyme-broker/src/collaboration_cli/lifecycle.rs": "9ff89a2283096d3aa28a691ccb2393a5a39a1bed5c2f75bf6e4aaeb6bfa4ed78",
+    "packages/aethyme/rust/crates/aethyme-broker/src/collaboration_sensitive.rs": "937ccf5ce2b4b0baf6d4fb35fe15c8ca96e23b89b8cd60e268a591c7e576be1c",
+    "packages/aethyme/rust/crates/aethyme-broker/src/execution_verifier.rs": "d40cd76ee5295ad06cb2cdd9c80181e146afe9d4ebc58540926bd8816fa7c886",
+    "packages/aethyme/rust/crates/aethyme-broker/src/execution_verifier/tests.rs": "6c20916b37393949742765c6e78a883ab2a11945f615c39914d482eba1dd603a",
+    "packages/aethyme/rust/crates/aethyme-broker/src/local_capture_notice.rs": "c88d07507bc43c76c695fdb51c111891fd4138bc44e8566db2dee99c092110b6",
+    "packages/aethyme/rust/crates/aethyme-broker/src/local_capture_notice/tests.rs": "23680217839c68d3b1e533c577e0bc4062847a73b244efec61aadcd39d72df0e",
+    "packages/aethyme/rust/crates/aethyme-broker/src/local_controller/service.rs": "48c58084de1db8c0e7544061540baf1b33ff80501a35fe3ca5b8dbd5ccaf263c",
+    "packages/aethyme/rust/crates/aethyme-cli/tests/snapshots/help/collab.snap": "97a2793991ed211a50d79e72e5fc716338ae24f686a18b718e7bf8f4f209492e"
+  },
+  "freeze_version": 5,
+  "head": "3af335ab87618cc7fcb92a4a5b01ad23edb633d9",
+  "merged_parent_docs_commit": "4f91ca708c9d111c5afd244701b13ca360db937c",
+  "mutations": {
+    "manifest": "/private/tmp/1129-mutants-rebased-v2/manifest.json",
+    "pre_fix_attempts": [
+      {
+        "exit": 101,
+        "failed": 2,
+        "ignored": 1,
+        "label": "1129-base-execution-verifier",
+        "log_sha256": "ef36ad3a20e525416f12b09d80457c4fdf21780daa97f726ffff6c05a93165ff",
+        "passed": 9,
+        "selected": 12
+      },
+      {
+        "exit": 101,
+        "failed": 16,
+        "ignored": 0,
+        "label": "1129-base-sensitive-module",
+        "log_sha256": "2bac92ae1f6ac3556d778ef4c1623b85c28fc6b6b3357792a5bf46d5ef35b2aa",
+        "passed": 12,
+        "selected": 28
+      },
+      {
+        "exit": 0,
+        "failed": 0,
+        "head": "469a2d158a743968907bde9db847dc5217de508a",
+        "ignored": 1,
+        "label": "1129-fixed-execution-verifier",
+        "log_sha256": "446a682a8a76e966989f1d7a9cc991d7e08cdd1b9ecdc0412fb0cf433787aaaa",
+        "passed": 12,
+        "selected": 13
+      }
+    ],
+    "status": "rebind and independently review proposals to frozen source tree 23213872; include retained inventory old-path and capture-notice ingress lock proof; no mutation until fresh CLEAR"
+  },
+  "parents": [
+    "ceec95e5aff148046547a1683ed3438b379cf634",
+    "4f91ca708c9d111c5afd244701b13ca360db937c"
+  ],
+  "planned_mutation_scope": [
+    "Rebind and independently review the five earlier guard mutants to this frozen source tree before execution.",
+    "Include the execution_verifier materialized harness inventory old-path mutant and bind it to the new direct regression.",
+    "Include a capture-notice ingress control-proof mutant bound to the new refusal/retention tests.",
+    "For every mutant, apply once to a disposable source copy, require the named test failure, restore exact baseline hashes, and never mutate profile/oracle fixtures."
+  ],
+  "planned_positive_selections": [
+    {
+      "expected_selected": 33,
+      "filter": "collaboration_sensitive::tests::",
+      "label": "sensitive-module"
+    },
+    {
+      "expected_selected": 16,
+      "filter": "local_generation::tests::",
+      "label": "local-generation"
+    },
+    {
+      "expected_selected": 19,
+      "filter": "local_handoff::tests::",
+      "label": "local-handoff"
+    },
+    {
+      "expected_selected": 5,
+      "filter": "local_capture_notice::tests::",
+      "label": "capture-notice"
+    },
+    {
+      "expected_selected": 1,
+      "filter": "local_controller::service::permit_tests::existing_producer_appointment_preserves_generation_and_refuses_revocation",
+      "label": "service-permit"
+    },
+    {
+      "expected_selected": 1,
+      "filter": "collaboration_cli::lifecycle::tests::verifier_prepare_refuses_oversized_literal_inventory_before_opening_state",
+      "label": "verifier-prepare-oversized"
+    },
+    {
+      "expected_selected": 1,
+      "filter": "execution_verifier::prepare_preflight_tests::prepare_rejects_nonzero_exit_before_runtime_or_capture_side_effects",
+      "label": "verifier-prepare-preflight"
+    },
+    {
+      "expected_selected_each": 1,
+      "filters": [
+        "collaboration_capture::tests::contribution_root_release_requires_exact_committed_receipt_and_is_idempotent",
+        "collaboration_capture::tests::contribution_root_release_refuses_missing_or_uncommitted_receipts"
+      ],
+      "label": "capture-release-exact"
+    },
+    {
+      "expected_selected": 1,
+      "filter": "native_gates::tests::dispatching_and_unknown_jobs_stay_rooted_without_a_process_tree_proof",
+      "label": "gc-dispatch-root"
+    },
+    {
+      "expected_selected": 1,
+      "filter": "local_target::tests::artifact_retention_permit_requires_each_exact_guard_and_owner_epoch",
+      "label": "target-retention-permit"
+    },
+    {
+      "expected_selected": 1,
+      "filter": "collaboration_cli::tests::bootstrap_routes_are_named_and_documented",
+      "label": "bootstrap-route-help"
+    },
+    {
+      "expected_selected": 1,
+      "filter": "local_acceptance::tests::private_current_qualification_requires_verifier_and_refuses_revocation",
+      "label": "private-current-qualification"
+    },
+    {
+      "expected_selected_each": 1,
+      "filters": [
+        "collaboration_cli::lifecycle::tests::service_status_nonce_recovers_unknown_appointment_after_lost_output_without_replay",
+        "collaboration_cli::lifecycle::tests::service_status_nonce_reads_completed_history_across_revisions_and_epochs",
+        "collaboration_cli::lifecycle::tests::service_status_rejects_corrupt_body_index_bindings_without_writes"
+      ],
+      "label": "service-status-and-recovery"
+    },
+    {
+      "command": "cargo test --locked -j4 -p aethyme-cli --test help_snapshots help_surface_matches_snapshots -- --exact",
+      "expected_selected": 1,
+      "label": "cli-help-snapshots"
+    },
+    {
+      "command": "cargo test --locked -j4 -p aethyme-cli --test help_everywhere help_works_everywhere_without_side_effects -- --exact",
+      "expected_selected": 1,
+      "label": "cli-help-everywhere"
+    },
+    {
+      "command": "cargo test --locked -j4 -p aethyme-cli --test collab_cli lifecycle_export_is_exclusive_and_verified_as_historical_source_only -- --exact",
+      "expected_selected": 1,
+      "label": "cli-export"
+    },
+    {
+      "command": "cargo test --locked -j4 -p aethyme-testkit --test deprecated_spelling_callers no_shipped_caller_uses_a_deprecated_broker_spelling -- --exact",
+      "expected_selected": 1,
+      "label": "deprecated-spelling"
+    },
+    {
+      "command": "cargo test --locked -j4 -p aethyme-testkit --test docs_hygiene no_unverifiable_python_examples -- --exact",
+      "expected_selected": 1,
+      "label": "docs-hygiene"
+    }
+  ],
+  "previous_sensitive_failure": {
+    "run": "20261015T225751Z-1129-final-sensitive-module-v4-5a134a74",
+    "selected": 33,
+    "passed": 32,
+    "failed": 1,
+    "ignored": 0,
+    "exit": 101,
+    "log_sha256": "dedbafc78bd1a4f7601debc74dd18fcfc14f8a6d47873329f742ab904ce29767",
+    "failure": "invalid_capture_notice_ingress_lock_blocks_database_cleanup: fixture lacked a completed capture wave; corrected only fixture setup"
+  },
+  "recorder": {
+    "path": "target/local-resume/record-final-local-check-v2.py",
+    "sha256": "29d2319c55cea24d6a1c76d7038b4bfd96cc105ae17e7ef4c00ef927d19286bc"
+  },
+  "runtime_policy": {
+    "cargo_flags": "--locked -j4",
+    "cwd": "packages/aethyme/rust",
+    "one_cargo_command_at_a_time": true,
+    "shared_target": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/integrate-reviewed-local-bare-git-servic/target/local-resume/cargo",
+    "tmp_base": "/private/tmp"
+  },
+  "session": 1129,
+  "source_fix_commit": "ceec95e5aff148046547a1683ed3438b379cf634",
+  "source_sha256": {
+    "packages/aethyme/rust/crates/aethyme-broker/src/collaboration_capture.rs": "b6207871391cf8421c32a6a3f932b9950bd0ce950efffd644b784e1edcd31ff6",
+    "packages/aethyme/rust/crates/aethyme-broker/src/collaboration_cli/lifecycle.rs": "9ff89a2283096d3aa28a691ccb2393a5a39a1bed5c2f75bf6e4aaeb6bfa4ed78",
+    "packages/aethyme/rust/crates/aethyme-broker/src/collaboration_sensitive.rs": "937ccf5ce2b4b0baf6d4fb35fe15c8ca96e23b89b8cd60e268a591c7e576be1c",
+    "packages/aethyme/rust/crates/aethyme-broker/src/execution_verifier.rs": "d40cd76ee5295ad06cb2cdd9c80181e146afe9d4ebc58540926bd8816fa7c886",
+    "packages/aethyme/rust/crates/aethyme-broker/src/execution_verifier/tests.rs": "6c20916b37393949742765c6e78a883ab2a11945f615c39914d482eba1dd603a",
+    "packages/aethyme/rust/crates/aethyme-broker/src/lib.rs": "82d8da4590a3b3d83b7db2faf4c5732c366b62e1faf2a263343fe1ef6887f7e8",
+    "packages/aethyme/rust/crates/aethyme-broker/src/local_capture_notice.rs": "c88d07507bc43c76c695fdb51c111891fd4138bc44e8566db2dee99c092110b6",
+    "packages/aethyme/rust/crates/aethyme-broker/src/local_capture_notice/tests.rs": "23680217839c68d3b1e533c577e0bc4062847a73b244efec61aadcd39d72df0e",
+    "packages/aethyme/rust/crates/aethyme-broker/src/local_controller/service.rs": "48c58084de1db8c0e7544061540baf1b33ff80501a35fe3ca5b8dbd5ccaf263c",
+    "packages/aethyme/rust/crates/aethyme-broker/src/local_generation/tests.rs": "1922df274e9415f063a9c159980845e1d40b4bdee6754ca0404e10314b0b4520",
+    "packages/aethyme/rust/crates/aethyme-broker/src/local_handoff/tests.rs": "aae8e324e4daa5306348a475632aa2c3d3e4e37853bb29eea52ed4e477a24488",
+    "packages/aethyme/rust/crates/aethyme-cli/tests/snapshots/help/collab.snap": "97a2793991ed211a50d79e72e5fc716338ae24f686a18b718e7bf8f4f209492e"
+  },
+  "status_porcelain": "",
+  "tree": "a414406951d28197ed101308914c379fe1678cbd",
+  "worktree": "clean; no tracked or untracked source changes",
+  "fixture_correction_commit": "3af335ab87618cc7fcb92a4a5b01ad23edb633d9",
+  "fixture_correction_patch": {
+    "path": "/private/tmp/1129-capture-notice-lock-v3.diff",
+    "sha256": "12a6092152743f84a51e356b748ffd1471c5bb37c31e55b49c4acf38a2ff3060",
+    "review": "CLEAR; fixture now completes a valid wave and records an acknowledged capture before injecting the nonempty ingress lock"
+  }
+}
