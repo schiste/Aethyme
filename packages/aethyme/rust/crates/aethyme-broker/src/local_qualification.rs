@@ -4,8 +4,9 @@ use super::*;
 use crate::collaboration_archive as archive;
 use crate::collaboration_gc as gc;
 use crate::execution_snapshot as snapshot;
-use crate::execution_supervisor::{DockerExecutor, Outcome};
+use crate::execution_supervisor::{BuildObservationWitnessKind, DockerExecutor, Outcome};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 fn age_objects(store: &CollaborationStore) {
     for prefix in std::fs::read_dir(archive::objects_dir(store)).unwrap() {
@@ -315,8 +316,83 @@ fn assert_cleanup(executor: &DockerExecutor, host: &Path) {
             .is_empty()
     );
 }
+
+fn wait_output_marker(executor: &DockerExecutor, object: &Object, path: &str) {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let output = control(
+            executor,
+            &[
+                "container",
+                "exec",
+                "--user",
+                "65534:65534",
+                object.id.as_deref().unwrap(),
+                "/bin/cat",
+                path,
+            ],
+        );
+        if output.status.success() && output.stdout == b"ready" {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "exact builder did not reach {path}"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn signal_pressure(executor: &DockerExecutor, object: &Object) {
+    let output = control(
+        executor,
+        &[
+            "container",
+            "exec",
+            "--user",
+            "65534:65534",
+            object.id.as_deref().unwrap(),
+            "/bin/sh",
+            "-c",
+            "printf ready > /outputs/qa-pressure",
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "exact builder pressure signal failed: {output:?}"
+    );
+}
+
+struct ResumeGc(Option<mpsc::Sender<()>>);
+
+fn assert_archive_exclusive_observed(lock_path: &std::path::Path, label: &str, stage: &str) {
+    let lock = std::fs::File::open(lock_path)
+        .unwrap_or_else(|error| panic!("{label}: open canonical archive lock for probe: {error}"));
+    assert!(
+        matches!(
+            lock.try_lock_shared(),
+            Err(std::fs::TryLockError::WouldBlock)
+        ),
+        "{label}: canonical archive shared try-lock must report WouldBlock {stage}; GC must still hold archive EX"
+    );
+}
+
+impl ResumeGc {
+    fn release(&mut self) {
+        if let Some(sender) = self.0.take() {
+            // A closed receiver means the GC worker exited; no pause remains.
+            sender.send(()).unwrap_or(());
+        }
+    }
+}
+
+impl Drop for ResumeGc {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
 #[test]
-#[ignore = "actual bounded tmpfs ENOSPC and cgroup OOM with concurrent native build and retained-source GC; requires explicit cached Linux image"]
+#[ignore = "actual bounded tmpfs ENOSPC and owned-cgroup OOM while same-store GC holds EX; requires explicit cached Linux image"]
 fn actual_pressure_preserves_retained_source_and_bounded_native_cleanup() {
     let host = tempfile::tempdir().unwrap().keep();
     eprintln!("Local QA durable host journal {}", host.display());
@@ -331,7 +407,7 @@ fn actual_pressure_preserves_retained_source_and_bounded_native_cleanup() {
     policy.runtime = native.runtime().id();
     policy.daemon = native.runtime().daemon_id.clone();
     policy.meter_image = image.clone();
-    policy.memory_mib = 4096;
+    policy.memory_mib = 3072;
     policy.disk_mib = 4096;
     policy.job_slots = 4;
     let executor = native.with_resources(policy.clone()).unwrap();
@@ -420,12 +496,12 @@ fn actual_pressure_preserves_retained_source_and_bounded_native_cleanup() {
             for (label, command, expected) in [
                 (
                     "bounded-tmpfs-enospc",
-                    "dd if=/dev/zero of=/tmp/pressure bs=1048576 count=20 2>/outputs/pressure-proof; code=$?; test \"$code\" -ne 0 || exit 99; while ! test -f /outputs/qa-release; do sleep 0.05; done; exit 28",
+                    "printf ready > /outputs/qa-start-pressure; while ! test -f /outputs/qa-pressure; do sleep 0.05; done; dd if=/dev/zero of=/tmp/pressure bs=1048576 count=20 2>/outputs/pressure-proof; code=$?; test \"$code\" -ne 0 || exit 99; while ! test -f /outputs/qa-release; do sleep 0.05; done; exit 28",
                     Outcome::CodeFailed,
                 ),
                 (
                     "bounded-cgroup-oom",
-                    "awk 'BEGIN {s=\"x\";for(i=0;i<28;i++)s=s s;print length(s)}'",
+                    "printf ready > /outputs/qa-start-pressure; while ! test -f /outputs/qa-pressure; do sleep 0.05; done; awk 'BEGIN {s=\"x\";for(i=0;i<28;i++)s=s s;print length(s)}'",
                     Outcome::InfrastructureDeferred,
                 ),
             ] {
@@ -452,27 +528,93 @@ fn actual_pressure_preserves_retained_source_and_bounded_native_cleanup() {
                     stable_object.id,
                     "stable build must still be actually running before each pressure trial"
                 );
-                let result = if label == "bounded-tmpfs-enospc" {
-                    std::thread::scope(|pressure_scope| {
+                let pressure_orphan = archive::put_object(
+                    &pressure.store,
+                    format!("T45 {label} independently reclaimable source").as_bytes(),
+                )
+                .unwrap();
+                age_objects(&pressure.store);
+                let pressure_root =
+                    crate::collaboration_state::CollaborationRoot::under_host_state(&pressure_host);
+                let pressure_project = pressure.store.project().clone();
+                let mut pressure_collector =
+                    CollaborationStore::open(&pressure_root, &pressure_project, &[]).unwrap();
+                let archive_lock_path = gc::lock_path(&pressure_collector);
+                let gc_options = gc::GcOptions::default();
+                let gc_plan = gc::plan(&mut pressure_collector, &gc_options).unwrap();
+                let orphan_path = archive::object_path(&pressure_collector, &pressure_orphan);
+                let move_ordinal = gc_plan
+                    .reclaimable
+                    .iter()
+                    .position(|entry| {
+                        pressure_collector.project_dir().join(&entry.relpath) == orphan_path
+                    })
+                    .map(|index| index + 1)
+                    .expect("the same-store plan must contain the named pressure orphan");
+                let plan_digest = gc_plan.digest.clone();
+                let executor_ref = &executor;
+                let host_ref = &host;
+                let execution_ref = &execution;
+                let attempt_ref = &attempt;
+                let pressure_owner_ref = &pressure_owner;
+                let (witness_tx, witness_rx) = mpsc::sync_channel(1);
+                let (result, gc_report, pressure_collector) = std::thread::scope(
+                    |pressure_scope| {
                         let job = pressure_scope.spawn(|| {
-                            executor.build(
+                            executor_ref.test_build_with_pre_finish_observer(
                                 &mut pressure.store,
-                                &pressure_owner,
-                                &execution,
-                                &attempt,
+                                pressure_owner_ref,
+                                execution_ref,
+                                attempt_ref,
                                 &cancel,
+                                witness_tx.clone(),
                             )
                         });
-                        // The trusted recipe waits after the actual dd failure. Observe
-                        // its kernel diagnostic via exact native exec before releasing it.
-                        let observed =
-                            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                let object =
-                                    wait_builder(&executor, &host, execution.id().as_str());
+                        let trial = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            let object =
+                                wait_builder(executor_ref, host_ref, execution_ref.id().as_str());
+                            wait_output_marker(executor_ref, &object, "/outputs/qa-start-pressure");
+
+                            let (entered_tx, entered_rx) = mpsc::channel();
+                            let (resume_tx, resume_rx) = mpsc::channel();
+                            let resume_rx = Arc::new(Mutex::new(resume_rx));
+                            let mut resume_gc = ResumeGc(Some(resume_tx));
+                            let moved_path = orphan_path.clone();
+                            let gc_plan_for_worker = plan_digest.clone();
+                            let gc_callback = Box::new(move || {
+                                let moved = !moved_path.exists();
+                                entered_tx.send(moved).unwrap();
+                                resume_rx.lock().unwrap().recv().unwrap();
+                            });
+                            let hooks = gc::GcHooks {
+                                after_moves: Some((move_ordinal, gc_callback)),
+                                ..gc::GcHooks::default()
+                            };
+                            let gc_worker = pressure_scope.spawn(move || {
+                                let result = gc::apply_with(
+                                    &mut pressure_collector,
+                                    &gc_plan_for_worker,
+                                    &gc_options,
+                                    &hooks,
+                                );
+                                (result, pressure_collector)
+                            });
+                            assert!(
+                                entered_rx.recv_timeout(Duration::from_secs(60)).unwrap(),
+                                "GC hook must acknowledge after moving the exact named orphan"
+                            );
+                            assert_archive_exclusive_observed(
+                                &archive_lock_path,
+                                label,
+                                "after the named move and before the pressure signal",
+                            );
+                            signal_pressure(executor_ref, &object);
+
+                            if label == "bounded-tmpfs-enospc" {
                                 let deadline = Instant::now() + Duration::from_secs(15);
                                 loop {
                                     let proof = control(
-                                        &executor,
+                                        executor_ref,
                                         &[
                                             "container",
                                             "exec",
@@ -487,40 +629,122 @@ fn actual_pressure_preserves_retained_source_and_bounded_native_cleanup() {
                                         && String::from_utf8_lossy(&proof.stdout)
                                             .contains("No space left on device")
                                     {
+                                        assert_archive_exclusive_observed(
+                                            &archive_lock_path,
+                                            label,
+                                            "after observing the actual kernel ENOSPC diagnostic",
+                                        );
                                         eprintln!(
-                                            "Local QA kernel ENOSPC diagnostic SHA-256 {}",
+                                            "Local QA kernel ENOSPC diagnostic SHA-256 {} while GC holds archive EX",
                                             ObjectDigest::of(&proof.stdout).hex()
                                         );
                                         break;
                                     }
                                     assert!(
                                         Instant::now() < deadline,
-                                        "actual kernel ENOSPC diagnostic required"
+                                        "actual kernel ENOSPC diagnostic required while GC is paused"
                                     );
                                     std::thread::sleep(Duration::from_millis(25));
                                 }
-                                release(&executor, &object);
-                            }));
-                        if observed.is_err() {
+                                release(executor_ref, &object);
+                            }
+
+                            let witness = witness_rx
+                                .recv_timeout(Duration::from_secs(75))
+                                .unwrap_or_else(|error| {
+                                    panic!("{label}: bounded pre-finish observation unavailable: {error}")
+                                });
+                            assert_eq!(
+                                witness.kind,
+                                BuildObservationWitnessKind::Observation,
+                                "{label}: unexpected build error before observation: {:?}",
+                                witness.detail
+                            );
+                            assert_eq!(witness.run_id, object.generation);
+                            assert_eq!(
+                                witness.outcome,
+                                Some(expected),
+                                "{label}: {:?}",
+                                witness.detail
+                            );
+                            assert!(
+                                !witness.artifact_present,
+                                "{label}: pressure cannot mint an artifact/pass"
+                            );
+                            if label == "bounded-tmpfs-enospc" {
+                                assert_eq!(witness.exit_code, Some(28));
+                                assert_eq!(witness.detail, None);
+                            } else {
+                                assert_eq!(witness.exit_code, None);
+                                assert_eq!(
+                                    witness.detail.as_deref(),
+                                    Some("infrastructure deferred: workload OOM")
+                                );
+                            }
+                            assert_archive_exclusive_observed(
+                                &archive_lock_path,
+                                label,
+                                "after the exact cleaned build observation and before join",
+                            );
+                            resume_gc.release();
+                            let observation = job.join().unwrap().unwrap();
+                            assert_eq!(
+                                observation.outcome(),
+                                expected,
+                                "{label}: {:?}",
+                                observation.detail()
+                            );
+                            assert!(
+                                observation.artifact().is_none(),
+                                "pressure cannot mint an artifact/pass"
+                            );
+                            if label == "bounded-tmpfs-enospc" {
+                                assert_eq!(observation.exit_code(), Some(28));
+                            } else {
+                                assert!(
+                                    observation
+                                        .detail()
+                                        .is_some_and(|detail| detail.contains("OOM"))
+                                );
+                            }
+                            let (report, collector) = gc_worker.join().unwrap();
+                            (observation, report.unwrap(), collector)
+                        }));
+                        if trial.is_err() {
                             cancel.store(true, Ordering::SeqCst);
                         }
-                        let outcome = job.join().unwrap();
-                        if let Err(error) = observed {
-                            std::panic::resume_unwind(error);
+                        match trial {
+                            Ok(result) => result,
+                            Err(panic) => std::panic::resume_unwind(panic),
                         }
-                        outcome.unwrap()
-                    })
-                } else {
-                    executor
-                        .build(
-                            &mut pressure.store,
-                            &pressure_owner,
-                            &execution,
-                            &attempt,
-                            &cancel,
-                        )
-                        .unwrap()
-                };
+                    },
+                );
+                assert!(
+                    gc_report.reclaimed.iter().any(|entry| pressure_collector
+                        .project_dir()
+                        .join(&entry.relpath)
+                        == orphan_path),
+                    "same-store GC must complete the exact named move after pressure"
+                );
+                assert!(!orphan_path.exists());
+                assert!(archive::read_object(&pressure_collector, &pressure_orphan).is_err());
+                let restored = tempfile::tempdir().unwrap();
+                let restored_source = restored.path().join("retained-pressure-source");
+                assert_eq!(
+                    archive::reconstruct(
+                        &pressure_collector,
+                        &pressure.a.result.snapshot_id,
+                        &restored_source
+                    )
+                    .unwrap()
+                    .id(),
+                    pressure.a.result.snapshot_id,
+                    "same-store GC must preserve the exact retained build source"
+                );
+                assert_eq!(
+                    std::fs::read(restored_source.join("one.txt")).unwrap(),
+                    b"A\n"
+                );
                 assert_eq!(
                     current_builder(&executor, &host, stable_id).unwrap().id,
                     stable_object.id,
@@ -544,7 +768,7 @@ fn actual_pressure_preserves_retained_source_and_bounded_native_cleanup() {
                 );
                 eprintln!(
                     "Local QA pressure transcript {}",
-                    serde_json::json!({"trial":label,"runtime":executor.runtime().id(),"daemon":executor.runtime().daemon_id,"image":image,"execution":execution.id().as_str(),"outcome":format!("{:?}",result.outcome()),"exit":result.exit_code(),"artifact":false})
+                    serde_json::json!({"trial":label,"runtime":executor.runtime().id(),"daemon":executor.runtime().daemon_id,"image":image,"execution":execution.id().as_str(),"outcome":format!("{:?}",result.outcome()),"exit":result.exit_code(),"artifact":false,"same_store_gc":"held_archive_ex_during_pressure_then_reclaimed_named_orphan","retained_source_reconstructed":true})
                 );
             }
             release(&executor, &stable_object);

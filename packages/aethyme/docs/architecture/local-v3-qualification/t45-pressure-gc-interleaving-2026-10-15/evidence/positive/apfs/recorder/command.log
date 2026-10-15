@@ -1,0 +1,20 @@
+   Compiling aethyme-graph-schema v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/implement-deterministic-t45-gc-and-stora/packages/aethyme/rust/crates/aethyme-graph-schema)
+   Compiling ra_ap_stdx v0.0.331
+   Compiling aethyme-engine v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/implement-deterministic-t45-gc-and-stora/packages/aethyme/rust/crates/aethyme-engine)
+   Compiling aethyme-broker v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/implement-deterministic-t45-gc-and-stora/packages/aethyme/rust/crates/aethyme-broker)
+   Compiling ra_ap_syntax v0.0.331
+   Compiling aethyme-testkit v0.1.0 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/implement-deterministic-t45-gc-and-stora/packages/aethyme/rust/crates/aethyme-testkit)
+   Compiling aethyme-enhance v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/implement-deterministic-t45-gc-and-stora/packages/aethyme/rust/crates/aethyme-enhance)
+   Compiling aethyme-graph-storage v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/implement-deterministic-t45-gc-and-stora/packages/aethyme/rust/crates/aethyme-graph-storage)
+   Compiling aethyme-producers v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/implement-deterministic-t45-gc-and-stora/packages/aethyme/rust/crates/aethyme-producers)
+   Compiling aethyme-graph-indexer v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/implement-deterministic-t45-gc-and-stora/packages/aethyme/rust/crates/aethyme-graph-indexer)
+   Compiling aethyme-contracts v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/implement-deterministic-t45-gc-and-stora/packages/aethyme/rust/crates/aethyme-contracts)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1m 22s
+     Running unittests src/lib.rs (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/integrate-reviewed-local-bare-git-servic/target/local-resume/cargo/debug/deps/aethyme_broker-0f278e0d02146111)
+
+running 1 test
+test execution_resources::qualification::native_filesystem::actual_native_t45_capture_and_hydration_enospc_interleave_with_gc ... Native source filesystem recovery root /Volumes/T7-repositories/Application Support/Aethyme/qualification/local-check-temporaries/t45-gc-apfs-source-pressure-positive-4b5f3bc-tmp-m7bukujf/.tmp8VK9Y3
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1830 filtered out; finished in 50.72s
+

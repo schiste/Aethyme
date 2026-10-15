@@ -1,0 +1,130 @@
+{
+  "schema": "aethyme.analysis-view-mutation/v1",
+  "state": "complete",
+  "label": "mutation-reader-lifecycle-lock",
+  "mode": "reader-lifecycle-lock",
+  "expected_test_name": "opening_a_view_pins_before_retirement_can_finish",
+  "source_path": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/fix-analysis-view-hold-retire-and-public/packages/aethyme/rust/crates/aethyme-broker/src/analysis_view.rs",
+  "source_before": {
+    "head": "d819d1758a341ee90fb7f6640865859295befef0",
+    "tree": "ddbf3de65d28a80321146d07462236d00248c710",
+    "status": "",
+    "diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  "source_file_sha256_before": "894a7eabef74810a95cfbdf333389356599f16e9a69ce8af1583e0c151d0ea08",
+  "source_file_mode_before": "0o644",
+  "backup_path": "/private/tmp/mutation-reader-lifecycle-lock-cc1xdhx2.bak",
+  "backup_sha256": "894a7eabef74810a95cfbdf333389356599f16e9a69ce8af1583e0c151d0ea08",
+  "started_at_utc": "2026-10-15T10:11:14.499217+00:00",
+  "mutator_stdout": "applied mutation reader-lifecycle-lock to /Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/fix-analysis-view-hold-retire-and-public/packages/aethyme/rust/crates/aethyme-broker/src/analysis_view.rs\n",
+  "mutator_stderr": "",
+  "mutator_exit_code": 0,
+  "source_file_sha256_mutated": "54dba6a380c9d6b709f5194db975b868288f836db1dee2049afd6a55763ab223",
+  "mutated_diff_sha256": "d3a8e2ffc30279f766c8aa8d75936e00c9ccacd40247bcc31b3cc031c6d61129",
+  "command": [
+    "/usr/bin/python3",
+    "/private/tmp/aethyme-record-final-local-check.py",
+    "--root",
+    "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/fix-analysis-view-hold-retire-and-public",
+    "--label",
+    "mutation-reader-lifecycle-lock",
+    "--target",
+    "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/integrate-reviewed-local-bare-git-servic/target/local-resume/cargo",
+    "--",
+    "cargo",
+    "test",
+    "--locked",
+    "-j4",
+    "-p",
+    "aethyme-broker",
+    "--lib",
+    "analysis_view::tests::opening_a_view_pins_before_retirement_can_finish",
+    "--",
+    "--nocapture"
+  ],
+  "recorder_stdout": "{\"metadata\": \"/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/fix-analysis-view-hold-retire-and-public/target/local-resume/final-integration-20261015T101114Z/mutation-reader-lifecycle-lock.json\", \"status\": 101, \"source_unchanged\": true, \"wall_seconds\": 26.24, \"summary_lines\": [\"warning: function `lock_lifecycle_shared` is never used\", \"359 | fn lock_lifecycle_shared(view_dir: &Path) -> Result<File, ViewError> {\", \"warning: `aethyme-broker` (lib test) generated 1 warning\", \"    Finished `test` profile [unoptimized + debuginfo] target(s) in 25.08s\", \"     Running unittests src/lib.rs (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/integrate-reviewed-local-bare-git-servic/target/local-resume/cargo/debug/deps/aethyme_broker-0f278e0d02146111)\", \"running 1 test\", \"assertion `left == right` failed\", \"test analysis_view::tests::opening_a_view_pins_before_retirement_can_finish ... FAILED\", \"test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1819 filtered out; finished in 0.41s\", \"error: test failed, to rerun pass `-p aethyme-broker --lib`\"]}\n",
+  "recorder_stderr": "",
+  "cargo_exit_code": 101,
+  "recorder_summary": {
+    "metadata": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/fix-analysis-view-hold-retire-and-public/target/local-resume/final-integration-20261015T101114Z/mutation-reader-lifecycle-lock.json",
+    "status": 101,
+    "source_unchanged": true,
+    "wall_seconds": 26.24,
+    "summary_lines": [
+      "warning: function `lock_lifecycle_shared` is never used",
+      "359 | fn lock_lifecycle_shared(view_dir: &Path) -> Result<File, ViewError> {",
+      "warning: `aethyme-broker` (lib test) generated 1 warning",
+      "    Finished `test` profile [unoptimized + debuginfo] target(s) in 25.08s",
+      "     Running unittests src/lib.rs (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/integrate-reviewed-local-bare-git-servic/target/local-resume/cargo/debug/deps/aethyme_broker-0f278e0d02146111)",
+      "running 1 test",
+      "assertion `left == right` failed",
+      "test analysis_view::tests::opening_a_view_pins_before_retirement_can_finish ... FAILED",
+      "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1819 filtered out; finished in 0.41s",
+      "error: test failed, to rerun pass `-p aethyme-broker --lib`"
+    ]
+  },
+  "cargo_metadata_path": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/fix-analysis-view-hold-retire-and-public/target/local-resume/final-integration-20261015T101114Z/mutation-reader-lifecycle-lock.json",
+  "cargo_metadata": {
+    "schema": "aethyme.local-check/v1",
+    "state": "complete",
+    "started_at_utc": "2026-10-15T10:11:14.569399+00:00",
+    "command": [
+      "/usr/bin/caffeinate",
+      "-i",
+      "/Users/christophehenner/.cargo/bin/cargo",
+      "test",
+      "--locked",
+      "-j4",
+      "-p",
+      "aethyme-broker",
+      "--lib",
+      "analysis_view::tests::opening_a_view_pins_before_retirement_can_finish",
+      "--",
+      "--nocapture"
+    ],
+    "working_directory": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/fix-analysis-view-hold-retire-and-public/packages/aethyme/rust",
+    "environment": {
+      "PATH": "/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/christophehenner/.cargo/bin",
+      "RUSTC_WRAPPER": "",
+      "CARGO_TARGET_DIR": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/integrate-reviewed-local-bare-git-servic/target/local-resume/cargo"
+    },
+    "source_before": {
+      "head": "d819d1758a341ee90fb7f6640865859295befef0",
+      "tree": "ddbf3de65d28a80321146d07462236d00248c710",
+      "status": " M packages/aethyme/rust/crates/aethyme-broker/src/analysis_view.rs",
+      "diff_sha256": "d3a8e2ffc30279f766c8aa8d75936e00c9ccacd40247bcc31b3cc031c6d61129"
+    },
+    "exit_code": 101,
+    "wall_seconds": 26.24,
+    "finished_at_utc": "2026-10-15T10:11:40.850710+00:00",
+    "source_after": {
+      "head": "d819d1758a341ee90fb7f6640865859295befef0",
+      "tree": "ddbf3de65d28a80321146d07462236d00248c710",
+      "status": " M packages/aethyme/rust/crates/aethyme-broker/src/analysis_view.rs",
+      "diff_sha256": "d3a8e2ffc30279f766c8aa8d75936e00c9ccacd40247bcc31b3cc031c6d61129"
+    },
+    "log": {
+      "path": "target/local-resume/final-integration-20261015T101114Z/mutation-reader-lifecycle-lock.log",
+      "bytes": 1693,
+      "sha256": "098d6d9f32d0714bf393e5d74e6b57744994517f288a4d3836b2dce8a71667ca"
+    },
+    "source_unchanged": true
+  },
+  "cargo_log_path": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/fix-analysis-view-hold-retire-and-public/target/local-resume/final-integration-20261015T101114Z/mutation-reader-lifecycle-lock.log",
+  "cargo_log_sha256": "098d6d9f32d0714bf393e5d74e6b57744994517f288a4d3836b2dce8a71667ca",
+  "named_test_line": "test analysis_view::tests::opening_a_view_pins_before_retirement_can_finish ... FAILED",
+  "log_has_compilation_error": false,
+  "log_has_test_binary": true,
+  "log_test_summary": "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1819 filtered out; finished in 0.41s",
+  "mutation_detected": true,
+  "source_file_sha256_restored": "894a7eabef74810a95cfbdf333389356599f16e9a69ce8af1583e0c151d0ea08",
+  "source_after_restore": {
+    "head": "d819d1758a341ee90fb7f6640865859295befef0",
+    "tree": "ddbf3de65d28a80321146d07462236d00248c710",
+    "status": "",
+    "diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  "restore_exact": true,
+  "finished_at_utc": "2026-10-15T10:11:40.958595+00:00",
+  "evidence_directory": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/fix-analysis-view-hold-retire-and-public/target/local-resume/final-integration-20261015T101114Z"
+}

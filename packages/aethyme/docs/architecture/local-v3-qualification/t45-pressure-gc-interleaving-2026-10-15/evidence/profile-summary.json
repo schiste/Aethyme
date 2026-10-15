@@ -1,0 +1,85 @@
+{
+  "profile_limitations": [
+    "No APFS capture or hydration OOM coverage.",
+    "No host or daemon-wide disk exhaustion claim.",
+    "No power-loss, arbitrary-backend, or universal resource-guarantee claim.",
+    "The Docker bounded-cgroup OOM witness is scoped to this pinned build fixture and daemon."
+  ],
+  "schema": "aethyme.t45-pressure-gc-interleaving-profile/v1",
+  "source_bound_profiles": [
+    {
+      "event_payloads": 97,
+      "exit_code": 0,
+      "profile": "owned-apfs-source-pressure/provisional-v0",
+      "recorder_command_json_sha256": "95af2f67db2f8c13b501d2133e663744f5f7f281fabd8b92b8c9840c86389ec2",
+      "recorder_log_sha256": "2c29ef5351c595911e72b30cdfa7971f5555ecc18baae2fa7082a5d1f1632d0e",
+      "recorder_payloads": 3,
+      "recorder_status_sha256": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa",
+      "resource_inventory_payloads": 1,
+      "result": "PASS",
+      "reviewed_assertions": {
+        "archive_shared_lock_gc_witnesses": true,
+        "capture_and_hydration_raw_enospc": true,
+        "capture_hydration_source_blob_mib": 32,
+        "journal_floor_mib": 16,
+        "named_orphan_reclamation": true,
+        "normal_reservation_floor_mib": 256,
+        "owned_apfs_image_mib": 512,
+        "retained_source_reconstruction": true
+      },
+      "run_ended_at_utc": "2026-10-15T14:51:36.878010Z",
+      "run_started_at_utc": "2026-10-15T14:49:23.211788Z",
+      "source_head": "4b5f3bc329d5f4108e3df62c67221a224c3c0710",
+      "source_tree": "8166dab40d2c419c67c5bae30c45dd4891c7e058",
+      "source_unchanged": true,
+      "staged_payloads": 101,
+      "test": "actual_native_t45_capture_and_hydration_enospc_interleave_with_gc",
+      "test_source_sha256": "95b70c34223d1ee2af2fd3f5211bd415fd307d0a89dcf4ed1aea492a7b31447d"
+    },
+    {
+      "concurrent_job_reservation_basis": {
+        "combined_mib": 1288,
+        "four_envelope_total_mib": 2576,
+        "maximum_simultaneous_jobs": 2,
+        "reservation_mib_each": 644
+      },
+      "daemon_cpus": 4,
+      "daemon_endpoint": "unix:///Volumes/T7-repositories/Colima/home/default/docker.sock",
+      "daemon_id": "9c943a04-41ca-4943-a8f5-c5734144b14b",
+      "daemon_mem_total_bytes": 4095193088,
+      "daemon_platform": "linux/aarch64",
+      "daemon_server_version": "29.5.2",
+      "exit_code": 0,
+      "pinned_image_id": "sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251",
+      "profile": "owned-docker-bounded-build-pressure",
+      "qualification_source_sha256": "b3d6d3f1207aebe82bcce4812fecf582948d64ca5d8fff1d83d07c76cf53090b",
+      "recorder_command_json_sha256": "b6f0f2107afa97a1a34d09e2897e7bda6e6113f7f4cb85df5b5cb6d095349f89",
+      "recorder_log_sha256": "248e8ca7a9cbbd6d76bdf4e50307e9324842ee619d19ce329f8bae825d155af8",
+      "recorder_status_sha256": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa",
+      "resource_policy_pool_ceiling_mib": 3072,
+      "result": "PASS",
+      "review_scope_limit": "One bounded Docker build run on the pinned daemon; no host/daemon-store exhaustion or Docker host OOM claim.",
+      "reviewed_assertions": {
+        "artifact_absent_for_both_pressure_cases": true,
+        "bounded_cgroup_oom_classification": "InfrastructureDeferred with OOM detail",
+        "bounded_tmpfs_enospc_exit": 28,
+        "container_cleanup_and_journal_reconciliation": true,
+        "retained_source_reconstructed_for_both_cases": true,
+        "same_store_gc_ex_lock_held_during_pressure_and_named_orphan_reclaimed": true,
+        "stable_build_remained_live": true
+      },
+      "run_ended_at_utc": "2026-10-15T15:50:30.767344Z",
+      "run_started_at_utc": "2026-10-15T15:47:57.548412Z",
+      "source_head": "bc0b03d08d63080da4fd86a5afba8a4449428623",
+      "source_tree": "70290c6ac210217c05d14ddfa0350e3a4e0a4e10",
+      "source_unchanged": true,
+      "superseded_pool_ceiling_mib": 4096,
+      "test": "actual_pressure_preserves_retained_source_and_bounded_native_cleanup",
+      "unchanged_build_limits": {
+        "cgroup_memory_mib": 64,
+        "output_limit_mib": 1,
+        "pids_limit": 32
+      }
+    }
+  ]
+}

@@ -1,0 +1,13 @@
+{
+  "schema": "aethyme.t45-docker-capacity/v1",
+  "captured_at_utc": "2026-10-15T15:44:10.561536+00:00",
+  "endpoint": "unix:///Volumes/T7-repositories/Colima/home/default/docker.sock",
+  "daemon_id": "9c943a04-41ca-4943-a8f5-c5734144b14b",
+  "mem_total_bytes": 4095193088,
+  "ncpus": 4,
+  "server_version": "29.5.2",
+  "platform": "linux/aarch64",
+  "exit_code": 0,
+  "stdout": "9c943a04-41ca-4943-a8f5-c5734144b14b 4095193088 4 29.5.2 linux/aarch64\n",
+  "stderr": ""
+}

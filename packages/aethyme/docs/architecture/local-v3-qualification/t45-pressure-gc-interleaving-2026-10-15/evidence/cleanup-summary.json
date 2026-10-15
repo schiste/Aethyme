@@ -1,0 +1,59 @@
+{
+  "corrected_docker_positive": {
+    "event_ownership_count": null,
+    "global_container_delta_claim": null,
+    "raw_global_event_bytes": 146458,
+    "raw_global_event_sha256": "ba747429b978cadfab42ba93b2f165d403ba2b979f62602d689b32cd57581e39",
+    "raw_postflight_bytes": 162400,
+    "raw_postflight_sha256": "0dd364403b9efabee88ebeb1d8d433216012d09e00f650fd8be3b48e42030542",
+    "raw_sources_omitted_from_public_bundle": true,
+    "reason": "Successful fixture cleanup removed the journals that supply the exact object-ID union. Without those IDs the mixed event stream cannot be attributed safely."
+  },
+  "interrupted_3072": {
+    "cleanup_mode": "manual reconciliation after exact recorder SIGINT",
+    "do_not_claim_normal_settled_receipt": true,
+    "first_lease_released": true,
+    "lease_released_through_broker_after_generation_reconciliation": true,
+    "owned_run_generations_removed": 2,
+    "postquery_active_owned_lease": false,
+    "raw_journals_database_wal_and_shm": "withheld; private grant-bearing state",
+    "second_journal_cleaned": true,
+    "second_journal_objects_removed": 7,
+    "second_journal_settled": false,
+    "source_receipt_sha256": "98f71dc2d08964e43c93cf8b11073ce47a66b5bbb483cee6ebe94fac4cd7791a"
+  },
+  "m4": {
+    "attempt_owned_values_found_in_postflight": 0,
+    "global_container_identity_delta": "two-container identity-set delta was observed but remains unattributed; no global ownership claim.",
+    "journals": 2,
+    "journals_cleaned_and_settled": true,
+    "objects_removed_per_journal": 7,
+    "private_host_state_empty": true,
+    "raw_corrected_classification_sidecar_sha256": "e872b71d0b68860e91d0217938fbc31c10a7baf37922326830fc90a197b9d449",
+    "raw_corrected_cleanup_receipt_sha256": "91f0ae70db57ad29161e96daa2b81b85e8ca7843a18e1c1f173c92bacf925fe9",
+    "readonly_command_exits_zero": true,
+    "recorder_scratch_files_removed": 51
+  },
+  "m5": {
+    "filter": "union of object IDs from both run journals; exact Actor.ID match; emitted only timestamp/timeNano/type/action prefix; IDs and attributes omitted.",
+    "filtered_event_counts": {
+      "container_rows_retained": 35,
+      "owned_rows_retained": 59,
+      "raw_rows": 256,
+      "unowned_or_unparseable_rows_excluded": 197,
+      "volume_rows_retained": 24
+    },
+    "global_container_identity_change": "unattributed; no claim about unrelated global container state.",
+    "journals": 2,
+    "journals_cleaned_and_settled": true,
+    "objects_removed_per_journal": 7,
+    "private_host_state_empty": true,
+    "raw_cleanup_receipt_sha256": "363741e9d1e11f88a37f9b6fb5beed60dd0ba332789f9091d021c3c296742343",
+    "raw_filtered_event_summary_sha256": "eac80fffb4e9c38f3603ea524f065ce85a98d04699d8d56ffe5ae2ccf6a1dbb8",
+    "recorder_scratch_bytes_removed": 1256486,
+    "recorder_scratch_directories_removed": 58,
+    "recorder_scratch_files_removed": 51,
+    "run_owned_container_objects_absent": 8
+  },
+  "schema": "aethyme.t45-cleanup-summary/v1"
+}

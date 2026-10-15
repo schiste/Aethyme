@@ -1,0 +1,35 @@
+{
+  "note": "Only persisted records are represented. Do not infer totals or statuses for attempts without recorded metadata.",
+  "records": [
+    {
+      "id": "corrected-docker-pin-mismatch",
+      "pins_match": false,
+      "raw_preflight_bytes": 4393,
+      "raw_preflight_sha256": "dffd959a6ea5b9f6f4cd3d799e24d19c8384dcd55326d8dafdd315fd3dcbc891",
+      "readonly_checks_all_exit_zero": true,
+      "test_dispatched": false
+    },
+    {
+      "claim": "No numeric status is available.",
+      "id": "corrected-docker-retry-folder",
+      "retained_file_count": 0,
+      "status_or_dispatch_record": false
+    },
+    {
+      "completed_recorder_metadata": false,
+      "id": "m4-setup-or-interruption-record",
+      "raw_attempt_json_sha256": "61fcb3b5465d219fa056ead1471fae17b392728fa519376a8ea70c834d035b45",
+      "source_restored_exactly": true,
+      "state": "restored_after_interruption_or_setup_error"
+    },
+    {
+      "cargo_spawned": false,
+      "exit_code": 1,
+      "id": "ratchet-launch-preflight-failure",
+      "raw_attempt_json_sha256": "a83f81aee8bf4ba2d83d972bc4743db70384e669099bc568095ba0bea7c5aa14",
+      "recorder_metadata_created": false,
+      "state": "preflight_failed_before_cargo_spawn"
+    }
+  ],
+  "schema": "aethyme.t45-pre-dispatch-records/v1"
+}

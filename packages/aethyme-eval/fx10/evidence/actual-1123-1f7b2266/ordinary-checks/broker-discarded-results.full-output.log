@@ -1,0 +1,10 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.39s
+     Running tests/broker_discarded_results.rs (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/integrate-reviewed-local-bare-git-servic/target/local-resume/cargo/debug/deps/broker_discarded_results-442fcffc8b5f3902)
+
+running 3 tests
+test test_items_are_not_counted ... ok
+test out_of_line_test_modules_are_not_counted_and_plain_modules_are ... ok
+test broker_production_code_does_not_discard_more_results ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.24s
+

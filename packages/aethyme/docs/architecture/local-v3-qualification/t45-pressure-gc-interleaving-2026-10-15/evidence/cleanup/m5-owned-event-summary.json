@@ -1,0 +1,365 @@
+{
+  "events": [
+    {
+      "action": "attach",
+      "time": 1792080816,
+      "time_nano": 1792080816388465649,
+      "type": "container"
+    },
+    {
+      "action": "mount",
+      "time": 1792080816,
+      "time_nano": 1792080816393261438,
+      "type": "volume"
+    },
+    {
+      "action": "start",
+      "time": 1792080816,
+      "time_nano": 1792080816432996948,
+      "type": "container"
+    },
+    {
+      "action": "unmount",
+      "time": 1792080816,
+      "time_nano": 1792080816448185266,
+      "type": "volume"
+    },
+    {
+      "action": "die",
+      "time": 1792080816,
+      "time_nano": 1792080816451993815,
+      "type": "container"
+    },
+    {
+      "action": "destroy",
+      "time": 1792080816,
+      "time_nano": 1792080816527369246,
+      "type": "container"
+    },
+    {
+      "action": "destroy",
+      "time": 1792080816,
+      "time_nano": 1792080816592483314,
+      "type": "volume"
+    },
+    {
+      "action": "create",
+      "time": 1792080816,
+      "time_nano": 1792080816633338605,
+      "type": "volume"
+    },
+    {
+      "action": "create",
+      "time": 1792080816,
+      "time_nano": 1792080816699554120,
+      "type": "container"
+    },
+    {
+      "action": "mount",
+      "time": 1792080816,
+      "time_nano": 1792080816724138269,
+      "type": "volume"
+    },
+    {
+      "action": "unmount",
+      "time": 1792080816,
+      "time_nano": 1792080816724443933,
+      "type": "volume"
+    },
+    {
+      "action": "mount",
+      "time": 1792080816,
+      "time_nano": 1792080816725489590,
+      "type": "volume"
+    },
+    {
+      "action": "extract-to-dir",
+      "time": 1792080816,
+      "time_nano": 1792080816725809254,
+      "type": "container"
+    },
+    {
+      "action": "unmount",
+      "time": 1792080816,
+      "time_nano": 1792080816725837629,
+      "type": "volume"
+    },
+    {
+      "action": "mount",
+      "time": 1792080816,
+      "time_nano": 1792080816745846403,
+      "type": "volume"
+    },
+    {
+      "action": "archive-path",
+      "time": 1792080816,
+      "time_nano": 1792080816746184108,
+      "type": "container"
+    },
+    {
+      "action": "unmount",
+      "time": 1792080816,
+      "time_nano": 1792080816746571021,
+      "type": "volume"
+    },
+    {
+      "action": "destroy",
+      "time": 1792080816,
+      "time_nano": 1792080816842835469,
+      "type": "container"
+    },
+    {
+      "action": "create",
+      "time": 1792080816,
+      "time_nano": 1792080816874099223,
+      "type": "volume"
+    },
+    {
+      "action": "create",
+      "time": 1792080816,
+      "time_nano": 1792080816936188110,
+      "type": "container"
+    },
+    {
+      "action": "mount",
+      "time": 1792080816,
+      "time_nano": 1792080816986257608,
+      "type": "volume"
+    },
+    {
+      "action": "start",
+      "time": 1792080817,
+      "time_nano": 1792080817025121376,
+      "type": "container"
+    },
+    {
+      "action": "create",
+      "time": 1792080817,
+      "time_nano": 1792080817091047313,
+      "type": "container"
+    },
+    {
+      "action": "mount",
+      "time": 1792080817,
+      "time_nano": 1792080817144774028,
+      "type": "volume"
+    },
+    {
+      "action": "mount",
+      "time": 1792080817,
+      "time_nano": 1792080817144815236,
+      "type": "volume"
+    },
+    {
+      "action": "start",
+      "time": 1792080817,
+      "time_nano": 1792080817199494860,
+      "type": "container"
+    },
+    {
+      "action": "exec_create",
+      "time": 1792080817,
+      "time_nano": 1792080817228578885,
+      "type": "container"
+    },
+    {
+      "action": "exec_start",
+      "time": 1792080817,
+      "time_nano": 1792080817229688124,
+      "type": "container"
+    },
+    {
+      "action": "exec_die",
+      "time": 1792080817,
+      "time_nano": 1792080817257265871,
+      "type": "container"
+    },
+    {
+      "action": "exec_create",
+      "time": 1792080817,
+      "time_nano": 1792080817303822528,
+      "type": "container"
+    },
+    {
+      "action": "exec_start",
+      "time": 1792080817,
+      "time_nano": 1792080817304877435,
+      "type": "container"
+    },
+    {
+      "action": "exec_die",
+      "time": 1792080817,
+      "time_nano": 1792080817328113638,
+      "type": "container"
+    },
+    {
+      "action": "exec_create",
+      "time": 1792080817,
+      "time_nano": 1792080817351892837,
+      "type": "container"
+    },
+    {
+      "action": "exec_start",
+      "time": 1792080817,
+      "time_nano": 1792080817353191158,
+      "type": "container"
+    },
+    {
+      "action": "exec_die",
+      "time": 1792080817,
+      "time_nano": 1792080817377512268,
+      "type": "container"
+    },
+    {
+      "action": "exec_create",
+      "time": 1792080817,
+      "time_nano": 1792080817414727010,
+      "type": "container"
+    },
+    {
+      "action": "exec_start",
+      "time": 1792080817,
+      "time_nano": 1792080817415665043,
+      "type": "container"
+    },
+    {
+      "action": "exec_die",
+      "time": 1792080817,
+      "time_nano": 1792080817436736058,
+      "type": "container"
+    },
+    {
+      "action": "unmount",
+      "time": 1792080817,
+      "time_nano": 1792080817488810622,
+      "type": "volume"
+    },
+    {
+      "action": "unmount",
+      "time": 1792080817,
+      "time_nano": 1792080817488823831,
+      "type": "volume"
+    },
+    {
+      "action": "die",
+      "time": 1792080817,
+      "time_nano": 1792080817495605935,
+      "type": "container"
+    },
+    {
+      "action": "destroy",
+      "time": 1792080817,
+      "time_nano": 1792080817645061939,
+      "type": "container"
+    },
+    {
+      "action": "kill",
+      "time": 1792080817,
+      "time_nano": 1792080817733242089,
+      "type": "container"
+    },
+    {
+      "action": "unmount",
+      "time": 1792080817,
+      "time_nano": 1792080817766434659,
+      "type": "volume"
+    },
+    {
+      "action": "die",
+      "time": 1792080817,
+      "time_nano": 1792080817772110649,
+      "type": "container"
+    },
+    {
+      "action": "destroy",
+      "time": 1792080817,
+      "time_nano": 1792080817783567877,
+      "type": "container"
+    },
+    {
+      "action": "destroy",
+      "time": 1792080817,
+      "time_nano": 1792080817894041405,
+      "type": "volume"
+    },
+    {
+      "action": "destroy",
+      "time": 1792080817,
+      "time_nano": 1792080817968670262,
+      "type": "volume"
+    },
+    {
+      "action": "kill",
+      "time": 1792080892,
+      "time_nano": 1792080892517631868,
+      "type": "container"
+    },
+    {
+      "action": "unmount",
+      "time": 1792080892,
+      "time_nano": 1792080892562927662,
+      "type": "volume"
+    },
+    {
+      "action": "unmount",
+      "time": 1792080892,
+      "time_nano": 1792080892562935037,
+      "type": "volume"
+    },
+    {
+      "action": "die",
+      "time": 1792080892,
+      "time_nano": 1792080892567703544,
+      "type": "container"
+    },
+    {
+      "action": "destroy",
+      "time": 1792080892,
+      "time_nano": 1792080892585146291,
+      "type": "container"
+    },
+    {
+      "action": "kill",
+      "time": 1792080892,
+      "time_nano": 1792080892684517565,
+      "type": "container"
+    },
+    {
+      "action": "unmount",
+      "time": 1792080892,
+      "time_nano": 1792080892705437537,
+      "type": "volume"
+    },
+    {
+      "action": "die",
+      "time": 1792080892,
+      "time_nano": 1792080892709225509,
+      "type": "container"
+    },
+    {
+      "action": "destroy",
+      "time": 1792080892,
+      "time_nano": 1792080892716791996,
+      "type": "container"
+    },
+    {
+      "action": "destroy",
+      "time": 1792080892,
+      "time_nano": 1792080892904669414,
+      "type": "volume"
+    },
+    {
+      "action": "destroy",
+      "time": 1792080893,
+      "time_nano": 1792080893068540676,
+      "type": "volume"
+    }
+  ],
+  "excluded_unowned_or_unparseable_rows": 197,
+  "filter_recipe": "Keep Docker event rows only when Actor.ID exactly matches an ID in the preserved run journals; emit time, timeNano, Type, and Action prefix before colon; omit actor IDs and attributes.",
+  "raw_event_rows": 256,
+  "raw_events_bytes": 229122,
+  "raw_events_sha256": "113cec9d205f1506e811053b9d6484fca5887f0fbcec545000267206d08313f2",
+  "retained_owned_rows": 59,
+  "schema": 1
+}

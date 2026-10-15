@@ -1,0 +1,46 @@
+{
+  "schema": "aethyme.local-check/v1",
+  "state": "complete",
+  "started_at_utc": "2026-10-15T10:10:30.060623+00:00",
+  "command": [
+    "/usr/bin/caffeinate",
+    "-i",
+    "/Users/christophehenner/.cargo/bin/cargo",
+    "test",
+    "--locked",
+    "-j4",
+    "-p",
+    "aethyme-broker",
+    "--lib",
+    "analysis_view::tests::hold_and_retire_wait_for_the_same_lifecycle_lock",
+    "--",
+    "--nocapture"
+  ],
+  "working_directory": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/fix-analysis-view-hold-retire-and-public/packages/aethyme/rust",
+  "environment": {
+    "PATH": "/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/christophehenner/.cargo/bin",
+    "RUSTC_WRAPPER": "",
+    "CARGO_TARGET_DIR": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/integrate-reviewed-local-bare-git-servic/target/local-resume/cargo"
+  },
+  "source_before": {
+    "head": "d819d1758a341ee90fb7f6640865859295befef0",
+    "tree": "ddbf3de65d28a80321146d07462236d00248c710",
+    "status": " M packages/aethyme/rust/crates/aethyme-broker/src/analysis_view.rs",
+    "diff_sha256": "7d44b0683bfcdfc2073d28ce633e5a3b0c280dcabc3478725d32e2514e365242"
+  },
+  "exit_code": 101,
+  "wall_seconds": 32.155,
+  "finished_at_utc": "2026-10-15T10:11:02.261568+00:00",
+  "source_after": {
+    "head": "d819d1758a341ee90fb7f6640865859295befef0",
+    "tree": "ddbf3de65d28a80321146d07462236d00248c710",
+    "status": " M packages/aethyme/rust/crates/aethyme-broker/src/analysis_view.rs",
+    "diff_sha256": "7d44b0683bfcdfc2073d28ce633e5a3b0c280dcabc3478725d32e2514e365242"
+  },
+  "log": {
+    "path": "target/local-resume/final-integration-20261015T101030Z/mutation-hold-retire-lock.log",
+    "bytes": 1628,
+    "sha256": "3dea93ba46a2d28c702b832d1de2de5660a68376a162f33608e6b43f4ecc24b0"
+  },
+  "source_unchanged": true
+}

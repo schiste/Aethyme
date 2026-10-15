@@ -49,7 +49,7 @@ use sha2::{Digest, Sha256};
 
 use crate::collaboration_archive::{
     ArchiveError, CommitOid, ObjectDigest, RetainedContribution, git as archive_git, has_object,
-    put_object, refuse_partial_clone, retain_contribution_with,
+    put_object, refuse_partial_clone,
 };
 use crate::collaboration_state::{CollaborationStateError, CollaborationStore};
 use crate::file_lock::{ExclusiveFileLock, open_lock_file};
@@ -344,10 +344,21 @@ pub enum FaultPoint {
 }
 
 /// Test seams. Production passes the default.
+#[cfg(test)]
+pub(crate) type BeforeCopyWriteCallback = Box<dyn Fn(&CommitOid, u64) + Send + Sync>;
+#[cfg(test)]
+pub(crate) type CopyErrorCallback = Box<dyn Fn(&ArchiveError) + Send + Sync>;
+
 #[derive(Default)]
 pub(crate) struct Hooks {
     #[cfg(test)]
     pub fault: Option<FaultPoint>,
+    /// Pause immediately before copying a blob of a chosen retained commit.
+    #[cfg(test)]
+    pub before_copy_write: Option<BeforeCopyWriteCallback>,
+    /// Observe and optionally pause after a real archive copy I/O error.
+    #[cfg(test)]
+    pub on_copy_error: Option<CopyErrorCallback>,
     /// Free bytes to report instead of asking the filesystem.
     pub free_bytes: Option<u64>,
 }
@@ -1147,7 +1158,30 @@ fn capture_locked(
     };
     #[cfg(not(test))]
     let mut before_blob = |_: usize| -> Result<(), ArchiveError> { Ok(()) };
-    let retained = retain_contribution_with(
+    #[cfg(test)]
+    let retained = {
+        let mut before_copy_write = |commit: &CommitOid, size: u64| {
+            if let Some(observer) = &hooks.before_copy_write {
+                observer(commit, size);
+            }
+        };
+        let mut on_copy_error = |error: &ArchiveError| {
+            if let Some(observer) = &hooks.on_copy_error {
+                observer(error);
+            }
+        };
+        crate::collaboration_archive::retain_contribution_observed(
+            store,
+            &request.repository,
+            &request.base,
+            &request.result,
+            &mut before_blob,
+            &mut before_copy_write,
+            &mut on_copy_error,
+        )
+    };
+    #[cfg(not(test))]
+    let retained = crate::collaboration_archive::retain_contribution_with(
         store,
         &request.repository,
         &request.base,
@@ -1477,7 +1511,7 @@ mod tests {
     fn faulted(fault: FaultPoint) -> Hooks {
         Hooks {
             fault: Some(fault),
-            free_bytes: None,
+            ..Hooks::default()
         }
     }
 

@@ -20,8 +20,9 @@ bounded results. The appointed controller completed the actual two-wave profile
 and a separate twenty-change controlled evolution run with nonempty native gates.
 All six once-final FX17 model rows failed at the provider's response-schema
 boundary, before producing candidates; none supplies behavioral evidence.
-Sustained-arrival service and final integration checks remain in progress. These
-finite observations do not establish reliable autonomous operation. All results
+A separate bounded sustained-arrival trial passed after one retained harness
+failure. Final integration checks and native-job retention cleanup remain in
+progress. These finite observations do not establish reliable autonomous operation. All results
 below name their source and profile; earlier operator profiles retain their
 original limits.
 
@@ -33,7 +34,7 @@ original limits.
 | Retained source, capture, roots and GC | #714–#719 | Capture/crash/cleanup schedules; bounded native workload and APFS retained-source pressure below; host/daemon and mid-journal exhaustion remain unqualified |
 | Bounded context and fresh analysis views | #718/#730/#731/#756 | Scoped invalidation schedules and [once-final FX08 campaign](local-v3-fx08-qualification.md): all 56 outcomes retained; reliable brief usefulness was not established |
 | Composition and bounded resolution | #733–#736/#755 | Historical provisional text profile plus [bounded external HTML structural profile](local-v3-e1-profile.md); semantic repair/consumer/subtraction evidence; original held-outs are not rerun; [reachable request guards](local-v3-qualification/resolution-guards-2026-10-12.json) |
-| Targets, finite waves, budgets and native epoch | #737–#740/#759/#763 | Transition, arrival, reservation, stop and stale-authority schedules; [actual appointed service and twenty-change evolution](local-v3-autonomous-controller.md); sustained-arrival qualification in progress; no general reliability claim |
+| Targets, finite waves, budgets and native epoch | #737–#740/#759/#763 | Transition, arrival, reservation, stop and stale-authority schedules; [actual appointed service and twenty-change evolution](local-v3-autonomous-controller.md); [bounded sustained-arrival trial](../../../aethyme-eval/fx10/evidence/actual-1123-1f7b2266/README.md) passed after one retained harness failure; no general reliability claim |
 | Exact execution, supervisor, verifier and resources | #741–#744/#758 | Independent negative profiles and artifact checks; actual bounded tmpfs ENOSPC and cgroup OOM below; [typed native candidate/gate join](local-v3-native-gates.md) implemented on the Local branch |
 | Source publication and acceptance | #745/#746 | Real private generic Git and native appointed observations; live GitHub/Mergify binding pending |
 | Generation, exchange and controlled handoff | #747–#749 | Real child/open-file schedules; [handoff regression ledger](local-v3-qualification/handoff-restored-2026-10-11.json); real controlled native joined path below |
@@ -209,8 +210,24 @@ record six passing model-free controls and three intended named mutation failure
 The [receiver-timeout ledger](local-v3-qualification/unknown-publication-2026-10-15/ledger.json)
 separately records a passing actual control at `b16af023`: the remote ref moved,
 the managed write stayed unknown, replay was refused and no private completion
-was issued. This is one ambiguous-publication schedule. Sustained-arrival load
-and integrated final checks remain explicit qualification work.
+was issued. This is one ambiguous-publication schedule.
+
+The [bounded FX10 evidence](../../../aethyme-eval/fx10/evidence/actual-1123-1f7b2266/README.md)
+retains both combined trial attempts: the first failed its drift-phase harness
+handshake before any controlled ref advance; the corrected trial passed at
+`1f7b2266`. Its positive schedule completed two waves with all six obligations.
+Three later arrivals persisted while the oldest wave was verifying, with no
+completion or cancellation of that wave. The admitted host child overlapped
+those arrivals in its release-controlled heartbeat wait loop; integrity checks
+ran after release. This proves process liveness during arrivals, without a
+claim that check computation overlapped them.
+
+A separate same-tree fast-forward occurred during the live child. Stale
+verification passed 11,075 ms later, but the single publication attempt failed
+safely and the service held with zero private completions or replay, preserving
+the competing remote tip. This qualifies one finite arrival/contention/drift
+profile. It does not establish repeated-drift or sustained-load reliability.
+Final integrated checks and explicit native-job retention cleanup remain open.
 
 The operator must designate the disposable GitHub/Mergify repository, branch
 and policy before live-provider trials. Actual private GenericGit acceptance

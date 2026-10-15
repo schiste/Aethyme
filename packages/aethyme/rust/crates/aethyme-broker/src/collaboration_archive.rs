@@ -1224,6 +1224,26 @@ pub(crate) fn retain_snapshot_with(
     commit: &CommitOid,
     before_blob: &mut dyn FnMut(usize) -> Result<(), ArchiveError>,
 ) -> Result<RetainedSnapshot, ArchiveError> {
+    let mut before_copy_write = |_: &CommitOid, _: u64| {};
+    let mut on_copy_error = |_: &ArchiveError| {};
+    retain_snapshot_inner(
+        store,
+        repo,
+        commit,
+        before_blob,
+        &mut before_copy_write,
+        &mut on_copy_error,
+    )
+}
+
+fn retain_snapshot_inner(
+    store: &mut CollaborationStore,
+    repo: &Path,
+    commit: &CommitOid,
+    before_blob: &mut dyn FnMut(usize) -> Result<(), ArchiveError>,
+    before_copy_write: &mut dyn FnMut(&CommitOid, u64),
+    on_copy_error: &mut dyn FnMut(&ArchiveError),
+) -> Result<RetainedSnapshot, ArchiveError> {
     refuse_partial_clone(repo)?;
     let mut reader = ObjectReader::open(repo)?;
     let format = reader.format;
@@ -1248,12 +1268,20 @@ pub(crate) fn retain_snapshot_with(
             });
         }
         let mut temporary = new_temporary(store)?;
-        let content = reader.copy_body(&entry.oid, &kind, size, temporary.as_file_mut())?;
+        before_copy_write(commit, size);
+        let content = match reader.copy_body(&entry.oid, &kind, size, temporary.as_file_mut()) {
+            Ok(content) => content,
+            Err(error) => {
+                on_copy_error(&error);
+                return Err(error);
+            }
+        };
         let path = temporary.path().to_path_buf();
-        temporary
-            .as_file()
-            .sync_all()
-            .map_err(|source| io(&path, source))?;
+        if let Err(source) = temporary.as_file().sync_all() {
+            let error = io(&path, source);
+            on_copy_error(&error);
+            return Err(error);
+        }
         publish(store, temporary, ObjectDigest(content))?;
         content_bytes += size;
         entries.push(SourceEntry::from_content_digest(
@@ -1390,6 +1418,49 @@ pub(crate) fn retain_contribution_with(
     result: &CommitOid,
     before_blob: &mut dyn FnMut(usize) -> Result<(), ArchiveError>,
 ) -> Result<RetainedContribution, ArchiveError> {
+    let mut before_copy_write = |_: &CommitOid, _: u64| {};
+    let mut on_copy_error = |_: &ArchiveError| {};
+    retain_contribution_inner(
+        store,
+        repo,
+        base,
+        result,
+        before_blob,
+        &mut before_copy_write,
+        &mut on_copy_error,
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn retain_contribution_observed(
+    store: &mut CollaborationStore,
+    repo: &Path,
+    base: &CommitOid,
+    result: &CommitOid,
+    before_blob: &mut dyn FnMut(usize) -> Result<(), ArchiveError>,
+    before_copy_write: &mut dyn FnMut(&CommitOid, u64),
+    on_copy_error: &mut dyn FnMut(&ArchiveError),
+) -> Result<RetainedContribution, ArchiveError> {
+    retain_contribution_inner(
+        store,
+        repo,
+        base,
+        result,
+        before_blob,
+        before_copy_write,
+        on_copy_error,
+    )
+}
+
+fn retain_contribution_inner(
+    store: &mut CollaborationStore,
+    repo: &Path,
+    base: &CommitOid,
+    result: &CommitOid,
+    before_blob: &mut dyn FnMut(usize) -> Result<(), ArchiveError>,
+    before_copy_write: &mut dyn FnMut(&CommitOid, u64),
+    on_copy_error: &mut dyn FnMut(&ArchiveError),
+) -> Result<RetainedContribution, ArchiveError> {
     let unavailable = |detail: String| ArchiveError::HistoryUnavailable {
         base: base.as_str().to_string(),
         result: result.as_str().to_string(),
@@ -1443,8 +1514,22 @@ pub(crate) fn retain_contribution_with(
         .parse()
         .map_err(|_| unavailable("unreadable commit count".into()))?;
 
-    let base_snapshot = retain_snapshot_with(store, repo, base, before_blob)?;
-    let result_snapshot = retain_snapshot_with(store, repo, result, before_blob)?;
+    let base_snapshot = retain_snapshot_inner(
+        store,
+        repo,
+        base,
+        before_blob,
+        before_copy_write,
+        on_copy_error,
+    )?;
+    let result_snapshot = retain_snapshot_inner(
+        store,
+        repo,
+        result,
+        before_blob,
+        before_copy_write,
+        on_copy_error,
+    )?;
     let format = ObjectReader::open(repo)?.format;
     let (bytes, lineage_record_id) = encode(
         object(vec![
