@@ -1,0 +1,36 @@
+F                                                                        [100%]
+=================================== FAILURES ===================================
+_ test_response_parser_accepts_exact_candidate_or_refusal_and_rejects_invalid __
+
+    def test_response_parser_accepts_exact_candidate_or_refusal_and_rejects_invalid() -> None:
+        candidate = b"#!/bin/sh\nprintf 'ok\\n'\n"
+        parsed = fx17.parse_model_response(
+            json.dumps({"app_sh": candidate.decode(), "refusal": None}).encode())
+        assert parsed == {
+            "status": "response_received",
+            "candidate": candidate,
+            "candidate_sha256": fx17.digest(candidate),
+            "candidate_utf8_bytes": len(candidate),
+        }
+        assert fx17.parse_model_response(
+            b'{"app_sh":null,"refusal":"cannot comply"}') == {
+                "status": "refusal", "refusal": "cannot comply"}
+    
+        for raw in (
+            b"not json",
+            b'{"app_sh":null,"refusal":null}',
+            b'{"app_sh":"script","refusal":"reason"}',
+            b'{"app_sh":"script","refusal":null,"extra":0}',
+            b'{"app_sh":"bad\\u0000script","refusal":null}',
+            b'{"app_sh":"\\ud800","refusal":null}',
+        ):
+>           assert fx17.parse_model_response(raw)["status"] == "invalid_response"
+E           AssertionError: assert 'response_received' == 'invalid_response'
+E             
+E             - invalid_response
+E             + response_received
+
+tests/test_fx17_model_protocol.py:60: AssertionError
+=========================== short test summary info ============================
+FAILED tests/test_fx17_model_protocol.py::test_response_parser_accepts_exact_candidate_or_refusal_and_rejects_invalid
+1 failed in 0.06s

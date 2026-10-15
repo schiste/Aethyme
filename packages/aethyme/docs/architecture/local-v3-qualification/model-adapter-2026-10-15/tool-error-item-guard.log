@@ -1,0 +1,24 @@
+F                                                                        [100%]
+=================================== FAILURES ===================================
+_______ test_event_classifier_ignores_error_and_counts_unique_tool_items _______
+
+    def test_event_classifier_ignores_error_and_counts_unique_tool_items() -> None:
+        events = [
+            {"type": "item.completed", "item": {"id": "err", "type": "error"}},
+            {"type": "item.completed", "item": {"id": "msg", "type": "agent_message"}},
+            {"type": "item.started", "item": {"id": "cmd-1", "type": "command_execution"}},
+            {"type": "item.completed", "item": {"id": "cmd-1", "type": "command_execution"}},
+            {"type": "item.completed", "item": {"id": "mcp-1", "type": "mcp_tool_call"}},
+        ]
+        calls = fx17.observed_tool_call_ids(events)
+>       assert calls == {("command_execution", "cmd-1"), ("mcp_tool_call", "mcp-1")}
+E       AssertionError: assert {('command_ex...ll', 'mcp-1')} == {('command_ex...ll', 'mcp-1')}
+E         
+E         Extra items in the left set:
+E         ('error', 'err')
+E         Use -v to get more diff
+
+tests/test_fx17_model_protocol.py:83: AssertionError
+=========================== short test summary info ============================
+FAILED tests/test_fx17_model_protocol.py::test_event_classifier_ignores_error_and_counts_unique_tool_items
+1 failed in 0.04s
