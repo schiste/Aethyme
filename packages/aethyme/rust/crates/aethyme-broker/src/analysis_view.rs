@@ -1215,7 +1215,7 @@ pub fn release_view_hold(
     holder: &str,
 ) -> Result<bool, ViewError> {
     let _archive = archive_use(store)?;
-    let _response = crate::collaboration_sensitive::response_use(store)?;
+    let _response = crate::collaboration_sensitive::response_use_for_view_hold_release(store)?;
     let view_dir = views_root(store).join(view);
     if std::fs::symlink_metadata(&view_dir)
         .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
@@ -1760,6 +1760,38 @@ mod tests {
             (!items.is_empty()).then_some(items)
         });
         assert_eq!(items.len(), 1, "{items:?}");
+    }
+
+    #[test]
+    fn a_quarantined_project_allows_only_metadata_hold_release() {
+        let host = tempfile::tempdir().unwrap();
+        let repo = fixture();
+        let mut store = store(host.path());
+        let snapshot = retain(&mut store, repo.path());
+        let view = build_view(&store, &snapshot, &options()).unwrap();
+        hold_view(&store, &view, "operator", None).unwrap();
+
+        let owner =
+            crate::local_target::acquire_controller(&mut store, "target", "appointed").unwrap();
+        let frozen = crate::local_authority::freeze(
+            &mut store,
+            owner.authority_epoch(),
+            "sensitive response",
+        )
+        .unwrap();
+        let incident = format!("sha256:{}", "b".repeat(64));
+        crate::collaboration_sensitive::quarantine(
+            &mut store,
+            &incident,
+            "local-operator",
+            frozen.epoch.as_str(),
+            crate::collaboration_sensitive::ReasonCode::SuspectedTestSecretExposure,
+        )
+        .unwrap();
+
+        assert!(open_view(&store, &view).is_err());
+        assert!(release_view_hold(&store, &view, "operator").unwrap());
+        assert!(open_view(&store, &view).is_err());
     }
 
     #[test]

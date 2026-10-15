@@ -17,6 +17,72 @@ fn a_frozen_witness_blocks_even_matching_database_and_handle_epochs() {
 }
 
 #[test]
+fn completed_freeze_rebinds_the_frozen_epoch_and_allows_sensitive_quarantine() {
+    let (mut f, owner, _w, _a) = setup();
+    let frozen = freeze(&mut f.store, owner.authority_epoch(), "sensitive response").unwrap();
+    assert_eq!(
+        bound(f.store.read_connection()).unwrap(),
+        Some(frozen.epoch.clone())
+    );
+    assert!(frozen_guard(&f.store, &frozen.epoch).is_ok());
+
+    let incident = format!("sha256:{}", "a".repeat(64));
+    let status = crate::collaboration_sensitive::quarantine(
+        &mut f.store,
+        &incident,
+        "local-operator",
+        frozen.epoch.as_str(),
+        crate::collaboration_sensitive::ReasonCode::SuspectedTestSecretExposure,
+    )
+    .unwrap();
+    assert_eq!(status.state, "quarantined");
+    assert_eq!(status.incident_id, incident);
+    let retry = crate::collaboration_sensitive::quarantine(
+        &mut f.store,
+        &incident,
+        "local-operator",
+        frozen.epoch.as_str(),
+        crate::collaboration_sensitive::ReasonCode::SuspectedTestSecretExposure,
+    )
+    .unwrap();
+    assert_eq!(retry.request_digest, status.request_digest);
+}
+
+#[test]
+fn interrupted_freeze_requires_explicit_completion_before_sensitive_response() {
+    let (mut f, owner, _w, _a) = setup();
+    let prior = owner.authority_epoch().clone();
+    let epoch = fresh_epoch().unwrap();
+    let witness_path = directory(&f.store).unwrap();
+    write(
+        &witness_path,
+        &Witness {
+            version: 1,
+            epoch: epoch.clone(),
+            status: Status::Frozen,
+            checkpoint: None,
+            reason: Some("interrupted freeze".into()),
+        },
+    )
+    .unwrap();
+
+    assert_eq!(bound(f.store.read_connection()).unwrap(), Some(prior));
+    assert!(matches!(
+        frozen_guard(&f.store, &epoch),
+        Err(AuthorityError::Stale)
+    ));
+    let completed = complete_interrupted_freeze(&mut f.store, &epoch).unwrap();
+    assert_eq!(completed.epoch, epoch);
+    assert!(completed.checkpoint.is_some());
+    assert_eq!(
+        bound(f.store.read_connection()).unwrap(),
+        Some(epoch.clone())
+    );
+    assert!(frozen_guard(&f.store, &epoch).is_ok());
+    assert!(complete_interrupted_freeze(&mut f.store, &epoch).is_err());
+}
+
+#[test]
 fn restored_matching_handle_and_database_cannot_bypass_the_current_witness() {
     let (mut f, owner, _w, _a) = setup();
     let frozen = freeze(&mut f.store, owner.authority_epoch(), "revoke").unwrap();
