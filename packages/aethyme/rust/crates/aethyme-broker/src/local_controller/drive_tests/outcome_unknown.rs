@@ -340,7 +340,7 @@ fn actual_unknown_publication_after_receiver_ref_update_never_completes() {
     std::fs::write(
         &hook,
         format!(
-            "#!/bin/sh\nset -eu\n/usr/bin/cat > {}\nhook_pid=$$\n/bin/sleep 5 &\ndelay_pid=$!\nprintf '%s %s %s\\n' \"$hook_pid\" \"$delay_pid\" {} > {}\nwait \"$delay_pid\"\nprintf '%s %s %s\\n' \"$hook_pid\" \"$delay_pid\" {} > {}\n",
+            "#!/bin/sh\nset -eu\n/bin/cat > {}\nhook_pid=$$\n/bin/sleep 5 &\ndelay_pid=$!\nprintf '%s %s %s\\n' \"$hook_pid\" \"$delay_pid\" {} > {}\nwait \"$delay_pid\"\nprintf '%s %s %s\\n' \"$hook_pid\" \"$delay_pid\" {} > {}\n",
             shell_quote(&hook_record),
             shell_quote_text(&hook_marker),
             shell_quote(&hook_started),

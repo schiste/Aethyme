@@ -778,7 +778,7 @@ fn run_fx17(
         json!({"at":"runtime-preflight","result":"pinned Docker runtime, private resources, verifier and safe native gate appointed"}),
     )?;
 
-    for ordinal in 1..=20 {
+    for (ordinal, controlled_state) in CONTROLLED_STATES.iter().enumerate().skip(1) {
         let id = format!("C{ordinal:02}");
         let stage_started = Instant::now();
         let stage_index = report["stages"]
@@ -791,7 +791,7 @@ fn run_fx17(
             "status": "preparing",
             "baseline_commit": previous_accepted_commit,
             "baseline_source": previous_source,
-            "declared_source_sha256": sha256(CONTROLLED_STATES[ordinal].as_bytes()),
+            "declared_source_sha256": sha256(controlled_state.as_bytes()),
             "expected_baseline_vectors": 65,
         });
         report["stages"]
@@ -1046,7 +1046,7 @@ fn run_fx17(
             ));
         }
         if read_commit_file(repo, &completion.accepted_commit, "app.sh")?
-            != CONTROLLED_STATES[ordinal].as_bytes()
+            != controlled_state.as_bytes()
         {
             return Err(format!(
                 "{id} accepted source is not the frozen controlled state"
