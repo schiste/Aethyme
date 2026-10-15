@@ -1,0 +1,226 @@
+{
+  "schema": "aethyme.local-native-job-lifecycle/v1",
+  "recorded_at": "2026-10-15",
+  "scope": "Explicit release of prepared/completed native-job roots, retention of dispatching/unknown jobs, and safe reopened status/GC behavior.",
+  "artifact_roots": {
+    "session_worktree": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/reconcile-retention-of-inactive-native-g",
+    "review_worktree": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/682-reconcile-final-local-qualification"
+  },
+  "reviewed_sources": [
+    {
+      "commit": "d6518745a1df9d75dc77ab2e44af35d5ef3ef470",
+      "tree": "88bf1707e1bac7925e8b453e5f676c11c4ef8dda",
+      "scope": "Production API, CLI, migration and lifecycle behavior",
+      "result": "Independent production review clear; no production findings."
+    },
+    {
+      "commit": "1a799a3eead55b9ed2380661c517d2ab0a8b4ce5",
+      "tree": "128a07026ffd8ccf2e3215b4ddfaff6362082949",
+      "scope": "StoredJobRow SQL mapping and independently enumerated fixture/spec roots",
+      "result": "Static review clear for typed mapping and expected fixture/spec identities."
+    },
+    {
+      "commit": "d524f3e695baa26a14302e68e3040fc61cef61d0",
+      "tree": "8b8302ffd16f6893bcd0fc8e67478b22728f3fa2",
+      "scope": "Complete independently derived source closure for dispatching and unknown GC plans",
+      "result": "Independent test review clear for fixture-derived manifests, snapshot entry blobs and metadata, contribution lineage/brief records, job and recipe records, and both GC plans."
+    }
+  ],
+  "test_filter": "native_gates::",
+  "selected_test_cases": 15,
+  "local_test_argv": [
+    "/usr/bin/caffeinate",
+    "-i",
+    "/Users/christophehenner/.cargo/bin/cargo",
+    "test",
+    "--locked",
+    "-j4",
+    "-p",
+    "aethyme-broker",
+    "--lib",
+    "native_gates::",
+    "--",
+    "--nocapture"
+  ],
+  "attempt_denominator": {
+    "local_native_gates_commands": 2,
+    "selected_slots": 30,
+    "returned_ok": 28,
+    "returned_assertion_failures": 1,
+    "not_returned_before_termination": 1,
+    "complete_passing_commands": 0,
+    "credited_native_gates_passes": 0,
+    "ci_checks_without_test_execution": 3,
+    "ci_test_cases_executed": 0
+  },
+  "attempts": [
+    {
+      "id": "ci-622-compile",
+      "source_commit": "622c633eb9c34b762ba795d2edf2b604b5b29c5b",
+      "source_tree": "be1a2a78620362549570002e1020f777babc22f5",
+      "kind": "CI compile check",
+      "numeric_exit": 101,
+      "tests_executed": 0,
+      "finding": "E0382 moved observation compile error before tests.",
+      "credited": false,
+      "artifacts": [
+        {
+          "path": "target/local-resume/pr782-116370216652-622.log",
+          "artifact_root": "review_worktree",
+          "bytes": 49095,
+          "sha256": "3c9b16d9b5b7a75df9f80d4f07dae085f37fde68144584ce291ee73265af89a7",
+          "kind": "complete raw CI log"
+        }
+      ]
+    },
+    {
+      "id": "ci-622-rustfmt",
+      "source_commit": "622c633eb9c34b762ba795d2edf2b604b5b29c5b",
+      "source_tree": "be1a2a78620362549570002e1020f777babc22f5",
+      "kind": "CI formatting check",
+      "numeric_exit": 1,
+      "tests_executed": 0,
+      "finding": "cargo fmt --all -- --check failed before tests.",
+      "credited": false,
+      "artifacts": [
+        {
+          "path": "target/local-resume/pr782-116370216237-622.log",
+          "artifact_root": "review_worktree",
+          "bytes": 53851,
+          "sha256": "fdc00755d03c4541d7c12b25840fcfd3637d368d3728e692b237f45ff8f7b761",
+          "kind": "complete raw CI log"
+        }
+      ]
+    },
+    {
+      "id": "local-native-gates-346001",
+      "source_commit": "346001298a2db1467b2807610dd04006f4b76889",
+      "source_tree": "d758e054309073ef99deb46360e362de98fb2271",
+      "kind": "focused local native-gates tests",
+      "source_worktree_clean_before_and_after": true,
+      "source_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "started_at_utc": "2026-10-15T10:40:55.101816+00:00",
+      "finished_at_utc": "2026-10-15T10:44:12.806987+00:00",
+      "wall_seconds": 197.643,
+      "numeric_exit": 101,
+      "results": {
+        "selected": 15,
+        "passed": 14,
+        "failed": 1,
+        "ignored": 0,
+        "filtered_out": 1805
+      },
+      "failure": "dispatching_and_unknown_jobs_stay_rooted_without_a_process_tree_proof: the test required dispatching_plan.entities to be empty, although unrelated collectible fixture entities may remain.",
+      "credited": false,
+      "artifacts": [
+        {
+          "path": "target/local-resume/final-integration-20261015T104055Z/native-gates-all.json",
+          "artifact_root": "session_worktree",
+          "bytes": 1686,
+          "sha256": "a7c14168ec9676fe869c02dacf1d1b604a0123a1e904457cfb32d7c081e81562",
+          "kind": "recorder metadata"
+        },
+        {
+          "path": "target/local-resume/final-integration-20261015T104055Z/native-gates-all.log",
+          "artifact_root": "session_worktree",
+          "bytes": 4362,
+          "sha256": "421db81263b95501477ac23084cae46b2c6d012c67500f83e3d9fbaac04e0892",
+          "kind": "complete raw local test output"
+        },
+        {
+          "path": "target/local-resume/final-integration-20261015T104055Z/native-gates-all.status",
+          "artifact_root": "session_worktree",
+          "bytes": 4,
+          "sha256": "39b8dc3fc8b44765c8e6f1adee04c5b465e555ab791cc42d0d9e810d5b64297c",
+          "kind": "numeric status file; content 101 plus newline"
+        },
+        {
+          "path": "target/local-resume/pr782-lint-346001.log",
+          "artifact_root": "review_worktree",
+          "bytes": 49838,
+          "sha256": "431d6da0d6ac49876aaa94496b740de7dd830aca7aac2251e576da43b85c2c62",
+          "kind": "complete raw CI lint log"
+        }
+      ],
+      "ci_lint_result": {
+        "numeric_exit": 101,
+        "finding": "Strict Clippy type_complexity on the eight-field retained-row tuple at native_gates.rs:171.",
+        "tests_executed": 0,
+        "credited": false
+      }
+    },
+    {
+      "id": "local-native-gates-d524-interrupted",
+      "source_commit": "d524f3e695baa26a14302e68e3040fc61cef61d0",
+      "source_tree": "8b8302ffd16f6893bcd0fc8e67478b22728f3fa2",
+      "kind": "focused local native-gates tests, interrupted",
+      "source_worktree_clean_before_and_after": true,
+      "source_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "started_at_utc": "2026-10-15T10:57:19.986873+00:00",
+      "finished_at_utc": "2026-10-15T11:01:34.935459+00:00",
+      "wall_seconds": 254.891,
+      "numeric_exit": 101,
+      "termination_signal": "SIGTERM",
+      "results": {
+        "selected": 15,
+        "returned_ok": 14,
+        "returned_assertion_failures": 0,
+        "not_returned_before_termination": 1,
+        "incomplete_test": "budget_capacity_and_requirement_holds_do_not_dispatch_prepared_jobs"
+      },
+      "termination_reason": "Stopped to prevent further allocation in host temporary storage after the Data volume approached full capacity; this was not an assertion failure.",
+      "credited": false,
+      "artifacts": [
+        {
+          "path": "target/local-resume/final-integration-20261015T105719Z/native-gates-full-closure-d524f3e.json",
+          "artifact_root": "session_worktree",
+          "bytes": 1703,
+          "sha256": "007b264cc318f357cf92d636e3c1ffc2e0d3eace25224172cd60060149855269",
+          "kind": "recorder metadata"
+        },
+        {
+          "path": "target/local-resume/final-integration-20261015T105719Z/native-gates-full-closure-d524f3e.log",
+          "artifact_root": "session_worktree",
+          "bytes": 4433,
+          "sha256": "edac8513324259d2d0984dc6ae7437d9f18287eaf955fd4281850f993c142660",
+          "kind": "complete raw local output through termination"
+        },
+        {
+          "path": "target/local-resume/final-integration-20261015T105719Z/native-gates-full-closure-d524f3e.status",
+          "artifact_root": "session_worktree",
+          "bytes": 4,
+          "sha256": "39b8dc3fc8b44765c8e6f1adee04c5b465e555ab791cc42d0d9e810d5b64297c",
+          "kind": "numeric status file; content 101 plus newline"
+        }
+      ]
+    }
+  ],
+  "pending_checks_as_of_record": [
+    {
+      "id": "cached-serial-native-gates",
+      "status": "not_started_at_this_checkpoint",
+      "scope": "All 15 native_gates tests from the exact d524 compiled binary, serialized."
+    },
+    {
+      "id": "migration-cli-and-regression-matrix",
+      "status": "not_run",
+      "scope": "Migration/state adoption and floor, touched native lifecycle CLI paths/help, controller/target/GC regressions, and ratchets."
+    },
+    {
+      "id": "strict-clippy",
+      "status": "not_run_after-retained-row-fix",
+      "scope": "Strict broker Clippy after the StoredJobRow type correction."
+    },
+    {
+      "id": "guard-removals",
+      "status": "not_run",
+      "scope": "Named removals for release lock, old-client trigger, current authority, and released-job GC/no replay, with exact restore verification."
+    }
+  ],
+  "limits": [
+    "No complete local native-gates command has passed at this record.",
+    "Compile, format and Clippy CI failures executed no tests and receive no test credit.",
+    "The interrupted d524 command receives no test credit although 14 selected tests returned ok.",
+    "No model calls, sealed evaluation or private oracle use is part of this lifecycle qualification."
+  ]
+}

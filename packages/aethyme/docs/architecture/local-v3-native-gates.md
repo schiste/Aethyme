@@ -59,6 +59,11 @@ these as `unknown_held`; it does not create a terminal observation or fresh
 trusted evidence. Quiesce old open collaboration clients before upgrading; the
 floor protects fresh opens.
 
+The explicit release and retention lifecycle has its own
+[native job lifecycle qualification ledger](local-v3-qualification/native-job-lifecycle-2026-10-15/README.md).
+Its source and test oracle have independent static review; complete local
+native runtime qualification is still pending.
+
 The Local integration is retained at `cb6dfeb57dc0f6c1d423e13fc78ea16e90e24529`
 (#758), with passing final workspace, lint, example/doctest, Windows and product
 CI checks. Local controls cover the actual composer-to-native-gate path,
