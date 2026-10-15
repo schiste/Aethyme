@@ -148,10 +148,11 @@ impl ReceiverHookProcess {
 
 impl Drop for ReceiverHookProcess {
     fn drop(&mut self) {
-        if self.armed && !self.attempted {
-            if let Err(error) = self.wait_for_exit() {
-                eprintln!("receiver hook cleanup was not proven: {error}");
-            }
+        if self.armed
+            && !self.attempted
+            && let Err(error) = self.wait_for_exit()
+        {
+            eprintln!("receiver hook cleanup was not proven: {error}");
         }
     }
 }
