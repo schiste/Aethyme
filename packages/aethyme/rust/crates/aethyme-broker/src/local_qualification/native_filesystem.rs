@@ -1339,10 +1339,13 @@ fn run_t45_capture_hydration_interleavings(disk: &mut OwnedImage) {
             }
             other => panic!("unexpected pre-pressure capture event {other:?}"),
         }
-        assert!(matches!(
-            crate::collaboration_gc::apply(&mut collector, &capture_plan.digest, &options),
-            Err(crate::collaboration_gc::GcError::ArchiveInUse)
-        ));
+        assert!(
+            matches!(
+                crate::collaboration_gc::apply(&mut collector, &capture_plan.digest, &options),
+                Err(crate::collaboration_gc::GcError::ArchiveInUse)
+            ),
+            "capture GC must return ArchiveInUse before pressure while capture holds archive SH"
+        );
         disk.note(
             "capture-gc-before-pressure",
             json!({"archive_shared_reader_held":true,"gc_apply":"archive_in_use","capture_state":"copying","capture_preflight_passed":true}),
@@ -1363,10 +1366,13 @@ fn run_t45_capture_hydration_interleavings(disk: &mut OwnedImage) {
             }
             other => panic!("unexpected capture I/O event {other:?}"),
         }
-        assert!(matches!(
-            crate::collaboration_gc::apply(&mut collector, &capture_plan.digest, &options),
-            Err(crate::collaboration_gc::GcError::ArchiveInUse)
-        ));
+        assert!(
+            matches!(
+                crate::collaboration_gc::apply(&mut collector, &capture_plan.digest, &options),
+                Err(crate::collaboration_gc::GcError::ArchiveInUse)
+            ),
+            "capture GC must return ArchiveInUse inside the raw ENOSPC callback while capture holds archive SH"
+        );
         capture_error.release();
         let result = worker.join().unwrap();
         (result, pressure)
@@ -1491,10 +1497,13 @@ fn run_t45_capture_hydration_interleavings(disk: &mut OwnedImage) {
             }
             other => panic!("unexpected pre-pressure hydration event {other:?}"),
         }
-        assert!(matches!(
-            crate::collaboration_gc::apply(&mut collector, &hydrate_plan.digest, &options),
-            Err(crate::collaboration_gc::GcError::ArchiveInUse)
-        ));
+        assert!(
+            matches!(
+                crate::collaboration_gc::apply(&mut collector, &hydrate_plan.digest, &options),
+                Err(crate::collaboration_gc::GcError::ArchiveInUse)
+            ),
+            "hydration GC must return ArchiveInUse before pressure while materialization holds archive SH"
+        );
         disk.note(
             "hydration-gc-before-pressure",
             json!({"archive_shared_reader_held":true,"gc_apply":"archive_in_use","materialization_workspace_created":true}),
@@ -1515,10 +1524,13 @@ fn run_t45_capture_hydration_interleavings(disk: &mut OwnedImage) {
             }
             other => panic!("unexpected hydration I/O event {other:?}"),
         }
-        assert!(matches!(
-            crate::collaboration_gc::apply(&mut collector, &hydrate_plan.digest, &options),
-            Err(crate::collaboration_gc::GcError::ArchiveInUse)
-        ));
+        assert!(
+            matches!(
+                crate::collaboration_gc::apply(&mut collector, &hydrate_plan.digest, &options),
+                Err(crate::collaboration_gc::GcError::ArchiveInUse)
+            ),
+            "hydration GC must return ArchiveInUse inside the raw ENOSPC callback while materialization holds archive SH"
+        );
         hydrate_error.release();
         let result = worker.join().unwrap();
         (result, pressure)
