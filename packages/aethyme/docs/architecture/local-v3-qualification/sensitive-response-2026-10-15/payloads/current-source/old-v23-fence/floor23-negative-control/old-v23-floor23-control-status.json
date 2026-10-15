@@ -1,0 +1,58 @@
+{
+  "exact_schema_floor_refusal": false,
+  "exit_code": 0,
+  "expected_old_binary_sha256": "1268402c5d49ac303b61bc28b4e4726bf95b1d17d64d7099850f2f67950f7e6f",
+  "finished_at_utc": "2026-10-15T21:59:02.423788+00:00",
+  "host_state_changed_paths": [],
+  "host_state_inventory_after_sha256": "4f1ab042371778660f9f7c7577dae41c2e3b27e7ef83e1647a54a3aa639192ae",
+  "host_state_inventory_before_sha256": "4f1ab042371778660f9f7c7577dae41c2e3b27e7ef83e1647a54a3aa639192ae",
+  "json_parse_error": null,
+  "label": "old-v23-floor23-control",
+  "log_bytes": 1029,
+  "log_sha256": "bbb50e9ddc1af88c5dc24be9344bac1333ad37f5e27aede36aa5ced79de3779f",
+  "old_binary_sha256_after": "1268402c5d49ac303b61bc28b4e4726bf95b1d17d64d7099850f2f67950f7e6f",
+  "parsed_json": {
+    "captures": {
+      "attention": [],
+      "by_state": {},
+      "reserved_bytes": 0
+    },
+    "collaboration_fence": null,
+    "config_source": "working_copy",
+    "enabled": true,
+    "gc": {
+      "unfinished_generations": 0
+    },
+    "next_actions": [],
+    "policy": "required",
+    "project": "local-target-test",
+    "schema": "aethyme.collab-status/experimental-v0",
+    "state": {
+      "durability": {
+        "filesystem": "apfs",
+        "full_fsync": true,
+        "journal_mode": "wal",
+        "local": true,
+        "supported": true,
+        "synchronous": 2
+      },
+      "initialized": true,
+      "min_compatible_schema": 23,
+      "needs_migration": false,
+      "project_dir": "/private/tmp/t56-old23-fence-425a0bc/floor23-negative-control/host-state/collaboration/local-target-test",
+      "receipt_label": "local_durable",
+      "root": "/private/tmp/t56-old23-fence-425a0bc/floor23-negative-control/host-state/collaboration",
+      "root_source": {
+        "kind": "host_state",
+        "setting": "aethyme_host_state_dir"
+      },
+      "schema_version": 24
+    }
+  },
+  "pid": 26474,
+  "project_binding_matches_exact_copy": true,
+  "repository_inventory_after_sha256": "d38a9874938abdea0f226fee6af0205883ba74668f0067c0f8a92590d7766ce0",
+  "repository_inventory_before_sha256": "d38a9874938abdea0f226fee6af0205883ba74668f0067c0f8a92590d7766ce0",
+  "repository_unchanged": true,
+  "started_at_utc": "2026-10-15T21:59:02.194073+00:00"
+}

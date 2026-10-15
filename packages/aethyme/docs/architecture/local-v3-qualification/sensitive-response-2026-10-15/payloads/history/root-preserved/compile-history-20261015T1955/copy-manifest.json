@@ -1,0 +1,30 @@
+{
+  "captured_at_utc": "2026-10-15T19:55:16.570387+00:00",
+  "scope": "Byte-exact author compile-only history; no test execution credit; source/dirty binding remains author recorder",
+  "files": [
+    {
+      "source": "/private/tmp/aethyme-t56-compile-8c691b042618-20261015T191025Z-29796/command.log",
+      "copy": "target/local-resume/t56-compile-history-20261015T1955/0-aethyme-t56-compile-8c691b042618-20261015T191025Z-29796.log",
+      "bytes": 1534,
+      "sha256": "f98136fbee4b9da4b7c8c7d45918bddae54919fb89a148f0adf39dfd63a25583"
+    },
+    {
+      "source": "/private/tmp/aethyme-t56-compile-95438f62-20261015T191356Z-51068/command.log",
+      "copy": "target/local-resume/t56-compile-history-20261015T1955/1-aethyme-t56-compile-95438f62-20261015T191356Z-51068.log",
+      "bytes": 1233,
+      "sha256": "014365f4992f5c966fb2a19514ddf742cb20efa96ddad66a728c20f474a1bde3"
+    },
+    {
+      "source": "/private/tmp/aethyme-t56-compile-cc31a0de-20261015T191505Z-73508/command.log",
+      "copy": "target/local-resume/t56-compile-history-20261015T1955/2-aethyme-t56-compile-cc31a0de-20261015T191505Z-73508.log",
+      "bytes": 32165,
+      "sha256": "66108f8c8945fad5d1748c23fcf2d1d1a4f9cf380903ff1bc18f73908c9dd7e9"
+    },
+    {
+      "source": "/private/tmp/t56-norun-1a13.2e2WEk/compile.log",
+      "copy": "target/local-resume/t56-compile-history-20261015T1955/3-t56-norun-1a13.2e2WEk.log",
+      "bytes": 5272,
+      "sha256": "9a1ca4303c9ecbc3c28293c07141b2f9c808cd02025b3b66d9b2a1fab2a50c6d"
+    }
+  ]
+}

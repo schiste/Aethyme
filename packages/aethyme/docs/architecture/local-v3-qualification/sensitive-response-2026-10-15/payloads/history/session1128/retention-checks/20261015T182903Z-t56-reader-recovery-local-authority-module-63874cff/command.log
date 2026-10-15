@@ -1,0 +1,15 @@
+   Compiling aethyme-engine v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/implement-local-administrative-sensitive/packages/aethyme/rust/crates/aethyme-engine)
+   Compiling aethyme-broker v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/implement-local-administrative-sensitive/packages/aethyme/rust/crates/aethyme-broker)
+error[E0433]: cannot find type `Phase` in this scope
+   --> crates/aethyme-broker/src/local_authority/tests.rs:219:9
+    |
+219 |         Phase::Stopped
+    |         ^^^^^ use of undeclared type `Phase`
+    |
+help: consider importing this enum
+    |
+  1 + use crate::local_target::Phase;
+    |
+
+For more information about this error, try `rustc --explain E0433`.
+error: could not compile `aethyme-broker` (lib test) due to 1 previous error

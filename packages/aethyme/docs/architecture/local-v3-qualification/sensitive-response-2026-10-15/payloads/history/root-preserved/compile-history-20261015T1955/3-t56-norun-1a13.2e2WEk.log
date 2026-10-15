@@ -1,0 +1,117 @@
+   Compiling aethyme-engine v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/implement-local-administrative-sensitive/packages/aethyme/rust/crates/aethyme-engine)
+   Compiling aethyme-broker v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/implement-local-administrative-sensitive/packages/aethyme/rust/crates/aethyme-broker)
+error[E0308]: mismatched types
+    --> crates/aethyme-broker/src/collaboration_sensitive.rs:2881:66
+     |
+2881 |         let profile = crate::analysis_view::ViewProfile::current(format!("t56-pin-{case}"));
+     |                                                                  ^^^^^^^^^^^^^^^^^^^^^^^^^ expected `&str`, found `String`
+
+error[E0369]: binary operation `==` cannot be applied to type `Vec<collaboration_sensitive::FileItem>`
+    --> crates/aethyme-broker/src/collaboration_sensitive.rs:2955:9
+     |
+2955 |         assert_eq!(before, after_mutation);
+     |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |         |
+     |         Vec<collaboration_sensitive::FileItem>
+     |         Vec<collaboration_sensitive::FileItem>
+     |
+note: an implementation of `PartialEq` might be missing for `collaboration_sensitive::FileItem`
+    --> crates/aethyme-broker/src/collaboration_sensitive.rs:990:1
+     |
+ 990 | struct FileItem {
+     | ^^^^^^^^^^^^^^^ must implement `PartialEq`
+help: consider annotating `collaboration_sensitive::FileItem` with `#[derive(PartialEq)]`
+     |
+ 990 + #[derive(PartialEq)]
+ 991 | struct FileItem {
+     |
+
+error[E0369]: binary operation `==` cannot be applied to type `Vec<collaboration_sensitive::FileItem>`
+    --> crates/aethyme-broker/src/collaboration_sensitive.rs:2974:9
+     |
+2974 | /         assert_eq!(
+2975 | |             view_snapshot_except_path(store, &view, excluded_relative),
+2976 | |             after_mutation
+2977 | |         );
+     | |         ^
+     | |         |
+     | |_________Vec<collaboration_sensitive::FileItem>
+     |           Vec<collaboration_sensitive::FileItem>
+     |
+note: an implementation of `PartialEq` might be missing for `collaboration_sensitive::FileItem`
+    --> crates/aethyme-broker/src/collaboration_sensitive.rs:990:1
+     |
+ 990 | struct FileItem {
+     | ^^^^^^^^^^^^^^^ must implement `PartialEq`
+help: consider annotating `collaboration_sensitive::FileItem` with `#[derive(PartialEq)]`
+     |
+ 990 + #[derive(PartialEq)]
+ 991 | struct FileItem {
+     |
+
+error[E0369]: binary operation `==` cannot be applied to type `Vec<collaboration_sensitive::FileItem>`
+    --> crates/aethyme-broker/src/collaboration_sensitive.rs:2982:9
+     |
+2982 | /         assert_eq!(
+2983 | |             view_snapshot_except_path(store, &view, excluded_relative),
+2984 | |             after_mutation
+2985 | |         );
+     | |         ^
+     | |         |
+     | |_________Vec<collaboration_sensitive::FileItem>
+     |           Vec<collaboration_sensitive::FileItem>
+     |
+note: an implementation of `PartialEq` might be missing for `collaboration_sensitive::FileItem`
+    --> crates/aethyme-broker/src/collaboration_sensitive.rs:990:1
+     |
+ 990 | struct FileItem {
+     | ^^^^^^^^^^^^^^^ must implement `PartialEq`
+help: consider annotating `collaboration_sensitive::FileItem` with `#[derive(PartialEq)]`
+     |
+ 990 + #[derive(PartialEq)]
+ 991 | struct FileItem {
+     |
+
+error[E0369]: binary operation `==` cannot be applied to type `Vec<collaboration_sensitive::FileItem>`
+    --> crates/aethyme-broker/src/collaboration_sensitive.rs:3393:9
+     |
+3393 |         assert_ne!(held_view, released_hold_view);
+     |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |         |
+     |         Vec<collaboration_sensitive::FileItem>
+     |         Vec<collaboration_sensitive::FileItem>
+     |
+note: an implementation of `PartialEq` might be missing for `collaboration_sensitive::FileItem`
+    --> crates/aethyme-broker/src/collaboration_sensitive.rs:990:1
+     |
+ 990 | struct FileItem {
+     | ^^^^^^^^^^^^^^^ must implement `PartialEq`
+help: consider annotating `collaboration_sensitive::FileItem` with `#[derive(PartialEq)]`
+     |
+ 990 + #[derive(PartialEq)]
+ 991 | struct FileItem {
+     |
+
+error[E0369]: binary operation `==` cannot be applied to type `Vec<collaboration_sensitive::FileItem>`
+    --> crates/aethyme-broker/src/collaboration_sensitive.rs:3396:9
+     |
+3396 |         assert_eq!(view_snapshot(store, &view), released_hold_view);
+     |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |         |
+     |         Vec<collaboration_sensitive::FileItem>
+     |         Vec<collaboration_sensitive::FileItem>
+     |
+note: an implementation of `PartialEq` might be missing for `collaboration_sensitive::FileItem`
+    --> crates/aethyme-broker/src/collaboration_sensitive.rs:990:1
+     |
+ 990 | struct FileItem {
+     | ^^^^^^^^^^^^^^^ must implement `PartialEq`
+help: consider annotating `collaboration_sensitive::FileItem` with `#[derive(PartialEq)]`
+     |
+ 990 + #[derive(PartialEq)]
+ 991 | struct FileItem {
+     |
+
+Some errors have detailed explanations: E0308, E0369.
+For more information about an error, try `rustc --explain E0308`.
+error: could not compile `aethyme-broker` (lib test) due to 6 previous errors

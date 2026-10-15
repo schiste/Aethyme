@@ -1,0 +1,13 @@
+   Compiling aethyme-engine v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/implement-local-administrative-sensitive/packages/aethyme/rust/crates/aethyme-engine)
+   Compiling aethyme-broker v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/implement-local-administrative-sensitive/packages/aethyme/rust/crates/aethyme-broker)
+warning: unused variable: `metadata`
+    --> crates/aethyme-broker/src/collaboration_sensitive.rs:2836:21
+     |
+2836 |                 let metadata = match fs::symlink_metadata(&path) {
+     |                     ^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_metadata`
+     |
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: `aethyme-broker` (lib test) generated 1 warning (run `cargo fix --lib -p aethyme-broker --tests` to apply 1 suggestion)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 33.21s
+  Executable unittests src/lib.rs (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/integrate-reviewed-local-bare-git-servic/target/local-resume/cargo/debug/deps/aethyme_broker-0f278e0d02146111)

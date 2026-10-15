@@ -1,0 +1,20 @@
+{
+  "case": "m1-response-gated-archive-read",
+  "reconciled_at_utc": "2026-10-15T21:51:30Z",
+  "classification": "intended_named_failure_confirmed_by_raw_log; runner_parser_incomplete",
+  "source_head": "425a0bc8e41031cea6b0ff8b5bc0e9cc80748b31",
+  "source_tree": "01f8a9f6a51818732cf6feb38125a34c81745d5b",
+  "raw_log_path": "/private/tmp/t56-final-mutants-425a0bc/m1-response-gated-archive-read/command.log",
+  "raw_log_bytes": 2317,
+  "raw_log_sha256": "342907c912cba5e53ee1690199a683943e3af3f8a4b359e37562224e758f96c6",
+  "raw_evidence": {
+    "exact_named_test_in_failure_list": "collaboration_sensitive::tests::synthetic_source_token_is_blocked_and_managed_copies_are_removed_with_residuals",
+    "assertion_fragment": "assertion failed: archive::read_object(store, &content_digest).is_err()",
+    "test_summary": "0 passed; 1 failed; 0 ignored",
+    "exit_code": 101
+  },
+  "original_status_preserved": true,
+  "source_restore_status_path": "/private/tmp/t56-final-mutants-425a0bc/m1-response-gated-archive-read/status.json",
+  "source_restore_byte_identical": true,
+  "correction": "The runner checked only the inline FAILED marker, while this libtest format puts the failed test identifier in the separate failures list. The raw log directly contains the exact named test and intended assertion; no test was rerun and no original record was rewritten."
+}

@@ -1,0 +1,16 @@
+{
+  "attempt_id": "t56-runtime-69e820-main-1cZpb4",
+  "kind": "focused_positive_composite",
+  "source_head": "69e8202a64dea2d2aa45d64ce89b223fc76b48a1",
+  "source_tree": "15909c7cedd2814486d35fd773a085885bef844c",
+  "source_dirty": false,
+  "source_file": {
+    "path": "packages/aethyme/rust/crates/aethyme-broker/src/collaboration_sensitive.rs",
+    "bytes": 148360,
+    "sha256": "42918ec1fb4d45a2c5254c16f1eb710d4c59e7fb34e5566efdc444b087761ef9"
+  },
+  "selector": "collaboration_sensitive::tests::synthetic_source_token_is_blocked_and_managed_copies_are_removed_with_residuals",
+  "command": "cargo test --locked -j4 -p aethyme-broker --lib collaboration_sensitive::tests::synthetic_source_token_is_blocked_and_managed_copies_are_removed_with_residuals -- --exact",
+  "expected_test_count": 1,
+  "fixture_root": "/private/tmp/t56-playground-<created-by-test>"
+}

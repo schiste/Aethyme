@@ -1,0 +1,18 @@
+{
+  "copied_at_utc": "2026-10-15T20:25:56.249378+00:00",
+  "kind": "compile-onlyFAIL101privatefield;zeroexecuted",
+  "files": [
+    {
+      "source": "/private/tmp/t56-v4-503ffd-unreadable-view-inventory/command.log",
+      "copy": "target/local-resume/t56-runtime-history-20261015/t56-v4-503ffd-unreadable-view-inventory/command.log",
+      "bytes": 1102,
+      "sha256": "66d38e2bf8c03fe8579deda458d3b617038642e2da46d3ddc500607d863e94ed"
+    },
+    {
+      "source": "/private/tmp/t56-v4-503ffd-unreadable-view-inventory/status",
+      "copy": "target/local-resume/t56-runtime-history-20261015/t56-v4-503ffd-unreadable-view-inventory/status",
+      "bytes": 4,
+      "sha256": "39b8dc3fc8b44765c8e6f1adee04c5b465e555ab791cc42d0d9e810d5b64297c"
+    }
+  ]
+}

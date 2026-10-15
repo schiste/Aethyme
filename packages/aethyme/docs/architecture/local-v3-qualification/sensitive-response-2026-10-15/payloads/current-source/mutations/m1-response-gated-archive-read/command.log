@@ -1,0 +1,27 @@
+   Compiling aethyme-graph-schema v0.8.26 (/private/tmp/t56-final-mutants-425a0bc/source/packages/aethyme/rust/crates/aethyme-graph-schema)
+   Compiling aethyme-engine v0.8.26 (/private/tmp/t56-final-mutants-425a0bc/source/packages/aethyme/rust/crates/aethyme-engine)
+   Compiling aethyme-broker v0.8.26 (/private/tmp/t56-final-mutants-425a0bc/source/packages/aethyme/rust/crates/aethyme-broker)
+   Compiling aethyme-testkit v0.1.0 (/private/tmp/t56-final-mutants-425a0bc/source/packages/aethyme/rust/crates/aethyme-testkit)
+   Compiling aethyme-enhance v0.8.26 (/private/tmp/t56-final-mutants-425a0bc/source/packages/aethyme/rust/crates/aethyme-enhance)
+   Compiling aethyme-contracts v0.8.26 (/private/tmp/t56-final-mutants-425a0bc/source/packages/aethyme/rust/crates/aethyme-contracts)
+   Compiling aethyme-graph-storage v0.8.26 (/private/tmp/t56-final-mutants-425a0bc/source/packages/aethyme/rust/crates/aethyme-graph-storage)
+   Compiling aethyme-producers v0.8.26 (/private/tmp/t56-final-mutants-425a0bc/source/packages/aethyme/rust/crates/aethyme-producers)
+   Compiling aethyme-graph-indexer v0.8.26 (/private/tmp/t56-final-mutants-425a0bc/source/packages/aethyme/rust/crates/aethyme-graph-indexer)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 48.42s
+     Running unittests src/lib.rs (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/integrate-reviewed-local-bare-git-servic/target/local-resume/cargo/debug/deps/aethyme_broker-fafff990a47ccea3)
+
+running 1 test
+test collaboration_sensitive::tests::synthetic_source_token_is_blocked_and_managed_copies_are_removed_with_residuals ... 
+thread 'collaboration_sensitive::tests::synthetic_source_token_is_blocked_and_managed_copies_are_removed_with_residuals' (10952607) panicked at crates/aethyme-broker/src/collaboration_sensitive.rs:4956:9:
+assertion failed: archive::read_object(store, &content_digest).is_err()
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+
+failures:
+    collaboration_sensitive::tests::synthetic_source_token_is_blocked_and_managed_copies_are_removed_with_residuals
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1866 filtered out; finished in 14.12s
+
+error: test failed, to rerun pass `-p aethyme-broker --lib`

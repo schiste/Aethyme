@@ -1,0 +1,25 @@
+{
+  "copied_at_utc": "2026-10-15T20:18:21.870228+00:00",
+  "classification": "actual focused runtime FAIL101;1run0PASS1FAIL;UnknownWork at sensitive.rs3929 after13.53seconds;no retry yet",
+  "source_commit": "69e8202a64dea2d2aa45d64ce89b223fc76b48a1",
+  "files": [
+    {
+      "source": "/private/tmp/t56-runtime-69e820-main-1cZpb4/attempt.json",
+      "copy": "target/local-resume/t56-runtime-history-20261015/t56-runtime-69e820-main-1cZpb4/attempt.json",
+      "bytes": 867,
+      "sha256": "abe578d4059379e5e7367ec814ba89c1e3d6a0c89e44c7e5adff62a141fd7589"
+    },
+    {
+      "source": "/private/tmp/t56-runtime-69e820-main-1cZpb4/command.log",
+      "copy": "target/local-resume/t56-runtime-history-20261015/t56-runtime-69e820-main-1cZpb4/command.log",
+      "bytes": 2801,
+      "sha256": "ecc47a9a6b56ba327f4b8a11c6c07adae2209dc58ffb9ec8224b1d94327de637"
+    },
+    {
+      "source": "/private/tmp/t56-runtime-69e820-main-1cZpb4/status",
+      "copy": "target/local-resume/t56-runtime-history-20261015/t56-runtime-69e820-main-1cZpb4/status",
+      "bytes": 4,
+      "sha256": "39b8dc3fc8b44765c8e6f1adee04c5b465e555ab791cc42d0d9e810d5b64297c"
+    }
+  ]
+}

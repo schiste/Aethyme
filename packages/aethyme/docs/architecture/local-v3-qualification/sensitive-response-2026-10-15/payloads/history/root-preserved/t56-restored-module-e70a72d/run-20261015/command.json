@@ -1,0 +1,34 @@
+{
+  "argv": [
+    "cargo",
+    "test",
+    "--locked",
+    "-j4",
+    "-p",
+    "aethyme-broker",
+    "--lib",
+    "collaboration_sensitive::tests",
+    "--",
+    "--nocapture",
+    "--test-threads=1"
+  ],
+  "cwd": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/implement-local-administrative-sensitive/packages/aethyme/rust",
+  "environment": {
+    "CARGO_BUILD_JOBS": "4",
+    "CARGO_HOME": "/Users/christophehenner/.cargo",
+    "CARGO_NET_OFFLINE": "true",
+    "CARGO_TARGET_DIR": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/integrate-reviewed-local-bare-git-servic/target/local-resume/cargo",
+    "CARGO_TERM_COLOR": "never",
+    "HOME": "/Users/christophehenner",
+    "LANG": "en_US.UTF-8",
+    "LC_ALL": "en_US.UTF-8",
+    "PATH": "/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/christophehenner/.cargo/bin",
+    "RUSTC_WRAPPER": "",
+    "RUSTUP_HOME": "/Users/christophehenner/.rustup",
+    "TMPDIR": "/private/tmp/t56-restored-module-e70a72d/run-20261015/tmp"
+  },
+  "head": "e70a72dcd2c2886ae0f1664ac40dcea4188e9fb0",
+  "repo": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/implement-local-administrative-sensitive",
+  "started_at_utc": "2026-10-15T21:42:31.799684+00:00",
+  "tree": "955e197b445891f7de6baa36fa2d5647995ee5ba"
+}

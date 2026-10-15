@@ -1,0 +1,12 @@
+{
+  "exit_code": 0,
+  "finished_at_utc": "2026-10-15T21:40:46.132015+00:00",
+  "head_after": "e70a72dcd2c2886ae0f1664ac40dcea4188e9fb0",
+  "log_bytes": 960,
+  "log_sha256": "badcf0ea4a04b50555e5ee64b06204cf5b7614f66e051ecd08e0320236b81ba3",
+  "pid": 57325,
+  "source_unchanged": true,
+  "status_after": "",
+  "tree_after": "955e197b445891f7de6baa36fa2d5647995ee5ba",
+  "worktree_clean_after": true
+}
