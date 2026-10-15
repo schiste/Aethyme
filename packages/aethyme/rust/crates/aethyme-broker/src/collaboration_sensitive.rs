@@ -27,6 +27,11 @@ const MARKER_NAME: &str = "sensitive-response.json";
 const MAX_MARKER_BYTES: usize = 16 * 1024;
 const SCOPE_KIND: &str = "project";
 
+#[cfg(test)]
+thread_local! {
+    static INTERRUPT_AFTER_MANAGED_TABLE_DELETE: Cell<bool> = const { Cell::new(false) };
+}
+
 /// Remove only schema-24 administrative-response tables from a synthetic
 /// pre-24 database used by historical-migration tests. Production migrations
 /// remain responsible for creating these tables on open.
@@ -3195,6 +3200,15 @@ fn clear_managed_database(
         }
         transaction.commit()?;
 
+        // Exercise the crash boundary after managed table rows are deleted
+        // but before the durable cleanup receipt can be published.
+        #[cfg(test)]
+        if INTERRUPT_AFTER_MANAGED_TABLE_DELETE.with(|interrupt| interrupt.replace(false)) {
+            return Err(SensitiveError::Invalid(
+                "injected interruption after managed table deletion".into(),
+            ));
+        }
+
         checkpoint_truncated(connection)?;
         connection.execute_batch("VACUUM")?;
         // In WAL mode VACUUM may commit pages to the WAL. The post-VACUUM
@@ -3460,6 +3474,14 @@ pub fn purge(
 mod tests {
     use super::*;
 
+    struct ResetDatabaseCleanupInterruption;
+
+    impl Drop for ResetDatabaseCleanupInterruption {
+        fn drop(&mut self) {
+            INTERRUPT_AFTER_MANAGED_TABLE_DELETE.with(|interrupt| interrupt.set(false));
+        }
+    }
+
     fn complete_fixture_wave(fixture: &mut crate::local_generation::tests::Fixture) {
         let binding = crate::local_acceptance::load(&fixture.v.f.store, &fixture.binding).unwrap();
         let intent_id = RecordId::parse(&binding.spec().intent).unwrap();
@@ -3502,6 +3524,93 @@ mod tests {
                 rusqlite::params![incident_id, project_key, "0".repeat(64), created_ms],
             )
             .unwrap();
+    }
+
+    #[test]
+    fn interrupted_database_cleanup_does_not_publish_early_completion_receipt() {
+        use crate::collaboration_archive::ObjectDigest;
+        use crate::collaboration_capture as capture;
+
+        let mut fixture = crate::local_generation::tests::Fixture::new();
+        complete_fixture_wave(&mut fixture);
+        let source_repository = fixture.v.f._repo.path().to_path_buf();
+        let capture_request = capture::CaptureRequest {
+            operation_id: capture::OperationId::mint().unwrap(),
+            repository: source_repository,
+            base: fixture.v.f.a.base.commit.clone(),
+            result: fixture.v.f.a.result.commit.clone(),
+            policy: capture::CapturePolicy::Required,
+            retention: capture::RetentionBoundary::UntilReleased,
+        };
+        assert!(matches!(
+            capture::capture(&mut fixture.v.f.store, &capture_request).unwrap(),
+            capture::CaptureOutcome::Acknowledged(_)
+        ));
+
+        let store = &mut fixture.v.f.store;
+        let frozen = crate::local_authority::freeze(
+            store,
+            fixture.v.owner.authority_epoch(),
+            "T56 managed database cleanup interruption control",
+        )
+        .unwrap();
+        let incident_id = format!(
+            "sha256:{}",
+            ObjectDigest::of(b"t56-managed-database-cleanup-interruption").hex()
+        );
+        let quarantined = quarantine(
+            store,
+            &incident_id,
+            "local-test-operator",
+            frozen.epoch.as_str(),
+            ReasonCode::SuspectedTestSecretExposure,
+        )
+        .unwrap();
+
+        let _reset = ResetDatabaseCleanupInterruption;
+        INTERRUPT_AFTER_MANAGED_TABLE_DELETE.with(|interrupt| {
+            assert!(
+                !interrupt.replace(true),
+                "stale cleanup interruption control"
+            );
+        });
+        let interrupted = purge(store, &incident_id, &quarantined.request_digest);
+        assert!(matches!(
+            interrupted,
+            Err(SensitiveError::Invalid(ref message))
+                if message == "injected interruption after managed table deletion"
+        ));
+
+        let interrupted_status = status(store, &incident_id).unwrap();
+        assert_eq!(interrupted_status.database_cleanup_completed_ms, None);
+        assert!(!interrupted_status.managed_cleanup_complete);
+        let object_items = interrupted_status
+            .items
+            .iter()
+            .filter(|item| item.path.starts_with("objects/"))
+            .collect::<Vec<_>>();
+        assert!(!object_items.is_empty());
+        assert!(
+            object_items.iter().all(|item| item.state == "deleted"),
+            "archive object files must be removed before this database interruption"
+        );
+        assert!(!interrupted_status.database_tables.is_empty());
+        assert!(
+            interrupted_status
+                .database_tables
+                .iter()
+                .all(|table| table.state == "pending"),
+            "database cleanup inventory must remain pending until its receipt"
+        );
+        let remaining_waves: i64 = store
+            .read_connection()
+            .query_row("SELECT count(*) FROM local_waves", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(remaining_waves, 0);
+
+        let retried = purge(store, &incident_id, &quarantined.request_digest).unwrap();
+        assert!(retried.status.database_cleanup_completed_ms.is_some());
+        assert!(retried.status.managed_cleanup_complete);
     }
 
     #[test]
