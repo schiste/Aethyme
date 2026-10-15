@@ -407,7 +407,7 @@ fn actual_pressure_preserves_retained_source_and_bounded_native_cleanup() {
     policy.runtime = native.runtime().id();
     policy.daemon = native.runtime().daemon_id.clone();
     policy.meter_image = image.clone();
-    policy.memory_mib = 4096;
+    policy.memory_mib = 3072;
     policy.disk_mib = 4096;
     policy.job_slots = 4;
     let executor = native.with_resources(policy.clone()).unwrap();
