@@ -37,6 +37,14 @@ fn completed_freeze_rebinds_the_frozen_epoch_and_allows_sensitive_quarantine() {
     .unwrap();
     assert_eq!(status.state, "quarantined");
     assert_eq!(status.incident_id, incident);
+    let archive_probe = crate::collaboration_gc::try_admin_exclusive(&f.store)
+        .unwrap()
+        .expect("archive barrier should be released after quarantine");
+    drop(archive_probe);
+    let response_probe = crate::collaboration_sensitive::try_response_exclusive(&f.store)
+        .unwrap()
+        .expect("response barrier should be released after quarantine");
+    drop(response_probe);
     let retry = crate::collaboration_sensitive::quarantine(
         &mut f.store,
         &incident,
@@ -46,6 +54,79 @@ fn completed_freeze_rebinds_the_frozen_epoch_and_allows_sensitive_quarantine() {
     )
     .unwrap();
     assert_eq!(retry.request_digest, status.request_digest);
+    let id = RecordId::parse(&incident).unwrap();
+    assert!(matches!(
+        target::load_revision(&f.store, &id),
+        Err(target::TargetError::Sensitive(
+            crate::collaboration_sensitive::SensitiveError::Quarantined
+        ))
+    ));
+    assert!(matches!(
+        target::dispositions(&f.store, &id),
+        Err(target::TargetError::Sensitive(
+            crate::collaboration_sensitive::SensitiveError::Quarantined
+        ))
+    ));
+    assert!(matches!(
+        wave::load(&f.store, &id),
+        Err(wave::WaveError::Sensitive(
+            crate::collaboration_sensitive::SensitiveError::Quarantined
+        ))
+    ));
+    assert!(matches!(
+        crate::local_acceptance::load(&f.store, &id),
+        Err(crate::local_acceptance::AcceptanceError::Sensitive(
+            crate::collaboration_sensitive::SensitiveError::Quarantined
+        ))
+    ));
+    assert!(matches!(
+        crate::local_source_transport::load(&f.store, &id),
+        Err(crate::local_source_transport::TransportError::Sensitive(
+            crate::collaboration_sensitive::SensitiveError::Quarantined
+        ))
+    ));
+    assert!(matches!(
+        crate::local_acceptance::last_receipt(&f.store, &id),
+        Err(crate::local_acceptance::AcceptanceError::Sensitive(
+            crate::collaboration_sensitive::SensitiveError::Quarantined
+        ))
+    ));
+    assert!(matches!(
+        crate::local_source_transport::last_receipt(&f.store, &id),
+        Err(crate::local_source_transport::TransportError::Sensitive(
+            crate::collaboration_sensitive::SensitiveError::Quarantined
+        ))
+    ));
+    assert!(matches!(
+        crate::local_budget::load(&f.store, &id),
+        Err(crate::local_budget::BudgetError::Sensitive(
+            crate::collaboration_sensitive::SensitiveError::Quarantined
+        ))
+    ));
+    assert!(matches!(
+        crate::native_gates::load(&f.store, &id),
+        Err(crate::native_gates::NativeGateError::Sensitive(
+            crate::collaboration_sensitive::SensitiveError::Quarantined
+        ))
+    ));
+    assert!(matches!(
+        crate::local_controller::load(&f.store, &id),
+        Err(crate::local_controller::ControllerError::Sensitive(
+            crate::collaboration_sensitive::SensitiveError::Quarantined
+        ))
+    ));
+}
+
+#[test]
+fn legacy_version_one_active_witness_remains_readable() {
+    let (f, owner, _w, _a) = setup();
+    let mut witness = status(&f.store).unwrap();
+    witness.version = 1;
+    witness.origin = None;
+    write(&directory(&f.store).unwrap(), &witness).unwrap();
+
+    assert_eq!(status(&f.store).unwrap().version, 1);
+    assert!(guard(&f.store, owner.authority_epoch()).is_ok());
 }
 
 #[test]
@@ -58,6 +139,7 @@ fn interrupted_freeze_requires_explicit_completion_before_sensitive_response() {
         &witness_path,
         &Witness {
             version: 1,
+            origin: None,
             epoch: epoch.clone(),
             status: Status::Frozen,
             checkpoint: None,
@@ -80,6 +162,121 @@ fn interrupted_freeze_requires_explicit_completion_before_sensitive_response() {
     );
     assert!(frozen_guard(&f.store, &epoch).is_ok());
     assert!(complete_interrupted_freeze(&mut f.store, &epoch).is_err());
+}
+
+#[test]
+fn empty_initial_installation_recovers_witness_written_before_first_binding() {
+    let fixture = Fixture::new();
+    let mut store = fixture.store;
+    let epoch = fresh_epoch().unwrap();
+    let witness_path = directory(&store).unwrap();
+    prepare(&witness_path).unwrap();
+    write(
+        &witness_path,
+        &Witness {
+            version: 2,
+            origin: Some(WitnessOrigin::InitialInstallation),
+            epoch: epoch.clone(),
+            status: Status::Frozen,
+            checkpoint: None,
+            reason: Some(INITIAL_INSTALLATION_INTERRUPTED.into()),
+        },
+    )
+    .unwrap();
+
+    assert_eq!(bound(store.read_connection()).unwrap(), None);
+    let completed = complete_interrupted_freeze(&mut store, &epoch).unwrap();
+    assert_eq!(completed.epoch, epoch);
+    assert!(completed.checkpoint.is_some());
+    assert_eq!(bound(store.read_connection()).unwrap(), Some(epoch.clone()));
+    assert!(frozen_guard(&store, &epoch).is_ok());
+}
+
+#[test]
+fn historical_local_records_survive_exact_initial_installation_recovery() {
+    let (mut f, _owner, _w, _a) = setup();
+    f.store
+        .connection()
+        .execute("DELETE FROM local_authority_state", [])
+        .unwrap();
+    let epoch = fresh_epoch().unwrap();
+    let witness_path = directory(&f.store).unwrap();
+    write(
+        &witness_path,
+        &Witness {
+            version: 2,
+            origin: Some(WitnessOrigin::InitialInstallation),
+            epoch: epoch.clone(),
+            status: Status::Frozen,
+            checkpoint: None,
+            reason: Some(INITIAL_INSTALLATION_INTERRUPTED.into()),
+        },
+    )
+    .unwrap();
+
+    let completed = complete_interrupted_freeze(&mut f.store, &epoch).unwrap();
+    assert_eq!(completed.epoch, epoch);
+    assert!(completed.checkpoint.is_some());
+    assert_eq!(
+        bound(f.store.read_connection()).unwrap(),
+        Some(epoch.clone())
+    );
+    assert!(frozen_guard(&f.store, &epoch).is_ok());
+    assert_eq!(status(&f.store).unwrap().status, Status::Frozen);
+    assert_eq!(
+        target::status(&f.store, "target").unwrap().phase,
+        target::Phase::Stopped
+    );
+}
+
+#[test]
+fn populated_store_with_generic_missing_binding_stays_stale() {
+    let (mut f, _owner, _w, _a) = setup();
+    f.store
+        .connection()
+        .execute("DELETE FROM local_authority_state", [])
+        .unwrap();
+    let epoch = fresh_epoch().unwrap();
+    let witness_path = directory(&f.store).unwrap();
+    write(
+        &witness_path,
+        &Witness {
+            version: 2,
+            origin: Some(WitnessOrigin::OperatorFreeze),
+            epoch: epoch.clone(),
+            status: Status::Frozen,
+            checkpoint: None,
+            reason: Some("operator freeze".into()),
+        },
+    )
+    .unwrap();
+
+    assert!(matches!(
+        complete_interrupted_freeze(&mut f.store, &epoch),
+        Err(AuthorityError::Stale)
+    ));
+    assert_eq!(bound(f.store.read_connection()).unwrap(), None);
+    assert!(status(&f.store).unwrap().checkpoint.is_none());
+}
+
+#[test]
+fn public_freeze_cannot_claim_initial_installation_origin_with_reserved_reason() {
+    let (mut f, owner, _w, _a) = setup();
+    let prior = owner.authority_epoch().clone();
+    let mut witness = freeze(&mut f.store, &prior, INITIAL_INSTALLATION_INTERRUPTED).unwrap();
+    assert_eq!(witness.origin, Some(WitnessOrigin::OperatorFreeze));
+    witness.checkpoint = None;
+    write(&directory(&f.store).unwrap(), &witness).unwrap();
+    f.store
+        .connection()
+        .execute("DELETE FROM local_authority_state", [])
+        .unwrap();
+
+    assert!(matches!(
+        complete_interrupted_freeze(&mut f.store, &witness.epoch),
+        Err(AuthorityError::Stale)
+    ));
+    assert_eq!(bound(f.store.read_connection()).unwrap(), None);
 }
 
 #[test]
@@ -354,7 +551,8 @@ fn interrupted_freeze_requires_exact_token_and_explicit_completion() {
     let (mut f, owner, _w, a) = setup();
     let path = directory(&f.store).unwrap();
     let frozen = Witness {
-        version: 1,
+        version: 2,
+        origin: Some(WitnessOrigin::OperatorFreeze),
         epoch: fresh_epoch().unwrap(),
         status: Status::Frozen,
         checkpoint: None,

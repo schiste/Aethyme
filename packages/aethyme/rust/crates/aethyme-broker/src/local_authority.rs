@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 
 // A 4096-byte reason/detail may require six JSON bytes per escaped byte.
 const MAX_FILE_BYTES: usize = 32 * 1024;
+const INITIAL_INSTALLATION_INTERRUPTED: &str = "initial installation interrupted";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -31,10 +32,20 @@ pub enum Status {
     Active,
     Frozen,
 }
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WitnessOrigin {
+    InitialInstallation,
+    OperatorFreeze,
+    Resume,
+    Active,
+}
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Witness {
     pub version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<WitnessOrigin>,
     pub epoch: Epoch,
     pub status: Status,
     pub checkpoint: Option<String>,
@@ -114,7 +125,7 @@ fn read(path: &Path) -> Result<Witness, AuthorityError> {
         return Err(AuthorityError::Invalid("witness size".into()));
     }
     let w: Witness = serde_json::from_slice(&bytes)?;
-    if w.version != 1
+    if !matches!((w.version, w.origin), (1, None) | (2, Some(_)))
         || RecordId::parse(w.epoch.as_str()).is_err()
         || w.checkpoint
             .as_ref()
@@ -182,11 +193,12 @@ pub(crate) fn acquire(store: &mut CollaborationStore) -> Result<(Epoch, Guard), 
         }
         let epoch = fresh_epoch()?;
         let frozen = Witness {
-            version: 1,
+            version: 2,
+            origin: Some(WitnessOrigin::InitialInstallation),
             epoch: epoch.clone(),
             status: Status::Frozen,
             checkpoint: None,
-            reason: Some("initial installation interrupted".into()),
+            reason: Some(INITIAL_INSTALLATION_INTERRUPTED.into()),
         };
         write(&path, &frozen)?;
         let tx = store
@@ -201,6 +213,7 @@ pub(crate) fn acquire(store: &mut CollaborationStore) -> Result<(Epoch, Guard), 
             &path,
             &Witness {
                 status: Status::Active,
+                origin: Some(WitnessOrigin::Active),
                 checkpoint: None,
                 reason: None,
                 ..frozen
@@ -374,7 +387,8 @@ pub fn freeze(
         return Err(AuthorityError::Stale);
     }
     let mut next = Witness {
-        version: 1,
+        version: 2,
+        origin: Some(WitnessOrigin::OperatorFreeze),
         epoch: fresh_epoch()?,
         status: Status::Frozen,
         checkpoint: None,
@@ -432,6 +446,8 @@ pub fn resume(store: &mut CollaborationStore, expected: &Epoch) -> Result<Witnes
     let epoch = fresh_epoch()?;
     // Persist the new frozen token first. A crash cannot reactivate the old DB.
     let mut next = Witness {
+        version: 2,
+        origin: Some(WitnessOrigin::Resume),
         epoch: epoch.clone(),
         ..current
     };
@@ -439,6 +455,7 @@ pub fn resume(store: &mut CollaborationStore, expected: &Epoch) -> Result<Witnes
     tx.execute("INSERT INTO local_authority_state(singleton,epoch) VALUES(1,?1) ON CONFLICT(singleton) DO UPDATE SET epoch=excluded.epoch",[epoch.as_str()])?;
     tx.commit()?;
     next.status = Status::Active;
+    next.origin = Some(WitnessOrigin::Active);
     next.checkpoint = None;
     next.reason = None;
     write(&path, &next)?;
@@ -464,13 +481,33 @@ pub fn complete_interrupted_freeze(
     let tx = store
         .connection()
         .transaction_with_behavior(TransactionBehavior::Immediate)?;
-    if bound(&tx)?.is_none() {
-        return Err(AuthorityError::Stale);
+    let current_binding = bound(&tx)?;
+    if current.origin == Some(WitnessOrigin::InitialInstallation)
+        && current.reason.as_deref() == Some(INITIAL_INSTALLATION_INTERRUPTED)
+    {
+        // This exact witness is persisted before the first Active state can be
+        // published, so historical Local records may predate authority. The
+        // typed origin prevents an operator-selected reason from claiming this
+        // recovery path.
+        match current_binding {
+            Some(bound_epoch) if bound_epoch == current.epoch => {}
+            Some(_) => return Err(AuthorityError::Stale),
+            None => {
+                tx.execute(
+                    "INSERT INTO local_authority_state(singleton,epoch) VALUES(1,?1)",
+                    [current.epoch.as_str()],
+                )?;
+            }
+        }
+    } else {
+        if current_binding.is_none() {
+            return Err(AuthorityError::Stale);
+        }
+        tx.execute(
+            "UPDATE local_authority_state SET epoch=?1 WHERE singleton=1",
+            [current.epoch.as_str()],
+        )?;
     }
-    tx.execute(
-        "UPDATE local_authority_state SET epoch=?1 WHERE singleton=1",
-        [current.epoch.as_str()],
-    )?;
     quarantine(&tx)?;
     current.checkpoint = Some(checkpoint(&tx)?);
     tx.commit()?;

@@ -51,6 +51,8 @@ pub enum AcceptanceError {
     #[error(transparent)]
     Verification(#[from] verifier::VerificationError),
     #[error(transparent)]
+    Sensitive(#[from] crate::collaboration_sensitive::SensitiveError),
+    #[error(transparent)]
     Broker(#[from] crate::BrokerOpError),
     #[error(transparent)]
     Git(#[from] crate::GitError),
@@ -369,6 +371,7 @@ pub fn load(
     store: &CollaborationStore,
     binding: &RecordId,
 ) -> Result<AcceptanceBinding, AcceptanceError> {
+    let _response = crate::collaboration_sensitive::response_use(store)?;
     let (revision, body): (String, Vec<u8>) = store
         .read_connection()
         .query_row(
@@ -899,6 +902,7 @@ pub fn last_receipt(
     store: &CollaborationStore,
     binding: &RecordId,
 ) -> Result<Option<AcceptanceReceipt>, AcceptanceError> {
+    let _response = crate::collaboration_sensitive::response_use(store)?;
     let b = load(store, binding)?;
     let row:Option<(String,Vec<u8>)>=store.read_connection().query_row("SELECT r.id,r.body FROM local_acceptance_bindings b JOIN local_acceptance_receipts r ON r.id=b.last_receipt AND r.binding=b.id WHERE b.id=?1",[binding.as_str()],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
     let Some((rid, body)) = row else {

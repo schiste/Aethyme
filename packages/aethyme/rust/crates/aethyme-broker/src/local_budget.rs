@@ -328,6 +328,8 @@ pub enum BudgetError {
     #[error(transparent)]
     Wave(#[from] wave::WaveError),
     #[error(transparent)]
+    Sensitive(#[from] crate::collaboration_sensitive::SensitiveError),
+    #[error(transparent)]
     Sqlite(#[from] rusqlite::Error),
     #[error(transparent)]
     Json(#[from] serde_json::Error),
@@ -596,6 +598,7 @@ fn load_conn_at(
     })
 }
 pub fn load(store: &CollaborationStore, key: &RecordId) -> Result<Reservation, BudgetError> {
+    let _response = crate::collaboration_sensitive::response_use(store)?;
     let r = load_conn(store.read_connection(), key)?;
     let w = wave::load(store, &id(&r.spec.wave)?)?;
     if r.spec.target != w.spec.target

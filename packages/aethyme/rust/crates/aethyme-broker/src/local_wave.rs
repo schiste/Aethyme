@@ -178,6 +178,8 @@ pub enum WaveError {
     #[error(transparent)]
     Target(#[from] TargetError),
     #[error(transparent)]
+    Sensitive(#[from] crate::collaboration_sensitive::SensitiveError),
+    #[error(transparent)]
     Archive(#[from] archive::ArchiveError),
     #[error(transparent)]
     Compose(#[from] composer::ComposeError),
@@ -228,6 +230,7 @@ pub(crate) fn available(
 }
 
 pub fn load(store: &CollaborationStore, wave: &RecordId) -> Result<Wave, WaveError> {
+    let _response = crate::collaboration_sensitive::response_use(store)?;
     type Row = (
         Vec<u8>,
         String,

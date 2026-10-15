@@ -62,6 +62,8 @@ pub enum TransportError {
     #[error(transparent)]
     Broker(#[from] crate::BrokerOpError),
     #[error(transparent)]
+    Sensitive(#[from] crate::collaboration_sensitive::SensitiveError),
+    #[error(transparent)]
     Sqlite(#[from] rusqlite::Error),
     #[error(transparent)]
     Json(#[from] serde_json::Error),
@@ -427,6 +429,7 @@ pub fn prepare(
 }
 
 pub fn load(store: &CollaborationStore, id: &RecordId) -> Result<Intent, TransportError> {
+    let _response = crate::collaboration_sensitive::response_use(store)?;
     let (bytes,revision,target,peer,destination):(Vec<u8>,String,String,String,String)=store.read_connection().query_row(
         "SELECT body,revision,target,peer,destination FROM local_source_transports WHERE intent=?1",[id.as_str()],
         |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).optional()?.ok_or(TransportError::Missing)?;
@@ -728,6 +731,7 @@ pub fn last_receipt(
     store: &CollaborationStore,
     id: &RecordId,
 ) -> Result<Option<Receipt>, TransportError> {
+    let _response = crate::collaboration_sensitive::response_use(store)?;
     let intent = load(store, id)?;
     let (observation, bytes): (String, Option<Vec<u8>>) = store.read_connection().query_row(
         "SELECT observation,receipt FROM local_source_transports WHERE intent=?1",
