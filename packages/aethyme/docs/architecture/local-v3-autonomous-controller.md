@@ -63,9 +63,11 @@ supply no future authority. Independent roots retain completion provenance;
 unknown consumption retains roots and reservations. Stop prevents further
 managed dispatch while cancellation/recovery keeps lingering work visible.
 
-Collaboration state schema and compatibility floor are 22. Migrations 19 and 20
-adopt existing controller tables without deleting retained rows. The later
-migration controls preserve completion, dispatch and root sentinels.
+The controller migrations require collaboration schema/floor 22. Migrations
+19 and 20 adopt existing controller tables without deleting retained rows. The
+aggregate Local branch uses schema/floor 23, whose native-job migration adds the
+irreversible root-release witness. Migration controls preserve completion,
+dispatch and root sentinels.
 
 ## Resource and deadline limits
 

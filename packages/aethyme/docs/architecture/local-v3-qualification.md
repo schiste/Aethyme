@@ -39,7 +39,7 @@ original limits.
 | Composition and bounded resolution | #733–#736/#755 | Historical provisional text profile plus [bounded external HTML structural profile](local-v3-e1-profile.md); semantic repair/consumer/subtraction evidence; original held-outs are not rerun; [reachable request guards](local-v3-qualification/resolution-guards-2026-10-12.json) |
 | Targets, finite waves, budgets and native epoch | #737–#740/#759/#763 | Transition, arrival, reservation, stop and stale-authority schedules; [actual appointed service and twenty-change evolution](local-v3-autonomous-controller.md); [bounded sustained-arrival trial](../../../aethyme-eval/fx10/evidence/actual-1123-1f7b2266/README.md) passed after one retained harness failure; no general reliability claim |
 | Exact execution, supervisor, verifier and resources | #741–#744/#758 | Independent negative profiles and artifact checks; actual bounded tmpfs ENOSPC and cgroup OOM below; [typed native candidate/gate join](local-v3-native-gates.md) implemented on the Local branch |
-| Source publication and acceptance | #745/#746 | Real private generic Git and native appointed observations; live GitHub/Mergify binding pending |
+| Source publication and acceptance | #745/#746 | Real private generic Git and native appointed observations; live GitHub/Mergify remains explicitly unbound |
 | Generation, exchange and controlled handoff | #747–#749 | Real child/open-file schedules; [handoff regression ledger](local-v3-qualification/handoff-restored-2026-10-11.json); real controlled native joined path below |
 | Retained export and isolated rehearsal | #750 | Independent receiver build after origin deletion; [restore regression and guard ledger](local-v3-qualification/restore-restored-2026-10-11.json); source/history only |
 | Disable, old binary, offline and paired CLI behavior | #751 | [Native compatibility ledger](local-v3-qualification/compatibility-native-2026-10-12.json); one pinned old binary and a declared finite paired-command set |
@@ -179,9 +179,10 @@ strict broker Clippy. These executions overlap across selections.
 
 This is a private single-writer profile. Host admission is not a global
 reservation; the ownership check followed by unlink is not atomic against a
-concurrent path change. This does not qualify native mid-capture journal IO,
-full host/daemon storage, another backend, power loss or build/verifier authority.
-Q3, Q4 and whole Local qualification remain open.
+concurrent path change. This earlier profile does not qualify native mid-capture
+journal IO, full host/daemon storage, another backend, power loss or
+build/verifier authority.
+Later joined and pressure/GC evidence is recorded separately below.
 
 ## Proof removals and provenance
 
@@ -198,7 +199,7 @@ provenance is the serial runner and root-observed terminal results; complete
 output hashes independently establish the named outcomes. It does not claim
 every decision-key/path comparison arm was removed.
 
-## Remaining Local requirements
+## Integrated results and qualification limits
 
 FX17 has a passing twenty-change controlled native run at `c45d4096`, after two
 unsuccessful runs. Its [complete attempt ledger](../../../../target/local-resume/attempts-ledger.md)
@@ -258,9 +259,9 @@ A bounded schedule with explicit operation/lock witnesses is implemented;
 its physical interleaving qualification is still in progress.
 This requirement does not imply a full-host, daemon-storage or power-loss claim.
 
-The operator must designate the disposable GitHub/Mergify repository, branch
-and policy before live-provider trials. Actual private GenericGit acceptance
-does not qualify that provider. Optional analysis profiles require their own
-execution decisions and applicable qualification; disabled optional profiles do
+The live GitHub/Mergify route remains unbound in this Local profile. Actual
+private GenericGit acceptance does not qualify that provider. Optional analysis
+profiles require their own execution decisions and applicable qualification;
+disabled optional profiles do
 not expand this Local claim. Neither historical receipts nor test success grant
 current execution, verifier, provider or publication authority.
