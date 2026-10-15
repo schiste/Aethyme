@@ -1,0 +1,20 @@
+   Compiling aethyme-broker v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/implement-deterministic-t45-gc-and-stora/packages/aethyme/rust/crates/aethyme-broker)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1m 18s
+     Running unittests src/lib.rs (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/integrate-reviewed-local-bare-git-servic/target/local-resume/cargo/debug/deps/aethyme_broker-0f278e0d02146111)
+
+running 1 test
+test execution_resources::qualification::native_filesystem::actual_native_t45_capture_and_hydration_enospc_interleave_with_gc ... Native source filesystem recovery root /Volumes/T7-repositories/Application Support/Aethyme/qualification/local-check-temporaries/t45-mutation-m2-hydration-sh-tmp-s31h815m/.tmpahDe7p
+
+thread 'execution_resources::qualification::native_filesystem::actual_native_t45_capture_and_hydration_enospc_interleave_with_gc' (2040746) panicked at crates/aethyme-broker/src/local_qualification/native_filesystem.rs:1502:9:
+hydration GC must return ArchiveInUse before pressure while materialization holds archive SH
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+
+failures:
+    execution_resources::qualification::native_filesystem::actual_native_t45_capture_and_hydration_enospc_interleave_with_gc
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1830 filtered out; finished in 34.09s
+
+error: test failed, to rerun pass `-p aethyme-broker --lib`

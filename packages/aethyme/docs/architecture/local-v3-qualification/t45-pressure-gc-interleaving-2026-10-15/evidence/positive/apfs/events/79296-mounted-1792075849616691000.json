@@ -1,0 +1,10 @@
+{
+  "device": "/dev/disk8",
+  "filesystem_device": 16777249,
+  "image_inode": [
+    16777241,
+    73633621
+  ],
+  "uuid": "E088D376-B3D7-476E-B466-5F1CC1E9DE33",
+  "volume": "/dev/disk9s1"
+}
