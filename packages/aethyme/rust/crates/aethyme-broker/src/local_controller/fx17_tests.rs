@@ -32,6 +32,8 @@ const FX17_SOURCE_REVIEW_SHA: &str =
     "de7d56d9cc37f68787540e298bd49577c3fdf83b51544e3113aed4928eebb74e";
 const FX17_PROVENANCE_SHA: &str =
     "6c6205982af3a7fc20d3e62134e4b30d9ad5ee7b3bb8f424a005a3296083829f";
+const FIXTURE_GIT_PATH: &str = "/usr/bin:/bin";
+const FIXTURE_GIT_NULL_DEVICE: &str = "/dev/null";
 
 const CONTROLLED_STATES: [&str; 21] = [
     include_str!("../../../../../../aethyme-eval/fx17/controlled/00-app.sh"),
@@ -101,26 +103,50 @@ fn output_error(program: &str, args: &[String], output: &Output) -> String {
     )
 }
 
+fn fixture_git_command(repo: &Path, args: &[String], index: Option<&Path>) -> Command {
+    let mut command = Command::new("git");
+    command
+        .env_clear()
+        .current_dir(repo)
+        .env("PATH", FIXTURE_GIT_PATH)
+        .env("HOME", "")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_SYSTEM", FIXTURE_GIT_NULL_DEVICE)
+        .env("GIT_CONFIG_GLOBAL", FIXTURE_GIT_NULL_DEVICE)
+        .env("GIT_ATTR_NOSYSTEM", "1")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_AUTHOR_NAME", "FX17 fixture")
+        .env("GIT_AUTHOR_EMAIL", "fx17@example.invalid")
+        .env("GIT_COMMITTER_NAME", "FX17 fixture")
+        .env("GIT_COMMITTER_EMAIL", "fx17@example.invalid")
+        .args([
+            "-c",
+            "commit.gpgsign=false",
+            "-c",
+            "core.autocrlf=false",
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "core.attributesFile=/dev/null",
+            "-c",
+            "core.excludesFile=/dev/null",
+            "-c",
+            "commit.template=",
+        ])
+        .args(args);
+    if let Some(index) = index {
+        command.env("GIT_INDEX_FILE", index);
+    }
+    command
+}
+
 fn git_output(
     repo: &Path,
     args: &[String],
     index: Option<&Path>,
     stdin: Option<&[u8]>,
 ) -> Result<Output, String> {
-    let mut command = Command::new("git");
-    command
-        .current_dir(repo)
-        .args(["-c", "commit.gpgsign=false", "-c", "core.autocrlf=false"])
-        .args(args)
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_AUTHOR_NAME", "FX17 fixture")
-        .env("GIT_AUTHOR_EMAIL", "fx17@example.invalid")
-        .env("GIT_COMMITTER_NAME", "FX17 fixture")
-        .env("GIT_COMMITTER_EMAIL", "fx17@example.invalid");
-    if let Some(index) = index {
-        command.env("GIT_INDEX_FILE", index);
-    }
+    let mut command = fixture_git_command(repo, args, index);
     let output = if let Some(bytes) = stdin {
         let mut child = command
             .stdin(Stdio::piped())
