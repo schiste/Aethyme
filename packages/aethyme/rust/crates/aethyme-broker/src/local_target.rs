@@ -785,7 +785,7 @@ pub(crate) struct ArtifactRetentionPermit<'a> {
 impl<'a> ArtifactRetentionPermit<'a> {
     pub(crate) fn new(
         store: &CollaborationStore,
-        owner: &ControllerOwner,
+        owner: &'a ControllerOwner,
         archive: &'a crate::collaboration_gc::ArchiveUse,
         response: &'a crate::collaboration_sensitive::ResponseUse,
         authority: &'a crate::local_authority::Guard,
