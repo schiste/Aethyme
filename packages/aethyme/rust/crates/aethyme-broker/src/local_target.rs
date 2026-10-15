@@ -765,26 +765,25 @@ pub fn retain_artifacts(
     let archive_guard = archive_use(store)?;
     let response_guard = crate::collaboration_sensitive::response_use(store)?;
     let authority_guard = authorize(store, owner)?;
-    retain_artifacts_under_guards(
+    let permit = ArtifactRetentionPermit::new(
         store,
         owner,
-        id,
-        snapshots,
-        objects,
         &archive_guard,
         &response_guard,
         &authority_guard,
-    )
+    )?;
+    retain_artifacts_under_guards(store, id, snapshots, objects, &permit)
 }
 
-struct ArtifactRetentionPermit<'a> {
+pub(crate) struct ArtifactRetentionPermit<'a> {
+    owner: &'a ControllerOwner,
     _archive: &'a crate::collaboration_gc::ArchiveUse,
     response: &'a crate::collaboration_sensitive::ResponseUse,
     _authority: &'a crate::local_authority::Guard,
 }
 
 impl<'a> ArtifactRetentionPermit<'a> {
-    fn new(
+    pub(crate) fn new(
         store: &CollaborationStore,
         owner: &ControllerOwner,
         archive: &'a crate::collaboration_gc::ArchiveUse,
@@ -800,6 +799,7 @@ impl<'a> ArtifactRetentionPermit<'a> {
         crate::collaboration_sensitive::ensure_available(store)?;
         validate_owner(store, owner)?;
         Ok(Self {
+            owner,
             _archive: archive,
             response,
             _authority: authority,
@@ -812,17 +812,13 @@ impl<'a> ArtifactRetentionPermit<'a> {
 /// lifetime explicit and avoid recursively opening the archive flock.
 pub(crate) fn retain_artifacts_under_guards(
     store: &mut CollaborationStore,
-    owner: &ControllerOwner,
     id: &RecordId,
     snapshots: &[SourceSnapshotId],
     objects: &[ObjectDigest],
-    _archive: &crate::collaboration_gc::ArchiveUse,
-    response: &crate::collaboration_sensitive::ResponseUse,
-    _authority: &crate::local_authority::Guard,
+    permit: &ArtifactRetentionPermit<'_>,
 ) -> Result<(), TargetError> {
-    let permit = ArtifactRetentionPermit::new(store, owner, _archive, response, _authority)?;
     let revision = load_revision_under_response(store, id, permit.response)?;
-    if revision.target != owner.target {
+    if revision.target != permit.owner.target || revision.issuer != permit.owner.issuer {
         return Err(TargetError::Unauthorized);
     }
     for snapshot in snapshots {

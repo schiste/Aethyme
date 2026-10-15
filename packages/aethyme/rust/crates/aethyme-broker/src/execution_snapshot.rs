@@ -283,6 +283,13 @@ fn freeze_bounded(
     let archive_guard = crate::collaboration_gc::archive_use(store)?;
     let response_guard = crate::collaboration_sensitive::response_use(store)?;
     let authority_guard = target::authorize(store, owner)?;
+    let permit = target::ArtifactRetentionPermit::new(
+        store,
+        owner,
+        &archive_guard,
+        &response_guard,
+        &authority_guard,
+    )?;
     current_under_response(store, owner, revision, &response_guard)?;
     let mut total = 0u64;
     for id in &inputs {
@@ -296,16 +303,7 @@ fn freeze_bounded(
     }
     let digest = archive::put_object(store, &bytes)?;
     // Pin under one retained revision and the same archive lock as reclamation.
-    target::retain_artifacts_under_guards(
-        store,
-        owner,
-        revision,
-        &inputs,
-        &[digest],
-        &archive_guard,
-        &response_guard,
-        &authority_guard,
-    )?;
+    target::retain_artifacts_under_guards(store, revision, &inputs, &[digest], &permit)?;
     Ok(ExecutionSnapshot {
         reference: SnapshotRef {
             id: record.id(),

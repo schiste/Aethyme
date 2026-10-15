@@ -686,6 +686,45 @@ fn candidate_and_request_objects_are_pinned_atomically_with_their_source() {
 }
 
 #[test]
+fn artifact_retention_permit_rejects_foreign_project_and_epoch_guards() {
+    let mut f = Fixture::new();
+    let owner = acquire_controller(&mut f.store, "target", "appointed").unwrap();
+    let mut foreign = Fixture::new();
+    let foreign_owner = acquire_controller(&mut foreign.store, "target", "appointed").unwrap();
+    let foreign_archive = gc::archive_use(&foreign.store).unwrap();
+    let foreign_response = crate::collaboration_sensitive::response_use(&foreign.store).unwrap();
+    let foreign_authority = authorize(&foreign.store, &foreign_owner).unwrap();
+    assert!(matches!(
+        ArtifactRetentionPermit::new(
+            &f.store,
+            &owner,
+            &foreign_archive,
+            &foreign_response,
+            &foreign_authority,
+        ),
+        Err(TargetError::Unauthorized)
+    ));
+
+    let archive = gc::archive_use(&f.store).unwrap();
+    let response = crate::collaboration_sensitive::response_use(&f.store).unwrap();
+    let mut wrong_epoch_owner =
+        acquire_controller(&mut f.store, "other-target", "appointed").unwrap();
+    let authority = authorize(&f.store, &owner).unwrap();
+    wrong_epoch_owner.epoch =
+        serde_json::from_value(serde_json::json!(format!("sha256:{}", "f".repeat(64)))).unwrap();
+    assert!(matches!(
+        ArtifactRetentionPermit::new(
+            &f.store,
+            &wrong_epoch_owner,
+            &archive,
+            &response,
+            &authority,
+        ),
+        Err(TargetError::Unauthorized)
+    ));
+}
+
+#[test]
 fn migration_adopts_charged_resolution_attempts_and_fences_schema_six() {
     let f = Fixture::new();
     let host = f._host.path().to_path_buf();

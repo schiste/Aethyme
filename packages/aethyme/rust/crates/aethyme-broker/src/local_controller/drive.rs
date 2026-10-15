@@ -313,16 +313,14 @@ pub(super) fn drive_until(
         };
         let record = canonical(&spec)?;
         let object = archive::put_object(store, &record.canonical_bytes())?;
-        target::retain_artifacts_under_guards(
+        let retention = target::ArtifactRetentionPermit::new(
             store,
             owner,
-            &revision,
-            &[],
-            &[object],
             &archive_guard,
             &response_guard,
             &authority_guard,
         )?;
+        target::retain_artifacts_under_guards(store, &revision, &[], &[object], &retention)?;
         store.connection().execute(
             "INSERT INTO local_controller_runs(wave,id,epoch,state,body) VALUES(?1,?2,?3,'dispatching',?4)",
             params![active.id.as_str(), record.id().as_str(), spec.epoch, record.canonical_bytes()],

@@ -454,6 +454,13 @@ pub fn configure(
     let archive_guard = crate::collaboration_gc::archive_use(store)?;
     let _response = crate::collaboration_sensitive::response_use(store)?;
     let authority_guard = target::authorize(store, owner)?;
+    let retention = target::ArtifactRetentionPermit::new(
+        store,
+        owner,
+        &archive_guard,
+        &_response,
+        &authority_guard,
+    )?;
     if !valid_name(producer) {
         return Err(VerificationError::Producer);
     }
@@ -468,16 +475,7 @@ pub fn configure(
     }
     let harness = retained_harness_inventory(store, &policy)?;
     let physical = archive::put_object(store, &record.canonical_bytes())?;
-    target::retain_artifacts_under_guards(
-        store,
-        owner,
-        &revision,
-        &[harness],
-        &[physical],
-        &archive_guard,
-        &_response,
-        &authority_guard,
-    )?;
+    target::retain_artifacts_under_guards(store, &revision, &[harness], &[physical], &retention)?;
     let tx = store
         .connection()
         .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -838,17 +836,15 @@ fn retain_evidence(
     let archive_guard = crate::collaboration_gc::archive_use(store)?;
     let response_guard = crate::collaboration_sensitive::response_use(store)?;
     let authority_guard = target::authorize(store, owner)?;
-    let physical = archive::put_object(store, &record.canonical_bytes())?;
-    target::retain_artifacts_under_guards(
+    let retention = target::ArtifactRetentionPermit::new(
         store,
         owner,
-        &revision,
-        &[],
-        &[physical],
         &archive_guard,
         &response_guard,
         &authority_guard,
     )?;
+    let physical = archive::put_object(store, &record.canonical_bytes())?;
+    target::retain_artifacts_under_guards(store, &revision, &[], &[physical], &retention)?;
     let tx = store
         .connection()
         .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;

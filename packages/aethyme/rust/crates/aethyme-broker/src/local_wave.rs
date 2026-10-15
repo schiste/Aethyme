@@ -204,7 +204,9 @@ fn object(value: &str) -> Result<ObjectDigest, WaveError> {
 }
 
 /// Idempotent availability for an exact selected input. This is not execution
-/// authorization and cannot add a new input to the target.
+/// authorization and cannot add a new input to the target. Production arrivals
+/// use the retained capture-notice ingress and owner-tick path below.
+#[cfg(test)]
 pub(crate) fn available(
     store: &mut CollaborationStore,
     owner: &ControllerOwner,
@@ -794,7 +796,9 @@ pub fn compose(
     repo: &Path,
     wave_id: &RecordId,
 ) -> Result<Wave, WaveError> {
-    let _authority = target::authorize(store, owner)?;
+    let archive_guard = archive_use(store)?;
+    let response_guard = crate::collaboration_sensitive::response_use(store)?;
+    let authority_guard = target::authorize(store, owner)?;
     let wave = load(store, wave_id)?;
     let state = current(store, owner, &wave)?;
     if wave.phase == WavePhase::Verifying {
@@ -803,8 +807,8 @@ pub fn compose(
     if wave.phase != WavePhase::Frozen {
         return Err(WaveError::OutcomeUnknown);
     }
-    let _archive = archive_use(store)?;
-    let pinned = target::load_revision(store, &id(&wave.spec.revision)?)?;
+    let pinned =
+        target::load_revision_under_response(store, &id(&wave.spec.revision)?, &response_guard)?;
     let baseline =
         archive::retained(store, &snapshot(&wave.spec.baseline)?)?.ok_or(TargetError::Missing)?;
     let (base_commit, accepted, already_delivered) = if let Some(key) = &wave.spec.prior_completion
@@ -850,6 +854,9 @@ pub fn compose(
         return Err(WaveError::Stale);
     }
     tx.commit()?;
+    drop(authority_guard);
+    drop(response_guard);
+    drop(archive_guard);
     let started = std::time::Instant::now();
     let request = CompositionRequest {
         baseline: base_commit,
@@ -869,25 +876,20 @@ pub fn compose(
     let elapsed = i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX);
     // State may have been stopped while the external Git tool ran. Retain the
     // bytes as historical work, but reject changing the current generation.
-    let (phase, detail, candidate, commit, recipe) = match result {
+    let (phase, detail, candidate, commit, recipe, candidate_source, recipe_object) = match result {
         Ok(composition) => match composition.outcome {
             crate::composition::CompositionOutcome::Candidate(candidate) => {
                 let recipe = composition
                     .recipe
                     .ok_or_else(|| WaveError::Invalid("candidate has no recipe".into()))?;
-                target::retain_artifacts(
-                    store,
-                    owner,
-                    &id(&wave.spec.revision)?,
-                    std::slice::from_ref(&candidate.subject),
-                    &[recipe.object],
-                )?;
                 (
                     "verifying",
                     "trusted verification adapter unavailable".into(),
                     Some(candidate.subject.to_string()),
                     Some(candidate.commit.as_str().to_string()),
                     Some(recipe.object.hex()),
+                    Some(candidate.subject),
+                    Some(recipe.object),
                 )
             }
             outcome => {
@@ -904,11 +906,48 @@ pub fn compose(
                 } else {
                     "blocked"
                 };
-                (phase, outcome.code().to_string(), None, None, None)
+                (
+                    phase,
+                    outcome.code().to_string(),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
             }
         },
-        Err(error) => ("outcome_unknown", error.to_string(), None, None, None),
+        Err(error) => (
+            "outcome_unknown",
+            error.to_string(),
+            None,
+            None,
+            None,
+            None,
+            None,
+        ),
     };
+    let archive_guard = archive_use(store)?;
+    let response_guard = crate::collaboration_sensitive::response_use(store)?;
+    let authority_guard = target::authorize(store, owner)?;
+    let retention = target::ArtifactRetentionPermit::new(
+        store,
+        owner,
+        &archive_guard,
+        &response_guard,
+        &authority_guard,
+    )?;
+    if let (Some(candidate_source), Some(recipe_object)) =
+        (candidate_source.as_ref(), recipe_object.as_ref())
+    {
+        target::retain_artifacts_under_guards(
+            store,
+            &id(&wave.spec.revision)?,
+            std::slice::from_ref(candidate_source),
+            std::slice::from_ref(recipe_object),
+            &retention,
+        )?;
+    }
     let tx = store
         .connection()
         .transaction_with_behavior(TransactionBehavior::Immediate)?;

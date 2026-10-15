@@ -653,6 +653,13 @@ impl DockerExecutor {
             let archive_guard = crate::collaboration_gc::archive_use(store)?;
             let response_guard = crate::collaboration_sensitive::response_use(store)?;
             let authority_guard = target::authorize(store, owner)?;
+            let retention = target::ArtifactRetentionPermit::new(
+                store,
+                owner,
+                &archive_guard,
+                &response_guard,
+                &authority_guard,
+            )?;
             require_active(store, owner, execution, &authority_guard)?;
             let packaging = format!(
                 "sha256:{}",
@@ -671,13 +678,10 @@ impl DockerExecutor {
             objects.push(physical);
             target::retain_artifacts_under_guards(
                 store,
-                owner,
                 execution.target_revision(),
                 &[],
                 &objects,
-                &archive_guard,
-                &response_guard,
-                &authority_guard,
+                &retention,
             )?;
             if cancel.load(Ordering::SeqCst) {
                 return Ok(BuildObservation {
