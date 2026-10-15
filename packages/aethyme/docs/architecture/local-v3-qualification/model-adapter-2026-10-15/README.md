@@ -20,3 +20,8 @@ in the mutation records identify disposable test roots that have been removed.
 No model request, private behavioral evaluator or isolation control was run.
 These checks do not supply candidate outputs or retrospectively qualify the six
 failed campaign rows. Controls006 still applies only to its original runner.
+
+Raw pytest failure logs retain three whitespace-only diagnostic lines across
+`candidate-refusal-exclusivity-guard.log` and `tool-error-item-guard.log`. Those
+bytes are deliberate evidence exceptions to `git diff --check`; they are not
+normalized or described as a whitespace-clean raw diff.
