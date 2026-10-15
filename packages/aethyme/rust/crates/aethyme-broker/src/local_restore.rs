@@ -446,31 +446,7 @@ fn read_bounded(
     store: &CollaborationStore,
     digest: &ObjectDigest,
 ) -> Result<Vec<u8>, RestoreError> {
-    use std::io::Read;
-    let path = archive::object_path(store, digest);
-    let metadata = std::fs::symlink_metadata(&path)?;
-    if !metadata.is_file()
-        || metadata.file_type().is_symlink()
-        || metadata.len() > MAX_OBJECT as u64
-    {
-        return Err(invalid("object file profile or budget"));
-    }
-    let mut options = std::fs::OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW);
-    }
-    let mut bytes = Vec::new();
-    options
-        .open(path)?
-        .take(MAX_OBJECT as u64 + 1)
-        .read_to_end(&mut bytes)?;
-    if bytes.len() > MAX_OBJECT || ObjectDigest::of(&bytes) != *digest {
-        return Err(invalid("retained object digest or budget"));
-    }
-    Ok(bytes)
+    archive::read_object_bounded(store, digest, MAX_OBJECT).map_err(RestoreError::from)
 }
 fn collect(
     store: &CollaborationStore,
@@ -504,6 +480,7 @@ pub fn export(
 ) -> Result<Vec<u8>, RestoreError> {
     let _epoch = target::authorize(store, owner)?;
     let _archive = gc::archive_use(store)?;
+    let _response = crate::collaboration_sensitive::response_use(store)?;
     scope.validate()?;
     if scope.origin != store.project().as_str() {
         return Err(RestoreError::Binding);

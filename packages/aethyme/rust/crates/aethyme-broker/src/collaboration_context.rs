@@ -680,6 +680,8 @@ pub fn attach_brief(
     contribution: &RecordId,
     brief: &Brief,
 ) -> Result<RecordId, ContextError> {
+    let _response = crate::collaboration_sensitive::response_use(store)
+        .map_err(crate::collaboration_archive::ArchiveError::from)?;
     let errors = brief.validate();
     if !errors.is_empty() {
         return Err(ContextError::InvalidBrief(
@@ -1803,6 +1805,8 @@ fn retrieve_with(
     mut hooks: Hooks<'_>,
     use_cache: bool,
 ) -> Result<Answer, ContextError> {
+    let _response = crate::collaboration_sensitive::response_use(store)
+        .map_err(crate::collaboration_archive::ArchiveError::from)?;
     query.budget.check()?;
     if query.scope.is_empty() {
         return Err(ContextError::EmptyScope);

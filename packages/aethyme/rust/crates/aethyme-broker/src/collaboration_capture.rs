@@ -915,7 +915,9 @@ fn commit(
     // keys; check that the manifests themselves are still on disk.
     for snapshot in [&base, &result] {
         let id = snapshot_id(snapshot, operation_id)?;
-        if !has_object(store, &ObjectDigest::of_snapshot(&id)) {
+        let manifest_exists = has_object(store, &ObjectDigest::of_snapshot(&id))
+            .map_err(|error| archive_failure(operation_id, &error))?;
+        if !manifest_exists {
             return Err(CaptureError::CorruptReceipt {
                 operation_id: operation_id.as_str().to_string(),
                 detail: format!("the manifest of snapshot {snapshot} is missing from the archive"),
@@ -1110,6 +1112,17 @@ pub fn try_capture(
     else {
         return Ok(None);
     };
+    let Some(_response) =
+        crate::collaboration_sensitive::try_response_use(store).map_err(|error| {
+            CaptureError::Refused {
+                operation_id: request.operation_id.to_string(),
+                code: "sensitive_response_quarantined".into(),
+                detail: error.to_string(),
+            }
+        })?
+    else {
+        return Ok(None);
+    };
     let Some(_lock) = lock_operation(store, &request.operation_id, false)? else {
         return Ok(None);
     };
@@ -1124,6 +1137,13 @@ pub(crate) fn capture_with(
     // Shared with every other capture and reader; reclamation (#659) waits
     // for all of them. Taken before the operation lock, always.
     let _use = archive_use(store)?;
+    let _response = crate::collaboration_sensitive::response_use(store).map_err(|error| {
+        CaptureError::Refused {
+            operation_id: request.operation_id.to_string(),
+            code: "sensitive_response_quarantined".into(),
+            detail: error.to_string(),
+        }
+    })?;
     let _lock = lock_operation(store, &request.operation_id, true)?;
     capture_locked(store, request, hooks)
 }

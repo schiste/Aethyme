@@ -160,7 +160,7 @@ pub fn try_archive_use(store: &CollaborationStore) -> std::io::Result<Option<Arc
     }
 }
 
-struct ArchiveExclusive {
+pub(crate) struct ArchiveExclusive {
     /// Closing the file releases the lock.
     _file: std::fs::File,
 }
@@ -178,6 +178,14 @@ fn try_exclusive(store: &CollaborationStore) -> Result<Option<ArchiveExclusive>,
             source,
         }),
     }
+}
+
+/// Administrative sensitive-content purge takes the same exclusive archive
+/// barrier as GC, but does not require an ordinary GC plan.
+pub(crate) fn try_admin_exclusive(
+    store: &CollaborationStore,
+) -> Result<Option<ArchiveExclusive>, GcError> {
+    try_exclusive(store)
 }
 
 // ------------------------------------------------------------------ types
