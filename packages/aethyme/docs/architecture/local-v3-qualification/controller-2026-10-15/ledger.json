@@ -1,0 +1,106 @@
+{
+  "format": "aethyme.local-controller.qualification/v1",
+  "recorded_utc": "2026-10-15",
+  "scope": "Appointed finite Local controller; actual Docker build, independent artifact verification and private GenericGit acceptance",
+  "source": {
+    "commit": "0d72131d0f09c79894a3daccd4a2159b372f012c",
+    "tree": "e944e0113c9cab941cf22d613982f5eea24155f8",
+    "publication_fix_commit": "9b5796ceab1e57ff6e375fcd207bac19ede0bcac",
+    "drive_sha256": "504c98fdaed40777a21bf1b4c3abdf5cfdaedf40e3c736925be1033d5b8b6831"
+  },
+  "ordinary_controls": {
+    "commit": "9b5796ceab1e57ff6e375fcd207bac19ede0bcac",
+    "tree": "15eeae6e5a6fe90ebb34e9426d775e035e914324",
+    "exit_status": 0,
+    "passed": 19,
+    "failed": 0,
+    "ignored": 1,
+    "log": "ordinary-controls.log"
+  },
+  "native_attempts": [
+    {
+      "attempt": 1,
+      "commit": "9b5796ceab1e57ff6e375fcd207bac19ede0bcac",
+      "exit_status": 101,
+      "passed": 0,
+      "failed": 1,
+      "test_seconds": 219.23,
+      "classification": "fixture scheduling assertion failed: ticks were 2; both private completions occurred",
+      "log": "two-wave-attempt1.log",
+      "service_report": "attempt1-service-report.json",
+      "credited": false
+    },
+    {
+      "attempt": 2,
+      "commit": "0d72131d0f09c79894a3daccd4a2159b372f012c",
+      "exit_status": 0,
+      "passed": 1,
+      "failed": 0,
+      "test_seconds": 141.56,
+      "classification": "passed after independently reviewed deterministic arrival synchronization",
+      "log": "two-wave-attempt2.log",
+      "report": "two-wave-report.json",
+      "ticks": 3,
+      "private_completions": 2,
+      "completed_runs": 2,
+      "pending_reservations": 0,
+      "credited": true
+    }
+  ],
+  "guard_removals": {
+    "report": "guard-report.json",
+    "count": 2,
+    "restored_sha256": "504c98fdaed40777a21bf1b4c3abdf5cfdaedf40e3c736925be1033d5b8b6831",
+    "criterion": "Each exact named test executed once and failed its intended assertion with process exit 101; compilation and zero-test failures excluded"
+  },
+  "runtime_image": "sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251",
+  "limits": [
+    "Two arrivals and one finite appointment; no reliability estimate or FX17 claim",
+    "Independent verifier inventory checks A; B and exact parent progression have additional direct Git assertions",
+    "Native no-command gate policy explicitly allows empty gates; independent artifact verifier and fresh private provider acceptance still run",
+    "Trusted host, Docker daemon and appointed provider configuration; resource accounting is not a hard host quota",
+    "Actual OutcomeUnknown receiver control and twenty-stage FX17 remain separately unqualified"
+  ],
+  "inventory": [
+    {
+      "path": "attempt1-service-report.json",
+      "bytes": 2169,
+      "sha256": "e711e53ae096239c7c8a30303db0c3c5ed384c67b910a1fbd89351403e77edd2"
+    },
+    {
+      "path": "guard-report.json",
+      "bytes": 1918,
+      "sha256": "e91fe8608716bb743559fd4e120f14f4c0d24004580f7667800957b16ea18f5d"
+    },
+    {
+      "path": "missing-publication-observation.log",
+      "bytes": 1565,
+      "sha256": "d9987fa9c0a013b069c4386f55653e67d2359902cf5c35460434ed3090286a7c"
+    },
+    {
+      "path": "ordinary-controls.log",
+      "bytes": 11031,
+      "sha256": "a7906875bd2a1edb5d3222537e06cb32e745b3cd70e53b6158e54125c1f96ab8"
+    },
+    {
+      "path": "two-wave-attempt1.log",
+      "bytes": 1200,
+      "sha256": "a77d942e0d13f78b54de761144b61b21192300d308d2b82240e25136feeb4f9c"
+    },
+    {
+      "path": "two-wave-attempt2.log",
+      "bytes": 1090,
+      "sha256": "5fc1929676fe4bcd3901f3deffc51f9b3fca139c33b174e814378f1398b4e311"
+    },
+    {
+      "path": "two-wave-report.json",
+      "bytes": 6203,
+      "sha256": "c9368b6899538a6239e3c0d31f173cdd1f2bc2c863b79e41348c154a313d8c1c"
+    },
+    {
+      "path": "unknown-dispatch-status.log",
+      "bytes": 1174,
+      "sha256": "8d7c12a1cd901e8408f34392c408ab0ebbde6134b2d35d85fc9625921dc1a4b0"
+    }
+  ]
+}
