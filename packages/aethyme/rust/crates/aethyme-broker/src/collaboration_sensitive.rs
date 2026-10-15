@@ -986,7 +986,7 @@ fn unresolved_work(store: &CollaborationStore) -> Result<bool, SensitiveError> {
     Ok(false)
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct FileItem {
     relative_path: String,
     sha256: String,
@@ -1137,7 +1137,19 @@ fn collect_view_tree(
             unknown.push(relative.to_string_lossy().into_owned());
             return Ok(());
         };
-        let (sha256, bytes) = hash_file(&path)?;
+        let (sha256, bytes) = if relative.file_name().and_then(|name| name.to_str())
+            == Some("CURRENT")
+        {
+            let bytes = read_bounded_regular_file(&path, 25).map_err(|_| {
+                SensitiveError::Invalid("analysis-view CURRENT is unreadable or oversized".into())
+            })?;
+            (
+                format!("sha256:{:x}", Sha256::digest(&bytes)),
+                bytes.len() as u64,
+            )
+        } else {
+            hash_file(&path)?
+        };
         files.push(FileItem {
             relative_path,
             sha256,
@@ -1421,7 +1433,13 @@ fn prepare_inventory(
     ] {
         collect_tree(store, path, &mut files, &mut unknown)?;
     }
-    collect_view_tree(store, Path::new("views"), &mut files, &mut unknown)?;
+    if collect_view_tree(store, Path::new("views"), &mut files, &mut unknown).is_err() {
+        // Do not create a partial per-file inventory for a view tree that could
+        // not be read completely. The durable root residual prevents any later
+        // group deletion while still making the refusal visible in status.
+        files.retain(|item| !item.relative_path.starts_with("views/"));
+        unknown.push("views/".into());
+    }
     // Lock and verifier-authority state is control state, not archived source.
     // Leave it in place and report the exact roots as unmanaged residuals.
     for name in ["objects", "spool"] {
@@ -1509,6 +1527,25 @@ fn prepare_inventory(
             "INSERT OR IGNORE INTO local_sensitive_residuals
              (incident_id,code,relative_path,permanence) VALUES (?1,'unclassified_managed_path',?2,'unclassified')",
             rusqlite::params![marker.incident_id, path],
+        )?;
+    }
+    let view_roots = unknown
+        .iter()
+        .filter_map(|path| {
+            if path == "views" || path == "views/" {
+                return Some("views/".to_string());
+            }
+            let relative = path.strip_prefix("views/")?;
+            let view = relative.split('/').next().filter(|view| !view.is_empty())?;
+            Some(format!("views/{view}/"))
+        })
+        .collect::<BTreeSet<_>>();
+    for view_root in view_roots {
+        tx.execute(
+            "INSERT OR IGNORE INTO local_sensitive_residuals
+             (incident_id,code,relative_path,permanence)
+             VALUES (?1,'analysis_view_layout_unclassified',?2,'unclassified')",
+            rusqlite::params![marker.incident_id, view_root],
         )?;
     }
     for source_path in &source_repositories {
@@ -1861,8 +1898,57 @@ fn record_view_block(
     Ok(false)
 }
 
+#[cfg(unix)]
+fn read_bounded_regular_file(path: &Path, maximum: usize) -> Result<Vec<u8>, ()> {
+    let before = fs::symlink_metadata(path).map_err(|_| ())?;
+    if !before.file_type().is_file() || before.len() > maximum as u64 {
+        return Err(());
+    }
+    let mut options = OpenOptions::new();
+    options.read(true);
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = options.open(path).map_err(|_| ())?;
+    let opened = file.metadata().map_err(|_| ())?;
+    if !opened.is_file() || opened.len() != before.len() || opened.len() > maximum as u64 {
+        return Err(());
+    }
+    {
+        use std::os::unix::fs::MetadataExt;
+        if opened.dev() != before.dev() || opened.ino() != before.ino() {
+            return Err(());
+        }
+    }
+    let mut bytes = Vec::with_capacity(maximum);
+    let mut limited = file.take(maximum as u64 + 1);
+    limited.read_to_end(&mut bytes).map_err(|_| ())?;
+    if bytes.len() > maximum || bytes.len() as u64 != opened.len() {
+        return Err(());
+    }
+    let after = fs::symlink_metadata(path).map_err(|_| ())?;
+    {
+        use std::os::unix::fs::MetadataExt;
+        if !after.file_type().is_file()
+            || after.dev() != opened.dev()
+            || after.ino() != opened.ino()
+            || after.len() != opened.len()
+        {
+            return Err(());
+        }
+    }
+    Ok(bytes)
+}
+
+#[cfg(not(unix))]
+fn read_bounded_regular_file(_path: &Path, _maximum: usize) -> Result<Vec<u8>, ()> {
+    Err(())
+}
+
+#[cfg(unix)]
 fn strict_current_generation(path: &Path) -> Result<u64, ()> {
-    let bytes = fs::read(path).map_err(|_| ())?;
+    let bytes = read_bounded_regular_file(path, 25)?;
     let text = bytes.strip_suffix(b"\n").ok_or(())?;
     let text = std::str::from_utf8(text).map_err(|_| ())?;
     let number = text
@@ -1874,6 +1960,11 @@ fn strict_current_generation(path: &Path) -> Result<u64, ()> {
         return Err(());
     }
     Ok(number)
+}
+
+#[cfg(not(unix))]
+fn strict_current_generation(_path: &Path) -> Result<u64, ()> {
+    Err(())
 }
 
 fn scan_view_tree(
@@ -2392,15 +2483,11 @@ fn delete_view_group(
         Ok(()) => Ok(true),
         Err(SensitiveError::Sqlite(error)) => Err(SensitiveError::Sqlite(error)),
         Err(SensitiveError::State(error)) => Err(SensitiveError::State(error)),
-        Err(error) => record_view_block(
+        Err(_) => record_view_block(
             store,
             incident_id,
             &group.relative_root,
-            if matches!(error, SensitiveError::Io(_)) {
-                ViewBlock::Busy
-            } else {
-                ViewBlock::Unclassified
-            },
+            ViewBlock::Unclassified,
         ),
     }
 }
@@ -2753,8 +2840,9 @@ pub fn purge(
         [incident_id],
         |row| row.get(0),
     )?;
-    // Views are inventoried but preserved because a reader from an older
-    // process can retain a generation pin without holding the response lock.
+    // A view group is deleted only while every inventoried generation pin is
+    // held exclusively. Legacy readers without that pin contract and already
+    // materialized process copies remain outside this cooperative boundary.
     let undeleted_non_view_files: bool = store.read_connection().query_row(
         "SELECT EXISTS(
              SELECT 1 FROM local_sensitive_items
@@ -2821,6 +2909,24 @@ mod tests {
                 .any(|window| window == needle)
     }
 
+    fn contains_bytes_in_tree(root: &Path, needle: &[u8]) -> std::io::Result<bool> {
+        let metadata = std::fs::symlink_metadata(root)?;
+        if metadata.file_type().is_symlink() {
+            return Ok(false);
+        }
+        if metadata.is_file() {
+            return Ok(contains_bytes(&std::fs::read(root)?, needle));
+        }
+        if metadata.is_dir() {
+            for entry in std::fs::read_dir(root)? {
+                if contains_bytes_in_tree(&entry?.path(), needle)? {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
     fn view_snapshot(store: &CollaborationStore, view: &str) -> Vec<FileItem> {
         let mut items = Vec::new();
         let mut unknown = Vec::new();
@@ -2834,6 +2940,566 @@ mod tests {
         assert!(unknown.is_empty());
         items.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
         items
+    }
+
+    #[cfg(unix)]
+    fn view_snapshot_except_path(
+        store: &CollaborationStore,
+        view: &str,
+        excluded_relative: &str,
+    ) -> Vec<FileItem> {
+        let mut items = Vec::new();
+        let mut unknown = Vec::new();
+        collect_view_tree(
+            store,
+            Path::new(&format!("views/{view}")),
+            &mut items,
+            &mut unknown,
+        )
+        .unwrap();
+        items.retain(|item| item.relative_path.trim_end_matches('/') != excluded_relative);
+        unknown.retain(|path| path.trim_end_matches('/') != excluded_relative);
+        assert!(unknown.is_empty());
+        items.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+        items
+    }
+
+    #[cfg(unix)]
+    fn view_layout_refusal_case(case: &str) {
+        use crate::collaboration_archive::ObjectDigest;
+        use crate::collaboration_capture as capture;
+
+        let mut fixture = crate::local_generation::tests::Fixture::new();
+        let source_repository = fixture.v.f._repo.path().to_path_buf();
+        let capture_request = capture::CaptureRequest {
+            operation_id: capture::OperationId::mint().unwrap(),
+            repository: source_repository.clone(),
+            base: fixture.v.f.a.base.commit.clone(),
+            result: fixture.v.f.a.result.commit.clone(),
+            policy: capture::CapturePolicy::Required,
+            retention: capture::RetentionBoundary::UntilReleased,
+        };
+        let capture_receipt =
+            match capture::capture(&mut fixture.v.f.store, &capture_request).unwrap() {
+                capture::CaptureOutcome::Acknowledged(receipt) => receipt,
+                _ => panic!("capture did not acknowledge"),
+            };
+        let repo_name = format!("t56-pin-{case}");
+        let profile = crate::analysis_view::ViewProfile::current(&repo_name);
+        let options = crate::analysis_view::ViewOptions::new(profile);
+        let view =
+            crate::analysis_view::build_view(&fixture.v.f.store, &capture_receipt.result, &options)
+                .unwrap();
+        crate::analysis_view::hold_view(&fixture.v.f.store, &view, "t56-pin-control-holder", None)
+            .unwrap();
+
+        let store = &mut fixture.v.f.store;
+        let frozen = crate::local_authority::freeze(
+            store,
+            fixture.v.owner.authority_epoch(),
+            "T56 synthetic pin-layout control",
+        )
+        .unwrap();
+        let incident_id = format!(
+            "sha256:{}",
+            ObjectDigest::of(format!("t56-pin-control-{case}").as_bytes()).hex()
+        );
+        let quarantined = quarantine(
+            store,
+            &incident_id,
+            "local-test-operator",
+            frozen.epoch.as_str(),
+            ReasonCode::SuspectedTestSecretExposure,
+        )
+        .unwrap();
+
+        let held = purge(store, &incident_id, &quarantined.request_digest).unwrap();
+        assert!(!held.completed);
+        assert!(!held.status.managed_cleanup_complete);
+        assert!(store.project_dir().join("views").join(&view).exists());
+        assert!(held.status.residuals.iter().any(|residual| {
+            residual.code == "analysis_view_reader_or_hold_active"
+                && residual.path == format!("views/{view}/")
+        }));
+
+        assert!(
+            crate::analysis_view::release_view_hold(store, &view, "t56-pin-control-holder")
+                .unwrap()
+        );
+        let current = strict_current_generation(
+            &store
+                .project_dir()
+                .join("views")
+                .join(&view)
+                .join("CURRENT"),
+        )
+        .unwrap();
+        let pin_relative = format!("views/{view}/gen-{current}/.pin");
+        let current_relative = format!("views/{view}/CURRENT");
+        let is_pin_case = matches!(case, "missing-pin" | "directory-pin" | "symlink-pin");
+        let excluded_relative = if is_pin_case {
+            pin_relative.as_str()
+        } else {
+            current_relative.as_str()
+        };
+        let before = view_snapshot_except_path(store, &view, excluded_relative);
+        let fault_path = store.project_dir().join(excluded_relative);
+        match case {
+            "missing-pin" => std::fs::remove_file(&fault_path).unwrap(),
+            "directory-pin" => {
+                std::fs::remove_file(&fault_path).unwrap();
+                std::fs::create_dir(&fault_path).unwrap();
+            }
+            "symlink-pin" => {
+                std::fs::remove_file(&fault_path).unwrap();
+                std::os::unix::fs::symlink("/dev/null", &fault_path).unwrap();
+            }
+            "missing-current" => std::fs::remove_file(&fault_path).unwrap(),
+            "symlink-current" => {
+                std::fs::remove_file(&fault_path).unwrap();
+                std::os::unix::fs::symlink("/dev/null", &fault_path).unwrap();
+            }
+            "malformed-current" => std::fs::write(&fault_path, b"not-a-generation\n").unwrap(),
+            _ => panic!("unknown view-layout control"),
+        }
+        let after_mutation = view_snapshot_except_path(store, &view, excluded_relative);
+        assert_eq!(before, after_mutation);
+
+        let refused = purge(store, &incident_id, &quarantined.request_digest).unwrap();
+        assert!(!refused.completed);
+        assert!(!refused.status.managed_cleanup_complete);
+        assert!(refused.status.residuals.iter().any(|residual| {
+            residual.code == "analysis_view_layout_unclassified"
+                && residual.path == format!("views/{view}/")
+                && residual.resolved_ms.is_none()
+        }));
+        assert!(refused.status.items.iter().all(|item| {
+            !item.path.starts_with(&format!("views/{view}/"))
+                || item.state != "deleted"
+                || item.path
+                    == format!(
+                        "views/{view}/holds/{}.json",
+                        hold_filename("t56-pin-control-holder")
+                    )
+        }));
+        assert_eq!(
+            view_snapshot_except_path(store, &view, excluded_relative),
+            after_mutation
+        );
+
+        let retry = purge(store, &incident_id, &quarantined.request_digest).unwrap();
+        assert!(!retry.completed);
+        assert!(!retry.status.managed_cleanup_complete);
+        assert_eq!(
+            view_snapshot_except_path(store, &view, excluded_relative),
+            after_mutation
+        );
+        match case {
+            "missing-pin" | "missing-current" => assert!(!fault_path.exists()),
+            "directory-pin" => assert!(fault_path.is_dir()),
+            "symlink-pin" => assert!(
+                std::fs::symlink_metadata(&fault_path)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            ),
+            "symlink-current" => assert!(
+                std::fs::symlink_metadata(&fault_path)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            ),
+            "malformed-current" => {
+                assert_eq!(std::fs::read(&fault_path).unwrap(), b"not-a-generation\n")
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[cfg(unix)]
+    fn preinventory_view_layout_refusal_case(case: &str) {
+        use crate::collaboration_archive::ObjectDigest;
+        use crate::collaboration_capture as capture;
+
+        let mut fixture = crate::local_generation::tests::Fixture::new();
+        let source_repository = fixture.v.f._repo.path().to_path_buf();
+        let capture_request = capture::CaptureRequest {
+            operation_id: capture::OperationId::mint().unwrap(),
+            repository: source_repository.clone(),
+            base: fixture.v.f.a.base.commit.clone(),
+            result: fixture.v.f.a.result.commit.clone(),
+            policy: capture::CapturePolicy::Required,
+            retention: capture::RetentionBoundary::UntilReleased,
+        };
+        let receipt = match capture::capture(&mut fixture.v.f.store, &capture_request).unwrap() {
+            capture::CaptureOutcome::Acknowledged(receipt) => receipt,
+            _ => panic!("capture did not acknowledge"),
+        };
+        let options = crate::analysis_view::ViewOptions::new(
+            crate::analysis_view::ViewProfile::current("t56-preinventory-view-fixture"),
+        );
+        let view = crate::analysis_view::build_view(&fixture.v.f.store, &receipt.result, &options)
+            .unwrap();
+        let view_root = fixture.v.f.store.project_dir().join("views").join(&view);
+        let fault_relative = match case {
+            "preinventory-symlink-pin" => {
+                let current = strict_current_generation(&view_root.join("CURRENT")).unwrap();
+                format!("views/{view}/gen-{current}/.pin")
+            }
+            "preinventory-symlink-current"
+            | "preinventory-malformed-current"
+            | "preinventory-oversized-current" => format!("views/{view}/CURRENT"),
+            _ => panic!("unknown pre-inventory view-layout control"),
+        };
+        let fault_path = fixture.v.f.store.project_dir().join(&fault_relative);
+        match case {
+            "preinventory-symlink-pin" | "preinventory-symlink-current" => {
+                std::fs::remove_file(&fault_path).unwrap();
+                std::os::unix::fs::symlink("/dev/null", &fault_path).unwrap();
+            }
+            "preinventory-malformed-current" => {
+                std::fs::write(&fault_path, b"not-a-generation\n").unwrap();
+            }
+            "preinventory-oversized-current" => {
+                std::fs::write(&fault_path, vec![b'x'; 26]).unwrap();
+            }
+            _ => unreachable!(),
+        }
+
+        let store = &mut fixture.v.f.store;
+        let frozen = crate::local_authority::freeze(
+            store,
+            fixture.v.owner.authority_epoch(),
+            "T56 pre-inventory view-layout control",
+        )
+        .unwrap();
+        let incident_id = format!(
+            "sha256:{}",
+            ObjectDigest::of(format!("t56-preinventory-{case}").as_bytes()).hex()
+        );
+        let quarantined = quarantine(
+            store,
+            &incident_id,
+            "local-test-operator",
+            frozen.epoch.as_str(),
+            ReasonCode::SuspectedTestSecretExposure,
+        )
+        .unwrap();
+        let refused = purge(store, &incident_id, &quarantined.request_digest).unwrap();
+        assert!(!refused.completed);
+        assert!(!refused.status.managed_cleanup_complete);
+        assert!(view_root.exists());
+        assert!(refused.status.residuals.iter().any(|residual| {
+            residual.code == "analysis_view_layout_unclassified"
+                && (residual.path == format!("views/{view}/") || residual.path == "views/")
+                && residual.resolved_ms.is_none()
+        }));
+        match case {
+            "preinventory-symlink-pin" | "preinventory-symlink-current" => assert!(
+                std::fs::symlink_metadata(&fault_path)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            ),
+            "preinventory-malformed-current" => {
+                assert_eq!(std::fs::read(&fault_path).unwrap(), b"not-a-generation\n")
+            }
+            "preinventory-oversized-current" => {
+                assert_eq!(std::fs::read(&fault_path).unwrap(), vec![b'x'; 26])
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preinventory_symlinked_view_pin_is_recorded_as_a_root_residual() {
+        preinventory_view_layout_refusal_case("preinventory-symlink-pin");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preinventory_symlinked_current_is_recorded_as_a_root_residual() {
+        preinventory_view_layout_refusal_case("preinventory-symlink-current");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preinventory_malformed_current_is_recorded_as_a_root_residual() {
+        preinventory_view_layout_refusal_case("preinventory-malformed-current");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preinventory_oversized_current_is_recorded_as_a_root_residual() {
+        preinventory_view_layout_refusal_case("preinventory-oversized-current");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn missing_view_pin_with_content_is_a_refusal_only_residual() {
+        view_layout_refusal_case("missing-pin");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_regular_view_pin_with_content_is_a_refusal_only_residual() {
+        view_layout_refusal_case("directory-pin");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_view_pin_with_content_is_a_refusal_only_residual() {
+        view_layout_refusal_case("symlink-pin");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn missing_current_with_content_is_a_refusal_only_residual() {
+        view_layout_refusal_case("missing-current");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn malformed_current_with_content_is_a_refusal_only_residual() {
+        view_layout_refusal_case("malformed-current");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_current_with_content_is_a_refusal_only_residual() {
+        view_layout_refusal_case("symlink-current");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn oversized_current_control_file_is_rejected_before_parsing() {
+        let root = tempfile::tempdir().unwrap();
+        let current = root.path().join("CURRENT");
+        std::fs::write(&current, vec![b'x'; 26]).unwrap();
+        assert!(strict_current_generation(&current).is_err());
+    }
+
+    fn view_hold_control_case(case: &str) {
+        use crate::collaboration_archive::ObjectDigest;
+        use crate::collaboration_capture as capture;
+
+        let mut fixture = crate::local_generation::tests::Fixture::new();
+        let source_repository = fixture.v.f._repo.path().to_path_buf();
+        let capture_request = capture::CaptureRequest {
+            operation_id: capture::OperationId::mint().unwrap(),
+            repository: source_repository.clone(),
+            base: fixture.v.f.a.base.commit.clone(),
+            result: fixture.v.f.a.result.commit.clone(),
+            policy: capture::CapturePolicy::Required,
+            retention: capture::RetentionBoundary::UntilReleased,
+        };
+        let receipt = match capture::capture(&mut fixture.v.f.store, &capture_request).unwrap() {
+            capture::CaptureOutcome::Acknowledged(receipt) => receipt,
+            _ => panic!("capture did not acknowledge"),
+        };
+        let options = crate::analysis_view::ViewOptions::new(
+            crate::analysis_view::ViewProfile::current("t56-hold-fixture"),
+        );
+        let view = crate::analysis_view::build_view(&fixture.v.f.store, &receipt.result, &options)
+            .unwrap();
+        let holder = format!("t56-{case}-holder");
+        let expiry = (case == "expired-hold").then_some(0);
+        crate::analysis_view::hold_view(&fixture.v.f.store, &view, &holder, expiry).unwrap();
+        let view_root = fixture.v.f.store.project_dir().join("views").join(&view);
+        let hold_path = view_root.join("holds").join(hold_filename(&holder));
+        if case == "malformed-hold" {
+            std::fs::write(&hold_path, b"{").unwrap();
+        }
+
+        let store = &mut fixture.v.f.store;
+        let frozen = crate::local_authority::freeze(
+            store,
+            fixture.v.owner.authority_epoch(),
+            "T56 synthetic hold control",
+        )
+        .unwrap();
+        let incident_id = format!(
+            "sha256:{}",
+            ObjectDigest::of(format!("t56-hold-control-{case}").as_bytes()).hex()
+        );
+        let quarantined = quarantine(
+            store,
+            &incident_id,
+            "local-test-operator",
+            frozen.epoch.as_str(),
+            ReasonCode::SuspectedTestSecretExposure,
+        )
+        .unwrap();
+        let blocked = purge(store, &incident_id, &quarantined.request_digest).unwrap();
+        assert!(!blocked.completed);
+        assert!(view_root.exists());
+        let expected_code = if case == "expired-hold" {
+            "analysis_view_reader_or_hold_active"
+        } else {
+            "analysis_view_layout_unclassified"
+        };
+        assert!(blocked.status.residuals.iter().any(|residual| {
+            residual.code == expected_code
+                && residual.path == format!("views/{view}/")
+                && residual.resolved_ms.is_none()
+        }));
+
+        if case == "expired-hold" {
+            assert!(crate::analysis_view::release_view_hold(store, &view, &holder).unwrap());
+            let retry = purge(store, &incident_id, &quarantined.request_digest).unwrap();
+            assert!(!retry.completed);
+            assert!(!view_root.exists());
+            assert!(retry.status.residuals.iter().any(|residual| {
+                residual.code == expected_code && residual.resolved_ms.is_some()
+            }));
+        } else {
+            let recorded = std::fs::read(&hold_path).unwrap();
+            let retry = purge(store, &incident_id, &quarantined.request_digest).unwrap();
+            assert!(!retry.completed);
+            assert!(view_root.exists());
+            assert_eq!(std::fs::read(&hold_path).unwrap(), recorded);
+            assert!(retry.status.residuals.iter().any(|residual| {
+                residual.code == expected_code && residual.resolved_ms.is_none()
+            }));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn expired_view_hold_remains_a_blocker_until_explicit_release() {
+        view_hold_control_case("expired-hold");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn malformed_view_hold_is_a_refusal_only_residual() {
+        view_hold_control_case("malformed-hold");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminal_view_state_after_last_pin_unlink_finishes_directory_cleanup() {
+        use crate::collaboration_capture as capture;
+
+        let mut fixture = crate::local_generation::tests::Fixture::new();
+        let source_repository = fixture.v.f._repo.path().to_path_buf();
+        let capture_request = capture::CaptureRequest {
+            operation_id: capture::OperationId::mint().unwrap(),
+            repository: source_repository.clone(),
+            base: fixture.v.f.a.base.commit.clone(),
+            result: fixture.v.f.a.result.commit.clone(),
+            policy: capture::CapturePolicy::Required,
+            retention: capture::RetentionBoundary::UntilReleased,
+        };
+        let receipt = match capture::capture(&mut fixture.v.f.store, &capture_request).unwrap() {
+            capture::CaptureOutcome::Acknowledged(receipt) => receipt,
+            _ => panic!("capture did not acknowledge"),
+        };
+        let options = crate::analysis_view::ViewOptions::new(
+            crate::analysis_view::ViewProfile::current("t56-terminal-view-fixture"),
+        );
+        let view = crate::analysis_view::build_view(&fixture.v.f.store, &receipt.result, &options)
+            .unwrap();
+        let store = &mut fixture.v.f.store;
+        let frozen = crate::local_authority::freeze(
+            store,
+            fixture.v.owner.authority_epoch(),
+            "T56 terminal view partition control",
+        )
+        .unwrap();
+        let incident_id = format!(
+            "sha256:{}",
+            crate::collaboration_archive::ObjectDigest::of(b"t56-terminal-view-control").hex()
+        );
+        let quarantined = quarantine(
+            store,
+            &incident_id,
+            "local-test-operator",
+            frozen.epoch.as_str(),
+            ReasonCode::SuspectedTestSecretExposure,
+        )
+        .unwrap();
+        let marker = marker_for_incident(store, &incident_id, &quarantined.request_digest).unwrap();
+
+        let Some(_archive) = crate::collaboration_gc::try_admin_exclusive(store).unwrap() else {
+            panic!("archive barrier was unexpectedly busy");
+        };
+        let Some(_response) = try_response_exclusive(store).unwrap() else {
+            panic!("response barrier was unexpectedly busy");
+        };
+        let witness = crate::local_authority::status(store).unwrap();
+        let _frozen = crate::local_authority::frozen_guard(store, &witness.epoch).unwrap();
+        let inventory = prepare_inventory(store, &marker).unwrap();
+        let (groups, malformed) = view_groups(&inventory);
+        assert!(malformed.is_empty());
+        assert_eq!(groups.len(), 1);
+        let group = &groups[0];
+        assert_eq!(group.relative_root, format!("views/{view}/"));
+        let current = group
+            .items
+            .iter()
+            .find(|item| item.relative_path == format!("views/{view}/CURRENT"))
+            .unwrap();
+        let mut pins = Vec::new();
+        for item in group
+            .items
+            .iter()
+            .filter(|item| item.relative_path.ends_with("/.pin"))
+        {
+            let path = store.project_dir().join(&item.relative_path);
+            let file = open_and_lock_view_pin(&path, item).unwrap();
+            pins.push(LockedViewPin {
+                item: item.clone(),
+                _file: file,
+            });
+        }
+        assert_eq!(pins.len(), 1);
+
+        for item in &group.items {
+            if !is_directory_item(&item.relative_path)
+                && item
+                    .relative_path
+                    .starts_with(&format!("{}gen-", group.relative_root))
+                && !item.relative_path.ends_with("/.pin")
+            {
+                delete_view_file(store, &incident_id, item).unwrap();
+            }
+        }
+        for item in &group.items {
+            if is_directory_item(&item.relative_path)
+                || item.relative_path == current.relative_path
+                || item.relative_path.ends_with("/.pin")
+                || item
+                    .relative_path
+                    .starts_with(&format!("{}gen-", group.relative_root))
+            {
+                continue;
+            }
+            delete_view_file(store, &incident_id, item).unwrap();
+        }
+        delete_view_file(store, &incident_id, current).unwrap();
+        for pin in &pins {
+            delete_view_file(store, &incident_id, &pin.item).unwrap();
+        }
+        drop(pins);
+        drop(_frozen);
+        drop(_response);
+        drop(_archive);
+
+        let resumed = purge(store, &incident_id, &quarantined.request_digest).unwrap();
+        assert!(!resumed.completed);
+        assert!(resumed.status.managed_cleanup_complete);
+        assert!(!store.project_dir().join("views").join(&view).exists());
+        assert!(!store.project_dir().join("views").exists());
+        assert!(
+            resumed
+                .status
+                .items
+                .iter()
+                .filter(|item| { item.path.starts_with(&format!("views/{view}/")) })
+                .all(|item| item.state == "deleted")
+        );
     }
 
     #[test]
@@ -2990,9 +3656,30 @@ mod tests {
             &view_options,
         )
         .unwrap();
+        let superseded_reader = crate::analysis_view::open_view(&fixture.v.f.store, &view).unwrap();
+        assert_eq!(superseded_reader.manifest().generation, 1);
+        let rebuilt = crate::analysis_view::build_view(
+            &fixture.v.f.store,
+            &capture_receipt.result,
+            &view_options,
+        )
+        .unwrap();
+        assert_eq!(rebuilt, view);
         let reader = crate::analysis_view::open_view(&fixture.v.f.store, &view).unwrap();
+        assert_eq!(reader.manifest().generation, 2);
         let references = reader.find_references(&token, 16).unwrap();
-        assert!(contains_bytes(&references.to_record().0, token_bytes));
+        let reference_record = references.to_record().0;
+        assert!(contains_bytes(&reference_record, b"src/credential.rs"));
+        assert!(!contains_bytes(&reference_record, token_bytes));
+        let view_root = fixture.v.f.store.project_dir().join("views").join(&view);
+        let generation = strict_current_generation(&view_root.join("CURRENT")).unwrap();
+        assert!(
+            contains_bytes_in_tree(
+                &view_root.join(format!("gen-{generation}/facts/.aethyme/graph")),
+                token_bytes
+            )
+            .unwrap()
+        );
         crate::analysis_view::hold_view(&fixture.v.f.store, &view, "t56-synthetic-holder", None)
             .unwrap();
 
@@ -3110,6 +3797,7 @@ mod tests {
         );
         assert!(crate::analysis_view::open_view(store, &view).is_err());
         assert!(reader.find_references(&token, 16).is_err());
+        assert!(superseded_reader.find_references(&token, 16).is_err());
         assert!(crate::local_generation::load_prepared(store, prepared.id()).is_err());
         assert!(crate::local_restore::show(store, &imported.id).is_err());
         assert!(crate::local_restore::bind_receiver(store, &fixture.v.owner, &verified).is_err());
@@ -3207,6 +3895,21 @@ mod tests {
                 && residual.resolved_ms.is_none()
         }));
         drop(reader);
+        let superseded_pin_purge = purge(store, &incident_id, &quarantined.request_digest).unwrap();
+        assert!(!superseded_pin_purge.completed);
+        assert_eq!(view_snapshot(store, &view), released_hold_view);
+        assert!(
+            superseded_pin_purge
+                .status
+                .residuals
+                .iter()
+                .any(|residual| {
+                    residual.code == "analysis_view_reader_or_hold_active"
+                        && residual.path == format!("views/{view}/")
+                        && residual.resolved_ms.is_none()
+                })
+        );
+        drop(superseded_reader);
         let final_purge = purge(store, &incident_id, &quarantined.request_digest).unwrap();
         assert!(!final_purge.completed);
         assert!(final_purge.status.managed_cleanup_complete);
