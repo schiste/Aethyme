@@ -537,6 +537,25 @@ struct ArrivalObservation {
     completions_before_release: i64,
 }
 
+struct PersistedOldGroupArrivals {
+    arrival_sequences: Vec<(String, i64, i64)>,
+    oldest_member_first_seen_unix_ms: i64,
+    group_ready_unix_ms: i64,
+}
+
+struct ActiveNativeWave<'a> {
+    owner: &'a target::ControllerOwner,
+    revision: &'a str,
+    wave_id: &'a aethyme_contracts::experimental_v0::RecordId,
+    job_id: &'a str,
+}
+
+impl ActiveNativeWave<'_> {
+    fn assert_active(&self, store: &CollaborationStore) -> Result<(String, i64), String> {
+        assert_active_older_dispatch(store, self.owner, self.revision, self.wave_id, self.job_id)
+    }
+}
+
 struct ArrivalEvent {
     id: String,
     sequence: i64,
@@ -775,7 +794,7 @@ fn assert_active_older_dispatch(
 fn persisted_old_group_arrivals(
     store: &CollaborationStore,
     revision: &str,
-) -> Result<(Vec<(String, i64, i64)>, i64, i64), String> {
+) -> Result<PersistedOldGroupArrivals, String> {
     let connection = store.read_connection();
     let mut statement = connection
         .prepare(
@@ -814,7 +833,11 @@ fn persisted_old_group_arrivals(
         .map(|(_, _, at)| *at)
         .max()
         .ok_or_else(|| "FX10 older group has no persisted readiness time".to_string())?;
-    Ok((arrivals, oldest_member, group_ready))
+    Ok(PersistedOldGroupArrivals {
+        arrival_sequences: arrivals,
+        oldest_member_first_seen_unix_ms: oldest_member,
+        group_ready_unix_ms: group_ready,
+    })
 }
 
 fn persisted_arrival(
@@ -836,10 +859,7 @@ fn persisted_arrival(
 
 fn await_minimum_contention_window(
     store: &CollaborationStore,
-    owner: &target::ControllerOwner,
-    revision: &str,
-    wave_id: &aethyme_contracts::experimental_v0::RecordId,
-    job_id: &str,
+    active_wave: &ActiveNativeWave<'_>,
     hold: &ContendedResource,
     handshake: &GateChildHandshake,
     window: Duration,
@@ -849,8 +869,7 @@ fn await_minimum_contention_window(
     let mut polls = 0_u64;
     while Instant::now() < until {
         polls = polls.saturating_add(1);
-        let (_, completions) =
-            assert_active_older_dispatch(store, owner, revision, wave_id, job_id)?;
+        let (_, completions) = active_wave.assert_active(store)?;
         if completions != 0
             || !hold.is_active()?
             || handshake.started_pid()?.is_some()
@@ -869,10 +888,7 @@ fn await_minimum_contention_window(
 
 fn await_gate_child_started(
     store: &CollaborationStore,
-    owner: &target::ControllerOwner,
-    revision: &str,
-    wave_id: &aethyme_contracts::experimental_v0::RecordId,
-    job_id: &str,
+    active_wave: &ActiveNativeWave<'_>,
     holder: &crate::resources::HostResourceLease,
     holder_release_unix_ms: i64,
     handshake: &GateChildHandshake,
@@ -881,7 +897,7 @@ fn await_gate_child_started(
     let mut polls = 0_u64;
     loop {
         polls = polls.saturating_add(1);
-        assert_active_older_dispatch(store, owner, revision, wave_id, job_id)?;
+        active_wave.assert_active(store)?;
         let child_pid = handshake.started_pid()?;
         let gate_lease = active_gate_capacity_lease(&holder.lease_id)?;
         if let (Some(pid), Some(lease)) = (child_pid, gate_lease) {
@@ -905,10 +921,7 @@ fn await_gate_child_started(
 
 fn await_live_gate_child_window(
     store: &CollaborationStore,
-    owner: &target::ControllerOwner,
-    revision: &str,
-    wave_id: &aethyme_contracts::experimental_v0::RecordId,
-    job_id: &str,
+    active_wave: &ActiveNativeWave<'_>,
     holder: &ContendedResource,
     gate_lease: &crate::resources::HostResourceLease,
     child_pid: i32,
@@ -923,9 +936,7 @@ fn await_live_gate_child_window(
     let mut polls = 0_u64;
     while Instant::now() < until {
         polls = polls.saturating_add(1);
-        assert_live_gate_child(
-            store, owner, revision, wave_id, job_id, holder, gate_lease, child_pid, handshake,
-        )?;
+        assert_live_gate_child(store, active_wave, holder, gate_lease, child_pid, handshake)?;
         if Instant::now() >= deadline {
             return Err("bounded live gate-child window expired".into());
         }
@@ -946,16 +957,13 @@ fn await_live_gate_child_window(
 
 fn assert_live_gate_child(
     store: &CollaborationStore,
-    owner: &target::ControllerOwner,
-    revision: &str,
-    wave_id: &aethyme_contracts::experimental_v0::RecordId,
-    job_id: &str,
+    active_wave: &ActiveNativeWave<'_>,
     holder: &ContendedResource,
     gate_lease: &crate::resources::HostResourceLease,
     child_pid: i32,
     handshake: &GateChildHandshake,
 ) -> Result<u64, String> {
-    let (_, completions) = assert_active_older_dispatch(store, owner, revision, wave_id, job_id)?;
+    let (_, completions) = active_wave.assert_active(store)?;
     let actual_lease = active_gate_capacity_lease(&holder.grant.lease.lease_id)?;
     let heartbeat = handshake
         .heartbeat_count()?
@@ -988,14 +996,22 @@ fn observe_sustained_arrivals(
         CollaborationStore::open(&root, &project, &[]).map_err(|error| error.to_string())?;
     let (job_id, active_wave, mut observer_polls) =
         dispatching_native_job(&observer, owner, &revision)?;
-    let (arrival_sequences, oldest_member_first_seen_unix_ms, group_ready_unix_ms) =
-        persisted_old_group_arrivals(&observer, &revision)?;
+    let active_dispatch = ActiveNativeWave {
+        owner,
+        revision: &revision,
+        wave_id: &active_wave,
+        job_id: &job_id,
+    };
+    let PersistedOldGroupArrivals {
+        arrival_sequences,
+        oldest_member_first_seen_unix_ms,
+        group_ready_unix_ms,
+    } = persisted_old_group_arrivals(&observer, &revision)?;
     let dispatch_seen_unix_ms = now_ms()?;
     let oldest_member_age_at_dispatch_ms =
         dispatch_seen_unix_ms.saturating_sub(oldest_member_first_seen_unix_ms);
     let ready_group_age_at_dispatch_ms = dispatch_seen_unix_ms.saturating_sub(group_ready_unix_ms);
-    let (target_phase_before, completions_before) =
-        assert_active_older_dispatch(&observer, owner, &revision, &active_wave, &job_id)?;
+    let (target_phase_before, completions_before) = active_dispatch.assert_active(&observer)?;
     if completions_before != 0 || !hold.is_active()? {
         return Err("FX10 controller-created older wave or real capacity hold was not active before arrivals".into());
     }
@@ -1003,10 +1019,7 @@ fn observe_sustained_arrivals(
     let contention_started = Instant::now();
     let polls_while_resource_held = await_minimum_contention_window(
         &observer,
-        owner,
-        &revision,
-        &active_wave,
-        &job_id,
+        &active_dispatch,
         &hold,
         &handshake,
         Duration::from_millis(FX10_MIN_CONTENTION_MS),
@@ -1020,10 +1033,7 @@ fn observe_sustained_arrivals(
     let (gate_child_pid, gate_resource_lease, child_polls, gate_child_started_unix_ms) =
         await_gate_child_started(
             &observer,
-            owner,
-            &revision,
-            &active_wave,
-            &job_id,
+            &active_dispatch,
             &released_holder,
             holder_release_unix_ms,
             &handshake,
@@ -1034,10 +1044,7 @@ fn observe_sustained_arrivals(
     for id in ["D", "E", "F"] {
         let heartbeat_before_arrival = assert_live_gate_child(
             &observer,
-            owner,
-            &revision,
-            &active_wave,
-            &job_id,
+            &active_dispatch,
             &hold,
             &gate_resource_lease,
             gate_child_pid,
@@ -1049,10 +1056,7 @@ fn observe_sustained_arrivals(
         let observed_while_gate_child_running_unix_ms = now_ms()?;
         let heartbeat_count = assert_live_gate_child(
             &observer,
-            owner,
-            &revision,
-            &active_wave,
-            &job_id,
+            &active_dispatch,
             &hold,
             &gate_resource_lease,
             gate_child_pid,
@@ -1072,10 +1076,7 @@ fn observe_sustained_arrivals(
     let (polls_while_gate_child_running, gate_child_heartbeat_updates) =
         await_live_gate_child_window(
             &observer,
-            owner,
-            &revision,
-            &active_wave,
-            &job_id,
+            &active_dispatch,
             &hold,
             &gate_resource_lease,
             gate_child_pid,
@@ -1084,7 +1085,7 @@ fn observe_sustained_arrivals(
         )?;
     observer_polls = observer_polls.saturating_add(polls_while_gate_child_running);
     let (target_phase_after, completions_before_release) =
-        assert_active_older_dispatch(&observer, owner, &revision, &active_wave, &job_id)?;
+        active_dispatch.assert_active(&observer)?;
     if completions_before_release != 0 {
         return Err("FX10 active A-C wave completed before the gate-child release".into());
     }
@@ -1177,32 +1178,57 @@ struct DriftObservation {
     completions_after_update: i64,
 }
 
-#[allow(clippy::too_many_arguments)]
-fn observe_external_ref_advance(
+struct ExternalRefAdvanceContext<'a> {
     host: PathBuf,
     repo: PathBuf,
     remote: PathBuf,
-    owner: &target::ControllerOwner,
+    owner: &'a target::ControllerOwner,
     revision: String,
     baseline_commit: String,
     advanced_commit: String,
-    mut hold: ContendedResource,
-    mut handshake: GateChildHandshake,
-    progress: &Mutex<Value>,
-    report_path: &Path,
+    hold: ContendedResource,
+    handshake: GateChildHandshake,
+    progress: &'a Mutex<Value>,
+    report_path: &'a Path,
+}
+
+fn observe_external_ref_advance(
+    context: ExternalRefAdvanceContext<'_>,
 ) -> Result<DriftObservation, String> {
+    let ExternalRefAdvanceContext {
+        host,
+        repo,
+        remote,
+        owner,
+        revision,
+        baseline_commit,
+        advanced_commit,
+        mut hold,
+        mut handshake,
+        progress,
+        report_path,
+    } = context;
     let root = CollaborationRoot::under_host_state(&host);
     let project = ProjectKey::parse(FX10_PROJECT).map_err(|error| error.to_string())?;
     let observer =
         CollaborationStore::open(&root, &project, &[]).map_err(|error| error.to_string())?;
     let (job_id, active_wave, mut observer_polls) =
         dispatching_native_job(&observer, owner, &revision)?;
-    let (arrival_sequences, oldest_member_first_seen_unix_ms, group_ready_unix_ms) =
-        persisted_old_group_arrivals(&observer, &revision)?;
+    let active_dispatch = ActiveNativeWave {
+        owner,
+        revision: &revision,
+        wave_id: &active_wave,
+        job_id: &job_id,
+    };
+    let PersistedOldGroupArrivals {
+        arrival_sequences,
+        oldest_member_first_seen_unix_ms,
+        group_ready_unix_ms,
+    } = persisted_old_group_arrivals(&observer, &revision)?;
     let dispatch_seen_unix_ms = now_ms()?;
     let ready_group_age_at_dispatch_ms = dispatch_seen_unix_ms.saturating_sub(group_ready_unix_ms);
     let (target_phase_before, completions_before_update) =
-        assert_active_older_dispatch(&observer, owner, &revision, &active_wave, &job_id)?;
+        active_dispatch.assert_active(&observer)?;
     if completions_before_update != 0 || !hold.is_active()? {
         return Err("FX10 drift observer did not begin on the controller-created older wave behind a live typed hold".into());
     }
@@ -1233,10 +1259,7 @@ fn observe_external_ref_advance(
     let contention_started = Instant::now();
     let polls_while_resource_held = await_minimum_contention_window(
         &observer,
-        owner,
-        &revision,
-        &active_wave,
-        &job_id,
+        &active_dispatch,
         &hold,
         &handshake,
         Duration::from_millis(FX10_MIN_CONTENTION_MS),
@@ -1263,10 +1286,7 @@ fn observe_external_ref_advance(
     let (gate_child_pid, gate_resource_lease, child_polls, gate_child_started_unix_ms) =
         await_gate_child_started(
             &observer,
-            owner,
-            &revision,
-            &active_wave,
-            &job_id,
+            &active_dispatch,
             &released_holder,
             holder_release_unix_ms,
             &handshake,
@@ -1332,10 +1352,7 @@ fn observe_external_ref_advance(
     let (polls_before_ref_update, gate_child_heartbeat_updates_before_ref_update) =
         await_live_gate_child_window(
             &observer,
-            owner,
-            &revision,
-            &active_wave,
-            &job_id,
+            &active_dispatch,
             &hold,
             &gate_resource_lease,
             gate_child_pid,
@@ -1459,10 +1476,7 @@ fn observe_external_ref_advance(
     let (polls_after_ref_update, gate_child_heartbeat_updates_after_ref_update) =
         await_live_gate_child_window(
             &observer,
-            owner,
-            &revision,
-            &active_wave,
-            &job_id,
+            &active_dispatch,
             &hold,
             &gate_resource_lease,
             gate_child_pid,
@@ -1491,8 +1505,7 @@ fn observe_external_ref_advance(
         if !same_tree_fast_forward {
             return Err("FX10 external ref movement was not a same-tree fast-forward".to_string());
         }
-        let (target_phase, completions) =
-            assert_active_older_dispatch(&observer, owner, &revision, &active_wave, &job_id)?;
+        let (target_phase, completions) = active_dispatch.assert_active(&observer)?;
         if completions != 0 {
             return Err(format!(
                 "FX10 external ref update coincided with {completions} older private completion(s)"
@@ -1666,6 +1679,13 @@ struct ExternalFailureEvidenceContext<'a> {
     expected_remote_tip: &'a str,
 }
 
+struct PublicationTransportRow {
+    dispatched: i64,
+    operation: Option<i64>,
+    write_outcome: Option<String>,
+    observation: String,
+}
+
 fn persist_external_failure_evidence(
     store: &CollaborationStore,
     report: &mut Value,
@@ -1773,23 +1793,41 @@ fn persist_external_failure_evidence(
         )?,
     }
 
-    let transport_rows =
-        (|| -> Result<Vec<(i64, Option<i64>, Option<String>, String)>, rusqlite::Error> {
-            let connection = store.read_connection();
-            let mut statement = connection.prepare(
+    let transport_rows = (|| -> Result<Vec<PublicationTransportRow>, rusqlite::Error> {
+        let connection = store.read_connection();
+        let mut statement = connection.prepare(
             "SELECT dispatched,operation,write_outcome,observation FROM local_source_transports WHERE target=?1 AND revision=?2 ORDER BY rowid",
         )?;
-            let rows = statement.query_map((context.target, context.revision), |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
-            })?;
-            rows.collect()
-        })();
+        let rows = statement.query_map((context.target, context.revision), |row| {
+            Ok(PublicationTransportRow {
+                dispatched: row.get(0)?,
+                operation: row.get(1)?,
+                write_outcome: row.get(2)?,
+                observation: row.get(3)?,
+            })
+        })?;
+        rows.collect()
+    })();
     match transport_rows {
-        Ok(rows) => save_event(
-            report_path,
-            report,
-            json!({"at":"external-target-update.publication-transport","facts":{"transport_count":rows.len(),"rows":rows}}),
-        )?,
+        Ok(rows) => {
+            let transport_count = rows.len();
+            let serialized_rows = rows
+                .iter()
+                .map(|row| {
+                    json!({
+                        "dispatched":row.dispatched,
+                        "operation":row.operation,
+                        "write_outcome":row.write_outcome,
+                        "observation":row.observation,
+                    })
+                })
+                .collect::<Vec<_>>();
+            save_event(
+                report_path,
+                report,
+                json!({"at":"external-target-update.publication-transport","facts":{"transport_count":transport_count,"rows":serialized_rows}}),
+            )?
+        }
         Err(error) => save_event(
             report_path,
             report,
@@ -1815,25 +1853,44 @@ fn persist_external_failure_evidence(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-fn run_external_target_update(
-    store: &mut CollaborationStore,
-    broker: &mut Broker,
+struct ExternalTargetUpdateContext<'a> {
+    store: &'a mut CollaborationStore,
+    broker: &'a mut Broker,
     session_id: i64,
-    host: &Path,
-    repo: &Path,
-    remote: &Path,
-    baseline_commit: &str,
-    baseline_snapshot: &str,
-    retained: &[(String, String, String)],
-    executor: &DockerExecutor,
-    verifier_policy: &VerifierPolicy,
-    drive_policy: &DrivePolicy,
+    host: &'a Path,
+    repo: &'a Path,
+    remote: &'a Path,
+    baseline_commit: &'a str,
+    baseline_snapshot: &'a str,
+    retained: &'a [(String, String, String)],
+    executor: &'a DockerExecutor,
+    verifier_policy: &'a VerifierPolicy,
+    drive_policy: &'a DrivePolicy,
     cap: Units,
-    report: &mut Value,
-    report_path: &Path,
+    report: &'a mut Value,
+    report_path: &'a Path,
     started: Instant,
-) -> Result<Value, String> {
+}
+
+fn run_external_target_update(context: ExternalTargetUpdateContext<'_>) -> Result<Value, String> {
+    let ExternalTargetUpdateContext {
+        store,
+        broker,
+        session_id,
+        host,
+        repo,
+        remote,
+        baseline_commit,
+        baseline_snapshot,
+        retained,
+        executor,
+        verifier_policy,
+        drive_policy,
+        cap,
+        report,
+        report_path,
+        started,
+    } = context;
     let owner = target::acquire_controller(store, FX10_DRIFT_TARGET, "appointed-fx10-operator")
         .map_err(|error| error.to_string())?;
     let acceptance_policy = verifier_policy
@@ -1904,7 +1961,7 @@ fn run_external_target_update(
         repo,
         &[
             "commit-tree".into(),
-            baseline_tree,
+            baseline_tree.clone(),
             "-p".into(),
             baseline_commit.into(),
             "-m".into(),
@@ -1966,6 +2023,7 @@ fn run_external_target_update(
     let handshake = GateChildHandshake::prepare(handshake_directory.clone())?;
     let _handshake_environment = GateChildHandshakeEnvironment::set(&handshake_directory);
     let progress = Mutex::new(report.clone());
+    let observer_progress = &progress;
     let observer_host = host.to_path_buf();
     let observer_repo = repo.to_path_buf();
     let observer_remote = remote.to_path_buf();
@@ -1973,21 +2031,21 @@ fn run_external_target_update(
     let observer_revision = revision.id.to_string();
     let baseline = baseline_commit.to_owned();
     let advanced = advanced_commit.clone();
-    let (service_result, drift_result, progress_snapshot) = std::thread::scope(|scope| {
-        let observer = scope.spawn(|| {
-            observe_external_ref_advance(
-                observer_host,
-                observer_repo,
-                observer_remote,
-                observer_owner,
-                observer_revision,
-                baseline,
-                advanced,
+    let (service_result, drift_result) = std::thread::scope(|scope| {
+        let observer = scope.spawn(move || {
+            observe_external_ref_advance(ExternalRefAdvanceContext {
+                host: observer_host,
+                repo: observer_repo,
+                remote: observer_remote,
+                owner: observer_owner,
+                revision: observer_revision,
+                baseline_commit: baseline,
+                advanced_commit: advanced,
                 hold,
                 handshake,
-                &progress,
+                progress: observer_progress,
                 report_path,
-            )
+            })
         });
         let service_result = serve(
             store,
@@ -2002,11 +2060,11 @@ fn run_external_target_update(
         let drift_result = observer
             .join()
             .unwrap_or_else(|_| Err("FX10 external-ref observer panicked".to_string()));
-        let progress_snapshot = progress
-            .into_inner()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        (service_result, drift_result, progress_snapshot)
+        (service_result, drift_result)
     });
+    let progress_snapshot = progress
+        .into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     *report = progress_snapshot;
     let service_finished_unix_ms = now_ms()?;
     let service_summary = match &service_result {
@@ -2120,12 +2178,19 @@ fn run_external_target_update(
         }),
     )?;
 
-    let transport_row: Option<(i64, Option<i64>, Option<String>, String)> = store
+    let transport_row: Option<PublicationTransportRow> = store
         .read_connection()
         .query_row(
             "SELECT dispatched,operation,write_outcome,observation FROM local_source_transports WHERE target=?1 AND revision=?2",
             (FX10_DRIFT_TARGET, revision.id.as_str()),
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            |row| {
+                Ok(PublicationTransportRow {
+                    dispatched: row.get(0)?,
+                    operation: row.get(1)?,
+                    write_outcome: row.get(2)?,
+                    observation: row.get(3)?,
+                })
+            },
         )
         .optional()
         .map_err(|error| error.to_string())?;
@@ -2144,10 +2209,10 @@ fn run_external_target_update(
             "at":"external-target-update.publication-transport",
             "facts":{
                 "transport_count":transport_count,
-                "dispatched":transport_row.as_ref().map(|row| row.0),
-                "operation":transport_row.as_ref().and_then(|row| row.1),
-                "write_outcome":transport_row.as_ref().and_then(|row| row.2.as_deref()),
-                "observation":transport_row.as_ref().map(|row| row.3.as_str()),
+                "dispatched":transport_row.as_ref().map(|row| row.dispatched),
+                "operation":transport_row.as_ref().and_then(|row| row.operation),
+                "write_outcome":transport_row.as_ref().and_then(|row| row.write_outcome.as_deref()),
+                "observation":transport_row.as_ref().map(|row| row.observation.as_str()),
             }
         }),
     )?;
@@ -2220,11 +2285,18 @@ fn run_external_target_update(
     if unknown_run_count != 0 {
         return Err("FX10 external-ref schedule created an uncertain run".into());
     }
-    let (dispatched, operation, write_outcome, observation) = transport_row
+    let transport = transport_row
         .ok_or_else(|| "FX10 controlled ref advance has no publication transport".to_string())?;
-    if dispatched != 1 || operation.is_none() || write_outcome.as_deref() != Some("failed") {
+    if transport.dispatched != 1
+        || transport.operation.is_none()
+        || transport.write_outcome.as_deref() != Some("failed")
+    {
         return Err(format!(
-            "FX10 controlled ref advance did not produce one known failed publication: dispatched={dispatched}, operation={operation:?}, outcome={write_outcome:?}, observation={observation}"
+            "FX10 controlled ref advance did not produce one known failed publication: dispatched={}, operation={:?}, outcome={:?}, observation={}",
+            transport.dispatched,
+            transport.operation,
+            transport.write_outcome,
+            transport.observation
         ));
     }
     if transport_count != 1 {
@@ -2271,6 +2343,7 @@ fn run_external_target_update(
             "gate_child_heartbeat_updates_after_ref_update":drift.gate_child_heartbeat_updates_after_ref_update,
             "gate_child_release_unix_ms":drift.gate_child_release_unix_ms,
             "gate_child_completed_unix_ms":drift.gate_child_completed_unix_ms,
+            "gate_child_resource_lease":drift.gate_resource_lease,
             "local_target_phase_after": drift.target_phase_after,
             "local_wave_phase_after": drift.active_wave_phase_after,
             "completions_before_update": drift.completions_before_update,
@@ -2299,9 +2372,9 @@ fn run_external_target_update(
         },
         "publication": {
             "dispatched_once": true,
-            "operation": operation,
-            "write_outcome": write_outcome,
-            "observation": observation,
+            "operation": transport.operation,
+            "write_outcome": transport.write_outcome,
+            "observation": transport.observation,
             "replays": 0,
             "private_completion_count": completion_count,
             "unknown_run_count": unknown_run_count,
@@ -2343,17 +2416,28 @@ fn run_external_target_update(
     Ok(result)
 }
 
-#[allow(clippy::too_many_arguments)]
-fn run_fx10(
-    report: &mut Value,
-    report_path: &Path,
+struct Fx10RunContext<'a> {
+    report: &'a mut Value,
+    report_path: &'a Path,
     started: Instant,
-    host: &Path,
-    repo: &Path,
-    harness_repo: &Path,
-    remote: &Path,
-    drift_remote: &Path,
-) -> Result<(), String> {
+    host: &'a Path,
+    repo: &'a Path,
+    harness_repo: &'a Path,
+    remote: &'a Path,
+    drift_remote: &'a Path,
+}
+
+fn run_fx10(context: Fx10RunContext<'_>) -> Result<(), String> {
+    let Fx10RunContext {
+        report,
+        report_path,
+        started,
+        host,
+        repo,
+        harness_repo,
+        remote,
+        drift_remote,
+    } = context;
     let (oracle, expected_transcript, _manifest) = check_frozen_inputs()?;
     report["frozen_inputs"] = json!({
         "manifest_sha256": FX10_MANIFEST_SHA,
@@ -2985,6 +3069,7 @@ fn run_fx10(
         "arrival_wave_waited": second_wave.spec.sequence - first_wave.spec.sequence,
         "observer_polls": arrivals.observer_polls,
         "polls_while_resource_held": arrivals.polls_while_resource_held,
+        "polls_while_gate_child_running": arrivals.polls_while_gate_child_running,
         "bounded_contention_window_ms": arrivals.contention_window_ms,
         "gate_child": {
             "pid":arrivals.gate_child_pid,
@@ -3000,6 +3085,7 @@ fn run_fx10(
             "typed_holder": arrivals.typed_holder,
             "holder_lease_released": arrivals.released_holder,
             "holder_release_unix_ms": arrivals.holder_release_unix_ms,
+            "active_gate_child_lease": arrivals.gate_resource_lease,
             "actual_second_admission": first_gate_admission
         },
         "first_gate_reported_wait_ms": first_gate_wait_ms,
@@ -3034,24 +3120,24 @@ fn run_fx10(
         report,
         json!({"at":"sustained-arrivals","result":"the older A-C wave completed before the later D-F wave with all obligations retained"}),
     )?;
-    let external_target_update = run_external_target_update(
-        &mut store,
-        &mut broker,
-        session.id,
+    let external_target_update = run_external_target_update(ExternalTargetUpdateContext {
+        store: &mut store,
+        broker: &mut broker,
+        session_id: session.id,
         host,
         repo,
-        drift_remote,
-        &baseline_commit,
-        baseline_snapshot.snapshot_id.as_str(),
-        &retained,
-        &executor,
-        permit.policy(),
-        &drive_policy,
+        remote: drift_remote,
+        baseline_commit: &baseline_commit,
+        baseline_snapshot: baseline_snapshot.snapshot_id.as_str(),
+        retained: &retained,
+        executor: &executor,
+        verifier_policy: permit.policy(),
+        drive_policy: &drive_policy,
         cap,
         report,
         report_path,
         started,
-    )?;
+    })?;
     report["external_target_update"] = external_target_update;
     report["completed_at_unix_ms"] = json!(now_ms()?);
     report["cumulative_elapsed_ms"] = json!(started.elapsed().as_millis());
@@ -3132,16 +3218,16 @@ fn actual_fx10_sustained_arrivals_serve_old_group_before_later_features() {
         harness_repo.display()
     );
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        run_fx10(
-            &mut report,
-            &report_path,
+        run_fx10(Fx10RunContext {
+            report: &mut report,
+            report_path: &report_path,
             started,
-            &host,
-            &repo,
-            &harness_repo,
-            &remote,
-            &drift_remote,
-        )
+            host: &host,
+            repo: &repo,
+            harness_repo: &harness_repo,
+            remote: &remote,
+            drift_remote: &drift_remote,
+        })
     }));
     match outcome {
         Ok(Ok(())) => {
