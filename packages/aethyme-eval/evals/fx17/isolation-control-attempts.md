@@ -154,7 +154,8 @@ controls run. No model call or private held-out evaluation occurred.
 - Control harness SHA256: `56572eb5bbe886de9c610b2836eceefbac54eb4faccf49f2d738ef96a63c98a0`
 - Attempt 004 subject profile SHA256: `401b20db9bea3af2f0d3c096ad4532b37416790732805658ca168519d65c2aff`
 - Runtime profile SHA256: `344525a875713778fae5344c053692db5b4aa21e8bd2a55929f18b2c5261940e`
-- Runtime correction SHA256 used by attempt 004: `050feab619b4b78503956dfa7a71e2b0550f936bd5048d9761d6e1d0509a5826`
+- Stale runtime-correction SHA256 recorded by the attempt 004 runner (it did not match the document): `050feab619b4b78503956dfa7a71e2b0550f936bd5048d9761d6e1d0509a5826`
+- Actual runtime-correction document SHA256 at attempt 004: `a6d2cd8289ef646cf281f6ef02c6d9bec0d0c8cc08a211fc8c492ed275d43d89`
 
 ## Profile correction after attempt 004
 
@@ -166,7 +167,7 @@ profile hash, runner hash, and runtime-correction document hash below describe
 this pending-reviewed change; the runtime-profile hash is unchanged. No
 controls attempt 005 has run.
 
-- Runner SHA256 with the profile correction: `926fc5c1af233d47421b8c84f991677e5012137a6d6e99a7ce9dc9781468f66e`
+- Runner SHA256 with the profile and verified runtime-correction pin: `fe92d4b47e47dabb9596d156c6fc1e9adeb4a44656fe53f44d103a4270791479`
 - Control harness SHA256: `56572eb5bbe886de9c610b2836eceefbac54eb4faccf49f2d738ef96a63c98a0`
 - Subject profile SHA256 with the correction: `cb3db0c407c33e7199908b2885ca037fc41c001c81eef30156ca907a75e985ee`
 - Runtime profile SHA256 (unchanged): `344525a875713778fae5344c053692db5b4aa21e8bd2a55929f18b2c5261940e`
