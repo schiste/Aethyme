@@ -1105,7 +1105,14 @@ struct HoldTemporary(PathBuf);
 
 impl Drop for HoldTemporary {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
+        match std::fs::remove_file(&self.0) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => crate::warn_unrecorded(
+                &format!("remove temporary view hold {}", self.0.display()),
+                Err::<(), _>(error),
+            ),
+        }
     }
 }
 
