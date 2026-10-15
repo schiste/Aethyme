@@ -3739,8 +3739,24 @@ mod tests {
     #[test]
     fn invalid_capture_notice_ingress_lock_blocks_database_cleanup() {
         use crate::collaboration_archive::ObjectDigest;
+        use crate::collaboration_capture as capture;
 
         let mut fixture = crate::local_generation::tests::Fixture::new();
+        complete_fixture_wave(&mut fixture);
+        let source_repository = fixture.v.f._repo.path().to_path_buf();
+        let capture_request = capture::CaptureRequest {
+            operation_id: capture::OperationId::mint().unwrap(),
+            repository: source_repository,
+            base: fixture.v.f.a.base.commit.clone(),
+            result: fixture.v.f.a.result.commit.clone(),
+            policy: capture::CapturePolicy::Required,
+            retention: capture::RetentionBoundary::UntilReleased,
+        };
+        assert!(matches!(
+            capture::capture(&mut fixture.v.f.store, &capture_request).unwrap(),
+            capture::CaptureOutcome::Acknowledged(_)
+        ));
+
         let store = &mut fixture.v.f.store;
         let frozen = crate::local_authority::freeze(
             store,
