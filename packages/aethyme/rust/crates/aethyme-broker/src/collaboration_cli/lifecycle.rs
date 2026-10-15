@@ -1303,7 +1303,7 @@ pub(super) fn export(root: &Path, rest: &[&str]) -> Result<Output, Failure> {
         visibility: "local_project".into(),
         audience: audience.into(),
     };
-    let bytes = restore::export_to_path(
+    let (byte_count, bundle_digest) = restore::export_to_path(
         &mut store,
         &owner,
         &scope,
@@ -1324,7 +1324,7 @@ pub(super) fn export(root: &Path, rest: &[&str]) -> Result<Output, Failure> {
         Failure::domain(code, e.to_string())
     })?;
     Ok((
-        json!({"schema":"aethyme.collab-export/experimental-v0","profile":restore::PROFILE,"bytes":bytes,"historical_only":true,"grants_authority":false,"source_released":false,"publication_guard_held_through_sync":true}),
+        json!({"schema":"aethyme.collab-export/experimental-v0","profile":restore::PROFILE,"bundle":bundle_digest.hex(),"bytes":byte_count,"historical_only":true,"grants_authority":false,"source_released":false,"publication_guard_held_through_sync":true}),
         "Historical source bundle written exclusively; source remains retained\n".into(),
     ))
 }

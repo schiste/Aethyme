@@ -596,7 +596,7 @@ pub fn export_to_path(
     scope: &Scope,
     selection: &Selection,
     output: &Path,
-) -> Result<u64, RestoreError> {
+) -> Result<(u64, ObjectDigest), RestoreError> {
     let _epoch = target::authorize(store, owner)?;
     let _archive = gc::archive_use(store)?;
     let _response = crate::collaboration_sensitive::response_use(store)?;
@@ -612,7 +612,8 @@ pub fn export_to_path(
     let path_text = path
         .to_str()
         .ok_or_else(|| invalid("export destination is not valid UTF-8"))?;
-    let digest = format!("sha256:{}", ObjectDigest::of(&bytes).hex());
+    let bundle_digest = ObjectDigest::of(&bytes);
+    let digest = format!("sha256:{}", bundle_digest.hex());
     let byte_count = u64::try_from(bytes.len()).map_err(|_| invalid("export byte count"))?;
     store.connection().execute(
         "INSERT INTO local_sensitive_exports(path,kind,sha256,bytes,state,created_ms)
@@ -635,7 +636,7 @@ pub fn export_to_path(
         "UPDATE local_sensitive_exports SET state='present' WHERE path=?1 AND state='intent'",
         [path_text],
     )?;
-    Ok(byte_count)
+    Ok((byte_count, bundle_digest))
 }
 
 fn canonical_output_path(output: &Path) -> Result<PathBuf, RestoreError> {
