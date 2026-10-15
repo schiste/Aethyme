@@ -304,6 +304,8 @@ fn actual_unknown_publication_after_receiver_ref_update_never_completes() {
 
     let remote = tempfile::tempdir().unwrap().keep();
     git(&remote, &["init", "--bare", "-q"]);
+    // Empty fixture templates do not create the receiver-owned hooks directory.
+    std::fs::create_dir_all(remote.join("hooks")).unwrap();
     git(
         &repo,
         &[
