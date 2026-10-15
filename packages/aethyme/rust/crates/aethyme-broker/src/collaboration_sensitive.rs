@@ -2839,12 +2839,12 @@ fn delete_managed_copy_directories(
                         blocked_path = Some(item.relative_path.clone());
                         break;
                     }
-                    Ok(metadata) if metadata.file_type().is_dir() => {}
-                    Ok(_) => {
-                        blocked_path = Some(item.relative_path.clone());
-                        break;
-                    }
+                    Ok(metadata) => metadata,
                 };
+                if !metadata.file_type().is_dir() {
+                    blocked_path = Some(item.relative_path.clone());
+                    break;
+                }
                 if states
                     .get(&item.relative_path)
                     .is_some_and(|state| state == "deleted")
