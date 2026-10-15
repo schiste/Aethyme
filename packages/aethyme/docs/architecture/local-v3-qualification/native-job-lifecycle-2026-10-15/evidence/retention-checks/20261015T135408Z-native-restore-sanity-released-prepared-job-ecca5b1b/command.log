@@ -1,0 +1,19 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.39s
+     Running unittests src/lib.rs (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/integrate-reviewed-local-bare-git-servic/target/local-resume/cargo/debug/deps/aethyme_broker-0f278e0d02146111)
+
+running 1 test
+test native_gates::tests::released_prepared_job_remains_readable_but_cannot_be_dispatched_or_replayed ... 
+thread 'native_gates::tests::released_prepared_job_remains_readable_but_cannot_be_dispatched_or_replayed' (556091) panicked at crates/aethyme-broker/src/native_gates/tests.rs:748:5:
+assertion failed: matches!(prepare(&mut migrated, owner, &mut s.broker, &s.wave),
+    Err(NativeGateError::RootsReleased))
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+
+failures:
+    native_gates::tests::released_prepared_job_remains_readable_but_cannot_be_dispatched_or_replayed
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1819 filtered out; finished in 23.64s
+
+error: test failed, to rerun pass `-p aethyme-broker --lib`

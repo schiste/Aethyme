@@ -1,0 +1,51 @@
+MUTATION_RUNNER_SHA256=b78af5398d30f7302854271b4228648e4cc30e8c66c4593759622ce7c9d7f1f3
+MUTATOR_SHA256=0b2e660db3c4b5bf39faada40c15205768cfa23e08b8cad54f011417a9cd0d8a
+MUTANT=m5-gc-ignores-retained-root-marker
+TEST_FILTER=completed_job_release_survives_real_gc_and_reopened_status_reads
+SOURCE=/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/reconcile-retention-of-inactive-native-g/packages/aethyme/rust/crates/aethyme-broker/src/collaboration_gc.rs
+ORIGINAL_SHA256=aa98ce865560de6a91b426fbcdf4fa570c8e1258845675a63d620995c89ddb1f
+MUTATION_BACKUP=/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/reconcile-retention-of-inactive-native-g/target/local-resume/mutation-backups/m5-gc-ignores-retained-root-marker.lUgHDo
+ORIGINAL_SHA256=aa98ce865560de6a91b426fbcdf4fa570c8e1258845675a63d620995c89ddb1f
+MUTANT_SHA256=6d1df5b4cde8433be7cf3dd7e28c6706f78cd60dffd17bc66dd6d49e992353ed
+APPLIED_SHA256=6d1df5b4cde8433be7cf3dd7e28c6706f78cd60dffd17bc66dd6d49e992353ed
+DIFF_BEGIN
+--- /Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/reconcile-retention-of-inactive-native-g/target/local-resume/mutation-backups/m5-gc-ignores-retained-root-marker.lUgHDo	2026-10-15 12:36:35
++++ /Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/reconcile-retention-of-inactive-native-g/packages/aethyme/rust/crates/aethyme-broker/src/collaboration_gc.rs	2026-10-15 15:50:15
+@@ -929,7 +929,7 @@
+     // release. Only an explicit release for a prepared (abandoned) or completed
+     // job retires these edges; dispatching and unknown jobs remain rooted.
+     let native_roots: Vec<(String, String)> = connection
+-        .prepare("SELECT roots.kind,roots.reference FROM local_native_gate_roots AS roots JOIN local_native_gate_jobs AS jobs ON jobs.id=roots.job WHERE jobs.roots_released_ms IS NULL UNION SELECT kind,reference FROM local_controller_completion_roots")?
++        .prepare("SELECT roots.kind,roots.reference FROM local_native_gate_roots AS roots JOIN local_native_gate_jobs AS jobs ON jobs.id=roots.job UNION SELECT kind,reference FROM local_controller_completion_roots")?
+         .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+         .collect::<Result<_, _>>()?;
+     for (kind, reference) in native_roots {
+DIFF_END
+MUTANT_SOURCE_SHA256=6d1df5b4cde8433be7cf3dd7e28c6706f78cd60dffd17bc66dd6d49e992353ed
+CARGO_LOG_PATH=/Volumes/T7-repositories/Application Support/Aethyme/qualification/local-check-temporaries/native-guard-m5-gc-retains-released-root-tmp-ee_ozdty/native-retention-m5-gc-ignores-retained-root-marker-cargo.C7Uv82
+CARGO_EXIT=101
+   Compiling aethyme-broker v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/reconcile-retention-of-inactive-native-g/packages/aethyme/rust/crates/aethyme-broker)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 28.82s
+     Running unittests src/lib.rs (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/integrate-reviewed-local-bare-git-servic/target/local-resume/cargo/debug/deps/aethyme_broker-0f278e0d02146111)
+
+running 1 test
+test native_gates::tests::completed_job_release_survives_real_gc_and_reopened_status_reads ... gate retained-features started (cost 0, tree 1e128ff5b7d8)
+gate retained-features pass in 0s (tree 1e128ff5b7d8) at load 1m 4.9/10 cpus
+
+thread 'native_gates::tests::completed_job_release_survives_real_gc_and_reopened_status_reads' (517356) panicked at crates/aethyme-broker/src/native_gates/tests.rs:969:5:
+the same job-owned subject manifest must become reclaimable after release
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+
+failures:
+    native_gates::tests::completed_job_release_survives_real_gc_and_reopened_status_reads
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1819 filtered out; finished in 23.93s
+
+error: test failed, to rerun pass `-p aethyme-broker --lib`
+NAMED_ASSERTION_FAILURE_CONFIRMED=native_gates::tests::completed_job_release_survives_real_gc_and_reopened_status_reads
+RESTORED_SHA256=aa98ce865560de6a91b426fbcdf4fa570c8e1258845675a63d620995c89ddb1f
+BACKUP_PATH=/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/reconcile-retention-of-inactive-native-g/target/local-resume/mutation-backups/m5-gc-ignores-retained-root-marker.lUgHDo
+BACKUP_SHA256=aa98ce865560de6a91b426fbcdf4fa570c8e1258845675a63d620995c89ddb1f

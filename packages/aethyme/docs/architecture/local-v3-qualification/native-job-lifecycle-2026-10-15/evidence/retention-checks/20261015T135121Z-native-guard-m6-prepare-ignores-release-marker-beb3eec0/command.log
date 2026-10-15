@@ -1,0 +1,55 @@
+MUTATION_RUNNER_SHA256=b78af5398d30f7302854271b4228648e4cc30e8c66c4593759622ce7c9d7f1f3
+MUTATOR_SHA256=0b2e660db3c4b5bf39faada40c15205768cfa23e08b8cad54f011417a9cd0d8a
+MUTANT=m6-prepare-ignores-released-marker
+TEST_FILTER=released_prepared_job_remains_readable_but_cannot_be_dispatched_or_replayed
+SOURCE=/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/reconcile-retention-of-inactive-native-g/packages/aethyme/rust/crates/aethyme-broker/src/native_gates.rs
+ORIGINAL_SHA256=e17607f4b349556be3eb38651e8bd270087c84d3023c7b767b3308293aa838b5
+MUTATION_BACKUP=/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/reconcile-retention-of-inactive-native-g/target/local-resume/mutation-backups/m6-prepare-ignores-released-marker.631Yrm
+ORIGINAL_SHA256=e17607f4b349556be3eb38651e8bd270087c84d3023c7b767b3308293aa838b5
+MUTANT_SHA256=870ddb885e7b60ee87d34a0b3554fc6dd87ceec7645e921d664cb433e6797a8d
+APPLIED_SHA256=870ddb885e7b60ee87d34a0b3554fc6dd87ceec7645e921d664cb433e6797a8d
+DIFF_BEGIN
+--- /Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/reconcile-retention-of-inactive-native-g/target/local-resume/mutation-backups/m6-prepare-ignores-released-marker.631Yrm	2026-10-15 12:48:30
++++ /Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/reconcile-retention-of-inactive-native-g/packages/aethyme/rust/crates/aethyme-broker/src/native_gates.rs	2026-10-15 15:51:21
+@@ -582,9 +582,7 @@
+     {
+         let job = load(store, &id(&key)?)?;
+         repository_binding(broker, &job.spec)?;
+-        if job.roots_released_ms.is_some() {
+-            return Err(NativeGateError::RootsReleased);
+-        }
++        // MUTATION: prepare marker-classification guard removed.
+         current(store, owner, &job.spec)?;
+         return Ok(job);
+     }
+DIFF_END
+MUTANT_SOURCE_SHA256=870ddb885e7b60ee87d34a0b3554fc6dd87ceec7645e921d664cb433e6797a8d
+CARGO_LOG_PATH=/Volumes/T7-repositories/Application Support/Aethyme/qualification/local-check-temporaries/native-guard-m6-prepare-ignores-release-marker-tmp-pmyf5ggg/native-retention-m6-prepare-ignores-released-marker-cargo.eSQoSK
+CARGO_EXIT=101
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+   Compiling aethyme-broker v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/reconcile-retention-of-inactive-native-g/packages/aethyme/rust/crates/aethyme-broker)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 38.70s
+     Running unittests src/lib.rs (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/integrate-reviewed-local-bare-git-servic/target/local-resume/cargo/debug/deps/aethyme_broker-0f278e0d02146111)
+
+running 1 test
+test native_gates::tests::released_prepared_job_remains_readable_but_cannot_be_dispatched_or_replayed ... 
+thread 'native_gates::tests::released_prepared_job_remains_readable_but_cannot_be_dispatched_or_replayed' (538885) panicked at crates/aethyme-broker/src/native_gates/tests.rs:748:5:
+assertion failed: matches!(prepare(&mut migrated, owner, &mut s.broker, &s.wave),
+    Err(NativeGateError::RootsReleased))
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+
+failures:
+    native_gates::tests::released_prepared_job_remains_readable_but_cannot_be_dispatched_or_replayed
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1819 filtered out; finished in 19.59s
+
+error: test failed, to rerun pass `-p aethyme-broker --lib`
+NAMED_ASSERTION_FAILURE_CONFIRMED=native_gates::tests::released_prepared_job_remains_readable_but_cannot_be_dispatched_or_replayed
+RESTORED_SHA256=e17607f4b349556be3eb38651e8bd270087c84d3023c7b767b3308293aa838b5
+BACKUP_PATH=/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/reconcile-retention-of-inactive-native-g/target/local-resume/mutation-backups/m6-prepare-ignores-released-marker.631Yrm
+BACKUP_SHA256=e17607f4b349556be3eb38651e8bd270087c84d3023c7b767b3308293aa838b5
