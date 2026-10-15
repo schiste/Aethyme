@@ -46,6 +46,7 @@ pub mod collaboration_submit;
 pub mod composer;
 pub mod composition;
 mod disk_headroom;
+pub mod experimental_symbol_mapping;
 mod duplicate_work;
 pub mod exit_status;
 pub mod local_capture_notice;

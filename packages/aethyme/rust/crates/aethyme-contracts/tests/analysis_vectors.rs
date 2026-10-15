@@ -23,6 +23,10 @@ struct ValidCase {
     input: Input,
     status: String,
     absence_is_evidence: bool,
+    #[serde(default)]
+    reason: Option<String>,
+    #[serde(default)]
+    gaps: Vec<String>,
     canonical_hex: String,
     id: String,
 }
@@ -65,6 +69,8 @@ fn every_degradation_reads_as_the_reference_says() {
             "{}",
             case.name
         );
+        assert_eq!(envelope.reason, case.reason, "{}", case.name);
+        assert_eq!(envelope.gaps, case.gaps, "{}", case.name);
     }
 }
 
