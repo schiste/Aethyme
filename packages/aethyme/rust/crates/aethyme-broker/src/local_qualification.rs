@@ -4,7 +4,7 @@ use super::*;
 use crate::collaboration_archive as archive;
 use crate::collaboration_gc as gc;
 use crate::execution_snapshot as snapshot;
-use crate::execution_supervisor::{DockerExecutor, Outcome};
+use crate::execution_supervisor::{BuildObservationWitnessKind, DockerExecutor, Outcome};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
@@ -557,15 +557,17 @@ fn actual_pressure_preserves_retained_source_and_bounded_native_cleanup() {
                 let execution_ref = &execution;
                 let attempt_ref = &attempt;
                 let pressure_owner_ref = &pressure_owner;
+                let (witness_tx, witness_rx) = mpsc::sync_channel(1);
                 let (result, gc_report, pressure_collector) = std::thread::scope(
                     |pressure_scope| {
                         let job = pressure_scope.spawn(|| {
-                            executor_ref.build(
+                            executor_ref.test_build_with_pre_finish_observer(
                                 &mut pressure.store,
                                 pressure_owner_ref,
                                 execution_ref,
                                 attempt_ref,
                                 &cancel,
+                                witness_tx.clone(),
                             )
                         });
                         let trial = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -647,6 +649,44 @@ fn actual_pressure_preserves_retained_source_and_bounded_native_cleanup() {
                                 release(executor_ref, &object);
                             }
 
+                            let witness = witness_rx
+                                .recv_timeout(Duration::from_secs(75))
+                                .unwrap_or_else(|error| {
+                                    panic!("{label}: bounded pre-finish observation unavailable: {error}")
+                                });
+                            assert_eq!(
+                                witness.kind,
+                                BuildObservationWitnessKind::Observation,
+                                "{label}: unexpected build error before observation: {:?}",
+                                witness.detail
+                            );
+                            assert_eq!(witness.run_id, object.generation);
+                            assert_eq!(
+                                witness.outcome,
+                                Some(expected),
+                                "{label}: {:?}",
+                                witness.detail
+                            );
+                            assert!(
+                                !witness.artifact_present,
+                                "{label}: pressure cannot mint an artifact/pass"
+                            );
+                            if label == "bounded-tmpfs-enospc" {
+                                assert_eq!(witness.exit_code, Some(28));
+                                assert_eq!(witness.detail, None);
+                            } else {
+                                assert_eq!(witness.exit_code, None);
+                                assert_eq!(
+                                    witness.detail.as_deref(),
+                                    Some("infrastructure deferred: workload OOM")
+                                );
+                            }
+                            assert_archive_exclusive_observed(
+                                &archive_lock_path,
+                                label,
+                                "after the exact cleaned build observation and before join",
+                            );
+                            resume_gc.release();
                             let observation = job.join().unwrap().unwrap();
                             assert_eq!(
                                 observation.outcome(),
@@ -667,12 +707,6 @@ fn actual_pressure_preserves_retained_source_and_bounded_native_cleanup() {
                                         .is_some_and(|detail| detail.contains("OOM"))
                                 );
                             }
-                            assert_archive_exclusive_observed(
-                                &archive_lock_path,
-                                label,
-                                "through the actual failed build observation",
-                            );
-                            resume_gc.release();
                             let (report, collector) = gc_worker.join().unwrap();
                             (observation, report.unwrap(), collector)
                         }));
