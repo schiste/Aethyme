@@ -61,7 +61,7 @@ floor protects fresh opens.
 
 The explicit release and retention lifecycle has its own
 [native job lifecycle qualification ledger](local-v3-qualification/native-job-lifecycle-2026-10-15/README.md).
-Independent review covers its source, test oracle and all 108 retained evidence
+Independent review covers its source, test oracle and all 109 retained evidence
 payloads. The 15-test native-gates selection, seven migration fixtures and
 restored-source sanity check passed at their recorded heads. Six deliberate
 guard removals failed their intended assertions with exact source restoration;

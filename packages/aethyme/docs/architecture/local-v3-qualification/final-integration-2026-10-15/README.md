@@ -39,8 +39,9 @@ credit. Their complete original logs are retained.
 
 ## Remaining integration work
 
-Native-job release and schema-23 qualification are recorded separately once
-executed and reviewed. The exact T45 pressure/GC interleaving is also pending.
+The separately reviewed [native-job release and schema-23 qualification](../native-job-lifecycle-2026-10-15/README.md)
+retains its successful checks, deliberate guard failures and failed or incomplete
+attempts. The exact T45 pressure/GC interleaving is still pending.
 No later combined tree is credited by these earlier source-bound runs.
 No model, provider trial or private held-out evaluator ran in this selection.
 The six consumed FX17 provider errors remain unchanged; this ledger does not

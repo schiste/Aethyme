@@ -254,7 +254,8 @@ unknown jobs remain rooted; this does not establish process-tree quiescence.
 Plan T45 also requires pressure during capture, hydration and build while GC
 runs. The earlier APFS and Docker profiles exercised their pressure and GC
 phases separately; those records are not credited as the required interleaving.
-A bounded schedule with explicit operation/lock witnesses is being implemented.
+A bounded schedule with explicit operation/lock witnesses is implemented;
+its physical interleaving qualification is still in progress.
 This requirement does not imply a full-host, daemon-storage or power-loss claim.
 
 The operator must designate the disposable GitHub/Mergify repository, branch
