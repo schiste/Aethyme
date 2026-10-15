@@ -146,6 +146,23 @@ impl DockerExecutor {
             resources: None,
         })
     }
+    /// Capture a runtime descriptor from one operator-pinned Unix endpoint.
+    /// Unlike [`Self::probe`], this path never consults `DOCKER_HOST` or a CLI
+    /// context, and the endpoint remains part of the observed runtime identity.
+    pub fn probe_at(cli: PathBuf, endpoint: &str) -> Result<Self, SupervisorError> {
+        if !cli.is_absolute() {
+            return Err(SupervisorError::Unsupported(
+                "absolute Docker CLI required".into(),
+            ));
+        }
+        let cli = docker::Connection::pinned(cli, endpoint)?;
+        let runtime = docker::probe(&cli)?;
+        Ok(Self {
+            cli,
+            runtime,
+            resources: None,
+        })
+    }
     /// Reclaim only the named journal's exact resources after its reader lock
     /// is available. Unacknowledged creation stays held for explicit review.
     pub fn recover_resources(&self, run: &str) -> Result<(), SupervisorError> {
