@@ -102,7 +102,27 @@ no credit. CI at `0d72131d` passed workspace tests, lint, examples/doctests,
 Windows smoke and the product path.
 
 This finite result supplies an actual autonomous positive and later-arrival
-continuation. It does not establish sustained-load reliability. The actual
-receiver-timeout control, FX17's twenty accepted controlled changes and separate
+continuation. It does not establish sustained-load reliability.
+
+The receiver-timeout control passed at `b16af023`: one explicit native test,
+zero failures, exit 0. The receiver actually updated its ref before the managed
+push timed out. The service held, classified the run as unknown and refused
+replay; no private acceptance receipt, qualification or completion was issued.
+Retained roots and charged reservations remained visible, and both owned hook
+processes exited. Two earlier fixture failures remain part of the attempt
+history. This demonstrates one ambiguous publication schedule; it does not
+establish behavior under repeated external ref movement.
+
+The first FX17 native attempt stopped before execution because its owned host
+resource directory was not private. After correcting only that fixture's mode,
+the second attempt accepted C01 and held C02. Its journal exposed an incorrect
+baseline commit across immutable target revisions: candidate ancestry and the
+publication lease used an older provenance commit despite selecting the accepted
+source bytes. The stale lease correctly refused publication. That sequence is
+failed, with one accepted change out of twenty required; it supplies no FX17
+qualification. The generic baseline repair requires focused regressions,
+independent review and a new complete native attempt.
+
+Sustained-arrival service, FX17's twenty accepted controlled changes and separate
 held-out model cases require their own reviewed runs and complete denominators.
 Retain failures, blocks, exclusions, budget uncertainty and observed costs.

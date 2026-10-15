@@ -183,9 +183,17 @@ every decision-key/path comparison arm was removed.
 
 FX17 requires twenty accepted controlled changes with surviving independent
 obligations and separate once-final held-out model cases. The reviewed harness
-and frozen payload preparation do not supply runtime evidence. Sustained-arrival
-load, actual ambiguous publication handling and integrated final checks remain
-explicit qualification work until their observations are recorded.
+and frozen payload preparation do not qualify that sequence. The first actual
+native attempt stopped on fixture directory permissions; the second accepted
+C01 and held C02 after exposing an incorrect baseline commit across target
+revisions. Both failures remain in the denominator. The generic repair and a
+complete native sequence remain required.
+
+The [controller record](local-v3-autonomous-controller.md) separately records a
+passing actual receiver-timeout control at `b16af023`: the remote ref moved,
+the managed write stayed unknown, replay was refused and no private completion
+was issued. This is one ambiguous-publication schedule. Sustained-arrival load
+and integrated final checks remain explicit qualification work.
 
 The operator must designate the disposable GitHub/Mergify repository, branch
 and policy before live-provider trials. Actual private GenericGit acceptance
