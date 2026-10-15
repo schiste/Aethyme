@@ -42,9 +42,22 @@ remain mandatory for autonomous acceptance.
 
 Collaboration schema/floor 18 adds native jobs and independent roots for the
 baseline, subject, recipe, job record and original contribution roles. Releasing
-revision roots does not release these jobs. Roots currently remain indefinitely;
-inactive job release and reconciliation remain implementation work. Quiesce old
-open collaboration clients before upgrading; the floor protects fresh opens.
+revision roots does not release these jobs. Schema 23 adds an irreversible root
+release witness while preserving each job row and observation as readable
+history. The current appointed target owner can explicitly abandon a prepared
+job or release roots for a completed job. GC ignores only that job's released
+root edges; other native jobs, target roots, controller completions and reader
+leases continue to protect shared data. A released prepared job cannot pass the
+dispatch CAS, and a database trigger also rejects state changes by an older
+already-open client. The `collab target native-gates list|status|release`
+commands use the existing target appointment and authority guard.
+
+Dispatching and unknown jobs remain rooted. Native gate runs have no
+job-correlated process-tree ledger, so PID absence, a free generic gate lock or
+a failed probe cannot prove that a child is gone. The retention API reports
+these as `unknown_held`; it does not create a terminal observation or fresh
+trusted evidence. Quiesce old open collaboration clients before upgrading; the
+floor protects fresh opens.
 
 The Local integration is retained at `cb6dfeb57dc0f6c1d423e13fc78ea16e90e24529`
 (#758), with passing final workspace, lint, example/doctest, Windows and product

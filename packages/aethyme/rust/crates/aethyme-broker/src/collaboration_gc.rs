@@ -861,9 +861,10 @@ fn survey(
         }
     }
     // Native gate jobs retain exact source and records independently of target
-    // release. A crash or observation never relinquishes these roots.
+    // release. Only an explicit release for a prepared (abandoned) or completed
+    // job retires these edges; dispatching and unknown jobs remain rooted.
     let native_roots: Vec<(String, String)> = connection
-        .prepare("SELECT kind,reference FROM local_native_gate_roots UNION SELECT kind,reference FROM local_controller_completion_roots")?
+        .prepare("SELECT roots.kind,roots.reference FROM local_native_gate_roots AS roots JOIN local_native_gate_jobs AS jobs ON jobs.id=roots.job WHERE jobs.roots_released_ms IS NULL UNION SELECT kind,reference FROM local_controller_completion_roots")?
         .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
         .collect::<Result<_, _>>()?;
     for (kind, reference) in native_roots {
