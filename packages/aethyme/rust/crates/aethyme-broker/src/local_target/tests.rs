@@ -2,20 +2,87 @@ use super::*;
 use crate::collaboration_archive::{CommitOid, RetainedContribution};
 use crate::collaboration_gc::{self as gc, GcOptions};
 use crate::collaboration_state::{CollaborationRoot, ProjectKey};
-use std::path::Path;
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+// Fixture setup commands need only system utilities; resolve Git itself through
+// the repository's trusted program probe and keep ambient user tools off PATH.
+fn minimal_git_path() -> OsString {
+    #[cfg(windows)]
+    let paths = {
+        let system_root = std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into());
+        vec![PathBuf::from(system_root).join("System32")]
+    };
+    #[cfg(unix)]
+    let paths = ["/usr/bin", "/bin", "/usr/sbin", "/sbin"]
+        .into_iter()
+        .map(PathBuf::from)
+        .collect::<Vec<_>>();
+    std::env::join_paths(paths).expect("minimal Git test PATH")
+}
+
+/// Run fixture setup with isolated Git config, identity, hooks and attributes.
+/// Managed GitCarrier dispatches do not use this helper and retain receiver hooks.
 pub(crate) fn git(repo: &Path, args: &[&str]) -> String {
-    let output = Command::new("git")
+    #[cfg(windows)]
+    let system_root = std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into());
+    let home = tempfile::tempdir().unwrap();
+    let hooks = home.path().join("empty-hooks");
+    let templates = home.path().join("empty-templates");
+    let xdg = home.path().join("xdg");
+    std::fs::create_dir_all(&hooks).unwrap();
+    std::fs::create_dir_all(&templates).unwrap();
+    std::fs::create_dir_all(&xdg).unwrap();
+    let global_config = home.path().join("global.gitconfig");
+    let system_config = home.path().join("system.gitconfig");
+    let attributes = home.path().join("global.attributes");
+    let excludes = home.path().join("global.excludes");
+    for path in [&global_config, &system_config, &attributes, &excludes] {
+        std::fs::write(path, b"").unwrap();
+    }
+
+    let mut command = crate::git::git_command();
+    command
         .current_dir(repo)
-        .args(["-c", "commit.gpgsign=false", "-c", "core.autocrlf=false"])
-        .args(args)
+        .env_clear()
+        .env("PATH", minimal_git_path())
+        .env("HOME", home.path())
+        .env("XDG_CONFIG_HOME", &xdg)
+        .env("GIT_CONFIG_GLOBAL", &global_config)
+        .env("GIT_CONFIG_SYSTEM", &system_config)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_ATTR_NOSYSTEM", "1")
+        .env("GIT_TEMPLATE_DIR", &templates)
+        .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_AUTHOR_NAME", "fixture")
         .env("GIT_AUTHOR_EMAIL", "fixture@example.invalid")
         .env("GIT_COMMITTER_NAME", "fixture")
         .env("GIT_COMMITTER_EMAIL", "fixture@example.invalid")
-        .output()
-        .unwrap();
+        .env("LC_ALL", "C")
+        .env("LANG", "C")
+        .arg("-c")
+        .arg("commit.gpgsign=false")
+        .arg("-c")
+        .arg("core.autocrlf=false")
+        .arg("-c")
+        .arg(format!("core.hooksPath={}", hooks.display()))
+        .arg("-c")
+        .arg(format!("core.attributesFile={}", attributes.display()))
+        .arg("-c")
+        .arg(format!("core.excludesFile={}", excludes.display()))
+        .arg("-c")
+        .arg(format!("init.templateDir={}", templates.display()))
+        .arg("-c")
+        .arg("user.name=fixture")
+        .arg("-c")
+        .arg("user.email=fixture@example.invalid")
+        .args(args);
+    #[cfg(windows)]
+    command
+        .env("SystemRoot", &system_root)
+        .env("USERPROFILE", home.path());
+    let output = command.output().unwrap();
     assert!(
         output.status.success(),
         "{}",

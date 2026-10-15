@@ -1,0 +1,87 @@
+{
+  "schema": "aethyme.fx08.independent-oracle-review/v1",
+  "source_commit": "d5406f7bbfe6e309aea097ff27951007cd5108ae",
+  "reviewer": "review_l5_targets",
+  "derivation_sha256": "82ec1b95137362e81cd4e95f46010b8f1946fd6bc0cbd0599b998fd2d9859967",
+  "method": "Literal vectors fixed from written public tasks/private contracts before existing source API binding. API extractor subsequently also printed baseline bodies after one-line type declarations; no patched/expected implementation was inspected or created.",
+  "executions": {
+    "cargo": 0,
+    "rustc": 0,
+    "model": 0,
+    "engine": 0,
+    "browser": 0
+  },
+  "qualification": "Uncompiled/unrun independent additive creation-order correction; coordinator calibration required before FX08 model admission.",
+  "tasks": [
+    {
+      "task": "01-optional",
+      "oracle": "/private/tmp/aethyme-fx08-oracle02-amendment.xGP1Ux/oracles/01-optional/oracle.rs",
+      "sha256": "54fdd15bdf077d84a2a0c3a9d7a025ed3ac7630e6f5572bc2045249e91835571",
+      "requested_tests": 2,
+      "survivor_tests": 1,
+      "contract_sha256": "83f739beaffa0cdae964825ece75e42a401803ec6bfe7a03047610b69d3ddf80",
+      "public_task_sha256": "b0cd6a9cab075133385dd8120215add2c708f781c3a473fd866b95c165ce6969",
+      "brief_arms_sha256": "105360b12d74ffd9323102282484febca897fcba2ffe6008220870170471ebf5",
+      "prior_sha256": "54fdd15bdf077d84a2a0c3a9d7a025ed3ac7630e6f5572bc2045249e91835571"
+    },
+    {
+      "task": "02-pagination",
+      "oracle": "/private/tmp/aethyme-fx08-oracle02-amendment.xGP1Ux/oracles/02-pagination/oracle.rs",
+      "sha256": "234e5d5ec12e4d619ee7f61fece106ef874705934db02f9dbdd1d68b54995cd6",
+      "requested_tests": 1,
+      "survivor_tests": 3,
+      "contract_sha256": "e7ad8b944483690a1bee8c82b6edebfedabb230f41e4a7d13af255347e2855dd",
+      "public_task_sha256": "e2c2363970e363d2b048a181f5b30ebd06a0c261a390b9326c3ad90f5b80bd31",
+      "brief_arms_sha256": "6205420c8d6766112b88f9474ad659845baad7052d819d67e31d50c40052863f",
+      "prior_sha256": "14a630b31c1b1aae60ecb2fbdd26ff7fe3c4c0cf5c403d45db2d6fd03a692798"
+    },
+    {
+      "task": "03-protocol",
+      "oracle": "/private/tmp/aethyme-fx08-oracle02-amendment.xGP1Ux/oracles/03-protocol/oracle.rs",
+      "sha256": "c643f771d539f6df742b86d68f581b81890bfa3f67b22ddf4a01af9e80a45c2b",
+      "requested_tests": 1,
+      "survivor_tests": 1,
+      "contract_sha256": "75aab2373b8f8a5fa5bfa92db46e7ee658b0456755fec74a7de19486a84f671d",
+      "public_task_sha256": "1f25c376c5898ca44bcf13116c7eb6f02f82d8827e8281c50781223b2b0908bc",
+      "brief_arms_sha256": "fee372c218b757e5086d0fa6fc4da051ebd3fbb2a1150fd7a4bb6ae6e88c903a",
+      "prior_sha256": "c643f771d539f6df742b86d68f581b81890bfa3f67b22ddf4a01af9e80a45c2b"
+    },
+    {
+      "task": "04-completion",
+      "oracle": "/private/tmp/aethyme-fx08-oracle02-amendment.xGP1Ux/oracles/04-completion/oracle.rs",
+      "sha256": "9832b84d367c4309838df62ca282bc626aaff458a53499ac2a142e84f1063636",
+      "requested_tests": 2,
+      "survivor_tests": 1,
+      "contract_sha256": "20f48bf5f26947986521f683015fb41c4a468604642d9e0c028f5f8cd7f470ea",
+      "public_task_sha256": "1da28444e501145bc94a088c2503ee2935deaee4235bc5831316264c04c7353b",
+      "brief_arms_sha256": "7a1ecd58ee44ae33f6d820ec18d05b2524fd046144923398d6ab61a93a62a817",
+      "prior_sha256": "9832b84d367c4309838df62ca282bc626aaff458a53499ac2a142e84f1063636"
+    },
+    {
+      "task": "05-identifiers",
+      "oracle": "/private/tmp/aethyme-fx08-oracle02-amendment.xGP1Ux/oracles/05-identifiers/oracle.rs",
+      "sha256": "aa5d5f8a5ff2d22d9d33ee1b9303a340aa4589fad2bf05e58453e1389dbb57bb",
+      "requested_tests": 2,
+      "survivor_tests": 1,
+      "contract_sha256": "9375dff5aad1468408fd7bea4a5abe67a5089d68b10898abae205e4f4ba7dfc8",
+      "public_task_sha256": "5540045d19be598ece1c76c3af563329648b1681f1ef47c7ca7a6e5543784246",
+      "brief_arms_sha256": "e408f46ae1ca26eff4dade96933fe382fe976fb3de6788011441725793732158",
+      "prior_sha256": "aa5d5f8a5ff2d22d9d33ee1b9303a340aa4589fad2bf05e58453e1389dbb57bb"
+    },
+    {
+      "task": "06-lookup",
+      "oracle": "/private/tmp/aethyme-fx08-oracle02-amendment.xGP1Ux/oracles/06-lookup/oracle.rs",
+      "sha256": "4fd892bbf4b85862b354b0050cc2eaca150c1fcf3b0396716b23b57ce3aec171",
+      "requested_tests": 2,
+      "survivor_tests": 1,
+      "contract_sha256": "e23f06bdb6d2019dabdef4ddf68280e26ea3238a252c2718ceb4e380de93aceb",
+      "public_task_sha256": "445b0e5328de131b4fe681814d9895a73fd6d8ef526aceeba4caa8635705e390",
+      "brief_arms_sha256": "af00dfc8f49829c1f70c69444d13d66753558905d522dee4b12028d0cb8c6859",
+      "prior_sha256": "4fd892bbf4b85862b354b0050cc2eaca150c1fcf3b0396716b23b57ce3aec171"
+    }
+  ],
+  "revision": "pretrial-creation-order-correction-v1",
+  "prior_manifest_sha256": "a7277d5e0ed9ed55b55fda18dafb507665b8622ed560c9f97e6c5b8b6252bb32",
+  "amendment_sha256": "abdf4e93609e175e9d1730d0381a1b18f6d59c2e49527f8e09e75d45f4b12e20",
+  "amendment": "/private/tmp/aethyme-fx08-oracle02-amendment.xGP1Ux/amendment.md"
+}

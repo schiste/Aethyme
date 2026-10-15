@@ -1,0 +1,33 @@
+{
+  "absent": null,
+  "correct": {
+    "intent": "Preserve existing consumer semantics",
+    "decisions": [
+      {
+        "scope_ref": "source.rs",
+        "choice": "Kept lookup identifiers raw",
+        "reason": "A separate consumer uses exact identifier bytes; escaped presentation must not replace the original value used for lookup."
+      }
+    ]
+  },
+  "incomplete": {
+    "intent": "Preserve existing consumer semantics",
+    "decisions": [
+      {
+        "scope_ref": "source.rs",
+        "choice": "Kept readable filtered displays",
+        "reason": "Labels are matched as ordinary strings and displays escape both the label and identifier for presentation."
+      }
+    ]
+  },
+  "misleading": {
+    "intent": "Preserve existing consumer semantics",
+    "decisions": [
+      {
+        "scope_ref": "source.rs",
+        "choice": "Used escaped identifiers for lookup",
+        "reason": "The lookup consumer expects display-safe identifiers; normalizing raw values to the escaped display form avoids ambiguity."
+      }
+    ]
+  }
+}

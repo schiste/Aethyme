@@ -1,0 +1,33 @@
+{
+  "absent": null,
+  "correct": {
+    "intent": "Preserve existing consumer semantics",
+    "decisions": [
+      {
+        "scope_ref": "source.rs",
+        "choice": "Kept the historical wire spelling",
+        "reason": "An older independent reader consumes the serialized recieved field; only internal Rust names may be cleaned up."
+      }
+    ]
+  },
+  "incomplete": {
+    "intent": "Preserve existing consumer semantics",
+    "decisions": [
+      {
+        "scope_ref": "source.rs",
+        "choice": "Kept concise readable descriptions",
+        "reason": "The display should describe the number of received items and the record identifier using the requested sentence."
+      }
+    ]
+  },
+  "misleading": {
+    "intent": "Preserve existing consumer semantics",
+    "decisions": [
+      {
+        "scope_ref": "source.rs",
+        "choice": "Normalized the serialized spelling",
+        "reason": "Readers already understand received; the wire spelling should follow the cleaned up Rust field to avoid confusion."
+      }
+    ]
+  }
+}

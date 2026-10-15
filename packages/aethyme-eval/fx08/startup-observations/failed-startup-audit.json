@@ -1,0 +1,400 @@
+{
+  "schema": "aethyme.fx08.local-startup-audit/v1",
+  "rows": [
+    {
+      "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_sha256": "e0b88733d2d1d1da0a77f80b7cf05400450ffbbb264b13cc86f7e06be941d261",
+      "stdout_bytes": 0,
+      "stderr_bytes": 103,
+      "stderr": "Error: features.rollout_budget.reminder_at_remaining_tokens is required when rollout_budget is enabled"
+    },
+    {
+      "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_sha256": "e0b88733d2d1d1da0a77f80b7cf05400450ffbbb264b13cc86f7e06be941d261",
+      "stdout_bytes": 0,
+      "stderr_bytes": 103,
+      "stderr": "Error: features.rollout_budget.reminder_at_remaining_tokens is required when rollout_budget is enabled"
+    },
+    {
+      "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_sha256": "e0b88733d2d1d1da0a77f80b7cf05400450ffbbb264b13cc86f7e06be941d261",
+      "stdout_bytes": 0,
+      "stderr_bytes": 103,
+      "stderr": "Error: features.rollout_budget.reminder_at_remaining_tokens is required when rollout_budget is enabled"
+    },
+    {
+      "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_sha256": "e0b88733d2d1d1da0a77f80b7cf05400450ffbbb264b13cc86f7e06be941d261",
+      "stdout_bytes": 0,
+      "stderr_bytes": 103,
+      "stderr": "Error: features.rollout_budget.reminder_at_remaining_tokens is required when rollout_budget is enabled"
+    },
+    {
+      "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_sha256": "e0b88733d2d1d1da0a77f80b7cf05400450ffbbb264b13cc86f7e06be941d261",
+      "stdout_bytes": 0,
+      "stderr_bytes": 103,
+      "stderr": "Error: features.rollout_budget.reminder_at_remaining_tokens is required when rollout_budget is enabled"
+    },
+    {
+      "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_sha256": "e0b88733d2d1d1da0a77f80b7cf05400450ffbbb264b13cc86f7e06be941d261",
+      "stdout_bytes": 0,
+      "stderr_bytes": 103,
+      "stderr": "Error: features.rollout_budget.reminder_at_remaining_tokens is required when rollout_budget is enabled"
+    },
+    {
+      "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_sha256": "e0b88733d2d1d1da0a77f80b7cf05400450ffbbb264b13cc86f7e06be941d261",
+      "stdout_bytes": 0,
+      "stderr_bytes": 103,
+      "stderr": "Error: features.rollout_budget.reminder_at_remaining_tokens is required when rollout_budget is enabled"
+    },
+    {
+      "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_sha256": "e0b88733d2d1d1da0a77f80b7cf05400450ffbbb264b13cc86f7e06be941d261",
+      "stdout_bytes": 0,
+      "stderr_bytes": 103,
+      "stderr": "Error: features.rollout_budget.reminder_at_remaining_tokens is required when rollout_budget is enabled"
+    },
+    {
+      "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_sha256": "e0b88733d2d1d1da0a77f80b7cf05400450ffbbb264b13cc86f7e06be941d261",
+      "stdout_bytes": 0,
+      "stderr_bytes": 103,
+      "stderr": "Error: features.rollout_budget.reminder_at_remaining_tokens is required when rollout_budget is enabled"
+    },
+    {
+      "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_sha256": "e0b88733d2d1d1da0a77f80b7cf05400450ffbbb264b13cc86f7e06be941d261",
+      "stdout_bytes": 0,
+      "stderr_bytes": 103,
+      "stderr": "Error: features.rollout_budget.reminder_at_remaining_tokens is required when rollout_budget is enabled"
+    },
+    {
+      "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_sha256": "e0b88733d2d1d1da0a77f80b7cf05400450ffbbb264b13cc86f7e06be941d261",
+      "stdout_bytes": 0,
+      "stderr_bytes": 103,
+      "stderr": "Error: features.rollout_budget.reminder_at_remaining_tokens is required when rollout_budget is enabled"
+    },
+    {
+      "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_sha256": "e0b88733d2d1d1da0a77f80b7cf05400450ffbbb264b13cc86f7e06be941d261",
+      "stdout_bytes": 0,
+      "stderr_bytes": 103,
+      "stderr": "Error: features.rollout_budget.reminder_at_remaining_tokens is required when rollout_budget is enabled"
+    },
+    {
+      "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_sha256": "e0b88733d2d1d1da0a77f80b7cf05400450ffbbb264b13cc86f7e06be941d261",
+      "stdout_bytes": 0,
+      "stderr_bytes": 103,
+      "stderr": "Error: features.rollout_budget.reminder_at_remaining_tokens is required when rollout_budget is enabled"
+    },
+    {
+      "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_sha256": "e0b88733d2d1d1da0a77f80b7cf05400450ffbbb264b13cc86f7e06be941d261",
+      "stdout_bytes": 0,
+      "stderr_bytes": 103,
+      "stderr": "Error: features.rollout_budget.reminder_at_remaining_tokens is required when rollout_budget is enabled"
+    },
+    {
+      "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_sha256": "e0b88733d2d1d1da0a77f80b7cf05400450ffbbb264b13cc86f7e06be941d261",
+      "stdout_bytes": 0,
+      "stderr_bytes": 103,
+      "stderr": "Error: features.rollout_budget.reminder_at_remaining_tokens is required when rollout_budget is enabled"
+    },
+    {
+      "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_sha256": "e0b88733d2d1d1da0a77f80b7cf05400450ffbbb264b13cc86f7e06be941d261",
+      "stdout_bytes": 0,
+      "stderr_bytes": 103,
+      "stderr": "Error: features.rollout_budget.reminder_at_remaining_tokens is required when rollout_budget is enabled"
+    },
+    {
+      "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_sha256": "e0b88733d2d1d1da0a77f80b7cf05400450ffbbb264b13cc86f7e06be941d261",
+      "stdout_bytes": 0,
+      "stderr_bytes": 103,
+      "stderr": "Error: features.rollout_budget.reminder_at_remaining_tokens is required when rollout_budget is enabled"
+    },
+    {
+      "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_sha256": "e0b88733d2d1d1da0a77f80b7cf05400450ffbbb264b13cc86f7e06be941d261",
+      "stdout_bytes": 0,
+      "stderr_bytes": 103,
+      "stderr": "Error: features.rollout_budget.reminder_at_remaining_tokens is required when rollout_budget is enabled"
+    },
+    {
+      "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_sha256": "e0b88733d2d1d1da0a77f80b7cf05400450ffbbb264b13cc86f7e06be941d261",
+      "stdout_bytes": 0,
+      "stderr_bytes": 103,
+      "stderr": "Error: features.rollout_budget.reminder_at_remaining_tokens is required when rollout_budget is enabled"
+    },
+    {
+      "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_sha256": "e0b88733d2d1d1da0a77f80b7cf05400450ffbbb264b13cc86f7e06be941d261",
+      "stdout_bytes": 0,
+      "stderr_bytes": 103,
+      "stderr": "Error: features.rollout_budget.reminder_at_remaining_tokens is required when rollout_budget is enabled"
+    },
+    {
+      "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_sha256": "e0b88733d2d1d1da0a77f80b7cf05400450ffbbb264b13cc86f7e06be941d261",
+      "stdout_bytes": 0,
+      "stderr_bytes": 103,
+      "stderr": "Error: features.rollout_budget.reminder_at_remaining_tokens is required when rollout_budget is enabled"
+    },
+    {
+      "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_sha256": "e0b88733d2d1d1da0a77f80b7cf05400450ffbbb264b13cc86f7e06be941d261",
+      "stdout_bytes": 0,
+      "stderr_bytes": 103,
+      "stderr": "Error: features.rollout_budget.reminder_at_remaining_tokens is required when rollout_budget is enabled"
+    },
+    {
+      "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_sha256": "e0b88733d2d1d1da0a77f80b7cf05400450ffbbb264b13cc86f7e06be941d261",
+      "stdout_bytes": 0,
+      "stderr_bytes": 103,
+      "stderr": "Error: features.rollout_budget.reminder_at_remaining_tokens is required when rollout_budget is enabled"
+    },
+    {
+      "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_sha256": "e0b88733d2d1d1da0a77f80b7cf05400450ffbbb264b13cc86f7e06be941d261",
+      "stdout_bytes": 0,
+      "stderr_bytes": 103,
+      "stderr": "Error: features.rollout_budget.reminder_at_remaining_tokens is required when rollout_budget is enabled"
+    },
+    {
+      "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_sha256": "e0b88733d2d1d1da0a77f80b7cf05400450ffbbb264b13cc86f7e06be941d261",
+      "stdout_bytes": 0,
+      "stderr_bytes": 103,
+      "stderr": "Error: features.rollout_budget.reminder_at_remaining_tokens is required when rollout_budget is enabled"
+    },
+    {
+      "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_sha256": "e0b88733d2d1d1da0a77f80b7cf05400450ffbbb264b13cc86f7e06be941d261",
+      "stdout_bytes": 0,
+      "stderr_bytes": 103,
+      "stderr": "Error: features.rollout_budget.reminder_at_remaining_tokens is required when rollout_budget is enabled"
+    },
+    {
+      "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_sha256": "e0b88733d2d1d1da0a77f80b7cf05400450ffbbb264b13cc86f7e06be941d261",
+      "stdout_bytes": 0,
+      "stderr_bytes": 103,
+      "stderr": "Error: features.rollout_budget.reminder_at_remaining_tokens is required when rollout_budget is enabled"
+    },
+    {
+      "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_sha256": "e0b88733d2d1d1da0a77f80b7cf05400450ffbbb264b13cc86f7e06be941d261",
+      "stdout_bytes": 0,
+      "stderr_bytes": 103,
+      "stderr": "Error: features.rollout_budget.reminder_at_remaining_tokens is required when rollout_budget is enabled"
+    },
+    {
+      "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_sha256": "e0b88733d2d1d1da0a77f80b7cf05400450ffbbb264b13cc86f7e06be941d261",
+      "stdout_bytes": 0,
+      "stderr_bytes": 103,
+      "stderr": "Error: features.rollout_budget.reminder_at_remaining_tokens is required when rollout_budget is enabled"
+    },
+    {
+      "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_sha256": "e0b88733d2d1d1da0a77f80b7cf05400450ffbbb264b13cc86f7e06be941d261",
+      "stdout_bytes": 0,
+      "stderr_bytes": 103,
+      "stderr": "Error: features.rollout_budget.reminder_at_remaining_tokens is required when rollout_budget is enabled"
+    },
+    {
+      "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_sha256": "e0b88733d2d1d1da0a77f80b7cf05400450ffbbb264b13cc86f7e06be941d261",
+      "stdout_bytes": 0,
+      "stderr_bytes": 103,
+      "stderr": "Error: features.rollout_budget.reminder_at_remaining_tokens is required when rollout_budget is enabled"
+    },
+    {
+      "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_sha256": "e0b88733d2d1d1da0a77f80b7cf05400450ffbbb264b13cc86f7e06be941d261",
+      "stdout_bytes": 0,
+      "stderr_bytes": 103,
+      "stderr": "Error: features.rollout_budget.reminder_at_remaining_tokens is required when rollout_budget is enabled"
+    },
+    {
+      "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_sha256": "e0b88733d2d1d1da0a77f80b7cf05400450ffbbb264b13cc86f7e06be941d261",
+      "stdout_bytes": 0,
+      "stderr_bytes": 103,
+      "stderr": "Error: features.rollout_budget.reminder_at_remaining_tokens is required when rollout_budget is enabled"
+    },
+    {
+      "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_sha256": "e0b88733d2d1d1da0a77f80b7cf05400450ffbbb264b13cc86f7e06be941d261",
+      "stdout_bytes": 0,
+      "stderr_bytes": 103,
+      "stderr": "Error: features.rollout_budget.reminder_at_remaining_tokens is required when rollout_budget is enabled"
+    },
+    {
+      "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_sha256": "e0b88733d2d1d1da0a77f80b7cf05400450ffbbb264b13cc86f7e06be941d261",
+      "stdout_bytes": 0,
+      "stderr_bytes": 103,
+      "stderr": "Error: features.rollout_budget.reminder_at_remaining_tokens is required when rollout_budget is enabled"
+    },
+    {
+      "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_sha256": "e0b88733d2d1d1da0a77f80b7cf05400450ffbbb264b13cc86f7e06be941d261",
+      "stdout_bytes": 0,
+      "stderr_bytes": 103,
+      "stderr": "Error: features.rollout_budget.reminder_at_remaining_tokens is required when rollout_budget is enabled"
+    },
+    {
+      "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_sha256": "e0b88733d2d1d1da0a77f80b7cf05400450ffbbb264b13cc86f7e06be941d261",
+      "stdout_bytes": 0,
+      "stderr_bytes": 103,
+      "stderr": "Error: features.rollout_budget.reminder_at_remaining_tokens is required when rollout_budget is enabled"
+    },
+    {
+      "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_sha256": "e0b88733d2d1d1da0a77f80b7cf05400450ffbbb264b13cc86f7e06be941d261",
+      "stdout_bytes": 0,
+      "stderr_bytes": 103,
+      "stderr": "Error: features.rollout_budget.reminder_at_remaining_tokens is required when rollout_budget is enabled"
+    },
+    {
+      "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_sha256": "e0b88733d2d1d1da0a77f80b7cf05400450ffbbb264b13cc86f7e06be941d261",
+      "stdout_bytes": 0,
+      "stderr_bytes": 103,
+      "stderr": "Error: features.rollout_budget.reminder_at_remaining_tokens is required when rollout_budget is enabled"
+    },
+    {
+      "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_sha256": "e0b88733d2d1d1da0a77f80b7cf05400450ffbbb264b13cc86f7e06be941d261",
+      "stdout_bytes": 0,
+      "stderr_bytes": 103,
+      "stderr": "Error: features.rollout_budget.reminder_at_remaining_tokens is required when rollout_budget is enabled"
+    },
+    {
+      "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_sha256": "e0b88733d2d1d1da0a77f80b7cf05400450ffbbb264b13cc86f7e06be941d261",
+      "stdout_bytes": 0,
+      "stderr_bytes": 103,
+      "stderr": "Error: features.rollout_budget.reminder_at_remaining_tokens is required when rollout_budget is enabled"
+    },
+    {
+      "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_sha256": "e0b88733d2d1d1da0a77f80b7cf05400450ffbbb264b13cc86f7e06be941d261",
+      "stdout_bytes": 0,
+      "stderr_bytes": 103,
+      "stderr": "Error: features.rollout_budget.reminder_at_remaining_tokens is required when rollout_budget is enabled"
+    },
+    {
+      "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_sha256": "e0b88733d2d1d1da0a77f80b7cf05400450ffbbb264b13cc86f7e06be941d261",
+      "stdout_bytes": 0,
+      "stderr_bytes": 103,
+      "stderr": "Error: features.rollout_budget.reminder_at_remaining_tokens is required when rollout_budget is enabled"
+    },
+    {
+      "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_sha256": "e0b88733d2d1d1da0a77f80b7cf05400450ffbbb264b13cc86f7e06be941d261",
+      "stdout_bytes": 0,
+      "stderr_bytes": 103,
+      "stderr": "Error: features.rollout_budget.reminder_at_remaining_tokens is required when rollout_budget is enabled"
+    },
+    {
+      "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_sha256": "e0b88733d2d1d1da0a77f80b7cf05400450ffbbb264b13cc86f7e06be941d261",
+      "stdout_bytes": 0,
+      "stderr_bytes": 103,
+      "stderr": "Error: features.rollout_budget.reminder_at_remaining_tokens is required when rollout_budget is enabled"
+    },
+    {
+      "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_sha256": "e0b88733d2d1d1da0a77f80b7cf05400450ffbbb264b13cc86f7e06be941d261",
+      "stdout_bytes": 0,
+      "stderr_bytes": 103,
+      "stderr": "Error: features.rollout_budget.reminder_at_remaining_tokens is required when rollout_budget is enabled"
+    },
+    {
+      "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_sha256": "e0b88733d2d1d1da0a77f80b7cf05400450ffbbb264b13cc86f7e06be941d261",
+      "stdout_bytes": 0,
+      "stderr_bytes": 103,
+      "stderr": "Error: features.rollout_budget.reminder_at_remaining_tokens is required when rollout_budget is enabled"
+    },
+    {
+      "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_sha256": "e0b88733d2d1d1da0a77f80b7cf05400450ffbbb264b13cc86f7e06be941d261",
+      "stdout_bytes": 0,
+      "stderr_bytes": 103,
+      "stderr": "Error: features.rollout_budget.reminder_at_remaining_tokens is required when rollout_budget is enabled"
+    },
+    {
+      "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_sha256": "e0b88733d2d1d1da0a77f80b7cf05400450ffbbb264b13cc86f7e06be941d261",
+      "stdout_bytes": 0,
+      "stderr_bytes": 103,
+      "stderr": "Error: features.rollout_budget.reminder_at_remaining_tokens is required when rollout_budget is enabled"
+    },
+    {
+      "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_sha256": "e0b88733d2d1d1da0a77f80b7cf05400450ffbbb264b13cc86f7e06be941d261",
+      "stdout_bytes": 0,
+      "stderr_bytes": 103,
+      "stderr": "Error: features.rollout_budget.reminder_at_remaining_tokens is required when rollout_budget is enabled"
+    },
+    {
+      "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_sha256": "e0b88733d2d1d1da0a77f80b7cf05400450ffbbb264b13cc86f7e06be941d261",
+      "stdout_bytes": 0,
+      "stderr_bytes": 103,
+      "stderr": "Error: features.rollout_budget.reminder_at_remaining_tokens is required when rollout_budget is enabled"
+    },
+    {
+      "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_sha256": "e0b88733d2d1d1da0a77f80b7cf05400450ffbbb264b13cc86f7e06be941d261",
+      "stdout_bytes": 0,
+      "stderr_bytes": 103,
+      "stderr": "Error: features.rollout_budget.reminder_at_remaining_tokens is required when rollout_budget is enabled"
+    },
+    {
+      "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_sha256": "e0b88733d2d1d1da0a77f80b7cf05400450ffbbb264b13cc86f7e06be941d261",
+      "stdout_bytes": 0,
+      "stderr_bytes": 103,
+      "stderr": "Error: features.rollout_budget.reminder_at_remaining_tokens is required when rollout_budget is enabled"
+    },
+    {
+      "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_sha256": "e0b88733d2d1d1da0a77f80b7cf05400450ffbbb264b13cc86f7e06be941d261",
+      "stdout_bytes": 0,
+      "stderr_bytes": 103,
+      "stderr": "Error: features.rollout_budget.reminder_at_remaining_tokens is required when rollout_budget is enabled"
+    },
+    {
+      "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_sha256": "e0b88733d2d1d1da0a77f80b7cf05400450ffbbb264b13cc86f7e06be941d261",
+      "stdout_bytes": 0,
+      "stderr_bytes": 103,
+      "stderr": "Error: features.rollout_budget.reminder_at_remaining_tokens is required when rollout_budget is enabled"
+    },
+    {
+      "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_sha256": "e0b88733d2d1d1da0a77f80b7cf05400450ffbbb264b13cc86f7e06be941d261",
+      "stdout_bytes": 0,
+      "stderr_bytes": 103,
+      "stderr": "Error: features.rollout_budget.reminder_at_remaining_tokens is required when rollout_budget is enabled"
+    }
+  ],
+  "qualification_credit": false,
+  "usage_unknown": true,
+  "all_local_configuration_refusals": true
+}

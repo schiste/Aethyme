@@ -226,6 +226,22 @@ const LOG_LIMIT: usize = 1024 * 1024;
 /// Bounded pipe readers retain at most limit+1 bytes. Descendants are confined
 /// to an owned process group under this cooperative experiment profile.
 fn external(command: &mut Command, root: &Path, label: &str, seconds: u64) -> Value {
+    external_observed(command, root, label, seconds, None)
+}
+
+fn external_observed(
+    command: &mut Command,
+    root: &Path,
+    label: &str,
+    seconds: u64,
+    model_tools: Option<u64>,
+) -> Value {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    };
+    let observed_tools = Arc::new(AtomicU64::new(0));
+    let exceeded = Arc::new(AtomicBool::new(false));
     let stdout = root.join(format!("{label}.stdout"));
     let stderr = root.join(format!("{label}.stderr"));
     command
@@ -252,12 +268,41 @@ fn external(command: &mut Command, root: &Path, label: &str, seconds: u64) -> Va
     let (sender, receiver) = std::sync::mpsc::channel();
     for (index, stream) in streams.into_iter().enumerate() {
         let sender = sender.clone();
+        let observed_tools = Arc::clone(&observed_tools);
+        let exceeded = Arc::clone(&exceeded);
         std::thread::spawn(move || {
             let mut bytes = Vec::new();
-            let result = stream
-                .take((LOG_LIMIT + 1) as u64)
-                .read_to_end(&mut bytes)
-                .map(|_| bytes);
+            let result = (|| -> std::io::Result<Vec<u8>> {
+                let mut stream = stream.take((LOG_LIMIT + 1) as u64);
+                let mut buffer = [0u8; 8192];
+                let mut line = Vec::new();
+                loop {
+                    let count = stream.read(&mut buffer)?;
+                    if count == 0 {
+                        break;
+                    }
+                    bytes.extend_from_slice(&buffer[..count]);
+                    if let Some(tool_limit) = model_tools.filter(|_| index == 0) {
+                        for byte in &buffer[..count] {
+                            if *byte == b'\n' {
+                                if let Ok(event) = serde_json::from_slice::<Value>(&line)
+                                    && event["type"] == "item.started"
+                                    && event["item"]["type"] == "command_execution"
+                                {
+                                    let count = observed_tools.fetch_add(1, Ordering::SeqCst) + 1;
+                                    if count > tool_limit {
+                                        exceeded.store(true, Ordering::SeqCst);
+                                    }
+                                }
+                                line.clear();
+                            } else {
+                                line.push(*byte);
+                            }
+                        }
+                    }
+                }
+                Ok(bytes)
+            })();
             let _ = sender.send((index, result));
         });
     }
@@ -272,6 +317,7 @@ fn external(command: &mut Command, root: &Path, label: &str, seconds: u64) -> Va
             }
         }
         if state != "completed"
+            || exceeded.load(Ordering::SeqCst)
             || logs.iter().flatten().any(|bytes| bytes.len() > LOG_LIMIT)
             || started.elapsed() > Duration::from_secs(seconds)
         {
@@ -310,12 +356,15 @@ fn external(command: &mut Command, root: &Path, label: &str, seconds: u64) -> Va
     if logs.iter().flatten().any(|bytes| bytes.len() > LOG_LIMIT) {
         state = "limit_exhausted";
     }
+    if exceeded.load(Ordering::SeqCst) {
+        state = "observed_tool_allowance_exhausted";
+    }
     for (path, bytes) in [&stdout, &stderr].into_iter().zip(logs) {
         let mut bytes = bytes.unwrap_or_default();
         bytes.truncate(LOG_LIMIT);
         std::fs::write(path, bytes).unwrap();
     }
-    json!({"state":state,"exit":exit,"signal":signal,"wall_ms":started.elapsed().as_millis(),"stdout":stdout,"stderr":stderr})
+    json!({"state":state,"exit":exit,"signal":signal,"wall_ms":started.elapsed().as_millis(),"stdout":stdout,"stderr":stderr,"observed_command_dispatches":observed_tools.load(Ordering::SeqCst),"observed_command_allowance":model_tools})
 }
 
 fn requirement_argument(requirements: &Value) -> String {

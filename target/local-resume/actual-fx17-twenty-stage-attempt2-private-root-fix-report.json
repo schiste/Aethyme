@@ -1,0 +1,678 @@
+{
+  "accepted_parent_chain": [
+    {
+      "accepted_commit": "3af3363fec2e88b2ace2e82a59b05adfe991a68b",
+      "accepted_tree": "7dd4c553980d0ede652f19f18cd672f7f372c2ef",
+      "baseline_commit": "72b9ecffc4be85b491fb13d3861d2a591035928c",
+      "completion_receipt": "sha256:7dee646a5a9bd868e971f09945a8eee38ee738b9230895f6e572c62a39d561e0",
+      "contribution": "C01",
+      "ordinal": 1,
+      "revision": "sha256:e33cb9e839d42456104167d4dcd2500ddb91289bba29225cef310d814545dcd4",
+      "source_snapshot": "sha256:6d5b4544c1917466df05bac2b622b8694962860486123d1b62752b02b0b03f40",
+      "verifier_generation": 1,
+      "wave": "sha256:079612a7924ece62b6754177dfe4ca641d090432c64c52cfab2e9cbf466ff266"
+    }
+  ],
+  "cumulative_elapsed_ms": 35114,
+  "events": [
+    {
+      "at": "preflight",
+      "result": "frozen hashes and independent transcript verified"
+    },
+    {
+      "at": "fixture",
+      "result": "baseline, harness and independent oracle retained"
+    },
+    {
+      "at": "runtime-preflight",
+      "result": "pinned Docker runtime, private resources, verifier and safe native gate appointed"
+    },
+    {
+      "actual_elapsed_ms": 14484,
+      "at": "completion",
+      "completion": {
+        "acceptance_receipt": "sha256:7dee646a5a9bd868e971f09945a8eee38ee738b9230895f6e572c62a39d561e0",
+        "accepted_commit": "3af3363fec2e88b2ace2e82a59b05adfe991a68b",
+        "accepted_tree": "7dd4c553980d0ede652f19f18cd672f7f372c2ef",
+        "candidate_commit": "3af3363fec2e88b2ace2e82a59b05adfe991a68b",
+        "candidate_tree": "7dd4c553980d0ede652f19f18cd672f7f372c2ef",
+        "epoch": "sha256:47a3b7df2acfe59545931ec026fc9f3a6267441f03426ed8e72e725f2a72749e",
+        "qualification": "sha256:b6082c5254f9ee393ebc132d4cd1d3fcb8ba1f65a0488b623ea93d96ea0f7011",
+        "revision": "sha256:e33cb9e839d42456104167d4dcd2500ddb91289bba29225cef310d814545dcd4",
+        "source": "sha256:6d5b4544c1917466df05bac2b622b8694962860486123d1b62752b02b0b03f40",
+        "target": "fx17-controlled-evolution",
+        "wave": "sha256:079612a7924ece62b6754177dfe4ca641d090432c64c52cfab2e9cbf466ff266"
+      },
+      "ordinal": 1
+    }
+  ],
+  "execution_profile": {
+    "artifact_mount": "read-only and contains only app.sh",
+    "budget_cap": {
+      "disk_bytes": 137438953472,
+      "input_tokens": 0,
+      "memory_bytes": 68719476736,
+      "model_requests": 0,
+      "output_tokens": 0,
+      "previews": 0,
+      "slots": 200,
+      "spend_microunits": 0,
+      "time_ms": 1000000000
+    },
+    "build": {
+      "arguments": [
+        "-c",
+        "set -eu; cp /source/app.sh /outputs/app.sh"
+      ],
+      "environment": {},
+      "program": "/bin/sh"
+    },
+    "candidate_source_host_execution": false,
+    "docker_cli": "/opt/homebrew/bin/docker",
+    "image": "sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251",
+    "native_gate": {
+      "command": "test -f app.sh && git diff --check HEAD^ HEAD",
+      "policy_sha256": "cda7eb140497d400b5c8e54df4d6f9728d13494c83b7cdefee14fa508cad55ce",
+      "trusted_once": true
+    },
+    "network": "none",
+    "private_tmp": "writable Docker tmpfs for joined stream capture",
+    "proxy_is_inline_byte_identical_to_archived_source": true,
+    "runtime": {
+      "api": "1.54",
+      "architecture": "arm64",
+      "client": "sha256:95e661f587166c7b3cd6b5877e6f23a2fc8e423c7466e26d289660fbd83c886b",
+      "components": [
+        {
+          "Details": {
+            "ApiVersion": "1.54",
+            "Arch": "arm64",
+            "BuildTime": "Wed May 20 14:39:25 2026",
+            "Experimental": "false",
+            "GitCommit": "568f755",
+            "GoVersion": "go1.26.3",
+            "KernelVersion": "6.8.0-117-generic",
+            "MinAPIVersion": "1.40",
+            "Module": "github.com/moby/moby/v2",
+            "ModuleVersion": "v2.0.0+unknown",
+            "Os": "linux"
+          },
+          "Name": "Engine",
+          "Version": "29.5.2"
+        },
+        {
+          "Details": {
+            "GitCommit": "193637f7ee8ae5f5aa5248f49e7baa3e6164966e"
+          },
+          "Name": "containerd",
+          "Version": "v2.2.4"
+        },
+        {
+          "Details": {
+            "GitCommit": "v1.3.5-0-g488fc13e"
+          },
+          "Name": "runc",
+          "Version": "1.3.5"
+        },
+        {
+          "Details": {
+            "GitCommit": "de40ad0"
+          },
+          "Name": "docker-init",
+          "Version": "0.19.0"
+        }
+      ],
+      "daemon_id": "9c943a04-41ca-4943-a8f5-c5734144b14b",
+      "endpoint": "unix:///Volumes/T7-repositories/Colima/home/default/docker.sock",
+      "engine": "29.5.2",
+      "kernel": "6.8.0-117-generic",
+      "native": "sha256:148be45fab30a6f8250e2410a8e09eeffc62ef5d0e4edd4da63500a2631c3e8f",
+      "policy": "rootfs-ro;uid65534;caps-none;nnp;seccomp-builtin;network-none;private-pid-ipc-cgroup;cpu1;swap-none;pids-bounded;tmpfs-output-bounded;no-logs;no-healthcheck;env-clear;no-cache;timeout-pid1-v0",
+      "profile": "aethyme.docker-linux/offline-v0"
+    },
+    "service_allowance": {
+      "appointments": 20,
+      "completions_per_appointment": 1,
+      "expected_ticks_per_appointment": 1,
+      "max_drive_wall_ms": 900000,
+      "max_elapsed_ms_per_appointment": 900000,
+      "max_ticks_per_appointment": 2
+    },
+    "verifier_command": {
+      "arguments": [
+        "-c",
+        "#!/bin/sh\n# FX17 transport proxy v1. Source is fixed independently of candidate app.sh.\nset -eu\nPATH=/usr/bin:/bin\nLC_ALL=C\nexport PATH LC_ALL\numask 077\ntmp=$(mktemp -d /tmp/fx17-proxy.XXXXXX)\ntrap 'rm -rf \"$tmp\"' EXIT HUP INT TERM\nrun_case() {\n  id=$1\n  shift\n  if /bin/sh /artifact/app.sh \"$@\" >\"$tmp/stdout\" 2>\"$tmp/stderr\"; then code=0; else code=$?; fi\n  out=$(od -An -v -tx1 \"$tmp/stdout\" | tr -d ' \\n')\n  err=$(od -An -v -tx1 \"$tmp/stderr\" | tr -d ' \\n')\n  printf '%s\\t%s\\t%s\\t%s\\n' \"$id\" \"$code\" \"$out\" \"$err\"\n}\nprintf 'FX17V1\\n'\nrun_case lookup_alpha lookup alpha\nrun_case lookup_beta lookup beta\nrun_case lookup_gamma lookup gamma\nrun_case list list\nrun_case arity_zero\nrun_case lookup_missing lookup\nrun_case lookup_extra lookup alpha extra\nrun_case lookup_four lookup alpha '' extra\nrun_case list_empty_extra list ''\nrun_case list_key_extra list alpha\nrun_case list_extra_three list alpha beta\nrun_case list_four list --limit 2 extra\nrun_case mode_empty ''\nrun_case mode_unknown unknown\nrun_case mode_upper_lookup LOOKUP alpha\nrun_case mode_trailing_lookup 'lookup ' alpha\nrun_case mode_leading_list ' list'\nrun_case mode_upper_list LIST\nrun_case mode_unicode 'líst'\nrun_case mode_option --help\nrun_case mode_shell_substitution '$(printf INJECTED)'\nrun_case mode_shell_sequence 'list; printf INJECTED'\nrun_case lookup_empty lookup ''\nrun_case lookup_unknown lookup delta\nrun_case lookup_uppercase lookup Alpha\nrun_case lookup_numeric lookup 0\nrun_case lookup_trailing_space lookup 'alpha '\nrun_case lookup_leading_space lookup ' alpha'\nrun_case lookup_tab lookup 'alpha\t'\nrun_case lookup_newline lookup 'alpha\n'\nrun_case lookup_carriage_return lookup 'alpha\r'\nrun_case lookup_nonbreaking_space lookup 'alpha '\nrun_case lookup_unicode lookup 'άλφα'\nrun_case lookup_fullwidth lookup 'ａｌｐｈａ'\nrun_case lookup_combining lookup 'alphá'\nrun_case lookup_zero_width lookup 'alpha​'\nrun_case lookup_glob lookup '*'\nrun_case lookup_question_glob lookup 'a?pha'\nrun_case lookup_bracket_glob lookup '[a]lpha'\nrun_case lookup_dollar lookup '$KEY'\nrun_case lookup_command_substitution lookup '$(printf alpha)'\nrun_case lookup_backtick lookup '`printf alpha`'\nrun_case lookup_semicolon lookup 'alpha; printf INJECTED'\nrun_case lookup_pipe lookup 'alpha | printf INJECTED'\nrun_case lookup_and lookup 'alpha && printf INJECTED'\nrun_case lookup_redirect lookup 'alpha > fx17-effect-canary'\nrun_case lookup_quote lookup 'alpha'\"'\"'\"\\'\nrun_case lookup_percent lookup %s\nrun_case display_missing display\nrun_case display_alpha display alpha\nrun_case display_beta display beta\nrun_case display_gamma display gamma\nrun_case display_empty display ''\nrun_case display_unknown display delta\nrun_case display_extra display alpha extra\nrun_case limit_missing_value list --limit\nrun_case limit_empty list --limit ''\nrun_case limit_flag_typo list --limits 1\nrun_case limit_flag_case list --LIMIT 1\nrun_case limit_0 list --limit 0\nrun_case limit_1 list --limit 1\nrun_case limit_2 list --limit 2\nrun_case limit_3 list --limit 3\nrun_case limit_03 list --limit 03\nrun_case limit_999 list --limit 999\n"
+      ],
+      "environment": {},
+      "program": "/bin/sh"
+    }
+  },
+  "failures": [
+    {
+      "error": "C02 did not produce exactly one actual service completion: ServiceReport { appointment: \"sha256:a708e3797d8dddf970617f8c572b9f892137fd72aaa8d7c31c5ffa96e633b8f7\", target: \"fx17-controlled-evolution\", revision: \"sha256:e8fba66fc2e2fb3055d28c5db002d081eda746fa419779a1d80c9b558caf9ec9\", epoch: \"sha256:47a3b7df2acfe59545931ec026fc9f3a6267441f03426ed8e72e725f2a72749e\", ticks: 1, completions: [], outcome: Held, detail: Some(\"publication dispatch Failed; explicit reconciliation required\") }"
+    }
+  ],
+  "frozen_inputs": {
+    "actual_change_count": 20,
+    "baseline_vector_count": 65,
+    "controlled_state_count": 21,
+    "expected_transcript_sha256": "db545a7b7e8f18a9dbeb6931dc327f99a6e8d074d039d08d60dfc57ff208d8bb",
+    "manifest_sha256": "b3846f2fcca9bc8fb3bbcad26c0adedbc96fba723eddbbb174a9f3545ba11abc",
+    "oracle_sha256": "bfbec841810ac9269b34c628969a4c8207809b70716753d979750ecedb605a06",
+    "provenance_sha256": "6c6205982af3a7fc20d3e62134e4b30d9ad5ee7b3bb8f424a005a3296083829f",
+    "proxy_sha256": "eae502e3245a6cb750d64828063e793732cfa3a8481f8ff6753dcacad63ee2ff",
+    "public_contract_sha256": "81d22e805fe6fa48424b1c83fe3bf54d1c9d0e76e5bb14d9cc8c20e84f3be13a",
+    "source_review_sha256": "de7d56d9cc37f68787540e298bd49577c3fdf83b51544e3113aed4928eebb74e"
+  },
+  "last_stage_elapsed_ms": 14484,
+  "model_exports": 0,
+  "profile": "aethyme.fx17-controlled-evolution-harness/v1",
+  "resource_root_permissions": {
+    "after": {
+      "gid": 20,
+      "mode_octal": "0700",
+      "uid": 501
+    },
+    "before": {
+      "gid": 20,
+      "mode_octal": "0755",
+      "uid": 501
+    }
+  },
+  "retained_roots": {
+    "bare_remote": "/var/folders/f2/krjzd4c15nn491pm37zrkp1h0000gn/T/.tmp1z0P7g",
+    "collaboration_project": "/private/var/folders/f2/krjzd4c15nn491pm37zrkp1h0000gn/T/.tmpbGnhEz/collaboration/fx17-controlled",
+    "harness_commit": "92bfd9a00505d99c206bb39cdb7a63abeba5befb",
+    "harness_repository": "/var/folders/f2/krjzd4c15nn491pm37zrkp1h0000gn/T/.tmprf2lAV",
+    "harness_snapshot": "sha256:3c84a35fb64b21eff1d35a64450b6a7a4e7e219478a84f5b33b7b98e4f033e4b",
+    "initial_baseline_commit": "72b9ecffc4be85b491fb13d3861d2a591035928c",
+    "initial_baseline_source": "sha256:1f95db4dec334df25ee9310eeb00895ffe495fc373efa0869a390a33ff3eddbc",
+    "source_repository": "/var/folders/f2/krjzd4c15nn491pm37zrkp1h0000gn/T/.tmp42GdOh"
+  },
+  "sealed_task_executions": 0,
+  "stages": [
+    {
+      "acceptance_receipt_id": "sha256:7dee646a5a9bd868e971f09945a8eee38ee738b9230895f6e572c62a39d561e0",
+      "accepted_changed_paths": [
+        "app.sh"
+      ],
+      "actual_elapsed_ms": 14475,
+      "baseline_commit": "72b9ecffc4be85b491fb13d3861d2a591035928c",
+      "baseline_source": "sha256:1f95db4dec334df25ee9310eeb00895ffe495fc373efa0869a390a33ff3eddbc",
+      "budget": {
+        "accounting_limit": "declared conservative local reservation/receipt units; not invoice, provider charge or external quota",
+        "allocated": {
+          "disk_bytes": 2961178624,
+          "input_tokens": 0,
+          "memory_bytes": 1887436800,
+          "model_requests": 0,
+          "output_tokens": 0,
+          "previews": 0,
+          "slots": 5,
+          "spend_microunits": 0,
+          "time_ms": 11760000
+        },
+        "reservations": [
+          {
+            "allocated": {
+              "disk_bytes": 1077936128,
+              "input_tokens": 0,
+              "memory_bytes": 675282944,
+              "model_requests": 0,
+              "output_tokens": 0,
+              "previews": 0,
+              "slots": 2,
+              "spend_microunits": 0,
+              "time_ms": 660000
+            },
+            "attempts": 1,
+            "id": "sha256:41d332acbea5bcbacf0458f7cdf661e36a0bfeedb02bf90af5c0eedfd875a55f",
+            "observed_overrun": null,
+            "receipt": "sha256:e33b43d9f9a6c5c175a22aa808bae96af7768641494d779d896ca022411706d5",
+            "root": "sha256:41d332acbea5bcbacf0458f7cdf661e36a0bfeedb02bf90af5c0eedfd875a55f",
+            "spent": {
+              "disk_bytes": 1077936128,
+              "input_tokens": 0,
+              "memory_bytes": 675282944,
+              "model_requests": 0,
+              "output_tokens": 0,
+              "previews": 0,
+              "slots": 2,
+              "spend_microunits": 0,
+              "time_ms": 660000
+            },
+            "state": "consumed"
+          },
+          {
+            "allocated": {
+              "disk_bytes": 805306368,
+              "input_tokens": 0,
+              "memory_bytes": 536870912,
+              "model_requests": 0,
+              "output_tokens": 0,
+              "previews": 0,
+              "slots": 1,
+              "spend_microunits": 0,
+              "time_ms": 900000
+            },
+            "attempts": 1,
+            "id": "sha256:74362e2151042c5342691d0918707dd41182224b7f525bfbe5cc47b9d7895e1b",
+            "observed_overrun": null,
+            "receipt": "sha256:5cd25589e74573c401ab70dad0d2859d26fa9701d9f5c1aeee9c71caf6a0d6de",
+            "root": "sha256:74362e2151042c5342691d0918707dd41182224b7f525bfbe5cc47b9d7895e1b",
+            "spent": {
+              "disk_bytes": 805306368,
+              "input_tokens": 0,
+              "memory_bytes": 536870912,
+              "model_requests": 0,
+              "output_tokens": 0,
+              "previews": 0,
+              "slots": 1,
+              "spend_microunits": 0,
+              "time_ms": 900000
+            },
+            "state": "consumed"
+          },
+          {
+            "allocated": {
+              "disk_bytes": 1077936128,
+              "input_tokens": 0,
+              "memory_bytes": 675282944,
+              "model_requests": 0,
+              "output_tokens": 0,
+              "previews": 0,
+              "slots": 2,
+              "spend_microunits": 0,
+              "time_ms": 10200000
+            },
+            "attempts": 1,
+            "id": "sha256:b9a0c29decfbac975d388dff2d5ab8d4d386ffce21be08a14c5add39796521df",
+            "observed_overrun": null,
+            "receipt": "sha256:d53890e5fdb824c27f83074e5a56734c680b3be9926ef29c6a9557ffc0adebb5",
+            "root": "sha256:b9a0c29decfbac975d388dff2d5ab8d4d386ffce21be08a14c5add39796521df",
+            "spent": {
+              "disk_bytes": 1077936128,
+              "input_tokens": 0,
+              "memory_bytes": 675282944,
+              "model_requests": 0,
+              "output_tokens": 0,
+              "previews": 0,
+              "slots": 2,
+              "spend_microunits": 0,
+              "time_ms": 10200000
+            },
+            "state": "consumed"
+          }
+        ],
+        "spent": {
+          "disk_bytes": 2961178624,
+          "input_tokens": 0,
+          "memory_bytes": 1887436800,
+          "model_requests": 0,
+          "output_tokens": 0,
+          "previews": 0,
+          "slots": 5,
+          "spend_microunits": 0,
+          "time_ms": 11760000
+        }
+      },
+      "changed_paths": [
+        "app.sh"
+      ],
+      "completion": {
+        "acceptance_receipt": "sha256:7dee646a5a9bd868e971f09945a8eee38ee738b9230895f6e572c62a39d561e0",
+        "accepted_commit": "3af3363fec2e88b2ace2e82a59b05adfe991a68b",
+        "accepted_tree": "7dd4c553980d0ede652f19f18cd672f7f372c2ef",
+        "candidate_commit": "3af3363fec2e88b2ace2e82a59b05adfe991a68b",
+        "candidate_tree": "7dd4c553980d0ede652f19f18cd672f7f372c2ef",
+        "epoch": "sha256:47a3b7df2acfe59545931ec026fc9f3a6267441f03426ed8e72e725f2a72749e",
+        "qualification": "sha256:b6082c5254f9ee393ebc132d4cd1d3fcb8ba1f65a0488b623ea93d96ea0f7011",
+        "revision": "sha256:e33cb9e839d42456104167d4dcd2500ddb91289bba29225cef310d814545dcd4",
+        "source": "sha256:6d5b4544c1917466df05bac2b622b8694962860486123d1b62752b02b0b03f40",
+        "target": "fx17-controlled-evolution",
+        "wave": "sha256:079612a7924ece62b6754177dfe4ca641d090432c64c52cfab2e9cbf466ff266"
+      },
+      "contribution": "C01",
+      "contribution_lineage": "sha256:d814a44bcb7beb69b90898773e04aa6f6365a4ea7611df9ed6880278cfaeb2d5",
+      "declared_source_sha256": "77a255e12c57d5c447c56044a59f83843f64bf2a9c4053be2dfc39aa321cdf87",
+      "expected_baseline_vectors": 65,
+      "native_gate_job": {
+        "id": "sha256:2e4171a6b1d2d3491c76055c2a100d1c5c6869a61e4bc902d3fd8c026a100404",
+        "observation": {
+          "candidate": {
+            "base_commit": "72b9ecffc4be85b491fb13d3861d2a591035928c",
+            "baseline": "sha256:1f95db4dec334df25ee9310eeb00895ffe495fc373efa0869a390a33ff3eddbc",
+            "commit": "3af3363fec2e88b2ace2e82a59b05adfe991a68b",
+            "epoch": "sha256:47a3b7df2acfe59545931ec026fc9f3a6267441f03426ed8e72e725f2a72749e",
+            "execution_allowance_seconds": 300,
+            "gate_config_sha256": "e9254f7c699cc4c571584ef5a3e2425f287f6e979eeace9860bf01b8ee852cd6",
+            "inputs": [
+              "65186c2aea6d73c0752085f91ed8faeb625bc9a6"
+            ],
+            "max_dispatches": 1,
+            "policy_sha256": "cda7eb140497d400b5c8e54df4d6f9728d13494c83b7cdefee14fa508cad55ce",
+            "profile": "aethyme.native-local-gates/experimental-v1",
+            "recipe": "a8fd7972161081567bb960d85afdd57f8d662ad57e46856deaa10b0982297a6b",
+            "repository_common_dir": "/private/var/folders/f2/krjzd4c15nn491pm37zrkp1h0000gn/T/.tmp42GdOh/.git",
+            "repository_root": "/private/var/folders/f2/krjzd4c15nn491pm37zrkp1h0000gn/T/.tmp42GdOh",
+            "revision": "sha256:e33cb9e839d42456104167d4dcd2500ddb91289bba29225cef310d814545dcd4",
+            "subject": "sha256:6d5b4544c1917466df05bac2b622b8694962860486123d1b62752b02b0b03f40",
+            "target": "fx17-controlled-evolution",
+            "tree": "7dd4c553980d0ede652f19f18cd672f7f372c2ef",
+            "wave": "sha256:079612a7924ece62b6754177dfe4ca641d090432c64c52cfab2e9cbf466ff266"
+          },
+          "configured_gates": 1,
+          "current_authority": true,
+          "gates": [
+            {
+              "broker_database": {
+                "kind": "disposable",
+                "path": "/private/var/folders/f2/krjzd4c15nn491pm37zrkp1h0000gn/T/.tmp42GdOh/.aethyme/run/gates/broker-db-91615-qSe31W/broker.db",
+                "protected_repositories": [
+                  "/private/var/folders/f2/krjzd4c15nn491pm37zrkp1h0000gn/T/.tmpWkTOGm"
+                ],
+                "retention": "removed_on_gate_exit"
+              },
+              "cached": false,
+              "cpu_count": 10,
+              "definition_hash": "8a89ca8004165cd8c5ac67bd23877d65d9cf6bf3135495c0b44dadad80e07c21",
+              "duration_ms": 38,
+              "exit_code": 0,
+              "failure_class": null,
+              "first_output_ms": 12,
+              "free_disk_bytes_start": 1099511627776,
+              "gate": "fx17-source-shape",
+              "load_avg_1m_end": 14.14990234375,
+              "load_avg_1m_start": 14.14990234375,
+              "log_path": "/private/var/folders/f2/krjzd4c15nn491pm37zrkp1h0000gn/T/.tmp42GdOh/.aethyme/logs/gates/fx17-source-shape-7dd4c553-p91615-fx17-source-shape.log",
+              "output_bytes": 479,
+              "status": "pass",
+              "tree_hash": "7dd4c553980d0ede652f19f18cd672f7f372c2ef",
+              "wait_duration_ms": 26
+            }
+          ],
+          "graph": {
+            "changed_paths": [],
+            "enforced": false,
+            "policy_digest": "7f6a2dd9801f81a7682b6d838c49e6e929d8dce2535e4fc21216fd4ba4c51ded",
+            "reason": "repository does not declare committed graph fragments authoritative",
+            "status": "disabled",
+            "tree_hash": "7dd4c553980d0ede652f19f18cd672f7f372c2ef",
+            "verdict": "disabled"
+          },
+          "policy_sha256": "cda7eb140497d400b5c8e54df4d6f9728d13494c83b7cdefee14fa508cad55ce",
+          "profile": "aethyme.native-local-gates/experimental-v1",
+          "provider_acceptance": false,
+          "selected_gates": 1,
+          "status": "passed",
+          "trusted_evidence": false,
+          "wall_ms": 263
+        },
+        "state": "completed"
+      },
+      "ordinal": 1,
+      "retained_base_snapshot": "sha256:1f95db4dec334df25ee9310eeb00895ffe495fc373efa0869a390a33ff3eddbc",
+      "retained_result_snapshot": "sha256:6d5b4544c1917466df05bac2b622b8694962860486123d1b62752b02b0b03f40",
+      "retention_roots": [
+        {
+          "kind": "contribution",
+          "reference": "sha256:d814a44bcb7beb69b90898773e04aa6f6365a4ea7611df9ed6880278cfaeb2d5"
+        },
+        {
+          "kind": "object",
+          "reference": "08768a7921e63b1156353ebed49afd0dcd388a0624ff9515cad3ac06a604d6b1"
+        },
+        {
+          "kind": "object",
+          "reference": "1bd4c6b7cf54d1c88af5a06beb978ffcf4b408fbec7239b1ce67dfd0aaa5cd33"
+        },
+        {
+          "kind": "object",
+          "reference": "2c34fa3d87b94ebe40c424e09acecce8b1edfbc199d02b7787ac7e039b499731"
+        },
+        {
+          "kind": "object",
+          "reference": "49f7c51c53fd1eff99b090101aae16aade5ac91c1cb015a1f38f069814e87de5"
+        },
+        {
+          "kind": "object",
+          "reference": "4e16332b208c9ee7a1e484f28e63cd94d12b1af31f955634944f960d434d7966"
+        },
+        {
+          "kind": "object",
+          "reference": "50dbdc415c869436639436665b7c2fca7f7bb3914a004ee2a04d74f66653257c"
+        },
+        {
+          "kind": "object",
+          "reference": "5ef7660550d7228cf68f59ef4959975dc2278855c355f0499e744cf94317ab43"
+        },
+        {
+          "kind": "object",
+          "reference": "62fe708a1aa8c1b2838219e7bd50dad813581ecaade5fa2b10a06e1261b81a50"
+        },
+        {
+          "kind": "object",
+          "reference": "77a255e12c57d5c447c56044a59f83843f64bf2a9c4053be2dfc39aa321cdf87"
+        },
+        {
+          "kind": "object",
+          "reference": "99c7c0b575b90fdfedd993d45cc16bbf253818e2c99dadc13b28e4ad24422572"
+        },
+        {
+          "kind": "object",
+          "reference": "a6c1155619984aa18b1c264aa502421f30d5d23605c5800f70b8548903a18075"
+        },
+        {
+          "kind": "object",
+          "reference": "a8fd7972161081567bb960d85afdd57f8d662ad57e46856deaa10b0982297a6b"
+        },
+        {
+          "kind": "object",
+          "reference": "b45d091e66883c703a268e692aa6c5134c83b2c372faa224b3d28e6d991eca07"
+        },
+        {
+          "kind": "object",
+          "reference": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "kind": "snapshot",
+          "reference": "sha256:1f95db4dec334df25ee9310eeb00895ffe495fc373efa0869a390a33ff3eddbc"
+        },
+        {
+          "kind": "snapshot",
+          "reference": "sha256:3c84a35fb64b21eff1d35a64450b6a7a4e7e219478a84f5b33b7b98e4f033e4b"
+        },
+        {
+          "kind": "snapshot",
+          "reference": "sha256:6d5b4544c1917466df05bac2b622b8694962860486123d1b62752b02b0b03f40"
+        }
+      ],
+      "revision_baseline": "sha256:1f95db4dec334df25ee9310eeb00895ffe495fc373efa0869a390a33ff3eddbc",
+      "selected": [
+        "C01"
+      ],
+      "service_policy": {
+        "drive": {
+          "allow_empty_native_gates": false,
+          "execution": {
+            "assertion_inventory": "sha256:dbd78471861444adc8dd9961afa0fbdc30fed24bb8fb578c71c957e644952d51",
+            "build": {
+              "arguments": [
+                "-c",
+                "set -eu; cp /source/app.sh /outputs/app.sh"
+              ],
+              "environment": {},
+              "program": "/bin/sh"
+            },
+            "candidate_source": "sha256:1f95db4dec334df25ee9310eeb00895ffe495fc373efa0869a390a33ff3eddbc",
+            "harness": "sha256:3c84a35fb64b21eff1d35a64450b6a7a4e7e219478a84f5b33b7b98e4f033e4b",
+            "materialization_profile": "aethyme.raw-linux-inputs/provisional-v0",
+            "profile": {
+              "architecture": "arm64",
+              "build_image": "sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251",
+              "build_limits": {
+                "memory_bytes": 67108864,
+                "output_bytes": 1048576,
+                "pids": 32,
+                "timeout_ms": 60000
+              },
+              "runtime_profile": "sha256:72aec5f0a642ea396d75dece3489d4a6c9cbe82362d7f7023b561c1a6732142c",
+              "verifier_image": "sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251",
+              "verifier_limits": {
+                "memory_bytes": 67108864,
+                "output_bytes": 1048576,
+                "pids": 32,
+                "timeout_ms": 60000
+              }
+            },
+            "verify": {
+              "arguments": [
+                "-c",
+                "#!/bin/sh\n# FX17 transport proxy v1. Source is fixed independently of candidate app.sh.\nset -eu\nPATH=/usr/bin:/bin\nLC_ALL=C\nexport PATH LC_ALL\numask 077\ntmp=$(mktemp -d /tmp/fx17-proxy.XXXXXX)\ntrap 'rm -rf \"$tmp\"' EXIT HUP INT TERM\nrun_case() {\n  id=$1\n  shift\n  if /bin/sh /artifact/app.sh \"$@\" >\"$tmp/stdout\" 2>\"$tmp/stderr\"; then code=0; else code=$?; fi\n  out=$(od -An -v -tx1 \"$tmp/stdout\" | tr -d ' \\n')\n  err=$(od -An -v -tx1 \"$tmp/stderr\" | tr -d ' \\n')\n  printf '%s\\t%s\\t%s\\t%s\\n' \"$id\" \"$code\" \"$out\" \"$err\"\n}\nprintf 'FX17V1\\n'\nrun_case lookup_alpha lookup alpha\nrun_case lookup_beta lookup beta\nrun_case lookup_gamma lookup gamma\nrun_case list list\nrun_case arity_zero\nrun_case lookup_missing lookup\nrun_case lookup_extra lookup alpha extra\nrun_case lookup_four lookup alpha '' extra\nrun_case list_empty_extra list ''\nrun_case list_key_extra list alpha\nrun_case list_extra_three list alpha beta\nrun_case list_four list --limit 2 extra\nrun_case mode_empty ''\nrun_case mode_unknown unknown\nrun_case mode_upper_lookup LOOKUP alpha\nrun_case mode_trailing_lookup 'lookup ' alpha\nrun_case mode_leading_list ' list'\nrun_case mode_upper_list LIST\nrun_case mode_unicode 'líst'\nrun_case mode_option --help\nrun_case mode_shell_substitution '$(printf INJECTED)'\nrun_case mode_shell_sequence 'list; printf INJECTED'\nrun_case lookup_empty lookup ''\nrun_case lookup_unknown lookup delta\nrun_case lookup_uppercase lookup Alpha\nrun_case lookup_numeric lookup 0\nrun_case lookup_trailing_space lookup 'alpha '\nrun_case lookup_leading_space lookup ' alpha'\nrun_case lookup_tab lookup 'alpha\t'\nrun_case lookup_newline lookup 'alpha\n'\nrun_case lookup_carriage_return lookup 'alpha\r'\nrun_case lookup_nonbreaking_space lookup 'alpha '\nrun_case lookup_unicode lookup 'άλφα'\nrun_case lookup_fullwidth lookup 'ａｌｐｈａ'\nrun_case lookup_combining lookup 'alphá'\nrun_case lookup_zero_width lookup 'alpha​'\nrun_case lookup_glob lookup '*'\nrun_case lookup_question_glob lookup 'a?pha'\nrun_case lookup_bracket_glob lookup '[a]lpha'\nrun_case lookup_dollar lookup '$KEY'\nrun_case lookup_command_substitution lookup '$(printf alpha)'\nrun_case lookup_backtick lookup '`printf alpha`'\nrun_case lookup_semicolon lookup 'alpha; printf INJECTED'\nrun_case lookup_pipe lookup 'alpha | printf INJECTED'\nrun_case lookup_and lookup 'alpha && printf INJECTED'\nrun_case lookup_redirect lookup 'alpha > fx17-effect-canary'\nrun_case lookup_quote lookup 'alpha'\"'\"'\"\\'\nrun_case lookup_percent lookup %s\nrun_case display_missing display\nrun_case display_alpha display alpha\nrun_case display_beta display beta\nrun_case display_gamma display gamma\nrun_case display_empty display ''\nrun_case display_unknown display delta\nrun_case display_extra display alpha extra\nrun_case limit_missing_value list --limit\nrun_case limit_empty list --limit ''\nrun_case limit_flag_typo list --limits 1\nrun_case limit_flag_case list --LIMIT 1\nrun_case limit_0 list --limit 0\nrun_case limit_1 list --limit 1\nrun_case limit_2 list --limit 2\nrun_case limit_3 list --limit 3\nrun_case limit_03 list --limit 03\nrun_case limit_999 list --limit 999\n"
+              ],
+              "environment": {},
+              "program": "/bin/sh"
+            }
+          },
+          "max_wall_ms": 900000,
+          "wave_policy": {
+            "age_promotion_ms": 0,
+            "batch_width": 1,
+            "debounce_ms": 0,
+            "drift_rechecks": 1,
+            "max_group": 1
+          }
+        },
+        "max_completions": 1,
+        "max_elapsed_ms": 900000,
+        "max_ticks": 2,
+        "nonce": "fx17-stage-01",
+        "poll_ms": 20
+      },
+      "service_report": {
+        "appointment": "sha256:e1e360815b0d1684e6bc416382db137aef096347ffe539d51246c25cdc67d4ab",
+        "completions": [
+          {
+            "acceptance_receipt": "sha256:7dee646a5a9bd868e971f09945a8eee38ee738b9230895f6e572c62a39d561e0",
+            "accepted_commit": "3af3363fec2e88b2ace2e82a59b05adfe991a68b",
+            "accepted_tree": "7dd4c553980d0ede652f19f18cd672f7f372c2ef",
+            "candidate_commit": "3af3363fec2e88b2ace2e82a59b05adfe991a68b",
+            "candidate_tree": "7dd4c553980d0ede652f19f18cd672f7f372c2ef",
+            "epoch": "sha256:47a3b7df2acfe59545931ec026fc9f3a6267441f03426ed8e72e725f2a72749e",
+            "qualification": "sha256:b6082c5254f9ee393ebc132d4cd1d3fcb8ba1f65a0488b623ea93d96ea0f7011",
+            "revision": "sha256:e33cb9e839d42456104167d4dcd2500ddb91289bba29225cef310d814545dcd4",
+            "source": "sha256:6d5b4544c1917466df05bac2b622b8694962860486123d1b62752b02b0b03f40",
+            "target": "fx17-controlled-evolution",
+            "wave": "sha256:079612a7924ece62b6754177dfe4ca641d090432c64c52cfab2e9cbf466ff266"
+          }
+        ],
+        "detail": null,
+        "epoch": "sha256:47a3b7df2acfe59545931ec026fc9f3a6267441f03426ed8e72e725f2a72749e",
+        "outcome": "completion_allowance",
+        "revision": "sha256:e33cb9e839d42456104167d4dcd2500ddb91289bba29225cef310d814545dcd4",
+        "target": "fx17-controlled-evolution",
+        "ticks": 1
+      },
+      "source_commit": "65186c2aea6d73c0752085f91ed8faeb625bc9a6",
+      "status": "accepted-target-returned-to-idle",
+      "target_revision": "sha256:e33cb9e839d42456104167d4dcd2500ddb91289bba29225cef310d814545dcd4",
+      "verifier_evidence_ids": [
+        "sha256:3ca23e923fe6a0cc5c348417e1a0b0b99d6c24e2357a58122fd2ee3154450e03"
+      ],
+      "verifier_generation": 1,
+      "wave": "sha256:079612a7924ece62b6754177dfe4ca641d090432c64c52cfab2e9cbf466ff266"
+    },
+    {
+      "baseline_commit": "3af3363fec2e88b2ace2e82a59b05adfe991a68b",
+      "baseline_source": "sha256:6d5b4544c1917466df05bac2b622b8694962860486123d1b62752b02b0b03f40",
+      "changed_paths": [
+        "app.sh"
+      ],
+      "contribution": "C02",
+      "contribution_lineage": "sha256:ca5f99ef44d786eabe332c23160256afc468af5785d873141830fcd67d8e4a61",
+      "declared_source_sha256": "10712e4e358e4e10916d609d9509e89c52deaa81335efbcf9ab362a2d6b068bd",
+      "expected_baseline_vectors": 65,
+      "ordinal": 2,
+      "retained_base_snapshot": "sha256:6d5b4544c1917466df05bac2b622b8694962860486123d1b62752b02b0b03f40",
+      "retained_result_snapshot": "sha256:5990e118d30ac8d4034bbe55e77d41b09f0fff251e442c4cca6e7be1e5653925",
+      "revision_baseline": "sha256:6d5b4544c1917466df05bac2b622b8694962860486123d1b62752b02b0b03f40",
+      "selected": [
+        "C02"
+      ],
+      "service_policy": {
+        "drive": {
+          "allow_empty_native_gates": false,
+          "execution": {
+            "assertion_inventory": "sha256:dbd78471861444adc8dd9961afa0fbdc30fed24bb8fb578c71c957e644952d51",
+            "build": {
+              "arguments": [
+                "-c",
+                "set -eu; cp /source/app.sh /outputs/app.sh"
+              ],
+              "environment": {},
+              "program": "/bin/sh"
+            },
+            "candidate_source": "sha256:1f95db4dec334df25ee9310eeb00895ffe495fc373efa0869a390a33ff3eddbc",
+            "harness": "sha256:3c84a35fb64b21eff1d35a64450b6a7a4e7e219478a84f5b33b7b98e4f033e4b",
+            "materialization_profile": "aethyme.raw-linux-inputs/provisional-v0",
+            "profile": {
+              "architecture": "arm64",
+              "build_image": "sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251",
+              "build_limits": {
+                "memory_bytes": 67108864,
+                "output_bytes": 1048576,
+                "pids": 32,
+                "timeout_ms": 60000
+              },
+              "runtime_profile": "sha256:72aec5f0a642ea396d75dece3489d4a6c9cbe82362d7f7023b561c1a6732142c",
+              "verifier_image": "sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251",
+              "verifier_limits": {
+                "memory_bytes": 67108864,
+                "output_bytes": 1048576,
+                "pids": 32,
+                "timeout_ms": 60000
+              }
+            },
+            "verify": {
+              "arguments": [
+                "-c",
+                "#!/bin/sh\n# FX17 transport proxy v1. Source is fixed independently of candidate app.sh.\nset -eu\nPATH=/usr/bin:/bin\nLC_ALL=C\nexport PATH LC_ALL\numask 077\ntmp=$(mktemp -d /tmp/fx17-proxy.XXXXXX)\ntrap 'rm -rf \"$tmp\"' EXIT HUP INT TERM\nrun_case() {\n  id=$1\n  shift\n  if /bin/sh /artifact/app.sh \"$@\" >\"$tmp/stdout\" 2>\"$tmp/stderr\"; then code=0; else code=$?; fi\n  out=$(od -An -v -tx1 \"$tmp/stdout\" | tr -d ' \\n')\n  err=$(od -An -v -tx1 \"$tmp/stderr\" | tr -d ' \\n')\n  printf '%s\\t%s\\t%s\\t%s\\n' \"$id\" \"$code\" \"$out\" \"$err\"\n}\nprintf 'FX17V1\\n'\nrun_case lookup_alpha lookup alpha\nrun_case lookup_beta lookup beta\nrun_case lookup_gamma lookup gamma\nrun_case list list\nrun_case arity_zero\nrun_case lookup_missing lookup\nrun_case lookup_extra lookup alpha extra\nrun_case lookup_four lookup alpha '' extra\nrun_case list_empty_extra list ''\nrun_case list_key_extra list alpha\nrun_case list_extra_three list alpha beta\nrun_case list_four list --limit 2 extra\nrun_case mode_empty ''\nrun_case mode_unknown unknown\nrun_case mode_upper_lookup LOOKUP alpha\nrun_case mode_trailing_lookup 'lookup ' alpha\nrun_case mode_leading_list ' list'\nrun_case mode_upper_list LIST\nrun_case mode_unicode 'líst'\nrun_case mode_option --help\nrun_case mode_shell_substitution '$(printf INJECTED)'\nrun_case mode_shell_sequence 'list; printf INJECTED'\nrun_case lookup_empty lookup ''\nrun_case lookup_unknown lookup delta\nrun_case lookup_uppercase lookup Alpha\nrun_case lookup_numeric lookup 0\nrun_case lookup_trailing_space lookup 'alpha '\nrun_case lookup_leading_space lookup ' alpha'\nrun_case lookup_tab lookup 'alpha\t'\nrun_case lookup_newline lookup 'alpha\n'\nrun_case lookup_carriage_return lookup 'alpha\r'\nrun_case lookup_nonbreaking_space lookup 'alpha '\nrun_case lookup_unicode lookup 'άλφα'\nrun_case lookup_fullwidth lookup 'ａｌｐｈａ'\nrun_case lookup_combining lookup 'alphá'\nrun_case lookup_zero_width lookup 'alpha​'\nrun_case lookup_glob lookup '*'\nrun_case lookup_question_glob lookup 'a?pha'\nrun_case lookup_bracket_glob lookup '[a]lpha'\nrun_case lookup_dollar lookup '$KEY'\nrun_case lookup_command_substitution lookup '$(printf alpha)'\nrun_case lookup_backtick lookup '`printf alpha`'\nrun_case lookup_semicolon lookup 'alpha; printf INJECTED'\nrun_case lookup_pipe lookup 'alpha | printf INJECTED'\nrun_case lookup_and lookup 'alpha && printf INJECTED'\nrun_case lookup_redirect lookup 'alpha > fx17-effect-canary'\nrun_case lookup_quote lookup 'alpha'\"'\"'\"\\'\nrun_case lookup_percent lookup %s\nrun_case display_missing display\nrun_case display_alpha display alpha\nrun_case display_beta display beta\nrun_case display_gamma display gamma\nrun_case display_empty display ''\nrun_case display_unknown display delta\nrun_case display_extra display alpha extra\nrun_case limit_missing_value list --limit\nrun_case limit_empty list --limit ''\nrun_case limit_flag_typo list --limits 1\nrun_case limit_flag_case list --LIMIT 1\nrun_case limit_0 list --limit 0\nrun_case limit_1 list --limit 1\nrun_case limit_2 list --limit 2\nrun_case limit_3 list --limit 3\nrun_case limit_03 list --limit 03\nrun_case limit_999 list --limit 999\n"
+              ],
+              "environment": {},
+              "program": "/bin/sh"
+            }
+          },
+          "max_wall_ms": 900000,
+          "wave_policy": {
+            "age_promotion_ms": 0,
+            "batch_width": 1,
+            "debounce_ms": 0,
+            "drift_rechecks": 1,
+            "max_group": 1
+          }
+        },
+        "max_completions": 1,
+        "max_elapsed_ms": 900000,
+        "max_ticks": 2,
+        "nonce": "fx17-stage-02",
+        "poll_ms": 20
+      },
+      "service_report": {
+        "appointment": "sha256:a708e3797d8dddf970617f8c572b9f892137fd72aaa8d7c31c5ffa96e633b8f7",
+        "completions": [],
+        "detail": "publication dispatch Failed; explicit reconciliation required",
+        "epoch": "sha256:47a3b7df2acfe59545931ec026fc9f3a6267441f03426ed8e72e725f2a72749e",
+        "outcome": "held",
+        "revision": "sha256:e8fba66fc2e2fb3055d28c5db002d081eda746fa419779a1d80c9b558caf9ec9",
+        "target": "fx17-controlled-evolution",
+        "ticks": 1
+      },
+      "source_commit": "0a86360df736734d1b09b92ac985be2dd2682a5d",
+      "status": "service-returned",
+      "target_revision": "sha256:e8fba66fc2e2fb3055d28c5db002d081eda746fa419779a1d80c9b558caf9ec9",
+      "verifier_generation": 1
+    }
+  ],
+  "started_unix_ms": 1792049383919,
+  "status": "failed"
+}

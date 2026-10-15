@@ -1,0 +1,54 @@
+ARGV: ["/usr/bin/caffeinate", "-i", "/Users/christophehenner/.cargo/bin/cargo", "test", "--locked", "-j", "4", "-p", "aethyme-broker", "--lib", "--", "--ignored", "--exact", "local_controller::drive::tests::fx17::actual_fx17_twenty_controlled_changes_preserve_all_65_vectors", "--nocapture"]
+SOURCE: {"head": "c45d4096f9d0238b800ccadbeb07f9b93ae30a3e", "status_porcelain": "", "tree": "874654af26ac7fd9bbaa9bedbc7a04fa8a834e40"}
+PINNED_IMAGE: {"inspect_argv": ["/opt/homebrew/bin/docker", "image", "inspect", "--format={{.Id}}", "sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251"], "inspect_status": 0, "inspect_stderr": "", "inspect_stdout": "sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251", "inspected_id": "sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251", "requested": "sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251"}
+   Compiling aethyme-broker v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/implement-the-actual-fx17-20-controlled/packages/aethyme/rust/crates/aethyme-broker)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1m 41s
+     Running unittests src/lib.rs (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/integrate-reviewed-local-bare-git-servic/target/local-resume/cargo/debug/deps/aethyme_broker-20bbfe5c0b2dd5c0)
+
+running 1 test
+FX17 actual trial report /var/folders/f2/krjzd4c15nn491pm37zrkp1h0000gn/T/.tmpR2Cdzn/fx17-report.json, source /var/folders/f2/krjzd4c15nn491pm37zrkp1h0000gn/T/.tmpIqM8wv, host /var/folders/f2/krjzd4c15nn491pm37zrkp1h0000gn/T/.tmpR2Cdzn, remote /var/folders/f2/krjzd4c15nn491pm37zrkp1h0000gn/T/.tmpMW8vvP, harness /var/folders/f2/krjzd4c15nn491pm37zrkp1h0000gn/T/.tmpEofF67
+gate fx17-source-shape started (cost 0, tree 7dd4c553980d)
+gate fx17-source-shape pass in 0s (tree 7dd4c553980d) at load 1m 41.5/10 cpus
+gate fx17-source-shape started (cost 0, tree 9c6baf1e7877)
+gate fx17-source-shape pass in 0s (tree 9c6baf1e7877) at load 1m 44.6/10 cpus
+test local_controller::drive::tests::fx17::actual_fx17_twenty_controlled_changes_preserve_all_65_vectors has been running for over 60 seconds
+gate fx17-source-shape started (cost 0, tree 18256be02fc9)
+gate fx17-source-shape pass in 0s (tree 18256be02fc9) at load 1m 48.8/10 cpus
+gate fx17-source-shape started (cost 0, tree d8b4c241941a)
+gate fx17-source-shape pass in 0s (tree d8b4c241941a) at load 1m 41.2/10 cpus
+gate fx17-source-shape started (cost 0, tree 2e3dbfe66976)
+gate fx17-source-shape pass in 0s (tree 2e3dbfe66976) at load 1m 29.4/10 cpus
+gate fx17-source-shape started (cost 0, tree dff65065c61b)
+gate fx17-source-shape pass in 0s (tree dff65065c61b) at load 1m 23.6/10 cpus
+gate fx17-source-shape started (cost 0, tree 9dd520fd25e5)
+gate fx17-source-shape pass in 0s (tree 9dd520fd25e5) at load 1m 20.1/10 cpus
+gate fx17-source-shape started (cost 0, tree 2e8944bf9d47)
+gate fx17-source-shape pass in 0s (tree 2e8944bf9d47) at load 1m 17.1/10 cpus
+gate fx17-source-shape started (cost 0, tree bbe7594aba01)
+gate fx17-source-shape pass in 0s (tree bbe7594aba01) at load 1m 14.8/10 cpus
+gate fx17-source-shape started (cost 0, tree 18da0c7c980b)
+gate fx17-source-shape pass in 0s (tree 18da0c7c980b) at load 1m 12.2/10 cpus
+gate fx17-source-shape started (cost 0, tree 3b682ab6546c)
+gate fx17-source-shape pass in 0s (tree 3b682ab6546c) at load 1m 11.2/10 cpus
+gate fx17-source-shape started (cost 0, tree b767dab932f8)
+gate fx17-source-shape pass in 0s (tree b767dab932f8) at load 1m 10.8/10 cpus
+gate fx17-source-shape started (cost 0, tree 9bfa9e474e2f)
+gate fx17-source-shape pass in 0s (tree 9bfa9e474e2f) at load 1m 10.0/10 cpus
+gate fx17-source-shape started (cost 0, tree b1f1ea3c32d1)
+gate fx17-source-shape pass in 0s (tree b1f1ea3c32d1) at load 1m 12.8/10 cpus
+gate fx17-source-shape started (cost 0, tree 97dac1c078cd)
+gate fx17-source-shape pass in 0s (tree 97dac1c078cd) at load 1m 12.5/10 cpus
+gate fx17-source-shape started (cost 0, tree 1d28c3be0c65)
+gate fx17-source-shape pass in 0s (tree 1d28c3be0c65) at load 1m 12.5/10 cpus
+gate fx17-source-shape started (cost 0, tree 2190e3bff396)
+gate fx17-source-shape pass in 0s (tree 2190e3bff396) at load 1m 11.0/10 cpus
+gate fx17-source-shape started (cost 0, tree 037249fd01ea)
+gate fx17-source-shape pass in 0s (tree 037249fd01ea) at load 1m 9.6/10 cpus
+gate fx17-source-shape started (cost 0, tree a6ed18386e3b)
+gate fx17-source-shape pass in 0s (tree a6ed18386e3b) at load 1m 8.4/10 cpus
+gate fx17-source-shape started (cost 0, tree 60522e0d2b21)
+gate fx17-source-shape pass in 0s (tree 60522e0d2b21) at load 1m 8.3/10 cpus
+test local_controller::drive::tests::fx17::actual_fx17_twenty_controlled_changes_preserve_all_65_vectors ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1798 filtered out; finished in 462.53s
+

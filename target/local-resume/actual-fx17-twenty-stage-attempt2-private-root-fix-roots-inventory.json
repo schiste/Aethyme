@@ -1,0 +1,42 @@
+{
+  "attempt": "actual-fx17-twenty-stage-attempt2-private-root-fix",
+  "created_at_utc": "2026-10-15T08:37:47.450237+00:00",
+  "roots": [
+    {
+      "archive_path": "target/local-resume/retained-roots/fx17-attempt2-host",
+      "entry_count": 127,
+      "manifest_sha256": "583388f993d904fbc0ab7f9ef2b984418459fcb9c49059b592384acbff65bb6a",
+      "name": "host",
+      "original_path": "/var/folders/f2/krjzd4c15nn491pm37zrkp1h0000gn/T/.tmpbGnhEz",
+      "regular_file_bytes": 868982,
+      "verified_byte_and_mode_match": true
+    },
+    {
+      "archive_path": "target/local-resume/retained-roots/fx17-attempt2-source",
+      "entry_count": 84,
+      "manifest_sha256": "7592a479c056483cd904ba2580cd68c675b7c858a86e9338c1972d178c2dbc9b",
+      "name": "source",
+      "original_path": "/var/folders/f2/krjzd4c15nn491pm37zrkp1h0000gn/T/.tmp42GdOh",
+      "regular_file_bytes": 658774,
+      "verified_byte_and_mode_match": true
+    },
+    {
+      "archive_path": "target/local-resume/retained-roots/fx17-attempt2-harness",
+      "entry_count": 46,
+      "manifest_sha256": "1cf01c56f15879af94aa4ca224b0e0ace2b9f1b03bb635b161569b6d6925cdcd",
+      "name": "harness",
+      "original_path": "/var/folders/f2/krjzd4c15nn491pm37zrkp1h0000gn/T/.tmprf2lAV",
+      "regular_file_bytes": 33001,
+      "verified_byte_and_mode_match": true
+    },
+    {
+      "archive_path": "target/local-resume/retained-roots/fx17-attempt2-remote",
+      "entry_count": 44,
+      "manifest_sha256": "13499bcc93ebd26336dd832456c2c1d69d2155b3c7142b35f2519cc32dc11292",
+      "name": "remote",
+      "original_path": "/var/folders/f2/krjzd4c15nn491pm37zrkp1h0000gn/T/.tmp1z0P7g",
+      "regular_file_bytes": 28455,
+      "verified_byte_and_mode_match": true
+    }
+  ]
+}

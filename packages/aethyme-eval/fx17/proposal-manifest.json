@@ -1,0 +1,57 @@
+{
+  "profile": "aethyme.fx17/declared-v0",
+  "files": {
+    "controlled/00-app.sh": "47138d438d5d64f05bd46840844bca8099da370a5dad71b8974e07fc3ae7aa6b",
+    "controlled/01-app.sh": "77a255e12c57d5c447c56044a59f83843f64bf2a9c4053be2dfc39aa321cdf87",
+    "controlled/02-app.sh": "10712e4e358e4e10916d609d9509e89c52deaa81335efbcf9ab362a2d6b068bd",
+    "controlled/03-app.sh": "8e74928631fcf2364aeb0ac9ecb893ef634f50b6ba51f1c13e8d55a228b89b8d",
+    "controlled/04-app.sh": "cd54309ecf39b470ab3811f28fc235ddc1f755a656efe4273d3b436820124589",
+    "controlled/05-app.sh": "caf1c63f46eb4de212e16aa38974d9f99b6dede6d7a42f5c4906795e78b3a359",
+    "controlled/06-app.sh": "308c779315a920d97bbe21a35ec6682b02b604187356f0908bcd0855a3348673",
+    "controlled/07-app.sh": "e83f2f1bae290315d22f0b3425b6ed21ceb0b0ad06567561fd6bcef51b5af77c",
+    "controlled/08-app.sh": "7321aff21b3962500fbe21df2ab5dcaad91bcafe27f86a6d71e157368dfbbe35",
+    "controlled/09-app.sh": "73bdaa929501cf2e8e99bab8e6fba984e6acee5cd8c8c1bee5f2ec017934d703",
+    "controlled/10-app.sh": "711893d70c529370b1cdd27fa6d0a9a2d99eafff2461fd3370a6449a0f0e5ace",
+    "controlled/11-app.sh": "7ade4369b403f06064192b7c481b42bb735a942441bc1b9df918ddb77087a609",
+    "controlled/12-app.sh": "9e36e9b481fe2a07be230ab8462973403d5f8228a46ca27f303e0d47e00782c0",
+    "controlled/13-app.sh": "9a9f13c8b86ca4b44468ee367c3d07350b00e97553bbb0a071ca99b22103f6af",
+    "controlled/14-app.sh": "49dbb3efcb71dd5bcc5884c54e9459d948c0a522107ca97d944a910a531749a1",
+    "controlled/15-app.sh": "0489118eabf5f759f7b417408bc9bd357938c9c1e7c93c779407343f0c050bb5",
+    "controlled/16-app.sh": "2171c547b4141eaef0e9419014cb40cbe42ac54af8e59bbd66470c11e939252e",
+    "controlled/17-app.sh": "946ed0d4fe38c76a3c5de4b36e008bad598b0d1faf238ec2df0369f3a884134c",
+    "controlled/18-app.sh": "f249c2f6f566c8511820b34e7a4946d931d8e158b2e10471cc02fb6037fa0ddb",
+    "controlled/19-app.sh": "126d1c2d30e73891fae54807c578e1351f38f7404ffe36a11e6d2f9b4c2edce8",
+    "controlled/20-app.sh": "6652e32ebd52cae516797435faf67ed37b79ba25787323178bc6d369755575a0",
+    "public-contract.md": "81d22e805fe6fa48424b1c83fe3bf54d1c9d0e76e5bb14d9cc8c20e84f3be13a",
+    "sealed-public/SX01-alias/app.sh": "6652e32ebd52cae516797435faf67ed37b79ba25787323178bc6d369755575a0",
+    "sealed-public/SX01-alias/requirements.md": "4fb2567284ca9abe9aa61c0887f955b9235bf4776725277fc8f9e67bfe6516a8",
+    "sealed-public/SX02-limit/app.sh": "6652e32ebd52cae516797435faf67ed37b79ba25787323178bc6d369755575a0",
+    "sealed-public/SX02-limit/requirements.md": "36dba4e84912e72ca322f15e17e78d4b2b8981db3e70352ac6ce6f2310b57c6c"
+  },
+  "model_schedule": [
+    {
+      "task": "SX01-alias",
+      "arm": "correct",
+      "repeat": 1,
+      "sealed": true
+    },
+    {
+      "task": "SX01-alias",
+      "arm": "absent",
+      "repeat": 1,
+      "sealed": true
+    },
+    {
+      "task": "SX02-limit",
+      "arm": "correct",
+      "repeat": 1,
+      "sealed": true
+    },
+    {
+      "task": "SX02-limit",
+      "arm": "absent",
+      "repeat": 1,
+      "sealed": true
+    }
+  ]
+}
