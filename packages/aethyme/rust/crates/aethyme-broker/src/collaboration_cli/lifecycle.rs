@@ -1393,7 +1393,7 @@ mod tests {
         .unwrap();
         let inventory = directory.path().join("inventory.json");
         std::fs::write(&inventory, vec![b'x'; 4 * 1024 * 1024 + 1]).unwrap();
-        let operation = OperationId::mint().unwrap().to_string();
+        let operation = OperationId::mint().unwrap().as_str().to_owned();
         let args = [
             "--harness-repo",
             "/no-such-harness",

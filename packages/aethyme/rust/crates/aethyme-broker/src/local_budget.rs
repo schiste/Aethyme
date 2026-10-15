@@ -333,8 +333,6 @@ pub enum BudgetError {
     Sqlite(#[from] rusqlite::Error),
     #[error(transparent)]
     Json(#[from] serde_json::Error),
-    #[error(transparent)]
-    Sensitive(#[from] crate::collaboration_sensitive::SensitiveError),
 }
 fn id(value: &str) -> Result<RecordId, BudgetError> {
     RecordId::parse(value).map_err(|e| BudgetError::Invalid(e.to_string()))
