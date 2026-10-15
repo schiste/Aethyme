@@ -347,6 +347,11 @@ fn checkout_placement_refuses_upward_project_discovery() {
 }
 #[test]
 fn actual_composer_candidate_runs_native_gates_without_legacy_queue_or_ref_writes() {
+    if run_in_clean_git_child(
+        "native_gates::tests::actual_composer_candidate_runs_native_gates_without_legacy_queue_or_ref_writes",
+    ) {
+        return;
+    }
     let mut s = setup(Some(GATES));
     let before = git(s.f._repo.path(), &["show-ref"]);
     let job = prepare(
@@ -455,6 +460,11 @@ fn physical_subject_includes_mode_symlink_target_and_untracked_source() {
 }
 #[test]
 fn no_gate_configuration_is_explicitly_not_verification() {
+    if run_in_clean_git_child(
+        "native_gates::tests::no_gate_configuration_is_explicitly_not_verification",
+    ) {
+        return;
+    }
     let mut s = setup(None);
     let job = prepare(
         &mut s.f.store,
@@ -651,6 +661,11 @@ fn native_gate_roots_survive_revision_root_release() {
 
 #[test]
 fn fresh_dispatch_refuses_a_job_completed_after_the_callers_snapshot() {
+    if run_in_clean_git_child(
+        "native_gates::tests::fresh_dispatch_refuses_a_job_completed_after_the_callers_snapshot",
+    ) {
+        return;
+    }
     let mut s = setup(None);
     let stale_prepared = prepare(
         &mut s.f.store,
@@ -902,6 +917,11 @@ fn stale_owner_cannot_release_but_current_owner_can_release_old_epoch_history() 
 
 #[test]
 fn completed_job_release_survives_real_gc_and_reopened_status_reads() {
+    if run_in_clean_git_child(
+        "native_gates::tests::completed_job_release_survives_real_gc_and_reopened_status_reads",
+    ) {
+        return;
+    }
     let mut s = setup(Some(GATES));
     let owner = s.owner.as_ref().expect("setup owner is present");
     let job = prepare(&mut s.f.store, owner, &mut s.broker, &s.wave).unwrap();
