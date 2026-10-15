@@ -446,7 +446,7 @@ pub(crate) fn materialize_in(
     )
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 pub(crate) fn materialize_in_observed(
     store: &CollaborationStore,
     owner: &ControllerOwner,
