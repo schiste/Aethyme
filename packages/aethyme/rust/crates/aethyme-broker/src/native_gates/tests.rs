@@ -708,7 +708,7 @@ fn released_prepared_job_remains_readable_but_cannot_be_dispatched_or_replayed()
     s.f.store
         .connection()
         .execute_batch(
-            "DROP TRIGGER local_native_gate_no_dispatch_after_root_release;
+            "DROP TABLE IF EXISTS local_capture_notice_outcomes; DROP TABLE IF EXISTS local_capture_notices; DROP TRIGGER local_native_gate_no_dispatch_after_root_release;
              ALTER TABLE local_native_gate_jobs DROP COLUMN roots_released_ms;
              UPDATE meta SET value='22' WHERE key='schema_version';
              UPDATE meta SET value='22' WHERE key='min_compatible_schema';",
