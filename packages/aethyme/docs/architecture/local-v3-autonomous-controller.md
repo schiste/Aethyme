@@ -177,5 +177,9 @@ strict broker Clippy. The earlier heartbeat regression and intended mutation
 record HEAD `143d9952` with individual source hashes matching the corrected
 file or its mutation. They did not record full working-tree status or diff
 and are not evidence of a clean `1f7b2266` test tree. Their raw preflights
-and failed setup attempts remain unchanged. Final integrated checks and
-explicit native-job retention cleanup remain separate work.
+and failed setup attempts remain unchanged. Final integrated checks remain
+separate work. The [native retention lifecycle](local-v3-qualification/native-job-lifecycle-2026-10-15/README.md)
+now has reviewed bounded local evidence: 15 native-gate tests, seven migration
+fixtures, restored-source sanity and six intended guard-removal failures.
+Dispatching and unknown jobs retain their roots; no process-tree quiescence
+claim follows from this lifecycle.

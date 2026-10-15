@@ -22,8 +22,9 @@ All six once-final FX17 model rows failed at the provider's response-schema
 boundary, before producing candidates; none supplies behavioral evidence.
 A separate bounded sustained-arrival trial passed after one retained harness
 failure. The aggregate view/context selections passed 61 selected executions at their
-recorded source. Native-job retention cleanup, the exact T45 pressure/GC
-interleaving and final combined-tree checks remain in progress. These finite
+recorded source. Native-job retention cleanup passed its bounded local checks
+and six guard-removal controls. The exact T45 pressure/GC interleaving and final
+combined-tree checks remain in progress. These finite
 observations do not establish reliable autonomous operation. All results
 below name their source and profile; earlier operator profiles retain their
 original limits.
@@ -241,7 +242,14 @@ verification passed 11,075 ms later, but the single publication attempt failed
 safely and the service held with zero private completions or replay, preserving
 the competing remote tip. This qualifies one finite arrival/contention/drift
 profile. It does not establish repeated-drift or sustained-load reliability.
-Final combined-tree checks and explicit native-job retention cleanup remain open.
+Final combined-tree checks remain open. The [native retention lifecycle](local-v3-qualification/native-job-lifecycle-2026-10-15/README.md)
+passed all 15 selected native-gate tests, seven migration fixtures and a separate
+restored-source sanity check at their recorded heads. Six deliberate guard
+removals each failed the intended assertion; exact source restoration, help
+snapshots, the discarded-results ratchet and strict broker Clippy are recorded.
+The ledger preserves every failed and incomplete attempt: its 85 selected
+native test slots overlap and include unresolved outcomes. Dispatching and
+unknown jobs remain rooted; this does not establish process-tree quiescence.
 
 Plan T45 also requires pressure during capture, hydration and build while GC
 runs. The earlier APFS and Docker profiles exercised their pressure and GC

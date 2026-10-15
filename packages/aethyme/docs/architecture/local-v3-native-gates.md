@@ -61,8 +61,14 @@ floor protects fresh opens.
 
 The explicit release and retention lifecycle has its own
 [native job lifecycle qualification ledger](local-v3-qualification/native-job-lifecycle-2026-10-15/README.md).
-Its source and test oracle have independent static review; complete local
-native runtime qualification is still pending.
+Independent review covers its source, test oracle and all 108 retained evidence
+payloads. The 15-test native-gates selection, seven migration fixtures and
+restored-source sanity check passed at their recorded heads. Six deliberate
+guard removals failed their intended assertions with exact source restoration;
+help snapshots, the discarded-results ratchet and strict broker Clippy passed.
+Failed and incomplete attempts remain explicit. These checks qualify the bounded
+release lifecycle; dispatching and unknown jobs remain held, and final combined
+workspace checks are separate.
 
 The Local integration is retained at `cb6dfeb57dc0f6c1d423e13fc78ea16e90e24529`
 (#758), with passing final workspace, lint, example/doctest, Windows and product
