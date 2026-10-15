@@ -37,7 +37,7 @@ use serde::Serialize;
 pub use crate::host_state::HostStateSource;
 
 /// The schema this binary writes.
-pub const COLLABORATION_STATE_SCHEMA_VERSION: i64 = 22;
+pub const COLLABORATION_STATE_SCHEMA_VERSION: i64 = 23;
 /// The oldest schema a database written by this binary can be read by.
 /// Unlike `host-operations.db`, a newer database stays readable by an older
 /// binary until a release raises this floor.
@@ -62,7 +62,8 @@ pub const COLLABORATION_STATE_SCHEMA_VERSION: i64 = 22;
 // Schema 11 cannot fence unresolved source publication against retention release.
 // Schema 17 reclamation cannot see independently retained native gate jobs.
 // Schema 21 cannot interpret finite controller service appointments.
-const MIN_COMPATIBLE_SCHEMA: i64 = 22;
+// Schema 22 cannot interpret explicit native-job root release.
+const MIN_COMPATIBLE_SCHEMA: i64 = 23;
 const ROOT_DIRECTORY: &str = "collaboration";
 /// Schema steps after the version 1 layout (`meta` only), applied in
 /// order. Step 17 adds separately indexed historical imports and rehearsals. The floor is
@@ -495,6 +496,11 @@ const MIGRATIONS: &[(i64, &str)] = &[
         nonce TEXT NOT NULL,body BLOB NOT NULL,state TEXT NOT NULL CHECK(state IN ('dispatching','completed','held')),
         report BLOB,UNIQUE(target,revision,epoch,nonce)
     ) STRICT;"),
+    (23, "ALTER TABLE local_native_gate_jobs ADD COLUMN roots_released_ms INTEGER;
+    CREATE TRIGGER local_native_gate_no_dispatch_after_root_release
+    BEFORE UPDATE OF state ON local_native_gate_jobs
+    WHEN OLD.roots_released_ms IS NOT NULL AND NEW.state<>OLD.state
+    BEGIN SELECT RAISE(ABORT, 'native gate roots were released'); END;"),
 ];
 /// The file that marks a directory as a collaboration root.
 pub const ROOT_MARKER: &str = ".aethyme-collaboration-root.json";
@@ -1832,6 +1838,7 @@ mod tests {
         let versions: Vec<i64> = MIGRATIONS.iter().map(|(version, _)| *version).collect();
         let expected: Vec<i64> = (2..=COLLABORATION_STATE_SCHEMA_VERSION).collect();
         assert_eq!(versions, expected);
+        assert_eq!(MIN_COMPATIBLE_SCHEMA, 23);
         const { assert!(MIN_COMPATIBLE_SCHEMA <= COLLABORATION_STATE_SCHEMA_VERSION) };
         // A schema 4 binary's reclamation does not keep attached briefs; a
         // schema 5 binary posts no broad-risk keys and purges no cache entry.

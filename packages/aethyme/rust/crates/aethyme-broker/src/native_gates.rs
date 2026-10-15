@@ -40,6 +40,8 @@ pub enum NativeGateError {
     Unsupported(String),
     #[error("native gate outcome is unknown; reconcile before further dispatch")]
     Unknown,
+    #[error("native gate roots were released; this history cannot be dispatched")]
+    RootsReleased,
     #[error(transparent)]
     Archive(#[from] archive::ArchiveError),
     #[error(transparent)]
@@ -94,6 +96,39 @@ pub struct Job {
     pub spec: Spec,
     pub state: String,
     pub observation: Option<Value>,
+    /// An irreversible retention-release witness. The job row remains
+    /// readable, while its source edges no longer participate in GC.
+    pub roots_released_ms: Option<i64>,
+}
+
+const RETENTION_LIST_LIMIT: i64 = 500;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RootReleaseStatus {
+    Released,
+    AlreadyReleased,
+    UnknownHeld,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RetentionStatus {
+    pub id: String,
+    pub target: String,
+    pub state: String,
+    pub roots_released_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RetentionListing {
+    pub jobs: Vec<RetentionStatus>,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RootRelease {
+    pub status: RootReleaseStatus,
+    pub job: RetentionStatus,
 }
 fn id(text: &str) -> Result<RecordId, NativeGateError> {
     RecordId::parse(text).map_err(|_| NativeGateError::Mismatch)
@@ -131,32 +166,198 @@ fn repository_binding(broker: &Broker, spec: &Spec) -> Result<(), NativeGateErro
     }
     Ok(())
 }
+struct StoredJobRow {
+    body: Vec<u8>,
+    state: String,
+    observation: Option<Vec<u8>>,
+    target: String,
+    revision: String,
+    epoch: String,
+    wave: String,
+    roots_released_ms: Option<i64>,
+}
+
 /// Durable historical read. Dispatch separately requires current authority.
 pub fn load(store: &CollaborationStore, key: &RecordId) -> Result<Job, NativeGateError> {
-    let row:(Vec<u8>,String,Option<Vec<u8>>,String,String,String,String)=store.read_connection()
-        .query_row("SELECT body,state,observation,target,revision,epoch,wave FROM local_native_gate_jobs WHERE id=?1",
-        [key.as_str()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?)))
-        .optional()?.ok_or(NativeGateError::Mismatch)?;
-    let rec = Record::decode(&row.0, &[&SCHEMA]).map_err(|_| NativeGateError::Mismatch)?;
-    let body: Value = serde_json::from_slice(&row.0)?;
+    let row = store
+        .read_connection()
+        .query_row(
+            "SELECT body,state,observation,target,revision,epoch,wave,roots_released_ms FROM local_native_gate_jobs WHERE id=?1",
+            [key.as_str()],
+            |row| {
+                Ok(StoredJobRow {
+                    body: row.get(0)?,
+                    state: row.get(1)?,
+                    observation: row.get(2)?,
+                    target: row.get(3)?,
+                    revision: row.get(4)?,
+                    epoch: row.get(5)?,
+                    wave: row.get(6)?,
+                    roots_released_ms: row.get(7)?,
+                })
+            },
+        )
+        .optional()?
+        .ok_or(NativeGateError::Mismatch)?;
+    let rec = Record::decode(&row.body, &[&SCHEMA]).map_err(|_| NativeGateError::Mismatch)?;
+    let body: Value = serde_json::from_slice(&row.body)?;
     let spec: Spec = serde_json::from_value(body["spec"].clone())?;
     if rec.id() != *key
-        || rec.canonical_bytes() != row.0
+        || rec.canonical_bytes() != row.body
         || spec.profile != PROFILE
         || spec.max_dispatches != 1
         || spec.execution_allowance_seconds != 300
-        || spec.target != row.3
-        || spec.revision != row.4
-        || spec.epoch != row.5
-        || spec.wave != row.6
+        || spec.target != row.target
+        || spec.revision != row.revision
+        || spec.epoch != row.epoch
+        || spec.wave != row.wave
     {
         return Err(NativeGateError::Mismatch);
     }
     Ok(Job {
         id: key.clone(),
         spec,
-        state: row.1,
-        observation: row.2.map(|b| serde_json::from_slice(&b)).transpose()?,
+        state: row.state,
+        observation: row
+            .observation
+            .map(|bytes| serde_json::from_slice(&bytes))
+            .transpose()?,
+        roots_released_ms: row.roots_released_ms,
+    })
+}
+
+fn retention_status(
+    id: String,
+    target: String,
+    state: String,
+    roots_released_ms: Option<i64>,
+) -> RetentionStatus {
+    RetentionStatus {
+        id,
+        target,
+        state,
+        roots_released_ms,
+    }
+}
+
+/// List a bounded page of job-retention records for the currently appointed
+/// target owner. This is an operator view only; it does not inspect or
+/// reconstruct archived source.
+pub fn list_retention(
+    store: &CollaborationStore,
+    owner: &ControllerOwner,
+) -> Result<RetentionListing, NativeGateError> {
+    let _authority = target::authorize(store, owner)?;
+    let mut statement = store.read_connection().prepare(
+        "SELECT id,target,state,roots_released_ms FROM local_native_gate_jobs
+         WHERE target=?1 ORDER BY rowid DESC LIMIT ?2",
+    )?;
+    let rows = statement
+        .query_map(params![owner.target(), RETENTION_LIST_LIMIT + 1], |row| {
+            Ok(retention_status(
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    let truncated = rows.len() as i64 > RETENTION_LIST_LIMIT;
+    Ok(RetentionListing {
+        jobs: rows
+            .into_iter()
+            .take(RETENTION_LIST_LIMIT as usize)
+            .collect(),
+        truncated,
+    })
+}
+
+/// Read one retention record without relying on its archived source object.
+pub fn retention_status_for(
+    store: &CollaborationStore,
+    owner: &ControllerOwner,
+    key: &RecordId,
+) -> Result<RetentionStatus, NativeGateError> {
+    let _authority = target::authorize(store, owner)?;
+    store
+        .read_connection()
+        .query_row(
+            "SELECT id,target,state,roots_released_ms FROM local_native_gate_jobs
+             WHERE id=?1 AND target=?2",
+            params![key.as_str(), owner.target()],
+            |row| {
+                Ok(retention_status(
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                ))
+            },
+        )
+        .optional()?
+        .ok_or(NativeGateError::Mismatch)
+}
+
+/// Explicitly abandon a never-dispatched prepared job or release the roots of
+/// a terminal completed job. Dispatching/unknown jobs stay rooted: this
+/// runtime has no job-correlated process-tree proof that would make releasing
+/// them safe.
+pub fn release_roots(
+    store: &mut CollaborationStore,
+    owner: &ControllerOwner,
+    key: &RecordId,
+) -> Result<RootRelease, NativeGateError> {
+    let _authority = target::authorize(store, owner)?;
+    let _archive = crate::collaboration_gc::archive_use(store)?;
+    let tx = store
+        .connection()
+        .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let row: Option<(String, String, Option<i64>)> = tx
+        .query_row(
+            "SELECT target,state,roots_released_ms FROM local_native_gate_jobs WHERE id=?1",
+            [key.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    let Some((job_target, state, released_ms)) = row else {
+        return Err(NativeGateError::Mismatch);
+    };
+    if owner.target() != job_target {
+        return Err(NativeGateError::Binding("appointed target owner"));
+    }
+    let status = if released_ms.is_some() {
+        RootReleaseStatus::AlreadyReleased
+    } else {
+        match state.as_str() {
+            "prepared" | "completed" => {
+                let released_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis()
+                    .min(i64::MAX as u128) as i64;
+                if tx.execute(
+                    "UPDATE local_native_gate_jobs SET roots_released_ms=?2
+                     WHERE id=?1 AND state=?3 AND roots_released_ms IS NULL",
+                    params![key.as_str(), released_ms, state.as_str()],
+                )? != 1
+                {
+                    return Err(NativeGateError::Unknown);
+                }
+                RootReleaseStatus::Released
+            }
+            "dispatching" | "unknown" => RootReleaseStatus::UnknownHeld,
+            _ => return Err(NativeGateError::Mismatch),
+        }
+    };
+    let released_ms: Option<i64> = tx.query_row(
+        "SELECT roots_released_ms FROM local_native_gate_jobs WHERE id=?1",
+        [key.as_str()],
+        |row| row.get(0),
+    )?;
+    tx.commit()?;
+    Ok(RootRelease {
+        status,
+        job: retention_status(key.to_string(), job_target, state, released_ms),
     })
 }
 
@@ -381,6 +582,9 @@ pub fn prepare(
     {
         let job = load(store, &id(&key)?)?;
         repository_binding(broker, &job.spec)?;
+        if job.roots_released_ms.is_some() {
+            return Err(NativeGateError::RootsReleased);
+        }
         current(store, owner, &job.spec)?;
         return Ok(job);
     }
@@ -711,6 +915,9 @@ fn run_inner(
     let _archive = crate::collaboration_gc::archive_use(store)?;
     let job = load(store, key)?;
     repository_binding(broker, &job.spec)?;
+    if job.state == "prepared" && job.roots_released_ms.is_some() {
+        return Err(NativeGateError::RootsReleased);
+    }
     current(store, owner, &job.spec)?;
     match job.state.as_str() {
         "completed" if !fresh => return Ok(job),
@@ -737,10 +944,18 @@ fn run_inner(
     current(store, owner, &job.spec)?;
     // One SQL predicate observes current target/wave and dispatches atomically.
     if store.connection().execute(
-        "UPDATE local_native_gate_jobs SET state='dispatching' WHERE id=?1 AND state='prepared' AND EXISTS (SELECT 1 FROM local_targets WHERE target=?2 AND active_revision=?3 AND (phase='verifying' OR (phase='waiting_for_input' AND resume_phase='verifying'))) AND EXISTS (SELECT 1 FROM local_waves WHERE wave=?4 AND phase='verifying')",
+        "UPDATE local_native_gate_jobs SET state='dispatching' WHERE id=?1 AND state='prepared' AND roots_released_ms IS NULL AND EXISTS (SELECT 1 FROM local_targets WHERE target=?2 AND active_revision=?3 AND (phase='verifying' OR (phase='waiting_for_input' AND resume_phase='verifying'))) AND EXISTS (SELECT 1 FROM local_waves WHERE wave=?4 AND phase='verifying')",
         params![key.as_str(),job.spec.target,job.spec.revision,job.spec.wave],
     )? != 1
     {
+        let released: bool = store.connection().query_row(
+            "SELECT roots_released_ms IS NOT NULL FROM local_native_gate_jobs WHERE id=?1",
+            [key.as_str()],
+            |row| row.get(0),
+        )?;
+        if released {
+            return Err(NativeGateError::RootsReleased);
+        }
         return Err(NativeGateError::Unknown);
     }
     let started = Instant::now();

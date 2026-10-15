@@ -108,6 +108,30 @@ fn target_error(error: target::TargetError) -> Failure {
     };
     Failure::domain(code, error.to_string())
 }
+fn native_gate_error(error: crate::native_gates::NativeGateError) -> Failure {
+    use crate::native_gates::NativeGateError;
+    match error {
+        NativeGateError::Target(error) => target_error(error),
+        NativeGateError::Sqlite(error) => sqlite(error),
+        NativeGateError::Io(error) => io(error),
+        NativeGateError::Mismatch => Failure::refused(
+            "native_job_missing",
+            "native job does not exist for this appointed target",
+            "list native jobs for the current target and inspect the exact job ID",
+        ),
+        NativeGateError::RootsReleased => Failure::refused(
+            "native_job_roots_released",
+            "native job roots were released and the history is not dispatchable",
+            "inspect the retained job status; do not retry a released job",
+        ),
+        NativeGateError::Unknown => Failure::refused(
+            "native_job_unknown",
+            "native job state changed during the operation",
+            "inspect the exact job status before taking further action",
+        ),
+        error => Failure::domain("native_gate", error.to_string()),
+    }
+}
 fn existing_owner(
     store: &mut CollaborationStore,
     name: &str,
@@ -216,6 +240,102 @@ pub(super) fn target_status(root: &Path, rest: &[&str]) -> Result<Output, Failur
         format!("target {name}: {phase}, version {version}\n"),
     ))
 }
+
+pub(super) fn native_gate_retention(root: &Path, rest: &[&str]) -> Result<Output, Failure> {
+    use crate::native_gates as native;
+    let Some(verb @ ("list" | "status" | "release")) = rest.first().copied() else {
+        return Err(Failure::usage(
+            "native-gates requires list, status, or release",
+        ));
+    };
+    let flags = Flags::parse(&rest[1..], &["--target", "--issuer", "--job"], &[])?;
+    let name = flags.one("--target")?;
+    let issuer = flags.one("--issuer")?;
+    if verb == "list" && flags.0.contains_key("--job") {
+        return Err(Failure::usage("native-gates list does not take --job"));
+    }
+    if verb != "list" && !flags.0.contains_key("--job") {
+        return Err(Failure::usage(
+            "native-gates status and release require --job",
+        ));
+    }
+    let key = if verb == "list" {
+        None
+    } else {
+        Some(parse_record(flags.one("--job")?)?)
+    };
+    let mut store = open(root)?;
+    let owner = existing_owner(&mut store, name, issuer)?;
+    match verb {
+        "list" => {
+            let listing = native::list_retention(&store, &owner).map_err(native_gate_error)?;
+            let jobs: Vec<Value> = listing
+                .jobs
+                .iter()
+                .map(|job| {
+                    json!({
+                        "id":job.id,
+                        "target":job.target,
+                        "state":job.state,
+                        "roots_retained":job.roots_released_ms.is_none(),
+                        "roots_released_ms":job.roots_released_ms,
+                    })
+                })
+                .collect();
+            let job_count = jobs.len();
+            Ok((
+                json!({"schema":"aethyme.native-gate-retention/experimental-v1","action":"list","jobs":jobs,"truncated":listing.truncated}),
+                format!(
+                    "{} native gate job(s) listed{}\n",
+                    job_count,
+                    if listing.truncated {
+                        "; list truncated at 500"
+                    } else {
+                        ""
+                    }
+                ),
+            ))
+        }
+        "status" => {
+            let job = native::retention_status_for(&store, &owner, key.as_ref().unwrap())
+                .map_err(native_gate_error)?;
+            let roots_retained = job.roots_released_ms.is_none();
+            let job_id = job.id.clone();
+            let state = job.state.clone();
+            Ok((
+                json!({"schema":"aethyme.native-gate-retention/experimental-v1","action":"status","job":job,"roots_retained":roots_retained}),
+                format!(
+                    "native gate job {job_id}: {state}, roots {}\n",
+                    if roots_retained {
+                        "retained"
+                    } else {
+                        "released"
+                    }
+                ),
+            ))
+        }
+        "release" => {
+            let release = native::release_roots(&mut store, &owner, key.as_ref().unwrap())
+                .map_err(native_gate_error)?;
+            let roots_retained = release.job.roots_released_ms.is_none();
+            let job_id = release.job.id.clone();
+            let status = release.status;
+            Ok((
+                json!({"schema":"aethyme.native-gate-retention/experimental-v1","action":"release","result":release,"roots_retained":roots_retained,"dispatch_authority_granted":false}),
+                format!(
+                    "native gate job {job_id}: {status:?}; roots {}\n",
+                    if roots_retained {
+                        "retained"
+                    } else {
+                        "released"
+                    }
+                ),
+            ))
+        }
+        _ => unreachable!(),
+    }
+}
+
 pub(super) fn target_change(root: &Path, verb: &str, rest: &[&str]) -> Result<Output, Failure> {
     let extra = match verb {
         "propose" => "--file",
@@ -633,6 +753,42 @@ mod tests {
         .unwrap();
         assert_eq!(valid.many("--source"), vec!["A", "B"]);
         assert_eq!(valid.one("--target").unwrap(), "T");
+    }
+    #[test]
+    fn native_gate_retention_cli_rejects_invalid_and_incomplete_arguments() {
+        let root = tempfile::tempdir().unwrap();
+        let too_many: Vec<&str> = (0..=MAX_ARGUMENTS / 2)
+            .flat_map(|_| ["--target", "T"])
+            .collect();
+        for (args, expected) in [
+            (
+                &["unknown"][..],
+                "native-gates requires list, status, or release",
+            ),
+            (&["list"][..], "--target is required"),
+            (&["list", "--target", "T"][..], "--issuer is required"),
+            (
+                &["list", "--target", "T", "--issuer", "I", "--job", "bad"][..],
+                "native-gates list does not take --job",
+            ),
+            (
+                &["status", "--target", "T", "--issuer", "I"][..],
+                "native-gates status and release require --job",
+            ),
+            (
+                &["release", "--target", "T", "--issuer", "I", "--job", "bad"][..],
+                "malformed record id \"bad\": expected sha256:<64 lowercase hex>",
+            ),
+        ] {
+            let failure = native_gate_retention(root.path(), args).unwrap_err();
+            assert_eq!(failure.exit, exit_status::USAGE, "args: {args:?}");
+            assert_eq!(failure.message, expected, "args: {args:?}");
+        }
+        let mut oversized = vec!["list"];
+        oversized.extend(too_many);
+        let failure = native_gate_retention(root.path(), &oversized).unwrap_err();
+        assert_eq!(failure.exit, exit_status::USAGE);
+        assert_eq!(failure.message, "expected a finite set of flag/value pairs");
     }
     #[test]
     fn malformed_regular_target_input_and_symlinks_are_rejected() {
