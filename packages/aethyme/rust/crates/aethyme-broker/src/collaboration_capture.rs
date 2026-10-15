@@ -873,6 +873,17 @@ pub fn receipt(
     }))
 }
 
+struct CaptureReleaseBinding {
+    op_lineage: Option<String>,
+    receipt_id: String,
+    digest_hex: String,
+    receipt_lineage: String,
+    receipt_base: String,
+    receipt_result: String,
+    durability: String,
+    until: Option<i64>,
+}
+
 /// Release only the contribution root created by one committed capture.
 /// Reclamation remains a separate operation, and other roots may keep the
 /// same source objects reachable.
@@ -919,16 +930,7 @@ pub fn release_retention(
         });
     }
 
-    let row: Option<(
-        Option<String>,
-        String,
-        String,
-        String,
-        String,
-        String,
-        String,
-        Option<i64>,
-    )> = store
+    let row: Option<CaptureReleaseBinding> = store
         .read_connection()
         .query_row(
             "SELECT o.lineage_record_id, r.receipt_record_id, r.receipt_sha256,
@@ -938,20 +940,26 @@ pub fn release_retention(
              WHERE o.operation_id=?1",
             [operation_id.as_str()],
             |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                    row.get(5)?,
-                    row.get(6)?,
-                    row.get(7)?,
-                ))
+                Ok(CaptureReleaseBinding {
+                    op_lineage: row.get(0)?,
+                    receipt_id: row.get(1)?,
+                    digest_hex: row.get(2)?,
+                    receipt_lineage: row.get(3)?,
+                    receipt_base: row.get(4)?,
+                    receipt_result: row.get(5)?,
+                    durability: row.get(6)?,
+                    until: row.get(7)?,
+                })
             },
         )
         .optional()?;
-    let Some((
+    let Some(binding) = row else {
+        return Err(CaptureError::CorruptReceipt {
+            operation_id: operation_id.as_str().into(),
+            detail: "committed operation has no receipt row".into(),
+        });
+    };
+    let CaptureReleaseBinding {
         op_lineage,
         receipt_id,
         digest_hex,
@@ -960,13 +968,7 @@ pub fn release_retention(
         receipt_result,
         durability,
         until,
-    )) = row
-    else {
-        return Err(CaptureError::CorruptReceipt {
-            operation_id: operation_id.as_str().into(),
-            detail: "committed operation has no receipt row".into(),
-        });
-    };
+    } = binding;
     if op_lineage.as_deref() != Some(receipt_lineage.as_str()) {
         return Err(CaptureError::CorruptReceipt {
             operation_id: operation_id.as_str().into(),

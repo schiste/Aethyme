@@ -408,6 +408,7 @@ pub(crate) fn compose_with_candidate_retainer(
 /// Internal wave adapter only: the caller has rechecked a private completion
 /// and its accepted wave against the exact baseline. All constituents remain
 /// in the lineage/dependency plan and recipe; delivered deltas are not replayed.
+#[cfg(test)]
 pub(crate) fn compose_after_accepted(
     store: &mut CollaborationStore,
     repo: &Path,
@@ -655,7 +656,7 @@ fn compose_inner(
     request: &CompositionRequest,
     deliveries: &[String],
     recomposition: Option<&Subtraction>,
-    mut candidate_retainer: Option<&mut CandidateRetainer<'_>>,
+    candidate_retainer: Option<&mut CandidateRetainer<'_>>,
     profile: &mut MergeProfile<'_>,
 ) -> Result<Composition, ComposeError> {
     // Reclamation cannot remove an input while this composition reads it.
@@ -789,7 +790,7 @@ fn compose_inner(
     )?;
     let object = collaboration_archive::put_object(store, &bytes)?;
     let recipe = RecipeRef { id, object };
-    if let Some(retain) = candidate_retainer.as_deref_mut() {
+    if let Some(retain) = candidate_retainer {
         retain(store, &candidate, &recipe, &_use)?;
     }
     Ok(Composition {

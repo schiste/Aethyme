@@ -2267,7 +2267,7 @@ mod tests {
         ];
         let failure = verifier_prepare(directory.path(), &args).unwrap_err();
         assert_eq!(failure.exit, exit_status::USAGE);
-        assert_eq!(failure.message, "operator file too large");
+        assert_eq!(failure.message, "bounded regular operator file required");
     }
     #[test]
     fn native_gate_retention_cli_rejects_invalid_and_incomplete_arguments() {

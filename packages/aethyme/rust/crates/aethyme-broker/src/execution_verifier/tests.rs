@@ -235,7 +235,7 @@ impl Subject {
         let policy = policy();
         let mut policy = policy;
         policy.max_age_ms = max_age_ms;
-        policy.harness = capture(&mut f, "inventory.json", &inventory.canonical_bytes());
+        policy.harness = capture(&mut f, "harness/inventory.json", &inventory.canonical_bytes());
         // Policy must be frozen before selecting the target; use the actual
         // harness identity in the target's appointed policy too.
         let mut ts = f.spec();
@@ -418,7 +418,9 @@ fn incomplete_wrong_subject_expired_and_revoked_evidence_cannot_pass() {
 }
 fn capture(f: &mut Fixture, path: &str, bytes: &[u8]) -> String {
     use crate::local_target::tests::git;
-    std::fs::write(f._repo.path().join(path), bytes).unwrap();
+    let input = f._repo.path().join(path);
+    std::fs::create_dir_all(input.parent().unwrap()).unwrap();
+    std::fs::write(&input, bytes).unwrap();
     git(f._repo.path(), &["add", path]);
     git(f._repo.path(), &["commit", "-qm", "verifier fixture input"]);
     let head = archive::CommitOid::parse(&git(f._repo.path(), &["rev-parse", "HEAD"])).unwrap();
@@ -447,10 +449,10 @@ fn real_cli_assertions_observe_behavior_and_refuse_forged_or_stale_receipts() {
     second.stdin_hex = "420a".into();
     second.stdout = d(b"Hello,B\n");
     let inventory = AssertionInventory::new(vec![hello, second]).unwrap();
-    let harness = capture(&mut f, "inventory.json", &inventory.canonical_bytes());
+    let harness = capture(&mut f, "harness/inventory.json", &inventory.canonical_bytes());
     // Independent expected digests/inventory stay on the host; the artifact is
     // the only mounted input to the app under test. A success file is ignored.
-    crate::local_target::tests::git(f._repo.path(), &["rm", "inventory.json"]);
+    crate::local_target::tests::git(f._repo.path(), &["rm", "harness/inventory.json"]);
     let source=capture(&mut f,"app.sh",b"set -eu\ntest ! -e /harness\ntest ! -e /dataset\ntest ! -e /var/run/docker.sock\ntest -z \"${HOME-}\"\nif printf tamper 2>/dev/null > /artifact/app.sh; then exit 77; fi\nread -r name\nprintf 'Hello,%s\\n' \"$name\"\n");
     let limits = snapshot::ResourceLimits {
         timeout_ms: 5000,
