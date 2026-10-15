@@ -381,7 +381,7 @@ impl ResumeGc {
     fn release(&mut self) {
         if let Some(sender) = self.0.take() {
             if sender.send(()).is_err() {
-                // The GC worker already exited, so no pause remains to release.
+                eprintln!("GC worker already exited; no pause remains to release.");
             }
         }
     }
