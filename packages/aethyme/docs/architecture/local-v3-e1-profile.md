@@ -1,6 +1,6 @@
 # E1 Local composition profile (#650)
 
-Last Updated: 2026-10-12
+Last Updated: 2026-10-15
 
 ## Ownership and sequencing
 
@@ -10,8 +10,9 @@ historical. Existing frozen composition inputs and independent expectations are
 unchanged; original held-out variants are not rerun.
 
 This session compares the pinned Git baseline and a pinned standalone structural
-candidate on retained Playground source. Mergiraf 0.19.1 is a candidate pending
-behavior evidence. Its GPL-3.0-only executable is an explicit external tool;
+candidate on retained Playground source. The completed bounded evidence below
+supports opt-in Mergiraf 0.19.1 for the external HTML profile. Its GPL-3.0-only
+executable is an explicit external tool;
 the product does not link or bundle it. Exact executable/source hashes and the
 upstream license inventory are part of the evidence.
 
@@ -69,6 +70,16 @@ complete candidate/input digests, observed mode/fallback, independent assertions
 bounded costs and cleanup status. Required positive move/edit, inherited-base
 and semantic-interaction evidence precede selecting the profile. Native gate
 integration and autonomous execution are separately reviewed Local steps.
+
+## Browser matrix result
+
+The separately frozen browser campaign retained 168 completed observations.
+Its nine-scenario verdict matrix records 8/9 for the text profile, 8/9 for the
+structural profile and 4/9 for unmanaged Git. The matrix checks every declared
+order/repeat and independent browser obligations; the 168 rows are observations,
+not 168 independent scenario successes. FX04 remains a semantic-resolution case.
+The complete report is retained in
+`packages/aethyme-eval/e1/browser-observations/report.json`.
 
 ## Actual synthesis, consumer and subtraction
 

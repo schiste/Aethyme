@@ -1,6 +1,6 @@
 # Local composed candidates at the native gate boundary
 
-Last Updated: 2026-10-12
+Last Updated: 2026-10-15
 
 `aethyme.native-local-gates/experimental-v1` prepares a durable native job for
 the current Local wave and invokes the existing broker gate executor on its
@@ -46,8 +46,14 @@ revision roots does not release these jobs. Roots currently remain indefinitely;
 inactive job release and reconciliation remain implementation work. Quiesce old
 open collaboration clients before upgrading; the floor protects fresh opens.
 
-Local testing is in progress. Preserve failed compile and runtime attempts.
-The first exact composer-to-native-gate positive passed without source/ref
-changes or legacy queue entries. The expanded suite exposed a revoked-trust
-failure; its fix and deadline/placement regression controls require final runs.
-This checkpoint does not qualify an autonomous controller or FX17.
+The Local integration is retained at `cb6dfeb57dc0f6c1d423e13fc78ea16e90e24529`
+(#758), with passing final workspace, lint, example/doctest, Windows and product
+CI checks. Local controls cover the actual composer-to-native-gate path,
+revoked trust, exact candidate policy, deadlines and private placement. The first
+compile/runtime failures remain historical failures, rather than passing evidence.
+
+The separately appointed [Local controller](local-v3-autonomous-controller.md)
+now consumes this native job boundary on its actual finite two-wave path. That
+path explicitly allows empty native commands and still runs independent artifact
+verification and fresh private GenericGit acceptance. It does not extend the
+native profile's host trust or deadline guarantees, or qualify FX17.

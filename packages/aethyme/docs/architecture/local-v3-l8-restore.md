@@ -1,6 +1,13 @@
 # Local v3 historical export and restore
 
-Last Updated: 2026-10-11
+Last Updated: 2026-10-15
+
+> Historical checkpoint: the implementation and pending-work statements below
+> describe the original provisional profile. Current bounded E1, FX08, native-gate
+> and appointed-controller results are recorded in the
+> [Local qualification ledger](local-v3-qualification.md). Each original fixture
+> and profile keeps its own evidence and limits.
+
 
 Issue #679; §6.8, §10.8–10.9; D16/D20/D28; T36–T40/T57. This is the
 provisional source/history profile `aethyme.restore.source-history/provisional-v0`.

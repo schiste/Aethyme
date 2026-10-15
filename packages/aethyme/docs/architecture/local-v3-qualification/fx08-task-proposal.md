@@ -1,6 +1,10 @@
 # FX08 Local brief usefulness: task review proposal
 
-Last Updated: 2026-10-11
+Last Updated: 2026-10-15
+
+> Historical task proposal. The approved tasks were constructed, frozen and run;
+> see the [once-final FX08 results](../local-v3-fx08-qualification.md).
+
 
 Status: proposed task descriptions; no fixtures frozen or trials run.
 
