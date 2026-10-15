@@ -978,11 +978,12 @@ pub fn release_retention(
             operation_id: operation_id.as_str().into(),
         });
     }
-    let digest =
-        archive::parse_digest(&digest_hex).ok_or_else(|| CaptureError::CorruptReceipt {
+    let digest = crate::collaboration_archive::parse_digest(&digest_hex).ok_or_else(|| {
+        CaptureError::CorruptReceipt {
             operation_id: operation_id.as_str().into(),
             detail: "receipt object digest is malformed".into(),
-        })?;
+        }
+    })?;
     let bytes = read_object(store, &digest)?;
     let expected = receipt_record(
         operation_id,

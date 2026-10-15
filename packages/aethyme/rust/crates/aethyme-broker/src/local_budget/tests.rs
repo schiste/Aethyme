@@ -77,7 +77,7 @@ fn nonce_status_recovers_pending_dispatch_without_replaying_it() {
     let reserved = reserve(&mut f.store, &owner, &wave, request.clone(), 0).unwrap();
     let attempt = begin_attempt(&mut f.store, &owner, &reserved.id, 0).unwrap();
 
-    let status = status(
+    let initial_status = status(
         &f.store,
         owner.target(),
         owner.issuer(),
@@ -85,7 +85,7 @@ fn nonce_status_recovers_pending_dispatch_without_replaying_it() {
         Some(&request.nonce),
     )
     .unwrap();
-    let lookup = status.nonce_lookup.unwrap();
+    let lookup = initial_status.nonce_lookup.unwrap();
     assert_eq!(lookup.outcome, NonceLookupOutcome::Found);
     assert_eq!(lookup.matches.len(), 1);
     assert_eq!(lookup.matches[0].id, reserved.id.as_str());
