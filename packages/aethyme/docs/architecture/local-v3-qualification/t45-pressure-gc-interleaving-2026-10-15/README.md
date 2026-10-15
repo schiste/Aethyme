@@ -5,8 +5,11 @@
 This folder freezes the finite T45 pressure assertions for source commit
 `0cc24dc3c18157084cc5af50a98792f3cd67ab81`, which received independent static
 review. The bounded Local checks are authorized and remain **UNRUN** while host
-headroom recovers. No Cargo, APFS, or Docker trial has run. No model calls or
-held-out evaluations are part of this profile.
+headroom recovers. At `0cc24dc3`, CI Cargo compilation and Clippy failed because
+two existing capture-hook initializers lacked the new fields. Those attempts
+produced no runtime test results. T45 runtime tests, APFS trials, and Docker
+trials remain **UNRUN**. No model calls or held-out evaluations are part of
+this profile.
 
 T45 requires ENOSPC/OOM during capture, hydration, and build while GC runs,
 with no lost retained source, partial success, or false verification pass.
