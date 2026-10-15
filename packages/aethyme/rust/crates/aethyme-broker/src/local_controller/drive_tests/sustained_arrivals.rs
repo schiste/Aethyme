@@ -901,14 +901,21 @@ fn await_gate_child_started(
         let child_pid = handshake.started_pid()?;
         let gate_lease = active_gate_capacity_lease(&holder.lease_id)?;
         if let (Some(pid), Some(lease)) = (child_pid, gate_lease) {
-            let has_heartbeat = handshake
-                .heartbeat_count()?
-                .is_some_and(|heartbeat| heartbeat > 0);
-            if lease.created_at < holder_release_unix_ms
-                || !has_heartbeat
-                || handshake.is_complete()
-            {
-                return Err("FX10 gate-child handshake did not prove a live child after actual resource admission".into());
+            if lease.created_at < holder_release_unix_ms {
+                return Err(format!(
+                    "FX10 gate-child resource lease predates the finite holder release: lease_created_at={}, holder_release_unix_ms={holder_release_unix_ms}",
+                    lease.created_at
+                ));
+            }
+            await_gate_child_heartbeat(
+                || handshake.heartbeat_count(),
+                || handshake.is_complete(),
+                deadline,
+            )?;
+            if handshake.is_complete() {
+                return Err(
+                    "FX10 gate child completed before its live admission could be recorded".into(),
+                );
             }
             return Ok((pid, lease, polls, now_ms()?));
         }
@@ -917,6 +924,49 @@ fn await_gate_child_started(
         }
         std::thread::sleep(Duration::from_millis(5));
     }
+}
+
+fn await_gate_child_heartbeat(
+    mut heartbeat_count: impl FnMut() -> Result<Option<u64>, String>,
+    mut is_complete: impl FnMut() -> bool,
+    deadline: Instant,
+) -> Result<u64, String> {
+    let mut last_heartbeat = None;
+    loop {
+        if is_complete() {
+            return Err(format!(
+                "FX10 gate child completed before a live heartbeat was observed; last heartbeat marker={last_heartbeat:?}"
+            ));
+        }
+        last_heartbeat = heartbeat_count()?;
+        if let Some(heartbeat) = last_heartbeat.filter(|heartbeat| *heartbeat > 0) {
+            return Ok(heartbeat);
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "bounded observer did not see the FX10 gate-child heartbeat; last marker={last_heartbeat:?}"
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[test]
+fn fx10_gate_child_start_waits_for_first_heartbeat() {
+    let mut heartbeat_markers = [None, Some(1)].into_iter();
+    let mut polls = 0;
+    let heartbeat = await_gate_child_heartbeat(
+        || {
+            polls += 1;
+            Ok(heartbeat_markers.next().flatten())
+        },
+        || false,
+        Instant::now() + Duration::from_secs(1),
+    )
+    .expect("started marker may precede the first heartbeat");
+
+    assert_eq!(heartbeat, 1);
+    assert_eq!(polls, 2);
 }
 
 fn await_live_gate_child_window(
@@ -1283,14 +1333,66 @@ fn observe_external_ref_advance(
             "polls_while_resource_held":polls_while_resource_held,
         }),
     )?;
+    let admission = await_gate_child_started(
+        &observer,
+        &active_dispatch,
+        &released_holder,
+        holder_release_unix_ms,
+        &handshake,
+    );
     let (gate_child_pid, gate_resource_lease, child_polls, gate_child_started_unix_ms) =
-        await_gate_child_started(
-            &observer,
-            &active_dispatch,
-            &released_holder,
-            holder_release_unix_ms,
-            &handshake,
-        )?;
+        match admission {
+            Ok(admission) => admission,
+            Err(error) => {
+                let started_pid_before_cleanup = handshake
+                    .started_pid()
+                    .map(|pid| json!(pid))
+                    .unwrap_or_else(
+                        |observation_error| json!({"observation_error":observation_error}),
+                    );
+                let heartbeat_before_cleanup = handshake
+                    .heartbeat_count()
+                    .map(|count| json!(count))
+                    .unwrap_or_else(
+                        |observation_error| json!({"observation_error":observation_error}),
+                    );
+                let active_gate_lease_before_cleanup =
+                    active_gate_capacity_lease(&released_holder.lease_id)
+                        .map(|lease| json!(lease))
+                        .unwrap_or_else(
+                            |observation_error| json!({"observation_error":observation_error}),
+                        );
+                let evidence = persist_external_event(
+                    progress,
+                    report_path,
+                    "native-gate-child-admission-failed",
+                    json!({
+                        "error":&error,
+                        "native_job":&job_id,
+                        "wave":active_wave.as_str(),
+                        "holder":&released_holder,
+                        "holder_release_unix_ms":holder_release_unix_ms,
+                        "gate_child_started_pid_before_cleanup":started_pid_before_cleanup,
+                        "gate_child_heartbeat_before_cleanup":heartbeat_before_cleanup,
+                        "gate_child_completed_before_cleanup":handshake.is_complete(),
+                        "active_gate_resource_lease_before_cleanup":active_gate_lease_before_cleanup,
+                        "expected_remote_ref_before_update":&baseline_commit,
+                        "proposed_remote_ref_after_update":&advanced_commit,
+                        "remote_ref_before_update_observed":null,
+                        "remote_ref_advance_attempted":false,
+                        "external_verifier_invoked":false,
+                        "publication_transport_invoked":false,
+                        "observed_at_unix_ms":now_ms().ok(),
+                    }),
+                );
+                if let Err(persist_error) = evidence {
+                    return Err(format!(
+                        "{error}; failed to persist pre-cleanup gate admission evidence: {persist_error}"
+                    ));
+                }
+                return Err(error);
+            }
+        };
     observer_polls = observer_polls.saturating_add(child_polls);
     persist_external_event(
         progress,
