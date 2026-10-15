@@ -159,6 +159,14 @@ impl Fixture {
         (host, repository, remote)
     }
 
+    pub(crate) fn root_paths(&self) -> (PathBuf, PathBuf, PathBuf) {
+        (
+            self.v.f._host.path().to_path_buf(),
+            self.v.f._repo.path().to_path_buf(),
+            self._remote.path().to_path_buf(),
+        )
+    }
+
     fn old(&self) -> OldWorkspace {
         OldWorkspace {
             session: "original-agent".into(),

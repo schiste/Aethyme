@@ -1909,21 +1909,24 @@ mod tests {
         use crate::collaboration_context as context;
 
         let playground_parent = std::path::Path::new("/private/tmp");
-        let playground = tempfile::Builder::new().prefix("aethyme-t56-playground-");
         let run_root = if playground_parent.is_dir() {
-            playground.tempdir_in(playground_parent).unwrap().keep()
+            tempfile::Builder::new()
+                .prefix("aethyme-t56-playground-")
+                .tempdir_in(playground_parent)
+                .unwrap()
         } else {
             tempfile::Builder::new()
                 .prefix("aethyme-t56-playground-")
                 .tempdir()
                 .unwrap()
-                .keep()
         };
         let nonce = capture::OperationId::mint().unwrap();
         let token = format!("secret_{}", nonce.as_str().trim_start_matches("cap-"));
         let token_bytes = token.as_bytes();
-        let mut fixture =
-            crate::local_generation::tests::Fixture::with_source_marker_in(token_bytes, &run_root);
+        let mut fixture = crate::local_generation::tests::Fixture::with_source_marker_in(
+            token_bytes,
+            run_root.path(),
+        );
         let prepared = fixture.prepare("t56-generation").unwrap();
         let generation_root = prepared.absolute_root().to_path_buf();
         assert!(
@@ -2053,8 +2056,8 @@ mod tests {
         let source_worktree_copy = source_repository.join("sensitive-test-material.txt");
         std::fs::write(&source_worktree_copy, token_bytes).unwrap();
         let project_dir = fixture.v.f.store.project_dir().to_path_buf();
-        let (host_root, preserved_repository, remote_root) = fixture.preserve_roots();
-        assert_eq!(source_repository, preserved_repository);
+        let (host_root, fixture_repository, remote_root) = fixture.root_paths();
+        assert_eq!(source_repository, fixture_repository);
         let store = &mut fixture.v.f.store;
         let wave: String = store
             .read_connection()
