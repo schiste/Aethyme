@@ -27,6 +27,16 @@ environment argument before launching tests; its separate failure record is
 retained without test credit. These executions do not qualify the failed live
 FX17 campaign.
 
+## Retained CI failures
+
+The ledger also retains the complete workspace logs for PR #783 at `99bbc0b1`
+and aggregate PR #777 at `f47ad6ea`. Each CI merge-ref checkout ran 4,566 tests:
+4,565 passed, one failed and 32 were skipped. Both exited 100 because the
+discarded-result ratchet found 144 sites against the unchanged baseline of 143.
+The records name the actual CI merge commit and tree, separate from the PR head.
+These failed commands receive no passing-command or ignored native-profile
+credit. Their complete original logs are retained.
+
 ## Remaining integration work
 
 Native-job release and schema-23 qualification are recorded separately once

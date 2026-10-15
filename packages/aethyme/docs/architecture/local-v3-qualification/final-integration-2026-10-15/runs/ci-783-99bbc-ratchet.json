@@ -1,0 +1,23 @@
+{
+  "schema": "aethyme.local-ci-workspace-result/v1",
+  "id": "ci-783-99bbc-ratchet",
+  "pr": 783,
+  "branch_head": "99bbc0b1b85f58d0d412ae392890793c4845e7e6",
+  "ci_checkout_commit": "136498ff0365eaead07890fa137a8b60bcf14a3a",
+  "ci_checkout_tree": "e7bcb4ed0c143446ed35a6d85b831af7f1acd69e",
+  "ci_checkout_parents": [
+    "d52bc0a514fc5035fe143b97208a9e328f6a5d8e",
+    "99bbc0b1b85f58d0d412ae392890793c4845e7e6"
+  ],
+  "job_url": "https://github.com/schiste/Aethyme/actions/runs/38745737562/job/116459398385",
+  "numeric_exit": 100,
+  "tests_run": 4566,
+  "tests_passed": 4565,
+  "tests_failed": 1,
+  "tests_skipped": 32,
+  "test_wall_seconds": 306.895,
+  "failure": "broker_production_code_does_not_discard_more_results: 144 let _ = sites exceeds frozen 143 baseline; both configured attempts failed.",
+  "credited_as_passing_command": false,
+  "log_sha256": "fc5d7f728822a3e341b8ff1d31bfad2aad3d2fb8261151172ec77eca4faaf1f5",
+  "scope": "Actual GitHub CI merge-ref checkout; source identities distinguish tested merge commit from PR head. Ignored T45 native profiles were skipped and receive no runtime credit."
+}

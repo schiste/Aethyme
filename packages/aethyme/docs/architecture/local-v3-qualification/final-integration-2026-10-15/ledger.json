@@ -239,9 +239,45 @@
       "source_path": "target/local-resume/aggregate-offline-fx17-recorder-preflight-failure.json",
       "bytes": 724,
       "sha256": "1f6b58ccdc8d5d63374dcebf5e8e2ed831d0a45d53df5bac292ca46596ab52d7"
+    },
+    {
+      "path": "runs/ci-783-99bbc-ratchet.log",
+      "source_path": "target/local-resume/pr783-116459398385-99bbc-workspace.log",
+      "bytes": 1015982,
+      "sha256": "fc5d7f728822a3e341b8ff1d31bfad2aad3d2fb8261151172ec77eca4faaf1f5"
+    },
+    {
+      "path": "runs/ci-783-99bbc-ratchet-merge-commit.json",
+      "source_path": "target/local-resume/pr783-99bbc-ci-merge-commit.json",
+      "bytes": 2616,
+      "sha256": "451c43bfd5df29000ae981f7c0f48c502a09e9c838b801ed5e3332070ba8b90d"
+    },
+    {
+      "path": "runs/ci-783-99bbc-ratchet.json",
+      "source_path": "target/local-resume/ci-783-99bbc-ratchet.json",
+      "bytes": 1120,
+      "sha256": "c7ec6fb299f188dfe86a06d441d6f8a75038922f0a967a15ecdb5e51b5247a1c"
+    },
+    {
+      "path": "runs/ci-777-f47-ratchet.log",
+      "source_path": "target/local-resume/pr777-116461857524-f47-workspace.log",
+      "bytes": 1015983,
+      "sha256": "d40543e5b6b083205a8c5a5b5d877821a1e3d1cdeb5598e24d964b63334d5b93"
+    },
+    {
+      "path": "runs/ci-777-f47-ratchet-merge-commit.json",
+      "source_path": "target/local-resume/pr777-f47-ci-merge-commit.json",
+      "bytes": 2616,
+      "sha256": "e6446f1450b57059b144282425cfb840acd5da3a67c98796105334b129f1279d"
+    },
+    {
+      "path": "runs/ci-777-f47-ratchet.json",
+      "source_path": "target/local-resume/ci-777-f47-ratchet.json",
+      "bytes": 1118,
+      "sha256": "2c9e8a06dd599868810924aa055051c908e3525593371ab5abb734c0827f883c"
     }
   ],
-  "updated_at_utc": "2026-10-15T13:53:12.631671+00:00",
+  "updated_at_utc": "2026-10-15T14:12:18.138719+00:00",
   "preflight_failures": [
     {
       "metadata": "runs/aggregate-offline-fx17-recorder-preflight-failure.json",
@@ -249,6 +285,20 @@
       "test_commands_launched": 0,
       "model_requests": 0,
       "credit": false
+    }
+  ],
+  "ci_runs": [
+    {
+      "id": "ci-783-99bbc-ratchet",
+      "metadata": "runs/ci-783-99bbc-ratchet.json",
+      "exit_code": 100,
+      "passing_command": false
+    },
+    {
+      "id": "ci-777-f47-ratchet",
+      "metadata": "runs/ci-777-f47-ratchet.json",
+      "exit_code": 100,
+      "passing_command": false
     }
   ]
 }
