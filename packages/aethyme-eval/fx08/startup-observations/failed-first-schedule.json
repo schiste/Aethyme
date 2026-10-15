@@ -1,0 +1,4357 @@
+{
+  "builtin_request_max_retries": 4,
+  "builtin_stream_max_retries": 5,
+  "cli_rollout_weighted_token_allowance": 128000,
+  "compiler": {
+    "path": "/Users/christophehenner/.rustup/toolchains/1.96.0-aarch64-apple-darwin/bin/rustc",
+    "sha256": "c5922366bfe3d6d028a65d626f4e629b3adad066995cf0b60c8a4b617bba5ffe",
+    "sysroot": "/Users/christophehenner/.rustup/toolchains/1.96.0-aarch64-apple-darwin"
+  },
+  "executable_sha256": "74c6a6d263f40d65f99c27a815275f5b4ed0bcc2baecc396b4cf3255498bdfc0",
+  "json_runtime": [
+    {
+      "bytes": 9599,
+      "file": "api-adapters.json",
+      "sha256": "72d2260b3117a03c17f3c3b6350fb7943209ea2004ff5e28f197ebf8c9544507"
+    },
+    {
+      "bytes": 9152,
+      "file": "libequivalent-3a8cf7e30933cca9.rlib",
+      "sha256": "ff034baa0148d74e8d51145aaa172d62c4bbf4ca4871375441d367907e0457dc"
+    },
+    {
+      "bytes": 1220296,
+      "file": "libhashbrown-61da303a68d3214c.rlib",
+      "sha256": "3e396376072f8ed77b8e11f8a11eaaa23a18756c4a295a87e5c3d374c81d9484"
+    },
+    {
+      "bytes": 1213952,
+      "file": "libhashbrown-7cac0e31e46304c0.rlib",
+      "sha256": "6aebb8539076308f4d504e6845987f2a5106ef63f0f5ff7d03194089ee823d29"
+    },
+    {
+      "bytes": 1249224,
+      "file": "libhashbrown-83dc1f18d14a792c.rlib",
+      "sha256": "97ed572223ecc924d62a374e4d04bf844814a6242813fd397df4fca3d344d16d"
+    },
+    {
+      "bytes": 1242720,
+      "file": "libhashbrown-9b1612cf1f37181d.rlib",
+      "sha256": "f5991219b0aff9596f6372c3010ad44fc38c668ee76740a354a7a141f82eac9f"
+    },
+    {
+      "bytes": 1214024,
+      "file": "libhashbrown-cc6c94c50a8ac47c.rlib",
+      "sha256": "93a19205e2ad4ebb01281eea2eca6139642e0f2cf936a624b20461b4a3332f34"
+    },
+    {
+      "bytes": 1322096,
+      "file": "libindexmap-212195dbe539b33b.rlib",
+      "sha256": "f2a2cb8dbe5817f7d4a65e61e9ddf14fdf784590daa4e81d2063b6aef9ce36e5"
+    },
+    {
+      "bytes": 1272648,
+      "file": "libindexmap-d7e121561dc2c587.rlib",
+      "sha256": "cf5346b0336902f22cc594e4611d069bf9e74aec14f5dfd46402f5cd03deb711"
+    },
+    {
+      "bytes": 106200,
+      "file": "libitoa-dc2773ea2abc124f.rlib",
+      "sha256": "10515bc90d76714203d4a062dbc0af14630109a89b9d13878fff0f397795d2d8"
+    },
+    {
+      "bytes": 1028328,
+      "file": "libmemchr-7a45a90fff84828d.rlib",
+      "sha256": "41e4412821a0e6b93acfe7e680efaaedf77871bf839c396105f494dda7d81525"
+    },
+    {
+      "bytes": 1028328,
+      "file": "libmemchr-a9b7532b425a0bb2.rlib",
+      "sha256": "a47b2462617e3abe81a55e34440d6da880256172e2bfc6b92c7c26ebf0d95cb0"
+    },
+    {
+      "bytes": 896520,
+      "file": "libserde-03522b0d8be01eed.rlib",
+      "sha256": "609dc424e54828724643e1934b0e0f2177d87110dc8397967cab1b3dea05825f"
+    },
+    {
+      "bytes": 896720,
+      "file": "libserde-adf1d10b2ba65292.rlib",
+      "sha256": "122eacfc77b809ca8866d19fb8c17a394b70ede5b03e5df1ebae82102263c539"
+    },
+    {
+      "bytes": 896520,
+      "file": "libserde-f373add3820595d1.rlib",
+      "sha256": "0fc3209d9947952cbcaf6816d0e571118cc605a5ab7ff0d5d99fa431af93a6a2"
+    },
+    {
+      "bytes": 4866584,
+      "file": "libserde_core-37d4d6db731edc2a.rlib",
+      "sha256": "7ffcdd6ece90bfaf928e1773bbc9fc43c628293f472e93934b86b2d496525435"
+    },
+    {
+      "bytes": 4884640,
+      "file": "libserde_core-724d29491ea41068.rlib",
+      "sha256": "af9ff6b722ed912f932213b82624da76d2bc9ee53d676642fbcce3eef730d6d0"
+    },
+    {
+      "bytes": 4884896,
+      "file": "libserde_core-a37e548d40160e1d.rlib",
+      "sha256": "6aed4d34397840f0a4df96d00a6eb13eb18bb432fa8645ff5b7f31d5e8d430bf"
+    },
+    {
+      "bytes": 2288696,
+      "file": "libserde_json-051464e51a9ec9d1.rlib",
+      "sha256": "17457f200270985762dfbaa6e6e38fc9d95e1f6826771a8aa4a6958bc4418c87"
+    },
+    {
+      "bytes": 2139496,
+      "file": "libserde_json-242a6147fcad8139.rlib",
+      "sha256": "b9b72ad4bee6ad1d48493e9813cff4e0fd027d3ca42c37093845978913b76ab9"
+    },
+    {
+      "bytes": 2139768,
+      "file": "libserde_json-debcc6433c376694.rlib",
+      "sha256": "b0c8fcb17415bc6ce0c027c8315b9861b346f16d70ed79fc9d0ad6f385a4dca6"
+    },
+    {
+      "bytes": 173248,
+      "file": "libzmij-a9f8c14c33d0abec.rlib",
+      "sha256": "795eb7789706a709a5d54f44fd428ccba4eb8412d835d73f824c31e332f76631"
+    },
+    {
+      "bytes": 2572,
+      "file": "proxy-runtime.rs",
+      "sha256": "37a718e1e9975f5db107a367fcf2b8cef97bb2b661c418c9d4f06b7beb3ab3f5"
+    },
+    {
+      "bytes": 838,
+      "file": "subject-runtime.rs",
+      "sha256": "97f22629c5374e4f6220aa7746bf4d0c03580591b3277532d56f253b96b56638"
+    }
+  ],
+  "model": "gpt-6-luna",
+  "model_invocations_per_row": 1,
+  "model_process_wall_seconds": 150,
+  "observed_command_allowance": 8,
+  "per_stream_bytes": 1048576,
+  "provider_charge_microunits": null,
+  "reasoning": "medium",
+  "retrieved_contexts": [
+    {
+      "agent_access": "not_yet_run",
+      "arm": "correct",
+      "brief": "sha256:25425944eb338b8d62906262dd67e171b69cda346fde066f40f1da1f4b57a426",
+      "cache_key": "sha256:a1e522e44093bdb81bfeb897df088d2c261ac8adfd6c4499c6644be32c4d1d2d",
+      "context_record": "sha256:e87551362c276d1f6f3f39cceecc84d3f2d50230720150c8bf4c9c15f9e9826a",
+      "context_sha256": "fe5f60e55c138f1c48ce15413bfb99ebed2a077c45c4fe5a57e72c740a68d40f",
+      "contribution": "sha256:724a856dda2816ff20d79a950a8aa8f6117e3ca2d871a82c2c18491e951dc1e5",
+      "coverage": "partial",
+      "delivered": true,
+      "freshness": "exact",
+      "group": "declared",
+      "public": "/private/tmp/aethyme-fx08-contexts-20261012-exact-brief/01-optional-correct/public",
+      "source": "sha256:a4bfdde858d7d80d7c96a716639887da8b2a583768a19391f7f38c61a9334f83",
+      "task": "01-optional"
+    },
+    {
+      "agent_access": "not_yet_run",
+      "arm": "absent",
+      "brief": null,
+      "cache_key": "sha256:7039c1dad94d64f797210772e663a37d3e9159f8d668ee76f5836c6ebb60e444",
+      "context_record": "sha256:a4655f28e217dbef1f94368edddbe50d5927f7c9d7d8bfe5ef6f27856391e799",
+      "context_sha256": "5e963db6fa14640def8431946b64e3027b193b2a56400a8f7e60ad22c07b2710",
+      "contribution": "sha256:724a856dda2816ff20d79a950a8aa8f6117e3ca2d871a82c2c18491e951dc1e5",
+      "coverage": "partial",
+      "delivered": true,
+      "freshness": "exact",
+      "group": "declared",
+      "public": "/private/tmp/aethyme-fx08-contexts-20261012-exact-brief/01-optional-absent/public",
+      "source": "sha256:a4bfdde858d7d80d7c96a716639887da8b2a583768a19391f7f38c61a9334f83",
+      "task": "01-optional"
+    },
+    {
+      "agent_access": "not_yet_run",
+      "arm": "incomplete",
+      "brief": "sha256:8e9d25603a93a8fac8fde3e05075a3839a9e5573b190dc8bfad90248d0251d64",
+      "cache_key": "sha256:bccdae44c7cf8155c8ade58f4cf4acd9add06bc5ce0564c1717a7f50349d5a11",
+      "context_record": "sha256:d35342b0a7e32d59c925fa0a4b093ea40e961afbe3ebbcb5eb62d5c5686ed0ef",
+      "context_sha256": "fb5e74a6e6fddbeeede56b01aa5e70201bd70154b81ee88a17af38dd234a5382",
+      "contribution": "sha256:724a856dda2816ff20d79a950a8aa8f6117e3ca2d871a82c2c18491e951dc1e5",
+      "coverage": "partial",
+      "delivered": true,
+      "freshness": "exact",
+      "group": "declared",
+      "public": "/private/tmp/aethyme-fx08-contexts-20261012-exact-brief/01-optional-incomplete/public",
+      "source": "sha256:a4bfdde858d7d80d7c96a716639887da8b2a583768a19391f7f38c61a9334f83",
+      "task": "01-optional"
+    },
+    {
+      "agent_access": "not_yet_run",
+      "arm": "misleading",
+      "brief": "sha256:ae44215cd07340f51d74fc3aa254666576db1d598cc57849324a7d3c8d4d7045",
+      "cache_key": "sha256:7e7e600f76c549447d6f825b02c87ba6ea6641a1e37410adc0b25854c08116da",
+      "context_record": "sha256:d6b5dabfd7199d896192139d2a793c1e88a8f6388672dd15de11656286359db0",
+      "context_sha256": "c57a22f8ccafdfaf294b6eed34c00bc08a379969890268a603f740efddb5470f",
+      "contribution": "sha256:724a856dda2816ff20d79a950a8aa8f6117e3ca2d871a82c2c18491e951dc1e5",
+      "coverage": "partial",
+      "delivered": true,
+      "freshness": "exact",
+      "group": "declared",
+      "public": "/private/tmp/aethyme-fx08-contexts-20261012-exact-brief/01-optional-misleading/public",
+      "source": "sha256:a4bfdde858d7d80d7c96a716639887da8b2a583768a19391f7f38c61a9334f83",
+      "task": "01-optional"
+    },
+    {
+      "agent_access": "not_yet_run",
+      "arm": "correct",
+      "brief": "sha256:9b49762244eaca96c2d974f9c932bad818f365f214a5540c92fa7af004ab1144",
+      "cache_key": "sha256:0485f9c6db7a02d62481dd66f070ad509e668544c3f6ebafaa16954af6aadee1",
+      "context_record": "sha256:9848dd39d624353e610613b2a1f3b3c4d8f4673cda935f79286b5e17bd6ef580",
+      "context_sha256": "496c77d936527978cee076593b174be1ab8b4a54237e0276e1ef64d3f129ecd7",
+      "contribution": "sha256:78c7d79d34bc904b71f5a0149a23c83fd9a8032dfebad36acad91365c0f88dc1",
+      "coverage": "partial",
+      "delivered": true,
+      "freshness": "exact",
+      "group": "declared",
+      "public": "/private/tmp/aethyme-fx08-contexts-20261012-exact-brief/02-pagination-correct/public",
+      "source": "sha256:ee6e2662b6c41c0642fed182ac2d84bccaf3885e65899da5be02476d7839eecf",
+      "task": "02-pagination"
+    },
+    {
+      "agent_access": "not_yet_run",
+      "arm": "absent",
+      "brief": null,
+      "cache_key": "sha256:c205218df872ac5ceefb025faf7ad5de3a50e0f33dead6252db5145ea8252495",
+      "context_record": "sha256:3cd0b0f52626bf94993f00379113d8dfe8994b49a898d49f45eb7cf80d5da8f1",
+      "context_sha256": "3b5c133c8bbe1086ffef37f77c0bb7fd07997b9cc533d626bc452d5ac6b05e31",
+      "contribution": "sha256:78c7d79d34bc904b71f5a0149a23c83fd9a8032dfebad36acad91365c0f88dc1",
+      "coverage": "partial",
+      "delivered": true,
+      "freshness": "exact",
+      "group": "declared",
+      "public": "/private/tmp/aethyme-fx08-contexts-20261012-exact-brief/02-pagination-absent/public",
+      "source": "sha256:ee6e2662b6c41c0642fed182ac2d84bccaf3885e65899da5be02476d7839eecf",
+      "task": "02-pagination"
+    },
+    {
+      "agent_access": "not_yet_run",
+      "arm": "incomplete",
+      "brief": "sha256:e50ace1a2ec67f7dc190c28a85199df750995447832264c44f4d305b6144cc88",
+      "cache_key": "sha256:52ddbd9e839ed826727a8d67dda90aedf240e3ba2786b6b054a2b7e868d902f2",
+      "context_record": "sha256:8f480c50b37f5be0afd7a5b9d96fe891cae2d4abec6687ebfd6ddada0e34ff98",
+      "context_sha256": "db5547c88d1478666016446d8d7071525c63116d7ede837e160d5b429a3b5575",
+      "contribution": "sha256:78c7d79d34bc904b71f5a0149a23c83fd9a8032dfebad36acad91365c0f88dc1",
+      "coverage": "partial",
+      "delivered": true,
+      "freshness": "exact",
+      "group": "declared",
+      "public": "/private/tmp/aethyme-fx08-contexts-20261012-exact-brief/02-pagination-incomplete/public",
+      "source": "sha256:ee6e2662b6c41c0642fed182ac2d84bccaf3885e65899da5be02476d7839eecf",
+      "task": "02-pagination"
+    },
+    {
+      "agent_access": "not_yet_run",
+      "arm": "misleading",
+      "brief": "sha256:149227ce5c5af2df538fda5a1e2054d41a2695dc0ac0749cdb50f431a3a8f5b5",
+      "cache_key": "sha256:fcd5eefae4d2c7095c15e7e19b985afb62c7ad310e405129dac0f2be3d7ee591",
+      "context_record": "sha256:17f880a399eecf473a33c7dcc0c38866f671c02ba26041ed876dc7fdb858b608",
+      "context_sha256": "d96efa4a79b4d48950fa6d24e4061519c2ce7f916c903453489e76e4d91fd077",
+      "contribution": "sha256:78c7d79d34bc904b71f5a0149a23c83fd9a8032dfebad36acad91365c0f88dc1",
+      "coverage": "partial",
+      "delivered": true,
+      "freshness": "exact",
+      "group": "declared",
+      "public": "/private/tmp/aethyme-fx08-contexts-20261012-exact-brief/02-pagination-misleading/public",
+      "source": "sha256:ee6e2662b6c41c0642fed182ac2d84bccaf3885e65899da5be02476d7839eecf",
+      "task": "02-pagination"
+    },
+    {
+      "agent_access": "not_yet_run",
+      "arm": "correct",
+      "brief": "sha256:c6148de23828afdbbc9d38185ff1daef2f97dfee7321f4e0e6e658ead0996565",
+      "cache_key": "sha256:25224295c6da6bc7bcf73fc15a4c0c146b7da91cfe0ac14d7d254809eb45d190",
+      "context_record": "sha256:77c58afdf4bf719070eaf9e9fd777a7ce6ea99a7a454be6f2fe47e53f2d61580",
+      "context_sha256": "cccd5ccbaad9d955b9ab0d44ad8026ec1a240930ef0f58282370315a1074be26",
+      "contribution": "sha256:afc875ac22577e2439e8b12816a0cba4a6e74db141b1242893c27db7ab85332c",
+      "coverage": "partial",
+      "delivered": true,
+      "freshness": "exact",
+      "group": "declared",
+      "public": "/private/tmp/aethyme-fx08-contexts-20261012-exact-brief/03-protocol-correct/public",
+      "source": "sha256:6addf864fdfcef3316a104db10f5b02acb85ff66cc3c16dd6d7b56d4aa6f7752",
+      "task": "03-protocol"
+    },
+    {
+      "agent_access": "not_yet_run",
+      "arm": "absent",
+      "brief": null,
+      "cache_key": "sha256:546de66874cb10a04e8ceda07dec938e9fd51e3841f96ae4e8f52e57ce772790",
+      "context_record": "sha256:68a6631d5df84dbbe4b92672a2d537b2cee058eacf3e37b5f60d5f1b6c541c2a",
+      "context_sha256": "0d46629a8c50fab3e552d2798b336568fc3d2b15ec8c10e3da21c416538e098e",
+      "contribution": "sha256:afc875ac22577e2439e8b12816a0cba4a6e74db141b1242893c27db7ab85332c",
+      "coverage": "partial",
+      "delivered": true,
+      "freshness": "exact",
+      "group": "declared",
+      "public": "/private/tmp/aethyme-fx08-contexts-20261012-exact-brief/03-protocol-absent/public",
+      "source": "sha256:6addf864fdfcef3316a104db10f5b02acb85ff66cc3c16dd6d7b56d4aa6f7752",
+      "task": "03-protocol"
+    },
+    {
+      "agent_access": "not_yet_run",
+      "arm": "incomplete",
+      "brief": "sha256:b8e142e6a131b57b3e056016431ad3861c04cc79e396403bdd214668b5a9c091",
+      "cache_key": "sha256:7a2ff7f357720c6677e2ac8c4d28b37c1dd309a67f3ba835b6d3ad640302c54a",
+      "context_record": "sha256:22156ff156a779fc69bf93afe4be8af9c68c13359181a006b4bfab4eee9eb388",
+      "context_sha256": "5f0c7c7d8256f2bc823f315308b92c19ae2d6d534e513d6fe7ef1c85fa76b0a8",
+      "contribution": "sha256:afc875ac22577e2439e8b12816a0cba4a6e74db141b1242893c27db7ab85332c",
+      "coverage": "partial",
+      "delivered": true,
+      "freshness": "exact",
+      "group": "declared",
+      "public": "/private/tmp/aethyme-fx08-contexts-20261012-exact-brief/03-protocol-incomplete/public",
+      "source": "sha256:6addf864fdfcef3316a104db10f5b02acb85ff66cc3c16dd6d7b56d4aa6f7752",
+      "task": "03-protocol"
+    },
+    {
+      "agent_access": "not_yet_run",
+      "arm": "misleading",
+      "brief": "sha256:4bcf965dfc2a94c3f6feaac68891344545b282af1dfe6621a167b6ccccd044fb",
+      "cache_key": "sha256:bd56215863672a2f49cdc3c0e14cbd59cc266b705432cd5056563afee12555db",
+      "context_record": "sha256:c707c8518e1a4660c85c573c58fcee4807097f66d484c4fa570bdac9ac09b5b8",
+      "context_sha256": "79ca40db919d7300fd04bd83a21c4e7a3cd64af827918c388e075c7d860e7167",
+      "contribution": "sha256:afc875ac22577e2439e8b12816a0cba4a6e74db141b1242893c27db7ab85332c",
+      "coverage": "partial",
+      "delivered": true,
+      "freshness": "exact",
+      "group": "declared",
+      "public": "/private/tmp/aethyme-fx08-contexts-20261012-exact-brief/03-protocol-misleading/public",
+      "source": "sha256:6addf864fdfcef3316a104db10f5b02acb85ff66cc3c16dd6d7b56d4aa6f7752",
+      "task": "03-protocol"
+    },
+    {
+      "agent_access": "not_yet_run",
+      "arm": "correct",
+      "brief": "sha256:821a088aacf69e8718a54e15af23983698486bcbad4df164c173fb219a9d77fb",
+      "cache_key": "sha256:32aacf1e2480d408a2c6ed051d8d49d42322dac3cbd8a245ce0daae6bc8836fe",
+      "context_record": "sha256:d01e465212cfa0196c3bbc66b471ba14fd4f7ad9b8345febde6ea370e52064dd",
+      "context_sha256": "074ead8968bd9f8dc55ab434e2f73df889b7e32006ba336e6945ee3f38153adc",
+      "contribution": "sha256:6d1ec576ce0e2d432ee6fc2c29675ad5782a2478388072ad60f399ee5bda81a8",
+      "coverage": "partial",
+      "delivered": true,
+      "freshness": "exact",
+      "group": "declared",
+      "public": "/private/tmp/aethyme-fx08-contexts-20261012-exact-brief/04-completion-correct/public",
+      "source": "sha256:b51a8b781a01aada4c18768ba19b9f8e568e7ddd31322946a266dee6cc9ddb87",
+      "task": "04-completion"
+    },
+    {
+      "agent_access": "not_yet_run",
+      "arm": "absent",
+      "brief": null,
+      "cache_key": "sha256:040f7a1c1cf03267f489c64e050d99ebdbcbbe95775b222f97aa2c7773dde8b8",
+      "context_record": "sha256:4d701cbd8e4ed673386a176d1e7170e0d2efc07c20470bbdee35b4c60585ee24",
+      "context_sha256": "669ef438d8279d4ef8b6ef49011de46182fa4839c22fc4ebab7f16749b3be47b",
+      "contribution": "sha256:6d1ec576ce0e2d432ee6fc2c29675ad5782a2478388072ad60f399ee5bda81a8",
+      "coverage": "partial",
+      "delivered": true,
+      "freshness": "exact",
+      "group": "declared",
+      "public": "/private/tmp/aethyme-fx08-contexts-20261012-exact-brief/04-completion-absent/public",
+      "source": "sha256:b51a8b781a01aada4c18768ba19b9f8e568e7ddd31322946a266dee6cc9ddb87",
+      "task": "04-completion"
+    },
+    {
+      "agent_access": "not_yet_run",
+      "arm": "incomplete",
+      "brief": "sha256:4438c8a1dc3c39a8461326c90541a73e701f72a6b1f1c8ae104aa4eb09380aa3",
+      "cache_key": "sha256:8a4aded303aa82ecd2c9aeff33036d0408cffff7a81d8c327487088e83e38e59",
+      "context_record": "sha256:b634fc97d7f07aa74776ed39f886d0caa6c88c998575b4a592cce64aa6d10e71",
+      "context_sha256": "7a74c6907ad7dfcf6186aec11a3188f04802acc976ca79cfc091456bb5bb7ac2",
+      "contribution": "sha256:6d1ec576ce0e2d432ee6fc2c29675ad5782a2478388072ad60f399ee5bda81a8",
+      "coverage": "partial",
+      "delivered": true,
+      "freshness": "exact",
+      "group": "declared",
+      "public": "/private/tmp/aethyme-fx08-contexts-20261012-exact-brief/04-completion-incomplete/public",
+      "source": "sha256:b51a8b781a01aada4c18768ba19b9f8e568e7ddd31322946a266dee6cc9ddb87",
+      "task": "04-completion"
+    },
+    {
+      "agent_access": "not_yet_run",
+      "arm": "misleading",
+      "brief": "sha256:2fe821b5ca377311bc1163e2daee71356ab169537fade91c2f99a3a72bb5cd32",
+      "cache_key": "sha256:5442d423543be176fad33947a9fa5de8faa74396565ea45fce5a9f005ec3b3bd",
+      "context_record": "sha256:68649c70844b46104efae3a2f07fae8d559e889469419899c32cd3f4c4ecf331",
+      "context_sha256": "ff45742d660671fa61d8097f711b8dfc19815d6179b0977f6a3b9c9f00b1109f",
+      "contribution": "sha256:6d1ec576ce0e2d432ee6fc2c29675ad5782a2478388072ad60f399ee5bda81a8",
+      "coverage": "partial",
+      "delivered": true,
+      "freshness": "exact",
+      "group": "declared",
+      "public": "/private/tmp/aethyme-fx08-contexts-20261012-exact-brief/04-completion-misleading/public",
+      "source": "sha256:b51a8b781a01aada4c18768ba19b9f8e568e7ddd31322946a266dee6cc9ddb87",
+      "task": "04-completion"
+    },
+    {
+      "agent_access": "not_yet_run",
+      "arm": "correct",
+      "brief": "sha256:22e86ed73f8e8e917ab2b3d7e3e5c77c1490607ef4b6f4eaa8eea14f65f15f45",
+      "cache_key": "sha256:835beb9f68ecf01d4ae8a4e6a1bff9fea5a79bca981c546b06dee8c50864126a",
+      "context_record": "sha256:08c026665fb243719c9f89c8f10daa93e1a97ce75ded199146d8a1cefaaa569b",
+      "context_sha256": "c3fad0d98a07ea3d605243d97229f8e9f90e2c0c4758d0bee8fd5d8930ef7b86",
+      "contribution": "sha256:2535597bd51ff60ccabec73ad45f60b62f9424c40bb82f2e9a864a77bd1ceab6",
+      "coverage": "partial",
+      "delivered": true,
+      "freshness": "exact",
+      "group": "sealed",
+      "public": "/private/tmp/aethyme-fx08-contexts-20261012-exact-brief/05-identifiers-correct/public",
+      "source": "sha256:bad8b14cc57b6b6e8056407d84a3c95a915c8b90c07b19bd30a380777a015750",
+      "task": "05-identifiers"
+    },
+    {
+      "agent_access": "not_yet_run",
+      "arm": "absent",
+      "brief": null,
+      "cache_key": "sha256:4f45e82ba55032ee833827576879511614aec9a9c4e555a182d888c7656d6558",
+      "context_record": "sha256:bad01b3bea1a90f7389644b8018293eb13fa490f2a8958e048bf9acf8e45d701",
+      "context_sha256": "64d1f765d1c5aef55b6d6a3348baa0829c6b4e71b37c752057f7c0c4ac8f60de",
+      "contribution": "sha256:2535597bd51ff60ccabec73ad45f60b62f9424c40bb82f2e9a864a77bd1ceab6",
+      "coverage": "partial",
+      "delivered": true,
+      "freshness": "exact",
+      "group": "sealed",
+      "public": "/private/tmp/aethyme-fx08-contexts-20261012-exact-brief/05-identifiers-absent/public",
+      "source": "sha256:bad8b14cc57b6b6e8056407d84a3c95a915c8b90c07b19bd30a380777a015750",
+      "task": "05-identifiers"
+    },
+    {
+      "agent_access": "not_yet_run",
+      "arm": "incomplete",
+      "brief": "sha256:32cc2c855ca68e5e4024658c36874195a9aa3896a965da8a522ac7028ebc7fea",
+      "cache_key": "sha256:dc06317a1323b508387bcc9ee3e7eabd59800898c3e017be6cbf905dc99c43fb",
+      "context_record": "sha256:334fe077d2457ce92aaa6bede1449af0b71611ae6257b76720f6c71f439c333a",
+      "context_sha256": "f4e9415d6903d53861953ee75a1c77e6f3b002a0493399af066a42fa7efee555",
+      "contribution": "sha256:2535597bd51ff60ccabec73ad45f60b62f9424c40bb82f2e9a864a77bd1ceab6",
+      "coverage": "partial",
+      "delivered": true,
+      "freshness": "exact",
+      "group": "sealed",
+      "public": "/private/tmp/aethyme-fx08-contexts-20261012-exact-brief/05-identifiers-incomplete/public",
+      "source": "sha256:bad8b14cc57b6b6e8056407d84a3c95a915c8b90c07b19bd30a380777a015750",
+      "task": "05-identifiers"
+    },
+    {
+      "agent_access": "not_yet_run",
+      "arm": "misleading",
+      "brief": "sha256:3515947abbf39f6f3d526b6e45ded73449039a6752e8b9f99075a160a5f02030",
+      "cache_key": "sha256:59f83cc0a612c64f961df7dc3db35e70e1d127e8bdb1d6aebdb3541ae75e1a56",
+      "context_record": "sha256:0a4cef1059a395c2bc805b192265b8a13bd698e6fea0a3d9cb4eb147aa3d9017",
+      "context_sha256": "8b06953ac22d9bf7ce453c4f149e1578cee76e4e924eed8a2df69ab4410526c6",
+      "contribution": "sha256:2535597bd51ff60ccabec73ad45f60b62f9424c40bb82f2e9a864a77bd1ceab6",
+      "coverage": "partial",
+      "delivered": true,
+      "freshness": "exact",
+      "group": "sealed",
+      "public": "/private/tmp/aethyme-fx08-contexts-20261012-exact-brief/05-identifiers-misleading/public",
+      "source": "sha256:bad8b14cc57b6b6e8056407d84a3c95a915c8b90c07b19bd30a380777a015750",
+      "task": "05-identifiers"
+    },
+    {
+      "agent_access": "not_yet_run",
+      "arm": "correct",
+      "brief": "sha256:055dfb8a3aedb616e1b1565b1e60a747c2a7d10517077f1153af2e9fba153868",
+      "cache_key": "sha256:02df603f961e9ba95c72c5c9a9da54e55e2e1b0227aa91c57fa825191aaa208d",
+      "context_record": "sha256:cd0628abeb90dcaa5c2174d6619c92849ee4e8554a43efe2f64dce1fa4daedf0",
+      "context_sha256": "19c81d29c80d7cef12c806b93ba2218548363660bc376c4ea83ff40ce7193723",
+      "contribution": "sha256:f64f0b930becd7fc5c708f8dab64937fdb2601ee297a4a5545341d50297cbd24",
+      "coverage": "partial",
+      "delivered": true,
+      "freshness": "exact",
+      "group": "sealed",
+      "public": "/private/tmp/aethyme-fx08-contexts-20261012-exact-brief/06-lookup-correct/public",
+      "source": "sha256:50f9760cd2f96e14e2215d129527913955195b5e5f6c26ee03929d4452fda075",
+      "task": "06-lookup"
+    },
+    {
+      "agent_access": "not_yet_run",
+      "arm": "absent",
+      "brief": null,
+      "cache_key": "sha256:1ca1c18daa7b7e97c207fd4741642f7ac288bb9f2b860d28caed0a75df14dbb2",
+      "context_record": "sha256:c13e4425cf4b0f4959b3b84239fec5c27b9b70ec5b2b34cde871a54458dfa9fa",
+      "context_sha256": "79dfef5500dfc511f7a896145865a7e890c2f208af0452e2ecb5e36d84435286",
+      "contribution": "sha256:f64f0b930becd7fc5c708f8dab64937fdb2601ee297a4a5545341d50297cbd24",
+      "coverage": "partial",
+      "delivered": true,
+      "freshness": "exact",
+      "group": "sealed",
+      "public": "/private/tmp/aethyme-fx08-contexts-20261012-exact-brief/06-lookup-absent/public",
+      "source": "sha256:50f9760cd2f96e14e2215d129527913955195b5e5f6c26ee03929d4452fda075",
+      "task": "06-lookup"
+    },
+    {
+      "agent_access": "not_yet_run",
+      "arm": "incomplete",
+      "brief": "sha256:74e5b0a80da4e63fc8ffe3b45ef54a806102c000e0e81bce8cab5d78c7bf974b",
+      "cache_key": "sha256:913802da2d50731c4bd7069919db78d8ed70ec5b82f7534e2d55396015ef4016",
+      "context_record": "sha256:2863fab891cf9f0ea2a0649c078b35e10428d8f492770cdba5e52b7766baa443",
+      "context_sha256": "4ec79d3e315ce0df4220daaf6d66f212e46fa37508ce9f4c946499a8047e462d",
+      "contribution": "sha256:f64f0b930becd7fc5c708f8dab64937fdb2601ee297a4a5545341d50297cbd24",
+      "coverage": "partial",
+      "delivered": true,
+      "freshness": "exact",
+      "group": "sealed",
+      "public": "/private/tmp/aethyme-fx08-contexts-20261012-exact-brief/06-lookup-incomplete/public",
+      "source": "sha256:50f9760cd2f96e14e2215d129527913955195b5e5f6c26ee03929d4452fda075",
+      "task": "06-lookup"
+    },
+    {
+      "agent_access": "not_yet_run",
+      "arm": "misleading",
+      "brief": "sha256:62afd4f448781b25c49676fde76126fbcd318196c2e9a653c06d5e4f57ffe627",
+      "cache_key": "sha256:8ca9af843e4a6fa4948bda38f5a85a614c651e3ceaa25ab1a838d8fd5ead4fb2",
+      "context_record": "sha256:5db35718caf341146b58c56ee8df5013589ed33eff8fa54d5b5ce06a2332541d",
+      "context_sha256": "3e28bed3fc297b79772d6276b5c1a2deb689943ad9a1f4148b271f806ac8502a",
+      "contribution": "sha256:f64f0b930becd7fc5c708f8dab64937fdb2601ee297a4a5545341d50297cbd24",
+      "coverage": "partial",
+      "delivered": true,
+      "freshness": "exact",
+      "group": "sealed",
+      "public": "/private/tmp/aethyme-fx08-contexts-20261012-exact-brief/06-lookup-misleading/public",
+      "source": "sha256:50f9760cd2f96e14e2215d129527913955195b5e5f6c26ee03929d4452fda075",
+      "task": "06-lookup"
+    }
+  ],
+  "retry_count_observed": null,
+  "rows": [
+    {
+      "agent_context_access": {
+        "completed_tool_items": [],
+        "established": false
+      },
+      "arm": "correct",
+      "delivered_context": {
+        "agent_access": "not_yet_run",
+        "arm": "correct",
+        "brief": "sha256:25425944eb338b8d62906262dd67e171b69cda346fde066f40f1da1f4b57a426",
+        "cache_key": "sha256:a1e522e44093bdb81bfeb897df088d2c261ac8adfd6c4499c6644be32c4d1d2d",
+        "context_record": "sha256:e87551362c276d1f6f3f39cceecc84d3f2d50230720150c8bf4c9c15f9e9826a",
+        "context_sha256": "fe5f60e55c138f1c48ce15413bfb99ebed2a077c45c4fe5a57e72c740a68d40f",
+        "contribution": "sha256:724a856dda2816ff20d79a950a8aa8f6117e3ca2d871a82c2c18491e951dc1e5",
+        "coverage": "partial",
+        "delivered": true,
+        "freshness": "exact",
+        "group": "declared",
+        "public": "/private/tmp/aethyme-fx08-contexts-20261012-exact-brief/01-optional-correct/public",
+        "source": "sha256:a4bfdde858d7d80d7c96a716639887da8b2a583768a19391f7f38c61a9334f83",
+        "task": "01-optional"
+      },
+      "group": "declared",
+      "model_process_wall_ms": 212,
+      "oracle_sha256": "54fdd15bdf077d84a2a0c3a9d7a025ed3ac7630e6f5572bc2045249e91835571",
+      "outcome": "model_process_failure",
+      "process": {
+        "exit": 1,
+        "observed_command_allowance": 8,
+        "observed_command_dispatches": 0,
+        "signal": null,
+        "state": "completed",
+        "stderr": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-00/codex.stderr",
+        "stdout": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-00/codex.stdout",
+        "wall_ms": 212
+      },
+      "provider_charge_microunits": null,
+      "provider_usage": {
+        "cache_write_input_tokens": null,
+        "cached_input_tokens": null,
+        "completed_command_tools": 0,
+        "input_tokens": null,
+        "output_tokens": null,
+        "provider_returned_model": null,
+        "turn_failures": 0
+      },
+      "public_inputs": [
+        {
+          "bytes": 524,
+          "file": "source.rs",
+          "sha256": "0d1c9bfb23fb6a38a78690d0a3489b7b81bbe4487d05d8961abd7ab3c6c475a0"
+        },
+        {
+          "bytes": 417,
+          "file": "task.md",
+          "sha256": "b0cd6a9cab075133385dd8120215add2c708f781c3a473fd866b95c165ce6969"
+        },
+        {
+          "bytes": 1731,
+          "file": "context.json",
+          "sha256": "fe5f60e55c138f1c48ce15413bfb99ebed2a077c45c4fe5a57e72c740a68d40f"
+        }
+      ],
+      "repeat": 0,
+      "root": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-00",
+      "state": "completed",
+      "task": "01-optional"
+    },
+    {
+      "agent_context_access": {
+        "completed_tool_items": [],
+        "established": false
+      },
+      "arm": "absent",
+      "delivered_context": {
+        "agent_access": "not_yet_run",
+        "arm": "absent",
+        "brief": null,
+        "cache_key": "sha256:7039c1dad94d64f797210772e663a37d3e9159f8d668ee76f5836c6ebb60e444",
+        "context_record": "sha256:a4655f28e217dbef1f94368edddbe50d5927f7c9d7d8bfe5ef6f27856391e799",
+        "context_sha256": "5e963db6fa14640def8431946b64e3027b193b2a56400a8f7e60ad22c07b2710",
+        "contribution": "sha256:724a856dda2816ff20d79a950a8aa8f6117e3ca2d871a82c2c18491e951dc1e5",
+        "coverage": "partial",
+        "delivered": true,
+        "freshness": "exact",
+        "group": "declared",
+        "public": "/private/tmp/aethyme-fx08-contexts-20261012-exact-brief/01-optional-absent/public",
+        "source": "sha256:a4bfdde858d7d80d7c96a716639887da8b2a583768a19391f7f38c61a9334f83",
+        "task": "01-optional"
+      },
+      "group": "declared",
+      "model_process_wall_ms": 52,
+      "oracle_sha256": "54fdd15bdf077d84a2a0c3a9d7a025ed3ac7630e6f5572bc2045249e91835571",
+      "outcome": "model_process_failure",
+      "process": {
+        "exit": 1,
+        "observed_command_allowance": 8,
+        "observed_command_dispatches": 0,
+        "signal": null,
+        "state": "completed",
+        "stderr": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-01/codex.stderr",
+        "stdout": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-01/codex.stdout",
+        "wall_ms": 52
+      },
+      "provider_charge_microunits": null,
+      "provider_usage": {
+        "cache_write_input_tokens": null,
+        "cached_input_tokens": null,
+        "completed_command_tools": 0,
+        "input_tokens": null,
+        "output_tokens": null,
+        "provider_returned_model": null,
+        "turn_failures": 0
+      },
+      "public_inputs": [
+        {
+          "bytes": 524,
+          "file": "source.rs",
+          "sha256": "0d1c9bfb23fb6a38a78690d0a3489b7b81bbe4487d05d8961abd7ab3c6c475a0"
+        },
+        {
+          "bytes": 417,
+          "file": "task.md",
+          "sha256": "b0cd6a9cab075133385dd8120215add2c708f781c3a473fd866b95c165ce6969"
+        },
+        {
+          "bytes": 1196,
+          "file": "context.json",
+          "sha256": "5e963db6fa14640def8431946b64e3027b193b2a56400a8f7e60ad22c07b2710"
+        }
+      ],
+      "repeat": 0,
+      "root": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-01",
+      "state": "completed",
+      "task": "01-optional"
+    },
+    {
+      "agent_context_access": {
+        "completed_tool_items": [],
+        "established": false
+      },
+      "arm": "incomplete",
+      "delivered_context": {
+        "agent_access": "not_yet_run",
+        "arm": "incomplete",
+        "brief": "sha256:8e9d25603a93a8fac8fde3e05075a3839a9e5573b190dc8bfad90248d0251d64",
+        "cache_key": "sha256:bccdae44c7cf8155c8ade58f4cf4acd9add06bc5ce0564c1717a7f50349d5a11",
+        "context_record": "sha256:d35342b0a7e32d59c925fa0a4b093ea40e961afbe3ebbcb5eb62d5c5686ed0ef",
+        "context_sha256": "fb5e74a6e6fddbeeede56b01aa5e70201bd70154b81ee88a17af38dd234a5382",
+        "contribution": "sha256:724a856dda2816ff20d79a950a8aa8f6117e3ca2d871a82c2c18491e951dc1e5",
+        "coverage": "partial",
+        "delivered": true,
+        "freshness": "exact",
+        "group": "declared",
+        "public": "/private/tmp/aethyme-fx08-contexts-20261012-exact-brief/01-optional-incomplete/public",
+        "source": "sha256:a4bfdde858d7d80d7c96a716639887da8b2a583768a19391f7f38c61a9334f83",
+        "task": "01-optional"
+      },
+      "group": "declared",
+      "model_process_wall_ms": 54,
+      "oracle_sha256": "54fdd15bdf077d84a2a0c3a9d7a025ed3ac7630e6f5572bc2045249e91835571",
+      "outcome": "model_process_failure",
+      "process": {
+        "exit": 1,
+        "observed_command_allowance": 8,
+        "observed_command_dispatches": 0,
+        "signal": null,
+        "state": "completed",
+        "stderr": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-02/codex.stderr",
+        "stdout": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-02/codex.stdout",
+        "wall_ms": 54
+      },
+      "provider_charge_microunits": null,
+      "provider_usage": {
+        "cache_write_input_tokens": null,
+        "cached_input_tokens": null,
+        "completed_command_tools": 0,
+        "input_tokens": null,
+        "output_tokens": null,
+        "provider_returned_model": null,
+        "turn_failures": 0
+      },
+      "public_inputs": [
+        {
+          "bytes": 524,
+          "file": "source.rs",
+          "sha256": "0d1c9bfb23fb6a38a78690d0a3489b7b81bbe4487d05d8961abd7ab3c6c475a0"
+        },
+        {
+          "bytes": 417,
+          "file": "task.md",
+          "sha256": "b0cd6a9cab075133385dd8120215add2c708f781c3a473fd866b95c165ce6969"
+        },
+        {
+          "bytes": 1724,
+          "file": "context.json",
+          "sha256": "fb5e74a6e6fddbeeede56b01aa5e70201bd70154b81ee88a17af38dd234a5382"
+        }
+      ],
+      "repeat": 0,
+      "root": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-02",
+      "state": "completed",
+      "task": "01-optional"
+    },
+    {
+      "agent_context_access": {
+        "completed_tool_items": [],
+        "established": false
+      },
+      "arm": "misleading",
+      "delivered_context": {
+        "agent_access": "not_yet_run",
+        "arm": "misleading",
+        "brief": "sha256:ae44215cd07340f51d74fc3aa254666576db1d598cc57849324a7d3c8d4d7045",
+        "cache_key": "sha256:7e7e600f76c549447d6f825b02c87ba6ea6641a1e37410adc0b25854c08116da",
+        "context_record": "sha256:d6b5dabfd7199d896192139d2a793c1e88a8f6388672dd15de11656286359db0",
+        "context_sha256": "c57a22f8ccafdfaf294b6eed34c00bc08a379969890268a603f740efddb5470f",
+        "contribution": "sha256:724a856dda2816ff20d79a950a8aa8f6117e3ca2d871a82c2c18491e951dc1e5",
+        "coverage": "partial",
+        "delivered": true,
+        "freshness": "exact",
+        "group": "declared",
+        "public": "/private/tmp/aethyme-fx08-contexts-20261012-exact-brief/01-optional-misleading/public",
+        "source": "sha256:a4bfdde858d7d80d7c96a716639887da8b2a583768a19391f7f38c61a9334f83",
+        "task": "01-optional"
+      },
+      "group": "declared",
+      "model_process_wall_ms": 47,
+      "oracle_sha256": "54fdd15bdf077d84a2a0c3a9d7a025ed3ac7630e6f5572bc2045249e91835571",
+      "outcome": "model_process_failure",
+      "process": {
+        "exit": 1,
+        "observed_command_allowance": 8,
+        "observed_command_dispatches": 0,
+        "signal": null,
+        "state": "completed",
+        "stderr": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-03/codex.stderr",
+        "stdout": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-03/codex.stdout",
+        "wall_ms": 47
+      },
+      "provider_charge_microunits": null,
+      "provider_usage": {
+        "cache_write_input_tokens": null,
+        "cached_input_tokens": null,
+        "completed_command_tools": 0,
+        "input_tokens": null,
+        "output_tokens": null,
+        "provider_returned_model": null,
+        "turn_failures": 0
+      },
+      "public_inputs": [
+        {
+          "bytes": 524,
+          "file": "source.rs",
+          "sha256": "0d1c9bfb23fb6a38a78690d0a3489b7b81bbe4487d05d8961abd7ab3c6c475a0"
+        },
+        {
+          "bytes": 417,
+          "file": "task.md",
+          "sha256": "b0cd6a9cab075133385dd8120215add2c708f781c3a473fd866b95c165ce6969"
+        },
+        {
+          "bytes": 1735,
+          "file": "context.json",
+          "sha256": "c57a22f8ccafdfaf294b6eed34c00bc08a379969890268a603f740efddb5470f"
+        }
+      ],
+      "repeat": 0,
+      "root": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-03",
+      "state": "completed",
+      "task": "01-optional"
+    },
+    {
+      "agent_context_access": {
+        "completed_tool_items": [],
+        "established": false
+      },
+      "arm": "correct",
+      "delivered_context": {
+        "agent_access": "not_yet_run",
+        "arm": "correct",
+        "brief": "sha256:25425944eb338b8d62906262dd67e171b69cda346fde066f40f1da1f4b57a426",
+        "cache_key": "sha256:a1e522e44093bdb81bfeb897df088d2c261ac8adfd6c4499c6644be32c4d1d2d",
+        "context_record": "sha256:e87551362c276d1f6f3f39cceecc84d3f2d50230720150c8bf4c9c15f9e9826a",
+        "context_sha256": "fe5f60e55c138f1c48ce15413bfb99ebed2a077c45c4fe5a57e72c740a68d40f",
+        "contribution": "sha256:724a856dda2816ff20d79a950a8aa8f6117e3ca2d871a82c2c18491e951dc1e5",
+        "coverage": "partial",
+        "delivered": true,
+        "freshness": "exact",
+        "group": "declared",
+        "public": "/private/tmp/aethyme-fx08-contexts-20261012-exact-brief/01-optional-correct/public",
+        "source": "sha256:a4bfdde858d7d80d7c96a716639887da8b2a583768a19391f7f38c61a9334f83",
+        "task": "01-optional"
+      },
+      "group": "declared",
+      "model_process_wall_ms": 41,
+      "oracle_sha256": "54fdd15bdf077d84a2a0c3a9d7a025ed3ac7630e6f5572bc2045249e91835571",
+      "outcome": "model_process_failure",
+      "process": {
+        "exit": 1,
+        "observed_command_allowance": 8,
+        "observed_command_dispatches": 0,
+        "signal": null,
+        "state": "completed",
+        "stderr": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-04/codex.stderr",
+        "stdout": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-04/codex.stdout",
+        "wall_ms": 41
+      },
+      "provider_charge_microunits": null,
+      "provider_usage": {
+        "cache_write_input_tokens": null,
+        "cached_input_tokens": null,
+        "completed_command_tools": 0,
+        "input_tokens": null,
+        "output_tokens": null,
+        "provider_returned_model": null,
+        "turn_failures": 0
+      },
+      "public_inputs": [
+        {
+          "bytes": 524,
+          "file": "source.rs",
+          "sha256": "0d1c9bfb23fb6a38a78690d0a3489b7b81bbe4487d05d8961abd7ab3c6c475a0"
+        },
+        {
+          "bytes": 417,
+          "file": "task.md",
+          "sha256": "b0cd6a9cab075133385dd8120215add2c708f781c3a473fd866b95c165ce6969"
+        },
+        {
+          "bytes": 1731,
+          "file": "context.json",
+          "sha256": "fe5f60e55c138f1c48ce15413bfb99ebed2a077c45c4fe5a57e72c740a68d40f"
+        }
+      ],
+      "repeat": 1,
+      "root": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-04",
+      "state": "completed",
+      "task": "01-optional"
+    },
+    {
+      "agent_context_access": {
+        "completed_tool_items": [],
+        "established": false
+      },
+      "arm": "absent",
+      "delivered_context": {
+        "agent_access": "not_yet_run",
+        "arm": "absent",
+        "brief": null,
+        "cache_key": "sha256:7039c1dad94d64f797210772e663a37d3e9159f8d668ee76f5836c6ebb60e444",
+        "context_record": "sha256:a4655f28e217dbef1f94368edddbe50d5927f7c9d7d8bfe5ef6f27856391e799",
+        "context_sha256": "5e963db6fa14640def8431946b64e3027b193b2a56400a8f7e60ad22c07b2710",
+        "contribution": "sha256:724a856dda2816ff20d79a950a8aa8f6117e3ca2d871a82c2c18491e951dc1e5",
+        "coverage": "partial",
+        "delivered": true,
+        "freshness": "exact",
+        "group": "declared",
+        "public": "/private/tmp/aethyme-fx08-contexts-20261012-exact-brief/01-optional-absent/public",
+        "source": "sha256:a4bfdde858d7d80d7c96a716639887da8b2a583768a19391f7f38c61a9334f83",
+        "task": "01-optional"
+      },
+      "group": "declared",
+      "model_process_wall_ms": 60,
+      "oracle_sha256": "54fdd15bdf077d84a2a0c3a9d7a025ed3ac7630e6f5572bc2045249e91835571",
+      "outcome": "model_process_failure",
+      "process": {
+        "exit": 1,
+        "observed_command_allowance": 8,
+        "observed_command_dispatches": 0,
+        "signal": null,
+        "state": "completed",
+        "stderr": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-05/codex.stderr",
+        "stdout": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-05/codex.stdout",
+        "wall_ms": 60
+      },
+      "provider_charge_microunits": null,
+      "provider_usage": {
+        "cache_write_input_tokens": null,
+        "cached_input_tokens": null,
+        "completed_command_tools": 0,
+        "input_tokens": null,
+        "output_tokens": null,
+        "provider_returned_model": null,
+        "turn_failures": 0
+      },
+      "public_inputs": [
+        {
+          "bytes": 524,
+          "file": "source.rs",
+          "sha256": "0d1c9bfb23fb6a38a78690d0a3489b7b81bbe4487d05d8961abd7ab3c6c475a0"
+        },
+        {
+          "bytes": 417,
+          "file": "task.md",
+          "sha256": "b0cd6a9cab075133385dd8120215add2c708f781c3a473fd866b95c165ce6969"
+        },
+        {
+          "bytes": 1196,
+          "file": "context.json",
+          "sha256": "5e963db6fa14640def8431946b64e3027b193b2a56400a8f7e60ad22c07b2710"
+        }
+      ],
+      "repeat": 1,
+      "root": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-05",
+      "state": "completed",
+      "task": "01-optional"
+    },
+    {
+      "agent_context_access": {
+        "completed_tool_items": [],
+        "established": false
+      },
+      "arm": "incomplete",
+      "delivered_context": {
+        "agent_access": "not_yet_run",
+        "arm": "incomplete",
+        "brief": "sha256:8e9d25603a93a8fac8fde3e05075a3839a9e5573b190dc8bfad90248d0251d64",
+        "cache_key": "sha256:bccdae44c7cf8155c8ade58f4cf4acd9add06bc5ce0564c1717a7f50349d5a11",
+        "context_record": "sha256:d35342b0a7e32d59c925fa0a4b093ea40e961afbe3ebbcb5eb62d5c5686ed0ef",
+        "context_sha256": "fb5e74a6e6fddbeeede56b01aa5e70201bd70154b81ee88a17af38dd234a5382",
+        "contribution": "sha256:724a856dda2816ff20d79a950a8aa8f6117e3ca2d871a82c2c18491e951dc1e5",
+        "coverage": "partial",
+        "delivered": true,
+        "freshness": "exact",
+        "group": "declared",
+        "public": "/private/tmp/aethyme-fx08-contexts-20261012-exact-brief/01-optional-incomplete/public",
+        "source": "sha256:a4bfdde858d7d80d7c96a716639887da8b2a583768a19391f7f38c61a9334f83",
+        "task": "01-optional"
+      },
+      "group": "declared",
+      "model_process_wall_ms": 220,
+      "oracle_sha256": "54fdd15bdf077d84a2a0c3a9d7a025ed3ac7630e6f5572bc2045249e91835571",
+      "outcome": "model_process_failure",
+      "process": {
+        "exit": 1,
+        "observed_command_allowance": 8,
+        "observed_command_dispatches": 0,
+        "signal": null,
+        "state": "completed",
+        "stderr": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-06/codex.stderr",
+        "stdout": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-06/codex.stdout",
+        "wall_ms": 220
+      },
+      "provider_charge_microunits": null,
+      "provider_usage": {
+        "cache_write_input_tokens": null,
+        "cached_input_tokens": null,
+        "completed_command_tools": 0,
+        "input_tokens": null,
+        "output_tokens": null,
+        "provider_returned_model": null,
+        "turn_failures": 0
+      },
+      "public_inputs": [
+        {
+          "bytes": 524,
+          "file": "source.rs",
+          "sha256": "0d1c9bfb23fb6a38a78690d0a3489b7b81bbe4487d05d8961abd7ab3c6c475a0"
+        },
+        {
+          "bytes": 417,
+          "file": "task.md",
+          "sha256": "b0cd6a9cab075133385dd8120215add2c708f781c3a473fd866b95c165ce6969"
+        },
+        {
+          "bytes": 1724,
+          "file": "context.json",
+          "sha256": "fb5e74a6e6fddbeeede56b01aa5e70201bd70154b81ee88a17af38dd234a5382"
+        }
+      ],
+      "repeat": 1,
+      "root": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-06",
+      "state": "completed",
+      "task": "01-optional"
+    },
+    {
+      "agent_context_access": {
+        "completed_tool_items": [],
+        "established": false
+      },
+      "arm": "misleading",
+      "delivered_context": {
+        "agent_access": "not_yet_run",
+        "arm": "misleading",
+        "brief": "sha256:ae44215cd07340f51d74fc3aa254666576db1d598cc57849324a7d3c8d4d7045",
+        "cache_key": "sha256:7e7e600f76c549447d6f825b02c87ba6ea6641a1e37410adc0b25854c08116da",
+        "context_record": "sha256:d6b5dabfd7199d896192139d2a793c1e88a8f6388672dd15de11656286359db0",
+        "context_sha256": "c57a22f8ccafdfaf294b6eed34c00bc08a379969890268a603f740efddb5470f",
+        "contribution": "sha256:724a856dda2816ff20d79a950a8aa8f6117e3ca2d871a82c2c18491e951dc1e5",
+        "coverage": "partial",
+        "delivered": true,
+        "freshness": "exact",
+        "group": "declared",
+        "public": "/private/tmp/aethyme-fx08-contexts-20261012-exact-brief/01-optional-misleading/public",
+        "source": "sha256:a4bfdde858d7d80d7c96a716639887da8b2a583768a19391f7f38c61a9334f83",
+        "task": "01-optional"
+      },
+      "group": "declared",
+      "model_process_wall_ms": 30,
+      "oracle_sha256": "54fdd15bdf077d84a2a0c3a9d7a025ed3ac7630e6f5572bc2045249e91835571",
+      "outcome": "model_process_failure",
+      "process": {
+        "exit": 1,
+        "observed_command_allowance": 8,
+        "observed_command_dispatches": 0,
+        "signal": null,
+        "state": "completed",
+        "stderr": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-07/codex.stderr",
+        "stdout": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-07/codex.stdout",
+        "wall_ms": 30
+      },
+      "provider_charge_microunits": null,
+      "provider_usage": {
+        "cache_write_input_tokens": null,
+        "cached_input_tokens": null,
+        "completed_command_tools": 0,
+        "input_tokens": null,
+        "output_tokens": null,
+        "provider_returned_model": null,
+        "turn_failures": 0
+      },
+      "public_inputs": [
+        {
+          "bytes": 524,
+          "file": "source.rs",
+          "sha256": "0d1c9bfb23fb6a38a78690d0a3489b7b81bbe4487d05d8961abd7ab3c6c475a0"
+        },
+        {
+          "bytes": 417,
+          "file": "task.md",
+          "sha256": "b0cd6a9cab075133385dd8120215add2c708f781c3a473fd866b95c165ce6969"
+        },
+        {
+          "bytes": 1735,
+          "file": "context.json",
+          "sha256": "c57a22f8ccafdfaf294b6eed34c00bc08a379969890268a603f740efddb5470f"
+        }
+      ],
+      "repeat": 1,
+      "root": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-07",
+      "state": "completed",
+      "task": "01-optional"
+    },
+    {
+      "agent_context_access": {
+        "completed_tool_items": [],
+        "established": false
+      },
+      "arm": "correct",
+      "delivered_context": {
+        "agent_access": "not_yet_run",
+        "arm": "correct",
+        "brief": "sha256:25425944eb338b8d62906262dd67e171b69cda346fde066f40f1da1f4b57a426",
+        "cache_key": "sha256:a1e522e44093bdb81bfeb897df088d2c261ac8adfd6c4499c6644be32c4d1d2d",
+        "context_record": "sha256:e87551362c276d1f6f3f39cceecc84d3f2d50230720150c8bf4c9c15f9e9826a",
+        "context_sha256": "fe5f60e55c138f1c48ce15413bfb99ebed2a077c45c4fe5a57e72c740a68d40f",
+        "contribution": "sha256:724a856dda2816ff20d79a950a8aa8f6117e3ca2d871a82c2c18491e951dc1e5",
+        "coverage": "partial",
+        "delivered": true,
+        "freshness": "exact",
+        "group": "declared",
+        "public": "/private/tmp/aethyme-fx08-contexts-20261012-exact-brief/01-optional-correct/public",
+        "source": "sha256:a4bfdde858d7d80d7c96a716639887da8b2a583768a19391f7f38c61a9334f83",
+        "task": "01-optional"
+      },
+      "group": "declared",
+      "model_process_wall_ms": 65,
+      "oracle_sha256": "54fdd15bdf077d84a2a0c3a9d7a025ed3ac7630e6f5572bc2045249e91835571",
+      "outcome": "model_process_failure",
+      "process": {
+        "exit": 1,
+        "observed_command_allowance": 8,
+        "observed_command_dispatches": 0,
+        "signal": null,
+        "state": "completed",
+        "stderr": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-08/codex.stderr",
+        "stdout": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-08/codex.stdout",
+        "wall_ms": 65
+      },
+      "provider_charge_microunits": null,
+      "provider_usage": {
+        "cache_write_input_tokens": null,
+        "cached_input_tokens": null,
+        "completed_command_tools": 0,
+        "input_tokens": null,
+        "output_tokens": null,
+        "provider_returned_model": null,
+        "turn_failures": 0
+      },
+      "public_inputs": [
+        {
+          "bytes": 524,
+          "file": "source.rs",
+          "sha256": "0d1c9bfb23fb6a38a78690d0a3489b7b81bbe4487d05d8961abd7ab3c6c475a0"
+        },
+        {
+          "bytes": 417,
+          "file": "task.md",
+          "sha256": "b0cd6a9cab075133385dd8120215add2c708f781c3a473fd866b95c165ce6969"
+        },
+        {
+          "bytes": 1731,
+          "file": "context.json",
+          "sha256": "fe5f60e55c138f1c48ce15413bfb99ebed2a077c45c4fe5a57e72c740a68d40f"
+        }
+      ],
+      "repeat": 2,
+      "root": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-08",
+      "state": "completed",
+      "task": "01-optional"
+    },
+    {
+      "agent_context_access": {
+        "completed_tool_items": [],
+        "established": false
+      },
+      "arm": "absent",
+      "delivered_context": {
+        "agent_access": "not_yet_run",
+        "arm": "absent",
+        "brief": null,
+        "cache_key": "sha256:7039c1dad94d64f797210772e663a37d3e9159f8d668ee76f5836c6ebb60e444",
+        "context_record": "sha256:a4655f28e217dbef1f94368edddbe50d5927f7c9d7d8bfe5ef6f27856391e799",
+        "context_sha256": "5e963db6fa14640def8431946b64e3027b193b2a56400a8f7e60ad22c07b2710",
+        "contribution": "sha256:724a856dda2816ff20d79a950a8aa8f6117e3ca2d871a82c2c18491e951dc1e5",
+        "coverage": "partial",
+        "delivered": true,
+        "freshness": "exact",
+        "group": "declared",
+        "public": "/private/tmp/aethyme-fx08-contexts-20261012-exact-brief/01-optional-absent/public",
+        "source": "sha256:a4bfdde858d7d80d7c96a716639887da8b2a583768a19391f7f38c61a9334f83",
+        "task": "01-optional"
+      },
+      "group": "declared",
+      "model_process_wall_ms": 232,
+      "oracle_sha256": "54fdd15bdf077d84a2a0c3a9d7a025ed3ac7630e6f5572bc2045249e91835571",
+      "outcome": "model_process_failure",
+      "process": {
+        "exit": 1,
+        "observed_command_allowance": 8,
+        "observed_command_dispatches": 0,
+        "signal": null,
+        "state": "completed",
+        "stderr": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-09/codex.stderr",
+        "stdout": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-09/codex.stdout",
+        "wall_ms": 232
+      },
+      "provider_charge_microunits": null,
+      "provider_usage": {
+        "cache_write_input_tokens": null,
+        "cached_input_tokens": null,
+        "completed_command_tools": 0,
+        "input_tokens": null,
+        "output_tokens": null,
+        "provider_returned_model": null,
+        "turn_failures": 0
+      },
+      "public_inputs": [
+        {
+          "bytes": 524,
+          "file": "source.rs",
+          "sha256": "0d1c9bfb23fb6a38a78690d0a3489b7b81bbe4487d05d8961abd7ab3c6c475a0"
+        },
+        {
+          "bytes": 417,
+          "file": "task.md",
+          "sha256": "b0cd6a9cab075133385dd8120215add2c708f781c3a473fd866b95c165ce6969"
+        },
+        {
+          "bytes": 1196,
+          "file": "context.json",
+          "sha256": "5e963db6fa14640def8431946b64e3027b193b2a56400a8f7e60ad22c07b2710"
+        }
+      ],
+      "repeat": 2,
+      "root": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-09",
+      "state": "completed",
+      "task": "01-optional"
+    },
+    {
+      "agent_context_access": {
+        "completed_tool_items": [],
+        "established": false
+      },
+      "arm": "incomplete",
+      "delivered_context": {
+        "agent_access": "not_yet_run",
+        "arm": "incomplete",
+        "brief": "sha256:8e9d25603a93a8fac8fde3e05075a3839a9e5573b190dc8bfad90248d0251d64",
+        "cache_key": "sha256:bccdae44c7cf8155c8ade58f4cf4acd9add06bc5ce0564c1717a7f50349d5a11",
+        "context_record": "sha256:d35342b0a7e32d59c925fa0a4b093ea40e961afbe3ebbcb5eb62d5c5686ed0ef",
+        "context_sha256": "fb5e74a6e6fddbeeede56b01aa5e70201bd70154b81ee88a17af38dd234a5382",
+        "contribution": "sha256:724a856dda2816ff20d79a950a8aa8f6117e3ca2d871a82c2c18491e951dc1e5",
+        "coverage": "partial",
+        "delivered": true,
+        "freshness": "exact",
+        "group": "declared",
+        "public": "/private/tmp/aethyme-fx08-contexts-20261012-exact-brief/01-optional-incomplete/public",
+        "source": "sha256:a4bfdde858d7d80d7c96a716639887da8b2a583768a19391f7f38c61a9334f83",
+        "task": "01-optional"
+      },
+      "group": "declared",
+      "model_process_wall_ms": 79,
+      "oracle_sha256": "54fdd15bdf077d84a2a0c3a9d7a025ed3ac7630e6f5572bc2045249e91835571",
+      "outcome": "model_process_failure",
+      "process": {
+        "exit": 1,
+        "observed_command_allowance": 8,
+        "observed_command_dispatches": 0,
+        "signal": null,
+        "state": "completed",
+        "stderr": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-10/codex.stderr",
+        "stdout": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-10/codex.stdout",
+        "wall_ms": 79
+      },
+      "provider_charge_microunits": null,
+      "provider_usage": {
+        "cache_write_input_tokens": null,
+        "cached_input_tokens": null,
+        "completed_command_tools": 0,
+        "input_tokens": null,
+        "output_tokens": null,
+        "provider_returned_model": null,
+        "turn_failures": 0
+      },
+      "public_inputs": [
+        {
+          "bytes": 524,
+          "file": "source.rs",
+          "sha256": "0d1c9bfb23fb6a38a78690d0a3489b7b81bbe4487d05d8961abd7ab3c6c475a0"
+        },
+        {
+          "bytes": 417,
+          "file": "task.md",
+          "sha256": "b0cd6a9cab075133385dd8120215add2c708f781c3a473fd866b95c165ce6969"
+        },
+        {
+          "bytes": 1724,
+          "file": "context.json",
+          "sha256": "fb5e74a6e6fddbeeede56b01aa5e70201bd70154b81ee88a17af38dd234a5382"
+        }
+      ],
+      "repeat": 2,
+      "root": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-10",
+      "state": "completed",
+      "task": "01-optional"
+    },
+    {
+      "agent_context_access": {
+        "completed_tool_items": [],
+        "established": false
+      },
+      "arm": "misleading",
+      "delivered_context": {
+        "agent_access": "not_yet_run",
+        "arm": "misleading",
+        "brief": "sha256:ae44215cd07340f51d74fc3aa254666576db1d598cc57849324a7d3c8d4d7045",
+        "cache_key": "sha256:7e7e600f76c549447d6f825b02c87ba6ea6641a1e37410adc0b25854c08116da",
+        "context_record": "sha256:d6b5dabfd7199d896192139d2a793c1e88a8f6388672dd15de11656286359db0",
+        "context_sha256": "c57a22f8ccafdfaf294b6eed34c00bc08a379969890268a603f740efddb5470f",
+        "contribution": "sha256:724a856dda2816ff20d79a950a8aa8f6117e3ca2d871a82c2c18491e951dc1e5",
+        "coverage": "partial",
+        "delivered": true,
+        "freshness": "exact",
+        "group": "declared",
+        "public": "/private/tmp/aethyme-fx08-contexts-20261012-exact-brief/01-optional-misleading/public",
+        "source": "sha256:a4bfdde858d7d80d7c96a716639887da8b2a583768a19391f7f38c61a9334f83",
+        "task": "01-optional"
+      },
+      "group": "declared",
+      "model_process_wall_ms": 49,
+      "oracle_sha256": "54fdd15bdf077d84a2a0c3a9d7a025ed3ac7630e6f5572bc2045249e91835571",
+      "outcome": "model_process_failure",
+      "process": {
+        "exit": 1,
+        "observed_command_allowance": 8,
+        "observed_command_dispatches": 0,
+        "signal": null,
+        "state": "completed",
+        "stderr": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-11/codex.stderr",
+        "stdout": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-11/codex.stdout",
+        "wall_ms": 49
+      },
+      "provider_charge_microunits": null,
+      "provider_usage": {
+        "cache_write_input_tokens": null,
+        "cached_input_tokens": null,
+        "completed_command_tools": 0,
+        "input_tokens": null,
+        "output_tokens": null,
+        "provider_returned_model": null,
+        "turn_failures": 0
+      },
+      "public_inputs": [
+        {
+          "bytes": 524,
+          "file": "source.rs",
+          "sha256": "0d1c9bfb23fb6a38a78690d0a3489b7b81bbe4487d05d8961abd7ab3c6c475a0"
+        },
+        {
+          "bytes": 417,
+          "file": "task.md",
+          "sha256": "b0cd6a9cab075133385dd8120215add2c708f781c3a473fd866b95c165ce6969"
+        },
+        {
+          "bytes": 1735,
+          "file": "context.json",
+          "sha256": "c57a22f8ccafdfaf294b6eed34c00bc08a379969890268a603f740efddb5470f"
+        }
+      ],
+      "repeat": 2,
+      "root": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-11",
+      "state": "completed",
+      "task": "01-optional"
+    },
+    {
+      "agent_context_access": {
+        "completed_tool_items": [],
+        "established": false
+      },
+      "arm": "correct",
+      "delivered_context": {
+        "agent_access": "not_yet_run",
+        "arm": "correct",
+        "brief": "sha256:9b49762244eaca96c2d974f9c932bad818f365f214a5540c92fa7af004ab1144",
+        "cache_key": "sha256:0485f9c6db7a02d62481dd66f070ad509e668544c3f6ebafaa16954af6aadee1",
+        "context_record": "sha256:9848dd39d624353e610613b2a1f3b3c4d8f4673cda935f79286b5e17bd6ef580",
+        "context_sha256": "496c77d936527978cee076593b174be1ab8b4a54237e0276e1ef64d3f129ecd7",
+        "contribution": "sha256:78c7d79d34bc904b71f5a0149a23c83fd9a8032dfebad36acad91365c0f88dc1",
+        "coverage": "partial",
+        "delivered": true,
+        "freshness": "exact",
+        "group": "declared",
+        "public": "/private/tmp/aethyme-fx08-contexts-20261012-exact-brief/02-pagination-correct/public",
+        "source": "sha256:ee6e2662b6c41c0642fed182ac2d84bccaf3885e65899da5be02476d7839eecf",
+        "task": "02-pagination"
+      },
+      "group": "declared",
+      "model_process_wall_ms": 81,
+      "oracle_sha256": "234e5d5ec12e4d619ee7f61fece106ef874705934db02f9dbdd1d68b54995cd6",
+      "outcome": "model_process_failure",
+      "process": {
+        "exit": 1,
+        "observed_command_allowance": 8,
+        "observed_command_dispatches": 0,
+        "signal": null,
+        "state": "completed",
+        "stderr": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-12/codex.stderr",
+        "stdout": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-12/codex.stdout",
+        "wall_ms": 81
+      },
+      "provider_charge_microunits": null,
+      "provider_usage": {
+        "cache_write_input_tokens": null,
+        "cached_input_tokens": null,
+        "completed_command_tools": 0,
+        "input_tokens": null,
+        "output_tokens": null,
+        "provider_returned_model": null,
+        "turn_failures": 0
+      },
+      "public_inputs": [
+        {
+          "bytes": 501,
+          "file": "source.rs",
+          "sha256": "73004783de8aa1bf224859f55dff328dad85ac8c8920ae8b046aa81d92fd1bec"
+        },
+        {
+          "bytes": 311,
+          "file": "task.md",
+          "sha256": "e2c2363970e363d2b048a181f5b30ebd06a0c261a390b9326c3ad90f5b80bd31"
+        },
+        {
+          "bytes": 1744,
+          "file": "context.json",
+          "sha256": "496c77d936527978cee076593b174be1ab8b4a54237e0276e1ef64d3f129ecd7"
+        }
+      ],
+      "repeat": 0,
+      "root": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-12",
+      "state": "completed",
+      "task": "02-pagination"
+    },
+    {
+      "agent_context_access": {
+        "completed_tool_items": [],
+        "established": false
+      },
+      "arm": "absent",
+      "delivered_context": {
+        "agent_access": "not_yet_run",
+        "arm": "absent",
+        "brief": null,
+        "cache_key": "sha256:c205218df872ac5ceefb025faf7ad5de3a50e0f33dead6252db5145ea8252495",
+        "context_record": "sha256:3cd0b0f52626bf94993f00379113d8dfe8994b49a898d49f45eb7cf80d5da8f1",
+        "context_sha256": "3b5c133c8bbe1086ffef37f77c0bb7fd07997b9cc533d626bc452d5ac6b05e31",
+        "contribution": "sha256:78c7d79d34bc904b71f5a0149a23c83fd9a8032dfebad36acad91365c0f88dc1",
+        "coverage": "partial",
+        "delivered": true,
+        "freshness": "exact",
+        "group": "declared",
+        "public": "/private/tmp/aethyme-fx08-contexts-20261012-exact-brief/02-pagination-absent/public",
+        "source": "sha256:ee6e2662b6c41c0642fed182ac2d84bccaf3885e65899da5be02476d7839eecf",
+        "task": "02-pagination"
+      },
+      "group": "declared",
+      "model_process_wall_ms": 49,
+      "oracle_sha256": "234e5d5ec12e4d619ee7f61fece106ef874705934db02f9dbdd1d68b54995cd6",
+      "outcome": "model_process_failure",
+      "process": {
+        "exit": 1,
+        "observed_command_allowance": 8,
+        "observed_command_dispatches": 0,
+        "signal": null,
+        "state": "completed",
+        "stderr": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-13/codex.stderr",
+        "stdout": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-13/codex.stdout",
+        "wall_ms": 49
+      },
+      "provider_charge_microunits": null,
+      "provider_usage": {
+        "cache_write_input_tokens": null,
+        "cached_input_tokens": null,
+        "completed_command_tools": 0,
+        "input_tokens": null,
+        "output_tokens": null,
+        "provider_returned_model": null,
+        "turn_failures": 0
+      },
+      "public_inputs": [
+        {
+          "bytes": 501,
+          "file": "source.rs",
+          "sha256": "73004783de8aa1bf224859f55dff328dad85ac8c8920ae8b046aa81d92fd1bec"
+        },
+        {
+          "bytes": 311,
+          "file": "task.md",
+          "sha256": "e2c2363970e363d2b048a181f5b30ebd06a0c261a390b9326c3ad90f5b80bd31"
+        },
+        {
+          "bytes": 1196,
+          "file": "context.json",
+          "sha256": "3b5c133c8bbe1086ffef37f77c0bb7fd07997b9cc533d626bc452d5ac6b05e31"
+        }
+      ],
+      "repeat": 0,
+      "root": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-13",
+      "state": "completed",
+      "task": "02-pagination"
+    },
+    {
+      "agent_context_access": {
+        "completed_tool_items": [],
+        "established": false
+      },
+      "arm": "incomplete",
+      "delivered_context": {
+        "agent_access": "not_yet_run",
+        "arm": "incomplete",
+        "brief": "sha256:e50ace1a2ec67f7dc190c28a85199df750995447832264c44f4d305b6144cc88",
+        "cache_key": "sha256:52ddbd9e839ed826727a8d67dda90aedf240e3ba2786b6b054a2b7e868d902f2",
+        "context_record": "sha256:8f480c50b37f5be0afd7a5b9d96fe891cae2d4abec6687ebfd6ddada0e34ff98",
+        "context_sha256": "db5547c88d1478666016446d8d7071525c63116d7ede837e160d5b429a3b5575",
+        "contribution": "sha256:78c7d79d34bc904b71f5a0149a23c83fd9a8032dfebad36acad91365c0f88dc1",
+        "coverage": "partial",
+        "delivered": true,
+        "freshness": "exact",
+        "group": "declared",
+        "public": "/private/tmp/aethyme-fx08-contexts-20261012-exact-brief/02-pagination-incomplete/public",
+        "source": "sha256:ee6e2662b6c41c0642fed182ac2d84bccaf3885e65899da5be02476d7839eecf",
+        "task": "02-pagination"
+      },
+      "group": "declared",
+      "model_process_wall_ms": 51,
+      "oracle_sha256": "234e5d5ec12e4d619ee7f61fece106ef874705934db02f9dbdd1d68b54995cd6",
+      "outcome": "model_process_failure",
+      "process": {
+        "exit": 1,
+        "observed_command_allowance": 8,
+        "observed_command_dispatches": 0,
+        "signal": null,
+        "state": "completed",
+        "stderr": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-14/codex.stderr",
+        "stdout": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-14/codex.stdout",
+        "wall_ms": 51
+      },
+      "provider_charge_microunits": null,
+      "provider_usage": {
+        "cache_write_input_tokens": null,
+        "cached_input_tokens": null,
+        "completed_command_tools": 0,
+        "input_tokens": null,
+        "output_tokens": null,
+        "provider_returned_model": null,
+        "turn_failures": 0
+      },
+      "public_inputs": [
+        {
+          "bytes": 501,
+          "file": "source.rs",
+          "sha256": "73004783de8aa1bf224859f55dff328dad85ac8c8920ae8b046aa81d92fd1bec"
+        },
+        {
+          "bytes": 311,
+          "file": "task.md",
+          "sha256": "e2c2363970e363d2b048a181f5b30ebd06a0c261a390b9326c3ad90f5b80bd31"
+        },
+        {
+          "bytes": 1745,
+          "file": "context.json",
+          "sha256": "db5547c88d1478666016446d8d7071525c63116d7ede837e160d5b429a3b5575"
+        }
+      ],
+      "repeat": 0,
+      "root": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-14",
+      "state": "completed",
+      "task": "02-pagination"
+    },
+    {
+      "agent_context_access": {
+        "completed_tool_items": [],
+        "established": false
+      },
+      "arm": "misleading",
+      "delivered_context": {
+        "agent_access": "not_yet_run",
+        "arm": "misleading",
+        "brief": "sha256:149227ce5c5af2df538fda5a1e2054d41a2695dc0ac0749cdb50f431a3a8f5b5",
+        "cache_key": "sha256:fcd5eefae4d2c7095c15e7e19b985afb62c7ad310e405129dac0f2be3d7ee591",
+        "context_record": "sha256:17f880a399eecf473a33c7dcc0c38866f671c02ba26041ed876dc7fdb858b608",
+        "context_sha256": "d96efa4a79b4d48950fa6d24e4061519c2ce7f916c903453489e76e4d91fd077",
+        "contribution": "sha256:78c7d79d34bc904b71f5a0149a23c83fd9a8032dfebad36acad91365c0f88dc1",
+        "coverage": "partial",
+        "delivered": true,
+        "freshness": "exact",
+        "group": "declared",
+        "public": "/private/tmp/aethyme-fx08-contexts-20261012-exact-brief/02-pagination-misleading/public",
+        "source": "sha256:ee6e2662b6c41c0642fed182ac2d84bccaf3885e65899da5be02476d7839eecf",
+        "task": "02-pagination"
+      },
+      "group": "declared",
+      "model_process_wall_ms": 60,
+      "oracle_sha256": "234e5d5ec12e4d619ee7f61fece106ef874705934db02f9dbdd1d68b54995cd6",
+      "outcome": "model_process_failure",
+      "process": {
+        "exit": 1,
+        "observed_command_allowance": 8,
+        "observed_command_dispatches": 0,
+        "signal": null,
+        "state": "completed",
+        "stderr": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-15/codex.stderr",
+        "stdout": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-15/codex.stdout",
+        "wall_ms": 60
+      },
+      "provider_charge_microunits": null,
+      "provider_usage": {
+        "cache_write_input_tokens": null,
+        "cached_input_tokens": null,
+        "completed_command_tools": 0,
+        "input_tokens": null,
+        "output_tokens": null,
+        "provider_returned_model": null,
+        "turn_failures": 0
+      },
+      "public_inputs": [
+        {
+          "bytes": 501,
+          "file": "source.rs",
+          "sha256": "73004783de8aa1bf224859f55dff328dad85ac8c8920ae8b046aa81d92fd1bec"
+        },
+        {
+          "bytes": 311,
+          "file": "task.md",
+          "sha256": "e2c2363970e363d2b048a181f5b30ebd06a0c261a390b9326c3ad90f5b80bd31"
+        },
+        {
+          "bytes": 1746,
+          "file": "context.json",
+          "sha256": "d96efa4a79b4d48950fa6d24e4061519c2ce7f916c903453489e76e4d91fd077"
+        }
+      ],
+      "repeat": 0,
+      "root": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-15",
+      "state": "completed",
+      "task": "02-pagination"
+    },
+    {
+      "agent_context_access": {
+        "completed_tool_items": [],
+        "established": false
+      },
+      "arm": "correct",
+      "delivered_context": {
+        "agent_access": "not_yet_run",
+        "arm": "correct",
+        "brief": "sha256:9b49762244eaca96c2d974f9c932bad818f365f214a5540c92fa7af004ab1144",
+        "cache_key": "sha256:0485f9c6db7a02d62481dd66f070ad509e668544c3f6ebafaa16954af6aadee1",
+        "context_record": "sha256:9848dd39d624353e610613b2a1f3b3c4d8f4673cda935f79286b5e17bd6ef580",
+        "context_sha256": "496c77d936527978cee076593b174be1ab8b4a54237e0276e1ef64d3f129ecd7",
+        "contribution": "sha256:78c7d79d34bc904b71f5a0149a23c83fd9a8032dfebad36acad91365c0f88dc1",
+        "coverage": "partial",
+        "delivered": true,
+        "freshness": "exact",
+        "group": "declared",
+        "public": "/private/tmp/aethyme-fx08-contexts-20261012-exact-brief/02-pagination-correct/public",
+        "source": "sha256:ee6e2662b6c41c0642fed182ac2d84bccaf3885e65899da5be02476d7839eecf",
+        "task": "02-pagination"
+      },
+      "group": "declared",
+      "model_process_wall_ms": 76,
+      "oracle_sha256": "234e5d5ec12e4d619ee7f61fece106ef874705934db02f9dbdd1d68b54995cd6",
+      "outcome": "model_process_failure",
+      "process": {
+        "exit": 1,
+        "observed_command_allowance": 8,
+        "observed_command_dispatches": 0,
+        "signal": null,
+        "state": "completed",
+        "stderr": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-16/codex.stderr",
+        "stdout": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-16/codex.stdout",
+        "wall_ms": 76
+      },
+      "provider_charge_microunits": null,
+      "provider_usage": {
+        "cache_write_input_tokens": null,
+        "cached_input_tokens": null,
+        "completed_command_tools": 0,
+        "input_tokens": null,
+        "output_tokens": null,
+        "provider_returned_model": null,
+        "turn_failures": 0
+      },
+      "public_inputs": [
+        {
+          "bytes": 501,
+          "file": "source.rs",
+          "sha256": "73004783de8aa1bf224859f55dff328dad85ac8c8920ae8b046aa81d92fd1bec"
+        },
+        {
+          "bytes": 311,
+          "file": "task.md",
+          "sha256": "e2c2363970e363d2b048a181f5b30ebd06a0c261a390b9326c3ad90f5b80bd31"
+        },
+        {
+          "bytes": 1744,
+          "file": "context.json",
+          "sha256": "496c77d936527978cee076593b174be1ab8b4a54237e0276e1ef64d3f129ecd7"
+        }
+      ],
+      "repeat": 1,
+      "root": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-16",
+      "state": "completed",
+      "task": "02-pagination"
+    },
+    {
+      "agent_context_access": {
+        "completed_tool_items": [],
+        "established": false
+      },
+      "arm": "absent",
+      "delivered_context": {
+        "agent_access": "not_yet_run",
+        "arm": "absent",
+        "brief": null,
+        "cache_key": "sha256:c205218df872ac5ceefb025faf7ad5de3a50e0f33dead6252db5145ea8252495",
+        "context_record": "sha256:3cd0b0f52626bf94993f00379113d8dfe8994b49a898d49f45eb7cf80d5da8f1",
+        "context_sha256": "3b5c133c8bbe1086ffef37f77c0bb7fd07997b9cc533d626bc452d5ac6b05e31",
+        "contribution": "sha256:78c7d79d34bc904b71f5a0149a23c83fd9a8032dfebad36acad91365c0f88dc1",
+        "coverage": "partial",
+        "delivered": true,
+        "freshness": "exact",
+        "group": "declared",
+        "public": "/private/tmp/aethyme-fx08-contexts-20261012-exact-brief/02-pagination-absent/public",
+        "source": "sha256:ee6e2662b6c41c0642fed182ac2d84bccaf3885e65899da5be02476d7839eecf",
+        "task": "02-pagination"
+      },
+      "group": "declared",
+      "model_process_wall_ms": 86,
+      "oracle_sha256": "234e5d5ec12e4d619ee7f61fece106ef874705934db02f9dbdd1d68b54995cd6",
+      "outcome": "model_process_failure",
+      "process": {
+        "exit": 1,
+        "observed_command_allowance": 8,
+        "observed_command_dispatches": 0,
+        "signal": null,
+        "state": "completed",
+        "stderr": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-17/codex.stderr",
+        "stdout": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-17/codex.stdout",
+        "wall_ms": 86
+      },
+      "provider_charge_microunits": null,
+      "provider_usage": {
+        "cache_write_input_tokens": null,
+        "cached_input_tokens": null,
+        "completed_command_tools": 0,
+        "input_tokens": null,
+        "output_tokens": null,
+        "provider_returned_model": null,
+        "turn_failures": 0
+      },
+      "public_inputs": [
+        {
+          "bytes": 501,
+          "file": "source.rs",
+          "sha256": "73004783de8aa1bf224859f55dff328dad85ac8c8920ae8b046aa81d92fd1bec"
+        },
+        {
+          "bytes": 311,
+          "file": "task.md",
+          "sha256": "e2c2363970e363d2b048a181f5b30ebd06a0c261a390b9326c3ad90f5b80bd31"
+        },
+        {
+          "bytes": 1196,
+          "file": "context.json",
+          "sha256": "3b5c133c8bbe1086ffef37f77c0bb7fd07997b9cc533d626bc452d5ac6b05e31"
+        }
+      ],
+      "repeat": 1,
+      "root": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-17",
+      "state": "completed",
+      "task": "02-pagination"
+    },
+    {
+      "agent_context_access": {
+        "completed_tool_items": [],
+        "established": false
+      },
+      "arm": "incomplete",
+      "delivered_context": {
+        "agent_access": "not_yet_run",
+        "arm": "incomplete",
+        "brief": "sha256:e50ace1a2ec67f7dc190c28a85199df750995447832264c44f4d305b6144cc88",
+        "cache_key": "sha256:52ddbd9e839ed826727a8d67dda90aedf240e3ba2786b6b054a2b7e868d902f2",
+        "context_record": "sha256:8f480c50b37f5be0afd7a5b9d96fe891cae2d4abec6687ebfd6ddada0e34ff98",
+        "context_sha256": "db5547c88d1478666016446d8d7071525c63116d7ede837e160d5b429a3b5575",
+        "contribution": "sha256:78c7d79d34bc904b71f5a0149a23c83fd9a8032dfebad36acad91365c0f88dc1",
+        "coverage": "partial",
+        "delivered": true,
+        "freshness": "exact",
+        "group": "declared",
+        "public": "/private/tmp/aethyme-fx08-contexts-20261012-exact-brief/02-pagination-incomplete/public",
+        "source": "sha256:ee6e2662b6c41c0642fed182ac2d84bccaf3885e65899da5be02476d7839eecf",
+        "task": "02-pagination"
+      },
+      "group": "declared",
+      "model_process_wall_ms": 74,
+      "oracle_sha256": "234e5d5ec12e4d619ee7f61fece106ef874705934db02f9dbdd1d68b54995cd6",
+      "outcome": "model_process_failure",
+      "process": {
+        "exit": 1,
+        "observed_command_allowance": 8,
+        "observed_command_dispatches": 0,
+        "signal": null,
+        "state": "completed",
+        "stderr": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-18/codex.stderr",
+        "stdout": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-18/codex.stdout",
+        "wall_ms": 74
+      },
+      "provider_charge_microunits": null,
+      "provider_usage": {
+        "cache_write_input_tokens": null,
+        "cached_input_tokens": null,
+        "completed_command_tools": 0,
+        "input_tokens": null,
+        "output_tokens": null,
+        "provider_returned_model": null,
+        "turn_failures": 0
+      },
+      "public_inputs": [
+        {
+          "bytes": 501,
+          "file": "source.rs",
+          "sha256": "73004783de8aa1bf224859f55dff328dad85ac8c8920ae8b046aa81d92fd1bec"
+        },
+        {
+          "bytes": 311,
+          "file": "task.md",
+          "sha256": "e2c2363970e363d2b048a181f5b30ebd06a0c261a390b9326c3ad90f5b80bd31"
+        },
+        {
+          "bytes": 1745,
+          "file": "context.json",
+          "sha256": "db5547c88d1478666016446d8d7071525c63116d7ede837e160d5b429a3b5575"
+        }
+      ],
+      "repeat": 1,
+      "root": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-18",
+      "state": "completed",
+      "task": "02-pagination"
+    },
+    {
+      "agent_context_access": {
+        "completed_tool_items": [],
+        "established": false
+      },
+      "arm": "misleading",
+      "delivered_context": {
+        "agent_access": "not_yet_run",
+        "arm": "misleading",
+        "brief": "sha256:149227ce5c5af2df538fda5a1e2054d41a2695dc0ac0749cdb50f431a3a8f5b5",
+        "cache_key": "sha256:fcd5eefae4d2c7095c15e7e19b985afb62c7ad310e405129dac0f2be3d7ee591",
+        "context_record": "sha256:17f880a399eecf473a33c7dcc0c38866f671c02ba26041ed876dc7fdb858b608",
+        "context_sha256": "d96efa4a79b4d48950fa6d24e4061519c2ce7f916c903453489e76e4d91fd077",
+        "contribution": "sha256:78c7d79d34bc904b71f5a0149a23c83fd9a8032dfebad36acad91365c0f88dc1",
+        "coverage": "partial",
+        "delivered": true,
+        "freshness": "exact",
+        "group": "declared",
+        "public": "/private/tmp/aethyme-fx08-contexts-20261012-exact-brief/02-pagination-misleading/public",
+        "source": "sha256:ee6e2662b6c41c0642fed182ac2d84bccaf3885e65899da5be02476d7839eecf",
+        "task": "02-pagination"
+      },
+      "group": "declared",
+      "model_process_wall_ms": 59,
+      "oracle_sha256": "234e5d5ec12e4d619ee7f61fece106ef874705934db02f9dbdd1d68b54995cd6",
+      "outcome": "model_process_failure",
+      "process": {
+        "exit": 1,
+        "observed_command_allowance": 8,
+        "observed_command_dispatches": 0,
+        "signal": null,
+        "state": "completed",
+        "stderr": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-19/codex.stderr",
+        "stdout": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-19/codex.stdout",
+        "wall_ms": 59
+      },
+      "provider_charge_microunits": null,
+      "provider_usage": {
+        "cache_write_input_tokens": null,
+        "cached_input_tokens": null,
+        "completed_command_tools": 0,
+        "input_tokens": null,
+        "output_tokens": null,
+        "provider_returned_model": null,
+        "turn_failures": 0
+      },
+      "public_inputs": [
+        {
+          "bytes": 501,
+          "file": "source.rs",
+          "sha256": "73004783de8aa1bf224859f55dff328dad85ac8c8920ae8b046aa81d92fd1bec"
+        },
+        {
+          "bytes": 311,
+          "file": "task.md",
+          "sha256": "e2c2363970e363d2b048a181f5b30ebd06a0c261a390b9326c3ad90f5b80bd31"
+        },
+        {
+          "bytes": 1746,
+          "file": "context.json",
+          "sha256": "d96efa4a79b4d48950fa6d24e4061519c2ce7f916c903453489e76e4d91fd077"
+        }
+      ],
+      "repeat": 1,
+      "root": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-19",
+      "state": "completed",
+      "task": "02-pagination"
+    },
+    {
+      "agent_context_access": {
+        "completed_tool_items": [],
+        "established": false
+      },
+      "arm": "correct",
+      "delivered_context": {
+        "agent_access": "not_yet_run",
+        "arm": "correct",
+        "brief": "sha256:9b49762244eaca96c2d974f9c932bad818f365f214a5540c92fa7af004ab1144",
+        "cache_key": "sha256:0485f9c6db7a02d62481dd66f070ad509e668544c3f6ebafaa16954af6aadee1",
+        "context_record": "sha256:9848dd39d624353e610613b2a1f3b3c4d8f4673cda935f79286b5e17bd6ef580",
+        "context_sha256": "496c77d936527978cee076593b174be1ab8b4a54237e0276e1ef64d3f129ecd7",
+        "contribution": "sha256:78c7d79d34bc904b71f5a0149a23c83fd9a8032dfebad36acad91365c0f88dc1",
+        "coverage": "partial",
+        "delivered": true,
+        "freshness": "exact",
+        "group": "declared",
+        "public": "/private/tmp/aethyme-fx08-contexts-20261012-exact-brief/02-pagination-correct/public",
+        "source": "sha256:ee6e2662b6c41c0642fed182ac2d84bccaf3885e65899da5be02476d7839eecf",
+        "task": "02-pagination"
+      },
+      "group": "declared",
+      "model_process_wall_ms": 76,
+      "oracle_sha256": "234e5d5ec12e4d619ee7f61fece106ef874705934db02f9dbdd1d68b54995cd6",
+      "outcome": "model_process_failure",
+      "process": {
+        "exit": 1,
+        "observed_command_allowance": 8,
+        "observed_command_dispatches": 0,
+        "signal": null,
+        "state": "completed",
+        "stderr": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-20/codex.stderr",
+        "stdout": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-20/codex.stdout",
+        "wall_ms": 76
+      },
+      "provider_charge_microunits": null,
+      "provider_usage": {
+        "cache_write_input_tokens": null,
+        "cached_input_tokens": null,
+        "completed_command_tools": 0,
+        "input_tokens": null,
+        "output_tokens": null,
+        "provider_returned_model": null,
+        "turn_failures": 0
+      },
+      "public_inputs": [
+        {
+          "bytes": 501,
+          "file": "source.rs",
+          "sha256": "73004783de8aa1bf224859f55dff328dad85ac8c8920ae8b046aa81d92fd1bec"
+        },
+        {
+          "bytes": 311,
+          "file": "task.md",
+          "sha256": "e2c2363970e363d2b048a181f5b30ebd06a0c261a390b9326c3ad90f5b80bd31"
+        },
+        {
+          "bytes": 1744,
+          "file": "context.json",
+          "sha256": "496c77d936527978cee076593b174be1ab8b4a54237e0276e1ef64d3f129ecd7"
+        }
+      ],
+      "repeat": 2,
+      "root": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-20",
+      "state": "completed",
+      "task": "02-pagination"
+    },
+    {
+      "agent_context_access": {
+        "completed_tool_items": [],
+        "established": false
+      },
+      "arm": "absent",
+      "delivered_context": {
+        "agent_access": "not_yet_run",
+        "arm": "absent",
+        "brief": null,
+        "cache_key": "sha256:c205218df872ac5ceefb025faf7ad5de3a50e0f33dead6252db5145ea8252495",
+        "context_record": "sha256:3cd0b0f52626bf94993f00379113d8dfe8994b49a898d49f45eb7cf80d5da8f1",
+        "context_sha256": "3b5c133c8bbe1086ffef37f77c0bb7fd07997b9cc533d626bc452d5ac6b05e31",
+        "contribution": "sha256:78c7d79d34bc904b71f5a0149a23c83fd9a8032dfebad36acad91365c0f88dc1",
+        "coverage": "partial",
+        "delivered": true,
+        "freshness": "exact",
+        "group": "declared",
+        "public": "/private/tmp/aethyme-fx08-contexts-20261012-exact-brief/02-pagination-absent/public",
+        "source": "sha256:ee6e2662b6c41c0642fed182ac2d84bccaf3885e65899da5be02476d7839eecf",
+        "task": "02-pagination"
+      },
+      "group": "declared",
+      "model_process_wall_ms": 48,
+      "oracle_sha256": "234e5d5ec12e4d619ee7f61fece106ef874705934db02f9dbdd1d68b54995cd6",
+      "outcome": "model_process_failure",
+      "process": {
+        "exit": 1,
+        "observed_command_allowance": 8,
+        "observed_command_dispatches": 0,
+        "signal": null,
+        "state": "completed",
+        "stderr": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-21/codex.stderr",
+        "stdout": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-21/codex.stdout",
+        "wall_ms": 48
+      },
+      "provider_charge_microunits": null,
+      "provider_usage": {
+        "cache_write_input_tokens": null,
+        "cached_input_tokens": null,
+        "completed_command_tools": 0,
+        "input_tokens": null,
+        "output_tokens": null,
+        "provider_returned_model": null,
+        "turn_failures": 0
+      },
+      "public_inputs": [
+        {
+          "bytes": 501,
+          "file": "source.rs",
+          "sha256": "73004783de8aa1bf224859f55dff328dad85ac8c8920ae8b046aa81d92fd1bec"
+        },
+        {
+          "bytes": 311,
+          "file": "task.md",
+          "sha256": "e2c2363970e363d2b048a181f5b30ebd06a0c261a390b9326c3ad90f5b80bd31"
+        },
+        {
+          "bytes": 1196,
+          "file": "context.json",
+          "sha256": "3b5c133c8bbe1086ffef37f77c0bb7fd07997b9cc533d626bc452d5ac6b05e31"
+        }
+      ],
+      "repeat": 2,
+      "root": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-21",
+      "state": "completed",
+      "task": "02-pagination"
+    },
+    {
+      "agent_context_access": {
+        "completed_tool_items": [],
+        "established": false
+      },
+      "arm": "incomplete",
+      "delivered_context": {
+        "agent_access": "not_yet_run",
+        "arm": "incomplete",
+        "brief": "sha256:e50ace1a2ec67f7dc190c28a85199df750995447832264c44f4d305b6144cc88",
+        "cache_key": "sha256:52ddbd9e839ed826727a8d67dda90aedf240e3ba2786b6b054a2b7e868d902f2",
+        "context_record": "sha256:8f480c50b37f5be0afd7a5b9d96fe891cae2d4abec6687ebfd6ddada0e34ff98",
+        "context_sha256": "db5547c88d1478666016446d8d7071525c63116d7ede837e160d5b429a3b5575",
+        "contribution": "sha256:78c7d79d34bc904b71f5a0149a23c83fd9a8032dfebad36acad91365c0f88dc1",
+        "coverage": "partial",
+        "delivered": true,
+        "freshness": "exact",
+        "group": "declared",
+        "public": "/private/tmp/aethyme-fx08-contexts-20261012-exact-brief/02-pagination-incomplete/public",
+        "source": "sha256:ee6e2662b6c41c0642fed182ac2d84bccaf3885e65899da5be02476d7839eecf",
+        "task": "02-pagination"
+      },
+      "group": "declared",
+      "model_process_wall_ms": 81,
+      "oracle_sha256": "234e5d5ec12e4d619ee7f61fece106ef874705934db02f9dbdd1d68b54995cd6",
+      "outcome": "model_process_failure",
+      "process": {
+        "exit": 1,
+        "observed_command_allowance": 8,
+        "observed_command_dispatches": 0,
+        "signal": null,
+        "state": "completed",
+        "stderr": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-22/codex.stderr",
+        "stdout": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-22/codex.stdout",
+        "wall_ms": 81
+      },
+      "provider_charge_microunits": null,
+      "provider_usage": {
+        "cache_write_input_tokens": null,
+        "cached_input_tokens": null,
+        "completed_command_tools": 0,
+        "input_tokens": null,
+        "output_tokens": null,
+        "provider_returned_model": null,
+        "turn_failures": 0
+      },
+      "public_inputs": [
+        {
+          "bytes": 501,
+          "file": "source.rs",
+          "sha256": "73004783de8aa1bf224859f55dff328dad85ac8c8920ae8b046aa81d92fd1bec"
+        },
+        {
+          "bytes": 311,
+          "file": "task.md",
+          "sha256": "e2c2363970e363d2b048a181f5b30ebd06a0c261a390b9326c3ad90f5b80bd31"
+        },
+        {
+          "bytes": 1745,
+          "file": "context.json",
+          "sha256": "db5547c88d1478666016446d8d7071525c63116d7ede837e160d5b429a3b5575"
+        }
+      ],
+      "repeat": 2,
+      "root": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-22",
+      "state": "completed",
+      "task": "02-pagination"
+    },
+    {
+      "agent_context_access": {
+        "completed_tool_items": [],
+        "established": false
+      },
+      "arm": "misleading",
+      "delivered_context": {
+        "agent_access": "not_yet_run",
+        "arm": "misleading",
+        "brief": "sha256:149227ce5c5af2df538fda5a1e2054d41a2695dc0ac0749cdb50f431a3a8f5b5",
+        "cache_key": "sha256:fcd5eefae4d2c7095c15e7e19b985afb62c7ad310e405129dac0f2be3d7ee591",
+        "context_record": "sha256:17f880a399eecf473a33c7dcc0c38866f671c02ba26041ed876dc7fdb858b608",
+        "context_sha256": "d96efa4a79b4d48950fa6d24e4061519c2ce7f916c903453489e76e4d91fd077",
+        "contribution": "sha256:78c7d79d34bc904b71f5a0149a23c83fd9a8032dfebad36acad91365c0f88dc1",
+        "coverage": "partial",
+        "delivered": true,
+        "freshness": "exact",
+        "group": "declared",
+        "public": "/private/tmp/aethyme-fx08-contexts-20261012-exact-brief/02-pagination-misleading/public",
+        "source": "sha256:ee6e2662b6c41c0642fed182ac2d84bccaf3885e65899da5be02476d7839eecf",
+        "task": "02-pagination"
+      },
+      "group": "declared",
+      "model_process_wall_ms": 50,
+      "oracle_sha256": "234e5d5ec12e4d619ee7f61fece106ef874705934db02f9dbdd1d68b54995cd6",
+      "outcome": "model_process_failure",
+      "process": {
+        "exit": 1,
+        "observed_command_allowance": 8,
+        "observed_command_dispatches": 0,
+        "signal": null,
+        "state": "completed",
+        "stderr": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-23/codex.stderr",
+        "stdout": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-23/codex.stdout",
+        "wall_ms": 50
+      },
+      "provider_charge_microunits": null,
+      "provider_usage": {
+        "cache_write_input_tokens": null,
+        "cached_input_tokens": null,
+        "completed_command_tools": 0,
+        "input_tokens": null,
+        "output_tokens": null,
+        "provider_returned_model": null,
+        "turn_failures": 0
+      },
+      "public_inputs": [
+        {
+          "bytes": 501,
+          "file": "source.rs",
+          "sha256": "73004783de8aa1bf224859f55dff328dad85ac8c8920ae8b046aa81d92fd1bec"
+        },
+        {
+          "bytes": 311,
+          "file": "task.md",
+          "sha256": "e2c2363970e363d2b048a181f5b30ebd06a0c261a390b9326c3ad90f5b80bd31"
+        },
+        {
+          "bytes": 1746,
+          "file": "context.json",
+          "sha256": "d96efa4a79b4d48950fa6d24e4061519c2ce7f916c903453489e76e4d91fd077"
+        }
+      ],
+      "repeat": 2,
+      "root": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-23",
+      "state": "completed",
+      "task": "02-pagination"
+    },
+    {
+      "agent_context_access": {
+        "completed_tool_items": [],
+        "established": false
+      },
+      "arm": "correct",
+      "delivered_context": {
+        "agent_access": "not_yet_run",
+        "arm": "correct",
+        "brief": "sha256:c6148de23828afdbbc9d38185ff1daef2f97dfee7321f4e0e6e658ead0996565",
+        "cache_key": "sha256:25224295c6da6bc7bcf73fc15a4c0c146b7da91cfe0ac14d7d254809eb45d190",
+        "context_record": "sha256:77c58afdf4bf719070eaf9e9fd777a7ce6ea99a7a454be6f2fe47e53f2d61580",
+        "context_sha256": "cccd5ccbaad9d955b9ab0d44ad8026ec1a240930ef0f58282370315a1074be26",
+        "contribution": "sha256:afc875ac22577e2439e8b12816a0cba4a6e74db141b1242893c27db7ab85332c",
+        "coverage": "partial",
+        "delivered": true,
+        "freshness": "exact",
+        "group": "declared",
+        "public": "/private/tmp/aethyme-fx08-contexts-20261012-exact-brief/03-protocol-correct/public",
+        "source": "sha256:6addf864fdfcef3316a104db10f5b02acb85ff66cc3c16dd6d7b56d4aa6f7752",
+        "task": "03-protocol"
+      },
+      "group": "declared",
+      "model_process_wall_ms": 75,
+      "oracle_sha256": "c643f771d539f6df742b86d68f581b81890bfa3f67b22ddf4a01af9e80a45c2b",
+      "outcome": "model_process_failure",
+      "process": {
+        "exit": 1,
+        "observed_command_allowance": 8,
+        "observed_command_dispatches": 0,
+        "signal": null,
+        "state": "completed",
+        "stderr": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-24/codex.stderr",
+        "stdout": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-24/codex.stdout",
+        "wall_ms": 75
+      },
+      "provider_charge_microunits": null,
+      "provider_usage": {
+        "cache_write_input_tokens": null,
+        "cached_input_tokens": null,
+        "completed_command_tools": 0,
+        "input_tokens": null,
+        "output_tokens": null,
+        "provider_returned_model": null,
+        "turn_failures": 0
+      },
+      "public_inputs": [
+        {
+          "bytes": 235,
+          "file": "source.rs",
+          "sha256": "6290c0b11801c7b90e60c6327eef9e2e44fcea3e8d3ccfc01bd1f0bbdf13e961"
+        },
+        {
+          "bytes": 234,
+          "file": "task.md",
+          "sha256": "1f25c376c5898ca44bcf13116c7eb6f02f82d8827e8281c50781223b2b0908bc"
+        },
+        {
+          "bytes": 1746,
+          "file": "context.json",
+          "sha256": "cccd5ccbaad9d955b9ab0d44ad8026ec1a240930ef0f58282370315a1074be26"
+        }
+      ],
+      "repeat": 0,
+      "root": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-24",
+      "state": "completed",
+      "task": "03-protocol"
+    },
+    {
+      "agent_context_access": {
+        "completed_tool_items": [],
+        "established": false
+      },
+      "arm": "absent",
+      "delivered_context": {
+        "agent_access": "not_yet_run",
+        "arm": "absent",
+        "brief": null,
+        "cache_key": "sha256:546de66874cb10a04e8ceda07dec938e9fd51e3841f96ae4e8f52e57ce772790",
+        "context_record": "sha256:68a6631d5df84dbbe4b92672a2d537b2cee058eacf3e37b5f60d5f1b6c541c2a",
+        "context_sha256": "0d46629a8c50fab3e552d2798b336568fc3d2b15ec8c10e3da21c416538e098e",
+        "contribution": "sha256:afc875ac22577e2439e8b12816a0cba4a6e74db141b1242893c27db7ab85332c",
+        "coverage": "partial",
+        "delivered": true,
+        "freshness": "exact",
+        "group": "declared",
+        "public": "/private/tmp/aethyme-fx08-contexts-20261012-exact-brief/03-protocol-absent/public",
+        "source": "sha256:6addf864fdfcef3316a104db10f5b02acb85ff66cc3c16dd6d7b56d4aa6f7752",
+        "task": "03-protocol"
+      },
+      "group": "declared",
+      "model_process_wall_ms": 57,
+      "oracle_sha256": "c643f771d539f6df742b86d68f581b81890bfa3f67b22ddf4a01af9e80a45c2b",
+      "outcome": "model_process_failure",
+      "process": {
+        "exit": 1,
+        "observed_command_allowance": 8,
+        "observed_command_dispatches": 0,
+        "signal": null,
+        "state": "completed",
+        "stderr": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-25/codex.stderr",
+        "stdout": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-25/codex.stdout",
+        "wall_ms": 57
+      },
+      "provider_charge_microunits": null,
+      "provider_usage": {
+        "cache_write_input_tokens": null,
+        "cached_input_tokens": null,
+        "completed_command_tools": 0,
+        "input_tokens": null,
+        "output_tokens": null,
+        "provider_returned_model": null,
+        "turn_failures": 0
+      },
+      "public_inputs": [
+        {
+          "bytes": 235,
+          "file": "source.rs",
+          "sha256": "6290c0b11801c7b90e60c6327eef9e2e44fcea3e8d3ccfc01bd1f0bbdf13e961"
+        },
+        {
+          "bytes": 234,
+          "file": "task.md",
+          "sha256": "1f25c376c5898ca44bcf13116c7eb6f02f82d8827e8281c50781223b2b0908bc"
+        },
+        {
+          "bytes": 1196,
+          "file": "context.json",
+          "sha256": "0d46629a8c50fab3e552d2798b336568fc3d2b15ec8c10e3da21c416538e098e"
+        }
+      ],
+      "repeat": 0,
+      "root": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-25",
+      "state": "completed",
+      "task": "03-protocol"
+    },
+    {
+      "agent_context_access": {
+        "completed_tool_items": [],
+        "established": false
+      },
+      "arm": "incomplete",
+      "delivered_context": {
+        "agent_access": "not_yet_run",
+        "arm": "incomplete",
+        "brief": "sha256:b8e142e6a131b57b3e056016431ad3861c04cc79e396403bdd214668b5a9c091",
+        "cache_key": "sha256:7a2ff7f357720c6677e2ac8c4d28b37c1dd309a67f3ba835b6d3ad640302c54a",
+        "context_record": "sha256:22156ff156a779fc69bf93afe4be8af9c68c13359181a006b4bfab4eee9eb388",
+        "context_sha256": "5f0c7c7d8256f2bc823f315308b92c19ae2d6d534e513d6fe7ef1c85fa76b0a8",
+        "contribution": "sha256:afc875ac22577e2439e8b12816a0cba4a6e74db141b1242893c27db7ab85332c",
+        "coverage": "partial",
+        "delivered": true,
+        "freshness": "exact",
+        "group": "declared",
+        "public": "/private/tmp/aethyme-fx08-contexts-20261012-exact-brief/03-protocol-incomplete/public",
+        "source": "sha256:6addf864fdfcef3316a104db10f5b02acb85ff66cc3c16dd6d7b56d4aa6f7752",
+        "task": "03-protocol"
+      },
+      "group": "declared",
+      "model_process_wall_ms": 75,
+      "oracle_sha256": "c643f771d539f6df742b86d68f581b81890bfa3f67b22ddf4a01af9e80a45c2b",
+      "outcome": "model_process_failure",
+      "process": {
+        "exit": 1,
+        "observed_command_allowance": 8,
+        "observed_command_dispatches": 0,
+        "signal": null,
+        "state": "completed",
+        "stderr": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-26/codex.stderr",
+        "stdout": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-26/codex.stdout",
+        "wall_ms": 75
+      },
+      "provider_charge_microunits": null,
+      "provider_usage": {
+        "cache_write_input_tokens": null,
+        "cached_input_tokens": null,
+        "completed_command_tools": 0,
+        "input_tokens": null,
+        "output_tokens": null,
+        "provider_returned_model": null,
+        "turn_failures": 0
+      },
+      "public_inputs": [
+        {
+          "bytes": 235,
+          "file": "source.rs",
+          "sha256": "6290c0b11801c7b90e60c6327eef9e2e44fcea3e8d3ccfc01bd1f0bbdf13e961"
+        },
+        {
+          "bytes": 234,
+          "file": "task.md",
+          "sha256": "1f25c376c5898ca44bcf13116c7eb6f02f82d8827e8281c50781223b2b0908bc"
+        },
+        {
+          "bytes": 1748,
+          "file": "context.json",
+          "sha256": "5f0c7c7d8256f2bc823f315308b92c19ae2d6d534e513d6fe7ef1c85fa76b0a8"
+        }
+      ],
+      "repeat": 0,
+      "root": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-26",
+      "state": "completed",
+      "task": "03-protocol"
+    },
+    {
+      "agent_context_access": {
+        "completed_tool_items": [],
+        "established": false
+      },
+      "arm": "misleading",
+      "delivered_context": {
+        "agent_access": "not_yet_run",
+        "arm": "misleading",
+        "brief": "sha256:4bcf965dfc2a94c3f6feaac68891344545b282af1dfe6621a167b6ccccd044fb",
+        "cache_key": "sha256:bd56215863672a2f49cdc3c0e14cbd59cc266b705432cd5056563afee12555db",
+        "context_record": "sha256:c707c8518e1a4660c85c573c58fcee4807097f66d484c4fa570bdac9ac09b5b8",
+        "context_sha256": "79ca40db919d7300fd04bd83a21c4e7a3cd64af827918c388e075c7d860e7167",
+        "contribution": "sha256:afc875ac22577e2439e8b12816a0cba4a6e74db141b1242893c27db7ab85332c",
+        "coverage": "partial",
+        "delivered": true,
+        "freshness": "exact",
+        "group": "declared",
+        "public": "/private/tmp/aethyme-fx08-contexts-20261012-exact-brief/03-protocol-misleading/public",
+        "source": "sha256:6addf864fdfcef3316a104db10f5b02acb85ff66cc3c16dd6d7b56d4aa6f7752",
+        "task": "03-protocol"
+      },
+      "group": "declared",
+      "model_process_wall_ms": 111,
+      "oracle_sha256": "c643f771d539f6df742b86d68f581b81890bfa3f67b22ddf4a01af9e80a45c2b",
+      "outcome": "model_process_failure",
+      "process": {
+        "exit": 1,
+        "observed_command_allowance": 8,
+        "observed_command_dispatches": 0,
+        "signal": null,
+        "state": "completed",
+        "stderr": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-27/codex.stderr",
+        "stdout": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-27/codex.stdout",
+        "wall_ms": 111
+      },
+      "provider_charge_microunits": null,
+      "provider_usage": {
+        "cache_write_input_tokens": null,
+        "cached_input_tokens": null,
+        "completed_command_tools": 0,
+        "input_tokens": null,
+        "output_tokens": null,
+        "provider_returned_model": null,
+        "turn_failures": 0
+      },
+      "public_inputs": [
+        {
+          "bytes": 235,
+          "file": "source.rs",
+          "sha256": "6290c0b11801c7b90e60c6327eef9e2e44fcea3e8d3ccfc01bd1f0bbdf13e961"
+        },
+        {
+          "bytes": 234,
+          "file": "task.md",
+          "sha256": "1f25c376c5898ca44bcf13116c7eb6f02f82d8827e8281c50781223b2b0908bc"
+        },
+        {
+          "bytes": 1750,
+          "file": "context.json",
+          "sha256": "79ca40db919d7300fd04bd83a21c4e7a3cd64af827918c388e075c7d860e7167"
+        }
+      ],
+      "repeat": 0,
+      "root": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-27",
+      "state": "completed",
+      "task": "03-protocol"
+    },
+    {
+      "agent_context_access": {
+        "completed_tool_items": [],
+        "established": false
+      },
+      "arm": "correct",
+      "delivered_context": {
+        "agent_access": "not_yet_run",
+        "arm": "correct",
+        "brief": "sha256:c6148de23828afdbbc9d38185ff1daef2f97dfee7321f4e0e6e658ead0996565",
+        "cache_key": "sha256:25224295c6da6bc7bcf73fc15a4c0c146b7da91cfe0ac14d7d254809eb45d190",
+        "context_record": "sha256:77c58afdf4bf719070eaf9e9fd777a7ce6ea99a7a454be6f2fe47e53f2d61580",
+        "context_sha256": "cccd5ccbaad9d955b9ab0d44ad8026ec1a240930ef0f58282370315a1074be26",
+        "contribution": "sha256:afc875ac22577e2439e8b12816a0cba4a6e74db141b1242893c27db7ab85332c",
+        "coverage": "partial",
+        "delivered": true,
+        "freshness": "exact",
+        "group": "declared",
+        "public": "/private/tmp/aethyme-fx08-contexts-20261012-exact-brief/03-protocol-correct/public",
+        "source": "sha256:6addf864fdfcef3316a104db10f5b02acb85ff66cc3c16dd6d7b56d4aa6f7752",
+        "task": "03-protocol"
+      },
+      "group": "declared",
+      "model_process_wall_ms": 86,
+      "oracle_sha256": "c643f771d539f6df742b86d68f581b81890bfa3f67b22ddf4a01af9e80a45c2b",
+      "outcome": "model_process_failure",
+      "process": {
+        "exit": 1,
+        "observed_command_allowance": 8,
+        "observed_command_dispatches": 0,
+        "signal": null,
+        "state": "completed",
+        "stderr": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-28/codex.stderr",
+        "stdout": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-28/codex.stdout",
+        "wall_ms": 86
+      },
+      "provider_charge_microunits": null,
+      "provider_usage": {
+        "cache_write_input_tokens": null,
+        "cached_input_tokens": null,
+        "completed_command_tools": 0,
+        "input_tokens": null,
+        "output_tokens": null,
+        "provider_returned_model": null,
+        "turn_failures": 0
+      },
+      "public_inputs": [
+        {
+          "bytes": 235,
+          "file": "source.rs",
+          "sha256": "6290c0b11801c7b90e60c6327eef9e2e44fcea3e8d3ccfc01bd1f0bbdf13e961"
+        },
+        {
+          "bytes": 234,
+          "file": "task.md",
+          "sha256": "1f25c376c5898ca44bcf13116c7eb6f02f82d8827e8281c50781223b2b0908bc"
+        },
+        {
+          "bytes": 1746,
+          "file": "context.json",
+          "sha256": "cccd5ccbaad9d955b9ab0d44ad8026ec1a240930ef0f58282370315a1074be26"
+        }
+      ],
+      "repeat": 1,
+      "root": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-28",
+      "state": "completed",
+      "task": "03-protocol"
+    },
+    {
+      "agent_context_access": {
+        "completed_tool_items": [],
+        "established": false
+      },
+      "arm": "absent",
+      "delivered_context": {
+        "agent_access": "not_yet_run",
+        "arm": "absent",
+        "brief": null,
+        "cache_key": "sha256:546de66874cb10a04e8ceda07dec938e9fd51e3841f96ae4e8f52e57ce772790",
+        "context_record": "sha256:68a6631d5df84dbbe4b92672a2d537b2cee058eacf3e37b5f60d5f1b6c541c2a",
+        "context_sha256": "0d46629a8c50fab3e552d2798b336568fc3d2b15ec8c10e3da21c416538e098e",
+        "contribution": "sha256:afc875ac22577e2439e8b12816a0cba4a6e74db141b1242893c27db7ab85332c",
+        "coverage": "partial",
+        "delivered": true,
+        "freshness": "exact",
+        "group": "declared",
+        "public": "/private/tmp/aethyme-fx08-contexts-20261012-exact-brief/03-protocol-absent/public",
+        "source": "sha256:6addf864fdfcef3316a104db10f5b02acb85ff66cc3c16dd6d7b56d4aa6f7752",
+        "task": "03-protocol"
+      },
+      "group": "declared",
+      "model_process_wall_ms": 106,
+      "oracle_sha256": "c643f771d539f6df742b86d68f581b81890bfa3f67b22ddf4a01af9e80a45c2b",
+      "outcome": "model_process_failure",
+      "process": {
+        "exit": 1,
+        "observed_command_allowance": 8,
+        "observed_command_dispatches": 0,
+        "signal": null,
+        "state": "completed",
+        "stderr": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-29/codex.stderr",
+        "stdout": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-29/codex.stdout",
+        "wall_ms": 106
+      },
+      "provider_charge_microunits": null,
+      "provider_usage": {
+        "cache_write_input_tokens": null,
+        "cached_input_tokens": null,
+        "completed_command_tools": 0,
+        "input_tokens": null,
+        "output_tokens": null,
+        "provider_returned_model": null,
+        "turn_failures": 0
+      },
+      "public_inputs": [
+        {
+          "bytes": 235,
+          "file": "source.rs",
+          "sha256": "6290c0b11801c7b90e60c6327eef9e2e44fcea3e8d3ccfc01bd1f0bbdf13e961"
+        },
+        {
+          "bytes": 234,
+          "file": "task.md",
+          "sha256": "1f25c376c5898ca44bcf13116c7eb6f02f82d8827e8281c50781223b2b0908bc"
+        },
+        {
+          "bytes": 1196,
+          "file": "context.json",
+          "sha256": "0d46629a8c50fab3e552d2798b336568fc3d2b15ec8c10e3da21c416538e098e"
+        }
+      ],
+      "repeat": 1,
+      "root": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-29",
+      "state": "completed",
+      "task": "03-protocol"
+    },
+    {
+      "agent_context_access": {
+        "completed_tool_items": [],
+        "established": false
+      },
+      "arm": "incomplete",
+      "delivered_context": {
+        "agent_access": "not_yet_run",
+        "arm": "incomplete",
+        "brief": "sha256:b8e142e6a131b57b3e056016431ad3861c04cc79e396403bdd214668b5a9c091",
+        "cache_key": "sha256:7a2ff7f357720c6677e2ac8c4d28b37c1dd309a67f3ba835b6d3ad640302c54a",
+        "context_record": "sha256:22156ff156a779fc69bf93afe4be8af9c68c13359181a006b4bfab4eee9eb388",
+        "context_sha256": "5f0c7c7d8256f2bc823f315308b92c19ae2d6d534e513d6fe7ef1c85fa76b0a8",
+        "contribution": "sha256:afc875ac22577e2439e8b12816a0cba4a6e74db141b1242893c27db7ab85332c",
+        "coverage": "partial",
+        "delivered": true,
+        "freshness": "exact",
+        "group": "declared",
+        "public": "/private/tmp/aethyme-fx08-contexts-20261012-exact-brief/03-protocol-incomplete/public",
+        "source": "sha256:6addf864fdfcef3316a104db10f5b02acb85ff66cc3c16dd6d7b56d4aa6f7752",
+        "task": "03-protocol"
+      },
+      "group": "declared",
+      "model_process_wall_ms": 75,
+      "oracle_sha256": "c643f771d539f6df742b86d68f581b81890bfa3f67b22ddf4a01af9e80a45c2b",
+      "outcome": "model_process_failure",
+      "process": {
+        "exit": 1,
+        "observed_command_allowance": 8,
+        "observed_command_dispatches": 0,
+        "signal": null,
+        "state": "completed",
+        "stderr": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-30/codex.stderr",
+        "stdout": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-30/codex.stdout",
+        "wall_ms": 75
+      },
+      "provider_charge_microunits": null,
+      "provider_usage": {
+        "cache_write_input_tokens": null,
+        "cached_input_tokens": null,
+        "completed_command_tools": 0,
+        "input_tokens": null,
+        "output_tokens": null,
+        "provider_returned_model": null,
+        "turn_failures": 0
+      },
+      "public_inputs": [
+        {
+          "bytes": 235,
+          "file": "source.rs",
+          "sha256": "6290c0b11801c7b90e60c6327eef9e2e44fcea3e8d3ccfc01bd1f0bbdf13e961"
+        },
+        {
+          "bytes": 234,
+          "file": "task.md",
+          "sha256": "1f25c376c5898ca44bcf13116c7eb6f02f82d8827e8281c50781223b2b0908bc"
+        },
+        {
+          "bytes": 1748,
+          "file": "context.json",
+          "sha256": "5f0c7c7d8256f2bc823f315308b92c19ae2d6d534e513d6fe7ef1c85fa76b0a8"
+        }
+      ],
+      "repeat": 1,
+      "root": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-30",
+      "state": "completed",
+      "task": "03-protocol"
+    },
+    {
+      "agent_context_access": {
+        "completed_tool_items": [],
+        "established": false
+      },
+      "arm": "misleading",
+      "delivered_context": {
+        "agent_access": "not_yet_run",
+        "arm": "misleading",
+        "brief": "sha256:4bcf965dfc2a94c3f6feaac68891344545b282af1dfe6621a167b6ccccd044fb",
+        "cache_key": "sha256:bd56215863672a2f49cdc3c0e14cbd59cc266b705432cd5056563afee12555db",
+        "context_record": "sha256:c707c8518e1a4660c85c573c58fcee4807097f66d484c4fa570bdac9ac09b5b8",
+        "context_sha256": "79ca40db919d7300fd04bd83a21c4e7a3cd64af827918c388e075c7d860e7167",
+        "contribution": "sha256:afc875ac22577e2439e8b12816a0cba4a6e74db141b1242893c27db7ab85332c",
+        "coverage": "partial",
+        "delivered": true,
+        "freshness": "exact",
+        "group": "declared",
+        "public": "/private/tmp/aethyme-fx08-contexts-20261012-exact-brief/03-protocol-misleading/public",
+        "source": "sha256:6addf864fdfcef3316a104db10f5b02acb85ff66cc3c16dd6d7b56d4aa6f7752",
+        "task": "03-protocol"
+      },
+      "group": "declared",
+      "model_process_wall_ms": 58,
+      "oracle_sha256": "c643f771d539f6df742b86d68f581b81890bfa3f67b22ddf4a01af9e80a45c2b",
+      "outcome": "model_process_failure",
+      "process": {
+        "exit": 1,
+        "observed_command_allowance": 8,
+        "observed_command_dispatches": 0,
+        "signal": null,
+        "state": "completed",
+        "stderr": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-31/codex.stderr",
+        "stdout": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-31/codex.stdout",
+        "wall_ms": 58
+      },
+      "provider_charge_microunits": null,
+      "provider_usage": {
+        "cache_write_input_tokens": null,
+        "cached_input_tokens": null,
+        "completed_command_tools": 0,
+        "input_tokens": null,
+        "output_tokens": null,
+        "provider_returned_model": null,
+        "turn_failures": 0
+      },
+      "public_inputs": [
+        {
+          "bytes": 235,
+          "file": "source.rs",
+          "sha256": "6290c0b11801c7b90e60c6327eef9e2e44fcea3e8d3ccfc01bd1f0bbdf13e961"
+        },
+        {
+          "bytes": 234,
+          "file": "task.md",
+          "sha256": "1f25c376c5898ca44bcf13116c7eb6f02f82d8827e8281c50781223b2b0908bc"
+        },
+        {
+          "bytes": 1750,
+          "file": "context.json",
+          "sha256": "79ca40db919d7300fd04bd83a21c4e7a3cd64af827918c388e075c7d860e7167"
+        }
+      ],
+      "repeat": 1,
+      "root": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-31",
+      "state": "completed",
+      "task": "03-protocol"
+    },
+    {
+      "agent_context_access": {
+        "completed_tool_items": [],
+        "established": false
+      },
+      "arm": "correct",
+      "delivered_context": {
+        "agent_access": "not_yet_run",
+        "arm": "correct",
+        "brief": "sha256:c6148de23828afdbbc9d38185ff1daef2f97dfee7321f4e0e6e658ead0996565",
+        "cache_key": "sha256:25224295c6da6bc7bcf73fc15a4c0c146b7da91cfe0ac14d7d254809eb45d190",
+        "context_record": "sha256:77c58afdf4bf719070eaf9e9fd777a7ce6ea99a7a454be6f2fe47e53f2d61580",
+        "context_sha256": "cccd5ccbaad9d955b9ab0d44ad8026ec1a240930ef0f58282370315a1074be26",
+        "contribution": "sha256:afc875ac22577e2439e8b12816a0cba4a6e74db141b1242893c27db7ab85332c",
+        "coverage": "partial",
+        "delivered": true,
+        "freshness": "exact",
+        "group": "declared",
+        "public": "/private/tmp/aethyme-fx08-contexts-20261012-exact-brief/03-protocol-correct/public",
+        "source": "sha256:6addf864fdfcef3316a104db10f5b02acb85ff66cc3c16dd6d7b56d4aa6f7752",
+        "task": "03-protocol"
+      },
+      "group": "declared",
+      "model_process_wall_ms": 26,
+      "oracle_sha256": "c643f771d539f6df742b86d68f581b81890bfa3f67b22ddf4a01af9e80a45c2b",
+      "outcome": "model_process_failure",
+      "process": {
+        "exit": 1,
+        "observed_command_allowance": 8,
+        "observed_command_dispatches": 0,
+        "signal": null,
+        "state": "completed",
+        "stderr": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-32/codex.stderr",
+        "stdout": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-32/codex.stdout",
+        "wall_ms": 26
+      },
+      "provider_charge_microunits": null,
+      "provider_usage": {
+        "cache_write_input_tokens": null,
+        "cached_input_tokens": null,
+        "completed_command_tools": 0,
+        "input_tokens": null,
+        "output_tokens": null,
+        "provider_returned_model": null,
+        "turn_failures": 0
+      },
+      "public_inputs": [
+        {
+          "bytes": 235,
+          "file": "source.rs",
+          "sha256": "6290c0b11801c7b90e60c6327eef9e2e44fcea3e8d3ccfc01bd1f0bbdf13e961"
+        },
+        {
+          "bytes": 234,
+          "file": "task.md",
+          "sha256": "1f25c376c5898ca44bcf13116c7eb6f02f82d8827e8281c50781223b2b0908bc"
+        },
+        {
+          "bytes": 1746,
+          "file": "context.json",
+          "sha256": "cccd5ccbaad9d955b9ab0d44ad8026ec1a240930ef0f58282370315a1074be26"
+        }
+      ],
+      "repeat": 2,
+      "root": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-32",
+      "state": "completed",
+      "task": "03-protocol"
+    },
+    {
+      "agent_context_access": {
+        "completed_tool_items": [],
+        "established": false
+      },
+      "arm": "absent",
+      "delivered_context": {
+        "agent_access": "not_yet_run",
+        "arm": "absent",
+        "brief": null,
+        "cache_key": "sha256:546de66874cb10a04e8ceda07dec938e9fd51e3841f96ae4e8f52e57ce772790",
+        "context_record": "sha256:68a6631d5df84dbbe4b92672a2d537b2cee058eacf3e37b5f60d5f1b6c541c2a",
+        "context_sha256": "0d46629a8c50fab3e552d2798b336568fc3d2b15ec8c10e3da21c416538e098e",
+        "contribution": "sha256:afc875ac22577e2439e8b12816a0cba4a6e74db141b1242893c27db7ab85332c",
+        "coverage": "partial",
+        "delivered": true,
+        "freshness": "exact",
+        "group": "declared",
+        "public": "/private/tmp/aethyme-fx08-contexts-20261012-exact-brief/03-protocol-absent/public",
+        "source": "sha256:6addf864fdfcef3316a104db10f5b02acb85ff66cc3c16dd6d7b56d4aa6f7752",
+        "task": "03-protocol"
+      },
+      "group": "declared",
+      "model_process_wall_ms": 82,
+      "oracle_sha256": "c643f771d539f6df742b86d68f581b81890bfa3f67b22ddf4a01af9e80a45c2b",
+      "outcome": "model_process_failure",
+      "process": {
+        "exit": 1,
+        "observed_command_allowance": 8,
+        "observed_command_dispatches": 0,
+        "signal": null,
+        "state": "completed",
+        "stderr": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-33/codex.stderr",
+        "stdout": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-33/codex.stdout",
+        "wall_ms": 82
+      },
+      "provider_charge_microunits": null,
+      "provider_usage": {
+        "cache_write_input_tokens": null,
+        "cached_input_tokens": null,
+        "completed_command_tools": 0,
+        "input_tokens": null,
+        "output_tokens": null,
+        "provider_returned_model": null,
+        "turn_failures": 0
+      },
+      "public_inputs": [
+        {
+          "bytes": 235,
+          "file": "source.rs",
+          "sha256": "6290c0b11801c7b90e60c6327eef9e2e44fcea3e8d3ccfc01bd1f0bbdf13e961"
+        },
+        {
+          "bytes": 234,
+          "file": "task.md",
+          "sha256": "1f25c376c5898ca44bcf13116c7eb6f02f82d8827e8281c50781223b2b0908bc"
+        },
+        {
+          "bytes": 1196,
+          "file": "context.json",
+          "sha256": "0d46629a8c50fab3e552d2798b336568fc3d2b15ec8c10e3da21c416538e098e"
+        }
+      ],
+      "repeat": 2,
+      "root": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-33",
+      "state": "completed",
+      "task": "03-protocol"
+    },
+    {
+      "agent_context_access": {
+        "completed_tool_items": [],
+        "established": false
+      },
+      "arm": "incomplete",
+      "delivered_context": {
+        "agent_access": "not_yet_run",
+        "arm": "incomplete",
+        "brief": "sha256:b8e142e6a131b57b3e056016431ad3861c04cc79e396403bdd214668b5a9c091",
+        "cache_key": "sha256:7a2ff7f357720c6677e2ac8c4d28b37c1dd309a67f3ba835b6d3ad640302c54a",
+        "context_record": "sha256:22156ff156a779fc69bf93afe4be8af9c68c13359181a006b4bfab4eee9eb388",
+        "context_sha256": "5f0c7c7d8256f2bc823f315308b92c19ae2d6d534e513d6fe7ef1c85fa76b0a8",
+        "contribution": "sha256:afc875ac22577e2439e8b12816a0cba4a6e74db141b1242893c27db7ab85332c",
+        "coverage": "partial",
+        "delivered": true,
+        "freshness": "exact",
+        "group": "declared",
+        "public": "/private/tmp/aethyme-fx08-contexts-20261012-exact-brief/03-protocol-incomplete/public",
+        "source": "sha256:6addf864fdfcef3316a104db10f5b02acb85ff66cc3c16dd6d7b56d4aa6f7752",
+        "task": "03-protocol"
+      },
+      "group": "declared",
+      "model_process_wall_ms": 50,
+      "oracle_sha256": "c643f771d539f6df742b86d68f581b81890bfa3f67b22ddf4a01af9e80a45c2b",
+      "outcome": "model_process_failure",
+      "process": {
+        "exit": 1,
+        "observed_command_allowance": 8,
+        "observed_command_dispatches": 0,
+        "signal": null,
+        "state": "completed",
+        "stderr": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-34/codex.stderr",
+        "stdout": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-34/codex.stdout",
+        "wall_ms": 50
+      },
+      "provider_charge_microunits": null,
+      "provider_usage": {
+        "cache_write_input_tokens": null,
+        "cached_input_tokens": null,
+        "completed_command_tools": 0,
+        "input_tokens": null,
+        "output_tokens": null,
+        "provider_returned_model": null,
+        "turn_failures": 0
+      },
+      "public_inputs": [
+        {
+          "bytes": 235,
+          "file": "source.rs",
+          "sha256": "6290c0b11801c7b90e60c6327eef9e2e44fcea3e8d3ccfc01bd1f0bbdf13e961"
+        },
+        {
+          "bytes": 234,
+          "file": "task.md",
+          "sha256": "1f25c376c5898ca44bcf13116c7eb6f02f82d8827e8281c50781223b2b0908bc"
+        },
+        {
+          "bytes": 1748,
+          "file": "context.json",
+          "sha256": "5f0c7c7d8256f2bc823f315308b92c19ae2d6d534e513d6fe7ef1c85fa76b0a8"
+        }
+      ],
+      "repeat": 2,
+      "root": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-34",
+      "state": "completed",
+      "task": "03-protocol"
+    },
+    {
+      "agent_context_access": {
+        "completed_tool_items": [],
+        "established": false
+      },
+      "arm": "misleading",
+      "delivered_context": {
+        "agent_access": "not_yet_run",
+        "arm": "misleading",
+        "brief": "sha256:4bcf965dfc2a94c3f6feaac68891344545b282af1dfe6621a167b6ccccd044fb",
+        "cache_key": "sha256:bd56215863672a2f49cdc3c0e14cbd59cc266b705432cd5056563afee12555db",
+        "context_record": "sha256:c707c8518e1a4660c85c573c58fcee4807097f66d484c4fa570bdac9ac09b5b8",
+        "context_sha256": "79ca40db919d7300fd04bd83a21c4e7a3cd64af827918c388e075c7d860e7167",
+        "contribution": "sha256:afc875ac22577e2439e8b12816a0cba4a6e74db141b1242893c27db7ab85332c",
+        "coverage": "partial",
+        "delivered": true,
+        "freshness": "exact",
+        "group": "declared",
+        "public": "/private/tmp/aethyme-fx08-contexts-20261012-exact-brief/03-protocol-misleading/public",
+        "source": "sha256:6addf864fdfcef3316a104db10f5b02acb85ff66cc3c16dd6d7b56d4aa6f7752",
+        "task": "03-protocol"
+      },
+      "group": "declared",
+      "model_process_wall_ms": 186,
+      "oracle_sha256": "c643f771d539f6df742b86d68f581b81890bfa3f67b22ddf4a01af9e80a45c2b",
+      "outcome": "model_process_failure",
+      "process": {
+        "exit": 1,
+        "observed_command_allowance": 8,
+        "observed_command_dispatches": 0,
+        "signal": null,
+        "state": "completed",
+        "stderr": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-35/codex.stderr",
+        "stdout": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-35/codex.stdout",
+        "wall_ms": 186
+      },
+      "provider_charge_microunits": null,
+      "provider_usage": {
+        "cache_write_input_tokens": null,
+        "cached_input_tokens": null,
+        "completed_command_tools": 0,
+        "input_tokens": null,
+        "output_tokens": null,
+        "provider_returned_model": null,
+        "turn_failures": 0
+      },
+      "public_inputs": [
+        {
+          "bytes": 235,
+          "file": "source.rs",
+          "sha256": "6290c0b11801c7b90e60c6327eef9e2e44fcea3e8d3ccfc01bd1f0bbdf13e961"
+        },
+        {
+          "bytes": 234,
+          "file": "task.md",
+          "sha256": "1f25c376c5898ca44bcf13116c7eb6f02f82d8827e8281c50781223b2b0908bc"
+        },
+        {
+          "bytes": 1750,
+          "file": "context.json",
+          "sha256": "79ca40db919d7300fd04bd83a21c4e7a3cd64af827918c388e075c7d860e7167"
+        }
+      ],
+      "repeat": 2,
+      "root": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-35",
+      "state": "completed",
+      "task": "03-protocol"
+    },
+    {
+      "agent_context_access": {
+        "completed_tool_items": [],
+        "established": false
+      },
+      "arm": "correct",
+      "delivered_context": {
+        "agent_access": "not_yet_run",
+        "arm": "correct",
+        "brief": "sha256:821a088aacf69e8718a54e15af23983698486bcbad4df164c173fb219a9d77fb",
+        "cache_key": "sha256:32aacf1e2480d408a2c6ed051d8d49d42322dac3cbd8a245ce0daae6bc8836fe",
+        "context_record": "sha256:d01e465212cfa0196c3bbc66b471ba14fd4f7ad9b8345febde6ea370e52064dd",
+        "context_sha256": "074ead8968bd9f8dc55ab434e2f73df889b7e32006ba336e6945ee3f38153adc",
+        "contribution": "sha256:6d1ec576ce0e2d432ee6fc2c29675ad5782a2478388072ad60f399ee5bda81a8",
+        "coverage": "partial",
+        "delivered": true,
+        "freshness": "exact",
+        "group": "declared",
+        "public": "/private/tmp/aethyme-fx08-contexts-20261012-exact-brief/04-completion-correct/public",
+        "source": "sha256:b51a8b781a01aada4c18768ba19b9f8e568e7ddd31322946a266dee6cc9ddb87",
+        "task": "04-completion"
+      },
+      "group": "declared",
+      "model_process_wall_ms": 73,
+      "oracle_sha256": "9832b84d367c4309838df62ca282bc626aaff458a53499ac2a142e84f1063636",
+      "outcome": "model_process_failure",
+      "process": {
+        "exit": 1,
+        "observed_command_allowance": 8,
+        "observed_command_dispatches": 0,
+        "signal": null,
+        "state": "completed",
+        "stderr": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-36/codex.stderr",
+        "stdout": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-36/codex.stdout",
+        "wall_ms": 73
+      },
+      "provider_charge_microunits": null,
+      "provider_usage": {
+        "cache_write_input_tokens": null,
+        "cached_input_tokens": null,
+        "completed_command_tools": 0,
+        "input_tokens": null,
+        "output_tokens": null,
+        "provider_returned_model": null,
+        "turn_failures": 0
+      },
+      "public_inputs": [
+        {
+          "bytes": 506,
+          "file": "source.rs",
+          "sha256": "4bc2bf52ce91287a872d94ce68ef5d8444977834cbe0830dcbb1808ee1c701d9"
+        },
+        {
+          "bytes": 299,
+          "file": "task.md",
+          "sha256": "1da28444e501145bc94a088c2503ee2935deaee4235bc5831316264c04c7353b"
+        },
+        {
+          "bytes": 1767,
+          "file": "context.json",
+          "sha256": "074ead8968bd9f8dc55ab434e2f73df889b7e32006ba336e6945ee3f38153adc"
+        }
+      ],
+      "repeat": 0,
+      "root": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-36",
+      "state": "completed",
+      "task": "04-completion"
+    },
+    {
+      "agent_context_access": {
+        "completed_tool_items": [],
+        "established": false
+      },
+      "arm": "absent",
+      "delivered_context": {
+        "agent_access": "not_yet_run",
+        "arm": "absent",
+        "brief": null,
+        "cache_key": "sha256:040f7a1c1cf03267f489c64e050d99ebdbcbbe95775b222f97aa2c7773dde8b8",
+        "context_record": "sha256:4d701cbd8e4ed673386a176d1e7170e0d2efc07c20470bbdee35b4c60585ee24",
+        "context_sha256": "669ef438d8279d4ef8b6ef49011de46182fa4839c22fc4ebab7f16749b3be47b",
+        "contribution": "sha256:6d1ec576ce0e2d432ee6fc2c29675ad5782a2478388072ad60f399ee5bda81a8",
+        "coverage": "partial",
+        "delivered": true,
+        "freshness": "exact",
+        "group": "declared",
+        "public": "/private/tmp/aethyme-fx08-contexts-20261012-exact-brief/04-completion-absent/public",
+        "source": "sha256:b51a8b781a01aada4c18768ba19b9f8e568e7ddd31322946a266dee6cc9ddb87",
+        "task": "04-completion"
+      },
+      "group": "declared",
+      "model_process_wall_ms": 113,
+      "oracle_sha256": "9832b84d367c4309838df62ca282bc626aaff458a53499ac2a142e84f1063636",
+      "outcome": "model_process_failure",
+      "process": {
+        "exit": 1,
+        "observed_command_allowance": 8,
+        "observed_command_dispatches": 0,
+        "signal": null,
+        "state": "completed",
+        "stderr": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-37/codex.stderr",
+        "stdout": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-37/codex.stdout",
+        "wall_ms": 113
+      },
+      "provider_charge_microunits": null,
+      "provider_usage": {
+        "cache_write_input_tokens": null,
+        "cached_input_tokens": null,
+        "completed_command_tools": 0,
+        "input_tokens": null,
+        "output_tokens": null,
+        "provider_returned_model": null,
+        "turn_failures": 0
+      },
+      "public_inputs": [
+        {
+          "bytes": 506,
+          "file": "source.rs",
+          "sha256": "4bc2bf52ce91287a872d94ce68ef5d8444977834cbe0830dcbb1808ee1c701d9"
+        },
+        {
+          "bytes": 299,
+          "file": "task.md",
+          "sha256": "1da28444e501145bc94a088c2503ee2935deaee4235bc5831316264c04c7353b"
+        },
+        {
+          "bytes": 1196,
+          "file": "context.json",
+          "sha256": "669ef438d8279d4ef8b6ef49011de46182fa4839c22fc4ebab7f16749b3be47b"
+        }
+      ],
+      "repeat": 0,
+      "root": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-37",
+      "state": "completed",
+      "task": "04-completion"
+    },
+    {
+      "agent_context_access": {
+        "completed_tool_items": [],
+        "established": false
+      },
+      "arm": "incomplete",
+      "delivered_context": {
+        "agent_access": "not_yet_run",
+        "arm": "incomplete",
+        "brief": "sha256:4438c8a1dc3c39a8461326c90541a73e701f72a6b1f1c8ae104aa4eb09380aa3",
+        "cache_key": "sha256:8a4aded303aa82ecd2c9aeff33036d0408cffff7a81d8c327487088e83e38e59",
+        "context_record": "sha256:b634fc97d7f07aa74776ed39f886d0caa6c88c998575b4a592cce64aa6d10e71",
+        "context_sha256": "7a74c6907ad7dfcf6186aec11a3188f04802acc976ca79cfc091456bb5bb7ac2",
+        "contribution": "sha256:6d1ec576ce0e2d432ee6fc2c29675ad5782a2478388072ad60f399ee5bda81a8",
+        "coverage": "partial",
+        "delivered": true,
+        "freshness": "exact",
+        "group": "declared",
+        "public": "/private/tmp/aethyme-fx08-contexts-20261012-exact-brief/04-completion-incomplete/public",
+        "source": "sha256:b51a8b781a01aada4c18768ba19b9f8e568e7ddd31322946a266dee6cc9ddb87",
+        "task": "04-completion"
+      },
+      "group": "declared",
+      "model_process_wall_ms": 85,
+      "oracle_sha256": "9832b84d367c4309838df62ca282bc626aaff458a53499ac2a142e84f1063636",
+      "outcome": "model_process_failure",
+      "process": {
+        "exit": 1,
+        "observed_command_allowance": 8,
+        "observed_command_dispatches": 0,
+        "signal": null,
+        "state": "completed",
+        "stderr": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-38/codex.stderr",
+        "stdout": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-38/codex.stdout",
+        "wall_ms": 85
+      },
+      "provider_charge_microunits": null,
+      "provider_usage": {
+        "cache_write_input_tokens": null,
+        "cached_input_tokens": null,
+        "completed_command_tools": 0,
+        "input_tokens": null,
+        "output_tokens": null,
+        "provider_returned_model": null,
+        "turn_failures": 0
+      },
+      "public_inputs": [
+        {
+          "bytes": 506,
+          "file": "source.rs",
+          "sha256": "4bc2bf52ce91287a872d94ce68ef5d8444977834cbe0830dcbb1808ee1c701d9"
+        },
+        {
+          "bytes": 299,
+          "file": "task.md",
+          "sha256": "1da28444e501145bc94a088c2503ee2935deaee4235bc5831316264c04c7353b"
+        },
+        {
+          "bytes": 1741,
+          "file": "context.json",
+          "sha256": "7a74c6907ad7dfcf6186aec11a3188f04802acc976ca79cfc091456bb5bb7ac2"
+        }
+      ],
+      "repeat": 0,
+      "root": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-38",
+      "state": "completed",
+      "task": "04-completion"
+    },
+    {
+      "agent_context_access": {
+        "completed_tool_items": [],
+        "established": false
+      },
+      "arm": "misleading",
+      "delivered_context": {
+        "agent_access": "not_yet_run",
+        "arm": "misleading",
+        "brief": "sha256:2fe821b5ca377311bc1163e2daee71356ab169537fade91c2f99a3a72bb5cd32",
+        "cache_key": "sha256:5442d423543be176fad33947a9fa5de8faa74396565ea45fce5a9f005ec3b3bd",
+        "context_record": "sha256:68649c70844b46104efae3a2f07fae8d559e889469419899c32cd3f4c4ecf331",
+        "context_sha256": "ff45742d660671fa61d8097f711b8dfc19815d6179b0977f6a3b9c9f00b1109f",
+        "contribution": "sha256:6d1ec576ce0e2d432ee6fc2c29675ad5782a2478388072ad60f399ee5bda81a8",
+        "coverage": "partial",
+        "delivered": true,
+        "freshness": "exact",
+        "group": "declared",
+        "public": "/private/tmp/aethyme-fx08-contexts-20261012-exact-brief/04-completion-misleading/public",
+        "source": "sha256:b51a8b781a01aada4c18768ba19b9f8e568e7ddd31322946a266dee6cc9ddb87",
+        "task": "04-completion"
+      },
+      "group": "declared",
+      "model_process_wall_ms": 101,
+      "oracle_sha256": "9832b84d367c4309838df62ca282bc626aaff458a53499ac2a142e84f1063636",
+      "outcome": "model_process_failure",
+      "process": {
+        "exit": 1,
+        "observed_command_allowance": 8,
+        "observed_command_dispatches": 0,
+        "signal": null,
+        "state": "completed",
+        "stderr": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-39/codex.stderr",
+        "stdout": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-39/codex.stdout",
+        "wall_ms": 101
+      },
+      "provider_charge_microunits": null,
+      "provider_usage": {
+        "cache_write_input_tokens": null,
+        "cached_input_tokens": null,
+        "completed_command_tools": 0,
+        "input_tokens": null,
+        "output_tokens": null,
+        "provider_returned_model": null,
+        "turn_failures": 0
+      },
+      "public_inputs": [
+        {
+          "bytes": 506,
+          "file": "source.rs",
+          "sha256": "4bc2bf52ce91287a872d94ce68ef5d8444977834cbe0830dcbb1808ee1c701d9"
+        },
+        {
+          "bytes": 299,
+          "file": "task.md",
+          "sha256": "1da28444e501145bc94a088c2503ee2935deaee4235bc5831316264c04c7353b"
+        },
+        {
+          "bytes": 1749,
+          "file": "context.json",
+          "sha256": "ff45742d660671fa61d8097f711b8dfc19815d6179b0977f6a3b9c9f00b1109f"
+        }
+      ],
+      "repeat": 0,
+      "root": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-39",
+      "state": "completed",
+      "task": "04-completion"
+    },
+    {
+      "agent_context_access": {
+        "completed_tool_items": [],
+        "established": false
+      },
+      "arm": "correct",
+      "delivered_context": {
+        "agent_access": "not_yet_run",
+        "arm": "correct",
+        "brief": "sha256:821a088aacf69e8718a54e15af23983698486bcbad4df164c173fb219a9d77fb",
+        "cache_key": "sha256:32aacf1e2480d408a2c6ed051d8d49d42322dac3cbd8a245ce0daae6bc8836fe",
+        "context_record": "sha256:d01e465212cfa0196c3bbc66b471ba14fd4f7ad9b8345febde6ea370e52064dd",
+        "context_sha256": "074ead8968bd9f8dc55ab434e2f73df889b7e32006ba336e6945ee3f38153adc",
+        "contribution": "sha256:6d1ec576ce0e2d432ee6fc2c29675ad5782a2478388072ad60f399ee5bda81a8",
+        "coverage": "partial",
+        "delivered": true,
+        "freshness": "exact",
+        "group": "declared",
+        "public": "/private/tmp/aethyme-fx08-contexts-20261012-exact-brief/04-completion-correct/public",
+        "source": "sha256:b51a8b781a01aada4c18768ba19b9f8e568e7ddd31322946a266dee6cc9ddb87",
+        "task": "04-completion"
+      },
+      "group": "declared",
+      "model_process_wall_ms": 65,
+      "oracle_sha256": "9832b84d367c4309838df62ca282bc626aaff458a53499ac2a142e84f1063636",
+      "outcome": "model_process_failure",
+      "process": {
+        "exit": 1,
+        "observed_command_allowance": 8,
+        "observed_command_dispatches": 0,
+        "signal": null,
+        "state": "completed",
+        "stderr": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-40/codex.stderr",
+        "stdout": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-40/codex.stdout",
+        "wall_ms": 65
+      },
+      "provider_charge_microunits": null,
+      "provider_usage": {
+        "cache_write_input_tokens": null,
+        "cached_input_tokens": null,
+        "completed_command_tools": 0,
+        "input_tokens": null,
+        "output_tokens": null,
+        "provider_returned_model": null,
+        "turn_failures": 0
+      },
+      "public_inputs": [
+        {
+          "bytes": 506,
+          "file": "source.rs",
+          "sha256": "4bc2bf52ce91287a872d94ce68ef5d8444977834cbe0830dcbb1808ee1c701d9"
+        },
+        {
+          "bytes": 299,
+          "file": "task.md",
+          "sha256": "1da28444e501145bc94a088c2503ee2935deaee4235bc5831316264c04c7353b"
+        },
+        {
+          "bytes": 1767,
+          "file": "context.json",
+          "sha256": "074ead8968bd9f8dc55ab434e2f73df889b7e32006ba336e6945ee3f38153adc"
+        }
+      ],
+      "repeat": 1,
+      "root": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-40",
+      "state": "completed",
+      "task": "04-completion"
+    },
+    {
+      "agent_context_access": {
+        "completed_tool_items": [],
+        "established": false
+      },
+      "arm": "absent",
+      "delivered_context": {
+        "agent_access": "not_yet_run",
+        "arm": "absent",
+        "brief": null,
+        "cache_key": "sha256:040f7a1c1cf03267f489c64e050d99ebdbcbbe95775b222f97aa2c7773dde8b8",
+        "context_record": "sha256:4d701cbd8e4ed673386a176d1e7170e0d2efc07c20470bbdee35b4c60585ee24",
+        "context_sha256": "669ef438d8279d4ef8b6ef49011de46182fa4839c22fc4ebab7f16749b3be47b",
+        "contribution": "sha256:6d1ec576ce0e2d432ee6fc2c29675ad5782a2478388072ad60f399ee5bda81a8",
+        "coverage": "partial",
+        "delivered": true,
+        "freshness": "exact",
+        "group": "declared",
+        "public": "/private/tmp/aethyme-fx08-contexts-20261012-exact-brief/04-completion-absent/public",
+        "source": "sha256:b51a8b781a01aada4c18768ba19b9f8e568e7ddd31322946a266dee6cc9ddb87",
+        "task": "04-completion"
+      },
+      "group": "declared",
+      "model_process_wall_ms": 59,
+      "oracle_sha256": "9832b84d367c4309838df62ca282bc626aaff458a53499ac2a142e84f1063636",
+      "outcome": "model_process_failure",
+      "process": {
+        "exit": 1,
+        "observed_command_allowance": 8,
+        "observed_command_dispatches": 0,
+        "signal": null,
+        "state": "completed",
+        "stderr": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-41/codex.stderr",
+        "stdout": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-41/codex.stdout",
+        "wall_ms": 59
+      },
+      "provider_charge_microunits": null,
+      "provider_usage": {
+        "cache_write_input_tokens": null,
+        "cached_input_tokens": null,
+        "completed_command_tools": 0,
+        "input_tokens": null,
+        "output_tokens": null,
+        "provider_returned_model": null,
+        "turn_failures": 0
+      },
+      "public_inputs": [
+        {
+          "bytes": 506,
+          "file": "source.rs",
+          "sha256": "4bc2bf52ce91287a872d94ce68ef5d8444977834cbe0830dcbb1808ee1c701d9"
+        },
+        {
+          "bytes": 299,
+          "file": "task.md",
+          "sha256": "1da28444e501145bc94a088c2503ee2935deaee4235bc5831316264c04c7353b"
+        },
+        {
+          "bytes": 1196,
+          "file": "context.json",
+          "sha256": "669ef438d8279d4ef8b6ef49011de46182fa4839c22fc4ebab7f16749b3be47b"
+        }
+      ],
+      "repeat": 1,
+      "root": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-41",
+      "state": "completed",
+      "task": "04-completion"
+    },
+    {
+      "agent_context_access": {
+        "completed_tool_items": [],
+        "established": false
+      },
+      "arm": "incomplete",
+      "delivered_context": {
+        "agent_access": "not_yet_run",
+        "arm": "incomplete",
+        "brief": "sha256:4438c8a1dc3c39a8461326c90541a73e701f72a6b1f1c8ae104aa4eb09380aa3",
+        "cache_key": "sha256:8a4aded303aa82ecd2c9aeff33036d0408cffff7a81d8c327487088e83e38e59",
+        "context_record": "sha256:b634fc97d7f07aa74776ed39f886d0caa6c88c998575b4a592cce64aa6d10e71",
+        "context_sha256": "7a74c6907ad7dfcf6186aec11a3188f04802acc976ca79cfc091456bb5bb7ac2",
+        "contribution": "sha256:6d1ec576ce0e2d432ee6fc2c29675ad5782a2478388072ad60f399ee5bda81a8",
+        "coverage": "partial",
+        "delivered": true,
+        "freshness": "exact",
+        "group": "declared",
+        "public": "/private/tmp/aethyme-fx08-contexts-20261012-exact-brief/04-completion-incomplete/public",
+        "source": "sha256:b51a8b781a01aada4c18768ba19b9f8e568e7ddd31322946a266dee6cc9ddb87",
+        "task": "04-completion"
+      },
+      "group": "declared",
+      "model_process_wall_ms": 58,
+      "oracle_sha256": "9832b84d367c4309838df62ca282bc626aaff458a53499ac2a142e84f1063636",
+      "outcome": "model_process_failure",
+      "process": {
+        "exit": 1,
+        "observed_command_allowance": 8,
+        "observed_command_dispatches": 0,
+        "signal": null,
+        "state": "completed",
+        "stderr": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-42/codex.stderr",
+        "stdout": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-42/codex.stdout",
+        "wall_ms": 58
+      },
+      "provider_charge_microunits": null,
+      "provider_usage": {
+        "cache_write_input_tokens": null,
+        "cached_input_tokens": null,
+        "completed_command_tools": 0,
+        "input_tokens": null,
+        "output_tokens": null,
+        "provider_returned_model": null,
+        "turn_failures": 0
+      },
+      "public_inputs": [
+        {
+          "bytes": 506,
+          "file": "source.rs",
+          "sha256": "4bc2bf52ce91287a872d94ce68ef5d8444977834cbe0830dcbb1808ee1c701d9"
+        },
+        {
+          "bytes": 299,
+          "file": "task.md",
+          "sha256": "1da28444e501145bc94a088c2503ee2935deaee4235bc5831316264c04c7353b"
+        },
+        {
+          "bytes": 1741,
+          "file": "context.json",
+          "sha256": "7a74c6907ad7dfcf6186aec11a3188f04802acc976ca79cfc091456bb5bb7ac2"
+        }
+      ],
+      "repeat": 1,
+      "root": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-42",
+      "state": "completed",
+      "task": "04-completion"
+    },
+    {
+      "agent_context_access": {
+        "completed_tool_items": [],
+        "established": false
+      },
+      "arm": "misleading",
+      "delivered_context": {
+        "agent_access": "not_yet_run",
+        "arm": "misleading",
+        "brief": "sha256:2fe821b5ca377311bc1163e2daee71356ab169537fade91c2f99a3a72bb5cd32",
+        "cache_key": "sha256:5442d423543be176fad33947a9fa5de8faa74396565ea45fce5a9f005ec3b3bd",
+        "context_record": "sha256:68649c70844b46104efae3a2f07fae8d559e889469419899c32cd3f4c4ecf331",
+        "context_sha256": "ff45742d660671fa61d8097f711b8dfc19815d6179b0977f6a3b9c9f00b1109f",
+        "contribution": "sha256:6d1ec576ce0e2d432ee6fc2c29675ad5782a2478388072ad60f399ee5bda81a8",
+        "coverage": "partial",
+        "delivered": true,
+        "freshness": "exact",
+        "group": "declared",
+        "public": "/private/tmp/aethyme-fx08-contexts-20261012-exact-brief/04-completion-misleading/public",
+        "source": "sha256:b51a8b781a01aada4c18768ba19b9f8e568e7ddd31322946a266dee6cc9ddb87",
+        "task": "04-completion"
+      },
+      "group": "declared",
+      "model_process_wall_ms": 61,
+      "oracle_sha256": "9832b84d367c4309838df62ca282bc626aaff458a53499ac2a142e84f1063636",
+      "outcome": "model_process_failure",
+      "process": {
+        "exit": 1,
+        "observed_command_allowance": 8,
+        "observed_command_dispatches": 0,
+        "signal": null,
+        "state": "completed",
+        "stderr": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-43/codex.stderr",
+        "stdout": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-43/codex.stdout",
+        "wall_ms": 61
+      },
+      "provider_charge_microunits": null,
+      "provider_usage": {
+        "cache_write_input_tokens": null,
+        "cached_input_tokens": null,
+        "completed_command_tools": 0,
+        "input_tokens": null,
+        "output_tokens": null,
+        "provider_returned_model": null,
+        "turn_failures": 0
+      },
+      "public_inputs": [
+        {
+          "bytes": 506,
+          "file": "source.rs",
+          "sha256": "4bc2bf52ce91287a872d94ce68ef5d8444977834cbe0830dcbb1808ee1c701d9"
+        },
+        {
+          "bytes": 299,
+          "file": "task.md",
+          "sha256": "1da28444e501145bc94a088c2503ee2935deaee4235bc5831316264c04c7353b"
+        },
+        {
+          "bytes": 1749,
+          "file": "context.json",
+          "sha256": "ff45742d660671fa61d8097f711b8dfc19815d6179b0977f6a3b9c9f00b1109f"
+        }
+      ],
+      "repeat": 1,
+      "root": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-43",
+      "state": "completed",
+      "task": "04-completion"
+    },
+    {
+      "agent_context_access": {
+        "completed_tool_items": [],
+        "established": false
+      },
+      "arm": "correct",
+      "delivered_context": {
+        "agent_access": "not_yet_run",
+        "arm": "correct",
+        "brief": "sha256:821a088aacf69e8718a54e15af23983698486bcbad4df164c173fb219a9d77fb",
+        "cache_key": "sha256:32aacf1e2480d408a2c6ed051d8d49d42322dac3cbd8a245ce0daae6bc8836fe",
+        "context_record": "sha256:d01e465212cfa0196c3bbc66b471ba14fd4f7ad9b8345febde6ea370e52064dd",
+        "context_sha256": "074ead8968bd9f8dc55ab434e2f73df889b7e32006ba336e6945ee3f38153adc",
+        "contribution": "sha256:6d1ec576ce0e2d432ee6fc2c29675ad5782a2478388072ad60f399ee5bda81a8",
+        "coverage": "partial",
+        "delivered": true,
+        "freshness": "exact",
+        "group": "declared",
+        "public": "/private/tmp/aethyme-fx08-contexts-20261012-exact-brief/04-completion-correct/public",
+        "source": "sha256:b51a8b781a01aada4c18768ba19b9f8e568e7ddd31322946a266dee6cc9ddb87",
+        "task": "04-completion"
+      },
+      "group": "declared",
+      "model_process_wall_ms": 90,
+      "oracle_sha256": "9832b84d367c4309838df62ca282bc626aaff458a53499ac2a142e84f1063636",
+      "outcome": "model_process_failure",
+      "process": {
+        "exit": 1,
+        "observed_command_allowance": 8,
+        "observed_command_dispatches": 0,
+        "signal": null,
+        "state": "completed",
+        "stderr": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-44/codex.stderr",
+        "stdout": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-44/codex.stdout",
+        "wall_ms": 90
+      },
+      "provider_charge_microunits": null,
+      "provider_usage": {
+        "cache_write_input_tokens": null,
+        "cached_input_tokens": null,
+        "completed_command_tools": 0,
+        "input_tokens": null,
+        "output_tokens": null,
+        "provider_returned_model": null,
+        "turn_failures": 0
+      },
+      "public_inputs": [
+        {
+          "bytes": 506,
+          "file": "source.rs",
+          "sha256": "4bc2bf52ce91287a872d94ce68ef5d8444977834cbe0830dcbb1808ee1c701d9"
+        },
+        {
+          "bytes": 299,
+          "file": "task.md",
+          "sha256": "1da28444e501145bc94a088c2503ee2935deaee4235bc5831316264c04c7353b"
+        },
+        {
+          "bytes": 1767,
+          "file": "context.json",
+          "sha256": "074ead8968bd9f8dc55ab434e2f73df889b7e32006ba336e6945ee3f38153adc"
+        }
+      ],
+      "repeat": 2,
+      "root": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-44",
+      "state": "completed",
+      "task": "04-completion"
+    },
+    {
+      "agent_context_access": {
+        "completed_tool_items": [],
+        "established": false
+      },
+      "arm": "absent",
+      "delivered_context": {
+        "agent_access": "not_yet_run",
+        "arm": "absent",
+        "brief": null,
+        "cache_key": "sha256:040f7a1c1cf03267f489c64e050d99ebdbcbbe95775b222f97aa2c7773dde8b8",
+        "context_record": "sha256:4d701cbd8e4ed673386a176d1e7170e0d2efc07c20470bbdee35b4c60585ee24",
+        "context_sha256": "669ef438d8279d4ef8b6ef49011de46182fa4839c22fc4ebab7f16749b3be47b",
+        "contribution": "sha256:6d1ec576ce0e2d432ee6fc2c29675ad5782a2478388072ad60f399ee5bda81a8",
+        "coverage": "partial",
+        "delivered": true,
+        "freshness": "exact",
+        "group": "declared",
+        "public": "/private/tmp/aethyme-fx08-contexts-20261012-exact-brief/04-completion-absent/public",
+        "source": "sha256:b51a8b781a01aada4c18768ba19b9f8e568e7ddd31322946a266dee6cc9ddb87",
+        "task": "04-completion"
+      },
+      "group": "declared",
+      "model_process_wall_ms": 104,
+      "oracle_sha256": "9832b84d367c4309838df62ca282bc626aaff458a53499ac2a142e84f1063636",
+      "outcome": "model_process_failure",
+      "process": {
+        "exit": 1,
+        "observed_command_allowance": 8,
+        "observed_command_dispatches": 0,
+        "signal": null,
+        "state": "completed",
+        "stderr": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-45/codex.stderr",
+        "stdout": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-45/codex.stdout",
+        "wall_ms": 104
+      },
+      "provider_charge_microunits": null,
+      "provider_usage": {
+        "cache_write_input_tokens": null,
+        "cached_input_tokens": null,
+        "completed_command_tools": 0,
+        "input_tokens": null,
+        "output_tokens": null,
+        "provider_returned_model": null,
+        "turn_failures": 0
+      },
+      "public_inputs": [
+        {
+          "bytes": 506,
+          "file": "source.rs",
+          "sha256": "4bc2bf52ce91287a872d94ce68ef5d8444977834cbe0830dcbb1808ee1c701d9"
+        },
+        {
+          "bytes": 299,
+          "file": "task.md",
+          "sha256": "1da28444e501145bc94a088c2503ee2935deaee4235bc5831316264c04c7353b"
+        },
+        {
+          "bytes": 1196,
+          "file": "context.json",
+          "sha256": "669ef438d8279d4ef8b6ef49011de46182fa4839c22fc4ebab7f16749b3be47b"
+        }
+      ],
+      "repeat": 2,
+      "root": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-45",
+      "state": "completed",
+      "task": "04-completion"
+    },
+    {
+      "agent_context_access": {
+        "completed_tool_items": [],
+        "established": false
+      },
+      "arm": "incomplete",
+      "delivered_context": {
+        "agent_access": "not_yet_run",
+        "arm": "incomplete",
+        "brief": "sha256:4438c8a1dc3c39a8461326c90541a73e701f72a6b1f1c8ae104aa4eb09380aa3",
+        "cache_key": "sha256:8a4aded303aa82ecd2c9aeff33036d0408cffff7a81d8c327487088e83e38e59",
+        "context_record": "sha256:b634fc97d7f07aa74776ed39f886d0caa6c88c998575b4a592cce64aa6d10e71",
+        "context_sha256": "7a74c6907ad7dfcf6186aec11a3188f04802acc976ca79cfc091456bb5bb7ac2",
+        "contribution": "sha256:6d1ec576ce0e2d432ee6fc2c29675ad5782a2478388072ad60f399ee5bda81a8",
+        "coverage": "partial",
+        "delivered": true,
+        "freshness": "exact",
+        "group": "declared",
+        "public": "/private/tmp/aethyme-fx08-contexts-20261012-exact-brief/04-completion-incomplete/public",
+        "source": "sha256:b51a8b781a01aada4c18768ba19b9f8e568e7ddd31322946a266dee6cc9ddb87",
+        "task": "04-completion"
+      },
+      "group": "declared",
+      "model_process_wall_ms": 77,
+      "oracle_sha256": "9832b84d367c4309838df62ca282bc626aaff458a53499ac2a142e84f1063636",
+      "outcome": "model_process_failure",
+      "process": {
+        "exit": 1,
+        "observed_command_allowance": 8,
+        "observed_command_dispatches": 0,
+        "signal": null,
+        "state": "completed",
+        "stderr": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-46/codex.stderr",
+        "stdout": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-46/codex.stdout",
+        "wall_ms": 77
+      },
+      "provider_charge_microunits": null,
+      "provider_usage": {
+        "cache_write_input_tokens": null,
+        "cached_input_tokens": null,
+        "completed_command_tools": 0,
+        "input_tokens": null,
+        "output_tokens": null,
+        "provider_returned_model": null,
+        "turn_failures": 0
+      },
+      "public_inputs": [
+        {
+          "bytes": 506,
+          "file": "source.rs",
+          "sha256": "4bc2bf52ce91287a872d94ce68ef5d8444977834cbe0830dcbb1808ee1c701d9"
+        },
+        {
+          "bytes": 299,
+          "file": "task.md",
+          "sha256": "1da28444e501145bc94a088c2503ee2935deaee4235bc5831316264c04c7353b"
+        },
+        {
+          "bytes": 1741,
+          "file": "context.json",
+          "sha256": "7a74c6907ad7dfcf6186aec11a3188f04802acc976ca79cfc091456bb5bb7ac2"
+        }
+      ],
+      "repeat": 2,
+      "root": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-46",
+      "state": "completed",
+      "task": "04-completion"
+    },
+    {
+      "agent_context_access": {
+        "completed_tool_items": [],
+        "established": false
+      },
+      "arm": "misleading",
+      "delivered_context": {
+        "agent_access": "not_yet_run",
+        "arm": "misleading",
+        "brief": "sha256:2fe821b5ca377311bc1163e2daee71356ab169537fade91c2f99a3a72bb5cd32",
+        "cache_key": "sha256:5442d423543be176fad33947a9fa5de8faa74396565ea45fce5a9f005ec3b3bd",
+        "context_record": "sha256:68649c70844b46104efae3a2f07fae8d559e889469419899c32cd3f4c4ecf331",
+        "context_sha256": "ff45742d660671fa61d8097f711b8dfc19815d6179b0977f6a3b9c9f00b1109f",
+        "contribution": "sha256:6d1ec576ce0e2d432ee6fc2c29675ad5782a2478388072ad60f399ee5bda81a8",
+        "coverage": "partial",
+        "delivered": true,
+        "freshness": "exact",
+        "group": "declared",
+        "public": "/private/tmp/aethyme-fx08-contexts-20261012-exact-brief/04-completion-misleading/public",
+        "source": "sha256:b51a8b781a01aada4c18768ba19b9f8e568e7ddd31322946a266dee6cc9ddb87",
+        "task": "04-completion"
+      },
+      "group": "declared",
+      "model_process_wall_ms": 60,
+      "oracle_sha256": "9832b84d367c4309838df62ca282bc626aaff458a53499ac2a142e84f1063636",
+      "outcome": "model_process_failure",
+      "process": {
+        "exit": 1,
+        "observed_command_allowance": 8,
+        "observed_command_dispatches": 0,
+        "signal": null,
+        "state": "completed",
+        "stderr": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-47/codex.stderr",
+        "stdout": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-47/codex.stdout",
+        "wall_ms": 60
+      },
+      "provider_charge_microunits": null,
+      "provider_usage": {
+        "cache_write_input_tokens": null,
+        "cached_input_tokens": null,
+        "completed_command_tools": 0,
+        "input_tokens": null,
+        "output_tokens": null,
+        "provider_returned_model": null,
+        "turn_failures": 0
+      },
+      "public_inputs": [
+        {
+          "bytes": 506,
+          "file": "source.rs",
+          "sha256": "4bc2bf52ce91287a872d94ce68ef5d8444977834cbe0830dcbb1808ee1c701d9"
+        },
+        {
+          "bytes": 299,
+          "file": "task.md",
+          "sha256": "1da28444e501145bc94a088c2503ee2935deaee4235bc5831316264c04c7353b"
+        },
+        {
+          "bytes": 1749,
+          "file": "context.json",
+          "sha256": "ff45742d660671fa61d8097f711b8dfc19815d6179b0977f6a3b9c9f00b1109f"
+        }
+      ],
+      "repeat": 2,
+      "root": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-47",
+      "state": "completed",
+      "task": "04-completion"
+    },
+    {
+      "agent_context_access": {
+        "completed_tool_items": [],
+        "established": false
+      },
+      "arm": "correct",
+      "delivered_context": {
+        "agent_access": "not_yet_run",
+        "arm": "correct",
+        "brief": "sha256:22e86ed73f8e8e917ab2b3d7e3e5c77c1490607ef4b6f4eaa8eea14f65f15f45",
+        "cache_key": "sha256:835beb9f68ecf01d4ae8a4e6a1bff9fea5a79bca981c546b06dee8c50864126a",
+        "context_record": "sha256:08c026665fb243719c9f89c8f10daa93e1a97ce75ded199146d8a1cefaaa569b",
+        "context_sha256": "c3fad0d98a07ea3d605243d97229f8e9f90e2c0c4758d0bee8fd5d8930ef7b86",
+        "contribution": "sha256:2535597bd51ff60ccabec73ad45f60b62f9424c40bb82f2e9a864a77bd1ceab6",
+        "coverage": "partial",
+        "delivered": true,
+        "freshness": "exact",
+        "group": "sealed",
+        "public": "/private/tmp/aethyme-fx08-contexts-20261012-exact-brief/05-identifiers-correct/public",
+        "source": "sha256:bad8b14cc57b6b6e8056407d84a3c95a915c8b90c07b19bd30a380777a015750",
+        "task": "05-identifiers"
+      },
+      "group": "sealed",
+      "model_process_wall_ms": 53,
+      "oracle_sha256": "aa5d5f8a5ff2d22d9d33ee1b9303a340aa4589fad2bf05e58453e1389dbb57bb",
+      "outcome": "model_process_failure",
+      "process": {
+        "exit": 1,
+        "observed_command_allowance": 8,
+        "observed_command_dispatches": 0,
+        "signal": null,
+        "state": "completed",
+        "stderr": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-48/codex.stderr",
+        "stdout": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-48/codex.stdout",
+        "wall_ms": 53
+      },
+      "provider_charge_microunits": null,
+      "provider_usage": {
+        "cache_write_input_tokens": null,
+        "cached_input_tokens": null,
+        "completed_command_tools": 0,
+        "input_tokens": null,
+        "output_tokens": null,
+        "provider_returned_model": null,
+        "turn_failures": 0
+      },
+      "public_inputs": [
+        {
+          "bytes": 396,
+          "file": "source.rs",
+          "sha256": "4944055a69006639c0119269a331348919f277b99a92f16b432f0b6ea541dc67"
+        },
+        {
+          "bytes": 280,
+          "file": "task.md",
+          "sha256": "5540045d19be598ece1c76c3af563329648b1681f1ef47c7ca7a6e5543784246"
+        },
+        {
+          "bytes": 1751,
+          "file": "context.json",
+          "sha256": "c3fad0d98a07ea3d605243d97229f8e9f90e2c0c4758d0bee8fd5d8930ef7b86"
+        }
+      ],
+      "repeat": 0,
+      "root": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-48",
+      "state": "completed",
+      "task": "05-identifiers"
+    },
+    {
+      "agent_context_access": {
+        "completed_tool_items": [],
+        "established": false
+      },
+      "arm": "absent",
+      "delivered_context": {
+        "agent_access": "not_yet_run",
+        "arm": "absent",
+        "brief": null,
+        "cache_key": "sha256:4f45e82ba55032ee833827576879511614aec9a9c4e555a182d888c7656d6558",
+        "context_record": "sha256:bad01b3bea1a90f7389644b8018293eb13fa490f2a8958e048bf9acf8e45d701",
+        "context_sha256": "64d1f765d1c5aef55b6d6a3348baa0829c6b4e71b37c752057f7c0c4ac8f60de",
+        "contribution": "sha256:2535597bd51ff60ccabec73ad45f60b62f9424c40bb82f2e9a864a77bd1ceab6",
+        "coverage": "partial",
+        "delivered": true,
+        "freshness": "exact",
+        "group": "sealed",
+        "public": "/private/tmp/aethyme-fx08-contexts-20261012-exact-brief/05-identifiers-absent/public",
+        "source": "sha256:bad8b14cc57b6b6e8056407d84a3c95a915c8b90c07b19bd30a380777a015750",
+        "task": "05-identifiers"
+      },
+      "group": "sealed",
+      "model_process_wall_ms": 95,
+      "oracle_sha256": "aa5d5f8a5ff2d22d9d33ee1b9303a340aa4589fad2bf05e58453e1389dbb57bb",
+      "outcome": "model_process_failure",
+      "process": {
+        "exit": 1,
+        "observed_command_allowance": 8,
+        "observed_command_dispatches": 0,
+        "signal": null,
+        "state": "completed",
+        "stderr": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-49/codex.stderr",
+        "stdout": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-49/codex.stdout",
+        "wall_ms": 95
+      },
+      "provider_charge_microunits": null,
+      "provider_usage": {
+        "cache_write_input_tokens": null,
+        "cached_input_tokens": null,
+        "completed_command_tools": 0,
+        "input_tokens": null,
+        "output_tokens": null,
+        "provider_returned_model": null,
+        "turn_failures": 0
+      },
+      "public_inputs": [
+        {
+          "bytes": 396,
+          "file": "source.rs",
+          "sha256": "4944055a69006639c0119269a331348919f277b99a92f16b432f0b6ea541dc67"
+        },
+        {
+          "bytes": 280,
+          "file": "task.md",
+          "sha256": "5540045d19be598ece1c76c3af563329648b1681f1ef47c7ca7a6e5543784246"
+        },
+        {
+          "bytes": 1196,
+          "file": "context.json",
+          "sha256": "64d1f765d1c5aef55b6d6a3348baa0829c6b4e71b37c752057f7c0c4ac8f60de"
+        }
+      ],
+      "repeat": 0,
+      "root": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-49",
+      "state": "completed",
+      "task": "05-identifiers"
+    },
+    {
+      "agent_context_access": {
+        "completed_tool_items": [],
+        "established": false
+      },
+      "arm": "incomplete",
+      "delivered_context": {
+        "agent_access": "not_yet_run",
+        "arm": "incomplete",
+        "brief": "sha256:32cc2c855ca68e5e4024658c36874195a9aa3896a965da8a522ac7028ebc7fea",
+        "cache_key": "sha256:dc06317a1323b508387bcc9ee3e7eabd59800898c3e017be6cbf905dc99c43fb",
+        "context_record": "sha256:334fe077d2457ce92aaa6bede1449af0b71611ae6257b76720f6c71f439c333a",
+        "context_sha256": "f4e9415d6903d53861953ee75a1c77e6f3b002a0493399af066a42fa7efee555",
+        "contribution": "sha256:2535597bd51ff60ccabec73ad45f60b62f9424c40bb82f2e9a864a77bd1ceab6",
+        "coverage": "partial",
+        "delivered": true,
+        "freshness": "exact",
+        "group": "sealed",
+        "public": "/private/tmp/aethyme-fx08-contexts-20261012-exact-brief/05-identifiers-incomplete/public",
+        "source": "sha256:bad8b14cc57b6b6e8056407d84a3c95a915c8b90c07b19bd30a380777a015750",
+        "task": "05-identifiers"
+      },
+      "group": "sealed",
+      "model_process_wall_ms": 78,
+      "oracle_sha256": "aa5d5f8a5ff2d22d9d33ee1b9303a340aa4589fad2bf05e58453e1389dbb57bb",
+      "outcome": "model_process_failure",
+      "process": {
+        "exit": 1,
+        "observed_command_allowance": 8,
+        "observed_command_dispatches": 0,
+        "signal": null,
+        "state": "completed",
+        "stderr": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-50/codex.stderr",
+        "stdout": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-50/codex.stdout",
+        "wall_ms": 78
+      },
+      "provider_charge_microunits": null,
+      "provider_usage": {
+        "cache_write_input_tokens": null,
+        "cached_input_tokens": null,
+        "completed_command_tools": 0,
+        "input_tokens": null,
+        "output_tokens": null,
+        "provider_returned_model": null,
+        "turn_failures": 0
+      },
+      "public_inputs": [
+        {
+          "bytes": 396,
+          "file": "source.rs",
+          "sha256": "4944055a69006639c0119269a331348919f277b99a92f16b432f0b6ea541dc67"
+        },
+        {
+          "bytes": 280,
+          "file": "task.md",
+          "sha256": "5540045d19be598ece1c76c3af563329648b1681f1ef47c7ca7a6e5543784246"
+        },
+        {
+          "bytes": 1739,
+          "file": "context.json",
+          "sha256": "f4e9415d6903d53861953ee75a1c77e6f3b002a0493399af066a42fa7efee555"
+        }
+      ],
+      "repeat": 0,
+      "root": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-50",
+      "state": "completed",
+      "task": "05-identifiers"
+    },
+    {
+      "agent_context_access": {
+        "completed_tool_items": [],
+        "established": false
+      },
+      "arm": "misleading",
+      "delivered_context": {
+        "agent_access": "not_yet_run",
+        "arm": "misleading",
+        "brief": "sha256:3515947abbf39f6f3d526b6e45ded73449039a6752e8b9f99075a160a5f02030",
+        "cache_key": "sha256:59f83cc0a612c64f961df7dc3db35e70e1d127e8bdb1d6aebdb3541ae75e1a56",
+        "context_record": "sha256:0a4cef1059a395c2bc805b192265b8a13bd698e6fea0a3d9cb4eb147aa3d9017",
+        "context_sha256": "8b06953ac22d9bf7ce453c4f149e1578cee76e4e924eed8a2df69ab4410526c6",
+        "contribution": "sha256:2535597bd51ff60ccabec73ad45f60b62f9424c40bb82f2e9a864a77bd1ceab6",
+        "coverage": "partial",
+        "delivered": true,
+        "freshness": "exact",
+        "group": "sealed",
+        "public": "/private/tmp/aethyme-fx08-contexts-20261012-exact-brief/05-identifiers-misleading/public",
+        "source": "sha256:bad8b14cc57b6b6e8056407d84a3c95a915c8b90c07b19bd30a380777a015750",
+        "task": "05-identifiers"
+      },
+      "group": "sealed",
+      "model_process_wall_ms": 119,
+      "oracle_sha256": "aa5d5f8a5ff2d22d9d33ee1b9303a340aa4589fad2bf05e58453e1389dbb57bb",
+      "outcome": "model_process_failure",
+      "process": {
+        "exit": 1,
+        "observed_command_allowance": 8,
+        "observed_command_dispatches": 0,
+        "signal": null,
+        "state": "completed",
+        "stderr": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-51/codex.stderr",
+        "stdout": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-51/codex.stdout",
+        "wall_ms": 119
+      },
+      "provider_charge_microunits": null,
+      "provider_usage": {
+        "cache_write_input_tokens": null,
+        "cached_input_tokens": null,
+        "completed_command_tools": 0,
+        "input_tokens": null,
+        "output_tokens": null,
+        "provider_returned_model": null,
+        "turn_failures": 0
+      },
+      "public_inputs": [
+        {
+          "bytes": 396,
+          "file": "source.rs",
+          "sha256": "4944055a69006639c0119269a331348919f277b99a92f16b432f0b6ea541dc67"
+        },
+        {
+          "bytes": 280,
+          "file": "task.md",
+          "sha256": "5540045d19be598ece1c76c3af563329648b1681f1ef47c7ca7a6e5543784246"
+        },
+        {
+          "bytes": 1759,
+          "file": "context.json",
+          "sha256": "8b06953ac22d9bf7ce453c4f149e1578cee76e4e924eed8a2df69ab4410526c6"
+        }
+      ],
+      "repeat": 0,
+      "root": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-51",
+      "state": "completed",
+      "task": "05-identifiers"
+    },
+    {
+      "agent_context_access": {
+        "completed_tool_items": [],
+        "established": false
+      },
+      "arm": "correct",
+      "delivered_context": {
+        "agent_access": "not_yet_run",
+        "arm": "correct",
+        "brief": "sha256:055dfb8a3aedb616e1b1565b1e60a747c2a7d10517077f1153af2e9fba153868",
+        "cache_key": "sha256:02df603f961e9ba95c72c5c9a9da54e55e2e1b0227aa91c57fa825191aaa208d",
+        "context_record": "sha256:cd0628abeb90dcaa5c2174d6619c92849ee4e8554a43efe2f64dce1fa4daedf0",
+        "context_sha256": "19c81d29c80d7cef12c806b93ba2218548363660bc376c4ea83ff40ce7193723",
+        "contribution": "sha256:f64f0b930becd7fc5c708f8dab64937fdb2601ee297a4a5545341d50297cbd24",
+        "coverage": "partial",
+        "delivered": true,
+        "freshness": "exact",
+        "group": "sealed",
+        "public": "/private/tmp/aethyme-fx08-contexts-20261012-exact-brief/06-lookup-correct/public",
+        "source": "sha256:50f9760cd2f96e14e2215d129527913955195b5e5f6c26ee03929d4452fda075",
+        "task": "06-lookup"
+      },
+      "group": "sealed",
+      "model_process_wall_ms": 131,
+      "oracle_sha256": "4fd892bbf4b85862b354b0050cc2eaca150c1fcf3b0396716b23b57ce3aec171",
+      "outcome": "model_process_failure",
+      "process": {
+        "exit": 1,
+        "observed_command_allowance": 8,
+        "observed_command_dispatches": 0,
+        "signal": null,
+        "state": "completed",
+        "stderr": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-52/codex.stderr",
+        "stdout": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-52/codex.stdout",
+        "wall_ms": 131
+      },
+      "provider_charge_microunits": null,
+      "provider_usage": {
+        "cache_write_input_tokens": null,
+        "cached_input_tokens": null,
+        "completed_command_tools": 0,
+        "input_tokens": null,
+        "output_tokens": null,
+        "provider_returned_model": null,
+        "turn_failures": 0
+      },
+      "public_inputs": [
+        {
+          "bytes": 322,
+          "file": "source.rs",
+          "sha256": "3c89983fab3c3d6a1073c818dca20203168c02760ad511ef9feb604cdd8da798"
+        },
+        {
+          "bytes": 332,
+          "file": "task.md",
+          "sha256": "445b0e5328de131b4fe681814d9895a73fd6d8ef526aceeba4caa8635705e390"
+        },
+        {
+          "bytes": 1754,
+          "file": "context.json",
+          "sha256": "19c81d29c80d7cef12c806b93ba2218548363660bc376c4ea83ff40ce7193723"
+        }
+      ],
+      "repeat": 0,
+      "root": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-52",
+      "state": "completed",
+      "task": "06-lookup"
+    },
+    {
+      "agent_context_access": {
+        "completed_tool_items": [],
+        "established": false
+      },
+      "arm": "absent",
+      "delivered_context": {
+        "agent_access": "not_yet_run",
+        "arm": "absent",
+        "brief": null,
+        "cache_key": "sha256:1ca1c18daa7b7e97c207fd4741642f7ac288bb9f2b860d28caed0a75df14dbb2",
+        "context_record": "sha256:c13e4425cf4b0f4959b3b84239fec5c27b9b70ec5b2b34cde871a54458dfa9fa",
+        "context_sha256": "79dfef5500dfc511f7a896145865a7e890c2f208af0452e2ecb5e36d84435286",
+        "contribution": "sha256:f64f0b930becd7fc5c708f8dab64937fdb2601ee297a4a5545341d50297cbd24",
+        "coverage": "partial",
+        "delivered": true,
+        "freshness": "exact",
+        "group": "sealed",
+        "public": "/private/tmp/aethyme-fx08-contexts-20261012-exact-brief/06-lookup-absent/public",
+        "source": "sha256:50f9760cd2f96e14e2215d129527913955195b5e5f6c26ee03929d4452fda075",
+        "task": "06-lookup"
+      },
+      "group": "sealed",
+      "model_process_wall_ms": 62,
+      "oracle_sha256": "4fd892bbf4b85862b354b0050cc2eaca150c1fcf3b0396716b23b57ce3aec171",
+      "outcome": "model_process_failure",
+      "process": {
+        "exit": 1,
+        "observed_command_allowance": 8,
+        "observed_command_dispatches": 0,
+        "signal": null,
+        "state": "completed",
+        "stderr": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-53/codex.stderr",
+        "stdout": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-53/codex.stdout",
+        "wall_ms": 62
+      },
+      "provider_charge_microunits": null,
+      "provider_usage": {
+        "cache_write_input_tokens": null,
+        "cached_input_tokens": null,
+        "completed_command_tools": 0,
+        "input_tokens": null,
+        "output_tokens": null,
+        "provider_returned_model": null,
+        "turn_failures": 0
+      },
+      "public_inputs": [
+        {
+          "bytes": 322,
+          "file": "source.rs",
+          "sha256": "3c89983fab3c3d6a1073c818dca20203168c02760ad511ef9feb604cdd8da798"
+        },
+        {
+          "bytes": 332,
+          "file": "task.md",
+          "sha256": "445b0e5328de131b4fe681814d9895a73fd6d8ef526aceeba4caa8635705e390"
+        },
+        {
+          "bytes": 1196,
+          "file": "context.json",
+          "sha256": "79dfef5500dfc511f7a896145865a7e890c2f208af0452e2ecb5e36d84435286"
+        }
+      ],
+      "repeat": 0,
+      "root": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-53",
+      "state": "completed",
+      "task": "06-lookup"
+    },
+    {
+      "agent_context_access": {
+        "completed_tool_items": [],
+        "established": false
+      },
+      "arm": "incomplete",
+      "delivered_context": {
+        "agent_access": "not_yet_run",
+        "arm": "incomplete",
+        "brief": "sha256:74e5b0a80da4e63fc8ffe3b45ef54a806102c000e0e81bce8cab5d78c7bf974b",
+        "cache_key": "sha256:913802da2d50731c4bd7069919db78d8ed70ec5b82f7534e2d55396015ef4016",
+        "context_record": "sha256:2863fab891cf9f0ea2a0649c078b35e10428d8f492770cdba5e52b7766baa443",
+        "context_sha256": "4ec79d3e315ce0df4220daaf6d66f212e46fa37508ce9f4c946499a8047e462d",
+        "contribution": "sha256:f64f0b930becd7fc5c708f8dab64937fdb2601ee297a4a5545341d50297cbd24",
+        "coverage": "partial",
+        "delivered": true,
+        "freshness": "exact",
+        "group": "sealed",
+        "public": "/private/tmp/aethyme-fx08-contexts-20261012-exact-brief/06-lookup-incomplete/public",
+        "source": "sha256:50f9760cd2f96e14e2215d129527913955195b5e5f6c26ee03929d4452fda075",
+        "task": "06-lookup"
+      },
+      "group": "sealed",
+      "model_process_wall_ms": 57,
+      "oracle_sha256": "4fd892bbf4b85862b354b0050cc2eaca150c1fcf3b0396716b23b57ce3aec171",
+      "outcome": "model_process_failure",
+      "process": {
+        "exit": 1,
+        "observed_command_allowance": 8,
+        "observed_command_dispatches": 0,
+        "signal": null,
+        "state": "completed",
+        "stderr": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-54/codex.stderr",
+        "stdout": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-54/codex.stdout",
+        "wall_ms": 57
+      },
+      "provider_charge_microunits": null,
+      "provider_usage": {
+        "cache_write_input_tokens": null,
+        "cached_input_tokens": null,
+        "completed_command_tools": 0,
+        "input_tokens": null,
+        "output_tokens": null,
+        "provider_returned_model": null,
+        "turn_failures": 0
+      },
+      "public_inputs": [
+        {
+          "bytes": 322,
+          "file": "source.rs",
+          "sha256": "3c89983fab3c3d6a1073c818dca20203168c02760ad511ef9feb604cdd8da798"
+        },
+        {
+          "bytes": 332,
+          "file": "task.md",
+          "sha256": "445b0e5328de131b4fe681814d9895a73fd6d8ef526aceeba4caa8635705e390"
+        },
+        {
+          "bytes": 1743,
+          "file": "context.json",
+          "sha256": "4ec79d3e315ce0df4220daaf6d66f212e46fa37508ce9f4c946499a8047e462d"
+        }
+      ],
+      "repeat": 0,
+      "root": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-54",
+      "state": "completed",
+      "task": "06-lookup"
+    },
+    {
+      "agent_context_access": {
+        "completed_tool_items": [],
+        "established": false
+      },
+      "arm": "misleading",
+      "delivered_context": {
+        "agent_access": "not_yet_run",
+        "arm": "misleading",
+        "brief": "sha256:62afd4f448781b25c49676fde76126fbcd318196c2e9a653c06d5e4f57ffe627",
+        "cache_key": "sha256:8ca9af843e4a6fa4948bda38f5a85a614c651e3ceaa25ab1a838d8fd5ead4fb2",
+        "context_record": "sha256:5db35718caf341146b58c56ee8df5013589ed33eff8fa54d5b5ce06a2332541d",
+        "context_sha256": "3e28bed3fc297b79772d6276b5c1a2deb689943ad9a1f4148b271f806ac8502a",
+        "contribution": "sha256:f64f0b930becd7fc5c708f8dab64937fdb2601ee297a4a5545341d50297cbd24",
+        "coverage": "partial",
+        "delivered": true,
+        "freshness": "exact",
+        "group": "sealed",
+        "public": "/private/tmp/aethyme-fx08-contexts-20261012-exact-brief/06-lookup-misleading/public",
+        "source": "sha256:50f9760cd2f96e14e2215d129527913955195b5e5f6c26ee03929d4452fda075",
+        "task": "06-lookup"
+      },
+      "group": "sealed",
+      "model_process_wall_ms": 157,
+      "oracle_sha256": "4fd892bbf4b85862b354b0050cc2eaca150c1fcf3b0396716b23b57ce3aec171",
+      "outcome": "model_process_failure",
+      "process": {
+        "exit": 1,
+        "observed_command_allowance": 8,
+        "observed_command_dispatches": 0,
+        "signal": null,
+        "state": "completed",
+        "stderr": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-55/codex.stderr",
+        "stdout": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-55/codex.stdout",
+        "wall_ms": 157
+      },
+      "provider_charge_microunits": null,
+      "provider_usage": {
+        "cache_write_input_tokens": null,
+        "cached_input_tokens": null,
+        "completed_command_tools": 0,
+        "input_tokens": null,
+        "output_tokens": null,
+        "provider_returned_model": null,
+        "turn_failures": 0
+      },
+      "public_inputs": [
+        {
+          "bytes": 322,
+          "file": "source.rs",
+          "sha256": "3c89983fab3c3d6a1073c818dca20203168c02760ad511ef9feb604cdd8da798"
+        },
+        {
+          "bytes": 332,
+          "file": "task.md",
+          "sha256": "445b0e5328de131b4fe681814d9895a73fd6d8ef526aceeba4caa8635705e390"
+        },
+        {
+          "bytes": 1763,
+          "file": "context.json",
+          "sha256": "3e28bed3fc297b79772d6276b5c1a2deb689943ad9a1f4148b271f806ac8502a"
+        }
+      ],
+      "repeat": 0,
+      "root": "/private/tmp/aethyme-fx08-matched-campaign-20261012-7cb0bffc/trial-55",
+      "state": "completed",
+      "task": "06-lookup"
+    }
+  ],
+  "runtime_files": [
+    [
+      "bin/codex-code-mode-host",
+      "0960435a104cf926e18bb938b8f6f8fcdf7e27be0c8d88e1911bc22a1de7d3e6"
+    ],
+    [
+      "codex-package.json",
+      "d932d8aed7d2cd6aee5dedccad6c30ddfa8ca10bce945f19c5780ab21291eb29"
+    ],
+    [
+      "codex-path/rg",
+      "cdd3c7bcc328730ac6bfbc04d19c0cfa1d23c1a3a838a8dc45ea7d84fda11b15"
+    ],
+    [
+      "codex-resources/zsh/bin/zsh",
+      "78baefdeac8715fe8a99b60d112f45daa2feaeb5068cd7b116c75300f1402d50"
+    ]
+  ],
+  "schema": "aethyme.fx08.actual-matched-campaign/v1",
+  "state": "completed"
+}

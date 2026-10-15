@@ -1,0 +1,1 @@
+Improve display to `ESCAPED_LABEL [ESCAPED_ID]`, using escaped for both values. Add public fn filtered(items: &[Item], needle: &str) -> Vec<Item> selecting entries whose label contains needle case-sensitively, preserving order. Keep exact lookup semantics and existing API types.

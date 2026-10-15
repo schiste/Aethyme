@@ -1,0 +1,618 @@
+[
+  {
+    "row": 0,
+    "task": "01-optional",
+    "arm": "correct",
+    "repeat": 0,
+    "group": "declared",
+    "proposal": {
+      "decision": "Unable to implement: the required files are under /private/tmp, which this session explicitly denies reading. I did not inspect them.",
+      "source": ""
+    }
+  },
+  {
+    "row": 1,
+    "task": "01-optional",
+    "arm": "absent",
+    "repeat": 0,
+    "group": "declared",
+    "proposal": {
+      "decision": "Unable to implement: filesystem policy denies reading the workspace under /private/tmp, including source.rs, task.md, and context.json.",
+      "source": ""
+    }
+  },
+  {
+    "row": 2,
+    "task": "01-optional",
+    "arm": "incomplete",
+    "repeat": 0,
+    "group": "declared",
+    "proposal": {
+      "decision": "Unable to implement: the workspace is under `/private/tmp`, which this session explicitly denies reading. I could not inspect `source.rs`, `task.md`, or `context.json`.",
+      "source": ""
+    }
+  },
+  {
+    "row": 3,
+    "task": "01-optional",
+    "arm": "misleading",
+    "repeat": 0,
+    "group": "declared",
+    "proposal": {
+      "decision": "Added public `parse_entry` with trimmed-token validation and indexed diagnostics; preserved `parse_feature` defaults and empty-setting behavior.",
+      "source": "pub fn parse_entry(entry: &str, index: usize) -> Result<String, String> {\n    let entry = entry.trim();\n    if entry.is_empty()\n        || !entry\n            .bytes()\n            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'_' || c == b'-')\n    {\n        Err(format!(\"feature entry {index} invalid: {entry}\"))\n    } else {\n        Ok(entry.to_string())\n    }\n}\n\npub fn parse_feature(setting: Option<&str>) -> Result<Vec<String>, String> {\n    let Some(setting) = setting else {\n        return Ok(vec![\"search\".into(), \"labels\".into()]);\n    };\n    if setting.is_empty() {\n        return Ok(Vec::new());\n    }\n    setting\n        .split(',')\n        .enumerate()\n        .map(|(index, entry)| parse_entry(entry, index))\n        .collect()\n}"
+    }
+  },
+  {
+    "row": 4,
+    "task": "01-optional",
+    "arm": "correct",
+    "repeat": 1,
+    "group": "declared",
+    "proposal": {
+      "decision": "Extracted public parse_entry with indexed diagnostics while preserving defaults and empty-setting behavior.",
+      "source": "pub fn parse_entry(entry: &str, index: usize) -> Result<String, String> {\n    let token = entry.trim();\n    if token.is_empty()\n        || !token\n            .bytes()\n            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'_' || c == b'-')\n    {\n        Err(format!(\"feature entry {index} invalid: {token}\"))\n    } else {\n        Ok(token.to_string())\n    }\n}\n\npub fn parse_feature(setting: Option<&str>) -> Result<Vec<String>, String> {\n    let Some(setting) = setting else {\n        return Ok(vec![\"search\".into(), \"labels\".into()]);\n    };\n    if setting.is_empty() {\n        return Ok(Vec::new());\n    }\n    setting\n        .split(',')\n        .enumerate()\n        .map(|(index, entry)| parse_entry(entry, index))\n        .collect()\n}"
+    }
+  },
+  {
+    "row": 5,
+    "task": "01-optional",
+    "arm": "absent",
+    "repeat": 1,
+    "group": "declared",
+    "proposal": {
+      "decision": "Refactored entry validation into the new public `parse_entry` function. `parse_feature` keeps its signature, defaults, empty-setting behavior, and now reports invalid entries with their zero-based index and trimmed token.",
+      "source": "pub fn parse_entry(entry: &str, index: usize) -> Result<String, String> {\n    let entry = entry.trim();\n    if entry.is_empty()\n        || !entry\n            .bytes()\n            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'_' || c == b'-')\n    {\n        Err(format!(\"feature entry {index} invalid: {entry}\"))\n    } else {\n        Ok(entry.to_string())\n    }\n}\n\npub fn parse_feature(setting: Option<&str>) -> Result<Vec<String>, String> {\n    let Some(setting) = setting else {\n        return Ok(vec![\"search\".into(), \"labels\".into()]);\n    };\n    if setting.is_empty() {\n        return Ok(Vec::new());\n    }\n    setting\n        .split(',')\n        .enumerate()\n        .map(|(index, entry)| parse_entry(entry, index))\n        .collect()\n}\n"
+    }
+  },
+  {
+    "row": 6,
+    "task": "01-optional",
+    "arm": "incomplete",
+    "repeat": 1,
+    "group": "declared",
+    "proposal": {
+      "decision": "Added public `parse_entry` with trimmed-token validation and indexed diagnostics; `parse_feature` preserves its defaults, empty-setting behavior, and signature while delegating each entry.",
+      "source": "pub fn parse_entry(entry: &str, index: usize) -> Result<String, String> {\n    let entry = entry.trim();\n    if entry.is_empty()\n        || !entry\n            .bytes()\n            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'_' || c == b'-')\n    {\n        Err(format!(\"feature entry {index} invalid: {entry}\"))\n    } else {\n        Ok(entry.to_string())\n    }\n}\n\npub fn parse_feature(setting: Option<&str>) -> Result<Vec<String>, String> {\n    let Some(setting) = setting else {\n        return Ok(vec![\"search\".into(), \"labels\".into()]);\n    };\n    if setting.is_empty() {\n        return Ok(Vec::new());\n    }\n    setting\n        .split(',')\n        .enumerate()\n        .map(|(index, entry)| parse_entry(entry, index))\n        .collect()\n}\n"
+    }
+  },
+  {
+    "row": 7,
+    "task": "01-optional",
+    "arm": "misleading",
+    "repeat": 1,
+    "group": "declared",
+    "proposal": {
+      "decision": "I can\u2019t read the requested files: the active filesystem policy denies access to /private/tmp. I can\u2019t safely implement the change without them.",
+      "source": ""
+    }
+  },
+  {
+    "row": 8,
+    "task": "01-optional",
+    "arm": "correct",
+    "repeat": 2,
+    "group": "declared",
+    "proposal": {
+      "decision": "Unable to read the requested files: the workspace is under /private/tmp, which the active filesystem policy explicitly denies. I did not inspect or edit files.",
+      "source": ""
+    }
+  },
+  {
+    "row": 9,
+    "task": "01-optional",
+    "arm": "absent",
+    "repeat": 2,
+    "group": "declared",
+    "proposal": {
+      "decision": "Refactored parsing through public `parse_entry`; preserved defaults and empty-setting behavior.",
+      "source": "pub fn parse_entry(entry: &str, index: usize) -> Result<String, String> {\n    let token = entry.trim();\n    if token.is_empty()\n        || !token\n            .bytes()\n            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'_' || c == b'-')\n    {\n        Err(format!(\"feature entry {index} invalid: {token}\"))\n    } else {\n        Ok(token.to_string())\n    }\n}\n\npub fn parse_feature(setting: Option<&str>) -> Result<Vec<String>, String> {\n    let Some(setting) = setting else {\n        return Ok(vec![\"search\".into(), \"labels\".into()]);\n    };\n    if setting.is_empty() {\n        return Ok(Vec::new());\n    }\n    setting\n        .split(',')\n        .enumerate()\n        .map(|(index, entry)| parse_entry(entry, index))\n        .collect()\n}"
+    }
+  },
+  {
+    "row": 10,
+    "task": "01-optional",
+    "arm": "incomplete",
+    "repeat": 2,
+    "group": "declared",
+    "proposal": {
+      "decision": "Implemented public per-entry parsing with trimmed-token validation and indexed diagnostics. Kept parse_feature\u2019s signature and default/empty-setting behavior.",
+      "source": "pub fn parse_entry(entry: &str, index: usize) -> Result<String, String> {\n    let entry = entry.trim();\n    if entry.is_empty()\n        || !entry\n            .bytes()\n            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'_' || c == b'-')\n    {\n        Err(format!(\"feature entry {index} invalid: {entry}\"))\n    } else {\n        Ok(entry.to_string())\n    }\n}\n\npub fn parse_feature(setting: Option<&str>) -> Result<Vec<String>, String> {\n    let Some(setting) = setting else {\n        return Ok(vec![\"search\".into(), \"labels\".into()]);\n    };\n    if setting.is_empty() {\n        return Ok(Vec::new());\n    }\n    setting\n        .split(',')\n        .enumerate()\n        .map(|(index, entry)| parse_entry(entry, index))\n        .collect()\n}\n"
+    }
+  },
+  {
+    "row": 11,
+    "task": "01-optional",
+    "arm": "misleading",
+    "repeat": 2,
+    "group": "declared",
+    "proposal": {
+      "decision": "Added public `parse_entry` with indexed diagnostics and delegated parsing to it, preserving `parse_feature` defaults and empty-setting behavior.",
+      "source": "pub fn parse_entry(entry: &str, index: usize) -> Result<String, String> {\n    let entry = entry.trim();\n    if entry.is_empty()\n        || !entry\n            .bytes()\n            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'_' || c == b'-')\n    {\n        Err(format!(\"feature entry {index} invalid: {entry}\"))\n    } else {\n        Ok(entry.to_string())\n    }\n}\n\npub fn parse_feature(setting: Option<&str>) -> Result<Vec<String>, String> {\n    let Some(setting) = setting else {\n        return Ok(vec![\"search\".into(), \"labels\".into()]);\n    };\n    if setting.is_empty() {\n        return Ok(Vec::new());\n    }\n    setting\n        .split(',')\n        .enumerate()\n        .map(|(index, entry)| parse_entry(entry, index))\n        .collect()\n}"
+    }
+  },
+  {
+    "row": 12,
+    "task": "02-pagination",
+    "arm": "correct",
+    "repeat": 0,
+    "group": "declared",
+    "proposal": {
+      "decision": "Added inclusive minimum-priority filtering to both APIs and shared their sort order, preserving the existing cursor behavior.",
+      "source": "#[derive(Clone, Debug, PartialEq, Eq)]\npub struct Entry { pub id: u64, pub priority: i32, pub created: u64 }\n\nfn sorted(entries: &[Entry]) -> Vec<Entry> {\n    let mut result = entries.to_vec();\n    result.sort_by(|a, b| {\n        b.priority\n            .cmp(&a.priority)\n            .then(a.created.cmp(&b.created))\n            .then(a.id.cmp(&b.id))\n    });\n    result\n}\n\npub fn ordered(entries: &[Entry], minimum: Option<i32>) -> Vec<Entry> {\n    sorted(entries)\n        .into_iter()\n        .filter(|entry| minimum.is_none_or(|minimum| entry.priority >= minimum))\n        .collect()\n}\n\npub fn page(\n    entries: &[Entry],\n    after: Option<(i32, u64, u64)>,\n    limit: usize,\n    minimum: Option<i32>,\n) -> Vec<Entry> {\n    sorted(entries)\n        .into_iter()\n        .filter(|entry| minimum.is_none_or(|minimum| entry.priority >= minimum))\n        .filter(|entry| {\n            after.is_none_or(|(priority, created, id)| {\n                entry.priority < priority\n                    || (entry.priority == priority && (entry.created, entry.id) > (created, id))\n            })\n        })\n        .take(limit)\n        .collect()\n}\n"
+    }
+  },
+  {
+    "row": 13,
+    "task": "02-pagination",
+    "arm": "absent",
+    "repeat": 0,
+    "group": "declared",
+    "proposal": {
+      "decision": "Added `ordered` and extended `page` with inclusive minimum-priority filtering. Both use the same ordering helper; cursor behavior is preserved.",
+      "source": "#[derive(Clone, Debug, PartialEq, Eq)]\npub struct Entry { pub id: u64, pub priority: i32, pub created: u64 }\n\nfn sorted_entries(entries: &[Entry]) -> Vec<Entry> {\n    let mut sorted = entries.to_vec();\n    sorted.sort_by(|a, b| {\n        b.priority\n            .cmp(&a.priority)\n            .then(a.created.cmp(&b.created))\n            .then(a.id.cmp(&b.id))\n    });\n    sorted\n}\n\npub fn ordered(entries: &[Entry], minimum: Option<i32>) -> Vec<Entry> {\n    sorted_entries(entries)\n        .into_iter()\n        .filter(|entry| minimum.is_none_or(|minimum| entry.priority >= minimum))\n        .collect()\n}\n\npub fn page(\n    entries: &[Entry],\n    after: Option<(i32, u64, u64)>,\n    limit: usize,\n    minimum: Option<i32>,\n) -> Vec<Entry> {\n    ordered(entries, minimum)\n        .into_iter()\n        .filter(|entry| {\n            after.is_none_or(|(priority, created, id)| {\n                entry.priority < priority\n                    || (entry.priority == priority && (entry.created, entry.id) > (created, id))\n            })\n        })\n        .take(limit)\n        .collect()\n}\n"
+    }
+  },
+  {
+    "row": 14,
+    "task": "02-pagination",
+    "arm": "incomplete",
+    "repeat": 0,
+    "group": "declared",
+    "proposal": {
+      "decision": "Added `ordered` and the inclusive minimum-priority filter to `page`; both use the same sorting helper, and `page` retains its cursor behavior.",
+      "source": "#[derive(Clone, Debug, PartialEq, Eq)]\npub struct Entry { pub id: u64, pub priority: i32, pub created: u64 }\n\nfn sorted_entries(entries: &[Entry]) -> Vec<Entry> {\n    let mut sorted = entries.to_vec();\n    sorted.sort_by(|a, b| {\n        b.priority\n            .cmp(&a.priority)\n            .then(a.created.cmp(&b.created))\n            .then(a.id.cmp(&b.id))\n    });\n    sorted\n}\n\npub fn ordered(entries: &[Entry], minimum: Option<i32>) -> Vec<Entry> {\n    sorted_entries(entries)\n        .into_iter()\n        .filter(|entry| minimum.is_none_or(|minimum| entry.priority >= minimum))\n        .collect()\n}\n\npub fn page(\n    entries: &[Entry],\n    after: Option<(i32, u64, u64)>,\n    limit: usize,\n    minimum: Option<i32>,\n) -> Vec<Entry> {\n    sorted_entries(entries)\n        .into_iter()\n        .filter(|entry| minimum.is_none_or(|minimum| entry.priority >= minimum))\n        .filter(|entry| {\n            after.is_none_or(|(priority, created, id)| {\n                entry.priority < priority\n                    || (entry.priority == priority && (entry.created, entry.id) > (created, id))\n            })\n        })\n        .take(limit)\n        .collect()\n}\n"
+    }
+  },
+  {
+    "row": 15,
+    "task": "02-pagination",
+    "arm": "misleading",
+    "repeat": 0,
+    "group": "declared",
+    "proposal": {
+      "decision": "Added inclusive minimum-priority filtering and shared the existing priority-descending, creation-ascending, ID-ascending ordering between both APIs. Retained the cursor comparison behavior.",
+      "source": "#[derive(Clone, Debug, PartialEq, Eq)]\npub struct Entry { pub id: u64, pub priority: i32, pub created: u64 }\n\npub fn ordered(entries: &[Entry], minimum: Option<i32>) -> Vec<Entry> {\n    let mut sorted = entries.to_vec();\n    sorted.sort_by(|a, b| {\n        b.priority\n            .cmp(&a.priority)\n            .then(a.created.cmp(&b.created))\n            .then(a.id.cmp(&b.id))\n    });\n    sorted\n        .into_iter()\n        .filter(|entry| minimum.is_none_or(|minimum| entry.priority >= minimum))\n        .collect()\n}\n\npub fn page(\n    entries: &[Entry],\n    after: Option<(i32, u64, u64)>,\n    limit: usize,\n    minimum: Option<i32>,\n) -> Vec<Entry> {\n    ordered(entries, minimum)\n        .into_iter()\n        .filter(|entry| {\n            after.is_none_or(|(priority, created, id)| {\n                entry.priority < priority\n                    || (entry.priority == priority && (entry.created, entry.id) > (created, id))\n            })\n        })\n        .take(limit)\n        .collect()\n}\n"
+    }
+  },
+  {
+    "row": 16,
+    "task": "02-pagination",
+    "arm": "correct",
+    "repeat": 1,
+    "group": "declared",
+    "proposal": {
+      "decision": "Added inclusive minimum-priority filtering to both APIs and factored their shared ordering. The page cursor ordering and comparison are preserved.",
+      "source": "#[derive(Clone, Debug, PartialEq, Eq)]\npub struct Entry {\n    pub id: u64,\n    pub priority: i32,\n    pub created: u64,\n}\n\nfn sorted_entries(entries: &[Entry]) -> Vec<Entry> {\n    let mut sorted = entries.to_vec();\n    sorted.sort_by(|a, b| {\n        b.priority\n            .cmp(&a.priority)\n            .then(a.created.cmp(&b.created))\n            .then(a.id.cmp(&b.id))\n    });\n    sorted\n}\n\npub fn ordered(entries: &[Entry], minimum: Option<i32>) -> Vec<Entry> {\n    sorted_entries(entries)\n        .into_iter()\n        .filter(|entry| minimum.map_or(true, |minimum| entry.priority >= minimum))\n        .collect()\n}\n\npub fn page(\n    entries: &[Entry],\n    after: Option<(i32, u64, u64)>,\n    limit: usize,\n    minimum: Option<i32>,\n) -> Vec<Entry> {\n    sorted_entries(entries)\n        .into_iter()\n        .filter(|entry| minimum.map_or(true, |minimum| entry.priority >= minimum))\n        .filter(|entry| {\n            after.map_or(true, |(priority, created, id)| {\n                entry.priority < priority\n                    || (entry.priority == priority && (entry.created, entry.id) > (created, id))\n            })\n        })\n        .take(limit)\n        .collect()\n}\n"
+    }
+  },
+  {
+    "row": 17,
+    "task": "02-pagination",
+    "arm": "absent",
+    "repeat": 1,
+    "group": "declared",
+    "proposal": {
+      "decision": "Added `ordered` and extended `page` with inclusive minimum-priority filtering; both use the same sort order, and page cursor behavior is preserved.",
+      "source": "#[derive(Clone, Debug, PartialEq, Eq)]\npub struct Entry {\n    pub id: u64,\n    pub priority: i32,\n    pub created: u64,\n}\n\nfn sorted_entries(entries: &[Entry]) -> Vec<Entry> {\n    let mut sorted = entries.to_vec();\n    sorted.sort_by(|a, b| {\n        b.priority\n            .cmp(&a.priority)\n            .then(a.created.cmp(&b.created))\n            .then(a.id.cmp(&b.id))\n    });\n    sorted\n}\n\npub fn ordered(entries: &[Entry], minimum: Option<i32>) -> Vec<Entry> {\n    sorted_entries(entries)\n        .into_iter()\n        .filter(|entry| minimum.is_none_or(|minimum| entry.priority >= minimum))\n        .collect()\n}\n\npub fn page(\n    entries: &[Entry],\n    after: Option<(i32, u64, u64)>,\n    limit: usize,\n    minimum: Option<i32>,\n) -> Vec<Entry> {\n    ordered(entries, minimum)\n        .into_iter()\n        .filter(|entry| {\n            after.is_none_or(|(priority, created, id)| {\n                entry.priority < priority\n                    || (entry.priority == priority && (entry.created, entry.id) > (created, id))\n            })\n        })\n        .take(limit)\n        .collect()\n}\n"
+    }
+  },
+  {
+    "row": 18,
+    "task": "02-pagination",
+    "arm": "incomplete",
+    "repeat": 1,
+    "group": "declared",
+    "proposal": {
+      "decision": "Added inclusive minimum-priority filtering to both APIs and shared their sorting logic; preserved the cursor rule.",
+      "source": "#[derive(Clone, Debug, PartialEq, Eq)]\npub struct Entry { pub id: u64, pub priority: i32, pub created: u64 }\n\nfn sorted(entries: &[Entry]) -> Vec<Entry> {\n    let mut result = entries.to_vec();\n    result.sort_by(|a, b| {\n        b.priority\n            .cmp(&a.priority)\n            .then(a.created.cmp(&b.created))\n            .then(a.id.cmp(&b.id))\n    });\n    result\n}\n\npub fn ordered(entries: &[Entry], minimum: Option<i32>) -> Vec<Entry> {\n    sorted(entries)\n        .into_iter()\n        .filter(|entry| minimum.is_none_or(|min| entry.priority >= min))\n        .collect()\n}\n\npub fn page(\n    entries: &[Entry],\n    after: Option<(i32, u64, u64)>,\n    limit: usize,\n    minimum: Option<i32>,\n) -> Vec<Entry> {\n    sorted(entries)\n        .into_iter()\n        .filter(|entry| minimum.is_none_or(|min| entry.priority >= min))\n        .filter(|entry| {\n            after.is_none_or(|(priority, created, id)| {\n                entry.priority < priority\n                    || (entry.priority == priority && (entry.created, entry.id) > (created, id))\n            })\n        })\n        .take(limit)\n        .collect()\n}\n"
+    }
+  },
+  {
+    "row": 19,
+    "task": "02-pagination",
+    "arm": "misleading",
+    "repeat": 1,
+    "group": "declared",
+    "proposal": {
+      "decision": "Unable to implement the change: the active filesystem policy denies reading /private/tmp, which contains the workspace and the requested files. I did not inspect or edit files.",
+      "source": ""
+    }
+  },
+  {
+    "row": 20,
+    "task": "02-pagination",
+    "arm": "correct",
+    "repeat": 2,
+    "group": "declared",
+    "proposal": {
+      "decision": "Added inclusive minimum-priority filtering in `ordered`; `page` uses the same ordering and preserves cursor behavior. The requested four-argument `page` signature replaces the old three-argument signature.",
+      "source": "#[derive(Clone, Debug, PartialEq, Eq)]\npub struct Entry {\n    pub id: u64,\n    pub priority: i32,\n    pub created: u64,\n}\n\npub fn ordered(entries: &[Entry], minimum: Option<i32>) -> Vec<Entry> {\n    let mut sorted = entries.to_vec();\n    sorted.sort_by(|a, b| {\n        b.priority\n            .cmp(&a.priority)\n            .then(a.created.cmp(&b.created))\n            .then(a.id.cmp(&b.id))\n    });\n\n    sorted\n        .into_iter()\n        .filter(|entry| minimum.is_none_or(|minimum| entry.priority >= minimum))\n        .collect()\n}\n\npub fn page(\n    entries: &[Entry],\n    after: Option<(i32, u64, u64)>,\n    limit: usize,\n    minimum: Option<i32>,\n) -> Vec<Entry> {\n    ordered(entries, minimum)\n        .into_iter()\n        .filter(|entry| {\n            after.is_none_or(|(priority, created, id)| {\n                entry.priority < priority\n                    || (entry.priority == priority && (entry.created, entry.id) > (created, id))\n            })\n        })\n        .take(limit)\n        .collect()\n}"
+    }
+  },
+  {
+    "row": 21,
+    "task": "02-pagination",
+    "arm": "absent",
+    "repeat": 2,
+    "group": "declared",
+    "proposal": {
+      "decision": "Added inclusive minimum-priority filtering and shared ordering for both public APIs. Existing cursor ordering is retained.",
+      "source": "#[derive(Clone, Debug, PartialEq, Eq)]\npub struct Entry {\n    pub id: u64,\n    pub priority: i32,\n    pub created: u64,\n}\n\nfn sorted_entries(entries: &[Entry]) -> Vec<Entry> {\n    let mut sorted = entries.to_vec();\n    sorted.sort_by(|a, b| {\n        b.priority\n            .cmp(&a.priority)\n            .then(a.created.cmp(&b.created))\n            .then(a.id.cmp(&b.id))\n    });\n    sorted\n}\n\npub fn ordered(entries: &[Entry], minimum: Option<i32>) -> Vec<Entry> {\n    sorted_entries(entries)\n        .into_iter()\n        .filter(|entry| minimum.is_none_or(|minimum| entry.priority >= minimum))\n        .collect()\n}\n\npub fn page(\n    entries: &[Entry],\n    after: Option<(i32, u64, u64)>,\n    limit: usize,\n    minimum: Option<i32>,\n) -> Vec<Entry> {\n    ordered(entries, minimum)\n        .into_iter()\n        .filter(|entry| {\n            after.is_none_or(|(priority, created, id)| {\n                entry.priority < priority\n                    || (entry.priority == priority && (entry.created, entry.id) > (created, id))\n            })\n        })\n        .take(limit)\n        .collect()\n}"
+    }
+  },
+  {
+    "row": 22,
+    "task": "02-pagination",
+    "arm": "incomplete",
+    "repeat": 2,
+    "group": "declared",
+    "proposal": {
+      "decision": "Added ordered with inclusive minimum-priority filtering. Both public APIs use the same sort order; page keeps its cursor rule and applies the minimum filter before the limit.",
+      "source": "#[derive(Clone, Debug, PartialEq, Eq)]\npub struct Entry { pub id: u64, pub priority: i32, pub created: u64 }\n\nfn sort_entries(entries: &[Entry]) -> Vec<Entry> {\n    let mut sorted = entries.to_vec();\n    sorted.sort_by(|a, b| {\n        b.priority\n            .cmp(&a.priority)\n            .then(a.created.cmp(&b.created))\n            .then(a.id.cmp(&b.id))\n    });\n    sorted\n}\n\npub fn ordered(entries: &[Entry], minimum: Option<i32>) -> Vec<Entry> {\n    sort_entries(entries)\n        .into_iter()\n        .filter(|entry| minimum.is_none_or(|minimum| entry.priority >= minimum))\n        .collect()\n}\n\npub fn page(\n    entries: &[Entry],\n    after: Option<(i32, u64, u64)>,\n    limit: usize,\n    minimum: Option<i32>,\n) -> Vec<Entry> {\n    ordered(entries, minimum)\n        .into_iter()\n        .filter(|entry| {\n            after.is_none_or(|(priority, created, id)| {\n                entry.priority < priority\n                    || (entry.priority == priority && (entry.created, entry.id) > (created, id))\n            })\n        })\n        .take(limit)\n        .collect()\n}"
+    }
+  },
+  {
+    "row": 23,
+    "task": "02-pagination",
+    "arm": "misleading",
+    "repeat": 2,
+    "group": "declared",
+    "proposal": {
+      "decision": "Added inclusive minimum-priority filtering and shared the existing sort order between both APIs, preserving cursor behavior.",
+      "source": "#[derive(Clone, Debug, PartialEq, Eq)]\npub struct Entry { pub id: u64, pub priority: i32, pub created: u64 }\n\npub fn ordered(entries: &[Entry], minimum: Option<i32>) -> Vec<Entry> {\n    let mut sorted = entries.to_vec();\n    sorted.sort_by(|a, b| {\n        b.priority\n            .cmp(&a.priority)\n            .then(a.created.cmp(&b.created))\n            .then(a.id.cmp(&b.id))\n    });\n    sorted\n        .into_iter()\n        .filter(|entry| minimum.is_none_or(|minimum| entry.priority >= minimum))\n        .collect()\n}\n\npub fn page(\n    entries: &[Entry],\n    after: Option<(i32, u64, u64)>,\n    limit: usize,\n    minimum: Option<i32>,\n) -> Vec<Entry> {\n    ordered(entries, minimum)\n        .into_iter()\n        .filter(|entry| {\n            after.is_none_or(|(priority, created, id)| {\n                entry.priority < priority\n                    || (entry.priority == priority && (entry.created, entry.id) > (created, id))\n            })\n        })\n        .take(limit)\n        .collect()\n}"
+    }
+  },
+  {
+    "row": 24,
+    "task": "03-protocol",
+    "arm": "correct",
+    "repeat": 0,
+    "group": "declared",
+    "proposal": {
+      "decision": "Cannot implement the change: the workspace is under `/private/tmp`, which the active filesystem policy explicitly denies reading. I did not inspect or edit files.",
+      "source": ""
+    }
+  },
+  {
+    "row": 25,
+    "task": "03-protocol",
+    "arm": "absent",
+    "repeat": 0,
+    "group": "declared",
+    "proposal": {
+      "decision": "Unable to implement: filesystem policy denies reading the workspace under /private/tmp, including the requested files.",
+      "source": ""
+    }
+  },
+  {
+    "row": 26,
+    "task": "03-protocol",
+    "arm": "incomplete",
+    "repeat": 0,
+    "group": "declared",
+    "proposal": {
+      "decision": "Unable to implement the change: filesystem policy denies reads under `/private/tmp`, where the workspace and requested files are located. I can\u2019t inspect `source.rs`, `task.md`, or `context.json`. Provide their contents in an accessible location to continue.",
+      "source": ""
+    }
+  },
+  {
+    "row": 27,
+    "task": "03-protocol",
+    "arm": "misleading",
+    "repeat": 0,
+    "group": "declared",
+    "proposal": {
+      "decision": "Unable to implement: the workspace is under `/private/tmp`, which the active filesystem policy explicitly denies reading. I can\u2019t inspect `source.rs`, `task.md`, or `context.json`.",
+      "source": ""
+    }
+  },
+  {
+    "row": 28,
+    "task": "03-protocol",
+    "arm": "correct",
+    "repeat": 1,
+    "group": "declared",
+    "proposal": {
+      "decision": "Renamed the Rust field to `received`, kept the serialized key `recieved` for consumer compatibility, and updated `describe` to the requested wording. No files were edited.",
+      "source": "pub struct Record { pub received: u32, pub id: u32 }\nimpl Record {\n    pub fn serialize(&self) -> String { format!(\"recieved={};id={}\", self.received, self.id) }\n    pub fn describe(&self) -> String { format!(\"Received {} items for record {}\", self.received, self.id) }\n}"
+    }
+  },
+  {
+    "row": 29,
+    "task": "03-protocol",
+    "arm": "absent",
+    "repeat": 1,
+    "group": "declared",
+    "proposal": {
+      "decision": "Preserved the existing public `recieved` field and serialized key for compatibility. Added a correctly spelled `received()` accessor and updated `describe()` as requested; renaming the public field would break existing struct literals and field access.",
+      "source": "pub struct Record { pub recieved: u32, pub id: u32 }\n\nimpl Record {\n    pub fn received(&self) -> u32 { self.recieved }\n\n    pub fn serialize(&self) -> String { format!(\"recieved={};id={}\", self.recieved, self.id) }\n\n    pub fn describe(&self) -> String { format!(\"Received {} items for record {}\", self.received(), self.id) }\n}\n"
+    }
+  },
+  {
+    "row": 30,
+    "task": "03-protocol",
+    "arm": "incomplete",
+    "repeat": 1,
+    "group": "declared",
+    "proposal": {
+      "decision": "Renamed the field to `received`, kept the serialized key `recieved` for compatibility, and updated `describe` to the requested wording.",
+      "source": "pub struct Record { pub received: u32, pub id: u32 }\n\nimpl Record {\n    pub fn serialize(&self) -> String {\n        format!(\"recieved={};id={}\", self.received, self.id)\n    }\n\n    pub fn describe(&self) -> String {\n        format!(\"Received {} items for record {}\", self.received, self.id)\n    }\n}"
+    }
+  },
+  {
+    "row": 31,
+    "task": "03-protocol",
+    "arm": "misleading",
+    "repeat": 1,
+    "group": "declared",
+    "proposal": {
+      "decision": "Renamed the Rust field and updated `describe`; kept the serialized key `recieved` for wire compatibility.",
+      "source": "pub struct Record { pub received: u32, pub id: u32 }\n\nimpl Record {\n    pub fn serialize(&self) -> String {\n        format!(\"recieved={};id={}\", self.received, self.id)\n    }\n\n    pub fn describe(&self) -> String {\n        format!(\"Received {} items for record {}\", self.received, self.id)\n    }\n}"
+    }
+  },
+  {
+    "row": 32,
+    "task": "03-protocol",
+    "arm": "correct",
+    "repeat": 2,
+    "group": "declared",
+    "proposal": {
+      "decision": "Renamed the Rust field to `received`, kept the historical `recieved` serialization key for consumer compatibility, and updated `describe` as requested.",
+      "source": "pub struct Record { pub received: u32, pub id: u32 }\n\nimpl Record {\n    pub fn serialize(&self) -> String {\n        format!(\"recieved={};id={}\", self.received, self.id)\n    }\n\n    pub fn describe(&self) -> String {\n        format!(\"Received {} items for record {}\", self.received, self.id)\n    }\n}"
+    }
+  },
+  {
+    "row": 33,
+    "task": "03-protocol",
+    "arm": "absent",
+    "repeat": 2,
+    "group": "declared",
+    "proposal": {
+      "decision": "Renamed the Rust field and updated the description. Kept the serialized `recieved` key unchanged for compatibility.",
+      "source": "pub struct Record {\n    pub received: u32,\n    pub id: u32,\n}\n\nimpl Record {\n    pub fn serialize(&self) -> String {\n        format!(\"recieved={};id={}\", self.received, self.id)\n    }\n\n    pub fn describe(&self) -> String {\n        format!(\"Received {} items for record {}\", self.received, self.id)\n    }\n}"
+    }
+  },
+  {
+    "row": 34,
+    "task": "03-protocol",
+    "arm": "incomplete",
+    "repeat": 2,
+    "group": "declared",
+    "proposal": {
+      "decision": "Renamed the Rust field to `received`, kept the serialized key `recieved` for consumer compatibility, and updated the description format.",
+      "source": "pub struct Record {\n    pub received: u32,\n    pub id: u32,\n}\n\nimpl Record {\n    pub fn serialize(&self) -> String {\n        format!(\"recieved={};id={}\", self.received, self.id)\n    }\n\n    pub fn describe(&self) -> String {\n        format!(\"Received {} items for record {}\", self.received, self.id)\n    }\n}\n"
+    }
+  },
+  {
+    "row": 35,
+    "task": "03-protocol",
+    "arm": "misleading",
+    "repeat": 2,
+    "group": "declared",
+    "proposal": {
+      "decision": "Renamed the public field to `received` as requested, kept `serialize` returning `String` and retained its existing `recieved=` wire spelling for consumer compatibility. Updated `describe` to the requested format.",
+      "source": "pub struct Record { pub received: u32, pub id: u32 }\nimpl Record {\n    pub fn serialize(&self) -> String { format!(\"recieved={};id={}\", self.received, self.id) }\n    pub fn describe(&self) -> String { format!(\"Received {} items for record {}\", self.received, self.id) }\n}"
+    }
+  },
+  {
+    "row": 36,
+    "task": "04-completion",
+    "arm": "correct",
+    "repeat": 0,
+    "group": "declared",
+    "proposal": {
+      "decision": "Updated status text and deduplicated notifications while preserving the recovery contract and public API.",
+      "source": "#[derive(Clone, Copy, Debug, PartialEq, Eq)]\npub enum Status { Running, Unknown, Completed, Failed }\n\npub fn lost_ack() -> Status { Status::Unknown }\n\npub fn may_replay(status: Status) -> bool { status == Status::Failed }\n\npub fn status_text(status: Status) -> &'static str {\n    match status {\n        Status::Running => \"In progress\",\n        Status::Unknown => \"Completion unknown\",\n        Status::Completed => \"Completed\",\n        Status::Failed => \"Failed\",\n    }\n}\n\npub fn notifications(events: &[(u64, Status)]) -> Vec<(u64, Status)> {\n    let mut seen = Vec::new();\n    events\n        .iter()\n        .copied()\n        .filter(|event| {\n            if seen.contains(event) {\n                false\n            } else {\n                seen.push(*event);\n                true\n            }\n        })\n        .collect()\n}\n"
+    }
+  },
+  {
+    "row": 37,
+    "task": "04-completion",
+    "arm": "absent",
+    "repeat": 0,
+    "group": "declared",
+    "proposal": {
+      "decision": "Unable to implement without reading the requested files: filesystem policy denies access to `/private/tmp`.",
+      "source": ""
+    }
+  },
+  {
+    "row": 38,
+    "task": "04-completion",
+    "arm": "incomplete",
+    "repeat": 0,
+    "group": "declared",
+    "proposal": {
+      "decision": "Unable to implement: the workspace is under /private/tmp, which this session\u2019s filesystem policy denies reading, and file writes are disabled. I can\u2019t provide the complete source without reading source.rs and task.md.",
+      "source": ""
+    }
+  },
+  {
+    "row": 39,
+    "task": "04-completion",
+    "arm": "misleading",
+    "repeat": 0,
+    "group": "declared",
+    "proposal": {
+      "decision": "Updated status labels and deduplicated exact notification pairs while keeping the recovery behavior and public API unchanged.",
+      "source": "#[derive(Clone, Copy, Debug, PartialEq, Eq)]\npub enum Status {\n    Running,\n    Unknown,\n    Completed,\n    Failed,\n}\n\npub fn lost_ack() -> Status {\n    Status::Unknown\n}\n\npub fn may_replay(status: Status) -> bool {\n    status == Status::Failed\n}\n\npub fn status_text(status: Status) -> &'static str {\n    match status {\n        Status::Running => \"In progress\",\n        Status::Unknown => \"Completion unknown\",\n        Status::Completed => \"Completed\",\n        Status::Failed => \"Failed\",\n    }\n}\n\npub fn notifications(events: &[(u64, Status)]) -> Vec<(u64, Status)> {\n    let mut unique = Vec::new();\n    for &event in events {\n        if !unique.contains(&event) {\n            unique.push(event);\n        }\n    }\n    unique\n}\n"
+    }
+  },
+  {
+    "row": 40,
+    "task": "04-completion",
+    "arm": "correct",
+    "repeat": 1,
+    "group": "declared",
+    "proposal": {
+      "decision": "Updated status labels and deduplicated notices while preserving recovery behavior and public signatures.",
+      "source": "#[derive(Clone, Copy, Debug, PartialEq, Eq)]\npub enum Status { Running, Unknown, Completed, Failed }\n\npub fn lost_ack() -> Status { Status::Unknown }\n\npub fn may_replay(status: Status) -> bool { status == Status::Failed }\n\npub fn status_text(status: Status) -> &'static str {\n    match status {\n        Status::Running => \"In progress\",\n        Status::Unknown => \"Completion unknown\",\n        Status::Completed => \"Completed\",\n        Status::Failed => \"Failed\",\n    }\n}\n\npub fn notifications(events: &[(u64, Status)]) -> Vec<(u64, Status)> {\n    let mut unique = Vec::with_capacity(events.len());\n    for event in events {\n        if !unique.contains(event) {\n            unique.push(*event);\n        }\n    }\n    unique\n}"
+    }
+  },
+  {
+    "row": 41,
+    "task": "04-completion",
+    "arm": "absent",
+    "repeat": 1,
+    "group": "declared",
+    "proposal": {
+      "decision": "Unable to implement: the workspace path is explicitly denied for reads, so I could not inspect source.rs, task.md, or context.json. I did not edit files.",
+      "source": ""
+    }
+  },
+  {
+    "row": 42,
+    "task": "04-completion",
+    "arm": "incomplete",
+    "repeat": 1,
+    "group": "declared",
+    "proposal": {
+      "decision": "Updated status text and deduplicated notifications by exact (operation id, status), preserving first-occurrence order and the existing recovery behavior.",
+      "source": "#[derive(Clone, Copy, Debug, PartialEq, Eq)]\npub enum Status { Running, Unknown, Completed, Failed }\npub fn lost_ack() -> Status { Status::Unknown }\npub fn may_replay(status: Status) -> bool { status == Status::Failed }\npub fn status_text(status: Status) -> &'static str {\n    match status {\n        Status::Running => \"In progress\",\n        Status::Unknown => \"Completion unknown\",\n        Status::Completed => \"Completed\",\n        Status::Failed => \"Failed\",\n    }\n}\npub fn notifications(events: &[(u64, Status)]) -> Vec<(u64, Status)> {\n    let mut unique = Vec::new();\n    for &event in events {\n        if !unique.contains(&event) {\n            unique.push(event);\n        }\n    }\n    unique\n}"
+    }
+  },
+  {
+    "row": 43,
+    "task": "04-completion",
+    "arm": "misleading",
+    "repeat": 1,
+    "group": "declared",
+    "proposal": {
+      "decision": "Updated status labels and deduplicated notifications by exact (operation ID, status), keeping the first occurrence. Preserved the existing recovery behavior: lost_ack returns Unknown, and only Failed may be replayed.",
+      "source": "#[derive(Clone, Copy, Debug, PartialEq, Eq)]\npub enum Status { Running, Unknown, Completed, Failed }\npub fn lost_ack() -> Status { Status::Unknown }\npub fn may_replay(status: Status) -> bool { status == Status::Failed }\npub fn status_text(status: Status) -> &'static str {\n    match status {\n        Status::Running => \"In progress\",\n        Status::Unknown => \"Completion unknown\",\n        Status::Completed => \"Completed\",\n        Status::Failed => \"Failed\",\n    }\n}\npub fn notifications(events: &[(u64, Status)]) -> Vec<(u64, Status)> {\n    let mut seen = Vec::new();\n    let mut result = Vec::new();\n    for &event in events {\n        if !seen.contains(&event) {\n            seen.push(event);\n            result.push(event);\n        }\n    }\n    result\n}"
+    }
+  },
+  {
+    "row": 44,
+    "task": "04-completion",
+    "arm": "correct",
+    "repeat": 2,
+    "group": "declared",
+    "proposal": {
+      "decision": "Updated status text and deduplicated exact (operation id, status) notices, preserving first occurrence and the recovery contract.",
+      "source": "#[derive(Clone, Copy, Debug, PartialEq, Eq)]\npub enum Status { Running, Unknown, Completed, Failed }\n\npub fn lost_ack() -> Status { Status::Unknown }\n\npub fn may_replay(status: Status) -> bool { status == Status::Failed }\n\npub fn status_text(status: Status) -> &'static str {\n    match status {\n        Status::Running => \"In progress\",\n        Status::Unknown => \"Completion unknown\",\n        Status::Completed => \"Completed\",\n        Status::Failed => \"Failed\",\n    }\n}\n\npub fn notifications(events: &[(u64, Status)]) -> Vec<(u64, Status)> {\n    let mut unique = Vec::with_capacity(events.len());\n    for event in events {\n        if !unique.contains(event) {\n            unique.push(*event);\n        }\n    }\n    unique\n}\n"
+    }
+  },
+  {
+    "row": 45,
+    "task": "04-completion",
+    "arm": "absent",
+    "repeat": 2,
+    "group": "declared",
+    "proposal": {
+      "decision": "Unable to implement: the workspace is under `/private/tmp`, which the active filesystem policy explicitly denies reading. I could not read the requested files, so I can\u2019t safely preserve the existing obligations or public API.",
+      "source": ""
+    }
+  },
+  {
+    "row": 46,
+    "task": "04-completion",
+    "arm": "incomplete",
+    "repeat": 2,
+    "group": "declared",
+    "proposal": {
+      "decision": "Unable to implement: filesystem policy denies reading the workspace files under /private/tmp.",
+      "source": ""
+    }
+  },
+  {
+    "row": 47,
+    "task": "04-completion",
+    "arm": "misleading",
+    "repeat": 2,
+    "group": "declared",
+    "proposal": {
+      "decision": "Updated status labels and deduplicated notifications while preserving the recovery contract.",
+      "source": "#[derive(Clone, Copy, Debug, PartialEq, Eq)]\npub enum Status { Running, Unknown, Completed, Failed }\n\npub fn lost_ack() -> Status { Status::Unknown }\n\npub fn may_replay(status: Status) -> bool { status == Status::Failed }\n\npub fn status_text(status: Status) -> &'static str {\n    match status {\n        Status::Running => \"In progress\",\n        Status::Unknown => \"Completion unknown\",\n        Status::Completed => \"Completed\",\n        Status::Failed => \"Failed\",\n    }\n}\n\npub fn notifications(events: &[(u64, Status)]) -> Vec<(u64, Status)> {\n    let mut unique = Vec::new();\n    for event in events {\n        if !unique.contains(event) {\n            unique.push(*event);\n        }\n    }\n    unique\n}\n"
+    }
+  },
+  {
+    "row": 48,
+    "task": "05-identifiers",
+    "arm": "correct",
+    "repeat": 0,
+    "group": "sealed",
+    "proposal": {
+      "decision": "Updated display to escape the label and identifier, and added ordered, case-sensitive label filtering. Exact lookup semantics and existing API types are preserved.",
+      "source": "#[derive(Clone, Debug, PartialEq, Eq)]\npub struct Item {\n    pub raw: String,\n    pub label: String,\n}\n\npub fn escaped(raw: &str) -> String {\n    raw.replace('&', \"&amp;\")\n        .replace('<', \"&lt;\")\n        .replace('>', \"&gt;\")\n        .replace('\"', \"&quot;\")\n}\n\npub fn lookup<'a>(items: &'a [Item], raw: &str) -> Option<&'a Item> {\n    items.iter().find(|item| item.raw == raw)\n}\n\npub fn display(item: &Item) -> String {\n    format!(\"{} [{}]\", escaped(&item.label), escaped(&item.raw))\n}\n\npub fn filtered(items: &[Item], needle: &str) -> Vec<Item> {\n    items\n        .iter()\n        .filter(|item| item.label.contains(needle))\n        .cloned()\n        .collect()\n}"
+    }
+  },
+  {
+    "row": 49,
+    "task": "05-identifiers",
+    "arm": "absent",
+    "repeat": 0,
+    "group": "sealed",
+    "proposal": {
+      "decision": "Cannot implement: the active filesystem policy denies reading /private/tmp, which contains the workspace files. I therefore could not inspect source.rs, task.md, or context.json.",
+      "source": ""
+    }
+  },
+  {
+    "row": 50,
+    "task": "05-identifiers",
+    "arm": "incomplete",
+    "repeat": 0,
+    "group": "sealed",
+    "proposal": {
+      "decision": "Updated display formatting and added ordered, case-sensitive label filtering while preserving lookup semantics and public types.",
+      "source": "#[derive(Clone, Debug, PartialEq, Eq)]\npub struct Item { pub raw: String, pub label: String }\npub fn escaped(raw: &str) -> String { raw.replace('&', \"&amp;\").replace('<', \"&lt;\").replace('>', \"&gt;\").replace('\"', \"&quot;\") }\npub fn lookup<'a>(items: &'a [Item], raw: &str) -> Option<&'a Item> { items.iter().find(|item| item.raw == raw) }\npub fn display(item: &Item) -> String { format!(\"{} [{}]\", escaped(&item.label), escaped(&item.raw)) }\npub fn filtered(items: &[Item], needle: &str) -> Vec<Item> { items.iter().filter(|item| item.label.contains(needle)).cloned().collect() }"
+    }
+  },
+  {
+    "row": 51,
+    "task": "05-identifiers",
+    "arm": "misleading",
+    "repeat": 0,
+    "group": "sealed",
+    "proposal": {
+      "decision": "Updated display to escape and format label plus raw ID, and added ordered, case-sensitive label filtering while preserving exact raw lookup semantics.",
+      "source": "#[derive(Clone, Debug, PartialEq, Eq)]\npub struct Item { pub raw: String, pub label: String }\n\npub fn escaped(raw: &str) -> String {\n    raw.replace('&', \"&amp;\")\n        .replace('<', \"&lt;\")\n        .replace('>', \"&gt;\")\n        .replace('\"', \"&quot;\")\n}\n\npub fn lookup<'a>(items: &'a [Item], raw: &str) -> Option<&'a Item> {\n    items.iter().find(|item| item.raw == raw)\n}\n\npub fn display(item: &Item) -> String {\n    format!(\"{} [{}]\", escaped(&item.label), escaped(&item.raw))\n}\n\npub fn filtered(items: &[Item], needle: &str) -> Vec<Item> {\n    items\n        .iter()\n        .filter(|item| item.label.contains(needle))\n        .cloned()\n        .collect()\n}\n"
+    }
+  },
+  {
+    "row": 52,
+    "task": "06-lookup",
+    "arm": "correct",
+    "repeat": 0,
+    "group": "sealed",
+    "proposal": {
+      "decision": "I can\u2019t read the requested files: the active filesystem policy explicitly denies access to `/private/tmp`, which contains the workspace. No source changes were made.",
+      "source": ""
+    }
+  },
+  {
+    "row": 53,
+    "task": "06-lookup",
+    "arm": "absent",
+    "repeat": 0,
+    "group": "sealed",
+    "proposal": {
+      "decision": "Unable to read or modify the requested source: filesystem policy denies access to `/private/tmp`, which contains the workspace. No source was provided.",
+      "source": ""
+    }
+  },
+  {
+    "row": 54,
+    "task": "06-lookup",
+    "arm": "incomplete",
+    "repeat": 0,
+    "group": "sealed",
+    "proposal": {
+      "decision": "Updated rendering for empty, populated, and unavailable lookups; added Unicode-scalar truncation while preserving fallback behavior.",
+      "source": "#[derive(Clone, Debug, PartialEq, Eq)]\npub enum Lookup {\n    Ready(Vec<String>),\n    Unavailable,\n}\n\npub fn fallback(value: &Lookup) -> bool {\n    matches!(value, Lookup::Unavailable)\n}\n\npub fn render(value: &Lookup) -> String {\n    match value {\n        Lookup::Ready(items) if items.is_empty() => \"No results\".into(),\n        Lookup::Ready(items) => items.join(\", \"),\n        Lookup::Unavailable => \"Lookup unavailable\".into(),\n    }\n}\n\npub fn display_field(value: &Lookup, limit: usize) -> String {\n    render(value).chars().take(limit).collect()\n}\n"
+    }
+  },
+  {
+    "row": 55,
+    "task": "06-lookup",
+    "arm": "misleading",
+    "repeat": 0,
+    "group": "sealed",
+    "proposal": {
+      "decision": "Updated rendering for empty, populated, and unavailable lookups; preserved fallback behavior and added Unicode-scalar truncation without a suffix. No files were edited, as requested.",
+      "source": "#[derive(Clone, Debug, PartialEq, Eq)]\npub enum Lookup {\n    Ready(Vec<String>),\n    Unavailable,\n}\n\npub fn fallback(value: &Lookup) -> bool {\n    matches!(value, Lookup::Unavailable)\n}\n\npub fn render(value: &Lookup) -> String {\n    match value {\n        Lookup::Ready(items) if items.is_empty() => \"No results\".into(),\n        Lookup::Ready(items) => items.join(\", \"),\n        Lookup::Unavailable => \"Lookup unavailable\".into(),\n    }\n}\n\npub fn display_field(value: &Lookup, limit: usize) -> String {\n    render(value).chars().take(limit).collect()\n}\n"
+    }
+  }
+]

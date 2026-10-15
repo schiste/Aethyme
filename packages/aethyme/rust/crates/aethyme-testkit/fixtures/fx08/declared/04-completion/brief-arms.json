@@ -1,0 +1,33 @@
+{
+  "absent": null,
+  "correct": {
+    "intent": "Preserve existing consumer semantics",
+    "decisions": [
+      {
+        "scope_ref": "source.rs",
+        "choice": "Kept lost completion acknowledgments unknown",
+        "reason": "The external operation may already have happened; an unknown acknowledgment must never authorize replay or imply success."
+      }
+    ]
+  },
+  "incomplete": {
+    "intent": "Preserve existing consumer semantics",
+    "decisions": [
+      {
+        "scope_ref": "source.rs",
+        "choice": "Kept first occurrence of each notice",
+        "reason": "Notifications should retain input order and suppress repetitions of the same operation and status pair."
+      }
+    ]
+  },
+  "misleading": {
+    "intent": "Preserve existing consumer semantics",
+    "decisions": [
+      {
+        "scope_ref": "source.rs",
+        "choice": "Made lost acknowledgments retryable",
+        "reason": "The external operation is safe to repeat; recovery should treat missing acknowledgment as failure and replay it."
+      }
+    ]
+  }
+}

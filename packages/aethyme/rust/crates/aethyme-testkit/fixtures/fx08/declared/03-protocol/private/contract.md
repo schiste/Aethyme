@@ -1,0 +1,1 @@
+Record's new public Rust field is received. The historical serialized wire field must remain exactly recieved: `recieved=N;id=ID` with decimal u32 values, no spaces/newline. An old reader accepts only that spelling. describe uses correctly spelled Received and the exact requested sentence. Changing internal spelling must not silently change wire spelling.

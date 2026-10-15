@@ -1,5 +1,8 @@
 //! User-approved export of synthetic Playground inputs only. Private oracles,
 //! Aethyme source, credentials and real project files are never prompt payload.
+
+#[path = "fx08.rs"]
+mod fx08;
 use super::*;
 use aethyme_broker::resolution::{
     self, FailedCheck, Proposal, ProposedFile, RequirementRef, ResolutionInputs, ResolutionOutcome,

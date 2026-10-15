@@ -1,0 +1,1 @@
+Extract public fn ordered(entries: &[Entry], minimum: Option<i32>) -> Vec<Entry>. Extend page to page(entries, after, limit, minimum), retaining its other argument types. minimum is inclusive; None includes all priorities. Both APIs must share sorting. Keep cursor behavior and existing consumer compatibility.
