@@ -2607,6 +2607,254 @@ fn delete_inventory_item(
     Ok(true)
 }
 
+/// Remove only empty generation/import parent directories that are proven by
+/// the immutable file inventory. Directories are metadata, but leaving them
+/// behind would make a successful file purge look like a complete tree purge.
+/// An untracked entry, changed type, symlink, or inspection/sync error records
+/// an unclassified residual and prevents a completion claim.
+fn delete_empty_managed_copy_directories(
+    store: &mut CollaborationStore,
+    incident_id: &str,
+    inventory: &[FileItem],
+) -> Result<bool, SensitiveError> {
+    let mut complete = true;
+    for root in ["generations", "import-rehearsals"] {
+        let prefix = format!("{root}/");
+        let items = inventory
+            .iter()
+            .filter(|item| item.relative_path.starts_with(&prefix))
+            .collect::<Vec<_>>();
+        let root_path = store.project_dir().join(root);
+        if items.is_empty() {
+            match fs::symlink_metadata(&root_path) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                _ => {
+                    add_residual(
+                        store,
+                        incident_id,
+                        "unclassified_managed_path",
+                        root,
+                        "unclassified",
+                    )?;
+                    complete = false;
+                }
+            }
+            continue;
+        }
+
+        let mut files_deleted = true;
+        for item in &items {
+            let state: Option<String> = store
+                .read_connection()
+                .query_row(
+                    "SELECT state FROM local_sensitive_items
+                     WHERE incident_id=?1 AND relative_path=?2",
+                    rusqlite::params![incident_id, item.relative_path],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if state.as_deref() != Some("deleted") {
+                if state.is_none() {
+                    add_residual(
+                        store,
+                        incident_id,
+                        "unclassified_managed_path",
+                        &item.relative_path,
+                        "unclassified",
+                    )?;
+                }
+                files_deleted = false;
+            }
+        }
+        if !files_deleted {
+            complete = false;
+            continue;
+        }
+
+        let mut directories = BTreeSet::new();
+        for item in &items {
+            let mut parent = Path::new(&item.relative_path).parent();
+            while let Some(path) = parent {
+                if path.as_os_str().is_empty() || path == Path::new(".") {
+                    break;
+                }
+                let Some(relative) = path.to_str() else {
+                    add_residual(
+                        store,
+                        incident_id,
+                        "unclassified_managed_path",
+                        root,
+                        "unclassified",
+                    )?;
+                    complete = false;
+                    directories.clear();
+                    break;
+                };
+                if relative != root && !relative.starts_with(&prefix) {
+                    break;
+                }
+                directories.insert(relative.to_owned());
+                parent = path.parent();
+            }
+        }
+        if directories.is_empty() {
+            add_residual(
+                store,
+                incident_id,
+                "unclassified_managed_path",
+                root,
+                "unclassified",
+            )?;
+            complete = false;
+            continue;
+        }
+
+        // Preflight the whole candidate tree before removing any directory.
+        // Every present child must be another inventoried parent directory;
+        // files, symlinks, and newly added directories remain untouched.
+        let mut blocked_path = None;
+        for relative in &directories {
+            let path = match safe_managed_path(store.project_dir(), relative) {
+                Ok(path) => path,
+                Err(_) => {
+                    blocked_path = Some(relative.clone());
+                    break;
+                }
+            };
+            match fs::symlink_metadata(&path) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(_) => {
+                    blocked_path = Some(relative.clone());
+                    break;
+                }
+                Ok(metadata) if metadata.file_type().is_dir() => {}
+                Ok(_) => {
+                    blocked_path = Some(relative.clone());
+                    break;
+                }
+            }
+            let entries = match fs::read_dir(&path) {
+                Ok(entries) => entries,
+                Err(_) => {
+                    blocked_path = Some(relative.clone());
+                    break;
+                }
+            };
+            for entry in entries {
+                let entry = match entry {
+                    Ok(entry) => entry,
+                    Err(_) => {
+                        blocked_path = Some(relative.clone());
+                        break;
+                    }
+                };
+                let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                    blocked_path = Some(relative.clone());
+                    break;
+                };
+                let child = Path::new(relative).join(name);
+                let Some(child) = child.to_str() else {
+                    blocked_path = Some(relative.clone());
+                    break;
+                };
+                if !directories.contains(child) {
+                    blocked_path = Some(child.to_owned());
+                    break;
+                }
+            }
+            if blocked_path.is_some() {
+                break;
+            }
+        }
+        if let Some(relative) = blocked_path {
+            add_residual(
+                store,
+                incident_id,
+                "unclassified_managed_path",
+                &relative,
+                "unclassified",
+            )?;
+            complete = false;
+            continue;
+        }
+
+        let mut ordered = directories.into_iter().collect::<Vec<_>>();
+        ordered.sort_by(|left, right| {
+            Path::new(right)
+                .components()
+                .count()
+                .cmp(&Path::new(left).components().count())
+                .then_with(|| right.cmp(left))
+        });
+        let mut removal_failure = None;
+        for relative in ordered {
+            let path = match safe_managed_path(store.project_dir(), &relative) {
+                Ok(path) => path,
+                Err(_) => {
+                    removal_failure = Some(relative.clone());
+                    break;
+                }
+            };
+            match fs::symlink_metadata(&path) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(_) => {
+                    removal_failure = Some(relative.clone());
+                    break;
+                }
+                Ok(metadata) if metadata.file_type().is_dir() => {}
+                Ok(_) => {
+                    removal_failure = Some(relative.clone());
+                    break;
+                }
+            }
+            let empty = match fs::read_dir(&path) {
+                Ok(mut entries) => match entries.next() {
+                    None => true,
+                    Some(Ok(_)) | Some(Err(_)) => false,
+                },
+                Err(_) => false,
+            };
+            if !empty || fs::remove_dir(&path).is_err() {
+                removal_failure = Some(relative.clone());
+                break;
+            }
+            let Some(parent) = path.parent() else {
+                removal_failure = Some(relative.clone());
+                break;
+            };
+            if sync_directory(parent).is_err() {
+                removal_failure = Some(relative);
+                break;
+            }
+        }
+        if let Some(relative) = removal_failure {
+            add_residual(
+                store,
+                incident_id,
+                "unclassified_managed_path",
+                &relative,
+                "unclassified",
+            )?;
+            complete = false;
+            continue;
+        }
+        match fs::symlink_metadata(&root_path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            _ => {
+                add_residual(
+                    store,
+                    incident_id,
+                    "unclassified_managed_path",
+                    root,
+                    "unclassified",
+                )?;
+                complete = false;
+            }
+        }
+    }
+    Ok(complete)
+}
+
 fn clear_managed_database(
     store: &mut CollaborationStore,
     incident_id: &str,
@@ -2821,6 +3069,9 @@ pub fn purge(
             completed = false;
         }
     }
+    if !delete_empty_managed_copy_directories(store, incident_id, &inventory)? {
+        completed = false;
+    }
     if groups_complete {
         for group in &groups {
             if !delete_view_group(store, incident_id, group)? {
@@ -2901,6 +3152,251 @@ pub fn purge(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn complete_fixture_wave(fixture: &mut crate::local_generation::tests::Fixture) {
+        let binding = crate::local_acceptance::load(&fixture.v.f.store, &fixture.binding).unwrap();
+        let intent_id = RecordId::parse(&binding.spec().intent).unwrap();
+        let intent = crate::local_source_transport::load(&fixture.v.f.store, &intent_id).unwrap();
+        let wave_id = RecordId::parse(&intent.spec.wave).unwrap();
+        let grant = crate::local_acceptance::qualify(
+            &mut fixture.v.f.store,
+            &fixture.v.owner,
+            &mut fixture.broker,
+            &fixture.carrier,
+            &fixture.binding,
+            &fixture.v.execution,
+            &fixture.v.artifact,
+            &fixture.v.permit,
+            &fixture.evidence,
+        )
+        .unwrap();
+        crate::local_controller::complete(
+            &mut fixture.v.f.store,
+            &fixture.v.owner,
+            &mut fixture.broker,
+            &fixture.carrier,
+            &wave_id,
+            &grant,
+        )
+        .unwrap();
+    }
+
+    fn insert_purging_incident(store: &mut CollaborationStore, incident_id: &str) {
+        store
+            .connection()
+            .execute(
+                "INSERT INTO local_sensitive_incidents
+                 (id,project_key,issuer_label,operator_uid,authority_epoch,scope_kind,scope_id,
+                  reason_code,request_digest,state,created_ms,updated_ms)
+                 VALUES (?1,?2,'test-operator',0,'test-epoch','project',?2,
+                         'operator_requested_purge',?3,'purging',?4,?4)",
+                rusqlite::params![
+                    incident_id,
+                    store.project().as_str(),
+                    "0".repeat(64),
+                    now_ms()
+                ],
+            )
+            .unwrap();
+    }
+
+    fn register_deleted_managed_file(
+        store: &mut CollaborationStore,
+        incident_id: &str,
+        relative_path: &str,
+    ) -> FileItem {
+        let path = store.project_dir().join(relative_path);
+        let parent = path.parent().unwrap();
+        std::fs::create_dir_all(parent).unwrap();
+        std::fs::write(&path, b"synthetic managed fixture bytes").unwrap();
+        let (sha256, bytes) = hash_file(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        store
+            .connection()
+            .execute(
+                "INSERT INTO local_sensitive_items
+                 (incident_id,relative_path,sha256,bytes,state)
+                 VALUES (?1,?2,?3,?4,'deleted')",
+                rusqlite::params![incident_id, relative_path, sha256, bytes],
+            )
+            .unwrap();
+        FileItem {
+            relative_path: relative_path.into(),
+            sha256,
+            bytes,
+        }
+    }
+
+    #[test]
+    fn managed_copy_cleanup_recovers_partial_removal_and_cleans_generation_and_import_parents() {
+        let mut fixture = crate::local_generation::tests::Fixture::new();
+        let store = &mut fixture.v.f.store;
+        let incident_id = format!("sha256:{}", "a".repeat(64));
+        insert_purging_incident(store, &incident_id);
+        let inventory = vec![
+            register_deleted_managed_file(
+                store,
+                &incident_id,
+                "generations/t56-generation/source/src/file.txt",
+            ),
+            register_deleted_managed_file(
+                store,
+                &incident_id,
+                "import-rehearsals/t56-import/source/src/file.txt",
+            ),
+        ];
+        // Model a restart after the deepest empty child was already removed.
+        std::fs::remove_dir(
+            &store
+                .project_dir()
+                .join("generations/t56-generation/source/src"),
+        )
+        .unwrap();
+
+        assert!(delete_empty_managed_copy_directories(store, &incident_id, &inventory).unwrap());
+        assert!(!store.project_dir().join("generations").exists());
+        assert!(!store.project_dir().join("import-rehearsals").exists());
+    }
+
+    #[test]
+    fn managed_copy_cleanup_preserves_and_records_an_untracked_entry_then_retries() {
+        let mut fixture = crate::local_generation::tests::Fixture::new();
+        let store = &mut fixture.v.f.store;
+        let incident_id = format!("sha256:{}", "b".repeat(64));
+        insert_purging_incident(store, &incident_id);
+        let inventory = vec![register_deleted_managed_file(
+            store,
+            &incident_id,
+            "generations/t56-generation/source/src/file.txt",
+        )];
+        let untracked = store
+            .project_dir()
+            .join("generations/t56-generation/source/untracked.txt");
+        std::fs::write(&untracked, b"unclassified fixture entry").unwrap();
+
+        assert!(!delete_empty_managed_copy_directories(store, &incident_id, &inventory).unwrap());
+        assert!(untracked.exists());
+        assert!(
+            store
+                .project_dir()
+                .join("generations/t56-generation/source")
+                .is_dir()
+        );
+        let residual: (String, Option<i64>) = store
+            .read_connection()
+            .query_row(
+                "SELECT relative_path,resolved_ms FROM local_sensitive_residuals
+                 WHERE incident_id=?1 AND code='unclassified_managed_path'",
+                [&incident_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            residual,
+            (
+                "generations/t56-generation/source/untracked.txt".into(),
+                None
+            )
+        );
+
+        std::fs::remove_file(&untracked).unwrap();
+        assert!(delete_empty_managed_copy_directories(store, &incident_id, &inventory).unwrap());
+        assert!(!store.project_dir().join("generations").exists());
+        let unresolved: bool = store
+            .read_connection()
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM local_sensitive_residuals
+                 WHERE incident_id=?1 AND resolved_ms IS NULL)",
+                [&incident_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(unresolved, "the unclassified incident remains incomplete");
+    }
+
+    #[test]
+    fn managed_copy_cleanup_refuses_changed_directory_type_and_retries_after_restoration() {
+        let mut fixture = crate::local_generation::tests::Fixture::new();
+        let store = &mut fixture.v.f.store;
+        let incident_id = format!("sha256:{}", "c".repeat(64));
+        insert_purging_incident(store, &incident_id);
+        let inventory = vec![register_deleted_managed_file(
+            store,
+            &incident_id,
+            "generations/t56-generation/source/nested/file.txt",
+        )];
+        let changed = store
+            .project_dir()
+            .join("generations/t56-generation/source/nested");
+        std::fs::remove_dir(&changed).unwrap();
+        std::fs::write(&changed, b"changed type").unwrap();
+
+        assert!(!delete_empty_managed_copy_directories(store, &incident_id, &inventory).unwrap());
+        assert!(changed.is_file());
+        assert_eq!(std::fs::read(&changed).unwrap(), b"changed type");
+
+        std::fs::remove_file(&changed).unwrap();
+        std::fs::create_dir(&changed).unwrap();
+        assert!(delete_empty_managed_copy_directories(store, &incident_id, &inventory).unwrap());
+        assert!(!store.project_dir().join("generations").exists());
+        let unresolved: bool = store
+            .read_connection()
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM local_sensitive_residuals
+                 WHERE incident_id=?1 AND resolved_ms IS NULL)",
+                [&incident_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(unresolved, "the changed-type incident remains incomplete");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_copy_cleanup_refuses_symlink_without_following_and_retries_after_restoration() {
+        let mut fixture = crate::local_generation::tests::Fixture::new();
+        let store = &mut fixture.v.f.store;
+        let incident_id = format!("sha256:{}", "d".repeat(64));
+        insert_purging_incident(store, &incident_id);
+        let inventory = vec![register_deleted_managed_file(
+            store,
+            &incident_id,
+            "generations/t56-generation/source/nested/file.txt",
+        )];
+        let changed = store
+            .project_dir()
+            .join("generations/t56-generation/source/nested");
+        std::fs::remove_dir(&changed).unwrap();
+        let target = tempfile::tempdir().unwrap();
+        let sentinel = target.path().join("unmodified.txt");
+        std::fs::write(&sentinel, b"outside managed tree").unwrap();
+        std::os::unix::fs::symlink(target.path(), &changed).unwrap();
+
+        assert!(!delete_empty_managed_copy_directories(store, &incident_id, &inventory).unwrap());
+        assert!(
+            std::fs::symlink_metadata(&changed)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"outside managed tree");
+
+        std::fs::remove_file(&changed).unwrap();
+        std::fs::create_dir(&changed).unwrap();
+        assert!(delete_empty_managed_copy_directories(store, &incident_id, &inventory).unwrap());
+        assert!(!store.project_dir().join("generations").exists());
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"outside managed tree");
+        let unresolved: bool = store
+            .read_connection()
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM local_sensitive_residuals
+                 WHERE incident_id=?1 AND resolved_ms IS NULL)",
+                [&incident_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(unresolved, "the symlink incident remains incomplete");
+    }
 
     fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
         !needle.is_empty()
@@ -2993,6 +3489,7 @@ mod tests {
         crate::analysis_view::hold_view(&fixture.v.f.store, &view, "t56-pin-control-holder", None)
             .unwrap();
 
+        complete_fixture_wave(&mut fixture);
         let store = &mut fixture.v.f.store;
         let frozen = crate::local_authority::freeze(
             store,
@@ -3166,6 +3663,7 @@ mod tests {
             _ => unreachable!(),
         }
 
+        complete_fixture_wave(&mut fixture);
         let store = &mut fixture.v.f.store;
         let frozen = crate::local_authority::freeze(
             store,
@@ -3276,6 +3774,7 @@ mod tests {
         let view = crate::analysis_view::build_view(&fixture.v.f.store, &receipt.result, &options)
             .unwrap();
         let view_root = fixture.v.f.store.project_dir().join("views").join(&view);
+        complete_fixture_wave(&mut fixture);
         let store = &mut fixture.v.f.store;
         let frozen = crate::local_authority::freeze(
             store,
@@ -3401,6 +3900,7 @@ mod tests {
             std::fs::write(&hold_path, b"{").unwrap();
         }
 
+        complete_fixture_wave(&mut fixture);
         let store = &mut fixture.v.f.store;
         let frozen = crate::local_authority::freeze(
             store,
@@ -3490,6 +3990,7 @@ mod tests {
         );
         let view = crate::analysis_view::build_view(&fixture.v.f.store, &receipt.result, &options)
             .unwrap();
+        complete_fixture_wave(&mut fixture);
         let store = &mut fixture.v.f.store;
         let frozen = crate::local_authority::freeze(
             store,
@@ -3676,37 +4177,9 @@ mod tests {
             run_root.path(),
         );
         let prepared = fixture.prepare("t56-generation").unwrap();
-        // Generation preparation intentionally leaves this accepted fixture's
-        // controller wave in `verifying`. Complete that exact fixture wave via
-        // the supported controller path so the independent synthetic unknown
-        // job below is the only unresolved-work witness exercised by purge.
-        let binding =
-            crate::local_acceptance::load(&fixture.v.f.store, &fixture.binding).unwrap();
-        let intent_id = RecordId::parse(&binding.spec().intent).unwrap();
-        let intent =
-            crate::local_source_transport::load(&fixture.v.f.store, &intent_id).unwrap();
-        let wave_id = RecordId::parse(&intent.spec.wave).unwrap();
-        let completion_grant = crate::local_acceptance::qualify(
-            &mut fixture.v.f.store,
-            &fixture.v.owner,
-            &mut fixture.broker,
-            &fixture.carrier,
-            &fixture.binding,
-            &fixture.v.execution,
-            &fixture.v.artifact,
-            &fixture.v.permit,
-            &fixture.evidence,
-        )
-        .unwrap();
-        crate::local_controller::complete(
-            &mut fixture.v.f.store,
-            &fixture.v.owner,
-            &mut fixture.broker,
-            &fixture.carrier,
-            &wave_id,
-            &completion_grant,
-        )
-        .unwrap();
+        // Keep the fixture's own wave terminal so the synthetic unknown job
+        // below is the only unresolved-work witness exercised by purge.
+        complete_fixture_wave(&mut fixture);
         let generation_root = prepared.absolute_root().to_path_buf();
         assert!(
             contains_bytes(
