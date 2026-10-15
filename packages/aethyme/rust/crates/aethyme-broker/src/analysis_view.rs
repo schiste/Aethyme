@@ -63,6 +63,29 @@ use sha2::{Digest, Sha256};
 
 use crate::collaboration_state::CollaborationStore;
 
+#[cfg(test)]
+#[derive(Debug)]
+enum LifecycleLockEvent {
+    Blocked(PathBuf),
+    Finished(&'static str),
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static LIFECYCLE_LOCK_EVENTS: std::cell::RefCell<
+        Option<std::sync::mpsc::Sender<LifecycleLockEvent>>
+    > = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn send_lifecycle_lock_event(event: LifecycleLockEvent) {
+    LIFECYCLE_LOCK_EVENTS.with(|events| {
+        if let Some(sender) = events.borrow().as_ref() {
+            let _ = sender.send(event);
+        }
+    });
+}
+
 /// The manifest schema of a view generation.
 pub const VIEW_SCHEMA: &str = "aethyme.analysis-view/experimental-v0";
 const PRODUCER: &str = "aethyme-structural-indexer";
@@ -318,14 +341,36 @@ fn lifecycle_lock_path(view_dir: &Path) -> PathBuf {
 fn lock_lifecycle(view_dir: &Path) -> Result<File, ViewError> {
     let path = lifecycle_lock_path(view_dir);
     let file = open_lock(&path)?;
-    file.lock().map_err(io(&path))?;
+    #[cfg(test)]
+    let lock_result = match file.try_lock() {
+        Ok(()) => Ok(()),
+        Err(std::fs::TryLockError::WouldBlock) => {
+            send_lifecycle_lock_event(LifecycleLockEvent::Blocked(path.clone()));
+            file.lock()
+        }
+        Err(std::fs::TryLockError::Error(source)) => Err(source),
+    };
+    #[cfg(not(test))]
+    let lock_result = file.lock();
+    lock_result.map_err(io(&path))?;
     Ok(file)
 }
 
 fn lock_lifecycle_shared(view_dir: &Path) -> Result<File, ViewError> {
     let path = lifecycle_lock_path(view_dir);
     let file = open_lock(&path)?;
-    file.lock_shared().map_err(io(&path))?;
+    #[cfg(test)]
+    let lock_result = match file.try_lock_shared() {
+        Ok(()) => Ok(()),
+        Err(std::fs::TryLockError::WouldBlock) => {
+            send_lifecycle_lock_event(LifecycleLockEvent::Blocked(path.clone()));
+            file.lock_shared()
+        }
+        Err(std::fs::TryLockError::Error(source)) => Err(source),
+    };
+    #[cfg(not(test))]
+    let lock_result = file.lock_shared();
+    lock_result.map_err(io(&path))?;
     Ok(file)
 }
 
@@ -1282,6 +1327,10 @@ mod tests {
     use std::thread;
     use std::time::Duration;
 
+    fn track_lifecycle_lock_events(sender: mpsc::Sender<LifecycleLockEvent>) {
+        LIFECYCLE_LOCK_EVENTS.with(|events| *events.borrow_mut() = Some(sender));
+    }
+
     fn git(repo: &Path, args: &[&str]) {
         let output = std::process::Command::new("/usr/bin/env")
             .arg("git")
@@ -1851,18 +1900,15 @@ mod tests {
         let view = build_view(&setup, &snapshot, &options()).unwrap();
         let view_dir = views_root(&setup).join(&view);
         let lifecycle = lock_lifecycle(&view_dir).unwrap();
-        let barrier = Arc::new(Barrier::new(3));
-        let (started_tx, started_rx) = mpsc::channel();
+        let (event_tx, event_rx) = mpsc::channel();
         let (done_tx, done_rx) = mpsc::channel();
 
-        let hold_barrier = Arc::clone(&barrier);
-        let hold_started = started_tx.clone();
+        let hold_events = event_tx.clone();
         let hold_done = done_tx.clone();
         let hold_store = store(host.path());
         let hold_view_name = view.clone();
         let hold_thread = thread::spawn(move || {
-            hold_started.send(()).unwrap();
-            hold_barrier.wait();
+            track_lifecycle_lock_events(hold_events);
             hold_done
                 .send((
                     "hold",
@@ -1870,41 +1916,49 @@ mod tests {
                         .map_err(|error| error.code()),
                 ))
                 .unwrap();
+            send_lifecycle_lock_event(LifecycleLockEvent::Finished("hold"));
         });
 
-        let retire_barrier = Arc::clone(&barrier);
-        let retire_started = started_tx;
+        let retire_events = event_tx.clone();
         let retire_done = done_tx;
         let retire_store = store(host.path());
         let retire_view_name = view.clone();
         let retire_thread = thread::spawn(move || {
-            retire_started.send(()).unwrap();
-            retire_barrier.wait();
+            track_lifecycle_lock_events(retire_events);
             retire_done
                 .send((
                     "retire",
                     retire(&retire_store, &retire_view_name).map_err(|error| error.code()),
                 ))
                 .unwrap();
+            send_lifecycle_lock_event(LifecycleLockEvent::Finished("retire"));
         });
 
-        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-        barrier.wait();
-        let early = done_rx.recv_timeout(Duration::from_millis(100));
-        let both_blocked = matches!(early, Err(mpsc::RecvTimeoutError::Timeout));
+        let expected = lifecycle_lock_path(&view_dir);
+        let mut blocked_paths = Vec::new();
+        let mut early_finishes = Vec::new();
+        while blocked_paths.len() < 2 && early_finishes.is_empty() {
+            match event_rx.recv_timeout(Duration::from_secs(5)) {
+                Ok(LifecycleLockEvent::Blocked(path)) => blocked_paths.push(path),
+                Ok(LifecycleLockEvent::Finished(operation)) => early_finishes.push(operation),
+                Err(mpsc::RecvTimeoutError::Timeout | mpsc::RecvTimeoutError::Disconnected) => {
+                    break;
+                }
+            }
+        }
         drop(lifecycle);
 
         let mut outcomes = Vec::new();
-        if let Ok(outcome) = early {
-            outcomes.push(outcome);
-        }
         while outcomes.len() < 2 {
             outcomes.push(done_rx.recv_timeout(Duration::from_secs(5)).unwrap());
         }
         hold_thread.join().unwrap();
         retire_thread.join().unwrap();
-        assert!(both_blocked, "an operation crossed the lifecycle lock");
+        assert_eq!(blocked_paths, vec![expected.clone(), expected.clone()]);
+        assert!(
+            early_finishes.is_empty(),
+            "an operation finished before locking"
+        );
         let first = outcomes.remove(0);
         let second = outcomes.remove(0);
         let hold_result = if first.0 == "hold" { first.1 } else { second.1 };
@@ -1933,27 +1987,24 @@ mod tests {
         let lifecycle = lock_lifecycle(&view_dir).unwrap();
         let reader_store = store(host.path());
         let reader_view_name = view.clone();
-        let (started_tx, started_rx) = mpsc::channel();
+        let (event_tx, event_rx) = mpsc::channel();
         let (reader_tx, reader_rx) = mpsc::channel();
         let reader_thread = thread::spawn(move || {
-            started_tx.send(()).unwrap();
+            track_lifecycle_lock_events(event_tx);
             reader_tx
                 .send(open_view(&reader_store, &reader_view_name))
                 .unwrap();
+            send_lifecycle_lock_event(LifecycleLockEvent::Finished("open"));
         });
-        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-        let early = reader_rx.recv_timeout(Duration::from_millis(100));
-        let reader_blocked = matches!(early, Err(mpsc::RecvTimeoutError::Timeout));
-        drop(lifecycle);
-        let reader_result = match early {
-            Ok(result) => result,
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                reader_rx.recv_timeout(Duration::from_secs(5)).unwrap()
-            }
-            Err(error) => panic!("reader thread ended early: {error}"),
+        let blocked_path = match event_rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(LifecycleLockEvent::Blocked(path)) => Some(path),
+            Ok(LifecycleLockEvent::Finished(_))
+            | Err(mpsc::RecvTimeoutError::Timeout | mpsc::RecvTimeoutError::Disconnected) => None,
         };
+        drop(lifecycle);
+        let reader_result = reader_rx.recv_timeout(Duration::from_secs(5)).unwrap();
         reader_thread.join().unwrap();
-        assert!(reader_blocked, "reader crossed the lifecycle lock");
+        assert_eq!(blocked_path, Some(lifecycle_lock_path(&view_dir)));
         let reader = reader_result.unwrap();
         assert_eq!(retire(&setup, &view).unwrap_err().code(), "pinned");
         drop(reader);
@@ -1980,38 +2031,33 @@ mod tests {
         let lifecycle = lock_lifecycle(&view_dir).unwrap();
         let publish_store = store(host.path());
         let publish_view_dir = view_dir.clone();
-        let (started_tx, started_rx) = mpsc::channel();
+        let (event_tx, event_rx) = mpsc::channel();
         let (done_tx, done_rx) = mpsc::channel();
         let publish_thread = thread::spawn(move || {
-            started_tx.send(()).unwrap();
+            track_lifecycle_lock_events(event_tx);
             done_tx
                 .send(
                     publish_current(&publish_store, &publish_view_dir, 2)
                         .map_err(|error| error.code()),
                 )
                 .unwrap();
+            send_lifecycle_lock_event(LifecycleLockEvent::Finished("publish"));
         });
-        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-        let early = done_rx.recv_timeout(Duration::from_millis(100));
-        let publication_blocked = matches!(early, Err(mpsc::RecvTimeoutError::Timeout));
+        let event = event_rx.recv_timeout(Duration::from_secs(5));
+        let blocked_path = match event {
+            Ok(LifecycleLockEvent::Blocked(path)) => Some(path),
+            Ok(LifecycleLockEvent::Finished(_))
+            | Err(mpsc::RecvTimeoutError::Timeout | mpsc::RecvTimeoutError::Disconnected) => None,
+        };
         assert_eq!(current_generation(&view_dir).unwrap(), Some(1));
         assert!(view_dir.join("RETIRED").is_file());
         drop(lifecycle);
-        match early {
-            Ok(result) => result.unwrap(),
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                done_rx
-                    .recv_timeout(Duration::from_secs(5))
-                    .unwrap()
-                    .unwrap();
-            }
-            Err(error) => panic!("publisher thread ended early: {error}"),
-        }
+        done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
         publish_thread.join().unwrap();
-        assert!(
-            publication_blocked,
-            "publication crossed the lifecycle lock"
-        );
+        assert_eq!(blocked_path, Some(lifecycle_lock_path(&view_dir)));
         assert_eq!(current_generation(&view_dir).unwrap(), Some(2));
         assert!(!is_retired(&view_dir).unwrap());
     }
