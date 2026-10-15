@@ -43,6 +43,24 @@ not return before SIGTERM. No complete local command passed. CI compile,
 format and Clippy checks executed no tests. The complete denominator is in
 ledger.json.
 
+At d524f3e695baa26a14302e68e3040fc61cef61d0, full workspace CI ran 4,557
+cases: 4,548 passed, 9 failed and 31 skipped (exit 100). Seven failures are
+old-schema fixtures that leave the schema-23 `roots_released_ms` column in a
+current database before rewinding its version; the schema-18 fixture must
+retain schema-18 native-job tables and remove only the schema-23 column and
+trigger. The other failures are the CLI help snapshot and a discarded-results
+ratchet (144 sites versus 143). The raw CI log is retained and hash-bound in
+ledger.json.
+
+A cached serial run of all 15 d524 native-gates tests used the previously built
+binary (SHA-256 `4b2376a7f628100d52b2b28d0f60511917c42a7d306a7eb88a6d4f599c8b6945`).
+It returned 1 pass and 14 failures because its per-run TMPDIR was placed inside
+the checked-out Git worktree, so temporary repositories were rejected as
+nested. This is an environmental preflight failure and receives zero test
+credit. Its complete command, status and raw output are preserved in the
+ledger. A rerun is pending with a unique T7 temporary root outside all
+worktrees.
+
 ## Remaining checks
 
 Pending checks are the cached serial native-gates suite, migration/state

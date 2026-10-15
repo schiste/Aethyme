@@ -43,15 +43,20 @@
     "--nocapture"
   ],
   "attempt_denominator": {
-    "local_native_gates_commands": 2,
-    "selected_slots": 30,
-    "returned_ok": 28,
+    "local_native_gates_commands": 3,
+    "selected_slots": 45,
+    "returned_ok": 29,
     "returned_assertion_failures": 1,
     "not_returned_before_termination": 1,
     "complete_passing_commands": 0,
     "credited_native_gates_passes": 0,
     "ci_checks_without_test_execution": 3,
-    "ci_test_cases_executed": 0
+    "ci_test_cases_executed": 4557,
+    "returned_environment_failures": 14,
+    "ci_workspace_checks": 1,
+    "ci_test_cases_passed": 4548,
+    "ci_test_cases_failed": 9,
+    "ci_test_cases_skipped": 31
   },
   "attempts": [
     {
@@ -193,13 +198,84 @@
           "kind": "numeric status file; content 101 plus newline"
         }
       ]
+    },
+    {
+      "id": "ci-workspace-d524",
+      "source_commit": "d524f3e695baa26a14302e68e3040fc61cef61d0",
+      "source_tree": "8b8302ffd16f6893bcd0fc8e67478b22728f3fa2",
+      "kind": "full workspace CI test command",
+      "numeric_exit": 100,
+      "tests_executed": 4557,
+      "results": {
+        "passed": 4548,
+        "failed": 9,
+        "skipped": 31
+      },
+      "findings": [
+        "Seven migration-fixture tests rewind a current-schema store without removing schema-23 local_native_gate_jobs state; migration 23 then reports duplicate column roots_released_ms. The fixture paths are archive v1, context schema 5, state schema 2 and 3, controller schema 18, exchange schema 14, and target schema 6. The controller schema-18 fixture must keep its schema-18 native-job tables and remove only schema-23 column/trigger; fixtures older than migration 18 can drop the native-job tables so migration 18 recreates them.",
+        "CLI help_surface_matches_snapshots is stale after the lifecycle commands were added.",
+        "broker_production_code_does_not_discard_more_results reports 144 let _ = sites versus the baseline of 143; inspect the exact added site and compare against integrated GC changes before changing the ratchet."
+      ],
+      "credited": false,
+      "artifacts": [
+        {
+          "path": "target/local-resume/pr782-workspace-d524.log",
+          "artifact_root": "review_worktree",
+          "bytes": 1060792,
+          "sha256": "7d120b0e565b8afc87d423acbb70d46fceba03bd92e72a7cee41bf3a5cbb066a",
+          "kind": "complete raw workspace CI test log"
+        }
+      ]
+    },
+    {
+      "id": "local-native-gates-cached-serial-d524-nested-tmpdir",
+      "source_commit": "27d1b2e9de6a3b09bb0dcf9bc598c22d8f39b52a",
+      "source_tree": "d0822c4484f37efdf90ff039fe6c13a08f293aa3",
+      "equivalent_rust_source_commit": "d524f3e695baa26a14302e68e3040fc61cef61d0",
+      "kind": "serial focused native-gates tests using cached binary; failed environmental preflight",
+      "source_worktree_clean_before_and_after": true,
+      "source_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "binary_sha256": "4b2376a7f628100d52b2b28d0f60511917c42a7d306a7eb88a6d4f599c8b6945",
+      "numeric_exit": 101,
+      "results": {
+        "selected": 15,
+        "passed": 1,
+        "failed": 14,
+        "ignored": 0,
+        "filtered_out": 1805
+      },
+      "failure": "The recorder put TMPDIR under target/local-resume inside the checked-out Git worktree. Temporary collaboration roots were therefore detected as nested in the enclosing repository (InsideGitWorktree); 14 tests failed before exercising the intended lifecycle assertions. This attempt receives no qualification credit.",
+      "credited": false,
+      "artifacts": [
+        {
+          "path": "target/local-resume/final-integration-20261015T111345Z/native-gates-cached-serial-d524-20261015.json",
+          "artifact_root": "session_worktree",
+          "bytes": 2047,
+          "sha256": "2b00411eba0fd497194162ca1aacdba63a8134bc385a3a77541108fb9cf818c2",
+          "kind": "complete recorder metadata including source binding, argv, environment and numeric status"
+        },
+        {
+          "path": "target/local-resume/final-integration-20261015T111345Z/native-gates-cached-serial-d524-20261015.log",
+          "artifact_root": "session_worktree",
+          "bytes": 11683,
+          "sha256": "5638959ccce7c071871723f19d5272df0ac4fb2bb156fa125ab8c8266d93cd0d",
+          "kind": "complete raw cached-binary test output"
+        },
+        {
+          "path": "target/local-resume/final-integration-20261015T111345Z/native-gates-cached-serial-d524-20261015.status",
+          "artifact_root": "session_worktree",
+          "bytes": 4,
+          "sha256": "39b8dc3fc8b44765c8e6f1adee04c5b465e555ab791cc42d0d9e810d5b64297c",
+          "kind": "numeric status file; content 101 plus newline"
+        }
+      ]
     }
   ],
   "pending_checks_as_of_record": [
     {
       "id": "cached-serial-native-gates",
-      "status": "not_started_at_this_checkpoint",
-      "scope": "All 15 native_gates tests from the exact d524 compiled binary, serialized."
+      "status": "failed environmental preflight; authorized rerun pending with TMPDIR outside all worktrees",
+      "scope": "All 15 native_gates tests from the exact d524 cached binary, serialized; prior attempt had TMPDIR inside the enclosing repository and is retained as a zero-credit failure."
     },
     {
       "id": "migration-cli-and-regression-matrix",
@@ -219,6 +295,7 @@
   ],
   "limits": [
     "No complete local native-gates command has passed at this record.",
+    "The cached-binary 1-pass/14-fail attempt is environmental only: its temporary root was inside the Git worktree; it does not establish native-gate behavior.",
     "Compile, format and Clippy CI failures executed no tests and receive no test credit.",
     "The interrupted d524 command receives no test credit although 14 selected tests returned ok.",
     "No model calls, sealed evaluation or private oracle use is part of this lifecycle qualification."
