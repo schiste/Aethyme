@@ -1,0 +1,43 @@
+   Compiling aethyme-broker v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/implement-local-administrative-sensitive/packages/aethyme/rust/crates/aethyme-broker)
+warning: variable does not need to be mutable
+    --> crates/aethyme-broker/src/collaboration_sensitive.rs:1894:9
+     |
+1894 |     let mut file = options.open(path).map_err(|_| ())?;
+     |         ----^^^^
+     |         |
+     |         help: remove this `mut`
+     |
+     = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: associated function `acceptance_fixture_with_source_marker` is never used
+   --> crates/aethyme-broker/src/execution_verifier/tests.rs:163:19
+    |
+156 | impl Subject {
+    | ------------ associated function in this implementation
+...
+163 |     pub(crate) fn acceptance_fixture_with_source_marker(marker: &[u8]) -> Self {
+    |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: method `preserve_roots` is never used
+   --> crates/aethyme-broker/src/local_generation/tests.rs:156:19
+    |
+ 26 | impl Fixture {
+    | ------------ method in this implementation
+...
+156 |     pub(crate) fn preserve_roots(&mut self) -> (PathBuf, PathBuf, PathBuf) {
+    |                   ^^^^^^^^^^^^^^
+
+warning: method `preserve_roots` is never used
+   --> crates/aethyme-broker/src/local_target/tests.rs:210:19
+    |
+125 | impl Fixture {
+    | ------------ method in this implementation
+...
+210 |     pub(crate) fn preserve_roots(&mut self) -> (PathBuf, PathBuf) {
+    |                   ^^^^^^^^^^^^^^
+
+warning: `aethyme-broker` (lib test) generated 4 warnings (run `cargo fix --lib -p aethyme-broker --tests` to apply 1 suggestion)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 31.06s
+  Executable unittests src/lib.rs (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/integrate-reviewed-local-bare-git-servic/target/local-resume/cargo/debug/deps/aethyme_broker-0f278e0d02146111)

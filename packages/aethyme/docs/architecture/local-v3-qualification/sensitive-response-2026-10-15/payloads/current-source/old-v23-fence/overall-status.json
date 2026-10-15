@@ -1,0 +1,8 @@
+{
+  "finished_at_utc": "2026-10-15T21:59:02.473138+00:00",
+  "floor23_negative_control_oracle_credit": true,
+  "old_binary_sha256": "1268402c5d49ac303b61bc28b4e4726bf95b1d17d64d7099850f2f67950f7e6f",
+  "positive_floor24_oracle_credit": true,
+  "source_head": "425a0bc8e41031cea6b0ff8b5bc0e9cc80748b31",
+  "source_tree": "01f8a9f6a51818732cf6feb38125a34c81745d5b"
+}

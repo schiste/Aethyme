@@ -1,0 +1,25 @@
+{
+  "original": "/private/tmp/t56-restored-module-e70a72d",
+  "items": [
+    {
+      "path": "manifest.json",
+      "bytes": 534,
+      "sha256": "84e56dcab707e9d3502cc65ec46263dc8bef1018695a566cfac6ff035c276bc5"
+    },
+    {
+      "path": "run-20261015/command.json",
+      "bytes": 1375,
+      "sha256": "9b32567ebd181e39d5c9d2489ce17fcc91fea363bd4a69ddbf63df0c706bc34b"
+    },
+    {
+      "path": "run-20261015/command.log",
+      "bytes": 3507,
+      "sha256": "4c398a292ea47b5b8ace33d53567f96fe0537f2750f73af50048d22008e99d02"
+    },
+    {
+      "path": "run-20261015/status.json",
+      "bytes": 401,
+      "sha256": "1d508cde1d1eca94a1bbf8c92c58d453e6a4ade17ddee66077dee9f28e123833"
+    }
+  ]
+}

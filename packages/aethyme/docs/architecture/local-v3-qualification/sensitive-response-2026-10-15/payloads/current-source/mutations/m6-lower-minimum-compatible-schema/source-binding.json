@@ -1,0 +1,22 @@
+{
+  "base_archive_bytes": 39168000,
+  "base_archive_path": "/private/tmp/t56-final-mutants-425a0bc/source.tar",
+  "base_archive_sha256": "936399325d06221e9eb553e578e6b4569b6be65a816513a4e681b9f3b066bae8",
+  "base_head": "425a0bc8e41031cea6b0ff8b5bc0e9cc80748b31",
+  "base_inventory_sha256": "8e0cb59f3ee0bbb19980dbbd6f49e8333633b20e323901fccb174bb7f6ab93c3",
+  "base_tree": "01f8a9f6a51818732cf6feb38125a34c81745d5b",
+  "case": "m6-lower-minimum-compatible-schema",
+  "created_at_utc": "2026-10-15T21:53:39.306976+00:00",
+  "expected_failure_fragment": "right: 24",
+  "mutation_patch_sha256": "69d3e710eb5914f6c2b003cec96efee446c50344d8cc46c787e999578ebf2499",
+  "mutations": {
+    "packages/aethyme/rust/crates/aethyme-broker/src/collaboration_state.rs": {
+      "backup_path": "/private/tmp/t56-final-mutants-425a0bc/m6-lower-minimum-compatible-schema/backup/packages/aethyme/rust/crates/aethyme-broker/src/collaboration_state.rs",
+      "mutated_bytes": 90149,
+      "mutated_sha256": "ea4c4f57d0748cb88ae5e466473841c763bad09c3f35f37b319f3c2da9e312bb",
+      "original_bytes": 90149,
+      "original_sha256": "bef0d8042a5ccf030b1c15010973735d81ae27baf9b97a46809d6636d02b1fd9"
+    }
+  },
+  "selector": "collaboration_state::tests::migrations_are_contiguous_and_end_at_this_binarys_version"
+}

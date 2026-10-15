@@ -1,0 +1,161 @@
+    Checking aethyme-graph-schema v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/implement-local-administrative-sensitive/packages/aethyme/rust/crates/aethyme-graph-schema)
+    Checking ra_ap_syntax v0.0.331
+   Compiling aethyme-engine v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/implement-local-administrative-sensitive/packages/aethyme/rust/crates/aethyme-engine)
+   Compiling aethyme-broker v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/implement-local-administrative-sensitive/packages/aethyme/rust/crates/aethyme-broker)
+    Checking aethyme-graph-storage v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/implement-local-administrative-sensitive/packages/aethyme/rust/crates/aethyme-graph-storage)
+    Checking aethyme-enhance v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/implement-local-administrative-sensitive/packages/aethyme/rust/crates/aethyme-enhance)
+    Checking aethyme-contracts v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/implement-local-administrative-sensitive/packages/aethyme/rust/crates/aethyme-contracts)
+    Checking aethyme-graph-indexer v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/implement-local-administrative-sensitive/packages/aethyme/rust/crates/aethyme-graph-indexer)
+    Checking aethyme-producers v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/implement-local-administrative-sensitive/packages/aethyme/rust/crates/aethyme-producers)
+warning: unused import: `File`
+  --> crates/aethyme-broker/src/local_restore.rs:13:15
+   |
+13 | use std::fs::{File, OpenOptions};
+   |               ^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+error[E0277]: `?` couldn't convert the error to `GenerationError`
+   --> crates/aethyme-broker/src/local_generation.rs:338:72
+    |
+336 | ) -> Result<PreparedGeneration, GenerationError> {
+    |      ------------------------------------------- expected `GenerationError` because of this
+337 |     let _archive = collaboration_gc::archive_use(store)?;
+338 |     let _response = crate::collaboration_sensitive::response_use(store)?;
+    |                     ---------------------------------------------------^ the trait `From<SensitiveError>` is not implemented for `GenerationError`
+    |                     |
+    |                     this can't be annotated with `?` because it has type `Result<_, SensitiveError>`
+    |
+note: `GenerationError` needs to implement `From<SensitiveError>`
+   --> crates/aethyme-broker/src/local_generation.rs:36:1
+    |
+ 36 | pub enum GenerationError {
+    | ^^^^^^^^^^^^^^^^^^^^^^^^
+    = note: the question mark operation (`?`) implicitly performs a conversion on the error value using the `From` trait
+    = help: `GenerationError` implements trait `From<T>`:
+              From<AcceptanceError>
+              From<ArchiveError>
+              From<ComposeError>
+              From<SnapshotError>
+              From<TargetError>
+              From<rusqlite::Error>
+              From<serde_json::Error>
+              From<std::io::Error>
+
+error[E0277]: `?` couldn't convert the error to `GenerationError`
+   --> crates/aethyme-broker/src/local_generation.rs:349:72
+    |
+347 | ) -> Result<PreparedGeneration, GenerationError> {
+    |      ------------------------------------------- expected `GenerationError` because of this
+348 |     let _archive = collaboration_gc::archive_use(store)?;
+349 |     let _response = crate::collaboration_sensitive::response_use(store)?;
+    |                     ---------------------------------------------------^ the trait `From<SensitiveError>` is not implemented for `GenerationError`
+    |                     |
+    |                     this can't be annotated with `?` because it has type `Result<_, SensitiveError>`
+    |
+note: `GenerationError` needs to implement `From<SensitiveError>`
+   --> crates/aethyme-broker/src/local_generation.rs:36:1
+    |
+ 36 | pub enum GenerationError {
+    | ^^^^^^^^^^^^^^^^^^^^^^^^
+    = note: the question mark operation (`?`) implicitly performs a conversion on the error value using the `From` trait
+    = help: `GenerationError` implements trait `From<T>`:
+              From<AcceptanceError>
+              From<ArchiveError>
+              From<ComposeError>
+              From<SnapshotError>
+              From<TargetError>
+              From<rusqlite::Error>
+              From<serde_json::Error>
+              From<std::io::Error>
+
+error[E0277]: `?` couldn't convert the error to `GenerationError`
+   --> crates/aethyme-broker/src/local_generation.rs:447:72
+    |
+442 | ) -> Result<PreparedGeneration, GenerationError> {
+    |      ------------------------------------------- expected `GenerationError` because of this
+...
+447 |     let _response = crate::collaboration_sensitive::response_use(store)?;
+    |                     ---------------------------------------------------^ the trait `From<SensitiveError>` is not implemented for `GenerationError`
+    |                     |
+    |                     this can't be annotated with `?` because it has type `Result<_, SensitiveError>`
+    |
+note: `GenerationError` needs to implement `From<SensitiveError>`
+   --> crates/aethyme-broker/src/local_generation.rs:36:1
+    |
+ 36 | pub enum GenerationError {
+    | ^^^^^^^^^^^^^^^^^^^^^^^^
+    = note: the question mark operation (`?`) implicitly performs a conversion on the error value using the `From` trait
+    = help: `GenerationError` implements trait `From<T>`:
+              From<AcceptanceError>
+              From<ArchiveError>
+              From<ComposeError>
+              From<SnapshotError>
+              From<TargetError>
+              From<rusqlite::Error>
+              From<serde_json::Error>
+              From<std::io::Error>
+
+warning: variable does not need to be mutable
+   --> crates/aethyme-broker/src/collaboration_archive.rs:500:9
+    |
+500 |     let mut file = match options.open(&path) {
+    |         ----^^^^
+    |         |
+    |         help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+error[E0596]: cannot borrow `*store` as mutable, as it is behind a `&` reference
+   --> crates/aethyme-broker/src/collaboration_sensitive.rs:725:25
+    |
+725 |     let mut statement = store.connection().prepare(
+    |                         ^^^^^ `store` is a `&` reference, so it cannot be borrowed as mutable
+    |
+help: consider changing this to be a mutable reference
+    |
+674 |     store: &mut CollaborationStore,
+    |             +++
+
+error[E0596]: cannot borrow `*store` as mutable, as it is behind a `&` reference
+   --> crates/aethyme-broker/src/collaboration_sensitive.rs:743:25
+    |
+743 |     let mut statement = store.connection().prepare(
+    |                         ^^^^^ `store` is a `&` reference, so it cannot be borrowed as mutable
+    |
+help: consider changing this to be a mutable reference
+    |
+674 |     store: &mut CollaborationStore,
+    |             +++
+
+error[E0502]: cannot borrow `*store` as immutable because it is also borrowed as mutable
+    --> crates/aethyme-broker/src/collaboration_sensitive.rs:1347:20
+     |
+1264 |     let tx = store
+     |              ----- mutable borrow occurs here
+...
+1347 |         let path = store.project_dir().join(name);
+     |                    ^^^^^ immutable borrow occurs here
+1348 |         if fs::symlink_metadata(&path).is_ok() {
+1349 |             tx.execute(
+     |             -- mutable borrow later used here
+
+error[E0502]: cannot borrow `*store` as immutable because it is also borrowed as mutable
+    --> crates/aethyme-broker/src/collaboration_sensitive.rs:1505:19
+     |
+1502 |     let connection = store.connection();
+     |                      ----- mutable borrow occurs here
+...
+1505 |     let result = (|| {
+     |                   ^^ immutable borrow occurs here
+...
+1541 |         sync_file_if_present(&store.project_dir().join("state.db-wal"))?;
+     |                               ----- second borrow occurs due to use of `*store` in closure
+...
+1561 |     let foreign_keys = connection.pragma_update(None, "foreign_keys", "ON");
+     |                        ---------- mutable borrow later used here
+
+Some errors have detailed explanations: E0277, E0502, E0596.
+For more information about an error, try `rustc --explain E0277`.
+warning: `aethyme-broker` (lib) generated 2 warnings
+error: could not compile `aethyme-broker` (lib) due to 7 previous errors; 2 warnings emitted

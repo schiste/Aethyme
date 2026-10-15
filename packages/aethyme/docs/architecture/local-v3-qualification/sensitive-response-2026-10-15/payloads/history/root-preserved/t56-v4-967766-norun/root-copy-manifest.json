@@ -1,0 +1,17 @@
+{
+  "captured_at_utc": "2026-10-15T20:41:40.004755+00:00",
+  "source": "/private/tmp/t56-v4-967766-norun",
+  "scope": "Exact retained source-bound attempts; no test credit for compile-only or setup failures.",
+  "files": [
+    {
+      "path": "command.log",
+      "bytes": 193,
+      "sha256": "e855013f7925b7759cd2e65c808c20e6d6a26cf77634eefdc47ba89c8c79d989"
+    },
+    {
+      "path": "status",
+      "bytes": 4,
+      "sha256": "39b8dc3fc8b44765c8e6f1adee04c5b465e555ab791cc42d0d9e810d5b64297c"
+    }
+  ]
+}

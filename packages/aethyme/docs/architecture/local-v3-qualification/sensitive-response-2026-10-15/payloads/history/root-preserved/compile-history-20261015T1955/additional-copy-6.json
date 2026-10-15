@@ -1,0 +1,10 @@
+{
+  "captured_at_utc": "2026-10-15T20:07:06.936602+00:00",
+  "source": "/private/tmp/t56-norun-v4-QvOnqg/compile.log",
+  "copy": "target/local-resume/t56-compile-history-20261015T1955/6-t56-norun-v4-QvOnqg.log",
+  "bytes": 253,
+  "sha256": "6b3912d83b92ec44f1b105e6b6f715cc4d7cf55a9b13bec14f40dff30c37d786",
+  "exit": 101,
+  "phase": "filesystem-sandbox sharedtarget-lock access failure before compilation; authorizedelevatedretryrecordedseparately",
+  "test_credit": 0
+}

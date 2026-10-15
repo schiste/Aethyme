@@ -1,0 +1,11 @@
+{
+  "captured_at_utc": "2026-10-15T20:05:46.028081+00:00",
+  "source": "/private/tmp/t56-norun-v4-final-8F7SaT/compile.log",
+  "copy": "target/local-resume/t56-compile-history-20261015T1955/5-t56-norun-v4-final-8F7SaT.log",
+  "bytes": 1671,
+  "sha256": "5b8a3168c95e8486fda7d16efe60779b3c3cf6437fd70fce8d02fcb89f52b8e9",
+  "source_commit": "773dd693e49b0e90d8e3cf12010556b9a2fdc3d1",
+  "source_tree": "b15fdd103b490f9026b86c078f72a9c449182eea",
+  "exit": 0,
+  "scope": "Exactsource compile-onlyPASS nofixtureexecution/testcredit;3unusedsiblingtesthelperwarningsremain"
+}
