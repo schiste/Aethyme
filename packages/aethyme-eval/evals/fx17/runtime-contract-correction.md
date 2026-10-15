@@ -42,7 +42,14 @@ is approved by this correction alone.
 
 The final-proposal evaluator loads the externally supplied frozen oracle in the
 parent process. Its child receives only the candidate script and each exact
-literal argv vector. Before the controls harness runs, an independent reviewer
+literal argv vector. Each sandboxed subject starts with `/` as its working
+directory. Attempt 003 showed that the `/bin/sh` selector starts Bash on this
+host, and Bash's startup `getcwd` check emitted a denial diagnostic when the
+child inherited the private candidate directory. The runner now uses the root
+directory entry already allowed by the profile; it grants no reads to the
+private temporary-directory ancestors. The candidate script remains in a
+private `0700` directory as a `0400` file, and only its exact absolute path
+is allowlisted. Before the controls harness runs, an independent reviewer
 must acknowledge the exact runner, control-harness, and subject-profile hashes.
 The deny-default subject profile permits process execution and file reads only
 for the exact `/bin/sh` and `/bin/bash` shell bootstrap executables. It permits
