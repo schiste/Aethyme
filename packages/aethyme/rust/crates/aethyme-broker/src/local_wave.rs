@@ -211,8 +211,20 @@ pub(crate) fn available(
     contribution: &str,
     now_ms: i64,
 ) -> Result<(), WaveError> {
-    let _authority = target::authorize(store, owner)?;
-    target::authorize(store, owner)?;
+    let _response = crate::collaboration_sensitive::response_use(store)?;
+    let authority = target::authorize(store, owner)?;
+    available_under_owner_tick(store, owner, contribution, now_ms, &authority)
+}
+
+/// Record an arrival while an enclosing owner tick already holds the response
+/// and authority guards. This avoids reacquiring authority below ingress.
+pub(crate) fn available_under_owner_tick(
+    store: &mut CollaborationStore,
+    owner: &ControllerOwner,
+    contribution: &str,
+    now_ms: i64,
+    _authority: &crate::local_authority::Guard,
+) -> Result<(), WaveError> {
     if now_ms < 0 {
         return Err(WaveError::Invalid("negative clock".into()));
     }
@@ -485,8 +497,8 @@ pub(crate) fn admit_after_notices(
     owner: &ControllerOwner,
     policy: WavePolicy,
     now_ms: i64,
+    _authority: &crate::local_authority::Guard,
 ) -> Result<Admission, WaveError> {
-    let _authority = target::authorize(store, owner)?;
     policy.validate()?;
     if now_ms < 0 {
         return Err(WaveError::Invalid("negative clock".into()));
@@ -519,7 +531,9 @@ pub(crate) fn admit_after_notices(
             "unsupported composer profile",
         );
     }
-    let _archive = archive_use(store)?;
+    // `admit_for_owner` holds the archive shared guard through this call.
+    // Reopening the same flock below the ingress lock can wait behind a
+    // queued reclamation writer while this tick already holds a shared guard.
     let baseline =
         archive::retained(store, &snapshot(&pinned.spec.baseline)?)?.ok_or(TargetError::Missing)?;
     let groups = composer::validate_retained_selection(

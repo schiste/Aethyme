@@ -240,7 +240,6 @@ pub(super) fn drive_until(
         carrier.check()?;
         destination.revalidate()?;
     }
-    let _authority = target::authorize(store, owner)?;
     if cancel.load(Ordering::SeqCst) || clock()? >= deadline_ms {
         return Err(ControllerError::Mismatch);
     }
@@ -256,6 +255,14 @@ pub(super) fn drive_until(
         wave::Admission::Frozen(w) | wave::Admission::Existing(w) => w,
         other => return Ok(DriveResult::Waiting(other)),
     };
+    // Admission owns its authority guard while it drains and freezes under the
+    // notice-ingress barrier. Reacquire here before any execution-side reads or
+    // dispatch so a freeze between those phases fails closed without nesting a
+    // second shared authority lock beneath the ingress lock.
+    let _authority = target::authorize(store, owner)?;
+    if cancel.load(Ordering::SeqCst) || clock()? >= deadline_ms {
+        return Err(ControllerError::Mismatch);
+    }
     let revision = RecordId::parse(&active.spec.revision).map_err(|_| ControllerError::Mismatch)?;
     let pinned = target::load_revision(store, &revision)?;
     if permit.policy().record()?.id().as_str() != pinned.spec.acceptance_policy

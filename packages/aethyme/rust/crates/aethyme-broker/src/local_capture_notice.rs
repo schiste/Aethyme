@@ -385,11 +385,15 @@ pub(crate) fn admit_for_owner(
     // authority -> ingress. The ingress lock remains held through admission.
     let _archive = crate::collaboration_gc::archive_use(store)?;
     let _response = crate::collaboration_sensitive::response_use(store)?;
-    let _authority = crate::local_authority::guard(store, owner.authority_epoch())?;
+    // `authorize` both validates the owner identity and holds the exact active
+    // authority epoch. Keep this guard for the whole tick so inner operations
+    // do not reacquire it beneath the ingress lock.
+    let authority = target::authorize(store, owner)?;
     let _ingress = ingress_lock(store)?;
-    consume_pending_locked(store, owner)?;
+    consume_pending_locked(store, owner, &authority)?;
     owner_tick_hook();
-    crate::local_wave::admit_after_notices(store, owner, policy, now_ms).map_err(Into::into)
+    crate::local_wave::admit_after_notices(store, owner, policy, now_ms, &authority)
+        .map_err(Into::into)
 }
 
 /// Consume queued notices while the caller owns archive, response, authority,
@@ -398,6 +402,7 @@ pub(crate) fn admit_for_owner(
 fn consume_pending_locked(
     store: &mut CollaborationStore,
     owner: &ControllerOwner,
+    _authority: &crate::local_authority::Guard,
 ) -> Result<ConsumeReport, NoticeError> {
     let mut statement = store.read_connection().prepare(
         "SELECT n.notice_id,n.body FROM local_capture_notices n
@@ -443,7 +448,13 @@ fn consume_pending_locked(
             )?;
             report.stale += 1;
         } else {
-            crate::local_wave::available(store, owner, &body.alias, body.received_ms)?;
+            crate::local_wave::available_under_owner_tick(
+                store,
+                owner,
+                &body.alias,
+                body.received_ms,
+                _authority,
+            )?;
             store.connection().execute(
                 "UPDATE local_capture_notice_outcomes SET status='available',detail=NULL,changed_ms=?2
                  WHERE notice_id=?1 AND status='pending'",
