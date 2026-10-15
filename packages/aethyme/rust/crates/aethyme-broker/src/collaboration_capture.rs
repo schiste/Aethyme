@@ -344,16 +344,21 @@ pub enum FaultPoint {
 }
 
 /// Test seams. Production passes the default.
+#[cfg(test)]
+pub(crate) type BeforeCopyWriteCallback = Box<dyn Fn(&CommitOid, u64) + Send + Sync>;
+#[cfg(test)]
+pub(crate) type CopyErrorCallback = Box<dyn Fn(&ArchiveError) + Send + Sync>;
+
 #[derive(Default)]
 pub(crate) struct Hooks {
     #[cfg(test)]
     pub fault: Option<FaultPoint>,
     /// Pause immediately before copying a blob of a chosen retained commit.
     #[cfg(test)]
-    pub before_copy_write: Option<Box<dyn Fn(&CommitOid, u64) + Send + Sync>>,
+    pub before_copy_write: Option<BeforeCopyWriteCallback>,
     /// Observe and optionally pause after a real archive copy I/O error.
     #[cfg(test)]
-    pub on_copy_error: Option<Box<dyn Fn(&ArchiveError) + Send + Sync>>,
+    pub on_copy_error: Option<CopyErrorCallback>,
     /// Free bytes to report instead of asking the filesystem.
     pub free_bytes: Option<u64>,
 }
