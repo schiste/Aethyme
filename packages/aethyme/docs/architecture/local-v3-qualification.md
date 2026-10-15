@@ -202,6 +202,9 @@ substituted. All six assigned rows remain in the denominator; their consumed
 campaign is not retried. Correct/absent/misleading brief usefulness and held-out
 behavior remain unqualified. Provider retries and invoiced cost are unknown.
 A corrected generic schema adapter cannot retrospectively qualify those rows.
+Its separate [local adapter checks](local-v3-qualification/model-adapter-2026-10-15/ledger.json)
+record six passing model-free controls and three intended named mutation failures
+(pytest exit 1), with exact source restoration and zero model/evaluator calls.
 
 The [receiver-timeout ledger](local-v3-qualification/unknown-publication-2026-10-15/ledger.json)
 separately records a passing actual control at `b16af023`: the remote ref moved,
