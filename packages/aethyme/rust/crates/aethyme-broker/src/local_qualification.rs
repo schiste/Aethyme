@@ -380,7 +380,9 @@ fn assert_archive_exclusive_observed(lock_path: &std::path::Path, label: &str, s
 impl ResumeGc {
     fn release(&mut self) {
         if let Some(sender) = self.0.take() {
-            let _ = sender.send(());
+            if sender.send(()).is_err() {
+                // The GC worker already exited, so no pause remains to release.
+            }
         }
     }
 }
