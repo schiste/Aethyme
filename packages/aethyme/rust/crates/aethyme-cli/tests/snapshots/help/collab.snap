@@ -33,6 +33,9 @@ Usage:
   aethyme collab capture receipt --operation <id> [--json]
       Show a capture's receipt. `released` or `reclaimed` means the source is
       no longer promised; only `retained_local` is.
+  aethyme collab capture release --operation <id> --confirm <receipt-record-id> [--json]
+      Release only that committed capture's contribution root. Other roots may
+      still retain source; this command does not reclaim or erase it.
   aethyme collab gc plan [--json]
       Survey retained data and record a plan. Removes nothing.
   aethyme collab gc apply --confirm <digest> [--json]
@@ -78,9 +81,11 @@ Additional explicit lifecycle commands (provisional Local packages):
       Appoint the immutable project budget policy from a strict bounded file.
   aethyme collab target budget objective --target NAME --issuer NAME --file PATH [--json]
       Appoint the immutable cap for the current target objective authorization.
-  aethyme collab target budget status --target NAME --issuer NAME [--reservation ID] [--json]
+  aethyme collab target budget status --target NAME --issuer NAME
+       [--reservation ID | --nonce NONCE] [--json]
       Reconcile immutable policies, totals, and up to 500 newest reservation rows.
-      An exact reservation lookup is included even when older than that page.
+      Exact reservation or nonce lookup is included even when older than that
+      page; nonce lookup is read-only and never retries or resumes work.
   aethyme collab target verifier prepare --harness-repo PATH --commit OID
        --inventory PATH --operation ID --docker ABSOLUTE_PATH --endpoint UNIX_SOCKET
        --file PLAN.json [--json]
