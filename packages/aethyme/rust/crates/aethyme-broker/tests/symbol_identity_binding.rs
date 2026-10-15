@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use aethyme_broker::experimental_symbol_mapping::{
-    CloneSnapshotBinding, MappingResolution, resolve_within_binding,
+    CapturedCloneSnapshot, CloneSnapshotBinding, MappingResolution, resolve_within_binding,
 };
 use aethyme_contracts::experimental_v0::source_snapshot::{EntryKind, SourceEntry};
 use aethyme_contracts::experimental_v0::symbol_identity::{
@@ -304,12 +304,8 @@ fn mapping_fixture_named(
     let right_source_encoded = right_source_id.as_str();
     let local_binding = CloneSnapshotBinding::from_snapshots(
         RecordId::parse(PROJECT).unwrap(),
-        left_clone.clone(),
-        left_repo,
-        &left_source,
-        right_clone.clone(),
-        right_repo,
-        &right_source,
+        CapturedCloneSnapshot::new(left_clone.clone(), left_repo, &left_source),
+        CapturedCloneSnapshot::new(right_clone.clone(), right_repo, &right_source),
         RecordId::parse(PROFILE).unwrap(),
     )
     .unwrap();
@@ -568,12 +564,16 @@ fn path_moves_renames_copies_and_historical_overload_collisions_stay_unknown() {
     assert_ne!(old_copy, node_ids(&clones.right, "src/copied.ts", "copy_me"));
     let refreshed = CloneSnapshotBinding::from_snapshots(
         RecordId::parse(PROJECT).unwrap(),
-        rid("clone-a"),
-        repo_component(&clones.left),
-        &source_snapshot(&clones.left),
-        rid("clone-b"),
-        repo_component(&clones.right),
-        &source_snapshot(&clones.right),
+        CapturedCloneSnapshot::new(
+            rid("clone-a"),
+            repo_component(&clones.left),
+            &source_snapshot(&clones.left),
+        ),
+        CapturedCloneSnapshot::new(
+            rid("clone-b"),
+            repo_component(&clones.right),
+            &source_snapshot(&clones.right),
+        ),
         RecordId::parse(PROFILE).unwrap(),
     )
     .unwrap();

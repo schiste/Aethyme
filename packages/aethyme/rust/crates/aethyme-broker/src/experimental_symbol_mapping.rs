@@ -35,19 +35,45 @@ pub struct CloneSnapshotBinding {
     right_repo_component: String,
 }
 
+/// Locally captured identity and source for one clone in a mapping binding.
+#[derive(Debug, Clone)]
+pub struct CapturedCloneSnapshot<'a> {
+    clone_id: RecordId,
+    repo_component: String,
+    source: &'a SourceSnapshot,
+}
+
+impl<'a> CapturedCloneSnapshot<'a> {
+    pub fn new(
+        clone_id: RecordId,
+        repo_component: impl Into<String>,
+        source: &'a SourceSnapshot,
+    ) -> Self {
+        Self {
+            clone_id,
+            repo_component: repo_component.into(),
+            source,
+        }
+    }
+}
+
 impl CloneSnapshotBinding {
     pub fn from_snapshots(
         project_id: RecordId,
-        left_clone_id: RecordId,
-        left_repo_component: impl Into<String>,
-        left_source: &SourceSnapshot,
-        right_clone_id: RecordId,
-        right_repo_component: impl Into<String>,
-        right_source: &SourceSnapshot,
+        left: CapturedCloneSnapshot<'_>,
+        right: CapturedCloneSnapshot<'_>,
         profile: RecordId,
     ) -> Result<Self, BindingError> {
-        let left_repo_component = left_repo_component.into();
-        let right_repo_component = right_repo_component.into();
+        let CapturedCloneSnapshot {
+            clone_id: left_clone_id,
+            repo_component: left_repo_component,
+            source: left_source,
+        } = left;
+        let CapturedCloneSnapshot {
+            clone_id: right_clone_id,
+            repo_component: right_repo_component,
+            source: right_source,
+        } = right;
         if left_clone_id == right_clone_id {
             return Err(BindingError::SameClone);
         }
