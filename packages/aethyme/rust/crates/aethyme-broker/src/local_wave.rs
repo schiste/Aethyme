@@ -307,6 +307,17 @@ pub fn load(store: &CollaborationStore, wave: &RecordId) -> Result<Wave, WaveErr
     })
 }
 
+struct AcceptedCompletionRow {
+    body: Vec<u8>,
+    phase: String,
+    detail: Option<String>,
+    sequence: i64,
+    target: String,
+    revision: String,
+    candidate: Option<String>,
+    commit: Option<String>,
+}
+
 /// Load a canonical private completion and its accepted wave. Cross-revision
 /// callers must additionally bind the completion's source to the new
 /// revision's explicitly selected baseline before using its commit as history.
@@ -317,38 +328,40 @@ pub(crate) fn accepted_completion(
 ) -> Result<(crate::local_controller::CompletionSpec, WaveSpec), WaveError> {
     let completion =
         crate::local_controller::load(store, key).map_err(|e| WaveError::Invalid(e.to_string()))?;
-    let (body, phase, detail, old_sequence, target, revision, candidate, commit): (
-        Vec<u8>,
-        String,
-        Option<String>,
-        i64,
-        String,
-        String,
-        Option<String>,
-        Option<String>,
-    ) = store.read_connection().query_row(
+    let row: AcceptedCompletionRow = store.read_connection().query_row(
         "SELECT body,phase,detail,sequence,target,revision,candidate_snapshot,candidate_commit FROM local_waves WHERE wave=?1",
         [completion.wave.as_str()],
-        |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?)),
+        |r| {
+            Ok(AcceptedCompletionRow {
+                body: r.get(0)?,
+                phase: r.get(1)?,
+                detail: r.get(2)?,
+                sequence: r.get(3)?,
+                target: r.get(4)?,
+                revision: r.get(5)?,
+                candidate: r.get(6)?,
+                commit: r.get(7)?,
+            })
+        },
     )?;
     let record =
-        Record::decode(&body, &[&SCHEMA]).map_err(|e| WaveError::Invalid(e.to_string()))?;
+        Record::decode(&row.body, &[&SCHEMA]).map_err(|e| WaveError::Invalid(e.to_string()))?;
     let spec: WaveSpec = serde_json::from_value(
-        serde_json::from_slice::<serde_json::Value>(&body)?["spec"].clone(),
+        serde_json::from_slice::<serde_json::Value>(&row.body)?["spec"].clone(),
     )?;
     if record.id().as_str() != completion.wave
-        || record.canonical_bytes() != body
-        || phase != "accepted"
-        || detail.as_deref() != Some(key.as_str())
-        || old_sequence != spec.sequence
-        || old_sequence <= 0
-        || old_sequence >= sequence
-        || target != completion.target
-        || revision != completion.revision
+        || record.canonical_bytes() != row.body
+        || row.phase != "accepted"
+        || row.detail.as_deref() != Some(key.as_str())
+        || row.sequence != spec.sequence
+        || row.sequence <= 0
+        || row.sequence >= sequence
+        || row.target != completion.target
+        || row.revision != completion.revision
         || spec.target != completion.target
         || spec.revision != completion.revision
-        || candidate.as_deref() != Some(completion.source.as_str())
-        || commit.as_deref() != Some(completion.candidate_commit.as_str())
+        || row.candidate.as_deref() != Some(completion.source.as_str())
+        || row.commit.as_deref() != Some(completion.candidate_commit.as_str())
         || completion.accepted_tree != completion.candidate_tree
     {
         return Err(WaveError::Invalid("prior proof-bound accepted wave".into()));
