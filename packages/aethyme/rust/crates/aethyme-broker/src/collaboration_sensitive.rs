@@ -2010,7 +2010,7 @@ mod tests {
             sources: vec![capture_receipt.result.clone()],
             records: Vec::new(),
         };
-        let export_path = run_root.join("external-export.bundle");
+        let export_path = run_root.path().join("external-export.bundle");
         crate::local_restore::export_to_path(
             &mut fixture.v.f.store,
             &fixture.v.owner,
@@ -2137,7 +2137,7 @@ mod tests {
                 &fixture.v.owner,
                 &scope,
                 &selection,
-                &run_root.join("blocked-export.bundle")
+                &run_root.path().join("blocked-export.bundle")
             )
             .is_err()
         );
