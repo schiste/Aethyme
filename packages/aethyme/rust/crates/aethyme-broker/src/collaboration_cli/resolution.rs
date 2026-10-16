@@ -422,7 +422,9 @@ mod tests {
         };
         let composed =
             wave::compose_with_source(&mut fixture.store, &owner, repo, &pending.id).unwrap();
-        let source = composed.source.unwrap();
+        let source = composed
+            .source
+            .unwrap_or_else(|| panic!("Playground composition has no source: {:?}", composed.wave));
         let requested = wave::raise_resolution_for_failed_checks(
             &mut fixture.store,
             &owner,
