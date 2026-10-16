@@ -9,8 +9,9 @@ use crate::execution_verifier::{self as verifier, ProducerPermit, VerificationOu
 use crate::local_budget::{self as budget, WorkKind};
 use crate::local_source_transport as transport;
 use crate::native_gates;
-use crate::resolution::{self, FailedCheck};
+use crate::resolution::FailedCheck;
 use rusqlite::OptionalExtension;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 const RUN_SCHEMA: RecordSchema = RecordSchema {
