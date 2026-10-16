@@ -55,6 +55,7 @@ const MAX_IDENTITY_PROOF_EDGES: usize = 10_000;
 const MAX_IDENTITY_ROOTS: usize = 20_000;
 const MAX_IDENTITY_MANIFEST_BYTES: usize = 64 * 1024 * 1024;
 const MAX_IDENTITY_SINGLE_MANIFEST_BYTES: usize = 16 * 1024 * 1024;
+const NATIVE_LIVE_ROOTS_SQL: &str = "SELECT roots.kind,roots.reference FROM local_native_gate_roots AS roots JOIN local_native_gate_jobs AS jobs ON jobs.id=roots.job WHERE jobs.roots_released_ms IS NULL UNION ALL SELECT kind,reference FROM local_controller_completion_roots";
 
 pub(crate) fn now_ms() -> i64 {
     std::time::SystemTime::now()
@@ -1197,8 +1198,8 @@ fn live_closure_with_identity_limit(
     // job retires these edges; dispatching and unknown jobs remain rooted.
     let native_roots: Vec<(String, String)> = collect_live_roots(
         connection
-        .prepare("SELECT roots.kind,roots.reference FROM local_native_gate_roots AS roots JOIN local_native_gate_jobs AS jobs ON jobs.id=roots.job WHERE jobs.roots_released_ms IS NULL UNION ALL SELECT kind,reference FROM local_controller_completion_roots")?
-        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?,
+            .prepare(NATIVE_LIVE_ROOTS_SQL)?
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?,
         &mut live.identity_roots_remaining,
     )?;
     for (kind, reference) in native_roots {
@@ -2646,6 +2647,29 @@ mod tests {
         ordinary.snapshot(&receipt.base.to_string()).unwrap();
         ordinary.snapshot(&receipt.result.to_string()).unwrap();
         assert!(ordinary.problems.is_empty());
+    }
+
+    #[test]
+    fn identity_native_root_query_streams_before_the_collector_limit() {
+        let host = tempfile::tempdir().unwrap();
+        let store = open(host.path());
+        let query = format!("EXPLAIN QUERY PLAN {NATIVE_LIVE_ROOTS_SQL}");
+        let details: Vec<String> = store
+            .read_connection()
+            .prepare(&query)
+            .unwrap()
+            .query_map([], |row| row.get(3))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(
+            details.iter().any(|detail| detail.contains("UNION ALL")),
+            "native roots must stream: {details:?}"
+        );
+        assert!(
+            !details.iter().any(|detail| detail.contains("TEMP B-TREE")),
+            "root discovery must not materialize an unbounded union: {details:?}"
+        );
     }
 
     #[test]
