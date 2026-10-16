@@ -78,6 +78,13 @@ formatter check passed. Strict combined Clippy failed on bridge argument-count,
 wire-enum layout, borrow and test-style diagnostics; its correction and rerun
 remain pending at this checkpoint.
 
+On merged source `1c30f0ab9f02be54446eb0c3e93c3ad690590f4c`, the
+corrected bridge passed all 18 revision-consumer tests, six target-profile tests,
+and 23 wave tests with no failures or ignored tests. Strict broker/contracts
+Clippy across all targets passed, and workspace formatting passed. These narrow
+checks qualify their recorded selections; final combined-workspace and public
+CLI rehearsal checks remain separate.
+
 The actual help snapshot generator ran on `22da789b`, changing only the intended
 collaboration help snapshot. That generation run receives no qualification credit
 because its source changed. After independent review and commit `8b9a56bc`, the
@@ -166,8 +173,9 @@ one writer contention test, and one current-head inheritance test passed.
 
 The first rerun after the bridge lint cleanup on `b89f4186` stopped at
 compilation: the borrowed revision digest was compared with an owned string.
-No tests executed; this attempt receives no qualification credit. Its owning
-bridge session is correcting the comparison before the rerun.
+No tests executed; this attempt receives no qualification credit. The owning
+bridge session corrected the comparison in `7ff5a380`; the clean-source rerun
+on `1c30f0ab` passed as recorded above.
 
 A replay-budget filter on `3570a853` initially selected zero tests. The driver
 stopped, the exact existing test filter was corrected, and that test passed in
