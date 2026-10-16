@@ -30,6 +30,8 @@ pub const STORAGE_PLAN_SCHEMA_VERSION: u32 = 3;
 pub const STORAGE_RECONCILIATION_SCHEMA_VERSION: u32 = 1;
 
 const DAY_MS: i64 = 86_400_000;
+const PREPARATION_SWEEP_MAX_DISCOVERY_PATHS: usize = 4096;
+const PREPARATION_SWEEP_MAX_MARKER_BYTES: u64 = 64 * 1024;
 
 #[derive(Debug, thiserror::Error)]
 pub enum StorageError {
@@ -1169,46 +1171,338 @@ fn directory_modified_within(dir: &Path, window_ms: u64) -> bool {
 /// command only trades disk for nothing. Measured here: 13.3 GB reclaimed by
 /// hand came back as 15 GB in three days, because nothing reclaimed it.
 ///
-/// Bounded by `deadline` and safe to interrupt -- entries are independent, so
-/// a partial sweep is simply a smaller sweep. Returns entries removed and
-/// bytes reclaimed.
+/// Checks `deadline` between filesystem operations and streamed hash chunks.
+/// Filesystem calls themselves cannot be cancelled, so a stalled OS call can
+/// outlive the deadline. Entries are independent, making a partial sweep safe.
+/// Returns fully removed entries and their measured bytes; an interrupted
+/// entry may already be partly drained, so these totals can conservatively
+/// undercount bytes removed during that pass.
 pub(crate) fn sweep_preparation_cache(
     main_root: &Path,
-    orphan_worktree_roots_days: u32,
+    _orphan_worktree_roots_days: u32,
     deadline: std::time::Instant,
 ) -> (usize, u64) {
+    if check_preparation_sweep_deadline(deadline).is_err() {
+        return (0, 0);
+    }
     let Ok(storage_root) = storage_container(main_root) else {
         return (0, 0);
     };
-    let mut records = crate::measurement::SizeRecords::default();
-    // Recorded sizing: the budget should be spent reclaiming, and an entry's
-    // size does not change whether it is dead.
-    let Ok(plan) = build_plan(
-        main_root,
-        &storage_root,
-        orphan_worktree_roots_days,
-        Vec::new(),
-        crate::SizeScan::Recorded,
-        &mut records,
-    ) else {
+    if check_preparation_sweep_deadline(deadline).is_err() {
+        return (0, 0);
+    }
+    let Some(cache_root) = preparation_cache_root(&storage_root) else {
         return (0, 0);
     };
-    // The same population the manual lane uses. It must span every enrolled
-    // checkout, not just this repository: the cache is shared, and a live
-    // entry belonging to a sibling repository would otherwise look dead here.
-    let live_roots = preparation_live_roots(main_root, &plan.primary_checkouts, &plan.roots);
+    sweep_preparation_cache_at(main_root, &storage_root, &cache_root, deadline)
+}
+
+/// The inline lane deliberately does not build a storage plan: that plan
+/// reconciles Git and broker ledgers for every storage class. Cache liveness
+/// needs only the checkout roots and their declared preparation inputs.
+fn sweep_preparation_cache_at(
+    main_root: &Path,
+    storage_root: &Path,
+    cache_root: &Path,
+    deadline: std::time::Instant,
+) -> (usize, u64) {
+    let live_roots = match discover_preparation_live_roots(main_root, storage_root, deadline) {
+        Ok(roots) => roots,
+        Err(_) => return (0, 0),
+    };
+    let live_keys = match current_preparation_keys(&live_roots, deadline) {
+        Ok(keys) => keys,
+        Err(_) => return (0, 0),
+    };
+    if check_preparation_sweep_deadline(deadline).is_err() {
+        return (0, 0);
+    }
+    let cache_metadata = match std::fs::symlink_metadata(cache_root) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return (0, 0),
+        Err(_) => return (0, 0),
+    };
+    if cache_metadata.file_type().is_symlink() || !cache_metadata.is_dir() {
+        return (0, 0);
+    }
+    if check_preparation_sweep_deadline(deadline).is_err() {
+        return (0, 0);
+    }
+    let repositories = match std::fs::read_dir(cache_root) {
+        Ok(entries) => entries,
+        Err(_) => return (0, 0),
+    };
+    if check_preparation_sweep_deadline(deadline).is_err() {
+        return (0, 0);
+    }
     let mut removed = 0_usize;
     let mut bytes = 0_u64;
-    for candidate in &plan.preparation_candidates {
-        if std::time::Instant::now() >= deadline {
+    for repository in repositories {
+        if check_preparation_sweep_deadline(deadline).is_err() {
             break;
         }
-        if let Ok(reclaimed) = apply_preparation_candidate(candidate, &live_roots) {
-            removed += 1;
-            bytes = bytes.saturating_add(reclaimed);
+        let Ok(repository) = repository else {
+            break;
+        };
+        let repository_path = repository.path();
+        let Ok(repository_type) = repository.file_type() else {
+            break;
+        };
+        if repository_type.is_symlink() || !repository_type.is_dir() {
+            continue;
+        }
+        let entries = match std::fs::read_dir(&repository_path) {
+            Ok(entries) => entries,
+            Err(_) => break,
+        };
+        for entry in entries {
+            if check_preparation_sweep_deadline(deadline).is_err() {
+                return (removed, bytes);
+            }
+            let Ok(entry) = entry else {
+                return (removed, bytes);
+            };
+            let Ok(file_type) = entry.file_type() else {
+                return (removed, bytes);
+            };
+            if file_type.is_symlink() || !file_type.is_dir() {
+                continue;
+            }
+            let key = entry.file_name().to_string_lossy().into_owned();
+            if key.len() != 12 || !key.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                continue;
+            }
+            if live_keys.contains(&key) {
+                continue;
+            }
+
+            // The initial key set made discovery cheap. Before each deletion,
+            // repeat the bounded root scan and key calculation so a checkout
+            // or input change since that snapshot can only retain the entry.
+            let current_roots =
+                match discover_preparation_live_roots(main_root, storage_root, deadline) {
+                    Ok(roots) => roots,
+                    Err(_) => return (removed, bytes),
+                };
+            let current_keys = match current_preparation_keys(&current_roots, deadline) {
+                Ok(keys) => keys,
+                Err(_) => return (removed, bytes),
+            };
+            if current_keys.contains(&key) {
+                continue;
+            }
+            let candidate_path = entry.path();
+            if candidate_path.parent() != Some(repository_path.as_path())
+                || repository_path.parent() != Some(cache_root)
+                || !is_real_directory(cache_root)
+                || !is_real_directory(&repository_path)
+            {
+                return (removed, bytes);
+            }
+            if check_preparation_sweep_deadline(deadline).is_err()
+                || !is_real_directory(&candidate_path)
+            {
+                return (removed, bytes);
+            }
+            let usage =
+                match crate::disk_headroom::directory_usage_bounded(&candidate_path, deadline) {
+                    Some(usage) => usage,
+                    None => return (removed, bytes),
+                };
+            if check_preparation_sweep_deadline(deadline).is_err() {
+                return (removed, bytes);
+            }
+            if !is_real_directory(cache_root)
+                || !is_real_directory(&repository_path)
+                || !is_real_directory(&candidate_path)
+            {
+                return (removed, bytes);
+            }
+            match remove_condemned_tree(&candidate_path, None, Some(deadline)) {
+                Ok(TreeRemoval::Complete) => {
+                    removed += 1;
+                    bytes = bytes.saturating_add(usage.bytes);
+                }
+                // Count only a fully removed cache entry. The interrupted
+                // entry can already have lost files, so `bytes` deliberately
+                // remains a conservative lower bound for this pass.
+                Ok(TreeRemoval::Interrupted) => return (removed, bytes),
+                Err(_) => continue,
+            }
         }
     }
     (removed, bytes)
+}
+
+fn check_preparation_sweep_deadline(deadline: std::time::Instant) -> Result<(), StorageError> {
+    if std::time::Instant::now() >= deadline {
+        return Err(StorageError::Unavailable {
+            reason: "preparation-cache liveness deadline elapsed".into(),
+        });
+    }
+    Ok(())
+}
+
+fn discover_preparation_live_roots(
+    main_root: &Path,
+    storage_root: &Path,
+    deadline: std::time::Instant,
+) -> Result<Vec<PathBuf>, StorageError> {
+    check_preparation_sweep_deadline(deadline)?;
+    let main_metadata =
+        std::fs::symlink_metadata(main_root).map_err(|source| StorageError::Io {
+            path: main_root.to_path_buf(),
+            source,
+        })?;
+    if main_metadata.file_type().is_symlink() || !main_metadata.is_dir() {
+        return Err(StorageError::Unavailable {
+            reason: "invoking checkout is not a real directory".into(),
+        });
+    }
+    check_preparation_sweep_deadline(deadline)?;
+    let storage_metadata = match std::fs::symlink_metadata(storage_root) {
+        Ok(metadata) => metadata,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(vec![main_root.to_path_buf()]);
+        }
+        Err(source) => {
+            return Err(StorageError::Io {
+                path: storage_root.to_path_buf(),
+                source,
+            });
+        }
+    };
+    if storage_metadata.file_type().is_symlink() || !storage_metadata.is_dir() {
+        return Err(StorageError::Unavailable {
+            reason: "worktree storage root is not a real directory".into(),
+        });
+    }
+    check_preparation_sweep_deadline(deadline)?;
+    let entries = std::fs::read_dir(storage_root).map_err(|source| StorageError::Io {
+        path: storage_root.to_path_buf(),
+        source,
+    })?;
+    let mut roots = BTreeSet::from([main_root.to_path_buf()]);
+    let mut examined = 0_usize;
+    for entry in entries {
+        check_preparation_sweep_deadline(deadline)?;
+        let entry = entry.map_err(|source| StorageError::Io {
+            path: storage_root.to_path_buf(),
+            source,
+        })?;
+        examined += 1;
+        if examined > PREPARATION_SWEEP_MAX_DISCOVERY_PATHS {
+            return Err(StorageError::Unavailable {
+                reason: "worktree-root discovery exceeded its entry bound".into(),
+            });
+        }
+        let file_type = entry.file_type().map_err(|source| StorageError::Io {
+            path: entry.path(),
+            source,
+        })?;
+        check_preparation_sweep_deadline(deadline)?;
+        if file_type.is_symlink() {
+            return Err(StorageError::Unavailable {
+                reason: "worktree storage contains a symlinked root".into(),
+            });
+        }
+        if !file_type.is_dir() {
+            continue;
+        }
+        let root = entry.path();
+        roots.insert(root.clone());
+        let marker = read_worktree_marker_for_liveness(&root, deadline)?.ok_or_else(|| {
+            StorageError::Unavailable {
+                reason: "worktree root has no readable ownership marker".into(),
+            }
+        })?;
+        if marker.schema_version != WORKTREE_ROOT_SCHEMA_VERSION
+            || marker.repository_key.is_empty()
+            || !marker.repository_root.is_absolute()
+        {
+            return Err(StorageError::Unavailable {
+                reason: "worktree root ownership marker is invalid".into(),
+            });
+        }
+        roots.insert(marker.repository_root);
+
+        let children = std::fs::read_dir(&root).map_err(|source| StorageError::Io {
+            path: root.clone(),
+            source,
+        })?;
+        check_preparation_sweep_deadline(deadline)?;
+        for child in children {
+            check_preparation_sweep_deadline(deadline)?;
+            let child = child.map_err(|source| StorageError::Io {
+                path: root.clone(),
+                source,
+            })?;
+            examined += 1;
+            if examined > PREPARATION_SWEEP_MAX_DISCOVERY_PATHS {
+                return Err(StorageError::Unavailable {
+                    reason: "worktree-root discovery exceeded its entry bound".into(),
+                });
+            }
+            let child_type = child.file_type().map_err(|source| StorageError::Io {
+                path: child.path(),
+                source,
+            })?;
+            check_preparation_sweep_deadline(deadline)?;
+            if child_type.is_symlink() {
+                return Err(StorageError::Unavailable {
+                    reason: "worktree root contains a symlinked checkout".into(),
+                });
+            }
+            if child_type.is_dir() {
+                roots.insert(child.path());
+            }
+        }
+    }
+    check_preparation_sweep_deadline(deadline)?;
+    Ok(roots.into_iter().collect())
+}
+
+fn current_preparation_keys(
+    roots: &[PathBuf],
+    deadline: std::time::Instant,
+) -> Result<BTreeSet<String>, StorageError> {
+    let mut keys = BTreeSet::new();
+    for root in roots {
+        check_preparation_sweep_deadline(deadline)?;
+        let key = crate::preparation::current_cache_key_before(root, Some(deadline)).map_err(
+            |error| StorageError::Unavailable {
+                reason: format!("checkout preparation liveness is unknown: {error}"),
+            },
+        )?;
+        if let Some(key) = key {
+            keys.insert(key);
+        }
+    }
+    Ok(keys)
+}
+
+fn read_worktree_marker_for_liveness(
+    root: &Path,
+    deadline: std::time::Instant,
+) -> Result<Option<WorktreeRootMarker>, StorageError> {
+    check_preparation_sweep_deadline(deadline)?;
+    let path = root.join(WORKTREE_ROOT_MARKER);
+    let Some(bytes) = crate::preparation::read_bounded_regular_file_for_liveness(
+        &path,
+        PREPARATION_SWEEP_MAX_MARKER_BYTES,
+        deadline,
+    )
+    .map_err(|error| StorageError::Unavailable {
+        reason: format!("worktree ownership marker could not be verified: {error}"),
+    })?
+    else {
+        return Ok(None);
+    };
+    let marker = serde_json::from_slice(&bytes).map_err(|error| StorageError::Unavailable {
+        reason: format!("worktree ownership marker is unreadable: {error}"),
+    })?;
+    check_preparation_sweep_deadline(deadline)?;
+    Ok(Some(marker))
 }
 
 fn preparation_live_roots(
@@ -2962,6 +3256,209 @@ mod tests {
         assert!(candidates.is_empty());
         assert!(apply_preparation_candidate(&candidate, &[repo]).is_err());
         assert!(path.is_dir());
+    }
+
+    #[test]
+    fn inline_preparation_sweep_stops_when_its_deadline_is_expired() {
+        let tmp = tempfile::tempdir().unwrap();
+        let main_root = tmp.path().join("main");
+        let storage_root = tmp.path().join("worktrees");
+        let cache_root = tmp.path().join("preparation-cache");
+        std::fs::create_dir_all(&main_root).unwrap();
+        std::fs::create_dir_all(&storage_root).unwrap();
+        let entry = cache_root.join("repository/aaaaaaaaaaaa");
+        std::fs::create_dir_all(&entry).unwrap();
+        std::fs::write(entry.join("cache.bin"), b"keep until verified").unwrap();
+
+        let (removed, bytes) = sweep_preparation_cache_at(
+            &main_root,
+            &storage_root,
+            &cache_root,
+            std::time::Instant::now() - Duration::from_millis(1),
+        );
+
+        assert_eq!((removed, bytes), (0, 0));
+        assert!(entry.join("cache.bin").exists());
+    }
+
+    #[test]
+    fn an_unknown_worktree_root_protects_every_inline_cache_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let main_root = tmp.path().join("main");
+        let storage_root = tmp.path().join("worktrees");
+        let cache_root = tmp.path().join("preparation-cache");
+        std::fs::create_dir_all(&main_root).unwrap();
+        let unmarked_root = storage_root.join("unattributed");
+        std::fs::create_dir_all(&unmarked_root).unwrap();
+        let entry = cache_root.join("repository/bbbbbbbbbbbb");
+        std::fs::create_dir_all(&entry).unwrap();
+        std::fs::write(entry.join("cache.bin"), b"retain on unknown liveness").unwrap();
+
+        let (removed, bytes) = sweep_preparation_cache_at(
+            &main_root,
+            &storage_root,
+            &cache_root,
+            std::time::Instant::now() + Duration::from_secs(5),
+        );
+
+        assert_eq!((removed, bytes), (0, 0));
+        assert!(entry.join("cache.bin").exists());
+        assert!(unmarked_root.is_dir());
+    }
+
+    #[test]
+    fn inline_preparation_sweep_removes_a_dead_entry_with_complete_liveness() {
+        let tmp = tempfile::tempdir().unwrap();
+        let main_root = tmp.path().join("main");
+        let storage_root = tmp.path().join("worktrees");
+        let cache_root = tmp.path().join("preparation-cache");
+        std::fs::create_dir_all(&main_root).unwrap();
+        let worktree_root = storage_root.join("repository");
+        std::fs::create_dir_all(&worktree_root).unwrap();
+        let marker = WorktreeRootMarker {
+            schema_version: WORKTREE_ROOT_SCHEMA_VERSION,
+            repository_key: "repository".into(),
+            repository_root: main_root.clone(),
+        };
+        std::fs::write(
+            worktree_root.join(WORKTREE_ROOT_MARKER),
+            serde_json::to_vec(&marker).unwrap(),
+        )
+        .unwrap();
+        let entry = cache_root.join("repository/cccccccccccc");
+        std::fs::create_dir_all(&entry).unwrap();
+        std::fs::write(entry.join("cache.bin"), b"dead").unwrap();
+
+        let (removed, bytes) = sweep_preparation_cache_at(
+            &main_root,
+            &storage_root,
+            &cache_root,
+            std::time::Instant::now() + Duration::from_secs(5),
+        );
+
+        assert_eq!(removed, 1);
+        assert_eq!(bytes, 4);
+        assert!(!entry.exists());
+    }
+
+    #[test]
+    fn inline_preparation_sweep_keeps_a_sibling_session_key_and_removes_a_dead_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let main_root = tmp.path().join("main");
+        let sibling_repository = tmp.path().join("sibling-repository");
+        let storage_root = tmp.path().join("worktrees");
+        let cache_root = tmp.path().join("preparation-cache");
+        std::fs::create_dir_all(&main_root).unwrap();
+        std::fs::create_dir_all(&sibling_repository).unwrap();
+
+        let worktree_root = storage_root.join("sibling");
+        let session_root = worktree_root.join("session-1");
+        std::fs::create_dir_all(&session_root).unwrap();
+        let marker = WorktreeRootMarker {
+            schema_version: WORKTREE_ROOT_SCHEMA_VERSION,
+            repository_key: "sibling".into(),
+            repository_root: sibling_repository,
+        };
+        std::fs::write(
+            worktree_root.join(WORKTREE_ROOT_MARKER),
+            serde_json::to_vec(&marker).unwrap(),
+        )
+        .unwrap();
+        std::fs::create_dir_all(session_root.join(".aethyme")).unwrap();
+        std::fs::write(session_root.join("lock.txt"), "sibling deps\n").unwrap();
+        std::fs::write(
+            session_root.join(".aethyme/prepare.toml"),
+            "schema_version = 1\n\n[[steps]]\nname = \"deps\"\ncommand = [\"sh\", \"-c\", \"true\"]\ninputs = [\"lock.txt\"]\noutputs = [\"out/\"]\ncache = \"repository_shared\"\nrequired_for_hooks = false\n",
+        )
+        .unwrap();
+        let live_key = crate::preparation::current_cache_key(&session_root)
+            .unwrap()
+            .expect("sibling session declares a shared preparation step");
+        let dead_key = "ffffffffffff";
+        assert_ne!(live_key, dead_key);
+
+        let live_entry = cache_root.join("sibling").join(&live_key);
+        let dead_entry = cache_root.join("sibling").join(dead_key);
+        std::fs::create_dir_all(&live_entry).unwrap();
+        std::fs::write(live_entry.join("cache.bin"), b"live").unwrap();
+        std::fs::create_dir_all(&dead_entry).unwrap();
+        std::fs::write(dead_entry.join("cache.bin"), b"dead").unwrap();
+
+        let (removed, bytes) = sweep_preparation_cache_at(
+            &main_root,
+            &storage_root,
+            &cache_root,
+            std::time::Instant::now() + Duration::from_secs(5),
+        );
+
+        assert_eq!((removed, bytes), (1, 4));
+        assert!(
+            live_entry.is_dir(),
+            "the sibling session's live key survives"
+        );
+        assert!(!dead_entry.exists(), "the unnamed cache key is removed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inline_preparation_sweep_retains_entries_when_config_is_a_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let main_root = tmp.path().join("main");
+        let storage_root = tmp.path().join("worktrees");
+        let cache_root = tmp.path().join("preparation-cache");
+        std::fs::create_dir_all(main_root.join(".aethyme")).unwrap();
+        std::fs::create_dir_all(&storage_root).unwrap();
+        let external_config = tmp.path().join("prepare.toml");
+        std::fs::write(&external_config, "schema_version = 1\n").unwrap();
+        std::os::unix::fs::symlink(&external_config, main_root.join(".aethyme/prepare.toml"))
+            .unwrap();
+        let entry = cache_root.join("repository/dddddddddddd");
+        std::fs::create_dir_all(&entry).unwrap();
+        std::fs::write(entry.join("cache.bin"), b"retain").unwrap();
+
+        let (removed, bytes) = sweep_preparation_cache_at(
+            &main_root,
+            &storage_root,
+            &cache_root,
+            std::time::Instant::now() + Duration::from_secs(5),
+        );
+
+        assert_eq!((removed, bytes), (0, 0));
+        assert!(
+            entry.is_dir(),
+            "unknown config provenance retains cache entries"
+        );
+    }
+
+    #[test]
+    fn inline_preparation_sweep_retains_entries_when_config_is_oversized() {
+        let tmp = tempfile::tempdir().unwrap();
+        let main_root = tmp.path().join("main");
+        let storage_root = tmp.path().join("worktrees");
+        let cache_root = tmp.path().join("preparation-cache");
+        std::fs::create_dir_all(main_root.join(".aethyme")).unwrap();
+        std::fs::create_dir_all(&storage_root).unwrap();
+        std::fs::write(
+            main_root.join(".aethyme/prepare.toml"),
+            vec![b'x'; 2 * 1024 * 1024],
+        )
+        .unwrap();
+        let entry = cache_root.join("repository/eeeeeeeeeeee");
+        std::fs::create_dir_all(&entry).unwrap();
+        std::fs::write(entry.join("cache.bin"), b"retain").unwrap();
+
+        let (removed, bytes) = sweep_preparation_cache_at(
+            &main_root,
+            &storage_root,
+            &cache_root,
+            std::time::Instant::now() + Duration::from_secs(5),
+        );
+
+        assert_eq!((removed, bytes), (0, 0));
+        assert!(
+            entry.is_dir(),
+            "unbounded config data retains cache entries"
+        );
     }
 
     #[test]

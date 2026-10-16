@@ -593,10 +593,12 @@ blocked.
    in integration and re-runs gates only for replayed trees that changed.
    Review that reconciliation report. If it refuses or cannot apply safely,
    use `aethyme broker advanced integration reconcile --upstream <published-sha> --dry-run`
-   and follow its reviewed apply plan. `broker main reconcile plan/apply` remains
-   the separate operation for advancing the local default checkout from
-   integration; independent publication does not mark the other queue entries
-   shipped or change their promotion order.
+   and follow its reviewed apply plan. Advancing the local default checkout
+   from integration is a separate reviewed operation: run
+   `aethyme broker advanced main reconcile plan`, then apply its reviewed
+   digest with `aethyme broker advanced main reconcile apply --session <id> --confirm <sha256>`.
+   Independent publication does not mark the other queue entries shipped or
+   change their promotion order.
 
    Prefer this reviewed broker ship workflow over a raw push. Never infer
    publication authority from permission to edit, submit, or promote.
@@ -1062,7 +1064,8 @@ mod tests {
             "ship plan --entry <promoted-entry-id> --only",
             "changed-path overlap",
             "broker advanced integration reconcile --upstream <published-sha> --dry-run",
-            "broker main reconcile plan/apply",
+            "aethyme broker advanced main reconcile plan",
+            "aethyme broker advanced main reconcile apply --session <id> --confirm <sha256>",
             "aethyme broker start --reuse --task",
             "aethyme graph materialize --repo .",
             "authority merely to silence a degraded response",
@@ -1208,10 +1211,12 @@ mod tests {
             "ship plan --entry <promoted-entry-id> --only",
             "changed-path overlap",
             "broker advanced integration reconcile --upstream <published-sha> --dry-run",
-            "broker main reconcile plan/apply",
+            "aethyme broker advanced main reconcile plan",
+            "aethyme broker advanced main reconcile apply --session <id> --confirm <sha256>",
         ] {
             assert!(reference.contains(needle), "missing {needle:?}");
         }
+        assert!(!reference.contains("broker main reconcile"));
     }
 
     #[test]
