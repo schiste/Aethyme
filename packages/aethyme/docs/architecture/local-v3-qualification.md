@@ -37,6 +37,7 @@ original limits.
 
 | Local surface | Implementations | Evidence and remaining qualification |
 |---|---|---|
+| Baseline reuse, cleanup, trust and analysis audit | #704 | [L0 audit and completion checklist](local-v3-l0/README.md), including the [D37 analysis inventory](local-v3-l0/d-analysis-inventory-d37.md); observations remain bound to the audited source |
 | Revision identities, records, briefs and analysis envelope | #704–#710/#786; #787/#788 in progress | Independent canonical vectors and baseline AQ0 fixtures; [scoped symbol qualification](local-v3-qualification/aq0-symbol-identity-2026-10-16/README.md) passed its bounded profile; explicit project/file binding and cross-language qualification remain open; records remain experimental |
 | Retained source, capture, roots and GC | #714–#719 | Capture/crash/cleanup schedules; bounded native workload and APFS retained-source pressure below; host/daemon and mid-journal exhaustion remain unqualified |
 | Bounded context and fresh analysis views | #718/#730/#731/#756/#781 | Scoped invalidation schedules, [reviewed lifecycle fixes](local-v3-qualification/analysis-view-lifecycle-2026-10-15/README.md), and [once-final FX08 campaign](local-v3-fx08-qualification.md): all 56 outcomes retained; reliable brief usefulness was not established |
