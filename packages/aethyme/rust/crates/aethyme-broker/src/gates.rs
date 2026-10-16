@@ -2032,6 +2032,153 @@ fn sha256_text(value: &str) -> String {
     format!("{:x}", Sha256::digest(value.as_bytes()))
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GateStorageProbe {
+    label: &'static str,
+    path: PathBuf,
+}
+
+fn gate_storage_probes(
+    main_root: &Path,
+    database_path: &Path,
+    checkout: &GitRepo,
+    gate: &Gate,
+) -> Vec<GateStorageProbe> {
+    let mut probes = vec![
+        GateStorageProbe {
+            label: "repository state and gate output",
+            path: main_root.join(".aethyme"),
+        },
+        GateStorageProbe {
+            label: "broker database",
+            path: database_path.parent().unwrap_or(main_root).to_path_buf(),
+        },
+        GateStorageProbe {
+            label: "gate checkout",
+            path: checkout.root().to_path_buf(),
+        },
+    ];
+    if let (Some(cache_key), Some(cache_root)) = (
+        gate.managed_cache.as_ref(),
+        crate::host_state::default_host_cache_dir(),
+    ) {
+        let repository = git_origin_fingerprint(checkout);
+        probes.push(GateStorageProbe {
+            label: "managed gate cache",
+            path: cache_root
+                .join("gates")
+                .join(repository)
+                .join(&cache_key.key),
+        });
+    }
+    if (!gate.resources.is_empty() || gate.managed_cache.is_some())
+        && let Ok(database) = crate::default_host_resource_db_path()
+    {
+        probes.push(GateStorageProbe {
+            label: "host resource database",
+            path: database.parent().unwrap_or(main_root).to_path_buf(),
+        });
+    }
+    probes
+}
+
+fn gate_storage_refusal(main_root: &Path, probes: &[GateStorageProbe]) -> Option<String> {
+    gate_storage_refusal_with(
+        probes,
+        crate::verification::removable_volume_unavailable_reason,
+        |path| {
+            use std::os::unix::fs::MetadataExt;
+            path.ancestors()
+                .find_map(|ancestor| std::fs::metadata(ancestor).ok())
+                .map(|metadata| metadata.dev())
+        },
+        |path| crate::disk_headroom::available_headroom_at_or_above_for(main_root, path),
+    )
+}
+
+fn gate_storage_refusal_with(
+    probes: &[GateStorageProbe],
+    mut unavailable: impl FnMut(&Path) -> Option<String>,
+    mut device_for: impl FnMut(&Path) -> Option<u64>,
+    mut headroom_for: impl FnMut(&Path) -> Option<crate::disk_headroom::DiskHeadroom>,
+) -> Option<String> {
+    let mut known_devices = std::collections::HashSet::new();
+    for probe in probes {
+        if let Some(reason) = unavailable(&probe.path) {
+            return Some(format!(
+                "{} storage at {} is unavailable: {reason}",
+                probe.label,
+                probe.path.display()
+            ));
+        }
+
+        let device = device_for(&probe.path);
+        if device.is_some_and(|device| !known_devices.insert(device)) {
+            continue;
+        }
+        let headroom = headroom_for(&probe.path);
+        if let Some(reason) = crate::disk_headroom::refusal_with_headroom(
+            headroom.map(|reading| reading.bytes),
+            headroom.and_then(|reading| reading.inodes),
+            crate::DEFAULT_GATE_HEADROOM_BYTES,
+            crate::disk_headroom::MIN_GATE_HEADROOM_INODES,
+        ) {
+            return Some(format!(
+                "{} storage at {} is below the gate reserve: {reason}",
+                probe.label,
+                probe.path.display()
+            ));
+        }
+    }
+    None
+}
+
+fn gate_storage_admission_refusal(
+    store: &BrokerStore,
+    main_root: &Path,
+    checkout: &GitRepo,
+    gate: &Gate,
+) -> Option<String> {
+    if (!gate.resources.is_empty() || gate.managed_cache.is_some())
+        && let Err(error) = crate::default_host_resource_db_path()
+    {
+        return Some(format!(
+            "host resource database storage is unavailable: {error}"
+        ));
+    }
+    let probes = gate_storage_probes(main_root, store.db_path(), checkout, gate);
+    gate_storage_refusal(main_root, &probes)
+}
+
+fn broker_database_storage_refusal(store: &BrokerStore, main_root: &Path) -> Option<String> {
+    let path = store.db_path().parent().unwrap_or(main_root).to_path_buf();
+    if let Some(reason) = crate::verification::removable_volume_unavailable_reason(&path) {
+        return Some(format!(
+            "broker database storage at {} is unavailable: {reason}",
+            path.display()
+        ));
+    }
+    let Some(headroom) = crate::disk_headroom::available_headroom_at_or_above_for(main_root, &path)
+    else {
+        return Some(format!(
+            "broker database storage headroom could not be measured at {}",
+            path.display()
+        ));
+    };
+    crate::disk_headroom::refusal_with_headroom(
+        Some(headroom.bytes),
+        headroom.inodes,
+        crate::DEFAULT_GATE_HEADROOM_BYTES,
+        crate::disk_headroom::MIN_GATE_HEADROOM_INODES,
+    )
+    .map(|reason| {
+        format!(
+            "broker database storage at {} is below the gate reserve: {reason}",
+            path.display()
+        )
+    })
+}
+
 /// Shared executor for a pre-computed selection: cheap-first order (the
 /// selection preserves `load_gates` sorting), tree-hash caching, one
 /// process group per gate, fail-fast.
@@ -2044,19 +2191,50 @@ fn run_selections(
     cache_policy: CachePolicy,
     runtime: GateRuntimeContext<'_>,
 ) -> Result<Vec<GateRunOutcome>, crate::broker::BrokerOpError> {
+    run_selections_with_admission(
+        store,
+        main_root,
+        checkout,
+        selections,
+        session_id,
+        cache_policy,
+        runtime,
+        broker_database_storage_refusal,
+        gate_storage_admission_refusal,
+    )
+}
+
+/// Keeps both storage admission probes injectable for ordering regressions.
+#[allow(clippy::too_many_arguments)]
+fn run_selections_with_admission<CachedEventAdmission, GateAdmission>(
+    store: &mut BrokerStore,
+    main_root: &Path,
+    checkout: &GitRepo,
+    selections: Vec<Selection<'_>>,
+    session_id: Option<i64>,
+    cache_policy: CachePolicy,
+    runtime: GateRuntimeContext<'_>,
+    mut database_write_admission: CachedEventAdmission,
+    mut gate_admission: GateAdmission,
+) -> Result<Vec<GateRunOutcome>, crate::broker::BrokerOpError>
+where
+    CachedEventAdmission: FnMut(&BrokerStore, &Path) -> Option<String>,
+    GateAdmission: FnMut(&BrokerStore, &Path, &GitRepo, &Gate) -> Option<String>,
+{
     let progress = runtime.progress;
     let admission_host = runtime.admission_host;
     let tree = checkout.working_tree_hash()?;
     if let Some(session_id) = session_id {
+        // This stop/recovery pass precedes admission for a new gate so
+        // obsolete process groups are stopped promptly. It records one
+        // cancellation row per stale pidfile; these writes reconcile existing
+        // runs, not a new dispatch. If a row write fails, the error leaves that
+        // pidfile for a later recovery pass.
         cancel_obsolete_runs(store, main_root, session_id, &tree)?;
     }
 
-    // A directory that cannot be created fails loudly where the first file
-    // inside it is opened (owner locks, pidfile, log), so nothing is lost here.
     let log_dir = main_root.join(".aethyme/logs/gates");
-    let _ = std::fs::create_dir_all(&log_dir);
     let run_dir = running_dir(main_root);
-    let _ = std::fs::create_dir_all(&run_dir);
 
     let mut outcomes = Vec::new();
     let mut expensive_advisories_surfaced = false;
@@ -2075,18 +2253,6 @@ fn run_selections(
             selection.gate
         };
         let worker_id = gate_worker_id(session_id, &gate.name);
-        if cache_policy == CachePolicy::Bypass {
-            crate::warn_unrecorded(
-                "record the gate cache bypass event",
-                store.append_event(
-                    crate::events::GATE_CACHE_BYPASSED,
-                    session_id,
-                    Some(&crate::events::gate_cache_bypassed_payload(
-                        &gate.name, &tree,
-                    )),
-                ),
-            );
-        }
         // Cache: conclusive result for this exact tree, any session. The
         // hit is recorded as an event so saved execution time is
         // measurable (kill-criterion accounting). Gates that inspect
@@ -2105,20 +2271,27 @@ fn run_selections(
                 short_tree_hash(&tree),
                 saved_ms
             ));
-            crate::warn_unrecorded(
-                "record the gate cache hit event",
-                store.append_event(
-                    crate::events::GATE_CACHED,
-                    session_id,
-                    Some(&crate::events::gate_cached_payload(
-                        &gate.name,
-                        &tree,
-                        saved_ms,
-                        hit.status,
-                        cached_failure_class(hit.status),
-                    )),
-                ),
-            );
+            if let Some(diagnostic) = database_write_admission(store, main_root) {
+                progress.report(&format!(
+                    "Warning: gate {} cache hit event unrecorded because {diagnostic}",
+                    gate.name
+                ));
+            } else {
+                crate::warn_unrecorded(
+                    "record the gate cache hit event",
+                    store.append_event(
+                        crate::events::GATE_CACHED,
+                        session_id,
+                        Some(&crate::events::gate_cached_payload(
+                            &gate.name,
+                            &tree,
+                            saved_ms,
+                            hit.status,
+                            cached_failure_class(hit.status),
+                        )),
+                    ),
+                );
+            }
             let failed = hit.status == GateStatus::Fail;
             outcomes.push(GateRunOutcome {
                 gate: gate.name.clone(),
@@ -2146,6 +2319,46 @@ fn run_selections(
             }
             continue;
         }
+
+        // Check every volume this run will write before making run/log
+        // directories or preparing a managed cache. A cache hit above has no
+        // such writes and remains usable even when a build volume is low.
+        if let Some(diagnostic) = gate_admission(store, main_root, checkout, gate) {
+            // Persist at most one bounded diagnostic row, and only when a
+            // separate probe confirms the broker database itself can accept it.
+            // The full preflight may have stopped at an earlier low-volume probe.
+            let database_refusal = database_write_admission(store, main_root);
+            outcomes.push(gate_storage_resource_failure(
+                store,
+                gate,
+                &tree,
+                session_id,
+                &diagnostic,
+                database_refusal.as_deref(),
+                progress,
+            )?);
+            break;
+        }
+
+        // Cache: bypass is an execution choice, so record it only after the
+        // storage admission check establishes that the gate can proceed.
+        if cache_policy == CachePolicy::Bypass {
+            crate::warn_unrecorded(
+                "record the gate cache bypass event",
+                store.append_event(
+                    crate::events::GATE_CACHE_BYPASSED,
+                    session_id,
+                    Some(&crate::events::gate_cache_bypassed_payload(
+                        &gate.name, &tree,
+                    )),
+                ),
+            );
+        }
+        // The selected volumes have been checked. Directory creation is best
+        // effort as before; opening the owner lock, pidfile, or log reports an
+        // actionable I/O error if a path became unavailable in the meantime.
+        let _ = std::fs::create_dir_all(&log_dir);
+        let _ = std::fs::create_dir_all(&run_dir);
 
         if gate.cost > 1 && !expensive_advisories_surfaced {
             expensive_advisories_surfaced = true;
@@ -2608,6 +2821,61 @@ fn record_gate_preflight_resource_failure(
         first_output_ms: None,
         output_bytes: Some(0),
         log_path: Some(log_path.to_string_lossy().into_owned()),
+        environment: GateEnvironment::default(),
+        host_fault: true,
+    })
+}
+
+/// Return an in-memory storage refusal without creating a gate log or pidfile.
+/// Persist its bounded database row only when the independent DB probe passed;
+/// the result is a host fault, not a gate verdict.
+fn gate_storage_resource_failure(
+    store: &mut BrokerStore,
+    gate: &Gate,
+    tree: &str,
+    session_id: Option<i64>,
+    diagnostic: &str,
+    database_refusal: Option<&str>,
+    progress: &dyn GateProgressSink,
+) -> Result<GateRunOutcome, crate::broker::BrokerOpError> {
+    progress.report(&format!("gate {} could not start: {diagnostic}", gate.name));
+    if let Some(database_refusal) = database_refusal {
+        progress.report(&format!(
+            "Warning: gate {} storage refusal is unrecorded because {database_refusal}",
+            gate.name
+        ));
+    } else {
+        store.record_gate_result(&NewGateResult {
+            gate_name: gate.name.clone(),
+            tree_hash: tree.to_string(),
+            definition_hash: gate.definition_hash.clone(),
+            status: GateStatus::Error,
+            failure_class: Some(GateFailureClass::ResourceContention),
+            exit_code: None,
+            duration_ms: Some(0),
+            wait_duration_ms: Some(0),
+            first_output_ms: None,
+            output_bytes: None,
+            log_path: None,
+            session_id,
+        })?;
+    }
+    Ok(GateRunOutcome {
+        gate: gate.name.clone(),
+        tree_hash: tree.to_string(),
+        definition_hash: gate.definition_hash.clone(),
+        resource_lease: None,
+        managed_cache: None,
+        broker_database: None,
+        status: GateStatus::Error,
+        failure_class: Some(GateFailureClass::ResourceContention),
+        cached: false,
+        exit_code: None,
+        duration_ms: Some(0),
+        wait_duration_ms: Some(0),
+        first_output_ms: None,
+        output_bytes: None,
+        log_path: None,
         environment: GateEnvironment::default(),
         host_fault: true,
     })
@@ -3511,6 +3779,346 @@ fn preserve_failed_gate_log(log_path: &Path, status: GateStatus) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn managed_cache_shortfall_refuses_admission_on_its_own_volume() {
+        let probes = vec![
+            GateStorageProbe {
+                label: "repository state and gate output",
+                path: PathBuf::from("/repo/.aethyme"),
+            },
+            GateStorageProbe {
+                label: "gate checkout",
+                path: PathBuf::from("/t7/checkout"),
+            },
+            GateStorageProbe {
+                label: "managed gate cache",
+                path: PathBuf::from("/cache/gates/key"),
+            },
+        ];
+        let mut read = Vec::new();
+        let refusal = gate_storage_refusal_with(
+            &probes,
+            |_| None,
+            |path| {
+                if path.starts_with("/repo") {
+                    Some(1)
+                } else if path.starts_with("/t7") {
+                    Some(2)
+                } else {
+                    Some(3)
+                }
+            },
+            |path| {
+                read.push(path.to_path_buf());
+                Some(crate::disk_headroom::DiskHeadroom {
+                    bytes: if path.starts_with("/cache") {
+                        1024 * 1024 * 1024
+                    } else {
+                        10 * 1024 * 1024 * 1024
+                    },
+                    inodes: Some(200_000),
+                })
+            },
+        );
+
+        let refusal = refusal.expect("the managed cache is below the gate floor");
+        assert!(refusal.contains("managed gate cache storage at /cache/gates/key"));
+        assert_eq!(
+            read,
+            probes
+                .iter()
+                .map(|probe| probe.path.clone())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn storage_refusal_records_a_nonverdict_without_creating_gate_output() {
+        let root = tempfile::tempdir().unwrap();
+        let database = root.path().join("broker.db");
+        let mut store = BrokerStore::open(&database).unwrap();
+        let gate = Gate {
+            name: "cargo".into(),
+            command: "cargo test".into(),
+            cost: 1,
+            triggers: Vec::new(),
+            cache: false,
+            timeout_seconds: None,
+            resources: Vec::new(),
+            resource_ttl_seconds: 60,
+            resource_wait_seconds: 0,
+            max_load_per_cpu: None,
+            managed_cache: None,
+            definition_hash: "definition".into(),
+            matcher: None,
+        };
+        let progress = Lines::default();
+
+        let outcome = gate_storage_resource_failure(
+            &mut store,
+            &gate,
+            "tree",
+            None,
+            "managed cache is below the gate reserve",
+            None,
+            &progress,
+        )
+        .unwrap();
+
+        assert_eq!(outcome.status, GateStatus::Error);
+        assert_eq!(
+            outcome.failure_class,
+            Some(GateFailureClass::ResourceContention)
+        );
+        assert!(outcome.is_host_fault());
+        assert_eq!(outcome.output_bytes, None);
+        assert_eq!(outcome.log_path, None);
+        assert!(!root.path().join(".aethyme/logs/gates").exists());
+        assert!(progress.0.lock().unwrap()[0].contains("managed cache"));
+    }
+
+    #[test]
+    fn storage_refusal_is_not_persisted_when_broker_database_admission_fails() {
+        let root = tempfile::tempdir().unwrap();
+        let checkout_root = root.path().join("checkout");
+        init_repo(&checkout_root);
+        let checkout = GitRepo::discover(&checkout_root).unwrap();
+        let database = root.path().join("broker.db");
+        let mut store = BrokerStore::open(&database).unwrap();
+        let gate = synthetic_gate("cargo", false, "touch should-not-run");
+        let before_events = store.events_after(0, 100).unwrap();
+        let before_rows: i64 = rusqlite::Connection::open(&database)
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM gate_results WHERE gate_name = 'cargo'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let progress = Lines::default();
+        let admission_host = SequencedAdmissionHost::new(vec![None]);
+
+        let outcomes = run_selections_with_admission(
+            &mut store,
+            &checkout_root,
+            &checkout,
+            vec![Selection {
+                gate: &gate,
+                triggered_by: None,
+                owner_paths: Vec::new(),
+            }],
+            None,
+            CachePolicy::Use,
+            GateRuntimeContext {
+                progress: &progress,
+                admission_host: &admission_host,
+                deadline: None,
+            },
+            |_, _| Some("broker database is below the gate reserve".to_string()),
+            |_, _, _, _| Some("gate checkout is below the gate reserve".to_string()),
+        )
+        .unwrap();
+
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].status, GateStatus::Error);
+        assert_eq!(
+            outcomes[0].failure_class,
+            Some(GateFailureClass::ResourceContention)
+        );
+        let after_rows: i64 = rusqlite::Connection::open(&database)
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM gate_results WHERE gate_name = 'cargo'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(after_rows, before_rows);
+        assert_eq!(
+            store.events_after(0, 100).unwrap().len(),
+            before_events.len()
+        );
+        assert!(progress.0.lock().unwrap().iter().any(|line| {
+            line.contains("storage refusal is unrecorded")
+                && line.contains("broker database is below the gate reserve")
+        }));
+        assert!(!checkout_root.join(".aethyme/logs/gates").exists());
+        assert!(!checkout_root.join("should-not-run").exists());
+    }
+
+    #[test]
+    fn cached_verdict_survives_a_refused_telemetry_write() {
+        let root = tempfile::tempdir().unwrap();
+        let checkout_root = root.path().join("checkout");
+        init_repo(&checkout_root);
+        let checkout = GitRepo::discover(&checkout_root).unwrap();
+        let database = root.path().join("broker.db");
+        let mut store = BrokerStore::open(&database).unwrap();
+        let gate = synthetic_gate("cached", true, "false");
+        let tree = checkout.working_tree_hash().unwrap();
+        store
+            .record_gate_result(&NewGateResult {
+                gate_name: gate.name.clone(),
+                tree_hash: tree,
+                definition_hash: gate.definition_hash.clone(),
+                status: GateStatus::Pass,
+                failure_class: None,
+                exit_code: Some(0),
+                duration_ms: Some(1),
+                wait_duration_ms: Some(0),
+                first_output_ms: None,
+                output_bytes: Some(0),
+                log_path: None,
+                session_id: None,
+            })
+            .unwrap();
+        let before = store.events_after(0, 100).unwrap();
+        let progress = Lines::default();
+        let admission_host = SequencedAdmissionHost::new(vec![None]);
+
+        let outcomes = run_selections_with_admission(
+            &mut store,
+            &checkout_root,
+            &checkout,
+            vec![Selection {
+                gate: &gate,
+                triggered_by: None,
+                owner_paths: Vec::new(),
+            }],
+            None,
+            CachePolicy::Use,
+            GateRuntimeContext {
+                progress: &progress,
+                admission_host: &admission_host,
+                deadline: None,
+            },
+            |_, _| Some("broker database is below the gate reserve".to_string()),
+            |_, _, _, _| panic!("a cache hit cannot dispatch a gate"),
+        )
+        .unwrap();
+
+        assert_eq!(outcomes.len(), 1);
+        assert!(outcomes[0].cached);
+        assert_eq!(outcomes[0].status, GateStatus::Pass);
+        assert_eq!(store.events_after(0, 100).unwrap().len(), before.len());
+        assert!(progress.0.lock().unwrap().iter().any(|line| {
+            line.contains("cache hit event unrecorded") && line.contains("below the gate reserve")
+        }));
+        assert!(!checkout_root.join(".aethyme/logs/gates").exists());
+    }
+
+    #[test]
+    fn low_storage_admission_still_cancels_an_obsolete_gate_run() {
+        let root = tempfile::tempdir().unwrap();
+        let checkout_root = root.path().join("checkout");
+        init_repo(&checkout_root);
+        let checkout = GitRepo::discover(&checkout_root).unwrap();
+        let database = root.path().join("broker.db");
+        let mut store = BrokerStore::open(&database).unwrap();
+        let session = store
+            .register_session(&crate::types::NewSession {
+                worktree_path: checkout_root.display().to_string(),
+                branch: "agent/test-low-storage-cancellation".to_string(),
+                origin: crate::types::SessionOrigin::Adopted,
+                task: None,
+                diff_base: None,
+                adoption_base: None,
+                adopted_head: None,
+                repository_contract: None,
+                pid: None,
+                command: None,
+                log_path: None,
+                agent_identity: None,
+            })
+            .unwrap();
+        let session_id = session.id;
+        let gate = synthetic_gate("slow", false, "touch should-not-run");
+        let pidfile = running_dir(&checkout_root).join(format!("{session_id}-slow.pid"));
+        std::fs::create_dir_all(pidfile.parent().unwrap()).unwrap();
+        std::fs::write(
+            &pidfile,
+            GatePidRecord {
+                pgid: 1,
+                tree: "obsolete-tree".to_string(),
+                pid: Some(1),
+                start: None,
+                run: None,
+            }
+            .render(),
+        )
+        .unwrap();
+        let progress = Lines::default();
+        let admission_host = SequencedAdmissionHost::new(vec![None]);
+        let pidfile_at_admission = pidfile.clone();
+
+        let outcomes = run_selections_with_admission(
+            &mut store,
+            &checkout_root,
+            &checkout,
+            vec![Selection {
+                gate: &gate,
+                triggered_by: None,
+                owner_paths: Vec::new(),
+            }],
+            Some(session_id),
+            CachePolicy::Use,
+            GateRuntimeContext {
+                progress: &progress,
+                admission_host: &admission_host,
+                deadline: None,
+            },
+            |_, _| None,
+            move |_, _, _, _| {
+                assert!(
+                    !pidfile_at_admission.exists(),
+                    "obsolete gate cancellation must precede dispatch admission"
+                );
+                Some("checkout is below the gate reserve".to_string())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].status, GateStatus::Error);
+        assert_eq!(
+            outcomes[0].failure_class,
+            Some(GateFailureClass::ResourceContention)
+        );
+        assert!(!pidfile.exists());
+        assert!(!checkout_root.join(".aethyme/logs/gates").exists());
+        assert!(!checkout_root.join("should-not-run").exists());
+        let cancelled: i64 = rusqlite::Connection::open(&database)
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM gate_results
+                 WHERE gate_name = 'slow' AND tree_hash = 'obsolete-tree'
+                   AND session_id = ?1
+                   AND status = 'cancelled'",
+                [session_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(cancelled, 1);
+    }
+
+    fn synthetic_gate(name: &str, cache: bool, command: &str) -> Gate {
+        Gate {
+            name: name.to_string(),
+            command: command.to_string(),
+            cost: 1,
+            triggers: Vec::new(),
+            cache,
+            timeout_seconds: None,
+            resources: Vec::new(),
+            resource_ttl_seconds: 60,
+            resource_wait_seconds: 0,
+            max_load_per_cpu: None,
+            managed_cache: None,
+            definition_hash: format!("{name}-definition"),
+            matcher: None,
+        }
+    }
 
     #[test]
     fn bounded_command_refuses_expired_dispatch_and_late_success() {

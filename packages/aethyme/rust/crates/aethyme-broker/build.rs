@@ -19,6 +19,10 @@ fn git_output(args: &[&str]) -> Option<String> {
 }
 
 fn main() {
+    // Cargo shares build-script outputs across linked worktrees using one target.
+    // Their absolute Git watches can still name the previous checkout. This
+    // absent package-relative input makes Cargo recheck checkout provenance.
+    println!("cargo:rerun-if-changed=.aethyme-source-identity-always-recheck");
     let describe = git_output(&["describe", "--tags", "--always", "--dirty"]).unwrap_or_default();
     let commit = git_output(&["rev-parse", "HEAD"]).unwrap_or_default();
     println!("cargo:rustc-env=AETHYME_BROKER_GIT_DESCRIBE={describe}");
