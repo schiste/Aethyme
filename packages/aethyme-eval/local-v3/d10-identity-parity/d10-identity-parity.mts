@@ -1176,7 +1176,29 @@ function run(): void {
   );
   for (const [pathHex, identity] of mixed.proposed_preimages) {
     const expectedIdentity = objectAt(mixedPreimages[pathHex], `preimage ${pathHex}`);
-    checkCanonicalValue(identity, expectedIdentity, `proposed FileId preimage ${pathHex}`);
+    checkCanonicalValue(
+      identity,
+      {
+        file_id: expectedIdentity.file_id,
+        ordinal: expectedIdentity.ordinal,
+        preimage_hex: expectedIdentity.preimage_hex,
+      },
+      `proposed FileId computed preimage fields ${pathHex}`,
+    );
+    check(
+      expectedIdentity.raw_path_hex === pathHex &&
+        mixed.result_files.some((file) => file.path_hex === pathHex),
+      `proposed FileId golden raw path does not match the actual result path ${pathHex}`,
+    );
+    const expectedRelation = stringAt(
+      expectedIdentity.relation,
+      `proposed FileId relation ${pathHex}`,
+    );
+    const actualChange = mixed.changes.find((change) => change.after?.path_hex === pathHex);
+    check(
+      actualChange !== undefined && actualChange.relation === expectedRelation,
+      `proposed FileId golden relation differs from the actual transition ${pathHex}`,
+    );
   }
   const permutedSplit: FileOperation = {
     kind: "split",
