@@ -1560,9 +1560,17 @@ fn brief_attach(main_root: &Path, rest: &[&str]) -> Result<Output, Failure> {
         )
     })?;
     let mut store = open(main_root)?;
+    attach_selected_brief(&mut store, selector, &brief)
+}
+
+fn attach_selected_brief(
+    store: &mut CollaborationStore,
+    selector: context_revisions::BriefSelector,
+    brief: &Brief,
+) -> Result<Output, Failure> {
     let (contribution, operation, revision, id) = match selector {
         context_revisions::BriefSelector::Capture(contribution) => {
-            let id = attach_brief(&mut store, &contribution, &brief)
+            let id = attach_brief(store, &contribution, brief)
                 .map_err(|error| Failure::domain(error.code(), error.to_string()))?;
             (contribution, None, None, id)
         }
@@ -1571,7 +1579,7 @@ fn brief_attach(main_root: &Path, rest: &[&str]) -> Result<Output, Failure> {
                 ContributionRevisionRequest, resolve_approved_project_binding,
                 revise_contribution_for_operation,
             };
-            let binding = resolve_approved_project_binding(&store)
+            let binding = resolve_approved_project_binding(store)
                 .map_err(|error| Failure::domain("revision_identity", error.to_string()))?
                 .ok_or_else(|| {
                     Failure::refused(
@@ -1581,12 +1589,12 @@ fn brief_attach(main_root: &Path, rest: &[&str]) -> Result<Output, Failure> {
                     )
                 })?;
             let resolved = revise_contribution_for_operation(
-                &mut store,
+                store,
                 &binding,
                 ContributionRevisionRequest {
                     operation_id: &operation,
                     file_operations: None,
-                    brief: Some(&brief),
+                    brief: Some(brief),
                     depends_on: None,
                 },
             )

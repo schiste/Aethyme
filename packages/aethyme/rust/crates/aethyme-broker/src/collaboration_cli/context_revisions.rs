@@ -182,6 +182,58 @@ mod tests {
     }
 
     #[test]
+    fn operation_brief_handler_selects_one_of_two_identical_capture_lineages() {
+        use crate::collaboration_cli::project_test_support::BoundProjectFixture;
+        let mut fixture = BoundProjectFixture::new().unwrap();
+        let base = fixture.bootstrap_commit.clone();
+        let result = fixture
+            .commit_file("a.txt", b"identical capture bytes\n")
+            .unwrap();
+        let first = fixture
+            .capture_operation("brief-first", &base, &result)
+            .unwrap();
+        let second = fixture
+            .capture_operation("brief-second", &base, &result)
+            .unwrap();
+        let original = Brief {
+            intent: "First immutable rationale".into(),
+            ..Brief::default()
+        };
+        let revised = Brief {
+            intent: "Second operation rationale".into(),
+            ..Brief::default()
+        };
+        let first_selector = BriefSelector::Operation(first.operation_id.clone());
+        let (first_result, _) =
+            attach_selected_brief(&mut fixture.store, first_selector, &original).unwrap();
+        let second_selector = BriefSelector::Operation(second.operation_id.clone());
+        let (second_result, _) =
+            attach_selected_brief(&mut fixture.store, second_selector, &revised).unwrap();
+        assert_eq!(first_result["contribution"], second_result["contribution"]);
+        assert_ne!(
+            first_result["contribution_revision"],
+            second_result["contribution_revision"]
+        );
+        assert_eq!(first_result["operation"], first.operation_id.as_str());
+        assert_eq!(second_result["operation"], second.operation_id.as_str());
+        let capture = RecordId::parse(first_result["contribution"].as_str().unwrap()).unwrap();
+        let ambiguous = attach_selected_brief(
+            &mut fixture.store,
+            BriefSelector::Capture(capture),
+            &revised,
+        )
+        .unwrap_err();
+        assert!(ambiguous.message.contains("--operation"));
+        let (retried, _) = attach_selected_brief(
+            &mut fixture.store,
+            BriefSelector::Operation(first.operation_id),
+            &original,
+        )
+        .unwrap();
+        assert_eq!(retried, first_result);
+    }
+
+    #[test]
     fn exact_pin_parser_requires_all_three_canonical_identities() {
         let parsed = parse_pin(&valid()).unwrap();
         assert_eq!(
