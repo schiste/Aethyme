@@ -1,0 +1,100 @@
+{
+  "package": "independent Local D10 canonical-record oracle v2",
+  "status": "frozen independent expected data; the prior v1 package remains unchanged and receives no valid-vector credit",
+  "source": {
+    "repository": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/complete-local-l1-project-binding-file-l",
+    "commit": "fcd5ed940b4d906452e4ad1d3aa90eb767f1af45",
+    "tree": "1acff82e4dc3f375aed028a0bbf13fa693f4fe64",
+    "archive_root": "/private/tmp/review-d10-v2.4dXN6j/commit-archive",
+    "archive_scope": "full commit tree archived with git archive; archive files and directories are read-only. Source file paths are relative to the packages/aethyme subdirectory",
+    "source_attribution": {
+      "test_inputs": {
+        "path": "rust/crates/aethyme-contracts/tests/contribution_revision.rs",
+        "lines": "8-57 (baseline and brief-only revisions); 60-112 (minimal new-file test)",
+        "sha256": "967936df4b3b18c5658a599eaad81a9c0b24989909c72b197a503436f539edc5"
+      },
+      "contribution_id_and_record": {
+        "path": "rust/crates/aethyme-contracts/src/experimental_v0/contribution_revision.rs",
+        "lines": "31-55 (ContributionId length/alphabet/tail); 108-159 (revision fields and constructor); 198-230 (record serialization); 301-379 (source change shape/order); 475-480 (base32 alphabet)",
+        "sha256": "bba6e7ae8747856905359a9fe7da63d510734c73726adc7019596319e8cd0538"
+      },
+      "source_snapshot_encoding": {
+        "path": "rust/crates/aethyme-contracts/src/experimental_v0/source_snapshot.rs",
+        "lines": "23-60 (byte contract); 69-75 (domain); 164-209 (raw-path sort and manifest bytes); 282-313 (path restrictions)",
+        "sha256": "d36bcd57d0f2ccc47aff1a4c69d5ee974d09a22879cfc0ce938687761737ed14"
+      },
+      "proposed_file_identity": {
+        "path": "rust/crates/aethyme-contracts/src/experimental_v0/project_identity.rs",
+        "lines": "106-131 (proposed FileId preimage); 615-623 (transition inputs); 791-813 (sorted new-path ordinals and IDs); 872-908 (new-file change); 1096-1107 (proposal ID validation)",
+        "sha256": "a38be70e5e394003a3ea209521160f3c0ad5e5c12d8bd19f29629c1f80785901"
+      },
+      "canonical_json": {
+        "path": "rust/crates/aethyme-contracts/src/experimental_v0/canonical_json.rs",
+        "lines": "28-39 (canonical profile); 106-111 (UTF-16 key order); 113-175 (canonical serialization)",
+        "sha256": "90070c56f613bb94564072c56076daf2428f2888f0b71e34a526b718c55b52f3"
+      },
+      "record_identity": {
+        "path": "rust/crates/aethyme-contracts/src/experimental_v0/record.rs",
+        "lines": "52-59 (record identity rule); 75-76 (record domain)",
+        "sha256": "d4888555e1653ea8897f383dfb6f6f9c50e5e2abd19ee113eb440ee575ad4400"
+      },
+      "identity_design_note": {
+        "path": "docs/architecture/local-v3-l1-identity.md",
+        "lines": "84-95 (ContributionId and immutable revision intent)",
+        "sha256": "ce7aba09fbaf9e01c009570e81d557fffcabbc06871ce027d62ce70956138600"
+      }
+    }
+  },
+  "files": {
+    "inputs.json": "b269c64f26ef1dd04603f0e062c5ccac98989c1875dff1546baa2f5f88465cd7",
+    "oracle.py": "3a95aa4a5b20f12fe13474d93e6c534685166de94dda5f1bea7c486c43e9c18e",
+    "expected.json": "62fbfa515b01804ac409fd591368b30b62b364d269ab1422015e9121a3093048"
+  },
+  "input_id_checks_before_hashing": {
+    "project_id": {
+      "suffix_length": 26,
+      "alphabet": "lowercase base32 a-z, 2-7",
+      "tail_symbol": "a",
+      "tail_value": 0,
+      "tail_low_two_bits": 0
+    },
+    "contribution_id": {
+      "suffix_length": 26,
+      "alphabet": "lowercase base32 a-z, 2-7",
+      "tail_symbol": "e",
+      "tail_value": 4,
+      "tail_low_two_bits": 0
+    },
+    "old_invalid_contribution_id": {
+      "suffix_length": 25,
+      "alphabet_valid": true,
+      "tail_symbol": "e",
+      "rejected_as": "suffix length 25; expected 26"
+    }
+  },
+  "prior_failed_package": {
+    "directory": "/private/tmp/review-d10-independent.rP4ZAU",
+    "manifest_sha256": "dcd046d68020c580fe3f5fa1598696ef864746240d7fc99e982d5e774fabc68f",
+    "four_files_preserved_byte_exact": true,
+    "file_sha256": {
+      "manifest.json": "dcd046d68020c580fe3f5fa1598696ef864746240d7fc99e982d5e774fabc68f",
+      "inputs.json": "be5e1daa719a1ae076c58e1728f330900af06aeb63cbb3253fa1c97c4aacb2dd",
+      "oracle.py": "bd6685735a17a72014a05e1319b16d62983fef5381f8b2d8d4795ba39f032c95",
+      "expected.json": "08b1d82960efa01461b4d1cdbf19d9da36a8a89bf2ed46e5918501ae3af78998"
+    }
+  },
+  "method": {
+    "runtime": "Python standard library only",
+    "production_rust_or_node_executed": false,
+    "cargo_or_native_trials": false,
+    "network_access": false,
+    "proposal_seed_for_bound_profile": "ContributionId.as_str(); no extra nonce or product schema field",
+    "canonical_json_key_order_for_fixtures": "All record keys are ASCII, so Python code-point ordering equals the source contract's UTF-16 ordering"
+  },
+  "key_expected_ids": {
+    "baseline_revision": "sha256:e23492596ea39c57706af0cc208872cce4795749ef5c71a0c9b34c2f8635e7d4",
+    "rationale_only_revision": "sha256:7afdf9507b5a6779e402990f2a9a15386095e4ef8203825429f3611ead52dad3",
+    "generic_minimal_file_id": "file:e090ec5898620365644e2eb739d3298c9b0f992f0cf1d9c5de30cabd11aad259",
+    "bound_profile_file_id": "file:48cc972d1617f9537958fd4cdda113c3af1efe0d331cf7f7f626f9ccbb77f6d5"
+  }
+}

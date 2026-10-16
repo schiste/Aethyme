@@ -1,0 +1,15 @@
+file:///Volumes/T7-repositories/Application%20Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/add-finite-d10-typescript-parity-for-pro/packages/aethyme-eval/local-v3/d10-identity-parity/d10-identity-parity.mts:203
+  throw new Error("fixture contains a value outside the frozen canonical profile");
+        ^
+
+Error: fixture contains a value outside the frozen canonical profile
+    at toCanonical (file:///Volumes/T7-repositories/Application%20Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/add-finite-d10-typescript-parity-for-pro/packages/aethyme-eval/local-v3/d10-identity-parity/d10-identity-parity.mts:203:9)
+    at canonicalBytes (file:///Volumes/T7-repositories/Application%20Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/add-finite-d10-typescript-parity-for-pro/packages/aethyme-eval/local-v3/d10-identity-parity/d10-identity-parity.mts:207:28)
+    at checkCanonicalValue (file:///Volumes/T7-repositories/Application%20Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/add-finite-d10-typescript-parity-for-pro/packages/aethyme-eval/local-v3/d10-identity-parity/d10-identity-parity.mts:212:35)
+    at run (file:///Volumes/T7-repositories/Application%20Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/add-finite-d10-typescript-parity-for-pro/packages/aethyme-eval/local-v3/d10-identity-parity/d10-identity-parity.mts:894:3)
+    at file:///Volumes/T7-repositories/Application%20Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/add-finite-d10-typescript-parity-for-pro/packages/aethyme-eval/local-v3/d10-identity-parity/d10-identity-parity.mts:1241:1
+    at ModuleJob.run (node:internal/modules/esm/module_job:569:25)
+    at async node:internal/modules/esm/loader:650:26
+    at async asyncRunEntryPointWithESMLoader (node:internal/modules/run_main:101:5)
+
+Node.js v26.8.2

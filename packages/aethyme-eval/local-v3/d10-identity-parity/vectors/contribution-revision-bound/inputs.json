@@ -1,0 +1,23 @@
+{
+  "fixture_schema": "aethyme.local-d10-bound-revision-golden-inputs/v1",
+  "project_id": "proj:aaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "contribution_id": "contrib:bbbbbbbbbbbbbbbbbbbbbbbbbe",
+  "proposal_seed": "contrib:bbbbbbbbbbbbbbbbbbbbbbbbbe",
+  "capture_record_id": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+  "anchor_commit": "1111111111111111111111111111111111111111",
+  "base_files": [
+    {
+      "path_hex": "7372632f6c69622e7273",
+      "mode": "100644",
+      "content_hex": "666e206d61696e2829207b7d0a"
+    }
+  ],
+  "new_file": {
+    "path_hex": "6e65772e7273",
+    "mode": "100644",
+    "content_hex": "6e65772066696c65"
+  },
+  "validation_controls": {
+    "invalid_contribution_id": "contrib:bbbbbbbbbbbbbbbbbbbbbbbbe"
+  }
+}

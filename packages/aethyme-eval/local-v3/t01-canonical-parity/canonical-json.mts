@@ -405,6 +405,150 @@ export function canonicalStringify(value: CanonicalValue): string {
   throw new Error("canonicalStringify received an unsupported value");
 }
 
+function boundedCanonicalStringByteLength(
+  value: string,
+  limit: number,
+): number | undefined {
+  let rawBytes = 0;
+  let encodedBytes = 2;
+  for (const character of value) {
+    const codePoint = character.codePointAt(0)!;
+    if (
+      (codePoint >= 0xd800 && codePoint <= 0xdfff) ||
+      (codePoint >= 0xfdd0 && codePoint <= 0xfdef) ||
+      (codePoint & 0xfffe) === 0xfffe
+    ) {
+      return undefined;
+    }
+    let scalarBytes: number;
+    if (codePoint <= 0x7f) scalarBytes = 1;
+    else if (codePoint <= 0x7ff) scalarBytes = 2;
+    else if (codePoint <= 0xffff) scalarBytes = 3;
+    else scalarBytes = 4;
+    rawBytes += scalarBytes;
+    if (rawBytes > PROFILE_LIMITS.max_string_bytes) return undefined;
+    const escapedBytes =
+      codePoint === 0x22 ||
+      codePoint === 0x5c ||
+      codePoint === 0x08 ||
+      codePoint === 0x0c ||
+      codePoint === 0x0a ||
+      codePoint === 0x0d ||
+      codePoint === 0x09
+        ? 2
+        : codePoint < 0x20
+          ? 6
+          : scalarBytes;
+    encodedBytes += escapedBytes;
+    if (encodedBytes > limit) return undefined;
+  }
+  return encodedBytes <= limit ? encodedBytes : undefined;
+}
+
+function addBoundedCanonicalBytes(
+  current: number,
+  addition: number,
+  limit: number,
+): number | undefined {
+  const total = current + addition;
+  return total <= limit ? total : undefined;
+}
+
+function boundedCanonicalByteLengthAtDepth(
+  value: CanonicalValue,
+  depth: number,
+  limit: number,
+): number | undefined {
+  if (typeof value === "boolean") {
+    const length = value ? 4 : 5;
+    return length <= limit ? length : undefined;
+  }
+  if (typeof value === "number") {
+    if (!Number.isSafeInteger(value) || Object.is(value, -0)) return undefined;
+    const length = value.toString(10).length;
+    return length <= limit ? length : undefined;
+  }
+  if (typeof value === "string") {
+    return boundedCanonicalStringByteLength(value, limit);
+  }
+  if (Array.isArray(value)) {
+    if (
+      depth >= PROFILE_LIMITS.max_depth ||
+      value.length > PROFILE_LIMITS.max_container_entries
+    ) {
+      return undefined;
+    }
+    let size = 2;
+    if (size > limit) return undefined;
+    for (let index = 0; index < value.length; index += 1) {
+      if (index > 0) {
+        const next = addBoundedCanonicalBytes(size, 1, limit);
+        if (next === undefined) return undefined;
+        size = next;
+      }
+      const child = boundedCanonicalByteLengthAtDepth(
+        value[index]!,
+        depth + 1,
+        limit - size,
+      );
+      if (child === undefined) return undefined;
+      const next = addBoundedCanonicalBytes(size, child, limit);
+      if (next === undefined) return undefined;
+      size = next;
+    }
+    return size;
+  }
+  if (value instanceof Map) {
+    if (
+      depth >= PROFILE_LIMITS.max_depth ||
+      value.size > PROFILE_LIMITS.max_container_entries
+    ) {
+      return undefined;
+    }
+    let size = 2;
+    if (size > limit) return undefined;
+    let index = 0;
+    for (const [key, childValue] of value) {
+      if (index > 0) {
+        const next = addBoundedCanonicalBytes(size, 1, limit);
+        if (next === undefined) return undefined;
+        size = next;
+      }
+      const keyBytes = boundedCanonicalStringByteLength(key, limit - size);
+      if (keyBytes === undefined) return undefined;
+      let next = addBoundedCanonicalBytes(size, keyBytes, limit);
+      if (next === undefined) return undefined;
+      size = next;
+      next = addBoundedCanonicalBytes(size, 1, limit);
+      if (next === undefined) return undefined;
+      size = next;
+      const childBytes = boundedCanonicalByteLengthAtDepth(
+        childValue,
+        depth + 1,
+        limit - size,
+      );
+      if (childBytes === undefined) return undefined;
+      next = addBoundedCanonicalBytes(size, childBytes, limit);
+      if (next === undefined) return undefined;
+      size = next;
+      index += 1;
+    }
+    return size;
+  }
+  return undefined;
+}
+
+/** Measure canonical UTF-8 JSON bytes without building the encoded document. */
+export function boundedCanonicalByteLength(
+  value: CanonicalValue,
+): number | undefined {
+  return boundedCanonicalByteLengthAtDepth(
+    value,
+    0,
+    PROFILE_LIMITS.max_document_bytes,
+  );
+}
+
 export function canonicalizeValue(value: CanonicalValue): Buffer {
   return Buffer.from(canonicalStringify(value), "utf8");
 }

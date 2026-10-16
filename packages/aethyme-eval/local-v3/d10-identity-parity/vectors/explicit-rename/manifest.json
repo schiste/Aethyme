@@ -1,0 +1,103 @@
+{
+  "derived_golden": {
+    "base_snapshot_id": "sha256:2fbf1dd77bbf889a5790e7a23e695e52d6699bb360e8c8cb900e9dc88537736a",
+    "contribution_revision_record_id": "sha256:ae98275074fdd0c63af8b5f7e0950df49333ce1aac3cd853ab781287d6a5fb0a",
+    "renamed_file_id_preserved": "file:sha256:a69cfec7645a258107611f9e440d88f784a9a8ebff6e2f69d039aeb6af026e05",
+    "result_snapshot_id": "sha256:8bb06a89bda4325b254b0ecdca0052e41d3dbd35b359bc7678d3fd5686fd7b3c",
+    "transition_canonical_json": "{\"base_snapshot_id\":\"sha256:2fbf1dd77bbf889a5790e7a23e695e52d6699bb360e8c8cb900e9dc88537736a\",\"changes\":[{\"after\":{\"content_sha256\":\"58100dc8fc06562ce3e578231dc948e083520ee49c4b4ee5a5a28bb4b4003feb\",\"file_id\":\"file:sha256:a69cfec7645a258107611f9e440d88f784a9a8ebff6e2f69d039aeb6af026e05\",\"mode\":\"100644\",\"path_hex\":\"6e65772e7273\"},\"before\":{\"content_sha256\":\"58100dc8fc06562ce3e578231dc948e083520ee49c4b4ee5a5a28bb4b4003feb\",\"file_id\":\"file:sha256:a69cfec7645a258107611f9e440d88f784a9a8ebff6e2f69d039aeb6af026e05\",\"mode\":\"100644\",\"path_hex\":\"6f6c642e7273\"},\"derived_from\":[],\"possible_sources\":[],\"relation\":\"explicit_rename\"}],\"project_id\":\"proj:aaaaaaaaaaaaaaaaaaaaaaaaaa\",\"proposal_id\":\"proposal-rename\",\"result_files\":[{\"content_sha256\":\"6ca7ea2feefc88ecb5ed6356ed963f47dc9137f82526fdd25d618ea626d0803f\",\"file_id\":\"file:sha256:7a7f99f5a4921422205d7568b6f3a67dbdb99b76516a9089341d499e540fa866\",\"mode\":\"100644\",\"path_hex\":\"6b6565702e7273\"},{\"content_sha256\":\"58100dc8fc06562ce3e578231dc948e083520ee49c4b4ee5a5a28bb4b4003feb\",\"file_id\":\"file:sha256:a69cfec7645a258107611f9e440d88f784a9a8ebff6e2f69d039aeb6af026e05\",\"mode\":\"100644\",\"path_hex\":\"6e65772e7273\"}],\"result_snapshot_id\":\"sha256:8bb06a89bda4325b254b0ecdca0052e41d3dbd35b359bc7678d3fd5686fd7b3c\"}"
+  },
+  "files": {
+    "expected.json": "ed8c5a28aa017e40661b965622001ddd23427f1e545203cefe8b8bccb5edd9b3",
+    "inputs.json": "5db662e3bbf4adab125b5f0cb1090eb586804815bc795a420d39d944fd4b3702",
+    "oracle.py": "91c9bd162616a148258f8305e599319844f6891c6bb097ee0e7b7464b83323c5"
+  },
+  "independent_checks": [
+    "Stdlib Python independently hashes content, raw-path-sorted source manifests, enrolled base FileIds, canonical FileChange/transition JSON, and ContributionRevision record bytes.",
+    "Explicit rename carries the original source FileId to the new path; unchanged keep.rs retains its own enrolled FileId.",
+    "The canonical transition follows the public FileIdentityTransition fields; no invented transition RecordId/domain is claimed.",
+    "FileId and snapshot/record ID formats are asserted; source-change and record canonical bytes round-trip through JSON.",
+    "No Rust, TypeScript, Node, Cargo, native code, model, network, or production runtime was executed."
+  ],
+  "input_validation_before_hashing": {
+    "capture_record_id": "sha256-prefixed 64 lowercase hex",
+    "invalid_control": "exact prior v1 invalid 25-symbol ContributionId rejected before first hash",
+    "modes": "limited to 100644, 100755, 120000; rename source and destination require equal mode/content",
+    "project_and_contribution_id": "valid 26-symbol lowercase base32; contribution tail low two bits zero",
+    "proposal_id": "proposal-rename, matching the existing Rust rename test and generic Rust proposal-token validator",
+    "raw_paths": "lowercase even hex, relative, NUL-free, no empty/dot/dot-dot components; distinct and exact rename mapping validated",
+    "schema": "aethyme.local-d10-explicit-rename-inputs/v1; exact top-level, operation, and file keys checked"
+  },
+  "package": "independent Local D10 explicit-rename transition and ContributionRevision golden v1",
+  "preserved_prior_packages_byte_exact": {
+    "failed_v1": {
+      "directory": "/private/tmp/review-d10-independent.rP4ZAU",
+      "files": {
+        "expected.json": "08b1d82960efa01461b4d1cdbf19d9da36a8a89bf2ed46e5918501ae3af78998",
+        "inputs.json": "be5e1daa719a1ae076c58e1728f330900af06aeb63cbb3253fa1c97c4aacb2dd",
+        "manifest.json": "dcd046d68020c580fe3f5fa1598696ef864746240d7fc99e982d5e774fabc68f",
+        "oracle.py": "bd6685735a17a72014a05e1319b16d62983fef5381f8b2d8d4795ba39f032c95"
+      },
+      "manifest_sha256": "dcd046d68020c580fe3f5fa1598696ef864746240d7fc99e982d5e774fabc68f"
+    },
+    "ordinal_supplement": {
+      "directory": "/private/tmp/review-d10-ordinals.hTOfKq",
+      "files": {
+        "expected.json": "67b9586320e91de0a5d3deda44ff03ee51f099846dc93597f46155f7e811711b",
+        "inputs.json": "a800c0f6622642e9cf0866a1e60f724270f7b9cfc1ee3afe06b600161e696fd8",
+        "oracle.py": "98b1c36ed2fea2b8a383e521901ee5ffb4cf51cad228a3a5f038482b26362072"
+      },
+      "manifest_sha256": "69ac3502ed87470275922c27a5098c06d0272049b53f4141c354346f66ca978f"
+    },
+    "v2": {
+      "directory": "/private/tmp/review-d10-v2.4dXN6j",
+      "files": {
+        "expected.json": "62fbfa515b01804ac409fd591368b30b62b364d269ab1422015e9121a3093048",
+        "inputs.json": "b269c64f26ef1dd04603f0e062c5ccac98989c1875dff1546baa2f5f88465cd7",
+        "oracle.py": "3a95aa4a5b20f12fe13474d93e6c534685166de94dda5f1bea7c486c43e9c18e"
+      },
+      "manifest_sha256": "4979504c53d8c23cefe22d577adc019154290f2466a06923eef3d772fe42d4e4"
+    }
+  },
+  "purpose": "Add one exact explicit Rename transition and its immutable ContributionRevision canonical bytes/RecordId. Existing v1/v2/ordinal packages remain unchanged.",
+  "source": {
+    "archive": "/private/tmp/review-d10-v2.4dXN6j/commit-archive",
+    "canonical_json": {
+      "lines": "28-39 (canonical profile); 106-111 (UTF-16 key order); 113-175 (canonical serialization)",
+      "path": "rust/crates/aethyme-contracts/src/experimental_v0/canonical_json.rs",
+      "sha256": "90070c56f613bb94564072c56076daf2428f2888f0b71e34a526b718c55b52f3"
+    },
+    "commit": "fcd5ed940b4d906452e4ad1d3aa90eb767f1af45",
+    "contribution_revision_contract": {
+      "lines": "31-55 ContributionId validation; 108-159 constructor; 198-230 record serialization; 301-379 source-change validation/order",
+      "path": "packages/aethyme/rust/crates/aethyme-contracts/src/experimental_v0/contribution_revision.rs",
+      "sha256": "bba6e7ae8747856905359a9fe7da63d510734c73726adc7019596319e8cd0538"
+    },
+    "project_identity_contract": {
+      "lines": "484-501 relation values; 515-553 FileChange serialization; 557-560 operation variants; 668-705 Rename validation and source FileId preservation; 821-877 source/result transition construction",
+      "path": "packages/aethyme/rust/crates/aethyme-contracts/src/experimental_v0/project_identity.rs",
+      "sha256": "a38be70e5e394003a3ea209521160f3c0ad5e5c12d8bd19f29629c1f80785901"
+    },
+    "proposal_id_validation": {
+      "lines": "1096-1107 (proposal-rename is a valid generic proposal token)",
+      "path": "packages/aethyme/rust/crates/aethyme-contracts/src/experimental_v0/project_identity.rs",
+      "sha256": "a38be70e5e394003a3ea209521160f3c0ad5e5c12d8bd19f29629c1f80785901"
+    },
+    "record_identity": {
+      "lines": "52-59 (record identity rule); 75-76 (record domain)",
+      "path": "rust/crates/aethyme-contracts/src/experimental_v0/record.rs",
+      "sha256": "d4888555e1653ea8897f383dfb6f6f9c50e5e2abd19ee113eb440ee575ad4400"
+    },
+    "source_snapshot_encoding": {
+      "lines": "23-60 (byte contract); 69-75 (domain); 164-209 (raw-path sort and manifest bytes); 282-313 (path restrictions)",
+      "path": "rust/crates/aethyme-contracts/src/experimental_v0/source_snapshot.rs",
+      "sha256": "d36bcd57d0f2ccc47aff1a4c69d5ee974d09a22879cfc0ce938687761737ed14"
+    },
+    "source_test": {
+      "lines": "99-161 (exact_rename_preserves_id_but_unannotated_rename_stays_uncertain; input paths/content/mode and Rename operation)",
+      "path": "packages/aethyme/rust/crates/aethyme-contracts/tests/project_identity_vectors.rs",
+      "sha256": "b3ec4923e020d868e09b363fb2bc6b76d86a73e3af2e3b8a8b157bde0cadc1d0"
+    },
+    "tree": "1acff82e4dc3f375aed028a0bbf13fa693f4fe64"
+  },
+  "status": "frozen additive expected-data package"
+}
