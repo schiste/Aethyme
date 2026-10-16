@@ -1015,10 +1015,16 @@ mod unix {
     fn mount_identity(fd: RawFd) -> io::Result<Vec<u8>> {
         // f_fsid identifies the volume; f_mntonname distinguishes a second
         // mount of that volume from an ordinary child directory.
+        // SAFETY: `statfs` is a plain C struct whose zeroed representation is
+        // valid; `fstatfs` fills it before any field is read.
         let mut stat: libc::statfs = unsafe { std::mem::zeroed() };
+        // SAFETY: `fd` is a live pinned directory descriptor and `stat` is
+        // writable for the duration of the syscall.
         if unsafe { libc::fstatfs(fd, &mut stat) } != 0 {
             return Err(io::Error::last_os_error());
         }
+        // SAFETY: successful `fstatfs` fills `f_mntonname` as a NUL-terminated
+        // fixed-size C string within the struct.
         let mountpoint = unsafe { CStr::from_ptr(stat.f_mntonname.as_ptr()) }.to_bytes();
         if mountpoint.is_empty() {
             return Err(io::Error::new(
