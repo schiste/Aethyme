@@ -601,9 +601,37 @@ fn private_current_qualification_requires_verifier_and_refuses_revocation() {
     .unwrap();
     assert_eq!(grant.receipt(), &receipt);
     assert_eq!(grant.expires_ms(), evidence.expires_ms());
+    let historical = HistoricalCompletionIdentity {
+        target: v.owner.target().into(),
+        issuer: v.owner.issuer().into(),
+        revision: intent.spec.revision.clone(),
+        epoch: v.owner.authority_epoch().as_str().into(),
+        wave: w.id.to_string(),
+        source: intent.spec.source.clone(),
+        candidate_commit: intent.spec.commit.clone(),
+        candidate_tree: receipt.spec.candidate_tree.clone(),
+        qualification: grant.id().to_string(),
+        receipt: receipt.id.to_string(),
+        accepted_commit: receipt.spec.accepted_commit.clone().unwrap(),
+        accepted_tree: receipt.spec.accepted_tree.clone().unwrap(),
+    };
+    verify_historical_completion(&v.f.store, &historical).unwrap();
+    let mut wrong_epoch = historical.clone();
+    wrong_epoch.epoch = format!("sha256:{}", "f".repeat(64));
+    assert!(verify_historical_completion(&v.f.store, &wrong_epoch).is_err());
+    let mut wrong_receipt = historical.clone();
+    wrong_receipt.receipt = format!("sha256:{}", "f".repeat(64));
+    assert!(verify_historical_completion(&v.f.store, &wrong_receipt).is_err());
+    let mut wrong_qualification = historical.clone();
+    wrong_qualification.qualification = format!("sha256:{}", "e".repeat(64));
+    assert!(verify_historical_completion(&v.f.store, &wrong_qualification).is_err());
+
     let current = current_guard(&mut v.f.store, &v.owner, &mut broker, &carrier, &grant).unwrap();
     current.check_clock().unwrap();
     drop(current);
+    let newest_receipt = last_receipt(&v.f.store, binding.id()).unwrap().unwrap();
+    assert_ne!(newest_receipt.id.as_str(), historical.receipt);
+    verify_historical_completion(&v.f.store, &historical).unwrap();
     let wrong = v.f.b.result.commit.as_str();
     git(
         v.f._repo.path(),
@@ -663,6 +691,53 @@ fn private_current_qualification_requires_verifier_and_refuses_revocation() {
             verifier::VerificationError::Producer
         ))
     ));
+
+    let prior_epoch = v.owner.authority_epoch().clone();
+    let target_name = historical.target.clone();
+    let issuer = historical.issuer.clone();
+    let frozen =
+        crate::local_authority::freeze(&mut v.f.store, &prior_epoch, "historical proof fixture")
+            .unwrap();
+    let resumed = crate::local_authority::resume(&mut v.f.store, &frozen.epoch).unwrap();
+    drop(v.owner);
+    let _new_owner = target::acquire_controller(&mut v.f.store, &target_name, &issuer).unwrap();
+    assert_ne!(_new_owner.authority_epoch(), &prior_epoch);
+    verify_historical_completion(&v.f.store, &historical).unwrap();
+
+    let receipt_body: Vec<u8> =
+        v.f.store
+            .read_connection()
+            .query_row(
+                "SELECT body FROM local_acceptance_receipts WHERE id=?1",
+                [&historical.receipt],
+                |row| row.get(0),
+            )
+            .unwrap();
+    v.f.store
+        .connection()
+        .execute(
+            "UPDATE local_acceptance_receipts SET body=?1 WHERE id=?2",
+            rusqlite::params![b"{}".as_slice(), &historical.receipt],
+        )
+        .unwrap();
+    assert!(verify_historical_completion(&v.f.store, &historical).is_err());
+    v.f.store
+        .connection()
+        .execute(
+            "UPDATE local_acceptance_receipts SET body=?1 WHERE id=?2",
+            rusqlite::params![receipt_body, &historical.receipt],
+        )
+        .unwrap();
+
+    v.f.store
+        .connection()
+        .execute(
+            "UPDATE local_acceptance_qualifications SET body=?1 WHERE id=?2",
+            rusqlite::params![b"{}".as_slice(), &historical.qualification],
+        )
+        .unwrap();
+    assert!(verify_historical_completion(&v.f.store, &historical).is_err());
+    let _ = resumed;
 }
 
 #[test]

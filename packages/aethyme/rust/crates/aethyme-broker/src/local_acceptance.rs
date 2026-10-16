@@ -18,6 +18,16 @@ pub const PROFILE: &str = "aethyme.acceptance.exact-source/provisional-v0";
 static BINDING: RecordSchema = schema("aethyme.acceptance-binding/provisional-v0");
 static RECEIPT: RecordSchema = schema("aethyme.acceptance-receipt/provisional-v0");
 static QUALIFICATION: RecordSchema = schema("aethyme.acceptance-qualification/provisional-v0");
+static HISTORICAL_EVIDENCE: RecordSchema = RecordSchema {
+    name: "aethyme.verification-evidence/provisional-v0",
+    fields: &[FieldSpec {
+        name: "observation",
+        required: true,
+        kind: FieldKind::Opaque,
+        capability: None,
+    }],
+    capabilities: &[],
+};
 const fn schema(name: &'static str) -> RecordSchema {
     RecordSchema {
         name,
@@ -52,6 +62,8 @@ pub enum AcceptanceError {
     Archive(#[from] archive::ArchiveError),
     #[error(transparent)]
     Verification(#[from] verifier::VerificationError),
+    #[error(transparent)]
+    Snapshot(#[from] crate::execution_snapshot::SnapshotError),
     #[error(transparent)]
     Sensitive(#[from] crate::collaboration_sensitive::SensitiveError),
     #[error(transparent)]
@@ -184,6 +196,325 @@ pub struct ReceiptSpec {
 pub struct AcceptanceReceipt {
     pub id: RecordId,
     pub spec: ReceiptSpec,
+}
+
+/// The exact historical identities a Local completion froze when it consumed
+/// a private acceptance grant. This record validates provenance for baseline
+/// reuse only; it is not a current acceptance grant or a producer permit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HistoricalCompletionIdentity {
+    pub(crate) target: String,
+    pub(crate) issuer: String,
+    pub(crate) revision: String,
+    pub(crate) epoch: String,
+    pub(crate) wave: String,
+    pub(crate) source: String,
+    pub(crate) candidate_commit: String,
+    pub(crate) candidate_tree: String,
+    pub(crate) qualification: String,
+    pub(crate) receipt: String,
+    pub(crate) accepted_commit: String,
+    pub(crate) accepted_tree: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HistoricalQualificationSpec {
+    binding: String,
+    receipt: String,
+    evidence: String,
+    execution: String,
+    epoch: String,
+    expires_ms: i64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HistoricalEvidenceBody {
+    verification: String,
+    producer: String,
+    generation: i64,
+    epoch: String,
+    revision: String,
+    execution: String,
+    candidate: String,
+    artifact: String,
+    output: String,
+    policy: String,
+    runtime: String,
+    image: String,
+    harness: String,
+    inventory: String,
+    profile: String,
+    result: verifier::VerificationOutcome,
+    assertions: Vec<HistoricalAssertionObservation>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HistoricalAssertionObservation {
+    id: String,
+    outcome: verifier::VerificationOutcome,
+    exit_code: Option<i32>,
+    stdout: Option<String>,
+    stderr: Option<String>,
+}
+
+fn object_for_record(record: &RecordId) -> Result<ObjectDigest, AcceptanceError> {
+    let hex = record
+        .as_str()
+        .strip_prefix("sha256:")
+        .ok_or_else(|| invalid("historical record ID"))?;
+    archive::parse_digest(hex).ok_or_else(|| invalid("historical record digest"))
+}
+
+fn lower_hex(value: &str, length: usize) -> bool {
+    value.len() == length
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+/// Revalidate an accepted completion's historical qualification without
+/// querying provider state. A qualification row can be written only by
+/// qualify_receipt, after its private QualifiedAcceptance capability has
+/// passed the current verifier guard and its exact receipt is accepted. We
+/// verify that sealed-row identity and successful evidence chain here, but
+/// deliberately do not turn it into a present grant, permit, or settlement.
+pub(crate) fn verify_historical_completion(
+    store: &CollaborationStore,
+    completion: &HistoricalCompletionIdentity,
+) -> Result<(), AcceptanceError> {
+    let _response = crate::collaboration_sensitive::response_use(store)?;
+    let qualification_id = id(&completion.qualification)?;
+    let expected_receipt_id = id(&completion.receipt)?;
+    let expected_wave_id = id(&completion.wave)?;
+    let expected_revision_id = id(&completion.revision)?;
+    let expected_epoch_id = id(&completion.epoch)?;
+    let expected_source =
+        aethyme_contracts::experimental_v0::SourceSnapshotId::parse(&completion.source)
+            .map_err(|_| invalid("historical completion source"))?;
+    let candidate_commit = sha(&completion.candidate_commit)?;
+    let candidate_tree = sha(&completion.candidate_tree)?;
+    let accepted_commit = sha(&completion.accepted_commit)?;
+    let accepted_tree = sha(&completion.accepted_tree)?;
+    if completion.target.trim().is_empty()
+        || completion.issuer.trim().is_empty()
+        || candidate_tree != accepted_tree
+    {
+        return Err(invalid("historical completion identity"));
+    }
+
+    let (qualification_binding, qualification_bytes): (String, Vec<u8>) = store
+        .read_connection()
+        .query_row(
+            "SELECT binding,body FROM local_acceptance_qualifications WHERE id=?1",
+            [qualification_id.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?
+        .ok_or(AcceptanceError::Missing)?;
+    let qualification_record = Record::decode(&qualification_bytes, &[&QUALIFICATION])
+        .map_err(|_| invalid("historical qualification record"))?;
+    let qualification_value: serde_json::Value = serde_json::from_slice(&qualification_bytes)?;
+    let qualification: HistoricalQualificationSpec =
+        serde_json::from_value(qualification_value["spec"].clone())
+            .map_err(|_| invalid("historical qualification payload"))?;
+    let binding_id = id(&qualification.binding)?;
+    let evidence_id = id(&qualification.evidence)?;
+    let execution_id = id(&qualification.execution)?;
+    let qualification_object = archive::ObjectDigest::of(&qualification_bytes);
+    let qualification_object_retained = archive::read_object(store, &qualification_object)?;
+    let qualification_rooted: bool = store.read_connection().query_row(
+        "SELECT EXISTS(SELECT 1 FROM local_target_roots
+         WHERE revision=?1 AND kind='object' AND reference=?2)",
+        rusqlite::params![completion.revision, qualification_object.hex()],
+        |row| row.get(0),
+    )?;
+    if qualification_record.id() != qualification_id
+        || qualification_record.canonical_bytes() != qualification_bytes
+        || qualification_object_retained != qualification_bytes
+        || !qualification_rooted
+        || qualification_binding != binding_id.as_str()
+        || qualification.receipt != expected_receipt_id.as_str()
+        || qualification.epoch != expected_epoch_id.as_str()
+        || qualification.expires_ms <= 0
+    {
+        return Err(invalid("historical qualification identity"));
+    }
+
+    let binding = load(store, &binding_id)?;
+    if binding.spec().revision != completion.revision
+        || binding.spec().epoch != expected_epoch_id.as_str()
+        || binding.spec().intent.is_empty()
+    {
+        return Err(invalid("historical acceptance binding"));
+    }
+    let intent_id = id(&binding.spec().intent)?;
+    let intent = transport::load(store, &intent_id)?;
+    if intent.id != intent_id
+        || intent.spec.target != completion.target
+        || intent.spec.issuer != completion.issuer
+        || intent.spec.epoch != expected_epoch_id.as_str()
+        || intent.spec.revision != completion.revision
+        || intent.spec.wave != expected_wave_id.as_str()
+        || intent.spec.source != expected_source.as_str()
+        || intent.spec.commit != candidate_commit.as_str()
+        || intent.spec.tree != candidate_tree.as_str()
+    {
+        return Err(invalid("historical acceptance intent"));
+    }
+
+    let (receipt_binding, receipt_bytes): (String, Vec<u8>) = store
+        .read_connection()
+        .query_row(
+            "SELECT binding,body FROM local_acceptance_receipts WHERE id=?1",
+            [expected_receipt_id.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?
+        .ok_or(AcceptanceError::Missing)?;
+    let receipt_record = Record::decode(&receipt_bytes, &[&RECEIPT])
+        .map_err(|_| invalid("historical receipt record"))?;
+    let receipt_value: serde_json::Value = serde_json::from_slice(&receipt_bytes)?;
+    let receipt_spec: ReceiptSpec = serde_json::from_value(receipt_value["spec"].clone())
+        .map_err(|_| invalid("historical receipt payload"))?;
+    if receipt_record.id() != expected_receipt_id
+        || receipt_record.canonical_bytes() != receipt_bytes
+        || receipt_binding != binding.id().as_str()
+        || receipt_spec.profile != PROFILE
+        || receipt_spec.binding != binding.id().as_str()
+        || receipt_spec.intent != intent.id.as_str()
+        || receipt_spec.revision != completion.revision
+        || receipt_spec.source != expected_source.as_str()
+        || receipt_spec.candidate_commit != candidate_commit.as_str()
+        || receipt_spec.candidate_tree != candidate_tree.as_str()
+        || receipt_spec.policy_commit != binding.spec().policy_commit
+        || receipt_spec.config_digest != binding.spec().config_digest
+        || receipt_spec.route != binding.spec().route
+        || receipt_spec.peer != intent.spec.peer
+        || receipt_spec.base_ref != binding.spec().base_ref
+        || receipt_spec.decision != ProviderDecision::Accepted
+        || receipt_spec.accepted_commit.as_deref() != Some(accepted_commit.as_str())
+        || receipt_spec.accepted_tree.as_deref() != Some(accepted_tree.as_str())
+        || receipt_spec.sequence == 0
+        || receipt_spec.sequence > binding.spec().max_observations
+        || receipt_spec.observed_ms <= 0
+    {
+        return Err(invalid("historical accepted receipt binding"));
+    }
+
+    let execution_object = object_for_record(&execution_id)?;
+    let execution = crate::execution_snapshot::load(
+        store,
+        &crate::execution_snapshot::SnapshotRef {
+            id: execution_id.clone(),
+            object: execution_object,
+        },
+    )?;
+    if execution.target_revision() != &expected_revision_id
+        || execution.spec().candidate_source != expected_source.as_str()
+    {
+        return Err(invalid("historical acceptance execution"));
+    }
+
+    let (
+        evidence_object_hex,
+        evidence_revision,
+        evidence_producer,
+        evidence_generation,
+        evidence_issued_ms,
+        evidence_expires_ms,
+        evidence_bytes,
+    ): (String, String, String, i64, i64, i64, Vec<u8>) = store
+        .read_connection()
+        .query_row(
+            "SELECT object,revision,producer,generation,issued_ms,expires_ms,body
+             FROM local_verification_evidence WHERE id=?1",
+            [evidence_id.as_str()],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                ))
+            },
+        )
+        .optional()?
+        .ok_or(AcceptanceError::Missing)?;
+    if evidence_bytes.len() > 1024 * 1024 {
+        return Err(invalid("historical evidence size"));
+    }
+    let evidence_object =
+        archive::parse_digest(&evidence_object_hex).ok_or_else(|| invalid("evidence object"))?;
+    let evidence_record = Record::decode(&evidence_bytes, &[&HISTORICAL_EVIDENCE])
+        .map_err(|_| invalid("historical evidence record"))?;
+    let evidence_value: serde_json::Value = serde_json::from_slice(&evidence_bytes)?;
+    let evidence: HistoricalEvidenceBody =
+        serde_json::from_value(evidence_value["observation"].clone())
+            .map_err(|_| invalid("historical evidence payload"))?;
+    let _artifact_id = id(&evidence.artifact)?;
+    let _output_snapshot =
+        aethyme_contracts::experimental_v0::SourceSnapshotId::parse(&evidence.output)
+            .map_err(|_| invalid("historical evidence output"))?;
+    let rooted: bool = store.read_connection().query_row(
+        "SELECT EXISTS(SELECT 1 FROM local_target_roots
+         WHERE revision=?1 AND kind='object' AND reference=?2)",
+        rusqlite::params![completion.revision, evidence_object_hex],
+        |row| row.get(0),
+    )?;
+    let retained_evidence = archive::read_object(store, &evidence_object)?;
+    let inventory_id = id(&execution.spec().assertion_inventory)?;
+    let inventory_object = object_for_record(&inventory_id)?;
+    let inventory_bytes = archive::read_object(store, &inventory_object)?;
+    let inventory = verifier::AssertionInventory::decode(&inventory_bytes)?;
+    let assertions_match = evidence.assertions.len() == inventory.cases().len()
+        && inventory
+            .cases()
+            .iter()
+            .zip(&evidence.assertions)
+            .all(|(case, observed)| {
+                case.exit_code == 0
+                    && observed.id == case.id
+                    && observed.outcome == verifier::VerificationOutcome::Passed
+                    && observed.exit_code == Some(i32::from(case.exit_code))
+                    && observed.stdout.as_deref() == Some(case.stdout.as_str())
+                    && observed.stderr.as_deref() == Some(case.stderr.as_str())
+            });
+    if evidence_record.id() != evidence_id
+        || evidence_record.canonical_bytes() != evidence_bytes
+        || archive::ObjectDigest::of(&evidence_bytes) != evidence_object
+        || retained_evidence != evidence_bytes
+        || !rooted
+        || evidence_revision != completion.revision
+        || evidence_generation <= 0
+        || evidence_issued_ms <= 0
+        || evidence_expires_ms != qualification.expires_ms
+        || evidence_expires_ms <= evidence_issued_ms
+        || evidence.producer != evidence_producer
+        || evidence.generation != evidence_generation.to_string()
+        || evidence.epoch != expected_epoch_id.as_str()
+        || evidence.revision != completion.revision
+        || evidence.execution != execution_id.as_str()
+        || evidence.candidate != expected_source.as_str()
+        || evidence.policy != binding.spec().verifier_policy
+        || evidence.harness != execution.spec().harness
+        || evidence.inventory != execution.spec().assertion_inventory
+        || evidence.runtime.trim().is_empty()
+        || evidence.image.trim().is_empty()
+        || evidence.profile != verifier::PROFILE
+        || !lower_hex(&evidence.verification, 64)
+        || evidence.result != verifier::VerificationOutcome::Passed
+        || !assertions_match
+    {
+        return Err(invalid("historical qualified verifier evidence"));
+    }
+
+    Ok(())
 }
 /// A grant is private, current, epoch-bound, and non-deserializable. Its public
 /// representation is a receipt, which cannot be imported as present authority.
