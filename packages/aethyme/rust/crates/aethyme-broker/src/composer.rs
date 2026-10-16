@@ -152,9 +152,11 @@ pub fn compose_structural(
         store,
         repo,
         request,
-        &request.deliveries,
-        None,
-        None,
+        CompositionInputs {
+            deliveries: &request.deliveries,
+            recomposition: None,
+            revision_bindings: None,
+        },
         None,
         &mut profile,
     )?;
@@ -353,6 +355,13 @@ pub(crate) type Entries = BTreeMap<Vec<u8>, (EntryKind, [u8; 32])>;
 
 struct Refused(Refusal, String);
 
+#[derive(Clone, Copy)]
+struct CompositionInputs<'a> {
+    deliveries: &'a [String],
+    recomposition: Option<&'a Subtraction>,
+    revision_bindings: Option<&'a BTreeMap<String, RecordId>>,
+}
+
 fn refused(reason: Refusal, detail: impl Into<String>) -> Refused {
     Refused(reason, detail.into())
 }
@@ -368,9 +377,11 @@ pub fn compose(
         store,
         repo,
         request,
-        &request.deliveries,
-        None,
-        None,
+        CompositionInputs {
+            deliveries: &request.deliveries,
+            recomposition: None,
+            revision_bindings: None,
+        },
         None,
         &mut MergeProfile {
             engine: None,
@@ -395,9 +406,11 @@ pub(crate) fn compose_with_candidate_retainer(
         store,
         repo,
         request,
-        &request.deliveries,
-        None,
-        None,
+        CompositionInputs {
+            deliveries: &request.deliveries,
+            recomposition: None,
+            revision_bindings: None,
+        },
         Some(retainer),
         &mut MergeProfile {
             engine: None,
@@ -422,9 +435,11 @@ pub(crate) fn compose_with_candidate_retainer_and_revisions(
         store,
         repo,
         request,
-        &request.deliveries,
-        None,
-        Some(revisions),
+        CompositionInputs {
+            deliveries: &request.deliveries,
+            recomposition: None,
+            revision_bindings: Some(revisions),
+        },
         Some(retainer),
         &mut MergeProfile {
             engine: None,
@@ -518,9 +533,11 @@ fn compose_after_accepted_inner(
         store,
         repo,
         request,
-        &request.deliveries,
-        None,
-        revision_bindings,
+        CompositionInputs {
+            deliveries: &request.deliveries,
+            recomposition: None,
+            revision_bindings,
+        },
         retainer,
         &mut MergeProfile {
             engine: None,
@@ -658,9 +675,11 @@ fn recompose_inner(
         store,
         repo,
         request,
-        &deliveries,
-        Some(subtraction),
-        None,
+        CompositionInputs {
+            deliveries: &deliveries,
+            recomposition: Some(subtraction),
+            revision_bindings: None,
+        },
         None,
         profile,
     )
@@ -715,14 +734,12 @@ fn compose_inner(
     store: &mut CollaborationStore,
     repo: &Path,
     request: &CompositionRequest,
-    deliveries: &[String],
-    recomposition: Option<&Subtraction>,
-    revision_bindings: Option<&BTreeMap<String, RecordId>>,
+    inputs: CompositionInputs<'_>,
     candidate_retainer: Option<&mut CandidateRetainer<'_>>,
     profile: &mut MergeProfile<'_>,
 ) -> Result<Composition, ComposeError> {
-    if let Some(revisions) = revision_bindings {
-        validate_revision_bindings(request, deliveries, revisions)?;
+    if let Some(revisions) = inputs.revision_bindings {
+        validate_revision_bindings(request, inputs.deliveries, revisions)?;
     }
     // Reclamation cannot remove an input while this composition reads it.
     let _use = crate::collaboration_gc::archive_use(store)
@@ -811,7 +828,7 @@ fn compose_inner(
             retained: baseline,
             accepted,
         },
-        deliveries,
+        inputs.deliveries,
         (&mut usage, &mut order),
         profile,
     )? {
@@ -844,16 +861,7 @@ fn compose_inner(
             observed: retained.snapshot_id.to_string(),
         });
     }
-    let (bytes, id) = recipe_record(
-        &candidate,
-        &plan,
-        request,
-        deliveries,
-        usage,
-        recomposition,
-        revision_bindings,
-        profile,
-    )?;
+    let (bytes, id) = recipe_record(&candidate, &plan, request, inputs, usage, profile)?;
     let object = collaboration_archive::put_object(store, &bytes)?;
     let recipe = RecipeRef { id, object };
     if let Some(retain) = candidate_retainer {
@@ -2304,10 +2312,8 @@ fn recipe_record(
     candidate: &Candidate,
     plan: &Plan,
     request: &CompositionRequest,
-    deliveries: &[String],
+    inputs: CompositionInputs<'_>,
     usage: BudgetUsage,
-    recomposition: Option<&Subtraction>,
-    revision_bindings: Option<&BTreeMap<String, RecordId>>,
     profile: &MergeProfile<'_>,
 ) -> Result<(Vec<u8>, RecordId), ComposeError> {
     let engine_version = git_version()?;
@@ -2320,7 +2326,8 @@ fn recipe_record(
                 step.retained.lineage_record_id.as_str(),
                 step.retained.base.snapshot_id.as_str(),
                 step.retained.result.snapshot_id.as_str(),
-                revision_bindings
+                inputs
+                    .revision_bindings
                     .and_then(|bindings| bindings.get(&step.spec.id))
                     .map(RecordId::as_str),
             )
@@ -2378,7 +2385,7 @@ fn recipe_record(
         ("candidate", text(candidate.subject.as_str())),
         ("candidate_commit", text(candidate.commit.as_str())),
         ("order", Value::Array(order)),
-        ("deliveries", integer(deliveries.len())),
+        ("deliveries", integer(inputs.deliveries.len())),
         (
             "budget",
             object(vec![
@@ -2420,7 +2427,7 @@ fn recipe_record(
             ),
         ));
     }
-    if let Some(subtraction) = recomposition {
+    if let Some(subtraction) = inputs.recomposition {
         members.push((
             "recomposition",
             object(vec![

@@ -124,7 +124,7 @@ fn hex_digit(byte: u8) -> Option<u8> {
     }
 }
 fn decode_lower_hex(value: &str, max_bytes: usize) -> Result<Vec<u8>, ExchangeError> {
-    if value.len() % 2 != 0 || value.len() / 2 > max_bytes {
+    if !value.len().is_multiple_of(2) || value.len() / 2 > max_bytes {
         return Err(ExchangeError::Limit);
     }
     let mut decoded = Vec::with_capacity(value.len() / 2);
@@ -280,6 +280,10 @@ impl SourceAvailability {
     }
 }
 /// Offers and announcements cannot decide a controller target or executor cwd.
+/// The D10 variant keeps named fields in the public Rust API. Boxing its payload
+/// would change that API; packet and enclosing event serialization are bounded
+/// independently before bytes are retained.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Metadata {
@@ -492,7 +496,7 @@ fn validate_hex_chunk(value: &str) -> Result<(), ExchangeError> {
         return Err(ExchangeError::Limit);
     }
     if value.is_empty()
-        || value.len() % 2 != 0
+        || !value.len().is_multiple_of(2)
         || value.bytes().any(|byte| hex_digit(byte).is_none())
     {
         return Err(invalid("lowercase hex payload chunk"));
@@ -569,23 +573,30 @@ impl Metadata {
             Self::Contribution { .. } | Self::GenerationOffer { .. } => MAX_PACKET_BYTES,
         }
     }
-    fn validate_revision(
-        project_id: &str,
-        descriptor_record_id: &str,
-        descriptor_object_sha256: &str,
-        logical_contribution_id: &str,
-        capture_record_id: &str,
-        capture_receipt_record_id: &str,
-        revision_record_id: &str,
-        revision_object_sha256: &str,
-        revision_bytes_hex: &BoundedHexPayload,
-        brief_record_id: Option<&str>,
-        brief_object_sha256: Option<&str>,
-        brief_bytes_hex: Option<&str>,
-        source: &str,
-        availability: &SourceAvailability,
-        scope: &[String],
-    ) -> Result<(), ExchangeError> {
+    fn validate_revision(&self) -> Result<(), ExchangeError> {
+        let Self::RevisionContribution {
+            project_id,
+            descriptor_record_id,
+            descriptor_object_sha256,
+            logical_contribution_id,
+            capture_record_id,
+            capture_receipt_record_id,
+            revision_record_id,
+            revision_object_sha256,
+            revision_bytes_hex,
+            brief_record_id,
+            brief_object_sha256,
+            brief_bytes_hex,
+            source,
+            availability,
+            scope,
+        } = self
+        else {
+            return Err(invalid("revision packet shape"));
+        };
+        let brief_record_id = brief_record_id.as_deref();
+        let brief_object_sha256 = brief_object_sha256.as_deref();
+        let brief_bytes_hex = brief_bytes_hex.as_deref();
         ProjectId::parse(project_id).map_err(|_| invalid("revision project identity"))?;
         record_id(descriptor_record_id)?;
         digest_text(descriptor_object_sha256)?;
@@ -597,7 +608,7 @@ impl Metadata {
         digest_text(revision_object_sha256)?;
         source_id(source)?;
         availability.validate()?;
-        revision_paths(&scope)?;
+        revision_paths(scope)?;
 
         // Preflight both object payloads before allocating either decoded byte
         // buffer. The enclosing Record length is measured separately below.
@@ -682,39 +693,7 @@ impl Metadata {
                     return Err(ExchangeError::Limit);
                 }
             }
-            Self::RevisionContribution {
-                project_id,
-                descriptor_record_id,
-                descriptor_object_sha256,
-                logical_contribution_id,
-                capture_record_id,
-                capture_receipt_record_id,
-                revision_record_id,
-                revision_object_sha256,
-                revision_bytes_hex,
-                brief_record_id,
-                brief_object_sha256,
-                brief_bytes_hex,
-                source,
-                availability,
-                scope,
-            } => Self::validate_revision(
-                project_id,
-                descriptor_record_id,
-                descriptor_object_sha256,
-                logical_contribution_id,
-                capture_record_id,
-                capture_receipt_record_id,
-                revision_record_id,
-                revision_object_sha256,
-                revision_bytes_hex,
-                brief_record_id.as_deref(),
-                brief_object_sha256.as_deref(),
-                brief_bytes_hex.as_deref(),
-                source,
-                availability,
-                scope,
-            )?,
+            Self::RevisionContribution { .. } => self.validate_revision()?,
             Self::GenerationOffer {
                 generation,
                 prepared_receipt,
