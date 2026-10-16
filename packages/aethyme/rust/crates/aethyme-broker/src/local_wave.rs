@@ -2229,7 +2229,7 @@ pub(crate) fn compose_with_source(
                         .composition
                         .recipe
                         .as_ref()
-                        .map(|recipe| recipe.object.clone());
+                        .map(|recipe| recipe.object);
                     source_wave.composition_source = Some(reference.clone());
                     let revision = id(&wave.spec.revision)?;
                     let pinned =
