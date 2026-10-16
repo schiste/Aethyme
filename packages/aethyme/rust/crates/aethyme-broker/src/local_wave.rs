@@ -324,13 +324,10 @@ pub(crate) fn read_synthesized_wave_result(
             .iter()
             .find(|contribution| contribution.id == *selected_id)
             .ok_or(WaveError::Stale)?;
-        let lineage = contribution
-            .lineage
-            .as_ref()
-            .ok_or_else(|| WaveError::Invalid("selected lineage is missing".into()))?;
-        if !selected_lineages.insert(lineage.as_str().to_owned())
+        let lineage = contribution.lineage.as_str();
+        if !selected_lineages.insert(lineage.to_owned())
             || selected
-                .insert(selected_id.clone(), lineage.as_str().to_owned())
+                .insert(selected_id.clone(), lineage.to_owned())
                 .is_some()
         {
             return Err(WaveError::Invalid(
