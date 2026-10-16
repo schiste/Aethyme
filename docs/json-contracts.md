@@ -557,6 +557,7 @@ says `experimental-v0`, and a consumer must check `schema` first.
 | `collab resolution packet` | `aethyme.collab-resolution-packet/experimental-v0` |
 | `collab resolution input` | `aethyme.collab-resolution-input/experimental-v0` |
 | `collab resolution import` | `aethyme.collab-resolution-import/experimental-v0` |
+| `collab resolution attach` | `aethyme.collab-resolution-attach/experimental-v0` |
 | any refusal or failure | `aethyme.collab-error/experimental-v0` |
 
 Resolution handoff commands are local and experimental. Every success object
@@ -590,6 +591,16 @@ attempt, session label, request record/object and input-manifest digest.
 Its `outcome` describes the resolution result; successful command execution
 does not mean synthesis succeeded. Synthesized results require fresh
 verification and are retained without wave attachment or acceptance.
+
+`attach` requires `--attempt`, the exact request record/object, and current
+`--target`, `--issuer`, `--wave`, `--version` authority. It links only a settled
+synthesized result covering every selected wave contribution. Partial groups
+remain held. The returned `wave_id`, `phase`, `candidate_snapshot`,
+`candidate_commit` and exact `result` reference describe unverified source;
+`attached_to_wave` and `requires_fresh_verification` are true. No gate receipt,
+publication or acceptance is created. Repeating an identical attachment with
+the original expected version is idempotent only while authority and wave
+currentness still hold. Historical import alone grants no attachment authority.
 
 A refusal or failure is printed on stdout in `--json` mode:
 
