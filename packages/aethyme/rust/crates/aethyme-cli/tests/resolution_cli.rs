@@ -112,6 +112,16 @@ fn resolution_commands_route_and_refuse_uninitialized_state_without_creating_it(
             "not-opened.json",
         ],
     ];
+    let attach = [
+        "attach",
+        "--attempt",
+        "unexported",
+        "--request",
+        &digest,
+        "--object",
+        &digest,
+    ];
+    let attach_cases: &[&[&str]] = &[&attach];
     let marks: &[&[&str]] = &[
         &[
             "mark-dispatching",
@@ -130,9 +140,9 @@ fn resolution_commands_route_and_refuse_uninitialized_state_without_creating_it(
             detail,
         ],
     ];
-    for args in cases.iter().chain(marks) {
+    for args in cases.iter().chain(marks).chain(attach_cases) {
         let mut arguments = args.to_vec();
-        if matches!(args[0], "prepare" | "mark-dispatching") {
+        if matches!(args[0], "prepare" | "mark-dispatching" | "attach") {
             arguments.extend([
                 "--target",
                 "target",

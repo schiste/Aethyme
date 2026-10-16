@@ -303,6 +303,55 @@ pub(super) fn import(root: &Path, rest: &[&str]) -> Result<Output, Failure> {
     )
 }
 
+/// Link a settled, exact request result under current controller authority.
+/// The wave API performs both initial and idempotent currentness checks.
+pub(super) fn attach(root: &Path, rest: &[&str]) -> Result<Output, Failure> {
+    let flags = Flags::parse(
+        rest,
+        &[
+            "--attempt",
+            "--request",
+            "--object",
+            "--target",
+            "--issuer",
+            "--wave",
+            "--version",
+        ],
+        &[],
+    )?;
+    let current = CurrentWave::parse(&flags)?;
+    let record = request(&flags)?;
+    let token = flags.one("--attempt")?;
+    let mut store = open(root)?;
+    let owner = existing_owner(&mut store, current.target, current.issuer)?;
+    let _authority = local_target::authorize(&store, &owner).map_err(target_error)?;
+    let wave = local_wave::attach_synthesized_attempt_result(
+        &mut store,
+        &owner,
+        root,
+        &current.wave,
+        current.version,
+        &record,
+        token,
+        &std::sync::atomic::AtomicBool::new(false),
+    )
+    .map_err(wave_error)?;
+    let result = wave
+        .resolution_result
+        .as_ref()
+        .ok_or_else(|| Failure::domain("state", "attached wave has no retained result".into()))?;
+    output(
+        "aethyme.collab-resolution-attach/experimental-v0",
+        json!({
+            "wave_id":wave.id.as_str(),"phase":wave.phase,
+            "candidate_snapshot":wave.candidate_snapshot.as_ref().map(SourceSnapshotId::as_str),
+            "candidate_commit":wave.candidate_commit.as_ref().map(crate::collaboration_archive::CommitOid::as_str),
+            "result":{"record_id":result.id.as_str(),"object_sha256":result.object.hex()},
+            "attached_to_wave":true,"requires_fresh_verification":true,
+        }),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -318,6 +367,7 @@ mod tests {
             packet,
             input,
             import,
+            attach,
         ] {
             assert_eq!(command(dir.path(), &[]).unwrap_err().code, "usage");
             assert_eq!(
@@ -435,6 +485,15 @@ mod tests {
 
     #[test]
     fn resolution_commands_complete_a_bound_round_trip() {
+        complete_bound_round_trip(false);
+    }
+
+    #[test]
+    fn resolution_commands_attach_synthesis_under_current_authority() {
+        complete_bound_round_trip(true);
+    }
+
+    fn complete_bound_round_trip(synthesize: bool) {
         use crate::local_target::tests::{Fixture, git};
         use crate::{local_target as target, local_wave as wave};
         use std::sync::atomic::AtomicBool;
@@ -621,13 +680,19 @@ mod tests {
         ]);
         assert_eq!(input["exit"], 0, "{input}");
         assert_eq!(input["value"]["file"]["sha256"], entry["sha256"]);
+        let response = if synthesize {
+            json!({"kind":"proposal","brief":"Repair the retained Playground source",
+                "writes":[{"path":"one.txt","kind":"regular","bytes_hex":"72657061697265640a"}]})
+        } else {
+            json!({"kind":"unresolved", "detail":"no safe change from this local reviewer"})
+        };
         let proposal = files.path().join("response.json");
         std::fs::write(&proposal, serde_json::to_vec(&json!({
             "schema":resolution_api::ASYNC_RESPONSE_ENVELOPE_SCHEMA,
             "attempt_token":token, "session_label":"local-reviewer",
             "request_record_id":request.id.as_str(), "request_object_sha256":request.object.hex(),
             "input_manifest_sha256":manifest["sha256"],
-            "response":{"kind":"unresolved", "detail":"no safe change from this local reviewer"},
+            "response":response,
         })).unwrap()).unwrap();
         let import_args = [
             "resolution",
@@ -682,7 +747,14 @@ mod tests {
         assert_eq!(unknown["value"]["status"]["state"], "outcome_unknown");
         let imported = invoke(&import_args);
         assert_eq!(imported["exit"], 0, "{imported}");
-        assert_eq!(imported["value"]["outcome"], "unresolved");
+        assert_eq!(
+            imported["value"]["outcome"],
+            if synthesize {
+                "synthesized"
+            } else {
+                "unresolved"
+            }
+        );
         assert_eq!(imported["value"]["attached_to_wave"], false);
         assert_eq!(imported["value"]["grants_acceptance"], false);
         assert_ne!(
@@ -690,6 +762,50 @@ mod tests {
             0,
             "settled response cannot be imported twice"
         );
+        if synthesize {
+            let mut attach_args = vec![
+                "resolution",
+                "attach",
+                "--attempt",
+                token,
+                "--request",
+                request.id.as_str(),
+                "--object",
+                &object,
+            ];
+            attach_args.extend(context);
+            let before = wave::load(&fixture.store, &pending.id).unwrap();
+            assert!(before.resolution_result.is_none());
+            let mut stale_attach = attach_args.clone();
+            *stale_attach.last_mut().unwrap() = &stale_version;
+            assert_ne!(invoke(&stale_attach)["exit"], 0);
+            assert_eq!(wave::load(&fixture.store, &pending.id).unwrap(), before);
+            let wrong_object = format!("sha256:{}", "e".repeat(64));
+            let mut mismatched_attach = attach_args.clone();
+            mismatched_attach[7] = &wrong_object;
+            assert_ne!(invoke(&mismatched_attach)["exit"], 0);
+            assert_eq!(wave::load(&fixture.store, &pending.id).unwrap(), before);
+            let attached = invoke(&attach_args);
+            assert_eq!(attached["exit"], 0, "{attached}");
+            assert_eq!(
+                attached["value"]["schema"],
+                "aethyme.collab-resolution-attach/experimental-v0"
+            );
+            assert_eq!(attached["value"]["attached_to_wave"], true);
+            assert_eq!(attached["value"]["requires_fresh_verification"], true);
+            assert_eq!(attached["value"]["dispatches_agent"], false);
+            assert_eq!(attached["value"]["grants_acceptance"], false);
+            let linked = wave::load(&fixture.store, &pending.id).unwrap();
+            assert!(linked.resolution_result.is_some());
+            assert_ne!(linked.candidate_snapshot, before.candidate_snapshot);
+            assert_ne!(linked.candidate_commit, before.candidate_commit);
+            assert_eq!(linked.phase, wave::WavePhase::Verifying);
+            let replay = invoke(&attach_args);
+            assert_eq!(replay["exit"], 0, "{replay}");
+            assert_eq!(replay["value"], attached["value"]);
+            assert_eq!(wave::load(&fixture.store, &pending.id).unwrap(), linked);
+            assert_ne!(invoke(&stale_attach)["exit"], 0);
+        }
         let status = invoke(&[
             "resolution",
             "status",
