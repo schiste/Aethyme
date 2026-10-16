@@ -1759,7 +1759,7 @@ fn exact_content_neutral_integration_merges_ignore_parent_tree_equality() {
 }
 
 #[test]
-fn normalized_replay_refuses_missing_baseline_and_owned_merge_commits() {
+fn normalized_replay_refuses_missing_baseline() {
     let missing_tmp = tempfile::tempdir().unwrap();
     init_repo(missing_tmp.path());
     let mut missing_broker = Broker::open(missing_tmp.path()).unwrap();
@@ -1814,56 +1814,188 @@ fn normalized_replay_refuses_missing_baseline_and_owned_merge_commits() {
         2,
         "each refusal remains auditable without a live queue row"
     );
+}
 
-    let merge_tmp = tempfile::tempdir().unwrap();
-    init_repo(merge_tmp.path());
-    let mut merge_broker = Broker::open(merge_tmp.path()).unwrap();
-    let merge_worktree = agent_worktree(merge_tmp.path(), "merge-commit");
-    let merge_session = merge_broker.adopt(&merge_worktree, None).unwrap();
-    let baseline = resolve(&merge_worktree, "HEAD");
-    sh(&merge_worktree, &["branch", "side", &baseline]);
-    commit_edit(&merge_worktree, "src/a.py", "a = 7\n");
-    sh(&merge_worktree, &["checkout", "side"]);
-    commit_edit(&merge_worktree, "src/b.py", "b = 7\n");
-    sh(&merge_worktree, &["checkout", "agent/merge-commit"]);
+fn owned_merge_fixture() -> (
+    tempfile::TempDir,
+    Broker,
+    std::path::PathBuf,
+    aethyme_broker::Session,
+) {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    let mut broker = Broker::open(tmp.path()).unwrap();
+    let worktree = agent_worktree(tmp.path(), "merge-commit");
+    let session = broker.adopt(&worktree, None).unwrap();
+    let baseline = resolve(&worktree, "HEAD");
+    sh(&worktree, &["branch", "side", &baseline]);
+    commit_edit(&worktree, "src/a.py", "a = 7\n");
+    sh(&worktree, &["checkout", "side"]);
+    commit_edit(&worktree, "src/b.py", "b = 7\n");
+    sh(&worktree, &["checkout", "agent/merge-commit"]);
     sh(
-        &merge_worktree,
+        &worktree,
         &["merge", "--no-ff", "side", "-m", "owned merge"],
     );
-    let merge_head = resolve(&merge_worktree, "HEAD");
-    let merge_error = merge_broker.submit(merge_session.id).unwrap_err();
-    let remediation = merge_error.to_string();
-    let recovery_branch = format!(
-        "aethyme/recovery/session-{}-{}",
-        merge_session.id,
-        &merge_head[..12]
+    (tmp, broker, worktree, session)
+}
+
+#[test]
+fn owned_merge_history_is_gated_exactly_and_preserved_without_ref_writes_during_planning() {
+    let (tmp, mut broker, worktree, session) = owned_merge_fixture();
+    let source = resolve(&worktree, "HEAD");
+    let source_tree = resolve(&worktree, "HEAD^{tree}");
+    let (_, base) = broker.integration_head().unwrap();
+    let main = resolve(tmp.path(), "main");
+    let plan = broker.submission_plan(session.id).unwrap();
+    assert!(plan.safe);
+    assert_eq!(plan.merged_tree_paths, vec!["src/a.py", "src/b.py"]);
+    assert_eq!(resolve(&worktree, "HEAD"), source);
+    assert_eq!(resolve(tmp.path(), "main"), main);
+    assert_eq!(resolve(tmp.path(), "aethyme/integration"), base);
+    assert!(broker.store().merge_queue().unwrap().is_empty());
+
+    let outcome = broker.submit(session.id).unwrap();
+    assert!(outcome.promoted, "{outcome:?}");
+    assert_eq!(
+        outcome.entry.merged_tree.as_deref(),
+        Some(source_tree.as_str())
     );
-    assert!(remediation.contains("has 2 parents"), "{remediation}");
-    assert!(
-        remediation.contains(&format!("accepted checkpoint: {baseline}")),
-        "{remediation}"
+    assert_eq!(outcome.gate_outcomes.len(), 1);
+    assert_eq!(outcome.gate_outcomes[0].tree_hash, source_tree);
+    let promoted = resolve(tmp.path(), "aethyme/integration");
+    assert_ne!(
+        promoted, source,
+        "the broker still records attribution and contract decisions"
     );
-    assert!(
-        remediation.contains(&format!("owned commit {merge_head}")),
-        "{remediation}"
+    let repo = GitRepo::discover(tmp.path()).unwrap();
+    assert_eq!(
+        repo.commit_parents(&promoted).unwrap(),
+        vec![base, source.clone()]
     );
-    let preserve = remediation
-        .find(&format!("git branch {recovery_branch} {merge_head}"))
+    assert!(repo.is_ancestor(&source, &promoted));
+    assert_eq!(file_at(tmp.path(), &promoted, "src/a.py"), "a = 7\n");
+    assert_eq!(file_at(tmp.path(), &promoted, "src/b.py"), "b = 7\n");
+    assert_eq!(resolve(&worktree, "HEAD"), source);
+    assert_eq!(resolve(tmp.path(), "main"), main);
+    assert_eq!(
+        broker
+            .store()
+            .session(session.id)
+            .unwrap()
+            .accepted_session_head
+            .as_deref(),
+        Some(source.as_str())
+    );
+    assert!(broker.submit(session.id).unwrap().no_changes);
+}
+
+#[test]
+fn owned_merge_history_preserves_manual_conflict_resolution_edits() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    let mut broker = Broker::open(tmp.path()).unwrap();
+    let worktree = agent_worktree(tmp.path(), "resolved");
+    let session = broker.adopt(&worktree, None).unwrap();
+    sh(&worktree, &["branch", "side"]);
+    commit_edit(&worktree, "src/a.py", "a = 7\n");
+    sh(&worktree, &["checkout", "side"]);
+    commit_edit(&worktree, "src/a.py", "a = 8\n");
+    sh(&worktree, &["checkout", "agent/resolved"]);
+    let output = Command::new("git")
+        .args(["merge", "--no-ff", "side", "-m", "owned merge"])
+        .current_dir(&worktree)
+        .output()
         .unwrap();
-    let reset = remediation
-        .find(&format!("git reset --soft {baseline}"))
-        .unwrap();
-    assert!(preserve < reset, "recovery must preserve HEAD before reset");
+    assert!(!output.status.success());
+    commit_edit(&worktree, "src/a.py", "a = 99\n");
+    let source = resolve(&worktree, "HEAD");
+    let tree = resolve(&worktree, "HEAD^{tree}");
+    let outcome = broker.submit(session.id).unwrap();
+    assert!(outcome.promoted, "{outcome:?}");
+    assert_eq!(outcome.gate_outcomes.len(), 1);
+    assert_eq!(outcome.gate_outcomes[0].tree_hash, tree);
+    let promoted = resolve(tmp.path(), "aethyme/integration");
+    assert_eq!(file_at(tmp.path(), &promoted, "src/a.py"), "a = 99\n");
     assert!(
-        remediation.contains(&format!(
-            "aethyme broker submit --session {}",
-            merge_session.id
-        )),
-        "{remediation}"
+        GitRepo::discover(tmp.path())
+            .unwrap()
+            .is_ancestor(&source, &promoted)
     );
-    assert!(merge_broker.store().merge_queue().unwrap().is_empty());
-    assert!(merge_broker.submit(merge_session.id).is_err());
-    assert!(merge_broker.store().merge_queue().unwrap().is_empty());
+}
+
+#[test]
+fn owned_merge_history_promotes_the_pinned_snapshot_when_the_source_branch_advances() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    std::fs::write(
+        tmp.path().join(".aethyme/config.toml"),
+        "[promote]\nmode = \"manual\"\n",
+    )
+    .unwrap();
+    let mut broker = Broker::open(tmp.path()).unwrap();
+    let worktree = agent_worktree(tmp.path(), "pinned");
+    let session = broker.adopt(&worktree, None).unwrap();
+    sh(&worktree, &["branch", "side"]);
+    commit_edit(&worktree, "src/a.py", "a = 7\n");
+    sh(&worktree, &["checkout", "side"]);
+    commit_edit(&worktree, "src/b.py", "b = 7\n");
+    sh(&worktree, &["checkout", "agent/pinned"]);
+    sh(
+        &worktree,
+        &["merge", "--no-ff", "side", "-m", "owned merge"],
+    );
+    let source = resolve(&worktree, "HEAD");
+    let pinned_tree = resolve(&worktree, "HEAD^{tree}");
+    let outcome = broker.submit(session.id).unwrap();
+    assert_eq!(outcome.entry.status, MergeStatus::Verified);
+    assert!(!outcome.promoted);
+    commit_edit(&worktree, "src/a.py", "a = 88\n");
+    let successor = resolve(&worktree, "HEAD");
+    broker.promote(outcome.entry.id).unwrap();
+    let promoted = resolve(tmp.path(), "aethyme/integration");
+    assert_eq!(
+        resolve(tmp.path(), &format!("{promoted}^{{tree}}")),
+        pinned_tree
+    );
+    assert_eq!(file_at(tmp.path(), &promoted, "src/a.py"), "a = 7\n");
+    assert_eq!(resolve(&worktree, "HEAD"), successor);
+    assert_eq!(
+        broker
+            .store()
+            .session(session.id)
+            .unwrap()
+            .accepted_session_head
+            .as_deref(),
+        Some(source.as_str())
+    );
+    let next = broker.submit(session.id).unwrap();
+    assert_eq!(next.entry.status, MergeStatus::Verified);
+    broker.promote(next.entry.id).unwrap();
+    assert_eq!(
+        file_at(tmp.path(), "aethyme/integration", "src/a.py"),
+        "a = 88\n"
+    );
+}
+
+#[test]
+fn owned_merge_history_refuses_when_current_integration_is_not_an_ancestor() {
+    let (tmp, mut broker, worktree, session) = owned_merge_fixture();
+    let source = resolve(&worktree, "HEAD");
+    commit_edit(tmp.path(), "src/c.py", "c = 1\n");
+    let error = broker.submit(session.id).unwrap_err();
+    assert!(
+        matches!(
+            error,
+            aethyme_broker::BrokerOpError::UnsupportedSubmissionCommit {
+                parent_count: 2,
+                ..
+            }
+        ),
+        "{error:?}"
+    );
+    assert_eq!(resolve(&worktree, "HEAD"), source);
+    assert!(broker.store().merge_queue().unwrap().is_empty());
 }
 
 #[test]

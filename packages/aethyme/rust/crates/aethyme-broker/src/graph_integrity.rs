@@ -391,6 +391,21 @@ pub(crate) fn verify_checkout_without_mutation(
     if !policy.enforces_committed_fragments() {
         return Ok(verify_disposable_checkout(checkout, policy));
     }
+    let root_plan = crate::verification::default_worktree_root_plan(main_root);
+    verify_checkout_without_mutation_with_worktree_root_plan(
+        main_root, checkout, policy, &root_plan,
+    )
+}
+
+pub(crate) fn verify_checkout_without_mutation_with_worktree_root_plan(
+    main_root: &Path,
+    checkout: &crate::GitRepo,
+    policy: &GraphIntegrityPolicy,
+    root_plan: &crate::WorktreeRootPlan,
+) -> Result<GraphIntegrityOutcome, crate::BrokerOpError> {
+    if !policy.enforces_committed_fragments() {
+        return Ok(verify_disposable_checkout(checkout, policy));
+    }
     let tree = checkout.working_tree_hash()?;
     let head = checkout.head_commit()?;
     let commit = checkout.commit_tree(
@@ -399,8 +414,11 @@ pub(crate) fn verify_checkout_without_mutation(
         "chore(broker): materialize exact graph-integrity verification tree",
         &crate::attribution::Attribution::broker_only(),
     )?;
-    let mut slot =
-        crate::verification::ExactTreeVerificationSlot::acquire(main_root, "graph-integrity")?;
+    let mut slot = crate::verification::ExactTreeVerificationSlot::acquire_with_worktree_root_plan(
+        main_root,
+        "graph-integrity",
+        root_plan,
+    )?;
     let disposable = slot.materialize(checkout, &commit)?;
     let outcome = verify_disposable_checkout(&disposable, policy);
     slot.cleanup();
@@ -414,26 +432,67 @@ pub(crate) fn verify_checkout_without_mutation(
 /// checkout error -- becomes an `Error` outcome, reported as `unknown`, and
 /// never an error that could stop the merge. `None` means the repository does
 /// not declare committed graph fragments authoritative.
+#[cfg(test)]
 pub(crate) fn verify_commit_for_advice(
     main_root: &Path,
     checkout: &crate::GitRepo,
     commit: &str,
 ) -> Option<GraphIntegrityOutcome> {
-    let unknown = |policy_digest: String, reason: String| {
-        Some(graph_error(String::new(), policy_digest, None, reason))
-    };
     let policy = match GraphIntegrityPolicy::load(checkout.root()) {
         Ok(policy) => policy,
         Err(error) => {
-            return unknown(
+            return Some(graph_error(
                 String::new(),
+                String::new(),
+                None,
                 format!("cannot read the graph policy: {error}"),
-            );
+            ));
         }
     };
     if !policy.enforces_committed_fragments() {
         return None;
     }
+    let root_plan = crate::verification::default_worktree_root_plan(main_root);
+    Some(verify_commit_for_advice_with_policy_and_worktree_root_plan(
+        main_root, checkout, commit, &root_plan, policy,
+    ))
+}
+
+pub(crate) fn verify_commit_for_advice_with_worktree_root_plan(
+    main_root: &Path,
+    checkout: &crate::GitRepo,
+    commit: &str,
+    root_plan: &crate::WorktreeRootPlan,
+) -> Option<GraphIntegrityOutcome> {
+    let policy = match GraphIntegrityPolicy::load(checkout.root()) {
+        Ok(policy) => policy,
+        Err(error) => {
+            return Some(graph_error(
+                String::new(),
+                String::new(),
+                None,
+                format!("cannot read the graph policy: {error}"),
+            ));
+        }
+    };
+    if !policy.enforces_committed_fragments() {
+        return None;
+    }
+    Some(verify_commit_for_advice_with_policy_and_worktree_root_plan(
+        main_root, checkout, commit, root_plan, policy,
+    ))
+}
+
+fn verify_commit_for_advice_with_policy_and_worktree_root_plan(
+    main_root: &Path,
+    checkout: &crate::GitRepo,
+    commit: &str,
+    root_plan: &crate::WorktreeRootPlan,
+    policy: GraphIntegrityPolicy,
+) -> GraphIntegrityOutcome {
+    let unknown = |policy_digest: String, reason: String| {
+        graph_error(String::new(), policy_digest, None, reason)
+    };
     let policy_digest = policy.digest();
     if checkout
         .resolve_ref(&format!("{commit}^{{commit}}"))
@@ -445,8 +504,11 @@ pub(crate) fn verify_commit_for_advice(
         );
     }
     let mut slot =
-        match crate::verification::ExactTreeVerificationSlot::acquire(main_root, "graph-integrity")
-        {
+        match crate::verification::ExactTreeVerificationSlot::acquire_with_worktree_root_plan(
+            main_root,
+            "graph-integrity",
+            root_plan,
+        ) {
             Ok(slot) => slot,
             Err(error) => {
                 return unknown(
@@ -465,7 +527,7 @@ pub(crate) fn verify_commit_for_advice(
         ),
     };
     slot.cleanup();
-    Some(outcome)
+    outcome
 }
 
 #[derive(Debug, thiserror::Error)]

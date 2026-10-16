@@ -35,8 +35,8 @@ pub const LEGACY_GIT_REPLAY_PROFILE: &str = "legacy-git-replay/v0";
 /// What built a candidate.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Producer {
-    /// `submit`'s replay of the session's pending commits, one
-    /// `git merge-tree` per commit.
+    /// `submit`'s Git path: normalized pending patches, or the exact tree
+    /// of a fully proven owned merge DAG based on current integration.
     LegacyGitReplay,
     /// A composer running the named profile (#664).
     Composer { profile: String },
@@ -62,6 +62,9 @@ pub enum CompositionMode {
     Text,
     Structural,
     Hybrid,
+    /// The producer retained an exact existing source tree without merging
+    /// its content. Makes no text or structural engine claim.
+    Preserved,
     /// A bounded resolver wrote the content (#665). Never verified by being
     /// produced: the candidate is checked again as its own candidate.
     Synthesized,
@@ -73,6 +76,7 @@ impl CompositionMode {
             Self::Text => "text",
             Self::Structural => "structural",
             Self::Hybrid => "hybrid",
+            Self::Preserved => "preserved",
             Self::Synthesized => "synthesized",
         }
     }
@@ -215,8 +219,8 @@ impl Refusal {
 /// Inputs the producer cannot represent at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Unsupported {
-    /// A pending input commit has more than one parent; the legacy replay
-    /// applies only linear history.
+    /// A pending input merge lacks the proof needed to retain its complete
+    /// owned history; first-parent patch replay cannot represent it safely.
     MergeCommit,
     /// The candidate holds an entry a #652 snapshot cannot name (a gitlink,
     /// say), so it has no subject.
@@ -431,6 +435,11 @@ impl Broker {
                     });
                 }
             };
+        let mode = if replay.retains_source_history() {
+            CompositionMode::Preserved
+        } else {
+            CompositionMode::Text
+        };
         Ok(CompositionOutcome::Candidate(Candidate {
             subject,
             tree: replay.tree,
@@ -439,7 +448,7 @@ impl Broker {
             baseline_source,
             inputs,
             producer: Producer::LegacyGitReplay,
-            mode: CompositionMode::Text,
+            mode,
         }))
     }
 
