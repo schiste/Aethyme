@@ -1615,6 +1615,76 @@ fn comparable_attempts(
     Ok(count)
 }
 
+/// Whether one stored managed-attempt row is the exact canonical decision
+/// represented by this already validated request.
+pub(crate) fn managed_attempt_decision_matches(
+    request: &ResolutionRequest,
+    key: &str,
+    kind: &str,
+    members: &str,
+    paths: &str,
+) -> bool {
+    request.decision.key() == key
+        && request.decision.kind == kind
+        && join_set(&request.decision.members) == members
+        && join_set(&request.decision.paths) == paths
+}
+
+fn decode_canonical_decision_set(value: &str) -> Result<BTreeSet<String>, ResolutionError> {
+    if value.len() > MAX_DOCUMENT_BYTES {
+        return Err(invalid(
+            "managed attempt decision set exceeds the size limit",
+        ));
+    }
+    let set = split_set(value);
+    if join_set(&set) != value {
+        return Err(invalid("managed attempt decision set is not canonical"));
+    }
+    Ok(set)
+}
+
+/// Whether an unresolved async managed attempt reserves a comparable
+/// contribution/path decision. The durable key is rederived from its bounded,
+/// canonical member/path sets before it can block admission.
+pub(crate) fn has_unresolved_managed_comparable_in_transaction(
+    connection: &rusqlite::Connection,
+    request: &ResolutionRequest,
+) -> Result<bool, ResolutionError> {
+    let mut statement = connection.prepare(
+        "SELECT decision_key,members,paths FROM resolution_attempts
+         WHERE kind=?1 AND resolver='local-managed-resolution'
+           AND session_label IS NULL AND outcome IS NULL
+           AND async_state IN ('dispatching','outcome_unknown')
+         ORDER BY attempt_id",
+    )?;
+    let rows = statement.query_map([request.decision.kind], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    })?;
+    for row in rows {
+        let (key, raw_members, raw_paths) = row?;
+        let members = decode_canonical_decision_set(&raw_members)?;
+        let paths = decode_canonical_decision_set(&raw_paths)?;
+        let stored = Decision {
+            kind: request.decision.kind,
+            members,
+            paths,
+        };
+        if stored.key() != key {
+            return Err(invalid(
+                "unresolved managed attempt decision key does not match",
+            ));
+        }
+        if request.decision.comparable(&stored.members, &stored.paths) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn attempts_used(store: &CollaborationStore, decision: &Decision) -> Result<u32, ResolutionError> {
     let connection = store.read_connection();
     let exists: Option<i64> = connection
@@ -4719,6 +4789,129 @@ mod tests {
             paths: set(&["x"]),
         };
         assert!(!conflict.comparable(&set(&["a", "b"]), &set(&["y"])));
+    }
+
+    fn managed_decision_request(members: &[&str], paths: &[&str]) -> ResolutionRequest {
+        let set = |items: &[&str]| items.iter().map(|item| (*item).to_owned()).collect();
+        let baseline = RetainedSnapshot {
+            snapshot_id: SourceSnapshotId::parse(&format!("sha256:{}", "0".repeat(64))).unwrap(),
+            record_id: RecordId::parse(&format!("sha256:{}", "1".repeat(64))).unwrap(),
+            commit: CommitOid::parse(&"a".repeat(40)).unwrap(),
+            entry_count: 0,
+            content_bytes: 0,
+        };
+        ResolutionRequest {
+            record: None,
+            decision: Decision {
+                kind: "conflict",
+                members: set(members),
+                paths: set(paths),
+            },
+            decision_members: Vec::new(),
+            members: Vec::new(),
+            contents: Vec::new(),
+            trigger: Trigger::Conflict(Vec::new()),
+            baseline: baseline.clone(),
+            accumulator: baseline,
+            requirements: Vec::new(),
+            scope: Vec::new(),
+            protection: Protection {
+                harness: BTreeSet::new(),
+                gate_files: BTreeSet::new(),
+                security_patterns: Vec::new(),
+                security: None,
+            },
+            preference: None,
+            allowance: Allowance { limit: 3, used: 0 },
+        }
+    }
+
+    #[test]
+    fn managed_attempt_rows_match_exact_bindings_and_hold_subset_or_superset_decisions() {
+        let request = managed_decision_request(&["a", "b"], &["src/a", "src/b"]);
+        let key = request.decision.key();
+        assert!(managed_attempt_decision_matches(
+            &request,
+            &key,
+            "conflict",
+            "a\nb",
+            "src/a\nsrc/b",
+        ));
+        assert!(!managed_attempt_decision_matches(
+            &request,
+            &key,
+            "conflict",
+            "b\na",
+            "src/a\nsrc/b",
+        ));
+
+        let connection = rusqlite::Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE resolution_attempts (
+                    attempt_id INTEGER PRIMARY KEY,
+                    decision_key TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    members TEXT NOT NULL,
+                    paths TEXT NOT NULL,
+                    resolver TEXT NOT NULL,
+                    session_label TEXT,
+                    outcome TEXT,
+                    async_state TEXT
+                );",
+            )
+            .unwrap();
+
+        let set = |items: &[&str]| items.iter().map(|item| (*item).to_owned()).collect();
+        for (members, paths) in [
+            (vec!["a"], vec!["src/a"]),
+            (vec!["a", "b", "c"], vec!["src/a", "src/b", "src/c"]),
+        ] {
+            let stored = Decision {
+                kind: "conflict",
+                members: set(&members),
+                paths: set(&paths),
+            };
+            connection
+                .execute(
+                    "INSERT INTO resolution_attempts
+                     (decision_key,kind,members,paths,resolver,session_label,outcome,async_state)
+                     VALUES(?1,?2,?3,?4,'local-managed-resolution',NULL,NULL,'outcome_unknown')",
+                    rusqlite::params![
+                        stored.key(),
+                        stored.kind,
+                        join_set(&stored.members),
+                        join_set(&stored.paths),
+                    ],
+                )
+                .unwrap();
+            assert!(
+                has_unresolved_managed_comparable_in_transaction(&connection, &request).unwrap()
+            );
+            connection
+                .execute("DELETE FROM resolution_attempts", [])
+                .unwrap();
+        }
+
+        let unrelated = Decision {
+            kind: "conflict",
+            members: set(&["a", "b"]),
+            paths: set(&["src/c"]),
+        };
+        connection
+            .execute(
+                "INSERT INTO resolution_attempts
+                 (decision_key,kind,members,paths,resolver,session_label,outcome,async_state)
+                 VALUES(?1,?2,?3,?4,'local-managed-resolution',NULL,NULL,'dispatching')",
+                rusqlite::params![
+                    unrelated.key(),
+                    unrelated.kind,
+                    join_set(&unrelated.members),
+                    join_set(&unrelated.paths),
+                ],
+            )
+            .unwrap();
+        assert!(!has_unresolved_managed_comparable_in_transaction(&connection, &request).unwrap());
     }
 
     #[test]
