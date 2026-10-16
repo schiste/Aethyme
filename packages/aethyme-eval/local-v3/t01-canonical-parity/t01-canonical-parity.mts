@@ -206,6 +206,65 @@ const FROZEN_SOURCES = [
   },
 ] as const;
 
+type FrozenSourcePin = { path: string; sha256: string };
+
+const LOCAL_STATE26_PROFILE = {
+  name: "local-state26-e6fb95",
+  referenceCommit: "e6fb95f65f3bf91d46c1ab76136486f492529ebb",
+  canonicalJsonPath:
+    "packages/aethyme/rust/crates/aethyme-contracts/src/experimental_v0/canonical_json.rs",
+  previousCanonicalJsonSha256:
+    "90070c56f613bb94564072c56076daf2428f2888f0b71e34a526b718c55b52f3",
+  canonicalJsonSha256:
+    "6bbeea89e7d5850651687382255619b2ea9d30538341ebbba51a53a0605a6a35",
+} as const;
+
+const LOCAL_STATE26_SOURCES = (() => {
+  const canonicalJsonPins = FROZEN_SOURCES.filter(
+    (source) => source.path === LOCAL_STATE26_PROFILE.canonicalJsonPath,
+  );
+  if (
+    canonicalJsonPins.length !== 1 ||
+    canonicalJsonPins[0].sha256 !==
+      LOCAL_STATE26_PROFILE.previousCanonicalJsonSha256
+  ) {
+    throw new Error("T01 source profile pin setup is inconsistent");
+  }
+
+  return FROZEN_SOURCES.map((source) =>
+    source.path === LOCAL_STATE26_PROFILE.canonicalJsonPath
+      ? { ...source, sha256: LOCAL_STATE26_PROFILE.canonicalJsonSha256 }
+      : source,
+  );
+})();
+
+type T01SourceSelection = {
+  sourceProfile?: typeof LOCAL_STATE26_PROFILE.name;
+  referenceCommit: string;
+  sources: readonly FrozenSourcePin[];
+};
+
+function selectSourceProfile(args: readonly string[]): T01SourceSelection {
+  if (args.length === 0) {
+    return { referenceCommit: REFERENCE_COMMIT, sources: FROZEN_SOURCES };
+  }
+
+  if (args.length === 2 && args[0] === "--source-profile") {
+    if (args[1] !== LOCAL_STATE26_PROFILE.name) {
+      throw new Error(`Error: unsupported T01 source profile: ${args[1]}`);
+    }
+    return {
+      sourceProfile: LOCAL_STATE26_PROFILE.name,
+      referenceCommit: LOCAL_STATE26_PROFILE.referenceCommit,
+      sources: LOCAL_STATE26_SOURCES,
+    };
+  }
+
+  throw new Error(
+    `Error: unsupported T01 command-line arguments: ${args.join(" ")}`,
+  );
+}
+
 const BRIEF_TOKEN_VECTORS_PATH =
   "packages/aethyme/rust/crates/aethyme-contracts/fixtures/experimental-v0/brief_tokens.json";
 const BRIEF_VECTORS_PATH =
@@ -275,7 +334,7 @@ function refusalCode(operation: () => unknown): string | undefined {
   }
 }
 
-function readFrozenSources(): {
+function readFrozenSources(sourcePins: readonly FrozenSourcePin[]): {
   canonical: CanonicalVectors;
   records: RecordVectors;
   snapshots: SnapshotVectors;
@@ -287,7 +346,7 @@ function readFrozenSources(): {
   const hashes: Array<{ path: string; sha256: string }> = [];
   const contents = new Map<string, Buffer>();
 
-  for (const source of FROZEN_SOURCES) {
+  for (const source of sourcePins) {
     const content = readFileSync(resolve(REPO_ROOT, source.path));
     const actual = sha256(content);
     check(
@@ -305,9 +364,9 @@ function readFrozenSources(): {
   };
 
   return {
-    canonical: json(FROZEN_SOURCES[0].path) as CanonicalVectors,
-    records: json(FROZEN_SOURCES[1].path) as RecordVectors,
-    snapshots: json(FROZEN_SOURCES[2].path) as SnapshotVectors,
+    canonical: json(sourcePins[0].path) as CanonicalVectors,
+    records: json(sourcePins[1].path) as RecordVectors,
+    snapshots: json(sourcePins[2].path) as SnapshotVectors,
     briefTokens: json(BRIEF_TOKEN_VECTORS_PATH) as BriefTokenVectors,
     briefs: json(BRIEF_VECTORS_PATH) as BriefVectors,
     calibration: json(BRIEF_CALIBRATION_PATH) as BriefCalibrationVectors,
@@ -789,8 +848,17 @@ function currentTypeScriptSources(): Array<{ path: string; sha256: string }> {
   }));
 }
 
-function run(): void {
-  const frozen = readFrozenSources();
+function run(args: readonly string[] = process.argv.slice(2)): void {
+  let selected: T01SourceSelection;
+  try {
+    selected = selectSourceProfile(args);
+  } catch (error) {
+    console.error(error instanceof Error ? error.message : String(error));
+    process.exitCode = 2;
+    return;
+  }
+
+  const frozen = readFrozenSources(selected.sources);
   const canonical = qualifyCanonicalVectors(frozen.canonical);
   const records = qualifyRecordVectors(frozen.records);
   const snapshots = qualifySnapshotVectors(frozen.snapshots);
@@ -806,7 +874,10 @@ function run(): void {
         schema: "aethyme.local-v3.t01-t02-typescript-parity.v1",
         status: "pass",
         runtime: process.version,
-        referenceCommit: REFERENCE_COMMIT,
+        ...(selected.sourceProfile === undefined
+          ? {}
+          : { sourceProfile: selected.sourceProfile }),
+        referenceCommit: selected.referenceCommit,
         assertions: assertionCount,
         vectors: { canonicalJson: canonical, records, sourceSnapshots: snapshots, briefs },
         frozenSources: frozen.hashes,
