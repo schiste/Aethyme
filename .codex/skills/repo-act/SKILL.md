@@ -28,6 +28,11 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   `AETHYME_WORKTREE_ROOT` can otherwise place worktrees outside the fixture and
   leave stale Git pointers after teardown. Assert paths and cleanup; avoid
   process-wide environment mutation in parallel tests.
+- Isolate `AETHYME_HOST_STATE_DIR` and `AETHYME_HOST_CACHE_DIR` for CLI children
+  too: a temporary worktree root alone does not isolate startup cache cleanup
+  or the shared resource database. Library startup needs a process-owned host
+  state/cache capsule before opening a broker; later builder overrides are
+  too late to isolate that startup work.
 - Run the fastest relevant test command first.
 - For each deliberate guard-removal check, run the same named regression on
   unmodified source, with the deliberate break, and after byte-for-byte
