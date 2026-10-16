@@ -651,7 +651,11 @@ impl RemovalClaim {
             .take()
             .ok_or_else(|| invalid("removal claim has already consumed its directory handle"))?
             .remove_verified_witness(WORKTREE_ROOT_MARKER, deadline, |bytes| {
-                marker_owner_matches(record, &decode_marker(bytes)?)
+                marker_owner_matches(record, &decode_marker(bytes)?)?;
+                if !origin_is_missing(record)? {
+                    return Err(invalid("owning repository reappeared before deletion"));
+                }
+                Ok(())
             })
     }
 }
@@ -904,6 +908,30 @@ mod tests {
             "must survive changed authority"
         );
         assert_eq!(fs::read(&marker_path).unwrap(), changed);
+    }
+
+    #[test]
+    fn a_restored_origin_after_claim_revokes_deletion_before_the_first_unlink() {
+        let fixture = Fixture::new();
+        let (root, owner) = fixture.root("root");
+        fs::write(
+            root.join("retained.txt"),
+            "restored repository keeps its worktrees",
+        )
+        .unwrap();
+        fixture.register(&root, &owner);
+        fs::remove_dir(&fixture.origin).unwrap();
+        let record = inventory(&fixture.database, None).roots.remove(0);
+        let fingerprint = ownership_fingerprint(&record).unwrap();
+        let mut claim = claim_for_removal(&fixture.database, &root, &fingerprint).unwrap();
+
+        fs::create_dir(&fixture.origin).unwrap();
+        assert!(claim.remove(None).is_err());
+        assert_eq!(
+            fs::read_to_string(root.join("retained.txt")).unwrap(),
+            "restored repository keeps its worktrees"
+        );
+        assert!(root.join(WORKTREE_ROOT_MARKER).is_file());
     }
 
     #[test]

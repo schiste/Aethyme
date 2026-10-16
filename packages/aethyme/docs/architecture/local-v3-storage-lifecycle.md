@@ -38,8 +38,8 @@ Contention refuses new admission promptly and leaves cleanup pending.
 The claim retains the directory handle whose identity it verified; deletion
 does not reopen the root by its pathname. Before the first mutation, the
 deleter reads the ownership marker through that handle and checks its exact
-owner fields against the reviewed record. This is a point-in-time check under
-the cooperative-writer rules. Removal preserves its ownership marker until
+owner fields against the reviewed record, then rechecks origin absence. This
+is a point-in-time check under the cooperative-writer rules. Removal preserves its ownership marker until
 the remaining contents are gone. A deadline leaves resumable
 journal work. Unavailable registry or filesystem inspection and deletion I/O
 errors leave the candidate pending with a visible failure. Conclusively
@@ -48,6 +48,8 @@ with a visible failure and no deletion; an operator can review a fresh plan.
 Lost history requires independent recovery and may cause a fresh plan to omit
 the root. Queue completion does not imply that every
 candidate was removed: callers must inspect failures and removed roots.
+An authority change detected by the pre-unlink callback initially leaves the
+candidate pending; the next apply rechecks and retires the changed authority.
 
 Descriptor-relative deletion refuses link redirection and changed directory
 bindings. It assumes closed roots have cooperative writers; it does not freeze
