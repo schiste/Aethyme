@@ -37,7 +37,7 @@ original limits.
 
 | Local surface | Implementations | Evidence and remaining qualification |
 |---|---|---|
-| Revision identities, records, briefs and analysis envelope | #704–#710 | Independent canonical vectors and baseline AQ0 fixtures; records remain experimental |
+| Revision identities, records, briefs and analysis envelope | #704–#710/#786; #787/#788 in progress | Independent canonical vectors and baseline AQ0 fixtures; [scoped symbol qualification](local-v3-qualification/aq0-symbol-identity-2026-10-16/README.md) passed its bounded profile; explicit project/file binding and cross-language qualification remain open; records remain experimental |
 | Retained source, capture, roots and GC | #714–#719 | Capture/crash/cleanup schedules; bounded native workload and APFS retained-source pressure below; host/daemon and mid-journal exhaustion remain unqualified |
 | Bounded context and fresh analysis views | #718/#730/#731/#756/#781 | Scoped invalidation schedules, [reviewed lifecycle fixes](local-v3-qualification/analysis-view-lifecycle-2026-10-15/README.md), and [once-final FX08 campaign](local-v3-fx08-qualification.md): all 56 outcomes retained; reliable brief usefulness was not established |
 | Composition and bounded resolution | #733–#736/#755 | Historical provisional text profile plus [bounded external HTML structural profile](local-v3-e1-profile.md); semantic repair/consumer/subtraction evidence; original held-outs are not rerun; [reachable request guards](local-v3-qualification/resolution-guards-2026-10-12.json) |
@@ -54,6 +54,37 @@ original limits.
 Each artifact names its tested source. A later parent fix does not turn
 historical evidence into evidence for a newer tree. Selected regression
 executions overlap; totals are executions, not unique tests.
+
+## L1 audit findings and recorded checks
+
+The [experimental scoped symbol package](local-v3-qualification/aq0-symbol-identity-2026-10-16/README.md)
+binds its results to clean source `025103777c16607639073cbf9024d2ad0c39f72d`
+and tree `5f7ef505a452b79b01faa325662102497bcb7bff`. Its 13 focused tests
+passed before and after six intended guard-removal failures. Strict scoped
+Clippy and workspace formatting passed. All six controls failed at their intended
+assertions and restored exact source bytes. The 74-payload package retains the
+denied zero-test attempt and earlier failures separately. These two-clone symbol
+observations are advisory and do not establish an authorized shared ProjectId or
+FileId mapping.
+
+The [immutable capture replay checks](local-v3-qualification/final-integration-2026-10-15/README.md#immutable-capture-revision-replay)
+at clean source `9a15fd24f437256f9ac33700a88ee856d108db65` passed both actual
+Git base-only/result-only revision cases. Removing each revision from the request
+digest caused its corresponding intended one-test assertion failure (exit 101);
+exact source restoration was verified and both tests passed again. These are two
+distinct positive cases executed twice, with two negative controls.
+
+The audit also identified required L1 work that remains unqualified: T01/T02
+Rust/TypeScript parity, T03 explicit descriptor binding, T05 file provenance and
+D10 immutable contribution revisions for rationale-only changes. Draft #787 adds a finite eval-side Rust/TypeScript parity harness; draft #788
+adds experimental descriptor, file-lineage and immutable-revision contracts and
+their local adapters. The first TypeScript run failed a frozen Chinese token
+vector and receives no passing credit. After its reviewed generic tokenizer fix,
+source `a4b478126edc5f03b84dd8bebc3cedeab7c5947b` passed 880 assertions in the
+bounded offline run `aethyme-t01-positive-20261016-004213`, with unchanged source
+and input hashes. Mutation controls and final evidence packaging remain open.
+These additions must complete independent review and their applicable local
+checks before final combined-source qualification. Frozen fixtures are unchanged.
 
 ## Completed E1, FX08 and native integration
 
