@@ -410,9 +410,15 @@ fn collaboration_config_uses_submit_policy_and_certify_stays_read_only() {
         (check, report.certified())
     };
 
-    let (check, certified) = certify_config(
-        "[collaboration]\ncapture = \"advisory\"\nproject = \"proj-local\"\ndescriptor = \"local\"\n",
-    );
+    let (check, certified) = certify_config(&format!(
+        "[collaboration]\ncapture = \"advisory\"\nproject = \"proj-local\"\ndescriptor = {:?}\n",
+        aethyme_contracts::experimental_v0::project_identity::PROJECT_DESCRIPTOR_PATH
+    ));
+    assert_eq!(check.status, CheckStatus::Pass, "{}", check.detail);
+    assert!(certified);
+
+    let (check, certified) =
+        certify_config("[collaboration]\ncapture = \"required\"\nproject = \"proj-local\"\n");
     assert_eq!(check.status, CheckStatus::Pass, "{}", check.detail);
     assert!(certified);
 
@@ -427,6 +433,10 @@ fn collaboration_config_uses_submit_policy_and_certify_stays_read_only() {
     );
     assert!(certified);
 
+    let (check, certified) = certify_config("[collaboration]\ncapture = \"off\"\nproject = 7\n");
+    assert_eq!(check.status, CheckStatus::Pass, "{}", check.detail);
+    assert!(certified);
+
     for (text, expected) in [
         (
             "[collaboration]\ncapture = \"required\"\nproject = \"proj-local\"\nfuture = true\n",
@@ -436,10 +446,26 @@ fn collaboration_config_uses_submit_policy_and_certify_stays_read_only() {
             "[collaboration]\ncapture = \"future\"\nproject = \"proj-local\"\n",
             "capture",
         ),
+        (
+            "[collaboration]\ncapture = true\nproject = \"proj-local\"\n",
+            "capture",
+        ),
         ("[collaboration]\ncapture = \"advisory\"\n", "project"),
         (
             "[collaboration]\ncapture = \"advisory\"\nproject = \"not a key\"\n",
             "project",
+        ),
+        (
+            "[collaboration]\ncapture = \"advisory\"\nproject = 7\n",
+            "project",
+        ),
+        (
+            "[collaboration]\ncapture = \"advisory\"\nproject = \"proj-local\"\ndescriptor = 7\n",
+            "descriptor must be a string",
+        ),
+        (
+            "[collaboration]\ncapture = \"advisory\"\nproject = \"proj-local\"\ndescriptor = \"local\"\n",
+            "descriptor must be exactly",
         ),
         (
             "collaboration = \"invalid\"\n",
