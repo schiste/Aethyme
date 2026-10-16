@@ -408,6 +408,7 @@ fn validate_owner_issuer(
     Ok(())
 }
 
+#[cfg(test)]
 fn normalize(spec: TargetSpec) -> Result<TargetSpec, TargetError> {
     normalize_with_d10(spec, false)
 }
