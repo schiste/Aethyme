@@ -1,5 +1,6 @@
 import { Buffer } from "node:buffer";
 import { createHash } from "node:crypto";
+import { TextDecoder } from "node:util";
 import {
   canonicalizeValue,
   type CanonicalValue,
@@ -67,6 +68,7 @@ export class IdentityProfileError extends Error {
 
 const BASE32 = "abcdefghijklmnopqrstuvwxyz234567";
 const ALLOWED_MODES = new Set(["100644", "100755", "120000"]);
+const MAX_PATH_BYTES = 4096;
 const SNAPSHOT_DOMAIN = Buffer.from("aethyme source-snapshot v0\0", "utf8");
 const FILE_ID_DOMAIN = Buffer.from("aethyme file identity v0\0", "utf8");
 const PROPOSED_FILE_ID_DOMAIN = Buffer.from(
@@ -165,15 +167,70 @@ export function parseFileId(value: string): string {
   return value;
 }
 
+const hfsUtf8Decoder = new TextDecoder("utf-8", { fatal: true });
+
+function asciiEqualsIgnoreCase(bytes: Uint8Array, expected: string): boolean {
+  if (bytes.length !== expected.length) return false;
+  for (let index = 0; index < bytes.length; index += 1) {
+    const byte = bytes[index]!;
+    const folded = byte >= 0x41 && byte <= 0x5a ? byte + 0x20 : byte;
+    if (folded !== expected.charCodeAt(index)) return false;
+  }
+  return true;
+}
+
+function isGitComponent(component: Buffer): boolean {
+  let hfsFiltered = component;
+  try {
+    const text = hfsUtf8Decoder.decode(component);
+    hfsFiltered = Buffer.from(
+      [...text]
+        .filter((character) => {
+          const point = character.codePointAt(0)!;
+          return !(
+            (point >= 0x200c && point <= 0x200f) ||
+            (point >= 0x202a && point <= 0x202e) ||
+            (point >= 0x206a && point <= 0x206f) ||
+            point === 0xfeff
+          );
+        })
+        .join(""),
+      "utf8",
+    );
+  } catch {
+    // Rust falls back to the original bytes when a component is not UTF-8.
+  }
+  if (asciiEqualsIgnoreCase(hfsFiltered, ".git")) return true;
+
+  const colon = component.indexOf(0x3a);
+  let stem = component.subarray(0, colon < 0 ? component.length : colon);
+  let end = stem.length;
+  while (end > 0 && (stem[end - 1] === 0x2e || stem[end - 1] === 0x20)) {
+    end -= 1;
+  }
+  stem = stem.subarray(0, end);
+  return asciiEqualsIgnoreCase(stem, ".git") || asciiEqualsIgnoreCase(stem, "git~1");
+}
+
 function validatePath(path: Uint8Array): Buffer {
   const raw = Buffer.from(path);
-  if (raw.length === 0 || raw.includes(0) || raw[0] === 0x2f) {
+  if (raw.length === 0 || raw.length > MAX_PATH_BYTES || raw.includes(0) || raw[0] === 0x2f) {
     fail("invalid_path");
   }
-  for (const component of raw.toString("latin1").split("/")) {
-    if (component === "" || component === "." || component === "..") {
+  if (raw[raw.length - 1] === 0x2f) fail("invalid_path");
+  let componentStart = 0;
+  for (let index = 0; index <= raw.length; index += 1) {
+    if (index !== raw.length && raw[index] !== 0x2f) continue;
+    const component = raw.subarray(componentStart, index);
+    if (component.length === 0) fail("invalid_path");
+    if (
+      (component.length === 1 && component[0] === 0x2e) ||
+      (component.length === 2 && component[0] === 0x2e && component[1] === 0x2e) ||
+      isGitComponent(component)
+    ) {
       fail("invalid_path");
     }
+    componentStart = index + 1;
   }
   return raw;
 }
@@ -189,19 +246,37 @@ function compareRawPath(left: Uint8Array, right: Uint8Array): number {
   return Buffer.compare(Buffer.from(left), Buffer.from(right));
 }
 
+function validateSnapshotPathSet(paths: readonly Buffer[]): void {
+  const sorted = [...paths].sort(compareRawPath);
+  for (let index = 1; index < sorted.length; index += 1) {
+    if (compareRawPath(sorted[index - 1]!, sorted[index]!) === 0) {
+      fail("duplicate_path");
+    }
+  }
+  const directoryPrefixes = new Set<string>();
+  for (const path of sorted) {
+    for (let index = 0; index < path.length; index += 1) {
+      if (path[index] === 0x2f) directoryPrefixes.add(lowerHex(path.subarray(0, index)));
+    }
+  }
+  if (sorted.some((path) => directoryPrefixes.has(lowerHex(path)))) {
+    fail("file_directory_conflict");
+  }
+}
+
 function contentBytes(file: FileVector): Buffer {
   if (!ALLOWED_MODES.has(file.mode)) fail("unsupported_mode");
   return decodeLowerHex(file.content_hex);
 }
 
-function normalizedFile(file: FileVector): {
+function normalizedFile(file: FileVector, validatedPath?: Buffer): {
   path: Buffer;
   mode: string;
   content: Buffer;
   content_sha256: string;
   path_hex: string;
 } {
-  const path = validatePath(decodeLowerHex(file.path_hex));
+  const path = validatedPath ?? validatePath(decodeLowerHex(file.path_hex));
   const content = contentBytes(file);
   return {
     path,
@@ -213,13 +288,10 @@ function normalizedFile(file: FileVector): {
 }
 
 export function sourceSnapshot(entries: FileVector[]): Snapshot {
-  const files = entries.map(normalizedFile);
+  const paths = entries.map((file) => validatePath(decodeLowerHex(file.path_hex)));
+  validateSnapshotPathSet(paths);
+  const files = entries.map((file, index) => normalizedFile(file, paths[index]!));
   files.sort((left, right) => compareRawPath(left.path, right.path));
-  for (let index = 1; index < files.length; index += 1) {
-    if (compareRawPath(files[index - 1]!.path, files[index]!.path) === 0) {
-      fail("duplicate_path");
-    }
-  }
 
   const manifestParts: Buffer[] = [SNAPSHOT_DOMAIN];
   for (const file of files) {

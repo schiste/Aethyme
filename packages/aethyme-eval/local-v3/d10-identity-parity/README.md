@@ -1,4 +1,4 @@
-# D10 TypeScript identity parity (provisional source checkpoint)
+# D10 TypeScript identity parity
 
 Last Updated: 2026-10-16
 
@@ -18,10 +18,10 @@ The runner rejects invalid ContributionIds and FileIds before identity hashing a
 
 ## Qualification coverage
 
-The finite harness checks descriptor canonical bytes and immutable RecordId, enrolled/proposed FileIds, source snapshots, raw-path ordering, explicit Rename identity preservation, Copy/Split/plain-new ordinals, immutable ContributionRevision IDs, and no-hash validation refusals. ContributionRevision source changes are validated for relation shape, fields, canonical FileIds, strict raw-path order, and the Rust change-count cap before hashing. The fixed pin manifest must cover exactly the reviewed Rust sources, TypeScript sources, and 20 frozen vector files, and binds the expected Rust contract source commit.
+The finite harness checks descriptor canonical bytes and immutable RecordId, enrolled/proposed FileIds, source snapshots, raw-path ordering, explicit Rename identity preservation, Copy/Split/plain-new ordinals, immutable ContributionRevision IDs, and no-hash validation refusals. It consumes both the generic `proposal-new-file` seed golden and the ContributionId-bound seed golden. Source paths match Rust `SourceSnapshot::new`: the 4096-byte cap, raw-byte component checks, protected `.git` aliases (case, HFS-ignorable, NTFS stream/trailing-dot/space and 8.3 forms), duplicate paths, and file/directory-prefix conflicts. Snapshot path sets are preflighted before the adapter hashes content or identities. ContributionRevision source changes are validated for relation shape, fields, canonical FileIds, strict raw-path order, and the Rust change-count cap before hashing. `source-pins.json` covers the exact reviewed Rust source set, TypeScript source set, and 20 frozen vector files, and binds the Rust contract source commit.
 
 ## Pending qualification work
 
-This checkpoint is source-only and **UNRUN**. `d10-identity-parity.mts` expects `source-pins.json`, which will be added only after the contract author freezes the final Rust source commit; the corrected bound-file ContributionRevision golden is already frozen and preserved above. Node qualification, intended-failure controls, and their retained output have not been run or claimed in this checkpoint. No Cargo or native product runtime is used by the intended qualification.
+This checkpoint is source-only and **UNRUN**. `source-pins.json` binds Rust contract source commit `324a493208517ba12f537c9e6a4ec7f608af322f` to its source bytes and pins the authored TypeScript sources and all 20 preserved fixture files. Node qualification, intended-failure controls, and their retained output have not been run or claimed in this checkpoint. No Cargo or native product runtime is used by the intended qualification.
 
-The adapter covers descriptor canonical bytes and immutable RecordId, enrolled and proposed FileIds, source snapshots, source changes, Rename/Copy/Split/plain-new identity behavior, operation-order invariance, and four immutable ContributionRevision goldens. The corrected bound-file and Rename ContributionRevision records come from independent standard-library-only oracles. The preserved invalid v1/v2 packages remain provenance only.
+The adapter covers descriptor canonical bytes and immutable RecordId, enrolled and proposed FileIds, source snapshots, source changes, Rename/Copy/Split/plain-new identity behavior, operation-order invariance, and four immutable ContributionRevision goldens. The generic-seed minimal new-file, corrected bound-file, and Rename expectations come from independent standard-library-only oracles. The preserved invalid v1/v2 packages remain provenance only.

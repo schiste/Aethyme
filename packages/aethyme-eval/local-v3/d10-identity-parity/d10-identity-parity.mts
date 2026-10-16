@@ -110,7 +110,7 @@ const EXPECTED_BOUND_REVISION_MANIFEST_SHA256 =
 const EXPECTED_RENAME_MANIFEST_SHA256 =
   "6fb13ac0e523d65efcaece433353e3fe787aaf09eb90cebab35804bafcc287e0";
 const EXPECTED_QUALIFICATION_SOURCE_COMMIT =
-  "5a941df666eeb8c477ed0e2eda3e67610713d9bc";
+  "324a493208517ba12f537c9e6a4ec7f608af322f";
 const EXPECTED_FIXTURE_SOURCE_COMMIT =
   "fcd5ed940b4d906452e4ad1d3aa90eb767f1af45";
 const REQUIRED_RUST_SOURCES = [
@@ -473,6 +473,60 @@ function run(): void {
     "invalid ContributionIds or proposal tokens were checked after identity hashing",
   );
 
+  const invalidPathCases: Array<{ path: Buffer; label: string }> = [
+    { path: Buffer.alloc(4097, 0x61), label: "path longer than Rust's 4096-byte cap" },
+    { path: Buffer.from(".GIT/config", "ascii"), label: "case-insensitive .git path alias" },
+    { path: Buffer.from(".g\u200cit/config", "utf8"), label: "HFS-ignorable .git path alias" },
+    { path: Buffer.from(".git. /config", "ascii"), label: "NTFS trailing-dot/space .git alias" },
+    { path: Buffer.from(".git::$INDEX_ALLOCATION/config", "ascii"), label: "NTFS alternate-stream .git alias" },
+    { path: Buffer.from("git~1/config", "ascii"), label: "NTFS 8.3 .git path alias" },
+  ];
+  for (const { path, label } of invalidPathCases) {
+    resetHashCallCount();
+    expectProfileError(
+      "invalid_path",
+      () => sourceSnapshot([{ path_hex: path.toString("hex"), mode: "100644", content_hex: "" }]),
+      label,
+    );
+    check(getHashCallCount() === 0, `${label}: rejected only after hashing`);
+  }
+  resetHashCallCount();
+  const maximumLengthPath = Buffer.alloc(4096, 0x61);
+  const maximumLengthSnapshot = sourceSnapshot([
+    { path_hex: maximumLengthPath.toString("hex"), mode: "100644", content_hex: "" },
+  ]);
+  check(
+    maximumLengthSnapshot.files_sorted_by_raw_path[0]?.path_hex ===
+      maximumLengthPath.toString("hex") &&
+      getHashCallCount() > 0,
+    "the exact 4096-byte source path limit was not accepted as Rust accepts it",
+  );
+  resetHashCallCount();
+  expectProfileError(
+    "file_directory_conflict",
+    () =>
+      sourceSnapshot([
+        { path_hex: "61", mode: "100644", content_hex: "" },
+        { path_hex: "612f62", mode: "100644", content_hex: "" },
+      ]),
+    "snapshot rejects a file that is also another path's directory prefix",
+  );
+  check(
+    getHashCallCount() === 0,
+    "file/directory conflict was rejected only after hashing",
+  );
+  resetHashCallCount();
+  const opaqueInvalidUtf8Path = Buffer.from([0x2e, 0x67, 0xff, 0x69, 0x74, 0x2f, 0x78]);
+  const opaqueInvalidUtf8Snapshot = sourceSnapshot([
+    { path_hex: opaqueInvalidUtf8Path.toString("hex"), mode: "100644", content_hex: "" },
+  ]);
+  check(
+    opaqueInvalidUtf8Snapshot.files_sorted_by_raw_path[0]?.path_hex ===
+      opaqueInvalidUtf8Path.toString("hex") &&
+      getHashCallCount() > 0,
+    "non-UTF-8 raw path bytes were normalized as a .git alias instead of preserved",
+  );
+
   const verifiedHashes = verifyPins(pins);
   const ordinalManifestSha = directSha256(
     readFileSync(resolve(HERE, "vectors/ordinal-supplement/manifest.json")),
@@ -656,6 +710,65 @@ function run(): void {
     priorV2Expected.contribution_revisions.rationale_only_changed_members.join(",") ===
       "brief_object_sha256,brief_record_id",
     "rationale-only golden changed fields unexpectedly",
+  );
+
+  const genericMinimalExpected = objectAt(
+    ordinalExpected.generic_minimal_new_file,
+    "generic_minimal_new_file",
+  );
+  const genericNewFile: FileVector = {
+    path_hex: ordinalInputs.generic_new_file.path_hex,
+    mode: ordinalInputs.generic_new_file.mode,
+    content_hex: ordinalInputs.generic_new_file.content_hex,
+  };
+  const genericProposalSeed = validateProposalId(ordinalInputs.generic_new_file.proposal_seed);
+  check(
+    genericProposalSeed === "proposal-new-file" &&
+      genericProposalSeed === genericMinimalExpected.proposal_seed &&
+      genericMinimalExpected.raw_path_hex === genericNewFile.path_hex,
+    "frozen generic new-file seed or raw path changed",
+  );
+  const genericMinimal = advanceFileIdentities(
+    ordinalInputs.project_id,
+    genericProposalSeed,
+    [],
+    [genericNewFile],
+    [],
+  );
+  check(
+    genericMinimal.base_snapshot.id === genericMinimalExpected.base_snapshot_id,
+    "generic-seed minimal new-file base snapshot ID mismatch",
+  );
+  checkExpectedSnapshot(
+    genericMinimal.result_snapshot,
+    genericMinimalExpected.result_snapshot,
+    "generic-seed minimal new-file result snapshot",
+  );
+  checkCanonicalValue(
+    genericMinimal.result_files,
+    [objectAt(genericMinimalExpected.source_change, "generic new-file source change").after],
+    "generic-seed minimal new-file FileId",
+  );
+  const genericIdentity = genericMinimal.proposed_preimages.get(genericNewFile.path_hex);
+  if (genericIdentity === undefined) throw new Error("generic new-file preimage is absent");
+  check(
+    genericIdentity.file_id === genericMinimalExpected.file_id &&
+      genericIdentity.ordinal === genericMinimalExpected.ordinal &&
+      genericIdentity.preimage_hex === genericMinimalExpected.preimage_hex,
+    "generic-seed proposed FileId or identity preimage mismatch",
+  );
+  const genericChange = genericMinimal.source_changes[0];
+  if (genericChange === undefined) throw new Error("generic new-file source change is absent");
+  checkCanonicalText(
+    genericChange,
+    stringAt(genericMinimalExpected.source_change_canonical_json, "generic source-change JSON"),
+    stringAt(genericMinimalExpected.source_change_canonical_hex, "generic source-change hex"),
+    "generic-seed minimal new-file source change",
+  );
+  checkCanonicalValue(
+    genericChange,
+    genericMinimalExpected.source_change,
+    "generic-seed minimal new-file source-change fields",
   );
 
   const boundExpected = objectAt(
