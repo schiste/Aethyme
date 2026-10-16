@@ -973,12 +973,17 @@ const MIGRATIONS: &[(i64, &str)] = &[
              wave TEXT NOT NULL REFERENCES local_waves(wave),
              request_record_id TEXT NOT NULL,
              request_object_sha256 TEXT NOT NULL CHECK(length(request_object_sha256)=64),
-             input_manifest_sha256 TEXT NOT NULL CHECK(length(input_manifest_sha256)=64),
+             -- ResolutionInputManifest is archived as canonical bytes and
+             -- identified by ObjectDigest; it is not a RecordRef.
+             input_manifest_object_sha256 TEXT NOT NULL
+                 CHECK(length(input_manifest_object_sha256)=64),
              trigger_sha256 TEXT NOT NULL CHECK(length(trigger_sha256)=64),
              project_policy TEXT NOT NULL,
              objective_policy TEXT NOT NULL,
              price_profile TEXT NOT NULL,
+             dispatch_limits TEXT NOT NULL CHECK(length(dispatch_limits) BETWEEN 1 AND 512),
              reserved_envelope BLOB NOT NULL CHECK(length(reserved_envelope) BETWEEN 1 AND 4096),
+             reservation_attempt_limit INTEGER NOT NULL CHECK(reservation_attempt_limit=1),
              deadline_ms INTEGER NOT NULL CHECK(deadline_ms >= 0),
              created_ms INTEGER NOT NULL CHECK(created_ms >= 0),
              UNIQUE(target,issuer,client_key)
@@ -997,7 +1002,9 @@ const MIGRATIONS: &[(i64, &str)] = &[
                  REFERENCES resolution_attempts(attempt_id),
              authority_epoch TEXT NOT NULL,
              reservation_version INTEGER NOT NULL CHECK(reservation_version >= 1),
-             attempt_number INTEGER NOT NULL CHECK(attempt_number >= 1),
+             shared_attempt_number INTEGER NOT NULL CHECK(shared_attempt_number >= 1),
+             reservation_attempt_number INTEGER NOT NULL
+                 CHECK(reservation_attempt_number=1),
              route TEXT NOT NULL
                  CHECK(route='local_managed_resolution_v1'),
              created_ms INTEGER NOT NULL CHECK(created_ms >= 0)
@@ -1055,15 +1062,16 @@ const MIGRATIONS: &[(i64, &str)] = &[
                AND p.authority_epoch=NEW.authority_epoch
                AND r.phase='completion_pending'
                AND r.version=NEW.reservation_version
+               AND r.attempts=NEW.reservation_attempt_number
                AND EXISTS (
                    SELECT 1 FROM local_resolution_reservation_roots rr
                    WHERE rr.reservation=p.reservation
                )
                AND a.request_record_id=p.request_record_id
                AND a.request_sha256=p.request_object_sha256
-               AND a.input_manifest_sha256=p.input_manifest_sha256
+               AND a.input_manifest_sha256=p.input_manifest_object_sha256
                AND a.client_key=p.client_key
-               AND a.attempt_number=NEW.attempt_number
+               AND a.attempt_number=NEW.shared_attempt_number
          )
          BEGIN
              SELECT RAISE(ABORT, 'managed resolution binding does not match its charged attempt');
@@ -2814,6 +2822,185 @@ mod tests {
         // Earlier writers cannot preserve immutable revision heads, durable
         // asynchronous attempts or the archive roots those attempts name.
         const { assert!(MIN_COMPATIBLE_SCHEMA >= 29) };
+    }
+
+    #[test]
+    fn schema_29_preserves_shared_charges_and_binds_distinct_attempt_axes() {
+        let host = tempfile::tempdir().unwrap();
+        let mut store = open(host.path(), &[]).unwrap();
+        store
+            .connection()
+            .execute(
+                "INSERT INTO resolution_attempts
+                     (decision_key,kind,members,paths,request_record_id,resolver,
+                      charged_ms,attempt_number,async_state)
+                 VALUES ('decision:shared','failed_checks','lineage-a','',
+                         'request:legacy','manual',123,1,'dispatching')",
+                [],
+            )
+            .unwrap();
+        drop_resolution_schema_29_for_legacy_fixture(store.connection()).unwrap();
+        store
+            .connection()
+            .execute_batch(
+                "UPDATE meta SET value='28'
+                     WHERE key IN ('schema_version','min_compatible_schema');",
+            )
+            .unwrap();
+        drop(store);
+
+        let mut migrated = open(host.path(), &[]).unwrap();
+        let legacy: (String, String, i64, Option<String>) = migrated
+            .read_connection()
+            .query_row(
+                "SELECT request_record_id,async_state,attempt_number,async_token
+                 FROM resolution_attempts WHERE decision_key='decision:shared'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            legacy,
+            ("request:legacy".into(), "dispatching".into(), 1, None)
+        );
+
+        let request_sha = "a".repeat(64);
+        let manifest_sha = "b".repeat(64);
+        let trigger_sha = "c".repeat(64);
+        migrated
+            .connection()
+            .execute_batch(
+                "INSERT INTO local_targets (target,issuer) VALUES ('target','issuer');
+                 INSERT INTO local_target_revisions (revision,target,body)
+                     VALUES ('revision','target',X'01');
+                 INSERT INTO local_waves
+                     (wave,target,revision,sequence,body,phase)
+                     VALUES ('wave','target','revision',1,X'02','verifying');
+                 INSERT INTO local_budget_reservations
+                     (reservation,nonce,target,revision,wave,root,parent,body,
+                      phase,spent,attempts,version)
+                     VALUES ('reservation','nonce','target','revision','wave',
+                             'reservation',NULL,X'03','completion_pending',X'00',1,1);",
+            )
+            .unwrap();
+        migrated
+            .connection()
+            .execute(
+                "INSERT INTO resolution_attempts
+                     (decision_key,kind,members,paths,request_record_id,resolver,
+                      charged_ms,attempt_number,request_sha256,input_manifest_sha256,
+                      client_key,async_state)
+                 VALUES ('decision:shared','failed_checks','lineage-a','',
+                         'request:managed','local-managed-resolution',456,2,?1,?2,
+                         'client-key','dispatching')",
+                rusqlite::params![request_sha, manifest_sha],
+            )
+            .unwrap();
+        let attempt_id = migrated.connection().last_insert_rowid();
+        migrated
+            .connection()
+            .execute(
+                "INSERT INTO local_resolution_reservation_proofs
+                     (reservation,target,issuer,authority_epoch,client_key,wave,
+                      request_record_id,request_object_sha256,input_manifest_object_sha256,
+                      trigger_sha256,project_policy,objective_policy,price_profile,
+                      dispatch_limits,reserved_envelope,reservation_attempt_limit,
+                      deadline_ms,created_ms)
+                 VALUES ('reservation','target','issuer','epoch-1','client-key','wave',
+                         'request:managed',?1,?2,?3,'project-policy','objective-policy',
+                         'price-profile','v1:1024:10:1024:4096:1024',X'04',1,999,100)",
+                rusqlite::params![request_sha, manifest_sha, trigger_sha],
+            )
+            .unwrap();
+        migrated
+            .connection()
+            .execute(
+                "INSERT INTO local_resolution_reservation_roots
+                     (reservation,lineage_record_id) VALUES ('reservation','lineage-a')",
+                [],
+            )
+            .unwrap();
+        migrated
+            .connection()
+            .execute(
+                "INSERT INTO local_managed_resolution_attempt_bindings
+                     (binding_id,reservation,attempt_id,authority_epoch,
+                      reservation_version,shared_attempt_number,
+                      reservation_attempt_number,route,created_ms)
+                 VALUES ('binding','reservation',?1,'epoch-1',1,2,1,
+                         'local_managed_resolution_v1',101)",
+                [attempt_id],
+            )
+            .unwrap();
+        let counters: (i64, i64) = migrated
+            .read_connection()
+            .query_row(
+                "SELECT shared_attempt_number,reservation_attempt_number
+                 FROM local_managed_resolution_attempt_bindings WHERE binding_id='binding'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(counters, (2, 1));
+
+        let duplicate_binding = migrated.connection().execute(
+            "INSERT INTO local_managed_resolution_attempt_bindings
+                 (binding_id,reservation,attempt_id,authority_epoch,
+                  reservation_version,shared_attempt_number,
+                  reservation_attempt_number,route,created_ms)
+             VALUES ('binding:duplicate','reservation',?1,'epoch-1',1,2,1,
+                     'local_managed_resolution_v1',102)",
+            [attempt_id],
+        );
+        assert!(
+            duplicate_binding.is_err(),
+            "a managed reservation binds once"
+        );
+        let changed_proof = migrated.connection().execute(
+            "UPDATE local_resolution_reservation_proofs
+             SET request_record_id='request:changed' WHERE reservation='reservation'",
+            [],
+        );
+        assert!(
+            changed_proof.is_err(),
+            "the exact request proof is immutable"
+        );
+        let appended_root = migrated.connection().execute(
+            "INSERT INTO local_resolution_reservation_roots
+                 (reservation,lineage_record_id) VALUES ('reservation','lineage-b')",
+            [],
+        );
+        assert!(
+            appended_root.is_err(),
+            "the selected root set closes at binding"
+        );
+        migrated
+            .connection()
+            .execute(
+                "INSERT INTO local_budget_reservations
+                     (reservation,nonce,target,revision,wave,root,parent,body,
+                      phase,spent,attempts,version)
+                 VALUES ('reservation:retry','nonce:retry','target','revision','wave',
+                         'reservation:retry',NULL,X'05','reserved',X'00',0,0)",
+                [],
+            )
+            .unwrap();
+        let cross_epoch_key = migrated.connection().execute(
+            "INSERT INTO local_resolution_reservation_proofs
+                 (reservation,target,issuer,authority_epoch,client_key,wave,
+                  request_record_id,request_object_sha256,input_manifest_object_sha256,
+                  trigger_sha256,project_policy,objective_policy,price_profile,
+                  dispatch_limits,reserved_envelope,reservation_attempt_limit,
+                  deadline_ms,created_ms)
+             VALUES ('reservation:retry','target','issuer','epoch-2','client-key','wave',
+                     'request:other',?1,?2,?3,'project-policy','objective-policy',
+                     'price-profile','v1:1024:10:1024:4096:1024',X'06',1,999,102)",
+            rusqlite::params![request_sha, manifest_sha, trigger_sha],
+        );
+        assert!(
+            cross_epoch_key.is_err(),
+            "idempotency scope remains stable across authority epochs"
+        );
     }
 
     #[test]
