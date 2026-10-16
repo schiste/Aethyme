@@ -20,6 +20,8 @@ description: Use after repo-onboarding or Explore when moving from orientation i
 
 ## Validation Checklist
 
+- Keep matching `.claude/skills` and `.codex/skills` files byte-identical when
+  editing a mirrored skill; the skill-surface parity check enforces this.
 - For tests that create broker worktrees, configure a fixture-owned worktree root
   outside the temporary repository (for example, a sibling under the fixture
   TempDir); pass it explicitly to CLI children too. An inherited
