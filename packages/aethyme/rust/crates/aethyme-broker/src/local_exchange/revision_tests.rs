@@ -320,6 +320,22 @@ fn revision_hex_chunks_require_one_bounded_canonical_shape() {
         Err(ExchangeError::Invalid(_))
     ));
 
+    let short_nonfinal_over_inline_threshold = BoundedHexPayload(HexPayloadWire::Chunks(vec![
+        "aa".into(),
+        "b".repeat(MAX_REVISION_HEX_CHUNK_CHARS),
+    ]));
+    let HexPayloadWire::Chunks(chunks) = &short_nonfinal_over_inline_threshold.0 else {
+        unreachable!();
+    };
+    assert_eq!(
+        chunks.iter().map(|chunk| chunk.len()).sum::<usize>(),
+        MAX_REVISION_HEX_CHUNK_CHARS + 2
+    );
+    assert!(matches!(
+        short_nonfinal_over_inline_threshold.decode(MAX_REVISION_OBJECT_BYTES_IN_PACKET),
+        Err(ExchangeError::Invalid(_))
+    ));
+
     let uppercase = BoundedHexPayload(HexPayloadWire::Chunks(vec![
         "A".repeat(MAX_REVISION_HEX_CHUNK_CHARS),
         "bb".into(),
