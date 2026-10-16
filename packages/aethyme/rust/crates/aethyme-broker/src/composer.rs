@@ -576,7 +576,7 @@ pub(crate) fn compose_after_synthesized_conflict(
         binding,
     )
     .map_err(|error| ComposeError::InvalidRequest(error.into()))?;
-    validate_current_conflict_result(binding, result, &synthesis, &request)
+    validate_current_conflict_result(&wave, binding, result, &synthesis, &request)
         .map_err(|error| ComposeError::InvalidRequest(error.into()))?;
 
     let prefix_len = synthesis
@@ -767,15 +767,14 @@ fn validate_current_blocked_conflict_wave(
     {
         return Err("conflict request is no longer current on the blocked wave");
     }
-    if wave.spec.baseline != binding.plan_payload.request.baseline
-        || wave.spec.selected != binding.plan_payload.selected
-    {
+    if wave.spec.selected != binding.plan_payload.selected {
         return Err("frozen conflict plan differs from the current blocked wave");
     }
     Ok(())
 }
 
 fn validate_current_conflict_result(
+    wave: &crate::local_wave::Wave,
     binding: &crate::local_wave::CurrentConflictRequestBinding,
     result: &crate::resolution::RecordRef,
     synthesis: &crate::resolution::UnverifiedSynthesis,
@@ -787,8 +786,7 @@ fn validate_current_conflict_result(
         || synthesis.status.result.as_ref() != Some(result)
         || synthesis.candidate.baseline != request.baseline
         || synthesis.request.baseline().commit != request.baseline
-        || synthesis.request.baseline().snapshot_id.as_str()
-            != binding.plan_payload.request.baseline
+        || synthesis.request.baseline().snapshot_id.as_str() != wave.spec.baseline
         || synthesis.candidate.producer
             != (Producer::Resolver {
                 profile: crate::resolution::SYNTHESIS_PROFILE.into(),
