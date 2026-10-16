@@ -1,0 +1,987 @@
+﻿2026-10-16T00:36:23.5442719Z Current runner version: '2.337.0'
+2026-10-16T00:36:23.5459061Z ##[group]Runner Image Provisioner
+2026-10-16T00:36:23.5459597Z Hosted Compute Agent
+2026-10-16T00:36:23.5460025Z Version: 20261012.601
+2026-10-16T00:36:23.5460433Z Commit: f3dc54e1fb89da6852db922499a0233137369e1d
+2026-10-16T00:36:23.5460887Z Build Date: 2026-10-12T17:48:21Z
+2026-10-16T00:36:23.5461301Z Worker ID: {c32ddfa2-4853-43ad-8891-f9e736220ade}
+2026-10-16T00:36:23.5461712Z Region: centralus
+2026-10-16T00:36:23.5462075Z Cloud: Azure
+2026-10-16T00:36:23.5462426Z ##[endgroup]
+2026-10-16T00:36:23.5463141Z ##[group]Operating System
+2026-10-16T00:36:23.5463684Z Ubuntu
+2026-10-16T00:36:23.5464022Z 24.04.5
+2026-10-16T00:36:23.5464365Z LTS
+2026-10-16T00:36:23.5464709Z ##[endgroup]
+2026-10-16T00:36:23.5465023Z ##[group]Runner Image
+2026-10-16T00:36:23.5465422Z Image: ubuntu-24.04
+2026-10-16T00:36:23.5465760Z Version: 20261012.334.1
+2026-10-16T00:36:23.5466536Z Included Software: https://github.com/actions/runner-images/blob/ubuntu24/20261012.334/images/ubuntu/Ubuntu2404-Readme.md
+2026-10-16T00:36:23.5467406Z Image Release: https://github.com/actions/runner-images/releases/tag/ubuntu24%2F20261012.334
+2026-10-16T00:36:23.5467997Z ##[endgroup]
+2026-10-16T00:36:23.5468646Z ##[group]GITHUB_TOKEN Permissions
+2026-10-16T00:36:23.5469839Z Contents: read
+2026-10-16T00:36:23.5470177Z Metadata: read
+2026-10-16T00:36:23.5470550Z ##[endgroup]
+2026-10-16T00:36:23.5471810Z Secret source: Actions
+2026-10-16T00:36:23.5472454Z Cache mode: write
+2026-10-16T00:36:23.5472933Z Prepare workflow directory
+2026-10-16T00:36:23.5724693Z Prepare all required actions
+2026-10-16T00:36:23.5755122Z Getting action download info
+2026-10-16T00:36:23.8065481Z Download action repository 'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1' (SHA:3d3c42e5aac5ba805825da76410c181273ba90b1)
+2026-10-16T00:36:23.9049001Z Download action repository 'dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87' (SHA:6bed0761d98439e5a578e2877258200ad565ba87)
+2026-10-16T00:36:24.0800792Z Download action repository 'Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6' (SHA:6323deb102c322ba6fcbdcafc7e3dddab59af2b6)
+2026-10-16T00:36:24.6922077Z Complete job name: Rust examples and doctests
+2026-10-16T00:36:24.7383016Z ##[group]Run actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+2026-10-16T00:36:24.7383973Z with:
+2026-10-16T00:36:24.7384280Z   repository: schiste/Aethyme
+2026-10-16T00:36:24.7386579Z   token: ***
+2026-10-16T00:36:24.7386868Z   ssh-strict: true
+2026-10-16T00:36:24.7387166Z   ssh-user: git
+2026-10-16T00:36:24.7387470Z   persist-credentials: true
+2026-10-16T00:36:24.7387802Z   clean: true
+2026-10-16T00:36:24.7388105Z   sparse-checkout-cone-mode: true
+2026-10-16T00:36:24.7388449Z   fetch-depth: 1
+2026-10-16T00:36:24.7388745Z   fetch-tags: false
+2026-10-16T00:36:24.7389055Z   show-progress: true
+2026-10-16T00:36:24.7389357Z   lfs: false
+2026-10-16T00:36:24.7389647Z   submodules: false
+2026-10-16T00:36:24.7389958Z   set-safe-directory: true
+2026-10-16T00:36:24.7390477Z   allow-unsafe-pr-checkout: false
+2026-10-16T00:36:24.7391051Z env:
+2026-10-16T00:36:24.7391400Z   CARGO_NET_RETRY: 10
+2026-10-16T00:36:24.7391821Z ##[endgroup]
+2026-10-16T00:36:24.8031740Z Syncing repository: schiste/Aethyme
+2026-10-16T00:36:24.8033568Z ##[group]Getting Git version info
+2026-10-16T00:36:24.8034437Z Working directory is '/home/runner/work/Aethyme/Aethyme'
+2026-10-16T00:36:24.8035563Z [command]/usr/bin/git version
+2026-10-16T00:36:24.8082531Z git version 2.55.0
+2026-10-16T00:36:24.8094746Z ##[endgroup]
+2026-10-16T00:36:24.8101795Z Temporarily overriding HOME='/home/runner/work/_temp/82c02f20-65e5-4a7e-987a-9e10e69134c0' before making global git config changes
+2026-10-16T00:36:24.8103716Z Adding repository directory to the temporary git global config as a safe directory
+2026-10-16T00:36:24.8106728Z [command]/usr/bin/git config --global --add safe.directory /home/runner/work/Aethyme/Aethyme
+2026-10-16T00:36:24.8148156Z Deleting the contents of '/home/runner/work/Aethyme/Aethyme'
+2026-10-16T00:36:24.8150383Z ##[group]Determining repository object format
+2026-10-16T00:36:24.8151473Z ##[endgroup]
+2026-10-16T00:36:24.8152300Z ##[group]Initializing the repository
+2026-10-16T00:36:24.8154702Z [command]/usr/bin/git init /home/runner/work/Aethyme/Aethyme
+2026-10-16T00:36:24.8238503Z hint: Using 'master' as the name for the initial branch. This default branch name
+2026-10-16T00:36:24.8239672Z hint: will change to "main" in Git 3.0. To configure the initial branch name
+2026-10-16T00:36:24.8240834Z hint: to use in all of your new repositories, which will suppress this warning,
+2026-10-16T00:36:24.8241660Z hint: call:
+2026-10-16T00:36:24.8242265Z hint:
+2026-10-16T00:36:24.8242892Z hint: 	git config --global init.defaultBranch <name>
+2026-10-16T00:36:24.8248272Z hint:
+2026-10-16T00:36:24.8249182Z hint: Names commonly chosen instead of 'master' are 'main', 'trunk' and
+2026-10-16T00:36:24.8250309Z hint: 'development'. The just-created branch can be renamed via this command:
+2026-10-16T00:36:24.8251160Z hint:
+2026-10-16T00:36:24.8251681Z hint: 	git branch -m <name>
+2026-10-16T00:36:24.8252209Z hint:
+2026-10-16T00:36:24.8252931Z hint: Disable this message with "git config set advice.defaultBranchName false"
+2026-10-16T00:36:24.8254366Z Initialized empty Git repository in /home/runner/work/Aethyme/Aethyme/.git/
+2026-10-16T00:36:24.8256490Z [command]/usr/bin/git remote add origin https://github.com/schiste/Aethyme
+2026-10-16T00:36:24.8293674Z ##[endgroup]
+2026-10-16T00:36:24.8294653Z ##[group]Disabling automatic garbage collection
+2026-10-16T00:36:24.8295823Z [command]/usr/bin/git config --local gc.auto 0
+2026-10-16T00:36:24.8323144Z ##[endgroup]
+2026-10-16T00:36:24.8324429Z ##[group]Setting up auth
+2026-10-16T00:36:24.8325018Z Removing SSH command configuration
+2026-10-16T00:36:24.8327166Z [command]/usr/bin/git config --local --name-only --get-regexp core\.sshCommand
+2026-10-16T00:36:24.8353936Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :"
+2026-10-16T00:36:24.8641300Z Removing HTTP extra header
+2026-10-16T00:36:24.8645472Z [command]/usr/bin/git config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
+2026-10-16T00:36:24.8672200Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :"
+2026-10-16T00:36:24.8841708Z Removing includeIf entries pointing to credentials config files
+2026-10-16T00:36:24.8845404Z [command]/usr/bin/git config --local --name-only --get-regexp ^includeIf\.gitdir:
+2026-10-16T00:36:24.8877007Z [command]/usr/bin/git submodule foreach --recursive git config --local --show-origin --name-only --get-regexp remote.origin.url
+2026-10-16T00:36:24.9044716Z [command]/usr/bin/git config --file /home/runner/work/_temp/git-credentials-d7610370-5987-41ae-9d13-26065ac80316.config http.https://github.com/.extraheader AUTHORIZATION: basic ***
+2026-10-16T00:36:24.9074337Z [command]/usr/bin/git config --local includeIf.gitdir:/home/runner/work/Aethyme/Aethyme/.git.path /home/runner/work/_temp/git-credentials-d7610370-5987-41ae-9d13-26065ac80316.config
+2026-10-16T00:36:24.9101142Z [command]/usr/bin/git config --local includeIf.gitdir:/home/runner/work/Aethyme/Aethyme/.git/worktrees/*.path /home/runner/work/_temp/git-credentials-d7610370-5987-41ae-9d13-26065ac80316.config
+2026-10-16T00:36:24.9130181Z [command]/usr/bin/git config --local includeIf.gitdir:/github/workspace/.git.path /github/runner_temp/git-credentials-d7610370-5987-41ae-9d13-26065ac80316.config
+2026-10-16T00:36:24.9157620Z [command]/usr/bin/git config --local includeIf.gitdir:/github/workspace/.git/worktrees/*.path /github/runner_temp/git-credentials-d7610370-5987-41ae-9d13-26065ac80316.config
+2026-10-16T00:36:24.9186758Z ##[endgroup]
+2026-10-16T00:36:24.9187705Z ##[group]Fetching the repository
+2026-10-16T00:36:24.9189062Z [command]/usr/bin/git -c protocol.version=2 fetch --no-tags --prune --no-recurse-submodules --depth=1 origin +33e9c9e5b798faffdea32865bd2f32a97140177f:refs/remotes/pull/788/merge
+2026-10-16T00:36:26.4414461Z From https://github.com/schiste/Aethyme
+2026-10-16T00:36:26.4415304Z  * [new ref]         33e9c9e5b798faffdea32865bd2f32a97140177f -> pull/788/merge
+2026-10-16T00:36:26.4470162Z ##[endgroup]
+2026-10-16T00:36:26.4471086Z ##[group]Determining the checkout info
+2026-10-16T00:36:26.4471578Z ##[endgroup]
+2026-10-16T00:36:26.4471796Z [command]/usr/bin/git sparse-checkout disable
+2026-10-16T00:36:26.4472311Z [command]/usr/bin/git config --local --unset-all extensions.worktreeConfig
+2026-10-16T00:36:26.4494301Z ##[group]Checking out the ref
+2026-10-16T00:36:26.4496607Z [command]/usr/bin/git checkout --progress --force refs/remotes/pull/788/merge
+2026-10-16T00:36:26.6072252Z Note: switching to 'refs/remotes/pull/788/merge'.
+2026-10-16T00:36:26.6072555Z 
+2026-10-16T00:36:26.6072703Z You are in 'detached HEAD' state. You can look around, make experimental
+2026-10-16T00:36:26.6073113Z changes and commit them, and you can discard any commits you make in this
+2026-10-16T00:36:26.6073708Z state without impacting any branches by switching back to a branch.
+2026-10-16T00:36:26.6073985Z 
+2026-10-16T00:36:26.6074222Z If you want to create a new branch to retain commits you create, you may
+2026-10-16T00:36:26.6074685Z do so (now or later) by using -c with the switch command. Example:
+2026-10-16T00:36:26.6074927Z 
+2026-10-16T00:36:26.6075053Z   git switch -c <new-branch-name>
+2026-10-16T00:36:26.6075226Z 
+2026-10-16T00:36:26.6075352Z Or undo this operation with:
+2026-10-16T00:36:26.6075519Z 
+2026-10-16T00:36:26.6075617Z   git switch -
+2026-10-16T00:36:26.6075778Z 
+2026-10-16T00:36:26.6076023Z Turn off this advice by setting config variable advice.detachedHead to false
+2026-10-16T00:36:26.6076301Z 
+2026-10-16T00:36:26.6076653Z HEAD is now at 33e9c9e Merge 63a3aa3e533ba466f02f1deabd36b9d3feb88985 into 898215cb89fcd1baccfc1af167a67c66f0488060
+2026-10-16T00:36:26.6087537Z ##[endgroup]
+2026-10-16T00:36:26.6126789Z [command]/usr/bin/git log -1 --format=%H
+2026-10-16T00:36:26.6149647Z 33e9c9e5b798faffdea32865bd2f32a97140177f
+2026-10-16T00:36:26.6386638Z ##[group]Run dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
+2026-10-16T00:36:26.6386886Z with:
+2026-10-16T00:36:26.6387025Z   toolchain: stable
+2026-10-16T00:36:26.6387171Z env:
+2026-10-16T00:36:26.6387301Z   CARGO_NET_RETRY: 10
+2026-10-16T00:36:26.6387448Z ##[endgroup]
+2026-10-16T00:36:26.6428275Z ##[start-action display=Parse toolchain version;id=__dtolnay_rust-toolchain.parse]
+2026-10-16T00:36:26.6467899Z ##[group]Run if [[ -z $toolchain ]]; then
+2026-10-16T00:36:26.6468152Z [36;1mif [[ -z $toolchain ]]; then[0m
+2026-10-16T00:36:26.6468489Z [36;1m  # GitHub does not enforce `required: true` inputs itself. https://github.com/actions/runner/issues/1070[0m
+2026-10-16T00:36:26.6468824Z [36;1m  echo "'toolchain' is a required input" >&2[0m
+2026-10-16T00:36:26.6469018Z [36;1m  exit 1[0m
+2026-10-16T00:36:26.6469253Z [36;1melif [[ $toolchain =~ ^stable' '[0-9]+' '(year|month|week|day)s?' 'ago$ ]]; then[0m
+2026-10-16T00:36:26.6469541Z [36;1m  if [[ Linux == macOS ]]; then[0m
+2026-10-16T00:36:26.6469862Z [36;1m    echo "toolchain=1.$((($(date -v-$(sed 's/stable \([0-9]*\) \(.\).*/\1\2/' <<< $toolchain) +%s)/60/60/24-16569)/7/6))" >> $GITHUB_OUTPUT[0m
+2026-10-16T00:36:26.6470166Z [36;1m  else[0m
+2026-10-16T00:36:26.6470414Z [36;1m    echo "toolchain=1.$((($(date --date "${toolchain#stable }" +%s)/60/60/24-16569)/7/6))" >> $GITHUB_OUTPUT[0m
+2026-10-16T00:36:26.6470686Z [36;1m  fi[0m
+2026-10-16T00:36:26.6470884Z [36;1melif [[ $toolchain =~ ^stable' 'minus' '[0-9]+' 'releases?$ ]]; then[0m
+2026-10-16T00:36:26.6471201Z [36;1m  echo "toolchain=1.$((($(date +%s)/60/60/24-16569)/7/6-${toolchain//[^0-9]/}))" >> $GITHUB_OUTPUT[0m
+2026-10-16T00:36:26.6471481Z [36;1melif [[ $toolchain =~ ^1\.[0-9]+$ ]]; then[0m
+2026-10-16T00:36:26.6471791Z [36;1m  echo "toolchain=1.$((i=${toolchain#1.}, c=($(date +%s)/60/60/24-16569)/7/6, i+9*i*(10*i<=c)+90*i*(100*i<=c)))" >> $GITHUB_OUTPUT[0m
+2026-10-16T00:36:26.6472239Z [36;1melse[0m
+2026-10-16T00:36:26.6472409Z [36;1m  echo "toolchain=$toolchain" >> $GITHUB_OUTPUT[0m
+2026-10-16T00:36:26.6472599Z [36;1mfi[0m
+2026-10-16T00:36:26.6686855Z shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+2026-10-16T00:36:26.6687083Z env:
+2026-10-16T00:36:26.6687222Z   CARGO_NET_RETRY: 10
+2026-10-16T00:36:26.6687371Z   toolchain: stable
+2026-10-16T00:36:26.6687511Z ##[endgroup]
+2026-10-16T00:36:26.6783648Z ##[end-action id=__dtolnay_rust-toolchain.parse;outcome=success;conclusion=success;duration_ms=35]
+2026-10-16T00:36:26.6790744Z ##[start-action display=Construct rustup command line;id=__dtolnay_rust-toolchain.flags]
+2026-10-16T00:36:26.6814136Z ##[group]Run echo "targets=$(for t in ${targets//,/ }; do echo -n ' --target' $t; done)" >> $GITHUB_OUTPUT
+2026-10-16T00:36:26.6814521Z [36;1mecho "targets=$(for t in ${targets//,/ }; do echo -n ' --target' $t; done)" >> $GITHUB_OUTPUT[0m
+2026-10-16T00:36:26.6814886Z [36;1mecho "components=$(for c in ${components//,/ }; do echo -n ' --component' $c; done)" >> $GITHUB_OUTPUT[0m
+2026-10-16T00:36:26.6815175Z [36;1mecho "downgrade=" >> $GITHUB_OUTPUT[0m
+2026-10-16T00:36:26.6859248Z shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+2026-10-16T00:36:26.6859478Z env:
+2026-10-16T00:36:26.6859612Z   CARGO_NET_RETRY: 10
+2026-10-16T00:36:26.6859756Z   targets: 
+2026-10-16T00:36:26.6859887Z   components: 
+2026-10-16T00:36:26.6860022Z ##[endgroup]
+2026-10-16T00:36:26.6930144Z ##[end-action id=__dtolnay_rust-toolchain.flags;outcome=success;conclusion=success;duration_ms=13]
+2026-10-16T00:36:26.6931564Z ##[start-action display=Set $CARGO_HOME;id=__dtolnay_rust-toolchain.__run]
+2026-10-16T00:36:26.6949523Z ##[group]Run echo CARGO_HOME=${CARGO_HOME:-"$HOME/.cargo"} >> $GITHUB_ENV
+2026-10-16T00:36:26.6949814Z [36;1mecho CARGO_HOME=${CARGO_HOME:-"$HOME/.cargo"} >> $GITHUB_ENV[0m
+2026-10-16T00:36:26.6996771Z shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+2026-10-16T00:36:26.6996988Z env:
+2026-10-16T00:36:26.6997123Z   CARGO_NET_RETRY: 10
+2026-10-16T00:36:26.6997272Z ##[endgroup]
+2026-10-16T00:36:26.7063460Z ##[end-action id=__dtolnay_rust-toolchain.__run;outcome=success;conclusion=success;duration_ms=13]
+2026-10-16T00:36:26.7064996Z ##[start-action display=Install rustup if needed;id=__dtolnay_rust-toolchain.__run_2]
+2026-10-16T00:36:26.7085764Z ##[group]Run if ! command -v rustup &>/dev/null; then
+2026-10-16T00:36:26.7086000Z [36;1mif ! command -v rustup &>/dev/null; then[0m
+2026-10-16T00:36:26.7086433Z [36;1m  curl --proto '=https' --tlsv1.2 --retry 10 --retry-connrefused --location --silent --show-error --fail https://sh.rustup.rs | sh -s -- --default-toolchain none -y[0m
+2026-10-16T00:36:26.7086846Z [36;1m  echo "$CARGO_HOME/bin" >> $GITHUB_PATH[0m
+2026-10-16T00:36:26.7087027Z [36;1mfi[0m
+2026-10-16T00:36:26.7133405Z shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+2026-10-16T00:36:26.7133620Z env:
+2026-10-16T00:36:26.7133757Z   CARGO_NET_RETRY: 10
+2026-10-16T00:36:26.7133913Z   CARGO_HOME: /home/runner/.cargo
+2026-10-16T00:36:26.7134077Z ##[endgroup]
+2026-10-16T00:36:26.7198196Z ##[end-action id=__dtolnay_rust-toolchain.__run_2;outcome=success;conclusion=success;duration_ms=13]
+2026-10-16T00:36:26.7199618Z ##[start-action display=Install rustup if needed on windows;id=__dtolnay_rust-toolchain.__run_3]
+2026-10-16T00:36:26.7203625Z ##[end-action id=__dtolnay_rust-toolchain.__run_3;outcome=skipped;conclusion=skipped;duration_ms=0]
+2026-10-16T00:36:26.7209975Z ##[start-action display=rustup toolchain install stable;id=__dtolnay_rust-toolchain.__run_4]
+2026-10-16T00:36:26.7227555Z ##[group]Run rustup toolchain install stable --profile minimal --no-self-update
+2026-10-16T00:36:26.7227880Z [36;1mrustup toolchain install stable --profile minimal --no-self-update[0m
+2026-10-16T00:36:26.7273802Z shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+2026-10-16T00:36:26.7274008Z env:
+2026-10-16T00:36:26.7274247Z   CARGO_NET_RETRY: 10
+2026-10-16T00:36:26.7274405Z   CARGO_HOME: /home/runner/.cargo
+2026-10-16T00:36:26.7274580Z   RUSTUP_PERMIT_COPY_RENAME: 1
+2026-10-16T00:36:26.7274745Z ##[endgroup]
+2026-10-16T00:36:26.8758978Z info: syncing channel updates for stable-x86_64-unknown-linux-gnu
+2026-10-16T00:36:27.0969017Z info: latest update on 2026-10-15 for version 1.99.1 (58cf8f9c3 2026-10-13)
+2026-10-16T00:36:27.1086843Z info: removing previous version of component rustfmt
+2026-10-16T00:36:27.1105631Z info: removing previous version of component clippy
+2026-10-16T00:36:27.1181463Z info: removing previous version of component cargo
+2026-10-16T00:36:27.1229039Z info: removing previous version of component rust-std
+2026-10-16T00:36:27.1274729Z info: removing previous version of component rustc
+2026-10-16T00:36:27.1374702Z info: downloading 5 components
+2026-10-16T00:36:33.9145515Z 
+2026-10-16T00:36:33.9197869Z   stable-x86_64-unknown-linux-gnu updated - rustc 1.99.1 (58cf8f9c3 2026-10-13) (from rustc 1.99.0 (b940084d7 2026-09-28))
+2026-10-16T00:36:33.9198194Z 
+2026-10-16T00:36:33.9256037Z ##[end-action id=__dtolnay_rust-toolchain.__run_4;outcome=success;conclusion=success;duration_ms=7204]
+2026-10-16T00:36:33.9260961Z ##[start-action display=rustup default stable;id=__dtolnay_rust-toolchain.__run_5]
+2026-10-16T00:36:33.9300512Z ##[group]Run rustup default stable
+2026-10-16T00:36:33.9300691Z [36;1mrustup default stable[0m
+2026-10-16T00:36:33.9366794Z shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+2026-10-16T00:36:33.9366975Z env:
+2026-10-16T00:36:33.9367084Z   CARGO_NET_RETRY: 10
+2026-10-16T00:36:33.9367212Z   CARGO_HOME: /home/runner/.cargo
+2026-10-16T00:36:33.9367345Z ##[endgroup]
+2026-10-16T00:36:33.9456307Z info: using existing install for stable-x86_64-unknown-linux-gnu
+2026-10-16T00:36:33.9461592Z info: default toolchain set to stable-x86_64-unknown-linux-gnu
+2026-10-16T00:36:33.9461820Z 
+2026-10-16T00:36:33.9509715Z   stable-x86_64-unknown-linux-gnu unchanged - rustc 1.99.1 (58cf8f9c3 2026-10-13)
+2026-10-16T00:36:33.9510005Z 
+2026-10-16T00:36:33.9510732Z info: note that the toolchain '1.96.0-x86_64-unknown-linux-gnu' is currently in use (overridden by '/home/runner/work/Aethyme/Aethyme/rust-toolchain.toml')
+2026-10-16T00:36:33.9522469Z ##[end-action id=__dtolnay_rust-toolchain.__run_5;outcome=success;conclusion=success;duration_ms=26]
+2026-10-16T00:36:33.9524167Z ##[start-action display=Create cachekey;id=__dtolnay_rust-toolchain.rustc-version]
+2026-10-16T00:36:33.9538399Z ##[group]Run DATE=$(rustc +stable --version --verbose | sed -ne 's/^commit-date: \(20[0-9][0-9]\)-\([01][0-9]\)-\([0-3][0-9]\)$/\1\2\3/p')
+2026-10-16T00:36:33.9538852Z [36;1mDATE=$(rustc +stable --version --verbose | sed -ne 's/^commit-date: \(20[0-9][0-9]\)-\([01][0-9]\)-\([0-3][0-9]\)$/\1\2\3/p')[0m
+2026-10-16T00:36:33.9539184Z [36;1mHASH=$(rustc +stable --version --verbose | sed -ne 's/^commit-hash: //p')[0m
+2026-10-16T00:36:33.9539441Z [36;1mecho "cachekey=$(echo $DATE$HASH | head -c12)" >> $GITHUB_OUTPUT[0m
+2026-10-16T00:36:33.9582594Z shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+2026-10-16T00:36:33.9582765Z env:
+2026-10-16T00:36:33.9582870Z   CARGO_NET_RETRY: 10
+2026-10-16T00:36:33.9582997Z   CARGO_HOME: /home/runner/.cargo
+2026-10-16T00:36:33.9583130Z ##[endgroup]
+2026-10-16T00:36:33.9823709Z ##[end-action id=__dtolnay_rust-toolchain.rustc-version;outcome=success;conclusion=success;duration_ms=29]
+2026-10-16T00:36:33.9825438Z ##[start-action display=Disable incremental compilation;id=__dtolnay_rust-toolchain.__run_6]
+2026-10-16T00:36:33.9839182Z ##[group]Run if [ -z "${CARGO_INCREMENTAL+set}" ]; then
+2026-10-16T00:36:33.9839420Z [36;1mif [ -z "${CARGO_INCREMENTAL+set}" ]; then[0m
+2026-10-16T00:36:33.9839600Z [36;1m  echo CARGO_INCREMENTAL=0 >> $GITHUB_ENV[0m
+2026-10-16T00:36:33.9839755Z [36;1mfi[0m
+2026-10-16T00:36:33.9886722Z shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+2026-10-16T00:36:33.9886897Z env:
+2026-10-16T00:36:33.9887007Z   CARGO_NET_RETRY: 10
+2026-10-16T00:36:33.9887132Z   CARGO_HOME: /home/runner/.cargo
+2026-10-16T00:36:33.9887389Z ##[endgroup]
+2026-10-16T00:36:33.9947033Z ##[end-action id=__dtolnay_rust-toolchain.__run_6;outcome=success;conclusion=success;duration_ms=12]
+2026-10-16T00:36:33.9948306Z ##[start-action display=Enable colors in Cargo output;id=__dtolnay_rust-toolchain.__run_7]
+2026-10-16T00:36:33.9961147Z ##[group]Run if [ -z "${CARGO_TERM_COLOR+set}" ]; then
+2026-10-16T00:36:33.9961347Z [36;1mif [ -z "${CARGO_TERM_COLOR+set}" ]; then[0m
+2026-10-16T00:36:33.9961525Z [36;1m  echo CARGO_TERM_COLOR=always >> $GITHUB_ENV[0m
+2026-10-16T00:36:33.9961681Z [36;1mfi[0m
+2026-10-16T00:36:34.0003459Z shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+2026-10-16T00:36:34.0003635Z env:
+2026-10-16T00:36:34.0003748Z   CARGO_NET_RETRY: 10
+2026-10-16T00:36:34.0003873Z   CARGO_HOME: /home/runner/.cargo
+2026-10-16T00:36:34.0004007Z   CARGO_INCREMENTAL: 0
+2026-10-16T00:36:34.0004125Z ##[endgroup]
+2026-10-16T00:36:34.0061889Z ##[end-action id=__dtolnay_rust-toolchain.__run_7;outcome=success;conclusion=success;duration_ms=11]
+2026-10-16T00:36:34.0063128Z ##[start-action display=Enable Cargo sparse registry;id=__dtolnay_rust-toolchain.__run_8]
+2026-10-16T00:36:34.0076371Z ##[group]Run # implemented in 1.66, stabilized in 1.68, made default in 1.70
+2026-10-16T00:36:34.0076643Z [36;1m# implemented in 1.66, stabilized in 1.68, made default in 1.70[0m
+2026-10-16T00:36:34.0077007Z [36;1mif [ -z "${CARGO_REGISTRIES_CRATES_IO_PROTOCOL+set}" -o -f "/home/runner/work/_temp"/.implicit_cargo_registries_crates_io_protocol ]; then[0m
+2026-10-16T00:36:34.0077381Z [36;1m  if rustc +stable --version --verbose | grep -q '^release: 1\.6[89]\.'; then[0m
+2026-10-16T00:36:34.0077682Z [36;1m    touch "/home/runner/work/_temp"/.implicit_cargo_registries_crates_io_protocol || true[0m
+2026-10-16T00:36:34.0077964Z [36;1m    echo CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse >> $GITHUB_ENV[0m
+2026-10-16T00:36:34.0078225Z [36;1m  elif rustc +stable --version --verbose | grep -q '^release: 1\.6[67]\.'; then[0m
+2026-10-16T00:36:34.0078524Z [36;1m    touch "/home/runner/work/_temp"/.implicit_cargo_registries_crates_io_protocol || true[0m
+2026-10-16T00:36:34.0078897Z [36;1m    echo CARGO_REGISTRIES_CRATES_IO_PROTOCOL=git >> $GITHUB_ENV[0m
+2026-10-16T00:36:34.0079079Z [36;1m  fi[0m
+2026-10-16T00:36:34.0079182Z [36;1mfi[0m
+2026-10-16T00:36:34.0120601Z shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+2026-10-16T00:36:34.0120774Z env:
+2026-10-16T00:36:34.0120888Z   CARGO_NET_RETRY: 10
+2026-10-16T00:36:34.0121012Z   CARGO_HOME: /home/runner/.cargo
+2026-10-16T00:36:34.0121147Z   CARGO_INCREMENTAL: 0
+2026-10-16T00:36:34.0121267Z   CARGO_TERM_COLOR: always
+2026-10-16T00:36:34.0121389Z ##[endgroup]
+2026-10-16T00:36:34.0338045Z ##[end-action id=__dtolnay_rust-toolchain.__run_8;outcome=success;conclusion=success;duration_ms=27]
+2026-10-16T00:36:34.0339509Z ##[start-action display=Work around spurious network errors in curl 8.0;id=__dtolnay_rust-toolchain.__run_9]
+2026-10-16T00:36:34.0352889Z ##[group]Run # https://rust-lang.zulipchat.com/#narrow/stream/246057-t-cargo/topic/timeout.20investigation
+2026-10-16T00:36:34.0353484Z [36;1m# https://rust-lang.zulipchat.com/#narrow/stream/246057-t-cargo/topic/timeout.20investigation[0m
+2026-10-16T00:36:34.0353809Z [36;1mif rustc +stable --version --verbose | grep -q '^release: 1\.7[01]\.'; then[0m
+2026-10-16T00:36:34.0354052Z [36;1m  echo CARGO_HTTP_MULTIPLEXING=false >> $GITHUB_ENV[0m
+2026-10-16T00:36:34.0354221Z [36;1mfi[0m
+2026-10-16T00:36:34.0397716Z shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+2026-10-16T00:36:34.0397891Z env:
+2026-10-16T00:36:34.0397996Z   CARGO_NET_RETRY: 10
+2026-10-16T00:36:34.0398119Z   CARGO_HOME: /home/runner/.cargo
+2026-10-16T00:36:34.0398255Z   CARGO_INCREMENTAL: 0
+2026-10-16T00:36:34.0398372Z   CARGO_TERM_COLOR: always
+2026-10-16T00:36:34.0398491Z ##[endgroup]
+2026-10-16T00:36:34.0536159Z ##[end-action id=__dtolnay_rust-toolchain.__run_9;outcome=success;conclusion=success;duration_ms=19]
+2026-10-16T00:36:34.0538635Z ##[start-action display=rustc +stable --version --verbose;id=__dtolnay_rust-toolchain.__run_10]
+2026-10-16T00:36:34.0551188Z ##[group]Run rustc +stable --version --verbose
+2026-10-16T00:36:34.0551369Z [36;1mrustc +stable --version --verbose[0m
+2026-10-16T00:36:34.0593025Z shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+2026-10-16T00:36:34.0593198Z env:
+2026-10-16T00:36:34.0593469Z   CARGO_NET_RETRY: 10
+2026-10-16T00:36:34.0593599Z   CARGO_HOME: /home/runner/.cargo
+2026-10-16T00:36:34.0593732Z   CARGO_INCREMENTAL: 0
+2026-10-16T00:36:34.0593849Z   CARGO_TERM_COLOR: always
+2026-10-16T00:36:34.0593969Z ##[endgroup]
+2026-10-16T00:36:34.0718388Z rustc 1.99.1 (58cf8f9c3 2026-10-13)
+2026-10-16T00:36:34.0718645Z binary: rustc
+2026-10-16T00:36:34.0718865Z commit-hash: 58cf8f9c35b355199727627d07ae34a4e2846d67
+2026-10-16T00:36:34.0719249Z commit-date: 2026-10-13
+2026-10-16T00:36:34.0719453Z host: x86_64-unknown-linux-gnu
+2026-10-16T00:36:34.0719720Z release: 1.99.1
+2026-10-16T00:36:34.0719907Z LLVM version: 23.1.1
+2026-10-16T00:36:34.0729476Z ##[end-action id=__dtolnay_rust-toolchain.__run_10;outcome=success;conclusion=success;duration_ms=19]
+2026-10-16T00:36:34.0795462Z ##[group]Run Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+2026-10-16T00:36:34.0795673Z with:
+2026-10-16T00:36:34.0795793Z   workspaces: packages/aethyme/rust
+2026-10-16T00:36:34.0795938Z   shared-key: rust-tests
+2026-10-16T00:36:34.0796059Z   save-if: false
+2026-10-16T00:36:34.0796174Z   prefix-key: v0-rust
+2026-10-16T00:36:34.0796296Z   add-job-id-key: true
+2026-10-16T00:36:34.0796429Z   add-rust-environment-hash-key: true
+2026-10-16T00:36:34.0796575Z   cache-targets: true
+2026-10-16T00:36:34.0796699Z   cache-all-crates: false
+2026-10-16T00:36:34.0796836Z   cache-workspace-crates: false
+2026-10-16T00:36:34.0796976Z   cache-provider: github
+2026-10-16T00:36:34.0797098Z   cache-bin: true
+2026-10-16T00:36:34.0797208Z   lookup-only: false
+2026-10-16T00:36:34.0797322Z   cmd-format: {0}
+2026-10-16T00:36:34.0797427Z env:
+2026-10-16T00:36:34.0797538Z   CARGO_NET_RETRY: 10
+2026-10-16T00:36:34.0797661Z   CARGO_HOME: /home/runner/.cargo
+2026-10-16T00:36:34.0797817Z   CARGO_INCREMENTAL: 0
+2026-10-16T00:36:34.0797938Z   CARGO_TERM_COLOR: always
+2026-10-16T00:36:34.0798059Z ##[endgroup]
+2026-10-16T00:36:40.4690442Z ##[group]Cache Configuration
+2026-10-16T00:36:40.4690801Z Cache Provider:
+2026-10-16T00:36:40.4690973Z     github
+2026-10-16T00:36:40.4691134Z Workspaces:
+2026-10-16T00:36:40.4691372Z     /home/runner/work/Aethyme/Aethyme/packages/aethyme/rust
+2026-10-16T00:36:40.4691680Z Cache Paths:
+2026-10-16T00:36:40.4691847Z     /home/runner/.cargo/bin
+2026-10-16T00:36:40.4692053Z     /home/runner/.cargo/.crates.toml
+2026-10-16T00:36:40.4692281Z     /home/runner/.cargo/.crates2.json
+2026-10-16T00:36:40.4692558Z     /home/runner/.cargo/registry
+2026-10-16T00:36:40.4692777Z     /home/runner/.cargo/git
+2026-10-16T00:36:40.4693061Z     /home/runner/work/Aethyme/Aethyme/packages/aethyme/rust/target
+2026-10-16T00:36:40.4693469Z Restore Key:
+2026-10-16T00:36:40.4693720Z     v0-rust-rust-tests-Linux-x64-46bda623
+2026-10-16T00:36:40.4693960Z Cache Key:
+2026-10-16T00:36:40.4694183Z     v0-rust-rust-tests-Linux-x64-46bda623-418c313b
+2026-10-16T00:36:40.4694438Z .. Prefix:
+2026-10-16T00:36:40.4694618Z   - v0-rust-rust-tests-Linux-x64
+2026-10-16T00:36:40.4694843Z .. Environment considered:
+2026-10-16T00:36:40.4695036Z   - Rust Versions:
+2026-10-16T00:36:40.4695320Z     - 1.96.0 x86_64-unknown-linux-gnu ac68faa20c58cbccd01ee7208bf3b6e93a7d7f96
+2026-10-16T00:36:40.4695772Z     - 1.99.1 x86_64-unknown-linux-gnu 58cf8f9c35b355199727627d07ae34a4e2846d67
+2026-10-16T00:36:40.4696087Z   - CARGO_HOME
+2026-10-16T00:36:40.4696261Z   - CARGO_INCREMENTAL
+2026-10-16T00:36:40.4696442Z   - CARGO_NET_RETRY
+2026-10-16T00:36:40.4696620Z   - CARGO_TERM_COLOR
+2026-10-16T00:36:40.4696802Z .. Lockfiles considered:
+2026-10-16T00:36:40.4697028Z   - /home/runner/work/Aethyme/Aethyme/.cargo/config.toml
+2026-10-16T00:36:40.4697388Z   - /home/runner/work/Aethyme/Aethyme/packages/aethyme/rust/Cargo.lock
+2026-10-16T00:36:40.4698213Z   - /home/runner/work/Aethyme/Aethyme/packages/aethyme/rust/crates/aethyme-broker/Cargo.toml
+2026-10-16T00:36:40.4698761Z   - /home/runner/work/Aethyme/Aethyme/packages/aethyme/rust/crates/aethyme-cli/Cargo.toml
+2026-10-16T00:36:40.4699300Z   - /home/runner/work/Aethyme/Aethyme/packages/aethyme/rust/crates/aethyme-contracts/Cargo.toml
+2026-10-16T00:36:40.4699834Z   - /home/runner/work/Aethyme/Aethyme/packages/aethyme/rust/crates/aethyme-engine/Cargo.toml
+2026-10-16T00:36:40.4700388Z   - /home/runner/work/Aethyme/Aethyme/packages/aethyme/rust/crates/aethyme-enhance/Cargo.toml
+2026-10-16T00:36:40.4700938Z   - /home/runner/work/Aethyme/Aethyme/packages/aethyme/rust/crates/aethyme-graph-indexer/Cargo.toml
+2026-10-16T00:36:40.4701383Z   - /home/runner/work/Aethyme/Aethyme/packages/aethyme/rust/crates/aethyme-graph-schema/Cargo.toml
+2026-10-16T00:36:40.4701722Z   - /home/runner/work/Aethyme/Aethyme/packages/aethyme/rust/crates/aethyme-graph-storage/Cargo.toml
+2026-10-16T00:36:40.4702062Z   - /home/runner/work/Aethyme/Aethyme/packages/aethyme/rust/crates/aethyme-producers/Cargo.toml
+2026-10-16T00:36:40.4702611Z   - /home/runner/work/Aethyme/Aethyme/packages/aethyme/rust/crates/aethyme-quality/Cargo.toml
+2026-10-16T00:36:40.4702927Z   - /home/runner/work/Aethyme/Aethyme/packages/aethyme/rust/crates/aethyme-testkit/Cargo.toml
+2026-10-16T00:36:40.4703186Z   - /home/runner/work/Aethyme/Aethyme/rust-toolchain.toml
+2026-10-16T00:36:40.4703770Z ##[endgroup]
+2026-10-16T00:36:40.4703840Z 
+2026-10-16T00:36:40.4703893Z ... Restoring cache ...
+2026-10-16T00:36:40.6068891Z No cache found.
+2026-10-16T00:36:40.6146802Z ##[group]Run cargo test --locked --workspace --examples
+2026-10-16T00:36:40.6147028Z [36;1mcargo test --locked --workspace --examples[0m
+2026-10-16T00:36:40.6196669Z shell: /usr/bin/bash -e {0}
+2026-10-16T00:36:40.6196800Z env:
+2026-10-16T00:36:40.6196902Z   CARGO_NET_RETRY: 10
+2026-10-16T00:36:40.6197022Z   CARGO_HOME: /home/runner/.cargo
+2026-10-16T00:36:40.6197157Z   CARGO_INCREMENTAL: 0
+2026-10-16T00:36:40.6197286Z   CARGO_TERM_COLOR: always
+2026-10-16T00:36:40.6197410Z   CACHE_ON_FAILURE: false
+2026-10-16T00:36:40.6197532Z ##[endgroup]
+2026-10-16T00:36:40.6625298Z [1m[92m    Updating[0m crates.io index
+2026-10-16T00:36:41.5618333Z [1m[92m Downloading[0m crates ...
+2026-10-16T00:36:41.6465653Z [1m[92m  Downloaded[0m clap_lex v1.1.0
+2026-10-16T00:36:41.6514031Z [1m[92m  Downloaded[0m ahash v0.8.12
+2026-10-16T00:36:41.6557012Z [1m[92m  Downloaded[0m countme v3.0.1
+2026-10-16T00:36:41.6610508Z [1m[92m  Downloaded[0m oxc-miette-derive v2.7.1
+2026-10-16T00:36:41.6638632Z [1m[92m  Downloaded[0m equivalent v1.0.2
+2026-10-16T00:36:41.6662652Z [1m[92m  Downloaded[0m anstyle v1.0.14
+2026-10-16T00:36:41.6714108Z [1m[92m  Downloaded[0m castaway v0.2.4
+2026-10-16T00:36:41.6728872Z [1m[92m  Downloaded[0m owo-colors v4.3.0
+2026-10-16T00:36:41.6748210Z [1m[92m  Downloaded[0m oxc_ast_macros v0.125.0
+2026-10-16T00:36:41.6759379Z [1m[92m  Downloaded[0m anes v0.1.6
+2026-10-16T00:36:41.6783523Z [1m[92m  Downloaded[0m anstream v1.0.0
+2026-10-16T00:36:41.6801976Z [1m[92m  Downloaded[0m cfg-if v1.0.4
+2026-10-16T00:36:41.6824254Z [1m[92m  Downloaded[0m ciborium-io v0.2.2
+2026-10-16T00:36:41.6833400Z [1m[92m  Downloaded[0m block-buffer v0.10.4
+2026-10-16T00:36:41.6872948Z [1m[92m  Downloaded[0m oxc_diagnostics v0.125.0
+2026-10-16T00:36:41.6885805Z [1m[92m  Downloaded[0m dragonbox_ecma v0.1.12
+2026-10-16T00:36:41.6909252Z [1m[92m  Downloaded[0m heck v0.5.0
+2026-10-16T00:36:41.6921515Z [1m[92m  Downloaded[0m ciborium-ll v0.2.2
+2026-10-16T00:36:41.6931523Z [1m[92m  Downloaded[0m cfg_aliases v0.2.1
+2026-10-16T00:36:41.6941102Z [1m[92m  Downloaded[0m anstyle-query v1.1.5
+2026-10-16T00:36:41.6952033Z [1m[92m  Downloaded[0m autocfg v1.5.0
+2026-10-16T00:36:41.6973129Z [1m[92m  Downloaded[0m ciborium v0.2.2
+2026-10-16T00:36:41.6996551Z [1m[92m  Downloaded[0m phf_codegen v0.11.3
+2026-10-16T00:36:41.7006083Z [1m[92m  Downloaded[0m phf_shared v0.13.1
+2026-10-16T00:36:41.7015454Z [1m[92m  Downloaded[0m allocator-api2 v0.2.21
+2026-10-16T00:36:41.7036513Z [1m[92m  Downloaded[0m oxc_str v0.125.0
+2026-10-16T00:36:41.7046402Z [1m[92m  Downloaded[0m bincode v1.3.3
+2026-10-16T00:36:41.7070010Z [1m[92m  Downloaded[0m nonmax v0.5.5
+2026-10-16T00:36:41.7081995Z [1m[92m  Downloaded[0m itoa v1.0.17
+2026-10-16T00:36:41.7095622Z [1m[92m  Downloaded[0m get-size-derive2 v0.7.4
+2026-10-16T00:36:41.7104689Z [1m[92m  Downloaded[0m crypto-common v0.1.7
+2026-10-16T00:36:41.7114150Z [1m[92m  Downloaded[0m rustc-literal-escaper v0.0.4
+2026-10-16T00:36:41.7126679Z [1m[92m  Downloaded[0m attribute-derive-macro v0.10.5
+2026-10-16T00:36:41.7135245Z [1m[92m  Downloaded[0m toml_datetime v0.6.11
+2026-10-16T00:36:41.7145795Z [1m[92m  Downloaded[0m text-size v1.1.1
+2026-10-16T00:36:41.7164280Z [1m[92m  Downloaded[0m is_terminal_polyfill v1.70.2
+2026-10-16T00:36:41.7173746Z [1m[92m  Downloaded[0m errno v0.3.14
+2026-10-16T00:36:41.7188346Z [1m[92m  Downloaded[0m cpufeatures v0.3.0
+2026-10-16T00:36:41.7201336Z [1m[92m  Downloaded[0m percent-encoding v2.3.2
+2026-10-16T00:36:41.7210481Z [1m[92m  Downloaded[0m phf_generator v0.11.3
+2026-10-16T00:36:41.7221409Z [1m[92m  Downloaded[0m memoffset v0.9.1
+2026-10-16T00:36:41.7237969Z [1m[92m  Downloaded[0m phf_shared v0.11.3
+2026-10-16T00:36:41.7248920Z [1m[92m  Downloaded[0m generic-array v0.14.7
+2026-10-16T00:36:41.7262521Z [1m[92m  Downloaded[0m data-encoding v2.11.1
+2026-10-16T00:36:41.7271725Z [1m[92m  Downloaded[0m anstyle-parse v1.0.0
+2026-10-16T00:36:41.7286209Z [1m[92m  Downloaded[0m cc v1.2.56
+2026-10-16T00:36:41.7310505Z [1m[92m  Downloaded[0m manyhow v0.11.4
+2026-10-16T00:36:41.7326329Z [1m[92m  Downloaded[0m same-file v1.0.6
+2026-10-16T00:36:41.7339551Z [1m[92m  Downloaded[0m version_check v0.9.5
+2026-10-16T00:36:41.7350656Z [1m[92m  Downloaded[0m ra_ap_edition v0.0.331
+2026-10-16T00:36:41.7357181Z [1m[92m  Downloaded[0m unicode_names2_generator v1.3.0
+2026-10-16T00:36:41.7366085Z [1m[92m  Downloaded[0m interpolator v0.5.0
+2026-10-16T00:36:41.7384223Z [1m[92m  Downloaded[0m num-integer v0.1.46
+2026-10-16T00:36:41.7399109Z [1m[92m  Downloaded[0m strsim v0.11.1
+2026-10-16T00:36:41.7414224Z [1m[92m  Downloaded[0m tree-sitter-language v0.1.7
+2026-10-16T00:36:41.7429809Z [1m[92m  Downloaded[0m walkdir v2.5.0
+2026-10-16T00:36:41.7444322Z [1m[92m  Downloaded[0m filetime v0.2.29
+2026-10-16T00:36:41.7460816Z [1m[92m  Downloaded[0m quote-use v0.8.4
+2026-10-16T00:36:41.7467324Z [1m[92m  Downloaded[0m criterion-plot v0.5.0
+2026-10-16T00:36:41.7482215Z [1m[92m  Downloaded[0m getrandom v0.2.17
+2026-10-16T00:36:41.7511106Z [1m[92m  Downloaded[0m zmij v1.0.21
+2026-10-16T00:36:41.7526183Z [1m[92m  Downloaded[0m proc-macro-utils v0.10.0
+2026-10-16T00:36:41.7536782Z [1m[92m  Downloaded[0m phf_macros v0.13.1
+2026-10-16T00:36:41.7548444Z [1m[92m  Downloaded[0m ppv-lite86 v0.2.21
+2026-10-16T00:36:41.7561467Z [1m[92m  Downloaded[0m unicode-properties v0.1.4
+2026-10-16T00:36:41.7577413Z [1m[92m  Downloaded[0m log v0.4.29
+2026-10-16T00:36:41.7601943Z [1m[92m  Downloaded[0m unicode-ident v1.0.24
+2026-10-16T00:36:41.7624446Z [1m[92m  Downloaded[0m rand_core v0.6.4
+2026-10-16T00:36:41.7636047Z [1m[92m  Downloaded[0m unicode-linebreak v0.1.5
+2026-10-16T00:36:41.7644178Z [1m[92m  Downloaded[0m tinyvec_macros v0.1.1
+2026-10-16T00:36:41.7651465Z [1m[92m  Downloaded[0m smawk v0.3.2
+2026-10-16T00:36:41.7662987Z [1m[92m  Downloaded[0m oxc-miette v2.7.1
+2026-10-16T00:36:41.7696830Z [1m[92m  Downloaded[0m serde_ignored v0.1.14
+2026-10-16T00:36:41.7710567Z [1m[92m  Downloaded[0m zerocopy-derive v0.8.42
+2026-10-16T00:36:41.7784228Z [1m[92m  Downloaded[0m unicode-normalization v0.1.25
+2026-10-16T00:36:41.7811372Z [1m[92m  Downloaded[0m streaming-iterator v0.1.9
+2026-10-16T00:36:41.7822142Z [1m[92m  Downloaded[0m clap_builder v4.6.7
+2026-10-16T00:36:41.7870913Z [1m[92m  Downloaded[0m rand_chacha v0.3.1
+2026-10-16T00:36:41.7881345Z [1m[92m  Downloaded[0m quote v1.0.45
+2026-10-16T00:36:41.7905185Z [1m[92m  Downloaded[0m triomphe v0.1.15
+2026-10-16T00:36:41.7925674Z [1m[92m  Downloaded[0m vcpkg v0.2.15
+2026-10-16T00:36:41.8334389Z [1m[92m  Downloaded[0m tempfile v3.27.0
+2026-10-16T00:36:41.8357938Z [1m[92m  Downloaded[0m zerocopy v0.8.42
+2026-10-16T00:36:41.8482798Z [1m[92m  Downloaded[0m unicode-width v0.2.2
+2026-10-16T00:36:41.8523888Z [1m[92m  Downloaded[0m similar v3.2.0
+2026-10-16T00:36:41.8551344Z [1m[92m  Downloaded[0m bstr v1.12.1
+2026-10-16T00:36:41.8609446Z [1m[92m  Downloaded[0m unicode_names2 v1.3.0
+2026-10-16T00:36:41.8657896Z [1m[92m  Downloaded[0m rustpython-ruff_python_ast v0.15.8
+2026-10-16T00:36:41.8691551Z [1m[92m  Downloaded[0m regex v1.12.4
+2026-10-16T00:36:41.8731689Z [1m[92m  Downloaded[0m serde_json v1.0.151
+2026-10-16T00:36:41.8786887Z [1m[92m  Downloaded[0m tree-sitter v0.25.10
+2026-10-16T00:36:41.8832172Z [1m[92m  Downloaded[0m winnow v0.7.15
+2026-10-16T00:36:41.8903597Z [1m[92m  Downloaded[0m redb v4.1.0
+2026-10-16T00:36:41.8957458Z [1m[92m  Downloaded[0m rayon v1.11.0
+2026-10-16T00:36:41.9027026Z [1m[92m  Downloaded[0m ra_ap_parser v0.0.331
+2026-10-16T00:36:41.9553902Z [1m[92m  Downloaded[0m oxc_parser v0.125.0
+2026-10-16T00:36:41.9599723Z [1m[92m  Downloaded[0m rusqlite v0.32.1
+2026-10-16T00:36:41.9645878Z [1m[92m  Downloaded[0m syn v3.0.6
+2026-10-16T00:36:41.9725254Z [1m[92m  Downloaded[0m syn v2.0.117
+2026-10-16T00:36:41.9803742Z [1m[92m  Downloaded[0m oxc_ast v0.125.0
+2026-10-16T00:36:41.9850316Z [1m[92m  Downloaded[0m ra_ap_syntax v0.0.331
+2026-10-16T00:36:41.9902595Z [1m[92m  Downloaded[0m rustix v1.1.4
+2026-10-16T00:36:42.0105294Z [1m[92m  Downloaded[0m regex-syntax v0.8.11
+2026-10-16T00:36:42.0155402Z [1m[92m  Downloaded[0m toml_edit v0.22.27
+2026-10-16T00:36:42.0188724Z [1m[92m  Downloaded[0m tracing v0.1.44
+2026-10-16T00:36:42.0302661Z [1m[92m  Downloaded[0m tree-sitter-php v0.23.11
+2026-10-16T00:36:42.0424141Z [1m[92m  Downloaded[0m rand v0.8.6
+2026-10-16T00:36:42.0449068Z [1m[92m  Downloaded[0m oxc_allocator v0.125.0
+2026-10-16T00:36:42.0475783Z [1m[92m  Downloaded[0m tracing-core v0.1.36
+2026-10-16T00:36:42.0495904Z [1m[92m  Downloaded[0m tar v0.4.46
+2026-10-16T00:36:42.0517707Z [1m[92m  Downloaded[0m rustpython-ruff_python_parser v0.15.8
+2026-10-16T00:36:42.1175603Z [1m[92m  Downloaded[0m libc v0.2.190
+2026-10-16T00:36:42.1530662Z [1m[92m  Downloaded[0m serde v1.0.229
+2026-10-16T00:36:42.1555991Z [1m[92m  Downloaded[0m rayon-core v1.13.0
+2026-10-16T00:36:42.1582711Z [1m[92m  Downloaded[0m textwrap v0.16.2
+2026-10-16T00:36:42.1600642Z [1m[92m  Downloaded[0m smallvec v1.15.1
+2026-10-16T00:36:42.1616103Z [1m[92m  Downloaded[0m regex-automata v0.4.18
+2026-10-16T00:36:42.1716240Z [1m[92m  Downloaded[0m serde_derive v1.0.229
+2026-10-16T00:36:42.1738058Z [1m[92m  Downloaded[0m serde_core v1.0.229
+2026-10-16T00:36:42.1757339Z [1m[92m  Downloaded[0m ryu v1.0.23
+2026-10-16T00:36:42.1780738Z [1m[92m  Downloaded[0m oxc_regular_expression v0.125.0
+2026-10-16T00:36:42.1809356Z [1m[92m  Downloaded[0m oxc_ecmascript v0.125.0
+2026-10-16T00:36:42.1834437Z [1m[92m  Downloaded[0m static_assertions v1.1.0
+2026-10-16T00:36:42.1845015Z [1m[92m  Downloaded[0m sha2 v0.10.9
+2026-10-16T00:36:42.1865053Z [1m[92m  Downloaded[0m rowan v0.15.18
+2026-10-16T00:36:42.1881696Z [1m[92m  Downloaded[0m ra-ap-rustc_lexer v0.160.0
+2026-10-16T00:36:42.1887453Z [1m[92m  Downloaded[0m proc-macro2 v1.0.106
+2026-10-16T00:36:42.1908051Z [1m[92m  Downloaded[0m utf8parse v0.2.2
+2026-10-16T00:36:42.1915333Z [1m[92m  Downloaded[0m tinyvec v1.11.0
+2026-10-16T00:36:42.1933074Z [1m[92m  Downloaded[0m toml v0.8.23
+2026-10-16T00:36:42.1949787Z [1m[92m  Downloaded[0m tinytemplate v1.2.1
+2026-10-16T00:36:42.1962094Z [1m[92m  Downloaded[0m thiserror-impl v2.0.21
+2026-10-16T00:36:42.1972397Z [1m[92m  Downloaded[0m thiserror v2.0.21
+2026-10-16T00:36:42.2019255Z [1m[92m  Downloaded[0m noyalib v0.0.53
+2026-10-16T00:36:42.2484294Z [1m[92m  Downloaded[0m smol_str v0.3.6
+2026-10-16T00:36:42.2496231Z [1m[92m  Downloaded[0m serde_spanned v0.6.9
+2026-10-16T00:36:42.2503177Z [1m[92m  Downloaded[0m semver v1.0.28
+2026-10-16T00:36:42.2519834Z [1m[92m  Downloaded[0m rustversion v1.0.22
+2026-10-16T00:36:42.2539833Z [1m[92m  Downloaded[0m ra_ap_stdx v0.0.331
+2026-10-16T00:36:42.2550802Z [1m[92m  Downloaded[0m hashbrown v0.14.5
+2026-10-16T00:36:42.2584507Z [1m[92m  Downloaded[0m blake3 v1.8.7
+2026-10-16T00:36:42.2640606Z [1m[92m  Downloaded[0m oxc_span v0.125.0
+2026-10-16T00:36:42.2651696Z [1m[92m  Downloaded[0m oxc_estree v0.125.0
+2026-10-16T00:36:42.2662828Z [1m[92m  Downloaded[0m libm v0.2.16
+2026-10-16T00:36:42.2741756Z [1m[92m  Downloaded[0m itertools v0.14.0
+2026-10-16T00:36:42.2791085Z [1m[92m  Downloaded[0m hashbrown v0.17.1
+2026-10-16T00:36:42.2828273Z [1m[92m  Downloaded[0m hashbrown v0.16.1
+2026-10-16T00:36:42.2864608Z [1m[92m  Downloaded[0m toml_write v0.1.2
+2026-10-16T00:36:42.2873518Z [1m[92m  Downloaded[0m shlex v1.3.0
+2026-10-16T00:36:42.2882560Z [1m[92m  Downloaded[0m seq-macro v0.3.6
+2026-10-16T00:36:42.2895761Z [1m[92m  Downloaded[0m rustpython-ruff_text_size v0.15.8
+2026-10-16T00:36:42.2905755Z [1m[92m  Downloaded[0m rustpython-ruff_source_file v0.15.8
+2026-10-16T00:36:42.2913150Z [1m[92m  Downloaded[0m rustpython-ruff_python_trivia v0.15.8
+2026-10-16T00:36:42.2922644Z [1m[92m  Downloaded[0m aho-corasick v1.1.4
+2026-10-16T00:36:42.2959560Z [1m[92m  Downloaded[0m unicode-segmentation v1.13.2
+2026-10-16T00:36:42.2980046Z [1m[92m  Downloaded[0m num-bigint v0.4.6
+2026-10-16T00:36:42.3012965Z [1m[92m  Downloaded[0m itertools v0.10.5
+2026-10-16T00:36:42.3057823Z [1m[92m  Downloaded[0m memchr v2.8.0
+2026-10-16T00:36:42.3096520Z [1m[92m  Downloaded[0m criterion v0.5.1
+2026-10-16T00:36:42.3148090Z [1m[92m  Downloaded[0m rustc-hash v2.1.1
+2026-10-16T00:36:42.3157548Z [1m[92m  Downloaded[0m rustc-hash v1.1.0
+2026-10-16T00:36:42.3163964Z [1m[92m  Downloaded[0m siphasher v1.0.3
+2026-10-16T00:36:42.3173634Z [1m[92m  Downloaded[0m sha1 v0.10.7
+2026-10-16T00:36:42.3184578Z [1m[92m  Downloaded[0m oxc_ast_visit v0.125.0
+2026-10-16T00:36:42.3198357Z [1m[92m  Downloaded[0m pkg-config v0.3.33
+2026-10-16T00:36:42.3209454Z [1m[92m  Downloaded[0m phf v0.11.3
+2026-10-16T00:36:42.3218553Z [1m[92m  Downloaded[0m ordermap v1.2.0
+2026-10-16T00:36:42.3243675Z [1m[92m  Downloaded[0m derive-where v1.6.1
+2026-10-16T00:36:42.3272020Z [1m[92m  Downloaded[0m crossbeam-channel v0.5.15
+2026-10-16T00:36:42.3300097Z [1m[92m  Downloaded[0m compact_str v0.9.0
+2026-10-16T00:36:42.3322854Z [1m[92m  Downloaded[0m borsh v1.6.1
+2026-10-16T00:36:42.3374174Z [1m[92m  Downloaded[0m typenum v1.19.0
+2026-10-16T00:36:42.3400214Z [1m[92m  Downloaded[0m getrandom v0.4.2
+2026-10-16T00:36:42.3427129Z [1m[92m  Downloaded[0m oxc_data_structures v0.125.0
+2026-10-16T00:36:42.3440881Z [1m[92m  Downloaded[0m clap v4.6.7
+2026-10-16T00:36:42.3510602Z [1m[92m  Downloaded[0m phf v0.13.1
+2026-10-16T00:36:42.3519892Z [1m[92m  Downloaded[0m bytes v1.11.1
+2026-10-16T00:36:42.3550637Z [1m[92m  Downloaded[0m unicode-id-start v1.4.0
+2026-10-16T00:36:42.3570892Z [1m[92m  Downloaded[0m phf_generator v0.13.1
+2026-10-16T00:36:42.3579228Z [1m[92m  Downloaded[0m once_cell v1.21.4
+2026-10-16T00:36:42.3597607Z [1m[92m  Downloaded[0m num-traits v0.2.19
+2026-10-16T00:36:42.3616481Z [1m[92m  Downloaded[0m indexmap v2.14.0
+2026-10-16T00:36:42.3646488Z [1m[92m  Downloaded[0m half v2.7.1
+2026-10-16T00:36:42.3669809Z [1m[92m  Downloaded[0m crossbeam-epoch v0.9.21
+2026-10-16T00:36:42.3687615Z [1m[92m  Downloaded[0m constant_time_eq v0.4.2
+2026-10-16T00:36:42.3702703Z [1m[92m  Downloaded[0m clap_derive v4.6.7
+2026-10-16T00:36:42.3718230Z [1m[92m  Downloaded[0m bitflags v2.11.0
+2026-10-16T00:36:42.3749012Z [1m[92m  Downloaded[0m hashlink v0.9.1
+2026-10-16T00:36:42.3761744Z [1m[92m  Downloaded[0m globset v0.4.20
+2026-10-16T00:36:42.3772598Z [1m[92m  Downloaded[0m fastrand v2.4.1
+2026-10-16T00:36:42.3782439Z [1m[92m  Downloaded[0m fallible-iterator v0.3.0
+2026-10-16T00:36:42.3791574Z [1m[92m  Downloaded[0m digest v0.10.7
+2026-10-16T00:36:42.3804302Z [1m[92m  Downloaded[0m crossbeam-utils v0.8.21
+2026-10-16T00:36:42.3823096Z [1m[92m  Downloaded[0m colorchoice v1.0.5
+2026-10-16T00:36:42.3829725Z [1m[92m  Downloaded[0m get-size2 v0.7.4
+2026-10-16T00:36:42.3846277Z [1m[92m  Downloaded[0m getopts v0.2.24
+2026-10-16T00:36:42.3857708Z [1m[92m  Downloaded[0m find-msvc-tools v0.1.9
+2026-10-16T00:36:42.3869075Z [1m[92m  Downloaded[0m either v1.15.0
+2026-10-16T00:36:42.3879453Z [1m[92m  Downloaded[0m quote-use-macros v0.8.4
+2026-10-16T00:36:42.3886790Z [1m[92m  Downloaded[0m pin-project-lite v0.2.17
+2026-10-16T00:36:42.3928907Z [1m[92m  Downloaded[0m oxc_syntax v0.125.0
+2026-10-16T00:36:42.3945605Z [1m[92m  Downloaded[0m oxc_index v4.1.0
+2026-10-16T00:36:42.3954009Z [1m[92m  Downloaded[0m oorandom v11.1.5
+2026-10-16T00:36:42.3961043Z [1m[92m  Downloaded[0m manyhow-macros v0.11.4
+2026-10-16T00:36:42.3966119Z [1m[92m  Downloaded[0m is-terminal v0.4.17
+2026-10-16T00:36:42.3972435Z [1m[92m  Downloaded[0m crossbeam-deque v0.8.6
+2026-10-16T00:36:42.3982685Z [1m[92m  Downloaded[0m fallible-streaming-iterator v0.1.9
+2026-10-16T00:36:42.3989213Z [1m[92m  Downloaded[0m drop_bomb v0.1.5
+2026-10-16T00:36:42.3995509Z [1m[92m  Downloaded[0m cpufeatures v0.2.17
+2026-10-16T00:36:42.4005310Z [1m[92m  Downloaded[0m cast v0.3.0
+2026-10-16T00:36:42.4013746Z [1m[92m  Downloaded[0m attribute-derive v0.10.5
+2026-10-16T00:36:42.4023465Z [1m[92m  Downloaded[0m arrayvec v0.7.6
+2026-10-16T00:36:42.4037849Z [1m[92m  Downloaded[0m is-macro v0.3.7
+2026-10-16T00:36:42.4046335Z [1m[92m  Downloaded[0m cow-utils v0.1.3
+2026-10-16T00:36:42.4054596Z [1m[92m  Downloaded[0m jod-thread v1.0.0
+2026-10-16T00:36:42.4060516Z [1m[92m  Downloaded[0m collection_literals v1.0.3
+2026-10-16T00:36:42.4119820Z [1m[92m  Downloaded[0m linux-raw-sys v0.12.1
+2026-10-16T00:36:42.4574237Z [1m[92m  Downloaded[0m libsqlite3-sys v0.30.1
+2026-10-16T00:36:42.6282071Z [1m[92m   Compiling[0m unicode-ident v1.0.24
+2026-10-16T00:36:42.6282468Z [1m[92m   Compiling[0m proc-macro2 v1.0.106
+2026-10-16T00:36:42.6282811Z [1m[92m   Compiling[0m quote v1.0.45
+2026-10-16T00:36:42.6293774Z [1m[92m   Compiling[0m cfg-if v1.0.4
+2026-10-16T00:36:42.6507881Z [1m[92m   Compiling[0m serde_core v1.0.229
+2026-10-16T00:36:42.6698826Z [1m[92m   Compiling[0m itoa v1.0.17
+2026-10-16T00:36:42.7394238Z [1m[92m   Compiling[0m allocator-api2 v0.2.21
+2026-10-16T00:36:42.7494608Z [1m[92m   Compiling[0m siphasher v1.0.3
+2026-10-16T00:36:42.8336181Z [1m[92m   Compiling[0m version_check v0.9.5
+2026-10-16T00:36:42.9463429Z [1m[92m   Compiling[0m hashbrown v0.17.1
+2026-10-16T00:36:42.9905221Z [1m[92m   Compiling[0m memchr v2.8.0
+2026-10-16T00:36:43.2575272Z [1m[92m   Compiling[0m syn v2.0.117
+2026-10-16T00:36:43.3062600Z [1m[92m   Compiling[0m syn v3.0.6
+2026-10-16T00:36:43.3854680Z [1m[92m   Compiling[0m equivalent v1.0.2
+2026-10-16T00:36:43.4105125Z [1m[92m   Compiling[0m serde v1.0.229
+2026-10-16T00:36:43.5334807Z [1m[92m   Compiling[0m rustversion v1.0.22
+2026-10-16T00:36:43.6664641Z [1m[92m   Compiling[0m thiserror v2.0.21
+2026-10-16T00:36:43.7934950Z [1m[92m   Compiling[0m find-msvc-tools v0.1.9
+2026-10-16T00:36:43.8974555Z [1m[92m   Compiling[0m shlex v1.3.0
+2026-10-16T00:36:43.9735050Z [1m[92m   Compiling[0m cc v1.2.56
+2026-10-16T00:36:44.4018505Z [1m[92m   Compiling[0m unicode-width v0.2.2
+2026-10-16T00:36:44.5135178Z [1m[92m   Compiling[0m ryu v1.0.23
+2026-10-16T00:36:44.5904468Z [1m[92m   Compiling[0m castaway v0.2.4
+2026-10-16T00:36:44.6274746Z [1m[92m   Compiling[0m static_assertions v1.1.0
+2026-10-16T00:36:44.6485288Z [1m[92m   Compiling[0m compact_str v0.9.0
+2026-10-16T00:36:44.7594708Z [1m[92m   Compiling[0m indexmap v2.14.0
+2026-10-16T00:36:44.9584735Z [1m[92m   Compiling[0m smallvec v1.15.1
+2026-10-16T00:36:45.0655060Z [1m[92m   Compiling[0m typenum v1.19.0
+2026-10-16T00:36:45.1585040Z [1m[92m   Compiling[0m proc-macro-utils v0.10.0
+2026-10-16T00:36:45.2025217Z [1m[92m   Compiling[0m generic-array v0.14.7
+2026-10-16T00:36:45.2635138Z [1m[92m   Compiling[0m bitflags v2.11.0
+2026-10-16T00:36:45.3624816Z [1m[92m   Compiling[0m libc v0.2.190
+2026-10-16T00:36:45.4204927Z [1m[92m   Compiling[0m zmij v1.0.21
+2026-10-16T00:36:45.5100044Z [1m[92m   Compiling[0m rustc-hash v2.1.1
+2026-10-16T00:36:45.5478852Z [1m[92m   Compiling[0m once_cell v1.21.4
+2026-10-16T00:36:45.5822516Z [1m[92m   Compiling[0m serde_derive v1.0.229
+2026-10-16T00:36:45.5924363Z [1m[92m   Compiling[0m thiserror-impl v2.0.21
+2026-10-16T00:36:46.0365026Z [1m[92m   Compiling[0m phf_shared v0.13.1
+2026-10-16T00:36:46.0435729Z [1m[92m   Compiling[0m autocfg v1.5.0
+2026-10-16T00:36:46.1524761Z [1m[92m   Compiling[0m zerocopy v0.8.42
+2026-10-16T00:36:46.4850402Z [1m[92m   Compiling[0m owo-colors v4.3.0
+2026-10-16T00:36:47.0914982Z [1m[92m   Compiling[0m getrandom v0.2.17
+2026-10-16T00:36:47.1691039Z [1m[92m   Compiling[0m quote-use-macros v0.8.4
+2026-10-16T00:36:47.2064786Z [1m[92m   Compiling[0m manyhow-macros v0.11.4
+2026-10-16T00:36:47.3907756Z [1m[92m   Compiling[0m unicode-linebreak v0.1.5
+2026-10-16T00:36:47.4235793Z [1m[92m   Compiling[0m smawk v0.3.2
+2026-10-16T00:36:47.4764821Z [1m[92m   Compiling[0m manyhow v0.11.4
+2026-10-16T00:36:47.5025066Z [1m[92m   Compiling[0m textwrap v0.16.2
+2026-10-16T00:36:47.5937293Z [1m[92m   Compiling[0m quote-use v0.8.4
+2026-10-16T00:36:47.6172754Z [1m[92m   Compiling[0m rand_core v0.6.4
+2026-10-16T00:36:47.7119416Z [1m[92m   Compiling[0m crypto-common v0.1.7
+2026-10-16T00:36:47.7284937Z [1m[92m   Compiling[0m block-buffer v0.10.4
+2026-10-16T00:36:47.7575283Z [1m[92m   Compiling[0m oxc-miette-derive v2.7.1
+2026-10-16T00:36:47.7784638Z [1m[92m   Compiling[0m interpolator v0.5.0
+2026-10-16T00:36:47.9404569Z [1m[92m   Compiling[0m collection_literals v1.0.3
+2026-10-16T00:36:47.9645017Z [1m[92m   Compiling[0m fastrand v2.4.1
+2026-10-16T00:36:48.0214837Z [1m[92m   Compiling[0m crossbeam-utils v0.8.21
+2026-10-16T00:36:48.1469837Z [1m[92m   Compiling[0m unicode-segmentation v1.13.2
+2026-10-16T00:36:48.1744645Z [1m[92m   Compiling[0m oxc_data_structures v0.125.0
+2026-10-16T00:36:48.2560783Z [1m[92m   Compiling[0m oxc_allocator v0.125.0
+2026-10-16T00:36:48.3794879Z [1m[92m   Compiling[0m phf_generator v0.13.1
+2026-10-16T00:36:48.3974771Z [1m[92m   Compiling[0m oxc-miette v2.7.1
+2026-10-16T00:36:48.4614773Z [1m[92m   Compiling[0m attribute-derive-macro v0.10.5
+2026-10-16T00:36:48.5585249Z [1m[92m   Compiling[0m digest v0.10.7
+2026-10-16T00:36:48.6504476Z [1m[92m   Compiling[0m phf v0.13.1
+2026-10-16T00:36:48.7114500Z [1m[92m   Compiling[0m derive-where v1.6.1
+2026-10-16T00:36:48.8335118Z [1m[92m   Compiling[0m ppv-lite86 v0.2.21
+2026-10-16T00:36:49.0027090Z [1m[92m   Compiling[0m rand_chacha v0.3.1
+2026-10-16T00:36:49.0254511Z [1m[92m   Compiling[0m serde_json v1.0.151
+2026-10-16T00:36:49.0875220Z [1m[92m   Compiling[0m cpufeatures v0.2.17
+2026-10-16T00:36:49.1085025Z [1m[92m   Compiling[0m oxc_estree v0.125.0
+2026-10-16T00:36:49.1319142Z [1m[92m   Compiling[0m winnow v0.7.15
+2026-10-16T00:36:49.2085135Z [1m[92m   Compiling[0m oxc_str v0.125.0
+2026-10-16T00:36:49.2254785Z [1m[92m   Compiling[0m rand v0.8.6
+2026-10-16T00:36:49.2894697Z [1m[92m   Compiling[0m oxc_ast_macros v0.125.0
+2026-10-16T00:36:49.4264580Z [1m[92m   Compiling[0m attribute-derive v0.10.5
+2026-10-16T00:36:49.5194710Z [1m[92m   Compiling[0m phf_macros v0.13.1
+2026-10-16T00:36:49.7715011Z [1m[92m   Compiling[0m zerocopy-derive v0.8.42
+2026-10-16T00:36:49.8905762Z [1m[92m   Compiling[0m aho-corasick v1.1.4
+2026-10-16T00:36:49.8964860Z [1m[92m   Compiling[0m ahash v0.8.12
+2026-10-16T00:36:49.9674987Z [1m[92m   Compiling[0m phf_shared v0.11.3
+2026-10-16T00:36:50.0365182Z [1m[92m   Compiling[0m dragonbox_ecma v0.1.12
+2026-10-16T00:36:50.1275388Z [1m[92m   Compiling[0m either v1.15.0
+2026-10-16T00:36:50.2121052Z [1m[92m   Compiling[0m cow-utils v0.1.3
+2026-10-16T00:36:50.2325258Z [1m[92m   Compiling[0m phf_generator v0.11.3
+2026-10-16T00:36:50.3159194Z [1m[92m   Compiling[0m get-size-derive2 v0.7.4
+2026-10-16T00:36:50.3668619Z [1m[92m   Compiling[0m oxc_span v0.125.0
+2026-10-16T00:36:50.5954435Z [1m[92m   Compiling[0m sha2 v0.10.9
+2026-10-16T00:36:50.7715046Z [1m[92m   Compiling[0m toml_datetime v0.6.11
+2026-10-16T00:36:50.8854776Z [1m[92m   Compiling[0m serde_spanned v0.6.9
+2026-10-16T00:36:50.9344859Z [1m[92m   Compiling[0m num-traits v0.2.19
+2026-10-16T00:36:50.9605168Z [1m[92m   Compiling[0m ordermap v1.2.0
+2026-10-16T00:36:50.9895082Z [1m[92m   Compiling[0m percent-encoding v2.3.2
+2026-10-16T00:36:51.0974912Z [1m[92m   Compiling[0m tree-sitter-language v0.1.7
+2026-10-16T00:36:51.1480838Z [1m[92m   Compiling[0m hashbrown v0.16.1
+2026-10-16T00:36:51.1521945Z [1m[92m   Compiling[0m nonmax v0.5.5
+2026-10-16T00:36:51.1785034Z [1m[92m   Compiling[0m unicode-id-start v1.4.0
+2026-10-16T00:36:51.2305468Z [1m[92m   Compiling[0m regex-syntax v0.8.11
+2026-10-16T00:36:51.2965149Z [1m[92m   Compiling[0m toml_write v0.1.2
+2026-10-16T00:36:51.3869558Z [1m[92m   Compiling[0m log v0.4.29
+2026-10-16T00:36:51.4635090Z [1m[92m   Compiling[0m get-size2 v0.7.4
+2026-10-16T00:36:51.4803891Z [1m[92m   Compiling[0m toml_edit v0.22.27
+2026-10-16T00:36:51.5725128Z [1m[92m   Compiling[0m oxc_index v4.1.0
+2026-10-16T00:36:51.7845144Z [1m[92m   Compiling[0m oxc_diagnostics v0.125.0
+2026-10-16T00:36:51.9984880Z [1m[92m   Compiling[0m phf_codegen v0.11.3
+2026-10-16T00:36:52.1205031Z [1m[92m   Compiling[0m itertools v0.14.0
+2026-10-16T00:36:52.7865156Z [1m[92m   Compiling[0m regex-automata v0.4.18
+2026-10-16T00:36:53.0265114Z [1m[92m   Compiling[0m blake3 v1.8.7
+2026-10-16T00:36:53.1025309Z [1m[92m   Compiling[0m getopts v0.2.24
+2026-10-16T00:36:53.1565257Z [1m[92m   Compiling[0m data-encoding v2.11.1
+2026-10-16T00:36:53.3024878Z [1m[92m   Compiling[0m crossbeam-epoch v0.9.21
+2026-10-16T00:36:53.3864808Z [1m[92m   Compiling[0m heck v0.5.0
+2026-10-16T00:36:53.5432077Z [1m[92m   Compiling[0m unicode_names2_generator v1.3.0
+2026-10-16T00:36:53.9015335Z [1m[92m   Compiling[0m hashbrown v0.14.5
+2026-10-16T00:36:54.0533805Z [1m[92m   Compiling[0m toml v0.8.23
+2026-10-16T00:36:54.1901341Z [1m[92m   Compiling[0m oxc_syntax v0.125.0
+2026-10-16T00:36:54.5684606Z [1m[92m   Compiling[0m oxc_regular_expression v0.125.0
+2026-10-16T00:36:54.7074781Z [1m[92m   Compiling[0m rustpython-ruff_text_size v0.15.8
+2026-10-16T00:36:54.7775173Z [1m[92m   Compiling[0m memoffset v0.9.1
+2026-10-16T00:36:54.8395286Z [1m[92m   Compiling[0m tracing-core v0.1.36
+2026-10-16T00:36:55.0472474Z [1m[92m   Compiling[0m cpufeatures v0.3.0
+2026-10-16T00:36:55.0814818Z [1m[92m   Compiling[0m pin-project-lite v0.2.17
+2026-10-16T00:36:55.1185147Z [1m[92m   Compiling[0m constant_time_eq v0.4.2
+2026-10-16T00:36:55.1845287Z [1m[92m   Compiling[0m arrayvec v0.7.6
+2026-10-16T00:36:55.2765053Z [1m[92m   Compiling[0m utf8parse v0.2.2
+2026-10-16T00:36:55.3114727Z [1m[92m   Compiling[0m anstyle-parse v1.0.0
+2026-10-16T00:36:55.3804699Z [1m[92m   Compiling[0m tracing v0.1.44
+2026-10-16T00:36:55.4786154Z [1m[92m   Compiling[0m oxc_ast v0.125.0
+2026-10-16T00:36:55.5784330Z [1m[92m   Compiling[0m rustpython-ruff_source_file v0.15.8
+2026-10-16T00:36:55.6014799Z [1m[92m   Compiling[0m num-integer v0.1.46
+2026-10-16T00:36:55.7256429Z [1m[92m   Compiling[0m unicode_names2 v1.3.0
+2026-10-16T00:36:55.8848076Z [1m[92m   Compiling[0m anstyle-query v1.1.5
+2026-10-16T00:36:55.9190888Z [1m[92m   Compiling[0m getrandom v0.4.2
+2026-10-16T00:36:55.9654951Z [1m[92m   Compiling[0m rayon-core v1.13.0
+2026-10-16T00:36:56.0065150Z [1m[92m   Compiling[0m colorchoice v1.0.5
+2026-10-16T00:36:56.0235346Z [1m[92m   Compiling[0m unicode-properties v0.1.4
+2026-10-16T00:36:56.0495082Z [1m[92m   Compiling[0m rustix v1.1.4
+2026-10-16T00:36:56.0785138Z [1m[92m   Compiling[0m tinyvec_macros v0.1.1
+2026-10-16T00:36:56.1025087Z [1m[92m   Compiling[0m anstyle v1.0.14
+2026-10-16T00:36:56.1866236Z [1m[92m   Compiling[0m is_terminal_polyfill v1.70.2
+2026-10-16T00:36:56.2195107Z [1m[92m   Compiling[0m anstream v1.0.0
+2026-10-16T00:36:56.2738934Z [1m[92m   Compiling[0m tinyvec v1.11.0
+2026-10-16T00:36:56.3835650Z [1m[92m   Compiling[0m ra-ap-rustc_lexer v0.160.0
+2026-10-16T00:36:56.4968942Z [1m[92m   Compiling[0m crossbeam-deque v0.8.6
+2026-10-16T00:36:56.5055040Z [1m[92m   Compiling[0m phf v0.11.3
+2026-10-16T00:36:56.5824421Z [1m[92m   Compiling[0m num-bigint v0.4.6
+2026-10-16T00:36:56.6104445Z [1m[92m   Compiling[0m tree-sitter v0.25.10
+2026-10-16T00:36:56.6997824Z [1m[92m   Compiling[0m rustpython-ruff_python_trivia v0.15.8
+2026-10-16T00:36:56.8965599Z [1m[92m   Compiling[0m aethyme-graph-schema v0.8.26 (/home/runner/work/Aethyme/Aethyme/packages/aethyme/rust/crates/aethyme-graph-schema)
+2026-10-16T00:36:57.3864501Z [1m[92m   Compiling[0m bstr v1.12.1
+2026-10-16T00:36:57.7404857Z [1m[92m   Compiling[0m is-macro v0.3.7
+2026-10-16T00:36:57.9644668Z [1m[92m   Compiling[0m crossbeam-channel v0.5.15
+2026-10-16T00:36:57.9818162Z [1m[92m   Compiling[0m bincode v1.3.3
+2026-10-16T00:36:58.1049554Z [1m[92m   Compiling[0m tree-sitter-php v0.23.11
+2026-10-16T00:36:58.1787087Z [1m[92m   Compiling[0m pkg-config v0.3.33
+2026-10-16T00:36:58.1953043Z [1m[92m   Compiling[0m drop_bomb v0.1.5
+2026-10-16T00:36:58.2085343Z [1m[92m   Compiling[0m clap_lex v1.1.0
+2026-10-16T00:36:58.2362602Z [1m[92m   Compiling[0m strsim v0.11.1
+2026-10-16T00:36:58.3024825Z [1m[92m   Compiling[0m linux-raw-sys v0.12.1
+2026-10-16T00:36:58.4061042Z [1m[92m   Compiling[0m jod-thread v1.0.0
+2026-10-16T00:36:58.4445161Z [1m[92m   Compiling[0m rustc-literal-escaper v0.0.4
+2026-10-16T00:36:58.4895189Z [1m[92m   Compiling[0m countme v3.0.1
+2026-10-16T00:36:58.4984655Z [1m[92m   Compiling[0m rustc-hash v1.1.0
+2026-10-16T00:36:58.5145034Z [1m[92m   Compiling[0m text-size v1.1.1
+2026-10-16T00:36:58.5354761Z [1m[92m   Compiling[0m ra_ap_edition v0.0.331
+2026-10-16T00:36:58.5555138Z [1m[92m   Compiling[0m vcpkg v0.2.15
+2026-10-16T00:36:58.5724571Z [1m[92m   Compiling[0m ra_ap_parser v0.0.331
+2026-10-16T00:36:58.5805050Z [1m[92m   Compiling[0m rowan v0.15.18
+2026-10-16T00:36:58.9335140Z [1m[92m   Compiling[0m libsqlite3-sys v0.30.1
+2026-10-16T00:36:59.0421900Z [1m[92m   Compiling[0m oxc_ecmascript v0.125.0
+2026-10-16T00:36:59.1195193Z [1m[92m   Compiling[0m ra_ap_stdx v0.0.331
+2026-10-16T00:36:59.4604744Z [1m[92m   Compiling[0m clap_builder v4.6.7
+2026-10-16T00:36:59.8806425Z [1m[92m   Compiling[0m aethyme-graph-storage v0.8.26 (/home/runner/work/Aethyme/Aethyme/packages/aethyme/rust/crates/aethyme-graph-storage)
+2026-10-16T00:37:00.6874877Z [1m[92m   Compiling[0m rustpython-ruff_python_ast v0.15.8
+2026-10-16T00:37:01.5886696Z [1m[92m   Compiling[0m unicode-normalization v0.1.25
+2026-10-16T00:37:01.6254441Z [1m[92m   Compiling[0m regex v1.12.4
+2026-10-16T00:37:01.6485390Z [1m[92m   Compiling[0m clap_derive v4.6.7
+2026-10-16T00:37:01.8335221Z [1m[92m   Compiling[0m redb v4.1.0
+2026-10-16T00:37:01.8515302Z [1m[92m   Compiling[0m streaming-iterator v0.1.9
+2026-10-16T00:37:01.8984734Z [1m[92m   Compiling[0m seq-macro v0.3.6
+2026-10-16T00:37:02.0072283Z [1m[92m   Compiling[0m smol_str v0.3.6
+2026-10-16T00:37:02.1124757Z [1m[92m   Compiling[0m triomphe v0.1.15
+2026-10-16T00:37:02.1266694Z [1m[92m   Compiling[0m libm v0.2.16
+2026-10-16T00:37:02.2385706Z [1m[92m   Compiling[0m same-file v1.0.6
+2026-10-16T00:37:02.2965342Z [1m[92m   Compiling[0m walkdir v2.5.0
+2026-10-16T00:37:02.3389543Z [1m[92m   Compiling[0m tempfile v3.27.0
+2026-10-16T00:37:02.4511922Z [1m[92m   Compiling[0m ra_ap_syntax v0.0.331
+2026-10-16T00:37:02.5321980Z [1m[92m   Compiling[0m oxc_parser v0.125.0
+2026-10-16T00:37:02.6875228Z [1m[92m   Compiling[0m clap v4.6.7
+2026-10-16T00:37:03.0514840Z [1m[92m   Compiling[0m rustpython-ruff_python_parser v0.15.8
+2026-10-16T00:37:03.8165218Z [1m[92m   Compiling[0m rayon v1.11.0
+2026-10-16T00:37:04.1874755Z [1m[92m   Compiling[0m oxc_ast_visit v0.125.0
+2026-10-16T00:37:04.5965087Z [1m[92m   Compiling[0m aethyme-engine v0.8.26 (/home/runner/work/Aethyme/Aethyme/packages/aethyme/rust/crates/aethyme-engine)
+2026-10-16T00:37:04.7044966Z [1m[92m   Compiling[0m noyalib v0.0.53
+2026-10-16T00:37:05.0825110Z [1m[92m   Compiling[0m aethyme-graph-indexer v0.8.26 (/home/runner/work/Aethyme/Aethyme/packages/aethyme/rust/crates/aethyme-graph-indexer)
+2026-10-16T00:37:05.8844848Z [1m[92m   Compiling[0m aethyme-producers v0.8.26 (/home/runner/work/Aethyme/Aethyme/packages/aethyme/rust/crates/aethyme-producers)
+2026-10-16T00:37:06.4085062Z [1m[92m   Compiling[0m hashlink v0.9.1
+2026-10-16T00:37:06.5655467Z [1m[92m   Compiling[0m aethyme-contracts v0.8.26 (/home/runner/work/Aethyme/Aethyme/packages/aethyme/rust/crates/aethyme-contracts)
+2026-10-16T00:37:06.6924686Z [1m[91merror[E0658][0m[1m: use of unstable library feature `str_as_str`[0m
+2026-10-16T00:37:06.6954175Z    [1m[94m--> [0mcrates/aethyme-contracts/src/experimental_v0/contribution_revision.rs:201:55
+2026-10-16T00:37:06.6983759Z     [1m[94m|[0m
+2026-10-16T00:37:06.7013853Z [1m[94m201[0m [1m[94m|[0m             .find(|(name, _)| !ALLOWED.contains(&name.as_str()))
+2026-10-16T00:37:06.7043795Z     [1m[94m|[0m                                                       [1m[91m^^^^^^[0m
+2026-10-16T00:37:06.7074209Z     [1m[94m|[0m
+2026-10-16T00:37:06.7104105Z     [1m[94m= [0m[1mnote[0m: see issue #130366 <https://github.com/rust-lang/rust/issues/130366> for more information
+2026-10-16T00:37:06.7132608Z 
+2026-10-16T00:37:06.7164234Z [1m[91merror[E0658][0m[1m: use of unstable library feature `str_as_str`[0m
+2026-10-16T00:37:06.7175635Z    [1m[94m--> [0mcrates/aethyme-contracts/src/experimental_v0/contribution_revision.rs:263:60
+2026-10-16T00:37:06.7223941Z     [1m[94m|[0m
+2026-10-16T00:37:06.7284125Z [1m[94m263[0m [1m[94m|[0m             .any(|(name, _)| !CHANGE_FIELDS.contains(&name.as_str()))
+2026-10-16T00:37:06.7313913Z     [1m[94m|[0m                                                            [1m[91m^^^^^^[0m
+2026-10-16T00:37:06.7314284Z     [1m[94m|[0m
+2026-10-16T00:37:06.7314812Z     [1m[94m= [0m[1mnote[0m: see issue #130366 <https://github.com/rust-lang/rust/issues/130366> for more information
+2026-10-16T00:37:06.7315195Z 
+2026-10-16T00:37:06.7315673Z [1m[91merror[E0599][0m[1m: no variant, associated function, or constant named `Null` found for enum `Value` in the current scope[0m
+2026-10-16T00:37:06.7316428Z    [1m[94m--> [0mcrates/aethyme-contracts/src/experimental_v0/contribution_revision.rs:335:21
+2026-10-16T00:37:06.7316850Z     [1m[94m|[0m
+2026-10-16T00:37:06.7353640Z [1m[94m335[0m [1m[94m|[0m         Some(Value::Null) => Ok(None),
+2026-10-16T00:37:06.7354374Z     [1m[94m|[0m                     [1m[91m^^^^[0m [1m[91mvariant, associated function, or constant not found in `Value`[0m
+2026-10-16T00:37:06.7354836Z     [1m[94m|[0m
+2026-10-16T00:37:06.7355326Z    [1m[94m::: [0mcrates/aethyme-contracts/src/experimental_v0/canonical_json.rs:59:1
+2026-10-16T00:37:06.7355728Z     [1m[94m|[0m
+2026-10-16T00:37:06.7355981Z [1m[94m 59[0m [1m[94m|[0m pub enum Value {
+2026-10-16T00:37:06.7356553Z     [1m[94m|[0m [1m[94m--------------[0m [1m[94mvariant, associated function, or constant `Null` not found for this enum[0m
+2026-10-16T00:37:06.7356958Z 
+2026-10-16T00:37:06.7357203Z [1m[91merror[E0658][0m[1m: use of unstable library feature `str_as_str`[0m
+2026-10-16T00:37:06.7357784Z    [1m[94m--> [0mcrates/aethyme-contracts/src/experimental_v0/contribution_revision.rs:340:57
+2026-10-16T00:37:06.7358216Z     [1m[94m|[0m
+2026-10-16T00:37:06.7358580Z [1m[94m340[0m [1m[94m|[0m                 .any(|(name, _)| !FIELDS.contains(&name.as_str()))
+2026-10-16T00:37:06.7359392Z     [1m[94m|[0m                                                         [1m[91m^^^^^^[0m
+2026-10-16T00:37:06.7359717Z     [1m[94m|[0m
+2026-10-16T00:37:06.7360217Z     [1m[94m= [0m[1mnote[0m: see issue #130366 <https://github.com/rust-lang/rust/issues/130366> for more information
+2026-10-16T00:37:06.7360600Z 
+2026-10-16T00:37:06.7360835Z [1m[91merror[E0658][0m[1m: use of unstable library feature `str_as_str`[0m
+2026-10-16T00:37:06.7361390Z    [1m[94m--> [0mcrates/aethyme-contracts/src/experimental_v0/project_identity.rs:281:55
+2026-10-16T00:37:06.7361801Z     [1m[94m|[0m
+2026-10-16T00:37:06.7362163Z [1m[94m281[0m [1m[94m|[0m             .find(|(name, _)| !allowed.contains(&name.as_str()))
+2026-10-16T00:37:06.7362641Z     [1m[94m|[0m                                                       [1m[91m^^^^^^[0m
+2026-10-16T00:37:06.7362967Z     [1m[94m|[0m
+2026-10-16T00:37:06.7363559Z     [1m[94m= [0m[1mnote[0m: see issue #130366 <https://github.com/rust-lang/rust/issues/130366> for more information
+2026-10-16T00:37:06.7363941Z 
+2026-10-16T00:37:06.7364154Z [1m[91merror[E0308][0m[1m: `?` operator has incompatible types[0m
+2026-10-16T00:37:06.7364670Z    [1m[94m--> [0mcrates/aethyme-contracts/src/experimental_v0/project_identity.rs:286:43
+2026-10-16T00:37:06.7365080Z     [1m[94m|[0m
+2026-10-16T00:37:06.7365599Z [1m[94m286[0m [1m[94m|[0m         let project_id = ProjectId::parse(required_string(&record, "project_id")?)?;
+2026-10-16T00:37:06.7366463Z     [1m[94m|[0m                                           [1m[91m^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^[0m [1m[91mexpected `&str`, found `String`[0m
+2026-10-16T00:37:06.7366882Z     [1m[94m|[0m
+2026-10-16T00:37:06.7367219Z     [1m[94m= [0m[1mnote[0m: `?` operator cannot convert from `String` to `&str`
+2026-10-16T00:37:06.7367608Z [1m[96mhelp[0m: consider borrowing here
+2026-10-16T00:37:06.7367873Z     [1m[94m|[0m
+2026-10-16T00:37:06.7368421Z [1m[94m286[0m [1m[94m| [0m        let project_id = ProjectId::parse([92m&[0mrequired_string(&record, "project_id")?)?;
+2026-10-16T00:37:06.7368973Z     [1m[94m|[0m                                           [92m+[0m
+2026-10-16T00:37:06.7369185Z 
+2026-10-16T00:37:06.7369422Z [1m[91merror[E0658][0m[1m: use of unstable library feature `str_as_str`[0m
+2026-10-16T00:37:06.7369980Z    [1m[94m--> [0mcrates/aethyme-contracts/src/experimental_v0/project_identity.rs:316:63
+2026-10-16T00:37:06.7370391Z     [1m[94m|[0m
+2026-10-16T00:37:06.7370778Z [1m[94m316[0m [1m[94m|[0m                 .find(|(name, _)| !FILE_FIELDS.contains(&name.as_str()))
+2026-10-16T00:37:06.7371283Z     [1m[94m|[0m                                                               [1m[91m^^^^^^[0m
+2026-10-16T00:37:06.7371619Z     [1m[94m|[0m
+2026-10-16T00:37:06.7372086Z     [1m[94m= [0m[1mnote[0m: see issue #130366 <https://github.com/rust-lang/rust/issues/130366> for more information
+2026-10-16T00:37:06.7372459Z 
+2026-10-16T00:37:06.7372741Z [1m[91merror[E0599][0m[1m: `FileId` doesn't implement `std::fmt::Display`[0m
+2026-10-16T00:37:06.7373428Z    [1m[94m--> [0mcrates/aethyme-contracts/src/experimental_v0/project_identity.rs:380:34
+2026-10-16T00:37:06.7373820Z     [1m[94m|[0m
+2026-10-16T00:37:06.7374087Z [1m[94m 87[0m [1m[94m|[0m pub struct FileId(String);
+2026-10-16T00:37:06.7374925Z     [1m[94m|[0m [1m[94m-----------------[0m [1m[94mmethod `to_string` not found for this struct because it doesn't satisfy `FileId: ToString` or `FileId: std::fmt::Display`[0m
+2026-10-16T00:37:06.7375569Z [1m[94m...[0m
+2026-10-16T00:37:06.7375885Z [1m[94m380[0m [1m[94m|[0m                     file.file_id.to_string(),
+2026-10-16T00:37:06.7376508Z     [1m[94m|[0m                                  [1m[91m^^^^^^^^^[0m [1m[91mmethod cannot be called on `FileId` due to unsatisfied trait bounds[0m
+2026-10-16T00:37:06.7376984Z     [1m[94m|[0m
+2026-10-16T00:37:06.7377304Z     [1m[94m= [0m[1mnote[0m: the following trait bounds were not satisfied:
+2026-10-16T00:37:06.7377783Z             `FileId: std::fmt::Display`
+2026-10-16T00:37:06.7378043Z             which is required by `FileId: ToString`
+2026-10-16T00:37:06.7378488Z [1m[92mnote[0m: the trait `std::fmt::Display` must be implemented
+2026-10-16T00:37:06.7379057Z    [1m[94m--> [0m/rustc/ac68faa20c58cbccd01ee7208bf3b6e93a7d7f96/library/core/src/fmt/mod.rs:1187:0
+2026-10-16T00:37:06.7379725Z     [1m[94m= [0m[1mhelp[0m: items from traits can only be used if the trait is implemented and in scope
+2026-10-16T00:37:06.7380401Z     [1m[94m= [0m[1mnote[0m: the following trait defines an item `to_string`, perhaps you need to implement it:
+2026-10-16T00:37:06.7380850Z             candidate #1: `ToString`
+2026-10-16T00:37:06.7381007Z 
+2026-10-16T00:37:06.7381445Z [1m[91merror[E0599][0m[1m: no variant, associated function, or constant named `Null` found for enum `Value` in the current scope[0m
+2026-10-16T00:37:06.7382166Z    [1m[94m--> [0mcrates/aethyme-contracts/src/experimental_v0/project_identity.rs:480:76
+2026-10-16T00:37:06.7382574Z     [1m[94m|[0m
+2026-10-16T00:37:06.7383035Z [1m[94m480[0m [1m[94m|[0m                     self.before.as_ref().map(state_value).unwrap_or(Value::Null),
+2026-10-16T00:37:06.7414333Z     [1m[94m|[0m                                                                            [1m[91m^^^^[0m [1m[91mvariant, associated function, or constant not found in `Value`[0m
+2026-10-16T00:37:06.7414932Z     [1m[94m|[0m
+2026-10-16T00:37:06.7415609Z    [1m[94m::: [0mcrates/aethyme-contracts/src/experimental_v0/canonical_json.rs:59:1
+2026-10-16T00:37:06.7416011Z     [1m[94m|[0m
+2026-10-16T00:37:06.7416265Z [1m[94m 59[0m [1m[94m|[0m pub enum Value {
+2026-10-16T00:37:06.7416842Z     [1m[94m|[0m [1m[94m--------------[0m [1m[94mvariant, associated function, or constant `Null` not found for this enum[0m
+2026-10-16T00:37:06.7417242Z 
+2026-10-16T00:37:06.7417675Z [1m[91merror[E0599][0m[1m: no variant, associated function, or constant named `Null` found for enum `Value` in the current scope[0m
+2026-10-16T00:37:06.7418411Z    [1m[94m--> [0mcrates/aethyme-contracts/src/experimental_v0/project_identity.rs:484:75
+2026-10-16T00:37:06.7418829Z     [1m[94m|[0m
+2026-10-16T00:37:06.7419299Z [1m[94m484[0m [1m[94m|[0m                     self.after.as_ref().map(state_value).unwrap_or(Value::Null),
+2026-10-16T00:37:06.7420060Z     [1m[94m|[0m                                                                           [1m[91m^^^^[0m [1m[91mvariant, associated function, or constant not found in `Value`[0m
+2026-10-16T00:37:06.7420568Z     [1m[94m|[0m
+2026-10-16T00:37:06.7420969Z    [1m[94m::: [0mcrates/aethyme-contracts/src/experimental_v0/canonical_json.rs:59:1
+2026-10-16T00:37:06.7421358Z     [1m[94m|[0m
+2026-10-16T00:37:06.7421604Z [1m[94m 59[0m [1m[94m|[0m pub enum Value {
+2026-10-16T00:37:06.7422170Z     [1m[94m|[0m [1m[94m--------------[0m [1m[94mvariant, associated function, or constant `Null` not found for this enum[0m
+2026-10-16T00:37:06.7422570Z 
+2026-10-16T00:37:06.7453869Z [1m[91merror[E0308][0m[1m: `if` and `else` have incompatible types[0m
+2026-10-16T00:37:06.7483882Z    [1m[94m--> [0mcrates/aethyme-contracts/src/experimental_v0/project_identity.rs:785:17
+2026-10-16T00:37:06.7493761Z     [1m[94m|[0m
+2026-10-16T00:37:06.7523907Z [1m[94m768[0m [1m[94m|[0m                let before = if *relation == IdentityRelation::ExplicitRename {
+2026-10-16T00:37:06.7543760Z     [1m[94m|[0m [1m[94m ___________________________-[0m
+2026-10-16T00:37:06.7573885Z [1m[94m769[0m [1m[94m|[0m [1m[94m|/[0m                 let source = operation_by_source.iter().find_map(
+2026-10-16T00:37:06.7583807Z [1m[94m770[0m [1m[94m|[0m [1m[94m||[0m                     |(source, (source_relation, destinations))| {
+2026-10-16T00:37:06.7587987Z [1m[94m771[0m [1m[94m|[0m [1m[94m||[0m                         (*source_relation == IdentityRelation::ExplicitRename
+2026-10-16T00:37:06.7629802Z [1m[94m772[0m [1m[94m|[0m [1m[94m||[0m                             && destinations.first() == Some(path))
+2026-10-16T00:37:06.7633834Z [1m[94m...[0m   [1m[94m||[0m
+2026-10-16T00:37:06.7634227Z [1m[94m782[0m [1m[94m|[0m [1m[94m||[0m                     },
+2026-10-16T00:37:06.7634630Z [1m[94m783[0m [1m[94m|[0m [1m[94m||[0m                 );
+2026-10-16T00:37:06.7635087Z     [1m[94m|[0m [1m[94m||__________________-[0m [1m[94mexpected because of this[0m
+2026-10-16T00:37:06.7635545Z [1m[94m784[0m [1m[94m|[0m [1m[94m|[0m              } else {
+2026-10-16T00:37:06.7635935Z [1m[94m785[0m [1m[94m|[0m [1m[94m|[0m                  None
+2026-10-16T00:37:06.7636425Z     [1m[94m|[0m [1m[94m|[0m                  [1m[91m^^^^[0m [1m[91mexpected `()`, found `Option<_>`[0m
+2026-10-16T00:37:06.7636878Z [1m[94m786[0m [1m[94m|[0m [1m[94m|[0m              };
+2026-10-16T00:37:06.7637354Z     [1m[94m|[0m [1m[94m|______________-[0m [1m[94m`if` and `else` have incompatible types[0m
+2026-10-16T00:37:06.7637751Z     [1m[94m|[0m
+2026-10-16T00:37:06.7638048Z     [1m[94m= [0m[1mnote[0m: expected unit type `[1m[35m()[0m`
+2026-10-16T00:37:06.7638425Z                     found enum `[1m[35mOption<_>[0m`
+2026-10-16T00:37:06.7638810Z [1m[96mhelp[0m: consider returning the local binding `source`
+2026-10-16T00:37:06.7639170Z     [1m[94m|[0m
+2026-10-16T00:37:06.7639447Z [1m[94m783[0m [92m~ [0m                );
+2026-10-16T00:37:06.7639778Z [1m[94m784[0m [92m+                 source[0m
+2026-10-16T00:37:06.7640267Z     [1m[94m|[0m
+2026-10-16T00:37:06.7640940Z [1m[96mhelp[0m: consider using `Option::expect` to unwrap the `Option<_>` value, panicking if the value is an `Option::None`
+2026-10-16T00:37:06.7641458Z     [1m[94m|[0m
+2026-10-16T00:37:06.7641759Z [1m[94m786[0m [1m[94m| [0m            }[92m.expect("REASON")[0m;
+2026-10-16T00:37:06.7642141Z     [1m[94m|[0m              [92m+++++++++++++++++[0m
+2026-10-16T00:37:06.7642343Z 
+2026-10-16T00:37:06.9072032Z [1mSome errors have detailed explanations: E0308, E0599, E0658.[0m
+2026-10-16T00:37:06.9072676Z [1mFor more information about an error, try `rustc --explain E0308`.[0m
+2026-10-16T00:37:06.9096749Z [1m[91merror[0m: could not compile `aethyme-contracts` (lib) due to 11 previous errors
+2026-10-16T00:37:06.9123945Z [1m[33mwarning[0m: build failed, waiting for other jobs to finish...
+2026-10-16T00:37:08.6579016Z ##[error]Process completed with exit code 101.
+2026-10-16T00:37:08.6658554Z Post job cleanup.
+2026-10-16T00:37:08.7194687Z [command]/usr/bin/git version
+2026-10-16T00:37:08.7223488Z git version 2.55.0
+2026-10-16T00:37:08.7245559Z Temporarily overriding HOME='/home/runner/work/_temp/e62fd020-deac-4e42-85ba-e46fd3cee62d' before making global git config changes
+2026-10-16T00:37:08.7246296Z Adding repository directory to the temporary git global config as a safe directory
+2026-10-16T00:37:08.7248877Z [command]/usr/bin/git config --global --add safe.directory /home/runner/work/Aethyme/Aethyme
+2026-10-16T00:37:08.7274403Z Removing SSH command configuration
+2026-10-16T00:37:08.7278216Z [command]/usr/bin/git config --local --name-only --get-regexp core\.sshCommand
+2026-10-16T00:37:08.7304622Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :"
+2026-10-16T00:37:08.7502545Z Removing HTTP extra header
+2026-10-16T00:37:08.7507537Z [command]/usr/bin/git config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
+2026-10-16T00:37:08.7537653Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :"
+2026-10-16T00:37:08.7728178Z Removing includeIf entries pointing to credentials config files
+2026-10-16T00:37:08.7733978Z [command]/usr/bin/git config --local --name-only --get-regexp ^includeIf\.gitdir:
+2026-10-16T00:37:08.7759807Z includeif.gitdir:/home/runner/work/Aethyme/Aethyme/.git.path
+2026-10-16T00:37:08.7760240Z includeif.gitdir:/home/runner/work/Aethyme/Aethyme/.git/worktrees/*.path
+2026-10-16T00:37:08.7760631Z includeif.gitdir:/github/workspace/.git.path
+2026-10-16T00:37:08.7760835Z includeif.gitdir:/github/workspace/.git/worktrees/*.path
+2026-10-16T00:37:08.7765984Z [command]/usr/bin/git config --local --get-all includeif.gitdir:/home/runner/work/Aethyme/Aethyme/.git.path
+2026-10-16T00:37:08.7787938Z /home/runner/work/_temp/git-credentials-d7610370-5987-41ae-9d13-26065ac80316.config
+2026-10-16T00:37:08.7795083Z [command]/usr/bin/git config --local --unset includeif.gitdir:/home/runner/work/Aethyme/Aethyme/.git.path \/home\/runner\/work\/_temp\/git\-credentials\-d7610370\-5987\-41ae\-9d13\-26065ac80316\.config
+2026-10-16T00:37:08.7827024Z [command]/usr/bin/git config --local --get-all includeif.gitdir:/home/runner/work/Aethyme/Aethyme/.git/worktrees/*.path
+2026-10-16T00:37:08.7849233Z /home/runner/work/_temp/git-credentials-d7610370-5987-41ae-9d13-26065ac80316.config
+2026-10-16T00:37:08.7855415Z [command]/usr/bin/git config --local --unset includeif.gitdir:/home/runner/work/Aethyme/Aethyme/.git/worktrees/*.path \/home\/runner\/work\/_temp\/git\-credentials\-d7610370\-5987\-41ae\-9d13\-26065ac80316\.config
+2026-10-16T00:37:08.7889979Z [command]/usr/bin/git config --local --get-all includeif.gitdir:/github/workspace/.git.path
+2026-10-16T00:37:08.7911010Z /github/runner_temp/git-credentials-d7610370-5987-41ae-9d13-26065ac80316.config
+2026-10-16T00:37:08.7915699Z [command]/usr/bin/git config --local --unset includeif.gitdir:/github/workspace/.git.path \/github\/runner_temp\/git\-credentials\-d7610370\-5987\-41ae\-9d13\-26065ac80316\.config
+2026-10-16T00:37:08.7984470Z [command]/usr/bin/git config --local --get-all includeif.gitdir:/github/workspace/.git/worktrees/*.path
+2026-10-16T00:37:08.8004131Z /github/runner_temp/git-credentials-d7610370-5987-41ae-9d13-26065ac80316.config
+2026-10-16T00:37:08.8008785Z [command]/usr/bin/git config --local --unset includeif.gitdir:/github/workspace/.git/worktrees/*.path \/github\/runner_temp\/git\-credentials\-d7610370\-5987\-41ae\-9d13\-26065ac80316\.config
+2026-10-16T00:37:08.8037754Z [command]/usr/bin/git submodule foreach --recursive git config --local --show-origin --name-only --get-regexp remote.origin.url
+2026-10-16T00:37:08.8212749Z Removing credentials config '/home/runner/work/_temp/git-credentials-d7610370-5987-41ae-9d13-26065ac80316.config'
+2026-10-16T00:37:08.8343473Z Cleaning up orphan processes

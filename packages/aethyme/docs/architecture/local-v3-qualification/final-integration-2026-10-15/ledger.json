@@ -2756,9 +2756,471 @@
       "source_path": "target/local-resume/t04-qualified/20261016T002421Z-9a15fd24f437/runs/20261016T002535Z-t04-restored-positive-9a15fd24f437-4bd5ef9a/command.status",
       "bytes": 2,
       "sha256": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa"
+    },
+    {
+      "path": "runs/ci-788-63a3-compile/artifacts/0001.raw",
+      "logical_path": "checkout-commit-33e9c9e5b798faffdea32865bd2f32a97140177f.stderr.txt",
+      "source_path": "/private/tmp/ci-pr788-38830415286-20261016/checkout-commit-33e9c9e5b798faffdea32865bd2f32a97140177f.stderr.txt",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "runs/ci-788-63a3-compile/artifacts/0002.raw",
+      "logical_path": "checkout-commit-33e9c9e5b798faffdea32865bd2f32a97140177f.stdout.json",
+      "source_path": "/private/tmp/ci-pr788-38830415286-20261016/checkout-commit-33e9c9e5b798faffdea32865bd2f32a97140177f.stdout.json",
+      "bytes": 2616,
+      "sha256": "b591aa6b2bf021635ae281869d02ec2a51ff29cf4e6d5e9e5d323889bb446350"
+    },
+    {
+      "path": "runs/ci-788-63a3-compile/artifacts/0003.raw",
+      "logical_path": "ci-summary.json",
+      "source_path": "/private/tmp/ci-pr788-38830415286-20261016/ci-summary.json",
+      "bytes": 20345,
+      "sha256": "1e1e58d0dd6013ff4cab41b3ad86d995b5f62338e3828fdff904d00e8dfac8aa"
+    },
+    {
+      "path": "runs/ci-788-63a3-compile/artifacts/0004.raw",
+      "logical_path": "commit-5ebe8d315062c7db0855bfa760a0379012a51743.stderr.txt",
+      "source_path": "/private/tmp/ci-pr788-38830415286-20261016/commit-5ebe8d315062c7db0855bfa760a0379012a51743.stderr.txt",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "runs/ci-788-63a3-compile/artifacts/0005.raw",
+      "logical_path": "commit-5ebe8d315062c7db0855bfa760a0379012a51743.stdout.json",
+      "source_path": "/private/tmp/ci-pr788-38830415286-20261016/commit-5ebe8d315062c7db0855bfa760a0379012a51743.stdout.json",
+      "bytes": 1998,
+      "sha256": "29b00d8d1c1b7a063bb841eb3a574be9d03a5ca1a40142450f91dfce26edfa93"
+    },
+    {
+      "path": "runs/ci-788-63a3-compile/artifacts/0006.raw",
+      "logical_path": "commit-63a3aa3e533ba466f02f1deabd36b9d3feb88985.stderr.txt",
+      "source_path": "/private/tmp/ci-pr788-38830415286-20261016/commit-63a3aa3e533ba466f02f1deabd36b9d3feb88985.stderr.txt",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "runs/ci-788-63a3-compile/artifacts/0007.raw",
+      "logical_path": "commit-63a3aa3e533ba466f02f1deabd36b9d3feb88985.stdout.json",
+      "source_path": "/private/tmp/ci-pr788-38830415286-20261016/commit-63a3aa3e533ba466f02f1deabd36b9d3feb88985.stdout.json",
+      "bytes": 1804,
+      "sha256": "25872dfdf9e5b182df5be30f401b8261d81f2a7bd193f2d79f14528154be4f15"
+    },
+    {
+      "path": "runs/ci-788-63a3-compile/artifacts/0008.raw",
+      "logical_path": "commit-898215cb89fcd1baccfc1af167a67c66f0488060.stderr.txt",
+      "source_path": "/private/tmp/ci-pr788-38830415286-20261016/commit-898215cb89fcd1baccfc1af167a67c66f0488060.stderr.txt",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "runs/ci-788-63a3-compile/artifacts/0009.raw",
+      "logical_path": "commit-898215cb89fcd1baccfc1af167a67c66f0488060.stdout.json",
+      "source_path": "/private/tmp/ci-pr788-38830415286-20261016/commit-898215cb89fcd1baccfc1af167a67c66f0488060.stdout.json",
+      "bytes": 1722,
+      "sha256": "ab0f3523480ae45e099d7182db3f5b9d226ee23ce887c6a2bbc8b385d59bd088"
+    },
+    {
+      "path": "runs/ci-788-63a3-compile/artifacts/0010.raw",
+      "logical_path": "commit-rest-5ebe8d315062c7db0855bfa760a0379012a51743.stderr.txt",
+      "source_path": "/private/tmp/ci-pr788-38830415286-20261016/commit-rest-5ebe8d315062c7db0855bfa760a0379012a51743.stderr.txt",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "runs/ci-788-63a3-compile/artifacts/0011.raw",
+      "logical_path": "commit-rest-5ebe8d315062c7db0855bfa760a0379012a51743.stdout.json",
+      "source_path": "/private/tmp/ci-pr788-38830415286-20261016/commit-rest-5ebe8d315062c7db0855bfa760a0379012a51743.stdout.json",
+      "bytes": 34541,
+      "sha256": "4ff6330378b773b71a75d40db30397bd68d95ab1786ff2f823a7d88c81e0e282"
+    },
+    {
+      "path": "runs/ci-788-63a3-compile/artifacts/0012.raw",
+      "logical_path": "commit-rest-63a3aa3e533ba466f02f1deabd36b9d3feb88985.stderr.txt",
+      "source_path": "/private/tmp/ci-pr788-38830415286-20261016/commit-rest-63a3aa3e533ba466f02f1deabd36b9d3feb88985.stderr.txt",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "runs/ci-788-63a3-compile/artifacts/0013.raw",
+      "logical_path": "commit-rest-63a3aa3e533ba466f02f1deabd36b9d3feb88985.stdout.json",
+      "source_path": "/private/tmp/ci-pr788-38830415286-20261016/commit-rest-63a3aa3e533ba466f02f1deabd36b9d3feb88985.stdout.json",
+      "bytes": 82284,
+      "sha256": "008eac7be0c286301fb87039a42578c7cc1e1b9d6fdcfebea2c2e40142ab5708"
+    },
+    {
+      "path": "runs/ci-788-63a3-compile/artifacts/0014.raw",
+      "logical_path": "commit-rest-898215cb89fcd1baccfc1af167a67c66f0488060.stderr.txt",
+      "source_path": "/private/tmp/ci-pr788-38830415286-20261016/commit-rest-898215cb89fcd1baccfc1af167a67c66f0488060.stderr.txt",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "runs/ci-788-63a3-compile/artifacts/0015.raw",
+      "logical_path": "commit-rest-898215cb89fcd1baccfc1af167a67c66f0488060.stdout.json",
+      "source_path": "/private/tmp/ci-pr788-38830415286-20261016/commit-rest-898215cb89fcd1baccfc1af167a67c66f0488060.stdout.json",
+      "bytes": 7941,
+      "sha256": "82c7d7ce927257f59eb0632e4210274ea454e510be1bbc19860fc2ba78a27f6d"
+    },
+    {
+      "path": "runs/ci-788-63a3-compile/artifacts/0016.raw",
+      "logical_path": "gh-run-full-log-view.stderr.txt",
+      "source_path": "/private/tmp/ci-pr788-38830415286-20261016/gh-run-full-log-view.stderr.txt",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "runs/ci-788-63a3-compile/artifacts/0017.raw",
+      "logical_path": "gh-run-full-log-view.stdout.txt",
+      "source_path": "/private/tmp/ci-pr788-38830415286-20261016/gh-run-full-log-view.stdout.txt",
+      "bytes": 542182,
+      "sha256": "4355a4cc8d9594d6d7275dc2bc41424a3dbf29afb0fdb076fa93d535d2528dd7"
+    },
+    {
+      "path": "runs/ci-788-63a3-compile/artifacts/0018.raw",
+      "logical_path": "gh-version.stderr.txt",
+      "source_path": "/private/tmp/ci-pr788-38830415286-20261016/gh-version.stderr.txt",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "runs/ci-788-63a3-compile/artifacts/0019.raw",
+      "logical_path": "gh-version.stdout.txt",
+      "source_path": "/private/tmp/ci-pr788-38830415286-20261016/gh-version.stdout.txt",
+      "bytes": 81,
+      "sha256": "a679442459bed23fdc13efb977dec3b17c3c923d8d48abc0d8e522182250955f"
+    },
+    {
+      "path": "runs/ci-788-63a3-compile/artifacts/0020.raw",
+      "logical_path": "index.json",
+      "source_path": "/private/tmp/ci-pr788-38830415286-20261016/index.json",
+      "bytes": 66903,
+      "sha256": "54c81ecbbf7596b4e71d9dd36b259cc6c51cfd11e8f2dfe9978accbb9a073951"
+    },
+    {
+      "path": "runs/ci-788-63a3-compile/artifacts/0021.raw",
+      "logical_path": "job-116747670020-logs-allow-escape.stderr.txt",
+      "source_path": "/private/tmp/ci-pr788-38830415286-20261016/job-116747670020-logs-allow-escape.stderr.txt",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "runs/ci-788-63a3-compile/artifacts/0022.raw",
+      "logical_path": "job-116747670020-logs-allow-escape.stdout.raw",
+      "source_path": "/private/tmp/ci-pr788-38830415286-20261016/job-116747670020-logs-allow-escape.stdout.raw",
+      "bytes": 85852,
+      "sha256": "c2d11296d25469355615c9aa7ca3a69fd7f49bf906e3d12fdf66212272b4f65a"
+    },
+    {
+      "path": "runs/ci-788-63a3-compile/artifacts/0023.raw",
+      "logical_path": "job-116747670020-logs.stderr.txt",
+      "source_path": "/private/tmp/ci-pr788-38830415286-20261016/job-116747670020-logs.stderr.txt",
+      "bytes": 99,
+      "sha256": "8b6407b2fdbca54bf3d53fb93e79a3560dbe59567fa5044cfee4bed1b5b6e467"
+    },
+    {
+      "path": "runs/ci-788-63a3-compile/artifacts/0024.raw",
+      "logical_path": "job-116747670020-logs.stdout.zip",
+      "source_path": "/private/tmp/ci-pr788-38830415286-20261016/job-116747670020-logs.stdout.zip",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "runs/ci-788-63a3-compile/artifacts/0025.raw",
+      "logical_path": "job-116747670020-metadata.stderr.txt",
+      "source_path": "/private/tmp/ci-pr788-38830415286-20261016/job-116747670020-metadata.stderr.txt",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "runs/ci-788-63a3-compile/artifacts/0026.raw",
+      "logical_path": "job-116747670020-metadata.stdout.json",
+      "source_path": "/private/tmp/ci-pr788-38830415286-20261016/job-116747670020-metadata.stdout.json",
+      "bytes": 2822,
+      "sha256": "2f40fe8489ec0f2742c91e9b062b51e52c9222c807c051de37ef51b4bb1658f3"
+    },
+    {
+      "path": "runs/ci-788-63a3-compile/artifacts/0027.raw",
+      "logical_path": "job-116747670224-logs-allow-escape.stderr.txt",
+      "source_path": "/private/tmp/ci-pr788-38830415286-20261016/job-116747670224-logs-allow-escape.stderr.txt",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "runs/ci-788-63a3-compile/artifacts/0028.raw",
+      "logical_path": "job-116747670224-logs-allow-escape.stdout.raw",
+      "source_path": "/private/tmp/ci-pr788-38830415286-20261016/job-116747670224-logs-allow-escape.stdout.raw",
+      "bytes": 80550,
+      "sha256": "fff3c23df355f5421165881b9053fd2589cadf0fe4a587a59dc94353d60dbef4"
+    },
+    {
+      "path": "runs/ci-788-63a3-compile/artifacts/0029.raw",
+      "logical_path": "job-116747670224-logs.stderr.txt",
+      "source_path": "/private/tmp/ci-pr788-38830415286-20261016/job-116747670224-logs.stderr.txt",
+      "bytes": 99,
+      "sha256": "8b6407b2fdbca54bf3d53fb93e79a3560dbe59567fa5044cfee4bed1b5b6e467"
+    },
+    {
+      "path": "runs/ci-788-63a3-compile/artifacts/0030.raw",
+      "logical_path": "job-116747670224-logs.stdout.zip",
+      "source_path": "/private/tmp/ci-pr788-38830415286-20261016/job-116747670224-logs.stdout.zip",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "runs/ci-788-63a3-compile/artifacts/0031.raw",
+      "logical_path": "job-116747670224-metadata.stderr.txt",
+      "source_path": "/private/tmp/ci-pr788-38830415286-20261016/job-116747670224-metadata.stderr.txt",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "runs/ci-788-63a3-compile/artifacts/0032.raw",
+      "logical_path": "job-116747670224-metadata.stdout.json",
+      "source_path": "/private/tmp/ci-pr788-38830415286-20261016/job-116747670224-metadata.stdout.json",
+      "bytes": 2315,
+      "sha256": "f8e5f0ea9287114e77b23531ecb42c9ec2e5f9a9c6d719db274fbdf2d8bafc69"
+    },
+    {
+      "path": "runs/ci-788-63a3-compile/artifacts/0033.raw",
+      "logical_path": "job-116747670390-logs-allow-escape.stderr.txt",
+      "source_path": "/private/tmp/ci-pr788-38830415286-20261016/job-116747670390-logs-allow-escape.stderr.txt",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "runs/ci-788-63a3-compile/artifacts/0034.raw",
+      "logical_path": "job-116747670390-logs-allow-escape.stdout.raw",
+      "source_path": "/private/tmp/ci-pr788-38830415286-20261016/job-116747670390-logs-allow-escape.stdout.raw",
+      "bytes": 81839,
+      "sha256": "8b38b9fda8e49c75a0ed3f0101e099290e4cc3eb37c37ba1bf18e790df8015c6"
+    },
+    {
+      "path": "runs/ci-788-63a3-compile/artifacts/0035.raw",
+      "logical_path": "job-116747670390-logs.stderr.txt",
+      "source_path": "/private/tmp/ci-pr788-38830415286-20261016/job-116747670390-logs.stderr.txt",
+      "bytes": 99,
+      "sha256": "8b6407b2fdbca54bf3d53fb93e79a3560dbe59567fa5044cfee4bed1b5b6e467"
+    },
+    {
+      "path": "runs/ci-788-63a3-compile/artifacts/0036.raw",
+      "logical_path": "job-116747670390-logs.stdout.zip",
+      "source_path": "/private/tmp/ci-pr788-38830415286-20261016/job-116747670390-logs.stdout.zip",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "runs/ci-788-63a3-compile/artifacts/0037.raw",
+      "logical_path": "job-116747670390-metadata.stderr.txt",
+      "source_path": "/private/tmp/ci-pr788-38830415286-20261016/job-116747670390-metadata.stderr.txt",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "runs/ci-788-63a3-compile/artifacts/0038.raw",
+      "logical_path": "job-116747670390-metadata.stdout.json",
+      "source_path": "/private/tmp/ci-pr788-38830415286-20261016/job-116747670390-metadata.stdout.json",
+      "bytes": 2393,
+      "sha256": "9fc0a0ebcada24a33242ee23ae5ca5dd1f644364b0b9145f35fc5a418dce6354"
+    },
+    {
+      "path": "runs/ci-788-63a3-compile/artifacts/0039.raw",
+      "logical_path": "job-116747670421-logs-allow-escape.stderr.txt",
+      "source_path": "/private/tmp/ci-pr788-38830415286-20261016/job-116747670421-logs-allow-escape.stderr.txt",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "runs/ci-788-63a3-compile/artifacts/0040.raw",
+      "logical_path": "job-116747670421-logs-allow-escape.stdout.raw",
+      "source_path": "/private/tmp/ci-pr788-38830415286-20261016/job-116747670421-logs-allow-escape.stdout.raw",
+      "bytes": 90894,
+      "sha256": "0441d0bb742dfc304f6845e4df2237c5d2e46caef8c64252c61092faebafe36d"
+    },
+    {
+      "path": "runs/ci-788-63a3-compile/artifacts/0041.raw",
+      "logical_path": "job-116747670421-logs.stderr.txt",
+      "source_path": "/private/tmp/ci-pr788-38830415286-20261016/job-116747670421-logs.stderr.txt",
+      "bytes": 99,
+      "sha256": "8b6407b2fdbca54bf3d53fb93e79a3560dbe59567fa5044cfee4bed1b5b6e467"
+    },
+    {
+      "path": "runs/ci-788-63a3-compile/artifacts/0042.raw",
+      "logical_path": "job-116747670421-logs.stdout.zip",
+      "source_path": "/private/tmp/ci-pr788-38830415286-20261016/job-116747670421-logs.stdout.zip",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "runs/ci-788-63a3-compile/artifacts/0043.raw",
+      "logical_path": "job-116747670421-metadata.stderr.txt",
+      "source_path": "/private/tmp/ci-pr788-38830415286-20261016/job-116747670421-metadata.stderr.txt",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "runs/ci-788-63a3-compile/artifacts/0044.raw",
+      "logical_path": "job-116747670421-metadata.stdout.json",
+      "source_path": "/private/tmp/ci-pr788-38830415286-20261016/job-116747670421-metadata.stdout.json",
+      "bytes": 2718,
+      "sha256": "e77a269f3520050b1e6dd1be7573d64f416211f46c714359d5cbfe17bd8d059f"
+    },
+    {
+      "path": "runs/ci-788-63a3-compile/artifacts/0045.raw",
+      "logical_path": "job-116747671168-logs-allow-escape.stderr.txt",
+      "source_path": "/private/tmp/ci-pr788-38830415286-20261016/job-116747671168-logs-allow-escape.stderr.txt",
+      "bytes": 13,
+      "sha256": "6c5ec582d3b25e97273d17fd4088d0e13837c8384ee94aba555afc35856ec3ae"
+    },
+    {
+      "path": "runs/ci-788-63a3-compile/artifacts/0046.raw",
+      "logical_path": "job-116747671168-logs-allow-escape.stdout.raw",
+      "source_path": "/private/tmp/ci-pr788-38830415286-20261016/job-116747671168-logs-allow-escape.stdout.raw",
+      "bytes": 215,
+      "sha256": "50fe7b1d98313b3b084459228b44f232947ee36f291380d78f349f377a303f7c"
+    },
+    {
+      "path": "runs/ci-788-63a3-compile/artifacts/0047.raw",
+      "logical_path": "job-116747671168-logs.stderr.txt",
+      "source_path": "/private/tmp/ci-pr788-38830415286-20261016/job-116747671168-logs.stderr.txt",
+      "bytes": 13,
+      "sha256": "6c5ec582d3b25e97273d17fd4088d0e13837c8384ee94aba555afc35856ec3ae"
+    },
+    {
+      "path": "runs/ci-788-63a3-compile/artifacts/0048.raw",
+      "logical_path": "job-116747671168-logs.stdout.zip",
+      "source_path": "/private/tmp/ci-pr788-38830415286-20261016/job-116747671168-logs.stdout.zip",
+      "bytes": 215,
+      "sha256": "8d27e5ee983da64ad4bff257f5f518339dad52a5afccee35d15b8a93e61653fc"
+    },
+    {
+      "path": "runs/ci-788-63a3-compile/artifacts/0049.raw",
+      "logical_path": "job-116747671168-metadata.stderr.txt",
+      "source_path": "/private/tmp/ci-pr788-38830415286-20261016/job-116747671168-metadata.stderr.txt",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "runs/ci-788-63a3-compile/artifacts/0050.raw",
+      "logical_path": "job-116747671168-metadata.stdout.json",
+      "source_path": "/private/tmp/ci-pr788-38830415286-20261016/job-116747671168-metadata.stdout.json",
+      "bytes": 879,
+      "sha256": "6f26a51477a85b86dc24a253a41f172ed8934cbb9f1f5a09fe1f80b9d57f0f64"
+    },
+    {
+      "path": "runs/ci-788-63a3-compile/artifacts/0051.raw",
+      "logical_path": "job-116748079784-logs-allow-escape.stderr.txt",
+      "source_path": "/private/tmp/ci-pr788-38830415286-20261016/job-116748079784-logs-allow-escape.stderr.txt",
+      "bytes": 13,
+      "sha256": "6c5ec582d3b25e97273d17fd4088d0e13837c8384ee94aba555afc35856ec3ae"
+    },
+    {
+      "path": "runs/ci-788-63a3-compile/artifacts/0052.raw",
+      "logical_path": "job-116748079784-logs-allow-escape.stdout.raw",
+      "source_path": "/private/tmp/ci-pr788-38830415286-20261016/job-116748079784-logs-allow-escape.stdout.raw",
+      "bytes": 215,
+      "sha256": "5b6c82736205772882cc28f04275939fe709ed2a2a0bd909f0ee636d594eb182"
+    },
+    {
+      "path": "runs/ci-788-63a3-compile/artifacts/0053.raw",
+      "logical_path": "job-116748079784-logs.stderr.txt",
+      "source_path": "/private/tmp/ci-pr788-38830415286-20261016/job-116748079784-logs.stderr.txt",
+      "bytes": 13,
+      "sha256": "6c5ec582d3b25e97273d17fd4088d0e13837c8384ee94aba555afc35856ec3ae"
+    },
+    {
+      "path": "runs/ci-788-63a3-compile/artifacts/0054.raw",
+      "logical_path": "job-116748079784-logs.stdout.zip",
+      "source_path": "/private/tmp/ci-pr788-38830415286-20261016/job-116748079784-logs.stdout.zip",
+      "bytes": 215,
+      "sha256": "2de663e581177826121f2da8b0b7add547063f21277a964027b0bed35578f7b5"
+    },
+    {
+      "path": "runs/ci-788-63a3-compile/artifacts/0055.raw",
+      "logical_path": "job-116748079784-metadata.stderr.txt",
+      "source_path": "/private/tmp/ci-pr788-38830415286-20261016/job-116748079784-metadata.stderr.txt",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "runs/ci-788-63a3-compile/artifacts/0056.raw",
+      "logical_path": "job-116748079784-metadata.stdout.json",
+      "source_path": "/private/tmp/ci-pr788-38830415286-20261016/job-116748079784-metadata.stdout.json",
+      "bytes": 882,
+      "sha256": "d9eadf9026e0f72bf695654d3406f422d44409b38a2cc9d3e158f27850f6c965"
+    },
+    {
+      "path": "runs/ci-788-63a3-compile/artifacts/0057.raw",
+      "logical_path": "jobs-metadata.stderr.txt",
+      "source_path": "/private/tmp/ci-pr788-38830415286-20261016/jobs-metadata.stderr.txt",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "runs/ci-788-63a3-compile/artifacts/0058.raw",
+      "logical_path": "jobs-metadata.stdout.json",
+      "source_path": "/private/tmp/ci-pr788-38830415286-20261016/jobs-metadata.stdout.json",
+      "bytes": 12041,
+      "sha256": "74bd0ffb97bb1b08480dbacc500dec1bb417ce22caa52faba5fed8fe80b1c53b"
+    },
+    {
+      "path": "runs/ci-788-63a3-compile/artifacts/0059.raw",
+      "logical_path": "pr-metadata.stderr.txt",
+      "source_path": "/private/tmp/ci-pr788-38830415286-20261016/pr-metadata.stderr.txt",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "runs/ci-788-63a3-compile/artifacts/0060.raw",
+      "logical_path": "pr-metadata.stdout.json",
+      "source_path": "/private/tmp/ci-pr788-38830415286-20261016/pr-metadata.stdout.json",
+      "bytes": 16301,
+      "sha256": "2535c9d018969252468d0ecc96daeb1a45fcf4c58787b9371d334ea4c6e92953"
+    },
+    {
+      "path": "runs/ci-788-63a3-compile/artifacts/0061.raw",
+      "logical_path": "retry-command-records.json",
+      "source_path": "/private/tmp/ci-pr788-38830415286-20261016/retry-command-records.json",
+      "bytes": 4567,
+      "sha256": "dd2b877380ee2571f6a8b7cee952f9cffaccb3539c0ae595444d7ec25fd6d4fb"
+    },
+    {
+      "path": "runs/ci-788-63a3-compile/artifacts/0062.raw",
+      "logical_path": "run-log-archive.stderr.txt",
+      "source_path": "/private/tmp/ci-pr788-38830415286-20261016/run-log-archive.stderr.txt",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "runs/ci-788-63a3-compile/artifacts/0063.raw",
+      "logical_path": "run-log-archive.stdout.zip",
+      "source_path": "/private/tmp/ci-pr788-38830415286-20261016/run-log-archive.stdout.zip",
+      "bytes": 154880,
+      "sha256": "0ca2162c7906d2a38e4c3525b4ec255321abf16b17922a6042e55068866790e6"
+    },
+    {
+      "path": "runs/ci-788-63a3-compile/artifacts/0064.raw",
+      "logical_path": "run-metadata.stderr.txt",
+      "source_path": "/private/tmp/ci-pr788-38830415286-20261016/run-metadata.stderr.txt",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "runs/ci-788-63a3-compile/artifacts/0065.raw",
+      "logical_path": "run-metadata.stdout.json",
+      "source_path": "/private/tmp/ci-pr788-38830415286-20261016/run-metadata.stdout.json",
+      "bytes": 12847,
+      "sha256": "ac4df9c6e4e25002670759d04caf8a1b78770efbf99b068288d057062dd2f415"
+    },
+    {
+      "path": "runs/ci-788-63a3-compile/artifacts/0066.raw",
+      "logical_path": "manifest.json",
+      "source_path": "/private/tmp/ci-pr788-38830415286-20261016/manifest.json",
+      "bytes": 11344,
+      "sha256": "cd2dbf0d3869870323c25bdee65a286208929fcc47f13a5ebf03db77ebd88147"
     }
   ],
-  "updated_at_utc": "2026-10-16T00:28:59.560078+00:00",
+  "updated_at_utc": "2026-10-16T00:55:49.429422+00:00",
   "preflight_failures": [
     {
       "metadata": "runs/aggregate-offline-fx17-recorder-preflight-failure.json",
@@ -3137,6 +3599,106 @@
       "passing_command": false,
       "completed_counts": null,
       "scope": "Engine installation dependency download failed with HTTP2 framing error; product assertions skipped. No later source qualification."
+    },
+    {
+      "id": "ci-788-63a3-116747670020",
+      "workflow_run_id": 38830415286,
+      "job_id": 116747670020,
+      "metadata": "runs/ci-788-63a3-compile/artifacts/0026.raw",
+      "run_metadata": "runs/ci-788-63a3-compile/artifacts/0003.raw",
+      "log": "runs/ci-788-63a3-compile/artifacts/0022.raw",
+      "checkout": "runs/ci-788-63a3-compile/artifacts/0002.raw",
+      "checkout_source": {
+        "actions_run_head_sha": "63a3aa3e533ba466f02f1deabd36b9d3feb88985",
+        "merge_commit_sha": "33e9c9e5b798faffdea32865bd2f32a97140177f",
+        "merge_tree_sha": "e22c60e2761184376826b0ecff54e5be13f5c5c7",
+        "merge_parent_shas": [
+          "898215cb89fcd1baccfc1af167a67c66f0488060",
+          "63a3aa3e533ba466f02f1deabd36b9d3feb88985"
+        ],
+        "pr": 788
+      },
+      "exit_code": 101,
+      "conclusion": "FAILURE",
+      "passing_command": false,
+      "completed_counts": null,
+      "scope": "Compilation failed before qualifying test execution. Formatting passed in the lint job; Clippy could not compile. Later commits are not qualified by this attempt.",
+      "bundle_inventory": "runs/ci-788-63a3-compile/artifacts/0066.raw"
+    },
+    {
+      "id": "ci-788-63a3-116747670224",
+      "workflow_run_id": 38830415286,
+      "job_id": 116747670224,
+      "metadata": "runs/ci-788-63a3-compile/artifacts/0032.raw",
+      "run_metadata": "runs/ci-788-63a3-compile/artifacts/0003.raw",
+      "log": "runs/ci-788-63a3-compile/artifacts/0028.raw",
+      "checkout": "runs/ci-788-63a3-compile/artifacts/0002.raw",
+      "checkout_source": {
+        "actions_run_head_sha": "63a3aa3e533ba466f02f1deabd36b9d3feb88985",
+        "merge_commit_sha": "33e9c9e5b798faffdea32865bd2f32a97140177f",
+        "merge_tree_sha": "e22c60e2761184376826b0ecff54e5be13f5c5c7",
+        "merge_parent_shas": [
+          "898215cb89fcd1baccfc1af167a67c66f0488060",
+          "63a3aa3e533ba466f02f1deabd36b9d3feb88985"
+        ],
+        "pr": 788
+      },
+      "exit_code": 101,
+      "conclusion": "FAILURE",
+      "passing_command": false,
+      "completed_counts": null,
+      "scope": "Compilation failed before qualifying test execution. Formatting passed in the lint job; Clippy could not compile. Later commits are not qualified by this attempt.",
+      "bundle_inventory": "runs/ci-788-63a3-compile/artifacts/0066.raw"
+    },
+    {
+      "id": "ci-788-63a3-116747670390",
+      "workflow_run_id": 38830415286,
+      "job_id": 116747670390,
+      "metadata": "runs/ci-788-63a3-compile/artifacts/0038.raw",
+      "run_metadata": "runs/ci-788-63a3-compile/artifacts/0003.raw",
+      "log": "runs/ci-788-63a3-compile/artifacts/0034.raw",
+      "checkout": "runs/ci-788-63a3-compile/artifacts/0002.raw",
+      "checkout_source": {
+        "actions_run_head_sha": "63a3aa3e533ba466f02f1deabd36b9d3feb88985",
+        "merge_commit_sha": "33e9c9e5b798faffdea32865bd2f32a97140177f",
+        "merge_tree_sha": "e22c60e2761184376826b0ecff54e5be13f5c5c7",
+        "merge_parent_shas": [
+          "898215cb89fcd1baccfc1af167a67c66f0488060",
+          "63a3aa3e533ba466f02f1deabd36b9d3feb88985"
+        ],
+        "pr": 788
+      },
+      "exit_code": 101,
+      "conclusion": "FAILURE",
+      "passing_command": false,
+      "completed_counts": null,
+      "scope": "Compilation failed before qualifying test execution. Formatting passed in the lint job; Clippy could not compile. Later commits are not qualified by this attempt.",
+      "bundle_inventory": "runs/ci-788-63a3-compile/artifacts/0066.raw"
+    },
+    {
+      "id": "ci-788-63a3-116747670421",
+      "workflow_run_id": 38830415286,
+      "job_id": 116747670421,
+      "metadata": "runs/ci-788-63a3-compile/artifacts/0044.raw",
+      "run_metadata": "runs/ci-788-63a3-compile/artifacts/0003.raw",
+      "log": "runs/ci-788-63a3-compile/artifacts/0040.raw",
+      "checkout": "runs/ci-788-63a3-compile/artifacts/0002.raw",
+      "checkout_source": {
+        "actions_run_head_sha": "63a3aa3e533ba466f02f1deabd36b9d3feb88985",
+        "merge_commit_sha": "33e9c9e5b798faffdea32865bd2f32a97140177f",
+        "merge_tree_sha": "e22c60e2761184376826b0ecff54e5be13f5c5c7",
+        "merge_parent_shas": [
+          "898215cb89fcd1baccfc1af167a67c66f0488060",
+          "63a3aa3e533ba466f02f1deabd36b9d3feb88985"
+        ],
+        "pr": 788
+      },
+      "exit_code": 101,
+      "conclusion": "FAILURE",
+      "passing_command": false,
+      "completed_counts": null,
+      "scope": "Compilation failed before qualifying test execution. Formatting passed in the lint job; Clippy could not compile. Later commits are not qualified by this attempt.",
+      "bundle_inventory": "runs/ci-788-63a3-compile/artifacts/0066.raw"
     }
   ],
   "artifact_bundles": [
@@ -3179,6 +3741,12 @@
       "files": 5,
       "bytes": 29570,
       "scope": "Previously independently reviewed validation plan, unchanged runner/recorder and additive evidence importer/53PR read-only CI collector. Scripts retained as provenance; this bundle records no execution result."
+    },
+    {
+      "id": "ci-788-63a3-compile",
+      "inventory": "runs/ci-788-63a3-compile/artifacts/0066.raw",
+      "summary": "runs/ci-788-63a3-compile/artifacts/0003.raw",
+      "scope": "All 65 original collector artifacts plus its byte-exact manifest, including failed log requests and complete successful raw logs; four compile failures, no executed-test denominator."
     }
   ]
 }

@@ -220,3 +220,18 @@ patches and test proposal. Git global/system configuration and attributes are
 isolated for both fixture creation and product calls. This closes the previously
 missing T04 changed-base/result replay oracle; it does not qualify the remaining
 project-binding, file-lineage or rationale-revision work, or the fresh T64 run.
+
+## L1 contract compilation failure
+
+At PR #788 head `63a3aa3e`, all four OSS jobs failed compilation with
+exit 101: workspace, product path, lint, and examples/documentation. The actual
+merge checkout was `33e9c9e5b798faffdea32865bd2f32a97140177f` (tree
+`e22c60e2761184376826b0ecff54e5be13f5c5c7`). Eleven compiler diagnostics
+covered unstable string calls, unsupported null values, a missing borrow and
+display implementation, and incompatible branch types. Formatting passed in
+the lint job, but no job supplies a qualifying executed-test count.
+
+The package preserves all original collector artifacts, including unsuccessful
+log requests, complete raw logs, API responses and their manifest. The observed
+PR head at collection was already `5ebe8d31`; these failures remain bound to
+the older checkout and supply no passing credit to subsequent repairs.
