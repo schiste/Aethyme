@@ -2,9 +2,9 @@
 
 use std::collections::BTreeSet;
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -17,6 +17,8 @@ use crate::{
 pub const PREPARATION_CONFIG_RELPATH: &str = ".aethyme/prepare.toml";
 pub const PREPARATION_SCHEMA_VERSION: u32 = 1;
 const PREPARATION_LEASE_TTL_SECONDS: u64 = 30;
+const PREPARATION_CACHE_CONFIG_MAX_BYTES: u64 = 1024 * 1024;
+const PREPARATION_CACHE_HASH_BUFFER_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, thiserror::Error)]
 pub enum PreparationError {
@@ -55,6 +57,10 @@ pub enum PreparationError {
     },
     #[error("preparation state at {path} is invalid: {reason}")]
     InvalidState { path: String, reason: String },
+    #[error("preparation cache liveness deadline elapsed")]
+    LivenessDeadlineElapsed,
+    #[error("preparation cache liveness could not be verified: {reason}")]
+    LivenessIncomplete { reason: String },
     #[error(transparent)]
     HostResource(#[from] crate::HostResourceError),
 }
@@ -723,12 +729,25 @@ fn preparation_source_digest(
     config: &PreparationConfig,
     session_id: i64,
 ) -> Result<String, PreparationError> {
+    preparation_source_digest_before(root, config, session_id, None)
+}
+
+fn preparation_source_digest_before(
+    root: &Path,
+    config: &PreparationConfig,
+    session_id: i64,
+    deadline: Option<Instant>,
+) -> Result<String, PreparationError> {
+    check_liveness_deadline(deadline)?;
     let mut hasher = Sha256::new();
     hasher.update(PREPARATION_SCHEMA_VERSION.to_le_bytes());
     hasher.update(std::env::consts::OS.as_bytes());
     hasher.update([0]);
     hasher.update(std::env::consts::ARCH.as_bytes());
-    hasher.update(serde_json::to_vec(config).map_err(|error| invalid_config(error.to_string()))?);
+    let config_bytes =
+        serde_json::to_vec(config).map_err(|error| invalid_config(error.to_string()))?;
+    check_liveness_deadline(deadline)?;
+    hasher.update(config_bytes);
     let mut inputs = config
         .steps
         .iter()
@@ -737,30 +756,19 @@ fn preparation_source_digest(
     inputs.sort();
     inputs.dedup();
     for relative in inputs {
+        check_liveness_deadline(deadline)?;
         let path = root.join(relative);
-        let metadata = fs::symlink_metadata(&path).map_err(|_| PreparationError::InvalidInput {
-            path: relative.clone(),
-        })?;
-        if !metadata.file_type().is_file() {
-            return Err(PreparationError::InvalidInput {
-                path: relative.clone(),
-            });
-        }
-        let bytes = fs::read(&path).map_err(|source| PreparationError::Io {
-            path: PathBuf::from(relative),
-            source,
-        })?;
+        let (length, digest) = preparation_input_digest(&path, relative, deadline)?;
         hasher.update(relative.as_bytes());
-        hasher.update((bytes.len() as u64).to_le_bytes());
-        hasher.update(Sha256::digest(bytes));
+        hasher.update(length.to_le_bytes());
+        hasher.update(digest);
     }
     for runtime in &config.runtimes {
-        let executable =
-            resolve_runtime_executable(root, &runtime.command[0]).ok_or_else(|| {
-                PreparationError::RuntimeProbe {
-                    name: runtime.name.clone(),
-                    session_id,
-                }
+        check_liveness_deadline(deadline)?;
+        let executable = resolve_runtime_executable_before(root, &runtime.command[0], deadline)?
+            .ok_or_else(|| PreparationError::RuntimeProbe {
+                name: runtime.name.clone(),
+                session_id,
             })?;
         let canonical = executable
             .canonicalize()
@@ -768,10 +776,12 @@ fn preparation_source_digest(
                 name: runtime.name.clone(),
                 session_id,
             })?;
+        check_liveness_deadline(deadline)?;
         let metadata = fs::metadata(&canonical).map_err(|_| PreparationError::RuntimeProbe {
             name: runtime.name.clone(),
             session_id,
         })?;
+        check_liveness_deadline(deadline)?;
         if !metadata.is_file() {
             return Err(PreparationError::RuntimeProbe {
                 name: runtime.name.clone(),
@@ -786,11 +796,300 @@ fn preparation_source_digest(
         {
             hasher.update(duration.as_nanos().to_le_bytes());
         }
+        check_liveness_deadline(deadline)?;
     }
+    check_liveness_deadline(deadline)?;
     Ok(format!("{:x}", hasher.finalize()))
 }
 
-fn resolve_runtime_executable(root: &Path, program: &str) -> Option<PathBuf> {
+fn check_liveness_deadline(deadline: Option<Instant>) -> Result<(), PreparationError> {
+    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        return Err(PreparationError::LivenessDeadlineElapsed);
+    }
+    Ok(())
+}
+
+fn open_liveness_file(path: &Path) -> Result<std::fs::File, std::io::Error> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    options.open(path)
+}
+
+fn same_regular_file_version(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    if !left.is_file()
+        || !right.is_file()
+        || left.len() != right.len()
+        || left.modified().ok() != right.modified().ok()
+    {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if left.dev() != right.dev()
+            || left.ino() != right.ino()
+            || left.ctime() != right.ctime()
+            || left.ctime_nsec() != right.ctime_nsec()
+        {
+            return false;
+        }
+    }
+    true
+}
+
+fn preparation_input_digest(
+    path: &Path,
+    relative: &str,
+    deadline: Option<Instant>,
+) -> Result<(u64, [u8; 32]), PreparationError> {
+    check_liveness_deadline(deadline)?;
+    let before = fs::symlink_metadata(path).map_err(|_| PreparationError::InvalidInput {
+        path: relative.to_owned(),
+    })?;
+    check_liveness_deadline(deadline)?;
+    if before.file_type().is_symlink() || !before.is_file() {
+        return Err(PreparationError::InvalidInput {
+            path: relative.to_owned(),
+        });
+    }
+    check_liveness_deadline(deadline)?;
+    let mut file = open_liveness_file(path).map_err(|source| PreparationError::Io {
+        path: relative.into(),
+        source,
+    })?;
+    check_liveness_deadline(deadline)?;
+    let opened = file.metadata().map_err(|source| PreparationError::Io {
+        path: relative.into(),
+        source,
+    })?;
+    check_liveness_deadline(deadline)?;
+    if !same_regular_file_version(&before, &opened) {
+        return Err(PreparationError::InvalidInput {
+            path: relative.to_owned(),
+        });
+    }
+
+    let expected_len = opened.len();
+    let mut length = 0_u64;
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; PREPARATION_CACHE_HASH_BUFFER_BYTES];
+    loop {
+        check_liveness_deadline(deadline)?;
+        let read = match file.read(&mut buffer) {
+            Ok(read) => read,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(source) => {
+                return Err(PreparationError::Io {
+                    path: relative.into(),
+                    source,
+                });
+            }
+        };
+        check_liveness_deadline(deadline)?;
+        if read == 0 {
+            break;
+        }
+        length = length
+            .checked_add(read as u64)
+            .ok_or_else(|| PreparationError::InvalidInput {
+                path: relative.to_owned(),
+            })?;
+        if length > expected_len {
+            return Err(PreparationError::InvalidInput {
+                path: relative.to_owned(),
+            });
+        }
+        digest.update(&buffer[..read]);
+    }
+    if length != expected_len {
+        return Err(PreparationError::InvalidInput {
+            path: relative.to_owned(),
+        });
+    }
+    check_liveness_deadline(deadline)?;
+    let after_open = file.metadata().map_err(|source| PreparationError::Io {
+        path: relative.into(),
+        source,
+    })?;
+    check_liveness_deadline(deadline)?;
+    let after_path = fs::symlink_metadata(path).map_err(|_| PreparationError::InvalidInput {
+        path: relative.to_owned(),
+    })?;
+    check_liveness_deadline(deadline)?;
+    if after_path.file_type().is_symlink()
+        || !same_regular_file_version(&opened, &after_open)
+        || !same_regular_file_version(&opened, &after_path)
+    {
+        return Err(PreparationError::InvalidInput {
+            path: relative.to_owned(),
+        });
+    }
+    check_liveness_deadline(deadline)?;
+    Ok((length, digest.finalize().into()))
+}
+
+fn load_config_for_cache_liveness(
+    root: &Path,
+    deadline: Instant,
+) -> Result<Option<PreparationConfig>, PreparationError> {
+    check_liveness_deadline(Some(deadline))?;
+    let root_metadata = match fs::symlink_metadata(root) {
+        Ok(metadata) => metadata,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+            check_liveness_deadline(Some(deadline))?;
+            return Ok(None);
+        }
+        Err(source) => {
+            return Err(PreparationError::Io {
+                path: root.to_path_buf(),
+                source,
+            });
+        }
+    };
+    if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
+        return Err(PreparationError::LivenessIncomplete {
+            reason: "checkout root is not a real directory".into(),
+        });
+    }
+    check_liveness_deadline(Some(deadline))?;
+    let config_dir = root.join(".aethyme");
+    let config_dir_metadata = match fs::symlink_metadata(&config_dir) {
+        Ok(metadata) => metadata,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+            check_liveness_deadline(Some(deadline))?;
+            return Ok(None);
+        }
+        Err(source) => {
+            return Err(PreparationError::Io {
+                path: config_dir,
+                source,
+            });
+        }
+    };
+    if config_dir_metadata.file_type().is_symlink() || !config_dir_metadata.is_dir() {
+        return Err(PreparationError::LivenessIncomplete {
+            reason: ".aethyme is not a real directory".into(),
+        });
+    }
+    check_liveness_deadline(Some(deadline))?;
+    let path = root.join(PREPARATION_CONFIG_RELPATH);
+    let Some(bytes) = read_bounded_regular_file_for_liveness(
+        &path,
+        PREPARATION_CACHE_CONFIG_MAX_BYTES,
+        deadline,
+    )?
+    else {
+        return Ok(None);
+    };
+    let text = String::from_utf8(bytes).map_err(|error| invalid_config(error.to_string()))?;
+    let config = parse_config(&text)?;
+    check_liveness_deadline(Some(deadline))?;
+    Ok(Some(config))
+}
+
+pub(crate) fn read_bounded_regular_file_for_liveness(
+    path: &Path,
+    maximum_bytes: u64,
+    deadline: Instant,
+) -> Result<Option<Vec<u8>>, PreparationError> {
+    check_liveness_deadline(Some(deadline))?;
+    let before = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+            check_liveness_deadline(Some(deadline))?;
+            return Ok(None);
+        }
+        Err(source) => {
+            return Err(PreparationError::Io {
+                path: path.to_path_buf(),
+                source,
+            });
+        }
+    };
+    check_liveness_deadline(Some(deadline))?;
+    if before.file_type().is_symlink() || !before.is_file() {
+        return Err(PreparationError::LivenessIncomplete {
+            reason: format!("{} is not a regular file", path.display()),
+        });
+    }
+    if before.len() > maximum_bytes {
+        return Err(PreparationError::LivenessIncomplete {
+            reason: format!("{} exceeds its bounded read size", path.display()),
+        });
+    }
+    let mut file = open_liveness_file(path).map_err(|source| PreparationError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    check_liveness_deadline(Some(deadline))?;
+    let opened = file.metadata().map_err(|source| PreparationError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    check_liveness_deadline(Some(deadline))?;
+    if !same_regular_file_version(&before, &opened) {
+        return Err(PreparationError::LivenessIncomplete {
+            reason: format!("{} changed during bounded read", path.display()),
+        });
+    }
+    let mut bytes = Vec::with_capacity(usize::try_from(opened.len()).unwrap_or(0));
+    let mut buffer = [0_u8; PREPARATION_CACHE_HASH_BUFFER_BYTES];
+    loop {
+        check_liveness_deadline(Some(deadline))?;
+        let read = match file.read(&mut buffer) {
+            Ok(read) => read,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(source) => {
+                return Err(PreparationError::Io {
+                    path: path.to_path_buf(),
+                    source,
+                });
+            }
+        };
+        check_liveness_deadline(Some(deadline))?;
+        if read == 0 {
+            break;
+        }
+        if bytes.len().saturating_add(read) as u64 > maximum_bytes {
+            return Err(PreparationError::LivenessIncomplete {
+                reason: format!("{} grew beyond its bounded read size", path.display()),
+            });
+        }
+        bytes.extend_from_slice(&buffer[..read]);
+    }
+    check_liveness_deadline(Some(deadline))?;
+    let after_open = file.metadata().map_err(|source| PreparationError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    check_liveness_deadline(Some(deadline))?;
+    let after_path = fs::symlink_metadata(path).map_err(|source| PreparationError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    check_liveness_deadline(Some(deadline))?;
+    if after_path.file_type().is_symlink()
+        || !same_regular_file_version(&opened, &after_open)
+        || !same_regular_file_version(&opened, &after_path)
+        || bytes.len() as u64 != opened.len()
+    {
+        return Err(PreparationError::LivenessIncomplete {
+            reason: format!("{} changed during bounded read", path.display()),
+        });
+    }
+    Ok(Some(bytes))
+}
+
+fn resolve_runtime_executable_before(
+    root: &Path,
+    program: &str,
+    deadline: Option<Instant>,
+) -> Result<Option<PathBuf>, PreparationError> {
     let path = Path::new(program);
     if path.components().count() > 1 {
         let candidate = if path.is_absolute() {
@@ -798,13 +1097,24 @@ fn resolve_runtime_executable(root: &Path, program: &str) -> Option<PathBuf> {
         } else {
             root.join(path)
         };
-        return candidate.is_file().then_some(candidate);
+        check_liveness_deadline(deadline)?;
+        let is_file = candidate.is_file();
+        check_liveness_deadline(deadline)?;
+        return Ok(is_file.then_some(candidate));
     }
-    std::env::var_os("PATH")
-        .into_iter()
-        .flat_map(|value| std::env::split_paths(&value).collect::<Vec<_>>())
-        .map(|directory| directory.join(program))
-        .find(|candidate| candidate.is_file())
+    let Some(search_path) = std::env::var_os("PATH") else {
+        return Ok(None);
+    };
+    for directory in std::env::split_paths(&search_path) {
+        check_liveness_deadline(deadline)?;
+        let candidate = directory.join(program);
+        let is_file = candidate.is_file();
+        check_liveness_deadline(deadline)?;
+        if is_file {
+            return Ok(Some(candidate));
+        }
+    }
+    Ok(None)
 }
 
 fn missing_outputs(
@@ -956,17 +1266,32 @@ fn preparation_resource_request(
 /// `session_id` reaches the digest only through error messages, so any value
 /// produces the same key; zero is passed because no session is asking.
 pub(crate) fn current_cache_key(root: &Path) -> Result<Option<String>, PreparationError> {
-    let Some(config) = load_config(root)? else {
+    current_cache_key_before(root, None)
+}
+
+pub(crate) fn current_cache_key_before(
+    root: &Path,
+    deadline: Option<Instant>,
+) -> Result<Option<String>, PreparationError> {
+    let config = match deadline {
+        Some(deadline) => load_config_for_cache_liveness(root, deadline)?,
+        None => load_config(root)?,
+    };
+    let Some(config) = config else {
         return Ok(None);
     };
+    check_liveness_deadline(deadline)?;
     if !config
         .steps
         .iter()
         .any(|step| step.cache == PreparationCachePolicy::RepositoryShared)
     {
+        check_liveness_deadline(deadline)?;
         return Ok(None);
     }
-    let digest = preparation_digest(root, &config, 0)?;
+    let source_digest = preparation_source_digest_before(root, &config, 0, deadline)?;
+    check_liveness_deadline(deadline)?;
+    let digest = hash_text(&source_digest);
     Ok(Some(digest[..12.min(digest.len())].to_string()))
 }
 
@@ -1319,6 +1644,53 @@ mod tests {
         fs::write(root.path().join("lock.file"), "two").unwrap();
         let two = preparation_digest(root.path(), &config(), 1).unwrap();
         assert_ne!(one, two);
+    }
+
+    #[test]
+    fn streamed_large_input_keeps_the_existing_digest() {
+        let root = tempfile::tempdir().unwrap();
+        let contents = (0..3 * 1024 * 1024)
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        fs::write(root.path().join("lock.file"), &contents).unwrap();
+        let config = config();
+
+        // Reproduce the established digest framing using the old whole-file
+        // read shape. The streaming implementation must be byte-for-byte
+        // compatible so already populated cache keys remain reusable.
+        let mut expected = Sha256::new();
+        expected.update(PREPARATION_SCHEMA_VERSION.to_le_bytes());
+        expected.update(std::env::consts::OS.as_bytes());
+        expected.update([0]);
+        expected.update(std::env::consts::ARCH.as_bytes());
+        expected.update(serde_json::to_vec(&config).unwrap());
+        expected.update(b"lock.file");
+        expected.update((contents.len() as u64).to_le_bytes());
+        expected.update(Sha256::digest(&contents));
+        let expected = format!("{:x}", expected.finalize());
+
+        assert_eq!(
+            preparation_source_digest(root.path(), &config, 1).unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    fn expired_liveness_deadline_refuses_before_reading_large_input() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir_all(root.path().join(".aethyme")).unwrap();
+        let text = "schema_version = 1\n\n[[steps]]\nname = \"deps\"\ncommand = [\"sh\", \"-c\", \"true\"]\ninputs = [\"lock.file\"]\noutputs = [\"out/\"]\ncache = \"repository_shared\"\nrequired_for_hooks = false\n";
+        assert!(parse_config(text).is_ok(), "fixture config must be valid");
+        fs::write(root.path().join(".aethyme/prepare.toml"), text).unwrap();
+        fs::write(root.path().join("lock.file"), vec![b'x'; 8 * 1024 * 1024]).unwrap();
+
+        let result =
+            current_cache_key_before(root.path(), Some(Instant::now() - Duration::from_millis(1)));
+
+        assert!(matches!(
+            result,
+            Err(PreparationError::LivenessDeadlineElapsed)
+        ));
     }
 
     #[test]
