@@ -10,6 +10,8 @@ use std::time::{Duration, Instant};
 use std::ffi::{CStr, CString};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::os::unix::ffi::OsStrExt;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::os::unix::fs::MetadataExt;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -1584,15 +1586,14 @@ fn directory_bytes(path: &Path) -> Result<Option<u64>, PreparationError> {
 
 fn directory_bytes_with_limits(
     path: &Path,
-    limits: SharedCacheScanLimits,
+    _limits: SharedCacheScanLimits,
 ) -> Result<Option<u64>, PreparationError> {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
-        directory_bytes_fd_relative(path, limits)
+        directory_bytes_fd_relative(path, _limits)
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
-        let _ = limits;
         Err(shared_cache_scan_refusal(
             path,
             "bounded no-follow inventory is unsupported on this platform",
@@ -1686,10 +1687,28 @@ struct SharedCacheDirectoryFrame {
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+enum SharedCacheScanOpenTarget<'a> {
+    Root,
+    Child(&'a CStr),
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn directory_bytes_fd_relative(
     path: &Path,
     limits: SharedCacheScanLimits,
 ) -> Result<Option<u64>, PreparationError> {
+    directory_bytes_fd_relative_with_hook(path, limits, |_| {})
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn directory_bytes_fd_relative_with_hook<F>(
+    path: &Path,
+    limits: SharedCacheScanLimits,
+    mut before_open: F,
+) -> Result<Option<u64>, PreparationError>
+where
+    F: for<'a> FnMut(SharedCacheScanOpenTarget<'a>),
+{
     use std::mem::MaybeUninit;
 
     let started = Instant::now();
@@ -1722,6 +1741,7 @@ fn directory_bytes_fd_relative(
         .map_err(|_| shared_cache_scan_refusal(path, "cache store path is invalid"))?;
     let flags =
         libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK;
+    before_open(SharedCacheScanOpenTarget::Root);
     // SAFETY: path_c is NUL-terminated and flags request a directory without
     // following the final path component if it is a symlink.
     let root_fd = unsafe { libc::open(path_c.as_ptr(), flags) };
@@ -1743,12 +1763,15 @@ fn directory_bytes_fd_relative(
     }
     // SAFETY: successful fstat initialized the structure.
     let root_stat = unsafe { root_stat.assume_init() };
-    if root_stat.st_mode & libc::S_IFMT != libc::S_IFDIR {
+    if root_stat.st_mode & libc::S_IFMT != libc::S_IFDIR
+        || root_stat.st_dev != root_metadata.dev()
+        || root_stat.st_ino != root_metadata.ino()
+    {
         // SAFETY: fd was opened above and has not transferred to fdopendir.
         unsafe { libc::close(root_fd) };
         return Err(shared_cache_scan_refusal(
             path,
-            "cache store root changed type",
+            "cache store root changed during inventory",
         ));
     }
     let root_device = root_stat.st_dev;
@@ -1826,6 +1849,7 @@ fn directory_bytes_fd_relative(
                     ));
                 }
                 check_shared_cache_scan_deadline(path, started, limits)?;
+                before_open(SharedCacheScanOpenTarget::Child(&name));
                 // SAFETY: name is NUL-terminated and parent_fd remains live.
                 let child_fd = unsafe { libc::openat(parent_fd, name.as_ptr(), flags) };
                 if child_fd < 0 {
@@ -1847,6 +1871,8 @@ fn directory_bytes_fd_relative(
                 let child_stat = unsafe { child_stat.assume_init() };
                 if child_stat.st_mode & libc::S_IFMT != libc::S_IFDIR
                     || child_stat.st_dev != root_device
+                    || child_stat.st_dev != entry_stat.st_dev
+                    || child_stat.st_ino != entry_stat.st_ino
                 {
                     // SAFETY: child_fd remains owned here because fdopendir was
                     // not called after validation failed.
@@ -2462,6 +2488,74 @@ mod tests {
             Err(PreparationError::StorageUnavailable { .. })
         ));
         assert_eq!(fs::read(target.join("payload")).unwrap(), b"preserve me");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn shared_cache_inventory_rejects_root_replaced_after_metadata_check() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = temporary.path().join("cache");
+        let original = temporary.path().join("cache-original");
+        fs::create_dir(&store).unwrap();
+        fs::write(store.join("original"), b"x").unwrap();
+        let mut replaced = false;
+
+        let result = directory_bytes_fd_relative_with_hook(
+            &store,
+            SharedCacheScanLimits::default(),
+            |target| {
+                if matches!(target, SharedCacheScanOpenTarget::Root) && !replaced {
+                    fs::rename(&store, &original).unwrap();
+                    fs::create_dir(&store).unwrap();
+                    fs::write(store.join("replacement"), [0_u8; 64]).unwrap();
+                    replaced = true;
+                }
+            },
+        );
+
+        assert!(replaced);
+        assert!(matches!(
+            result,
+            Err(PreparationError::StorageUnavailable { .. })
+        ));
+        assert_eq!(fs::read(original.join("original")).unwrap(), b"x");
+        assert_eq!(fs::metadata(store.join("replacement")).unwrap().len(), 64);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn shared_cache_inventory_rejects_child_replaced_after_lstat() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = temporary.path().join("cache");
+        let child = store.join("child");
+        let original = store.join("child-original");
+        fs::create_dir_all(&child).unwrap();
+        fs::write(child.join("original"), b"x").unwrap();
+        let mut replaced = false;
+
+        let result = directory_bytes_fd_relative_with_hook(
+            &store,
+            SharedCacheScanLimits::default(),
+            |target| {
+                if let SharedCacheScanOpenTarget::Child(name) = target
+                    && name.to_bytes() == b"child"
+                    && !replaced
+                {
+                    fs::rename(&child, &original).unwrap();
+                    fs::create_dir(&child).unwrap();
+                    fs::write(child.join("replacement"), [0_u8; 64]).unwrap();
+                    replaced = true;
+                }
+            },
+        );
+
+        assert!(replaced);
+        assert!(matches!(
+            result,
+            Err(PreparationError::StorageUnavailable { .. })
+        ));
+        assert_eq!(fs::read(original.join("original")).unwrap(), b"x");
+        assert_eq!(fs::metadata(child.join("replacement")).unwrap().len(), 64);
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
