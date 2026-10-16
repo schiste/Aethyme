@@ -5027,18 +5027,21 @@ mod tests {
     fn interrupted_tree_reports_entries_unlinked_before_its_cursor_stalls() {
         let tmp = tempfile::tempdir().unwrap();
         let cache = tmp.path().join("target");
-        std::fs::create_dir_all(cache.join("nested")).unwrap();
-        std::fs::write(cache.join("nested/first"), b"first").unwrap();
-        std::fs::write(cache.join("nested/second"), b"second").unwrap();
+        // An expired budget may unlink one flat leaf, but must not descend
+        // into an arbitrary directory chain before checking that budget.
+        std::fs::create_dir_all(&cache).unwrap();
+        std::fs::write(cache.join("first"), b"first").unwrap();
+        std::fs::write(cache.join("second"), b"second").unwrap();
 
         let (outcome, entries_reclaimed) =
             remove_condemned_tree_with_progress(&cache, None, Some(Instant::now())).unwrap();
 
         assert_eq!(outcome, TreeRemoval::Interrupted);
-        assert!(
-            entries_reclaimed > 0,
-            "partial unlink progress must be visible even when the worker resumes the same tree"
+        assert_eq!(
+            entries_reclaimed, 1,
+            "report the single successful unlink before the expired budget stops this pass"
         );
+        assert_eq!(std::fs::read_dir(&cache).unwrap().count(), 1);
         assert!(cache.exists(), "the interrupted cache remains resumable");
     }
 
@@ -5113,7 +5116,10 @@ mod tests {
                 let active = broker.start_worktree("active cache fixture", None).unwrap();
                 let active_worktree = PathBuf::from(&active.worktree_path);
                 let closed_cache = closed_worktree.join("target");
-                std::fs::create_dir_all(closed_cache.join("debug")).unwrap();
+                // Flat leaves make the deliberate zero-budget crash deterministic:
+                // one leaf is removed before interruption; directory descent
+                // remains forbidden after the deadline has already expired.
+                std::fs::create_dir_all(&closed_cache).unwrap();
                 std::fs::write(
                     closed_cache.join("CACHEDIR.TAG"),
                     "Signature: 8a477f597d28d172\n",
@@ -5121,7 +5127,7 @@ mod tests {
                 .unwrap();
                 for index in 0..128 {
                     std::fs::write(
-                        closed_cache.join("debug").join(format!("entry-{index:03}")),
+                        closed_cache.join(format!("entry-{index:03}")),
                         vec![b'x'; 4096],
                     )
                     .unwrap();
@@ -5256,7 +5262,7 @@ mod tests {
                 let cache = closed_worktree.join("target");
                 let active_cache = active_worktree.join("target");
                 let idle_cache = idle_worktree.join("target");
-                assert!(cache.join("debug").is_dir());
+                assert!(cache.is_dir());
                 assert!(active_cache.join("debug/keep.txt").is_file());
                 assert!(
                     idle_cache
@@ -5526,9 +5532,7 @@ mod tests {
             store.meta_set(ARTIFACT_SWEEP_PROGRESS_KEY, "1").unwrap();
             store.meta_set(ARTIFACT_SWEEP_INTERRUPTED_KEY, "").unwrap();
         }
-        let cache_entries_before = std::fs::read_dir(closed_cache.join("debug"))
-            .unwrap()
-            .count();
+        let cache_entries_before = std::fs::read_dir(&closed_cache).unwrap().count();
 
         // Hold the OS lock in this process and prove a separate test-binary
         // process cannot enter its cache-only section.
@@ -5540,9 +5544,7 @@ mod tests {
             b"blocked"
         );
         assert_eq!(
-            std::fs::read_dir(closed_cache.join("debug"))
-                .unwrap()
-                .count(),
+            std::fs::read_dir(&closed_cache).unwrap().count(),
             cache_entries_before
         );
         drop(held_lock);
@@ -5592,9 +5594,7 @@ mod tests {
                 "the interrupted worker must exit instead of remaining detached forever"
             );
         }
-        let partially_remaining = std::fs::read_dir(closed_cache.join("debug"))
-            .unwrap()
-            .count();
+        let partially_remaining = std::fs::read_dir(&closed_cache).unwrap().count();
         assert!(partially_remaining < cache_entries_before && partially_remaining > 0);
         assert!(active_cache.join("debug/keep.txt").is_file());
         {
