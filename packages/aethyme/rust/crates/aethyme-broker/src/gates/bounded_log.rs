@@ -274,10 +274,10 @@ impl BoundedGateLog {
                 self.try_write_file_bytes(&tail);
             }
         }
-        if self.write_error.is_none() {
-            if let Err(error) = self.file.flush() {
-                self.write_error = Some(error.to_string());
-            }
+        if self.write_error.is_none()
+            && let Err(error) = self.file.flush()
+        {
+            self.write_error = Some(error.to_string());
         }
         CaptureSummary {
             output_bytes: self.output_bytes,
@@ -450,10 +450,10 @@ fn unsupported_pipe_capture() -> io::Error {
 }
 
 fn record_drain_error(failed: &AtomicBool, slot: &Mutex<Option<String>>, error: &io::Error) {
-    if let Ok(mut message) = slot.lock() {
-        if message.is_none() {
-            *message = Some(error.to_string());
-        }
+    if let Ok(mut message) = slot.lock()
+        && message.is_none()
+    {
+        *message = Some(error.to_string());
     }
     failed.store(true, Ordering::Release);
 }

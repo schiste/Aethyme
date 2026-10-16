@@ -3292,6 +3292,27 @@ fn wait_gate_child(
     process_group: i32,
     collector: &std::sync::Arc<std::sync::Mutex<bounded_log::BoundedGateLog>>,
     drain_failed: &std::sync::atomic::AtomicBool,
+    resource_stop_requested: &std::sync::atomic::AtomicBool,
+) -> (Result<std::process::ExitStatus, std::io::Error>, bool) {
+    wait_gate_child_with_signaler(
+        child,
+        context,
+        process_group,
+        collector,
+        drain_failed,
+        resource_stop_requested,
+        signal_owned_process_group,
+    )
+}
+
+fn wait_gate_child_with_signaler(
+    child: &mut std::process::Child,
+    context: &GateCommandContext<'_>,
+    process_group: i32,
+    collector: &std::sync::Arc<std::sync::Mutex<bounded_log::BoundedGateLog>>,
+    drain_failed: &std::sync::atomic::AtomicBool,
+    resource_stop_requested: &std::sync::atomic::AtomicBool,
+    mut signal_group: impl FnMut(i32, i32) -> std::io::Result<()>,
 ) -> (Result<std::process::ExitStatus, std::io::Error>, bool) {
     let deadline = context.timeout_seconds.map(Duration::from_secs);
     let mut timed_out = false;
@@ -3301,24 +3322,36 @@ fn wait_gate_child(
                 timed_out = command_completion_is_late(context.absolute_deadline);
                 break Ok(status);
             }
-            Ok(None) if drain_failed.load(std::sync::atomic::Ordering::Acquire) => {
-                // A reader failure would let the child fill a pipe and hang.
-                // The leader is still unreaped, so its process group is still
-                // owned by this run and can be stopped safely here.
-                // SAFETY: killpg takes plain integers and has no memory-safety
-                // preconditions; the child has not been reaped.
-                unsafe {
-                    libc::killpg(process_group, libc::SIGTERM);
+            Ok(None)
+                if drain_failed.load(std::sync::atomic::Ordering::Acquire)
+                    || resource_stop_requested.load(std::sync::atomic::Ordering::Acquire) =>
+            {
+                let renewal_failed =
+                    resource_stop_requested.load(std::sync::atomic::Ordering::Acquire);
+                if renewal_failed {
+                    collector
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .write_note(
+                            b"aethyme: host resource lease renewal failed; stopping the gate while its leader is still owned\n",
+                        );
                 }
+                // Both failure sources are handled only by this waiter. The
+                // branch is reached after `try_wait()` returned `None`, so
+                // the leader is still unreaped and the process-group id has
+                // not been released for reuse.
+                signal_group_and_note(&mut signal_group, process_group, libc::SIGTERM, collector);
                 let grace_deadline = Instant::now() + Duration::from_secs(1);
                 let final_status = loop {
                     match child.try_wait() {
                         Ok(Some(status)) => break Ok(status),
                         Ok(None) if Instant::now() >= grace_deadline => {
-                            // SAFETY: the leader remains unreaped.
-                            unsafe {
-                                libc::killpg(process_group, libc::SIGKILL);
-                            }
+                            signal_group_and_note(
+                                &mut signal_group,
+                                process_group,
+                                libc::SIGKILL,
+                                collector,
+                            );
                             break child.wait();
                         }
                         Ok(None) => std::thread::sleep(Duration::from_millis(25)),
@@ -3349,20 +3382,18 @@ fn wait_gate_child(
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .write_note(diagnostic.as_bytes());
-                // SAFETY: killpg has no memory-safety preconditions; the
-                // leader is unreaped, so the group cannot have been reused.
-                unsafe {
-                    libc::killpg(process_group, libc::SIGTERM);
-                }
+                signal_group_and_note(&mut signal_group, process_group, libc::SIGTERM, collector);
                 let grace_deadline = Instant::now() + Duration::from_secs(1);
                 let final_status = loop {
                     match child.try_wait() {
                         Ok(Some(status)) => break Ok(status),
                         Ok(None) if Instant::now() >= grace_deadline => {
-                            // SAFETY: as for the SIGTERM above.
-                            unsafe {
-                                libc::killpg(process_group, libc::SIGKILL);
-                            }
+                            signal_group_and_note(
+                                &mut signal_group,
+                                process_group,
+                                libc::SIGKILL,
+                                collector,
+                            );
                             break child.wait();
                         }
                         Ok(None) => std::thread::sleep(Duration::from_millis(25)),
@@ -3376,6 +3407,61 @@ fn wait_gate_child(
         }
     };
     (status, timed_out)
+}
+
+fn signal_owned_process_group(process_group: i32, signal: i32) -> std::io::Result<()> {
+    // SAFETY: callers invoke this only from the child waiter after observing
+    // `try_wait() == None`, so the unreaped child still owns this group id.
+    let result = unsafe { libc::killpg(process_group, signal) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+fn signal_group_and_note(
+    signal_group: &mut impl FnMut(i32, i32) -> std::io::Result<()>,
+    process_group: i32,
+    signal: i32,
+    collector: &std::sync::Arc<std::sync::Mutex<bounded_log::BoundedGateLog>>,
+) {
+    if let Err(error) = signal_group(process_group, signal) {
+        let message = format!("aethyme: could not signal owned gate process group: {error}\n");
+        collector
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .write_note(message.as_bytes());
+    }
+}
+
+fn request_resource_stop(
+    stop_requested: &std::sync::atomic::AtomicBool,
+    error_slot: &std::sync::Mutex<Option<String>>,
+    message: String,
+) {
+    {
+        let mut slot = error_slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if slot.is_none() {
+            *slot = Some(bounded_gate_diagnostic(message));
+        }
+    }
+    stop_requested.store(true, std::sync::atomic::Ordering::Release);
+}
+
+fn bounded_gate_diagnostic(mut message: String) -> String {
+    const MAX_DIAGNOSTIC_BYTES: usize = 4 * 1024;
+    if message.len() > MAX_DIAGNOSTIC_BYTES {
+        let mut boundary = MAX_DIAGNOSTIC_BYTES;
+        while !message.is_char_boundary(boundary) {
+            boundary -= 1;
+        }
+        message.truncate(boundary);
+        message.push_str("…[truncated]");
+    }
+    message
 }
 
 fn spawn_gate_command(
@@ -3652,6 +3738,7 @@ fn run_gate_command(
     let drain_error = std::sync::Arc::new(std::sync::Mutex::new(None));
     let first_output = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(-1));
     let fatal_resource_error = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let resource_stop_requested = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let (status, timed_out, pipes_incomplete, stdout_result, stderr_result) =
         std::thread::scope(|scope| {
             let stdout_reader = scope.spawn({
@@ -3700,79 +3787,95 @@ fn run_gate_command(
                 .map(|(_, ttl)| Duration::from_secs((ttl / 3).max(1)))
                 .map(|renewal| renewal.min(progress_interval))
                 .unwrap_or(progress_interval);
-            let process_group = child.id() as i32;
             let thread_error = fatal_resource_error.clone();
+            let thread_stop_requested = resource_stop_requested.clone();
             let renewal_thread = scope.spawn(move || {
-                let mut renewal = renewal;
-                let mut last_progress = Instant::now();
-                loop {
-                    match done_rx.recv_timeout(interval) {
-                        Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
-                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                            if let Some((grant, ttl_seconds)) = renewal.as_mut() {
-                                match crate::HostResourceCoordinator::open_default().and_then(
-                                    |mut coordinator| {
-                                        coordinator.renew(
-                                            &grant.lease.lease_id,
-                                            grant.lease.generation,
-                                            &grant.ownership_token,
-                                            *ttl_seconds,
-                                        )
-                                    },
-                                ) {
-                                    Ok(lease) => grant.lease = lease,
-                                    Err(error) => {
-                                        // Keep retrying while the last confirmed TTL still grants
-                                        // authority. Stop the process before that authority expires.
-                                        if epoch_ms().saturating_add(1_000)
-                                            >= grant.lease.expires_at
-                                        {
-                                            if let Ok(mut slot) = thread_error.lock() {
-                                                *slot = Some(error.to_string());
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let mut renewal = renewal;
+                    let mut last_progress = Instant::now();
+                    loop {
+                        match done_rx.recv_timeout(interval) {
+                            Ok(()) => break,
+                            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                                request_resource_stop(
+                                    &thread_stop_requested,
+                                    &thread_error,
+                                    "gate resource-renewal shutdown control disconnected".into(),
+                                );
+                                break;
+                            }
+                            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                                if let Some((grant, ttl_seconds)) = renewal.as_mut() {
+                                    match crate::HostResourceCoordinator::open_default().and_then(
+                                        |mut coordinator| {
+                                            coordinator.renew(
+                                                &grant.lease.lease_id,
+                                                grant.lease.generation,
+                                                &grant.ownership_token,
+                                                *ttl_seconds,
+                                            )
+                                        },
+                                    ) {
+                                        Ok(lease) => grant.lease = lease,
+                                        Err(error) => {
+                                            // Keep retrying while the last confirmed TTL still
+                                            // grants authority. Ask the sole child waiter to stop
+                                            // the process before that authority expires.
+                                            if epoch_ms().saturating_add(1_000)
+                                                >= grant.lease.expires_at
+                                            {
+                                                request_resource_stop(
+                                                    &thread_stop_requested,
+                                                    &thread_error,
+                                                    error.to_string(),
+                                                );
+                                                break;
                                             }
-                                            // SAFETY: killpg has no memory-safety preconditions;
-                                            // the child leader has not yet been reaped.
-                                            unsafe {
-                                                libc::killpg(process_group, libc::SIGTERM);
-                                            }
-                                            break;
                                         }
                                     }
                                 }
-                            }
-                            if last_progress.elapsed() >= progress_interval {
-                                context.progress.report(&format!(
-                                    "gate {} running... {}s",
-                                    context.gate_name,
-                                    context.started.elapsed().as_secs()
-                                ));
-                                last_progress = Instant::now();
+                                if last_progress.elapsed() >= progress_interval {
+                                    context.progress.report(&format!(
+                                        "gate {} running... {}s",
+                                        context.gate_name,
+                                        context.started.elapsed().as_secs()
+                                    ));
+                                    last_progress = Instant::now();
+                                }
                             }
                         }
                     }
+                }));
+                if result.is_err() {
+                    request_resource_stop(
+                        &thread_stop_requested,
+                        &thread_error,
+                        "gate resource-renewal thread panicked".into(),
+                    );
                 }
             });
+            let process_group = child.id() as i32;
             let (status, timed_out) = wait_gate_child(
                 &mut child,
                 &context,
                 process_group,
                 &collector,
                 &drain_failed,
+                &resource_stop_requested,
             );
-            let shutdown_signal_failed = done_tx.send(()).is_err();
-            let renewal_thread_failed = renewal_thread.join().is_err();
-            if shutdown_signal_failed || renewal_thread_failed {
-                let mut error = fatal_resource_error
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if error.is_none() {
-                    *error = Some(if renewal_thread_failed {
-                        "gate resource-renewal thread panicked before shutdown".to_string()
-                    } else {
-                        "gate resource-renewal thread stopped before its shutdown signal"
-                            .to_string()
-                    });
-                }
+            if done_tx.send(()).is_err() {
+                request_resource_stop(
+                    &resource_stop_requested,
+                    &fatal_resource_error,
+                    "gate resource-renewal thread stopped before its shutdown signal".into(),
+                );
+            }
+            if renewal_thread.join().is_err() {
+                request_resource_stop(
+                    &resource_stop_requested,
+                    &fatal_resource_error,
+                    "gate resource-renewal thread could not be joined".into(),
+                );
             }
             let drain_deadline = Instant::now() + bounded_log::PIPE_DRAIN_GRACE;
             while !(stdout_reader.is_finished() && stderr_reader.is_finished())
@@ -4406,9 +4509,31 @@ mod tests {
             bounded_log::BoundedGateLog::create(&log).unwrap(),
         ));
         let drain_failed = std::sync::atomic::AtomicBool::new(false);
-        let (result, late) =
-            wait_gate_child(&mut child, &context(), group, &collector, &drain_failed);
+        let resource_stop_requested = std::sync::atomic::AtomicBool::new(false);
+        let renewal_error = std::sync::Mutex::new(None);
+        request_resource_stop(
+            &resource_stop_requested,
+            &renewal_error,
+            "injected late renewal failure".to_string(),
+        );
+        let mut signals = Vec::new();
+        let (result, late) = wait_gate_child_with_signaler(
+            &mut child,
+            &context(),
+            group,
+            &collector,
+            &drain_failed,
+            &resource_stop_requested,
+            |process_group, signal| {
+                signals.push((process_group, signal));
+                Ok(())
+            },
+        );
         assert!(result.unwrap().success());
+        assert!(
+            signals.is_empty(),
+            "a reaped child group must never be signalled"
+        );
         assert!(
             late,
             "production completion observer must reject late success"
@@ -4416,6 +4541,87 @@ mod tests {
         assert!(
             !command_completion_is_late(None),
             "ordinary legacy completion keeps its existing semantics"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn renewal_failure_is_signalled_by_the_waiter_while_child_is_unreaped() {
+        use std::os::unix::process::CommandExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let log = root.path().join("log");
+        let environment = GateEnvironment::default();
+        let progress = Lines::default();
+        let database = std::cell::OnceCell::new();
+        let labels = crate::gate_debris::GateRunLabels::new("renewal-stop", None, "synthetic");
+        let context = GateCommandContext {
+            cwd: root.path(),
+            available_bytes: None,
+            available_inodes: None,
+            environment: &environment,
+            log_path: &log,
+            run_dir: root.path(),
+            session_id: None,
+            gate_name: "renewal-stop",
+            tree: "synthetic",
+            worker_id: "renewal-stop",
+            owner_paths: &[],
+            configured_timeout_seconds: Some(30),
+            timeout_seconds: Some(30),
+            absolute_deadline: None,
+            started: Instant::now(),
+            progress: &progress,
+            resources: None,
+            managed_cache: None,
+            broker_database: &database,
+            run_labels: &labels,
+        };
+        let collector = std::sync::Arc::new(std::sync::Mutex::new(
+            bounded_log::BoundedGateLog::create(&log).unwrap(),
+        ));
+        let drain_failed = std::sync::atomic::AtomicBool::new(false);
+        let resource_stop_requested =
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let renewal_error = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let mut command = std::process::Command::new("/bin/sleep");
+        command.arg("30").process_group(0);
+        let mut child = command.spawn().unwrap();
+        let process_group = i32::try_from(child.id()).unwrap();
+
+        let renewer_stop = resource_stop_requested.clone();
+        let renewer_error = renewal_error.clone();
+        let renewer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            request_resource_stop(
+                &renewer_stop,
+                &renewer_error,
+                "injected resource renewal failure".to_string(),
+            );
+        });
+        let mut signals = Vec::new();
+        let (result, timed_out) = wait_gate_child_with_signaler(
+            &mut child,
+            &context,
+            process_group,
+            &collector,
+            &drain_failed,
+            &resource_stop_requested,
+            |owned_group, signal| {
+                assert_eq!(owned_group, process_group);
+                signals.push(signal);
+                signal_owned_process_group(owned_group, signal)
+            },
+        );
+        renewer.join().unwrap();
+
+        let status = result.unwrap();
+        assert!(!status.success(), "renewal failure must stop the live gate");
+        assert!(!timed_out);
+        assert_eq!(signals, [libc::SIGTERM]);
+        assert_eq!(
+            renewal_error.lock().unwrap().as_deref(),
+            Some("injected resource renewal failure")
         );
     }
 
