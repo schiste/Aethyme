@@ -2916,7 +2916,7 @@ mod identity_store_tests {
         project: crate::collaboration_state::ProjectKey,
         operation: &str,
     ) -> Result<String, IdentityStoreError> {
-        let root = CollaborationRoot::under_host_state(host);
+        let root = CollaborationRoot::under_host_state(&host);
         let mut store = CollaborationStore::open(&root, &project, &[])
             .expect("reopen the actual approved project store");
         let binding = super::resolve_approved_project_binding(&store)

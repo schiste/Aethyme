@@ -1411,7 +1411,7 @@ mod binding_tests {
 
     #[test]
     fn approved_binding_survives_pointer_removal_and_conflicting_rebind_refuses() {
-        let mut fixture = BoundProjectFixture::new().unwrap();
+        let fixture = BoundProjectFixture::new().unwrap();
         let original_id = fixture.binding.descriptor_record_id().as_str().to_string();
         let original_project = fixture.binding.project_id().as_str().to_string();
         std::fs::write(
@@ -1497,7 +1497,7 @@ mod binding_tests {
 
     #[test]
     fn a_corrupt_bootstrap_transition_is_a_typed_binding_refusal() {
-        let fixture = BoundProjectFixture::new().unwrap();
+        let mut fixture = BoundProjectFixture::new().unwrap();
         fixture
             .store
             .connection()
