@@ -17,9 +17,9 @@ use unicode_normalization::UnicodeNormalization;
 
 pub const SCHEMA_NAME: &str = "aethyme.execution-snapshot/provisional-v0";
 pub const MATERIALIZATION_PROFILE: &str = "aethyme.raw-linux-inputs/provisional-v0";
-const MAX_FILES: usize = 8192;
-const MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
-const MAX_INPUT_BYTES: u64 = 256 * 1024 * 1024;
+pub(crate) const MAX_FILES: usize = 8192;
+pub(crate) const MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
+pub(crate) const MAX_INPUT_BYTES: u64 = 256 * 1024 * 1024;
 static SCHEMA: RecordSchema = RecordSchema {
     name: SCHEMA_NAME,
     fields: &[
