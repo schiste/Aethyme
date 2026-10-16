@@ -704,13 +704,7 @@ mod tests {
         let new_pin = RevisionPin {
             contribution_id: old.revision().contribution_id().clone(),
             revision_record_id: RecordId::parse(&head).unwrap(),
-            object_digest: ObjectDigest::from_bytes(
-                data_encoding::HEXLOWER
-                    .decode(digest.as_bytes())
-                    .unwrap()
-                    .try_into()
-                    .unwrap(),
-            ),
+            object_digest: hex_digest(&digest).unwrap(),
         };
         let newest =
             retrieve_revisions(&fixture.store, &request, &[new_pin], &LocalProject).unwrap();

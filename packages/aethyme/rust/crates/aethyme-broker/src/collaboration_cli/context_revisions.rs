@@ -1,6 +1,5 @@
 //! Public selection of exact immutable contribution revisions.
 use super::*;
-use crate::collaboration_archive::ObjectDigest;
 use crate::collaboration_context::{RevisionPin, retrieve_revisions};
 use aethyme_contracts::experimental_v0::ContributionId;
 
@@ -97,15 +96,11 @@ fn parse_pin(value: &str) -> Result<RevisionPin, Failure> {
     }
     let contribution_id = ContributionId::parse(contribution).map_err(|_| invalid())?;
     let revision_record_id = RecordId::parse(revision).map_err(|_| invalid())?;
-    let bytes: [u8; 32] = data_encoding::HEXLOWER
-        .decode(digest.as_bytes())
-        .map_err(|_| invalid())?
-        .try_into()
-        .map_err(|_| invalid())?;
+    let object_digest = crate::collaboration_context::hex_digest(digest).ok_or_else(invalid)?;
     Ok(RevisionPin {
         contribution_id,
         revision_record_id,
-        object_digest: ObjectDigest::from_bytes(bytes),
+        object_digest,
     })
 }
 
