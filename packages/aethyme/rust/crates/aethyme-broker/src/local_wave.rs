@@ -939,37 +939,40 @@ pub fn compose(
         })
     } else {
         match (already_delivered, revision_bindings.as_ref()) {
-        (Some((completion, members)), Some(revisions)) => {
-            composer::compose_after_accepted_with_candidate_retainer_and_revisions(
+            (Some((completion, members)), Some(revisions)) => {
+                composer::compose_after_accepted_with_candidate_retainer_and_revisions(
+                    store,
+                    repo,
+                    &request,
+                    completion,
+                    members,
+                    revisions,
+                    &mut retain_candidate,
+                )
+            }
+            (Some((completion, members)), None) => {
+                composer::compose_after_accepted_with_candidate_retainer(
+                    store,
+                    repo,
+                    &request,
+                    completion,
+                    members,
+                    &mut retain_candidate,
+                )
+            }
+            (None, Some(revisions)) => composer::compose_with_candidate_retainer_and_revisions(
                 store,
                 repo,
                 &request,
-                completion,
-                members,
                 revisions,
                 &mut retain_candidate,
-            )
-        }
-        (Some((completion, members)), None) => {
-            composer::compose_after_accepted_with_candidate_retainer(
+            ),
+            (None, None) => composer::compose_with_candidate_retainer(
                 store,
                 repo,
                 &request,
-                completion,
-                members,
                 &mut retain_candidate,
-            )
-        }
-        (None, Some(revisions)) => composer::compose_with_candidate_retainer_and_revisions(
-            store,
-            repo,
-            &request,
-            revisions,
-            &mut retain_candidate,
-        ),
-        (None, None) => {
-            composer::compose_with_candidate_retainer(store, repo, &request, &mut retain_candidate)
-        }
+            ),
         }
     };
     let elapsed = i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX);

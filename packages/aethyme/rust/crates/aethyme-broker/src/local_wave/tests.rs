@@ -56,6 +56,7 @@ fn conflicting_bound_revisions() -> (
     // path overlaps, while the distinct source commits keep the two legacy
     // capture lineages separate for wave admission.
     crate::local_target::tests::git(fixture.repo_path(), &["switch", "--detach", base.as_str()]);
+    std::fs::create_dir_all(fixture.repo_path().join("src")).unwrap();
     std::fs::write(
         fixture.repo_path().join("src/shared.rs"),
         b"pub fn shared_b() {}\n",
@@ -160,25 +161,14 @@ fn split_single_item_waves_refuse_conflicts_across_the_full_selected_cohort() {
 
     let first_wave = frozen(admit(&mut fixture.store, &owner, one_item, 1).unwrap());
     assert_eq!(first_wave.spec.selected, ["A"]);
-    let first_result = compose(
-        &mut fixture.store,
-        &owner,
-        fixture.repo_path(),
-        &first_wave.id,
-    )
-    .unwrap();
+    let repo = fixture.repo_path().to_path_buf();
+    let first_result = compose(&mut fixture.store, &owner, &repo, &first_wave.id).unwrap();
     assert_eq!(first_result.phase, WavePhase::Blocked);
     assert!(first_result.candidate_snapshot.is_none());
 
     let second_wave = frozen(admit(&mut fixture.store, &owner, one_item, 2).unwrap());
     assert_eq!(second_wave.spec.selected, ["B"]);
-    let second_result = compose(
-        &mut fixture.store,
-        &owner,
-        fixture.repo_path(),
-        &second_wave.id,
-    )
-    .unwrap();
+    let second_result = compose(&mut fixture.store, &owner, &repo, &second_wave.id).unwrap();
     assert_eq!(second_result.phase, WavePhase::Blocked);
     assert!(second_result.candidate_snapshot.is_none());
 }
@@ -200,7 +190,8 @@ fn d10_wave_validation_does_not_include_conflicting_unselected_catalog_entries()
     let wave = frozen(admit(&mut fixture.store, &owner, one_item, 0).unwrap());
     assert_eq!(wave.spec.selected, ["A"]);
 
-    let result = compose(&mut fixture.store, &owner, fixture.repo_path(), &wave.id).unwrap();
+    let repo = fixture.repo_path().to_path_buf();
+    let result = compose(&mut fixture.store, &owner, &repo, &wave.id).unwrap();
     assert_eq!(result.phase, WavePhase::Verifying);
     assert!(result.candidate_snapshot.is_some());
 }
