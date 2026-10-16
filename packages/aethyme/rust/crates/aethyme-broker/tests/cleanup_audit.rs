@@ -5,10 +5,13 @@
 //! upstream that can move independently of the local default branch -- the
 //! shape that made a stale local `main` a silent wrong baseline.
 
+#[path = "common/isolation.rs"]
+mod isolation;
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-use aethyme_broker::{AuditDisposition, Broker, CheckoutState, CleanupAudit, LandingEvidence};
+use aethyme_broker::{AuditDisposition, CheckoutState, CleanupAudit, LandingEvidence};
 
 const CLI: &str = env!("CARGO_BIN_EXE_broker-cli-shim");
 
@@ -42,11 +45,7 @@ fn commit(dir: &Path, file: &str, content: &str, message: &str) -> String {
 }
 
 fn cli(dir: &Path, args: &[&str]) -> Output {
-    Command::new(CLI)
-        .args(args)
-        .current_dir(dir)
-        .output()
-        .unwrap()
+    isolation::command(CLI, dir, args).output().unwrap()
 }
 
 /// A bare origin, a publisher clone standing in for the forge, and the
@@ -105,7 +104,7 @@ fn item_for(audit: &CleanupAudit, session_id: i64) -> &aethyme_broker::AuditItem
 #[test]
 fn squash_landing_is_in_target_against_upstream_while_local_main_is_stale() {
     let (_tmp, publisher, repo) = fixture();
-    let mut broker = Broker::open(&repo).unwrap();
+    let mut broker = isolation::open(&repo);
     let session = broker.start_worktree("squashed work", None).unwrap();
     let worktree = PathBuf::from(&session.worktree_path);
     commit(&worktree, "feature.txt", "a\n", "feature part one");
@@ -154,7 +153,7 @@ fn squash_landing_is_in_target_against_upstream_while_local_main_is_stale() {
 #[test]
 fn rebased_delivery_is_recognised_by_patch_identity() {
     let (_tmp, publisher, repo) = fixture();
-    let mut broker = Broker::open(&repo).unwrap();
+    let mut broker = isolation::open(&repo);
     let session = broker.start_worktree("rebased work", None).unwrap();
     let worktree = PathBuf::from(&session.worktree_path);
     let change = commit(
@@ -200,7 +199,7 @@ fn rebased_delivery_is_recognised_by_patch_identity() {
 #[test]
 fn rebased_then_merged_work_gets_one_verdict_from_scan_audit_and_plan() {
     let (_tmp, publisher, repo) = fixture();
-    let mut broker = Broker::open(&repo).unwrap();
+    let mut broker = isolation::open(&repo);
     let session = broker.start_worktree("rebased then merged", None).unwrap();
     let worktree = PathBuf::from(&session.worktree_path);
     let change = commit(
@@ -285,7 +284,7 @@ fn rebased_then_merged_work_gets_one_verdict_from_scan_audit_and_plan() {
 #[test]
 fn unique_dirty_integration_only_and_live_are_distinct_dispositions() {
     let (_tmp, _publisher, repo) = fixture();
-    let mut broker = Broker::open(&repo).unwrap();
+    let mut broker = isolation::open(&repo);
 
     let unique = broker.start_worktree("unique work", None).unwrap();
     let unique_path = PathBuf::from(&unique.worktree_path);
@@ -380,7 +379,7 @@ fn unique_dirty_integration_only_and_live_are_distinct_dispositions() {
 #[test]
 fn missing_directories_metadata_and_unowned_roots_are_distinct_states() {
     let (tmp, _publisher, repo) = fixture();
-    let mut broker = Broker::open(&repo).unwrap();
+    let mut broker = isolation::open(&repo);
 
     // Session directory deleted behind Git's back: the branch still holds
     // its work and Git still lists the registration as prunable.
@@ -469,7 +468,7 @@ fn missing_directories_metadata_and_unowned_roots_are_distinct_states() {
 #[test]
 fn target_advancement_after_review_invalidates_the_apply_digest() {
     let (_tmp, publisher, repo) = fixture();
-    let mut broker = Broker::open(&repo).unwrap();
+    let mut broker = isolation::open(&repo);
     let session = broker.start_worktree("represented work", None).unwrap();
     let worktree = PathBuf::from(&session.worktree_path);
     commit(&worktree, "done.txt", "done\n", "done");
@@ -554,7 +553,7 @@ fn target_advancement_after_review_invalidates_the_apply_digest() {
 fn audit_is_scoped_to_the_named_repository_and_renders_a_summary() {
     let (_tmp, _publisher, repo) = fixture();
     let other = tempfile::tempdir().unwrap();
-    let mut broker = Broker::open(&repo).unwrap();
+    let mut broker = isolation::open(&repo);
     let session = broker.start_worktree("scoped", None).unwrap();
     broker.close(session.id).unwrap();
     drop(broker);
@@ -569,8 +568,9 @@ fn audit_is_scoped_to_the_named_repository_and_renders_a_summary() {
     .unwrap();
 
     // Run from an unrelated directory, naming the repository explicitly.
-    let output = cli(
-        other.path(),
+    let output = isolation::command(
+        CLI,
+        &repo,
         &[
             "finish",
             "cleanup",
@@ -578,7 +578,10 @@ fn audit_is_scoped_to_the_named_repository_and_renders_a_summary() {
             "--repo",
             repo.to_str().unwrap(),
         ],
-    );
+    )
+    .current_dir(other.path())
+    .output()
+    .unwrap();
     assert!(
         output.status.success(),
         "{}",

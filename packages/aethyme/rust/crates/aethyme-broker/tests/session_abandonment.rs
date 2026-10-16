@@ -5,6 +5,9 @@
 //! consequence, which is the part that was actually broken: a stale session was
 //! never a cleanup *candidate*, so no retention policy could reach its disk.
 
+#[path = "common/isolation.rs"]
+mod isolation;
+
 use std::path::Path;
 use std::process::Command;
 
@@ -68,9 +71,9 @@ fn landed_session(broker: &mut Broker, tmp: &Path) -> i64 {
 
 #[test]
 fn a_quiet_session_pins_its_worktree_until_the_window_elapses() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = isolation::FixtureRepo::new();
     fixture(tmp.path());
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = isolation::open(tmp.path());
     let id = landed_session(&mut broker, tmp.path());
 
     // This is the #176 symptom, reproduced: the session is stale by any
@@ -104,9 +107,9 @@ fn a_quiet_session_pins_its_worktree_until_the_window_elapses() {
 
 #[test]
 fn abandonment_grants_candidacy_but_never_eligibility() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = isolation::FixtureRepo::new();
     fixture(tmp.path());
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = isolation::open(tmp.path());
     let session = broker.start_worktree("dirty fixture", None).unwrap();
     let worktree = std::path::PathBuf::from(&session.worktree_path);
     // Uncommitted work. Abandoning the session must not put it at risk.
@@ -132,7 +135,7 @@ fn abandonment_grants_candidacy_but_never_eligibility() {
 
 #[test]
 fn a_zero_window_restores_the_unbounded_hold() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = isolation::FixtureRepo::new();
     fixture(tmp.path());
     std::fs::create_dir_all(tmp.path().join(".aethyme")).unwrap();
     std::fs::write(
@@ -141,7 +144,7 @@ fn a_zero_window_restores_the_unbounded_hold() {
     )
     .unwrap();
 
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = isolation::open(tmp.path());
     let id = landed_session(&mut broker, tmp.path());
     broker.agents(now_ms() + 10_000 * HOUR_MS).unwrap();
     let plan = broker.cleanup_plan().unwrap();
@@ -153,9 +156,9 @@ fn a_zero_window_restores_the_unbounded_hold() {
 
 #[test]
 fn the_transition_is_recorded_for_audit() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = isolation::FixtureRepo::new();
     fixture(tmp.path());
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = isolation::open(tmp.path());
     let id = landed_session(&mut broker, tmp.path());
     broker.agents(now_ms() + 100 * HOUR_MS).unwrap();
 
@@ -175,9 +178,9 @@ fn the_transition_is_recorded_for_audit() {
 
 #[test]
 fn abandonment_is_idempotent_across_repeated_status_checks() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = isolation::FixtureRepo::new();
     fixture(tmp.path());
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = isolation::open(tmp.path());
     let id = landed_session(&mut broker, tmp.path());
     for _ in 0..3 {
         broker.agents(now_ms() + 100 * HOUR_MS).unwrap();
@@ -200,9 +203,9 @@ fn a_running_agent_keeps_its_worktree_however_long_it_has_been_quiet() {
     // exactly like an abandoned one on every signal except the process
     // itself, so this pins liveness ahead of the clock at the level where
     // the worktree actually gets removed.
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = isolation::FixtureRepo::new();
     fixture(tmp.path());
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = isolation::open(tmp.path());
     let session = broker
         .start_agent("long-running agent", "sleep 300", None)
         .unwrap();
@@ -231,9 +234,9 @@ fn abandoning_an_adopted_session_releases_the_leases_it_was_holding() {
     // An adopted session owns no broker worktree, so abandoning it frees no
     // disk. It frees something else that was also held without bound: the
     // implicit leases that make other agents' claims conflict.
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = isolation::FixtureRepo::new();
     fixture(tmp.path());
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = isolation::open(tmp.path());
     let session = broker.adopt(tmp.path(), Some("adopted task")).unwrap();
     std::fs::write(tmp.path().join("README.md"), "edited\n").unwrap();
 
