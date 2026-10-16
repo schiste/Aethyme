@@ -145,6 +145,69 @@ fn low_space_preparation_preserves_state_and_does_not_run_install() {
 }
 
 #[test]
+fn preparation_rechecks_headroom_before_the_next_step() {
+    let temp = fixture();
+    let config_path = temp.path().join(".aethyme/prepare.toml");
+    let mut config: toml::Value =
+        toml::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+    config["steps"][0]["command"] = toml::Value::Array(
+        [
+            "sh",
+            "-c",
+            "mkdir -p node_modules && printf 0 > \"${AETHYME_TEST_AVAILABLE_BYTES#@}\"",
+        ]
+        .into_iter()
+        .map(|value| toml::Value::String(value.into()))
+        .collect(),
+    );
+    std::fs::write(&config_path, toml::to_string(&config).unwrap()).unwrap();
+    git(temp.path(), &["add", ".aethyme/prepare.toml"]);
+    git(temp.path(), &["commit", "-qm", "fixture storage pressure"]);
+    let state = temp.path().join("host-state");
+    let adopted = success_json(run(
+        temp.path(),
+        &state,
+        &["start", "--adopt", ".", "--task", "prepare", "--json"],
+    ));
+    let session = adopted["id"].as_i64().unwrap().to_string();
+    let reading = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(reading.path(), u64::MAX.to_string()).unwrap();
+    let output = common::broker_cli(CLI, &["submit", "prepare", "--session", &session, "--json"])
+        .current_dir(temp.path())
+        .env("AETHYME_HOST_STATE_DIR", &state)
+        .env(
+            "AETHYME_TEST_AVAILABLE_BYTES",
+            format!("@{}", reading.path().display()),
+        )
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("dependency preparation storage"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(temp.path().join("node_modules").is_dir());
+    assert!(
+        !temp.path().join("target").exists(),
+        "second install ran after reserve was exhausted"
+    );
+    let status = success_json(run(
+        temp.path(),
+        &state,
+        &[
+            "submit",
+            "prepare",
+            "status",
+            "--session",
+            &session,
+            "--json",
+        ],
+    ));
+    assert_eq!(status["state"], "failed");
+}
+
+#[test]
 fn current_preparation_can_be_read_when_disk_is_full() {
     let temp = fixture();
     let state = temp.path().join("host-state");
