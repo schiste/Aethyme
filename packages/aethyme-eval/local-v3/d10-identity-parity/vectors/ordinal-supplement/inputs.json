@@ -1,0 +1,44 @@
+{
+  "fixture_schema": "aethyme.local-d10-ordinal-supplement-inputs/v1",
+  "project_id": "proj:aaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "contribution_id": "contrib:bbbbbbbbbbbbbbbbbbbbbbbbbe",
+  "anchor_commit": "1111111111111111111111111111111111111111",
+  "descriptor_fixture_source_file": {
+    "path_hex": "7372632f6c69622e7273",
+    "mode": "100644",
+    "content_hex": "666e206d61696e2829207b7d0a"
+  },
+  "descriptor_fixture_expected": {
+    "anchor_snapshot_id": "sha256:2939b109e979106efe56e4132e534918d03524dd8391186d54e237cd871a43e3",
+    "enrolled_file_id": "file:sha256:fd0ee6dc0f6b45715b845b427f345007bd60c53f1b75196d94be53bec48ed33e",
+    "descriptor_record_id": "sha256:fd653fa8879751de70df354eae024d77e9e0179e70adb59567eade4d6c6bbbb7"
+  },
+  "generic_new_file": {
+    "path_hex": "6e65772e7273",
+    "mode": "100644",
+    "content_hex": "6e65772066696c65",
+    "proposal_seed": "proposal-new-file"
+  },
+  "bound_profile_existing_file": {
+    "path_hex": "6e65772e7273",
+    "mode": "100644",
+    "content_hex": "6e65772066696c65"
+  },
+  "mixed_base_files": [
+    {"path_hex": "636f70792d736f757263652e7273", "mode": "100644", "content_hex": "73616d652d636f7079"},
+    {"path_hex": "73706c69742d736f757263652e7273", "mode": "100644", "content_hex": "73706c69742d6f726967696e616c"}
+  ],
+  "mixed_result_files": [
+    {"path_hex": "636f70792d736f757263652e7273", "mode": "100644", "content_hex": "73616d652d636f7079"},
+    {"path_hex": "612d73706c69742e7273", "mode": "100644", "content_hex": "73706c69742d6c656674"},
+    {"path_hex": "6d2d706c61696e2e7273", "mode": "100644", "content_hex": "706c61696e2d6e6577"},
+    {"path_hex": "7a2d636f70792e7273", "mode": "100644", "content_hex": "73616d652d636f7079"},
+    {"path_hex": "7a2d73706c69742e7273", "mode": "100644", "content_hex": "73706c69742d7269676874"}
+  ],
+  "copy_operation": {"from_path_hex": "636f70792d736f757263652e7273", "to_path_hex": "7a2d636f70792e7273"},
+  "split_operation": {
+    "from_path_hex": "73706c69742d736f757263652e7273",
+    "to_path_hexes_input_order": ["7a2d73706c69742e7273", "612d73706c69742e7273"]
+  },
+  "plain_new_path_hex": "6d2d706c61696e2e7273"
+}
