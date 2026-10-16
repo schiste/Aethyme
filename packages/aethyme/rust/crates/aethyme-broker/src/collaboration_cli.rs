@@ -123,10 +123,10 @@ Usage:
       --source and a complete analysis covering every path, the answer is
       partial: an empty answer is not evidence that nothing relevant exists.
       --revision-pin selects exact immutable revisions; repeat it for each pin.
-  aethyme collab brief attach --contribution <record-id> <decision-file> [--json]
+  aethyme collab brief attach (--contribution <record-id> | --operation <id>) <decision-file> [--json]
       Attach a decision brief (aethyme-brief-tokens/v0, at most 150 tokens) to
       a retained contribution. Bound contributions append an immutable revision;
-      an ambiguous shared lineage requires an exact operation selector.
+      select --operation for a lineage shared by multiple logical contributions.
 
 Additional explicit lifecycle commands (provisional Local packages):
   aethyme collab authority status [--json]
@@ -1550,32 +1550,7 @@ fn context_text(record: &Value, served: &str, evidence: bool) -> String {
 // ------------------------------------------------------------------ brief
 
 fn brief_attach(main_root: &Path, rest: &[&str]) -> Result<Output, Failure> {
-    no_extra(rest, &["--contribution"], 1)?;
-    let contribution = flag_value(rest, "--contribution")?
-        .ok_or_else(|| Failure::usage("--contribution <record-id> is required"))?;
-    let mut skip = false;
-    let file = rest
-        .iter()
-        .find(|word| {
-            if skip {
-                skip = false;
-                return false;
-            }
-            if **word == "--contribution" {
-                skip = true;
-                return false;
-            }
-            true
-        })
-        .copied()
-        .ok_or_else(|| Failure::usage("the decision file is required"))?;
-    let contribution = RecordId::parse(contribution).map_err(|error| {
-        Failure::refused(
-            "invalid_record_id",
-            format!("{contribution}: {error}"),
-            "pass the contribution ID a capture receipt prints",
-        )
-    })?;
+    let (selector, file) = context_revisions::brief_selector(rest)?;
     let bytes = read_capped(file, MAX_BRIEF_FILE_BYTES, "decision file")?;
     let brief = Brief::from_decision_file(&bytes).map_err(|errors| {
         Failure::refused(
@@ -1585,15 +1560,68 @@ fn brief_attach(main_root: &Path, rest: &[&str]) -> Result<Output, Failure> {
         )
     })?;
     let mut store = open(main_root)?;
-    let id = attach_brief(&mut store, &contribution, &brief)
-        .map_err(|error| Failure::domain(error.code(), error.to_string()))?;
+    let (contribution, operation, revision, id) = match selector {
+        context_revisions::BriefSelector::Capture(contribution) => {
+            let id = attach_brief(&mut store, &contribution, &brief)
+                .map_err(|error| Failure::domain(error.code(), error.to_string()))?;
+            (contribution, None, None, id)
+        }
+        context_revisions::BriefSelector::Operation(operation) => {
+            use crate::collaboration_identity_store::{
+                ContributionRevisionRequest, resolve_approved_project_binding,
+                revise_contribution_for_operation,
+            };
+            let binding = resolve_approved_project_binding(&store)
+                .map_err(|error| Failure::domain("revision_identity", error.to_string()))?
+                .ok_or_else(|| {
+                    Failure::refused(
+                        "project_unbound",
+                        "project binding is missing",
+                        "run `aethyme collab project bind` first",
+                    )
+                })?;
+            let resolved = revise_contribution_for_operation(
+                &mut store,
+                &binding,
+                ContributionRevisionRequest {
+                    operation_id: &operation,
+                    file_operations: None,
+                    brief: Some(&brief),
+                    depends_on: None,
+                },
+            )
+            .map_err(|error| Failure::domain("revision_identity", error.to_string()))?;
+            let id = resolved
+                .revision()
+                .brief()
+                .ok_or_else(|| {
+                    Failure::domain(
+                        "revision_identity",
+                        "committed revision has no requested Brief".to_string(),
+                    )
+                })?
+                .record_id
+                .clone();
+            (
+                resolved.capture_record_id().clone(),
+                Some(operation),
+                Some(resolved.record_id().clone()),
+                id,
+            )
+        }
+    };
+    let mut value = json!({
+        "schema": BRIEF_ATTACH_SCHEMA,
+        "contribution": contribution.as_str(),
+        "brief_record_id": id.as_str(),
+        "tokens": brief.token_count(),
+    });
+    if let Some(operation) = operation {
+        value["operation"] = json!(operation.as_str());
+        value["contribution_revision"] = json!(revision.as_ref().map(RecordId::as_str));
+    }
     Ok((
-        json!({
-            "schema": BRIEF_ATTACH_SCHEMA,
-            "contribution": contribution.as_str(),
-            "brief_record_id": id.as_str(),
-            "tokens": brief.token_count(),
-        }),
+        value,
         format!(
             "attached brief {} ({} tokens) to {}\n",
             id.as_str(),

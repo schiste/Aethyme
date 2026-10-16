@@ -29,6 +29,8 @@ pub enum RevisionContextError {
     Identity(#[from] IdentityStoreError),
     #[error("the same immutable revision was selected with incompatible pins")]
     ConflictingPin,
+    #[error("a selected immutable revision is unavailable to this reader")]
+    RevisionUnavailable,
     #[error("reader visibility changed while exact revision context was read")]
     VisibilityChanged,
 }
@@ -39,6 +41,7 @@ impl RevisionContextError {
             Self::Context(error) => error.code(),
             Self::Identity(_) => "revision_identity",
             Self::ConflictingPin => "conflicting_revision_pin",
+            Self::RevisionUnavailable => "revision_unavailable",
             Self::VisibilityChanged => "visibility_changed",
         }
     }
@@ -108,11 +111,11 @@ pub fn retrieve_revisions(
             )
             .optional()
             .map_err(ContextError::from)?;
-        let capture = capture.ok_or_else(|| {
-            IdentityStoreError::UnknownRevision(pin.revision_record_id.as_str().to_string())
-        })?;
+        // Missing and invisible pins have the same public refusal. A caller
+        // cannot use exact selection to discover a hidden revision's existence.
+        let capture = capture.ok_or(RevisionContextError::RevisionUnavailable)?;
         if !visibility.visible(&capture) {
-            continue;
+            return Err(RevisionContextError::RevisionUnavailable);
         }
         visible_pins.push(ContributionRevisionPin {
             revision_record_id: &pin.revision_record_id,
@@ -176,7 +179,7 @@ pub fn retrieve_revisions(
             }
         })
         .collect();
-    let mut selection = select(
+    let selection = select(
         &SelectionQuery {
             scope: scope.clone(),
             has_source: query.source.is_some(),
@@ -188,16 +191,6 @@ pub fn retrieve_revisions(
         },
         &candidates,
     );
-    let available: BTreeSet<_> = resolved.iter().map(|r| r.record_id().clone()).collect();
-    for revision in &resolved {
-        for prerequisite in revision.revision().depends_on() {
-            if !available.contains(prerequisite) {
-                selection
-                    .gaps
-                    .insert(format!("missing_prerequisite:{prerequisite}"));
-            }
-        }
-    }
     let mut query_fields = vec![
         ("profile", text(REVISION_CONTEXT_PROFILE)),
         ("project", text(binding.project_id().as_str())),
@@ -307,7 +300,14 @@ fn encode_context(
     resolved: &[ResolvedContributionRevision],
     mut selection: Selection,
 ) -> Result<ContributionContext, ContextError> {
+    let available: BTreeSet<_> = resolved.iter().map(|r| r.record_id().clone()).collect();
     loop {
+        // Byte budgeting may remove items on the next iteration. Recompute
+        // dependency gaps solely from the items in the response being encoded.
+        selection.gaps.retain(|gap| {
+            !gap.starts_with("missing_prerequisite:")
+                && !gap.starts_with("prerequisite_not_returned:")
+        });
         let returned: BTreeSet<RecordId> = selection
             .items
             .iter()
@@ -315,6 +315,11 @@ fn encode_context(
             .collect();
         for item in &selection.items {
             for prerequisite in resolved[item.candidate].revision().depends_on() {
+                if !available.contains(prerequisite) {
+                    selection
+                        .gaps
+                        .insert(format!("missing_prerequisite:{prerequisite}"));
+                }
                 if !returned.contains(prerequisite) {
                     selection
                         .gaps
@@ -526,7 +531,7 @@ pub(super) fn attach_bound_brief(
     }
     if operations.len() != 1 {
         return Err(ContextError::RevisionIdentity(
-            "capture lineage belongs to multiple logical contributions; select an exact operation"
+            "capture lineage belongs to multiple logical contributions; use `aethyme collab brief attach --operation <id> <decision-file>`"
                 .into(),
         ));
     }
@@ -801,7 +806,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_context_hidden_revision_returns_no_item_or_brief() {
+    fn exact_context_hidden_and_absent_revisions_have_the_same_public_refusal() {
         let mut fixture = BoundProjectFixture::new().unwrap();
         let revision = first_revision(&mut fixture);
         struct Hidden;
@@ -816,19 +821,126 @@ mod tests {
                 false
             }
         }
-        let context = retrieve_revisions(
+        let hidden = retrieve_revisions(
             &fixture.store,
             &query(&revision),
             &[pin(&revision)],
             &Hidden,
         )
+        .unwrap_err();
+        let mut absent = pin(&revision);
+        absent.revision_record_id = RecordId::parse(&format!("sha256:{}", "0".repeat(64))).unwrap();
+        let unknown =
+            retrieve_revisions(&fixture.store, &query(&revision), &[absent], &Hidden).unwrap_err();
+        assert!(matches!(hidden, RevisionContextError::RevisionUnavailable));
+        assert!(matches!(unknown, RevisionContextError::RevisionUnavailable));
+        assert_eq!(hidden.code(), unknown.code());
+        assert_eq!(hidden.to_string(), unknown.to_string());
+    }
+
+    #[test]
+    fn exact_context_dependency_gaps_follow_selected_items_and_byte_budget() {
+        let mut fixture = BoundProjectFixture::new().unwrap();
+        let prerequisite = first_revision(&mut fixture);
+        let operation = crate::collaboration_capture::OperationId::parse(
+            prerequisite.capture_operation_id().unwrap(),
+        )
         .unwrap();
-        assert!(context.selection.items.is_empty());
-        assert!(
-            !String::from_utf8(context.record)
-                .unwrap()
-                .contains("original rationale")
+        let selected_a = revise(
+            &mut fixture,
+            &operation,
+            &brief("later independent rationale"),
         );
+        // Capture B from the exact prior result, so only B changes. It cannot
+        // match an A query through paths or a Brief's scope references.
+        let result_a =
+            crate::collaboration_archive::pin_commit(fixture.repo_path(), "HEAD").unwrap();
+        let result_b = fixture.commit_file("b.txt", b"unrelated path\n").unwrap();
+        let receipt = fixture
+            .capture_operation("context-dependent", &result_a, &result_b)
+            .unwrap();
+        let dependencies = [prerequisite.record_id().clone()];
+        let dependent = revise_contribution_for_operation(
+            &mut fixture.store,
+            &fixture.binding,
+            ContributionRevisionRequest {
+                operation_id: &receipt.operation_id,
+                file_operations: None,
+                brief: None,
+                depends_on: Some(&dependencies),
+            },
+        )
+        .unwrap();
+        let request = query(&selected_a);
+        let unrelated = retrieve_revisions(
+            &fixture.store,
+            &request,
+            &[pin(&selected_a), pin(&dependent)],
+            &LocalProject,
+        )
+        .unwrap();
+        assert_eq!(unrelated.selection.items.len(), 1);
+        assert!(
+            !unrelated
+                .selection
+                .gaps
+                .iter()
+                .any(|gap| gap.starts_with("missing_prerequisite:")
+                    || gap.starts_with("prerequisite_not_returned:"))
+        );
+        let mut request_b = query(&dependent);
+        request_b.scope = vec![b"b.txt".to_vec()];
+        let selected = retrieve_revisions(
+            &fixture.store,
+            &request_b,
+            &[pin(&dependent)],
+            &LocalProject,
+        )
+        .unwrap();
+        assert!(selected.selection.gaps.contains(&format!(
+            "missing_prerequisite:{}",
+            prerequisite.record_id()
+        )));
+        assert!(selected.selection.gaps.contains(&format!(
+            "prerequisite_not_returned:{}",
+            prerequisite.record_id()
+        )));
+        // Exercise the encoder's byte-budget retry directly with the already
+        // resolver-validated revision and selection from the actual store.
+        let query_value = object(vec![("scope", Value::Array(vec![path_value(b"b.txt")]))]);
+        let mut empty_selection = selected.selection.clone();
+        empty_selection.items.clear();
+        empty_selection.brief_tokens = 0;
+        empty_selection.truncated_by.insert("bytes");
+        let empty = encode_context(
+            &request_b,
+            &LocalProject,
+            &query_value,
+            "bounded",
+            std::slice::from_ref(&dependent),
+            empty_selection,
+        )
+        .unwrap();
+        request_b.budget.max_bytes = empty.record.len();
+        let bounded = encode_context(
+            &request_b,
+            &LocalProject,
+            &query_value,
+            "bounded",
+            &[dependent],
+            selected.selection,
+        )
+        .unwrap();
+        assert!(bounded.selection.items.is_empty());
+        assert!(
+            !bounded
+                .selection
+                .gaps
+                .iter()
+                .any(|gap| gap.starts_with("missing_prerequisite:")
+                    || gap.starts_with("prerequisite_not_returned:"))
+        );
+        assert_eq!(bounded.record, empty.record);
     }
 
     fn release_captures(store: &mut CollaborationStore) {

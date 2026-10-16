@@ -7,6 +7,52 @@ use aethyme_contracts::experimental_v0::ContributionId;
 const MAX_PINS: usize = 256;
 const PIN_FORMAT: &str = "CONTRIBUTION_ID@REVISION_RECORD_ID@sha256:HEX";
 
+pub(super) enum BriefSelector {
+    Capture(RecordId),
+    Operation(OperationId),
+}
+
+pub(super) fn brief_selector<'a>(rest: &[&'a str]) -> Result<(BriefSelector, &'a str), Failure> {
+    no_extra(rest, &["--contribution", "--operation"], 1)?;
+    for flag in ["--contribution", "--operation"] {
+        if rest.iter().filter(|word| **word == flag).count() > 1 {
+            return Err(Failure::usage(format!("duplicate {flag}")));
+        }
+    }
+    let contribution = flag_value(rest, "--contribution")?;
+    let operation = flag_value(rest, "--operation")?;
+    let selector = match (contribution, operation) {
+        (Some(id), None) => BriefSelector::Capture(RecordId::parse(id).map_err(|error| {
+            Failure::refused(
+                "invalid_record_id",
+                error.to_string(),
+                "pass the capture receipt's contribution ID",
+            )
+        })?),
+        (None, Some(id)) => BriefSelector::Operation(OperationId::parse(id).map_err(|error| {
+            Failure::refused(
+                "invalid_operation_id",
+                error.to_string(),
+                "pass the exact capture operation ID",
+            )
+        })?),
+        _ => {
+            return Err(Failure::usage(
+                "select exactly one of --contribution <record-id> or --operation <id>",
+            ));
+        }
+    };
+    let mut index = 0;
+    while index < rest.len() {
+        if matches!(rest[index], "--contribution" | "--operation") {
+            index += 2;
+        } else {
+            return Ok((selector, rest[index]));
+        }
+    }
+    Err(Failure::usage("the decision file is required"))
+}
+
 pub(super) fn pins(rest: &[&str]) -> Result<Vec<RevisionPin>, Failure> {
     let mut pins = Vec::new();
     for (index, word) in rest.iter().enumerate() {
@@ -95,6 +141,44 @@ mod tests {
             "1".repeat(64),
             "2".repeat(64)
         )
+    }
+
+    #[test]
+    fn brief_selector_requires_one_exact_selector_and_one_file() {
+        let operation = ["--operation", "specific-op", "decision.json"];
+        let (selector, file) = brief_selector(&operation).unwrap();
+        assert!(
+            matches!(selector, BriefSelector::Operation(ref id) if id.as_str() == "specific-op")
+        );
+        assert_eq!(file, "decision.json");
+        let record = format!("sha256:{}", "1".repeat(64));
+        assert!(matches!(
+            brief_selector(&["decision.json", "--contribution", &record])
+                .unwrap()
+                .0,
+            BriefSelector::Capture(_)
+        ));
+        for invalid in [
+            vec!["decision.json"],
+            vec!["--operation", "specific-op"],
+            vec!["--operation", "specific-op", "decision.json", "extra.json"],
+            vec![
+                "--operation",
+                "specific-op",
+                "--contribution",
+                &record,
+                "decision.json",
+            ],
+            vec![
+                "--operation",
+                "specific-op",
+                "--operation",
+                "other-op",
+                "decision.json",
+            ],
+        ] {
+            assert!(brief_selector(&invalid).is_err(), "{invalid:?}");
+        }
     }
 
     #[test]
