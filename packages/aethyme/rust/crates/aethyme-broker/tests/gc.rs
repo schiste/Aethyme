@@ -24,8 +24,37 @@ fn git(repo: &Path, args: &[&str]) -> String {
     String::from_utf8_lossy(&output.stdout).trim().to_string()
 }
 
-fn fixture() -> (tempfile::TempDir, Broker, i64, PathBuf) {
-    let tmp = tempfile::tempdir().unwrap();
+struct Fixture {
+    _root: tempfile::TempDir,
+    repo: PathBuf,
+}
+
+impl Fixture {
+    fn new() -> Self {
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        Self { _root: root, repo }
+    }
+
+    fn path(&self) -> &Path {
+        &self.repo
+    }
+
+    fn worktree_root(&self) -> PathBuf {
+        self._root.path().join("worktrees")
+    }
+
+    fn open(&self) -> Broker {
+        Broker::open(self.path())
+            .unwrap()
+            .with_host_operation_database(self._root.path().join("host-state/host-operations.db"))
+            .with_worktree_root(self.worktree_root())
+    }
+}
+
+fn fixture() -> (Fixture, Broker, i64, PathBuf) {
+    let tmp = Fixture::new();
     git(tmp.path(), &["init", "-q", "-b", "main"]);
     std::fs::write(tmp.path().join("README.md"), "fixture\n").unwrap();
     std::fs::write(tmp.path().join(".gitignore"), "/.aethyme/\n").unwrap();
@@ -38,7 +67,7 @@ fn fixture() -> (tempfile::TempDir, Broker, i64, PathBuf) {
     )
     .unwrap();
 
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = tmp.open();
     let delivered = broker.start_worktree("old delivered work", None).unwrap();
     let worktree = PathBuf::from(&delivered.worktree_path);
     std::fs::write(worktree.join("done.txt"), "done\n").unwrap();
@@ -57,6 +86,65 @@ fn fixture() -> (tempfile::TempDir, Broker, i64, PathBuf) {
             .closed
     );
     (tmp, broker, delivered.id, worktree)
+}
+
+#[test]
+fn gc_fixture_worktree_stays_under_owned_root_and_is_removed_with_fixture() {
+    const REPORT_ENV: &str = "AETHYME_TEST_GC_WORKTREE_REPORT";
+
+    if let Some(report_path) = std::env::var_os(REPORT_ENV) {
+        let poison_root = PathBuf::from(
+            std::env::var_os("AETHYME_WORKTREE_ROOT")
+                .expect("the child test process must inherit a poisoned root"),
+        );
+        let (tmp, broker, _session, worktree) = fixture();
+        let expected_root = tmp.worktree_root().canonicalize().unwrap();
+        let canonical_worktree = worktree.canonicalize().unwrap();
+        assert!(canonical_worktree.starts_with(expected_root));
+        assert!(
+            !poison_root.exists(),
+            "the poisoned root must remain unused"
+        );
+
+        drop(broker);
+        drop(tmp);
+        assert!(
+            !worktree.exists(),
+            "fixture teardown must remove its worktree"
+        );
+        assert!(
+            !poison_root.exists(),
+            "fixture teardown must not touch poison"
+        );
+        std::fs::write(report_path, canonical_worktree.to_string_lossy().as_bytes()).unwrap();
+        return;
+    }
+
+    let parent = tempfile::tempdir().unwrap();
+    let poison_root = parent.path().join("poisoned-worktrees");
+    let report_path = parent.path().join("result.txt");
+    let host_state = parent.path().join("private-host-state");
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "gc_fixture_worktree_stays_under_owned_root_and_is_removed_with_fixture",
+            "--nocapture",
+        ])
+        .env("AETHYME_WORKTREE_ROOT", &poison_root)
+        .env("AETHYME_HOST_STATE_DIR", host_state)
+        .env(REPORT_ENV, &report_path)
+        .env_remove("XDG_STATE_HOME")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "child test failed: {}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let removed_path = PathBuf::from(std::fs::read_to_string(report_path).unwrap());
+    assert!(!removed_path.exists());
+    assert!(!poison_root.exists());
 }
 
 #[test]
@@ -121,7 +209,7 @@ fn reviewed_gc_plan_releases_legacy_pin_and_keeps_provenance_and_files() {
     .unwrap();
     drop(db);
 
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = tmp.open();
     let plan = broker.gc_plan().unwrap();
     assert_eq!(plan.checkpoint_pin_releases.len(), 1);
     assert_eq!(plan.checkpoint_pin_releases[0].session_id, delivered_id);
@@ -192,7 +280,7 @@ fn reviewed_gc_plan_expires_old_publication_exposure_to_terminal_state() {
     .unwrap();
     drop(db);
 
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = tmp.open();
     let plan = broker.gc_plan().unwrap();
     assert_eq!(plan.publication_exposure_expiries.len(), 1);
     assert_eq!(
@@ -312,7 +400,7 @@ fn plan_is_exact_deterministic_and_protects_live_or_unresolved_state() {
     )
     .unwrap();
 
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = tmp.open();
     let first = broker.gc_plan().unwrap();
     let second = broker.gc_plan().unwrap();
     assert_eq!(first.digest, second.digest);
@@ -430,7 +518,7 @@ fn digest_confirmed_apply_resumes_a_deadline_and_preserves_monotonic_ids() {
     )
     .unwrap();
 
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = tmp.open();
     let plan = broker.gc_plan().unwrap();
     // No journal yet, so this is ordinary staleness: send the operator back to
     // `gc plan` rather than offering a digest to paste (issue #140).
@@ -475,7 +563,7 @@ fn digest_confirmed_apply_resumes_a_deadline_and_preserves_monotonic_ids() {
     std::fs::write(&gate_log, "old gate output\n").unwrap();
 
     drop(broker);
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = tmp.open();
     assert!(!gate_log.exists());
     if main_root.join(".aethyme/gc-journal.json").exists() {
         let applied = broker.gc_apply(&plan.digest).unwrap();
@@ -549,13 +637,88 @@ fn locked_runtime_file_is_retained_and_resumable() {
 
 #[test]
 fn ephemeral_repositories_never_anchor_worktrees_in_durable_host_state() {
-    let (tmp, _broker, _id, worktree) = fixture();
+    const CHILD_ENV: &str = "AETHYME_TEST_DEFAULT_EPHEMERAL_PLACEMENT";
+    const HOME_MARKER: &str = ".aethyme-test-ephemeral-placement-home";
+    if std::env::var_os(CHILD_ENV).is_none() {
+        let private_home = tempfile::tempdir().unwrap();
+        std::fs::write(
+            private_home.path().join(HOME_MARKER),
+            "owned by placement test\n",
+        )
+        .unwrap();
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "ephemeral_repositories_never_anchor_worktrees_in_durable_host_state",
+                "--nocapture",
+            ])
+            .env(CHILD_ENV, private_home.path())
+            .env("HOME", private_home.path())
+            .env_remove("AETHYME_WORKTREE_ROOT")
+            .env_remove("AETHYME_HOST_STATE_DIR")
+            .env_remove("XDG_STATE_HOME")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "default-placement child failed: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    // An inherited sentinel must never bypass environment isolation. Validate
+    // the parent's owned home and all placement overrides before opening state.
+    for name in [
+        "AETHYME_WORKTREE_ROOT",
+        "AETHYME_HOST_STATE_DIR",
+        "XDG_STATE_HOME",
+    ] {
+        assert!(
+            std::env::var_os(name).is_none(),
+            "unsanitized child environment: {name}"
+        );
+    }
+    let private_home = PathBuf::from(std::env::var_os(CHILD_ENV).unwrap())
+        .canonicalize()
+        .unwrap();
+    let home = PathBuf::from(std::env::var_os("HOME").unwrap())
+        .canonicalize()
+        .unwrap();
+    assert_eq!(
+        home, private_home,
+        "placement child must use its parent's owned HOME"
+    );
+    assert!(home.starts_with(std::env::temp_dir().canonicalize().unwrap()));
+    assert_eq!(
+        std::fs::read_to_string(home.join(HOME_MARKER)).unwrap(),
+        "owned by placement test\n"
+    );
+    // This tests the production default. The shared fixture intentionally
+    // supplies a library override and therefore cannot exercise that default.
+    let tmp = Fixture::new();
+    git(tmp.path(), &["init", "-q", "-b", "main"]);
+    std::fs::write(tmp.path().join("README.md"), "fixture\n").unwrap();
+    git(tmp.path(), &["add", "README.md"]);
+    git(tmp.path(), &["commit", "-qm", "init"]);
+    let mut broker = Broker::open(tmp.path())
+        .unwrap()
+        .with_host_operation_database(tmp._root.path().join("host-operations.db"));
+    let session = broker
+        .start_worktree("default ephemeral placement", None)
+        .unwrap();
     let repo = tmp.path().canonicalize().unwrap();
-    let worktree = worktree.canonicalize().unwrap();
+    let worktree = PathBuf::from(session.worktree_path).canonicalize().unwrap();
     assert!(
         worktree.starts_with(&repo),
         "a temp-dir repository must keep its worktrees repo-local so they die with it, got {}",
         worktree.display()
+    );
+    drop(broker);
+    drop(tmp);
+    assert!(
+        !worktree.exists(),
+        "default worktree must die with its fixture"
     );
 }
 
@@ -584,7 +747,7 @@ fn a_resumed_candidate_that_stopped_qualifying_is_retained_without_stranding_the
         dir
     });
 
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = tmp.open();
     let plan = broker.gc_plan().unwrap();
     assert_eq!(
         plan.artifacts.len(),
