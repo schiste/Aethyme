@@ -484,6 +484,44 @@ pub(crate) fn read_object_bounded(
     read_object_unlocked(store, digest, Some(max_bytes))
 }
 
+/// Return an archive object's byte length without allocating its body. The
+/// caller can reject an over-budget object before reading it; the eventual
+/// bounded read still verifies the digest.
+pub(crate) fn object_size(
+    store: &CollaborationStore,
+    digest: &ObjectDigest,
+) -> Result<u64, ArchiveError> {
+    let _response = crate::collaboration_sensitive::response_use(store)?;
+    let path = object_path(store, digest);
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = match options.open(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(ArchiveError::MissingObject {
+                digest: digest.hex(),
+            });
+        }
+        Err(source) => return Err(io(&path, source)),
+    };
+    let metadata = file.metadata().map_err(|source| io(&path, source))?;
+    if !metadata.is_file() {
+        return Err(io(
+            &path,
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "object is not a regular file",
+            ),
+        ));
+    }
+    Ok(metadata.len())
+}
+
 fn read_object_unlocked(
     store: &CollaborationStore,
     digest: &ObjectDigest,
@@ -900,7 +938,7 @@ fn commit_tree(commit: &str, body: &[u8], format: ObjectFormat) -> Result<String
 
 /// The largest commit or tree object read into memory. A tree of 100,000
 /// entries is a few megabytes; real repositories stay far below this.
-const MAX_METADATA_OBJECT_BYTES: u64 = 64 * 1024 * 1024;
+pub(crate) const MAX_METADATA_OBJECT_BYTES: u64 = 64 * 1024 * 1024;
 
 /// List every non-tree entry under `root`, verifying each tree object
 /// against its id on the way.
