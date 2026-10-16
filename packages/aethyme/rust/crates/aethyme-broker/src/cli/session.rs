@@ -823,6 +823,14 @@ pub(super) fn render_worktree_report(report: &crate::WorktreeReport) {
     }
 }
 
+fn scanner_boundary_summary(preferred_outside_repository: bool) -> &'static str {
+    if preferred_outside_repository {
+        "outside the repository"
+    } else {
+        "not verified outside the repository"
+    }
+}
+
 /// `broker worktree-root`.
 pub(super) fn run_worktree_root(parsed: Parsed) -> Result<(), UsageError> {
     if !parsed.positional.is_empty() {
@@ -845,11 +853,7 @@ pub(super) fn run_worktree_root(parsed: Parsed) -> Result<(), UsageError> {
             );
             out!(
                 "Scanner boundary: {}",
-                if plan.preferred_outside_repository {
-                    "outside the repository"
-                } else {
-                    "invalid: preferred root resolves inside the repository"
-                }
+                scanner_boundary_summary(plan.preferred_outside_repository)
             );
         } else {
             out!("Preferred worktree root: unavailable");
@@ -1833,4 +1837,15 @@ pub(super) fn run_cleanup(parsed: Parsed) -> Result<(), UsageError> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod worktree_root_display_tests {
+    #[test]
+    fn an_unverified_preferred_root_is_not_reported_as_inside() {
+        assert_eq!(
+            super::scanner_boundary_summary(false),
+            "not verified outside the repository"
+        );
+    }
 }

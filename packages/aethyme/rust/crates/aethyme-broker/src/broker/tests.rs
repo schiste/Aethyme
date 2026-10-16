@@ -255,6 +255,29 @@ fn a_worktree_directory_is_never_mistaken_for_broker_infrastructure() {
 }
 
 #[test]
+fn verification_runtime_infrastructure_is_ignored_but_a_user_run_directory_is_visible() {
+    let (repo, _) = landing_fixture();
+    let worktree_root = repo.path().join("external-worktrees");
+    let runtime = worktree_root.join(".aethyme/run/merge-sim");
+    let user_run = worktree_root.join("run");
+    std::fs::create_dir_all(&runtime).unwrap();
+    std::fs::create_dir_all(&user_run).unwrap();
+
+    let broker = super::Broker::open(repo.path())
+        .unwrap()
+        .with_worktree_root(worktree_root.clone());
+    let reconciliation = broker.reconcile_worktree_directories(false).unwrap();
+
+    assert_eq!(reconciliation.unclaimed_count, 1);
+    assert_eq!(reconciliation.unclaimed.len(), 1);
+    assert_eq!(reconciliation.unclaimed[0].kind, "stray_directory");
+    assert_eq!(
+        reconciliation.unclaimed[0].path,
+        user_run.to_string_lossy().into_owned()
+    );
+}
+
+#[test]
 fn slugify_is_safe_for_branches_and_paths() {
     assert_eq!(slugify("Fix auth bug!"), "fix-auth-bug");
     assert_eq!(slugify("  weird///name  "), "weird-name");
