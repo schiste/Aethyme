@@ -46,7 +46,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 
-use aethyme_contracts::experimental_v0::canonical_json::{Object, Value};
+use aethyme_contracts::experimental_v0::canonical_json::{MAX_DOCUMENT_BYTES, Object, Value};
 use aethyme_contracts::experimental_v0::{
     EntryKind, FieldKind, FieldSpec, Record, RecordId, RecordSchema, SourceSnapshotId,
 };
@@ -56,6 +56,7 @@ use sha2::{Digest, Sha256};
 use unicode_normalization::UnicodeNormalization;
 
 use crate::collaboration_archive::{self, ArchiveError, CommitOid, ObjectDigest, RetainedSnapshot};
+use crate::collaboration_capture::OperationId;
 use crate::collaboration_state::CollaborationStore;
 use crate::composer::{
     self, COMPOSER_BASELINE_SOURCE, ComposeError, Composition, CompositionRequest, Entries, Entry,
@@ -74,6 +75,13 @@ pub const SYNTHESIS_PROFILE: &str = "aethyme.resolve.bounded/provisional-v0";
 /// Automatic synthesis attempts per decision (plan §7.5's provisional
 /// experiment; D15 sets the real caps before paid dispatch).
 pub const MAX_SYNTHESIS_ATTEMPTS: u32 = 2;
+
+/// Maximum encoded asynchronous response retained for one attempt.
+const MAX_ASYNC_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
+const ASYNC_RESPONSE_MAGIC: &[u8] = b"aethyme-resolution-response\0\x01";
+const ASYNC_INPUT_MANIFEST_MAGIC: &[u8] = b"aethyme-resolution-inputs\0\x01";
+pub const ASYNC_RESPONSE_ENVELOPE_SCHEMA: &str =
+    "aethyme.resolution-attempt-response/experimental-v0";
 
 /// Directory names no resolver may write under, at any depth: the broker's
 /// policy and gates, CI, Cargo configuration and tool configuration such as
@@ -565,6 +573,10 @@ impl ResolutionRequest {
     pub fn members(&self) -> &[GroupMember] {
         &self.members
     }
+    /// Every selected contribution used to define the decision allowance.
+    pub fn decision_members(&self) -> &[GroupMember] {
+        &self.decision_members
+    }
     /// Every contribution the accumulator already contains, in order.
     pub fn contents(&self) -> &[GroupMember] {
         &self.contents
@@ -597,6 +609,112 @@ impl ResolutionRequest {
     /// The decision's allowance when this request was loaded.
     pub fn allowance(&self) -> Allowance {
         self.allowance
+    }
+
+    /// Versioned, bounded metadata view for export. The matching input
+    /// manifest is emitted separately and carries no content bytes.
+    pub fn export_json(
+        &self,
+        status: &ResolutionAttemptStatus,
+        manifest: &ResolutionInputManifest,
+    ) -> Result<serde_json::Value, ResolutionError> {
+        if self.record() != &status.request
+            || status.request_sha256 != status.request.object.hex()
+            || status.input_sha256 != resolution_input_digest(self, &status.request.object)
+            || manifest.sha256 != status.input_manifest_sha256
+        {
+            return Err(invalid("resolution export packet binding mismatch"));
+        }
+        validate_manifest_scope(self, manifest)?;
+        let encoded_manifest = encode_input_manifest(
+            &status.request.object,
+            status.limits,
+            &manifest.entries,
+            usize::try_from(status.limits.max_manifest_bytes)
+                .map_err(|_| invalid("stored manifest byte limit"))?,
+        )?;
+        if ObjectDigest::of(&encoded_manifest).hex() != manifest.sha256 {
+            return Err(invalid("resolution export manifest digest mismatch"));
+        }
+        let member_json = |member: &GroupMember| {
+            serde_json::json!({
+                "id": member.id,
+                "lineage_record_id": member.lineage.as_str(),
+                "base_snapshot": member.base.as_str(),
+                "result_snapshot": member.result.as_str(),
+                "base_commit": member.base_commit.as_str(),
+                "result_commit": member.result_commit.as_str(),
+            })
+        };
+        let snapshot_json = |snapshot: &RetainedSnapshot| {
+            serde_json::json!({
+                "snapshot": snapshot.snapshot_id.as_str(),
+                "record_id": snapshot.record_id.as_str(),
+                "commit": snapshot.commit.as_str(),
+                "entry_count": snapshot.entry_count,
+                "content_bytes": snapshot.content_bytes,
+            })
+        };
+        let trigger = match &self.trigger {
+            Trigger::Conflict(conflicts) => serde_json::json!({
+                "kind": "conflict",
+                "conflicts": conflicts.iter().map(|conflict| serde_json::json!({
+                    "path": conflict.path,
+                    "input_commit": conflict.input.as_str(),
+                    "reason": conflict.reason,
+                })).collect::<Vec<_>>(),
+            }),
+            Trigger::FailedChecks { candidate, checks } => serde_json::json!({
+                "kind": "failed_checks",
+                "candidate": candidate.as_str(),
+                "checks": checks.iter().map(|check| serde_json::json!({"check": check.check})).collect::<Vec<_>>(),
+            }),
+        };
+        Ok(serde_json::json!({
+            "schema": "aethyme.resolution-attempt-packet/experimental-v0",
+            "attempt": status.to_json(),
+            "request": {
+                "record_id": self.record().id.as_str(),
+                "object_sha256": self.record().object.hex(),
+                "decision_key": self.decision_key(),
+                "trigger": trigger,
+                "baseline": snapshot_json(&self.baseline),
+                "accumulator": snapshot_json(&self.accumulator),
+                "decision_members": self.decision_members.iter().map(member_json).collect::<Vec<_>>(),
+                "members": self.members.iter().map(member_json).collect::<Vec<_>>(),
+                "contents": self.contents.iter().map(member_json).collect::<Vec<_>>(),
+                "requirements": self.requirements.iter().map(|requirement| serde_json::json!({
+                    "id": requirement.id,
+                    "path": requirement.path,
+                })).collect::<Vec<_>>(),
+                "scope": self.scope,
+                "protected": self.protected(),
+                "preference": self.preference.as_ref().map(|preference| serde_json::json!({
+                    "authorized_by": preference.authorized_by,
+                    "prefer": preference.prefer,
+                })),
+                "allowance": {
+                    "limit": self.allowance.limit,
+                    "used": self.allowance.used,
+                    "remaining": self.allowance.remaining(),
+                },
+            },
+            "input_manifest": {
+                "sha256": manifest.sha256,
+                "entries": manifest.entries.iter().map(|entry| serde_json::json!({
+                    "snapshot": entry.snapshot.as_str(),
+                    "path": entry.path,
+                    "kind": entry.kind.map(entry_kind_name),
+                    "bytes": entry.bytes,
+                    "sha256": entry.sha256,
+                })).collect::<Vec<_>>(),
+            },
+            "authority": {
+                "session_label": "provenance_only",
+                "dispatch": "not_authorized_by_this_packet",
+                "acceptance": "not_authorized_by_this_packet",
+            },
+        }))
     }
 }
 
@@ -867,7 +985,26 @@ pub fn load_request(
     record: &RecordRef,
 ) -> Result<ResolutionRequest, ResolutionError> {
     let bytes = collaboration_archive::read_object(store, &record.object)?;
-    let decoded = Record::decode(&bytes, &[&RESOLUTION_REQUEST_SCHEMA])
+    load_request_from_bytes(store, repo, record, &bytes)
+}
+
+fn load_request_bounded(
+    store: &mut CollaborationStore,
+    repo: &Path,
+    record: &RecordRef,
+    max_bytes: usize,
+) -> Result<ResolutionRequest, ResolutionError> {
+    let bytes = collaboration_archive::read_object_bounded(store, &record.object, max_bytes)?;
+    load_request_from_bytes(store, repo, record, &bytes)
+}
+
+fn load_request_from_bytes(
+    store: &mut CollaborationStore,
+    repo: &Path,
+    record: &RecordRef,
+    bytes: &[u8],
+) -> Result<ResolutionRequest, ResolutionError> {
+    let decoded = Record::decode(bytes, &[&RESOLUTION_REQUEST_SCHEMA])
         .map_err(|error| invalid(format!("resolution request record: {error}")))?;
     let mismatch = |detail: String| ResolutionError::RecordMismatch {
         record: record.id.as_str().to_string(),
@@ -1493,8 +1630,9 @@ fn charge(
     }
     transaction.execute(
         "INSERT INTO resolution_attempts
-             (decision_key, kind, members, paths, request_record_id, resolver, charged_ms)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+             (decision_key, kind, members, paths, request_record_id, resolver, charged_ms,
+              attempt_number, async_state)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'dispatching')",
         rusqlite::params![
             decision.key(),
             decision.kind,
@@ -1502,7 +1640,8 @@ fn charge(
             join_set(&decision.paths),
             request.as_str(),
             resolver,
-            now_ms()
+            now_ms(),
+            i64::from(used + 1)
         ],
     )?;
     let row = transaction.last_insert_rowid();
@@ -1512,7 +1651,8 @@ fn charge(
 
 fn settle(store: &mut CollaborationStore, row: i64, outcome: &str) -> Result<(), ResolutionError> {
     store.connection().execute(
-        "UPDATE resolution_attempts SET outcome = ?2 WHERE attempt_id = ?1",
+        "UPDATE resolution_attempts SET outcome = ?2, async_state='settled'
+         WHERE attempt_id = ?1",
         rusqlite::params![row, outcome],
     )?;
     Ok(())
@@ -1669,6 +1809,1780 @@ pub struct Resolution {
     pub allowance: Allowance,
 }
 
+/// Durable state of one asynchronous, session-bound synthesis attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResolutionAttemptState {
+    /// The attempt has been charged and its exact request exported. A caller
+    /// must use a separate pre-dispatch transition before external dispatch.
+    Exported,
+    /// The attempt is marked for external dispatch. A caller must not dispatch
+    /// it again; a missing response remains unknown until imported.
+    Dispatching,
+    /// The caller recorded that delivery or completion is uncertain. A late
+    /// response for this same token may still be imported exactly once.
+    OutcomeUnknown,
+    /// One response digest is fixed and is being validated/materialized.
+    Importing,
+    /// The response was settled as a failure or an unverified candidate.
+    Settled,
+}
+
+impl ResolutionAttemptState {
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::Exported => "exported",
+            Self::Dispatching => "dispatching",
+            Self::OutcomeUnknown => "outcome_unknown",
+            Self::Importing => "importing",
+            Self::Settled => "settled",
+        }
+    }
+
+    fn parse(text: &str) -> Result<Self, ResolutionError> {
+        match text {
+            "exported" => Ok(Self::Exported),
+            "dispatching" => Ok(Self::Dispatching),
+            "outcome_unknown" => Ok(Self::OutcomeUnknown),
+            "importing" => Ok(Self::Importing),
+            "settled" => Ok(Self::Settled),
+            _ => Err(invalid(format!(
+                "unknown asynchronous attempt state {text}"
+            ))),
+        }
+    }
+}
+
+/// Caller-supplied limits frozen into one async attempt before any request
+/// leaves the broker. These bound metadata and exact scoped inputs; they are
+/// not provider-token or paid-dispatch policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DispatchLimits {
+    pub max_manifest_bytes: u64,
+    pub max_manifest_entries: u64,
+    pub max_file_bytes: u64,
+    pub max_total_input_bytes: u64,
+    pub max_response_bytes: u64,
+}
+
+impl DispatchLimits {
+    pub fn validate(self) -> Result<Self, ResolutionError> {
+        if self.max_manifest_bytes == 0
+            || self.max_manifest_bytes > collaboration_archive::MAX_METADATA_OBJECT_BYTES
+            || self.max_manifest_entries == 0
+            || self.max_manifest_entries > crate::execution_snapshot::MAX_FILES as u64
+            || self.max_file_bytes == 0
+            || self.max_file_bytes > crate::execution_snapshot::MAX_FILE_BYTES
+            || self.max_total_input_bytes == 0
+            || self.max_total_input_bytes > crate::execution_snapshot::MAX_INPUT_BYTES
+            || self.max_response_bytes == 0
+            || self.max_response_bytes > MAX_ASYNC_RESPONSE_BYTES as u64
+            || usize::try_from(self.max_manifest_bytes)
+                .ok()
+                .and_then(|bytes| bytes.checked_add(1))
+                .is_none()
+            || usize::try_from(self.max_file_bytes)
+                .ok()
+                .and_then(|bytes| bytes.checked_add(1))
+                .is_none()
+        {
+            return Err(invalid("dispatch size limits"));
+        }
+        Ok(self)
+    }
+
+    /// Canonical ledger encoding. A caller can use JSON for CLI input; this
+    /// stable representation is the exact value persisted with the charge.
+    pub fn canonical_ledger_value(self) -> String {
+        format!(
+            "v1:{}:{}:{}:{}:{}",
+            self.max_manifest_bytes,
+            self.max_manifest_entries,
+            self.max_file_bytes,
+            self.max_total_input_bytes,
+            self.max_response_bytes
+        )
+    }
+
+    pub fn from_canonical_ledger_value(value: &str) -> Result<Self, ResolutionError> {
+        let mut fields = value.split(':');
+        if fields.next() != Some("v1") {
+            return Err(invalid("stored dispatch limits version"));
+        }
+        let mut next = || {
+            fields
+                .next()
+                .ok_or_else(|| invalid("stored dispatch limits"))?
+                .parse::<u64>()
+                .map_err(|_| invalid("stored dispatch limits"))
+        };
+        let limits = Self {
+            max_manifest_bytes: next()?,
+            max_manifest_entries: next()?,
+            max_file_bytes: next()?,
+            max_total_input_bytes: next()?,
+            max_response_bytes: next()?,
+        }
+        .validate()?;
+        if fields.next().is_some() || limits.canonical_ledger_value() != value {
+            return Err(invalid("stored dispatch limits are not canonical"));
+        }
+        Ok(limits)
+    }
+}
+
+fn request_record_limit(limits: DispatchLimits) -> Result<usize, ResolutionError> {
+    usize::try_from(limits.max_manifest_bytes.min(MAX_DOCUMENT_BYTES as u64))
+        .map_err(|_| invalid("resolution request byte limit"))
+}
+
+/// One exact `(snapshot, path)` exposed to an external session. Missing paths
+/// are explicit entries; a present file carries its archived size and digest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InputManifestEntry {
+    pub snapshot: SourceSnapshotId,
+    pub path: String,
+    pub kind: Option<EntryKind>,
+    pub bytes: u64,
+    pub sha256: Option<String>,
+}
+
+/// Durable bounded input manifest returned with a newly started attempt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolutionInputManifest {
+    pub sha256: String,
+    pub entries: Vec<InputManifestEntry>,
+}
+
+/// Recoverable view of one charged attempt. The request object and input
+/// digest bind the session to the exact archived request and its retained
+/// source snapshots; they are never reconstructed from caller-held data.
+#[derive(Debug, Clone)]
+pub struct ResolutionAttemptStatus {
+    pub token: String,
+    /// Provenance label only; this low-level ledger does not grant authority.
+    pub session_label: String,
+    pub attempt: u32,
+    pub request: RecordRef,
+    pub request_sha256: String,
+    pub input_sha256: String,
+    pub input_manifest_sha256: String,
+    pub limits: DispatchLimits,
+    pub response_sha256: Option<String>,
+    pub state: ResolutionAttemptState,
+    pub outcome: Option<String>,
+    pub detail: Option<String>,
+    pub result: Option<RecordRef>,
+}
+
+impl ResolutionAttemptStatus {
+    /// Public, read-only status shape. `session_label` is explicitly
+    /// provenance and never authenticates a caller or agent.
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "schema": "aethyme.resolution-attempt-status/experimental-v0",
+            "token": self.token,
+            "session_label": self.session_label,
+            "session_label_kind": "provenance_only",
+            "attempt": self.attempt,
+            "request": {
+                "record_id": self.request.id.as_str(),
+                "object_sha256": self.request.object.hex(),
+            },
+            "request_sha256": self.request_sha256,
+            "input_sha256": self.input_sha256,
+            "input_manifest_sha256": self.input_manifest_sha256,
+            "limits": self.limits,
+            "response_sha256": self.response_sha256,
+            "state": self.state.code(),
+            "outcome": self.outcome,
+            "detail": self.detail,
+            "result": self.result.as_ref().map(|record| serde_json::json!({
+                "record_id": record.id.as_str(),
+                "object_sha256": record.object.hex(),
+            })),
+        })
+    }
+}
+
+/// Result of beginning with a caller-stable idempotency key. Only `Started`
+/// carries the request for explicit operator-mediated export. Repeating a key
+/// returns `Existing` with status only, so it cannot redispatch the attempt.
+#[derive(Debug, Clone)]
+pub enum BeginResolutionAttempt {
+    Started {
+        status: ResolutionAttemptStatus,
+        request: ResolutionRequest,
+        input_manifest: ResolutionInputManifest,
+    },
+    Existing(ResolutionAttemptStatus),
+    BudgetExhausted(Allowance),
+}
+
+/// Begin one charged asynchronous attempt. `session_label` is provenance only;
+/// current-wave eligibility and agent appointment must be proved by a future
+/// controller caller. This API exports no live authority. `client_key` makes
+/// command retries idempotent.
+pub fn begin_attempt(
+    store: &mut CollaborationStore,
+    repo: &Path,
+    record: &RecordRef,
+    session_label: &str,
+    client_key: &str,
+    limits: DispatchLimits,
+) -> Result<BeginResolutionAttempt, ResolutionError> {
+    validate_attempt_binding(session_label, "session label")?;
+    validate_attempt_binding(client_key, "client key")?;
+    let limits = limits.validate()?;
+    let _archive = crate::collaboration_gc::archive_use(store)
+        .map_err(|error| invalid(format!("archive retention: {error}")))?;
+    let request = load_request_bounded(store, repo, record, request_record_limit(limits)?)?;
+    let request_sha256 = record.object.hex();
+    let input_sha256 = resolution_input_digest(&request, &record.object);
+    let (manifest_bytes, input_manifest) = build_input_manifest(store, &request, limits)?;
+    let encoded_limits = limits.canonical_ledger_value();
+    let manifest_digest = collaboration_archive::put_object(store, &manifest_bytes)?;
+    if manifest_digest.hex() != input_manifest.sha256 {
+        return Err(ResolutionError::Archive(ArchiveError::CorruptObject {
+            digest: input_manifest.sha256,
+        }));
+    }
+
+    let transaction = store
+        .connection()
+        .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let existing: Option<(
+        String,
+        String,
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+    )> = transaction
+        .query_row(
+            "SELECT async_token, request_record_id, request_sha256, input_sha256,
+                    input_manifest_sha256, dispatch_limits
+             FROM resolution_attempts WHERE session_label=?1 AND client_key=?2",
+            rusqlite::params![session_label, client_key],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )
+        .optional()?;
+    if let Some((
+        token,
+        existing_request,
+        existing_sha,
+        existing_input_sha,
+        existing_manifest_sha,
+        existing_limits,
+    )) = existing
+    {
+        if token.is_empty()
+            || existing_request != record.id.as_str()
+            || existing_sha != request_sha256
+            || existing_input_sha != input_sha256
+            || existing_manifest_sha.as_deref() != Some(input_manifest.sha256.as_str())
+            || existing_limits.as_deref() != Some(encoded_limits.as_str())
+        {
+            return Err(invalid("the idempotency key belongs to another request"));
+        }
+        let status = attempt_status_conn(&transaction, &token, session_label)?;
+        transaction.commit()?;
+        return Ok(BeginResolutionAttempt::Existing(status));
+    }
+
+    let used = comparable_attempts(&transaction, &request.decision)?;
+    if used >= MAX_SYNTHESIS_ATTEMPTS {
+        transaction.commit()?;
+        return Ok(BeginResolutionAttempt::BudgetExhausted(Allowance {
+            limit: MAX_SYNTHESIS_ATTEMPTS,
+            used,
+        }));
+    }
+
+    let token = OperationId::mint()
+        .map_err(|error| invalid(format!("could not mint resolution token: {error}")))?
+        .as_str()
+        .to_owned();
+    transaction.execute(
+        "INSERT INTO resolution_attempts
+             (decision_key, kind, members, paths, request_record_id, resolver,
+              charged_ms, async_token, client_key, session_label, attempt_number,
+              request_sha256, input_sha256, input_manifest_sha256, dispatch_limits,
+              async_state)
+         VALUES (?1, ?2, ?3, ?4, ?5, 'external-session-label', ?6, ?7, ?8, ?9,
+                 ?10, ?11, ?12, ?13, ?14, 'exported')",
+        rusqlite::params![
+            request.decision.key(),
+            request.decision.kind,
+            join_set(&request.decision.members),
+            join_set(&request.decision.paths),
+            record.id.as_str(),
+            now_ms(),
+            token,
+            client_key,
+            session_label,
+            i64::from(used + 1),
+            request_sha256,
+            input_sha256,
+            input_manifest.sha256,
+            encoded_limits,
+        ],
+    )?;
+    retain_attempt_inputs(&transaction, &token, record, &request)?;
+    transaction.execute(
+        "INSERT INTO object_pins(class,object_sha256,holder,until_ms,created_ms)
+         VALUES('cited_evidence',?1,?2,NULL,?3)",
+        rusqlite::params![
+            manifest_digest.hex(),
+            format!("resolution:{token}"),
+            now_ms()
+        ],
+    )?;
+    transaction.commit()?;
+
+    let status = attempt_status_conn(store.read_connection(), &token, session_label)?;
+    Ok(BeginResolutionAttempt::Started {
+        status,
+        request,
+        input_manifest,
+    })
+}
+
+/// Return the durable state of an attempt, scoped to the session that began it.
+pub fn attempt_status(
+    store: &CollaborationStore,
+    token: &str,
+    session_label: &str,
+) -> Result<ResolutionAttemptStatus, ResolutionError> {
+    attempt_status_from_connection(store.read_connection(), token, session_label)
+}
+
+/// Read an attempt from a lifecycle snapshot without opening a writer,
+/// applying migrations, or creating collaboration state.
+pub(crate) fn attempt_status_from_connection(
+    connection: &rusqlite::Connection,
+    token: &str,
+    session_label: &str,
+) -> Result<ResolutionAttemptStatus, ResolutionError> {
+    validate_attempt_binding(token, "attempt token")?;
+    validate_attempt_binding(session_label, "session label")?;
+    attempt_status_conn(connection, token, session_label)
+}
+
+/// Rebuild a packet only while the durable attempt remains exported. This
+/// recovers a caller that crashed before dispatch while preventing a request
+/// from being reissued after dispatch intent was recorded.
+pub fn exported_attempt_packet(
+    store: &mut CollaborationStore,
+    repo: &Path,
+    token: &str,
+    session_label: &str,
+) -> Result<(ResolutionRequest, ResolutionInputManifest), ResolutionError> {
+    let status = attempt_status(store, token, session_label)?;
+    if status.state != ResolutionAttemptState::Exported {
+        return Err(invalid("attempt is no longer exportable"));
+    }
+    let request = load_request_bounded(
+        store,
+        repo,
+        &status.request,
+        request_record_limit(status.limits)?,
+    )?;
+    verify_attempt_inputs(&status, &request)?;
+    let manifest = load_attempt_manifest(store, &status, &request)?;
+    Ok((request, manifest))
+}
+
+/// Commit the dispatch intent before the caller hands the exported request to
+/// an external agent. A repeated call or a process restart never returns the
+/// payload again.
+pub fn mark_attempt_dispatching(
+    store: &mut CollaborationStore,
+    token: &str,
+    session_label: &str,
+) -> Result<ResolutionAttemptStatus, ResolutionError> {
+    validate_attempt_binding(token, "attempt token")?;
+    validate_attempt_binding(session_label, "session label")?;
+    let transaction = store
+        .connection()
+        .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let current = attempt_status_conn(&transaction, token, session_label)?;
+    if current.state != ResolutionAttemptState::Exported {
+        return Err(invalid("attempt is not in the exported state"));
+    }
+    transaction.execute(
+        "UPDATE resolution_attempts SET async_state='dispatching'
+         WHERE async_token=?1 AND session_label=?2 AND async_state='exported'",
+        rusqlite::params![token, session_label],
+    )?;
+    let status = attempt_status_conn(&transaction, token, session_label)?;
+    transaction.commit()?;
+    Ok(status)
+}
+
+/// Mark delivery/completion as uncertain without clearing the charge or
+/// permitting another dispatch. Importing a late response remains possible.
+pub fn mark_attempt_unknown(
+    store: &mut CollaborationStore,
+    token: &str,
+    session_label: &str,
+    detail: &str,
+) -> Result<ResolutionAttemptStatus, ResolutionError> {
+    validate_attempt_binding(token, "attempt token")?;
+    validate_attempt_binding(session_label, "session label")?;
+    if detail.trim().is_empty() || detail.len() > 4096 {
+        return Err(invalid("unknown-attempt detail"));
+    }
+    let transaction = store
+        .connection()
+        .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let current = attempt_status_conn(&transaction, token, session_label)?;
+    match current.state {
+        ResolutionAttemptState::Exported | ResolutionAttemptState::Dispatching => {
+            transaction.execute(
+                "UPDATE resolution_attempts SET async_state='outcome_unknown', detail=?2
+                 WHERE async_token=?1 AND session_label=?3
+                   AND async_state IN ('exported','dispatching')",
+                rusqlite::params![token, detail, session_label],
+            )?;
+        }
+        ResolutionAttemptState::OutcomeUnknown if current.detail.as_deref() == Some(detail) => {}
+        _ => return Err(invalid("attempt is no longer exportable or dispatching")),
+    }
+    let status = attempt_status_conn(&transaction, token, session_label)?;
+    transaction.commit()?;
+    Ok(status)
+}
+
+/// Read one scoped file from the exact request attached to a live attempt.
+/// The request is reloaded and its scope/protection is recomputed each time.
+pub fn read_attempt_input(
+    store: &mut CollaborationStore,
+    repo: &Path,
+    token: &str,
+    session_label: &str,
+    snapshot: &SourceSnapshotId,
+    path: &str,
+) -> Result<Option<ProposedFile>, ResolutionError> {
+    let status = attempt_status(store, token, session_label)?;
+    if status.state == ResolutionAttemptState::Settled {
+        return Err(invalid("attempt inputs are closed after settlement"));
+    }
+    let request = load_request_bounded(
+        store,
+        repo,
+        &status.request,
+        request_record_limit(status.limits)?,
+    )?;
+    verify_attempt_inputs(&status, &request)?;
+    let manifest = load_attempt_manifest(store, &status, &request)?;
+    let Some(entry) = manifest
+        .entries
+        .iter()
+        .find(|entry| entry.snapshot == *snapshot && entry.path == path)
+    else {
+        return Err(ResolutionError::OutOfScopeRead {
+            snapshot: snapshot.to_string(),
+            path: path.to_string(),
+        });
+    };
+    let (Some(kind), Some(digest)) = (entry.kind, entry.sha256.as_deref()) else {
+        return Ok(None);
+    };
+    let digest = ObjectDigest::from_bytes(parse_digest_hex(digest)?);
+    let bytes = collaboration_archive::read_object_bounded(
+        store,
+        &digest,
+        usize::try_from(status.limits.max_file_bytes)
+            .map_err(|_| invalid("stored input file byte limit"))?,
+    )?;
+    if bytes.len() as u64 != entry.bytes {
+        return Err(invalid(
+            "resolution input changed size after manifest capture",
+        ));
+    }
+    Ok(Some(ProposedFile { kind, bytes }))
+}
+
+fn verify_attempt_inputs(
+    status: &ResolutionAttemptStatus,
+    request: &ResolutionRequest,
+) -> Result<(), ResolutionError> {
+    let found = resolution_input_digest(request, &status.request.object);
+    if found != status.input_sha256 {
+        return Err(ResolutionError::RecordMismatch {
+            record: status.request.id.as_str().to_string(),
+            detail: "the retained resolution inputs differ from the charged attempt".into(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_attempt_binding(value: &str, label: &str) -> Result<(), ResolutionError> {
+    if OperationId::parse(value).is_err() {
+        return Err(invalid(label));
+    }
+    Ok(())
+}
+
+fn attempt_status_conn(
+    connection: &rusqlite::Connection,
+    token: &str,
+    session_label: &str,
+) -> Result<ResolutionAttemptStatus, ResolutionError> {
+    let row: Option<(
+        String,
+        Option<i64>,
+        String,
+        String,
+        Option<String>,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    )> = connection
+        .query_row(
+            "SELECT coalesce(async_token,''), attempt_number, request_record_id,
+                    coalesce(request_sha256,''), response_sha256, async_state,
+                    outcome, detail, result_record_id, result_sha256,
+                    session_label, client_key, decision_key, input_sha256,
+                    input_manifest_sha256, dispatch_limits
+             FROM resolution_attempts WHERE async_token=?1",
+            [token],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                    row.get(9)?,
+                    row.get(10)?,
+                    row.get(11)?,
+                    row.get(12)?,
+                    row.get(13)?,
+                    row.get(14)?,
+                    row.get(15)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((
+        stored_token,
+        attempt,
+        request_id,
+        request_sha256,
+        response_sha256,
+        state,
+        outcome,
+        detail,
+        result_id,
+        result_sha256,
+        stored_session,
+        _client_key,
+        _decision_key,
+        input_sha256,
+        input_manifest_sha256,
+        dispatch_limits,
+    )) = row
+    else {
+        return Err(invalid("unknown resolution attempt token"));
+    };
+    if stored_token != token || stored_session != session_label {
+        return Err(invalid("resolution attempt provenance mismatch"));
+    }
+    let attempt = attempt
+        .and_then(|value| u32::try_from(value).ok())
+        .ok_or_else(|| invalid("resolution attempt number is malformed"))?;
+    let request_id = RecordId::parse(&request_id)
+        .map_err(|_| invalid("resolution attempt request id is malformed"))?;
+    let request_digest = parse_digest_hex(&request_sha256)?;
+    let request = RecordRef {
+        id: request_id,
+        object: ObjectDigest::from_bytes(request_digest),
+    };
+    let result = match (result_id, result_sha256) {
+        (Some(id), Some(digest)) => Some(RecordRef {
+            id: RecordId::parse(&id).map_err(|_| invalid("result record id is malformed"))?,
+            object: ObjectDigest::from_bytes(parse_digest_hex(&digest)?),
+        }),
+        (None, None) => None,
+        _ => return Err(invalid("result record reference is incomplete")),
+    };
+    let input_sha256 = input_sha256
+        .filter(|digest| !digest.is_empty())
+        .ok_or_else(|| invalid("resolution attempt input digest is missing"))?;
+    parse_digest_hex(&input_sha256)?;
+    let input_manifest_sha256 = input_manifest_sha256
+        .filter(|digest| !digest.is_empty())
+        .ok_or_else(|| invalid("resolution attempt manifest digest is missing"))?;
+    parse_digest_hex(&input_manifest_sha256)?;
+    let limits = DispatchLimits::from_canonical_ledger_value(
+        dispatch_limits
+            .as_deref()
+            .ok_or_else(|| invalid("resolution attempt dispatch limits are missing"))?,
+    )?;
+    Ok(ResolutionAttemptStatus {
+        token: stored_token,
+        session_label: stored_session,
+        attempt,
+        request,
+        request_sha256,
+        input_sha256,
+        input_manifest_sha256,
+        limits,
+        response_sha256,
+        state: ResolutionAttemptState::parse(&state)?,
+        outcome,
+        detail,
+        result,
+    })
+}
+
+fn parse_digest_hex(text: &str) -> Result<[u8; 32], ResolutionError> {
+    if text.len() != 64 || !text.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(invalid("archive digest is malformed"));
+    }
+    let mut bytes = [0; 32];
+    for (index, byte) in bytes.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&text[index * 2..index * 2 + 2], 16)
+            .map_err(|_| invalid("archive digest is malformed"))?;
+    }
+    Ok(bytes)
+}
+
+fn attempt_inputs(request: &ResolutionRequest) -> (BTreeSet<String>, BTreeSet<String>) {
+    let mut snapshots = BTreeSet::from([
+        request.baseline.snapshot_id.to_string(),
+        request.accumulator.snapshot_id.to_string(),
+    ]);
+    let mut contributions = BTreeSet::new();
+    for member in request
+        .decision_members
+        .iter()
+        .chain(&request.members)
+        .chain(&request.contents)
+    {
+        contributions.insert(member.lineage.as_str().to_string());
+        snapshots.insert(member.base.as_str().to_string());
+        snapshots.insert(member.result.as_str().to_string());
+    }
+    (snapshots, contributions)
+}
+
+fn visible_input_snapshots(request: &ResolutionRequest) -> BTreeSet<SourceSnapshotId> {
+    let mut snapshots = BTreeSet::from([
+        request.baseline.snapshot_id.clone(),
+        request.accumulator.snapshot_id.clone(),
+    ]);
+    for member in request.members.iter().chain(&request.contents) {
+        snapshots.insert(member.base.clone());
+        snapshots.insert(member.result.clone());
+    }
+    snapshots
+}
+
+fn account_manifest_entry(
+    encoded_size: &mut usize,
+    snapshot: &SourceSnapshotId,
+    path: &str,
+    present: bool,
+    max_bytes: usize,
+) -> Result<(), ResolutionError> {
+    let size = 8usize
+        .checked_add(snapshot.as_str().len())
+        .and_then(|size| size.checked_add(8))
+        .and_then(|size| size.checked_add(path.len()))
+        .and_then(|size| size.checked_add(1 + 8 + if present { 32 } else { 0 }))
+        .ok_or_else(|| invalid("resolution input manifest size overflow"))?;
+    *encoded_size = encoded_size
+        .checked_add(size)
+        .ok_or_else(|| invalid("resolution input manifest size overflow"))?;
+    if *encoded_size > max_bytes {
+        return Err(invalid("resolution input manifest exceeds its byte limit"));
+    }
+    Ok(())
+}
+
+fn build_input_manifest(
+    store: &CollaborationStore,
+    request: &ResolutionRequest,
+    limits: DispatchLimits,
+) -> Result<(Vec<u8>, ResolutionInputManifest), ResolutionError> {
+    let limits = limits.validate()?;
+    let snapshots = visible_input_snapshots(request);
+    let manifest_entries = snapshots
+        .len()
+        .checked_mul(request.scope.len())
+        .ok_or_else(|| invalid("resolution input manifest entry count overflow"))?;
+    if manifest_entries as u64 > limits.max_manifest_entries {
+        return Err(invalid("resolution input manifest exceeds its entry limit"));
+    }
+    let manifest_bytes_limit = usize::try_from(limits.max_manifest_bytes)
+        .map_err(|_| invalid("resolution input manifest byte limit"))?;
+    let file_bytes_limit = usize::try_from(limits.max_file_bytes)
+        .map_err(|_| invalid("resolution input file byte limit"))?;
+    let mut entries = Vec::new();
+    let mut unique_sizes = BTreeMap::<[u8; 32], u64>::new();
+    let mut total_unique_bytes = 0u64;
+    let mut encoded_size = ASYNC_INPUT_MANIFEST_MAGIC
+        .len()
+        .checked_add(32 + 5 * 8 + 4)
+        .ok_or_else(|| invalid("resolution input manifest size overflow"))?;
+    if encoded_size > manifest_bytes_limit {
+        return Err(invalid("resolution input manifest exceeds its byte limit"));
+    }
+
+    for snapshot_id in snapshots {
+        let manifest_digest = ObjectDigest::of_snapshot(&snapshot_id);
+        let manifest_bytes = collaboration_archive::read_object_bounded(
+            store,
+            &manifest_digest,
+            manifest_bytes_limit,
+        )?;
+        let snapshot = collaboration_archive::parse_manifest(&manifest_bytes)
+            .filter(|snapshot| {
+                snapshot.id() == snapshot_id && snapshot.manifest_bytes() == manifest_bytes
+            })
+            .ok_or_else(|| ArchiveError::CorruptObject {
+                digest: manifest_digest.hex(),
+            })?;
+        if snapshot.entries().len() as u64 > limits.max_manifest_entries {
+            return Err(invalid("source snapshot exceeds the manifest entry limit"));
+        }
+
+        for path in &request.scope {
+            let entry = snapshot
+                .entries()
+                .iter()
+                .find(|entry| entry.path() == path.as_bytes());
+            match entry {
+                None => {
+                    account_manifest_entry(
+                        &mut encoded_size,
+                        &snapshot_id,
+                        path,
+                        false,
+                        manifest_bytes_limit,
+                    )?;
+                    entries.push(InputManifestEntry {
+                        snapshot: snapshot_id.clone(),
+                        path: path.clone(),
+                        kind: None,
+                        bytes: 0,
+                        sha256: None,
+                    });
+                }
+                Some(entry) => {
+                    account_manifest_entry(
+                        &mut encoded_size,
+                        &snapshot_id,
+                        path,
+                        true,
+                        manifest_bytes_limit,
+                    )?;
+                    let digest = ObjectDigest::from_bytes(*entry.content_sha256());
+                    let size = collaboration_archive::object_size(store, &digest)?;
+                    if size > limits.max_file_bytes {
+                        return Err(invalid(format!(
+                            "resolution input {} in {} exceeds its per-file byte limit",
+                            path, snapshot_id
+                        )));
+                    }
+                    if let Some(previous_size) = unique_sizes.get(&digest.raw()) {
+                        if *previous_size != size {
+                            return Err(invalid("one input digest has inconsistent object sizes"));
+                        }
+                    } else {
+                        total_unique_bytes = total_unique_bytes
+                            .checked_add(size)
+                            .ok_or_else(|| invalid("resolution input byte count overflow"))?;
+                        if total_unique_bytes > limits.max_total_input_bytes {
+                            return Err(invalid(
+                                "resolution inputs exceed their total unique byte limit",
+                            ));
+                        }
+                        let content = collaboration_archive::read_object_bounded(
+                            store,
+                            &digest,
+                            file_bytes_limit,
+                        )?;
+                        if content.len() as u64 != size {
+                            return Err(invalid("resolution input size changed during inspection"));
+                        }
+                        unique_sizes.insert(digest.raw(), size);
+                    }
+                    entries.push(InputManifestEntry {
+                        snapshot: snapshot_id.clone(),
+                        path: path.clone(),
+                        kind: Some(entry.kind()),
+                        bytes: size,
+                        sha256: Some(digest.hex()),
+                    });
+                }
+            }
+        }
+    }
+
+    let encoded = encode_input_manifest(
+        &request.record().object,
+        limits,
+        &entries,
+        manifest_bytes_limit,
+    )?;
+    let sha256 = ObjectDigest::of(&encoded).hex();
+    Ok((encoded, ResolutionInputManifest { sha256, entries }))
+}
+
+fn append_manifest_bytes(
+    output: &mut Vec<u8>,
+    bytes: &[u8],
+    max_bytes: usize,
+) -> Result<(), ResolutionError> {
+    if output
+        .len()
+        .checked_add(bytes.len())
+        .is_none_or(|length| length > max_bytes)
+    {
+        return Err(invalid("bounded payload exceeds its byte limit"));
+    }
+    output.extend_from_slice(bytes);
+    Ok(())
+}
+
+fn append_manifest_string(
+    output: &mut Vec<u8>,
+    value: &str,
+    max_bytes: usize,
+) -> Result<(), ResolutionError> {
+    let length = u64::try_from(value.len())
+        .map_err(|_| invalid("resolution input manifest field is too large"))?;
+    append_manifest_bytes(output, &length.to_be_bytes(), max_bytes)?;
+    append_manifest_bytes(output, value.as_bytes(), max_bytes)
+}
+
+fn entry_kind_name(kind: EntryKind) -> &'static str {
+    match kind {
+        EntryKind::Regular => "regular",
+        EntryKind::Executable => "executable",
+        EntryKind::Symlink => "symlink",
+    }
+}
+
+fn encode_input_manifest(
+    request_digest: &ObjectDigest,
+    limits: DispatchLimits,
+    entries: &[InputManifestEntry],
+    max_bytes: usize,
+) -> Result<Vec<u8>, ResolutionError> {
+    if entries.len() as u64 > limits.max_manifest_entries {
+        return Err(invalid("resolution input manifest exceeds its entry limit"));
+    }
+    let mut output = Vec::new();
+    append_manifest_bytes(&mut output, ASYNC_INPUT_MANIFEST_MAGIC, max_bytes)?;
+    append_manifest_bytes(&mut output, &request_digest.raw(), max_bytes)?;
+    for value in [
+        limits.max_manifest_bytes,
+        limits.max_manifest_entries,
+        limits.max_file_bytes,
+        limits.max_total_input_bytes,
+        limits.max_response_bytes,
+    ] {
+        append_manifest_bytes(&mut output, &value.to_be_bytes(), max_bytes)?;
+    }
+    let count = u32::try_from(entries.len())
+        .map_err(|_| invalid("resolution input manifest has too many entries"))?;
+    append_manifest_bytes(&mut output, &count.to_be_bytes(), max_bytes)?;
+    for entry in entries {
+        append_manifest_string(&mut output, entry.snapshot.as_str(), max_bytes)?;
+        append_manifest_string(&mut output, &entry.path, max_bytes)?;
+        match (entry.kind, entry.sha256.as_deref()) {
+            (None, None) if entry.bytes == 0 => {
+                append_manifest_bytes(&mut output, &[0], max_bytes)?
+            }
+            (Some(kind), Some(digest)) => {
+                append_manifest_bytes(
+                    &mut output,
+                    &[match kind {
+                        EntryKind::Regular => 1,
+                        EntryKind::Executable => 2,
+                        EntryKind::Symlink => 3,
+                    }],
+                    max_bytes,
+                )?;
+                append_manifest_bytes(&mut output, &entry.bytes.to_be_bytes(), max_bytes)?;
+                append_manifest_bytes(&mut output, &parse_digest_hex(digest)?, max_bytes)?;
+            }
+            _ => return Err(invalid("resolution input manifest entry is incomplete")),
+        }
+        if entry.kind.is_none() {
+            append_manifest_bytes(&mut output, &0u64.to_be_bytes(), max_bytes)?;
+        }
+    }
+    Ok(output)
+}
+
+fn resolution_input_digest(request: &ResolutionRequest, request_object: &ObjectDigest) -> String {
+    let (snapshots, contributions) = attempt_inputs(request);
+    let mut hasher = Sha256::new();
+    hasher.update(b"aethyme async resolution inputs v1\0");
+    hasher.update(request_object.raw());
+    for snapshot in snapshots {
+        hasher.update(b"\0s");
+        hasher.update(snapshot.as_bytes());
+    }
+    for contribution in contributions {
+        hasher.update(b"\0c");
+        hasher.update(contribution.as_bytes());
+    }
+    hex(&hasher.finalize())
+}
+
+fn retain_attempt_inputs(
+    transaction: &rusqlite::Transaction<'_>,
+    token: &str,
+    record: &RecordRef,
+    request: &ResolutionRequest,
+) -> Result<(), ResolutionError> {
+    let holder = format!("resolution:{token}");
+    let now = now_ms();
+    let (snapshots, contributions) = attempt_inputs(request);
+    for snapshot in snapshots {
+        let retained: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM retained_snapshots WHERE snapshot_id=?1
+                AND snapshot_id NOT IN (SELECT snapshot_id FROM reclaimed_snapshots))",
+            [&snapshot],
+            |row| row.get(0),
+        )?;
+        if !retained {
+            return Err(invalid(format!(
+                "resolution input snapshot {snapshot} is not retained"
+            )));
+        }
+        transaction.execute(
+            "INSERT INTO reader_leases(target_kind,target,holder,until_ms,created_ms)
+             VALUES('snapshot',?1,?2,?3,?4)",
+            rusqlite::params![snapshot, holder, i64::MAX, now],
+        )?;
+    }
+    for contribution in contributions {
+        let retained: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM retained_contributions WHERE lineage_record_id=?1
+                AND lineage_record_id NOT IN (SELECT lineage_record_id FROM reclaimed_contributions))",
+            [&contribution],
+            |row| row.get(0),
+        )?;
+        if !retained {
+            return Err(invalid(format!(
+                "resolution contribution {contribution} is not retained"
+            )));
+        }
+        transaction.execute(
+            "INSERT INTO reader_leases(target_kind,target,holder,until_ms,created_ms)
+             VALUES('contribution',?1,?2,?3,?4)",
+            rusqlite::params![contribution, holder, i64::MAX, now],
+        )?;
+    }
+    transaction.execute(
+        "INSERT INTO object_pins(class,object_sha256,holder,until_ms,created_ms)
+         VALUES('cited_evidence',?1,?2,NULL,?3)",
+        rusqlite::params![record.object.hex(), holder, now],
+    )?;
+    Ok(())
+}
+
+/// A response packet whose label and exact request identity were checked
+/// against one durable attempt before it can be imported.
+#[derive(Debug, Clone)]
+pub struct BoundResolutionResponse {
+    token: String,
+    session_label: String,
+    request: RecordRef,
+    input_manifest_sha256: String,
+    response: Response,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AttemptResponseEnvelope {
+    schema: String,
+    attempt_token: String,
+    session_label: String,
+    request_record_id: String,
+    request_object_sha256: String,
+    input_manifest_sha256: String,
+    response: AttemptResponseBody,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AttemptResponseBody {
+    kind: String,
+    detail: Option<String>,
+    brief: Option<String>,
+    writes: Option<Vec<AttemptResponseWrite>>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AttemptResponseWrite {
+    path: String,
+    #[serde(default)]
+    delete: bool,
+    kind: Option<String>,
+    bytes_hex: Option<String>,
+}
+
+impl AttemptResponseBody {
+    fn into_response(self) -> Result<Response, ResolutionError> {
+        match self.kind.as_str() {
+            "unresolved" => match (self.detail, self.brief, self.writes) {
+                (Some(detail), None, None) => Ok(Response::Unresolved(detail)),
+                _ => Err(invalid("unresolved response envelope fields")),
+            },
+            "inconclusive" => match (self.detail, self.brief, self.writes) {
+                (Some(detail), None, None) => Ok(Response::Inconclusive(detail)),
+                _ => Err(invalid("inconclusive response envelope fields")),
+            },
+            "proposal" => {
+                let (None, brief, Some(writes)) = (self.detail, self.brief, self.writes) else {
+                    return Err(invalid("proposal response envelope fields"));
+                };
+                if writes.len() > 4096 {
+                    return Err(invalid("too many response paths"));
+                }
+                let mut proposal_writes = BTreeMap::new();
+                for write in writes {
+                    let file = if write.delete {
+                        if write.kind.is_some() || write.bytes_hex.is_some() {
+                            return Err(invalid("delete response path has file content"));
+                        }
+                        None
+                    } else {
+                        let kind = match write.kind.as_deref() {
+                            Some("regular") => EntryKind::Regular,
+                            Some("executable") => EntryKind::Executable,
+                            Some("symlink") => EntryKind::Symlink,
+                            _ => return Err(invalid("response file kind is missing or unknown")),
+                        };
+                        let bytes_hex = write
+                            .bytes_hex
+                            .as_deref()
+                            .ok_or_else(|| invalid("response file bytes are missing"))?;
+                        Some(ProposedFile {
+                            kind,
+                            bytes: decode_hex_bytes(bytes_hex)?,
+                        })
+                    };
+                    if proposal_writes.insert(write.path, file).is_some() {
+                        return Err(invalid("duplicate response path"));
+                    }
+                }
+                Ok(Response::Proposal(Proposal {
+                    writes: proposal_writes,
+                    brief,
+                }))
+            }
+            _ => Err(invalid("unknown response envelope kind")),
+        }
+    }
+}
+
+fn decode_hex_bytes(text: &str) -> Result<Vec<u8>, ResolutionError> {
+    if text.len() % 2 != 0
+        || !text
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err(invalid("response file bytes must be lowercase hexadecimal"));
+    }
+    let mut bytes = Vec::with_capacity(text.len() / 2);
+    for index in (0..text.len()).step_by(2) {
+        bytes.push(
+            u8::from_str_radix(&text[index..index + 2], 16)
+                .map_err(|_| invalid("response file bytes are malformed"))?,
+        );
+    }
+    Ok(bytes)
+}
+
+/// Decode a versioned, strict JSON response envelope under the attempt's
+/// persisted byte limit. The envelope binds the response to this exact token,
+/// provenance label, archived request and input manifest.
+pub fn decode_attempt_response_envelope(
+    status: &ResolutionAttemptStatus,
+    bytes: &[u8],
+) -> Result<BoundResolutionResponse, ResolutionError> {
+    if bytes.len() as u64 > status.limits.max_response_bytes {
+        return Err(invalid(
+            "response envelope exceeds its persisted byte limit",
+        ));
+    }
+    let envelope: AttemptResponseEnvelope = serde_json::from_slice(bytes)
+        .map_err(|error| invalid(format!("response envelope JSON: {error}")))?;
+    if envelope.schema != ASYNC_RESPONSE_ENVELOPE_SCHEMA
+        || envelope.attempt_token != status.token
+        || envelope.session_label != status.session_label
+        || envelope.request_record_id != status.request.id.as_str()
+        || envelope.request_object_sha256 != status.request.object.hex()
+        || envelope.input_manifest_sha256 != status.input_manifest_sha256
+    {
+        return Err(invalid("response envelope attempt binding mismatch"));
+    }
+    let response = envelope.response.into_response()?;
+    encode_response(
+        &response,
+        usize::try_from(status.limits.max_response_bytes)
+            .map_err(|_| invalid("stored response byte limit"))?,
+    )?;
+    Ok(BoundResolutionResponse {
+        token: status.token.clone(),
+        session_label: status.session_label.clone(),
+        request: status.request.clone(),
+        input_manifest_sha256: status.input_manifest_sha256.clone(),
+        response,
+    })
+}
+
+/// Import a response envelope previously bound to the durable attempt. The
+/// status is re-read immediately before import to reject stale or retargeted
+/// packets; normal proposal validation and single-use settlement still apply.
+pub fn finish_bound_attempt(
+    store: &mut CollaborationStore,
+    repo: &Path,
+    bound: &BoundResolutionResponse,
+) -> Result<Resolution, ResolutionError> {
+    let current = attempt_status(store, &bound.token, &bound.session_label)?;
+    if current.request != bound.request
+        || current.input_manifest_sha256 != bound.input_manifest_sha256
+    {
+        return Err(invalid("response envelope attempt binding changed"));
+    }
+    finish_attempt(
+        store,
+        repo,
+        &bound.token,
+        &bound.session_label,
+        &bound.response,
+    )
+}
+
+/// Persist one response by content digest and then run the common proposal
+/// checks. The response object is pinned before its status becomes importing;
+/// retrying after a crash can only load that exact object, never dispatch again.
+fn finish_attempt(
+    store: &mut CollaborationStore,
+    repo: &Path,
+    token: &str,
+    session_label: &str,
+    response: &Response,
+) -> Result<Resolution, ResolutionError> {
+    validate_attempt_binding(token, "attempt token")?;
+    validate_attempt_binding(session_label, "session label")?;
+    let existing = attempt_status(store, token, session_label)?;
+    let encoded = encode_response(
+        response,
+        usize::try_from(existing.limits.max_response_bytes)
+            .map_err(|_| invalid("stored response byte limit"))?,
+    )?;
+    let response_digest = ObjectDigest::of(&encoded);
+    let response_sha256 = response_digest.hex();
+    match existing.state {
+        ResolutionAttemptState::Exported => {
+            return Err(invalid("attempt must be marked dispatching before import"));
+        }
+        ResolutionAttemptState::Settled => {
+            return Err(invalid("response was already imported"));
+        }
+        ResolutionAttemptState::Importing
+            if existing.response_sha256.as_deref() != Some(response_sha256.as_str()) =>
+        {
+            return Err(invalid(
+                "a different response is already bound to this attempt",
+            ));
+        }
+        _ => {}
+    }
+    {
+        let _archive = crate::collaboration_gc::archive_use(store)
+            .map_err(|error| invalid(format!("archive retention: {error}")))?;
+        let published = collaboration_archive::put_object(store, &encoded)?;
+        if published != response_digest {
+            return Err(ResolutionError::Archive(ArchiveError::CorruptObject {
+                digest: response_digest.hex(),
+            }));
+        }
+        let transaction = store
+            .connection()
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current = attempt_status_conn(&transaction, token, session_label)?;
+        match current.state {
+            ResolutionAttemptState::Exported => {
+                return Err(invalid("attempt must be marked dispatching before import"));
+            }
+            ResolutionAttemptState::Dispatching | ResolutionAttemptState::OutcomeUnknown => {
+                transaction.execute(
+                    "UPDATE resolution_attempts
+                     SET async_state='importing', response_sha256=?2, detail=NULL
+                     WHERE async_token=?1 AND session_label=?3
+                       AND async_state IN ('dispatching','outcome_unknown')",
+                    rusqlite::params![token, response_digest.hex(), session_label],
+                )?;
+                transaction.execute(
+                    "INSERT INTO object_pins(class,object_sha256,holder,until_ms,created_ms)
+                     VALUES('cited_evidence',?1,?2,NULL,?3)",
+                    rusqlite::params![
+                        response_digest.hex(),
+                        format!("resolution:{token}"),
+                        now_ms()
+                    ],
+                )?;
+            }
+            ResolutionAttemptState::Importing
+                if current.response_sha256.as_deref() == Some(response_sha256.as_str()) => {}
+            ResolutionAttemptState::Importing => {
+                return Err(invalid(
+                    "a different response is already bound to this attempt",
+                ));
+            }
+            ResolutionAttemptState::Settled => {
+                return Err(invalid("response was already imported"));
+            }
+        }
+        transaction.commit()?;
+    }
+    resume_attempt_import(store, repo, token, session_label)
+}
+
+/// Resume only the locally persisted response of an importing attempt. This
+/// is recovery of the same single-use import, not a second agent dispatch.
+pub fn resume_attempt_import(
+    store: &mut CollaborationStore,
+    repo: &Path,
+    token: &str,
+    session_label: &str,
+) -> Result<Resolution, ResolutionError> {
+    validate_attempt_binding(token, "attempt token")?;
+    validate_attempt_binding(session_label, "session label")?;
+    let _archive = crate::collaboration_gc::archive_use(store)
+        .map_err(|error| invalid(format!("archive retention: {error}")))?;
+    let status = attempt_status(store, token, session_label)?;
+    if status.state != ResolutionAttemptState::Importing {
+        return Err(invalid("attempt has no import to resume"));
+    }
+    let response_sha256 = status
+        .response_sha256
+        .as_deref()
+        .ok_or_else(|| invalid("importing attempt has no response digest"))?;
+    let digest = ObjectDigest::from_bytes(parse_digest_hex(response_sha256)?);
+    let response_bytes = collaboration_archive::read_object_bounded(
+        store,
+        &digest,
+        usize::try_from(status.limits.max_response_bytes)
+            .map_err(|_| invalid("stored response byte limit"))?,
+    )?;
+    let response = decode_response(&response_bytes)?;
+    let identity = ResolverIdentity {
+        name: "external-session-label".into(),
+        version: session_label.into(),
+    };
+    let request = match load_request_bounded(
+        store,
+        repo,
+        &status.request,
+        request_record_limit(status.limits)?,
+    ) {
+        Ok(request) => match verify_attempt_inputs(&status, &request)
+            .and_then(|()| load_attempt_manifest(store, &status, &request).map(|_| ()))
+        {
+            Ok(()) => Some(request),
+            Err(error) => {
+                let outcome = failed(after_dispatch(&error), format!("{}: {error}", error.code()));
+                settle_async_attempt(store, token, session_label, response_sha256, &outcome, None)?;
+                return Ok(Resolution {
+                    outcome,
+                    attempt: Some(status.attempt),
+                    allowance: Allowance {
+                        limit: MAX_SYNTHESIS_ATTEMPTS,
+                        used: status.attempt,
+                    },
+                });
+            }
+        },
+        Err(error) => {
+            let outcome = failed(after_dispatch(&error), format!("{}: {error}", error.code()));
+            settle_async_attempt(store, token, session_label, response_sha256, &outcome, None)?;
+            return Ok(Resolution {
+                outcome,
+                attempt: Some(status.attempt),
+                allowance: Allowance {
+                    limit: MAX_SYNTHESIS_ATTEMPTS,
+                    used: status.attempt,
+                },
+            });
+        }
+    };
+    let request = request.expect("successful load returned a request");
+    let outcome = match apply_response(
+        store,
+        repo,
+        &request,
+        Ok(response),
+        &identity,
+        status.attempt,
+    ) {
+        Ok(outcome) => outcome,
+        Err(error) => failed(after_dispatch(&error), format!("{}: {error}", error.code())),
+    };
+    let result = match &outcome {
+        ResolutionOutcome::Synthesized(synthesized) => Some((
+            synthesized.group_record.clone(),
+            synthesized.candidate.subject.clone(),
+        )),
+        ResolutionOutcome::Failed { .. } => None,
+    };
+    settle_async_attempt(
+        store,
+        token,
+        session_label,
+        response_sha256,
+        &outcome,
+        result.as_ref(),
+    )?;
+    Ok(Resolution {
+        outcome,
+        attempt: Some(status.attempt),
+        allowance: Allowance {
+            limit: MAX_SYNTHESIS_ATTEMPTS,
+            used: attempts_used(store, &request.decision)?,
+        },
+    })
+}
+
+fn settle_async_attempt(
+    store: &mut CollaborationStore,
+    token: &str,
+    session_label: &str,
+    response_sha256: &str,
+    outcome: &ResolutionOutcome,
+    result: Option<&(RecordRef, SourceSnapshotId)>,
+) -> Result<(), ResolutionError> {
+    let transaction = store
+        .connection()
+        .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let current = attempt_status_conn(&transaction, token, session_label)?;
+    if current.state != ResolutionAttemptState::Importing
+        || current.response_sha256.as_deref() != Some(response_sha256)
+    {
+        return Err(invalid("attempt import state changed during validation"));
+    }
+    if let Some((record, snapshot)) = result {
+        let holder = format!("resolution:{token}");
+        transaction.execute(
+            "INSERT INTO reader_leases(target_kind,target,holder,until_ms,created_ms)
+             VALUES('snapshot',?1,?2,?3,?4)",
+            rusqlite::params![snapshot.as_str(), holder, i64::MAX, now_ms()],
+        )?;
+        transaction.execute(
+            "INSERT INTO object_pins(class,object_sha256,holder,until_ms,created_ms)
+             VALUES('cited_evidence',?1,?2,NULL,?3)",
+            rusqlite::params![record.object.hex(), holder, now_ms()],
+        )?;
+    }
+    let (result_id, result_sha) = result
+        .map(|(record, _)| (Some(record.id.as_str()), Some(record.object.hex())))
+        .unwrap_or((None, None));
+    transaction.execute(
+        "UPDATE resolution_attempts
+         SET outcome=?2, detail=?3, result_record_id=?4, result_sha256=?5,
+             async_state='settled'
+         WHERE async_token=?1 AND async_state='importing' AND response_sha256=?6",
+        rusqlite::params![
+            token,
+            outcome.code(),
+            outcome_detail(outcome),
+            result_id,
+            result_sha,
+            response_sha256,
+        ],
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn outcome_detail(outcome: &ResolutionOutcome) -> Option<&str> {
+    match outcome {
+        ResolutionOutcome::Synthesized(_) => None,
+        ResolutionOutcome::Failed { detail, .. } => Some(detail),
+    }
+}
+
+/// Encode a response under an explicit caller limit. Used by offline tools
+/// to create the canonical internal payload without provider or dispatch APIs.
+pub fn encode_response_bytes(
+    response: &Response,
+    max_bytes: u64,
+) -> Result<Vec<u8>, ResolutionError> {
+    let max_bytes =
+        usize::try_from(max_bytes).map_err(|_| invalid("asynchronous response byte limit"))?;
+    encode_response(response, max_bytes)
+}
+
+/// Decode the canonical internal response format under an explicit caller
+/// limit. The attempt-bound JSON envelope should be preferred for CLI import.
+pub fn decode_response_bytes(bytes: &[u8], max_bytes: u64) -> Result<Response, ResolutionError> {
+    let max_bytes =
+        usize::try_from(max_bytes).map_err(|_| invalid("asynchronous response byte limit"))?;
+    if max_bytes == 0 || max_bytes > MAX_ASYNC_RESPONSE_BYTES || bytes.len() > max_bytes {
+        return Err(invalid("asynchronous response byte limit"));
+    }
+    decode_response(bytes)
+}
+
+fn encode_response(response: &Response, max_bytes: usize) -> Result<Vec<u8>, ResolutionError> {
+    if max_bytes == 0 || max_bytes > MAX_ASYNC_RESPONSE_BYTES {
+        return Err(invalid("asynchronous response byte limit"));
+    }
+    let mut bytes = Vec::new();
+    append_manifest_bytes(&mut bytes, ASYNC_RESPONSE_MAGIC, max_bytes)?;
+    match response {
+        Response::Unresolved(detail) => {
+            append_manifest_bytes(&mut bytes, &[0], max_bytes)?;
+            write_response_string(&mut bytes, detail, max_bytes)?;
+        }
+        Response::Inconclusive(detail) => {
+            append_manifest_bytes(&mut bytes, &[1], max_bytes)?;
+            write_response_string(&mut bytes, detail, max_bytes)?;
+        }
+        Response::Proposal(proposal) => {
+            if proposal.writes.len() > 4096 {
+                return Err(invalid("too many response paths"));
+            }
+            append_manifest_bytes(&mut bytes, &[2], max_bytes)?;
+            match &proposal.brief {
+                Some(brief) => {
+                    append_manifest_bytes(&mut bytes, &[1], max_bytes)?;
+                    write_response_string(&mut bytes, brief, max_bytes)?;
+                }
+                None => append_manifest_bytes(&mut bytes, &[0], max_bytes)?,
+            }
+            let count = u32::try_from(proposal.writes.len())
+                .map_err(|_| invalid("too many response paths"))?;
+            append_manifest_bytes(&mut bytes, &count.to_be_bytes(), max_bytes)?;
+            for (path, file) in &proposal.writes {
+                write_response_string(&mut bytes, path, max_bytes)?;
+                match file {
+                    None => append_manifest_bytes(&mut bytes, &[0], max_bytes)?,
+                    Some(file) => {
+                        append_manifest_bytes(&mut bytes, &[1], max_bytes)?;
+                        append_manifest_bytes(
+                            &mut bytes,
+                            &[match file.kind {
+                                EntryKind::Regular => 0,
+                                EntryKind::Executable => 1,
+                                EntryKind::Symlink => 2,
+                            }],
+                            max_bytes,
+                        )?;
+                        write_response_bytes(&mut bytes, &file.bytes, max_bytes)?;
+                    }
+                }
+            }
+        }
+    }
+    Ok(bytes)
+}
+
+fn write_response_string(
+    bytes: &mut Vec<u8>,
+    text: &str,
+    max_bytes: usize,
+) -> Result<(), ResolutionError> {
+    write_response_bytes(bytes, text.as_bytes(), max_bytes)
+}
+
+fn write_response_bytes(
+    bytes: &mut Vec<u8>,
+    content: &[u8],
+    max_bytes: usize,
+) -> Result<(), ResolutionError> {
+    let length =
+        u64::try_from(content.len()).map_err(|_| invalid("response field is too large"))?;
+    append_manifest_bytes(bytes, &length.to_be_bytes(), max_bytes)?;
+    append_manifest_bytes(bytes, content, max_bytes)?;
+    Ok(())
+}
+
+struct ResponseReader<'a> {
+    bytes: &'a [u8],
+    offset: usize,
+}
+
+impl ResponseReader<'_> {
+    fn take(&mut self, length: usize) -> Result<&[u8], ResolutionError> {
+        let end = self
+            .offset
+            .checked_add(length)
+            .ok_or_else(|| invalid("response length overflow"))?;
+        if end > self.bytes.len() {
+            return Err(invalid("truncated asynchronous response"));
+        }
+        let slice = &self.bytes[self.offset..end];
+        self.offset = end;
+        Ok(slice)
+    }
+
+    fn byte(&mut self) -> Result<u8, ResolutionError> {
+        Ok(self.take(1)?[0])
+    }
+
+    fn u32(&mut self) -> Result<u32, ResolutionError> {
+        Ok(u32::from_be_bytes(
+            self.take(4)?.try_into().expect("four bytes"),
+        ))
+    }
+
+    fn u64(&mut self) -> Result<u64, ResolutionError> {
+        Ok(u64::from_be_bytes(
+            self.take(8)?.try_into().expect("eight bytes"),
+        ))
+    }
+
+    fn bytes(&mut self) -> Result<Vec<u8>, ResolutionError> {
+        let length =
+            usize::try_from(self.u64()?).map_err(|_| invalid("response field is too large"))?;
+        Ok(self.take(length)?.to_vec())
+    }
+
+    fn string(&mut self) -> Result<String, ResolutionError> {
+        String::from_utf8(self.bytes()?).map_err(|_| invalid("response string is not UTF-8"))
+    }
+}
+
+fn decode_input_manifest(
+    bytes: &[u8],
+    request_digest: &ObjectDigest,
+    limits: DispatchLimits,
+) -> Result<ResolutionInputManifest, ResolutionError> {
+    if bytes.len() as u64 > limits.max_manifest_bytes
+        || !bytes.starts_with(ASYNC_INPUT_MANIFEST_MAGIC)
+    {
+        return Err(invalid(
+            "unsupported or oversized resolution input manifest",
+        ));
+    }
+    let mut reader = ResponseReader {
+        bytes,
+        offset: ASYNC_INPUT_MANIFEST_MAGIC.len(),
+    };
+    if reader.take(32)? != request_digest.raw() {
+        return Err(invalid(
+            "resolution input manifest request binding mismatch",
+        ));
+    }
+    let stored_limits = DispatchLimits {
+        max_manifest_bytes: reader.u64()?,
+        max_manifest_entries: reader.u64()?,
+        max_file_bytes: reader.u64()?,
+        max_total_input_bytes: reader.u64()?,
+        max_response_bytes: reader.u64()?,
+    }
+    .validate()?;
+    if stored_limits != limits {
+        return Err(invalid("resolution input manifest limits mismatch"));
+    }
+    let count = reader.u32()? as usize;
+    if count as u64 > limits.max_manifest_entries {
+        return Err(invalid("resolution input manifest exceeds its entry limit"));
+    }
+    // Even an absent entry needs a snapshot id (71 bytes), a path, two
+    // lengths, a marker and a size. Reject impossible counts before reserving.
+    if count > bytes.len().saturating_sub(reader.offset) / 97 {
+        return Err(invalid("truncated resolution input manifest"));
+    }
+    let mut entries = Vec::new();
+    let mut seen = BTreeSet::new();
+    let mut unique_sizes = BTreeMap::<[u8; 32], u64>::new();
+    let mut total_unique_bytes = 0u64;
+    for _ in 0..count {
+        let snapshot_text = reader.string()?;
+        let snapshot = SourceSnapshotId::parse(&snapshot_text)
+            .map_err(|_| invalid("resolution input snapshot id is malformed"))?;
+        let path = reader.string()?;
+        let kind = match reader.byte()? {
+            0 => None,
+            1 => Some(EntryKind::Regular),
+            2 => Some(EntryKind::Executable),
+            3 => Some(EntryKind::Symlink),
+            _ => return Err(invalid("resolution input entry kind is malformed")),
+        };
+        let size = reader.u64()?;
+        let digest = if kind.is_some() {
+            Some(reader.take(32)?.to_vec())
+        } else {
+            None
+        };
+        let sha256 = digest.map(|bytes| {
+            let bytes: [u8; 32] = bytes.try_into().expect("digest is 32 bytes");
+            hex(&bytes)
+        });
+        match (kind, sha256.as_deref()) {
+            (None, None) if size == 0 => {}
+            (Some(_), Some(digest)) if size <= limits.max_file_bytes => {
+                let raw = parse_digest_hex(digest)?;
+                if let Some(previous_size) = unique_sizes.get(&raw) {
+                    if *previous_size != size {
+                        return Err(invalid("input manifest has inconsistent digest sizes"));
+                    }
+                } else {
+                    total_unique_bytes = total_unique_bytes
+                        .checked_add(size)
+                        .ok_or_else(|| invalid("input manifest byte count overflow"))?;
+                    if total_unique_bytes > limits.max_total_input_bytes {
+                        return Err(invalid("input manifest exceeds its total byte limit"));
+                    }
+                    unique_sizes.insert(raw, size);
+                }
+            }
+            _ => return Err(invalid("input manifest file reference is incomplete")),
+        }
+        if !seen.insert((snapshot.clone(), path.clone())) {
+            return Err(invalid("input manifest has duplicate snapshot paths"));
+        }
+        entries.push(InputManifestEntry {
+            snapshot,
+            path,
+            kind,
+            bytes: size,
+            sha256,
+        });
+    }
+    if reader.offset != bytes.len() {
+        return Err(invalid("trailing bytes in resolution input manifest"));
+    }
+    Ok(ResolutionInputManifest {
+        sha256: ObjectDigest::of(bytes).hex(),
+        entries,
+    })
+}
+
+fn validate_manifest_scope(
+    request: &ResolutionRequest,
+    manifest: &ResolutionInputManifest,
+) -> Result<(), ResolutionError> {
+    let expected: BTreeSet<_> = visible_input_snapshots(request)
+        .into_iter()
+        .flat_map(|snapshot| {
+            request
+                .scope
+                .iter()
+                .map(move |path| (snapshot.clone(), path.clone()))
+        })
+        .collect();
+    let found: BTreeSet<_> = manifest
+        .entries
+        .iter()
+        .map(|entry| (entry.snapshot.clone(), entry.path.clone()))
+        .collect();
+    if found != expected || found.len() != manifest.entries.len() {
+        return Err(invalid(
+            "resolution input manifest scope differs from request",
+        ));
+    }
+    Ok(())
+}
+
+fn load_attempt_manifest(
+    store: &CollaborationStore,
+    status: &ResolutionAttemptStatus,
+    request: &ResolutionRequest,
+) -> Result<ResolutionInputManifest, ResolutionError> {
+    let digest = ObjectDigest::from_bytes(parse_digest_hex(&status.input_manifest_sha256)?);
+    let max_bytes = usize::try_from(status.limits.max_manifest_bytes)
+        .map_err(|_| invalid("stored dispatch manifest byte limit"))?;
+    let bytes = collaboration_archive::read_object_bounded(store, &digest, max_bytes)?;
+    let manifest = decode_input_manifest(&bytes, &status.request.object, status.limits)?;
+    if manifest.sha256 != status.input_manifest_sha256 {
+        return Err(invalid("resolution input manifest digest mismatch"));
+    }
+    validate_manifest_scope(request, &manifest)?;
+    Ok(manifest)
+}
+
+fn decode_response(bytes: &[u8]) -> Result<Response, ResolutionError> {
+    if bytes.len() > MAX_ASYNC_RESPONSE_BYTES || !bytes.starts_with(ASYNC_RESPONSE_MAGIC) {
+        return Err(invalid("unsupported asynchronous response encoding"));
+    }
+    let mut reader = ResponseReader {
+        bytes,
+        offset: ASYNC_RESPONSE_MAGIC.len(),
+    };
+    let response = match reader.byte()? {
+        0 => Response::Unresolved(reader.string()?),
+        1 => Response::Inconclusive(reader.string()?),
+        2 => {
+            let brief = match reader.byte()? {
+                0 => None,
+                1 => Some(reader.string()?),
+                _ => return Err(invalid("malformed response brief marker")),
+            };
+            let count = reader.u32()? as usize;
+            if count > 4096 {
+                return Err(invalid("too many response paths"));
+            }
+            let mut writes = BTreeMap::new();
+            for _ in 0..count {
+                let path = reader.string()?;
+                let file = match reader.byte()? {
+                    0 => None,
+                    1 => {
+                        let kind = match reader.byte()? {
+                            0 => EntryKind::Regular,
+                            1 => EntryKind::Executable,
+                            2 => EntryKind::Symlink,
+                            _ => return Err(invalid("malformed response entry kind")),
+                        };
+                        Some(ProposedFile {
+                            kind,
+                            bytes: reader.bytes()?,
+                        })
+                    }
+                    _ => return Err(invalid("malformed response file marker")),
+                };
+                if writes.insert(path, file).is_some() {
+                    return Err(invalid("duplicate response path"));
+                }
+            }
+            Response::Proposal(Proposal { writes, brief })
+        }
+        _ => return Err(invalid("malformed asynchronous response kind")),
+    };
+    if reader.offset != bytes.len() {
+        return Err(invalid("trailing bytes in asynchronous response"));
+    }
+    Ok(response)
+}
+
 /// Dispatch the request recorded at `record` to `resolver` once, within
 /// its decision's allowance, and accept its proposal only if it stays in
 /// scope and drops nothing.
@@ -1751,6 +3665,17 @@ fn attempt_once(
         let inputs = ResolutionInputs { store, request };
         resolver.propose(request, &inputs)
     };
+    apply_response(store, repo, request, response, identity, attempt)
+}
+
+fn apply_response(
+    store: &mut CollaborationStore,
+    repo: &Path,
+    request: &ResolutionRequest,
+    response: Result<Response, String>,
+    identity: &ResolverIdentity,
+    attempt: u32,
+) -> Result<ResolutionOutcome, ResolutionError> {
     let proposal = match response {
         Ok(Response::Proposal(proposal)) => proposal,
         Ok(Response::Unresolved(detail)) => {
@@ -2131,6 +4056,62 @@ pub fn read_record(
 mod tests {
     use super::*;
 
+    #[test]
+    fn dispatch_limits_stay_within_existing_local_io_caps() {
+        let limits = DispatchLimits {
+            max_manifest_bytes: collaboration_archive::MAX_METADATA_OBJECT_BYTES,
+            max_manifest_entries: crate::execution_snapshot::MAX_FILES as u64,
+            max_file_bytes: crate::execution_snapshot::MAX_FILE_BYTES,
+            max_total_input_bytes: crate::execution_snapshot::MAX_INPUT_BYTES,
+            max_response_bytes: MAX_ASYNC_RESPONSE_BYTES as u64,
+        };
+        assert_eq!(limits.validate().unwrap(), limits);
+        assert_eq!(request_record_limit(limits).unwrap(), MAX_DOCUMENT_BYTES);
+
+        assert!(
+            DispatchLimits {
+                max_manifest_bytes: collaboration_archive::MAX_METADATA_OBJECT_BYTES + 1,
+                ..limits
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            DispatchLimits {
+                max_manifest_entries: crate::execution_snapshot::MAX_FILES as u64 + 1,
+                ..limits
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            DispatchLimits {
+                max_file_bytes: crate::execution_snapshot::MAX_FILE_BYTES + 1,
+                ..limits
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            DispatchLimits {
+                max_total_input_bytes: crate::execution_snapshot::MAX_INPUT_BYTES + 1,
+                ..limits
+            }
+            .validate()
+            .is_err()
+        );
+        for max_response_bytes in [MAX_ASYNC_RESPONSE_BYTES as u64 + 1, u64::MAX] {
+            assert!(
+                DispatchLimits {
+                    max_response_bytes,
+                    ..limits
+                }
+                .validate()
+                .is_err()
+            );
+        }
+    }
+
     fn protection() -> Protection {
         Protection {
             harness: [fold_path("pkg/check.sh"), fold_path("harness")]
@@ -2212,5 +4193,45 @@ mod tests {
             paths: set(&["x"]),
         };
         assert!(!conflict.comparable(&set(&["a", "b"]), &set(&["y"])));
+    }
+
+    #[test]
+    fn asynchronous_response_encoding_is_deterministic_and_round_trips() {
+        let response = Response::Proposal(Proposal {
+            writes: BTreeMap::from([
+                (
+                    "src/main.rs".into(),
+                    Some(ProposedFile {
+                        kind: EntryKind::Regular,
+                        bytes: b"fn main() {}\n".to_vec(),
+                    }),
+                ),
+                ("src/old.rs".into(), None),
+            ]),
+            brief: Some("combine both changes".into()),
+        });
+        let encoded = encode_response(&response, MAX_ASYNC_RESPONSE_BYTES).unwrap();
+        let decoded = decode_response(&encoded).unwrap();
+        assert_eq!(
+            encode_response(&decoded, MAX_ASYNC_RESPONSE_BYTES).unwrap(),
+            encoded
+        );
+        assert_eq!(
+            ObjectDigest::of(&encoded),
+            ObjectDigest::of(&encode_response(&decoded, MAX_ASYNC_RESPONSE_BYTES).unwrap())
+        );
+    }
+
+    #[test]
+    fn asynchronous_response_decoder_rejects_truncation_and_trailing_bytes() {
+        let encoded = encode_response(
+            &Response::Unresolved("no safe merge".into()),
+            MAX_ASYNC_RESPONSE_BYTES,
+        )
+        .unwrap();
+        assert!(decode_response(&encoded[..encoded.len() - 1]).is_err());
+        let mut trailing = encoded;
+        trailing.push(0);
+        assert!(decode_response(&trailing).is_err());
     }
 }
