@@ -2696,10 +2696,21 @@ mod owned_merge_history_tests {
                 )
                 .unwrap(),
                 "replace" => {
-                    git(
-                        root,
-                        &["replace", &plan.session_head, &plan.integration_head],
-                    );
+                    // Even an unrelated replacement must disable this path;
+                    // otherwise another ref could change the history view.
+                    let unrelated = broker
+                        .repo_handle()
+                        .commit_tree(
+                            &broker
+                                .repo_handle()
+                                .commit_tree_id(&plan.integration_head)
+                                .unwrap(),
+                            &[&plan.integration_head],
+                            "unreachable history-view control",
+                            &crate::attribution::Attribution::broker_only(),
+                        )
+                        .unwrap();
+                    git(root, &["replace", &unrelated, &plan.integration_head]);
                 }
                 "graft" => std::fs::write(
                     root.join(".git/info/grafts"),
