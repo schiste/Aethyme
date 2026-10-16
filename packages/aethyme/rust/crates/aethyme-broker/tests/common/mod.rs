@@ -81,6 +81,7 @@ pub fn fixture_host_state_dir(fixture_root: &Path) -> PathBuf {
         .unwrap_or_else(|| fixture_root.join("host-state"))
 }
 
+#[allow(dead_code)]
 pub fn fixture_host_cache_dir(fixture_root: &Path) -> PathBuf {
     fixture_git_common_dir(fixture_root)
         .map(|git_dir| git_dir.join("aethyme-test-cache"))
@@ -89,6 +90,7 @@ pub fn fixture_host_cache_dir(fixture_root: &Path) -> PathBuf {
 
 /// Set owned host paths after constructing a CLI command. These explicit
 /// paths take precedence over inherited XDG and user host-state locations.
+#[allow(dead_code)]
 pub fn isolate_host_paths(command: &mut Command, fixture_root: &Path) {
     command
         .env_remove("AETHYME_BROKER_DB")
@@ -104,6 +106,7 @@ pub fn isolate_host_paths(command: &mut Command, fixture_root: &Path) {
         );
 }
 
+#[allow(dead_code)]
 pub fn broker_cli_for_fixture(binary: &str, args: &[&str], fixture_root: &Path) -> Command {
     let mut command = broker_cli(binary, args);
     isolate_host_paths(&mut command, fixture_root);
