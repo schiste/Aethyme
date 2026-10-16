@@ -4019,14 +4019,17 @@ mod tests {
             .connection()
             .execute_batch(
                 "INSERT INTO local_targets (target, issuer) VALUES ('target', 'issuer');
+                 INSERT INTO local_targets (target, issuer) VALUES ('target:unknown', 'issuer');
                  INSERT INTO local_target_revisions (revision, target, body)
                      VALUES ('revision', 'target', X'01');
+                 INSERT INTO local_target_revisions (revision, target, body)
+                     VALUES ('revision:unknown', 'target:unknown', X'07');
                  INSERT INTO local_waves
                      (wave, target, revision, sequence, body, phase)
                      VALUES ('wave', 'target', 'revision', 1, X'02', 'verifying');
                  INSERT INTO local_waves
                      (wave, target, revision, sequence, body, phase)
-                     VALUES ('wave:unknown', 'target', 'revision', 2, X'08', 'verifying');
+                     VALUES ('wave:unknown', 'target:unknown', 'revision:unknown', 1, X'08', 'verifying');
 
                  DROP TRIGGER local_native_gate_no_dispatch_after_root_release;
                  DROP INDEX local_native_gate_jobs_by_wave;
@@ -4059,7 +4062,7 @@ mod tests {
                      ('job:legacy','object','0123456789abcdef');
                  INSERT INTO local_native_gate_jobs
                      (id,wave,target,revision,epoch,body,state,observation,roots_released_ms)
-                     VALUES ('job:unknown','wave:unknown','target','revision','epoch',X'090a',
+                     VALUES ('job:unknown','wave:unknown','target:unknown','revision:unknown','epoch',X'090a',
                              'unknown',X'0b0c',NULL);
                  INSERT INTO local_native_gate_roots VALUES
                      ('job:unknown','snapshot','sha256:unknown');",
@@ -4357,39 +4360,13 @@ mod tests {
     fn schema_27_preserves_unsettled_legacy_attempts_as_unknown() {
         let host = tempfile::tempdir().unwrap();
         let mut store = open(host.path(), &[]).unwrap();
+        drop_resolution_schema_27_for_legacy_fixture(store.connection()).unwrap();
         store
             .connection()
-            .execute_batch(
-                "DROP TRIGGER resolution_attempts_require_v27_charge;
-                 DROP TRIGGER resolution_attempts_legacy_rows_immutable;
-                 DROP TRIGGER resolution_attempts_never_delete;
-                 DROP TRIGGER resolution_attempts_identity_immutable;
-                 DROP TRIGGER resolution_attempts_lifecycle_guard;
-                 DROP TRIGGER local_waves_resolution_request_pair_insert;
-                 DROP TRIGGER local_waves_resolution_request_pair_update;
-                 DROP TRIGGER local_waves_composition_source_pair_insert;
-                 DROP TRIGGER local_waves_composition_source_pair_update;
-                 DROP INDEX resolution_attempts_async_token;
-                 DROP INDEX resolution_attempts_session_client_key;
-                 ALTER TABLE local_waves DROP COLUMN resolution_request_object;
-                 ALTER TABLE local_waves DROP COLUMN resolution_request_record_id;
-                 ALTER TABLE local_waves DROP COLUMN composition_source_object;
-                 ALTER TABLE local_waves DROP COLUMN composition_source_record_id;
-                 ALTER TABLE resolution_attempts DROP COLUMN async_state;
-                 ALTER TABLE resolution_attempts DROP COLUMN detail;
-                 ALTER TABLE resolution_attempts DROP COLUMN result_sha256;
-                 ALTER TABLE resolution_attempts DROP COLUMN result_record_id;
-                 ALTER TABLE resolution_attempts DROP COLUMN response_sha256;
-                 ALTER TABLE resolution_attempts DROP COLUMN dispatch_limits;
-                 ALTER TABLE resolution_attempts DROP COLUMN input_manifest_sha256;
-                 ALTER TABLE resolution_attempts DROP COLUMN input_sha256;
-                 ALTER TABLE resolution_attempts DROP COLUMN request_sha256;
-                 ALTER TABLE resolution_attempts DROP COLUMN attempt_number;
-                 ALTER TABLE resolution_attempts DROP COLUMN session_label;
-                 ALTER TABLE resolution_attempts DROP COLUMN client_key;
-                 ALTER TABLE resolution_attempts DROP COLUMN async_token;
-                 UPDATE meta SET value='26'
-                     WHERE key IN ('schema_version','min_compatible_schema');",
+            .execute(
+                "UPDATE meta SET value='26'
+                 WHERE key IN ('schema_version','min_compatible_schema')",
+                [],
             )
             .unwrap();
         store
