@@ -174,10 +174,10 @@ fn a_root_below_its_free_space_floor_falls_back() {
     fx.assert_default_with_reason(&started, "min_free_bytes");
 }
 
-/// The default floor is the gate headroom, read through the suite's simulated
-/// free space: a drive the test reports as nearly full falls back on any host.
+/// A fallback must preserve the recovery reserve too: simulating low space
+/// for every placement refuses the start instead of bypassing admission.
 #[test]
-fn a_root_reported_nearly_full_falls_back_at_the_default_floor() {
+fn all_roots_reported_nearly_full_refuse_instead_of_bypassing_the_default_floor() {
     let fx = fixture();
     std::fs::create_dir_all(&fx.drive).unwrap();
     fx.configure_root(&fx.drive);
@@ -189,9 +189,13 @@ fn a_root_reported_nearly_full_falls_back_at_the_default_floor() {
         .env(aethyme_broker::TEST_AVAILABLE_BYTES_ENV, "1024")
         .output()
         .unwrap();
-    assert!(output.status.success(), "{output:?}");
-    let started: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    fx.assert_default_with_reason(&started, "min_free_bytes");
+    assert!(!output.status.success(), "{output:?}");
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(error.contains("broker recovery reserve"), "{error}");
+    assert!(
+        !fx.repo.join(".aethyme/worktrees").exists(),
+        "fallback checkout allocated despite low space"
+    );
 }
 
 #[test]

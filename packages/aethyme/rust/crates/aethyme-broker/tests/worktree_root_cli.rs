@@ -281,7 +281,12 @@ fn low_space_refuses_host_and_environment_placement_before_checkout_or_agent_lau
             );
             assert!(!sentinel.exists(), "an unadmitted agent executed");
             assert!(
-                !repo.join(".aethyme/logs").exists(),
+                std::fs::read_dir(repo.join(".aethyme/logs"))
+                    .map(|mut entries| entries.next().is_none())
+                    .unwrap_or_else(|error| {
+                        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+                        true
+                    }),
                 "unadmitted agent allocated a log"
             );
             let branches = Command::new("git")
@@ -399,7 +404,12 @@ fn a_refresh_cannot_spend_the_reserve_checked_before_it_started() {
     assert!(text.contains("broker recovery reserve"), "{text}");
     assert!(!sentinel.exists(), "agent ran before late admission");
     assert!(
-        !repo.join(".aethyme/logs").exists(),
+        std::fs::read_dir(repo.join(".aethyme/logs"))
+            .map(|mut entries| entries.next().is_none())
+            .unwrap_or_else(|error| {
+                assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+                true
+            }),
         "agent log allocated before late admission"
     );
     let mut entries: Vec<_> = std::fs::read_dir(&actual_root)
