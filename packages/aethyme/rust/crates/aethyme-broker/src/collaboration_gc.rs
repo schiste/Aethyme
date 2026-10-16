@@ -49,8 +49,10 @@ pub const DEFAULT_GRACE_MS: i64 = PLAN_TTL_MS;
 /// The most files one generation removes; the rest wait for the next plan.
 /// Bounds how long apply holds the archive exclusively.
 pub const MAX_ITEMS_PER_GENERATION: usize = 10_000;
+const MAX_IDENTITY_REVISIONS: usize = 10_000;
+const MAX_IDENTITY_PROOF_EDGES: usize = 10_000;
 
-fn now_ms() -> i64 {
+pub(crate) fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|elapsed| i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX))
@@ -372,6 +374,8 @@ pub enum GcError {
     Authority(#[from] crate::local_authority::AuthorityError),
     #[error("the archive is in use by a capture, recovery or reader; apply again when they finish")]
     ArchiveInUse,
+    #[error("bounded identity proof closure exceeds {MAX_IDENTITY_REVISIONS} revisions")]
+    IdentityReplayLimit,
     #[error("reclamation is blocked: {}", .0.iter().map(|b| format!("{} ({})", b.kind, b.detail)).collect::<Vec<_>>().join("; "))]
     Blocked(Vec<GcBlocker>),
     #[error("no recorded plan {digest}; run plan and confirm the digest it prints")]
@@ -413,6 +417,7 @@ impl GcError {
             Self::Authority(crate::local_authority::AuthorityError::Stale) => "authority_stale",
             Self::Authority(_) => "authority_unavailable",
             Self::ArchiveInUse => "archive_in_use",
+            Self::IdentityReplayLimit => "identity_replay_limit",
             Self::Blocked(_) => "blocked",
             Self::UnknownPlan { .. } => "unknown_plan",
             Self::StalePlan { .. } => "stale_plan",
@@ -667,18 +672,31 @@ struct Closure<'a> {
     snapshots: BTreeSet<String>,
     contributions: BTreeSet<String>,
     revisions: BTreeSet<RecordId>,
+    identity_revision_seeds: BTreeSet<RecordId>,
+    identity_revision_limit: Option<usize>,
+    identity_proof_edges_seen: usize,
     /// Why a root could not be followed, when strict.
     problems: Vec<String>,
 }
 
 impl<'a> Closure<'a> {
     fn new(store: &'a CollaborationStore) -> Self {
+        Self::with_identity_revision_limit(store, None)
+    }
+
+    fn with_identity_revision_limit(
+        store: &'a CollaborationStore,
+        identity_revision_limit: Option<usize>,
+    ) -> Self {
         Self {
             store,
             objects: BTreeMap::new(),
             snapshots: BTreeSet::new(),
             contributions: BTreeSet::new(),
             revisions: BTreeSet::new(),
+            identity_revision_seeds: BTreeSet::new(),
+            identity_revision_limit,
+            identity_proof_edges_seen: 0,
             problems: Vec::new(),
         }
     }
@@ -787,16 +805,42 @@ impl<'a> Closure<'a> {
         // target or reader root as their source lineage. Index rows alone are
         // not roots: the old closure uses these edges too when reclaiming it.
         if self.store.schema_version() >= 26 {
-            let revisions: Vec<(String, Option<String>)> = self
+            let base = "SELECT r.revision_record_id,r.record_sha256,r.brief_object_sha256
+                        FROM contribution_revisions r
+                        WHERE r.lineage_record_id=?1
+                          AND NOT EXISTS (
+                              SELECT 1 FROM reclaimed_contribution_revisions retired
+                              WHERE retired.revision_record_id=r.revision_record_id
+                          )
+                        ORDER BY r.revision_record_id";
+            let sql = match self.identity_revision_limit {
+                Some(limit) => format!("{base} LIMIT {}", limit.saturating_add(1)),
+                None => base.to_string(),
+            };
+            let revisions: Vec<(String, String, Option<String>)> = self
                 .store
                 .read_connection()
-                .prepare(
-                    "SELECT record_sha256,brief_object_sha256 FROM contribution_revisions
-                          WHERE lineage_record_id=?1 ORDER BY revision_record_id",
-                )?
-                .query_map([lineage], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .prepare(&sql)?
+                .query_map([lineage], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
                 .collect::<Result<_, _>>()?;
-            for (revision, brief) in revisions {
+            for (record_text, revision, brief) in revisions {
+                let record_id = match RecordId::parse(&record_text) {
+                    Ok(record_id) => record_id,
+                    Err(_) => {
+                        self.problems.push(format!(
+                            "contribution {lineage} has a malformed immutable revision id"
+                        ));
+                        continue;
+                    }
+                };
+                let inserted = self.identity_revision_seeds.insert(record_id);
+                if inserted
+                    && self
+                        .identity_revision_limit
+                        .is_some_and(|limit| self.identity_revision_seeds.len() > limit)
+                {
+                    return Err(GcError::IdentityReplayLimit);
+                }
                 for digest in std::iter::once(revision).chain(brief) {
                     match parse_hex_digest(&digest) {
                         Some(digest) => self.object(digest, RetentionClass::Record),
@@ -818,29 +862,68 @@ impl<'a> Closure<'a> {
         if self.store.schema_version() < 26 {
             return Ok(());
         }
-        let indexed: Vec<(String, String)> = self.store.read_connection()
-            .prepare("SELECT revision_record_id,record_sha256 FROM contribution_revisions ORDER BY revision_record_id")?
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
-            .collect::<Result<_, _>>()?;
-        let mut pending = Vec::new();
-        for (id, digest) in indexed {
-            if parse_hex_digest(&digest).is_some_and(|digest| self.objects.contains_key(&digest)) {
-                pending.push(id);
+        let mut pending: Vec<RecordId> = self.identity_revision_seeds.iter().cloned().collect();
+        let limit = self.identity_revision_limit;
+        let object_digests: Vec<ObjectDigest> = self.objects.keys().copied().collect();
+        for digest in object_digests {
+            let remaining = limit
+                .map(|limit| {
+                    limit
+                        .saturating_sub(self.identity_revision_seeds.len())
+                        .saturating_add(1)
+                })
+                .unwrap_or(usize::MAX);
+            if remaining == 0 {
+                return Err(GcError::IdentityReplayLimit);
+            }
+            let mut statement = self.store.read_connection().prepare(
+                "SELECT r.revision_record_id FROM contribution_revisions r
+                 WHERE r.record_sha256=?1
+                   AND NOT EXISTS (
+                       SELECT 1 FROM reclaimed_contribution_revisions retired
+                       WHERE retired.revision_record_id=r.revision_record_id
+                   )
+                 ORDER BY r.revision_record_id LIMIT ?2",
+            )?;
+            let ids: Vec<String> = statement
+                .query_map(
+                    rusqlite::params![digest.hex(), i64::try_from(remaining).unwrap_or(i64::MAX)],
+                    |row| row.get(0),
+                )?
+                .collect::<Result<_, _>>()?;
+            for id in ids {
+                let record_id = match RecordId::parse(&id) {
+                    Ok(record_id) => record_id,
+                    Err(_) => {
+                        self.problems
+                            .push(format!("rooted revision {id} has a malformed id"));
+                        continue;
+                    }
+                };
+                if self.identity_revision_seeds.insert(record_id.clone()) {
+                    if limit.is_some_and(|limit| self.identity_revision_seeds.len() > limit) {
+                        return Err(GcError::IdentityReplayLimit);
+                    }
+                    pending.push(record_id);
+                }
             }
         }
-        while let Some(id) = pending.pop() {
-            let Ok(record_id) = RecordId::parse(&id) else {
-                self.problems
-                    .push(format!("rooted revision {id} has a malformed id"));
-                continue;
-            };
-            if !self.revisions.insert(record_id) {
+        while let Some(record_id) = pending.pop() {
+            if !self.revisions.insert(record_id.clone()) {
                 continue;
             }
+            if limit.is_some_and(|limit| self.revisions.len() > limit) {
+                return Err(GcError::IdentityReplayLimit);
+            }
+            let id = record_id.as_str().to_string();
             let row: Option<(String, Option<String>, String, String, String, String)> = self.store.read_connection().query_row(
                 "SELECT r.record_sha256,r.brief_object_sha256,r.lineage_record_id,c.record_sha256,c.base_snapshot,c.result_snapshot
                  FROM contribution_revisions r JOIN retained_contributions c ON c.lineage_record_id=r.lineage_record_id
-                 WHERE r.revision_record_id=?1", [&id],
+                 WHERE r.revision_record_id=?1
+                   AND NOT EXISTS (
+                       SELECT 1 FROM reclaimed_contribution_revisions retired
+                       WHERE retired.revision_record_id=r.revision_record_id
+                   )", [&id],
                 |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?)),
             ).optional()?;
             let Some((revision, brief, lineage, capture, base, result)) = row else {
@@ -864,10 +947,54 @@ impl<'a> Closure<'a> {
             }
             self.snapshot(&base)?;
             self.snapshot(&result)?;
-            let dependencies: Vec<String> = self.store.read_connection()
-                .prepare("SELECT base_revision_record_id FROM contribution_revision_identity_bases WHERE revision_record_id=?1 ORDER BY base_revision_record_id")?
-                .query_map([&id], |row| row.get(0))?.collect::<Result<_, _>>()?;
-            pending.extend(dependencies);
+            let dependencies = {
+                let remaining = if limit.is_some() {
+                    MAX_IDENTITY_PROOF_EDGES
+                        .saturating_sub(self.identity_proof_edges_seen)
+                        .saturating_add(1)
+                } else {
+                    usize::MAX
+                };
+                let mut statement = self.store.read_connection().prepare(
+                    "SELECT base_revision_record_id
+                     FROM contribution_revision_identity_bases
+                     WHERE revision_record_id=?1
+                     ORDER BY base_revision_record_id LIMIT ?2",
+                )?;
+                let limit_param = i64::try_from(remaining).unwrap_or(i64::MAX);
+                statement
+                    .query_map(rusqlite::params![id, limit_param], |row| {
+                        row.get::<_, String>(0)
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?
+            };
+            if limit.is_some() {
+                if self
+                    .identity_proof_edges_seen
+                    .saturating_add(dependencies.len())
+                    > MAX_IDENTITY_PROOF_EDGES
+                {
+                    return Err(GcError::IdentityReplayLimit);
+                }
+                self.identity_proof_edges_seen += dependencies.len();
+            }
+            for dependency in dependencies {
+                let dependency_id = match RecordId::parse(&dependency) {
+                    Ok(dependency_id) => dependency_id,
+                    Err(_) => {
+                        self.problems.push(format!(
+                            "rooted revision {id} has malformed identity-base reference {dependency}"
+                        ));
+                        continue;
+                    }
+                };
+                if self.identity_revision_seeds.insert(dependency_id.clone()) {
+                    if limit.is_some_and(|limit| self.identity_revision_seeds.len() > limit) {
+                        return Err(GcError::IdentityReplayLimit);
+                    }
+                    pending.push(dependency_id);
+                }
+            }
         }
         Ok(())
     }
@@ -903,8 +1030,16 @@ impl<'a> Closure<'a> {
 /// Shared root discovery for GC and identity replay. Callers hold the archive
 /// barrier and, when needed, their existing SQLite snapshot. No lock is opened.
 fn live_closure(store: &CollaborationStore, now: i64) -> Result<Closure<'_>, GcError> {
+    live_closure_with_identity_limit(store, now, None)
+}
+
+fn live_closure_with_identity_limit(
+    store: &CollaborationStore,
+    now: i64,
+    identity_revision_limit: Option<usize>,
+) -> Result<Closure<'_>, GcError> {
     let connection = store.read_connection();
-    let mut live = Closure::new(store);
+    let mut live = Closure::with_identity_revision_limit(store, identity_revision_limit);
     // Durable explicit enrollment retains its descriptor and both identity anchors, even
     // after independent capture roots are released. No revision index is a root.
     live.approved_project_binding()?;
@@ -1041,7 +1176,7 @@ pub(crate) fn live_identity_revision_roots(
     store: &CollaborationStore,
     now_ms: i64,
 ) -> Result<BTreeSet<RecordId>, GcError> {
-    let live = live_closure(store, now_ms)?;
+    let live = live_closure_with_identity_limit(store, now_ms, Some(MAX_IDENTITY_REVISIONS))?;
     if !live.problems.is_empty() {
         return Err(GcError::Blocked(
             live.problems
@@ -1958,6 +2093,7 @@ pub(crate) fn apply_with(
 
     // The decision is durable before any file moves.
     let now = now_ms();
+    let schema_version = store.schema_version();
     let transaction = store
         .connection()
         .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1975,6 +2111,42 @@ pub(crate) fn apply_with(
                 i64::try_from(item.bytes).unwrap_or(i64::MAX)
             ],
         )?;
+    }
+    if schema_version >= 26 {
+        for item in reclaim.iter().filter(|item| item.kind == ItemKind::Object) {
+            let Some(digest) = object_digest(&item.relpath) else {
+                continue;
+            };
+            let indexed: Vec<(String, String)> = transaction
+                .prepare(
+                    "SELECT r.revision_record_id,r.lineage_record_id
+                     FROM contribution_revisions r
+                     WHERE r.record_sha256=?1
+                       AND NOT EXISTS (
+                           SELECT 1 FROM reclaimed_contribution_revisions retired
+                           WHERE retired.revision_record_id=r.revision_record_id
+                       )
+                     ORDER BY r.revision_record_id",
+                )?
+                .query_map([digest.hex()], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .collect::<Result<_, _>>()?;
+            for (revision_id, lineage) in indexed {
+                transaction.execute(
+                    "INSERT OR IGNORE INTO reclaimed_contribution_revisions
+                         (revision_record_id,generation,reclaimed_ms)
+                     VALUES (?1,?2,?3)",
+                    rusqlite::params![revision_id, generation, now],
+                )?;
+                let retired_alias = transaction.execute(
+                    "DELETE FROM contribution_briefs
+                     WHERE revision_record_id=?1",
+                    [&revision_id],
+                )?;
+                if retired_alias != 0 {
+                    crate::collaboration_context::forget(&transaction, &lineage)?;
+                }
+            }
+        }
     }
     for entity in &entities {
         match entity {

@@ -1,0 +1,20 @@
+{
+  "project_id": "proj:aaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "contribution_id": "contrib:bbbbbbbbbbbbbbbbbbbbbbbbe",
+  "capture_record_id": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+  "source_file": {
+    "path_hex": "7372632f6c69622e7273",
+    "mode": "100644",
+    "content_hex": "666e206d61696e2829207b7d0a"
+  },
+  "brief": {
+    "record_id": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+    "object_sha256": "3333333333333333333333333333333333333333333333333333333333333333"
+  },
+  "minimal_new_file": {
+    "path_hex": "6e65772e7273",
+    "mode": "100644",
+    "content_hex": "6e65772066696c65",
+    "proposal_id": "proposal-new-file"
+  }
+}
