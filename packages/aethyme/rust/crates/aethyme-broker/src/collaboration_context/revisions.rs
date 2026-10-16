@@ -634,9 +634,13 @@ mod tests {
         let old = first_revision(&mut fixture);
         let old_pin = pin(&old);
         let request = query(&old);
-        let before =
-            retrieve_revisions(&fixture.store, &request, &[old_pin.clone()], &LocalProject)
-                .unwrap();
+        let before = retrieve_revisions(
+            &fixture.store,
+            &request,
+            std::slice::from_ref(&old_pin),
+            &LocalProject,
+        )
+        .unwrap();
         assert_eq!(before.selection.items.len(), 1);
         let updated = brief("new rationale with the same source bytes");
         let new_brief =
