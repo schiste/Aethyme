@@ -39,6 +39,11 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   restoration. Require positive, intended runtime failure, positive; a compile
   failure or a test that also fails without the break does not validate the
   guard. A passing adjacent suite cannot replace either positive run.
+- Before reclaiming a completed worktree, inspect ignored paths for qualification
+  records; a clean Git status does not cover them. Preserve irreplaceable
+  reports outside the worktree and build target, verify copied file sizes and
+  hashes, and check symlink targets before cleanup. Keep regenerable build
+  output separate from the evidence archive.
 - Check likely entrypoints and impacted callers before finishing.
 - Re-run lint/build only after the focused validation passes.
 - Document any override-based maintainer note that affected the change plan.
