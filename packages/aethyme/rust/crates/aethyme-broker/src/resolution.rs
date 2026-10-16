@@ -3883,7 +3883,7 @@ fn validate_synthesized_group_shape(
         Some(Value::Object(resolver))
             if resolver.len() == 2
                 && ["name", "version"].iter().all(|key| {
-                    matches!(resolver.get(*key), Some(Value::String(value))
+                    matches!(resolver.get(key), Some(Value::String(value))
                         if !value.trim().is_empty()
                             && value.len() <= 256
                             && !value.bytes().any(|byte| byte.is_ascii_control()))
