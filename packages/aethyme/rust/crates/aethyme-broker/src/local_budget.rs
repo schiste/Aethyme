@@ -329,6 +329,7 @@ pub struct ManagedResolutionStatus {
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum ManagedResolutionOutcome {
     AdapterUnavailable,
+    DispatchAcknowledged(ManagedResolutionStatus),
     StatusOnly(ManagedResolutionStatus),
     StaleUnknown,
 }
@@ -1087,6 +1088,17 @@ pub fn begin_attempt(
         epoch: owner.authority_epoch().clone(),
         project_dir: store.project_dir().to_owned(),
     })
+}
+
+/// Begin the owner-bound managed Local resolution route. Stable-key retries
+/// report retained status only; they never return a dispatch capability.
+pub fn begin_managed_resolution(
+    store: &mut CollaborationStore,
+    repo: &std::path::Path,
+    owner: &ControllerOwner,
+    command: &ManagedResolutionCommand,
+) -> Result<ManagedResolutionOutcome, BudgetError> {
+    managed_resolution::begin(store, repo, owner, command)
 }
 
 /// Native execution adapter: a live pending attempt must name this exact frozen

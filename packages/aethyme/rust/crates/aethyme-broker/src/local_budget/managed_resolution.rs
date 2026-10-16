@@ -3,35 +3,38 @@
 //! is consumed by one Immediate transaction which writes the shared charge,
 //! root reservation, retained inputs, proof, roots, and attempt binding.
 
+#[cfg(test)]
+use std::cell::Cell;
 use std::collections::BTreeSet;
+use std::path::Path;
 
 use aethyme_contracts::experimental_v0::RecordId;
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
 
 use super::{
-    BudgetError, ManagedResolutionCommand, Request, ReservationSpec, Units, WorkKind, charge,
-    guard, insert, objective, project, reject_overrun, rows, sum,
+    BudgetError, ManagedResolutionCommand, ManagedResolutionOutcome, ManagedResolutionStatus,
+    Request, ReservationSpec, State, Units, WorkKind, charge, decode, guard, insert, objective,
+    project, reject_overrun, rows, sum,
 };
-use crate::collaboration_archive::ObjectDigest;
+use crate::collaboration_archive::{self as archive, ObjectDigest};
+use crate::collaboration_capture::OperationId;
+use crate::collaboration_gc;
 use crate::collaboration_state::CollaborationStore;
-use crate::local_target::ControllerOwner;
-use crate::local_wave::{Wave, WavePhase};
+use crate::local_target::{self, ControllerOwner};
+use crate::local_wave::{self, Wave, WavePhase};
 use crate::resolution::{self, ResolutionRequest, Trigger};
 
 const MANAGED_ROUTE: &str = "local_managed_resolution_v1";
 
 /// Data assembled only after the typed current conflict reader validates the
-/// wave, request, source wrapper, and frozen plan. In particular, selected
-/// roots and the price profile are derived from that archived plan, never the
-/// command supplied by the caller.
+/// wave, request, source wrapper, and frozen plan. Selected roots are derived
+/// from that archived plan; policies are read again in the admission transaction.
 pub(super) struct ValidatedConflict<'a> {
     pub command: &'a ManagedResolutionCommand,
     pub wave: &'a Wave,
     pub request: &'a ResolutionRequest,
     pub trigger_sha256: &'a str,
     pub selected_roots: &'a BTreeSet<RecordId>,
-    pub price_profile: &'a str,
-    pub budget_ceiling: Units,
     pub input_manifest: ObjectDigest,
     pub now_ms: i64,
 }
@@ -59,6 +62,929 @@ struct ResolutionDispatchPermit {
     roots: BTreeSet<RecordId>,
 }
 
+type AdapterAcknowledge = fn(&ResolutionDispatchPermit) -> Result<(), BudgetError>;
+
+#[cfg(test)]
+thread_local! {
+    static TEST_ADAPTER: Cell<Option<AdapterAcknowledge>> = const { Cell::new(None) };
+}
+
+/// This production build deliberately has no registered paid or external
+/// adapter. The function pointer is private so callers cannot supply code.
+fn registered_adapter() -> Option<AdapterAcknowledge> {
+    #[cfg(test)]
+    if let Some(adapter) = TEST_ADAPTER.with(Cell::get) {
+        return Some(adapter);
+    }
+    None
+}
+
+#[cfg(test)]
+struct TestAdapterRegistration(Option<AdapterAcknowledge>);
+
+#[cfg(test)]
+impl Drop for TestAdapterRegistration {
+    fn drop(&mut self) {
+        TEST_ADAPTER.with(|slot| slot.set(self.0));
+    }
+}
+
+#[cfg(test)]
+fn register_test_adapter(adapter: AdapterAcknowledge) -> TestAdapterRegistration {
+    let previous = TEST_ADAPTER.with(|slot| slot.replace(Some(adapter)));
+    TestAdapterRegistration(previous)
+}
+
+/// Resolve an existing key before checking current ownership or policy. New
+/// commands validate the exact archived conflict and hold archive, response,
+/// and active-authority barriers through admission and private acknowledgement.
+pub(super) fn begin(
+    store: &mut CollaborationStore,
+    repo: &Path,
+    owner: &ControllerOwner,
+    command: &ManagedResolutionCommand,
+) -> Result<ManagedResolutionOutcome, BudgetError> {
+    let initial_now_ms = wall_clock_ms()?;
+    let _archive_guard = collaboration_gc::archive_use(store)
+        .map_err(|error| BudgetError::Invalid(format!("archive use: {error}")))?;
+    let _response_guard = crate::collaboration_sensitive::response_use(store)?;
+
+    if let Some(outcome) = existing_key_status(store, repo, owner, command)? {
+        return Ok(outcome);
+    }
+
+    let authority_guard = local_target::authorize(store, owner)?;
+    let binding = local_wave::current_conflict_request_binding(
+        store,
+        repo,
+        owner,
+        &command.wave,
+        command.expected_version,
+        &command.request,
+    )?;
+    if binding.request != command.request || binding.source != command.source {
+        return Err(BudgetError::Immutable);
+    }
+    let wave = local_wave::load(store, &command.wave)?;
+    let request = resolution::load_request(store, repo, &command.request)?;
+    let trigger_sha256 = conflict_trigger_digest(request.trigger())?;
+    let selected_roots = selected_roots(&binding.plan_payload.order)?;
+    if selected_roots.is_empty()
+        || request.record() != &command.request
+        || !matches!(request.trigger(), Trigger::Conflict(conflicts) if !conflicts.is_empty())
+        || binding.plan_payload.wave != wave.id.as_str()
+        || binding.plan_payload.revision != wave.spec.revision
+        || binding.plan_payload.selected != wave.spec.selected
+    {
+        return Err(BudgetError::Stale);
+    }
+    command.envelope.validate()?;
+    command.limits.validate()?;
+    if initial_now_ms >= command.deadline_ms
+        || command.deadline_ms.saturating_sub(initial_now_ms) > 86_400_000
+        || command.envelope.zero()
+    {
+        return Err(BudgetError::Invalid("managed resolution bounds".into()));
+    }
+    let (manifest_bytes, input_manifest) =
+        resolution::build_input_manifest(store, &request, command.limits)?;
+    let manifest_object = ObjectDigest::of(&manifest_bytes);
+    if input_manifest.sha256 != manifest_object.hex() {
+        return Err(BudgetError::Stale);
+    }
+
+    let Some(adapter) = registered_adapter() else {
+        return Ok(ManagedResolutionOutcome::AdapterUnavailable);
+    };
+
+    let now_ms = wall_clock_ms()?;
+    if now_ms >= command.deadline_ms || command.deadline_ms.saturating_sub(now_ms) > 86_400_000 {
+        return Err(BudgetError::Invalid("managed resolution deadline".into()));
+    }
+    let stored_manifest = archive::put_object(store, &manifest_bytes)?;
+    if stored_manifest != manifest_object {
+        return Err(BudgetError::Stale);
+    }
+    let validated = ValidatedConflict {
+        command,
+        wave: &wave,
+        request: &request,
+        trigger_sha256: &trigger_sha256,
+        selected_roots: &selected_roots,
+        input_manifest: manifest_object,
+        now_ms,
+    };
+    let permit = match admit_new(store, owner, validated) {
+        Ok(permit) => permit,
+        Err(BudgetError::Stale) => {
+            if let Some(outcome) = existing_key_status(store, repo, owner, command)? {
+                return Ok(outcome);
+            }
+            return Err(BudgetError::Stale);
+        }
+        Err(error) => return Err(error),
+    };
+    dispatch_acknowledgement(
+        store,
+        owner,
+        &authority_guard,
+        command,
+        &wave,
+        &request,
+        &trigger_sha256,
+        &selected_roots,
+        permit,
+        adapter,
+    )?;
+    let status = existing_key_status(store, repo, owner, command)?
+        .and_then(|outcome| match outcome {
+            ManagedResolutionOutcome::StatusOnly(status) => Some(status),
+            _ => None,
+        })
+        .ok_or(BudgetError::Stale)?;
+    Ok(ManagedResolutionOutcome::DispatchAcknowledged(status))
+}
+
+struct ReservationProofRow {
+    reservation: String,
+    target: String,
+    issuer: String,
+    authority_epoch: String,
+    client_key: String,
+    wave: String,
+    expected_version: i64,
+    request_record_id: String,
+    request_object_sha256: String,
+    source_record_id: String,
+    source_object_sha256: String,
+    input_manifest_sha256: String,
+    trigger_sha256: String,
+    project_policy: String,
+    objective_policy: String,
+    price_profile: String,
+    dispatch_limits: String,
+    reserved_envelope: Vec<u8>,
+    reservation_attempt_limit: u32,
+    deadline_ms: i64,
+    created_ms: i64,
+}
+
+fn existing_key_status(
+    store: &mut CollaborationStore,
+    repo: &Path,
+    owner: &ControllerOwner,
+    command: &ManagedResolutionCommand,
+) -> Result<Option<ManagedResolutionOutcome>, BudgetError> {
+    let proof_row = store
+        .read_connection()
+        .query_row(
+            "SELECT reservation,target,issuer,authority_epoch,client_key,wave,
+                    expected_version,request_record_id,request_object_sha256,
+                    composition_source_record_id,composition_source_object_sha256,
+                    input_manifest_object_sha256,trigger_sha256,project_policy,
+                    objective_policy,price_profile,dispatch_limits,reserved_envelope,
+                    reservation_attempt_limit,deadline_ms,created_ms
+             FROM local_resolution_reservation_proofs
+             WHERE target=?1 AND issuer=?2 AND client_key=?3",
+            params![owner.target(), owner.issuer(), command.client_key.as_str()],
+            |row| {
+                Ok(ReservationProofRow {
+                    reservation: row.get(0)?,
+                    target: row.get(1)?,
+                    issuer: row.get(2)?,
+                    authority_epoch: row.get(3)?,
+                    client_key: row.get(4)?,
+                    wave: row.get(5)?,
+                    expected_version: row.get(6)?,
+                    request_record_id: row.get(7)?,
+                    request_object_sha256: row.get(8)?,
+                    source_record_id: row.get(9)?,
+                    source_object_sha256: row.get(10)?,
+                    input_manifest_sha256: row.get(11)?,
+                    trigger_sha256: row.get(12)?,
+                    project_policy: row.get(13)?,
+                    objective_policy: row.get(14)?,
+                    price_profile: row.get(15)?,
+                    dispatch_limits: row.get(16)?,
+                    reserved_envelope: row.get(17)?,
+                    reservation_attempt_limit: row.get(18)?,
+                    deadline_ms: row.get(19)?,
+                    created_ms: row.get(20)?,
+                })
+            },
+        )
+        .optional();
+    let proof = match proof_row {
+        Ok(Some(proof)) => proof,
+        Ok(None) => {
+            return if orphaned_managed_key(store, owner, &command.client_key)? {
+                Ok(Some(ManagedResolutionOutcome::StaleUnknown))
+            } else {
+                Ok(None)
+            };
+        }
+        Err(error) if corrupt_row_encoding(&error) => {
+            return Ok(Some(ManagedResolutionOutcome::StaleUnknown));
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let retained_command = match command_from_proof(&proof) {
+        Ok(command) => command,
+        Err(_) => return Ok(Some(ManagedResolutionOutcome::StaleUnknown)),
+    };
+    let status = match retained_status(store, repo, owner, &retained_command, &proof) {
+        Ok(status) => status,
+        Err(_) => return Ok(Some(ManagedResolutionOutcome::StaleUnknown)),
+    };
+    if !same_command_identity(command, &retained_command) {
+        return Err(BudgetError::Immutable);
+    }
+    Ok(Some(ManagedResolutionOutcome::StatusOnly(status)))
+}
+
+fn orphaned_managed_key(
+    store: &CollaborationStore,
+    owner: &ControllerOwner,
+    key: &OperationId,
+) -> Result<bool, BudgetError> {
+    let nonce = reservation_nonce_for(owner.target(), owner.issuer(), key);
+    Ok(store.read_connection().query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM local_budget_reservations WHERE nonce=?1
+         ) OR EXISTS(
+             SELECT 1 FROM resolution_attempts a
+             JOIN local_waves w
+               ON w.resolution_request_record_id=a.request_record_id
+              AND w.resolution_request_object=a.request_sha256
+             WHERE a.client_key=?2 AND a.resolver='local-managed-resolution'
+               AND w.target=?3
+         )",
+        params![nonce, key.as_str(), owner.target()],
+        |row| row.get(0),
+    )?)
+}
+
+fn corrupt_row_encoding(error: &rusqlite::Error) -> bool {
+    matches!(
+        error,
+        rusqlite::Error::FromSqlConversionFailure(..)
+            | rusqlite::Error::IntegralValueOutOfRange(..)
+            | rusqlite::Error::InvalidColumnType(..)
+    )
+}
+
+/// Reconstruct the full immutable identity from the retained proof before
+/// classifying a caller's same-key reuse as a conflict. A malformed proof is
+/// stale/unknown; it must never turn a corrupt binding into a fresh permit.
+fn command_from_proof(
+    proof: &ReservationProofRow,
+) -> Result<ManagedResolutionCommand, BudgetError> {
+    validate_digest(&proof.request_object_sha256)?;
+    validate_digest(&proof.source_object_sha256)?;
+    validate_digest(&proof.input_manifest_sha256)?;
+    validate_digest(&proof.trigger_sha256)?;
+    if proof.reservation_attempt_limit != 1
+        || proof.expected_version < 0
+        || proof.created_ms < 0
+        || proof.deadline_ms <= proof.created_ms
+        || proof.deadline_ms.saturating_sub(proof.created_ms) > 86_400_000
+    {
+        return Err(BudgetError::Stale);
+    }
+    RecordId::parse(&proof.reservation).map_err(|_| BudgetError::Stale)?;
+    RecordId::parse(&proof.authority_epoch).map_err(|_| BudgetError::Stale)?;
+    RecordId::parse(&proof.project_policy).map_err(|_| BudgetError::Stale)?;
+    RecordId::parse(&proof.objective_policy).map_err(|_| BudgetError::Stale)?;
+    RecordId::parse(&proof.price_profile).map_err(|_| BudgetError::Stale)?;
+    let client_key = OperationId::parse(&proof.client_key).map_err(|_| BudgetError::Stale)?;
+    let wave = RecordId::parse(&proof.wave).map_err(|_| BudgetError::Stale)?;
+    let request = resolution::RecordRef {
+        id: RecordId::parse(&proof.request_record_id).map_err(|_| BudgetError::Stale)?,
+        object: archive::parse_digest(&proof.request_object_sha256).ok_or(BudgetError::Stale)?,
+    };
+    let source = resolution::RecordRef {
+        id: RecordId::parse(&proof.source_record_id).map_err(|_| BudgetError::Stale)?,
+        object: archive::parse_digest(&proof.source_object_sha256).ok_or(BudgetError::Stale)?,
+    };
+    let envelope: Units = serde_json::from_slice(&proof.reserved_envelope)?;
+    envelope.validate()?;
+    if serde_json::to_vec(&envelope)? != proof.reserved_envelope {
+        return Err(BudgetError::Stale);
+    }
+    let limits = resolution::DispatchLimits::from_canonical_ledger_value(&proof.dispatch_limits)?;
+    limits.validate()?;
+    Ok(ManagedResolutionCommand {
+        wave,
+        expected_version: proof.expected_version,
+        request,
+        source,
+        client_key,
+        envelope,
+        limits,
+        deadline_ms: proof.deadline_ms,
+    })
+}
+
+fn same_command_identity(
+    left: &ManagedResolutionCommand,
+    right: &ManagedResolutionCommand,
+) -> bool {
+    left.wave == right.wave
+        && left.expected_version == right.expected_version
+        && left.request == right.request
+        && left.source == right.source
+        && left.client_key == right.client_key
+        && left.envelope == right.envelope
+        && left.limits == right.limits
+        && left.deadline_ms == right.deadline_ms
+}
+
+fn proof_for_reservation(
+    connection: &rusqlite::Connection,
+    reservation: &RecordId,
+) -> Result<ReservationProofRow, BudgetError> {
+    Ok(connection.query_row(
+        "SELECT reservation,target,issuer,authority_epoch,client_key,wave,
+                expected_version,request_record_id,request_object_sha256,
+                composition_source_record_id,composition_source_object_sha256,
+                input_manifest_object_sha256,trigger_sha256,project_policy,
+                objective_policy,price_profile,dispatch_limits,reserved_envelope,
+                reservation_attempt_limit,deadline_ms,created_ms
+         FROM local_resolution_reservation_proofs WHERE reservation=?1",
+        [reservation.as_str()],
+        |row| {
+            Ok(ReservationProofRow {
+                reservation: row.get(0)?,
+                target: row.get(1)?,
+                issuer: row.get(2)?,
+                authority_epoch: row.get(3)?,
+                client_key: row.get(4)?,
+                wave: row.get(5)?,
+                expected_version: row.get(6)?,
+                request_record_id: row.get(7)?,
+                request_object_sha256: row.get(8)?,
+                source_record_id: row.get(9)?,
+                source_object_sha256: row.get(10)?,
+                input_manifest_sha256: row.get(11)?,
+                trigger_sha256: row.get(12)?,
+                project_policy: row.get(13)?,
+                objective_policy: row.get(14)?,
+                price_profile: row.get(15)?,
+                dispatch_limits: row.get(16)?,
+                reserved_envelope: row.get(17)?,
+                reservation_attempt_limit: row.get(18)?,
+                deadline_ms: row.get(19)?,
+                created_ms: row.get(20)?,
+            })
+        },
+    )?)
+}
+
+fn retained_status(
+    store: &mut CollaborationStore,
+    repo: &Path,
+    owner: &ControllerOwner,
+    command: &ManagedResolutionCommand,
+    proof: &ReservationProofRow,
+) -> Result<ManagedResolutionStatus, BudgetError> {
+    validate_digest(&proof.request_object_sha256)?;
+    validate_digest(&proof.source_object_sha256)?;
+    validate_digest(&proof.input_manifest_sha256)?;
+    validate_digest(&proof.trigger_sha256)?;
+    if proof.target != owner.target()
+        || proof.issuer != owner.issuer()
+        || proof.client_key != command.client_key.as_str()
+        || proof.reservation_attempt_limit != 1
+        || proof.deadline_ms < 0
+        || proof.created_ms < 0
+    {
+        return Err(BudgetError::Stale);
+    }
+    RecordId::parse(&proof.authority_epoch).map_err(|_| BudgetError::Stale)?;
+    let reservation_id = RecordId::parse(&proof.reservation).map_err(|_| BudgetError::Stale)?;
+    let request_ref = resolution::RecordRef {
+        id: RecordId::parse(&proof.request_record_id).map_err(|_| BudgetError::Stale)?,
+        object: archive::parse_digest(&proof.request_object_sha256).ok_or(BudgetError::Stale)?,
+    };
+    let source_ref = resolution::RecordRef {
+        id: RecordId::parse(&proof.source_record_id).map_err(|_| BudgetError::Stale)?,
+        object: archive::parse_digest(&proof.source_object_sha256).ok_or(BudgetError::Stale)?,
+    };
+    RecordId::parse(&proof.project_policy).map_err(|_| BudgetError::Stale)?;
+    RecordId::parse(&proof.objective_policy).map_err(|_| BudgetError::Stale)?;
+    RecordId::parse(&proof.price_profile).map_err(|_| BudgetError::Stale)?;
+    let limits = resolution::DispatchLimits::from_canonical_ledger_value(&proof.dispatch_limits)?;
+    let envelope: Units = serde_json::from_slice(&proof.reserved_envelope)?;
+    envelope.validate()?;
+    if limits != command.limits || envelope != command.envelope {
+        return Err(BudgetError::Stale);
+    }
+
+    let binding =
+        local_wave::read_retained_conflict_request_binding(store, repo, &request_ref, &source_ref)?;
+    if binding.request != request_ref
+        || binding.source != source_ref
+        || binding.plan_payload.wave != proof.wave
+    {
+        return Err(BudgetError::Stale);
+    }
+    let revision =
+        RecordId::parse(&binding.plan_payload.revision).map_err(|_| BudgetError::Stale)?;
+    if revision.as_str() != binding.plan_payload.revision {
+        return Err(BudgetError::Stale);
+    }
+    let wave = local_wave::load(
+        store,
+        &RecordId::parse(&proof.wave).map_err(|_| BudgetError::Stale)?,
+    )?;
+    if wave.id.as_str() != proof.wave
+        || wave.spec.target != proof.target
+        || wave.spec.issuer != proof.issuer
+        || wave.spec.revision != revision.as_str()
+        || wave.spec.selected != binding.plan_payload.selected
+        || wave.spec.policy != binding.plan_payload.policy
+        || wave.spec.prior_completion != binding.plan_payload.prior_completion
+        || wave.resolution_request.as_ref() != Some(&request_ref)
+        || wave.composition_source.as_ref() != Some(&source_ref)
+    {
+        return Err(BudgetError::Stale);
+    }
+    let roots = selected_roots(&binding.plan_payload.order)?;
+    let mut root_statement = store.read_connection().prepare(
+        "SELECT lineage_record_id FROM local_resolution_reservation_roots
+         WHERE reservation=?1 ORDER BY lineage_record_id",
+    )?;
+    let root_rows = root_statement
+        .query_map([reservation_id.as_str()], |row| row.get::<_, String>(0))?
+        .collect::<Result<BTreeSet<_>, _>>()?;
+    let stored_roots = root_rows
+        .iter()
+        .map(|root| RecordId::parse(root).map_err(|_| BudgetError::Stale))
+        .collect::<Result<BTreeSet<_>, _>>()?;
+    if roots.is_empty() || stored_roots != roots {
+        return Err(BudgetError::Stale);
+    }
+
+    let request = resolution::load_request(store, repo, &request_ref)?;
+    if request.record() != &request_ref
+        || !matches!(request.trigger(), Trigger::Conflict(conflicts) if !conflicts.is_empty())
+        || conflict_trigger_digest(request.trigger())? != proof.trigger_sha256
+    {
+        return Err(BudgetError::Stale);
+    }
+    let (manifest_bytes, manifest) = resolution::build_input_manifest(store, &request, limits)?;
+    if manifest.sha256 != proof.input_manifest_sha256
+        || ObjectDigest::of(&manifest_bytes).hex() != proof.input_manifest_sha256
+    {
+        return Err(BudgetError::Stale);
+    }
+    let manifest_digest =
+        archive::parse_digest(&proof.input_manifest_sha256).ok_or(BudgetError::Stale)?;
+    let stored_manifest = archive::read_object_bounded(
+        store,
+        &manifest_digest,
+        usize::try_from(limits.max_manifest_bytes).map_err(|_| BudgetError::Stale)?,
+    )?;
+    if stored_manifest != manifest_bytes {
+        return Err(BudgetError::Stale);
+    }
+
+    let reservation = load_retained_reservation(
+        store.read_connection(),
+        &reservation_id,
+        proof,
+        command,
+        &revision,
+    )?;
+    let binding = load_retained_attempt_binding(
+        store.read_connection(),
+        &reservation_id,
+        proof,
+        command,
+        &request,
+    )?;
+    let state = reservation.state;
+    if !matches!(state, State::CompletionPending | State::ConsumptionUnknown)
+        || reservation.attempts != 1
+        || reservation.version < binding.reservation_version_at_dispatch
+        || reservation.objective != wave.spec.objective_authorization
+    {
+        return Err(BudgetError::Stale);
+    }
+    Ok(ManagedResolutionStatus {
+        reservation: reservation_id.as_str().into(),
+        phase: state,
+        reservation_attempt: 1,
+        reservation_version: reservation.version,
+        shared_attempt: binding.shared_attempt,
+        async_state: binding.async_state,
+        outcome: None,
+    })
+}
+
+struct RetainedAttemptBinding {
+    binding_id: String,
+    attempt_id: i64,
+    authority_epoch: String,
+    reservation_version_at_dispatch: i64,
+    shared_attempt: u32,
+    async_token: String,
+    async_state: String,
+}
+
+struct RetainedReservation {
+    objective: String,
+    state: State,
+    attempts: u32,
+    version: i64,
+}
+
+fn load_retained_reservation(
+    connection: &rusqlite::Connection,
+    reservation: &RecordId,
+    proof: &ReservationProofRow,
+    command: &ManagedResolutionCommand,
+    revision: &RecordId,
+) -> Result<RetainedReservation, BudgetError> {
+    let row: (
+        Vec<u8>,
+        String,
+        u32,
+        i64,
+        String,
+        Option<String>,
+        String,
+        String,
+        String,
+        String,
+        Vec<u8>,
+        Option<String>,
+    ) = connection.query_row(
+        "SELECT body,phase,attempts,version,root,parent,target,revision,wave,nonce,spent,receipt
+         FROM local_budget_reservations WHERE reservation=?1",
+        [reservation.as_str()],
+        |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+                row.get(6)?,
+                row.get(7)?,
+                row.get(8)?,
+                row.get(9)?,
+                row.get(10)?,
+                row.get(11)?,
+            ))
+        },
+    )?;
+    let spec: ReservationSpec = decode(reservation.as_str(), &row.0)?;
+    let encoded = record(&spec)?;
+    let spent: Units = serde_json::from_slice(&row.10)?;
+    spent.validate()?;
+    let state = parse_state(&row.1)?;
+    let expected_nonce = reservation_nonce_for(&proof.target, &proof.issuer, &command.client_key);
+    RecordId::parse(&spec.objective).map_err(|_| BudgetError::Stale)?;
+    if encoded.id() != reservation
+        || spec.issuer != proof.issuer
+        || spec.target != proof.target
+        || spec.revision != revision.as_str()
+        || spec.wave != command.wave.as_str()
+        || spec.project_policy != proof.project_policy
+        || spec.objective_policy != proof.objective_policy
+        || spec.parent.is_some()
+        || spec.request.kind != WorkKind::Resolution
+        || spec.request.nonce != expected_nonce
+        || spec.request.recipe != command.request.id.as_str()
+        || spec.request.units != command.envelope
+        || spec.request.max_attempts != 1
+        || spec.request.deadline_ms != command.deadline_ms
+        || row.2 != 1
+        || row.3 < 1
+        || row.4 != reservation.as_str()
+        || row.5.is_some()
+        || row.6 != proof.target
+        || row.7 != revision.as_str()
+        || row.8 != command.wave.as_str()
+        || row.9 != expected_nonce
+        || !spent.zero()
+        || row.11.is_some()
+    {
+        return Err(BudgetError::Stale);
+    }
+    Ok(RetainedReservation {
+        objective: spec.objective,
+        state,
+        attempts: row.2,
+        version: row.3,
+    })
+}
+
+fn load_retained_attempt_binding(
+    connection: &rusqlite::Connection,
+    reservation: &RecordId,
+    proof: &ReservationProofRow,
+    command: &ManagedResolutionCommand,
+    request: &ResolutionRequest,
+) -> Result<RetainedAttemptBinding, BudgetError> {
+    let row: (String, i64, String, i64, u32, u32, String, i64) = connection.query_row(
+        "SELECT binding_id,attempt_id,authority_epoch,reservation_version,
+                shared_attempt_number,reservation_attempt_number,route,created_ms
+         FROM local_managed_resolution_attempt_bindings WHERE reservation=?1",
+        [reservation.as_str()],
+        |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+                row.get(6)?,
+                row.get(7)?,
+            ))
+        },
+    )?;
+    let expected_binding = binding_id(reservation, row.1);
+    let async_state: String;
+    let attempt_matches: bool = connection.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM resolution_attempts
+             WHERE attempt_id=?1 AND decision_key=?2 AND kind=?3
+               AND members=?4 AND paths=?5 AND request_record_id=?6
+               AND resolver='local-managed-resolution' AND outcome IS NULL
+               AND request_sha256=?7 AND input_sha256=?8
+               AND input_manifest_sha256=?9 AND client_key=?10
+               AND dispatch_limits=?11 AND async_state IN ('dispatching','outcome_unknown')
+               AND session_label IS NULL AND response_sha256 IS NULL
+               AND attempt_number=?12
+         )",
+        params![
+            row.1,
+            request.decision.key(),
+            request.decision.kind,
+            canonical_set(&request.decision.members),
+            canonical_set(&request.decision.paths),
+            command.request.id.as_str(),
+            command.request.object.hex(),
+            resolution::resolution_input_digest(request, &command.request.object),
+            proof.input_manifest_sha256,
+            command.client_key.as_str(),
+            command.limits.canonical_ledger_value(),
+            row.4,
+        ],
+        |row| row.get(0),
+    )?;
+    if !attempt_matches {
+        return Err(BudgetError::Stale);
+    }
+    async_state = connection.query_row(
+        "SELECT async_state FROM resolution_attempts WHERE attempt_id=?1",
+        [row.1],
+        |row| row.get(0),
+    )?;
+    let async_token: String = connection.query_row(
+        "SELECT async_token FROM resolution_attempts WHERE attempt_id=?1",
+        [row.1],
+        |row| row.get(0),
+    )?;
+    OperationId::parse(&async_token).map_err(|_| BudgetError::Stale)?;
+    if row.0 != expected_binding.as_str()
+        || row.2 != proof.authority_epoch
+        || row.3 != 1
+        || row.4 == 0
+        || row.5 != 1
+        || row.6 != MANAGED_ROUTE
+        || row.7 != proof.created_ms
+    {
+        return Err(BudgetError::Stale);
+    }
+    Ok(RetainedAttemptBinding {
+        binding_id: row.0,
+        attempt_id: row.1,
+        authority_epoch: row.2,
+        reservation_version_at_dispatch: row.3,
+        shared_attempt: row.4,
+        async_token,
+        async_state,
+    })
+}
+
+fn selected_roots(
+    order: &[crate::local_wave::ConflictOrderPayload],
+) -> Result<BTreeSet<RecordId>, BudgetError> {
+    let roots = order
+        .iter()
+        .map(|entry| RecordId::parse(&entry.lineage).map_err(|_| BudgetError::Stale))
+        .collect::<Result<BTreeSet<_>, _>>()?;
+    if roots.len() != order.len() {
+        return Err(BudgetError::Stale);
+    }
+    Ok(roots)
+}
+
+fn conflict_trigger_digest(trigger: &Trigger) -> Result<String, BudgetError> {
+    let conflicts = match trigger {
+        Trigger::Conflict(conflicts) if !conflicts.is_empty() => conflicts,
+        _ => return Err(BudgetError::Stale),
+    };
+    let body = serde_json::to_vec(&serde_json::json!({
+        "schema": "aethyme.local-managed-resolution-trigger/experimental-v0",
+        "version": 1,
+        "kind": "conflict",
+        "conflicts": conflicts.iter().map(|conflict| serde_json::json!({
+            "path": conflict.path,
+            "input": conflict.input.as_str(),
+            "reason": conflict.reason,
+        })).collect::<Vec<_>>(),
+    }))?;
+    Ok(ObjectDigest::of(&body).hex())
+}
+
+fn canonical_set(values: &BTreeSet<String>) -> String {
+    values.iter().cloned().collect::<Vec<_>>().join("\n")
+}
+
+fn parse_state(value: &str) -> Result<State, BudgetError> {
+    serde_json::from_value(serde_json::Value::String(value.to_owned()))
+        .map_err(|_| BudgetError::Stale)
+}
+
+fn wall_clock_ms() -> Result<i64, BudgetError> {
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| BudgetError::Stale)?
+        .as_millis();
+    i64::try_from(millis).map_err(|_| BudgetError::Stale)
+}
+
+fn dispatch_acknowledgement(
+    store: &mut CollaborationStore,
+    owner: &ControllerOwner,
+    authority_guard: &crate::local_authority::Guard,
+    command: &ManagedResolutionCommand,
+    wave: &Wave,
+    request: &ResolutionRequest,
+    trigger_sha256: &str,
+    roots: &BTreeSet<RecordId>,
+    permit: ResolutionDispatchPermit,
+    adapter: AdapterAcknowledge,
+) -> Result<(), BudgetError> {
+    let now_ms = wall_clock_ms()?;
+    if now_ms >= permit.deadline_ms
+        || !authority_guard.covers_active(store, &permit.authority_epoch)
+        || permit.owner_target != owner.target()
+        || permit.owner_issuer != owner.issuer()
+        || permit.authority_epoch != *owner.authority_epoch()
+        || permit.wave != command.wave
+        || permit.expected_version != command.expected_version
+        || permit.request != command.request
+        || permit.source != command.source
+        || permit.manifest
+            != ObjectDigest::of(
+                &resolution::build_input_manifest(store, request, command.limits)?.0,
+            )
+        || permit.limits != command.limits
+        || permit.deadline_ms != command.deadline_ms
+        || &permit.roots != roots
+    {
+        return Err(BudgetError::Stale);
+    }
+    let transaction = store
+        .connection()
+        .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    guard(
+        &transaction,
+        owner,
+        &wave.spec.revision,
+        command.expected_version,
+    )?;
+    let validated = ValidatedConflict {
+        command,
+        wave,
+        request,
+        trigger_sha256,
+        selected_roots: roots,
+        input_manifest: permit.manifest,
+        now_ms,
+    };
+    verify_current_wave(&transaction, owner, &validated)?;
+    let proof = proof_for_reservation(&transaction, &permit.reservation)?;
+    if proof.reservation != permit.reservation.as_str()
+        || proof.target != owner.target()
+        || proof.issuer != owner.issuer()
+        || proof.authority_epoch != permit.authority_epoch.as_str()
+        || proof.client_key != command.client_key.as_str()
+        || proof.wave != command.wave.as_str()
+        || proof.expected_version != command.expected_version
+        || proof.request_record_id != command.request.id.as_str()
+        || proof.request_object_sha256 != command.request.object.hex()
+        || proof.source_record_id != command.source.id.as_str()
+        || proof.source_object_sha256 != command.source.object.hex()
+        || proof.input_manifest_sha256 != permit.manifest.hex()
+        || proof.trigger_sha256 != trigger_sha256
+        || proof.dispatch_limits != command.limits.canonical_ledger_value()
+        || proof.reserved_envelope != serde_json::to_vec(&command.envelope)?
+        || proof.deadline_ms != command.deadline_ms
+    {
+        return Err(BudgetError::Stale);
+    }
+    let reservation_id = permit.reservation.clone();
+    let revision = RecordId::parse(&wave.spec.revision).map_err(|_| BudgetError::Stale)?;
+    let reservation =
+        load_retained_reservation(&transaction, &reservation_id, &proof, command, &revision)?;
+    if reservation.state != State::CompletionPending
+        || reservation.attempts != 1
+        || reservation.version != permit.reservation_version
+    {
+        return Err(BudgetError::Stale);
+    }
+    let retained_binding =
+        load_retained_attempt_binding(&transaction, &reservation_id, &proof, command, request)?;
+    if retained_binding.binding_id != permit.binding_id.as_str()
+        || retained_binding.attempt_id != permit.attempt_id
+        || retained_binding.authority_epoch != permit.authority_epoch.as_str()
+        || retained_binding.reservation_version_at_dispatch != permit.reservation_version
+        || retained_binding.shared_attempt != permit.shared_attempt
+        || retained_binding.async_token != permit.async_token.as_str()
+        || retained_binding.async_state != "dispatching"
+    {
+        return Err(BudgetError::Stale);
+    }
+    let row_matches: bool = transaction.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM local_resolution_reservation_proofs p
+             JOIN local_budget_reservations r ON r.reservation=p.reservation
+             JOIN local_managed_resolution_attempt_bindings b
+               ON b.reservation=p.reservation
+             JOIN resolution_attempts a ON a.attempt_id=b.attempt_id
+             WHERE p.reservation=?1 AND p.target=?2 AND p.issuer=?3
+               AND p.authority_epoch=?4 AND p.client_key=?5
+               AND p.wave=?6 AND p.expected_version=?7
+               AND p.request_record_id=?8 AND p.request_object_sha256=?9
+               AND p.composition_source_record_id=?10
+               AND p.composition_source_object_sha256=?11
+               AND p.input_manifest_object_sha256=?12
+               AND p.trigger_sha256=?13 AND p.dispatch_limits=?14
+               AND p.reserved_envelope=?15 AND p.deadline_ms=?16
+               AND r.phase='completion_pending' AND r.attempts=1
+               AND r.version=?17 AND b.binding_id=?18
+               AND b.attempt_id=?19 AND b.authority_epoch=?4
+               AND b.reservation_version=?17
+               AND b.reservation_attempt_number=1
+               AND b.shared_attempt_number=?20 AND b.route=?21
+               AND a.resolver='local-managed-resolution'
+               AND a.session_label IS NULL AND a.async_token=?22
+               AND a.async_state='dispatching' AND a.outcome IS NULL
+         )",
+        params![
+            permit.reservation.as_str(),
+            owner.target(),
+            owner.issuer(),
+            permit.authority_epoch.as_str(),
+            command.client_key.as_str(),
+            command.wave.as_str(),
+            command.expected_version,
+            command.request.id.as_str(),
+            command.request.object.hex(),
+            command.source.id.as_str(),
+            command.source.object.hex(),
+            permit.manifest.hex(),
+            trigger_sha256,
+            command.limits.canonical_ledger_value(),
+            serde_json::to_vec(&command.envelope)?,
+            command.deadline_ms,
+            permit.reservation_version,
+            permit.binding_id.as_str(),
+            permit.attempt_id,
+            permit.shared_attempt,
+            MANAGED_ROUTE,
+            permit.async_token.as_str(),
+        ],
+        |row| row.get(0),
+    )?;
+    let mut roots_statement = transaction.prepare(
+        "SELECT lineage_record_id FROM local_resolution_reservation_roots
+             WHERE reservation=?1 ORDER BY lineage_record_id",
+    )?;
+    let stored_roots: BTreeSet<String> = roots_statement
+        .query_map([permit.reservation.as_str()], |row| row.get(0))?
+        .collect::<Result<_, _>>()?;
+    let expected_roots: BTreeSet<String> =
+        roots.iter().map(|root| root.as_str().to_owned()).collect();
+    if !row_matches || stored_roots != expected_roots {
+        return Err(BudgetError::Stale);
+    }
+    if wall_clock_ms()? >= permit.deadline_ms {
+        return Err(BudgetError::Stale);
+    }
+    adapter(&permit)?;
+    transaction.commit()?;
+    Ok(())
+}
+
 /// Reserve and charge a new conflict attempt in one transaction. The caller
 /// holds archive, response, and active-authority guards in that order and has
 /// checked the exact current conflict binding before entering this function.
@@ -76,7 +1002,6 @@ pub(super) fn admit_new(
         || validated.now_ms >= command.deadline_ms
         || command.deadline_ms.saturating_sub(validated.now_ms) > 86_400_000
         || command.envelope.zero()
-        || !command.envelope.within(validated.budget_ceiling)
         || validated.selected_roots.is_empty()
     {
         return Err(BudgetError::Invalid("managed resolution bounds".into()));
@@ -121,6 +1046,15 @@ pub(super) fn admit_new(
     let transaction = store
         .connection()
         .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let duplicate_key: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM local_resolution_reservation_proofs
+         WHERE target=?1 AND issuer=?2 AND client_key=?3)",
+        params![owner.target(), owner.issuer(), command.client_key.as_str()],
+        |row| row.get(0),
+    )?;
+    if duplicate_key || super::nonce_key(&transaction, &nonce)?.is_some() {
+        return Err(BudgetError::Stale);
+    }
     reject_overrun(&transaction)?;
     let (revision, version, target_phase, resume_phase): (
         Option<String>,
@@ -148,10 +1082,22 @@ pub(super) fn admit_new(
     )?;
     verify_current_wave(&transaction, owner, &validated)?;
 
-    let (project_id, policy) = project(&transaction, owner.issuer())?;
-    if policy.price_profile != validated.price_profile {
-        return Err(BudgetError::Stale);
+    resolution::initialize_ledger_in_transaction(&transaction)?;
+    let unresolved_managed: bool = transaction.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM resolution_attempts
+             WHERE decision_key=?1 AND resolver='local-managed-resolution'
+               AND session_label IS NULL AND outcome IS NULL
+               AND async_state IN ('dispatching','outcome_unknown')
+         )",
+        params![validated.request.decision.key()],
+        |row| row.get(0),
+    )?;
+    if unresolved_managed {
+        return Err(BudgetError::Pending);
     }
+
+    let (project_id, policy) = project(&transaction, owner.issuer())?;
     let (objective_id, objective_cap) =
         objective(&transaction, owner.issuer(), &spec.objective, &project_id)?;
     let spec = ReservationSpec {
@@ -160,16 +1106,6 @@ pub(super) fn admit_new(
         ..spec
     };
     let reservation_record = super::record(&spec)?;
-
-    let duplicate_key: bool = transaction.query_row(
-        "SELECT EXISTS(SELECT 1 FROM local_resolution_reservation_proofs
-         WHERE target=?1 AND issuer=?2 AND client_key=?3)",
-        params![owner.target(), owner.issuer(), command.client_key.as_str()],
-        |row| row.get(0),
-    )?;
-    if duplicate_key || super::nonce_key(&transaction, &nonce)?.is_some() {
-        return Err(BudgetError::Stale);
-    }
 
     let root_rows = rows(
         &transaction,
@@ -203,7 +1139,6 @@ pub(super) fn admit_new(
         return Err(BudgetError::Capacity("recovery headroom"));
     }
 
-    resolution::initialize_ledger_in_transaction(&transaction)?;
     let input_sha256 =
         resolution::resolution_input_digest(validated.request, &command.request.object);
     let Some((shared_attempt, attempt_id)) = resolution::charge_managed_in_transaction(
@@ -260,7 +1195,7 @@ pub(super) fn admit_new(
             validated.trigger_sha256,
             project_id.as_str(),
             objective_id.as_str(),
-            validated.price_profile,
+            policy.price_profile,
             command.limits.canonical_ledger_value(),
             serde_json::to_vec(&command.envelope)?,
             command.deadline_ms,
@@ -352,6 +1287,17 @@ fn verify_current_wave(
     validated: &ValidatedConflict<'_>,
 ) -> Result<(), BudgetError> {
     let command = validated.command;
+    let target: Option<(String, i64, String, Option<String>)> = transaction
+        .query_row(
+            "SELECT active_revision,version,phase,resume_phase FROM local_targets
+             WHERE target=?1 AND issuer=?2",
+            params![owner.target(), owner.issuer()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()?;
+    let Some((active_revision, version, target_phase, resume_phase)) = target else {
+        return Err(BudgetError::Stale);
+    };
     let row: Option<(
         String,
         String,
@@ -400,7 +1346,11 @@ fn verify_current_wave(
         params![owner.target(), revision],
         |row| row.get(0),
     )?;
-    if target != owner.target()
+    if active_revision != validated.wave.spec.revision
+        || version != command.expected_version
+        || target_phase != "idle"
+        || resume_phase.is_some()
+        || target != owner.target()
         || revision != validated.wave.spec.revision
         || sequence != validated.wave.spec.sequence
         || sequence != latest_sequence
@@ -419,11 +1369,15 @@ fn reservation_nonce(
     owner: &ControllerOwner,
     key: &crate::collaboration_capture::OperationId,
 ) -> String {
+    reservation_nonce_for(owner.target(), owner.issuer(), key)
+}
+
+fn reservation_nonce_for(target: &str, issuer: &str, key: &OperationId) -> String {
     let digest = ObjectDigest::of(
         format!(
             "aethyme local resolution reservation nonce v1\0{}\0{}\0{}",
-            owner.target(),
-            owner.issuer(),
+            target,
+            issuer,
             key.as_str()
         )
         .as_bytes(),
@@ -451,4 +1405,363 @@ fn validate_digest(value: &str) -> Result<(), BudgetError> {
         return Err(BudgetError::Invalid("managed resolution digest".into()));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::collaboration_archive::{CommitOid, RetainedContribution};
+    use crate::local_target::{self, RequestedContribution};
+    use std::cell::Cell;
+
+    thread_local! {
+        static ACKNOWLEDGEMENTS: Cell<u32> = const { Cell::new(0) };
+    }
+
+    fn acknowledge(permit: &ResolutionDispatchPermit) -> Result<(), BudgetError> {
+        assert!((1..=2).contains(&permit.shared_attempt));
+        ACKNOWLEDGEMENTS.with(|count| count.set(count.get() + 1));
+        Ok(())
+    }
+
+    fn reset_acknowledgements() {
+        ACKNOWLEDGEMENTS.with(|count| count.set(0));
+    }
+
+    fn acknowledgements() -> u32 {
+        ACKNOWLEDGEMENTS.with(Cell::get)
+    }
+
+    fn units(value: i64) -> Units {
+        Units {
+            time_ms: value,
+            memory_bytes: value,
+            disk_bytes: value,
+            model_requests: value,
+            input_tokens: value,
+            output_tokens: value,
+            spend_microunits: value,
+            slots: value,
+            previews: value,
+        }
+    }
+
+    fn reference(byte: char) -> String {
+        format!("sha256:{}", byte.to_string().repeat(64))
+    }
+
+    fn limits() -> resolution::DispatchLimits {
+        resolution::DispatchLimits {
+            max_manifest_bytes: 1 << 20,
+            max_manifest_entries: 64,
+            max_file_bytes: 1 << 20,
+            max_total_input_bytes: 4 << 20,
+            max_response_bytes: 1 << 20,
+        }
+    }
+
+    fn project_policy() -> super::super::ProjectPolicy {
+        super::super::ProjectPolicy {
+            authorization: reference('7'),
+            price_profile: reference('8'),
+            cap: units(10_000),
+            recovery_headroom: units(100),
+            mandatory_headroom: units(100),
+            max_root_reservations: 32,
+        }
+    }
+
+    fn conflict_fixture() -> (local_target::tests::Fixture, ControllerOwner, Wave) {
+        let mut fixture = local_target::tests::Fixture::new();
+        let base = fixture.a.base.commit.clone();
+        local_target::tests::git(
+            fixture._repo.path(),
+            &["switch", "-qc", "managed-conflict", base.as_str()],
+        );
+        std::fs::write(fixture._repo.path().join("one.txt"), "incompatible\n").unwrap();
+        local_target::tests::git(
+            fixture._repo.path(),
+            &["commit", "-qam", "conflicting edit"],
+        );
+        let tip = CommitOid::parse(&local_target::tests::git(
+            fixture._repo.path(),
+            &["rev-parse", "HEAD"],
+        ))
+        .unwrap();
+        let conflict: RetainedContribution =
+            archive::retain_contribution(&mut fixture.store, fixture._repo.path(), &base, &tip)
+                .unwrap();
+
+        let mut spec = fixture.spec();
+        spec.contributions.push(RequestedContribution {
+            id: "C".into(),
+            lineage: conflict.lineage_record_id.to_string(),
+            requires: Vec::new(),
+            atomic_group: None,
+            revision_of: None,
+            derived_from: Vec::new(),
+        });
+        spec.selected = vec!["A".into(), "C".into()];
+        let owner =
+            local_target::acquire_controller(&mut fixture.store, "target", "appointed").unwrap();
+        let revision = local_target::propose_revision(&mut fixture.store, &owner, spec).unwrap();
+        local_target::select_revision(&mut fixture.store, &owner, &revision.id).unwrap();
+        configure_project(&mut fixture.store, &owner, project_policy()).unwrap();
+        authorize_objective(&mut fixture.store, &owner, units(5_000)).unwrap();
+        local_wave::available(&mut fixture.store, &owner, "A", 0).unwrap();
+        local_wave::available(&mut fixture.store, &owner, "C", 1).unwrap();
+        let admission = local_wave::admit(
+            &mut fixture.store,
+            &owner,
+            local_wave::WavePolicy {
+                debounce_ms: 0,
+                ..local_wave::WavePolicy::default()
+            },
+            1,
+        )
+        .unwrap();
+        let local_wave::Admission::Frozen(wave) = admission else {
+            panic!("expected frozen conflict wave, got {admission:?}");
+        };
+        let wave = local_wave::compose_with_source(
+            &mut fixture.store,
+            &owner,
+            fixture._repo.path(),
+            &wave.id,
+        )
+        .unwrap()
+        .wave;
+        assert_eq!(wave.phase, WavePhase::Blocked);
+        assert!(wave.resolution_request.is_some());
+        assert!(wave.composition_source.is_some());
+        (fixture, owner, wave)
+    }
+
+    fn command(store: &CollaborationStore, wave: &Wave) -> ManagedResolutionCommand {
+        ManagedResolutionCommand {
+            wave: wave.id.clone(),
+            expected_version: local_target::status(store, &wave.spec.target)
+                .unwrap()
+                .version,
+            request: wave.resolution_request.clone().unwrap(),
+            source: wave.composition_source.clone().unwrap(),
+            client_key: OperationId::mint().unwrap(),
+            envelope: units(10),
+            limits: limits(),
+            deadline_ms: wall_clock_ms().unwrap() + 60_000,
+        }
+    }
+
+    type WriteSnapshot = (i64, i64, i64, i64, i64, i64, i64, i64);
+
+    fn write_snapshot(store: &CollaborationStore, target: &str) -> WriteSnapshot {
+        store
+            .read_connection()
+            .query_row(
+                "SELECT
+                    (SELECT count(*) FROM local_budget_reservations),
+                    (SELECT count(*) FROM resolution_attempts),
+                    (SELECT count(*) FROM local_resolution_reservation_proofs),
+                    (SELECT count(*) FROM local_resolution_reservation_roots),
+                    (SELECT count(*) FROM local_managed_resolution_attempt_bindings),
+                    (SELECT count(*) FROM object_pins WHERE holder LIKE 'resolution:%'),
+                    (SELECT count(*) FROM reader_leases WHERE holder LIKE 'resolution:%'),
+                    (SELECT version FROM local_targets WHERE target=?1)",
+                [target],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                    ))
+                },
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn empty_production_registry_refuses_before_any_managed_write() {
+        let (mut fixture, owner, wave) = conflict_fixture();
+        let command = command(&fixture.store, &wave);
+        let request =
+            resolution::load_request(&mut fixture.store, fixture._repo.path(), &command.request)
+                .unwrap();
+        let (manifest, _) =
+            resolution::build_input_manifest(&fixture.store, &request, command.limits).unwrap();
+        let manifest_digest = ObjectDigest::of(&manifest);
+        assert!(archive::read_object(&fixture.store, &manifest_digest).is_err());
+        let before = write_snapshot(&fixture.store, owner.target());
+
+        let outcome = begin(&mut fixture.store, fixture._repo.path(), &owner, &command).unwrap();
+
+        assert_eq!(outcome, ManagedResolutionOutcome::AdapterUnavailable);
+        assert_eq!(write_snapshot(&fixture.store, owner.target()), before);
+        assert!(archive::read_object(&fixture.store, &manifest_digest).is_err());
+    }
+
+    #[test]
+    fn registered_test_adapter_charges_once_and_retries_are_status_only() {
+        let (mut fixture, owner, wave) = conflict_fixture();
+        let command = command(&fixture.store, &wave);
+        let before = write_snapshot(&fixture.store, owner.target());
+        reset_acknowledgements();
+        let _adapter = register_test_adapter(acknowledge);
+
+        let first = begin(&mut fixture.store, fixture._repo.path(), &owner, &command).unwrap();
+        let ManagedResolutionOutcome::DispatchAcknowledged(status) = first else {
+            panic!("expected private fake acknowledgement, got {first:?}");
+        };
+        assert_eq!(status.phase, State::CompletionPending);
+        assert_eq!(status.reservation_attempt, 1);
+        assert_eq!(status.shared_attempt, 1);
+        assert_eq!(status.async_state, "dispatching");
+        assert_eq!(acknowledgements(), 1);
+        let admitted = write_snapshot(&fixture.store, owner.target());
+        assert_eq!(admitted.0, before.0 + 1);
+        assert_eq!(admitted.1, before.1 + 1);
+        assert_eq!(admitted.2, before.2 + 1);
+        assert_eq!(admitted.3, before.3 + 2);
+        assert_eq!(admitted.4, before.4 + 1);
+
+        let retry = begin(&mut fixture.store, fixture._repo.path(), &owner, &command).unwrap();
+        assert_eq!(retry, ManagedResolutionOutcome::StatusOnly(status.clone()));
+        assert_eq!(acknowledgements(), 1);
+        assert_eq!(write_snapshot(&fixture.store, owner.target()), admitted);
+
+        let mut distinct_key = command.clone();
+        distinct_key.client_key = OperationId::mint().unwrap();
+        let held = begin(
+            &mut fixture.store,
+            fixture._repo.path(),
+            &owner,
+            &distinct_key,
+        );
+        assert!(matches!(held, Err(BudgetError::Pending)));
+        assert_eq!(acknowledgements(), 1);
+        assert_eq!(write_snapshot(&fixture.store, owner.target()), admitted);
+
+        let root =
+            crate::collaboration_state::CollaborationRoot::under_host_state(fixture._host.path());
+        let project_key =
+            crate::collaboration_state::ProjectKey::parse("local-target-test").unwrap();
+        drop(fixture.store);
+        fixture.store = CollaborationStore::open(&root, &project_key, &[]).unwrap();
+        let after_reopen = begin(
+            &mut fixture.store,
+            fixture._repo.path(),
+            &owner,
+            &distinct_key,
+        );
+        assert!(matches!(after_reopen, Err(BudgetError::Pending)));
+        assert_eq!(acknowledgements(), 1);
+        assert_eq!(write_snapshot(&fixture.store, owner.target()), admitted);
+
+        let mut changed = command.clone();
+        changed.envelope = units(11);
+        assert!(matches!(
+            begin(&mut fixture.store, fixture._repo.path(), &owner, &changed),
+            Err(BudgetError::Immutable)
+        ));
+        assert_eq!(acknowledgements(), 1);
+        assert_eq!(write_snapshot(&fixture.store, owner.target()), admitted);
+    }
+
+    #[test]
+    fn managed_charge_uses_manual_comparable_attempt_count() {
+        let (mut fixture, owner, wave) = conflict_fixture();
+        let command = command(&fixture.store, &wave);
+        let manual_key = OperationId::mint().unwrap();
+        resolution::begin_attempt(
+            &mut fixture.store,
+            fixture._repo.path(),
+            &command.request,
+            "manual-comparable-attempt",
+            manual_key.as_str(),
+            command.limits,
+        )
+        .unwrap();
+        reset_acknowledgements();
+        let _adapter = register_test_adapter(acknowledge);
+
+        let outcome = begin(&mut fixture.store, fixture._repo.path(), &owner, &command).unwrap();
+
+        let ManagedResolutionOutcome::DispatchAcknowledged(status) = outcome else {
+            panic!("expected second shared comparable attempt, got {outcome:?}");
+        };
+        assert_eq!(status.shared_attempt, 2);
+        assert_eq!(status.reservation_attempt, 1);
+        assert_eq!(acknowledgements(), 1);
+        let managed_rows: i64 = fixture
+            .store
+            .read_connection()
+            .query_row(
+                "SELECT count(*) FROM resolution_attempts
+                 WHERE resolver='local-managed-resolution' AND client_key=?1",
+                [command.client_key.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(managed_rows, 1);
+    }
+
+    #[test]
+    fn exhausted_manual_shared_cap_does_not_create_local_reservation() {
+        let (mut fixture, owner, wave) = conflict_fixture();
+        let command = command(&fixture.store, &wave);
+        for session in ["manual-first", "manual-second"] {
+            let key = OperationId::mint().unwrap();
+            resolution::begin_attempt(
+                &mut fixture.store,
+                fixture._repo.path(),
+                &command.request,
+                session,
+                key.as_str(),
+                command.limits,
+            )
+            .unwrap();
+        }
+        let before = write_snapshot(&fixture.store, owner.target());
+        reset_acknowledgements();
+        let _adapter = register_test_adapter(acknowledge);
+
+        let result = begin(&mut fixture.store, fixture._repo.path(), &owner, &command);
+
+        assert!(matches!(result, Err(BudgetError::AttemptsExhausted)));
+        assert_eq!(acknowledgements(), 0);
+        assert_eq!(write_snapshot(&fixture.store, owner.target()), before);
+    }
+
+    #[test]
+    fn binding_insert_failure_rolls_back_charge_reservation_and_retention_rows() {
+        let (mut fixture, owner, wave) = conflict_fixture();
+        let command = command(&fixture.store, &wave);
+        let before = write_snapshot(&fixture.store, owner.target());
+        fixture
+            .store
+            .connection()
+            .execute_batch(
+                "CREATE TEMP TRIGGER reject_managed_binding
+                 BEFORE INSERT ON main.local_managed_resolution_attempt_bindings
+                 BEGIN SELECT RAISE(ABORT, 'injected binding failure'); END;",
+            )
+            .unwrap();
+        reset_acknowledgements();
+        let _adapter = register_test_adapter(acknowledge);
+
+        let result = begin(&mut fixture.store, fixture._repo.path(), &owner, &command);
+
+        assert!(result.is_err());
+        assert_eq!(acknowledgements(), 0);
+        assert_eq!(write_snapshot(&fixture.store, owner.target()), before);
+        fixture
+            .store
+            .connection()
+            .execute_batch("DROP TRIGGER reject_managed_binding")
+            .unwrap();
+    }
 }
