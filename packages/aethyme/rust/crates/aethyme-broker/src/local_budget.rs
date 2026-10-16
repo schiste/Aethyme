@@ -9,9 +9,12 @@ use aethyme_contracts::experimental_v0::{FieldKind, FieldSpec, Record, RecordId,
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 
+use crate::collaboration_capture::OperationId;
 use crate::collaboration_state::CollaborationStore;
 use crate::local_target::{self as target, ControllerOwner, Phase, TargetError};
 use crate::local_wave::{self as wave, WavePhase};
+
+mod managed_resolution;
 
 const SCHEMA_NAME: &str = "aethyme.local-budget/provisional-v0";
 static SCHEMA: RecordSchema = RecordSchema {
@@ -291,6 +294,45 @@ pub struct NonceLookupStatus {
     pub matches: Vec<ReservationStatus>,
 }
 
+/// Immutable command identity for the Local managed-resolution entrypoint.
+/// Every submitted reference is re-read and checked against the current owner
+/// and wave before a new budget attempt can be admitted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManagedResolutionCommand {
+    pub wave: RecordId,
+    pub expected_version: i64,
+    pub request: crate::resolution::RecordRef,
+    pub source: crate::resolution::RecordRef,
+    pub client_key: OperationId,
+    pub envelope: Units,
+    pub limits: crate::resolution::DispatchLimits,
+    pub deadline_ms: i64,
+}
+
+/// Status returned for an existing managed key. It reports the retained
+/// ledger state only; it never carries a permit or authorizes redispatch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ManagedResolutionStatus {
+    pub reservation: String,
+    pub phase: State,
+    pub reservation_attempt: u32,
+    pub reservation_version: i64,
+    pub shared_attempt: u32,
+    pub async_state: String,
+    pub outcome: Option<String>,
+}
+
+/// Result of asking the validated Local managed-resolution route to start.
+/// This build registers no production adapter, so new commands return
+/// `AdapterUnavailable` before any reservation or shared charge is written.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum ManagedResolutionOutcome {
+    AdapterUnavailable,
+    StatusOnly(ManagedResolutionStatus),
+    StaleUnknown,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NonceLookupOutcome {
@@ -360,6 +402,8 @@ pub enum BudgetError {
     Wave(#[from] wave::WaveError),
     #[error(transparent)]
     Sensitive(#[from] crate::collaboration_sensitive::SensitiveError),
+    #[error(transparent)]
+    Resolution(#[from] crate::resolution::ResolutionError),
     #[error(transparent)]
     Sqlite(#[from] rusqlite::Error),
     #[error(transparent)]
