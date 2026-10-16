@@ -24,7 +24,7 @@ fn wave_error(error: local_wave::WaveError) -> Failure {
     use local_wave::WaveError;
     match error {
         WaveError::Target(error) => target_error(error),
-        WaveError::Resolution(error) => self::error(error),
+        WaveError::Resolution(error) => self::error(*error),
         WaveError::ResolutionUnsupported => {
             Failure::domain("unsupported_profile", error.to_string())
         }
@@ -344,7 +344,7 @@ mod tests {
         let failure = wave_error(local_wave::WaveError::Sqlite(rusqlite::Error::InvalidQuery));
         assert_eq!(failure.code, "sqlite");
         assert_eq!(failure.exit, super::super::exit_status::FAILED);
-        let invalid = wave_error(local_wave::WaveError::Resolution(
+        let invalid = wave_error(local_wave::WaveError::from(
             resolution_api::ResolutionError::InvalidRequest("mismatched request".into()),
         ));
         assert_eq!(invalid.code, "invalid_request");
