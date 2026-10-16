@@ -40,8 +40,9 @@ gone. A deadline leaves resumable journal work. Unavailable registry or
 filesystem inspection leaves the candidate pending. A deletion I/O error is
 currently reported and retires that candidate from the journal; the saved root
 can be discovered by a fresh plan. Conclusively changed authority is retired
-with a visible failure and no deletion; an operator can review a fresh plan. Lost history requires independent recovery and may cause a
-fresh plan to omit the root. Queue completion does not imply that every
+with a visible failure and no deletion; an operator can review a fresh plan.
+Lost history requires independent recovery and may cause a fresh plan to omit
+the root. Queue completion does not imply that every
 candidate was removed: callers must inspect failures and removed roots.
 
 Existing unregistered roots whose origins are already missing cannot acquire

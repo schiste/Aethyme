@@ -97,7 +97,6 @@ mod homebrew;
 pub mod hooks;
 mod host_operations;
 mod host_state;
-mod worktree_registry;
 pub mod init;
 pub mod insights;
 pub mod install_health;
@@ -125,6 +124,7 @@ mod operation_stats;
 mod operations;
 mod overlap_pairs;
 mod ownership;
+mod worktree_registry;
 pub use ownership::{
     MAX_OWNERSHIP_CLAIM_NAME_CHARS, OwnershipClaim, OwnershipClaimReport, OwnershipClaimView,
 };
