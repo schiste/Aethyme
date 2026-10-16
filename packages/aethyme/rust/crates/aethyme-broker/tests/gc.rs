@@ -637,13 +637,55 @@ fn locked_runtime_file_is_retained_and_resumable() {
 
 #[test]
 fn ephemeral_repositories_never_anchor_worktrees_in_durable_host_state() {
-    let (tmp, _broker, _id, worktree) = fixture();
+    const CHILD_ENV: &str = "AETHYME_TEST_DEFAULT_EPHEMERAL_PLACEMENT";
+    if std::env::var_os(CHILD_ENV).is_none() {
+        let private_home = tempfile::tempdir().unwrap();
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "ephemeral_repositories_never_anchor_worktrees_in_durable_host_state",
+                "--nocapture",
+            ])
+            .env(CHILD_ENV, "1")
+            .env("HOME", private_home.path())
+            .env_remove("AETHYME_WORKTREE_ROOT")
+            .env_remove("AETHYME_HOST_STATE_DIR")
+            .env_remove("XDG_STATE_HOME")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "default-placement child failed: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    // This tests the production default. The shared fixture intentionally
+    // supplies a library override and therefore cannot exercise that default.
+    let tmp = Fixture::new();
+    git(tmp.path(), &["init", "-q", "-b", "main"]);
+    std::fs::write(tmp.path().join("README.md"), "fixture\n").unwrap();
+    git(tmp.path(), &["add", "README.md"]);
+    git(tmp.path(), &["commit", "-qm", "init"]);
+    let mut broker = Broker::open(tmp.path())
+        .unwrap()
+        .with_host_operation_database(tmp._root.path().join("host-operations.db"));
+    let session = broker
+        .start_worktree("default ephemeral placement", None)
+        .unwrap();
     let repo = tmp.path().canonicalize().unwrap();
-    let worktree = worktree.canonicalize().unwrap();
+    let worktree = PathBuf::from(session.worktree_path).canonicalize().unwrap();
     assert!(
         worktree.starts_with(&repo),
         "a temp-dir repository must keep its worktrees repo-local so they die with it, got {}",
         worktree.display()
+    );
+    drop(broker);
+    drop(tmp);
+    assert!(
+        !worktree.exists(),
+        "default worktree must die with its fixture"
     );
 }
 
