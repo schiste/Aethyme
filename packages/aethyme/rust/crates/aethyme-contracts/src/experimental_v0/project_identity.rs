@@ -880,7 +880,7 @@ pub fn advance_file_identities(
                 continue;
             }
             changes.push(FileChange {
-                before,
+                before: None,
                 after: Some(after.clone()),
                 relation: *relation,
                 derived_from: derived_from.clone(),
