@@ -789,7 +789,7 @@ fn settled_synthesized_attempt_attaches_and_prepares_a_fresh_exact_gate() {
     assert_eq!(observation["selected_gates"], 1);
     assert_eq!(
         observation["candidate"]["commit"],
-        synthesis.candidate.commit
+        synthesis.candidate.commit.as_str()
     );
     assert_eq!(observation["candidate"]["tree"], synthesis.candidate.tree);
     assert_eq!(
@@ -801,7 +801,7 @@ fn settled_synthesized_attempt_attaches_and_prepares_a_fresh_exact_gate() {
     let gate_log =
         std::fs::read_to_string(observation["gates"][0]["log_path"].as_str().unwrap()).unwrap();
     assert!(
-        gate_log.contains(&synthesis.candidate.commit),
+        gate_log.contains(synthesis.candidate.commit.as_str()),
         "fresh gate log must name the synthesized candidate commit"
     );
     assert_eq!(git(repo.as_path(), &["show-ref"]), refs_before_gate);
