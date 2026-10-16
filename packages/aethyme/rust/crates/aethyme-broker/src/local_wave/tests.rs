@@ -78,6 +78,71 @@ fn rewrite_source_record(
     }
 }
 
+fn rewrite_recipe_with_unexpected_prior_completion(
+    f: &mut Fixture,
+    owner: &ControllerOwner,
+    wave: &Wave,
+) {
+    let source_ref = wave.composition_source.as_ref().unwrap();
+    let source_bytes = archive::read_object(&f.store, &source_ref.object).unwrap();
+    let mut payload: CompositionSourcePayload = serde_json::from_slice(&source_bytes).unwrap();
+    let old_recipe = composer::RecipeRef {
+        id: id(&payload.composition.recipe.id).unwrap(),
+        object: object(&payload.composition.recipe.object).unwrap(),
+    };
+    let old_recipe_record = composer::read_recipe(&f.store, &old_recipe).unwrap();
+    let mut recipe_json: serde_json::Value =
+        serde_json::from_slice(&old_recipe_record.canonical_bytes()).unwrap();
+    recipe_json["accepted_baseline"] = serde_json::json!({
+        "completion": format!("sha256:{}", "f".repeat(64)),
+        "members": ["A"]
+    });
+    let required = composer::COMPOSITION_RECIPE_SCHEMA
+        .required_capabilities(["accepted_baseline"])
+        .iter()
+        .map(|capability| serde_json::Value::String((*capability).to_owned()))
+        .collect::<Vec<_>>();
+    recipe_json["requires"] = serde_json::Value::Array(required);
+    let recipe_record = Record::decode(
+        &serde_json::to_vec(&recipe_json).unwrap(),
+        &[&composer::COMPOSITION_RECIPE_SCHEMA],
+    )
+    .unwrap();
+    let recipe_object =
+        archive::put_object(&mut f.store, &recipe_record.canonical_bytes()).unwrap();
+    payload.composition.recipe.id = recipe_record.id().to_string();
+    payload.composition.recipe.object = recipe_object.hex();
+
+    let source_record = Record::decode(
+        &serde_json::to_vec(&payload).unwrap(),
+        &[&COMPOSITION_SOURCE_SCHEMA],
+    )
+    .unwrap();
+    let source_object =
+        archive::put_object(&mut f.store, &source_record.canonical_bytes()).unwrap();
+    let revision = id(&wave.spec.revision).unwrap();
+    target::retain_artifacts(
+        &mut f.store,
+        owner,
+        &revision,
+        &[],
+        &[recipe_object.clone(), source_object.clone()],
+    )
+    .unwrap();
+    f.store
+        .connection()
+        .execute(
+            "UPDATE local_waves SET recipe_object=?2, composition_source_record_id=?3, composition_source_object=?4 WHERE wave=?1",
+            params![
+                wave.id.as_str(),
+                recipe_object.hex(),
+                source_record.id().as_str(),
+                source_object.hex(),
+            ],
+        )
+        .unwrap();
+}
+
 fn setup(f: &mut Fixture, selected: &[&str]) -> (ControllerOwner, RecordId) {
     let owner = target::acquire_controller(&mut f.store, "target", "appointed").unwrap();
     let mut spec = f.spec();
@@ -921,6 +986,7 @@ fn tampered_composition_source_bindings_never_attach_a_request() {
         "revision",
         "candidate_commit",
         "recipe_object",
+        "producer_profile",
         "noncanonical_budget",
         "noncanonical_usage",
     ] {
@@ -931,6 +997,10 @@ fn tampered_composition_source_bindings_never_attach_a_request() {
             "revision" => payload.revision = format!("sha256:{}", "9".repeat(64)),
             "candidate_commit" => payload.composition.candidate.commit = "f".repeat(40),
             "recipe_object" => payload.composition.recipe.object = "e".repeat(64),
+            "producer_profile" => {
+                payload.composition.candidate.producer_profile =
+                    ACCEPTED_BASELINE_TEXT_PROFILE.into()
+            }
             "noncanonical_budget" => {
                 payload.request.budget.max_bytes = format!("0{}", payload.request.budget.max_bytes)
             }
@@ -950,6 +1020,65 @@ fn tampered_composition_source_bindings_never_attach_a_request() {
                 .is_none()
         );
     }
+}
+
+#[test]
+fn composition_recipe_binds_exact_prior_completion_and_members() {
+    let completion = format!("sha256:{}", "a".repeat(64));
+    let expected = serde_json::json!({"completion": completion, "members": []});
+    assert!(prior_completion_recipe_matches(
+        &serde_json::json!({"accepted_baseline": expected}),
+        Some(&expected),
+    ));
+
+    for actual in [
+        serde_json::json!({
+            "accepted_baseline": {
+                "completion": format!("sha256:{}", "b".repeat(64)),
+                "members": []
+            }
+        }),
+        serde_json::json!({
+            "accepted_baseline": {
+                "completion": completion,
+                "members": ["A"]
+            }
+        }),
+        serde_json::json!({}),
+    ] {
+        assert!(
+            !prior_completion_recipe_matches(&actual, Some(&expected)),
+            "mismatched accepted-baseline provenance must be rejected: {actual}"
+        );
+    }
+    assert!(prior_completion_recipe_matches(
+        &serde_json::json!({}),
+        None
+    ));
+    assert!(!prior_completion_recipe_matches(
+        &serde_json::json!({"accepted_baseline": expected}),
+        None,
+    ));
+}
+
+#[test]
+fn composition_source_rejects_unexpected_prior_recipe_with_matching_archive_refs() {
+    let mut f = Fixture::new();
+    let (owner, wave) = composed_candidate(&mut f);
+    let repo = f._repo.path().to_path_buf();
+    rewrite_recipe_with_unexpected_prior_completion(&mut f, &owner, &wave);
+
+    let error = compose_with_source(&mut f.store, &owner, &repo, &wave.id).unwrap_err();
+    assert!(
+        matches!(&error, WaveError::Invalid(detail) if detail.contains("prior completion")),
+        "the exact prior-completion recipe guard should reject the reconstructed refs: {error:?}"
+    );
+    assert!(
+        load(&f.store, &wave.id)
+            .unwrap()
+            .resolution_request
+            .is_none()
+    );
 }
 
 #[test]

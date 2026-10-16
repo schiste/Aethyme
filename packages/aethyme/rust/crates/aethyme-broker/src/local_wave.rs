@@ -25,6 +25,7 @@ use crate::resolution::{self, FailedCheck, RequirementRef};
 
 const COMPOSITION_SOURCE_SCHEMA_NAME: &str = "aethyme.local-composition-source/experimental-v0";
 const COMPOSITION_SOURCE_MAX_BYTES: usize = 1 << 20;
+const ACCEPTED_BASELINE_TEXT_PROFILE: &str = "aethyme.compose.git-merge-file/accepted-baseline-v0";
 
 const SCHEMA_NAME: &str = "aethyme.local-wave/provisional-v0";
 static SCHEMA: RecordSchema = RecordSchema {
@@ -754,7 +755,10 @@ fn source_from_payload(
         || payload.profile != composer::PROVISIONAL_TEXT_PROFILE
         || payload.composition.outcome != "candidate"
         || payload.composition.candidate.producer_kind != "composer"
-        || payload.composition.candidate.producer_profile != composer::PROVISIONAL_TEXT_PROFILE
+        || !matches!(
+            payload.composition.candidate.producer_profile.as_str(),
+            composer::PROVISIONAL_TEXT_PROFILE | ACCEPTED_BASELINE_TEXT_PROFILE
+        )
         || payload.composition.candidate.baseline_source != composer::COMPOSER_BASELINE_SOURCE
         || payload.composition.candidate.mode != "text"
     {
@@ -868,6 +872,36 @@ fn expected_composition_request(
     })
 }
 
+fn expected_source_provenance(
+    store: &CollaborationStore,
+    owner: &ControllerOwner,
+    wave: &Wave,
+) -> Result<(&'static str, Option<serde_json::Value>), WaveError> {
+    let Some(key) = &wave.spec.prior_completion else {
+        return Ok((composer::PROVISIONAL_TEXT_PROFILE, None));
+    };
+    let (completion, previous) = accepted_completion(store, &id(key)?, wave.spec.sequence)?;
+    if completion.target != owner.target() || completion.epoch != owner.authority_epoch().as_str() {
+        return Err(WaveError::Stale);
+    }
+    let members = if completion.revision == wave.spec.revision {
+        previous.selected
+    } else {
+        Vec::new()
+    };
+    Ok((
+        ACCEPTED_BASELINE_TEXT_PROFILE,
+        Some(serde_json::json!({"completion": key, "members": members})),
+    ))
+}
+
+fn prior_completion_recipe_matches(
+    recipe: &serde_json::Value,
+    expected: Option<&serde_json::Value>,
+) -> bool {
+    recipe.get("accepted_baseline") == expected
+}
+
 fn requirement_payloads(requirements: &[RequirementRef]) -> Vec<RequirementPayload> {
     requirements
         .iter()
@@ -898,6 +932,8 @@ fn validate_source_context(
         return Err(WaveError::Stale);
     }
     let expected = expected_composition_request(store, owner, wave, pinned)?;
+    let (expected_producer_profile, expected_prior_completion) =
+        expected_source_provenance(store, owner, wave)?;
     if source.request.baseline != expected.baseline
         || source.request.accepted != expected.accepted
         || source.request.catalog != expected.catalog
@@ -939,7 +975,7 @@ fn validate_source_context(
         || wave.recipe_object.as_ref() != Some(&recipe.object)
         || source.record != *wave.composition_source.as_ref().ok_or(WaveError::Stale)?
         || candidate.baseline != source.request.baseline
-        || candidate.producer.profile() != payload.profile
+        || candidate.producer.profile() != expected_producer_profile
         || candidate.mode != CompositionMode::Text
         || candidate.baseline_source != composer::COMPOSER_BASELINE_SOURCE
         || archive::raw_commit_tree(repo, &candidate.commit)? != candidate.tree
@@ -956,6 +992,11 @@ fn validate_source_context(
     }
     let recipe_record = composer::read_recipe(store, recipe)?;
     let recipe_json: serde_json::Value = serde_json::from_slice(&recipe_record.canonical_bytes())?;
+    if !prior_completion_recipe_matches(&recipe_json, expected_prior_completion.as_ref()) {
+        return Err(WaveError::Invalid(
+            "composition recipe prior completion does not match the wave".into(),
+        ));
+    }
     if recipe_json["candidate"].as_str() != Some(candidate.subject.as_str())
         || recipe_json["candidate_commit"].as_str() != Some(candidate.commit.as_str())
         || recipe_json["baseline_commit"].as_str() != Some(source.request.baseline.as_str())
