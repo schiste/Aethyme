@@ -1,4 +1,49 @@
 use super::*;
+use std::io::Read;
+
+const WORKTREE_OWNERSHIP_WITNESS_MAX_BYTES: u64 = 8 * 1024;
+
+/// Read the two small files used as ownership witnesses without following a
+/// replacement symlink or blocking on a FIFO. A witness that is not a
+/// bounded regular file is a conclusive non-match; other I/O errors remain
+/// unavailable so callers can preserve their retry state.
+fn read_bounded_ownership_witness(path: &Path) -> Result<Option<Vec<u8>>, GitError> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // FILE_FLAG_OPEN_REPARSE_POINT: open the reparse point itself so the
+        // handle metadata below can reject it without following its target.
+        options.custom_flags(0x0020_0000);
+    }
+    let file = match options.open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        #[cfg(unix)]
+        Err(error) if error.raw_os_error() == Some(libc::ELOOP) => return Ok(None),
+        Err(error) => return Err(ownership_inspection_error(path, "open", error)),
+    };
+    let metadata = file
+        .metadata()
+        .map_err(|error| ownership_inspection_error(path, "inspect opened", error))?;
+    if !metadata.file_type().is_file() || metadata.len() > WORKTREE_OWNERSHIP_WITNESS_MAX_BYTES {
+        return Ok(None);
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take(WORKTREE_OWNERSHIP_WITNESS_MAX_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| ownership_inspection_error(path, "read", error))?;
+    if bytes.len() as u64 > WORKTREE_OWNERSHIP_WITNESS_MAX_BYTES {
+        return Ok(None);
+    }
+    Ok(Some(bytes))
+}
 
 fn ownership_inspection_error(path: &Path, action: &str, error: std::io::Error) -> GitError {
     GitError::UntrustedOutput {
@@ -30,14 +75,12 @@ impl Broker {
     ) -> Result<bool, GitError> {
         let expected = self.main_git_common_dir()?;
         let pointer_path = path.join(".git");
-        match std::fs::symlink_metadata(&pointer_path) {
-            Ok(metadata) if metadata.file_type().is_file() => {}
-            Ok(_) => return Ok(false),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-            Err(error) => return Err(ownership_inspection_error(&pointer_path, "inspect", error)),
-        }
-        let pointer = std::fs::read_to_string(&pointer_path)
-            .map_err(|error| ownership_inspection_error(&pointer_path, "read", error))?;
+        let Some(pointer) = read_bounded_ownership_witness(&pointer_path)? else {
+            return Ok(false);
+        };
+        let Ok(pointer) = std::str::from_utf8(&pointer) else {
+            return Ok(false);
+        };
         let Some(gitdir) = pointer.trim().strip_prefix("gitdir:") else {
             return Ok(false);
         };
@@ -83,14 +126,9 @@ impl Broker {
         root: &Path,
     ) -> Result<bool, GitError> {
         let marker_path = root.join(WORKTREE_ROOT_MARKER);
-        match std::fs::symlink_metadata(&marker_path) {
-            Ok(metadata) if metadata.file_type().is_file() => {}
-            Ok(_) => return Ok(false),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-            Err(error) => return Err(ownership_inspection_error(&marker_path, "inspect", error)),
-        }
-        let bytes = std::fs::read(&marker_path)
-            .map_err(|error| ownership_inspection_error(&marker_path, "read", error))?;
+        let Some(bytes) = read_bounded_ownership_witness(&marker_path)? else {
+            return Ok(false);
+        };
         let Ok(marker) = serde_json::from_slice::<WorktreeRootMarker>(&bytes) else {
             return Ok(false);
         };
@@ -1541,5 +1579,58 @@ impl Broker {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod ownership_witness_tests {
+    use super::{WORKTREE_OWNERSHIP_WITNESS_MAX_BYTES, read_bounded_ownership_witness};
+    #[cfg(unix)]
+    use std::time::Duration;
+
+    #[test]
+    fn ownership_witness_reads_are_size_bounded() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("marker");
+        std::fs::write(&path, b"small marker").unwrap();
+        assert_eq!(
+            read_bounded_ownership_witness(&path).unwrap().as_deref(),
+            Some(&b"small marker"[..])
+        );
+
+        std::fs::write(
+            &path,
+            vec![b'x'; WORKTREE_OWNERSHIP_WITNESS_MAX_BYTES as usize + 1],
+        )
+        .unwrap();
+        assert!(read_bounded_ownership_witness(&path).unwrap().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ownership_witness_open_rejects_symlinks_and_does_not_block_on_fifos() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("target");
+        let linked = temp.path().join("linked-marker");
+        std::fs::write(&target, b"target marker").unwrap();
+        symlink(&target, &linked).unwrap();
+        assert!(read_bounded_ownership_witness(&linked).unwrap().is_none());
+
+        let fifo = temp.path().join("fifo-marker");
+        let output = std::process::Command::new("/usr/bin/mkfifo")
+            .arg(&fifo)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            assert!(sender.send(read_bounded_ownership_witness(&fifo)).is_ok());
+        });
+        assert!(matches!(
+            receiver.recv_timeout(Duration::from_secs(1)),
+            Ok(Ok(None))
+        ));
     }
 }
