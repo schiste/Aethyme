@@ -796,7 +796,7 @@ pub fn compose(
     repo: &Path,
     wave_id: &RecordId,
 ) -> Result<Wave, WaveError> {
-    let (wave, request, already_delivered) = {
+    let (wave, request, already_delivered, revision_bindings, namespace_conflict) = {
         let _archive_guard = archive_use(store)?;
         let response_guard = crate::collaboration_sensitive::response_use(store)?;
         let _authority_guard = target::authorize(store, owner)?;
@@ -813,6 +813,17 @@ pub fn compose(
             &id(&wave.spec.revision)?,
             &response_guard,
         )?;
+        let namespace_conflict =
+            match target::validate_d10_file_namespace(store, &pinned, &wave.spec.selected) {
+                Ok(()) => None,
+                Err(TargetError::FileNamespaceConflict(detail)) => Some(detail),
+                Err(error) => return Err(error.into()),
+            };
+        let revision_bindings = pinned
+            .revision_bindings
+            .as_ref()
+            .map(target::D10RevisionBindings::revision_ids)
+            .transpose()?;
         let baseline = archive::retained(store, &snapshot(&wave.spec.baseline)?)?
             .ok_or(TargetError::Missing)?;
         let (base_commit, accepted, already_delivered) = if let Some(key) =
@@ -869,7 +880,13 @@ pub fn compose(
                 ..CompositionBudget::default()
             },
         };
-        (wave, request, already_delivered)
+        (
+            wave,
+            request,
+            already_delivered,
+            revision_bindings,
+            namespace_conflict,
+        )
     };
     let started = std::time::Instant::now();
     let revision_id = id(&wave.spec.revision)?;
@@ -907,17 +924,50 @@ pub fn compose(
             )
             .map_err(|error| composer::ComposeError::CandidateRetention(error.to_string()))
         };
-    let result = if let Some((completion, members)) = already_delivered {
-        composer::compose_after_accepted_with_candidate_retainer(
+    let result = if let Some(detail) = namespace_conflict {
+        Ok(composer::Composition {
+            outcome: crate::composition::CompositionOutcome::Refused {
+                reason: crate::composition::Refusal::FileNamespaceConflict,
+                detail,
+            },
+            recipe: None,
+            order: Vec::new(),
+            usage: composer::BudgetUsage::default(),
+        })
+    } else {
+        match (already_delivered, revision_bindings.as_ref()) {
+        (Some((completion, members)), Some(revisions)) => {
+            composer::compose_after_accepted_with_candidate_retainer_and_revisions(
+                store,
+                repo,
+                &request,
+                completion,
+                members,
+                revisions,
+                &mut retain_candidate,
+            )
+        }
+        (Some((completion, members)), None) => {
+            composer::compose_after_accepted_with_candidate_retainer(
+                store,
+                repo,
+                &request,
+                completion,
+                members,
+                &mut retain_candidate,
+            )
+        }
+        (None, Some(revisions)) => composer::compose_with_candidate_retainer_and_revisions(
             store,
             repo,
             &request,
-            completion,
-            members,
+            revisions,
             &mut retain_candidate,
-        )
-    } else {
-        composer::compose_with_candidate_retainer(store, repo, &request, &mut retain_candidate)
+        ),
+        (None, None) => {
+            composer::compose_with_candidate_retainer(store, repo, &request, &mut retain_candidate)
+        }
+        }
     };
     let elapsed = i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX);
     // State may have been stopped while the external Git tool ran. Retain the

@@ -22,6 +22,9 @@ use crate::collaboration_gc::archive_use;
 use crate::collaboration_state::CollaborationStore;
 use crate::file_lock::{ExclusiveFileLock, open_lock_file};
 
+mod revision;
+pub use revision::{D10RevisionBindings, D10RevisionPin, D10_TARGET_PROFILE};
+
 pub const TARGET_REVISION_SCHEMA_NAME: &str = "aethyme.target-revision/provisional-v0";
 
 pub static TARGET_REVISION_SCHEMA: RecordSchema = RecordSchema {
@@ -42,6 +45,12 @@ pub static TARGET_REVISION_SCHEMA: RecordSchema = RecordSchema {
         FieldSpec {
             name: "spec",
             required: true,
+            kind: FieldKind::Opaque,
+            capability: None,
+        },
+        FieldSpec {
+            name: "revision_bindings",
+            required: false,
             kind: FieldKind::Opaque,
             capability: None,
         },
@@ -103,6 +112,7 @@ pub struct TargetRevision {
     pub target: String,
     pub issuer: String,
     pub spec: TargetSpec,
+    pub revision_bindings: Option<D10RevisionBindings>,
 }
 
 /// The full model, including later acceptance phases. The current runtime
@@ -261,6 +271,10 @@ pub enum TargetError {
     StaleVersion,
     #[error("trusted verification/provider integration is unavailable")]
     VerificationUnavailable,
+    #[error("trusted project identity binding is unavailable for D10 revisions")]
+    RevisionBindingUnsupported,
+    #[error("D10 selected inputs have a FileId namespace conflict: {0}")]
+    FileNamespaceConflict(String),
     #[error("released revisions cannot be selected; authorize a new revision")]
     Released,
     #[error("corrupt target state: {0}")]
@@ -383,7 +397,14 @@ fn validate_owner_issuer(
     Ok(())
 }
 
-fn normalize(mut spec: TargetSpec) -> Result<TargetSpec, TargetError> {
+fn normalize(spec: TargetSpec) -> Result<TargetSpec, TargetError> {
+    normalize_with_d10(spec, false)
+}
+
+fn normalize_with_d10(
+    mut spec: TargetSpec,
+    allow_duplicate_lineage: bool,
+) -> Result<TargetSpec, TargetError> {
     nonempty(&spec.objective, "objective")?;
     nonempty(&spec.composer_profile, "composer profile")?;
     record_id(&spec.objective_authorization)?;
@@ -429,7 +450,7 @@ fn normalize(mut spec: TargetSpec) -> Result<TargetSpec, TargetError> {
     }
     // Different aliases for the same exact input must not grant two obligations.
     let lineages: BTreeSet<_> = spec.contributions.iter().map(|c| &c.lineage).collect();
-    if lineages.len() != catalog.len() {
+    if !allow_duplicate_lineage && lineages.len() != catalog.len() {
         return Err(TargetError::Invalid("duplicate lineage alias".into()));
     }
     for id in &selected {
@@ -456,7 +477,22 @@ pub(crate) fn validate_proposal(
     store: &CollaborationStore,
     spec: TargetSpec,
 ) -> Result<TargetSpec, TargetError> {
-    let spec = normalize(spec)?;
+    validate_proposal_inner(store, spec, false)
+}
+
+fn validate_d10_proposal(
+    store: &CollaborationStore,
+    spec: TargetSpec,
+) -> Result<TargetSpec, TargetError> {
+    validate_proposal_inner(store, spec, true)
+}
+
+fn validate_proposal_inner(
+    store: &CollaborationStore,
+    spec: TargetSpec,
+    allow_duplicate_lineage: bool,
+) -> Result<TargetSpec, TargetError> {
+    let spec = normalize_with_d10(spec, allow_duplicate_lineage)?;
     let _archive = archive_use(store)?;
     require_snapshot(store, &spec.baseline)?;
     for c in &spec.contributions {
@@ -491,12 +527,54 @@ pub fn propose_revision(
     owner: &ControllerOwner,
     spec: TargetSpec,
 ) -> Result<TargetRevision, TargetError> {
+    propose_revision_inner(store, owner, spec, None)
+}
+
+/// Propose an experimental D10 target whose selected aliases each pin one
+/// immutable contribution revision. The selected revision set is recorded in
+/// the outer target hash; the existing TargetSpec and legacy capture IDs stay
+/// unchanged.
+pub fn propose_revision_with_d10_bindings(
+    store: &mut CollaborationStore,
+    owner: &ControllerOwner,
+    spec: TargetSpec,
+    bindings: D10RevisionBindings,
+) -> Result<TargetRevision, TargetError> {
+    propose_revision_inner(store, owner, spec, Some(bindings))
+}
+
+fn propose_revision_inner(
+    store: &mut CollaborationStore,
+    owner: &ControllerOwner,
+    spec: TargetSpec,
+    bindings: Option<D10RevisionBindings>,
+) -> Result<TargetRevision, TargetError> {
     let _authority = authorize(store, owner)?;
     let _archive = archive_use(store)?;
-    let spec = validate_proposal(store, spec)?;
-    let record = Record::decode(&serde_json::to_vec(&serde_json::json!({
-        "schema": TARGET_REVISION_SCHEMA_NAME, "target": owner.target, "issuer": owner.issuer, "spec": spec,
-    }))?, &[&TARGET_REVISION_SCHEMA]).map_err(|e| TargetError::Invalid(e.to_string()))?;
+    let spec = if bindings.is_some() {
+        validate_d10_proposal(store, spec)?
+    } else {
+        validate_proposal(store, spec)?
+    };
+    let loaded = bindings
+        .map(|bindings| revision::validate_bindings(store, &spec, bindings))
+        .transpose()?;
+    let mut body = serde_json::json!({
+        "schema": TARGET_REVISION_SCHEMA_NAME,
+        "target": owner.target,
+        "issuer": owner.issuer,
+        "spec": spec,
+    });
+    if let Some(loaded) = &loaded {
+        body.as_object_mut()
+            .expect("target record is an object")
+            .insert(
+                "revision_bindings".into(),
+                serde_json::to_value(&loaded.bindings)?,
+            );
+    }
+    let record = Record::decode(&serde_json::to_vec(&body)?, &[&TARGET_REVISION_SCHEMA])
+        .map_err(|e| TargetError::Invalid(e.to_string()))?;
     let id = record.id();
     let tx = store
         .connection()
@@ -534,12 +612,21 @@ pub fn propose_revision(
             (id.as_str(), &c.id, status),
         )?;
     }
+    if let Some(loaded) = &loaded {
+        for digest in &loaded.object_digests {
+            tx.execute(
+                "INSERT OR IGNORE INTO local_target_roots VALUES (?1, 'object', ?2)",
+                (id.as_str(), digest.hex()),
+            )?;
+        }
+    }
     tx.commit()?;
     Ok(TargetRevision {
         id,
         target: owner.target.clone(),
         issuer: owner.issuer.clone(),
         spec,
+        revision_bindings: loaded.map(|loaded| loaded.bindings),
     })
 }
 
@@ -550,6 +637,23 @@ pub fn load_revision(
 ) -> Result<TargetRevision, TargetError> {
     let _response = crate::collaboration_sensitive::response_use(store)?;
     load_revision_under_response(store, id, &_response)
+}
+
+/// Revalidate selected D10 transitions against the approved project history
+/// before the legacy composer can collapse equal capture lineages. A repeated
+/// logical operation is considered once only when its full transition is
+/// byte-for-byte equivalent; divergent transitions under one logical ID are
+/// refused.
+pub(crate) fn validate_d10_file_namespace(
+    store: &CollaborationStore,
+    pinned: &TargetRevision,
+    selected: &[String],
+) -> Result<(), TargetError> {
+    let Some(bindings) = &pinned.revision_bindings else {
+        return Ok(());
+    };
+    let loaded = revision::validate_bindings(store, &pinned.spec, bindings.clone())?;
+    revision::validate_selected_identity_transitions(selected, &loaded.identity_transitions)
 }
 
 /// Read a revision while the caller already holds the response-use barrier.
@@ -586,14 +690,41 @@ pub(crate) fn load_revision_under_response(
         .ok_or_else(|| TargetError::Corrupt("issuer".into()))?
         .to_string();
     let spec: TargetSpec = serde_json::from_value(json["spec"].clone())?;
-    if normalize(spec.clone())? != spec {
+    let has_revision_bindings = json.get("revision_bindings").is_some();
+    if normalize_with_d10(spec.clone(), has_revision_bindings)? != spec {
         return Err(TargetError::Corrupt("unnormalized target".into()));
     }
+    let revision_bindings = match json.get("revision_bindings") {
+        None => None,
+        Some(serde_json::Value::Null) => {
+            return Err(TargetError::Corrupt("null D10 revision bindings".into()));
+        }
+        Some(value) => {
+            let bindings: D10RevisionBindings = serde_json::from_value(value.clone())?;
+            if bindings
+                .revisions
+                .windows(2)
+                .any(|pair| pair[0].contribution >= pair[1].contribution)
+            {
+                return Err(TargetError::Corrupt(
+                    "D10 contribution mappings are not strictly sorted".into(),
+                ));
+            }
+            let loaded = revision::validate_bindings(store, &spec, bindings.clone())?;
+            if loaded.bindings != bindings {
+                return Err(TargetError::Corrupt(
+                    "D10 contribution mappings are not sorted".into(),
+                ));
+            }
+            Some(loaded.bindings)
+        }
+    };
     Ok(TargetRevision {
         id: id.clone(),
         target,
         issuer,
         spec,
+        revision_bindings,
     })
 }
 

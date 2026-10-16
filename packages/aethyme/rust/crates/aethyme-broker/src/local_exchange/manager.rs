@@ -81,8 +81,30 @@ fn pin(tx: &Transaction<'_>, digest: &ObjectDigest, holder: &str) -> Result<(), 
     tx.execute("INSERT INTO object_pins(class,object_sha256,holder,created_ms) VALUES('cited_evidence',?1,?2,?3)",params![digest.hex(),holder,now()?])?;
     Ok(())
 }
+fn pin_revision_event_objects(
+    tx: &Transaction<'_>,
+    binding: &RecordId,
+    stream: &RecordId,
+    sequence: u64,
+    objects: &[ObjectDigest],
+) -> Result<(), ExchangeError> {
+    for (index, digest) in objects.iter().enumerate() {
+        pin(
+            tx,
+            digest,
+            &format!(
+                "exchange-revision-event:{}:{}:{}:{}",
+                binding.as_str(),
+                stream.as_str(),
+                sequence,
+                index
+            ),
+        )?;
+    }
+    Ok(())
+}
 fn packet_from(body: &[u8], expected: &str) -> Result<Metadata, ExchangeError> {
-    if body.len() > MAX_PACKET_BYTES {
+    if body.len() > MAX_REVISION_PACKET_BYTES {
         return Err(ExchangeError::Limit);
     }
     let rec = Record::decode(body, &[&PACKET])?;
@@ -92,9 +114,15 @@ fn packet_from(body: &[u8], expected: &str) -> Result<Metadata, ExchangeError> {
     let value: serde_json::Value = serde_json::from_slice(body)?;
     let packet: Metadata = serde_json::from_value(value["spec"].clone())?;
     packet.validate()?;
+    if body.len() > packet.wire_limit() {
+        return Err(ExchangeError::Limit);
+    }
     Ok(packet)
 }
 fn event_from(body: &[u8], expected: &str) -> Result<Event, ExchangeError> {
+    if body.len() > MAX_REVISION_PACKET_BYTES {
+        return Err(ExchangeError::Limit);
+    }
     let rec = Record::decode(body, &[&EVENT])?;
     if rec.id().as_str() != expected || rec.canonical_bytes() != body {
         return Err(invalid("stored event identity"));
@@ -275,6 +303,12 @@ impl CurrentPeer<'_> {
                             v == p || v.strip_prefix(p).is_some_and(|rest| rest.starts_with('/'))
                         })
                     }) => {}
+                Metadata::RevisionContribution { scope, .. }
+                    if scope.iter().all(|v| {
+                        paths.iter().any(|p| {
+                            v == p || v.strip_prefix(p).is_some_and(|rest| rest.starts_with('/'))
+                        })
+                    }) => {}
                 _ => return Err(ExchangeError::Forbidden),
             }
         }
@@ -434,9 +468,157 @@ fn validate_capture_envelope(
         {
             Ok(digest)
         }
+        Metadata::RevisionContribution {
+            capture_record_id,
+            capture_receipt_record_id,
+            source,
+            revision_bytes_hex,
+            ..
+        } if capture_record_id == receipt.contribution.as_str()
+            && capture_receipt_record_id == receipt.receipt_record_id.as_str()
+            && source == receipt.result.as_str()
+            && payload == receipt.receipt_record_id.as_str() =>
+        {
+            let revision_bytes = decode_lower_hex(
+                revision_bytes_hex,
+                aethyme_contracts::experimental_v0::contribution_revision::MAX_CONTRIBUTION_REVISION_BYTES,
+            )?;
+            let (revision, _) = ContributionRevision::from_record(&revision_bytes)
+                .map_err(|_| invalid("revision record"))?;
+            if revision.base() != &receipt.base || revision.result() != &receipt.result {
+                return Err(invalid("revision capture transition"));
+            }
+            Ok(digest)
+        }
         _ => Err(invalid("capture envelope subject")),
     }
 }
+
+/// Resolve a revision packet against the locally approved project descriptor
+/// and exact retained identity history. The packet stays advisory; this only
+/// verifies that its immutable references and source transition are bound to
+/// the selected project. Successful revision and brief bytes are returned for
+/// the caller to retain alongside the peer event.
+fn validate_revision_project_binding(
+    store: &mut CollaborationStore,
+    packet: &Metadata,
+) -> Result<Vec<ObjectDigest>, ExchangeError> {
+    let Metadata::RevisionContribution {
+        project_id,
+        descriptor_record_id,
+        descriptor_object_sha256,
+        logical_contribution_id,
+        capture_record_id,
+        revision_record_id,
+        revision_object_sha256,
+        revision_bytes_hex,
+        brief_object_sha256,
+        brief_bytes_hex,
+        ..
+    } = packet
+    else {
+        return Ok(Vec::new());
+    };
+
+    let project_id = ProjectId::parse(project_id)
+        .map_err(|_| invalid("revision project identity"))?;
+    let descriptor_record_id = RecordId::parse(descriptor_record_id)
+        .map_err(|_| invalid("revision descriptor identity"))?;
+    let descriptor_object = archive::parse_digest(descriptor_object_sha256)
+        .ok_or_else(|| invalid("revision descriptor object"))?;
+    let logical_id = ContributionId::parse(logical_contribution_id)
+        .map_err(|_| invalid("revision logical contribution identity"))?;
+    let capture_record_id = RecordId::parse(capture_record_id)
+        .map_err(|_| invalid("revision capture lineage"))?;
+    let revision_record_id = RecordId::parse(revision_record_id)
+        .map_err(|_| invalid("revision record identity"))?;
+    let revision_object = archive::parse_digest(revision_object_sha256)
+        .ok_or_else(|| invalid("revision object digest"))?;
+    let revision_bytes = decode_lower_hex(
+        revision_bytes_hex,
+        aethyme_contracts::experimental_v0::contribution_revision::MAX_CONTRIBUTION_REVISION_BYTES,
+    )?;
+    let (revision, observed_revision_id) = ContributionRevision::from_record(&revision_bytes)
+        .map_err(|_| invalid("revision record"))?;
+    if observed_revision_id != revision_record_id
+        || revision.project_id() != &project_id
+        || revision.contribution_id() != &logical_id
+        || revision.capture_record_id() != &capture_record_id
+    {
+        return Err(invalid("revision record binding"));
+    }
+
+    let approved = crate::collaboration_identity_store::resolve_approved_project_binding(store)
+        .map_err(|_| invalid("approved project binding unavailable"))?
+        .ok_or_else(|| invalid("approved project binding unavailable"))?;
+    if approved.project_id() != &project_id
+        || approved.descriptor_record_id() != &descriptor_record_id
+        || approved.descriptor_object() != descriptor_object
+    {
+        return Err(invalid("revision is outside the approved project binding"));
+    }
+    let base_state = match crate::collaboration_identity_store::resolve_project_file_identity_state(
+        store,
+        &approved,
+        revision.base(),
+    )
+    .map_err(|_| invalid("revision base identity state unavailable"))?
+    {
+        crate::collaboration_identity_store::IdentityStateResolution::Anchor(state)
+        | crate::collaboration_identity_store::IdentityStateResolution::Replayed(state) => state,
+        crate::collaboration_identity_store::IdentityStateResolution::Unknown { .. } => {
+            return Err(invalid("revision base identity state is unknown"));
+        }
+    };
+    let brief_bytes = brief_bytes_hex
+        .as_deref()
+        .map(|encoded| {
+            decode_lower_hex(
+                encoded,
+                aethyme_contracts::experimental_v0::brief::MAX_BRIEF_RECORD_BYTES,
+            )
+        })
+        .transpose()?;
+    let resolved = crate::collaboration_identity_store::validate_bound_contribution_revision_bytes(
+        store,
+        &approved,
+        &base_state,
+        &revision_record_id,
+        revision_object,
+        &logical_id,
+        None,
+        &revision_bytes,
+        brief_bytes.as_deref(),
+    )
+    .map_err(|_| invalid("revision identity transition is not verified"))?;
+    if resolved.record_id() != &revision_record_id
+        || resolved.object_digest() != revision_object
+        || resolved.revision() != &revision
+        || resolved.capture_lineage() != &capture_record_id
+        || resolved.base_state().snapshot_id() != revision.base()
+        || resolved.result_state().snapshot_id() != revision.result()
+    {
+        return Err(invalid("revision identity transition binding"));
+    }
+    let brief_digest = match (brief_object_sha256, resolved.brief_digest()) {
+        (Some(encoded), Some(digest)) if archive::parse_digest(encoded) == Some(digest) => {
+            Some(digest)
+        }
+        (None, None) => None,
+        _ => return Err(invalid("revision brief object binding")),
+    };
+
+    let mut retained = vec![archive::put_object(store, &revision_bytes)?];
+    if let Some(bytes) = brief_bytes {
+        let digest = archive::put_object(store, &bytes)?;
+        if Some(digest) != brief_digest {
+            return Err(invalid("revision brief digest changed during retention"));
+        }
+        retained.push(digest);
+    }
+    Ok(retained)
+}
+
 /// Attach one immutable metadata envelope to a real committed capture outbox
 /// row. The original sequence, capture operation, payload receipt and global
 /// delivery marker remain the capture's; the wire envelope has its own identity.
@@ -457,6 +639,7 @@ pub fn stage_capture_metadata(
     }
     let record = packet.record()?;
     let receipt_digest = validate_capture_envelope(store, &operation, &payload, packet)?;
+    let revision_objects = validate_revision_project_binding(store, packet)?;
     let digest = archive::put_object(store, &record.canonical_bytes())?;
     let tx = store
         .connection()
@@ -490,6 +673,20 @@ pub fn stage_capture_metadata(
         &receipt_digest,
         &format!("exchange-capture-receipt:{sequence}"),
     )?;
+    if let Some(revision) = revision_objects.first() {
+        pin(
+            &tx,
+            revision,
+            &format!("exchange-capture-revision:{sequence}"),
+        )?;
+        if let Some(brief) = revision_objects.get(1) {
+            pin(
+                &tx,
+                brief,
+                &format!("exchange-capture-brief:{sequence}"),
+            )?;
+        }
+    }
     tx.commit()?;
     Ok(record.id())
 }
@@ -570,6 +767,7 @@ pub fn deliver(
         } else {
             validate_capture_envelope(store, &operation, &payload, &packet)?;
         }
+        validate_revision_project_binding(store, &packet)?;
         proof.visible(&peer.spec, &packet)?;
         let record = packet.record()?;
         let ack = peer.adapter.send(&*proof.lease, &record)?;
@@ -647,7 +845,7 @@ fn save_event(
     stream: &RecordId,
     event: &Event,
     digest: &ObjectDigest,
-) -> Result<(), ExchangeError> {
+) -> Result<bool, ExchangeError> {
     let record = event.record()?;
     let existing:Option<(String,Vec<u8>)>=tx.query_row("SELECT id,body FROM local_exchange_events WHERE binding=?1 AND stream=?2 AND sequence=?3",params![id.as_str(),stream.as_str(),event.sequence],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
     if let Some((old, body)) = existing {
@@ -655,7 +853,7 @@ fn save_event(
             return Err(invalid("event position reused"));
         }
         tx.execute("UPDATE local_exchange_events SET applied=0 WHERE binding=?1 AND stream=?2 AND sequence=?3 AND applied=2",params![id.as_str(),stream.as_str(),event.sequence])?;
-        return Ok(());
+        return Ok(false);
     }
     let count: i64 = tx.query_row(
         "SELECT count(*) FROM local_exchange_events WHERE binding=?1",
@@ -667,7 +865,7 @@ fn save_event(
     }
     tx.execute("INSERT INTO local_exchange_events(binding,stream,sequence,id,body,applied) VALUES(?1,?2,?3,?4,?5,0)",params![id.as_str(),stream.as_str(),event.sequence,record.id().as_str(),record.canonical_bytes()])?;
     pin(tx, digest, record.id().as_str())?;
-    Ok(())
+    Ok(true)
 }
 fn project(tx: &Transaction<'_>, id: &RecordId, packet: &Metadata) -> Result<(), ExchangeError> {
     let record = packet.record()?;
@@ -710,6 +908,7 @@ pub fn poll(
     let _local = authority::guard(store, &peer.epoch)?;
     let _lock = peer_lock(store, peer)?;
     reserve_observation(store, peer, operation)?;
+    let _use = gc::archive_use(store)?;
     let proof = current(store, peer)?;
     let position = require_stream(store, peer, &proof)?;
     let cursor = Cursor {
@@ -723,25 +922,61 @@ pub fn poll(
         }
         let stream = stream_id(&cursor.stream)?;
         let mut retained = Vec::new();
+        let mut revision_objects = Vec::new();
+        let mut total_event_bytes = 0usize;
         for event in &events {
             if event.stream != cursor.stream {
                 return Err(ExchangeError::Stale);
             }
             proof.visible(&peer.spec, &event.packet)?;
+            let record = event.record()?;
+            total_event_bytes = total_event_bytes
+                .checked_add(record.canonical_bytes().len())
+                .ok_or(ExchangeError::Limit)?;
+            if total_event_bytes > MAX_SNAPSHOT_PAGE_BYTES {
+                return Err(ExchangeError::Limit);
+            }
+            revision_objects.push(validate_revision_project_binding(store, &event.packet)?);
             if event.sequence <= position {
                 let known:bool=store.read_connection().query_row("SELECT EXISTS(SELECT 1 FROM local_exchange_events WHERE binding=?1 AND stream=?2 AND sequence=?3)",params![peer.id.as_str(),stream.as_str(),event.sequence],|r|r.get(0))?;
                 if !known {
                     return Err(ExchangeError::Stale);
                 }
             }
-            let record = event.record()?;
             retained.push(archive::put_object(store, &record.canonical_bytes())?);
+        }
+        let buffered = {
+            let mut statement = store.read_connection().prepare(
+                "SELECT id,body FROM local_exchange_events WHERE binding=?1 AND applied=0 ORDER BY sequence LIMIT ?2",
+            )?;
+            statement
+                .query_map(
+                    params![peer.id.as_str(), MAX_BUFFERED_EVENTS as i64 + 1],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?)),
+                )?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        for (id, body) in buffered {
+            let event = event_from(&body, &id)?;
+            if event.stream != cursor.stream {
+                return Err(ExchangeError::Stale);
+            }
+            proof.visible(&peer.spec, &event.packet)?;
+            validate_revision_project_binding(store, &event.packet)?;
         }
         let tx = store
             .connection()
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        for (event, digest) in events.iter().zip(&retained) {
-            save_event(&tx, &peer.id, &stream, event, digest)?;
+        for ((event, digest), objects) in events.iter().zip(&retained).zip(&revision_objects) {
+            if save_event(&tx, &peer.id, &stream, event, digest)? {
+                pin_revision_event_objects(
+                    &tx,
+                    &peer.id,
+                    &stream,
+                    event.sequence,
+                    objects,
+                )?;
+            }
         }
         let mut next = position;
         loop {
@@ -791,6 +1026,7 @@ pub fn recover_snapshot(
     let _local = authority::guard(store, &peer.epoch)?;
     let _lock = peer_lock(store, peer)?;
     reserve_observation(store, peer, operation)?;
+    let _use = gc::archive_use(store)?;
     let proof = current(store, peer)?;
     let old = cursor_row(store, &peer.id)?;
     if old
@@ -803,6 +1039,7 @@ pub fn recover_snapshot(
         let mut descriptor = None;
         let mut offset = 0;
         let mut items = Vec::new();
+        let mut revision_objects = Vec::new();
         let mut positions = BTreeSet::new();
         let mut packets = BTreeSet::new();
         loop {
@@ -819,6 +1056,7 @@ pub fn recover_snapshot(
             descriptor = Some(page.snapshot.clone());
             for event in page.items {
                 proof.visible(&peer.spec, &event.packet)?;
+                revision_objects.push(validate_revision_project_binding(store, &event.packet)?);
                 if !positions.insert(event.sequence) || !packets.insert(event.packet.record()?.id())
                 {
                     return Err(invalid("duplicate complete snapshot item"));
@@ -849,8 +1087,16 @@ pub fn recover_snapshot(
             .connection()
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         clear_projection(&tx, &peer.id)?;
-        for (event, digest) in items.iter().zip(&retained) {
-            save_event(&tx, &peer.id, &stream, event, digest)?;
+        for ((event, digest), objects) in items.iter().zip(&retained).zip(&revision_objects) {
+            if save_event(&tx, &peer.id, &stream, event, digest)? {
+                pin_revision_event_objects(
+                    &tx,
+                    &peer.id,
+                    &stream,
+                    event.sequence,
+                    objects,
+                )?;
+            }
             project(&tx, &peer.id, &event.packet)?;
             tx.execute("UPDATE local_exchange_events SET applied=1 WHERE binding=?1 AND stream=?2 AND sequence=?3",params![peer.id.as_str(),stream.as_str(),event.sequence])?;
         }
@@ -876,11 +1122,18 @@ pub fn projection(
     let _lock = peer_lock(store, peer)?;
     let proof = current(store, peer)?;
     require_stream(store, peer, &proof)?;
+    let _use = gc::archive_use(store)?;
     let result = (|| {
-        let tx = store
-            .connection()
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let rows:Vec<(String,Vec<u8>)>=tx.prepare("SELECT packet,body FROM local_exchange_projection WHERE binding=?1 ORDER BY packet LIMIT 1025")?.query_map([peer.id.as_str()],|r|Ok((r.get(0)?,r.get(1)?)))?.collect::<Result<_,_>>()?;
+        let rows = {
+            let mut statement = store.read_connection().prepare(
+                "SELECT packet,body FROM local_exchange_projection WHERE binding=?1 ORDER BY packet LIMIT 1025",
+            )?;
+            statement
+                .query_map([peer.id.as_str()], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+                })?
+                .collect::<Result<Vec<_>, _>>()?
+        };
         if rows.len() > MAX_VISIBLE_ITEMS {
             return Err(ExchangeError::Limit);
         }
@@ -888,8 +1141,12 @@ pub fn projection(
         for (id, body) in rows {
             let packet = packet_from(&body, &id)?;
             proof.visible(&peer.spec, &packet)?;
+            validate_revision_project_binding(store, &packet)?;
             packets.push(packet);
         }
+        let tx = store
+            .connection()
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         proof.check_in(&tx, peer)?;
         tx.commit()?;
         Ok(packets)

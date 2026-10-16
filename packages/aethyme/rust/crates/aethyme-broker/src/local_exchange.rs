@@ -2,13 +2,22 @@
 //! advisory data. Only an operator-appointed native adapter can supply current
 //! authorization; no packet grants retention, verification or adoption.
 use aethyme_contracts::experimental_v0::{
-    FieldKind, FieldSpec, Record, RecordId, RecordSchema, SourceSnapshotId,
+    Brief, ContributionId, ContributionRevision, FieldKind, FieldSpec, ProjectId, Record,
+    RecordId, RecordSchema, SourceSnapshotId,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
 pub const PROFILE: &str = "aethyme.exchange.scoped-metadata/provisional-v0";
 pub const MAX_PACKET_BYTES: usize = 16 * 1024;
+/// The experimental immutable revision packet carries bounded canonical
+/// revision and brief bytes as lowercase hex. The larger limit applies only
+/// to that explicit variant; legacy metadata remains capped at 16 KiB.
+pub const MAX_REVISION_PACKET_BYTES: usize =
+    2 * aethyme_contracts::experimental_v0::contribution_revision::MAX_CONTRIBUTION_REVISION_BYTES
+        + 2 * aethyme_contracts::experimental_v0::brief::MAX_BRIEF_RECORD_BYTES
+        + 32 * 1024;
+pub const MAX_SNAPSHOT_PAGE_BYTES: usize = 32 * 1024 * 1024;
 pub const MAX_BATCH_ITEMS: usize = 64;
 pub const MAX_VISIBLE_ITEMS: usize = 1024;
 pub const MAX_BUFFERED_EVENTS: usize = 256;
@@ -88,6 +97,48 @@ fn source_id(s: &str) -> Result<(), ExchangeError> {
     SourceSnapshotId::parse(s)
         .map(|_| ())
         .map_err(|_| invalid("source identity"))
+}
+fn digest_text(s: &str) -> Result<(), ExchangeError> {
+    if s.len() != 64
+        || !s
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        return Err(invalid("object digest"));
+    }
+    Ok(())
+}
+fn hex_digit(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        _ => None,
+    }
+}
+fn decode_lower_hex(value: &str, max_bytes: usize) -> Result<Vec<u8>, ExchangeError> {
+    if value.len() % 2 != 0 || value.len() / 2 > max_bytes {
+        return Err(ExchangeError::Limit);
+    }
+    let mut decoded = Vec::with_capacity(value.len() / 2);
+    for pair in value.as_bytes().chunks_exact(2) {
+        let Some(high) = hex_digit(pair[0]) else {
+            return Err(invalid("lowercase hex payload"));
+        };
+        let Some(low) = hex_digit(pair[1]) else {
+            return Err(invalid("lowercase hex payload"));
+        };
+        decoded.push((high << 4) | low);
+    }
+    Ok(decoded)
+}
+fn lower_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut text = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        text.push(HEX[(byte >> 4) as usize] as char);
+        text.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    text
 }
 fn paths(values: &[String]) -> Result<(), ExchangeError> {
     if values.is_empty() || values.len() > 64 {
@@ -223,6 +274,29 @@ pub enum Metadata {
         #[serde(skip_serializing_if = "Option::is_none")]
         brief: Option<String>,
     },
+    /// Exact immutable revision objects plus explicit project and legacy
+    /// capture bindings. These fields are untrusted claims until a local
+    /// approved-project and FileId-history resolver verifies them.
+    RevisionContribution {
+        project_id: String,
+        descriptor_record_id: String,
+        descriptor_object_sha256: String,
+        logical_contribution_id: String,
+        capture_record_id: String,
+        capture_receipt_record_id: String,
+        revision_record_id: String,
+        revision_object_sha256: String,
+        revision_bytes_hex: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        brief_record_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        brief_object_sha256: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        brief_bytes_hex: Option<String>,
+        source: String,
+        availability: SourceAvailability,
+        scope: Vec<String>,
+    },
     GenerationOffer {
         generation: String,
         prepared_receipt: String,
@@ -234,13 +308,178 @@ fn canonical(
     schema: &'static RecordSchema,
     spec: &impl Serialize,
 ) -> Result<Record, ExchangeError> {
+    canonical_with_limit(schema, spec, MAX_PACKET_BYTES)
+}
+fn canonical_with_limit(
+    schema: &'static RecordSchema,
+    spec: &impl Serialize,
+    max_bytes: usize,
+) -> Result<Record, ExchangeError> {
     let bytes = serde_json::to_vec(&serde_json::json!({"schema":schema.name,"spec":spec}))?;
-    if bytes.len() > MAX_PACKET_BYTES {
+    if bytes.len() > max_bytes {
         return Err(ExchangeError::Limit);
     }
     Ok(Record::decode(&bytes, &[schema])?)
 }
 impl Metadata {
+    /// Build the advisory peer envelope around one canonical immutable
+    /// revision. The descriptor references are claims only; staging and use
+    /// still require a locally approved project binding and replayed FileIds.
+    #[allow(clippy::too_many_arguments)]
+    pub fn revision_contribution(
+        project_id: &ProjectId,
+        descriptor_record_id: &RecordId,
+        descriptor_object_sha256: &str,
+        capture_receipt_record_id: &RecordId,
+        revision_bytes: &[u8],
+        brief_bytes: Option<&[u8]>,
+        availability: SourceAvailability,
+        scope: Vec<String>,
+    ) -> Result<Self, ExchangeError> {
+        let (revision, revision_record_id) = ContributionRevision::from_record(revision_bytes)
+            .map_err(|_| invalid("revision record"))?;
+        let brief_fields = match (revision.brief(), brief_bytes) {
+            (None, None) => (None, None, None),
+            (Some(reference), Some(bytes)) => {
+                let (_, observed_id) = Brief::from_record(bytes)
+                    .map_err(|_| invalid("brief record"))?;
+                if observed_id != reference.record_id
+                    || crate::collaboration_archive::ObjectDigest::of(bytes).hex()
+                        != reference.object_sha256
+                {
+                    return Err(invalid("brief object binding"));
+                }
+                (
+                    Some(reference.record_id.to_string()),
+                    Some(reference.object_sha256.clone()),
+                    Some(lower_hex(bytes)),
+                )
+            }
+            _ => return Err(invalid("incomplete brief object")),
+        };
+        let packet = Self::RevisionContribution {
+            project_id: project_id.to_string(),
+            descriptor_record_id: descriptor_record_id.to_string(),
+            descriptor_object_sha256: descriptor_object_sha256.into(),
+            logical_contribution_id: revision.contribution_id().to_string(),
+            capture_record_id: revision.capture_record_id().to_string(),
+            capture_receipt_record_id: capture_receipt_record_id.to_string(),
+            revision_record_id: revision_record_id.to_string(),
+            revision_object_sha256: crate::collaboration_archive::ObjectDigest::of(revision_bytes)
+                .hex()
+                .to_string(),
+            revision_bytes_hex: lower_hex(revision_bytes),
+            brief_record_id: brief_fields.0,
+            brief_object_sha256: brief_fields.1,
+            brief_bytes_hex: brief_fields.2,
+            source: revision.result().to_string(),
+            availability,
+            scope,
+        };
+        packet.validate()?;
+        Ok(packet)
+    }
+    fn wire_limit(&self) -> usize {
+        match self {
+            Self::RevisionContribution { .. } => MAX_REVISION_PACKET_BYTES,
+            Self::Contribution { .. } | Self::GenerationOffer { .. } => MAX_PACKET_BYTES,
+        }
+    }
+    fn validate_revision(
+        project_id: &str,
+        descriptor_record_id: &str,
+        descriptor_object_sha256: &str,
+        logical_contribution_id: &str,
+        capture_record_id: &str,
+        capture_receipt_record_id: &str,
+        revision_record_id: &str,
+        revision_object_sha256: &str,
+        revision_bytes_hex: &str,
+        brief_record_id: Option<&str>,
+        brief_object_sha256: Option<&str>,
+        brief_bytes_hex: Option<&str>,
+        source: &str,
+        availability: &SourceAvailability,
+        scope: &[String],
+    ) -> Result<(), ExchangeError> {
+        ProjectId::parse(project_id).map_err(|_| invalid("revision project identity"))?;
+        record_id(descriptor_record_id)?;
+        digest_text(descriptor_object_sha256)?;
+        ContributionId::parse(logical_contribution_id)
+            .map_err(|_| invalid("logical contribution identity"))?;
+        record_id(capture_record_id)?;
+        record_id(capture_receipt_record_id)?;
+        record_id(revision_record_id)?;
+        digest_text(revision_object_sha256)?;
+        source_id(source)?;
+        availability.validate()?;
+        paths(scope)?;
+
+        // Check encoded lengths before allocating decoded bytes.
+        if revision_bytes_hex.len()
+            > 2 * aethyme_contracts::experimental_v0::contribution_revision::MAX_CONTRIBUTION_REVISION_BYTES
+        {
+            return Err(ExchangeError::Limit);
+        }
+        let revision_bytes = decode_lower_hex(
+            revision_bytes_hex,
+            aethyme_contracts::experimental_v0::contribution_revision::MAX_CONTRIBUTION_REVISION_BYTES,
+        )?;
+        if crate::collaboration_archive::ObjectDigest::of(&revision_bytes).hex()
+            != revision_object_sha256
+        {
+            return Err(invalid("revision object digest"));
+        }
+        let (revision, parsed_id) = ContributionRevision::from_record(&revision_bytes)
+            .map_err(|_| invalid("revision record"))?;
+        if parsed_id.as_str() != revision_record_id
+            || revision.project_id().as_str() != project_id
+            || revision.contribution_id().as_str() != logical_contribution_id
+            || revision.capture_record_id().as_str() != capture_record_id
+            || revision.result().as_str() != source
+        {
+            return Err(invalid("revision binding"));
+        }
+
+        match (
+            revision.brief(),
+            brief_record_id,
+            brief_object_sha256,
+            brief_bytes_hex,
+        ) {
+            (None, None, None, None) => {}
+            (Some(reference), Some(id), Some(digest), Some(encoded)) => {
+                record_id(id)?;
+                digest_text(digest)?;
+                if encoded.len()
+                    > 2 * aethyme_contracts::experimental_v0::brief::MAX_BRIEF_RECORD_BYTES
+                {
+                    return Err(ExchangeError::Limit);
+                }
+                let brief_bytes = decode_lower_hex(
+                    encoded,
+                    aethyme_contracts::experimental_v0::brief::MAX_BRIEF_RECORD_BYTES,
+                )?;
+                if id != reference.record_id.as_str()
+                    || digest != reference.object_sha256
+                    || crate::collaboration_archive::ObjectDigest::of(&brief_bytes).hex() != digest
+                {
+                    return Err(invalid("brief object binding"));
+                }
+                let (brief, brief_id) = Brief::from_record(&brief_bytes)
+                    .map_err(|_| invalid("brief record"))?;
+                let (canonical, canonical_id) = brief.to_record();
+                if brief_id.as_str() != id
+                    || canonical_id != brief_id
+                    || canonical != brief_bytes
+                {
+                    return Err(invalid("brief canonical record"));
+                }
+            }
+            _ => return Err(invalid("incomplete brief object")),
+        }
+        Ok(())
+    }
     pub fn validate(&self) -> Result<(), ExchangeError> {
         match self {
             Self::Contribution {
@@ -258,6 +497,39 @@ impl Metadata {
                     return Err(ExchangeError::Limit);
                 }
             }
+            Self::RevisionContribution {
+                project_id,
+                descriptor_record_id,
+                descriptor_object_sha256,
+                logical_contribution_id,
+                capture_record_id,
+                capture_receipt_record_id,
+                revision_record_id,
+                revision_object_sha256,
+                revision_bytes_hex,
+                brief_record_id,
+                brief_object_sha256,
+                brief_bytes_hex,
+                source,
+                availability,
+                scope,
+            } => Self::validate_revision(
+                project_id,
+                descriptor_record_id,
+                descriptor_object_sha256,
+                logical_contribution_id,
+                capture_record_id,
+                capture_receipt_record_id,
+                revision_record_id,
+                revision_object_sha256,
+                revision_bytes_hex,
+                brief_record_id.as_deref(),
+                brief_object_sha256.as_deref(),
+                brief_bytes_hex.as_deref(),
+                source,
+                availability,
+                scope,
+            )?,
             Self::GenerationOffer {
                 generation,
                 prepared_receipt,
@@ -283,7 +555,7 @@ impl Metadata {
     }
     pub fn record(&self) -> Result<Record, ExchangeError> {
         self.validate()?;
-        canonical(&PACKET, self)
+        canonical_with_limit(&PACKET, self, self.wire_limit())
     }
 }
 /// A transport witness is serialized history. It must match a separate currently
@@ -336,7 +608,11 @@ impl Event {
         if self.sequence == 0 || self.sequence > MAX_STREAM_POSITION {
             return Err(invalid("event position"));
         }
-        canonical(&EVENT, self)
+        let max_bytes = match &self.packet {
+            Metadata::RevisionContribution { .. } => MAX_REVISION_PACKET_BYTES,
+            Metadata::Contribution { .. } | Metadata::GenerationOffer { .. } => MAX_PACKET_BYTES,
+        };
+        canonical_with_limit(&EVENT, self, max_bytes)
     }
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -414,11 +690,18 @@ impl SnapshotPage {
         }
         let mut positions = BTreeSet::new();
         let mut records = BTreeSet::new();
+        let mut total_bytes = 0usize;
         for event in &self.items {
             if event.stream != self.snapshot.stream || event.sequence > self.snapshot.watermark {
                 return Err(ExchangeError::Stale);
             }
-            event.record()?;
+            let encoded = event.record()?;
+            total_bytes = total_bytes
+                .checked_add(encoded.canonical_bytes().len())
+                .ok_or(ExchangeError::Limit)?;
+            if total_bytes > MAX_SNAPSHOT_PAGE_BYTES {
+                return Err(ExchangeError::Limit);
+            }
             if !positions.insert(event.sequence) || !records.insert(event.packet.record()?.id()) {
                 return Err(invalid("duplicate snapshot item"));
             }
@@ -494,3 +777,5 @@ pub use manager::{
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod revision_tests;
