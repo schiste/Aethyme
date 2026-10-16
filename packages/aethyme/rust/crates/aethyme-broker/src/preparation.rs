@@ -1584,6 +1584,16 @@ fn directory_bytes(path: &Path) -> Result<Option<u64>, PreparationError> {
     directory_bytes_with_limits(path, SharedCacheScanLimits::default())
 }
 
+#[cfg(target_os = "linux")]
+fn shared_cache_stat_device(device: libc::dev_t) -> Option<u64> {
+    Some(device)
+}
+
+#[cfg(target_os = "macos")]
+fn shared_cache_stat_device(device: libc::dev_t) -> Option<u64> {
+    u64::try_from(device).ok()
+}
+
 fn directory_bytes_with_limits(
     path: &Path,
     _limits: SharedCacheScanLimits,
@@ -1764,7 +1774,7 @@ where
     // SAFETY: successful fstat initialized the structure.
     let root_stat = unsafe { root_stat.assume_init() };
     if root_stat.st_mode & libc::S_IFMT != libc::S_IFDIR
-        || root_stat.st_dev != root_metadata.dev()
+        || shared_cache_stat_device(root_stat.st_dev) != Some(root_metadata.dev())
         || root_stat.st_ino != root_metadata.ino()
     {
         // SAFETY: fd was opened above and has not transferred to fdopendir.
