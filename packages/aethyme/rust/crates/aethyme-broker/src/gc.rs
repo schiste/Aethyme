@@ -66,6 +66,8 @@ const ARTIFACT_SWEEP_PROGRESS_KEY: &str = "gc.artifact_sweep.last_partial_ms";
 /// protected an idle open session's half-removed cache for another idle
 /// window. A cache already judged idle and partly removed is finished.
 const ARTIFACT_SWEEP_INTERRUPTED_KEY: &str = "gc.artifact_sweep.interrupted_path";
+/// Durable request for the detached, cache-only continuation worker.
+const ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY: &str = "gc.artifact_sweep.recovery_requested_ms";
 
 /// Most a broker open may spend on the artifact sweep, whatever the policy
 /// budget or disk pressure. Broker open runs before every command, including
@@ -87,6 +89,9 @@ pub(crate) enum ArtifactSweepScope {
     /// An explicit reclaim command: the policy budget scaled by disk
     /// pressure, ignoring cadence and spacing.
     Drain,
+    /// Detached recovery: the policy budget scaled by disk pressure, ignoring
+    /// cadence and spacing, and without whole-checkout cleanup.
+    AutomaticContinuation,
     /// The targeted pass over one just-closed session.
     ClosedSession(i64),
 }
@@ -190,7 +195,9 @@ fn artifact_sweep_budget_ms(
 ) -> u64 {
     match scope {
         ArtifactSweepScope::Inline => policy_budget_ms.min(INLINE_ARTIFACT_SWEEP_BUDGET_MS),
-        ArtifactSweepScope::Drain | ArtifactSweepScope::ClosedSession(_) => {
+        ArtifactSweepScope::Drain
+        | ArtifactSweepScope::AutomaticContinuation
+        | ArtifactSweepScope::ClosedSession(_) => {
             policy_budget_ms.saturating_mul(urgency.budget_scale())
         }
     }
@@ -2152,6 +2159,35 @@ impl Broker {
             .map(Some)
     }
 
+    /// Persist an automatic recovery request when an admission failure or an
+    /// unfinished bounded sweep has exposed durable cache backlog. The marker
+    /// is intentionally separate from the cadence/cursor state: normal broker
+    /// opens can request a worker without pretending that the foreground pass
+    /// finished or resetting its resume point.
+    pub(crate) fn request_artifact_sweep_recovery(&mut self) -> Result<(), BrokerOpError> {
+        if self
+            .store()
+            .meta_get(ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY)?
+            .is_none_or(|value| value.is_empty())
+        {
+            self.store().meta_set(
+                ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY,
+                &now_ms().max(1).to_string(),
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Whether a recovery request remains durable. The worker clears this only
+    /// after a complete cache-only lap; interruptions retain both this marker
+    /// and the existing sweep cursor/interrupted-tree evidence.
+    pub(crate) fn artifact_sweep_recovery_requested(&self) -> Result<bool, BrokerOpError> {
+        Ok(self
+            .store()
+            .meta_get(ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY)?
+            .is_some_and(|value| !value.is_empty()))
+    }
+
     /// An earlier pass stopped at its budget and has not finished a lap since.
     fn artifact_sweep_backlog_pending(&mut self) -> Result<bool, BrokerOpError> {
         let cursor = self
@@ -2164,7 +2200,7 @@ impl Broker {
             .meta_get(ARTIFACT_SWEEP_PROGRESS_KEY)?
             .and_then(|value| value.parse::<i64>().ok())
             .unwrap_or(0);
-        Ok(cursor != 0 || partial != 0)
+        Ok(cursor != 0 || partial != 0 || self.artifact_sweep_recovery_requested()?)
     }
 
     /// Whether the millisecond stamp under `key` is set and younger than
@@ -2258,7 +2294,9 @@ impl Broker {
         }
         let closed_session_id = match scope {
             ArtifactSweepScope::ClosedSession(session_id) => Some(session_id),
-            ArtifactSweepScope::Inline | ArtifactSweepScope::Drain => None,
+            ArtifactSweepScope::Inline
+            | ArtifactSweepScope::Drain
+            | ArtifactSweepScope::AutomaticContinuation => None,
         };
         let main_root = self.main_root().to_path_buf();
         let now = now_ms();
@@ -2553,11 +2591,12 @@ impl Broker {
         // budget, and only on the general sweep: the targeted pass after a
         // close is about one session's build output (#588). Its failure must
         // not stop the sweep any more than the sweep's may stop a command.
-        let auto_cleanup = if closed_session_id.is_none() {
-            self.auto_remove_disposable_checkouts(Some(deadline)).ok()
-        } else {
-            None
-        };
+        let auto_cleanup =
+            if closed_session_id.is_none() && scope != ArtifactSweepScope::AutomaticContinuation {
+                self.auto_remove_disposable_checkouts(Some(deadline)).ok()
+            } else {
+                None
+            };
         Ok(ArtifactSweepOutcome {
             directories_reclaimed: removed.len(),
             complete: scan_completed,
@@ -3302,6 +3341,30 @@ mod tests {
         );
     }
 
+    #[test]
+    fn an_automatic_recovery_request_is_durable_and_idempotent() {
+        let tmp = tempfile::tempdir().unwrap();
+        git(tmp.path(), &["init", "-q", "-b", "main"]);
+        std::fs::write(tmp.path().join("README.md"), "fixture\n").unwrap();
+        git(tmp.path(), &["add", "README.md"]);
+        git(tmp.path(), &["commit", "-qm", "init"]);
+        let mut broker = Broker::open(tmp.path()).unwrap();
+
+        assert!(!broker.artifact_sweep_recovery_requested().unwrap());
+        broker.request_artifact_sweep_recovery().unwrap();
+        assert!(broker.artifact_sweep_recovery_requested().unwrap());
+        let first = broker
+            .store()
+            .meta_get(ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY)
+            .unwrap();
+        broker.request_artifact_sweep_recovery().unwrap();
+        let second = broker
+            .store()
+            .meta_get(ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY)
+            .unwrap();
+        assert_eq!(first, second, "repeated requests retain the first due time");
+    }
+
     /// Each case is rejected by exactly one guard, so each guard is proved on
     /// its own rather than masked by the others.
     #[test]
@@ -3380,6 +3443,7 @@ mod tests {
     fn explicit_and_closed_session_sweeps_keep_the_pressure_scaled_budget() {
         for scope in [
             ArtifactSweepScope::Drain,
+            ArtifactSweepScope::AutomaticContinuation,
             ArtifactSweepScope::ClosedSession(7),
         ] {
             assert_eq!(
