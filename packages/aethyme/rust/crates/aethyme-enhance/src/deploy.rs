@@ -866,14 +866,12 @@ mod tests {
         // 1 AGENTS + 6 onboarding + 20 targets + settings = 28.
         assert_eq!(actions.len(), 28);
 
-        let codex_broker_reference = std::fs::read_to_string(
-            repo.join(".codex/skills/aethyme/references/broker.md"),
-        )
-        .unwrap();
-        let claude_broker_reference = std::fs::read_to_string(
-            repo.join(".claude/skills/aethyme/references/broker.md"),
-        )
-        .unwrap();
+        let codex_broker_reference =
+            std::fs::read_to_string(repo.join(".codex/skills/aethyme/references/broker.md"))
+                .unwrap();
+        let claude_broker_reference =
+            std::fs::read_to_string(repo.join(".claude/skills/aethyme/references/broker.md"))
+                .unwrap();
         assert_eq!(codex_broker_reference, claude_broker_reference);
         for required in [
             "aethyme broker advanced main reconcile plan",
