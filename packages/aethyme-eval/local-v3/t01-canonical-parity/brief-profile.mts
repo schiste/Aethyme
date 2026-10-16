@@ -256,12 +256,9 @@ export function countBriefTokens(text: string): number {
           : codePoint >= 0x80 && codePoint <= 0x7ff
             ? "two_byte"
             : undefined;
-    if (next !== run) {
+    if (next === undefined) {
       flush();
-      if (next !== undefined) {
-        run = next;
-        length = 1;
-      } else if (
+      if (
         codePoint !== 0x20 &&
         codePoint !== 0x09 &&
         codePoint !== 0x0a &&
@@ -269,7 +266,11 @@ export function countBriefTokens(text: string): number {
       ) {
         total += 1;
       }
-    } else if (next !== undefined) {
+    } else if (next !== run) {
+      flush();
+      run = next;
+      length = 1;
+    } else {
       length += 1;
     }
   }
