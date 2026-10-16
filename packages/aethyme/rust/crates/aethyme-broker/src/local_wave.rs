@@ -17,7 +17,9 @@ use crate::collaboration_archive::{self as archive, CommitOid, ObjectDigest};
 use crate::collaboration_gc::archive_use;
 use crate::collaboration_state::CollaborationStore;
 use crate::composer::{self, Composition, CompositionBudget, CompositionRequest};
-use crate::composition::{Candidate, CandidateInput, CompositionMode, CompositionOutcome, Producer};
+use crate::composition::{
+    Candidate, CandidateInput, CompositionMode, CompositionOutcome, Producer,
+};
 use crate::local_target::{self as target, ControllerOwner, Phase, TargetError};
 use crate::resolution::{self, FailedCheck, RequirementRef};
 
@@ -597,15 +599,15 @@ fn source_payload(
             candidate: CandidatePayload {
                 subject: candidate.subject.to_string(),
                 tree: candidate.tree.clone(),
-                commit: candidate.commit.to_string(),
-                baseline: candidate.baseline.to_string(),
+                commit: candidate.commit.as_str().to_owned(),
+                baseline: candidate.baseline.as_str().to_owned(),
                 baseline_source: candidate.baseline_source.into(),
                 inputs: candidate
                     .inputs
                     .iter()
                     .map(|input| CandidateInputPayload {
-                        base: input.base.to_string(),
-                        result: input.result.to_string(),
+                        base: input.base.as_str().to_owned(),
+                        result: input.result.as_str().to_owned(),
                         base_snapshot: input.base_snapshot.as_ref().map(ToString::to_string),
                         result_snapshot: input.result_snapshot.as_ref().map(ToString::to_string),
                     })
