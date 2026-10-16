@@ -973,6 +973,9 @@ const MIGRATIONS: &[(i64, &str)] = &[
              wave TEXT NOT NULL REFERENCES local_waves(wave),
              request_record_id TEXT NOT NULL,
              request_object_sha256 TEXT NOT NULL CHECK(length(request_object_sha256)=64),
+             composition_source_record_id TEXT NOT NULL,
+             composition_source_object_sha256 TEXT NOT NULL
+                 CHECK(length(composition_source_object_sha256)=64),
              -- ResolutionInputManifest is archived as canonical bytes and
              -- identified by ObjectDigest; it is not a RecordRef.
              input_manifest_object_sha256 TEXT NOT NULL
@@ -1057,9 +1060,14 @@ const MIGRATIONS: &[(i64, &str)] = &[
              SELECT 1
              FROM local_resolution_reservation_proofs p
              JOIN local_budget_reservations r ON r.reservation=p.reservation
+             JOIN local_waves w ON w.wave=p.wave
              JOIN resolution_attempts a ON a.attempt_id=NEW.attempt_id
              WHERE p.reservation=NEW.reservation
                AND p.authority_epoch=NEW.authority_epoch
+               AND w.resolution_request_record_id=p.request_record_id
+               AND w.resolution_request_object=p.request_object_sha256
+               AND w.composition_source_record_id=p.composition_source_record_id
+               AND w.composition_source_object=p.composition_source_object_sha256
                AND r.phase='completion_pending'
                AND r.version=NEW.reservation_version
                AND r.attempts=NEW.reservation_attempt_number
@@ -2836,6 +2844,8 @@ mod tests {
             wave: String,
             request_record_id: String,
             request_object_sha256: String,
+            composition_source_record_id: String,
+            composition_source_object_sha256: String,
             input_manifest_object_sha256: String,
             trigger_sha256: String,
             project_policy: String,
@@ -2880,6 +2890,7 @@ mod tests {
             let proof = connection.query_row(
                 "SELECT reservation,target,issuer,authority_epoch,client_key,wave,
                         request_record_id,request_object_sha256,
+                        composition_source_record_id,composition_source_object_sha256,
                         input_manifest_object_sha256,trigger_sha256,project_policy,
                         objective_policy,price_profile,dispatch_limits,reserved_envelope,
                         reservation_attempt_limit,deadline_ms,created_ms
@@ -2895,16 +2906,18 @@ mod tests {
                         wave: row.get(5)?,
                         request_record_id: row.get(6)?,
                         request_object_sha256: row.get(7)?,
-                        input_manifest_object_sha256: row.get(8)?,
-                        trigger_sha256: row.get(9)?,
-                        project_policy: row.get(10)?,
-                        objective_policy: row.get(11)?,
-                        price_profile: row.get(12)?,
-                        dispatch_limits: row.get(13)?,
-                        reserved_envelope: row.get(14)?,
-                        reservation_attempt_limit: row.get(15)?,
-                        deadline_ms: row.get(16)?,
-                        created_ms: row.get(17)?,
+                        composition_source_record_id: row.get(8)?,
+                        composition_source_object_sha256: row.get(9)?,
+                        input_manifest_object_sha256: row.get(10)?,
+                        trigger_sha256: row.get(11)?,
+                        project_policy: row.get(12)?,
+                        objective_policy: row.get(13)?,
+                        price_profile: row.get(14)?,
+                        dispatch_limits: row.get(15)?,
+                        reserved_envelope: row.get(16)?,
+                        reservation_attempt_limit: row.get(17)?,
+                        deadline_ms: row.get(18)?,
+                        created_ms: row.get(19)?,
                     })
                 },
             )?;
@@ -2988,6 +3001,7 @@ mod tests {
             request_sha: &str,
             manifest_sha: &str,
             client_key: &str,
+            shared_attempt_number: i64,
         ) -> rusqlite::Result<i64> {
             connection.execute(
                 "INSERT INTO resolution_attempts
@@ -2995,8 +3009,14 @@ mod tests {
                       charged_ms,attempt_number,request_sha256,input_manifest_sha256,
                       client_key,async_state)
                  VALUES ('decision:shared','failed_checks','lineage-a','',?1,
-                         'local-managed-resolution',456,2,?2,?3,?4,'dispatching')",
-                rusqlite::params![request_record_id, request_sha, manifest_sha, client_key],
+                         'local-managed-resolution',456,?5,?2,?3,?4,'dispatching')",
+                rusqlite::params![
+                    request_record_id,
+                    request_sha,
+                    manifest_sha,
+                    client_key,
+                    shared_attempt_number
+                ],
             )?;
             Ok(connection.last_insert_rowid())
         }
@@ -3058,6 +3078,7 @@ mod tests {
         );
 
         let request_sha = "a".repeat(64);
+        let source_sha = "f".repeat(64);
         let manifest_sha = "b".repeat(64);
         let trigger_sha = "c".repeat(64);
         migrated
@@ -3065,15 +3086,29 @@ mod tests {
             .execute_batch(
                 "INSERT INTO local_targets (target,issuer) VALUES ('target','issuer');
                  INSERT INTO local_target_revisions (revision,target,body)
-                     VALUES ('revision','target',X'01');
-                 INSERT INTO local_waves
-                     (wave,target,revision,sequence,body,phase)
-                     VALUES ('wave','target','revision',1,X'02','verifying');
-                 INSERT INTO local_budget_reservations
+                     VALUES ('revision','target',X'01');",
+            )
+            .unwrap();
+        migrated
+            .connection()
+            .execute(
+                "INSERT INTO local_waves
+                     (wave,target,revision,sequence,body,phase,
+                      resolution_request_record_id,resolution_request_object,
+                      composition_source_record_id,composition_source_object)
+                 VALUES ('wave','target','revision',1,X'02','verifying',?1,?2,?3,?4)",
+                rusqlite::params!["request:managed", request_sha, "source:managed", source_sha],
+            )
+            .unwrap();
+        migrated
+            .connection()
+            .execute(
+                "INSERT INTO local_budget_reservations
                      (reservation,nonce,target,revision,wave,root,parent,body,
                       phase,spent,attempts,version)
-                     VALUES ('reservation','nonce','target','revision','wave',
-                             'reservation',NULL,X'03','completion_pending',X'00',1,1);",
+                 VALUES ('reservation','nonce','target','revision','wave',
+                         'reservation',NULL,X'03','completion_pending',X'00',1,1)",
+                [],
             )
             .unwrap();
         migrated
@@ -3095,14 +3130,16 @@ mod tests {
             .execute(
                 "INSERT INTO local_resolution_reservation_proofs
                      (reservation,target,issuer,authority_epoch,client_key,wave,
-                      request_record_id,request_object_sha256,input_manifest_object_sha256,
+                      request_record_id,request_object_sha256,composition_source_record_id,
+                      composition_source_object_sha256,input_manifest_object_sha256,
                       trigger_sha256,project_policy,objective_policy,price_profile,
                       dispatch_limits,reserved_envelope,reservation_attempt_limit,
                       deadline_ms,created_ms)
                  VALUES ('reservation','target','issuer','epoch-1','client-key','wave',
-                         'request:managed',?1,?2,?3,'project-policy','objective-policy',
+                         'request:managed',?1,'source:managed',?2,?3,?4,
+                         'project-policy','objective-policy',
                          'price-profile','v1:1024:10:1024:4096:1024',X'04',1,999,100)",
-                rusqlite::params![request_sha, manifest_sha, trigger_sha],
+                rusqlite::params![request_sha, source_sha, manifest_sha, trigger_sha],
             )
             .unwrap();
         migrated
@@ -3180,12 +3217,141 @@ mod tests {
             )
             .unwrap();
 
+        // The wrapper source pair is current-wave authority too. A matching
+        // charged attempt cannot be bound to a different frozen source.
+        migrated
+            .connection()
+            .execute(
+                "INSERT INTO local_budget_reservations
+                     (reservation,nonce,target,revision,wave,root,parent,body,
+                      phase,spent,attempts,version)
+                 VALUES ('reservation:wrong-source','nonce:wrong-source','target',
+                         'revision','wave','reservation:wrong-source',NULL,X'09',
+                         'completion_pending',X'00',1,1)",
+                [],
+            )
+            .unwrap();
+        migrated
+            .connection()
+            .execute(
+                "INSERT INTO local_resolution_reservation_proofs
+                     (reservation,target,issuer,authority_epoch,client_key,wave,
+                      request_record_id,request_object_sha256,composition_source_record_id,
+                      composition_source_object_sha256,input_manifest_object_sha256,
+                      trigger_sha256,project_policy,objective_policy,price_profile,
+                      dispatch_limits,reserved_envelope,reservation_attempt_limit,
+                      deadline_ms,created_ms)
+                 VALUES ('reservation:wrong-source','target','issuer','epoch-1',
+                         'client-key:wrong-source','wave','request:managed',?1,
+                         'source:wrong',?2,?3,?4,'project-policy','objective-policy',
+                         'price-profile','v1:1024:10:1024:4096:1024',X'0a',1,999,100)",
+                rusqlite::params![request_sha, &"0".repeat(64), manifest_sha, trigger_sha],
+            )
+            .unwrap();
+        migrated
+            .connection()
+            .execute(
+                "INSERT INTO local_resolution_reservation_roots
+                     (reservation,lineage_record_id)
+                 VALUES ('reservation:wrong-source','lineage-a')",
+                [],
+            )
+            .unwrap();
+        let wrong_source_attempt = insert_attempt(
+            migrated.connection(),
+            "request:managed",
+            &request_sha,
+            &manifest_sha,
+            "client-key:wrong-source",
+            3,
+        )
+        .unwrap();
+        assert_rejected_without_mutation(
+            migrated.connection(),
+            "reservation:wrong-source",
+            "wrong composition source wrapper identity",
+            |connection| {
+                insert_binding(
+                    connection,
+                    "binding:wrong-source",
+                    "reservation:wrong-source",
+                    wrong_source_attempt,
+                    3,
+                    1,
+                )
+            },
+        );
+
+        migrated
+            .connection()
+            .execute(
+                "INSERT INTO local_budget_reservations
+                     (reservation,nonce,target,revision,wave,root,parent,body,
+                      phase,spent,attempts,version)
+                 VALUES ('reservation:wrong-source-object','nonce:wrong-source-object',
+                         'target','revision','wave','reservation:wrong-source-object',
+                         NULL,X'0b','completion_pending',X'00',1,1)",
+                [],
+            )
+            .unwrap();
+        migrated
+            .connection()
+            .execute(
+                "INSERT INTO local_resolution_reservation_proofs
+                     (reservation,target,issuer,authority_epoch,client_key,wave,
+                      request_record_id,request_object_sha256,composition_source_record_id,
+                      composition_source_object_sha256,input_manifest_object_sha256,
+                      trigger_sha256,project_policy,objective_policy,price_profile,
+                      dispatch_limits,reserved_envelope,reservation_attempt_limit,
+                      deadline_ms,created_ms)
+                 VALUES ('reservation:wrong-source-object','target','issuer','epoch-1',
+                         'client-key:wrong-source-object','wave','request:managed',?1,
+                         'source:managed',?2,?3,?4,'project-policy','objective-policy',
+                         'price-profile','v1:1024:10:1024:4096:1024',X'0c',1,999,100)",
+                rusqlite::params![request_sha, &"0".repeat(64), manifest_sha, trigger_sha],
+            )
+            .unwrap();
+        migrated
+            .connection()
+            .execute(
+                "INSERT INTO local_resolution_reservation_roots
+                     (reservation,lineage_record_id)
+                 VALUES ('reservation:wrong-source-object','lineage-a')",
+                [],
+            )
+            .unwrap();
+        let wrong_source_object_attempt = insert_attempt(
+            migrated.connection(),
+            "request:managed",
+            &request_sha,
+            &manifest_sha,
+            "client-key:wrong-source-object",
+            3,
+        )
+        .unwrap();
+        assert_rejected_without_mutation(
+            migrated.connection(),
+            "reservation:wrong-source-object",
+            "wrong composition source object digest",
+            |connection| {
+                insert_binding(
+                    connection,
+                    "binding:wrong-source-object",
+                    "reservation:wrong-source-object",
+                    wrong_source_object_attempt,
+                    3,
+                    1,
+                )
+            },
+        );
+
         let wrong_request_record_attempt = insert_attempt(
             migrated.connection(),
             "request:other",
             &request_sha,
             &manifest_sha,
             "client-key",
+            2,
         )
         .unwrap();
         assert_rejected_without_mutation(
@@ -3210,6 +3376,7 @@ mod tests {
             &"d".repeat(64),
             &manifest_sha,
             "client-key",
+            2,
         )
         .unwrap();
         assert_rejected_without_mutation(
@@ -3234,6 +3401,7 @@ mod tests {
             &request_sha,
             &"e".repeat(64),
             "client-key",
+            2,
         )
         .unwrap();
         assert_rejected_without_mutation(
@@ -3269,15 +3437,17 @@ mod tests {
             .execute(
                 "INSERT INTO local_resolution_reservation_proofs
                      (reservation,target,issuer,authority_epoch,client_key,wave,
-                      request_record_id,request_object_sha256,input_manifest_object_sha256,
+                      request_record_id,request_object_sha256,composition_source_record_id,
+                      composition_source_object_sha256,input_manifest_object_sha256,
                       trigger_sha256,project_policy,objective_policy,price_profile,
                       dispatch_limits,reserved_envelope,reservation_attempt_limit,
                       deadline_ms,created_ms)
                  VALUES ('reservation:no-roots','target','issuer','epoch-1',
-                         'client-key:no-roots','wave','request:managed',?1,?2,?3,
+                         'client-key:no-roots','wave','request:managed',?1,
+                         'source:managed',?2,?3,?4,
                          'project-policy','objective-policy','price-profile',
                          'v1:1024:10:1024:4096:1024',X'08',1,999,100)",
-                rusqlite::params![request_sha, manifest_sha, trigger_sha],
+                rusqlite::params![request_sha, source_sha, manifest_sha, trigger_sha],
             )
             .unwrap();
         let no_roots_attempt = insert_attempt(
@@ -3286,6 +3456,7 @@ mod tests {
             &request_sha,
             &manifest_sha,
             "client-key:no-roots",
+            2,
         )
         .unwrap();
         assert_rejected_without_mutation(
@@ -3339,11 +3510,21 @@ mod tests {
         );
         let changed_proof = migrated.connection().execute(
             "UPDATE local_resolution_reservation_proofs
-             SET request_record_id='request:changed' WHERE reservation='reservation'",
+             SET composition_source_record_id='source:changed'
+             WHERE reservation='reservation'",
             [],
         );
         assert!(
             changed_proof.is_err(),
+            "the exact request/source proof is immutable"
+        );
+        let changed_request_proof = migrated.connection().execute(
+            "UPDATE local_resolution_reservation_proofs
+             SET request_record_id='request:changed' WHERE reservation='reservation'",
+            [],
+        );
+        assert!(
+            changed_request_proof.is_err(),
             "the exact request proof is immutable"
         );
         let appended_root = migrated.connection().execute(
@@ -3369,14 +3550,16 @@ mod tests {
         let cross_epoch_key = migrated.connection().execute(
             "INSERT INTO local_resolution_reservation_proofs
                  (reservation,target,issuer,authority_epoch,client_key,wave,
-                  request_record_id,request_object_sha256,input_manifest_object_sha256,
+                  request_record_id,request_object_sha256,composition_source_record_id,
+                  composition_source_object_sha256,input_manifest_object_sha256,
                   trigger_sha256,project_policy,objective_policy,price_profile,
                   dispatch_limits,reserved_envelope,reservation_attempt_limit,
                   deadline_ms,created_ms)
              VALUES ('reservation:retry','target','issuer','epoch-2','client-key','wave',
-                     'request:other',?1,?2,?3,'project-policy','objective-policy',
+                     'request:other',?1,'source:other',?2,?3,?4,
+                     'project-policy','objective-policy',
                      'price-profile','v1:1024:10:1024:4096:1024',X'06',1,999,102)",
-            rusqlite::params![request_sha, manifest_sha, trigger_sha],
+            rusqlite::params![request_sha, source_sha, manifest_sha, trigger_sha],
         );
         assert!(
             cross_epoch_key.is_err(),
