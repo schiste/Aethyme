@@ -638,15 +638,21 @@ fn locked_runtime_file_is_retained_and_resumable() {
 #[test]
 fn ephemeral_repositories_never_anchor_worktrees_in_durable_host_state() {
     const CHILD_ENV: &str = "AETHYME_TEST_DEFAULT_EPHEMERAL_PLACEMENT";
+    const HOME_MARKER: &str = ".aethyme-test-ephemeral-placement-home";
     if std::env::var_os(CHILD_ENV).is_none() {
         let private_home = tempfile::tempdir().unwrap();
+        std::fs::write(
+            private_home.path().join(HOME_MARKER),
+            "owned by placement test\n",
+        )
+        .unwrap();
         let output = Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
                 "ephemeral_repositories_never_anchor_worktrees_in_durable_host_state",
                 "--nocapture",
             ])
-            .env(CHILD_ENV, "1")
+            .env(CHILD_ENV, private_home.path())
             .env("HOME", private_home.path())
             .env_remove("AETHYME_WORKTREE_ROOT")
             .env_remove("AETHYME_HOST_STATE_DIR")
@@ -661,6 +667,33 @@ fn ephemeral_repositories_never_anchor_worktrees_in_durable_host_state() {
         );
         return;
     }
+    // An inherited sentinel must never bypass environment isolation. Validate
+    // the parent's owned home and all placement overrides before opening state.
+    for name in [
+        "AETHYME_WORKTREE_ROOT",
+        "AETHYME_HOST_STATE_DIR",
+        "XDG_STATE_HOME",
+    ] {
+        assert!(
+            std::env::var_os(name).is_none(),
+            "unsanitized child environment: {name}"
+        );
+    }
+    let private_home = PathBuf::from(std::env::var_os(CHILD_ENV).unwrap())
+        .canonicalize()
+        .unwrap();
+    let home = PathBuf::from(std::env::var_os("HOME").unwrap())
+        .canonicalize()
+        .unwrap();
+    assert_eq!(
+        home, private_home,
+        "placement child must use its parent's owned HOME"
+    );
+    assert!(home.starts_with(std::env::temp_dir().canonicalize().unwrap()));
+    assert_eq!(
+        std::fs::read_to_string(home.join(HOME_MARKER)).unwrap(),
+        "owned by placement test\n"
+    );
     // This tests the production default. The shared fixture intentionally
     // supplies a library override and therefore cannot exercise that default.
     let tmp = Fixture::new();
