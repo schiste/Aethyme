@@ -793,18 +793,20 @@ fn cancellation_while_waiting_for_wave_write_lock_prevents_request_link() {
     .unwrap();
     let request_ref = request.record().clone();
     let revision = id(&wave.spec.revision).unwrap();
-    let archive_guard = archive_use(&mut f.store).unwrap();
+    let archive_guard = archive_use(&f.store).unwrap();
     let response_guard = crate::collaboration_sensitive::response_use(&f.store).unwrap();
-    let authority_guard = target::authorize(&mut f.store, &owner).unwrap();
+    let authority_guard = target::authorize(&f.store, &owner).unwrap();
     retain_resolution_request(
         &mut f.store,
         &owner,
         &revision,
         &request,
         &source.request,
-        &archive_guard,
-        &response_guard,
-        &authority_guard,
+        RetentionGuards {
+            archive: &archive_guard,
+            response: &response_guard,
+            authority: &authority_guard,
+        },
     )
     .unwrap();
     let state = current(&f.store, &owner, &wave).unwrap();

@@ -374,13 +374,19 @@ pub enum WaveError {
     #[error(transparent)]
     Compose(#[from] composer::ComposeError),
     #[error(transparent)]
-    Resolution(#[from] resolution::ResolutionError),
+    Resolution(Box<resolution::ResolutionError>),
     #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error(transparent)]
     Sqlite(#[from] rusqlite::Error),
     #[error(transparent)]
     Json(#[from] serde_json::Error),
+}
+
+impl From<resolution::ResolutionError> for WaveError {
+    fn from(error: resolution::ResolutionError) -> Self {
+        Self::Resolution(Box::new(error))
+    }
 }
 
 fn id(value: &str) -> Result<RecordId, WaveError> {
@@ -1061,6 +1067,12 @@ fn load_composition_source(
     Ok((wave, Some(source)))
 }
 
+struct RetentionGuards<'a> {
+    archive: &'a crate::collaboration_gc::ArchiveUse,
+    response: &'a crate::collaboration_sensitive::ResponseUse,
+    authority: &'a crate::local_authority::Guard,
+}
+
 fn retain_composition_source(
     store: &mut CollaborationStore,
     owner: &ControllerOwner,
@@ -1068,9 +1080,7 @@ fn retain_composition_source(
     reference: &resolution::RecordRef,
     source: &CompositionSource,
     pinned: &target::TargetRevision,
-    archive_guard: &crate::collaboration_gc::ArchiveUse,
-    response_guard: &crate::collaboration_sensitive::ResponseUse,
-    authority_guard: &crate::local_authority::Guard,
+    guards: RetentionGuards<'_>,
 ) -> Result<(), WaveError> {
     let candidate = source
         .composition
@@ -1132,13 +1142,13 @@ fn retain_composition_source(
         );
     }
     let snapshots = snapshots.into_values().collect::<Vec<_>>();
-    let objects = [reference.object.clone(), recipe.object.clone()];
+    let objects = [reference.object, recipe.object];
     let retention = target::ArtifactRetentionPermit::new(
         store,
         owner,
-        archive_guard,
-        response_guard,
-        authority_guard,
+        guards.archive,
+        guards.response,
+        guards.authority,
     )?;
     target::retain_artifacts_under_guards(store, revision, &snapshots, &objects, &retention)?;
     Ok(())
@@ -1228,9 +1238,7 @@ fn retain_resolution_request(
     revision: &RecordId,
     request: &resolution::ResolutionRequest,
     composition_request: &CompositionRequest,
-    archive_guard: &crate::collaboration_gc::ArchiveUse,
-    response_guard: &crate::collaboration_sensitive::ResponseUse,
-    authority_guard: &crate::local_authority::Guard,
+    guards: RetentionGuards<'_>,
 ) -> Result<(), WaveError> {
     let mut snapshots = std::collections::BTreeMap::new();
     let mut add = |snapshot: &SourceSnapshotId| {
@@ -1257,13 +1265,13 @@ fn retain_resolution_request(
         add(&retained.result.snapshot_id);
     }
     let snapshots = snapshots.into_values().collect::<Vec<_>>();
-    let object = request.record().object.clone();
+    let object = request.record().object;
     let retention = target::ArtifactRetentionPermit::new(
         store,
         owner,
-        archive_guard,
-        response_guard,
-        authority_guard,
+        guards.archive,
+        guards.response,
+        guards.authority,
     )?;
     target::retain_artifacts_under_guards(store, revision, &snapshots, &[object], &retention)?;
     Ok(())
@@ -2131,9 +2139,11 @@ pub(crate) fn compose_with_source(
                         &id(&wave.spec.revision)?,
                         &request_record,
                         &request,
-                        &_archive_guard,
-                        &_response_guard,
-                        &authority_guard,
+                        RetentionGuards {
+                            archive: &_archive_guard,
+                            response: &_response_guard,
+                            authority: &authority_guard,
+                        },
                     ) {
                         Ok(()) => {
                             resolution_request = Some(request_record.record().clone());
@@ -2230,9 +2240,11 @@ pub(crate) fn compose_with_source(
                         &reference,
                         &retained_source,
                         &pinned,
-                        &_archive_guard,
-                        &_response_guard,
-                        &authority_guard,
+                        RetentionGuards {
+                            archive: &_archive_guard,
+                            response: &_response_guard,
+                            authority: &authority_guard,
+                        },
                     )
                 })();
                 match validate {
@@ -2359,9 +2371,11 @@ pub(crate) fn raise_resolution_for_failed_checks(
         &revision,
         &request,
         &source.request,
-        &_archive_guard,
-        &response_guard,
-        &authority_guard,
+        RetentionGuards {
+            archive: &_archive_guard,
+            response: &response_guard,
+            authority: &authority_guard,
+        },
     )?;
     if cancel.load(Ordering::SeqCst) {
         return Err(WaveError::Stale);
