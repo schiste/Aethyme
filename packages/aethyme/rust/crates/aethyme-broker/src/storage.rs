@@ -3684,37 +3684,46 @@ mod tests {
 
         let resource_db_path = tmp.path().join("host-state/host-resources.db");
         let invalid_candidates = [
-            StoragePreparationCandidate {
-                path: foreign_key,
-                repository: "notes".into(),
-                key: "aaaaaaaaaaaa".into(),
-                estimated_bytes: Some(9),
-                estimated_inodes: Some(1),
-                reason: "forged foreign candidate".into(),
-            },
-            StoragePreparationCandidate {
-                path: uppercase_repository.clone(),
-                repository: TEST_PREPARATION_REPOSITORY.to_uppercase(),
-                key: "bbbbbbbbbbbb".into(),
-                estimated_bytes: Some(9),
-                estimated_inodes: Some(1),
-                reason: "forged uppercase repository candidate".into(),
-            },
-            StoragePreparationCandidate {
-                path: uppercase_key.clone(),
-                repository: TEST_PREPARATION_REPOSITORY.into(),
-                key: "CCCCCCCCCCCC".into(),
-                estimated_bytes: Some(9),
-                estimated_inodes: Some(1),
-                reason: "forged uppercase key candidate".into(),
-            },
+            (
+                StoragePreparationCandidate {
+                    path: foreign_key,
+                    repository: "notes".into(),
+                    key: "aaaaaaaaaaaa".into(),
+                    estimated_bytes: Some(9),
+                    estimated_inodes: Some(1),
+                    reason: "forged foreign candidate".into(),
+                },
+                cache_root.as_path(),
+            ),
+            (
+                StoragePreparationCandidate {
+                    path: uppercase_repository.clone(),
+                    repository: TEST_PREPARATION_REPOSITORY.to_uppercase(),
+                    key: "bbbbbbbbbbbb".into(),
+                    estimated_bytes: Some(9),
+                    estimated_inodes: Some(1),
+                    reason: "forged uppercase repository candidate".into(),
+                },
+                cache_root.as_path(),
+            ),
+            (
+                StoragePreparationCandidate {
+                    path: uppercase_key.clone(),
+                    repository: TEST_PREPARATION_REPOSITORY.into(),
+                    key: "CCCCCCCCCCCC".into(),
+                    estimated_bytes: Some(9),
+                    estimated_inodes: Some(1),
+                    reason: "forged uppercase key candidate".into(),
+                },
+                uppercase_key_cache_root.as_path(),
+            ),
         ];
-        for candidate in invalid_candidates {
+        for (candidate, candidate_cache_root) in invalid_candidates {
             let error = apply_preparation_candidate_with_lease_at(
                 &candidate,
                 &[],
                 &resource_db_path,
-                &cache_root,
+                candidate_cache_root,
             )
             .expect_err("manual removal must reject unmanaged path shapes");
             assert!(error.contains("managed"));
