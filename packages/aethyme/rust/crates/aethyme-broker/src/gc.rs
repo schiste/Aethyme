@@ -205,6 +205,62 @@ fn bounded_artifact_diagnostic_path(path: &str) -> String {
         .collect()
 }
 
+fn revoke_interrupted_paths_under_root(
+    store: &mut crate::BrokerStore,
+    interrupted_paths: &mut Vec<String>,
+    interrupted_paths_valid: &mut bool,
+    root: &Path,
+    reason: &'static str,
+    revoked: &mut Vec<RevokedInterruptedPath>,
+    blocked: &mut Vec<BlockedInterruptedPath>,
+) -> Result<bool, BrokerOpError> {
+    let revoked_paths = interrupted_paths
+        .iter()
+        .filter(|path| Path::new(path).starts_with(root))
+        .cloned()
+        .collect::<Vec<_>>();
+    if revoked_paths.is_empty() {
+        return Ok(true);
+    }
+    if !*interrupted_paths_valid {
+        blocked.extend(
+            revoked_paths
+                .into_iter()
+                .map(|path| BlockedInterruptedPath {
+                    path: Some(path),
+                    reason: "queue_unavailable_for_revocation",
+                }),
+        );
+        return Ok(false);
+    }
+    let mut updated_paths = interrupted_paths.clone();
+    updated_paths.retain(|path| !revoked_paths.contains(path));
+    if persist_interrupted_paths(store, &updated_paths)? {
+        *interrupted_paths = updated_paths;
+        revoked.extend(
+            revoked_paths
+                .into_iter()
+                .map(|path| RevokedInterruptedPath {
+                    path,
+                    reason,
+                    canonical_path: None,
+                }),
+        );
+        Ok(true)
+    } else {
+        *interrupted_paths_valid = false;
+        blocked.extend(
+            revoked_paths
+                .into_iter()
+                .map(|path| BlockedInterruptedPath {
+                    path: Some(path),
+                    reason: "queue_update_unavailable",
+                }),
+        );
+        Ok(false)
+    }
+}
+
 /// Re-prove a remembered path before continuing removal. A known mismatch
 /// revokes only this path's old removal authority; an I/O failure is different
 /// because it says nothing about whether that authority is still valid.
@@ -3406,11 +3462,64 @@ impl Broker {
                 continue;
             }
             let sheltered = overlaps_live_worktree(&root, &live_worktrees);
-            if sheltered
-                || !is_real_directory(&root)
-                || !self.is_broker_owned_worktree(&session, &root)
-            {
+            if sheltered {
                 continue;
+            }
+            let root_is_directory = match std::fs::symlink_metadata(&root) {
+                Ok(metadata) if metadata.file_type().is_dir() => true,
+                Ok(_) => false,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                Err(_) => {
+                    blocked_interrupted_paths.push(BlockedInterruptedPath {
+                        path: Some(root.to_string_lossy().into_owned()),
+                        reason: "worktree_metadata_unavailable",
+                    });
+                    scan_completed = false;
+                    continue;
+                }
+            };
+            if !root_is_directory {
+                if !revoke_interrupted_paths_under_root(
+                    self.store(),
+                    &mut interrupted_paths,
+                    &mut interrupted_paths_valid,
+                    &root,
+                    "worktree_root_revoked",
+                    &mut revoked_interrupted_paths,
+                    &mut blocked_interrupted_paths,
+                )? {
+                    scan_completed = false;
+                }
+                continue;
+            }
+            let ownership = {
+                let _git_deadline = crate::git::limit_git_until(discovery_deadline);
+                self.is_broker_owned_worktree_checked(&session, &root)
+            };
+            match ownership {
+                Ok(true) => {}
+                Ok(false) => {
+                    if !revoke_interrupted_paths_under_root(
+                        self.store(),
+                        &mut interrupted_paths,
+                        &mut interrupted_paths_valid,
+                        &root,
+                        "worktree_ownership_revoked",
+                        &mut revoked_interrupted_paths,
+                        &mut blocked_interrupted_paths,
+                    )? {
+                        scan_completed = false;
+                    }
+                    continue;
+                }
+                Err(_) => {
+                    blocked_interrupted_paths.push(BlockedInterruptedPath {
+                        path: Some(root.to_string_lossy().into_owned()),
+                        reason: "worktree_ownership_unavailable",
+                    });
+                    scan_completed = false;
+                    continue;
+                }
             }
             let checkout_result = {
                 let _git_deadline = crate::git::limit_git_until(discovery_deadline);
@@ -5952,6 +6061,24 @@ mod tests {
         assert!(later_cache.is_dir());
         let later_session = broker.store().session(later_id).unwrap();
         assert!(broker.is_broker_owned_worktree(&later_session, &later_worktree));
+        assert!(
+            broker
+                .is_broker_owned_worktree_checked(&later_session, &later_worktree)
+                .unwrap()
+        );
+        assert!(
+            !broker
+                .is_broker_owned_worktree_checked(&later_session, root)
+                .unwrap()
+        );
+        let expired_ownership = {
+            let _deadline = crate::git::limit_git_until(Instant::now() - Duration::from_millis(1));
+            broker.is_broker_owned_worktree_checked(&later_session, &later_worktree)
+        };
+        assert!(matches!(
+            expired_ownership,
+            Err(crate::GitError::TimedOut { .. })
+        ));
         let later_checkout = GitRepo::discover(&later_worktree).unwrap();
         assert!(later_checkout.path_is_ignored_checked("target").unwrap());
 

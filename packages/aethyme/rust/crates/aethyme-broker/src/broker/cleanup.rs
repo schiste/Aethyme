@@ -1,5 +1,14 @@
 use super::*;
 
+fn ownership_inspection_error(path: &Path, action: &str, error: std::io::Error) -> GitError {
+    GitError::UntrustedOutput {
+        detail: format!(
+            "could not {action} worktree ownership path {}: {error}",
+            path.display()
+        ),
+    }
+}
+
 impl Broker {
     /// Whether a directory is the remains of a worktree of *this* repository
     /// whose registration is already gone.
@@ -11,43 +20,86 @@ impl Broker {
     /// establish which repository the remains belong to, not that they are safe
     /// to touch.
     pub(super) fn is_orphaned_worktree_of_this_repository(&self, path: &Path) -> bool {
-        let Ok(expected) = self.main_git_common_dir() else {
-            return false;
-        };
-        let Ok(pointer) = std::fs::read_to_string(path.join(".git")) else {
-            return false;
-        };
+        self.is_orphaned_worktree_of_this_repository_checked(path)
+            .unwrap_or(false)
+    }
+
+    pub(super) fn is_orphaned_worktree_of_this_repository_checked(
+        &self,
+        path: &Path,
+    ) -> Result<bool, GitError> {
+        let expected = self.main_git_common_dir()?;
+        let pointer_path = path.join(".git");
+        match std::fs::symlink_metadata(&pointer_path) {
+            Ok(metadata) if metadata.file_type().is_file() => {}
+            Ok(_) => return Ok(false),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(ownership_inspection_error(&pointer_path, "inspect", error)),
+        }
+        let pointer = std::fs::read_to_string(&pointer_path)
+            .map_err(|error| ownership_inspection_error(&pointer_path, "read", error))?;
         let Some(gitdir) = pointer.trim().strip_prefix("gitdir:") else {
-            return false;
+            return Ok(false);
         };
         let gitdir = PathBuf::from(gitdir.trim());
+        let gitdir = if gitdir.is_absolute() {
+            gitdir
+        } else {
+            path.join(gitdir)
+        };
         // The gitdir itself is gone -- that is the definition of this state --
         // so compare the `worktrees/<name>` parent it named, not the leaf.
         let Some(worktrees_dir) = gitdir.parent() else {
-            return false;
+            return Ok(false);
         };
         if worktrees_dir.file_name() != Some(std::ffi::OsStr::new("worktrees")) {
-            return false;
+            return Ok(false);
         }
         let Some(claimed_common_dir) = worktrees_dir.parent() else {
-            return false;
+            return Ok(false);
         };
-        let canonical = |path: &Path| path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-        canonical(claimed_common_dir) == canonical(&expected)
+        match std::fs::symlink_metadata(&gitdir) {
+            Ok(_) => return Ok(false),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(ownership_inspection_error(&gitdir, "inspect", error)),
+        }
+        let canonical = |candidate: &Path| match candidate.canonicalize() {
+            Ok(path) => Ok(path),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Ok(candidate.to_path_buf())
+            }
+            Err(error) => Err(ownership_inspection_error(candidate, "resolve", error)),
+        };
+        Ok(canonical(claimed_common_dir)? == canonical(&expected)?)
     }
 
     pub(super) fn worktree_root_marker_matches(&self, root: &Path) -> bool {
-        let Ok(bytes) = std::fs::read(root.join(WORKTREE_ROOT_MARKER)) else {
-            return false;
-        };
+        self.worktree_root_marker_matches_checked(root)
+            .unwrap_or(false)
+    }
+
+    pub(super) fn worktree_root_marker_matches_checked(
+        &self,
+        root: &Path,
+    ) -> Result<bool, GitError> {
+        let marker_path = root.join(WORKTREE_ROOT_MARKER);
+        match std::fs::symlink_metadata(&marker_path) {
+            Ok(metadata) if metadata.file_type().is_file() => {}
+            Ok(_) => return Ok(false),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(ownership_inspection_error(&marker_path, "inspect", error)),
+        }
+        let bytes = std::fs::read(&marker_path)
+            .map_err(|error| ownership_inspection_error(&marker_path, "read", error))?;
         let Ok(marker) = serde_json::from_slice::<WorktreeRootMarker>(&bytes) else {
-            return false;
+            return Ok(false);
         };
-        marker.schema_version == WORKTREE_ROOT_SCHEMA_VERSION
-            && self
-                .repository_worktree_key()
-                .is_ok_and(|key| marker.repository_key == key)
-            && marker.repository_root == self.main_root
+        if marker.schema_version != WORKTREE_ROOT_SCHEMA_VERSION {
+            return Ok(false);
+        }
+        let common_dir = self.main_git_common_dir()?;
+        let repository_key = crate::host_state::repository_key(&self.main_root, Some(&common_dir));
+        Ok(marker.repository_key == repository_key && marker.repository_root == self.main_root)
     }
 
     /// The reason for a cleanup inspection that could not complete. In a

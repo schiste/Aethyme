@@ -1003,47 +1003,77 @@ impl Broker {
     }
 
     pub(crate) fn is_broker_owned_worktree(&self, session: &Session, path: &Path) -> bool {
+        self.is_broker_owned_worktree_checked(session, path)
+            .unwrap_or(false)
+    }
+
+    /// Check worktree ownership without collapsing Git or filesystem
+    /// uncertainty into the same `false` result as a known non-owned path.
+    /// Callers doing bounded maintenance must hold `limit_git_until` around
+    /// this method so all nested Git invocations share their pass deadline.
+    pub(crate) fn is_broker_owned_worktree_checked(
+        &self,
+        session: &Session,
+        path: &Path,
+    ) -> Result<bool, GitError> {
         if session.origin != SessionOrigin::Spawned || path == self.main_root.as_path() {
-            return false;
+            return Ok(false);
         }
         let Some(parent) = path.parent() else {
-            return false;
+            return Ok(false);
         };
-        let parent = parent
-            .canonicalize()
-            .unwrap_or_else(|_| parent.to_path_buf());
-        let legacy = self
-            .legacy_broker_worktree_root()
-            .canonicalize()
-            .unwrap_or_else(|_| self.legacy_broker_worktree_root());
-        let owned_root = parent == legacy || self.worktree_root_marker_matches(&parent);
+        let parent = canonical_path_or_missing(parent)?;
+        let legacy_root = self.legacy_broker_worktree_root();
+        let legacy = canonical_path_or_missing(&legacy_root)?;
+        let owned_root = parent == legacy || self.worktree_root_marker_matches_checked(&parent)?;
         if !owned_root {
-            return false;
+            return Ok(false);
         }
-        if !path.exists() {
-            return true;
+        match std::fs::symlink_metadata(path) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+            Err(error) => return Err(ownership_inspection_error(path, "inspect", error)),
         }
-        let Ok(canonical_path) = path.canonicalize() else {
-            return false;
-        };
+        let canonical_path = canonical_path_or_missing(path)?;
         if canonical_path.parent() != Some(parent.as_path()) {
-            return false;
+            return Ok(false);
         }
-        let Ok(checkout) = GitRepo::discover(&canonical_path) else {
-            // A worktree whose removal was interrupted after deregistration is
-            // no longer discoverable, so this arm used to report it as "outside
-            // the broker-owned worktree directory" -- a claim that is false on
-            // its face, since containment under the owned root was proven
-            // above. That wrong answer is what blocked the documented recovery
-            // and forced a manual `rm -rf` (#165). Fall back to the orphan's
-            // own `.git` pointer, which still names the repository it belonged
-            // to.
-            return self.is_orphaned_worktree_of_this_repository(&canonical_path);
+        let checkout = match GitRepo::discover(&canonical_path) {
+            Ok(checkout) => checkout,
+            Err(discovery_error) => {
+                // The pointer is independent evidence only if it names this
+                // repository and its gitdir is actually gone. A timeout or
+                // other Git failure while the gitdir still exists must remain
+                // unavailable, not become an ownership refusal or approval.
+                if self
+                    .is_orphaned_worktree_of_this_repository_checked(&canonical_path)
+                    .unwrap_or(false)
+                {
+                    return Ok(true);
+                }
+                return Err(discovery_error);
+            }
         };
-        match (checkout.git_common_dir(), self.main_git_common_dir()) {
-            (Ok(actual), Ok(expected)) => actual == expected,
-            _ => false,
-        }
+        let actual = checkout.git_common_dir()?;
+        let expected = self.main_git_common_dir()?;
+        Ok(actual == expected)
+    }
+}
+
+fn canonical_path_or_missing(path: &Path) -> Result<PathBuf, GitError> {
+    match path.canonicalize() {
+        Ok(path) => Ok(path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(path.to_path_buf()),
+        Err(error) => Err(ownership_inspection_error(path, "resolve", error)),
+    }
+}
+
+fn ownership_inspection_error(path: &Path, action: &str, error: std::io::Error) -> GitError {
+    GitError::UntrustedOutput {
+        detail: format!(
+            "could not {action} worktree ownership path {}: {error}",
+            path.display()
+        ),
     }
 }
 
