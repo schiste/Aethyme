@@ -839,6 +839,8 @@ const MIGRATIONS: &[(i64, &str)] = &[
                  OR (OLD.async_state = 'importing' AND NEW.async_state = 'settled')
              ))
              OR (NEW.async_state = 'importing' AND NEW.response_sha256 IS NULL)
+             OR (OLD.response_sha256 IS NOT NULL
+                 AND NEW.response_sha256 IS NOT OLD.response_sha256)
              OR (NEW.async_state = 'settled' AND NEW.outcome IS NULL)
              OR (NEW.async_state != 'settled' AND NEW.outcome IS NOT OLD.outcome)
              OR (NEW.async_state != 'settled' AND (
@@ -2394,29 +2396,7 @@ mod tests {
     #[test]
     fn schema_27_preserves_unsettled_legacy_attempts_as_unknown() {
         let host = tempfile::tempdir().unwrap();
-        let store = open(host.path(), &[]).unwrap();
-        store
-            .connection()
-            .execute(
-                "INSERT INTO resolution_attempts
-                 (decision_key,kind,members,paths,request_record_id,resolver,outcome,charged_ms,
-                  attempt_number,async_state)
-                 VALUES('legacy-decision','conflict','member','path','req:legacy',
-                        'legacy-resolver',NULL,1,1,'dispatching')",
-                [],
-            )
-            .unwrap();
-        store
-            .connection()
-            .execute(
-                "INSERT INTO resolution_attempts
-                 (decision_key,kind,members,paths,request_record_id,resolver,outcome,charged_ms,
-                  attempt_number,async_state)
-                 VALUES('legacy-terminal','conflict','member','path','req:terminal',
-                        'legacy-resolver','resolved',2,1,'settled')",
-                [],
-            )
-            .unwrap();
+        let mut store = open(host.path(), &[]).unwrap();
         store
             .connection()
             .execute_batch(
@@ -2452,6 +2432,26 @@ mod tests {
                      WHERE key IN ('schema_version','min_compatible_schema');",
             )
             .unwrap();
+        store
+            .connection()
+            .execute(
+                "INSERT INTO resolution_attempts
+                 (decision_key,kind,members,paths,request_record_id,resolver,outcome,charged_ms)
+                 VALUES('legacy-decision','conflict','member','path','req:legacy',
+                        'legacy-resolver',NULL,1)",
+                [],
+            )
+            .unwrap();
+        store
+            .connection()
+            .execute(
+                "INSERT INTO resolution_attempts
+                 (decision_key,kind,members,paths,request_record_id,resolver,outcome,charged_ms)
+                 VALUES('legacy-terminal','conflict','member','path','req:terminal',
+                        'legacy-resolver','resolved',2)",
+                [],
+            )
+            .unwrap();
         let stale_writer_path = store.project_dir().join("state.db");
         drop(store);
         let stale_writer = rusqlite::Connection::open(stale_writer_path).unwrap();
@@ -2460,7 +2460,7 @@ mod tests {
              VALUES(?1,?2,?3,?4,?5,?6,?7)";
         drop(stale_writer.prepare_cached(stale_insert).unwrap());
 
-        let migrated = open(host.path(), &[]).unwrap();
+        let mut migrated = open(host.path(), &[]).unwrap();
         let (state, outcome): (String, Option<String>) = migrated
             .read_connection()
             .query_row(
@@ -2502,6 +2502,52 @@ mod tests {
             )
             .unwrap();
         assert_eq!(inserted_v27, 1);
+
+        let first_response = "2".repeat(64);
+        let substituted_response = "3".repeat(64);
+        migrated
+            .connection()
+            .execute(
+                "UPDATE resolution_attempts SET async_state='dispatching'
+                 WHERE async_token='attempt:new'",
+                [],
+            )
+            .unwrap();
+        migrated
+            .connection()
+            .execute(
+                "UPDATE resolution_attempts
+                 SET async_state='importing',response_sha256=?1
+                 WHERE async_token='attempt:new'",
+                [&first_response],
+            )
+            .unwrap();
+        assert!(
+            migrated
+                .connection()
+                .execute(
+                    "UPDATE resolution_attempts
+                     SET async_state='settled',outcome='resolved',response_sha256=?1
+                     WHERE async_token='attempt:new'",
+                    [&substituted_response],
+                )
+                .is_err(),
+            "settlement cannot replace the response digest fixed at import"
+        );
+        let bound_response: (String, String, Option<String>) = migrated
+            .read_connection()
+            .query_row(
+                "SELECT async_state,response_sha256,outcome FROM resolution_attempts
+                 WHERE async_token='attempt:new'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            bound_response,
+            ("importing".into(), first_response, None),
+            "rejected digest substitution leaves the bound import untouched"
+        );
         assert!(
             migrated
                 .connection()

@@ -78,6 +78,7 @@ pub const MAX_SYNTHESIS_ATTEMPTS: u32 = 2;
 
 /// Maximum encoded asynchronous response retained for one attempt.
 const MAX_ASYNC_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
+const ASYNC_ATTEMPT_SCHEMA_VERSION: i64 = 27;
 const ASYNC_RESPONSE_MAGIC: &[u8] = b"aethyme-resolution-response\0\x01";
 const ASYNC_INPUT_MANIFEST_MAGIC: &[u8] = b"aethyme-resolution-inputs\0\x01";
 pub const ASYNC_RESPONSE_ENVELOPE_SCHEMA: &str =
@@ -197,6 +198,10 @@ pub enum ResolutionError {
     InvalidRequest(String),
     #[error("resolution request {record}: {detail}")]
     RecordMismatch { record: String, detail: String },
+    #[error(
+        "asynchronous resolution attempts require schema {required} or newer (store schema {actual})"
+    )]
+    UnsupportedSchema { required: i64, actual: i64 },
     #[error("{path} in {snapshot} is not an input of this resolution request")]
     OutOfScopeRead { snapshot: String, path: String },
 }
@@ -209,6 +214,7 @@ impl ResolutionError {
             Self::Sqlite(_) => "sqlite",
             Self::InvalidRequest(_) => "invalid_request",
             Self::RecordMismatch { .. } => "record_mismatch",
+            Self::UnsupportedSchema { .. } => "unsupported_schema",
             Self::OutOfScopeRead { .. } => "out_of_scope_read",
         }
     }
@@ -2012,17 +2018,31 @@ impl ResolutionAttemptStatus {
 pub enum BeginResolutionAttempt {
     Started {
         status: ResolutionAttemptStatus,
-        request: ResolutionRequest,
+        request: Box<ResolutionRequest>,
         input_manifest: ResolutionInputManifest,
     },
     Existing(ResolutionAttemptStatus),
     BudgetExhausted(Allowance),
 }
 
+type ExistingAttemptRow = (
+    String,
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+);
+
 /// Begin one charged asynchronous attempt. `session_label` is provenance only;
 /// current-wave eligibility and agent appointment must be proved by a future
-/// controller caller. This API exports no live authority. `client_key` makes
-/// command retries idempotent.
+/// controller caller. This API exports no live authority or dispatch, and it
+/// cannot prevent a caller from sharing a separately known request beforehand.
+/// A newly prepared payload is returned only after the charge and its retained
+/// roots commit. Source inputs and audit evidence remain rooted indefinitely
+/// in schema 27; a later explicit release/reconciliation lifecycle must prove
+/// no late import is possible before those roots can be released. `client_key`
+/// makes command retries idempotent.
 pub fn begin_attempt(
     store: &mut CollaborationStore,
     repo: &Path,
@@ -2051,14 +2071,7 @@ pub fn begin_attempt(
     let transaction = store
         .connection()
         .transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let existing: Option<(
-        String,
-        String,
-        String,
-        String,
-        Option<String>,
-        Option<String>,
-    )> = transaction
+    let existing: Option<ExistingAttemptRow> = transaction
         .query_row(
             "SELECT async_token, request_record_id, request_sha256, input_sha256,
                     input_manifest_sha256, dispatch_limits
@@ -2152,7 +2165,7 @@ pub fn begin_attempt(
     let status = attempt_status_conn(store.read_connection(), &token, session_label)?;
     Ok(BeginResolutionAttempt::Started {
         status,
-        request,
+        request: Box::new(request),
         input_manifest,
     })
 }
@@ -2175,6 +2188,22 @@ pub(crate) fn attempt_status_from_connection(
 ) -> Result<ResolutionAttemptStatus, ResolutionError> {
     validate_attempt_binding(token, "attempt token")?;
     validate_attempt_binding(session_label, "session label")?;
+    let actual: Option<String> = connection
+        .query_row(
+            "SELECT value FROM meta WHERE key='schema_version'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let actual = actual
+        .and_then(|version| version.parse::<i64>().ok())
+        .unwrap_or_default();
+    if actual < ASYNC_ATTEMPT_SCHEMA_VERSION {
+        return Err(ResolutionError::UnsupportedSchema {
+            required: ASYNC_ATTEMPT_SCHEMA_VERSION,
+            actual,
+        });
+    }
     attempt_status_conn(connection, token, session_label)
 }
 
@@ -2202,9 +2231,10 @@ pub fn exported_attempt_packet(
     Ok((request, manifest))
 }
 
-/// Commit the dispatch intent before the caller hands the exported request to
-/// an external agent. A repeated call or a process restart never returns the
-/// payload again.
+/// Record operator dispatch intent before the caller hands the exported
+/// request to an external agent. This does not dispatch, prove appointment, or
+/// authenticate `session_label`. A repeated call or process restart never
+/// returns the payload again.
 pub fn mark_attempt_dispatching(
     store: &mut CollaborationStore,
     token: &str,
@@ -2334,29 +2364,31 @@ fn validate_attempt_binding(value: &str, label: &str) -> Result<(), ResolutionEr
     Ok(())
 }
 
+type AttemptStatusRow = (
+    String,
+    Option<i64>,
+    String,
+    String,
+    Option<String>,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
 fn attempt_status_conn(
     connection: &rusqlite::Connection,
     token: &str,
     session_label: &str,
 ) -> Result<ResolutionAttemptStatus, ResolutionError> {
-    let row: Option<(
-        String,
-        Option<i64>,
-        String,
-        String,
-        Option<String>,
-        String,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        String,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-    )> = connection
+    let row: Option<AttemptStatusRow> = connection
         .query_row(
             "SELECT coalesce(async_token,''), attempt_number, request_record_id,
                     coalesce(request_sha256,''), response_sha256, async_state,
@@ -2909,7 +2941,7 @@ impl AttemptResponseBody {
 }
 
 fn decode_hex_bytes(text: &str) -> Result<Vec<u8>, ResolutionError> {
-    if text.len() % 2 != 0
+    if !text.len().is_multiple_of(2)
         || !text
             .bytes()
             .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
@@ -2967,6 +2999,8 @@ pub fn decode_attempt_response_envelope(
 /// Import a response envelope previously bound to the durable attempt. The
 /// status is re-read immediately before import to reject stale or retargeted
 /// packets; normal proposal validation and single-use settlement still apply.
+/// A synthesized result remains an unverified candidate for the controller's
+/// independent checks and acceptance gates.
 pub fn finish_bound_attempt(
     store: &mut CollaborationStore,
     repo: &Path,
@@ -4110,6 +4144,27 @@ mod tests {
                 .is_err()
             );
         }
+    }
+
+    #[test]
+    fn read_only_attempt_status_rejects_pre_v27_schema_typed() {
+        let connection = rusqlite::Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL) STRICT;
+                 INSERT INTO meta(key,value) VALUES('schema_version','26');",
+            )
+            .unwrap();
+        let error = attempt_status_from_connection(&connection, "attempt:test", "session:test")
+            .unwrap_err();
+        assert_eq!(error.code(), "unsupported_schema");
+        assert!(matches!(
+            &error,
+            ResolutionError::UnsupportedSchema {
+                required: 27,
+                actual: 26
+            }
+        ));
     }
 
     fn protection() -> Protection {
