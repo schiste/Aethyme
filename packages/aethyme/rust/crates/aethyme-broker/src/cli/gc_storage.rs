@@ -1039,28 +1039,6 @@ fn artifact_worker_environment_has(mut present: impl FnMut(&str) -> bool) -> boo
         .any(|key| present(key))
 }
 
-#[cfg(test)]
-mod artifact_worker_tests {
-    use super::*;
-
-    #[test]
-    fn hidden_worker_cli_rejects_untrusted_invocations_before_repository_open() {
-        assert!(validate_artifact_sweep_worker_invocation(None, false, 2, false).is_err());
-        assert!(validate_artifact_sweep_worker_invocation(Some("wrong"), false, 2, false).is_err());
-        assert!(validate_artifact_sweep_worker_invocation(Some("1"), true, 2, false).is_err());
-        assert!(validate_artifact_sweep_worker_invocation(Some("1"), false, 1, false).is_err());
-        assert!(validate_artifact_sweep_worker_invocation(Some("1"), false, 2, true).is_err());
-        assert!(validate_artifact_sweep_worker_invocation(Some("1"), false, 2, false).is_ok());
-        assert!(artifact_worker_environment_has(
-            |key| key == crate::BROKER_DB_ENV
-        ));
-        assert!(artifact_worker_environment_has(
-            |key| key == "AETHYME_TEST_DB_SUFFIX"
-        ));
-        assert!(!artifact_worker_environment_has(|_| false));
-    }
-}
-
 fn render_gc_sweep(report: &crate::ArtifactSweepReport) {
     let noun = if report.directories_reclaimed == 1 {
         "directory"
@@ -1144,4 +1122,26 @@ pub(super) fn run_storage(parsed: Parsed) -> Result<(), UsageError> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod artifact_worker_tests {
+    use super::*;
+
+    #[test]
+    fn hidden_worker_cli_rejects_untrusted_invocations_before_repository_open() {
+        assert!(validate_artifact_sweep_worker_invocation(None, false, 2, false).is_err());
+        assert!(validate_artifact_sweep_worker_invocation(Some("wrong"), false, 2, false).is_err());
+        assert!(validate_artifact_sweep_worker_invocation(Some("1"), true, 2, false).is_err());
+        assert!(validate_artifact_sweep_worker_invocation(Some("1"), false, 1, false).is_err());
+        assert!(validate_artifact_sweep_worker_invocation(Some("1"), false, 2, true).is_err());
+        assert!(validate_artifact_sweep_worker_invocation(Some("1"), false, 2, false).is_ok());
+        assert!(artifact_worker_environment_has(
+            |key| key == crate::BROKER_DB_ENV
+        ));
+        assert!(artifact_worker_environment_has(
+            |key| key == "AETHYME_TEST_DB_SUFFIX"
+        ));
+        assert!(!artifact_worker_environment_has(|_| false));
+    }
 }

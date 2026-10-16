@@ -1330,7 +1330,18 @@ fn a_live_session_keeps_its_build_cache() {
 
     // Without this the sweep would simply be disabled, and the assertion below
     // would hold for the wrong reason.
-    sweep(repo.path(), container.path());
+    enable_sweep(repo.path());
+    let report = sweep(repo.path(), container.path());
+    assert!(
+        report["budget_ms"]
+            .as_u64()
+            .is_some_and(|budget| budget > 0),
+        "the sweep must have a nonzero budget: {report}"
+    );
+    assert_eq!(
+        report["complete"], true,
+        "the sweep must actually run: {report}"
+    );
     assert!(
         target.exists(),
         "a session still in use must keep its build cache"

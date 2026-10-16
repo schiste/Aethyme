@@ -52,8 +52,11 @@ const ARTIFACT_SWEEP_STAMP_KEY: &str = "gc.artifact_sweep.last_run_ms";
 ///
 /// Without it an interrupted pass restarts at the lowest session id, so a
 /// budget smaller than one full scan services the head of the list forever and
-/// never reaches the backlog behind it. The cadence stamp records *when* a pass
-/// ran; this records *how far* it got (#222).
+/// never reaches the backlog behind it. An incompletely discovered worktree
+/// is recorded as an incomplete pass, but the cursor still advances past it;
+/// every later closed session gets a turn and no pass can claim completion
+/// while any worktree was unclassified. The cadence stamp records *when* a
+/// pass ran; this records *how far* it got (#222).
 const ARTIFACT_SWEEP_CURSOR_KEY: &str = "gc.artifact_sweep.cursor_session_id";
 /// When an unfinished pass last made progress on a broker open.
 ///
@@ -64,13 +67,16 @@ const ARTIFACT_SWEEP_CURSOR_KEY: &str = "gc.artifact_sweep.cursor_session_id";
 /// and hook call. Inline continuation is spaced by this instead.
 const ARTIFACT_SWEEP_PROGRESS_KEY: &str = "gc.artifact_sweep.last_partial_ms";
 
-/// The build cache an unfinished pass was part-way through removing.
+/// Build caches that an unfinished pass was part-way through removing.
 ///
 /// Unlinking a tree's contents updates its modification time, so without
-/// this the next pass mistook its own partial removal for a writer and
+/// this queue the next pass mistook its own partial removal for a writer and
 /// protected an idle open session's half-removed cache for another idle
-/// window. A cache already judged idle and partly removed is finished.
+/// window. Legacy single-path values remain readable; multiple in-progress
+/// trees are stored as a bounded JSON array.
 const ARTIFACT_SWEEP_INTERRUPTED_KEY: &str = "gc.artifact_sweep.interrupted_path";
+const ARTIFACT_SWEEP_INTERRUPTED_PATHS_MAX: usize = 32;
+const ARTIFACT_SWEEP_INTERRUPTED_VALUE_MAX_BYTES: usize = 64 * 1024;
 /// Durable request for the detached, cache-only continuation worker.
 const ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY: &str = "gc.artifact_sweep.recovery_requested_ms";
 /// Highest recovery request generation completed by the cache-only worker.
@@ -86,6 +92,10 @@ const ARTIFACT_SWEEP_WORKER_NO_PROGRESS_PASSES: usize = 3;
 /// Positive partial deletion is progress, but must not let one detached worker
 /// run indefinitely while another process keeps replenishing the cache.
 const ARTIFACT_SWEEP_WORKER_MAX_PASSES: usize = 8;
+/// Pressure can multiply one sweep budget by twelve. Cap the worker's entire
+/// lifetime as well as each individual pass, retaining the cursor/request for
+/// a later normal open when this deadline expires.
+const ARTIFACT_SWEEP_WORKER_MAX_DURATION: Duration = Duration::from_secs(5 * 60);
 const ARTIFACT_SWEEP_WORKER_RETRY_MS: i64 = 10 * 60_000;
 
 /// Most a broker open may spend on the artifact sweep, whatever the policy
@@ -203,6 +213,90 @@ fn resumable_interrupted_tree(root: &Path, path: &Path, extras: &[String]) -> bo
     }
 }
 
+/// Read either the legacy single absolute path or the current bounded path
+/// queue. Invalid and oversized state is kept fail-closed by the caller.
+fn decode_interrupted_paths(value: Option<&str>) -> Result<Vec<String>, ()> {
+    let Some(value) = value.filter(|value| !value.is_empty()) else {
+        return Ok(Vec::new());
+    };
+    if value.len() > ARTIFACT_SWEEP_INTERRUPTED_VALUE_MAX_BYTES {
+        return Err(());
+    }
+    let decoded = if value.starts_with('[') {
+        serde_json::from_str::<Vec<String>>(value).map_err(|_| ())?
+    } else {
+        vec![value.to_string()]
+    };
+    if decoded.len() > ARTIFACT_SWEEP_INTERRUPTED_PATHS_MAX
+        || decoded.iter().any(|path| !Path::new(path).is_absolute())
+    {
+        return Err(());
+    }
+    let mut unique = Vec::with_capacity(decoded.len());
+    let mut seen = BTreeSet::new();
+    for path in decoded {
+        if seen.insert(path.clone()) {
+            unique.push(path);
+        }
+    }
+    Ok(unique)
+}
+
+/// Keep a one-path marker compatible with older brokers and encode multiple
+/// interrupted trees without ambiguous path delimiters.
+fn encode_interrupted_paths(paths: &[String]) -> Option<String> {
+    if paths.len() > ARTIFACT_SWEEP_INTERRUPTED_PATHS_MAX
+        || paths.iter().any(|path| !Path::new(path).is_absolute())
+    {
+        return None;
+    }
+    let value = match paths {
+        [] => String::new(),
+        [path] => path.clone(),
+        paths => serde_json::Value::Array(
+            paths
+                .iter()
+                .cloned()
+                .map(serde_json::Value::String)
+                .collect(),
+        )
+        .to_string(),
+    };
+    (value.len() <= ARTIFACT_SWEEP_INTERRUPTED_VALUE_MAX_BYTES).then_some(value)
+}
+
+fn persist_interrupted_paths(
+    store: &mut crate::BrokerStore,
+    paths: &[String],
+) -> Result<bool, BrokerOpError> {
+    let Some(value) = encode_interrupted_paths(paths) else {
+        return Ok(false);
+    };
+    store.meta_set(ARTIFACT_SWEEP_INTERRUPTED_KEY, &value)?;
+    Ok(true)
+}
+
+/// Drop only paths that are conclusively no longer directories. Symlinks and
+/// metadata errors remain blockers so a changed path is never mistaken for a
+/// completed tree.
+fn prune_absent_interrupted_paths(paths: &mut Vec<String>) -> bool {
+    let mut complete = true;
+    paths.retain(|path| match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            complete = false;
+            true
+        }
+        Ok(metadata) if metadata.is_dir() => true,
+        Ok(_) => false,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(_) => {
+            complete = false;
+            true
+        }
+    });
+    complete
+}
+
 /// Wall-clock budget for one sweep pass. A broker open gets the smaller of the
 /// policy budget and [`INLINE_ARTIFACT_SWEEP_BUDGET_MS`], never scaled by disk
 /// pressure: under pressure the scale used to turn every command into a
@@ -317,7 +411,6 @@ fn collect_artifact_dirs_bounded(
     entry_budget: usize,
 ) -> BoundedArtifactDiscovery {
     fn visit(
-        root: &Path,
         current: &Path,
         depth: usize,
         extras: &[String],
@@ -325,7 +418,14 @@ fn collect_artifact_dirs_bounded(
         entry_budget: usize,
         discovery: &mut BoundedArtifactDiscovery,
     ) {
-        if depth > ARTIFACT_SCAN_DEPTH || !discovery.complete {
+        if !discovery.complete {
+            return;
+        }
+        if depth > ARTIFACT_SCAN_DEPTH {
+            // A depth cap is a discovery limit just like the entry budget: a
+            // hidden cache may exist below this point, so the caller must not
+            // advance the completed generation.
+            discovery.complete = false;
             return;
         }
         if Instant::now() >= deadline || discovery.entries_examined >= entry_budget {
@@ -363,15 +463,7 @@ fn collect_artifact_dirs_bounded(
                 discovery.classified.push(path);
                 continue;
             }
-            visit(
-                root,
-                &path,
-                depth + 1,
-                extras,
-                deadline,
-                entry_budget,
-                discovery,
-            );
+            visit(&path, depth + 1, extras, deadline, entry_budget, discovery);
             if !discovery.complete {
                 return;
             }
@@ -379,15 +471,7 @@ fn collect_artifact_dirs_bounded(
     }
 
     let mut discovery = BoundedArtifactDiscovery::new();
-    visit(
-        root,
-        root,
-        0,
-        extras,
-        deadline,
-        entry_budget,
-        &mut discovery,
-    );
+    visit(root, 0, extras, deadline, entry_budget, &mut discovery);
     discovery
 }
 
@@ -1055,6 +1139,7 @@ pub(crate) fn try_artifact_sweep_worker_lock(
 /// Worker entry acquires the same lock before Broker::open, so its open-time
 /// maintenance cannot overlap another worker or create an ordinary inline
 /// sweep ahead of cache-only continuation.
+#[cfg(test)]
 pub(crate) fn acquire_artifact_sweep_worker_lock(
     main_root: &Path,
 ) -> Result<crate::file_lock::ExclusiveFileLock, BrokerOpError> {
@@ -1216,15 +1301,14 @@ pub(crate) fn remove_condemned_tree_with_progress(
                 });
             }
         }
-        if let Some(name) = keep_until_last {
-            if let Err(source) =
+        if let Some(name) = keep_until_last
+            && let Err(source) =
                 remove_entry_with_progress(&dir.join(name), false, &mut entries_reclaimed)
-            {
-                return Err(TreeRemovalError {
-                    source,
-                    entries_reclaimed,
-                });
-            }
+        {
+            return Err(TreeRemovalError {
+                source,
+                entries_reclaimed,
+            });
         }
         match std::fs::remove_dir(dir) {
             Ok(()) => {
@@ -1296,16 +1380,6 @@ fn drain_directory(
         }
     }
     Ok(TreeRemoval::Complete)
-}
-
-/// Unlink one entry, treating "already gone" as the outcome we wanted.
-///
-/// A nested directory that a writer refilled is left alone: it resurfaces as
-/// the parent's `ENOTEMPTY`, which is what the retry in
-/// [`remove_condemned_tree`] exists to absorb. Reporting it here would abort a
-/// removal that is one cheap sweep away from finishing.
-fn remove_entry(path: &Path, is_directory: bool) -> std::io::Result<()> {
-    remove_entry_with_progress(path, is_directory, &mut 0)
 }
 
 fn remove_entry_with_progress(
@@ -2645,11 +2719,6 @@ impl Broker {
     /// is intentionally separate from the cadence/cursor state: normal broker
     /// opens can request a worker without pretending that the foreground pass
     /// finished or resetting its resume point.
-    pub(crate) fn request_artifact_sweep_recovery(&mut self) -> Result<(), BrokerOpError> {
-        self.persist_artifact_sweep_recovery_request()?;
-        self.start_artifact_sweep_recovery_worker()
-    }
-
     /// Record the durable request without launching the detached process.
     /// Preparation uses this while holding its shared-cache lease, then starts
     /// the worker only after the lease has been released successfully.
@@ -2737,9 +2806,10 @@ impl Broker {
 
     /// Execute the detached worker's bounded, cache-only continuation loop.
     /// It exits after three passes without an actual unlink, or after a fixed
-    /// pass limit even when positive partial deletion continues. It leaves the
-    /// durable request/cursor in place and backs off so open files or a
-    /// concurrent writer cannot keep a background process alive forever.
+    /// pass or wall-clock limit even when positive partial deletion continues.
+    /// It leaves the durable request/cursor in place and backs off so open
+    /// files or a concurrent writer cannot keep a background process alive
+    /// forever.
     pub(crate) fn run_artifact_sweep_recovery_worker(&mut self) -> Result<(), BrokerOpError> {
         if !matches!(std::env::var(ARTIFACT_SWEEP_WORKER_ENV).as_deref(), Ok("1")) {
             self.write_artifact_sweep_worker_status("refused_environment")?;
@@ -2776,10 +2846,13 @@ impl Broker {
             &policy,
             request_generation,
             Some(ARTIFACT_SWEEP_WORKER_MAX_PASSES),
-            |broker, policy| {
-                broker.sweep_artifacts_autonomously_with_progress(
+            Some(ARTIFACT_SWEEP_WORKER_MAX_DURATION),
+            |broker, policy, remaining| {
+                let deadline = remaining.map(|remaining| Instant::now() + remaining);
+                broker.sweep_artifacts_autonomously_with_deadline(
                     policy,
                     ArtifactSweepScope::AutomaticContinuation,
+                    deadline,
                 )
             },
         )
@@ -2794,17 +2867,27 @@ impl Broker {
         policy: &RetentionPolicy,
         request_generation: i64,
         max_passes: Option<usize>,
+        max_duration: Option<Duration>,
         mut sweep_pass: impl FnMut(
             &mut Self,
             &RetentionPolicy,
+            Option<Duration>,
         ) -> Result<(ArtifactSweepOutcome, usize), BrokerOpError>,
     ) -> Result<(), BrokerOpError> {
+        let started_at = Instant::now();
         let mut passes = 0usize;
         let mut no_progress_passes = 0usize;
         let mut entries_reclaimed = 0usize;
         loop {
+            let remaining = max_duration.map(|limit| limit.saturating_sub(started_at.elapsed()));
+            if remaining.is_some_and(|remaining| remaining.is_zero()) {
+                self.defer_artifact_sweep_worker(&format!(
+                    "time_limit passes={passes} entries={entries_reclaimed}"
+                ))?;
+                return Ok(());
+            }
             passes = passes.saturating_add(1);
-            let (outcome, pass_entries_reclaimed) = match sweep_pass(self, policy) {
+            let (outcome, pass_entries_reclaimed) = match sweep_pass(self, policy, remaining) {
                 Ok(outcome) => outcome,
                 Err(error) => {
                     self.defer_artifact_sweep_worker(&format!("sweep_failed: {error}"))?;
@@ -2812,6 +2895,12 @@ impl Broker {
                 }
             };
             entries_reclaimed = entries_reclaimed.saturating_add(pass_entries_reclaimed);
+            if max_duration.is_some_and(|limit| started_at.elapsed() >= limit) {
+                self.defer_artifact_sweep_worker(&format!(
+                    "time_limit passes={passes} entries={entries_reclaimed}"
+                ))?;
+                return Ok(());
+            }
             if outcome.complete {
                 // Preserve request history and advance only the generation
                 // this pass actually covered. A pressure refusal arriving
@@ -2843,7 +2932,11 @@ impl Broker {
                     ))?;
                     return Ok(());
                 }
-                std::thread::sleep(Duration::from_millis(1_000));
+                let sleep = Duration::from_millis(1_000);
+                let remaining = max_duration
+                    .map(|limit| limit.saturating_sub(started_at.elapsed()))
+                    .unwrap_or(sleep);
+                std::thread::sleep(sleep.min(remaining));
             } else {
                 no_progress_passes = 0;
             }
@@ -3008,14 +3101,10 @@ impl Broker {
     ///
     /// The budget bounds the work, not the number of directories attempted.
     /// A single `target/` can hold several gigabytes and take minutes to
-    /// unlink, which no per-open budget can absorb in one go, so removal stops
-    /// at the deadline mid-directory and leaves the tree still classified as
-    /// the build cache it is. An unfinished pass withholds the cadence stamp,
-    /// so the next broker open resumes instead of waiting out the interval,
-    /// and records the session it stopped after so the next
-    /// pass continues from there. Resuming without that cursor re-scans the
-    /// head of the list every time, which is why a backlog larger than one
-    /// budget used to sit untouched behind it (#222).
+    /// unlink, so removal stops at the deadline and records each in-progress
+    /// path before unlinking. Later passes resume those exact paths and rotate
+    /// the session cursor past incomplete worktrees so a wide or blocked
+    /// checkout cannot starve the rest of the backlog (#222).
     fn sweep_artifacts_autonomously(
         &mut self,
         policy: &RetentionPolicy,
@@ -3044,6 +3133,7 @@ impl Broker {
             scope,
             deadline_override,
             deadline_override,
+            ARTIFACT_SWEEP_DISCOVERY_ENTRY_BUDGET,
         )
     }
 
@@ -3060,7 +3150,18 @@ impl Broker {
             scope,
             Some(discovery_deadline),
             Some(removal_deadline),
+            ARTIFACT_SWEEP_DISCOVERY_ENTRY_BUDGET,
         )
+    }
+
+    #[cfg(test)]
+    fn sweep_artifacts_autonomously_with_test_discovery_budget(
+        &mut self,
+        policy: &RetentionPolicy,
+        scope: ArtifactSweepScope,
+        entry_budget: usize,
+    ) -> Result<(ArtifactSweepOutcome, usize), BrokerOpError> {
+        self.sweep_artifacts_autonomously_with_deadlines(policy, scope, None, None, entry_budget)
     }
 
     fn sweep_artifacts_autonomously_with_deadlines(
@@ -3069,6 +3170,7 @@ impl Broker {
         scope: ArtifactSweepScope,
         discovery_deadline_override: Option<Instant>,
         removal_deadline_override: Option<Instant>,
+        discovery_entry_budget: usize,
     ) -> Result<(ArtifactSweepOutcome, usize), BrokerOpError> {
         if policy.artifact_sweep_budget_ms == 0 {
             return Ok((
@@ -3180,11 +3282,31 @@ impl Broker {
                 .collect(),
             None => sweep_order(&all, cursor, |session| session.id),
         };
-        // Forget a remembered tree that no longer exists, whoever removed it.
-        let mut interrupted_path = self
-            .store()
-            .meta_get(ARTIFACT_SWEEP_INTERRUPTED_KEY)?
-            .filter(|path| !path.is_empty() && is_real_directory(Path::new(path)));
+        let interrupted_value = self.store().meta_get(ARTIFACT_SWEEP_INTERRUPTED_KEY)?;
+        let mut interrupted_paths_valid = true;
+        let mut interrupted_paths = match decode_interrupted_paths(interrupted_value.as_deref()) {
+            Ok(paths) => paths,
+            Err(()) => {
+                // Preserve malformed or over-cap state as a durable blocker.
+                // Do not delete new trees while we cannot prove the queue has
+                // room to remember a partial removal.
+                interrupted_paths_valid = false;
+                scan_completed = false;
+                Vec::new()
+            }
+        };
+        if interrupted_paths_valid {
+            let previous_paths = interrupted_paths.clone();
+            if !prune_absent_interrupted_paths(&mut interrupted_paths) {
+                scan_completed = false;
+            }
+            if interrupted_paths != previous_paths
+                && !persist_interrupted_paths(self.store(), &interrupted_paths)?
+            {
+                interrupted_paths_valid = false;
+                scan_completed = false;
+            }
+        }
         let mut visited_any = false;
         for session in sessions {
             // Checked before the session is taken, so the cursor names the
@@ -3197,6 +3319,7 @@ impl Broker {
             }
             visited_any = true;
             last_visited = session.id;
+            let mut session_scan_complete = true;
             let root = PathBuf::from(&session.worktree_path);
             if live.contains(&session.id) {
                 continue;
@@ -3222,10 +3345,9 @@ impl Broker {
                     // Git discovery is part of the proof that the candidate
                     // belongs to this checkout. A timeout or any other
                     // failure leaves the session unclassified, so retain the
-                    // cursor and retry it instead of advancing a full lap.
+                    // unfinished pass, then let later sessions make progress.
                     scan_completed = false;
-                    last_visited = session.id.saturating_sub(1);
-                    break;
+                    continue;
                 }
             };
             eligible_worktree_seen = true;
@@ -3233,45 +3355,77 @@ impl Broker {
                 &root,
                 &policy.artefact_directories,
                 discovery_deadline,
-                ARTIFACT_SWEEP_DISCOVERY_ENTRY_BUDGET,
+                discovery_entry_budget,
             );
             let discovery_complete = discovery.complete;
             let mut found = discovery.classified;
-            // The tree this sweep was part-way through goes first and is found
-            // by path: a cache witnessed only by being non-empty stops
-            // classifying once a paused removal has emptied it, and taking it
-            // first means a pause elsewhere can never replace -- and so forget
-            // -- the one remembered tree.
-            if let Some(path) = interrupted_path.as_deref().map(PathBuf::from)
-                && path.starts_with(&root)
+            // Interrupted trees are injected ahead of newly discovered caches:
+            // after partial removal their original witness may be gone, but
+            // their exact path remains safe to resume after fresh validation.
+            let mut pending_in_worktree = Vec::new();
+            for path in interrupted_paths
+                .iter()
+                .map(|path| PathBuf::from(path.as_str()))
+                .filter(|path| path.starts_with(&root))
             {
                 if resumable_interrupted_tree(&root, &path, &policy.artefact_directories) {
-                    found.retain(|dir| dir != &path);
-                    found.insert(0, path);
+                    pending_in_worktree.push(path);
                 } else {
-                    // Lexically claims this worktree but is not a build cache
-                    // inside it: never act on it, and stop remembering it.
-                    interrupted_path = None;
+                    // Keep an existing but no-longer-verifiable path as a
+                    // blocker. It must not be silently forgotten or removed.
+                    session_scan_complete = false;
                 }
             }
+            found.retain(|dir| !pending_in_worktree.contains(dir));
+            pending_in_worktree.extend(found);
+            let found = pending_in_worktree;
             for dir in found {
                 let Some(relative) = repo_relative(&root, &dir) else {
+                    session_scan_complete = false;
                     continue;
                 };
                 let ignored = {
                     let _git_deadline = crate::git::limit_git_until(discovery_deadline);
-                    checkout.path_is_ignored(&relative)
+                    checkout.path_is_ignored_checked(&relative)
                 };
-                if check_deadline(Some(discovery_deadline)) {
-                    scan_completed = false;
-                    last_visited = session.id.saturating_sub(1);
-                    break;
-                }
+                let ignored = match ignored {
+                    Ok(ignored) => ignored,
+                    Err(_) => {
+                        // A Git failure (including a shorter configured Git
+                        // timeout) leaves this candidate unclassified. Do not
+                        // advance the recovery generation on that basis.
+                        session_scan_complete = false;
+                        break;
+                    }
+                };
+                let dir_key = dir.to_string_lossy().into_owned();
+                let resuming = interrupted_paths.iter().any(|path| path == &dir_key);
                 if !ignored {
+                    if resuming {
+                        session_scan_complete = false;
+                    }
                     continue;
                 }
-                let dir_key = dir.to_string_lossy().into_owned();
-                let resuming = interrupted_path.as_deref() == Some(dir_key.as_str());
+                if !interrupted_paths_valid {
+                    session_scan_complete = false;
+                    continue;
+                }
+                if !resuming {
+                    let mut updated_paths = interrupted_paths.clone();
+                    updated_paths.push(dir_key.clone());
+                    if encode_interrupted_paths(&updated_paths).is_none() {
+                        // The queue is deliberately finite. Leave this cache
+                        // intact and let a later pass retry after older paths
+                        // have completed; never unlink without a recovery key.
+                        session_scan_complete = false;
+                        continue;
+                    }
+                    if !persist_interrupted_paths(self.store(), &updated_paths)? {
+                        session_scan_complete = false;
+                        continue;
+                    }
+                    interrupted_paths = updated_paths;
+                }
                 let deferrable =
                     artifact_witness_for_with_extras(&dir, &policy.artefact_directories)
                         .and_then(ArtifactWitness::deferrable_entry);
@@ -3279,76 +3433,61 @@ impl Broker {
                 {
                     Ok((TreeRemoval::Complete, count)) => {
                         entries_reclaimed = entries_reclaimed.saturating_add(count);
-                        if resuming {
-                            interrupted_path = None;
+                        let mut updated_paths = interrupted_paths.clone();
+                        updated_paths.retain(|path| path != &dir_key);
+                        match persist_interrupted_paths(self.store(), &updated_paths) {
+                            Ok(true) => interrupted_paths = updated_paths,
+                            Ok(false) | Err(_) => {
+                                // The cache is gone, but retain the old queue
+                                // entry and retry its absence proof next time.
+                                session_scan_complete = false;
+                            }
                         }
                         removed.push(dir_key);
                     }
-                    // The budget stopped a removal partway. The directory is
-                    // still a recognisable build cache, so the next pass finds
-                    // it again and carries on -- and withholding the cadence
-                    // stamp below is what makes a next pass happen today
-                    // rather than after the interval.
+                    // The path was durably queued before any unlink. The next
+                    // pass will retry it even if removal consumed its witness.
                     Ok((TreeRemoval::Interrupted, count)) => {
                         entries_reclaimed = entries_reclaimed.saturating_add(count);
-                        // One remembered tree at a time, and never replaced
-                        // before it is finished: the next pass starts after
-                        // this session, so a pause elsewhere would otherwise
-                        // overwrite it before it is resumed.
-                        if interrupted_path.is_none() {
-                            interrupted_path = Some(dir_key);
-                        }
-                        scan_completed = false;
+                        session_scan_complete = false;
                     }
                     Err(error) => {
                         entries_reclaimed =
                             entries_reclaimed.saturating_add(error.entries_reclaimed);
-                        scan_completed = false;
-                        if closed_session_id.is_none() {
-                            // The failed session must be first on the next
-                            // pass. Otherwise the cursor could skip it and
-                            // later report a complete cache lap.
-                            last_visited = session.id.saturating_sub(1);
-                        }
+                        session_scan_complete = false;
                     }
                 }
                 if check_deadline(Some(discovery_deadline))
                     || check_deadline(Some(removal_deadline))
                 {
-                    scan_completed = false;
-                }
-                if !scan_completed {
+                    session_scan_complete = false;
                     break;
                 }
             }
             if !discovery_complete {
-                // Retry this entire session next time: directory enumeration
-                // was only partial, so its cursor cannot claim the worktree
-                // was fully covered even if every discovered cache was dealt
-                // with successfully.
+                // This worktree is not fully classified. Keep the pass
+                // explicitly incomplete, but rotate beyond it so a broad
+                // early session cannot starve every later closed session.
+                session_scan_complete = false;
+            }
+            if !session_scan_complete {
                 scan_completed = false;
-                last_visited = session.id.saturating_sub(1);
-            }
-            if !scan_completed {
-                break;
             }
         }
-        // A full lap visited every eligible session, so a remembered tree it
-        // did not resume is no longer eligible; holding it would only stop
-        // the next pause from being remembered.
-        if scan_completed && closed_session_id.is_none() {
-            interrupted_path = None;
+        if !interrupted_paths.is_empty() {
+            // A full directory lap is not complete while a path remains
+            // blocked or incompletely removed, including a path from a
+            // session not visited in this bounded pass.
+            scan_completed = false;
         }
-        match &interrupted_path {
-            Some(path) => self
-                .store()
-                .meta_set(ARTIFACT_SWEEP_INTERRUPTED_KEY, path)?,
-            None => self.store().meta_set(ARTIFACT_SWEEP_INTERRUPTED_KEY, "")?,
+        if interrupted_paths_valid {
+            if !persist_interrupted_paths(self.store(), &interrupted_paths)? {
+                scan_completed = false;
+            }
         }
-        // Do not consume the cadence window before any closed worktree exists,
-        // and do not hide an unfinished backlog for a full interval. Removal
-        // failures do consume the window, preventing a broken path from
-        // slowing every broker command until an operator can inspect it.
+        // Only a completed lap consumes the cadence window. Incomplete work
+        // keeps the durable request/cursor pending; inline spacing limits how
+        // often ordinary broker opens retry a blocked path.
         if let Some(session_id) = closed_session_id {
             if !scan_completed {
                 // Retry this session first on the next ordinary broker open.
@@ -4090,16 +4229,22 @@ mod tests {
         let policy = load_retention_policy(root).unwrap();
 
         broker
-            .run_artifact_sweep_recovery_worker_loop(&policy, 7, None, |_broker, _policy| {
-                Ok((
-                    ArtifactSweepOutcome {
-                        directories_reclaimed: 0,
-                        complete: false,
-                        auto_cleanup: None,
-                    },
-                    0,
-                ))
-            })
+            .run_artifact_sweep_recovery_worker_loop(
+                &policy,
+                7,
+                None,
+                None,
+                |_broker, _policy, _remaining| {
+                    Ok((
+                        ArtifactSweepOutcome {
+                            directories_reclaimed: 0,
+                            complete: false,
+                            auto_cleanup: None,
+                        },
+                        0,
+                    ))
+                },
+            )
             .unwrap();
         assert_eq!(
             broker
@@ -4133,7 +4278,8 @@ mod tests {
                 &policy,
                 retry_generation.parse().unwrap(),
                 None,
-                |_broker, _policy| {
+                None,
+                |_broker, _policy, _remaining| {
                     Ok((
                         ArtifactSweepOutcome {
                             directories_reclaimed: 1,
@@ -4179,17 +4325,23 @@ mod tests {
         let mut passes = 0;
 
         broker
-            .run_artifact_sweep_recovery_worker_loop(&policy, 7, Some(2), |_broker, _policy| {
-                passes += 1;
-                Ok((
-                    ArtifactSweepOutcome {
-                        directories_reclaimed: 1,
-                        complete: false,
-                        auto_cleanup: None,
-                    },
-                    1,
-                ))
-            })
+            .run_artifact_sweep_recovery_worker_loop(
+                &policy,
+                7,
+                Some(2),
+                None,
+                |_broker, _policy, _remaining| {
+                    passes += 1;
+                    Ok((
+                        ArtifactSweepOutcome {
+                            directories_reclaimed: 1,
+                            complete: false,
+                            auto_cleanup: None,
+                        },
+                        1,
+                    ))
+                },
+            )
             .unwrap();
         assert_eq!(passes, 2, "positive progress cannot bypass the pass cap");
         assert_eq!(
@@ -4231,7 +4383,8 @@ mod tests {
                 &policy,
                 retry_generation.parse().unwrap(),
                 Some(1),
-                |_broker, _policy| {
+                None,
+                |_broker, _policy, _remaining| {
                     Ok((
                         ArtifactSweepOutcome {
                             directories_reclaimed: 1,
@@ -4252,6 +4405,93 @@ mod tests {
             Some(retry_generation.as_str()),
             "a later eligible pass completes the retained request"
         );
+    }
+
+    #[test]
+    fn worker_wall_clock_limit_keeps_request_pending_after_positive_progress() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        git(root, &["init", "-q", "-b", "main"]);
+        std::fs::write(root.join("README.md"), "fixture\n").unwrap();
+        git(root, &["add", "README.md"]);
+        git(root, &["commit", "-qm", "fixture"]);
+        std::fs::create_dir_all(root.join(".aethyme")).unwrap();
+        let mut broker = Broker::open(root).unwrap();
+        broker
+            .store()
+            .meta_set(ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY, "7")
+            .unwrap();
+        broker
+            .store()
+            .meta_set(ARTIFACT_SWEEP_RECOVERY_COMPLETED_KEY, "3")
+            .unwrap();
+        broker
+            .store()
+            .meta_set(ARTIFACT_SWEEP_CURSOR_KEY, "4")
+            .unwrap();
+        let policy = load_retention_policy(root).unwrap();
+        let mut passes = 0;
+
+        broker
+            .run_artifact_sweep_recovery_worker_loop(
+                &policy,
+                7,
+                None,
+                Some(Duration::from_millis(1)),
+                |_broker, _policy, _remaining| {
+                    passes += 1;
+                    std::thread::sleep(Duration::from_millis(2));
+                    Ok((
+                        ArtifactSweepOutcome {
+                            directories_reclaimed: 0,
+                            complete: false,
+                            auto_cleanup: None,
+                        },
+                        1,
+                    ))
+                },
+            )
+            .unwrap();
+
+        assert_eq!(
+            passes, 1,
+            "positive progress cannot exceed the time ceiling"
+        );
+        assert_eq!(
+            broker
+                .store()
+                .meta_get(ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY)
+                .unwrap()
+                .as_deref(),
+            Some("7")
+        );
+        assert_eq!(
+            broker
+                .store()
+                .meta_get(ARTIFACT_SWEEP_RECOVERY_COMPLETED_KEY)
+                .unwrap()
+                .as_deref(),
+            Some("3"),
+            "partial work never advances the completed request generation"
+        );
+        assert_eq!(
+            broker
+                .store()
+                .meta_get(ARTIFACT_SWEEP_CURSOR_KEY)
+                .unwrap()
+                .as_deref(),
+            Some("4"),
+            "the timeout preserves the cursor for a later worker"
+        );
+        assert_eq!(
+            broker
+                .store()
+                .meta_get(ARTIFACT_SWEEP_WORKER_STATUS_KEY)
+                .unwrap()
+                .as_deref(),
+            Some("time_limit passes=1 entries=1")
+        );
+        assert!(worker_retry_pending(broker.store(), now_ms()).unwrap());
     }
 
     fn detached_fixture_store(root: &Path) -> crate::BrokerStore {
@@ -4440,13 +4680,13 @@ mod tests {
         let mut broker = Broker::open(tmp.path()).unwrap();
 
         assert!(!broker.artifact_sweep_recovery_requested().unwrap());
-        broker.request_artifact_sweep_recovery().unwrap();
+        broker.persist_artifact_sweep_recovery_request().unwrap();
         assert!(broker.artifact_sweep_recovery_requested().unwrap());
         let first = broker
             .store()
             .meta_get(ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY)
             .unwrap();
-        broker.request_artifact_sweep_recovery().unwrap();
+        broker.persist_artifact_sweep_recovery_request().unwrap();
         let second = broker
             .store()
             .meta_get(ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY)
@@ -4463,7 +4703,10 @@ mod tests {
     /// `detached_worker_survives_its_launcher_and_resumes_after_a_crash`.
     /// It deliberately exercises the real advisory lock, metadata store, and
     /// cache-tree remover without resolving or launching an installed broker.
+    // This test-only launcher must exit while its grandchild worker remains
+    // detached, so waiting here would invalidate the parent-exit regression.
     #[test]
+    #[allow(clippy::zombie_processes)]
     fn detached_artifact_worker_child_fixture() {
         let Ok(mode) = std::env::var(DETACHED_FIXTURE_MODE_ENV) else {
             return;
@@ -4665,7 +4908,8 @@ mod tests {
                         &policy,
                         77,
                         Some(1),
-                        |broker, policy| {
+                        None,
+                        |broker, policy, _remaining| {
                             let result = broker.sweep_artifacts_autonomously_with_test_deadlines(
                                 policy,
                                 ArtifactSweepScope::AutomaticContinuation,
@@ -4764,16 +5008,24 @@ mod tests {
                 let policy = load_retention_policy(broker.main_root()).unwrap();
                 let mut entries_reclaimed: usize = 0;
                 broker
-                    .run_artifact_sweep_recovery_worker_loop(&policy, 77, None, |broker, policy| {
-                        let result = broker.sweep_artifacts_autonomously_with_progress(
-                            policy,
-                            ArtifactSweepScope::AutomaticContinuation,
-                        );
-                        if let Ok((_, count)) = &result {
-                            entries_reclaimed = entries_reclaimed.saturating_add(*count);
-                        }
-                        result
-                    })
+                    .run_artifact_sweep_recovery_worker_loop(
+                        &policy,
+                        77,
+                        None,
+                        None,
+                        |broker, policy, remaining| {
+                            let deadline = remaining.map(|remaining| Instant::now() + remaining);
+                            let result = broker.sweep_artifacts_autonomously_with_deadline(
+                                policy,
+                                ArtifactSweepScope::AutomaticContinuation,
+                                deadline,
+                            );
+                            if let Ok((_, count)) = &result {
+                                entries_reclaimed = entries_reclaimed.saturating_add(*count);
+                            }
+                            result
+                        },
+                    )
                     .unwrap();
                 assert!(entries_reclaimed > 0);
                 assert!(!cache.exists(), "the closed session cache is reclaimed");
@@ -5186,6 +5438,250 @@ mod tests {
         assert!(sweep_order(&[] as &[i64], 7, |id| *id).is_empty());
     }
 
+    #[test]
+    fn interrupted_path_queue_reads_legacy_values_and_stays_bounded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let first = tmp
+            .path()
+            .join("first/target")
+            .to_string_lossy()
+            .into_owned();
+        let second = tmp
+            .path()
+            .join("second/target")
+            .to_string_lossy()
+            .into_owned();
+
+        assert_eq!(
+            decode_interrupted_paths(Some(&first)).unwrap(),
+            vec![first.clone()]
+        );
+        let encoded = encode_interrupted_paths(&[first.clone(), second.clone()]).unwrap();
+        assert!(encoded.starts_with('['));
+        assert_eq!(
+            decode_interrupted_paths(Some(&encoded)).unwrap(),
+            vec![first.clone(), second]
+        );
+        assert_eq!(
+            encode_interrupted_paths(&[first.clone()]).as_deref(),
+            Some(first.as_str())
+        );
+        assert!(decode_interrupted_paths(Some("relative/target")).is_err());
+
+        let too_many = (0..=ARTIFACT_SWEEP_INTERRUPTED_PATHS_MAX)
+            .map(|index| {
+                tmp.path()
+                    .join(format!("{index}/target"))
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect::<Vec<_>>();
+        assert!(encode_interrupted_paths(&too_many).is_none());
+        let oversized = format!(
+            "{}/{}",
+            tmp.path().display(),
+            "x".repeat(ARTIFACT_SWEEP_INTERRUPTED_VALUE_MAX_BYTES)
+        );
+        assert!(decode_interrupted_paths(Some(&oversized)).is_err());
+    }
+
+    #[test]
+    fn an_interrupted_path_blocks_completion_without_starving_other_closed_caches() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        git(root, &["init", "-q", "-b", "main"]);
+        std::fs::write(root.join("README.md"), "fixture\n").unwrap();
+        std::fs::write(root.join(".gitignore"), "/.aethyme/\n/target/\n").unwrap();
+        git(root, &["add", "README.md", ".gitignore"]);
+        git(root, &["commit", "-qm", "fixture"]);
+        std::fs::create_dir_all(root.join(".aethyme")).unwrap();
+        std::fs::write(
+            root.join(".aethyme/broker.toml"),
+            "[retention]\nclosed_worktrees_days = 30\nclosed_worktree_grace_hours = 0\nartifact_reclaim_days = 0\nartifact_sweep_budget_ms = 0\nartifact_sweep_interval_hours = 0\n",
+        )
+        .unwrap();
+        let mut broker = Broker::open(root).unwrap();
+
+        let mut make_closed = |label: &str| {
+            let session = broker.start_worktree(label, None).unwrap();
+            let worktree = PathBuf::from(&session.worktree_path);
+            std::fs::write(worktree.join("landed.txt"), "landed\n").unwrap();
+            git(&worktree, &["add", "landed.txt"]);
+            git(&worktree, &["commit", "-qm", label]);
+            assert!(broker.submit(session.id).unwrap().promoted);
+            assert!(
+                broker
+                    .finish_with_options(
+                        session.id,
+                        crate::FinishOptions {
+                            keep_worktree: true,
+                        },
+                    )
+                    .unwrap()
+                    .closed
+            );
+            let cache = worktree.join("target");
+            std::fs::create_dir_all(cache.join("debug")).unwrap();
+            std::fs::write(cache.join("CACHEDIR.TAG"), "Signature: 8a477f597d28d172\n").unwrap();
+            std::fs::write(cache.join("debug/build.bin"), vec![b'x'; 128]).unwrap();
+            (session.id, cache)
+        };
+
+        let (first_id, first_cache) = make_closed("first closed cache");
+        let (later_id, later_cache) = make_closed("later closed cache");
+        assert!(first_id < later_id);
+        let blocker = root.join(".aethyme/interrupted-but-unmapped");
+        std::fs::create_dir_all(&blocker).unwrap();
+        std::fs::write(
+            root.join(".aethyme/broker.toml"),
+            "[retention]\nclosed_worktrees_days = 30\nclosed_worktree_grace_hours = 0\nartifact_reclaim_days = 0\nartifact_sweep_budget_ms = 5000\nartifact_sweep_interval_hours = 0\n",
+        )
+        .unwrap();
+        broker
+            .store()
+            .meta_set(ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY, "7")
+            .unwrap();
+        broker
+            .store()
+            .meta_set(ARTIFACT_SWEEP_RECOVERY_COMPLETED_KEY, "3")
+            .unwrap();
+        broker
+            .store()
+            .meta_set(ARTIFACT_SWEEP_INTERRUPTED_KEY, blocker.to_str().unwrap())
+            .unwrap();
+        let policy = load_retention_policy(root).unwrap();
+        let mut pass_complete = true;
+
+        broker
+            .run_artifact_sweep_recovery_worker_loop(
+                &policy,
+                7,
+                Some(1),
+                Some(Duration::from_secs(10)),
+                |broker, policy, remaining| {
+                    let deadline = remaining.map(|remaining| Instant::now() + remaining);
+                    let result = broker.sweep_artifacts_autonomously_with_deadline(
+                        policy,
+                        ArtifactSweepScope::AutomaticContinuation,
+                        deadline,
+                    );
+                    if let Ok((outcome, _)) = &result {
+                        pass_complete = outcome.complete;
+                    }
+                    result
+                },
+            )
+            .unwrap();
+
+        assert!(
+            !pass_complete,
+            "an unresolved queue entry withholds completion"
+        );
+        assert!(!first_cache.exists());
+        assert!(
+            !later_cache.exists(),
+            "unrelated closed caches still make progress"
+        );
+        assert_eq!(
+            broker
+                .store()
+                .meta_get(ARTIFACT_SWEEP_INTERRUPTED_KEY)
+                .unwrap()
+                .as_deref(),
+            Some(blocker.to_str().unwrap()),
+            "the unresolved path is preserved for later revalidation"
+        );
+        assert_eq!(
+            broker
+                .store()
+                .meta_get(ARTIFACT_SWEEP_RECOVERY_COMPLETED_KEY)
+                .unwrap()
+                .as_deref(),
+            Some("3"),
+            "the worker must not advance generation on an incomplete cache lap"
+        );
+        assert!(worker_retry_pending(broker.store(), now_ms()).unwrap());
+    }
+
+    #[test]
+    fn an_incomplete_large_worktree_does_not_starve_later_closed_sessions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        git(root, &["init", "-q", "-b", "main"]);
+        std::fs::write(root.join("README.md"), "fixture\n").unwrap();
+        std::fs::write(root.join(".gitignore"), "/.aethyme/\n/target/\n").unwrap();
+        git(root, &["add", "README.md", ".gitignore"]);
+        git(root, &["commit", "-qm", "fixture"]);
+        std::fs::create_dir_all(root.join(".aethyme")).unwrap();
+        std::fs::write(
+            root.join(".aethyme/broker.toml"),
+            "[retention]\nclosed_worktrees_days = 30\nclosed_worktree_grace_hours = 0\nartifact_reclaim_days = 0\nartifact_sweep_budget_ms = 5000\nartifact_sweep_interval_hours = 0\n",
+        )
+        .unwrap();
+        let mut broker = Broker::open(root).unwrap();
+
+        let mut make_closed = |label: &str| {
+            let session = broker.start_worktree(label, None).unwrap();
+            let worktree = PathBuf::from(&session.worktree_path);
+            std::fs::write(worktree.join("landed.txt"), "landed\n").unwrap();
+            git(&worktree, &["add", "landed.txt"]);
+            git(&worktree, &["commit", "-qm", label]);
+            assert!(broker.submit(session.id).unwrap().promoted);
+            assert!(
+                broker
+                    .finish_with_options(
+                        session.id,
+                        crate::FinishOptions {
+                            keep_worktree: true,
+                        },
+                    )
+                    .unwrap()
+                    .closed
+            );
+            let cache = worktree.join("target");
+            std::fs::create_dir_all(cache.join("debug")).unwrap();
+            std::fs::write(cache.join("CACHEDIR.TAG"), "Signature: 8a477f597d28d172\n").unwrap();
+            (session.id, worktree, cache)
+        };
+
+        let (large_id, large_worktree, large_cache) = make_closed("large first session");
+        for index in 0..32 {
+            std::fs::create_dir(large_worktree.join(format!("unclassified-{index:02}"))).unwrap();
+        }
+        let (later_id, _later_worktree, later_cache) = make_closed("later session");
+        assert!(large_id < later_id);
+        assert!(large_cache.is_dir());
+        assert!(later_cache.is_dir());
+
+        let policy = load_retention_policy(root).unwrap();
+        let (outcome, _) = broker
+            .sweep_artifacts_autonomously_with_test_discovery_budget(
+                &policy,
+                ArtifactSweepScope::Inline,
+                16,
+            )
+            .unwrap();
+
+        assert!(
+            !outcome.complete,
+            "the bounded first worktree remains an explicit incomplete pass"
+        );
+        assert!(
+            !later_cache.exists(),
+            "later closed sessions still get scanned after an earlier worktree exceeds the entry budget"
+        );
+        let expected_cursor = later_id.to_string();
+        assert_eq!(
+            broker
+                .store()
+                .meta_get(ARTIFACT_SWEEP_CURSOR_KEY)
+                .unwrap()
+                .as_deref(),
+            Some(expected_cursor.as_str()),
+            "the saved cursor advances past the later session without claiming a full lap"
+        );
+    }
+
     fn dir(root: &Path, relative: &str) -> PathBuf {
         let path = root.join(relative);
         std::fs::create_dir_all(&path).unwrap();
@@ -5315,6 +5811,16 @@ mod tests {
             found.is_empty(),
             "a directory below the scan depth must stay untouched: {found:?}"
         );
+        let bounded = collect_artifact_dirs_bounded(
+            root,
+            &[],
+            Instant::now() + Duration::from_secs(1),
+            ARTIFACT_SWEEP_DISCOVERY_ENTRY_BUDGET,
+        );
+        assert!(
+            !bounded.complete,
+            "a depth cap must not be reported as a complete cache lap"
+        );
     }
 
     #[test]
@@ -5438,9 +5944,11 @@ mod tests {
         // can gain a file after the removal already emptied it. Reporting
         // that as an error is what aborted the run; it is left for the retry
         // that follows to collect.
-        assert!(remove_entry(&nested, true).is_ok());
+        assert!(remove_entry_with_progress(&nested, true, &mut 0).is_ok());
         assert!(nested.exists());
-        assert!(remove_entry(&tmp.path().join("target/absent"), false).is_ok());
+        assert!(
+            remove_entry_with_progress(&tmp.path().join("target/absent"), false, &mut 0).is_ok()
+        );
 
         // The retry is what actually finishes it.
         assert_eq!(
