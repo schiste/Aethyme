@@ -13,7 +13,7 @@ use std::process::Stdio;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use aethyme_contracts::experimental_v0::project_identity::{
-    PROJECT_DESCRIPTOR_PATH, ProjectDescriptor, ProjectId,
+    PROJECT_DESCRIPTOR_PATH, ProjectDescriptor, ProjectId, ProjectIdentityError,
 };
 use aethyme_contracts::experimental_v0::{
     EntryKind, FileIdentityTransition, RecordId, SourceSnapshot, SourceSnapshotId,
@@ -91,7 +91,7 @@ fn enroll(worktree: &Path, rest: &[&str]) -> Result<Output, Failure> {
     let project_id = ProjectId::parse(&format!("proj:{encoded}"))
         .map_err(|error| Failure::domain("invalid_project_id", error.to_string()))?;
     let descriptor = ProjectDescriptor::from_snapshot(project_id, requested.as_str(), &snapshot)
-        .map_err(|error| Failure::domain("invalid_descriptor", error.to_string()))?;
+        .map_err(enrollment_descriptor_failure)?;
     let (bytes, record_id) = descriptor.to_record();
     if bytes.len() > aethyme_contracts::experimental_v0::project_identity::MAX_DESCRIPTOR_BYTES {
         return Err(Failure::refused(
@@ -136,6 +136,22 @@ fn enroll(worktree: &Path, rest: &[&str]) -> Result<Output, Failure> {
         CONFIRM_NEXT,
     );
     Ok((value, text))
+}
+
+fn enrollment_descriptor_failure(error: ProjectIdentityError) -> Failure {
+    match &error {
+        ProjectIdentityError::TooManyFiles { .. } => Failure::refused(
+            "descriptor_too_many_files",
+            error.to_string(),
+            "enroll a committed source snapshot with no more than the canonical profile file limit",
+        ),
+        ProjectIdentityError::DescriptorTooLarge { .. } => Failure::refused(
+            "descriptor_too_large",
+            error.to_string(),
+            "enroll a committed source snapshot whose canonical descriptor fits the record limit",
+        ),
+        _ => Failure::domain("invalid_descriptor", error.to_string()),
+    }
 }
 
 fn write_descriptor(worktree: &Path, bytes: &[u8]) -> Result<PathBuf, Failure> {
@@ -337,7 +353,7 @@ fn bind_with_root(
     }
     if let Some(existing) =
         identity_store::resolve_approved_project_binding_with_archive_use(&store, &archive_use)
-            .map_err(|error| Failure::domain("identity_store", error.to_string()))?
+            .map_err(|error| Failure::domain(error.code(), error.to_string()))?
     {
         if existing.project_id() != descriptor.project_id()
             || existing.descriptor_record_id() != &actual_record_id
@@ -403,7 +419,7 @@ fn bind_with_root(
     )?;
     let binding =
         identity_store::resolve_approved_project_binding_with_archive_use(&store, &archive_use)
-            .map_err(|error| Failure::domain("identity_store", error.to_string()))?
+            .map_err(|error| Failure::domain(error.code(), error.to_string()))?
             .ok_or_else(|| {
                 Failure::domain("identity_store", "binding row was not committed".into())
             })?;
@@ -916,7 +932,7 @@ fn sqlite(error: rusqlite::Error) -> Failure {
 
 #[cfg(test)]
 pub(crate) mod test_support {
-    use super::{PROJECT_DESCRIPTOR_PATH, bind_at_root, enroll};
+    use super::{CONFIG_PATH, PROJECT_DESCRIPTOR_PATH, bind_at_root, enroll};
     use std::path::{Path, PathBuf};
     use std::process::Command;
 
@@ -930,6 +946,95 @@ pub(crate) mod test_support {
     use aethyme_contracts::experimental_v0::SourceSnapshotId;
 
     pub(crate) type FixtureError = String;
+
+    /// Enrollment state before its proposed descriptor and pointer are
+    /// committed. The fixture exists to drive real bind refusals without
+    /// manufacturing an approved row.
+    pub(crate) struct PendingProjectFixture {
+        pub(crate) repo: tempfile::TempDir,
+        pub(crate) host: tempfile::TempDir,
+        pub(crate) store: CollaborationStore,
+        pub(crate) root: CollaborationRoot,
+        pub(crate) anchor_commit: CommitOid,
+        pub(crate) descriptor_record_id: String,
+    }
+
+    impl PendingProjectFixture {
+        pub(crate) fn new() -> Result<Self, FixtureError> {
+            let repo = tempfile::tempdir().map_err(|error| error.to_string())?;
+            let host = tempfile::tempdir().map_err(|error| error.to_string())?;
+            let key = ProjectKey::parse("pending-project").map_err(|error| error.to_string())?;
+            std::fs::create_dir_all(repo.path().join(".aethyme"))
+                .map_err(|error| error.to_string())?;
+            std::fs::write(
+                repo.path().join(CONFIG_PATH),
+                format!(
+                    "[collaboration]\ncapture = \"required\"\nproject = \"{}\"\n",
+                    key.as_str()
+                ),
+            )
+            .map_err(|error| error.to_string())?;
+            std::fs::write(repo.path().join("a.txt"), b"anchor\n")
+                .map_err(|error| error.to_string())?;
+            git(repo.path(), &["init", "-q", "-b", "main"])?;
+            git(repo.path(), &["add", "-A"])?;
+            git(repo.path(), &["commit", "-q", "-m", "pending anchor"])?;
+            let anchor_commit =
+                archive::pin_commit(repo.path(), "HEAD").map_err(|error| error.to_string())?;
+            let root = CollaborationRoot::under_host_state(host.path());
+            let mut store =
+                CollaborationStore::open(&root, &key, &[]).map_err(|error| error.to_string())?;
+            capture_anchor(&mut store, repo.path(), &anchor_commit, "pending-anchor")?;
+            let enrolled = enroll(
+                repo.path(),
+                &["--commit", anchor_commit.as_str(), "--write"],
+            )
+            .map_err(|failure| format!("project enroll failed: {}", failure.message))?;
+            let descriptor_record_id = enrolled
+                .0
+                .get("descriptor_record_id")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| "project enroll returned no descriptor RecordId".to_string())?
+                .to_string();
+            Ok(Self {
+                repo,
+                host,
+                store,
+                root,
+                anchor_commit,
+                descriptor_record_id,
+            })
+        }
+
+        pub(crate) fn write_working_pointer(&self, pointer: &str) -> Result<(), FixtureError> {
+            let config = format!(
+                "[collaboration]\ncapture = \"required\"\nproject = \"{}\"\ndescriptor = \"{}\"\n",
+                self.store.project().as_str(),
+                pointer
+            );
+            std::fs::write(self.repo.path().join(CONFIG_PATH), config)
+                .map_err(|error| error.to_string())
+        }
+
+        pub(crate) fn commit_pointer(&self, pointer: &str) -> Result<CommitOid, FixtureError> {
+            self.write_working_pointer(pointer)?;
+            git(self.repo.path(), &["add", "-A"])?;
+            git(
+                self.repo.path(),
+                &["commit", "-q", "-m", "commit descriptor pointer"],
+            )?;
+            archive::pin_commit(self.repo.path(), "HEAD").map_err(|error| error.to_string())
+        }
+
+        pub(crate) fn bind(&self, record_id: &str) -> Result<super::Output, super::Failure> {
+            bind_at_root(
+                self.repo.path(),
+                self.repo.path(),
+                &["--confirm", record_id],
+                &self.root,
+            )
+        }
+    }
 
     /// A real local enrollment/binding fixture. It drives the same `enroll`
     /// and `bind` command functions as the public CLI and owns an isolated
@@ -1171,5 +1276,229 @@ pub(crate) mod test_support {
             ));
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod binding_tests {
+    use super::test_support::{BoundProjectFixture, PendingProjectFixture};
+    use super::{PROJECT_DESCRIPTOR_PATH, bind_at_root, enroll};
+    use crate::collaboration_identity_store;
+    use crate::collaboration_state::CollaborationRoot;
+    use std::process::Command;
+
+    fn git(repo: &std::path::Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .args([
+                "-c",
+                "user.name=Aethyme Fixture",
+                "-c",
+                "user.email=fixture@aethyme.invalid",
+            ])
+            .args(args)
+            .current_dir(repo)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    fn binding_count(store: &crate::collaboration_state::CollaborationStore) -> i64 {
+        store
+            .read_connection()
+            .query_row("SELECT count(*) FROM local_project_bindings", [], |row| {
+                row.get(0)
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn enrollment_refuses_over_profile_file_count_before_writing_descriptor() {
+        use aethyme_contracts::experimental_v0::project_identity::MAX_DESCRIPTOR_FILES;
+
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir(repo.path().join(".aethyme")).unwrap();
+        git(repo.path(), &["init", "-q", "-b", "main"]);
+        for index in 0..=MAX_DESCRIPTOR_FILES {
+            std::fs::write(
+                repo.path().join(format!("file-{index:04}.txt")),
+                b"small source file\n",
+            )
+            .unwrap();
+        }
+        git(repo.path(), &["add", "--all"]);
+        git(
+            repo.path(),
+            &["commit", "-q", "-m", "oversized descriptor fixture"],
+        );
+        let commit = git(repo.path(), &["rev-parse", "HEAD"]);
+        let error = enroll(repo.path(), &["--commit", &commit, "--write"]).unwrap_err();
+
+        assert_eq!(error.code, "descriptor_too_many_files");
+        assert!(
+            !repo.path().join(PROJECT_DESCRIPTOR_PATH).exists(),
+            "refused enrollment must not write the proposed descriptor"
+        );
+    }
+
+    #[test]
+    fn malformed_confirmation_is_usage_and_never_creates_approval() {
+        let fixture = PendingProjectFixture::new().unwrap();
+        fixture.commit_pointer(PROJECT_DESCRIPTOR_PATH).unwrap();
+        let error = fixture.bind("not-a-record-id").unwrap_err();
+        assert_eq!(error.code, "usage");
+        assert_eq!(binding_count(&fixture.store), 0);
+        assert!(
+            collaboration_identity_store::resolve_approved_project_binding(&fixture.store)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn mismatched_descriptor_confirmation_is_refused_without_approval() {
+        let fixture = PendingProjectFixture::new().unwrap();
+        fixture.commit_pointer(PROJECT_DESCRIPTOR_PATH).unwrap();
+        let wrong = format!("sha256:{}", "0".repeat(64));
+        let error = fixture.bind(&wrong).unwrap_err();
+        assert_eq!(error.code, "descriptor_confirmation_mismatch");
+        assert_eq!(binding_count(&fixture.store), 0);
+    }
+
+    #[test]
+    fn an_uncommitted_descriptor_pointer_does_not_authorize_binding() {
+        let fixture = PendingProjectFixture::new().unwrap();
+        fixture
+            .write_working_pointer(PROJECT_DESCRIPTOR_PATH)
+            .unwrap();
+        let error = fixture.bind(&fixture.descriptor_record_id).unwrap_err();
+        assert_eq!(error.code, "descriptor_pointer_missing");
+        assert_eq!(binding_count(&fixture.store), 0);
+    }
+
+    #[test]
+    fn a_committed_tampered_descriptor_pointer_is_refused() {
+        let fixture = PendingProjectFixture::new().unwrap();
+        fixture
+            .commit_pointer(".aethyme/other-project.json")
+            .unwrap();
+        let error = fixture.bind(&fixture.descriptor_record_id).unwrap_err();
+        assert_eq!(error.code, "descriptor_pointer_mismatch");
+        assert_eq!(binding_count(&fixture.store), 0);
+    }
+
+    #[test]
+    fn exact_binding_confirmation_is_idempotent() {
+        let fixture = BoundProjectFixture::new().unwrap();
+        let record_id = fixture.binding.descriptor_record_id().as_str().to_string();
+        let root = CollaborationRoot::under_host_state(fixture.host.path());
+        let output = bind_at_root(
+            fixture.repo.path(),
+            fixture.repo.path(),
+            &["--confirm", &record_id],
+            &root,
+        )
+        .unwrap();
+        assert_eq!(output.0["status"], "already_bound");
+        assert_eq!(binding_count(&fixture.store), 1);
+    }
+
+    #[test]
+    fn approved_binding_survives_pointer_removal_and_conflicting_rebind_refuses() {
+        let mut fixture = BoundProjectFixture::new().unwrap();
+        let original_id = fixture.binding.descriptor_record_id().as_str().to_string();
+        let original_project = fixture.binding.project_id().as_str().to_string();
+        std::fs::write(
+            fixture.repo.path().join(".aethyme/config.toml"),
+            format!(
+                "[collaboration]\ncapture = \"required\"\nproject = \"{}\"\n",
+                fixture.store.project().as_str()
+            ),
+        )
+        .unwrap();
+        git(fixture.repo.path(), &["add", "-A"]);
+        git(
+            fixture.repo.path(),
+            &["commit", "-q", "-m", "remove descriptor pointer"],
+        );
+        let resolved =
+            collaboration_identity_store::resolve_approved_project_binding(&fixture.store)
+                .unwrap()
+                .expect("approval is anchored to the committed binding, not the current pointer");
+        assert_eq!(resolved.descriptor_record_id().as_str(), original_id);
+        let removed_pointer = bind_at_root(
+            fixture.repo.path(),
+            fixture.repo.path(),
+            &["--confirm", &original_id],
+            &CollaborationRoot::under_host_state(fixture.host.path()),
+        )
+        .unwrap_err();
+        assert_eq!(removed_pointer.code, "descriptor_pointer_missing");
+
+        std::fs::remove_file(fixture.repo.path().join(PROJECT_DESCRIPTOR_PATH)).unwrap();
+        let enrolled = enroll(
+            fixture.repo.path(),
+            &["--commit", fixture.anchor_commit.as_str(), "--write"],
+        )
+        .unwrap();
+        let replacement_id = enrolled.0["descriptor_record_id"].as_str().unwrap();
+        assert_ne!(replacement_id, original_id);
+        std::fs::write(
+            fixture.repo.path().join(".aethyme/config.toml"),
+            format!(
+                "[collaboration]\ncapture = \"required\"\nproject = \"{}\"\ndescriptor = \"{}\"\n",
+                fixture.store.project().as_str(),
+                PROJECT_DESCRIPTOR_PATH
+            ),
+        )
+        .unwrap();
+        git(fixture.repo.path(), &["add", "-A"]);
+        git(
+            fixture.repo.path(),
+            &["commit", "-q", "-m", "attempt conflicting descriptor"],
+        );
+        let error = bind_at_root(
+            fixture.repo.path(),
+            fixture.repo.path(),
+            &["--confirm", replacement_id],
+            &CollaborationRoot::under_host_state(fixture.host.path()),
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "project_binding_conflict");
+        let still_approved =
+            collaboration_identity_store::resolve_approved_project_binding(&fixture.store)
+                .unwrap()
+                .unwrap();
+        assert_eq!(still_approved.project_id().as_str(), original_project);
+        assert_eq!(still_approved.descriptor_record_id().as_str(), original_id);
+    }
+
+    #[test]
+    fn a_corrupt_bootstrap_transition_is_a_typed_binding_refusal() {
+        let fixture = BoundProjectFixture::new().unwrap();
+        fixture
+            .store
+            .connection()
+            .execute(
+                "UPDATE local_project_bindings SET bootstrap_transition_sha256=?1",
+                ["0".repeat(64)],
+            )
+            .unwrap();
+        let record_id = fixture.binding.descriptor_record_id().as_str().to_string();
+        let error = bind_at_root(
+            fixture.repo.path(),
+            fixture.repo.path(),
+            &["--confirm", &record_id],
+            &CollaborationRoot::under_host_state(fixture.host.path()),
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "corrupt_state");
+        assert_eq!(error.exit, crate::exit_status::REFUSED);
     }
 }

@@ -19,8 +19,8 @@ use super::source_snapshot::{
 pub const PROJECT_DESCRIPTOR_SCHEMA_NAME: &str = "aethyme.project-descriptor/experimental-v0";
 pub const PROJECT_DESCRIPTOR_PATH: &str = ".aethyme/project-descriptor.json";
 pub const PROJECT_POLICY_PATH: &str = ".aethyme/config.toml";
-pub const MAX_DESCRIPTOR_BYTES: usize = 16 * 1024 * 1024;
-pub const MAX_DESCRIPTOR_FILES: usize = 200_000;
+pub const MAX_DESCRIPTOR_BYTES: usize = canonical_json::MAX_DOCUMENT_BYTES;
+pub const MAX_DESCRIPTOR_FILES: usize = canonical_json::MAX_CONTAINER_ENTRIES;
 const FILE_ID_DOMAIN: &[u8] = b"aethyme file identity v0\0";
 const PROPOSAL_FILE_ID_DOMAIN: &[u8] = b"aethyme proposed file identity v0\0";
 
@@ -180,12 +180,14 @@ impl ProjectDescriptor {
                 file_id: FileId::enrolled(&project_id, &anchor_snapshot, entry.path()),
             })
             .collect();
-        Ok(Self {
+        let descriptor = Self {
             project_id,
             anchor_commit,
             anchor_snapshot,
             files,
-        })
+        };
+        descriptor.validate()?;
+        Ok(descriptor)
     }
 
     pub fn project_id(&self) -> &ProjectId {
@@ -250,6 +252,13 @@ impl ProjectDescriptor {
 
     /// Canonical descriptor bytes and their immutable RecordId.
     pub fn to_record(&self) -> (Vec<u8>, RecordId) {
+        let bytes = self.canonical_bytes();
+        let record = Record::decode(&bytes, &[&PROJECT_DESCRIPTOR_SCHEMA])
+            .expect("descriptor constructors enforce the canonical record profile");
+        (bytes, record.id())
+    }
+
+    fn canonical_bytes(&self) -> Vec<u8> {
         let files = self
             .files
             .iter()
@@ -285,11 +294,7 @@ impl ProjectDescriptor {
             ("visibility_boundary".into(), text("local")),
             ("files".into(), Value::Array(files)),
         ];
-        let bytes = Value::Object(Object::new(fields).expect("distinct descriptor fields"))
-            .to_canonical_bytes();
-        let record = Record::decode(&bytes, &[&PROJECT_DESCRIPTOR_SCHEMA])
-            .expect("a project descriptor encodes to its schema");
-        (bytes, record.id())
+        Value::Object(Object::new(fields).expect("distinct descriptor fields")).to_canonical_bytes()
     }
 
     pub fn from_record(input: &[u8]) -> Result<(Self, RecordId), ProjectIdentityError> {
@@ -395,6 +400,12 @@ impl ProjectDescriptor {
         if self.files.len() > MAX_DESCRIPTOR_FILES {
             return Err(ProjectIdentityError::TooManyFiles {
                 count: self.files.len(),
+            });
+        }
+        let encoded_bytes = self.canonical_bytes().len();
+        if encoded_bytes > MAX_DESCRIPTOR_BYTES {
+            return Err(ProjectIdentityError::DescriptorTooLarge {
+                bytes: encoded_bytes,
             });
         }
         let source = self.anchor_source()?;

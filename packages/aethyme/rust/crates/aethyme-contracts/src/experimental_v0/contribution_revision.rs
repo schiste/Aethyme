@@ -13,8 +13,8 @@ use super::record::{FieldKind, FieldSpec, Record, RecordError, RecordId, RecordS
 use super::source_snapshot::{EntryKind, SourceEntry, SourceSnapshot, SourceSnapshotId};
 
 pub const CONTRIBUTION_REVISION_SCHEMA_NAME: &str = "aethyme.contribution-revision/experimental-v0";
-pub const MAX_CONTRIBUTION_REVISION_BYTES: usize = 4 * 1024 * 1024;
-pub const MAX_REVISION_CHANGES: usize = 200_000;
+pub const MAX_CONTRIBUTION_REVISION_BYTES: usize = canonical_json::MAX_DOCUMENT_BYTES;
+pub const MAX_REVISION_CHANGES: usize = canonical_json::MAX_CONTAINER_ENTRIES;
 
 const fn field(name: &'static str, required: bool, kind: FieldKind) -> FieldSpec {
     FieldSpec {
@@ -134,6 +134,11 @@ impl ContributionRevision {
                 source_changes.len(),
             ));
         }
+        if depends_on.len() > canonical_json::MAX_CONTAINER_ENTRIES {
+            return Err(ContributionRevisionError::TooManyDependencies(
+                depends_on.len(),
+            ));
+        }
         validate_changes(&source_changes)?;
         let mut dependency_ids: Vec<String> = depends_on
             .iter()
@@ -147,7 +152,7 @@ impl ContributionRevision {
             .iter()
             .map(|id| RecordId::parse(id).expect("input dependency IDs were RecordIds"))
             .collect();
-        Ok(Self {
+        let revision = Self {
             project_id,
             contribution_id,
             capture_record_id,
@@ -156,7 +161,12 @@ impl ContributionRevision {
             source_changes,
             brief,
             depends_on,
-        })
+        };
+        let encoded = revision.canonical_record_bytes();
+        if encoded.len() > MAX_CONTRIBUTION_REVISION_BYTES {
+            return Err(ContributionRevisionError::TooLarge(encoded.len()));
+        }
+        Ok(revision)
     }
 
     pub fn project_id(&self) -> &ProjectId {
@@ -197,6 +207,13 @@ impl ContributionRevision {
 
     /// Canonical record bytes and their immutable revision ID.
     pub fn to_record(&self) -> (Vec<u8>, RecordId) {
+        let bytes = self.canonical_record_bytes();
+        let record = Record::decode(&bytes, &[&CONTRIBUTION_REVISION_SCHEMA])
+            .expect("the constructor admits only canonical-profile contribution revisions");
+        (bytes, record.id())
+    }
+
+    fn canonical_record_bytes(&self) -> Vec<u8> {
         let mut fields = vec![
             ("schema".into(), text(CONTRIBUTION_REVISION_SCHEMA_NAME)),
             ("project_id".into(), text(self.project_id.as_str())),
@@ -223,12 +240,8 @@ impl ContributionRevision {
             fields.push(("brief_record_id".into(), text(brief.record_id.as_str())));
             fields.push(("brief_object_sha256".into(), text(&brief.object_sha256)));
         }
-        let bytes =
-            Value::Object(Object::new(fields).expect("distinct contribution revision fields"))
-                .to_canonical_bytes();
-        let record = Record::decode(&bytes, &[&CONTRIBUTION_REVISION_SCHEMA])
-            .expect("a contribution revision encodes to its schema");
-        (bytes, record.id())
+        Value::Object(Object::new(fields).expect("distinct contribution revision fields"))
+            .to_canonical_bytes()
     }
 
     pub fn from_record(input: &[u8]) -> Result<(Self, RecordId), ContributionRevisionError> {
@@ -416,13 +429,20 @@ fn object_ids(
     field: &'static str,
 ) -> Result<Vec<FileId>, ContributionRevisionError> {
     match object.get(field) {
-        Some(Value::Array(values)) => values
-            .iter()
-            .map(|value| match value {
-                Value::String(id) => FileId::parse(id).map_err(ContributionRevisionError::Project),
-                _ => Err(ContributionRevisionError::InvalidSourceChange),
-            })
-            .collect(),
+        Some(Value::Array(values)) => {
+            if values.len() > canonical_json::MAX_CONTAINER_ENTRIES {
+                return Err(ContributionRevisionError::TooManyReferences(values.len()));
+            }
+            values
+                .iter()
+                .map(|value| match value {
+                    Value::String(id) => {
+                        FileId::parse(id).map_err(ContributionRevisionError::Project)
+                    }
+                    _ => Err(ContributionRevisionError::InvalidSourceChange),
+                })
+                .collect()
+        }
         _ => Err(ContributionRevisionError::InvalidSourceChange),
     }
 }
@@ -486,6 +506,14 @@ pub enum ContributionRevisionError {
     TooLarge(usize),
     #[error("contribution revision has more than {MAX_REVISION_CHANGES} source changes ({0})")]
     TooManyChanges(usize),
+    #[error(
+        "contribution revision has more than {canonical_json::MAX_CONTAINER_ENTRIES} dependencies ({0})"
+    )]
+    TooManyDependencies(usize),
+    #[error(
+        "a contribution source change has more than {canonical_json::MAX_CONTAINER_ENTRIES} file references ({0})"
+    )]
+    TooManyReferences(usize),
     #[error("contribution revision must be a JSON object")]
     NotAnObject,
     #[error("contribution revision contains unknown field {0:?}")]
