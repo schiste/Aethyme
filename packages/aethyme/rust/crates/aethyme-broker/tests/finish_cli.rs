@@ -424,11 +424,15 @@ fn finish_cli_reports_partial_cleanup_and_resumes_idempotently() {
 
 #[test]
 fn finish_cli_can_remove_its_current_worktree_after_the_command_starts() {
-    let (_tmp, session_id, worktree, _) = promoted_fixture();
-    let output = run(
-        &worktree,
+    let (tmp, session_id, worktree, _) = promoted_fixture();
+    let output = isolation::command(
+        CLI,
+        tmp.path(),
         &["finish", "--session", &session_id.to_string(), "--json"],
-    );
+    )
+    .current_dir(&worktree)
+    .output()
+    .unwrap();
     assert!(
         output.status.success(),
         "{}",
