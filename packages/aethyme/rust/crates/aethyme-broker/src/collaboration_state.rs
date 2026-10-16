@@ -971,6 +971,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
              authority_epoch TEXT NOT NULL,
              client_key TEXT NOT NULL CHECK(length(client_key) BETWEEN 1 AND 256),
              wave TEXT NOT NULL REFERENCES local_waves(wave),
+             expected_version INTEGER NOT NULL CHECK(expected_version >= 0),
              request_record_id TEXT NOT NULL,
              request_object_sha256 TEXT NOT NULL CHECK(length(request_object_sha256)=64),
              composition_source_record_id TEXT NOT NULL,
@@ -1021,6 +1022,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
              WHERE r.reservation=NEW.reservation AND r.target=NEW.target
                AND r.wave=NEW.wave AND r.parent IS NULL
                AND t.issuer=NEW.issuer
+               AND t.active_revision=r.revision AND t.version=NEW.expected_version
          )
          BEGIN
              SELECT RAISE(ABORT, 'managed resolution proof must match a root reservation');
@@ -1061,9 +1063,11 @@ const MIGRATIONS: &[(i64, &str)] = &[
              FROM local_resolution_reservation_proofs p
              JOIN local_budget_reservations r ON r.reservation=p.reservation
              JOIN local_waves w ON w.wave=p.wave
+             JOIN local_targets t ON t.target=p.target AND t.issuer=p.issuer
              JOIN resolution_attempts a ON a.attempt_id=NEW.attempt_id
              WHERE p.reservation=NEW.reservation
                AND p.authority_epoch=NEW.authority_epoch
+               AND t.active_revision=w.revision AND t.version=p.expected_version
                AND w.resolution_request_record_id=p.request_record_id
                AND w.resolution_request_object=p.request_object_sha256
                AND w.composition_source_record_id=p.composition_source_record_id
@@ -2842,6 +2846,7 @@ mod tests {
             authority_epoch: String,
             client_key: String,
             wave: String,
+            expected_version: i64,
             request_record_id: String,
             request_object_sha256: String,
             composition_source_record_id: String,
@@ -2918,7 +2923,7 @@ mod tests {
             reservation: &str,
         ) -> rusqlite::Result<BindingAuthoritySnapshot> {
             let proof = connection.query_row(
-                "SELECT reservation,target,issuer,authority_epoch,client_key,wave,
+                "SELECT reservation,target,issuer,authority_epoch,client_key,wave,expected_version,
                         request_record_id,request_object_sha256,
                         composition_source_record_id,composition_source_object_sha256,
                         input_manifest_object_sha256,trigger_sha256,project_policy,
@@ -2934,20 +2939,21 @@ mod tests {
                         authority_epoch: row.get(3)?,
                         client_key: row.get(4)?,
                         wave: row.get(5)?,
-                        request_record_id: row.get(6)?,
-                        request_object_sha256: row.get(7)?,
-                        composition_source_record_id: row.get(8)?,
-                        composition_source_object_sha256: row.get(9)?,
-                        input_manifest_object_sha256: row.get(10)?,
-                        trigger_sha256: row.get(11)?,
-                        project_policy: row.get(12)?,
-                        objective_policy: row.get(13)?,
-                        price_profile: row.get(14)?,
-                        dispatch_limits: row.get(15)?,
-                        reserved_envelope: row.get(16)?,
-                        reservation_attempt_limit: row.get(17)?,
-                        deadline_ms: row.get(18)?,
-                        created_ms: row.get(19)?,
+                        expected_version: row.get(6)?,
+                        request_record_id: row.get(7)?,
+                        request_object_sha256: row.get(8)?,
+                        composition_source_record_id: row.get(9)?,
+                        composition_source_object_sha256: row.get(10)?,
+                        input_manifest_object_sha256: row.get(11)?,
+                        trigger_sha256: row.get(12)?,
+                        project_policy: row.get(13)?,
+                        objective_policy: row.get(14)?,
+                        price_profile: row.get(15)?,
+                        dispatch_limits: row.get(16)?,
+                        reserved_envelope: row.get(17)?,
+                        reservation_attempt_limit: row.get(18)?,
+                        deadline_ms: row.get(19)?,
+                        created_ms: row.get(20)?,
                     })
                 },
             )?;
@@ -3157,7 +3163,9 @@ mod tests {
             .execute_batch(
                 "INSERT INTO local_targets (target,issuer) VALUES ('target','issuer');
                  INSERT INTO local_target_revisions (revision,target,body)
-                     VALUES ('revision','target',X'01');",
+                     VALUES ('revision','target',X'01');
+                 UPDATE local_targets SET active_revision='revision'
+                     WHERE target='target';",
             )
             .unwrap();
         migrated
@@ -3185,6 +3193,46 @@ mod tests {
         migrated
             .connection()
             .execute(
+                "INSERT INTO local_budget_reservations
+                     (reservation,nonce,target,revision,wave,root,parent,body,
+                      phase,spent,attempts,version)
+                 VALUES ('reservation:stale-version','nonce:stale-version','target',
+                         'revision','wave','reservation:stale-version',NULL,X'0d',
+                         'reserved',X'00',0,0)",
+                [],
+            )
+            .unwrap();
+        let stale_version_proof = migrated.connection().execute(
+            "INSERT INTO local_resolution_reservation_proofs
+                 (reservation,target,issuer,authority_epoch,client_key,wave,expected_version,
+                  request_record_id,request_object_sha256,composition_source_record_id,
+                  composition_source_object_sha256,input_manifest_object_sha256,
+                  trigger_sha256,project_policy,objective_policy,price_profile,
+                  dispatch_limits,reserved_envelope,reservation_attempt_limit,
+                  deadline_ms,created_ms)
+             VALUES ('reservation:stale-version','target','issuer','epoch-1',
+                     'client-key:stale-version','wave',1,'request:managed',?1,
+                     'source:managed',?2,?3,?4,'project-policy','objective-policy',
+                     'price-profile','v1:1024:10:1024:4096:1024',X'0e',1,999,100)",
+            rusqlite::params![request_sha, source_sha, manifest_sha, trigger_sha],
+        );
+        assert!(
+            stale_version_proof.is_err(),
+            "proof creation must bind the expected current target version"
+        );
+        let stale_version_proof_count: i64 = migrated
+            .read_connection()
+            .query_row(
+                "SELECT count(*) FROM local_resolution_reservation_proofs
+                 WHERE reservation='reservation:stale-version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stale_version_proof_count, 0);
+        migrated
+            .connection()
+            .execute(
                 "INSERT INTO resolution_attempts
                      (decision_key,kind,members,paths,request_record_id,resolver,
                       charged_ms,attempt_number,request_sha256,input_manifest_sha256,
@@ -3201,12 +3249,12 @@ mod tests {
             .execute(
                 "INSERT INTO local_resolution_reservation_proofs
                      (reservation,target,issuer,authority_epoch,client_key,wave,
-                      request_record_id,request_object_sha256,composition_source_record_id,
+                      expected_version,request_record_id,request_object_sha256,composition_source_record_id,
                       composition_source_object_sha256,input_manifest_object_sha256,
                       trigger_sha256,project_policy,objective_policy,price_profile,
                       dispatch_limits,reserved_envelope,reservation_attempt_limit,
                       deadline_ms,created_ms)
-                 VALUES ('reservation','target','issuer','epoch-1','client-key','wave',
+                 VALUES ('reservation','target','issuer','epoch-1','client-key','wave',0,
                          'request:managed',?1,'source:managed',?2,?3,?4,
                          'project-policy','objective-policy',
                          'price-profile','v1:1024:10:1024:4096:1024',X'04',1,999,100)",
@@ -3307,13 +3355,13 @@ mod tests {
             .execute(
                 "INSERT INTO local_resolution_reservation_proofs
                      (reservation,target,issuer,authority_epoch,client_key,wave,
-                      request_record_id,request_object_sha256,composition_source_record_id,
+                      expected_version,request_record_id,request_object_sha256,composition_source_record_id,
                       composition_source_object_sha256,input_manifest_object_sha256,
                       trigger_sha256,project_policy,objective_policy,price_profile,
                       dispatch_limits,reserved_envelope,reservation_attempt_limit,
                       deadline_ms,created_ms)
                  VALUES ('reservation:wrong-source','target','issuer','epoch-1',
-                         'client-key:wrong-source','wave','request:managed',?1,
+                         'client-key:wrong-source','wave',0,'request:managed',?1,
                          'source:wrong',?2,?3,?4,'project-policy','objective-policy',
                          'price-profile','v1:1024:10:1024:4096:1024',X'0a',1,999,100)",
                 rusqlite::params![request_sha, &"0".repeat(64), manifest_sha, trigger_sha],
@@ -3370,13 +3418,13 @@ mod tests {
             .execute(
                 "INSERT INTO local_resolution_reservation_proofs
                      (reservation,target,issuer,authority_epoch,client_key,wave,
-                      request_record_id,request_object_sha256,composition_source_record_id,
+                      expected_version,request_record_id,request_object_sha256,composition_source_record_id,
                       composition_source_object_sha256,input_manifest_object_sha256,
                       trigger_sha256,project_policy,objective_policy,price_profile,
                       dispatch_limits,reserved_envelope,reservation_attempt_limit,
                       deadline_ms,created_ms)
                  VALUES ('reservation:wrong-source-object','target','issuer','epoch-1',
-                         'client-key:wrong-source-object','wave','request:managed',?1,
+                         'client-key:wrong-source-object','wave',0,'request:managed',?1,
                          'source:managed',?2,?3,?4,'project-policy','objective-policy',
                          'price-profile','v1:1024:10:1024:4096:1024',X'0c',1,999,100)",
                 rusqlite::params![request_sha, &"0".repeat(64), manifest_sha, trigger_sha],
@@ -3508,13 +3556,13 @@ mod tests {
             .execute(
                 "INSERT INTO local_resolution_reservation_proofs
                      (reservation,target,issuer,authority_epoch,client_key,wave,
-                      request_record_id,request_object_sha256,composition_source_record_id,
+                      expected_version,request_record_id,request_object_sha256,composition_source_record_id,
                       composition_source_object_sha256,input_manifest_object_sha256,
                       trigger_sha256,project_policy,objective_policy,price_profile,
                       dispatch_limits,reserved_envelope,reservation_attempt_limit,
                       deadline_ms,created_ms)
                  VALUES ('reservation:no-roots','target','issuer','epoch-1',
-                         'client-key:no-roots','wave','request:managed',?1,
+                         'client-key:no-roots','wave',0,'request:managed',?1,
                          'source:managed',?2,?3,?4,
                          'project-policy','objective-policy','price-profile',
                          'v1:1024:10:1024:4096:1024',X'08',1,999,100)",
@@ -3621,12 +3669,12 @@ mod tests {
         let cross_epoch_key = migrated.connection().execute(
             "INSERT INTO local_resolution_reservation_proofs
                  (reservation,target,issuer,authority_epoch,client_key,wave,
-                  request_record_id,request_object_sha256,composition_source_record_id,
+                  expected_version,request_record_id,request_object_sha256,composition_source_record_id,
                   composition_source_object_sha256,input_manifest_object_sha256,
                   trigger_sha256,project_policy,objective_policy,price_profile,
                   dispatch_limits,reserved_envelope,reservation_attempt_limit,
                   deadline_ms,created_ms)
-             VALUES ('reservation:retry','target','issuer','epoch-2','client-key','wave',
+             VALUES ('reservation:retry','target','issuer','epoch-2','client-key','wave',0,
                      'request:other',?1,'source:other',?2,?3,?4,
                      'project-policy','objective-policy',
                      'price-profile','v1:1024:10:1024:4096:1024',X'06',1,999,102)",
