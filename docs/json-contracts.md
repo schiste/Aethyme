@@ -567,6 +567,13 @@ before returning the metadata-only packet. Reusing its client key returns
 it cannot replenish the allowance. `status` opens a read-only snapshot and
 does not create state or migrate it. Session labels are provenance only.
 
+`prepare` and `mark-dispatching` require `--target`, `--issuer`, `--wave`
+and `--version`, acquire the appointed local controller, and check that the
+exact request belongs to the current active wave at that target version.
+Stale, terminal or stopped waves cannot prepare or mark new handoff intent.
+Status, unknown-delivery bookkeeping and response import remain usable for
+historical charged attempts; they grant no current-wave attachment authority.
+
 `mark-dispatching` records handoff intent before an operator supplies the
 packet to a local agent. It returns `status` and starts no process. A response
 cannot be imported while the attempt is merely exported. `mark-unknown`

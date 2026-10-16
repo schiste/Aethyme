@@ -146,13 +146,16 @@ Usage:
 
 Additional explicit lifecycle commands (provisional Local packages):
   aethyme collab resolution prepare --request ID --object sha256:HEX
-       --session-label LABEL --client-key KEY --limits PATH [--json]
+       --session-label LABEL --client-key KEY --limits PATH
+       --target NAME --issuer NAME --wave ID --version N [--json]
       Charge one bounded attempt before exposing its exact metadata packet.
       Limits are a strict JSON file; labels are provenance, not authentication.
+      Preparation and handoff intent require the exact current wave and target version.
       Repeating a client key returns status without a new charge or packet.
   aethyme collab resolution status --attempt TOKEN --session-label LABEL [--json]
       Read-only attempt status, including the retained limits and unknowns.
-  aethyme collab resolution mark-dispatching --attempt TOKEN --session-label LABEL [--json]
+  aethyme collab resolution mark-dispatching --attempt TOKEN --session-label LABEL
+       --target NAME --issuer NAME --wave ID --version N [--json]
       Record handoff intent before giving the packet to a local agent.
       This command records state only; it neither starts nor authorizes an agent.
   aethyme collab resolution mark-unknown --attempt TOKEN --session-label LABEL
@@ -365,6 +368,9 @@ fn next_action_for(code: &str) -> Option<&'static str> {
         "not_initialized" => {
             "nothing is retained yet: an advisory or required `aethyme broker submit` \
              creates collaboration state"
+        }
+        "resolution_wave_refused" => {
+            "inspect the latest target and wave, then use their exact request and version"
         }
         "file_too_large" => "pass a smaller file; the message gives the limit",
         _ => return None,

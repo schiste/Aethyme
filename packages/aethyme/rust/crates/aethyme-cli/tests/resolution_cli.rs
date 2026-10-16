@@ -131,6 +131,19 @@ fn resolution_commands_route_and_refuse_uninitialized_state_without_creating_it(
         ],
     ];
     for args in cases.iter().chain(marks) {
+        let mut arguments = args.to_vec();
+        if matches!(args[0], "prepare" | "mark-dispatching") {
+            arguments.extend([
+                "--target",
+                "target",
+                "--issuer",
+                "appointed",
+                "--wave",
+                &digest,
+                "--version",
+                "0",
+            ]);
+        }
         let output = Command::new(aethyme_testkit::aethyme_bin())
             .current_dir(&repo)
             .env("HOME", &home)
@@ -141,7 +154,7 @@ fn resolution_commands_route_and_refuse_uninitialized_state_without_creating_it(
             .env_remove("XDG_STATE_HOME")
             .env_remove("XDG_CACHE_HOME")
             .args(["collab", "resolution"])
-            .args(*args)
+            .args(&arguments)
             .arg("--json")
             .output()
             .unwrap();

@@ -92,7 +92,7 @@ fn authority_error(error: authority::AuthorityError) -> Failure {
     };
     Failure::domain(code, error.to_string())
 }
-fn target_error(error: target::TargetError) -> Failure {
+pub(super) fn target_error(error: target::TargetError) -> Failure {
     if let target::TargetError::Authority(error) = error {
         return authority_error(error);
     }
@@ -137,7 +137,7 @@ fn native_gate_error(error: crate::native_gates::NativeGateError) -> Failure {
         error => Failure::domain("native_gate", error.to_string()),
     }
 }
-fn existing_owner(
+pub(super) fn existing_owner(
     store: &mut CollaborationStore,
     name: &str,
     issuer: &str,
@@ -167,7 +167,7 @@ fn existing_owner(
 fn parse_record(value: &str) -> Result<RecordId, Failure> {
     RecordId::parse(value).map_err(|e| Failure::usage(e.to_string()))
 }
-fn version(flags: &Flags<'_>) -> Result<i64, Failure> {
+pub(super) fn version(flags: &Flags<'_>) -> Result<i64, Failure> {
     let n = flags
         .one("--version")?
         .parse::<i64>()

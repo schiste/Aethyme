@@ -10,6 +10,11 @@ requires an exact archived request and explicit byte/entry limits; it commits
 one attempt charge and retention roots before exposing a metadata-only packet.
 `status` is read-only. `packet` recovers a still-exported packet and `input`
 reads only an exact manifested snapshot/path under the retained limits.
+Preparation and handoff intent require the appointed controller and explicit
+current target, issuer, wave and target version. The archived request must
+match the current active wave; stale or terminal work cannot start new intent.
+Historical status and late-response import preserve already charged attempts
+without granting current-wave or acceptance authority.
 `mark-dispatching` records handoff intent before an operator supplies the
 packet to a local agent. `mark-unknown` preserves an uncertain attempt and
 its charge. Neither command starts a process or grants dispatch authority.
