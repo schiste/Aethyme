@@ -1194,6 +1194,55 @@ function run(): void {
     "invalid borrowed brief digest was checked only after identity hashing",
   );
 
+  const exactBoundarySyntaxBytes = 2 + 15 + 2 * 16;
+  const exactBoundaryTailBytes =
+    PROFILE_LIMITS.max_document_bytes -
+    exactBoundarySyntaxBytes -
+    15 * PROFILE_LIMITS.max_string_bytes;
+  check(
+    exactBoundarySyntaxBytes === 49 && exactBoundaryTailBytes === 65_487,
+    "generated 16-string array boundary arithmetic is exact",
+  );
+  const exactBoundaryPrefix = Array.from(
+    { length: 15 },
+    () => "x".repeat(PROFILE_LIMITS.max_string_bytes),
+  );
+  const exactAsciiBoundary = [
+    ...exactBoundaryPrefix,
+    "x".repeat(exactBoundaryTailBytes),
+  ];
+  check(
+    boundedCanonicalByteLength(exactAsciiBoundary) ===
+      PROFILE_LIMITS.max_document_bytes,
+    "bounded canonical size accepts an exact 1 MiB ASCII array",
+  );
+  const oneByteOverAsciiBoundary = [
+    ...exactBoundaryPrefix,
+    "x".repeat(exactBoundaryTailBytes + 1),
+  ];
+  check(
+    boundedCanonicalByteLength(oneByteOverAsciiBoundary) === undefined,
+    "bounded canonical size refuses a 1 MiB plus one-byte ASCII array",
+  );
+  const exactUtf8Boundary = [
+    ...exactBoundaryPrefix,
+    "x".repeat(exactBoundaryTailBytes - 2) + "é",
+  ];
+  check(
+    boundedCanonicalByteLength(exactUtf8Boundary) ===
+      PROFILE_LIMITS.max_document_bytes,
+    "bounded canonical size counts a two-byte UTF-8 scalar at the exact limit",
+  );
+  const exactEscapedNewlineBoundary = [
+    ...exactBoundaryPrefix,
+    "x".repeat(exactBoundaryTailBytes - 2) + "\n",
+  ];
+  check(
+    boundedCanonicalByteLength(exactEscapedNewlineBoundary) ===
+      PROFILE_LIMITS.max_document_bytes,
+    "bounded canonical size counts newline escaping at the exact limit",
+  );
+
   const aggregateOversizeChanges = Array.from(
     { length: 13 },
     () => "x".repeat(64_000),
