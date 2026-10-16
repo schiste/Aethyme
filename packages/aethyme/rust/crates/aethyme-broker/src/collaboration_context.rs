@@ -683,7 +683,7 @@ pub fn attach_brief(
     contribution: &RecordId,
     brief: &Brief,
 ) -> Result<RecordId, ContextError> {
-    let _archive = archive_read(store)?;
+    let archive_use = archive_read(store)?;
     let _response = crate::collaboration_sensitive::response_use(store)
         .map_err(crate::collaboration_archive::ArchiveError::from)?;
     let errors = brief.validate();
@@ -692,7 +692,7 @@ pub fn attach_brief(
             aethyme_contracts::experimental_v0::brief::BriefErrors(errors).to_string(),
         ));
     }
-    if let Some(id) = revisions::attach_bound_brief(store, contribution, brief)? {
+    if let Some(id) = revisions::attach_bound_brief(store, contribution, brief, &archive_use)? {
         return Ok(id);
     }
     let (bytes, id) = brief.to_record();

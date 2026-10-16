@@ -6,8 +6,9 @@
 
 use super::*;
 use crate::collaboration_identity_store::{
-    IdentityStoreError, ResolvedContributionRevision, resolve_approved_project_binding,
-    resolve_bound_contribution_revision,
+    ContributionRevisionPin, IdentityStoreError, ResolvedContributionRevision,
+    resolve_approved_project_binding_with_archive_use,
+    resolve_bound_contribution_revisions_with_archive_use,
 };
 use aethyme_contracts::experimental_v0::ContributionId;
 
@@ -52,7 +53,7 @@ pub fn retrieve_revisions(
     pins: &[RevisionPin],
     visibility: &dyn Visibility,
 ) -> Result<ContributionContext, RevisionContextError> {
-    let _archive = archive_read(store)?;
+    let archive_use = archive_read(store)?;
     let _response = crate::collaboration_sensitive::response_use(store)
         .map_err(ArchiveError::from)
         .map_err(ContextError::from)?;
@@ -93,8 +94,9 @@ pub fn retrieve_revisions(
         .unchecked_transaction()
         .map_err(ContextError::from)?;
     let revocation = reader_revocation(&transaction, &reader).map_err(ContextError::from)?;
-    let binding = resolve_approved_project_binding(store)?.ok_or(IdentityStoreError::Unbound)?;
-    let mut resolved = Vec::new();
+    let binding = resolve_approved_project_binding_with_archive_use(store, &archive_use)?
+        .ok_or(IdentityStoreError::Unbound)?;
+    let mut visible_pins = Vec::new();
     for pin in ordered.values() {
         // Apply the existing capture visibility boundary before loading data.
         // The resolver verifies the actual capture identity again below.
@@ -112,16 +114,27 @@ pub fn retrieve_revisions(
         if !visibility.visible(&capture) {
             continue;
         }
-        let revision = resolve_bound_contribution_revision(
-            store,
-            &binding,
-            &pin.revision_record_id,
-            pin.object_digest,
-            &pin.contribution_id,
-        )?;
-        if visibility.visible(revision.capture_record_id().as_str()) {
-            resolved.push(revision);
-        }
+        visible_pins.push(ContributionRevisionPin {
+            revision_record_id: &pin.revision_record_id,
+            object_digest: pin.object_digest,
+            contribution_id: &pin.contribution_id,
+        });
+    }
+    // The selected set shares one bounded replay. Repeating the complete
+    // history per pin would amplify one allowed request by MAX_CANDIDATES.
+    let resolved: Vec<_> = resolve_bound_contribution_revisions_with_archive_use(
+        store,
+        &binding,
+        &visible_pins,
+        &archive_use,
+    )?
+    .into_values()
+    .collect();
+    if resolved
+        .iter()
+        .any(|revision| !visibility.visible(revision.capture_record_id().as_str()))
+    {
+        return Err(RevisionContextError::VisibilityChanged);
     }
     let mut analysis = Vec::new();
     let mut related_count = 0;
@@ -495,6 +508,7 @@ pub(super) fn attach_bound_brief(
     store: &mut CollaborationStore,
     contribution: &RecordId,
     brief: &Brief,
+    archive_use: &crate::collaboration_gc::ArchiveUse,
 ) -> Result<Option<RecordId>, ContextError> {
     if store.schema_version() < 26 {
         return Ok(None);
@@ -518,20 +532,22 @@ pub(super) fn attach_bound_brief(
     }
     let operation = crate::collaboration_capture::OperationId::parse(&operations[0])
         .map_err(|error| ContextError::RevisionIdentity(error.to_string()))?;
-    let binding = resolve_approved_project_binding(store)
+    let binding = resolve_approved_project_binding_with_archive_use(store, archive_use)
         .map_err(|error| ContextError::RevisionIdentity(error.to_string()))?
         .ok_or_else(|| ContextError::RevisionIdentity("project binding is missing".into()))?;
-    let resolved = crate::collaboration_identity_store::revise_contribution_for_operation(
-        store,
-        &binding,
-        crate::collaboration_identity_store::ContributionRevisionRequest {
-            operation_id: &operation,
-            file_operations: None,
-            brief: Some(brief),
-            depends_on: None,
-        },
-    )
-    .map_err(|error| ContextError::RevisionIdentity(error.to_string()))?;
+    let resolved =
+        crate::collaboration_identity_store::revise_contribution_for_operation_with_archive_use(
+            store,
+            &binding,
+            crate::collaboration_identity_store::ContributionRevisionRequest {
+                operation_id: &operation,
+                file_operations: None,
+                brief: Some(brief),
+                depends_on: None,
+            },
+            archive_use,
+        )
+        .map_err(|error| ContextError::RevisionIdentity(error.to_string()))?;
     resolved
         .revision()
         .brief()

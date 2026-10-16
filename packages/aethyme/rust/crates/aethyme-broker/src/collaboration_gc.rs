@@ -28,7 +28,7 @@ use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::sync::mpsc::Sender;
 
-use aethyme_contracts::experimental_v0::SourceSnapshotId;
+use aethyme_contracts::experimental_v0::{RecordId, SourceSnapshotId};
 use rusqlite::{OptionalExtension, TransactionBehavior};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -666,6 +666,7 @@ struct Closure<'a> {
     objects: BTreeMap<ObjectDigest, RetentionClass>,
     snapshots: BTreeSet<String>,
     contributions: BTreeSet<String>,
+    revisions: BTreeSet<RecordId>,
     /// Why a root could not be followed, when strict.
     problems: Vec<String>,
 }
@@ -677,6 +678,7 @@ impl<'a> Closure<'a> {
             objects: BTreeMap::new(),
             snapshots: BTreeSet::new(),
             contributions: BTreeSet::new(),
+            revisions: BTreeSet::new(),
             problems: Vec::new(),
         }
     }
@@ -809,21 +811,82 @@ impl<'a> Closure<'a> {
         self.snapshot(&result)
     }
 
+    /// Follow only immutable proof edges selected by roots. Index rows by
+    /// themselves do not keep any history alive. This routine never invokes
+    /// the identity resolver or takes a second archive lock during GC apply.
+    fn expand_identity_proofs(&mut self) -> Result<(), GcError> {
+        if self.store.schema_version() < 26 {
+            return Ok(());
+        }
+        let indexed: Vec<(String, String)> = self.store.read_connection()
+            .prepare("SELECT revision_record_id,record_sha256 FROM contribution_revisions ORDER BY revision_record_id")?
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<Result<_, _>>()?;
+        let mut pending = Vec::new();
+        for (id, digest) in indexed {
+            if parse_hex_digest(&digest).is_some_and(|digest| self.objects.contains_key(&digest)) {
+                pending.push(id);
+            }
+        }
+        while let Some(id) = pending.pop() {
+            let Ok(record_id) = RecordId::parse(&id) else {
+                self.problems
+                    .push(format!("rooted revision {id} has a malformed id"));
+                continue;
+            };
+            if !self.revisions.insert(record_id) {
+                continue;
+            }
+            let row: Option<(String, Option<String>, String, String, String, String)> = self.store.read_connection().query_row(
+                "SELECT r.record_sha256,r.brief_object_sha256,r.lineage_record_id,c.record_sha256,c.base_snapshot,c.result_snapshot
+                 FROM contribution_revisions r JOIN retained_contributions c ON c.lineage_record_id=r.lineage_record_id
+                 WHERE r.revision_record_id=?1", [&id],
+                |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?)),
+            ).optional()?;
+            let Some((revision, brief, lineage, capture, base, result)) = row else {
+                self.problems
+                    .push(format!("rooted revision {id} has no retained source proof"));
+                continue;
+            };
+            // Keep the exact ancestor's source without rooting every other
+            // revision sharing its capture lineage.
+            self.contributions.insert(lineage);
+            for digest in std::iter::once(revision)
+                .chain(brief)
+                .chain(std::iter::once(capture))
+            {
+                match parse_hex_digest(&digest) {
+                    Some(digest) => self.object(digest, RetentionClass::Record),
+                    None => self.problems.push(format!(
+                        "rooted revision {id} has a malformed object digest"
+                    )),
+                }
+            }
+            self.snapshot(&base)?;
+            self.snapshot(&result)?;
+            let dependencies: Vec<String> = self.store.read_connection()
+                .prepare("SELECT base_revision_record_id FROM contribution_revision_identity_bases WHERE revision_record_id=?1 ORDER BY base_revision_record_id")?
+                .query_map([&id], |row| row.get(0))?.collect::<Result<_, _>>()?;
+            pending.extend(dependencies);
+        }
+        Ok(())
+    }
+
     fn approved_project_binding(&mut self) -> Result<(), GcError> {
         if self.store.schema_version() < 26 {
             return Ok(());
         }
-        let binding: Option<(String, String)> = self
+        let binding: Option<(String, String, String)> = self
             .store
             .read_connection()
             .query_row(
-                "SELECT descriptor_object_sha256,anchor_snapshot FROM local_project_bindings
+                "SELECT descriptor_object_sha256,anchor_snapshot,bootstrap_snapshot FROM local_project_bindings
              WHERE singleton=1",
                 [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()?;
-        if let Some((descriptor, anchor)) = binding {
+        if let Some((descriptor, anchor, bootstrap)) = binding {
             match parse_hex_digest(&descriptor) {
                 Some(digest) => self.object(digest, RetentionClass::Record),
                 None => self
@@ -831,98 +894,18 @@ impl<'a> Closure<'a> {
                     .push("approved project descriptor digest is malformed".into()),
             }
             self.snapshot(&anchor)?;
+            self.snapshot(&bootstrap)?;
         }
         Ok(())
     }
 }
 
-/// Everything a plan is computed from.
-struct Survey {
-    blockers: Vec<GcBlocker>,
-    retained: BTreeMap<RetentionClass, ClassTotal>,
-    protected_bytes: u64,
-    unknown: Vec<String>,
-    candidates: BTreeMap<String, GcItem>,
-    entities: BTreeSet<GcEntity>,
-}
-
-/// `resuming` is a generation the caller is finishing, which is therefore
-/// not a blocker.
-fn survey(
-    store: &CollaborationStore,
-    options: &GcOptions,
-    resuming: Option<i64>,
-    own_view_locks: &BTreeSet<String>,
-) -> Result<Survey, GcError> {
-    let now = options.now();
+/// Shared root discovery for GC and identity replay. Callers hold the archive
+/// barrier and, when needed, their existing SQLite snapshot. No lock is opened.
+fn live_closure(store: &CollaborationStore, now: i64) -> Result<Closure<'_>, GcError> {
     let connection = store.read_connection();
-    let mut blockers = Vec::new();
-
-    // Captures that are not over.
-    let active: Vec<String> = connection
-        .prepare(
-            "SELECT operation_id FROM capture_operations
-             WHERE state IN ('intent', 'copying', 'sealed') ORDER BY operation_id",
-        )?
-        .query_map([], |row| row.get(0))?
-        .collect::<Result<_, _>>()?;
-    for operation in &active {
-        let path = crate::collaboration_capture::locks_dir(store).join(format!("{operation}.lock"));
-        let live = open_lock_file(&path)
-            .is_ok_and(|file| matches!(file.try_lock(), Err(std::fs::TryLockError::WouldBlock)));
-        blockers.push(if live {
-            GcBlocker {
-                kind: "capture_in_progress",
-                detail: format!("capture {operation} is running"),
-            }
-        } else {
-            GcBlocker {
-                kind: "unrecovered_capture",
-                detail: format!(
-                    "capture {operation} stopped without an outcome; run \
-                     collaboration_capture::recover first"
-                ),
-            }
-        });
-    }
-    let stray_intents: Vec<String> = connection
-        .prepare(
-            "SELECT r.operation_id FROM retention_roots r JOIN capture_operations o
-                 USING (operation_id)
-             WHERE r.kind = 'capture_intent' AND r.released_ms IS NULL
-               AND o.state NOT IN ('intent', 'copying', 'sealed')",
-        )?
-        .query_map([], |row| row.get(0))?
-        .collect::<Result<_, _>>()?;
-    for operation in stray_intents {
-        blockers.push(GcBlocker {
-            kind: "live_capture_intent",
-            detail: format!(
-                "capture {operation} has ended but still holds an intent root, which protects \
-                 objects nothing indexes"
-            ),
-        });
-    }
-    let interrupted: Vec<i64> = connection
-        .prepare(
-            "SELECT generation FROM gc_generations
-             WHERE state != 'done' AND generation IS NOT ?1",
-        )?
-        .query_map([resuming], |row| row.get(0))?
-        .collect::<Result<_, _>>()?;
-    for generation in interrupted {
-        blockers.push(GcBlocker {
-            kind: "interrupted_gc",
-            detail: format!(
-                "reclamation generation {generation} was interrupted; run \
-                 collaboration_gc::resume first"
-            ),
-        });
-    }
-
-    // Live roots and what they reach.
     let mut live = Closure::new(store);
-    // Durable explicit enrollment retains its descriptor and anchor, even
+    // Durable explicit enrollment retains its descriptor and both identity anchors, even
     // after independent capture roots are released. No revision index is a root.
     live.approved_project_binding()?;
     let roots: Vec<(String, Option<String>)> = connection
@@ -1050,6 +1033,114 @@ fn survey(
                 .push(format!("unknown generation root kind {kind}")),
         }
     }
+    live.expand_identity_proofs()?;
+    Ok(live)
+}
+
+pub(crate) fn live_identity_revision_roots(
+    store: &CollaborationStore,
+    now_ms: i64,
+) -> Result<BTreeSet<RecordId>, GcError> {
+    let live = live_closure(store, now_ms)?;
+    if !live.problems.is_empty() {
+        return Err(GcError::Blocked(
+            live.problems
+                .into_iter()
+                .map(|detail| GcBlocker {
+                    kind: "dangling_root",
+                    detail,
+                })
+                .collect(),
+        ));
+    }
+    Ok(live.revisions)
+}
+
+/// Everything a plan is computed from.
+struct Survey {
+    blockers: Vec<GcBlocker>,
+    retained: BTreeMap<RetentionClass, ClassTotal>,
+    protected_bytes: u64,
+    unknown: Vec<String>,
+    candidates: BTreeMap<String, GcItem>,
+    entities: BTreeSet<GcEntity>,
+}
+
+/// `resuming` is a generation the caller is finishing, which is therefore
+/// not a blocker.
+fn survey(
+    store: &CollaborationStore,
+    options: &GcOptions,
+    resuming: Option<i64>,
+    own_view_locks: &BTreeSet<String>,
+) -> Result<Survey, GcError> {
+    let now = options.now();
+    let connection = store.read_connection();
+    let mut blockers = Vec::new();
+
+    // Captures that are not over.
+    let active: Vec<String> = connection
+        .prepare(
+            "SELECT operation_id FROM capture_operations
+             WHERE state IN ('intent', 'copying', 'sealed') ORDER BY operation_id",
+        )?
+        .query_map([], |row| row.get(0))?
+        .collect::<Result<_, _>>()?;
+    for operation in &active {
+        let path = crate::collaboration_capture::locks_dir(store).join(format!("{operation}.lock"));
+        let live = open_lock_file(&path)
+            .is_ok_and(|file| matches!(file.try_lock(), Err(std::fs::TryLockError::WouldBlock)));
+        blockers.push(if live {
+            GcBlocker {
+                kind: "capture_in_progress",
+                detail: format!("capture {operation} is running"),
+            }
+        } else {
+            GcBlocker {
+                kind: "unrecovered_capture",
+                detail: format!(
+                    "capture {operation} stopped without an outcome; run \
+                     collaboration_capture::recover first"
+                ),
+            }
+        });
+    }
+    let stray_intents: Vec<String> = connection
+        .prepare(
+            "SELECT r.operation_id FROM retention_roots r JOIN capture_operations o
+                 USING (operation_id)
+             WHERE r.kind = 'capture_intent' AND r.released_ms IS NULL
+               AND o.state NOT IN ('intent', 'copying', 'sealed')",
+        )?
+        .query_map([], |row| row.get(0))?
+        .collect::<Result<_, _>>()?;
+    for operation in stray_intents {
+        blockers.push(GcBlocker {
+            kind: "live_capture_intent",
+            detail: format!(
+                "capture {operation} has ended but still holds an intent root, which protects \
+                 objects nothing indexes"
+            ),
+        });
+    }
+    let interrupted: Vec<i64> = connection
+        .prepare(
+            "SELECT generation FROM gc_generations
+             WHERE state != 'done' AND generation IS NOT ?1",
+        )?
+        .query_map([resuming], |row| row.get(0))?
+        .collect::<Result<_, _>>()?;
+    for generation in interrupted {
+        blockers.push(GcBlocker {
+            kind: "interrupted_gc",
+            detail: format!(
+                "reclamation generation {generation} was interrupted; run \
+                 collaboration_gc::resume first"
+            ),
+        });
+    }
+
+    let mut live = live_closure(store, now)?;
     for problem in std::mem::take(&mut live.problems) {
         blockers.push(GcBlocker {
             kind: "dangling_root",
@@ -1084,6 +1175,13 @@ fn survey(
             entities.insert(GcEntity::Contribution(lineage.clone()));
         }
     }
+    kept.expand_identity_proofs()?;
+    // A young revision may retain an older ancestor contribution. Preserve
+    // its index status as well as its objects until that proof loses roots.
+    entities.retain(|entity| match entity {
+        GcEntity::Contribution(lineage) => !kept.contributions.contains(lineage),
+        GcEntity::Snapshot(_) => true,
+    });
     let snapshots: Vec<(String, String)> = connection
         .prepare(
             "SELECT snapshot_id, record_sha256 FROM retained_snapshots
