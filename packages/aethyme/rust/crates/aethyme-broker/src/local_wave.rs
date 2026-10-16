@@ -26,9 +26,19 @@ use crate::local_target::{self as target, ControllerOwner, Phase, TargetError};
 use crate::resolution::{self, FailedCheck, RequirementRef};
 
 #[cfg(test)]
+struct SynthesizedAttachGuardCallback(Box<dyn FnMut(&CollaborationStore)>);
+
+#[cfg(test)]
 thread_local! {
     static SYNTHESIZED_ATTACH_GUARD_PROBE:
-        RefCell<Option<Box<dyn FnMut(&CollaborationStore)>>> = const { RefCell::new(None) };
+        RefCell<Option<SynthesizedAttachGuardCallback>> = const { RefCell::new(None) };
+}
+
+#[cfg(test)]
+impl SynthesizedAttachGuardCallback {
+    fn call(&mut self, store: &CollaborationStore) {
+        (self.0)(store);
+    }
 }
 
 #[cfg(test)]
@@ -48,7 +58,12 @@ pub(crate) fn observe_synthesized_attach_guards(
     callback: impl FnMut(&CollaborationStore) + 'static,
 ) -> SynthesizedAttachGuardProbe {
     SYNTHESIZED_ATTACH_GUARD_PROBE.with(|probe| {
-        assert!(probe.borrow_mut().replace(Box::new(callback)).is_none());
+        assert!(
+            probe
+                .borrow_mut()
+                .replace(SynthesizedAttachGuardCallback(Box::new(callback)))
+                .is_none()
+        );
     });
     SynthesizedAttachGuardProbe
 }
@@ -57,7 +72,7 @@ pub(crate) fn observe_synthesized_attach_guards(
 fn check_synthesized_attach_guards(store: &CollaborationStore) {
     SYNTHESIZED_ATTACH_GUARD_PROBE.with(|probe| {
         if let Some(callback) = probe.borrow_mut().as_mut() {
-            callback(store);
+            callback.call(store);
         }
     });
 }
@@ -2281,6 +2296,8 @@ pub fn require_current_resolution_request(
 /// Attach the exact settled async result to its still-current wave. This only
 /// links unverified source and roots its inputs; it does not settle attempts,
 /// change allowance, or authorize acceptance.
+// These independent authority bindings stay explicit at the public boundary.
+#[allow(clippy::too_many_arguments)]
 pub fn attach_synthesized_attempt_result(
     store: &mut CollaborationStore,
     owner: &ControllerOwner,
@@ -2420,34 +2437,46 @@ pub fn attach_synthesized_attempt_result(
             params![owner.target(), owner.issuer()],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )?;
-    let (wave_phase, request_id, request_object, result_id, result_object, candidate, commit): (
-        String,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-    ) = tx.query_row(
+    struct AttachedWaveState {
+        phase: String,
+        request_id: Option<String>,
+        request_object: Option<String>,
+        result_id: Option<String>,
+        result_object: Option<String>,
+        candidate: Option<String>,
+        commit: Option<String>,
+    }
+    let attached_wave = tx.query_row(
         "SELECT phase,resolution_request_record_id,resolution_request_object,
                 resolution_result_record_id,resolution_result_object,candidate_snapshot,candidate_commit
          FROM local_waves WHERE wave=?1 AND target=?2 AND revision=?3 AND sequence=?4",
         params![wave_id.as_str(), owner.target(), observed.spec.revision, observed.spec.sequence],
-        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?)),
+        |row| {
+            Ok(AttachedWaveState {
+                phase: row.get(0)?,
+                request_id: row.get(1)?,
+                request_object: row.get(2)?,
+                result_id: row.get(3)?,
+                result_object: row.get(4)?,
+                candidate: row.get(5)?,
+                commit: row.get(6)?,
+            })
+        },
     )?;
     if version != expected_version
         || active_revision.as_deref() != Some(observed.spec.revision.as_str())
-        || request_id.as_deref() != Some(request_ref.id.as_str())
-        || request_object.as_deref() != Some(request_ref.object.hex().as_str())
-        || result_id.is_some()
-        || result_object.is_some()
-        || candidate.as_deref()
+        || attached_wave.request_id.as_deref() != Some(request_ref.id.as_str())
+        || attached_wave.request_object.as_deref() != Some(request_ref.object.hex().as_str())
+        || attached_wave.result_id.is_some()
+        || attached_wave.result_object.is_some()
+        || attached_wave.candidate.as_deref()
             != observed
                 .candidate_snapshot
                 .as_ref()
                 .map(SourceSnapshotId::as_str)
-        || commit.as_deref() != observed.candidate_commit.as_ref().map(CommitOid::as_str)
-        || wave_phase
+        || attached_wave.commit.as_deref()
+            != observed.candidate_commit.as_ref().map(CommitOid::as_str)
+        || attached_wave.phase
             != serde_json::to_value(observed.phase)?
                 .as_str()
                 .unwrap_or_default()
@@ -2490,7 +2519,7 @@ pub fn attach_synthesized_attempt_result(
             synthesis.candidate.commit.as_str(),
             synthesis.group_record.id.as_str(),
             synthesis.group_record.object.hex(),
-            wave_phase,
+            attached_wave.phase,
             request_ref.id.as_str(),
             request_ref.object.hex(),
         ],
