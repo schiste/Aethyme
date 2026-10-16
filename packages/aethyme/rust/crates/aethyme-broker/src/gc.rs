@@ -1040,6 +1040,12 @@ pub(crate) enum TreeRemoval {
     Interrupted,
 }
 
+#[derive(Debug)]
+pub(crate) struct TreeRemovalError {
+    pub(crate) source: std::io::Error,
+    pub(crate) entries_reclaimed: usize,
+}
+
 /// Remove a condemned directory tree without ever losing the evidence that it
 /// was condemned.
 ///
@@ -1069,18 +1075,20 @@ pub(crate) fn remove_condemned_tree(
     keep_until_last: Option<&str>,
     deadline: Option<Instant>,
 ) -> std::io::Result<TreeRemoval> {
-    remove_condemned_tree_with_progress(dir, keep_until_last, deadline).map(|(outcome, _)| outcome)
+    remove_condemned_tree_with_progress(dir, keep_until_last, deadline)
+        .map(|(outcome, _)| outcome)
+        .map_err(|error| error.source)
 }
 
 /// Remove a condemned tree and count entries actually unlinked. A partial
 /// deletion can keep the same cursor and interrupted path across passes, so
 /// the continuation worker uses this count instead of mistaking that stable
 /// path for a stalled sweep.
-fn remove_condemned_tree_with_progress(
+pub(crate) fn remove_condemned_tree_with_progress(
     dir: &Path,
     keep_until_last: Option<&str>,
     deadline: Option<Instant>,
-) -> std::io::Result<(TreeRemoval, usize)> {
+) -> Result<(TreeRemoval, usize), TreeRemovalError> {
     let mut entries_reclaimed = 0;
     let mut attempts_left = TREE_REMOVAL_ATTEMPTS;
     loop {
@@ -1088,13 +1096,27 @@ fn remove_condemned_tree_with_progress(
         if !is_real_directory(dir) {
             return Ok((TreeRemoval::Complete, entries_reclaimed));
         }
-        if drain_directory(dir, keep_until_last, deadline, &mut entries_reclaimed)?
-            == TreeRemoval::Interrupted
-        {
-            return Ok((TreeRemoval::Interrupted, entries_reclaimed));
+        match drain_directory(dir, keep_until_last, deadline, &mut entries_reclaimed) {
+            Ok(TreeRemoval::Interrupted) => {
+                return Ok((TreeRemoval::Interrupted, entries_reclaimed));
+            }
+            Ok(TreeRemoval::Complete) => {}
+            Err(source) => {
+                return Err(TreeRemovalError {
+                    source,
+                    entries_reclaimed,
+                });
+            }
         }
         if let Some(name) = keep_until_last {
-            remove_entry_with_progress(&dir.join(name), false, &mut entries_reclaimed)?;
+            if let Err(source) =
+                remove_entry_with_progress(&dir.join(name), false, &mut entries_reclaimed)
+            {
+                return Err(TreeRemovalError {
+                    source,
+                    entries_reclaimed,
+                });
+            }
         }
         match std::fs::remove_dir(dir) {
             Ok(()) => {
@@ -1104,7 +1126,12 @@ fn remove_condemned_tree_with_progress(
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 return Ok((TreeRemoval::Complete, entries_reclaimed));
             }
-            Err(error) if attempts_left == 0 => return Err(error),
+            Err(source) if attempts_left == 0 => {
+                return Err(TreeRemovalError {
+                    source,
+                    entries_reclaimed,
+                });
+            }
             // Something reappeared underneath while we walked. Sweep again.
             Err(_) => {}
         }
@@ -2505,6 +2532,14 @@ impl Broker {
     /// opens can request a worker without pretending that the foreground pass
     /// finished or resetting its resume point.
     pub(crate) fn request_artifact_sweep_recovery(&mut self) -> Result<(), BrokerOpError> {
+        self.persist_artifact_sweep_recovery_request()?;
+        self.start_artifact_sweep_recovery_worker()
+    }
+
+    /// Record the durable request without launching the detached process.
+    /// Preparation uses this while holding its shared-cache lease, then starts
+    /// the worker only after the lease has been released successfully.
+    pub(crate) fn persist_artifact_sweep_recovery_request(&mut self) -> Result<(), BrokerOpError> {
         let prior = self
             .store()
             .meta_get(ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY)?
@@ -2519,6 +2554,12 @@ impl Broker {
             &requested_at.to_string(),
         )?;
         self.store().meta_set(ARTIFACT_SWEEP_RETRY_AFTER_KEY, "")?;
+        Ok(())
+    }
+
+    /// Launch recovery after the request is durable and any conflicting
+    /// preparation lease has been released.
+    pub(crate) fn start_artifact_sweep_recovery_worker(&mut self) -> Result<(), BrokerOpError> {
         let _ = self.maybe_start_artifact_sweep_worker(true);
         Ok(())
     }
@@ -2619,16 +2660,39 @@ impl Broker {
             .and_then(|value| value.parse::<i64>().ok())
             .unwrap_or(0);
 
+        self.run_artifact_sweep_recovery_worker_loop(
+            &policy,
+            request_generation,
+            None,
+            |broker, policy| {
+                broker.sweep_artifacts_autonomously_with_progress(
+                    policy,
+                    ArtifactSweepScope::AutomaticContinuation,
+                )
+            },
+        )
+    }
+
+    /// The durable worker loop is separated from the installed-runtime gate
+    /// so child-process tests can drive its real generation/cursor behavior
+    /// with the test harness binary. Production always calls it through
+    /// `run_artifact_sweep_recovery_worker` after runtime validation.
+    fn run_artifact_sweep_recovery_worker_loop(
+        &mut self,
+        policy: &RetentionPolicy,
+        request_generation: i64,
+        max_passes: Option<usize>,
+        mut sweep_pass: impl FnMut(
+            &mut Self,
+            &RetentionPolicy,
+        ) -> Result<(ArtifactSweepOutcome, usize), BrokerOpError>,
+    ) -> Result<(), BrokerOpError> {
         let mut passes = 0usize;
         let mut no_progress_passes = 0usize;
         let mut entries_reclaimed = 0usize;
         loop {
             passes = passes.saturating_add(1);
-            let (outcome, pass_entries_reclaimed) = match self
-                .sweep_artifacts_autonomously_with_progress(
-                    &policy,
-                    ArtifactSweepScope::AutomaticContinuation,
-                ) {
+            let (outcome, pass_entries_reclaimed) = match sweep_pass(self, policy) {
                 Ok(outcome) => outcome,
                 Err(_) => {
                     self.defer_artifact_sweep_worker("sweep_failed");
@@ -2648,6 +2712,12 @@ impl Broker {
                 self.write_artifact_sweep_worker_status(&format!(
                     "complete passes={passes} entries={entries_reclaimed}"
                 ));
+                return Ok(());
+            }
+            if max_passes.is_some_and(|limit| passes >= limit) {
+                // This seam lets a child-process test stop after one real
+                // incomplete lap, then prove another process can resume from
+                // its persisted cursor without manufacturing completion.
                 return Ok(());
             }
             if pass_entries_reclaimed == 0 {
@@ -2937,21 +3007,26 @@ impl Broker {
             .iter()
             .map(|session| session.id)
             .collect::<Vec<_>>();
+        let mut preparation_entries_reclaimed = 0usize;
+        let mut scan_completed = true;
         if closed_session_id.is_none() {
             // The shared preparation cache is content-addressed: an entry no
             // checkout computes is unreadable forever, so it needs no operator
             // review. It was reachable only from the manual lane, which is why a
             // hand reclaim of 13.3 GB returned as 15 GB within three days.
-            let (cache_entries, cache_bytes) = crate::storage::sweep_preparation_cache(
+            let preparation_sweep = crate::storage::sweep_preparation_cache(
                 &main_root,
                 policy.orphan_worktree_roots_days,
                 deadline,
             );
-            if cache_entries > 0 {
+            preparation_entries_reclaimed = preparation_sweep.filesystem_entries_reclaimed;
+            scan_completed = preparation_sweep.complete;
+            if preparation_sweep.entries_removed > 0 {
                 let payload = serde_json::json!({
-                    "entries": cache_entries,
-                    "bytes": cache_bytes,
+                    "entries": preparation_sweep.entries_removed,
+                    "bytes": preparation_sweep.bytes_reclaimed,
                     "urgency": format!("{urgency:?}"),
+                    "complete": preparation_sweep.complete,
                 })
                 .to_string();
                 self.store().append_event(
@@ -2962,9 +3037,8 @@ impl Broker {
             }
         }
         let mut removed = Vec::new();
-        let mut entries_reclaimed = 0usize;
+        let mut entries_reclaimed = preparation_entries_reclaimed;
         let mut eligible_worktree_seen = false;
-        let mut scan_completed = true;
         let cursor = self
             .store()
             .meta_get(ARTIFACT_SWEEP_CURSOR_KEY)?
@@ -3105,8 +3179,17 @@ impl Broker {
                         }
                         scan_completed = false;
                     }
-                    Err(_) if closed_session_id.is_some() => scan_completed = false,
-                    Err(_) => {}
+                    Err(error) => {
+                        entries_reclaimed =
+                            entries_reclaimed.saturating_add(error.entries_reclaimed);
+                        scan_completed = false;
+                        if closed_session_id.is_none() {
+                            // The failed session must be first on the next
+                            // pass. Otherwise the cursor could skip it and
+                            // later report a complete cache lap.
+                            last_visited = session.id.saturating_sub(1);
+                        }
+                    }
                 }
                 if check_deadline(Some(deadline)) {
                     scan_completed = false;
@@ -3855,8 +3938,192 @@ mod tests {
         command
     }
 
+    #[test]
+    fn incomplete_worker_keeps_request_and_a_new_pressure_request_retries_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        git(root, &["init", "-q", "-b", "main"]);
+        std::fs::write(root.join("README.md"), "fixture\n").unwrap();
+        git(root, &["add", "README.md"]);
+        git(root, &["commit", "-qm", "fixture"]);
+        std::fs::create_dir_all(root.join(".aethyme")).unwrap();
+        let mut broker = Broker::open(root).unwrap();
+        broker
+            .store()
+            .meta_set(ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY, "7")
+            .unwrap();
+        broker
+            .store()
+            .meta_set(ARTIFACT_SWEEP_RECOVERY_COMPLETED_KEY, "3")
+            .unwrap();
+        let policy = load_retention_policy(root).unwrap();
+
+        broker
+            .run_artifact_sweep_recovery_worker_loop(&policy, 7, None, |_broker, _policy| {
+                Ok((
+                    ArtifactSweepOutcome {
+                        directories_reclaimed: 0,
+                        complete: false,
+                        auto_cleanup: None,
+                    },
+                    0,
+                ))
+            })
+            .unwrap();
+        assert_eq!(
+            broker
+                .store()
+                .meta_get(ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY)
+                .unwrap()
+                .as_deref(),
+            Some("7"),
+            "a stalled cache removal leaves its durable request pending"
+        );
+        assert_eq!(
+            broker
+                .store()
+                .meta_get(ARTIFACT_SWEEP_RECOVERY_COMPLETED_KEY)
+                .unwrap()
+                .as_deref(),
+            Some("3")
+        );
+        assert!(worker_retry_pending(broker.store(), now_ms()).unwrap());
+
+        broker.persist_artifact_sweep_recovery_request().unwrap();
+        let retry_generation = broker
+            .store()
+            .meta_get(ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY)
+            .unwrap()
+            .unwrap();
+        assert!(retry_generation.parse::<i64>().unwrap() > 7);
+        assert!(!worker_retry_pending(broker.store(), now_ms()).unwrap());
+        broker
+            .run_artifact_sweep_recovery_worker_loop(
+                &policy,
+                retry_generation.parse().unwrap(),
+                None,
+                |_broker, _policy| {
+                    Ok((
+                        ArtifactSweepOutcome {
+                            directories_reclaimed: 1,
+                            complete: true,
+                            auto_cleanup: None,
+                        },
+                        1,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            broker
+                .store()
+                .meta_get(ARTIFACT_SWEEP_RECOVERY_COMPLETED_KEY)
+                .unwrap()
+                .as_deref(),
+            Some(retry_generation.as_str()),
+            "a subsequent eligible pass records the requested generation"
+        );
+        assert!(!worker_retry_pending(broker.store(), now_ms()).unwrap());
+    }
+
     fn detached_fixture_store(root: &Path) -> crate::BrokerStore {
         crate::BrokerStore::open(&root.join(".aethyme/broker.db")).unwrap()
+    }
+
+    #[test]
+    fn test_harness_executable_is_never_selected_as_the_detached_runtime() {
+        assert!(
+            artifact_worker_binaries().is_none(),
+            "Cargo test executables must never be launched as installed workers"
+        );
+    }
+
+    #[test]
+    fn incomplete_worker_keeps_request_and_a_new_pressure_request_retries_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        git(root, &["init", "-q", "-b", "main"]);
+        std::fs::write(root.join("README.md"), "fixture\n").unwrap();
+        git(root, &["add", "README.md"]);
+        git(root, &["commit", "-qm", "fixture"]);
+        std::fs::create_dir_all(root.join(".aethyme")).unwrap();
+        let mut broker = Broker::open(root).unwrap();
+        broker
+            .store()
+            .meta_set(ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY, "7")
+            .unwrap();
+        broker
+            .store()
+            .meta_set(ARTIFACT_SWEEP_RECOVERY_COMPLETED_KEY, "3")
+            .unwrap();
+        let policy = load_retention_policy(root).unwrap();
+
+        broker
+            .run_artifact_sweep_recovery_worker_loop(&policy, 7, None, |_broker, _policy| {
+                Ok((
+                    ArtifactSweepOutcome {
+                        directories_reclaimed: 0,
+                        complete: false,
+                        auto_cleanup: None,
+                    },
+                    0,
+                ))
+            })
+            .unwrap();
+        assert_eq!(
+            broker
+                .store()
+                .meta_get(ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY)
+                .unwrap()
+                .as_deref(),
+            Some("7"),
+            "a stalled cache removal leaves its durable request pending"
+        );
+        assert_eq!(
+            broker
+                .store()
+                .meta_get(ARTIFACT_SWEEP_RECOVERY_COMPLETED_KEY)
+                .unwrap()
+                .as_deref(),
+            Some("3")
+        );
+        assert!(worker_retry_pending(broker.store(), now_ms()).unwrap());
+
+        broker.persist_artifact_sweep_recovery_request().unwrap();
+        let retry_generation = broker
+            .store()
+            .meta_get(ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY)
+            .unwrap()
+            .unwrap();
+        assert!(retry_generation.parse::<i64>().unwrap() > 7);
+        assert!(!worker_retry_pending(broker.store(), now_ms()).unwrap());
+        broker
+            .run_artifact_sweep_recovery_worker_loop(
+                &policy,
+                retry_generation.parse().unwrap(),
+                None,
+                |_broker, _policy| {
+                    Ok((
+                        ArtifactSweepOutcome {
+                            directories_reclaimed: 1,
+                            complete: true,
+                            auto_cleanup: None,
+                        },
+                        1,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            broker
+                .store()
+                .meta_get(ARTIFACT_SWEEP_RECOVERY_COMPLETED_KEY)
+                .unwrap()
+                .as_deref(),
+            Some(retry_generation.as_str()),
+            "a subsequent eligible pass records the requested generation"
+        );
+        assert!(!worker_retry_pending(broker.store(), now_ms()).unwrap());
     }
 
     fn detached_fixture_marker(root: &Path, name: &str) -> PathBuf {
@@ -4196,21 +4463,37 @@ mod tests {
                 );
                 assert!(broker.is_broker_owned_worktree(&session, &closed_worktree));
                 let policy = load_retention_policy(broker.main_root()).unwrap();
-                let (outcome, entries_reclaimed) = broker
-                    .sweep_artifacts_autonomously_with_deadline(
+                let mut entries_reclaimed = 0;
+                broker
+                    .run_artifact_sweep_recovery_worker_loop(
                         &policy,
-                        ArtifactSweepScope::AutomaticContinuation,
-                        Some(Instant::now()),
+                        77,
+                        Some(1),
+                        |broker, policy| {
+                            let result = broker.sweep_artifacts_autonomously_with_deadline(
+                                policy,
+                                ArtifactSweepScope::AutomaticContinuation,
+                                Some(Instant::now()),
+                            );
+                            if let Ok((_, count)) = &result {
+                                entries_reclaimed = *count;
+                            }
+                            result
+                        },
                     )
                     .unwrap();
                 assert!(
-                    !outcome.complete,
-                    "the injected deadline must pause a real pass"
-                );
-                assert!(outcome.auto_cleanup.is_none());
-                assert!(
                     entries_reclaimed > 0,
                     "the detached cache-only child must make filesystem progress"
+                );
+                assert_eq!(
+                    broker
+                        .store()
+                        .meta_get(ARTIFACT_SWEEP_RECOVERY_COMPLETED_KEY)
+                        .unwrap()
+                        .as_deref(),
+                    Some("0"),
+                    "an incomplete worker pass must not advance the completed generation"
                 );
                 assert!(
                     cache.is_dir(),
@@ -4271,26 +4554,19 @@ mod tests {
                 }
 
                 let policy = load_retention_policy(broker.main_root()).unwrap();
-                let mut complete = false;
                 let mut entries_reclaimed = 0;
-                for _ in 0..8 {
-                    let (outcome, pass_entries_reclaimed) = broker
-                        .sweep_artifacts_autonomously_with_progress(
-                            &policy,
+                broker
+                    .run_artifact_sweep_recovery_worker_loop(&policy, 77, None, |broker, policy| {
+                        let result = broker.sweep_artifacts_autonomously_with_progress(
+                            policy,
                             ArtifactSweepScope::AutomaticContinuation,
-                        )
-                        .unwrap();
-                    assert!(outcome.auto_cleanup.is_none());
-                    entries_reclaimed = entries_reclaimed.saturating_add(pass_entries_reclaimed);
-                    if outcome.complete {
-                        complete = true;
-                        break;
-                    }
-                }
-                assert!(
-                    complete,
-                    "the persisted cache-only continuation must finish"
-                );
+                        );
+                        if let Ok((_, count)) = &result {
+                            entries_reclaimed = entries_reclaimed.saturating_add(*count);
+                        }
+                        result
+                    })
+                    .unwrap();
                 assert!(entries_reclaimed > 0);
                 assert!(!cache.exists(), "the closed session cache is reclaimed");
                 assert!(active_cache.join("debug/keep.txt").is_file());
@@ -4317,14 +4593,15 @@ mod tests {
                     .meta_get(ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY)
                     .unwrap()
                     .unwrap();
-                broker
-                    .store()
-                    .meta_set(ARTIFACT_SWEEP_RECOVERY_COMPLETED_KEY, &requested)
-                    .unwrap();
-                broker
-                    .store()
-                    .meta_set(ARTIFACT_SWEEP_RETRY_AFTER_KEY, "")
-                    .unwrap();
+                assert_eq!(
+                    broker
+                        .store()
+                        .meta_get(ARTIFACT_SWEEP_RECOVERY_COMPLETED_KEY)
+                        .unwrap()
+                        .as_deref(),
+                    Some(requested.as_str()),
+                    "the worker loop advances the generation after a complete lap"
+                );
                 std::fs::write(
                     detached_fixture_marker(&root, "child-resumed"),
                     entries_reclaimed.to_string(),

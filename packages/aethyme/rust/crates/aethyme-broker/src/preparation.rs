@@ -214,11 +214,58 @@ struct PreparationRecord {
 
 impl Broker {
     fn recover_storage_refusal(&mut self, error: &BrokerOpError) {
-        if is_storage_unavailable(error)
-            && let Err(recovery_error) = self.request_artifact_sweep_recovery()
-        {
-            warn_preparation_cleanup_failure("request cache recovery", &recovery_error);
+        let persisted = self.persist_storage_refusal(error);
+        if persisted {
+            self.start_storage_recovery_worker();
         }
+    }
+
+    /// Persist a recovery generation without launching the worker. A caller
+    /// holding the shared preparation lease must release it before launch.
+    fn persist_storage_refusal(&mut self, error: &BrokerOpError) -> bool {
+        if !is_storage_unavailable(error) {
+            return false;
+        }
+        self.persist_storage_recovery_request()
+    }
+
+    fn persist_storage_recovery_request(&mut self) -> bool {
+        match self.persist_artifact_sweep_recovery_request() {
+            Ok(()) => true,
+            Err(recovery_error) => {
+                warn_preparation_cleanup_failure("persist cache recovery request", &recovery_error);
+                false
+            }
+        }
+    }
+
+    fn start_storage_recovery_worker(&mut self) {
+        if let Err(recovery_error) = self.start_artifact_sweep_recovery_worker() {
+            warn_preparation_cleanup_failure("start cache recovery worker", &recovery_error);
+        }
+    }
+
+    fn release_grant_after_error<T>(
+        &mut self,
+        result: Result<T, PreparationError>,
+        coordinator: &mut Option<HostResourceCoordinator>,
+        grant: &mut Option<crate::HostResourceGrant>,
+        recheck: impl FnOnce() -> Result<(), PreparationError>,
+    ) -> Result<T, PreparationError> {
+        let error = match result {
+            Ok(value) => return Ok(value),
+            Err(error) => error,
+        };
+        let storage_refused = match &error {
+            PreparationError::StorageUnavailable { .. } => true,
+            _ => matches!(recheck(), Err(PreparationError::StorageUnavailable { .. })),
+        };
+        let recovery_persisted = storage_refused && self.persist_storage_recovery_request();
+        let lease_released = release_grant_best_effort(coordinator, grant);
+        if recovery_persisted && lease_released {
+            self.start_storage_recovery_worker();
+        }
+        Err(error)
     }
 
     /// A package-manager command may fill its volume after preflight and then
@@ -229,14 +276,14 @@ impl Broker {
         &mut self,
         error: &BrokerOpError,
         recheck: impl FnOnce() -> Result<(), PreparationError>,
-    ) {
+    ) -> bool {
         if is_storage_unavailable(error) {
-            self.recover_storage_refusal(error);
-            return;
+            return self.persist_storage_refusal(error);
         }
         if let Err(pressure @ PreparationError::StorageUnavailable { .. }) = recheck() {
-            self.recover_storage_refusal(&pressure.into());
+            return self.persist_storage_refusal(&pressure.into());
         }
+        false
     }
 
     /// Git-ignored top-level directories that exist in the primary checkout but
@@ -494,24 +541,35 @@ impl Broker {
         // A shared-cache lease may have waited while another process filled
         // either volume. Recheck before rotation, state writes or commands.
         if let Err(error) = require_preparation_storage(self.main_root(), &storage_paths) {
-            if let Err(release_error) = release_grant(&mut coordinator, &mut grant) {
-                warn_preparation_cleanup_failure("release host resource lease", &release_error);
-            }
             let error = BrokerOpError::from(error);
-            self.recover_storage_refusal(&error);
+            let recovery_persisted = self.persist_storage_refusal(&error);
+            let lease_released = release_grant_best_effort(&mut coordinator, &mut grant);
+            if recovery_persisted && lease_released {
+                self.start_storage_recovery_worker();
+            }
             return Err(error);
         }
+        let storage_root = self.main_root().to_path_buf();
         // Enforce the budget while the exclusive lease is held, never after
         // release: rotation removes a store other worktrees may be reading, so
         // it has to be inside the same critical section that granted access.
         // It also runs before this run's directory is created, because it
         // moves the whole repository store away, that directory included.
-        let rotation = shared_cache_budget(config.shared_cache.as_ref(), &digest, self)?;
-        if let Some(cache_dir) = &cache_dir {
-            fs::create_dir_all(cache_dir).map_err(|source| PreparationError::Io {
-                path: cache_dir.clone(),
-                source,
+        let rotation_result = shared_cache_budget(config.shared_cache.as_ref(), &digest, self);
+        let rotation =
+            self.release_grant_after_error(rotation_result, &mut coordinator, &mut grant, || {
+                require_preparation_storage(&storage_root, &storage_paths)
             })?;
+        if let Some(cache_dir) = &cache_dir {
+            self.release_grant_after_error(
+                fs::create_dir_all(cache_dir).map_err(|source| PreparationError::Io {
+                    path: cache_dir.clone(),
+                    source,
+                }),
+                &mut coordinator,
+                &mut grant,
+                || require_preparation_storage(&storage_root, &storage_paths),
+            )?;
         }
 
         let started_at = now_ms();
@@ -529,7 +587,12 @@ impl Broker {
             host_lease_generation: grant.as_ref().map(|grant| grant.lease.generation),
         };
         let state_path = record_path(self.main_root(), session_id);
-        write_record(&state_path, &record)?;
+        self.release_grant_after_error(
+            write_record(&state_path, &record),
+            &mut coordinator,
+            &mut grant,
+            || require_preparation_storage(&storage_root, &storage_paths),
+        )?;
 
         let environment = cache_dir
             .as_ref()
@@ -583,16 +646,20 @@ impl Broker {
                 }) {
                 Ok(report) => report,
                 Err(error) => {
-                    self.recover_storage_pressure_after_command_failure(&error, || {
-                        require_preparation_storage(&main_root, &storage_paths)
-                    });
+                    let recovery_persisted = self
+                        .recover_storage_pressure_after_command_failure(&error, || {
+                            require_preparation_storage(&main_root, &storage_paths)
+                        });
                     record.state = PreparationState::Failed;
                     record.failed_step = Some(step.name.clone());
                     record.completed_at = Some(now_ms());
-                    best_effort_failed_preparation_cleanup(
+                    let lease_released = best_effort_failed_preparation_cleanup(
                         || write_record(&state_path, &record),
                         || release_grant(&mut coordinator, &mut grant),
                     );
+                    if recovery_persisted && lease_released {
+                        self.start_storage_recovery_worker();
+                    }
                     return Err(error);
                 }
             };
@@ -608,17 +675,21 @@ impl Broker {
                     session_id,
                 };
                 let error = BrokerOpError::from(error);
-                self.recover_storage_pressure_after_command_failure(&error, || {
-                    require_preparation_storage(&main_root, &storage_paths)
-                });
+                let recovery_persisted = self
+                    .recover_storage_pressure_after_command_failure(&error, || {
+                        require_preparation_storage(&main_root, &storage_paths)
+                    });
                 record.state = PreparationState::Failed;
                 record.failed_step = Some(step.name.clone());
                 record.exit_code = report.exit_code;
                 record.completed_at = Some(now_ms());
-                best_effort_failed_preparation_cleanup(
+                let lease_released = best_effort_failed_preparation_cleanup(
                     || write_record(&state_path, &record),
                     || release_grant(&mut coordinator, &mut grant),
                 );
+                if recovery_persisted && lease_released {
+                    self.start_storage_recovery_worker();
+                }
                 return Err(error);
             }
             let absent = match missing_step_outputs(&root, step) {
@@ -654,7 +725,12 @@ impl Broker {
         record.completed_at = Some(now_ms());
         record.host_lease_id = None;
         record.host_lease_generation = None;
-        write_record(&state_path, &record)?;
+        self.release_grant_after_error(
+            write_record(&state_path, &record),
+            &mut coordinator,
+            &mut grant,
+            || require_preparation_storage(&storage_root, &storage_paths),
+        )?;
         Ok(PreparationReport {
             schema_version: PREPARATION_SCHEMA_VERSION,
             session_id,
@@ -1526,12 +1602,29 @@ fn is_storage_unavailable(error: &BrokerOpError) -> bool {
 fn best_effort_failed_preparation_cleanup(
     write_state: impl FnOnce() -> Result<(), PreparationError>,
     release_lease: impl FnOnce() -> Result<(), PreparationError>,
-) {
+) -> bool {
     if let Err(error) = write_state() {
         warn_preparation_cleanup_failure("write failed preparation state", &error);
     }
-    if let Err(error) = release_lease() {
-        warn_preparation_cleanup_failure("release host resource lease", &error);
+    match release_lease() {
+        Ok(()) => true,
+        Err(error) => {
+            warn_preparation_cleanup_failure("release host resource lease", &error);
+            false
+        }
+    }
+}
+
+fn release_grant_best_effort(
+    coordinator: &mut Option<HostResourceCoordinator>,
+    grant: &mut Option<crate::HostResourceGrant>,
+) -> bool {
+    match release_grant(coordinator, grant) {
+        Ok(()) => true,
+        Err(error) => {
+            warn_preparation_cleanup_failure("release host resource lease", &error);
+            false
+        }
     }
 }
 
@@ -1574,12 +1667,21 @@ fn release_grant(
     coordinator: &mut Option<HostResourceCoordinator>,
     grant: &mut Option<crate::HostResourceGrant>,
 ) -> Result<(), PreparationError> {
-    if let (Some(coordinator), Some(grant)) = (coordinator.as_mut(), grant.take()) {
-        coordinator.release(
-            &grant.lease.lease_id,
-            grant.lease.generation,
-            &grant.ownership_token,
-        )?;
+    match (coordinator.as_mut(), grant.as_ref()) {
+        (Some(coordinator), Some(leased_grant)) => {
+            let lease_id = leased_grant.lease.lease_id.clone();
+            let generation = leased_grant.lease.generation;
+            let ownership_token = leased_grant.ownership_token.clone();
+            coordinator.release(&lease_id, generation, &ownership_token)?;
+            grant.take();
+        }
+        (Some(_), None) | (None, None) => {}
+        (None, Some(_)) => {
+            return Err(PreparationError::InvalidState {
+                path: "host-resource lease".into(),
+                reason: "coordinator and acquired grant are inconsistent".into(),
+            });
+        }
     }
     Ok(())
 }
@@ -1710,6 +1812,61 @@ mod tests {
         );
 
         assert!(released.get());
+    }
+
+    #[test]
+    fn an_initial_preparation_state_write_error_releases_the_acquired_host_lease() {
+        let tmp = tempfile::tempdir().unwrap();
+        let run_git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(tmp.path())
+                .env("GIT_AUTHOR_NAME", "test")
+                .env("GIT_AUTHOR_EMAIL", "test@example.invalid")
+                .env("GIT_COMMITTER_NAME", "test")
+                .env("GIT_COMMITTER_EMAIL", "test@example.invalid")
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?}");
+        };
+        run_git(&["init", "-q", "-b", "main"]);
+        std::fs::write(tmp.path().join("README.md"), "fixture\n").unwrap();
+        run_git(&["add", "README.md"]);
+        run_git(&["commit", "-qm", "fixture"]);
+        let mut broker = Broker::open(tmp.path()).unwrap();
+        let resource_db = tmp.path().join("host-state/host-resources.db");
+        let mut coordinator = Some(HostResourceCoordinator::open(&resource_db).unwrap());
+        let request =
+            preparation_resource_request(&broker, 7, tmp.path(), &"a".repeat(64)).unwrap();
+        let acquired = coordinator.as_mut().unwrap().acquire(&request).unwrap();
+        let lease_id = acquired.lease.lease_id.clone();
+        let mut grant = Some(acquired);
+
+        let result = broker.release_grant_after_error(
+            Err(PreparationError::InvalidState {
+                path: ".aethyme/preparation/7.json".into(),
+                reason: "injected initial state write failure".into(),
+            }),
+            &mut coordinator,
+            &mut grant,
+            || Ok(()),
+        );
+
+        assert!(result.is_err());
+        assert!(grant.is_none());
+        assert_eq!(
+            coordinator
+                .as_ref()
+                .unwrap()
+                .list(true)
+                .unwrap()
+                .into_iter()
+                .find(|lease| lease.lease_id == lease_id)
+                .unwrap()
+                .state,
+            crate::HostLeaseState::Released,
+            "the original state-write failure must not strand the acquired lease"
+        );
     }
 
     #[test]
