@@ -1617,20 +1617,22 @@ fn attempts_used(store: &CollaborationStore, decision: &Decision) -> Result<u32,
     comparable_attempts(connection, decision)
 }
 
-/// Charge one attempt to `decision` before dispatch, so a crash never
-/// refunds it. `None` when the allowance is spent; otherwise the attempt
-/// number and the ledger row to settle.
-fn charge(
-    store: &mut CollaborationStore,
-    decision: &Decision,
-    request: &RecordId,
+/// Insert the comparable-decision charge into an already-open transaction.
+/// Callers supply the archived request, not a member/path summary, so the
+/// decision key and allowance query always come from the validated record.
+fn charge_in_transaction(
+    transaction: &rusqlite::Transaction<'_>,
+    request: &ResolutionRequest,
+    record: &RecordRef,
     resolver: &str,
 ) -> Result<Option<(u32, i64)>, ResolutionError> {
-    let transaction = store
-        .connection()
-        .transaction_with_behavior(TransactionBehavior::Immediate)?;
-    transaction.execute_batch(LEDGER)?;
-    let used = comparable_attempts(&transaction, decision)?;
+    if request.record() != record {
+        return Err(invalid(
+            "charged request reference differs from its archived record",
+        ));
+    }
+    let decision = &request.decision;
+    let used = comparable_attempts(transaction, decision)?;
     if used >= MAX_SYNTHESIS_ATTEMPTS {
         return Ok(None);
     }
@@ -1644,15 +1646,32 @@ fn charge(
             decision.kind,
             join_set(&decision.members),
             join_set(&decision.paths),
-            request.as_str(),
+            record.id.as_str(),
             resolver,
             now_ms(),
             i64::from(used + 1)
         ],
     )?;
     let row = transaction.last_insert_rowid();
-    transaction.commit()?;
     Ok(Some((used + 1, row)))
+}
+
+/// Charge one attempt before dispatch, so a crash never refunds it. `None`
+/// means the shared allowance is spent; otherwise return its number and the
+/// ledger row to settle.
+fn charge(
+    store: &mut CollaborationStore,
+    request: &ResolutionRequest,
+    record: &RecordRef,
+    resolver: &str,
+) -> Result<Option<(u32, i64)>, ResolutionError> {
+    let transaction = store
+        .connection()
+        .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    transaction.execute_batch(LEDGER)?;
+    let charge = charge_in_transaction(&transaction, request, record, resolver)?;
+    transaction.commit()?;
+    Ok(charge)
 }
 
 fn settle(store: &mut CollaborationStore, row: i64, outcome: &str) -> Result<(), ResolutionError> {
@@ -3970,7 +3989,7 @@ pub fn resolve(
             used: attempts_used(store, &request.decision)?,
         })
     };
-    let Some((attempt, row)) = charge(store, &request.decision, &record.id, &label)? else {
+    let Some((attempt, row)) = charge(store, &request, record, &label)? else {
         return Ok(Resolution {
             outcome: failed(
                 ResolutionFailure::BudgetExhausted,
