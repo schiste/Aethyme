@@ -781,8 +781,58 @@ impl<'a> Closure<'a> {
                 )),
             }
         }
+        // Immutable rationale revisions are retained by the same live capture,
+        // target or reader root as their source lineage. Index rows alone are
+        // not roots: the old closure uses these edges too when reclaiming it.
+        if self.store.schema_version() >= 26 {
+            let revisions: Vec<(String, Option<String>)> = self
+                .store
+                .read_connection()
+                .prepare(
+                    "SELECT record_sha256,brief_object_sha256 FROM contribution_revisions
+                          WHERE lineage_record_id=?1 ORDER BY revision_record_id",
+                )?
+                .query_map([lineage], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .collect::<Result<_, _>>()?;
+            for (revision, brief) in revisions {
+                for digest in std::iter::once(revision).chain(brief) {
+                    match parse_hex_digest(&digest) {
+                        Some(digest) => self.object(digest, RetentionClass::Record),
+                        None => self.problems.push(format!(
+                            "contribution {lineage} has a malformed immutable revision object digest"
+                        )),
+                    }
+                }
+            }
+        }
         self.snapshot(&base)?;
         self.snapshot(&result)
+    }
+
+    fn approved_project_binding(&mut self) -> Result<(), GcError> {
+        if self.store.schema_version() < 26 {
+            return Ok(());
+        }
+        let binding: Option<(String, String)> = self
+            .store
+            .read_connection()
+            .query_row(
+                "SELECT descriptor_object_sha256,anchor_snapshot FROM local_project_bindings
+             WHERE singleton=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        if let Some((descriptor, anchor)) = binding {
+            match parse_hex_digest(&descriptor) {
+                Some(digest) => self.object(digest, RetentionClass::Record),
+                None => self
+                    .problems
+                    .push("approved project descriptor digest is malformed".into()),
+            }
+            self.snapshot(&anchor)?;
+        }
+        Ok(())
     }
 }
 
@@ -872,6 +922,9 @@ fn survey(
 
     // Live roots and what they reach.
     let mut live = Closure::new(store);
+    // Durable explicit enrollment retains its descriptor and anchor, even
+    // after independent capture roots are released. No revision index is a root.
+    live.approved_project_binding()?;
     let roots: Vec<(String, Option<String>)> = connection
         .prepare(
             "SELECT operation_id, lineage_record_id FROM retention_roots

@@ -638,6 +638,8 @@ pub enum ContextError {
     NotRetained { id: String },
     #[error("the brief is invalid: {0}")]
     InvalidBrief(String),
+    #[error("immutable revision identity: {0}")]
+    RevisionIdentity(String),
     #[error(transparent)]
     Archive(#[from] ArchiveError),
     #[error(transparent)]
@@ -656,6 +658,7 @@ impl ContextError {
             Self::EmptyScope => "empty_scope",
             Self::NotRetained { .. } => "not_retained",
             Self::InvalidBrief(_) => "invalid_brief",
+            Self::RevisionIdentity(_) => "revision_identity",
             Self::Archive(error) => error.code(),
             Self::State(error) => error.code(),
             Self::Sqlite(_) => "sqlite",
@@ -680,6 +683,7 @@ pub fn attach_brief(
     contribution: &RecordId,
     brief: &Brief,
 ) -> Result<RecordId, ContextError> {
+    let _archive = archive_read(store)?;
     let _response = crate::collaboration_sensitive::response_use(store)
         .map_err(crate::collaboration_archive::ArchiveError::from)?;
     let errors = brief.validate();
@@ -687,6 +691,9 @@ pub fn attach_brief(
         return Err(ContextError::InvalidBrief(
             aethyme_contracts::experimental_v0::brief::BriefErrors(errors).to_string(),
         ));
+    }
+    if let Some(id) = revisions::attach_bound_brief(store, contribution, brief)? {
+        return Ok(id);
     }
     let (bytes, id) = brief.to_record();
     let digest = put_object(store, &bytes)?;
@@ -725,7 +732,10 @@ pub fn attach_brief(
 /// Drop a contribution from the derived index, and every cached answer that
 /// carries its data: a released or re-briefed contribution's content must not
 /// outlive it in the cache, even though no key would reach those answers.
-fn forget(connection: &rusqlite::Connection, contribution: &str) -> rusqlite::Result<()> {
+pub(crate) fn forget(
+    connection: &rusqlite::Connection,
+    contribution: &str,
+) -> rusqlite::Result<()> {
     for sql in [
         "DELETE FROM context_postings WHERE lineage_record_id = ?1",
         "DELETE FROM context_indexed WHERE lineage_record_id = ?1",
@@ -1805,6 +1815,7 @@ fn retrieve_with(
     mut hooks: Hooks<'_>,
     use_cache: bool,
 ) -> Result<Answer, ContextError> {
+    let _archive = archive_read(store)?;
     let _response = crate::collaboration_sensitive::response_use(store)
         .map_err(crate::collaboration_archive::ArchiveError::from)?;
     query.budget.check()?;
@@ -4324,4 +4335,21 @@ mod tests {
             assert_eq!(served.record, expected.record);
         }
     }
+}
+
+mod revisions;
+pub use revisions::{
+    REVISION_CONTEXT_PROFILE, RevisionContextError, RevisionPin, retrieve_revisions,
+};
+
+/// Shared archive barrier, acquired before the sensitive-response barrier.
+fn archive_read(
+    store: &CollaborationStore,
+) -> Result<crate::collaboration_gc::ArchiveUse, ContextError> {
+    crate::collaboration_gc::archive_use(store)
+        .map_err(|source| ArchiveError::Io {
+            path: crate::collaboration_gc::lock_path(store),
+            source,
+        })
+        .map_err(ContextError::from)
 }
