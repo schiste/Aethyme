@@ -111,7 +111,7 @@ struct ParsedArgs<'a> {
     depends_on: Option<Vec<RecordId>>,
 }
 
-fn parse_args(rest: &[&str]) -> Result<ParsedArgs<'_>, Failure> {
+fn parse_args<'a>(rest: &'a [&'a str]) -> Result<ParsedArgs<'a>, Failure> {
     let mut operation = None;
     let mut brief_file = None;
     let mut file_operations = None;
@@ -320,7 +320,7 @@ fn string_field<'a>(object: &'a Object, name: &str) -> Result<&'a str, Failure> 
 }
 
 fn decode_path_hex(text: &str) -> Result<Vec<u8>, Failure> {
-    if text.is_empty() || text.len() % 2 != 0 {
+    if text.is_empty() || !text.len().is_multiple_of(2) {
         return Err(invalid_file_operations(
             "path_hex must be nonempty lowercase hex with an even number of digits",
         ));
@@ -360,6 +360,8 @@ mod tests {
     use crate::collaboration_cli::project_test_support::BoundProjectFixture;
     use crate::collaboration_identity_store::{self as identity_store, IdentityStateResolution};
     use crate::collaboration_state::CollaborationRoot;
+    use aethyme_contracts::experimental_v0::ContributionId;
+    use std::process::Command;
 
     fn run_at_fixture(
         fixture: &BoundProjectFixture,
@@ -375,6 +377,47 @@ mod tests {
             [contribution_id],
             |row| row.get(0),
         ).expect("contribution revision head")
+    }
+
+    fn resolve_output(
+        fixture: &BoundProjectFixture,
+        output: &serde_json::Value,
+    ) -> identity_store::ResolvedContributionRevision {
+        let record_id = RecordId::parse(output["revision_record_id"].as_str().unwrap()).unwrap();
+        let digest = crate::collaboration_archive::parse_digest(
+            output["revision_object_sha256"].as_str().unwrap(),
+        )
+        .unwrap();
+        let contribution_id =
+            ContributionId::parse(output["contribution_id"].as_str().unwrap()).unwrap();
+        identity_store::resolve_bound_contribution_revision(
+            fixture.store(),
+            &fixture.binding,
+            &record_id,
+            digest,
+            &contribution_id,
+        )
+        .expect("resolve exact public revision")
+    }
+
+    fn git(repo: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .args([
+                "-c",
+                "user.name=Aethyme Fixture",
+                "-c",
+                "user.email=fixture@aethyme.invalid",
+            ])
+            .args(args)
+            .current_dir(repo)
+            .output()
+            .expect("run git fixture command");
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[test]
@@ -482,6 +525,124 @@ mod tests {
         };
         assert_eq!(original.snapshot_id(), cloned.snapshot_id());
         assert_eq!(original.state(), cloned.state());
+    }
+
+    #[test]
+    fn public_handler_applies_valid_rename_and_exact_dependency_updates() {
+        let mut fixture = BoundProjectFixture::new().expect("real project enrollment and bind");
+        let root = CollaborationRoot::under_host_state(fixture.host.path());
+        let base = fixture.bootstrap_commit.clone();
+
+        fixture
+            .capture_operation("op-revision-dependency", &base, &base)
+            .expect("committed dependency capture operation");
+        let dependency =
+            run_at_fixture(&fixture, &root, &["--operation", "op-revision-dependency"])
+                .expect("public prerequisite revision")
+                .0;
+        let dependency_id = dependency["revision_record_id"]
+            .as_str()
+            .expect("prerequisite revision RecordId")
+            .to_string();
+
+        std::fs::rename(
+            fixture.repo_path().join("a.txt"),
+            fixture.repo_path().join("b.txt"),
+        )
+        .expect("rename tracked file");
+        git(fixture.repo_path(), &["add", "--all"]);
+        git(
+            fixture.repo_path(),
+            &["commit", "-q", "-m", "fixture rename"],
+        );
+        let result = crate::collaboration_archive::pin_commit(fixture.repo_path(), "HEAD")
+            .expect("pin rename result");
+        fixture
+            .capture_operation("op-revision-rename", &base, &result)
+            .expect("committed rename capture operation");
+
+        let files = tempfile::tempdir().expect("file-operation fixture");
+        let operations = files.path().join("operations.json");
+        std::fs::write(
+            &operations,
+            br#"{"operations":[{"from_hex":"612e747874","kind":"rename","to_hex":"622e747874"}],"schema":"aethyme.collab-file-operations/experimental-v0"}"#,
+        )
+        .expect("write valid rename operation");
+        let operations = operations.to_str().expect("UTF-8 fixture path");
+
+        let renamed = run_at_fixture(
+            &fixture,
+            &root,
+            &[
+                "--operation",
+                "op-revision-rename",
+                "--file-operations",
+                operations,
+                "--depends-on",
+                &dependency_id,
+            ],
+        )
+        .expect("public valid rename revision")
+        .0;
+        assert_eq!(renamed["depends_on"], json!([dependency_id]));
+        let resolved = resolve_output(&fixture, &renamed);
+        let rename = resolved
+            .identity_transition()
+            .changes()
+            .iter()
+            .find(|change| {
+                change
+                    .after
+                    .as_ref()
+                    .is_some_and(|after| after.path.as_slice() == b"b.txt")
+            })
+            .expect("destination rename transition");
+        assert_eq!(rename.relation.as_str(), "explicit_rename");
+        assert_eq!(
+            resolved.base_state().state().file_id(b"a.txt"),
+            resolved.result_state().state().file_id(b"b.txt")
+        );
+
+        let cleared = run_at_fixture(
+            &fixture,
+            &root,
+            &["--operation", "op-revision-rename", "--clear-dependencies"],
+        )
+        .expect("public explicit dependency clear")
+        .0;
+        assert_eq!(cleared["depends_on"], json!([]));
+        assert_eq!(cleared["contribution_id"], renamed["contribution_id"]);
+        assert_ne!(cleared["revision_record_id"], renamed["revision_record_id"]);
+        assert_eq!(
+            current_head(&fixture, renamed["contribution_id"].as_str().unwrap()),
+            cleared["revision_record_id"].as_str().unwrap()
+        );
+    }
+
+    #[test]
+    fn distinct_capture_operations_for_the_same_pair_mint_distinct_contributions() {
+        let mut fixture = BoundProjectFixture::new().expect("real project enrollment and bind");
+        let root = CollaborationRoot::under_host_state(fixture.host.path());
+        let same = fixture.bootstrap_commit.clone();
+        fixture
+            .capture_operation("op-revision-same-pair-a", &same, &same)
+            .expect("first same-pair capture operation");
+        fixture
+            .capture_operation("op-revision-same-pair-b", &same, &same)
+            .expect("second same-pair capture operation");
+
+        let first = run_at_fixture(&fixture, &root, &["--operation", "op-revision-same-pair-a"])
+            .expect("first same-pair logical contribution")
+            .0;
+        let second = run_at_fixture(&fixture, &root, &["--operation", "op-revision-same-pair-b"])
+            .expect("second same-pair logical contribution")
+            .0;
+
+        assert_eq!(first["capture_record_id"], second["capture_record_id"]);
+        assert_ne!(first["contribution_id"], second["contribution_id"]);
+        assert_ne!(first["revision_record_id"], second["revision_record_id"]);
+        assert_eq!(first["base_snapshot"], second["base_snapshot"]);
+        assert_eq!(first["result_snapshot"], second["result_snapshot"]);
     }
 
     #[test]
