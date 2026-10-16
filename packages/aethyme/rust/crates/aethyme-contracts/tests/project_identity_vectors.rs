@@ -1,7 +1,5 @@
 //! Project and FileId qualification vectors for the bounded Local profile.
 
-use std::collections::BTreeMap;
-
 use aethyme_contracts::experimental_v0::{
     EntryKind, FileId, FileOperation, IdentityRelation, ProjectDescriptor, ProjectId, SourceEntry,
     SourceSnapshot, advance_file_identities, validate_file_proposals,
@@ -62,10 +60,15 @@ fn independent_descriptor_vector_round_trips_exactly() {
     let (decoded, decoded_id) = ProjectDescriptor::from_record(&bytes).unwrap();
     assert_eq!(decoded, descriptor);
     assert_eq!(decoded_id, id);
+
+    let mut extended: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    extended["extensions"] = serde_json::json!({"future": "opaque"});
+    let extended = serde_json::to_vec(&extended).unwrap();
+    assert!(ProjectDescriptor::from_record(&extended).is_err());
 }
 
 #[test]
-fn file_ids_align_only_under_the_same_explicit_project_mapping() {
+fn file_ids_are_project_scoped_and_repeatable_for_the_same_project_id() {
     let source = snapshot(&[(b"src/a.rs", b"same")]);
     let project_a = project();
     let project_b = ProjectId::parse(&format!("proj:{}a", "b".repeat(25))).unwrap();
@@ -102,14 +105,15 @@ fn exact_rename_preserves_id_but_unannotated_rename_stays_uncertain() {
     )
     .unwrap();
     let base_ids = descriptor.file_map();
+    let base_state = descriptor.initial_file_identity_state().unwrap();
     let renamed = snapshot(&[(b"new.rs", b"same bytes"), (b"keep.rs", b"keep")]);
 
     let explicit = advance_file_identities(
         &project(),
+        &base_state,
         "proposal-rename",
         &base,
         &renamed,
-        &base_ids,
         &[FileOperation::Rename {
             from: b"old.rs".to_vec(),
             to: b"new.rs".to_vec(),
@@ -118,7 +122,7 @@ fn exact_rename_preserves_id_but_unannotated_rename_stays_uncertain() {
     .unwrap();
     assert_eq!(
         explicit
-            .result_files
+            .result_files()
             .iter()
             .find(|file| file.path == b"new.rs")
             .unwrap()
@@ -127,29 +131,29 @@ fn exact_rename_preserves_id_but_unannotated_rename_stays_uncertain() {
     );
     assert!(
         explicit
-            .changes
+            .changes()
             .iter()
             .any(|change| change.relation == IdentityRelation::ExplicitRename)
     );
 
     let inferred = advance_file_identities(
         &project(),
+        &base_state,
         "proposal-inferred",
         &base,
         &renamed,
-        &base_ids,
         &[],
     )
     .unwrap();
     let old_id = &base_ids[b"old.rs"];
     let new_id = &inferred
-        .result_files
+        .result_files()
         .iter()
         .find(|file| file.path == b"new.rs")
         .unwrap()
         .file_id;
     assert_ne!(old_id, new_id);
-    assert!(inferred.changes.iter().any(|change| {
+    assert!(inferred.changes().iter().any(|change| {
         change.relation == IdentityRelation::UncertainRename
             && change.possible_sources == vec![old_id.clone()]
     }));
@@ -164,14 +168,15 @@ fn edited_rename_is_not_claimed_as_a_validated_rename() {
         &base,
     )
     .unwrap();
+    let base_state = descriptor.initial_file_identity_state().unwrap();
     let result = snapshot(&[(b"new.rs", b"after")]);
     assert!(
         advance_file_identities(
             &project(),
+            &base_state,
             "proposal-edited-rename",
             &base,
             &result,
-            &descriptor.file_map(),
             &[FileOperation::Rename {
                 from: b"old.rs".to_vec(),
                 to: b"new.rs".to_vec(),
@@ -181,16 +186,16 @@ fn edited_rename_is_not_claimed_as_a_validated_rename() {
     );
     let unknown = advance_file_identities(
         &project(),
+        &base_state,
         "proposal-unknown-edit",
         &base,
         &result,
-        &descriptor.file_map(),
         &[],
     )
     .unwrap();
     assert!(
         unknown
-            .changes
+            .changes()
             .iter()
             .any(|change| change.relation == IdentityRelation::New)
     );
@@ -206,13 +211,14 @@ fn copy_and_split_create_new_ids_with_explicit_derivation() {
     )
     .unwrap();
     let base_ids = descriptor.file_map();
+    let base_state = descriptor.initial_file_identity_state().unwrap();
     let copy_result = snapshot(&[(b"copy.rs", b"original"), (b"source.rs", b"original")]);
     let copy = advance_file_identities(
         &project(),
+        &base_state,
         "proposal-copy",
         &base,
         &copy_result,
-        &base_ids,
         &[FileOperation::Copy {
             from: b"source.rs".to_vec(),
             to: b"copy.rs".to_vec(),
@@ -220,12 +226,12 @@ fn copy_and_split_create_new_ids_with_explicit_derivation() {
     )
     .unwrap();
     let copied = copy
-        .result_files
+        .result_files()
         .iter()
         .find(|file| file.path == b"copy.rs")
         .unwrap();
     assert_ne!(copied.file_id, base_ids[b"source.rs"]);
-    assert!(copy.changes.iter().any(|change| {
+    assert!(copy.changes().iter().any(|change| {
         change.relation == IdentityRelation::ExplicitCopy
             && change.derived_from == vec![base_ids[b"source.rs"].clone()]
     }));
@@ -233,10 +239,10 @@ fn copy_and_split_create_new_ids_with_explicit_derivation() {
     let split_result = snapshot(&[(b"part-a.rs", b"first"), (b"part-b.rs", b"second")]);
     let split = advance_file_identities(
         &project(),
+        &base_state,
         "proposal-split",
         &base,
         &split_result,
-        &base_ids,
         &[FileOperation::Split {
             from: b"source.rs".to_vec(),
             to: vec![b"part-a.rs".to_vec(), b"part-b.rs".to_vec()],
@@ -244,7 +250,7 @@ fn copy_and_split_create_new_ids_with_explicit_derivation() {
     )
     .unwrap();
     let ids: Vec<&FileId> = split
-        .result_files
+        .result_files()
         .iter()
         .map(|file| &file.file_id)
         .collect();
@@ -252,7 +258,7 @@ fn copy_and_split_create_new_ids_with_explicit_derivation() {
     assert_ne!(ids[0], ids[1]);
     assert!(
         split
-            .changes
+            .changes()
             .iter()
             .filter(|change| { change.relation == IdentityRelation::ExplicitSplit })
             .all(|change| change.derived_from == vec![base_ids[b"source.rs"].clone()])
@@ -269,30 +275,73 @@ fn competing_new_files_at_the_same_path_conflict_even_with_equal_bytes() {
     )
     .unwrap();
     let base_ids = descriptor.file_map();
+    let base_state = descriptor.initial_file_identity_state().unwrap();
     let result = snapshot(&[(b"base.rs", b"base"), (b"new.rs", b"same")]);
-    let left = advance_file_identities(&project(), "proposal-left", &base, &result, &base_ids, &[])
-        .unwrap();
-    let right =
-        advance_file_identities(&project(), "proposal-right", &base, &result, &base_ids, &[])
-            .unwrap();
+    let left = advance_file_identities(
+        &project(),
+        &base_state,
+        "proposal-left",
+        &base,
+        &result,
+        &[],
+    )
+    .unwrap();
+    let right = advance_file_identities(
+        &project(),
+        &base_state,
+        "proposal-right",
+        &base,
+        &result,
+        &[],
+    )
+    .unwrap();
     let conflict = validate_file_proposals(&[left, right]).unwrap_err();
     assert_eq!(conflict.path, b"new.rs");
     assert_eq!(conflict.proposal_ids, ["proposal-left", "proposal-right"]);
 }
 
 #[test]
-fn unrelated_file_id_map_members_are_refused() {
+fn foreign_project_identity_state_and_wrong_base_snapshot_are_refused() {
     let base = snapshot(&[(b"a.rs", b"a")]);
     let result = snapshot(&[(b"a.rs", b"a")]);
-    let mut ids = BTreeMap::from([(
-        b"a.rs".to_vec(),
-        FileId::parse(
-            "file:sha256:fd0ee6dc0f6b45715b845b427f345007bd60c53f1b75196d94be53bec48ed33e",
-        )
-        .unwrap(),
-    )]);
-    ids.insert(b"extra.rs".to_vec(), ids[b"a.rs"].clone());
+    let foreign = ProjectDescriptor::from_snapshot(
+        ProjectId::parse(&format!("proj:{}a", "b".repeat(25))).unwrap(),
+        "1111111111111111111111111111111111111111",
+        &base,
+    )
+    .unwrap()
+    .initial_file_identity_state()
+    .unwrap();
     assert!(
-        advance_file_identities(&project(), "proposal-extra", &base, &result, &ids, &[]).is_err()
+        advance_file_identities(
+            &project(),
+            &foreign,
+            "proposal-foreign",
+            &base,
+            &result,
+            &[]
+        )
+        .is_err()
+    );
+
+    let local = ProjectDescriptor::from_snapshot(
+        project(),
+        "1111111111111111111111111111111111111111",
+        &base,
+    )
+    .unwrap()
+    .initial_file_identity_state()
+    .unwrap();
+    let wrong_base = snapshot(&[(b"a.rs", b"changed")]);
+    assert!(
+        advance_file_identities(
+            &project(),
+            &local,
+            "proposal-stale-state",
+            &wrong_base,
+            &result,
+            &[]
+        )
+        .is_err()
     );
 }

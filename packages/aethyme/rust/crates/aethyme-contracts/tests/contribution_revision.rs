@@ -1,8 +1,8 @@
 //! Contribution revision qualification vectors for the bounded Local profile.
 
 use aethyme_contracts::experimental_v0::{
-    BriefReference, ContributionRevision, EntryKind, ProjectId, RecordId, SourceEntry,
-    SourceSnapshot,
+    BriefReference, ContributionId, ContributionRevision, EntryKind, ProjectId, RecordId,
+    SourceEntry, SourceSnapshot,
 };
 
 fn project() -> ProjectId {
@@ -17,10 +17,12 @@ fn rationale_only_brief_change_creates_a_distinct_immutable_revision() {
         b"fn main() {}\n",
     )])
     .unwrap();
-    let contribution = RecordId::parse(&format!("sha256:{}", "1".repeat(64))).unwrap();
+    let contribution = ContributionId::parse(&format!("contrib:{}", "b".repeat(25) + "e")).unwrap();
+    let capture_record_id = RecordId::parse(&format!("sha256:{}", "1".repeat(64))).unwrap();
     let original = ContributionRevision::new(
         project(),
         contribution.clone(),
+        capture_record_id.clone(),
         snapshot.id(),
         snapshot.id(),
         Vec::new(),
@@ -36,6 +38,7 @@ fn rationale_only_brief_change_creates_a_distinct_immutable_revision() {
     let revised = ContributionRevision::new(
         project(),
         contribution,
+        capture_record_id,
         snapshot.id(),
         snapshot.id(),
         Vec::new(),

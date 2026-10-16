@@ -205,6 +205,36 @@ impl ProjectDescriptor {
             .collect()
     }
 
+    /// Build the opaque initial identity state for this exact enrollment.
+    /// This mapping value is not proof that the descriptor was approved or
+    /// associated with another clone; the broker must validate the committed
+    /// binding before using it as established local history.
+    pub fn initial_file_identity_state(
+        &self,
+    ) -> Result<ProjectFileIdentityState, ProjectIdentityError> {
+        self.validate()?;
+        let files = self
+            .files
+            .iter()
+            .map(|file| {
+                (
+                    file.path.clone(),
+                    FileState {
+                        path: file.path.clone(),
+                        kind: file.kind,
+                        content_sha256: file.content_sha256,
+                        file_id: file.file_id.clone(),
+                    },
+                )
+            })
+            .collect();
+        Ok(ProjectFileIdentityState {
+            project_id: self.project_id.clone(),
+            snapshot: self.anchor_snapshot.clone(),
+            files,
+        })
+    }
+
     pub fn anchor_source(&self) -> Result<SourceSnapshot, ProjectIdentityError> {
         SourceSnapshot::new(self.files.iter().map(|file| {
             SourceEntry::from_content_digest(file.path.clone(), file.kind, file.content_sha256)
@@ -281,6 +311,13 @@ impl ProjectDescriptor {
             .find(|(name, _)| !allowed.contains(&name.as_str()))
         {
             return Err(ProjectIdentityError::UnknownField(name.to_string()));
+        }
+        // This experimental descriptor is a closed profile. The generic
+        // record envelope can carry extensions, but this typed value cannot
+        // yet preserve them, so accepting one would change the RecordId on
+        // re-encoding.
+        if raw.get("extensions").is_some() {
+            return Err(ProjectIdentityError::ExtensionsUnsupported);
         }
         let record = Record::decode(input, &[&PROJECT_DESCRIPTOR_SCHEMA])?;
         let project_id = ProjectId::parse(required_string(&record, "project_id")?)?;
@@ -413,6 +450,34 @@ pub struct FileState {
     pub file_id: FileId,
 }
 
+/// Opaque FileId map tied to one logical project and one exact snapshot.
+/// Only a descriptor or a validated transition can create this value, so a
+/// caller cannot attach an arbitrary map to a chosen ProjectId.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectFileIdentityState {
+    project_id: ProjectId,
+    snapshot: SourceSnapshotId,
+    files: BTreeMap<Vec<u8>, FileState>,
+}
+
+impl ProjectFileIdentityState {
+    pub fn project_id(&self) -> &ProjectId {
+        &self.project_id
+    }
+
+    pub fn snapshot(&self) -> &SourceSnapshotId {
+        &self.snapshot
+    }
+
+    pub fn files(&self) -> impl Iterator<Item = &FileState> {
+        self.files.values()
+    }
+
+    pub fn file_id(&self, path: &[u8]) -> Option<&FileId> {
+        self.files.get(path).map(|file| &file.file_id)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IdentityRelation {
     SamePath,
@@ -501,12 +566,51 @@ pub enum FileOperation {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileIdentityTransition {
-    pub project_id: ProjectId,
-    pub proposal_id: String,
-    pub base: SourceSnapshotId,
-    pub result: SourceSnapshotId,
-    pub result_files: Vec<FileState>,
-    pub changes: Vec<FileChange>,
+    project_id: ProjectId,
+    proposal_id: String,
+    base: SourceSnapshotId,
+    result: SourceSnapshotId,
+    result_files: Vec<FileState>,
+    changes: Vec<FileChange>,
+}
+
+impl FileIdentityTransition {
+    pub fn project_id(&self) -> &ProjectId {
+        &self.project_id
+    }
+
+    pub fn proposal_id(&self) -> &str {
+        &self.proposal_id
+    }
+
+    pub fn base(&self) -> &SourceSnapshotId {
+        &self.base
+    }
+
+    pub fn result(&self) -> &SourceSnapshotId {
+        &self.result
+    }
+
+    pub fn result_files(&self) -> &[FileState] {
+        &self.result_files
+    }
+
+    pub fn changes(&self) -> &[FileChange] {
+        &self.changes
+    }
+
+    pub fn result_identity_state(&self) -> ProjectFileIdentityState {
+        ProjectFileIdentityState {
+            project_id: self.project_id.clone(),
+            snapshot: self.result.clone(),
+            files: self
+                .result_files
+                .iter()
+                .cloned()
+                .map(|file| (file.path.clone(), file))
+                .collect(),
+        }
+    }
 }
 
 /// Advance file identities from an exact, previously known base. Unspecified
@@ -514,35 +618,45 @@ pub struct FileIdentityTransition {
 /// surfaced as uncertain candidates until an explicit operation is supplied.
 pub fn advance_file_identities(
     project_id: &ProjectId,
+    base_state: &ProjectFileIdentityState,
     proposal_id: &str,
     base: &SourceSnapshot,
     result: &SourceSnapshot,
-    base_ids: &BTreeMap<Vec<u8>, FileId>,
     operations: &[FileOperation],
 ) -> Result<FileIdentityTransition, ProjectIdentityError> {
     validate_proposal_id(proposal_id)?;
+    if &base_state.project_id != project_id {
+        return Err(ProjectIdentityError::ForeignProjectState);
+    }
+    if base_state.snapshot != base.id() {
+        return Err(ProjectIdentityError::BaseIdentitySnapshotMismatch);
+    }
     let base_entries: BTreeMap<Vec<u8>, &SourceEntry> = base
         .entries()
         .iter()
         .map(|entry| (entry.path().to_vec(), entry))
+        .collect();
+    if base_state.files.len() != base_entries.len()
+        || base_entries.iter().any(|(path, entry)| {
+            base_state.files.get(path).map_or(true, |state| {
+                state.path != *path
+                    || state.kind != entry.kind()
+                    || state.content_sha256 != *entry.content_sha256()
+            })
+        })
+    {
+        return Err(ProjectIdentityError::BaseIdentitySnapshotMismatch);
+    }
+    let base_ids: BTreeMap<Vec<u8>, FileId> = base_state
+        .files
+        .iter()
+        .map(|(path, state)| (path.clone(), state.file_id.clone()))
         .collect();
     let result_entries: BTreeMap<Vec<u8>, &SourceEntry> = result
         .entries()
         .iter()
         .map(|entry| (entry.path().to_vec(), entry))
         .collect();
-    if base_entries.keys().any(|path| !base_ids.contains_key(path)) {
-        let path = base_entries
-            .keys()
-            .find(|path| !base_ids.contains_key(*path))
-            .unwrap();
-        return Err(ProjectIdentityError::UnknownBasePath(HEXLOWER.encode(path)));
-    }
-    if base_ids.len() != base_entries.len()
-        || base_ids.keys().any(|path| !base_entries.contains_key(path))
-    {
-        return Err(ProjectIdentityError::BaseIdentitySetMismatch);
-    }
     let unique_base_ids: BTreeSet<FileId> = base_ids.values().cloned().collect();
     if unique_base_ids.len() != base_ids.len() {
         return Err(ProjectIdentityError::DuplicateBaseFileId);
@@ -916,6 +1030,8 @@ pub enum ProjectIdentityError {
     NotAnObject,
     #[error("descriptor contains unknown field {0:?}")]
     UnknownField(String),
+    #[error("descriptor extensions are unsupported by this closed experimental profile")]
+    ExtensionsUnsupported,
     #[error("descriptor field {0} has the wrong type")]
     WrongFieldType(&'static str),
     #[error("descriptor file entry is not an object")]
@@ -926,6 +1042,10 @@ pub enum ProjectIdentityError {
     NonCanonicalFileOrder,
     #[error("base FileId map does not exactly cover the base source snapshot")]
     BaseIdentitySetMismatch,
+    #[error("FileId state belongs to a different project than the requested transition")]
+    ForeignProjectState,
+    #[error("FileId state does not describe the exact supplied base snapshot")]
+    BaseIdentitySnapshotMismatch,
     #[error("base source snapshot assigns one FileId to more than one path")]
     DuplicateBaseFileId,
     #[error("invalid descriptor file entry: {0}")]

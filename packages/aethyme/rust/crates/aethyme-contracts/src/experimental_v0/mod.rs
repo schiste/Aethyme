@@ -10,12 +10,15 @@ pub mod record;
 pub mod source_snapshot;
 pub mod symbol_identity;
 
-pub use contribution_revision::{BriefReference, ContributionRevision, ContributionRevisionError};
+pub use contribution_revision::{
+    BriefReference, ContributionId, ContributionRevision, ContributionRevisionError,
+};
 pub use digest::ID_PREFIX;
 pub use project_identity::{
     EnrolledFile, FileChange, FileId, FileIdentityTransition, FileNamespaceConflict,
     FileNamespaceConflictKind, FileOperation, FileState, IdentityRelation, ProjectDescriptor,
-    ProjectId, ProjectIdentityError, advance_file_identities, validate_file_proposals,
+    ProjectFileIdentityState, ProjectId, ProjectIdentityError, advance_file_identities,
+    validate_file_proposals,
 };
 pub use record::{FieldKind, FieldSpec, Record, RecordError, RecordId, RecordSchema, StateReading};
 pub use source_snapshot::{

@@ -25,12 +25,48 @@ const fn field(name: &'static str, required: bool, kind: FieldKind) -> FieldSpec
     }
 }
 
+/// Random identity for one logical submitted intent. This is deliberately
+/// distinct from the digest RecordId of any immutable revision.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ContributionId(String);
+
+impl ContributionId {
+    pub fn parse(value: &str) -> Result<Self, ContributionRevisionError> {
+        let encoded = value.strip_prefix("contrib:").unwrap_or_default();
+        let valid = encoded.len() == 26
+            && encoded
+                .bytes()
+                .all(|byte| contribution_base32_value(byte).is_some())
+            && encoded.as_bytes().last().is_some_and(|last| {
+                contribution_base32_value(*last).is_some_and(|value| value % 4 == 0)
+            });
+        if valid {
+            Ok(Self(value.to_string()))
+        } else {
+            Err(ContributionRevisionError::InvalidContributionId(
+                value.to_string(),
+            ))
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for ContributionId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
 /// Exact immutable payload for one revision of a logical contribution.
 pub static CONTRIBUTION_REVISION_SCHEMA: RecordSchema = RecordSchema {
     name: CONTRIBUTION_REVISION_SCHEMA_NAME,
     fields: &[
         field("project_id", true, FieldKind::String),
         field("contribution_id", true, FieldKind::String),
+        field("capture_record_id", true, FieldKind::String),
         field("base", true, FieldKind::String),
         field("result", true, FieldKind::String),
         field("source_changes", true, FieldKind::Opaque),
@@ -71,7 +107,8 @@ impl BriefReference {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContributionRevision {
     project_id: ProjectId,
-    contribution_id: RecordId,
+    contribution_id: ContributionId,
+    capture_record_id: RecordId,
     base: SourceSnapshotId,
     result: SourceSnapshotId,
     source_changes: Vec<Value>,
@@ -82,7 +119,8 @@ pub struct ContributionRevision {
 impl ContributionRevision {
     pub fn new(
         project_id: ProjectId,
-        contribution_id: RecordId,
+        contribution_id: ContributionId,
+        capture_record_id: RecordId,
         base: SourceSnapshotId,
         result: SourceSnapshotId,
         source_changes: Vec<Value>,
@@ -110,6 +148,7 @@ impl ContributionRevision {
         Ok(Self {
             project_id,
             contribution_id,
+            capture_record_id,
             base,
             result,
             source_changes,
@@ -122,8 +161,16 @@ impl ContributionRevision {
         &self.project_id
     }
 
-    pub fn contribution_id(&self) -> &RecordId {
+    pub fn contribution_id(&self) -> &ContributionId {
         &self.contribution_id
+    }
+
+    /// Exact legacy capture lineage this revision extends. This remains a
+    /// separate identity from both the logical ContributionId and revision
+    /// digest, allowing the adapter to join history without rewriting old
+    /// capture records.
+    pub fn capture_record_id(&self) -> &RecordId {
+        &self.capture_record_id
     }
 
     pub fn base(&self) -> &SourceSnapshotId {
@@ -154,6 +201,10 @@ impl ContributionRevision {
             (
                 "contribution_id".into(),
                 text(self.contribution_id.as_str()),
+            ),
+            (
+                "capture_record_id".into(),
+                text(self.capture_record_id.as_str()),
             ),
             ("base".into(), text(self.base.as_str())),
             ("result".into(), text(self.result.as_str())),
@@ -189,6 +240,7 @@ impl ContributionRevision {
             "schema",
             "project_id",
             "contribution_id",
+            "capture_record_id",
             "base",
             "result",
             "source_changes",
@@ -204,7 +256,8 @@ impl ContributionRevision {
         }
         let record = Record::decode(input, &[&CONTRIBUTION_REVISION_SCHEMA])?;
         let project_id = ProjectId::parse(&required_string(&record, "project_id")?)?;
-        let contribution_id = RecordId::parse(&required_string(&record, "contribution_id")?)?;
+        let contribution_id = ContributionId::parse(&required_string(&record, "contribution_id")?)?;
+        let capture_record_id = RecordId::parse(&required_string(&record, "capture_record_id")?)?;
         let base = SourceSnapshotId::parse(&required_string(&record, "base")?)?;
         let result = SourceSnapshotId::parse(&required_string(&record, "result")?)?;
         let Value::Array(source_changes) = record.get("source_changes").expect("schema checked")
@@ -231,6 +284,7 @@ impl ContributionRevision {
         let revision = Self::new(
             project_id,
             contribution_id,
+            capture_record_id,
             base,
             result,
             source_changes.clone(),
@@ -422,6 +476,14 @@ fn decode_hex(value: String, field: &'static str) -> Result<Vec<u8>, Contributio
     Ok(bytes)
 }
 
+fn contribution_base32_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'a'..=b'z' => Some(byte - b'a'),
+        b'2'..=b'7' => Some(byte - b'2' + 26),
+        _ => None,
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ContributionRevisionError {
     #[error("contribution revision exceeds the {MAX_CONTRIBUTION_REVISION_BYTES}-byte limit ({0})")]
@@ -440,6 +502,8 @@ pub enum ContributionRevisionError {
     InvalidBriefDigest,
     #[error("contribution revision has duplicate dependency IDs")]
     DuplicateDependency,
+    #[error("invalid logical contribution ID {0:?}; expected contrib:<random 128-bit base32>")]
+    InvalidContributionId(String),
     #[error("contribution revision has an invalid source change")]
     InvalidSourceChange,
     #[error("contribution revision changes must be in strict raw-byte path order")]
