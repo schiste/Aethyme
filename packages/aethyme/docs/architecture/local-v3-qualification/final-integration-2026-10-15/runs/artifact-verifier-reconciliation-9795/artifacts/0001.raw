@@ -1,0 +1,82 @@
+{
+  "source_freeze": "After independently reviewed final T56+CLI source fixes merge into clean combined root HEAD/tree, freeze it through the five sequential checks. These may run before the actual T64 rehearsal while the operator waits for mandatory human TTY trust, provided the operator explicitly releases Cargo/native runtime and stops all runtime setup. No source edits or HEAD changes during checks. Any later Rust/source behavior change requires applicable checks again; documentation/evidence-only additions receive artifact/link verification and applicable documentation checks, without relabelling these source-bound runs.",
+  "cargo_concurrency": "One worker, four compile jobs; existing shared T7 target; restored source mtime invalidation",
+  "commands": [
+    [
+      "packages/aethyme/scripts/test-like-ci.sh",
+      "--full"
+    ],
+    [
+      "cargo",
+      "fmt",
+      "--all",
+      "--",
+      "--check"
+    ],
+    [
+      "cargo",
+      "clippy",
+      "--locked",
+      "-j",
+      "4",
+      "--workspace",
+      "--all-targets",
+      "--",
+      "-D",
+      "warnings"
+    ],
+    [
+      "cargo",
+      "test",
+      "--locked",
+      "-j",
+      "4",
+      "--workspace",
+      "--examples"
+    ],
+    [
+      "cargo",
+      "test",
+      "--locked",
+      "-j",
+      "4",
+      "--workspace",
+      "--doc"
+    ]
+  ],
+  "root_command_cwd": ".",
+  "cargo_command_cwd": "packages/aethyme/rust",
+  "recording": "Copy original command.json/log/status and nextest JUnit into final-integration ledger; preserve failures and retries",
+  "forbidden_replays": [
+    "E1 final held-outs",
+    "FX08 final held-outs",
+    "six consumed FX17 model requests"
+  ],
+  "checks_after_push": "Fresh structured 52-PR CI snapshot with exact current head SHA, statuses, pagination/error fields; all OPEN drafts, no ready/main merge/submit/finish.",
+  "updated_at_utc": "2026-10-15T22:41:23.968947+00:00",
+  "temporary_profile": "Whitespace-free off-Git /private/tmp temporary roots via reviewed recorder option; shared compilation cache remainsT7. Official local-CI Git isolation remains enabled; no production refusal changes.",
+  "driver": "run-final-workspace-checks-v3.py SHA2566b0c4332fddceabe89dc0dcb4cae947fe6f972be847fcd5ec82de1fd4feb815b",
+  "supersedes_for_future_runs_only": {
+    "path": "target/local-resume/final-local-validation-plan-v2.json",
+    "sha256": "7ff01ed11eb6746a060b27b00de401484d58107e9de014d53916e382a8043556",
+    "previous_results_preserved": true
+  },
+  "launcher_environment": {
+    "HOME": "/Users/christophehenner",
+    "CARGO_HOME": "/Users/christophehenner/.cargo",
+    "RUSTUP_HOME": "/Users/christophehenner/.rustup",
+    "PATH": "/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/christophehenner/.cargo/bin",
+    "require_filtered_env": true
+  },
+  "review": "Independent read-only LunaMax final_local_adversarial CLEAR runner6b0c4332/frozenrecorder29d2319c. Priorhandoff1d0ce is intentionally stale and must be replaced only after all authors/operator release globalCargo/native slot, bound to finalcleanHEAD and <=600s old. No runner changes.",
+  "ordering_amendment": {
+    "reason": "Use the mandatory human TTY trust wait for independent workspace verification; no test, assertion, environment bound, runtime lock or evidence rule changes. Actual T64 remains required and uncredited until executed.",
+    "conditions": [
+      "CLI focused positives, five intended mutations and exact source restoration, strict scoped lint/build and old23/schema25 controls complete before CLI runtime release.",
+      "Operator may build/setup only before its explicit runtime release; no compiler, checker, Docker or contributor launch overlaps the workspace batch.",
+      "Fresh runtime handoff <=600seconds binds exact clean root source before unchanged reviewed runner starts.",
+      "After workspace batch ends, hand runtime back explicitly; actual T64 uses pinned qualified source/binaries and preserves its own complete result denominator."
+    ],
+    "runner_and_recorder_unchanged": true
+  }
+}

@@ -1,0 +1,132 @@
+Diff in /Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/complete-exact-immutable-contribution-co/packages/aethyme/rust/crates/aethyme-broker/src/composer/revision_tests.rs:18:
+ }
+ 
+ fn revision_id(digit: char) -> RecordId {
+-    RecordId::parse(&format!("sha256:{}", digit.to_string().repeat(64)))
+-        .expect("record id")
++    RecordId::parse(&format!("sha256:{}", digit.to_string().repeat(64))).expect("record id")
+ }
+ 
+ #[test]
+Diff in /Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/complete-exact-immutable-contribution-co/packages/aethyme/rust/crates/aethyme-broker/src/composer/revision_tests.rs:26:
+ fn unbound_recipe_order_keeps_the_legacy_shape() {
+-    let order = recipe_order_entry(
+-        "A",
+-        "sha256:lineage",
+-        "sha256:base",
+-        "sha256:result",
+-        None,
+-    );
++    let order = recipe_order_entry("A", "sha256:lineage", "sha256:base", "sha256:result", None);
+     assert_eq!(
+         order,
+         object(vec![
+Diff in /Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/complete-exact-immutable-contribution-co/packages/aethyme/rust/crates/aethyme-broker/src/composer/revision_tests.rs:66:
+ #[test]
+ fn revision_binding_map_is_exact_for_every_delivery() {
+     let request = composition_request(vec!["A".into()]);
+-    assert!(validate_revision_bindings(
+-        &request,
+-        &request.deliveries,
+-        &BTreeMap::from([("A".into(), revision_id('a'))]),
+-    )
+-    .is_ok());
++    assert!(
++        validate_revision_bindings(
++            &request,
++            &request.deliveries,
++            &BTreeMap::from([("A".into(), revision_id('a'))]),
++        )
++        .is_ok()
++    );
+     assert!(validate_revision_bindings(&request, &request.deliveries, &BTreeMap::new()).is_err());
+-    assert!(validate_revision_bindings(
+-        &request,
+-        &request.deliveries,
+-        &BTreeMap::from([("outside-catalog".into(), revision_id('a'))]),
+-    )
+-    .is_err());
++    assert!(
++        validate_revision_bindings(
++            &request,
++            &request.deliveries,
++            &BTreeMap::from([("outside-catalog".into(), revision_id('a'))]),
++        )
++        .is_err()
++    );
+ }
+ 
+ #[test]
+Diff in /Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/complete-exact-immutable-contribution-co/packages/aethyme/rust/crates/aethyme-broker/src/composer/revision_tests.rs:93:
+         derived_from: Vec::new(),
+     });
+     let revision = revision_id('a');
+-    assert!(validate_revision_bindings(
+-        &request,
+-        &request.deliveries,
+-        &BTreeMap::from([("A".into(), revision.clone()), ("B".into(), revision)]),
+-    )
+-    .is_err());
++    assert!(
++        validate_revision_bindings(
++            &request,
++            &request.deliveries,
++            &BTreeMap::from([("A".into(), revision.clone()), ("B".into(), revision)]),
++        )
++        .is_err()
++    );
+ }
+ 
+Diff in /Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/complete-exact-immutable-contribution-co/packages/aethyme/rust/crates/aethyme-broker/src/local_exchange.rs:13:
+ /// The experimental immutable revision packet carries bounded canonical
+ /// revision and brief bytes as lowercase hex. The larger limit applies only
+ /// to that explicit variant; legacy metadata remains capped at 16 KiB.
+-pub const MAX_REVISION_PACKET_BYTES: usize =
+-    2 * aethyme_contracts::experimental_v0::contribution_revision::MAX_CONTRIBUTION_REVISION_BYTES
+-        + 2 * aethyme_contracts::experimental_v0::brief::MAX_BRIEF_RECORD_BYTES
+-        + 32 * 1024;
++pub const MAX_REVISION_PACKET_BYTES: usize = 2
++    * aethyme_contracts::experimental_v0::contribution_revision::MAX_CONTRIBUTION_REVISION_BYTES
++    + 2 * aethyme_contracts::experimental_v0::brief::MAX_BRIEF_RECORD_BYTES
++    + 32 * 1024;
+ pub const MAX_SNAPSHOT_PAGE_BYTES: usize = 32 * 1024 * 1024;
+ /// Bound the complete in-memory snapshot assembled from multiple pages.
+ pub const MAX_SNAPSHOT_RECOVERY_BYTES: usize = 64 * 1024 * 1024;
+Diff in /Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/complete-exact-immutable-contribution-co/packages/aethyme/rust/crates/aethyme-broker/src/local_exchange.rs:352:
+         let brief_fields = match (revision.brief(), brief_bytes) {
+             (None, None) => (None, None, None),
+             (Some(reference), Some(bytes)) => {
+-                let (_, observed_id) = Brief::from_record(bytes)
+-                    .map_err(|_| invalid("brief record"))?;
++                let (_, observed_id) =
++                    Brief::from_record(bytes).map_err(|_| invalid("brief record"))?;
+                 if observed_id != reference.record_id
+                     || crate::collaboration_archive::ObjectDigest::of(bytes).hex()
+                         != reference.object_sha256
+Diff in /Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/complete-exact-immutable-contribution-co/packages/aethyme/rust/crates/aethyme-broker/src/local_exchange.rs:477:
+                 {
+                     return Err(invalid("brief object binding"));
+                 }
+-                let (brief, brief_id) = Brief::from_record(&brief_bytes)
+-                    .map_err(|_| invalid("brief record"))?;
++                let (brief, brief_id) =
++                    Brief::from_record(&brief_bytes).map_err(|_| invalid("brief record"))?;
+                 let (canonical, canonical_id) = brief.to_record();
+-                if brief_id.as_str() != id
+-                    || canonical_id != brief_id
+-                    || canonical != brief_bytes
+-                {
++                if brief_id.as_str() != id || canonical_id != brief_id || canonical != brief_bytes {
+                     return Err(invalid("brief canonical record"));
+                 }
+             }
+Diff in /Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/complete-exact-immutable-contribution-co/packages/aethyme/rust/crates/aethyme-broker/src/local_exchange.rs:787:
+ };
+ 
+ #[cfg(test)]
+-mod tests;
+-#[cfg(test)]
+ mod revision_tests;
++#[cfg(test)]
++mod tests;
+ 

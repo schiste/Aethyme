@@ -1,0 +1,5 @@
+run=fx10-1123-heartbeat-regression-normal
+command=env PATH=/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/christophehenner/.cargo/bin CARGO_TARGET_DIR=/Volumes/T7-repositories/Application\ Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/integrate-reviewed-local-bare-git-servic/target/local-resume/cargo RUSTC_WRAPPER= /Users/christophehenner/.chau7/cto_bin/cargo test --locked -j4 -p aethyme-broker --lib fx10_gate_child_start_waits_for_first_heartbeat -- --nocapture
+started=2026-10-15T09:29:48Z
+143d995220334d426934b330c54b9ba2f9a329db
+5b46a4281c56518c361643563e602d084f820b12a7ebec37614489a1b183ed32  packages/aethyme/rust/crates/aethyme-broker/src/local_controller/drive_tests/sustained_arrivals.rs

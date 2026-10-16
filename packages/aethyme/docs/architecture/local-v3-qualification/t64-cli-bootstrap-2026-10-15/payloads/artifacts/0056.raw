@@ -1,0 +1,14 @@
+--- a/packages/aethyme/rust/crates/aethyme-broker/src/collaboration_sensitive.rs
++++ b/packages/aethyme/rust/crates/aethyme-broker/src/collaboration_sensitive.rs
+@@ -1185,10 +1185,7 @@
+             return Err(());
+         }
+     }
+-    let Some(_unlocked) = crate::file_lock::ExclusiveFileLock::try_acquire(file).map_err(|_| ())?
+-    else {
+-        return Err(());
+-    };
++    drop(file);
+     let after = fs::symlink_metadata(path).map_err(|_| ())?;
+     if after.file_type().is_symlink() || !after.file_type().is_file() || after.len() != 0 {
+         return Err(());

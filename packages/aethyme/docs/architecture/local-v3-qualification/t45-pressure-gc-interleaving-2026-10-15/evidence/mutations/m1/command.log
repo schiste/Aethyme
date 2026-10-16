@@ -1,0 +1,24 @@
+   Compiling ra_ap_stdx v0.0.331
+   Compiling ra_ap_syntax v0.0.331
+   Compiling aethyme-graph-indexer v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/implement-deterministic-t45-gc-and-stora/packages/aethyme/rust/crates/aethyme-graph-indexer)
+   Compiling aethyme-engine v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/implement-deterministic-t45-gc-and-stora/packages/aethyme/rust/crates/aethyme-engine)
+   Compiling aethyme-broker v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/implement-deterministic-t45-gc-and-stora/packages/aethyme/rust/crates/aethyme-broker)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 42.86s
+     Running unittests src/lib.rs (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/integrate-reviewed-local-bare-git-servic/target/local-resume/cargo/debug/deps/aethyme_broker-0f278e0d02146111)
+
+running 1 test
+test execution_resources::qualification::native_filesystem::actual_native_t45_capture_and_hydration_enospc_interleave_with_gc ... Native source filesystem recovery root /Volumes/T7-repositories/Application Support/Aethyme/qualification/local-check-temporaries/t45-mutation-m1-capture-sh-tmp-4ah_mvcx/.tmpFgK36p
+
+thread 'execution_resources::qualification::native_filesystem::actual_native_t45_capture_and_hydration_enospc_interleave_with_gc' (1942885) panicked at crates/aethyme-broker/src/local_qualification/native_filesystem.rs:1344:9:
+capture GC must return ArchiveInUse before pressure while capture holds archive SH
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+
+failures:
+    execution_resources::qualification::native_filesystem::actual_native_t45_capture_and_hydration_enospc_interleave_with_gc
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1830 filtered out; finished in 21.92s
+
+error: test failed, to rerun pass `-p aethyme-broker --lib`

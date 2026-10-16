@@ -1,0 +1,11 @@
+--- a/packages/aethyme/rust/crates/aethyme-broker/src/collaboration_capture.rs
++++ b/packages/aethyme/rust/crates/aethyme-broker/src/collaboration_capture.rs
+@@ -189,7 +189,7 @@
+         let canonical = format!(
+             "aethyme capture request v0\0{}\0{}\0{}\0{}",
+             self.base.as_str(),
+-            self.result.as_str(),
++            "T04-omitted-result",
+             self.policy.as_str(),
+             self.retention.describe()
+         );

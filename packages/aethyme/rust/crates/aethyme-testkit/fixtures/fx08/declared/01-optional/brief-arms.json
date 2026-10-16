@@ -1,0 +1,33 @@
+{
+  "absent": null,
+  "correct": {
+    "intent": "Preserve existing consumer semantics",
+    "decisions": [
+      {
+        "scope_ref": "source.rs",
+        "choice": "Kept empty distinct from absent",
+        "reason": "The existing consumer uses an explicit empty setting to disable features; absent retains defaults."
+      }
+    ]
+  },
+  "incomplete": {
+    "intent": "Preserve existing consumer semantics",
+    "decisions": [
+      {
+        "scope_ref": "source.rs",
+        "choice": "Kept per-entry parsing simple",
+        "reason": "Tokens are trimmed and accepted names use lowercase letters, digits, underscores and hyphens."
+      }
+    ]
+  },
+  "misleading": {
+    "intent": "Preserve existing consumer semantics",
+    "decisions": [
+      {
+        "scope_ref": "source.rs",
+        "choice": "Treated empty like absent",
+        "reason": "The consumer expects blank settings to choose the usual defaults; a separate disable setting is unnecessary."
+      }
+    ]
+  }
+}

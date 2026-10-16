@@ -1,0 +1,37 @@
+{
+  "appointment": "sha256:7d7f472da706f773cbdc273aa3cf0200aebc821fce72fa66aa1c87a6a7bbbcd3",
+  "target": "native-controller",
+  "revision": "sha256:4f53d4f7d88bf5dd2c5977df8a2edd637f71ed3cbc0653d76f602efaa8463d30",
+  "epoch": "sha256:e413181b82e41033f8842f8960d2296a36b1f8441186f2f1e37ef8d0d456da0f",
+  "ticks": 2,
+  "completions": [
+    {
+      "target": "native-controller",
+      "revision": "sha256:4f53d4f7d88bf5dd2c5977df8a2edd637f71ed3cbc0653d76f602efaa8463d30",
+      "epoch": "sha256:e413181b82e41033f8842f8960d2296a36b1f8441186f2f1e37ef8d0d456da0f",
+      "wave": "sha256:273786aa07ddeb544697e088e36ab758c795ce219008a64c6ef4d45482a64172",
+      "source": "sha256:d837f77f12ebf1ce4d434bf360b63dba754c3ba3b990be49295791ad85671bc9",
+      "candidate_commit": "23939f9bcb1d54355251f04a143809a5abdb214d",
+      "candidate_tree": "4712a345780702b88d8aece2a47a1fa9fa55175f",
+      "qualification": "sha256:e5a5c7291fb5bdf8dbd3024c03a3fcbb0b4eb638aa7d3ab89ecf657f844b16e5",
+      "acceptance_receipt": "sha256:a36cc2aba441f4af6227e51a8490531bc83777a4294b8a7da62a4b1df3c121ea",
+      "accepted_commit": "23939f9bcb1d54355251f04a143809a5abdb214d",
+      "accepted_tree": "4712a345780702b88d8aece2a47a1fa9fa55175f"
+    },
+    {
+      "target": "native-controller",
+      "revision": "sha256:4f53d4f7d88bf5dd2c5977df8a2edd637f71ed3cbc0653d76f602efaa8463d30",
+      "epoch": "sha256:e413181b82e41033f8842f8960d2296a36b1f8441186f2f1e37ef8d0d456da0f",
+      "wave": "sha256:9c0d6f1685fb565d79d400bb0b6b425e0be088ca5472586d988b15b4230450f2",
+      "source": "sha256:603d6c554d2ae70ad66fd945494e581f2db905113aea511d74c903258209c16a",
+      "candidate_commit": "751adcea57f8dcfb041e72866b5632dffdc82e40",
+      "candidate_tree": "e0508f29edef948e2ded1dbeed32d686ea8a7289",
+      "qualification": "sha256:213191aefa2dfbd497c28e55c1e489fcb83f4ab80fc7019183df46c215e0092f",
+      "acceptance_receipt": "sha256:ef5a03932ebe43619e4911dbdd308a42f8a851d9e1a85b742f808e9742d0159c",
+      "accepted_commit": "751adcea57f8dcfb041e72866b5632dffdc82e40",
+      "accepted_tree": "e0508f29edef948e2ded1dbeed32d686ea8a7289"
+    }
+  ],
+  "outcome": "completion_allowance",
+  "detail": null
+}

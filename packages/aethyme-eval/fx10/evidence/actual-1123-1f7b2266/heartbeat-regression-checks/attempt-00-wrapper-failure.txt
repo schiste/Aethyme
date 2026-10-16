@@ -1,0 +1,7 @@
+run=fx10-1123-heartbeat-regression-normal-wrapper-failure
+shell_exit_status=1
+cargo_exit_status=unknown (not captured; do not credit as a test result)
+source_sha256=5b46a4281c56518c361643563e602d084f820b12a7ebec37614489a1b183ed32
+commit=143d995220334d426934b330c54b9ba2f9a329db
+log=/private/tmp/fx10-1123-heartbeat-regression-normal.log
+reason=Run was launched from the repository root instead of packages/aethyme/rust; the custom Cargo wrapper also could not write its command log. The zsh capture then tried to assign its reserved `status` variable and stopped before recording the subprocess result.

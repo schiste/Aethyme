@@ -1,0 +1,19 @@
+   Compiling aethyme-broker v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/complete-fresh-local-cli-bootstrap-and-c/packages/aethyme/rust/crates/aethyme-broker)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 47.65s
+     Running unittests src/lib.rs (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/integrate-reviewed-local-bare-git-servic/target/local-resume/cargo/debug/deps/aethyme_broker-0f278e0d02146111)
+
+running 1 test
+
+thread 'collaboration_cli::lifecycle::tests::service_status_rejects_corrupt_body_index_bindings_without_writes' (11998942) panicked at crates/aethyme-broker/src/collaboration_cli/lifecycle.rs:2045:14:
+called `Result::unwrap_err()` on an `Ok` value: (Object {"appointment": String("sha256:e8d32ed07c7936f39323fe23e1d2e4d93e81636512499e4971b6a8d357e3d824"), "automatic_replay": Bool(false), "epoch": String("sha256:fe28883dd112db3308beff00df4469f7170473103d3b56006101e67fec4e11fa"), "lookup": String("appointment"), "nonce": String("corrupt-binding-status-v1"), "reconciliation_required": Bool(true), "report": Null, "revision": String("sha256:826580ce2025ed65b61e015f0539f88f0470765edc66c3445eb3de83219f19b8"), "schema": String("aethyme.collab-service-status/experimental-v0"), "state": String("unknown"), "target": String("T")}, "appointment sha256:e8d32ed07c7936f39323fe23e1d2e4d93e81636512499e4971b6a8d357e3d824: outcome unknown; automatic replay is disabled\n")
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test collaboration_cli::lifecycle::tests::service_status_rejects_corrupt_body_index_bindings_without_writes ... FAILED
+
+failures:
+
+failures:
+    collaboration_cli::lifecycle::tests::service_status_rejects_corrupt_body_index_bindings_without_writes
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1893 filtered out; finished in 0.75s
+
+error: test failed, to rerun pass `-p aethyme-broker --lib`

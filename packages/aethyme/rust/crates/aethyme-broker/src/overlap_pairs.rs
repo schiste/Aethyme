@@ -425,7 +425,71 @@ impl Broker {
         if full {
             cache.retain(|key, _| grouped.keys().any(|pair| pair_key_string(*pair) == *key));
         }
+        let order = self.classify_into(&grouped, budget, &mut cache)?;
 
+        let mut pairs = Vec::new();
+        for key in order {
+            let paths = &grouped[&key];
+            let entry = cache.entry(pair_key_string(key)).or_default();
+            let pair = build_pair(key, paths, Some(entry));
+            let signature = announcement_signature(&pair);
+            // Only a full pass announces: a subset pass judges pairs a full
+            // refresh no longer tracks (a stale holder), and the next full
+            // pass forgets them, so announcing would repeat on every submit.
+            if full && entry.announced.as_deref() != Some(signature.as_str()) {
+                let payload = serde_json::json!({
+                    "session_a": pair.session_a,
+                    "session_b": pair.session_b,
+                    // The first sample path, kept so readers of the old
+                    // one-event-per-path payload still find a path here.
+                    "path": pair.sample_paths.first(),
+                    "severity": pair.severity,
+                    "paths_count": pair.paths_count,
+                    "conflicting_paths": pair.conflicting_paths,
+                    "sample_paths": pair.sample_paths,
+                    "classified": pair.classified,
+                    "reason": pair.reason,
+                });
+                self.store().append_event(
+                    crate::events::LEASE_OVERLAP,
+                    Some(pair.session_a),
+                    Some(&payload.to_string()),
+                )?;
+                entry.announced = Some(signature);
+            }
+            pairs.push(pair);
+        }
+        self.store()
+            .meta_set(PAIR_CACHE_META_KEY, &serde_json::to_string(&cache)?)?;
+        rank(&mut pairs);
+        Ok(pairs)
+    }
+
+    /// Classify `overlaps` now, from no cached verdict, writing nothing:
+    /// no cache update and no announcement. For read-only callers (#663).
+    pub(crate) fn classify_overlaps_now(
+        &self,
+        overlaps: &[Overlap],
+    ) -> Result<Vec<OverlapPair>, BrokerOpError> {
+        let grouped = group_overlaps(overlaps);
+        let mut cache = BTreeMap::new();
+        self.classify_into(&grouped, CLASSIFY_BUDGET, &mut cache)?;
+        let mut pairs: Vec<OverlapPair> = grouped
+            .iter()
+            .map(|(key, paths)| build_pair(*key, paths, cache.get(&pair_key_string(*key))))
+            .collect();
+        rank(&mut pairs);
+        Ok(pairs)
+    }
+
+    /// Bring `cache`'s verdict for each pair of `grouped` up to date, within
+    /// `budget`. Returns the pairs in the order they were judged.
+    fn classify_into(
+        &self,
+        grouped: &BTreeMap<PairKey, Vec<String>>,
+        budget: std::time::Duration,
+        cache: &mut BTreeMap<String, CachedPair>,
+    ) -> Result<Vec<PairKey>, BrokerOpError> {
         let sessions: BTreeMap<i64, String> = self
             .store_ref()
             .live_sessions()?
@@ -437,7 +501,7 @@ impl Broker {
         // per pair: with N sessions sharing a file there are N*(N-1)/2 pairs,
         // and reading state runs several Git commands in the worktree.
         let mut session_paths: BTreeMap<i64, BTreeSet<String>> = BTreeMap::new();
-        for ((a, b), paths) in &grouped {
+        for ((a, b), paths) in grouped {
             for session in [a, b] {
                 session_paths
                     .entry(*session)
@@ -477,7 +541,7 @@ impl Broker {
         });
 
         let started = std::time::Instant::now();
-        let mut pairs = Vec::new();
+        let mut judged = Vec::new();
         for (key, paths) in order {
             let entry = cache.entry(pair_key_string(*key)).or_default();
             if started.elapsed() >= budget {
@@ -542,38 +606,9 @@ impl Broker {
                     }
                 }
             }
-            let pair = build_pair(*key, paths, Some(entry));
-            let signature = announcement_signature(&pair);
-            // Only a full pass announces: a subset pass judges pairs a full
-            // refresh no longer tracks (a stale holder), and the next full
-            // pass forgets them, so announcing would repeat on every submit.
-            if full && entry.announced.as_deref() != Some(signature.as_str()) {
-                let payload = serde_json::json!({
-                    "session_a": pair.session_a,
-                    "session_b": pair.session_b,
-                    // The first sample path, kept so readers of the old
-                    // one-event-per-path payload still find a path here.
-                    "path": pair.sample_paths.first(),
-                    "severity": pair.severity,
-                    "paths_count": pair.paths_count,
-                    "conflicting_paths": pair.conflicting_paths,
-                    "sample_paths": pair.sample_paths,
-                    "classified": pair.classified,
-                    "reason": pair.reason,
-                });
-                self.store().append_event(
-                    crate::events::LEASE_OVERLAP,
-                    Some(pair.session_a),
-                    Some(&payload.to_string()),
-                )?;
-                entry.announced = Some(signature);
-            }
-            pairs.push(pair);
+            judged.push(*key);
         }
-        self.store()
-            .meta_set(PAIR_CACHE_META_KEY, &serde_json::to_string(&cache)?)?;
-        rank(&mut pairs);
-        Ok(pairs)
+        Ok(judged)
     }
 
     /// The classified pair for two sessions, if they currently overlap.

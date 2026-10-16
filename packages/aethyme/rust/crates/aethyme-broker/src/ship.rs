@@ -3622,33 +3622,38 @@ fn publication_policy_at(
     else {
         return Ok(ShipPublicationPolicy::default());
     };
-    let value =
-        text.parse::<toml::Value>()
-            .map_err(|error| BrokerOpError::ShipPublicationPolicy {
-                reason: format!("committed .aethyme/config.toml is invalid: {error}"),
-                remediation: "fix and submit the committed publication policy".into(),
-            })?;
-    let Some(publication) = value.get("publication") else {
-        return Ok(ShipPublicationPolicy::default());
-    };
-    let policy: ShipPublicationPolicy =
-        publication
-            .clone()
-            .try_into()
-            .map_err(|error| BrokerOpError::ShipPublicationPolicy {
+    ShipPublicationPolicy::from_config_text(&text)
+}
+
+impl ShipPublicationPolicy {
+    /// The same parser used by ordinary committed publication policy.
+    pub fn from_config_text(text: &str) -> Result<Self, BrokerOpError> {
+        let value =
+            text.parse::<toml::Value>()
+                .map_err(|error| BrokerOpError::ShipPublicationPolicy {
+                    reason: format!("committed .aethyme/config.toml is invalid: {error}"),
+                    remediation: "fix and submit the committed publication policy".into(),
+                })?;
+        let Some(publication) = value.get("publication") else {
+            return Ok(ShipPublicationPolicy::default());
+        };
+        let policy: ShipPublicationPolicy = publication.clone().try_into().map_err(|error| {
+            BrokerOpError::ShipPublicationPolicy {
                 reason: format!("committed [publication] policy is invalid: {error}"),
                 remediation: "fix and submit the committed publication policy".into(),
-            })?;
-    if policy.schema_version != PUBLICATION_POLICY_SCHEMA_VERSION {
-        return Err(BrokerOpError::ShipPublicationPolicy {
-            reason: format!(
-                "publication policy schema {} is unsupported; expected {}",
-                policy.schema_version, PUBLICATION_POLICY_SCHEMA_VERSION
-            ),
-            remediation: "upgrade Aethyme or use a supported committed policy schema".into(),
-        });
+            }
+        })?;
+        if policy.schema_version != PUBLICATION_POLICY_SCHEMA_VERSION {
+            return Err(BrokerOpError::ShipPublicationPolicy {
+                reason: format!(
+                    "publication policy schema {} is unsupported; expected {}",
+                    policy.schema_version, PUBLICATION_POLICY_SCHEMA_VERSION
+                ),
+                remediation: "upgrade Aethyme or use a supported committed policy schema".into(),
+            });
+        }
+        Ok(policy)
     }
-    Ok(policy)
 }
 
 fn authorize_publication(

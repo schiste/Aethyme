@@ -1,0 +1,31 @@
+[package]
+name = "aethyme-contracts"
+version.workspace = true
+edition = "2024"
+description = "Portable records, identities and canonical encodings for Aethyme Local v3. Pure functions only: no I/O, no storage, no CLI. Everything here is experimental until the plan's qualification gates pass."
+license = "Apache-2.0"
+
+[lib]
+name = "aethyme_contracts"
+path = "src/lib.rs"
+
+[dependencies]
+# SHA-256, not BLAKE3: these digests are identities that other implementations
+# (a Cloudflare Worker, a third-party verifier) must recompute, and SHA-256 is
+# available there natively (WebCrypto) and from standard tools (`shasum -a 256`).
+# The algorithm is part of every encoded ID (`sha256:`), so a later change is a
+# new tag rather than a silent re-identification.
+sha2 = { workspace = true }
+
+# Lowercase hex for the encoded ID and per-entry content digests.
+data-encoding = { workspace = true }
+
+thiserror = { workspace = true }
+
+[dev-dependencies]
+# Golden vectors are JSON so that a non-Rust implementation can load them too.
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

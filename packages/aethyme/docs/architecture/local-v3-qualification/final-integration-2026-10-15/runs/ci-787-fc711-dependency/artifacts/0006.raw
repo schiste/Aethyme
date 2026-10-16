@@ -1,0 +1,9 @@
+{
+  "argv": [
+    "gh",
+    "api",
+    "repos/schiste/Aethyme/actions/runs/38834487227/jobs?per_page=100"
+  ],
+  "exit_status": 0,
+  "captured_at_utc": "2026-10-16T01:34:34.787682+00:00"
+}

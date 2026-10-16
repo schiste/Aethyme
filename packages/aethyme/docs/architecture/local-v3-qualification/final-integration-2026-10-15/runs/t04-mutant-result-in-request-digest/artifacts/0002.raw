@@ -1,0 +1,19 @@
+   Compiling aethyme-broker v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/682-reconcile-final-local-qualification/packages/aethyme/rust/crates/aethyme-broker)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 22.29s
+     Running tests/capture_revision_replay.rs (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/integrate-reviewed-local-bare-git-servic/target/local-resume/cargo/debug/deps/capture_revision_replay-15e0cfc5709d3e2b)
+
+running 1 test
+
+thread 'changing_only_the_result_revision_cannot_overwrite_an_operation_receipt' (12675894) panicked at crates/aethyme-broker/tests/capture_revision_replay.rs:122:39:
+called `Result::unwrap_err()` on an `Ok` value: Acknowledged(CaptureReceipt { operation_id: OperationId("logical-operation"), status: "retained_local", durability: "local_durable", contribution: RecordId("sha256:6852b6e8fb1fe51bdc72f846e0f02ca2f9008ba3406b65a4986cb0a6eb88a8ee"), base: SourceSnapshotId("sha256:ea570c62606a293673323aacbefb51263cc7de96dc9ad952a50773b701d0218c"), result: SourceSnapshotId("sha256:c962839c8fcae60d052466941e5b1d0d9b7dfd1503cf3a54f5551e005e85b98a"), retention: UntilReleased, receipt_record_id: RecordId("sha256:793aead03b54aee09f7e623a08c54a02991367813ca9f35972d64845ab6b3709") })
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test changing_only_the_result_revision_cannot_overwrite_an_operation_receipt ... FAILED
+
+failures:
+
+failures:
+    changing_only_the_result_revision_cannot_overwrite_an_operation_receipt
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.68s
+
+error: test failed, to rerun pass `-p aethyme-broker --test capture_revision_replay`

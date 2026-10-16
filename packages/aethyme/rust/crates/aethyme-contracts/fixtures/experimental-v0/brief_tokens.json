@@ -1,0 +1,126 @@
+{
+  "profile": "aethyme-brief-tokens/v0",
+  "note": "Independent reference implementation.",
+  "cases": [
+    {
+      "text": "",
+      "tokens": 0
+    },
+    {
+      "text": "   \t\n\r",
+      "tokens": 0
+    },
+    {
+      "text": "a",
+      "tokens": 1
+    },
+    {
+      "text": "abcd",
+      "tokens": 1
+    },
+    {
+      "text": "abcde",
+      "tokens": 2
+    },
+    {
+      "text": "Keep the existing element id.",
+      "tokens": 8
+    },
+    {
+      "text": "0",
+      "tokens": 1
+    },
+    {
+      "text": "12",
+      "tokens": 1
+    },
+    {
+      "text": "123",
+      "tokens": 2
+    },
+    {
+      "text": "v0.8.26",
+      "tokens": 6
+    },
+    {
+      "text": "sha256:d92b8298",
+      "tokens": 9
+    },
+    {
+      "text": "caf\u00e9",
+      "tokens": 2
+    },
+    {
+      "text": "\u00e9l\u00e9ment",
+      "tokens": 4
+    },
+    {
+      "text": "e\u0301",
+      "tokens": 2
+    },
+    {
+      "text": "\u0395\u03bb\u03bb\u03b7\u03bd\u03b9\u03ba\u03ac",
+      "tokens": 4
+    },
+    {
+      "text": "\u0421\u043e\u0445\u0440\u0430\u043d\u0438\u0442\u044c \u043f\u043e\u0438\u0441\u043a",
+      "tokens": 8
+    },
+    {
+      "text": "\u05e9\u05dc\u05d5\u05dd",
+      "tokens": 2
+    },
+    {
+      "text": "\u0645\u0631\u062d\u0628\u0627",
+      "tokens": 3
+    },
+    {
+      "text": "\u4fdd\u6301\u73b0\u6709\u7684\u5143\u7d20",
+      "tokens": 7
+    },
+    {
+      "text": "\u30d8\u30c3\u30c0\u30fc",
+      "tokens": 4
+    },
+    {
+      "text": "\ud55c\uad6d\uc5b4",
+      "tokens": 3
+    },
+    {
+      "text": "\ud83d\ude80",
+      "tokens": 1
+    },
+    {
+      "text": "\ud83d\udc69\u200d\ud83d\udcbb",
+      "tokens": 3
+    },
+    {
+      "text": "\u00a0",
+      "tokens": 1
+    },
+    {
+      "text": "a\u00a0b",
+      "tokens": 3
+    },
+    {
+      "text": "x-y_z/w",
+      "tokens": 7
+    },
+    {
+      "text": "AAAAaaaa1111\u00e9\u00e9\u20ac\u20ac",
+      "tokens": 7
+    },
+    {
+      "text": "tab\tsep",
+      "tokens": 2
+    },
+    {
+      "text": "\ufb01",
+      "tokens": 1
+    },
+    {
+      "text": "\ud83d\ude00\ud83d\ude00",
+      "tokens": 2
+    }
+  ]
+}

@@ -1,0 +1,169 @@
+{
+  "schema": "aethyme.local-ci-evidence-bundle-inventory/v1",
+  "bundle_root": "/private/tmp/aethyme-ci-777-784-20261016-1yiyyg3s",
+  "inventory_scope": "All regular files present when generated except this inventory file itself; original GitHub API JSON and raw logs are preserved byte-for-byte, and prior evidence files are copied byte-for-byte.",
+  "artifacts": [
+    {
+      "path": "fetch-manifest.json",
+      "bytes": 5046,
+      "sha256": "c35ed1e593b18a8e501132ba8031ba6be6fcafa4bd9c330e3524b6835a200721",
+      "mtime_utc": "2026-10-15T22:17:05.175331+00:00"
+    },
+    {
+      "path": "github-current/ci-777-f1abe-workspace-cancelled.json",
+      "bytes": 9297,
+      "sha256": "dbde96860b9a7a5bccd9745fe52cc170b4c8d17c872dde0be2f04a05cd4ccede",
+      "mtime_utc": "2026-10-15T22:19:52.780099+00:00"
+    },
+    {
+      "path": "github-current/ci-784-0ec-workspace-failure.json",
+      "bytes": 10429,
+      "sha256": "2450ae1101f324e640f0323f905798bdde9f05107627324a97eeb013a4db0389",
+      "mtime_utc": "2026-10-15T22:19:52.780222+00:00"
+    },
+    {
+      "path": "github-current/job-116691584220.json",
+      "bytes": 2822,
+      "sha256": "3c5092ff48ac51cbd57eeca910e26d8496ea5b4b8ebc0363127b2d6f4b0c34e1",
+      "mtime_utc": "2026-10-15T22:17:02.945706+00:00"
+    },
+    {
+      "path": "github-current/job-116691584220.json.fetch.json",
+      "bytes": 510,
+      "sha256": "e51023452067d75d804c268846bb131e74e05b0d5f9d03210050b90d19773319",
+      "mtime_utc": "2026-10-15T22:17:02.945941+00:00"
+    },
+    {
+      "path": "github-current/job-116691584220.json.stderr",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "mtime_utc": "2026-10-15T22:17:02.945776+00:00"
+    },
+    {
+      "path": "github-current/job-116691584220.logs.raw",
+      "bytes": 1355302,
+      "sha256": "c52d7ac9c7f7e8cc523c5e48c748b5665099e7fa9d0c9469a2cbce4a051c2d2d",
+      "mtime_utc": "2026-10-15T22:17:05.140488+00:00"
+    },
+    {
+      "path": "github-current/job-116691584220.logs.raw.fetch.json",
+      "bytes": 586,
+      "sha256": "0f0ccfbc800ce85221437622227b030cbe3e45acedb65d93b38994d29d5dd7da",
+      "mtime_utc": "2026-10-15T22:17:05.175192+00:00"
+    },
+    {
+      "path": "github-current/job-116691584220.logs.raw.stderr",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "mtime_utc": "2026-10-15T22:17:05.174577+00:00"
+    },
+    {
+      "path": "github-current/job-116693225763.json",
+      "bytes": 2825,
+      "sha256": "b4df6d9e8bfa2d75e0babb9b56cb3cdf5fc8304618fae99a65ddd694577b0cd2",
+      "mtime_utc": "2026-10-15T22:17:02.121965+00:00"
+    },
+    {
+      "path": "github-current/job-116693225763.json.fetch.json",
+      "bytes": 510,
+      "sha256": "0d2d78dbaeebdea59f8ee147b45c06dd827fdd204af4c74293965a50432a4041",
+      "mtime_utc": "2026-10-15T22:17:02.122208+00:00"
+    },
+    {
+      "path": "github-current/job-116693225763.json.stderr",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "mtime_utc": "2026-10-15T22:17:02.122019+00:00"
+    },
+    {
+      "path": "github-current/run-38813286501.json",
+      "bytes": 12194,
+      "sha256": "056423366314d5928d00c5a25e64fd5f1f32e8fe1e3b8f6d4292ca69b2c09d45",
+      "mtime_utc": "2026-10-15T22:17:03.453234+00:00"
+    },
+    {
+      "path": "github-current/run-38813286501.json.fetch.json",
+      "bytes": 509,
+      "sha256": "29882b856e4ce7de8293c69d154c579546978e4512d0506db35b0b64f8369d16",
+      "mtime_utc": "2026-10-15T22:17:03.453436+00:00"
+    },
+    {
+      "path": "github-current/run-38813286501.json.stderr",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "mtime_utc": "2026-10-15T22:17:03.453292+00:00"
+    },
+    {
+      "path": "github-current/run-38813772970.json",
+      "bytes": 12200,
+      "sha256": "190268c8a5f194c7f78a2f62d861e3e3972051e7468af2e8888c5f7d0b145e3d",
+      "mtime_utc": "2026-10-15T22:17:02.515375+00:00"
+    },
+    {
+      "path": "github-current/run-38813772970.json.fetch.json",
+      "bytes": 509,
+      "sha256": "ca2d5984a4825132df7e630806c2ee3350ded5cbe8182dcf20ac1c71f0385974",
+      "mtime_utc": "2026-10-15T22:17:02.515577+00:00"
+    },
+    {
+      "path": "github-current/run-38813772970.json.stderr",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "mtime_utc": "2026-10-15T22:17:02.515427+00:00"
+    },
+    {
+      "path": "prior-snapshots/777-f1abe-checkout.json",
+      "bytes": 2616,
+      "sha256": "d0f3d11a325b401f96e11d81f082f95f82d2ebf2c138223ebdf654087d2b2768",
+      "mtime_utc": "2026-10-15T22:03:21.676846+00:00"
+    },
+    {
+      "path": "prior-snapshots/777-f1abe-workspace-job-20261015T220756Z.json",
+      "bytes": 2825,
+      "sha256": "b4df6d9e8bfa2d75e0babb9b56cb3cdf5fc8304618fae99a65ddd694577b0cd2",
+      "mtime_utc": "2026-10-15T22:07:57.350258+00:00"
+    },
+    {
+      "path": "prior-snapshots/784-0ec-checkout.json",
+      "bytes": 2616,
+      "sha256": "605af38099a29201b526b4cf424c710647fc8ba2f98953c61ff6e01d85b5ed57",
+      "mtime_utc": "2026-10-15T22:03:21.676851+00:00"
+    },
+    {
+      "path": "prior-snapshots/784-0ec-workspace-job-20261015T220756Z.json",
+      "bytes": 2540,
+      "sha256": "cd96f7301771bf5af800c9d308dc20375b8a15cc7e5c0e6cc979650fa93e9032",
+      "mtime_utc": "2026-10-15T22:07:57.396508+00:00"
+    },
+    {
+      "path": "prior-snapshots/ci-777-f1abe-run.json",
+      "bytes": 12195,
+      "sha256": "a52bd363a725cb05970969a25e0bc569f75648cc10107ea734a61accbb7f46bf",
+      "mtime_utc": "2026-10-15T22:02:24.403457+00:00"
+    },
+    {
+      "path": "prior-snapshots/ci-777-f1abe-workspace.raw.log",
+      "bytes": 783097,
+      "sha256": "956a71eb459dd823a3235183cecbe54f0d7629a1fc931b800bee548e40090153",
+      "mtime_utc": "2026-10-15T22:08:09.051960+00:00"
+    },
+    {
+      "path": "prior-snapshots/ci-784-0ec-lint.raw.log.fetch.json",
+      "bytes": 259,
+      "sha256": "59cabb798aad5902cf9aaca75e2789175a4d321305a43cc64c6b85b8691e4bda",
+      "mtime_utc": "2026-10-15T22:02:25.144729+00:00"
+    },
+    {
+      "path": "prior-snapshots/ci-784-0ec-run.json",
+      "bytes": 12191,
+      "sha256": "34c2e9f784d8d64abe9bf69f68ef313fd095545c4d09bc80330395960248cdd3",
+      "mtime_utc": "2026-10-15T22:02:24.474096+00:00"
+    },
+    {
+      "path": "prior-snapshots/ci-784-0ec-run.json.fetch.json",
+      "bytes": 221,
+      "sha256": "e4e562c973ea5a306fb6f9d9f4a4d0bafa4e07af983e02ea41faeb74d5941c9e",
+      "mtime_utc": "2026-10-15T22:02:24.474433+00:00"
+    }
+  ]
+}

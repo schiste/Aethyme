@@ -1,0 +1,41 @@
+{
+  "schema": "aethyme.local-check/v1",
+  "state": "complete",
+  "started_at_utc": "2026-10-15T11:13:45.821558+00:00",
+  "command": [
+    "/usr/bin/caffeinate",
+    "-i",
+    "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/integrate-reviewed-local-bare-git-servic/target/local-resume/cargo/debug/deps/aethyme_broker-0f278e0d02146111",
+    "native_gates::tests",
+    "--nocapture",
+    "--test-threads=1"
+  ],
+  "working_directory": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/reconcile-retention-of-inactive-native-g/packages/aethyme/rust",
+  "environment": {
+    "PATH": "/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/christophehenner/.cargo/bin",
+    "RUSTC_WRAPPER": "",
+    "CARGO_TARGET_DIR": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/integrate-reviewed-local-bare-git-servic/target/local-resume/cargo",
+    "TMPDIR": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/reconcile-retention-of-inactive-native-g/target/local-resume/final-integration-20261015T111345Z/native-gates-cached-serial-d524-20261015-tmp"
+  },
+  "source_before": {
+    "head": "27d1b2e9de6a3b09bb0dcf9bc598c22d8f39b52a",
+    "tree": "d0822c4484f37efdf90ff039fe6c13a08f293aa3",
+    "status": "",
+    "diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  "exit_code": 101,
+  "wall_seconds": 1.405,
+  "finished_at_utc": "2026-10-15T11:13:47.304473+00:00",
+  "source_after": {
+    "head": "27d1b2e9de6a3b09bb0dcf9bc598c22d8f39b52a",
+    "tree": "d0822c4484f37efdf90ff039fe6c13a08f293aa3",
+    "status": "",
+    "diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  "log": {
+    "path": "target/local-resume/final-integration-20261015T111345Z/native-gates-cached-serial-d524-20261015.log",
+    "bytes": 11683,
+    "sha256": "5638959ccce7c071871723f19d5272df0ac4fb2bb156fa125ab8c8266d93cd0d"
+  },
+  "source_unchanged": true
+}

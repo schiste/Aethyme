@@ -1,0 +1,41 @@
+warning: type `collaboration_cli::Failure` is more private than the item `PendingProjectFixture::bind`
+    --> crates/aethyme-broker/src/collaboration_cli/project.rs:1029:9
+     |
+1029 |         pub(crate) fn bind(&self, record_id: &str) -> Result<super::Output, super::Failure> {
+     |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ method `PendingProjectFixture::bind` is reachable at visibility `pub(crate)`
+     |
+note: but type `collaboration_cli::Failure` is only usable at visibility `pub(self)`
+    --> crates/aethyme-broker/src/collaboration_cli.rs:241:1
+     |
+ 241 | struct Failure {
+     | ^^^^^^^^^^^^^^
+     = note: `#[warn(private_interfaces)]` on by default
+
+warning: fields `host` and `anchor_commit` are never read
+   --> crates/aethyme-broker/src/collaboration_cli/project.rs:955:20
+    |
+953 |     pub(crate) struct PendingProjectFixture {
+    |                       --------------------- fields in this struct
+954 |         pub(crate) repo: tempfile::TempDir,
+955 |         pub(crate) host: tempfile::TempDir,
+    |                    ^^^^
+...
+958 |         pub(crate) anchor_commit: CommitOid,
+    |                    ^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `aethyme-broker` (lib test) generated 2 warnings
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.45s
+     Running unittests src/lib.rs (target/debug/deps/aethyme_broker-0f278e0d02146111)
+
+running 6 tests
+test local_target::revision::tests::d10_order_requires_one_exact_chain_and_refuses_merges_and_cycles ... ok
+test local_target::revision::tests::duplicate_capture_lineage_is_allowed_only_for_the_bound_d10_profile ... ok
+test local_target::revision::tests::immutable_revision_and_brief_roots_survive_target_supersession_with_recipe_candidate ... ok
+test local_target::revision::tests::revision_dependencies_must_equal_target_requirement_pins ... ok
+test local_target::revision::tests::selected_d10_proposals_conflict_before_legacy_lineage_dedup ... ok
+test local_target::revision::tests::selected_revision_map_must_be_exact ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 1948 filtered out; finished in 0.85s
+

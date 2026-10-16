@@ -1,0 +1,13 @@
+diff --git a/packages/aethyme/rust/crates/aethyme-broker/src/experimental_symbol_mapping.rs b/packages/aethyme/rust/crates/aethyme-broker/src/experimental_symbol_mapping.rs
+--- a/packages/aethyme/rust/crates/aethyme-broker/src/experimental_symbol_mapping.rs
++++ b/packages/aethyme/rust/crates/aethyme-broker/src/experimental_symbol_mapping.rs
+@@ -152,9 +152,6 @@
+         Ok(record) if record.schema() == SYMBOL_MAPPING_CLAIM_SCHEMA_NAME => record,
+         _ => return MappingResolution::Unknown("invalid_or_non_claim_record"),
+     };
+-    if !matches!(claim.state("state"), StateReading::Known("proposed")) {
+-        return MappingResolution::Unknown("claim_not_proposed");
+-    }
+     let Some(binding_id) = record_id(&claim, "binding") else {
+         return MappingResolution::Unknown("invalid_binding_reference");
+     };

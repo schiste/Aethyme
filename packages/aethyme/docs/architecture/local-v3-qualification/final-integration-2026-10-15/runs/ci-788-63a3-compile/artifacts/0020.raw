@@ -1,0 +1,1576 @@
+{
+  "collected_at_unix": 1792111584,
+  "repository": "schiste/Aethyme",
+  "run_id": "38830415286",
+  "pr_number": 788,
+  "run": {
+    "id": 38830415286,
+    "name": "OSS CI",
+    "node_id": "WFR_kwLOQ07FcM8AAAAJCnkdtg",
+    "head_branch": "agent/complete-local-l1-project-binding-file-l",
+    "head_sha": "63a3aa3e533ba466f02f1deabd36b9d3feb88985",
+    "path": ".github/workflows/oss-ci.yml",
+    "display_title": "feat(local): add experimental project identity and revisions",
+    "run_number": 1749,
+    "event": "pull_request",
+    "status": "completed",
+    "conclusion": "failure",
+    "workflow_id": 285417851,
+    "check_suite_id": 105232703414,
+    "check_suite_node_id": "CS_kwDOQ07FcM8AAAAYgFuftg",
+    "url": "https://api.github.com/repos/schiste/Aethyme/actions/runs/38830415286",
+    "html_url": "https://github.com/schiste/Aethyme/actions/runs/38830415286",
+    "pull_requests": [
+      {
+        "url": "https://api.github.com/repos/schiste/Aethyme/pulls/788",
+        "id": 4881705562,
+        "number": 788,
+        "head": {
+          "ref": "agent/complete-local-l1-project-binding-file-l",
+          "sha": "5ebe8d315062c7db0855bfa760a0379012a51743",
+          "repo": {
+            "id": 1129235824,
+            "url": "https://api.github.com/repos/schiste/Aethyme",
+            "name": "Aethyme"
+          }
+        },
+        "base": {
+          "ref": "agent/implement-t01-rust-typescript-canonical",
+          "sha": "898215cb89fcd1baccfc1af167a67c66f0488060",
+          "repo": {
+            "id": 1129235824,
+            "url": "https://api.github.com/repos/schiste/Aethyme",
+            "name": "Aethyme"
+          }
+        }
+      }
+    ],
+    "created_at": "2026-10-16T00:36:19Z",
+    "updated_at": "2026-10-16T00:39:21Z",
+    "actor": {
+      "login": "schiste",
+      "id": 15890754,
+      "node_id": "MDQ6VXNlcjE1ODkwNzU0",
+      "avatar_url": "https://avatars.githubusercontent.com/u/15890754?v=4",
+      "gravatar_id": "",
+      "url": "https://api.github.com/users/schiste",
+      "html_url": "https://github.com/schiste",
+      "followers_url": "https://api.github.com/users/schiste/followers",
+      "following_url": "https://api.github.com/users/schiste/following{/other_user}",
+      "gists_url": "https://api.github.com/users/schiste/gists{/gist_id}",
+      "starred_url": "https://api.github.com/users/schiste/starred{/owner}{/repo}",
+      "subscriptions_url": "https://api.github.com/users/schiste/subscriptions",
+      "organizations_url": "https://api.github.com/users/schiste/orgs",
+      "repos_url": "https://api.github.com/users/schiste/repos",
+      "events_url": "https://api.github.com/users/schiste/events{/privacy}",
+      "received_events_url": "https://api.github.com/users/schiste/received_events",
+      "type": "User",
+      "user_view_type": "public",
+      "site_admin": false
+    },
+    "run_attempt": 1,
+    "referenced_workflows": [],
+    "run_started_at": "2026-10-16T00:36:19Z",
+    "triggering_actor": {
+      "login": "schiste",
+      "id": 15890754,
+      "node_id": "MDQ6VXNlcjE1ODkwNzU0",
+      "avatar_url": "https://avatars.githubusercontent.com/u/15890754?v=4",
+      "gravatar_id": "",
+      "url": "https://api.github.com/users/schiste",
+      "html_url": "https://github.com/schiste",
+      "followers_url": "https://api.github.com/users/schiste/followers",
+      "following_url": "https://api.github.com/users/schiste/following{/other_user}",
+      "gists_url": "https://api.github.com/users/schiste/gists{/gist_id}",
+      "starred_url": "https://api.github.com/users/schiste/starred{/owner}{/repo}",
+      "subscriptions_url": "https://api.github.com/users/schiste/subscriptions",
+      "organizations_url": "https://api.github.com/users/schiste/orgs",
+      "repos_url": "https://api.github.com/users/schiste/repos",
+      "events_url": "https://api.github.com/users/schiste/events{/privacy}",
+      "received_events_url": "https://api.github.com/users/schiste/received_events",
+      "type": "User",
+      "user_view_type": "public",
+      "site_admin": false
+    },
+    "jobs_url": "https://api.github.com/repos/schiste/Aethyme/actions/runs/38830415286/jobs",
+    "logs_url": "https://api.github.com/repos/schiste/Aethyme/actions/runs/38830415286/logs",
+    "check_suite_url": "https://api.github.com/repos/schiste/Aethyme/check-suites/105232703414",
+    "artifacts_url": "https://api.github.com/repos/schiste/Aethyme/actions/runs/38830415286/artifacts",
+    "cancel_url": "https://api.github.com/repos/schiste/Aethyme/actions/runs/38830415286/cancel",
+    "rerun_url": "https://api.github.com/repos/schiste/Aethyme/actions/runs/38830415286/rerun",
+    "previous_attempt_url": null,
+    "workflow_url": "https://api.github.com/repos/schiste/Aethyme/actions/workflows/285417851",
+    "head_commit": {
+      "id": "63a3aa3e533ba466f02f1deabd36b9d3feb88985",
+      "tree_id": "e593dc9bfe6ac2113d3fb23d21744fa670199774",
+      "message": "feat(contracts): add experimental local identity revisions\n\nProblem\nLocal project mappings and contribution rationale changes need immutable, bounded records without granting workflow authority.\n\nDecision\nAdd experimental project descriptors, stable FileIds with explicit lineage operations, and content-addressed contribution revisions that bind exact source snapshots and optional brief objects.\n\nRationale\nThe contracts keep local ProjectKey storage separate from logical project identity, preserve uncertainty for inferred renames, and make brief-only changes produce a new revision.\n\nValidation\nRan rustfmt and git diff --check. Cargo and native tests were not run under the active runtime gate.",
+      "timestamp": "2026-10-16T00:34:27Z",
+      "author": {
+        "name": "Christophe Henner",
+        "email": "christophehenner@gmail.com"
+      },
+      "committer": {
+        "name": "Christophe Henner",
+        "email": "christophehenner@gmail.com"
+      }
+    },
+    "repository": {
+      "id": 1129235824,
+      "node_id": "R_kgDOQ07FcA",
+      "name": "Aethyme",
+      "full_name": "schiste/Aethyme",
+      "private": false,
+      "owner": {
+        "login": "schiste",
+        "id": 15890754,
+        "node_id": "MDQ6VXNlcjE1ODkwNzU0",
+        "avatar_url": "https://avatars.githubusercontent.com/u/15890754?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/schiste",
+        "html_url": "https://github.com/schiste",
+        "followers_url": "https://api.github.com/users/schiste/followers",
+        "following_url": "https://api.github.com/users/schiste/following{/other_user}",
+        "gists_url": "https://api.github.com/users/schiste/gists{/gist_id}",
+        "starred_url": "https://api.github.com/users/schiste/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/schiste/subscriptions",
+        "organizations_url": "https://api.github.com/users/schiste/orgs",
+        "repos_url": "https://api.github.com/users/schiste/repos",
+        "events_url": "https://api.github.com/users/schiste/events{/privacy}",
+        "received_events_url": "https://api.github.com/users/schiste/received_events",
+        "type": "User",
+        "user_view_type": "public",
+        "site_admin": false
+      },
+      "html_url": "https://github.com/schiste/Aethyme",
+      "description": null,
+      "fork": false,
+      "url": "https://api.github.com/repos/schiste/Aethyme",
+      "forks_url": "https://api.github.com/repos/schiste/Aethyme/forks",
+      "keys_url": "https://api.github.com/repos/schiste/Aethyme/keys{/key_id}",
+      "collaborators_url": "https://api.github.com/repos/schiste/Aethyme/collaborators{/collaborator}",
+      "teams_url": "https://api.github.com/repos/schiste/Aethyme/teams",
+      "hooks_url": "https://api.github.com/repos/schiste/Aethyme/hooks",
+      "issue_events_url": "https://api.github.com/repos/schiste/Aethyme/issues/events{/number}",
+      "events_url": "https://api.github.com/repos/schiste/Aethyme/events",
+      "assignees_url": "https://api.github.com/repos/schiste/Aethyme/assignees{/user}",
+      "branches_url": "https://api.github.com/repos/schiste/Aethyme/branches{/branch}",
+      "tags_url": "https://api.github.com/repos/schiste/Aethyme/tags",
+      "blobs_url": "https://api.github.com/repos/schiste/Aethyme/git/blobs{/sha}",
+      "git_tags_url": "https://api.github.com/repos/schiste/Aethyme/git/tags{/sha}",
+      "git_refs_url": "https://api.github.com/repos/schiste/Aethyme/git/refs{/sha}",
+      "trees_url": "https://api.github.com/repos/schiste/Aethyme/git/trees{/sha}",
+      "statuses_url": "https://api.github.com/repos/schiste/Aethyme/statuses/{sha}",
+      "languages_url": "https://api.github.com/repos/schiste/Aethyme/languages",
+      "stargazers_url": "https://api.github.com/repos/schiste/Aethyme/stargazers",
+      "contributors_url": "https://api.github.com/repos/schiste/Aethyme/contributors",
+      "subscribers_url": "https://api.github.com/repos/schiste/Aethyme/subscribers",
+      "subscription_url": "https://api.github.com/repos/schiste/Aethyme/subscription",
+      "commits_url": "https://api.github.com/repos/schiste/Aethyme/commits{/sha}",
+      "git_commits_url": "https://api.github.com/repos/schiste/Aethyme/git/commits{/sha}",
+      "comments_url": "https://api.github.com/repos/schiste/Aethyme/comments{/number}",
+      "issue_comment_url": "https://api.github.com/repos/schiste/Aethyme/issues/comments{/number}",
+      "contents_url": "https://api.github.com/repos/schiste/Aethyme/contents/{+path}",
+      "compare_url": "https://api.github.com/repos/schiste/Aethyme/compare/{base}...{head}",
+      "merges_url": "https://api.github.com/repos/schiste/Aethyme/merges",
+      "archive_url": "https://api.github.com/repos/schiste/Aethyme/{archive_format}{/ref}",
+      "downloads_url": "https://api.github.com/repos/schiste/Aethyme/downloads",
+      "issues_url": "https://api.github.com/repos/schiste/Aethyme/issues{/number}",
+      "pulls_url": "https://api.github.com/repos/schiste/Aethyme/pulls{/number}",
+      "milestones_url": "https://api.github.com/repos/schiste/Aethyme/milestones{/number}",
+      "notifications_url": "https://api.github.com/repos/schiste/Aethyme/notifications{?since,all,participating}",
+      "labels_url": "https://api.github.com/repos/schiste/Aethyme/labels{/name}",
+      "releases_url": "https://api.github.com/repos/schiste/Aethyme/releases{/id}",
+      "deployments_url": "https://api.github.com/repos/schiste/Aethyme/deployments"
+    },
+    "head_repository": {
+      "id": 1129235824,
+      "node_id": "R_kgDOQ07FcA",
+      "name": "Aethyme",
+      "full_name": "schiste/Aethyme",
+      "private": false,
+      "owner": {
+        "login": "schiste",
+        "id": 15890754,
+        "node_id": "MDQ6VXNlcjE1ODkwNzU0",
+        "avatar_url": "https://avatars.githubusercontent.com/u/15890754?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/schiste",
+        "html_url": "https://github.com/schiste",
+        "followers_url": "https://api.github.com/users/schiste/followers",
+        "following_url": "https://api.github.com/users/schiste/following{/other_user}",
+        "gists_url": "https://api.github.com/users/schiste/gists{/gist_id}",
+        "starred_url": "https://api.github.com/users/schiste/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/schiste/subscriptions",
+        "organizations_url": "https://api.github.com/users/schiste/orgs",
+        "repos_url": "https://api.github.com/users/schiste/repos",
+        "events_url": "https://api.github.com/users/schiste/events{/privacy}",
+        "received_events_url": "https://api.github.com/users/schiste/received_events",
+        "type": "User",
+        "user_view_type": "public",
+        "site_admin": false
+      },
+      "html_url": "https://github.com/schiste/Aethyme",
+      "description": null,
+      "fork": false,
+      "url": "https://api.github.com/repos/schiste/Aethyme",
+      "forks_url": "https://api.github.com/repos/schiste/Aethyme/forks",
+      "keys_url": "https://api.github.com/repos/schiste/Aethyme/keys{/key_id}",
+      "collaborators_url": "https://api.github.com/repos/schiste/Aethyme/collaborators{/collaborator}",
+      "teams_url": "https://api.github.com/repos/schiste/Aethyme/teams",
+      "hooks_url": "https://api.github.com/repos/schiste/Aethyme/hooks",
+      "issue_events_url": "https://api.github.com/repos/schiste/Aethyme/issues/events{/number}",
+      "events_url": "https://api.github.com/repos/schiste/Aethyme/events",
+      "assignees_url": "https://api.github.com/repos/schiste/Aethyme/assignees{/user}",
+      "branches_url": "https://api.github.com/repos/schiste/Aethyme/branches{/branch}",
+      "tags_url": "https://api.github.com/repos/schiste/Aethyme/tags",
+      "blobs_url": "https://api.github.com/repos/schiste/Aethyme/git/blobs{/sha}",
+      "git_tags_url": "https://api.github.com/repos/schiste/Aethyme/git/tags{/sha}",
+      "git_refs_url": "https://api.github.com/repos/schiste/Aethyme/git/refs{/sha}",
+      "trees_url": "https://api.github.com/repos/schiste/Aethyme/git/trees{/sha}",
+      "statuses_url": "https://api.github.com/repos/schiste/Aethyme/statuses/{sha}",
+      "languages_url": "https://api.github.com/repos/schiste/Aethyme/languages",
+      "stargazers_url": "https://api.github.com/repos/schiste/Aethyme/stargazers",
+      "contributors_url": "https://api.github.com/repos/schiste/Aethyme/contributors",
+      "subscribers_url": "https://api.github.com/repos/schiste/Aethyme/subscribers",
+      "subscription_url": "https://api.github.com/repos/schiste/Aethyme/subscription",
+      "commits_url": "https://api.github.com/repos/schiste/Aethyme/commits{/sha}",
+      "git_commits_url": "https://api.github.com/repos/schiste/Aethyme/git/commits{/sha}",
+      "comments_url": "https://api.github.com/repos/schiste/Aethyme/comments{/number}",
+      "issue_comment_url": "https://api.github.com/repos/schiste/Aethyme/issues/comments{/number}",
+      "contents_url": "https://api.github.com/repos/schiste/Aethyme/contents/{+path}",
+      "compare_url": "https://api.github.com/repos/schiste/Aethyme/compare/{base}...{head}",
+      "merges_url": "https://api.github.com/repos/schiste/Aethyme/merges",
+      "archive_url": "https://api.github.com/repos/schiste/Aethyme/{archive_format}{/ref}",
+      "downloads_url": "https://api.github.com/repos/schiste/Aethyme/downloads",
+      "issues_url": "https://api.github.com/repos/schiste/Aethyme/issues{/number}",
+      "pulls_url": "https://api.github.com/repos/schiste/Aethyme/pulls{/number}",
+      "milestones_url": "https://api.github.com/repos/schiste/Aethyme/milestones{/number}",
+      "notifications_url": "https://api.github.com/repos/schiste/Aethyme/notifications{?since,all,participating}",
+      "labels_url": "https://api.github.com/repos/schiste/Aethyme/labels{/name}",
+      "releases_url": "https://api.github.com/repos/schiste/Aethyme/releases{/id}",
+      "deployments_url": "https://api.github.com/repos/schiste/Aethyme/deployments"
+    }
+  },
+  "jobs": {
+    "total_count": 6,
+    "jobs": [
+      {
+        "id": 116747670020,
+        "run_id": 38830415286,
+        "workflow_name": "OSS CI",
+        "head_branch": "agent/complete-local-l1-project-binding-file-l",
+        "run_url": "https://api.github.com/repos/schiste/Aethyme/actions/runs/38830415286",
+        "run_attempt": 1,
+        "node_id": "CR_kwDOQ07FcM8AAAAbLrQSBA",
+        "head_sha": "63a3aa3e533ba466f02f1deabd36b9d3feb88985",
+        "url": "https://api.github.com/repos/schiste/Aethyme/actions/jobs/116747670020",
+        "html_url": "https://github.com/schiste/Aethyme/actions/runs/38830415286/job/116747670020",
+        "status": "completed",
+        "conclusion": "failure",
+        "created_at": "2026-10-16T00:36:20Z",
+        "started_at": "2026-10-16T00:36:23Z",
+        "completed_at": "2026-10-16T00:37:42Z",
+        "name": "Rust workspace tests",
+        "steps": [
+          {
+            "name": "Set up job",
+            "status": "completed",
+            "conclusion": "success",
+            "number": 1,
+            "started_at": "2026-10-16T00:36:24Z",
+            "completed_at": "2026-10-16T00:36:26Z"
+          },
+          {
+            "name": "Checkout",
+            "status": "completed",
+            "conclusion": "success",
+            "number": 2,
+            "started_at": "2026-10-16T00:36:26Z",
+            "completed_at": "2026-10-16T00:36:29Z"
+          },
+          {
+            "name": "Set up Rust",
+            "status": "completed",
+            "conclusion": "success",
+            "number": 3,
+            "started_at": "2026-10-16T00:36:29Z",
+            "completed_at": "2026-10-16T00:36:38Z"
+          },
+          {
+            "name": "Cache Rust build",
+            "status": "completed",
+            "conclusion": "success",
+            "number": 4,
+            "started_at": "2026-10-16T00:36:38Z",
+            "completed_at": "2026-10-16T00:36:47Z"
+          },
+          {
+            "name": "Install cargo-nextest",
+            "status": "completed",
+            "conclusion": "success",
+            "number": 5,
+            "started_at": "2026-10-16T00:36:47Z",
+            "completed_at": "2026-10-16T00:36:47Z"
+          },
+          {
+            "name": "Build the product binaries",
+            "status": "completed",
+            "conclusion": "failure",
+            "number": 6,
+            "started_at": "2026-10-16T00:36:47Z",
+            "completed_at": "2026-10-16T00:37:40Z"
+          },
+          {
+            "name": "Compile the workspace tests",
+            "status": "completed",
+            "conclusion": "skipped",
+            "number": 7,
+            "started_at": "2026-10-16T00:37:40Z",
+            "completed_at": "2026-10-16T00:37:40Z"
+          },
+          {
+            "name": "Upload the compile timings",
+            "status": "completed",
+            "conclusion": "skipped",
+            "number": 8,
+            "started_at": "2026-10-16T00:37:40Z",
+            "completed_at": "2026-10-16T00:37:40Z"
+          },
+          {
+            "name": "Run workspace tests",
+            "status": "completed",
+            "conclusion": "skipped",
+            "number": 9,
+            "started_at": "2026-10-16T00:37:40Z",
+            "completed_at": "2026-10-16T00:37:40Z"
+          },
+          {
+            "name": "Post Cache Rust build",
+            "status": "completed",
+            "conclusion": "skipped",
+            "number": 17,
+            "started_at": "2026-10-16T00:37:40Z",
+            "completed_at": "2026-10-16T00:37:40Z"
+          },
+          {
+            "name": "Post Checkout",
+            "status": "completed",
+            "conclusion": "success",
+            "number": 18,
+            "started_at": "2026-10-16T00:37:40Z",
+            "completed_at": "2026-10-16T00:37:40Z"
+          },
+          {
+            "name": "Complete job",
+            "status": "completed",
+            "conclusion": "success",
+            "number": 19,
+            "started_at": "2026-10-16T00:37:40Z",
+            "completed_at": "2026-10-16T00:37:40Z"
+          }
+        ],
+        "check_run_url": "https://api.github.com/repos/schiste/Aethyme/check-runs/116747670020",
+        "labels": [
+          "ubuntu-latest"
+        ],
+        "runner_id": 1000024007,
+        "runner_name": "GitHub Actions 1000024007",
+        "runner_group_id": 0,
+        "runner_group_name": "GitHub Actions"
+      },
+      {
+        "id": 116747670224,
+        "run_id": 38830415286,
+        "workflow_name": "OSS CI",
+        "head_branch": "agent/complete-local-l1-project-binding-file-l",
+        "run_url": "https://api.github.com/repos/schiste/Aethyme/actions/runs/38830415286",
+        "run_attempt": 1,
+        "node_id": "CR_kwDOQ07FcM8AAAAbLrQS0A",
+        "head_sha": "63a3aa3e533ba466f02f1deabd36b9d3feb88985",
+        "url": "https://api.github.com/repos/schiste/Aethyme/actions/jobs/116747670224",
+        "html_url": "https://github.com/schiste/Aethyme/actions/runs/38830415286/job/116747670224",
+        "status": "completed",
+        "conclusion": "failure",
+        "created_at": "2026-10-16T00:36:20Z",
+        "started_at": "2026-10-16T00:36:22Z",
+        "completed_at": "2026-10-16T00:37:10Z",
+        "name": "Rust examples and doctests",
+        "steps": [
+          {
+            "name": "Set up job",
+            "status": "completed",
+            "conclusion": "success",
+            "number": 1,
+            "started_at": "2026-10-16T00:36:23Z",
+            "completed_at": "2026-10-16T00:36:24Z"
+          },
+          {
+            "name": "Checkout",
+            "status": "completed",
+            "conclusion": "success",
+            "number": 2,
+            "started_at": "2026-10-16T00:36:24Z",
+            "completed_at": "2026-10-16T00:36:26Z"
+          },
+          {
+            "name": "Set up Rust",
+            "status": "completed",
+            "conclusion": "success",
+            "number": 3,
+            "started_at": "2026-10-16T00:36:26Z",
+            "completed_at": "2026-10-16T00:36:34Z"
+          },
+          {
+            "name": "Cache Rust build",
+            "status": "completed",
+            "conclusion": "success",
+            "number": 4,
+            "started_at": "2026-10-16T00:36:34Z",
+            "completed_at": "2026-10-16T00:36:40Z"
+          },
+          {
+            "name": "Run example tests",
+            "status": "completed",
+            "conclusion": "failure",
+            "number": 5,
+            "started_at": "2026-10-16T00:36:40Z",
+            "completed_at": "2026-10-16T00:37:08Z"
+          },
+          {
+            "name": "Run doctests",
+            "status": "completed",
+            "conclusion": "skipped",
+            "number": 6,
+            "started_at": "2026-10-16T00:37:08Z",
+            "completed_at": "2026-10-16T00:37:08Z"
+          },
+          {
+            "name": "Post Cache Rust build",
+            "status": "completed",
+            "conclusion": "skipped",
+            "number": 11,
+            "started_at": "2026-10-16T00:37:08Z",
+            "completed_at": "2026-10-16T00:37:08Z"
+          },
+          {
+            "name": "Post Checkout",
+            "status": "completed",
+            "conclusion": "success",
+            "number": 12,
+            "started_at": "2026-10-16T00:37:08Z",
+            "completed_at": "2026-10-16T00:37:08Z"
+          },
+          {
+            "name": "Complete job",
+            "status": "completed",
+            "conclusion": "success",
+            "number": 13,
+            "started_at": "2026-10-16T00:37:08Z",
+            "completed_at": "2026-10-16T00:37:08Z"
+          }
+        ],
+        "check_run_url": "https://api.github.com/repos/schiste/Aethyme/check-runs/116747670224",
+        "labels": [
+          "ubuntu-latest"
+        ],
+        "runner_id": 1000024008,
+        "runner_name": "GitHub Actions 1000024008",
+        "runner_group_id": 0,
+        "runner_group_name": "GitHub Actions"
+      },
+      {
+        "id": 116747670390,
+        "run_id": 38830415286,
+        "workflow_name": "OSS CI",
+        "head_branch": "agent/complete-local-l1-project-binding-file-l",
+        "run_url": "https://api.github.com/repos/schiste/Aethyme/actions/runs/38830415286",
+        "run_attempt": 1,
+        "node_id": "CR_kwDOQ07FcM8AAAAbLrQTdg",
+        "head_sha": "63a3aa3e533ba466f02f1deabd36b9d3feb88985",
+        "url": "https://api.github.com/repos/schiste/Aethyme/actions/jobs/116747670390",
+        "html_url": "https://github.com/schiste/Aethyme/actions/runs/38830415286/job/116747670390",
+        "status": "completed",
+        "conclusion": "failure",
+        "created_at": "2026-10-16T00:36:20Z",
+        "started_at": "2026-10-16T00:36:22Z",
+        "completed_at": "2026-10-16T00:39:20Z",
+        "name": "Product path (no Python on PATH)",
+        "steps": [
+          {
+            "name": "Set up job",
+            "status": "completed",
+            "conclusion": "success",
+            "number": 1,
+            "started_at": "2026-10-16T00:36:23Z",
+            "completed_at": "2026-10-16T00:36:24Z"
+          },
+          {
+            "name": "Checkout",
+            "status": "completed",
+            "conclusion": "success",
+            "number": 2,
+            "started_at": "2026-10-16T00:36:24Z",
+            "completed_at": "2026-10-16T00:36:26Z"
+          },
+          {
+            "name": "Set up Rust",
+            "status": "completed",
+            "conclusion": "success",
+            "number": 3,
+            "started_at": "2026-10-16T00:36:26Z",
+            "completed_at": "2026-10-16T00:36:36Z"
+          },
+          {
+            "name": "Cache Rust build",
+            "status": "completed",
+            "conclusion": "success",
+            "number": 4,
+            "started_at": "2026-10-16T00:36:36Z",
+            "completed_at": "2026-10-16T00:36:45Z"
+          },
+          {
+            "name": "Install the router and its sibling binaries",
+            "status": "completed",
+            "conclusion": "failure",
+            "number": 5,
+            "started_at": "2026-10-16T00:36:45Z",
+            "completed_at": "2026-10-16T00:39:18Z"
+          },
+          {
+            "name": "Exercise the product surface with no interpreter reachable",
+            "status": "completed",
+            "conclusion": "skipped",
+            "number": 6,
+            "started_at": "2026-10-16T00:39:18Z",
+            "completed_at": "2026-10-16T00:39:18Z"
+          },
+          {
+            "name": "Post Cache Rust build",
+            "status": "completed",
+            "conclusion": "skipped",
+            "number": 11,
+            "started_at": "2026-10-16T00:39:18Z",
+            "completed_at": "2026-10-16T00:39:18Z"
+          },
+          {
+            "name": "Post Checkout",
+            "status": "completed",
+            "conclusion": "success",
+            "number": 12,
+            "started_at": "2026-10-16T00:39:18Z",
+            "completed_at": "2026-10-16T00:39:18Z"
+          },
+          {
+            "name": "Complete job",
+            "status": "completed",
+            "conclusion": "success",
+            "number": 13,
+            "started_at": "2026-10-16T00:39:18Z",
+            "completed_at": "2026-10-16T00:39:18Z"
+          }
+        ],
+        "check_run_url": "https://api.github.com/repos/schiste/Aethyme/check-runs/116747670390",
+        "labels": [
+          "ubuntu-latest"
+        ],
+        "runner_id": 1000024009,
+        "runner_name": "GitHub Actions 1000024009",
+        "runner_group_id": 0,
+        "runner_group_name": "GitHub Actions"
+      },
+      {
+        "id": 116747670421,
+        "run_id": 38830415286,
+        "workflow_name": "OSS CI",
+        "head_branch": "agent/complete-local-l1-project-binding-file-l",
+        "run_url": "https://api.github.com/repos/schiste/Aethyme/actions/runs/38830415286",
+        "run_attempt": 1,
+        "node_id": "CR_kwDOQ07FcM8AAAAbLrQTlQ",
+        "head_sha": "63a3aa3e533ba466f02f1deabd36b9d3feb88985",
+        "url": "https://api.github.com/repos/schiste/Aethyme/actions/jobs/116747670421",
+        "html_url": "https://github.com/schiste/Aethyme/actions/runs/38830415286/job/116747670421",
+        "status": "completed",
+        "conclusion": "failure",
+        "created_at": "2026-10-16T00:36:20Z",
+        "started_at": "2026-10-16T00:36:23Z",
+        "completed_at": "2026-10-16T00:37:38Z",
+        "name": "Rust lint (fmt, clippy)",
+        "steps": [
+          {
+            "name": "Set up job",
+            "status": "completed",
+            "conclusion": "success",
+            "number": 1,
+            "started_at": "2026-10-16T00:36:24Z",
+            "completed_at": "2026-10-16T00:36:26Z"
+          },
+          {
+            "name": "Build EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25",
+            "status": "completed",
+            "conclusion": "success",
+            "number": 2,
+            "started_at": "2026-10-16T00:36:26Z",
+            "completed_at": "2026-10-16T00:36:46Z"
+          },
+          {
+            "name": "Checkout",
+            "status": "completed",
+            "conclusion": "success",
+            "number": 3,
+            "started_at": "2026-10-16T00:36:46Z",
+            "completed_at": "2026-10-16T00:36:48Z"
+          },
+          {
+            "name": "Set up Rust",
+            "status": "completed",
+            "conclusion": "success",
+            "number": 4,
+            "started_at": "2026-10-16T00:36:48Z",
+            "completed_at": "2026-10-16T00:36:57Z"
+          },
+          {
+            "name": "Cache Rust build",
+            "status": "completed",
+            "conclusion": "success",
+            "number": 5,
+            "started_at": "2026-10-16T00:36:57Z",
+            "completed_at": "2026-10-16T00:37:05Z"
+          },
+          {
+            "name": "Check formatting",
+            "status": "completed",
+            "conclusion": "success",
+            "number": 6,
+            "started_at": "2026-10-16T00:37:05Z",
+            "completed_at": "2026-10-16T00:37:08Z"
+          },
+          {
+            "name": "Run clippy",
+            "status": "completed",
+            "conclusion": "failure",
+            "number": 7,
+            "started_at": "2026-10-16T00:37:08Z",
+            "completed_at": "2026-10-16T00:37:35Z"
+          },
+          {
+            "name": "Check dependency advisories, licenses and sources",
+            "status": "completed",
+            "conclusion": "skipped",
+            "number": 8,
+            "started_at": "2026-10-16T00:37:35Z",
+            "completed_at": "2026-10-16T00:37:35Z"
+          },
+          {
+            "name": "Post Cache Rust build",
+            "status": "completed",
+            "conclusion": "skipped",
+            "number": 15,
+            "started_at": "2026-10-16T00:37:35Z",
+            "completed_at": "2026-10-16T00:37:35Z"
+          },
+          {
+            "name": "Post Checkout",
+            "status": "completed",
+            "conclusion": "success",
+            "number": 16,
+            "started_at": "2026-10-16T00:37:35Z",
+            "completed_at": "2026-10-16T00:37:36Z"
+          },
+          {
+            "name": "Complete job",
+            "status": "completed",
+            "conclusion": "success",
+            "number": 17,
+            "started_at": "2026-10-16T00:37:36Z",
+            "completed_at": "2026-10-16T00:37:36Z"
+          }
+        ],
+        "check_run_url": "https://api.github.com/repos/schiste/Aethyme/check-runs/116747670421",
+        "labels": [
+          "ubuntu-latest"
+        ],
+        "runner_id": 1000024010,
+        "runner_name": "GitHub Actions 1000024010",
+        "runner_group_id": 0,
+        "runner_group_name": "GitHub Actions"
+      },
+      {
+        "id": 116747671168,
+        "run_id": 38830415286,
+        "workflow_name": "OSS CI",
+        "head_branch": "agent/complete-local-l1-project-binding-file-l",
+        "run_url": "https://api.github.com/repos/schiste/Aethyme/actions/runs/38830415286",
+        "run_attempt": 1,
+        "node_id": "CR_kwDOQ07FcM8AAAAbLrQWgA",
+        "head_sha": "63a3aa3e533ba466f02f1deabd36b9d3feb88985",
+        "url": "https://api.github.com/repos/schiste/Aethyme/actions/jobs/116747671168",
+        "html_url": "https://github.com/schiste/Aethyme/actions/runs/38830415286/job/116747671168",
+        "status": "completed",
+        "conclusion": "skipped",
+        "created_at": "2026-10-16T00:36:20Z",
+        "started_at": "2026-10-16T00:36:20Z",
+        "completed_at": "2026-10-16T00:36:20Z",
+        "name": "Warm Rust cache (${{ matrix.os }})",
+        "steps": [],
+        "check_run_url": "https://api.github.com/repos/schiste/Aethyme/check-runs/116747671168",
+        "labels": [],
+        "runner_id": null,
+        "runner_name": null,
+        "runner_group_id": null,
+        "runner_group_name": null
+      },
+      {
+        "id": 116748079784,
+        "run_id": 38830415286,
+        "workflow_name": "OSS CI",
+        "head_branch": "agent/complete-local-l1-project-binding-file-l",
+        "run_url": "https://api.github.com/repos/schiste/Aethyme/actions/runs/38830415286",
+        "run_attempt": 1,
+        "node_id": "CR_kwDOQ07FcM8AAAAbLrpSqA",
+        "head_sha": "63a3aa3e533ba466f02f1deabd36b9d3feb88985",
+        "url": "https://api.github.com/repos/schiste/Aethyme/actions/jobs/116748079784",
+        "html_url": "https://github.com/schiste/Aethyme/actions/runs/38830415286/job/116748079784",
+        "status": "completed",
+        "conclusion": "skipped",
+        "created_at": "2026-10-16T00:37:43Z",
+        "started_at": "2026-10-16T00:37:43Z",
+        "completed_at": "2026-10-16T00:37:42Z",
+        "name": "Record the tested tree",
+        "steps": [],
+        "check_run_url": "https://api.github.com/repos/schiste/Aethyme/check-runs/116748079784",
+        "labels": [
+          "ubuntu-latest"
+        ],
+        "runner_id": null,
+        "runner_name": null,
+        "runner_group_id": null,
+        "runner_group_name": null
+      }
+    ]
+  },
+  "pull_request": {
+    "url": "https://api.github.com/repos/schiste/Aethyme/pulls/788",
+    "id": 4881705562,
+    "node_id": "PR_kwDOQ07FcM8AAAABIvjqWg",
+    "html_url": "https://github.com/schiste/Aethyme/pull/788",
+    "diff_url": "https://github.com/schiste/Aethyme/pull/788.diff",
+    "patch_url": "https://github.com/schiste/Aethyme/pull/788.patch",
+    "issue_url": "https://api.github.com/repos/schiste/Aethyme/issues/788",
+    "commits_url": "https://api.github.com/repos/schiste/Aethyme/pulls/788/commits",
+    "review_comments_url": "https://api.github.com/repos/schiste/Aethyme/pulls/788/comments",
+    "review_comment_url": "https://api.github.com/repos/schiste/Aethyme/pulls/comments{/number}",
+    "comments_url": "https://api.github.com/repos/schiste/Aethyme/issues/788/comments",
+    "statuses_url": "https://api.github.com/repos/schiste/Aethyme/statuses/5ebe8d315062c7db0855bfa760a0379012a51743",
+    "number": 788,
+    "state": "open",
+    "locked": false,
+    "title": "feat(local): add experimental project identity and revisions",
+    "user": {
+      "login": "schiste",
+      "id": 15890754,
+      "node_id": "MDQ6VXNlcjE1ODkwNzU0",
+      "avatar_url": "https://avatars.githubusercontent.com/u/15890754?v=4",
+      "gravatar_id": "",
+      "url": "https://api.github.com/users/schiste",
+      "html_url": "https://github.com/schiste",
+      "followers_url": "https://api.github.com/users/schiste/followers",
+      "following_url": "https://api.github.com/users/schiste/following{/other_user}",
+      "gists_url": "https://api.github.com/users/schiste/gists{/gist_id}",
+      "starred_url": "https://api.github.com/users/schiste/starred{/owner}{/repo}",
+      "subscriptions_url": "https://api.github.com/users/schiste/subscriptions",
+      "organizations_url": "https://api.github.com/users/schiste/orgs",
+      "repos_url": "https://api.github.com/users/schiste/repos",
+      "events_url": "https://api.github.com/users/schiste/events{/privacy}",
+      "received_events_url": "https://api.github.com/users/schiste/received_events",
+      "type": "User",
+      "user_view_type": "public",
+      "site_admin": false
+    },
+    "body": "## Summary\nAdd experimental Local project descriptor, FileId lineage, and immutable contribution revision contracts.\n\n## Contract\nProject identity is distinct from the host-local collaboration key. Exact content and path bytes define enrollment; rename continuity requires explicit exact-content evidence; copies, splits, and new files receive proposal-scoped IDs; uncertain rename candidates remain explicit. A revision binds project, contribution, exact base/result snapshots, source changes, and optional exact brief object bytes. These records grant no workflow authority.\n\n## Test plan\nAdded a descriptor fixture independently recomputed with Python standard-library SHA-256/canonical JSON and contract tests for clone mapping, rename/copy/split, namespace conflicts, and rationale-only revision changes. Ran rustfmt and `git diff --check`; Cargo tests were not run under the current runtime gate.\n\n## Eval impact\nNo evaluation code or fixtures changed; no evaluations were run.\n",
+    "labels": [],
+    "milestone": null,
+    "active_lock_reason": null,
+    "created_at": "2026-10-16T00:36:17Z",
+    "updated_at": "2026-10-16T00:44:46Z",
+    "closed_at": null,
+    "merged_at": null,
+    "merge_commit_sha": "78e6a1596772672f941f44790de4112eff61aee8",
+    "assignee": null,
+    "assignees": [],
+    "requested_reviewers": [],
+    "requested_teams": [],
+    "head": {
+      "label": "schiste:agent/complete-local-l1-project-binding-file-l",
+      "ref": "agent/complete-local-l1-project-binding-file-l",
+      "repo": {
+        "id": 1129235824,
+        "node_id": "R_kgDOQ07FcA",
+        "name": "Aethyme",
+        "full_name": "schiste/Aethyme",
+        "owner": {
+          "login": "schiste",
+          "id": 15890754,
+          "node_id": "MDQ6VXNlcjE1ODkwNzU0",
+          "avatar_url": "https://avatars.githubusercontent.com/u/15890754?v=4",
+          "gravatar_id": "",
+          "url": "https://api.github.com/users/schiste",
+          "html_url": "https://github.com/schiste",
+          "followers_url": "https://api.github.com/users/schiste/followers",
+          "following_url": "https://api.github.com/users/schiste/following{/other_user}",
+          "gists_url": "https://api.github.com/users/schiste/gists{/gist_id}",
+          "starred_url": "https://api.github.com/users/schiste/starred{/owner}{/repo}",
+          "subscriptions_url": "https://api.github.com/users/schiste/subscriptions",
+          "organizations_url": "https://api.github.com/users/schiste/orgs",
+          "repos_url": "https://api.github.com/users/schiste/repos",
+          "events_url": "https://api.github.com/users/schiste/events{/privacy}",
+          "received_events_url": "https://api.github.com/users/schiste/received_events",
+          "type": "User",
+          "user_view_type": "public",
+          "site_admin": false
+        },
+        "private": false,
+        "fork": false,
+        "archived": false,
+        "disabled": false,
+        "description": null,
+        "homepage": null,
+        "language": "Rust",
+        "visibility": "public",
+        "is_template": false,
+        "topics": [],
+        "forks_count": 0,
+        "forks": 0,
+        "stargazers_count": 0,
+        "watchers_count": 0,
+        "watchers": 0,
+        "open_issues_count": 144,
+        "open_issues": 144,
+        "size": 33402,
+        "default_branch": "main",
+        "has_issues": true,
+        "has_projects": true,
+        "has_wiki": false,
+        "has_pages": false,
+        "has_downloads": false,
+        "has_discussions": false,
+        "has_pull_requests": true,
+        "pushed_at": "2026-10-16T00:44:45Z",
+        "created_at": "2026-01-06T19:58:50Z",
+        "updated_at": "2026-10-08T19:19:16Z",
+        "allow_forking": true,
+        "web_commit_signoff_required": false,
+        "pull_request_creation_policy": "all",
+        "license": {
+          "key": "apache-2.0",
+          "name": "Apache License 2.0",
+          "url": "https://api.github.com/licenses/apache-2.0",
+          "spdx_id": "Apache-2.0",
+          "node_id": "MDc6TGljZW5zZTI="
+        },
+        "url": "https://api.github.com/repos/schiste/Aethyme",
+        "html_url": "https://github.com/schiste/Aethyme",
+        "archive_url": "https://api.github.com/repos/schiste/Aethyme/{archive_format}{/ref}",
+        "assignees_url": "https://api.github.com/repos/schiste/Aethyme/assignees{/user}",
+        "blobs_url": "https://api.github.com/repos/schiste/Aethyme/git/blobs{/sha}",
+        "branches_url": "https://api.github.com/repos/schiste/Aethyme/branches{/branch}",
+        "collaborators_url": "https://api.github.com/repos/schiste/Aethyme/collaborators{/collaborator}",
+        "comments_url": "https://api.github.com/repos/schiste/Aethyme/comments{/number}",
+        "commits_url": "https://api.github.com/repos/schiste/Aethyme/commits{/sha}",
+        "compare_url": "https://api.github.com/repos/schiste/Aethyme/compare/{base}...{head}",
+        "contents_url": "https://api.github.com/repos/schiste/Aethyme/contents/{+path}",
+        "contributors_url": "https://api.github.com/repos/schiste/Aethyme/contributors",
+        "deployments_url": "https://api.github.com/repos/schiste/Aethyme/deployments",
+        "downloads_url": "https://api.github.com/repos/schiste/Aethyme/downloads",
+        "events_url": "https://api.github.com/repos/schiste/Aethyme/events",
+        "forks_url": "https://api.github.com/repos/schiste/Aethyme/forks",
+        "git_commits_url": "https://api.github.com/repos/schiste/Aethyme/git/commits{/sha}",
+        "git_refs_url": "https://api.github.com/repos/schiste/Aethyme/git/refs{/sha}",
+        "git_tags_url": "https://api.github.com/repos/schiste/Aethyme/git/tags{/sha}",
+        "git_url": "git://github.com/schiste/Aethyme.git",
+        "issue_comment_url": "https://api.github.com/repos/schiste/Aethyme/issues/comments{/number}",
+        "issue_events_url": "https://api.github.com/repos/schiste/Aethyme/issues/events{/number}",
+        "issues_url": "https://api.github.com/repos/schiste/Aethyme/issues{/number}",
+        "keys_url": "https://api.github.com/repos/schiste/Aethyme/keys{/key_id}",
+        "labels_url": "https://api.github.com/repos/schiste/Aethyme/labels{/name}",
+        "languages_url": "https://api.github.com/repos/schiste/Aethyme/languages",
+        "merges_url": "https://api.github.com/repos/schiste/Aethyme/merges",
+        "milestones_url": "https://api.github.com/repos/schiste/Aethyme/milestones{/number}",
+        "notifications_url": "https://api.github.com/repos/schiste/Aethyme/notifications{?since,all,participating}",
+        "pulls_url": "https://api.github.com/repos/schiste/Aethyme/pulls{/number}",
+        "releases_url": "https://api.github.com/repos/schiste/Aethyme/releases{/id}",
+        "ssh_url": "git@github.com:schiste/Aethyme.git",
+        "stargazers_url": "https://api.github.com/repos/schiste/Aethyme/stargazers",
+        "statuses_url": "https://api.github.com/repos/schiste/Aethyme/statuses/{sha}",
+        "subscribers_url": "https://api.github.com/repos/schiste/Aethyme/subscribers",
+        "subscription_url": "https://api.github.com/repos/schiste/Aethyme/subscription",
+        "tags_url": "https://api.github.com/repos/schiste/Aethyme/tags",
+        "teams_url": "https://api.github.com/repos/schiste/Aethyme/teams",
+        "trees_url": "https://api.github.com/repos/schiste/Aethyme/git/trees{/sha}",
+        "clone_url": "https://github.com/schiste/Aethyme.git",
+        "mirror_url": null,
+        "hooks_url": "https://api.github.com/repos/schiste/Aethyme/hooks",
+        "svn_url": "https://github.com/schiste/Aethyme"
+      },
+      "sha": "5ebe8d315062c7db0855bfa760a0379012a51743",
+      "user": {
+        "login": "schiste",
+        "id": 15890754,
+        "node_id": "MDQ6VXNlcjE1ODkwNzU0",
+        "avatar_url": "https://avatars.githubusercontent.com/u/15890754?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/schiste",
+        "html_url": "https://github.com/schiste",
+        "followers_url": "https://api.github.com/users/schiste/followers",
+        "following_url": "https://api.github.com/users/schiste/following{/other_user}",
+        "gists_url": "https://api.github.com/users/schiste/gists{/gist_id}",
+        "starred_url": "https://api.github.com/users/schiste/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/schiste/subscriptions",
+        "organizations_url": "https://api.github.com/users/schiste/orgs",
+        "repos_url": "https://api.github.com/users/schiste/repos",
+        "events_url": "https://api.github.com/users/schiste/events{/privacy}",
+        "received_events_url": "https://api.github.com/users/schiste/received_events",
+        "type": "User",
+        "user_view_type": "public",
+        "site_admin": false
+      }
+    },
+    "base": {
+      "label": "schiste:agent/implement-t01-rust-typescript-canonical",
+      "ref": "agent/implement-t01-rust-typescript-canonical",
+      "repo": {
+        "id": 1129235824,
+        "node_id": "R_kgDOQ07FcA",
+        "name": "Aethyme",
+        "full_name": "schiste/Aethyme",
+        "owner": {
+          "login": "schiste",
+          "id": 15890754,
+          "node_id": "MDQ6VXNlcjE1ODkwNzU0",
+          "avatar_url": "https://avatars.githubusercontent.com/u/15890754?v=4",
+          "gravatar_id": "",
+          "url": "https://api.github.com/users/schiste",
+          "html_url": "https://github.com/schiste",
+          "followers_url": "https://api.github.com/users/schiste/followers",
+          "following_url": "https://api.github.com/users/schiste/following{/other_user}",
+          "gists_url": "https://api.github.com/users/schiste/gists{/gist_id}",
+          "starred_url": "https://api.github.com/users/schiste/starred{/owner}{/repo}",
+          "subscriptions_url": "https://api.github.com/users/schiste/subscriptions",
+          "organizations_url": "https://api.github.com/users/schiste/orgs",
+          "repos_url": "https://api.github.com/users/schiste/repos",
+          "events_url": "https://api.github.com/users/schiste/events{/privacy}",
+          "received_events_url": "https://api.github.com/users/schiste/received_events",
+          "type": "User",
+          "user_view_type": "public",
+          "site_admin": false
+        },
+        "private": false,
+        "fork": false,
+        "archived": false,
+        "disabled": false,
+        "description": null,
+        "homepage": null,
+        "language": "Rust",
+        "visibility": "public",
+        "is_template": false,
+        "topics": [],
+        "forks_count": 0,
+        "forks": 0,
+        "stargazers_count": 0,
+        "watchers_count": 0,
+        "watchers": 0,
+        "open_issues_count": 144,
+        "open_issues": 144,
+        "size": 33402,
+        "default_branch": "main",
+        "has_issues": true,
+        "has_projects": true,
+        "has_wiki": false,
+        "has_pages": false,
+        "has_downloads": false,
+        "has_discussions": false,
+        "has_pull_requests": true,
+        "pushed_at": "2026-10-16T00:44:45Z",
+        "created_at": "2026-01-06T19:58:50Z",
+        "updated_at": "2026-10-08T19:19:16Z",
+        "allow_forking": true,
+        "web_commit_signoff_required": false,
+        "pull_request_creation_policy": "all",
+        "license": {
+          "key": "apache-2.0",
+          "name": "Apache License 2.0",
+          "url": "https://api.github.com/licenses/apache-2.0",
+          "spdx_id": "Apache-2.0",
+          "node_id": "MDc6TGljZW5zZTI="
+        },
+        "url": "https://api.github.com/repos/schiste/Aethyme",
+        "html_url": "https://github.com/schiste/Aethyme",
+        "archive_url": "https://api.github.com/repos/schiste/Aethyme/{archive_format}{/ref}",
+        "assignees_url": "https://api.github.com/repos/schiste/Aethyme/assignees{/user}",
+        "blobs_url": "https://api.github.com/repos/schiste/Aethyme/git/blobs{/sha}",
+        "branches_url": "https://api.github.com/repos/schiste/Aethyme/branches{/branch}",
+        "collaborators_url": "https://api.github.com/repos/schiste/Aethyme/collaborators{/collaborator}",
+        "comments_url": "https://api.github.com/repos/schiste/Aethyme/comments{/number}",
+        "commits_url": "https://api.github.com/repos/schiste/Aethyme/commits{/sha}",
+        "compare_url": "https://api.github.com/repos/schiste/Aethyme/compare/{base}...{head}",
+        "contents_url": "https://api.github.com/repos/schiste/Aethyme/contents/{+path}",
+        "contributors_url": "https://api.github.com/repos/schiste/Aethyme/contributors",
+        "deployments_url": "https://api.github.com/repos/schiste/Aethyme/deployments",
+        "downloads_url": "https://api.github.com/repos/schiste/Aethyme/downloads",
+        "events_url": "https://api.github.com/repos/schiste/Aethyme/events",
+        "forks_url": "https://api.github.com/repos/schiste/Aethyme/forks",
+        "git_commits_url": "https://api.github.com/repos/schiste/Aethyme/git/commits{/sha}",
+        "git_refs_url": "https://api.github.com/repos/schiste/Aethyme/git/refs{/sha}",
+        "git_tags_url": "https://api.github.com/repos/schiste/Aethyme/git/tags{/sha}",
+        "git_url": "git://github.com/schiste/Aethyme.git",
+        "issue_comment_url": "https://api.github.com/repos/schiste/Aethyme/issues/comments{/number}",
+        "issue_events_url": "https://api.github.com/repos/schiste/Aethyme/issues/events{/number}",
+        "issues_url": "https://api.github.com/repos/schiste/Aethyme/issues{/number}",
+        "keys_url": "https://api.github.com/repos/schiste/Aethyme/keys{/key_id}",
+        "labels_url": "https://api.github.com/repos/schiste/Aethyme/labels{/name}",
+        "languages_url": "https://api.github.com/repos/schiste/Aethyme/languages",
+        "merges_url": "https://api.github.com/repos/schiste/Aethyme/merges",
+        "milestones_url": "https://api.github.com/repos/schiste/Aethyme/milestones{/number}",
+        "notifications_url": "https://api.github.com/repos/schiste/Aethyme/notifications{?since,all,participating}",
+        "pulls_url": "https://api.github.com/repos/schiste/Aethyme/pulls{/number}",
+        "releases_url": "https://api.github.com/repos/schiste/Aethyme/releases{/id}",
+        "ssh_url": "git@github.com:schiste/Aethyme.git",
+        "stargazers_url": "https://api.github.com/repos/schiste/Aethyme/stargazers",
+        "statuses_url": "https://api.github.com/repos/schiste/Aethyme/statuses/{sha}",
+        "subscribers_url": "https://api.github.com/repos/schiste/Aethyme/subscribers",
+        "subscription_url": "https://api.github.com/repos/schiste/Aethyme/subscription",
+        "tags_url": "https://api.github.com/repos/schiste/Aethyme/tags",
+        "teams_url": "https://api.github.com/repos/schiste/Aethyme/teams",
+        "trees_url": "https://api.github.com/repos/schiste/Aethyme/git/trees{/sha}",
+        "clone_url": "https://github.com/schiste/Aethyme.git",
+        "mirror_url": null,
+        "hooks_url": "https://api.github.com/repos/schiste/Aethyme/hooks",
+        "svn_url": "https://github.com/schiste/Aethyme"
+      },
+      "sha": "898215cb89fcd1baccfc1af167a67c66f0488060",
+      "user": {
+        "login": "schiste",
+        "id": 15890754,
+        "node_id": "MDQ6VXNlcjE1ODkwNzU0",
+        "avatar_url": "https://avatars.githubusercontent.com/u/15890754?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/schiste",
+        "html_url": "https://github.com/schiste",
+        "followers_url": "https://api.github.com/users/schiste/followers",
+        "following_url": "https://api.github.com/users/schiste/following{/other_user}",
+        "gists_url": "https://api.github.com/users/schiste/gists{/gist_id}",
+        "starred_url": "https://api.github.com/users/schiste/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/schiste/subscriptions",
+        "organizations_url": "https://api.github.com/users/schiste/orgs",
+        "repos_url": "https://api.github.com/users/schiste/repos",
+        "events_url": "https://api.github.com/users/schiste/events{/privacy}",
+        "received_events_url": "https://api.github.com/users/schiste/received_events",
+        "type": "User",
+        "user_view_type": "public",
+        "site_admin": false
+      }
+    },
+    "_links": {
+      "comments": {
+        "href": "https://api.github.com/repos/schiste/Aethyme/issues/788/comments"
+      },
+      "commits": {
+        "href": "https://api.github.com/repos/schiste/Aethyme/pulls/788/commits"
+      },
+      "statuses": {
+        "href": "https://api.github.com/repos/schiste/Aethyme/statuses/5ebe8d315062c7db0855bfa760a0379012a51743"
+      },
+      "html": {
+        "href": "https://github.com/schiste/Aethyme/pull/788"
+      },
+      "issue": {
+        "href": "https://api.github.com/repos/schiste/Aethyme/issues/788"
+      },
+      "review_comments": {
+        "href": "https://api.github.com/repos/schiste/Aethyme/pulls/788/comments"
+      },
+      "review_comment": {
+        "href": "https://api.github.com/repos/schiste/Aethyme/pulls/comments{/number}"
+      },
+      "self": {
+        "href": "https://api.github.com/repos/schiste/Aethyme/pulls/788"
+      }
+    },
+    "author_association": "OWNER",
+    "auto_merge": null,
+    "draft": true,
+    "merged": false,
+    "mergeable": true,
+    "rebaseable": true,
+    "mergeable_state": "unstable",
+    "merged_by": null,
+    "comments": 0,
+    "review_comments": 0,
+    "maintainer_can_modify": false,
+    "commits": 2,
+    "additions": 2109,
+    "deletions": 0,
+    "changed_files": 6
+  },
+  "command_capture": [
+    {
+      "name": "gh-version",
+      "argv": [
+        "gh",
+        "--version"
+      ],
+      "exit_code": 0,
+      "stdout": {
+        "path": "gh-version.stdout.txt",
+        "bytes": 81,
+        "sha256": "a679442459bed23fdc13efb977dec3b17c3c923d8d48abc0d8e522182250955f"
+      },
+      "stderr": {
+        "path": "gh-version.stderr.txt",
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    },
+    {
+      "name": "run-metadata",
+      "argv": [
+        "gh",
+        "api",
+        "repos/schiste/Aethyme/actions/runs/38830415286"
+      ],
+      "exit_code": 0,
+      "stdout": {
+        "path": "run-metadata.stdout.json",
+        "bytes": 12847,
+        "sha256": "ac4df9c6e4e25002670759d04caf8a1b78770efbf99b068288d057062dd2f415"
+      },
+      "stderr": {
+        "path": "run-metadata.stderr.txt",
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    },
+    {
+      "name": "jobs-metadata",
+      "argv": [
+        "gh",
+        "api",
+        "repos/schiste/Aethyme/actions/runs/38830415286/jobs?per_page=100"
+      ],
+      "exit_code": 0,
+      "stdout": {
+        "path": "jobs-metadata.stdout.json",
+        "bytes": 12041,
+        "sha256": "74bd0ffb97bb1b08480dbacc500dec1bb417ce22caa52faba5fed8fe80b1c53b"
+      },
+      "stderr": {
+        "path": "jobs-metadata.stderr.txt",
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    },
+    {
+      "name": "pr-metadata",
+      "argv": [
+        "gh",
+        "api",
+        "repos/schiste/Aethyme/pulls/788"
+      ],
+      "exit_code": 0,
+      "stdout": {
+        "path": "pr-metadata.stdout.json",
+        "bytes": 16301,
+        "sha256": "2535c9d018969252468d0ecc96daeb1a45fcf4c58787b9371d334ea4c6e92953"
+      },
+      "stderr": {
+        "path": "pr-metadata.stderr.txt",
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    },
+    {
+      "name": "commit-5ebe8d315062c7db0855bfa760a0379012a51743",
+      "argv": [
+        "gh",
+        "api",
+        "repos/schiste/Aethyme/git/commits/5ebe8d315062c7db0855bfa760a0379012a51743"
+      ],
+      "exit_code": 0,
+      "stdout": {
+        "path": "commit-5ebe8d315062c7db0855bfa760a0379012a51743.stdout.json",
+        "bytes": 1998,
+        "sha256": "29b00d8d1c1b7a063bb841eb3a574be9d03a5ca1a40142450f91dfce26edfa93"
+      },
+      "stderr": {
+        "path": "commit-5ebe8d315062c7db0855bfa760a0379012a51743.stderr.txt",
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    },
+    {
+      "name": "commit-rest-5ebe8d315062c7db0855bfa760a0379012a51743",
+      "argv": [
+        "gh",
+        "api",
+        "repos/schiste/Aethyme/commits/5ebe8d315062c7db0855bfa760a0379012a51743"
+      ],
+      "exit_code": 0,
+      "stdout": {
+        "path": "commit-rest-5ebe8d315062c7db0855bfa760a0379012a51743.stdout.json",
+        "bytes": 34541,
+        "sha256": "4ff6330378b773b71a75d40db30397bd68d95ab1786ff2f823a7d88c81e0e282"
+      },
+      "stderr": {
+        "path": "commit-rest-5ebe8d315062c7db0855bfa760a0379012a51743.stderr.txt",
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    },
+    {
+      "name": "commit-63a3aa3e533ba466f02f1deabd36b9d3feb88985",
+      "argv": [
+        "gh",
+        "api",
+        "repos/schiste/Aethyme/git/commits/63a3aa3e533ba466f02f1deabd36b9d3feb88985"
+      ],
+      "exit_code": 0,
+      "stdout": {
+        "path": "commit-63a3aa3e533ba466f02f1deabd36b9d3feb88985.stdout.json",
+        "bytes": 1804,
+        "sha256": "25872dfdf9e5b182df5be30f401b8261d81f2a7bd193f2d79f14528154be4f15"
+      },
+      "stderr": {
+        "path": "commit-63a3aa3e533ba466f02f1deabd36b9d3feb88985.stderr.txt",
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    },
+    {
+      "name": "commit-rest-63a3aa3e533ba466f02f1deabd36b9d3feb88985",
+      "argv": [
+        "gh",
+        "api",
+        "repos/schiste/Aethyme/commits/63a3aa3e533ba466f02f1deabd36b9d3feb88985"
+      ],
+      "exit_code": 0,
+      "stdout": {
+        "path": "commit-rest-63a3aa3e533ba466f02f1deabd36b9d3feb88985.stdout.json",
+        "bytes": 82284,
+        "sha256": "008eac7be0c286301fb87039a42578c7cc1e1b9d6fdcfebea2c2e40142ab5708"
+      },
+      "stderr": {
+        "path": "commit-rest-63a3aa3e533ba466f02f1deabd36b9d3feb88985.stderr.txt",
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    },
+    {
+      "name": "commit-898215cb89fcd1baccfc1af167a67c66f0488060",
+      "argv": [
+        "gh",
+        "api",
+        "repos/schiste/Aethyme/git/commits/898215cb89fcd1baccfc1af167a67c66f0488060"
+      ],
+      "exit_code": 0,
+      "stdout": {
+        "path": "commit-898215cb89fcd1baccfc1af167a67c66f0488060.stdout.json",
+        "bytes": 1722,
+        "sha256": "ab0f3523480ae45e099d7182db3f5b9d226ee23ce887c6a2bbc8b385d59bd088"
+      },
+      "stderr": {
+        "path": "commit-898215cb89fcd1baccfc1af167a67c66f0488060.stderr.txt",
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    },
+    {
+      "name": "commit-rest-898215cb89fcd1baccfc1af167a67c66f0488060",
+      "argv": [
+        "gh",
+        "api",
+        "repos/schiste/Aethyme/commits/898215cb89fcd1baccfc1af167a67c66f0488060"
+      ],
+      "exit_code": 0,
+      "stdout": {
+        "path": "commit-rest-898215cb89fcd1baccfc1af167a67c66f0488060.stdout.json",
+        "bytes": 7941,
+        "sha256": "82c7d7ce927257f59eb0632e4210274ea454e510be1bbc19860fc2ba78a27f6d"
+      },
+      "stderr": {
+        "path": "commit-rest-898215cb89fcd1baccfc1af167a67c66f0488060.stderr.txt",
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    },
+    {
+      "name": "run-log-archive",
+      "argv": [
+        "gh",
+        "api",
+        "repos/schiste/Aethyme/actions/runs/38830415286/logs"
+      ],
+      "exit_code": 0,
+      "stdout": {
+        "path": "run-log-archive.stdout.zip",
+        "bytes": 154880,
+        "sha256": "0ca2162c7906d2a38e4c3525b4ec255321abf16b17922a6042e55068866790e6"
+      },
+      "stderr": {
+        "path": "run-log-archive.stderr.txt",
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    },
+    {
+      "name": "job-116747670020-metadata",
+      "argv": [
+        "gh",
+        "api",
+        "repos/schiste/Aethyme/actions/jobs/116747670020"
+      ],
+      "exit_code": 0,
+      "stdout": {
+        "path": "job-116747670020-metadata.stdout.json",
+        "bytes": 2822,
+        "sha256": "2f40fe8489ec0f2742c91e9b062b51e52c9222c807c051de37ef51b4bb1658f3"
+      },
+      "stderr": {
+        "path": "job-116747670020-metadata.stderr.txt",
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    },
+    {
+      "name": "job-116747670020-logs",
+      "argv": [
+        "gh",
+        "api",
+        "repos/schiste/Aethyme/actions/jobs/116747670020/logs"
+      ],
+      "exit_code": 1,
+      "stdout": {
+        "path": "job-116747670020-logs.stdout.zip",
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "stderr": {
+        "path": "job-116747670020-logs.stderr.txt",
+        "bytes": 99,
+        "sha256": "8b6407b2fdbca54bf3d53fb93e79a3560dbe59567fa5044cfee4bed1b5b6e467"
+      }
+    },
+    {
+      "name": "job-116747670224-metadata",
+      "argv": [
+        "gh",
+        "api",
+        "repos/schiste/Aethyme/actions/jobs/116747670224"
+      ],
+      "exit_code": 0,
+      "stdout": {
+        "path": "job-116747670224-metadata.stdout.json",
+        "bytes": 2315,
+        "sha256": "f8e5f0ea9287114e77b23531ecb42c9ec2e5f9a9c6d719db274fbdf2d8bafc69"
+      },
+      "stderr": {
+        "path": "job-116747670224-metadata.stderr.txt",
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    },
+    {
+      "name": "job-116747670224-logs",
+      "argv": [
+        "gh",
+        "api",
+        "repos/schiste/Aethyme/actions/jobs/116747670224/logs"
+      ],
+      "exit_code": 1,
+      "stdout": {
+        "path": "job-116747670224-logs.stdout.zip",
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "stderr": {
+        "path": "job-116747670224-logs.stderr.txt",
+        "bytes": 99,
+        "sha256": "8b6407b2fdbca54bf3d53fb93e79a3560dbe59567fa5044cfee4bed1b5b6e467"
+      }
+    },
+    {
+      "name": "job-116747670390-metadata",
+      "argv": [
+        "gh",
+        "api",
+        "repos/schiste/Aethyme/actions/jobs/116747670390"
+      ],
+      "exit_code": 0,
+      "stdout": {
+        "path": "job-116747670390-metadata.stdout.json",
+        "bytes": 2393,
+        "sha256": "9fc0a0ebcada24a33242ee23ae5ca5dd1f644364b0b9145f35fc5a418dce6354"
+      },
+      "stderr": {
+        "path": "job-116747670390-metadata.stderr.txt",
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    },
+    {
+      "name": "job-116747670390-logs",
+      "argv": [
+        "gh",
+        "api",
+        "repos/schiste/Aethyme/actions/jobs/116747670390/logs"
+      ],
+      "exit_code": 1,
+      "stdout": {
+        "path": "job-116747670390-logs.stdout.zip",
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "stderr": {
+        "path": "job-116747670390-logs.stderr.txt",
+        "bytes": 99,
+        "sha256": "8b6407b2fdbca54bf3d53fb93e79a3560dbe59567fa5044cfee4bed1b5b6e467"
+      }
+    },
+    {
+      "name": "job-116747670421-metadata",
+      "argv": [
+        "gh",
+        "api",
+        "repos/schiste/Aethyme/actions/jobs/116747670421"
+      ],
+      "exit_code": 0,
+      "stdout": {
+        "path": "job-116747670421-metadata.stdout.json",
+        "bytes": 2718,
+        "sha256": "e77a269f3520050b1e6dd1be7573d64f416211f46c714359d5cbfe17bd8d059f"
+      },
+      "stderr": {
+        "path": "job-116747670421-metadata.stderr.txt",
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    },
+    {
+      "name": "job-116747670421-logs",
+      "argv": [
+        "gh",
+        "api",
+        "repos/schiste/Aethyme/actions/jobs/116747670421/logs"
+      ],
+      "exit_code": 1,
+      "stdout": {
+        "path": "job-116747670421-logs.stdout.zip",
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "stderr": {
+        "path": "job-116747670421-logs.stderr.txt",
+        "bytes": 99,
+        "sha256": "8b6407b2fdbca54bf3d53fb93e79a3560dbe59567fa5044cfee4bed1b5b6e467"
+      }
+    },
+    {
+      "name": "job-116747671168-metadata",
+      "argv": [
+        "gh",
+        "api",
+        "repos/schiste/Aethyme/actions/jobs/116747671168"
+      ],
+      "exit_code": 0,
+      "stdout": {
+        "path": "job-116747671168-metadata.stdout.json",
+        "bytes": 879,
+        "sha256": "6f26a51477a85b86dc24a253a41f172ed8934cbb9f1f5a09fe1f80b9d57f0f64"
+      },
+      "stderr": {
+        "path": "job-116747671168-metadata.stderr.txt",
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    },
+    {
+      "name": "job-116747671168-logs",
+      "argv": [
+        "gh",
+        "api",
+        "repos/schiste/Aethyme/actions/jobs/116747671168/logs"
+      ],
+      "exit_code": 1,
+      "stdout": {
+        "path": "job-116747671168-logs.stdout.zip",
+        "bytes": 215,
+        "sha256": "8d27e5ee983da64ad4bff257f5f518339dad52a5afccee35d15b8a93e61653fc"
+      },
+      "stderr": {
+        "path": "job-116747671168-logs.stderr.txt",
+        "bytes": 13,
+        "sha256": "6c5ec582d3b25e97273d17fd4088d0e13837c8384ee94aba555afc35856ec3ae"
+      }
+    },
+    {
+      "name": "job-116748079784-metadata",
+      "argv": [
+        "gh",
+        "api",
+        "repos/schiste/Aethyme/actions/jobs/116748079784"
+      ],
+      "exit_code": 0,
+      "stdout": {
+        "path": "job-116748079784-metadata.stdout.json",
+        "bytes": 882,
+        "sha256": "d9eadf9026e0f72bf695654d3406f422d44409b38a2cc9d3e158f27850f6c965"
+      },
+      "stderr": {
+        "path": "job-116748079784-metadata.stderr.txt",
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    },
+    {
+      "name": "job-116748079784-logs",
+      "argv": [
+        "gh",
+        "api",
+        "repos/schiste/Aethyme/actions/jobs/116748079784/logs"
+      ],
+      "exit_code": 1,
+      "stdout": {
+        "path": "job-116748079784-logs.stdout.zip",
+        "bytes": 215,
+        "sha256": "2de663e581177826121f2da8b0b7add547063f21277a964027b0bed35578f7b5"
+      },
+      "stderr": {
+        "path": "job-116748079784-logs.stderr.txt",
+        "bytes": 13,
+        "sha256": "6c5ec582d3b25e97273d17fd4088d0e13837c8384ee94aba555afc35856ec3ae"
+      }
+    },
+    {
+      "name": "gh-run-full-log-view",
+      "argv": [
+        "gh",
+        "run",
+        "view",
+        "38830415286",
+        "--repo",
+        "schiste/Aethyme",
+        "--log"
+      ],
+      "exit_code": 0,
+      "stdout": {
+        "path": "gh-run-full-log-view.stdout.txt",
+        "bytes": 542182,
+        "sha256": "4355a4cc8d9594d6d7275dc2bc41424a3dbf29afb0fdb076fa93d535d2528dd7"
+      },
+      "stderr": {
+        "path": "gh-run-full-log-view.stderr.txt",
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    }
+  ],
+  "limitations": "Each command stdout/stderr is retained byte-for-byte; nonzero exits and HTTP errors are preserved in the command record and stderr file."
+}

@@ -1,0 +1,4 @@
+{
+  "canonical": "{\"schema\":\"aethyme.source-transport-receipt/provisional-v0\",\"spec\":{\"commit\":\"3333333333333333333333333333333333333333\",\"content_checked\":true,\"destination\":\"refs/heads/candidate\",\"intent\":\"sha256:1111111111111111111111111111111111111111111111111111111111111111\",\"observation\":\"available\",\"observed_oid\":\"3333333333333333333333333333333333333333\",\"peer\":\"github.com/playground/local-fixture\",\"profile\":\"aethyme.source-transport.git/provisional-v0\",\"read_operation\":18,\"read_outcome\":\"succeeded\",\"source\":\"sha256:2222222222222222222222222222222222222222222222222222222222222222\",\"tree\":\"4444444444444444444444444444444444444444\",\"write_operation\":17,\"write_outcome\":\"succeeded\"}}",
+  "id": "sha256:a53d014c20d05e6e391b09ca34aef91b187026b1b85e1c04deeae4c4f59da2e0"
+}

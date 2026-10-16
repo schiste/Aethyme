@@ -1,0 +1,15 @@
+{
+  "argv": [
+    "gh",
+    "run",
+    "view",
+    "38834487227",
+    "--repo",
+    "schiste/Aethyme",
+    "--job",
+    "116760424917",
+    "--log"
+  ],
+  "exit_status": 0,
+  "captured_at_utc": "2026-10-16T01:34:36.240658+00:00"
+}

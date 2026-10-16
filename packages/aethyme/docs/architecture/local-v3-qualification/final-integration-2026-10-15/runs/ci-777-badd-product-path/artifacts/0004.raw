@@ -1,0 +1,36 @@
+{
+  "captured_at": "2026-10-15T23:36:01.770150+00:00",
+  "head": "badd670065871f1c02755be2c3e427f375f3c248",
+  "files": [
+    {
+      "path": "target/local-resume/ci-badd-productpath-20261015/job.stdout",
+      "bytes": 2392,
+      "sha256": "e8334482827d29e3ce2ae77786d9efc5ff399ba9690d2c1f1c861396aa3edf1a"
+    },
+    {
+      "path": "target/local-resume/ci-badd-productpath-20261015/job.stderr",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "target/local-resume/ci-badd-productpath-20261015/workflow.stdout",
+      "bytes": 12185,
+      "sha256": "fd2e9e288057bf66d73389b7c2ac88dd9c0c5e8a3f0593bc2d4dc24db78b31e7"
+    },
+    {
+      "path": "target/local-resume/ci-badd-productpath-20261015/workflow.stderr",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "target/local-resume/ci-badd-productpath-20261015/log.stdout",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "target/local-resume/ci-badd-productpath-20261015/log.stderr",
+      "bytes": 99,
+      "sha256": "8b6407b2fdbca54bf3d53fb93e79a3560dbe59567fa5044cfee4bed1b5b6e467"
+    }
+  ]
+}

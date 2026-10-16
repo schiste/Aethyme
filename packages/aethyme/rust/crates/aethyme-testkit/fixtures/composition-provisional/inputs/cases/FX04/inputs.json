@@ -1,0 +1,42 @@
+{
+  "schema": "aethyme.composition-inputs/provisional-v0",
+  "case": "FX04",
+  "trees": {
+    "t0": {
+      "accepted": true
+    }
+  },
+  "contributions": [
+    {
+      "id": "c1",
+      "base": "tree:t0"
+    },
+    {
+      "id": "c2",
+      "base": "tree:t0"
+    }
+  ],
+  "scenarios": [
+    {
+      "id": "s1",
+      "baseline": "t0",
+      "request": {
+        "compose": [
+          "c1",
+          "c2"
+        ]
+      },
+      "orders": [
+        [
+          "c1",
+          "c2"
+        ],
+        [
+          "c2",
+          "c1"
+        ]
+      ],
+      "commutative": true
+    }
+  ]
+}

@@ -1,0 +1,270 @@
+[
+  {
+    "pr": 788,
+    "exit": 0,
+    "stderr": "",
+    "baseRefName": "agent/implement-t01-rust-typescript-canonical",
+    "headRefOid": "9dde57f0f4f71552e35ff96ce47110f46240d494",
+    "isDraft": true,
+    "number": 788,
+    "state": "OPEN",
+    "statusCheckRollup": [
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-10-16T03:43:16Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/schiste/Aethyme/actions/runs/38846356042/job/116797665868",
+        "name": "Product path (no Python on PATH)",
+        "startedAt": "2026-10-16T03:36:27Z",
+        "status": "COMPLETED",
+        "workflowName": "OSS CI"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-10-16T03:47:33Z",
+        "conclusion": "FAILURE",
+        "detailsUrl": "https://github.com/schiste/Aethyme/actions/runs/38846356042/job/116797664997",
+        "name": "Rust workspace tests",
+        "startedAt": "2026-10-16T03:36:27Z",
+        "status": "COMPLETED",
+        "workflowName": "OSS CI"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-10-16T03:38:45Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/schiste/Aethyme/actions/runs/38846356042/job/116797665157",
+        "name": "Rust examples and doctests",
+        "startedAt": "2026-10-16T03:36:27Z",
+        "status": "COMPLETED",
+        "workflowName": "OSS CI"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-10-16T03:36:24Z",
+        "conclusion": "SKIPPED",
+        "detailsUrl": "https://github.com/schiste/Aethyme/actions/runs/38846356042/job/116797665976",
+        "name": "Warm Rust cache (${{ matrix.os }})",
+        "startedAt": "2026-10-16T03:36:24Z",
+        "status": "COMPLETED",
+        "workflowName": "OSS CI"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-10-16T03:38:45Z",
+        "conclusion": "FAILURE",
+        "detailsUrl": "https://github.com/schiste/Aethyme/actions/runs/38846356042/job/116797665145",
+        "name": "Rust lint (fmt, clippy)",
+        "startedAt": "2026-10-16T03:36:27Z",
+        "status": "COMPLETED",
+        "workflowName": "OSS CI"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-10-16T03:47:33Z",
+        "conclusion": "SKIPPED",
+        "detailsUrl": "https://github.com/schiste/Aethyme/actions/runs/38846356042/job/116800541243",
+        "name": "Record the tested tree",
+        "startedAt": "2026-10-16T03:47:34Z",
+        "status": "COMPLETED",
+        "workflowName": "OSS CI"
+      }
+    ]
+  },
+  {
+    "pr": 789,
+    "exit": 0,
+    "stderr": "",
+    "baseRefName": "agent/complete-local-l1-project-binding-file-l",
+    "headRefOid": "1ec6bf95d6435fd4793a8abf3d4c98f11ddbfbc0",
+    "isDraft": true,
+    "number": 789,
+    "state": "OPEN",
+    "statusCheckRollup": [
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-10-16T03:53:17Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/schiste/Aethyme/actions/runs/38847041017/job/116800213229",
+        "name": "Product path (no Python on PATH)",
+        "startedAt": "2026-10-16T03:46:19Z",
+        "status": "COMPLETED",
+        "workflowName": "OSS CI"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-10-16T03:46:45Z",
+        "conclusion": "FAILURE",
+        "detailsUrl": "https://github.com/schiste/Aethyme/actions/runs/38847041017/job/116800213151",
+        "name": "Rust workspace tests",
+        "startedAt": "2026-10-16T03:46:19Z",
+        "status": "COMPLETED",
+        "workflowName": "OSS CI"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-10-16T03:49:08Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/schiste/Aethyme/actions/runs/38847041017/job/116800213259",
+        "name": "Rust examples and doctests",
+        "startedAt": "2026-10-16T03:46:19Z",
+        "status": "COMPLETED",
+        "workflowName": "OSS CI"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-10-16T03:46:16Z",
+        "conclusion": "SKIPPED",
+        "detailsUrl": "https://github.com/schiste/Aethyme/actions/runs/38847041017/job/116800213849",
+        "name": "Warm Rust cache (${{ matrix.os }})",
+        "startedAt": "2026-10-16T03:46:16Z",
+        "status": "COMPLETED",
+        "workflowName": "OSS CI"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-10-16T03:47:02Z",
+        "conclusion": "FAILURE",
+        "detailsUrl": "https://github.com/schiste/Aethyme/actions/runs/38847041017/job/116800212992",
+        "name": "Rust lint (fmt, clippy)",
+        "startedAt": "2026-10-16T03:46:19Z",
+        "status": "COMPLETED",
+        "workflowName": "OSS CI"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-10-16T03:49:08Z",
+        "conclusion": "SKIPPED",
+        "detailsUrl": "https://github.com/schiste/Aethyme/actions/runs/38847041017/job/116800947414",
+        "name": "Record the tested tree",
+        "startedAt": "2026-10-16T03:49:08Z",
+        "status": "COMPLETED",
+        "workflowName": "OSS CI"
+      }
+    ]
+  },
+  {
+    "pr": 790,
+    "exit": 0,
+    "stderr": "",
+    "baseRefName": "agent/complete-local-l1-project-binding-file-l",
+    "headRefOid": "a6b34828cb657364ed255269f056001ff581bc96",
+    "isDraft": true,
+    "number": 790,
+    "state": "OPEN",
+    "statusCheckRollup": [
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-10-16T03:53:38Z",
+        "conclusion": "FAILURE",
+        "detailsUrl": "https://github.com/schiste/Aethyme/actions/runs/38847165787/job/116800381307",
+        "name": "Product path (no Python on PATH)",
+        "startedAt": "2026-10-16T03:46:59Z",
+        "status": "COMPLETED",
+        "workflowName": "OSS CI"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "0001-01-01T00:00:00Z",
+        "conclusion": "",
+        "detailsUrl": "https://github.com/schiste/Aethyme/actions/runs/38847165787/job/116800381168",
+        "name": "Rust workspace tests",
+        "startedAt": "2026-10-16T03:46:59Z",
+        "status": "IN_PROGRESS",
+        "workflowName": "OSS CI"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-10-16T03:49:51Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/schiste/Aethyme/actions/runs/38847165787/job/116800381374",
+        "name": "Rust examples and doctests",
+        "startedAt": "2026-10-16T03:46:59Z",
+        "status": "COMPLETED",
+        "workflowName": "OSS CI"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-10-16T03:46:56Z",
+        "conclusion": "SKIPPED",
+        "detailsUrl": "https://github.com/schiste/Aethyme/actions/runs/38847165787/job/116800382159",
+        "name": "Warm Rust cache (${{ matrix.os }})",
+        "startedAt": "2026-10-16T03:46:56Z",
+        "status": "COMPLETED",
+        "workflowName": "OSS CI"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-10-16T03:47:45Z",
+        "conclusion": "FAILURE",
+        "detailsUrl": "https://github.com/schiste/Aethyme/actions/runs/38847165787/job/116800381407",
+        "name": "Rust lint (fmt, clippy)",
+        "startedAt": "2026-10-16T03:46:59Z",
+        "status": "COMPLETED",
+        "workflowName": "OSS CI"
+      }
+    ]
+  },
+  {
+    "pr": 791,
+    "exit": 0,
+    "stderr": "",
+    "baseRefName": "agent/complete-local-l1-project-binding-file-l",
+    "headRefOid": "75ee20385b85529ea427e4fcd784727e8776c973",
+    "isDraft": true,
+    "number": 791,
+    "state": "OPEN",
+    "statusCheckRollup": [
+      {
+        "__typename": "CheckRun",
+        "completedAt": "0001-01-01T00:00:00Z",
+        "conclusion": "",
+        "detailsUrl": "https://github.com/schiste/Aethyme/actions/runs/38847601512/job/116801647642",
+        "name": "Product path (no Python on PATH)",
+        "startedAt": "2026-10-16T03:51:52Z",
+        "status": "IN_PROGRESS",
+        "workflowName": "OSS CI"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "0001-01-01T00:00:00Z",
+        "conclusion": "",
+        "detailsUrl": "https://github.com/schiste/Aethyme/actions/runs/38847601512/job/116801647773",
+        "name": "Rust workspace tests",
+        "startedAt": "2026-10-16T03:51:52Z",
+        "status": "IN_PROGRESS",
+        "workflowName": "OSS CI"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "0001-01-01T00:00:00Z",
+        "conclusion": "",
+        "detailsUrl": "https://github.com/schiste/Aethyme/actions/runs/38847601512/job/116801647351",
+        "name": "Rust examples and doctests",
+        "startedAt": "2026-10-16T03:51:51Z",
+        "status": "IN_PROGRESS",
+        "workflowName": "OSS CI"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-10-16T03:51:49Z",
+        "conclusion": "SKIPPED",
+        "detailsUrl": "https://github.com/schiste/Aethyme/actions/runs/38847601512/job/116801648253",
+        "name": "Warm Rust cache (${{ matrix.os }})",
+        "startedAt": "2026-10-16T03:51:49Z",
+        "status": "COMPLETED",
+        "workflowName": "OSS CI"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-10-16T03:53:32Z",
+        "conclusion": "FAILURE",
+        "detailsUrl": "https://github.com/schiste/Aethyme/actions/runs/38847601512/job/116801647699",
+        "name": "Rust lint (fmt, clippy)",
+        "startedAt": "2026-10-16T03:51:51Z",
+        "status": "COMPLETED",
+        "workflowName": "OSS CI"
+      }
+    ]
+  }
+]

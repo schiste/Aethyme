@@ -1,0 +1,73 @@
+#!/bin/bash
+set -euo pipefail
+
+aq0_worktree='/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/implement-experimental-d39-t66-scoped-sy'
+aq0_source='packages/aethyme/rust/crates/aethyme-broker/src/experimental_symbol_mapping.rs'
+aq0_test='packages/aethyme/rust/crates/aethyme-broker/tests/symbol_identity_binding.rs'
+aq0_expected_source='0263ad2f61841f041faded9780f2046cdd28cc5485deb1a57752a0c722d7604f'
+aq0_expected_test='24222dc71132d8593ab2a3e9dafbbfc1e54ffff682868c673c5e5cdd037c82b0'
+aq0_patch="$1"
+aq0_label="$2"
+aq0_log="/private/tmp/aq0-02510377-mutant-${aq0_label}.txt"
+aq0_restore_log="/private/tmp/aq0-02510377-mutant-${aq0_label}-restore.txt"
+
+cd "$aq0_worktree"
+aq0_source_before=$(shasum -a 256 "$aq0_source" | awk '{print $1}')
+aq0_test_before=$(shasum -a 256 "$aq0_test" | awk '{print $1}')
+if [[ "$aq0_source_before" != "$aq0_expected_source" || "$aq0_test_before" != "$aq0_expected_test" ]]; then
+  printf 'BASELINE HASH MISMATCH source=%s test=%s\n' "$aq0_source_before" "$aq0_test_before" >&2
+  exit 80
+fi
+if ! git diff --quiet -- "$aq0_source" "$aq0_test"; then
+  printf 'TARGETS DIRTY BEFORE MUTANT\n' >&2
+  exit 81
+fi
+
+aq0_source_mtime_before=$(stat -f %m "$aq0_source")
+aq0_backup=$(mktemp "/private/tmp/aq0-02510377-${aq0_label}.source.XXXXXX")
+cp "$aq0_source" "$aq0_backup"
+
+aq0_restore() {
+  aq0_status=$?
+  trap - EXIT HUP INT TERM
+  cp "$aq0_backup" "$aq0_source" || exit 90
+  touch "$aq0_source" || exit 91
+  aq0_restored_source=$(shasum -a 256 "$aq0_source" | awk '{print $1}')
+  aq0_restored_test=$(shasum -a 256 "$aq0_test" | awk '{print $1}')
+  aq0_restored_mtime=$(stat -f %m "$aq0_source")
+  {
+    printf 'RESTORED_SOURCE_SHA=%s\n' "$aq0_restored_source"
+    printf 'RESTORED_TEST_SHA=%s\n' "$aq0_restored_test"
+    printf 'RESTORED_SOURCE_MTIME=%s\n' "$aq0_restored_mtime"
+    printf 'BASELINE_SOURCE_MTIME=%s\n' "$aq0_source_mtime_before"
+  } | tee "$aq0_restore_log"
+  if [[ "$aq0_restored_source" != "$aq0_expected_source" || "$aq0_restored_test" != "$aq0_expected_test" ]]; then
+    aq0_status=92
+  fi
+  if ! git diff --exit-code -- "$aq0_source" "$aq0_test"; then
+    aq0_status=93
+  fi
+  rm -f "$aq0_backup"
+  exit "$aq0_status"
+}
+trap aq0_restore EXIT HUP INT TERM
+
+git apply --check "$aq0_patch"
+git apply "$aq0_patch"
+touch "$aq0_source"
+aq0_mutant_source=$(shasum -a 256 "$aq0_source" | awk '{print $1}')
+printf 'BASE_SOURCE_SHA=%s\nMUTANT_SOURCE_SHA=%s\nPATCH=%s\n' "$aq0_expected_source" "$aq0_mutant_source" "$aq0_patch"
+printf 'SOURCE_MTIME_BEFORE=%s\nSOURCE_MTIME_MUTANT=%s\n' "$aq0_source_mtime_before" "$(stat -f %m "$aq0_source")"
+set +e
+env -i PATH=/Users/christophehenner/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin HOME=/Users/christophehenner CARGO_HOME=/Users/christophehenner/.cargo RUSTUP_HOME=/Users/christophehenner/.rustup TMPDIR=/private/tmp CARGO_INCREMENTAL=0 CARGO_TARGET_DIR='/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/integrate-reviewed-local-bare-git-servic/target/local-resume/cargo' cargo test --locked -j4 --manifest-path packages/aethyme/rust/Cargo.toml -p aethyme-broker --test symbol_identity_binding mismatched_or_incomplete_mapping_records_never_establish 2>&1 | tee "$aq0_log"
+aq0_test_rc=${PIPESTATUS[0]}
+set -e
+printf 'MUTANT_TEST_EXIT=%s\n' "$aq0_test_rc"
+if [[ "$aq0_test_rc" -ne 101 ]]; then
+  printf 'UNEXPECTED_MUTANT_EXIT=%s\n' "$aq0_test_rc" >&2
+  exit 94
+fi
+if ! rg -q 'test result: FAILED\. 0 passed; 1 failed;' "$aq0_log"; then
+  printf 'EXPECTED_SINGLE_ASSERTION_FAILURE_NOT_FOUND\n' >&2
+  exit 95
+fi

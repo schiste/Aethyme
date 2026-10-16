@@ -1,0 +1,5 @@
+{
+  "origin": "Independent Node JSON canonicalization and crypto SHA-256, ASCII-only vector",
+  "canonical": "{\"issuer\":\"appointed\",\"schema\":\"aethyme.target-revision/provisional-v0\",\"spec\":{\"acceptance_policy\":\"sha256:4444444444444444444444444444444444444444444444444444444444444444\",\"baseline\":\"sha256:0000000000000000000000000000000000000000000000000000000000000000\",\"composer_profile\":\"text/provisional\",\"contributions\":[{\"derived_from\":[],\"id\":\"A\",\"lineage\":\"sha256:2222222222222222222222222222222222222222222222222222222222222222\",\"requires\":[]}],\"objective\":\"combine A\",\"objective_authorization\":\"sha256:1111111111111111111111111111111111111111111111111111111111111111\",\"requirements\":[\"sha256:3333333333333333333333333333333333333333333333333333333333333333\"],\"selected\":[\"A\"]},\"target\":\"example\"}",
+  "id": "sha256:9b722820d54e2a8c778d08c597d5d9b6e999e185685c565083ec19fc5f4d1b34"
+}

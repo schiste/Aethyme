@@ -1,0 +1,25 @@
+{
+  "schema": "aethyme.local-ci-command-result/v1",
+  "id": "ci-785-8387-workspace-cancelled",
+  "pr": 785,
+  "branch_head": "8387fd9f78e53c5a66c76938b10020b67c3cdbe6",
+  "ci_checkout_commit": "31501311435e1d9fc534e18996df0d69049633e6",
+  "ci_checkout_tree": "eb89e29c54256b10463f5fb3de1ddea66790df44",
+  "ci_checkout_parents": [
+    "8daffab2bb80ae0cce8286c530d70fad42c033f5",
+    "8387fd9f78e53c5a66c76938b10020b67c3cdbe6"
+  ],
+  "job_url": "https://github.com/schiste/Aethyme/actions/runs/38803465516/job/116658462789",
+  "conclusion": "CANCELLED",
+  "numeric_exit": null,
+  "test_commands_completed": 0,
+  "failure": "Workspace command cancelled before completion. Eight distinct first-attempt failures comprise six view-residual assertions, terminal view cleanup and synthetic-token composite. Retries remain in the raw log. No completed-suite denominator or passing command credit.",
+  "credited_as_passing_command": false,
+  "log_sha256": "1a164d791b6670ee2996f031a140388dcfaf56726c3bf3c941943c2bee55c4f7",
+  "scope": "Actual GitHub merge-ref checkout and complete original raw log; no credit for later source.",
+  "observed_distinct_first_attempt_failures": 8,
+  "tests_run": null,
+  "tests_passed": null,
+  "tests_failed": null,
+  "tests_skipped": null
+}

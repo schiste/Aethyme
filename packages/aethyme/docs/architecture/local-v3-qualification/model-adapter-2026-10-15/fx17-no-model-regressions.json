@@ -1,0 +1,53 @@
+{
+  "schema": "aethyme.local-check/v1",
+  "state": "complete",
+  "started_at_utc": "2026-10-15T09:30:24.008466+00:00",
+  "command": [
+    "/usr/bin/caffeinate",
+    "-i",
+    "/opt/homebrew/bin/uv",
+    "--cache-dir",
+    "/private/tmp/aethyme-fx17-pytest-e6e3109a-20261015/uv-cache",
+    "run",
+    "--offline",
+    "--no-project",
+    "--with",
+    "pytest",
+    "--",
+    "python",
+    "-m",
+    "pytest",
+    "-q",
+    "-p",
+    "no:cacheprovider",
+    "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/682-reconcile-final-local-qualification/packages/aethyme-eval/tests/test_fx17_model_protocol.py",
+    "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/682-reconcile-final-local-qualification/packages/aethyme-eval/tests/test_fx17_campaign_consumption.py"
+  ],
+  "working_directory": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/682-reconcile-final-local-qualification/packages/aethyme/rust",
+  "environment": {
+    "PATH": "/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/christophehenner/.cargo/bin",
+    "RUSTC_WRAPPER": "",
+    "CARGO_TARGET_DIR": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/integrate-reviewed-local-bare-git-servic/target/local-resume/cargo"
+  },
+  "source_before": {
+    "head": "caef9cc94ca47b6f75f1d712e3e85359ccad55e1",
+    "tree": "d796ddd4c0110e1b8b3e589b88967c779e4954ab",
+    "status": "",
+    "diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  "exit_code": 0,
+  "wall_seconds": 0.944,
+  "finished_at_utc": "2026-10-15T09:30:25.015942+00:00",
+  "source_after": {
+    "head": "caef9cc94ca47b6f75f1d712e3e85359ccad55e1",
+    "tree": "d796ddd4c0110e1b8b3e589b88967c779e4954ab",
+    "status": "",
+    "diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  "log": {
+    "path": "target/local-resume/final-integration-20261015T093024Z/fx17-no-model-regressions.log",
+    "bytes": 98,
+    "sha256": "af88bdd7a54cc39cfb5904eec849f46c36db3b008cd00a1693c86331142646eb"
+  },
+  "source_unchanged": true
+}

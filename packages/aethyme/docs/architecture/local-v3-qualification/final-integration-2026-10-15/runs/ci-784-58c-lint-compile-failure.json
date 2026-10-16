@@ -1,0 +1,23 @@
+{
+  "schema": "aethyme.local-ci-command-result/v1",
+  "id": "ci-784-58c-lint-compile-failure",
+  "pr": 784,
+  "branch_head": "58c470747b50e9ca9bc26e3914ba5a8c736f1144",
+  "ci_checkout_commit": "aaaa023f3a38cdc049f9f50832a2f2f2b7ed11e5",
+  "ci_checkout_tree": "76ce5904693f04af9a41e825a4c3be98ee30961f",
+  "ci_checkout_parents": [
+    "65f0bce9a918acbd92b67c54550edde072d40a03",
+    "58c470747b50e9ca9bc26e3914ba5a8c736f1144"
+  ],
+  "job_url": "https://github.com/schiste/Aethyme/actions/runs/38788708993/job/116607349478",
+  "numeric_exit": 101,
+  "tests_run": null,
+  "tests_passed": null,
+  "tests_failed": null,
+  "tests_skipped": null,
+  "failed_tests": [],
+  "failure": "Rust compilation failed: duplicated BudgetError::Sensitive after stacking; test OperationId has no Display. Cascading derive diagnostics are retained.",
+  "credited_as_passing_command": false,
+  "log_sha256": "000c26226723da5044b412d3b37f8241cbfde6aaa092042e0b34ed374cedb485",
+  "scope": "Actual GitHub merge-ref source, separate from PR head. Compile failures supply no executed-test credit. Full original job log preserved without normalization."
+}

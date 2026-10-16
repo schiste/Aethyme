@@ -1,0 +1,521 @@
+Rust workspace tests	Set up job	﻿2026-10-16T01:19:34.1102943Z Current runner version: '2.337.0'
+Rust workspace tests	Set up job	2026-10-16T01:19:34.1131653Z ##[group]Runner Image Provisioner
+Rust workspace tests	Set up job	2026-10-16T01:19:34.1132600Z Hosted Compute Agent
+Rust workspace tests	Set up job	2026-10-16T01:19:34.1133201Z Version: 20261012.601
+Rust workspace tests	Set up job	2026-10-16T01:19:34.1133995Z Commit: f3dc54e1fb89da6852db922499a0233137369e1d
+Rust workspace tests	Set up job	2026-10-16T01:19:34.1134732Z Build Date: 2026-10-12T17:48:21Z
+Rust workspace tests	Set up job	2026-10-16T01:19:34.1135475Z Worker ID: {2426725d-9027-4cbd-8f43-33aa4d792738}
+Rust workspace tests	Set up job	2026-10-16T01:19:34.1136219Z Region: westus2
+Rust workspace tests	Set up job	2026-10-16T01:19:34.1136759Z Cloud: Azure
+Rust workspace tests	Set up job	2026-10-16T01:19:34.1137363Z ##[endgroup]
+Rust workspace tests	Set up job	2026-10-16T01:19:34.1138796Z ##[group]Operating System
+Rust workspace tests	Set up job	2026-10-16T01:19:34.1140079Z Ubuntu
+Rust workspace tests	Set up job	2026-10-16T01:19:34.1140708Z 24.04.5
+Rust workspace tests	Set up job	2026-10-16T01:19:34.1141233Z LTS
+Rust workspace tests	Set up job	2026-10-16T01:19:34.1141838Z ##[endgroup]
+Rust workspace tests	Set up job	2026-10-16T01:19:34.1142400Z ##[group]Runner Image
+Rust workspace tests	Set up job	2026-10-16T01:19:34.1143071Z Image: ubuntu-24.04
+Rust workspace tests	Set up job	2026-10-16T01:19:34.1143693Z Version: 20261012.334.1
+Rust workspace tests	Set up job	2026-10-16T01:19:34.1144763Z Included Software: https://github.com/actions/runner-images/blob/ubuntu24/20261012.334/images/ubuntu/Ubuntu2404-Readme.md
+Rust workspace tests	Set up job	2026-10-16T01:19:34.1146583Z Image Release: https://github.com/actions/runner-images/releases/tag/ubuntu24%2F20261012.334
+Rust workspace tests	Set up job	2026-10-16T01:19:34.1147591Z ##[endgroup]
+Rust workspace tests	Set up job	2026-10-16T01:19:34.1148742Z ##[group]GITHUB_TOKEN Permissions
+Rust workspace tests	Set up job	2026-10-16T01:19:34.1151006Z Contents: read
+Rust workspace tests	Set up job	2026-10-16T01:19:34.1151677Z Metadata: read
+Rust workspace tests	Set up job	2026-10-16T01:19:34.1152244Z ##[endgroup]
+Rust workspace tests	Set up job	2026-10-16T01:19:34.1154533Z Secret source: Actions
+Rust workspace tests	Set up job	2026-10-16T01:19:34.1155541Z Cache mode: write
+Rust workspace tests	Set up job	2026-10-16T01:19:34.1156338Z Prepare workflow directory
+Rust workspace tests	Set up job	2026-10-16T01:19:34.1641604Z Prepare all required actions
+Rust workspace tests	Set up job	2026-10-16T01:19:34.1698211Z Getting action download info
+Rust workspace tests	Set up job	2026-10-16T01:19:34.5182463Z Download action repository 'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1' (SHA:3d3c42e5aac5ba805825da76410c181273ba90b1)
+Rust workspace tests	Set up job	2026-10-16T01:19:34.6698173Z Download action repository 'dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87' (SHA:6bed0761d98439e5a578e2877258200ad565ba87)
+Rust workspace tests	Set up job	2026-10-16T01:19:34.8338060Z Download action repository 'Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6' (SHA:6323deb102c322ba6fcbdcafc7e3dddab59af2b6)
+Rust workspace tests	Set up job	2026-10-16T01:19:35.0580236Z Download action repository 'taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0' (SHA:e407f7bafb71fd004bc5c2da3032e5470cbb6ef0)
+Rust workspace tests	Set up job	2026-10-16T01:19:35.3127236Z Download action repository 'actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a' (SHA:043fb46d1a93c77aae656e7c1c64a875d1fc6a0a)
+Rust workspace tests	Set up job	2026-10-16T01:19:35.5575185Z Complete job name: Rust workspace tests
+Rust workspace tests	Checkout	﻿2026-10-16T01:19:35.6485632Z ##[group]Run actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+Rust workspace tests	Checkout	2026-10-16T01:19:35.6486817Z with:
+Rust workspace tests	Checkout	2026-10-16T01:19:35.6487306Z   repository: schiste/Aethyme
+Rust workspace tests	Checkout	2026-10-16T01:19:35.6491769Z   token: ***
+Rust workspace tests	Checkout	2026-10-16T01:19:35.6492268Z   ssh-strict: true
+Rust workspace tests	Checkout	2026-10-16T01:19:35.6492718Z   ssh-user: git
+Rust workspace tests	Checkout	2026-10-16T01:19:35.6493179Z   persist-credentials: true
+Rust workspace tests	Checkout	2026-10-16T01:19:35.6493681Z   clean: true
+Rust workspace tests	Checkout	2026-10-16T01:19:35.6494201Z   sparse-checkout-cone-mode: true
+Rust workspace tests	Checkout	2026-10-16T01:19:35.6494774Z   fetch-depth: 1
+Rust workspace tests	Checkout	2026-10-16T01:19:35.6495231Z   fetch-tags: false
+Rust workspace tests	Checkout	2026-10-16T01:19:35.6495688Z   show-progress: true
+Rust workspace tests	Checkout	2026-10-16T01:19:35.6496159Z   lfs: false
+Rust workspace tests	Checkout	2026-10-16T01:19:35.6496614Z   submodules: false
+Rust workspace tests	Checkout	2026-10-16T01:19:35.6497071Z   set-safe-directory: true
+Rust workspace tests	Checkout	2026-10-16T01:19:35.6497594Z   allow-unsafe-pr-checkout: false
+Rust workspace tests	Checkout	2026-10-16T01:19:35.6498501Z env:
+Rust workspace tests	Checkout	2026-10-16T01:19:35.6499126Z   CARGO_NET_RETRY: 10
+Rust workspace tests	Checkout	2026-10-16T01:19:35.6499620Z ##[endgroup]
+Rust workspace tests	Checkout	2026-10-16T01:19:35.7598848Z Syncing repository: schiste/Aethyme
+Rust workspace tests	Checkout	2026-10-16T01:19:35.7602507Z ##[group]Getting Git version info
+Rust workspace tests	Checkout	2026-10-16T01:19:35.7604143Z Working directory is '/home/runner/work/Aethyme/Aethyme'
+Rust workspace tests	Checkout	2026-10-16T01:19:35.7606022Z [command]/usr/bin/git version
+Rust workspace tests	Checkout	2026-10-16T01:19:35.7719752Z git version 2.55.0
+Rust workspace tests	Checkout	2026-10-16T01:19:35.7738017Z ##[endgroup]
+Rust workspace tests	Checkout	2026-10-16T01:19:35.7750515Z Temporarily overriding HOME='/home/runner/work/_temp/31194dfa-735e-4e5b-9215-7b3eb656dd94' before making global git config changes
+Rust workspace tests	Checkout	2026-10-16T01:19:35.7756641Z Adding repository directory to the temporary git global config as a safe directory
+Rust workspace tests	Checkout	2026-10-16T01:19:35.7758514Z [command]/usr/bin/git config --global --add safe.directory /home/runner/work/Aethyme/Aethyme
+Rust workspace tests	Checkout	2026-10-16T01:19:35.7817605Z Deleting the contents of '/home/runner/work/Aethyme/Aethyme'
+Rust workspace tests	Checkout	2026-10-16T01:19:35.7831668Z ##[group]Determining repository object format
+Rust workspace tests	Checkout	2026-10-16T01:19:35.7833519Z ##[endgroup]
+Rust workspace tests	Checkout	2026-10-16T01:19:35.7834823Z ##[group]Initializing the repository
+Rust workspace tests	Checkout	2026-10-16T01:19:35.7836007Z [command]/usr/bin/git init /home/runner/work/Aethyme/Aethyme
+Rust workspace tests	Checkout	2026-10-16T01:19:35.7964466Z hint: Using 'master' as the name for the initial branch. This default branch name
+Rust workspace tests	Checkout	2026-10-16T01:19:35.7966386Z hint: will change to "main" in Git 3.0. To configure the initial branch name
+Rust workspace tests	Checkout	2026-10-16T01:19:35.7968040Z hint: to use in all of your new repositories, which will suppress this warning,
+Rust workspace tests	Checkout	2026-10-16T01:19:35.7969726Z hint: call:
+Rust workspace tests	Checkout	2026-10-16T01:19:35.7970387Z hint:
+Rust workspace tests	Checkout	2026-10-16T01:19:35.7971265Z hint: 	git config --global init.defaultBranch <name>
+Rust workspace tests	Checkout	2026-10-16T01:19:35.7972445Z hint:
+Rust workspace tests	Checkout	2026-10-16T01:19:35.7973468Z hint: Names commonly chosen instead of 'master' are 'main', 'trunk' and
+Rust workspace tests	Checkout	2026-10-16T01:19:35.7975033Z hint: 'development'. The just-created branch can be renamed via this command:
+Rust workspace tests	Checkout	2026-10-16T01:19:35.7976251Z hint:
+Rust workspace tests	Checkout	2026-10-16T01:19:35.7976970Z hint: 	git branch -m <name>
+Rust workspace tests	Checkout	2026-10-16T01:19:35.7977849Z hint:
+Rust workspace tests	Checkout	2026-10-16T01:19:35.7979241Z hint: Disable this message with "git config set advice.defaultBranchName false"
+Rust workspace tests	Checkout	2026-10-16T01:19:35.7980899Z Initialized empty Git repository in /home/runner/work/Aethyme/Aethyme/.git/
+Rust workspace tests	Checkout	2026-10-16T01:19:35.7984296Z [command]/usr/bin/git remote add origin https://github.com/schiste/Aethyme
+Rust workspace tests	Checkout	2026-10-16T01:19:35.8046875Z ##[endgroup]
+Rust workspace tests	Checkout	2026-10-16T01:19:35.8049180Z ##[group]Disabling automatic garbage collection
+Rust workspace tests	Checkout	2026-10-16T01:19:35.8051950Z [command]/usr/bin/git config --local gc.auto 0
+Rust workspace tests	Checkout	2026-10-16T01:19:35.8097894Z ##[endgroup]
+Rust workspace tests	Checkout	2026-10-16T01:19:35.8099946Z ##[group]Setting up auth
+Rust workspace tests	Checkout	2026-10-16T01:19:35.8101314Z Removing SSH command configuration
+Rust workspace tests	Checkout	2026-10-16T01:19:35.8105379Z [command]/usr/bin/git config --local --name-only --get-regexp core\.sshCommand
+Rust workspace tests	Checkout	2026-10-16T01:19:35.8152338Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :"
+Rust workspace tests	Checkout	2026-10-16T01:19:35.8576843Z Removing HTTP extra header
+Rust workspace tests	Checkout	2026-10-16T01:19:35.8584515Z [command]/usr/bin/git config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
+Rust workspace tests	Checkout	2026-10-16T01:19:35.8629622Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :"
+Rust workspace tests	Checkout	2026-10-16T01:19:35.8873374Z Removing includeIf entries pointing to credentials config files
+Rust workspace tests	Checkout	2026-10-16T01:19:35.8879358Z [command]/usr/bin/git config --local --name-only --get-regexp ^includeIf\.gitdir:
+Rust workspace tests	Checkout	2026-10-16T01:19:35.8934342Z [command]/usr/bin/git submodule foreach --recursive git config --local --show-origin --name-only --get-regexp remote.origin.url
+Rust workspace tests	Checkout	2026-10-16T01:19:35.9214563Z [command]/usr/bin/git config --file /home/runner/work/_temp/git-credentials-bdc2a9bc-474e-40d8-a73e-457a416bd478.config http.https://github.com/.extraheader AUTHORIZATION: basic ***
+Rust workspace tests	Checkout	2026-10-16T01:19:35.9268249Z [command]/usr/bin/git config --local includeIf.gitdir:/home/runner/work/Aethyme/Aethyme/.git.path /home/runner/work/_temp/git-credentials-bdc2a9bc-474e-40d8-a73e-457a416bd478.config
+Rust workspace tests	Checkout	2026-10-16T01:19:35.9313094Z [command]/usr/bin/git config --local includeIf.gitdir:/home/runner/work/Aethyme/Aethyme/.git/worktrees/*.path /home/runner/work/_temp/git-credentials-bdc2a9bc-474e-40d8-a73e-457a416bd478.config
+Rust workspace tests	Checkout	2026-10-16T01:19:35.9364093Z [command]/usr/bin/git config --local includeIf.gitdir:/github/workspace/.git.path /github/runner_temp/git-credentials-bdc2a9bc-474e-40d8-a73e-457a416bd478.config
+Rust workspace tests	Checkout	2026-10-16T01:19:35.9412683Z [command]/usr/bin/git config --local includeIf.gitdir:/github/workspace/.git/worktrees/*.path /github/runner_temp/git-credentials-bdc2a9bc-474e-40d8-a73e-457a416bd478.config
+Rust workspace tests	Checkout	2026-10-16T01:19:35.9455260Z ##[endgroup]
+Rust workspace tests	Checkout	2026-10-16T01:19:35.9456606Z ##[group]Fetching the repository
+Rust workspace tests	Checkout	2026-10-16T01:19:35.9462350Z [command]/usr/bin/git -c protocol.version=2 fetch --no-tags --prune --no-recurse-submodules --depth=1 origin +48ae7c6df372a7f71302c1febf6d8d87870c9fab:refs/remotes/pull/787/merge
+Rust workspace tests	Checkout	2026-10-16T01:19:37.4493548Z From https://github.com/schiste/Aethyme
+Rust workspace tests	Checkout	2026-10-16T01:19:37.4515085Z  * [new ref]         48ae7c6df372a7f71302c1febf6d8d87870c9fab -> pull/787/merge
+Rust workspace tests	Checkout	2026-10-16T01:19:37.4518560Z ##[endgroup]
+Rust workspace tests	Checkout	2026-10-16T01:19:37.4519661Z ##[group]Determining the checkout info
+Rust workspace tests	Checkout	2026-10-16T01:19:37.4520281Z ##[endgroup]
+Rust workspace tests	Checkout	2026-10-16T01:19:37.4520647Z [command]/usr/bin/git sparse-checkout disable
+Rust workspace tests	Checkout	2026-10-16T01:19:37.4563406Z [command]/usr/bin/git config --local --unset-all extensions.worktreeConfig
+Rust workspace tests	Checkout	2026-10-16T01:19:37.4597752Z ##[group]Checking out the ref
+Rust workspace tests	Checkout	2026-10-16T01:19:37.4602208Z [command]/usr/bin/git checkout --progress --force refs/remotes/pull/787/merge
+Rust workspace tests	Checkout	2026-10-16T01:19:37.8110529Z Note: switching to 'refs/remotes/pull/787/merge'.
+Rust workspace tests	Checkout	2026-10-16T01:19:37.8111206Z 
+Rust workspace tests	Checkout	2026-10-16T01:19:37.8111636Z You are in 'detached HEAD' state. You can look around, make experimental
+Rust workspace tests	Checkout	2026-10-16T01:19:37.8112584Z changes and commit them, and you can discard any commits you make in this
+Rust workspace tests	Checkout	2026-10-16T01:19:37.8113538Z state without impacting any branches by switching back to a branch.
+Rust workspace tests	Checkout	2026-10-16T01:19:37.8114178Z 
+Rust workspace tests	Checkout	2026-10-16T01:19:37.8114603Z If you want to create a new branch to retain commits you create, you may
+Rust workspace tests	Checkout	2026-10-16T01:19:37.8115441Z do so (now or later) by using -c with the switch command. Example:
+Rust workspace tests	Checkout	2026-10-16T01:19:37.8115931Z 
+Rust workspace tests	Checkout	2026-10-16T01:19:37.8116157Z   git switch -c <new-branch-name>
+Rust workspace tests	Checkout	2026-10-16T01:19:37.8116509Z 
+Rust workspace tests	Checkout	2026-10-16T01:19:37.8116727Z Or undo this operation with:
+Rust workspace tests	Checkout	2026-10-16T01:19:37.8117066Z 
+Rust workspace tests	Checkout	2026-10-16T01:19:37.8117249Z   git switch -
+Rust workspace tests	Checkout	2026-10-16T01:19:37.8117538Z 
+Rust workspace tests	Checkout	2026-10-16T01:19:37.8118038Z Turn off this advice by setting config variable advice.detachedHead to false
+Rust workspace tests	Checkout	2026-10-16T01:19:37.8118644Z 
+Rust workspace tests	Checkout	2026-10-16T01:19:37.8119611Z HEAD is now at 48ae7c6 Merge fc711d13172a61bc9188c59731579a4f5ac63ca0 into 5f760b0e1d0b21faa3c26c3bf5c63205a487ca15
+Rust workspace tests	Checkout	2026-10-16T01:19:37.8131376Z ##[endgroup]
+Rust workspace tests	Checkout	2026-10-16T01:19:37.8195812Z [command]/usr/bin/git log -1 --format=%H
+Rust workspace tests	Checkout	2026-10-16T01:19:37.8230858Z 48ae7c6df372a7f71302c1febf6d8d87870c9fab
+Rust workspace tests	Set up Rust	﻿2026-10-16T01:19:37.8645027Z ##[group]Run dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
+Rust workspace tests	Set up Rust	2026-10-16T01:19:37.8645520Z with:
+Rust workspace tests	Set up Rust	2026-10-16T01:19:37.8645729Z   toolchain: stable
+Rust workspace tests	Set up Rust	2026-10-16T01:19:37.8645954Z env:
+Rust workspace tests	Set up Rust	2026-10-16T01:19:37.8646145Z   CARGO_NET_RETRY: 10
+Rust workspace tests	Set up Rust	2026-10-16T01:19:37.8646366Z ##[endgroup]
+Rust workspace tests	Set up Rust	2026-10-16T01:19:37.8716687Z ##[start-action display=Parse toolchain version;id=__dtolnay_rust-toolchain.parse]
+Rust workspace tests	Set up Rust	2026-10-16T01:19:37.8787891Z ##[group]Run if [[ -z $toolchain ]]; then
+Rust workspace tests	Set up Rust	2026-10-16T01:19:37.8788364Z ^[[36;1mif [[ -z $toolchain ]]; then^[[0m
+Rust workspace tests	Set up Rust	2026-10-16T01:19:37.8789155Z ^[[36;1m  # GitHub does not enforce `required: true` inputs itself. https://github.com/actions/runner/issues/1070^[[0m
+Rust workspace tests	Set up Rust	2026-10-16T01:19:37.8789746Z ^[[36;1m  echo "'toolchain' is a required input" >&2^[[0m
+Rust workspace tests	Set up Rust	2026-10-16T01:19:37.8790049Z ^[[36;1m  exit 1^[[0m
+Rust workspace tests	Set up Rust	2026-10-16T01:19:37.8790394Z ^[[36;1melif [[ $toolchain =~ ^stable' '[0-9]+' '(year|month|week|day)s?' 'ago$ ]]; then^[[0m
+Rust workspace tests	Set up Rust	2026-10-16T01:19:37.8790830Z ^[[36;1m  if [[ Linux == macOS ]]; then^[[0m
+Rust workspace tests	Set up Rust	2026-10-16T01:19:37.8791423Z ^[[36;1m    echo "toolchain=1.$((($(date -v-$(sed 's/stable \([0-9]*\) \(.\).*/\1\2/' <<< $toolchain) +%s)/60/60/24-16569)/7/6))" >> $GITHUB_OUTPUT^[[0m
+Rust workspace tests	Set up Rust	2026-10-16T01:19:37.8791954Z ^[[36;1m  else^[[0m
+Rust workspace tests	Set up Rust	2026-10-16T01:19:37.8792371Z ^[[36;1m    echo "toolchain=1.$((($(date --date "${toolchain#stable }" +%s)/60/60/24-16569)/7/6))" >> $GITHUB_OUTPUT^[[0m
+Rust workspace tests	Set up Rust	2026-10-16T01:19:37.8792838Z ^[[36;1m  fi^[[0m
+Rust workspace tests	Set up Rust	2026-10-16T01:19:37.8793143Z ^[[36;1melif [[ $toolchain =~ ^stable' 'minus' '[0-9]+' 'releases?$ ]]; then^[[0m
+Rust workspace tests	Set up Rust	2026-10-16T01:19:37.8793920Z ^[[36;1m  echo "toolchain=1.$((($(date +%s)/60/60/24-16569)/7/6-${toolchain//[^0-9]/}))" >> $GITHUB_OUTPUT^[[0m
+Rust workspace tests	Set up Rust	2026-10-16T01:19:37.8794396Z ^[[36;1melif [[ $toolchain =~ ^1\.[0-9]+$ ]]; then^[[0m
+Rust workspace tests	Set up Rust	2026-10-16T01:19:37.8794930Z ^[[36;1m  echo "toolchain=1.$((i=${toolchain#1.}, c=($(date +%s)/60/60/24-16569)/7/6, i+9*i*(10*i<=c)+90*i*(100*i<=c)))" >> $GITHUB_OUTPUT^[[0m
+Rust workspace tests	Set up Rust	2026-10-16T01:19:37.8795432Z ^[[36;1melse^[[0m
+Rust workspace tests	Set up Rust	2026-10-16T01:19:37.8795679Z ^[[36;1m  echo "toolchain=$toolchain" >> $GITHUB_OUTPUT^[[0m
+Rust workspace tests	Set up Rust	2026-10-16T01:19:37.8795997Z ^[[36;1mfi^[[0m
+Rust workspace tests	Set up Rust	2026-10-16T01:19:37.9054801Z shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+Rust workspace tests	Set up Rust	2026-10-16T01:19:37.9055257Z env:
+Rust workspace tests	Set up Rust	2026-10-16T01:19:37.9055489Z   CARGO_NET_RETRY: 10
+Rust workspace tests	Set up Rust	2026-10-16T01:19:37.9055745Z   toolchain: stable
+Rust workspace tests	Set up Rust	2026-10-16T01:19:37.9056012Z ##[endgroup]
+Rust workspace tests	Set up Rust	2026-10-16T01:19:37.9209563Z ##[end-action id=__dtolnay_rust-toolchain.parse;outcome=success;conclusion=success;duration_ms=49]
+Rust workspace tests	Set up Rust	2026-10-16T01:19:37.9223025Z ##[start-action display=Construct rustup command line;id=__dtolnay_rust-toolchain.flags]
+Rust workspace tests	Set up Rust	2026-10-16T01:19:37.9265286Z ##[group]Run echo "targets=$(for t in ${targets//,/ }; do echo -n ' --target' $t; done)" >> $GITHUB_OUTPUT
+Rust workspace tests	Set up Rust	2026-10-16T01:19:37.9265994Z ^[[36;1mecho "targets=$(for t in ${targets//,/ }; do echo -n ' --target' $t; done)" >> $GITHUB_OUTPUT^[[0m
+Rust workspace tests	Set up Rust	2026-10-16T01:19:37.9266679Z ^[[36;1mecho "components=$(for c in ${components//,/ }; do echo -n ' --component' $c; done)" >> $GITHUB_OUTPUT^[[0m
+Rust workspace tests	Set up Rust	2026-10-16T01:19:37.9267189Z ^[[36;1mecho "downgrade=" >> $GITHUB_OUTPUT^[[0m
+Rust workspace tests	Set up Rust	2026-10-16T01:19:37.9334409Z shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+Rust workspace tests	Set up Rust	2026-10-16T01:19:37.9334781Z env:
+Rust workspace tests	Set up Rust	2026-10-16T01:19:37.9334984Z   CARGO_NET_RETRY: 10
+Rust workspace tests	Set up Rust	2026-10-16T01:19:37.9335202Z   targets: 
+Rust workspace tests	Set up Rust	2026-10-16T01:19:37.9335399Z   components: 
+Rust workspace tests	Set up Rust	2026-10-16T01:19:37.9335600Z ##[endgroup]
+Rust workspace tests	Set up Rust	2026-10-16T01:19:37.9447332Z ##[end-action id=__dtolnay_rust-toolchain.flags;outcome=success;conclusion=success;duration_ms=22]
+Rust workspace tests	Set up Rust	2026-10-16T01:19:37.9450303Z ##[start-action display=Set $CARGO_HOME;id=__dtolnay_rust-toolchain.__run]
+Rust workspace tests	Set up Rust	2026-10-16T01:19:37.9480832Z ##[group]Run echo CARGO_HOME=${CARGO_HOME:-"$HOME/.cargo"} >> $GITHUB_ENV
+Rust workspace tests	Set up Rust	2026-10-16T01:19:37.9481327Z ^[[36;1mecho CARGO_HOME=${CARGO_HOME:-"$HOME/.cargo"} >> $GITHUB_ENV^[[0m
+Rust workspace tests	Set up Rust	2026-10-16T01:19:37.9550025Z shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+Rust workspace tests	Set up Rust	2026-10-16T01:19:37.9550398Z env:
+Rust workspace tests	Set up Rust	2026-10-16T01:19:37.9550598Z   CARGO_NET_RETRY: 10
+Rust workspace tests	Set up Rust	2026-10-16T01:19:37.9550830Z ##[endgroup]
+Rust workspace tests	Set up Rust	2026-10-16T01:19:37.9648466Z ##[end-action id=__dtolnay_rust-toolchain.__run;outcome=success;conclusion=success;duration_ms=19]
+Rust workspace tests	Set up Rust	2026-10-16T01:19:37.9651745Z ##[start-action display=Install rustup if needed;id=__dtolnay_rust-toolchain.__run_2]
+Rust workspace tests	Set up Rust	2026-10-16T01:19:37.9688655Z ##[group]Run if ! command -v rustup &>/dev/null; then
+Rust workspace tests	Set up Rust	2026-10-16T01:19:37.9689370Z ^[[36;1mif ! command -v rustup &>/dev/null; then^[[0m
+Rust workspace tests	Set up Rust	2026-10-16T01:19:37.9690178Z ^[[36;1m  curl --proto '=https' --tlsv1.2 --retry 10 --retry-connrefused --location --silent --show-error --fail https://sh.rustup.rs | sh -s -- --default-toolchain none -y^[[0m
+Rust workspace tests	Set up Rust	2026-10-16T01:19:37.9690942Z ^[[36;1m  echo "$CARGO_HOME/bin" >> $GITHUB_PATH^[[0m
+Rust workspace tests	Set up Rust	2026-10-16T01:19:37.9691243Z ^[[36;1mfi^[[0m
+Rust workspace tests	Set up Rust	2026-10-16T01:19:37.9758625Z shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+Rust workspace tests	Set up Rust	2026-10-16T01:19:37.9759313Z env:
+Rust workspace tests	Set up Rust	2026-10-16T01:19:37.9759531Z   CARGO_NET_RETRY: 10
+Rust workspace tests	Set up Rust	2026-10-16T01:19:37.9759779Z   CARGO_HOME: /home/runner/.cargo
+Rust workspace tests	Set up Rust	2026-10-16T01:19:37.9760040Z ##[endgroup]
+Rust workspace tests	Set up Rust	2026-10-16T01:19:37.9857602Z ##[end-action id=__dtolnay_rust-toolchain.__run_2;outcome=success;conclusion=success;duration_ms=20]
+Rust workspace tests	Set up Rust	2026-10-16T01:19:37.9860548Z ##[start-action display=Install rustup if needed on windows;id=__dtolnay_rust-toolchain.__run_3]
+Rust workspace tests	Set up Rust	2026-10-16T01:19:37.9887021Z ##[end-action id=__dtolnay_rust-toolchain.__run_3;outcome=skipped;conclusion=skipped;duration_ms=0]
+Rust workspace tests	Set up Rust	2026-10-16T01:19:37.9900051Z ##[start-action display=rustup toolchain install stable;id=__dtolnay_rust-toolchain.__run_4]
+Rust workspace tests	Set up Rust	2026-10-16T01:19:37.9932932Z ##[group]Run rustup toolchain install stable --profile minimal --no-self-update
+Rust workspace tests	Set up Rust	2026-10-16T01:19:37.9933503Z ^[[36;1mrustup toolchain install stable --profile minimal --no-self-update^[[0m
+Rust workspace tests	Set up Rust	2026-10-16T01:19:38.0003742Z shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+Rust workspace tests	Set up Rust	2026-10-16T01:19:38.0004112Z env:
+Rust workspace tests	Set up Rust	2026-10-16T01:19:38.0004361Z   CARGO_NET_RETRY: 10
+Rust workspace tests	Set up Rust	2026-10-16T01:19:38.0004609Z   CARGO_HOME: /home/runner/.cargo
+Rust workspace tests	Set up Rust	2026-10-16T01:19:38.0004893Z   RUSTUP_PERMIT_COPY_RENAME: 1
+Rust workspace tests	Set up Rust	2026-10-16T01:19:38.0005145Z ##[endgroup]
+Rust workspace tests	Set up Rust	2026-10-16T01:19:40.5551959Z info: syncing channel updates for stable-x86_64-unknown-linux-gnu
+Rust workspace tests	Set up Rust	2026-10-16T01:19:40.8276237Z info: latest update on 2026-10-15 for version 1.99.1 (58cf8f9c3 2026-10-13)
+Rust workspace tests	Set up Rust	2026-10-16T01:19:40.8505157Z info: removing previous version of component rustfmt
+Rust workspace tests	Set up Rust	2026-10-16T01:19:40.8523235Z info: removing previous version of component clippy
+Rust workspace tests	Set up Rust	2026-10-16T01:19:40.8588569Z info: removing previous version of component cargo
+Rust workspace tests	Set up Rust	2026-10-16T01:19:40.8637483Z info: removing previous version of component rust-std
+Rust workspace tests	Set up Rust	2026-10-16T01:19:40.8692017Z info: removing previous version of component rustc
+Rust workspace tests	Set up Rust	2026-10-16T01:19:40.8747499Z info: downloading 5 components
+Rust workspace tests	Set up Rust	2026-10-16T01:19:49.0732325Z 
+Rust workspace tests	Set up Rust	2026-10-16T01:19:49.0803162Z   stable-x86_64-unknown-linux-gnu updated - rustc 1.99.1 (58cf8f9c3 2026-10-13) (from rustc 1.99.0 (b940084d7 2026-09-28))
+Rust workspace tests	Set up Rust	2026-10-16T01:19:49.0803722Z 
+Rust workspace tests	Set up Rust	2026-10-16T01:19:49.0856576Z ##[end-action id=__dtolnay_rust-toolchain.__run_4;outcome=success;conclusion=success;duration_ms=11095]
+Rust workspace tests	Set up Rust	2026-10-16T01:19:49.0863850Z ##[start-action display=rustup default stable;id=__dtolnay_rust-toolchain.__run_5]
+Rust workspace tests	Set up Rust	2026-10-16T01:19:49.0886428Z ##[group]Run rustup default stable
+Rust workspace tests	Set up Rust	2026-10-16T01:19:49.0886730Z ^[[36;1mrustup default stable^[[0m
+Rust workspace tests	Set up Rust	2026-10-16T01:19:49.0949383Z shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+Rust workspace tests	Set up Rust	2026-10-16T01:19:49.0949746Z env:
+Rust workspace tests	Set up Rust	2026-10-16T01:19:49.0949940Z   CARGO_NET_RETRY: 10
+Rust workspace tests	Set up Rust	2026-10-16T01:19:49.0950181Z   CARGO_HOME: /home/runner/.cargo
+Rust workspace tests	Set up Rust	2026-10-16T01:19:49.0950436Z ##[endgroup]
+Rust workspace tests	Set up Rust	2026-10-16T01:19:49.1078052Z info: using existing install for stable-x86_64-unknown-linux-gnu
+Rust workspace tests	Set up Rust	2026-10-16T01:19:49.1083942Z info: default toolchain set to stable-x86_64-unknown-linux-gnu
+Rust workspace tests	Set up Rust	2026-10-16T01:19:49.1084442Z 
+Rust workspace tests	Set up Rust	2026-10-16T01:19:49.1148505Z   stable-x86_64-unknown-linux-gnu unchanged - rustc 1.99.1 (58cf8f9c3 2026-10-13)
+Rust workspace tests	Set up Rust	2026-10-16T01:19:49.1149317Z 
+Rust workspace tests	Set up Rust	2026-10-16T01:19:49.1150224Z info: note that the toolchain '1.96.0-x86_64-unknown-linux-gnu' is currently in use (overridden by '/home/runner/work/Aethyme/Aethyme/rust-toolchain.toml')
+Rust workspace tests	Set up Rust	2026-10-16T01:19:49.1165879Z ##[end-action id=__dtolnay_rust-toolchain.__run_5;outcome=success;conclusion=success;duration_ms=30]
+Rust workspace tests	Set up Rust	2026-10-16T01:19:49.1168371Z ##[start-action display=Create cachekey;id=__dtolnay_rust-toolchain.rustc-version]
+Rust workspace tests	Set up Rust	2026-10-16T01:19:49.1190729Z ##[group]Run DATE=$(rustc +stable --version --verbose | sed -ne 's/^commit-date: \(20[0-9][0-9]\)-\([01][0-9]\)-\([0-3][0-9]\)$/\1\2\3/p')
+Rust workspace tests	Set up Rust	2026-10-16T01:19:49.1191579Z ^[[36;1mDATE=$(rustc +stable --version --verbose | sed -ne 's/^commit-date: \(20[0-9][0-9]\)-\([01][0-9]\)-\([0-3][0-9]\)$/\1\2\3/p')^[[0m
+Rust workspace tests	Set up Rust	2026-10-16T01:19:49.1192238Z ^[[36;1mHASH=$(rustc +stable --version --verbose | sed -ne 's/^commit-hash: //p')^[[0m
+Rust workspace tests	Set up Rust	2026-10-16T01:19:49.1192760Z ^[[36;1mecho "cachekey=$(echo $DATE$HASH | head -c12)" >> $GITHUB_OUTPUT^[[0m
+Rust workspace tests	Set up Rust	2026-10-16T01:19:49.1255862Z shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+Rust workspace tests	Set up Rust	2026-10-16T01:19:49.1256215Z env:
+Rust workspace tests	Set up Rust	2026-10-16T01:19:49.1256409Z   CARGO_NET_RETRY: 10
+Rust workspace tests	Set up Rust	2026-10-16T01:19:49.1256636Z   CARGO_HOME: /home/runner/.cargo
+Rust workspace tests	Set up Rust	2026-10-16T01:19:49.1256894Z ##[endgroup]
+Rust workspace tests	Set up Rust	2026-10-16T01:19:49.1596534Z ##[end-action id=__dtolnay_rust-toolchain.rustc-version;outcome=success;conclusion=success;duration_ms=42]
+Rust workspace tests	Set up Rust	2026-10-16T01:19:49.1599421Z ##[start-action display=Disable incremental compilation;id=__dtolnay_rust-toolchain.__run_6]
+Rust workspace tests	Set up Rust	2026-10-16T01:19:49.1619733Z ##[group]Run if [ -z "${CARGO_INCREMENTAL+set}" ]; then
+Rust workspace tests	Set up Rust	2026-10-16T01:19:49.1620132Z ^[[36;1mif [ -z "${CARGO_INCREMENTAL+set}" ]; then^[[0m
+Rust workspace tests	Set up Rust	2026-10-16T01:19:49.1620629Z ^[[36;1m  echo CARGO_INCREMENTAL=0 >> $GITHUB_ENV^[[0m
+Rust workspace tests	Set up Rust	2026-10-16T01:19:49.1620918Z ^[[36;1mfi^[[0m
+Rust workspace tests	Set up Rust	2026-10-16T01:19:49.1683532Z shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+Rust workspace tests	Set up Rust	2026-10-16T01:19:49.1683880Z env:
+Rust workspace tests	Set up Rust	2026-10-16T01:19:49.1684079Z   CARGO_NET_RETRY: 10
+Rust workspace tests	Set up Rust	2026-10-16T01:19:49.1684315Z   CARGO_HOME: /home/runner/.cargo
+Rust workspace tests	Set up Rust	2026-10-16T01:19:49.1684564Z ##[endgroup]
+Rust workspace tests	Set up Rust	2026-10-16T01:19:49.1771247Z ##[end-action id=__dtolnay_rust-toolchain.__run_6;outcome=success;conclusion=success;duration_ms=17]
+Rust workspace tests	Set up Rust	2026-10-16T01:19:49.1773451Z ##[start-action display=Enable colors in Cargo output;id=__dtolnay_rust-toolchain.__run_7]
+Rust workspace tests	Set up Rust	2026-10-16T01:19:49.1792749Z ##[group]Run if [ -z "${CARGO_TERM_COLOR+set}" ]; then
+Rust workspace tests	Set up Rust	2026-10-16T01:19:49.1793118Z ^[[36;1mif [ -z "${CARGO_TERM_COLOR+set}" ]; then^[[0m
+Rust workspace tests	Set up Rust	2026-10-16T01:19:49.1793453Z ^[[36;1m  echo CARGO_TERM_COLOR=always >> $GITHUB_ENV^[[0m
+Rust workspace tests	Set up Rust	2026-10-16T01:19:49.1793750Z ^[[36;1mfi^[[0m
+Rust workspace tests	Set up Rust	2026-10-16T01:19:49.1849955Z shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+Rust workspace tests	Set up Rust	2026-10-16T01:19:49.1850314Z env:
+Rust workspace tests	Set up Rust	2026-10-16T01:19:49.1850510Z   CARGO_NET_RETRY: 10
+Rust workspace tests	Set up Rust	2026-10-16T01:19:49.1850735Z   CARGO_HOME: /home/runner/.cargo
+Rust workspace tests	Set up Rust	2026-10-16T01:19:49.1850981Z   CARGO_INCREMENTAL: 0
+Rust workspace tests	Set up Rust	2026-10-16T01:19:49.1851190Z ##[endgroup]
+Rust workspace tests	Set up Rust	2026-10-16T01:19:49.1935265Z ##[end-action id=__dtolnay_rust-toolchain.__run_7;outcome=success;conclusion=success;duration_ms=16]
+Rust workspace tests	Set up Rust	2026-10-16T01:19:49.1937388Z ##[start-action display=Enable Cargo sparse registry;id=__dtolnay_rust-toolchain.__run_8]
+Rust workspace tests	Set up Rust	2026-10-16T01:19:49.1957840Z ##[group]Run # implemented in 1.66, stabilized in 1.68, made default in 1.70
+Rust workspace tests	Set up Rust	2026-10-16T01:19:49.1958544Z ^[[36;1m# implemented in 1.66, stabilized in 1.68, made default in 1.70^[[0m
+Rust workspace tests	Set up Rust	2026-10-16T01:19:49.1959906Z ^[[36;1mif [ -z "${CARGO_REGISTRIES_CRATES_IO_PROTOCOL+set}" -o -f "/home/runner/work/_temp"/.implicit_cargo_registries_crates_io_protocol ]; then^[[0m
+Rust workspace tests	Set up Rust	2026-10-16T01:19:49.1960999Z ^[[36;1m  if rustc +stable --version --verbose | grep -q '^release: 1\.6[89]\.'; then^[[0m
+Rust workspace tests	Set up Rust	2026-10-16T01:19:49.1962003Z ^[[36;1m    touch "/home/runner/work/_temp"/.implicit_cargo_registries_crates_io_protocol || true^[[0m
+Rust workspace tests	Set up Rust	2026-10-16T01:19:49.1962983Z ^[[36;1m    echo CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse >> $GITHUB_ENV^[[0m
+Rust workspace tests	Set up Rust	2026-10-16T01:19:49.1963848Z ^[[36;1m  elif rustc +stable --version --verbose | grep -q '^release: 1\.6[67]\.'; then^[[0m
+Rust workspace tests	Set up Rust	2026-10-16T01:19:49.1964578Z ^[[36;1m    touch "/home/runner/work/_temp"/.implicit_cargo_registries_crates_io_protocol || true^[[0m
+Rust workspace tests	Set up Rust	2026-10-16T01:19:49.1965135Z ^[[36;1m    echo CARGO_REGISTRIES_CRATES_IO_PROTOCOL=git >> $GITHUB_ENV^[[0m
+Rust workspace tests	Set up Rust	2026-10-16T01:19:49.1965677Z ^[[36;1m  fi^[[0m
+Rust workspace tests	Set up Rust	2026-10-16T01:19:49.1965876Z ^[[36;1mfi^[[0m
+Rust workspace tests	Set up Rust	2026-10-16T01:19:49.2022675Z shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+Rust workspace tests	Set up Rust	2026-10-16T01:19:49.2023047Z env:
+Rust workspace tests	Set up Rust	2026-10-16T01:19:49.2023382Z   CARGO_NET_RETRY: 10
+Rust workspace tests	Set up Rust	2026-10-16T01:19:49.2023621Z   CARGO_HOME: /home/runner/.cargo
+Rust workspace tests	Set up Rust	2026-10-16T01:19:49.2023874Z   CARGO_INCREMENTAL: 0
+Rust workspace tests	Set up Rust	2026-10-16T01:19:49.2024093Z   CARGO_TERM_COLOR: always
+Rust workspace tests	Set up Rust	2026-10-16T01:19:49.2024330Z ##[endgroup]
+Rust workspace tests	Set up Rust	2026-10-16T01:19:49.2346742Z ##[end-action id=__dtolnay_rust-toolchain.__run_8;outcome=success;conclusion=success;duration_ms=40]
+Rust workspace tests	Set up Rust	2026-10-16T01:19:49.2349724Z ##[start-action display=Work around spurious network errors in curl 8.0;id=__dtolnay_rust-toolchain.__run_9]
+Rust workspace tests	Set up Rust	2026-10-16T01:19:49.2371310Z ##[group]Run # https://rust-lang.zulipchat.com/#narrow/stream/246057-t-cargo/topic/timeout.20investigation
+Rust workspace tests	Set up Rust	2026-10-16T01:19:49.2372108Z ^[[36;1m# https://rust-lang.zulipchat.com/#narrow/stream/246057-t-cargo/topic/timeout.20investigation^[[0m
+Rust workspace tests	Set up Rust	2026-10-16T01:19:49.2372743Z ^[[36;1mif rustc +stable --version --verbose | grep -q '^release: 1\.7[01]\.'; then^[[0m
+Rust workspace tests	Set up Rust	2026-10-16T01:19:49.2373203Z ^[[36;1m  echo CARGO_HTTP_MULTIPLEXING=false >> $GITHUB_ENV^[[0m
+Rust workspace tests	Set up Rust	2026-10-16T01:19:49.2373526Z ^[[36;1mfi^[[0m
+Rust workspace tests	Set up Rust	2026-10-16T01:19:49.2435888Z shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+Rust workspace tests	Set up Rust	2026-10-16T01:19:49.2436242Z env:
+Rust workspace tests	Set up Rust	2026-10-16T01:19:49.2436440Z   CARGO_NET_RETRY: 10
+Rust workspace tests	Set up Rust	2026-10-16T01:19:49.2436675Z   CARGO_HOME: /home/runner/.cargo
+Rust workspace tests	Set up Rust	2026-10-16T01:19:49.2437099Z   CARGO_INCREMENTAL: 0
+Rust workspace tests	Set up Rust	2026-10-16T01:19:49.2437318Z   CARGO_TERM_COLOR: always
+Rust workspace tests	Set up Rust	2026-10-16T01:19:49.2437541Z ##[endgroup]
+Rust workspace tests	Set up Rust	2026-10-16T01:19:49.2638795Z ##[end-action id=__dtolnay_rust-toolchain.__run_9;outcome=success;conclusion=success;duration_ms=28]
+Rust workspace tests	Set up Rust	2026-10-16T01:19:49.2643708Z ##[start-action display=rustc +stable --version --verbose;id=__dtolnay_rust-toolchain.__run_10]
+Rust workspace tests	Set up Rust	2026-10-16T01:19:49.2663818Z ##[group]Run rustc +stable --version --verbose
+Rust workspace tests	Set up Rust	2026-10-16T01:19:49.2664204Z ^[[36;1mrustc +stable --version --verbose^[[0m
+Rust workspace tests	Set up Rust	2026-10-16T01:19:49.2725707Z shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+Rust workspace tests	Set up Rust	2026-10-16T01:19:49.2726063Z env:
+Rust workspace tests	Set up Rust	2026-10-16T01:19:49.2726265Z   CARGO_NET_RETRY: 10
+Rust workspace tests	Set up Rust	2026-10-16T01:19:49.2726496Z   CARGO_HOME: /home/runner/.cargo
+Rust workspace tests	Set up Rust	2026-10-16T01:19:49.2726759Z   CARGO_INCREMENTAL: 0
+Rust workspace tests	Set up Rust	2026-10-16T01:19:49.2726983Z   CARGO_TERM_COLOR: always
+Rust workspace tests	Set up Rust	2026-10-16T01:19:49.2727209Z ##[endgroup]
+Rust workspace tests	Set up Rust	2026-10-16T01:19:49.2911354Z rustc 1.99.1 (58cf8f9c3 2026-10-13)
+Rust workspace tests	Set up Rust	2026-10-16T01:19:49.2912162Z binary: rustc
+Rust workspace tests	Set up Rust	2026-10-16T01:19:49.2912704Z commit-hash: 58cf8f9c35b355199727627d07ae34a4e2846d67
+Rust workspace tests	Set up Rust	2026-10-16T01:19:49.2913359Z commit-date: 2026-10-13
+Rust workspace tests	Set up Rust	2026-10-16T01:19:49.2913964Z host: x86_64-unknown-linux-gnu
+Rust workspace tests	Set up Rust	2026-10-16T01:19:49.2914403Z release: 1.99.1
+Rust workspace tests	Set up Rust	2026-10-16T01:19:49.2914747Z LLVM version: 23.1.1
+Rust workspace tests	Set up Rust	2026-10-16T01:19:49.2939736Z ##[end-action id=__dtolnay_rust-toolchain.__run_10;outcome=success;conclusion=success;duration_ms=29]
+Rust workspace tests	Cache Rust build	﻿2026-10-16T01:19:49.3046296Z ##[group]Run Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+Rust workspace tests	Cache Rust build	2026-10-16T01:19:49.3046724Z with:
+Rust workspace tests	Cache Rust build	2026-10-16T01:19:49.3046940Z   workspaces: packages/aethyme/rust
+Rust workspace tests	Cache Rust build	2026-10-16T01:19:49.3047222Z   shared-key: rust-tests
+Rust workspace tests	Cache Rust build	2026-10-16T01:19:49.3047448Z   save-if: false
+Rust workspace tests	Cache Rust build	2026-10-16T01:19:49.3047651Z   prefix-key: v0-rust
+Rust workspace tests	Cache Rust build	2026-10-16T01:19:49.3047873Z   add-job-id-key: true
+Rust workspace tests	Cache Rust build	2026-10-16T01:19:49.3048108Z   add-rust-environment-hash-key: true
+Rust workspace tests	Cache Rust build	2026-10-16T01:19:49.3048376Z   cache-targets: true
+Rust workspace tests	Cache Rust build	2026-10-16T01:19:49.3048606Z   cache-all-crates: false
+Rust workspace tests	Cache Rust build	2026-10-16T01:19:49.3048852Z   cache-workspace-crates: false
+Rust workspace tests	Cache Rust build	2026-10-16T01:19:49.3049304Z   cache-provider: github
+Rust workspace tests	Cache Rust build	2026-10-16T01:19:49.3049524Z   cache-bin: true
+Rust workspace tests	Cache Rust build	2026-10-16T01:19:49.3049727Z   lookup-only: false
+Rust workspace tests	Cache Rust build	2026-10-16T01:19:49.3049935Z   cmd-format: {0}
+Rust workspace tests	Cache Rust build	2026-10-16T01:19:49.3050203Z env:
+Rust workspace tests	Cache Rust build	2026-10-16T01:19:49.3050410Z   CARGO_NET_RETRY: 10
+Rust workspace tests	Cache Rust build	2026-10-16T01:19:49.3050629Z   CARGO_HOME: /home/runner/.cargo
+Rust workspace tests	Cache Rust build	2026-10-16T01:19:49.3050884Z   CARGO_INCREMENTAL: 0
+Rust workspace tests	Cache Rust build	2026-10-16T01:19:49.3051126Z   CARGO_TERM_COLOR: always
+Rust workspace tests	Cache Rust build	2026-10-16T01:19:49.3051345Z ##[endgroup]
+Rust workspace tests	Cache Rust build	2026-10-16T01:19:58.7940971Z ##[group]Cache Configuration
+Rust workspace tests	Cache Rust build	2026-10-16T01:19:58.7941629Z Cache Provider:
+Rust workspace tests	Cache Rust build	2026-10-16T01:19:58.7970331Z     github
+Rust workspace tests	Cache Rust build	2026-10-16T01:19:58.7979990Z Workspaces:
+Rust workspace tests	Cache Rust build	2026-10-16T01:19:58.7980714Z     /home/runner/work/Aethyme/Aethyme/packages/aethyme/rust
+Rust workspace tests	Cache Rust build	2026-10-16T01:19:58.7981625Z Cache Paths:
+Rust workspace tests	Cache Rust build	2026-10-16T01:19:58.7982157Z     /home/runner/.cargo/bin
+Rust workspace tests	Cache Rust build	2026-10-16T01:19:58.7982609Z     /home/runner/.cargo/.crates.toml
+Rust workspace tests	Cache Rust build	2026-10-16T01:19:58.7983121Z     /home/runner/.cargo/.crates2.json
+Rust workspace tests	Cache Rust build	2026-10-16T01:19:58.7983594Z     /home/runner/.cargo/registry
+Rust workspace tests	Cache Rust build	2026-10-16T01:19:58.7984038Z     /home/runner/.cargo/git
+Rust workspace tests	Cache Rust build	2026-10-16T01:19:58.7984574Z     /home/runner/work/Aethyme/Aethyme/packages/aethyme/rust/target
+Rust workspace tests	Cache Rust build	2026-10-16T01:19:58.7985162Z Restore Key:
+Rust workspace tests	Cache Rust build	2026-10-16T01:19:58.7985525Z     v0-rust-rust-tests-Linux-x64-46bda623
+Rust workspace tests	Cache Rust build	2026-10-16T01:19:58.7985978Z Cache Key:
+Rust workspace tests	Cache Rust build	2026-10-16T01:19:58.7986306Z     v0-rust-rust-tests-Linux-x64-46bda623-418c313b
+Rust workspace tests	Cache Rust build	2026-10-16T01:19:58.7986645Z .. Prefix:
+Rust workspace tests	Cache Rust build	2026-10-16T01:19:58.7986860Z   - v0-rust-rust-tests-Linux-x64
+Rust workspace tests	Cache Rust build	2026-10-16T01:19:58.7987125Z .. Environment considered:
+Rust workspace tests	Cache Rust build	2026-10-16T01:19:58.7987357Z   - Rust Versions:
+Rust workspace tests	Cache Rust build	2026-10-16T01:19:58.7987686Z     - 1.96.0 x86_64-unknown-linux-gnu ac68faa20c58cbccd01ee7208bf3b6e93a7d7f96
+Rust workspace tests	Cache Rust build	2026-10-16T01:19:58.7988171Z     - 1.99.1 x86_64-unknown-linux-gnu 58cf8f9c35b355199727627d07ae34a4e2846d67
+Rust workspace tests	Cache Rust build	2026-10-16T01:19:58.7988529Z   - CARGO_HOME
+Rust workspace tests	Cache Rust build	2026-10-16T01:19:58.7988727Z   - CARGO_INCREMENTAL
+Rust workspace tests	Cache Rust build	2026-10-16T01:19:58.7989703Z   - CARGO_NET_RETRY
+Rust workspace tests	Cache Rust build	2026-10-16T01:19:58.7989924Z   - CARGO_TERM_COLOR
+Rust workspace tests	Cache Rust build	2026-10-16T01:19:58.7990171Z .. Lockfiles considered:
+Rust workspace tests	Cache Rust build	2026-10-16T01:19:58.7990460Z   - /home/runner/work/Aethyme/Aethyme/.cargo/config.toml
+Rust workspace tests	Cache Rust build	2026-10-16T01:19:58.7990888Z   - /home/runner/work/Aethyme/Aethyme/packages/aethyme/rust/Cargo.lock
+Rust workspace tests	Cache Rust build	2026-10-16T01:19:58.7991441Z   - /home/runner/work/Aethyme/Aethyme/packages/aethyme/rust/crates/aethyme-broker/Cargo.toml
+Rust workspace tests	Cache Rust build	2026-10-16T01:19:58.7992073Z   - /home/runner/work/Aethyme/Aethyme/packages/aethyme/rust/crates/aethyme-cli/Cargo.toml
+Rust workspace tests	Cache Rust build	2026-10-16T01:19:58.7992703Z   - /home/runner/work/Aethyme/Aethyme/packages/aethyme/rust/crates/aethyme-contracts/Cargo.toml
+Rust workspace tests	Cache Rust build	2026-10-16T01:19:58.7993325Z   - /home/runner/work/Aethyme/Aethyme/packages/aethyme/rust/crates/aethyme-engine/Cargo.toml
+Rust workspace tests	Cache Rust build	2026-10-16T01:19:58.7993936Z   - /home/runner/work/Aethyme/Aethyme/packages/aethyme/rust/crates/aethyme-enhance/Cargo.toml
+Rust workspace tests	Cache Rust build	2026-10-16T01:19:58.7994580Z   - /home/runner/work/Aethyme/Aethyme/packages/aethyme/rust/crates/aethyme-graph-indexer/Cargo.toml
+Rust workspace tests	Cache Rust build	2026-10-16T01:19:58.7995271Z   - /home/runner/work/Aethyme/Aethyme/packages/aethyme/rust/crates/aethyme-graph-schema/Cargo.toml
+Rust workspace tests	Cache Rust build	2026-10-16T01:19:58.7995936Z   - /home/runner/work/Aethyme/Aethyme/packages/aethyme/rust/crates/aethyme-graph-storage/Cargo.toml
+Rust workspace tests	Cache Rust build	2026-10-16T01:19:58.7996582Z   - /home/runner/work/Aethyme/Aethyme/packages/aethyme/rust/crates/aethyme-producers/Cargo.toml
+Rust workspace tests	Cache Rust build	2026-10-16T01:19:58.7997256Z   - /home/runner/work/Aethyme/Aethyme/packages/aethyme/rust/crates/aethyme-quality/Cargo.toml
+Rust workspace tests	Cache Rust build	2026-10-16T01:19:58.7999253Z   - /home/runner/work/Aethyme/Aethyme/packages/aethyme/rust/crates/aethyme-testkit/Cargo.toml
+Rust workspace tests	Cache Rust build	2026-10-16T01:19:58.8000138Z   - /home/runner/work/Aethyme/Aethyme/rust-toolchain.toml
+Rust workspace tests	Cache Rust build	2026-10-16T01:19:58.8000957Z ##[endgroup]
+Rust workspace tests	Cache Rust build	2026-10-16T01:19:58.8001123Z 
+Rust workspace tests	Cache Rust build	2026-10-16T01:19:58.8001242Z ... Restoring cache ...
+Rust workspace tests	Cache Rust build	2026-10-16T01:19:59.0351571Z No cache found.
+Rust workspace tests	Install cargo-nextest	﻿2026-10-16T01:19:59.0516312Z ##[group]Run taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0
+Rust workspace tests	Install cargo-nextest	2026-10-16T01:19:59.0516785Z with:
+Rust workspace tests	Install cargo-nextest	2026-10-16T01:19:59.0516992Z   tool: cargo-nextest@0.9.146
+Rust workspace tests	Install cargo-nextest	2026-10-16T01:19:59.0517238Z   checksum: true
+Rust workspace tests	Install cargo-nextest	2026-10-16T01:19:59.0517449Z   fallback: cargo-binstall
+Rust workspace tests	Install cargo-nextest	2026-10-16T01:19:59.0517686Z env:
+Rust workspace tests	Install cargo-nextest	2026-10-16T01:19:59.0517873Z   CARGO_NET_RETRY: 10
+Rust workspace tests	Install cargo-nextest	2026-10-16T01:19:59.0518103Z   CARGO_HOME: /home/runner/.cargo
+Rust workspace tests	Install cargo-nextest	2026-10-16T01:19:59.0518360Z   CARGO_INCREMENTAL: 0
+Rust workspace tests	Install cargo-nextest	2026-10-16T01:19:59.0518576Z   CARGO_TERM_COLOR: always
+Rust workspace tests	Install cargo-nextest	2026-10-16T01:19:59.0518803Z   CACHE_ON_FAILURE: false
+Rust workspace tests	Install cargo-nextest	2026-10-16T01:19:59.0519373Z ##[endgroup]
+Rust workspace tests	Install cargo-nextest	2026-10-16T01:19:59.0525631Z ##[start-action display=Run bail() {;id=__taiki-e_install-action.__run]
+Rust workspace tests	Install cargo-nextest	2026-10-16T01:19:59.0544321Z ##[group]Run bail() {
+Rust workspace tests	Install cargo-nextest	2026-10-16T01:19:59.0544598Z ^[[36;1mbail() {^[[0m
+Rust workspace tests	Install cargo-nextest	2026-10-16T01:19:59.0544850Z ^[[36;1m  printf '::error::install-action: %s\n' "$*"^[[0m
+Rust workspace tests	Install cargo-nextest	2026-10-16T01:19:59.0545158Z ^[[36;1m  exit 1^[[0m
+Rust workspace tests	Install cargo-nextest	2026-10-16T01:19:59.0545347Z ^[[36;1m}^[[0m
+Rust workspace tests	Install cargo-nextest	2026-10-16T01:19:59.0545743Z ^[[36;1m# If /bin/sh is dash, environment variable containing % is not imported, but is fine^[[0m
+Rust workspace tests	Install cargo-nextest	2026-10-16T01:19:59.0546301Z ^[[36;1m# because it also means that it will not be exposed to subprocess.^[[0m
+Rust workspace tests	Install cargo-nextest	2026-10-16T01:19:59.0546726Z ^[[36;1mif /usr/bin/env | grep -Eq '^BASH_FUNC_'; then^[[0m
+Rust workspace tests	Install cargo-nextest	2026-10-16T01:19:59.0547267Z ^[[36;1m  bail 'bash function injection via BASH_FUNC_ environment variable is not allowed for security reasons'^[[0m
+Rust workspace tests	Install cargo-nextest	2026-10-16T01:19:59.0547759Z ^[[36;1mfi^[[0m
+Rust workspace tests	Install cargo-nextest	2026-10-16T01:19:59.0547991Z ^[[36;1mif ! command -v bash >/dev/null; then^[[0m
+Rust workspace tests	Install cargo-nextest	2026-10-16T01:19:59.0548335Z ^[[36;1m  if grep -Eq '^ID=alpine' /etc/os-release; then^[[0m
+Rust workspace tests	Install cargo-nextest	2026-10-16T01:19:59.0548776Z ^[[36;1m    printf '::group::Install packages required for install-action (bash)\n'^[[0m
+Rust workspace tests	Install cargo-nextest	2026-10-16T01:19:59.0549383Z ^[[36;1m    # NB: sync with apk_install in main.sh^[[0m
+Rust workspace tests	Install cargo-nextest	2026-10-16T01:19:59.0549708Z ^[[36;1m    if command -v sudo >/dev/null; then^[[0m
+Rust workspace tests	Install cargo-nextest	2026-10-16T01:19:59.0550014Z ^[[36;1m      sudo apk --no-cache add bash^[[0m
+Rust workspace tests	Install cargo-nextest	2026-10-16T01:19:59.0550340Z ^[[36;1m    elif command -v doas >/dev/null; then^[[0m
+Rust workspace tests	Install cargo-nextest	2026-10-16T01:19:59.0550852Z ^[[36;1m      doas apk --no-cache add bash^[[0m
+Rust workspace tests	Install cargo-nextest	2026-10-16T01:19:59.0551128Z ^[[36;1m    else^[[0m
+Rust workspace tests	Install cargo-nextest	2026-10-16T01:19:59.0551346Z ^[[36;1m      apk --no-cache add bash^[[0m
+Rust workspace tests	Install cargo-nextest	2026-10-16T01:19:59.0551603Z ^[[36;1m    fi^[[0m
+Rust workspace tests	Install cargo-nextest	2026-10-16T01:19:59.0551814Z ^[[36;1m    printf '::endgroup::\n'^[[0m
+Rust workspace tests	Install cargo-nextest	2026-10-16T01:19:59.0552059Z ^[[36;1m  else^[[0m
+Rust workspace tests	Install cargo-nextest	2026-10-16T01:19:59.0552282Z ^[[36;1m    bail 'this action requires bash'^[[0m
+Rust workspace tests	Install cargo-nextest	2026-10-16T01:19:59.0552551Z ^[[36;1m  fi^[[0m
+Rust workspace tests	Install cargo-nextest	2026-10-16T01:19:59.0552731Z ^[[36;1mfi^[[0m
+Rust workspace tests	Install cargo-nextest	2026-10-16T01:19:59.0553002Z ^[[36;1mbash --noprofile --norc "${GITHUB_ACTION_PATH:?}/main.sh"^[[0m
+Rust workspace tests	Install cargo-nextest	2026-10-16T01:19:59.0554149Z shell: /usr/bin/env -u ENV -u BASH_ENV -u CDPATH -u SHELLOPTS -u BASHOPTS /bin/sh -eu {0}
+Rust workspace tests	Install cargo-nextest	2026-10-16T01:19:59.0554562Z env:
+Rust workspace tests	Install cargo-nextest	2026-10-16T01:19:59.0554745Z   CARGO_NET_RETRY: 10
+Rust workspace tests	Install cargo-nextest	2026-10-16T01:19:59.0554970Z   CARGO_HOME: /home/runner/.cargo
+Rust workspace tests	Install cargo-nextest	2026-10-16T01:19:59.0555218Z   CARGO_INCREMENTAL: 0
+Rust workspace tests	Install cargo-nextest	2026-10-16T01:19:59.0555444Z   CARGO_TERM_COLOR: always
+Rust workspace tests	Install cargo-nextest	2026-10-16T01:19:59.0555678Z   CACHE_ON_FAILURE: false
+Rust workspace tests	Install cargo-nextest	2026-10-16T01:19:59.0555914Z   INPUT_TOOL: cargo-nextest@0.9.146
+Rust workspace tests	Install cargo-nextest	2026-10-16T01:19:59.0556168Z   INPUT_CHECKSUM: true
+Rust workspace tests	Install cargo-nextest	2026-10-16T01:19:59.0556392Z   INPUT_FALLBACK: cargo-binstall
+Rust workspace tests	Install cargo-nextest	2026-10-16T01:19:59.0559290Z   DEFAULT_GITHUB_TOKEN: ***
+Rust workspace tests	Install cargo-nextest	2026-10-16T01:19:59.0559719Z   ACTION_USER_AGENT: taiki-e/install-action (e407f7bafb71fd004bc5c2da3032e5470cbb6ef0)
+Rust workspace tests	Install cargo-nextest	2026-10-16T01:19:59.0560147Z   RUNNER_OS: Linux
+Rust workspace tests	Install cargo-nextest	2026-10-16T01:19:59.0560351Z   RUNNER_ARCH: X64
+Rust workspace tests	Install cargo-nextest	2026-10-16T01:19:59.0560548Z ##[endgroup]
+Rust workspace tests	Install cargo-nextest	2026-10-16T01:19:59.0701449Z info: host platform: x86_64_linux
+Rust workspace tests	Install cargo-nextest	2026-10-16T01:19:59.0951781Z info: installing cargo-nextest@0.9.146
+Rust workspace tests	Install cargo-nextest	2026-10-16T01:19:59.1173394Z info: downloading https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-0.9.146/cargo-nextest-0.9.146-x86_64-unknown-linux-gnu.tar.gz
+Rust workspace tests	Install cargo-nextest	2026-10-16T01:19:59.3403532Z info: verifying sha256 checksum for cargo-nextest-0.9.146-x86_64-unknown-linux-gnu.tar.gz
+Rust workspace tests	Install cargo-nextest	2026-10-16T01:19:59.6113713Z info: cargo-nextest installed at /home/runner/.cargo/bin/cargo-nextest
+Rust workspace tests	Install cargo-nextest	2026-10-16T01:19:59.6116908Z + cargo-nextest nextest --version
+Rust workspace tests	Install cargo-nextest	2026-10-16T01:19:59.6146037Z cargo-nextest 0.9.146 (8af696ddc 2026-09-21)
+Rust workspace tests	Install cargo-nextest	2026-10-16T01:19:59.6146571Z release: 0.9.146
+Rust workspace tests	Install cargo-nextest	2026-10-16T01:19:59.6147001Z commit-hash: 8af696ddcce8fff2962d6a5168b6d138b8616a35
+Rust workspace tests	Install cargo-nextest	2026-10-16T01:19:59.6147533Z commit-date: 2026-09-21
+Rust workspace tests	Install cargo-nextest	2026-10-16T01:19:59.6147930Z host: x86_64-unknown-linux-gnu
+Rust workspace tests	Install cargo-nextest	2026-10-16T01:19:59.6151822Z 
+Rust workspace tests	Install cargo-nextest	2026-10-16T01:19:59.6164136Z ##[end-action id=__taiki-e_install-action.__run;outcome=success;conclusion=success;duration_ms=563]
+Rust workspace tests	Install cargo-nextest	2026-10-16T01:19:59.6169300Z ##[start-action display=Run Set-StrictMode -Version Latest;id=__taiki-e_install-action.__run_2]
+Rust workspace tests	Install cargo-nextest	2026-10-16T01:19:59.6173337Z ##[end-action id=__taiki-e_install-action.__run_2;outcome=skipped;conclusion=skipped;duration_ms=0]
+Rust workspace tests	Build the product binaries	﻿2026-10-16T01:19:59.6211027Z ##[group]Run cargo build --locked --workspace --bins
+Rust workspace tests	Build the product binaries	2026-10-16T01:19:59.6211463Z ^[[36;1mcargo build --locked --workspace --bins^[[0m
+Rust workspace tests	Build the product binaries	2026-10-16T01:19:59.6274101Z shell: /usr/bin/bash -e {0}
+Rust workspace tests	Build the product binaries	2026-10-16T01:19:59.6274363Z env:
+Rust workspace tests	Build the product binaries	2026-10-16T01:19:59.6274554Z   CARGO_NET_RETRY: 10
+Rust workspace tests	Build the product binaries	2026-10-16T01:19:59.6274784Z   CARGO_HOME: /home/runner/.cargo
+Rust workspace tests	Build the product binaries	2026-10-16T01:19:59.6275041Z   CARGO_INCREMENTAL: 0
+Rust workspace tests	Build the product binaries	2026-10-16T01:19:59.6275260Z   CARGO_TERM_COLOR: always
+Rust workspace tests	Build the product binaries	2026-10-16T01:19:59.6275490Z   CACHE_ON_FAILURE: false
+Rust workspace tests	Build the product binaries	2026-10-16T01:19:59.6275713Z ##[endgroup]
+Rust workspace tests	Build the product binaries	2026-10-16T01:19:59.6954895Z ^[[1m^[[92m    Updating^[[0m crates.io index
+Rust workspace tests	Build the product binaries	2026-10-16T01:20:00.0436275Z ^[[1m^[[91merror^[[0m: failed to get `bstr` as a dependency of package `globset v0.4.20`
+Rust workspace tests	Build the product binaries	2026-10-16T01:20:00.0438331Z     ... which satisfies dependency `globset = "^0.4"` (locked to 0.4.20) of package `aethyme-broker v0.8.26 (/home/runner/work/Aethyme/Aethyme/packages/aethyme/rust/crates/aethyme-broker)`
+Rust workspace tests	Build the product binaries	2026-10-16T01:20:00.0440678Z 
+Rust workspace tests	Build the product binaries	2026-10-16T01:20:00.0440866Z Caused by:
+Rust workspace tests	Build the product binaries	2026-10-16T01:20:00.0441474Z   failed to load source for dependency `bstr`
+Rust workspace tests	Build the product binaries	2026-10-16T01:20:00.0441946Z 
+Rust workspace tests	Build the product binaries	2026-10-16T01:20:00.0442115Z Caused by:
+Rust workspace tests	Build the product binaries	2026-10-16T01:20:00.0443038Z   unable to update registry `crates-io`
+Rust workspace tests	Build the product binaries	2026-10-16T01:20:00.0443492Z 
+Rust workspace tests	Build the product binaries	2026-10-16T01:20:00.0443660Z Caused by:
+Rust workspace tests	Build the product binaries	2026-10-16T01:20:00.0444005Z   download of bs/tr/bstr failed
+Rust workspace tests	Build the product binaries	2026-10-16T01:20:00.0444315Z 
+Rust workspace tests	Build the product binaries	2026-10-16T01:20:00.0444441Z Caused by:
+Rust workspace tests	Build the product binaries	2026-10-16T01:20:00.0444764Z   curl failed
+Rust workspace tests	Build the product binaries	2026-10-16T01:20:00.0444971Z 
+Rust workspace tests	Build the product binaries	2026-10-16T01:20:00.0445147Z Caused by:
+Rust workspace tests	Build the product binaries	2026-10-16T01:20:00.0445542Z   [16] Error in the HTTP2 framing layer
+Rust workspace tests	Build the product binaries	2026-10-16T01:20:00.0497498Z ##[error]Process completed with exit code 101.
+Rust workspace tests	Post Checkout	﻿2026-10-16T01:20:00.0643779Z Post job cleanup.
+Rust workspace tests	Post Checkout	2026-10-16T01:20:00.1572305Z [command]/usr/bin/git version
+Rust workspace tests	Post Checkout	2026-10-16T01:20:00.1618359Z git version 2.55.0
+Rust workspace tests	Post Checkout	2026-10-16T01:20:00.1657955Z Temporarily overriding HOME='/home/runner/work/_temp/73231e08-60b4-4bf9-8d04-df9cb7bc0bbb' before making global git config changes
+Rust workspace tests	Post Checkout	2026-10-16T01:20:00.1659826Z Adding repository directory to the temporary git global config as a safe directory
+Rust workspace tests	Post Checkout	2026-10-16T01:20:00.1664829Z [command]/usr/bin/git config --global --add safe.directory /home/runner/work/Aethyme/Aethyme
+Rust workspace tests	Post Checkout	2026-10-16T01:20:00.1704714Z Removing SSH command configuration
+Rust workspace tests	Post Checkout	2026-10-16T01:20:00.1711834Z [command]/usr/bin/git config --local --name-only --get-regexp core\.sshCommand
+Rust workspace tests	Post Checkout	2026-10-16T01:20:00.1753637Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :"
+Rust workspace tests	Post Checkout	2026-10-16T01:20:00.2007949Z Removing HTTP extra header
+Rust workspace tests	Post Checkout	2026-10-16T01:20:00.2014433Z [command]/usr/bin/git config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
+Rust workspace tests	Post Checkout	2026-10-16T01:20:00.2056486Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :"
+Rust workspace tests	Post Checkout	2026-10-16T01:20:00.2333399Z Removing includeIf entries pointing to credentials config files
+Rust workspace tests	Post Checkout	2026-10-16T01:20:00.2350437Z [command]/usr/bin/git config --local --name-only --get-regexp ^includeIf\.gitdir:
+Rust workspace tests	Post Checkout	2026-10-16T01:20:00.2381296Z includeif.gitdir:/home/runner/work/Aethyme/Aethyme/.git.path
+Rust workspace tests	Post Checkout	2026-10-16T01:20:00.2382653Z includeif.gitdir:/home/runner/work/Aethyme/Aethyme/.git/worktrees/*.path
+Rust workspace tests	Post Checkout	2026-10-16T01:20:00.2383555Z includeif.gitdir:/github/workspace/.git.path
+Rust workspace tests	Post Checkout	2026-10-16T01:20:00.2384294Z includeif.gitdir:/github/workspace/.git/worktrees/*.path
+Rust workspace tests	Post Checkout	2026-10-16T01:20:00.2391158Z [command]/usr/bin/git config --local --get-all includeif.gitdir:/home/runner/work/Aethyme/Aethyme/.git.path
+Rust workspace tests	Post Checkout	2026-10-16T01:20:00.2419929Z /home/runner/work/_temp/git-credentials-bdc2a9bc-474e-40d8-a73e-457a416bd478.config
+Rust workspace tests	Post Checkout	2026-10-16T01:20:00.2434381Z [command]/usr/bin/git config --local --unset includeif.gitdir:/home/runner/work/Aethyme/Aethyme/.git.path \/home\/runner\/work\/_temp\/git\-credentials\-bdc2a9bc\-474e\-40d8\-a73e\-457a416bd478\.config
+Rust workspace tests	Post Checkout	2026-10-16T01:20:00.2488418Z [command]/usr/bin/git config --local --get-all includeif.gitdir:/home/runner/work/Aethyme/Aethyme/.git/worktrees/*.path
+Rust workspace tests	Post Checkout	2026-10-16T01:20:00.2540100Z /home/runner/work/_temp/git-credentials-bdc2a9bc-474e-40d8-a73e-457a416bd478.config
+Rust workspace tests	Post Checkout	2026-10-16T01:20:00.2545618Z [command]/usr/bin/git config --local --unset includeif.gitdir:/home/runner/work/Aethyme/Aethyme/.git/worktrees/*.path \/home\/runner\/work\/_temp\/git\-credentials\-bdc2a9bc\-474e\-40d8\-a73e\-457a416bd478\.config
+Rust workspace tests	Post Checkout	2026-10-16T01:20:00.2597537Z [command]/usr/bin/git config --local --get-all includeif.gitdir:/github/workspace/.git.path
+Rust workspace tests	Post Checkout	2026-10-16T01:20:00.2620175Z /github/runner_temp/git-credentials-bdc2a9bc-474e-40d8-a73e-457a416bd478.config
+Rust workspace tests	Post Checkout	2026-10-16T01:20:00.2631138Z [command]/usr/bin/git config --local --unset includeif.gitdir:/github/workspace/.git.path \/github\/runner_temp\/git\-credentials\-bdc2a9bc\-474e\-40d8\-a73e\-457a416bd478\.config
+Rust workspace tests	Post Checkout	2026-10-16T01:20:00.2685391Z [command]/usr/bin/git config --local --get-all includeif.gitdir:/github/workspace/.git/worktrees/*.path
+Rust workspace tests	Post Checkout	2026-10-16T01:20:00.2707187Z /github/runner_temp/git-credentials-bdc2a9bc-474e-40d8-a73e-457a416bd478.config
+Rust workspace tests	Post Checkout	2026-10-16T01:20:00.2728371Z [command]/usr/bin/git config --local --unset includeif.gitdir:/github/workspace/.git/worktrees/*.path \/github\/runner_temp\/git\-credentials\-bdc2a9bc\-474e\-40d8\-a73e\-457a416bd478\.config
+Rust workspace tests	Post Checkout	2026-10-16T01:20:00.2764136Z [command]/usr/bin/git submodule foreach --recursive git config --local --show-origin --name-only --get-regexp remote.origin.url
+Rust workspace tests	Post Checkout	2026-10-16T01:20:00.2997286Z Removing credentials config '/home/runner/work/_temp/git-credentials-bdc2a9bc-474e-40d8-a73e-457a416bd478.config'
+Rust workspace tests	Complete job	﻿2026-10-16T01:20:00.3156153Z Cleaning up orphan processes

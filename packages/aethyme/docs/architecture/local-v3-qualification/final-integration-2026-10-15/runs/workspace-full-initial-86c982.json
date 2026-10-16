@@ -1,0 +1,87 @@
+{
+  "argv": [
+    "packages/aethyme/scripts/test-like-ci.sh",
+    "--full"
+  ],
+  "duration_seconds": 1019.672749,
+  "ended_at_utc": "2026-10-15T16:38:21.860259Z",
+  "environment": {
+    "explicit_profile_keys": [],
+    "values": {
+      "CARGO_BUILD_JOBS": "4",
+      "CARGO_TARGET_DIR": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/integrate-reviewed-local-bare-git-servic/target/local-resume/cargo",
+      "HOME": "/Users/christophehenner",
+      "LANG": "en_US.UTF-8",
+      "LC_ALL": "en_US.UTF-8",
+      "PATH": "/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/christophehenner/.cargo/bin",
+      "RUSTC_WRAPPER": "",
+      "TMPDIR": "/Volumes/T7-repositories/Application Support/Aethyme/qualification/local-check-temporaries/workspace-full-86c982eeecd9-tmp-_toub1sd"
+    }
+  },
+  "execution_context": {
+    "host": {
+      "hostname": "Mac.lan",
+      "machine": "arm64",
+      "platform": "macOS-27.2-arm64-arm-64bit",
+      "python": "3.9.6 (default, Aug 25 2026, 21:26:21) "
+    },
+    "tmp_volume": {
+      "free_bytes_before": 124208291840,
+      "path": "/Volumes/T7-repositories/Application Support/Aethyme/qualification/local-check-temporaries",
+      "total_bytes": 899994554368
+    },
+    "tool_versions": {
+      "aethyme": {
+        "executable": "/Users/christophehenner/.cargo/bin/aethyme",
+        "exit_code": 0,
+        "version": "aethyme 0.8.26 (v0.8.26 build_commit=5e8daf712e26c63f1d4082e9a617f556cf995de2) build_date=2026-10-08T19:30:03Z"
+      },
+      "cargo": {
+        "executable": "/Users/christophehenner/.cargo/bin/cargo",
+        "exit_code": 0,
+        "version": "cargo 1.96.0 (30a34c682 2026-05-25)"
+      },
+      "git": {
+        "executable": "/opt/homebrew/bin/git",
+        "exit_code": 0,
+        "version": "git version 2.55.0"
+      },
+      "rustc": {
+        "executable": "/Users/christophehenner/.cargo/bin/rustc",
+        "exit_code": 0,
+        "version": "rustc 1.96.0 (ac68faa20 2026-05-25)"
+      }
+    }
+  },
+  "label": "workspace-full-86c982eeecd9",
+  "launcher_error": null,
+  "log_bytes": 829281,
+  "log_path": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/682-reconcile-final-local-qualification/target/local-resume/final-workspace-batches/20261015T162121Z-86c982eeecd9/runs/20261015T162121Z-workspace-full-86c982eeecd9-6d7fdc93/command.log",
+  "log_sha256": "07ad97d1554c70b37768d7e6528538644eae6a6d8b5b2e8f441f4173fe71b853",
+  "numeric_exit": 100,
+  "root": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/682-reconcile-final-local-qualification",
+  "schema": "aethyme.local-check/v1",
+  "source_after": {
+    "diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "head": "86c982eeecd92e473e309bf0f13dfdde1379e6ac",
+    "status": "",
+    "tree": "c2227f58038619a59decdc37b36df1af5ce73a92",
+    "untracked_content_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  "source_before": {
+    "diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "head": "86c982eeecd92e473e309bf0f13dfdde1379e6ac",
+    "status": "",
+    "tree": "c2227f58038619a59decdc37b36df1af5ce73a92",
+    "untracked_content_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  "source_unchanged": true,
+  "started_at_utc": "2026-10-15T16:21:22.265081Z",
+  "state": "completed",
+  "status_bytes": 4,
+  "status_path": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/682-reconcile-final-local-qualification/target/local-resume/final-workspace-batches/20261015T162121Z-86c982eeecd9/runs/20261015T162121Z-workspace-full-86c982eeecd9-6d7fdc93/command.status",
+  "status_sha256": "eea8254c7500ba3de996aa8ad6af399183f04e17d4a8102fde539dbc93a90012",
+  "termination_signal": null,
+  "tmpdir": "/Volumes/T7-repositories/Application Support/Aethyme/qualification/local-check-temporaries/workspace-full-86c982eeecd9-tmp-_toub1sd",
+  "working_directory": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/682-reconcile-final-local-qualification"
+}

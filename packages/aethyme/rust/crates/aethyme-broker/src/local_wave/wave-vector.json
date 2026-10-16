@@ -1,0 +1,5 @@
+{
+  "origin": "Independent Node canonical ASCII JSON and crypto SHA-256; no product implementation imported",
+  "canonical": "{\"schema\":\"aethyme.local-wave/provisional-v0\",\"spec\":{\"baseline\":\"sha256:3333333333333333333333333333333333333333333333333333333333333333\",\"issuer\":\"appointed\",\"objective_authorization\":\"sha256:2222222222222222222222222222222222222222222222222222222222222222\",\"policy\":{\"age_promotion_ms\":5000,\"batch_width\":3,\"debounce_ms\":200,\"drift_rechecks\":2,\"max_group\":1024},\"revision\":\"sha256:1111111111111111111111111111111111111111111111111111111111111111\",\"selected\":[\"B\",\"A\"],\"sequence\":1,\"target\":\"example\"}}",
+  "id": "sha256:95002430b335019f759b6d0f1acd65ae6069751d2de561eea46f55079b9f4722"
+}

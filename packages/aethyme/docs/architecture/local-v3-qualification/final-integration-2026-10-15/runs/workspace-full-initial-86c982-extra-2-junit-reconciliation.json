@@ -1,0 +1,10 @@
+{
+  "source_head": "86c982eeecd92e473e309bf0f13dfdde1379e6ac",
+  "raw_recorder_path": "target/local-resume/final-workspace-batches/20261015T162121Z-86c982eeecd9/runs/20261015T162121Z-workspace-full-86c982eeecd9-6d7fdc93/command.json",
+  "reconciled_at_utc": "2026-10-15T16:45:04.686833+00:00",
+  "source_path": "packages/aethyme/rust/target/nextest/ci/junit.xml",
+  "mtime_utc": "2026-10-15T16:38:21.803725+00:00",
+  "bytes": 1163903,
+  "sha256": "cc8d3108e7e6e2121293481db2acbde1182e16ad01311708967babca446f19e9",
+  "reason": "Driver probed shared Cargo target, but nextest CI writes under workspace rust/target/nextest/ci; original driver batch metadata remains unchanged. JUnit mtime falls within the source-bound command and XML counts are reconciled separately."
+}

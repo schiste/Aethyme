@@ -1,0 +1,104 @@
+{
+  "source_head": "86c982eeecd92e473e309bf0f13dfdde1379e6ac",
+  "checks": [
+    {
+      "label": "workspace-full",
+      "cwd": ".",
+      "argv": [
+        "packages/aethyme/scripts/test-like-ci.sh",
+        "--full"
+      ]
+    },
+    {
+      "label": "workspace-fmt",
+      "cwd": "packages/aethyme/rust",
+      "argv": [
+        "cargo",
+        "fmt",
+        "--all",
+        "--",
+        "--check"
+      ]
+    },
+    {
+      "label": "workspace-clippy",
+      "cwd": "packages/aethyme/rust",
+      "argv": [
+        "cargo",
+        "clippy",
+        "--locked",
+        "-j",
+        "4",
+        "--workspace",
+        "--all-targets",
+        "--",
+        "-D",
+        "warnings"
+      ]
+    },
+    {
+      "label": "workspace-examples",
+      "cwd": "packages/aethyme/rust",
+      "argv": [
+        "cargo",
+        "test",
+        "--locked",
+        "-j",
+        "4",
+        "--workspace",
+        "--examples"
+      ]
+    },
+    {
+      "label": "workspace-doc",
+      "cwd": "packages/aethyme/rust",
+      "argv": [
+        "cargo",
+        "test",
+        "--locked",
+        "-j",
+        "4",
+        "--workspace",
+        "--doc"
+      ]
+    }
+  ],
+  "results": [
+    {
+      "label": "workspace-full",
+      "recorder_returncode": 100,
+      "metadata": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/682-reconcile-final-local-qualification/target/local-resume/final-workspace-batches/20261015T162121Z-86c982eeecd9/runs/20261015T162121Z-workspace-full-86c982eeecd9-6d7fdc93/command.json",
+      "source_unchanged_and_clean": true,
+      "source_after": {
+        "head": "86c982eeecd92e473e309bf0f13dfdde1379e6ac",
+        "status": ""
+      },
+      "junit_copy": null,
+      "junit_note": "No fresh JUnit file produced by this command; do not credit an earlier run"
+    }
+  ],
+  "declared_environment": {
+    "HOME": "/Users/christophehenner",
+    "LANG": "en_US.UTF-8",
+    "LC_ALL": "en_US.UTF-8",
+    "PATH": "/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/christophehenner/.cargo/bin",
+    "RUSTC_WRAPPER": "",
+    "CARGO_BUILD_JOBS": "4",
+    "CARGO_TARGET_DIR": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/integrate-reviewed-local-bare-git-servic/target/local-resume/cargo"
+  },
+  "runtime_handoff": {
+    "path": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/682-reconcile-final-local-qualification/target/local-resume/final-workspace-runtime-handoff.json",
+    "sha256": "48c02012dc71780c028f10b1951514544427452eac13f5cfca6ba5b12abed998",
+    "record": {
+      "cargo_native_slot_released": true,
+      "root_source_head": "86c982eeecd92e473e309bf0f13dfdde1379e6ac",
+      "created_at_utc": "2026-10-15T16:21:21.725899+00:00",
+      "released_by_session": 1126,
+      "released_source_head": "487169242ddc3eb47ee17aed55327a1022b81076",
+      "release_message": "64ac merged and pushed; worktree clean. Releasing exclusive Cargo/native slot; no further Cargo/native commands. Static evidence packaging/review continues.",
+      "source_scope": "Root already integrates T45 bc0b03 and native64ac; no tracked edits or HEAD changes during five sequential checks."
+    }
+  },
+  "shared_target_lock": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/integrate-reviewed-local-bare-git-servic/target/local-resume/cargo/.aethyme-final-local-validation.lock",
+  "preflight_active_compilers": []
+}

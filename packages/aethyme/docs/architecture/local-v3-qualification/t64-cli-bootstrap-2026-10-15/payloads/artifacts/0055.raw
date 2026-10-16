@@ -1,0 +1,12 @@
+--- a/packages/aethyme/rust/crates/aethyme-broker/src/collaboration_sensitive.rs
++++ b/packages/aethyme/rust/crates/aethyme-broker/src/collaboration_sensitive.rs
+@@ -1262,8 +1262,7 @@
+     if before.file_type().is_symlink() || !before.is_dir() {
+         return Err(());
+     }
+-    let recognized =
+-        empty_unheld_control_lock(&project_dir.join(CAPTURE_NOTICE_INGRESS_LOCK_PATH))?;
++    let recognized = fs::symlink_metadata(&project_dir.join(CAPTURE_NOTICE_INGRESS_LOCK_PATH)).is_ok();
+     let after = fs::symlink_metadata(&spool).map_err(|_| ())?;
+     if after.file_type().is_symlink() || !after.is_dir() {
+         return Err(());

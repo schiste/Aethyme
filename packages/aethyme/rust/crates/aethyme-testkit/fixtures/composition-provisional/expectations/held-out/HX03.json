@@ -1,0 +1,57 @@
+{
+  "schema": "aethyme.composition-expectations/provisional-v0",
+  "case": "HX03",
+  "title": "Held-out FX03 variant: inherited contribution on a moved-on baseline, and an unrecorded base",
+  "plan": "#650 held-out variant of FX03",
+  "scenarios": {
+    "s1": {
+      "title": "",
+      "required_outcomes": [
+        "candidate"
+      ],
+      "behaviors": [
+        {
+          "check": "text",
+          "file": "index.html",
+          "selector": "#step-c",
+          "equals": "Sign in with your account"
+        },
+        {
+          "check": "count",
+          "file": "index.html",
+          "selector": "#steps li",
+          "equals": 3
+        },
+        {
+          "check": "text",
+          "file": "index.html",
+          "selector": "#caption",
+          "equals": "Getting started quickly"
+        },
+        {
+          "check": "text",
+          "file": "index.html",
+          "selector": "#note",
+          "equals": "Takes about two minutes."
+        }
+      ],
+      "provisional_text": {
+        "outcome": "conflict",
+        "behavior": null,
+        "note": "c2's caption edit sits on the line next to the baseline's accepted note change, so a line merge conflicts even with exact lineage"
+      }
+    },
+    "s2": {
+      "title": "",
+      "required_outcomes": [
+        "unknown_base"
+      ],
+      "behaviors": [],
+      "provisional_text": {
+        "outcome": null,
+        "behavior": null,
+        "note": "planning refusal: decided from lineage, selection and records before any merge engine runs, so the text profile is not measured"
+      }
+    }
+  }
+}

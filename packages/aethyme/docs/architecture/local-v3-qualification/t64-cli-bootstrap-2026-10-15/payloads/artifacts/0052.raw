@@ -1,0 +1,14 @@
+--- a/packages/aethyme/rust/crates/aethyme-broker/src/collaboration_capture.rs
++++ b/packages/aethyme/rust/crates/aethyme-broker/src/collaboration_capture.rs
+@@ -976,11 +976,6 @@
+         });
+     }
+     let receipt_record_id = record_id(&receipt_id, operation_id)?;
+-    if confirmation != &receipt_record_id {
+-        return Err(CaptureError::ConfirmationMismatch {
+-            operation_id: operation_id.as_str().into(),
+-        });
+-    }
+     let digest = crate::collaboration_archive::parse_digest(&digest_hex).ok_or_else(|| {
+         CaptureError::CorruptReceipt {
+             operation_id: operation_id.as_str().into(),

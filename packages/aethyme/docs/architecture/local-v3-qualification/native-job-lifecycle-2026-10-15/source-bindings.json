@@ -1,0 +1,131 @@
+{
+  "schema": "aethyme.native-retention-source-bindings/v1",
+  "recorded_at_utc": "2026-10-15T14:26:46Z",
+  "tested_source_heads": [
+    {
+      "commit": "e9a62f328db011d00def7a40ffccbe2da4c82967",
+      "tree": "61a3bceeb876587819222cca6344574e04d77857",
+      "role": "15-test suite, migration fixtures, snapshot checks and strict Clippy"
+    },
+    {
+      "commit": "d52bc0a514fc5035fe143b97208a9e328f6a5d8e",
+      "tree": "8840983777e2bc46dac1a2b5c748935955cb7be6",
+      "role": "M1-M6 mutations and initial restoration attempts"
+    },
+    {
+      "commit": "3df43525dafede5f5c0119b9e8444ed9730dea9f",
+      "tree": "04d4728e2f5a92c8e6928197d26fb743b2269ac8",
+      "role": "final restored-source sanity and final snapshot/ratchet checks"
+    }
+  ],
+  "commit_delta_binding": {
+    "e9_to_d52_native_source_diff_empty": true,
+    "d52_to_3df_native_source_diff_empty": true,
+    "only_e9_to_d52_tracked_path": "packages/aethyme/rust/crates/aethyme-cli/tests/snapshots/help/collab.snap",
+    "early_local_runs_had_only_qualification_ledger_overlay": true,
+    "note": "Three native lifecycle source files are byte-identical across the tested heads and match all six restored mutation backups."
+  },
+  "files": [
+    {
+      "path": "packages/aethyme/rust/crates/aethyme-broker/src/native_gates.rs",
+      "bytes": 38968,
+      "sha256": "e17607f4b349556be3eb38651e8bd270087c84d3023c7b767b3308293aa838b5",
+      "bound_tested_heads": [
+        "e9a62f328db011d00def7a40ffccbe2da4c82967",
+        "d52bc0a514fc5035fe143b97208a9e328f6a5d8e",
+        "3df43525dafede5f5c0119b9e8444ed9730dea9f"
+      ],
+      "same_bytes_at_each_bound_head": true,
+      "mutation_ids": [
+        "M1",
+        "M2",
+        "M4",
+        "M6"
+      ]
+    },
+    {
+      "path": "packages/aethyme/rust/crates/aethyme-broker/src/collaboration_state.rs",
+      "bytes": 83144,
+      "sha256": "998d698813a6ea3091e8445db54cc155b9b041633748c7c7cb86ee78761f0cd8",
+      "bound_tested_heads": [
+        "e9a62f328db011d00def7a40ffccbe2da4c82967",
+        "d52bc0a514fc5035fe143b97208a9e328f6a5d8e",
+        "3df43525dafede5f5c0119b9e8444ed9730dea9f"
+      ],
+      "same_bytes_at_each_bound_head": true,
+      "mutation_ids": [
+        "M3"
+      ]
+    },
+    {
+      "path": "packages/aethyme/rust/crates/aethyme-broker/src/collaboration_gc.rs",
+      "bytes": 118203,
+      "sha256": "aa98ce865560de6a91b426fbcdf4fa570c8e1258845675a63d620995c89ddb1f",
+      "bound_tested_heads": [
+        "e9a62f328db011d00def7a40ffccbe2da4c82967",
+        "d52bc0a514fc5035fe143b97208a9e328f6a5d8e",
+        "3df43525dafede5f5c0119b9e8444ed9730dea9f"
+      ],
+      "same_bytes_at_each_bound_head": true,
+      "mutation_ids": [
+        "M5"
+      ]
+    }
+  ],
+  "mutation_restorations": [
+    {
+      "mutation_id": "M1",
+      "source_path": "packages/aethyme/rust/crates/aethyme-broker/src/native_gates.rs",
+      "backup_path": "evidence/mutation-backups/m1-release-without-archive-use.NKsZIC",
+      "backup_bytes": 38968,
+      "backup_sha256": "e17607f4b349556be3eb38651e8bd270087c84d3023c7b767b3308293aa838b5",
+      "restored_source_sha256": "e17607f4b349556be3eb38651e8bd270087c84d3023c7b767b3308293aa838b5",
+      "byte_identical": true
+    },
+    {
+      "mutation_id": "M2",
+      "source_path": "packages/aethyme/rust/crates/aethyme-broker/src/native_gates.rs",
+      "backup_path": "evidence/mutation-backups/m2-release-without-owner-authorization.73zwDd",
+      "backup_bytes": 38968,
+      "backup_sha256": "e17607f4b349556be3eb38651e8bd270087c84d3023c7b767b3308293aa838b5",
+      "restored_source_sha256": "e17607f4b349556be3eb38651e8bd270087c84d3023c7b767b3308293aa838b5",
+      "byte_identical": true
+    },
+    {
+      "mutation_id": "M3",
+      "source_path": "packages/aethyme/rust/crates/aethyme-broker/src/collaboration_state.rs",
+      "backup_path": "evidence/mutation-backups/m3-disabled-schema23-old-client-trigger.Mqpbij",
+      "backup_bytes": 83144,
+      "backup_sha256": "998d698813a6ea3091e8445db54cc155b9b041633748c7c7cb86ee78761f0cd8",
+      "restored_source_sha256": "998d698813a6ea3091e8445db54cc155b9b041633748c7c7cb86ee78761f0cd8",
+      "byte_identical": true
+    },
+    {
+      "mutation_id": "M4",
+      "source_path": "packages/aethyme/rust/crates/aethyme-broker/src/native_gates.rs",
+      "backup_path": "evidence/mutation-backups/m4-release-dispatching-unknown-roots.7vJKeT",
+      "backup_bytes": 38968,
+      "backup_sha256": "e17607f4b349556be3eb38651e8bd270087c84d3023c7b767b3308293aa838b5",
+      "restored_source_sha256": "e17607f4b349556be3eb38651e8bd270087c84d3023c7b767b3308293aa838b5",
+      "byte_identical": true
+    },
+    {
+      "mutation_id": "M5",
+      "source_path": "packages/aethyme/rust/crates/aethyme-broker/src/collaboration_gc.rs",
+      "backup_path": "evidence/mutation-backups/m5-gc-ignores-retained-root-marker.lUgHDo",
+      "backup_bytes": 118203,
+      "backup_sha256": "aa98ce865560de6a91b426fbcdf4fa570c8e1258845675a63d620995c89ddb1f",
+      "restored_source_sha256": "aa98ce865560de6a91b426fbcdf4fa570c8e1258845675a63d620995c89ddb1f",
+      "byte_identical": true
+    },
+    {
+      "mutation_id": "M6",
+      "source_path": "packages/aethyme/rust/crates/aethyme-broker/src/native_gates.rs",
+      "backup_path": "evidence/mutation-backups/m6-prepare-ignores-released-marker.631Yrm",
+      "backup_bytes": 38968,
+      "backup_sha256": "e17607f4b349556be3eb38651e8bd270087c84d3023c7b767b3308293aa838b5",
+      "restored_source_sha256": "e17607f4b349556be3eb38651e8bd270087c84d3023c7b767b3308293aa838b5",
+      "byte_identical": true
+    }
+  ]
+}

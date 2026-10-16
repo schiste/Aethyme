@@ -33,7 +33,7 @@ use rusqlite::Connection;
 use crate::error::BrokerError;
 
 /// Current database schema version (== `MIGRATIONS.len()`).
-pub const SCHEMA_VERSION: i64 = 49;
+pub const SCHEMA_VERSION: i64 = 51;
 
 /// The oldest schema version whose binaries can safely use a database at
 /// [`SCHEMA_VERSION`]. Before this existed every newer database locked out
@@ -65,7 +65,103 @@ pub const SCHEMA_VERSION: i64 = 49;
 /// - v49: adds nullable local operation provenance. A v48 writer names its
 ///   existing columns and can continue writing; a v48 reader safely ignores
 ///   the additional field.
+/// - v50: adds a typed verification-candidate table. New writers keep the
+///   legacy queue details in sync for older readers; the table is additive.
+/// - v51: no schema change. It marks the first binaries that implement
+///   `[collaboration] capture = "required"` (#660). Repositories that do not
+///   require capture keep this minimum; one that does has its own floor
+///   raised to [`COLLABORATION_FENCE_SCHEMA`] (see that constant).
 pub const MIN_COMPATIBLE_SCHEMA: i64 = 47;
+
+/// The first schema whose binaries implement required collaboration capture
+/// (#660): the version of [`MIGRATION_V51`].
+///
+/// A repository whose effective config says `capture = "required"` has its
+/// `meta.min_compatible_schema` raised to this value, so every older binary
+/// refuses its database with [`BrokerError::SchemaTooNew`] instead of
+/// submitting uncaptured work. The floor is never lowered, so turning required
+/// off later does not let older binaries back in. If this migration is
+/// renumbered on rebase, this constant must follow it; a test pins the pair.
+pub const COLLABORATION_FENCE_SCHEMA: i64 = 51;
+
+/// Why a database carries the collaboration fence (`meta.collaboration_fence`).
+pub const COLLABORATION_FENCE_REASON: &str = "collaboration capture required";
+
+/// The collaboration fence on a database: raised, or required by the
+/// committed config but not yet raised.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct CollaborationFence {
+    /// The floor in force (`active`), or the one to be raised (`pending`).
+    pub min_compatible_schema: i64,
+    pub reason: String,
+    /// The config that required it: `committed` (the fetched default
+    /// branch's `.aethyme/config.toml`).
+    pub source: String,
+    /// `active` once raised; `pending` while required but not yet raised,
+    /// because this open is read-only or the write failed.
+    pub state: &'static str,
+}
+
+impl CollaborationFence {
+    /// Required by the committed config, not yet raised.
+    pub fn pending() -> Self {
+        Self {
+            min_compatible_schema: COLLABORATION_FENCE_SCHEMA,
+            reason: COLLABORATION_FENCE_REASON.into(),
+            source: "committed".into(),
+            state: "pending",
+        }
+    }
+}
+
+/// Read the fence in one query: the floor, the reason and the source.
+pub fn collaboration_fence(conn: &Connection) -> Result<Option<CollaborationFence>, BrokerError> {
+    let (minimum, reason, source): (Option<String>, Option<String>, Option<String>) = conn
+        .query_row(
+            "SELECT (SELECT value FROM meta WHERE key = 'min_compatible_schema'),
+                    (SELECT value FROM meta WHERE key = 'collaboration_fence'),
+                    (SELECT value FROM meta WHERE key = 'collaboration_fence_source')",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+    let minimum = minimum.and_then(|value| value.parse::<i64>().ok());
+    Ok(match (minimum, reason) {
+        (Some(minimum), Some(reason)) if minimum >= COLLABORATION_FENCE_SCHEMA => {
+            Some(CollaborationFence {
+                min_compatible_schema: minimum,
+                reason,
+                source: source.unwrap_or_else(|| "unknown".into()),
+                state: "active",
+            })
+        }
+        _ => None,
+    })
+}
+
+/// Raise the floor to [`COLLABORATION_FENCE_SCHEMA`] and record why and from
+/// which config, in one transaction that rolls back on any failure, so a
+/// failed raise never leaves the connection holding a write lock. Never
+/// lowers a higher floor and never replaces a recorded reason or source.
+pub fn raise_collaboration_fence(conn: &Connection, source: &str) -> Result<(), BrokerError> {
+    let transaction = conn.unchecked_transaction()?;
+    transaction.execute(
+        "INSERT INTO meta (key, value) VALUES ('min_compatible_schema', ?1)
+         ON CONFLICT (key) DO UPDATE SET value = excluded.value
+         WHERE CAST(meta.value AS INTEGER) < CAST(excluded.value AS INTEGER)",
+        [COLLABORATION_FENCE_SCHEMA.to_string()],
+    )?;
+    for (key, value) in [
+        ("collaboration_fence", COLLABORATION_FENCE_REASON),
+        ("collaboration_fence_source", source),
+    ] {
+        transaction.execute(
+            "INSERT INTO meta (key, value) VALUES (?1, ?2) ON CONFLICT (key) DO NOTHING",
+            [key, value],
+        )?;
+    }
+    transaction.commit()?;
+    Ok(())
+}
 
 /// Whether this binary may use a database at `found`, a version newer than
 /// its own, because every migration past [`SCHEMA_VERSION`] was declared
@@ -76,7 +172,7 @@ pub fn newer_schema_is_compatible(conn: &Connection, found: i64) -> Result<bool,
 
 /// [`newer_schema_is_compatible`] for a binary whose own schema version is
 /// `supported`, so the decision an older binary makes can be tested here.
-fn schema_is_compatible_with(
+pub(crate) fn schema_is_compatible_with(
     conn: &Connection,
     found: i64,
     supported: i64,
@@ -1621,6 +1717,29 @@ const MIGRATION_V49: &str = "
 ALTER TABLE coordinated_operations ADD COLUMN agent_provenance_json TEXT;
 ";
 
+const MIGRATION_V50: &str = "
+-- Keep the durable candidate identity typed and separate from details_json,
+-- which remains a compatibility projection for older broker readers.
+CREATE TABLE verification_candidates (
+    queue_entry_id INTEGER PRIMARY KEY REFERENCES merge_queue (id) ON DELETE CASCADE,
+    base_commit   TEXT NOT NULL,
+    inputs_json   TEXT NOT NULL,
+    tree_id       TEXT NOT NULL,
+    commit_id     TEXT NOT NULL
+);
+
+CREATE INDEX verification_candidates_by_commit
+    ON verification_candidates (commit_id, queue_entry_id);
+";
+
+/// v51 (#660): no schema change; see [`COLLABORATION_FENCE_SCHEMA`]. The
+/// statement is a no-op on every database that reaches it.
+const MIGRATION_V51: &str = "
+-- No schema change: this version marks binaries that implement required
+-- collaboration capture, so a repository can fence older ones out.
+CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+";
+
 const MIGRATIONS: &[&str] = &[
     MIGRATION_V1,
     MIGRATION_V2,
@@ -1671,6 +1790,8 @@ const MIGRATIONS: &[&str] = &[
     MIGRATION_V47,
     MIGRATION_V48,
     MIGRATION_V49,
+    MIGRATION_V50,
+    MIGRATION_V51,
 ];
 
 /// Migrations that only add columns. One is skipped when every column it adds
@@ -1681,17 +1802,20 @@ const COLUMN_ONLY_MIGRATIONS: &[(i64, &[(&str, &str)])] =
 
 /// Migrations whose tables the repair pass re-creates, with `IF NOT EXISTS`,
 /// when a database records the version but lacks one of the tables.
-const TABLE_MIGRATIONS: &[(i64, &str, &[&str])] = &[(
-    48,
-    MIGRATION_V48,
-    &[
-        "repository_watches",
-        "repository_watch_pull_requests",
-        "repository_watch_events",
-        "repository_delivery_subscriptions",
-        "repository_delivery_outbox",
-    ],
-)];
+const TABLE_MIGRATIONS: &[(i64, &str, &[&str])] = &[
+    (
+        48,
+        MIGRATION_V48,
+        &[
+            "repository_watches",
+            "repository_watch_pull_requests",
+            "repository_watch_events",
+            "repository_delivery_subscriptions",
+            "repository_delivery_outbox",
+        ],
+    ),
+    (50, MIGRATION_V50, &["verification_candidates"]),
+];
 
 fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool, BrokerError> {
     let count: i64 = conn.query_row(
@@ -1940,6 +2064,79 @@ mod tests {
             migrate(&conn),
             Err(BrokerError::SchemaTooNew { .. })
         ));
+    }
+
+    /// The fence constant names migration v51, so a renumbering restack that
+    /// moves the migration without the constant fails here.
+    #[test]
+    fn the_collaboration_fence_is_the_version_of_its_marker_migration() {
+        let index = usize::try_from(COLLABORATION_FENCE_SCHEMA - 1).unwrap();
+        assert_eq!(MIGRATIONS[index], MIGRATION_V51);
+        const { assert!(SCHEMA_VERSION >= COLLABORATION_FENCE_SCHEMA) };
+        const { assert!(MIN_COMPATIBLE_SCHEMA < COLLABORATION_FENCE_SCHEMA) };
+    }
+
+    /// Without the fence a pre-#660 binary (schema 49) still opens a v51
+    /// database; with it, that binary is refused and this one is not.
+    #[test]
+    fn the_collaboration_fence_refuses_older_binaries_and_is_never_lowered() {
+        let conn = migrated();
+        let found = current_version(&conn).unwrap();
+        assert!(schema_is_compatible_with(&conn, found, 49).unwrap());
+        assert_eq!(collaboration_fence(&conn).unwrap(), None);
+
+        raise_collaboration_fence(&conn, "committed").unwrap();
+        assert!(!schema_is_compatible_with(&conn, found, 49).unwrap());
+        assert!(schema_is_compatible_with(&conn, found, COLLABORATION_FENCE_SCHEMA).unwrap());
+        assert_eq!(
+            collaboration_fence(&conn).unwrap(),
+            Some(CollaborationFence {
+                min_compatible_schema: COLLABORATION_FENCE_SCHEMA,
+                reason: COLLABORATION_FENCE_REASON.into(),
+                source: "committed".into(),
+                state: "active",
+            })
+        );
+        // Re-opening, re-raising and re-migrating never lower it.
+        raise_collaboration_fence(&conn, "committed").unwrap();
+        migrate(&conn).unwrap();
+        record_min_compatible_schema(&conn).unwrap();
+        assert!(!schema_is_compatible_with(&conn, found, 49).unwrap());
+
+        // A higher floor from a later migration is kept.
+        set_meta(
+            &conn,
+            "min_compatible_schema",
+            COLLABORATION_FENCE_SCHEMA + 3,
+        );
+        raise_collaboration_fence(&conn, "committed").unwrap();
+        assert_eq!(
+            collaboration_fence(&conn)
+                .unwrap()
+                .unwrap()
+                .min_compatible_schema,
+            COLLABORATION_FENCE_SCHEMA + 3
+        );
+    }
+
+    /// A raise that fails part-way rolls back and leaves no transaction open,
+    /// so the connection keeps working and other processes are not blocked.
+    #[test]
+    fn a_failed_fence_raise_leaves_no_open_transaction() {
+        let conn = migrated();
+        conn.execute_batch(
+            "CREATE TRIGGER refuse_fence_source BEFORE INSERT ON meta
+             WHEN NEW.key = 'collaboration_fence_source'
+             BEGIN SELECT RAISE(ABORT, 'injected'); END;",
+        )
+        .unwrap();
+        assert!(raise_collaboration_fence(&conn, "committed").is_err());
+        assert!(conn.is_autocommit(), "a transaction was left open");
+        // The floor was rolled back with the rest.
+        assert_eq!(collaboration_fence(&conn).unwrap(), None);
+        let found = current_version(&conn).unwrap();
+        assert!(schema_is_compatible_with(&conn, found, 49).unwrap());
+        conn.execute_batch("BEGIN IMMEDIATE; COMMIT;").unwrap();
     }
 
     #[test]
@@ -2285,15 +2482,15 @@ mod tests {
 
     #[test]
     fn v49_adds_agent_provenance_without_raising_the_compatibility_floor() {
-        assert_eq!(SCHEMA_VERSION, 49);
+        const { assert!(SCHEMA_VERSION >= 49) };
         assert_eq!(MIN_COMPATIBLE_SCHEMA, 47);
 
         let conn = migrated_through(48);
         assert_eq!(current_version(&conn).unwrap(), 48);
         migrate(&conn).unwrap();
-        assert_eq!(current_version(&conn).unwrap(), 49);
-        assert!(schema_is_compatible_with(&conn, 49, 47).unwrap());
-        assert!(!schema_is_compatible_with(&conn, 49, 46).unwrap());
+        assert_eq!(current_version(&conn).unwrap(), SCHEMA_VERSION);
+        assert!(schema_is_compatible_with(&conn, SCHEMA_VERSION, 47).unwrap());
+        assert!(!schema_is_compatible_with(&conn, SCHEMA_VERSION, 46).unwrap());
 
         let nullable: i64 = conn
             .query_row(
@@ -2305,11 +2502,105 @@ mod tests {
             .unwrap();
         assert_eq!(nullable, 0);
 
-        // A v47 database, the compatibility floor, migrates straight through.
+        // A v47 database, the compatibility floor, applies v48 and v49 while
+        // retaining the same minimum; v50 is covered by its own test.
         let from_v47 = migrated_through(47);
         migrate(&from_v47).unwrap();
-        assert_eq!(current_version(&from_v47).unwrap(), 49);
-        assert!(schema_is_compatible_with(&from_v47, 49, 47).unwrap());
+        assert_eq!(current_version(&from_v47).unwrap(), SCHEMA_VERSION);
+        assert!(schema_is_compatible_with(&from_v47, SCHEMA_VERSION, 47).unwrap());
+    }
+
+    /// v51 changes nothing: a v50 database migrates to it, the floor stays at
+    /// 47, and a v50 binary still opens the result. Only the collaboration
+    /// fence, raised per repository, shuts v49 binaries out.
+    #[test]
+    fn v51_is_a_compatible_marker_that_leaves_the_floor_alone() {
+        assert_eq!(SCHEMA_VERSION, 51);
+        let conn = migrated_through(50);
+        let tables: i64 = conn
+            .query_row("SELECT count(*) FROM sqlite_master", [], |row| row.get(0))
+            .unwrap();
+        migrate(&conn).unwrap();
+        assert_eq!(current_version(&conn).unwrap(), 51);
+        let after: i64 = conn
+            .query_row("SELECT count(*) FROM sqlite_master", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(after, tables, "v51 must not change the schema");
+        assert!(schema_is_compatible_with(&conn, 51, 49).unwrap());
+        assert!(schema_is_compatible_with(&conn, 51, 47).unwrap());
+        assert_eq!(collaboration_fence(&conn).unwrap(), None);
+    }
+
+    #[test]
+    fn v50_adds_and_repairs_the_typed_verification_candidate_table() {
+        let conn = migrated_through(49);
+        set_meta(&conn, "min_compatible_schema", 47);
+
+        migrate(&conn).unwrap();
+        assert_eq!(current_version(&conn).unwrap(), SCHEMA_VERSION);
+        assert_eq!(MIN_COMPATIBLE_SCHEMA, 47);
+        assert!(schema_is_compatible_with(&conn, 50, 47).unwrap());
+
+        let columns = conn
+            .prepare("SELECT name FROM pragma_table_info('verification_candidates') ORDER BY cid")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            columns,
+            vec![
+                "queue_entry_id".to_string(),
+                "base_commit".to_string(),
+                "inputs_json".to_string(),
+                "tree_id".to_string(),
+                "commit_id".to_string()
+            ]
+        );
+
+        conn.execute_batch("DROP TABLE verification_candidates")
+            .unwrap();
+        migrate(&conn).unwrap();
+        assert!(table_exists(&conn, "verification_candidates").unwrap());
+    }
+
+    #[test]
+    fn adopts_the_provisional_capture_marker_without_losing_its_floor() {
+        // The provisional Local stack used v50 for the capture marker, so a
+        // recorded version alone does not prove typed candidate objects exist.
+        let conn = migrated_through(49);
+        set_meta(&conn, "schema_version", 50);
+        set_meta(&conn, "min_compatible_schema", 50);
+        conn.execute(
+            "INSERT INTO meta (key,value) VALUES ('collaboration_fence',?1)",
+            [COLLABORATION_FENCE_REASON],
+        )
+        .unwrap();
+        assert!(!table_exists(&conn, "verification_candidates").unwrap());
+        migrate(&conn).unwrap();
+        assert!(table_exists(&conn, "verification_candidates").unwrap());
+        assert_eq!(current_version(&conn).unwrap(), SCHEMA_VERSION);
+        let floor: String = conn
+            .query_row(
+                "SELECT value FROM meta WHERE key='min_compatible_schema'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            floor, "50",
+            "migration must not invent committed capture intent"
+        );
+        raise_collaboration_fence(&conn, "committed").unwrap();
+        assert_eq!(
+            collaboration_fence(&conn)
+                .unwrap()
+                .unwrap()
+                .min_compatible_schema,
+            51
+        );
+        assert!(!schema_is_compatible_with(&conn, 51, 50).unwrap());
     }
 
     #[test]

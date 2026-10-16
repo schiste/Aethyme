@@ -1,0 +1,4 @@
+{
+  "canonical": "{\"schema\":\"aethyme.exchange-packet/provisional-v0\",\"spec\":{\"availability\":{\"audience\":\"project-readers\",\"kind\":\"remote_retention_claim\",\"service_id\":\"coord.example\",\"until_ms\":1000},\"brief\":\"Untrusted attributed decision.\",\"contribution\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"kind\":\"contribution\",\"scope\":[\"src/lib.rs\"],\"source\":\"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"}}",
+  "id": "sha256:5b07901a836193e3af34d8aecea151ad056eef0b94e8b430904f8dceddb88bed"
+}

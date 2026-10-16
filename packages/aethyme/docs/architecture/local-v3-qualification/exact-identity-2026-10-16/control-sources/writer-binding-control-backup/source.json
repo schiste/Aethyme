@@ -1,0 +1,7 @@
+{
+  "head": "25dad81de0035577535e7696423d1a7a0e0baf9d",
+  "sources": {
+    "packages/aethyme/rust/crates/aethyme-broker/src/collaboration_identity_store.rs": "6ad5eebb54a4cf8c1e6902f22f64479c48bbffc447c58726d7fef23aa4959ce8",
+    "packages/aethyme/rust/crates/aethyme-broker/src/collaboration_cli/project.rs": "8190ecf5a5723efd6b7ac72414478b8bdc3c24bddfed8426d2e4fe12227d00ff"
+  }
+}

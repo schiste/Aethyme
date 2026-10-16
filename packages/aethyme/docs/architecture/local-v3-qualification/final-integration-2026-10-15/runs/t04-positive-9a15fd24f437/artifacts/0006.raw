@@ -1,0 +1,11 @@
+{
+  "guard": "result-in-request-digest",
+  "backup": "/private/tmp/t04-pristine-result-in-request-digest-srnaiq80",
+  "before_sha256": "b6207871391cf8421c32a6a3f932b9950bd0ce950efffd644b784e1edcd31ff6",
+  "before_mtime_ns": 1792110311870518000,
+  "mutant_sha256": "cd8087fd8867265f1b2db0f90d6da7aeca0d506a06b0278e0a672c9fbe446905",
+  "after_sha256": "b6207871391cf8421c32a6a3f932b9950bd0ce950efffd644b784e1edcd31ff6",
+  "after_mtime_ns": 1792110335435755000,
+  "clean_status": "",
+  "exact_restored": true
+}

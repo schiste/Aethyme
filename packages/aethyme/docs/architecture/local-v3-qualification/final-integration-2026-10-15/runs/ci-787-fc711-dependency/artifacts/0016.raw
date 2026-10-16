@@ -1,0 +1,87 @@
+{
+  "schema": "aethyme.failed-ci-raw-collection/v1",
+  "pr": 787,
+  "head_sha": "fc711d13172a61bc9188c59731579a4f5ac63ca0",
+  "actual_checkout_sha": "48ae7c6df372a7f71302c1febf6d8d87870c9fab",
+  "run_id": 38834487227,
+  "workspace_job": 116760424917,
+  "test_denominator": null,
+  "classification": "crates.io bstr HTTP2 framing dependency fetch failure before product binary build; exit101, no tests executed",
+  "files": [
+    {
+      "path": "run.stdout",
+      "bytes": 12167,
+      "sha256": "f499bd20c6c2d76410068eeda9d7f2aed7965ab24ca8084ea6250cb7866277a7"
+    },
+    {
+      "path": "run.stderr",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "run.command.json",
+      "bytes": 171,
+      "sha256": "10fb65dd1863853b7caf12cfac9e6960c2622663ec5f0f8c7b9cc0828daba32f"
+    },
+    {
+      "path": "jobs.stdout",
+      "bytes": 12035,
+      "sha256": "57acf95ae18ddb7580bb49be8153dfff484b521bc48194676b931fd8aa78498d"
+    },
+    {
+      "path": "jobs.stderr",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "jobs.command.json",
+      "bytes": 189,
+      "sha256": "0a25cb41e5ca473d663ba223abb58b00827c6c2a162f24751f5d35823b7e1bc7"
+    },
+    {
+      "path": "workspace-job.stdout",
+      "bytes": 2821,
+      "sha256": "addf5659cdc9a405d6b2c3fc7db5283ce508fa2c8a659d74ffe2b1ad44960535"
+    },
+    {
+      "path": "workspace-job.stderr",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "workspace-job.command.json",
+      "bytes": 172,
+      "sha256": "efa71f11ca07ca69c4d48d0a7d114ad0e2ee475792489015537a1f6f2bb9144b"
+    },
+    {
+      "path": "workspace-log.stdout",
+      "bytes": 60150,
+      "sha256": "c614d228475d03cf46ba549a61442b3f431532f30cde85ceefcfc57f847d84b7"
+    },
+    {
+      "path": "workspace-log.stderr",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "workspace-log.command.json",
+      "bytes": 231,
+      "sha256": "9d6aa5ba759f03ba71337a218e21a026cae9bf33c79656b469dd2aa9daf70690"
+    },
+    {
+      "path": "checkout.stdout",
+      "bytes": 181348,
+      "sha256": "0ddacf80a88a0f35915c0ac4e1d295f45bca6d1fd4aef4a525155611565824b5"
+    },
+    {
+      "path": "checkout.stderr",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "checkout.command.json",
+      "bytes": 195,
+      "sha256": "3efa7fe5ce1028a1bcba1feda13c4497092cbd91bb029e03aec3dc2a55d21049"
+    }
+  ]
+}

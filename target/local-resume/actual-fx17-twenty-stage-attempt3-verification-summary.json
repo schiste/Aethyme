@@ -1,0 +1,784 @@
+{
+  "attempt": "actual-fx17-twenty-stage-attempt3",
+  "disposable_remote": {
+    "archive_path": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/implement-the-actual-fx17-20-controlled/target/local-resume/retained-roots/fx17-attempt3-remote",
+    "candidate_parent_tree_checks_passed_for_all_20": true,
+    "final_accepted_commit": "2d8d7e4ff2912ebd55bd0eaa12e3b6cb93d9ac2f",
+    "final_refs": [
+      "2d8d7e4ff2912ebd55bd0eaa12e3b6cb93d9ac2f HEAD",
+      "2d8d7e4ff2912ebd55bd0eaa12e3b6cb93d9ac2f refs/heads/accepted"
+    ]
+  },
+  "frozen_inputs": {
+    "after_manifest": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/implement-the-actual-fx17-20-controlled/target/local-resume/actual-fx17-twenty-stage-attempt3-frozen-inputs-after.json",
+    "after_manifest_sha256": "f521534541cc311dc2edcb69af25abd8ffed11f01a43360595f4bcd3ca3aea03",
+    "all_paths_sizes_and_sha256_identical": true,
+    "before_manifest": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/implement-the-actual-fx17-20-controlled/target/local-resume/actual-fx17-twenty-stage-attempt3-frozen-inputs-before.json",
+    "before_manifest_sha256": "be8bb4af3f7ea58dca2d77636174b8ed9604451aa1e1f435085a60400f6c9771",
+    "file_count": 29,
+    "manifest_sha256": "7a80fd1315703e3489bc63ea5aa707a4b67f071f22fc86270ca1a87b61260c4a",
+    "source_oracle_profile_frozen": true
+  },
+  "original_source_checkout": {
+    "final_head": "f44e567d8c5a357d9b72341ab3a60c56a9126aec",
+    "final_refs": [
+      "refs/heads/main f44e567d8c5a357d9b72341ab3a60c56a9126aec",
+      "refs/remotes/fx17-accepted/accepted 2d8d7e4ff2912ebd55bd0eaa12e3b6cb93d9ac2f"
+    ],
+    "final_refs_sha256": "9aa24e82be9d36a8a85513a85828590353b9784f1f07f2a550c5ef04c0679477",
+    "final_symbolic_head": "refs/heads/main",
+    "head_unchanged": true,
+    "initial_head": "f44e567d8c5a357d9b72341ab3a60c56a9126aec",
+    "initial_refs_sha256": "0986fd62dd04ba7cf120c6247c7f93c5f3924448856ca43d2262931db4025385",
+    "initial_symbolic_head": "refs/heads/main",
+    "refs_changed": true,
+    "tracked_changes": "",
+    "untracked_runtime_paths": "?? .aethyme/broker.db\n?? .aethyme/locks/\n?? .aethyme/logs/\n?? .aethyme/run/"
+  },
+  "profile": {
+    "cargo_argv": [
+      "/usr/bin/caffeinate",
+      "-i",
+      "/Users/christophehenner/.cargo/bin/cargo",
+      "test",
+      "--locked",
+      "-j",
+      "4",
+      "-p",
+      "aethyme-broker",
+      "--lib",
+      "--",
+      "--ignored",
+      "--exact",
+      "local_controller::drive::tests::fx17::actual_fx17_twenty_controlled_changes_preserve_all_65_vectors",
+      "--nocapture"
+    ],
+    "docker_execution_profile": {
+      "artifact_mount": "read-only and contains only app.sh",
+      "budget_cap": {
+        "disk_bytes": 137438953472,
+        "input_tokens": 0,
+        "memory_bytes": 68719476736,
+        "model_requests": 0,
+        "output_tokens": 0,
+        "previews": 0,
+        "slots": 200,
+        "spend_microunits": 0,
+        "time_ms": 1000000000
+      },
+      "build": {
+        "arguments": [
+          "-c",
+          "set -eu; cp /source/app.sh /outputs/app.sh"
+        ],
+        "environment": {},
+        "program": "/bin/sh"
+      },
+      "candidate_source_host_execution": false,
+      "docker_cli": "/opt/homebrew/bin/docker",
+      "image": "sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251",
+      "native_gate": {
+        "command": "test -f app.sh && git diff --check HEAD^ HEAD",
+        "policy_sha256": "cda7eb140497d400b5c8e54df4d6f9728d13494c83b7cdefee14fa508cad55ce",
+        "trusted_once": true
+      },
+      "network": "none",
+      "private_tmp": "writable Docker tmpfs for joined stream capture",
+      "proxy_is_inline_byte_identical_to_archived_source": true,
+      "runtime": {
+        "api": "1.54",
+        "architecture": "arm64",
+        "client": "sha256:95e661f587166c7b3cd6b5877e6f23a2fc8e423c7466e26d289660fbd83c886b",
+        "components": [
+          {
+            "Details": {
+              "ApiVersion": "1.54",
+              "Arch": "arm64",
+              "BuildTime": "Wed May 20 14:39:25 2026",
+              "Experimental": "false",
+              "GitCommit": "568f755",
+              "GoVersion": "go1.26.3",
+              "KernelVersion": "6.8.0-117-generic",
+              "MinAPIVersion": "1.40",
+              "Module": "github.com/moby/moby/v2",
+              "ModuleVersion": "v2.0.0+unknown",
+              "Os": "linux"
+            },
+            "Name": "Engine",
+            "Version": "29.5.2"
+          },
+          {
+            "Details": {
+              "GitCommit": "193637f7ee8ae5f5aa5248f49e7baa3e6164966e"
+            },
+            "Name": "containerd",
+            "Version": "v2.2.4"
+          },
+          {
+            "Details": {
+              "GitCommit": "v1.3.5-0-g488fc13e"
+            },
+            "Name": "runc",
+            "Version": "1.3.5"
+          },
+          {
+            "Details": {
+              "GitCommit": "de40ad0"
+            },
+            "Name": "docker-init",
+            "Version": "0.19.0"
+          }
+        ],
+        "daemon_id": "9c943a04-41ca-4943-a8f5-c5734144b14b",
+        "endpoint": "unix:///Volumes/T7-repositories/Colima/home/default/docker.sock",
+        "engine": "29.5.2",
+        "kernel": "6.8.0-117-generic",
+        "native": "sha256:1ab555b4f08e2ab493d482dab52a8df3cade06f7f0b8b112aa590112a88059b9",
+        "policy": "rootfs-ro;uid65534;caps-none;nnp;seccomp-builtin;network-none;private-pid-ipc-cgroup;cpu1;swap-none;pids-bounded;tmpfs-output-bounded;no-logs;no-healthcheck;env-clear;no-cache;timeout-pid1-v0",
+        "profile": "aethyme.docker-linux/offline-v0"
+      },
+      "service_allowance": {
+        "appointments": 20,
+        "completions_per_appointment": 1,
+        "expected_ticks_per_appointment": 1,
+        "max_drive_wall_ms": 900000,
+        "max_elapsed_ms_per_appointment": 900000,
+        "max_ticks_per_appointment": 2
+      },
+      "verifier_command": {
+        "arguments": [
+          "-c",
+          "#!/bin/sh\n# FX17 transport proxy v1. Source is fixed independently of candidate app.sh.\nset -eu\nPATH=/usr/bin:/bin\nLC_ALL=C\nexport PATH LC_ALL\numask 077\ntmp=$(mktemp -d /tmp/fx17-proxy.XXXXXX)\ntrap 'rm -rf \"$tmp\"' EXIT HUP INT TERM\nrun_case() {\n  id=$1\n  shift\n  if /bin/sh /artifact/app.sh \"$@\" >\"$tmp/stdout\" 2>\"$tmp/stderr\"; then code=0; else code=$?; fi\n  out=$(od -An -v -tx1 \"$tmp/stdout\" | tr -d ' \\n')\n  err=$(od -An -v -tx1 \"$tmp/stderr\" | tr -d ' \\n')\n  printf '%s\\t%s\\t%s\\t%s\\n' \"$id\" \"$code\" \"$out\" \"$err\"\n}\nprintf 'FX17V1\\n'\nrun_case lookup_alpha lookup alpha\nrun_case lookup_beta lookup beta\nrun_case lookup_gamma lookup gamma\nrun_case list list\nrun_case arity_zero\nrun_case lookup_missing lookup\nrun_case lookup_extra lookup alpha extra\nrun_case lookup_four lookup alpha '' extra\nrun_case list_empty_extra list ''\nrun_case list_key_extra list alpha\nrun_case list_extra_three list alpha beta\nrun_case list_four list --limit 2 extra\nrun_case mode_empty ''\nrun_case mode_unknown unknown\nrun_case mode_upper_lookup LOOKUP alpha\nrun_case mode_trailing_lookup 'lookup ' alpha\nrun_case mode_leading_list ' list'\nrun_case mode_upper_list LIST\nrun_case mode_unicode 'l\u00edst'\nrun_case mode_option --help\nrun_case mode_shell_substitution '$(printf INJECTED)'\nrun_case mode_shell_sequence 'list; printf INJECTED'\nrun_case lookup_empty lookup ''\nrun_case lookup_unknown lookup delta\nrun_case lookup_uppercase lookup Alpha\nrun_case lookup_numeric lookup 0\nrun_case lookup_trailing_space lookup 'alpha '\nrun_case lookup_leading_space lookup ' alpha'\nrun_case lookup_tab lookup 'alpha\t'\nrun_case lookup_newline lookup 'alpha\n'\nrun_case lookup_carriage_return lookup 'alpha\r'\nrun_case lookup_nonbreaking_space lookup 'alpha\u00a0'\nrun_case lookup_unicode lookup '\u03ac\u03bb\u03c6\u03b1'\nrun_case lookup_fullwidth lookup '\uff41\uff4c\uff50\uff48\uff41'\nrun_case lookup_combining lookup 'alpha\u0301'\nrun_case lookup_zero_width lookup 'alpha\u200b'\nrun_case lookup_glob lookup '*'\nrun_case lookup_question_glob lookup 'a?pha'\nrun_case lookup_bracket_glob lookup '[a]lpha'\nrun_case lookup_dollar lookup '$KEY'\nrun_case lookup_command_substitution lookup '$(printf alpha)'\nrun_case lookup_backtick lookup '`printf alpha`'\nrun_case lookup_semicolon lookup 'alpha; printf INJECTED'\nrun_case lookup_pipe lookup 'alpha | printf INJECTED'\nrun_case lookup_and lookup 'alpha && printf INJECTED'\nrun_case lookup_redirect lookup 'alpha > fx17-effect-canary'\nrun_case lookup_quote lookup 'alpha'\"'\"'\"\\'\nrun_case lookup_percent lookup %s\nrun_case display_missing display\nrun_case display_alpha display alpha\nrun_case display_beta display beta\nrun_case display_gamma display gamma\nrun_case display_empty display ''\nrun_case display_unknown display delta\nrun_case display_extra display alpha extra\nrun_case limit_missing_value list --limit\nrun_case limit_empty list --limit ''\nrun_case limit_flag_typo list --limits 1\nrun_case limit_flag_case list --LIMIT 1\nrun_case limit_0 list --limit 0\nrun_case limit_1 list --limit 1\nrun_case limit_2 list --limit 2\nrun_case limit_3 list --limit 3\nrun_case limit_03 list --limit 03\nrun_case limit_999 list --limit 999\n"
+        ],
+        "environment": {},
+        "program": "/bin/sh"
+      }
+    },
+    "effects": {
+      "artifact_mount": "read-only, app.sh only",
+      "candidate_built_on_host": false,
+      "candidate_subject": "/bin/sh /artifact/app.sh <frozen argv>",
+      "docker_network": "none",
+      "effect_claim_limit": "This does not prove complete filesystem-effect absence. The 21 frozen candidate sources are covered by the independent static review, while this runtime checks the full 65-case behavior transcript.",
+      "writable_container_path": "private /tmp tmpfs for proxy stream capture"
+    },
+    "environment": {
+      "AETHYME_DOCKER_CLI": "/opt/homebrew/bin/docker",
+      "AETHYME_DOCKER_TEST_IMAGE": "sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251",
+      "CARGO_TARGET_DIR": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/integrate-reviewed-local-bare-git-servic/target/local-resume/cargo",
+      "HOME": "/Users/christophehenner",
+      "PATH": "/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/christophehenner/.cargo/bin",
+      "RUSTC_WRAPPER": "",
+      "TMPDIR": "/var/folders/f2/krjzd4c15nn491pm37zrkp1h0000gn/T/"
+    },
+    "finite_profile": {
+      "appointments": 20,
+      "assertions": {
+        "actual_changes": 20,
+        "baseline_vectors": 65,
+        "frozen_controlled_states": 21,
+        "model_exports": 0
+      },
+      "cargo_jobs": 4,
+      "cargo_profile": "test (default, non-release)",
+      "docker_resources": {
+        "disk_mib": 2048,
+        "job_slots": 2,
+        "memory_mib": 2048,
+        "process_slots": 1024
+      },
+      "execution_limits": {
+        "artifact_mount": "read-only",
+        "memory_bytes": 67108864,
+        "network": "disabled",
+        "output_bytes": 1048576,
+        "process_ids": 32,
+        "timeout_ms": 60000
+      },
+      "per_appointment": {
+        "completions": 1,
+        "expected_ticks": 1,
+        "max_drive_wall_ms": 900000,
+        "max_elapsed_ms": 900000,
+        "max_ticks": 2,
+        "poll_ms": 20
+      },
+      "project_budget": {
+        "disk_bytes": 137438953472,
+        "memory_bytes": 68719476736,
+        "slots": 200,
+        "time_ms": 1000000000
+      },
+      "test_threads": "Rust test harness default; exact filter selects one test"
+    },
+    "pinned_image": "sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251"
+  },
+  "recorded_at_utc": "2026-10-15T08:53:17.043452+00:00",
+  "result": {
+    "accepted_stages": 20,
+    "completion_count": 20,
+    "failures": [],
+    "held_stages": 0,
+    "model_exports": 0,
+    "numeric_exit_code": 0,
+    "sealed_task_executions": 0,
+    "stages": 20,
+    "status": "completed",
+    "test_result_lines": [
+      "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1798 filtered out; finished in 462.53s"
+    ],
+    "unrun_stages": 0,
+    "vectors_per_stage": 65,
+    "verified_vector_checks": 1300,
+    "verifier_evidence_receipts": 20
+  },
+  "source": {
+    "head": "c45d4096f9d0238b800ccadbeb07f9b93ae30a3e",
+    "source_matches_trial_metadata": true,
+    "status_porcelain": "",
+    "tree": "874654af26ac7fd9bbaa9bedbc7a04fa8a834e40"
+  },
+  "stages": [
+    {
+      "accepted_commit": "cfad3e914335eb08c2e4ff6c17c8a2cbbcde8ecc",
+      "accepted_tree": "7dd4c553980d0ede652f19f18cd672f7f372c2ef",
+      "baseline_commit": "f44e567d8c5a357d9b72341ab3a60c56a9126aec",
+      "candidate_base_commit": "f44e567d8c5a357d9b72341ab3a60c56a9126aec",
+      "candidate_commit": "cfad3e914335eb08c2e4ff6c17c8a2cbbcde8ecc",
+      "candidate_parent_commit_verified_in_remote": "f44e567d8c5a357d9b72341ab3a60c56a9126aec",
+      "candidate_tree": "7dd4c553980d0ede652f19f18cd672f7f372c2ef",
+      "changed_paths": [
+        "app.sh"
+      ],
+      "completion_epoch": "sha256:2f221f64a52ff4e536fdd0a83991cbbac5a01716e8920a90953a2be150a0e94b",
+      "completion_receipt": "sha256:a06ee8a5a95b3b96dfc2074922b7fcdc6053782dd6b8c41c66db26dc023b5bca",
+      "contribution": "C01",
+      "expected_baseline_vectors": 65,
+      "native_gate_current_authority": true,
+      "native_gate_job_id": "sha256:c961ba465aab92850549bed281aca5b3137f19cfc76a25090c597a925f34e29d",
+      "native_gate_status": "passed",
+      "ordinal": 1,
+      "revision": "sha256:e6ad86b68ffba819fd18e0e1c42989a90594fc4efbc71aaf868d3c57e35b69ef",
+      "service_completion_count": 1,
+      "service_ticks": 1,
+      "source_commit": "2f1ed446495d141f0643e84ba305ddcb7cc4bdf0",
+      "verifier_evidence_ids": [
+        "sha256:d6af39f2178958cafd4b5fad319f08728466e27dc16f7d0e1ebeb99b062941ca"
+      ]
+    },
+    {
+      "accepted_commit": "f17e39a702a2be98dc6e361989e47787024b8add",
+      "accepted_tree": "9c6baf1e7877deb33e91f1c7af29058859f499b4",
+      "baseline_commit": "cfad3e914335eb08c2e4ff6c17c8a2cbbcde8ecc",
+      "candidate_base_commit": "cfad3e914335eb08c2e4ff6c17c8a2cbbcde8ecc",
+      "candidate_commit": "f17e39a702a2be98dc6e361989e47787024b8add",
+      "candidate_parent_commit_verified_in_remote": "cfad3e914335eb08c2e4ff6c17c8a2cbbcde8ecc",
+      "candidate_tree": "9c6baf1e7877deb33e91f1c7af29058859f499b4",
+      "changed_paths": [
+        "app.sh"
+      ],
+      "completion_epoch": "sha256:2f221f64a52ff4e536fdd0a83991cbbac5a01716e8920a90953a2be150a0e94b",
+      "completion_receipt": "sha256:baab080c028a1d30ec294ae91cd4b64ac83bd249b34a31e8022ac9e853338fe0",
+      "contribution": "C02",
+      "expected_baseline_vectors": 65,
+      "native_gate_current_authority": true,
+      "native_gate_job_id": "sha256:bca1773039d49154a39cda1b374a8c9748b05b9d215f0693c6a0b14e67e23e08",
+      "native_gate_status": "passed",
+      "ordinal": 2,
+      "revision": "sha256:b754ebfbb13aaddc17926e9a3203d927f3e5743c830f8c4bd2a55e58f5dc169e",
+      "service_completion_count": 1,
+      "service_ticks": 1,
+      "source_commit": "230ec36cce1e203f49d5bae2081620b48a6dde7c",
+      "verifier_evidence_ids": [
+        "sha256:917c7be687891e84534401c002a6a2b188b6845b16513121bc6f62cd30f1a36a"
+      ]
+    },
+    {
+      "accepted_commit": "96546154d81bdc364d80ff2045074ea108677067",
+      "accepted_tree": "18256be02fc97c0c063da215f288188b00365d4f",
+      "baseline_commit": "f17e39a702a2be98dc6e361989e47787024b8add",
+      "candidate_base_commit": "f17e39a702a2be98dc6e361989e47787024b8add",
+      "candidate_commit": "96546154d81bdc364d80ff2045074ea108677067",
+      "candidate_parent_commit_verified_in_remote": "f17e39a702a2be98dc6e361989e47787024b8add",
+      "candidate_tree": "18256be02fc97c0c063da215f288188b00365d4f",
+      "changed_paths": [
+        "app.sh"
+      ],
+      "completion_epoch": "sha256:2f221f64a52ff4e536fdd0a83991cbbac5a01716e8920a90953a2be150a0e94b",
+      "completion_receipt": "sha256:a9c9bc11d0c2422f96faf0b84958c8881a237453229eff7d63c6a9f19b60edb6",
+      "contribution": "C03",
+      "expected_baseline_vectors": 65,
+      "native_gate_current_authority": true,
+      "native_gate_job_id": "sha256:a87223f6998608cad5d89e69c5eb32930e027bc01aa4581a09ceb9523a78edd2",
+      "native_gate_status": "passed",
+      "ordinal": 3,
+      "revision": "sha256:7a38a0079e8eba9925a27c5400970342a1382ddb7ea43a41b2267d415aadf2e7",
+      "service_completion_count": 1,
+      "service_ticks": 1,
+      "source_commit": "5e9084ac65c494daad6fd5264ee4d933dc6c1ce5",
+      "verifier_evidence_ids": [
+        "sha256:dc92076cc0e51f799611a4619615f82a4670787b1a0662b6f9ec379e7e74cb46"
+      ]
+    },
+    {
+      "accepted_commit": "3cbff2942787bf4cd559f41cc4dd8934cde2495a",
+      "accepted_tree": "d8b4c241941aa9d780e7888ad27fbcb49e0bbb8e",
+      "baseline_commit": "96546154d81bdc364d80ff2045074ea108677067",
+      "candidate_base_commit": "96546154d81bdc364d80ff2045074ea108677067",
+      "candidate_commit": "3cbff2942787bf4cd559f41cc4dd8934cde2495a",
+      "candidate_parent_commit_verified_in_remote": "96546154d81bdc364d80ff2045074ea108677067",
+      "candidate_tree": "d8b4c241941aa9d780e7888ad27fbcb49e0bbb8e",
+      "changed_paths": [
+        "app.sh"
+      ],
+      "completion_epoch": "sha256:2f221f64a52ff4e536fdd0a83991cbbac5a01716e8920a90953a2be150a0e94b",
+      "completion_receipt": "sha256:3564dbd5c4de42c393d0100e9c8916f550806c5ede21a1385464758855138c93",
+      "contribution": "C04",
+      "expected_baseline_vectors": 65,
+      "native_gate_current_authority": true,
+      "native_gate_job_id": "sha256:af0070280f42cfc8f5b6e73817d8c3b51916256d7f2b71e699bbeff5088df348",
+      "native_gate_status": "passed",
+      "ordinal": 4,
+      "revision": "sha256:2ce03813e8d79a1ca09e2ebb8069d20cc325a908aadf09cf1b6e6249bd315956",
+      "service_completion_count": 1,
+      "service_ticks": 1,
+      "source_commit": "abbdca88c29bd369296544db36eed93da0dc21ab",
+      "verifier_evidence_ids": [
+        "sha256:8f09d1e6a0bd513721b98ad2daa0b37b66f1d2ba4098305f567f70e4ea337810"
+      ]
+    },
+    {
+      "accepted_commit": "05fa33f548b2f87bc2dec3c0dd26dfbf32e80a40",
+      "accepted_tree": "2e3dbfe669769c6105033fa259e9e246644dfe26",
+      "baseline_commit": "3cbff2942787bf4cd559f41cc4dd8934cde2495a",
+      "candidate_base_commit": "3cbff2942787bf4cd559f41cc4dd8934cde2495a",
+      "candidate_commit": "05fa33f548b2f87bc2dec3c0dd26dfbf32e80a40",
+      "candidate_parent_commit_verified_in_remote": "3cbff2942787bf4cd559f41cc4dd8934cde2495a",
+      "candidate_tree": "2e3dbfe669769c6105033fa259e9e246644dfe26",
+      "changed_paths": [
+        "app.sh"
+      ],
+      "completion_epoch": "sha256:2f221f64a52ff4e536fdd0a83991cbbac5a01716e8920a90953a2be150a0e94b",
+      "completion_receipt": "sha256:7379c60ecfa717ef360cea13b9e149ec0f46d234d99e2edc84cffcce9faaff0b",
+      "contribution": "C05",
+      "expected_baseline_vectors": 65,
+      "native_gate_current_authority": true,
+      "native_gate_job_id": "sha256:6b899ab7bb2f9ee0f5f4b4766ea448594c0aa66d3fc3508c208e0280eaea449c",
+      "native_gate_status": "passed",
+      "ordinal": 5,
+      "revision": "sha256:d2147104d69fd31a79e2cfb632963e4208ef1804515d6a0cf79820472bb28953",
+      "service_completion_count": 1,
+      "service_ticks": 1,
+      "source_commit": "5352f788e15b704ce5f075265ac1c319fa0e8ba5",
+      "verifier_evidence_ids": [
+        "sha256:78fe1104dfca38f81baa2b2e32a89bba30bc63eedd765fbb83ca9fa0d70858c5"
+      ]
+    },
+    {
+      "accepted_commit": "b0570f6c2091b7fd20e52814c3ccc4b4fddab577",
+      "accepted_tree": "dff65065c61bb9708815daf86ee99bbb9fd1292f",
+      "baseline_commit": "05fa33f548b2f87bc2dec3c0dd26dfbf32e80a40",
+      "candidate_base_commit": "05fa33f548b2f87bc2dec3c0dd26dfbf32e80a40",
+      "candidate_commit": "b0570f6c2091b7fd20e52814c3ccc4b4fddab577",
+      "candidate_parent_commit_verified_in_remote": "05fa33f548b2f87bc2dec3c0dd26dfbf32e80a40",
+      "candidate_tree": "dff65065c61bb9708815daf86ee99bbb9fd1292f",
+      "changed_paths": [
+        "app.sh"
+      ],
+      "completion_epoch": "sha256:2f221f64a52ff4e536fdd0a83991cbbac5a01716e8920a90953a2be150a0e94b",
+      "completion_receipt": "sha256:5fcdd8653f419ec121ad5375a000a1be78855e29ddfc2f854529142c1a47568b",
+      "contribution": "C06",
+      "expected_baseline_vectors": 65,
+      "native_gate_current_authority": true,
+      "native_gate_job_id": "sha256:d7c707dbf49fc9a51940190f3dae660fbeb9617f35525b7eae7ec220e1f08776",
+      "native_gate_status": "passed",
+      "ordinal": 6,
+      "revision": "sha256:5ba6fc1dfb253d0e4cd287d76e575b9f66fe40f86bd8e6214330899790aec771",
+      "service_completion_count": 1,
+      "service_ticks": 1,
+      "source_commit": "fd1551a2760335529528957f3c3c73f627aa0b9e",
+      "verifier_evidence_ids": [
+        "sha256:b423293c9adae91e5c63e76bf13b74502a9c605d9bbf5d757c8c5973bc3921ed"
+      ]
+    },
+    {
+      "accepted_commit": "01268011d195df3de3bd33c9319ba6c63169beb1",
+      "accepted_tree": "9dd520fd25e560af72fae6df50597f3a5b6f4c62",
+      "baseline_commit": "b0570f6c2091b7fd20e52814c3ccc4b4fddab577",
+      "candidate_base_commit": "b0570f6c2091b7fd20e52814c3ccc4b4fddab577",
+      "candidate_commit": "01268011d195df3de3bd33c9319ba6c63169beb1",
+      "candidate_parent_commit_verified_in_remote": "b0570f6c2091b7fd20e52814c3ccc4b4fddab577",
+      "candidate_tree": "9dd520fd25e560af72fae6df50597f3a5b6f4c62",
+      "changed_paths": [
+        "app.sh"
+      ],
+      "completion_epoch": "sha256:2f221f64a52ff4e536fdd0a83991cbbac5a01716e8920a90953a2be150a0e94b",
+      "completion_receipt": "sha256:dd543e8c761eaccb180aa661041f167c2e0516e7abe9ee84dd9c5437624d3d32",
+      "contribution": "C07",
+      "expected_baseline_vectors": 65,
+      "native_gate_current_authority": true,
+      "native_gate_job_id": "sha256:9ccc5fe56996089e9d0500d3bc56820e690f4f513c43ed8d7bbba01031196bbd",
+      "native_gate_status": "passed",
+      "ordinal": 7,
+      "revision": "sha256:4518a34c6525cbba661c711352f9a53c8f01921d08cbe2b4c787c9f660955033",
+      "service_completion_count": 1,
+      "service_ticks": 1,
+      "source_commit": "8fd5ddf0c5dda5a78265b8cb7dcdddaf80f8de65",
+      "verifier_evidence_ids": [
+        "sha256:bcc147bf07ed636b70dcb6f62fac066aa740e670b19e96ee7711c24d1375149c"
+      ]
+    },
+    {
+      "accepted_commit": "792f5cb0ab4383d268245664f41eae11961603e9",
+      "accepted_tree": "2e8944bf9d4759c4575392cffc1f41207459df87",
+      "baseline_commit": "01268011d195df3de3bd33c9319ba6c63169beb1",
+      "candidate_base_commit": "01268011d195df3de3bd33c9319ba6c63169beb1",
+      "candidate_commit": "792f5cb0ab4383d268245664f41eae11961603e9",
+      "candidate_parent_commit_verified_in_remote": "01268011d195df3de3bd33c9319ba6c63169beb1",
+      "candidate_tree": "2e8944bf9d4759c4575392cffc1f41207459df87",
+      "changed_paths": [
+        "app.sh"
+      ],
+      "completion_epoch": "sha256:2f221f64a52ff4e536fdd0a83991cbbac5a01716e8920a90953a2be150a0e94b",
+      "completion_receipt": "sha256:7bc149d14042b3330c8b59048f7b8a58b9381a3d8d7245d6326a0d5693394e90",
+      "contribution": "C08",
+      "expected_baseline_vectors": 65,
+      "native_gate_current_authority": true,
+      "native_gate_job_id": "sha256:50b1815bf8b342fd4a69bce29ebe206d5d89bc91e7fb4365f3397b40aee4b632",
+      "native_gate_status": "passed",
+      "ordinal": 8,
+      "revision": "sha256:4abe27baa9861390402447dc2074c53b062723c8aec2813d09f0292fcd35bcf0",
+      "service_completion_count": 1,
+      "service_ticks": 1,
+      "source_commit": "082d73bc2c1ffebd535a8f5a8ac4e2ee0133548f",
+      "verifier_evidence_ids": [
+        "sha256:3c58cd8d0f87c4672601243bbe7cb89c2d3afb9a696c3876e4994076f7451bf6"
+      ]
+    },
+    {
+      "accepted_commit": "f5fc29a1aa63d4413b97778e821e514b568d44f2",
+      "accepted_tree": "bbe7594aba01d491900d0b493a470a7852538e3a",
+      "baseline_commit": "792f5cb0ab4383d268245664f41eae11961603e9",
+      "candidate_base_commit": "792f5cb0ab4383d268245664f41eae11961603e9",
+      "candidate_commit": "f5fc29a1aa63d4413b97778e821e514b568d44f2",
+      "candidate_parent_commit_verified_in_remote": "792f5cb0ab4383d268245664f41eae11961603e9",
+      "candidate_tree": "bbe7594aba01d491900d0b493a470a7852538e3a",
+      "changed_paths": [
+        "app.sh"
+      ],
+      "completion_epoch": "sha256:2f221f64a52ff4e536fdd0a83991cbbac5a01716e8920a90953a2be150a0e94b",
+      "completion_receipt": "sha256:34a4fb50deb5355163e919253f093525639fb3c7e000e4317ea2868a0e609ccb",
+      "contribution": "C09",
+      "expected_baseline_vectors": 65,
+      "native_gate_current_authority": true,
+      "native_gate_job_id": "sha256:765525d7eb499b6e50fb65a1aa411ff69cd4186ef75d4250a720b7950230eb0a",
+      "native_gate_status": "passed",
+      "ordinal": 9,
+      "revision": "sha256:f8e187fe7e81e51dc6c372271e6ccd0732598bbd9ea2e23bb172833c1b34e440",
+      "service_completion_count": 1,
+      "service_ticks": 1,
+      "source_commit": "31bc6ea7f433e0718a623be3815615806c78bf62",
+      "verifier_evidence_ids": [
+        "sha256:69d8662ee1bb4eaf5ef1bcc184d77da49c43d2557c17eb804d2ea4dfccdff570"
+      ]
+    },
+    {
+      "accepted_commit": "676585c47318394082ce00497b3f944c405188ee",
+      "accepted_tree": "18da0c7c980b689cc51f38852d56ca2d9d1a22f1",
+      "baseline_commit": "f5fc29a1aa63d4413b97778e821e514b568d44f2",
+      "candidate_base_commit": "f5fc29a1aa63d4413b97778e821e514b568d44f2",
+      "candidate_commit": "676585c47318394082ce00497b3f944c405188ee",
+      "candidate_parent_commit_verified_in_remote": "f5fc29a1aa63d4413b97778e821e514b568d44f2",
+      "candidate_tree": "18da0c7c980b689cc51f38852d56ca2d9d1a22f1",
+      "changed_paths": [
+        "app.sh"
+      ],
+      "completion_epoch": "sha256:2f221f64a52ff4e536fdd0a83991cbbac5a01716e8920a90953a2be150a0e94b",
+      "completion_receipt": "sha256:c3104f824876dd710636b36209a4c5924758df2cbf7a3bcd5e27c54e1f28fdf1",
+      "contribution": "C10",
+      "expected_baseline_vectors": 65,
+      "native_gate_current_authority": true,
+      "native_gate_job_id": "sha256:52103075ae80932b0e392a746b75c3f8fb6a87df481daee02e82d0f899cbbb50",
+      "native_gate_status": "passed",
+      "ordinal": 10,
+      "revision": "sha256:e55f22899fbb3ab5403af2cd9eaf46b845a44fb656cbc61396c658e7fcd6ba17",
+      "service_completion_count": 1,
+      "service_ticks": 1,
+      "source_commit": "10fb7a0fd5852c411ea312d5ee4c2913e5075328",
+      "verifier_evidence_ids": [
+        "sha256:3d93b2676e84a0e72a96ee88188108c419cda05a1a1508acc1b03a934ad9aa80"
+      ]
+    },
+    {
+      "accepted_commit": "5088e64ca2a2f7df3e4af1bd680143b0ef22752e",
+      "accepted_tree": "3b682ab6546c14ee20b3a3e9be4fefb027d79099",
+      "baseline_commit": "676585c47318394082ce00497b3f944c405188ee",
+      "candidate_base_commit": "676585c47318394082ce00497b3f944c405188ee",
+      "candidate_commit": "5088e64ca2a2f7df3e4af1bd680143b0ef22752e",
+      "candidate_parent_commit_verified_in_remote": "676585c47318394082ce00497b3f944c405188ee",
+      "candidate_tree": "3b682ab6546c14ee20b3a3e9be4fefb027d79099",
+      "changed_paths": [
+        "app.sh"
+      ],
+      "completion_epoch": "sha256:2f221f64a52ff4e536fdd0a83991cbbac5a01716e8920a90953a2be150a0e94b",
+      "completion_receipt": "sha256:48c0b23230dcadd73f581d761c21b38a9178f044a47ebc819881fb83e780eb3f",
+      "contribution": "C11",
+      "expected_baseline_vectors": 65,
+      "native_gate_current_authority": true,
+      "native_gate_job_id": "sha256:44b9898b402f10338756b163510e7c1d43af464af1875df9fc81a6f5049e2423",
+      "native_gate_status": "passed",
+      "ordinal": 11,
+      "revision": "sha256:27513f652c1958e8424412b1e4a8620013665e266c49fb752e2b1c15cd7b0ef7",
+      "service_completion_count": 1,
+      "service_ticks": 1,
+      "source_commit": "e40988d866d07da17f5be6bdc0913db80a6ee950",
+      "verifier_evidence_ids": [
+        "sha256:d4e6765ebf4427c8b79465f21e9e0411ebff8d4c72603f20375ac0b416e4a819"
+      ]
+    },
+    {
+      "accepted_commit": "b40e693d9148bfd3dd36cbf8b155c040891dab29",
+      "accepted_tree": "b767dab932f8578ce1285f022eb6b1fb7aac6dc9",
+      "baseline_commit": "5088e64ca2a2f7df3e4af1bd680143b0ef22752e",
+      "candidate_base_commit": "5088e64ca2a2f7df3e4af1bd680143b0ef22752e",
+      "candidate_commit": "b40e693d9148bfd3dd36cbf8b155c040891dab29",
+      "candidate_parent_commit_verified_in_remote": "5088e64ca2a2f7df3e4af1bd680143b0ef22752e",
+      "candidate_tree": "b767dab932f8578ce1285f022eb6b1fb7aac6dc9",
+      "changed_paths": [
+        "app.sh"
+      ],
+      "completion_epoch": "sha256:2f221f64a52ff4e536fdd0a83991cbbac5a01716e8920a90953a2be150a0e94b",
+      "completion_receipt": "sha256:c59c5713d516e73eb52638923c2acca91b7d506f243275a56574f82a05901a92",
+      "contribution": "C12",
+      "expected_baseline_vectors": 65,
+      "native_gate_current_authority": true,
+      "native_gate_job_id": "sha256:e4e1f86d05348216068ea538eedf23cef15d07866a209c3c24024d613c66dc7d",
+      "native_gate_status": "passed",
+      "ordinal": 12,
+      "revision": "sha256:c225282cce758a05899a6e087f7c5841e0fd81c2becfda72ee43c3e1458bdb01",
+      "service_completion_count": 1,
+      "service_ticks": 1,
+      "source_commit": "f1ae6d1e88b6c855e26cac6de99dcc4cb6a542dc",
+      "verifier_evidence_ids": [
+        "sha256:d04ca3708cde02eb979b08ac7326bc33c0d866987f37ce3469b91b7fc45a3b98"
+      ]
+    },
+    {
+      "accepted_commit": "3d88a162c4a5db26fe3ef89c169cb8ca6c848a24",
+      "accepted_tree": "9bfa9e474e2f68e73b075d3c85a91a56df29a131",
+      "baseline_commit": "b40e693d9148bfd3dd36cbf8b155c040891dab29",
+      "candidate_base_commit": "b40e693d9148bfd3dd36cbf8b155c040891dab29",
+      "candidate_commit": "3d88a162c4a5db26fe3ef89c169cb8ca6c848a24",
+      "candidate_parent_commit_verified_in_remote": "b40e693d9148bfd3dd36cbf8b155c040891dab29",
+      "candidate_tree": "9bfa9e474e2f68e73b075d3c85a91a56df29a131",
+      "changed_paths": [
+        "app.sh"
+      ],
+      "completion_epoch": "sha256:2f221f64a52ff4e536fdd0a83991cbbac5a01716e8920a90953a2be150a0e94b",
+      "completion_receipt": "sha256:a998083299145eb30cdc6ee0deb6db520df50bd501af3612dd8b2f8f22956777",
+      "contribution": "C13",
+      "expected_baseline_vectors": 65,
+      "native_gate_current_authority": true,
+      "native_gate_job_id": "sha256:d724e181723f7fbd43b5cc867dbcdf878ce507d44e93ae3a92da6f1d781997f5",
+      "native_gate_status": "passed",
+      "ordinal": 13,
+      "revision": "sha256:e5f05a954615e91e5a66abd98a352ce695405f71218b17637e9f9bcc6df0024d",
+      "service_completion_count": 1,
+      "service_ticks": 1,
+      "source_commit": "cf093246265c4b3e05a15382a815d92e8a7f5201",
+      "verifier_evidence_ids": [
+        "sha256:cc43d70813fcd42fa937589dac3e685da015fe1dbb78008e6665c1ea62267202"
+      ]
+    },
+    {
+      "accepted_commit": "faefbadfb3a9129e8fd516d15f2899ab276befd4",
+      "accepted_tree": "b1f1ea3c32d11ea8e010964886e1606dba886a01",
+      "baseline_commit": "3d88a162c4a5db26fe3ef89c169cb8ca6c848a24",
+      "candidate_base_commit": "3d88a162c4a5db26fe3ef89c169cb8ca6c848a24",
+      "candidate_commit": "faefbadfb3a9129e8fd516d15f2899ab276befd4",
+      "candidate_parent_commit_verified_in_remote": "3d88a162c4a5db26fe3ef89c169cb8ca6c848a24",
+      "candidate_tree": "b1f1ea3c32d11ea8e010964886e1606dba886a01",
+      "changed_paths": [
+        "app.sh"
+      ],
+      "completion_epoch": "sha256:2f221f64a52ff4e536fdd0a83991cbbac5a01716e8920a90953a2be150a0e94b",
+      "completion_receipt": "sha256:5b2d8ee052a3803c4eb478972f92e3e52d035fcf4e5f0ea3667c4783d292d5b0",
+      "contribution": "C14",
+      "expected_baseline_vectors": 65,
+      "native_gate_current_authority": true,
+      "native_gate_job_id": "sha256:9f402e6b03ef055ec664dbbeb28df9b9c027db51db28bdd621265fab6867bce2",
+      "native_gate_status": "passed",
+      "ordinal": 14,
+      "revision": "sha256:c8fecd1d07402ea7191cb896da4df6a99af4c8235cd02f8c724b970be71cd1e8",
+      "service_completion_count": 1,
+      "service_ticks": 1,
+      "source_commit": "e125634aa50c1314cd2cc9612edc49e25a0c7dba",
+      "verifier_evidence_ids": [
+        "sha256:0f4bf4684b30f77ec2d65c53f0323599ae58a16fd57a5be026f42cc2161f5e22"
+      ]
+    },
+    {
+      "accepted_commit": "863e81ddf005001c0ea49fbcbb626319a90e86de",
+      "accepted_tree": "97dac1c078cdc207724a5bceaf4acea616f5debf",
+      "baseline_commit": "faefbadfb3a9129e8fd516d15f2899ab276befd4",
+      "candidate_base_commit": "faefbadfb3a9129e8fd516d15f2899ab276befd4",
+      "candidate_commit": "863e81ddf005001c0ea49fbcbb626319a90e86de",
+      "candidate_parent_commit_verified_in_remote": "faefbadfb3a9129e8fd516d15f2899ab276befd4",
+      "candidate_tree": "97dac1c078cdc207724a5bceaf4acea616f5debf",
+      "changed_paths": [
+        "app.sh"
+      ],
+      "completion_epoch": "sha256:2f221f64a52ff4e536fdd0a83991cbbac5a01716e8920a90953a2be150a0e94b",
+      "completion_receipt": "sha256:dfd764ec2c8bcbc65d89a5ae23ba93f4ddd97a6393caeea68e1d15a19e8646db",
+      "contribution": "C15",
+      "expected_baseline_vectors": 65,
+      "native_gate_current_authority": true,
+      "native_gate_job_id": "sha256:f2787f914d2a04ee7271b8f6f63033067e6db639e1252d31bcd3dc546d588b34",
+      "native_gate_status": "passed",
+      "ordinal": 15,
+      "revision": "sha256:0a9f8cf175785f7cde6e83dfa65534392657e2e2ad36fcf4128958823364b9bc",
+      "service_completion_count": 1,
+      "service_ticks": 1,
+      "source_commit": "b1b53ac3c314813121d2359334c5c702848379c1",
+      "verifier_evidence_ids": [
+        "sha256:0510d1dbe2b027617d6b91154cf6fabecfa8bb96caa5687116f69b4690650de5"
+      ]
+    },
+    {
+      "accepted_commit": "ced55df580a711cd1447fa88588e2b822cd0251c",
+      "accepted_tree": "1d28c3be0c659b705832240e815041be9de8558d",
+      "baseline_commit": "863e81ddf005001c0ea49fbcbb626319a90e86de",
+      "candidate_base_commit": "863e81ddf005001c0ea49fbcbb626319a90e86de",
+      "candidate_commit": "ced55df580a711cd1447fa88588e2b822cd0251c",
+      "candidate_parent_commit_verified_in_remote": "863e81ddf005001c0ea49fbcbb626319a90e86de",
+      "candidate_tree": "1d28c3be0c659b705832240e815041be9de8558d",
+      "changed_paths": [
+        "app.sh"
+      ],
+      "completion_epoch": "sha256:2f221f64a52ff4e536fdd0a83991cbbac5a01716e8920a90953a2be150a0e94b",
+      "completion_receipt": "sha256:06af2e4b54667389ab03045ce60802850694e04844809811280c1dce3cd7982b",
+      "contribution": "C16",
+      "expected_baseline_vectors": 65,
+      "native_gate_current_authority": true,
+      "native_gate_job_id": "sha256:da7844fcde32bc72ab3e5280347bd96386cb05be338954ecaded4cfad472d3d2",
+      "native_gate_status": "passed",
+      "ordinal": 16,
+      "revision": "sha256:509d9b357791d7c430a0c187d635535234cb1e6284440817b2f36653612e7afb",
+      "service_completion_count": 1,
+      "service_ticks": 1,
+      "source_commit": "84fe03d164a661946ce16549a03993d4d798e2df",
+      "verifier_evidence_ids": [
+        "sha256:6b27c3511307727dea7e082aaec87f9307bf521ce74aeb3bdaa6b729b10b4c7b"
+      ]
+    },
+    {
+      "accepted_commit": "51c8e0eb908e02873ea42f5402b10324054434f2",
+      "accepted_tree": "2190e3bff396a598932125310de11c77cb04db7c",
+      "baseline_commit": "ced55df580a711cd1447fa88588e2b822cd0251c",
+      "candidate_base_commit": "ced55df580a711cd1447fa88588e2b822cd0251c",
+      "candidate_commit": "51c8e0eb908e02873ea42f5402b10324054434f2",
+      "candidate_parent_commit_verified_in_remote": "ced55df580a711cd1447fa88588e2b822cd0251c",
+      "candidate_tree": "2190e3bff396a598932125310de11c77cb04db7c",
+      "changed_paths": [
+        "app.sh"
+      ],
+      "completion_epoch": "sha256:2f221f64a52ff4e536fdd0a83991cbbac5a01716e8920a90953a2be150a0e94b",
+      "completion_receipt": "sha256:2911fc86b0b6c6d05ad8179b154e73328bb76482cb1f8099db5306ed2f303f49",
+      "contribution": "C17",
+      "expected_baseline_vectors": 65,
+      "native_gate_current_authority": true,
+      "native_gate_job_id": "sha256:24ec06b78aa324b6e5c936256e9518652d140ffb9d222f97e2779d477a819dc6",
+      "native_gate_status": "passed",
+      "ordinal": 17,
+      "revision": "sha256:91f16b7fc33f3a1cf6463cbeec0550c4e9123a5946e3b1d0cc6d83c5d6faacfa",
+      "service_completion_count": 1,
+      "service_ticks": 1,
+      "source_commit": "8eae6e7c5be36f3d1110d3b79323eb5667164031",
+      "verifier_evidence_ids": [
+        "sha256:63dc0884ed7b7b2ff932311b1a2586b0ebb7931b21a991a5ffe19c1ed0eb52c5"
+      ]
+    },
+    {
+      "accepted_commit": "0f14044f294816fa2ffd850811bdd8a8b66a6510",
+      "accepted_tree": "037249fd01ea9259ac133b7a7c27e2e147998ea1",
+      "baseline_commit": "51c8e0eb908e02873ea42f5402b10324054434f2",
+      "candidate_base_commit": "51c8e0eb908e02873ea42f5402b10324054434f2",
+      "candidate_commit": "0f14044f294816fa2ffd850811bdd8a8b66a6510",
+      "candidate_parent_commit_verified_in_remote": "51c8e0eb908e02873ea42f5402b10324054434f2",
+      "candidate_tree": "037249fd01ea9259ac133b7a7c27e2e147998ea1",
+      "changed_paths": [
+        "app.sh"
+      ],
+      "completion_epoch": "sha256:2f221f64a52ff4e536fdd0a83991cbbac5a01716e8920a90953a2be150a0e94b",
+      "completion_receipt": "sha256:3d4cb3d7a89ba176ac9e27338928fa23668818dee5155b183defa5c084fc3866",
+      "contribution": "C18",
+      "expected_baseline_vectors": 65,
+      "native_gate_current_authority": true,
+      "native_gate_job_id": "sha256:a0103568f468711f3a36293a318d2bbd1d0e7f96c186f38f57e50d0c6e7deb5f",
+      "native_gate_status": "passed",
+      "ordinal": 18,
+      "revision": "sha256:be4af11188278618b86171ccb439c180b553e88730a39732446e7aacd2445658",
+      "service_completion_count": 1,
+      "service_ticks": 1,
+      "source_commit": "b8d1323897ebfa1b5d4ec0dafe8a0ea1e488b861",
+      "verifier_evidence_ids": [
+        "sha256:e6fb0298de11b88f65b9e5567fc65bca892dbc5a3e174585f933733554ab2695"
+      ]
+    },
+    {
+      "accepted_commit": "d0663396f7891bff2c59e7ea68e40ede11f58583",
+      "accepted_tree": "a6ed18386e3b54f28ebe3e78aac09e74b8c76ad2",
+      "baseline_commit": "0f14044f294816fa2ffd850811bdd8a8b66a6510",
+      "candidate_base_commit": "0f14044f294816fa2ffd850811bdd8a8b66a6510",
+      "candidate_commit": "d0663396f7891bff2c59e7ea68e40ede11f58583",
+      "candidate_parent_commit_verified_in_remote": "0f14044f294816fa2ffd850811bdd8a8b66a6510",
+      "candidate_tree": "a6ed18386e3b54f28ebe3e78aac09e74b8c76ad2",
+      "changed_paths": [
+        "app.sh"
+      ],
+      "completion_epoch": "sha256:2f221f64a52ff4e536fdd0a83991cbbac5a01716e8920a90953a2be150a0e94b",
+      "completion_receipt": "sha256:5dec5786a38b79301c91f0b2d066afbacbd9470854bc12698507764906307874",
+      "contribution": "C19",
+      "expected_baseline_vectors": 65,
+      "native_gate_current_authority": true,
+      "native_gate_job_id": "sha256:c56948489bf30e8a810097b36e046bde84b9c0910a3214feaa49b083a6a94d54",
+      "native_gate_status": "passed",
+      "ordinal": 19,
+      "revision": "sha256:b032402dbbd50f97bb8a7f6ad7bdc0f931e45ff3087d8a470a2abf7f3a101837",
+      "service_completion_count": 1,
+      "service_ticks": 1,
+      "source_commit": "0a338b51a769be7268afc5e927009a8989ff2ded",
+      "verifier_evidence_ids": [
+        "sha256:e9d5ee123a3afa8e79aca5b541608011caf6595b97ebb5bcb73624c0dd77c892"
+      ]
+    },
+    {
+      "accepted_commit": "2d8d7e4ff2912ebd55bd0eaa12e3b6cb93d9ac2f",
+      "accepted_tree": "60522e0d2b21a104a090b555ff8e3cbe41e688c0",
+      "baseline_commit": "d0663396f7891bff2c59e7ea68e40ede11f58583",
+      "candidate_base_commit": "d0663396f7891bff2c59e7ea68e40ede11f58583",
+      "candidate_commit": "2d8d7e4ff2912ebd55bd0eaa12e3b6cb93d9ac2f",
+      "candidate_parent_commit_verified_in_remote": "d0663396f7891bff2c59e7ea68e40ede11f58583",
+      "candidate_tree": "60522e0d2b21a104a090b555ff8e3cbe41e688c0",
+      "changed_paths": [
+        "app.sh"
+      ],
+      "completion_epoch": "sha256:2f221f64a52ff4e536fdd0a83991cbbac5a01716e8920a90953a2be150a0e94b",
+      "completion_receipt": "sha256:09bc3a748f4b4f7e81cb057802487d796f449b4bd8e333841dc54e6be0aa130c",
+      "contribution": "C20",
+      "expected_baseline_vectors": 65,
+      "native_gate_current_authority": true,
+      "native_gate_job_id": "sha256:3ab94cfa9ca008912d2b7681ea12c9519f4ace33c73a4985ecec370ec5a2d1a6",
+      "native_gate_status": "passed",
+      "ordinal": 20,
+      "revision": "sha256:1e933e53a7d6a75114e776fe8308f2bf405e0bc3d1f754e4f411a524c2c0fcf5",
+      "service_completion_count": 1,
+      "service_ticks": 1,
+      "source_commit": "25f2752ce2b2b09a85a262e65eaa3437d41a641d",
+      "verifier_evidence_ids": [
+        "sha256:d93ffc40adebdc31814f71737aa62282ccc1e2c22f1d9741437b7e7804a877e3"
+      ]
+    }
+  ],
+  "test": "local_controller::drive::tests::fx17::actual_fx17_twenty_controlled_changes_preserve_all_65_vectors"
+}

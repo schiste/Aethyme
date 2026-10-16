@@ -1,0 +1,550 @@
+{
+  "schema": "aethyme.e1.browser-fixtures/v1",
+  "baseline": "base.html",
+  "browser_contract": "requirements.md",
+  "cases": [
+    {
+      "id": "FX01-browser",
+      "contributions": [
+        {
+          "id": "c1",
+          "base": "base.html",
+          "result": "label.html",
+          "requires": [
+
+          ],
+          "atomic_group": null,
+          "derived_from": [
+
+          ]
+        },
+        {
+          "id": "c2",
+          "base": "base.html",
+          "result": "accessible.html",
+          "requires": [
+
+          ],
+          "atomic_group": null,
+          "derived_from": [
+
+          ]
+        },
+        {
+          "id": "c3",
+          "base": "base.html",
+          "result": "mobile.html",
+          "requires": [
+
+          ],
+          "atomic_group": null,
+          "derived_from": [
+
+          ]
+        }
+      ],
+      "orders": [
+        [
+          "c1",
+          "c2",
+          "c3"
+        ],
+        [
+          "c1",
+          "c3",
+          "c2"
+        ],
+        [
+          "c2",
+          "c1",
+          "c3"
+        ],
+        [
+          "c2",
+          "c3",
+          "c1"
+        ],
+        [
+          "c3",
+          "c1",
+          "c2"
+        ],
+        [
+          "c3",
+          "c2",
+          "c1"
+        ]
+      ],
+      "requirements": [
+        "search",
+        "label",
+        "accessible",
+        "keyboard",
+        "mobile",
+        "navigation"
+      ]
+    },
+    {
+      "id": "FX02-browser",
+      "contributions": [
+        {
+          "id": "c1",
+          "base": "base.html",
+          "result": "moved.html",
+          "requires": [
+
+          ],
+          "atomic_group": null,
+          "derived_from": [
+
+          ]
+        },
+        {
+          "id": "c2",
+          "base": "base.html",
+          "result": "accessible.html",
+          "requires": [
+
+          ],
+          "atomic_group": null,
+          "derived_from": [
+
+          ]
+        },
+        {
+          "id": "c3",
+          "base": "base.html",
+          "result": "mobile.html",
+          "requires": [
+
+          ],
+          "atomic_group": null,
+          "derived_from": [
+
+          ]
+        }
+      ],
+      "orders": [
+        [
+          "c1",
+          "c2",
+          "c3"
+        ],
+        [
+          "c1",
+          "c3",
+          "c2"
+        ],
+        [
+          "c2",
+          "c1",
+          "c3"
+        ],
+        [
+          "c2",
+          "c3",
+          "c1"
+        ],
+        [
+          "c3",
+          "c1",
+          "c2"
+        ],
+        [
+          "c3",
+          "c2",
+          "c1"
+        ]
+      ],
+      "requirements": [
+        "search",
+        "accessible",
+        "keyboard",
+        "mobile",
+        "navigation",
+        "moved"
+      ]
+    },
+    {
+      "id": "FX03-browser",
+      "contributions": [
+        {
+          "id": "c1",
+          "base": "base.html",
+          "result": "label.html",
+          "requires": [
+
+          ],
+          "atomic_group": null,
+          "derived_from": [
+
+          ]
+        },
+        {
+          "id": "c2",
+          "base": "label.html",
+          "result": "inherited.html",
+          "requires": [
+
+          ],
+          "atomic_group": null,
+          "derived_from": [
+
+          ]
+        },
+        {
+          "id": "c3",
+          "base": "base.html",
+          "result": "mobile.html",
+          "requires": [
+
+          ],
+          "atomic_group": null,
+          "derived_from": [
+
+          ]
+        }
+      ],
+      "orders": [
+        [
+          "c1",
+          "c2",
+          "c3"
+        ],
+        [
+          "c1",
+          "c3",
+          "c2"
+        ],
+        [
+          "c2",
+          "c1",
+          "c3"
+        ],
+        [
+          "c2",
+          "c3",
+          "c1"
+        ],
+        [
+          "c3",
+          "c1",
+          "c2"
+        ],
+        [
+          "c3",
+          "c2",
+          "c1"
+        ],
+        [
+          "c1",
+          "c1",
+          "c2",
+          "c3"
+        ]
+      ],
+      "requirements": [
+        "search",
+        "label",
+        "accessible",
+        "mobile",
+        "navigation",
+        "keyboard"
+      ]
+    },
+    {
+      "id": "FX04-browser",
+      "contributions": [
+        {
+          "id": "c1",
+          "base": "base.html",
+          "result": "analytics.html",
+          "requires": [
+
+          ],
+          "atomic_group": null,
+          "derived_from": [
+
+          ]
+        },
+        {
+          "id": "c2",
+          "base": "base.html",
+          "result": "privacy.html",
+          "requires": [
+
+          ],
+          "atomic_group": null,
+          "derived_from": [
+
+          ]
+        }
+      ],
+      "orders": [
+        [
+          "c1",
+          "c2"
+        ],
+        [
+          "c2",
+          "c1"
+        ]
+      ],
+      "requirements": [
+        "search",
+        "consent",
+        "privacy",
+        "navigation"
+      ]
+    },
+    {
+      "id": "FX05-browser",
+      "contributions": [
+        {
+          "id": "c1",
+          "base": "base.html",
+          "result": "left-timeout.html",
+          "requires": [
+
+          ],
+          "atomic_group": null,
+          "derived_from": [
+
+          ]
+        },
+        {
+          "id": "c2",
+          "base": "base.html",
+          "result": "right-timeout.html",
+          "requires": [
+
+          ],
+          "atomic_group": null,
+          "derived_from": [
+
+          ]
+        }
+      ],
+      "orders": [
+        [
+          "c1",
+          "c2"
+        ],
+        [
+          "c2",
+          "c1"
+        ]
+      ],
+      "requirements": [
+        "search"
+      ]
+    },
+    {
+      "id": "FX06-browser",
+      "contributions": [
+        {
+          "id": "c1",
+          "base": "base.html",
+          "result": "producer.html",
+          "requires": [
+
+          ],
+          "atomic_group": "a1",
+          "derived_from": [
+
+          ]
+        },
+        {
+          "id": "c2",
+          "base": "base.html",
+          "result": "consumer.html",
+          "requires": [
+
+          ],
+          "atomic_group": "a1",
+          "derived_from": [
+
+          ]
+        }
+      ],
+      "orders": [
+        [
+          "c1",
+          "c2"
+        ],
+        [
+          "c2",
+          "c1"
+        ]
+      ],
+      "requirements": [
+        "search",
+        "navigation"
+      ]
+    },
+    {
+      "id": "FX06-partial",
+      "contributions": [
+        {
+          "id": "c1",
+          "base": "base.html",
+          "result": "producer.html",
+          "requires": [
+
+          ],
+          "atomic_group": "a1",
+          "derived_from": [
+
+          ]
+        },
+        {
+          "id": "c2",
+          "base": "base.html",
+          "result": "consumer.html",
+          "requires": [
+
+          ],
+          "atomic_group": "a1",
+          "derived_from": [
+
+          ]
+        }
+      ],
+      "orders": [
+        [
+          "c1"
+        ]
+      ],
+      "requirements": [
+
+      ]
+    },
+    {
+      "id": "FX06-cycle",
+      "contributions": [
+        {
+          "id": "c1",
+          "base": "base.html",
+          "result": "label.html",
+          "requires": [
+            "c2"
+          ],
+          "atomic_group": null,
+          "derived_from": [
+
+          ]
+        },
+        {
+          "id": "c2",
+          "base": "base.html",
+          "result": "accessible.html",
+          "requires": [
+            "c1"
+          ],
+          "atomic_group": null,
+          "derived_from": [
+
+          ]
+        }
+      ],
+      "orders": [
+        [
+          "c1",
+          "c2"
+        ]
+      ],
+      "requirements": [
+
+      ]
+    },
+    {
+      "id": "FX03-unknown",
+      "contributions": [
+        {
+          "id": "c1",
+          "base": "label.html",
+          "result": "inherited.html",
+          "requires": [
+
+          ],
+          "atomic_group": null,
+          "derived_from": [
+
+          ]
+        }
+      ],
+      "orders": [
+        [
+          "c1"
+        ]
+      ],
+      "requirements": [
+
+      ]
+    },
+    {
+      "id": "FX07-browser",
+      "contributions": [
+        {
+          "id": "c1",
+          "base": "base.html",
+          "result": "analytics.html",
+          "requires": [
+
+          ],
+          "atomic_group": null,
+          "derived_from": [
+
+          ]
+        },
+        {
+          "id": "c2",
+          "base": "base.html",
+          "result": "privacy.html",
+          "requires": [
+
+          ],
+          "atomic_group": null,
+          "derived_from": [
+
+          ]
+        }
+      ],
+      "orders": [
+        [
+          "c1",
+          "c2"
+        ]
+      ],
+      "requirements": [
+        "search",
+        "consent",
+        "privacy",
+        "navigation"
+      ],
+      "synthesis": "FX04-browser",
+      "exclude": "c1",
+      "consumer_task": "fx07-consumer-declaration.json",
+      "subtraction_paths": [
+        {
+          "keep": [
+
+          ],
+          "requirements": [
+            "search",
+            "navigation",
+            "no_analytics"
+          ]
+        },
+        {
+          "keep": [
+            "consumer-footer"
+          ],
+          "requirements": [
+
+          ]
+        }
+      ]
+    }
+  ]
+}

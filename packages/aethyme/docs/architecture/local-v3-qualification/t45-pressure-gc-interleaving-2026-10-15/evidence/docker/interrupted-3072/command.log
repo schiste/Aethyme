@@ -1,0 +1,10 @@
+   Compiling aethyme-engine v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/implement-deterministic-t45-gc-and-stora/packages/aethyme/rust/crates/aethyme-engine)
+   Compiling aethyme-broker v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/implement-deterministic-t45-gc-and-stora/packages/aethyme/rust/crates/aethyme-broker)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1m 28s
+     Running unittests src/lib.rs (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/integrate-reviewed-local-bare-git-servic/target/local-resume/cargo/debug/deps/aethyme_broker-0f278e0d02146111)
+
+running 1 test
+test execution_resources::qualification::actual_pressure_preserves_retained_source_and_bounded_native_cleanup ... Local QA durable host journal /Volumes/T7-repositories/Application Support/Aethyme/qualification/local-check-temporaries/t45-gc-docker-bounded-positive-profile-3072-ec6f550b-tmp-ivsyv_qo/.tmpcROtKM
+Local QA retained stable source root /Volumes/T7-repositories/Application Support/Aethyme/qualification/local-check-temporaries/t45-gc-docker-bounded-positive-profile-3072-ec6f550b-tmp-ivsyv_qo/.tmpXjvXxJ
+Local QA retained pressure source root /Volumes/T7-repositories/Application Support/Aethyme/qualification/local-check-temporaries/t45-gc-docker-bounded-positive-profile-3072-ec6f550b-tmp-ivsyv_qo/.tmp7C9Zou
+Local QA kernel ENOSPC diagnostic SHA-256 bec33a64676bc7e02db8144a5eb2a93df7ae2fb0b79d9882358a4e94ed189564 while GC holds archive EX

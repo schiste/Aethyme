@@ -1,0 +1,11 @@
+--- a/packages/aethyme/rust/crates/aethyme-broker/src/execution_verifier.rs
++++ b/packages/aethyme/rust/crates/aethyme-broker/src/execution_verifier.rs
+@@ -772,7 +772,7 @@
+     inputs: &snapshot::MaterializedInputs,
+     policy: &VerifierPolicy,
+ ) -> Result<AssertionInventory, VerificationError> {
+-    let path = inputs.harness_dir().join("harness/inventory.json");
++    let path = inputs.root().join("harness/inventory.json");
+     let mut file = std::fs::File::open(path)?;
+     use std::io::Read;
+     let mut bytes = Vec::new();

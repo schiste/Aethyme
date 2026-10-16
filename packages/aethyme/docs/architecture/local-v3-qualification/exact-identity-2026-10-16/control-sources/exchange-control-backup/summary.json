@@ -1,0 +1,66 @@
+{
+  "source_restored": true,
+  "source_sha256": "2c68461f785746c85d38b0c85019bb331143ba799b119c99dda7bd296bc72e8d",
+  "trials": [
+    {
+      "label": "full-prefix-chunk-shape",
+      "exit": 101,
+      "final": {
+        "log": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/complete-exact-immutable-contribution-co/target/local-resume/exact-revision-checks/20261016T043655Z-exchange-neuter-full-prefix-chunk-shape-f465192e/command.log",
+        "log_sha256": "7fd7b7e41e3d36bb98aea5ff222c3c28a415ce36b9196b1b2ad78ec9efa8e6c6",
+        "metadata": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/complete-exact-immutable-contribution-co/target/local-resume/exact-revision-checks/20261016T043655Z-exchange-neuter-full-prefix-chunk-shape-f465192e/command.json",
+        "numeric_exit": 101,
+        "source_unchanged": true,
+        "state": "completed",
+        "status": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/complete-exact-immutable-contribution-co/target/local-resume/exact-revision-checks/20261016T043655Z-exchange-neuter-full-prefix-chunk-shape-f465192e/command.status"
+      },
+      "test_results": [
+        [
+          "0",
+          "1",
+          "0"
+        ]
+      ]
+    },
+    {
+      "label": "whole-envelope-preflight",
+      "exit": 101,
+      "final": {
+        "log": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/complete-exact-immutable-contribution-co/target/local-resume/exact-revision-checks/20261016T043730Z-exchange-neuter-whole-envelope-preflight-800a707e/command.log",
+        "log_sha256": "3448bf8e3cd1b8cd4940cd292df8d621f9661d1da60db73e02af1b9996f925a9",
+        "metadata": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/complete-exact-immutable-contribution-co/target/local-resume/exact-revision-checks/20261016T043730Z-exchange-neuter-whole-envelope-preflight-800a707e/command.json",
+        "numeric_exit": 101,
+        "source_unchanged": true,
+        "state": "completed",
+        "status": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/complete-exact-immutable-contribution-co/target/local-resume/exact-revision-checks/20261016T043730Z-exchange-neuter-whole-envelope-preflight-800a707e/command.status"
+      },
+      "test_results": [
+        [
+          "0",
+          "1",
+          "0"
+        ]
+      ]
+    },
+    {
+      "label": "aggregate-page-byte-cap",
+      "exit": 101,
+      "final": {
+        "log": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/complete-exact-immutable-contribution-co/target/local-resume/exact-revision-checks/20261016T043759Z-exchange-neuter-aggregate-page-byte-cap-713e0d7e/command.log",
+        "log_sha256": "33f6ab86e048385f61721e5da11d23cd535b9d6567be0936977535b7952592f8",
+        "metadata": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/complete-exact-immutable-contribution-co/target/local-resume/exact-revision-checks/20261016T043759Z-exchange-neuter-aggregate-page-byte-cap-713e0d7e/command.json",
+        "numeric_exit": 101,
+        "source_unchanged": true,
+        "state": "completed",
+        "status": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/complete-exact-immutable-contribution-co/target/local-resume/exact-revision-checks/20261016T043759Z-exchange-neuter-aggregate-page-byte-cap-713e0d7e/command.status"
+      },
+      "test_results": [
+        [
+          "0",
+          "1",
+          "0"
+        ]
+      ]
+    }
+  ]
+}

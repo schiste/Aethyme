@@ -1,0 +1,25 @@
+   Compiling aethyme-engine v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/682-reconcile-final-local-qualification/packages/aethyme/rust/crates/aethyme-engine)
+   Compiling aethyme-broker v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/682-reconcile-final-local-qualification/packages/aethyme/rust/crates/aethyme-broker)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 36.50s
+────────────
+ Nextest run ID c9229ad7-d58d-41e1-b711-297f7f4a963f with nextest profile: default
+    Starting 16 tests across 1 binary (1815 tests skipped)
+        PASS [  38.520s] aethyme-broker native_gates::tests::a_dispatched_job_reopens_unknown_without_any_retry
+        PASS [   0.057s] aethyme-broker native_gates::tests::checkout_placement_refuses_upward_project_discovery
+        PASS [  39.384s] aethyme-broker local_controller::drive::tests::completed_native_job_is_history_and_cannot_approve_controller_dispatch
+        PASS [  39.702s] aethyme-broker native_gates::tests::actual_composer_candidate_runs_native_gates_without_legacy_queue_or_ref_writes
+        SLOW [> 60.000s] aethyme-broker native_gates::tests::budget_capacity_and_requirement_holds_do_not_dispatch_prepared_jobs
+        PASS [  32.173s] aethyme-broker native_gates::tests::corrupt_projected_job_identity_and_source_binding_refuse_before_dispatch
+        PASS [  31.887s] aethyme-broker native_gates::tests::dispatching_and_unknown_jobs_stay_rooted_without_a_process_tree_proof
+        PASS [  33.686s] aethyme-broker native_gates::tests::completed_job_release_survives_real_gc_and_reopened_status_reads
+        PASS [  26.269s] aethyme-broker native_gates::tests::native_gate_roots_survive_revision_root_release
+        PASS [  97.865s] aethyme-broker native_gates::tests::budget_capacity_and_requirement_holds_do_not_dispatch_prepared_jobs
+        PASS [   0.011s] aethyme-broker native_gates::tests::physical_subject_includes_mode_symlink_target_and_untracked_source
+        PASS [  26.207s] aethyme-broker native_gates::tests::no_gate_configuration_is_explicitly_not_verification
+        PASS [  26.926s] aethyme-broker native_gates::tests::fresh_dispatch_refuses_a_job_completed_after_the_callers_snapshot
+        PASS [  24.437s] aethyme-broker native_gates::tests::released_prepared_job_remains_readable_but_cannot_be_dispatched_or_replayed
+        PASS [  23.820s] aethyme-broker native_gates::tests::stale_owner_cannot_release_but_current_owner_can_release_old_epoch_history
+        PASS [  23.829s] aethyme-broker native_gates::tests::root_release_waits_for_an_in_progress_gc_generation
+        PASS [  43.595s] aethyme-broker native_gates::tests::prepared_job_cannot_borrow_another_repository_trust_or_survive_revocation
+────────────
+     Summary [ 141.462s] 16 tests run: 16 passed (1 slow), 1815 skipped

@@ -1,0 +1,29 @@
+{
+  "source_head": "f30ed703ed855fb8edf66b2dccb08765c9a3b23e",
+  "test_proposal": "/private/tmp/capture_revision_replay-v2.rs",
+  "test_sha256": "7748070d3cda443ab28d28a4a8873160aed376d44e0b567d14ce723c2ad2bd5a",
+  "production_source_sha256": "b6207871391cf8421c32a6a3f932b9950bd0ce950efffd644b784e1edcd31ff6",
+  "controls": [
+    {
+      "guard": "base-in-request-digest",
+      "patch": "/private/tmp/t04-replay-controls-v1/base.patch",
+      "patch_sha256": "08aaf526676ad652a76ea93f9875a3f72567de95de624fbcbc4f16e52c58a055",
+      "test": "changing_only_the_base_revision_cannot_overwrite_an_operation_receipt",
+      "expected": "one selected test fails at intended conflicting_operation assertion (unwrap_err on acknowledged receipt); compile failures and zero tests uncredited",
+      "restore": "unique mktemp pristine backup and trap/finally restore; compare original source SHA and clean git diff; touch crate lib mtime before rebuilt run; restored two positive cases pass"
+    },
+    {
+      "guard": "result-in-request-digest",
+      "patch": "/private/tmp/t04-replay-controls-v1/result.patch",
+      "patch_sha256": "7cccede77e98ffcfc5248bf23018dba9510d8dc66e7b07b84007f8faa1e0648d",
+      "test": "changing_only_the_result_revision_cannot_overwrite_an_operation_receipt",
+      "expected": "one selected test fails at intended conflicting_operation assertion (unwrap_err on acknowledged receipt); compile failures and zero tests uncredited",
+      "restore": "unique mktemp pristine backup and trap/finally restore; compare original source SHA and clean git diff; touch crate lib mtime before rebuilt run; restored two positive cases pass"
+    }
+  ],
+  "runtime": "Author1130explicitlyreleasedCargo/native;root1122willrunonlyafterthisexactv2staticreviewandcleancommittedsource.",
+  "supersedes_test_for_future_runs_only": {
+    "path": "/private/tmp/capture_revision_replay.rs",
+    "sha256": "5cf7b8ca388563e5e165441aec38c697fcf25e519f52ec6f65915ab0c9afad70"
+  }
+}

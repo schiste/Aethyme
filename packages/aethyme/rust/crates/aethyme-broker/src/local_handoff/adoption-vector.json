@@ -1,0 +1,16 @@
+{
+  "spec": {
+    "profile": "aethyme.handoff.native-unix-command/provisional-v0",
+    "handoff": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "dispatch": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "generation": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "source": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    "session": "fixture-agent",
+    "agent_nonce": "fixture-native-incarnation",
+    "epoch": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    "absolute_root": "/playground/generations/fixture/source",
+    "native_pid": 12345
+  },
+  "canonical": "{\"schema\":\"aethyme.adoption-receipt/provisional-v0\",\"spec\":{\"absolute_root\":\"/playground/generations/fixture/source\",\"agent_nonce\":\"fixture-native-incarnation\",\"dispatch\":\"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"epoch\":\"sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\",\"generation\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"handoff\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"native_pid\":12345,\"profile\":\"aethyme.handoff.native-unix-command/provisional-v0\",\"session\":\"fixture-agent\",\"source\":\"sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\"}}",
+  "id": "sha256:1a23942180fad840e1880c207986122de4ea127e2d31aaeff0e5a80755a2dc4f"
+}

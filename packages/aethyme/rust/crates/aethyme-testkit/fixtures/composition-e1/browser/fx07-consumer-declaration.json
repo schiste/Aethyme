@@ -1,0 +1,79 @@
+{
+  "schema": "aethyme.e1.dynamic-consumer-task/v1",
+  "id": "FX07-browser-actual-consumer",
+  "status": "frozen_design_unrun",
+  "synthesis_subject": {
+    "source": "exact actual successful FX04-browser synthesis",
+    "input_lineage": [
+      "c1",
+      "c2"
+    ],
+    "identity": "read from the retained archive after actual independent qualification; never supplied or fabricated",
+    "candidate_bytes": "the actual resolver result, not an expected merged fixture",
+    "retain": [
+      "original baseline",
+      "c1",
+      "c2",
+      "actual synthesized contribution S"
+    ]
+  },
+  "consumer": {
+    "id": "consumer-footer",
+    "base": "the exact retained snapshot/result revision of S",
+    "requires": [
+      "the exact synthesized contribution S"
+    ],
+    "derived_from": [
+
+    ],
+    "synthesized": false,
+    "edit": {
+      "kind": "bounded literal insertion before document close",
+      "path": "page.html",
+      "anchor_utf8": "</body>",
+      "required_literal_occurrences": 1,
+      "required_suffix_pattern": "</body>\\s*</html>\\s*$",
+      "insert_utf8": "<footer id=\"consumer-note\">Consumer observes the consent-aware search revision.</footer>\n",
+      "changes_elsewhere": false,
+      "missing_or_nonunique_anchor": "record failed/unrun consumer preparation; no subtraction qualification"
+    },
+    "capture": "make an actual commit from S with precisely this edit and archive it with the existing native capture API; record exact raw parent/result tree identities",
+    "pre_subtraction_positive": "the actual kept S+consumer candidate passes original FX04 browser behavior and one visible consumer footer"
+  },
+  "subtraction_without_consumer": {
+    "from": "S",
+    "remove": [
+      "c1"
+    ],
+    "keep": [
+
+    ],
+    "expected": "new independently validated candidate composed from retained c2 alone",
+    "required_assertions": [
+      "recipe/input lineage names exact retained c2, excludes c1 and S as selected merge inputs",
+      "capture originals, S and consumer remain reconstructable",
+      "search by Enter and pointer and original navigation work",
+      "consent control begins unchecked and still toggles",
+      "all telemetry/network history empty at load, before consent, with consent and after revocation",
+      "candidate not relabelled S: independent no-analytics observations on exact new candidate bytes"
+    ]
+  },
+  "subtraction_with_consumer": {
+    "from": "S",
+    "remove": [
+      "c1"
+    ],
+    "keep": [
+      "consumer-footer"
+    ],
+    "expected": "Refused(inseparable_selection)",
+    "required_assertions": [
+      "actual retained consumer base is the exact S result and requires its exact synthesized identity",
+      "exact refusal code, no candidate and no successful composition recipe",
+      "retained source identities/bytes unchanged",
+      "no substituted/rebased consumer and no historical S reused as a new result"
+    ]
+  },
+  "privacy_observer_split": "no-consumer subtraction uses a separate no_analytics requirement: it must not run the consent-positive one-event assertion from FX04",
+  "order_and_repeat_policy": "run all declared input orders twice for successful commutative results; classify every required preparation/failure/unrun row; do not rerun sealed cases"
+}

@@ -1,0 +1,27 @@
+{
+  "schema": "aethyme.local-ci-command-result/v1",
+  "id": "ci-785-cc31-workspace-failure",
+  "pr": 785,
+  "branch_head": "cc31a0de198dbd5231bbeebc9b78aa7a05cd6cf8",
+  "ci_checkout_commit": "a8512872f554623c96e040206f4a6174003c515e",
+  "ci_checkout_tree": "7d872ee2c3fdee8a5baabdcbdd2802dceb20ff3e",
+  "ci_checkout_parents": [
+    "8daffab2bb80ae0cce8286c530d70fad42c033f5",
+    "cc31a0de198dbd5231bbeebc9b78aa7a05cd6cf8"
+  ],
+  "job_url": "https://github.com/schiste/Aethyme/actions/runs/38792337665/job/116620358510",
+  "numeric_exit": 100,
+  "tests_run": 4576,
+  "tests_passed": 4573,
+  "tests_failed": 3,
+  "tests_skipped": 32,
+  "failed_tests": [
+    "aethyme-broker collaboration_sensitive::tests::synthetic_source_token_is_blocked_and_managed_copies_are_removed_with_residuals",
+    "aethyme-broker native_gates::tests::released_prepared_job_remains_readable_but_cannot_be_dispatched_or_replayed",
+    "aethyme-cli::help_snapshots help_surface_matches_snapshots"
+  ],
+  "failure": "The sensitive-content composite failed its retrieved-record token assertion. The native-job test expected schema 23 but observed 24. The help snapshot was stale. All remain failed attempts.",
+  "credited_as_passing_command": false,
+  "log_sha256": "b9d330aec884da8be74ef62bc4143539204e9e5ba84050ccf0d73aca0014bf49",
+  "scope": "Actual GitHub merge-ref source, separate from PR head. This executes the pre-v4 composite and supplies no credit for the later frozen v4 view cleanup protocol. Full original job log preserved without normalization."
+}

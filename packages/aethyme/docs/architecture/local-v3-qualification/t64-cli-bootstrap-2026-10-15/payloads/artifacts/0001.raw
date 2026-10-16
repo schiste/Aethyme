@@ -1,0 +1,176 @@
+   Compiling aethyme-engine v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/complete-fresh-local-cli-bootstrap-and-c/packages/aethyme/rust/crates/aethyme-engine)
+   Compiling aethyme-broker v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/complete-fresh-local-cli-bootstrap-and-c/packages/aethyme/rust/crates/aethyme-broker)
+error[E0433]: cannot find module or crate `archive` in this scope
+   --> crates/aethyme-broker/src/collaboration_capture.rs:982:9
+    |
+982 |         archive::parse_digest(&digest_hex).ok_or_else(|| CaptureError::CorruptReceipt {
+    |         ^^^^^^^ use of unresolved module or unlinked crate `archive`
+    |
+    = help: if you wanted to use a crate named `archive`, use `cargo add archive` to add it to your `Cargo.toml`
+note: module `crate::local_restore::manager::archive` exists but is inaccessible
+   --> crates/aethyme-broker/src/lib.rs:38:1
+    |
+ 38 | pub mod collaboration_archive;
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ not accessible
+
+error[E0433]: cannot find module or crate `archive` in this scope
+   --> crates/aethyme-broker/src/collaboration_capture.rs:982:9
+    |
+982 |         archive::parse_digest(&digest_hex).ok_or_else(|| CaptureError::CorruptReceipt {
+    |         ^^^^^^^ use of unresolved module or unlinked crate `archive`
+    |
+    = help: if you wanted to use a crate named `archive`, use `cargo add archive` to add it to your `Cargo.toml`
+note: module `crate::local_wave::tests::archive` exists but is inaccessible
+   --> crates/aethyme-broker/src/lib.rs:38:1
+    |
+ 38 | pub mod collaboration_archive;
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ not accessible
+
+error[E0308]: mismatched types
+   --> crates/aethyme-broker/src/local_capture_notice/tests.rs:217:44
+    |
+217 |     let capture_receipt = capture::receipt(&f.store, &operation).unwrap().unwrap();
+    |                           ---------------- ^^^^^^^^ types differ in mutability
+    |                           |
+    |                           arguments to this function are incorrect
+    |
+    = note: expected mutable reference `&mut collaboration_state::CollaborationStore`
+                       found reference `&collaboration_state::CollaborationStore`
+note: function defined here
+   --> crates/aethyme-broker/src/collaboration_capture.rs:816:8
+    |
+816 | pub fn receipt(
+    |        ^^^^^^^
+817 |     store: &mut CollaborationStore,
+    |     ------------------------------
+
+error[E0618]: expected function, found `BudgetStatus`
+    --> crates/aethyme-broker/src/broker/gate_trust.rs:503:1
+     |
+ 503 |   pub(crate) fn status(dir: &Path) -> Result<GateTrustStatus, BrokerOpError> {
+     |   -------------------------------------------------------------------------- this function of the same name is available here, but it's shadowed by the local binding
+     |
+    ::: crates/aethyme-broker/src/collaboration_cli.rs:665:1
+     |
+ 665 |   fn status(main_root: &Path) -> Result<Output, Failure> {
+     |   ------------------------------------------------------ this function of the same name is available here, but it's shadowed by the local binding
+     |
+    ::: crates/aethyme-broker/src/collaboration_sensitive.rs:727:1
+     |
+ 727 | / pub fn status(
+ 728 | |     store: &CollaborationStore,
+ 729 | |     incident_id: &str,
+ 730 | | ) -> Result<IncidentStatus, SensitiveError> {
+     | |___________________________________________- this function of the same name is available here, but it's shadowed by the local binding
+     |
+    ::: crates/aethyme-broker/src/hooks.rs:750:1
+     |
+ 750 |   pub fn status(repo: &GitRepo) -> Result<Vec<HookReport>, HooksError> {
+     |   -------------------------------------------------------------------- this function of the same name is available here, but it's shadowed by the local binding
+     |
+    ::: crates/aethyme-broker/src/local_authority.rs:299:1
+     |
+ 299 |   pub fn status(store: &CollaborationStore) -> Result<Witness, AuthorityError> {
+     |   ---------------------------------------------------------------------------- this function of the same name is available here, but it's shadowed by the local binding
+     |
+    ::: crates/aethyme-broker/src/local_budget.rs:1316:1
+     |
+1316 | / pub fn status(
+1317 | |     store: &CollaborationStore,
+1318 | |     target_name: &str,
+1319 | |     issuer: &str,
+1320 | |     reservation: Option<&RecordId>,
+1321 | |     nonce: Option<&str>,
+1322 | | ) -> Result<BudgetStatus, BudgetError> {
+     | |______________________________________- this function of the same name is available here, but it's shadowed by the local binding
+     |
+    ::: crates/aethyme-broker/src/local_target.rs:600:1
+     |
+ 600 |   pub fn status(store: &CollaborationStore, target: &str) -> Result<ControllerStatus, TargetError> {
+     |   ------------------------------------------------------------------------------------------------ this function of the same name is available here, but it's shadowed by the local binding
+     |
+    ::: crates/aethyme-broker/src/local_budget/tests.rs:80:9
+     |
+  80 |       let status = status(
+     |           ------ `status` has type `BudgetStatus`
+...
+  98 |       let repeated = status(
+     |                      -^^^^^- help: consider using a semicolon here to finish the statement: `;`
+     |  ____________________|
+     | |
+  99 | |         &f.store,
+ 100 | |         owner.target(),
+ 101 | |         owner.issuer(),
+ 102 | |         None,
+ 103 | |         Some(&request.nonce),
+ 104 | |     )
+     | |_____- call expression requires function
+
+error[E0618]: expected function, found `BudgetStatus`
+    --> crates/aethyme-broker/src/broker/gate_trust.rs:503:1
+     |
+ 503 |   pub(crate) fn status(dir: &Path) -> Result<GateTrustStatus, BrokerOpError> {
+     |   -------------------------------------------------------------------------- this function of the same name is available here, but it's shadowed by the local binding
+     |
+    ::: crates/aethyme-broker/src/collaboration_cli.rs:665:1
+     |
+ 665 |   fn status(main_root: &Path) -> Result<Output, Failure> {
+     |   ------------------------------------------------------ this function of the same name is available here, but it's shadowed by the local binding
+     |
+    ::: crates/aethyme-broker/src/collaboration_sensitive.rs:727:1
+     |
+ 727 | / pub fn status(
+ 728 | |     store: &CollaborationStore,
+ 729 | |     incident_id: &str,
+ 730 | | ) -> Result<IncidentStatus, SensitiveError> {
+     | |___________________________________________- this function of the same name is available here, but it's shadowed by the local binding
+     |
+    ::: crates/aethyme-broker/src/hooks.rs:750:1
+     |
+ 750 |   pub fn status(repo: &GitRepo) -> Result<Vec<HookReport>, HooksError> {
+     |   -------------------------------------------------------------------- this function of the same name is available here, but it's shadowed by the local binding
+     |
+    ::: crates/aethyme-broker/src/local_authority.rs:299:1
+     |
+ 299 |   pub fn status(store: &CollaborationStore) -> Result<Witness, AuthorityError> {
+     |   ---------------------------------------------------------------------------- this function of the same name is available here, but it's shadowed by the local binding
+     |
+    ::: crates/aethyme-broker/src/local_budget.rs:1316:1
+     |
+1316 | / pub fn status(
+1317 | |     store: &CollaborationStore,
+1318 | |     target_name: &str,
+1319 | |     issuer: &str,
+1320 | |     reservation: Option<&RecordId>,
+1321 | |     nonce: Option<&str>,
+1322 | | ) -> Result<BudgetStatus, BudgetError> {
+     | |______________________________________- this function of the same name is available here, but it's shadowed by the local binding
+     |
+    ::: crates/aethyme-broker/src/local_target.rs:600:1
+     |
+ 600 |   pub fn status(store: &CollaborationStore, target: &str) -> Result<ControllerStatus, TargetError> {
+     |   ------------------------------------------------------------------------------------------------ this function of the same name is available here, but it's shadowed by the local binding
+     |
+    ::: crates/aethyme-broker/src/local_budget/tests.rs:80:9
+     |
+  80 |       let status = status(
+     |           ------ `status` has type `BudgetStatus`
+...
+ 110 |       let absent = status(
+     |                    -^^^^^- help: consider using a semicolon here to finish the statement: `;`
+     |  __________________|
+     | |
+ 111 | |         &f.store,
+ 112 | |         owner.target(),
+ 113 | |         owner.issuer(),
+ 114 | |         None,
+ 115 | |         Some(&reference('f')),
+ 116 | |     )
+     | |_____- call expression requires function
+
+For more information about this error, try `rustc --explain E0433`.
+error: could not compile `aethyme-broker` (lib) due to 1 previous error
+warning: build failed, waiting for other jobs to finish...
+Some errors have detailed explanations: E0308, E0433, E0618.
+For more information about an error, try `rustc --explain E0308`.
+error: could not compile `aethyme-broker` (lib test) due to 4 previous errors

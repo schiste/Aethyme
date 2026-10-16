@@ -1,0 +1,114 @@
+{
+  "schema": "aethyme.local.qualification.semantic-guards/provisional-v0",
+  "complete_local_qualification": false,
+  "source_commit": "191b34e5d699e1015b908796f299bd9d7d05dc29",
+  "source_tree": "9e255db9e09f05bc1f48c7d2fe6e36478fad9782",
+  "profile": "archived-resolution-semantic-rechecks/provisional-v0",
+  "test": "a_valid_archived_request_rechecks_decision_scope_and_protection",
+  "argv": [
+    "cargo",
+    "test",
+    "--locked",
+    "-j",
+    "4",
+    "--manifest-path",
+    "packages/aethyme/rust/Cargo.toml",
+    "-p",
+    "aethyme-broker",
+    "--test",
+    "resolution_boundaries",
+    "a_valid_archived_request_rechecks_decision_scope_and_protection",
+    "--",
+    "--exact",
+    "--test-threads=1",
+    "--nocapture"
+  ],
+  "source_file": "packages/aethyme/rust/crates/aethyme-broker/src/resolution.rs",
+  "process_status_provenance": {
+    "method": "Runner enforced Process::Status: exit 101 for negatives and success for positives. Root terminal reported 0/101/101/101/0. Numeric process statuses were not persisted separately; row fields therefore state expected statuses, and the retained logs independently support named test counts only.",
+    "runner_sha256": "dfa6c9604e2afb5f2176ef666ef9aa70fbeb46996bd377686016257ef5b3b0c5"
+  },
+  "restored_source_sha256": "a6d2631891bd13a5a886622e88a79da402de0d213fdd26a7039537f7832888c1",
+  "rows": [
+    {
+      "name": "original-positive",
+      "expected_exit_status": 0,
+      "counts": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0
+      },
+      "output_sha256": "1516c5015eac792de149a39df6d0e1830a57fff0e2896c69d03e763f15a0b40f",
+      "output_bytes": 599,
+      "credited": true
+    },
+    {
+      "name": "decision",
+      "expected_exit_status": 101,
+      "counts": {
+        "passed": 0,
+        "failed": 1,
+        "ignored": 0
+      },
+      "output_sha256": "1563a6f830421ce0318ecaa706f85972b542a01b51c23a49e0ffc0b39bd0da5a",
+      "output_bytes": 5047,
+      "credited": true
+    },
+    {
+      "name": "scope",
+      "expected_exit_status": 101,
+      "counts": {
+        "passed": 0,
+        "failed": 1,
+        "ignored": 0
+      },
+      "output_sha256": "1225d8bd0c84189a7d5c5da322a1a6d5b1aae3d7714a137f00d967682e39f98c",
+      "output_bytes": 5053,
+      "credited": true
+    },
+    {
+      "name": "protection",
+      "expected_exit_status": 101,
+      "counts": {
+        "passed": 0,
+        "failed": 1,
+        "ignored": 0
+      },
+      "output_sha256": "db36604cf198d20e5b04a5c9eb10b0d2774397ade90e5a9bf6154cfa9a000994",
+      "output_bytes": 5050,
+      "credited": true
+    },
+    {
+      "name": "restored-positive",
+      "expected_exit_status": 0,
+      "counts": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0
+      },
+      "output_sha256": "11c93ef26f2d583d688252971759ccd7fa7da606197ff70f66df1e5de701e41d",
+      "output_bytes": 599,
+      "credited": true
+    }
+  ],
+  "excluded_observations": [
+    {
+      "name": "initial-negative-log-parser",
+      "credited": false,
+      "reason": "The exact test failed but the runner rejected an interleaved nocapture log. Rerun with exact named panic and failure-list checks supplies the credited row.",
+      "output_sha256": "c04407da77704c1925e3adbd23b8708e5deede9d80825853964fb1022c55be86",
+      "output_bytes": 5259
+    }
+  ],
+  "independent_review": {
+    "status": "clear",
+    "source_commit": "191b34e5d699e1015b908796f299bd9d7d05dc29",
+    "method": "read-only exact private archive; no Cargo"
+  },
+  "limitations": [
+    "Decision guard qualifies the kind comparison only, not decision-key or path comparisons.",
+    "Compiler errors and zero-test executions excluded.",
+    "Canonical malicious fixture bytes are written only into an exclusive disposable test archive; production visibility unchanged.",
+    "Composition profile remains provisional until E1."
+  ]
+}

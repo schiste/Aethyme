@@ -1,0 +1,33 @@
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+   Compiling aethyme-engine v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/implement-fx10-actual-sustained-arrival/packages/aethyme/rust/crates/aethyme-engine)
+   Compiling aethyme-broker v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/implement-fx10-actual-sustained-arrival/packages/aethyme/rust/crates/aethyme-broker)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1m 40s
+     Running unittests src/lib.rs (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/integrate-reviewed-local-bare-git-servic/target/local-resume/cargo/debug/deps/aethyme_broker-20bbfe5c0b2dd5c0)
+
+running 1 test
+FX10 actual trial report /var/folders/f2/krjzd4c15nn491pm37zrkp1h0000gn/T/.tmpI2gBcv/fx10-report.json, host /var/folders/f2/krjzd4c15nn491pm37zrkp1h0000gn/T/.tmpI2gBcv, source /var/folders/f2/krjzd4c15nn491pm37zrkp1h0000gn/T/.tmpxOuDbf, remote /var/folders/f2/krjzd4c15nn491pm37zrkp1h0000gn/T/.tmpRB39o3, harness /var/folders/f2/krjzd4c15nn491pm37zrkp1h0000gn/T/.tmpu3a1Yp
+gate fx10-source-integrity waiting for host resources: fx10_sustained_arrival_slot: pool has 1/1 units allocated by 1 live lease(s)
+gate fx10-source-integrity started (cost 0, tree 77ce984c8293)
+gate fx10-source-integrity pass in 0s (tree 77ce984c8293) at load 1m 23.2/10 cpus
+gate fx10-source-integrity started (cost 0, tree 63372f03cdd5)
+gate fx10-source-integrity pass in 0s (tree 63372f03cdd5) at load 1m 18.7/10 cpus
+test local_controller::drive::tests::fx17::sustained_arrivals::actual_fx10_sustained_arrivals_serve_old_group_before_later_features has been running for over 60 seconds
+gate fx10-source-integrity waiting for host resources: fx10_sustained_arrival_slot: pool has 1/1 units allocated by 1 live lease(s)
+gate fx10-source-integrity started (cost 0, tree 77ce984c8293)
+gate fx10-source-integrity pass in 0s (tree 77ce984c8293) at load 1m 15.6/10 cpus
+
+thread 'local_controller::drive::tests::fx17::sustained_arrivals::actual_fx10_sustained_arrivals_serve_old_group_before_later_features' (24551509) panicked at crates/aethyme-broker/src/local_controller/drive_tests/sustained_arrivals.rs:3245:13:
+FX10 actual qualification failed; retained report: /var/folders/f2/krjzd4c15nn491pm37zrkp1h0000gn/T/.tmpI2gBcv/fx10-report.json
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test local_controller::drive::tests::fx17::sustained_arrivals::actual_fx10_sustained_arrivals_serve_old_group_before_later_features ... FAILED
+
+failures:
+
+failures:
+    local_controller::drive::tests::fx17::sustained_arrivals::actual_fx10_sustained_arrivals_serve_old_group_before_later_features
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1800 filtered out; finished in 73.72s
+
+error: test failed, to rerun pass `-p aethyme-broker --lib`

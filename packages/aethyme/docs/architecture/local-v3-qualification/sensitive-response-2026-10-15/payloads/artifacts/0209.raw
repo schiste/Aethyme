@@ -1,0 +1,18 @@
+{
+  "source_head": "584d914f2661952e3413326cf16a7447bd6378f2",
+  "worktree": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/implement-local-administrative-sensitive",
+  "cwd": "packages/aethyme/rust",
+  "argv": ["cargo", "check", "--locked", "-j4", "-p", "aethyme-broker", "--manifest-path", "Cargo.toml"],
+  "environment": {
+    "PATH": "/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/christophehenner/.cargo/bin",
+    "HOME": "/Users/christophehenner",
+    "CARGO_HOME": "/Users/christophehenner/.cargo",
+    "RUSTUP_HOME": "/Users/christophehenner/.rustup",
+    "CARGO_TARGET_DIR": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/integrate-reviewed-local-bare-git-servic/target/local-resume/cargo",
+    "TMPDIR": "/private/tmp/t56-584d914-cargo-tmp.JOwSEg",
+    "CARGO_BUILD_JOBS": "4",
+    "RUSTC_WRAPPER": ""
+  },
+  "caffeinate": "/usr/bin/caffeinate -i",
+  "started_at_utc": "2026-10-15T17:20:00Z"
+}

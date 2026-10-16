@@ -1,0 +1,45 @@
+{
+  "attempt": "guard-mutation-20261015T081000Z",
+  "started_utc": "2026-10-15T08:09:44.447068+00:00",
+  "cwd": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/implement-the-actual-fx17-20-controlled/packages/aethyme/rust",
+  "source_head": "4e741407e3473e39183114cf748b25df1f242751",
+  "source_tree": "f2dedb161daedb9b23e23aec9766e7884d0e939d",
+  "worktree_status_with_mutation": "# branch.oid 4e741407e3473e39183114cf748b25df1f242751\n# branch.head agent/implement-the-actual-fx17-20-controlled\n1 .M N... 100644 100644 100644 e1e1bc6b8f9ad80db7817ad14c5ccdd9acda2441 e1e1bc6b8f9ad80db7817ad14c5ccdd9acda2441 crates/aethyme-broker/src/local_controller.rs\n1 .M N... 100644 100644 100644 16939113b8061bad55a46b794ad65cc53185216d 16939113b8061bad55a46b794ad65cc53185216d crates/aethyme-broker/src/local_controller/drive_tests.rs\n1 .M N... 100644 100644 100644 d97fd91aad8125ac7f34449a62b03be6cfdcc327 d97fd91aad8125ac7f34449a62b03be6cfdcc327 crates/aethyme-broker/src/local_controller/fx17_tests.rs\n1 .M N... 100644 100644 100644 36b3fa318208762c1f597c0187b8612c11582cef 36b3fa318208762c1f597c0187b8612c11582cef crates/aethyme-broker/src/local_wave.rs\n1 .M N... 100644 100644 100644 0fc671895c7409ac7407b0a661e8e084425dffce 0fc671895c7409ac7407b0a661e8e084425dffce crates/aethyme-broker/src/native_gates.rs\n",
+  "unstaged_diff_sha256_with_mutation": "8fca0f007bcb658510fb0f82a4ebfc3c3b34fb06a56e0441456e4cae032f3c8a",
+  "mutation": {
+    "file": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/implement-the-actual-fx17-20-controlled/packages/aethyme/rust/crates/aethyme-broker/src/local_wave.rs",
+    "anchor": "(None, Some(source)) => completion.source == source,",
+    "replacement": "(None, Some(_source)) => true,",
+    "original_sha256": "98db152a45a287bc30ea3c5086b5ce4e76b37b020f61a39db62888ea9cdbeed6",
+    "mutated_sha256": "5458556137716b02cc28ed23d4736d81ae13ba7480d403196a368702d4606cce",
+    "backup": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/integrate-reviewed-local-bare-git-servic/target/local-resume/cross-revision-baseline/guard-mutation-20261015T081000Z.local_wave.rs.before"
+  },
+  "argv": [
+    "/usr/bin/caffeinate",
+    "-i",
+    "cargo",
+    "test",
+    "--locked",
+    "-j4",
+    "-p",
+    "aethyme-broker",
+    "--lib",
+    "cross_revision_lookup_rejects_wrong_source_target_and_epoch",
+    "--",
+    "--nocapture",
+    "--test-threads=1"
+  ],
+  "env": {
+    "PATH": "/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/christophehenner/.cargo/bin",
+    "RUSTC_WRAPPER": "",
+    "CARGO_TARGET_DIR": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/integrate-reviewed-local-bare-git-servic/target/local-resume/cargo"
+  },
+  "log_path": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/integrate-reviewed-local-bare-git-servic/target/local-resume/cross-revision-baseline/guard-mutation-20261015T081000Z.log",
+  "status_path": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/integrate-reviewed-local-bare-git-servic/target/local-resume/cross-revision-baseline/guard-mutation-20261015T081000Z.status",
+  "expected_named_failure": "local_controller::drive::tests::cross_revision_lookup_rejects_wrong_source_target_and_epoch",
+  "finished_utc": "2026-10-15T08:11:01.457560+00:00",
+  "wall_seconds": 76.92484379198868,
+  "child_exit_status": 101,
+  "restored_exact_bytes": true,
+  "restored_sha256": "98db152a45a287bc30ea3c5086b5ce4e76b37b020f61a39db62888ea9cdbeed6"
+}

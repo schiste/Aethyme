@@ -280,6 +280,9 @@ pub enum BrokerOpError {
          {id} --archive` and confirm the digest it prints (the digest passed, {actual}, is stale)"
     )]
     CleanupResolveConfirmationMismatch { id: i64, actual: String },
+    /// Building a candidate could not read or name its source (#663).
+    #[error("candidate source ({code}): {0}", code = .0.code())]
+    CandidateSource(crate::collaboration_archive::ArchiveError),
     #[error(
         "the recovery archive for session {id} failed verification, so its worktree was left in \
          place: {reason} (incomplete archive: {path})"
@@ -504,6 +507,27 @@ pub enum BrokerOpError {
         expected_head: Option<Box<str>>,
         actual_head: Box<str>,
         recorded_branch_head: Option<Box<str>>,
+    },
+    /// A required collaboration capture retained one commit and the session
+    /// then moved, so submitting would integrate code that was never captured.
+    #[error(
+        "refusing to submit session {session_id}: its head moved from {captured} to {actual} after the required collaboration capture, so the captured commit is not the one that would be submitted; resubmit to capture and submit the current head"
+    )]
+    CapturedHeadMoved {
+        session_id: i64,
+        captured: Box<str>,
+        actual: Box<str>,
+    },
+    /// `[collaboration] capture = "required"` and the entry's head has no
+    /// acknowledged required capture, so promoting it would integrate code
+    /// that was never retained.
+    #[error(
+        "refusing to promote entry {entry}: this repository requires collaboration capture and head {head} has no acknowledged required capture ({reason}); resubmit the session with `aethyme broker submit --session <id>` to capture and verify it"
+    )]
+    CaptureRequiredForPromotion {
+        entry: i64,
+        head: Box<str>,
+        reason: String,
     },
     #[error("session {session_id}'s branch {branch} does not exist in this repository")]
     SessionBranchMissing { session_id: i64, branch: String },
@@ -1556,6 +1580,16 @@ pub struct PendingOperationView {
     pub liveness: crate::operations::OperationLivenessView,
 }
 
+/// What prompts a collaboration-fence check (#660); see
+/// `Broker::collaboration_fence_state`.
+pub(crate) enum FenceTrigger<'a> {
+    /// A broker open: cheap, reaching Git only when the working copy says
+    /// `capture = "required"`.
+    Open,
+    /// A caller that already loaded the repository config (text, source).
+    Config(Option<&'a (String, &'static str)>),
+}
+
 /// Everything `broker status` renders, in one serializable shape.
 #[derive(Debug, serde::Serialize)]
 pub struct StatusView {
@@ -1571,6 +1605,10 @@ pub struct StatusView {
     pub advisory_delivery: crate::AdvisoryDeliverySummary,
     /// Promoted entry paths whose publication has not yet been proven.
     pub outstanding_entry_exposures: Vec<crate::EntryPathExposure>,
+    /// `broker.db`'s compatibility floor raised because this repository
+    /// requires collaboration capture (#660); absent otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub collaboration_fence: Option<crate::CollaborationFence>,
     pub agents: Vec<AgentView>,
     pub leases: Vec<crate::Lease>,
     /// Liveness of each lease in `leases`, bound to its holder process (#360).
@@ -1862,6 +1900,22 @@ pub(crate) struct LeaseRefusalPolicy {
 }
 
 impl LeaseRefusalPolicy {
+    pub(crate) fn new(
+        verify_only: bool,
+        live: std::collections::HashMap<i64, SessionStatus>,
+    ) -> Self {
+        Self { verify_only, live }
+    }
+
+    pub(crate) fn is_verify_only(&self) -> bool {
+        self.verify_only
+    }
+
+    /// The derived status of a live holder; `None` once it is not live.
+    pub(crate) fn status_of(&self, session_id: i64) -> Option<SessionStatus> {
+        self.live.get(&session_id).copied()
+    }
+
     /// Only an explicit lease held by a session that is actively working may
     /// refuse, and never under verify-only. Implicit leases are telemetry
     /// derived from edits; stale, exited and closed holders are not working.
@@ -2980,6 +3034,8 @@ pub struct Broker {
     graph_impact_provider: Box<dyn GraphImpactProvider>,
     host_operation_db_path: Option<PathBuf>,
     worktree_root_override: Option<PathBuf>,
+    /// Test-only host state directory for collaboration state (#660).
+    collaboration_state_override: Option<PathBuf>,
     /// Set only while a bounded eligibility pass runs: the landing search
     /// stops at it instead of finishing one expensive worktree long past the
     /// pass's budget (#460).

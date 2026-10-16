@@ -1,0 +1,32 @@
+{
+  "schema": "aethyme.e1.sealed-input/v1",
+  "id": "SH01-loan-move-edit",
+  "baseline": "inputs/base.html",
+  "contributions": [
+    {
+      "id": "c1",
+      "base": "inputs/base.html",
+      "result": "inputs/move.html"
+    },
+    {
+      "id": "c2",
+      "base": "inputs/base.html",
+      "result": "inputs/edit.html"
+    }
+  ],
+  "orders": [
+    [
+      "c1",
+      "c2"
+    ],
+    [
+      "c2",
+      "c1"
+    ]
+  ],
+  "runs_per_order": 2,
+  "commutative": true,
+  "selected_engine_only": true,
+  "release": "after engine/profile freeze; one final campaign only",
+  "oracle_visibility": "private observer not supplied to engine/resolver"
+}

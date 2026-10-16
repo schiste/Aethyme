@@ -1,0 +1,44 @@
+{
+  "schema": "aethyme.e1.private-observer-state-calibration/v1",
+  "status": "designed_unrun",
+  "controls": [
+    {
+      "name": "control-search-state.html",
+      "bytes": 1539,
+      "sha256": "e47d7c4c4dd5c66fae6578e8daceb99a52f6137b11bcd6469b77f495939a47a9",
+      "requirements": [
+        "search",
+        "consent",
+        "privacy",
+        "navigation"
+      ],
+      "expected_pass": false,
+      "expected_assertion": "consented Enter search must produce Lake rather than stale pre-consent Forest"
+    },
+    {
+      "name": "control-initial-state.html",
+      "bytes": 1587,
+      "sha256": "872bd5bae257026f76ab84cc7fbb8beb185e332b512c5aa1592af967592c042a",
+      "requirements": [
+        "search",
+        "consent",
+        "privacy",
+        "navigation"
+      ],
+      "expected_pass": false,
+      "expected_assertion": "initial checkbox is checked before any search; first-search clearing must not mask this"
+    },
+    {
+      "name": "control-ordinary-channel.html",
+      "bytes": 1587,
+      "sha256": "068b46e161335a4f28df93c5a375eb12fac963b00261432f59f4829904b1f1ec",
+      "requirements": [
+        "search",
+        "navigation"
+      ],
+      "expected_pass": false,
+      "expected_assertion": "ordinary non-analytics profile must observe no HTTP requests"
+    }
+  ],
+  "contract_sha256": "c8f86e7d70983725a695dc303f946b1c4568632de1693e3c6df556a43b1cc1b9"
+}

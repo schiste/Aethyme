@@ -1,0 +1,51 @@
+{
+  "scope": "Existing direct test binaries, cwd resolves current evidence checkout; no recompilation or product runtime qualification claim",
+  "commands": [
+    {
+      "argv": [
+        "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/integrate-reviewed-local-bare-git-servic/target/local-resume/cargo/debug/deps/docs_hygiene-5682703e1a8038e0",
+        "--exact",
+        "internal_links_valid",
+        "--nocapture"
+      ],
+      "cwd": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/publish-final-local-qualification-eviden",
+      "environment": {
+        "HOME": "/Users/christophehenner",
+        "PATH": "/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/christophehenner/.cargo/bin",
+        "TMPDIR": "/private/tmp",
+        "LANG": "C",
+        "LC_ALL": "C"
+      },
+      "binary_sha256": "1b8f2599480d71ebf4ea2df48e1430140699cfba656aa60aabceb6163752678c",
+      "exit_status": 0,
+      "elapsed_seconds": 0.123424958,
+      "stdout_sha256": "352812880a8d42ff72e21000d13c63a8a947f93811d10ee5903aaf9e8350a764",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stdout": "\nrunning 1 test\ntest internal_links_valid ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 13 filtered out; finished in 0.08s\n\n",
+      "stderr": ""
+    },
+    {
+      "argv": [
+        "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/integrate-reviewed-local-bare-git-servic/target/local-resume/cargo/debug/deps/docs_hygiene-85182808376e2d1a",
+        "--exact",
+        "internal_links_valid",
+        "--nocapture"
+      ],
+      "cwd": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/publish-final-local-qualification-eviden",
+      "environment": {
+        "HOME": "/Users/christophehenner",
+        "PATH": "/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/christophehenner/.cargo/bin",
+        "TMPDIR": "/private/tmp",
+        "LANG": "C",
+        "LC_ALL": "C"
+      },
+      "binary_sha256": "002f3ba79bc8725be5dc26dfcbf4c80bfddb230745bf620deee11fe4dad5cc53",
+      "exit_status": 0,
+      "elapsed_seconds": 0.09435674999999999,
+      "stdout_sha256": "131c1097ecec0bd4f4e278c7a45951c50ab26d1785a2749f5f4bf0d1a0ab2721",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stdout": "\nrunning 1 test\ntest internal_links_valid ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 13 filtered out; finished in 0.04s\n\n",
+      "stderr": ""
+    }
+  ]
+}

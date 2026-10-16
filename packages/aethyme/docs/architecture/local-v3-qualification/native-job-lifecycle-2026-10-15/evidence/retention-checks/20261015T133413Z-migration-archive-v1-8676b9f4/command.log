@@ -1,0 +1,8 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.54s
+     Running unittests src/lib.rs (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/integrate-reviewed-local-bare-git-servic/target/local-resume/cargo/debug/deps/aethyme_broker-0f278e0d02146111)
+
+running 1 test
+test collaboration_archive::tests::a_version_one_database_is_migrated ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1819 filtered out; finished in 0.51s
+

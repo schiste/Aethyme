@@ -1,0 +1,24 @@
+   Compiling aethyme-engine v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/complete-exact-immutable-contribution-co/packages/aethyme/rust/crates/aethyme-engine)
+   Compiling aethyme-broker v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/complete-exact-immutable-contribution-co/packages/aethyme/rust/crates/aethyme-broker)
+   Compiling aethyme-contracts v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/complete-exact-immutable-contribution-co/packages/aethyme/rust/crates/aethyme-contracts)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 35.16s
+     Running unittests src/lib.rs (target/debug/deps/aethyme_broker-0f278e0d02146111)
+
+running 1 test
+test collaboration_identity_store::identity_store_tests::revision_writers_serialize_preflight_and_refuse_a_stale_dependent_capture ... 
+thread '<unnamed>' (16900161) panicked at crates/aethyme-broker/src/collaboration_identity_store.rs:3025:21:
+the competing writer must own the lock while paused after preflight
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+thread 'collaboration_identity_store::identity_store_tests::revision_writers_serialize_preflight_and_refuse_a_stale_dependent_capture' (16899660) panicked at crates/aethyme-broker/src/collaboration_identity_store.rs:3060:14:
+dependent writer observed the paused competitor holding the writer lock: Timeout
+FAILED
+
+failures:
+
+failures:
+    collaboration_identity_store::identity_store_tests::revision_writers_serialize_preflight_and_refuse_a_stale_dependent_capture
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1953 filtered out; finished in 11.44s
+
+error: test failed, to rerun pass `-p aethyme-broker --lib`

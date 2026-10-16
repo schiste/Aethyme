@@ -1,0 +1,44 @@
+    Checking serde v1.0.229
+    Checking zerocopy v0.8.42
+    Checking ra_ap_stdx v0.0.331
+   Compiling aethyme-engine v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/682-reconcile-final-local-qualification/packages/aethyme/rust/crates/aethyme-engine)
+   Compiling aethyme-broker v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/682-reconcile-final-local-qualification/packages/aethyme/rust/crates/aethyme-broker)
+    Checking ciborium-io v0.2.2
+    Checking itertools v0.10.5
+   Compiling aethyme-cli v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/682-reconcile-final-local-qualification/packages/aethyme/rust/crates/aethyme-cli)
+    Checking cast v0.3.0
+    Checking serde_spanned v0.6.9
+    Checking toml_datetime v0.6.11
+    Checking bincode v1.3.3
+    Checking toml_edit v0.22.27
+    Checking aethyme-graph-schema v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/682-reconcile-final-local-qualification/packages/aethyme/rust/crates/aethyme-graph-schema)
+    Checking oxc_index v4.1.0
+    Checking oxc_syntax v0.125.0
+    Checking toml v0.8.23
+    Checking oxc_ast v0.125.0
+    Checking aethyme-testkit v0.1.0 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/682-reconcile-final-local-qualification/packages/aethyme/rust/crates/aethyme-testkit)
+    Checking aethyme-graph-storage v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/682-reconcile-final-local-qualification/packages/aethyme/rust/crates/aethyme-graph-storage)
+    Checking aethyme-enhance v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/682-reconcile-final-local-qualification/packages/aethyme/rust/crates/aethyme-enhance)
+    Checking ahash v0.8.12
+    Checking hashbrown v0.14.5
+    Checking aethyme-producers v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/682-reconcile-final-local-qualification/packages/aethyme/rust/crates/aethyme-producers)
+    Checking rowan v0.15.18
+    Checking hashlink v0.9.1
+    Checking rusqlite v0.32.1
+    Checking ra_ap_syntax v0.0.331
+    Checking half v2.7.1
+    Checking aethyme-quality v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/682-reconcile-final-local-qualification/packages/aethyme/rust/crates/aethyme-quality)
+    Checking ciborium-ll v0.2.2
+    Checking ciborium v0.2.2
+    Checking criterion-plot v0.5.0
+    Checking tinytemplate v1.2.1
+    Checking is-terminal v0.4.17
+    Checking anes v0.1.6
+    Checking oorandom v11.1.5
+    Checking criterion v0.5.1
+    Checking oxc_ecmascript v0.125.0
+    Checking oxc_ast_visit v0.125.0
+    Checking oxc_parser v0.125.0
+    Checking aethyme-graph-indexer v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/682-reconcile-final-local-qualification/packages/aethyme/rust/crates/aethyme-graph-indexer)
+    Checking aethyme-contracts v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/682-reconcile-final-local-qualification/packages/aethyme/rust/crates/aethyme-contracts)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2m 06s

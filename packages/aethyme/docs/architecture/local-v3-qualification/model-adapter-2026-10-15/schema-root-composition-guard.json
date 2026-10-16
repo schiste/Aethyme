@@ -1,0 +1,38 @@
+{
+  "source_head": "caef9cc94ca47b6f75f1d712e3e85359ccad55e1",
+  "source_runner_sha256": "2e3a93668a6aeae8c61e2579e909a91e1b17c50ee1a1b9e33ed615a94d3f2df8",
+  "named_test": "test_response_schema_gate_rejects_root_composition",
+  "started_at_utc": "2026-10-15T09:31:44.757583+00:00",
+  "wall_seconds": 0.631,
+  "command": [
+    "/opt/homebrew/bin/uv",
+    "--cache-dir",
+    "/private/tmp/aethyme-fx17-pytest-e6e3109a-20261015/uv-cache",
+    "run",
+    "--offline",
+    "--no-project",
+    "--with",
+    "pytest",
+    "--",
+    "python",
+    "-m",
+    "pytest",
+    "-q",
+    "-p",
+    "no:cacheprovider",
+    "/private/tmp/aethyme-fx17-mutation-7g9mnpmf/tests/test_fx17_model_protocol.py::test_response_schema_gate_rejects_root_composition"
+  ],
+  "working_directory": "/private/tmp/aethyme-fx17-mutation-7g9mnpmf",
+  "mutation": {
+    "old": "or set(schema) != {\"type\", \"additionalProperties\", \"required\", \"properties\"}",
+    "new": "or False",
+    "runner_sha256": "7486ece61282a94abfc7fc5df52fbc23f55f89c01be714211a1b016edc569f90"
+  },
+  "exit_code": 1,
+  "expected_exit_code": 1,
+  "source_exactly_restored": true,
+  "log_sha256": "9a79d7380e80c6d26c0dc86c84bf7c0deb57867cc5cdc74acce5e13d428abc49",
+  "log_bytes": 816,
+  "provider_calls": 0,
+  "evaluator_calls": 0
+}
