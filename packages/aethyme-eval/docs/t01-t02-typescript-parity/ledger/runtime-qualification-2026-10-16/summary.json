@@ -1,0 +1,223 @@
+{
+  "attempt_001": {
+    "classification": "UNQUALIFIED_BASELINE_FAILURE",
+    "d10_assertions": 224,
+    "mutant_controls_run": 0,
+    "source_checkpoint": {
+      "branch": "agent/add-finite-d10-typescript-parity-for-pro",
+      "head": "d7b34d65435222bdf3a60e2a15e038364a6ec6f2",
+      "status_paths": [],
+      "tree": "43f9c94a66718a177ff4ed3c2095f02df99a553b"
+    },
+    "t01_exit_status": 1,
+    "t01_refusal": "Error: frozen source drift at packages/aethyme/rust/crates/aethyme-contracts/src/experimental_v0/canonical_json.rs: expected 90070c56f613bb94564072c56076daf2428f2888f0b71e34a526b718c55b52f3, found 6bbeea89e7d5850651687382255619b2ea9d30538341ebbba51a53a0605a6a35",
+    "t01_stderr_sha256": "e304256cd596d6e0395ea9649b9b658a300fe7c0fdbd08696a5e2d19ac2161587",
+    "t01_t02_assertions": null
+  },
+  "attempt_002": {
+    "argument_control_count": 2,
+    "classification": "PASS",
+    "control_errors": 0,
+    "mutation_control_count": 6,
+    "positive_run_pairs": 2,
+    "qualification_results_sha256": "6c053b8aaebcbd8695aec38cbedff6313df950188b940c0e102f396a250a6fb7",
+    "source_or_fixture_bytes_mutated": false,
+    "start_manifest_sha256": "3ef58f04db9cd307a4f6382e0c5f2f9c9549fe3a7560c357d69cfe4430d87237"
+  },
+  "attempts_archive": {
+    "member_count": 76,
+    "path": "attempts-and-controls.tar.gz",
+    "regular_file_members_only": true,
+    "sha256": "6acde8924274b1d609db326b59b4d207a80cfceb9254ee54f4f735cbaff2ba24"
+  },
+  "d10": {
+    "assertions_initial": 224,
+    "assertions_restored": 224,
+    "pin_counts": {
+      "frozen_fixture_files": 20,
+      "rust_sources": 12,
+      "typescript_sources": 3
+    },
+    "source_pins_sha256": "b12fc193b8eddeb14b475f837b80df8ec30122bd89028f5eafafb6874ca5e61d",
+    "vectors": {
+      "bound_profile_new_file": 1,
+      "contribution_revision_records": 4,
+      "contribution_revision_validation_negative_controls": 4,
+      "descriptor": 1,
+      "explicit_rename": 1,
+      "mixed_copy_split_plain_new": 1,
+      "retained_invalid_attempts": {
+        "v1_contribution_id": "rejected",
+        "v2_file_id": "rejected"
+      }
+    },
+    "verified_source_and_fixture_files": 35
+  },
+  "mutation_controls": [
+    {
+      "backup_hashes": {
+        "source": "8454cd093e84b3e4234d1112a78e4cc297d29f3ef588abd3f9153ff84dc05ef3",
+        "source_pins": "b12fc193b8eddeb14b475f837b80df8ec30122bd89028f5eafafb6874ca5e61d"
+      },
+      "classification": "intended_named_assertion_failure",
+      "credited": true,
+      "exact_restore": true,
+      "expected_assertion": "ContributionRevision scans oversized reference arrays before malformed change semantics",
+      "id": "01-early-reference-count",
+      "restoration_clean": true,
+      "restored_hashes": {
+        "source": "8454cd093e84b3e4234d1112a78e4cc297d29f3ef588abd3f9153ff84dc05ef3",
+        "source_pins": "b12fc193b8eddeb14b475f837b80df8ec30122bd89028f5eafafb6874ca5e61d"
+      }
+    },
+    {
+      "backup_hashes": {
+        "source": "8454cd093e84b3e4234d1112a78e4cc297d29f3ef588abd3f9153ff84dc05ef3",
+        "source_pins": "b12fc193b8eddeb14b475f837b80df8ec30122bd89028f5eafafb6874ca5e61d"
+      },
+      "classification": "intended_named_assertion_failure",
+      "credited": true,
+      "exact_restore": true,
+      "expected_assertion": "ContributionRevision validates the borrowed brief digest before change semantics",
+      "id": "02-brief-digest-precedence",
+      "restoration_clean": true,
+      "restored_hashes": {
+        "source": "8454cd093e84b3e4234d1112a78e4cc297d29f3ef588abd3f9153ff84dc05ef3",
+        "source_pins": "b12fc193b8eddeb14b475f837b80df8ec30122bd89028f5eafafb6874ca5e61d"
+      }
+    },
+    {
+      "backup_hashes": {
+        "source": "8454cd093e84b3e4234d1112a78e4cc297d29f3ef588abd3f9153ff84dc05ef3",
+        "source_pins": "b12fc193b8eddeb14b475f837b80df8ec30122bd89028f5eafafb6874ca5e61d"
+      },
+      "classification": "intended_named_assertion_failure",
+      "credited": true,
+      "exact_restore": true,
+      "expected_assertion": "ContributionRevision rejects an oversized full envelope before malformed change semantics",
+      "id": "03-full-envelope-cap",
+      "restoration_clean": true,
+      "restored_hashes": {
+        "source": "8454cd093e84b3e4234d1112a78e4cc297d29f3ef588abd3f9153ff84dc05ef3",
+        "source_pins": "b12fc193b8eddeb14b475f837b80df8ec30122bd89028f5eafafb6874ca5e61d"
+      }
+    },
+    {
+      "backup_hashes": {
+        "source": "8454cd093e84b3e4234d1112a78e4cc297d29f3ef588abd3f9153ff84dc05ef3",
+        "source_pins": "b12fc193b8eddeb14b475f837b80df8ec30122bd89028f5eafafb6874ca5e61d"
+      },
+      "classification": "intended_named_assertion_failure",
+      "credited": true,
+      "exact_restore": true,
+      "expected_assertion": "ContributionRevision rejects path_hex over the raw-path cap before decoding",
+      "id": "04-raw-path-predecode-cap",
+      "restoration_clean": true,
+      "restored_hashes": {
+        "source": "8454cd093e84b3e4234d1112a78e4cc297d29f3ef588abd3f9153ff84dc05ef3",
+        "source_pins": "b12fc193b8eddeb14b475f837b80df8ec30122bd89028f5eafafb6874ca5e61d"
+      }
+    },
+    {
+      "backup_hashes": {
+        "source": "96a444d3d7f40c8d934586c9d8f49346c8e74973eba6d2fa60c01c4ebce92ebb",
+        "source_pins": "b12fc193b8eddeb14b475f837b80df8ec30122bd89028f5eafafb6874ca5e61d"
+      },
+      "classification": "intended_named_assertion_failure",
+      "credited": true,
+      "exact_restore": true,
+      "expected_assertion": "bounded canonical size counts a two-byte UTF-8 scalar at the exact limit",
+      "id": "05-utf8-byte-count",
+      "restoration_clean": true,
+      "restored_hashes": {
+        "source": "96a444d3d7f40c8d934586c9d8f49346c8e74973eba6d2fa60c01c4ebce92ebb",
+        "source_pins": "b12fc193b8eddeb14b475f837b80df8ec30122bd89028f5eafafb6874ca5e61d"
+      }
+    },
+    {
+      "backup_hashes": {
+        "source": "96a444d3d7f40c8d934586c9d8f49346c8e74973eba6d2fa60c01c4ebce92ebb",
+        "source_pins": "b12fc193b8eddeb14b475f837b80df8ec30122bd89028f5eafafb6874ca5e61d"
+      },
+      "classification": "intended_named_assertion_failure",
+      "credited": true,
+      "exact_restore": true,
+      "expected_assertion": "bounded canonical size counts newline escaping at the exact limit",
+      "id": "06-newline-escape-byte-count",
+      "restoration_clean": true,
+      "restored_hashes": {
+        "source": "96a444d3d7f40c8d934586c9d8f49346c8e74973eba6d2fa60c01c4ebce92ebb",
+        "source_pins": "b12fc193b8eddeb14b475f837b80df8ec30122bd89028f5eafafb6874ca5e61d"
+      }
+    }
+  ],
+  "parser_refusal_controls": [
+    {
+      "exact_parser_refusal": true,
+      "expected_stderr": "Error: unsupported T01 source profile: local-state26-unreviewed\n",
+      "id": "t01-unknown-source-profile",
+      "numeric_exit_status": 2,
+      "stderr_sha256": "0c7d4e5adc3314cc118135218fb3ac39c241853d3903b9b7f238ce8b84a4a02f"
+    },
+    {
+      "exact_parser_refusal": true,
+      "expected_stderr": "Error: unsupported T01 command-line arguments: --unexpected\n",
+      "id": "t01-unsupported-arguments",
+      "numeric_exit_status": 2,
+      "stderr_sha256": "207a8ba131b02afe436c3ea61ecda85dd8eaa76666013cc9c939e09041711913"
+    }
+  ],
+  "qualification_scope": {
+    "aethyme_evaluation_target": false,
+    "cargo_or_native_commands": false,
+    "fixture_or_oracle_edits": false,
+    "network_or_install_commands": false,
+    "product_runtime_claim": false,
+    "provider_or_heldout_calls": false
+  },
+  "qualification_source_checkpoint": {
+    "branch": "agent/add-finite-d10-typescript-parity-for-pro",
+    "clean_after_run": true,
+    "commit": "f02096084b3b17703ff8dc3e07d0fdc84795ddb2",
+    "tree": "e261027b49b71015305017a473584322073b98c5"
+  },
+  "runtime": {
+    "heap_mib": 256,
+    "node_binary_sha256": "3e401401d90e7f0367b7737a613801242c9a6b2966fb50c2e48eb1c45d701c6a",
+    "node_path": "/opt/homebrew/bin/node",
+    "node_realpath": "/opt/homebrew/Cellar/node/26.8.2/bin/node",
+    "node_version": "v26.8.2",
+    "per_process_deadline_seconds": 60
+  },
+  "schema": "aethyme.local-ts-parity-runtime-summary.v1",
+  "t01_profile": {
+    "assertions_initial": 880,
+    "assertions_restored": 880,
+    "canonical_json_source_sha256": "6bbeea89e7d5850651687382255619b2ea9d30538341ebbba51a53a0605a6a35",
+    "name": "local-state26-e6fb95",
+    "reference_commit": "e6fb95f65f3bf91d46c1ab76136486f492529ebb",
+    "vectors": {
+      "briefs": {
+        "calibrationCases": 27,
+        "invalidDecisionFiles": 25,
+        "invalidRecords": 6,
+        "tokenCases": 30,
+        "validDecisionFiles": 9,
+        "validRecords": 1
+      },
+      "canonicalJson": {
+        "invalid": 40,
+        "valid": 16
+      },
+      "records": {
+        "invalid": 21,
+        "valid": 16
+      },
+      "sourceSnapshots": {
+        "invalid": 17,
+        "unsupportedModes": 5,
+        "valid": 13
+      }
+    }
+  }
+}
