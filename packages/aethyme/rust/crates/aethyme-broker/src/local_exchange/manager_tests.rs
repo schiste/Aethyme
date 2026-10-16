@@ -636,6 +636,7 @@ fn migration_preserves_capture_rows_and_operation_constraints_without_fake_captu
     let db = store.project_dir().join("state.db");
     drop(store);
     let conn = rusqlite::Connection::open(&db).unwrap();
+    crate::collaboration_state::drop_identity_revision_schema_for_legacy_fixture(&conn).unwrap();
     crate::collaboration_sensitive::drop_sensitive_response_tables_for_legacy_fixture(&conn)
         .unwrap();
     // Reconstruct schema 14, including removal of later stack-owned tables.
