@@ -213,6 +213,32 @@ struct PreparationRecord {
 }
 
 impl Broker {
+    fn recover_storage_refusal(&mut self, error: &BrokerOpError) {
+        if is_storage_unavailable(error)
+            && let Err(recovery_error) = self.request_artifact_sweep_recovery()
+        {
+            warn_preparation_cleanup_failure("request cache recovery", &recovery_error);
+        }
+    }
+
+    /// A package-manager command may fill its volume after preflight and then
+    /// fail with an ordinary exit status. Recheck only the already-known write
+    /// volumes on failure; this is an admission signal for later recovery, not
+    /// a quota or a way to interrupt the command while it runs.
+    fn recover_storage_pressure_after_command_failure(
+        &mut self,
+        error: &BrokerOpError,
+        recheck: impl FnOnce() -> Result<(), PreparationError>,
+    ) {
+        if is_storage_unavailable(error) {
+            self.recover_storage_refusal(error);
+            return;
+        }
+        if let Err(pressure @ PreparationError::StorageUnavailable { .. }) = recheck() {
+            self.recover_storage_refusal(&pressure.into());
+        }
+    }
+
     /// Git-ignored top-level directories that exist in the primary checkout but
     /// not in this worktree.
     ///
@@ -446,7 +472,11 @@ impl Broker {
             storage_paths
                 .push(crate::default_host_resource_db_path().map_err(PreparationError::from)?);
         }
-        require_preparation_storage(self.main_root(), &storage_paths)?;
+        if let Err(error) = require_preparation_storage(self.main_root(), &storage_paths) {
+            let error = BrokerOpError::from(error);
+            self.recover_storage_refusal(&error);
+            return Err(error);
+        }
         let mut coordinator = shared
             .then(HostResourceCoordinator::open_default)
             .transpose()
@@ -464,8 +494,12 @@ impl Broker {
         // A shared-cache lease may have waited while another process filled
         // either volume. Recheck before rotation, state writes or commands.
         if let Err(error) = require_preparation_storage(self.main_root(), &storage_paths) {
-            release_grant(&mut coordinator, &mut grant)?;
-            return Err(error.into());
+            if let Err(release_error) = release_grant(&mut coordinator, &mut grant) {
+                warn_preparation_cleanup_failure("release host resource lease", &release_error);
+            }
+            let error = BrokerOpError::from(error);
+            self.recover_storage_refusal(&error);
+            return Err(error);
         }
         // Enforce the budget while the exclusive lease is held, never after
         // release: rotation removes a store other worktrees may be reading, so
@@ -549,11 +583,16 @@ impl Broker {
                 }) {
                 Ok(report) => report,
                 Err(error) => {
+                    self.recover_storage_pressure_after_command_failure(&error, || {
+                        require_preparation_storage(&main_root, &storage_paths)
+                    });
                     record.state = PreparationState::Failed;
                     record.failed_step = Some(step.name.clone());
                     record.completed_at = Some(now_ms());
-                    write_record(&state_path, &record)?;
-                    release_grant(&mut coordinator, &mut grant)?;
+                    best_effort_failed_preparation_cleanup(
+                        || write_record(&state_path, &record),
+                        || release_grant(&mut coordinator, &mut grant),
+                    );
                     return Err(error);
                 }
             };
@@ -563,18 +602,24 @@ impl Broker {
                 succeeded: report.ok,
             });
             if !report.ok {
+                let error = PreparationError::StepFailed {
+                    step: step.name.clone(),
+                    exit_code: report.exit_code,
+                    session_id,
+                };
+                let error = BrokerOpError::from(error);
+                self.recover_storage_pressure_after_command_failure(&error, || {
+                    require_preparation_storage(&main_root, &storage_paths)
+                });
                 record.state = PreparationState::Failed;
                 record.failed_step = Some(step.name.clone());
                 record.exit_code = report.exit_code;
                 record.completed_at = Some(now_ms());
-                write_record(&state_path, &record)?;
-                release_grant(&mut coordinator, &mut grant)?;
-                return Err(PreparationError::StepFailed {
-                    step: step.name.clone(),
-                    exit_code: report.exit_code,
-                    session_id,
-                }
-                .into());
+                best_effort_failed_preparation_cleanup(
+                    || write_record(&state_path, &record),
+                    || release_grant(&mut coordinator, &mut grant),
+                );
+                return Err(error);
             }
             let absent = match missing_step_outputs(&root, step) {
                 Ok(absent) => absent,
@@ -582,8 +627,10 @@ impl Broker {
                     record.state = PreparationState::Failed;
                     record.failed_step = Some(step.name.clone());
                     record.completed_at = Some(now_ms());
-                    write_record(&state_path, &record)?;
-                    release_grant(&mut coordinator, &mut grant)?;
+                    best_effort_failed_preparation_cleanup(
+                        || write_record(&state_path, &record),
+                        || release_grant(&mut coordinator, &mut grant),
+                    );
                     return Err(error.into());
                 }
             };
@@ -591,8 +638,10 @@ impl Broker {
                 record.state = PreparationState::Failed;
                 record.failed_step = Some(step.name.clone());
                 record.completed_at = Some(now_ms());
-                write_record(&state_path, &record)?;
-                release_grant(&mut coordinator, &mut grant)?;
+                best_effort_failed_preparation_cleanup(
+                    || write_record(&state_path, &record),
+                    || release_grant(&mut coordinator, &mut grant),
+                );
                 return Err(PreparationError::MissingOutputs {
                     step: step.name.clone(),
                     paths: absent.join(", "),
@@ -1467,6 +1516,29 @@ fn require_preparation_storage(
     )
 }
 
+fn is_storage_unavailable(error: &BrokerOpError) -> bool {
+    matches!(
+        error,
+        BrokerOpError::Preparation(PreparationError::StorageUnavailable { .. })
+    )
+}
+
+fn best_effort_failed_preparation_cleanup(
+    write_state: impl FnOnce() -> Result<(), PreparationError>,
+    release_lease: impl FnOnce() -> Result<(), PreparationError>,
+) {
+    if let Err(error) = write_state() {
+        warn_preparation_cleanup_failure("write failed preparation state", &error);
+    }
+    if let Err(error) = release_lease() {
+        warn_preparation_cleanup_failure("release host resource lease", &error);
+    }
+}
+
+fn warn_preparation_cleanup_failure(action: &str, error: &impl std::fmt::Display) {
+    eprintln!("warning: could not {action} after preparation refusal: {error}");
+}
+
 fn preparation_storage_with(
     paths: &[PathBuf],
     mut unavailable: impl FnMut(&Path) -> Option<String>,
@@ -1551,6 +1623,94 @@ fn now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_storage_refusal_persists_a_cache_recovery_request() {
+        let tmp = tempfile::tempdir().unwrap();
+        let run_git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(tmp.path())
+                .env("GIT_AUTHOR_NAME", "test")
+                .env("GIT_AUTHOR_EMAIL", "test@example.invalid")
+                .env("GIT_COMMITTER_NAME", "test")
+                .env("GIT_COMMITTER_EMAIL", "test@example.invalid")
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?}");
+        };
+        run_git(&["init", "-q", "-b", "main"]);
+        std::fs::write(tmp.path().join("README.md"), "fixture\n").unwrap();
+        run_git(&["add", "README.md"]);
+        run_git(&["commit", "-qm", "fixture"]);
+
+        let mut broker = Broker::open(tmp.path()).unwrap();
+        let unrelated = BrokerOpError::from(PreparationError::StepFailed {
+            step: "deps".into(),
+            exit_code: Some(1),
+            session_id: 1,
+        });
+        broker.recover_storage_pressure_after_command_failure(&unrelated, || Ok(()));
+        assert!(!broker.artifact_sweep_recovery_requested().unwrap());
+
+        broker.recover_storage_pressure_after_command_failure(&unrelated, || {
+            Err(PreparationError::InvalidConfig {
+                path: PREPARATION_CONFIG_RELPATH.into(),
+                reason: "injected non-storage recheck error".into(),
+            })
+        });
+        assert!(!broker.artifact_sweep_recovery_requested().unwrap());
+
+        broker.recover_storage_pressure_after_command_failure(&unrelated, || {
+            Err(PreparationError::StorageUnavailable {
+                path: tmp.path().join("target"),
+                reason: "injected post-command pressure".into(),
+            })
+        });
+        assert!(broker.artifact_sweep_recovery_requested().unwrap());
+
+        let refusal = BrokerOpError::from(PreparationError::StorageUnavailable {
+            path: tmp.path().join("target"),
+            reason: "injected test refusal".into(),
+        });
+
+        let checked = std::cell::Cell::new(false);
+        broker.recover_storage_pressure_after_command_failure(&refusal, || {
+            checked.set(true);
+            Ok(())
+        });
+        assert!(
+            !checked.get(),
+            "typed storage refusals need no second probe"
+        );
+
+        assert!(matches!(
+            refusal,
+            BrokerOpError::Preparation(PreparationError::StorageUnavailable { .. })
+        ));
+        assert!(broker.artifact_sweep_recovery_requested().unwrap());
+    }
+
+    #[test]
+    fn a_failed_state_write_does_not_skip_host_lease_release() {
+        use std::cell::Cell;
+
+        let released = Cell::new(false);
+        best_effort_failed_preparation_cleanup(
+            || {
+                Err(PreparationError::InvalidState {
+                    path: ".aethyme/test-state.json".into(),
+                    reason: "injected write failure".into(),
+                })
+            },
+            || {
+                released.set(true);
+                Ok(())
+            },
+        );
+
+        assert!(released.get());
+    }
 
     #[test]
     fn preparation_checks_every_write_volume_and_inode_reserve() {

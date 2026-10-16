@@ -873,6 +873,9 @@ pub(super) fn run_gc(parsed: Parsed) -> Result<(), UsageError> {
         .ok_or_else(|| {
             UsageError::Message("gc requires `plan`, `apply --confirm <sha256>` or `sweep`".into())
         })?;
+    if action == "__continue-artifacts" {
+        return run_artifact_sweep_continuation_worker(parsed);
+    }
     if parsed.positional.len() != 1 {
         return Err(UsageError::Message(
             "gc accepts exactly one action: `plan`, `apply --confirm <sha256>` or `sweep`".into(),
@@ -935,6 +938,78 @@ pub(super) fn run_gc(parsed: Parsed) -> Result<(), UsageError> {
             )));
         }
     }
+    Ok(())
+}
+
+/// Private detached-worker entry point. It is absent from help and refuses to
+/// open a broker unless the exact installed worker environment, repository,
+/// runtime pair, and singleton lock all agree.
+fn run_artifact_sweep_continuation_worker(parsed: Parsed) -> Result<(), UsageError> {
+    if !matches!(
+        std::env::var(crate::gc::ARTIFACT_SWEEP_WORKER_ENV).as_deref(),
+        Ok("1")
+    ) {
+        return Err(UsageError::Message(
+            "automatic artifact continuation is an internal worker command".into(),
+        ));
+    }
+    if parsed.read_only_snapshot || parsed.positional.len() != 2 {
+        return Err(UsageError::Message(
+            "automatic artifact continuation requires one repository path and writable broker state".into(),
+        ));
+    }
+    if cfg!(test)
+        || [
+            "CARGO_MANIFEST_DIR",
+            "CARGO_TARGET_DIR",
+            "CARGO_BIN_EXE_aethyme",
+        ]
+        .iter()
+        .any(|key| std::env::var_os(key).is_some())
+    {
+        return Err(UsageError::Message(
+            "automatic artifact continuation cannot run from a test or build environment".into(),
+        ));
+    }
+    let requested_root = std::fs::canonicalize(&parsed.positional[1]).map_err(|error| {
+        UsageError::Message(format!(
+            "cannot resolve automatic artifact continuation repository: {error}"
+        ))
+    })?;
+    let discovered = crate::GitRepo::discover(&requested_root)?;
+    let repository_root = std::fs::canonicalize(discovered.main_root()?)?;
+    if repository_root != requested_root {
+        return Err(UsageError::Message(
+            "automatic artifact continuation repository does not match its main checkout".into(),
+        ));
+    }
+    if crate::host_state::path_is_ephemeral(&repository_root)
+        || !crate::gc::artifact_worker_runtime_is_aligned()
+    {
+        return Err(UsageError::Message(
+            "automatic artifact continuation runtime or repository is not eligible".into(),
+        ));
+    }
+
+    // Hold the OS lock before Broker::open. The parent drops it only after
+    // this process has been spawned, so no second detached worker can enter.
+    let mut worker_lock = None;
+    for _ in 0..40 {
+        if let Some(lock) = crate::gc::try_artifact_sweep_worker_lock(&repository_root)? {
+            worker_lock = Some(lock);
+            break;
+        }
+        // The launcher still owns the lock while the child starts. Wait for
+        // that handoff, but do not queue another worker behind an active one.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let Some(_worker_lock) = worker_lock else {
+        return Err(UsageError::Message(
+            "automatic artifact continuation worker is already active".into(),
+        ));
+    };
+    let mut broker = Broker::open(&repository_root)?;
+    broker.run_artifact_sweep_recovery_worker()?;
     Ok(())
 }
 
