@@ -16,10 +16,8 @@ use serde::{Deserialize, Serialize};
 use crate::collaboration_archive::{self as archive, CommitOid, ObjectDigest};
 use crate::collaboration_gc::archive_use;
 use crate::collaboration_state::CollaborationStore;
-use crate::composer::{self, CompositionBudget, CompositionRequest};
-use crate::composition::{
-    Candidate, CandidateInput, Composition, CompositionMode, CompositionOutcome, Producer,
-};
+use crate::composer::{self, Composition, CompositionBudget, CompositionRequest};
+use crate::composition::{Candidate, CandidateInput, CompositionMode, CompositionOutcome, Producer};
 use crate::local_target::{self as target, ControllerOwner, Phase, TargetError};
 use crate::resolution::{self, FailedCheck, RequirementRef};
 
@@ -302,7 +300,7 @@ struct BudgetUsagePayload {
     merges: usize,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RequirementPayload {
     id: String,
@@ -568,8 +566,12 @@ fn source_payload(
         revision: wave.spec.revision.clone(),
         profile: composer::PROVISIONAL_TEXT_PROFILE.into(),
         request: CompositionRequestPayload {
-            baseline: request.baseline.to_string(),
-            accepted: request.accepted.iter().map(ToString::to_string).collect(),
+            baseline: request.baseline.as_str().to_owned(),
+            accepted: request
+                .accepted
+                .iter()
+                .map(|commit| commit.as_str().to_owned())
+                .collect(),
             catalog: request
                 .catalog
                 .iter()
@@ -682,7 +684,7 @@ fn write_source_record(
     }
     let record = Record::decode(&bytes, &[&COMPOSITION_SOURCE_SCHEMA])
         .map_err(|error| WaveError::Invalid(format!("composition source record: {error}")))?;
-    let object = archive::put_object(store, record.canonical_bytes())?;
+    let object = archive::put_object(store, &record.canonical_bytes())?;
     Ok(resolution::RecordRef {
         id: record.id(),
         object,
@@ -946,7 +948,7 @@ fn validate_source_context(
         ));
     }
     let recipe_record = composer::read_recipe(store, recipe)?;
-    let recipe_json: serde_json::Value = serde_json::from_slice(recipe_record.canonical_bytes())?;
+    let recipe_json: serde_json::Value = serde_json::from_slice(&recipe_record.canonical_bytes())?;
     if recipe_json["candidate"].as_str() != Some(candidate.subject.as_str())
         || recipe_json["candidate_commit"].as_str() != Some(candidate.commit.as_str())
         || recipe_json["baseline_commit"].as_str() != Some(source.request.baseline.as_str())
@@ -1079,7 +1081,7 @@ fn retain_composition_source(
         .as_ref()
         .ok_or_else(|| WaveError::Invalid("composition source has no recipe".into()))?;
     let recipe_record = composer::read_recipe(store, recipe)?;
-    let recipe_json: serde_json::Value = serde_json::from_slice(recipe_record.canonical_bytes())?;
+    let recipe_json: serde_json::Value = serde_json::from_slice(&recipe_record.canonical_bytes())?;
     let baseline = snapshot(
         recipe_json["baseline"]
             .as_str()
@@ -1175,7 +1177,7 @@ fn validate_composition_source_roots(
     require_root("snapshot", candidate.subject.as_str())?;
 
     let recipe_record = composer::read_recipe(store, recipe)?;
-    let recipe_json: serde_json::Value = serde_json::from_slice(recipe_record.canonical_bytes())?;
+    let recipe_json: serde_json::Value = serde_json::from_slice(&recipe_record.canonical_bytes())?;
     let baseline = snapshot(
         recipe_json["baseline"]
             .as_str()
@@ -1973,7 +1975,7 @@ pub(crate) fn compose_with_source(
                 ..CompositionBudget::default()
             },
         };
-        let requirements = pinned
+        let requirements: Vec<RequirementRef> = pinned
             .spec
             .requirements
             .iter()
