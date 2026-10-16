@@ -1,0 +1,76 @@
+# 1129 post-merge CLI validation plan
+
+Status: planning only. No Cargo/native command from this plan has run.
+
+## Frozen baseline and slot rules
+
+Current clean merged source checkpoint: commit `0ec6d692054c979fad42d47dc36c0bb229e5f5ba`, tree `3626a11c679f4b9e09910139c124b2abda048ec0`, with parents `c6e470f10b138ec682ac8af42f6667aa2316bf6f` and `425a0bc8e41031cea6b0ff8b5bc0e9cc80748b31`. The T56 parent merge is committed and pushed. Freeze the resulting HEAD, tree, tracked/untracked status, source file hashes, recorder hash, and exact test names before launch. Do not run while 1128 owns Cargo/native. Do not edit source during any recorded command. Preserve the previous bed926 compiler-only failure unchanged; it exited 101 with zero tests, so it earns no test result.
+
+Use only a newly granted exclusive slot. Keep the shared warm Cargo target on T7:
+`/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/integrate-reviewed-local-bare-git-servic/target/local-resume/cargo`
+
+Use the approved frozen recorder bytes (SHA-256 `29d2319c55cea24d6a1c76d7038b4bfd96cc105ae17e7ef4c00ef927d19286bc`) copied byte-for-byte into this session's ignored target. Give each command a unique label/output directory and `--tmp-base /private/tmp`. Launch from a filtered `env -i` environment with explicit `HOME=/Users/christophehenner`, `CARGO_HOME=/Users/christophehenner/.cargo`, `RUSTUP_HOME=/Users/christophehenner/.rustup`, the T7 `CARGO_TARGET_DIR`, `CARGO_BUILD_JOBS=4`, `RUSTC_WRAPPER=`, `PATH=/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/christophehenner/.cargo/bin`, `LANG=C.UTF-8`, and `LC_ALL=C.UTF-8`; use `caffeinate -i`. Do not pass PATH through recorder `--env`. Touch only the owned broker library source mtime immediately before launch if required to prevent Cargo reusing the failed compile; preserve and record its content hash. Record command JSON, complete log, status, source hash checks before/after, actual test count, and every failed predicate. No broad cleanup.
+
+## Focused tests (after the merged source is frozen)
+
+Run each as an exact named test, preserving the complete output and observed test count:
+
+- Broker notice module: `cargo test --locked -j4 -p aethyme-broker local_capture_notice::tests:: -- --nocapture` (module batch; report actual count, including ignored tests). Core cases include `notice_ingress_refuses_unbound_issuer_revision_and_capture_without_admission_effects`, `duplicate_ingress_and_owner_ticks_are_idempotent_for_one_arrival`, `pending_notice_limit_accepts_512_and_refuses_513_without_effects`, `owner_tick_marks_notice_from_old_epoch_stale_without_admission_effects`, and `ingress_cannot_interleave_between_notice_drain_and_wave_admission`.
+- Service nonce status (run each listed command separately):
+  - `cargo test --locked -j4 -p aethyme-broker collaboration_cli::lifecycle::tests::service_status_nonce_recovers_unknown_appointment_after_lost_output_without_replay -- --exact --nocapture`
+  - `cargo test --locked -j4 -p aethyme-broker collaboration_cli::lifecycle::tests::service_status_nonce_reads_completed_history_across_revisions_and_epochs -- --exact --nocapture`
+  - `cargo test --locked -j4 -p aethyme-broker collaboration_cli::lifecycle::tests::service_status_rejects_corrupt_body_index_bindings_without_writes -- --exact --nocapture`
+- Prepare preflight:
+  - `cargo test --locked -j4 -p aethyme-broker collaboration_cli::lifecycle::tests::verifier_prepare_refuses_oversized_literal_inventory_before_opening_state -- --exact --nocapture`
+  - `cargo test --locked -j4 -p aethyme-broker execution_verifier::prepare_preflight_tests::prepare_rejects_nonzero_exit_before_runtime_or_capture_side_effects -- --exact --nocapture`
+- Capture-root release:
+  - `cargo test --locked -j4 -p aethyme-broker collaboration_capture::tests::contribution_root_release_requires_exact_committed_receipt_and_is_idempotent -- --exact --nocapture`
+  - `cargo test --locked -j4 -p aethyme-broker collaboration_capture::tests::contribution_root_release_refuses_missing_or_uncommitted_receipts -- --exact --nocapture`
+- Native root refusal: `cargo test --locked -j4 -p aethyme-broker native_gates::tests::dispatching_and_unknown_jobs_stay_rooted_without_a_process_tree_proof -- --exact --nocapture`.
+- Guard proof: `cargo test --locked -j4 -p aethyme-broker local_target::tests::artifact_retention_permit_requires_each_exact_guard_and_owner_epoch -- --exact --nocapture`.
+- Broker route/help: `cargo test --locked -j4 -p aethyme-broker collaboration_cli::tests::bootstrap_routes_are_named_and_documented -- --exact --nocapture`.
+- CLI integration tests: `cargo test --locked -j4 -p aethyme-cli --test help_snapshots help_surface_matches_snapshots -- --exact`; then `cargo test --locked -j4 -p aethyme-cli --test help_everywhere help_works_everywhere_without_side_effects -- --exact`. Update snapshots only if the merged help intentionally changed and an independent review confirms the exact diff; inspect and retain both update and no-update records.
+
+If a test fails during compile, records zero tests, selects more than the one intended test, or fails a setup predicate, preserve it as non-credit and stop to diagnose. Do not rerun a frozen attempt merely to improve parser classification.
+
+## Static checks and binaries
+
+After focused tests pass, run strict scoped lint:
+`cargo clippy --locked -j4 -p aethyme-broker -p aethyme-cli -p aethyme-engine --all-targets -- -D warnings`
+
+Then build the exact CLI and engine binaries without installing them:
+`cargo build --locked -j4 -p aethyme-cli --bin aethyme`
+`cargo build --locked -j4 -p aethyme-engine --bin aethyme-engine-cli`
+
+Record full logs/status, source hash before/after, binary path, size and SHA-256. Do not run another workspace-wide suite already owned by root.
+
+## Old schema 23 compatibility diagnostic
+
+Never rebuild or replace the pinned old binary:
+`/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/682-reconcile-final-local-qualification/target/local-resume/old-state23-cli/aethyme-1d0ce264-state23`
+Expected size `99,711,128` bytes; SHA-256 `1268402c5d49ac303b61bc28b4e4726bf95b1d17d64d7099850f2f67950f7e6f`.
+
+On a disposable copy of an initialized schema-25 Playground, preserve the copy's DB/file hashes before and after; invoke the known parent-tested public read-only route exactly as `"/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/682-reconcile-final-local-qualification/target/local-resume/old-state23-cli/aethyme-1d0ce264-state23" collab status --json --repo "<copy>"`. Judge the JSON refusal, not exit status alone: require `state.refusal.code == "schema_too_new"`, a diagnostic identifying found schema 25, minimum compatible schema 25, old-client support 23, and the exact disposable DB path. Do not substitute `collab authority status`; that old-binary route/envelope has not been pinned. Do not edit SQLite directly. Do not repeat the already-passed schema-24 parent probe.
+
+## Mutations after independent review
+
+Only after the exact source, mutant, runner, restoration procedure, and expected assertion are independently CLEAR and a fresh slot grant exists. Mutate one predicate at a time from a byte-exact backup; do not edit profile/oracle fixtures. The following are mutation specifications, not authorization to execute. For each one, freeze the merged baseline source hash, make a unique run directory, copy the exact affected file byte-for-byte to `source-backup/`, record its SHA-256, apply only the stated one-predicate edit, record the mutant hash, and launch only the named test with `--exact --nocapture`. Immediately restore from that backup, touch the restored file and owned broker library source to prevent stale Cargo reuse, and verify the original SHA-256 before any next command. Preserve full original output/status and a separate correction record if metadata parsing is wrong; never edit the frozen attempt.
+
+| ID | Exact mutation | Exact selected test | Expected failing assertion |
+| --- | --- | --- | --- |
+| N1 issuer admission | In `packages/aethyme/rust/crates/aethyme-broker/src/local_capture_notice.rs::ingest`, change `if revision.target != target_name || revision.issuer != issuer` to `if revision.target != target_name` (remove only issuer binding). | `local_capture_notice::tests::notice_ingress_refuses_unbound_issuer_revision_and_capture_without_admission_effects` | The existing `assert!(matches!(wrong_issuer, Err(NoticeError::Stale)))` fails because the wrong-issuer notice is accepted. |
+| N2 old epoch tick | In `packages/aethyme/rust/crates/aethyme-broker/src/local_capture_notice.rs::consume_pending_locked`, remove only `|| body.authority_epoch != owner.authority_epoch().as_str()` from the stale predicate. | `local_capture_notice::tests::owner_tick_marks_notice_from_old_epoch_stale_without_admission_effects` | The exact detail assertion expects `Some("authority epoch or selected target revision changed")`; the old-epoch notice reaches the retained-capture mismatch path and reports a different reason. |
+| S1 canonical appointment body | In `packages/aethyme/rust/crates/aethyme-broker/src/local_controller/service.rs::validate_status_binding`, remove only the `record.canonical_bytes() != body` refusal block. | `collaboration_cli::lifecycle::tests::service_status_rejects_corrupt_body_index_bindings_without_writes` | The `noncanonical_body` case's `service_status_for_store(...).unwrap_err()` panics because lookup accepts the noncanonical but parse-equivalent persisted body. |
+| C1 exact receipt confirmation | In `packages/aethyme/rust/crates/aethyme-broker/src/collaboration_capture.rs::release_retention`, remove only `if confirmation != &receipt_record_id { return Err(CaptureError::ConfirmationMismatch { ... }) }`. | `collaboration_capture::tests::contribution_root_release_requires_exact_committed_receipt_and_is_idempotent` | The first wrong-confirmation assertion expecting `Err(CaptureError::ConfirmationMismatch { .. })` fails because release proceeds with the wrong receipt ID. |
+| V1 unsupported inventory preflight | In `packages/aethyme/rust/crates/aethyme-broker/src/execution_verifier.rs::prepare`, remove only `ensure_supported_inventory(&inventory)?;`. | `execution_verifier::prepare_preflight_tests::prepare_rejects_nonzero_exit_before_runtime_or_capture_side_effects` | The assertion requiring `Err(VerificationError::Unsupported(detail))` with `detail == NONZERO_EXIT_UNSUPPORTED` fails; malformed commit processing returns a different error. |
+
+For all five, require compile completion, the one named test selected and failed at the stated assertion, `0 passed; 1 failed`, status/exit 101, exact restored source hash, and unchanged runner/recorder/operator hashes. A compile failure, zero selected tests, another assertion, or a setup failure is preserved and uncredited. Exact route registration/help, history no-replay, CAP missing/uncommitted receipt, and native unknown-root tests remain positive regressions in the focused suite; do not claim they are mutation-qualified unless separately reviewed with a concrete mutant. No provider/model/held-out/replay work.
+
+## Scope limits
+
+The notice queue bounds pending rows at 512 project-wide, owner-tick batches at 512, and status response pages by the requested limit. Terminal notice/outcome audit history is append-only and has no automatic pruning or total-history cap; no total database-size bound is claimed. This plan does not claim T64 rehearsal completion, provider coverage, quality improvements, or reliability beyond the specifically observed finite commands.
+
+
+## Exact merged-source amendment
+
+This revision preserves the previously reviewed test names, assertions, mutation intent, restoration procedure, and old-schema route. It only binds them to the merged source above. The Git archive is `/private/tmp/t45-merge-1129-cEGhEO/source.tar` (SHA-256 `b66613f50dd775f668393c974cd973bbe0fa84c012d8b84dd23059f281fb0127`). The three-file conflict-resolution diff is `/private/tmp/t45-merge-1129-cEGhEO/resolution.patch` (SHA-256 `76fcaf421784498fb4a21d3141dc735f11d7178c44c02734378450a603e0b78b`). Runtime launch remains blocked until root explicitly hands off the exclusive Cargo/native slot. Before a mutation, independently re-review its exact hunk against this merged source archive and freeze the target file hash, runner, recorder and restore receipt.

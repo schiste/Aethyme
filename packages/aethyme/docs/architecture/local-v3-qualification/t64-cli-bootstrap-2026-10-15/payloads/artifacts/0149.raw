@@ -1,0 +1,99 @@
+{
+  "argv": [
+    "/usr/bin/caffeinate",
+    "-i",
+    "cargo",
+    "test",
+    "--locked",
+    "-j4",
+    "-p",
+    "aethyme-broker",
+    "collaboration_sensitive::tests::capture_notice_ingress_lock_control_refuses_held_file_then_retries_after_release",
+    "--",
+    "--exact",
+    "--nocapture"
+  ],
+  "duration_seconds": 48.378325,
+  "ended_at_utc": "2026-10-15T23:27:46.398666Z",
+  "environment": {
+    "explicit_profile_keys": [],
+    "values": {
+      "CARGO_BUILD_JOBS": "4",
+      "CARGO_HOME": "/Users/christophehenner/.cargo",
+      "CARGO_TARGET_DIR": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/integrate-reviewed-local-bare-git-servic/target/local-resume/cargo",
+      "HOME": "/Users/christophehenner",
+      "LANG": "C.UTF-8",
+      "LC_ALL": "C.UTF-8",
+      "PATH": "/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/christophehenner/.cargo/bin",
+      "RUSTC_WRAPPER": "",
+      "RUSTUP_HOME": "/Users/christophehenner/.rustup",
+      "TMPDIR": "/private/tmp/1129-mutant-L2-held-lock-tmp-0dxm84yg"
+    }
+  },
+  "execution_context": {
+    "host": {
+      "hostname": "Mac.lan",
+      "machine": "arm64",
+      "platform": "macOS-27.2-arm64-arm-64bit",
+      "python": "3.9.6 (default, Aug 17 2026, 12:07:42) "
+    },
+    "tmp_volume": {
+      "free_bytes_before": 10306252800,
+      "path": "/private/tmp",
+      "total_bytes": 494384795648
+    },
+    "tool_versions": {
+      "aethyme": {
+        "executable": "/Users/christophehenner/.cargo/bin/aethyme",
+        "exit_code": 0,
+        "version": "aethyme 0.8.26 (v0.8.26 build_commit=5e8daf712e26c63f1d4082e9a617f556cf995de2) build_date=2026-10-08T19:30:03Z"
+      },
+      "cargo": {
+        "executable": "/Users/christophehenner/.cargo/bin/cargo",
+        "exit_code": 0,
+        "version": "cargo 1.96.0 (30a34c682 2026-05-25)"
+      },
+      "git": {
+        "executable": "/opt/homebrew/bin/git",
+        "exit_code": 0,
+        "version": "git version 2.55.0"
+      },
+      "rustc": {
+        "executable": "/Users/christophehenner/.cargo/bin/rustc",
+        "exit_code": 0,
+        "version": "rustc 1.96.0 (ac68faa20 2026-05-25)"
+      }
+    }
+  },
+  "label": "1129-mutant-L2-held-lock",
+  "launcher_error": null,
+  "log_bytes": 1332,
+  "log_path": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/complete-fresh-local-cli-bootstrap-and-c/target/local-resume/retention-checks/20261015T232657Z-1129-mutant-L2-held-lock-4f2959a7/command.log",
+  "log_sha256": "8aa9d7666ac4be1a89634c616e798e61688973bce37cac66eefa59968da9dd80",
+  "numeric_exit": 101,
+  "root": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/complete-fresh-local-cli-bootstrap-and-c",
+  "schema": "aethyme.local-check/v1",
+  "source_after": {
+    "diff_sha256": "16954057d2795376a84758c71c67ae210ec8377dca1a1cd23564477d92207947",
+    "head": "3af335ab87618cc7fcb92a4a5b01ad23edb633d9",
+    "status": " M packages/aethyme/rust/crates/aethyme-broker/src/collaboration_sensitive.rs\n",
+    "tree": "a414406951d28197ed101308914c379fe1678cbd",
+    "untracked_content_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  "source_before": {
+    "diff_sha256": "16954057d2795376a84758c71c67ae210ec8377dca1a1cd23564477d92207947",
+    "head": "3af335ab87618cc7fcb92a4a5b01ad23edb633d9",
+    "status": " M packages/aethyme/rust/crates/aethyme-broker/src/collaboration_sensitive.rs\n",
+    "tree": "a414406951d28197ed101308914c379fe1678cbd",
+    "untracked_content_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  "source_unchanged": true,
+  "started_at_utc": "2026-10-15T23:26:58.095261Z",
+  "state": "completed",
+  "status_bytes": 4,
+  "status_path": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/complete-fresh-local-cli-bootstrap-and-c/target/local-resume/retention-checks/20261015T232657Z-1129-mutant-L2-held-lock-4f2959a7/command.status",
+  "status_sha256": "39b8dc3fc8b44765c8e6f1adee04c5b465e555ab791cc42d0d9e810d5b64297c",
+  "termination_signal": null,
+  "tmpdir": "/private/tmp/1129-mutant-L2-held-lock-tmp-0dxm84yg",
+  "working_directory": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/complete-fresh-local-cli-bootstrap-and-c/packages/aethyme/rust"
+}
