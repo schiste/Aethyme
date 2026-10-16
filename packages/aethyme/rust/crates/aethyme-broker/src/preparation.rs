@@ -61,6 +61,8 @@ pub enum PreparationError {
     LivenessDeadlineElapsed,
     #[error("preparation cache liveness could not be verified: {reason}")]
     LivenessIncomplete { reason: String },
+    #[error("dependency preparation storage at {path} is unavailable: {reason}")]
+    StorageUnavailable { path: PathBuf, reason: String },
     #[error(transparent)]
     HostResource(#[from] crate::HostResourceError),
 }
@@ -435,6 +437,16 @@ impl Broker {
             .steps
             .iter()
             .any(|step| step.cache == PreparationCachePolicy::RepositoryShared);
+        let cache_dir = shared
+            .then(|| preparation_cache_dir(self, &digest))
+            .transpose()?;
+        let mut storage_paths = vec![root.clone(), self.main_root().join(".aethyme")];
+        if let Some(cache_dir) = &cache_dir {
+            storage_paths.push(cache_dir.clone());
+            storage_paths
+                .push(crate::default_host_resource_db_path().map_err(PreparationError::from)?);
+        }
+        require_preparation_storage(self.main_root(), &storage_paths)?;
         let mut coordinator = shared
             .then(HostResourceCoordinator::open_default)
             .transpose()
@@ -449,17 +461,18 @@ impl Broker {
         } else {
             None
         };
+        // A shared-cache lease may have waited while another process filled
+        // either volume. Recheck before rotation, state writes or commands.
+        if let Err(error) = require_preparation_storage(self.main_root(), &storage_paths) {
+            release_grant(&mut coordinator, &mut grant)?;
+            return Err(error.into());
+        }
         // Enforce the budget while the exclusive lease is held, never after
         // release: rotation removes a store other worktrees may be reading, so
         // it has to be inside the same critical section that granted access.
         // It also runs before this run's directory is created, because it
         // moves the whole repository store away, that directory included.
         let rotation = shared_cache_budget(config.shared_cache.as_ref(), &digest, self)?;
-        let cache_dir = if shared {
-            Some(preparation_cache_dir(self, &digest)?)
-        } else {
-            None
-        };
         if let Some(cache_dir) = &cache_dir {
             fs::create_dir_all(cache_dir).map_err(|source| PreparationError::Io {
                 path: cache_dir.clone(),
@@ -494,6 +507,7 @@ impl Broker {
             })
             .unwrap_or_default();
         let mut results = Vec::new();
+        let main_root = self.main_root().to_path_buf();
         let mut next_renewal =
             std::time::Instant::now() + Duration::from_secs(PREPARATION_LEASE_TTL_SECONDS / 3);
         for step in &config.steps {
@@ -504,30 +518,35 @@ impl Broker {
             } else {
                 &step.command
             };
-            let report = match self.guarded_exec_with_env_and_heartbeat(
-                session_id,
-                command,
-                &environment,
-                || {
-                    if std::time::Instant::now() < next_renewal {
-                        return Ok(());
-                    }
-                    if let (Some(coordinator), Some(grant)) = (coordinator.as_mut(), grant.as_mut())
-                    {
-                        grant.lease = coordinator
-                            .renew(
-                                &grant.lease.lease_id,
-                                grant.lease.generation,
-                                &grant.ownership_token,
-                                PREPARATION_LEASE_TTL_SECONDS,
-                            )
-                            .map_err(PreparationError::from)?;
-                    }
-                    next_renewal = std::time::Instant::now()
-                        + Duration::from_secs(PREPARATION_LEASE_TTL_SECONDS / 3);
-                    Ok(())
-                },
-            ) {
+            let report = match require_preparation_storage(&main_root, &storage_paths)
+                .map_err(BrokerOpError::from)
+                .and_then(|()| {
+                    self.guarded_exec_with_env_and_heartbeat(
+                        session_id,
+                        command,
+                        &environment,
+                        || {
+                            if std::time::Instant::now() < next_renewal {
+                                return Ok(());
+                            }
+                            if let (Some(coordinator), Some(grant)) =
+                                (coordinator.as_mut(), grant.as_mut())
+                            {
+                                grant.lease = coordinator
+                                    .renew(
+                                        &grant.lease.lease_id,
+                                        grant.lease.generation,
+                                        &grant.ownership_token,
+                                        PREPARATION_LEASE_TTL_SECONDS,
+                                    )
+                                    .map_err(PreparationError::from)?;
+                            }
+                            next_renewal = std::time::Instant::now()
+                                + Duration::from_secs(PREPARATION_LEASE_TTL_SECONDS / 3);
+                            Ok(())
+                        },
+                    )
+                }) {
                 Ok(report) => report,
                 Err(error) => {
                     record.state = PreparationState::Failed;
@@ -1248,10 +1267,14 @@ fn preparation_resource_request(
         resources: vec![HostResourceRequirement {
             key: "preparation_cache".into(),
             resource: HostResourceKind::ExclusiveKey {
-                name: format!("aethyme-prepare-cache:{repository}"),
+                name: preparation_cache_lease_name(&repository),
             },
         }],
     })
+}
+
+pub(crate) fn preparation_cache_lease_name(repository: &str) -> String {
+    format!("aethyme-prepare-cache:{repository}")
 }
 
 /// The shared-cache key this checkout would ask for right now, if it declares
@@ -1387,13 +1410,18 @@ pub struct SharedCacheRotation {
 }
 
 fn preparation_store_dir(broker: &Broker) -> Result<PathBuf, PreparationError> {
+    Ok(preparation_cache_root()?.join(repository_identity(broker)))
+}
+
+/// Shared by preparation and garbage collection. Worktree placement is
+/// independent of the host resource database and must not redirect discovery
+/// to a different cache than the one preparation actually writes.
+pub(crate) fn preparation_cache_root() -> Result<PathBuf, PreparationError> {
     let db = crate::default_host_resource_db_path()?;
     let parent = db
         .parent()
         .ok_or_else(|| invalid_config("host state has no parent directory"))?;
-    Ok(parent
-        .join("preparation-cache")
-        .join(repository_identity(broker)))
+    Ok(parent.join("preparation-cache"))
 }
 
 fn directory_bytes(path: &Path) -> u64 {
@@ -1425,14 +1453,43 @@ fn epoch_ms() -> u128 {
 }
 
 fn preparation_cache_dir(broker: &Broker, digest: &str) -> Result<PathBuf, PreparationError> {
-    let db = crate::default_host_resource_db_path()?;
-    let parent = db
-        .parent()
-        .ok_or_else(|| invalid_config("host state has no parent directory"))?;
-    Ok(parent
-        .join("preparation-cache")
-        .join(repository_identity(broker))
-        .join(&digest[..12]))
+    Ok(preparation_store_dir(broker)?.join(&digest[..12]))
+}
+
+fn require_preparation_storage(
+    main_root: &Path,
+    paths: &[PathBuf],
+) -> Result<(), PreparationError> {
+    preparation_storage_with(
+        paths,
+        crate::verification::removable_volume_unavailable_reason,
+        |path| crate::disk_headroom::available_headroom_at_or_above_for(main_root, path),
+    )
+}
+
+fn preparation_storage_with(
+    paths: &[PathBuf],
+    mut unavailable: impl FnMut(&Path) -> Option<String>,
+    mut headroom: impl FnMut(&Path) -> Option<crate::disk_headroom::DiskHeadroom>,
+) -> Result<(), PreparationError> {
+    for path in paths {
+        let reason = unavailable(path).or_else(|| {
+            let reading = headroom(path);
+            crate::disk_headroom::refusal_with_headroom(
+                reading.map(|reading| reading.bytes),
+                reading.and_then(|reading| reading.inodes),
+                crate::DEFAULT_GATE_HEADROOM_BYTES,
+                crate::disk_headroom::MIN_GATE_HEADROOM_INODES,
+            )
+        });
+        if let Some(reason) = reason {
+            return Err(PreparationError::StorageUnavailable {
+                path: path.clone(),
+                reason,
+            });
+        }
+    }
+    Ok(())
 }
 
 fn repository_identity(broker: &Broker) -> String {
@@ -1494,6 +1551,63 @@ fn now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preparation_checks_every_write_volume_and_inode_reserve() {
+        let paths = [PathBuf::from("/checkout"), PathBuf::from("/cache")];
+        for (bytes, inodes) in [
+            (crate::DEFAULT_GATE_HEADROOM_BYTES - 1, Some(1_000_000)),
+            (crate::DEFAULT_GATE_HEADROOM_BYTES, Some(99_999)),
+        ] {
+            let result = preparation_storage_with(
+                &paths,
+                |_| None,
+                |path| {
+                    Some(crate::disk_headroom::DiskHeadroom {
+                        bytes: if path == Path::new("/cache") {
+                            bytes
+                        } else {
+                            u64::MAX
+                        },
+                        inodes: if path == Path::new("/cache") {
+                            inodes
+                        } else {
+                            None
+                        },
+                    })
+                },
+            );
+            assert!(
+                matches!(result, Err(PreparationError::StorageUnavailable { path, .. }) if path == paths[1])
+            );
+        }
+    }
+
+    #[test]
+    fn preparation_refuses_unmounted_storage_but_preserves_unknown_headroom() {
+        let paths = [PathBuf::from("/missing-volume")];
+        let result = preparation_storage_with(
+            &paths,
+            |_| Some("volume is absent".into()),
+            |_| panic!("must not probe an absent volume"),
+        );
+        assert!(matches!(
+            result,
+            Err(PreparationError::StorageUnavailable { .. })
+        ));
+        assert!(preparation_storage_with(&paths, |_| None, |_| None).is_ok());
+        assert!(
+            preparation_storage_with(
+                &paths,
+                |_| None,
+                |_| Some(crate::disk_headroom::DiskHeadroom {
+                    bytes: crate::DEFAULT_GATE_HEADROOM_BYTES,
+                    inodes: Some(crate::disk_headroom::MIN_GATE_HEADROOM_INODES),
+                })
+            )
+            .is_ok()
+        );
+    }
 
     fn config() -> PreparationConfig {
         PreparationConfig {
