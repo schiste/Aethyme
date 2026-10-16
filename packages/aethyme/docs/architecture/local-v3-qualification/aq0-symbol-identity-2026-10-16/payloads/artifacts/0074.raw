@@ -1,0 +1,61 @@
+#!/bin/bash
+set -euo pipefail
+aq0_source=packages/aethyme/rust/crates/aethyme-broker/src/experimental_symbol_mapping.rs
+aq0_test=packages/aethyme/rust/crates/aethyme-broker/tests/symbol_identity_binding.rs
+aq0_baseline=72cf7ea55fefa5779da822e11d3caf523766d2bada2a936bb762c41df6e29726
+aq0_target='/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/integrate-reviewed-local-bare-git-servic/target/local-resume/cargo'
+aq0_patch=${1:?patch path required}
+aq0_log=${2:?log path required}
+aq0_label=${3:?label required}
+aq0_backup=$(mktemp /private/tmp/aq0-source.XXXXXX)
+
+aq0_restore() {
+  local aq0_exit=$?
+  trap - EXIT HUP INT TERM
+  if ! cp -p "$aq0_backup" "$aq0_source"; then
+    printf 'RESTORE_COPY_FAILED label=%s backup=%s\n' "$aq0_label" "$aq0_backup"
+    exit 91
+  fi
+  touch "$aq0_source"
+  local aq0_actual
+  aq0_actual=$(shasum -a 256 "$aq0_source" | awk '{print $1}')
+  printf 'RESTORED label=%s sha256=%s expected=%s\n' "$aq0_label" "$aq0_actual" "$aq0_baseline"
+  if [[ "$aq0_actual" != "$aq0_baseline" ]]; then
+    printf 'RESTORE_HASH_MISMATCH label=%s\n' "$aq0_label"
+    exit 92
+  fi
+  if ! git diff --exit-code -- "$aq0_source" "$aq0_test"; then
+    printf 'RESTORE_DIFF_NOT_CLEAN label=%s\n' "$aq0_label"
+    exit 93
+  fi
+  stat -f 'RESTORED_MTIME=%m SOURCE=%N' "$aq0_source"
+  rm -f "$aq0_backup"
+  exit "$aq0_exit"
+}
+trap aq0_restore EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+cp -p "$aq0_source" "$aq0_backup"
+aq0_before=$(shasum -a 256 "$aq0_source" | awk '{print $1}')
+if [[ "$aq0_before" != "$aq0_baseline" ]]; then
+  printf 'BASELINE_HASH_MISMATCH actual=%s expected=%s\n' "$aq0_before" "$aq0_baseline"
+  exit 94
+fi
+git apply "$aq0_patch"
+touch "$aq0_source"
+set +e
+env -i PATH="/Users/christophehenner/.cargo/bin:/usr/bin:/bin" HOME=/Users/christophehenner TMPDIR=/private/tmp CARGO_TARGET_DIR="$aq0_target" cargo test --locked -j4 --manifest-path packages/aethyme/rust/Cargo.toml -p aethyme-broker --test symbol_identity_binding mismatched_or_incomplete_mapping_records_never_establish -- --exact 2>&1 | tee "$aq0_log"
+aq0_test_status=${PIPESTATUS[0]}
+set -e
+printf 'MUTANT_TEST_EXIT label=%s status=%s log=%s\n' "$aq0_label" "$aq0_test_status" "$aq0_log"
+if [[ "$aq0_test_status" -eq 0 ]]; then
+  printf 'MUTANT_SURVIVED label=%s\n' "$aq0_label"
+  exit 80
+fi
+if ! rg -F 'running 1 test' "$aq0_log" || ! rg -F 'test mismatched_or_incomplete_mapping_records_never_establish ... FAILED' "$aq0_log"; then
+  printf 'EXPECTED_TEST_FAILURE_NOT_CONFIRMED label=%s\n' "$aq0_label"
+  exit 81
+fi
+printf 'EXPECTED_KILL label=%s\n' "$aq0_label"

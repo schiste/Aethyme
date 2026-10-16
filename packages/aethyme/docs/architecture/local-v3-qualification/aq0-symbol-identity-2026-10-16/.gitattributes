@@ -1,0 +1,2 @@
+# Frozen evidence keeps captured bytes unchanged across checkouts.
+payloads/artifacts/*.raw -text

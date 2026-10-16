@@ -1,0 +1,21 @@
+AQ0 static review snapshot
+base 3af335ab87618cc7fcb92a4a5b01ad23edb633d9
+head c81927caf98220e686c18474869960ad7940804f
+tree b006fe71644fb740d1a6054370dcf3411be04e9a
+scope source-only; no Cargo, native build, or tests run
+files are committed bytes at head; subsequent review fixes require additive snapshots
+
+sha256 path
+2404c13cb1f8d116ff9e16a8acad64d3919a9bd5bc15f6aa8571cb510472fa96  packages/aethyme/docs/architecture/local-v3-l1-analysis.md
+ce7aba09fbaf9e01c009570e81d557fffcabbc06871ce027d62ce70956138600  packages/aethyme/docs/architecture/local-v3-l1-identity.md
+e6b838e713c505f069f80dd9b193981d8ecf4cf2a2e7565b6607d31f26a339ce  packages/aethyme/rust/crates/aethyme-broker/src/experimental_symbol_mapping.rs
+5b73c8855631b36cb3fe3f3991a3787b52d95f37d90cdccb55058331cd609263  packages/aethyme/rust/crates/aethyme-broker/src/lib.rs
+b7e3f4a48abcf4ccb5303f2e9271308eb5e005ded39f0a1e3ba1e0254804f32f  packages/aethyme/rust/crates/aethyme-broker/tests/fixtures/synthetic-playground-symbol-identity/seed/src/lib.ts
+eede3566909a21fe81b9cdd4074524fbc8e64b679df5a188fecd83a4ea3191ca  packages/aethyme/rust/crates/aethyme-broker/tests/fixtures/synthetic-playground-symbol-identity/seed/src/other.ts
+b3c7ea2727fe7afc68a738190eac981e77f265ebb63aebfa053817ab35dd649c  packages/aethyme/rust/crates/aethyme-broker/tests/symbol_identity_binding.rs
+9122162966626e38662b647b0bb7ec4d9e8ef2413338d7aa2f454b428c6e95e6  packages/aethyme/rust/crates/aethyme-contracts/fixtures/experimental-v0/analysis.json
+ed33ac2fb805d2e00b9a720035e2aca460b2386eb41008f51e4f2c6b156bf5bd  packages/aethyme/rust/crates/aethyme-contracts/fixtures/experimental-v0/symbol_identity.json
+2e0c649874bbde4937e9218b297fbf63a8201d24fff8548204cea7e9b9afeb56  packages/aethyme/rust/crates/aethyme-contracts/src/experimental_v0/mod.rs
+885c35d40df2e7de8ad2d86d4a0d5f004e2b3add1210203c24a3d7c54fbb955e  packages/aethyme/rust/crates/aethyme-contracts/src/experimental_v0/symbol_identity.rs
+32efa6906caeb2d7b5f66342e1780f949f5a178e64244948329bd574ea5f55b7  packages/aethyme/rust/crates/aethyme-contracts/tests/analysis_vectors.rs
+52eb6dfedc6429f5edca2335a5aad57d8bc3bc1e6c0665e3c98b6c2c60a5e2c2  packages/aethyme/rust/crates/aethyme-contracts/tests/symbol_identity_vectors.rs

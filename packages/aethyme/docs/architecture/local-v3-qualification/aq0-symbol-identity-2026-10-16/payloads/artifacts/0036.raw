@@ -1,0 +1,32 @@
+   Compiling aethyme-broker v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/implement-experimental-d39-t66-scoped-sy/packages/aethyme/rust/crates/aethyme-broker)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.74s
+     Running tests/symbol_identity_binding.rs (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/integrate-reviewed-local-bare-git-servic/target/local-resume/cargo/debug/deps/symbol_identity_binding-00ddf30bf8dc4d61)
+
+running 4 tests
+test identical_local_names_need_document_and_producer_scope_and_package_versions_survive ... ok
+test mismatched_or_incomplete_mapping_records_never_establish ... FAILED
+test actual_playground_clones_bind_observations_and_keep_existing_node_ids ... ok
+test path_moves_renames_copies_and_historical_overload_collisions_stay_unknown ... FAILED
+
+failures:
+
+---- mismatched_or_incomplete_mapping_records_never_establish stdout ----
+
+thread 'mismatched_or_incomplete_mapping_records_never_establish' (12255800) panicked at crates/aethyme-broker/tests/symbol_identity_binding.rs:688:5:
+assertion failed: matches!(resolve_within_binding(&fixture.binding, &fixture.claim, &duplicate),
+    MappingResolution::Unknown("duplicate_evidence_record"))
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- path_moves_renames_copies_and_historical_overload_collisions_stay_unknown stdout ----
+
+thread 'path_moves_renames_copies_and_historical_overload_collisions_stay_unknown' (12255801) panicked at crates/aethyme-broker/tests/symbol_identity_binding.rs:210:5:
+"convert" is declared in "src/lib.ts"
+
+
+failures:
+    mismatched_or_incomplete_mapping_records_never_establish
+    path_moves_renames_copies_and_historical_overload_collisions_stay_unknown
+
+test result: FAILED. 2 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.39s
+
+error: test failed, to rerun pass `-p aethyme-broker --test symbol_identity_binding`
