@@ -46,7 +46,6 @@ type DescriptorInput = {
     descriptor_record_id: string;
   };
   generic_new_file: FileVector & { proposal_seed: string };
-  bound_profile_existing_file: FileVector;
   mixed_base_files: FileVector[];
   mixed_result_files: FileVector[];
   copy_operation: { from_path_hex: string; to_path_hex: string };
@@ -777,14 +776,13 @@ function run(): void {
     ordinalExpected.bound_profile_new_file,
     "bound_profile_new_file",
   );
-  const boundResultFiles = [
-    ordinalInputs.bound_profile_existing_file,
-    ordinalInputs.generic_new_file,
-  ];
+  // The independent bound-profile golden uses the descriptor source as its base.
+  const boundBaseFile = descriptorSource;
+  const boundResultFiles = [boundBaseFile, ordinalInputs.generic_new_file];
   const bound = advanceFileIdentities(
     ordinalInputs.project_id,
     ordinalInputs.contribution_id,
-    [ordinalInputs.bound_profile_existing_file],
+    [boundBaseFile],
     boundResultFiles,
     [],
   );
@@ -811,7 +809,7 @@ function run(): void {
   const boundIdentity = advanceFileIdentities(
     ordinalInputs.project_id,
     ordinalInputs.contribution_id,
-    [ordinalInputs.bound_profile_existing_file],
+    [boundBaseFile],
     boundResultFiles,
     [],
   ).proposed_preimages.get(ordinalInputs.generic_new_file.path_hex);
@@ -854,7 +852,7 @@ function run(): void {
   );
   checkCanonicalValue(
     boundRevisionInputs.base_files,
-    [ordinalInputs.bound_profile_existing_file],
+    [descriptorSource],
     "corrected bound-file revision base inputs",
   );
   checkCanonicalValue(
