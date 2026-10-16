@@ -1,9 +1,12 @@
 //! Durable, repository-scoped intent for shared preparation-cache rotation.
 //!
 //! The record is an immutable witness in the cache root. It is published with
-//! a no-replace rename and is never removed or rewritten by this module unless
-//! the caller proves that the retired store is gone and the replacement store
-//! is a new, empty directory on the same filesystem.
+//! a no-replace rename and is removed only after the old store is gone and the
+//! replacement store is a new, empty directory on the same filesystem. Every
+//! mutation requires the caller to hold the repository's preparation-cache
+//! lease for its full duration.
+
+#![cfg(any(target_os = "linux", target_os = "macos"))]
 
 use std::ffi::{CStr, CString};
 use std::fs::File;
@@ -23,9 +26,15 @@ const VERSION: u8 = 1;
 const MAX_RECORD_BYTES: u64 = 8 * 1024;
 const RECORD_PREFIX: &str = ".aethyme-preparation-rotation-";
 const SCRATCH_SUFFIX: &str = ".scratch";
-const REMOVE_SUFFIX: &str = ".remove";
 const DIRECTORY_FLAGS: libc::c_int =
     libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK;
+
+/// Confirm that the descriptor-relative, no-follow recovery implementation is
+/// available on this platform. The sibling unsupported-platform module returns
+/// an explicit `Unsupported` error instead of compiling a partial fallback.
+pub(crate) fn ensure_supported() -> io::Result<()> {
+    Ok(())
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -135,14 +144,12 @@ impl RotationDebt {
         }
         component(&format!("{RECORD_PREFIX}{repository}{SCRATCH_SUFFIX}"))
     }
-
-    fn remove_component(repository: &str, transaction: &str) -> io::Result<CString> {
-        component(&format!(
-            "{RECORD_PREFIX}{repository}{REMOVE_SUFFIX}-{transaction}"
-        ))
-    }
 }
 
+/// A read-only classification. It is not authority to mutate any path.
+/// Callers must hold the same per-repository preparation-cache lease from
+/// classification through each operation, recheck pinned directory and file
+/// identities immediately before mutation, and retain the debt on uncertainty.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RecoveryStep {
     RenameOriginalStore,
@@ -207,11 +214,21 @@ fn classify_recovery(
 }
 
 /// Inspect the current and retired names with descriptor-relative no-follow
-/// opens, then classify the durable transaction state.
+/// opens while the caller holds the per-repository preparation-cache lease.
+///
+/// This is classification only. A caller must finish any committed debt
+/// before creating a store, running a command, or treating a storage-budget
+/// refusal as permission to skip recovery. Mutations must revalidate the
+/// pinned root and exact component identities immediately before acting.
 pub(crate) fn recovery_step(cache_root: &Path, debt: &RotationDebt) -> io::Result<RecoveryStep> {
     debt.validate()?;
     let root = open_cache_root(cache_root)?;
-    let root_identity = identity_for_directory(&root)?;
+    recovery_step_at(&root, debt)
+}
+
+fn recovery_step_at(root: &File, debt: &RotationDebt) -> io::Result<RecoveryStep> {
+    debt.validate()?;
+    let root_identity = identity_for_directory(root)?;
     if !root_identity.same_directory(&debt.cache_root) {
         return Err(invalid_record(
             "cache root changed during rotation recovery",
@@ -418,17 +435,31 @@ pub(crate) fn publish(
     decode_retained(file, &proposed.repository, &root_identity)
 }
 
-/// Remove only the exact witness that was read after a descriptor-relative
-/// recovery check proves the old tree absent and the fresh store empty.
-/// Moving it to a unique tombstone prevents a raced replacement from being
-/// unlinked.
+/// Remove only the exact witness after a descriptor-relative recovery check
+/// proves the old tree absent and the fresh store empty. The caller must hold
+/// the same per-repository preparation-cache lease used by every preparation
+/// writer and rotation recovery operation.
+///
+/// Classification alone is not mutation authority: this function pins and
+/// verifies the cache-root descriptor, repeats the completed-state check,
+/// re-reads the exact canonical witness, and checks its inode immediately
+/// before descriptor-relative unlink. There is deliberately no rename-to-
+/// tombstone step: after the old tree is gone, a crash after unlink but before
+/// directory sync can at worst leave an unnecessary witness, never hide old
+/// cache data or strand unbounded removal tombstones.
 pub(crate) fn clear_completed(
     cache_root: &Path,
     retained: &RetainedRotationDebt,
 ) -> io::Result<()> {
-    if recovery_step(cache_root, &retained.debt)? != RecoveryStep::ClearCompletedDebt {
-        return Err(invalid_record("rotation debt is not in a clearable state"));
-    }
+    clear_completed_with_sync(cache_root, retained, File::sync_all)
+}
+
+fn clear_completed_with_sync(
+    cache_root: &Path,
+    retained: &RetainedRotationDebt,
+    sync_root: impl FnOnce(&File) -> io::Result<()>,
+) -> io::Result<()> {
+    retained.debt.validate()?;
     let root = open_cache_root(cache_root)?;
     let root_identity = identity_for_directory(&root)?;
     if !root_identity.same_directory(&retained.debt.cache_root) {
@@ -441,33 +472,29 @@ pub(crate) fn clear_completed(
             "unpublished scratch prevents clearing completed rotation debt",
         ));
     }
-    let tombstone =
-        RotationDebt::remove_component(&retained.debt.repository, &retained.debt.transaction)?;
+    if recovery_step_at(&root, &retained.debt)? != RecoveryStep::ClearCompletedDebt {
+        return Err(invalid_record("rotation debt is not in a clearable state"));
+    }
     let current = read_component(root.as_raw_fd(), &name)?
         .ok_or_else(|| invalid_record("rotation witness disappeared before removal"))?;
     if current.identity != retained.marker || current.bytes != encode(&retained.debt)? {
         return Err(invalid_record("rotation witness changed before removal"));
     }
-    rename_noreplace(root.as_raw_fd(), &name, root.as_raw_fd(), &tombstone)?;
-    let moved = read_component(root.as_raw_fd(), &tombstone)?;
-    let Some(moved) = moved else {
+    if read_component(root.as_raw_fd(), &scratch_name)?.is_some()
+        || recovery_step_at(&root, &retained.debt)? != RecoveryStep::ClearCompletedDebt
+    {
         return Err(invalid_record(
-            "rotation witness disappeared during removal",
+            "rotation state changed before completed witness removal",
         ));
-    };
-    if moved.identity != retained.marker || moved.bytes != current.bytes {
-        let restore = rename_noreplace(root.as_raw_fd(), &tombstone, root.as_raw_fd(), &name);
-        return Err(match restore {
-            Ok(()) => invalid_record("a replacement witness was preserved"),
-            Err(error) => io::Error::new(
-                error.kind(),
-                format!("witness replacement was preserved at its tombstone: {error}"),
-            ),
-        });
     }
-    ensure_component_identity(root.as_raw_fd(), &tombstone, retained.marker)?;
-    unlink_component(root.as_raw_fd(), &tombstone)?;
-    root.sync_all()
+    let final_witness = read_component(root.as_raw_fd(), &name)?
+        .ok_or_else(|| invalid_record("rotation witness disappeared before removal"))?;
+    if final_witness.identity != retained.marker || final_witness.bytes != encode(&retained.debt)? {
+        return Err(invalid_record("rotation witness changed before removal"));
+    }
+    ensure_component_identity(root.as_raw_fd(), &name, retained.marker)?;
+    unlink_component(root.as_raw_fd(), &name)?;
+    sync_root(&root)
 }
 
 fn encode(debt: &RotationDebt) -> io::Result<Vec<u8>> {
@@ -503,6 +530,8 @@ struct ReadComponent {
 }
 
 fn read_component(parent_fd: RawFd, name: &CStr) -> io::Result<Option<ReadComponent>> {
+    // SAFETY: parent_fd is a live directory fd and name is a NUL-terminated
+    // single component. openat returns a new descriptor on success.
     let fd = unsafe {
         libc::openat(
             parent_fd,
@@ -517,6 +546,8 @@ fn read_component(parent_fd: RawFd, name: &CStr) -> io::Result<Option<ReadCompon
         }
         return Err(error);
     }
+    // SAFETY: fd is the fresh descriptor returned by the successful openat
+    // above; ownership is transferred to File exactly once.
     let file = unsafe { File::from_raw_fd(fd) };
     let before = file.metadata()?;
     if !is_private_owned_file(&before) {
@@ -550,6 +581,8 @@ fn read_component(parent_fd: RawFd, name: &CStr) -> io::Result<Option<ReadCompon
 }
 
 fn create_regular_exclusive(parent_fd: RawFd, name: &CStr) -> io::Result<File> {
+    // SAFETY: parent_fd is a live directory fd and name is a NUL-terminated
+    // single component. O_EXCL creates a new descriptor without following links.
     let fd = unsafe {
         libc::openat(
             parent_fd,
@@ -566,6 +599,8 @@ fn create_regular_exclusive(parent_fd: RawFd, name: &CStr) -> io::Result<File> {
     if fd < 0 {
         return Err(io::Error::last_os_error());
     }
+    // SAFETY: fd is the fresh descriptor returned by the successful openat
+    // above; ownership is transferred to File exactly once.
     let file = unsafe { File::from_raw_fd(fd) };
     let metadata = file.metadata()?;
     if !is_private_owned_file(&metadata) {
@@ -589,10 +624,12 @@ fn open_cache_root(path: &Path) -> io::Result<File> {
 fn open_directory(path: &Path) -> io::Result<File> {
     let path = CString::new(path.as_os_str().as_bytes())
         .map_err(|_| invalid_record("cache root path contains NUL"))?;
+    // SAFETY: path is a live NUL-terminated CString and open returns a new fd.
     let fd = unsafe { libc::open(path.as_ptr(), DIRECTORY_FLAGS) };
     if fd < 0 {
         return Err(io::Error::last_os_error());
     }
+    // SAFETY: fd is the fresh descriptor returned by successful open above.
     let directory = unsafe { File::from_raw_fd(fd) };
     if !directory.metadata()?.is_dir() {
         return Err(invalid_record("cache root is not a directory"));
@@ -601,10 +638,13 @@ fn open_directory(path: &Path) -> io::Result<File> {
 }
 
 fn open_directory_at(parent_fd: RawFd, name: &CStr) -> io::Result<File> {
+    // SAFETY: parent_fd is a live directory fd and name is a NUL-terminated
+    // single component. openat returns a new fd on success.
     let fd = unsafe { libc::openat(parent_fd, name.as_ptr(), DIRECTORY_FLAGS) };
     if fd < 0 {
         return Err(io::Error::last_os_error());
     }
+    // SAFETY: fd is the fresh descriptor returned by successful openat above.
     let directory = unsafe { File::from_raw_fd(fd) };
     if !directory.metadata()?.is_dir() {
         return Err(invalid_record("cache entry is not a directory"));
@@ -615,25 +655,38 @@ fn open_directory_at(parent_fd: RawFd, name: &CStr) -> io::Result<File> {
 fn directory_is_empty_at(parent_fd: RawFd, name: &CStr) -> io::Result<bool> {
     let directory = open_directory_at(parent_fd, name)?;
     let fd = directory.into_raw_fd();
+    // SAFETY: fd is a readable directory descriptor transferred from File;
+    // fdopendir owns it on success.
     let stream = unsafe { libc::fdopendir(fd) };
     if stream.is_null() {
         let error = io::Error::last_os_error();
+        // SAFETY: fdopendir failed and therefore did not consume fd.
         unsafe { libc::close(fd) };
         return Err(error);
     }
     loop {
+        // SAFETY: the returned errno pointer is thread-local and writable.
         unsafe { *directory_errno_location() = 0 };
+        // SAFETY: stream is the live DIR* returned by fdopendir and is closed
+        // only after this entry has been consumed.
         let entry = unsafe { libc::readdir(stream) };
         if entry.is_null() {
+            // SAFETY: errno pointer is thread-local and readable on this thread.
             let errno = unsafe { *directory_errno_location() };
+            // SAFETY: stream is the live DIR* returned by fdopendir and is
+            // closed exactly once here.
             unsafe { libc::closedir(stream) };
             if errno != 0 {
                 return Err(io::Error::from_raw_os_error(errno));
             }
             return Ok(true);
         }
+        // SAFETY: entry points into stream-owned readdir storage and d_name is
+        // NUL-terminated; the bytes are copied/inspected before the next call.
         let entry_name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
         if entry_name != b"." && entry_name != b".." {
+            // SAFETY: stream is the live DIR* returned by fdopendir and is
+            // closed exactly once here.
             unsafe { libc::closedir(stream) };
             return Ok(false);
         }
@@ -641,12 +694,14 @@ fn directory_is_empty_at(parent_fd: RawFd, name: &CStr) -> io::Result<bool> {
 }
 
 #[cfg(target_os = "linux")]
-unsafe fn directory_errno_location() -> *mut libc::c_int {
+fn directory_errno_location() -> *mut libc::c_int {
+    // SAFETY: libc returns the current thread's errno slot.
     unsafe { libc::__errno_location() }
 }
 
 #[cfg(target_os = "macos")]
-unsafe fn directory_errno_location() -> *mut libc::c_int {
+fn directory_errno_location() -> *mut libc::c_int {
+    // SAFETY: libc returns the current thread's errno slot.
     unsafe { libc::__error() }
 }
 
@@ -688,11 +743,16 @@ fn directory_identity_at(parent_fd: RawFd, name: &CStr) -> io::Result<Option<Dir
 
 fn filesystem_id(fd: RawFd) -> io::Result<String> {
     let mut stat = MaybeUninit::<libc::statfs>::zeroed();
+    // SAFETY: fd is a live directory descriptor and stat points to writable
+    // storage for the complete statfs result.
     if unsafe { libc::fstatfs(fd, stat.as_mut_ptr()) } != 0 {
         return Err(io::Error::last_os_error());
     }
+    // SAFETY: fstatfs returned success and initialized the complete structure.
     let stat = unsafe { stat.assume_init() };
     let fsid = std::ptr::addr_of!(stat.f_fsid).cast::<u8>();
+    // SAFETY: fsid points to the live f_fsid field and the length is exactly
+    // that field's initialized size; the slice is read-only.
     let bytes = unsafe { std::slice::from_raw_parts(fsid, mem::size_of_val(&stat.f_fsid)) };
     let mut encoded = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
@@ -704,6 +764,8 @@ fn filesystem_id(fd: RawFd) -> io::Result<String> {
 
 fn entry_exists(parent_fd: RawFd, name: &CStr) -> io::Result<bool> {
     let mut stat = MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: parent_fd is a live directory descriptor; name is a valid
+    // component and stat points to writable storage for fstatat's result.
     if unsafe {
         libc::fstatat(
             parent_fd,
@@ -742,17 +804,20 @@ fn ensure_original_source_unchanged(
     Ok(())
 }
 
+fn current_effective_uid() -> u32 {
+    // SAFETY: geteuid has no pointer or memory preconditions.
+    unsafe { libc::geteuid() }
+}
+
 fn is_private_owned_file(metadata: &std::fs::Metadata) -> bool {
     metadata.is_file()
         && metadata.nlink() == 1
-        && metadata.uid() == unsafe { libc::geteuid() }
+        && metadata.uid() == current_effective_uid()
         && metadata.mode() & 0o077 == 0
 }
 
 fn is_owned_cache_directory(metadata: &std::fs::Metadata) -> bool {
-    metadata.is_dir()
-        && metadata.uid() == unsafe { libc::geteuid() }
-        && metadata.mode() & 0o022 == 0
+    metadata.is_dir() && metadata.uid() == current_effective_uid() && metadata.mode() & 0o022 == 0
 }
 
 fn remove_scratch(parent_fd: RawFd, name: &CStr, expected: &ReadComponent) -> io::Result<()> {
@@ -771,6 +836,8 @@ fn ensure_component_identity(
     expected: FileIdentity,
 ) -> io::Result<()> {
     let mut stat = MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: parent_fd is a live directory descriptor; name is a valid
+    // component and stat points to writable storage for fstatat's result.
     if unsafe {
         libc::fstatat(
             parent_fd,
@@ -782,6 +849,7 @@ fn ensure_component_identity(
     {
         return Err(io::Error::last_os_error());
     }
+    // SAFETY: fstatat returned success and initialized the complete structure.
     let stat = unsafe { stat.assume_init() };
     #[cfg(target_os = "linux")]
     let device = stat.st_dev;
@@ -790,7 +858,7 @@ fn ensure_component_identity(
         .map_err(|_| invalid_record("negative device number in rotation witness"))?;
     if stat.st_mode & libc::S_IFMT != libc::S_IFREG
         || stat.st_nlink != 1
-        || stat.st_uid != unsafe { libc::geteuid() }
+        || stat.st_uid != current_effective_uid()
         || stat.st_mode & 0o077 != 0
         || device != expected.device
         || stat.st_ino != expected.inode
@@ -807,6 +875,8 @@ fn rename_noreplace(
     to: &CStr,
 ) -> io::Result<()> {
     #[cfg(target_os = "macos")]
+    // SAFETY: both directory descriptors are live; from/to are NUL-terminated
+    // single components and RENAME_EXCL prevents replacement of the target.
     let result = unsafe {
         libc::renameatx_np(
             parent_fd,
@@ -817,6 +887,8 @@ fn rename_noreplace(
         )
     };
     #[cfg(target_os = "linux")]
+    // SAFETY: both directory descriptors are live; from/to are NUL-terminated
+    // single components and RENAME_NOREPLACE prevents replacement of target.
     let result = unsafe {
         libc::renameat2(
             parent_fd,
@@ -834,6 +906,9 @@ fn rename_noreplace(
 }
 
 fn unlink_component(parent_fd: RawFd, name: &CStr) -> io::Result<()> {
+    // SAFETY: parent_fd is a live directory descriptor and name is a
+    // NUL-terminated single component. Callers revalidate the exact inode and
+    // hold the repository-scoped cooperative lease before unlinking.
     if unsafe { libc::unlinkat(parent_fd, name.as_ptr(), 0) } == 0 {
         Ok(())
     } else {
@@ -993,6 +1068,67 @@ mod tests {
     }
 
     #[test]
+    fn clear_refuses_to_forget_retired_payload_or_nonempty_fresh_store() {
+        let (_temp, cache_root, debt) = fixture();
+        let retained = publish(&cache_root, debt.clone()).unwrap();
+        let store = cache_root.join(REPOSITORY);
+        let retired = cache_root.join(debt.retired_component());
+        fs::rename(&store, &retired).unwrap();
+
+        assert!(super::clear_completed(&cache_root, &retained).is_err());
+        assert_eq!(read(&cache_root, REPOSITORY).unwrap().unwrap().debt, debt);
+        assert_eq!(fs::read(retired.join("package-index")).unwrap(), b"cached");
+
+        fs::remove_dir_all(&retired).unwrap();
+        fs::create_dir(&store).unwrap();
+        fs::write(store.join("unexpected"), b"preserve me").unwrap();
+        assert!(super::clear_completed(&cache_root, &retained).is_err());
+        assert_eq!(read(&cache_root, REPOSITORY).unwrap().unwrap().debt, debt);
+        assert_eq!(fs::read(store.join("unexpected")).unwrap(), b"preserve me");
+
+        fs::remove_file(store.join("unexpected")).unwrap();
+        super::clear_completed(&cache_root, &retained).unwrap();
+        assert!(read(&cache_root, REPOSITORY).unwrap().is_none());
+    }
+
+    #[test]
+    fn restart_after_unlink_before_directory_sync_cannot_hide_old_payload() {
+        let (_temp, cache_root, debt) = fixture();
+        let retained = publish(&cache_root, debt.clone()).unwrap();
+        let store = cache_root.join(REPOSITORY);
+        let retired = cache_root.join(debt.retired_component());
+        fs::rename(&store, &retired).unwrap();
+        fs::remove_dir_all(&retired).unwrap();
+        fs::create_dir(&store).unwrap();
+
+        let injected = super::clear_completed_with_sync(&cache_root, &retained, |_| {
+            Err(std::io::Error::other(
+                "simulated interruption before directory sync",
+            ))
+        });
+        assert!(injected.is_err());
+
+        // Reopen the cache root as a restarted caller would. No old tree is
+        // recoverable or hidden: it was removed before the witness was cleared.
+        assert!(read(&cache_root, REPOSITORY).unwrap().is_none());
+        assert!(!retired.exists());
+        assert!(!store.join("package-index").exists());
+        assert!(fs::read_dir(&store).unwrap().next().is_none());
+
+        let next_debt = RotationDebt::new(
+            REPOSITORY,
+            new_transaction_id().as_str(),
+            DirectoryIdentity::capture(&cache_root).unwrap(),
+            DirectoryIdentity::capture(&store).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            publish(&cache_root, next_debt.clone()).unwrap().debt,
+            next_debt
+        );
+    }
+
+    #[test]
     fn fresh_store_and_retired_deletion_transitions_are_recoverable() {
         let (_temp, cache_root, debt) = fixture();
         let retained = publish(&cache_root, debt.clone()).unwrap();
@@ -1015,6 +1151,13 @@ mod tests {
         );
         super::clear_completed(&cache_root, &retained).unwrap();
         assert!(read(&cache_root, REPOSITORY).unwrap().is_none());
+        assert!(fs::read_dir(&cache_root).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains(".remove-")
+        }));
     }
 
     #[test]
