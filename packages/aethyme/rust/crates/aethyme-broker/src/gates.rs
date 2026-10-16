@@ -2672,11 +2672,15 @@ where
             .map(|outcome| i64::try_from(outcome.output_bytes).unwrap_or(i64::MAX));
         let timed_out = status.as_ref().is_ok_and(|outcome| outcome.timed_out);
         let mut host_fault = observed_host_fault(&status, &log_path);
+        let has_capture_or_resource_error = status.as_ref().is_ok_and(|outcome| {
+            outcome.capture_error.is_some() || outcome.resource_error.is_some()
+        });
         // A deadline kill is the host's fault only the first time. A change
         // that hangs times out on every run of its tree, and deferring each one
         // would ask the agent to resubmit unchanged code forever.
         if host_fault
             && timed_out
+            && !has_capture_or_resource_error
             && store.gate_timeouts_for_tree(&gate.name, &tree, &gate.definition_hash)? > 0
         {
             host_fault = false;
@@ -3382,6 +3386,14 @@ fn spawn_gate_command(
     command.spawn()
 }
 
+fn remove_gate_pidfile_after_setup_failure(pidfile: &Path, reason: &str) {
+    match std::fs::remove_file(pidfile) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => crate::warn_unrecorded(reason, Err::<(), _>(error)),
+    }
+}
+
 fn run_gate_command(
     command: &str,
     context: GateCommandContext<'_>,
@@ -3580,9 +3592,15 @@ fn run_gate_command(
             unsafe {
                 libc::killpg(child.id() as i32, libc::SIGKILL);
             }
-            let _ = child.wait();
+            crate::warn_unrecorded(
+                "reap gate child after stdout pipe setup failure",
+                child.wait(),
+            );
             if let Some(pidfile) = &pidfile {
-                let _ = std::fs::remove_file(pidfile);
+                remove_gate_pidfile_after_setup_failure(
+                    pidfile,
+                    "remove the gate pidfile after stdout pipe setup failure",
+                );
             }
             return Err(std::io::Error::other("gate stdout pipe was not created"));
         }
@@ -3595,9 +3613,15 @@ fn run_gate_command(
             unsafe {
                 libc::killpg(child.id() as i32, libc::SIGKILL);
             }
-            let _ = child.wait();
+            crate::warn_unrecorded(
+                "reap gate child after stderr pipe setup failure",
+                child.wait(),
+            );
             if let Some(pidfile) = &pidfile {
-                let _ = std::fs::remove_file(pidfile);
+                remove_gate_pidfile_after_setup_failure(
+                    pidfile,
+                    "remove the gate pidfile after stderr pipe setup failure",
+                );
             }
             return Err(std::io::Error::other("gate stderr pipe was not created"));
         }
@@ -3611,9 +3635,15 @@ fn run_gate_command(
         unsafe {
             libc::killpg(child.id() as i32, libc::SIGKILL);
         }
-        let _ = child.wait();
+        crate::warn_unrecorded(
+            "reap gate child after nonblocking pipe setup failure",
+            child.wait(),
+        );
         if let Some(pidfile) = &pidfile {
-            let _ = std::fs::remove_file(pidfile);
+            remove_gate_pidfile_after_setup_failure(
+                pidfile,
+                "remove the gate pidfile after nonblocking pipe setup failure",
+            );
         }
         return Err(error);
     }
@@ -3729,8 +3759,21 @@ fn run_gate_command(
                 &collector,
                 &drain_failed,
             );
-            let _ = done_tx.send(());
-            let _ = renewal_thread.join();
+            let shutdown_signal_failed = done_tx.send(()).is_err();
+            let renewal_thread_failed = renewal_thread.join().is_err();
+            if shutdown_signal_failed || renewal_thread_failed {
+                let mut error = fatal_resource_error
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if error.is_none() {
+                    *error = Some(if renewal_thread_failed {
+                        "gate resource-renewal thread panicked before shutdown".to_string()
+                    } else {
+                        "gate resource-renewal thread stopped before its shutdown signal"
+                            .to_string()
+                    });
+                }
+            }
             let drain_deadline = Instant::now() + bounded_log::PIPE_DRAIN_GRACE;
             while !(stdout_reader.is_finished() && stderr_reader.is_finished())
                 && Instant::now() < drain_deadline
