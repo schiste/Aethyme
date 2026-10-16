@@ -597,6 +597,16 @@ mod tests {
             "local-reviewer",
         ];
         mark_args.extend(context);
+        let mut stale_mark = mark_args.clone();
+        *stale_mark.last_mut().unwrap() = &stale_version;
+        let refused = invoke(&stale_mark);
+        assert_ne!(refused["exit"], 0, "stale wave cannot dispatch: {refused}");
+        assert_eq!(
+            resolution_api::attempt_status(&fixture.store, token, "local-reviewer")
+                .unwrap()
+                .state,
+            resolution_api::ResolutionAttemptState::Exported
+        );
         let marked = invoke(&mark_args);
         assert_eq!(marked["exit"], 0, "{marked}");
         assert_eq!(marked["value"]["status"]["state"], "dispatching");
