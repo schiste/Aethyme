@@ -78,7 +78,7 @@ Failing to read the source for any other reason (a Git failure, I/O) is an `Err`
 | Refused | `untrusted_policy` | Legacy: the gate policy at the baseline is untrusted, and submit refuses too |
 | Refused | `unsafe_plan` | Legacy: commit provenance is ambiguous, and submit refuses the same plan |
 | Refused | `unknown_base`, `dependency_cycle`, `missing_input`, `competing_revisions`, `budget_exhausted`, `inseparable_selection` | Reserved for the composer (§7.2, §7.3) |
-| Unsupported | `merge_commit` | Legacy: a pending commit with two or more parents. Submit refuses with `UnsupportedSubmissionCommit` |
+| Unsupported | `merge_commit` | Legacy: a pending merge whose complete owned history cannot be proven on current integration (or an octopus merge). Submit refuses with `UnsupportedSubmissionCommit` |
 | Unsupported | `commit_shape` | Legacy: a pending root commit (no parent). Submit refuses with `UnsupportedSubmissionCommit` |
 | Unsupported | `snapshot_entry` | The candidate holds something a #652 snapshot cannot name: a gitlink, or a path #652 rejects |
 | Unsupported | `transforming_attribute` | A candidate path has `filter`, `working-tree-encoding` or `ident`, which the archive refuses to retain |
@@ -134,7 +134,8 @@ then runs the real `submit` on the same state:
 | Clean merge after another promotion | `candidate`: same tree, baseline and source; subject equals the promoted commit's snapshot | promoted |
 | Same line edited twice | `conflict` naming `shared.txt` and the session commit | `Conflict`, same path and commit |
 | Empty commit | `no_change` | `no_changes`, not promoted |
-| Merge commit in the session | `merge_commit` | `UnsupportedSubmissionCommit` |
+| Fully owned two-parent merge based on current integration | `candidate`: exact session tree | verified and promoted with the source DAG retained |
+| Pending merge without a complete owned-history proof | `merge_commit` | `UnsupportedSubmissionCommit` |
 | Root commit merged in from unrelated history | `commit_shape` | `UnsupportedSubmissionCommit`, 0 parents |
 | History rewritten off the recorded baseline | `unsafe_plan` | `UnsafeSubmissionPlan` |
 | Checkout switched to another branch | `checkout_drift` | `SessionCheckoutDrift` |
@@ -184,8 +185,10 @@ checks.
 - **Overlap classification budget.** Both classify within `CLASSIFY_BUDGET`. Submit starts
   from the cached verdicts, the adapter from none. A pass cut short by the budget treats an
   unclassified pair as low severity in both.
-- **Metadata of the candidate commit.** It has the same tree and parent as submit's
-  verification commit, but a different message (`chore(broker): candidate for session N`)
+- **Metadata of the candidate commit.** It has the same tree and first parent as submit's
+  verification commit. For a proven owned merge, submit also retains the exact source
+  HEAD as a second parent; the read-only candidate keeps its single baseline parent.
+  It has a different message (`chore(broker): candidate for session N`)
   and broker-only attribution. Submit's verification commit carries the promotion subject,
   the agent's `Co-Authored-By` trailer, and the contract decision and justification copied
   from the pending commits. The contract gate reads that commit, so when #692 routes submit

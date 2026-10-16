@@ -757,11 +757,11 @@ pub struct GateResult {
 /// details JSON that older readers still consume.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct VerificationCandidate {
-    /// Commit the candidate was replayed onto.
+    /// Exact integration base the candidate was verified against.
     pub base: String,
-    /// Session-owned commits replayed into this candidate, in replay order.
+    /// Session-owned pending commits incorporated in provenance order.
     pub inputs: Vec<String>,
-    /// Resulting tree written by the replay.
+    /// Exact resulting tree, from replay or a fully owned source DAG.
     pub tree: String,
     /// Commit object whose tree was gated.
     pub commit: String,
