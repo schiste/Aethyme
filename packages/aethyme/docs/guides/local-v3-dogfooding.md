@@ -31,11 +31,15 @@ broker-managed branches and worktrees of this same Git repository.
    the pair in a repository-scoped, immutable runtime directory and select the
    pair together. Preserve the previous pair for diagnosis; a binary rollback
    does not authorize a database downgrade.
-5. Make participating agents use that runtime directory at the front of their
-   clean PATH, so CLI, hooks and engine subprocesses resolve the same pair.
+5. Resolve the selected runtime directory once per agent and put its immutable
+   version's `bin` directory at the front of the clean PATH. Pin that resolved
+   path for the operation so CLI, hooks and engine subprocesses use the same
+   pair even if a later deployment changes the selection.
 6. Run `aethyme collab status --json` against the actual checkout. Confirm
    `config_source` is `committed`, policy is `advisory`, and the required-capture
    fence has not been raised. Missing state before the first submit is normal.
+   Run `aethyme certify --json` and confirm `certify.config` recognizes the
+   collaboration section without an unknown-key warning.
 
 ## Use it for real work
 
