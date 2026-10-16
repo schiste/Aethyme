@@ -64,11 +64,6 @@ impl Broker {
     /// proven the path sits under the broker-owned root, so this only has to
     /// establish which repository the remains belong to, not that they are safe
     /// to touch.
-    pub(super) fn is_orphaned_worktree_of_this_repository(&self, path: &Path) -> bool {
-        self.is_orphaned_worktree_of_this_repository_checked(path)
-            .unwrap_or(false)
-    }
-
     pub(super) fn is_orphaned_worktree_of_this_repository_checked(
         &self,
         path: &Path,
@@ -114,11 +109,6 @@ impl Broker {
             Err(error) => Err(ownership_inspection_error(candidate, "resolve", error)),
         };
         Ok(canonical(claimed_common_dir)? == canonical(&expected)?)
-    }
-
-    pub(super) fn worktree_root_marker_matches(&self, root: &Path) -> bool {
-        self.worktree_root_marker_matches_checked(root)
-            .unwrap_or(false)
     }
 
     pub(super) fn worktree_root_marker_matches_checked(

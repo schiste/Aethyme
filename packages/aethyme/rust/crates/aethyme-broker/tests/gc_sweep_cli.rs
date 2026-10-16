@@ -1748,7 +1748,7 @@ fn broker_opens_space_their_continuations_of_an_unfinished_sweep() {
     // budget can finish.
     std::fs::write(
         repo.path().join(".aethyme/broker.toml"),
-        "[retention]\nartifact_reclaim_days = 0\nartifact_sweep_budget_ms = 50\n",
+        "[retention]\nartifact_reclaim_days = 0\nartifact_sweep_budget_ms = 250\n",
     )
     .unwrap();
     let before = count_entries(&target);
@@ -1756,7 +1756,14 @@ fn broker_opens_space_their_continuations_of_an_unfinished_sweep() {
     let first = run(repo.path(), container.path(), &["status"]);
     assert!(first.status.success());
     let after_first = count_entries(&target);
-    assert!(after_first < before, "the first open must make ground");
+    assert!(
+        after_first < before,
+        "the first open must make ground: before={before}, after={after_first}, partial={:?}, interrupted={:?}, stdout={}, stderr={}",
+        meta(repo.path(), SWEEP_PARTIAL),
+        meta(repo.path(), "gc.artifact_sweep.interrupted_path"),
+        String::from_utf8_lossy(&first.stdout),
+        String::from_utf8_lossy(&first.stderr),
+    );
     let paused_at = meta(repo.path(), SWEEP_PARTIAL).expect("a paused pass records when");
     assert_ne!(paused_at, "0");
 
@@ -2030,6 +2037,30 @@ fn a_remembered_parent_traversal_is_never_resumed() {
     assert_eq!(
         meta(repo.path(), "gc.artifact_sweep.interrupted_path").as_deref(),
         Some("")
+    );
+}
+
+#[test]
+fn a_valid_remembered_open_cache_stays_pending_and_untouched() {
+    let (repo, container) =
+        fixture("[retention]\nartifact_reclaim_days = 0\nartifact_sweep_budget_ms = 0\n");
+    let (_id, worktree) = quiet_open_session(repo.path(), container.path(), 30);
+    let target = worktree.join("rust/target");
+    let artifact = target.join("debug/artifact.bin");
+    let before = std::fs::read(&artifact).unwrap();
+    remember_interrupted_tree(repo.path(), &target);
+    enable_sweep(repo.path());
+
+    let report = sweep(repo.path(), container.path());
+    assert!(
+        target.is_dir(),
+        "an open session's cache remains present: {report}"
+    );
+    assert_eq!(std::fs::read(&artifact).unwrap(), before);
+    assert_eq!(
+        meta(repo.path(), "gc.artifact_sweep.interrupted_path").as_deref(),
+        Some(target.to_string_lossy().as_ref()),
+        "a valid live marker remains pending until its session closes"
     );
 }
 

@@ -349,6 +349,11 @@ fn decode_interrupted_paths(value: Option<&str>) -> Result<Vec<String>, ()> {
     Ok(unique)
 }
 
+fn has_parent_dir_component(path: &Path) -> bool {
+    path.components()
+        .any(|component| matches!(component, Component::ParentDir))
+}
+
 /// Keep a one-path marker compatible with older brokers and encode multiple
 /// interrupted trees without ambiguous path delimiters.
 fn encode_interrupted_paths(paths: &[String]) -> Option<String> {
@@ -3404,6 +3409,41 @@ impl Broker {
                 Vec::new()
             }
         };
+        let mut revoked_interrupted_paths = Vec::<RevokedInterruptedPath>::new();
+        if interrupted_paths_valid {
+            // A queued path containing `..` can never be a deletion witness.
+            // Retire it before checking liveness or touching the referenced
+            // filesystem path, so a malformed marker cannot poison recovery
+            // while its session remains open.
+            let structurally_revoked = interrupted_paths
+                .iter()
+                .filter(|path| has_parent_dir_component(Path::new(path)))
+                .cloned()
+                .collect::<Vec<_>>();
+            if !structurally_revoked.is_empty() {
+                let mut updated_paths = interrupted_paths.clone();
+                updated_paths.retain(|path| !structurally_revoked.contains(path));
+                if persist_interrupted_paths(self.store(), &updated_paths)? {
+                    interrupted_paths = updated_paths;
+                    revoked_interrupted_paths.extend(structurally_revoked.into_iter().map(
+                        |path| RevokedInterruptedPath {
+                            path,
+                            reason: "unsafe_path_components",
+                            canonical_path: None,
+                        },
+                    ));
+                } else {
+                    interrupted_paths_valid = false;
+                    scan_completed = false;
+                    blocked_interrupted_paths.extend(structurally_revoked.into_iter().map(
+                        |path| BlockedInterruptedPath {
+                            path: Some(path),
+                            reason: "queue_update_unavailable",
+                        },
+                    ));
+                }
+            }
+        }
         if interrupted_paths_valid {
             let previous_paths = interrupted_paths.clone();
             let unavailable = prune_absent_interrupted_paths(&mut interrupted_paths);
@@ -3440,7 +3480,6 @@ impl Broker {
                 }),
         );
         let mut visited_any = false;
-        let mut revoked_interrupted_paths = Vec::<RevokedInterruptedPath>::new();
         for session in sessions {
             // Checked before the session is taken, so the cursor names the
             // last session actually visited and the next pass starts here.
@@ -3561,20 +3600,21 @@ impl Broker {
             {
                 match interrupted_tree_state(&root, &path, &policy.artefact_directories) {
                     InterruptedTreeState::Resume => pending_in_worktree.push(path),
-                    InterruptedTreeState::Revoked(reason) if interrupted_paths_valid => {
-                        let path = path.to_string_lossy().into_owned();
-                        revoked_in_worktree.push(RevokedInterruptedPath {
-                            canonical_path: std::fs::canonicalize(&path).ok(),
-                            path,
-                            reason,
-                        });
-                    }
-                    InterruptedTreeState::Revoked(_) if !interrupted_paths_valid => {
-                        blocked_interrupted_paths.push(BlockedInterruptedPath {
-                            path: Some(path.to_string_lossy().into_owned()),
-                            reason: "queue_unavailable_for_revocation",
-                        });
-                        session_scan_complete = false;
+                    InterruptedTreeState::Revoked(reason) => {
+                        if interrupted_paths_valid {
+                            let path = path.to_string_lossy().into_owned();
+                            revoked_in_worktree.push(RevokedInterruptedPath {
+                                canonical_path: std::fs::canonicalize(&path).ok(),
+                                path,
+                                reason,
+                            });
+                        } else {
+                            blocked_interrupted_paths.push(BlockedInterruptedPath {
+                                path: Some(path.to_string_lossy().into_owned()),
+                                reason: "queue_unavailable_for_revocation",
+                            });
+                            session_scan_complete = false;
+                        }
                     }
                     InterruptedTreeState::Unavailable(reason) => {
                         // Without a trustworthy queue write, or when the
@@ -3808,10 +3848,9 @@ impl Broker {
             // session not visited in this bounded pass.
             scan_completed = false;
         }
-        if interrupted_paths_valid {
-            if !persist_interrupted_paths(self.store(), &interrupted_paths)? {
-                scan_completed = false;
-            }
+        if interrupted_paths_valid && !persist_interrupted_paths(self.store(), &interrupted_paths)?
+        {
+            scan_completed = false;
         }
         // Only a completed lap consumes the cadence window. Incomplete work
         // keeps the durable request/cursor pending; inline spacing limits how
@@ -5848,7 +5887,7 @@ mod tests {
             vec![first.clone(), second]
         );
         assert_eq!(
-            encode_interrupted_paths(&[first.clone()]).as_deref(),
+            encode_interrupted_paths(std::slice::from_ref(&first)).as_deref(),
             Some(first.as_str())
         );
         assert!(decode_interrupted_paths(Some("relative/target")).is_err());
