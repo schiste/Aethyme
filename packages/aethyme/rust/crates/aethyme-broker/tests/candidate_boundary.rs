@@ -292,6 +292,8 @@ fn a_fully_owned_merge_candidate_matches_the_tree_submit_gates() {
     let outcome = broker.legacy_candidate(a).unwrap();
     assert_eq!(world(root, &mut broker, &[&a_path]), before);
     let candidate = outcome.candidate().expect("fully owned merge candidate");
+    assert_eq!(candidate.mode, CompositionMode::Preserved);
+    assert_eq!(candidate.mode.code(), "preserved");
     let tree = candidate.tree.to_string();
     let submitted = broker.submit(a).unwrap();
     assert!(submitted.promoted, "{submitted:?}");

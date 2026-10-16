@@ -62,6 +62,9 @@ pub enum CompositionMode {
     Text,
     Structural,
     Hybrid,
+    /// The producer retained an exact existing source tree without merging
+    /// its content. Makes no text or structural engine claim.
+    Preserved,
     /// A bounded resolver wrote the content (#665). Never verified by being
     /// produced: the candidate is checked again as its own candidate.
     Synthesized,
@@ -73,6 +76,7 @@ impl CompositionMode {
             Self::Text => "text",
             Self::Structural => "structural",
             Self::Hybrid => "hybrid",
+            Self::Preserved => "preserved",
             Self::Synthesized => "synthesized",
         }
     }
@@ -431,6 +435,11 @@ impl Broker {
                     });
                 }
             };
+        let mode = if replay.retains_source_history() {
+            CompositionMode::Preserved
+        } else {
+            CompositionMode::Text
+        };
         Ok(CompositionOutcome::Candidate(Candidate {
             subject,
             tree: replay.tree,
@@ -439,7 +448,7 @@ impl Broker {
             baseline_source,
             inputs,
             producer: Producer::LegacyGitReplay,
-            mode: CompositionMode::Text,
+            mode,
         }))
     }
 

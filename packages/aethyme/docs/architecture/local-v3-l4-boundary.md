@@ -134,7 +134,7 @@ then runs the real `submit` on the same state:
 | Clean merge after another promotion | `candidate`: same tree, baseline and source; subject equals the promoted commit's snapshot | promoted |
 | Same line edited twice | `conflict` naming `shared.txt` and the session commit | `Conflict`, same path and commit |
 | Empty commit | `no_change` | `no_changes`, not promoted |
-| Fully owned two-parent merge based on current integration | `candidate`: exact session tree | verified and promoted with the source DAG retained |
+| Fully owned two-parent merge based on current integration | `candidate`: exact session tree, mode `preserved` | verified and promoted with the source DAG retained |
 | Pending merge without a complete owned-history proof | `merge_commit` | `UnsupportedSubmissionCommit` |
 | Root commit merged in from unrelated history | `commit_shape` | `UnsupportedSubmissionCommit`, 0 parents |
 | History rewritten off the recorded baseline | `unsafe_plan` | `UnsafeSubmissionPlan` |
@@ -223,3 +223,7 @@ checks.
 - `cargo test -p aethyme-broker --lib collaboration_archive::tests::a_commit_snapshot`:
   `snapshot_of_commit` agrees with the oracle and with `retain_snapshot`, and makes the same
   refusals with the same codes.
+
+For a fully owned source DAG, `preserved` reports that the legacy producer kept
+the exact existing tree. It makes no text or structural engine claim, including
+when that tree contains manual merge-resolution edits.

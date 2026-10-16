@@ -562,6 +562,12 @@ pub(crate) struct SubmissionReplay {
     pub(crate) conflict_details: Vec<SubmissionConflict>,
 }
 
+impl SubmissionReplay {
+    pub(crate) fn retains_source_history(&self) -> bool {
+        self.history_parent.is_some()
+    }
+}
+
 impl Broker {
     /// Build the exact plan used by submission before creating a queue entry
     /// or running gates. Replaying patches can create unreachable Git objects,
