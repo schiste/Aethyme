@@ -241,6 +241,38 @@ fn constructor_reports_reference_count_before_canonical_byte_limit() {
 }
 
 #[test]
+fn constructor_rejects_full_envelope_overflow_before_source_change_validation() {
+    let snapshot = SourceSnapshot::new(std::iter::empty::<SourceEntry>()).unwrap();
+    let contribution = ContributionId::parse(&format!("contrib:{}e", "b".repeat(25))).unwrap();
+    let capture_record_id = RecordId::parse(&format!("sha256:{}", "1".repeat(64))).unwrap();
+    let source_changes: Vec<_> = (0..13).map(|_| Value::String("x".repeat(64_000))).collect();
+    let depends_on: Vec<_> = (0..MAX_REVISION_ARRAY_ENTRIES)
+        .map(|index| RecordId::parse(&format!("sha256:{index:064x}")).unwrap())
+        .collect();
+
+    let source_changes_bytes = 2 + source_changes.len() * (64_000 + 2) + source_changes.len() - 1;
+    let depends_on_bytes = 2 + depends_on.len() * (71 + 2) + depends_on.len() - 1;
+    assert!(source_changes_bytes < MAX_CONTRIBUTION_REVISION_BYTES);
+    assert!(source_changes_bytes + depends_on_bytes > MAX_CONTRIBUTION_REVISION_BYTES);
+
+    let result = ContributionRevision::new(
+        project(),
+        contribution,
+        capture_record_id,
+        snapshot.id(),
+        snapshot.id(),
+        source_changes,
+        None,
+        depends_on,
+    );
+    assert!(matches!(
+        result,
+        Err(ContributionRevisionError::TooLarge(bytes))
+            if bytes > MAX_CONTRIBUTION_REVISION_BYTES
+    ));
+}
+
+#[test]
 fn constructor_validates_brief_digest_before_canonical_byte_limit() {
     let snapshot = SourceSnapshot::new(std::iter::empty::<SourceEntry>()).unwrap();
     let contribution = ContributionId::parse(&format!("contrib:{}e", "b".repeat(25))).unwrap();
