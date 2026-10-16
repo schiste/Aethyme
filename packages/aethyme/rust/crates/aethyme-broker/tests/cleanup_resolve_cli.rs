@@ -1,10 +1,13 @@
 //! `finish cleanup resolve <id> --archive`: preserve a closed worktree cleanup
 //! refuses, verify the archive, then remove the worktree.
 
+#[path = "common/isolation.rs"]
+mod isolation;
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-use aethyme_broker::{Broker, FinishOptions};
+use aethyme_broker::FinishOptions;
 
 const CLI: &str = env!("CARGO_BIN_EXE_broker-cli-shim");
 
@@ -31,11 +34,7 @@ fn git(dir: &Path, args: &[&str]) -> String {
 }
 
 fn run(repo: &Path, args: &[&str]) -> Output {
-    Command::new(CLI)
-        .args(args)
-        .current_dir(repo)
-        .output()
-        .unwrap()
+    isolation::command(CLI, repo, args).output().unwrap()
 }
 
 fn json(output: &Output) -> serde_json::Value {
@@ -48,8 +47,8 @@ fn json(output: &Output) -> serde_json::Value {
     serde_json::from_slice(&output.stdout).unwrap()
 }
 
-fn repo() -> tempfile::TempDir {
-    let tmp = tempfile::tempdir().unwrap();
+fn repo() -> isolation::FixtureRepo {
+    let tmp = isolation::FixtureRepo::new();
     git(tmp.path(), &["init", "-q", "-b", "main"]);
     std::fs::write(tmp.path().join("README.md"), "fixture\n").unwrap();
     std::fs::write(tmp.path().join(".gitignore"), "/.aethyme/\n/target/\n").unwrap();
@@ -62,7 +61,7 @@ fn repo() -> tempfile::TempDir {
 /// unstaged edits, untracked files (text, binary, a symlink) and ignored build
 /// output.
 fn dirty_closed_session(repo: &Path) -> (String, PathBuf) {
-    let mut broker = Broker::open(repo).unwrap();
+    let mut broker = isolation::open(repo);
     let session = broker.start_worktree("resolve fixture", None).unwrap();
     let worktree = PathBuf::from(&session.worktree_path);
     std::fs::write(worktree.join("feature.txt"), "v1\n").unwrap();
@@ -211,7 +210,7 @@ fn a_dirty_worktree_is_archived_restored_and_then_removed() {
 #[test]
 fn pending_commits_are_carried_by_a_verified_bundle() {
     let tmp = repo();
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = isolation::open(tmp.path());
     let session = broker.start_worktree("pending fixture", None).unwrap();
     let worktree = PathBuf::from(&session.worktree_path);
     std::fs::write(worktree.join("one.txt"), "1\n").unwrap();
@@ -312,7 +311,7 @@ fn a_failed_archive_leaves_the_worktree_in_place() {
 #[test]
 fn live_eligible_and_unmarked_requests_are_refused() {
     let tmp = repo();
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = isolation::open(tmp.path());
     let live = broker.start_worktree("live fixture", None).unwrap();
 
     let landed = broker.start_worktree("landed fixture", None).unwrap();
