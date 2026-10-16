@@ -1,0 +1,21 @@
+   Compiling aethyme-broker v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/complete-fresh-local-cli-bootstrap-and-c/packages/aethyme/rust/crates/aethyme-broker)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 47.26s
+     Running unittests src/lib.rs (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/integrate-reviewed-local-bare-git-servic/target/local-resume/cargo/debug/deps/aethyme_broker-0f278e0d02146111)
+
+running 1 test
+
+thread 'local_capture_notice::tests::owner_tick_marks_notice_from_old_epoch_stale_without_admission_effects' (11982629) panicked at crates/aethyme-broker/src/local_capture_notice/tests.rs:357:5:
+assertion `left == right` failed
+  left: Some("retained capture no longer matches the selected alias")
+ right: Some("authority epoch or selected target revision changed")
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test local_capture_notice::tests::owner_tick_marks_notice_from_old_epoch_stale_without_admission_effects ... FAILED
+
+failures:
+
+failures:
+    local_capture_notice::tests::owner_tick_marks_notice_from_old_epoch_stale_without_admission_effects
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1893 filtered out; finished in 0.94s
+
+error: test failed, to rerun pass `-p aethyme-broker --lib`

@@ -1,0 +1,110 @@
+AQ0 runtime and restoration addendum — final source 02510377
+
+This addendum records final-source runtime after the immutable pre-run manifest
+and formatted-v3 review. It does not edit or replace those prior artifacts.
+
+Source binding:
+  worktree: /Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/implement-experimental-d39-t66-scoped-sy
+  session/branch: 1130 / agent/implement-experimental-d39-t66-scoped-sy
+  commit: 025103777c16607639073cbf9024d2ad0c39f72d
+  tree: 5f7ef505a452b79b01faa325662102497bcb7bff
+  worktree: clean after the six restorations and final tests
+  resolver SHA-256:
+    packages/aethyme/rust/crates/aethyme-broker/src/experimental_symbol_mapping.rs
+    0263ad2f61841f041faded9780f2046cdd28cc5485deb1a57752a0c722d7604f
+  integration-test SHA-256:
+    packages/aethyme/rust/crates/aethyme-broker/tests/symbol_identity_binding.rs
+    24222dc71132d8593ab2a3e9dafbbfc1e54ffff682868c673c5e5cdd037c82b0
+  These target files are byte-identical to the formatted-v3 source/test independently
+  reviewed CLEAR by recover_review_local. Commit 025 adds only the separately
+  reviewed rustfmt diff to broker lib.rs and contracts codec/vector files.
+
+Validation at 02510377, using --locked -j4 and the shared target
+.../integrate-reviewed-local-bare-git-servic/target/local-resume/cargo:
+  cargo fmt --all --manifest-path packages/aethyme/rust/Cargo.toml -- --check
+    PASS, exit 0.
+  cargo test -p aethyme-contracts --test analysis_vectors
+    PASS, 6/6.
+  cargo test -p aethyme-contracts --test symbol_identity_vectors
+    PASS, 3/3.
+  cargo test -p aethyme-broker --test symbol_identity_binding
+    PASS, 4/4, including two actual disposable Playground Git clones and
+    unchanged existing NodeId minting inputs/results.
+  cargo clippy -p aethyme-contracts -p aethyme-broker --all-targets -- -D warnings
+    PASS, exit 0.
+  After all six mutant restorations, the three test targets above were rerun:
+    analysis vectors 6/6; symbol identity vectors 3/3; clone binding 4/4.
+  The initial non-escalated contracts attempt is preserved separately as
+  /private/tmp/aq0-02510377-contract-positives.txt, exit 101 before tests due
+  shared-target .cargo-build-lock permission denial (0 tests, no validation
+  credit). Retrying the identical command/env/target with the parent-authorized
+  narrow escalation passed; no source changes occurred between.
+
+Final positive log SHA-256:
+  /private/tmp/aq0-02510377-restored-contract-positives.txt
+    99cd3d14887ec3348370fa9ef9d4da860342cf492dfa0c00daf816ada39cabc2
+  /private/tmp/aq0-02510377-restored-clone-binding.txt
+    1816b5c7f81c20ce6ecfed4e4ac23086d76467bd90873c2da1ef4b38aa2ed741
+Strict scoped Clippy log:
+  /private/tmp/aq0-02510377-scoped-clippy.txt
+    74b179e39fadf17b69080557076bbbf9e0ceee7891921b87dcfe48f8e5b302c4
+
+Six one-predicate controls:
+  01-predecode-count, patch 77d7f4a9…:
+    killed the eight-malformed-input early-bound assertion (0 passed, 1 failed).
+  02-right-source-binding-v2, patch fbc1b8c4…:
+    killed SourceMismatch's exact captured-clone reason; removing this check
+    falls through to observation_binding_mismatch (0 passed, 1 failed).
+  03-profile-binding-v2, patch 4a44785c…:
+    killed ProfileMismatch's captured-clone reason; removing this check
+    produces EstablishedWithinBinding (0 passed, 1 failed).
+  04-claim-origin-refs, patch 49c160c2…:
+    killed wrong-evidence closure's evidence_set_not_exact assertion
+    (0 passed, 1 failed).
+  05-right-origin-record, patch 692df77b…:
+    killed OriginMismatch's origin_binding_mismatch assertion; without this
+    predicate that case produces EstablishedWithinBinding (0 passed, 1 failed).
+  06-proposed-state, patch 1f6db2f9…:
+    killed the established wire claim's claim_not_proposed assertion
+    (0 passed, 1 failed).
+  For each isolated mutation, the runner used a unique mktemp source backup and
+  EXIT/HUP/INT/TERM restoration trap, touched the resolver before the mutant and
+  after restoration, verified restored resolver/test hashes, and ran
+  git diff --exit-code on both target files. All six restored source logs report
+  resolver SHA 0263ad2f… and test SHA 24222dc7…; each restored mtime exceeds the
+  pre-mutation mtime. No fixture or other guard was modified.
+  Exact per-mutant and restore logs are under /private/tmp/aq0-02510377-mutant-*.
+  The complete patch inventory and original six patch hashes remain in
+  /private/tmp/aq0-mutants-1c763a10/manifest.txt (SHA-256
+  cfca2e5e565bbd803cf607729038ecc0172d4d146198bd12ddb73d34826fb3f5);
+  historical findings/addenda there remain immutable.
+
+Scope:
+  This qualifies the experimental D39/T66 mapping boundary and T78 conservative
+  baseline at the stated source. It does not close T01-T06 wholesale, D10-D12,
+  or D32. Optional semantic producer profiles remain disabled/unqualified.
+
+Per-attempt log checksums (SHA-256):
+  denied zero-test attempt:
+    aq0-02510377-contract-positives.txt
+    6b3912d83b92ec44f1b105e6b6f715cc4d7cf55a9b13bec14f40dff30c37d786
+  mutant 01: cd4875ba52db9bcb79f78aae31afb9476c5e2969f2daef03126560d50f1a3f33
+    restore: 923a8c0155a2344f790dc81cf081ef24a07317fd38d92ef9a0f51cc6ec9ebf47
+  mutant 02: 2ddc20f868fcb3d251d05a62ce757185df9729c06f946db911c1bbc4d76b8ee4
+    restore: 1af322955cdd725581f4034046886db9bddd75b974ac0a58d295b519e902feab
+  mutant 03: a96d10725f8fb0ea339ecfee017106520ed373cdb580fbf2925640eb11ddebb5
+    restore: 1002522dc38063c8f83617b9e59a2e3ff6f95cc027408699ad1c6f103b252326
+  mutant 04: cf5928e5a7b6fa16809267fc3ad977d1f74979d8d432dadc7b1b7a09a8493a85
+    restore: 458783e360dbe6aff1c02e162ee9642d5f9b2bd0fa6f83b694796b08d9a79483
+  mutant 05: 350bddc1e33eb3880b84bb115716d19eedb044542408dc2e5c0685646807cb19
+    restore: 48e820e808a1de115b86081634cbec12472189a39acdfa441afada9b3e8c4ddf
+  mutant 06: 91640d8ce671deb86e5fd8fafb9d3589f51be4b88a60462a77f93713a88e650c
+    restore: 906105c4b80d6bd3c2d4db4812227627cc50b6accc40a1c30313599e811ecf5c
+
+Mutant source snapshots and mtime invalidation (resolver SHA-256):
+  01 predecode-count: 2ce93fec7a54f97b0f6025d7e1a274920e7b5e9ada86450c8869809ce7014075; mtime 1792108678 -> 1792109253 -> restored 1792109277.
+  02 right-source-binding: 666752027d65b9f43ea040acfd665af5f7646a141ab258194c06fd77382c874a; mtime 1792109277 -> 1792109286 -> restored 1792109311.
+  03 profile-binding: 2810bf0da8b65eefc8edbdd1ce70cba2188ba5c226c0e99fbd5b86ac5bf626ce; mtime 1792109311 -> 1792109315 -> restored 1792109339.
+  04 claim-origin-refs: e1659aeca421113571c0e388ea7b2dd0785946ffcf2d0f17652242321c2b0e54; mtime 1792109339 -> 1792109345 -> restored 1792109369.
+  05 right-origin-record: f9a6e481c5ffa9fa38484c587990b16dc9ac63f45279dcea194e0ebdd0a7c35e; mtime 1792109369 -> 1792109373 -> restored 1792109397.
+  06 proposed-state: b03ebcaad0134f401912d525b1ba75b5a6f428f93c3868e337aa7c477da118a1; mtime 1792109397 -> 1792109401 -> restored 1792109424.

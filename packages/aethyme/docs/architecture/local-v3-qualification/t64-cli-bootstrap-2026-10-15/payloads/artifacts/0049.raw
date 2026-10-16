@@ -1,0 +1,11 @@
+--- a/packages/aethyme/rust/crates/aethyme-broker/src/local_capture_notice.rs
++++ b/packages/aethyme/rust/crates/aethyme-broker/src/local_capture_notice.rs
+@@ -276,7 +276,7 @@
+     let _authority = crate::local_authority::guard(store, &witness.epoch)?;
+     let _ingress = ingress_lock(store)?;
+     let revision = target::load_revision(store, revision_id)?;
+-    if revision.target != target_name || revision.issuer != issuer {
++    if revision.target != target_name {
+         return Err(NoticeError::Stale);
+     }
+     let current = target::status(store, target_name)?;

@@ -1,0 +1,40 @@
+{
+  "captures": {
+    "attention": [],
+    "by_state": {
+      "acknowledged": 1
+    },
+    "reserved_bytes": 0
+  },
+  "collaboration_fence": null,
+  "config_source": "working_copy",
+  "enabled": true,
+  "gc": {
+    "unfinished_generations": 0
+  },
+  "next_actions": [],
+  "policy": "advisory",
+  "project": "proj-collabtest",
+  "schema": "aethyme.collab-status/experimental-v0",
+  "state": {
+    "durability": {
+      "filesystem": "apfs",
+      "full_fsync": true,
+      "journal_mode": "wal",
+      "local": true,
+      "supported": true,
+      "synchronous": 2
+    },
+    "initialized": true,
+    "min_compatible_schema": 25,
+    "needs_migration": false,
+    "project_dir": "/private/tmp/1129-schema25-playground-v1/state/collaboration/proj-collabtest",
+    "receipt_label": "local_durable",
+    "root": "/private/tmp/1129-schema25-playground-v1/state/collaboration",
+    "root_source": {
+      "kind": "host_state",
+      "setting": "aethyme_host_state_dir"
+    },
+    "schema_version": 25
+  }
+}

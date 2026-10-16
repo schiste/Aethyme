@@ -1,0 +1,35 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.10s
+     Running tests/symbol_identity_binding.rs (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/integrate-reviewed-local-bare-git-servic/target/local-resume/cargo/debug/deps/symbol_identity_binding-00ddf30bf8dc4d61)
+
+running 1 test
+
+thread 'path_moves_renames_copies_and_historical_overload_collisions_stay_unknown' (12260742) panicked at crates/aethyme-broker/tests/symbol_identity_binding.rs:210:5:
+"convert" is declared in "src/lib.ts"
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+             at /rustc/ac68faa20c58cbccd01ee7208bf3b6e93a7d7f96/library/std/src/panicking.rs:689:5
+   1: core::panicking::panic_fmt
+             at /rustc/ac68faa20c58cbccd01ee7208bf3b6e93a7d7f96/library/core/src/panicking.rs:80:14
+   2: node_ids
+             at ./tests/symbol_identity_binding.rs:210:5
+   3: mapping_fixture_named
+             at ./tests/symbol_identity_binding.rs:279:22
+   4: path_moves_renames_copies_and_historical_overload_collisions_stay_unknown
+             at ./tests/symbol_identity_binding.rs:596:22
+   5: {closure#0}
+             at ./tests/symbol_identity_binding.rs:546:79
+   6: call_once<symbol_identity_binding::path_moves_renames_copies_and_historical_overload_collisions_stay_unknown::{closure_env#0}, ()>
+             at /rustc/ac68faa20c58cbccd01ee7208bf3b6e93a7d7f96/library/core/src/ops/function.rs:250:5
+   7: <fn() -> core::result::Result<(), alloc::string::String> as core::ops::function::FnOnce<()>>::call_once
+             at /rustc/ac68faa20c58cbccd01ee7208bf3b6e93a7d7f96/library/core/src/ops/function.rs:250:5
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+test path_moves_renames_copies_and_historical_overload_collisions_stay_unknown ... FAILED
+
+failures:
+
+failures:
+    path_moves_renames_copies_and_historical_overload_collisions_stay_unknown
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.16s
+
+error: test failed, to rerun pass `-p aethyme-broker --test symbol_identity_binding`

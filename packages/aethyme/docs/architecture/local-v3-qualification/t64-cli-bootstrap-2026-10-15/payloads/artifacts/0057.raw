@@ -1,0 +1,458 @@
+{
+  "schema": "aethyme.local-positive-manifest/v1",
+  "session": 1129,
+  "branch": "agent/complete-fresh-local-cli-bootstrap-and-c",
+  "commit": "3af335ab87618cc7fcb92a4a5b01ad23edb633d9",
+  "tree": "a414406951d28197ed101308914c379fe1678cbd",
+  "freeze": {
+    "path": "/private/tmp/1129-final-cli-validation-freeze-v5.json",
+    "sha256": "f8dd2177a1a026cb88fdb978a06b823d09e4f60f22732ccc22f8f670d9b5e0c9"
+  },
+  "recorder": {
+    "path": "target/local-resume/record-final-local-check-v2.py",
+    "sha256": "29d2319c55cea24d6a1c76d7038b4bfd96cc105ae17e7ef4c00ef927d19286bc"
+  },
+  "runtime_policy": {
+    "cargo_flags": "--locked -j4",
+    "cwd": "packages/aethyme/rust",
+    "one_cargo_command_at_a_time": true,
+    "shared_target": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/integrate-reviewed-local-bare-git-servic/target/local-resume/cargo",
+    "tmp_base": "/private/tmp"
+  },
+  "results": [
+    {
+      "label": "20261016T-1129-sensitive-module-corrected-fixture",
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-j4",
+        "-p",
+        "aethyme-broker",
+        "collaboration_sensitive::tests::"
+      ],
+      "selected": 33,
+      "passed": 33,
+      "failed": 0,
+      "ignored": 0,
+      "exit": 0,
+      "source_unchanged": true,
+      "log": "target/local-resume/retention-checks/20261015T230203Z-20261016T-1129-sensitive-module-corrected-fixture-bf425401/command.log",
+      "log_sha256": "5d945b50a93980e9623cd02efb585564024c49ef8901dbd8f665c59c0e413ecf"
+    },
+    {
+      "label": "20261016T-1129-local-generation",
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-j4",
+        "-p",
+        "aethyme-broker",
+        "local_generation::tests::"
+      ],
+      "selected": 16,
+      "passed": 16,
+      "failed": 0,
+      "ignored": 0,
+      "exit": 0,
+      "source_unchanged": true,
+      "log": "target/local-resume/retention-checks/20261015T230442Z-20261016T-1129-local-generation-be47b775/command.log",
+      "log_sha256": "f349582f4cc09db7edf06f8617dc475ce3572e7434d18bea37084410d6cfbf5c"
+    },
+    {
+      "label": "20261016T-1129-local-handoff",
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-j4",
+        "-p",
+        "aethyme-broker",
+        "local_handoff::tests::"
+      ],
+      "selected": 19,
+      "passed": 18,
+      "failed": 0,
+      "ignored": 1,
+      "exit": 0,
+      "source_unchanged": true,
+      "log": "target/local-resume/retention-checks/20261015T230511Z-20261016T-1129-local-handoff-72ea6008/command.log",
+      "log_sha256": "7783047c07dc6d727a3c402f3757cf859acab2644cf0a0d138880692ed5c482c"
+    },
+    {
+      "label": "20261016T-1129-local-capture-notice",
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-j4",
+        "-p",
+        "aethyme-broker",
+        "local_capture_notice::tests::"
+      ],
+      "selected": 5,
+      "passed": 5,
+      "failed": 0,
+      "ignored": 0,
+      "exit": 0,
+      "source_unchanged": true,
+      "log": "target/local-resume/retention-checks/20261015T230603Z-20261016T-1129-local-capture-notice-d93abb21/command.log",
+      "log_sha256": "47fce25ddb9bc59bce511a582231ec8fd1fdb2433ba24277278a2272a0110019"
+    },
+    {
+      "label": "20261016T-1129-service-permit",
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-j4",
+        "-p",
+        "aethyme-broker",
+        "local_controller::service::permit_tests::existing_producer_appointment_preserves_generation_and_refuses_revocation",
+        "--",
+        "--exact"
+      ],
+      "selected": 1,
+      "passed": 1,
+      "failed": 0,
+      "ignored": 0,
+      "exit": 0,
+      "source_unchanged": true,
+      "log": "target/local-resume/retention-checks/20261015T230618Z-20261016T-1129-service-permit-34bfd0d4/command.log",
+      "log_sha256": "962fe07bde97458812acb587244886c57289888f58de07a6fbf0b65639f4f666"
+    },
+    {
+      "label": "20261016T-1129-verifier-prepare-oversized",
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-j4",
+        "-p",
+        "aethyme-broker",
+        "collaboration_cli::lifecycle::tests::verifier_prepare_refuses_oversized_literal_inventory_before_opening_state",
+        "--",
+        "--exact"
+      ],
+      "selected": 1,
+      "passed": 1,
+      "failed": 0,
+      "ignored": 0,
+      "exit": 0,
+      "source_unchanged": true,
+      "log": "target/local-resume/retention-checks/20261015T230636Z-20261016T-1129-verifier-prepare-oversized-c1f59b3b/command.log",
+      "log_sha256": "57cbc8e1e690e613a22ed544d6f03f4d70ec93a452656e52415cdf98943c729d"
+    },
+    {
+      "label": "20261016T-1129-verifier-prepare-preflight",
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-j4",
+        "-p",
+        "aethyme-broker",
+        "execution_verifier::prepare_preflight_tests::prepare_rejects_nonzero_exit_before_runtime_or_capture_side_effects",
+        "--",
+        "--exact"
+      ],
+      "selected": 1,
+      "passed": 1,
+      "failed": 0,
+      "ignored": 0,
+      "exit": 0,
+      "source_unchanged": true,
+      "log": "target/local-resume/retention-checks/20261015T230645Z-20261016T-1129-verifier-prepare-preflight-a803d8ba/command.log",
+      "log_sha256": "26686323324ebfae39feea8cbde77e525f6cacd3ee4ca104014c3c281c7dbe57"
+    },
+    {
+      "label": "20261016T-1129-capture-release-exact",
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-j4",
+        "-p",
+        "aethyme-broker",
+        "contribution_root_release_"
+      ],
+      "selected": 2,
+      "passed": 2,
+      "failed": 0,
+      "ignored": 0,
+      "exit": 0,
+      "source_unchanged": true,
+      "log": "target/local-resume/retention-checks/20261015T230702Z-20261016T-1129-capture-release-exact-a7db6c6f/command.log",
+      "log_sha256": "d9c670ad7a637601c923d107854659c3fd57890857f5a2eeb671efdbb704d813"
+    },
+    {
+      "label": "20261016T-1129-gc-dispatch-root",
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-j4",
+        "-p",
+        "aethyme-broker",
+        "native_gates::tests::dispatching_and_unknown_jobs_stay_rooted_without_a_process_tree_proof",
+        "--",
+        "--exact"
+      ],
+      "selected": 1,
+      "passed": 1,
+      "failed": 0,
+      "ignored": 0,
+      "exit": 0,
+      "source_unchanged": true,
+      "log": "target/local-resume/retention-checks/20261015T230716Z-20261016T-1129-gc-dispatch-root-e6067729/command.log",
+      "log_sha256": "d3dcaeb2820688001382eb611d4cf5720c85569d940f2ba336c4b6564b47e080"
+    },
+    {
+      "label": "20261016T-1129-target-retention-permit",
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-j4",
+        "-p",
+        "aethyme-broker",
+        "local_target::tests::artifact_retention_permit_requires_each_exact_guard_and_owner_epoch",
+        "--",
+        "--exact"
+      ],
+      "selected": 1,
+      "passed": 1,
+      "failed": 0,
+      "ignored": 0,
+      "exit": 0,
+      "source_unchanged": true,
+      "log": "target/local-resume/retention-checks/20261015T230731Z-20261016T-1129-target-retention-permit-138c8213/command.log",
+      "log_sha256": "737ec2cefd55c9aaa04b3173eaf07bb8b776b1a8e3cd3152183c1ddf9d3cd016"
+    },
+    {
+      "label": "20261016T-1129-bootstrap-route-help",
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-j4",
+        "-p",
+        "aethyme-broker",
+        "collaboration_cli::tests::bootstrap_routes_are_named_and_documented",
+        "--",
+        "--exact"
+      ],
+      "selected": 1,
+      "passed": 1,
+      "failed": 0,
+      "ignored": 0,
+      "exit": 0,
+      "source_unchanged": true,
+      "log": "target/local-resume/retention-checks/20261015T230744Z-20261016T-1129-bootstrap-route-help-cfb3885b/command.log",
+      "log_sha256": "c4a5caa8f7ff21b35ca4ce241e4fbacdd345000c43544bbac4d375dea04f2ef0"
+    },
+    {
+      "label": "20261016T-1129-private-current-qualification",
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-j4",
+        "-p",
+        "aethyme-broker",
+        "local_acceptance::tests::private_current_qualification_requires_verifier_and_refuses_revocation",
+        "--",
+        "--exact"
+      ],
+      "selected": 1,
+      "passed": 1,
+      "failed": 0,
+      "ignored": 0,
+      "exit": 0,
+      "source_unchanged": true,
+      "log": "target/local-resume/retention-checks/20261015T230755Z-20261016T-1129-private-current-qualification-80c72081/command.log",
+      "log_sha256": "54e0d8b9aea3218155c21a4785b5d4b1a53cc8e1091ce31223867e4f6c43501f"
+    },
+    {
+      "label": "20261016T-1129-service-status-recovery",
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-j4",
+        "-p",
+        "aethyme-broker",
+        "service_status_"
+      ],
+      "selected": 3,
+      "passed": 3,
+      "failed": 0,
+      "ignored": 0,
+      "exit": 0,
+      "source_unchanged": true,
+      "log": "target/local-resume/retention-checks/20261015T230811Z-20261016T-1129-service-status-recovery-a0c7cb0a/command.log",
+      "log_sha256": "307e95d5ae891fd8ea4f861359036a0aa00af4c7c34ebc45da6b4ef5aa98aa11"
+    },
+    {
+      "label": "20261016T-1129-cli-help-snapshots",
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-j4",
+        "-p",
+        "aethyme-cli",
+        "--test",
+        "help_snapshots",
+        "help_surface_matches_snapshots",
+        "--",
+        "--exact"
+      ],
+      "selected": 1,
+      "passed": 1,
+      "failed": 0,
+      "ignored": 0,
+      "exit": 0,
+      "source_unchanged": true,
+      "log": "target/local-resume/retention-checks/20261015T230827Z-20261016T-1129-cli-help-snapshots-3d02ed98/command.log",
+      "log_sha256": "7603c065d08eac0439ea332aa0d19ea02e6cfc1d582bd30d789acb0673268117"
+    },
+    {
+      "label": "20261016T-1129-cli-help-everywhere",
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-j4",
+        "-p",
+        "aethyme-cli",
+        "--test",
+        "help_everywhere",
+        "help_works_everywhere_without_side_effects",
+        "--",
+        "--exact"
+      ],
+      "selected": 1,
+      "passed": 1,
+      "failed": 0,
+      "ignored": 0,
+      "exit": 0,
+      "source_unchanged": true,
+      "log": "target/local-resume/retention-checks/20261015T230902Z-20261016T-1129-cli-help-everywhere-32dc84e1/command.log",
+      "log_sha256": "231beec99b1c417d6754aea754a1229905a1ab9ee1ccc3a3efe38242688ff099"
+    },
+    {
+      "label": "20261016T-1129-cli-export",
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-j4",
+        "-p",
+        "aethyme-cli",
+        "--test",
+        "collab_cli",
+        "lifecycle_export_is_exclusive_and_verified_as_historical_source_only",
+        "--",
+        "--exact"
+      ],
+      "selected": 1,
+      "passed": 1,
+      "failed": 0,
+      "ignored": 0,
+      "exit": 0,
+      "source_unchanged": true,
+      "log": "target/local-resume/retention-checks/20261015T230909Z-20261016T-1129-cli-export-5c61b0a3/command.log",
+      "log_sha256": "81de3b5543266ba780b65935abece6db2ac0984220feaf1af0cbbf26d11d9727"
+    },
+    {
+      "label": "20261016T-1129-deprecated-spelling",
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-j4",
+        "-p",
+        "aethyme-testkit",
+        "--test",
+        "deprecated_spelling_callers",
+        "no_shipped_caller_uses_a_deprecated_broker_spelling",
+        "--",
+        "--exact"
+      ],
+      "selected": 1,
+      "passed": 1,
+      "failed": 0,
+      "ignored": 0,
+      "exit": 0,
+      "source_unchanged": true,
+      "log": "target/local-resume/retention-checks/20261015T230946Z-20261016T-1129-deprecated-spelling-1b4822c8/command.log",
+      "log_sha256": "a6937066f1cb1f4c7dfd0c1b223d644f79b2d1280e1041654ffb502c3ec46e07"
+    },
+    {
+      "label": "20261016T-1129-docs-hygiene",
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-j4",
+        "-p",
+        "aethyme-testkit",
+        "--test",
+        "docs_hygiene",
+        "no_unverifiable_python_examples",
+        "--",
+        "--exact"
+      ],
+      "selected": 1,
+      "passed": 1,
+      "failed": 0,
+      "ignored": 0,
+      "exit": 0,
+      "source_unchanged": true,
+      "log": "target/local-resume/retention-checks/20261015T230953Z-20261016T-1129-docs-hygiene-7590159f/command.log",
+      "log_sha256": "53771638ab40f7fe90fbb9998c38a338acc27944e8aa0088f86c9f047b36788e"
+    },
+    {
+      "label": "20261016T-1129-execution-verifier-module",
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-j4",
+        "-p",
+        "aethyme-broker",
+        "execution_verifier::tests::"
+      ],
+      "selected": 13,
+      "passed": 12,
+      "failed": 0,
+      "ignored": 1,
+      "exit": 0,
+      "source_unchanged": true,
+      "log": "target/local-resume/retention-checks/20261015T231041Z-20261016T-1129-execution-verifier-module-df630c65/command.log",
+      "log_sha256": "f8cc0772911e474ea3133e5897cee7ec6dc7903d94b44cdeb25a1b24f34514fc"
+    }
+  ],
+  "preserved_sensitive_failures": [
+    {
+      "selected": 28,
+      "passed": 25,
+      "failed": 3,
+      "ignored": 0,
+      "exit": 101,
+      "log_sha256": "cfaa178eb8a1c2e3a55c5bbc130a5f544024c49ef8901dbd8f665c59c0e413ecf",
+      "run": "20261015T224817Z-1129-fixed-sensitive-module-b65b979b"
+    },
+    {
+      "selected": 33,
+      "passed": 32,
+      "failed": 1,
+      "ignored": 0,
+      "exit": 101,
+      "log_sha256": "dedbafc78bd1a4f7601debc74dd18fcfc14f8a6d47873329f742ab904ce29767",
+      "run": "20261015T225751Z-1129-final-sensitive-module-v4-5a134a74"
+    }
+  ]
+}

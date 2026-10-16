@@ -1,0 +1,19 @@
+   Compiling aethyme-broker v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/complete-fresh-local-cli-bootstrap-and-c/packages/aethyme/rust/crates/aethyme-broker)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 49.80s
+     Running unittests src/lib.rs (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/integrate-reviewed-local-bare-git-servic/target/local-resume/cargo/debug/deps/aethyme_broker-0f278e0d02146111)
+
+running 1 test
+
+thread 'collaboration_sensitive::tests::capture_notice_ingress_lock_control_refuses_nonempty_file' (12060663) panicked at crates/aethyme-broker/src/collaboration_sensitive.rs:3700:9:
+assertion failed: capture_notice_ingress_lock_control_path(root.path()).is_err()
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test collaboration_sensitive::tests::capture_notice_ingress_lock_control_refuses_nonempty_file ... FAILED
+
+failures:
+
+failures:
+    collaboration_sensitive::tests::capture_notice_ingress_lock_control_refuses_nonempty_file
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1893 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p aethyme-broker --lib`

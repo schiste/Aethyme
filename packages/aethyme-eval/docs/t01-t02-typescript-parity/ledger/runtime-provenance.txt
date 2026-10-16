@@ -1,0 +1,7 @@
+Node runtime selected by the clean PATH used for qualification:
+Version: v26.8.2
+Path: /opt/homebrew/bin/node
+Heap cap for every qualification command: --max-old-space-size=256
+Timeout utility: /usr/bin/timeout
+Qualification deadline: 60 seconds; TERM then KILL after 5 seconds.
+Network/provider variables are removed for each harness run with env -i.
