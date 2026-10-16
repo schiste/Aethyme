@@ -20,6 +20,14 @@ description: Use after repo-onboarding or Explore when moving from orientation i
 
 ## Validation Checklist
 
+- Keep matching `.claude/skills` and `.codex/skills` files byte-identical when
+  editing a mirrored skill; the skill-surface parity check enforces this.
+- For tests that create broker worktrees, configure a fixture-owned worktree root
+  outside the temporary repository (for example, a sibling under the fixture
+  TempDir); pass it explicitly to CLI children too. An inherited
+  `AETHYME_WORKTREE_ROOT` can otherwise place worktrees outside the fixture and
+  leave stale Git pointers after teardown. Assert paths and cleanup; avoid
+  process-wide environment mutation in parallel tests.
 - Run the fastest relevant test command first.
 - Check likely entrypoints and impacted callers before finishing.
 - Re-run lint/build only after the focused validation passes.
