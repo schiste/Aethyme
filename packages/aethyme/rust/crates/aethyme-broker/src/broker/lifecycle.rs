@@ -1524,7 +1524,7 @@ impl Broker {
         };
 
         let log_dir = self.main_root.join(".aethyme/logs");
-        let (log_path, log_file) = match create_agent_log(&log_dir, &slug) {
+        let (created_log, log_file) = match create_agent_log(&log_dir, &slug) {
             Ok(log) => log,
             Err(error) => {
                 return Err(start_agent_setup_failure(
@@ -1537,6 +1537,7 @@ impl Broker {
                 ));
             }
         };
+        let log_path = created_log.path.clone();
         let log_clone = match log_file.try_clone() {
             Ok(log) => log,
             Err(source) => {
@@ -1549,7 +1550,7 @@ impl Broker {
                     &worktree_path,
                     &branch,
                     &base,
-                    Some(&log_path),
+                    Some(&created_log),
                     error,
                 ));
             }
@@ -1563,7 +1564,7 @@ impl Broker {
                     &worktree_path,
                     &branch,
                     &base,
-                    Some(&log_path),
+                    Some(&created_log),
                     error,
                 ));
             }
@@ -1625,7 +1626,7 @@ impl Broker {
                             &worktree_path,
                             &branch,
                             &base,
-                            Some(&log_path),
+                            Some(&created_log),
                             primary,
                         ));
                     }
@@ -2327,10 +2328,10 @@ impl GatedAgent {
         }
         #[cfg(not(unix))]
         {
-            let _ = force;
+            let action = if force { "force-stopping" } else { "stopping" };
             self.child
                 .kill()
-                .map_err(|error| format!("stopping owned child {}: {error}", self.pid()))
+                .map_err(|error| format!("{action} owned child {}: {error}", self.pid()))
         }
     }
 }
@@ -2338,7 +2339,10 @@ impl GatedAgent {
 impl Drop for GatedAgent {
     fn drop(&mut self) {
         if !self.released {
-            let _ = self.abort();
+            crate::warn_unrecorded(
+                "stop and reap an unreleased gated agent during drop",
+                self.abort(),
+            );
         }
     }
 }
@@ -2396,10 +2400,69 @@ pub(super) fn spawn_blocked_agent(
     Ok(agent)
 }
 
+pub(super) struct CreatedAgentLog {
+    pub(super) path: PathBuf,
+    identity: AgentLogIdentity,
+}
+
+#[derive(Clone, Copy)]
+struct AgentLogIdentity {
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+}
+
+impl AgentLogIdentity {
+    #[cfg(unix)]
+    fn from_file(file: &File) -> std::io::Result<Self> {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let metadata = file.metadata()?;
+        if !metadata.is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "new agent log is not a regular file",
+            ));
+        }
+        Ok(Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
+    }
+
+    #[cfg(not(unix))]
+    fn from_file(_file: &File) -> std::io::Result<Self> {
+        Ok(Self {})
+    }
+
+    fn matches_path_or_absent(self, path: &Path) -> std::io::Result<bool> {
+        let metadata = match std::fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+            Err(error) => return Err(error),
+        };
+        if !metadata.file_type().is_file() {
+            return Ok(false);
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            Ok(metadata.dev() == self.device && metadata.ino() == self.inode)
+        }
+        #[cfg(not(unix))]
+        {
+            match self {
+                Self {} => Ok(false),
+            }
+        }
+    }
+}
+
 pub(super) fn create_agent_log(
     log_dir: &Path,
     slug: &str,
-) -> Result<(PathBuf, File), BrokerOpError> {
+) -> Result<(CreatedAgentLog, File), BrokerOpError> {
     std::fs::create_dir_all(log_dir).map_err(|source| {
         BrokerOpError::Store(BrokerError::Io {
             path: log_dir.to_path_buf(),
@@ -2418,7 +2481,22 @@ pub(super) fn create_agent_log(
             .create_new(true)
             .open(&path)
         {
-            Ok(file) => return Ok((path, file)),
+            Ok(file) => {
+                let identity = AgentLogIdentity::from_file(&file).map_err(|source| {
+                    let source = std::io::Error::new(
+                        source.kind(),
+                        format!(
+                            "could not capture the newly created agent log identity; retained {}: {source}",
+                            path.display()
+                        ),
+                    );
+                    BrokerOpError::Store(BrokerError::Io {
+                        path: path.clone(),
+                        source,
+                    })
+                })?;
+                return Ok((CreatedAgentLog { path, identity }, file));
+            }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(source) => return Err(BrokerOpError::Store(BrokerError::Io { path, source })),
         }
@@ -2459,10 +2537,10 @@ fn start_agent_setup_failure(
     worktree_path: &Path,
     branch: &str,
     base: &str,
-    log_path: Option<&Path>,
+    created_log: Option<&CreatedAgentLog>,
     primary: BrokerOpError,
 ) -> BrokerOpError {
-    let recovery = rollback_unregistered_start(repo, worktree_path, branch, base, log_path);
+    let recovery = rollback_unregistered_start(repo, worktree_path, branch, base, created_log);
     if recovery.is_empty() {
         primary
     } else {
@@ -2502,12 +2580,12 @@ fn inspect_partial_worktree_creation(
     }
 }
 
-fn rollback_unregistered_start(
+pub(super) fn rollback_unregistered_start(
     repo: &GitRepo,
     worktree_path: &Path,
     branch: &str,
     base: &str,
-    log_path: Option<&Path>,
+    created_log: Option<&CreatedAgentLog>,
 ) -> Vec<String> {
     let inventory = match repo.worktree_inventory() {
         Ok(inventory) => inventory,
@@ -2580,19 +2658,30 @@ fn rollback_unregistered_start(
             worktree_path.display()
         )];
     }
-    if let Some(log_path) = log_path {
-        match std::fs::remove_file(log_path) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return vec![format!(
-                    "removed the unregistered worktree and branch but retained agent log {} because removal failed: {error}",
-                    log_path.display()
-                )];
-            }
+    if let Some(created_log) = created_log {
+        if let Err(reason) = remove_created_agent_log(created_log) {
+            return vec![format!(
+                "removed the unregistered worktree and branch but retained agent log {}: {reason}",
+                created_log.path.display()
+            )];
         }
     }
     Vec::new()
+}
+
+pub(super) fn remove_created_agent_log(created_log: &CreatedAgentLog) -> Result<(), String> {
+    match created_log
+        .identity
+        .matches_path_or_absent(&created_log.path)
+    {
+        Ok(true) => match std::fs::remove_file(&created_log.path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(format!("removal failed: {error}")),
+        },
+        Ok(false) => Err("the path no longer identifies the file created by this start attempt; it was preserved".into()),
+        Err(error) => Err(format!("could not verify the created file identity: {error}; it was preserved")),
+    }
 }
 
 fn same_path(left: &Path, right: &Path) -> bool {

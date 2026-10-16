@@ -81,10 +81,13 @@ fn failed_session_registration_never_releases_the_agent_command() {
 
     let log_dir = repo_root.join(".aethyme/logs");
     if log_dir.exists() {
+        let log_count = std::fs::read_dir(log_dir).unwrap().count();
+        #[cfg(unix)]
+        assert_eq!(log_count, 0, "failed registration left its unowned log");
+        #[cfg(not(unix))]
         assert_eq!(
-            std::fs::read_dir(log_dir).unwrap().count(),
-            0,
-            "failed registration left its unowned log"
+            log_count, 1,
+            "without stable file identity, rollback should preserve the log and report it"
         );
     }
 }
@@ -124,6 +127,54 @@ fn agent_log_allocation_never_truncates_an_existing_log() {
         "same-task-2.log"
     );
     assert_eq!(std::fs::read(old_log).unwrap(), b"prior evidence");
+}
+
+#[test]
+fn rollback_preserves_a_replacement_at_the_created_agent_log_path() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo_root = temp.path().join("repo");
+    initialized_repo(&repo_root);
+    let repo = GitRepo::discover(&repo_root).unwrap();
+    let base = repo.resolve_ref("HEAD").unwrap();
+    let worktree_path = temp.path().join("agent-worktree");
+    let worktree_text = worktree_path.to_str().unwrap();
+    let branch = "agent/log-replacement";
+    run_git(
+        &repo_root,
+        &["worktree", "add", "-b", branch, worktree_text, &base],
+    );
+
+    let (created_log, created_file) = lifecycle::create_agent_log(temp.path(), "agent").unwrap();
+    std::fs::remove_file(&created_log.path).unwrap();
+    std::fs::write(&created_log.path, b"replacement evidence").unwrap();
+
+    let recovery = lifecycle::rollback_unregistered_start(
+        &repo,
+        &worktree_path,
+        branch,
+        &base,
+        Some(&created_log),
+    );
+    assert_eq!(
+        recovery.len(),
+        1,
+        "replacement should be retained with a diagnostic"
+    );
+    assert!(
+        recovery[0].contains("created by this start attempt"),
+        "{recovery:?}"
+    );
+    assert!(
+        !worktree_path.exists(),
+        "the exact clean worktree should be removed"
+    );
+    assert!(repo.resolve_ref(&format!("refs/heads/{branch}")).is_none());
+    assert_eq!(
+        std::fs::read(&created_log.path).unwrap(),
+        b"replacement evidence",
+        "rollback must preserve a replacement file"
+    );
+    drop(created_file);
 }
 
 #[cfg(unix)]
