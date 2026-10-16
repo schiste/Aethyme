@@ -2613,7 +2613,7 @@ impl Broker {
                 path: root.clone(),
                 source,
             })?;
-        let child = match Command::new(&router)
+        let _child = match Command::new(&router)
             .args(["broker", "gc", "__continue-artifacts"])
             .arg(&canonical_root)
             .current_dir(&canonical_root)
