@@ -157,14 +157,17 @@ fn resumed_legacy_wave_without_source_is_held_without_creating_a_request() {
         policy: minimal_policy(),
         deadline_ms: i64::MAX,
     };
+    let cancel = AtomicBool::new(false);
     let reason = raise_failed_check_request(
         &mut fixture.store,
-        &owner,
-        fixture._repo.path(),
-        &spec,
-        &pending.id,
-        &AtomicBool::new(false),
-        resumed.source.as_ref(),
+        FailedCheckRequestContext {
+            owner: &owner,
+            repo: fixture._repo.path(),
+            spec: &spec,
+            wave_id: &pending.id,
+            cancel: &cancel,
+            source: resumed.source.as_ref(),
+        },
         vec![FailedCheck {
             check:
                 "native-gate:unit:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"

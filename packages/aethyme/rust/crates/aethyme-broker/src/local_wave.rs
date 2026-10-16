@@ -948,9 +948,8 @@ fn validate_source_context(
             "composition source candidate does not match the current wave".into(),
         ));
     }
-    let retained_candidate =
-        archive::retained(store, &candidate.subject)?.ok_or(TargetError::Missing)?;
-    if retained_candidate.commit != candidate.commit {
+    archive::retained(store, &candidate.subject)?.ok_or(TargetError::Missing)?;
+    if archive::snapshot_of_commit(repo, &candidate.commit)?.id() != candidate.subject {
         return Err(WaveError::Invalid(
             "composition source subject and commit disagree".into(),
         ));
@@ -970,11 +969,8 @@ fn validate_source_context(
         .as_str()
         .ok_or_else(|| WaveError::Invalid("composition recipe baseline".into()))?;
     let baseline_snapshot = snapshot(baseline_snapshot)?;
-    if archive::retained(store, &baseline_snapshot)?
-        .ok_or(TargetError::Missing)?
-        .commit
-        != source.request.baseline
-    {
+    archive::retained(store, &baseline_snapshot)?.ok_or(TargetError::Missing)?;
+    if archive::snapshot_of_commit(repo, &source.request.baseline)?.id() != baseline_snapshot {
         return Err(WaveError::Invalid(
             "composition recipe baseline snapshot changed".into(),
         ));
@@ -1002,16 +998,36 @@ fn validate_source_context(
             .ok_or_else(|| WaveError::Invalid("composition recipe input result".into()))?;
         let base = snapshot(base_text)?;
         let result = snapshot(result_text)?;
+        let contribution_id = entry["id"]
+            .as_str()
+            .ok_or_else(|| WaveError::Invalid("composition recipe input id".into()))?;
+        let lineage_text = entry["lineage"]
+            .as_str()
+            .ok_or_else(|| WaveError::Invalid("composition recipe input lineage".into()))?;
+        let contribution = source
+            .request
+            .catalog
+            .iter()
+            .find(|contribution| contribution.id == contribution_id)
+            .ok_or_else(|| {
+                WaveError::Invalid("composition recipe contribution is not requested".into())
+            })?;
+        let lineage = contribution.lineage.as_ref().ok_or_else(|| {
+            WaveError::Invalid("composition recipe lineage is not retained".into())
+        })?;
+        if lineage.as_str() != lineage_text {
+            return Err(WaveError::Invalid(
+                "composition recipe lineage does not match the pinned request".into(),
+            ));
+        }
+        let retained =
+            archive::retained_contribution(store, lineage)?.ok_or(TargetError::Missing)?;
         if input.base_snapshot.as_ref() != Some(&base)
             || input.result_snapshot.as_ref() != Some(&result)
-            || archive::retained(store, &base)?
-                .ok_or(TargetError::Missing)?
-                .commit
-                != input.base
-            || archive::retained(store, &result)?
-                .ok_or(TargetError::Missing)?
-                .commit
-                != input.result
+            || retained.base.snapshot_id != base
+            || retained.result.snapshot_id != result
+            || archive::snapshot_of_commit(repo, &input.base)?.id() != base
+            || archive::snapshot_of_commit(repo, &input.result)?.id() != result
         {
             return Err(WaveError::Invalid(
                 "composition source input does not match its recipe".into(),

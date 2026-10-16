@@ -15,6 +15,34 @@ fn composed_candidate(f: &mut Fixture) -> (ControllerOwner, Wave) {
     (owner, composed.wave)
 }
 
+#[test]
+fn composition_source_accepts_content_identical_candidate_with_new_commit_locator() {
+    let mut f = Fixture::new();
+    let (owner, _) = setup(&mut f, &["A"]);
+    available(&mut f.store, &owner, "A", 0).unwrap();
+    let wave = frozen(admit(&mut f.store, &owner, policy(), 0).unwrap());
+
+    let composed = compose_with_source(&mut f.store, &owner, f._repo.path(), &wave.id).unwrap();
+    let source = composed
+        .source
+        .as_ref()
+        .expect("the fresh composition source should be retained");
+    let candidate = source.composition.outcome.candidate().unwrap();
+    let retained = archive::retained(&f.store, &candidate.subject)
+        .unwrap()
+        .expect("candidate subject remains retained");
+    assert_ne!(retained.commit, candidate.commit);
+    assert_eq!(
+        archive::snapshot_of_commit(f._repo.path(), &candidate.commit)
+            .unwrap()
+            .id(),
+        candidate.subject
+    );
+
+    let resumed = compose_with_source(&mut f.store, &owner, f._repo.path(), &wave.id).unwrap();
+    assert!(resumed.source.is_some());
+}
+
 fn rewrite_source_record(
     f: &mut Fixture,
     owner: &ControllerOwner,
