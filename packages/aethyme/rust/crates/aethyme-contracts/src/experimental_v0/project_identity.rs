@@ -132,6 +132,12 @@ impl FileId {
     }
 }
 
+impl std::fmt::Display for FileId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EnrolledFile {
     pub path: Vec<u8>,
@@ -306,10 +312,7 @@ impl ProjectDescriptor {
             "visibility_boundary",
             "files",
         ];
-        if let Some((name, _)) = raw
-            .iter()
-            .find(|(name, _)| !allowed.contains(&name.as_str()))
-        {
+        if let Some((name, _)) = raw.iter().find(|(name, _)| !allowed.contains(name)) {
             return Err(ProjectIdentityError::UnknownField(name.to_string()));
         }
         // This experimental descriptor is a closed profile. The generic
@@ -320,7 +323,7 @@ impl ProjectDescriptor {
             return Err(ProjectIdentityError::ExtensionsUnsupported);
         }
         let record = Record::decode(input, &[&PROJECT_DESCRIPTOR_SCHEMA])?;
-        let project_id = ProjectId::parse(required_string(&record, "project_id")?)?;
+        let project_id = ProjectId::parse(&required_string(&record, "project_id")?)?;
         let anchor_commit = required_string(&record, "anchor_commit")?;
         validate_commit(&anchor_commit)?;
         let anchor_snapshot =
@@ -348,10 +351,7 @@ impl ProjectDescriptor {
                 return Err(ProjectIdentityError::WrongFileEntry);
             };
             const FILE_FIELDS: &[&str] = &["path_hex", "mode", "content_sha256", "file_id"];
-            if let Some((name, _)) = entry
-                .iter()
-                .find(|(name, _)| !FILE_FIELDS.contains(&name.as_str()))
-            {
+            if let Some((name, _)) = entry.iter().find(|(name, _)| !FILE_FIELDS.contains(name)) {
                 return Err(ProjectIdentityError::UnknownFileField(name.to_string()));
             }
             let path = decode_hex(required_object_string(entry, "path_hex")?, "path_hex")?;
@@ -538,22 +538,18 @@ impl FileChange {
             .iter()
             .map(|id| text(id.as_str()))
             .collect();
-        Value::Object(
-            Object::new(vec![
-                (
-                    "before".into(),
-                    self.before.as_ref().map(state_value).unwrap_or(Value::Null),
-                ),
-                (
-                    "after".into(),
-                    self.after.as_ref().map(state_value).unwrap_or(Value::Null),
-                ),
-                ("relation".into(), text(self.relation.as_str())),
-                ("derived_from".into(), Value::Array(derived)),
-                ("possible_sources".into(), Value::Array(possible)),
-            ])
-            .expect("distinct file change fields"),
-        )
+        let mut fields = vec![
+            ("relation".into(), text(self.relation.as_str())),
+            ("derived_from".into(), Value::Array(derived)),
+            ("possible_sources".into(), Value::Array(possible)),
+        ];
+        if let Some(before) = &self.before {
+            fields.push(("before".into(), state_value(before)));
+        }
+        if let Some(after) = &self.after {
+            fields.push(("after".into(), state_value(after)));
+        }
+        Value::Object(Object::new(fields).expect("distinct file change fields"))
     }
 }
 
@@ -879,25 +875,6 @@ pub fn advance_file_identities(
             continue;
         }
         if let Some((relation, _, derived_from)) = operation_by_destination.get(path) {
-            let before = if *relation == IdentityRelation::ExplicitRename {
-                let source = operation_by_source.iter().find_map(
-                    |(source, (source_relation, destinations))| {
-                        (*source_relation == IdentityRelation::ExplicitRename
-                            && destinations.first() == Some(path))
-                        .then(|| {
-                            let entry = base_entries[source];
-                            FileState {
-                                path: source.clone(),
-                                kind: entry.kind(),
-                                content_sha256: *entry.content_sha256(),
-                                file_id: base_ids[source].clone(),
-                            }
-                        })
-                    },
-                );
-            } else {
-                None
-            };
             if *relation == IdentityRelation::ExplicitRename {
                 // The paired move was emitted from its source path.
                 continue;

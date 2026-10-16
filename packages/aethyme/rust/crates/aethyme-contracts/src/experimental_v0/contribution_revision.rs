@@ -248,10 +248,7 @@ impl ContributionRevision {
             "brief_object_sha256",
             "depends_on",
         ];
-        if let Some((name, _)) = raw
-            .iter()
-            .find(|(name, _)| !ALLOWED.contains(&name.as_str()))
-        {
+        if let Some((name, _)) = raw.iter().find(|(name, _)| !ALLOWED.contains(name)) {
             return Err(ContributionRevisionError::UnknownField(name.to_string()));
         }
         let record = Record::decode(input, &[&CONTRIBUTION_REVISION_SCHEMA])?;
@@ -312,10 +309,7 @@ fn validate_changes(changes: &[Value]) -> Result<(), ContributionRevisionError> 
             "derived_from",
             "possible_sources",
         ];
-        if object
-            .iter()
-            .any(|(name, _)| !CHANGE_FIELDS.contains(&name.as_str()))
-        {
+        if object.iter().any(|(name, _)| !CHANGE_FIELDS.contains(name)) {
             return Err(ContributionRevisionError::InvalidSourceChange);
         }
         let relation_text = object_string(object, "relation")?;
@@ -386,13 +380,10 @@ fn object_state(
     field: &'static str,
 ) -> Result<Option<(Vec<u8>, EntryKind, FileId)>, ContributionRevisionError> {
     match object.get(field) {
-        Some(Value::Null) => Ok(None),
+        None => Ok(None),
         Some(Value::Object(state)) => {
             const FIELDS: &[&str] = &["path_hex", "mode", "content_sha256", "file_id"];
-            if state
-                .iter()
-                .any(|(name, _)| !FIELDS.contains(&name.as_str()))
-            {
+            if state.iter().any(|(name, _)| !FIELDS.contains(name)) {
                 return Err(ContributionRevisionError::InvalidSourceChange);
             }
             let path = decode_hex(object_string(state, "path_hex")?, "path_hex")?;
