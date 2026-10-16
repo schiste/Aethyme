@@ -2826,6 +2826,61 @@ mod tests {
 
     #[test]
     fn schema_29_preserves_shared_charges_and_binds_distinct_attempt_axes() {
+        fn insert_binding(
+            connection: &rusqlite::Connection,
+            binding_id: &str,
+            reservation: &str,
+            attempt_id: i64,
+            shared_attempt_number: i64,
+            reservation_attempt_number: i64,
+        ) -> rusqlite::Result<usize> {
+            connection.execute(
+                "INSERT INTO local_managed_resolution_attempt_bindings
+                     (binding_id,reservation,attempt_id,authority_epoch,
+                      reservation_version,shared_attempt_number,
+                      reservation_attempt_number,route,created_ms)
+                 VALUES (?1,?2,?3,'epoch-1',1,?4,?5,
+                         'local_managed_resolution_v1',101)",
+                rusqlite::params![
+                    binding_id,
+                    reservation,
+                    attempt_id,
+                    shared_attempt_number,
+                    reservation_attempt_number,
+                ],
+            )
+        }
+
+        fn insert_attempt(
+            connection: &rusqlite::Connection,
+            request_record_id: &str,
+            request_sha: &str,
+            manifest_sha: &str,
+            client_key: &str,
+        ) -> rusqlite::Result<i64> {
+            connection.execute(
+                "INSERT INTO resolution_attempts
+                     (decision_key,kind,members,paths,request_record_id,resolver,
+                      charged_ms,attempt_number,request_sha256,input_manifest_sha256,
+                      client_key,async_state)
+                 VALUES ('decision:shared','failed_checks','lineage-a','',?1,
+                         'local-managed-resolution',456,2,?2,?3,?4,'dispatching')",
+                rusqlite::params![request_record_id, request_sha, manifest_sha, client_key],
+            )?;
+            Ok(connection.last_insert_rowid())
+        }
+
+        fn assert_no_bindings(connection: &rusqlite::Connection) {
+            let count: i64 = connection
+                .query_row(
+                    "SELECT count(*) FROM local_managed_resolution_attempt_bindings",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 0, "a rejected binding must leave no row behind");
+        }
+
         let host = tempfile::tempdir().unwrap();
         let mut store = open(host.path(), &[]).unwrap();
         store
@@ -2920,18 +2975,181 @@ mod tests {
                 [],
             )
             .unwrap();
+
+        // Each invalid insert reaches the binding predicate for the intended
+        // proof axis before the valid row is created below.
+        let wrong_shared_attempt = insert_binding(
+            migrated.connection(),
+            "binding:wrong-shared-attempt",
+            "reservation",
+            attempt_id,
+            1,
+            1,
+        );
+        assert!(
+            wrong_shared_attempt.is_err(),
+            "the binding must use the charged shared comparable attempt number"
+        );
+        assert_no_bindings(migrated.connection());
+
+        // Keep NEW.reservation_attempt_number valid and vary the persisted
+        // reservation count, so the r.attempts equality guard is what rejects
+        // the insert (rather than the binding column CHECK).
         migrated
             .connection()
             .execute(
-                "INSERT INTO local_managed_resolution_attempt_bindings
-                     (binding_id,reservation,attempt_id,authority_epoch,
-                      reservation_version,shared_attempt_number,
-                      reservation_attempt_number,route,created_ms)
-                 VALUES ('binding','reservation',?1,'epoch-1',1,2,1,
-                         'local_managed_resolution_v1',101)",
-                [attempt_id],
+                "UPDATE local_budget_reservations SET attempts=2
+                 WHERE reservation='reservation'",
+                [],
             )
             .unwrap();
+        let wrong_reservation_attempt = insert_binding(
+            migrated.connection(),
+            "binding:wrong-reservation-attempt",
+            "reservation",
+            attempt_id,
+            2,
+            1,
+        );
+        assert!(
+            wrong_reservation_attempt.is_err(),
+            "the binding must match the Local reservation attempt count"
+        );
+        assert_no_bindings(migrated.connection());
+        migrated
+            .connection()
+            .execute(
+                "UPDATE local_budget_reservations SET attempts=1
+                 WHERE reservation='reservation'",
+                [],
+            )
+            .unwrap();
+
+        let wrong_request_record_attempt = insert_attempt(
+            migrated.connection(),
+            "request:other",
+            &request_sha,
+            &manifest_sha,
+            "client-key",
+        )
+        .unwrap();
+        assert!(
+            insert_binding(
+                migrated.connection(),
+                "binding:wrong-request-record",
+                "reservation",
+                wrong_request_record_attempt,
+                2,
+                1,
+            )
+            .is_err(),
+            "the binding must match the charged request record ID"
+        );
+        assert_no_bindings(migrated.connection());
+
+        let wrong_request_object_attempt = insert_attempt(
+            migrated.connection(),
+            "request:managed",
+            &"d".repeat(64),
+            &manifest_sha,
+            "client-key",
+        )
+        .unwrap();
+        assert!(
+            insert_binding(
+                migrated.connection(),
+                "binding:wrong-request-object",
+                "reservation",
+                wrong_request_object_attempt,
+                2,
+                1,
+            )
+            .is_err(),
+            "the binding must match the request object digest"
+        );
+        assert_no_bindings(migrated.connection());
+
+        let wrong_manifest_object_attempt = insert_attempt(
+            migrated.connection(),
+            "request:managed",
+            &request_sha,
+            &"e".repeat(64),
+            "client-key",
+        )
+        .unwrap();
+        assert!(
+            insert_binding(
+                migrated.connection(),
+                "binding:wrong-manifest-object",
+                "reservation",
+                wrong_manifest_object_attempt,
+                2,
+                1,
+            )
+            .is_err(),
+            "the binding must match the input manifest object digest"
+        );
+        assert_no_bindings(migrated.connection());
+
+        migrated
+            .connection()
+            .execute(
+                "INSERT INTO local_budget_reservations
+                     (reservation,nonce,target,revision,wave,root,parent,body,
+                      phase,spent,attempts,version)
+                 VALUES ('reservation:no-roots','nonce:no-roots','target','revision',
+                         'wave','reservation:no-roots',NULL,X'07',
+                         'completion_pending',X'00',1,1)",
+                [],
+            )
+            .unwrap();
+        migrated
+            .connection()
+            .execute(
+                "INSERT INTO local_resolution_reservation_proofs
+                     (reservation,target,issuer,authority_epoch,client_key,wave,
+                      request_record_id,request_object_sha256,input_manifest_object_sha256,
+                      trigger_sha256,project_policy,objective_policy,price_profile,
+                      dispatch_limits,reserved_envelope,reservation_attempt_limit,
+                      deadline_ms,created_ms)
+                 VALUES ('reservation:no-roots','target','issuer','epoch-1',
+                         'client-key:no-roots','wave','request:managed',?1,?2,?3,
+                         'project-policy','objective-policy','price-profile',
+                         'v1:1024:10:1024:4096:1024',X'08',1,999,100)",
+                rusqlite::params![request_sha, manifest_sha, trigger_sha],
+            )
+            .unwrap();
+        let no_roots_attempt = insert_attempt(
+            migrated.connection(),
+            "request:managed",
+            &request_sha,
+            &manifest_sha,
+            "client-key:no-roots",
+        )
+        .unwrap();
+        assert!(
+            insert_binding(
+                migrated.connection(),
+                "binding:no-roots",
+                "reservation:no-roots",
+                no_roots_attempt,
+                2,
+                1,
+            )
+            .is_err(),
+            "a managed attempt must retain at least one selected lineage root"
+        );
+        assert_no_bindings(migrated.connection());
+
+        insert_binding(
+            migrated.connection(),
+            "binding",
+            "reservation",
+            attempt_id,
+            2,
+            1,
+        )
+        .unwrap();
         let counters: (i64, i64) = migrated
             .read_connection()
             .query_row(
