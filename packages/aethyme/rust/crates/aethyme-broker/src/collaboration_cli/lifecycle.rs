@@ -13,9 +13,13 @@ use std::collections::BTreeMap;
 const MAX_ARGUMENTS: usize = 512;
 const MAX_SPEC: u64 = 256 * 1024;
 
-struct Flags<'a>(BTreeMap<&'a str, Vec<&'a str>>);
+pub(super) struct Flags<'a>(BTreeMap<&'a str, Vec<&'a str>>);
 impl<'a> Flags<'a> {
-    fn parse(rest: &[&'a str], allowed: &[&str], repeated: &[&str]) -> Result<Self, Failure> {
+    pub(super) fn parse(
+        rest: &[&'a str],
+        allowed: &[&str],
+        repeated: &[&str],
+    ) -> Result<Self, Failure> {
         if rest.len() > MAX_ARGUMENTS || !rest.len().is_multiple_of(2) {
             return Err(Failure::usage("expected a finite set of flag/value pairs"));
         }
@@ -38,7 +42,7 @@ impl<'a> Flags<'a> {
         }
         Ok(Self(values))
     }
-    fn one(&self, name: &str) -> Result<&'a str, Failure> {
+    pub(super) fn one(&self, name: &str) -> Result<&'a str, Failure> {
         self.0
             .get(name)
             .and_then(|v| v.first())
@@ -55,7 +59,7 @@ fn sqlite(error: rusqlite::Error) -> Failure {
 fn io(error: std::io::Error) -> Failure {
     Failure::domain("io", error.to_string())
 }
-fn observe(root: &Path) -> Result<CollaborationSnapshot, Failure> {
+pub(super) fn observe(root: &Path) -> Result<CollaborationSnapshot, Failure> {
     let enabled = require_enabled(root)?;
     inspect_for_repository(root, &enabled.project)
         .map_err(|e| Failure::domain(e.code(), e.to_string()))?
@@ -1367,8 +1371,11 @@ fn read_operator<T: serde::de::DeserializeOwned>(path: &str) -> Result<T, Failur
     serde_json::from_slice(&bytes).map_err(|e| Failure::usage(e.to_string()))
 }
 
-fn read_operator_bytes(path: &str, max_bytes: u64) -> Result<Vec<u8>, Failure> {
+pub(super) fn read_operator_bytes(path: &str, max_bytes: u64) -> Result<Vec<u8>, Failure> {
     use std::io::Read;
+    let read_limit = max_bytes
+        .checked_add(1)
+        .ok_or_else(|| Failure::usage("operator file byte limit is too large"))?;
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -1381,10 +1388,13 @@ fn read_operator_bytes(path: &str, max_bytes: u64) -> Result<Vec<u8>, Failure> {
     if !metadata.is_file() || metadata.len() > max_bytes {
         return Err(Failure::usage("bounded regular operator file required"));
     }
-    let mut bytes = Vec::with_capacity(metadata.len() as usize);
-    file.take(max_bytes + 1)
-        .read_to_end(&mut bytes)
-        .map_err(io)?;
+    let capacity = usize::try_from(metadata.len())
+        .map_err(|_| Failure::usage("operator file does not fit in memory"))?;
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(capacity)
+        .map_err(|_| Failure::usage("operator file allocation exceeds available memory"))?;
+    file.take(read_limit).read_to_end(&mut bytes).map_err(io)?;
     if bytes.len() as u64 > max_bytes {
         return Err(Failure::usage("operator file too large"));
     }
@@ -1647,6 +1657,25 @@ mod tests {
         target::select_revision(&mut fixture.store, &owner, &proposal.id).unwrap();
         let epoch = authority::status(&fixture.store).unwrap().epoch;
         (proposal.id.to_string(), epoch)
+    }
+
+    #[test]
+    fn operator_bytes_enforce_exact_cap_and_reject_overflow_before_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("input.json");
+        std::fs::write(&input, b"data").unwrap();
+        let path = input.to_str().unwrap();
+        assert_eq!(read_operator_bytes(path, 4).unwrap(), b"data");
+        assert!(read_operator_bytes(path, 3).is_err());
+        let error = read_operator_bytes("/does/not/exist", u64::MAX).unwrap_err();
+        assert_eq!(error.code, "usage");
+        assert!(error.message.contains("byte limit is too large"));
+        #[cfg(unix)]
+        {
+            let link = dir.path().join("link.json");
+            std::os::unix::fs::symlink(&input, &link).unwrap();
+            assert!(read_operator_bytes(link.to_str().unwrap(), 4).is_err());
+        }
     }
 
     #[test]

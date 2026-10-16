@@ -1,6 +1,25 @@
 # Local v3 — L4 resolution requests and candidate manifests (#665)
 
-Last Updated: 2026-10-15
+Last Updated: 2026-10-16
+
+## Current asynchronous handoff slice
+
+The experimental `aethyme collab resolution` commands expose the shared
+resolution validator through a local, operator-mediated handoff. `prepare`
+requires an exact archived request and explicit byte/entry limits; it commits
+one attempt charge and retention roots before exposing a metadata-only packet.
+`status` is read-only. `packet` recovers a still-exported packet and `input`
+reads only an exact manifested snapshot/path under the retained limits.
+`import` requires a strict attempt/request/manifest-bound response file and
+settles that same charge through `finish_bound_attempt`; it never calls
+`resolve()` to charge a second attempt.
+
+This slice creates no provider session and authorizes no paid dispatch.
+Session labels record provenance and do not authenticate an agent. A synthesis
+result remains retained and unverified, with no wave attachment, publication
+or acceptance. Guarded wave attachment and a fresh complete verification flow
+are separate implementation work. The original provisional evidence below is
+historical; this interface alone closes no model-quality qualification gate.
 
 > Historical checkpoint: the implementation and pending-work statements below
 > describe the original provisional profile. Current bounded E1, FX08, native-gate

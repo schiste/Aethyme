@@ -49,6 +49,8 @@ mod contribution;
 mod lifecycle;
 #[path = "collaboration_cli/project.rs"]
 mod project;
+#[path = "collaboration_cli/resolution.rs"]
+mod resolution;
 #[cfg(test)]
 pub(crate) use project::test_support as project_test_support;
 #[path = "collaboration_cli/sensitive.rs"]
@@ -143,6 +145,22 @@ Usage:
       select --operation for a lineage shared by multiple logical contributions.
 
 Additional explicit lifecycle commands (provisional Local packages):
+  aethyme collab resolution prepare --request ID --object sha256:HEX
+       --session-label LABEL --client-key KEY --limits PATH [--json]
+      Charge one bounded attempt before exposing its exact metadata packet.
+      Limits are a strict JSON file; labels are provenance, not authentication.
+      Repeating a client key returns status without a new charge or packet.
+  aethyme collab resolution status --attempt TOKEN --session-label LABEL [--json]
+      Read-only attempt status, including the retained limits and unknowns.
+  aethyme collab resolution packet --attempt TOKEN --session-label LABEL [--json]
+      Recover an exported metadata packet without charging another attempt.
+  aethyme collab resolution input --attempt TOKEN --session-label LABEL
+       --snapshot sha256:HEX --path PATH [--json]
+      Read one exact manifested input, with bytes encoded as lowercase hex.
+  aethyme collab resolution import --attempt TOKEN --session-label LABEL
+       --proposal PATH [--json]
+      Import one strict attempt/request/manifest-bound response file. The
+      result is retained and unverified; no dispatch, wave attachment or acceptance.
   aethyme collab authority status [--json]
       Read the native epoch/witness and ledger binding without changing state.
       Observation grants no authority; unbound, frozen and drift remain distinct.
@@ -457,6 +475,10 @@ fn command_name(args: &[String]) -> String {
         "show",
         "dispatch",
         "sync",
+        "resolution",
+        "packet",
+        "input",
+        "import",
     ];
     let words: Vec<&str> = args
         .iter()
@@ -515,6 +537,11 @@ fn dispatch(options: Options) -> Result<Output, Failure> {
             verb @ ("quarantine" | "purge" | "resume" | "status"),
             rest @ ..,
         ] => sensitive::command(&main_root, verb, rest),
+        ["resolution", "prepare", rest @ ..] => resolution::prepare(&main_root, rest),
+        ["resolution", "status", rest @ ..] => resolution::status(&main_root, rest),
+        ["resolution", "packet", rest @ ..] => resolution::packet(&main_root, rest),
+        ["resolution", "input", rest @ ..] => resolution::input(&main_root, rest),
+        ["resolution", "import", rest @ ..] => resolution::import(&main_root, rest),
         ["authority", "status", rest @ ..] => lifecycle::authority_status(&main_root, rest),
         ["target", "status", rest @ ..] => lifecycle::target_status(&main_root, rest),
         ["target", "budget", "project", rest @ ..] => {
