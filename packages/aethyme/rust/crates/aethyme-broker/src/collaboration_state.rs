@@ -1018,9 +1018,12 @@ const MIGRATIONS: &[(i64, &str)] = &[
          WHEN NOT EXISTS (
              SELECT 1
              FROM local_budget_reservations r
+             JOIN local_waves w ON w.wave=NEW.wave
              JOIN local_targets t ON t.target=r.target
              WHERE r.reservation=NEW.reservation AND r.target=NEW.target
                AND r.wave=NEW.wave AND r.parent IS NULL
+               AND w.wave=r.wave AND w.target=NEW.target
+               AND w.revision=r.revision
                AND t.issuer=NEW.issuer
                AND t.active_revision=r.revision AND t.version=NEW.expected_version
          )
@@ -1067,7 +1070,9 @@ const MIGRATIONS: &[(i64, &str)] = &[
              JOIN resolution_attempts a ON a.attempt_id=NEW.attempt_id
              WHERE p.reservation=NEW.reservation
                AND p.authority_epoch=NEW.authority_epoch
-               AND t.active_revision=w.revision AND t.version=p.expected_version
+               AND r.target=p.target AND r.wave=p.wave
+               AND w.target=p.target AND w.revision=r.revision
+               AND t.active_revision=r.revision AND t.version=p.expected_version
                AND w.resolution_request_record_id=p.request_record_id
                AND w.resolution_request_object=p.request_object_sha256
                AND w.composition_source_record_id=p.composition_source_record_id
@@ -1083,6 +1088,8 @@ const MIGRATIONS: &[(i64, &str)] = &[
                AND a.request_sha256=p.request_object_sha256
                AND a.input_manifest_sha256=p.input_manifest_object_sha256
                AND a.client_key=p.client_key
+               AND a.resolver='local-managed-resolution'
+               AND a.session_label IS NULL
                AND a.attempt_number=NEW.shared_attempt_number
          )
          BEGIN
@@ -2876,6 +2883,9 @@ mod tests {
         }
         #[derive(Debug, PartialEq, Eq)]
         struct ReservationSnapshot {
+            target: String,
+            revision: String,
+            wave: String,
             phase: String,
             version: i64,
             attempts: i64,
@@ -2912,6 +2922,7 @@ mod tests {
         #[derive(Debug, PartialEq, Eq)]
         struct BindingAuthoritySnapshot {
             proof: ProofSnapshot,
+            wave_target_revision: (String, String),
             roots: Vec<String>,
             bindings: Vec<BindingSnapshot>,
             reservation: ReservationSnapshot,
@@ -2964,6 +2975,11 @@ mod tests {
             let roots: Vec<String> = root_statement
                 .query_map([reservation], |row| row.get(0))?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
+            let wave_target_revision = connection.query_row(
+                "SELECT target,revision FROM local_waves WHERE wave=?1",
+                [proof.wave.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
             let mut binding_statement = connection.prepare(
                 "SELECT binding_id,reservation,attempt_id,authority_epoch,
                         reservation_version,shared_attempt_number,
@@ -2987,19 +3003,23 @@ mod tests {
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             let reservation_state = connection.query_row(
-                "SELECT phase,version,attempts,spent,receipt,detail,observed_overrun
+                "SELECT target,revision,wave,phase,version,attempts,spent,receipt,detail,
+                        observed_overrun
                  FROM local_budget_reservations
                  WHERE reservation=?1",
                 [reservation],
                 |row| {
                     Ok(ReservationSnapshot {
-                        phase: row.get(0)?,
-                        version: row.get(1)?,
-                        attempts: row.get(2)?,
-                        spent: row.get(3)?,
-                        receipt: row.get(4)?,
-                        detail: row.get(5)?,
-                        observed_overrun: row.get(6)?,
+                        target: row.get(0)?,
+                        revision: row.get(1)?,
+                        wave: row.get(2)?,
+                        phase: row.get(3)?,
+                        version: row.get(4)?,
+                        attempts: row.get(5)?,
+                        spent: row.get(6)?,
+                        receipt: row.get(7)?,
+                        detail: row.get(8)?,
+                        observed_overrun: row.get(9)?,
                     })
                 },
             )?;
@@ -3040,6 +3060,7 @@ mod tests {
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             Ok(BindingAuthoritySnapshot {
                 proof,
+                wave_target_revision,
                 roots,
                 bindings,
                 reservation: reservation_state,
@@ -3072,6 +3093,36 @@ mod tests {
             )
         }
 
+        fn insert_attempt_with_route(
+            connection: &rusqlite::Connection,
+            request_record_id: &str,
+            request_sha: &str,
+            manifest_sha: &str,
+            client_key: &str,
+            resolver: &str,
+            session_label: Option<&str>,
+            shared_attempt_number: i64,
+        ) -> rusqlite::Result<i64> {
+            connection.execute(
+                "INSERT INTO resolution_attempts
+                     (decision_key,kind,members,paths,request_record_id,resolver,
+                      charged_ms,attempt_number,request_sha256,input_manifest_sha256,
+                      client_key,session_label,async_state)
+                 VALUES ('decision:shared','failed_checks','lineage-a','',?1,
+                         ?6,456,?7,?2,?3,?4,?5,'dispatching')",
+                rusqlite::params![
+                    request_record_id,
+                    request_sha,
+                    manifest_sha,
+                    client_key,
+                    session_label,
+                    resolver,
+                    shared_attempt_number
+                ],
+            )?;
+            Ok(connection.last_insert_rowid())
+        }
+
         fn insert_attempt(
             connection: &rusqlite::Connection,
             request_record_id: &str,
@@ -3080,22 +3131,16 @@ mod tests {
             client_key: &str,
             shared_attempt_number: i64,
         ) -> rusqlite::Result<i64> {
-            connection.execute(
-                "INSERT INTO resolution_attempts
-                     (decision_key,kind,members,paths,request_record_id,resolver,
-                      charged_ms,attempt_number,request_sha256,input_manifest_sha256,
-                      client_key,async_state)
-                 VALUES ('decision:shared','failed_checks','lineage-a','',?1,
-                         'local-managed-resolution',456,?5,?2,?3,?4,'dispatching')",
-                rusqlite::params![
-                    request_record_id,
-                    request_sha,
-                    manifest_sha,
-                    client_key,
-                    shared_attempt_number
-                ],
-            )?;
-            Ok(connection.last_insert_rowid())
+            insert_attempt_with_route(
+                connection,
+                request_record_id,
+                request_sha,
+                manifest_sha,
+                client_key,
+                "local-managed-resolution",
+                None,
+                shared_attempt_number,
+            )
         }
 
         fn assert_rejected_without_mutation(
@@ -3164,6 +3209,10 @@ mod tests {
                 "INSERT INTO local_targets (target,issuer) VALUES ('target','issuer');
                  INSERT INTO local_target_revisions (revision,target,body)
                      VALUES ('revision','target',X'01');
+                 INSERT INTO local_target_revisions (revision,target,body)
+                     VALUES ('revision:other','target',X'11');
+                 INSERT INTO local_targets (target,issuer)
+                     VALUES ('target:other','issuer');
                  UPDATE local_targets SET active_revision='revision'
                      WHERE target='target';",
             )
@@ -3179,6 +3228,94 @@ mod tests {
                 rusqlite::params!["request:managed", request_sha, "source:managed", source_sha],
             )
             .unwrap();
+        migrated
+            .connection()
+            .execute_batch(
+                "INSERT INTO local_waves
+                     (wave,target,revision,sequence,body,phase)
+                 VALUES ('wave:wrong-target','target:other','revision',4,X'12','completed');
+                 INSERT INTO local_waves
+                     (wave,target,revision,sequence,body,phase)
+                 VALUES ('wave:wrong-revision','target','revision:other',2,X'13','completed');",
+            )
+            .unwrap();
+        migrated
+            .connection()
+            .execute_batch(
+                "INSERT INTO local_budget_reservations
+                     (reservation,nonce,target,revision,wave,root,parent,body,
+                      phase,spent,attempts,version)
+                 VALUES ('reservation:wrong-wave-target','nonce:wrong-wave-target',
+                         'target','revision','wave:wrong-target',
+                         'reservation:wrong-wave-target',NULL,X'14',
+                         'completion_pending',X'00',1,1);
+                 INSERT INTO local_budget_reservations
+                     (reservation,nonce,target,revision,wave,root,parent,body,
+                      phase,spent,attempts,version)
+                 VALUES ('reservation:wrong-wave-revision','nonce:wrong-wave-revision',
+                         'target','revision','wave:wrong-revision',
+                         'reservation:wrong-wave-revision',NULL,X'15',
+                         'completion_pending',X'00',1,1);",
+            )
+            .unwrap();
+        let wrong_wave_target_proof = migrated.connection().execute(
+            "INSERT INTO local_resolution_reservation_proofs
+                 (reservation,target,issuer,authority_epoch,client_key,wave,expected_version,
+                  request_record_id,request_object_sha256,composition_source_record_id,
+                  composition_source_object_sha256,input_manifest_object_sha256,
+                  trigger_sha256,project_policy,objective_policy,price_profile,
+                  dispatch_limits,reserved_envelope,reservation_attempt_limit,
+                  deadline_ms,created_ms)
+             VALUES ('reservation:wrong-wave-target','target','issuer','epoch-1',
+                     'client-key:wrong-wave-target','wave:wrong-target',0,
+                     'request:managed',?1,'source:managed',?2,?3,?4,
+                     'project-policy','objective-policy','price-profile',
+                     'v1:1024:10:1024:4096:1024',X'16',1,999,100)",
+            rusqlite::params![request_sha, source_sha, manifest_sha, trigger_sha],
+        );
+        assert!(
+            wrong_wave_target_proof.is_err(),
+            "a proof cannot bind a reservation to a wave for another target"
+        );
+        let wrong_wave_target_proof_count: i64 = migrated
+            .read_connection()
+            .query_row(
+                "SELECT count(*) FROM local_resolution_reservation_proofs
+                 WHERE reservation='reservation:wrong-wave-target'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(wrong_wave_target_proof_count, 0);
+        let wrong_wave_revision_proof = migrated.connection().execute(
+            "INSERT INTO local_resolution_reservation_proofs
+                 (reservation,target,issuer,authority_epoch,client_key,wave,expected_version,
+                  request_record_id,request_object_sha256,composition_source_record_id,
+                  composition_source_object_sha256,input_manifest_object_sha256,
+                  trigger_sha256,project_policy,objective_policy,price_profile,
+                  dispatch_limits,reserved_envelope,reservation_attempt_limit,
+                  deadline_ms,created_ms)
+             VALUES ('reservation:wrong-wave-revision','target','issuer','epoch-1',
+                     'client-key:wrong-wave-revision','wave:wrong-revision',0,
+                     'request:managed',?1,'source:managed',?2,?3,?4,
+                     'project-policy','objective-policy','price-profile',
+                     'v1:1024:10:1024:4096:1024',X'17',1,999,100)",
+            rusqlite::params![request_sha, source_sha, manifest_sha, trigger_sha],
+        );
+        assert!(
+            wrong_wave_revision_proof.is_err(),
+            "a proof cannot bind a reservation to a different wave revision"
+        );
+        let wrong_wave_revision_proof_count: i64 = migrated
+            .read_connection()
+            .query_row(
+                "SELECT count(*) FROM local_resolution_reservation_proofs
+                 WHERE reservation='reservation:wrong-wave-revision'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(wrong_wave_revision_proof_count, 0);
         migrated
             .connection()
             .execute(
@@ -3539,6 +3676,60 @@ mod tests {
             },
         );
 
+        let manual_attempt = insert_attempt_with_route(
+            migrated.connection(),
+            "request:managed",
+            &request_sha,
+            &manifest_sha,
+            "client-key",
+            "manual",
+            None,
+            2,
+        )
+        .unwrap();
+        assert_rejected_without_mutation(
+            migrated.connection(),
+            "reservation",
+            "manual attempt cannot receive a managed binding",
+            |connection| {
+                insert_binding(
+                    connection,
+                    "binding:manual-attempt",
+                    "reservation",
+                    manual_attempt,
+                    2,
+                    1,
+                )
+            },
+        );
+
+        let labeled_managed_attempt = insert_attempt_with_route(
+            migrated.connection(),
+            "request:managed",
+            &request_sha,
+            &manifest_sha,
+            "client-key",
+            "local-managed-resolution",
+            Some("manual-session"),
+            2,
+        )
+        .unwrap();
+        assert_rejected_without_mutation(
+            migrated.connection(),
+            "reservation",
+            "session-labeled attempt cannot receive a managed binding",
+            |connection| {
+                insert_binding(
+                    connection,
+                    "binding:labeled-attempt",
+                    "reservation",
+                    labeled_managed_attempt,
+                    2,
+                    1,
+                )
+            },
+        );
+
         migrated
             .connection()
             .execute(
@@ -3593,6 +3784,66 @@ mod tests {
                 )
             },
         );
+
+        // Recheck reservation and wave identity at binding time too. The
+        // proof was valid when inserted; these direct fixture mutations model
+        // stale or corrupted state reaching the durable trigger boundary.
+        migrated
+            .connection()
+            .execute_batch(
+                "UPDATE local_targets SET active_revision='revision:other'
+                 WHERE target='target';
+                 UPDATE local_budget_reservations SET revision='revision:other'
+                 WHERE reservation='reservation';",
+            )
+            .unwrap();
+        assert_rejected_without_mutation(
+            migrated.connection(),
+            "reservation",
+            "wave revision must still match the reservation revision",
+            |connection| {
+                insert_binding(
+                    connection,
+                    "binding:stale-reservation-revision",
+                    "reservation",
+                    attempt_id,
+                    2,
+                    1,
+                )
+            },
+        );
+        migrated
+            .connection()
+            .execute_batch(
+                "UPDATE local_targets SET active_revision='revision'
+                 WHERE target='target';
+                 UPDATE local_budget_reservations SET revision='revision'
+                 WHERE reservation='reservation';
+                 UPDATE local_waves SET target='target:other' WHERE wave='wave';",
+            )
+            .unwrap();
+        assert_rejected_without_mutation(
+            migrated.connection(),
+            "reservation",
+            "wave target must still match the proof target",
+            |connection| {
+                insert_binding(
+                    connection,
+                    "binding:stale-wave-target",
+                    "reservation",
+                    attempt_id,
+                    2,
+                    1,
+                )
+            },
+        );
+        migrated
+            .connection()
+            .execute(
+                "UPDATE local_waves SET target='target' WHERE wave='wave'",
+                [],
+            )
+            .unwrap();
 
         insert_binding(
             migrated.connection(),
