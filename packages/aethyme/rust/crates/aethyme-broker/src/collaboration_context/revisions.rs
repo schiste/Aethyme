@@ -565,7 +565,7 @@ mod tests {
         ContributionRevisionRequest, resolve_bound_contribution_revision,
         revise_contribution_for_operation,
     };
-    use aethyme_contracts::experimental_v0::Decision;
+    use aethyme_contracts::experimental_v0::brief::Decision;
 
     fn brief(reason: &str) -> Brief {
         Brief {
@@ -954,5 +954,40 @@ mod tests {
             )
             .is_err()
         );
+        // A new operation may capture the identical source lineage after GC.
+        // It must not revive old immutable records or their retired Brief alias.
+        let bootstrap = fixture.bootstrap_commit.clone();
+        let recaptured = fixture
+            .capture_operation("context-recapture", &bootstrap, &first_result_commit)
+            .unwrap();
+        assert_eq!(&recaptured.contribution, first.capture_record_id());
+        let fresh = revise(
+            &mut fixture,
+            &recaptured.operation_id,
+            &brief("new logical operation after reclamation"),
+        );
+        assert_ne!(
+            fresh.revision().contribution_id(),
+            first.revision().contribution_id()
+        );
+        assert_ne!(fresh.record_id(), first.record_id());
+        let plan = crate::collaboration_gc::plan(
+            &mut fixture.store,
+            &crate::collaboration_gc::GcOptions::default(),
+        )
+        .unwrap();
+        assert!(
+            plan.blockers.is_empty(),
+            "retired roots must not reappear: {:?}",
+            plan.blockers
+        );
+        resolve_bound_contribution_revision(
+            &fixture.store,
+            &fixture.binding,
+            fresh.record_id(),
+            fresh.object_digest(),
+            fresh.revision().contribution_id(),
+        )
+        .unwrap();
     }
 }
