@@ -138,6 +138,7 @@ pub enum WorkKind {
     Verification,
     OptionalAnalysis,
     Recovery,
+    Resolution,
 }
 impl WorkKind {
     fn optional(self) -> bool {
@@ -337,6 +338,8 @@ pub enum BudgetError {
     Arithmetic,
     #[error("immutable budget authorization or idempotency key differs")]
     Immutable,
+    #[error("resolution reservations require the managed-resolution route")]
+    ResolutionRoute,
     #[error("budget unavailable in {0}")]
     Capacity(&'static str),
     #[error("reservation missing")]
@@ -676,6 +679,12 @@ fn reject_overrun(conn: &Connection) -> Result<(), BudgetError> {
 
     Ok(())
 }
+fn reject_generic_resolution(kind: WorkKind) -> Result<(), BudgetError> {
+    if kind == WorkKind::Resolution {
+        return Err(BudgetError::ResolutionRoute);
+    }
+    Ok(())
+}
 
 fn current(
     store: &CollaborationStore,
@@ -711,6 +720,7 @@ fn current(
                 )
         }
         WorkKind::Recovery => true,
+        WorkKind::Resolution => false,
     };
     if !phase_ok {
         return Err(BudgetError::Stale);
@@ -766,6 +776,7 @@ pub fn reserve(
     request: Request,
     now_ms: i64,
 ) -> Result<Reservation, BudgetError> {
+    reject_generic_resolution(request.kind)?;
     let _authority = target::authorize(store, owner)?;
     target::authorize(store, owner)?;
     if let Some(key) = nonce_key(store.read_connection(), &request.nonce)? {
@@ -891,8 +902,10 @@ pub fn delegate(
     mut request: Request,
     now_ms: i64,
 ) -> Result<Reservation, BudgetError> {
+    reject_generic_resolution(request.kind)?;
     let _authority = target::authorize(store, owner)?;
     let parent = owned(store, owner, parent)?;
+    reject_generic_resolution(parent.spec.request.kind)?;
     if let Some(key) = nonce_key(store.read_connection(), &request.nonce)? {
         let existing = owned(store, owner, &key)?;
         if existing.spec.parent.as_deref() != Some(parent.id.as_str())
@@ -982,6 +995,7 @@ pub fn begin_attempt(
 ) -> Result<Attempt, BudgetError> {
     let _authority = target::authorize(store, owner)?;
     let r = owned(store, owner, key)?;
+    reject_generic_resolution(r.spec.request.kind)?;
     let (_, state) = current(store, owner, &id(&r.spec.wave)?, r.spec.request.kind)?;
     if now_ms < 0 || now_ms >= r.spec.request.deadline_ms {
         return Err(BudgetError::Invalid("deadline".into()));
@@ -1116,7 +1130,8 @@ fn charge_usage(
     receipt: &RecordId,
     reconcile: bool,
 ) -> Result<Reservation, BudgetError> {
-    owned(store, owner, key)?;
+    let reservation = owned(store, owner, key)?;
+    reject_generic_resolution(reservation.spec.request.kind)?;
     usage.validate()?;
     let tx = store
         .connection()
@@ -1234,7 +1249,8 @@ pub fn close(
     version: i64,
 ) -> Result<Reservation, BudgetError> {
     let _authority = target::authorize(store, owner)?;
-    owned(store, owner, key)?;
+    let reservation = owned(store, owner, key)?;
+    reject_generic_resolution(reservation.spec.request.kind)?;
     let tx = store
         .connection()
         .transaction_with_behavior(TransactionBehavior::Immediate)?;
