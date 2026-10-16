@@ -2,8 +2,8 @@
 //! advisory data. Only an operator-appointed native adapter can supply current
 //! authorization; no packet grants retention, verification or adoption.
 use aethyme_contracts::experimental_v0::{
-    Brief, ContributionId, ContributionRevision, FieldKind, FieldSpec, ProjectId, Record,
-    RecordId, RecordSchema, SourceSnapshotId,
+    ContributionId, ContributionRevision, FieldKind, FieldSpec, ProjectId, Record, RecordId,
+    RecordSchema, SourceSnapshotId, brief::Brief,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
