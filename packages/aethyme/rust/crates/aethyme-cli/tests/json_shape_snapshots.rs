@@ -98,6 +98,54 @@ fn shape(value: &serde_json::Value) -> String {
     )
 }
 
+/// `StatusAdvice` identifiers are `Option<i64>`. Which advice item is first
+/// depends on the observed status, so represent their stable nullable type
+/// after checking every emitted value against the contract.
+fn status_shape(value: &serde_json::Value) -> String {
+    let advice = value
+        .get("advice")
+        .and_then(serde_json::Value::as_array)
+        .expect("status advice is an array");
+    assert!(!advice.is_empty(), "status includes its recorded-observations advice");
+    for (index, item) in advice.iter().enumerate() {
+        let item = item
+            .as_object()
+            .unwrap_or_else(|| panic!("status advice item {index} is an object: {item}"));
+        for field_name in ["session_id", "queue_entry_id"] {
+            let field = item.get(field_name).unwrap_or_else(|| {
+                panic!("status advice item {index} includes {field_name}: {item:?}")
+            });
+            assert!(
+                field.is_null() || field.as_i64().is_some(),
+                "status advice item {index} field {field_name} is null or i64: {field}"
+            );
+        }
+    }
+
+    let mut shape = json_shape(value);
+    let advice_shape = shape
+        .get_mut("advice")
+        .and_then(serde_json::Value::as_array_mut)
+        .expect("status advice shape is an array");
+    let first = advice_shape
+        .first_mut()
+        .expect("nonempty status advice has a shape");
+    let first = first
+        .as_object_mut()
+        .expect("status advice shape item is an object");
+    for field_name in ["session_id", "queue_entry_id"] {
+        assert!(first.contains_key(field_name), "status shape includes {field_name}");
+        first.insert(
+            field_name.to_string(),
+            serde_json::Value::String("integer|null".into()),
+        );
+    }
+    format!(
+        "{}\n",
+        serde_json::to_string_pretty(&shape).expect("serialize status shape")
+    )
+}
+
 fn fixture() -> tempfile::TempDir {
     let tmp = tempfile::tempdir().expect("tempdir");
     let repo = tmp.path().join("repo");
@@ -152,7 +200,7 @@ fn session_lifecycle_json_shapes_match_snapshots() {
     entries.push(("submit".to_string(), shape(&submitted)));
 
     let status = json(&repo, &["broker", "status", "--json"]);
-    entries.push(("status".to_string(), shape(&status)));
+    entries.push(("status".to_string(), status_shape(&status)));
 
     let finished = json(
         &repo,

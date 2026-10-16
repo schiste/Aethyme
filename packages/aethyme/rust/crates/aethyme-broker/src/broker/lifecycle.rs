@@ -68,9 +68,9 @@ pub(crate) fn plan_worktree_root_for(
         } else {
             (None, None, None)
         };
-    let preferred_outside_repository = preferred_root
-        .as_deref()
-        .is_some_and(|root| !path_is_inside_repository(main_root, root));
+    let preferred_outside_repository = preferred_root.as_deref().is_some_and(|root| {
+        root_path_is_inside_repository(main_root, root).is_ok_and(|inside| !inside)
+    });
     WorktreeRootPlan {
         schema_version: WORKTREE_ROOT_SCHEMA_VERSION,
         repository_root: main_root.to_path_buf(),
@@ -144,12 +144,16 @@ fn configured_root_unavailable_for(
     if let Some(reason) = crate::worktree_location::base_unavailable_reason(base) {
         return Some(reason);
     }
-    if path_is_inside_repository(main_root, base) {
-        return Some(format!(
-            "{} resolves inside repository {}",
-            base.display(),
-            main_root.display()
-        ));
+    match root_path_is_inside_repository(main_root, base) {
+        Ok(true) => {
+            return Some(format!(
+                "{} resolves inside repository {}",
+                base.display(),
+                main_root.display()
+            ));
+        }
+        Ok(false) => {}
+        Err(reason) => return Some(reason),
     }
     match crate::disk_headroom::available_bytes_for(main_root, base) {
         Some(free) if free < min_free_bytes => Some(format!(
@@ -162,12 +166,146 @@ fn configured_root_unavailable_for(
     }
 }
 
-fn path_is_inside_repository(main_root: &Path, path: &Path) -> bool {
-    let repository = main_root
-        .canonicalize()
-        .unwrap_or_else(|_| main_root.to_path_buf());
-    let candidate = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    candidate.starts_with(repository)
+fn root_path_is_inside_repository(main_root: &Path, path: &Path) -> Result<bool, String> {
+    let repository = canonical_prefix(main_root)?;
+    let candidate = canonical_prefix(path)?;
+    Ok(candidate.starts_with(repository))
+}
+
+/// Resolve the nearest existing ancestor, then walk the missing suffix while
+/// resolving every component that exists. A `..` after a missing component is
+/// ambiguous: it can skip the directory `create_dir_all` would first create,
+/// or re-enter an existing symlink. Refuse it before any root is created.
+pub(crate) fn canonical_prefix(path: &Path) -> Result<PathBuf, String> {
+    for ancestor in path.ancestors() {
+        let Ok(mut resolved) = ancestor.canonicalize() else {
+            continue;
+        };
+        let remainder = path.strip_prefix(ancestor).unwrap_or(Path::new(""));
+        let mut unresolved_component = false;
+        for component in remainder.components() {
+            match component {
+                std::path::Component::Prefix(prefix) => resolved.push(prefix.as_os_str()),
+                std::path::Component::RootDir => {
+                    resolved = PathBuf::from(std::path::MAIN_SEPARATOR.to_string());
+                    unresolved_component = false;
+                }
+                std::path::Component::CurDir => {}
+                std::path::Component::ParentDir => {
+                    if unresolved_component {
+                        return Err(format!(
+                            "{} contains `..` after a missing path component; refusing ambiguous path resolution",
+                            path.display()
+                        ));
+                    }
+                    resolved.pop();
+                }
+                std::path::Component::Normal(name) => {
+                    let candidate = resolved.join(name);
+                    match candidate.canonicalize() {
+                        Ok(canonical) => {
+                            resolved = canonical;
+                            unresolved_component = false;
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                            resolved = candidate;
+                            unresolved_component = true;
+                        }
+                        Err(error) => {
+                            return Err(format!(
+                                "cannot resolve path component {}: {error}",
+                                candidate.display()
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        return Ok(resolved);
+    }
+    Err(format!(
+        "no existing ancestor can be resolved for {}",
+        path.display()
+    ))
+}
+
+fn preflight_worktree_root(
+    main_root: &Path,
+    path: &Path,
+    source: WorktreeRootSource,
+    require_external: bool,
+    min_free_bytes: Option<u64>,
+    mut removable_volume_refusal: impl FnMut(&Path) -> Option<String>,
+    mut available_bytes: impl FnMut(&Path) -> Option<u64>,
+) -> Result<(), String> {
+    if let Some(reason) = removable_volume_refusal(path) {
+        return Err(reason);
+    }
+    if let Some(ancestor) = path.ancestors().find(|ancestor| ancestor.exists())
+        && !ancestor.is_dir()
+    {
+        return Err(format!(
+            "nearest existing ancestor {} is not a directory",
+            ancestor.display()
+        ));
+    }
+    if require_external {
+        match root_path_is_inside_repository(main_root, path) {
+            Ok(true) => {
+                return Err(format!(
+                    "{} must resolve outside repository {}; choose an external AETHYME_WORKTREE_ROOT",
+                    source.as_str(),
+                    main_root.display()
+                ));
+            }
+            Ok(false) => {}
+            Err(reason) => {
+                return Err(format!(
+                    "cannot safely resolve {} before creating it: {reason}",
+                    path.display()
+                ));
+            }
+        }
+    }
+    // `worktrees.min_free_bytes` is policy for an explicitly configured
+    // repository root. Environment/library overrides, host state, and the
+    // in-repository fallback get mount, ancestor, and containment checks here;
+    // verification slots apply their separate gate reserve when they are used.
+    if source == WorktreeRootSource::RepositoryConfig
+        && let Some(minimum) = min_free_bytes
+        && let Some(free) = available_bytes(path)
+        && free < minimum
+    {
+        return Err(format!(
+            "{} has {} free, below the {} required (worktrees.min_free_bytes)",
+            path.display(),
+            crate::disk_headroom::format_gibibytes(free),
+            crate::disk_headroom::format_gibibytes(minimum)
+        ));
+    }
+    Ok(())
+}
+
+fn prepare_worktree_root_directory(
+    main_root: &Path,
+    path: &Path,
+    source: WorktreeRootSource,
+    require_external: bool,
+    min_free_bytes: Option<u64>,
+    removable_volume_refusal: impl FnMut(&Path) -> Option<String>,
+    available_bytes: impl FnMut(&Path) -> Option<u64>,
+) -> Result<PathBuf, String> {
+    preflight_worktree_root(
+        main_root,
+        path,
+        source,
+        require_external,
+        min_free_bytes,
+        removable_volume_refusal,
+        available_bytes,
+    )?;
+    std::fs::create_dir_all(path).map_err(|error| error.to_string())?;
+    path.canonicalize().map_err(|error| error.to_string())
 }
 
 impl Broker {
@@ -1535,16 +1673,31 @@ impl Broker {
         source: WorktreeRootSource,
         require_external: bool,
     ) -> Result<PathBuf, BrokerOpError> {
-        std::fs::create_dir_all(path).map_err(|error| BrokerOpError::WorktreeRootUnavailable {
+        let min_free_bytes = if source == WorktreeRootSource::RepositoryConfig {
+            crate::worktree_location::WorktreeLocationConfig::load(&self.main_root)
+                .map_err(|reason| BrokerOpError::WorktreeRootUnavailable {
+                    path: self.main_root.join(".aethyme/config.toml"),
+                    reason,
+                })?
+                .map(|settings| settings.min_free_bytes())
+        } else {
+            None
+        };
+        let root = prepare_worktree_root_directory(
+            &self.main_root,
+            path,
+            source,
+            require_external,
+            min_free_bytes,
+            crate::verification::removable_volume_unavailable_reason,
+            |candidate| {
+                crate::disk_headroom::available_bytes_at_or_above_for(&self.main_root, candidate)
+            },
+        )
+        .map_err(|reason| BrokerOpError::WorktreeRootUnavailable {
             path: path.to_path_buf(),
-            reason: error.to_string(),
+            reason,
         })?;
-        let root = path
-            .canonicalize()
-            .map_err(|error| BrokerOpError::WorktreeRootUnavailable {
-                path: path.to_path_buf(),
-                reason: error.to_string(),
-            })?;
         if require_external && self.path_is_inside_repository(&root) {
             return Err(BrokerOpError::WorktreeRootUnavailable {
                 path: root,
@@ -1669,21 +1822,8 @@ impl Broker {
         Ok(self.main_common_dir.get_or_init(|| dir).clone())
     }
 
-    pub(super) fn absolute_worktree_root(&self, path: &Path) -> PathBuf {
-        if path.is_absolute() {
-            path.to_path_buf()
-        } else {
-            self.main_root.join(path)
-        }
-    }
-
     pub(super) fn path_is_inside_repository(&self, path: &Path) -> bool {
-        let repository = self
-            .main_root
-            .canonicalize()
-            .unwrap_or_else(|_| self.main_root.clone());
-        let candidate = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-        candidate.starts_with(repository)
+        root_path_is_inside_repository(&self.main_root, path).unwrap_or(true)
     }
 
     pub(super) fn refuse_nested_worktree_path(&self, path: &Path) -> Result<(), BrokerOpError> {
@@ -2004,6 +2144,154 @@ mod worktree_root_candidate_tests {
                 ),
             ]
         );
+    }
+
+    #[test]
+    fn an_unmounted_strict_override_fails_before_creating_its_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let repository = temp.path().join("repo");
+        std::fs::create_dir(&repository).unwrap();
+        let missing = temp.path().join("Volumes/Gone/worktrees/repo-key");
+        let plan = plan_worktree_root_for(&repository, None, Some(&missing));
+
+        assert_eq!(
+            worktree_root_candidates_for(&plan),
+            vec![(missing.clone(), WorktreeRootSource::LibraryOverride)]
+        );
+        let result = prepare_worktree_root_directory(
+            &repository,
+            &missing,
+            WorktreeRootSource::LibraryOverride,
+            true,
+            None,
+            |_| Some("volume /Volumes/Gone is not mounted".into()),
+            |_| None,
+        );
+
+        assert!(result.unwrap_err().contains("not mounted"));
+        assert!(!missing.exists());
+    }
+
+    #[test]
+    fn a_configured_root_below_its_existing_floor_is_not_created() {
+        let temp = tempfile::tempdir().unwrap();
+        let repository = temp.path().join("repo");
+        let base = temp.path().join("external");
+        std::fs::create_dir_all(&repository).unwrap();
+        std::fs::create_dir_all(&base).unwrap();
+        let missing = base.join("repo-key");
+
+        let result = prepare_worktree_root_directory(
+            &repository,
+            &missing,
+            WorktreeRootSource::RepositoryConfig,
+            true,
+            Some(1024),
+            |_| None,
+            |_| Some(512),
+        );
+
+        let reason = result.unwrap_err();
+        assert!(reason.contains("worktrees.min_free_bytes"), "{reason}");
+        assert!(!missing.exists());
+    }
+
+    #[test]
+    fn a_non_directory_ancestor_is_refused_before_creating_the_missing_suffix() {
+        let temp = tempfile::tempdir().unwrap();
+        let repository = temp.path().join("repo");
+        let blocker = temp.path().join("external/blocker");
+        std::fs::create_dir_all(&repository).unwrap();
+        std::fs::create_dir_all(blocker.parent().unwrap()).unwrap();
+        std::fs::write(&blocker, "not a directory").unwrap();
+        let missing = blocker.join("new/worktree-root");
+
+        let result = prepare_worktree_root_directory(
+            &repository,
+            &missing,
+            WorktreeRootSource::LibraryOverride,
+            true,
+            None,
+            |_| None,
+            |_| None,
+        );
+
+        assert!(result.unwrap_err().contains("is not a directory"));
+        assert!(!blocker.join("new").exists());
+        assert!(!missing.exists());
+    }
+
+    #[test]
+    fn unresolved_parent_traversal_is_refused_before_creating_any_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let repository = temp.path().join("base/repo");
+        std::fs::create_dir_all(&repository).unwrap();
+        let missing = temp.path().join("missing");
+        // If create_dir_all followed this path, it would create `missing`,
+        // walk back to the temp root, then create `new-root` inside the repo.
+        let path = temp.path().join("missing/../base/repo/new-root");
+
+        let result = prepare_worktree_root_directory(
+            &repository,
+            &path,
+            WorktreeRootSource::LibraryOverride,
+            true,
+            None,
+            |_| None,
+            |_| None,
+        );
+
+        let reason = result.unwrap_err();
+        assert!(reason.contains("ambiguous path resolution"), "{reason}");
+        assert!(!missing.exists());
+        assert!(!repository.join("new-root").exists());
+    }
+
+    #[test]
+    fn only_configured_roots_use_the_configured_space_floor() {
+        let temp = tempfile::tempdir().unwrap();
+        let repository = temp.path().join("repo");
+        std::fs::create_dir_all(&repository).unwrap();
+        let mut headroom_reads = 0;
+
+        for (source, path, require_external) in [
+            (
+                WorktreeRootSource::EnvironmentOverride,
+                temp.path().join("env-root"),
+                true,
+            ),
+            (
+                WorktreeRootSource::LibraryOverride,
+                temp.path().join("library-root"),
+                true,
+            ),
+            (
+                WorktreeRootSource::HostState,
+                temp.path().join("host-root"),
+                true,
+            ),
+            (
+                WorktreeRootSource::RepositoryFallback,
+                repository.join(".aethyme/worktrees"),
+                false,
+            ),
+        ] {
+            preflight_worktree_root(
+                &repository,
+                &path,
+                source,
+                require_external,
+                Some(1024),
+                |_| None,
+                |_| {
+                    headroom_reads += 1;
+                    Some(0)
+                },
+            )
+            .unwrap();
+        }
+
+        assert_eq!(headroom_reads, 0);
     }
 
     #[test]

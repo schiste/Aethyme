@@ -1279,18 +1279,27 @@ impl Broker {
                 .unwrap_or(&self.main_root)
                 .to_path_buf(),
         ]);
-        if let Ok(plan) = self.worktree_root_plan() {
-            if let Some((root, _)) = crate::broker::lifecycle::worktree_root_candidates_for(&plan)
+        let worktree_root_plan = self.worktree_root_plan().ok();
+        if let Some(plan) = &worktree_root_plan
+            && let Some((root, _)) = crate::broker::lifecycle::worktree_root_candidates_for(plan)
                 .into_iter()
                 .find(|(root, source)| {
                     *source != crate::WorktreeRootSource::RepositoryFallback
                         && crate::verification::removable_volume_unavailable_reason(root).is_none()
                 })
-            {
-                probes.insert(root);
-            }
+        {
+            probes.insert(root);
         }
-        let verification = crate::verification::plan_slot_placement(&self.main_root, "merge-sim");
+        let verification = worktree_root_plan.as_ref().map_or_else(
+            || crate::verification::plan_slot_placement(&self.main_root, "merge-sim"),
+            |plan| {
+                crate::verification::plan_slot_placement_with_worktree_root_plan(
+                    &self.main_root,
+                    "merge-sim",
+                    plan,
+                )
+            },
+        );
         if crate::verification::removable_volume_unavailable_reason(&verification.directory)
             .is_none()
         {

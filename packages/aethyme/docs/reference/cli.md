@@ -331,7 +331,11 @@ in `worktree_placement.fallback_reason`, when the root
 - or the `[worktrees]` section is invalid (for example a relative `root`).
 
 Because the key is committed, a machine without that path simply keeps the
-default.
+default. This `min_free_bytes` floor applies only to the configured
+`[worktrees].root`. Environment and library overrides, host state, and the
+legacy fallback still get mount and path-safety checks before creation, but do
+not have a separate worktree-root space floor. Verification slots separately
+use the gate storage reserve described below.
 
 ### Working agreement
 

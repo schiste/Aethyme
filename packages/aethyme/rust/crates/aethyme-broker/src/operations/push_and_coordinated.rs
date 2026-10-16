@@ -1756,8 +1756,20 @@ impl Broker {
             return;
         };
         let main_root = self.main_root_path();
-        let Some(outcome) =
-            crate::graph_integrity::verify_commit_for_advice(&main_root, &checkout, head_oid)
+        if crate::GraphIntegrityPolicy::load(checkout.root())
+            .is_ok_and(|policy| !policy.enforces_committed_fragments())
+        {
+            return;
+        }
+        let Ok(worktree_root_plan) = self.worktree_root_plan() else {
+            return;
+        };
+        let Some(outcome) = crate::graph_integrity::verify_commit_for_advice_with_worktree_root_plan(
+            &main_root,
+            &checkout,
+            head_oid,
+            &worktree_root_plan,
+        )
         else {
             return;
         };

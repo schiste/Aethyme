@@ -599,9 +599,13 @@ pub fn probe_gate_quality(
             crate::broker::gate_trust::require_trusted_standalone(&main_root, &policy)
         })
         .map_err(|error| GateDoctorError::Probe(error.to_string()))?;
-    let mut slot =
-        crate::verification::ExactTreeVerificationSlot::acquire(&main_root, "gate-doctor-probe")
-            .map_err(|error| GateDoctorError::Probe(error.to_string()))?;
+    let worktree_root_plan = crate::verification::default_worktree_root_plan(&main_root);
+    let mut slot = crate::verification::ExactTreeVerificationSlot::acquire_with_worktree_root_plan(
+        &main_root,
+        "gate-doctor-probe",
+        &worktree_root_plan,
+    )
+    .map_err(|error| GateDoctorError::Probe(error.to_string()))?;
     let checkout = slot
         .materialize(repo, &head)
         .map_err(|error| GateDoctorError::Probe(error.to_string()))?;
