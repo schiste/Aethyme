@@ -20,8 +20,7 @@ pub const SYMBOL_ORIGIN_EVIDENCE_SCHEMA_NAME: &str =
     "aethyme.symbol-origin-evidence/experimental-v0";
 pub const EXPLICIT_SYMBOL_MAPPING_EVIDENCE_SCHEMA_NAME: &str =
     "aethyme.explicit-symbol-mapping-evidence/experimental-v0";
-pub const SYMBOL_MAPPING_CLAIM_SCHEMA_NAME: &str =
-    "aethyme.symbol-mapping-claim/experimental-v0";
+pub const SYMBOL_MAPPING_CLAIM_SCHEMA_NAME: &str = "aethyme.symbol-mapping-claim/experimental-v0";
 pub const SYMBOL_MAPPING_AUTHORITY: &str = "advisory_symbol_mapping";
 
 /// Symbol records are deliberately much smaller than the general record
@@ -351,13 +350,18 @@ fn record_id(record: &Record, field: &'static str) -> Result<RecordId, SymbolIde
     RecordId::parse(required_text(record, field)?).map_err(Into::into)
 }
 
-fn source_id(record: &Record, field: &'static str) -> Result<SourceSnapshotId, SymbolIdentityError> {
-    SourceSnapshotId::parse(required_text(record, field)?).map_err(|_| {
-        SymbolIdentityError::InvalidField(field)
-    })
+fn source_id(
+    record: &Record,
+    field: &'static str,
+) -> Result<SourceSnapshotId, SymbolIdentityError> {
+    SourceSnapshotId::parse(required_text(record, field)?)
+        .map_err(|_| SymbolIdentityError::InvalidField(field))
 }
 
-fn required_text<'a>(record: &'a Record, field: &'static str) -> Result<&'a str, SymbolIdentityError> {
+fn required_text<'a>(
+    record: &'a Record,
+    field: &'static str,
+) -> Result<&'a str, SymbolIdentityError> {
     let Some(Value::String(value)) = record.get(field) else {
         return Err(SymbolIdentityError::InvalidField(field));
     };

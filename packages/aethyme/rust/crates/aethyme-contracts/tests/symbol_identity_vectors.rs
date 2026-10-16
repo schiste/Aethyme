@@ -50,8 +50,10 @@ fn hex(text: &str) -> Vec<u8> {
 }
 
 fn vectors() -> Vectors {
-    serde_json::from_str(include_str!("../fixtures/experimental-v0/symbol_identity.json"))
-        .expect("symbol identity vectors parse")
+    serde_json::from_str(include_str!(
+        "../fixtures/experimental-v0/symbol_identity.json"
+    ))
+    .expect("symbol identity vectors parse")
 }
 
 #[test]
@@ -118,11 +120,16 @@ fn frozen_vectors_bind_the_independent_canonical_profile_and_domain() {
         .find(|case| case.name == "explicit unknown claim")
         .expect("explicit unknown vector");
     let input = hex(&explicit_unknown.input.hex);
-    assert!(std::str::from_utf8(&input)
-        .expect("UTF-8 vector")
-        .contains("\"state\":\"unknown\""));
+    assert!(
+        std::str::from_utf8(&input)
+            .expect("UTF-8 vector")
+            .contains("\"state\":\"unknown\"")
+    );
     let decoded = decode_symbol_identity_record(&input).expect("unknown state is accepted");
-    assert_eq!(decoded.canonical_bytes(), hex(&explicit_unknown.canonical_hex));
+    assert_eq!(
+        decoded.canonical_bytes(),
+        hex(&explicit_unknown.canonical_hex)
+    );
     assert_eq!(decoded.id().as_str(), explicit_unknown.id);
     assert_eq!(decoded.state("state"), StateReading::Unknown);
 }
@@ -159,15 +166,13 @@ fn malformed_ids_and_noncanonical_or_oversized_inputs_fail_closed() {
 
 #[test]
 fn symbol_record_schema_is_selected_from_the_encoded_schema() {
-    let input = hex(
-        &vectors()
-            .valid
-            .into_iter()
-            .find(|case| case.name == "engine symbol in clone A")
-            .expect("engine symbol vector")
-            .input
-            .hex,
-    );
+    let input = hex(&vectors()
+        .valid
+        .into_iter()
+        .find(|case| case.name == "engine symbol in clone A")
+        .expect("engine symbol vector")
+        .input
+        .hex);
     let record = decode_symbol_identity_record(&input).expect("symbol ref");
     assert_eq!(record.schema(), "aethyme.symbol-ref/experimental-v0");
     let _: Record = record;
