@@ -28,21 +28,31 @@ use aethyme_broker::composer::{
 };
 use aethyme_broker::composition::{CompositionMode, CompositionOutcome, Producer};
 use aethyme_broker::resolution::{
-    self, FailedCheck, MAX_SYNTHESIS_ATTEMPTS, Preference, Proposal, ProposedFile, RequirementRef,
-    Resolution, ResolutionFailure, ResolutionInputs, ResolutionOutcome, ResolutionRequest,
-    Resolver, ResolverIdentity, Response, Trigger,
+    self, BeginResolutionAttempt, DispatchLimits, FailedCheck, MAX_SYNTHESIS_ATTEMPTS, Preference,
+    Proposal, ProposedFile, RequirementRef, Resolution, ResolutionAttemptState, ResolutionFailure,
+    ResolutionInputs, ResolutionOutcome, ResolutionRequest, Resolver, ResolverIdentity, Response,
+    Trigger,
 };
 use aethyme_contracts::experimental_v0::canonical_json::Value;
 use aethyme_contracts::experimental_v0::{EntryKind, RecordId};
 use aethyme_testkit::composition_fixtures::{
     self as fx, CaseInput, Observed, Outcome, ScenarioInput,
 };
+use sha2::{Digest, Sha256};
 
 fn open_store(root: &Path, repo: &Path) -> CollaborationStore {
     CollaborationStore::open(
         &CollaborationRoot::under_host_state(root),
         &ProjectKey::parse("fixtures").unwrap(),
         &forbidden_roots(repo),
+    )
+    .unwrap()
+}
+
+fn read_only_state_connection(store: &CollaborationStore) -> rusqlite::Connection {
+    rusqlite::Connection::open_with_flags(
+        store.project_dir().join("state.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
     )
     .unwrap()
 }
@@ -589,6 +599,282 @@ fn a_failed_check_raises_an_exact_scoped_request() {
     assert_eq!(request.baseline().commit, world.baseline);
     assert!(request.protected().iter().any(|p| p == "dir:.aethyme"));
     resolution::read_record(&world.store, request.record()).unwrap();
+}
+
+#[test]
+fn asynchronous_attempt_is_charged_before_export_and_imported_once() {
+    let (case, input) = interaction();
+    let (mut world, request) = raise(&case, &input);
+    let limits = DispatchLimits {
+        max_manifest_bytes: 4 * 1024 * 1024,
+        max_manifest_entries: 8192,
+        max_file_bytes: 4 * 1024 * 1024,
+        max_total_input_bytes: 32 * 1024 * 1024,
+        max_response_bytes: 64 * 1024,
+    };
+    let started = resolution::begin_attempt(
+        &mut world.store,
+        &world.repo,
+        request.record(),
+        "session-test-1",
+        "client-key-1",
+        limits,
+    )
+    .unwrap();
+    let (status, exported_request, input_manifest) = match started {
+        BeginResolutionAttempt::Started {
+            status,
+            request,
+            input_manifest,
+        } => (status, request, input_manifest),
+        other => panic!("unexpected begin result: {other:?}"),
+    };
+    assert_eq!(status.state, ResolutionAttemptState::Exported);
+    assert_eq!(status.attempt, 1);
+    assert_eq!(status.limits, limits);
+    assert_eq!(input_manifest.sha256, status.input_manifest_sha256);
+    assert!(!input_manifest.entries.is_empty());
+    let packet = exported_request
+        .export_json(&status, &input_manifest)
+        .unwrap();
+    assert_eq!(
+        packet["input_manifest"]["sha256"],
+        status.input_manifest_sha256
+    );
+    assert_eq!(packet["authority"]["session_label"], "provenance_only");
+    assert!(packet["request"]["requirements"].is_array());
+
+    let ledger = read_only_state_connection(&world.store);
+    let charged: i64 = ledger
+        .query_row(
+            "SELECT count(*) FROM resolution_attempts WHERE async_token=?1",
+            [&status.token],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(charged, 1, "the ledger charge precedes request export");
+
+    let holder = format!("resolution:{}", status.token);
+    let snapshot_roots: i64 = ledger
+        .query_row(
+            "SELECT count(*) FROM reader_leases
+             WHERE holder=?1 AND target_kind='snapshot'",
+            [&holder],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let contribution_roots: i64 = ledger
+        .query_row(
+            "SELECT count(*) FROM reader_leases
+             WHERE holder=?1 AND target_kind='contribution'",
+            [&holder],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let request_roots: i64 = ledger
+        .query_row(
+            "SELECT count(*) FROM object_pins
+             WHERE holder=?1 AND object_sha256=?2",
+            rusqlite::params![holder, status.request.object.hex()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(snapshot_roots > 0);
+    assert!(contribution_roots > 0);
+    assert_eq!(request_roots, 1);
+
+    let input_entry = input_manifest
+        .entries
+        .iter()
+        .find(|entry| entry.kind.is_some())
+        .expect("the scoped request includes a file");
+    let input = resolution::read_attempt_input(
+        &mut world.store,
+        &world.repo,
+        &status.token,
+        "session-test-1",
+        &input_entry.snapshot,
+        &input_entry.path,
+    )
+    .unwrap()
+    .expect("the exact manifest names a file");
+    assert_eq!(input.bytes.len() as u64, input_entry.bytes);
+    assert_eq!(
+        format!("{:x}", Sha256::digest(&input.bytes)),
+        input_entry.sha256.as_deref().unwrap()
+    );
+    assert!(
+        resolution::read_attempt_input(
+            &mut world.store,
+            &world.repo,
+            &status.token,
+            "session-test-1",
+            &input_entry.snapshot,
+            "not-in-request.txt",
+        )
+        .is_err()
+    );
+
+    let repeated = resolution::begin_attempt(
+        &mut world.store,
+        &world.repo,
+        request.record(),
+        "session-test-1",
+        "client-key-1",
+        limits,
+    )
+    .unwrap();
+    let BeginResolutionAttempt::Existing(repeated) = repeated else {
+        panic!("idempotent begin returned another export");
+    };
+    assert_eq!(repeated.token, status.token);
+    assert_eq!(repeated.state, ResolutionAttemptState::Exported);
+
+    let dispatching =
+        resolution::mark_attempt_dispatching(&mut world.store, &status.token, "session-test-1")
+            .unwrap();
+    assert_eq!(dispatching.state, ResolutionAttemptState::Dispatching);
+    let unknown = resolution::mark_attempt_unknown(
+        &mut world.store,
+        &status.token,
+        "session-test-1",
+        "operator did not receive a completion signal",
+    )
+    .unwrap();
+    assert_eq!(unknown.state, ResolutionAttemptState::OutcomeUnknown);
+    assert_eq!(unknown.attempt, 1);
+
+    let response_envelope = serde_json::json!({
+        "schema": resolution::ASYNC_RESPONSE_ENVELOPE_SCHEMA,
+        "attempt_token": status.token,
+        "session_label": "session-test-1",
+        "request_record_id": status.request.id.as_str(),
+        "request_object_sha256": status.request.object.hex(),
+        "input_manifest_sha256": status.input_manifest_sha256,
+        "response": {"kind": "unresolved", "detail": "no safe synthesis"},
+    });
+    let response_bytes = serde_json::to_vec(&response_envelope).unwrap();
+    let wrong_binding = serde_json::json!({
+        "schema": resolution::ASYNC_RESPONSE_ENVELOPE_SCHEMA,
+        "attempt_token": status.token,
+        "session_label": "session-test-1",
+        "request_record_id": status.request.id.as_str(),
+        "request_object_sha256": "0".repeat(64),
+        "input_manifest_sha256": status.input_manifest_sha256,
+        "response": {"kind": "unresolved", "detail": "wrong request"},
+    });
+    let wrong_bytes = serde_json::to_vec(&wrong_binding).unwrap();
+    assert!(resolution::decode_attempt_response_envelope(&unknown, &wrong_bytes).is_err());
+    let bound = resolution::decode_attempt_response_envelope(&unknown, &response_bytes).unwrap();
+    let late = resolution::finish_bound_attempt(&mut world.store, &world.repo, &bound).unwrap();
+    assert_eq!(
+        failure(&late),
+        Some(ResolutionFailure::Unresolved),
+        "the late response settles the existing charge"
+    );
+    let settled =
+        resolution::attempt_status(&world.store, &status.token, "session-test-1").unwrap();
+    assert_eq!(settled.state, ResolutionAttemptState::Settled);
+    assert_eq!(settled.outcome.as_deref(), Some("unresolved"));
+    assert!(resolution::finish_bound_attempt(&mut world.store, &world.repo, &bound).is_err());
+    let after_settlement = resolution::begin_attempt(
+        &mut world.store,
+        &world.repo,
+        request.record(),
+        "session-test-1",
+        "client-key-1",
+        limits,
+    )
+    .unwrap();
+    let BeginResolutionAttempt::Existing(after_settlement) = after_settlement else {
+        panic!("settled idempotency key created another attempt");
+    };
+    assert_eq!(after_settlement.token, status.token);
+    assert_eq!(after_settlement.state, ResolutionAttemptState::Settled);
+}
+
+#[test]
+fn asynchronous_attempt_rejects_oversized_scoped_inputs_before_charge() {
+    let (case, input) = interaction();
+    let (mut world, request) = raise(&case, &input);
+    let limits = DispatchLimits {
+        max_manifest_bytes: 1024 * 1024,
+        max_manifest_entries: 1024,
+        max_file_bytes: 1,
+        max_total_input_bytes: 1,
+        max_response_bytes: 1024,
+    };
+    assert!(
+        resolution::begin_attempt(
+            &mut world.store,
+            &world.repo,
+            request.record(),
+            "session-test-oversize",
+            "client-key-oversize",
+            limits,
+        )
+        .is_err()
+    );
+    let ledger = read_only_state_connection(&world.store);
+    let charged: i64 = ledger
+        .query_row(
+            "SELECT count(*) FROM resolution_attempts WHERE session_label='session-test-oversize'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        charged, 0,
+        "oversized input is refused before request export"
+    );
+}
+
+#[test]
+fn asynchronous_response_over_limit_remains_charged_and_dispatching() {
+    let (case, input) = interaction();
+    let (mut world, request) = raise(&case, &input);
+    let limits = DispatchLimits {
+        max_manifest_bytes: 1024 * 1024,
+        max_manifest_entries: 1024,
+        max_file_bytes: 1024,
+        max_total_input_bytes: 16 * 1024,
+        max_response_bytes: 1024,
+    };
+    let started = resolution::begin_attempt(
+        &mut world.store,
+        &world.repo,
+        request.record(),
+        "session-test-response-limit",
+        "client-key-response-limit",
+        limits,
+    )
+    .unwrap();
+    let BeginResolutionAttempt::Started { status, .. } = started else {
+        panic!("unexpected begin result: {started:?}");
+    };
+    resolution::mark_attempt_dispatching(
+        &mut world.store,
+        &status.token,
+        "session-test-response-limit",
+    )
+    .unwrap();
+    let too_large_envelope = serde_json::json!({
+        "schema": resolution::ASYNC_RESPONSE_ENVELOPE_SCHEMA,
+        "attempt_token": status.token,
+        "session_label": "session-test-response-limit",
+        "request_record_id": status.request.id.as_str(),
+        "request_object_sha256": status.request.object.hex(),
+        "input_manifest_sha256": status.input_manifest_sha256,
+        "response": {"kind": "unresolved", "detail": "response too large".repeat(256)},
+    });
+    let too_large_bytes = serde_json::to_vec(&too_large_envelope).unwrap();
+    assert!(resolution::decode_attempt_response_envelope(&status, &too_large_bytes).is_err());
+    let current =
+        resolution::attempt_status(&world.store, &status.token, "session-test-response-limit")
+            .unwrap();
+    assert_eq!(current.state, ResolutionAttemptState::Dispatching);
+    assert!(current.response_sha256.is_none());
+    assert!(current.outcome.is_none());
 }
 
 fn changed(repo: &Path, base: &str, result: &str) -> Vec<String> {
