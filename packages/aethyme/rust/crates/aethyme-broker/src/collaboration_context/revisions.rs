@@ -556,3 +556,403 @@ pub(super) fn attach_bound_brief(
             ContextError::RevisionIdentity("committed revision has no requested brief".into())
         })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::collaboration_cli::project_test_support::BoundProjectFixture;
+    use crate::collaboration_identity_store::{
+        ContributionRevisionRequest, resolve_bound_contribution_revision,
+        revise_contribution_for_operation,
+    };
+    use aethyme_contracts::experimental_v0::Decision;
+
+    fn brief(reason: &str) -> Brief {
+        Brief {
+            intent: "Keep the public interface stable".into(),
+            decisions: vec![Decision {
+                scope_ref: "a.txt".into(),
+                choice: "preserve the source transition".into(),
+                reason: reason.into(),
+            }],
+            ..Brief::default()
+        }
+    }
+
+    fn pin(revision: &ResolvedContributionRevision) -> RevisionPin {
+        RevisionPin {
+            contribution_id: revision.revision().contribution_id().clone(),
+            revision_record_id: revision.record_id().clone(),
+            object_digest: revision.object_digest(),
+        }
+    }
+
+    fn revise(
+        fixture: &mut BoundProjectFixture,
+        operation: &crate::collaboration_capture::OperationId,
+        rationale: &Brief,
+    ) -> ResolvedContributionRevision {
+        revise_contribution_for_operation(
+            &mut fixture.store,
+            &fixture.binding,
+            ContributionRevisionRequest {
+                operation_id: operation,
+                file_operations: None,
+                brief: Some(rationale),
+                depends_on: None,
+            },
+        )
+        .unwrap()
+    }
+
+    fn first_revision(fixture: &mut BoundProjectFixture) -> ResolvedContributionRevision {
+        let base = fixture.bootstrap_commit.clone();
+        let result = fixture.commit_file("a.txt", b"first revision\n").unwrap();
+        let receipt = fixture
+            .capture_operation("context-first", &base, &result)
+            .unwrap();
+        revise(fixture, &receipt.operation_id, &brief("original rationale"))
+    }
+
+    fn query(revision: &ResolvedContributionRevision) -> ContextQuery {
+        ContextQuery {
+            scope: vec![b"a.txt".to_vec()],
+            source: Some(revision.revision().base().clone()),
+            analysis: Vec::new(),
+            budget: Budget::default(),
+        }
+    }
+
+    #[test]
+    fn exact_context_keeps_old_rationale_after_new_revision_and_legacy_attach() {
+        let mut fixture = BoundProjectFixture::new().unwrap();
+        let old = first_revision(&mut fixture);
+        let old_pin = pin(&old);
+        let request = query(&old);
+        let before =
+            retrieve_revisions(&fixture.store, &request, &[old_pin.clone()], &LocalProject)
+                .unwrap();
+        assert_eq!(before.selection.items.len(), 1);
+        let updated = brief("new rationale with the same source bytes");
+        let new_brief =
+            attach_brief(&mut fixture.store, old.capture_record_id(), &updated).unwrap();
+        assert_ne!(
+            Some(new_brief.clone()),
+            old.revision().brief().map(|r| r.record_id.clone())
+        );
+        let head: String = fixture.store.read_connection().query_row(
+            "SELECT revision_record_id FROM contribution_revision_heads WHERE contribution_id=?1",
+            [old.revision().contribution_id().as_str()], |row| row.get(0),
+        ).unwrap();
+        assert_ne!(head, old.record_id().as_str());
+        let old_again =
+            retrieve_revisions(&fixture.store, &request, &[old_pin], &LocalProject).unwrap();
+        assert_eq!(before.record, old_again.record);
+        assert_eq!(before.cache_key, old_again.cache_key);
+        assert!(
+            String::from_utf8(old_again.record)
+                .unwrap()
+                .contains("original rationale")
+        );
+        let alias: String = fixture
+            .store
+            .read_connection()
+            .query_row(
+                "SELECT brief_record_id FROM contribution_briefs WHERE lineage_record_id=?1",
+                [old.capture_record_id().as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(alias, new_brief.as_str());
+        let digest: String = fixture
+            .store
+            .read_connection()
+            .query_row(
+                "SELECT record_sha256 FROM contribution_revisions WHERE revision_record_id=?1",
+                [&head],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let new_pin = RevisionPin {
+            contribution_id: old.revision().contribution_id().clone(),
+            revision_record_id: RecordId::parse(&head).unwrap(),
+            object_digest: ObjectDigest::from_bytes(
+                data_encoding::HEXLOWER
+                    .decode(digest.as_bytes())
+                    .unwrap()
+                    .try_into()
+                    .unwrap(),
+            ),
+        };
+        let newest =
+            retrieve_revisions(&fixture.store, &request, &[new_pin], &LocalProject).unwrap();
+        assert_ne!(newest.cache_key, before.cache_key);
+        assert!(
+            String::from_utf8(newest.record)
+                .unwrap()
+                .contains("new rationale with the same source bytes")
+        );
+    }
+
+    #[test]
+    fn exact_context_zero_brief_budget_and_permuted_pins_are_deterministic() {
+        let mut fixture = BoundProjectFixture::new().unwrap();
+        let old = first_revision(&mut fixture);
+        let operation =
+            crate::collaboration_capture::OperationId::parse(old.capture_operation_id().unwrap())
+                .unwrap();
+        let new = revise(
+            &mut fixture,
+            &operation,
+            &brief("second immutable rationale"),
+        );
+        let mut request = query(&old);
+        request.budget.max_brief_tokens = 0;
+        let forward = retrieve_revisions(
+            &fixture.store,
+            &request,
+            &[pin(&old), pin(&new)],
+            &LocalProject,
+        )
+        .unwrap();
+        let reverse = retrieve_revisions(
+            &fixture.store,
+            &request,
+            &[pin(&new), pin(&old)],
+            &LocalProject,
+        )
+        .unwrap();
+        assert_eq!(forward.record, reverse.record);
+        assert_eq!(forward.selection.items.len(), 2);
+        assert_eq!(forward.selection.brief_tokens, 0);
+        assert!(
+            forward
+                .selection
+                .items
+                .iter()
+                .all(|item| item.brief_included == Some(false))
+        );
+        let record = String::from_utf8(forward.record).unwrap();
+        assert!(!record.contains("original rationale"));
+        assert!(!record.contains("second immutable rationale"));
+    }
+
+    #[test]
+    fn exact_context_refuses_conflicting_pin_and_changed_visibility_epoch() {
+        let mut fixture = BoundProjectFixture::new().unwrap();
+        let revision = first_revision(&mut fixture);
+        let mut forged = pin(&revision);
+        forged.object_digest = ObjectDigest::from_bytes([0; 32]);
+        assert!(matches!(
+            retrieve_revisions(
+                &fixture.store,
+                &query(&revision),
+                &[pin(&revision), forged],
+                &LocalProject
+            ),
+            Err(RevisionContextError::ConflictingPin)
+        ));
+        struct ChangingEpoch(std::cell::Cell<u64>);
+        impl Visibility for ChangingEpoch {
+            fn name(&self) -> &str {
+                "changing-reader"
+            }
+            fn epoch(&self) -> u64 {
+                let epoch = self.0.get();
+                self.0.set(epoch + 1);
+                epoch
+            }
+            fn visible(&self, _: &str) -> bool {
+                true
+            }
+        }
+        assert!(matches!(
+            retrieve_revisions(
+                &fixture.store,
+                &query(&revision),
+                &[pin(&revision)],
+                &ChangingEpoch(std::cell::Cell::new(0))
+            ),
+            Err(RevisionContextError::VisibilityChanged)
+        ));
+    }
+
+    #[test]
+    fn exact_context_hidden_revision_returns_no_item_or_brief() {
+        let mut fixture = BoundProjectFixture::new().unwrap();
+        let revision = first_revision(&mut fixture);
+        struct Hidden;
+        impl Visibility for Hidden {
+            fn name(&self) -> &str {
+                "hidden-reader"
+            }
+            fn epoch(&self) -> u64 {
+                0
+            }
+            fn visible(&self, _: &str) -> bool {
+                false
+            }
+        }
+        let context = retrieve_revisions(
+            &fixture.store,
+            &query(&revision),
+            &[pin(&revision)],
+            &Hidden,
+        )
+        .unwrap();
+        assert!(context.selection.items.is_empty());
+        assert!(
+            !String::from_utf8(context.record)
+                .unwrap()
+                .contains("original rationale")
+        );
+    }
+
+    fn release_captures(store: &mut CollaborationStore) {
+        let operations: Vec<String> = store.read_connection().prepare(
+            "SELECT operation_id FROM retention_roots WHERE kind='contribution' AND released_ms IS NULL"
+        ).unwrap().query_map([], |row| row.get(0)).unwrap().collect::<Result<_,_>>().unwrap();
+        for operation in operations {
+            assert!(crate::collaboration_gc::release_retention(store, &operation).unwrap());
+        }
+        let active: i64 = store
+            .read_connection()
+            .query_row(
+                "SELECT count(*) FROM retention_roots WHERE released_ms IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            active, 0,
+            "proof retention must not be masked by capture roots"
+        );
+    }
+
+    fn age_own_archive(store: &CollaborationStore) {
+        let before_grace =
+            std::time::SystemTime::now() - std::time::Duration::from_secs(3 * 24 * 60 * 60);
+        for directory in std::fs::read_dir(store.project_dir().join("objects/sha256")).unwrap() {
+            for file in std::fs::read_dir(directory.unwrap().path()).unwrap() {
+                let path = file.unwrap().path();
+                assert!(std::fs::symlink_metadata(&path).unwrap().is_file());
+                std::fs::File::options()
+                    .write(true)
+                    .open(path)
+                    .unwrap()
+                    .set_times(std::fs::FileTimes::new().set_modified(before_grace))
+                    .unwrap();
+            }
+        }
+    }
+
+    fn collect(store: &mut CollaborationStore) -> crate::collaboration_gc::GcReport {
+        let options = crate::collaboration_gc::GcOptions::default();
+        let plan = crate::collaboration_gc::plan(store, &options).unwrap();
+        assert!(plan.blockers.is_empty(), "{:?}", plan.blockers);
+        crate::collaboration_gc::apply(store, &plan.digest, &options).unwrap()
+    }
+
+    #[test]
+    fn exact_revision_pin_keeps_ancestor_proofs_then_gc_reclaims_unrooted_history() {
+        let mut fixture = BoundProjectFixture::new().unwrap();
+        let first = first_revision(&mut fixture);
+        let first_result_commit =
+            crate::collaboration_archive::pin_commit(fixture.repo.path(), "HEAD").unwrap();
+        let second_commit = fixture
+            .commit_file("a.txt", b"second source transition\n")
+            .unwrap();
+        let receipt = fixture
+            .capture_operation("context-second", &first_result_commit, &second_commit)
+            .unwrap();
+        let second = revise(
+            &mut fixture,
+            &receipt.operation_id,
+            &brief("descendant rationale"),
+        );
+        let dependency: i64 = fixture.store.read_connection().query_row(
+            "SELECT count(*) FROM contribution_revision_identity_bases WHERE revision_record_id=?1 AND base_revision_record_id=?2",
+            [second.record_id().as_str(), first.record_id().as_str()], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(dependency, 1);
+        let root = crate::collaboration_gc::pin_object(
+            &mut fixture.store,
+            crate::collaboration_gc::PinClass::CitedEvidence,
+            &second.object_digest(),
+            "exact-proof-root",
+            None,
+        )
+        .unwrap();
+        release_captures(&mut fixture.store);
+        age_own_archive(&fixture.store);
+        collect(&mut fixture.store);
+        for digest in [
+            first.object_digest(),
+            first.brief_object_digest().unwrap(),
+            second.object_digest(),
+            second.brief_object_digest().unwrap(),
+        ] {
+            assert!(
+                crate::collaboration_archive::object_path(&fixture.store, &digest).is_file(),
+                "live exact proof {}",
+                digest.hex()
+            );
+        }
+        resolve_bound_contribution_revision(
+            &fixture.store,
+            &fixture.binding,
+            second.record_id(),
+            second.object_digest(),
+            second.revision().contribution_id(),
+        )
+        .unwrap();
+        assert!(crate::collaboration_gc::release_pin(&mut fixture.store, root).unwrap());
+        age_own_archive(&fixture.store);
+        let report = collect(&mut fixture.store);
+        assert!(!report.reclaimed.is_empty());
+        for digest in [
+            first.object_digest(),
+            first.brief_object_digest().unwrap(),
+            second.object_digest(),
+            second.brief_object_digest().unwrap(),
+        ] {
+            assert!(
+                !crate::collaboration_archive::object_path(&fixture.store, &digest).exists(),
+                "unrooted history {} must be reclaimed",
+                digest.hex()
+            );
+        }
+        assert!(
+            crate::collaboration_archive::object_path(
+                &fixture.store,
+                &fixture.binding.descriptor_object()
+            )
+            .is_file()
+        );
+        assert!(
+            crate::collaboration_archive::object_path(
+                &fixture.store,
+                &ObjectDigest::of_snapshot(&fixture.bootstrap_snapshot)
+            )
+            .is_file()
+        );
+        let binding =
+            crate::collaboration_identity_store::resolve_approved_project_binding(&fixture.store)
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            binding.descriptor_record_id(),
+            fixture.binding.descriptor_record_id()
+        );
+        assert!(
+            resolve_bound_contribution_revision(
+                &fixture.store,
+                &binding,
+                second.record_id(),
+                second.object_digest(),
+                second.revision().contribution_id()
+            )
+            .is_err()
+        );
+    }
+}
