@@ -1442,9 +1442,25 @@ mod binding_tests {
         assert_eq!(removed_pointer.code, "descriptor_pointer_missing");
 
         std::fs::remove_file(fixture.repo.path().join(PROJECT_DESCRIPTOR_PATH)).unwrap();
+        std::fs::write(
+            fixture.repo.path().join("replacement.txt"),
+            b"new descriptor anchor\n",
+        )
+        .unwrap();
+        git(fixture.repo.path(), &["add", "-A"]);
+        git(
+            fixture.repo.path(),
+            &[
+                "commit",
+                "-q",
+                "-m",
+                "prepare replacement descriptor anchor",
+            ],
+        );
+        let replacement_anchor = git(fixture.repo.path(), &["rev-parse", "HEAD"]);
         let enrolled = enroll(
             fixture.repo.path(),
-            &["--commit", fixture.anchor_commit.as_str(), "--write"],
+            &["--commit", &replacement_anchor, "--write"],
         )
         .unwrap();
         let replacement_id = enrolled.0["descriptor_record_id"].as_str().unwrap();

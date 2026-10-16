@@ -98,8 +98,10 @@ Usage:
       Binding grants no execution or acceptance authority.
   aethyme collab contribution revise --operation ID [--brief-file PATH]
        [--file-operations PATH] [--depends-on RECORD_ID...] [--clear-dependencies] [--json]
-      Append an immutable revision for one retained capture operation. Repeating the
-      same input is idempotent; a changed brief creates a new rationale revision.
+      Append an immutable revision for one retained capture operation. A retry
+      returns the same revision only when its normalized content matches; omitted
+      file operations and dependencies inherit from the current head. A changed
+      brief creates a new rationale revision.
       The optional file-operation document uses schema
       aethyme.collab-file-operations/experimental-v0 with lowercase-hex Git paths.
       Rename/copy entries require kind, from_hex and to_hex; split entries use
