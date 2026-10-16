@@ -1,0 +1,24 @@
+   Compiling aethyme-broker v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/implement-experimental-d39-t66-scoped-sy/packages/aethyme/rust/crates/aethyme-broker)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 21.93s
+     Running tests/symbol_identity_binding.rs (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/integrate-reviewed-local-bare-git-servic/target/local-resume/cargo/debug/deps/symbol_identity_binding-00ddf30bf8dc4d61)
+
+running 1 test
+test mismatched_or_incomplete_mapping_records_never_establish ... FAILED
+
+failures:
+
+---- mismatched_or_incomplete_mapping_records_never_establish stdout ----
+
+thread 'mismatched_or_incomplete_mapping_records_never_establish' (12296669) panicked at crates/aethyme-broker/tests/symbol_identity_binding.rs:629:9:
+assertion `left == right` failed: ProfileMismatch
+  left: EstablishedWithinBinding(EstablishedWithinBinding { binding_record: RecordId("sha256:830030ea3b0245fabf5283c8d36e9a870f993b2ce5fe0482d28e06e6f10f75f2"), left_symbol_ref: RecordId("sha256:26eaf445952884e37cb205d0ce69a7b22e968cbdc72bbf916fdf1e9fa0e26fb5"), right_symbol_ref: RecordId("sha256:64d2b58bb16e2944475b87f8a2d3a3c0d98ec9f8de1d95b13fb0b1b271b83c8a"), left_observation: RecordId("sha256:68defaf06b109227b4669b50239c95b8e3896438ff47f06646187e8739ad2511"), right_observation: RecordId("sha256:759cfd40f54648948d23dd1a946ea9c97c0393b99d3dfe5335caf71649000a16"), left_origin: RecordId("sha256:9ce1aa206b0ed744fe7e94894fbc8727ebcd460ee511cac7c7ce217e3ed3f635"), right_origin: RecordId("sha256:db57e823afe82e42bf3642abc4652f37d615cd6be66ce4547b7ac8264f62ebed") })
+ right: Unknown("captured_clone_binding_mismatch")
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    mismatched_or_incomplete_mapping_records_never_establish
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.17s
+
+error: test failed, to rerun pass `-p aethyme-broker --test symbol_identity_binding`

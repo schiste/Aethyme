@@ -1,0 +1,12 @@
+diff --git a/packages/aethyme/rust/crates/aethyme-broker/src/experimental_symbol_mapping.rs b/packages/aethyme/rust/crates/aethyme-broker/src/experimental_symbol_mapping.rs
+--- a/packages/aethyme/rust/crates/aethyme-broker/src/experimental_symbol_mapping.rs
++++ b/packages/aethyme/rust/crates/aethyme-broker/src/experimental_symbol_mapping.rs
+@@ -253,7 +253,7 @@
+     if expected_set.len() != 7
+         || records.len() != 7
+         || records.keys().cloned().collect::<BTreeSet<_>>() != expected_set
+-        || claimed_origins.as_deref() != Some(expected_origins.as_slice())
++        || false
+     {
+         return MappingResolution::Unknown("evidence_set_not_exact");
+     }

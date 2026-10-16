@@ -1,0 +1,39 @@
+{
+  "fixture_schema": "aethyme.local-d10-explicit-rename-inputs/v1",
+  "project_id": "proj:aaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "contribution_id": "contrib:bbbbbbbbbbbbbbbbbbbbbbbbbe",
+  "proposal_id": "proposal-rename",
+  "capture_record_id": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+  "base_files": [
+    {
+      "path_hex": "6f6c642e7273",
+      "mode": "100644",
+      "content_hex": "73616d65206279746573"
+    },
+    {
+      "path_hex": "6b6565702e7273",
+      "mode": "100644",
+      "content_hex": "6b656570"
+    }
+  ],
+  "result_files": [
+    {
+      "path_hex": "6e65772e7273",
+      "mode": "100644",
+      "content_hex": "73616d65206279746573"
+    },
+    {
+      "path_hex": "6b6565702e7273",
+      "mode": "100644",
+      "content_hex": "6b656570"
+    }
+  ],
+  "operation": {
+    "kind": "rename",
+    "from_path_hex": "6f6c642e7273",
+    "to_path_hex": "6e65772e7273"
+  },
+  "validation_controls": {
+    "invalid_contribution_id": "contrib:bbbbbbbbbbbbbbbbbbbbbbbbe"
+  }
+}

@@ -1,0 +1,22 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.11s
+     Running tests/analysis_vectors.rs (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/integrate-reviewed-local-bare-git-servic/target/local-resume/cargo/debug/deps/analysis_vectors-af2481bca12512e9)
+
+running 6 tests
+test cursors_pin_one_view_and_one_query ... ok
+test only_identical_profiles_compare ... ok
+test schema_matches_the_reference ... ok
+test invalid_envelopes_are_refused_with_the_expected_code ... ok
+test every_degradation_reads_as_the_reference_says ... ok
+test round_trip_keeps_identity_and_never_upgrades_a_reading ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/symbol_identity_vectors.rs (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/integrate-reviewed-local-bare-git-servic/target/local-resume/cargo/debug/deps/symbol_identity_vectors-d75383bf9791b54b)
+
+running 3 tests
+test symbol_record_schema_is_selected_from_the_encoded_schema ... ok
+test malformed_ids_and_noncanonical_or_oversized_inputs_fail_closed ... ok
+test frozen_vectors_bind_the_independent_canonical_profile_and_domain ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+

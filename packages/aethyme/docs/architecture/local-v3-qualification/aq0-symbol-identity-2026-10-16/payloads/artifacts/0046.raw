@@ -1,0 +1,24 @@
+   Compiling aethyme-broker v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/implement-experimental-d39-t66-scoped-sy/packages/aethyme/rust/crates/aethyme-broker)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 22.17s
+     Running tests/symbol_identity_binding.rs (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/integrate-reviewed-local-bare-git-servic/target/local-resume/cargo/debug/deps/symbol_identity_binding-00ddf30bf8dc4d61)
+
+running 1 test
+test mismatched_or_incomplete_mapping_records_never_establish ... FAILED
+
+failures:
+
+---- mismatched_or_incomplete_mapping_records_never_establish stdout ----
+
+thread 'mismatched_or_incomplete_mapping_records_never_establish' (12294396) panicked at crates/aethyme-broker/tests/symbol_identity_binding.rs:629:9:
+assertion `left == right` failed: SourceMismatch
+  left: Unknown("observation_binding_mismatch")
+ right: Unknown("captured_clone_binding_mismatch")
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    mismatched_or_incomplete_mapping_records_never_establish
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.16s
+
+error: test failed, to rerun pass `-p aethyme-broker --test symbol_identity_binding`

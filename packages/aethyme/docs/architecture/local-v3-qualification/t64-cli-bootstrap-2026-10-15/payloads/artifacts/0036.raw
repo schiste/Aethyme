@@ -1,0 +1,30 @@
+   Compiling aethyme-broker v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/complete-fresh-local-cli-bootstrap-and-c/packages/aethyme/rust/crates/aethyme-broker)
+warning: unused variable: `confirmation`
+   --> crates/aethyme-broker/src/collaboration_capture.rs:893:5
+    |
+893 |     confirmation: &RecordId,
+    |     ^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_confirmation`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: `aethyme-broker` (lib) generated 1 warning (run `cargo fix --lib -p aethyme-broker` to apply 1 suggestion)
+warning: `aethyme-broker` (lib test) generated 1 warning (1 duplicate)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 48.05s
+     Running unittests src/lib.rs (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/integrate-reviewed-local-bare-git-servic/target/local-resume/cargo/debug/deps/aethyme_broker-0f278e0d02146111)
+
+running 1 test
+
+thread 'collaboration_capture::tests::contribution_root_release_requires_exact_committed_receipt_and_is_idempotent' (12015765) panicked at crates/aethyme-broker/src/collaboration_capture.rs:1868:9:
+assertion failed: matches!(release_retention(&mut store, &captured.operation_id, &wrong),
+    Err(CaptureError::ConfirmationMismatch { .. }))
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test collaboration_capture::tests::contribution_root_release_requires_exact_committed_receipt_and_is_idempotent ... FAILED
+
+failures:
+
+failures:
+    collaboration_capture::tests::contribution_root_release_requires_exact_committed_receipt_and_is_idempotent
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1893 filtered out; finished in 0.53s
+
+error: test failed, to rerun pass `-p aethyme-broker --lib`

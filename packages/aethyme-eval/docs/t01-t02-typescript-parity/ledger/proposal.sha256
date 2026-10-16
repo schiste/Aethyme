@@ -1,0 +1,9 @@
+ddae89e42193c383494200c6ca9a542f0c43dfe0e921d98d08c3836e8d301a49  ./.gitattributes
+25e06de560d43d8f0937431375938457b5ffc1d02d872ab3f98ccfdb9afe8f31  ./README.md
+b5e784dfe368da54ffa9e8b7840cee9c0551b7d4ea486b0101630e549157f1ca  ./ledger/frozen-inputs.sha256
+002c95e4a967f4eb9bd41d9becd93ae2d4f5cbd89799ed1843728775efd1a2cc  ./ledger/portable-package-manifest.sha256
+61d1796ef726e2fc80ac76c23f4126d25050478216549caa0b3069df718dea7e  ./ledger/qualification.sha256
+9a077c4dfef06add44a29ad4ff62c202898de8b8c46b86112e4495cb4bd70c99  ./ledger/rejected-archive-inventory.tsv
+03bd0637805680b415c2fe6f9a09fe0b76c5387e0cb49c5d6666ee8c3c097c12  ./ledger/rejected-archive-review.md
+6e812b59aab06360dce97a7e49a4d7ad0fa75e78e355563ff3672429781413a4  ./ledger/runtime-provenance.txt
+1d2a38871c1ca66fc06ac49685833d93dd1bfa2301e8309f8ccf074955501cc2  ./qualification.tar.gz

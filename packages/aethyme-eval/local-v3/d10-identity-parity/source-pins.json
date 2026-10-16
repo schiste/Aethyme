@@ -1,0 +1,151 @@
+{
+  "schema": "aethyme.local-d10-typescript-parity-pins/v2",
+  "fixture_source_commit": "fcd5ed940b4d906452e4ad1d3aa90eb767f1af45",
+  "qualification_source_commit": "e6fb95f65f3bf91d46c1ab76136486f492529ebb",
+  "rust_sources": [
+    {
+      "path": "packages/aethyme/rust/crates/aethyme-contracts/src/experimental_v0/canonical_json.rs",
+      "sha256": "6bbeea89e7d5850651687382255619b2ea9d30538341ebbba51a53a0605a6a35"
+    },
+    {
+      "path": "packages/aethyme/rust/crates/aethyme-contracts/src/experimental_v0/record.rs",
+      "sha256": "d4888555e1653ea8897f383dfb6f6f9c50e5e2abd19ee113eb440ee575ad4400"
+    },
+    {
+      "path": "packages/aethyme/rust/crates/aethyme-contracts/src/experimental_v0/source_snapshot.rs",
+      "sha256": "d36bcd57d0f2ccc47aff1a4c69d5ee974d09a22879cfc0ce938687761737ed14"
+    },
+    {
+      "path": "packages/aethyme/rust/crates/aethyme-contracts/src/experimental_v0/digest.rs",
+      "sha256": "788a9f87485bca0aa35c91f1071bb647fc76c559c2f304f59ceb747b39437ab6"
+    },
+    {
+      "path": "packages/aethyme/rust/crates/aethyme-contracts/src/experimental_v0/project_identity.rs",
+      "sha256": "c1cc308deeea7a0c83f400fc326acd69b75bfc4c01390ae59cb731620877883b"
+    },
+    {
+      "path": "packages/aethyme/rust/crates/aethyme-contracts/src/experimental_v0/contribution_revision.rs",
+      "sha256": "130fd50fa6ef2e6f14cc5b6efdde2d88de13116d9766716e5a4bdab8ddbd188b"
+    },
+    {
+      "path": "packages/aethyme/rust/crates/aethyme-contracts/tests/canonical_json_vectors.rs",
+      "sha256": "403d6afa08ac94b71b1386bc20a50b401e513cb9765f2d60007c3ff7e8bba96e"
+    },
+    {
+      "path": "packages/aethyme/rust/crates/aethyme-contracts/tests/record_vectors.rs",
+      "sha256": "563bd824740be45f994d50999da3f1a6dccb50b3f652378a9c0fd94533207c61"
+    },
+    {
+      "path": "packages/aethyme/rust/crates/aethyme-contracts/tests/source_snapshot_vectors.rs",
+      "sha256": "881fb26bddb06042605b922dd706430502de4e4354ab6cfa9eefe53150623a40"
+    },
+    {
+      "path": "packages/aethyme/rust/crates/aethyme-contracts/tests/project_identity_vectors.rs",
+      "sha256": "105318cb03e0132c30c1c73684e16e6e9ce85f54ae829a97c8b347788b6ff4d2"
+    },
+    {
+      "path": "packages/aethyme/rust/crates/aethyme-contracts/tests/contribution_revision.rs",
+      "sha256": "c648dca581d9137849292d7283448f1c55bd18de7054b35570d5151708f5835d"
+    },
+    {
+      "path": "packages/aethyme/rust/crates/aethyme-contracts/fixtures/experimental-v0/project_identity.json",
+      "sha256": "9b8a506c0830ebb49a72d8751c694465a213c64a8800b6ce90d51800cb8fb009"
+    }
+  ],
+  "typescript_sources": [
+    {
+      "path": "packages/aethyme-eval/local-v3/t01-canonical-parity/canonical-json.mts",
+      "sha256": "96a444d3d7f40c8d934586c9d8f49346c8e74973eba6d2fa60c01c4ebce92ebb"
+    },
+    {
+      "path": "packages/aethyme-eval/local-v3/d10-identity-parity/project-identity.mts",
+      "sha256": "8454cd093e84b3e4234d1112a78e4cc297d29f3ef588abd3f9153ff84dc05ef3"
+    },
+    {
+      "path": "packages/aethyme-eval/local-v3/d10-identity-parity/d10-identity-parity.mts",
+      "sha256": "2530b3eddec4c59f39c0d3b1acd37b11c1309013ba57f87b8a82a0b68695f0c3"
+    }
+  ],
+  "fixture_files": [
+    {
+      "path": "vectors/ordinal-supplement/manifest.json",
+      "sha256": "69ac3502ed87470275922c27a5098c06d0272049b53f4141c354346f66ca978f"
+    },
+    {
+      "path": "vectors/ordinal-supplement/inputs.json",
+      "sha256": "a800c0f6622642e9cf0866a1e60f724270f7b9cfc1ee3afe06b600161e696fd8"
+    },
+    {
+      "path": "vectors/ordinal-supplement/expected.json",
+      "sha256": "67b9586320e91de0a5d3deda44ff03ee51f099846dc93597f46155f7e811711b"
+    },
+    {
+      "path": "vectors/ordinal-supplement/oracle.py",
+      "sha256": "98b1c36ed2fea2b8a383e521901ee5ffb4cf51cad228a3a5f038482b26362072"
+    },
+    {
+      "path": "vectors/prior-v1-invalid/manifest.json",
+      "sha256": "dcd046d68020c580fe3f5fa1598696ef864746240d7fc99e982d5e774fabc68f"
+    },
+    {
+      "path": "vectors/prior-v1-invalid/inputs.json",
+      "sha256": "be5e1daa719a1ae076c58e1728f330900af06aeb63cbb3253fa1c97c4aacb2dd"
+    },
+    {
+      "path": "vectors/prior-v1-invalid/expected.json",
+      "sha256": "08b1d82960efa01461b4d1cdbf19d9da36a8a89bf2ed46e5918501ae3af78998"
+    },
+    {
+      "path": "vectors/prior-v1-invalid/oracle.py",
+      "sha256": "bd6685735a17a72014a05e1319b16d62983fef5381f8b2d8d4795ba39f032c95"
+    },
+    {
+      "path": "vectors/prior-v2-partially-invalid/manifest.json",
+      "sha256": "4979504c53d8c23cefe22d577adc019154290f2466a06923eef3d772fe42d4e4"
+    },
+    {
+      "path": "vectors/prior-v2-partially-invalid/inputs.json",
+      "sha256": "b269c64f26ef1dd04603f0e062c5ccac98989c1875dff1546baa2f5f88465cd7"
+    },
+    {
+      "path": "vectors/prior-v2-partially-invalid/expected.json",
+      "sha256": "62fbfa515b01804ac409fd591368b30b62b364d269ab1422015e9121a3093048"
+    },
+    {
+      "path": "vectors/prior-v2-partially-invalid/oracle.py",
+      "sha256": "3a95aa4a5b20f12fe13474d93e6c534685166de94dda5f1bea7c486c43e9c18e"
+    },
+    {
+      "path": "vectors/contribution-revision-bound/manifest.json",
+      "sha256": "ab85554b8b16543b2b356acaa29fcfbfcea8456292baa705d167daab5a14c9d1"
+    },
+    {
+      "path": "vectors/contribution-revision-bound/inputs.json",
+      "sha256": "f168d9734ee9f4298c5abac430b944ab3e49d25cae46b293d7b4319a359b99c0"
+    },
+    {
+      "path": "vectors/contribution-revision-bound/expected.json",
+      "sha256": "335a8c93721d8fc29f09cbdeff2637a7eb000b4db90e17b0d13fef0e2155c0d2"
+    },
+    {
+      "path": "vectors/contribution-revision-bound/oracle.py",
+      "sha256": "b69674dcc74b5388baf13b4eef09059ed119afd47ab37a9768e811c5334e901e"
+    },
+    {
+      "path": "vectors/explicit-rename/manifest.json",
+      "sha256": "6fb13ac0e523d65efcaece433353e3fe787aaf09eb90cebab35804bafcc287e0"
+    },
+    {
+      "path": "vectors/explicit-rename/inputs.json",
+      "sha256": "5db662e3bbf4adab125b5f0cb1090eb586804815bc795a420d39d944fd4b3702"
+    },
+    {
+      "path": "vectors/explicit-rename/expected.json",
+      "sha256": "ed8c5a28aa017e40661b965622001ddd23427f1e545203cefe8b8bccb5edd9b3"
+    },
+    {
+      "path": "vectors/explicit-rename/oracle.py",
+      "sha256": "91c9bd162616a148258f8305e599319844f6891c6bb097ee0e7b7464b83323c5"
+    }
+  ]
+}
