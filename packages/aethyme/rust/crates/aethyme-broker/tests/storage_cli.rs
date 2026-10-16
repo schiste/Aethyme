@@ -3,10 +3,19 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-use aethyme_broker::Broker;
-
 const CLI: &str = env!("CARGO_BIN_EXE_broker-cli-shim");
 mod common;
+
+struct TestRepo {
+    _root: tempfile::TempDir,
+    path: PathBuf,
+}
+
+impl TestRepo {
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
 
 fn git(repo: &Path, args: &[&str]) {
     let output = Command::new("git")
@@ -25,22 +34,27 @@ fn git(repo: &Path, args: &[&str]) {
     );
 }
 
-fn fixture() -> (tempfile::TempDir, tempfile::TempDir) {
-    let repo = tempfile::tempdir().unwrap();
+fn fixture() -> (TestRepo, tempfile::TempDir) {
+    let root = tempfile::tempdir().unwrap();
+    let repo_path = root.path().join("repo");
+    std::fs::create_dir_all(&repo_path).unwrap();
     let container = tempfile::tempdir().unwrap();
-    git(repo.path(), &["init", "-q", "-b", "main"]);
-    std::fs::write(repo.path().join("README.md"), "fixture\n").unwrap();
-    std::fs::write(repo.path().join(".gitignore"), "/.aethyme/\n").unwrap();
-    git(repo.path(), &["add", "-A"]);
-    git(repo.path(), &["commit", "-qm", "init"]);
-    std::fs::create_dir_all(repo.path().join(".aethyme")).unwrap();
+    git(&repo_path, &["init", "-q", "-b", "main"]);
+    std::fs::write(repo_path.join("README.md"), "fixture\n").unwrap();
+    std::fs::write(repo_path.join(".gitignore"), "/.aethyme/\n").unwrap();
+    git(&repo_path, &["add", "-A"]);
+    git(&repo_path, &["commit", "-qm", "init"]);
+    std::fs::create_dir_all(repo_path.join(".aethyme")).unwrap();
     std::fs::write(
-        repo.path().join(".aethyme/broker.toml"),
+        repo_path.join(".aethyme/broker.toml"),
         "[retention]\norphan_worktree_roots_days = 0\n",
     )
     .unwrap();
-    let broker = Broker::open(repo.path()).unwrap();
-    drop(broker);
+    drop(aethyme_broker::BrokerStore::open_in_repo(&repo_path).unwrap());
+    let repo = TestRepo {
+        _root: root,
+        path: repo_path,
+    };
     (repo, container)
 }
 
@@ -60,12 +74,39 @@ fn enroll(repo: &Path) {
     git(repo, &["commit", "-qm", "enroll fixture"]);
 }
 
-fn run(repo: &Path, container: &Path, args: &[&str]) -> Output {
+fn run_at(repo: &Path, current_dir: &Path, container: &Path, args: &[&str]) -> Output {
+    let fixture_root = repo
+        .parent()
+        .expect("the test repository is nested under its owned fixture root");
+    let host_state = fixture_root.join("host-state");
+    let host_cache = fixture_root.join("host-cache");
+    std::fs::create_dir_all(&host_state).unwrap();
+    std::fs::create_dir_all(&host_cache).unwrap();
+    drop(
+        aethyme_broker::HostResourceCoordinator::open(&host_state.join("host-resources.db"))
+            .unwrap(),
+    );
     common::broker_cli(CLI, args)
-        .current_dir(repo)
+        .current_dir(current_dir)
         .env("AETHYME_WORKTREE_ROOT", container)
+        .env("AETHYME_HOST_STATE_DIR", host_state)
+        .env("AETHYME_HOST_CACHE_DIR", host_cache)
         .output()
         .unwrap()
+}
+
+fn run(repo: &Path, container: &Path, args: &[&str]) -> Output {
+    run_at(repo, repo, container, args)
+}
+
+fn adopt_worktree(repo: &Path, container: &Path, worktree: &Path, task: &str) {
+    let output = run_at(
+        repo,
+        worktree,
+        container,
+        &["start", "--adopt", ".", "--task", task, "--json"],
+    );
+    let _ = json(output);
 }
 
 fn marker(root: &Path, key: &str, repository_root: &Path) {
@@ -85,7 +126,8 @@ fn marker(root: &Path, key: &str, repository_root: &Path) {
 fn json(output: Output) -> serde_json::Value {
     assert!(
         output.status.success(),
-        "CLI failed: {}",
+        "CLI failed: stdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
     serde_json::from_slice(&output.stdout).unwrap()
@@ -110,8 +152,7 @@ fn storage_plan_reconciles_disk_git_and_session_ledger_without_writing() {
         ],
     );
     let registered_path = std::fs::canonicalize(&registered).unwrap();
-    let mut broker = Broker::open(repo.path()).unwrap();
-    broker.adopt(&registered, Some("ledger claim")).unwrap();
+    adopt_worktree(repo.path(), container.path(), &registered, "ledger claim");
     git(repo.path(), &["branch", "agent/unclaimed", "HEAD"]);
     std::fs::create_dir_all(owner_root.join("stray")).unwrap();
     std::fs::write(owner_root.join("stray/data"), "stray\n").unwrap();
@@ -446,20 +487,26 @@ fn storage_apply_refuses_a_plan_when_a_new_stray_appears() {
 
 #[test]
 fn storage_apply_binds_preparation_candidates_to_confirmation() {
-    let (repo, host) = fixture();
-    let container = host.path().join("worktrees");
-    std::fs::create_dir_all(&container).unwrap();
+    let (repo, container) = fixture();
+    let host_state = repo
+        .path()
+        .parent()
+        .expect("the test repository is nested under its owned fixture root")
+        .join("host-state");
+    let cache_root = host_state.join("preparation-cache");
+    let container = container.path();
+    std::fs::create_dir_all(container).unwrap();
     let empty = json(run(
         repo.path(),
-        &container,
+        container,
         &["gc", "storage", "plan", "--json"],
     ));
-    let entry = host.path().join("preparation-cache/repository/new-key");
+    let entry = cache_root.join("a".repeat(64)).join("b".repeat(12));
     std::fs::create_dir_all(&entry).unwrap();
     std::fs::write(entry.join("payload"), "must survive stale approval").unwrap();
     let populated = json(run(
         repo.path(),
-        &container,
+        container,
         &["gc", "storage", "plan", "--json"],
     ));
     assert_ne!(empty["digest"], populated["digest"]);
@@ -467,7 +514,7 @@ fn storage_apply_binds_preparation_candidates_to_confirmation() {
 
     let refused = run(
         repo.path(),
-        &container,
+        container,
         &[
             "gc",
             "storage",
@@ -483,7 +530,7 @@ fn storage_apply_binds_preparation_candidates_to_confirmation() {
 
     let applied = json(run(
         repo.path(),
-        &container,
+        container,
         &[
             "gc",
             "storage",
@@ -546,9 +593,7 @@ fn storage_reconciliation_lists_git_or_ledger_paths_missing_on_disk() {
             "HEAD",
         ],
     );
-    let mut broker = Broker::open(repo.path()).unwrap();
-    broker.adopt(&registered, Some("ledger claim")).unwrap();
-    drop(broker);
+    adopt_worktree(repo.path(), container.path(), &registered, "ledger claim");
     let registered_path = std::fs::canonicalize(&registered).unwrap();
     std::fs::remove_dir_all(&registered).unwrap();
 
@@ -1056,8 +1101,12 @@ fn a_shared_branch_named_by_a_session_is_reported_shared_not_session_owned() {
             "HEAD",
         ],
     );
-    let mut broker = Broker::open(repo.path()).unwrap();
-    broker.adopt(&shared, Some("shared branch claim")).unwrap();
+    adopt_worktree(
+        repo.path(),
+        container.path(),
+        &shared,
+        "shared branch claim",
+    );
 
     let plan = json(run(
         repo.path(),
