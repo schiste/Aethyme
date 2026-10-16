@@ -1764,12 +1764,13 @@ impl Broker {
         let Ok(worktree_root_plan) = self.worktree_root_plan() else {
             return;
         };
-        let Some(outcome) = crate::graph_integrity::verify_commit_for_advice_with_worktree_root_plan(
-            &main_root,
-            &checkout,
-            head_oid,
-            &worktree_root_plan,
-        )
+        let Some(outcome) =
+            crate::graph_integrity::verify_commit_for_advice_with_worktree_root_plan(
+                &main_root,
+                &checkout,
+                head_oid,
+                &worktree_root_plan,
+            )
         else {
             return;
         };

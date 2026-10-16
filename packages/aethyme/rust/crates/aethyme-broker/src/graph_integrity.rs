@@ -393,10 +393,7 @@ pub(crate) fn verify_checkout_without_mutation(
     }
     let root_plan = crate::verification::default_worktree_root_plan(main_root);
     verify_checkout_without_mutation_with_worktree_root_plan(
-        main_root,
-        checkout,
-        policy,
-        &root_plan,
+        main_root, checkout, policy, &root_plan,
     )
 }
 
