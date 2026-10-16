@@ -77,6 +77,17 @@ fn stream_id(stream: &StreamWitness) -> Result<RecordId, ExchangeError> {
     stream.validate()?;
     Ok(canonical(&STREAM, stream)?.id())
 }
+fn paths_within_peer_scope(paths: &[String], packet_paths: &[String]) -> bool {
+    !packet_paths.is_empty()
+        && packet_paths.iter().all(|value| {
+            paths.iter().any(|path| {
+                value == path
+                    || value
+                        .strip_prefix(path)
+                        .is_some_and(|rest| rest.starts_with('/'))
+            })
+        })
+}
 fn pin(tx: &Transaction<'_>, digest: &ObjectDigest, holder: &str) -> Result<(), ExchangeError> {
     tx.execute("INSERT INTO object_pins(class,object_sha256,holder,created_ms) VALUES('cited_evidence',?1,?2,?3)",params![digest.hex(),holder,now()?])?;
     Ok(())
@@ -298,17 +309,9 @@ impl CurrentPeer<'_> {
         if let Scope::Paths(paths) = &spec.scope {
             match packet {
                 Metadata::Contribution { scope, .. }
-                    if scope.iter().all(|v| {
-                        paths.iter().any(|p| {
-                            v == p || v.strip_prefix(p).is_some_and(|rest| rest.starts_with('/'))
-                        })
-                    }) => {}
+                    if paths_within_peer_scope(paths, scope) => {}
                 Metadata::RevisionContribution { scope, .. }
-                    if scope.iter().all(|v| {
-                        paths.iter().any(|p| {
-                            v == p || v.strip_prefix(p).is_some_and(|rest| rest.starts_with('/'))
-                        })
-                    }) => {}
+                    if paths_within_peer_scope(paths, scope) => {}
                 _ => return Err(ExchangeError::Forbidden),
             }
         }
@@ -514,6 +517,7 @@ fn validate_revision_project_binding(
         revision_bytes_hex,
         brief_object_sha256,
         brief_bytes_hex,
+        scope,
         ..
     } = packet
     else {
@@ -599,6 +603,25 @@ fn validate_revision_project_binding(
         || resolved.result_state().snapshot_id() != revision.result()
     {
         return Err(invalid("revision identity transition binding"));
+    }
+    let mut actual_paths = BTreeSet::new();
+    for state in resolved
+        .identity_transition()
+        .changes()
+        .iter()
+        .flat_map(|change| [change.before.as_ref(), change.after.as_ref()])
+        .flatten()
+    {
+        let path = std::str::from_utf8(&state.path)
+            .map_err(|_| invalid("revision scope contains a non-UTF-8 source path"))?;
+        actual_paths.insert(path.to_string());
+    }
+    let actual_paths: Vec<_> = actual_paths.into_iter().collect();
+    super::revision_paths(&actual_paths)?;
+    if actual_paths.iter().collect::<BTreeSet<_>>()
+        != scope.iter().collect::<BTreeSet<_>>()
+    {
+        return Err(invalid("revision scope does not match verified source paths"));
     }
     let brief_digest = match (brief_object_sha256, resolved.brief_digest()) {
         (Some(encoded), Some(digest)) if archive::parse_digest(encoded) == Some(digest) => {
@@ -1042,6 +1065,7 @@ pub fn recover_snapshot(
         let mut revision_objects = Vec::new();
         let mut positions = BTreeSet::new();
         let mut packets = BTreeSet::new();
+        let mut total_snapshot_bytes = 0usize;
         loop {
             proof.check()?;
             let page = peer
@@ -1055,6 +1079,9 @@ pub fn recover_snapshot(
             }
             descriptor = Some(page.snapshot.clone());
             for event in page.items {
+                let event_bytes = event.record()?.canonical_bytes().len();
+                total_snapshot_bytes =
+                    add_snapshot_recovery_bytes(total_snapshot_bytes, event_bytes)?;
                 proof.visible(&peer.spec, &event.packet)?;
                 revision_objects.push(validate_revision_project_binding(store, &event.packet)?);
                 if !positions.insert(event.sequence) || !packets.insert(event.packet.record()?.id())
@@ -1113,6 +1140,31 @@ pub fn recover_snapshot(
     }
     result
 }
+
+fn add_snapshot_recovery_bytes(total: usize, next: usize) -> Result<usize, ExchangeError> {
+    let total = total.checked_add(next).ok_or(ExchangeError::Limit)?;
+    if total > MAX_SNAPSHOT_RECOVERY_BYTES {
+        return Err(ExchangeError::Limit);
+    }
+    Ok(total)
+}
+
+#[cfg(test)]
+mod revision_snapshot_budget_tests {
+    use super::*;
+
+    #[test]
+    fn snapshot_recovery_rejects_aggregate_over_budget_before_append() {
+        assert_eq!(
+            add_snapshot_recovery_bytes(MAX_SNAPSHOT_RECOVERY_BYTES - 1, 1).unwrap(),
+            MAX_SNAPSHOT_RECOVERY_BYTES
+        );
+        assert!(matches!(
+            add_snapshot_recovery_bytes(MAX_SNAPSHOT_RECOVERY_BYTES - 1, 2),
+            Err(ExchangeError::Limit)
+        ));
+    }
+}
 /// Cached remote projection is accessible only after a fresh native lease.
 /// Offline/expired/revoked peer data cannot silently regain current visibility.
 pub fn projection(
@@ -1156,3 +1208,6 @@ pub fn projection(
     }
     result
 }
+
+#[cfg(test)]
+mod revision_tests;

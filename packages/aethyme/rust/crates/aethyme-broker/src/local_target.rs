@@ -115,6 +115,17 @@ pub struct TargetRevision {
     pub revision_bindings: Option<D10RevisionBindings>,
 }
 
+/// Read-only view of a target revision used to render historical waves and
+/// dispositions. It carries no D10 binding references that could authorize a
+/// later action.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TargetRevisionHistory {
+    pub(crate) id: RecordId,
+    pub(crate) target: String,
+    pub(crate) issuer: String,
+    pub(crate) spec: TargetSpec,
+}
+
 /// The full model, including later acceptance phases. The current runtime
 /// refuses to enter acceptance phases without the future trusted integration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -667,12 +678,12 @@ pub(crate) fn load_revision_under_response(
         return Err(TargetError::Unauthorized);
     }
     crate::collaboration_sensitive::ensure_available(store)?;
-    let (target, body): (String, Vec<u8>) = store
+    let (target, body, released): (String, Vec<u8>, bool) = store
         .read_connection()
         .query_row(
-            "SELECT target, body FROM local_target_revisions WHERE revision = ?1",
+            "SELECT target, body, released FROM local_target_revisions WHERE revision = ?1",
             [id.as_str()],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
         .optional()?
         .ok_or(TargetError::Missing)?;
@@ -691,6 +702,9 @@ pub(crate) fn load_revision_under_response(
         .to_string();
     let spec: TargetSpec = serde_json::from_value(json["spec"].clone())?;
     let has_revision_bindings = json.get("revision_bindings").is_some();
+    if released && has_revision_bindings {
+        return Err(TargetError::Released);
+    }
     if normalize_with_d10(spec.clone(), has_revision_bindings)? != spec {
         return Err(TargetError::Corrupt("unnormalized target".into()));
     }
@@ -725,6 +739,81 @@ pub(crate) fn load_revision_under_response(
         issuer,
         spec,
         revision_bindings,
+    })
+}
+
+/// Load the immutable body for historical display. Active revisions go
+/// through the full D10 archive and identity-history validator. Released D10
+/// revisions retain only their canonical local body; this view cannot be
+/// passed to execution or target-selection APIs.
+pub(crate) fn load_revision_history_under_response(
+    store: &CollaborationStore,
+    id: &RecordId,
+    response: &crate::collaboration_sensitive::ResponseUse,
+) -> Result<TargetRevisionHistory, TargetError> {
+    if !response.covers(store) {
+        return Err(TargetError::Unauthorized);
+    }
+    crate::collaboration_sensitive::ensure_available(store)?;
+    let (target, body, released): (String, Vec<u8>, bool) = store
+        .read_connection()
+        .query_row(
+            "SELECT target, body, released FROM local_target_revisions WHERE revision = ?1",
+            [id.as_str()],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()?
+        .ok_or(TargetError::Missing)?;
+    let record = Record::decode(&body, &[&TARGET_REVISION_SCHEMA])
+        .map_err(|error| TargetError::Corrupt(error.to_string()))?;
+    if record.id() != *id || record.canonical_bytes() != body {
+        return Err(TargetError::Corrupt("revision digest".into()));
+    }
+    let json: serde_json::Value = serde_json::from_slice(&body)?;
+    if json["target"].as_str() != Some(&target) {
+        return Err(TargetError::Corrupt("revision target".into()));
+    }
+    let issuer = json["issuer"]
+        .as_str()
+        .ok_or_else(|| TargetError::Corrupt("issuer".into()))?
+        .to_string();
+    let spec: TargetSpec = serde_json::from_value(json["spec"].clone())?;
+    let has_revision_bindings = json.get("revision_bindings").is_some();
+    if normalize_with_d10(spec.clone(), has_revision_bindings)? != spec {
+        return Err(TargetError::Corrupt("unnormalized target".into()));
+    }
+    match json.get("revision_bindings") {
+        None => {}
+        Some(serde_json::Value::Null) => {
+            return Err(TargetError::Corrupt("null D10 revision bindings".into()));
+        }
+        Some(value) => {
+            let bindings: D10RevisionBindings = serde_json::from_value(value.clone())?;
+            if bindings
+                .revisions
+                .windows(2)
+                .any(|pair| pair[0].contribution >= pair[1].contribution)
+            {
+                return Err(TargetError::Corrupt(
+                    "D10 contribution mappings are not strictly sorted".into(),
+                ));
+            }
+        }
+    }
+    if !released {
+        let active = load_revision_under_response(store, id, response)?;
+        return Ok(TargetRevisionHistory {
+            id: active.id,
+            target: active.target,
+            issuer: active.issuer,
+            spec: active.spec,
+        });
+    }
+    Ok(TargetRevisionHistory {
+        id: id.clone(),
+        target,
+        issuer,
+        spec,
     })
 }
 
@@ -866,10 +955,24 @@ pub fn dispositions(
     id: &RecordId,
 ) -> Result<Vec<ContributionDisposition>, TargetError> {
     let _response = crate::collaboration_sensitive::response_use(store)?;
-    load_revision(store, id)?;
+    let history = load_revision_history_under_response(store, id, &_response)?;
+    if history.id != *id || history.target.is_empty() || history.issuer.is_empty() {
+        return Err(TargetError::Corrupt("target revision history identity".into()));
+    }
+    let expected: BTreeSet<_> = history
+        .spec
+        .contributions
+        .iter()
+        .map(|contribution| contribution.id.as_str())
+        .collect();
     let raw: Vec<(String, String, Option<String>)> = store.read_connection().prepare(
         "SELECT contribution, status, detail FROM local_target_dispositions WHERE revision = ?1 ORDER BY contribution",
     )?.query_map([id.as_str()], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<Result<_, _>>()?;
+    if raw.len() != expected.len()
+        || raw.iter().any(|(contribution, _, _)| !expected.contains(contribution.as_str()))
+    {
+        return Err(TargetError::Corrupt("target revision dispositions".into()));
+    }
     raw.into_iter()
         .map(|(contribution, code, detail)| {
             Ok(ContributionDisposition {
@@ -1045,3 +1148,5 @@ pub fn release_revision(
 
 #[cfg(test)]
 pub(crate) mod tests;
+#[cfg(test)]
+mod revision_tests;

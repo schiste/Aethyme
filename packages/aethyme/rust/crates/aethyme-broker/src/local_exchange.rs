@@ -18,6 +18,8 @@ pub const MAX_REVISION_PACKET_BYTES: usize =
         + 2 * aethyme_contracts::experimental_v0::brief::MAX_BRIEF_RECORD_BYTES
         + 32 * 1024;
 pub const MAX_SNAPSHOT_PAGE_BYTES: usize = 32 * 1024 * 1024;
+/// Bound the complete in-memory snapshot assembled from multiple pages.
+pub const MAX_SNAPSHOT_RECOVERY_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_BATCH_ITEMS: usize = 64;
 pub const MAX_VISIBLE_ITEMS: usize = 1024;
 pub const MAX_BUFFERED_EVENTS: usize = 256;
@@ -154,6 +156,15 @@ fn paths(values: &[String]) -> Result<(), ExchangeError> {
         {
             return Err(invalid("scope path"));
         }
+    }
+    Ok(())
+}
+fn revision_paths(values: &[String]) -> Result<(), ExchangeError> {
+    if values.len() > 64 {
+        return Err(invalid("scope paths"));
+    }
+    if !values.is_empty() {
+        paths(values)?;
     }
     Ok(())
 }
@@ -413,7 +424,7 @@ impl Metadata {
         digest_text(revision_object_sha256)?;
         source_id(source)?;
         availability.validate()?;
-        paths(scope)?;
+        revision_paths(&scope)?;
 
         // Check encoded lengths before allocating decoded bytes.
         if revision_bytes_hex.len()

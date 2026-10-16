@@ -20,7 +20,8 @@ use crate::{
     collaboration_archive::{self as archive, ObjectDigest},
     collaboration_state::CollaborationStore,
     collaboration_identity_store::{
-        resolve_approved_project_binding, resolve_bound_contribution_revision,
+        resolve_approved_project_binding, resolve_bound_contribution_revisions,
+        ContributionRevisionPin,
     },
 };
 
@@ -128,9 +129,7 @@ pub(super) fn validate_bindings(
         .iter()
         .map(|contribution| (contribution.id.as_str(), contribution))
         .collect();
-    let mut parsed_revisions = BTreeMap::new();
-    let mut identity_transitions = BTreeMap::new();
-
+    let mut parsed_pins = Vec::with_capacity(bindings.revisions.len());
     for pin in &bindings.revisions {
         let target_id = &pin.contribution;
         let contribution = contributions
@@ -146,43 +145,60 @@ pub(super) fn validate_bindings(
                 "D10 revision is mapped more than once".into(),
             ));
         }
-        let remaining_bytes = MAX_D10_TARGET_BYTES.saturating_sub(total_bytes);
-        let revision_bytes =
-            archive::read_object_bounded(store, &revision_digest, remaining_bytes)?;
+        let lineage = record_id(&contribution.lineage)?;
+        parsed_pins.push((target_id.clone(), logical_id, revision_id, revision_digest, lineage));
+    }
+    let resolver_pins: Vec<_> = parsed_pins
+        .iter()
+        .map(
+            |(_, logical_id, revision_id, revision_digest, _)| ContributionRevisionPin {
+                revision_record_id: revision_id,
+                object_digest: *revision_digest,
+                contribution_id: logical_id,
+            },
+        )
+        .collect();
+    let resolved_revisions = resolve_bound_contribution_revisions(store, &approved, &resolver_pins)
+        .map_err(|_| TargetError::RevisionBindingUnsupported)?;
+    let mut parsed_revisions = BTreeMap::new();
+    let mut identity_transitions = BTreeMap::new();
+
+    for (target_id, logical_id, revision_id, revision_digest, lineage) in parsed_pins {
+        let contribution = contributions
+            .get(target_id.as_str())
+            .ok_or_else(|| TargetError::Invalid("D10 target contribution".into()))?;
+        let resolved = resolved_revisions
+            .get(&revision_id)
+            .ok_or(TargetError::RevisionBindingUnsupported)?;
+        let revision = resolved.revision();
+        if resolved.record_id() != &revision_id
+            || resolved.object_digest() != revision_digest
+            || revision.project_id() != &project_id
+            || revision.contribution_id() != &logical_id
+            || revision.capture_record_id() != &lineage
+            || revision.capture_record_id().as_str() != contribution.lineage
+        {
+            return Err(TargetError::Invalid("D10 revision binding".into()));
+        }
+        let (revision_bytes, observed_revision_id) = revision.to_record();
+        if observed_revision_id != revision_id
+            || ObjectDigest::of(&revision_bytes) != revision_digest
+        {
+            return Err(TargetError::Invalid("D10 revision record identity".into()));
+        }
         total_bytes = total_bytes
             .checked_add(revision_bytes.len())
             .ok_or_else(|| TargetError::Invalid("D10 target size".into()))?;
         if total_bytes > MAX_D10_TARGET_BYTES {
             return Err(TargetError::Invalid("D10 target size".into()));
         }
-        let (revision, observed_revision_id) = ContributionRevision::from_record(&revision_bytes)
-            .map_err(|error| TargetError::Invalid(format!("D10 revision: {error}")))?;
-        if observed_revision_id != revision_id
-            || revision.project_id() != &project_id
-            || revision.contribution_id() != &logical_id
-            || revision.capture_record_id().as_str() != contribution.lineage
-        {
-            return Err(TargetError::Invalid("D10 revision binding".into()));
-        }
-        let lineage = record_id(&contribution.lineage)?;
         let retained = archive::retained_contribution(store, &lineage)?.ok_or(TargetError::Missing)?;
         if revision.base() != &retained.base.snapshot_id
             || revision.result() != &retained.result.snapshot_id
         {
             return Err(TargetError::Invalid("D10 capture snapshot binding".into()));
         }
-        let resolved = resolve_bound_contribution_revision(
-            store,
-            &approved,
-            &revision_id,
-            revision_digest,
-            &logical_id,
-        )
-        .map_err(|_| TargetError::RevisionBindingUnsupported)?;
-        if resolved.record_id() != &revision_id
-            || resolved.object_digest() != revision_digest
-            || resolved.revision() != &revision
-            || resolved.capture_lineage() != &lineage
+        if resolved.capture_lineage() != &lineage
             || resolved.base_state().snapshot_id() != revision.base()
             || resolved.result_state().snapshot_id() != revision.result()
         {
@@ -194,8 +210,9 @@ pub(super) fn validate_bindings(
         if let Some(brief) = revision.brief() {
             let digest = archive::parse_digest(&brief.object_sha256)
                 .ok_or_else(|| TargetError::Invalid("D10 brief object digest".into()))?;
-            let remaining_bytes = MAX_D10_TARGET_BYTES.saturating_sub(total_bytes);
-            let brief_bytes = archive::read_object_bounded(store, &digest, remaining_bytes)?;
+            let brief_bytes = resolved
+                .brief_record_bytes()
+                .ok_or_else(|| TargetError::Invalid("D10 brief bytes are unavailable".into()))?;
             total_bytes = total_bytes
                 .checked_add(brief_bytes.len())
                 .ok_or_else(|| TargetError::Invalid("D10 target size".into()))?;
@@ -220,7 +237,7 @@ pub(super) fn validate_bindings(
         }
         object_digests.insert(revision_digest);
         revision_ids.insert(target_id.clone(), revision_id.clone());
-        parsed_revisions.insert(target_id.clone(), revision);
+        parsed_revisions.insert(target_id, revision.clone());
     }
 
     validate_dependencies(spec, &bindings.revisions, &parsed_revisions)?;
