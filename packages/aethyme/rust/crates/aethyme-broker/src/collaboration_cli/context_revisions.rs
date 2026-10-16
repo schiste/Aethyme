@@ -144,6 +144,27 @@ mod tests {
     }
 
     #[test]
+    fn identity_integrity_and_io_errors_remain_failures_at_the_cli_boundary() {
+        use crate::collaboration_identity_store::IdentityStoreError;
+        let corrupt = IdentityStoreError::Corrupt("invalid immutable record".into());
+        assert_eq!(
+            Failure::domain(corrupt.code(), corrupt.to_string()).exit,
+            exit_status::FAILED
+        );
+        let sqlite = IdentityStoreError::Sqlite(rusqlite::Error::InvalidQuery);
+        let context = crate::collaboration_context::ContextError::ImmutableRevision(sqlite);
+        assert_eq!(
+            Failure::domain(context.code(), context.to_string()).exit,
+            exit_status::FAILED
+        );
+        let unknown = IdentityStoreError::UnknownCaptureOperation("absent-operation".into());
+        assert_eq!(
+            Failure::domain(unknown.code(), unknown.to_string()).exit,
+            exit_status::REFUSED
+        );
+    }
+
+    #[test]
     fn brief_selector_requires_one_exact_selector_and_one_file() {
         let operation = ["--operation", "specific-op", "decision.json"];
         let (selector, file) = brief_selector(&operation).unwrap();

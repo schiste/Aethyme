@@ -39,7 +39,7 @@ impl RevisionContextError {
     pub fn code(&self) -> &'static str {
         match self {
             Self::Context(error) => error.code(),
-            Self::Identity(_) => "revision_identity",
+            Self::Identity(error) => error.code(),
             Self::ConflictingPin => "conflicting_revision_pin",
             Self::RevisionUnavailable => "revision_unavailable",
             Self::VisibilityChanged => "visibility_changed",
@@ -538,7 +538,7 @@ pub(super) fn attach_bound_brief(
     let operation = crate::collaboration_capture::OperationId::parse(&operations[0])
         .map_err(|error| ContextError::RevisionIdentity(error.to_string()))?;
     let binding = resolve_approved_project_binding_with_archive_use(store, archive_use)
-        .map_err(|error| ContextError::RevisionIdentity(error.to_string()))?
+        .map_err(ContextError::ImmutableRevision)?
         .ok_or_else(|| ContextError::RevisionIdentity("project binding is missing".into()))?;
     let resolved =
         crate::collaboration_identity_store::revise_contribution_for_operation_with_archive_use(
@@ -552,7 +552,7 @@ pub(super) fn attach_bound_brief(
             },
             archive_use,
         )
-        .map_err(|error| ContextError::RevisionIdentity(error.to_string()))?;
+        .map_err(ContextError::ImmutableRevision)?;
     resolved
         .revision()
         .brief()

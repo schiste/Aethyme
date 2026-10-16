@@ -641,6 +641,8 @@ pub enum ContextError {
     #[error("immutable revision identity: {0}")]
     RevisionIdentity(String),
     #[error(transparent)]
+    ImmutableRevision(#[from] crate::collaboration_identity_store::IdentityStoreError),
+    #[error(transparent)]
     Archive(#[from] ArchiveError),
     #[error(transparent)]
     State(#[from] CollaborationStateError),
@@ -659,6 +661,7 @@ impl ContextError {
             Self::NotRetained { .. } => "not_retained",
             Self::InvalidBrief(_) => "invalid_brief",
             Self::RevisionIdentity(_) => "revision_identity",
+            Self::ImmutableRevision(error) => error.code(),
             Self::Archive(error) => error.code(),
             Self::State(error) => error.code(),
             Self::Sqlite(_) => "sqlite",

@@ -265,6 +265,8 @@ impl Failure {
                 | "injected"
                 | "corrupt_receipt"
                 | "corrupt_object"
+                | "corrupt_state"
+                | "archive_lock"
                 | "missing_object"
         ) {
             exit_status::FAILED
@@ -1582,7 +1584,7 @@ fn attach_selected_brief(
                 revise_contribution_for_operation,
             };
             let binding = resolve_approved_project_binding(store)
-                .map_err(|error| Failure::domain("revision_identity", error.to_string()))?
+                .map_err(|error| Failure::domain(error.code(), error.to_string()))?
                 .ok_or_else(|| {
                     Failure::refused(
                         "project_unbound",
@@ -1600,7 +1602,7 @@ fn attach_selected_brief(
                     depends_on: None,
                 },
             )
-            .map_err(|error| Failure::domain("revision_identity", error.to_string()))?;
+            .map_err(|error| Failure::domain(error.code(), error.to_string()))?;
             let id = resolved
                 .revision()
                 .brief()
