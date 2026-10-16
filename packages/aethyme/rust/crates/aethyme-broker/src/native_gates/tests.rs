@@ -549,6 +549,238 @@ fn actual_composer_candidate_runs_native_gates_without_legacy_queue_or_ref_write
 }
 
 #[test]
+fn settled_synthesized_attempt_attaches_and_prepares_a_fresh_exact_gate() {
+    let mut s = setup(Some(GATES));
+    let repo = s.f._repo.path().to_path_buf();
+    let owner = s.owner.as_ref().expect("setup owner is present");
+
+    let old_job = prepare(&mut s.f.store, owner, &mut s.broker, &s.wave).unwrap();
+    let old_observation = json!({"status":"original candidate observation"});
+    s.f.store
+        .connection()
+        .execute(
+            "UPDATE local_native_gate_jobs SET state='completed',observation=?2 WHERE id=?1",
+            params![
+                old_job.id.as_str(),
+                serde_json::to_vec(&old_observation).unwrap()
+            ],
+        )
+        .unwrap();
+
+    let composed = wave::compose_with_source(&mut s.f.store, owner, &repo, &s.wave).unwrap();
+    let source = composed
+        .source
+        .expect("the original recipe source is retained");
+    let checks = [crate::resolution::FailedCheck {
+        check: format!("native-gate:retained-features:{}", "a".repeat(64)),
+    }];
+    let requested = wave::raise_resolution_for_failed_checks(
+        &mut s.f.store,
+        owner,
+        &repo,
+        &s.wave,
+        &source,
+        &checks,
+        &std::sync::atomic::AtomicBool::new(false),
+    )
+    .unwrap();
+    let request_ref = requested
+        .resolution_request
+        .clone()
+        .expect("the failed check request is linked to the wave");
+    let expected_version = target::status(&s.f.store, owner.target()).unwrap().version;
+
+    let session_label = "session-synthesized-attach-test";
+    let started = crate::resolution::begin_attempt(
+        &mut s.f.store,
+        &repo,
+        &request_ref,
+        session_label,
+        "client-synthesized-attach-test",
+        crate::resolution::DispatchLimits {
+            max_manifest_bytes: 1_000_000,
+            max_manifest_entries: 256,
+            max_file_bytes: 1_000_000,
+            max_total_input_bytes: 4_000_000,
+            max_response_bytes: 1_000_000,
+        },
+    )
+    .unwrap();
+    let crate::resolution::BeginResolutionAttempt::Started { status, .. } = started else {
+        panic!("the focused test must create one new charged attempt");
+    };
+    assert_eq!(status.request, request_ref);
+    crate::resolution::mark_attempt_dispatching(&mut s.f.store, &status.token, session_label)
+        .unwrap();
+    let envelope = json!({
+        "schema": crate::resolution::ASYNC_RESPONSE_ENVELOPE_SCHEMA,
+        "attempt_token": status.token,
+        "session_label": session_label,
+        "request_record_id": status.request.id.as_str(),
+        "request_object_sha256": status.request.object.hex(),
+        "input_manifest_sha256": status.input_manifest_sha256,
+        "response": {
+            "kind": "proposal",
+            "detail": null,
+            "brief": "repair the retained failed-check candidate",
+            "writes": [{
+                "path": "one.txt",
+                "delete": false,
+                "kind": "regular",
+                "bytes_hex": "410a7265736f6c7665640a"
+            }]
+        }
+    });
+    let response_bytes = serde_json::to_vec(&envelope).unwrap();
+    let bound =
+        crate::resolution::decode_attempt_response_envelope(&status, &response_bytes).unwrap();
+    let settled = crate::resolution::finish_bound_attempt(&mut s.f.store, &repo, &bound).unwrap();
+    assert!(matches!(
+        settled.outcome,
+        crate::resolution::ResolutionOutcome::Synthesized(_)
+    ));
+    let ledger =
+        crate::resolution::attempt_status(&s.f.store, &status.token, session_label).unwrap();
+    assert_eq!(
+        ledger.state,
+        crate::resolution::ResolutionAttemptState::Settled
+    );
+    let result_ref = ledger.result.expect("the settled ledger names its result");
+
+    assert_eq!(
+        target::status(&s.f.store, owner.target()).unwrap().version,
+        expected_version
+    );
+    let cancelled = wave::attach_synthesized_attempt_result(
+        &mut s.f.store,
+        owner,
+        &repo,
+        &s.wave,
+        expected_version,
+        &request_ref,
+        &status.token,
+        &std::sync::atomic::AtomicBool::new(true),
+    );
+    assert!(matches!(cancelled, Err(wave::WaveError::Stale)));
+    let before_attach = wave::load(&s.f.store, &s.wave).unwrap();
+    assert!(before_attach.resolution_result.is_none());
+    assert_eq!(
+        target::status(&s.f.store, owner.target()).unwrap().version,
+        expected_version
+    );
+
+    let attached = wave::attach_synthesized_attempt_result(
+        &mut s.f.store,
+        owner,
+        &repo,
+        &s.wave,
+        expected_version,
+        &request_ref,
+        &status.token,
+        &std::sync::atomic::AtomicBool::new(false),
+    )
+    .unwrap();
+    assert_eq!(attached.phase, WavePhase::Verifying);
+    assert_eq!(attached.resolution_result.as_ref(), Some(&result_ref));
+    let attached_status = target::status(&s.f.store, owner.target()).unwrap();
+    assert_eq!(attached_status.version, expected_version + 1);
+    assert_eq!(attached_status.phase, target::Phase::Verifying);
+    let settled_after_attach =
+        crate::resolution::attempt_status(&s.f.store, &status.token, session_label).unwrap();
+    assert_eq!(
+        settled_after_attach.state,
+        crate::resolution::ResolutionAttemptState::Settled
+    );
+    assert_eq!(settled_after_attach.result.as_ref(), Some(&result_ref));
+    let charge_count: i64 =
+        s.f.store
+            .read_connection()
+            .query_row(
+                "SELECT count(*) FROM resolution_attempts WHERE async_token=?1",
+                [&status.token],
+                |row| row.get(0),
+            )
+            .unwrap();
+    assert_eq!(
+        charge_count, 1,
+        "attachment does not create another attempt charge"
+    );
+    let (synthesis, provenance) = wave::read_synthesized_wave_result(&s.f.store, &repo, &attached)
+        .unwrap()
+        .expect("only a strict settled result has synthesized provenance");
+    assert_eq!(provenance.request_record_id, request_ref.id.to_string());
+    assert_eq!(provenance.request_object, request_ref.object.hex());
+    assert_eq!(provenance.group_record_id, result_ref.id.to_string());
+    assert_eq!(provenance.group_object, result_ref.object.hex());
+    assert_eq!(
+        attached.candidate_snapshot.as_ref(),
+        Some(&synthesis.candidate.subject)
+    );
+    assert_eq!(
+        attached.candidate_commit.as_ref(),
+        Some(&synthesis.candidate.commit)
+    );
+    let repeated = wave::attach_synthesized_attempt_result(
+        &mut s.f.store,
+        owner,
+        &repo,
+        &s.wave,
+        expected_version,
+        &request_ref,
+        &status.token,
+        &std::sync::atomic::AtomicBool::new(false),
+    )
+    .unwrap();
+    assert_eq!(repeated, attached);
+
+    let fresh_job = prepare(&mut s.f.store, owner, &mut s.broker, &s.wave).unwrap();
+    assert_ne!(fresh_job.id, old_job.id);
+    assert_eq!(fresh_job.spec.synthesized_group.as_ref(), Some(&provenance));
+    assert_eq!(
+        fresh_job.spec.recipe,
+        attached.recipe_object.map(|object| object.hex())
+    );
+    let verified_candidate =
+        validate_source(&mut s.f.store, owner, &repo, &fresh_job.spec).unwrap();
+    assert_eq!(verified_candidate.commit, fresh_job.spec.commit);
+    assert_eq!(verified_candidate.tree, fresh_job.spec.tree);
+    assert!(validate_source(&mut s.f.store, owner, &repo, &old_job.spec).is_err());
+    let loaded_old = load(&s.f.store, &old_job.id).unwrap();
+    assert_eq!(loaded_old.observation, Some(old_observation));
+
+    for reference in [
+        provenance.request_object.as_str(),
+        provenance.group_object.as_str(),
+        provenance.input_manifest_sha256.as_str(),
+    ] {
+        let roots: i64 = s
+            .f
+            .store
+            .read_connection()
+            .query_row(
+                "SELECT count(*) FROM local_native_gate_roots WHERE job=?1 AND kind='object' AND reference=?2",
+                params![fresh_job.id.as_str(), reference],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            roots, 1,
+            "fresh gate job must retain provenance object {reference}"
+        );
+    }
+    let same_wave_jobs: i64 =
+        s.f.store
+            .read_connection()
+            .query_row(
+                "SELECT count(*) FROM local_native_gate_jobs WHERE wave=?1",
+                [&fresh_job.spec.wave],
+                |row| row.get(0),
+            )
+            .unwrap();
+    assert_eq!(same_wave_jobs, 2);
+}
+
+#[test]
 fn exact_spec_identity_preserves_old_job_and_separates_same_wave_synthesis() {
     let mut s = setup(Some(GATES));
     let job = prepare(
