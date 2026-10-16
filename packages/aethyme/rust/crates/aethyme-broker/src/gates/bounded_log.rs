@@ -470,7 +470,8 @@ mod tests {
         log.write_header(b"header\n").unwrap();
         let mut output = vec![b'a'; PREFIX_BUDGET_BYTES + 4096];
         let evidence_at = PREFIX_BUDGET_BYTES + 32;
-        output[evidence_at..evidence_at + 24].copy_from_slice(b"no space left on device");
+        let evidence = b"no space left on device";
+        output[evidence_at..evidence_at + evidence.len()].copy_from_slice(evidence);
         output.extend(std::iter::repeat_n(b'z', MAX_TAIL_BYTES));
         log.record_output(&output);
         let summary = log.finish();
