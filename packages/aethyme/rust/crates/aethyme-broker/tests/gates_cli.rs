@@ -68,8 +68,8 @@ fn stdout(output: Output) -> String {
     String::from_utf8(output.stdout).unwrap()
 }
 
-fn fixture() -> tempfile::TempDir {
-    let tmp = tempfile::tempdir().unwrap();
+fn fixture() -> common::FixtureRepository {
+    let tmp = common::FixtureRepository::new();
     git(tmp.path(), &["init", "-q", "-b", "main"]);
     std::fs::create_dir_all(tmp.path().join(".aethyme")).unwrap();
     std::fs::write(tmp.path().join("tracked.txt"), "first\n").unwrap();
@@ -96,7 +96,7 @@ fn fixture() -> tempfile::TempDir {
 #[test]
 fn affected_gates_json_stays_an_array_and_timings_are_opt_in() {
     let tmp = fixture();
-    let mut broker = common::open_fixture_broker(tmp.path(), tmp.path()).unwrap();
+    let mut broker = common::open_fixture_repository_broker(&tmp).unwrap();
     let session = broker
         .start_worktree("affected gate timings", None)
         .unwrap();
@@ -664,17 +664,18 @@ fn gate_scope_separates_fixtures_and_protects_the_linked_primary() {
         assert_eq!(adopted["id"], 1, "{name}: {adopted}");
         assert_eq!(adopted["task"], name);
     }
-    let live = common::open_fixture_broker(primary.path(), primary.path())
+    let live = common::open_fixture_repository_broker(&primary)
         .unwrap()
         .store()
         .live_sessions()
         .unwrap();
     assert_eq!(live.len(), 1);
     assert_eq!(live[0].task.as_deref(), Some("live operator"));
-    for repo in [first.path(), second.path()] {
+    for fixture in [&first, &second] {
+        let repo = fixture.path();
         assert!(repo.join(aethyme_broker::BROKER_DB_RELPATH).is_file());
         assert_eq!(
-            common::open_fixture_broker(repo, repo)
+            common::open_fixture_repository_broker(fixture)
                 .unwrap()
                 .store()
                 .live_sessions()
@@ -726,7 +727,7 @@ fn nested_gate_retains_ancestor_database_isolation() {
         assert_eq!(adopted["id"], 1, "{name}: {adopted}");
         assert_eq!(adopted["task"], name);
     }
-    let live = common::open_fixture_broker(outer.path(), outer.path())
+    let live = common::open_fixture_repository_broker(&outer)
         .unwrap()
         .store()
         .live_sessions()
@@ -734,7 +735,7 @@ fn nested_gate_retains_ancestor_database_isolation() {
     assert_eq!(live.len(), 1);
     assert_eq!(live[0].task.as_deref(), Some("live operator"));
     assert!(
-        common::open_fixture_broker(inner.path(), inner.path())
+        common::open_fixture_repository_broker(&inner)
             .unwrap()
             .store()
             .live_sessions()
@@ -977,7 +978,7 @@ fn submit_rejects_unknown_subcommand_before_state_changes_or_gates() {
     git(&worktree, &["commit", "-qm", "prepare pending submission"]);
 
     let broker_state = || {
-        let mut broker = common::open_fixture_broker(tmp.path(), tmp.path()).unwrap();
+        let mut broker = common::open_fixture_repository_broker(&tmp).unwrap();
         let queue_entries = broker.store().merge_queue().unwrap().len();
         let holder_event = broker
             .store()

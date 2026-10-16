@@ -207,7 +207,7 @@ fn cleanup_accepts_a_worktree_owned_by_the_external_root_marker() {
     let root = tmp.path().join("owned-worktrees");
     fixture_at(&repo);
 
-    let mut broker = common::open_fixture_broker(&repo, &repo)
+    let mut broker = common::open_fixture_broker(&repo, tmp.path())
         .unwrap()
         .with_worktree_root(&root);
     let session = broker

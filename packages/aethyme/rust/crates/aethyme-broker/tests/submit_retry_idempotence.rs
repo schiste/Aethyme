@@ -4,7 +4,7 @@
 use std::path::Path;
 use std::process::Command;
 
-use aethyme_broker::{Broker, MergeStatus};
+use aethyme_broker::MergeStatus;
 
 mod common;
 
@@ -25,7 +25,14 @@ fn sh(cwd: &Path, args: &[&str]) {
     );
 }
 
-fn repo_with_session(tmp: &Path) -> (std::path::PathBuf, Broker, i64, std::path::PathBuf) {
+fn repo_with_session(
+    tmp: &Path,
+) -> (
+    std::path::PathBuf,
+    common::FixtureBroker,
+    i64,
+    std::path::PathBuf,
+) {
     let repo = tmp.join("repo");
     std::fs::create_dir_all(&repo).unwrap();
     sh(&repo, &["init", "-q", "-b", "main"]);

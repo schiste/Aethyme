@@ -45,8 +45,8 @@ fn stdout(output: &Output) -> String {
     String::from_utf8_lossy(&output.stdout).into_owned()
 }
 
-fn fixture() -> tempfile::TempDir {
-    let tmp = tempfile::tempdir().unwrap();
+fn fixture() -> common::FixtureRepository {
+    let tmp = common::FixtureRepository::new();
     git(tmp.path(), &["init", "-q", "-b", "main"]);
     std::fs::write(tmp.path().join("README.md"), "fixture\n").unwrap();
     std::fs::write(tmp.path().join(".gitignore"), "/.aethyme/\n").unwrap();
@@ -751,7 +751,7 @@ fn start_refuses_a_pull_request_review_before_creating_a_session() {
     assert!(stderr.contains("integration-tip worktree"), "{stderr}");
     assert!(stderr.contains("pull-request review #42"), "{stderr}");
     assert!(
-        common::open_fixture_broker(tmp.path(), tmp.path())
+        common::open_fixture_repository_broker(&tmp)
             .unwrap()
             .store()
             .live_sessions()
@@ -971,7 +971,7 @@ fn adopt_warns_about_uncommitted_paths_it_did_not_create() {
 }
 
 fn overlaps(repo: &Path) -> Vec<aethyme_broker::ScopeOverlap> {
-    common::open_fixture_broker(repo, repo)
+    common::open_fixture_broker(repo, repo.parent().unwrap_or(repo))
         .unwrap()
         .scope_overlaps_snapshot()
         .unwrap()
@@ -1116,7 +1116,7 @@ fn a_new_session_on_the_main_checkout_is_refused_however_it_is_spelled() {
         assert_main_checkout_refused(&output);
     }
     assert!(
-        common::open_fixture_broker(root, root)
+        common::open_fixture_broker(root, root.parent().unwrap_or(root))
             .unwrap()
             .store()
             .live_sessions()

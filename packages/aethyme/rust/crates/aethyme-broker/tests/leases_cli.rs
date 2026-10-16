@@ -30,8 +30,8 @@ fn run(repo: &Path, args: &[&str]) -> Output {
         .unwrap()
 }
 
-fn fixture() -> tempfile::TempDir {
-    let tmp = tempfile::tempdir().unwrap();
+fn fixture() -> common::FixtureRepository {
+    let tmp = common::FixtureRepository::new();
     git(tmp.path(), &["init", "-q", "-b", "main"]);
     std::fs::create_dir_all(tmp.path().join("src")).unwrap();
     std::fs::write(tmp.path().join("README.md"), "fixture\n").unwrap();
@@ -63,7 +63,7 @@ fn add_worktree(root: &Path, name: &str) -> std::path::PathBuf {
 #[test]
 fn lease_plan_cli_renders_structured_and_text_results_without_mutation() {
     let tmp = fixture();
-    let mut broker = common::open_fixture_broker(tmp.path(), tmp.path()).unwrap();
+    let mut broker = common::open_fixture_repository_broker(&tmp).unwrap();
     let planner_worktree = add_worktree(tmp.path(), "planner");
     let owner_worktree = add_worktree(tmp.path(), "owner");
     let planner = broker.adopt(&planner_worktree, None).unwrap();
@@ -211,7 +211,7 @@ fn closed_session_lease_claim_fails_without_persisting_a_phantom_lease() {
     let tmp = fixture();
     let worktree = add_worktree(tmp.path(), "closed-owner");
     let session_id = {
-        let mut broker = common::open_fixture_broker(tmp.path(), tmp.path()).unwrap();
+        let mut broker = common::open_fixture_repository_broker(&tmp).unwrap();
         let session = broker.adopt(&worktree, None).unwrap();
         broker.close(session.id).unwrap();
         session.id
@@ -236,7 +236,7 @@ fn closed_session_lease_claim_fails_without_persisting_a_phantom_lease() {
         "{error}"
     );
 
-    let mut broker = common::open_fixture_broker(tmp.path(), tmp.path()).unwrap();
+    let mut broker = common::open_fixture_repository_broker(&tmp).unwrap();
     assert!(
         broker
             .store()
@@ -249,7 +249,7 @@ fn closed_session_lease_claim_fails_without_persisting_a_phantom_lease() {
 #[test]
 fn lease_plan_cli_requires_paths_and_rejects_ambiguous_spelling() {
     let tmp = fixture();
-    common::open_fixture_broker(tmp.path(), tmp.path()).unwrap();
+    common::open_fixture_repository_broker(&tmp).unwrap();
 
     let missing = run(tmp.path(), &["advanced", "leases", "plan"]);
     assert!(!missing.status.success());
@@ -287,7 +287,7 @@ fn lease_export_is_bounded_redacted_routed_and_read_only() {
     git(tmp.path(), &["add", "-f", ".aethyme/config.toml"]);
     git(tmp.path(), &["commit", "-qm", "routing config"]);
 
-    let mut broker = common::open_fixture_broker(tmp.path(), tmp.path()).unwrap();
+    let mut broker = common::open_fixture_repository_broker(&tmp).unwrap();
     let owner_worktree = add_worktree(tmp.path(), "secret-owner-path");
     let other_worktree = add_worktree(tmp.path(), "other");
     let owner = broker
@@ -436,7 +436,7 @@ fn lease_export_normalizes_one_remote_across_independent_clones() {
     fn exported_repository(remote: &str) -> serde_json::Value {
         let tmp = fixture();
         git(tmp.path(), &["remote", "add", "origin", remote]);
-        let mut broker = common::open_fixture_broker(tmp.path(), tmp.path()).unwrap();
+        let mut broker = common::open_fixture_repository_broker(&tmp).unwrap();
         let session = broker.adopt(tmp.path(), None).unwrap();
         broker
             .store()
@@ -472,7 +472,7 @@ fn lease_export_requires_a_selector_and_valid_bounds() {
             "https://example.com/acme/product.git",
         ],
     );
-    common::open_fixture_broker(tmp.path(), tmp.path()).unwrap();
+    common::open_fixture_repository_broker(&tmp).unwrap();
 
     let missing = run(tmp.path(), &["advanced", "leases", "export", "--json"]);
     assert!(!missing.status.success());

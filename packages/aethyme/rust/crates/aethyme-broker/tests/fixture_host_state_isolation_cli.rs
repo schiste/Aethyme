@@ -5,6 +5,8 @@ use std::process::{Command, Output};
 
 const CLI: &str = env!("CARGO_BIN_EXE_broker-cli-shim");
 const CHILD_FLAG: &str = "AETHYME_TEST_FIXTURE_HOST_ISOLATION_CHILD";
+const LIBRARY_CHILD_FLAG: &str = "AETHYME_TEST_FIXTURE_LIBRARY_PLACEMENT_CHILD";
+const LIBRARY_PATH_REPORT: &str = "AETHYME_TEST_FIXTURE_LIBRARY_PATH_REPORT";
 
 mod common;
 
@@ -25,8 +27,8 @@ fn git(repo: &Path, args: &[&str]) {
     );
 }
 
-fn fixture() -> tempfile::TempDir {
-    let repo = tempfile::tempdir().unwrap();
+fn fixture() -> common::FixtureRepository {
+    let repo = common::FixtureRepository::new();
     git(repo.path(), &["init", "-q", "-b", "main"]);
     std::fs::write(
         repo.path().join(".gitignore"),
@@ -222,4 +224,123 @@ fn fixture_cli_replaces_poisoned_inherited_host_paths() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+#[test]
+fn fixture_library_start_survives_broker_reopen_until_fixture_drop() {
+    if std::env::var_os(LIBRARY_CHILD_FLAG).is_some() {
+        let poison_root = PathBuf::from(std::env::var_os("AETHYME_TEST_POISON_ROOT").unwrap());
+        let repo = fixture();
+        let mut broker = common::open_fixture_repository_broker(&repo).unwrap();
+        let owned_root_path = broker.worktree_root().to_path_buf();
+        let session = broker.start_worktree("library fixture", None).unwrap();
+        let owned_root = owned_root_path.canonicalize().unwrap();
+        let checkout = PathBuf::from(session.worktree_path);
+        assert!(
+            checkout.starts_with(&owned_root),
+            "{} escaped fixture-owned root {}",
+            checkout.display(),
+            owned_root.display()
+        );
+        for path in [
+            poison_root.join("host-state"),
+            poison_root.join("host-cache"),
+            poison_root.join("worktrees"),
+        ] {
+            assert!(
+                !path.exists(),
+                "library start used poisoned inherited path {}",
+                path.display()
+            );
+        }
+        drop(broker);
+        assert!(
+            checkout.exists(),
+            "dropping one broker handle must not remove a fixture-owned checkout"
+        );
+        assert!(
+            owned_root.exists(),
+            "dropping one broker handle must not remove its fixture-owned root"
+        );
+
+        let reopened = common::open_fixture_repository_broker(&repo).unwrap();
+        assert_eq!(reopened.worktree_root().canonicalize().unwrap(), owned_root);
+        assert!(checkout.exists(), "reopening removed the existing checkout");
+        drop(reopened);
+        assert!(
+            checkout.exists(),
+            "the reopened broker removed the checkout"
+        );
+
+        std::fs::write(
+            std::env::var_os(LIBRARY_PATH_REPORT).unwrap(),
+            format!("{}\n{}\n", owned_root.display(), checkout.display()),
+        )
+        .unwrap();
+        drop(repo);
+        assert!(!checkout.exists(), "fixture teardown retained its checkout");
+        assert!(
+            !owned_root.exists(),
+            "fixture teardown retained its worktree root"
+        );
+        return;
+    }
+
+    let poison_root = tempfile::tempdir().unwrap();
+    let report = poison_root.path().join("paths.txt");
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "fixture_library_start_survives_broker_reopen_until_fixture_drop",
+            "--nocapture",
+        ])
+        .env(LIBRARY_CHILD_FLAG, "1")
+        .env("AETHYME_TEST_POISON_ROOT", poison_root.path())
+        .env("AETHYME_TEST_FIXTURE_LIBRARY_PATH_REPORT", &report)
+        .env(
+            "AETHYME_HOST_STATE_DIR",
+            poison_root.path().join("host-state"),
+        )
+        .env(
+            "AETHYME_HOST_CACHE_DIR",
+            poison_root.path().join("host-cache"),
+        )
+        .env(
+            "AETHYME_WORKTREE_ROOT",
+            poison_root.path().join("worktrees"),
+        )
+        // Broker::open reads these before the fixture builder can override
+        // anything. Keep this test scoped to host paths and worktree placement.
+        .env_remove("AETHYME_BROKER_DB")
+        .env_remove("AETHYME_GATE_BROKER_DATABASES")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "child stdout={}\nchild stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let reported_paths = std::fs::read_to_string(report).unwrap();
+    let mut paths = reported_paths.lines().map(PathBuf::from);
+    let owned_root = paths.next().expect("owned root report");
+    let checkout = paths.next().expect("checkout report");
+    assert!(paths.next().is_none(), "unexpected child report fields");
+    assert!(checkout.starts_with(&owned_root));
+    assert!(
+        !checkout.exists(),
+        "child checkout survived its owner guard"
+    );
+    assert!(!owned_root.exists(), "child root survived its owner guard");
+    for path in [
+        poison_root.path().join("host-state"),
+        poison_root.path().join("host-cache"),
+        poison_root.path().join("worktrees"),
+    ] {
+        assert!(
+            !path.exists(),
+            "child used poisoned path {}",
+            path.display()
+        );
+    }
 }

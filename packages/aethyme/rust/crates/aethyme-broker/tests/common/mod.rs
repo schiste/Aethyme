@@ -1,3 +1,4 @@
+use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -109,13 +110,98 @@ pub fn broker_cli_for_fixture(binary: &str, args: &[&str], fixture_root: &Path) 
     command
 }
 
+/// A temporary repository and the external paths owned by one test fixture.
+/// Keep this value alive while dropping and reopening its broker: worktrees
+/// belong to the fixture, not to an individual `Broker` handle.
+#[allow(dead_code)]
+pub struct FixtureRepository {
+    owner: tempfile::TempDir,
+    repository: PathBuf,
+}
+
+#[allow(dead_code)]
+impl FixtureRepository {
+    pub fn new() -> Self {
+        let owner = tempfile::tempdir().expect("create fixture owner");
+        let repository = owner.path().join("repo");
+        std::fs::create_dir_all(&repository).expect("create fixture repository");
+        Self { owner, repository }
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.repository
+    }
+
+    pub fn owner_path(&self) -> &Path {
+        self.owner.path()
+    }
+
+    pub fn worktree_root(&self) -> PathBuf {
+        self.owner.path().join("worktrees")
+    }
+}
+
+/// A library broker configured to use paths owned by its caller's fixture.
+/// The caller must keep the fixture owner alive for the full test scope,
+/// including across broker drop/reopen cycles.
+#[allow(dead_code)]
+pub struct FixtureBroker {
+    broker: Broker,
+    worktree_root: PathBuf,
+}
+
+#[allow(dead_code)]
+impl FixtureBroker {
+    /// The stable worktree root selected for this broker.
+    #[allow(dead_code)]
+    pub fn worktree_root(&self) -> &Path {
+        &self.worktree_root
+    }
+
+    /// Select a caller-owned fixture root. The fixture owner must outlive every
+    /// broker handle opened against it, not just this handle.
+    pub fn with_worktree_root(mut self, root: impl Into<PathBuf>) -> Self {
+        let root = root.into();
+        self.broker = self.broker.with_worktree_root(root.clone());
+        self.worktree_root = root;
+        self
+    }
+}
+
+impl Deref for FixtureBroker {
+    type Target = Broker;
+
+    fn deref(&self) -> &Self::Target {
+        &self.broker
+    }
+}
+
+impl DerefMut for FixtureBroker {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.broker
+    }
+}
+
+#[allow(dead_code)]
 pub fn open_fixture_broker(
     repository: &Path,
     fixture_root: &Path,
-) -> Result<Broker, BrokerOpError> {
-    Broker::open(repository).map(|broker| {
-        broker.with_host_operation_database(
-            fixture_host_state_dir(fixture_root).join("host-operations.db"),
-        )
+) -> Result<FixtureBroker, BrokerOpError> {
+    let worktree_root_path = fixture_root.join("worktrees");
+    let broker = Broker::open(repository)?;
+    Ok(FixtureBroker {
+        broker: broker
+            .with_host_operation_database(
+                fixture_host_state_dir(fixture_root).join("host-operations.db"),
+            )
+            .with_worktree_root(worktree_root_path.clone()),
+        worktree_root: worktree_root_path,
     })
+}
+
+#[allow(dead_code)]
+pub fn open_fixture_repository_broker(
+    fixture: &FixtureRepository,
+) -> Result<FixtureBroker, BrokerOpError> {
+    open_fixture_broker(fixture.path(), fixture.owner_path())
 }

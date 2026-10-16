@@ -123,7 +123,7 @@ impl Fixture {
         git(&self.root, &["rev-parse", INTEGRATION])
     }
 
-    fn broker(&self) -> Broker {
+    fn broker(&self) -> common::FixtureBroker {
         common::open_fixture_broker(&self.root, self._tmp.path()).unwrap()
     }
 }
