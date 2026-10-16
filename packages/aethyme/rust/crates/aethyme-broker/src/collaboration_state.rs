@@ -37,7 +37,7 @@ use serde::Serialize;
 pub use crate::host_state::HostStateSource;
 
 /// The schema this binary writes.
-pub const COLLABORATION_STATE_SCHEMA_VERSION: i64 = 26;
+pub const COLLABORATION_STATE_SCHEMA_VERSION: i64 = 27;
 /// The oldest schema a database written by this binary can be read by.
 /// Unlike `host-operations.db`, a newer database stays readable by an older
 /// binary until a release raises this floor.
@@ -70,7 +70,9 @@ pub const COLLABORATION_STATE_SCHEMA_VERSION: i64 = 26;
 // Schema 26 introduces project/file mappings and immutable contribution
 // revision heads. A schema-25 writer would replace a brief without advancing
 // that head or rooting superseded brief objects, so stop it before writes.
-const MIN_COMPATIBLE_SCHEMA: i64 = 26;
+// Schema 27 adds single-use, session-bound resolution imports and durable
+// request identity. Schema 26 writers do not preserve that state or its roots.
+const MIN_COMPATIBLE_SCHEMA: i64 = 27;
 const ROOT_DIRECTORY: &str = "collaboration";
 /// Schema steps after the version 1 layout (`meta` only), applied in
 /// order. Step 17 adds separately indexed historical imports and rehearsals. The floor is
@@ -735,6 +737,158 @@ const MIGRATIONS: &[(i64, &str)] = &[
     ) STRICT;
     CREATE INDEX local_project_file_ids_by_snapshot
         ON local_project_file_ids(snapshot_id);"),
+    (
+        27,
+        "ALTER TABLE resolution_attempts ADD COLUMN async_token TEXT;
+         ALTER TABLE resolution_attempts ADD COLUMN client_key TEXT;
+         ALTER TABLE resolution_attempts ADD COLUMN session_label TEXT;
+         ALTER TABLE resolution_attempts ADD COLUMN attempt_number INTEGER;
+         ALTER TABLE resolution_attempts ADD COLUMN request_sha256 TEXT;
+         ALTER TABLE resolution_attempts ADD COLUMN input_sha256 TEXT;
+         ALTER TABLE resolution_attempts ADD COLUMN input_manifest_sha256 TEXT;
+         ALTER TABLE resolution_attempts ADD COLUMN dispatch_limits TEXT;
+         ALTER TABLE resolution_attempts ADD COLUMN response_sha256 TEXT;
+         ALTER TABLE resolution_attempts ADD COLUMN result_record_id TEXT;
+         ALTER TABLE resolution_attempts ADD COLUMN result_sha256 TEXT;
+         ALTER TABLE resolution_attempts ADD COLUMN detail TEXT;
+         ALTER TABLE resolution_attempts ADD COLUMN async_state TEXT NOT NULL DEFAULT 'settled'
+             CHECK (async_state IN ('settled','exported','dispatching','outcome_unknown','importing'));
+         ALTER TABLE local_waves ADD COLUMN resolution_request_record_id TEXT;
+         ALTER TABLE local_waves ADD COLUMN resolution_request_object TEXT;
+         ALTER TABLE local_waves ADD COLUMN composition_source_record_id TEXT;
+         ALTER TABLE local_waves ADD COLUMN composition_source_object TEXT;
+         UPDATE resolution_attempts
+             SET async_state = CASE WHEN outcome IS NULL THEN 'outcome_unknown' ELSE 'settled' END;
+         CREATE UNIQUE INDEX resolution_attempts_async_token
+             ON resolution_attempts(async_token) WHERE async_token IS NOT NULL;
+         CREATE UNIQUE INDEX resolution_attempts_session_client_key
+             ON resolution_attempts(session_label, client_key)
+             WHERE session_label IS NOT NULL AND client_key IS NOT NULL;
+         -- Already-open pre-v27 writers omit attempt_number. Once the new
+         -- version is stamped, refuse their later charge or settlement SQL.
+         -- Legacy rows remain charged and read-only; null outcomes were
+         -- classified as unknown above and require a future strict reconcile.
+         CREATE TRIGGER resolution_attempts_require_v27_charge
+         BEFORE INSERT ON resolution_attempts
+         WHEN (NEW.attempt_number IS NULL OR NEW.attempt_number < 1
+               OR NEW.async_state = 'settled'
+               OR (NEW.async_token IS NOT NULL AND
+                   (NEW.async_state != 'exported'
+                    OR NEW.client_key IS NULL OR NEW.session_label IS NULL
+                    OR NEW.request_sha256 IS NULL OR NEW.input_sha256 IS NULL
+                    OR NEW.input_manifest_sha256 IS NULL OR NEW.dispatch_limits IS NULL)))
+          AND COALESCE((SELECT CAST(value AS INTEGER) FROM meta WHERE key='schema_version'), 0) >= 27
+         BEGIN
+             SELECT RAISE(ABORT, 'resolution attempt requires a v27 pre-dispatch charge');
+         END;
+         CREATE TRIGGER resolution_attempts_legacy_rows_immutable
+         BEFORE UPDATE ON resolution_attempts
+         WHEN OLD.attempt_number IS NULL
+          AND COALESCE((SELECT CAST(value AS INTEGER) FROM meta WHERE key='schema_version'), 0) >= 27
+         BEGIN
+             SELECT RAISE(ABORT, 'legacy charged resolution attempts are immutable');
+         END;
+         CREATE TRIGGER resolution_attempts_never_delete
+         BEFORE DELETE ON resolution_attempts
+         BEGIN
+             SELECT RAISE(ABORT, 'charged resolution attempts cannot be deleted');
+         END;
+         CREATE TRIGGER resolution_attempts_identity_immutable
+         BEFORE UPDATE OF decision_key,kind,members,paths,request_record_id,charged_ms,
+                          async_token,client_key,session_label,attempt_number,request_sha256,
+                          input_sha256,input_manifest_sha256,dispatch_limits
+         ON resolution_attempts
+         WHEN NEW.decision_key IS NOT OLD.decision_key
+           OR NEW.kind IS NOT OLD.kind
+           OR NEW.members IS NOT OLD.members
+           OR NEW.paths IS NOT OLD.paths
+           OR NEW.request_record_id IS NOT OLD.request_record_id
+           OR NEW.charged_ms IS NOT OLD.charged_ms
+           OR NEW.async_token IS NOT OLD.async_token
+           OR NEW.client_key IS NOT OLD.client_key
+           OR NEW.session_label IS NOT OLD.session_label
+           OR NEW.attempt_number IS NOT OLD.attempt_number
+           OR NEW.request_sha256 IS NOT OLD.request_sha256
+           OR NEW.input_sha256 IS NOT OLD.input_sha256
+           OR NEW.input_manifest_sha256 IS NOT OLD.input_manifest_sha256
+           OR NEW.dispatch_limits IS NOT OLD.dispatch_limits
+         BEGIN
+             SELECT RAISE(ABORT, 'resolution attempt charge identity is immutable');
+         END;
+         -- A stale pre-v27 resolver can still hold a connection across the
+         -- migration. Its old settlement statement updates only `outcome`;
+         -- reject that write on new rows too. Current writers must advance
+         -- through the charged state machine and bind one response digest.
+         CREATE TRIGGER resolution_attempts_lifecycle_guard
+         BEFORE UPDATE ON resolution_attempts
+         WHEN OLD.attempt_number IS NOT NULL
+          AND (
+             (NEW.async_state = OLD.async_state AND (
+                 NEW.outcome IS NOT OLD.outcome
+                 OR NEW.response_sha256 IS NOT OLD.response_sha256
+                 OR NEW.result_record_id IS NOT OLD.result_record_id
+                 OR NEW.result_sha256 IS NOT OLD.result_sha256
+                 OR NEW.detail IS NOT OLD.detail
+             ))
+             OR (NEW.async_state != OLD.async_state AND NOT (
+                 (OLD.async_state = 'exported' AND NEW.async_state IN ('dispatching','outcome_unknown'))
+                 OR (OLD.async_state = 'dispatching' AND NEW.async_state IN ('outcome_unknown','importing'))
+                 OR (OLD.async_state = 'dispatching' AND NEW.async_state = 'settled'
+                     AND OLD.async_token IS NULL)
+                 OR (OLD.async_state = 'outcome_unknown' AND NEW.async_state = 'importing')
+                 OR (OLD.async_state = 'importing' AND NEW.async_state = 'settled')
+             ))
+             OR (NEW.async_state = 'importing' AND NEW.response_sha256 IS NULL)
+             OR (OLD.response_sha256 IS NOT NULL
+                 AND NEW.response_sha256 IS NOT OLD.response_sha256)
+             OR (NEW.async_state = 'settled' AND NEW.outcome IS NULL)
+             OR (NEW.async_state != 'settled' AND NEW.outcome IS NOT OLD.outcome)
+             OR (NEW.async_state != 'settled' AND (
+                 NEW.result_record_id IS NOT OLD.result_record_id
+                 OR NEW.result_sha256 IS NOT OLD.result_sha256
+             ))
+             OR ((NEW.result_record_id IS NULL) != (NEW.result_sha256 IS NULL))
+             OR (NEW.async_state = 'importing'
+                 AND OLD.response_sha256 IS NOT NULL
+                 AND NEW.response_sha256 IS NOT OLD.response_sha256)
+             OR (NEW.async_state != 'importing'
+                 AND OLD.response_sha256 IS NULL
+                 AND NEW.response_sha256 IS NOT NULL)
+          )
+         BEGIN
+             SELECT RAISE(ABORT, 'resolution attempt lifecycle transition is invalid');
+         END;
+         CREATE TRIGGER local_waves_resolution_request_pair_insert
+         BEFORE INSERT ON local_waves
+         WHEN (NEW.resolution_request_record_id IS NULL)
+           != (NEW.resolution_request_object IS NULL)
+         BEGIN
+             SELECT RAISE(ABORT, 'resolution request reference must be complete');
+         END;
+         CREATE TRIGGER local_waves_resolution_request_pair_update
+         BEFORE UPDATE OF resolution_request_record_id,resolution_request_object
+         ON local_waves
+         WHEN (NEW.resolution_request_record_id IS NULL)
+           != (NEW.resolution_request_object IS NULL)
+         BEGIN
+             SELECT RAISE(ABORT, 'resolution request reference must be complete');
+         END;
+         CREATE TRIGGER local_waves_composition_source_pair_insert
+         BEFORE INSERT ON local_waves
+         WHEN (NEW.composition_source_record_id IS NULL)
+           != (NEW.composition_source_object IS NULL)
+         BEGIN
+             SELECT RAISE(ABORT, 'composition source reference must be complete');
+         END;
+         CREATE TRIGGER local_waves_composition_source_pair_update
+         BEFORE UPDATE OF composition_source_record_id,composition_source_object
+         ON local_waves
+         WHEN (NEW.composition_source_record_id IS NULL)
+           != (NEW.composition_source_object IS NULL)
+         BEGIN
+             SELECT RAISE(ABORT, 'composition source reference must be complete');
+         END;",
+    ),
 ];
 /// Reconstruct the exact pre-schema-26 shape in historical migration fixtures
 /// while preserving all schema-25 rows. This is test setup only: production
@@ -2232,11 +2386,244 @@ mod tests {
         let versions: Vec<i64> = MIGRATIONS.iter().map(|(version, _)| *version).collect();
         let expected: Vec<i64> = (2..=COLLABORATION_STATE_SCHEMA_VERSION).collect();
         assert_eq!(versions, expected);
-        assert_eq!(MIN_COMPATIBLE_SCHEMA, 26);
+        assert_eq!(MIN_COMPATIBLE_SCHEMA, 27);
         const { assert!(MIN_COMPATIBLE_SCHEMA <= COLLABORATION_STATE_SCHEMA_VERSION) };
-        // Earlier writers cannot preserve immutable revision heads or the
-        // historical brief objects they name.
-        const { assert!(MIN_COMPATIBLE_SCHEMA >= 26) };
+        // Earlier writers cannot preserve immutable revision heads, durable
+        // asynchronous attempts or the archive roots those attempts name.
+        const { assert!(MIN_COMPATIBLE_SCHEMA >= 27) };
+    }
+
+    #[test]
+    fn schema_27_preserves_unsettled_legacy_attempts_as_unknown() {
+        let host = tempfile::tempdir().unwrap();
+        let mut store = open(host.path(), &[]).unwrap();
+        store
+            .connection()
+            .execute_batch(
+                "DROP TRIGGER resolution_attempts_require_v27_charge;
+                 DROP TRIGGER resolution_attempts_legacy_rows_immutable;
+                 DROP TRIGGER resolution_attempts_never_delete;
+                 DROP TRIGGER resolution_attempts_identity_immutable;
+                 DROP TRIGGER resolution_attempts_lifecycle_guard;
+                 DROP TRIGGER local_waves_resolution_request_pair_insert;
+                 DROP TRIGGER local_waves_resolution_request_pair_update;
+                 DROP TRIGGER local_waves_composition_source_pair_insert;
+                 DROP TRIGGER local_waves_composition_source_pair_update;
+                 DROP INDEX resolution_attempts_async_token;
+                 DROP INDEX resolution_attempts_session_client_key;
+                 ALTER TABLE local_waves DROP COLUMN resolution_request_object;
+                 ALTER TABLE local_waves DROP COLUMN resolution_request_record_id;
+                 ALTER TABLE local_waves DROP COLUMN composition_source_object;
+                 ALTER TABLE local_waves DROP COLUMN composition_source_record_id;
+                 ALTER TABLE resolution_attempts DROP COLUMN async_state;
+                 ALTER TABLE resolution_attempts DROP COLUMN detail;
+                 ALTER TABLE resolution_attempts DROP COLUMN result_sha256;
+                 ALTER TABLE resolution_attempts DROP COLUMN result_record_id;
+                 ALTER TABLE resolution_attempts DROP COLUMN response_sha256;
+                 ALTER TABLE resolution_attempts DROP COLUMN dispatch_limits;
+                 ALTER TABLE resolution_attempts DROP COLUMN input_manifest_sha256;
+                 ALTER TABLE resolution_attempts DROP COLUMN input_sha256;
+                 ALTER TABLE resolution_attempts DROP COLUMN request_sha256;
+                 ALTER TABLE resolution_attempts DROP COLUMN attempt_number;
+                 ALTER TABLE resolution_attempts DROP COLUMN session_label;
+                 ALTER TABLE resolution_attempts DROP COLUMN client_key;
+                 ALTER TABLE resolution_attempts DROP COLUMN async_token;
+                 UPDATE meta SET value='26'
+                     WHERE key IN ('schema_version','min_compatible_schema');",
+            )
+            .unwrap();
+        store
+            .connection()
+            .execute(
+                "INSERT INTO resolution_attempts
+                 (decision_key,kind,members,paths,request_record_id,resolver,outcome,charged_ms)
+                 VALUES('legacy-decision','conflict','member','path','req:legacy',
+                        'legacy-resolver',NULL,1)",
+                [],
+            )
+            .unwrap();
+        store
+            .connection()
+            .execute(
+                "INSERT INTO resolution_attempts
+                 (decision_key,kind,members,paths,request_record_id,resolver,outcome,charged_ms)
+                 VALUES('legacy-terminal','conflict','member','path','req:terminal',
+                        'legacy-resolver','resolved',2)",
+                [],
+            )
+            .unwrap();
+        let stale_writer_path = store.project_dir().join("state.db");
+        drop(store);
+        let stale_writer = rusqlite::Connection::open(stale_writer_path).unwrap();
+        let stale_insert = "INSERT INTO resolution_attempts
+             (decision_key,kind,members,paths,request_record_id,resolver,charged_ms)
+             VALUES(?1,?2,?3,?4,?5,?6,?7)";
+        drop(stale_writer.prepare_cached(stale_insert).unwrap());
+
+        let mut migrated = open(host.path(), &[]).unwrap();
+        let (state, outcome): (String, Option<String>) = migrated
+            .read_connection()
+            .query_row(
+                "SELECT async_state,outcome FROM resolution_attempts
+                 WHERE decision_key='legacy-decision'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(state, "outcome_unknown");
+        assert_eq!(outcome, None);
+        let (terminal_state, terminal_outcome): (String, Option<String>) = migrated
+            .read_connection()
+            .query_row(
+                "SELECT async_state,outcome FROM resolution_attempts
+                 WHERE decision_key='legacy-terminal'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(terminal_state, "settled");
+        assert_eq!(terminal_outcome.as_deref(), Some("resolved"));
+        assert_eq!(
+            migrated.schema_version(),
+            COLLABORATION_STATE_SCHEMA_VERSION
+        );
+
+        let inserted_v27 = migrated
+            .connection()
+            .execute(
+                "INSERT INTO resolution_attempts
+                 (decision_key,kind,members,paths,request_record_id,resolver,charged_ms,
+                  async_token,client_key,session_label,attempt_number,request_sha256,input_sha256,
+                  input_manifest_sha256,dispatch_limits,async_state)
+                 VALUES('new-async','conflict','member','path','req:new','external-session-label',
+                        3,'attempt:new','client:new','session:new',1,?1,?1,?1,
+                        'v1:1024:8:1024:4096:1024','exported')",
+                rusqlite::params!["0".repeat(64)],
+            )
+            .unwrap();
+        assert_eq!(inserted_v27, 1);
+
+        let first_response = "2".repeat(64);
+        let substituted_response = "3".repeat(64);
+        migrated
+            .connection()
+            .execute(
+                "UPDATE resolution_attempts SET async_state='dispatching'
+                 WHERE async_token='attempt:new'",
+                [],
+            )
+            .unwrap();
+        migrated
+            .connection()
+            .execute(
+                "UPDATE resolution_attempts
+                 SET async_state='importing',response_sha256=?1
+                 WHERE async_token='attempt:new'",
+                [&first_response],
+            )
+            .unwrap();
+        assert!(
+            migrated
+                .connection()
+                .execute(
+                    "UPDATE resolution_attempts
+                     SET async_state='settled',outcome='resolved',response_sha256=?1
+                     WHERE async_token='attempt:new'",
+                    [&substituted_response],
+                )
+                .is_err(),
+            "settlement cannot replace the response digest fixed at import"
+        );
+        let bound_response: (String, String, Option<String>) = migrated
+            .read_connection()
+            .query_row(
+                "SELECT async_state,response_sha256,outcome FROM resolution_attempts
+                 WHERE async_token='attempt:new'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            bound_response,
+            ("importing".into(), first_response, None),
+            "rejected digest substitution leaves the bound import untouched"
+        );
+        assert!(
+            migrated
+                .connection()
+                .execute(
+                    "INSERT INTO resolution_attempts
+                     (decision_key,kind,members,paths,request_record_id,resolver,charged_ms,
+                      async_token,client_key,session_label,attempt_number,request_sha256,input_sha256,
+                      input_manifest_sha256,dispatch_limits,async_state)
+                     VALUES('direct-dispatch','conflict','member','path','req:new',
+                            'external-session-label',4,'attempt:direct','client:direct','session:new',
+                            2,?1,?1,?1,'v1:1024:8:1024:4096:1024','dispatching')",
+                    rusqlite::params!["1".repeat(64)],
+                )
+                .is_err()
+        );
+
+        assert!(
+            stale_writer
+                .prepare_cached(stale_insert)
+                .unwrap()
+                .execute(rusqlite::params![
+                    "stale-writer",
+                    "conflict",
+                    "member",
+                    "path",
+                    "req:stale",
+                    "old",
+                    2
+                ])
+                .is_err()
+        );
+        assert!(
+            stale_writer
+                .execute(
+                    "UPDATE resolution_attempts SET outcome='resolved'
+                 WHERE decision_key='legacy-decision'",
+                    [],
+                )
+                .is_err()
+        );
+        assert!(
+            stale_writer
+                .execute(
+                    "DELETE FROM resolution_attempts WHERE decision_key='legacy-decision'",
+                    [],
+                )
+                .is_err()
+        );
+        assert!(
+            stale_writer
+                .execute(
+                    "UPDATE resolution_attempts SET outcome='unresolved'
+                     WHERE decision_key='legacy-terminal'",
+                    [],
+                )
+                .is_err()
+        );
+        assert!(
+            stale_writer
+                .execute(
+                    "UPDATE resolution_attempts SET outcome='resolved'
+                     WHERE decision_key='new-async'",
+                    [],
+                )
+                .is_err()
+        );
+        let final_legacy: (String, Option<String>) = migrated
+            .read_connection()
+            .query_row(
+                "SELECT async_state,outcome FROM resolution_attempts
+                 WHERE decision_key='legacy-decision'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(final_legacy, ("outcome_unknown".into(), None));
     }
 
     /// Inspection opens read-only: it reports a store that needs migration
