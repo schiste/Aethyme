@@ -1,5 +1,7 @@
 # Local v3 dogfooding on Aethyme
 
+Last Updated: 2026-10-16
+
 Use the Local workflow while developing this repository. Agents keep using
 broker-managed branches and worktrees of this same Git repository.
 
