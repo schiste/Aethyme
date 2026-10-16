@@ -983,6 +983,72 @@ mod tests {
     }
 
     #[test]
+    fn exact_pin_reads_unrooted_history_during_grace_without_creating_retention() {
+        let mut fixture = BoundProjectFixture::new().unwrap();
+        let first = first_revision(&mut fixture);
+        let first_result_commit =
+            crate::collaboration_archive::pin_commit(fixture.repo.path(), "HEAD").unwrap();
+        let second_commit = fixture
+            .commit_file("a.txt", b"unrooted descendant source transition\n")
+            .unwrap();
+        let receipt = fixture
+            .capture_operation(
+                "context-grace-descendant",
+                &first_result_commit,
+                &second_commit,
+            )
+            .unwrap();
+        let second = revise(
+            &mut fixture,
+            &receipt.operation_id,
+            &brief("rationale retained only by the archive grace period"),
+        );
+        release_captures(&mut fixture.store);
+        let root_counts = |store: &CollaborationStore| -> (i64, i64, i64) {
+            store.read_connection().query_row(
+                "SELECT (SELECT count(*) FROM object_pins), (SELECT count(*) FROM reader_leases), (SELECT count(*) FROM retention_roots WHERE released_ms IS NULL)",
+                [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            ).unwrap()
+        };
+        let before = root_counts(&fixture.store);
+        assert_eq!(before.2, 0);
+        let retrieved = retrieve_revisions(
+            &fixture.store,
+            &query(&second),
+            &[pin(&second)],
+            &LocalProject,
+        )
+        .expect("an exact pin seeds its retained proof closure during grace");
+        assert_eq!(retrieved.selection.items.len(), 1);
+        assert!(
+            String::from_utf8(retrieved.record)
+                .unwrap()
+                .contains("rationale retained only by the archive grace period")
+        );
+        assert_eq!(
+            root_counts(&fixture.store),
+            before,
+            "a read must not grant durable retention"
+        );
+        age_own_archive(&fixture.store);
+        collect(&mut fixture.store);
+        assert!(
+            !crate::collaboration_archive::object_path(&fixture.store, &first.object_digest())
+                .exists()
+        );
+        assert!(
+            retrieve_revisions(
+                &fixture.store,
+                &query(&second),
+                &[pin(&second)],
+                &LocalProject
+            )
+            .is_err(),
+            "retired proof must remain unavailable"
+        );
+    }
+
+    #[test]
     fn exact_revision_pin_keeps_ancestor_proofs_then_gc_reclaims_unrooted_history() {
         let mut fixture = BoundProjectFixture::new().unwrap();
         let first = first_revision(&mut fixture);
