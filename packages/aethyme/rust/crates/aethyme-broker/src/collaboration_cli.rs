@@ -171,6 +171,10 @@ Additional explicit lifecycle commands (provisional Local packages):
        --proposal PATH [--json]
       Import one strict attempt/request/manifest-bound response file. The
       result is retained and unverified; no dispatch, wave attachment or acceptance.
+  aethyme collab resolution attach --attempt TOKEN --request ID --object sha256:HEX
+       --target NAME --issuer NAME --wave ID --version N [--json]
+      Attach a settled synthesis to its exact current wave for fresh verification.
+      The result must cover every selected contribution. Grants no acceptance.
   aethyme collab authority status [--json]
       Read the native epoch/witness and ledger binding without changing state.
       Observation grants no authority; unbound, frozen and drift remain distinct.
@@ -561,6 +565,7 @@ fn dispatch(options: Options) -> Result<Output, Failure> {
         ["resolution", "packet", rest @ ..] => resolution::packet(&main_root, rest),
         ["resolution", "input", rest @ ..] => resolution::input(&main_root, rest),
         ["resolution", "import", rest @ ..] => resolution::import(&main_root, rest),
+        ["resolution", "attach", rest @ ..] => resolution::attach(&main_root, rest),
         ["authority", "status", rest @ ..] => lifecycle::authority_status(&main_root, rest),
         ["target", "status", rest @ ..] => lifecycle::target_status(&main_root, rest),
         ["target", "budget", "project", rest @ ..] => {

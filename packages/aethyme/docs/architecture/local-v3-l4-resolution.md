@@ -25,10 +25,14 @@ settles that same charge through `finish_bound_attempt`; it never calls
 
 This slice creates no provider session and authorizes no paid dispatch.
 Session labels record provenance and do not authenticate an agent. A synthesis
-result remains retained and unverified, with no wave attachment, publication
-or acceptance. Guarded wave attachment and a fresh complete verification flow
-are separate implementation work. The original provisional evidence below is
-historical; this interface alone closes no model-quality qualification gate.
+result remains retained and unverified. The explicit `attach` command links an
+exact settled result to its still-current wave under appointed controller
+and target-version checks. It requires the synthesized group to cover every
+selected contribution; partial groups remain held. The linked candidate must
+run fresh trusted gates before acceptance. Attachment grants no acceptance,
+publication or provider authority, and does not settle a budget reservation.
+The original provisional evidence below is historical; this interface alone
+closes no model-quality qualification gate.
 
 > Historical checkpoint: the implementation and pending-work statements below
 > describe the original provisional profile. Current bounded E1, FX08, native-gate
