@@ -88,19 +88,13 @@ pub struct BriefReference {
 impl BriefReference {
     pub fn new(
         record_id: RecordId,
-        object_sha256: impl Into<String>,
+        object_sha256: impl AsRef<str>,
     ) -> Result<Self, ContributionRevisionError> {
-        let object_sha256 = object_sha256.into();
-        if object_sha256.len() != 64
-            || !object_sha256
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-        {
-            return Err(ContributionRevisionError::InvalidBriefDigest);
-        }
+        let object_sha256 = object_sha256.as_ref();
+        validate_brief_digest(object_sha256)?;
         Ok(Self {
             record_id,
-            object_sha256,
+            object_sha256: object_sha256.to_string(),
         })
     }
 }
@@ -140,6 +134,23 @@ impl ContributionRevision {
                 depends_on.len(),
             ));
         }
+        if let Some(count) = oversized_reference_count(&source_changes) {
+            return Err(ContributionRevisionError::TooManyReferences(count));
+        }
+        if let Some(brief) = &brief {
+            // `BriefReference` fields are public for compatibility, so a
+            // literal can bypass `BriefReference::new`. Validate the borrowed
+            // digest before it is copied into a canonical Value or accepted
+            // by `to_record`.
+            validate_brief_digest(&brief.object_sha256)?;
+        }
+        let source_changes_bytes = canonical_json::bounded_canonical_array_size(
+            &source_changes,
+            MAX_CONTRIBUTION_REVISION_BYTES,
+        )
+        .ok_or(ContributionRevisionError::TooLarge(
+            MAX_CONTRIBUTION_REVISION_BYTES + 1,
+        ))?;
         validate_changes(&source_changes)?;
         let mut dependency_ids: Vec<String> = depends_on
             .iter()
@@ -163,9 +174,21 @@ impl ContributionRevision {
             brief,
             depends_on,
         };
-        let encoded = revision.canonical_record_bytes();
-        if encoded.len() > MAX_CONTRIBUTION_REVISION_BYTES {
-            return Err(ContributionRevisionError::TooLarge(encoded.len()));
+        let fixed_size = canonical_json::bounded_canonical_size(
+            &revision.canonical_record_value(Value::Array(Vec::new())),
+            MAX_CONTRIBUTION_REVISION_BYTES,
+        )
+        .ok_or(ContributionRevisionError::TooLarge(
+            MAX_CONTRIBUTION_REVISION_BYTES + 1,
+        ))?;
+        let measured_size = fixed_size
+            .checked_sub(2)
+            .and_then(|size| size.checked_add(source_changes_bytes))
+            .ok_or(ContributionRevisionError::TooLarge(
+                MAX_CONTRIBUTION_REVISION_BYTES + 1,
+            ))?;
+        if measured_size > MAX_CONTRIBUTION_REVISION_BYTES {
+            return Err(ContributionRevisionError::TooLarge(measured_size));
         }
         Ok(revision)
     }
@@ -215,6 +238,11 @@ impl ContributionRevision {
     }
 
     fn canonical_record_bytes(&self) -> Vec<u8> {
+        self.canonical_record_value(Value::Array(self.source_changes.clone()))
+            .to_canonical_bytes()
+    }
+
+    fn canonical_record_value(&self, source_changes: Value) -> Value {
         let mut fields = vec![
             ("schema".into(), text(CONTRIBUTION_REVISION_SCHEMA_NAME)),
             ("project_id".into(), text(self.project_id.as_str())),
@@ -228,10 +256,7 @@ impl ContributionRevision {
             ),
             ("base".into(), text(self.base.as_str())),
             ("result".into(), text(self.result.as_str())),
-            (
-                "source_changes".into(),
-                Value::Array(self.source_changes.clone()),
-            ),
+            ("source_changes".into(), source_changes),
             (
                 "depends_on".into(),
                 Value::Array(self.depends_on.iter().map(|id| text(id.as_str())).collect()),
@@ -242,7 +267,6 @@ impl ContributionRevision {
             fields.push(("brief_object_sha256".into(), text(&brief.object_sha256)));
         }
         Value::Object(Object::new(fields).expect("distinct contribution revision fields"))
-            .to_canonical_bytes()
     }
 
     pub fn from_record(input: &[u8]) -> Result<(Self, RecordId), ContributionRevisionError> {
@@ -332,7 +356,7 @@ fn validate_changes(changes: &[Value]) -> Result<(), ContributionRevisionError> 
             return Err(ContributionRevisionError::InvalidSourceChange);
         }
         let relation_text = object_string(object, "relation")?;
-        let relation = match relation_text.as_str() {
+        let relation = match relation_text {
             "same_path" => IdentityRelation::SamePath,
             "explicit_rename" => IdentityRelation::ExplicitRename,
             "explicit_copy" => IdentityRelation::ExplicitCopy,
@@ -393,6 +417,25 @@ fn validate_changes(changes: &[Value]) -> Result<(), ContributionRevisionError> 
     Ok(())
 }
 
+/// Return an oversized file-reference array before bounded canonical sizing.
+/// This checks only borrowed cardinalities; full source-change validation and
+/// its allocations remain behind the document-size admission check.
+fn oversized_reference_count(changes: &[Value]) -> Option<usize> {
+    for change in changes {
+        let Value::Object(object) = change else {
+            continue;
+        };
+        for field in ["derived_from", "possible_sources"] {
+            if let Some(Value::Array(references)) = object.get(field)
+                && references.len() > MAX_REVISION_ARRAY_ENTRIES
+            {
+                return Some(references.len());
+            }
+        }
+    }
+    None
+}
+
 /// Parsed source file state: canonical raw path bytes.
 fn object_state(
     object: &Object,
@@ -413,7 +456,7 @@ fn object_state(
             let content: [u8; 32] = content
                 .try_into()
                 .map_err(|_| ContributionRevisionError::InvalidSourceChange)?;
-            let file_id = FileId::parse(&object_string(state, "file_id")?)?;
+            let file_id = FileId::parse(object_string(state, "file_id")?)?;
             SourceSnapshot::new([SourceEntry::from_content_digest(
                 path.clone(),
                 kind,
@@ -448,12 +491,12 @@ fn object_ids(
     }
 }
 
-fn object_string(
-    object: &Object,
+fn object_string<'a>(
+    object: &'a Object,
     field: &'static str,
-) -> Result<String, ContributionRevisionError> {
+) -> Result<&'a str, ContributionRevisionError> {
     match object.get(field) {
-        Some(Value::String(value)) => Ok(value.clone()),
+        Some(Value::String(value)) => Ok(value),
         _ => Err(ContributionRevisionError::InvalidSourceChange),
     }
 }
@@ -483,7 +526,12 @@ fn text(value: &str) -> Value {
     Value::String(value.to_string())
 }
 
-fn decode_hex(value: String, field: &'static str) -> Result<Vec<u8>, ContributionRevisionError> {
+fn decode_hex(value: &str, field: &'static str) -> Result<Vec<u8>, ContributionRevisionError> {
+    if (field == "path_hex" && value.len() > super::source_snapshot::MAX_PATH_BYTES * 2)
+        || (field == "content_sha256" && value.len() != 64)
+    {
+        return Err(ContributionRevisionError::InvalidSourceChange);
+    }
     let bytes = HEXLOWER
         .decode(value.as_bytes())
         .map_err(|_| ContributionRevisionError::InvalidSourceChange)?;
@@ -491,6 +539,17 @@ fn decode_hex(value: String, field: &'static str) -> Result<Vec<u8>, Contributio
         return Err(ContributionRevisionError::InvalidSourceChange);
     }
     Ok(bytes)
+}
+
+fn validate_brief_digest(value: &str) -> Result<(), ContributionRevisionError> {
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(ContributionRevisionError::InvalidBriefDigest);
+    }
+    Ok(())
 }
 
 fn contribution_base32_value(byte: u8) -> Option<u8> {

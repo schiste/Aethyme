@@ -337,6 +337,12 @@ pub enum IdentityStoreError {
     DuplicateRevisionPin(String),
     #[error("archive use guard belongs to a different project store")]
     ForeignArchiveUse,
+    #[error("could not acquire the per-project revision writer lock at {path}: {source}")]
+    RevisionWriterLock {
+        path: std::path::PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
     #[error("could not acquire the shared archive-use lock at {path}: {source}")]
     ArchiveLock {
         path: std::path::PathBuf,
@@ -388,6 +394,7 @@ impl IdentityStoreError {
             Self::ReplayByteLimit => "identity_replay_byte_limit",
             Self::DuplicateRevisionPin(_) => "duplicate_revision_pin",
             Self::ForeignArchiveUse => "foreign_archive_guard",
+            Self::RevisionWriterLock { .. } => "revision_writer_lock",
             Self::ArchiveLock { .. } => "archive_lock",
             Self::UnknownRevision(_) => "unknown_revision",
             Self::UnknownCaptureOperation(_) => "unknown_capture_operation",
@@ -1111,6 +1118,49 @@ fn validate_bound_contribution_revision_bytes_locked(
     })
 }
 
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RevisionWriterStage {
+    BeforeLock,
+    AfterLock,
+    PreflightStarted,
+    AfterPreflight,
+}
+
+#[cfg(test)]
+type RevisionWriterTestHook =
+    std::sync::Arc<dyn Fn(RevisionWriterStage, &str) + Send + Sync + 'static>;
+
+#[cfg(test)]
+static REVISION_WRITER_TEST_HOOK: std::sync::OnceLock<
+    std::sync::Mutex<Option<RevisionWriterTestHook>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+fn report_revision_writer_stage(stage: RevisionWriterStage, operation_id: &str) {
+    let hook = REVISION_WRITER_TEST_HOOK
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .expect("revision writer test hook mutex")
+        .clone();
+    if let Some(hook) = hook {
+        hook(stage, operation_id);
+    }
+}
+
+#[cfg(test)]
+fn replace_revision_writer_test_hook(
+    hook: Option<RevisionWriterTestHook>,
+) -> Option<RevisionWriterTestHook> {
+    std::mem::replace(
+        &mut *REVISION_WRITER_TEST_HOOK
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .expect("revision writer test hook mutex"),
+        hook,
+    )
+}
+
 /// Append an immutable D10 revision for one exact retained capture operation.
 /// The capture OperationId is the durable retry selector; its first revision
 /// atomically persists the fresh ContributionId mapping with the revision and
@@ -1133,7 +1183,34 @@ pub(crate) fn revise_contribution_for_operation_with_archive_use(
 ) -> Result<ResolvedContributionRevision, IdentityStoreError> {
     validate_archive_use(store, archive_use)?;
     let _response = crate::collaboration_sensitive::response_use(store)?;
+    #[cfg(test)]
+    report_revision_writer_stage(
+        RevisionWriterStage::BeforeLock,
+        request.operation_id.as_str(),
+    );
+    let _writer = acquire_revision_writer_lock(store)?;
+    #[cfg(test)]
+    report_revision_writer_stage(
+        RevisionWriterStage::AfterLock,
+        request.operation_id.as_str(),
+    );
     revise_contribution_for_operation_locked(store, binding, request, archive_use)
+}
+
+fn acquire_revision_writer_lock(
+    store: &CollaborationStore,
+) -> Result<crate::file_lock::ExclusiveFileLock, IdentityStoreError> {
+    let path = store
+        .project_dir()
+        .join("spool/contribution-revision-writer.lock");
+    let file = crate::file_lock::open_lock_file(&path).map_err(|source| {
+        IdentityStoreError::RevisionWriterLock {
+            path: path.clone(),
+            source,
+        }
+    })?;
+    crate::file_lock::ExclusiveFileLock::acquire(file)
+        .map_err(|source| IdentityStoreError::RevisionWriterLock { path, source })
 }
 
 fn revise_contribution_for_operation_locked(
@@ -1142,6 +1219,11 @@ fn revise_contribution_for_operation_locked(
     request: ContributionRevisionRequest<'_>,
     archive_use: &ArchiveUse,
 ) -> Result<ResolvedContributionRevision, IdentityStoreError> {
+    #[cfg(test)]
+    report_revision_writer_stage(
+        RevisionWriterStage::PreflightStarted,
+        request.operation_id.as_str(),
+    );
     validate_binding_store(store, binding)?;
     require_schema(store)?;
 
@@ -1342,6 +1424,11 @@ fn revise_contribution_for_operation_locked(
         ));
     }
 
+    #[cfg(test)]
+    report_revision_writer_stage(
+        RevisionWriterStage::AfterPreflight,
+        request.operation_id.as_str(),
+    );
     let now = crate::clock::epoch_ms();
     let transaction = store
         .connection()
@@ -2566,23 +2653,6 @@ fn decode_lower_hex(text: &str) -> Result<Vec<u8>, IdentityStoreError> {
     Ok(bytes)
 }
 
-#[cfg(test)]
-mod replay_budget_tests {
-    use super::{IdentityStoreError, MAX_DESCRIPTOR_FILES, ReplayBudget};
-
-    #[test]
-    fn refuses_identity_map_allocation_before_advancing_over_budget() {
-        let mut budget = ReplayBudget::new();
-        budget
-            .admit_transition(MAX_DESCRIPTOR_FILES, MAX_DESCRIPTOR_FILES)
-            .expect("one maximum-sized transition fits the bounded profile");
-        assert!(matches!(
-            budget.admit_transition(1, 1),
-            Err(IdentityStoreError::ReplayByteLimit)
-        ));
-    }
-}
-
 fn lower_hex_nibble(byte: u8) -> Option<u8> {
     match byte {
         b'0'..=b'9' => Some(byte - b'0'),
@@ -2800,4 +2870,267 @@ fn validate_cached_maps(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod identity_store_tests {
+    use super::{
+        ContributionRevisionRequest, IdentityStoreError, MAX_DESCRIPTOR_FILES, ReplayBudget,
+        RevisionWriterStage, RevisionWriterTestHook, replace_revision_writer_test_hook,
+        revise_contribution_for_operation,
+    };
+    use crate::collaboration_capture::OperationId;
+    use crate::collaboration_cli::project_test_support::BoundProjectFixture;
+    use crate::collaboration_state::{CollaborationRoot, CollaborationStore};
+    use std::path::PathBuf;
+    use std::sync::{Arc, Condvar, Mutex, mpsc};
+    use std::thread;
+    use std::time::Duration;
+
+    #[test]
+    fn refuses_identity_map_allocation_before_advancing_over_budget() {
+        let mut budget = ReplayBudget::new();
+        budget
+            .admit_transition(MAX_DESCRIPTOR_FILES, MAX_DESCRIPTOR_FILES)
+            .expect("one maximum-sized transition fits the bounded profile");
+        assert!(matches!(
+            budget.admit_transition(1, 1),
+            Err(IdentityStoreError::ReplayByteLimit)
+        ));
+    }
+
+    struct ResetWriterHook(Option<RevisionWriterTestHook>);
+
+    impl Drop for ResetWriterHook {
+        fn drop(&mut self) {
+            replace_revision_writer_test_hook(self.0.take());
+        }
+    }
+
+    struct ReleasePausedWriter(Arc<(Mutex<bool>, Condvar)>);
+
+    impl ReleasePausedWriter {
+        fn release(&self) {
+            let (released, condition) = &*self.0;
+            *released.lock().expect("release mutex") = true;
+            condition.notify_all();
+        }
+    }
+
+    impl Drop for ReleasePausedWriter {
+        fn drop(&mut self) {
+            self.release();
+        }
+    }
+
+    fn revise_from_host(
+        host: PathBuf,
+        project: crate::collaboration_state::ProjectKey,
+        operation: &str,
+    ) -> Result<String, IdentityStoreError> {
+        let root = CollaborationRoot::under_host_state(&host);
+        let mut store = CollaborationStore::open(&root, &project, &[])
+            .expect("reopen the actual approved project store");
+        let binding = super::resolve_approved_project_binding(&store)
+            .expect("resolve persisted approved binding")
+            .expect("binding exists");
+        let operation_id = OperationId::parse(operation).expect("valid capture operation ID");
+        revise_contribution_for_operation(
+            &mut store,
+            &binding,
+            ContributionRevisionRequest {
+                operation_id: &operation_id,
+                file_operations: None,
+                brief: None,
+                depends_on: None,
+            },
+        )
+        .map(|revision| revision.record_id().as_str().to_string())
+    }
+
+    #[test]
+    fn revision_writers_serialize_preflight_and_refuse_a_stale_dependent_capture() {
+        let mut fixture = BoundProjectFixture::new().expect("real project enrollment and binding");
+        let base = fixture.bootstrap_commit.clone();
+        let first_result = fixture
+            .commit_file(
+                "new.txt",
+                b"first result
+",
+            )
+            .expect("first committed result");
+        let second_result = fixture
+            .commit_file(
+                "second.txt",
+                b"second result
+",
+            )
+            .expect("second committed result");
+        fixture
+            .capture_operation("op-race-pair-a", &base, &first_result)
+            .expect("first operation for the repeated pair");
+        fixture
+            .capture_operation("op-race-pair-b", &base, &first_result)
+            .expect("competing operation for the repeated pair");
+        fixture
+            .capture_operation("op-race-dependent", &first_result, &second_result)
+            .expect("operation based on the competing result");
+
+        let first_operation = OperationId::parse("op-race-pair-a").unwrap();
+        let first = revise_contribution_for_operation(
+            &mut fixture.store,
+            &fixture.binding,
+            ContributionRevisionRequest {
+                operation_id: &first_operation,
+                file_operations: None,
+                brief: None,
+                depends_on: None,
+            },
+        )
+        .expect("seed first exact identity history");
+        let first_revision_id = first.record_id().as_str().to_string();
+        let first_contribution_id = first.revision().contribution_id().as_str().to_string();
+
+        let (competing_preflight_tx, competing_preflight_rx) = mpsc::channel();
+        let (dependent_before_lock_tx, dependent_before_lock_rx) = mpsc::channel();
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let release_in_hook = Arc::clone(&release);
+        let stage_trace = Arc::new(Mutex::new(Vec::new()));
+        let stage_trace_in_hook = Arc::clone(&stage_trace);
+        let writer_lock_path = fixture
+            .store
+            .project_dir()
+            .join("spool/contribution-revision-writer.lock");
+        let hook: RevisionWriterTestHook = Arc::new(move |stage, operation| {
+            stage_trace_in_hook
+                .lock()
+                .expect("revision writer stage trace")
+                .push((operation.to_string(), stage));
+            match (stage, operation) {
+                (RevisionWriterStage::AfterPreflight, "op-race-pair-b") => {
+                    competing_preflight_tx
+                        .send(())
+                        .expect("signal competing writer preflight");
+                    let (released, condition) = &*release_in_hook;
+                    let mut released = released.lock().expect("release mutex");
+                    while !*released {
+                        released = condition.wait(released).expect("wait for release");
+                    }
+                }
+                (RevisionWriterStage::BeforeLock, "op-race-dependent") => {
+                    let file = crate::file_lock::open_lock_file(&writer_lock_path)
+                        .expect("open the competing writer lock for a nonblocking probe");
+                    let probe = crate::file_lock::ExclusiveFileLock::try_acquire(file)
+                        .expect("probe the writer lock without blocking");
+                    assert!(
+                        probe.is_none(),
+                        "the competing writer must own the lock while paused after preflight"
+                    );
+                    dependent_before_lock_tx
+                        .send(())
+                        .expect("signal that the dependent observed lock contention");
+                }
+                _ => {}
+            }
+        });
+        let previous_hook = replace_revision_writer_test_hook(Some(hook));
+        let no_previous_hook = previous_hook.is_none();
+        let _reset_hook = ResetWriterHook(previous_hook);
+        assert!(no_previous_hook, "no other writer hook is installed");
+        let release_guard = ReleasePausedWriter(Arc::clone(&release));
+
+        let host = fixture.host.path().to_path_buf();
+        let project = fixture.store.project().clone();
+        let competing_host = host.clone();
+        let competing_project = project.clone();
+        let competing = thread::spawn(move || {
+            revise_from_host(competing_host, competing_project, "op-race-pair-b")
+        });
+        competing_preflight_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("competing writer pauses after preflight and before its transaction");
+
+        let dependent_host = host.clone();
+        let dependent_project = project.clone();
+        let dependent = thread::spawn(move || {
+            revise_from_host(dependent_host, dependent_project, "op-race-dependent")
+        });
+        dependent_before_lock_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("dependent writer observed the paused competitor holding the writer lock");
+
+        release_guard.release();
+        let competing_revision_id = competing
+            .join()
+            .expect("competing revision thread")
+            .expect("the competing exact capture is a valid immutable revision");
+        assert_ne!(competing_revision_id, first_revision_id);
+
+        let dependent_result = dependent.join().expect("dependent revision thread");
+        let dependent_stages: Vec<_> = stage_trace
+            .lock()
+            .expect("revision writer stage trace")
+            .iter()
+            .filter_map(|(operation, stage)| (operation == "op-race-dependent").then_some(*stage))
+            .collect();
+        assert_eq!(
+            dependent_stages,
+            [
+                RevisionWriterStage::BeforeLock,
+                RevisionWriterStage::AfterLock,
+                RevisionWriterStage::PreflightStarted
+            ],
+            "the dependent must acquire the held lock before it can preflight"
+        );
+        assert!(matches!(
+            dependent_result,
+            Err(IdentityStoreError::UnknownSnapshot {
+                reason: super::IdentityStateUnknownReason::CompetingHistories,
+                ..
+            })
+        ));
+
+        let operation_rows: i64 = fixture
+            .store
+            .read_connection()
+            .query_row(
+                "SELECT count(*) FROM local_logical_contributions
+             WHERE operation_id='op-race-dependent'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let revision_rows: i64 = fixture
+            .store
+            .read_connection()
+            .query_row(
+                "SELECT count(*) FROM contribution_revisions
+             WHERE operation_id='op-race-dependent'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let first_head: String = fixture
+            .store
+            .read_connection()
+            .query_row(
+                "SELECT revision_record_id FROM contribution_revision_heads
+             WHERE contribution_id=?1",
+                [&first_contribution_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            operation_rows, 0,
+            "refused operation has no logical mapping"
+        );
+        assert_eq!(
+            revision_rows, 0,
+            "refused operation has no durable revision"
+        );
+        assert_eq!(
+            first_head, first_revision_id,
+            "the rejected dependent operation cannot alter the existing logical head"
+        );
+    }
 }
