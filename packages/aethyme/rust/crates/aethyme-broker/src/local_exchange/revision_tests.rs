@@ -96,7 +96,6 @@ fn packet_with_brief(include_brief: bool, many_changes: bool) -> Metadata {
         (bytes, id, digest)
     });
     let (revision_bytes, revision_id) = captured_revision(brief.clone(), many_changes);
-    let revision_hex = lower_hex(&revision_bytes);
     let revision_digest = crate::collaboration_archive::ObjectDigest::of(&revision_bytes)
         .hex()
         .to_string();
@@ -109,7 +108,8 @@ fn packet_with_brief(include_brief: bool, many_changes: bool) -> Metadata {
         capture_receipt_record_id: sha('f'),
         revision_record_id: revision_id.to_string(),
         revision_object_sha256: revision_digest,
-        revision_bytes_hex: revision_hex,
+        revision_bytes_hex: BoundedHexPayload::from_bytes(&revision_bytes)
+            .expect("bounded revision payload"),
         brief_record_id: brief.as_ref().map(|(_, id, _)| id.to_string()),
         brief_object_sha256: brief.as_ref().map(|(_, _, digest)| digest.clone()),
         brief_bytes_hex: brief.as_ref().map(|(bytes, _, _)| lower_hex(bytes)),
@@ -123,7 +123,7 @@ fn packet_with_brief(include_brief: bool, many_changes: bool) -> Metadata {
     }
 }
 
-fn large_packet_with_scope(revision_bytes: &[u8], scope: String) -> Metadata {
+fn large_packet_with_scope(revision_bytes: &[u8], scope: Vec<String>) -> Metadata {
     let (revision, revision_id) =
         ContributionRevision::from_record(revision_bytes).expect("large revision");
     Metadata::RevisionContribution {
@@ -137,14 +137,25 @@ fn large_packet_with_scope(revision_bytes: &[u8], scope: String) -> Metadata {
         revision_object_sha256: crate::collaboration_archive::ObjectDigest::of(revision_bytes)
             .hex()
             .to_string(),
-        revision_bytes_hex: lower_hex(revision_bytes),
+        revision_bytes_hex: BoundedHexPayload::from_bytes(revision_bytes)
+            .expect("bounded revision payload"),
         brief_record_id: None,
         brief_object_sha256: None,
         brief_bytes_hex: None,
         source: revision.result().to_string(),
         availability: SourceAvailability::LocalOnly,
-        scope: vec![scope],
+        scope,
     }
+}
+
+fn large_scope_paths() -> Vec<String> {
+    let path_bytes = 1024;
+    (0..64)
+        .map(|index| {
+            let prefix = format!("src/{index:04}-");
+            format!("{}{}", prefix, "x".repeat(path_bytes - prefix.len()))
+        })
+        .collect()
 }
 
 fn large_revision_bytes() -> Vec<u8> {
@@ -156,11 +167,12 @@ fn large_revision_bytes() -> Vec<u8> {
         &base,
     )
     .expect("descriptor");
-    let path_bytes = aethyme_contracts::experimental_v0::source_snapshot::MAX_PATH_BYTES;
-    let result = SourceSnapshot::new((0..460).map(|index| {
-        let prefix = format!("src/{index:04}-");
-        let path = format!("{}{}", prefix, "x".repeat(path_bytes - prefix.len()));
-        SourceEntry::from_content(path.into_bytes(), EntryKind::Regular, b"new source\n")
+    let result = SourceSnapshot::new(large_scope_paths().iter().map(|path| {
+        SourceEntry::from_content(
+            path.as_bytes().to_vec(),
+            EntryKind::Regular,
+            b"new source\n",
+        )
     }))
     .expect("large result snapshot");
     let logical_id = logical_id();
@@ -188,19 +200,35 @@ fn large_revision_bytes() -> Vec<u8> {
         result.id(),
         changes,
         None,
-        Vec::new(),
+        // These are valid unique wire references; resolution is outside this
+        // transport-size fixture, which exercises only canonical byte bounds.
+        (1..=3000)
+            .map(|index| {
+                RecordId::parse(&format!("sha256:{index:064x}"))
+                    .expect("valid dependency record ID")
+            })
+            .collect(),
     )
     .expect("large revision")
     .to_record();
-    assert!(bytes.len() < aethyme_contracts::experimental_v0::contribution_revision::MAX_CONTRIBUTION_REVISION_BYTES);
+    assert!(bytes.len() <= MAX_REVISION_OBJECT_BYTES_IN_PACKET);
     bytes
 }
 
 #[test]
 fn revision_exchange_binds_exact_records_and_preserves_advisory_role() {
     let packet = packet_with_brief(true, true);
+    let Metadata::RevisionContribution {
+        revision_bytes_hex: BoundedHexPayload(HexPayloadWire::Chunks(chunks)),
+        ..
+    } = &packet
+    else {
+        panic!("large revision must use bounded chunks");
+    };
+    assert!(chunks.len() > 1);
     let record = packet.record().expect("bounded revision packet");
     assert!(record.canonical_bytes().len() > MAX_PACKET_BYTES);
+    assert!(record.canonical_bytes().len() <= MAX_REVISION_PACKET_BYTES);
     let value: serde_json::Value = serde_json::from_slice(&record.canonical_bytes()).unwrap();
     let decoded: Metadata = serde_json::from_value(value["spec"].clone()).unwrap();
     assert_eq!(decoded.record().unwrap().id(), record.id());
@@ -259,13 +287,113 @@ fn revision_exchange_rejects_incomplete_brief_and_oversized_hex_before_decode() 
         revision_bytes_hex, ..
     } = &mut oversized
     {
-        revision_bytes_hex.push_str(
-            &"0".repeat(
-                2 * aethyme_contracts::experimental_v0::contribution_revision::MAX_CONTRIBUTION_REVISION_BYTES,
-            ),
-        );
+        *revision_bytes_hex = BoundedHexPayload(HexPayloadWire::Inline(
+            "0".repeat(MAX_REVISION_HEX_CHUNK_CHARS + 2),
+        ));
     }
     assert!(matches!(oversized.record(), Err(ExchangeError::Limit)));
+}
+
+#[test]
+fn revision_hex_chunks_require_one_bounded_canonical_shape() {
+    let raw = vec![0x5a; MAX_REVISION_HEX_CHUNK_BYTES + 1];
+    let encoded = BoundedHexPayload::from_bytes(&raw).unwrap();
+    let HexPayloadWire::Chunks(chunks) = &encoded.0 else {
+        panic!("payload over the inline threshold must be chunked");
+    };
+    assert_eq!(chunks.len(), 2);
+    assert_eq!(chunks[0].len(), MAX_REVISION_HEX_CHUNK_CHARS);
+    assert_eq!(chunks[1].len(), 2);
+    assert_eq!(
+        encoded.decode(MAX_REVISION_OBJECT_BYTES_IN_PACKET).unwrap(),
+        raw
+    );
+
+    let unnormalized =
+        BoundedHexPayload(HexPayloadWire::Chunks(vec!["aabb".into(), "ccdd".into()]));
+    assert!(matches!(
+        unnormalized.decode(16),
+        Err(ExchangeError::Invalid(_))
+    ));
+
+    let uppercase = BoundedHexPayload(HexPayloadWire::Chunks(vec![
+        "A".repeat(MAX_REVISION_HEX_CHUNK_CHARS),
+        "bb".into(),
+    ]));
+    assert!(matches!(
+        uppercase.decode(MAX_REVISION_OBJECT_BYTES_IN_PACKET),
+        Err(ExchangeError::Invalid(_))
+    ));
+
+    let too_many = BoundedHexPayload(HexPayloadWire::Chunks(vec![
+        String::new();
+        MAX_REVISION_HEX_CHUNKS + 1
+    ]));
+    assert!(matches!(
+        too_many.decode(MAX_REVISION_OBJECT_BYTES_IN_PACKET),
+        Err(ExchangeError::Limit)
+    ));
+}
+
+#[test]
+fn complete_event_wire_size_is_preflighted_under_the_generic_record_cap() {
+    let event = Event {
+        stream: StreamWitness {
+            binding: sha('1'),
+            reader: "reader".into(),
+            scope_digest: sha('2'),
+            visibility_generation: "visibility-1".into(),
+            incarnation: "incarnation-1".into(),
+            remote_authority_epoch: "authority-1".into(),
+        },
+        sequence: 1,
+        packet: packet_with_brief(true, true),
+    };
+    let record = event.record().expect("complete bounded event");
+    assert!(record.canonical_bytes().len() <= MAX_REVISION_PACKET_BYTES);
+
+    let mut oversized_packet = packet_with_brief(false, false);
+    let Metadata::RevisionContribution {
+        revision_bytes_hex, ..
+    } = &mut oversized_packet
+    else {
+        unreachable!();
+    };
+    *revision_bytes_hex = BoundedHexPayload(HexPayloadWire::Chunks(vec![
+        "0".repeat(
+            MAX_REVISION_HEX_CHUNK_CHARS
+        );
+        MAX_REVISION_HEX_CHUNKS
+    ]));
+    let oversized_event = Event {
+        stream: StreamWitness {
+            binding: sha('1'),
+            reader: "reader".into(),
+            scope_digest: sha('2'),
+            visibility_generation: "visibility-1".into(),
+            incarnation: "incarnation-1".into(),
+            remote_authority_epoch: "authority-1".into(),
+        },
+        sequence: 1,
+        packet: oversized_packet,
+    };
+    assert!(matches!(
+        canonical_with_limit(&EVENT, &oversized_event, MAX_REVISION_PACKET_BYTES),
+        Err(ExchangeError::Limit)
+    ));
+}
+
+#[test]
+fn small_revision_payloads_keep_the_legacy_inline_shape() {
+    let packet = packet_with_brief(false, false);
+    let Metadata::RevisionContribution {
+        revision_bytes_hex: BoundedHexPayload(HexPayloadWire::Inline(_)),
+        ..
+    } = &packet
+    else {
+        panic!("small revision must retain inline encoding");
+    };
+    assert!(packet.record().unwrap().canonical_bytes().len() <= MAX_PACKET_BYTES);
 }
 
 #[test]
@@ -289,7 +417,10 @@ fn legacy_exchange_packet_keeps_the_original_size_profile() {
 
 #[test]
 fn snapshot_page_rejects_aggregate_revision_bytes_over_the_page_cap() {
+    // The source paths match the packet scope exactly; valid revision references
+    // make each item large enough for one bounded page to cross its 32 MiB cap.
     let revision = large_revision_bytes();
+    let scope = large_scope_paths();
     let stream = StreamWitness {
         binding: sha('1'),
         reader: "reader".into(),
@@ -298,17 +429,34 @@ fn snapshot_page_rejects_aggregate_revision_bytes_over_the_page_cap() {
         incarnation: "incarnation-1".into(),
         remote_authority_epoch: "authority-1".into(),
     };
-    let items = (0..5)
+    let first_event = Event {
+        stream: stream.clone(),
+        sequence: 1,
+        packet: large_packet_with_scope(&revision, scope.clone()),
+    };
+    let first_event_bytes = first_event.record().unwrap().canonical_bytes().len();
+    let item_count = MAX_SNAPSHOT_PAGE_BYTES / first_event_bytes + 1;
+    assert!(item_count <= MAX_BATCH_ITEMS);
+    let items = (0..item_count)
         .map(|index| Event {
             stream: stream.clone(),
-            sequence: index + 1,
-            packet: large_packet_with_scope(&revision, format!("src/variant-{index}.rs")),
+            sequence: index as u64 + 1,
+            packet: large_packet_with_scope(&revision, scope.clone()),
         })
         .collect::<Vec<_>>();
+    assert!(items.len() > 1);
     assert!(
-        items.iter().all(
-            |event| event.record().unwrap().canonical_bytes().len() < MAX_REVISION_PACKET_BYTES
-        )
+        items
+            .iter()
+            .all(|event| event.record().unwrap().canonical_bytes().len()
+                <= MAX_REVISION_PACKET_BYTES)
+    );
+    assert!(
+        items
+            .iter()
+            .map(|event| event.record().unwrap().canonical_bytes().len())
+            .sum::<usize>()
+            > MAX_SNAPSHOT_PAGE_BYTES
     );
     let page = SnapshotPage {
         snapshot: SnapshotDescriptor {

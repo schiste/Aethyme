@@ -58,7 +58,6 @@ pub struct D10RevisionPin {
 #[derive(Debug)]
 pub(super) struct LoadedD10Bindings {
     pub bindings: D10RevisionBindings,
-    pub revision_ids: BTreeMap<String, RecordId>,
     pub object_digests: BTreeSet<ObjectDigest>,
     pub revisions: BTreeMap<String, ContributionRevision>,
     pub identity_transitions: BTreeMap<String, FileIdentityTransition>,
@@ -127,7 +126,6 @@ pub(super) fn validate_bindings(
 
     let mut total_bytes = descriptor_bytes.len();
     let mut object_digests = BTreeSet::from([descriptor_digest]);
-    let mut revision_ids = BTreeMap::new();
     let mut unique_revision_ids = BTreeSet::new();
     let contributions: BTreeMap<_, _> = spec
         .contributions
@@ -248,7 +246,6 @@ pub(super) fn validate_bindings(
             ));
         }
         object_digests.insert(revision_digest);
-        revision_ids.insert(target_id.clone(), revision_id.clone());
         parsed_revisions.insert(target_id, revision.clone());
     }
 
@@ -256,7 +253,6 @@ pub(super) fn validate_bindings(
 
     Ok(LoadedD10Bindings {
         bindings,
-        revision_ids,
         object_digests,
         revisions: parsed_revisions,
         identity_transitions,
@@ -734,19 +730,19 @@ mod tests {
     fn bindings() -> D10RevisionBindings {
         D10RevisionBindings {
             profile: D10_TARGET_PROFILE.into(),
-            project_id: "proj:00000000000000000000000000".into(),
+            project_id: "proj:aaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
             descriptor_record_id: record_id('3').to_string(),
             descriptor_object_sha256: "4".repeat(64),
             revisions: vec![
                 D10RevisionPin {
                     contribution: "A".into(),
-                    logical_contribution_id: "contrib:00000000000000000000000000".into(),
+                    logical_contribution_id: "contrib:aaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
                     revision_record_id: record_id('5').to_string(),
                     revision_object_sha256: "6".repeat(64),
                 },
                 D10RevisionPin {
                     contribution: "B".into(),
-                    logical_contribution_id: "contrib:00000000000000000000000004".into(),
+                    logical_contribution_id: "contrib:bbbbbbbbbbbbbbbbbbbbbbbbbe".into(),
                     revision_record_id: record_id('7').to_string(),
                     revision_object_sha256: "8".repeat(64),
                 },
@@ -755,13 +751,13 @@ mod tests {
     }
 
     fn parsed_revisions(depends_on_b: RecordId) -> BTreeMap<String, ContributionRevision> {
-        let project = ProjectId::parse("proj:00000000000000000000000000").expect("project ID");
+        let project = ProjectId::parse("proj:aaaaaaaaaaaaaaaaaaaaaaaaaa").expect("project ID");
         BTreeMap::from([
             (
                 "A".into(),
                 ContributionRevision::new(
                     project.clone(),
-                    contribution_id("contrib:00000000000000000000000000"),
+                    contribution_id("contrib:aaaaaaaaaaaaaaaaaaaaaaaaaa"),
                     record_id('a'),
                     source_id('0'),
                     source_id('1'),
@@ -775,7 +771,7 @@ mod tests {
                 "B".into(),
                 ContributionRevision::new(
                     project,
-                    contribution_id("contrib:00000000000000000000000004"),
+                    contribution_id("contrib:bbbbbbbbbbbbbbbbbbbbbbbbbe"),
                     record_id('b'),
                     source_id('1'),
                     source_id('2'),
@@ -926,7 +922,7 @@ mod tests {
         let side_transition = advance_file_identities(
             &project_id,
             &first_transition.result_identity_state(),
-            "contrib:cccccccccccccccccccccccccf",
+            "contrib:ccccccccccccccccccccccccce",
             &first,
             &side,
             &[],
@@ -1002,7 +998,7 @@ mod tests {
                 "C".into(),
                 ContributionRevision::new(
                     project_id,
-                    contribution_id("contrib:cccccccccccccccccccccccccf"),
+                    contribution_id("contrib:ccccccccccccccccccccccccce"),
                     record_id('c'),
                     first.id(),
                     side.id(),
