@@ -5,7 +5,8 @@ use aethyme_contracts::experimental_v0::{
     ProjectId, RecordId, SourceEntry, SourceSnapshot, advance_file_identities,
     canonical_json::{MAX_STRING_BYTES, Object, Value},
     contribution_revision::{
-        ContributionRevisionError, MAX_CONTRIBUTION_REVISION_BYTES, MAX_REVISION_CHANGES,
+        ContributionRevisionError, MAX_CONTRIBUTION_REVISION_BYTES, MAX_REVISION_ARRAY_ENTRIES,
+        MAX_REVISION_CHANGES,
     },
 };
 
@@ -37,6 +38,31 @@ fn lower_hex(bytes: &[u8]) -> String {
         encoded.push(DIGITS[usize::from(byte & 0x0f)]);
     }
     String::from_utf8(encoded).unwrap()
+}
+
+fn oversized_new_file_changes(file_id: &FileId) -> Vec<Value> {
+    (0..130)
+        .map(|index| {
+            let prefix = format!("{index:03}");
+            let path = format!("{prefix}{}", "x".repeat(4096 - prefix.len()));
+            let after = Object::new(vec![
+                ("content_sha256".into(), Value::String("3".repeat(64))),
+                ("file_id".into(), Value::String(file_id.as_str().into())),
+                ("mode".into(), Value::String("100644".into())),
+                ("path_hex".into(), Value::String(lower_hex(path.as_bytes()))),
+            ])
+            .unwrap();
+            Value::Object(
+                Object::new(vec![
+                    ("after".into(), Value::Object(after)),
+                    ("derived_from".into(), Value::Array(Vec::new())),
+                    ("possible_sources".into(), Value::Array(Vec::new())),
+                    ("relation".into(), Value::String("new".into())),
+                ])
+                .unwrap(),
+            )
+        })
+        .collect()
 }
 
 #[test]
@@ -147,28 +173,7 @@ fn constructor_rejects_a_revision_larger_than_the_canonical_record_limit() {
     let contribution = ContributionId::parse(&format!("contrib:{}e", "b".repeat(25))).unwrap();
     let capture_record_id = RecordId::parse(&format!("sha256:{}", "1".repeat(64))).unwrap();
     let file_id = FileId::parse(&format!("file:sha256:{}", "2".repeat(64))).unwrap();
-    let changes = (0..130)
-        .map(|index| {
-            let prefix = format!("{index:03}");
-            let path = format!("{prefix}{}", "x".repeat(4096 - prefix.len()));
-            let after = Object::new(vec![
-                ("content_sha256".into(), Value::String("3".repeat(64))),
-                ("file_id".into(), Value::String(file_id.as_str().into())),
-                ("mode".into(), Value::String("100644".into())),
-                ("path_hex".into(), Value::String(lower_hex(path.as_bytes()))),
-            ])
-            .unwrap();
-            Value::Object(
-                Object::new(vec![
-                    ("after".into(), Value::Object(after)),
-                    ("derived_from".into(), Value::Array(Vec::new())),
-                    ("possible_sources".into(), Value::Array(Vec::new())),
-                    ("relation".into(), Value::String("new".into())),
-                ])
-                .unwrap(),
-            )
-        })
-        .collect();
+    let changes = oversized_new_file_changes(&file_id);
 
     let result = ContributionRevision::new(
         project(),
@@ -184,6 +189,81 @@ fn constructor_rejects_a_revision_larger_than_the_canonical_record_limit() {
         result,
         Err(ContributionRevisionError::TooLarge(bytes))
             if bytes > MAX_CONTRIBUTION_REVISION_BYTES
+    ));
+}
+
+#[test]
+fn constructor_reports_reference_count_before_canonical_byte_limit() {
+    let snapshot = SourceSnapshot::new(std::iter::empty::<SourceEntry>()).unwrap();
+    let contribution = ContributionId::parse(&format!("contrib:{}e", "b".repeat(25))).unwrap();
+    let capture_record_id = RecordId::parse(&format!("sha256:{}", "1".repeat(64))).unwrap();
+    let source_id = FileId::parse(&format!("file:sha256:{}", "2".repeat(64))).unwrap();
+    let result_id = FileId::parse(&format!("file:sha256:{}", "3".repeat(64))).unwrap();
+    let references: Vec<_> = (0..=MAX_REVISION_ARRAY_ENTRIES)
+        .map(|_| Value::String(source_id.as_str().into()))
+        .collect();
+    let reference_json_bytes =
+        2 + references.len() * (source_id.as_str().len() + 2) + references.len().saturating_sub(1);
+    assert!(reference_json_bytes + 1024 < MAX_CONTRIBUTION_REVISION_BYTES);
+
+    let after = Object::new(vec![
+        ("content_sha256".into(), Value::String("4".repeat(64))),
+        ("file_id".into(), Value::String(result_id.as_str().into())),
+        ("mode".into(), Value::String("100644".into())),
+        ("path_hex".into(), Value::String(lower_hex(b"new.rs"))),
+    ])
+    .unwrap();
+    let change = Value::Object(
+        Object::new(vec![
+            ("after".into(), Value::Object(after)),
+            ("derived_from".into(), Value::Array(references)),
+            ("possible_sources".into(), Value::Array(Vec::new())),
+            ("relation".into(), Value::String("explicit_split".into())),
+        ])
+        .unwrap(),
+    );
+
+    let result = ContributionRevision::new(
+        project(),
+        contribution,
+        capture_record_id,
+        snapshot.id(),
+        snapshot.id(),
+        vec![change],
+        None,
+        Vec::new(),
+    );
+    assert!(matches!(
+        result,
+        Err(ContributionRevisionError::TooManyReferences(count))
+            if count == MAX_REVISION_ARRAY_ENTRIES + 1
+    ));
+}
+
+#[test]
+fn constructor_validates_brief_digest_before_canonical_byte_limit() {
+    let snapshot = SourceSnapshot::new(std::iter::empty::<SourceEntry>()).unwrap();
+    let contribution = ContributionId::parse(&format!("contrib:{}e", "b".repeat(25))).unwrap();
+    let capture_record_id = RecordId::parse(&format!("sha256:{}", "1".repeat(64))).unwrap();
+    let file_id = FileId::parse(&format!("file:sha256:{}", "2".repeat(64))).unwrap();
+    let brief = BriefReference {
+        record_id: RecordId::parse(&format!("sha256:{}", "3".repeat(64))).unwrap(),
+        object_sha256: "x".into(),
+    };
+
+    let result = ContributionRevision::new(
+        project(),
+        contribution,
+        capture_record_id,
+        snapshot.id(),
+        snapshot.id(),
+        oversized_new_file_changes(&file_id),
+        Some(brief),
+        Vec::new(),
+    );
+    assert!(matches!(
+        result,
+        Err(ContributionRevisionError::InvalidBriefDigest)
     ));
 }
 
