@@ -2,7 +2,7 @@ use super::*;
 use crate::collaboration_gc::{self as gc, GcHooks};
 use crate::collaboration_state::{CollaborationRoot, ProjectKey};
 use crate::local_target::tests::{Fixture, git};
-use rusqlite::OptionalExtension;
+use rusqlite::{OptionalExtension, TransactionBehavior};
 use std::path::Path;
 
 struct Setup {
@@ -23,6 +23,10 @@ impl Setup {
     }
 }
 fn setup(config: Option<&str>) -> Setup {
+    setup_with_legacy_candidate(config, false)
+}
+
+fn setup_with_legacy_candidate(config: Option<&str>, legacy: bool) -> Setup {
     let mut f = Fixture::new();
     let original = f.a.base.commit.clone();
     git(
@@ -59,20 +63,38 @@ fn setup(config: Option<&str>) -> Setup {
     target::select_revision(&mut f.store, &owner, &revision.id).unwrap();
     wave::available(&mut f.store, &owner, "A", 0).unwrap();
     wave::available(&mut f.store, &owner, "B", 1).unwrap();
-    let run = wave::tick(
-        &mut f.store,
-        &owner,
-        f._repo.path(),
-        wave::WavePolicy {
-            debounce_ms: 0,
-            ..Default::default()
-        },
-        1,
-    )
-    .unwrap();
-    let wave = match run {
-        wave::Run::RequiresVerification(w) => w.id,
-        other => panic!("{other:?}"),
+    let wave = if legacy {
+        let admitted = wave::admit(
+            &mut f.store,
+            &owner,
+            wave::WavePolicy {
+                debounce_ms: 0,
+                ..Default::default()
+            },
+            1,
+        )
+        .unwrap();
+        let frozen = match admitted {
+            wave::Admission::Frozen(wave) => wave,
+            other => panic!("{other:?}"),
+        };
+        compose_legacy_candidate(&mut f.store, &owner, f._repo.path(), &frozen).id
+    } else {
+        let run = wave::tick(
+            &mut f.store,
+            &owner,
+            f._repo.path(),
+            wave::WavePolicy {
+                debounce_ms: 0,
+                ..Default::default()
+            },
+            1,
+        )
+        .unwrap();
+        match run {
+            wave::Run::RequiresVerification(w) => w.id,
+            other => panic!("{other:?}"),
+        }
     };
     let p = policy(f._repo.path(), &base).unwrap();
     let trust = crate::broker::gate_trust::record_trust(
@@ -89,6 +111,128 @@ fn setup(config: Option<&str>) -> Setup {
         wave,
         trust,
     }
+}
+
+/// Build the schema-22 shape directly: the wave has a candidate and composer
+/// recipe but no schema-27 request/source references. This models a real
+/// pre-migration row instead of clearing provenance from a current wave.
+fn compose_legacy_candidate(
+    store: &mut CollaborationStore,
+    owner: &ControllerOwner,
+    repo: &Path,
+    frozen: &wave::Wave,
+) -> wave::Wave {
+    let revision_id = RecordId::parse(&frozen.spec.revision).unwrap();
+    let pinned = target::load_revision(store, &revision_id).unwrap();
+    let baseline = archive::retained(store, &snapshot(&frozen.spec.baseline).unwrap())
+        .unwrap()
+        .unwrap();
+    let request = crate::composer::CompositionRequest {
+        baseline: baseline.commit,
+        accepted: Vec::new(),
+        catalog: pinned.spec.catalog().unwrap(),
+        deliveries: frozen.spec.selected.clone(),
+        budget: crate::composer::CompositionBudget {
+            max_contributions: frozen.spec.policy.max_group,
+            ..Default::default()
+        },
+    };
+    let tx = store
+        .connection()
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .unwrap();
+    assert_eq!(
+        tx.execute(
+            "UPDATE local_waves SET phase='composing' WHERE wave=?1 AND phase='frozen'",
+            [frozen.id.as_str()],
+        )
+        .unwrap(),
+        1
+    );
+    assert_eq!(
+        tx.execute(
+            "UPDATE local_targets SET phase='composing',version=version+1
+             WHERE target=?1 AND active_revision=?2 AND phase='wave_frozen'",
+            rusqlite::params![owner.target(), frozen.spec.revision],
+        )
+        .unwrap(),
+        1
+    );
+    tx.commit().unwrap();
+
+    let mut retain_candidate =
+        |store: &mut CollaborationStore,
+         candidate: &crate::composition::Candidate,
+         recipe: &crate::composer::RecipeRef,
+         archive_guard: &crate::collaboration_gc::ArchiveUse| {
+            let response_guard =
+                crate::collaboration_sensitive::response_use(store).map_err(|error| {
+                    crate::composer::ComposeError::CandidateRetention(error.to_string())
+                })?;
+            let authority_guard = target::authorize(store, owner).map_err(|error| {
+                crate::composer::ComposeError::CandidateRetention(error.to_string())
+            })?;
+            let permit = target::ArtifactRetentionPermit::new(
+                store,
+                owner,
+                archive_guard,
+                &response_guard,
+                &authority_guard,
+            )
+            .map_err(|error| {
+                crate::composer::ComposeError::CandidateRetention(error.to_string())
+            })?;
+            target::retain_artifacts_under_guards(
+                store,
+                &revision_id,
+                std::slice::from_ref(&candidate.subject),
+                std::slice::from_ref(&recipe.object),
+                &permit,
+            )
+            .map_err(|error| crate::composer::ComposeError::CandidateRetention(error.to_string()))
+        };
+    let composition = crate::composer::compose_with_candidate_retainer(
+        store,
+        repo,
+        &request,
+        &mut retain_candidate,
+    )
+    .unwrap();
+    let candidate = match composition.outcome {
+        crate::composition::CompositionOutcome::Candidate(candidate) => candidate,
+        other => panic!("expected historical fixture candidate, got {other:?}"),
+    };
+    let recipe = composition.recipe.expect("candidate has a recipe");
+    let tx = store
+        .connection()
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .unwrap();
+    assert_eq!(
+        tx.execute(
+            "UPDATE local_waves SET phase='verifying',detail='trusted verification adapter unavailable',
+                 candidate_snapshot=?2,candidate_commit=?3,recipe_object=?4,composition_ms=0
+             WHERE wave=?1 AND phase='composing'",
+            rusqlite::params![
+                frozen.id.as_str(),
+                candidate.subject.as_str(),
+                candidate.commit.as_str(),
+                recipe.object.hex(),
+            ],
+        )
+        .unwrap(),
+        1
+    );
+    assert_eq!(
+        tx.execute(
+            "UPDATE local_targets SET phase='waiting_for_input',resume_phase='verifying',version=version+1
+             WHERE target=?1 AND active_revision=?2 AND phase='composing'",
+            rusqlite::params![owner.target(), frozen.spec.revision],
+        )
+        .unwrap(),
+        1
+    );
+    tx.commit().unwrap();
+    wave::load(store, &frozen.id).unwrap()
 }
 
 fn open_store(host: &Path) -> CollaborationStore {
@@ -714,7 +858,7 @@ fn fresh_dispatch_refuses_a_job_completed_after_the_callers_snapshot() {
 
 #[test]
 fn released_prepared_job_remains_readable_but_cannot_be_dispatched_or_replayed() {
-    let mut s = setup(None);
+    let mut s = setup_with_legacy_candidate(None, true);
     let owner = s.owner.as_ref().expect("setup owner is present");
     let job = prepare(&mut s.f.store, owner, &mut s.broker, &s.wave).unwrap();
     // Reopen the durable store as a schema-22 client would see it, then keep

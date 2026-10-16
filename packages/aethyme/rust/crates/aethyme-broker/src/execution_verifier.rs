@@ -706,6 +706,20 @@ impl TrustedEvidence {
     pub fn collected_assertions(&self) -> usize {
         self.body.assertions.len()
     }
+    /// Assertion identifiers that the trusted verifier observed failing.
+    /// Infrastructure, timeout, cancellation, and incomplete evidence never
+    /// become resolver checks, even if an individual row carries a failure.
+    pub(crate) fn failed_assertion_ids(&self) -> Vec<String> {
+        if self.body.result != VerificationOutcome::AssertionFailed {
+            return Vec::new();
+        }
+        self.body
+            .assertions
+            .iter()
+            .filter(|assertion| assertion.outcome == VerificationOutcome::AssertionFailed)
+            .map(|assertion| assertion.id.clone())
+            .collect()
+    }
     pub fn expires_ms(&self) -> i64 {
         self.expires_ms
     }
