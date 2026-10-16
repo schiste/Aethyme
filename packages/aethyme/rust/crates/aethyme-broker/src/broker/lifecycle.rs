@@ -267,23 +267,39 @@ fn preflight_worktree_root(
             }
         }
     }
-    // `worktrees.min_free_bytes` is policy for an explicitly configured
-    // repository root. Environment/library overrides, host state, and the
-    // in-repository fallback get mount, ancestor, and containment checks here;
-    // verification slots apply their separate gate reserve when they are used.
-    if source == WorktreeRootSource::RepositoryConfig
-        && let Some(minimum) = min_free_bytes
-        && let Some(free) = available_bytes(path)
-        && free < minimum
-    {
-        return Err(format!(
-            "{} has {} free, below the {} required (worktrees.min_free_bytes)",
-            path.display(),
-            crate::disk_headroom::format_gibibytes(free),
-            crate::disk_headroom::format_gibibytes(minimum)
-        ));
+    // Placement overrides select a location; they do not opt out of the
+    // recovery reserve. Only the configured root uses its explicit policy.
+    let minimum = worktree_storage_minimum(source, min_free_bytes);
+    if minimum > 0 {
+        let free = available_bytes(path).ok_or_else(|| {
+            format!(
+                "cannot inspect free space at {}; refusing checkout allocation until its volume can be inspected",
+                path.display()
+            )
+        })?;
+        if free < minimum {
+            let policy = if source == WorktreeRootSource::RepositoryConfig {
+                "worktrees.min_free_bytes"
+            } else {
+                "broker recovery reserve"
+            };
+            return Err(format!(
+                "{} has {} free, below the {} required ({policy})",
+                path.display(),
+                crate::disk_headroom::format_gibibytes(free),
+                crate::disk_headroom::format_gibibytes(minimum)
+            ));
+        }
     }
     Ok(())
+}
+
+fn worktree_storage_minimum(source: WorktreeRootSource, configured: Option<u64>) -> u64 {
+    if source == WorktreeRootSource::RepositoryConfig {
+        configured.unwrap_or(crate::disk_headroom::DEFAULT_GATE_HEADROOM_BYTES)
+    } else {
+        crate::disk_headroom::DEFAULT_GATE_HEADROOM_BYTES
+    }
 }
 
 fn prepare_worktree_root_directory(
@@ -1582,6 +1598,9 @@ impl Broker {
         self.refresh_disposable_integration(crate::IntegrationRefreshTrigger::Start);
         let mut start_base = self.select_session_start_base(explicit_base)?;
         refresh.record(&mut start_base);
+        // Refresh may wait on another process or a remote. Sample the actual
+        // destination again immediately before allocating a Git checkout.
+        self.preflight_session_checkout_storage(&placement)?;
         let worktree = self
             .repo
             .worktree_add(&worktree_path, &branch, &start_base.commit)?;
@@ -1667,22 +1686,51 @@ impl Broker {
         )
     }
 
+    fn configured_worktree_minimum(
+        &self,
+        source: WorktreeRootSource,
+    ) -> Result<Option<u64>, BrokerOpError> {
+        if source != WorktreeRootSource::RepositoryConfig {
+            return Ok(None);
+        }
+        crate::worktree_location::WorktreeLocationConfig::load(&self.main_root)
+            .map(|config| config.map(|settings| settings.min_free_bytes()))
+            .map_err(|reason| BrokerOpError::WorktreeRootUnavailable {
+                path: self.main_root.join(".aethyme/config.toml"),
+                reason,
+            })
+    }
+
+    fn preflight_session_checkout_storage(
+        &self,
+        placement: &WorktreePlacement,
+    ) -> Result<(), BrokerOpError> {
+        let configured_minimum = self.configured_worktree_minimum(placement.source)?;
+        preflight_worktree_root(
+            &self.main_root,
+            &placement.root,
+            placement.source,
+            placement.source != WorktreeRootSource::RepositoryFallback,
+            configured_minimum,
+            crate::verification::removable_volume_unavailable_reason,
+            |candidate| {
+                crate::disk_headroom::available_headroom_at_or_above_for(&self.main_root, candidate)
+                    .map(|headroom| headroom.bytes)
+            },
+        )
+        .map_err(|reason| BrokerOpError::WorktreeRootUnavailable {
+            path: placement.root.clone(),
+            reason,
+        })
+    }
+
     pub(super) fn prepare_worktree_root(
         &self,
         path: &Path,
         source: WorktreeRootSource,
         require_external: bool,
     ) -> Result<PathBuf, BrokerOpError> {
-        let min_free_bytes = if source == WorktreeRootSource::RepositoryConfig {
-            crate::worktree_location::WorktreeLocationConfig::load(&self.main_root)
-                .map_err(|reason| BrokerOpError::WorktreeRootUnavailable {
-                    path: self.main_root.join(".aethyme/config.toml"),
-                    reason,
-                })?
-                .map(|settings| settings.min_free_bytes())
-        } else {
-            None
-        };
+        let min_free_bytes = self.configured_worktree_minimum(source)?;
         let root = prepare_worktree_root_directory(
             &self.main_root,
             path,
@@ -2249,13 +2297,16 @@ mod worktree_root_candidate_tests {
     }
 
     #[test]
-    fn only_configured_roots_use_the_configured_space_floor() {
+    fn every_placement_keeps_a_recovery_reserve_before_creating_storage() {
         let temp = tempfile::tempdir().unwrap();
         let repository = temp.path().join("repo");
         std::fs::create_dir_all(&repository).unwrap();
-        let mut headroom_reads = 0;
-
         for (source, path, require_external) in [
+            (
+                WorktreeRootSource::RepositoryConfig,
+                temp.path().join("configured-root"),
+                true,
+            ),
             (
                 WorktreeRootSource::EnvironmentOverride,
                 temp.path().join("env-root"),
@@ -2277,22 +2328,72 @@ mod worktree_root_candidate_tests {
                 false,
             ),
         ] {
-            preflight_worktree_root(
+            let minimum = if source == WorktreeRootSource::RepositoryConfig {
+                1024
+            } else {
+                crate::disk_headroom::DEFAULT_GATE_HEADROOM_BYTES
+            };
+            let result = prepare_worktree_root_directory(
                 &repository,
                 &path,
                 source,
                 require_external,
                 Some(1024),
                 |_| None,
-                |_| {
-                    headroom_reads += 1;
-                    Some(0)
-                },
+                |_| Some(minimum - 1),
+            );
+            assert!(result.is_err(), "{source:?} ignored its reserve");
+            assert!(!path.exists(), "{source:?} wrote before admission");
+            let admitted = prepare_worktree_root_directory(
+                &repository,
+                &path,
+                source,
+                require_external,
+                Some(1024),
+                |_| None,
+                |_| Some(minimum),
             )
             .unwrap();
+            assert_eq!(admitted, path.canonicalize().unwrap());
         }
+    }
 
-        assert_eq!(headroom_reads, 0);
+    #[test]
+    fn unknown_volume_headroom_cannot_authorize_new_checkout_storage() {
+        let temp = tempfile::tempdir().unwrap();
+        let repository = temp.path().join("repo");
+        std::fs::create_dir_all(&repository).unwrap();
+        let root = temp.path().join("unknown-root");
+        let result = prepare_worktree_root_directory(
+            &repository,
+            &root,
+            WorktreeRootSource::LibraryOverride,
+            true,
+            None,
+            |_| None,
+            |_| None,
+        );
+        assert!(result.unwrap_err().contains("cannot inspect free space"));
+        assert!(!root.exists());
+    }
+
+    #[test]
+    fn a_configured_floor_cannot_disable_an_overrides_default_reserve() {
+        assert_eq!(
+            worktree_storage_minimum(WorktreeRootSource::RepositoryConfig, Some(0)),
+            0
+        );
+        for source in [
+            WorktreeRootSource::EnvironmentOverride,
+            WorktreeRootSource::LibraryOverride,
+            WorktreeRootSource::HostState,
+            WorktreeRootSource::RepositoryFallback,
+        ] {
+            assert_eq!(
+                worktree_storage_minimum(source, Some(0)),
+                crate::disk_headroom::DEFAULT_GATE_HEADROOM_BYTES
+            );
+        }
     }
 
     #[test]
