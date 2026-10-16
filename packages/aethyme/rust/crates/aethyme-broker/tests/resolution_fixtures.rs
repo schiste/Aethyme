@@ -824,7 +824,11 @@ fn importing_attempt_resumes_after_store_reopen() {
     let response = Response::Unresolved("recovered after import interruption".into());
     let response_bytes =
         resolution::encode_response_bytes(&response, limits.max_response_bytes).unwrap();
-    let base = git(&world.repo, &["rev-parse", "HEAD"]);
+    git(
+        &world.repo,
+        &["checkout", "--detach", world.baseline.as_str()],
+    );
+    let base = world.baseline.as_str().to_owned();
     let response_path = world.repo.join("async-response.fixture");
     std::fs::write(&response_path, &response_bytes).unwrap();
     git(&world.repo, &["add", "async-response.fixture"]);
@@ -837,9 +841,13 @@ fn importing_attempt_resumes_after_store_reopen() {
 
     let response_sha256 = format!("{:x}", Sha256::digest(&response_bytes));
     let holder = format!("resolution:{}", status.token);
-    let transaction = world
-        .store
-        .connection()
+    let mut ledger = rusqlite::Connection::open_with_flags(
+        world.store.project_dir().join("state.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .unwrap();
+    ledger.busy_timeout(Duration::from_secs(5)).unwrap();
+    let transaction = ledger
         .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
         .unwrap();
     let changed = transaction
@@ -859,6 +867,7 @@ fn importing_attempt_resumes_after_store_reopen() {
         )
         .unwrap();
     transaction.commit().unwrap();
+    drop(ledger);
 
     let importing =
         resolution::attempt_status(&world.store, &status.token, "session-test-reopen").unwrap();
