@@ -391,13 +391,15 @@ fn bind_with_root(
     );
     let result = persist_binding(
         &mut store,
-        &descriptor,
-        &actual_record_id,
-        descriptor_digest,
-        &head,
-        &retained_bootstrap.snapshot_id,
-        &bootstrap_digest,
-        &transition,
+        BindingPersistRequest {
+            descriptor: &descriptor,
+            record_id: &actual_record_id,
+            object_digest: descriptor_digest,
+            head: &head,
+            bootstrap_snapshot: &retained_bootstrap.snapshot_id,
+            bootstrap_transition_sha256: &bootstrap_digest,
+            bootstrap_transition: &transition,
+        },
     )?;
     let binding =
         identity_store::resolve_approved_project_binding_with_archive_use(&store, &archive_use)
@@ -705,16 +707,29 @@ fn retain_anchor(
     Ok(())
 }
 
+struct BindingPersistRequest<'a> {
+    descriptor: &'a ProjectDescriptor,
+    record_id: &'a RecordId,
+    object_digest: ObjectDigest,
+    head: &'a CommitOid,
+    bootstrap_snapshot: &'a SourceSnapshotId,
+    bootstrap_transition_sha256: &'a str,
+    bootstrap_transition: &'a FileIdentityTransition,
+}
+
 fn persist_binding(
     store: &mut CollaborationStore,
-    descriptor: &ProjectDescriptor,
-    record_id: &RecordId,
-    object_digest: ObjectDigest,
-    head: &CommitOid,
-    bootstrap_snapshot: &SourceSnapshotId,
-    bootstrap_transition_sha256: &str,
-    bootstrap_transition: &FileIdentityTransition,
+    request: BindingPersistRequest<'_>,
 ) -> Result<&'static str, Failure> {
+    let BindingPersistRequest {
+        descriptor,
+        record_id,
+        object_digest,
+        head,
+        bootstrap_snapshot,
+        bootstrap_transition_sha256,
+        bootstrap_transition,
+    } = request;
     let conn = store.connection();
     let transaction = conn
         .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
@@ -1007,10 +1022,6 @@ pub(crate) mod test_support {
 
         pub(crate) fn store(&self) -> &CollaborationStore {
             &self.store
-        }
-
-        pub(crate) fn store_mut(&mut self) -> &mut CollaborationStore {
-            &mut self.store
         }
 
         pub(crate) fn commit_file(

@@ -15,7 +15,7 @@ use aethyme_contracts::experimental_v0::{
     brief::Brief,
     canonical_json::{Object, Value as CanonicalValue},
     contribution_revision::MAX_CONTRIBUTION_REVISION_BYTES,
-    project_identity::{MAX_DESCRIPTOR_BYTES, PROJECT_DESCRIPTOR_PATH},
+    project_identity::{MAX_DESCRIPTOR_BYTES, MAX_DESCRIPTOR_FILES, PROJECT_DESCRIPTOR_PATH},
 };
 use rusqlite::{OptionalExtension, TransactionBehavior};
 use thiserror::Error;
@@ -492,7 +492,7 @@ fn resolve_approved_project_binding_locked(
     store: &CollaborationStore,
 ) -> Result<Option<ApprovedProjectBinding>, IdentityStoreError> {
     require_schema(store)?;
-    let row: Option<(
+    type BindingRow = (
         String,
         String,
         String,
@@ -502,7 +502,8 @@ fn resolve_approved_project_binding_locked(
         String,
         String,
         String,
-    )> = store
+    );
+    let row: Option<BindingRow> = store
         .read_connection()
         .query_row(
             "SELECT project_id,descriptor_record_id,descriptor_object_sha256,anchor_commit,
@@ -1405,7 +1406,8 @@ fn revise_contribution_for_operation_locked(
         ],
     )?;
     if changed == 0 {
-        let stored: Option<(String, String, String, Option<String>, Option<String>)> = transaction
+        type StoredRevisionRow = (String, String, String, Option<String>, Option<String>);
+        let stored: Option<StoredRevisionRow> = transaction
             .query_row(
                 "SELECT operation_id,contribution_id,lineage_record_id,brief_record_id,
                         brief_object_sha256
@@ -1894,15 +1896,18 @@ fn load_history(
     if selected_revision_ids.len() > MAX_REPLAY_REVISIONS {
         return Err(IdentityStoreError::ReplayLimit);
     }
-    let live_revision_ids =
-        collaboration_gc::live_identity_revision_roots(store, collaboration_gc::now_ms()).map_err(
-            |error| match error {
-                collaboration_gc::GcError::IdentityReplayLimit => IdentityStoreError::ReplayLimit,
-                other => IdentityStoreError::Corrupt(format!(
-                    "could not enumerate retained identity history: {other}"
-                )),
-            },
-        )?;
+    let live_revision_ids = collaboration_gc::live_identity_revision_roots(
+        store,
+        collaboration_gc::now_ms(),
+    )
+    .map_err(|error| match error {
+        collaboration_gc::GcError::IdentityReplayLimit => IdentityStoreError::ReplayLimit,
+        collaboration_gc::GcError::IdentityRootLimit => IdentityStoreError::ReplayLimit,
+        collaboration_gc::GcError::IdentityManifestLimit => IdentityStoreError::ReplayByteLimit,
+        other => IdentityStoreError::Corrupt(format!(
+            "could not enumerate retained identity history: {other}"
+        )),
+    })?;
     let selected: BTreeSet<_> = selected_revision_ids.iter().cloned().collect();
     let mut revision_ids = live_revision_ids;
     let mut pending = Vec::new();
@@ -2096,7 +2101,7 @@ fn load_history(
                 ) if row_id.as_str() == expected_id.as_str()
                     && row_digest.as_str() == object_sha256.as_str() =>
                 {
-                    let digest = archive::parse_digest(&object_sha256).ok_or_else(|| {
+                    let digest = archive::parse_digest(object_sha256).ok_or_else(|| {
                         IdentityStoreError::Corrupt("invalid brief object digest".into())
                     })?;
                     let brief_bytes = read_replay_object(
@@ -2322,11 +2327,7 @@ fn replay_history(
         replay
             .blocked_by_unretained
             .extend(unresolved.iter().cloned());
-        let result_ids: BTreeSet<_> = candidates
-            .keys()
-            .cloned()
-            .chain(unresolved.into_iter())
-            .collect();
+        let result_ids: BTreeSet<_> = candidates.keys().cloned().chain(unresolved).collect();
         for snapshot in result_ids {
             let values = candidates.remove(&snapshot).unwrap_or_default();
             let has_unresolved = replay.blocked_by_unretained.contains(&snapshot);
@@ -2547,7 +2548,7 @@ fn explicit_operations(
 }
 
 fn decode_lower_hex(text: &str) -> Result<Vec<u8>, IdentityStoreError> {
-    if text.len() % 2 != 0 {
+    if !text.len().is_multiple_of(2) {
         return Err(IdentityStoreError::Corrupt(
             "source change hex field has an odd number of digits".into(),
         ));

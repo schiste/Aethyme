@@ -34,7 +34,8 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use crate::collaboration_archive::{
-    ObjectDigest, hash_file, object_path, objects_dir, parse_manifest, read_object, spool_dir,
+    ObjectDigest, hash_file, object_path, objects_dir, parse_manifest, read_object,
+    read_object_bounded, spool_dir,
 };
 use crate::collaboration_state::{CollaborationStateError, CollaborationStore, sync_directory};
 use crate::file_lock::open_lock_file;
@@ -51,6 +52,10 @@ pub const DEFAULT_GRACE_MS: i64 = PLAN_TTL_MS;
 pub const MAX_ITEMS_PER_GENERATION: usize = 10_000;
 const MAX_IDENTITY_REVISIONS: usize = 10_000;
 const MAX_IDENTITY_PROOF_EDGES: usize = 10_000;
+const MAX_IDENTITY_ROOTS: usize = 20_000;
+const MAX_IDENTITY_MANIFEST_BYTES: usize = 64 * 1024 * 1024;
+const MAX_IDENTITY_SINGLE_MANIFEST_BYTES: usize = 16 * 1024 * 1024;
+const NATIVE_LIVE_ROOTS_SQL: &str = "SELECT roots.kind,roots.reference FROM local_native_gate_roots AS roots JOIN local_native_gate_jobs AS jobs ON jobs.id=roots.job WHERE jobs.roots_released_ms IS NULL UNION ALL SELECT kind,reference FROM local_controller_completion_roots";
 
 pub(crate) fn now_ms() -> i64 {
     std::time::SystemTime::now()
@@ -376,6 +381,10 @@ pub enum GcError {
     ArchiveInUse,
     #[error("bounded identity proof closure exceeds {MAX_IDENTITY_REVISIONS} revisions")]
     IdentityReplayLimit,
+    #[error("bounded identity root discovery exceeds {MAX_IDENTITY_ROOTS} roots")]
+    IdentityRootLimit,
+    #[error("bounded identity snapshot discovery exceeds its manifest byte budget")]
+    IdentityManifestLimit,
     #[error("reclamation is blocked: {}", .0.iter().map(|b| format!("{} ({})", b.kind, b.detail)).collect::<Vec<_>>().join("; "))]
     Blocked(Vec<GcBlocker>),
     #[error("no recorded plan {digest}; run plan and confirm the digest it prints")]
@@ -418,6 +427,8 @@ impl GcError {
             Self::Authority(_) => "authority_unavailable",
             Self::ArchiveInUse => "archive_in_use",
             Self::IdentityReplayLimit => "identity_replay_limit",
+            Self::IdentityRootLimit => "identity_root_limit",
+            Self::IdentityManifestLimit => "identity_manifest_limit",
             Self::Blocked(_) => "blocked",
             Self::UnknownPlan { .. } => "unknown_plan",
             Self::StalePlan { .. } => "stale_plan",
@@ -675,6 +686,8 @@ struct Closure<'a> {
     identity_revision_seeds: BTreeSet<RecordId>,
     identity_revision_limit: Option<usize>,
     identity_proof_edges_seen: usize,
+    identity_roots_remaining: Option<usize>,
+    identity_manifest_bytes_remaining: Option<usize>,
     /// Why a root could not be followed, when strict.
     problems: Vec<String>,
 }
@@ -697,6 +710,9 @@ impl<'a> Closure<'a> {
             identity_revision_seeds: BTreeSet::new(),
             identity_revision_limit,
             identity_proof_edges_seen: 0,
+            identity_roots_remaining: identity_revision_limit.map(|_| MAX_IDENTITY_ROOTS),
+            identity_manifest_bytes_remaining: identity_revision_limit
+                .map(|_| MAX_IDENTITY_MANIFEST_BYTES),
             problems: Vec::new(),
         }
     }
@@ -738,11 +754,38 @@ impl<'a> Closure<'a> {
         self.object(manifest_digest, RetentionClass::Source);
         let regular = std::fs::symlink_metadata(object_path(self.store, &manifest_digest))
             .is_ok_and(|metadata| metadata.is_file());
-        let Some(snapshot) = regular
-            .then(|| read_object(self.store, &manifest_digest).ok())
-            .flatten()
-            .and_then(|bytes| parse_manifest(&bytes))
-        else {
+        // Identity replay cannot first materialize an unbounded GC survey.
+        // Admit each distinct manifest before reading or parsing it. Normal GC
+        // keeps its existing full survey behavior.
+        let bytes = if regular {
+            if let Some(remaining) = &mut self.identity_manifest_bytes_remaining {
+                let metadata = std::fs::symlink_metadata(object_path(self.store, &manifest_digest))
+                    .map_err(|source| io(&object_path(self.store, &manifest_digest), source))?;
+                let length =
+                    usize::try_from(metadata.len()).map_err(|_| GcError::IdentityManifestLimit)?;
+                let limit = (*remaining).min(MAX_IDENTITY_SINGLE_MANIFEST_BYTES);
+                if length > limit {
+                    return Err(GcError::IdentityManifestLimit);
+                }
+                // Debit before I/O, including failed/corrupt reads. Read no
+                // more than the admitted size (plus the reader's one-byte
+                // overflow sentinel), and stop the entire discovery on error.
+                *remaining -= length;
+                Some(
+                    read_object_bounded(self.store, &manifest_digest, length).map_err(|_| {
+                        GcError::Blocked(vec![GcBlocker {
+                            kind: "dangling_root",
+                            detail: format!("the manifest of snapshot {id} is unreadable"),
+                        }])
+                    })?,
+                )
+            } else {
+                read_object(self.store, &manifest_digest).ok()
+            }
+        } else {
+            None
+        };
+        let Some(snapshot) = bytes.and_then(|bytes| parse_manifest(&bytes)) else {
             self.problems
                 .push(format!("the manifest of snapshot {id} is unreadable"));
             return Ok(());
@@ -1033,6 +1076,23 @@ fn live_closure(store: &CollaborationStore, now: i64) -> Result<Closure<'_>, GcE
     live_closure_with_identity_limit(store, now, None)
 }
 
+fn collect_live_roots<T>(
+    rows: impl Iterator<Item = rusqlite::Result<T>>,
+    remaining: &mut Option<usize>,
+) -> Result<Vec<T>, GcError> {
+    let mut roots = Vec::new();
+    for row in rows {
+        if let Some(remaining) = remaining {
+            if *remaining == 0 {
+                return Err(GcError::IdentityRootLimit);
+            }
+            *remaining -= 1;
+        }
+        roots.push(row?);
+    }
+    Ok(roots)
+}
+
 fn live_closure_with_identity_limit(
     store: &CollaborationStore,
     now: i64,
@@ -1043,14 +1103,16 @@ fn live_closure_with_identity_limit(
     // Durable explicit enrollment retains its descriptor and both identity anchors, even
     // after independent capture roots are released. No revision index is a root.
     live.approved_project_binding()?;
-    let roots: Vec<(String, Option<String>)> = connection
-        .prepare(
-            "SELECT operation_id, lineage_record_id FROM retention_roots
+    let roots: Vec<(String, Option<String>)> = collect_live_roots(
+        connection
+            .prepare(
+                "SELECT operation_id, lineage_record_id FROM retention_roots
              WHERE kind = 'contribution' AND released_ms IS NULL
                AND (until_ms IS NULL OR until_ms > ?1)",
-        )?
-        .query_map([now], |row| Ok((row.get(0)?, row.get(1)?)))?
-        .collect::<Result<_, _>>()?;
+            )?
+            .query_map([now], |row| Ok((row.get(0)?, row.get(1)?)))?,
+        &mut live.identity_roots_remaining,
+    )?;
     for (operation, lineage) in &roots {
         match lineage {
             Some(lineage) => live.contribution(lineage)?,
@@ -1072,13 +1134,15 @@ fn live_closure_with_identity_limit(
                 .push(format!("the receipt of capture {operation} is not indexed")),
         }
     }
-    let leases: Vec<(String, String)> = connection
-        .prepare(
-            "SELECT target_kind, target FROM reader_leases
+    let leases: Vec<(String, String)> = collect_live_roots(
+        connection
+            .prepare(
+                "SELECT target_kind, target FROM reader_leases
              WHERE released_ms IS NULL AND until_ms > ?1",
-        )?
-        .query_map([now], |row| Ok((row.get(0)?, row.get(1)?)))?
-        .collect::<Result<_, _>>()?;
+            )?
+            .query_map([now], |row| Ok((row.get(0)?, row.get(1)?)))?,
+        &mut live.identity_roots_remaining,
+    )?;
     for (kind, target) in &leases {
         if kind == "snapshot" {
             live.snapshot(target)?;
@@ -1086,13 +1150,15 @@ fn live_closure_with_identity_limit(
             live.contribution(target)?;
         }
     }
-    let pins: Vec<(String, String)> = connection
-        .prepare(
-            "SELECT class, object_sha256 FROM object_pins
+    let pins: Vec<(String, String)> = collect_live_roots(
+        connection
+            .prepare(
+                "SELECT class, object_sha256 FROM object_pins
              WHERE released_ms IS NULL AND (until_ms IS NULL OR until_ms > ?1)",
-        )?
-        .query_map([now], |row| Ok((row.get(0)?, row.get(1)?)))?
-        .collect::<Result<_, _>>()?;
+            )?
+            .query_map([now], |row| Ok((row.get(0)?, row.get(1)?)))?,
+        &mut live.identity_roots_remaining,
+    )?;
     for (class, digest) in &pins {
         let class = if class == "analysis_view" {
             RetentionClass::AnalysisView
@@ -1106,10 +1172,12 @@ fn live_closure_with_identity_limit(
     }
     // L5 roots do not expire with a worker or capture lease. Explicit owner
     // release of an inactive revision is their only reclamation boundary.
-    let target_roots: Vec<(String, String)> = connection
-        .prepare("SELECT kind, reference FROM local_target_roots")?
-        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
-        .collect::<Result<_, _>>()?;
+    let target_roots: Vec<(String, String)> = collect_live_roots(
+        connection
+            .prepare("SELECT kind, reference FROM local_target_roots")?
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?,
+        &mut live.identity_roots_remaining,
+    )?;
     for (kind, reference) in target_roots {
         match kind.as_str() {
             "snapshot" => live.snapshot(&reference)?,
@@ -1128,10 +1196,12 @@ fn live_closure_with_identity_limit(
     // Native gate jobs retain exact source and records independently of target
     // release. Only an explicit release for a prepared (abandoned) or completed
     // job retires these edges; dispatching and unknown jobs remain rooted.
-    let native_roots: Vec<(String, String)> = connection
-        .prepare("SELECT roots.kind,roots.reference FROM local_native_gate_roots AS roots JOIN local_native_gate_jobs AS jobs ON jobs.id=roots.job WHERE jobs.roots_released_ms IS NULL UNION SELECT kind,reference FROM local_controller_completion_roots")?
-        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
-        .collect::<Result<_, _>>()?;
+    let native_roots: Vec<(String, String)> = collect_live_roots(
+        connection
+            .prepare(NATIVE_LIVE_ROOTS_SQL)?
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?,
+        &mut live.identity_roots_remaining,
+    )?;
     for (kind, reference) in native_roots {
         match kind.as_str() {
             "snapshot" => live.snapshot(&reference)?,
@@ -1149,10 +1219,12 @@ fn live_closure_with_identity_limit(
     }
     // Fresh generations retain their own source and pending work independently
     // of the target lifetime. Preparation or an event never retires these roots.
-    let generation_roots: Vec<(String, String)> = connection
-        .prepare("SELECT kind,reference FROM local_generation_roots")?
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
-        .collect::<Result<_, _>>()?;
+    let generation_roots: Vec<(String, String)> = collect_live_roots(
+        connection
+            .prepare("SELECT kind,reference FROM local_generation_roots")?
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?,
+        &mut live.identity_roots_remaining,
+    )?;
     for (kind, reference) in generation_roots {
         match kind.as_str() {
             "snapshot" => live.snapshot(&reference)?,
@@ -2509,6 +2581,139 @@ mod tests {
                     .sum()
             })
             .unwrap_or(0)
+    }
+
+    #[test]
+    fn identity_root_discovery_budget_is_shared_and_stops_enumeration() {
+        let mut budget = Some(2);
+        assert_eq!(
+            collect_live_roots([Ok(1)].into_iter(), &mut budget).unwrap(),
+            [1]
+        );
+        let mut visited = 0;
+        let rows = (2..).map(|value| {
+            visited += 1;
+            assert!(visited <= 2, "enumerated beyond the first refused root");
+            Ok(value)
+        });
+        assert!(matches!(
+            collect_live_roots(rows, &mut budget),
+            Err(GcError::IdentityRootLimit)
+        ));
+        assert_eq!(visited, 2);
+        assert_eq!(budget, Some(0));
+        assert_eq!(
+            collect_live_roots([Ok(1), Ok(2), Ok(3)].into_iter(), &mut None).unwrap(),
+            [1, 2, 3]
+        );
+    }
+
+    #[test]
+    fn identity_snapshot_manifest_budget_is_cumulative_and_precedes_parsing() {
+        let host = tempfile::tempdir().unwrap();
+        let (source, base, result) = repo("identity-budget");
+        let mut store = open(host.path());
+        let receipt = captured(
+            &mut store,
+            &request(
+                source.path(),
+                "identity-budget",
+                &base,
+                &result,
+                RetentionBoundary::UntilReleased,
+            ),
+        );
+        let digest = ObjectDigest::of_snapshot(&receipt.base);
+        let length = std::fs::metadata(object_path(&store, &digest))
+            .unwrap()
+            .len() as usize;
+        let mut closure = Closure::with_identity_revision_limit(&store, Some(10));
+        closure.identity_manifest_bytes_remaining = Some(length);
+        closure.snapshot(&receipt.base.to_string()).unwrap();
+        assert_eq!(closure.identity_manifest_bytes_remaining, Some(0));
+        // Duplicate source is already admitted and costs no second allocation.
+        closure.snapshot(&receipt.base.to_string()).unwrap();
+        assert!(matches!(
+            closure.snapshot(&receipt.result.to_string()),
+            Err(GcError::IdentityManifestLimit)
+        ));
+        let mut too_small = Closure::with_identity_revision_limit(&store, Some(10));
+        too_small.identity_manifest_bytes_remaining = Some(length - 1);
+        assert!(matches!(
+            too_small.snapshot(&receipt.base.to_string()),
+            Err(GcError::IdentityManifestLimit)
+        ));
+        let mut ordinary = Closure::new(&store);
+        ordinary.snapshot(&receipt.base.to_string()).unwrap();
+        ordinary.snapshot(&receipt.result.to_string()).unwrap();
+        assert!(ordinary.problems.is_empty());
+    }
+
+    #[test]
+    fn identity_native_root_query_streams_before_the_collector_limit() {
+        let host = tempfile::tempdir().unwrap();
+        let store = open(host.path());
+        let query = format!("EXPLAIN QUERY PLAN {NATIVE_LIVE_ROOTS_SQL}");
+        let details: Vec<String> = store
+            .read_connection()
+            .prepare(&query)
+            .unwrap()
+            .query_map([], |row| row.get(3))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(
+            details.iter().any(|detail| detail.contains("UNION ALL")),
+            "native roots must stream: {details:?}"
+        );
+        assert!(
+            !details.iter().any(|detail| detail.contains("TEMP B-TREE")),
+            "root discovery must not materialize an unbounded union: {details:?}"
+        );
+    }
+
+    #[test]
+    fn identity_corrupt_manifest_is_charged_and_stops_discovery() {
+        let host = tempfile::tempdir().unwrap();
+        let (source, base, result) = repo("identity-corrupt-budget");
+        let mut store = open(host.path());
+        let receipt = captured(
+            &mut store,
+            &request(
+                source.path(),
+                "identity-corrupt-budget",
+                &base,
+                &result,
+                RetentionBoundary::UntilReleased,
+            ),
+        );
+        let path = object_path(&store, &ObjectDigest::of_snapshot(&receipt.base));
+        let mut bytes = std::fs::read(&path).unwrap();
+        let length = bytes.len();
+        bytes[0] ^= 1;
+        std::fs::write(path, bytes).unwrap();
+        let mut closure = Closure::with_identity_revision_limit(&store, Some(10));
+        closure.identity_manifest_bytes_remaining = Some(length);
+        assert!(
+            matches!(
+                closure.snapshot(&receipt.base.to_string()),
+                Err(GcError::Blocked(_))
+            ),
+            "a corrupt proof aborts identity discovery"
+        );
+        assert_eq!(
+            closure.identity_manifest_bytes_remaining,
+            Some(0),
+            "failed reads still consume the admitted budget"
+        );
+        assert!(matches!(
+            closure.snapshot(&receipt.result.to_string()),
+            Err(GcError::IdentityManifestLimit)
+        ));
+        // Ordinary GC keeps its existing problem-collection behavior.
+        let mut ordinary = Closure::new(&store);
+        ordinary.snapshot(&receipt.base.to_string()).unwrap();
+        assert_eq!(ordinary.problems.len(), 1);
     }
 
     #[test]
