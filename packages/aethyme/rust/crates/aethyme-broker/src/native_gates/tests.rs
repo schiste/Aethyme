@@ -705,9 +705,10 @@ fn settled_synthesized_attempt_attaches_and_prepares_a_fresh_exact_gate() {
         charge_count, 1,
         "attachment does not create another attempt charge"
     );
-    let (synthesis, provenance) = wave::read_synthesized_wave_result(&s.f.store, &repo, &attached)
-        .unwrap()
-        .expect("only a strict settled result has synthesized provenance");
+    let (synthesis, provenance) =
+        wave::read_synthesized_wave_result(&mut s.f.store, &repo, &attached)
+            .unwrap()
+            .expect("only a strict settled result has synthesized provenance");
     assert_eq!(provenance.request_record_id, request_ref.id.to_string());
     assert_eq!(provenance.request_object, request_ref.object.hex());
     assert_eq!(provenance.group_record_id, result_ref.id.to_string());
