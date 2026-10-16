@@ -97,6 +97,80 @@ outputs = [".venv/"]
 }
 
 #[test]
+fn low_space_preparation_preserves_state_and_does_not_run_install() {
+    let temp = fixture();
+    let state = temp.path().join("host-state");
+    let adopted = success_json(run(
+        temp.path(),
+        &state,
+        &["start", "--adopt", ".", "--task", "prepare", "--json"],
+    ));
+    let session = adopted["id"].as_i64().unwrap().to_string();
+    let output = common::broker_cli(CLI, &["submit", "prepare", "--session", &session, "--json"])
+        .current_dir(temp.path())
+        .env("AETHYME_HOST_STATE_DIR", &state)
+        .env("AETHYME_TEST_AVAILABLE_BYTES", "0")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("dependency preparation storage"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    for path in [
+        "node_modules",
+        "target",
+        ".venv",
+        "runtime-probe-must-not-run",
+    ] {
+        assert!(
+            !temp.path().join(path).exists(),
+            "preparation created {path} under pressure"
+        );
+    }
+    let status = success_json(run(
+        temp.path(),
+        &state,
+        &[
+            "submit",
+            "prepare",
+            "status",
+            "--session",
+            &session,
+            "--json",
+        ],
+    ));
+    assert_eq!(status["state"], "required");
+}
+
+#[test]
+fn current_preparation_can_be_read_when_disk_is_full() {
+    let temp = fixture();
+    let state = temp.path().join("host-state");
+    let adopted = success_json(run(
+        temp.path(),
+        &state,
+        &["start", "--adopt", ".", "--task", "prepare", "--json"],
+    ));
+    let session = adopted["id"].as_i64().unwrap().to_string();
+    success_json(run(
+        temp.path(),
+        &state,
+        &["submit", "prepare", "--session", &session, "--json"],
+    ));
+    let output = common::broker_cli(CLI, &["submit", "prepare", "--session", &session, "--json"])
+        .current_dir(temp.path())
+        .env("AETHYME_HOST_STATE_DIR", &state)
+        .env("AETHYME_TEST_AVAILABLE_BYTES", "0")
+        .output()
+        .unwrap();
+    let report = success_json(output);
+    assert_eq!(report["state"], "current");
+    assert_eq!(report["steps"], serde_json::json!([]));
+}
+
+#[test]
 fn preparation_is_explicit_language_neutral_and_invalidates_on_input_change() {
     let temp = fixture();
     let state = temp.path().join("host-state");
