@@ -27,8 +27,42 @@ use crate::collaboration_state::{CollaborationStore, ProjectKey};
 
 const REQUIRED_SCHEMA: i64 = 26;
 const MAX_REPLAY_REVISIONS: usize = 10_000;
+const MAX_REPLAY_IDENTITY_EDGES: usize = 10_000;
 const MAX_REPLAY_ARCHIVE_BYTES: usize = 64 * 1024 * 1024;
+const MAX_REPLAY_IDENTITY_ENTRY_UNITS: usize = MAX_DESCRIPTOR_FILES * 8;
 const MAX_SNAPSHOT_MANIFEST_BYTES: usize = 16 * 1024 * 1024;
+
+#[derive(Debug)]
+struct ReplayBudget {
+    archive_bytes_remaining: usize,
+    identity_entry_units_remaining: usize,
+}
+
+impl ReplayBudget {
+    fn new() -> Self {
+        Self {
+            archive_bytes_remaining: MAX_REPLAY_ARCHIVE_BYTES,
+            identity_entry_units_remaining: MAX_REPLAY_IDENTITY_ENTRY_UNITS,
+        }
+    }
+
+    fn admit_transition(
+        &mut self,
+        base_entries: usize,
+        result_entries: usize,
+    ) -> Result<(), IdentityStoreError> {
+        // Advancing clones the complete identity map into the transition and
+        // replay result state. Charge four map-entry copies before that work.
+        let units = base_entries
+            .saturating_add(result_entries)
+            .saturating_mul(4);
+        if units > self.identity_entry_units_remaining {
+            return Err(IdentityStoreError::ReplayByteLimit);
+        }
+        self.identity_entry_units_remaining -= units;
+        Ok(())
+    }
+}
 
 /// An approved mapping for this exact local store. Fields are private so
 /// callers cannot manufacture authority from a descriptor or ProjectId.
@@ -295,7 +329,9 @@ pub enum IdentityStoreError {
     Corrupt(String),
     #[error("bounded identity replay is limited to {MAX_REPLAY_REVISIONS} revisions")]
     ReplayLimit,
-    #[error("bounded identity replay exceeds the {MAX_REPLAY_ARCHIVE_BYTES}-byte archive budget")]
+    #[error(
+        "bounded identity replay exceeds its aggregate archive or identity-state allocation budget"
+    )]
     ReplayByteLimit,
     #[error("duplicate revision pin {0}")]
     DuplicateRevisionPin(String),
@@ -413,6 +449,7 @@ struct RevisionRow {
     brief_object_digest: Option<ObjectDigest>,
     brief: Option<Brief>,
     brief_record_bytes: Option<Vec<u8>>,
+    identity_base_revision_ids: BTreeSet<RecordId>,
     source_retained: bool,
 }
 
@@ -658,7 +695,7 @@ fn resolve_project_file_identity_state_locked(
             reason: IdentityStateUnknownReason::SnapshotNotRetained,
         });
     }
-    let replay = replay_history(store, binding)?;
+    let replay = replay_history(store, binding, &[])?;
     validate_cached_maps(store, &replay)?;
     if replay.conflicts.contains(snapshot) {
         return Ok(IdentityStateResolution::Unknown {
@@ -751,6 +788,9 @@ pub(crate) fn resolve_bound_contribution_revisions_with_archive_use(
     validate_binding_store(store, binding)?;
     require_schema(store)?;
 
+    if pins.len() > MAX_REPLAY_REVISIONS {
+        return Err(IdentityStoreError::ReplayLimit);
+    }
     let mut seen = BTreeSet::new();
     for pin in pins {
         if !seen.insert(pin.revision_record_id.clone()) {
@@ -763,7 +803,11 @@ pub(crate) fn resolve_bound_contribution_revisions_with_archive_use(
         return Ok(BTreeMap::new());
     }
 
-    let replay = replay_history(store, binding)?;
+    let selected_revision_ids: Vec<_> = pins
+        .iter()
+        .map(|pin| pin.revision_record_id.clone())
+        .collect();
+    let replay = replay_history(store, binding, &selected_revision_ids)?;
     validate_cached_maps(store, &replay)?;
     let mut resolved = BTreeMap::new();
     for pin in pins {
@@ -937,7 +981,10 @@ fn validate_bound_contribution_revision_bytes_locked(
         return Err(IdentityStoreError::ForeignStore);
     }
 
-    let replay = replay_history(store, binding)?;
+    let selected_base_proofs: Vec<_> = provenance_ids(base_state.provenance())
+        .into_iter()
+        .collect();
+    let replay = replay_history(store, binding, &selected_base_proofs)?;
     validate_cached_maps(store, &replay)?;
     let trusted_base = unique_state(&replay, base_state.snapshot_id())?;
     if trusted_base.state != *base_state.state() {
@@ -1389,7 +1436,16 @@ fn revise_contribution_for_operation_locked(
             ));
         }
     }
+    let identity_base_revision_ids = provenance_ids(base_state.provenance());
     if changed > 0 {
+        for base_revision_id in &identity_base_revision_ids {
+            transaction.execute(
+                "INSERT INTO contribution_revision_identity_bases
+                     (revision_record_id,base_revision_record_id)
+                 VALUES (?1,?2)",
+                rusqlite::params![revision_record_id.as_str(), base_revision_id.as_str()],
+            )?;
+        }
         transaction.execute(
             "INSERT INTO contribution_revision_heads (contribution_id,revision_record_id)
              VALUES (?1,?2)
@@ -1397,6 +1453,15 @@ fn revise_contribution_for_operation_locked(
              SET revision_record_id=excluded.revision_record_id",
             rusqlite::params![contribution_id.as_str(), revision_record_id.as_str()],
         )?;
+    } else {
+        let stored_base_ids =
+            read_identity_base_ids_for_revision(&transaction, &revision_record_id)?;
+        if !stored_base_ids.is_subset(&identity_base_revision_ids) {
+            return Err(IdentityStoreError::Corrupt(
+                "idempotent revision retry no longer validates its persisted base identity proofs"
+                    .into(),
+            ));
+        }
     }
 
     if changed > 0 {
@@ -1757,6 +1822,49 @@ fn validate_identity_file_rows(
     Ok(())
 }
 
+fn read_replay_snapshot(
+    store: &CollaborationStore,
+    id: &SourceSnapshotId,
+    budget: &mut ReplayBudget,
+) -> Result<SourceSnapshot, IdentityStoreError> {
+    let digest = ObjectDigest::of_snapshot(id);
+    let bytes = read_replay_object(
+        store,
+        &digest,
+        MAX_SNAPSHOT_MANIFEST_BYTES,
+        &mut budget.archive_bytes_remaining,
+    )?;
+    let snapshot = archive::parse_manifest(&bytes).ok_or_else(|| {
+        IdentityStoreError::Corrupt("retained snapshot manifest is invalid".into())
+    })?;
+    if snapshot.id() != *id || snapshot.entries().len() > MAX_DESCRIPTOR_FILES {
+        return Err(IdentityStoreError::Corrupt(
+            "retained snapshot manifest does not match its bounded ID".into(),
+        ));
+    }
+    Ok(snapshot)
+}
+
+fn read_identity_base_ids_for_revision(
+    connection: &rusqlite::Connection,
+    revision_record_id: &RecordId,
+) -> Result<BTreeSet<RecordId>, IdentityStoreError> {
+    let mut statement = connection.prepare(
+        "SELECT base_revision_record_id
+         FROM contribution_revision_identity_bases
+         WHERE revision_record_id=?1
+         ORDER BY base_revision_record_id",
+    )?;
+    let raw = statement
+        .query_map([revision_record_id.as_str()], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    raw.into_iter()
+        .map(|text| {
+            RecordId::parse(&text).map_err(|error| IdentityStoreError::Corrupt(error.to_string()))
+        })
+        .collect()
+}
+
 fn read_retained_snapshot(
     store: &CollaborationStore,
     id: &SourceSnapshotId,
@@ -1780,7 +1888,12 @@ fn read_retained_snapshot(
 fn load_history(
     store: &CollaborationStore,
     binding: &ApprovedProjectBinding,
+    selected_revision_ids: &[RecordId],
+    budget: &mut ReplayBudget,
 ) -> Result<BTreeMap<RecordId, RevisionRow>, IdentityStoreError> {
+    if selected_revision_ids.len() > MAX_REPLAY_REVISIONS {
+        return Err(IdentityStoreError::ReplayLimit);
+    }
     let live_revision_ids =
         collaboration_gc::live_identity_revision_roots(store, collaboration_gc::now_ms()).map_err(
             |error| match error {
@@ -1790,13 +1903,97 @@ fn load_history(
                 )),
             },
         )?;
-    if live_revision_ids.len() > MAX_REPLAY_REVISIONS {
+    let selected: BTreeSet<_> = selected_revision_ids.iter().cloned().collect();
+    let mut revision_ids = live_revision_ids;
+    let mut pending = Vec::new();
+    for revision_id in selected_revision_ids {
+        let id = revision_id.as_str();
+        let retired: bool = store.read_connection().query_row(
+            "SELECT EXISTS(SELECT 1 FROM reclaimed_contribution_revisions WHERE revision_record_id=?1)",
+            [id],
+            |row| row.get(0),
+        )?;
+        if retired {
+            return Err(IdentityStoreError::UnknownRevision(id.to_string()));
+        }
+        let exists: bool = store.read_connection().query_row(
+            "SELECT EXISTS(SELECT 1 FROM contribution_revisions WHERE revision_record_id=?1)",
+            [id],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            return Err(IdentityStoreError::UnknownRevision(id.to_string()));
+        }
+        if revision_ids.insert(revision_id.clone()) {
+            pending.push(revision_id.clone());
+        }
+    }
+    // Live roots are already closed by GC. Selected exact pins may be in the
+    // source-retention grace window instead, so walk their persisted proof
+    // edges here under the same replay limits.
+    pending = revision_ids.iter().cloned().collect();
+    let mut base_ids_by_revision = BTreeMap::<RecordId, BTreeSet<RecordId>>::new();
+    let mut edge_count = 0_usize;
+    while let Some(revision_id) = pending.pop() {
+        if base_ids_by_revision.contains_key(&revision_id) {
+            continue;
+        }
+        let edge_read_limit = MAX_REPLAY_IDENTITY_EDGES
+            .saturating_sub(edge_count)
+            .saturating_add(1);
+        let edge_read_limit = i64::try_from(edge_read_limit).unwrap_or(i64::MAX);
+        let mut statement = store.read_connection().prepare(
+            "SELECT base_revision_record_id
+             FROM contribution_revision_identity_bases
+             WHERE revision_record_id=?1
+             ORDER BY base_revision_record_id
+             LIMIT ?2",
+        )?;
+        let raw_dependencies = statement
+            .query_map(
+                rusqlite::params![revision_id.as_str(), edge_read_limit],
+                |row| row.get::<_, String>(0),
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        edge_count = edge_count.saturating_add(raw_dependencies.len());
+        if edge_count > MAX_REPLAY_IDENTITY_EDGES {
+            return Err(IdentityStoreError::ReplayLimit);
+        }
+        let mut dependencies = BTreeSet::new();
+        for raw in raw_dependencies {
+            let dependency = RecordId::parse(&raw)
+                .map_err(|error| IdentityStoreError::Corrupt(error.to_string()))?;
+            let retired: bool = store.read_connection().query_row(
+                "SELECT EXISTS(SELECT 1 FROM reclaimed_contribution_revisions WHERE revision_record_id=?1)",
+                [dependency.as_str()],
+                |row| row.get(0),
+            )?;
+            if retired {
+                if selected.contains(&dependency) {
+                    return Err(IdentityStoreError::UnknownRevision(
+                        dependency.as_str().into(),
+                    ));
+                }
+                return Err(IdentityStoreError::Corrupt(
+                    "identity proof edge points to a retired revision".into(),
+                ));
+            }
+            if dependencies.insert(dependency.clone()) && revision_ids.insert(dependency.clone()) {
+                pending.push(dependency);
+                if revision_ids.len() > MAX_REPLAY_REVISIONS {
+                    return Err(IdentityStoreError::ReplayLimit);
+                }
+            }
+        }
+        base_ids_by_revision.insert(revision_id, dependencies);
+    }
+    if revision_ids.len() > MAX_REPLAY_REVISIONS {
         return Err(IdentityStoreError::ReplayLimit);
     }
-    if live_revision_ids.is_empty() {
+    if revision_ids.is_empty() {
         return Ok(BTreeMap::new());
     }
-    let live_id_text: Vec<String> = live_revision_ids
+    let live_id_text: Vec<String> = revision_ids
         .iter()
         .map(|record_id| record_id.as_str().to_string())
         .collect();
@@ -1814,6 +2011,10 @@ fn load_history(
           AND l.contribution_id=r.contribution_id
           AND l.lineage_record_id=r.lineage_record_id
          WHERE r.revision_record_id IN ({placeholders})
+           AND NOT EXISTS (
+               SELECT 1 FROM reclaimed_contribution_revisions retired
+               WHERE retired.revision_record_id=r.revision_record_id
+           )
          ORDER BY r.created_ms,r.revision_record_id"
     );
     let raw_rows = {
@@ -1832,13 +2033,12 @@ fn load_history(
         })?;
         rows.collect::<Result<Vec<_>, _>>()?
     };
-    if raw_rows.len() != live_revision_ids.len() {
+    if raw_rows.len() != revision_ids.len() {
         return Err(IdentityStoreError::Corrupt(
-            "a live identity proof has no exact persisted logical-operation binding".into(),
+            "a retained identity proof has no exact persisted logical-operation binding".into(),
         ));
     }
     let mut history = BTreeMap::new();
-    let mut replay_archive_bytes = MAX_REPLAY_ARCHIVE_BYTES;
     let mut contribution_owners = BTreeMap::<ContributionId, (String, RecordId)>::new();
 
     for (
@@ -1871,7 +2071,7 @@ fn load_history(
             store,
             &object_digest,
             MAX_CONTRIBUTION_REVISION_BYTES,
-            &mut replay_archive_bytes,
+            &mut budget.archive_bytes_remaining,
         )?;
         let (revision, observed_id) = ContributionRevision::from_record(&bytes)?;
         if observed_id != record_id
@@ -1903,7 +2103,7 @@ fn load_history(
                         store,
                         &digest,
                         aethyme_contracts::experimental_v0::brief::MAX_BRIEF_RECORD_BYTES,
-                        &mut replay_archive_bytes,
+                        &mut budget.archive_bytes_remaining,
                     )?;
                     let (brief, observed_brief_id) = Brief::from_record(&brief_bytes)?;
                     if &observed_brief_id != expected_id {
@@ -1950,6 +2150,7 @@ fn load_history(
             brief_object_digest,
             brief,
             brief_record_bytes,
+            identity_base_revision_ids: base_ids_by_revision.remove(&record_id).unwrap_or_default(),
             source_retained,
         };
         if history.insert(record_id, row).is_some() {
@@ -1964,12 +2165,19 @@ fn load_history(
 fn replay_history(
     store: &CollaborationStore,
     binding: &ApprovedProjectBinding,
+    selected_revision_ids: &[RecordId],
 ) -> Result<ReplayIndex, IdentityStoreError> {
-    let history = load_history(store, binding)?;
+    let mut budget = ReplayBudget::new();
+    let history = load_history(store, binding, selected_revision_ids, &mut budget)?;
     let anchor_state = binding.descriptor.initial_file_identity_state()?;
     let anchor = binding.descriptor.anchor_snapshot().clone();
-    let bootstrap_source = read_retained_snapshot(store, binding.bootstrap_snapshot())?;
-    let anchor_source = read_retained_snapshot(store, binding.descriptor.anchor_snapshot())?;
+    let bootstrap_source = read_replay_snapshot(store, binding.bootstrap_snapshot(), &mut budget)?;
+    let anchor_source =
+        read_replay_snapshot(store, binding.descriptor.anchor_snapshot(), &mut budget)?;
+    budget.admit_transition(
+        anchor_state.files().count(),
+        bootstrap_source.entries().len(),
+    )?;
     let bootstrap_transition = advance_file_identities(
         binding.project_id(),
         &anchor_state,
@@ -2056,8 +2264,26 @@ fn replay_history(
                 progress = true;
                 continue;
             }
-            let base = read_retained_snapshot(store, row.revision.base())?;
-            let result = read_retained_snapshot(store, row.revision.result())?;
+            let base = read_replay_snapshot(store, row.revision.base(), &mut budget)?;
+            let result = read_replay_snapshot(store, row.revision.result(), &mut budget)?;
+            let anchor = binding.descriptor.anchor_snapshot();
+            let bootstrap = binding.bootstrap_snapshot();
+            if (row.revision.base() != anchor && row.revision.base() != bootstrap)
+                && row.identity_base_revision_ids.is_empty()
+            {
+                return Err(IdentityStoreError::Corrupt(
+                    "non-anchor revision has no persisted base identity proof edges".into(),
+                ));
+            }
+            if !row
+                .identity_base_revision_ids
+                .is_subset(&base_state.provenance)
+            {
+                return Err(IdentityStoreError::Corrupt(
+                    "persisted base identity proof edges differ from validated history".into(),
+                ));
+            }
+            budget.admit_transition(base_state.state.files().count(), result.entries().len())?;
             let operations = explicit_operations(&row.revision, &base_state.state)?;
             let transition = advance_file_identities(
                 binding.project_id(),
@@ -2337,6 +2563,23 @@ fn decode_lower_hex(text: &str) -> Result<Vec<u8>, IdentityStoreError> {
         bytes.push((high << 4) | low);
     }
     Ok(bytes)
+}
+
+#[cfg(test)]
+mod replay_budget_tests {
+    use super::{IdentityStoreError, MAX_DESCRIPTOR_FILES, ReplayBudget};
+
+    #[test]
+    fn refuses_identity_map_allocation_before_advancing_over_budget() {
+        let mut budget = ReplayBudget::new();
+        budget
+            .admit_transition(MAX_DESCRIPTOR_FILES, MAX_DESCRIPTOR_FILES)
+            .expect("one maximum-sized transition fits the bounded profile");
+        assert!(matches!(
+            budget.admit_transition(1, 1),
+            Err(IdentityStoreError::ReplayByteLimit)
+        ));
+    }
 }
 
 fn lower_hex_nibble(byte: u8) -> Option<u8> {

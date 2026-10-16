@@ -41,6 +41,8 @@ use crate::collaboration_state::{
 use crate::collaboration_submit::{Setting, setting};
 use crate::exit_status;
 
+#[path = "collaboration_cli/contribution.rs"]
+mod contribution;
 #[path = "collaboration_cli/lifecycle.rs"]
 mod lifecycle;
 #[path = "collaboration_cli/project.rs"]
@@ -94,6 +96,14 @@ Usage:
   aethyme collab project bind --confirm <descriptor-record-id> [--json]
       Bind this local store to the exact descriptor and pointer committed in this clone.
       Binding grants no execution or acceptance authority.
+  aethyme collab contribution revise --operation ID [--brief-file PATH]
+       [--file-operations PATH] [--depends-on RECORD_ID...] [--clear-dependencies] [--json]
+      Append an immutable revision for one retained capture operation. Repeating the
+      same input is idempotent; a changed brief creates a new rationale revision.
+      The optional file-operation document uses schema
+      aethyme.collab-file-operations/experimental-v0 with lowercase-hex Git paths.
+      Rename/copy entries require kind, from_hex and to_hex; split entries use
+      kind, from_hex and a to_hex array. --clear-dependencies removes prior deps.
   aethyme collab capture recover [--json]
       Resolve captures a crashed process left in flight. Live ones are
       skipped; per-operation failures are reported and do not stop the rest.
@@ -419,6 +429,8 @@ fn command_name(args: &[String]) -> String {
         "configure",
         "objective",
         "project",
+        "contribution",
+        "revise",
         "capture-notice",
         "ingest",
         "list",
@@ -479,6 +491,7 @@ fn dispatch(options: Options) -> Result<Output, Failure> {
             &current_worktree(options.repo.as_deref())?,
             rest,
         ),
+        ["contribution", "revise", rest @ ..] => contribution::revise(&main_root, rest),
         ["capture", "recover"] => capture_recover(&main_root),
         ["capture", "abort", rest @ ..] => capture_abort(&main_root, rest),
         ["capture", "receipt", rest @ ..] => capture_receipt(&main_root, rest),
