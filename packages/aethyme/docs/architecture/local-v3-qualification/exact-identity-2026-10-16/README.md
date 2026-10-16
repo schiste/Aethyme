@@ -30,6 +30,12 @@ later target/wave/peer bridge merge.
 On combined source `18913101e3ec1a25ad44dac47803fe91aa9e9937`, all 45 contract
 integration tests passed, and strict Clippy passed for the contracts package.
 
+On combined source `a6b34828cb657364ed255269f056001ff581bc96`, all 23 wave
+tests passed, including refusal of competing proposals split across one-item
+waves and exclusion of unselected catalog entries. The consumer selection ran
+15 tests: 13 passed and two failed. The target profile selection ran six tests:
+four passed and two failed. These failed commands do not qualify the consumers.
+
 ## Guard controls
 
 Unique backups and the exact drivers are under [control-sources](control-sources/).
@@ -48,6 +54,15 @@ and restored exact source bytes. The restored four-test GC suite passed in the
 merged-source run above. These finite controls do not establish universal
 resource bounds or reliability for other profiles.
 
+Six additional controls on combined source `a6b34828` separately disabled
+conflicting-pin refusal, the final visibility epoch check, dependency-gap
+recomputation, base-proof persistence, exact-pin grace seeding, and cumulative
+identity-map allocation charging. Each executed one test and failed at the
+expected boundary with exit 101. The base-proof control was caught by the
+resolver’s typed corrupt-proof check. Exact bytes were restored from a unique
+backup; the restored seven-test context suite and replay-budget test passed.
+These runs contain the bridge’s existing unused-field warning.
+
 ## Retained failures and uncredited selections
 
 - The first exact-context build failed before tests because of an undeclared
@@ -62,7 +77,18 @@ resource bounds or reliability for other profiles.
   zero tests. They carry no test credit. The corrected contracts integration
   command executed and passed 45 tests.
 - The first bridge consumer build on `18913101` stopped on seven test compilation
-  errors. No consumer tests executed; fixes and runtime qualification are pending.
+  errors. No consumer tests executed. The compile fixes were merged into
+  `a6b34828`; the subsequent actual tests exposed two failures: a revision
+  packet exceeded the canonical string limit, and the aggregate-page setup
+  exceeded the canonical record limit and reached an unchecked constructor
+  assumption. Generic typed admission and transport fixes are in progress.
+- Two inline target profile tests rejected invalid synthetic IDs before testing
+  their intended behavior; correcting those test inputs is pending independent
+  review and a fresh executed run.
+- The retained completed CI jobs include schema downgrade fixtures that kept a
+  newly added column, an out-of-date collab help snapshot, formatting/test-module
+  lint failures, and dependency-download failures. These are historical failures
+  on their recorded heads, not passing final CI evidence.
 
 The inventory retains earlier positive runs as historical attempts without
 extending their claims to later source. Final workspace checks, complete public

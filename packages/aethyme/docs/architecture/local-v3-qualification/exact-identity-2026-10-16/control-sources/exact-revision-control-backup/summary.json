@@ -1,0 +1,32 @@
+{
+  "restored": {
+    "revisions.rs": "8332aa20bcee6c4b4e1b95b9b5a738f9147f4f130ecd91e20244342c52a3ba39",
+    "collaboration_identity_store.rs": "b20fad5d4bb204e0ff876d79577f774634be770bcb31d593726be311ecb0d655"
+  },
+  "trials": [
+    {
+      "label": "conflicting-pin",
+      "exit": 101
+    },
+    {
+      "label": "visibility-epoch",
+      "exit": 101
+    },
+    {
+      "label": "dependency-gap-recompute",
+      "exit": 101
+    },
+    {
+      "label": "persist-base-proofs",
+      "exit": 101
+    },
+    {
+      "label": "grace-exact-pin-seed",
+      "exit": 101
+    },
+    {
+      "label": "identity-entry-budget",
+      "exit": 101
+    }
+  ]
+}

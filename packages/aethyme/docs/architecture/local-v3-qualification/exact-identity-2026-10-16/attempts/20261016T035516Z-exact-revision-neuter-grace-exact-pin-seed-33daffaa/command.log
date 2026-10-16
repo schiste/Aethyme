@@ -1,0 +1,32 @@
+   Compiling aethyme-broker v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/complete-exact-immutable-contribution-co/packages/aethyme/rust/crates/aethyme-broker)
+warning: field `revision_ids` is never read
+  --> crates/aethyme-broker/src/local_target/revision.rs:61:9
+   |
+59 | pub(super) struct LoadedD10Bindings {
+   |                   ----------------- field in this struct
+60 |     pub bindings: D10RevisionBindings,
+61 |     pub revision_ids: BTreeMap<String, RecordId>,
+   |         ^^^^^^^^^^^^
+   |
+   = note: `LoadedD10Bindings` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `aethyme-broker` (lib test) generated 1 warning
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 25.98s
+     Running unittests src/lib.rs (target/debug/deps/aethyme_broker-0f278e0d02146111)
+
+running 1 test
+test collaboration_context::revisions::tests::exact_pin_reads_unrooted_history_during_grace_without_creating_retention ... 
+thread 'collaboration_context::revisions::tests::exact_pin_reads_unrooted_history_during_grace_without_creating_retention' (15781366) panicked at crates/aethyme-broker/src/collaboration_context/revisions.rs:1025:10:
+an exact pin seeds its retained proof closure during grace: Identity(UnknownRevision("sha256:76749e3c37d5eb126652aba182ef79f4b2e436091eb4b31d49ba30004ce0694a"))
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+
+failures:
+    collaboration_context::revisions::tests::exact_pin_reads_unrooted_history_during_grace_without_creating_retention
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1939 filtered out; finished in 1.40s
+
+error: test failed, to rerun pass `-p aethyme-broker --lib`
