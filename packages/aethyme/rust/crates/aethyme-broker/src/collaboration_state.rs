@@ -736,6 +736,52 @@ const MIGRATIONS: &[(i64, &str)] = &[
     CREATE INDEX local_project_file_ids_by_snapshot
         ON local_project_file_ids(snapshot_id);"),
 ];
+/// Reconstruct the exact pre-schema-26 shape in historical migration fixtures
+/// while preserving all schema-25 rows. This is test setup only: production
+/// migrations continue to reject malformed databases instead of repairing them.
+#[cfg(test)]
+pub(crate) fn drop_identity_revision_schema_for_legacy_fixture(
+    connection: &rusqlite::Connection,
+) -> rusqlite::Result<()> {
+    connection.execute_batch(
+        "DROP TABLE IF EXISTS contribution_revision_heads;
+         DROP TABLE IF EXISTS contribution_revision_identity_bases;
+         DROP TABLE IF EXISTS reclaimed_contribution_revisions;
+         DROP TABLE IF EXISTS contribution_revisions;
+         DROP TABLE IF EXISTS local_logical_contributions;
+         DROP TABLE IF EXISTS local_project_file_ids;
+         DROP TABLE IF EXISTS local_project_bindings;
+         DROP INDEX IF EXISTS capture_receipts_operation_lineage;",
+    )?;
+
+    let has_briefs: bool = connection.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM sqlite_master
+             WHERE type='table' AND name='contribution_briefs'
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+    if has_briefs {
+        let has_revision_column = {
+            let mut statement = connection.prepare("PRAGMA table_info(contribution_briefs)")?;
+            let rows = statement.query_map([], |row| row.get::<_, String>(1))?;
+            let mut found = false;
+            for column in rows {
+                if column? == "revision_record_id" {
+                    found = true;
+                    break;
+                }
+            }
+            found
+        };
+        if has_revision_column {
+            connection
+                .execute_batch("ALTER TABLE contribution_briefs DROP COLUMN revision_record_id;")?;
+        }
+    }
+    Ok(())
+}
 /// The file that marks a directory as a collaboration root.
 pub const ROOT_MARKER: &str = ".aethyme-collaboration-root.json";
 const ROOT_MARKER_KIND: &str = "aethyme-collaboration-root";
@@ -2066,6 +2112,116 @@ mod tests {
         let store = open(host.path(), &[]).unwrap();
         assert_eq!(store.schema_version(), COLLABORATION_STATE_SCHEMA_VERSION);
         assert_eq!(floor(&store), MIN_COMPATIBLE_SCHEMA);
+    }
+
+    #[test]
+    fn schema_twenty_three_migrates_capture_rows_without_rewriting_them() {
+        use crate::collaboration_cli::project_test_support::BoundProjectFixture;
+
+        let mut fixture = BoundProjectFixture::new().expect("real bound Local fixture");
+        let base = fixture.bootstrap_commit.clone();
+        let result = fixture
+            .commit_file(
+                "migration-sentinel.txt",
+                b"capture survives schema 23 migration\n",
+            )
+            .expect("real committed result");
+        fixture
+            .capture_operation("op-schema23-preserved", &base, &result)
+            .expect("real retained capture");
+        let project = fixture.store.project().clone();
+        let host_path = fixture.host.path().to_path_buf();
+        let project_dir = fixture.store.project_dir().to_path_buf();
+        let before: (String, String, String, String, String, i64) = fixture
+            .store
+            .read_connection()
+            .query_row(
+                "SELECT receipt_record_id,receipt_sha256,lineage_record_id,
+                        base_snapshot,result_snapshot,committed_ms
+                 FROM capture_receipts WHERE operation_id='op-schema23-preserved'",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .unwrap();
+        drop(fixture.store);
+
+        let connection = Connection::open(project_dir.join(STATE_DATABASE)).unwrap();
+        drop_identity_revision_schema_for_legacy_fixture(&connection).unwrap();
+        crate::collaboration_sensitive::drop_sensitive_response_tables_for_legacy_fixture(
+            &connection,
+        )
+        .unwrap();
+        connection
+            .execute_batch(
+                "DROP TRIGGER IF EXISTS local_capture_notice_outcome_monotone;
+                 DROP TABLE IF EXISTS local_capture_notice_outcomes;
+                 DROP TABLE IF EXISTS local_capture_notices;
+                 UPDATE meta SET value='23'
+                     WHERE key IN ('schema_version','min_compatible_schema');",
+            )
+            .unwrap();
+        drop(connection);
+
+        let migrated = CollaborationStore::open(
+            &CollaborationRoot::under_host_state(host_path),
+            &project,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            migrated.schema_version(),
+            COLLABORATION_STATE_SCHEMA_VERSION
+        );
+        let floor: i64 = migrated
+            .read_connection()
+            .query_row(
+                "SELECT CAST(value AS INTEGER) FROM meta WHERE key='min_compatible_schema'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(floor, MIN_COMPATIBLE_SCHEMA);
+        let after: (String, String, String, String, String, i64) = migrated
+            .read_connection()
+            .query_row(
+                "SELECT receipt_record_id,receipt_sha256,lineage_record_id,
+                        base_snapshot,result_snapshot,committed_ms
+                 FROM capture_receipts WHERE operation_id='op-schema23-preserved'",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            after, before,
+            "schema migration rewrote retained receipt authority"
+        );
+        let outbox_count: i64 = migrated
+            .read_connection()
+            .query_row(
+                "SELECT count(*) FROM outbox WHERE operation_id='op-schema23-preserved'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(outbox_count, 1);
     }
 
     /// Migrations run in list order and skip versions at or below the

@@ -3936,6 +3936,10 @@ mod tests {
         fixture.contribute(&[("Cargo.toml", "[workspace]\n")]);
         fresh(&mut fixture, &["src/search.rs"], &reader);
         // As a schema 5 binary would have left it.
+        crate::collaboration_state::drop_identity_revision_schema_for_legacy_fixture(
+            fixture.store.connection(),
+        )
+        .unwrap();
         crate::collaboration_sensitive::drop_sensitive_response_tables_for_legacy_fixture(
             fixture.store.connection(),
         )
