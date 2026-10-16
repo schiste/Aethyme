@@ -4,7 +4,7 @@ use crate::collaboration_cli::project_test_support::BoundProjectFixture;
 use crate::collaboration_identity_store::{
     ContributionRevisionRequest, ResolvedContributionRevision, revise_contribution_for_operation,
 };
-use aethyme_contracts::experimental_v0::Brief;
+use aethyme_contracts::experimental_v0::brief::Brief;
 use rusqlite::params;
 
 fn revise_operation(

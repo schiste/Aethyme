@@ -1,6 +1,7 @@
 use super::*;
+use aethyme_contracts::experimental_v0::brief::Brief;
 use aethyme_contracts::experimental_v0::{
-    Brief, BriefReference, ContributionRevision, EntryKind, ProjectDescriptor, SourceEntry,
+    BriefReference, ContributionRevision, EntryKind, ProjectDescriptor, SourceEntry,
     SourceSnapshot, advance_file_identities,
 };
 
@@ -21,8 +22,8 @@ fn captured_revision(
     many_changes: bool,
 ) -> (Vec<u8>, RecordId) {
     let (base, source, source_changes) = if many_changes {
-        let base = SourceSnapshot::new(std::iter::empty::<SourceEntry>())
-            .expect("empty source snapshot");
+        let base =
+            SourceSnapshot::new(std::iter::empty::<SourceEntry>()).expect("empty source snapshot");
         let project = project_id();
         let descriptor = ProjectDescriptor::from_snapshot(
             project.clone(),
@@ -40,7 +41,9 @@ fn captured_revision(
         .expect("large source snapshot");
         let transition = advance_file_identities(
             &project,
-            &descriptor.initial_file_identity_state().expect("initial IDs"),
+            &descriptor
+                .initial_file_identity_state()
+                .expect("initial IDs"),
             "exchange-large-test",
             &base,
             &source,
@@ -111,15 +114,18 @@ fn packet_with_brief(include_brief: bool, many_changes: bool) -> Metadata {
         brief_object_sha256: brief.as_ref().map(|(_, _, digest)| digest.clone()),
         brief_bytes_hex: brief.as_ref().map(|(bytes, _, _)| lower_hex(bytes)),
         source: ContributionRevision::from_record(&revision_bytes)
-            .expect("revision").0.result().to_string(),
+            .expect("revision")
+            .0
+            .result()
+            .to_string(),
         availability: SourceAvailability::LocalOnly,
         scope: vec!["src/lib.rs".into()],
     }
 }
 
 fn large_packet_with_scope(revision_bytes: &[u8], scope: String) -> Metadata {
-    let (revision, revision_id) = ContributionRevision::from_record(revision_bytes)
-        .expect("large revision");
+    let (revision, revision_id) =
+        ContributionRevision::from_record(revision_bytes).expect("large revision");
     Metadata::RevisionContribution {
         project_id: revision.project_id().to_string(),
         descriptor_record_id: sha('d'),
@@ -142,8 +148,7 @@ fn large_packet_with_scope(revision_bytes: &[u8], scope: String) -> Metadata {
 }
 
 fn large_revision_bytes() -> Vec<u8> {
-    let base = SourceSnapshot::new(std::iter::empty::<SourceEntry>())
-        .expect("empty base snapshot");
+    let base = SourceSnapshot::new(std::iter::empty::<SourceEntry>()).expect("empty base snapshot");
     let project = project_id();
     let descriptor = ProjectDescriptor::from_snapshot(
         project.clone(),
@@ -161,7 +166,9 @@ fn large_revision_bytes() -> Vec<u8> {
     let logical_id = logical_id();
     let transition = advance_file_identities(
         &project,
-        &descriptor.initial_file_identity_state().expect("initial IDs"),
+        &descriptor
+            .initial_file_identity_state()
+            .expect("initial IDs"),
         logical_id.as_str(),
         &base,
         &result,
@@ -194,7 +201,7 @@ fn revision_exchange_binds_exact_records_and_preserves_advisory_role() {
     let packet = packet_with_brief(true, true);
     let record = packet.record().expect("bounded revision packet");
     assert!(record.canonical_bytes().len() > MAX_PACKET_BYTES);
-    let value: serde_json::Value = serde_json::from_slice(record.canonical_bytes()).unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&record.canonical_bytes()).unwrap();
     let decoded: Metadata = serde_json::from_value(value["spec"].clone()).unwrap();
     assert_eq!(decoded.record().unwrap().id(), record.id());
     assert_eq!(DATA_ROLE, "untrusted_advisory_metadata");
@@ -298,9 +305,11 @@ fn snapshot_page_rejects_aggregate_revision_bytes_over_the_page_cap() {
             packet: large_packet_with_scope(&revision, format!("src/variant-{index}.rs")),
         })
         .collect::<Vec<_>>();
-    assert!(items
-        .iter()
-        .all(|event| event.record().unwrap().canonical_bytes().len() < MAX_REVISION_PACKET_BYTES));
+    assert!(
+        items.iter().all(
+            |event| event.record().unwrap().canonical_bytes().len() < MAX_REVISION_PACKET_BYTES
+        )
+    );
     let page = SnapshotPage {
         snapshot: SnapshotDescriptor {
             stream: stream.clone(),
