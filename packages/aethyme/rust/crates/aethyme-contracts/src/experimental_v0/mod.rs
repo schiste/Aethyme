@@ -6,6 +6,7 @@ pub mod canonical_json;
 mod digest;
 pub mod record;
 pub mod source_snapshot;
+pub mod symbol_identity;
 
 pub use digest::ID_PREFIX;
 pub use record::{FieldKind, FieldSpec, Record, RecordError, RecordId, RecordSchema, StateReading};

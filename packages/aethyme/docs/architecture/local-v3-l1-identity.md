@@ -1,18 +1,25 @@
 # Local v3 — L1 identity decision record (#652)
 
-Last Updated: 2026-10-09
+Last Updated: 2026-10-16
 
 This record is input to decision **D10** (how identities and exact revision references are
 minted and encoded) and the identity part of **D39** (how existing NodeIds relate to
-portable references). It is a **proposal**, except where "Decided" below says otherwise. D10 closes only with the evidence the plan
-names (two clones, rename/copy/split, rationale-only updates, canonical Rust/TypeScript
-fixtures, authority binding), and part of that evidence comes from E1 (#650), which has
-not run.
+portable references). It is a **proposal**, except where "Decided" below says otherwise.
+D10 closes only with the evidence the plan names (two clones, rename/copy/split,
+rationale-only updates, canonical Rust/TypeScript fixtures, authority binding), and part
+of that evidence comes from E1 (#650), which has not run.
 
 Baseline facts come from the L0 audit (`local-v3-l0/`, slice D): NodeId hashes
 (repo, path, name, kind) and nothing else; there is no FileId; the engine also mints
 path-string IDs (`file:`, `dir:`, …); the repository key is derived from the repository's
 path; and the existing source digest hashes Git object ids.
+
+The D39 source review pins an additional detail: `NodeId::new` hashes the caller-supplied
+repo component without canonicalizing it. The engine's filesystem adapter supplies the
+canonical checkout basename, while `IndexerContext` retains its caller-provided repo
+name. Two clones named `clone-a` and `clone-b` therefore mint different existing
+NodeIds for the same path, name and kind. Body edits preserve those IDs; path moves and
+renames change them. These are existing semantics and remain unchanged.
 
 ## Status per identity
 
@@ -24,7 +31,7 @@ path; and the existing source digest hashes Git object ids.
 | `FileId` | Proposed below; rename/copy/split rules **wait for E1** (FX02 move+edit). | — |
 | `ContributionId` / `ContributionRevisionId` | Proposed below; lineage shape **waits for E1** (FX03 inherited base, FX07 subtraction). | — |
 | `BrokerId` / `SessionRef` | Proposed below; no code. | — |
-| `SymbolRef` | Proposed below; mapping fixtures belong to AQ0 (#655). | — |
+| `SymbolRef` | Experimental scoped records and a finite advisory mapping resolver are implemented. No producer emits these records automatically. | `aethyme-contracts::experimental_v0::symbol_identity`; `aethyme-broker::experimental_symbol_mapping` |
 
 ## Common rules
 
@@ -93,12 +100,37 @@ path; and the existing source digest hashes Git object ids.
   (BrokerId, local integer session id). The integer alone is neither unique nor a
   permission, and broker session ids are already per repository.
 
-### SymbolRef: proposed; fixtures belong to #655
+### SymbolRef: experimental v0; producer integration remains out of scope
 
-- Wraps an **existing** engine identity, unchanged, plus its scope: (ProjectId,
-  SourceSnapshotId, producer and profile). NodeIds are never rewritten.
-- Must name **which** ID space it wraps: schema `NodeId` for symbols, or the engine's
-  path-string IDs for files, directories, docs and configs.
+- `SymbolRef` wraps the unchanged existing NodeId with ProjectId, clone identity, and an
+  explicit engine-node scope. Producer-local scope includes producer namespace, document
+  and local label; external package scope retains producer, package, version and symbol.
+  Unknown scope kinds are retained as opaque data and cannot resolve.
+- `ObservedSymbolRevision` binds one SymbolRef to an exact SourceSnapshotId, profile,
+  fact revision and origin record. `SymbolOriginEvidence` and
+  `ExplicitSymbolMappingEvidence` are advisory records. A `SymbolMappingClaim` has only
+  the wire states `proposed` and `unknown`; a serialized `established` value is
+  unrecognized.
+- The broker returns its non-serializable `EstablishedWithinBinding` only when a local
+  binding token matches the exact project, two distinct clone IDs, both source snapshot
+  IDs and one profile, and the claim resolves to exactly seven canonical records:
+  mapping evidence, two observations, two symbol refs and two distinct origin records.
+  Missing, duplicate, aliased, malformed, cross-scope or mismatched evidence yields
+  `Unknown`. This result is process-local and advisory; it is not verification, accepted
+  identity, or execution authority. No name, NodeId equality or contributor claim alone
+  creates it.
+- External package mappings must retain the same producer, package and exact version on
+  both sides. A proposed cross-version mapping remains `Unknown` because this adapter has
+  no evidence that proves compatibility between package releases.
+- Mapping scope is intentionally bounded. The two-clone fixture checks body edits,
+  path moves, renames, copies, equal producer-local labels in separate documents,
+  external package versions, and historical overload collisions. In particular, the
+  legacy NodeId tuple omits signature, so overload declarations with the same repo, path,
+  name and kind collide; without explicit resolved evidence the mapping remains
+  `Unknown`. Old NodeIds are not rewritten.
+- The adapter validates NodeId syntax and repo-component binding for engine scopes. It
+  does not execute an indexer, infer clone lineage, prove external package contents, or
+  turn a proposed record into cross-version identity. There is no automatic producer.
 - **Body revision is separate.** The T65 test shows that a function's NodeId survives body
   **and signature** edits, so "same NodeId" never means "same code". Any reuse of a result
   binds the exact SourceSnapshotId (#655, #685).
@@ -126,4 +158,4 @@ path; and the existing source digest hashes Git object ids.
 | T03 (two clones) | Not started: needs the enrollment descriptor. |
 | T05 (rename, copy, split, competing paths) | Not started: waits for E1. |
 | T65 (body edit keeps NodeId, revision changes) | Baseline done (#700). The "revision binds the exact input" half is #655's envelope. |
-| T66 (scoped symbols, clone mapping) | Not started: #655 / AQ0. |
+| T66 (scoped symbols, clone mapping) | Experimental records, resolver and an actual two-clone synthetic Playground fixture are added under AQ0. The fixture covers scope mismatches, independent origins, stale snapshots, external version mismatch and overload collisions. Runtime qualification remains pending; no producer integration is claimed. |

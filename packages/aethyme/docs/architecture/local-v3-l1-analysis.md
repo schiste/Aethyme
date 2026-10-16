@@ -1,6 +1,6 @@
 # Local v3 — L1 analysis envelope and baseline adapter (#655)
 
-Last Updated: 2026-10-09
+Last Updated: 2026-10-16
 
 This record covers the AQ0 analysis contract: how an analysis answer states its exact
 subject and profile, and how much of it is known (plan §5.7, §6.11, §6.20). It is input
@@ -11,7 +11,9 @@ consumes L0's D37 inventory (`local-v3-l0/d-analysis-inventory-d37.md`, PR #704)
 Code: `aethyme-contracts::experimental_v0::analysis` (envelope) and
 `aethyme-broker::impact_analysis_envelope` (baseline adapter). Golden vectors:
 `aethyme-contracts/fixtures/experimental-v0/analysis.json`, from an independent Python
-implementation.
+implementation. AQ0's experimental symbol identity records and finite clone-binding
+resolver are documented in `local-v3-l1-identity.md`; they do not add an analysis
+producer or widen this baseline adapter.
 
 ## Envelope
 
@@ -71,9 +73,11 @@ coverage". The adapter's choices:
 - **D38 closes** only when real consumers (L3, Explore, the composer) show that the same
   source under different configurations cannot share a result. That needs a pinned
   profile from an actual producer. Today's engine has only legacy profiles.
-- **D39** (symbol references across clones, overloads, package versions) needs
-  `resolve_symbol`/`find_references` producers and two-clone fixtures (T66). The envelope
-  carries their results; it does not define `SymbolRef` mapping records yet.
+- **D39** (symbol references across clones, overloads, package versions) now has
+  experimental scoped records and a two-clone synthetic Playground fixture through the
+  broker's exact-binding resolver (T66). It still has no `resolve_symbol` or
+  `find_references` producer, no automatic indexer path, and no cross-version identity
+  authority. Runtime qualification and broader producer/profile evidence remain open.
 - **D44 closes** with Local, Explore, compositor and service fixtures reading one
   envelope. Only the broker's impact report is adapted so far.
 - **D47:** the engine's "forever 1" fragment and overlay formats are wrapped, not
@@ -85,6 +89,6 @@ coverage". The adapter's choices:
 | Plan test | State |
 |---|---|
 | AQ0 (no stronger claim than coverage; partial/missing producer; old/new schema) | Envelope vectors plus adapter tests: complete-empty vs every degradation, an old producer missing dimensions, an unrecognized value, high confidence on a partial report, a coverage gap not read as truncation. |
-| T78 (stopped producer, truncation, older cursor) | Unavailable, truncated and stale-cursor cases done. Timeout and an omitted language map to unavailable and partial, but have no producer fixture yet. |
+| T78 (stopped producer, truncation, older cursor) | Unavailable, truncated and stale-cursor cases have vectors. Independent vectors now also pin timeout (`query_timeout`) and omitted-language (`language_omitted_from_profile`) reasons/gaps; these remain baseline contract fixtures, not live producer runs. |
 | T85 (unknown fields and old/new consumers) | Through the record layer (#653) and the unknown/unrecognized dimension cases. |
-| T65 / T66 | T65 baseline in #700. T66 needs symbol producers (D39). |
+| T65 / T66 | T65 baseline in #700. T66's scoped record adapter and actual two-clone fixture are implemented experimentally; runtime qualification and producer integration remain open. |
