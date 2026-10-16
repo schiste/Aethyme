@@ -758,7 +758,18 @@ fn artifact_sweep_worker_lock_path(main_root: &Path) -> Result<PathBuf, BrokerOp
 
     let lock_path = canonical_run.join("gc-artifact-worker.lock");
     match std::fs::symlink_metadata(&lock_path) {
-        Ok(metadata) if metadata.file_type().is_file() => {}
+        Ok(metadata) if metadata.file_type().is_file() => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                if metadata.nlink() != 1 {
+                    return Err(worker_path_error(
+                        &lock_path,
+                        "worker lock file must not have hard links",
+                    ));
+                }
+            }
+        }
         Ok(_) => {
             return Err(worker_path_error(
                 &lock_path,
@@ -922,7 +933,11 @@ fn artifact_sweep_worker_lock_file(main_root: &Path) -> Result<std::fs::File, Br
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        if named.dev() != opened.dev() || named.ino() != opened.ino() {
+        if named.dev() != opened.dev()
+            || named.ino() != opened.ino()
+            || named.nlink() != 1
+            || opened.nlink() != 1
+        {
             return Err(worker_path_error(
                 &path,
                 "worker lock path changed while it was opened",
@@ -2567,7 +2582,7 @@ impl Broker {
     }
 
     /// Launch the installed router as a detached cache-only continuation.
-    /// The OS advisory lock is the singleton; the PID text is diagnostic only.
+    /// The OS advisory lock is the singleton; its file stays content-free.
     fn maybe_start_artifact_sweep_worker(
         &mut self,
         pressure_request: bool,
@@ -2598,7 +2613,7 @@ impl Broker {
                 path: root.clone(),
                 source,
             })?;
-        let mut child = match Command::new(&router)
+        let child = match Command::new(&router)
             .args(["broker", "gc", "__continue-artifacts"])
             .arg(&canonical_root)
             .current_dir(&canonical_root)
@@ -2614,14 +2629,11 @@ impl Broker {
                 return Ok(());
             }
         };
-        let holder = format!("pid={}", child.id());
-        if lock.record_holder(&holder).is_err() {
-            let _ = child.kill();
-            let _ = child.wait();
-            self.defer_artifact_sweep_worker("worker_lock_record_failed");
-        }
-        // Dropping the parent lock lets the child (which already exists and
-        // is blocked on the same OS lock) take over without a PID race.
+        // The advisory lock is intentionally content-free. Writing a PID
+        // here could truncate another file if the lock path were hard-linked
+        // between validation and open. Dropping the parent lock lets the
+        // child (which already exists and is blocked on the same OS lock) take
+        // over without a PID race.
         drop(lock);
         Ok(())
     }
@@ -2806,11 +2818,11 @@ impl Broker {
         policy: &RetentionPolicy,
         scope: ArtifactSweepScope,
     ) -> (u64, crate::disk_headroom::SweepUrgency) {
-        let main_root = self.main_root();
+        let main_root = self.main_root().to_path_buf();
         // The detached worker can reclaim caches from external worktree and
         // preparation-cache volumes. Looking only at the main checkout misses
         // pressure on those filesystems (the main checkout is often elsewhere).
-        let mut roots = BTreeSet::from([main_root.to_path_buf()]);
+        let mut roots = BTreeSet::from([main_root.clone()]);
         if scope == ArtifactSweepScope::AutomaticContinuation {
             if let Ok(sessions) = self.store().live_sessions() {
                 roots.extend(
@@ -2852,7 +2864,7 @@ impl Broker {
                 continue;
             }
             let headroom =
-                crate::disk_headroom::available_headroom_at_or_above_for(main_root, &path);
+                crate::disk_headroom::available_headroom_at_or_above_for(&main_root, &path);
             if crate::disk_headroom::sweep_urgency_with_inodes(
                 headroom.map(|value| value.bytes),
                 crate::disk_headroom::DEFAULT_GATE_HEADROOM_BYTES,
@@ -4526,6 +4538,26 @@ mod tests {
             }
             other => panic!("unknown detached worker fixture mode {other:?}"),
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn artifact_worker_lock_refuses_hard_links_without_mutating_the_target() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let run = root.join(".aethyme/run");
+        std::fs::create_dir_all(&run).unwrap();
+        let protected = root.join("protected-data");
+        std::fs::write(&protected, b"keep this file intact\n").unwrap();
+        let lock_path = run.join("gc-artifact-worker.lock");
+        std::fs::hard_link(&protected, &lock_path).unwrap();
+
+        assert!(artifact_sweep_worker_lock_file(root).is_err());
+        assert_eq!(
+            std::fs::read(&protected).unwrap(),
+            b"keep this file intact\n",
+            "the worker must never truncate a hard-linked target"
+        );
     }
 
     #[test]
