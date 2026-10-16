@@ -1842,7 +1842,7 @@ mod tests {
         let lease_id = acquired.lease.lease_id.clone();
         let mut grant = Some(acquired);
 
-        let result = broker.release_grant_after_error(
+        let result: Result<(), PreparationError> = broker.release_grant_after_error(
             Err(PreparationError::InvalidState {
                 path: ".aethyme/preparation/7.json".into(),
                 reason: "injected initial state write failure".into(),

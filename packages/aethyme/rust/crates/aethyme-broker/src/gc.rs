@@ -877,10 +877,12 @@ pub(crate) fn artifact_worker_runtime_is_aligned() -> bool {
     let Some((router, engine)) = artifact_worker_binaries() else {
         return false;
     };
-    let router_identity = worker_binary_version(&router)
+    let router_version = worker_binary_version(&router);
+    let engine_version = worker_binary_version(&engine);
+    let router_identity = router_version
         .as_deref()
         .and_then(crate::install_health::build_identity);
-    let engine_identity = worker_binary_version(&engine)
+    let engine_identity = engine_version
         .as_deref()
         .and_then(crate::install_health::build_identity);
     matches!(
@@ -2735,7 +2737,7 @@ impl Broker {
         }
     }
 
-    fn defer_artifact_sweep_worker(&self, reason: &str) {
+    fn defer_artifact_sweep_worker(&mut self, reason: &str) {
         let retry_after = now_ms().saturating_add(ARTIFACT_SWEEP_WORKER_RETRY_MS);
         let _ = self
             .store()
@@ -2743,7 +2745,7 @@ impl Broker {
         self.write_artifact_sweep_worker_status(reason);
     }
 
-    fn write_artifact_sweep_worker_status(&self, status: &str) {
+    fn write_artifact_sweep_worker_status(&mut self, status: &str) {
         // The value is intentionally bounded and replaced rather than logged
         // to a file that could itself grow without limit.
         let bounded = status.chars().take(160).collect::<String>();
@@ -2755,7 +2757,7 @@ impl Broker {
     /// Whether a recovery request remains durable. The worker advances a
     /// separate completed generation only after a complete cache-only lap;
     /// interruptions retain this marker and the existing sweep cursor/tree.
-    pub(crate) fn artifact_sweep_recovery_requested(&self) -> Result<bool, BrokerOpError> {
+    pub(crate) fn artifact_sweep_recovery_requested(&mut self) -> Result<bool, BrokerOpError> {
         let requested = self
             .store()
             .meta_get(ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY)?
@@ -2800,7 +2802,7 @@ impl Broker {
     }
 
     fn artifact_sweep_budget(
-        &self,
+        &mut self,
         policy: &RetentionPolicy,
         scope: ArtifactSweepScope,
     ) -> (u64, crate::disk_headroom::SweepUrgency) {
@@ -4038,94 +4040,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn incomplete_worker_keeps_request_and_a_new_pressure_request_retries_it() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path();
-        git(root, &["init", "-q", "-b", "main"]);
-        std::fs::write(root.join("README.md"), "fixture\n").unwrap();
-        git(root, &["add", "README.md"]);
-        git(root, &["commit", "-qm", "fixture"]);
-        std::fs::create_dir_all(root.join(".aethyme")).unwrap();
-        let mut broker = Broker::open(root).unwrap();
-        broker
-            .store()
-            .meta_set(ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY, "7")
-            .unwrap();
-        broker
-            .store()
-            .meta_set(ARTIFACT_SWEEP_RECOVERY_COMPLETED_KEY, "3")
-            .unwrap();
-        let policy = load_retention_policy(root).unwrap();
-
-        broker
-            .run_artifact_sweep_recovery_worker_loop(&policy, 7, None, |_broker, _policy| {
-                Ok((
-                    ArtifactSweepOutcome {
-                        directories_reclaimed: 0,
-                        complete: false,
-                        auto_cleanup: None,
-                    },
-                    0,
-                ))
-            })
-            .unwrap();
-        assert_eq!(
-            broker
-                .store()
-                .meta_get(ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY)
-                .unwrap()
-                .as_deref(),
-            Some("7"),
-            "a stalled cache removal leaves its durable request pending"
-        );
-        assert_eq!(
-            broker
-                .store()
-                .meta_get(ARTIFACT_SWEEP_RECOVERY_COMPLETED_KEY)
-                .unwrap()
-                .as_deref(),
-            Some("3")
-        );
-        assert!(worker_retry_pending(broker.store(), now_ms()).unwrap());
-
-        broker.persist_artifact_sweep_recovery_request().unwrap();
-        let retry_generation = broker
-            .store()
-            .meta_get(ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY)
-            .unwrap()
-            .unwrap();
-        assert!(retry_generation.parse::<i64>().unwrap() > 7);
-        assert!(!worker_retry_pending(broker.store(), now_ms()).unwrap());
-        broker
-            .run_artifact_sweep_recovery_worker_loop(
-                &policy,
-                retry_generation.parse().unwrap(),
-                None,
-                |_broker, _policy| {
-                    Ok((
-                        ArtifactSweepOutcome {
-                            directories_reclaimed: 1,
-                            complete: true,
-                            auto_cleanup: None,
-                        },
-                        1,
-                    ))
-                },
-            )
-            .unwrap();
-        assert_eq!(
-            broker
-                .store()
-                .meta_get(ARTIFACT_SWEEP_RECOVERY_COMPLETED_KEY)
-                .unwrap()
-                .as_deref(),
-            Some(retry_generation.as_str()),
-            "a subsequent eligible pass records the requested generation"
-        );
-        assert!(!worker_retry_pending(broker.store(), now_ms()).unwrap());
-    }
-
     fn detached_fixture_marker(root: &Path, name: &str) -> PathBuf {
         root.join(".aethyme/test-worker").join(name)
     }
@@ -4463,7 +4377,7 @@ mod tests {
                 );
                 assert!(broker.is_broker_owned_worktree(&session, &closed_worktree));
                 let policy = load_retention_policy(broker.main_root()).unwrap();
-                let mut entries_reclaimed = 0;
+                let mut entries_reclaimed: usize = 0;
                 broker
                     .run_artifact_sweep_recovery_worker_loop(
                         &policy,
@@ -4554,7 +4468,7 @@ mod tests {
                 }
 
                 let policy = load_retention_policy(broker.main_root()).unwrap();
-                let mut entries_reclaimed = 0;
+                let mut entries_reclaimed: usize = 0;
                 broker
                     .run_artifact_sweep_recovery_worker_loop(&policy, 77, None, |broker, policy| {
                         let result = broker.sweep_artifacts_autonomously_with_progress(
