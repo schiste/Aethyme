@@ -49,6 +49,8 @@ mod contribution;
 mod lifecycle;
 #[path = "collaboration_cli/project.rs"]
 mod project;
+#[path = "collaboration_cli/resolution.rs"]
+mod resolution;
 #[cfg(test)]
 pub(crate) use project::test_support as project_test_support;
 #[path = "collaboration_cli/sensitive.rs"]
@@ -143,6 +145,32 @@ Usage:
       select --operation for a lineage shared by multiple logical contributions.
 
 Additional explicit lifecycle commands (provisional Local packages):
+  aethyme collab resolution prepare --request ID --object sha256:HEX
+       --session-label LABEL --client-key KEY --limits PATH
+       --target NAME --issuer NAME --wave ID --version N [--json]
+      Charge one bounded attempt before exposing its exact metadata packet.
+      Limits are a strict JSON file; labels are provenance, not authentication.
+      Preparation and handoff intent require the exact current wave and target version.
+      Repeating a client key returns status without a new charge or packet.
+  aethyme collab resolution status --attempt TOKEN --session-label LABEL [--json]
+      Read-only attempt status, including the retained limits and unknowns.
+  aethyme collab resolution mark-dispatching --attempt TOKEN --session-label LABEL
+       --target NAME --issuer NAME --wave ID --version N [--json]
+      Record handoff intent before giving the packet to a local agent.
+      This command records state only; it neither starts nor authorizes an agent.
+  aethyme collab resolution mark-unknown --attempt TOKEN --session-label LABEL
+       --detail PATH [--json]
+      Record uncertainty using a UTF-8 detail file (at most 4096 bytes).
+      The attempt stays charged; a late bound response may settle it.
+  aethyme collab resolution packet --attempt TOKEN --session-label LABEL [--json]
+      Recover an exported metadata packet without charging another attempt.
+  aethyme collab resolution input --attempt TOKEN --session-label LABEL
+       --snapshot sha256:HEX --path PATH [--json]
+      Read one exact manifested input, with bytes encoded as lowercase hex.
+  aethyme collab resolution import --attempt TOKEN --session-label LABEL
+       --proposal PATH [--json]
+      Import one strict attempt/request/manifest-bound response file. The
+      result is retained and unverified; no dispatch, wave attachment or acceptance.
   aethyme collab authority status [--json]
       Read the native epoch/witness and ledger binding without changing state.
       Observation grants no authority; unbound, frozen and drift remain distinct.
@@ -341,6 +369,9 @@ fn next_action_for(code: &str) -> Option<&'static str> {
             "nothing is retained yet: an advisory or required `aethyme broker submit` \
              creates collaboration state"
         }
+        "resolution_wave_refused" => {
+            "inspect the latest target and wave, then use their exact request and version"
+        }
         "file_too_large" => "pass a smaller file; the message gives the limit",
         _ => return None,
     })
@@ -457,6 +488,12 @@ fn command_name(args: &[String]) -> String {
         "show",
         "dispatch",
         "sync",
+        "resolution",
+        "mark-dispatching",
+        "mark-unknown",
+        "packet",
+        "input",
+        "import",
     ];
     let words: Vec<&str> = args
         .iter()
@@ -515,6 +552,15 @@ fn dispatch(options: Options) -> Result<Output, Failure> {
             verb @ ("quarantine" | "purge" | "resume" | "status"),
             rest @ ..,
         ] => sensitive::command(&main_root, verb, rest),
+        ["resolution", "prepare", rest @ ..] => resolution::prepare(&main_root, rest),
+        ["resolution", "status", rest @ ..] => resolution::status(&main_root, rest),
+        ["resolution", "mark-dispatching", rest @ ..] => {
+            resolution::mark_dispatching(&main_root, rest)
+        }
+        ["resolution", "mark-unknown", rest @ ..] => resolution::mark_unknown(&main_root, rest),
+        ["resolution", "packet", rest @ ..] => resolution::packet(&main_root, rest),
+        ["resolution", "input", rest @ ..] => resolution::input(&main_root, rest),
+        ["resolution", "import", rest @ ..] => resolution::import(&main_root, rest),
         ["authority", "status", rest @ ..] => lifecycle::authority_status(&main_root, rest),
         ["target", "status", rest @ ..] => lifecycle::target_status(&main_root, rest),
         ["target", "budget", "project", rest @ ..] => {
