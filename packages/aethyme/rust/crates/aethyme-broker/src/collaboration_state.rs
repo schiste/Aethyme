@@ -2826,6 +2826,137 @@ mod tests {
 
     #[test]
     fn schema_29_preserves_shared_charges_and_binds_distinct_attempt_axes() {
+        #[derive(Debug, PartialEq, Eq)]
+        struct ProofSnapshot {
+            reservation: String,
+            target: String,
+            issuer: String,
+            authority_epoch: String,
+            client_key: String,
+            wave: String,
+            request_record_id: String,
+            request_object_sha256: String,
+            input_manifest_object_sha256: String,
+            trigger_sha256: String,
+            project_policy: String,
+            objective_policy: String,
+            price_profile: String,
+            dispatch_limits: String,
+            reserved_envelope: Vec<u8>,
+            reservation_attempt_limit: i64,
+            deadline_ms: i64,
+            created_ms: i64,
+        }
+        #[derive(Debug, PartialEq, Eq)]
+        struct BindingSnapshot {
+            binding_id: String,
+            reservation: String,
+            attempt_id: i64,
+            authority_epoch: String,
+            reservation_version: i64,
+            shared_attempt_number: i64,
+            reservation_attempt_number: i64,
+            route: String,
+            created_ms: i64,
+        }
+        #[derive(Debug, PartialEq, Eq)]
+        struct ReservationSnapshot {
+            phase: String,
+            version: i64,
+            attempts: i64,
+        }
+        #[derive(Debug, PartialEq, Eq)]
+        struct BindingAuthoritySnapshot {
+            proof: ProofSnapshot,
+            roots: Vec<String>,
+            bindings: Vec<BindingSnapshot>,
+            reservation: ReservationSnapshot,
+        }
+
+        fn snapshot(
+            connection: &rusqlite::Connection,
+            reservation: &str,
+        ) -> rusqlite::Result<BindingAuthoritySnapshot> {
+            let proof = connection.query_row(
+                "SELECT reservation,target,issuer,authority_epoch,client_key,wave,
+                        request_record_id,request_object_sha256,
+                        input_manifest_object_sha256,trigger_sha256,project_policy,
+                        objective_policy,price_profile,dispatch_limits,reserved_envelope,
+                        reservation_attempt_limit,deadline_ms,created_ms
+                 FROM local_resolution_reservation_proofs WHERE reservation=?1",
+                [reservation],
+                |row| {
+                    Ok(ProofSnapshot {
+                        reservation: row.get(0)?,
+                        target: row.get(1)?,
+                        issuer: row.get(2)?,
+                        authority_epoch: row.get(3)?,
+                        client_key: row.get(4)?,
+                        wave: row.get(5)?,
+                        request_record_id: row.get(6)?,
+                        request_object_sha256: row.get(7)?,
+                        input_manifest_object_sha256: row.get(8)?,
+                        trigger_sha256: row.get(9)?,
+                        project_policy: row.get(10)?,
+                        objective_policy: row.get(11)?,
+                        price_profile: row.get(12)?,
+                        dispatch_limits: row.get(13)?,
+                        reserved_envelope: row.get(14)?,
+                        reservation_attempt_limit: row.get(15)?,
+                        deadline_ms: row.get(16)?,
+                        created_ms: row.get(17)?,
+                    })
+                },
+            )?;
+            let mut root_statement = connection.prepare(
+                "SELECT lineage_record_id FROM local_resolution_reservation_roots
+                 WHERE reservation=?1 ORDER BY lineage_record_id",
+            )?;
+            let roots: Vec<String> = root_statement
+                .query_map([reservation], |row| row.get(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            let mut binding_statement = connection.prepare(
+                "SELECT binding_id,reservation,attempt_id,authority_epoch,
+                        reservation_version,shared_attempt_number,
+                        reservation_attempt_number,route,created_ms
+                 FROM local_managed_resolution_attempt_bindings
+                 WHERE reservation=?1 ORDER BY binding_id",
+            )?;
+            let bindings = binding_statement
+                .query_map([reservation], |row| {
+                    Ok(BindingSnapshot {
+                        binding_id: row.get(0)?,
+                        reservation: row.get(1)?,
+                        attempt_id: row.get(2)?,
+                        authority_epoch: row.get(3)?,
+                        reservation_version: row.get(4)?,
+                        shared_attempt_number: row.get(5)?,
+                        reservation_attempt_number: row.get(6)?,
+                        route: row.get(7)?,
+                        created_ms: row.get(8)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            let reservation_state = connection.query_row(
+                "SELECT phase,version,attempts FROM local_budget_reservations
+                 WHERE reservation=?1",
+                [reservation],
+                |row| {
+                    Ok(ReservationSnapshot {
+                        phase: row.get(0)?,
+                        version: row.get(1)?,
+                        attempts: row.get(2)?,
+                    })
+                },
+            )?;
+            Ok(BindingAuthoritySnapshot {
+                proof,
+                roots,
+                bindings,
+                reservation: reservation_state,
+            })
+        }
+
         fn insert_binding(
             connection: &rusqlite::Connection,
             binding_id: &str,
@@ -2870,15 +3001,22 @@ mod tests {
             Ok(connection.last_insert_rowid())
         }
 
-        fn assert_no_bindings(connection: &rusqlite::Connection) {
-            let count: i64 = connection
-                .query_row(
-                    "SELECT count(*) FROM local_managed_resolution_attempt_bindings",
-                    [],
-                    |row| row.get(0),
-                )
-                .unwrap();
-            assert_eq!(count, 0, "a rejected binding must leave no row behind");
+        fn assert_rejected_without_mutation(
+            connection: &rusqlite::Connection,
+            reservation: &str,
+            description: &str,
+            insert: impl FnOnce(&rusqlite::Connection) -> rusqlite::Result<usize>,
+        ) {
+            let before = snapshot(connection, reservation).unwrap();
+            assert!(
+                insert(connection).is_err(),
+                "{description} must be rejected"
+            );
+            let after = snapshot(connection, reservation).unwrap();
+            assert_eq!(
+                after, before,
+                "{description} must not mutate proof, roots, bindings, or reservation state"
+            );
         }
 
         let host = tempfile::tempdir().unwrap();
@@ -2978,19 +3116,21 @@ mod tests {
 
         // Each invalid insert reaches the binding predicate for the intended
         // proof axis before the valid row is created below.
-        let wrong_shared_attempt = insert_binding(
+        assert_rejected_without_mutation(
             migrated.connection(),
-            "binding:wrong-shared-attempt",
             "reservation",
-            attempt_id,
-            1,
-            1,
+            "wrong shared comparable attempt number",
+            |connection| {
+                insert_binding(
+                    connection,
+                    "binding:wrong-shared-attempt",
+                    "reservation",
+                    attempt_id,
+                    1,
+                    1,
+                )
+            },
         );
-        assert!(
-            wrong_shared_attempt.is_err(),
-            "the binding must use the charged shared comparable attempt number"
-        );
-        assert_no_bindings(migrated.connection());
 
         // Keep NEW.reservation_attempt_number valid and vary the persisted
         // reservation count, so the r.attempts equality guard is what rejects
@@ -3003,19 +3143,34 @@ mod tests {
                 [],
             )
             .unwrap();
-        let wrong_reservation_attempt = insert_binding(
+        assert_rejected_without_mutation(
             migrated.connection(),
-            "binding:wrong-reservation-attempt",
             "reservation",
-            attempt_id,
-            2,
-            1,
+            "wrong Local reservation attempt count",
+            |connection| {
+                insert_binding(
+                    connection,
+                    "binding:wrong-reservation-attempt",
+                    "reservation",
+                    attempt_id,
+                    2,
+                    1,
+                )
+            },
         );
-        assert!(
-            wrong_reservation_attempt.is_err(),
-            "the binding must match the Local reservation attempt count"
+        let attempts_after_rejection: i64 = migrated
+            .connection()
+            .query_row(
+                "SELECT attempts FROM local_budget_reservations
+                 WHERE reservation='reservation'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            attempts_after_rejection, 2,
+            "the failed binding must not change the persisted Local attempt count"
         );
-        assert_no_bindings(migrated.connection());
         migrated
             .connection()
             .execute(
@@ -3033,19 +3188,21 @@ mod tests {
             "client-key",
         )
         .unwrap();
-        assert!(
-            insert_binding(
-                migrated.connection(),
-                "binding:wrong-request-record",
-                "reservation",
-                wrong_request_record_attempt,
-                2,
-                1,
-            )
-            .is_err(),
-            "the binding must match the charged request record ID"
+        assert_rejected_without_mutation(
+            migrated.connection(),
+            "reservation",
+            "wrong request record ID",
+            |connection| {
+                insert_binding(
+                    connection,
+                    "binding:wrong-request-record",
+                    "reservation",
+                    wrong_request_record_attempt,
+                    2,
+                    1,
+                )
+            },
         );
-        assert_no_bindings(migrated.connection());
 
         let wrong_request_object_attempt = insert_attempt(
             migrated.connection(),
@@ -3055,19 +3212,21 @@ mod tests {
             "client-key",
         )
         .unwrap();
-        assert!(
-            insert_binding(
-                migrated.connection(),
-                "binding:wrong-request-object",
-                "reservation",
-                wrong_request_object_attempt,
-                2,
-                1,
-            )
-            .is_err(),
-            "the binding must match the request object digest"
+        assert_rejected_without_mutation(
+            migrated.connection(),
+            "reservation",
+            "wrong request object digest",
+            |connection| {
+                insert_binding(
+                    connection,
+                    "binding:wrong-request-object",
+                    "reservation",
+                    wrong_request_object_attempt,
+                    2,
+                    1,
+                )
+            },
         );
-        assert_no_bindings(migrated.connection());
 
         let wrong_manifest_object_attempt = insert_attempt(
             migrated.connection(),
@@ -3077,19 +3236,21 @@ mod tests {
             "client-key",
         )
         .unwrap();
-        assert!(
-            insert_binding(
-                migrated.connection(),
-                "binding:wrong-manifest-object",
-                "reservation",
-                wrong_manifest_object_attempt,
-                2,
-                1,
-            )
-            .is_err(),
-            "the binding must match the input manifest object digest"
+        assert_rejected_without_mutation(
+            migrated.connection(),
+            "reservation",
+            "wrong manifest object digest",
+            |connection| {
+                insert_binding(
+                    connection,
+                    "binding:wrong-manifest-object",
+                    "reservation",
+                    wrong_manifest_object_attempt,
+                    2,
+                    1,
+                )
+            },
         );
-        assert_no_bindings(migrated.connection());
 
         migrated
             .connection()
@@ -3127,19 +3288,21 @@ mod tests {
             "client-key:no-roots",
         )
         .unwrap();
-        assert!(
-            insert_binding(
-                migrated.connection(),
-                "binding:no-roots",
-                "reservation:no-roots",
-                no_roots_attempt,
-                2,
-                1,
-            )
-            .is_err(),
-            "a managed attempt must retain at least one selected lineage root"
+        assert_rejected_without_mutation(
+            migrated.connection(),
+            "reservation:no-roots",
+            "binding without selected lineage roots",
+            |connection| {
+                insert_binding(
+                    connection,
+                    "binding:no-roots",
+                    "reservation:no-roots",
+                    no_roots_attempt,
+                    2,
+                    1,
+                )
+            },
         );
-        assert_no_bindings(migrated.connection());
 
         insert_binding(
             migrated.connection(),
