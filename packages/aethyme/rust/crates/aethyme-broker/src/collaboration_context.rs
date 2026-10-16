@@ -638,6 +638,10 @@ pub enum ContextError {
     NotRetained { id: String },
     #[error("the brief is invalid: {0}")]
     InvalidBrief(String),
+    #[error("immutable revision identity: {0}")]
+    RevisionIdentity(String),
+    #[error(transparent)]
+    ImmutableRevision(#[from] crate::collaboration_identity_store::IdentityStoreError),
     #[error(transparent)]
     Archive(#[from] ArchiveError),
     #[error(transparent)]
@@ -656,6 +660,8 @@ impl ContextError {
             Self::EmptyScope => "empty_scope",
             Self::NotRetained { .. } => "not_retained",
             Self::InvalidBrief(_) => "invalid_brief",
+            Self::RevisionIdentity(_) => "revision_identity",
+            Self::ImmutableRevision(error) => error.code(),
             Self::Archive(error) => error.code(),
             Self::State(error) => error.code(),
             Self::Sqlite(_) => "sqlite",
@@ -680,6 +686,7 @@ pub fn attach_brief(
     contribution: &RecordId,
     brief: &Brief,
 ) -> Result<RecordId, ContextError> {
+    let archive_use = archive_read(store)?;
     let _response = crate::collaboration_sensitive::response_use(store)
         .map_err(crate::collaboration_archive::ArchiveError::from)?;
     let errors = brief.validate();
@@ -687,6 +694,9 @@ pub fn attach_brief(
         return Err(ContextError::InvalidBrief(
             aethyme_contracts::experimental_v0::brief::BriefErrors(errors).to_string(),
         ));
+    }
+    if let Some(id) = revisions::attach_bound_brief(store, contribution, brief, &archive_use)? {
+        return Ok(id);
     }
     let (bytes, id) = brief.to_record();
     let digest = put_object(store, &bytes)?;
@@ -913,7 +923,7 @@ fn read_brief(
     }
 }
 
-fn hex_digest(text: &str) -> Option<ObjectDigest> {
+pub(crate) fn hex_digest(text: &str) -> Option<ObjectDigest> {
     if text.len() != 64 {
         return None;
     }
@@ -1808,6 +1818,7 @@ fn retrieve_with(
     mut hooks: Hooks<'_>,
     use_cache: bool,
 ) -> Result<Answer, ContextError> {
+    let _archive = archive_read(store)?;
     let _response = crate::collaboration_sensitive::response_use(store)
         .map_err(crate::collaboration_archive::ArchiveError::from)?;
     query.budget.check()?;
@@ -4331,4 +4342,21 @@ mod tests {
             assert_eq!(served.record, expected.record);
         }
     }
+}
+
+mod revisions;
+pub use revisions::{
+    REVISION_CONTEXT_PROFILE, RevisionContextError, RevisionPin, retrieve_revisions,
+};
+
+/// Shared archive barrier, acquired before the sensitive-response barrier.
+fn archive_read(
+    store: &CollaborationStore,
+) -> Result<crate::collaboration_gc::ArchiveUse, ContextError> {
+    crate::collaboration_gc::archive_use(store)
+        .map_err(|source| ArchiveError::Io {
+            path: crate::collaboration_gc::lock_path(store),
+            source,
+        })
+        .map_err(ContextError::from)
 }

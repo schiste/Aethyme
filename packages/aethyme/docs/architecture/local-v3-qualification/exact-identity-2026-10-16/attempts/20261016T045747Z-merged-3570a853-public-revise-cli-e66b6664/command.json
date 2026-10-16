@@ -1,0 +1,94 @@
+{
+  "argv": [
+    "cargo",
+    "test",
+    "--locked",
+    "-j4",
+    "-p",
+    "aethyme-broker",
+    "--lib",
+    "collaboration_cli::contribution::tests",
+    "--",
+    "--test-threads=1",
+    "--nocapture"
+  ],
+  "duration_seconds": 7.409701,
+  "ended_at_utc": "2026-10-16T04:57:54.524581Z",
+  "environment": {
+    "explicit_profile_keys": [],
+    "values": {
+      "HOME": "/Users/christophehenner",
+      "LANG": "C.UTF-8",
+      "LC_ALL": "C.UTF-8",
+      "PATH": "/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/christophehenner/.cargo/bin",
+      "RUSTC_WRAPPER": "",
+      "TMPDIR": "/private/tmp/merged-3570a853-public-revise-cli-tmp-ihugpbqr"
+    }
+  },
+  "execution_context": {
+    "host": {
+      "hostname": "Mac.lan",
+      "machine": "arm64",
+      "platform": "macOS-27.2-arm64-arm-64bit",
+      "python": "3.9.6 (default, Aug 17 2026, 12:07:42) "
+    },
+    "tmp_volume": {
+      "free_bytes_before": 6295859200,
+      "path": "/private/tmp",
+      "total_bytes": 494384795648
+    },
+    "tool_versions": {
+      "aethyme": {
+        "executable": "/Users/christophehenner/.cargo/bin/aethyme",
+        "exit_code": 0,
+        "version": "aethyme 0.8.26 (v0.8.26 build_commit=5e8daf712e26c63f1d4082e9a617f556cf995de2) build_date=2026-10-08T19:30:03Z"
+      },
+      "cargo": {
+        "executable": "/Users/christophehenner/.cargo/bin/cargo",
+        "exit_code": 0,
+        "version": "cargo 1.96.0 (30a34c682 2026-05-25)"
+      },
+      "git": {
+        "executable": "/opt/homebrew/bin/git",
+        "exit_code": 0,
+        "version": "git version 2.55.0"
+      },
+      "rustc": {
+        "executable": "/Users/christophehenner/.cargo/bin/rustc",
+        "exit_code": 0,
+        "version": "rustc 1.96.0 (ac68faa20 2026-05-25)"
+      }
+    }
+  },
+  "label": "merged-3570a853-public-revise-cli",
+  "launcher_error": null,
+  "log_bytes": 1033,
+  "log_path": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/complete-exact-immutable-contribution-co/target/local-resume/exact-revision-checks/20261016T045747Z-merged-3570a853-public-revise-cli-e66b6664/command.log",
+  "log_sha256": "c36a32a991b9a939d9ae8c31efaf76a5c0c5e749f41a4c4ed4ba2d9b4f5232d2",
+  "numeric_exit": 0,
+  "root": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/complete-exact-immutable-contribution-co",
+  "schema": "aethyme.local-check/v1",
+  "source_after": {
+    "diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "head": "3570a85346693cc3b8550e35c2ad5d8e4f447f97",
+    "status": "",
+    "tree": "874e0d45d1432035cb650b12576081729c47e881",
+    "untracked_content_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  "source_before": {
+    "diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "head": "3570a85346693cc3b8550e35c2ad5d8e4f447f97",
+    "status": "",
+    "tree": "874e0d45d1432035cb650b12576081729c47e881",
+    "untracked_content_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  "source_unchanged": true,
+  "started_at_utc": "2026-10-16T04:57:47.175629Z",
+  "state": "completed",
+  "status_bytes": 2,
+  "status_path": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/complete-exact-immutable-contribution-co/target/local-resume/exact-revision-checks/20261016T045747Z-merged-3570a853-public-revise-cli-e66b6664/command.status",
+  "status_sha256": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa",
+  "termination_signal": null,
+  "tmpdir": "/private/tmp/merged-3570a853-public-revise-cli-tmp-ihugpbqr",
+  "working_directory": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/complete-exact-immutable-contribution-co/packages/aethyme/rust"
+}

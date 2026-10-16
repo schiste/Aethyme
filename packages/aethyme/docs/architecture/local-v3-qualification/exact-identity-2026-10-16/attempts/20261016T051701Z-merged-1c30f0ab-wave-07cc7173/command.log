@@ -1,0 +1,30 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.60s
+     Running unittests src/lib.rs (target/debug/deps/aethyme_broker-0f278e0d02146111)
+
+running 23 tests
+test local_wave::tests::a_dispatch_state_change_invalidates_a_pre_dispatch_stop_observation ... ok
+test local_wave::tests::a_real_composer_dispatch_roots_candidate_before_releasing_archive_guard ... ok
+test local_wave::tests::a_terminal_conflict_cannot_stop_or_drift_a_later_independent_wave ... ok
+test local_wave::tests::age_promotion_keeps_the_oldest_group_dedicated ... ok
+test local_wave::tests::arriving_work_and_duplicate_ticks_cannot_replace_an_active_wave ... ok
+test local_wave::tests::atomic_replacements_keep_the_original_group_in_one_wave ... ok
+test local_wave::tests::availability_is_exact_idempotent_and_not_permission_to_add_work ... ok
+test local_wave::tests::crash_intent_is_unknown_and_stop_does_not_claim_process_death ... ok
+test local_wave::tests::d10_wave_validation_does_not_include_conflicting_unselected_catalog_entries ... ok
+test local_wave::tests::drift_cannot_release_a_composing_or_recovered_unknown_dispatch ... ok
+test local_wave::tests::independent_wave_identity_vector_binds_order_and_policy ... ok
+test local_wave::tests::interrupted_dispatch_recovers_after_generic_stop_or_drift_without_clearing_intent ... ok
+test local_wave::tests::lineage_prerequisites_are_admitted_together_after_the_parent_arrives ... ok
+test local_wave::tests::missing_or_corrupt_wave_is_not_an_execution_order ... ok
+test local_wave::tests::oldest_large_group_gets_a_dedicated_wave_before_new_short_work ... ok
+test local_wave::tests::one_timed_driver_call_composes_three_available_inputs_and_explicitly_holds ... ok
+test local_wave::tests::rehashed_wave_records_cannot_expand_the_pinned_authorization ... ok
+test local_wave::tests::repeated_external_movement_is_finite_and_does_not_relabel_the_baseline ... ok
+test local_wave::tests::returning_to_the_baseline_does_not_reset_or_bypass_drift_allowance ... ok
+test local_wave::tests::split_single_item_waves_refuse_conflicts_across_the_full_selected_cohort ... ok
+test local_wave::tests::stopping_a_frozen_wave_cannot_revive_it_after_selecting_a_new_revision ... ok
+test local_wave::tests::timed_admission_recovers_and_debounce_does_not_slide_with_arrivals ... ok
+test local_wave::tests::unsupported_profile_and_inadmissible_group_have_persistent_dispositions ... ok
+
+test result: ok. 23 passed; 0 failed; 0 ignored; 0 measured; 1931 filtered out; finished in 27.48s
+

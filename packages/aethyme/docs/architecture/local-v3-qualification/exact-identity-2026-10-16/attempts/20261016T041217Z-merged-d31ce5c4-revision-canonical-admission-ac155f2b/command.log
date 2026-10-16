@@ -1,0 +1,11 @@
+   Compiling aethyme-contracts v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/complete-exact-immutable-contribution-co/packages/aethyme/rust/crates/aethyme-contracts)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.32s
+     Running tests/contribution_revision.rs (target/debug/deps/contribution_revision-9c0c2fe7d725049d)
+
+running 3 tests
+test constructor_rejects_a_revision_larger_than_the_canonical_record_limit ... ok
+test new_file_revision_round_trips_without_json_null_state ... ok
+test rationale_only_brief_change_creates_a_distinct_immutable_revision ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.14s
+

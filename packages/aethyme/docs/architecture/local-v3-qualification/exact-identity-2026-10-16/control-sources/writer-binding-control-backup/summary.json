@@ -1,0 +1,49 @@
+{
+  "source_restored": true,
+  "sources": {
+    "packages/aethyme/rust/crates/aethyme-broker/src/collaboration_identity_store.rs": "6ad5eebb54a4cf8c1e6902f22f64479c48bbffc447c58726d7fef23aa4959ce8",
+    "packages/aethyme/rust/crates/aethyme-broker/src/collaboration_cli/project.rs": "8190ecf5a5723efd6b7ac72414478b8bdc3c24bddfed8426d2e4fe12227d00ff"
+  },
+  "trials": [
+    {
+      "label": "writer-lock-lifetime",
+      "exit": 101,
+      "final": {
+        "log": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/complete-exact-immutable-contribution-co/target/local-resume/exact-revision-checks/20261016T050536Z-writer-binding-neuter-writer-lock-lifetime-232126be/command.log",
+        "log_sha256": "f27a16e65ad0dd8e572326f48014abc87db743a8a245da6a3c3fc401909e4020",
+        "metadata": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/complete-exact-immutable-contribution-co/target/local-resume/exact-revision-checks/20261016T050536Z-writer-binding-neuter-writer-lock-lifetime-232126be/command.json",
+        "numeric_exit": 101,
+        "source_unchanged": true,
+        "state": "completed",
+        "status": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/complete-exact-immutable-contribution-co/target/local-resume/exact-revision-checks/20261016T050536Z-writer-binding-neuter-writer-lock-lifetime-232126be/command.status"
+      },
+      "test_results": [
+        [
+          "0",
+          "1",
+          "0"
+        ]
+      ]
+    },
+    {
+      "label": "corrupt-binding-refusal",
+      "exit": 101,
+      "final": {
+        "log": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/complete-exact-immutable-contribution-co/target/local-resume/exact-revision-checks/20261016T050624Z-writer-binding-neuter-corrupt-binding-refusal-a42f3d9b/command.log",
+        "log_sha256": "b17bd02ef48a0dbb3596453f12bbb03f3458a9a5b7840a1dfd0bf5f1bd7f41af",
+        "metadata": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/complete-exact-immutable-contribution-co/target/local-resume/exact-revision-checks/20261016T050624Z-writer-binding-neuter-corrupt-binding-refusal-a42f3d9b/command.json",
+        "numeric_exit": 101,
+        "source_unchanged": true,
+        "state": "completed",
+        "status": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/complete-exact-immutable-contribution-co/target/local-resume/exact-revision-checks/20261016T050624Z-writer-binding-neuter-corrupt-binding-refusal-a42f3d9b/command.status"
+      },
+      "test_results": [
+        [
+          "0",
+          "1",
+          "0"
+        ]
+      ]
+    }
+  ]
+}

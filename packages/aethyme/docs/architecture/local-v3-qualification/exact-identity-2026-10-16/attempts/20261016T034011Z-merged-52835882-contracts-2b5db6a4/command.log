@@ -1,0 +1,17 @@
+   Compiling syn v3.0.6
+   Compiling serde_core v1.0.229
+   Compiling cpufeatures v0.2.17
+   Compiling sha2 v0.10.9
+   Compiling serde_derive v1.0.229
+   Compiling thiserror-impl v2.0.21
+   Compiling serde_json v1.0.151
+   Compiling thiserror v2.0.21
+   Compiling serde v1.0.229
+   Compiling aethyme-contracts v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/complete-exact-immutable-contribution-co/packages/aethyme/rust/crates/aethyme-contracts)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.32s
+     Running unittests src/lib.rs (target/debug/deps/aethyme_contracts-10725fd451d1fdb4)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

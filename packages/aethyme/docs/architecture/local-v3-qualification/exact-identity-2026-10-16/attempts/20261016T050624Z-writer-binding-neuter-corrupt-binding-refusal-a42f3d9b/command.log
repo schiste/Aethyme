@@ -1,0 +1,21 @@
+   Compiling aethyme-broker v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/complete-exact-immutable-contribution-co/packages/aethyme/rust/crates/aethyme-broker)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 29.42s
+     Running unittests src/lib.rs (target/debug/deps/aethyme_broker-0f278e0d02146111)
+
+running 1 test
+test collaboration_cli::project::binding_tests::a_corrupt_bootstrap_transition_is_a_typed_binding_refusal ... 
+thread 'collaboration_cli::project::binding_tests::a_corrupt_bootstrap_transition_is_a_typed_binding_refusal' (16908272) panicked at crates/aethyme-broker/src/collaboration_cli/project.rs:1541:9:
+assertion `left == right` failed
+  left: 1
+ right: 3
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+
+failures:
+    collaboration_cli::project::binding_tests::a_corrupt_bootstrap_transition_is_a_typed_binding_refusal
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1953 filtered out; finished in 0.80s
+
+error: test failed, to rerun pass `-p aethyme-broker --lib`

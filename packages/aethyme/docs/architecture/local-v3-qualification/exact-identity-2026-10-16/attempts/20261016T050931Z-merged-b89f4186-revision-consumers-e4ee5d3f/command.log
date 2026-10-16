@@ -1,0 +1,20 @@
+   Compiling aethyme-engine v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/complete-exact-immutable-contribution-co/packages/aethyme/rust/crates/aethyme-engine)
+   Compiling aethyme-broker v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/complete-exact-immutable-contribution-co/packages/aethyme/rust/crates/aethyme-broker)
+error[E0277]: can't compare `std::string::String` with `&std::string::String`
+   --> crates/aethyme-broker/src/local_exchange.rs:632:13
+    |
+631 |         if crate::collaboration_archive::ObjectDigest::of(&revision_bytes).hex()
+    |            ---------------------------------------------------------------------
+632 |             != revision_object_sha256
+    |             ^^ ----------------------
+    |             |
+    |             no implementation for `std::string::String == &std::string::String`
+    |
+    = help: the trait `PartialEq<&std::string::String>` is not implemented for `std::string::String`
+help: consider dereferencing here
+    |
+632 |             != *revision_object_sha256
+    |                +
+
+For more information about this error, try `rustc --explain E0277`.
+error: could not compile `aethyme-broker` (lib test) due to 1 previous error

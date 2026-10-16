@@ -1,0 +1,55 @@
+   Compiling aethyme-engine v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/complete-exact-immutable-contribution-co/packages/aethyme/rust/crates/aethyme-engine)
+   Compiling aethyme-broker v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/complete-exact-immutable-contribution-co/packages/aethyme/rust/crates/aethyme-broker)
+warning: type `collaboration_cli::Failure` is more private than the item `PendingProjectFixture::bind`
+    --> crates/aethyme-broker/src/collaboration_cli/project.rs:1029:9
+     |
+1029 |         pub(crate) fn bind(&self, record_id: &str) -> Result<super::Output, super::Failure> {
+     |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ method `PendingProjectFixture::bind` is reachable at visibility `pub(crate)`
+     |
+note: but type `collaboration_cli::Failure` is only usable at visibility `pub(self)`
+    --> crates/aethyme-broker/src/collaboration_cli.rs:241:1
+     |
+ 241 | struct Failure {
+     | ^^^^^^^^^^^^^^
+     = note: `#[warn(private_interfaces)]` on by default
+
+warning: fields `host` and `anchor_commit` are never read
+   --> crates/aethyme-broker/src/collaboration_cli/project.rs:955:20
+    |
+953 |     pub(crate) struct PendingProjectFixture {
+    |                       --------------------- fields in this struct
+954 |         pub(crate) repo: tempfile::TempDir,
+955 |         pub(crate) host: tempfile::TempDir,
+    |                    ^^^^
+...
+958 |         pub(crate) anchor_commit: CommitOid,
+    |                    ^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `aethyme-broker` (lib test) generated 2 warnings
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 33.30s
+     Running unittests src/lib.rs (target/debug/deps/aethyme_broker-0f278e0d02146111)
+
+running 18 tests
+test composer::revision_tests::bound_recipe_order_carries_the_exact_immutable_revision_id ... ok
+test composer::revision_tests::one_revision_cannot_be_pinned_to_two_contributions ... ok
+test composer::revision_tests::revision_binding_map_is_exact_for_every_delivery ... ok
+test composer::revision_tests::unbound_recipe_order_keeps_the_legacy_shape ... ok
+test local_exchange::manager::revision_tests::empty_or_out_of_scope_packet_paths_are_not_visible_to_path_scope ... ok
+test local_exchange::manager::revision_tests::received_unindexed_revision_keeps_its_source_and_transitive_proof_after_capture_release ... ok
+test local_exchange::revision_tests::complete_event_wire_size_is_preflighted_under_the_generic_record_cap ... ok
+test local_exchange::revision_tests::legacy_exchange_packet_keeps_the_original_size_profile ... ok
+test local_exchange::revision_tests::revision_exchange_binds_exact_records_and_preserves_advisory_role ... ok
+test local_exchange::revision_tests::revision_exchange_refuses_mismatched_project_lineage_source_and_digest ... ok
+test local_exchange::revision_tests::revision_exchange_rejects_incomplete_brief_and_oversized_hex_before_decode ... ok
+test local_exchange::revision_tests::revision_hex_chunks_require_one_bounded_canonical_shape ... ok
+test local_exchange::revision_tests::small_revision_payloads_keep_the_legacy_inline_shape ... ok
+test local_exchange::revision_tests::snapshot_page_rejects_aggregate_revision_bytes_over_the_page_cap ... ok
+test local_target::revision_tests::released_d10_history_does_not_require_reclaimed_archive_objects ... ok
+test local_target::revision_tests::source_bound_dependency_pin_must_match_the_selected_target_edge ... ok
+test local_target::revision_tests::source_bound_rationale_revision_changes_the_immutable_target_identity ... ok
+test local_target::revision_tests::source_bound_same_operation_replays_but_independent_same_pair_proposals_conflict ... ok
+
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 1936 filtered out; finished in 46.61s
+

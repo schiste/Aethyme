@@ -1,0 +1,68 @@
+   Compiling aethyme-engine v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/complete-exact-immutable-contribution-co/packages/aethyme/rust/crates/aethyme-engine)
+   Compiling aethyme-broker v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/complete-exact-immutable-contribution-co/packages/aethyme/rust/crates/aethyme-broker)
+warning: type `collaboration_cli::Failure` is more private than the item `PendingProjectFixture::bind`
+    --> crates/aethyme-broker/src/collaboration_cli/project.rs:1029:9
+     |
+1029 |         pub(crate) fn bind(&self, record_id: &str) -> Result<super::Output, super::Failure> {
+     |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ method `PendingProjectFixture::bind` is reachable at visibility `pub(crate)`
+     |
+note: but type `collaboration_cli::Failure` is only usable at visibility `pub(self)`
+    --> crates/aethyme-broker/src/collaboration_cli.rs:241:1
+     |
+ 241 | struct Failure {
+     | ^^^^^^^^^^^^^^
+     = note: `#[warn(private_interfaces)]` on by default
+
+warning: fields `host` and `anchor_commit` are never read
+   --> crates/aethyme-broker/src/collaboration_cli/project.rs:955:20
+    |
+953 |     pub(crate) struct PendingProjectFixture {
+    |                       --------------------- fields in this struct
+954 |         pub(crate) repo: tempfile::TempDir,
+955 |         pub(crate) host: tempfile::TempDir,
+    |                    ^^^^
+...
+958 |         pub(crate) anchor_commit: CommitOid,
+    |                    ^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: field `revision_ids` is never read
+  --> crates/aethyme-broker/src/local_target/revision.rs:61:9
+   |
+59 | pub(super) struct LoadedD10Bindings {
+   |                   ----------------- field in this struct
+60 |     pub bindings: D10RevisionBindings,
+61 |     pub revision_ids: BTreeMap<String, RecordId>,
+   |         ^^^^^^^^^^^^
+   |
+   = note: `LoadedD10Bindings` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+
+warning: `aethyme-broker` (lib test) generated 3 warnings
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 33.50s
+     Running unittests src/lib.rs (target/debug/deps/aethyme_broker-0f278e0d02146111)
+
+running 8 tests
+test collaboration_cli::project::binding_tests::a_committed_tampered_descriptor_pointer_is_refused ... ok
+test collaboration_cli::project::binding_tests::a_corrupt_bootstrap_transition_is_a_typed_binding_refusal ... 
+thread 'collaboration_cli::project::binding_tests::a_corrupt_bootstrap_transition_is_a_typed_binding_refusal' (16266299) panicked at crates/aethyme-broker/src/collaboration_cli/project.rs:1518:9:
+assertion `left == right` failed
+  left: 1
+ right: 3
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+test collaboration_cli::project::binding_tests::an_uncommitted_descriptor_pointer_does_not_authorize_binding ... ok
+test collaboration_cli::project::binding_tests::approved_binding_survives_pointer_removal_and_conflicting_rebind_refuses ... ok
+test collaboration_cli::project::binding_tests::enrollment_refuses_over_profile_file_count_before_writing_descriptor ... ok
+test collaboration_cli::project::binding_tests::exact_binding_confirmation_is_idempotent ... ok
+test collaboration_cli::project::binding_tests::malformed_confirmation_is_usage_and_never_creates_approval ... ok
+test collaboration_cli::project::binding_tests::mismatched_descriptor_confirmation_is_refused_without_approval ... ok
+
+failures:
+
+failures:
+    collaboration_cli::project::binding_tests::a_corrupt_bootstrap_transition_is_a_typed_binding_refusal
+
+test result: FAILED. 7 passed; 1 failed; 0 ignored; 0 measured; 1943 filtered out; finished in 5.49s
+
+error: test failed, to rerun pass `-p aethyme-broker --lib`
