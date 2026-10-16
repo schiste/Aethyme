@@ -1,0 +1,40 @@
+import datetime, fcntl, hashlib, json, os, pathlib, re, signal, subprocess, tempfile, time
+ROOT=pathlib.Path('/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/682-reconcile-final-local-qualification')
+TARGET=pathlib.Path('/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/integrate-reviewed-local-bare-git-servic/target/local-resume/cargo')
+GIT='/opt/homebrew/bin/git';SOURCE=ROOT/'packages/aethyme/rust/crates/aethyme-broker/src/collaboration_capture.rs';TEST=ROOT/'packages/aethyme/rust/crates/aethyme-broker/tests/capture_revision_replay.rs';LIB=ROOT/'packages/aethyme/rust/crates/aethyme-broker/src/lib.rs'
+MANIFEST=pathlib.Path('/private/tmp/t04-replay-controls-v2.json');assert hashlib.sha256(MANIFEST.read_bytes()).hexdigest()=='0191c9e6de4fd11eed8cca0cc72ee81ac5b01a2b09c5e8872fa2ecd8d8078d28';PLAN=json.loads(MANIFEST.read_text())
+def git(*args):return subprocess.check_output([GIT,*args],cwd=ROOT,text=True).strip()
+assert git('status','--porcelain=v1')=='';HEAD=git('rev-parse','HEAD');TREE=git('rev-parse','HEAD^{tree}');ORIGINAL=SOURCE.read_bytes();assert hashlib.sha256(ORIGINAL).hexdigest()==PLAN['production_source_sha256'];assert hashlib.sha256(TEST.read_bytes()).hexdigest()==PLAN['test_sha256']
+lock=(TARGET/'.aethyme-final-local-validation.lock').open('a+');fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+ps=subprocess.check_output(['/bin/ps','-A','-o','pid=,comm='],text=True);compilers={'cargo','rustc','rustdoc','clippy-driver','cargo-clippy','cargo-nextest'};active=[line for line in ps.splitlines() if line.strip() and pathlib.Path(line.strip().split(None,1)[1]).name in compilers];assert not active,active
+stamp=datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%SZ');OUT=ROOT/'target/local-resume/t04-qualified'/f'{stamp}-{HEAD[:12]}';OUT.mkdir(parents=True,exist_ok=False)
+env={'HOME':'/Users/christophehenner','CARGO_HOME':'/Users/christophehenner/.cargo','RUSTUP_HOME':'/Users/christophehenner/.rustup','LANG':'en_US.UTF-8','LC_ALL':'en_US.UTF-8','PATH':'/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/christophehenner/.cargo/bin','RUSTC_WRAPPER':'','CARGO_BUILD_JOBS':'4','CARGO_TARGET_DIR':str(TARGET),'GIT_CONFIG_GLOBAL':'/dev/null','GIT_CONFIG_SYSTEM':'/dev/null','GIT_CONFIG_NOSYSTEM':'1','GIT_ATTR_NOSYSTEM':'1'}
+state={'head':HEAD,'tree':TREE,'plan':PLAN,'manifest_sha256':hashlib.sha256(MANIFEST.read_bytes()).hexdigest(),'environment':env,'runs':[],'preflight_active_compilers':active,'complete':False}
+def save(): (OUT/'batch.json').write_text(json.dumps(state,indent=2)+'\n')
+def run(label,selection=None,mutant=False):
+ LIB.touch(); before=set((OUT/'runs').glob('*/command.json')) if (OUT/'runs').exists() else set();argv=['cargo','test','--locked','-j4','-p','aethyme-broker','--test','capture_revision_replay']
+ if selection:argv += [selection,'--','--exact','--nocapture']
+ else:argv += ['--','--nocapture']
+ argv=['/usr/bin/env','GIT_CONFIG_GLOBAL=/dev/null','GIT_CONFIG_SYSTEM=/dev/null','GIT_CONFIG_NOSYSTEM=1','GIT_ATTR_NOSYSTEM=1']+argv
+ command=['/usr/bin/python3',str(ROOT/'target/local-resume/record-final-local-check-v2.py'),'--root',str(ROOT),'--label',label,'--cwd','packages/aethyme/rust','--output-root',str(OUT/'runs'),'--tmp-base','/private/tmp','--']+argv
+ completed=subprocess.run(command,cwd=ROOT,env=env,check=False);new=set((OUT/'runs').glob('*/command.json'))-before;assert len(new)==1;metadata_path=new.pop();metadata=json.loads(metadata_path.read_text());log=(metadata_path.parent/'command.log').read_text(errors='replace');expected=101 if mutant else 0
+ row={'label':label,'metadata':str(metadata_path),'recorder_exit':completed.returncode,'numeric_exit':metadata['numeric_exit'],'source_unchanged':metadata['source_unchanged'],'mutant':mutant};state['runs'].append(row);save();assert completed.returncode==expected and metadata['numeric_exit']==expected;assert metadata['source_unchanged'];assert metadata['source_before']['head']==HEAD and metadata['source_after']['head']==HEAD
+ if mutant:
+  assert '0 passed; 1 failed;' in log and 'Result::unwrap_err()' in log and 'Acknowledged' in log and selection in log,'require one intended assertion failure'
+ else:assert '2 passed; 0 failed;' in log,'require exactly both positive cases'
+ print(json.dumps(row),flush=True)
+ return row
+save();print(json.dumps({'output':str(OUT),'source_head':HEAD}),flush=True)
+run('t04-positive-'+HEAD[:12])
+for control in PLAN['controls']:
+ assert git('status','--porcelain=v1')=='' and SOURCE.read_bytes()==ORIGINAL
+ patch=pathlib.Path(control['patch']);assert hashlib.sha256(patch.read_bytes()).hexdigest()==control['patch_sha256'];subprocess.run([GIT,'apply','--check',str(patch)],cwd=ROOT,check=True)
+ fd,backup_name=tempfile.mkstemp(prefix='t04-pristine-'+control['guard']+'-',dir='/private/tmp');backup=pathlib.Path(backup_name)
+ with os.fdopen(fd,'wb') as f:f.write(ORIGINAL);f.flush();os.fsync(f.fileno())
+ restore={'guard':control['guard'],'backup':str(backup),'before_sha256':hashlib.sha256(ORIGINAL).hexdigest(),'before_mtime_ns':SOURCE.stat().st_mtime_ns}
+ try:
+  subprocess.run([GIT,'apply',str(patch)],cwd=ROOT,check=True);restore['mutant_sha256']=hashlib.sha256(SOURCE.read_bytes()).hexdigest();assert SOURCE.read_bytes()!=ORIGINAL
+  run('t04-mutant-'+control['guard'],control['test'],True)
+ finally:
+  SOURCE.write_bytes(backup.read_bytes());os.utime(SOURCE,None);LIB.touch();restore['after_sha256']=hashlib.sha256(SOURCE.read_bytes()).hexdigest();restore['after_mtime_ns']=SOURCE.stat().st_mtime_ns;restore['clean_status']=git('status','--porcelain=v1');restore['exact_restored']=SOURCE.read_bytes()==ORIGINAL and not restore['clean_status'];(OUT/(control['guard']+'-restore.json')).write_text(json.dumps(restore,indent=2)+'\n');assert restore['exact_restored'];assert restore['after_mtime_ns']>restore['before_mtime_ns']
+run('t04-restored-positive-'+HEAD[:12]);assert git('rev-parse','HEAD')==HEAD and git('status','--porcelain=v1')=='';state['complete']=True;save();print(json.dumps({'complete':True,'output':str(OUT)}),flush=True)

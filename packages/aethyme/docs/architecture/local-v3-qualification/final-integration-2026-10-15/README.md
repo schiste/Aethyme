@@ -196,3 +196,27 @@ local summary links with zero errors. Both outputs and scripts are preserved.
 This is evidence-integrity verification; the fresh T64 operator rehearsal remains
 unrun. The frozen validation plan and recording helpers are retained separately
 as provenance, without claiming their future results.
+
+## Immutable capture revision replay
+
+At clean source `9a15fd24f437256f9ac33700a88ee856d108db65` (tree
+`3bd92184ab06f84777a763df2189c14807a6cddd`), both T04 integration tests
+passed. They create actual Git commits and change only the immutable base or
+result revision while retaining the original logical operation ID. Each alternate
+pair is valid under its own operation ID; replay under the original ID must
+refuse and leave its acknowledged receipt unchanged, including after reopening.
+
+Removing the base revision from the request digest made the base-only test fail
+at its intended refusal assertion (exit 101; one failed test). Removing the
+result revision caused the corresponding result-only assertion to fail the same
+way. Neither control failed compilation or selected zero tests. Each production
+mutation was restored from a separate pristine backup and its original SHA-256
+verified. Both positive tests then passed again on the same clean source. These
+are two distinct positive cases executed twice, with two negative controls.
+
+The appended ledger preserves all four recorder triplets, the original batch
+record, both restoration witnesses, reviewed runner and control manifest, exact
+patches and test proposal. Git global/system configuration and attributes are
+isolated for both fixture creation and product calls. This closes the previously
+missing T04 changed-base/result replay oracle; it does not qualify the remaining
+project-binding, file-lineage or rationale-revision work, or the fresh T64 run.

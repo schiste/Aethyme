@@ -1,0 +1,85 @@
+{
+  "head": "9a15fd24f437256f9ac33700a88ee856d108db65",
+  "tree": "3bd92184ab06f84777a763df2189c14807a6cddd",
+  "plan": {
+    "source_head": "f30ed703ed855fb8edf66b2dccb08765c9a3b23e",
+    "test_proposal": "/private/tmp/capture_revision_replay-v2.rs",
+    "test_sha256": "7748070d3cda443ab28d28a4a8873160aed376d44e0b567d14ce723c2ad2bd5a",
+    "production_source_sha256": "b6207871391cf8421c32a6a3f932b9950bd0ce950efffd644b784e1edcd31ff6",
+    "controls": [
+      {
+        "guard": "base-in-request-digest",
+        "patch": "/private/tmp/t04-replay-controls-v1/base.patch",
+        "patch_sha256": "08aaf526676ad652a76ea93f9875a3f72567de95de624fbcbc4f16e52c58a055",
+        "test": "changing_only_the_base_revision_cannot_overwrite_an_operation_receipt",
+        "expected": "one selected test fails at intended conflicting_operation assertion (unwrap_err on acknowledged receipt); compile failures and zero tests uncredited",
+        "restore": "unique mktemp pristine backup and trap/finally restore; compare original source SHA and clean git diff; touch crate lib mtime before rebuilt run; restored two positive cases pass"
+      },
+      {
+        "guard": "result-in-request-digest",
+        "patch": "/private/tmp/t04-replay-controls-v1/result.patch",
+        "patch_sha256": "7cccede77e98ffcfc5248bf23018dba9510d8dc66e7b07b84007f8faa1e0648d",
+        "test": "changing_only_the_result_revision_cannot_overwrite_an_operation_receipt",
+        "expected": "one selected test fails at intended conflicting_operation assertion (unwrap_err on acknowledged receipt); compile failures and zero tests uncredited",
+        "restore": "unique mktemp pristine backup and trap/finally restore; compare original source SHA and clean git diff; touch crate lib mtime before rebuilt run; restored two positive cases pass"
+      }
+    ],
+    "runtime": "Author1130explicitlyreleasedCargo/native;root1122willrunonlyafterthisexactv2staticreviewandcleancommittedsource.",
+    "supersedes_test_for_future_runs_only": {
+      "path": "/private/tmp/capture_revision_replay.rs",
+      "sha256": "5cf7b8ca388563e5e165441aec38c697fcf25e519f52ec6f65915ab0c9afad70"
+    }
+  },
+  "manifest_sha256": "0191c9e6de4fd11eed8cca0cc72ee81ac5b01a2b09c5e8872fa2ecd8d8078d28",
+  "environment": {
+    "HOME": "/Users/christophehenner",
+    "CARGO_HOME": "/Users/christophehenner/.cargo",
+    "RUSTUP_HOME": "/Users/christophehenner/.rustup",
+    "LANG": "en_US.UTF-8",
+    "LC_ALL": "en_US.UTF-8",
+    "PATH": "/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/christophehenner/.cargo/bin",
+    "RUSTC_WRAPPER": "",
+    "CARGO_BUILD_JOBS": "4",
+    "CARGO_TARGET_DIR": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/integrate-reviewed-local-bare-git-servic/target/local-resume/cargo",
+    "GIT_CONFIG_GLOBAL": "/dev/null",
+    "GIT_CONFIG_SYSTEM": "/dev/null",
+    "GIT_CONFIG_NOSYSTEM": "1",
+    "GIT_ATTR_NOSYSTEM": "1"
+  },
+  "runs": [
+    {
+      "label": "t04-positive-9a15fd24f437",
+      "metadata": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/682-reconcile-final-local-qualification/target/local-resume/t04-qualified/20261016T002421Z-9a15fd24f437/runs/20261016T002421Z-t04-positive-9a15fd24f437-2d17362c/command.json",
+      "recorder_exit": 0,
+      "numeric_exit": 0,
+      "source_unchanged": true,
+      "mutant": false
+    },
+    {
+      "label": "t04-mutant-base-in-request-digest",
+      "metadata": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/682-reconcile-final-local-qualification/target/local-resume/t04-qualified/20261016T002421Z-9a15fd24f437/runs/20261016T002449Z-t04-mutant-base-in-request-digest-00b02efa/command.json",
+      "recorder_exit": 101,
+      "numeric_exit": 101,
+      "source_unchanged": true,
+      "mutant": true
+    },
+    {
+      "label": "t04-mutant-result-in-request-digest",
+      "metadata": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/682-reconcile-final-local-qualification/target/local-resume/t04-qualified/20261016T002421Z-9a15fd24f437/runs/20261016T002511Z-t04-mutant-result-in-request-digest-cde5ab8b/command.json",
+      "recorder_exit": 101,
+      "numeric_exit": 101,
+      "source_unchanged": true,
+      "mutant": true
+    },
+    {
+      "label": "t04-restored-positive-9a15fd24f437",
+      "metadata": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/682-reconcile-final-local-qualification/target/local-resume/t04-qualified/20261016T002421Z-9a15fd24f437/runs/20261016T002535Z-t04-restored-positive-9a15fd24f437-4bd5ef9a/command.json",
+      "recorder_exit": 0,
+      "numeric_exit": 0,
+      "source_unchanged": true,
+      "mutant": false
+    }
+  ],
+  "preflight_active_compilers": [],
+  "complete": true
+}
