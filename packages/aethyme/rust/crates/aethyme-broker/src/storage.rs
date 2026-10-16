@@ -1952,8 +1952,7 @@ fn preparation_cache_repository_identity(name: &str) -> Option<(&str, bool)> {
     let (timestamp_text, process_id_text) = retired_suffix.split_once('-')?;
     let timestamp = timestamp_text.parse::<u128>().ok()?;
     let process_id = process_id_text.parse::<u32>().ok()?;
-    if timestamp == 0
-        || process_id == 0
+    if process_id == 0
         || timestamp.to_string() != timestamp_text
         || process_id.to_string() != process_id_text
     {
@@ -3777,6 +3776,36 @@ mod tests {
         assert_eq!(removed, 1);
         assert_eq!(bytes, b"retired store".len() as u64);
         assert!(!retired_path.exists());
+    }
+
+    #[test]
+    fn retired_preparation_store_names_match_the_writer_suffix_exactly() {
+        let retired_zero_timestamp = format!("{TEST_PREPARATION_REPOSITORY}.retired-0-42");
+        assert_eq!(
+            preparation_cache_repository_identity(TEST_PREPARATION_REPOSITORY),
+            Some((TEST_PREPARATION_REPOSITORY, false))
+        );
+        assert_eq!(
+            preparation_cache_repository_identity(&retired_zero_timestamp),
+            Some((TEST_PREPARATION_REPOSITORY, true))
+        );
+
+        for invalid_name in [
+            format!("{TEST_PREPARATION_REPOSITORY}.retired-01-42"),
+            format!("{TEST_PREPARATION_REPOSITORY}.retired-1-0"),
+            format!("{TEST_PREPARATION_REPOSITORY}.retired-1-42x"),
+            format!("{TEST_PREPARATION_REPOSITORY}.retired-1-42-extra"),
+            format!(
+                "{}.retired-1-42",
+                TEST_PREPARATION_REPOSITORY.to_uppercase()
+            ),
+        ] {
+            assert_eq!(
+                preparation_cache_repository_identity(&invalid_name),
+                None,
+                "unexpectedly accepted {invalid_name}"
+            );
+        }
     }
 
     /// A checkout that still computes a key keeps its entry, and only that
