@@ -23,7 +23,8 @@ use crate::{
 
 mod tree_removal;
 pub(crate) use tree_removal::{
-    PinnedTreeRemoval, TreeObjectIdentity, TreeRemoval, remove_condemned_tree,
+    PinnedTreeRemoval, TreeObjectIdentity, TreeRemoval, TreeRemovalError, remove_condemned_tree,
+    remove_condemned_tree_with_progress,
 };
 
 pub const GC_PLAN_SCHEMA_VERSION: u32 = 2;
@@ -6224,22 +6225,20 @@ mod tests {
     }
 
     #[test]
-    fn a_directory_refilled_while_it_was_being_emptied_is_swept_again() {
+    fn pinned_removal_handles_nested_trees_and_missing_leaves() {
         let tmp = tempfile::tempdir().unwrap();
         let nested = dir(tmp.path(), "target/debug");
         std::fs::write(nested.join(".DS_Store"), "finder\n").unwrap();
 
-        // Finder writes into directories as they are walked, so a directory
-        // can gain a file after the removal already emptied it. Reporting
-        // that as an error is what aborted the run; it is left for the retry
-        // that follows to collect.
-        assert!(remove_entry_with_progress(&nested, true, &mut 0).is_ok());
-        assert!(nested.exists());
-        assert!(
-            remove_entry_with_progress(&tmp.path().join("target/absent"), false, &mut 0).is_ok()
+        assert_eq!(
+            remove_condemned_tree(&nested, None, None).unwrap(),
+            TreeRemoval::Complete
         );
-
-        // The retry is what actually finishes it.
+        assert!(!nested.exists());
+        assert_eq!(
+            remove_condemned_tree(&tmp.path().join("target/absent"), None, None).unwrap(),
+            TreeRemoval::Complete
+        );
         assert_eq!(
             remove_condemned_tree(&tmp.path().join("target"), None, None).unwrap(),
             TreeRemoval::Complete
