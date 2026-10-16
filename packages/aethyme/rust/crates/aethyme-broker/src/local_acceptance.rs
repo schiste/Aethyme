@@ -276,7 +276,7 @@ struct HistoricalQualificationSpec {
 struct HistoricalEvidenceBody {
     verification: String,
     producer: String,
-    generation: i64,
+    generation: String,
     epoch: String,
     revision: String,
     execution: String,

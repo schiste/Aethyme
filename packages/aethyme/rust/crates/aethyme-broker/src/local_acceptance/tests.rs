@@ -766,6 +766,25 @@ fn historical_completion_roots_survive_revision_release_and_gc() {
         last_receipt(&v.f.store, binding.id()).unwrap().unwrap().id,
         receipt.id
     );
+    let (generation_column, evidence_body): (i64, Vec<u8>) = v
+        .f
+        .store
+        .read_connection()
+        .query_row(
+            "SELECT generation,body FROM local_verification_evidence WHERE id=(SELECT evidence FROM local_acceptance_qualifications WHERE id=?1)",
+            [&historical.qualification],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    let evidence_json: serde_json::Value = serde_json::from_slice(&evidence_body).unwrap();
+    let body_generation = evidence_json["observation"]["generation"]
+        .as_str()
+        .expect("the evidence producer stores generation as a decimal string");
+    assert_eq!(
+        body_generation.parse::<i64>().unwrap(),
+        generation_column,
+        "the serialized producer generation agrees with the integer journal column"
+    );
     verify_historical_completion(&v.f.store, &historical).unwrap();
 
     let mut wrong_completion = historical.clone();
