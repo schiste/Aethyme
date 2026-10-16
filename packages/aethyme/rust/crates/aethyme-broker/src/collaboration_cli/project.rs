@@ -353,7 +353,7 @@ fn bind_with_root(
     }
     if let Some(existing) =
         identity_store::resolve_approved_project_binding_with_archive_use(&store, &archive_use)
-            .map_err(|error| Failure::domain(error.code(), error.to_string()))?
+            .map_err(identity_binding_failure)?
     {
         if existing.project_id() != descriptor.project_id()
             || existing.descriptor_record_id() != &actual_record_id
@@ -419,11 +419,25 @@ fn bind_with_root(
     )?;
     let binding =
         identity_store::resolve_approved_project_binding_with_archive_use(&store, &archive_use)
-            .map_err(|error| Failure::domain(error.code(), error.to_string()))?
+            .map_err(identity_binding_failure)?
             .ok_or_else(|| {
                 Failure::domain("identity_store", "binding row was not committed".into())
             })?;
     Ok(binding_output(&project_key, &binding, result))
+}
+
+fn identity_binding_failure(error: identity_store::IdentityStoreError) -> Failure {
+    let code = error.code();
+    let message = error.to_string();
+    if matches!(error, identity_store::IdentityStoreError::Corrupt(_)) {
+        Failure::refused(
+            code,
+            message,
+            "repair or restore the local project identity record before binding",
+        )
+    } else {
+        Failure::domain(code, message)
+    }
 }
 
 fn binding_output(
@@ -952,10 +966,9 @@ pub(crate) mod test_support {
     /// manufacturing an approved row.
     pub(crate) struct PendingProjectFixture {
         pub(crate) repo: tempfile::TempDir,
-        pub(crate) host: tempfile::TempDir,
+        _host: tempfile::TempDir,
         pub(crate) store: CollaborationStore,
         pub(crate) root: CollaborationRoot,
-        pub(crate) anchor_commit: CommitOid,
         pub(crate) descriptor_record_id: String,
     }
 
@@ -998,10 +1011,9 @@ pub(crate) mod test_support {
                 .to_string();
             Ok(Self {
                 repo,
-                host,
+                _host: host,
                 store,
                 root,
-                anchor_commit,
                 descriptor_record_id,
             })
         }
@@ -1026,14 +1038,24 @@ pub(crate) mod test_support {
             archive::pin_commit(self.repo.path(), "HEAD").map_err(|error| error.to_string())
         }
 
-        pub(crate) fn bind(&self, record_id: &str) -> Result<super::Output, super::Failure> {
+        pub(crate) fn bind(&self, record_id: &str) -> Result<(), FixtureFailure> {
             bind_at_root(
                 self.repo.path(),
                 self.repo.path(),
                 &["--confirm", record_id],
                 &self.root,
             )
+            .map(|_| ())
+            .map_err(|failure| FixtureFailure {
+                code: failure.code,
+                exit: failure.exit,
+            })
         }
+    }
+
+    pub(crate) struct FixtureFailure {
+        pub(crate) code: String,
+        pub(crate) exit: u8,
     }
 
     /// A real local enrollment/binding fixture. It drives the same `enroll`
