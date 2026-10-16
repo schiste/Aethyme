@@ -1990,7 +1990,7 @@ fn retired_preparation_store_layout(path: &Path, deadline: Option<std::time::Ins
             return false;
         }
     }
-    !deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline)
+    deadline.is_none_or(|deadline| std::time::Instant::now() < deadline)
 }
 
 /// Remove one dead cache entry, re-deciding at the moment of removal.
