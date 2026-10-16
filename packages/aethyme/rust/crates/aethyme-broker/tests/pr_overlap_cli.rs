@@ -6,6 +6,8 @@
 //! files the test writes. Nothing reaches GitHub.
 #![cfg(unix)]
 
+mod common;
+
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -201,9 +203,20 @@ impl Fixture {
     }
 
     fn broker(&self) -> Broker {
-        Broker::open(&self.repo)
+        self.broker_with_root().0
+    }
+
+    fn broker_with_root(&self) -> (Broker, PathBuf) {
+        let broker = Broker::open(&self.repo)
             .unwrap()
-            .with_host_operation_database(self.tmp.path().join("host-state/operations.db"))
+            .with_host_operation_database(self.tmp.path().join("host-state/operations.db"));
+        let repository_key = broker.worktree_root_plan().unwrap().repository_key;
+        let root = self
+            .tmp
+            .path()
+            .join("host-state/worktrees")
+            .join(repository_key);
+        (broker.with_worktree_root(root.clone()), root)
     }
 
     /// A live session whose one commit edits `shared.txt` as given.
@@ -216,8 +229,7 @@ impl Fixture {
     }
 
     fn run(&self, args: &[&str]) -> Output {
-        Command::new(CLI)
-            .args(args)
+        common::broker_cli(CLI, args)
             .current_dir(&self.repo)
             .env(
                 "PATH",
@@ -264,6 +276,84 @@ fn json(output: &Output) -> serde_json::Value {
         String::from_utf8_lossy(&output.stdout)
     );
     serde_json::from_slice(&output.stdout).unwrap()
+}
+
+#[test]
+fn inherited_worktree_root_cannot_redirect_fixture_direct_and_cli_worktrees() {
+    const REPORT_ENV: &str = "AETHYME_TEST_POISONED_WORKTREE_REPORT";
+
+    if let Some(report_path) = std::env::var_os(REPORT_ENV) {
+        let poison_root = PathBuf::from(
+            std::env::var_os("AETHYME_WORKTREE_ROOT")
+                .expect("the child test process must inherit a poisoned root"),
+        );
+        let fixture = Fixture::new();
+        let (mut broker, owned_root) = fixture.broker_with_root();
+        let direct = broker
+            .start_worktree("direct fixture worktree", None)
+            .unwrap();
+        let direct_path = PathBuf::from(direct.worktree_path);
+
+        let cli = json(&fixture.run(&["start", "--task", "CLI fixture worktree", "--json"]));
+        let cli_path = PathBuf::from(cli["worktree_path"].as_str().unwrap());
+        assert!(
+            !poison_root.exists(),
+            "the poisoned root must remain unused"
+        );
+        let canonical_owned_root = owned_root.canonicalize().unwrap();
+        let canonical_direct_path = direct_path.canonicalize().unwrap();
+        let canonical_cli_path = cli_path.canonicalize().unwrap();
+        assert!(canonical_direct_path.starts_with(&canonical_owned_root));
+        assert!(canonical_cli_path.starts_with(&canonical_owned_root));
+
+        drop(broker);
+        drop(fixture);
+        let report = serde_json::json!({
+            "owned_root": canonical_owned_root,
+            "direct_path": canonical_direct_path,
+            "cli_path": canonical_cli_path,
+            "direct_removed": !direct_path.exists(),
+            "cli_removed": !cli_path.exists(),
+            "poison_untouched": !poison_root.exists(),
+        });
+        std::fs::write(report_path, serde_json::to_vec(&report).unwrap()).unwrap();
+        return;
+    }
+
+    let parent = tempfile::tempdir().unwrap();
+    let poison_root = parent.path().join("poisoned-worktrees");
+    let report_path = parent.path().join("result.json");
+    let host_state = parent.path().join("private-host-state");
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "inherited_worktree_root_cannot_redirect_fixture_direct_and_cli_worktrees",
+            "--nocapture",
+        ])
+        .env("AETHYME_WORKTREE_ROOT", &poison_root)
+        .env("AETHYME_HOST_STATE_DIR", host_state)
+        .env(REPORT_ENV, &report_path)
+        .env_remove("XDG_STATE_HOME")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "child test failed: {}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let report: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(report_path).unwrap()).unwrap();
+    let owned_root = PathBuf::from(report["owned_root"].as_str().unwrap());
+    let direct_path = PathBuf::from(report["direct_path"].as_str().unwrap());
+    let cli_path = PathBuf::from(report["cli_path"].as_str().unwrap());
+    assert!(direct_path.starts_with(&owned_root));
+    assert!(cli_path.starts_with(&owned_root));
+    assert!(report["direct_removed"].as_bool().unwrap());
+    assert!(report["cli_removed"].as_bool().unwrap());
+    assert!(report["poison_untouched"].as_bool().unwrap());
+    assert!(!poison_root.exists());
 }
 
 fn overlap_advice(status: &serde_json::Value) -> Vec<serde_json::Value> {
