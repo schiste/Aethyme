@@ -1189,13 +1189,105 @@
       "test_results": [],
       "credited_for_narrow_command_only": false,
       "raw_directory": "attempts/20261016T042800Z-merged-9328d987-format-check-07ce5a19"
+    },
+    {
+      "attempt": "20261016T043655Z-exchange-neuter-full-prefix-chunk-shape-f465192e",
+      "label": "exchange-neuter-full-prefix-chunk-shape",
+      "kind": "deliberate_guard_control",
+      "numeric_exit": 101,
+      "source_unchanged": true,
+      "source": {
+        "diff_sha256": "880bdad676666e7d669a5b167b4ae26db034d469054fc2d2fadbe92f50f7335e",
+        "head": "9502007dd97011a20b0c34c181ad49237409019e",
+        "status": " M packages/aethyme/rust/crates/aethyme-broker/src/local_exchange.rs\n",
+        "tree": "d2a590b3ab98bae87bd87a4f3d828ad6e5313353",
+        "untracked_content_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "test_results": [
+        {
+          "passed": 0,
+          "failed": 1,
+          "ignored": 0
+        }
+      ],
+      "credited_for_narrow_command_only": true,
+      "raw_directory": "attempts/20261016T043655Z-exchange-neuter-full-prefix-chunk-shape-f465192e"
+    },
+    {
+      "attempt": "20261016T043730Z-exchange-neuter-whole-envelope-preflight-800a707e",
+      "label": "exchange-neuter-whole-envelope-preflight",
+      "kind": "deliberate_guard_control",
+      "numeric_exit": 101,
+      "source_unchanged": true,
+      "source": {
+        "diff_sha256": "d5638efe9fd445dd5e539f9a12bc88cc185b5bd0fe442ba8490f854dae855466",
+        "head": "9502007dd97011a20b0c34c181ad49237409019e",
+        "status": " M packages/aethyme/rust/crates/aethyme-broker/src/local_exchange.rs\n",
+        "tree": "d2a590b3ab98bae87bd87a4f3d828ad6e5313353",
+        "untracked_content_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "test_results": [
+        {
+          "passed": 0,
+          "failed": 1,
+          "ignored": 0
+        }
+      ],
+      "credited_for_narrow_command_only": true,
+      "raw_directory": "attempts/20261016T043730Z-exchange-neuter-whole-envelope-preflight-800a707e"
+    },
+    {
+      "attempt": "20261016T043759Z-exchange-neuter-aggregate-page-byte-cap-713e0d7e",
+      "label": "exchange-neuter-aggregate-page-byte-cap",
+      "kind": "deliberate_guard_control",
+      "numeric_exit": 101,
+      "source_unchanged": true,
+      "source": {
+        "diff_sha256": "2d91e290ef9b7f431b040ad73eb3f455c7c92e6109dd0a9aa4ed550f2aade219",
+        "head": "9502007dd97011a20b0c34c181ad49237409019e",
+        "status": " M packages/aethyme/rust/crates/aethyme-broker/src/local_exchange.rs\n",
+        "tree": "d2a590b3ab98bae87bd87a4f3d828ad6e5313353",
+        "untracked_content_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "test_results": [
+        {
+          "passed": 0,
+          "failed": 1,
+          "ignored": 0
+        }
+      ],
+      "credited_for_narrow_command_only": true,
+      "raw_directory": "attempts/20261016T043759Z-exchange-neuter-aggregate-page-byte-cap-713e0d7e"
+    },
+    {
+      "attempt": "20261016T043920Z-merged-9502007d-exchange-restored-3f74462c",
+      "label": "merged-9502007d-exchange-restored",
+      "kind": "test_or_lint_attempt",
+      "numeric_exit": 0,
+      "source_unchanged": true,
+      "source": {
+        "diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "head": "9502007dd97011a20b0c34c181ad49237409019e",
+        "status": "",
+        "tree": "d2a590b3ab98bae87bd87a4f3d828ad6e5313353",
+        "untracked_content_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "test_results": [
+        {
+          "passed": 8,
+          "failed": 0,
+          "ignored": 0
+        }
+      ],
+      "credited_for_narrow_command_only": true,
+      "raw_directory": "attempts/20261016T043920Z-merged-9502007d-exchange-restored-3f74462c"
     }
   ],
   "files": [
     {
       "path": "README.md",
-      "bytes": 7329,
-      "sha256": "c178ec6d4343420df53a647667c95b91c5fb2cb846acec2fbefeae3f652232ef"
+      "bytes": 7961,
+      "sha256": "db78678e5db747aa1fae5a4add39826526b10546cd1dec78b43b3ed0a81962e6"
     },
     {
       "path": "attempts/20261016T031107Z-exact-revision-context-positive-b3d71f92-1a5e87d4/command.json",
@@ -1978,6 +2070,66 @@
       "sha256": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa"
     },
     {
+      "path": "attempts/20261016T043655Z-exchange-neuter-full-prefix-chunk-shape-f465192e/command.json",
+      "bytes": 4095,
+      "sha256": "b390ab97c0021665caa1b511b2bc07c62bf11a599ac021c8fcf81389f66df415"
+    },
+    {
+      "path": "attempts/20261016T043655Z-exchange-neuter-full-prefix-chunk-shape-f465192e/command.log",
+      "bytes": 2731,
+      "sha256": "7fd7b7e41e3d36bb98aea5ff222c3c28a415ce36b9196b1b2ad78ec9efa8e6c6"
+    },
+    {
+      "path": "attempts/20261016T043655Z-exchange-neuter-full-prefix-chunk-shape-f465192e/command.status",
+      "bytes": 4,
+      "sha256": "39b8dc3fc8b44765c8e6f1adee04c5b465e555ab791cc42d0d9e810d5b64297c"
+    },
+    {
+      "path": "attempts/20261016T043730Z-exchange-neuter-whole-envelope-preflight-800a707e/command.json",
+      "bytes": 4113,
+      "sha256": "2c41a672dfc5f67b4904df9925665abc09bba8edaa76a061a87a7a06b24f5aae"
+    },
+    {
+      "path": "attempts/20261016T043730Z-exchange-neuter-whole-envelope-preflight-800a707e/command.log",
+      "bytes": 2547,
+      "sha256": "3448bf8e3cd1b8cd4940cd292df8d621f9661d1da60db73e02af1b9996f925a9"
+    },
+    {
+      "path": "attempts/20261016T043730Z-exchange-neuter-whole-envelope-preflight-800a707e/command.status",
+      "bytes": 4,
+      "sha256": "39b8dc3fc8b44765c8e6f1adee04c5b465e555ab791cc42d0d9e810d5b64297c"
+    },
+    {
+      "path": "attempts/20261016T043759Z-exchange-neuter-aggregate-page-byte-cap-713e0d7e/command.json",
+      "bytes": 4104,
+      "sha256": "d3d930009f5fee43fdb88bfb8b4fa2507a3191b652f6d509c57db1ad3bff609e"
+    },
+    {
+      "path": "attempts/20261016T043759Z-exchange-neuter-aggregate-page-byte-cap-713e0d7e/command.log",
+      "bytes": 2494,
+      "sha256": "33f6ab86e048385f61721e5da11d23cd535b9d6567be0936977535b7952592f8"
+    },
+    {
+      "path": "attempts/20261016T043759Z-exchange-neuter-aggregate-page-byte-cap-713e0d7e/command.status",
+      "bytes": 4,
+      "sha256": "39b8dc3fc8b44765c8e6f1adee04c5b465e555ab791cc42d0d9e810d5b64297c"
+    },
+    {
+      "path": "attempts/20261016T043920Z-merged-9502007d-exchange-restored-3f74462c/command.json",
+      "bytes": 3851,
+      "sha256": "1123491c15d0dd996fc4a37662989c3b9ede0cbf62319e1a7808cd87d4b36c78"
+    },
+    {
+      "path": "attempts/20261016T043920Z-merged-9502007d-exchange-restored-3f74462c/command.log",
+      "bytes": 2692,
+      "sha256": "d4f0cba5bf14f19ae557dc0e02f4c25e6559669c1703922c949ccb24bb0dc406"
+    },
+    {
+      "path": "attempts/20261016T043920Z-merged-9502007d-exchange-restored-3f74462c/command.status",
+      "bytes": 2,
+      "sha256": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa"
+    },
+    {
       "path": "ci-attempts/local-current-pr-status-20261016T0400.json",
       "bytes": 9654,
       "sha256": "ea45af34ff3ca39cc322e2331b73c39add263f20a0ecfe88864ce098084948fc"
@@ -2191,6 +2343,56 @@
       "path": "control-sources/exact-revision-restored-driver.py",
       "bytes": 1467,
       "sha256": "a14ec468584586cb5e886330c72c35d01e4cb8852cee886d99f6dccc364350d1"
+    },
+    {
+      "path": "control-sources/exchange-control-backup/aggregate-page-byte-cap.stderr",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "control-sources/exchange-control-backup/aggregate-page-byte-cap.stdout",
+      "bytes": 1751,
+      "sha256": "f4b2fb02da131c6de4dae8030f427b672f36768e4398f50b9a16a8b21c4d917a"
+    },
+    {
+      "path": "control-sources/exchange-control-backup/full-prefix-chunk-shape.stderr",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "control-sources/exchange-control-backup/full-prefix-chunk-shape.stdout",
+      "bytes": 1751,
+      "sha256": "544e459fe094433aa6268d7788f899712dd6ef3dc0a289b5b5a816e075a410ee"
+    },
+    {
+      "path": "control-sources/exchange-control-backup/local_exchange.rs",
+      "bytes": 34330,
+      "sha256": "2c68461f785746c85d38b0c85019bb331143ba799b119c99dda7bd296bc72e8d"
+    },
+    {
+      "path": "control-sources/exchange-control-backup/source.json",
+      "bytes": 229,
+      "sha256": "2a3841a56573921be0481a68201f86d11c051880ab54b60ad2ddd82eff7bf53f"
+    },
+    {
+      "path": "control-sources/exchange-control-backup/summary.json",
+      "bytes": 3712,
+      "sha256": "fef5b4474b7aae58267420dc0bd5041ac7dc12763877c1d5ed715d14e92abc0c"
+    },
+    {
+      "path": "control-sources/exchange-control-backup/whole-envelope-preflight.stderr",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "control-sources/exchange-control-backup/whole-envelope-preflight.stdout",
+      "bytes": 1757,
+      "sha256": "8bc68890ae51c693b3b18d0849aea38cd153f63e9d91ac47ed023a86de5d01d0"
+    },
+    {
+      "path": "control-sources/exchange-guard-driver.py",
+      "bytes": 3646,
+      "sha256": "0a902508db4cde1ad617a94680c9db7eccf6c3b46fb87c4ecd4421dc6d28b8cb"
     },
     {
       "path": "control-sources/older-gc-control-backup/manifest-budget.stderr",

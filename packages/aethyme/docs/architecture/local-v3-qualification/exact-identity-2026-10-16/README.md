@@ -89,6 +89,15 @@ resolver’s typed corrupt-proof check. Exact bytes were restored from a unique
 backup; the restored seven-test context suite and replay-budget test passed.
 These runs contain the bridge’s existing unused-field warning.
 
+Three exchange controls on source `9502007d` separately removed the normalized
+nonfinal-chunk check, the complete-envelope counting limit, and the cumulative
+snapshot-page byte limit. Each ran one test and failed its intended assertion
+(exit 101, zero ignored). The envelope control establishes the early typed limit
+refusal; it does not measure peak allocation. The page fixture uses distinct valid
+packet IDs and reaches the aggregate byte boundary. The driver retained source
+and test hashes in a unique backup, restored exact source bytes, and the restored
+eight-test exchange suite passed with zero failures or ignored tests.
+
 ## Retained failures and uncredited selections
 
 - The first exact-context build failed before tests because of an undeclared
