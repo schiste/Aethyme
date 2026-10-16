@@ -1,0 +1,88 @@
+AQ0 additive runtime freeze at test-fixture commit
+
+Repository worktree: /Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/implement-experimental-d39-t66-scoped-sy
+Session/branch: 1130 / agent/implement-experimental-d39-t66-scoped-sy
+New HEAD: 1df98deb1654dbf2b198ed0c9b915896440faa51
+New tree: 575ca56e05539107a320c89deab3e0f801b21d42
+PR #786 remains OPEN+DRAFT; head branch pushed through broker.
+
+Frozen runtime source SHA-256:
+  packages/aethyme/rust/crates/aethyme-broker/src/experimental_symbol_mapping.rs
+  72cf7ea55fefa5779da822e11d3caf523766d2bada2a936bb762c41df6e29726
+Frozen integration test SHA-256:
+  packages/aethyme/rust/crates/aethyme-broker/tests/symbol_identity_binding.rs
+  10c21639b1a082a0a0f1f61804de33726733d198988d0e7278513b0659256ed5
+Frozen vector test SHA-256:
+  packages/aethyme/rust/crates/aethyme-contracts/tests/symbol_identity_vectors.rs
+  9687b83f484ae1ce570b742f9e986a810c15a13837aea804ff8a17d80be573bc
+Frozen analysis test SHA-256:
+  packages/aethyme/rust/crates/aethyme-contracts/tests/analysis_vectors.rs
+  6cfa9330c42a727102f3d2c1852add92c47f9ee9cb3ef77974fb309e2bf300f7
+Independent analysis fixture SHA-256:
+  packages/aethyme/rust/crates/aethyme-contracts/fixtures/experimental-v0/analysis.json
+  9122162966626e38662b647b0bb7ec4d9e8ef2413338d7aa2f454b428c6e95e6
+
+Static corrections at this commit:
+- Corrected only the vector-test loader local name (`vector_set`), enabling the
+  explicit-unknown assertion.
+- Corrected only the isolated Git helper's missing return semicolon.
+- Moved the overload fixture construction before the test mutates the right
+  clone's src/lib.ts; fixture source bytes are unchanged.
+- The duplicate-evidence case now uses exactly seven entries (first six plus a
+  duplicate of entry zero), so it reaches duplicate-ID insertion while the
+  seven-record closure is incomplete. Separate eight-malformed case continues
+  to prove the pre-decode count bound.
+- Reviewer CLEAR for exact combined integration test diff/hash 10c21639…;
+  reviewer ran no tests.
+
+Positive focused runs on this frozen source:
+- `aethyme-contracts --test analysis_vectors`: 6 passed, 0 failed.
+  Log `/private/tmp/aq0-attempt-127056-analysis-vectors.txt`
+  SHA-256 ba39899e733e22fe6abd3647b67594022352694afb0682c6ca0c17888448c230
+- `aethyme-contracts --test symbol_identity_vectors`: 3 passed, 0 failed.
+  Log `/private/tmp/aq0-attempt-127056-symbol-vectors-rename.txt`
+  SHA-256 4d46fe4478aa6ab288ead528f7218cc3f84938b7e075d80f44469c1201d10184
+- `aethyme-broker --test symbol_identity_binding`: 4 passed, 0 failed.
+  Log `/private/tmp/aq0-attempt-10c21639-clone-binding.txt`
+  SHA-256 20269a92b8750ef3247fc17922d1d7b51b25d8858d9fbdd6aace439e018d874d
+
+Preserved failed attempts (diagnostic only; no qualification credit):
+- Analysis-vector run before the Optional expectation correction had 5/6 pass;
+  original input/canonical bytes remain unchanged. Existing artifact:
+  `/private/tmp/aq0-runtime-attempt-01.txt`
+  SHA-256 1d84fb30df806bb46f2e179f4975511170a9644f755de1b96d82d314f0b96e39
+- Initial symbol-vector compile found the loader-name shadow; log:
+  `/private/tmp/aq0-attempt-127056-symbol-vectors.txt`
+  SHA-256 3dfd487fd5b9426326997f350297ac0caaf326cfb06bd39b42688eece2c34719
+- Initial integration compile found missing return expression; log:
+  `/private/tmp/aq0-attempt-127056-clone-binding.txt`
+  SHA-256 32d05861e1b98b70fc4e18a8fc0a77f62346c6a60e375f7f7d883f4f450ba11e
+- First compiled integration run had 2/4 pass; duplicate test exceeded the bound,
+  and the overload fixture was constructed after its source was modified:
+  `/private/tmp/aq0-attempt-127056-clone-binding-fix.txt`
+  SHA-256 0a98a096286b210f49545d7aa470daff40b5b61622fd81263762f0e694f6619a
+- Isolated backtrace confirmed the path-fixture ordering failure:
+  `/private/tmp/aq0-diagnose-path-case.txt`
+  SHA-256 34e0065b6e8cbe7cb8888854a979cc88cd1390de1498c47a2332dcc6b1535851
+
+Six isolated resolver patches remain byte-identical to manifest
+`/private/tmp/aq0-mutants-1c763a10/manifest.txt` SHA-256
+cfca2e5e565bbd803cf607729038ecc0172d4d146198bd12ddb73d34826fb3f5:
+  01-predecode-count.patch  77d7f4a90f8583729e7fd529de9cc2f2b8edddc179ccecef2ae56a27f59196a9
+  02-right-source-binding.patch 6742a6981b84f7b8eb8c10e701b6d83fec94d560a2e0498e6da786acfb8209d0
+  03-profile-binding.patch c33537103ad5ee5692709f182aeaa700e7f7082a612a2563e514b605ef648af7
+  04-claim-origin-refs.patch 49c160c2d1adddfa81461b771eb5855db1efaee36e05c907798b87864a063d10
+  05-right-origin-record.patch 692df77bf8d6c89ac5de7f8f731bf66e6b30a53652bd8f3aca9fb8e2187580a6
+  06-proposed-state.patch 1f6db2f94eebdffa079e7c4d6f25cb07689c1156012c94d5749cc404764cae61
+Reviewer previously statically cleared each one-predicate patch and its assertion
+against the exact unchanged resolver source; recheck patch applicability and
+reachability against this final test hash before mutant runtime. No mutant has
+run yet.
+
+Approved runtime environment: filtered `env -i`, `TMPDIR=/private/tmp`,
+shared target `/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/integrate-reviewed-local-bare-git-servic/target/local-resume/cargo`,
+`cargo test --locked -j4`. Use a unique mktemp source backup plus EXIT/HUP/INT/TERM
+restore trap for each patch; on restore touch resolver to invalidate Cargo
+cache, verify original source hash and `git diff --exit-code --` for resolver
+and integration test, record restored mtime before continuing. Run no concurrent
+mutants. After all restorations, rerun focused positives and scoped strict Clippy.

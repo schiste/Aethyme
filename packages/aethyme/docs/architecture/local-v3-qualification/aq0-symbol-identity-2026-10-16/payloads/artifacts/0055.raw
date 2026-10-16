@@ -1,0 +1,12 @@
+   Compiling aethyme-broker v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/implement-experimental-d39-t66-scoped-sy/packages/aethyme/rust/crates/aethyme-broker)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 22.09s
+     Running tests/symbol_identity_binding.rs (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/integrate-reviewed-local-bare-git-servic/target/local-resume/cargo/debug/deps/symbol_identity_binding-00ddf30bf8dc4d61)
+
+running 4 tests
+test identical_local_names_need_document_and_producer_scope_and_package_versions_survive ... ok
+test mismatched_or_incomplete_mapping_records_never_establish ... ok
+test actual_playground_clones_bind_observations_and_keep_existing_node_ids ... ok
+test path_moves_renames_copies_and_historical_overload_collisions_stay_unknown ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.21s
+
