@@ -3050,7 +3050,7 @@ mod cleanup;
 mod finish;
 mod gates;
 mod leases;
-mod lifecycle;
+pub(crate) mod lifecycle;
 mod scope_capture;
 mod status;
 mod status_helpers;

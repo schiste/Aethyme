@@ -970,7 +970,7 @@ fn source_payload(
                     .collect(),
                 producer_kind: producer_kind.into(),
                 producer_profile,
-                mode: composition_mode_code(candidate.mode).into(),
+                mode: candidate.mode.code().into(),
             },
             recipe: RecordRefPayload {
                 id: recipe.id.to_string(),
@@ -1014,15 +1014,6 @@ fn ensure_resolution_supported(
         Err(WaveError::ResolutionUnsupported)
     } else {
         Ok(())
-    }
-}
-
-fn composition_mode_code(mode: CompositionMode) -> &'static str {
-    match mode {
-        CompositionMode::Text => "text",
-        CompositionMode::Structural => "structural",
-        CompositionMode::Hybrid => "hybrid",
-        CompositionMode::Synthesized => "synthesized",
     }
 }
 
