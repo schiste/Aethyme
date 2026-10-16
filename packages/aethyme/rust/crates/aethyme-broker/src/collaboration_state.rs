@@ -2794,7 +2794,7 @@ mod tests {
             .unwrap();
         drop(store);
 
-        let migrated = open(host.path(), &[]).unwrap();
+        let mut migrated = open(host.path(), &[]).unwrap();
         let job: (
             String,
             String,
@@ -2927,7 +2927,7 @@ mod tests {
             .unwrap();
         drop(migrated);
 
-        let reopened = open(host.path(), &[]).unwrap();
+        let mut reopened = open(host.path(), &[]).unwrap();
         let jobs: i64 = reopened
             .read_connection()
             .query_row(

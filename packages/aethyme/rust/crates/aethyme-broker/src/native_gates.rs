@@ -486,6 +486,8 @@ pub(crate) fn validate_source(
     repo: &Path,
     spec: &Spec,
 ) -> Result<crate::types::VerificationCandidate, NativeGateError> {
+    let _archive_guard = crate::collaboration_gc::archive_use(store)?;
+    let _response_guard = crate::collaboration_sensitive::response_use(store)?;
     let candidate = commit(&spec.commit)?;
     let baseline = commit(&spec.base_commit)?;
     if archive::raw_commit_tree(repo, &candidate)? != spec.tree
@@ -652,6 +654,8 @@ pub fn prepare(
     broker: &mut Broker,
     wave_id: &RecordId,
 ) -> Result<Job, NativeGateError> {
+    let _archive_guard = crate::collaboration_gc::archive_use(store)?;
+    let _response_guard = crate::collaboration_sensitive::response_use(store)?;
     let (w, _source) =
         wave::load_composition_source(store, owner, broker.repo_handle().root(), wave_id)?;
     let synthesized = wave::read_synthesized_wave_result(store, broker.repo_handle().root(), &w)?;
@@ -757,9 +761,14 @@ pub fn prepare(
     }
     current(store, owner, &spec)?;
     validate_source(store, owner, broker.repo_handle().root(), &spec)?;
-    let _archive = crate::collaboration_gc::archive_use(store)?;
     let rec = record(&spec)?;
     let object = archive::put_object(store, &rec.canonical_bytes())?;
+    let recipe_bytes = if synthesis.is_none() {
+        let recipe = spec.recipe.as_deref().ok_or(NativeGateError::Mismatch)?;
+        Some(archive::read_object(store, &digest(recipe)?)?)
+    } else {
+        None
+    };
     let tx = store
         .connection()
         .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -795,10 +804,8 @@ pub fn prepare(
             params![rec.id().as_str(), kind, reference],
         )?;
     }
-    if synthesis.is_none() {
-        let recipe = spec.recipe.as_deref().ok_or(NativeGateError::Mismatch)?;
-        let bytes = archive::read_object(store, &digest(recipe)?)?;
-        let body: Value = serde_json::from_slice(&bytes)?;
+    if let Some(bytes) = recipe_bytes.as_deref() {
+        let body: Value = serde_json::from_slice(bytes)?;
         for member in body["order"].as_array().ok_or(NativeGateError::Mismatch)? {
             for field in ["base", "result"] {
                 tx.execute("INSERT OR IGNORE INTO local_native_gate_roots(job,kind,reference) VALUES(?1,'snapshot',?2)",params![rec.id().as_str(),member[field].as_str().ok_or(NativeGateError::Mismatch)?])?;
@@ -1044,6 +1051,8 @@ fn run_inner(
     key: &RecordId,
     fresh: bool,
 ) -> Result<Job, NativeGateError> {
+    let _archive_guard = crate::collaboration_gc::archive_use(store)?;
+    let _response_guard = crate::collaboration_sensitive::response_use(store)?;
     let _authority = target::authorize(store, owner)?;
     let job = load(store, key)?;
     repository_binding(broker, &job.spec)?;
@@ -1069,7 +1078,6 @@ fn run_inner(
     }
     require_explicit_trust(broker, &p.trust)?;
     broker.sync_gate_definitions(&p.gates)?;
-    let _archive = crate::collaboration_gc::archive_use(store)?;
     let checkout = Checkout::new(store, broker.repo_handle().root(), &job.spec)?;
     let changed = checkout
         .repo

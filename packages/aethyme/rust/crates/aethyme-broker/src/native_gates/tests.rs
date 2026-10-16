@@ -669,6 +669,21 @@ fn settled_synthesized_attempt_attaches_and_prepares_a_fresh_exact_gate() {
         expected_version
     );
 
+    let guard_checks = std::rc::Rc::new(std::cell::Cell::new(0));
+    let guard_checks_probe = guard_checks.clone();
+    let _guard_probe = wave::observe_synthesized_attach_guards(move |store| {
+        assert!(
+            gc::try_admin_exclusive(store).unwrap().is_none(),
+            "archive reclamation must remain blocked from result read through retention"
+        );
+        assert!(
+            crate::collaboration_sensitive::try_response_exclusive(store)
+                .unwrap()
+                .is_none(),
+            "sensitive purge must remain blocked from result read through retention"
+        );
+        guard_checks_probe.set(guard_checks_probe.get() + 1);
+    });
     let attached = wave::attach_synthesized_attempt_result(
         &mut s.f.store,
         owner,
@@ -680,6 +695,12 @@ fn settled_synthesized_attempt_attaches_and_prepares_a_fresh_exact_gate() {
         &std::sync::atomic::AtomicBool::new(false),
     )
     .unwrap();
+    drop(_guard_probe);
+    assert_eq!(
+        guard_checks.get(),
+        2,
+        "both barriers stay held after the strict read and after artifact retention"
+    );
     assert_eq!(attached.phase, WavePhase::Verifying);
     assert_eq!(attached.resolution_result.as_ref(), Some(&result_ref));
     let attached_status = target::status(&s.f.store, owner.target()).unwrap();

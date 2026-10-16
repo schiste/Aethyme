@@ -3,6 +3,8 @@
 //! composer; verification and acceptance remain unavailable until their
 //! trusted adapters exist. No candidate code or publication is executed here.
 
+#[cfg(test)]
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -22,6 +24,43 @@ use crate::composition::{
 };
 use crate::local_target::{self as target, ControllerOwner, Phase, TargetError};
 use crate::resolution::{self, FailedCheck, RequirementRef};
+
+#[cfg(test)]
+thread_local! {
+    static SYNTHESIZED_ATTACH_GUARD_PROBE:
+        RefCell<Option<Box<dyn FnMut(&CollaborationStore)>>> = const { RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) struct SynthesizedAttachGuardProbe;
+
+#[cfg(test)]
+impl Drop for SynthesizedAttachGuardProbe {
+    fn drop(&mut self) {
+        SYNTHESIZED_ATTACH_GUARD_PROBE.with(|probe| {
+            probe.borrow_mut().take();
+        });
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn observe_synthesized_attach_guards(
+    callback: impl FnMut(&CollaborationStore) + 'static,
+) -> SynthesizedAttachGuardProbe {
+    SYNTHESIZED_ATTACH_GUARD_PROBE.with(|probe| {
+        assert!(probe.borrow_mut().replace(Box::new(callback)).is_none());
+    });
+    SynthesizedAttachGuardProbe
+}
+
+#[cfg(test)]
+fn check_synthesized_attach_guards(store: &CollaborationStore) {
+    SYNTHESIZED_ATTACH_GUARD_PROBE.with(|probe| {
+        if let Some(callback) = probe.borrow_mut().as_mut() {
+            callback(store);
+        }
+    });
+}
 
 const COMPOSITION_SOURCE_SCHEMA_NAME: &str = "aethyme.local-composition-source/experimental-v0";
 const COMPOSITION_SOURCE_MAX_BYTES: usize = 1 << 20;
@@ -237,6 +276,8 @@ pub(crate) fn read_synthesized_wave_result(
     repo: &Path,
     wave: &Wave,
 ) -> Result<Option<(resolution::UnverifiedSynthesis, SynthesizedGroupProvenance)>, WaveError> {
+    let _archive_guard = archive_use(store)?;
+    let _response_guard = crate::collaboration_sensitive::response_use(store)?;
     let (Some(request_ref), Some(result_ref)) = (&wave.resolution_request, &wave.resolution_result)
     else {
         if wave.resolution_request.is_none() && wave.resolution_result.is_none() {
@@ -260,8 +301,8 @@ pub(crate) fn read_synthesized_wave_result(
             })
         || synthesis.candidate.mode != CompositionMode::Synthesized
         || synthesis.candidate.baseline_source != composer::COMPOSER_BASELINE_SOURCE
-        || synthesis.candidate.baseline != synthesis.request.baseline.commit
-        || synthesis.request.baseline.snapshot_id.as_str() != wave.spec.baseline
+        || synthesis.candidate.baseline != synthesis.request.baseline().commit
+        || synthesis.request.baseline().snapshot_id.as_str() != wave.spec.baseline
         || wave.candidate_snapshot.as_ref() != Some(&synthesis.candidate.subject)
         || wave.candidate_commit.as_ref() != Some(&synthesis.candidate.commit)
     {
@@ -404,8 +445,8 @@ pub(crate) fn read_synthesized_wave_result(
                 lineage: lineage.clone(),
                 base_snapshot: member.base.to_string(),
                 result_snapshot: member.result.to_string(),
-                base_commit: member.base_commit.to_string(),
-                result_commit: member.result_commit.to_string(),
+                base_commit: member.base_commit.as_str().to_owned(),
+                result_commit: member.result_commit.as_str().to_owned(),
             }
         })
         .collect();
@@ -418,11 +459,11 @@ pub(crate) fn read_synthesized_wave_result(
         group_record_id: result_ref.id.to_string(),
         group_object: result_ref.object.hex(),
         input_manifest_sha256: synthesis.input_manifest.sha256,
-        baseline_snapshot: synthesis.request.baseline.snapshot_id.to_string(),
-        baseline_commit: synthesis.request.baseline.commit.to_string(),
+        baseline_snapshot: synthesis.request.baseline().snapshot_id.to_string(),
+        baseline_commit: synthesis.request.baseline().commit.as_str().to_owned(),
         candidate_subject: synthesis.candidate.subject.to_string(),
         candidate_tree: synthesis.candidate.tree,
-        candidate_commit: synthesis.candidate.commit.to_string(),
+        candidate_commit: synthesis.candidate.commit.as_str().to_owned(),
         inputs,
     };
     Ok(Some((synthesis, provenance)))
@@ -1390,14 +1431,14 @@ pub(crate) fn load_composition_source(
     repo: &Path,
     wave_id: &RecordId,
 ) -> Result<(Wave, Option<CompositionSource>), WaveError> {
+    let _archive_guard = archive_use(store)?;
+    let response_guard = crate::collaboration_sensitive::response_use(store)?;
     let observed = load(store, wave_id)?;
     let synthesized = if observed.resolution_result.is_some() {
         read_synthesized_wave_result(store, repo, &observed)?
     } else {
         None
     };
-    let _archive_guard = archive_use(store)?;
-    let response_guard = crate::collaboration_sensitive::response_use(store)?;
     let _authority_guard = target::authorize(store, owner)?;
     let wave = load(store, wave_id)?;
     if wave.resolution_request != observed.resolution_request
@@ -2253,6 +2294,8 @@ pub fn attach_synthesized_attempt_result(
     token: &str,
     cancel: &AtomicBool,
 ) -> Result<Wave, WaveError> {
+    let archive_guard = archive_use(store)?;
+    let response_guard = crate::collaboration_sensitive::response_use(store)?;
     let observed = load(store, wave_id)?;
     if observed.resolution_request.as_ref() != Some(request_ref)
         || observed.spec.prior_completion.is_some()
@@ -2271,6 +2314,8 @@ pub fn attach_synthesized_attempt_result(
     if synthesis.status.request != *request_ref || synthesis.status.token != token {
         return Err(WaveError::Stale);
     }
+    #[cfg(test)]
+    check_synthesized_attach_guards(store);
     if let Some(existing) = &observed.resolution_result {
         if existing != &synthesis.group_record || observed.phase != WavePhase::Verifying {
             return Err(WaveError::Stale);
@@ -2310,8 +2355,6 @@ pub fn attach_synthesized_attempt_result(
     let (_, provenance) =
         read_synthesized_wave_result(store, repo, &prospective)?.ok_or(WaveError::Stale)?;
 
-    let archive_guard = archive_use(store)?;
-    let response_guard = crate::collaboration_sensitive::response_use(store)?;
     let authority_guard = target::authorize(store, owner)?;
     let pinned = target::load_revision_under_response(
         store,
@@ -2365,6 +2408,8 @@ pub fn attach_synthesized_attempt_result(
         &authority_guard,
     )?;
     target::retain_artifacts_under_guards(store, &pinned.id, &snapshots, &objects, &retention)?;
+    #[cfg(test)]
+    check_synthesized_attach_guards(store);
 
     let tx = store
         .connection()
