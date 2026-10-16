@@ -1,0 +1,39 @@
+Addendum to frozen AQ0 manifest cfca2e5e565bbd803cf607729038ecc0172d4d146198bd12ddb73d34826fb3f5
+
+New final commit: 1270567843c075acb9b42c737bd38b5f310c3a89
+New tree: e171acbb36bd36044646faf5976e4748b1adba4c
+Final branch: agent/implement-experimental-d39-t66-scoped-sy (session 1130)
+PR: #786 OPEN+DRAFT; same head branch, base agent/complete-fresh-local-cli-bootstrap-and-c.
+Working tree: clean; broker push succeeded.
+
+Unchanged mapping source SHA-256:
+  packages/aethyme/rust/crates/aethyme-broker/src/experimental_symbol_mapping.rs
+  72cf7ea55fefa5779da822e11d3caf523766d2bada2a936bb762c41df6e29726
+Unchanged actual-clone integration SHA-256:
+  packages/aethyme/rust/crates/aethyme-broker/tests/symbol_identity_binding.rs
+  ae19b14cbeb7b8512f34cd3cf83465ba77df1843d2d5630557990d0fd26dd47a
+Corrected analysis vector test SHA-256:
+  packages/aethyme/rust/crates/aethyme-contracts/tests/analysis_vectors.rs
+  6cfa9330c42a727102f3d2c1852add92c47f9ee9cb3ef77974fb309e2bf300f7
+Unchanged independent analysis vector bytes SHA-256:
+  packages/aethyme/rust/crates/aethyme-contracts/fixtures/experimental-v0/analysis.json
+  9122162966626e38662b647b0bb7ec4d9e8ef2413338d7aa2f454b428c6e95e6
+
+The test-only correction changes the optional expected gaps field from
+`Vec<String>` to `Option<Vec<String>>` and asserts reason/gaps only when supplied
+by the independent reference row. Thus the original 14 cases, which lack these
+optional summary fields, no longer become default-empty expectations. The two
+new T78 rows remain strict because each explicitly supplies reason and gaps.
+Neither input hex nor canonical hex/ID changed. Independent review has confirmed
+that the failing old case's canonical bytes contain `gaps:["missing_edge_kind:calls"]`;
+review of this exact test-only patch is pending.
+
+All six resolver patch files and SHA-256 hashes in the referenced manifest are
+unchanged. Each was rechecked with `git apply --check` against final commit
+12705678; none was applied. No Cargo command has been rerun since the preserved
+attempt in `/private/tmp/aq0-runtime-attempt-01.txt` (SHA-256
+1d84fb30df806bb46f2e179f4975511170a9644f755de1b96d82d314f0b96e39). That
+artifact retains both: (1) a shared-target lock permission failure before test
+execution (zero tests), and (2) 6 analysis-vector tests, 5 passing, with the
+now-corrected default-empty expectation failure. Neither attempt is qualification
+credit. Focused tests/mutants remain gated on exact-patch static CLEAR.

@@ -1,0 +1,89 @@
+AQ0 / T66 / D39 / T78 source-bound static manifest
+
+Source repository worktree:
+  /Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/implement-experimental-d39-t66-scoped-sy
+Session / branch: 1130 / agent/implement-experimental-d39-t66-scoped-sy
+Base: 3af335ab87618cc7fcb92a4a5b01ad23edb633d9
+Commits: c81927caf98220e686c18474869960ad7940804f,
+         1c763a10e4eec115d9ea4d09a4a13392534a2591,
+         1fa8317914e591f99715ec4cff2154c5830b8c99
+Final head: 1fa8317914e591f99715ec4cff2154c5830b8c99
+Final tree: 6619b595a77c0cccc744b6cd76f43fdce560526c
+Working tree: clean after final commit; branch push confirmed.
+
+Frozen source file SHA-256:
+  packages/aethyme/rust/crates/aethyme-broker/src/experimental_symbol_mapping.rs
+  72cf7ea55fefa5779da822e11d3caf523766d2bada2a936bb762c41df6e29726
+Frozen integration test SHA-256:
+  packages/aethyme/rust/crates/aethyme-broker/tests/symbol_identity_binding.rs
+  ae19b14cbeb7b8512f34cd3cf83465ba77df1843d2d5630557990d0fd26dd47a
+
+Guard-removal patches below are isolated single-predicate mutations, each based
+on the frozen source above. `git apply --check` succeeded for each patch against
+the final source. None has been applied; no Cargo/native/test/mutant command has
+run in this session. Root released the exclusive runtime slot, but execution is
+still gated on independent reviewer CLEAR of this exact manifest and patch set.
+
+Patch inventory (all under /private/tmp/aq0-mutants-1c763a10):
+1. 01-predecode-count.patch
+   SHA-256 77d7f4a90f8583729e7fd529de9cc2f2b8edddc179ccecef2ae56a27f59196a9
+   Predicate: evidence_bytes.len() > 7 early bound, before decode/insert.
+   Assertion: mismatched_or_incomplete_mapping_records_never_establish / eight
+   malformed entries must return evidence_set_not_exact before decode. Removing
+   it changes the typed result to invalid_evidence_record.
+2. 02-right-source-binding.patch
+   SHA-256 6742a6981b84f7b8eb8c10e701b6d83fec94d560a2e0498e6da786acfb8209d0
+   Predicate: local binding's right source snapshot equality.
+   Assertion: SourceMismatch expects captured_clone_binding_mismatch. Removing
+   the predicate falls through to observation_binding_mismatch; that later
+   refusal is intentionally preserved and the exact-reason assertion kills it.
+3. 03-profile-binding.patch
+   SHA-256 c33537103ad5ee5692709f182aeaa700e7f7082a612a2563e514b605ef648af7
+   Predicate: local binding's profile equality.
+   Assertion: ProfileMismatch expects captured_clone_binding_mismatch. Removing
+   the predicate falls through to observation_binding_mismatch; that later
+   refusal is intentionally preserved and the exact-reason assertion kills it.
+4. 04-claim-origin-refs.patch
+   SHA-256 49c160c2d1adddfa81461b771eb5855db1efaee36e05c907798b87864a063d10
+   Predicate: claim's sorted evidence references equal the two independent
+   origin IDs.
+   Assertion: wrong-evidence closure expects evidence_set_not_exact. Removing
+   this predicate lets the full seven-record closure continue; no guards or
+   fixtures are weakened.
+5. 05-right-origin-record.patch
+   SHA-256 692df77bf8d6c89ac5de7f8f731bf66e6b30a53652bd8f3aca9fb8e2187580a6
+   Predicate: right origin record binds the right symbol/clone/profile/
+   observation.
+   Assertion: OriginMismatch expects origin_binding_mismatch. Removing only
+   this side's predicate allows the intentionally inconsistent right origin
+   through; left-side validation remains.
+6. 06-proposed-state.patch
+   SHA-256 1f6db2f94eebdffa079e7c4d6f25cb07689c1156012c94d5749cc404764cae61
+   Predicate: claim wire state must be proposed.
+   Assertions: `unknown` and `established` wire states each expect
+   claim_not_proposed. The adapter state check remains the sole source of
+   in-process establishment authority.
+
+Restoration/cache procedure for each later authorized runtime mutation:
+- Start each mutation in a fresh shell. Before mutation record the source SHA-256
+  above and `stat -f %m` (baseline source mtime 1792106981 at this freeze).
+- Make a unique `backup=$(mktemp "${TMPDIR:-/tmp}/aq0-source.XXXXXX")`, copy the
+  resolver byte-for-byte to it, install an EXIT/HUP/INT/TERM trap that copies the
+  backup back, touches the resolver to force Cargo cache invalidation, verifies
+  its SHA-256 equals the frozen baseline, runs `git diff --exit-code --` for the
+  resolver and integration test, and deletes only that unique backup.
+- Apply exactly one named patch; touch the resolver before its focused command
+  so the mutation is compiled. Never overlap a mutation or reuse a mutant build
+  as baseline evidence. Keep test fixtures and every other guard unchanged.
+- On trap restoration, the fresh mtime is deliberately newer than mutant build
+  artifacts. Record restored SHA, mtime, and clean diff before the next mutant;
+  the final focused positive command must compile the restored source again.
+
+T78 minimum conservative baseline coverage already present (no new semantic
+producer or producer execution):
+  packages/aethyme/rust/crates/aethyme-contracts/fixtures/experimental-v0/analysis.json
+  packages/aethyme/rust/crates/aethyme-contracts/tests/analysis_vectors.rs
+The independent vectors include producer timeout -> unavailable/no evidence,
+omitted TypeScript -> partial/no evidence, truncation, unavailable producer,
+and stale view/query cursor; the vector decoder/round-trip tests exercise all
+valid degradation cases. Optional X1/X3/X4 stay disabled and unqualified.

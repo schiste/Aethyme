@@ -1,0 +1,33 @@
+   Compiling aethyme-engine v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/implement-experimental-d39-t66-scoped-sy/packages/aethyme/rust/crates/aethyme-engine)
+   Compiling aethyme-broker v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/implement-experimental-d39-t66-scoped-sy/packages/aethyme/rust/crates/aethyme-broker)
+warning: unused import: `StateReading`
+  --> crates/aethyme-broker/src/experimental_symbol_mapping.rs:18:57
+   |
+18 |     Record, RecordId, SourceSnapshot, SourceSnapshotId, StateReading,
+   |                                                         ^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: `aethyme-broker` (lib) generated 1 warning (run `cargo fix --lib -p aethyme-broker` to apply 1 suggestion)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 22.54s
+     Running tests/symbol_identity_binding.rs (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/integrate-reviewed-local-bare-git-servic/target/local-resume/cargo/debug/deps/symbol_identity_binding-00ddf30bf8dc4d61)
+
+running 1 test
+test mismatched_or_incomplete_mapping_records_never_establish ... FAILED
+
+failures:
+
+---- mismatched_or_incomplete_mapping_records_never_establish stdout ----
+
+thread 'mismatched_or_incomplete_mapping_records_never_establish' (12471645) panicked at crates/aethyme-broker/tests/symbol_identity_binding.rs:718:5:
+assertion failed: matches!(resolve_within_binding(&fixture.binding, &established_wire,
+    &records), MappingResolution::Unknown("claim_not_proposed"))
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    mismatched_or_incomplete_mapping_records_never_establish
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.15s
+
+error: test failed, to rerun pass `-p aethyme-broker --test symbol_identity_binding`
