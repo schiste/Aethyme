@@ -94,6 +94,7 @@ impl PinnedTreeRemoval {
     /// `keep_until_last` is removed only after every other entry is gone. The
     /// root name is checked against the pinned inode before mutations and
     /// before final `rmdir`, so a replaced or unmounted root is left alone.
+    #[cfg(test)]
     pub(crate) fn remove(
         self,
         _keep_until_last: Option<&str>,
@@ -282,6 +283,7 @@ mod unix {
             }))
         }
 
+        #[cfg(test)]
         pub(super) fn remove<F>(
             self,
             keep_until_last: Option<&str>,
@@ -333,6 +335,7 @@ mod unix {
             .map_err(|error| error.source)
         }
 
+        #[cfg(test)]
         fn remove_with_hooks<F, G>(
             self,
             keep_until_last: Option<&str>,
