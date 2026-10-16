@@ -1,0 +1,27 @@
+   Compiling aethyme-graph-schema v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/complete-exact-immutable-contribution-co/packages/aethyme/rust/crates/aethyme-graph-schema)
+   Compiling aethyme-engine v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/complete-exact-immutable-contribution-co/packages/aethyme/rust/crates/aethyme-engine)
+   Compiling aethyme-broker v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/complete-exact-immutable-contribution-co/packages/aethyme/rust/crates/aethyme-broker)
+   Compiling aethyme-testkit v0.1.0 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/complete-exact-immutable-contribution-co/packages/aethyme/rust/crates/aethyme-testkit)
+   Compiling aethyme-graph-storage v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/complete-exact-immutable-contribution-co/packages/aethyme/rust/crates/aethyme-graph-storage)
+   Compiling aethyme-enhance v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/complete-exact-immutable-contribution-co/packages/aethyme/rust/crates/aethyme-enhance)
+   Compiling aethyme-contracts v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/complete-exact-immutable-contribution-co/packages/aethyme/rust/crates/aethyme-contracts)
+   Compiling aethyme-graph-indexer v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/complete-exact-immutable-contribution-co/packages/aethyme/rust/crates/aethyme-graph-indexer)
+   Compiling aethyme-producers v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/complete-exact-immutable-contribution-co/packages/aethyme/rust/crates/aethyme-producers)
+error[E0433]: cannot find module or crate `data_encoding` in this scope
+   --> crates/aethyme-broker/src/collaboration_cli/context_revisions.rs:100:27
+    |
+100 |     let bytes: [u8; 32] = data_encoding::HEXLOWER
+    |                           ^^^^^^^^^^^^^ use of unresolved module or unlinked crate `data_encoding`
+    |
+    = help: if you wanted to use a crate named `data_encoding`, use `cargo add data_encoding` to add it to your `Cargo.toml`
+
+error[E0433]: cannot find module or crate `data_encoding` in this scope
+   --> crates/aethyme-broker/src/collaboration_context/revisions.rs:708:17
+    |
+708 |                 data_encoding::HEXLOWER
+    |                 ^^^^^^^^^^^^^ use of unresolved module or unlinked crate `data_encoding`
+    |
+    = help: if you wanted to use a crate named `data_encoding`, use `cargo add data_encoding` to add it to your `Cargo.toml`
+
+For more information about this error, try `rustc --explain E0433`.
+error: could not compile `aethyme-broker` (lib test) due to 2 previous errors

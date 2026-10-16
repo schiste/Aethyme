@@ -1,0 +1,47 @@
+   Compiling aethyme-broker v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/complete-exact-immutable-contribution-co/packages/aethyme/rust/crates/aethyme-broker)
+warning: type `collaboration_cli::Failure` is more private than the item `PendingProjectFixture::bind`
+    --> crates/aethyme-broker/src/collaboration_cli/project.rs:1029:9
+     |
+1029 |         pub(crate) fn bind(&self, record_id: &str) -> Result<super::Output, super::Failure> {
+     |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ method `PendingProjectFixture::bind` is reachable at visibility `pub(crate)`
+     |
+note: but type `collaboration_cli::Failure` is only usable at visibility `pub(self)`
+    --> crates/aethyme-broker/src/collaboration_cli.rs:241:1
+     |
+ 241 | struct Failure {
+     | ^^^^^^^^^^^^^^
+     = note: `#[warn(private_interfaces)]` on by default
+
+warning: fields `host` and `anchor_commit` are never read
+   --> crates/aethyme-broker/src/collaboration_cli/project.rs:955:20
+    |
+953 |     pub(crate) struct PendingProjectFixture {
+    |                       --------------------- fields in this struct
+954 |         pub(crate) repo: tempfile::TempDir,
+955 |         pub(crate) host: tempfile::TempDir,
+    |                    ^^^^
+...
+958 |         pub(crate) anchor_commit: CommitOid,
+    |                    ^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `aethyme-broker` (lib test) generated 2 warnings
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 26.22s
+     Running unittests src/lib.rs (target/debug/deps/aethyme_broker-0f278e0d02146111)
+
+running 1 test
+test local_exchange::revision_tests::snapshot_page_rejects_aggregate_revision_bytes_over_the_page_cap ... 
+thread 'local_exchange::revision_tests::snapshot_page_rejects_aggregate_revision_bytes_over_the_page_cap' (16455453) panicked at crates/aethyme-broker/src/local_exchange/revision_tests.rs:509:5:
+assertion failed: matches!(page.validate_for(&stream, None, 0), Err(ExchangeError::Limit))
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+
+failures:
+    local_exchange::revision_tests::snapshot_page_rejects_aggregate_revision_bytes_over_the_page_cap
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1953 filtered out; finished in 39.81s
+
+error: test failed, to rerun pass `-p aethyme-broker --lib`

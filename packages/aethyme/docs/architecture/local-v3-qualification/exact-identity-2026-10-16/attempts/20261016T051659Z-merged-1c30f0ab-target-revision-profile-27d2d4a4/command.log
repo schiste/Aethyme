@@ -1,0 +1,13 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.71s
+     Running unittests src/lib.rs (target/debug/deps/aethyme_broker-0f278e0d02146111)
+
+running 6 tests
+test local_target::revision::tests::d10_order_requires_one_exact_chain_and_refuses_merges_and_cycles ... ok
+test local_target::revision::tests::duplicate_capture_lineage_is_allowed_only_for_the_bound_d10_profile ... ok
+test local_target::revision::tests::immutable_revision_and_brief_roots_survive_target_supersession_with_recipe_candidate ... ok
+test local_target::revision::tests::revision_dependencies_must_equal_target_requirement_pins ... ok
+test local_target::revision::tests::selected_d10_proposals_conflict_before_legacy_lineage_dedup ... ok
+test local_target::revision::tests::selected_revision_map_must_be_exact ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 1948 filtered out; finished in 0.95s
+

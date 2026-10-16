@@ -1,0 +1,13 @@
+{
+  "restored_sha256": "0551f163b6ff1ed202ed356e0f1776267aaebdc3984764d7df4f42de8c4a6995",
+  "trials": [
+    {
+      "label": "root-budget",
+      "exit": 101
+    },
+    {
+      "label": "manifest-budget",
+      "exit": 101
+    }
+  ]
+}

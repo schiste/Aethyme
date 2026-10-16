@@ -1,0 +1,17 @@
+{
+  "restored_sha256": "98dfe8e1119a32d6474e7e582eb6dadf40431931b1a1be6b939f9cba2a0b4163",
+  "trials": [
+    {
+      "label": "root-budget",
+      "exit": 101
+    },
+    {
+      "label": "failed-read-byte-budget",
+      "exit": 101
+    },
+    {
+      "label": "streaming-union",
+      "exit": 101
+    }
+  ]
+}

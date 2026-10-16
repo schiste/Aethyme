@@ -1,0 +1,29 @@
+   Compiling aethyme-contracts v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/complete-exact-immutable-contribution-co/packages/aethyme/rust/crates/aethyme-contracts)
+warning: function `bounded_canonical_array_size` is never used
+   --> crates/aethyme-contracts/src/experimental_v0/canonical_json.rs:241:15
+    |
+241 | pub(crate) fn bounded_canonical_array_size(values: &[Value], limit: usize) -> Option<usize> {
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `aethyme-contracts` (lib) generated 1 warning
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.73s
+     Running tests/contribution_revision.rs (target/debug/deps/contribution_revision-9c0c2fe7d725049d)
+
+running 1 test
+test constructor_preflights_aggregate_values_before_semantic_cloning ... 
+thread 'constructor_preflights_aggregate_values_before_semantic_cloning' (16841229) panicked at crates/aethyme-contracts/tests/contribution_revision.rs:321:5:
+assertion failed: matches!(result, Err(ContributionRevisionError::TooLarge(bytes)) if bytes >
+    MAX_CONTRIBUTION_REVISION_BYTES)
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+
+failures:
+    constructor_preflights_aggregate_values_before_semantic_cloning
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 7 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p aethyme-contracts --test contribution_revision`
