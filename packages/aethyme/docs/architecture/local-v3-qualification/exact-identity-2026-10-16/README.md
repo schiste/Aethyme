@@ -46,6 +46,22 @@ The formatter check on `e47766f0` also retained the existing bridge-format diffs
 Further bounded-allocation and brief-reference validation changes remain under
 review and are not qualified by these runs.
 
+On merged source `595082df8f759a3f6c6c30340056d8ef9f93188d`, the eight
+public binding tests executed: seven passed and the corrupt-bootstrap case failed
+because its typed `corrupt_state` response used generic exit 1 instead of refusal
+exit 3. That command remains uncredited. Each of the seven migration selections
+passed its one test, including schema-23 capture-row preservation. The current-head
+inheritance regression and writer serialization test each passed; the latter still
+used a timing-based negative observation and needs the independently requested
+deterministic contention control before it can qualify lock contention.
+
+On merged source `9328d987e666fd3d2ac5442c019911722cc4be6f`, all 18 revision
+consumer tests, six target-profile tests and 23 wave tests passed with zero
+ignored tests. The workspace formatter check passed. These runs include the
+bounded chunked transport and corrected aggregate-page fixture. Parent test-helper
+warnings remain; constructor hardening and the binding error mapping are still
+pending, so these checks do not qualify the final combined source.
+
 ## Guard controls
 
 Unique backups and the exact drivers are under [control-sources](control-sources/).
@@ -91,10 +107,10 @@ These runs contain the bridge’s existing unused-field warning.
   `a6b34828`; the subsequent actual tests exposed two failures: a revision
   packet exceeded the canonical string limit, and the aggregate-page setup
   exceeded the canonical record limit and reached an unchecked constructor
-  assumption. Generic typed admission and transport fixes are in progress.
+  assumption. The later bounded transport run above passed; further constructor admission changes remain in progress.
 - Two inline target profile tests rejected invalid synthetic IDs before testing
-  their intended behavior; correcting those test inputs is pending independent
-  review and a fresh executed run.
+  their intended behavior; the corrected inputs passed independent review and the later six-test
+  target-profile run above.
 - The retained completed CI jobs include schema downgrade fixtures that kept a
   newly added column, an out-of-date collab help snapshot, formatting/test-module
   lint failures, and dependency-download failures. These are historical failures
