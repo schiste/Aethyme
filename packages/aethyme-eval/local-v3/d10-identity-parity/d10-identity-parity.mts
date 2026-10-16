@@ -5,6 +5,7 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   canonicalizeValue,
+  PROFILE_LIMITS,
   type CanonicalValue,
 } from "../t01-canonical-parity/canonical-json.mts";
 import {
@@ -13,11 +14,11 @@ import {
   decodeLowerHex,
   enrolledFileId,
   getHashCallCount,
-  immutableRecordId,
   isCanonicalFileId,
   parseContributionId,
   parseFileId,
   parseProjectId,
+  projectDescriptorRecord,
   resetHashCallCount,
   sourceSnapshot,
   type FileOperation,
@@ -109,7 +110,7 @@ const EXPECTED_BOUND_REVISION_MANIFEST_SHA256 =
 const EXPECTED_RENAME_MANIFEST_SHA256 =
   "6fb13ac0e523d65efcaece433353e3fe787aaf09eb90cebab35804bafcc287e0";
 const EXPECTED_QUALIFICATION_SOURCE_COMMIT =
-  "324a493208517ba12f537c9e6a4ec7f608af322f";
+  "01258cbc8c3e223ebbe01c9fe19e9c5bc6dbba7a";
 const EXPECTED_FIXTURE_SOURCE_COMMIT =
   "fcd5ed940b4d906452e4ad1d3aa90eb767f1af45";
 const REQUIRED_RUST_SOURCES = [
@@ -153,6 +154,63 @@ const REQUIRED_FIXTURE_PATHS = [
   "vectors/explicit-rename/expected.json",
   "vectors/explicit-rename/oracle.py",
 ] as const;
+const SAFE_SHORT_PATH_BYTES = Array.from(
+  { length: 0x7e - 0x21 + 1 },
+  (_, index) => 0x21 + index,
+).filter((byte) => byte !== 0x2e && byte !== 0x2f);
+
+function indexedAsciiPath(index: number, byteLength: number): Buffer {
+  const prefix = `p${index.toString(16).padStart(4, "0")}`;
+  if (index < 0 || index > 0xffff || prefix.length > byteLength) {
+    throw new Error("generated raw path dimensions are invalid");
+  }
+  return Buffer.from(prefix + "x".repeat(byteLength - prefix.length), "ascii");
+}
+
+function generatedDescriptorFiles(count: number, pathBytes: number): FileVector[] {
+  if (pathBytes === 2 && count > SAFE_SHORT_PATH_BYTES.length ** 2) {
+    throw new Error("not enough safe two-byte descriptor paths");
+  }
+  return Array.from({ length: count }, (_, index) => {
+    const path =
+      pathBytes === 2
+        ? Buffer.from([
+            SAFE_SHORT_PATH_BYTES[Math.floor(index / SAFE_SHORT_PATH_BYTES.length)]!,
+            SAFE_SHORT_PATH_BYTES[index % SAFE_SHORT_PATH_BYTES.length]!,
+          ])
+        : indexedAsciiPath(index, pathBytes);
+    return {
+      path_hex: path.toString("hex"),
+      mode: "100644",
+      content_hex: "",
+    };
+  });
+}
+
+function newSourceChange(pathHex: string, fileId: string): Map<string, CanonicalValue> {
+  const after = new Map<string, CanonicalValue>([
+    ["path_hex", pathHex],
+    ["mode", "100644"],
+    ["content_sha256", "3".repeat(64)],
+    ["file_id", fileId],
+  ]);
+  return new Map<string, CanonicalValue>([
+    ["relation", "new"],
+    ["derived_from", []],
+    ["possible_sources", []],
+    ["after", after],
+  ]);
+}
+
+function generatedNewChanges(count: number, pathBytes: number): CanonicalValue[] {
+  return Array.from({ length: count }, (_, index) =>
+    newSourceChange(
+      indexedAsciiPath(index, pathBytes).toString("hex"),
+      `file:sha256:${index.toString(16).padStart(64, "0")}`,
+    ),
+  );
+}
+
 let assertionCount = 0;
 
 function check(condition: boolean, message: string): asserts condition {
@@ -582,34 +640,25 @@ function run(): void {
   );
   const descriptorSource = ordinalInputs.descriptor_fixture_source_file;
   const descriptorSnapshot = sourceSnapshot([descriptorSource]);
-  const descriptorPath = decodeLowerHex(descriptorSource.path_hex);
-  const descriptorFileId = enrolledFileId(
+  const descriptorRecord = projectDescriptorRecord(
     ordinalInputs.project_id,
-    descriptorSnapshot.id,
-    descriptorPath,
+    ordinalInputs.anchor_commit,
+    descriptorSnapshot,
   );
-  const descriptorEntry = descriptorSnapshot.files_sorted_by_raw_path[0];
-  if (descriptorEntry === undefined) throw new Error("descriptor snapshot has no file");
+  const descriptorEnrollmentFile = descriptorRecord.enrolled_files[0];
+  if (descriptorEnrollmentFile === undefined) {
+    throw new Error("descriptor snapshot has no enrolled file");
+  }
   const descriptorFile = new Map<string, CanonicalValue>([
-    ["path_hex", descriptorEntry.path_hex],
-    ["mode", descriptorEntry.mode],
-    ["content_sha256", descriptorEntry.content_sha256],
-    ["file_id", descriptorFileId.file_id],
+    ["path_hex", descriptorEnrollmentFile.state.path_hex],
+    ["mode", descriptorEnrollmentFile.state.mode],
+    ["content_sha256", descriptorEnrollmentFile.state.content_sha256],
+    ["file_id", descriptorEnrollmentFile.state.file_id],
   ]);
   const descriptorEnrollment = new Map<string, CanonicalValue>(descriptorFile);
-  descriptorEnrollment.set("preimage_hex", descriptorFileId.preimage_hex);
-  const descriptor = new Map<string, CanonicalValue>([
-    ["schema", "aethyme.project-descriptor/experimental-v0"],
-    ["project_id", ordinalInputs.project_id],
-    ["anchor_commit", ordinalInputs.anchor_commit],
-    ["anchor_snapshot", descriptorSnapshot.id],
-    ["source_binding", `git-commit:${ordinalInputs.anchor_commit}`],
-    ["policy_location", ".aethyme/config.toml"],
-    ["acceptance_target", "unbound"],
-    ["visibility_boundary", "local"],
-    ["files", [descriptorFile]],
-  ]);
-  const descriptorBytes = canonicalizeValue(descriptor);
+  descriptorEnrollment.set("preimage_hex", descriptorEnrollmentFile.preimage_hex);
+  const descriptor = descriptorRecord.value;
+  const descriptorBytes = descriptorRecord.canonical_bytes;
   checkExpectedSnapshot(
     descriptorSnapshot,
     descriptorVector.anchor_snapshot,
@@ -621,7 +670,8 @@ function run(): void {
     "descriptor enrolled FileId state and preimage",
   );
   check(
-    descriptorFileId.file_id === ordinalInputs.descriptor_fixture_expected.enrolled_file_id,
+    descriptorEnrollmentFile.state.file_id ===
+      ordinalInputs.descriptor_fixture_expected.enrolled_file_id,
     "descriptor enrolled FileId differs from committed Rust fixture expectation",
   );
   check(
@@ -635,11 +685,69 @@ function run(): void {
     stringAt(descriptorVector.canonical_hex, "descriptor canonical_hex"),
     "ProjectDescriptor record",
   );
-  const descriptorRecordId = immutableRecordId(descriptorBytes);
+  const descriptorRecordId = descriptorRecord.id;
   check(
     descriptorRecordId === descriptorVector.record_id &&
       descriptorRecordId === ordinalInputs.descriptor_fixture_expected.descriptor_record_id,
     "ProjectDescriptor immutable RecordId mismatch",
+  );
+
+  const descriptorEntryLimit = PROFILE_LIMITS.max_container_entries;
+  const maximumDescriptorSnapshot = sourceSnapshot(
+    generatedDescriptorFiles(descriptorEntryLimit, 2),
+  );
+  resetHashCallCount();
+  const maximumDescriptor = projectDescriptorRecord(
+    ordinalInputs.project_id,
+    ordinalInputs.anchor_commit,
+    maximumDescriptorSnapshot,
+  );
+  check(
+    maximumDescriptor.enrolled_files.length === descriptorEntryLimit &&
+      maximumDescriptor.canonical_bytes.length <= PROFILE_LIMITS.max_document_bytes,
+    "ProjectDescriptor accepts exactly 4096 small file entries within the byte cap",
+  );
+  check(
+    getHashCallCount() === descriptorEntryLimit + 1,
+    "ProjectDescriptor maximum-count admission hashed an unexpected number of identities",
+  );
+
+  const oversizedCountSnapshot = sourceSnapshot(
+    generatedDescriptorFiles(descriptorEntryLimit + 1, 2),
+  );
+  resetHashCallCount();
+  expectProfileError(
+    "too_many_files",
+    () =>
+      projectDescriptorRecord(
+        ordinalInputs.project_id,
+        ordinalInputs.anchor_commit,
+        oversizedCountSnapshot,
+      ),
+    "ProjectDescriptor rejects 4097 file entries before enrollment hashing",
+  );
+  check(
+    getHashCallCount() === 0,
+    "ProjectDescriptor count refusal hashed an enrolled FileId",
+  );
+
+  const oversizedDescriptorSnapshot = sourceSnapshot(
+    generatedDescriptorFiles(descriptorEntryLimit, 100),
+  );
+  resetHashCallCount();
+  expectProfileError(
+    "descriptor_too_large",
+    () =>
+      projectDescriptorRecord(
+        ordinalInputs.project_id,
+        ordinalInputs.anchor_commit,
+        oversizedDescriptorSnapshot,
+      ),
+    "ProjectDescriptor rejects canonical bytes above 1 MiB",
+  );
+  check(
+    getHashCallCount() === descriptorEntryLimit,
+    "ProjectDescriptor byte refusal hashed the immutable RecordId",
   );
 
   const priorBaseline = priorV2Expected.contribution_revisions.baseline_immutable;
@@ -925,11 +1033,17 @@ function run(): void {
     expectedCode: string,
     changes: CanonicalValue[],
     label: string,
+    dependencies: string[] = revisionArgs.depends_on,
   ): void => {
     resetHashCallCount();
     expectProfileError(
       expectedCode,
-      () => contributionRevisionRecord({ ...revisionArgs, source_changes: changes }),
+      () =>
+        contributionRevisionRecord({
+          ...revisionArgs,
+          source_changes: changes,
+          depends_on: dependencies,
+        }),
       label,
     );
     check(getHashCallCount() === 0, `${label}: rejected only after hashing`);
@@ -959,20 +1073,7 @@ function run(): void {
     [badFileIdChange],
     "ContributionRevision rejects a non-canonical source-change FileId",
   );
-  const newChange = (pathHex: string, fileId: string): CanonicalValue => {
-    const state = new Map<string, CanonicalValue>([
-      ["path_hex", pathHex],
-      ["mode", "100644"],
-      ["content_sha256", "3".repeat(64)],
-      ["file_id", fileId],
-    ]);
-    return new Map<string, CanonicalValue>([
-      ["relation", "new"],
-      ["derived_from", []],
-      ["possible_sources", []],
-      ["after", state],
-    ]);
-  };
+  const newChange = newSourceChange;
   expectInvalidRevision(
     "non_canonical_change_order",
     [
@@ -981,6 +1082,120 @@ function run(): void {
     ],
     "ContributionRevision enforces strictly increasing raw-path change order",
   );
+
+  const entryLimit = PROFILE_LIMITS.max_container_entries;
+  const maximumDependencies = Array.from(
+    { length: entryLimit },
+    (_, index) => `sha256:${index.toString(16).padStart(64, "0")}`,
+  );
+  resetHashCallCount();
+  const maximumDependencyRevision = contributionRevisionRecord({
+    ...revisionArgs,
+    source_changes: [],
+    depends_on: maximumDependencies,
+  });
+  const maximumDependencyValue = maximumDependencyRevision.value.get("depends_on");
+  check(
+    Array.isArray(maximumDependencyValue) &&
+      maximumDependencyValue.length === entryLimit &&
+      maximumDependencyRevision.canonical_bytes.length <= PROFILE_LIMITS.max_document_bytes,
+    "ContributionRevision accepts exactly 4096 dependencies within the byte cap",
+  );
+  check(
+    getHashCallCount() === 1,
+    "ContributionRevision maximum-dependency record did not hash exactly once",
+  );
+  const oversizedDependencies = Array.from(
+    { length: entryLimit + 1 },
+    (_, index) => `sha256:${index.toString(16).padStart(64, "0")}`,
+  );
+  expectInvalidRevision(
+    "too_many_dependencies",
+    [],
+    "ContributionRevision rejects 4097 dependencies before ID hashing",
+    oversizedDependencies,
+  );
+
+  const referenceFileId = `file:sha256:${"a".repeat(64)}`;
+  const referenceSourceId = `file:sha256:${"b".repeat(64)}`;
+  const referenceChange = (references: string[]): CanonicalValue =>
+    new Map<string, CanonicalValue>([
+      [
+        "after",
+        new Map<string, CanonicalValue>([
+          ["path_hex", "61"],
+          ["mode", "100644"],
+          ["content_sha256", "3".repeat(64)],
+          ["file_id", referenceFileId],
+        ]),
+      ],
+      ["derived_from", references],
+      ["possible_sources", []],
+      ["relation", "explicit_split"],
+    ]);
+  resetHashCallCount();
+  const maximumReferenceRevision = contributionRevisionRecord({
+    ...revisionArgs,
+    source_changes: [
+      referenceChange(Array.from({ length: entryLimit }, () => referenceSourceId)),
+    ],
+  });
+  const maximumReferenceChanges = maximumReferenceRevision.value.get("source_changes");
+  const maximumReferenceChange = Array.isArray(maximumReferenceChanges)
+    ? maximumReferenceChanges[0]
+    : undefined;
+  const maximumReferenceIds =
+    maximumReferenceChange instanceof Map
+      ? maximumReferenceChange.get("derived_from")
+      : undefined;
+  check(
+    Array.isArray(maximumReferenceIds) &&
+      maximumReferenceIds.length === entryLimit &&
+      maximumReferenceRevision.canonical_bytes.length <= PROFILE_LIMITS.max_document_bytes,
+    "ContributionRevision accepts exactly 4096 file references within the byte cap",
+  );
+  check(
+    getHashCallCount() === 1,
+    "ContributionRevision maximum-reference record did not hash exactly once",
+  );
+  expectInvalidRevision(
+    "too_many_references",
+    [referenceChange(Array.from({ length: entryLimit + 1 }, () => referenceSourceId))],
+    "ContributionRevision rejects 4097 file references before ID hashing",
+  );
+
+  const maximumCountChanges = generatedNewChanges(entryLimit, 5);
+  expectInvalidRevision(
+    "too_large_revision",
+    maximumCountChanges,
+    "4096 source changes pass the count cap then fail the 1 MiB document cap",
+  );
+  expectInvalidRevision(
+    "too_many_changes",
+    generatedNewChanges(entryLimit + 1, 5),
+    "ContributionRevision rejects 4097 source changes before byte admission",
+  );
+
+  const nearLimitRevision = contributionRevisionRecord({
+    ...revisionArgs,
+    source_changes: generatedNewChanges(123, 4096),
+  });
+  check(
+    nearLimitRevision.canonical_bytes.length <= PROFILE_LIMITS.max_document_bytes &&
+      nearLimitRevision.canonical_bytes.length >
+        PROFILE_LIMITS.max_document_bytes - 10_000,
+    "ContributionRevision accepts a canonical document just below 1 MiB",
+  );
+  check(
+    getHashCallCount() === 1,
+    "ContributionRevision near-limit document did not hash exactly once",
+  );
+  expectInvalidRevision(
+    "too_large_revision",
+    generatedNewChanges(124, 4096),
+    "ContributionRevision rejects canonical bytes above 1 MiB before ID hashing",
+  );
+
   resetHashCallCount();
 
   const renameIdentity = objectAt(renameExpected.identity, "rename identity expected values");

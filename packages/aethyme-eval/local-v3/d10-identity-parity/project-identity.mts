@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { TextDecoder } from "node:util";
 import {
   canonicalizeValue,
+  PROFILE_LIMITS,
   type CanonicalValue,
 } from "../t01-canonical-parity/canonical-json.mts";
 
@@ -362,6 +363,63 @@ export function proposedFileId(
   return {
     file_id: parseFileId(`file:sha256:${sha256(preimage)}`),
     preimage_hex: lowerHex(preimage),
+  };
+}
+
+export function projectDescriptorRecord(
+  projectId: string,
+  anchorCommit: string,
+  snapshot: Snapshot,
+): {
+  value: Map<string, CanonicalValue>;
+  canonical_bytes: Buffer;
+  id: string;
+  enrolled_files: Array<{ state: FileState; preimage_hex: string }>;
+} {
+  parseProjectId(projectId);
+  validateCommit(anchorCommit);
+  const entries = snapshot.files_sorted_by_raw_path;
+  if (entries.length > PROFILE_LIMITS.max_container_entries) fail("too_many_files");
+
+  const enrolled_files = entries.map((entry) => {
+    const identity = enrolledFileId(
+      projectId,
+      snapshot.id,
+      decodeLowerHex(entry.path_hex),
+    );
+    return {
+      state: { ...entry, file_id: identity.file_id },
+      preimage_hex: identity.preimage_hex,
+    };
+  });
+  const descriptorFiles = enrolled_files.map(({ state }) =>
+    new Map<string, CanonicalValue>([
+      ["path_hex", state.path_hex],
+      ["mode", state.mode],
+      ["content_sha256", state.content_sha256],
+      ["file_id", state.file_id],
+    ]),
+  );
+  const value = new Map<string, CanonicalValue>([
+    ["schema", "aethyme.project-descriptor/experimental-v0"],
+    ["project_id", projectId],
+    ["anchor_commit", anchorCommit],
+    ["anchor_snapshot", snapshot.id],
+    ["source_binding", `git-commit:${anchorCommit}`],
+    ["policy_location", ".aethyme/config.toml"],
+    ["acceptance_target", "unbound"],
+    ["visibility_boundary", "local"],
+    ["files", descriptorFiles],
+  ]);
+  const canonicalBytes = canonicalizeValue(value);
+  if (canonicalBytes.length > PROFILE_LIMITS.max_document_bytes) {
+    fail("descriptor_too_large");
+  }
+  return {
+    value,
+    canonical_bytes: canonicalBytes,
+    id: immutableRecordId(canonicalBytes),
+    enrolled_files,
   };
 }
 
@@ -782,6 +840,7 @@ function sourceChangeIds(
 ): string[] {
   const values = object.get(field);
   if (!Array.isArray(values)) fail("invalid_source_change");
+  if (values.length > PROFILE_LIMITS.max_container_entries) fail("too_many_references");
   return values.map((value) => {
     if (typeof value !== "string") fail("invalid_source_change");
     return parseFileId(value);
@@ -789,7 +848,6 @@ function sourceChangeIds(
 }
 
 function validateContributionChanges(changes: CanonicalValue[]): void {
-  if (changes.length > 200_000) fail("too_many_changes");
   const allowedFields = new Set([
     "before",
     "after",
@@ -888,8 +946,15 @@ export function contributionRevisionRecord(args: {
   validateSha256Id(args.capture_record_id, "sha256:", "invalid_capture_record_id");
   validateSha256Id(args.base, "sha256:", "invalid_base_snapshot_id");
   validateSha256Id(args.result, "sha256:", "invalid_result_snapshot_id");
+  if (args.source_changes.length > PROFILE_LIMITS.max_container_entries) {
+    fail("too_many_changes");
+  }
+  const suppliedDependencies = args.depends_on ?? [];
+  if (suppliedDependencies.length > PROFILE_LIMITS.max_container_entries) {
+    fail("too_many_dependencies");
+  }
   validateContributionChanges(args.source_changes);
-  const dependencies = [...(args.depends_on ?? [])].sort();
+  const dependencies = [...suppliedDependencies].sort();
   for (let index = 0; index < dependencies.length; index += 1) {
     validateSha256Id(dependencies[index]!, "sha256:", "invalid_dependency_id");
     if (index > 0 && dependencies[index - 1] === dependencies[index]) {
@@ -923,6 +988,9 @@ export function contributionRevisionRecord(args: {
     fail("incomplete_brief_reference");
   }
   const canonicalBytes = canonicalizeValue(fields);
+  if (canonicalBytes.length > PROFILE_LIMITS.max_document_bytes) {
+    fail("too_large_revision");
+  }
   return {
     value: fields,
     canonical_bytes: canonicalBytes,
