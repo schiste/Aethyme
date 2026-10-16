@@ -1691,7 +1691,8 @@ impl Broker {
             min_free_bytes,
             crate::verification::removable_volume_unavailable_reason,
             |candidate| {
-                crate::disk_headroom::available_bytes_at_or_above_for(&self.main_root, candidate)
+                crate::disk_headroom::available_headroom_at_or_above_for(&self.main_root, candidate)
+                    .map(|headroom| headroom.bytes)
             },
         )
         .map_err(|reason| BrokerOpError::WorktreeRootUnavailable {

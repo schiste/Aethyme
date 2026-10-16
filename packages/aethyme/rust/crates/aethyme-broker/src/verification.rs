@@ -49,11 +49,7 @@ pub(crate) fn default_worktree_root_plan(main_root: &Path) -> crate::WorktreeRoo
     let git_common_dir = repository
         .as_ref()
         .and_then(|repository| repository.git_common_dir().ok());
-    crate::broker::lifecycle::plan_worktree_root_for(
-        main_root,
-        git_common_dir.as_deref(),
-        None,
-    )
+    crate::broker::lifecycle::plan_worktree_root_for(main_root, git_common_dir.as_deref(), None)
 }
 
 /// Place a verification slot using the exact root order accepted by its
@@ -173,7 +169,7 @@ where
 {
     let mut candidates = worktree_roots
         .iter()
-        .map(|(root, _)| root.join("run").join(namespace))
+        .map(|(root, _)| root.join(".aethyme/run").join(namespace))
         .collect::<Vec<_>>();
     if !strict_override {
         candidates.push(
@@ -278,13 +274,9 @@ where
             blocking_refusal: None,
         };
     }
-    repository_fallback_slot_placement(
-        main_root,
-        namespace,
-        preferred,
-        refusals,
-        |directory| headroom_refusal(directory),
-    )
+    repository_fallback_slot_placement(main_root, namespace, preferred, refusals, |directory| {
+        headroom_refusal(directory)
+    })
 }
 
 fn repository_fallback_slot_placement(
@@ -362,6 +354,7 @@ fn removable_volume_unavailable_reason_with_root(path: &Path, volumes: &Path) ->
 
 /// Conservatively treat paths with ambiguous missing-suffix traversal as
 /// inside the repository. Placement itself reports the resolution refusal.
+#[cfg(test)]
 fn path_is_inside(root: &Path, candidate: &Path) -> bool {
     match (
         crate::broker::lifecycle::canonical_prefix(root),
@@ -704,7 +697,7 @@ mod tests {
         let fx = fixture();
         let volumes = fx._root.path().join("volumes");
         std::fs::create_dir(&volumes).unwrap();
-        let target = volumes.join("gone/worktrees/repo/run/merge-sim");
+        let target = volumes.join("gone/worktrees/repo/.aethyme/run/merge-sim");
 
         let refusal = removable_volume_unavailable_reason_with_root(&target, &volumes)
             .expect("a missing mount must be refused");
@@ -718,6 +711,7 @@ mod tests {
         let fx = fixture();
         let worktree_root = fx._root.path().join("worktrees/repo-key");
         std::fs::create_dir_all(&worktree_root).unwrap();
+        let resolved_worktree_root = std::fs::canonicalize(&worktree_root).unwrap();
         let placement = plan_slot_placement_for_roots(
             &fx.main,
             "merge-sim",
@@ -727,7 +721,10 @@ mod tests {
             "repo-key",
         );
 
-        assert_eq!(placement.directory, worktree_root.join("run/merge-sim"));
+        assert_eq!(
+            placement.directory,
+            resolved_worktree_root.join(".aethyme/run/merge-sim")
+        );
         assert!(
             !placement
                 .directory
@@ -756,7 +753,7 @@ mod tests {
             "repo-key",
             true,
         );
-        let expected = unavailable_root.join("run/merge-sim");
+        let expected = unavailable_root.join(".aethyme/run/merge-sim");
 
         assert!(placement.blocking_refusal.is_some());
         assert_eq!(placement.preferred.as_deref(), Some(expected.as_path()));
@@ -777,16 +774,17 @@ mod tests {
         let fx = fixture();
         let worktree_root = fx._root.path().join("library-worktrees");
         std::fs::create_dir_all(&worktree_root).unwrap();
-        let root_plan = crate::broker::lifecycle::plan_worktree_root_for(
-            &fx.main,
-            None,
-            Some(&worktree_root),
-        );
+        let resolved_worktree_root = std::fs::canonicalize(&worktree_root).unwrap();
+        let root_plan =
+            crate::broker::lifecycle::plan_worktree_root_for(&fx.main, None, Some(&worktree_root));
 
         let placement =
             plan_slot_placement_with_worktree_root_plan(&fx.main, "merge-sim", &root_plan);
 
-        assert_eq!(placement.directory, worktree_root.join("run/merge-sim"));
+        assert_eq!(
+            placement.directory,
+            resolved_worktree_root.join(".aethyme/run/merge-sim")
+        );
         assert_eq!(placement.preferred, None);
         assert!(!placement.inside_repository);
         assert!(!placement.directory.exists());
@@ -802,7 +800,7 @@ mod tests {
             None,
             Some(&unavailable_root),
         );
-        let expected = unavailable_root.join("run/merge-sim");
+        let expected = unavailable_root.join(".aethyme/run/merge-sim");
 
         let placement =
             plan_slot_placement_with_worktree_root_plan(&fx.main, "merge-sim", &root_plan);
@@ -833,11 +831,8 @@ mod tests {
         let missing = fx._root.path().join("missing");
         // The unresolved traversal would end under the checkout if followed.
         let override_root = fx._root.path().join("missing/../repo/.aethyme/worktrees");
-        let root_plan = crate::broker::lifecycle::plan_worktree_root_for(
-            &fx.main,
-            None,
-            Some(&override_root),
-        );
+        let root_plan =
+            crate::broker::lifecycle::plan_worktree_root_for(&fx.main, None, Some(&override_root));
 
         let placement =
             plan_slot_placement_with_worktree_root_plan(&fx.main, "merge-sim", &root_plan);
@@ -887,7 +882,7 @@ mod tests {
                 |_| None,
                 |_| Some(reason.to_string()),
             );
-            let expected = override_root.join("run/merge-sim");
+            let expected = override_root.join(".aethyme/run/merge-sim");
 
             assert!(placement.blocking_refusal.is_some(), "{reason}");
             assert!(placement.refusals[0].contains(reason));
@@ -905,7 +900,10 @@ mod tests {
     #[test]
     fn the_repository_fallback_refuses_low_headroom_without_creating_a_slot() {
         let fx = fixture();
-        let preferred = fx._root.path().join("external/repo-key/run/merge-sim");
+        let preferred = fx
+            ._root
+            .path()
+            .join("external/repo-key/.aethyme/run/merge-sim");
         let placement = repository_fallback_slot_placement(
             &fx.main,
             "merge-sim",

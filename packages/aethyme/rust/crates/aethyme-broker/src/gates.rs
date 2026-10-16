@@ -2151,11 +2151,7 @@ fn gate_storage_admission_refusal(
 }
 
 fn broker_database_storage_refusal(store: &BrokerStore, main_root: &Path) -> Option<String> {
-    let path = store
-        .db_path()
-        .parent()
-        .unwrap_or(main_root)
-        .to_path_buf();
+    let path = store.db_path().parent().unwrap_or(main_root).to_path_buf();
     if let Some(reason) = crate::verification::removable_volume_unavailable_reason(&path) {
         return Some(format!(
             "broker database storage at {} is unavailable: {reason}",
@@ -2208,6 +2204,8 @@ fn run_selections(
     )
 }
 
+/// Keeps both storage admission probes injectable for ordering regressions.
+#[allow(clippy::too_many_arguments)]
 fn run_selections_with_admission<CachedEventAdmission, GateAdmission>(
     store: &mut BrokerStore,
     main_root: &Path,
@@ -3937,7 +3935,10 @@ mod tests {
             )
             .unwrap();
         assert_eq!(after_rows, before_rows);
-        assert_eq!(store.events_after(0, 100).unwrap().len(), before_events.len());
+        assert_eq!(
+            store.events_after(0, 100).unwrap().len(),
+            before_events.len()
+        );
         assert!(progress.0.lock().unwrap().iter().any(|line| {
             line.contains("storage refusal is unrecorded")
                 && line.contains("broker database is below the gate reserve")
@@ -4002,8 +4003,7 @@ mod tests {
         assert_eq!(outcomes[0].status, GateStatus::Pass);
         assert_eq!(store.events_after(0, 100).unwrap().len(), before.len());
         assert!(progress.0.lock().unwrap().iter().any(|line| {
-            line.contains("cache hit event unrecorded")
-                && line.contains("below the gate reserve")
+            line.contains("cache hit event unrecorded") && line.contains("below the gate reserve")
         }));
         assert!(!checkout_root.join(".aethyme/logs/gates").exists());
     }
@@ -4016,14 +4016,31 @@ mod tests {
         let checkout = GitRepo::discover(&checkout_root).unwrap();
         let database = root.path().join("broker.db");
         let mut store = BrokerStore::open(&database).unwrap();
+        let session = store
+            .register_session(&crate::types::NewSession {
+                worktree_path: checkout_root.display().to_string(),
+                branch: "agent/test-low-storage-cancellation".to_string(),
+                origin: crate::types::SessionOrigin::Adopted,
+                task: None,
+                diff_base: None,
+                adoption_base: None,
+                adopted_head: None,
+                repository_contract: None,
+                pid: None,
+                command: None,
+                log_path: None,
+                agent_identity: None,
+            })
+            .unwrap();
+        let session_id = session.id;
         let gate = synthetic_gate("slow", false, "touch should-not-run");
-        let pidfile = running_dir(&checkout_root).join("7-slow.pid");
+        let pidfile = running_dir(&checkout_root).join(format!("{session_id}-slow.pid"));
         std::fs::create_dir_all(pidfile.parent().unwrap()).unwrap();
         std::fs::write(
             &pidfile,
             GatePidRecord {
                 pgid: 1,
-                tree: "obsolete tree".to_string(),
+                tree: "obsolete-tree".to_string(),
                 pid: Some(1),
                 start: None,
                 run: None,
@@ -4044,7 +4061,7 @@ mod tests {
                 triggered_by: None,
                 owner_paths: Vec::new(),
             }],
-            Some(7),
+            Some(session_id),
             CachePolicy::Use,
             GateRuntimeContext {
                 progress: &progress,
@@ -4064,7 +4081,10 @@ mod tests {
 
         assert_eq!(outcomes.len(), 1);
         assert_eq!(outcomes[0].status, GateStatus::Error);
-        assert_eq!(outcomes[0].failure_class, Some(GateFailureClass::ResourceContention));
+        assert_eq!(
+            outcomes[0].failure_class,
+            Some(GateFailureClass::ResourceContention)
+        );
         assert!(!pidfile.exists());
         assert!(!checkout_root.join(".aethyme/logs/gates").exists());
         assert!(!checkout_root.join("should-not-run").exists());
@@ -4072,9 +4092,10 @@ mod tests {
             .unwrap()
             .query_row(
                 "SELECT COUNT(*) FROM gate_results
-                 WHERE gate_name = 'slow' AND tree_hash = 'obsolete tree'
+                 WHERE gate_name = 'slow' AND tree_hash = 'obsolete-tree'
+                   AND session_id = ?1
                    AND status = 'cancelled'",
-                [],
+                [session_id],
                 |row| row.get(0),
             )
             .unwrap();

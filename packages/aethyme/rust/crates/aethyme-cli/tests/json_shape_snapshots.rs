@@ -106,7 +106,10 @@ fn status_shape(value: &serde_json::Value) -> String {
         .get("advice")
         .and_then(serde_json::Value::as_array)
         .expect("status advice is an array");
-    assert!(!advice.is_empty(), "status includes its recorded-observations advice");
+    assert!(
+        !advice.is_empty(),
+        "status includes its recorded-observations advice"
+    );
     for (index, item) in advice.iter().enumerate() {
         let item = item
             .as_object()
@@ -134,7 +137,10 @@ fn status_shape(value: &serde_json::Value) -> String {
         .as_object_mut()
         .expect("status advice shape item is an object");
     for field_name in ["session_id", "queue_entry_id"] {
-        assert!(first.contains_key(field_name), "status shape includes {field_name}");
+        assert!(
+            first.contains_key(field_name),
+            "status shape includes {field_name}"
+        );
         first.insert(
             field_name.to_string(),
             serde_json::Value::String("integer|null".into()),

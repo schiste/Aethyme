@@ -1839,7 +1839,6 @@ pub(super) fn run_cleanup(parsed: Parsed) -> Result<(), UsageError> {
     Ok(())
 }
 
-
 #[cfg(test)]
 mod worktree_root_display_tests {
     #[test]
