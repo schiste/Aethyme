@@ -384,6 +384,55 @@ mod tests {
         .unwrap();
     }
 
+    fn assert_request_reconstruction_rejects_rehashed_semantic_changes(
+        store: &mut crate::collaboration_state::CollaborationStore,
+        repo: &Path,
+        request: &RecordRef,
+    ) {
+        use aethyme_contracts::experimental_v0::{Record, canonical_json};
+
+        let original = resolution_api::read_record(store, request).unwrap();
+        for (field, altered, expected_detail) in [
+            (
+                "decision",
+                json!("f".repeat(64)),
+                "the decision does not match its contributions",
+            ),
+            (
+                "scope",
+                json!(["outside-the-resolution.txt"]),
+                "the scope does not match the members' changes",
+            ),
+            (
+                "protected",
+                json!([]),
+                "the protected paths do not match the baseline's policy",
+            ),
+        ] {
+            let mut document: Value = serde_json::from_slice(&original.canonical_bytes()).unwrap();
+            document[field] = altered;
+            let bytes =
+                canonical_json::canonicalize(&serde_json::to_vec(&document).unwrap()).unwrap();
+            // Recompute both identities, so rejection must come from rebuilding
+            // the request's meaning rather than a stale object/record digest.
+            let decoded =
+                Record::decode(&bytes, &[&resolution_api::RESOLUTION_REQUEST_SCHEMA]).unwrap();
+            let forged = RecordRef {
+                id: decoded.id(),
+                object: crate::collaboration_archive::put_object(store, &bytes).unwrap(),
+            };
+            assert_ne!(forged.id, request.id);
+            assert_ne!(forged.object, request.object);
+            match resolution_api::load_request(store, repo, &forged).unwrap_err() {
+                resolution_api::ResolutionError::RecordMismatch { detail, .. } => {
+                    assert_eq!(detail, expected_detail, "altered {field}");
+                }
+                other => panic!("altered {field} failed before semantic reconstruction: {other:?}"),
+            }
+        }
+        resolution_api::load_request(store, repo, request).unwrap();
+    }
+
     #[test]
     fn resolution_commands_complete_a_bound_round_trip() {
         use crate::local_target::tests::{Fixture, git};
@@ -438,6 +487,11 @@ mod tests {
         )
         .unwrap();
         let request = requested.resolution_request.unwrap();
+        assert_request_reconstruction_rejects_rehashed_semantic_changes(
+            &mut fixture.store,
+            repo,
+            &request,
+        );
         let version = target::status(&fixture.store, "target")
             .unwrap()
             .version
