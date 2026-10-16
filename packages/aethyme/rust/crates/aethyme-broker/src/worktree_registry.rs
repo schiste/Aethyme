@@ -127,6 +127,17 @@ fn regular_file(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
+fn registry_outside_root(host_database: &Path, root: &Path) -> io::Result<()> {
+    let registry = crate::broker::lifecycle::canonical_prefix(&registry_directory(host_database)?)
+        .map_err(invalid)?;
+    if registry.starts_with(root) {
+        return Err(invalid(
+            "worktree registry must reside outside the root it coordinates",
+        ));
+    }
+    Ok(())
+}
+
 /// One stable host-domain lock excludes root admission for the entire orphan
 /// removal. It is never unlinked or truncated. Contention refuses admission
 /// promptly; a crashed remover releases the OS lock without stale tombstones.
@@ -417,8 +428,9 @@ fn register_with_limit(
     source: WorktreeRootSource,
     limit: usize,
 ) -> io::Result<()> {
-    let _admission = registry_lock(host_database, true)?;
     let root = fs::canonicalize(root)?;
+    registry_outside_root(host_database, &root)?;
+    let _admission = registry_lock(host_database, true)?;
     let actual = read_marker(&root)?;
     if actual.schema_version != marker.schema_version
         || actual.repository_key != marker.repository_key
@@ -610,6 +622,8 @@ pub(crate) struct RemovalClaim {
 pub(crate) enum ClaimError {
     /// The old authorization has conclusively lost its ownership premise.
     Revoked(String),
+    /// The root is retained; a fresh plan may not rediscover missing history.
+    HistoryLost(String),
     /// Inspection or coordination could not finish. Keep durable work pending.
     Unavailable(io::Error),
 }
@@ -625,14 +639,16 @@ pub(crate) fn claim_for_removal(
     root: &Path,
     expected: &str,
 ) -> Result<RemovalClaim, ClaimError> {
+    registry_outside_root(host_database, root)?;
     let claim = registry_lock(host_database, false)?;
     let connection = open_registry(host_database, false)?;
     let key = record_key(root);
     let payload: Option<String> = connection.query_row("SELECT CASE WHEN length(CAST(payload AS BLOB)) <= 8192 THEN payload ELSE NULL END FROM roots WHERE key=?1", [&key], |row| row.get(0)).optional().map_err(invalid)?.flatten();
     let payload = payload.ok_or_else(|| {
-        ClaimError::Revoked("registered ownership record is missing or oversized".into())
+        ClaimError::HistoryLost("registered ownership record is missing or oversized".into())
     })?;
-    let record = decode(&key, &payload).map_err(|error| ClaimError::Revoked(error.to_string()))?;
+    let record =
+        decode(&key, &payload).map_err(|error| ClaimError::HistoryLost(error.to_string()))?;
     let fingerprint = format!(
         "{:x}",
         Sha256::digest(serde_json::to_vec(&record).map_err(invalid)?)
@@ -1125,5 +1141,22 @@ mod tests {
             claim_for_removal(&fixture.database, &root, &fingerprint),
             Err(ClaimError::Unavailable(_))
         ));
+    }
+    #[test]
+    fn registry_cannot_be_placed_inside_a_root_it_may_remove() {
+        let fixture = Fixture::new();
+        let (root, owner) = fixture.root("root");
+        let database = root.join("host-operations.db");
+        assert!(
+            register(
+                &database,
+                &root,
+                &owner,
+                WorktreeRootSource::LibraryOverride
+            )
+            .is_err()
+        );
+        assert!(!registry_directory(&database).unwrap().exists());
+        assert!(root.join(WORKTREE_ROOT_MARKER).is_file());
     }
 }

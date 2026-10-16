@@ -1184,12 +1184,32 @@ impl Broker {
             }
         }
         let mut candidates = Vec::new();
+        let mut inspected_roots = std::collections::BTreeSet::new();
         for root in roots {
             if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
                 complete = false;
                 break;
             }
             if !is_real_directory(&root) {
+                continue;
+            }
+            // Registry records use canonical roots. Container discovery may
+            // reach the same directory through an ancestor alias (for example
+            // macOS /var and /private/var); compare the same identity once.
+            // Reject a symlink leaf above before resolving ancestor aliases.
+            let root = match std::fs::canonicalize(&root) {
+                Ok(root) => root,
+                Err(error) => {
+                    complete = false;
+                    blockers.push(GcBlocker {
+                        kind: "worktree_root_history_uninspected".into(),
+                        id: None,
+                        reason: format!("{}: {error}", root.display()),
+                    });
+                    continue;
+                }
+            };
+            if !inspected_roots.insert(root.clone()) {
                 continue;
             }
             let marker = match crate::worktree_registry::read_marker(&root) {
@@ -3116,6 +3136,12 @@ impl Broker {
                     write_journal(&journal_path, &journal)?;
                     continue;
                 }
+                Err(crate::worktree_registry::ClaimError::HistoryLost(reason)) => {
+                    failures.push(format!("{}: orphan authorization revoked ({reason}); no deletion performed. Saved history cannot safely authorize reclamation; a fresh plan may omit this root. Independently recover ownership before requesting its removal", candidate.worktree_root));
+                    journal.remaining_orphans.remove(0);
+                    write_journal(&journal_path, &journal)?;
+                    continue;
+                }
                 Err(crate::worktree_registry::ClaimError::Unavailable(error)) => {
                     failures.push(format!(
                         "{}: orphan removal temporarily unavailable ({error}); retained in journal",
@@ -3578,6 +3604,32 @@ mod tests {
         )
         .unwrap();
         (fixture, broker, root.canonicalize().unwrap(), digest)
+    }
+
+    #[test]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn a_discovery_parent_alias_matches_one_registered_root_without_unknown_bytes() {
+        let (fixture, broker, root, _digest) = registered_orphan_fixture();
+        let alias = fixture.path().join("aliased-container");
+        std::os::unix::fs::symlink(root.parent().unwrap(), &alias).unwrap();
+        let mut broker = broker.with_worktree_root(alias.join(root.file_name().unwrap()));
+        let plan = broker.gc_plan().unwrap();
+        assert_eq!(plan.orphans.len(), 1, "aliased roots must be counted once");
+        assert_eq!(plan.orphans[0].worktree_root, root.to_string_lossy());
+        assert!(
+            !plan
+                .deferred_checks
+                .iter()
+                .any(|check| check == "orphan_scan"),
+            "a registered root reached through a parent alias has known ownership: {:?}",
+            plan.blockers
+        );
+        assert!(
+            !plan
+                .blockers
+                .iter()
+                .any(|blocker| blocker.kind == "worktree_origin_uninspected")
+        );
     }
 
     #[test]
