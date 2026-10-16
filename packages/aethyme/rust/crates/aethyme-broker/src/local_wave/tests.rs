@@ -27,7 +27,7 @@ fn rewrite_source_record(
     edit(&mut payload);
     let encoded = serde_json::to_vec(&payload).unwrap();
     let record = Record::decode(&encoded, &[&COMPOSITION_SOURCE_SCHEMA]).unwrap();
-    let object = archive::put_object(&f.store, record.canonical_bytes()).unwrap();
+    let object = archive::put_object(&f.store, &record.canonical_bytes()).unwrap();
     let revision = id(&wave.spec.revision).unwrap();
     target::retain_artifacts(
         &mut f.store,
