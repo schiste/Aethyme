@@ -42,8 +42,16 @@ fn mint_verification_candidate(
     tree: &str,
     message: &str,
     attribution: &crate::attribution::Attribution,
+    history_parent: Option<&str>,
 ) -> Result<VerificationCandidate, BrokerOpError> {
-    let commit = repo.commit_tree(tree, &[base], message, attribution)?;
+    // The optional second parent is the exact, fully owned source DAG. Keep
+    // the verified integration base first, and preserve broker attribution
+    // and contract decisions on the newly gated commit as on linear replay.
+    let parents = match history_parent {
+        Some(head) => vec![base, head],
+        None => vec![base],
+    };
+    let commit = repo.commit_tree(tree, &parents, message, attribution)?;
     Ok(VerificationCandidate {
         base: base.to_string(),
         inputs,
@@ -547,9 +555,17 @@ pub struct SubmissionConflict {
 }
 
 pub(crate) struct SubmissionReplay {
+    /// A proven source DAG to retain as the verification commit's second parent.
+    history_parent: Option<String>,
     pub(crate) tree: String,
     pub(crate) conflicts: Vec<String>,
     pub(crate) conflict_details: Vec<SubmissionConflict>,
+}
+
+impl SubmissionReplay {
+    pub(crate) fn retains_source_history(&self) -> bool {
+        self.history_parent.is_some()
+    }
 }
 
 impl Broker {
@@ -1083,6 +1099,7 @@ impl Broker {
             &simulation.tree,
             &verification_message,
             &attribution,
+            simulation.history_parent.as_deref(),
         )?;
         let merge_commit = candidate.commit.as_str();
         let verify_base = pre_refresh.as_deref().unwrap_or(&base);
@@ -1381,6 +1398,14 @@ impl Broker {
         }
 
         let repo = self.repo_handle();
+        if self.can_preserve_owned_merge_history(plan)? {
+            return Ok(SubmissionReplay {
+                history_parent: Some(plan.session_head.clone()),
+                tree: repo.commit_tree_id(&plan.session_head)?,
+                conflicts: Vec::new(),
+                conflict_details: Vec::new(),
+            });
+        }
         let mut current = plan.integration_head.clone();
         for commit in &plan.commits {
             if commit.ownership != SubmissionCommitOwnership::SessionOwned
@@ -1433,6 +1458,7 @@ impl Broker {
                     })
                     .collect();
                 return Ok(SubmissionReplay {
+                    history_parent: None,
                     tree: simulation.tree,
                     conflicts: simulation.conflicts,
                     conflict_details,
@@ -1450,10 +1476,57 @@ impl Broker {
             )?;
         }
         Ok(SubmissionReplay {
+            history_parent: None,
             tree: repo.commit_tree_id(&current)?,
             conflicts: Vec::new(),
             conflict_details: Vec::new(),
         })
+    }
+
+    /// Retain a merge DAG only when its entire exclusive history is owned,
+    /// pending, and based on the exact current integration. First-parent
+    /// patch replay cannot preserve a merge's conflict-resolution edits.
+    /// Missing, rewritten, inherited or patch-equivalent provenance keeps
+    /// using the existing replay/refusal path instead of importing history.
+    fn can_preserve_owned_merge_history(
+        &self,
+        plan: &SubmissionPlan,
+    ) -> Result<bool, BrokerOpError> {
+        if !plan.commits.iter().any(|c| c.parents.len() == 2) {
+            return Ok(false);
+        }
+        let repo = self.repo_handle();
+        let Some(baseline) = plan.recorded_baseline.as_deref() else {
+            return Ok(false);
+        };
+        if !plan.safe
+            || !repo.has_complete_unmodified_history()?
+            || !repo.is_ancestor_checked(baseline, &plan.integration_head)?
+            || !repo.is_ancestor_checked(baseline, &plan.session_head)?
+            || !repo.is_ancestor_checked(&plan.integration_head, &plan.session_head)?
+        {
+            return Ok(false);
+        }
+        let carried = repo
+            .commits_excluding_oldest(&plan.session_head, &plan.integration_head)?
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        let pending = plan.pending_owned_commit_ids();
+        if carried.is_empty()
+            || pending.len() != carried.len()
+            || pending.into_iter().collect::<BTreeSet<_>>() != carried
+        {
+            return Ok(false);
+        }
+        let mut has_merge = false;
+        for commit in plan.commits.iter().filter(|c| carried.contains(&c.commit)) {
+            let parents = repo.commit_parents(&commit.commit)?;
+            if parents != commit.parents || !(1..=2).contains(&parents.len()) {
+                return Ok(false);
+            }
+            has_merge |= parents.len() == 2;
+        }
+        Ok(has_merge)
     }
 
     pub(crate) fn validate_submission_plan(
@@ -2483,6 +2556,7 @@ mod verification_candidate_tests {
             &tree,
             "test verification candidate",
             &Attribution::broker_only(),
+            None,
         )
         .unwrap();
 
@@ -2501,5 +2575,156 @@ mod verification_candidate_tests {
             repo.commit_message(&candidate.commit).unwrap(),
             "test verification candidate"
         );
+    }
+}
+
+#[cfg(test)]
+mod owned_merge_history_tests {
+    use super::*;
+
+    fn git(root: &Path, args: &[&str]) -> String {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .env("GIT_AUTHOR_NAME", "History Test")
+            .env("GIT_AUTHOR_EMAIL", "history@example.invalid")
+            .env("GIT_COMMITTER_NAME", "History Test")
+            .env("GIT_COMMITTER_EMAIL", "history@example.invalid")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
+    }
+
+    fn edit(root: &Path, file: &str, content: &str) {
+        std::fs::write(root.join(file), content).unwrap();
+        git(root, &["add", file]);
+        git(root, &["commit", "-qm", file]);
+    }
+
+    fn fixture() -> (tempfile::TempDir, Broker, SubmissionPlan) {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        git(root, &["init", "-q", "-b", "main"]);
+        edit(root, "base.txt", "base\n");
+        let base = git(root, &["rev-parse", "HEAD"]);
+        let mut broker = Broker::open(root).unwrap();
+        let source = root.join(".aethyme/worktrees/source");
+        git(
+            root,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "agent/source",
+                source.to_str().unwrap(),
+            ],
+        );
+        let session = broker.adopt(&source, None).unwrap();
+        git(&source, &["branch", "side"]);
+        edit(&source, "left.txt", "left\n");
+        git(&source, &["checkout", "-q", "side"]);
+        edit(&source, "right.txt", "right\n");
+        git(&source, &["checkout", "-q", "agent/source"]);
+        git(
+            &source,
+            &["merge", "-q", "--no-ff", "side", "-m", "owned merge"],
+        );
+        let head = git(&source, &["rev-parse", "HEAD"]);
+        let plan = broker
+            .build_submission_plan(&session, &head, &base)
+            .unwrap();
+        assert!(broker.can_preserve_owned_merge_history(&plan).unwrap());
+        (tmp, broker, plan)
+    }
+
+    #[test]
+    fn owned_merge_proof_requires_exact_complete_pending_history() {
+        let (_tmp, broker, original) = fixture();
+        let merge = original
+            .commits
+            .iter()
+            .position(|c| c.parents.len() == 2)
+            .unwrap();
+        let mut cases = Vec::new();
+        let mut plan = original.clone();
+        plan.safe = false;
+        cases.push(("unsafe", plan));
+        let mut plan = original.clone();
+        plan.recorded_baseline = None;
+        cases.push(("missing boundary", plan));
+        let mut plan = original.clone();
+        plan.recorded_baseline = Some(original.session_head.clone());
+        cases.push(("boundary outside integration", plan));
+        let mut plan = original.clone();
+        plan.commits[0].ownership = SubmissionCommitOwnership::InheritedFromRecordedBaseline;
+        cases.push(("inherited side ancestor", plan));
+        let mut plan = original.clone();
+        plan.commits[0].integration_state =
+            SubmissionIntegrationState::AlreadyIntegratedByStablePatchIdentity;
+        cases.push(("patch identity is not ancestry", plan));
+        let mut plan = original.clone();
+        plan.commits[merge].parents.reverse();
+        cases.push(("ordered parent mismatch", plan));
+        let mut plan = original.clone();
+        plan.commits.remove(0);
+        cases.push(("omitted ancestor", plan));
+        let mut plan = original.clone();
+        plan.commits.push(plan.commits[0].clone());
+        cases.push(("duplicated provenance", plan));
+        for (label, plan) in cases {
+            assert!(
+                !broker.can_preserve_owned_merge_history(&plan).unwrap(),
+                "{label}"
+            );
+        }
+        assert!(broker.can_preserve_owned_merge_history(&original).unwrap());
+    }
+
+    #[test]
+    fn owned_merge_proof_refuses_shallow_replacement_and_grafted_history() {
+        for control in ["shallow", "replace", "graft"] {
+            let (tmp, broker, plan) = fixture();
+            let root = tmp.path();
+            match control {
+                "shallow" => std::fs::write(
+                    root.join(".git/shallow"),
+                    format!("{}\n", plan.session_head),
+                )
+                .unwrap(),
+                "replace" => {
+                    // Even an unrelated replacement must disable this path;
+                    // otherwise another ref could change the history view.
+                    let unrelated = broker
+                        .repo_handle()
+                        .commit_tree(
+                            &broker
+                                .repo_handle()
+                                .commit_tree_id(&plan.integration_head)
+                                .unwrap(),
+                            &[&plan.integration_head],
+                            "unreachable history-view control",
+                            &crate::attribution::Attribution::broker_only(),
+                        )
+                        .unwrap();
+                    git(root, &["replace", &unrelated, &plan.integration_head]);
+                }
+                "graft" => std::fs::write(
+                    root.join(".git/info/grafts"),
+                    format!("{}\n", plan.session_head),
+                )
+                .unwrap(),
+                _ => unreachable!(),
+            }
+            assert!(
+                !broker.can_preserve_owned_merge_history(&plan).unwrap(),
+                "{control}"
+            );
+        }
     }
 }
