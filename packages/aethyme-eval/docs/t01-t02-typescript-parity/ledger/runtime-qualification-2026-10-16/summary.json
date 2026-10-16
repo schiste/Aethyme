@@ -11,7 +11,7 @@
     },
     "t01_exit_status": 1,
     "t01_refusal": "Error: frozen source drift at packages/aethyme/rust/crates/aethyme-contracts/src/experimental_v0/canonical_json.rs: expected 90070c56f613bb94564072c56076daf2428f2888f0b71e34a526b718c55b52f3, found 6bbeea89e7d5850651687382255619b2ea9d30538341ebbba51a53a0605a6a35",
-    "t01_stderr_sha256": "e304256cd596d6e0395ea9649b9b658a300fe7c0fdbd08696a5e2d19ac2161587",
+    "t01_stderr_sha256": "e304256cd596d6e0395ea964b9b658a300fe7c0fdbd08696a5e2d19ac2161587",
     "t01_t02_assertions": null
   },
   "attempt_002": {
