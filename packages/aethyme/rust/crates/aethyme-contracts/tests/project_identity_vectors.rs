@@ -127,7 +127,7 @@ fn exact_rename_preserves_id_but_unannotated_rename_stays_uncertain() {
             .find(|file| file.path == b"new.rs")
             .unwrap()
             .file_id,
-        base_ids[b"old.rs"]
+        base_ids[&b"old.rs"[..]]
     );
     assert!(
         explicit
@@ -145,7 +145,7 @@ fn exact_rename_preserves_id_but_unannotated_rename_stays_uncertain() {
         &[],
     )
     .unwrap();
-    let old_id = &base_ids[b"old.rs"];
+    let old_id = &base_ids[&b"old.rs"[..]];
     let new_id = &inferred
         .result_files()
         .iter()
@@ -230,10 +230,10 @@ fn copy_and_split_create_new_ids_with_explicit_derivation() {
         .iter()
         .find(|file| file.path == b"copy.rs")
         .unwrap();
-    assert_ne!(copied.file_id, base_ids[b"source.rs"]);
+    assert_ne!(copied.file_id, base_ids[&b"source.rs"[..]]);
     assert!(copy.changes().iter().any(|change| {
         change.relation == IdentityRelation::ExplicitCopy
-            && change.derived_from == vec![base_ids[b"source.rs"].clone()]
+            && change.derived_from == vec![base_ids[&b"source.rs"[..]].clone()]
     }));
 
     let split_result = snapshot(&[(b"part-a.rs", b"first"), (b"part-b.rs", b"second")]);
@@ -261,7 +261,7 @@ fn copy_and_split_create_new_ids_with_explicit_derivation() {
             .changes()
             .iter()
             .filter(|change| { change.relation == IdentityRelation::ExplicitSplit })
-            .all(|change| change.derived_from == vec![base_ids[b"source.rs"].clone()])
+            .all(|change| change.derived_from == vec![base_ids[&b"source.rs"[..]].clone()])
     );
 }
 
@@ -274,7 +274,6 @@ fn competing_new_files_at_the_same_path_conflict_even_with_equal_bytes() {
         &base,
     )
     .unwrap();
-    let base_ids = descriptor.file_map();
     let base_state = descriptor.initial_file_identity_state().unwrap();
     let result = snapshot(&[(b"base.rs", b"base"), (b"new.rs", b"same")]);
     let left = advance_file_identities(
