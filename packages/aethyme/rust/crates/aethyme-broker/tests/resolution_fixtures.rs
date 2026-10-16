@@ -15,6 +15,7 @@ use std::cell::Cell;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::rc::Rc;
+use std::sync::{Arc, Barrier};
 
 use aethyme_broker::collaboration_archive::{self, CommitOid};
 use aethyme_broker::collaboration_capture::{
@@ -791,6 +792,180 @@ fn asynchronous_attempt_is_charged_before_export_and_imported_once() {
     };
     assert_eq!(after_settlement.token, status.token);
     assert_eq!(after_settlement.state, ResolutionAttemptState::Settled);
+}
+
+#[test]
+fn importing_attempt_resumes_after_store_reopen() {
+    let (case, input) = interaction();
+    let (mut world, request) = raise(&case, &input);
+    let limits = DispatchLimits {
+        max_manifest_bytes: 4 * 1024 * 1024,
+        max_manifest_entries: 8192,
+        max_file_bytes: 4 * 1024 * 1024,
+        max_total_input_bytes: 32 * 1024 * 1024,
+        max_response_bytes: 64 * 1024,
+    };
+    let started = resolution::begin_attempt(
+        &mut world.store,
+        &world.repo,
+        request.record(),
+        "session-test-reopen",
+        "client-key-reopen",
+        limits,
+    )
+    .unwrap();
+    let BeginResolutionAttempt::Started { status, .. } = started else {
+        panic!("expected a new charged attempt");
+    };
+    resolution::mark_attempt_dispatching(&mut world.store, &status.token, "session-test-reopen")
+        .unwrap();
+
+    let response = Response::Unresolved("recovered after import interruption".into());
+    let response_bytes =
+        resolution::encode_response_bytes(&response, limits.max_response_bytes).unwrap();
+    let base = git(&world.repo, &["rev-parse", "HEAD"]);
+    let response_path = world.repo.join("async-response.fixture");
+    std::fs::write(&response_path, &response_bytes).unwrap();
+    git(&world.repo, &["add", "async-response.fixture"]);
+    git(
+        &world.repo,
+        &["commit", "-m", "fixture async response archive object"],
+    );
+    let result = git(&world.repo, &["rev-parse", "HEAD"]);
+    capture_lineage(&mut world.store, &world.repo, &base, &result);
+
+    let response_sha256 = format!("{:x}", Sha256::digest(&response_bytes));
+    let holder = format!("resolution:{}", status.token);
+    let transaction = world
+        .store
+        .connection()
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .unwrap();
+    let changed = transaction
+        .execute(
+            "UPDATE resolution_attempts
+             SET async_state='importing', response_sha256=?1
+             WHERE async_token=?2 AND session_label=?3 AND async_state='dispatching'",
+            rusqlite::params![response_sha256, status.token, "session-test-reopen"],
+        )
+        .unwrap();
+    assert_eq!(changed, 1);
+    transaction
+        .execute(
+            "INSERT INTO object_pins(class,object_sha256,holder,until_ms,created_ms)
+             VALUES('cited_evidence',?1,?2,NULL,1)",
+            rusqlite::params![response_sha256, holder],
+        )
+        .unwrap();
+    transaction.commit().unwrap();
+
+    let importing =
+        resolution::attempt_status(&world.store, &status.token, "session-test-reopen").unwrap();
+    assert_eq!(importing.state, ResolutionAttemptState::Importing);
+    assert_eq!(
+        importing.response_sha256.as_deref(),
+        Some(response_sha256.as_str())
+    );
+
+    let host = world.root.path().join("state");
+    let repo = world.repo.clone();
+    drop(world.store);
+    world.store = open_store(&host, &repo);
+    let resumed = resolution::resume_attempt_import(
+        &mut world.store,
+        &world.repo,
+        &status.token,
+        "session-test-reopen",
+    )
+    .unwrap();
+    assert_eq!(failure(&resumed), Some(ResolutionFailure::Unresolved));
+    let settled =
+        resolution::attempt_status(&world.store, &status.token, "session-test-reopen").unwrap();
+    assert_eq!(settled.state, ResolutionAttemptState::Settled);
+    assert_eq!(
+        settled.response_sha256.as_deref(),
+        Some(response_sha256.as_str())
+    );
+    assert_eq!(settled.outcome.as_deref(), Some("unresolved"));
+}
+
+#[test]
+fn concurrent_bound_imports_settle_one_attempt_once() {
+    let (case, input) = interaction();
+    let (mut world, request) = raise(&case, &input);
+    let limits = DispatchLimits {
+        max_manifest_bytes: 4 * 1024 * 1024,
+        max_manifest_entries: 8192,
+        max_file_bytes: 4 * 1024 * 1024,
+        max_total_input_bytes: 32 * 1024 * 1024,
+        max_response_bytes: 64 * 1024,
+    };
+    let started = resolution::begin_attempt(
+        &mut world.store,
+        &world.repo,
+        request.record(),
+        "session-test-concurrent",
+        "client-key-concurrent",
+        limits,
+    )
+    .unwrap();
+    let BeginResolutionAttempt::Started { status, .. } = started else {
+        panic!("expected a new charged attempt");
+    };
+    resolution::mark_attempt_dispatching(
+        &mut world.store,
+        &status.token,
+        "session-test-concurrent",
+    )
+    .unwrap();
+    let response_envelope = serde_json::json!({
+        "schema": resolution::ASYNC_RESPONSE_ENVELOPE_SCHEMA,
+        "attempt_token": status.token,
+        "session_label": "session-test-concurrent",
+        "request_record_id": status.request.id.as_str(),
+        "request_object_sha256": status.request.object.hex(),
+        "input_manifest_sha256": status.input_manifest_sha256,
+        "response": {"kind": "unresolved", "detail": "one concurrent settlement"},
+    });
+    let response_bytes = serde_json::to_vec(&response_envelope).unwrap();
+    let bound = resolution::decode_attempt_response_envelope(&status, &response_bytes).unwrap();
+
+    let barrier = Arc::new(Barrier::new(2));
+    let host = world.root.path().join("state");
+    let repo = world.repo.clone();
+    let first_barrier = Arc::clone(&barrier);
+    let first_bound = bound.clone();
+    let first_host = host.clone();
+    let first_repo = repo.clone();
+    let first = std::thread::spawn(move || {
+        let mut store = open_store(&first_host, &first_repo);
+        first_barrier.wait();
+        resolution::finish_bound_attempt(&mut store, &first_repo, &first_bound)
+    });
+    let second_barrier = Arc::clone(&barrier);
+    let second_bound = bound;
+    let second = std::thread::spawn(move || {
+        let mut store = open_store(&host, &repo);
+        second_barrier.wait();
+        resolution::finish_bound_attempt(&mut store, &repo, &second_bound)
+    });
+    let first = first.join().unwrap();
+    let second = second.join().unwrap();
+    assert_eq!(usize::from(first.is_ok()) + usize::from(second.is_ok()), 1);
+
+    let settled =
+        resolution::attempt_status(&world.store, &status.token, "session-test-concurrent").unwrap();
+    assert_eq!(settled.state, ResolutionAttemptState::Settled);
+    assert_eq!(settled.outcome.as_deref(), Some("unresolved"));
+    let ledger = read_only_state_connection(&world.store);
+    let attempts: i64 = ledger
+        .query_row(
+            "SELECT count(*) FROM resolution_attempts WHERE async_token=?1",
+            [&status.token],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(attempts, 1);
 }
 
 #[test]
