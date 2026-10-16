@@ -382,6 +382,78 @@ fn config_schema_key_is_accepted_and_unknown_keys_warn_never_fail() {
 }
 
 #[test]
+fn collaboration_config_uses_submit_policy_and_certify_stays_read_only() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_repo(tmp.path());
+    write_agent_protocol(tmp.path());
+    std::fs::create_dir_all(tmp.path().join(".aethyme")).unwrap();
+    let config = tmp.path().join(".aethyme/config.toml");
+    let certify_config = |text: &str| {
+        std::fs::write(&config, text).unwrap();
+        let before = snapshot(tmp.path());
+        let report = init::certify(tmp.path()).unwrap();
+        assert_eq!(
+            snapshot(tmp.path()),
+            before,
+            "certify changed repository files"
+        );
+        assert!(
+            !tmp.path().join(".aethyme/broker.db").exists(),
+            "certify created broker state"
+        );
+        let check = report
+            .checks
+            .iter()
+            .find(|check| check.id == "certify.config")
+            .unwrap()
+            .clone();
+        (check, report.certified())
+    };
+
+    let (check, certified) = certify_config(
+        "[collaboration]\ncapture = \"advisory\"\nproject = \"proj-local\"\ndescriptor = \"local\"\n",
+    );
+    assert_eq!(check.status, CheckStatus::Pass, "{}", check.detail);
+    assert!(certified);
+
+    let (check, certified) = certify_config(
+        "[collaboration]\ncapture = \"advisory\"\nproject = \"proj-local\"\nfuture = true\n",
+    );
+    assert_eq!(check.status, CheckStatus::Warn, "{}", check.detail);
+    assert!(
+        check.detail.contains("collaboration.future"),
+        "{}",
+        check.detail
+    );
+    assert!(certified);
+
+    for (text, expected) in [
+        (
+            "[collaboration]\ncapture = \"required\"\nproject = \"proj-local\"\nfuture = true\n",
+            "future",
+        ),
+        (
+            "[collaboration]\ncapture = \"future\"\nproject = \"proj-local\"\n",
+            "capture",
+        ),
+        ("[collaboration]\ncapture = \"advisory\"\n", "project"),
+        (
+            "[collaboration]\ncapture = \"advisory\"\nproject = \"not a key\"\n",
+            "project",
+        ),
+        (
+            "collaboration = \"invalid\"\n",
+            "not a [collaboration] table",
+        ),
+    ] {
+        let (check, certified) = certify_config(text);
+        assert_eq!(check.status, CheckStatus::Fail, "{}", check.detail);
+        assert!(check.detail.contains(expected), "{}", check.detail);
+        assert!(!certified);
+    }
+}
+
+#[test]
 fn local_scaffold_uses_runtime_state_without_touching_gitignore() {
     let tmp = tempfile::tempdir().unwrap();
     init_repo(tmp.path());
