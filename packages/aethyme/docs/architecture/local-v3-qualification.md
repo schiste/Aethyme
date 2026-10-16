@@ -84,6 +84,13 @@ vector run. Separate wrapper files retain the rejected archive inventory and
 review; neither failed attempt receives passing credit.
 This is an eval-side implementation, with no production TypeScript client claim.
 
+The additive [schema-26 runtime parity package](../../../aethyme-eval/docs/t01-t02-typescript-parity/ledger/runtime-qualification-2026-10-16/README.md)
+retains both attempts at source `f0209608`: the passing attempt ran 880 T01/T02
+and 224 D10 assertions before and after six intended mutation failures, plus two
+exact parser refusals. All 35 source/fixture pins and exact restores were checked.
+The first attempt remains an unqualified baseline failure; this is finite offline
+contract parity, with no production TypeScript consumer claim.
+
 Required L1 integration remains open: T03 explicit descriptor binding, T05 file
 provenance, D10 immutable contribution revisions for rationale-only changes and
 their added cross-language vectors. Draft #788 adds experimental contracts and
