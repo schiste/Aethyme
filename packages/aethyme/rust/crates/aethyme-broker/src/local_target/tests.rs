@@ -772,6 +772,7 @@ fn migration_adopts_charged_resolution_attempts_and_fences_schema_six() {
     let db = f.store.project_dir().join("state.db");
     drop(f.store);
     let c = rusqlite::Connection::open(&db).unwrap();
+    crate::collaboration_state::drop_identity_revision_schema_for_legacy_fixture(&c).unwrap();
     crate::collaboration_sensitive::drop_sensitive_response_tables_for_legacy_fixture(&c).unwrap();
     c.execute_batch("DROP TABLE IF EXISTS local_capture_notice_outcomes; DROP TABLE IF EXISTS local_capture_notices; DROP TABLE local_native_gate_roots; DROP TABLE local_native_gate_jobs;
         UPDATE meta SET value = '6' WHERE key IN ('schema_version', 'min_compatible_schema');

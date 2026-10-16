@@ -620,6 +620,121 @@ mod tests {
     }
 
     #[test]
+    fn an_old_omitted_fields_retry_inherits_the_current_operations_and_dependencies() {
+        let mut fixture = BoundProjectFixture::new().expect("real project enrollment and bind");
+        let root = CollaborationRoot::under_host_state(fixture.host.path());
+        let base = fixture.bootstrap_commit.clone();
+        fixture
+            .capture_operation("op-revision-hybrid-dependency", &base, &base)
+            .expect("dependency capture operation");
+        let dependency = run_at_fixture(
+            &fixture,
+            &root,
+            &["--operation", "op-revision-hybrid-dependency"],
+        )
+        .expect("real dependency revision")
+        .0["revision_record_id"]
+            .as_str()
+            .expect("dependency RecordId")
+            .to_string();
+
+        std::fs::rename(
+            fixture.repo_path().join("a.txt"),
+            fixture.repo_path().join("b.txt"),
+        )
+        .expect("rename tracked source");
+        git(fixture.repo_path(), &["add", "--all"]);
+        git(
+            fixture.repo_path(),
+            &["commit", "-q", "-m", "hybrid retry rename"],
+        );
+        let result = crate::collaboration_archive::pin_commit(fixture.repo_path(), "HEAD")
+            .expect("pin renamed result");
+        fixture
+            .capture_operation("op-revision-hybrid", &base, &result)
+            .expect("retained operation for the renamed source");
+
+        let files = tempfile::tempdir().expect("revision input files");
+        let brief_a = files.path().join("brief-a.json");
+        let brief_b = files.path().join("brief-b.json");
+        let operations = files.path().join("operations.json");
+        std::fs::write(&brief_a, br#"{"intent":"Initial rationale."}"#).unwrap();
+        std::fs::write(&brief_b, br#"{"intent":"New current rationale."}"#).unwrap();
+        std::fs::write(
+            &operations,
+            br#"{"operations":[{"from_hex":"612e747874","kind":"rename","to_hex":"622e747874"}],"schema":"aethyme.collab-file-operations/experimental-v0"}"#,
+        )
+        .unwrap();
+        let brief_a = brief_a.to_str().unwrap();
+        let brief_b = brief_b.to_str().unwrap();
+        let operations = operations.to_str().unwrap();
+
+        let initial = run_at_fixture(
+            &fixture,
+            &root,
+            &["--operation", "op-revision-hybrid", "--brief-file", brief_a],
+        )
+        .expect("initial revision with omitted operation/dependency fields")
+        .0;
+        assert_eq!(initial["depends_on"], json!([]));
+
+        let current = run_at_fixture(
+            &fixture,
+            &root,
+            &[
+                "--operation",
+                "op-revision-hybrid",
+                "--brief-file",
+                brief_b,
+                "--file-operations",
+                operations,
+                "--depends-on",
+                &dependency,
+            ],
+        )
+        .expect("revision that changes current operation/dependency fields")
+        .0;
+        assert_eq!(current["depends_on"], json!([dependency]));
+        assert_ne!(current["revision_record_id"], initial["revision_record_id"]);
+
+        let retried_old_input = run_at_fixture(
+            &fixture,
+            &root,
+            &["--operation", "op-revision-hybrid", "--brief-file", brief_a],
+        )
+        .expect("an omitted-field retry inherits the current head")
+        .0;
+        assert_eq!(
+            retried_old_input["brief_record_id"],
+            initial["brief_record_id"]
+        );
+        assert_eq!(retried_old_input["depends_on"], json!([dependency]));
+        assert_ne!(
+            retried_old_input["revision_record_id"], initial["revision_record_id"],
+            "the old command input does not pin the omitted fields to its historical revision"
+        );
+        assert_ne!(
+            retried_old_input["revision_record_id"],
+            current["revision_record_id"]
+        );
+        let resolved = resolve_output(&fixture, &retried_old_input);
+        assert!(
+            resolved
+                .identity_transition()
+                .changes()
+                .iter()
+                .any(|change| change.relation.as_str() == "explicit_rename")
+        );
+        assert_eq!(
+            current_head(
+                &fixture,
+                retried_old_input["contribution_id"].as_str().unwrap()
+            ),
+            retried_old_input["revision_record_id"].as_str().unwrap()
+        );
+    }
+
+    #[test]
     fn distinct_capture_operations_for_the_same_pair_mint_distinct_contributions() {
         let mut fixture = BoundProjectFixture::new().expect("real project enrollment and bind");
         let root = CollaborationRoot::under_host_state(fixture.host.path());
