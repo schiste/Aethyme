@@ -1683,8 +1683,8 @@ impl Broker {
             return Err(BrokerOpError::StartAgentRelease {
                 session_id: session.id,
                 pid,
-                worktree_path: worktree_path_string,
-                log_path: log_path_string,
+                worktree_path: worktree_path_string.into_boxed_str(),
+                log_path: log_path_string.into_boxed_str(),
                 reason: source.to_string(),
                 cleanup,
             });
@@ -2658,13 +2658,13 @@ pub(super) fn rollback_unregistered_start(
             worktree_path.display()
         )];
     }
-    if let Some(created_log) = created_log {
-        if let Err(reason) = remove_created_agent_log(created_log) {
-            return vec![format!(
-                "removed the unregistered worktree and branch but retained agent log {}: {reason}",
-                created_log.path.display()
-            )];
-        }
+    if let Some(created_log) = created_log
+        && let Err(reason) = remove_created_agent_log(created_log)
+    {
+        return vec![format!(
+            "removed the unregistered worktree and branch but retained agent log {}: {reason}",
+            created_log.path.display()
+        )];
     }
     Vec::new()
 }

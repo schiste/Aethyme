@@ -410,8 +410,8 @@ pub enum BrokerOpError {
     StartAgentRelease {
         session_id: i64,
         pid: u32,
-        worktree_path: String,
-        log_path: String,
+        worktree_path: Box<str>,
+        log_path: Box<str>,
         reason: String,
         cleanup: String,
     },

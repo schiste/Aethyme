@@ -123,7 +123,7 @@ fn agent_log_allocation_never_truncates_an_existing_log() {
 
     let (new_log, _file) = lifecycle::create_agent_log(temp.path(), "same-task").unwrap();
     assert_eq!(
-        new_log.file_name().unwrap().to_string_lossy(),
+        new_log.path.file_name().unwrap().to_string_lossy(),
         "same-task-2.log"
     );
     assert_eq!(std::fs::read(old_log).unwrap(), b"prior evidence");
