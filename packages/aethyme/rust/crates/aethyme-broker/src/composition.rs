@@ -176,6 +176,8 @@ pub enum Refusal {
     DependencyCycle,
     MissingInput,
     CompetingRevisions,
+    /// Distinct logical D10 proposals create the same project path.
+    FileNamespaceConflict,
     BudgetExhausted,
     /// The selection cannot be separated from a synthesized result.
     InseparableSelection,
@@ -199,6 +201,7 @@ impl Refusal {
             Self::DependencyCycle => "dependency_cycle",
             Self::MissingInput => "missing_input",
             Self::CompetingRevisions => "competing_revisions",
+            Self::FileNamespaceConflict => "file_namespace_conflict",
             Self::BudgetExhausted => "budget_exhausted",
             Self::InseparableSelection => "inseparable_selection",
             Self::UnsafePlan => "unsafe_plan",
