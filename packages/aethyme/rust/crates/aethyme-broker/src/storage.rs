@@ -19,8 +19,6 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
 
-use crate::broker::directory_size_without_following_links;
-
 use crate::broker::{WORKTREE_ROOT_MARKER, WORKTREE_ROOT_SCHEMA_VERSION, WorktreeRootMarker};
 use crate::gc::{TreeRemoval, remove_condemned_tree};
 use crate::reclaim::is_artefact_directory_with_extras;
@@ -32,6 +30,11 @@ pub const STORAGE_RECONCILIATION_SCHEMA_VERSION: u32 = 1;
 const DAY_MS: i64 = 86_400_000;
 const PREPARATION_SWEEP_MAX_DISCOVERY_PATHS: usize = 4096;
 const PREPARATION_SWEEP_MAX_MARKER_BYTES: u64 = 64 * 1024;
+const PREPARATION_RETIRED_STORE_MAX_KEYS: usize = 4096;
+const PREPARATION_LEASE_TTL_MARGIN_SECONDS: u64 = 30;
+const PREPARATION_COORDINATOR_OPEN_MAX_WAIT: Duration = Duration::from_millis(25);
+const PREPARATION_APPLY_DEADLINE: Duration = Duration::from_secs(60 * 60);
+const HOST_RESOURCE_MAX_TTL_SECONDS: u64 = 86_400;
 
 #[derive(Debug, thiserror::Error)]
 pub enum StorageError {
@@ -301,10 +304,8 @@ pub struct StorageSummary {
 
 /// One entry in the shared preparation cache.
 ///
-/// The cache sits beside the worktree container rather than inside it, which
-/// is why every other lane here has been blind to it: `storage_container`
-/// resolves to `<host>/worktrees`, and these live under
-/// `<host>/preparation-cache/<repository>/<key>`.
+/// The cache lives beside the host resource database, independently of where
+/// this repository places its worktrees.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct StoragePreparationEntry {
     pub path: PathBuf,
@@ -597,7 +598,7 @@ fn build_plan(
     main_root: &Path,
     storage_root: &Path,
     orphan_worktree_roots_days: u32,
-    warnings: Vec<String>,
+    mut warnings: Vec<String>,
     scan: crate::SizeScan,
     records: &mut crate::measurement::SizeRecords,
 ) -> Result<StoragePlan, StorageError> {
@@ -671,15 +672,20 @@ fn build_plan(
     let (primary_checkouts, primary_candidates) =
         inspect_primary_checkouts(main_root, &roots, scan, records);
 
-    // The cache is a sibling of the worktree container, so it is reached from
-    // the container rather than rediscovered. Live roots are every enrolled
-    // checkout in the inventory plus the one being invoked from.
+    // Live roots come from the worktree container, but the cache itself is
+    // resolved beside the host resource database by preparation.rs. These
+    // locations can differ when the repository overrides worktree placement.
     let live_roots = preparation_live_roots(main_root, &primary_checkouts, &roots);
-    let (preparation_entries, preparation_candidates) = match preparation_cache_root(&storage_root)
-    {
-        Some(cache_root) => inspect_preparation_cache(&cache_root, &live_roots, scan, records),
-        None => (Vec::new(), Vec::new()),
-    };
+    let (preparation_entries, preparation_candidates) =
+        match crate::preparation::preparation_cache_root() {
+            Ok(cache_root) => inspect_preparation_cache(&cache_root, &live_roots, scan, records),
+            Err(error) => {
+                warnings.push(format!(
+                    "preparation cache could not be located, so its entries were retained: {error}"
+                ));
+                (Vec::new(), Vec::new())
+            }
+        };
     let digest = decision_digest(
         &storage_root,
         orphan_worktree_roots_days,
@@ -1191,10 +1197,19 @@ pub(crate) fn sweep_preparation_cache(
     if check_preparation_sweep_deadline(deadline).is_err() {
         return (0, 0);
     }
-    let Some(cache_root) = preparation_cache_root(&storage_root) else {
+    let Ok(cache_root) = crate::preparation::preparation_cache_root() else {
         return (0, 0);
     };
-    sweep_preparation_cache_at(main_root, &storage_root, &cache_root, deadline)
+    let Ok(resource_db_path) = crate::default_host_resource_db_path() else {
+        return (0, 0);
+    };
+    sweep_preparation_cache_at(
+        main_root,
+        &storage_root,
+        &cache_root,
+        &resource_db_path,
+        deadline,
+    )
 }
 
 /// The inline lane deliberately does not build a storage plan: that plan
@@ -1204,6 +1219,7 @@ fn sweep_preparation_cache_at(
     main_root: &Path,
     storage_root: &Path,
     cache_root: &Path,
+    resource_db_path: &Path,
     deadline: std::time::Instant,
 ) -> (usize, u64) {
     let live_roots = match discover_preparation_live_roots(main_root, storage_root, deadline) {
@@ -1237,6 +1253,7 @@ fn sweep_preparation_cache_at(
     }
     let mut removed = 0_usize;
     let mut bytes = 0_u64;
+    let mut coordinator = None;
     for repository in repositories {
         if check_preparation_sweep_deadline(deadline).is_err() {
             break;
@@ -1249,6 +1266,79 @@ fn sweep_preparation_cache_at(
             break;
         };
         if repository_type.is_symlink() || !repository_type.is_dir() {
+            continue;
+        }
+        let Some(repository_name) = repository_path.file_name().and_then(|name| name.to_str())
+        else {
+            return (removed, bytes);
+        };
+        let Some((lease_repository, retired)) =
+            preparation_cache_repository_identity(repository_name)
+        else {
+            continue;
+        };
+        if retired {
+            let grant = match acquire_preparation_cache_lease(
+                &mut coordinator,
+                resource_db_path,
+                cache_root,
+                lease_repository,
+                deadline,
+            ) {
+                Ok(grant) => grant,
+                Err(PreparationCacheLeaseError::Busy) => continue,
+                Err(PreparationCacheLeaseError::Deadline) => return (removed, bytes),
+                Err(PreparationCacheLeaseError::Unavailable(_reason)) => {
+                    return (removed, bytes);
+                }
+            };
+            // The budget rotator renames a complete repository store while
+            // holding the original repository lease. The retired path is no
+            // longer used by writers, but the same lease prevents cleanup
+            // from racing another rotation or active preparation command.
+            let outcome = (|| {
+                let current_roots =
+                    match discover_preparation_live_roots(main_root, storage_root, deadline) {
+                        Ok(roots) => roots,
+                        Err(_) => return PreparationCacheSweepOutcome::Stop,
+                    };
+                if current_preparation_keys(&current_roots, deadline).is_err() {
+                    return PreparationCacheSweepOutcome::Stop;
+                }
+                if repository_path.parent() != Some(cache_root)
+                    || !is_real_directory(cache_root)
+                    || !retired_preparation_store_layout(&repository_path, Some(deadline))
+                {
+                    return PreparationCacheSweepOutcome::Retained;
+                }
+                let usage =
+                    match crate::disk_headroom::directory_usage_bounded(&repository_path, deadline)
+                    {
+                        Some(usage) => usage,
+                        None => return PreparationCacheSweepOutcome::Stop,
+                    };
+                if check_preparation_sweep_deadline(deadline).is_err()
+                    || repository_path.parent() != Some(cache_root)
+                    || !is_real_directory(cache_root)
+                    || !retired_preparation_store_layout(&repository_path, Some(deadline))
+                {
+                    return PreparationCacheSweepOutcome::Stop;
+                }
+                match remove_condemned_tree(&repository_path, None, Some(deadline)) {
+                    Ok(TreeRemoval::Complete) => PreparationCacheSweepOutcome::Removed(usage.bytes),
+                    Ok(TreeRemoval::Interrupted) => PreparationCacheSweepOutcome::Stop,
+                    Err(_) => PreparationCacheSweepOutcome::Retained,
+                }
+            })();
+            release_preparation_cache_lease(&mut coordinator, &grant);
+            match outcome {
+                PreparationCacheSweepOutcome::Removed(reclaimed) => {
+                    removed += 1;
+                    bytes = bytes.saturating_add(reclaimed);
+                }
+                PreparationCacheSweepOutcome::Retained => continue,
+                PreparationCacheSweepOutcome::Stop => return (removed, bytes),
+            }
             continue;
         }
         let entries = match std::fs::read_dir(&repository_path) {
@@ -1269,69 +1359,228 @@ fn sweep_preparation_cache_at(
                 continue;
             }
             let key = entry.file_name().to_string_lossy().into_owned();
-            if key.len() != 12 || !key.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            if !is_preparation_cache_key(&key) {
                 continue;
             }
             if live_keys.contains(&key) {
                 continue;
             }
 
-            // The initial key set made discovery cheap. Before each deletion,
-            // repeat the bounded root scan and key calculation so a checkout
-            // or input change since that snapshot can only retain the entry.
-            let current_roots =
-                match discover_preparation_live_roots(main_root, storage_root, deadline) {
-                    Ok(roots) => roots,
-                    Err(_) => return (removed, bytes),
-                };
-            let current_keys = match current_preparation_keys(&current_roots, deadline) {
-                Ok(keys) => keys,
-                Err(_) => return (removed, bytes),
-            };
-            if current_keys.contains(&key) {
-                continue;
-            }
             let candidate_path = entry.path();
-            if candidate_path.parent() != Some(repository_path.as_path())
-                || repository_path.parent() != Some(cache_root)
-                || !is_real_directory(cache_root)
-                || !is_real_directory(&repository_path)
-            {
-                return (removed, bytes);
-            }
-            if check_preparation_sweep_deadline(deadline).is_err()
-                || !is_real_directory(&candidate_path)
-            {
-                return (removed, bytes);
-            }
-            let usage =
-                match crate::disk_headroom::directory_usage_bounded(&candidate_path, deadline) {
-                    Some(usage) => usage,
-                    None => return (removed, bytes),
-                };
-            if check_preparation_sweep_deadline(deadline).is_err() {
-                return (removed, bytes);
-            }
-            if !is_real_directory(cache_root)
-                || !is_real_directory(&repository_path)
-                || !is_real_directory(&candidate_path)
-            {
-                return (removed, bytes);
-            }
-            match remove_condemned_tree(&candidate_path, None, Some(deadline)) {
-                Ok(TreeRemoval::Complete) => {
-                    removed += 1;
-                    bytes = bytes.saturating_add(usage.bytes);
+            let grant = match acquire_preparation_cache_lease(
+                &mut coordinator,
+                resource_db_path,
+                cache_root,
+                lease_repository,
+                deadline,
+            ) {
+                Ok(grant) => grant,
+                Err(PreparationCacheLeaseError::Busy) => continue,
+                Err(PreparationCacheLeaseError::Deadline) => return (removed, bytes),
+                Err(PreparationCacheLeaseError::Unavailable(_reason)) => {
+                    return (removed, bytes);
                 }
-                // Count only a fully removed cache entry. The interrupted
-                // entry can already have lost files, so `bytes` deliberately
-                // remains a conservative lower bound for this pass.
-                Ok(TreeRemoval::Interrupted) => return (removed, bytes),
-                Err(_) => continue,
+            };
+
+            // The writer and sweeper share this exclusive key. Re-discover
+            // liveness only after acquiring it, then hold it through removal
+            // so preparation cannot start using the entry between the check
+            // and delete.
+            let outcome = (|| {
+                let current_roots =
+                    match discover_preparation_live_roots(main_root, storage_root, deadline) {
+                        Ok(roots) => roots,
+                        Err(_) => return PreparationCacheSweepOutcome::Stop,
+                    };
+                let current_keys = match current_preparation_keys(&current_roots, deadline) {
+                    Ok(keys) => keys,
+                    Err(_) => return PreparationCacheSweepOutcome::Stop,
+                };
+                if current_keys.contains(&key) {
+                    return PreparationCacheSweepOutcome::Retained;
+                }
+                if candidate_path.parent() != Some(repository_path.as_path())
+                    || repository_path.parent() != Some(cache_root)
+                    || !is_real_directory(cache_root)
+                    || !is_real_directory(&repository_path)
+                {
+                    return PreparationCacheSweepOutcome::Stop;
+                }
+                if check_preparation_sweep_deadline(deadline).is_err()
+                    || !is_real_directory(&candidate_path)
+                {
+                    return PreparationCacheSweepOutcome::Stop;
+                }
+                let usage = match crate::disk_headroom::directory_usage_bounded(
+                    &candidate_path,
+                    deadline,
+                ) {
+                    Some(usage) => usage,
+                    None => return PreparationCacheSweepOutcome::Stop,
+                };
+                if check_preparation_sweep_deadline(deadline).is_err()
+                    || !is_real_directory(cache_root)
+                    || !is_real_directory(&repository_path)
+                    || !is_real_directory(&candidate_path)
+                {
+                    return PreparationCacheSweepOutcome::Stop;
+                }
+                match remove_condemned_tree(&candidate_path, None, Some(deadline)) {
+                    Ok(TreeRemoval::Complete) => PreparationCacheSweepOutcome::Removed(usage.bytes),
+                    // Count only a fully removed cache entry. The interrupted
+                    // entry can already have lost files, so `bytes` remains a
+                    // conservative lower bound for this pass.
+                    Ok(TreeRemoval::Interrupted) => PreparationCacheSweepOutcome::Stop,
+                    Err(_) => PreparationCacheSweepOutcome::Retained,
+                }
+            })();
+            release_preparation_cache_lease(&mut coordinator, &grant);
+            match outcome {
+                PreparationCacheSweepOutcome::Removed(reclaimed) => {
+                    removed += 1;
+                    bytes = bytes.saturating_add(reclaimed);
+                }
+                PreparationCacheSweepOutcome::Retained => continue,
+                PreparationCacheSweepOutcome::Stop => return (removed, bytes),
             }
         }
     }
     (removed, bytes)
+}
+
+enum PreparationCacheSweepOutcome {
+    Removed(u64),
+    Retained,
+    Stop,
+}
+
+#[derive(Debug)]
+enum PreparationCacheLeaseError {
+    Busy,
+    Deadline,
+    Unavailable(String),
+}
+
+fn acquire_preparation_cache_lease(
+    coordinator: &mut Option<crate::HostResourceCoordinator>,
+    resource_db_path: &Path,
+    cache_root: &Path,
+    repository: &str,
+    deadline: std::time::Instant,
+) -> Result<crate::HostResourceGrant, PreparationCacheLeaseError> {
+    if check_preparation_sweep_deadline(deadline).is_err() {
+        return Err(PreparationCacheLeaseError::Deadline);
+    }
+    if coordinator.is_none() {
+        let metadata = std::fs::symlink_metadata(resource_db_path).map_err(|error| {
+            PreparationCacheLeaseError::Unavailable(format!(
+                "cannot inspect host resource database {}: {error}",
+                resource_db_path.display()
+            ))
+        })?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(PreparationCacheLeaseError::Unavailable(
+                "host resource database is not a regular file".into(),
+            ));
+        }
+        let open_wait = deadline
+            .saturating_duration_since(std::time::Instant::now())
+            .min(PREPARATION_COORDINATOR_OPEN_MAX_WAIT);
+        if open_wait.is_zero() {
+            return Err(PreparationCacheLeaseError::Deadline);
+        }
+        let opened =
+            crate::HostResourceCoordinator::open_with_busy_timeout(resource_db_path, open_wait)
+                .map_err(|error| {
+                    PreparationCacheLeaseError::Unavailable(format!(
+                        "cannot open host resource database: {error}"
+                    ))
+                })?;
+        if check_preparation_sweep_deadline(deadline).is_err() {
+            return Err(PreparationCacheLeaseError::Deadline);
+        }
+        *coordinator = Some(opened);
+    }
+
+    let request = preparation_cache_lease_request(repository, cache_root, deadline)?;
+    let grant = coordinator
+        .as_mut()
+        .expect("the resource coordinator was opened above")
+        .acquire_with_wait(&request, Duration::ZERO, |_| {})
+        .map_err(|error| match error {
+            crate::HostResourceError::Conflict { .. } => PreparationCacheLeaseError::Busy,
+            error => PreparationCacheLeaseError::Unavailable(format!(
+                "cannot acquire preparation-cache lease: {error}"
+            )),
+        })?;
+    if check_preparation_sweep_deadline(deadline).is_err() {
+        release_preparation_cache_lease(coordinator, &grant);
+        return Err(PreparationCacheLeaseError::Deadline);
+    }
+    Ok(grant)
+}
+
+fn preparation_cache_lease_request(
+    repository: &str,
+    cache_root: &Path,
+    deadline: std::time::Instant,
+) -> Result<crate::HostResourceRequest, PreparationCacheLeaseError> {
+    if !is_lowercase_hex(repository, 64) {
+        return Err(PreparationCacheLeaseError::Unavailable(
+            "preparation-cache repository identity is not a lowercase SHA-256 digest".into(),
+        ));
+    }
+    static NEXT_REQUEST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+    if remaining.is_zero() {
+        return Err(PreparationCacheLeaseError::Deadline);
+    }
+    let remaining_seconds = remaining
+        .as_secs()
+        .saturating_add(if remaining.subsec_nanos() > 0 { 1 } else { 0 });
+    let ttl_seconds = remaining_seconds.saturating_add(PREPARATION_LEASE_TTL_MARGIN_SECONDS);
+    if ttl_seconds > HOST_RESOURCE_MAX_TTL_SECONDS {
+        return Err(PreparationCacheLeaseError::Unavailable(
+            "sweep deadline exceeds the host-resource lease TTL limit".into(),
+        ));
+    }
+    let sequence = NEXT_REQUEST.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let run_id = format!("preparation-cache-gc-{}-{sequence}", std::process::id());
+    let request_id = format!("{run_id}-{}", now_ms());
+    let worktree_fingerprint = format!(
+        "{:x}",
+        Sha256::digest(cache_root.as_os_str().to_string_lossy().as_bytes())
+    );
+    Ok(crate::HostResourceRequest {
+        schema_version: crate::HOST_RESOURCE_REQUEST_SCHEMA_VERSION,
+        request_id,
+        repository: repository.to_string(),
+        worktree_fingerprint,
+        run_id,
+        ttl_seconds: ttl_seconds.max(15),
+        holder_pid: Some(std::process::id()),
+        resources: vec![crate::HostResourceRequirement {
+            key: "preparation_cache".into(),
+            resource: crate::HostResourceKind::ExclusiveKey {
+                name: crate::preparation::preparation_cache_lease_name(repository),
+            },
+        }],
+    })
+}
+
+fn release_preparation_cache_lease(
+    coordinator: &mut Option<crate::HostResourceCoordinator>,
+    grant: &crate::HostResourceGrant,
+) {
+    let result = coordinator
+        .as_mut()
+        .expect("a grant must have an open coordinator")
+        .release(
+            &grant.lease.lease_id,
+            grant.lease.generation,
+            &grant.ownership_token,
+        );
+    crate::warn_unrecorded("release preparation-cache storage lease", result);
 }
 
 fn check_preparation_sweep_deadline(deadline: std::time::Instant) -> Result<(), StorageError> {
@@ -1562,15 +1811,59 @@ fn inspect_preparation_cache(
             continue;
         }
         let repository_name = repository.file_name().to_string_lossy().into_owned();
+        let Some((_, retired)) = preparation_cache_repository_identity(&repository_name) else {
+            entries.push(retained_preparation_entry(
+                repository_path,
+                repository_name,
+                String::new(),
+                "repository directory name is not a managed preparation-cache identity; retained",
+            ));
+            continue;
+        };
+        if retired {
+            let managed_layout = retired_preparation_store_layout(&repository_path, None);
+            let estimated_bytes = managed_layout
+                .then(|| observed_size(&repository_path, scan, records))
+                .flatten();
+            let estimated_inodes = managed_layout
+                .then(|| observed_inodes(&repository_path, records))
+                .flatten();
+            entries.push(StoragePreparationEntry {
+                path: repository_path,
+                repository: repository_name,
+                key: String::new(),
+                estimated_bytes,
+                estimated_inodes,
+                reclaimable: managed_layout,
+                reason: if managed_layout {
+                    "retired preparation-cache store from a completed budget rotation".into()
+                } else {
+                    "retired preparation-cache store has an unknown layout; retained".into()
+                },
+            });
+            continue;
+        }
         let Ok(keys) = std::fs::read_dir(&repository_path) else {
+            entries.push(retained_preparation_entry(
+                repository_path,
+                repository_name,
+                String::new(),
+                "preparation-cache keys could not be inspected; retained",
+            ));
             continue;
         };
         for key_entry in keys.flatten() {
             let path = key_entry.path();
-            if !is_real_directory(&path) {
+            let key = key_entry.file_name().to_string_lossy().into_owned();
+            if !is_real_directory(&path) || !is_preparation_cache_key(&key) {
+                entries.push(retained_preparation_entry(
+                    path,
+                    repository_name.clone(),
+                    key,
+                    "preparation-cache key path does not match the managed layout; retained",
+                ));
                 continue;
             }
-            let key = key_entry.file_name().to_string_lossy().into_owned();
             let live = liveness_unknown || live_keys.contains(&key);
             // Measuring is the expensive half, so a live entry is counted but
             // never walked: its size cannot change the decision.
@@ -1619,6 +1912,87 @@ fn inspect_preparation_cache(
     (entries, candidates)
 }
 
+fn retained_preparation_entry(
+    path: PathBuf,
+    repository: String,
+    key: String,
+    reason: &str,
+) -> StoragePreparationEntry {
+    StoragePreparationEntry {
+        path,
+        repository,
+        key,
+        estimated_bytes: None,
+        estimated_inodes: None,
+        reclaimable: false,
+        reason: reason.into(),
+    }
+}
+
+fn is_lowercase_hex(value: &str, length: usize) -> bool {
+    value.len() == length
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn is_preparation_cache_key(value: &str) -> bool {
+    is_lowercase_hex(value, 12)
+}
+
+fn preparation_cache_repository_identity(name: &str) -> Option<(&str, bool)> {
+    if is_lowercase_hex(name, 64) {
+        return Some((name, false));
+    }
+
+    let (repository, retired_suffix) = name.split_once(".retired-")?;
+    if !is_lowercase_hex(repository, 64) {
+        return None;
+    }
+    let (timestamp_text, process_id_text) = retired_suffix.split_once('-')?;
+    let timestamp = timestamp_text.parse::<u128>().ok()?;
+    let process_id = process_id_text.parse::<u32>().ok()?;
+    if process_id == 0
+        || timestamp.to_string() != timestamp_text
+        || process_id.to_string() != process_id_text
+    {
+        return None;
+    }
+    Some((repository, true))
+}
+
+fn retired_preparation_store_layout(path: &Path, deadline: Option<std::time::Instant>) -> bool {
+    if !is_real_directory(path) {
+        return false;
+    }
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return false;
+    };
+    let mut examined = 0_usize;
+    for entry in entries {
+        if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+            return false;
+        }
+        examined += 1;
+        if examined > PREPARATION_RETIRED_STORE_MAX_KEYS {
+            return false;
+        }
+        let Ok(entry) = entry else {
+            return false;
+        };
+        let Ok(file_type) = entry.file_type() else {
+            return false;
+        };
+        if file_type.is_symlink()
+            || !file_type.is_dir()
+            || !is_preparation_cache_key(&entry.file_name().to_string_lossy())
+        {
+            return false;
+        }
+    }
+    deadline.is_none_or(|deadline| std::time::Instant::now() < deadline)
+}
+
 /// Remove one dead cache entry, re-deciding at the moment of removal.
 ///
 /// The plan may be minutes old and a checkout may have changed its lockfile
@@ -1628,27 +2002,123 @@ fn apply_preparation_candidate(
     candidate: &StoragePreparationCandidate,
     live_roots: &[PathBuf],
 ) -> Result<u64, String> {
-    for root in live_roots {
-        let key = crate::preparation::current_cache_key(root)
-            .map_err(|error| format!("cannot verify preparation liveness: {error}"))?;
-        if key.as_deref() == Some(candidate.key.as_str()) {
-            return Err("a checkout now computes this key again; it is no longer dead".into());
-        }
-    }
-    if !is_real_directory(&candidate.path) {
-        return Err("cache entry is no longer a directory".into());
-    }
-    let bytes = directory_size_without_following_links(&candidate.path).unwrap_or(0);
-    std::fs::remove_dir_all(&candidate.path)
-        .map_err(|error| format!("cannot remove cache entry: {error}"))?;
-    Ok(bytes)
+    let resource_db_path = crate::default_host_resource_db_path()
+        .map_err(|error| format!("cannot locate host resource database: {error}"))?;
+    let cache_root = crate::preparation::preparation_cache_root()
+        .map_err(|error| format!("cannot locate preparation cache: {error}"))?;
+    apply_preparation_candidate_with_lease_at(candidate, live_roots, &resource_db_path, &cache_root)
 }
 
-/// Where the shared preparation cache lives, beside the worktree container.
-fn preparation_cache_root(storage_root: &Path) -> Option<PathBuf> {
-    storage_root
-        .parent()
-        .map(|base| base.join("preparation-cache"))
+fn apply_preparation_candidate_with_lease_at(
+    candidate: &StoragePreparationCandidate,
+    live_roots: &[PathBuf],
+    resource_db_path: &Path,
+    cache_root: &Path,
+) -> Result<u64, String> {
+    let deadline = std::time::Instant::now() + PREPARATION_APPLY_DEADLINE;
+    let (lease_repository, retired) = validate_preparation_candidate_shape(candidate, cache_root)?;
+    let mut coordinator = None;
+    let grant = acquire_preparation_cache_lease(
+        &mut coordinator,
+        resource_db_path,
+        cache_root,
+        lease_repository,
+        deadline,
+    )
+    .map_err(|error| match error {
+        PreparationCacheLeaseError::Busy => {
+            "preparation cache is currently in use; no entry was removed".into()
+        }
+        PreparationCacheLeaseError::Deadline => {
+            "preparation-cache lease deadline elapsed; no entry was removed".into()
+        }
+        PreparationCacheLeaseError::Unavailable(reason) => {
+            format!("cannot safely acquire preparation-cache lease: {reason}")
+        }
+    })?;
+    let result = apply_preparation_candidate_under_lease(
+        candidate, live_roots, cache_root, deadline, retired,
+    );
+    release_preparation_cache_lease(&mut coordinator, &grant);
+    result
+}
+
+fn apply_preparation_candidate_under_lease(
+    candidate: &StoragePreparationCandidate,
+    live_roots: &[PathBuf],
+    cache_root: &Path,
+    deadline: std::time::Instant,
+    retired: bool,
+) -> Result<u64, String> {
+    let repository_path = cache_root.join(&candidate.repository);
+    if retired {
+        if candidate.path != repository_path
+            || candidate.path.parent() != Some(cache_root)
+            || !is_real_directory(cache_root)
+            || !retired_preparation_store_layout(&candidate.path, Some(deadline))
+        {
+            return Err("retired preparation cache no longer has a managed layout".into());
+        }
+    } else {
+        for root in live_roots {
+            let key = crate::preparation::current_cache_key_before(root, Some(deadline))
+                .map_err(|error| format!("cannot verify preparation liveness: {error}"))?;
+            if key.as_deref() == Some(candidate.key.as_str()) {
+                return Err("a checkout now computes this key again; it is no longer dead".into());
+            }
+        }
+        if candidate.path.parent() != Some(repository_path.as_path())
+            || candidate.path.file_name().and_then(|name| name.to_str())
+                != Some(candidate.key.as_str())
+            || !is_real_directory(cache_root)
+            || !is_real_directory(&repository_path)
+            || !is_real_directory(&candidate.path)
+        {
+            return Err("cache entry is no longer a directory".into());
+        }
+    }
+    let usage = crate::disk_headroom::directory_usage_bounded(&candidate.path, deadline)
+        .ok_or_else(|| "cache entry size could not be verified before the deadline".to_string())?;
+    if check_preparation_sweep_deadline(deadline).is_err()
+        || !is_real_directory(cache_root)
+        || !is_real_directory(&candidate.path)
+        || (!retired && !is_real_directory(&repository_path))
+        || (retired && !retired_preparation_store_layout(&candidate.path, Some(deadline)))
+    {
+        return Err("cache entry changed before removal; review a fresh storage plan".into());
+    }
+    match remove_condemned_tree(&candidate.path, None, Some(deadline))
+        .map_err(|error| format!("cannot remove cache entry: {error}"))?
+    {
+        TreeRemoval::Complete => Ok(usage.bytes),
+        TreeRemoval::Interrupted => {
+            Err("cache removal deadline elapsed; review a fresh storage plan".into())
+        }
+    }
+}
+
+fn validate_preparation_candidate_shape<'a>(
+    candidate: &'a StoragePreparationCandidate,
+    cache_root: &Path,
+) -> Result<(&'a str, bool), String> {
+    let (lease_repository, retired) = preparation_cache_repository_identity(&candidate.repository)
+        .ok_or_else(|| {
+            "preparation-cache repository identity is not a managed lowercase digest".to_string()
+        })?;
+    let repository_path = cache_root.join(&candidate.repository);
+    if retired {
+        if !candidate.key.is_empty() || candidate.path != repository_path {
+            return Err("retired preparation-cache candidate has an invalid path shape".into());
+        }
+    } else if !is_preparation_cache_key(&candidate.key)
+        || candidate.path.parent() != Some(repository_path.as_path())
+        || candidate.path.file_name().and_then(|name| name.to_str()) != Some(candidate.key.as_str())
+    {
+        return Err(
+            "preparation-cache candidate does not match the managed repository/key layout".into(),
+        );
+    }
+    Ok((lease_repository, retired))
 }
 
 fn is_enrolled_primary_checkout(path: &Path) -> bool {
@@ -3113,13 +3583,27 @@ fn is_sha256(value: &str) -> bool {
 mod tests {
     use super::*;
 
+    const TEST_PREPARATION_REPOSITORY: &str = concat!(
+        "aaaaaaaaaaaaaaaa",
+        "aaaaaaaaaaaaaaaa",
+        "aaaaaaaaaaaaaaaa",
+        "aaaaaaaaaaaaaaaa"
+    );
+
+    fn test_host_resource_db(root: &Path) -> PathBuf {
+        let path = root.join("host-state/host-resources.db");
+        crate::HostResourceCoordinator::open(&path)
+            .expect("initialize isolated host resource state");
+        path
+    }
+
     /// The live set is the keys checkouts would recompute, so an entry is dead
     /// exactly when no checkout names it -- not when it looks old.
     #[test]
     fn a_cache_entry_no_checkout_names_is_the_reclaimable_one() {
         let tmp = tempfile::tempdir().unwrap();
         let cache = tmp.path().join("preparation-cache");
-        let repo_dir = cache.join("repository-a");
+        let repo_dir = cache.join(TEST_PREPARATION_REPOSITORY);
         std::fs::create_dir_all(repo_dir.join("aaaaaaaaaaaa")).unwrap();
         std::fs::create_dir_all(repo_dir.join("bbbbbbbbbbbb")).unwrap();
         std::fs::write(repo_dir.join("bbbbbbbbbbbb/blob"), "cached\n").unwrap();
@@ -3145,6 +3629,219 @@ mod tests {
         assert_eq!(summary.preparation_reclaimable_inodes, Some(3));
     }
 
+    #[test]
+    fn unmanaged_preparation_cache_layout_is_retained_by_inventory_sweep_and_apply() {
+        let tmp = tempfile::tempdir().unwrap();
+        let main_root = tmp.path().join("main");
+        let storage_root = tmp.path().join("worktrees");
+        let cache_root = tmp.path().join("preparation-cache");
+        std::fs::create_dir_all(&main_root).unwrap();
+
+        let foreign_key = cache_root.join("notes/aaaaaaaaaaaa");
+        let uppercase_repository = cache_root
+            .join(TEST_PREPARATION_REPOSITORY.to_uppercase())
+            .join("bbbbbbbbbbbb");
+        for path in [&foreign_key, &uppercase_repository] {
+            std::fs::create_dir_all(path).unwrap();
+            std::fs::write(path.join("data"), b"unmanaged").unwrap();
+        }
+
+        let mut records = crate::measurement::SizeRecords::default();
+        let (entries, candidates) =
+            inspect_preparation_cache(&cache_root, &[], crate::SizeScan::Recorded, &mut records);
+        assert_eq!(entries.len(), 2);
+        assert!(candidates.is_empty());
+        for path in [
+            cache_root.join("notes"),
+            uppercase_repository.parent().unwrap().to_path_buf(),
+        ] {
+            let entry = entries
+                .iter()
+                .find(|entry| entry.path == path)
+                .expect("unmanaged repository is reported in the inventory");
+            assert!(!entry.reclaimable, "unmanaged path must be retained");
+            assert!(entry.reason.contains("retained"));
+        }
+
+        let uppercase_key_cache_root = tmp.path().join("uppercase-key-cache");
+        let uppercase_key = uppercase_key_cache_root
+            .join(TEST_PREPARATION_REPOSITORY)
+            .join("CCCCCCCCCCCC");
+        std::fs::create_dir_all(&uppercase_key).unwrap();
+        std::fs::write(uppercase_key.join("data"), b"unmanaged").unwrap();
+        let mut records = crate::measurement::SizeRecords::default();
+        let (key_entries, key_candidates) = inspect_preparation_cache(
+            &uppercase_key_cache_root,
+            &[],
+            crate::SizeScan::Recorded,
+            &mut records,
+        );
+        assert_eq!(key_entries.len(), 1);
+        assert!(key_candidates.is_empty());
+        assert_eq!(key_entries[0].path, uppercase_key);
+        assert!(key_entries[0].reason.contains("retained"));
+        assert!(candidates.is_empty());
+
+        let resource_db_path = tmp.path().join("host-state/host-resources.db");
+        let invalid_candidates = [
+            (
+                StoragePreparationCandidate {
+                    path: foreign_key,
+                    repository: "notes".into(),
+                    key: "aaaaaaaaaaaa".into(),
+                    estimated_bytes: Some(9),
+                    estimated_inodes: Some(1),
+                    reason: "forged foreign candidate".into(),
+                },
+                cache_root.as_path(),
+            ),
+            (
+                StoragePreparationCandidate {
+                    path: uppercase_repository.clone(),
+                    repository: TEST_PREPARATION_REPOSITORY.to_uppercase(),
+                    key: "bbbbbbbbbbbb".into(),
+                    estimated_bytes: Some(9),
+                    estimated_inodes: Some(1),
+                    reason: "forged uppercase repository candidate".into(),
+                },
+                cache_root.as_path(),
+            ),
+            (
+                StoragePreparationCandidate {
+                    path: uppercase_key.clone(),
+                    repository: TEST_PREPARATION_REPOSITORY.into(),
+                    key: "CCCCCCCCCCCC".into(),
+                    estimated_bytes: Some(9),
+                    estimated_inodes: Some(1),
+                    reason: "forged uppercase key candidate".into(),
+                },
+                uppercase_key_cache_root.as_path(),
+            ),
+        ];
+        for (candidate, candidate_cache_root) in invalid_candidates {
+            let error = apply_preparation_candidate_with_lease_at(
+                &candidate,
+                &[],
+                &resource_db_path,
+                candidate_cache_root,
+            )
+            .expect_err("manual removal must reject unmanaged path shapes");
+            assert!(error.contains("managed"));
+            assert!(candidate.path.join("data").is_file());
+        }
+        assert!(
+            !resource_db_path.exists(),
+            "shape refusal happens before host lease state is opened"
+        );
+
+        let resource_db_path = test_host_resource_db(tmp.path());
+        for root in [&cache_root, &uppercase_key_cache_root] {
+            let (removed, bytes) = sweep_preparation_cache_at(
+                &main_root,
+                &storage_root,
+                root,
+                &resource_db_path,
+                std::time::Instant::now() + Duration::from_secs(5),
+            );
+            assert_eq!((removed, bytes), (0, 0));
+        }
+        assert!(uppercase_repository.join("data").is_file());
+        assert!(uppercase_key.join("data").is_file());
+    }
+
+    #[test]
+    fn retired_preparation_store_uses_original_repository_lease() {
+        let tmp = tempfile::tempdir().unwrap();
+        let main_root = tmp.path().join("main");
+        let storage_root = tmp.path().join("worktrees");
+        let cache_root = tmp.path().join("preparation-cache");
+        std::fs::create_dir_all(&main_root).unwrap();
+        let retired_name = format!(
+            "{TEST_PREPARATION_REPOSITORY}.retired-1700000000000-{}",
+            std::process::id()
+        );
+        let retired_path = cache_root.join(&retired_name);
+        let retired_key = retired_path.join("aaaaaaaaaaaa");
+        std::fs::create_dir_all(&retired_key).unwrap();
+        std::fs::write(retired_key.join("cache.bin"), b"retired store").unwrap();
+
+        let mut records = crate::measurement::SizeRecords::default();
+        let (entries, candidates) =
+            inspect_preparation_cache(&cache_root, &[], crate::SizeScan::Recorded, &mut records);
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].reclaimable);
+        assert_eq!(entries[0].key, "");
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].repository, retired_name);
+
+        let resource_db_path = test_host_resource_db(tmp.path());
+        let lease_request = preparation_cache_lease_request(
+            TEST_PREPARATION_REPOSITORY,
+            &cache_root,
+            std::time::Instant::now() + Duration::from_secs(5),
+        )
+        .expect("retired paths use the original writer identity");
+        let mut writer = crate::HostResourceCoordinator::open(&resource_db_path).unwrap();
+        let grant = writer.acquire(&lease_request).unwrap();
+        let (removed_while_leased, _) = sweep_preparation_cache_at(
+            &main_root,
+            &storage_root,
+            &cache_root,
+            &resource_db_path,
+            std::time::Instant::now() + Duration::from_secs(5),
+        );
+        assert_eq!(removed_while_leased, 0);
+        assert!(retired_key.join("cache.bin").is_file());
+        writer
+            .release(
+                &grant.lease.lease_id,
+                grant.lease.generation,
+                &grant.ownership_token,
+            )
+            .unwrap();
+
+        let (removed, bytes) = sweep_preparation_cache_at(
+            &main_root,
+            &storage_root,
+            &cache_root,
+            &resource_db_path,
+            std::time::Instant::now() + Duration::from_secs(5),
+        );
+        assert_eq!(removed, 1);
+        assert_eq!(bytes, b"retired store".len() as u64);
+        assert!(!retired_path.exists());
+    }
+
+    #[test]
+    fn retired_preparation_store_names_match_the_writer_suffix_exactly() {
+        let retired_zero_timestamp = format!("{TEST_PREPARATION_REPOSITORY}.retired-0-42");
+        assert_eq!(
+            preparation_cache_repository_identity(TEST_PREPARATION_REPOSITORY),
+            Some((TEST_PREPARATION_REPOSITORY, false))
+        );
+        assert_eq!(
+            preparation_cache_repository_identity(&retired_zero_timestamp),
+            Some((TEST_PREPARATION_REPOSITORY, true))
+        );
+
+        for invalid_name in [
+            format!("{TEST_PREPARATION_REPOSITORY}.retired-01-42"),
+            format!("{TEST_PREPARATION_REPOSITORY}.retired-1-0"),
+            format!("{TEST_PREPARATION_REPOSITORY}.retired-1-42x"),
+            format!("{TEST_PREPARATION_REPOSITORY}.retired-1-42-extra"),
+            format!(
+                "{}.retired-1-42",
+                TEST_PREPARATION_REPOSITORY.to_uppercase()
+            ),
+        ] {
+            assert_eq!(
+                preparation_cache_repository_identity(&invalid_name),
+                None,
+                "unexpectedly accepted {invalid_name}"
+            );
+        }
+    }
+
     /// A checkout that still computes a key keeps its entry, and only that
     /// entry. This is the half that makes the rule safe rather than merely
     /// aggressive: session worktrees are what run `broker prepare`, so if they
@@ -3165,7 +3862,10 @@ mod tests {
             .unwrap()
             .expect("a checkout declaring a shared step computes a key");
 
-        let cache = tmp.path().join("preparation-cache/repository-a");
+        let cache = tmp
+            .path()
+            .join("preparation-cache")
+            .join(TEST_PREPARATION_REPOSITORY);
         std::fs::create_dir_all(cache.join(&key)).unwrap();
         std::fs::create_dir_all(cache.join("deadbeefdead")).unwrap();
 
@@ -3187,14 +3887,23 @@ mod tests {
         assert!(kept.reason.contains("still computes"));
         let live_candidate = StoragePreparationCandidate {
             path: cache.join(&key),
-            repository: "repository-a".into(),
+            repository: TEST_PREPARATION_REPOSITORY.into(),
             key,
             estimated_bytes: None,
             estimated_inodes: None,
             reason: "previously dead".into(),
         };
         let roots = preparation_live_roots(&repo, &[], &[]);
-        assert!(apply_preparation_candidate(&live_candidate, &roots).is_err());
+        let resource_db_path = test_host_resource_db(tmp.path());
+        assert!(
+            apply_preparation_candidate_with_lease_at(
+                &live_candidate,
+                &roots,
+                &resource_db_path,
+                &tmp.path().join("preparation-cache"),
+            )
+            .is_err()
+        );
         assert!(live_candidate.path.is_dir());
     }
 
@@ -3204,11 +3913,13 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let entry = tmp
             .path()
-            .join("preparation-cache/repository-a/ccccccccccc1");
+            .join("preparation-cache")
+            .join(TEST_PREPARATION_REPOSITORY)
+            .join("ccccccccccc1");
         std::fs::create_dir_all(&entry).unwrap();
         let candidate = StoragePreparationCandidate {
             path: entry.clone(),
-            repository: "repository-a".into(),
+            repository: TEST_PREPARATION_REPOSITORY.into(),
             key: "ccccccccccc1".into(),
             estimated_bytes: None,
             estimated_inodes: None,
@@ -3216,16 +3927,125 @@ mod tests {
         };
 
         // A root that cannot produce a key leaves the entry dead, so it goes.
-        let removed = apply_preparation_candidate(&candidate, &[tmp.path().to_path_buf()]);
+        let resource_db_path = test_host_resource_db(tmp.path());
+        let cache_root = tmp.path().join("preparation-cache");
+        let removed = apply_preparation_candidate_with_lease_at(
+            &candidate,
+            &[tmp.path().to_path_buf()],
+            &resource_db_path,
+            &cache_root,
+        );
         assert!(removed.is_ok(), "a dead entry is removable: {removed:?}");
         assert!(!entry.exists(), "the entry must actually be gone");
 
         // Removing what is already gone is a refusal, not a silent success.
-        assert!(apply_preparation_candidate(&candidate, &[]).is_err());
+        assert!(
+            apply_preparation_candidate_with_lease_at(
+                &candidate,
+                &[],
+                &resource_db_path,
+                &cache_root,
+            )
+            .is_err()
+        );
     }
 
-    /// The cache is a sibling of the worktree container, which is the whole
-    /// reason it was invisible to this lane.
+    #[test]
+    fn preparation_cache_sweep_skips_a_repository_with_an_active_writer_lease() {
+        let tmp = tempfile::tempdir().unwrap();
+        let main_root = tmp.path().join("main");
+        let storage_root = tmp.path().join("worktrees");
+        let cache_root = tmp.path().join("preparation-cache");
+        std::fs::create_dir_all(&main_root).unwrap();
+        std::fs::create_dir_all(&storage_root).unwrap();
+        let entry = cache_root
+            .join(TEST_PREPARATION_REPOSITORY)
+            .join("aaaaaaaaaaaa");
+        std::fs::create_dir_all(&entry).unwrap();
+        std::fs::write(entry.join("cache.bin"), b"writer protected").unwrap();
+        let resource_db_path = test_host_resource_db(tmp.path());
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let request =
+            preparation_cache_lease_request(TEST_PREPARATION_REPOSITORY, &cache_root, deadline)
+                .expect("lease request is valid");
+        let mut writer = crate::HostResourceCoordinator::open(&resource_db_path).unwrap();
+        let grant = writer.acquire(&request).unwrap();
+
+        let (removed, bytes) = sweep_preparation_cache_at(
+            &main_root,
+            &storage_root,
+            &cache_root,
+            &resource_db_path,
+            deadline,
+        );
+
+        assert_eq!((removed, bytes), (0, 0));
+        assert!(entry.join("cache.bin").exists());
+        writer
+            .release(
+                &grant.lease.lease_id,
+                grant.lease.generation,
+                &grant.ownership_token,
+            )
+            .unwrap();
+
+        let (removed, bytes) = sweep_preparation_cache_at(
+            &main_root,
+            &storage_root,
+            &cache_root,
+            &resource_db_path,
+            std::time::Instant::now() + Duration::from_secs(5),
+        );
+        assert_eq!((removed, bytes), (1, 16));
+        assert!(!entry.exists());
+    }
+
+    #[test]
+    fn reviewed_preparation_removal_refuses_an_active_writer_lease() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache_root = tmp.path().join("preparation-cache");
+        let entry = cache_root
+            .join(TEST_PREPARATION_REPOSITORY)
+            .join("bbbbbbbbbbbb");
+        std::fs::create_dir_all(&entry).unwrap();
+        std::fs::write(entry.join("cache.bin"), b"writer protected").unwrap();
+        let resource_db_path = test_host_resource_db(tmp.path());
+        let request = preparation_cache_lease_request(
+            TEST_PREPARATION_REPOSITORY,
+            &cache_root,
+            std::time::Instant::now() + Duration::from_secs(5),
+        )
+        .unwrap();
+        let mut writer = crate::HostResourceCoordinator::open(&resource_db_path).unwrap();
+        let grant = writer.acquire(&request).unwrap();
+        let candidate = StoragePreparationCandidate {
+            path: entry.clone(),
+            repository: TEST_PREPARATION_REPOSITORY.into(),
+            key: "bbbbbbbbbbbb".into(),
+            estimated_bytes: Some(16),
+            estimated_inodes: Some(1),
+            reason: "reviewed dead entry".into(),
+        };
+
+        let result = apply_preparation_candidate_with_lease_at(
+            &candidate,
+            &[],
+            &resource_db_path,
+            &cache_root,
+        );
+
+        assert!(result.unwrap_err().contains("currently in use"));
+        assert!(entry.join("cache.bin").exists());
+        writer
+            .release(
+                &grant.lease.lease_id,
+                grant.lease.generation,
+                &grant.ownership_token,
+            )
+            .unwrap();
+    }
+
+    /// Unknown preparation inputs never authorize cache deletion.
     #[test]
     fn unknown_preparation_liveness_never_authorizes_deletion() {
         let tmp = tempfile::tempdir().unwrap();
@@ -3233,12 +4053,12 @@ mod tests {
         std::fs::create_dir_all(repo.join(".aethyme")).unwrap();
         std::fs::write(repo.join(".aethyme/prepare.toml"), "invalid = [").unwrap();
         let cache = tmp.path().join("preparation-cache");
-        let path = cache.join("repository/key");
+        let path = cache.join(TEST_PREPARATION_REPOSITORY).join("cccccccccccc");
         std::fs::create_dir_all(&path).unwrap();
         let candidate = StoragePreparationCandidate {
             path: path.clone(),
-            repository: "repository".into(),
-            key: "key".into(),
+            repository: TEST_PREPARATION_REPOSITORY.into(),
+            key: "cccccccccccc".into(),
             estimated_bytes: None,
             estimated_inodes: None,
             reason: "previously unused".into(),
@@ -3254,7 +4074,16 @@ mod tests {
         assert!(!entries[0].reclaimable);
         assert!(entries[0].reason.contains("could not be verified"));
         assert!(candidates.is_empty());
-        assert!(apply_preparation_candidate(&candidate, &[repo]).is_err());
+        let resource_db_path = test_host_resource_db(tmp.path());
+        assert!(
+            apply_preparation_candidate_with_lease_at(
+                &candidate,
+                &[repo],
+                &resource_db_path,
+                &cache,
+            )
+            .is_err()
+        );
         assert!(path.is_dir());
     }
 
@@ -3266,7 +4095,9 @@ mod tests {
         let cache_root = tmp.path().join("preparation-cache");
         std::fs::create_dir_all(&main_root).unwrap();
         std::fs::create_dir_all(&storage_root).unwrap();
-        let entry = cache_root.join("repository/aaaaaaaaaaaa");
+        let entry = cache_root
+            .join(TEST_PREPARATION_REPOSITORY)
+            .join("aaaaaaaaaaaa");
         std::fs::create_dir_all(&entry).unwrap();
         std::fs::write(entry.join("cache.bin"), b"keep until verified").unwrap();
 
@@ -3274,11 +4105,57 @@ mod tests {
             &main_root,
             &storage_root,
             &cache_root,
+            &tmp.path().join("host-resource.db"),
             std::time::Instant::now() - Duration::from_millis(1),
         );
 
         assert_eq!((removed, bytes), (0, 0));
         assert!(entry.join("cache.bin").exists());
+    }
+
+    #[test]
+    fn inline_preparation_sweep_retains_entries_when_resource_state_is_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let main_root = tmp.path().join("main");
+        let storage_root = tmp.path().join("worktrees");
+        let cache_root = tmp.path().join("preparation-cache");
+        let resource_db_path = tmp.path().join("host-state/host-resources.db");
+        std::fs::create_dir_all(&main_root).unwrap();
+        std::fs::create_dir_all(&storage_root).unwrap();
+        let entry = cache_root
+            .join(TEST_PREPARATION_REPOSITORY)
+            .join("aaaaaaaaaaaa");
+        std::fs::create_dir_all(&entry).unwrap();
+        std::fs::write(entry.join("cache.bin"), b"retain without lease registry").unwrap();
+
+        let (removed, bytes) = sweep_preparation_cache_at(
+            &main_root,
+            &storage_root,
+            &cache_root,
+            &resource_db_path,
+            std::time::Instant::now() + Duration::from_secs(5),
+        );
+
+        assert_eq!((removed, bytes), (0, 0));
+        assert!(entry.join("cache.bin").exists());
+        assert!(
+            !resource_db_path.exists(),
+            "the sweep must not create host state"
+        );
+    }
+
+    #[test]
+    fn storage_cache_root_uses_the_host_resource_database_parent() {
+        let database = crate::default_host_resource_db_path().unwrap();
+        let expected = database
+            .parent()
+            .expect("host resource database has a parent")
+            .join("preparation-cache");
+
+        assert_eq!(
+            crate::preparation::preparation_cache_root().unwrap(),
+            expected
+        );
     }
 
     #[test]
@@ -3290,14 +4167,18 @@ mod tests {
         std::fs::create_dir_all(&main_root).unwrap();
         let unmarked_root = storage_root.join("unattributed");
         std::fs::create_dir_all(&unmarked_root).unwrap();
-        let entry = cache_root.join("repository/bbbbbbbbbbbb");
+        let entry = cache_root
+            .join(TEST_PREPARATION_REPOSITORY)
+            .join("bbbbbbbbbbbb");
         std::fs::create_dir_all(&entry).unwrap();
         std::fs::write(entry.join("cache.bin"), b"retain on unknown liveness").unwrap();
+        let resource_db_path = test_host_resource_db(tmp.path());
 
         let (removed, bytes) = sweep_preparation_cache_at(
             &main_root,
             &storage_root,
             &cache_root,
+            &resource_db_path,
             std::time::Instant::now() + Duration::from_secs(5),
         );
 
@@ -3325,14 +4206,18 @@ mod tests {
             serde_json::to_vec(&marker).unwrap(),
         )
         .unwrap();
-        let entry = cache_root.join("repository/cccccccccccc");
+        let entry = cache_root
+            .join(TEST_PREPARATION_REPOSITORY)
+            .join("cccccccccccc");
         std::fs::create_dir_all(&entry).unwrap();
         std::fs::write(entry.join("cache.bin"), b"dead").unwrap();
+        let resource_db_path = test_host_resource_db(tmp.path());
 
         let (removed, bytes) = sweep_preparation_cache_at(
             &main_root,
             &storage_root,
             &cache_root,
+            &resource_db_path,
             std::time::Instant::now() + Duration::from_secs(5),
         );
 
@@ -3377,17 +4262,19 @@ mod tests {
         let dead_key = "ffffffffffff";
         assert_ne!(live_key, dead_key);
 
-        let live_entry = cache_root.join("sibling").join(&live_key);
-        let dead_entry = cache_root.join("sibling").join(dead_key);
+        let live_entry = cache_root.join(TEST_PREPARATION_REPOSITORY).join(&live_key);
+        let dead_entry = cache_root.join(TEST_PREPARATION_REPOSITORY).join(dead_key);
         std::fs::create_dir_all(&live_entry).unwrap();
         std::fs::write(live_entry.join("cache.bin"), b"live").unwrap();
         std::fs::create_dir_all(&dead_entry).unwrap();
         std::fs::write(dead_entry.join("cache.bin"), b"dead").unwrap();
+        let resource_db_path = test_host_resource_db(tmp.path());
 
         let (removed, bytes) = sweep_preparation_cache_at(
             &main_root,
             &storage_root,
             &cache_root,
+            &resource_db_path,
             std::time::Instant::now() + Duration::from_secs(5),
         );
 
@@ -3412,14 +4299,18 @@ mod tests {
         std::fs::write(&external_config, "schema_version = 1\n").unwrap();
         std::os::unix::fs::symlink(&external_config, main_root.join(".aethyme/prepare.toml"))
             .unwrap();
-        let entry = cache_root.join("repository/dddddddddddd");
+        let entry = cache_root
+            .join(TEST_PREPARATION_REPOSITORY)
+            .join("dddddddddddd");
         std::fs::create_dir_all(&entry).unwrap();
         std::fs::write(entry.join("cache.bin"), b"retain").unwrap();
+        let resource_db_path = test_host_resource_db(tmp.path());
 
         let (removed, bytes) = sweep_preparation_cache_at(
             &main_root,
             &storage_root,
             &cache_root,
+            &resource_db_path,
             std::time::Instant::now() + Duration::from_secs(5),
         );
 
@@ -3443,14 +4334,18 @@ mod tests {
             vec![b'x'; 2 * 1024 * 1024],
         )
         .unwrap();
-        let entry = cache_root.join("repository/eeeeeeeeeeee");
+        let entry = cache_root
+            .join(TEST_PREPARATION_REPOSITORY)
+            .join("eeeeeeeeeeee");
         std::fs::create_dir_all(&entry).unwrap();
         std::fs::write(entry.join("cache.bin"), b"retain").unwrap();
+        let resource_db_path = test_host_resource_db(tmp.path());
 
         let (removed, bytes) = sweep_preparation_cache_at(
             &main_root,
             &storage_root,
             &cache_root,
+            &resource_db_path,
             std::time::Instant::now() + Duration::from_secs(5),
         );
 
@@ -3458,15 +4353,6 @@ mod tests {
         assert!(
             entry.is_dir(),
             "unbounded config data retains cache entries"
-        );
-    }
-
-    #[test]
-    fn the_cache_is_found_beside_the_worktree_container() {
-        let root = Path::new("/host/state/worktrees");
-        assert_eq!(
-            preparation_cache_root(root),
-            Some(PathBuf::from("/host/state/preparation-cache"))
         );
     }
 

@@ -359,6 +359,17 @@ impl HostResourceCoordinator {
     }
 
     pub fn open(path: &Path) -> Result<Self, HostResourceError> {
+        Self::open_with_busy_timeout(path, std::time::Duration::from_secs(5))
+    }
+
+    /// Open a writable coordinator with a caller-bounded SQLite lock wait.
+    /// Ordinary host-resource clients keep the five-second default above;
+    /// short inline maintenance lanes can use a smaller timeout so database
+    /// contention does not outlive their own deadline.
+    pub(crate) fn open_with_busy_timeout(
+        path: &Path,
+        busy_timeout: std::time::Duration,
+    ) -> Result<Self, HostResourceError> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|source| HostResourceError::Io {
                 path: parent.into(),
@@ -378,7 +389,7 @@ impl HostResourceCoordinator {
                 source,
             }
         })?;
-        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        conn.busy_timeout(busy_timeout)?;
         conn.pragma_update(None, "journal_mode", "wal")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
