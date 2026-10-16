@@ -392,10 +392,11 @@ fn a_kept_candidate_appearing_after_review_does_not_block_apply() {
 /// The review authorizes; whether the path may go now is decided afresh.
 #[test]
 fn a_reviewed_worktree_that_became_active_is_skipped() {
-    let (repo, container) = fixture("");
+    let (repo, container) = fixture("[retention]\nartifact_sweep_budget_ms = 0\n");
     let (worktree, _) = closed_session_with_target(repo.path(), container.path(), "resumed");
     let plan = reclaim_plan_json(repo.path(), container.path());
     let digest = plan["digest"].as_str().unwrap().to_string();
+    assert!(worktree.join("rust/target").exists());
 
     let adopted = common::broker_cli(
         CLI,
@@ -410,6 +411,7 @@ fn a_reviewed_worktree_that_became_active_is_skipped() {
         "adopt: {}",
         String::from_utf8_lossy(&adopted.stderr)
     );
+    assert!(worktree.join("rust/target").exists());
 
     let applied = run(
         repo.path(),
@@ -461,7 +463,7 @@ fn a_missing_review_still_requires_the_exact_digest() {
 /// digest, so it authorizes nothing.
 #[test]
 fn a_tampered_review_authorizes_nothing() {
-    let (repo, container) = fixture("");
+    let (repo, container) = fixture("[retention]\nartifact_sweep_budget_ms = 0\n");
     let (worktree, id) = closed_session_with_target(repo.path(), container.path(), "tampered");
     let (other, _) = closed_session_with_target(repo.path(), container.path(), "not reviewed");
     let scoped = run(
@@ -496,6 +498,8 @@ fn a_tampered_review_authorizes_nothing() {
             .cmp(right["path"].as_str().unwrap())
     });
     std::fs::write(&snapshot, serde_json::to_vec(&saved).unwrap()).unwrap();
+    assert!(worktree.join("rust/target").exists());
+    assert!(other.join("rust/target").exists());
 
     let refused = run(
         repo.path(),
@@ -515,7 +519,7 @@ fn a_tampered_review_authorizes_nothing() {
 /// One worktree can be reviewed and applied without the others holding still.
 #[test]
 fn a_session_scoped_plan_reviews_and_removes_one_worktree() {
-    let (repo, container) = fixture("");
+    let (repo, container) = fixture("[retention]\nartifact_sweep_budget_ms = 0\n");
     let (first, first_id) = closed_session_with_target(repo.path(), container.path(), "first");
     let (second, _) = closed_session_with_target(repo.path(), container.path(), "second");
     let scoped = run(
@@ -532,6 +536,8 @@ fn a_session_scoped_plan_reviews_and_removes_one_worktree() {
     let candidates = plan["candidates"].as_array().unwrap();
     assert_eq!(candidates.len(), 1, "{plan}");
     let digest = plan["digest"].as_str().unwrap().to_string();
+    assert!(first.join("rust/target").exists());
+    assert!(second.join("rust/target").exists());
 
     let applied = run(
         repo.path(),
@@ -560,7 +566,7 @@ fn a_session_scoped_plan_reviews_and_removes_one_worktree() {
 /// session, so neither confirmation is accepted for the other scope.
 #[test]
 fn a_reclaim_confirmation_is_refused_for_a_different_scope() {
-    let (repo, container) = fixture("");
+    let (repo, container) = fixture("[retention]\nartifact_sweep_budget_ms = 0\n");
     let (first, first_id) = closed_session_with_target(repo.path(), container.path(), "first");
     let (second, _) = closed_session_with_target(repo.path(), container.path(), "second");
     let scoped = run(
@@ -578,6 +584,8 @@ fn a_reclaim_confirmation_is_refused_for_a_different_scope() {
     let whole = reclaim_plan_json(repo.path(), container.path());
     let whole_digest = whole["digest"].as_str().unwrap().to_string();
     assert!(whole.get("scope").is_none(), "{whole}");
+    assert!(first.join("rust/target").exists());
+    assert!(second.join("rust/target").exists());
 
     let unscoped_apply = run(
         repo.path(),
@@ -781,6 +789,15 @@ fn meta(repo: &Path, key: &str) -> Option<String> {
             row.get(0)
         })
         .ok()
+}
+
+fn interrupted_paths(repo: &Path) -> Vec<String> {
+    match meta(repo, "gc.artifact_sweep.interrupted_path") {
+        None => Vec::new(),
+        Some(value) if value.is_empty() => Vec::new(),
+        Some(value) if value.starts_with('[') => serde_json::from_str(&value).unwrap(),
+        Some(value) => vec![value],
+    }
 }
 
 fn clear_meta(repo: &Path, key: &str) {
@@ -1909,9 +1926,9 @@ fn a_paused_removal_in_a_closed_session_is_finished_by_the_next_pass() {
             .success()
     );
     assert!(target.exists(), "a 50 ms pass must pause part-way");
+    let target_key = target.to_string_lossy().into_owned();
     assert!(
-        meta(repo.path(), "gc.artifact_sweep.interrupted_path")
-            .is_some_and(|path| path.ends_with("rust/target")),
+        interrupted_paths(repo.path()).contains(&target_key),
         "the paused tree is remembered"
     );
 
@@ -1975,6 +1992,10 @@ fn a_remembered_path_outside_the_session_worktree_is_never_touched() {
 
     sweep(repo.path(), container.path());
     assert!(precious.join("keep").exists());
+    assert_eq!(
+        meta(repo.path(), "gc.artifact_sweep.interrupted_path").as_deref(),
+        Some("")
+    );
 }
 
 fn remember_interrupted_tree(repo: &Path, path: &Path) {
@@ -2017,17 +2038,44 @@ fn a_remembered_non_artifact_directory_is_never_removed() {
     let (repo, container) =
         fixture("[retention]\nartifact_reclaim_days = 0\nartifact_sweep_budget_ms = 0\n");
     let (_id, worktree) = blocked_session_with_build_cache(repo.path(), container.path());
+    let cache = worktree.join("rust/target");
     let precious = worktree.join("local-data");
     std::fs::create_dir(&precious).unwrap();
     std::fs::write(precious.join("keep"), "keep\n").unwrap();
     std::fs::write(repo.path().join(".git/info/exclude"), "local-data/\n").unwrap();
     remember_interrupted_tree(repo.path(), &precious);
+    assert!(
+        cache.exists(),
+        "the unrelated eligible cache starts present"
+    );
     enable_sweep(repo.path());
     sweep(repo.path(), container.path());
     assert!(precious.join("keep").exists());
+    assert!(
+        !cache.exists(),
+        "a revoked marker must not starve eligible caches"
+    );
     assert_eq!(
         meta(repo.path(), "gc.artifact_sweep.interrupted_path").as_deref(),
         Some("")
+    );
+    let payload: String = rusqlite::Connection::open(repo.path().join(".aethyme/broker.db"))
+        .unwrap()
+        .query_row(
+            "SELECT payload_json FROM events WHERE kind = 'broker.gc.artifacts-swept' ORDER BY id DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let payload: serde_json::Value = serde_json::from_str(&payload).unwrap();
+    assert_eq!(payload["directories"], 1);
+    assert_eq!(
+        payload["revoked_interrupted_paths"][0]["path"],
+        precious.to_string_lossy().as_ref()
+    );
+    assert_eq!(
+        payload["revoked_interrupted_paths"][0]["reason"],
+        "not_unattended_artifact"
     );
 }
 

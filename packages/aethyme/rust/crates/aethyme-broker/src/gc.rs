@@ -77,6 +77,11 @@ const ARTIFACT_SWEEP_PROGRESS_KEY: &str = "gc.artifact_sweep.last_partial_ms";
 const ARTIFACT_SWEEP_INTERRUPTED_KEY: &str = "gc.artifact_sweep.interrupted_path";
 const ARTIFACT_SWEEP_INTERRUPTED_PATHS_MAX: usize = 32;
 const ARTIFACT_SWEEP_INTERRUPTED_VALUE_MAX_BYTES: usize = 64 * 1024;
+const ARTIFACT_SWEEP_DIAGNOSTIC_PATH_MAX_CHARS: usize = 128;
+const ARTIFACT_SWEEP_BLOCKED_DIAGNOSTICS_MAX: usize = 32;
+/// Last diagnosed unavailable marker set; replaced or cleared to avoid an
+/// append-only event for every retry of the same blocked paths.
+const ARTIFACT_SWEEP_BLOCKED_PATHS_KEY: &str = "gc.artifact_sweep.blocked_paths";
 /// Durable request for the detached, cache-only continuation worker.
 const ARTIFACT_SWEEP_RECOVERY_REQUESTED_KEY: &str = "gc.artifact_sweep.recovery_requested_ms";
 /// Highest recovery request generation completed by the cache-only worker.
@@ -174,9 +179,38 @@ fn sweep_order<T: Clone>(items: &[T], cursor: i64, id: impl Fn(&T) -> i64) -> Ve
 ///   root;
 /// - its name is still one the unattended lane may remove. The witness may be
 ///   gone after a partial removal; the name may not change.
-fn resumable_interrupted_tree(root: &Path, path: &Path, extras: &[String]) -> bool {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InterruptedTreeState {
+    Resume,
+    Revoked(&'static str),
+    Unavailable(&'static str),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RevokedInterruptedPath {
+    path: String,
+    reason: &'static str,
+    canonical_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BlockedInterruptedPath {
+    path: Option<String>,
+    reason: &'static str,
+}
+
+fn bounded_artifact_diagnostic_path(path: &str) -> String {
+    path.chars()
+        .take(ARTIFACT_SWEEP_DIAGNOSTIC_PATH_MAX_CHARS)
+        .collect()
+}
+
+/// Re-prove a remembered path before continuing removal. A known mismatch
+/// revokes only this path's old removal authority; an I/O failure is different
+/// because it says nothing about whether that authority is still valid.
+fn interrupted_tree_state(root: &Path, path: &Path, extras: &[String]) -> InterruptedTreeState {
     let Ok(relative) = path.strip_prefix(root) else {
-        return false;
+        return InterruptedTreeState::Revoked("outside_worktree");
     };
     let components = relative.components().collect::<Vec<_>>();
     if components.is_empty()
@@ -184,32 +218,49 @@ fn resumable_interrupted_tree(root: &Path, path: &Path, extras: &[String]) -> bo
             .iter()
             .all(|component| matches!(component, Component::Normal(_)))
     {
-        return false;
+        return InterruptedTreeState::Revoked("unsafe_path_components");
     }
     let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-        return false;
+        return InterruptedTreeState::Revoked("invalid_artifact_name");
     };
     if crate::artifact_catalog::unattended_witness(name, extras).is_none() {
-        return false;
+        return InterruptedTreeState::Revoked("not_unattended_artifact");
     }
-    let real_directory = |candidate: &Path| {
-        std::fs::symlink_metadata(candidate).is_ok_and(|metadata| metadata.file_type().is_dir())
+    let inspect_directory = |candidate: &Path| match std::fs::symlink_metadata(candidate) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            InterruptedTreeState::Revoked("symlink_component")
+        }
+        Ok(metadata) if metadata.is_dir() => InterruptedTreeState::Resume,
+        Ok(_) => InterruptedTreeState::Revoked("not_directory"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            InterruptedTreeState::Revoked("path_missing")
+        }
+        Err(_) => InterruptedTreeState::Unavailable("metadata_unavailable"),
     };
-    if !real_directory(root) {
-        return false;
+    let root_state = inspect_directory(root);
+    if root_state != InterruptedTreeState::Resume {
+        return root_state;
     }
     let mut walked = root.to_path_buf();
     for component in &components {
         walked.push(component);
-        if !real_directory(&walked) {
-            return false;
+        let state = inspect_directory(&walked);
+        if state != InterruptedTreeState::Resume {
+            return state;
         }
     }
     match (std::fs::canonicalize(root), std::fs::canonicalize(path)) {
         (Ok(canonical_root), Ok(canonical_path)) => {
-            canonical_path != canonical_root && canonical_path.starts_with(&canonical_root)
+            if canonical_path != canonical_root && canonical_path.starts_with(&canonical_root) {
+                InterruptedTreeState::Resume
+            } else {
+                InterruptedTreeState::Revoked("outside_worktree")
+            }
         }
-        _ => false,
+        (Err(error), _) | (_, Err(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+            InterruptedTreeState::Revoked("path_missing")
+        }
+        _ => InterruptedTreeState::Unavailable("canonicalization_unavailable"),
     }
 }
 
@@ -276,25 +327,22 @@ fn persist_interrupted_paths(
     Ok(true)
 }
 
-/// Drop only paths that are conclusively no longer directories. Symlinks and
-/// metadata errors remain blockers so a changed path is never mistaken for a
-/// completed tree.
-fn prune_absent_interrupted_paths(paths: &mut Vec<String>) -> bool {
-    let mut complete = true;
+/// Drop paths that are conclusively absent or no longer directories. Keep
+/// symlinks for the per-worktree authority check, and preserve metadata errors
+/// as blockers rather than mistaking them for completed removals.
+fn prune_absent_interrupted_paths(paths: &mut Vec<String>) -> Vec<String> {
+    let mut unavailable = Vec::new();
     paths.retain(|path| match std::fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() => {
-            complete = false;
-            true
-        }
+        Ok(metadata) if metadata.file_type().is_symlink() => true,
         Ok(metadata) if metadata.is_dir() => true,
         Ok(_) => false,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
         Err(_) => {
-            complete = false;
+            unavailable.push(path.clone());
             true
         }
     });
-    complete
+    unavailable
 }
 
 /// Wall-clock budget for one sweep pass. A broker open gets the smaller of the
@@ -3284,6 +3332,7 @@ impl Broker {
         };
         let interrupted_value = self.store().meta_get(ARTIFACT_SWEEP_INTERRUPTED_KEY)?;
         let mut interrupted_paths_valid = true;
+        let mut blocked_interrupted_paths = Vec::<BlockedInterruptedPath>::new();
         let mut interrupted_paths = match decode_interrupted_paths(interrupted_value.as_deref()) {
             Ok(paths) => paths,
             Err(()) => {
@@ -3292,22 +3341,50 @@ impl Broker {
                 // room to remember a partial removal.
                 interrupted_paths_valid = false;
                 scan_completed = false;
+                blocked_interrupted_paths.push(BlockedInterruptedPath {
+                    path: None,
+                    reason: "queue_invalid_or_oversized",
+                });
                 Vec::new()
             }
         };
         if interrupted_paths_valid {
             let previous_paths = interrupted_paths.clone();
-            if !prune_absent_interrupted_paths(&mut interrupted_paths) {
+            let unavailable = prune_absent_interrupted_paths(&mut interrupted_paths);
+            if !unavailable.is_empty() {
                 scan_completed = false;
+                blocked_interrupted_paths.extend(unavailable.into_iter().map(|path| {
+                    BlockedInterruptedPath {
+                        path: Some(path),
+                        reason: "metadata_unavailable",
+                    }
+                }));
             }
             if interrupted_paths != previous_paths
                 && !persist_interrupted_paths(self.store(), &interrupted_paths)?
             {
                 interrupted_paths_valid = false;
                 scan_completed = false;
+                blocked_interrupted_paths.push(BlockedInterruptedPath {
+                    path: None,
+                    reason: "queue_update_unavailable",
+                });
             }
         }
+        blocked_interrupted_paths.extend(
+            interrupted_paths
+                .iter()
+                .filter(|path| {
+                    let path = Path::new(path);
+                    live_worktrees.iter().any(|root| path.starts_with(root))
+                })
+                .map(|path| BlockedInterruptedPath {
+                    path: Some(path.clone()),
+                    reason: "live_session",
+                }),
+        );
         let mut visited_any = false;
+        let mut revoked_interrupted_paths = Vec::<RevokedInterruptedPath>::new();
         for session in sessions {
             // Checked before the session is taken, so the cursor names the
             // last session actually visited and the next pass starts here.
@@ -3346,6 +3423,10 @@ impl Broker {
                     // belongs to this checkout. A timeout or any other
                     // failure leaves the session unclassified, so retain the
                     // unfinished pass, then let later sessions make progress.
+                    blocked_interrupted_paths.push(BlockedInterruptedPath {
+                        path: Some(root.to_string_lossy().into_owned()),
+                        reason: "git_discovery_unavailable",
+                    });
                     scan_completed = false;
                     continue;
                 }
@@ -3363,24 +3444,80 @@ impl Broker {
             // after partial removal their original witness may be gone, but
             // their exact path remains safe to resume after fresh validation.
             let mut pending_in_worktree = Vec::new();
+            let mut revoked_in_worktree = Vec::new();
             for path in interrupted_paths
                 .iter()
                 .map(|path| PathBuf::from(path.as_str()))
                 .filter(|path| path.starts_with(&root))
             {
-                if resumable_interrupted_tree(&root, &path, &policy.artefact_directories) {
-                    pending_in_worktree.push(path);
+                match interrupted_tree_state(&root, &path, &policy.artefact_directories) {
+                    InterruptedTreeState::Resume => pending_in_worktree.push(path),
+                    InterruptedTreeState::Revoked(reason) if interrupted_paths_valid => {
+                        let path = path.to_string_lossy().into_owned();
+                        revoked_in_worktree.push(RevokedInterruptedPath {
+                            canonical_path: std::fs::canonicalize(&path).ok(),
+                            path,
+                            reason,
+                        });
+                    }
+                    InterruptedTreeState::Revoked(_) if !interrupted_paths_valid => {
+                        blocked_interrupted_paths.push(BlockedInterruptedPath {
+                            path: Some(path.to_string_lossy().into_owned()),
+                            reason: "queue_unavailable_for_revocation",
+                        });
+                        session_scan_complete = false;
+                    }
+                    InterruptedTreeState::Unavailable(reason) => {
+                        // Without a trustworthy queue write, or when the
+                        // filesystem cannot be inspected, preserve the marker
+                        // and keep the pass incomplete.
+                        blocked_interrupted_paths.push(BlockedInterruptedPath {
+                            path: Some(path.to_string_lossy().into_owned()),
+                            reason,
+                        });
+                        session_scan_complete = false;
+                    }
+                }
+            }
+            let revoked_targets = revoked_in_worktree
+                .iter()
+                .filter_map(|revoked| revoked.canonical_path.clone())
+                .collect::<BTreeSet<_>>();
+            if !revoked_in_worktree.is_empty() {
+                let revoked_paths = revoked_in_worktree
+                    .iter()
+                    .map(|revoked| revoked.path.as_str())
+                    .collect::<BTreeSet<_>>();
+                let mut updated_paths = interrupted_paths.clone();
+                updated_paths.retain(|path| !revoked_paths.contains(path.as_str()));
+                if persist_interrupted_paths(self.store(), &updated_paths)? {
+                    interrupted_paths = updated_paths;
+                    revoked_interrupted_paths.extend(revoked_in_worktree);
                 } else {
-                    // Keep an existing but no-longer-verifiable path as a
-                    // blocker. It must not be silently forgotten or removed.
+                    interrupted_paths_valid = false;
                     session_scan_complete = false;
+                    blocked_interrupted_paths.extend(revoked_in_worktree.iter().map(|revoked| {
+                        BlockedInterruptedPath {
+                            path: Some(revoked.path.clone()),
+                            reason: "queue_update_unavailable",
+                        }
+                    }));
                 }
             }
             found.retain(|dir| !pending_in_worktree.contains(dir));
+            found.retain(|dir| {
+                std::fs::canonicalize(dir)
+                    .ok()
+                    .is_none_or(|canonical| !revoked_targets.contains(&canonical))
+            });
             pending_in_worktree.extend(found);
             let found = pending_in_worktree;
             for dir in found {
                 let Some(relative) = repo_relative(&root, &dir) else {
+                    blocked_interrupted_paths.push(BlockedInterruptedPath {
+                        path: Some(dir.to_string_lossy().into_owned()),
+                        reason: "path_not_repository_relative",
+                    });
                     session_scan_complete = false;
                     continue;
                 };
@@ -3394,6 +3531,10 @@ impl Broker {
                         // A Git failure (including a shorter configured Git
                         // timeout) leaves this candidate unclassified. Do not
                         // advance the recovery generation on that basis.
+                        blocked_interrupted_paths.push(BlockedInterruptedPath {
+                            path: Some(dir.to_string_lossy().into_owned()),
+                            reason: "git_ignore_check_unavailable",
+                        });
                         session_scan_complete = false;
                         break;
                     }
@@ -3402,7 +3543,27 @@ impl Broker {
                 let resuming = interrupted_paths.iter().any(|path| path == &dir_key);
                 if !ignored {
                     if resuming {
-                        session_scan_complete = false;
+                        if interrupted_paths_valid {
+                            let mut updated_paths = interrupted_paths.clone();
+                            updated_paths.retain(|path| path != &dir_key);
+                            if persist_interrupted_paths(self.store(), &updated_paths)? {
+                                interrupted_paths = updated_paths;
+                                revoked_interrupted_paths.push(RevokedInterruptedPath {
+                                    canonical_path: std::fs::canonicalize(&dir).ok(),
+                                    path: dir_key,
+                                    reason: "no_longer_git_ignored",
+                                });
+                            } else {
+                                interrupted_paths_valid = false;
+                                blocked_interrupted_paths.push(BlockedInterruptedPath {
+                                    path: Some(dir_key),
+                                    reason: "queue_update_unavailable",
+                                });
+                                session_scan_complete = false;
+                            }
+                        } else {
+                            session_scan_complete = false;
+                        }
                     }
                     continue;
                 }
@@ -3417,10 +3578,18 @@ impl Broker {
                         // The queue is deliberately finite. Leave this cache
                         // intact and let a later pass retry after older paths
                         // have completed; never unlink without a recovery key.
+                        blocked_interrupted_paths.push(BlockedInterruptedPath {
+                            path: Some(dir_key),
+                            reason: "queue_capacity_exceeded",
+                        });
                         session_scan_complete = false;
                         continue;
                     }
                     if !persist_interrupted_paths(self.store(), &updated_paths)? {
+                        blocked_interrupted_paths.push(BlockedInterruptedPath {
+                            path: Some(dir_key),
+                            reason: "queue_update_unavailable",
+                        });
                         session_scan_complete = false;
                         continue;
                     }
@@ -3440,6 +3609,10 @@ impl Broker {
                             Ok(false) | Err(_) => {
                                 // The cache is gone, but retain the old queue
                                 // entry and retry its absence proof next time.
+                                blocked_interrupted_paths.push(BlockedInterruptedPath {
+                                    path: Some(dir_key.clone()),
+                                    reason: "queue_update_unavailable",
+                                });
                                 session_scan_complete = false;
                             }
                         }
@@ -3454,6 +3627,10 @@ impl Broker {
                     Err(error) => {
                         entries_reclaimed =
                             entries_reclaimed.saturating_add(error.entries_reclaimed);
+                        blocked_interrupted_paths.push(BlockedInterruptedPath {
+                            path: Some(dir_key),
+                            reason: "removal_unavailable",
+                        });
                         session_scan_complete = false;
                     }
                 }
@@ -3472,6 +3649,48 @@ impl Broker {
             }
             if !session_scan_complete {
                 scan_completed = false;
+            }
+        }
+        // A remembered path outside every known session root no longer has
+        // broker deletion authority. Retire just that marker; never follow or
+        // remove the external path itself. Include live roots so a cache that
+        // became active remains queued for a later closed-session pass.
+        if interrupted_paths_valid {
+            let known_worktrees = all
+                .iter()
+                .map(|session| PathBuf::from(&session.worktree_path))
+                .chain(live_worktrees.iter().cloned())
+                .collect::<Vec<_>>();
+            let outside_managed_worktrees = interrupted_paths
+                .iter()
+                .filter(|path| {
+                    let path = Path::new(path);
+                    !known_worktrees.iter().any(|root| path.starts_with(root))
+                })
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            if !outside_managed_worktrees.is_empty() {
+                let mut updated_paths = interrupted_paths.clone();
+                updated_paths.retain(|path| !outside_managed_worktrees.contains(path));
+                if persist_interrupted_paths(self.store(), &updated_paths)? {
+                    interrupted_paths = updated_paths;
+                    revoked_interrupted_paths.extend(outside_managed_worktrees.into_iter().map(
+                        |path| RevokedInterruptedPath {
+                            path,
+                            reason: "outside_managed_worktrees",
+                            canonical_path: None,
+                        },
+                    ));
+                } else {
+                    interrupted_paths_valid = false;
+                    scan_completed = false;
+                    blocked_interrupted_paths.extend(outside_managed_worktrees.iter().map(
+                        |path| BlockedInterruptedPath {
+                            path: Some(path.clone()),
+                            reason: "queue_update_unavailable",
+                        },
+                    ));
+                }
             }
         }
         if !interrupted_paths.is_empty() {
@@ -3516,13 +3735,65 @@ impl Broker {
                     .meta_set(ARTIFACT_SWEEP_PROGRESS_KEY, &now.to_string())?;
             }
         }
-        if !removed.is_empty() {
+        blocked_interrupted_paths.sort_by(|left, right| {
+            left.path
+                .cmp(&right.path)
+                .then_with(|| left.reason.cmp(right.reason))
+        });
+        blocked_interrupted_paths.dedup();
+        let omitted_blocked_diagnostics = blocked_interrupted_paths.len()
+            > ARTIFACT_SWEEP_BLOCKED_DIAGNOSTICS_MAX.saturating_sub(1);
+        let mut blocked = blocked_interrupted_paths
+            .iter()
+            .take(ARTIFACT_SWEEP_BLOCKED_DIAGNOSTICS_MAX.saturating_sub(1))
+            .map(|blocked| {
+                serde_json::json!({
+                    "path": blocked.path.as_deref().map(bounded_artifact_diagnostic_path),
+                    "reason": blocked.reason,
+                })
+            })
+            .collect::<Vec<_>>();
+        if omitted_blocked_diagnostics {
+            blocked.push(serde_json::json!({
+                "path": null,
+                "reason": "additional_blockers_omitted",
+            }));
+        }
+        let blocked_json = serde_json::Value::Array(blocked.clone()).to_string();
+        let blocked_state = if blocked_interrupted_paths.is_empty() {
+            String::new()
+        } else {
+            blocked_json.clone()
+        };
+        let previous_blocked_state = self.store().meta_get(ARTIFACT_SWEEP_BLOCKED_PATHS_KEY)?;
+        let blocked_state_changed =
+            previous_blocked_state.as_deref().unwrap_or("") != blocked_state;
+        if !removed.is_empty() || !revoked_interrupted_paths.is_empty() || blocked_state_changed {
+            let mut revoked_interrupted_paths = revoked_interrupted_paths;
+            revoked_interrupted_paths.sort_by(|left, right| {
+                left.path
+                    .cmp(&right.path)
+                    .then_with(|| left.reason.cmp(right.reason))
+            });
+            revoked_interrupted_paths.dedup();
+            let revoked = revoked_interrupted_paths
+                .iter()
+                .map(|revoked| {
+                    serde_json::json!({
+                        "path": bounded_artifact_diagnostic_path(&revoked.path),
+                        "reason": revoked.reason,
+                    })
+                })
+                .collect::<Vec<_>>();
             let payload = serde_json::json!({
                 "directories": removed.len(),
                 "idle_days": policy.artifact_reclaim_days,
                 "closed_session_directories": removed.len(),
                 "idle_open_session_directories": 0,
                 "idle_session_artifact_hours": policy.idle_session_artifact_hours,
+                "complete": scan_completed,
+                "revoked_interrupted_paths": revoked,
+                "blocked_interrupted_paths": blocked,
             })
             .to_string();
             self.store().append_event(
@@ -3530,6 +3801,10 @@ impl Broker {
                 None,
                 Some(&payload),
             )?;
+        }
+        if blocked_state_changed {
+            self.store()
+                .meta_set(ARTIFACT_SWEEP_BLOCKED_PATHS_KEY, &blocked_state)?;
         }
         // Whole checkouts go after their caches, under the same lock and
         // budget, and only on the general sweep: the targeted pass after a
@@ -5313,61 +5588,62 @@ mod tests {
         std::fs::create_dir_all(root.join("real/node_modules")).unwrap();
         std::os::unix::fs::symlink(root.join("real"), root.join("inner-link")).unwrap();
 
-        assert!(resumable_interrupted_tree(
-            root,
-            &root.join(".pnpm-store"),
-            &[]
-        ));
-        assert!(resumable_interrupted_tree(
-            root,
-            &root.join("web/node_modules"),
-            &[]
-        ));
+        assert_eq!(
+            interrupted_tree_state(root, &root.join(".pnpm-store"), &[]),
+            InterruptedTreeState::Resume
+        );
+        assert_eq!(
+            interrupted_tree_state(root, &root.join("web/node_modules"), &[]),
+            InterruptedTreeState::Resume
+        );
         // Component guard only: canonically inside root, no symlink, an
         // artefact name -- but it is spelled with `..`.
-        assert!(!resumable_interrupted_tree(
-            root,
-            &root.join("a/../.pnpm-store"),
-            &[]
-        ));
+        assert_eq!(
+            interrupted_tree_state(root, &root.join("a/../.pnpm-store"), &[]),
+            InterruptedTreeState::Revoked("unsafe_path_components")
+        );
         // Name guard only: a real directory inside root, but not a cache.
-        assert!(!resumable_interrupted_tree(root, &root.join("src"), &[]));
-        assert!(!resumable_interrupted_tree(
-            root,
-            &root.join("src"),
-            &["src".to_string()]
-        ));
+        assert_eq!(
+            interrupted_tree_state(root, &root.join("src"), &[]),
+            InterruptedTreeState::Revoked("not_unattended_artifact")
+        );
+        assert_eq!(
+            interrupted_tree_state(root, &root.join("src"), &["src".to_string()]),
+            InterruptedTreeState::Revoked("not_unattended_artifact")
+        );
         std::fs::create_dir(root.join("custom-cache")).unwrap();
-        assert!(resumable_interrupted_tree(
-            root,
-            &root.join("custom-cache"),
-            &["custom-cache".to_string()]
-        ));
+        assert_eq!(
+            interrupted_tree_state(
+                root,
+                &root.join("custom-cache"),
+                &["custom-cache".to_string()]
+            ),
+            InterruptedTreeState::Resume
+        );
         // Symlink guard only: the link resolves inside root.
-        assert!(!resumable_interrupted_tree(
-            root,
-            &root.join("inner-link/node_modules"),
-            &[]
-        ));
+        assert_eq!(
+            interrupted_tree_state(root, &root.join("inner-link/node_modules"), &[]),
+            InterruptedTreeState::Revoked("symlink_component")
+        );
         // A link leaving root.
-        assert!(!resumable_interrupted_tree(
-            root,
-            &root.join("link/node_modules"),
-            &[]
-        ));
+        assert_eq!(
+            interrupted_tree_state(root, &root.join("link/node_modules"), &[]),
+            InterruptedTreeState::Revoked("symlink_component")
+        );
         // Not under root at all, and root itself.
-        assert!(!resumable_interrupted_tree(
-            root,
-            &outside.path().join("node_modules"),
-            &[]
-        ));
-        assert!(!resumable_interrupted_tree(root, root, &[]));
+        assert_eq!(
+            interrupted_tree_state(root, &outside.path().join("node_modules"), &[]),
+            InterruptedTreeState::Revoked("outside_worktree")
+        );
+        assert_eq!(
+            interrupted_tree_state(root, root, &[]),
+            InterruptedTreeState::Revoked("unsafe_path_components")
+        );
         // Gone.
-        assert!(!resumable_interrupted_tree(
-            root,
-            &root.join("node_modules"),
-            &[]
-        ));
+        assert_eq!(
+            interrupted_tree_state(root, &root.join("node_modules"), &[]),
+            InterruptedTreeState::Revoked("path_missing")
+        );
     }
 
     /// Explicit reclaim commands keep the pressure-scaled policy budget.
@@ -5530,8 +5806,12 @@ mod tests {
         let (first_id, first_cache) = make_closed("first closed cache");
         let (later_id, later_cache) = make_closed("later closed cache");
         assert!(first_id < later_id);
-        let blocker = root.join(".aethyme/interrupted-but-unmapped");
+        let active = broker
+            .start_worktree("active-marker-blocker", None)
+            .unwrap();
+        let blocker = PathBuf::from(&active.worktree_path).join("target");
         std::fs::create_dir_all(&blocker).unwrap();
+        std::fs::write(blocker.join("keep"), b"active\n").unwrap();
         std::fs::write(
             root.join(".aethyme/broker.toml"),
             "[retention]\nclosed_worktrees_days = 30\nclosed_worktree_grace_hours = 0\nartifact_reclaim_days = 0\nartifact_sweep_budget_ms = 5000\nartifact_sweep_interval_hours = 1\n",
@@ -5582,6 +5862,7 @@ mod tests {
             !later_cache.exists(),
             "unrelated closed caches still make progress"
         );
+        assert!(blocker.join("keep").exists(), "a live root stays untouched");
         assert_eq!(
             broker
                 .store()
@@ -5599,6 +5880,23 @@ mod tests {
                 .as_deref(),
             Some("3"),
             "the worker must not advance generation on an incomplete cache lap"
+        );
+        let blocked: serde_json::Value = serde_json::from_str(
+            broker
+                .store()
+                .meta_get(ARTIFACT_SWEEP_BLOCKED_PATHS_KEY)
+                .unwrap()
+                .as_deref()
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(blocked.as_array().unwrap().len() <= ARTIFACT_SWEEP_BLOCKED_DIAGNOSTICS_MAX);
+        assert!(
+            blocked
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| { item["reason"] == "live_session" && item["path"].is_string() })
         );
         assert!(worker_retry_pending(broker.store(), now_ms()).unwrap());
     }
