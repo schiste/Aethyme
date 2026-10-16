@@ -108,8 +108,7 @@ fn rewrite_recipe_with_unexpected_prior_completion(
         &[&composer::COMPOSITION_RECIPE_SCHEMA],
     )
     .unwrap();
-    let recipe_object =
-        archive::put_object(&mut f.store, &recipe_record.canonical_bytes()).unwrap();
+    let recipe_object = archive::put_object(&f.store, &recipe_record.canonical_bytes()).unwrap();
     payload.composition.recipe.id = recipe_record.id().to_string();
     payload.composition.recipe.object = recipe_object.hex();
 
@@ -118,15 +117,14 @@ fn rewrite_recipe_with_unexpected_prior_completion(
         &[&COMPOSITION_SOURCE_SCHEMA],
     )
     .unwrap();
-    let source_object =
-        archive::put_object(&mut f.store, &source_record.canonical_bytes()).unwrap();
+    let source_object = archive::put_object(&f.store, &source_record.canonical_bytes()).unwrap();
     let revision = id(&wave.spec.revision).unwrap();
     target::retain_artifacts(
         &mut f.store,
         owner,
         &revision,
         &[],
-        &[recipe_object.clone(), source_object.clone()],
+        &[recipe_object, source_object],
     )
     .unwrap();
     f.store
