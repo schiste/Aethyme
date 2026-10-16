@@ -11,6 +11,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const MAX_BINDINGS: i64 = 64;
 const MAX_HISTORY_EVENTS: i64 = 4096;
 const MAX_OBSERVATION_OPERATIONS: i64 = 1024;
+const MAX_REVISION_PROOF_OBJECTS: usize = 128;
+const MAX_REVISION_PROOF_BYTES: usize = MAX_SNAPSHOT_RECOVERY_BYTES;
+const MAX_REVISION_PROOF_SNAPSHOTS: usize = MAX_REVISION_PROOF_OBJECTS * 2;
+const MAX_SNAPSHOT_RECOVERY_PROOF_OBJECTS: usize = 1024;
+const MAX_SNAPSHOT_RECOVERY_PROOF_SNAPSHOTS: usize = MAX_SNAPSHOT_RECOVERY_PROOF_OBJECTS * 2;
 const KIND: &str = "exchange_metadata_v0";
 static BINDING: RecordSchema = RecordSchema {
     name: "aethyme.exchange-binding/provisional-v0",
@@ -92,25 +97,62 @@ fn pin(tx: &Transaction<'_>, digest: &ObjectDigest, holder: &str) -> Result<(), 
     tx.execute("INSERT INTO object_pins(class,object_sha256,holder,created_ms) VALUES('cited_evidence',?1,?2,?3)",params![digest.hex(),holder,now()?])?;
     Ok(())
 }
-fn pin_revision_event_objects(
+#[derive(Debug, Clone)]
+struct VerifiedRevisionRetention {
+    object_digests: BTreeSet<ObjectDigest>,
+    source_snapshots: BTreeSet<SourceSnapshotId>,
+    object_bytes: usize,
+}
+
+fn retain_revision_proof(
     tx: &Transaction<'_>,
-    binding: &RecordId,
-    stream: &RecordId,
-    sequence: u64,
-    objects: &[ObjectDigest],
+    proof: &VerifiedRevisionRetention,
 ) -> Result<(), ExchangeError> {
-    for (index, digest) in objects.iter().enumerate() {
-        pin(
-            tx,
-            digest,
-            &format!(
-                "exchange-revision-event:{}:{}:{}:{}",
-                binding.as_str(),
-                stream.as_str(),
-                sequence,
-                index
-            ),
+    if proof.object_digests.len() > MAX_REVISION_PROOF_OBJECTS
+        || proof.object_bytes > MAX_REVISION_PROOF_BYTES
+        || proof.source_snapshots.len() > MAX_REVISION_PROOF_SNAPSHOTS
+    {
+        return Err(ExchangeError::Limit);
+    }
+    for digest in &proof.object_digests {
+        let holder = format!("exchange-revision-proof:{}", digest.hex());
+        let exists: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM object_pins
+             WHERE class='cited_evidence' AND object_sha256=?1
+               AND holder=?2 AND released_ms IS NULL)",
+            params![digest.hex(), holder],
+            |row| row.get(0),
         )?;
+        if !exists {
+            pin(tx, digest, &holder)?;
+        }
+    }
+    for snapshot in &proof.source_snapshots {
+        let retained: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM retained_snapshots
+             WHERE snapshot_id=?1 AND snapshot_id NOT IN
+               (SELECT snapshot_id FROM reclaimed_snapshots))",
+            [snapshot.as_str()],
+            |row| row.get(0),
+        )?;
+        if !retained {
+            return Err(invalid("revision source snapshot is not retained"));
+        }
+        let holder = format!("exchange-revision-source:{}", snapshot.as_str());
+        let exists: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM reader_leases
+             WHERE target_kind='snapshot' AND target=?1 AND holder=?2
+               AND released_ms IS NULL AND until_ms>?3)",
+            params![snapshot.as_str(), holder, now()?],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            tx.execute(
+                "INSERT INTO reader_leases (target_kind,target,holder,until_ms,created_ms)
+                 VALUES ('snapshot',?1,?2,?3,?4)",
+                params![snapshot.as_str(), holder, i64::MAX, now()?],
+            )?;
+        }
     }
     Ok(())
 }
@@ -308,8 +350,7 @@ impl CurrentPeer<'_> {
         }
         if let Scope::Paths(paths) = &spec.scope {
             match packet {
-                Metadata::Contribution { scope, .. }
-                    if paths_within_peer_scope(paths, scope) => {}
+                Metadata::Contribution { scope, .. } if paths_within_peer_scope(paths, scope) => {}
                 Metadata::RevisionContribution { scope, .. }
                     if paths_within_peer_scope(paths, scope) => {}
                 _ => return Err(ExchangeError::Forbidden),
@@ -505,7 +546,7 @@ fn validate_capture_envelope(
 fn validate_revision_project_binding(
     store: &mut CollaborationStore,
     packet: &Metadata,
-) -> Result<Vec<ObjectDigest>, ExchangeError> {
+) -> Result<Option<VerifiedRevisionRetention>, ExchangeError> {
     let Metadata::RevisionContribution {
         project_id,
         descriptor_record_id,
@@ -521,21 +562,21 @@ fn validate_revision_project_binding(
         ..
     } = packet
     else {
-        return Ok(Vec::new());
+        return Ok(None);
     };
 
-    let project_id = ProjectId::parse(project_id)
-        .map_err(|_| invalid("revision project identity"))?;
+    let project_id =
+        ProjectId::parse(project_id).map_err(|_| invalid("revision project identity"))?;
     let descriptor_record_id = RecordId::parse(descriptor_record_id)
         .map_err(|_| invalid("revision descriptor identity"))?;
     let descriptor_object = archive::parse_digest(descriptor_object_sha256)
         .ok_or_else(|| invalid("revision descriptor object"))?;
     let logical_id = ContributionId::parse(logical_contribution_id)
         .map_err(|_| invalid("revision logical contribution identity"))?;
-    let capture_record_id = RecordId::parse(capture_record_id)
-        .map_err(|_| invalid("revision capture lineage"))?;
-    let revision_record_id = RecordId::parse(revision_record_id)
-        .map_err(|_| invalid("revision record identity"))?;
+    let capture_record_id =
+        RecordId::parse(capture_record_id).map_err(|_| invalid("revision capture lineage"))?;
+    let revision_record_id =
+        RecordId::parse(revision_record_id).map_err(|_| invalid("revision record identity"))?;
     let revision_object = archive::parse_digest(revision_object_sha256)
         .ok_or_else(|| invalid("revision object digest"))?;
     let revision_bytes = decode_lower_hex(
@@ -618,10 +659,10 @@ fn validate_revision_project_binding(
     }
     let actual_paths: Vec<_> = actual_paths.into_iter().collect();
     super::revision_paths(&actual_paths)?;
-    if actual_paths.iter().collect::<BTreeSet<_>>()
-        != scope.iter().collect::<BTreeSet<_>>()
-    {
-        return Err(invalid("revision scope does not match verified source paths"));
+    if actual_paths.iter().collect::<BTreeSet<_>>() != scope.iter().collect::<BTreeSet<_>>() {
+        return Err(invalid(
+            "revision scope does not match verified source paths",
+        ));
     }
     let brief_digest = match (brief_object_sha256, resolved.brief_digest()) {
         (Some(encoded), Some(digest)) if archive::parse_digest(encoded) == Some(digest) => {
@@ -631,15 +672,89 @@ fn validate_revision_project_binding(
         _ => return Err(invalid("revision brief object binding")),
     };
 
-    let mut retained = vec![archive::put_object(store, &revision_bytes)?];
-    if let Some(bytes) = brief_bytes {
-        let digest = archive::put_object(store, &bytes)?;
+    let retained_revision = archive::put_object(store, &revision_bytes)?;
+    if retained_revision != revision_object {
+        return Err(invalid("revision object changed during retention"));
+    }
+    let resolver_proof_objects = resolved.identity_proof_object_digests().clone();
+    let mut retained = resolver_proof_objects.clone();
+    retained.insert(descriptor_object);
+    retained.insert(revision_object);
+    if let Some(bytes) = brief_bytes.as_deref() {
+        let digest = archive::put_object(store, bytes)?;
         if Some(digest) != brief_digest {
             return Err(invalid("revision brief digest changed during retention"));
         }
-        retained.push(digest);
+        retained.insert(digest);
     }
-    Ok(retained)
+    if retained.len() > MAX_REVISION_PROOF_OBJECTS {
+        return Err(ExchangeError::Limit);
+    }
+    let mut object_bytes = 0usize;
+    let mut source_snapshots = BTreeSet::new();
+    let mut proof_revision_ids = BTreeSet::new();
+    for digest in &retained {
+        let bytes = if *digest == revision_object {
+            revision_bytes.as_slice()
+        } else if Some(*digest) == brief_digest {
+            brief_bytes
+                .as_deref()
+                .ok_or_else(|| invalid("revision brief bytes are absent"))?
+        } else {
+            // The resolver already verified these immutable objects. Read
+            // them once more under the archive barrier to retain every
+            // ancestor revision's base/result snapshots with the event.
+            // A digest in this set must decode as either a revision or Brief.
+            let owned = archive::read_object_bounded(store, digest, MAX_REVISION_PACKET_BYTES)?;
+            if resolver_proof_objects.contains(digest) {
+                if let Ok((proof_revision, proof_id)) = ContributionRevision::from_record(&owned) {
+                    proof_revision_ids.insert(proof_id);
+                    source_snapshots.insert(proof_revision.base().clone());
+                    source_snapshots.insert(proof_revision.result().clone());
+                } else if Brief::from_record(&owned).is_err() {
+                    return Err(invalid(
+                        "revision proof object is not a canonical revision or brief",
+                    ));
+                }
+            }
+            object_bytes = object_bytes
+                .checked_add(owned.len())
+                .ok_or(ExchangeError::Limit)?;
+            if object_bytes > MAX_REVISION_PROOF_BYTES {
+                return Err(ExchangeError::Limit);
+            }
+            continue;
+        };
+        object_bytes = object_bytes
+            .checked_add(bytes.len())
+            .ok_or(ExchangeError::Limit)?;
+        if object_bytes > MAX_REVISION_PROOF_BYTES {
+            return Err(ExchangeError::Limit);
+        }
+        if *digest == revision_object || resolver_proof_objects.contains(digest) {
+            if let Ok((proof_revision, proof_id)) = ContributionRevision::from_record(bytes) {
+                proof_revision_ids.insert(proof_id);
+                source_snapshots.insert(proof_revision.base().clone());
+                source_snapshots.insert(proof_revision.result().clone());
+            } else if resolver_proof_objects.contains(digest) && Brief::from_record(bytes).is_err()
+            {
+                return Err(invalid(
+                    "revision proof object is not a canonical revision or brief",
+                ));
+            }
+        }
+    }
+    if proof_revision_ids != *resolved.identity_proof_revision_ids()
+        || source_snapshots.is_empty()
+        || source_snapshots.len() > MAX_REVISION_PROOF_SNAPSHOTS
+    {
+        return Err(invalid("revision proof closure is incomplete or too large"));
+    }
+    Ok(Some(VerifiedRevisionRetention {
+        object_digests: retained,
+        source_snapshots,
+        object_bytes,
+    }))
 }
 
 /// Attach one immutable metadata envelope to a real committed capture outbox
@@ -662,7 +777,7 @@ pub fn stage_capture_metadata(
     }
     let record = packet.record()?;
     let receipt_digest = validate_capture_envelope(store, &operation, &payload, packet)?;
-    let revision_objects = validate_revision_project_binding(store, packet)?;
+    let revision_proof = validate_revision_project_binding(store, packet)?;
     let digest = archive::put_object(store, &record.canonical_bytes())?;
     let tx = store
         .connection()
@@ -678,6 +793,10 @@ pub fn stage_capture_metadata(
         if body != record.canonical_bytes() {
             return Err(invalid("capture envelope is immutable"));
         }
+        if let Some(proof) = &revision_proof {
+            retain_revision_proof(&tx, proof)?;
+        }
+        tx.commit()?;
         return Ok(record.id());
     }
     let count: i64 = tx.query_row("SELECT count(*) FROM local_exchange_messages", [], |r| {
@@ -696,19 +815,8 @@ pub fn stage_capture_metadata(
         &receipt_digest,
         &format!("exchange-capture-receipt:{sequence}"),
     )?;
-    if let Some(revision) = revision_objects.first() {
-        pin(
-            &tx,
-            revision,
-            &format!("exchange-capture-revision:{sequence}"),
-        )?;
-        if let Some(brief) = revision_objects.get(1) {
-            pin(
-                &tx,
-                brief,
-                &format!("exchange-capture-brief:{sequence}"),
-            )?;
-        }
+    if let Some(proof) = &revision_proof {
+        retain_revision_proof(&tx, proof)?;
     }
     tx.commit()?;
     Ok(record.id())
@@ -945,8 +1053,10 @@ pub fn poll(
         }
         let stream = stream_id(&cursor.stream)?;
         let mut retained = Vec::new();
-        let mut revision_objects = Vec::new();
+        let mut revision_proofs = Vec::new();
         let mut total_event_bytes = 0usize;
+        let mut total_proof_objects = 0usize;
+        let mut total_proof_snapshots = 0usize;
         for event in &events {
             if event.stream != cursor.stream {
                 return Err(ExchangeError::Stale);
@@ -959,7 +1069,25 @@ pub fn poll(
             if total_event_bytes > MAX_SNAPSHOT_PAGE_BYTES {
                 return Err(ExchangeError::Limit);
             }
-            revision_objects.push(validate_revision_project_binding(store, &event.packet)?);
+            let proof = validate_revision_project_binding(store, &event.packet)?;
+            if let Some(proof) = &proof {
+                total_event_bytes = total_event_bytes
+                    .checked_add(proof.object_bytes)
+                    .ok_or(ExchangeError::Limit)?;
+                total_proof_objects = total_proof_objects
+                    .checked_add(proof.object_digests.len())
+                    .ok_or(ExchangeError::Limit)?;
+                total_proof_snapshots = total_proof_snapshots
+                    .checked_add(proof.source_snapshots.len())
+                    .ok_or(ExchangeError::Limit)?;
+                if total_event_bytes > MAX_SNAPSHOT_RECOVERY_BYTES
+                    || total_proof_objects > MAX_SNAPSHOT_RECOVERY_PROOF_OBJECTS
+                    || total_proof_snapshots > MAX_SNAPSHOT_RECOVERY_PROOF_SNAPSHOTS
+                {
+                    return Err(ExchangeError::Limit);
+                }
+            }
+            revision_proofs.push(proof);
             if event.sequence <= position {
                 let known:bool=store.read_connection().query_row("SELECT EXISTS(SELECT 1 FROM local_exchange_events WHERE binding=?1 AND stream=?2 AND sequence=?3)",params![peer.id.as_str(),stream.as_str(),event.sequence],|r|r.get(0))?;
                 if !known {
@@ -990,15 +1118,10 @@ pub fn poll(
         let tx = store
             .connection()
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        for ((event, digest), objects) in events.iter().zip(&retained).zip(&revision_objects) {
-            if save_event(&tx, &peer.id, &stream, event, digest)? {
-                pin_revision_event_objects(
-                    &tx,
-                    &peer.id,
-                    &stream,
-                    event.sequence,
-                    objects,
-                )?;
+        for ((event, digest), proof) in events.iter().zip(&retained).zip(&revision_proofs) {
+            save_event(&tx, &peer.id, &stream, event, digest)?;
+            if let Some(proof) = proof {
+                retain_revision_proof(&tx, proof)?;
             }
         }
         let mut next = position;
@@ -1062,10 +1185,12 @@ pub fn recover_snapshot(
         let mut descriptor = None;
         let mut offset = 0;
         let mut items = Vec::new();
-        let mut revision_objects = Vec::new();
+        let mut revision_proofs = Vec::new();
         let mut positions = BTreeSet::new();
         let mut packets = BTreeSet::new();
         let mut total_snapshot_bytes = 0usize;
+        let mut total_proof_objects = 0usize;
+        let mut total_proof_snapshots = 0usize;
         loop {
             proof.check()?;
             let page = peer
@@ -1083,7 +1208,23 @@ pub fn recover_snapshot(
                 total_snapshot_bytes =
                     add_snapshot_recovery_bytes(total_snapshot_bytes, event_bytes)?;
                 proof.visible(&peer.spec, &event.packet)?;
-                revision_objects.push(validate_revision_project_binding(store, &event.packet)?);
+                let proof = validate_revision_project_binding(store, &event.packet)?;
+                if let Some(proof) = &proof {
+                    total_snapshot_bytes =
+                        add_snapshot_recovery_bytes(total_snapshot_bytes, proof.object_bytes)?;
+                    total_proof_objects = total_proof_objects
+                        .checked_add(proof.object_digests.len())
+                        .ok_or(ExchangeError::Limit)?;
+                    total_proof_snapshots = total_proof_snapshots
+                        .checked_add(proof.source_snapshots.len())
+                        .ok_or(ExchangeError::Limit)?;
+                    if total_proof_objects > MAX_SNAPSHOT_RECOVERY_PROOF_OBJECTS
+                        || total_proof_snapshots > MAX_SNAPSHOT_RECOVERY_PROOF_SNAPSHOTS
+                    {
+                        return Err(ExchangeError::Limit);
+                    }
+                }
+                revision_proofs.push(proof);
                 if !positions.insert(event.sequence) || !packets.insert(event.packet.record()?.id())
                 {
                     return Err(invalid("duplicate complete snapshot item"));
@@ -1114,15 +1255,10 @@ pub fn recover_snapshot(
             .connection()
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         clear_projection(&tx, &peer.id)?;
-        for ((event, digest), objects) in items.iter().zip(&retained).zip(&revision_objects) {
-            if save_event(&tx, &peer.id, &stream, event, digest)? {
-                pin_revision_event_objects(
-                    &tx,
-                    &peer.id,
-                    &stream,
-                    event.sequence,
-                    objects,
-                )?;
+        for ((event, digest), proof) in items.iter().zip(&retained).zip(&revision_proofs) {
+            save_event(&tx, &peer.id, &stream, event, digest)?;
+            if let Some(proof) = proof {
+                retain_revision_proof(&tx, proof)?;
             }
             project(&tx, &peer.id, &event.packet)?;
             tx.execute("UPDATE local_exchange_events SET applied=1 WHERE binding=?1 AND stream=?2 AND sequence=?3",params![peer.id.as_str(),stream.as_str(),event.sequence])?;

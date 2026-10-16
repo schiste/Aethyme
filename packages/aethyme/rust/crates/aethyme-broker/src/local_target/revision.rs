@@ -9,7 +9,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use aethyme_contracts::experimental_v0::{
-    RecordId,
+    RecordId, SourceSnapshotId,
     brief::Brief,
     contribution_revision::{ContributionId, ContributionRevision},
     project_identity::{FileIdentityTransition, ProjectDescriptor, ProjectId},
@@ -18,15 +18,17 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     collaboration_archive::{self as archive, ObjectDigest},
-    collaboration_state::CollaborationStore,
     collaboration_identity_store::{
-        resolve_approved_project_binding, resolve_bound_contribution_revisions,
-        ContributionRevisionPin,
+        ContributionRevisionPin, resolve_approved_project_binding,
+        resolve_bound_contribution_revisions,
     },
+    collaboration_state::CollaborationStore,
 };
 
 use super::{TargetError, TargetSpec, record_id};
 
+/// The bound profile currently accepts same-baseline proposals or one exact
+/// ordered revision chain. Branch/merge convergence remains unsupported.
 pub const D10_TARGET_PROFILE: &str = "aethyme.target-revision/d10-experimental-v0";
 const MAX_D10_TARGET_BYTES: usize = 16 * 1024 * 1024;
 
@@ -58,6 +60,7 @@ pub(super) struct LoadedD10Bindings {
     pub bindings: D10RevisionBindings,
     pub revision_ids: BTreeMap<String, RecordId>,
     pub object_digests: BTreeSet<ObjectDigest>,
+    pub revisions: BTreeMap<String, ContributionRevision>,
     pub identity_transitions: BTreeMap<String, FileIdentityTransition>,
 }
 
@@ -72,7 +75,9 @@ impl D10RevisionBindings {
                 )
                 .is_some()
             {
-                return Err(TargetError::Invalid("duplicate D10 contribution mapping".into()));
+                return Err(TargetError::Invalid(
+                    "duplicate D10 contribution mapping".into(),
+                ));
             }
         }
         Ok(ids)
@@ -146,7 +151,13 @@ pub(super) fn validate_bindings(
             ));
         }
         let lineage = record_id(&contribution.lineage)?;
-        parsed_pins.push((target_id.clone(), logical_id, revision_id, revision_digest, lineage));
+        parsed_pins.push((
+            target_id.clone(),
+            logical_id,
+            revision_id,
+            revision_digest,
+            lineage,
+        ));
     }
     let resolver_pins: Vec<_> = parsed_pins
         .iter()
@@ -192,7 +203,8 @@ pub(super) fn validate_bindings(
         if total_bytes > MAX_D10_TARGET_BYTES {
             return Err(TargetError::Invalid("D10 target size".into()));
         }
-        let retained = archive::retained_contribution(store, &lineage)?.ok_or(TargetError::Missing)?;
+        let retained =
+            archive::retained_contribution(store, &lineage)?.ok_or(TargetError::Missing)?;
         if revision.base() != &retained.base.snapshot_id
             || revision.result() != &retained.result.snapshot_id
         {
@@ -246,16 +258,22 @@ pub(super) fn validate_bindings(
         bindings,
         revision_ids,
         object_digests,
+        revisions: parsed_revisions,
         identity_transitions,
     })
 }
 
-fn validate_selected_map(spec: &TargetSpec, revisions: &[D10RevisionPin]) -> Result<(), TargetError> {
+fn validate_selected_map(
+    spec: &TargetSpec,
+    revisions: &[D10RevisionPin],
+) -> Result<(), TargetError> {
     let selected: BTreeSet<_> = spec.selected.iter().map(String::as_str).collect();
     let mut supplied = BTreeSet::new();
     for revision in revisions {
         if !supplied.insert(revision.contribution.as_str()) {
-            return Err(TargetError::Invalid("duplicate D10 contribution mapping".into()));
+            return Err(TargetError::Invalid(
+                "duplicate D10 contribution mapping".into(),
+            ));
         }
     }
     if selected != supplied {
@@ -288,8 +306,186 @@ pub(super) fn validate_selected_identity_transitions(
         by_proposal.insert(proposal_id, transition.clone());
         proposals.push(transition.clone());
     }
-    aethyme_contracts::experimental_v0::validate_file_proposals(&proposals)
-        .map_err(|error| TargetError::FileNamespaceConflict(error.to_string()))
+    let mut by_base = BTreeMap::new();
+    for proposal in proposals {
+        by_base
+            .entry(proposal.base().clone())
+            .or_insert_with(Vec::new)
+            .push(proposal);
+    }
+    for proposals in by_base.values() {
+        aethyme_contracts::experimental_v0::validate_file_proposals(proposals)
+            .map_err(|error| TargetError::FileNamespaceConflict(error.to_string()))?;
+    }
+    Ok(())
+}
+
+pub(super) fn validate_selected_transition_order(
+    spec: &TargetSpec,
+    selected: &[String],
+    revisions: &BTreeMap<String, ContributionRevision>,
+    transitions: &BTreeMap<String, FileIdentityTransition>,
+) -> Result<(), TargetError> {
+    validate_dependency_dag(spec, selected)?;
+    let contributions: BTreeMap<_, _> = spec
+        .contributions
+        .iter()
+        .map(|contribution| (contribution.id.as_str(), contribution))
+        .collect();
+    let order: BTreeMap<_, _> = selected
+        .iter()
+        .enumerate()
+        .map(|(index, id)| (id.as_str(), index))
+        .collect();
+    let baseline = SourceSnapshotId::parse(&spec.baseline)
+        .map_err(|_| TargetError::Invalid("D10 target baseline".into()))?;
+    let has_dependencies = selected.iter().any(|target_id| {
+        contributions
+            .get(target_id.as_str())
+            .is_some_and(|contribution| !contribution.requires.is_empty())
+    });
+    if !has_dependencies {
+        for target_id in selected {
+            let revision = revisions
+                .get(target_id)
+                .ok_or_else(|| TargetError::Invalid("D10 selected revision is missing".into()))?;
+            let transition = transitions
+                .get(target_id)
+                .ok_or_else(|| TargetError::Invalid("D10 selected transition is missing".into()))?;
+            if transition.base() != revision.base() || transition.result() != revision.result() {
+                return Err(TargetError::Invalid(
+                    "D10 transition does not match its revision snapshots".into(),
+                ));
+            }
+            if revision.base() != &baseline {
+                return Err(TargetError::FileNamespaceConflict(
+                    "D10 independent source base is not the target baseline".into(),
+                ));
+            }
+        }
+        return validate_selected_identity_transitions(selected, transitions);
+    }
+
+    // Until the composer can prove merge convergence, the bound profile
+    // accepts one exact chain only: a baseline root followed by each selected
+    // child based on the immediately preceding selected revision. Parallel
+    // roots remain valid only in the all-baseline case above, where namespace
+    // conflicts are checked together at their shared base.
+    if selected.is_empty() || selected.len() == 1 {
+        return Err(TargetError::Invalid(
+            "D10 dependent selection is not a source-ordered chain".into(),
+        ));
+    }
+    for (index, target_id) in selected.iter().enumerate() {
+        let contribution = contributions
+            .get(target_id.as_str())
+            .ok_or_else(|| TargetError::Invalid("D10 selected contribution is missing".into()))?;
+        for dependency in &contribution.requires {
+            if order
+                .get(dependency.as_str())
+                .is_none_or(|dependency_index| *dependency_index >= index)
+            {
+                return Err(TargetError::Invalid(
+                    "D10 selected dependencies must precede their dependents".into(),
+                ));
+            }
+        }
+        let revision = revisions
+            .get(target_id)
+            .ok_or_else(|| TargetError::Invalid("D10 selected revision is missing".into()))?;
+        let transition = transitions
+            .get(target_id)
+            .ok_or_else(|| TargetError::Invalid("D10 selected transition is missing".into()))?;
+        if transition.base() != revision.base() || transition.result() != revision.result() {
+            return Err(TargetError::Invalid(
+                "D10 transition does not match its revision snapshots".into(),
+            ));
+        }
+        if index == 0 {
+            if !contribution.requires.is_empty() || revision.base() != &baseline {
+                return Err(TargetError::FileNamespaceConflict(
+                    "D10 ordered chain must start at the target baseline".into(),
+                ));
+            }
+            continue;
+        }
+        let expected_parent = &selected[index - 1];
+        if contribution.requires.len() != 1
+            || contribution.requires.first().map(String::as_str) != Some(expected_parent.as_str())
+        {
+            return Err(TargetError::Invalid(
+                "D10 dependent selection must have one exact preceding parent".into(),
+            ));
+        }
+        let parent_revision = revisions
+            .get(expected_parent)
+            .ok_or_else(|| TargetError::Invalid("D10 dependency revision is missing".into()))?;
+        if revision.base() != parent_revision.result() {
+            return Err(TargetError::FileNamespaceConflict(
+                "D10 child source base does not match its exact preceding parent result".into(),
+            ));
+        }
+    }
+    validate_selected_identity_transitions(selected, transitions)
+}
+
+fn validate_dependency_dag(spec: &TargetSpec, selected: &[String]) -> Result<(), TargetError> {
+    let selected_ids: BTreeSet<_> = selected.iter().map(String::as_str).collect();
+    if selected_ids.is_empty() || selected_ids.len() != selected.len() {
+        return Err(TargetError::Invalid(
+            "D10 selected dependency graph is empty or duplicated".into(),
+        ));
+    }
+    let catalog: BTreeMap<_, _> = spec
+        .contributions
+        .iter()
+        .map(|contribution| (contribution.id.as_str(), contribution))
+        .collect();
+    let mut indegree = BTreeMap::<&str, usize>::new();
+    for id in &selected_ids {
+        let contribution = catalog
+            .get(id)
+            .ok_or_else(|| TargetError::Invalid("D10 selected contribution is missing".into()))?;
+        for dependency in &contribution.requires {
+            if !selected_ids.contains(dependency.as_str()) {
+                return Err(TargetError::Invalid(
+                    "D10 dependency is not selected".into(),
+                ));
+            }
+        }
+        indegree.insert(id, contribution.requires.len());
+    }
+    let mut ready: Vec<_> = indegree
+        .iter()
+        .filter_map(|(id, degree)| (*degree == 0).then_some(*id))
+        .collect();
+    let mut visited = 0usize;
+    while let Some(completed) = ready.pop() {
+        visited += 1;
+        for (id, contribution) in &catalog {
+            if !selected_ids.contains(id)
+                || !contribution
+                    .requires
+                    .iter()
+                    .any(|dependency| dependency.as_str() == completed)
+            {
+                continue;
+            }
+            let degree = indegree
+                .get_mut(id)
+                .ok_or_else(|| TargetError::Invalid("D10 dependency graph".into()))?;
+            *degree -= 1;
+            if *degree == 0 {
+                ready.push(id);
+            }
+        }
+    }
+    if visited != selected_ids.len() {
+        return Err(TargetError::Invalid(
+            "D10 dependency graph contains a cycle".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_dependencies(
@@ -342,8 +538,7 @@ mod tests {
     };
 
     fn record_id(digit: char) -> RecordId {
-        RecordId::parse(&format!("sha256:{}", digit.to_string().repeat(64)))
-            .expect("record ID")
+        RecordId::parse(&format!("sha256:{}", digit.to_string().repeat(64))).expect("record ID")
     }
 
     fn source_id(digit: char) -> SourceSnapshotId {
@@ -361,8 +556,9 @@ mod tests {
                 std::fs::File::open(object.unwrap().path())
                     .unwrap()
                     .set_times(
-                        std::fs::FileTimes::new()
-                            .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1)),
+                        std::fs::FileTimes::new().set_modified(
+                            std::time::UNIX_EPOCH + std::time::Duration::from_secs(1),
+                        ),
                     )
                     .unwrap();
             }
@@ -378,10 +574,10 @@ mod tests {
     fn immutable_revision_and_brief_roots_survive_target_supersession_with_recipe_candidate() {
         let mut fixture = crate::local_target::tests::Fixture::new();
         let owner = acquire_controller(&mut fixture.store, "target", "appointed").unwrap();
-        let base = archive::snapshot_of_commit(fixture._repo.path(), &fixture.a.base.commit)
-            .unwrap();
-        let result = archive::snapshot_of_commit(fixture._repo.path(), &fixture.a.result.commit)
-            .unwrap();
+        let base =
+            archive::snapshot_of_commit(fixture._repo.path(), &fixture.a.base.commit).unwrap();
+        let result =
+            archive::snapshot_of_commit(fixture._repo.path(), &fixture.a.result.commit).unwrap();
         assert_eq!(base.id(), fixture.a.base.snapshot_id);
         assert_eq!(result.id(), fixture.a.result.snapshot_id);
 
@@ -422,14 +618,17 @@ mod tests {
             fixture.a.base.snapshot_id.clone(),
             fixture.a.result.snapshot_id.clone(),
             source_changes,
-            Some(
-                BriefReference::new(brief_id, brief_object.hex()).expect("brief reference"),
-            ),
+            Some(BriefReference::new(brief_id, brief_object.hex()).expect("brief reference")),
             Vec::new(),
         )
         .unwrap();
         let (revision_bytes, revision_id) = revision.to_record();
-        assert_eq!(ContributionRevision::from_record(&revision_bytes).unwrap().1, revision_id);
+        assert_eq!(
+            ContributionRevision::from_record(&revision_bytes)
+                .unwrap()
+                .1,
+            revision_id
+        );
         let revision_object = archive::put_object(&fixture.store, &revision_bytes).unwrap();
         let recipe_bytes = serde_json::to_vec(&serde_json::json!({
             "schema": "test.composition-recipe",
@@ -607,18 +806,22 @@ mod tests {
         let spec = spec();
         let bindings = bindings();
         let revision_a = record_id('5');
-        assert!(validate_dependencies(
-            &spec,
-            &bindings.revisions,
-            &parsed_revisions(revision_a.clone()),
-        )
-        .is_ok());
-        assert!(validate_dependencies(
-            &spec,
-            &bindings.revisions,
-            &parsed_revisions(record_id('7')),
-        )
-        .is_err());
+        assert!(
+            validate_dependencies(
+                &spec,
+                &bindings.revisions,
+                &parsed_revisions(revision_a.clone()),
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_dependencies(
+                &spec,
+                &bindings.revisions,
+                &parsed_revisions(record_id('7')),
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -664,20 +867,222 @@ mod tests {
         );
 
         let selected = vec!["A".into(), "B".into()];
-        let transitions = BTreeMap::from([
-            ("A".into(), first.clone()),
-            ("B".into(), second),
-        ]);
+        let transitions = BTreeMap::from([("A".into(), first.clone()), ("B".into(), second)]);
         assert!(matches!(
             validate_selected_identity_transitions(&selected, &transitions),
             Err(TargetError::FileNamespaceConflict(_))
         ));
 
-        let replayed = BTreeMap::from([
-            ("A".into(), first.clone()),
-            ("B".into(), first),
-        ]);
+        let replayed = BTreeMap::from([("A".into(), first.clone()), ("B".into(), first)]);
         assert!(validate_selected_identity_transitions(&selected, &replayed).is_ok());
+    }
+
+    #[test]
+    fn d10_order_requires_one_exact_chain_and_refuses_merges_and_cycles() {
+        let project_id = ProjectId::parse("proj:aaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
+        let base = SourceSnapshot::new(std::iter::empty::<SourceEntry>()).unwrap();
+        let first = SourceSnapshot::new([SourceEntry::from_content(
+            b"src/a.rs".to_vec(),
+            EntryKind::Regular,
+            b"a",
+        )])
+        .unwrap();
+        let second = SourceSnapshot::new([
+            SourceEntry::from_content(b"src/a.rs".to_vec(), EntryKind::Regular, b"a"),
+            SourceEntry::from_content(b"src/b.rs".to_vec(), EntryKind::Regular, b"b"),
+        ])
+        .unwrap();
+        let side = SourceSnapshot::new([
+            SourceEntry::from_content(b"src/a.rs".to_vec(), EntryKind::Regular, b"a"),
+            SourceEntry::from_content(b"src/side.rs".to_vec(), EntryKind::Regular, b"side"),
+        ])
+        .unwrap();
+        let descriptor = ProjectDescriptor::from_snapshot(
+            project_id.clone(),
+            "1111111111111111111111111111111111111111",
+            &base,
+        )
+        .unwrap();
+        let first_transition = advance_file_identities(
+            &project_id,
+            &descriptor.initial_file_identity_state().unwrap(),
+            "contrib:aaaaaaaaaaaaaaaaaaaaaaaaaa",
+            &base,
+            &first,
+            &[],
+        )
+        .unwrap();
+        let second_transition = advance_file_identities(
+            &project_id,
+            &first_transition.result_identity_state(),
+            "contrib:bbbbbbbbbbbbbbbbbbbbbbbbbe",
+            &first,
+            &second,
+            &[],
+        )
+        .unwrap();
+        let side_transition = advance_file_identities(
+            &project_id,
+            &first_transition.result_identity_state(),
+            "contrib:cccccccccccccccccccccccccf",
+            &first,
+            &side,
+            &[],
+        )
+        .unwrap();
+
+        let mut spec = TargetSpec {
+            objective_authorization: record_id('1').to_string(),
+            objective: "ordered source chain".into(),
+            baseline: base.id().to_string(),
+            contributions: vec![
+                RequestedContribution {
+                    id: "A".into(),
+                    lineage: record_id('a').to_string(),
+                    requires: Vec::new(),
+                    atomic_group: None,
+                    revision_of: None,
+                    derived_from: Vec::new(),
+                },
+                RequestedContribution {
+                    id: "B".into(),
+                    lineage: record_id('b').to_string(),
+                    requires: vec!["A".into()],
+                    atomic_group: None,
+                    revision_of: None,
+                    derived_from: Vec::new(),
+                },
+                RequestedContribution {
+                    id: "C".into(),
+                    lineage: record_id('c').to_string(),
+                    requires: vec!["B".into()],
+                    atomic_group: None,
+                    revision_of: None,
+                    derived_from: Vec::new(),
+                },
+            ],
+            selected: vec!["A".into(), "B".into(), "C".into()],
+            requirements: Vec::new(),
+            acceptance_policy: record_id('2').to_string(),
+            composer_profile: "text/provisional".into(),
+        };
+        let a_id = record_id('5');
+        let revisions = BTreeMap::from([
+            (
+                "A".into(),
+                ContributionRevision::new(
+                    project_id.clone(),
+                    contribution_id("contrib:aaaaaaaaaaaaaaaaaaaaaaaaaa"),
+                    record_id('a'),
+                    base.id(),
+                    first.id(),
+                    Vec::new(),
+                    None,
+                    Vec::new(),
+                )
+                .unwrap(),
+            ),
+            (
+                "B".into(),
+                ContributionRevision::new(
+                    project_id.clone(),
+                    contribution_id("contrib:bbbbbbbbbbbbbbbbbbbbbbbbbe"),
+                    record_id('b'),
+                    first.id(),
+                    second.id(),
+                    Vec::new(),
+                    None,
+                    vec![a_id.clone()],
+                )
+                .unwrap(),
+            ),
+            (
+                "C".into(),
+                ContributionRevision::new(
+                    project_id,
+                    contribution_id("contrib:cccccccccccccccccccccccccf"),
+                    record_id('c'),
+                    first.id(),
+                    side.id(),
+                    Vec::new(),
+                    None,
+                    vec![a_id.clone()],
+                )
+                .unwrap(),
+            ),
+        ]);
+        let transitions = BTreeMap::from([
+            ("A".into(), first_transition.clone()),
+            ("B".into(), second_transition),
+            ("C".into(), side_transition),
+        ]);
+
+        spec.selected = vec!["A".into(), "B".into()];
+        spec.contributions.pop();
+        let two_revisions = BTreeMap::from([
+            ("A".into(), revisions["A"].clone()),
+            ("B".into(), revisions["B"].clone()),
+        ]);
+        let two_transitions = BTreeMap::from([
+            ("A".into(), transitions["A"].clone()),
+            ("B".into(), transitions["B"].clone()),
+        ]);
+        assert!(
+            validate_selected_transition_order(
+                &spec,
+                &spec.selected,
+                &two_revisions,
+                &two_transitions,
+            )
+            .is_ok()
+        );
+
+        spec.contributions[1].requires.clear();
+        assert!(matches!(
+            validate_selected_transition_order(
+                &spec,
+                &spec.selected,
+                &two_revisions,
+                &two_transitions,
+            ),
+            Err(TargetError::FileNamespaceConflict(_))
+        ));
+
+        spec.contributions[1].requires = vec!["A".into()];
+        spec.contributions.push(RequestedContribution {
+            id: "C".into(),
+            lineage: record_id('c').to_string(),
+            requires: vec!["A".into()],
+            atomic_group: None,
+            revision_of: None,
+            derived_from: Vec::new(),
+        });
+        spec.selected.push("C".into());
+        assert!(matches!(
+            validate_selected_transition_order(&spec, &spec.selected, &revisions, &transitions),
+            Err(TargetError::Invalid(_))
+        ));
+
+        spec.contributions[2].requires = vec!["A".into(), "B".into()];
+        assert!(matches!(
+            validate_selected_transition_order(&spec, &spec.selected, &revisions, &transitions),
+            Err(TargetError::Invalid(_))
+        ));
+
+        spec.contributions[0].requires = vec!["B".into()];
+        spec.contributions[2].requires = vec!["B".into()];
+        assert!(matches!(
+            validate_selected_transition_order(&spec, &spec.selected, &revisions, &transitions),
+            Err(TargetError::Invalid(_))
+        ));
+
+        spec.contributions[0].requires.clear();
+        spec.contributions[2].requires = vec!["B".into()];
+        spec.selected.reverse();
+        assert!(matches!(
+            validate_selected_transition_order(&spec, &spec.selected, &revisions, &transitions),
+            Err(TargetError::Invalid(_))
+        ));
     }
 
     #[test]

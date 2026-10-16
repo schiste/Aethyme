@@ -23,7 +23,7 @@ use crate::collaboration_state::CollaborationStore;
 use crate::file_lock::{ExclusiveFileLock, open_lock_file};
 
 mod revision;
-pub use revision::{D10RevisionBindings, D10RevisionPin, D10_TARGET_PROFILE};
+pub use revision::{D10_TARGET_PROFILE, D10RevisionBindings, D10RevisionPin};
 
 pub const TARGET_REVISION_SCHEMA_NAME: &str = "aethyme.target-revision/provisional-v0";
 
@@ -664,7 +664,12 @@ pub(crate) fn validate_d10_file_namespace(
         return Ok(());
     };
     let loaded = revision::validate_bindings(store, &pinned.spec, bindings.clone())?;
-    revision::validate_selected_identity_transitions(selected, &loaded.identity_transitions)
+    revision::validate_selected_transition_order(
+        &pinned.spec,
+        selected,
+        &loaded.revisions,
+        &loaded.identity_transitions,
+    )
 }
 
 /// Read a revision while the caller already holds the response-use barrier.
@@ -957,7 +962,9 @@ pub fn dispositions(
     let _response = crate::collaboration_sensitive::response_use(store)?;
     let history = load_revision_history_under_response(store, id, &_response)?;
     if history.id != *id || history.target.is_empty() || history.issuer.is_empty() {
-        return Err(TargetError::Corrupt("target revision history identity".into()));
+        return Err(TargetError::Corrupt(
+            "target revision history identity".into(),
+        ));
     }
     let expected: BTreeSet<_> = history
         .spec
@@ -969,7 +976,9 @@ pub fn dispositions(
         "SELECT contribution, status, detail FROM local_target_dispositions WHERE revision = ?1 ORDER BY contribution",
     )?.query_map([id.as_str()], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<Result<_, _>>()?;
     if raw.len() != expected.len()
-        || raw.iter().any(|(contribution, _, _)| !expected.contains(contribution.as_str()))
+        || raw
+            .iter()
+            .any(|(contribution, _, _)| !expected.contains(contribution.as_str()))
     {
         return Err(TargetError::Corrupt("target revision dispositions".into()));
     }
@@ -1147,6 +1156,6 @@ pub fn release_revision(
 }
 
 #[cfg(test)]
-pub(crate) mod tests;
-#[cfg(test)]
 mod revision_tests;
+#[cfg(test)]
+pub(crate) mod tests;
