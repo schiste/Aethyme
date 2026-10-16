@@ -13,8 +13,8 @@ use rusqlite::{OptionalExtension, TransactionBehavior, params};
 
 use super::{
     BudgetError, ManagedResolutionCommand, ManagedResolutionOutcome, ManagedResolutionStatus,
-    Request, ReservationSpec, State, Units, WorkKind, charge, decode, guard, insert, objective,
-    project, reject_overrun, rows, sum,
+    Request, ReservationSpec, State, Units, WorkKind, charge, children, decode, guard, insert,
+    objective, project, reject_overrun, rows, sum,
 };
 use crate::collaboration_archive::{self as archive, ObjectDigest};
 use crate::collaboration_capture::OperationId;
@@ -67,6 +67,7 @@ type AdapterAcknowledge = fn(&ResolutionDispatchPermit) -> Result<(), BudgetErro
 #[cfg(test)]
 thread_local! {
     static TEST_ADAPTER: Cell<Option<AdapterAcknowledge>> = const { Cell::new(None) };
+    static TEST_AFTER_ADMISSION: Cell<Option<fn(&mut CollaborationStore)>> = const { Cell::new(None) };
 }
 
 /// This production build deliberately has no registered paid or external
@@ -93,6 +94,22 @@ impl Drop for TestAdapterRegistration {
 fn register_test_adapter(adapter: AdapterAcknowledge) -> TestAdapterRegistration {
     let previous = TEST_ADAPTER.with(|slot| slot.replace(Some(adapter)));
     TestAdapterRegistration(previous)
+}
+
+#[cfg(test)]
+struct TestAdmissionMutation(Option<fn(&mut CollaborationStore)>);
+
+#[cfg(test)]
+impl Drop for TestAdmissionMutation {
+    fn drop(&mut self) {
+        TEST_AFTER_ADMISSION.with(|slot| slot.set(self.0));
+    }
+}
+
+#[cfg(test)]
+fn register_after_admission(mutation: fn(&mut CollaborationStore)) -> TestAdmissionMutation {
+    let previous = TEST_AFTER_ADMISSION.with(|slot| slot.replace(Some(mutation)));
+    TestAdmissionMutation(previous)
 }
 
 /// Resolve an existing key before checking current ownership or policy. New
@@ -184,6 +201,10 @@ pub(super) fn begin(
         }
         Err(error) => return Err(error),
     };
+    #[cfg(test)]
+    if let Some(mutation) = TEST_AFTER_ADMISSION.with(Cell::get) {
+        mutation(store);
+    }
     dispatch_acknowledgement(
         store,
         owner,
@@ -977,11 +998,73 @@ fn dispatch_acknowledgement(
     if !row_matches || stored_roots != expected_roots {
         return Err(BudgetError::Stale);
     }
+    revalidate_current_budget(&transaction, owner, wave, &proof, &reservation_id)?;
     if wall_clock_ms()? >= permit.deadline_ms {
         return Err(BudgetError::Stale);
     }
     adapter(&permit)?;
     transaction.commit()?;
+    Ok(())
+}
+
+fn revalidate_current_budget(
+    transaction: &rusqlite::Transaction<'_>,
+    owner: &ControllerOwner,
+    wave: &Wave,
+    proof: &ReservationProofRow,
+    reservation: &RecordId,
+) -> Result<(), BudgetError> {
+    reject_overrun(transaction)?;
+    let (project_id, project_policy) = project(transaction, owner.issuer())?;
+    let (objective_id, objective_cap) = objective(
+        transaction,
+        owner.issuer(),
+        &wave.spec.objective_authorization,
+        &project_id,
+    )?;
+    if project_id.as_str() != proof.project_policy
+        || objective_id.as_str() != proof.objective_policy
+        || project_policy.price_profile != proof.price_profile
+    {
+        return Err(BudgetError::Stale);
+    }
+
+    let roots = rows(
+        transaction,
+        "SELECT reservation FROM local_budget_reservations WHERE parent IS NULL",
+        &[],
+    )?;
+    if roots.len() > project_policy.max_root_reservations {
+        return Err(BudgetError::Capacity("ledger bound"));
+    }
+    if !sum(roots.iter().map(charge))?.within(project_policy.cap) {
+        return Err(BudgetError::Capacity("project"));
+    }
+    if !sum(roots
+        .iter()
+        .filter(|root| root.spec.objective == wave.spec.objective_authorization)
+        .map(charge))?
+    .within(objective_cap)
+    {
+        return Err(BudgetError::Capacity("objective"));
+    }
+    if !sum(roots
+        .iter()
+        .filter(|root| !root.spec.request.kind.recovery())
+        .map(charge))?
+    .within(
+        project_policy
+            .cap
+            .subtract(project_policy.recovery_headroom)?,
+    ) {
+        return Err(BudgetError::Capacity("recovery headroom"));
+    }
+    if children(transaction, reservation)?
+        .iter()
+        .any(|child| child.state.held())
+    {
+        return Err(BudgetError::Pending);
+    }
     Ok(())
 }
 
@@ -1424,6 +1507,72 @@ mod tests {
         Ok(())
     }
 
+    fn mark_overrun_after_admission(store: &mut CollaborationStore) {
+        let updated = store
+            .connection()
+            .execute(
+                "UPDATE local_budget_reservations
+                 SET observed_overrun='injected between admission and acknowledgement'
+                 WHERE target='target' AND phase='completion_pending'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(updated, 1);
+    }
+
+    fn change_project_profile_after_admission(store: &mut CollaborationStore) {
+        let (project_key, project_body): (String, Vec<u8>) = store
+            .read_connection()
+            .query_row(
+                "SELECT policy,body FROM local_budget_project WHERE singleton=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let mut project: super::super::ProjectRecord =
+            super::super::decode(&project_key, &project_body).unwrap();
+        project.policy.price_profile = reference('9');
+        let project_record = super::super::record(&project).unwrap();
+        let project_id = project_record.id();
+        assert_eq!(
+            store
+                .connection()
+                .execute(
+                    "UPDATE local_budget_project SET policy=?1,body=?2 WHERE singleton=1",
+                    params![project_id.as_str(), project_record.canonical_bytes()],
+                )
+                .unwrap(),
+            1
+        );
+
+        let (objective_id, objective_key, objective_body): (String, String, Vec<u8>) = store
+            .read_connection()
+            .query_row(
+                "SELECT objective,policy,body FROM local_budget_objectives LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        let mut objective: super::super::ObjectiveRecord =
+            super::super::decode(&objective_key, &objective_body).unwrap();
+        objective.project_policy = project_id.as_str().to_owned();
+        let objective_record = super::super::record(&objective).unwrap();
+        assert_eq!(
+            store
+                .connection()
+                .execute(
+                    "UPDATE local_budget_objectives SET policy=?1,body=?2 WHERE objective=?3",
+                    params![
+                        objective_record.id().as_str(),
+                        objective_record.canonical_bytes(),
+                        objective_id
+                    ],
+                )
+                .unwrap(),
+            1
+        );
+    }
+
     fn reset_acknowledgements() {
         ACKNOWLEDGEMENTS.with(|count| count.set(0));
     }
@@ -1808,5 +1957,48 @@ mod tests {
             .connection()
             .execute_batch("DROP TRIGGER reject_managed_binding")
             .unwrap();
+    }
+
+    #[test]
+    fn acknowledgement_rechecks_overrun_after_admission_commit() {
+        let (mut fixture, owner, wave) = conflict_fixture();
+        let command = command(&fixture.store, &wave);
+        let before = write_snapshot(&fixture.store, owner.target());
+        reset_acknowledgements();
+        let _adapter = register_test_adapter(acknowledge);
+        let _mutation = register_after_admission(mark_overrun_after_admission);
+
+        let result = begin(&mut fixture.store, fixture._repo.path(), &owner, &command);
+
+        assert!(matches!(
+            result,
+            Err(BudgetError::Capacity("unreconciled overrun"))
+        ));
+        assert_eq!(acknowledgements(), 0);
+        let after = write_snapshot(&fixture.store, owner.target());
+        assert_eq!(after.0, before.0 + 1);
+        assert_eq!(after.1, before.1 + 1);
+        assert_eq!(after.2, before.2 + 1);
+        assert_eq!(after.4, before.4 + 1);
+    }
+
+    #[test]
+    fn acknowledgement_rechecks_exact_project_policy_after_admission_commit() {
+        let (mut fixture, owner, wave) = conflict_fixture();
+        let command = command(&fixture.store, &wave);
+        let before = write_snapshot(&fixture.store, owner.target());
+        reset_acknowledgements();
+        let _adapter = register_test_adapter(acknowledge);
+        let _mutation = register_after_admission(change_project_profile_after_admission);
+
+        let result = begin(&mut fixture.store, fixture._repo.path(), &owner, &command);
+
+        assert!(matches!(result, Err(BudgetError::Stale)));
+        assert_eq!(acknowledgements(), 0);
+        let after = write_snapshot(&fixture.store, owner.target());
+        assert_eq!(after.0, before.0 + 1);
+        assert_eq!(after.1, before.1 + 1);
+        assert_eq!(after.2, before.2 + 1);
+        assert_eq!(after.4, before.4 + 1);
     }
 }
