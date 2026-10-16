@@ -2010,10 +2010,12 @@ fn verify_ship_only_tree(
     broker.require_trusted_policy_at_commit(base_sha, Some(session_id))?;
     let main_root = broker.main_root().to_path_buf();
     let repo = GitRepo::discover(&main_root)?;
-    let mut slot = crate::verification::ExactTreeVerificationSlot::acquire_pooled_reporting(
+    let worktree_root_plan = broker.worktree_root_plan()?;
+    let mut slot = crate::verification::ExactTreeVerificationSlot::acquire_pooled_reporting_with_worktree_root_plan(
         &main_root,
         "ship-only",
         4,
+        &worktree_root_plan,
         Duration::from_secs(2),
         &mut |waited| {
             eprintln!("[ship --only] waiting for an exact-tree verification slot ({waited:?})")
