@@ -6,15 +6,18 @@
 use std::collections::BTreeSet;
 use std::path::Path;
 
-use aethyme_contracts::experimental_v0::{RecordId, SourceSnapshotId};
+use aethyme_contracts::experimental_v0::{Record, RecordId, SourceSnapshotId};
+use rusqlite::OptionalExtension;
 use serde_json::Value;
 
 use crate::collaboration_archive::{self as archive, CommitOid};
 use crate::collaboration_state::CollaborationStore;
+use crate::composer::{self, CompositionBudget, CompositionRequest};
+use crate::composition::CompositionMode;
 use crate::local_acceptance::{HistoricalCompletionIdentity, verify_historical_completion};
 use crate::local_controller::CompletionSpec;
-use crate::local_target::{ControllerOwner, TargetRevision};
-use crate::resolution::ResolutionRequest;
+use crate::local_target::{self, ControllerOwner, TargetRevision};
+use crate::resolution::{RequirementRef, ResolutionRequest};
 
 use super::{Wave, WaveError, WaveSpec, accepted_completion, id, snapshot};
 
@@ -90,6 +93,7 @@ fn load_for_identity(
     }
     let historical = historical_identity(&key, &completion, issuer);
     verify_historical_completion(store, &historical).map_err(|_| WaveError::Stale)?;
+    verify_historical_source(store, &key, &completion, &previous)?;
 
     let relation = classify_revision_relation(
         &completion.revision,
@@ -153,46 +157,566 @@ pub(super) fn latest_for_admission(
     if pinned.target != owner.target() || pinned.issuer != owner.issuer() {
         return Err(WaveError::Stale);
     }
-    let ids: Vec<String> = store
-        .read_connection()
-        .prepare(
+    let find = |revision: Option<&str>| -> Result<Option<RecordId>, WaveError> {
+        let connection = store.read_connection();
+        let sql = if revision.is_some() {
             "SELECT c.id FROM local_controller_completions c
              JOIN local_waves w ON w.wave=c.wave
-             WHERE c.target=?1 ORDER BY w.sequence DESC,c.id DESC",
-        )?
-        .query_map([owner.target()], |row| row.get(0))?
-        .collect::<Result<_, _>>()?;
-    let mut matching = Vec::new();
-    for raw in ids {
-        let key = id(&raw)?;
-        let (completion, previous) = accepted_completion(store, &key, i64::MAX)?;
-        if completion.target != owner.target() || previous.issuer != owner.issuer() {
-            continue;
-        }
-        let same_revision = completion.revision == pinned.id.as_str();
-        let cross_revision = !same_revision && completion.source == pinned.spec.baseline;
-        if !same_revision && !cross_revision {
-            continue;
-        }
-        matching.push((key, completion, previous, same_revision));
+             JOIN local_targets t ON t.target=c.target
+             WHERE c.target=?1 AND w.target=?1 AND w.phase='accepted'
+               AND w.revision=?3
+               AND t.issuer=?2
+             ORDER BY w.sequence DESC,c.id DESC LIMIT 1"
+        } else {
+            "SELECT c.id FROM local_controller_completions c
+             JOIN local_waves w ON w.wave=c.wave
+             JOIN local_targets t ON t.target=c.target
+             WHERE c.target=?1 AND w.target=?1 AND w.phase='accepted'
+               AND w.revision<>?4 AND w.candidate_snapshot=?3
+               AND t.issuer=?2
+             ORDER BY w.sequence DESC,c.id DESC LIMIT 1"
+        };
+        let raw: Option<String> = if let Some(revision) = revision {
+            connection
+                .query_row(
+                    sql,
+                    rusqlite::params![owner.target(), owner.issuer(), revision],
+                    |row| row.get(0),
+                )
+                .optional()?
+        } else {
+            connection
+                .query_row(
+                    sql,
+                    rusqlite::params![
+                        owner.target(),
+                        owner.issuer(),
+                        pinned.spec.baseline,
+                        pinned.id.as_str(),
+                    ],
+                    |row| row.get(0),
+                )
+                .optional()?
+        };
+        raw.map(|raw| id(&raw)).transpose()
+    };
+
+    // Same-revision cumulative history wins. Only if none exists do we
+    // consider a prior revision whose accepted source is this revision's
+    // explicit baseline. Each query selects one newest candidate; a damaged
+    // newest proof fails closed instead of falling back to an older row.
+    let key = match find(Some(pinned.id.as_str()))? {
+        Some(key) => Some(key),
+        None => find(None)?,
+    };
+    let Some(key) = key else {
+        return Ok(None);
+    };
+    let (completion, previous) = accepted_completion(store, &key, i64::MAX)?;
+    if completion.target != owner.target()
+        || previous.target != owner.target()
+        || previous.issuer != owner.issuer()
+        || (completion.revision != pinned.id.as_str() && completion.source != pinned.spec.baseline)
+    {
+        return Err(WaveError::Stale);
     }
-    for want_same_revision in [true, false] {
-        for (key, completion, previous, same_revision) in &matching {
-            if *same_revision != want_same_revision {
-                continue;
-            }
-            verify_historical_completion(
-                store,
-                &historical_identity(key, completion, owner.issuer()),
-            )
-            .map_err(|_| WaveError::Stale)?;
-            if previous.target != owner.target() || previous.issuer != owner.issuer() {
-                return Err(WaveError::Stale);
-            }
-            return Ok(Some(key.clone()));
-        }
+    verify_historical_completion(
+        store,
+        &historical_identity(&key, &completion, owner.issuer()),
+    )
+    .map_err(|_| WaveError::Stale)?;
+    verify_historical_source(store, &key, &completion, &previous)?;
+    Ok(Some(key))
+}
+
+const MAX_HISTORICAL_COMPLETION_DEPTH: usize = 32;
+
+/// Validate the immutable composition source for an accepted completion.
+/// This is provenance only: it never authorizes a current controller action.
+fn verify_historical_source(
+    store: &CollaborationStore,
+    key: &RecordId,
+    completion: &CompletionSpec,
+    wave_spec: &WaveSpec,
+) -> Result<(), WaveError> {
+    let _archive = crate::collaboration_gc::archive_use(store)
+        .map_err(|error| WaveError::Invalid(format!("archive retention: {error}")))?;
+    let response = crate::collaboration_sensitive::response_use(store)?;
+    let mut seen = BTreeSet::new();
+    verify_historical_source_inner(store, &response, key, completion, wave_spec, &mut seen, 0)
+}
+
+fn verify_historical_source_inner(
+    store: &CollaborationStore,
+    response: &crate::collaboration_sensitive::ResponseUse,
+    key: &RecordId,
+    completion: &CompletionSpec,
+    wave_spec: &WaveSpec,
+    seen: &mut BTreeSet<String>,
+    depth: usize,
+) -> Result<(), WaveError> {
+    if depth >= MAX_HISTORICAL_COMPLETION_DEPTH || !seen.insert(key.to_string()) {
+        return Err(WaveError::Invalid(
+            "historical completion source chain is cyclic or too deep".into(),
+        ));
     }
-    Ok(None)
+    let result = (|| {
+        let row: (
+            Vec<u8>,
+            String,
+            Option<String>,
+            i64,
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ) = store.read_connection().query_row(
+            "SELECT body,phase,detail,sequence,target,revision,candidate_snapshot,
+                    candidate_commit,recipe_object,composition_source_record_id,
+                    composition_source_object,resolution_request_record_id,
+                    resolution_request_object,resolution_result_record_id,
+                    resolution_result_object
+             FROM local_waves WHERE wave=?1",
+            [&completion.wave],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                    row.get(9)?,
+                    row.get(10)?,
+                    row.get(11)?,
+                    row.get(12)?,
+                    row.get(13)?,
+                    row.get(14)?,
+                ))
+            },
+        )?;
+        let record = Record::decode(&row.0, &[&super::SCHEMA])
+            .map_err(|error| WaveError::Invalid(format!("historical wave record: {error}")))?;
+        let body: Value = serde_json::from_slice(&row.0)?;
+        let stored_spec: WaveSpec = serde_json::from_value(body["spec"].clone())?;
+        if record.id().as_str() != completion.wave
+            || record.canonical_bytes() != row.0
+            || row.1 != "accepted"
+            || row.2.as_deref() != Some(key.as_str())
+            || row.3 != wave_spec.sequence
+            || row.4 != completion.target
+            || row.5 != completion.revision
+            || stored_spec != *wave_spec
+            || row.6.as_deref() != Some(completion.source.as_str())
+            || row.7.as_deref() != Some(completion.candidate_commit.as_str())
+        {
+            return Err(WaveError::Invalid(
+                "historical accepted wave source projection".into(),
+            ));
+        }
+        let source_ref = super::record_ref(row.9.as_deref(), row.10.as_deref())?
+            .ok_or_else(|| WaveError::Invalid("accepted wave has no composition source".into()))?;
+        let request_ref = super::record_ref(row.11.as_deref(), row.12.as_deref())?;
+        let result_ref = super::record_ref(row.13.as_deref(), row.14.as_deref())?;
+        match (request_ref.as_ref(), result_ref.as_ref()) {
+            (None, None) => {}
+            (Some(request), Some(result)) => {
+                let synthesis = crate::resolution::read_retained_synthesized_result_for_refs(
+                    store, request, result,
+                )?;
+                if synthesis.request.baseline().snapshot_id.as_str() != wave_spec.baseline {
+                    return Err(WaveError::Invalid(
+                        "historical synthesized baseline differs from its wave".into(),
+                    ));
+                }
+                // The archive proof is available, but prior-completion reuse
+                // remains failclosed until the seed tree is checked against
+                // its Git commit at the repository materialization boundary.
+                return Err(WaveError::ResolutionUnsupported);
+            }
+            _ => {
+                return Err(WaveError::Invalid(
+                    "historical wave has an incomplete synthesized request/result pair".into(),
+                ));
+            }
+        }
+
+        let recipe_object = row
+            .8
+            .as_deref()
+            .map(super::object)
+            .transpose()?
+            .ok_or_else(|| {
+                WaveError::Invalid("accepted wave has no composition recipe object".into())
+            })?;
+        let source_bytes = archive::read_object_bounded(
+            store,
+            &source_ref.object,
+            super::COMPOSITION_SOURCE_MAX_BYTES,
+        )?;
+        let source_record = Record::decode(&source_bytes, &[&super::COMPOSITION_SOURCE_SCHEMA])
+            .map_err(|error| WaveError::Invalid(format!("composition source record: {error}")))?;
+        if source_record.id() != source_ref.id || source_record.canonical_bytes() != source_bytes {
+            return Err(WaveError::Invalid(
+                "historical composition source digest".into(),
+            ));
+        }
+        let payload: super::CompositionSourcePayload = serde_json::from_slice(&source_bytes)?;
+        let source = super::source_from_payload(&payload, &source_ref)?;
+        let candidate = source
+            .composition
+            .outcome
+            .candidate()
+            .ok_or_else(|| WaveError::Invalid("historical source has no candidate".into()))?;
+        let recipe = source
+            .composition
+            .recipe
+            .as_ref()
+            .ok_or_else(|| WaveError::Invalid("historical source has no recipe".into()))?;
+        if payload.wave != completion.wave
+            || payload.revision != completion.revision
+            || payload.profile != composer::PROVISIONAL_TEXT_PROFILE
+            || source.record != source_ref
+            || recipe.object != recipe_object
+            || candidate.subject.as_str() != completion.source
+            || candidate.commit.as_str() != completion.candidate_commit
+            || candidate.tree != completion.candidate_tree
+            || candidate.baseline_source != composer::COMPOSER_BASELINE_SOURCE
+            || candidate.baseline != source.request.baseline
+            || candidate.mode != CompositionMode::Text
+        {
+            return Err(WaveError::Invalid(
+                "historical composition source candidate binding".into(),
+            ));
+        }
+
+        let revision_id = super::id(&completion.revision)?;
+        let revision =
+            local_target::load_revision_history_under_response(store, &revision_id, response)?;
+        if revision.target != completion.target
+            || revision.issuer != wave_spec.issuer
+            || wave_spec.target != completion.target
+            || wave_spec.revision != completion.revision
+            || wave_spec.selected.is_empty()
+            || wave_spec.selected.iter().collect::<BTreeSet<_>>().len() != wave_spec.selected.len()
+            || wave_spec
+                .selected
+                .iter()
+                .any(|member| !revision.spec.selected.contains(member))
+        {
+            return Err(WaveError::Invalid(
+                "historical source revision binding".into(),
+            ));
+        }
+        let (released, revision_body): (bool, Vec<u8>) = store.read_connection().query_row(
+            "SELECT released,body FROM local_target_revisions WHERE revision=?1",
+            [revision_id.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let revision_json: Value = serde_json::from_slice(&revision_body)?;
+        if released && revision_json.get("revision_bindings").is_some() {
+            return Err(WaveError::ResolutionUnsupported);
+        }
+        let revision_ids = if released {
+            None
+        } else {
+            local_target::load_revision_under_response(store, &revision_id, response)?
+                .revision_bindings
+                .map(|bindings| bindings.revision_ids())
+                .transpose()?
+        };
+
+        let revision_baseline = revision.spec.baseline.as_str();
+        let baseline_snapshot = super::snapshot(&wave_spec.baseline)?;
+        let baseline = archive::retained(store, &baseline_snapshot)?
+            .ok_or(crate::local_target::TargetError::Missing)?;
+        let (expected_commit, expected_accepted, expected_profile, expected_prior) =
+            if let Some(prior_text) = wave_spec.prior_completion.as_deref() {
+                let prior_key = super::id(prior_text)?;
+                if prior_key == *key {
+                    return Err(WaveError::Invalid("historical completion cycle".into()));
+                }
+                let (prior_completion, prior_wave) =
+                    super::accepted_completion(store, &prior_key, wave_spec.sequence)?;
+                if prior_completion.target != completion.target
+                    || prior_wave.issuer != wave_spec.issuer
+                {
+                    return Err(WaveError::Stale);
+                }
+                verify_historical_completion(
+                    store,
+                    &historical_identity(&prior_key, &prior_completion, &prior_wave.issuer),
+                )
+                .map_err(|_| WaveError::Stale)?;
+                verify_historical_source_inner(
+                    store,
+                    response,
+                    &prior_key,
+                    &prior_completion,
+                    &prior_wave,
+                    seen,
+                    depth + 1,
+                )?;
+                let relation = classify_revision_relation(
+                    &prior_completion.revision,
+                    &wave_spec.revision,
+                    &prior_completion.source,
+                    &wave_spec.baseline,
+                    revision_baseline,
+                    &prior_wave.selected,
+                    &wave_spec.selected,
+                )?;
+                let accepted = if relation == RevisionRelation::Same {
+                    let original_baseline_snapshot = snapshot(revision_baseline)?;
+                    require_completion_root(
+                        store,
+                        key,
+                        "snapshot",
+                        original_baseline_snapshot.as_str(),
+                    )?;
+                    let original_baseline = archive::retained(store, &original_baseline_snapshot)?
+                        .ok_or(crate::local_target::TargetError::Missing)?;
+                    vec![original_baseline.commit]
+                } else {
+                    Vec::new()
+                };
+                let members = if relation == RevisionRelation::Same {
+                    prior_wave.selected.clone()
+                } else {
+                    Vec::new()
+                };
+                (
+                    CommitOid::parse(&prior_completion.accepted_commit)?,
+                    accepted,
+                    super::ACCEPTED_BASELINE_TEXT_PROFILE,
+                    Some(serde_json::json!({
+                        "completion": prior_key.as_str(),
+                        "members": members,
+                    })),
+                )
+            } else {
+                if wave_spec.baseline != revision_baseline {
+                    return Err(WaveError::Invalid(
+                        "historical initial wave differs from its revision baseline".into(),
+                    ));
+                }
+                (
+                    baseline.commit.clone(),
+                    Vec::new(),
+                    composer::PROVISIONAL_TEXT_PROFILE,
+                    None,
+                )
+            };
+
+        let expected_catalog = revision.spec.catalog()?;
+        let expected_request = CompositionRequest {
+            baseline: expected_commit.clone(),
+            accepted: expected_accepted.clone(),
+            catalog: expected_catalog,
+            deliveries: wave_spec.selected.clone(),
+            budget: CompositionBudget {
+                max_contributions: wave_spec.policy.max_group,
+                ..CompositionBudget::default()
+            },
+        };
+        if source.request.baseline != expected_request.baseline
+            || source.request.accepted != expected_request.accepted
+            || source.request.catalog != expected_request.catalog
+            || source.request.deliveries != expected_request.deliveries
+            || source.request.budget != expected_request.budget
+            || source.requirements
+                != revision
+                    .spec
+                    .requirements
+                    .iter()
+                    .map(|id| RequirementRef {
+                        id: id.clone(),
+                        path: None,
+                    })
+                    .collect::<Vec<_>>()
+            || payload.requirements != super::requirement_payloads(&source.requirements)
+            || candidate.producer.profile() != expected_profile
+            || recipe_json_acceptance_baseline(&recipe.object, store)? != expected_prior
+        {
+            return Err(WaveError::Invalid(
+                "historical source request, requirements, or prior binding".into(),
+            ));
+        }
+
+        let recipe_bytes = archive::read_object_bounded(
+            store,
+            &recipe.object,
+            super::COMPOSITION_SOURCE_MAX_BYTES,
+        )?;
+        let recipe_record = Record::decode(&recipe_bytes, &[&composer::COMPOSITION_RECIPE_SCHEMA])
+            .map_err(|error| WaveError::Invalid(format!("composition recipe: {error}")))?;
+        if recipe_record.id() != recipe.id || recipe_record.canonical_bytes() != recipe_bytes {
+            return Err(WaveError::Invalid(
+                "historical composition recipe digest".into(),
+            ));
+        }
+        let recipe_json: Value = serde_json::from_slice(&recipe_bytes)?;
+        if recipe_json["candidate"].as_str() != Some(candidate.subject.as_str())
+            || recipe_json["candidate_commit"].as_str() != Some(candidate.commit.as_str())
+            || recipe_json["baseline"].as_str() != Some(wave_spec.baseline.as_str())
+            || recipe_json["baseline_commit"].as_str() != Some(expected_commit.as_str())
+            || recipe_json["profile"].as_str() != Some(expected_profile)
+            || recipe_json.get("seeded_conflict").is_some()
+        {
+            return Err(WaveError::Invalid(
+                "historical composition recipe binding".into(),
+            ));
+        }
+        let usage = source.composition.usage;
+        let budget = source.request.budget;
+        if usage.contributions > budget.max_contributions
+            || usage.paths > budget.max_paths
+            || usage.bytes > budget.max_bytes
+            || usage.merges > budget.max_merges
+            || recipe_json["deliveries"].as_u64() != Some(source.request.deliveries.len() as u64)
+            || recipe_json["budget"]
+                != serde_json::json!({
+                    "limits": {
+                        "contributions": budget.max_contributions,
+                        "paths": budget.max_paths,
+                        "bytes": budget.max_bytes.to_string(),
+                        "merges": budget.max_merges,
+                    },
+                    "used": {
+                        "contributions": usage.contributions,
+                        "paths": usage.paths,
+                        "bytes": usage.bytes.to_string(),
+                        "merges": usage.merges,
+                    },
+                })
+        {
+            return Err(WaveError::Invalid(
+                "historical composition budget binding".into(),
+            ));
+        }
+
+        let order = recipe_json["order"]
+            .as_array()
+            .ok_or_else(|| WaveError::Invalid("historical recipe order".into()))?;
+        let selected: BTreeSet<&str> = wave_spec.selected.iter().map(String::as_str).collect();
+        let ordered: BTreeSet<&str> = source
+            .composition
+            .order
+            .iter()
+            .map(String::as_str)
+            .collect();
+        if source.composition.order.len() != selected.len()
+            || ordered.len() != source.composition.order.len()
+            || ordered != selected
+            || order.len() != source.composition.order.len()
+            || candidate.inputs.len() != order.len()
+        {
+            return Err(WaveError::Invalid(
+                "historical recipe does not cover the full selected order".into(),
+            ));
+        }
+        for ((entry, contribution_id), input) in order
+            .iter()
+            .zip(&source.composition.order)
+            .zip(&candidate.inputs)
+        {
+            let contribution = source
+                .request
+                .catalog
+                .iter()
+                .find(|item| item.id == *contribution_id)
+                .ok_or_else(|| WaveError::Invalid("historical recipe contribution".into()))?;
+            let lineage = contribution
+                .lineage
+                .as_ref()
+                .ok_or_else(|| WaveError::Invalid("historical recipe lineage".into()))?;
+            let retained = archive::retained_contribution(store, lineage)?
+                .ok_or(crate::local_target::TargetError::Missing)?;
+            let mut expected_entry = serde_json::json!({
+                "id": contribution_id,
+                "lineage": lineage.as_str(),
+                "base": retained.base.snapshot_id.as_str(),
+                "result": retained.result.snapshot_id.as_str(),
+            });
+            if let Some(revision_id) = revision_ids
+                .as_ref()
+                .and_then(|ids| ids.get(contribution_id))
+            {
+                expected_entry["revision"] = Value::String(revision_id.as_str().to_owned());
+            }
+            if entry != &expected_entry
+                || input.base != retained.base.commit
+                || input.result != retained.result.commit
+                || input.base_snapshot.as_ref() != Some(&retained.base.snapshot_id)
+                || input.result_snapshot.as_ref() != Some(&retained.result.snapshot_id)
+            {
+                return Err(WaveError::Invalid(
+                    "historical recipe input differs from its retained lineage".into(),
+                ));
+            }
+            require_completion_root(store, key, "contribution", lineage.as_str())?;
+            require_completion_root(store, key, "snapshot", retained.base.snapshot_id.as_str())?;
+            require_completion_root(store, key, "snapshot", retained.result.snapshot_id.as_str())?;
+        }
+        require_completion_root(store, key, "object", source_ref.object.hex().as_str())?;
+        require_completion_root(store, key, "object", recipe.object.hex().as_str())?;
+        require_completion_root(store, key, "snapshot", candidate.subject.as_str())?;
+        require_completion_root(store, key, "snapshot", baseline_snapshot.as_str())?;
+        archive::retained(store, &baseline_snapshot)?
+            .ok_or(crate::local_target::TargetError::Missing)?;
+        archive::retained(store, &candidate.subject)?
+            .ok_or(crate::local_target::TargetError::Missing)?;
+        Ok(())
+    })();
+    seen.remove(key.as_str());
+    result
+}
+
+fn recipe_json_acceptance_baseline(
+    recipe_object: &archive::ObjectDigest,
+    store: &CollaborationStore,
+) -> Result<Option<Value>, WaveError> {
+    let bytes =
+        archive::read_object_bounded(store, recipe_object, super::COMPOSITION_SOURCE_MAX_BYTES)?;
+    let record = Record::decode(&bytes, &[&composer::COMPOSITION_RECIPE_SCHEMA])
+        .map_err(|error| WaveError::Invalid(format!("composition recipe: {error}")))?;
+    if record.canonical_bytes() != bytes {
+        return Err(WaveError::Invalid(
+            "historical composition recipe digest".into(),
+        ));
+    }
+    let value: Value = serde_json::from_slice(&bytes)?;
+    Ok(value.get("accepted_baseline").cloned())
+}
+
+fn require_completion_root(
+    store: &CollaborationStore,
+    key: &RecordId,
+    kind: &str,
+    reference: &str,
+) -> Result<(), WaveError> {
+    let rooted: bool = store.read_connection().query_row(
+        "SELECT EXISTS(SELECT 1 FROM local_controller_completion_roots
+         WHERE completion=?1 AND kind=?2 AND reference=?3)",
+        rusqlite::params![key.as_str(), kind, reference],
+        |row| row.get(0),
+    )?;
+    if !rooted {
+        return Err(WaveError::Invalid(format!(
+            "historical completion does not retain {kind} {reference}"
+        )));
+    }
+    Ok(())
 }
 
 fn classify_revision_relation(

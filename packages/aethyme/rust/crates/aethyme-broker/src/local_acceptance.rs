@@ -342,6 +342,7 @@ pub(crate) fn verify_historical_completion(
     store: &CollaborationStore,
     completion: &HistoricalCompletionIdentity,
 ) -> Result<(), AcceptanceError> {
+    let _archive = crate::collaboration_gc::archive_use(store).map_err(AcceptanceError::Io)?;
     let _response = crate::collaboration_sensitive::response_use(store)?;
     let completion_id = id(&completion.completion)?;
     let qualification_id = id(&completion.qualification)?;
