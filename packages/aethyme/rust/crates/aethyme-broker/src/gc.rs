@@ -4293,7 +4293,7 @@ mod tests {
                 );
                 assert!(entries_reclaimed > 0);
                 assert!(!cache.exists(), "the closed session cache is reclaimed");
-                assert!(active_cache.join("keep.txt").is_file());
+                assert!(active_cache.join("debug/keep.txt").is_file());
                 assert!(closed_worktree.is_dir(), "the retained checkout survives");
                 assert!(GitRepo::discover(&closed_worktree).is_ok());
                 let branch =
