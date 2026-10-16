@@ -3273,7 +3273,7 @@ impl Broker {
             .and_then(|value| value.parse::<i64>().ok())
             .unwrap_or(0);
         let mut last_visited = cursor;
-        let mut all = self.store().cleaned_sessions()?;
+        let all = self.store().cleaned_sessions()?;
         let sessions = match closed_session_id {
             Some(session_id) => all
                 .iter()
@@ -5497,7 +5497,7 @@ mod tests {
         std::fs::create_dir_all(root.join(".aethyme")).unwrap();
         std::fs::write(
             root.join(".aethyme/broker.toml"),
-            "[retention]\nclosed_worktrees_days = 30\nclosed_worktree_grace_hours = 0\nartifact_reclaim_days = 0\nartifact_sweep_budget_ms = 0\nartifact_sweep_interval_hours = 0\n",
+            "[retention]\nclosed_worktrees_days = 30\nclosed_worktree_grace_hours = 0\nartifact_reclaim_days = 0\nartifact_sweep_budget_ms = 0\nartifact_sweep_interval_hours = 1\n",
         )
         .unwrap();
         let mut broker = Broker::open(root).unwrap();
@@ -5505,7 +5505,7 @@ mod tests {
         let mut make_closed = |label: &str| {
             let session = broker.start_worktree(label, None).unwrap();
             let worktree = PathBuf::from(&session.worktree_path);
-            std::fs::write(worktree.join("landed.txt"), "landed\n").unwrap();
+            std::fs::write(worktree.join("landed.txt"), format!("{label}\n")).unwrap();
             git(&worktree, &["add", "landed.txt"]);
             git(&worktree, &["commit", "-qm", label]);
             assert!(broker.submit(session.id).unwrap().promoted);
@@ -5534,7 +5534,7 @@ mod tests {
         std::fs::create_dir_all(&blocker).unwrap();
         std::fs::write(
             root.join(".aethyme/broker.toml"),
-            "[retention]\nclosed_worktrees_days = 30\nclosed_worktree_grace_hours = 0\nartifact_reclaim_days = 0\nartifact_sweep_budget_ms = 5000\nartifact_sweep_interval_hours = 0\n",
+            "[retention]\nclosed_worktrees_days = 30\nclosed_worktree_grace_hours = 0\nartifact_reclaim_days = 0\nartifact_sweep_budget_ms = 5000\nartifact_sweep_interval_hours = 1\n",
         )
         .unwrap();
         broker
@@ -5615,7 +5615,7 @@ mod tests {
         std::fs::create_dir_all(root.join(".aethyme")).unwrap();
         std::fs::write(
             root.join(".aethyme/broker.toml"),
-            "[retention]\nclosed_worktrees_days = 30\nclosed_worktree_grace_hours = 0\nartifact_reclaim_days = 0\nartifact_sweep_budget_ms = 5000\nartifact_sweep_interval_hours = 0\n",
+            "[retention]\nclosed_worktrees_days = 30\nclosed_worktree_grace_hours = 0\nartifact_reclaim_days = 0\nartifact_sweep_budget_ms = 0\nartifact_sweep_interval_hours = 1\n",
         )
         .unwrap();
         let mut broker = Broker::open(root).unwrap();
@@ -5623,7 +5623,7 @@ mod tests {
         let mut make_closed = |label: &str| {
             let session = broker.start_worktree(label, None).unwrap();
             let worktree = PathBuf::from(&session.worktree_path);
-            std::fs::write(worktree.join("landed.txt"), "landed\n").unwrap();
+            std::fs::write(worktree.join("landed.txt"), format!("{label}\n")).unwrap();
             git(&worktree, &["add", "landed.txt"]);
             git(&worktree, &["commit", "-qm", label]);
             assert!(broker.submit(session.id).unwrap().promoted);
@@ -5648,16 +5648,25 @@ mod tests {
         for index in 0..32 {
             std::fs::create_dir(large_worktree.join(format!("unclassified-{index:02}"))).unwrap();
         }
-        let (later_id, _later_worktree, later_cache) = make_closed("later session");
+        let (later_id, later_worktree, later_cache) = make_closed("later session");
         assert!(large_id < later_id);
         assert!(large_cache.is_dir());
         assert!(later_cache.is_dir());
+        let later_session = broker.store().session(later_id).unwrap();
+        assert!(broker.is_broker_owned_worktree(&later_session, &later_worktree));
+        let later_checkout = GitRepo::discover(&later_worktree).unwrap();
+        assert!(later_checkout.path_is_ignored_checked("target").unwrap());
 
+        std::fs::write(
+            root.join(".aethyme/broker.toml"),
+            "[retention]\nclosed_worktrees_days = 30\nclosed_worktree_grace_hours = 0\nartifact_reclaim_days = 0\nartifact_sweep_budget_ms = 5000\nartifact_sweep_interval_hours = 1\n",
+        )
+        .unwrap();
         let policy = load_retention_policy(root).unwrap();
         let (outcome, _) = broker
             .sweep_artifacts_autonomously_with_test_discovery_budget(
                 &policy,
-                ArtifactSweepScope::Inline,
+                ArtifactSweepScope::AutomaticContinuation,
                 16,
             )
             .unwrap();
@@ -5666,19 +5675,17 @@ mod tests {
             !outcome.complete,
             "the bounded first worktree remains an explicit incomplete pass"
         );
-        assert!(
-            !later_cache.exists(),
-            "later closed sessions still get scanned after an earlier worktree exceeds the entry budget"
-        );
+        let cursor = broker.store().meta_get(ARTIFACT_SWEEP_CURSOR_KEY).unwrap();
         let expected_cursor = later_id.to_string();
         assert_eq!(
-            broker
-                .store()
-                .meta_get(ARTIFACT_SWEEP_CURSOR_KEY)
-                .unwrap()
-                .as_deref(),
+            cursor.as_deref(),
             Some(expected_cursor.as_str()),
-            "the saved cursor advances past the later session without claiming a full lap"
+            "the incomplete first worktree must not prevent visiting the later session"
+        );
+        assert!(
+            !later_cache.exists(),
+            "later closed sessions still get scanned after an earlier worktree exceeds the entry budget; reclaimed={}, cursor={cursor:?}",
+            outcome.directories_reclaimed
         );
     }
 
