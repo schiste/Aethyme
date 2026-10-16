@@ -1,0 +1,41 @@
+   Compiling aethyme-broker v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/682-reconcile-final-local-qualification/packages/aethyme/rust/crates/aethyme-broker)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 33.93s
+     Running unittests src/lib.rs (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/integrate-reviewed-local-bare-git-servic/target/local-resume/cargo/debug/deps/aethyme_broker-0f278e0d02146111)
+
+running 1 test
+
+thread 'native_gates::tests::no_gate_configuration_is_explicitly_not_verification' (5003055) panicked at crates/aethyme-broker/src/native_gates.rs:1093:5:
+isolated child did not run exactly one passing test (native_gates::tests::no_gate_configuration_is_explicitly_not_verification); status=ExitStatus(unix_wait_status(25856))
+stdout:
+
+running 1 test
+test native_gates::tests::no_gate_configuration_is_explicitly_not_verification ... FAILED
+
+failures:
+
+---- native_gates::tests::no_gate_configuration_is_explicitly_not_verification stdout ----
+
+thread 'native_gates::tests::no_gate_configuration_is_explicitly_not_verification' (5003059) panicked at crates/aethyme-broker/src/native_gates.rs:1050:13:
+isolated native-gate child must not inherit any GIT_* variable
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    native_gates::tests::no_gate_configuration_is_explicitly_not_verification
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1830 filtered out; finished in 0.00s
+
+
+stderr:
+
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test native_gates::tests::no_gate_configuration_is_explicitly_not_verification ... FAILED
+
+failures:
+
+failures:
+    native_gates::tests::no_gate_configuration_is_explicitly_not_verification
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1830 filtered out; finished in 0.01s
+
+error: test failed, to rerun pass `-p aethyme-broker --lib`

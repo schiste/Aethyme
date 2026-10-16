@@ -1,0 +1,11 @@
+{
+  "backup": "/private/tmp/native-child-mutation-gqypfbne/native_gates.rs",
+  "before_sha256": "5d2ee6e0eb12db263fd0b00f3c0af8c20de8a98cfb35f526d9f0a532aa559d39",
+  "started_at_utc": "2026-10-15T16:46:12.868014+00:00",
+  "mutant_sha256": "74766aa417c094120e9404e8af057a0ac0b27af773ded11cc8b09dc501856078",
+  "recorder_exit": 101,
+  "expected_named_failure": true,
+  "restored_sha256": "5d2ee6e0eb12db263fd0b00f3c0af8c20de8a98cfb35f526d9f0a532aa559d39",
+  "exact_restore": true,
+  "finished_at_utc": "2026-10-15T16:46:48.123871+00:00"
+}

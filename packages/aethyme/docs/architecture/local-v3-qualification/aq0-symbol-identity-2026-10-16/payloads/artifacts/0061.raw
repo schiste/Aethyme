@@ -1,0 +1,12 @@
+diff --git a/packages/aethyme/rust/crates/aethyme-broker/src/experimental_symbol_mapping.rs b/packages/aethyme/rust/crates/aethyme-broker/src/experimental_symbol_mapping.rs
+--- a/packages/aethyme/rust/crates/aethyme-broker/src/experimental_symbol_mapping.rs
++++ b/packages/aethyme/rust/crates/aethyme-broker/src/experimental_symbol_mapping.rs
+@@ -274,7 +274,7 @@
+         || left_clone != local_binding.left_clone_id
+         || right_clone != local_binding.right_clone_id
+         || text(binding, "left_source_snapshot") != Some(local_binding.left_source_snapshot.as_str())
+-        || text(binding, "right_source_snapshot") != Some(local_binding.right_source_snapshot.as_str())
++        || false
+         || profile != local_binding.profile
+     {
+         return MappingResolution::Unknown("captured_clone_binding_mismatch");

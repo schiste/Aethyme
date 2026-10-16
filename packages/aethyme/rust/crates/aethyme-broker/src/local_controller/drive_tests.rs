@@ -985,6 +985,11 @@ fn completion_control_checks_cancel_and_expiry_at_commit_boundary() {
 
 #[test]
 fn completed_native_job_is_history_and_cannot_approve_controller_dispatch() {
+    if crate::native_gates::run_in_clean_git_child(
+        "local_controller::drive::tests::completed_native_job_is_history_and_cannot_approve_controller_dispatch",
+    ) {
+        return;
+    }
     let mut f = Fixture::new();
     let owner = target::acquire_controller(&mut f.store, "completed-gate", "operator").unwrap();
     let selected = f.spec();

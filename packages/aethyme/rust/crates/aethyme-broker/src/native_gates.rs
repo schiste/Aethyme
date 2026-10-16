@@ -1021,5 +1021,93 @@ fn run_inner(
 }
 
 #[cfg(all(test, unix))]
+pub(crate) fn run_in_clean_git_child(test_name: &str) -> bool {
+    const CHILD_TEST_ENV: &str = "AETHYME_NATIVE_GATES_CLEAN_CHILD_TEST";
+    const CHILD_ROOT_ENV: &str = "AETHYME_NATIVE_GATES_CLEAN_CHILD_ROOT";
+
+    match (
+        std::env::var_os(CHILD_TEST_ENV),
+        std::env::var_os(CHILD_ROOT_ENV),
+    ) {
+        (Some(child_test), Some(child_root)) => {
+            assert_eq!(
+                child_test,
+                std::ffi::OsString::from(test_name),
+                "native-gate child marker must bind this exact test"
+            );
+            let child_root = std::path::PathBuf::from(child_root);
+            let child_xdg = child_root.join("xdg-config");
+            assert!(child_root.is_dir() && child_xdg.is_dir());
+            for key in ["HOME", "TMPDIR", "TMP", "TEMP"] {
+                assert_eq!(
+                    std::env::var_os(key).as_deref(),
+                    Some(child_root.as_os_str()),
+                    "isolated native-gate child must use its private {key}"
+                );
+            }
+            assert_eq!(
+                std::env::var_os("XDG_CONFIG_HOME").as_deref(),
+                Some(child_xdg.as_os_str()),
+                "isolated native-gate child must use its private XDG config"
+            );
+            assert!(
+                !std::env::vars_os().any(|(key, _)| key.to_string_lossy().starts_with("GIT_")),
+                "isolated native-gate child must not inherit any GIT_* variable"
+            );
+            return false;
+        }
+        (None, None) => {}
+        _ => panic!("native-gate child markers must be set together by the wrapper"),
+    }
+
+    let temporary = tempfile::tempdir().expect("create private native-gate test environment");
+    let xdg_config = temporary.path().join("xdg-config");
+    std::fs::create_dir(&xdg_config).expect("create private XDG config directory");
+
+    let mut command = std::process::Command::new(
+        std::env::current_exe().expect("locate current Rust test binary"),
+    );
+    for (key, _) in std::env::vars_os() {
+        if key.to_string_lossy().starts_with("GIT_") {
+            command.env_remove(key);
+        }
+    }
+    let output = command
+        .args([
+            "--exact",
+            test_name,
+            "--test-threads=1",
+            "--format=pretty",
+            "--color=never",
+        ])
+        .env(CHILD_TEST_ENV, test_name)
+        .env(CHILD_ROOT_ENV, temporary.path())
+        .env("HOME", temporary.path())
+        .env("XDG_CONFIG_HOME", &xdg_config)
+        .env("TMPDIR", temporary.path())
+        .env("TMP", temporary.path())
+        .env("TEMP", temporary.path())
+        .output()
+        .expect("run exact native-gate test in a clean Git environment");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let expected_test_line = format!("test {test_name} ... ok");
+    assert!(
+        output.status.success()
+            && stdout
+                .lines()
+                .any(|line| line == expected_test_line.as_str())
+            && stdout
+                .lines()
+                .any(|line| line.starts_with("test result: ok. 1 passed; 0 failed;")),
+        "isolated child did not run exactly one passing test ({test_name}); \
+         status={:?}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+        output.status
+    );
+    true
+}
+
+#[cfg(all(test, unix))]
 #[path = "native_gates/tests.rs"]
 mod tests;

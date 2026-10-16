@@ -48,6 +48,7 @@ pub mod composition;
 mod disk_headroom;
 mod duplicate_work;
 pub mod exit_status;
+pub mod experimental_symbol_mapping;
 pub mod local_capture_notice;
 pub mod native_gates;
 pub mod resolution;

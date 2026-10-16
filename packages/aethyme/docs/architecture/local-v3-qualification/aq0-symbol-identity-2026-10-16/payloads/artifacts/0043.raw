@@ -1,0 +1,102 @@
+Diff in /Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/implement-experimental-d39-t66-scoped-sy/packages/aethyme/rust/crates/aethyme-broker/src/lib.rs:46:
+ pub mod composer;
+ pub mod composition;
+ mod disk_headroom;
+-pub mod experimental_symbol_mapping;
+ mod duplicate_work;
+ pub mod exit_status;
++pub mod experimental_symbol_mapping;
+ pub mod local_capture_notice;
+ pub mod native_gates;
+ pub mod resolution;
+Diff in /Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/implement-experimental-d39-t66-scoped-sy/packages/aethyme/rust/crates/aethyme-contracts/src/experimental_v0/symbol_identity.rs:20:
+     "aethyme.symbol-origin-evidence/experimental-v0";
+ pub const EXPLICIT_SYMBOL_MAPPING_EVIDENCE_SCHEMA_NAME: &str =
+     "aethyme.explicit-symbol-mapping-evidence/experimental-v0";
+-pub const SYMBOL_MAPPING_CLAIM_SCHEMA_NAME: &str =
+-    "aethyme.symbol-mapping-claim/experimental-v0";
++pub const SYMBOL_MAPPING_CLAIM_SCHEMA_NAME: &str = "aethyme.symbol-mapping-claim/experimental-v0";
+ pub const SYMBOL_MAPPING_AUTHORITY: &str = "advisory_symbol_mapping";
+ 
+ /// Symbol records are deliberately much smaller than the general record
+Diff in /Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/implement-experimental-d39-t66-scoped-sy/packages/aethyme/rust/crates/aethyme-contracts/src/experimental_v0/symbol_identity.rs:351:
+     RecordId::parse(required_text(record, field)?).map_err(Into::into)
+ }
+ 
+-fn source_id(record: &Record, field: &'static str) -> Result<SourceSnapshotId, SymbolIdentityError> {
+-    SourceSnapshotId::parse(required_text(record, field)?).map_err(|_| {
+-        SymbolIdentityError::InvalidField(field)
+-    })
++fn source_id(
++    record: &Record,
++    field: &'static str,
++) -> Result<SourceSnapshotId, SymbolIdentityError> {
++    SourceSnapshotId::parse(required_text(record, field)?)
++        .map_err(|_| SymbolIdentityError::InvalidField(field))
+ }
+ 
+-fn required_text<'a>(record: &'a Record, field: &'static str) -> Result<&'a str, SymbolIdentityError> {
++fn required_text<'a>(
++    record: &'a Record,
++    field: &'static str,
++) -> Result<&'a str, SymbolIdentityError> {
+     let Some(Value::String(value)) = record.get(field) else {
+         return Err(SymbolIdentityError::InvalidField(field));
+     };
+Diff in /Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/implement-experimental-d39-t66-scoped-sy/packages/aethyme/rust/crates/aethyme-contracts/tests/symbol_identity_vectors.rs:50:
+ }
+ 
+ fn vectors() -> Vectors {
+-    serde_json::from_str(include_str!("../fixtures/experimental-v0/symbol_identity.json"))
+-        .expect("symbol identity vectors parse")
++    serde_json::from_str(include_str!(
++        "../fixtures/experimental-v0/symbol_identity.json"
++    ))
++    .expect("symbol identity vectors parse")
+ }
+ 
+ #[test]
+Diff in /Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/implement-experimental-d39-t66-scoped-sy/packages/aethyme/rust/crates/aethyme-contracts/tests/symbol_identity_vectors.rs:118:
+         .find(|case| case.name == "explicit unknown claim")
+         .expect("explicit unknown vector");
+     let input = hex(&explicit_unknown.input.hex);
+-    assert!(std::str::from_utf8(&input)
+-        .expect("UTF-8 vector")
+-        .contains("\"state\":\"unknown\""));
++    assert!(
++        std::str::from_utf8(&input)
++            .expect("UTF-8 vector")
++            .contains("\"state\":\"unknown\"")
++    );
+     let decoded = decode_symbol_identity_record(&input).expect("unknown state is accepted");
+-    assert_eq!(decoded.canonical_bytes(), hex(&explicit_unknown.canonical_hex));
++    assert_eq!(
++        decoded.canonical_bytes(),
++        hex(&explicit_unknown.canonical_hex)
++    );
+     assert_eq!(decoded.id().as_str(), explicit_unknown.id);
+     assert_eq!(decoded.state("state"), StateReading::Unknown);
+ }
+Diff in /Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/implement-experimental-d39-t66-scoped-sy/packages/aethyme/rust/crates/aethyme-contracts/tests/symbol_identity_vectors.rs:159:
+ 
+ #[test]
+ fn symbol_record_schema_is_selected_from_the_encoded_schema() {
+-    let input = hex(
+-        &vectors()
+-            .valid
+-            .into_iter()
+-            .find(|case| case.name == "engine symbol in clone A")
+-            .expect("engine symbol vector")
+-            .input
+-            .hex,
+-    );
++    let input = hex(&vectors()
++        .valid
++        .into_iter()
++        .find(|case| case.name == "engine symbol in clone A")
++        .expect("engine symbol vector")
++        .input
++        .hex);
+     let record = decode_symbol_identity_record(&input).expect("symbol ref");
+     assert_eq!(record.schema(), "aethyme.symbol-ref/experimental-v0");
+     let _: Record = record;

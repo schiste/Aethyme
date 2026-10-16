@@ -1,0 +1,12 @@
+{
+  "argv": [
+    "gh",
+    "api",
+    "--allow-escape-sequences",
+    "repos/schiste/Aethyme/actions/jobs/116691583401/logs"
+  ],
+  "exit": 0,
+  "stderr": "",
+  "bytes": 82767,
+  "sha256": "d5fbf9c81a1fdf0ee6216dc4a68880f194a38815fdf76a84a741970c086ede3e"
+}

@@ -1,0 +1,52 @@
+{
+  "schema": "aethyme.local-ci-compile-failure/v1",
+  "pr": 784,
+  "branch_head": "3f14f83d4a4502c9f150611196baf630484c00f3",
+  "run_id": 38795607520,
+  "checkout_commit": "ef470cc8a982e767d38109e09ce25c67c6881561",
+  "checkout_tree": "fa237a4a0c513237b5af3ed1c13c041d0c20aa83",
+  "checkout_parents": [
+    "cc31a0de198dbd5231bbeebc9b78aa7a05cd6cf8",
+    "3f14f83d4a4502c9f150611196baf630484c00f3"
+  ],
+  "numeric_exit": 101,
+  "passing": false,
+  "executed_test_credit": 0,
+  "errors": [
+    {
+      "code": "E0277",
+      "path": "crates/aethyme-broker/src/local_acceptance.rs",
+      "line": 353,
+      "cause": "WaveError cannot convert to AcceptanceError"
+    },
+    {
+      "code": "E0277",
+      "path": "crates/aethyme-broker/src/local_source_transport.rs",
+      "line": 362,
+      "cause": "std::io::Error cannot convert to TransportError"
+    }
+  ],
+  "logs": [
+    {
+      "path": "local-pr784-3f14-examples-116631061910.raw.log",
+      "bytes": 73293,
+      "sha256": "a6afc9dc6342cd154650d94a01eb655de91c6a3d9b2d7cadd7cb93a69a850851"
+    },
+    {
+      "path": "local-pr784-3f14-lint-116631062401.raw.log",
+      "bytes": 85548,
+      "sha256": "da72285f5239cbdd226ed0a384a030eac7f95ce8e439c4cf1db3353b47fce973"
+    },
+    {
+      "path": "local-pr784-3f14-product-116631062235.raw.log",
+      "bytes": 73901,
+      "sha256": "626f5797f226a66fd1c9c63bd9aea44eb128bef45b995ab3e9366a9af15bdc18"
+    },
+    {
+      "path": "local-pr784-3f14-workspace-116631062734.raw.log",
+      "bytes": 77835,
+      "sha256": "80b409128b46783494d26129b1234d8cd118f1bcfa3c519fecc382812ca02a6f"
+    }
+  ],
+  "retrieval_note": "Initial ghapi calls rejected ANSI output (exit1, four0B *.log files retained). Exact raw retry used --allow-escape-sequences and all4 downloads exited0."
+}

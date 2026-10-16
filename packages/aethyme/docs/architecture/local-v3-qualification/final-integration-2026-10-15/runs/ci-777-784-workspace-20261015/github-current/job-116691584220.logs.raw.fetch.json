@@ -1,0 +1,18 @@
+{
+  "schema": "aethyme.local-gh-read-fetch/v1",
+  "request": "job-116691584220.logs.raw",
+  "argv": [
+    "gh",
+    "api",
+    "--allow-escape-sequences",
+    "repos/schiste/Aethyme/actions/jobs/116691584220/logs"
+  ],
+  "exit": 0,
+  "started_at_utc": "2026-10-15T22:17:03.453523+00:00",
+  "finished_at_utc": "2026-10-15T22:17:05.140154+00:00",
+  "bytes": 1355302,
+  "sha256": "c52d7ac9c7f7e8cc523c5e48c748b5665099e7fa9d0c9469a2cbce4a051c2d2d",
+  "stderr_bytes": 0,
+  "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "signature": "text-or-other"
+}

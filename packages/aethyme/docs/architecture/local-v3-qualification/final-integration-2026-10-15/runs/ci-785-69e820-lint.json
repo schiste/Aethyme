@@ -1,0 +1,20 @@
+{
+  "schema": "aethyme.local-ci-command-result/v1",
+  "id": "ci-785-69e820-lint",
+  "pr": 785,
+  "branch_head": "69e8202a64dea2d2aa45d64ce89b223fc76b48a1",
+  "ci_checkout_commit": "598c32c7a6aa40963c4caa80ac8c6da940c415a9",
+  "ci_checkout_tree": "15909c7cedd2814486d35fd773a085885bef844c",
+  "ci_checkout_parents": [
+    "8daffab2bb80ae0cce8286c530d70fad42c033f5",
+    "69e8202a64dea2d2aa45d64ce89b223fc76b48a1"
+  ],
+  "job_url": "https://github.com/schiste/Aethyme/actions/runs/38799703441/job/116645605479",
+  "conclusion": "FAILURE",
+  "numeric_exit": 101,
+  "test_commands_completed": 0,
+  "failure": "Strict Clippy rejected three unused test helper functions and a non-octal Unix permissions literal. No test cases executed.",
+  "credited_as_passing_command": false,
+  "log_sha256": "c7274153b8c5d190b9a4ca1d3a27d500de7cb66c643dab4f185da154bda55b44",
+  "scope": "Actual GitHub merge-ref checkout and full original log, distinct from a completed passing run or later fixed source."
+}

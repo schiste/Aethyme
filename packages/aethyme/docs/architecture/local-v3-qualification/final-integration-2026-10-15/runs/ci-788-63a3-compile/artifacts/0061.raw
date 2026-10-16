@@ -1,0 +1,144 @@
+{
+  "collected_at_unix": 1792111695,
+  "commands": [
+    {
+      "name": "job-116747670390-logs-allow-escape",
+      "argv": [
+        "gh",
+        "api",
+        "--allow-escape-sequences",
+        "repos/schiste/Aethyme/actions/jobs/116747670390/logs"
+      ],
+      "exit_code": 0,
+      "stdout": {
+        "path": "job-116747670390-logs-allow-escape.stdout.raw",
+        "bytes": 81839,
+        "sha256": "8b38b9fda8e49c75a0ed3f0101e099290e4cc3eb37c37ba1bf18e790df8015c6"
+      },
+      "stderr": {
+        "path": "job-116747670390-logs-allow-escape.stderr.txt",
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    },
+    {
+      "name": "job-116747670020-logs-allow-escape",
+      "argv": [
+        "gh",
+        "api",
+        "--allow-escape-sequences",
+        "repos/schiste/Aethyme/actions/jobs/116747670020/logs"
+      ],
+      "exit_code": 0,
+      "stdout": {
+        "path": "job-116747670020-logs-allow-escape.stdout.raw",
+        "bytes": 85852,
+        "sha256": "c2d11296d25469355615c9aa7ca3a69fd7f49bf906e3d12fdf66212272b4f65a"
+      },
+      "stderr": {
+        "path": "job-116747670020-logs-allow-escape.stderr.txt",
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    },
+    {
+      "name": "job-116747670224-logs-allow-escape",
+      "argv": [
+        "gh",
+        "api",
+        "--allow-escape-sequences",
+        "repos/schiste/Aethyme/actions/jobs/116747670224/logs"
+      ],
+      "exit_code": 0,
+      "stdout": {
+        "path": "job-116747670224-logs-allow-escape.stdout.raw",
+        "bytes": 80550,
+        "sha256": "fff3c23df355f5421165881b9053fd2589cadf0fe4a587a59dc94353d60dbef4"
+      },
+      "stderr": {
+        "path": "job-116747670224-logs-allow-escape.stderr.txt",
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    },
+    {
+      "name": "job-116747670421-logs-allow-escape",
+      "argv": [
+        "gh",
+        "api",
+        "--allow-escape-sequences",
+        "repos/schiste/Aethyme/actions/jobs/116747670421/logs"
+      ],
+      "exit_code": 0,
+      "stdout": {
+        "path": "job-116747670421-logs-allow-escape.stdout.raw",
+        "bytes": 90894,
+        "sha256": "0441d0bb742dfc304f6845e4df2237c5d2e46caef8c64252c61092faebafe36d"
+      },
+      "stderr": {
+        "path": "job-116747670421-logs-allow-escape.stderr.txt",
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    },
+    {
+      "name": "job-116747671168-logs-allow-escape",
+      "argv": [
+        "gh",
+        "api",
+        "--allow-escape-sequences",
+        "repos/schiste/Aethyme/actions/jobs/116747671168/logs"
+      ],
+      "exit_code": 1,
+      "stdout": {
+        "path": "job-116747671168-logs-allow-escape.stdout.raw",
+        "bytes": 215,
+        "sha256": "50fe7b1d98313b3b084459228b44f232947ee36f291380d78f349f377a303f7c"
+      },
+      "stderr": {
+        "path": "job-116747671168-logs-allow-escape.stderr.txt",
+        "bytes": 13,
+        "sha256": "6c5ec582d3b25e97273d17fd4088d0e13837c8384ee94aba555afc35856ec3ae"
+      }
+    },
+    {
+      "name": "job-116748079784-logs-allow-escape",
+      "argv": [
+        "gh",
+        "api",
+        "--allow-escape-sequences",
+        "repos/schiste/Aethyme/actions/jobs/116748079784/logs"
+      ],
+      "exit_code": 1,
+      "stdout": {
+        "path": "job-116748079784-logs-allow-escape.stdout.raw",
+        "bytes": 215,
+        "sha256": "5b6c82736205772882cc28f04275939fe709ed2a2a0bd909f0ee636d594eb182"
+      },
+      "stderr": {
+        "path": "job-116748079784-logs-allow-escape.stderr.txt",
+        "bytes": 13,
+        "sha256": "6c5ec582d3b25e97273d17fd4088d0e13837c8384ee94aba555afc35856ec3ae"
+      }
+    },
+    {
+      "name": "checkout-commit-33e9c9e5b798faffdea32865bd2f32a97140177f",
+      "argv": [
+        "gh",
+        "api",
+        "repos/schiste/Aethyme/git/commits/33e9c9e5b798faffdea32865bd2f32a97140177f"
+      ],
+      "exit_code": 0,
+      "stdout": {
+        "path": "checkout-commit-33e9c9e5b798faffdea32865bd2f32a97140177f.stdout.json",
+        "bytes": 2616,
+        "sha256": "b591aa6b2bf021635ae281869d02ec2a51ff29cf4e6d5e9e5d323889bb446350"
+      },
+      "stderr": {
+        "path": "checkout-commit-33e9c9e5b798faffdea32865bd2f32a97140177f.stderr.txt",
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    }
+  ]
+}

@@ -1,0 +1,43 @@
+AQ0 focused positive attempt 01 (preserved; no results hidden)
+
+Source at execution: 1fa8317914e591f99715ec4cff2154c5830b8c99
+Source file SHA-256: experimental_symbol_mapping.rs 72cf7ea55fefa5779da822e11d3caf523766d2bada2a936bb762c41df6e29726
+Test file SHA-256: symbol_identity_binding.rs ae19b14cbeb7b8512f34cd3cf83465ba77df1843d2d5630557990d0fd26dd47a
+Shared CARGO_TARGET_DIR: /Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/integrate-reviewed-local-bare-git-servic/target/local-resume/cargo
+TMPDIR: /private/tmp
+
+Attempt 1 command (filtered environment, default sandbox):
+env -i PATH="$PATH" HOME="$HOME" TMPDIR=/private/tmp CARGO_TARGET_DIR='/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/integrate-reviewed-local-bare-git-servic/target/local-resume/cargo' cargo test --locked -j4 --manifest-path packages/aethyme/rust/Cargo.toml -p aethyme-contracts --test analysis_vectors
+Result: exit 101 before compilation/test execution; zero tests ran. Cargo could not open the shared target `.cargo-build-lock` due sandbox `Operation not permitted`. The exact same command was retried with narrow escalated permission, as authorized.
+
+Attempt 2 command (identical, narrow escalated permission):
+env -i PATH="$PATH" HOME="$HOME" TMPDIR=/private/tmp CARGO_TARGET_DIR='/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/integrate-reviewed-local-bare-git-servic/target/local-resume/cargo' cargo test --locked -j4 --manifest-path packages/aethyme/rust/Cargo.toml -p aethyme-contracts --test analysis_vectors
+Result: exit 101; 6 tests executed, 5 passed, 1 failed. Full relevant output:
+  Compiling syn v3.0.6
+  Compiling cpufeatures v0.2.17
+  Compiling sha2 v0.10.9
+  Compiling thiserror-impl v2.0.21
+  Compiling serde_derive v1.0.229
+  Compiling thiserror v2.0.21
+  Compiling aethyme-contracts v0.8.26
+  Compiling serde v1.0.229
+  Finished `test` profile [unoptimized + debuginfo] target(s) in 3.54s
+  Running tests/analysis_vectors.rs
+  running 6 tests
+  test only_identical_profiles_compare ... ok
+  test cursors_pin_one_view_and_one_query ... ok
+  test schema_matches_the_reference ... ok
+  test every_degradation_reads_as_the_reference_says ... FAILED
+  test invalid_envelopes_are_refused_with_the_expected_code ... ok
+  test round_trip_keeps_identity_and_never_upgrades_a_reading ... ok
+
+  failures:
+  ---- every_degradation_reads_as_the_reference_says stdout ----
+  crates/aethyme-contracts/tests/analysis_vectors.rs:73:
+  assertion `left == right` failed: partial coverage: empty is not evidence
+    left: ["missing_edge_kind:calls"]
+    right: []
+  test result: FAILED. 5 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out
+  error: test failed, to rerun pass `-p aethyme-contracts --test analysis_vectors`
+
+Diagnosis: c81927ca introduced a default-empty expected `gaps` vector assertion. Parent 3af test had no gaps assertion. The unchanged independent canonical_hex for the failing case contains `gaps:["missing_edge_kind:calls"]`. No product or golden vector files were changed. Further tests are paused pending independent review of a test-only interpretation correction.

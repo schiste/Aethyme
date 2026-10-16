@@ -1,0 +1,40 @@
+#!/usr/bin/env python3
+import datetime, json, pathlib, subprocess, sys
+root=pathlib.Path(__file__).resolve().parent
+seed=json.loads((root/'local-draft-pr-ci-snapshot-20261015T144244Z.raw.json').read_text())
+now=datetime.datetime.now(datetime.timezone.utc)
+query=seed['graphql_query']
+# Extend the frozen seed without losing the full status/error/pagination fields.
+import re
+fragment=re.search(r'p783: pullRequest\(number: 783\) (\{.*\}) \} \}$', query).group(1)
+query=query[:-4] + ' '.join(f'p{n}: pullRequest(number: {n}) '+fragment for n in [784,785,786]) + ' } }'
+result=subprocess.run(['/opt/homebrew/bin/gh','api','graphql','-f','query='+query],capture_output=True,text=True)
+stamp=now.strftime('%Y%m%dT%H%M%SZ')
+base=root/('local-pr-ci-v2-'+stamp)
+if result.returncode:
+ (base.with_suffix('.error.json')).write_text(json.dumps({'timestamp':now.isoformat(),'exit':result.returncode,'stdout':result.stdout,'stderr':result.stderr},indent=2)+'\n')
+ raise SystemExit(result.returncode)
+response=json.loads(result.stdout)
+raw={'broker_session':1122,'captured_at_utc':now.isoformat(),'graphql_query':query,'repository':'schiste/Aethyme','response':response}
+base.with_suffix('.raw.json').write_text(json.dumps(raw,indent=2)+'\n')
+if response.get('errors'):raise SystemExit('GraphQL returned errors; raw response retained')
+rows=[];counts={k:[] for k in ['green','pending','failing','unknown']}
+for alias,p in response['data']['repository'].items():
+ if p is None:raise SystemExit('Missing pull request: '+alias)
+ roll=p.get('statusCheckRollup');contexts=roll['contexts']['nodes'] if roll else []
+ truncated=bool(roll and roll['contexts']['pageInfo']['hasNextPage'])
+ failures=[];pending=[];unrecognized=[]
+ for c in contexts:
+  if c['__typename']=='CheckRun':
+   if c['status']!='COMPLETED':pending.append(c['name'])
+   elif c.get('conclusion') not in ['SUCCESS','SKIPPED','NEUTRAL']:failures.append(c['name'])
+  elif c['__typename']=='StatusContext':
+   if c['state']=='PENDING':pending.append(c['context'])
+   elif c['state'] in ['FAILURE','ERROR']:failures.append(c['context'])
+   elif c['state']!='SUCCESS':unrecognized.append(c['context'])
+  else:unrecognized.append(c['__typename'])
+ state='failing' if failures else 'unknown' if truncated or unrecognized or not contexts else 'pending' if pending else 'green'
+ counts[state].append(p['number']);rows.append({**p,'classification':state,'failing_jobs':failures,'pending_jobs':pending,'context_pagination_truncated':truncated})
+summary={'broker_session':1122,'captured_at_utc':now.isoformat(),'raw_response_file':base.with_suffix('.raw.json').name,'counts':{k:len(v) for k,v in counts.items()},'by_classification':counts,'records':rows}
+base.with_suffix('.summary.json').write_text(json.dumps(summary,indent=2)+'\n')
+print(json.dumps({'summary':str(base.with_suffix('.summary.json')),'counts':summary['counts'],'by_classification':counts},indent=2))

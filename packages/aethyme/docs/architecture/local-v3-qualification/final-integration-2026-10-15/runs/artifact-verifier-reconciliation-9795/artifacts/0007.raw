@@ -1,0 +1,55 @@
+#!/usr/bin/env python3
+"""Read-only verification of retained Local payload inventories and local summary links."""
+import argparse, hashlib, json, pathlib, re, subprocess, sys, urllib.parse
+ap=argparse.ArgumentParser();ap.add_argument('--root',type=pathlib.Path,default=pathlib.Path.cwd());ap.add_argument('--require-complete-local',action='store_true');a=ap.parse_args();root=a.root.resolve();errors=[];groups=[];seen=set()
+tracked=set(subprocess.check_output(['/opt/homebrew/bin/git','ls-files','-z'],cwd=root).decode().split('\0'))
+def check(base,rows,label):
+ count=0
+ for row in rows:
+  name=row.get('path');expected=row.get('sha256');size=row.get('bytes',row.get('size_bytes'))
+  if not name or not expected:errors.append(f'{label}: missing path/hash');continue
+  p=(base/name).resolve()
+  try:rel=str(p.relative_to(root))
+  except ValueError:errors.append(f'{label}: outside root {name}');continue
+  if rel not in tracked:errors.append(f'{label}: untracked {rel}')
+  try:data=p.read_bytes()
+  except OSError as e:errors.append(f'{label}: {e}');continue
+  if hashlib.sha256(data).hexdigest()!=expected:errors.append(f'{label}: hash mismatch {name}')
+  if size is not None and len(data)!=size:errors.append(f'{label}: size mismatch {name}')
+  seen.add(rel);count+=1
+ groups.append({'inventory':label,'checked':count})
+q=root/'packages/aethyme/docs/architecture/local-v3-qualification'
+if a.require_complete_local:
+ for name in ['sensitive-response-2026-10-15','t64-cli-bootstrap-2026-10-15']:
+  if not (q/name/'ledger.json').is_file():errors.append(f'required Local evidence missing: {name}/ledger.json')
+p=root/'target/local-resume/actual-fx17-twenty-stage-evidence-inventory.json';check(root,json.loads(p.read_text())['evidence_files'],str(p.relative_to(root)))
+for name,key,file in [('cross-revision-baseline-2026-10-15','raw_artifacts','ledger.json'),('unknown-publication-2026-10-15','raw_artifacts','ledger.json'),('model-adapter-2026-10-15','files','ledger.json'),('analysis-view-lifecycle-2026-10-15','artifacts','artifact-inventory.json'),('final-integration-2026-10-15','files','ledger.json'),('native-job-lifecycle-2026-10-15','raw_artifacts','ledger.json'),('t45-pressure-gc-interleaving-2026-10-15','files','ledger.json'),('sensitive-response-2026-10-15','files','ledger.json'),('t64-cli-bootstrap-2026-10-15','files','ledger.json')]:
+ p=q/name/file
+ if p.exists():
+  x=json.loads(p.read_text())
+  if key not in x:
+   candidates=[k for k in ['files','raw_artifacts','artifacts','evidence_files'] if isinstance(x.get(k),list)]
+   if len(candidates)==1:key=candidates[0]
+   else:errors.append(f'{p}: unable to identify artifact list');continue
+  check(p.parent,x[key],str(p.relative_to(root)))
+p=q/'t45-pressure-gc-interleaving-2026-10-15/evidence/inventory.json'
+if p.exists():check(p.parent.parent,json.loads(p.read_text())['files'],str(p.relative_to(root)))
+p=root/'packages/aethyme-eval/fx10/evidence/actual-1123-1f7b2266/INVENTORY.tsv';rows=[]
+for line in p.read_text().splitlines()[1:]:
+ h,n,name=line.split('\t',2)
+ if name!='README.md':rows.append({'path':name,'bytes':int(n),'sha256':h})
+checksums=p.parent/'SHA256SUMS.txt'
+for line in checksums.read_text().splitlines():
+ h,name=line.split('  ',1)
+ if name=='INVENTORY.tsv':rows.append({'path':name,'sha256':h})
+check(p.parent,rows,str(p.relative_to(root)))
+links=0
+for name in ['local-v3-qualification.md','local-v3-autonomous-controller.md','local-v3-native-gates.md']:
+ p=q.parent/name
+ for label,target in re.findall(r'\[([^\]]+)\]\(([^)]+)\)',p.read_text()):
+  target=target.strip('<>');u=urllib.parse.urlsplit(target)
+  if u.scheme or not u.path:continue
+  links+=1;dest=(p.parent/urllib.parse.unquote(u.path)).resolve()
+  if not dest.exists():errors.append(f'{name}: missing link {target}')
+result={'source_head':subprocess.check_output(['/opt/homebrew/bin/git','rev-parse','HEAD'],cwd=root,text=True).strip(),'unique_payloads':len(seen),'groups':groups,'local_summary_links':links,'errors':errors}
+print(json.dumps(result,indent=2));sys.exit(bool(errors))

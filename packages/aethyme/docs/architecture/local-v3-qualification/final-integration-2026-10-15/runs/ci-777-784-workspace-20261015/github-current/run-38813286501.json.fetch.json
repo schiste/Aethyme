@@ -1,0 +1,16 @@
+{
+  "schema": "aethyme.local-gh-read-fetch/v1",
+  "request": "run-38813286501.json",
+  "argv": [
+    "gh",
+    "api",
+    "repos/schiste/Aethyme/actions/runs/38813286501"
+  ],
+  "exit": 0,
+  "started_at_utc": "2026-10-15T22:17:02.945995+00:00",
+  "finished_at_utc": "2026-10-15T22:17:03.453034+00:00",
+  "bytes": 12194,
+  "sha256": "056423366314d5928d00c5a25e64fd5f1f32e8fe1e3b8f6d4292ca69b2c09d45",
+  "stderr_bytes": 0,
+  "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+}
