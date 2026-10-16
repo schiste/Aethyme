@@ -994,7 +994,7 @@ pub fn load_request(
     load_request_from_bytes(store, repo, record, &bytes)
 }
 
-fn load_request_bounded(
+pub(crate) fn load_request_bounded(
     store: &mut CollaborationStore,
     repo: &Path,
     record: &RecordRef,
@@ -1617,42 +1617,144 @@ fn attempts_used(store: &CollaborationStore, decision: &Decision) -> Result<u32,
     comparable_attempts(connection, decision)
 }
 
-/// Charge one attempt to `decision` before dispatch, so a crash never
-/// refunds it. `None` when the allowance is spent; otherwise the attempt
-/// number and the ledger row to settle.
-fn charge(
-    store: &mut CollaborationStore,
-    decision: &Decision,
-    request: &RecordId,
+/// Insert the comparable-decision charge into an already-open transaction.
+/// Callers supply the archived request, not a member/path summary, so the
+/// decision key and allowance query always come from the validated record.
+fn charge_in_transaction(
+    transaction: &rusqlite::Transaction<'_>,
+    request: &ResolutionRequest,
+    record: &RecordRef,
     resolver: &str,
 ) -> Result<Option<(u32, i64)>, ResolutionError> {
-    let transaction = store
-        .connection()
-        .transaction_with_behavior(TransactionBehavior::Immediate)?;
-    transaction.execute_batch(LEDGER)?;
-    let used = comparable_attempts(&transaction, decision)?;
+    charge_in_transaction_with_metadata(transaction, request, record, resolver, None)
+}
+
+/// The managed route must preserve the exact manifest and stable idempotency
+/// key on the same shared comparable-attempt row used by manual resolution.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ManagedChargeContext<'a> {
+    pub(crate) input_manifest: ObjectDigest,
+    pub(crate) client_key: &'a OperationId,
+    pub(crate) async_token: &'a OperationId,
+    pub(crate) input_sha256: &'a str,
+    pub(crate) limits: DispatchLimits,
+}
+
+#[derive(Debug)]
+struct AttemptChargeMetadata {
+    request_sha256: String,
+    input_sha256: String,
+    input_manifest_sha256: String,
+    client_key: String,
+    async_token: String,
+    dispatch_limits: String,
+}
+
+/// Insert one managed charge through the same decision/cap check as manual
+/// resolution. The caller owns the Immediate transaction and initializes the
+/// resolution ledger before invoking this helper.
+pub(crate) fn charge_managed_in_transaction(
+    transaction: &rusqlite::Transaction<'_>,
+    request: &ResolutionRequest,
+    context: ManagedChargeContext<'_>,
+) -> Result<Option<(u32, i64)>, ResolutionError> {
+    validate_attempt_binding(context.client_key.as_str(), "client key")?;
+    validate_attempt_binding(context.async_token.as_str(), "attempt token")?;
+    let limits = context.limits.validate()?;
+    let record = request.record();
+    let metadata = AttemptChargeMetadata {
+        request_sha256: record.object.hex(),
+        input_sha256: context.input_sha256.to_owned(),
+        input_manifest_sha256: context.input_manifest.hex(),
+        client_key: context.client_key.as_str().to_owned(),
+        async_token: context.async_token.as_str().to_owned(),
+        dispatch_limits: limits.canonical_ledger_value(),
+    };
+    charge_in_transaction_with_metadata(
+        transaction,
+        request,
+        record,
+        "local-managed-resolution",
+        Some(&metadata),
+    )
+}
+
+fn charge_in_transaction_with_metadata(
+    transaction: &rusqlite::Transaction<'_>,
+    request: &ResolutionRequest,
+    record: &RecordRef,
+    resolver: &str,
+    metadata: Option<&AttemptChargeMetadata>,
+) -> Result<Option<(u32, i64)>, ResolutionError> {
+    if request.record() != record {
+        return Err(invalid(
+            "charged request reference differs from its archived record",
+        ));
+    }
+    let decision = &request.decision;
+    let used = comparable_attempts(transaction, decision)?;
     if used >= MAX_SYNTHESIS_ATTEMPTS {
         return Ok(None);
     }
+    let request_sha256 = metadata.map(|metadata| metadata.request_sha256.as_str());
+    let input_sha256 = metadata.map(|metadata| metadata.input_sha256.as_str());
+    let input_manifest_sha256 = metadata.map(|metadata| metadata.input_manifest_sha256.as_str());
+    let client_key = metadata.map(|metadata| metadata.client_key.as_str());
+    let async_token = metadata.map(|metadata| metadata.async_token.as_str());
+    let dispatch_limits = metadata.map(|metadata| metadata.dispatch_limits.as_str());
     transaction.execute(
         "INSERT INTO resolution_attempts
              (decision_key, kind, members, paths, request_record_id, resolver, charged_ms,
-              attempt_number, async_state)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'dispatching')",
+              attempt_number, request_sha256, input_sha256, input_manifest_sha256,
+              client_key, async_token, dispatch_limits, async_state)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, 'dispatching')",
         rusqlite::params![
             decision.key(),
             decision.kind,
             join_set(&decision.members),
             join_set(&decision.paths),
-            request.as_str(),
+            record.id.as_str(),
             resolver,
             now_ms(),
-            i64::from(used + 1)
+            i64::from(used + 1),
+            request_sha256,
+            input_sha256,
+            input_manifest_sha256,
+            client_key,
+            async_token,
+            dispatch_limits,
         ],
     )?;
     let row = transaction.last_insert_rowid();
-    transaction.commit()?;
     Ok(Some((used + 1, row)))
+}
+
+/// Charge one attempt before dispatch, so a crash never refunds it. `None`
+/// means the shared allowance is spent; otherwise return its number and the
+/// ledger row to settle.
+fn charge(
+    store: &mut CollaborationStore,
+    request: &ResolutionRequest,
+    record: &RecordRef,
+    resolver: &str,
+) -> Result<Option<(u32, i64)>, ResolutionError> {
+    let transaction = store
+        .connection()
+        .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    initialize_ledger_in_transaction(&transaction)?;
+    let charge = charge_in_transaction(&transaction, request, record, resolver)?;
+    transaction.commit()?;
+    Ok(charge)
+}
+
+/// Initialize the shared resolution-attempt ledger inside a caller-owned
+/// transaction. Managed Local admission uses this with its reservation and
+/// immutable binding writes so all authority commits atomically.
+pub(crate) fn initialize_ledger_in_transaction(
+    transaction: &rusqlite::Transaction<'_>,
+) -> Result<(), ResolutionError> {
+    transaction.execute_batch(LEDGER)?;
+    Ok(())
 }
 
 fn settle(store: &mut CollaborationStore, row: i64, outcome: &str) -> Result<(), ResolutionError> {
@@ -1937,7 +2039,7 @@ impl DispatchLimits {
     }
 }
 
-fn request_record_limit(limits: DispatchLimits) -> Result<usize, ResolutionError> {
+pub(crate) fn request_record_limit(limits: DispatchLimits) -> Result<usize, ResolutionError> {
     usize::try_from(limits.max_manifest_bytes.min(MAX_DOCUMENT_BYTES as u64))
         .map_err(|_| invalid("resolution request byte limit"))
 }
@@ -2568,7 +2670,7 @@ fn account_manifest_entry(
     Ok(())
 }
 
-fn build_input_manifest(
+pub(crate) fn build_input_manifest(
     store: &CollaborationStore,
     request: &ResolutionRequest,
     limits: DispatchLimits,
@@ -2786,7 +2888,10 @@ fn encode_input_manifest(
     Ok(output)
 }
 
-fn resolution_input_digest(request: &ResolutionRequest, request_object: &ObjectDigest) -> String {
+pub(crate) fn resolution_input_digest(
+    request: &ResolutionRequest,
+    request_object: &ObjectDigest,
+) -> String {
     let (snapshots, contributions) = attempt_inputs(request);
     let mut hasher = Sha256::new();
     hasher.update(b"aethyme async resolution inputs v1\0");
@@ -2802,7 +2907,7 @@ fn resolution_input_digest(request: &ResolutionRequest, request_object: &ObjectD
     hex(&hasher.finalize())
 }
 
-fn retain_attempt_inputs(
+pub(crate) fn retain_attempt_inputs(
     transaction: &rusqlite::Transaction<'_>,
     token: &str,
     record: &RecordRef,
@@ -3970,7 +4075,7 @@ pub fn resolve(
             used: attempts_used(store, &request.decision)?,
         })
     };
-    let Some((attempt, row)) = charge(store, &request.decision, &record.id, &label)? else {
+    let Some((attempt, row)) = charge(store, &request, record, &label)? else {
         return Ok(Resolution {
             outcome: failed(
                 ResolutionFailure::BudgetExhausted,

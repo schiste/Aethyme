@@ -81,6 +81,17 @@ use crate::composition::{
 /// `git merge-file`, with the limits in the module documentation.
 pub const PROVISIONAL_TEXT_PROFILE: &str = "aethyme.compose.git-merge-file/provisional-v0";
 
+/// Immutable text-engine pins captured when Local freezes a conflict source.
+/// Candidate recipes continue to record the same values in their recipe body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProvisionalTextProfilePins {
+    pub(crate) profile: String,
+    pub(crate) engine: String,
+    pub(crate) version: String,
+    pub(crate) diff: String,
+    pub(crate) move_window: usize,
+}
+
 pub mod structural;
 use structural::{MergeMethod, MergeObservation, MergirafEngine};
 
@@ -1897,6 +1908,18 @@ fn git_version() -> Result<String, ComposeError> {
         return Err(ComposeError::Git("git --version failed".into()));
     }
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// Capture the exact provisional text profile and engine versions used by
+/// Local when it freezes the immutable source for a conflict request.
+pub(crate) fn provisional_text_profile_pins() -> Result<ProvisionalTextProfilePins, ComposeError> {
+    Ok(ProvisionalTextProfilePins {
+        profile: PROVISIONAL_TEXT_PROFILE.into(),
+        engine: "git merge-file".into(),
+        version: git_version()?,
+        diff: DIFF_ENGINE.into(),
+        move_window: MOVE_WINDOW,
+    })
 }
 
 // ------------------------------------------------- shared with resolution

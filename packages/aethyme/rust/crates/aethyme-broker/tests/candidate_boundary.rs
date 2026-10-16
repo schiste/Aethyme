@@ -275,7 +275,7 @@ fn work_already_on_the_baseline_is_no_change_as_submit_reports() {
 }
 
 #[test]
-fn a_merge_commit_is_unsupported_where_submit_refuses_it() {
+fn a_fully_owned_merge_candidate_matches_the_tree_submit_gates() {
     let (tmp, mut broker) = fixture(None);
     let root = tmp.path();
     let (a, a_path) = start(&mut broker, "a");
@@ -291,16 +291,13 @@ fn a_merge_commit_is_unsupported_where_submit_refuses_it() {
     let before = world(root, &mut broker, &[&a_path]);
     let outcome = broker.legacy_candidate(a).unwrap();
     assert_eq!(world(root, &mut broker, &[&a_path]), before);
-    let CompositionOutcome::Unsupported { reason, .. } = &outcome else {
-        panic!("expected unsupported, got {outcome:?}");
-    };
-    assert_eq!(*reason, Unsupported::MergeCommit);
-    assert_eq!(outcome.code(), "merge_commit");
-
-    match broker.submit(a) {
-        Err(BrokerOpError::UnsupportedSubmissionCommit { .. }) => {}
-        other => panic!("submit should refuse the merge commit: {other:?}"),
-    }
+    let candidate = outcome.candidate().expect("fully owned merge candidate");
+    assert_eq!(candidate.mode, CompositionMode::Preserved);
+    assert_eq!(candidate.mode.code(), "preserved");
+    let tree = candidate.tree.to_string();
+    let submitted = broker.submit(a).unwrap();
+    assert!(submitted.promoted, "{submitted:?}");
+    assert_eq!(submitted.entry.merged_tree.as_deref(), Some(tree.as_str()));
 }
 
 /// Under `verify-only` the baseline is the fetched default branch, not the

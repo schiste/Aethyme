@@ -1290,6 +1290,36 @@ impl GitRepo {
             .is_ok_and(|output| output.trim() == "true")
     }
 
+    /// The exact owned-DAG path must not derive ancestry from shallow
+    /// boundaries, replacement refs or grafts. Errors inspecting these
+    /// controls propagate rather than proving an absent history override.
+    pub(crate) fn has_complete_unmodified_history(&self) -> Result<bool, GitError> {
+        if ["GIT_REPLACE_REF_BASE", "GIT_GRAFT_FILE", "GIT_SHALLOW_FILE"]
+            .iter()
+            .any(|name| std::env::var_os(name).is_some())
+        {
+            return Ok(false);
+        }
+        if run_git(&self.root, &["rev-parse", "--is-shallow-repository"])? != "false"
+            || !run_git(
+                &self.root,
+                &["for-each-ref", "--format=%(refname)", "refs/replace/"],
+            )?
+            .is_empty()
+        {
+            return Ok(false);
+        }
+        let grafts = self.git_common_dir()?.join("info/grafts");
+        match std::fs::symlink_metadata(&grafts) {
+            Ok(_) => Ok(false),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+            Err(source) => Err(GitError::Spawn {
+                args: format!("inspect history grafts {}", grafts.display()),
+                source,
+            }),
+        }
+    }
+
     /// A git config value (`git config --get`), `None` when unset.
     pub fn config_get(&self, key: &str) -> Option<String> {
         run_git(&self.root, &["config", "--get", key])
