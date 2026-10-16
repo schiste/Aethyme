@@ -49,7 +49,7 @@ use crate::collaboration_state::{CollaborationStateError, CollaborationStore, Pr
 pub const SUBMIT_CAPTURE_SCHEMA: &str = "aethyme.submit-capture/experimental-v0";
 
 /// The `[collaboration]` settings this binary implements.
-const KNOWN_SETTINGS: &[&str] = &["capture", "project", "descriptor"];
+pub(crate) const KNOWN_SETTINGS: &[&str] = &["capture", "project", "descriptor"];
 
 /// What `[collaboration] capture` asks for.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1511,6 +1511,23 @@ mod tests {
             setting,
             Setting::On {
                 project: Err(_),
+                ..
+            }
+        ));
+    }
+
+    /// Descriptor pointers are optional for capture and validated only by
+    /// certification and the explicit project-binding command.
+    #[test]
+    fn advisory_capture_does_not_block_on_an_unused_descriptor_pointer() {
+        let setting = setting_from_text(Some(
+            "[collaboration]\ncapture = \"advisory\"\nproject = \"p\"\ndescriptor = 7\n",
+        ));
+        assert!(matches!(
+            setting,
+            Setting::On {
+                policy: CapturePolicy::Advisory,
+                project: Ok(_),
                 ..
             }
         ));

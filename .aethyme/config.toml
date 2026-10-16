@@ -295,3 +295,7 @@ repository = "schiste/Aethyme"
 
 [delivery]
 push_session_branches = true
+
+[collaboration]
+capture = "advisory"
+project = "proj-yphigqgbnleotk2lkce4rm366y"
