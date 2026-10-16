@@ -229,7 +229,7 @@ pub(super) fn validate_bindings(
             if total_bytes > MAX_D10_TARGET_BYTES {
                 return Err(TargetError::Invalid("D10 target size".into()));
             }
-            let (_, observed_brief_id) = Brief::from_record(&brief_bytes)
+            let (_, observed_brief_id) = Brief::from_record(brief_bytes)
                 .map_err(|error| TargetError::Invalid(format!("D10 brief: {error}")))?;
             if observed_brief_id != brief.record_id {
                 return Err(TargetError::Invalid("D10 brief binding".into()));
@@ -642,10 +642,10 @@ mod tests {
             &first.id,
             &[fixture.a.result.snapshot_id.clone()],
             &[
-                descriptor_object.clone(),
-                revision_object.clone(),
-                brief_object.clone(),
-                recipe_object.clone(),
+                descriptor_object,
+                revision_object,
+                brief_object,
+                recipe_object,
             ],
         )
         .unwrap();
@@ -694,7 +694,7 @@ mod tests {
                     && item.relpath == archive_object_relpath(digest)
             }));
         }
-        assert_eq!(descriptor_id.as_str().starts_with("sha256:"), true);
+        assert!(descriptor_id.as_str().starts_with("sha256:"));
     }
 
     fn spec() -> TargetSpec {

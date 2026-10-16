@@ -63,14 +63,14 @@ fn d10_target_inputs(
             contribution: (*alias).into(),
             logical_contribution_id: revision.revision().contribution_id().to_string(),
             revision_record_id: revision.record_id().to_string(),
-            revision_object_sha256: revision.object_digest().hex().into(),
+            revision_object_sha256: revision.object_digest().hex(),
         })
         .collect();
     let bindings = D10RevisionBindings {
         profile: D10_TARGET_PROFILE.into(),
         project_id: fixture.binding.project_id().to_string(),
         descriptor_record_id: fixture.binding.descriptor_record_id().to_string(),
-        descriptor_object_sha256: fixture.binding.descriptor_object().hex().into(),
+        descriptor_object_sha256: fixture.binding.descriptor_object().hex(),
         revisions: pins,
     };
     (spec, bindings)
