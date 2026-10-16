@@ -8,14 +8,12 @@
 //! tree instead of failing. Outside the repository the same walk terminates
 //! with nothing, which is loud (#149).
 //!
-//! So a slot is placed in host-scoped storage, beside the broker worktree root
-//! and under the same policy: an ephemeral repository is kept out of durable
-//! host state unless that directory was named explicitly, and falls back to the
-//! system temporary directory. The repository itself is the placement of last
-//! resort, taken only when every location outside it is unwritable -- a sandbox
-//! confining writes to the invoking checkout is the case that requires it. That
-//! placement is recorded rather than silently accepted, and `gate doctor`
-//! reports it.
+//! A slot follows the broker's already repository-scoped worktree root so a
+//! checkout and the verification of its exact tree land on the same volume.
+//! Host state remains the fallback for an unavailable configured root, and
+//! system temporary storage is the fallback for unavailable host state. The
+//! repository itself remains the last resort. Placement is planned without
+//! creating paths; acquisition rechecks the selected volume before writing.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -33,36 +31,43 @@ pub(crate) struct SlotPlacement {
     pub(crate) preferred: Option<PathBuf>,
     /// Why each location outside the repository was rejected, in order.
     pub(crate) refusals: Vec<String>,
+    /// Explicit environment/library roots are strict. If their storage is not
+    /// safe, acquisition must fail rather than silently switching volumes.
+    pub(crate) blocking_refusal: Option<String>,
 }
 
 /// Choose the directory this repository's slot will occupy.
 pub(crate) fn plan_slot_placement(main_root: &Path, namespace: &str) -> SlotPlacement {
-    plan_slot_placement_in(
+    let repository = GitRepo::discover(main_root).ok();
+    let git_common_dir = repository
+        .as_ref()
+        .and_then(|repository| repository.git_common_dir().ok());
+    let root_plan = crate::broker::lifecycle::plan_worktree_root_for(
+        main_root,
+        git_common_dir.as_deref(),
+        None,
+    );
+    let key = root_plan.repository_key.clone();
+    let candidates = crate::broker::lifecycle::worktree_root_candidates_for(&root_plan);
+    let strict = matches!(
+        root_plan.preferred_source,
+        Some(
+            crate::WorktreeRootSource::EnvironmentOverride
+                | crate::WorktreeRootSource::LibraryOverride
+        )
+    );
+    plan_slot_placement_for_worktree_candidates(
         main_root,
         namespace,
-        durable_host_state(main_root).as_deref(),
+        &candidates,
         &std::env::temp_dir(),
+        &key,
+        strict,
     )
 }
 
-/// The host state directory, when this repository is entitled to durable space.
-///
-/// The same rule the broker worktree root applies: a repository under the
-/// system temporary directory is a fixture or a scratch clone, and must not
-/// leave storage in durable host state that outlives the records owning it.
-fn durable_host_state(main_root: &Path) -> Option<PathBuf> {
-    crate::host_state::default_host_state_dir().filter(|_| {
-        crate::host_state::host_state_dir_is_explicit()
-            || !crate::host_state::path_is_ephemeral(main_root)
-    })
-}
-
-/// [`plan_slot_placement`] with its two environment inputs supplied.
-///
-/// Creating the directory *is* the writability test, and it is the same
-/// directory the slot would use anyway, so planning leaves nothing behind that
-/// acquiring would not have created. Callers that only want to know where a
-/// slot would land -- the gate doctor -- can therefore ask without running one.
+/// [`plan_slot_placement`] with host and temporary roots supplied for tests.
+#[cfg(test)]
 fn plan_slot_placement_in(
     main_root: &Path,
     namespace: &str,
@@ -76,39 +81,173 @@ fn plan_slot_placement_in(
             .and_then(|repo| repo.git_common_dir().ok())
             .as_deref(),
     );
-    let mut candidates = Vec::new();
-    if let Some(base) = host_state {
-        candidates.push(base.join("run").join(&key).join(namespace));
+    let host_state_root = host_state.map(|base| base.join(&key));
+    let mut roots = Vec::new();
+    if let Some(root) = host_state_root {
+        roots.push((root, crate::WorktreeRootSource::HostState));
     }
-    candidates.push(temp_root.join("aethyme-run").join(&key).join(namespace));
-    // An explicitly named host state directory can be anywhere, including
-    // under the checkout it serves, and a temporary directory can be
-    // redirected the same way. Either would reintroduce the nesting that this
-    // placement exists to avoid, so neither is taken on faith.
-    candidates.retain(|candidate| !path_is_inside(main_root, candidate));
+    plan_slot_placement_for_worktree_candidates(
+        main_root, namespace, &roots, temp_root, &key, false,
+    )
+}
 
+#[cfg(test)]
+fn plan_slot_placement_for_roots(
+    main_root: &Path,
+    namespace: &str,
+    worktree_root: Option<&Path>,
+    host_state_root: Option<&Path>,
+    temp_root: &Path,
+    repository_key: &str,
+) -> SlotPlacement {
+    let mut roots = Vec::new();
+    if let Some(root) = worktree_root {
+        roots.push((
+            root.to_path_buf(),
+            crate::WorktreeRootSource::RepositoryConfig,
+        ));
+    }
+    if let Some(root) = host_state_root {
+        roots.push((root.to_path_buf(), crate::WorktreeRootSource::HostState));
+    }
+    plan_slot_placement_for_worktree_candidates(
+        main_root,
+        namespace,
+        &roots,
+        temp_root,
+        repository_key,
+        false,
+    )
+}
+
+fn plan_slot_placement_for_worktree_candidates(
+    main_root: &Path,
+    namespace: &str,
+    worktree_roots: &[(PathBuf, crate::WorktreeRootSource)],
+    temp_root: &Path,
+    repository_key: &str,
+    strict_override: bool,
+) -> SlotPlacement {
+    let mut candidates = worktree_roots
+        .iter()
+        .map(|(root, _)| root.join("run").join(namespace))
+        .collect::<Vec<_>>();
+    if !strict_override {
+        candidates.push(
+            temp_root
+                .join("aethyme-run")
+                .join(repository_key)
+                .join(namespace),
+        );
+    }
+    candidates.dedup();
+
+    let preferred = candidates.first().cloned();
     let mut refusals = Vec::new();
-    let mut preferred = None;
     for directory in candidates {
-        preferred.get_or_insert_with(|| directory.clone());
-        match std::fs::create_dir_all(&directory) {
-            Ok(()) => {
+        if path_is_inside(main_root, &directory) {
+            let reason = format!(
+                "{} resolves inside repository {}",
+                directory.display(),
+                main_root.display()
+            );
+            refusals.push(reason.clone());
+            if strict_override {
+                return SlotPlacement {
+                    directory,
+                    inside_repository: true,
+                    preferred,
+                    refusals,
+                    blocking_refusal: Some(reason),
+                };
+            }
+            continue;
+        }
+        if let Some(reason) = removable_volume_unavailable_reason(&directory) {
+            let refusal = format!("{}: {reason}", directory.display());
+            refusals.push(refusal.clone());
+            if strict_override {
                 return SlotPlacement {
                     directory,
                     inside_repository: false,
-                    preferred: None,
+                    preferred,
                     refusals,
+                    blocking_refusal: Some(refusal),
                 };
             }
-            Err(source) => refusals.push(format!("{}: {source}", directory.display())),
+            continue;
         }
+        if let Some(reason) = slot_headroom_refusal(main_root, &directory) {
+            let refusal = format!("{}: {reason}", directory.display());
+            refusals.push(refusal.clone());
+            if strict_override {
+                return SlotPlacement {
+                    directory,
+                    inside_repository: false,
+                    preferred,
+                    refusals,
+                    blocking_refusal: Some(refusal),
+                };
+            }
+            continue;
+        }
+        return SlotPlacement {
+            directory,
+            inside_repository: false,
+            preferred: None,
+            refusals,
+            blocking_refusal: None,
+        };
     }
     SlotPlacement {
         directory: main_root.join(".aethyme/run").join(namespace),
         inside_repository: true,
         preferred,
         refusals,
+        blocking_refusal: None,
     }
+}
+
+fn slot_headroom_refusal(main_root: &Path, directory: &Path) -> Option<String> {
+    let nearest_directory = directory.ancestors().find(|ancestor| ancestor.exists())?;
+    if !nearest_directory.is_dir() {
+        return Some(format!(
+            "{} is not a directory",
+            nearest_directory.display()
+        ));
+    }
+    let available = crate::disk_headroom::available_headroom_at_or_above_for(main_root, directory)?;
+    crate::disk_headroom::refusal_with_headroom(
+        Some(available.bytes),
+        available.inodes,
+        crate::DEFAULT_GATE_HEADROOM_BYTES,
+        crate::disk_headroom::MIN_GATE_HEADROOM_INODES,
+    )
+}
+
+pub(crate) fn removable_volume_unavailable_reason(path: &Path) -> Option<String> {
+    removable_volume_unavailable_reason_with_root(path, Path::new("/Volumes"))
+}
+
+fn removable_volume_unavailable_reason_with_root(path: &Path, volumes: &Path) -> Option<String> {
+    let relative = path.strip_prefix(volumes).ok()?;
+    let name = relative.components().next()?;
+    let mount = volumes.join(name);
+    if !mount.is_dir() {
+        return Some(format!("volume {} is not mounted", mount.display()));
+    }
+    use std::os::unix::fs::MetadataExt;
+    let (Ok(mount_metadata), Ok(volumes_metadata)) =
+        (std::fs::metadata(&mount), std::fs::metadata(volumes))
+    else {
+        return Some(format!("cannot verify mounted volume {}", mount.display()));
+    };
+    (mount_metadata.dev() == volumes_metadata.dev()).then(|| {
+        format!(
+            "{} is not a mounted volume (it is a directory on the startup disk)",
+            mount.display()
+        )
+    })
 }
 
 /// True when `candidate` resolves inside `root`.
@@ -222,7 +361,7 @@ impl ExactTreeVerificationSlot {
         main_root: &Path,
         placement: SlotPlacement,
     ) -> Result<Option<Self>, BrokerOpError> {
-        let lock_path = Self::prepare_lock_path(&placement)?;
+        let lock_path = Self::prepare_lock_path(main_root, &placement)?;
         let file = open_lock_file(&lock_path).map_err(|source| BrokerError::Io {
             path: lock_path.clone(),
             source,
@@ -238,7 +377,23 @@ impl ExactTreeVerificationSlot {
         }))
     }
 
-    fn prepare_lock_path(placement: &SlotPlacement) -> Result<PathBuf, BrokerOpError> {
+    fn prepare_lock_path(
+        main_root: &Path,
+        placement: &SlotPlacement,
+    ) -> Result<PathBuf, BrokerOpError> {
+        if let Some(reason) = &placement.blocking_refusal {
+            return Err(BrokerError::Io {
+                path: placement.directory.clone(),
+                source: std::io::Error::new(std::io::ErrorKind::PermissionDenied, reason.clone()),
+            }
+            .into());
+        }
+        ensure_slot_storage_available(main_root, &placement.directory).map_err(|source| {
+            BrokerError::Io {
+                path: placement.directory.clone(),
+                source,
+            }
+        })?;
         std::fs::create_dir_all(&placement.directory).map_err(|source| BrokerError::Io {
             path: placement.directory.clone(),
             source,
@@ -248,11 +403,7 @@ impl ExactTreeVerificationSlot {
 
     /// Take the lock on an already chosen placement.
     fn acquire_at(main_root: &Path, placement: SlotPlacement) -> Result<Self, BrokerOpError> {
-        std::fs::create_dir_all(&placement.directory).map_err(|source| BrokerError::Io {
-            path: placement.directory.clone(),
-            source,
-        })?;
-        let lock_path = placement.directory.join("slot.lock");
+        let lock_path = Self::prepare_lock_path(main_root, &placement)?;
         let file = open_lock_file(&lock_path).map_err(|source| BrokerError::Io {
             path: lock_path.clone(),
             source,
@@ -276,6 +427,12 @@ impl ExactTreeVerificationSlot {
         repository: &GitRepo,
         commit: &str,
     ) -> Result<GitRepo, BrokerOpError> {
+        ensure_slot_storage_available(&self.repository_root, &self.path).map_err(|source| {
+            BrokerError::Io {
+                path: self.path.clone(),
+                source,
+            }
+        })?;
         self.cleanup();
         Ok(repository.worktree_add_detached(&self.path, commit)?)
     }
@@ -288,6 +445,16 @@ impl ExactTreeVerificationSlot {
         }
         let _ = std::fs::remove_dir_all(&self.path);
     }
+}
+
+fn ensure_slot_storage_available(main_root: &Path, path: &Path) -> Result<(), std::io::Error> {
+    if let Some(reason) = removable_volume_unavailable_reason(path) {
+        return Err(std::io::Error::new(std::io::ErrorKind::NotFound, reason));
+    }
+    if let Some(reason) = slot_headroom_refusal(main_root, path) {
+        return Err(std::io::Error::new(std::io::ErrorKind::StorageFull, reason));
+    }
+    Ok(())
 }
 
 impl Drop for ExactTreeVerificationSlot {
@@ -339,6 +506,11 @@ mod tests {
         assert!(placement.directory.ends_with("merge-sim"));
         assert_eq!(placement.preferred, None);
         assert!(placement.refusals.is_empty(), "{:?}", placement.refusals);
+        assert!(
+            !placement.directory.exists(),
+            "planning must not create {}",
+            placement.directory.display()
+        );
     }
 
     #[test]
@@ -392,6 +564,79 @@ mod tests {
         assert!(!placement.inside_repository);
         assert!(placement.directory.starts_with(fx.temp.join("aethyme-run")));
         assert_eq!(placement.refusals.len(), 1, "{:?}", placement.refusals);
+    }
+
+    #[test]
+    fn a_missing_removable_mount_is_refused_without_creating_its_mountpoint() {
+        let fx = fixture();
+        let volumes = fx._root.path().join("volumes");
+        std::fs::create_dir(&volumes).unwrap();
+        let target = volumes.join("gone/worktrees/repo/run/merge-sim");
+
+        let refusal = removable_volume_unavailable_reason_with_root(&target, &volumes)
+            .expect("a missing mount must be refused");
+
+        assert!(refusal.contains("is not mounted"), "{refusal}");
+        assert!(!volumes.join("gone").exists());
+    }
+
+    #[test]
+    fn a_worktree_root_slot_is_scoped_under_its_existing_repository_directory_once() {
+        let fx = fixture();
+        let worktree_root = fx._root.path().join("worktrees/repo-key");
+        std::fs::create_dir_all(&worktree_root).unwrap();
+        let placement = plan_slot_placement_for_roots(
+            &fx.main,
+            "merge-sim",
+            Some(&worktree_root),
+            None,
+            &fx.temp,
+            "repo-key",
+        );
+
+        assert_eq!(placement.directory, worktree_root.join("run/merge-sim"));
+        assert!(
+            !placement
+                .directory
+                .to_string_lossy()
+                .contains("repo-key/repo-key"),
+            "repository key was appended twice: {}",
+            placement.directory.display()
+        );
+        assert!(!placement.directory.exists());
+    }
+
+    #[test]
+    fn an_unavailable_explicit_worktree_root_does_not_fall_back_to_another_volume() {
+        let fx = fixture();
+        let unavailable_root = fx._root.path().join("not-a-directory");
+        std::fs::write(&unavailable_root, "file blocks the root path").unwrap();
+        let candidates = vec![(
+            unavailable_root.clone(),
+            crate::WorktreeRootSource::EnvironmentOverride,
+        )];
+        let placement = plan_slot_placement_for_worktree_candidates(
+            &fx.main,
+            "merge-sim",
+            &candidates,
+            &fx.temp,
+            "repo-key",
+            true,
+        );
+        let expected = unavailable_root.join("run/merge-sim");
+
+        assert!(placement.blocking_refusal.is_some());
+        assert_eq!(placement.preferred.as_deref(), Some(expected.as_path()));
+        assert!(!expected.exists());
+        assert!(
+            !fx.temp.join("aethyme-run/repo-key/merge-sim").exists(),
+            "an explicit root must not fall back to a different volume"
+        );
+        assert!(
+            ExactTreeVerificationSlot::acquire_at(&fx.main, placement).is_err(),
+            "an unavailable explicit root must fail before creating a slot"
+        );
+        assert!(!expected.exists());
     }
 
     #[test]

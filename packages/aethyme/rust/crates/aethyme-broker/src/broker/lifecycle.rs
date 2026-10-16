@@ -1,5 +1,175 @@
 use super::*;
 
+/// The shared, read-only worktree-root choice used by both session placement
+/// and disposable exact-tree verification. `repository_key` is already
+/// appended to `preferred_root`; downstream storage must not add it again.
+pub(crate) fn plan_worktree_root_for(
+    main_root: &Path,
+    git_common_dir: Option<&Path>,
+    worktree_root_override: Option<&Path>,
+) -> WorktreeRootPlan {
+    let repository_key = crate::host_state::repository_key(main_root, git_common_dir);
+    let host_state_container = crate::host_state::default_host_state_dir()
+        .filter(|_| {
+            crate::host_state::host_state_dir_is_explicit()
+                || !crate::host_state::path_is_ephemeral(main_root)
+        })
+        .map(|base| base.join("worktrees"));
+    let mut preferred_unavailable_reason = None;
+    let configured_root = match crate::worktree_location::WorktreeLocationConfig::load(main_root) {
+        Ok(config) => config.and_then(|config| config.root.clone().map(|root| (root, config))),
+        Err(error) => {
+            preferred_unavailable_reason =
+                Some(format!("[worktrees] configuration ignored: {error}"));
+            None
+        }
+    };
+    let mut host_state_fallback_root = None;
+    let absolute_root = |path: &Path| {
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            main_root.join(path)
+        }
+    };
+    let (preferred_root, preferred_source, root_container) =
+        if let Some(root) = worktree_root_override {
+            (
+                Some(absolute_root(root)),
+                Some(WorktreeRootSource::LibraryOverride),
+                None,
+            )
+        } else if let Some(base) =
+            std::env::var_os("AETHYME_WORKTREE_ROOT").filter(|value| !value.is_empty())
+        {
+            let container = absolute_root(Path::new(&base));
+            (
+                Some(container.join(&repository_key)),
+                Some(WorktreeRootSource::EnvironmentOverride),
+                Some(container),
+            )
+        } else if let Some((container, settings)) = configured_root {
+            host_state_fallback_root = host_state_container
+                .as_ref()
+                .map(|container| container.join(&repository_key));
+            preferred_unavailable_reason =
+                configured_root_unavailable_for(main_root, &container, settings.min_free_bytes());
+            (
+                Some(container.join(&repository_key)),
+                Some(WorktreeRootSource::RepositoryConfig),
+                Some(container),
+            )
+        } else if let Some(container) = host_state_container {
+            (
+                Some(container.join(&repository_key)),
+                Some(WorktreeRootSource::HostState),
+                Some(container),
+            )
+        } else {
+            (None, None, None)
+        };
+    let preferred_outside_repository = preferred_root
+        .as_deref()
+        .is_some_and(|root| !path_is_inside_repository(main_root, root));
+    WorktreeRootPlan {
+        schema_version: WORKTREE_ROOT_SCHEMA_VERSION,
+        repository_root: main_root.to_path_buf(),
+        repository_key,
+        preferred_root,
+        preferred_source,
+        root_container,
+        legacy_fallback_root: main_root.join(".aethyme/worktrees"),
+        preferred_outside_repository,
+        host_state_fallback_root,
+        preferred_unavailable_reason,
+    }
+}
+
+/// Read-only root order used by both session preparation and exact-tree
+/// verification. Configured roots may fall back through host state to the
+/// repository; host state may fall back to the repository. Explicit roots are
+/// strict: an unavailable environment or library override is an error, not a
+/// reason to put work on a different volume.
+pub(crate) fn worktree_root_candidates_for(
+    plan: &WorktreeRootPlan,
+) -> Vec<(PathBuf, WorktreeRootSource)> {
+    let mut candidates = Vec::new();
+    match plan.preferred_source {
+        Some(WorktreeRootSource::RepositoryConfig) => {
+            if plan.preferred_unavailable_reason.is_none()
+                && let Some(root) = &plan.preferred_root
+            {
+                candidates.push((root.clone(), WorktreeRootSource::RepositoryConfig));
+            }
+            if let Some(root) = &plan.host_state_fallback_root {
+                candidates.push((root.clone(), WorktreeRootSource::HostState));
+            }
+            candidates.push((
+                plan.legacy_fallback_root.clone(),
+                WorktreeRootSource::RepositoryFallback,
+            ));
+        }
+        Some(WorktreeRootSource::HostState) => {
+            if let Some(root) = &plan.preferred_root {
+                candidates.push((root.clone(), WorktreeRootSource::HostState));
+            }
+            candidates.push((
+                plan.legacy_fallback_root.clone(),
+                WorktreeRootSource::RepositoryFallback,
+            ));
+        }
+        Some(
+            source
+            @ (WorktreeRootSource::EnvironmentOverride | WorktreeRootSource::LibraryOverride),
+        ) => {
+            if let Some(root) = &plan.preferred_root {
+                candidates.push((root.clone(), source));
+            }
+        }
+        Some(WorktreeRootSource::RepositoryFallback) | None => {
+            candidates.push((
+                plan.legacy_fallback_root.clone(),
+                WorktreeRootSource::RepositoryFallback,
+            ));
+        }
+    }
+    candidates
+}
+
+fn configured_root_unavailable_for(
+    main_root: &Path,
+    base: &Path,
+    min_free_bytes: u64,
+) -> Option<String> {
+    if let Some(reason) = crate::worktree_location::base_unavailable_reason(base) {
+        return Some(reason);
+    }
+    if path_is_inside_repository(main_root, base) {
+        return Some(format!(
+            "{} resolves inside repository {}",
+            base.display(),
+            main_root.display()
+        ));
+    }
+    match crate::disk_headroom::available_bytes_for(main_root, base) {
+        Some(free) if free < min_free_bytes => Some(format!(
+            "{} has {} free, below the {} required (worktrees.min_free_bytes)",
+            base.display(),
+            crate::disk_headroom::format_gibibytes(free),
+            crate::disk_headroom::format_gibibytes(min_free_bytes)
+        )),
+        _ => None,
+    }
+}
+
+fn path_is_inside_repository(main_root: &Path, path: &Path) -> bool {
+    let repository = main_root
+        .canonicalize()
+        .unwrap_or_else(|_| main_root.to_path_buf());
+    let candidate = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    candidate.starts_with(repository)
+}
+
 impl Broker {
     pub fn open(path_inside_repo: &Path) -> Result<Self, BrokerOpError> {
         Self::open_with_graph_impact_provider(path_inside_repo, GraphStoreImpactProvider)
@@ -1289,217 +1459,74 @@ impl Broker {
     }
 
     pub fn worktree_root_plan(&self) -> Result<WorktreeRootPlan, BrokerOpError> {
-        let repository_key = self.repository_worktree_key()?;
-        let host_state_container = crate::host_state::default_host_state_dir()
-            .filter(|_| {
-                // Only the implicit platform default is withheld from ephemeral
-                // repositories; an explicitly named host state directory is a
-                // deliberate choice and is always honoured.
-                crate::host_state::host_state_dir_is_explicit()
-                    || !crate::host_state::path_is_ephemeral(&self.main_root)
-            })
-            .map(|base| base.join("worktrees"));
-        // The configured root is read only when nothing more specific was
-        // asked for. An invalid section must not stop a session from
-        // starting: it is ignored, and the reason is reported.
-        let mut preferred_unavailable_reason = None;
-        let configured_root =
-            match crate::worktree_location::WorktreeLocationConfig::load(&self.main_root) {
-                Ok(config) => {
-                    config.and_then(|config| config.root.clone().map(|root| (root, config)))
-                }
-                Err(error) => {
-                    preferred_unavailable_reason =
-                        Some(format!("[worktrees] configuration ignored: {error}"));
-                    None
-                }
-            };
-        let mut host_state_fallback_root = None;
-        let (preferred_root, preferred_source, root_container) =
-            if let Some(root) = &self.worktree_root_override {
-                (
-                    Some(self.absolute_worktree_root(root)),
-                    Some(WorktreeRootSource::LibraryOverride),
-                    None,
-                )
-            } else if let Some(base) =
-                std::env::var_os("AETHYME_WORKTREE_ROOT").filter(|value| !value.is_empty())
-            {
-                let container = self.absolute_worktree_root(&PathBuf::from(base));
-                (
-                    Some(container.join(&repository_key)),
-                    Some(WorktreeRootSource::EnvironmentOverride),
-                    Some(container),
-                )
-            } else if let Some((container, settings)) = configured_root {
-                host_state_fallback_root = host_state_container
-                    .as_ref()
-                    .map(|container| container.join(&repository_key));
-                preferred_unavailable_reason =
-                    self.configured_root_unavailable(&container, settings.min_free_bytes());
-                (
-                    Some(container.join(&repository_key)),
-                    Some(WorktreeRootSource::RepositoryConfig),
-                    Some(container),
-                )
-            } else if let Some(container) = host_state_container {
-                (
-                    Some(container.join(&repository_key)),
-                    Some(WorktreeRootSource::HostState),
-                    Some(container),
-                )
-            } else {
-                (None, None, None)
-            };
-        let preferred_outside_repository = preferred_root
-            .as_deref()
-            .is_some_and(|root| !self.path_is_inside_repository(root));
-        Ok(WorktreeRootPlan {
-            schema_version: WORKTREE_ROOT_SCHEMA_VERSION,
-            repository_root: self.main_root.clone(),
-            repository_key,
-            preferred_root,
-            preferred_source,
-            root_container,
-            legacy_fallback_root: self.legacy_broker_worktree_root(),
-            preferred_outside_repository,
-            host_state_fallback_root,
-            preferred_unavailable_reason,
-        })
-    }
-
-    /// Why the configured worktree root cannot take a new session now.
-    ///
-    /// The base itself is never created -- only the per-repository directory
-    /// beneath it -- so an unplugged drive is reported, not replaced by an
-    /// empty directory on the startup disk.
-    pub(super) fn configured_root_unavailable(
-        &self,
-        base: &Path,
-        min_free_bytes: u64,
-    ) -> Option<String> {
-        if let Some(reason) = crate::worktree_location::base_unavailable_reason(base) {
-            return Some(reason);
-        }
-        if self.path_is_inside_repository(base) {
-            return Some(format!(
-                "{} resolves inside repository {}",
-                base.display(),
-                self.main_root.display()
-            ));
-        }
-        match crate::disk_headroom::available_bytes_for(&self.main_root, base) {
-            Some(free) if free < min_free_bytes => Some(format!(
-                "{} has {} free, below the {} required (worktrees.min_free_bytes)",
-                base.display(),
-                crate::disk_headroom::format_gibibytes(free),
-                crate::disk_headroom::format_gibibytes(min_free_bytes)
-            )),
-            _ => None,
-        }
+        let git_common_dir = self.main_git_common_dir()?;
+        Ok(plan_worktree_root_for(
+            &self.main_root,
+            Some(&git_common_dir),
+            self.worktree_root_override.as_deref(),
+        ))
     }
 
     pub(super) fn prepare_broker_worktree_root(&self) -> Result<WorktreePlacement, BrokerOpError> {
         let plan = self.worktree_root_plan()?;
-        if plan.preferred_source == Some(WorktreeRootSource::RepositoryConfig)
-            && let Some(root) = &plan.preferred_root
+        let candidates = worktree_root_candidates_for(&plan);
+        let strict_override = matches!(
+            plan.preferred_source,
+            Some(WorktreeRootSource::EnvironmentOverride | WorktreeRootSource::LibraryOverride)
+        );
+        let mut fallback_reason = if plan.preferred_source
+            == Some(WorktreeRootSource::RepositoryConfig)
+            && let Some(reason) = &plan.preferred_unavailable_reason
         {
-            let reason = match &plan.preferred_unavailable_reason {
-                Some(reason) => reason.clone(),
-                None => {
-                    match self.prepare_worktree_root(
-                        root,
-                        WorktreeRootSource::RepositoryConfig,
-                        true,
-                    ) {
-                        Ok(root) => {
-                            return Ok(WorktreePlacement {
-                                root,
-                                source: WorktreeRootSource::RepositoryConfig,
-                                outside_repository: true,
-                                fallback_reason: None,
-                            });
-                        }
-                        Err(error) => error.to_string(),
-                    }
-                }
-            };
-            let reason = format!("configured worktree root is unavailable: {reason}");
-            if let Some(fallback) = &plan.host_state_fallback_root
-                && let Ok(root) =
-                    self.prepare_worktree_root(fallback, WorktreeRootSource::HostState, true)
-            {
-                return Ok(WorktreePlacement {
-                    root,
-                    source: WorktreeRootSource::HostState,
-                    outside_repository: true,
-                    fallback_reason: Some(reason),
-                });
-            }
-            let root = self.prepare_worktree_root(
-                &plan.legacy_fallback_root,
-                WorktreeRootSource::RepositoryFallback,
-                false,
-            )?;
-            return Ok(WorktreePlacement {
-                root,
-                source: WorktreeRootSource::RepositoryFallback,
-                outside_repository: false,
-                fallback_reason: Some(reason),
-            });
-        }
-        if let (Some(root), Some(source)) = (&plan.preferred_root, plan.preferred_source) {
-            match self.prepare_worktree_root(root, source, true) {
+            Some(format!("configured worktree root is unavailable: {reason}"))
+        } else if plan.preferred_source.is_none() {
+            Some(
+                "no per-user host-state directory is available; set AETHYME_WORKTREE_ROOT to a writable external base"
+                    .into(),
+            )
+        } else {
+            plan.preferred_unavailable_reason.clone()
+        };
+        let mut last_error = None;
+        for (path, source) in candidates {
+            match self.prepare_worktree_root(
+                &path,
+                source,
+                source != WorktreeRootSource::RepositoryFallback,
+            ) {
                 Ok(root) => {
                     return Ok(WorktreePlacement {
                         root,
                         source,
-                        outside_repository: true,
-                        // Set only when an invalid `[worktrees]` section was
-                        // ignored in favour of this default.
-                        fallback_reason: plan.preferred_unavailable_reason.clone(),
+                        outside_repository: source != WorktreeRootSource::RepositoryFallback,
+                        fallback_reason,
                     });
                 }
-                Err(error)
-                    if matches!(
-                        source,
-                        WorktreeRootSource::EnvironmentOverride
-                            | WorktreeRootSource::LibraryOverride
-                    ) =>
-                {
-                    return Err(error);
-                }
+                Err(error) if strict_override => return Err(error),
                 Err(error) => {
-                    let fallback_reason = error.to_string();
-                    let root = self.prepare_worktree_root(
-                        &plan.legacy_fallback_root,
-                        WorktreeRootSource::RepositoryFallback,
-                        false,
-                    )?;
-                    return Ok(WorktreePlacement {
-                        root,
-                        source: WorktreeRootSource::RepositoryFallback,
-                        outside_repository: false,
-                        fallback_reason: Some(fallback_reason),
-                    });
+                    let reason = match source {
+                        WorktreeRootSource::RepositoryConfig => {
+                            format!("configured worktree root is unavailable: {error}")
+                        }
+                        WorktreeRootSource::HostState
+                            if plan.preferred_source
+                                == Some(WorktreeRootSource::RepositoryConfig) =>
+                        {
+                            fallback_reason.unwrap_or_else(|| error.to_string())
+                        }
+                        _ => error.to_string(),
+                    };
+                    fallback_reason = Some(reason);
+                    last_error = Some(error);
                 }
             }
         }
-
-        let root = self.prepare_worktree_root(
-            &plan.legacy_fallback_root,
-            WorktreeRootSource::RepositoryFallback,
-            false,
-        )?;
-        Ok(WorktreePlacement {
-            root,
-            source: WorktreeRootSource::RepositoryFallback,
-            outside_repository: false,
-            fallback_reason: Some(
-                "no per-user host-state directory is available; set AETHYME_WORKTREE_ROOT to a writable external base"
-                    .into(),
-            ),
-        })
+        Err(
+            last_error.unwrap_or_else(|| BrokerOpError::WorktreeRootUnavailable {
+                path: plan.legacy_fallback_root,
+                reason: "no worktree-root candidates are available".into(),
+            }),
+        )
     }
 
     pub(super) fn prepare_worktree_root(
@@ -1905,5 +1932,90 @@ impl Broker {
             }
         }
         format!("{base}-{}", now_ms())
+    }
+}
+
+#[cfg(test)]
+mod worktree_root_candidate_tests {
+    use super::*;
+
+    fn plan(source: WorktreeRootSource, unavailable: Option<&str>) -> WorktreeRootPlan {
+        WorktreeRootPlan {
+            schema_version: WORKTREE_ROOT_SCHEMA_VERSION,
+            repository_root: PathBuf::from("/repo"),
+            repository_key: "repo-key".into(),
+            preferred_root: Some(PathBuf::from("/external/repo-key")),
+            preferred_source: Some(source),
+            root_container: None,
+            legacy_fallback_root: PathBuf::from("/repo/.aethyme/worktrees"),
+            preferred_outside_repository: true,
+            host_state_fallback_root: Some(PathBuf::from("/host/worktrees/repo-key")),
+            preferred_unavailable_reason: unavailable.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn configured_and_host_state_roots_follow_the_session_fallback_order() {
+        let configured = plan(WorktreeRootSource::RepositoryConfig, None);
+        assert_eq!(
+            worktree_root_candidates_for(&configured),
+            vec![
+                (
+                    PathBuf::from("/external/repo-key"),
+                    WorktreeRootSource::RepositoryConfig,
+                ),
+                (
+                    PathBuf::from("/host/worktrees/repo-key"),
+                    WorktreeRootSource::HostState,
+                ),
+                (
+                    PathBuf::from("/repo/.aethyme/worktrees"),
+                    WorktreeRootSource::RepositoryFallback,
+                ),
+            ]
+        );
+
+        let unavailable = plan(WorktreeRootSource::RepositoryConfig, Some("low space"));
+        assert_eq!(
+            worktree_root_candidates_for(&unavailable),
+            vec![
+                (
+                    PathBuf::from("/host/worktrees/repo-key"),
+                    WorktreeRootSource::HostState,
+                ),
+                (
+                    PathBuf::from("/repo/.aethyme/worktrees"),
+                    WorktreeRootSource::RepositoryFallback,
+                ),
+            ]
+        );
+
+        let host = plan(WorktreeRootSource::HostState, None);
+        assert_eq!(
+            worktree_root_candidates_for(&host),
+            vec![
+                (
+                    PathBuf::from("/external/repo-key"),
+                    WorktreeRootSource::HostState,
+                ),
+                (
+                    PathBuf::from("/repo/.aethyme/worktrees"),
+                    WorktreeRootSource::RepositoryFallback,
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn explicit_roots_never_receive_an_implicit_fallback() {
+        for source in [
+            WorktreeRootSource::EnvironmentOverride,
+            WorktreeRootSource::LibraryOverride,
+        ] {
+            assert_eq!(
+                worktree_root_candidates_for(&plan(source, None)),
+                vec![(PathBuf::from("/external/repo-key"), source)]
+            );
+        }
     }
 }

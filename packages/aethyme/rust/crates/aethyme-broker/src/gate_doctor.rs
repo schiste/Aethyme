@@ -29,6 +29,7 @@ pub enum GateDiagnosticId {
     InconsistentFailureClassification,
     DuplicateGate,
     NestedVerificationSlot,
+    VerificationSlotUnavailable,
     ProbeMutatesTracked,
     ProbeCreatesUntracked,
     ProbeCreatesIgnored,
@@ -174,6 +175,20 @@ fn finding(
 fn nested_verification_slot_finding(
     placement: &crate::verification::SlotPlacement,
 ) -> Option<GateDiagnostic> {
+    if let Some(refusal) = &placement.blocking_refusal {
+        return Some(finding(
+            GateDiagnosticId::VerificationSlotUnavailable,
+            None,
+            GateDiagnosticSeverity::Warning,
+            GateDiagnosticConfidence::High,
+            "verification slot storage is unavailable",
+            vec![format!(
+                "the explicit verification location {} was refused: {refusal}",
+                placement.directory.display()
+            )],
+            "Restore the configured external worktree location or change its explicit setting; verification will not silently move its slot to another volume.",
+        ));
+    }
     if !placement.inside_repository {
         return None;
     }
@@ -520,9 +535,8 @@ pub fn inspect_gate_quality(repo: &crate::GitRepo) -> Result<GateDoctorReport, G
             )),
         }
 
-        // Planning creates the directory it selects, which is the directory a
-        // slot would use anyway, so asking costs nothing a gate run would not
-        // have already spent.
+        // Placement planning is read-only: doctor can report where a slot
+        // would land without creating a directory or touching a volume.
         let placement = crate::verification::plan_slot_placement(&root, "merge-sim");
         findings.extend(nested_verification_slot_finding(&placement));
     }
@@ -1695,6 +1709,7 @@ end = 55999
             inside_repository,
             preferred: preferred.map(Into::into),
             refusals: refusals.iter().map(|refusal| (*refusal).into()).collect(),
+            blocking_refusal: None,
         }
     }
 
@@ -1749,5 +1764,24 @@ end = 55999
             "{evidence}"
         );
         assert!(found.remediation.contains("AETHYME_HOST_STATE_DIR"));
+    }
+
+    #[test]
+    fn an_unavailable_explicit_slot_root_is_reported_without_fallback() {
+        let mut placement = placement(
+            "/Volumes/External/run/merge-sim",
+            false,
+            Some("/Volumes/External/run/merge-sim"),
+            &["volume /Volumes/External is not mounted"],
+        );
+        placement.blocking_refusal = Some("volume /Volumes/External is not mounted".into());
+
+        let found = nested_verification_slot_finding(&placement)
+            .expect("the blocked explicit root is reported");
+
+        assert_eq!(found.id, GateDiagnosticId::VerificationSlotUnavailable);
+        assert_eq!(found.severity, GateDiagnosticSeverity::Warning);
+        assert!(found.evidence[0].contains("/Volumes/External/run/merge-sim"));
+        assert!(found.evidence[0].contains("is not mounted"));
     }
 }
