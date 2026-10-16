@@ -1,0 +1,11 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.11s
+     Running unittests src/lib.rs (target/debug/deps/aethyme_broker-0f278e0d02146111)
+
+running 4 tests
+test collaboration_gc::tests::identity_corrupt_manifest_is_charged_and_stops_discovery ... ok
+test collaboration_gc::tests::identity_native_root_query_streams_before_the_collector_limit ... ok
+test collaboration_gc::tests::identity_root_discovery_budget_is_shared_and_stops_enumeration ... ok
+test collaboration_gc::tests::identity_snapshot_manifest_budget_is_cumulative_and_precedes_parsing ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 1912 filtered out; finished in 1.20s
+

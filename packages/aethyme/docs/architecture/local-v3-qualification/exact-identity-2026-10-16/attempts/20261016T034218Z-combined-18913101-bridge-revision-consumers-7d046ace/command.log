@@ -1,0 +1,113 @@
+   Compiling aethyme-engine v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/complete-exact-immutable-contribution-co/packages/aethyme/rust/crates/aethyme-engine)
+   Compiling aethyme-broker v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/complete-exact-immutable-contribution-co/packages/aethyme/rust/crates/aethyme-broker)
+error[E0432]: unresolved import `aethyme_contracts::experimental_v0::Brief`
+ --> crates/aethyme-broker/src/local_exchange/revision_tests.rs:3:5
+  |
+3 |     Brief, BriefReference, ContributionRevision, EntryKind, ProjectDescriptor, SourceEntry,
+  |     ^^^^^ no `Brief` in `experimental_v0`
+  |
+  = help: consider importing this variant instead:
+          crate::collaboration_identity_store::IdentityStoreError::Brief
+help: a similar name exists in the module
+  |
+3 -     Brief, BriefReference, ContributionRevision, EntryKind, ProjectDescriptor, SourceEntry,
+3 +     brief, BriefReference, ContributionRevision, EntryKind, ProjectDescriptor, SourceEntry,
+  |
+
+error[E0432]: unresolved import `aethyme_contracts::experimental_v0::Brief`
+   --> crates/aethyme-broker/src/local_target/revision.rs:536:9
+    |
+536 |         Brief, BriefReference, EntryKind, ProjectDescriptor, SourceEntry, SourceSnapshot,
+    |         ^^^^^ no `Brief` in `experimental_v0`
+    |
+    = help: consider importing this variant instead:
+            crate::collaboration_identity_store::IdentityStoreError::Brief
+help: a similar name exists in the module
+    |
+536 -         Brief, BriefReference, EntryKind, ProjectDescriptor, SourceEntry, SourceSnapshot,
+536 +         brief, BriefReference, EntryKind, ProjectDescriptor, SourceEntry, SourceSnapshot,
+    |
+
+error[E0432]: unresolved import `aethyme_contracts::experimental_v0::Brief`
+ --> crates/aethyme-broker/src/local_target/revision_tests.rs:7:5
+  |
+7 | use aethyme_contracts::experimental_v0::Brief;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ no `Brief` in `experimental_v0`
+  |
+help: a similar name exists in the module
+  |
+7 - use aethyme_contracts::experimental_v0::Brief;
+7 + use aethyme_contracts::experimental_v0::brief;
+  |
+help: consider importing this variant instead
+  |
+7 - use aethyme_contracts::experimental_v0::Brief;
+7 + use crate::collaboration_identity_store::IdentityStoreError::Brief;
+  |
+
+warning: unused import: `SourceSnapshot`
+  --> crates/aethyme-broker/src/local_exchange/manager/revision_tests.rs:16:77
+   |
+16 |     BriefReference, ContributionId, ContributionRevision, Record, RecordId, SourceSnapshot,
+   |                                                                             ^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+error[E0308]: mismatched types
+   --> crates/aethyme-broker/src/local_exchange/manager/revision_tests.rs:140:17
+    |
+140 |                 identity,
+    |                 ^^^^^^^^ expected `String`, found `RecordId`
+    |
+help: try using a conversion method
+    |
+140 |                 identity: identity.to_string(),
+    |                 +++++++++         ++++++++++++
+
+error[E0308]: mismatched types
+    --> crates/aethyme-broker/src/local_exchange/revision_tests.rs:197:59
+     |
+ 197 |     let value: serde_json::Value = serde_json::from_slice(record.canonical_bytes()).unwrap();
+     |                                    ---------------------- ^^^^^^^^^^^^^^^^^^^^^^^^ expected `&[u8]`, found `Vec<u8>`
+     |                                    |
+     |                                    arguments to this function are incorrect
+     |
+     = note: expected reference `&[u8]`
+                   found struct `Vec<u8>`
+note: function defined here
+    --> /Users/christophehenner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde_json-1.0.151/src/de.rs:2667:8
+     |
+2667 | pub fn from_slice<'a, T>(v: &'a [u8]) -> Result<T>
+     |        ^^^^^^^^^^
+help: consider borrowing here
+     |
+ 197 |     let value: serde_json::Value = serde_json::from_slice(&record.canonical_bytes()).unwrap();
+     |                                                           +
+
+error[E0502]: cannot borrow `receiver` as mutable because it is also borrowed as immutable
+   --> crates/aethyme-broker/src/local_exchange/manager/revision_tests.rs:157:26
+    |
+157 |       let parent_capture = receiver
+    |  __________________________^
+158 | |         .capture_operation(
+    | |          ----------------- immutable borrow later used by call
+159 | |             "parent-revision",
+160 | |             &receiver.bootstrap_commit,
+    | |             -------------------------- immutable borrow occurs here
+161 | |             &parent_result,
+162 | |         )
+    | |_________^ mutable borrow occurs here
+
+error[E0502]: cannot borrow `fixture` as immutable because it is also borrowed as mutable
+   --> crates/aethyme-broker/src/local_target/revision.rs:640:66
+    |
+640 |         let first = propose_revision(&mut fixture.store, &owner, fixture.spec()).unwrap();
+    |                     ---------------- ------------------          ^^^^^^^ immutable borrow occurs here
+    |                     |                |
+    |                     |                mutable borrow occurs here
+    |                     mutable borrow later used by call
+
+Some errors have detailed explanations: E0308, E0432, E0502.
+For more information about an error, try `rustc --explain E0308`.
+warning: `aethyme-broker` (lib test) generated 1 warning
+error: could not compile `aethyme-broker` (lib test) due to 7 previous errors; 1 warning emitted

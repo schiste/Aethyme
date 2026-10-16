@@ -1,0 +1,10 @@
+    Checking libc v0.2.190
+    Checking serde_core v1.0.229
+    Checking thiserror v2.0.21
+    Checking memchr v2.8.0
+    Checking cpufeatures v0.2.17
+    Checking sha2 v0.10.9
+    Checking aethyme-contracts v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/complete-exact-immutable-contribution-co/packages/aethyme/rust/crates/aethyme-contracts)
+    Checking serde_json v1.0.151
+    Checking serde v1.0.229
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.68s
