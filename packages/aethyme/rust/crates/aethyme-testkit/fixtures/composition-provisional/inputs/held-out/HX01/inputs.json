@@ -1,0 +1,54 @@
+{
+  "schema": "aethyme.composition-inputs/provisional-v0",
+  "case": "HX01",
+  "trees": {
+    "t0": {
+      "accepted": true
+    }
+  },
+  "contributions": [
+    {
+      "id": "c1",
+      "base": "tree:t0"
+    },
+    {
+      "id": "c2",
+      "base": "tree:t0"
+    },
+    {
+      "id": "c3",
+      "base": "tree:t0"
+    }
+  ],
+  "scenarios": [
+    {
+      "id": "s1",
+      "baseline": "t0",
+      "request": {
+        "compose": [
+          "c1",
+          "c2",
+          "c3"
+        ]
+      },
+      "orders": [
+        [
+          "c1",
+          "c2",
+          "c3"
+        ],
+        [
+          "c3",
+          "c2",
+          "c1"
+        ],
+        [
+          "c2",
+          "c3",
+          "c1"
+        ]
+      ],
+      "commutative": true
+    }
+  ]
+}

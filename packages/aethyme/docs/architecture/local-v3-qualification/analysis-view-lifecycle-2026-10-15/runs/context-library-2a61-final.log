@@ -1,0 +1,45 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.76s
+     Running unittests src/lib.rs (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/integrate-reviewed-local-bare-git-servic/target/local-resume/cargo/debug/deps/aethyme_broker-0f278e0d02146111)
+
+running 38 tests
+test collaboration_context::tests::a_path_outside_the_json_profile_is_carried_as_hex ... ok
+test collaboration_context::tests::a_different_source_never_hits ... ok
+test collaboration_context::tests::a_complete_scoped_bound_analysis_makes_an_empty_answer_evidence ... ok
+test collaboration_context::tests::a_release_purges_cached_answers_carrying_the_contribution ... ok
+test collaboration_context::tests::a_cached_answer_reports_its_compute_generation ... ok
+test collaboration_context::tests::a_racing_rebrief_never_wedges_or_mixes_briefs ... ok
+test collaboration_context::tests::a_row_is_served_only_to_the_reader_it_was_computed_for ... ok
+test collaboration_context::tests::an_answer_that_raced_a_change_is_not_stored ... ok
+test collaboration_context::tests::an_impact_between_retained_snapshots_is_scoped_by_its_change ... ok
+test collaboration_context::tests::a_result_explains_each_match_and_is_a_valid_record ... ok
+test collaboration_context::tests::a_change_between_read_and_store_prevents_the_store ... ok
+test collaboration_context::tests::a_broad_change_invalidates_every_answer_and_is_reported ... ok
+test collaboration_context::tests::a_hostile_brief_is_data_and_changes_nothing_else ... ok
+test collaboration_context::tests::an_index_from_another_format_is_rebuilt_and_the_cache_dropped ... ok
+test collaboration_context::tests::an_unreadable_cache_row_is_recomputed_not_served ... ok
+test collaboration_context::tests::an_answer_with_a_cut_dependency_set_is_partial_and_refetched ... ok
+test collaboration_context::tests::briefs_and_retention_are_part_of_the_cache_key ... ok
+test collaboration_context::tests::an_impact_edge_dependency_invalidates_the_answer ... ok
+test collaboration_context::tests::a_contribution_that_stops_being_live_mid_query_is_not_returned ... ok
+test collaboration_context::tests::oversized_requests_and_budgets_are_refused_never_exceeded ... ok
+test collaboration_context::tests::hidden_contributions_are_absent_and_an_epoch_change_invalidates ... ok
+test collaboration_context::tests::migrating_to_schema_6_rebuilds_the_index_with_broad_postings ... ok
+test collaboration_context::tests::requests_are_checked_before_anything_is_read ... ok
+test collaboration_context::tests::the_cache_format_is_part_of_the_key ... ok
+test collaboration_context::tests::reclaiming_an_analysis_snapshot_invalidates_a_complete_answer ... ok
+test collaboration_context::tests::same_millisecond_reader_revocations_distinguish_before_and_after_answers ... ok
+test collaboration_context::tests::restricted_data_is_never_served_from_the_cache ... ok
+test collaboration_context::tests::unchanged_legacy_revocation_updates_fence_new_reader_snapshots ... ok
+test collaboration_context::tests::the_least_recently_used_answers_are_evicted ... ok
+test collaboration_context::tests::released_and_unreadable_contributions_are_reported_not_hidden ... ok
+test collaboration_context::tests::relevant_changes_invalidate_exactly_the_affected_answers ... ok
+test collaboration_context::tests::the_byte_budget_drops_items_from_the_end ... ok
+test collaboration_context::tests::unreadable_contributions_are_keyed_and_shown_only_to_their_readers ... ok
+test collaboration_context::tests::a_cached_answer_is_always_what_a_fresh_query_returns ... ok
+test collaboration_context::tests::without_analysis_a_cached_empty_answer_is_still_not_evidence ... ok
+test collaboration_context::tests::only_relevant_changes_invalidate_a_scoped_result ... ok
+test collaboration_context::tests::an_unrelated_storm_keeps_the_cached_answer_and_a_relevant_capture_replaces_it ... ok
+test collaboration_context::tests::work_per_query_is_bounded_and_reported ... ok
+
+test result: ok. 38 passed; 0 failed; 0 ignored; 0 measured; 1782 filtered out; finished in 22.61s
+

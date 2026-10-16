@@ -1,0 +1,156 @@
+{
+  "captured_at_utc": "2026-10-15T08:38:05.741335+00:00",
+  "files": [
+    {
+      "path": "packages/aethyme-eval/fx17/proposal-manifest.json",
+      "sha256": "b3846f2fcca9bc8fb3bbcad26c0adedbc96fba723eddbbb174a9f3545ba11abc",
+      "size_bytes": 3061
+    },
+    {
+      "path": "packages/aethyme-eval/fx17/public-contract.md",
+      "sha256": "81d22e805fe6fa48424b1c83fe3bf54d1c9d0e76e5bb14d9cc8c20e84f3be13a",
+      "size_bytes": 1540
+    },
+    {
+      "path": "packages/aethyme-eval/fx17/proxy.sh",
+      "sha256": "eae502e3245a6cb750d64828063e793732cfa3a8481f8ff6753dcacad63ee2ff",
+      "size_bytes": 3097
+    },
+    {
+      "path": "packages/aethyme-eval/fx17/oracle/baseline-cases.json",
+      "sha256": "bfbec841810ac9269b34c628969a4c8207809b70716753d979750ecedb605a06",
+      "size_bytes": 8748
+    },
+    {
+      "path": "packages/aethyme-eval/fx17/oracle/source-review.json",
+      "sha256": "de7d56d9cc37f68787540e298bd49577c3fdf83b51544e3113aed4928eebb74e",
+      "size_bytes": 1862
+    },
+    {
+      "path": "packages/aethyme-eval/fx17/oracle/provenance.json",
+      "sha256": "6c6205982af3a7fc20d3e62134e4b30d9ad5ee7b3bb8f424a005a3296083829f",
+      "size_bytes": 1772
+    },
+    {
+      "path": "packages/aethyme-eval/fx17/oracle/baseline65-proxy-transcript.txt",
+      "sha256": "db545a7b7e8f18a9dbeb6931dc327f99a6e8d074d039d08d60dfc57ff208d8bb",
+      "size_bytes": 4363
+    },
+    {
+      "path": "packages/aethyme/rust/crates/aethyme-broker/src/local_controller/fx17_tests.rs",
+      "sha256": "dbcd973bb3f35d9320d180a2ef7e24497de5b1b399f0e5396fc954fcded94fc5",
+      "size_bytes": 56109
+    },
+    {
+      "path": "packages/aethyme/rust/crates/aethyme-broker/src/local_controller/drive_tests.rs",
+      "sha256": "93459548beae3d319574ca4edda2af9e8af836187842f5739c8fa6bbc1306248",
+      "size_bytes": 49059
+    },
+    {
+      "path": "packages/aethyme-eval/fx17/controlled/01-app.sh",
+      "sha256": "77a255e12c57d5c447c56044a59f83843f64bf2a9c4053be2dfc39aa321cdf87",
+      "size_bytes": 484
+    },
+    {
+      "path": "packages/aethyme-eval/fx17/controlled/02-app.sh",
+      "sha256": "10712e4e358e4e10916d609d9509e89c52deaa81335efbcf9ab362a2d6b068bd",
+      "size_bytes": 484
+    },
+    {
+      "path": "packages/aethyme-eval/fx17/controlled/03-app.sh",
+      "sha256": "8e74928631fcf2364aeb0ac9ecb893ef634f50b6ba51f1c13e8d55a228b89b8d",
+      "size_bytes": 484
+    },
+    {
+      "path": "packages/aethyme-eval/fx17/controlled/04-app.sh",
+      "sha256": "cd54309ecf39b470ab3811f28fc235ddc1f755a656efe4273d3b436820124589",
+      "size_bytes": 484
+    },
+    {
+      "path": "packages/aethyme-eval/fx17/controlled/05-app.sh",
+      "sha256": "caf1c63f46eb4de212e16aa38974d9f99b6dede6d7a42f5c4906795e78b3a359",
+      "size_bytes": 484
+    },
+    {
+      "path": "packages/aethyme-eval/fx17/controlled/06-app.sh",
+      "sha256": "308c779315a920d97bbe21a35ec6682b02b604187356f0908bcd0855a3348673",
+      "size_bytes": 487
+    },
+    {
+      "path": "packages/aethyme-eval/fx17/controlled/07-app.sh",
+      "sha256": "e83f2f1bae290315d22f0b3425b6ed21ceb0b0ad06567561fd6bcef51b5af77c",
+      "size_bytes": 487
+    },
+    {
+      "path": "packages/aethyme-eval/fx17/controlled/08-app.sh",
+      "sha256": "7321aff21b3962500fbe21df2ab5dcaad91bcafe27f86a6d71e157368dfbbe35",
+      "size_bytes": 487
+    },
+    {
+      "path": "packages/aethyme-eval/fx17/controlled/09-app.sh",
+      "sha256": "73bdaa929501cf2e8e99bab8e6fba984e6acee5cd8c8c1bee5f2ec017934d703",
+      "size_bytes": 487
+    },
+    {
+      "path": "packages/aethyme-eval/fx17/controlled/10-app.sh",
+      "sha256": "711893d70c529370b1cdd27fa6d0a9a2d99eafff2461fd3370a6449a0f0e5ace",
+      "size_bytes": 487
+    },
+    {
+      "path": "packages/aethyme-eval/fx17/controlled/11-app.sh",
+      "sha256": "7ade4369b403f06064192b7c481b42bb735a942441bc1b9df918ddb77087a609",
+      "size_bytes": 487
+    },
+    {
+      "path": "packages/aethyme-eval/fx17/controlled/12-app.sh",
+      "sha256": "9e36e9b481fe2a07be230ab8462973403d5f8228a46ca27f303e0d47e00782c0",
+      "size_bytes": 466
+    },
+    {
+      "path": "packages/aethyme-eval/fx17/controlled/13-app.sh",
+      "sha256": "9a9f13c8b86ca4b44468ee367c3d07350b00e97553bbb0a071ca99b22103f6af",
+      "size_bytes": 466
+    },
+    {
+      "path": "packages/aethyme-eval/fx17/controlled/14-app.sh",
+      "sha256": "49dbb3efcb71dd5bcc5884c54e9459d948c0a522107ca97d944a910a531749a1",
+      "size_bytes": 466
+    },
+    {
+      "path": "packages/aethyme-eval/fx17/controlled/15-app.sh",
+      "sha256": "0489118eabf5f759f7b417408bc9bd357938c9c1e7c93c779407343f0c050bb5",
+      "size_bytes": 466
+    },
+    {
+      "path": "packages/aethyme-eval/fx17/controlled/16-app.sh",
+      "sha256": "2171c547b4141eaef0e9419014cb40cbe42ac54af8e59bbd66470c11e939252e",
+      "size_bytes": 466
+    },
+    {
+      "path": "packages/aethyme-eval/fx17/controlled/17-app.sh",
+      "sha256": "946ed0d4fe38c76a3c5de4b36e008bad598b0d1faf238ec2df0369f3a884134c",
+      "size_bytes": 466
+    },
+    {
+      "path": "packages/aethyme-eval/fx17/controlled/18-app.sh",
+      "sha256": "f249c2f6f566c8511820b34e7a4946d931d8e158b2e10471cc02fb6037fa0ddb",
+      "size_bytes": 469
+    },
+    {
+      "path": "packages/aethyme-eval/fx17/controlled/19-app.sh",
+      "sha256": "126d1c2d30e73891fae54807c578e1351f38f7404ffe36a11e6d2f9b4c2edce8",
+      "size_bytes": 469
+    },
+    {
+      "path": "packages/aethyme-eval/fx17/controlled/20-app.sh",
+      "sha256": "6652e32ebd52cae516797435faf67ed37b79ba25787323178bc6d369755575a0",
+      "size_bytes": 469
+    }
+  ],
+  "frozen_state_count": 21,
+  "scheduled_actual_changes": 20,
+  "source_head": "c45d4096f9d0238b800ccadbeb07f9b93ae30a3e",
+  "source_status_porcelain": "",
+  "source_tree": "874654af26ac7fd9bbaa9bedbc7a04fa8a834e40",
+  "verifier_vectors_per_change": 65
+}

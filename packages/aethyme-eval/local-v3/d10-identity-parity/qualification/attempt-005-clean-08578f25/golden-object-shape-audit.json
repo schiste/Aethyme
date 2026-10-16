@@ -1,0 +1,37 @@
+{
+  "checkpoint_run": "08578f25cf0cdba0dbd524b8c811cb90c7759148",
+  "expected_json_sha256": {
+    "vectors/contribution-revision-bound/expected.json": "335a8c93721d8fc29f09cbdeff2637a7eb000b4db90e17b0d13fef0e2155c0d2",
+    "vectors/explicit-rename/expected.json": "ed8c5a28aa017e40661b965622001ddd23427f1e545203cefe8b8bccb5edd9b3",
+    "vectors/ordinal-supplement/expected.json": "67b9586320e91de0a5d3deda44ff03ee51f099846dc93597f46155f7e811711b",
+    "vectors/prior-v1-invalid/expected.json": "08b1d82960efa01461b4d1cdbf19d9da36a8a89bf2ed46e5918501ae3af78998",
+    "vectors/prior-v2-partially-invalid/expected.json": "62fbfa515b01804ac409fd591368b30b62b364d269ab1422015e9121a3093048"
+  },
+  "mismatch": {
+    "actual_adapter_value_keys": [
+      "file_id",
+      "ordinal",
+      "preimage_hex"
+    ],
+    "correction": "canonical-compare the exact computed triple, assert raw_path_hex equals the actual result path, and assert expected relation equals the actual transition change after that path",
+    "fixture_changed": false,
+    "frozen_expected_entry_keys": [
+      "file_id",
+      "ordinal",
+      "preimage_hex",
+      "raw_path_hex",
+      "relation"
+    ],
+    "path_hex": "612d73706c69742e7273"
+  },
+  "no_vectors_or_oracles_modified": true,
+  "other_comparisons": {
+    "all_prior_actual_vs_frozen_canonical_object_comparisons_passed_before_this_failure": true,
+    "mixed_transition_canonical_object_comparison_preceded_the_failure": true,
+    "no_later_actual_vs_frozen_canonical_object_comparisons_after_this_loop": true,
+    "remaining_post-loop_checks_compare_operation_permutation_and_file_count": true
+  },
+  "runner_sha256_after_correction": "c11920cf41ebd4e4e39e83e21e326bc6aa7e39d5b11eb7ecfe44c1faf2128b6e",
+  "runner_sha256_before_correction": "4b541b0b27f8a93d5f1e26db1c257d7ffb04cb718a66d02f73b0850b4f804fcc",
+  "schema": "aethyme.d10-frozen-golden-object-shape-audit/v1"
+}

@@ -1,0 +1,11 @@
+--- a/packages/aethyme/rust/crates/aethyme-broker/src/collaboration_capture.rs
++++ b/packages/aethyme/rust/crates/aethyme-broker/src/collaboration_capture.rs
+@@ -188,7 +188,7 @@
+     fn digest(&self) -> String {
+         let canonical = format!(
+             "aethyme capture request v0\0{}\0{}\0{}\0{}",
+-            self.base.as_str(),
++            "T04-omitted-base",
+             self.result.as_str(),
+             self.policy.as_str(),
+             self.retention.describe()

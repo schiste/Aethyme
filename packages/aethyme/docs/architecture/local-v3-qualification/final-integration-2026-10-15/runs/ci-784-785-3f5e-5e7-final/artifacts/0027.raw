@@ -1,0 +1,571 @@
+Windows x64 build and native smoke	Set up job	﻿2026-10-15T22:12:48.2395273Z Current runner version: '2.337.0'
+Windows x64 build and native smoke	Set up job	2026-10-15T22:12:48.2457117Z ##[group]Runner Image Provisioner
+Windows x64 build and native smoke	Set up job	2026-10-15T22:12:48.2458171Z Hosted Compute Agent
+Windows x64 build and native smoke	Set up job	2026-10-15T22:12:48.2458801Z Version: 20261002.596
+Windows x64 build and native smoke	Set up job	2026-10-15T22:12:48.2459486Z Commit: c3d12f3313a95f25162a1503be624f3b0617f8c0
+Windows x64 build and native smoke	Set up job	2026-10-15T22:12:48.2460238Z Build Date: 2026-10-02T22:28:27Z
+Windows x64 build and native smoke	Set up job	2026-10-15T22:12:48.2460993Z Worker ID: {d1a79722-748e-4d04-ba2c-7821133c8d04}
+Windows x64 build and native smoke	Set up job	2026-10-15T22:12:48.2461794Z Region: centralus
+Windows x64 build and native smoke	Set up job	2026-10-15T22:12:48.2462329Z Cloud: Azure
+Windows x64 build and native smoke	Set up job	2026-10-15T22:12:48.2462875Z ##[endgroup]
+Windows x64 build and native smoke	Set up job	2026-10-15T22:12:48.2464865Z ##[group]Operating System
+Windows x64 build and native smoke	Set up job	2026-10-15T22:12:48.2465673Z Microsoft Windows Server 2025
+Windows x64 build and native smoke	Set up job	2026-10-15T22:12:48.2466460Z 10.0.26100
+Windows x64 build and native smoke	Set up job	2026-10-15T22:12:48.2467015Z Datacenter
+Windows x64 build and native smoke	Set up job	2026-10-15T22:12:48.2467524Z ##[endgroup]
+Windows x64 build and native smoke	Set up job	2026-10-15T22:12:48.2468175Z ##[group]Runner Image
+Windows x64 build and native smoke	Set up job	2026-10-15T22:12:48.2468858Z Image: windows-2025-vs2026
+Windows x64 build and native smoke	Set up job	2026-10-15T22:12:48.2469613Z Version: 20261007.264.1
+Windows x64 build and native smoke	Set up job	2026-10-15T22:12:48.2470892Z Included Software: https://github.com/actions/runner-images/blob/win25-vs2026/20261007.264/images/windows/Windows2025-VS2026-Readme.md
+Windows x64 build and native smoke	Set up job	2026-10-15T22:12:48.2473145Z Image Release: https://github.com/actions/runner-images/releases/tag/win25-vs2026%2F20261007.264
+Windows x64 build and native smoke	Set up job	2026-10-15T22:12:48.2474141Z ##[endgroup]
+Windows x64 build and native smoke	Set up job	2026-10-15T22:12:48.2475205Z ##[group]GITHUB_TOKEN Permissions
+Windows x64 build and native smoke	Set up job	2026-10-15T22:12:48.2478305Z Contents: read
+Windows x64 build and native smoke	Set up job	2026-10-15T22:12:48.2478971Z Metadata: read
+Windows x64 build and native smoke	Set up job	2026-10-15T22:12:48.2479548Z ##[endgroup]
+Windows x64 build and native smoke	Set up job	2026-10-15T22:12:48.2481961Z Secret source: Actions
+Windows x64 build and native smoke	Set up job	2026-10-15T22:12:48.2482946Z Cache mode: write
+Windows x64 build and native smoke	Set up job	2026-10-15T22:12:48.2483644Z Prepare workflow directory
+Windows x64 build and native smoke	Set up job	2026-10-15T22:12:48.2826772Z Prepare all required actions
+Windows x64 build and native smoke	Set up job	2026-10-15T22:12:48.2885509Z Getting action download info
+Windows x64 build and native smoke	Set up job	2026-10-15T22:12:48.5407406Z Download action repository 'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1' (SHA:3d3c42e5aac5ba805825da76410c181273ba90b1)
+Windows x64 build and native smoke	Set up job	2026-10-15T22:12:48.6433490Z Download action repository 'dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87' (SHA:6bed0761d98439e5a578e2877258200ad565ba87)
+Windows x64 build and native smoke	Set up job	2026-10-15T22:12:48.9551249Z Complete job name: Windows x64 build and native smoke
+Windows x64 build and native smoke	Checkout	﻿2026-10-15T22:12:49.0779015Z ##[group]Run actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:49.0780547Z with:
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:49.0781075Z   fetch-depth: 0
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:49.0781549Z   repository: schiste/Aethyme
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:49.0785158Z   token: ***
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:49.0785574Z   ssh-strict: true
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:49.0785965Z   ssh-user: git
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:49.0786408Z   persist-credentials: true
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:49.0786847Z   clean: true
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:49.0787255Z   sparse-checkout-cone-mode: true
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:49.0787858Z   fetch-tags: false
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:49.0788257Z   show-progress: true
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:49.0788749Z   lfs: false
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:49.0789176Z   submodules: false
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:49.0789589Z   set-safe-directory: true
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:49.0790100Z   allow-unsafe-pr-checkout: false
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:49.0791748Z ##[endgroup]
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:49.2218424Z Syncing repository: schiste/Aethyme
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:49.2220496Z ##[group]Getting Git version info
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:49.2221438Z Working directory is 'D:\a\Aethyme\Aethyme'
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:49.2940858Z [command]"C:\Program Files\Git\bin\git.exe" version
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:49.6661119Z git version 2.56.0.windows.2
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:49.6712385Z ##[endgroup]
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:49.6730298Z Temporarily overriding HOME='D:\a\_temp\bf0c50f3-3821-4b38-99b3-abbcaa41dee6' before making global git config changes
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:49.6739370Z Adding repository directory to the temporary git global config as a safe directory
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:49.6741421Z [command]"C:\Program Files\Git\bin\git.exe" config --global --add safe.directory D:\a\Aethyme\Aethyme
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:49.7415454Z Deleting the contents of 'D:\a\Aethyme\Aethyme'
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:49.7421087Z ##[group]Determining repository object format
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:49.7423630Z ##[endgroup]
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:49.7427362Z ##[group]Initializing the repository
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:49.7433433Z [command]"C:\Program Files\Git\bin\git.exe" init D:\a\Aethyme\Aethyme
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:49.8353013Z Initialized empty Git repository in D:/a/Aethyme/Aethyme/.git/
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:49.8406625Z [command]"C:\Program Files\Git\bin\git.exe" remote add origin https://github.com/schiste/Aethyme
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:49.9122678Z ##[endgroup]
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:49.9124859Z ##[group]Disabling automatic garbage collection
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:49.9130697Z [command]"C:\Program Files\Git\bin\git.exe" config --local gc.auto 0
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:49.9477017Z ##[endgroup]
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:49.9478598Z ##[group]Setting up auth
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:49.9479726Z Removing SSH command configuration
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:49.9485597Z [command]"C:\Program Files\Git\bin\git.exe" config --local --name-only --get-regexp core\.sshCommand
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:49.9830656Z [command]"C:\Program Files\Git\bin\git.exe" submodule foreach --recursive "sh -c \"git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :\""
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:51.5684887Z Removing HTTP extra header
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:51.5694558Z [command]"C:\Program Files\Git\bin\git.exe" config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:51.6051327Z [command]"C:\Program Files\Git\bin\git.exe" submodule foreach --recursive "sh -c \"git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :\""
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:52.1246437Z Removing includeIf entries pointing to credentials config files
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:52.1259844Z [command]"C:\Program Files\Git\bin\git.exe" config --local --name-only --get-regexp ^includeIf\.gitdir:
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:52.1592641Z [command]"C:\Program Files\Git\bin\git.exe" submodule foreach --recursive "git config --local --show-origin --name-only --get-regexp remote.origin.url"
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:52.6696138Z [command]"C:\Program Files\Git\bin\git.exe" config --file D:\a\_temp\git-credentials-6f15cf6c-1fd5-49e7-8881-ea32d08b4417.config http.https://github.com/.extraheader "AUTHORIZATION: basic ***"
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:52.7035895Z [command]"C:\Program Files\Git\bin\git.exe" config --local includeIf.gitdir:D:/a/Aethyme/Aethyme/.git.path D:\a\_temp\git-credentials-6f15cf6c-1fd5-49e7-8881-ea32d08b4417.config
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:52.7363037Z [command]"C:\Program Files\Git\bin\git.exe" config --local includeIf.gitdir:D:/a/Aethyme/Aethyme/.git/worktrees/*.path D:\a\_temp\git-credentials-6f15cf6c-1fd5-49e7-8881-ea32d08b4417.config
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:52.7751814Z [command]"C:\Program Files\Git\bin\git.exe" config --local includeIf.gitdir:/github/workspace/.git.path /github/runner_temp/git-credentials-6f15cf6c-1fd5-49e7-8881-ea32d08b4417.config
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:52.8105292Z [command]"C:\Program Files\Git\bin\git.exe" config --local includeIf.gitdir:/github/workspace/.git/worktrees/*.path /github/runner_temp/git-credentials-6f15cf6c-1fd5-49e7-8881-ea32d08b4417.config
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:52.8457391Z ##[endgroup]
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:52.8458102Z ##[group]Fetching the repository
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:52.8474928Z [command]"C:\Program Files\Git\bin\git.exe" -c protocol.version=2 fetch --no-tags --prune --no-recurse-submodules origin +refs/heads/*:refs/remotes/origin/* +refs/tags/*:refs/tags/* +c72d80af88e6957be50adb2b45dfd70051b5ab58:refs/remotes/pull/785/merge
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6850473Z From https://github.com/schiste/Aethyme
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6851674Z  * [new branch]        aethyme/delivery/q667-253fd5e0b72c       -> origin/aethyme/delivery/q667-253fd5e0b72c
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6852714Z  * [new branch]        aethyme/delivery/q689-b6318e5109ae       -> origin/aethyme/delivery/q689-b6318e5109ae
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6853755Z  * [new branch]        agent/650-e1-composition-feasibility-and-struc -> origin/agent/650-e1-composition-feasibility-and-struc
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6854678Z  * [new branch]        agent/652-l1-id-experimental-sourcesnapshotid -> origin/agent/652-l1-id-experimental-sourcesnapshotid
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6856974Z  * [new branch]        agent/653-l1-canonical-record-encoding-digest -> origin/agent/653-l1-canonical-record-encoding-digest
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6858030Z  * [new branch]        agent/654-l1-decision-brief-aethyme-brief-toke -> origin/agent/654-l1-decision-brief-aethyme-brief-toke
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6859019Z  * [new branch]        agent/655-l1-analysis-envelope-aq0-and-conserv -> origin/agent/655-l1-analysis-envelope-aq0-and-conserv
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6860016Z  * [new branch]        agent/656-l2-isolate-collaboration-state-root -> origin/agent/656-l2-isolate-collaboration-state-root
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6862348Z  * [new branch]        agent/657-l2-content-addressed-archive-of-exac -> origin/agent/657-l2-content-addressed-archive-of-exac
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6863268Z  * [new branch]        agent/658-l2-crash-safe-capture-intent-record -> origin/agent/658-l2-crash-safe-capture-intent-record
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6864112Z  * [new branch]        agent/659-l2-reference-safe-collaboration-gc -> origin/agent/659-l2-reference-safe-collaboration-gc
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6864929Z  * [new branch]        agent/660-l2-opt-in-capture-beside-legacy-subm -> origin/agent/660-l2-opt-in-capture-beside-legacy-subm
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6865746Z  * [new branch]        agent/661-fx08-matched-cold-start-brief-trials -> origin/agent/661-fx08-matched-cold-start-brief-trials
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6866616Z  * [new branch]        agent/661-l3-bounded-explainable-contribution -> origin/agent/661-l3-bounded-explainable-contribution
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6868582Z  * [new branch]        agent/662-l3-scoped-context-cache-invalidation -> origin/agent/662-l3-scoped-context-cache-invalidation
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6869679Z  * [new branch]        agent/666-complete-autonomous-appointed-local -> origin/agent/666-complete-autonomous-appointed-local
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6870573Z  * [new branch]        agent/680-complete-explicit-local-target-stop -> origin/agent/680-complete-explicit-local-target-stop
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6871594Z  * [new branch]        agent/680-l9-slice-1-opt-in-collaboration-comm -> origin/agent/680-l9-slice-1-opt-in-collaboration-comm
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6873614Z  * [new branch]        agent/682-complete-local-qualification-ledger -> origin/agent/682-complete-local-qualification-ledger
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6874534Z  * [new branch]        agent/682-qualify-bounded-native-capture-and-m -> origin/agent/682-qualify-bounded-native-capture-and-m
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6875557Z  * [new branch]        agent/682-reconcile-final-local-qualification -> origin/agent/682-reconcile-final-local-qualification
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6876590Z  * [new branch]        agent/684-x2-one-base-private-analysis-views-p -> origin/agent/684-x2-one-base-private-analysis-views-p
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6877507Z  * [new branch]        agent/692-local-v3-integrate-typed-verificatio -> origin/agent/692-local-v3-integrate-typed-verificatio
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6878521Z  * [new branch]        agent/add-a-complete-git-worktree-inventory-to -> origin/agent/add-a-complete-git-worktree-inventory-to
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6879564Z  * [new branch]        agent/add-actual-native-publication-outcomeunk -> origin/agent/add-actual-native-publication-outcomeunk
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6881389Z  * [new branch]        agent/add-audited-exact-path-operator-lease-ha -> origin/agent/add-audited-exact-path-operator-lease-ha
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6882230Z  * [new branch]        agent/add-broker-advanced-merge-chain-sequenti -> origin/agent/add-broker-advanced-merge-chain-sequenti
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6882996Z  * [new branch]        agent/add-broker-gc-reclaim-artifacts-and-a-lo -> origin/agent/add-broker-gc-reclaim-artifacts-and-a-lo
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6883753Z  * [new branch]        agent/add-read-only-repo-branches-audit-classi -> origin/agent/add-read-only-repo-branches-audit-classi
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6884537Z  * [new branch]        agent/address-aethyme-378-unify-broker-runtime -> origin/agent/address-aethyme-378-unify-broker-runtime
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6885538Z  * [new branch]        agent/address-aethyme-415-persist-bounded-acti -> origin/agent/address-aethyme-415-persist-bounded-acti
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6886564Z  * [new branch]        agent/address-aethyme-416-preserve-cleared-gat -> origin/agent/address-aethyme-416-preserve-cleared-gat
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6887357Z  * [new branch]        agent/admit-expensive-gates-by-host-load-inste -> origin/agent/admit-expensive-gates-by-host-load-inste
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6888189Z  * [new branch]        agent/advise-landing-a-shared-edit-first-when -> origin/agent/advise-landing-a-shared-edit-first-when
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6888914Z  * [new branch]        agent/allow-pr-close-reopen-without-ref-writes -> origin/agent/allow-pr-close-reopen-without-ref-writes
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6889668Z  * [new branch]        agent/audit-remediation-batch-1-security-escap -> origin/agent/audit-remediation-batch-1-security-escap
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6890439Z  * [new branch]        agent/audit-remediation-drop-vestigial-python -> origin/agent/audit-remediation-drop-vestigial-python
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6891204Z  * [new branch]        agent/automate-safe-finish-cleanup-for-landed -> origin/agent/automate-safe-finish-cleanup-for-landed
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6891952Z  * [new branch]        agent/backfill-provable-worktree-root-markers -> origin/agent/backfill-provable-worktree-root-markers
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6892795Z  * [new branch]        agent/batch-submit-s-per-commit-provenance-che -> origin/agent/batch-submit-s-per-commit-provenance-che
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6893547Z  * [new branch]        agent/bind-broker-sessions-to-their-holder-pro -> origin/agent/bind-broker-sessions-to-their-holder-pro
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6894306Z  * [new branch]        agent/bound-broker-status-latency-with-truthfu -> origin/agent/bound-broker-status-latency-with-truthfu
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6895064Z  * [new branch]        agent/bound-the-build-artifact-scan-on-health -> origin/agent/bound-the-build-artifact-scan-on-health
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6895811Z  * [new branch]        agent/bound-the-cleanup-eligibility-pass-on-do -> origin/agent/bound-the-cleanup-eligibility-pass-on-do
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6896627Z  * [new branch]        agent/bound-the-gc-sweep-on-broker-open  -> origin/agent/bound-the-gc-sweep-on-broker-open
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6897595Z  * [new branch]        agent/broker-pr-workflow-template-based-push-p -> origin/agent/broker-pr-workflow-template-based-push-p
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6898900Z  * [new branch]        agent/bump-noyalib-to-0-0-53-for-rustsec-2026 -> origin/agent/bump-noyalib-to-0-0-53-for-rustsec-2026
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6899719Z  * [new branch]        agent/cargo-test-gate-run-the-workspace-suite -> origin/agent/cargo-test-gate-run-the-workspace-suite
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6900386Z  * [new branch]        agent/cargo-test-no-fail-fast            -> origin/agent/cargo-test-no-fail-fast
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6901283Z  * [new branch]        agent/complete-286-paired-write-recovery-accep -> origin/agent/complete-286-paired-write-recovery-accep
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6902130Z  * [new branch]        agent/complete-393-follow-ups-protect-implicit -> origin/agent/complete-393-follow-ups-protect-implicit
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6902848Z  * [new branch]        agent/complete-670-l6-exact-input-materializat -> origin/agent/complete-670-l6-exact-input-materializat
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6903606Z  * [new branch]        agent/complete-671-l6-isolated-linux-superviso -> origin/agent/complete-671-l6-isolated-linux-superviso
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6904335Z  * [new branch]        agent/complete-672-local-independent-verifier -> origin/agent/complete-672-local-independent-verifier
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6905047Z  * [new branch]        agent/complete-673-local-verifier-host-resourc -> origin/agent/complete-673-local-verifier-host-resourc
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6905787Z  * [new branch]        agent/complete-674-local-exact-retained-candid -> origin/agent/complete-674-local-exact-retained-candid
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6906546Z  * [new branch]        agent/complete-675-local-configured-github-mer -> origin/agent/complete-675-local-configured-github-mer
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6907485Z  * [new branch]        agent/complete-676-local-resumable-inbox-outbo -> origin/agent/complete-676-local-resumable-inbox-outbo
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6908211Z  * [new branch]        agent/complete-677-local-accepted-source-gener -> origin/agent/complete-677-local-accepted-source-gener
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6908993Z  * [new branch]        agent/complete-678-local-controlled-generation -> origin/agent/complete-678-local-controlled-generation
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6909921Z  * [new branch]        agent/complete-679-local-retained-record-expor -> origin/agent/complete-679-local-retained-record-expor
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6910722Z  * [new branch]        agent/complete-681-local-old-binary-disabled-o -> origin/agent/complete-681-local-old-binary-disabled-o
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6911504Z  * [new branch]        agent/complete-709-fx08-package-and-evidence-f -> origin/agent/complete-709-fx08-package-and-evidence-f
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6912259Z  * [new branch]        agent/complete-fresh-local-cli-bootstrap-and-c -> origin/agent/complete-fresh-local-cli-bootstrap-and-c
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6913127Z  * [new branch]        agent/complete-issue-253-verify-automated-home -> origin/agent/complete-issue-253-verify-automated-home
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6914111Z  * [new branch]        agent/complete-issue-335-lifecycle-acceptance -> origin/agent/complete-issue-335-lifecycle-acceptance
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6914828Z  * [new branch]        agent/complete-issue-356-native-linux-arm64-re -> origin/agent/complete-issue-356-native-linux-arm64-re
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6915612Z  * [new branch]        agent/configurable-host-worktree-root-with-fal -> origin/agent/configurable-host-worktree-root-with-fal
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6916354Z  * [new branch]        agent/count-untracked-folders-once-in-broker-p -> origin/agent/count-untracked-folders-once-in-broker-p
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6916982Z  * [new branch]        agent/cut-release-v0-8-16                -> origin/agent/cut-release-v0-8-16
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6917543Z  * [new branch]        agent/cut-release-v0-8-17                -> origin/agent/cut-release-v0-8-17
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6918199Z  * [new branch]        agent/cut-release-v0-8-19                -> origin/agent/cut-release-v0-8-19
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6918852Z  * [new branch]        agent/cut-release-v0-8-20                -> origin/agent/cut-release-v0-8-20
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6919520Z  * [new branch]        agent/declare-the-v0-8-10-contract-decision-fo -> origin/agent/declare-the-v0-8-10-contract-decision-fo
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6920241Z  * [new branch]        agent/deduplicate-lease-overlaps-rank-by-hunk -> origin/agent/deduplicate-lease-overlaps-rank-by-hunk
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6921383Z  * [new branch]        agent/defer-load-admitted-gates-when-sustained -> origin/agent/defer-load-admitted-gates-when-sustained
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6922210Z  * [new branch]        agent/defer-resource-failures-v2         -> origin/agent/defer-resource-failures-v2
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6923002Z  * [new branch]        agent/detect-broken-core-hookspath-in-doctor-a -> origin/agent/detect-broken-core-hookspath-in-doctor-a
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6923753Z  * [new branch]        agent/docs-follow-up-for-354-document-broker-f -> origin/agent/docs-follow-up-for-354-document-broker-f
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6924524Z  * [new branch]        agent/drop-clap-derive-so-the-workspace-builds -> origin/agent/drop-clap-derive-so-the-workspace-builds
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6925280Z  * [new branch]        agent/enable-push-session-branches-and-promote -> origin/agent/enable-push-session-branches-and-promote
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6926042Z  * [new branch]        agent/expire-recovery-archives-through-reviewe -> origin/agent/expire-recovery-archives-through-reviewe
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6926790Z  * [new branch]        agent/explain-read-only-compatibility-refusals -> origin/agent/explain-read-only-compatibility-refusals
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6928103Z  * [new branch]        agent/explain-shallow-clone-cleanup-inspection -> origin/agent/explain-shallow-clone-cleanup-inspection
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6928834Z  * [new branch]        agent/faster-ci-cache-gates-warm-macos-cache-f -> origin/agent/faster-ci-cache-gates-warm-macos-cache-f
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6929640Z  * [new branch]        agent/feat-broker-scaffold-aethyme-prepare-tom -> origin/agent/feat-broker-scaffold-aethyme-prepare-tom
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6930382Z  * [new branch]        agent/finalize-aethyme-release-after-pr-403 -> origin/agent/finalize-aethyme-release-after-pr-403
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6931055Z  * [new branch]        agent/finish-cleanup-resolve-archive     -> origin/agent/finish-cleanup-resolve-archive
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6931741Z  * [new branch]        agent/fix-361-disposable-databases-for-broker -> origin/agent/fix-361-disposable-databases-for-broker
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6932459Z  * [new branch]        agent/fix-366-make-path-lease-coverage-explici -> origin/agent/fix-366-make-path-lease-coverage-explici
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6933253Z  * [new branch]        agent/fix-383-centralize-workspace-dependency -> origin/agent/fix-383-centralize-workspace-dependency
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6933984Z  * [new branch]        agent/fix-385-correct-the-explore-wrapper-runt -> origin/agent/fix-385-correct-the-explore-wrapper-runt
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6934714Z  * [new branch]        agent/fix-393-remaining-cross-session-ref-and -> origin/agent/fix-393-remaining-cross-session-ref-and
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6935379Z  * [new branch]        agent/fix-405-integration-reconcile      -> origin/agent/fix-405-integration-reconcile
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6936034Z  * [new branch]        agent/fix-413-admit-the-cross-process-contract -> origin/agent/fix-413-admit-the-cross-process-contract
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6936792Z  * [new branch]        agent/fix-413-defer-the-cost-1-cross-process-c -> origin/agent/fix-413-defer-the-cost-1-cross-process-c
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6937587Z  * [new branch]        agent/fix-418-preflight-associated-pr-contract -> origin/agent/fix-418-preflight-associated-pr-contract
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6938342Z  * [new branch]        agent/fix-419-replace-flaky-fixed-delay-broker -> origin/agent/fix-419-replace-flaky-fixed-delay-broker
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6939439Z  * [new branch]        agent/fix-430-concurrent-gate-workers-sharing -> origin/agent/fix-430-concurrent-gate-workers-sharing
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6940157Z  * [new branch]        agent/fix-471-r1-account-for-inode-headroom-an -> origin/agent/fix-471-r1-account-for-inode-headroom-an
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6940954Z  * [new branch]        agent/fix-481-make-affected-gate-inspection-re -> origin/agent/fix-481-make-affected-gate-inspection-re
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6942110Z  * [new branch]        agent/fix-493-cap-promotion-commit-subjects-at -> origin/agent/fix-493-cap-promotion-commit-subjects-at
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6942868Z  * [new branch]        agent/fix-549-classify-an-explicit-auto-merge -> origin/agent/fix-549-classify-an-explicit-auto-merge
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6943604Z  * [new branch]        agent/fix-595-reject-the-unsupported-broker-su -> origin/agent/fix-595-reject-the-unsupported-broker-su
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6944493Z  * [new branch]        agent/fix-695-inspect-remote-exact-ref-push-ou -> origin/agent/fix-695-inspect-remote-exact-ref-push-ou
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6945262Z  * [new branch]        agent/fix-696-make-finish-integration-reconcil -> origin/agent/fix-696-make-finish-integration-reconcil
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6946051Z  * [new branch]        agent/fix-analysis-view-hold-retire-and-public -> origin/agent/fix-analysis-view-hold-retire-and-public
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6946821Z  * [new branch]        agent/fix-default-branch-ownership-in-ref-guar -> origin/agent/fix-default-branch-ownership-in-ref-guar
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6947577Z  * [new branch]        agent/fix-gc-reclaim-tracked-dirs        -> origin/agent/fix-gc-reclaim-tracked-dirs
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6948241Z  * [new branch]        agent/fix-main-duplicate-gitrepo-operation-in -> origin/agent/fix-main-duplicate-gitrepo-operation-in
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6949137Z  * [new branch]        agent/fix-projection-github-writes-refused-by -> origin/agent/fix-projection-github-writes-refused-by
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6949781Z  * [new branch]        agent/gate-capacity-slot                 -> origin/agent/gate-capacity-slot
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6950438Z  * [new branch]        agent/gc-reclaim-apply-reviewed-subset   -> origin/agent/gc-reclaim-apply-reviewed-subset
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6951074Z  * [new branch]        agent/gc-shared-artifact-catalog         -> origin/agent/gc-shared-artifact-catalog
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6951902Z  * [new branch]        agent/gc-storage-retire-cleaned-empty-roots -> origin/agent/gc-storage-retire-cleaned-empty-roots
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6952777Z  * [new branch]        agent/gc-sweep-idle-open-sessions        -> origin/agent/gc-sweep-idle-open-sessions
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6953676Z  * [new branch]        agent/generated-agent-instructions-push-sessio -> origin/agent/generated-agent-instructions-push-sessio
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6954720Z  * [new branch]        agent/graph-tooling-audit-remediation-15-recom -> origin/agent/graph-tooling-audit-remediation-15-recom
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6955641Z  * [new branch]        agent/hermetic-free-space-probe-for-tests -> origin/agent/hermetic-free-space-probe-for-tests
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6956625Z  * [new branch]        agent/hook-overlap-notes-use-current-session-c -> origin/agent/hook-overlap-notes-use-current-session-c
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6957730Z  * [new branch]        agent/implement-213-vertical-slice-rust-and-ty -> origin/agent/implement-213-vertical-slice-rust-and-ty
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6958662Z  * [new branch]        agent/implement-232-isolate-broker-gates-from -> origin/agent/implement-232-isolate-broker-gates-from
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6959603Z  * [new branch]        agent/implement-232-warn-when-exploring-a-stal -> origin/agent/implement-232-warn-when-exploring-a-stal
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6960543Z  * [new branch]        agent/implement-237-clean                -> origin/agent/implement-237-clean
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6962828Z  * [new branch]        agent/implement-237-persist-operation-progress -> origin/agent/implement-237-persist-operation-progress
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6964265Z  * [new branch]        agent/implement-258-reclaim-verified-regenerab -> origin/agent/implement-258-reclaim-verified-regenerab
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6965286Z  * [new branch]        agent/implement-264-skip-verification-for-dele -> origin/agent/implement-264-skip-verification-for-dele
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6966194Z  * [new branch]        agent/implement-280-292-graph-integrity-stale -> origin/agent/implement-280-292-graph-integrity-stale
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6967054Z  * [new branch]        agent/implement-287-broker-doctor-across-store -> origin/agent/implement-287-broker-doctor-across-store
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6967825Z  * [new branch]        agent/implement-293-251-install-replacement-de -> origin/agent/implement-293-251-install-replacement-de
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6968616Z  * [new branch]        agent/implement-294-keep-submission-ownership -> origin/agent/implement-294-keep-submission-ownership
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6969371Z  * [new branch]        agent/implement-352-integration-as-a-disposabl -> origin/agent/implement-352-integration-as-a-disposabl
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6970277Z  * [new branch]        agent/implement-358-release-leases-on-a-verifi -> origin/agent/implement-358-release-leases-on-a-verifi
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6971250Z  * [new branch]        agent/implement-359-lease-release-requests-ack -> origin/agent/implement-359-lease-release-requests-ack
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6972204Z  * [new branch]        agent/implement-360-lease-liveness-bound-to-th -> origin/agent/implement-360-lease-liveness-bound-to-th
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6973273Z  * [new branch]        agent/implement-369-independently-ship-a-verif -> origin/agent/implement-369-independently-ship-a-verif
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6974273Z  * [new branch]        agent/implement-374-section-3-orphaned-console -> origin/agent/implement-374-section-3-orphaned-console
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6975514Z  * [new branch]        agent/implement-381-enhance-first-aethyme-enha -> origin/agent/implement-381-enhance-first-aethyme-enha
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6976553Z  * [new branch]        agent/implement-381-integration-suites-for-aet -> origin/agent/implement-381-integration-suites-for-aet
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6977513Z  * [new branch]        agent/implement-384-remove-quality-inspect-fal -> origin/agent/implement-384-remove-quality-inspect-fal
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6978526Z  * [new branch]        agent/implement-386-add-reproducible-criterion -> origin/agent/implement-386-add-reproducible-criterion
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6979580Z  * [new branch]        agent/implement-393-remainder-guard-gh-ref-del -> origin/agent/implement-393-remainder-guard-gh-ref-del
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6980969Z  * [new branch]        agent/implement-417-back-off-empty-delivery-po -> origin/agent/implement-417-back-off-empty-delivery-po
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6982392Z  * [new branch]        agent/implement-460-bound-full-broker-status-a -> origin/agent/implement-460-bound-full-broker-status-a
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6983546Z  * [new branch]        agent/implement-464-tracked-elsewhere-reconcil -> origin/agent/implement-464-tracked-elsewhere-reconcil
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6984817Z  * [new branch]        agent/implement-494-make-broker-operation-lock -> origin/agent/implement-494-make-broker-operation-lock
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6985863Z  * [new branch]        agent/implement-549-and-286-definitive-gh-reje -> origin/agent/implement-549-and-286-definitive-gh-reje
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6986862Z  * [new branch]        agent/implement-555-bound-brokered-read-only-g -> origin/agent/implement-555-bound-brokered-read-only-g
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6987937Z  * [new branch]        agent/implement-559-bound-broker-worktrees-jso -> origin/agent/implement-559-bound-broker-worktrees-jso
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6989001Z  * [new branch]        agent/implement-584-a-compute-pr-size-and-risk -> origin/agent/implement-584-a-compute-pr-size-and-risk
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6990015Z  * [new branch]        agent/implement-584-b-rule-conditions-on-size -> origin/agent/implement-584-b-rule-conditions-on-size
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6991441Z  * [new branch]        agent/implement-588-a-ancestry-fast-path-for-l -> origin/agent/implement-588-a-ancestry-fast-path-for-l
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6992652Z  * [new branch]        agent/implement-588-b-automatic-removal-of-dis -> origin/agent/implement-588-b-automatic-removal-of-dis
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6993810Z  * [new branch]        agent/implement-596-configurable-comment-actio -> origin/agent/implement-596-configurable-comment-actio
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6994694Z  * [new branch]        agent/implement-598-a-one-local-test-command-t -> origin/agent/implement-598-a-one-local-test-command-t
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6995849Z  * [new branch]        agent/implement-598-b-stabilise-the-flaky-gc-c -> origin/agent/implement-598-b-stabilise-the-flaky-gc-c
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6996837Z  * [new branch]        agent/implement-606-repo-wide-pr-subscriptions -> origin/agent/implement-606-repo-wide-pr-subscriptions
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6997822Z  * [new branch]        agent/implement-663-l4-candidate-boundary-and -> origin/agent/implement-663-l4-candidate-boundary-and
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6998906Z  * [new branch]        agent/implement-664-provisional-composer-over -> origin/agent/implement-664-provisional-composer-over
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.6999912Z  * [new branch]        agent/implement-665-bounded-resolution-request -> origin/agent/implement-665-bounded-resolution-request
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7000890Z  * [new branch]        agent/implement-666-provisional-l5-target-revi -> origin/agent/implement-666-provisional-l5-target-revi
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7002885Z  * [new branch]        agent/implement-667-provisional-l5-finite-cand -> origin/agent/implement-667-provisional-l5-finite-cand
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7003830Z  * [new branch]        agent/implement-668-provisional-l5-reservation -> origin/agent/implement-668-provisional-l5-reservation
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7005183Z  * [new branch]        agent/implement-669-provisional-l5-stop-restor -> origin/agent/implement-669-provisional-l5-stop-restor
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7006204Z  * [new branch]        agent/implement-691-reject-unknown-promote-mod -> origin/agent/implement-691-reject-unknown-promote-mod
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7007205Z  * [new branch]        agent/implement-692-add-a-typed-verification-c -> origin/agent/implement-692-add-a-typed-verification-c
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7008227Z  * [new branch]        agent/implement-693-make-verify-only-submit-pl -> origin/agent/implement-693-make-verify-only-submit-pl
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7009151Z  * [new branch]        agent/implement-694-extract-shared-delivery-ou -> origin/agent/implement-694-extract-shared-delivery-ou
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7010183Z  * [new branch]        agent/implement-broker-short-names-and-chau7-t -> origin/agent/implement-broker-short-names-and-chau7-t
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7011115Z  * [new branch]        agent/implement-deterministic-t45-gc-and-stora -> origin/agent/implement-deterministic-t45-gc-and-stora
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7012133Z  * [new branch]        agent/implement-fx10-actual-sustained-arrival -> origin/agent/implement-fx10-actual-sustained-arrival
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7013171Z  * [new branch]        agent/implement-fx17-sealed-model-payload-and -> origin/agent/implement-fx17-sealed-model-payload-and
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7014157Z  * [new branch]        agent/implement-github-issue-224-configurable -> origin/agent/implement-github-issue-224-configurable
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7015149Z  * [new branch]        agent/implement-issue-213-dispatchable-imports -> origin/agent/implement-issue-213-dispatchable-imports
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7016145Z  * [new branch]        agent/implement-issue-218-diagnose-and-reclaim -> origin/agent/implement-issue-218-diagnose-and-reclaim
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7017088Z  * [new branch]        agent/implement-issue-219-prepared-admission-o -> origin/agent/implement-issue-219-prepared-admission-o
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7018082Z  * [new branch]        agent/implement-issue-222-promotion-landing-pr -> origin/agent/implement-issue-222-promotion-landing-pr
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7019303Z  * [new branch]        agent/implement-issue-225-extend-storage-to-en -> origin/agent/implement-issue-225-extend-storage-to-en
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7020864Z  * [new branch]        agent/implement-issue-232-safe-automatic-fast -> origin/agent/implement-issue-232-safe-automatic-fast
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7021895Z  * [new branch]        agent/implement-issue-335-unify-safe-worktree -> origin/agent/implement-issue-335-unify-safe-worktree
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7023015Z  * [new branch]        agent/implement-issue-380-add-nightly-workspac -> origin/agent/implement-issue-380-add-nightly-workspac
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7024007Z  * [new branch]        agent/implement-issue-496-skip-chau7-tab-looku -> origin/agent/implement-issue-496-skip-chau7-tab-looku
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7024984Z  * [new branch]        agent/implement-issue-621-preserve-and-surface -> origin/agent/implement-issue-621-preserve-and-surface
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7025975Z  * [new branch]        agent/implement-issue-640-report-branch-drift -> origin/agent/implement-issue-640-report-branch-drift
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7027002Z  * [new branch]        agent/implement-issue-688-fix-broker-finish-mi -> origin/agent/implement-issue-688-fix-broker-finish-mi
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7028093Z  * [new branch]        agent/implement-issue-689-bind-cached-gate-ver -> origin/agent/implement-issue-689-bind-cached-gate-ver
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7029091Z  * [new branch]        agent/implement-issue-690-pin-pytest-in-the-py -> origin/agent/implement-issue-690-pin-pytest-in-the-py
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7030100Z  * [new branch]        agent/implement-local-administrative-sensitive -> origin/agent/implement-local-administrative-sensitive
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7031155Z  * [new branch]        agent/implement-prioritized-open-issue-687-ver -> origin/agent/implement-prioritized-open-issue-687-ver
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7033156Z  * [new branch]        agent/implement-remaining-actionable-proposals -> origin/agent/implement-remaining-actionable-proposals
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7034249Z  * [new branch]        agent/implement-the-actual-fx17-20-controlled -> origin/agent/implement-the-actual-fx17-20-controlled
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7035363Z  * [new branch]        agent/implement-the-maintainer-approved-phase -> origin/agent/implement-the-maintainer-approved-phase
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7036351Z  * [new branch]        agent/insights-session-throughput-telemetry-fe -> origin/agent/insights-session-throughput-telemetry-fe
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7037390Z  * [new branch]        agent/integrate-reviewed-local-bare-git-servic -> origin/agent/integrate-reviewed-local-bare-git-servic
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7038373Z  * [new branch]        agent/investigate-all-issues-flagged-triaged-a -> origin/agent/investigate-all-issues-flagged-triaged-a
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7039411Z  * [new branch]        agent/issue-126-finish-internal-only-pilot-acc -> origin/agent/issue-126-finish-internal-only-pilot-acc
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7040760Z  * [new branch]        agent/issue-213-tranche-implement-non-code-and -> origin/agent/issue-213-tranche-implement-non-code-and
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7041767Z  * [new branch]        agent/issue-369-reject-broker-ship-in-verify-o -> origin/agent/issue-369-reject-broker-ship-in-verify-o
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7042566Z  * [new branch]        agent/issue-382-part-1-pure-move-broker-rs-int -> origin/agent/issue-382-part-1-pure-move-broker-rs-int
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7043317Z  * [new branch]        agent/issue-382-part-2-pure-move-store-rs-into -> origin/agent/issue-382-part-2-pure-move-store-rs-into
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7044058Z  * [new branch]        agent/issue-382-part-3-pure-move-broker-operat -> origin/agent/issue-382-part-3-pure-move-broker-operat
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7044811Z  * [new branch]        agent/issue-413-include-measured-host-load-in -> origin/agent/issue-413-include-measured-host-load-in
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7045584Z  * [new branch]        agent/issue-460-bound-interactive-broker-reads -> origin/agent/issue-460-bound-interactive-broker-reads
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7047078Z  * [new branch]        agent/issue-460-bound-interactive-broker-statu -> origin/agent/issue-460-bound-interactive-broker-statu
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7047816Z  * [new branch]        agent/issue-481-instrument-gates-affected-per -> origin/agent/issue-481-instrument-gates-affected-per
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7048541Z  * [new branch]        agent/issue-494-observable-lock-and-lease-wait -> origin/agent/issue-494-observable-lock-and-lease-wait
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7049294Z  * [new branch]        agent/issue-637-unblock-advice-respects-pendin -> origin/agent/issue-637-unblock-advice-respects-pendin
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7050029Z  * [new branch]        agent/l0-audit-651-revision-bound-reuse-and-co -> origin/agent/l0-audit-651-revision-bound-reuse-and-co
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7050806Z  * [new branch]        agent/lease-aware-hook-context-and-note-delive -> origin/agent/lease-aware-hook-context-and-note-delive
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7051752Z  * [new branch]        agent/lease-claims-inform-instead-of-block-in -> origin/agent/lease-claims-inform-instead-of-block-in
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7052522Z  * [new branch]        agent/local-bare-git-endpoint-verifier-helper -> origin/agent/local-bare-git-endpoint-verifier-helper
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7053292Z  * [new branch]        agent/make-broker-schema-migrations-idempotent -> origin/agent/make-broker-schema-migrations-idempotent
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7054033Z  * [new branch]        agent/make-broker-sync-report-what-it-merged-a -> origin/agent/make-broker-sync-report-what-it-merged-a
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7054819Z  * [new branch]        agent/make-the-main-branch-contract-gate-read -> origin/agent/make-the-main-branch-contract-gate-read
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7055492Z  * [new branch]        agent/merge-pr-517-and-cut-v0-8-18       -> origin/agent/merge-pr-517-and-cut-v0-8-18
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7056163Z  * [new branch]        agent/merge-remaining-prs-and-cut-the-next-rel -> origin/agent/merge-remaining-prs-and-cut-the-next-rel
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7057118Z  * [new branch]        agent/mode-aware-integration-advice-none-of-it -> origin/agent/mode-aware-integration-advice-none-of-it
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7057886Z  * [new branch]        agent/operator-claims-show-release-orchestrati -> origin/agent/operator-claims-show-release-orchestrati
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7058661Z  * [new branch]        agent/overlap-classification-scales-with-sessi -> origin/agent/overlap-classification-scales-with-sessi
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7059720Z  * [new branch]        agent/per-repository-session-guidance-shown-at -> origin/agent/per-repository-session-guidance-shown-at
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7061046Z  * [new branch]        agent/perf-broker-batch-the-cleanup-representa -> origin/agent/perf-broker-batch-the-cleanup-representa
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7062086Z  * [new branch]        agent/prepare-and-publish-the-v0-8-11-patch-re -> origin/agent/prepare-and-publish-the-v0-8-11-patch-re
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7063051Z  * [new branch]        agent/prepare-and-publish-the-v0-8-12-patch-re -> origin/agent/prepare-and-publish-the-v0-8-12-patch-re
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7064102Z  * [new branch]        agent/prepare-and-publish-the-v0-8-13-patch-re -> origin/agent/prepare-and-publish-the-v0-8-13-patch-re
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7065256Z  * [new branch]        agent/prepare-and-publish-the-v0-8-14-patch-re -> origin/agent/prepare-and-publish-the-v0-8-14-patch-re
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7066227Z  * [new branch]        agent/prepare-external-adopter-pilot-kit-for-i -> origin/agent/prepare-external-adopter-pilot-kit-for-i
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7067270Z  * [new branch]        agent/prepare-publish-and-install-aethyme-v0-8 -> origin/agent/prepare-publish-and-install-aethyme-v0-8
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7068274Z  * [new branch]        agent/prepare-v0-8-8-release-after-pr-402 -> origin/agent/prepare-v0-8-8-release-after-pr-402
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7069303Z  * [new branch]        agent/provisional-fx01-fx07-composition-fixtur -> origin/agent/provisional-fx01-fx07-composition-fixtur
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7070409Z  * [new branch]        agent/push-early-delivery-agents-push-session -> origin/agent/push-early-delivery-agents-push-session
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7071699Z  * [new branch]        agent/ready-issue-169-implement-the-triaged-sh -> origin/agent/ready-issue-169-implement-the-triaged-sh
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7072657Z  * [new branch]        agent/ready-issue-174-complete-typed-review-le -> origin/agent/ready-issue-174-complete-typed-review-le
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7073515Z  * [new branch]        agent/ready-issue-185-classify-local-git-confl -> origin/agent/ready-issue-185-classify-local-git-confl
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7074403Z  * [new branch]        agent/ready-issue-192-make-regenerable-artifac -> origin/agent/ready-issue-192-make-regenerable-artifac
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7075167Z  * [new branch]        agent/ready-issue-193-make-retention-parsing-f -> origin/agent/ready-issue-193-make-retention-parsing-f
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7075981Z  * [new branch]        agent/ready-issue-194-align-gc-age-policy-with -> origin/agent/ready-issue-194-align-gc-age-policy-with
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7076994Z  * [new branch]        agent/ready-issue-195-implement-host-scoped-st -> origin/agent/ready-issue-195-implement-host-scoped-st
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7077933Z  * [new branch]        agent/ready-issue-196-make-gc-protections-mono -> origin/agent/ready-issue-196-make-gc-protections-mono
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7078980Z  * [new branch]        agent/ready-issue-198-surface-stale-broker-bin -> origin/agent/ready-issue-198-surface-stale-broker-bin
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7079994Z  * [new branch]        agent/ready-issue-200-make-reclaim-confirmatio -> origin/agent/ready-issue-200-make-reclaim-confirmatio
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7081269Z  * [new branch]        agent/ready-issues-159-and-161-unify-revision -> origin/agent/ready-issues-159-and-161-unify-revision
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7082305Z  * [new branch]        agent/reconcile-retention-of-inactive-native-g -> origin/agent/reconcile-retention-of-inactive-native-g
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7083611Z  * [new branch]        agent/record-a-redacted-error-message-with-fai -> origin/agent/record-a-redacted-error-message-with-fai
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7084630Z  * [new branch]        agent/record-definitive-github-refusals-as-fai -> origin/agent/record-definitive-github-refusals-as-fai
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7085673Z  * [new branch]        agent/record-the-maintainer-s-internal-only-pi -> origin/agent/record-the-maintainer-s-internal-only-pi
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7086728Z  * [new branch]        agent/refuse-coordinated-ops-when-repo-does-no -> origin/agent/refuse-coordinated-ops-when-repo-does-no
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7087768Z  * [new branch]        agent/refuse-destructive-writes-to-another-liv -> origin/agent/refuse-destructive-writes-to-another-liv
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7088848Z  * [new branch]        agent/regenerate-broker-lifecycle-split-382-pa -> origin/agent/regenerate-broker-lifecycle-split-382-pa
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7090013Z  * [new branch]        agent/regenerate-broker-store-split-382-part-2 -> origin/agent/regenerate-broker-store-split-382-part-2
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7091170Z  * [new branch]        agent/regenerate-coordinated-operations-split -> origin/agent/regenerate-coordinated-operations-split
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7092381Z  * [new branch]        agent/register-broker-push-help-snapshot-and-g -> origin/agent/register-broker-push-help-snapshot-and-g
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7093256Z  * [new branch]        agent/release-0-8-21                     -> origin/agent/release-0-8-21
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7093916Z  * [new branch]        agent/release-0-8-22                     -> origin/agent/release-0-8-22
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7094610Z  * [new branch]        agent/release-0-8-23                     -> origin/agent/release-0-8-23
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7095309Z  * [new branch]        agent/release-0-8-24                     -> origin/agent/release-0-8-24
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7096019Z  * [new branch]        agent/release-0-8-25                     -> origin/agent/release-0-8-25
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7096796Z  * [new branch]        agent/release-0-8-26                     -> origin/agent/release-0-8-26
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7097914Z  * [new branch]        agent/remove-duplicate-graph-task-skill-sectio -> origin/agent/remove-duplicate-graph-task-skill-sectio
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7099012Z  * [new branch]        agent/report-leftover-integration-work-in-aeth -> origin/agent/report-leftover-integration-work-in-aeth
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7099876Z  * [new branch]        agent/report-worktree-lock-failures-instead-of -> origin/agent/report-worktree-lock-failures-instead-of
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7101054Z  * [new branch]        agent/resolve-safe-behind-only-integration-dri -> origin/agent/resolve-safe-behind-only-integration-dri
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7102709Z  * [new branch]        agent/review-and-upgrade-pr-487-insights-repor -> origin/agent/review-and-upgrade-pr-487-insights-repor
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7103772Z  * [new branch]        agent/run-review-on-broker-push-head-template -> origin/agent/run-review-on-broker-push-head-template
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7104841Z  * [new branch]        agent/run-the-cargo-test-gate-with-nextest-and -> origin/agent/run-the-cargo-test-gate-with-nextest-and
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7105908Z  * [new branch]        agent/session-scoped-reclaim-plans-scan-only-t -> origin/agent/session-scoped-reclaim-plans-scan-only-t
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7106884Z  * [new branch]        agent/shared-landed-work-check           -> origin/agent/shared-landed-work-check
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7107816Z  * [new branch]        agent/show-position-and-progress-while-broker -> origin/agent/show-position-and-progress-while-broker
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7108821Z  * [new branch]        agent/skip-aethyme-gates-workspace-suite-gates -> origin/agent/skip-aethyme-gates-workspace-suite-gates
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7109874Z  * [new branch]        agent/start-fetches-the-default-branch-broker -> origin/agent/start-fetches-the-default-branch-broker
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7111203Z  * [new branch]        agent/start-sessions-from-upstream-when-integr -> origin/agent/start-sessions-from-upstream-when-integr
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7112089Z  * [new branch]        agent/status-hot-path                    -> origin/agent/status-hot-path
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7112903Z  * [new branch]        agent/storage-foreign-worktree-root      -> origin/agent/storage-foreign-worktree-root
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7113824Z  * [new branch]        agent/storage-inventory-treat-a-git-worktree-a -> origin/agent/storage-inventory-treat-a-git-worktree-a
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7114922Z  * [new branch]        agent/surface-stale-diverged-aethyme-integrati -> origin/agent/surface-stale-diverged-aethyme-integrati
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7115995Z  * [new branch]        agent/surface-unpushed-session-work-and-stop-f -> origin/agent/surface-unpushed-session-work-and-stop-f
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7117028Z  * [new branch]        agent/treat-a-gate-that-starves-after-it-start -> origin/agent/treat-a-gate-that-starves-after-it-start
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7118129Z  * [new branch]        agent/tree-keyed-verification-slot       -> origin/agent/tree-keyed-verification-slot
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7118992Z  * [new branch]        agent/tree-keyed-verification-slot-v2    -> origin/agent/tree-keyed-verification-slot-v2
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7119889Z  * [new branch]        agent/trustworthy-gate-verdicts-fix-391-cache -> origin/agent/trustworthy-gate-verdicts-fix-391-cache
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7120746Z  * [new branch]        agent/unify-disk-model                   -> origin/agent/unify-disk-model
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7121875Z  * [new branch]        agent/use-git-patch-id-verbatim-for-every-land -> origin/agent/use-git-patch-id-verbatim-for-every-land
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7122958Z  * [new branch]        agent/validate-aethyme-path-references-against -> origin/agent/validate-aethyme-path-references-against
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7124003Z  * [new branch]        agent/verify-only-repos-submit-and-push-agains -> origin/agent/verify-only-repos-submit-and-push-agains
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7125062Z  * [new branch]        agent/warn-on-duplicate-sessions-for-one-pr-mi -> origin/agent/warn-on-duplicate-sessions-for-one-pr-mi
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7126410Z  * [new branch]        agent/warn-when-a-session-overlaps-open-pull-r -> origin/agent/warn-when-a-session-overlaps-open-pull-r
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7127419Z  * [new branch]        build/ci-release-gating-macos            -> origin/build/ci-release-gating-macos
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7128309Z  * [new branch]        build/debug-trim-sccache                 -> origin/build/debug-trim-sccache
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7129201Z  * [new branch]        build/gate-every-main-commit             -> origin/build/gate-every-main-commit
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7130069Z  * [new branch]        build/release-linux-arm64-musl-tap       -> origin/build/release-linux-arm64-musl-tap
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7131039Z  * [new branch]        chore/migrate-deprecated-broker-callers  -> origin/chore/migrate-deprecated-broker-callers
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7131935Z  * [new branch]        chore/regenerate-guidance-phase4         -> origin/chore/regenerate-guidance-phase4
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7132799Z  * [new branch]        chore/rustfmt-workspace                  -> origin/chore/rustfmt-workspace
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7133844Z  * [new branch]        dependabot/cargo/packages/aethyme/rust/cargo-patch-e3e0769812 -> origin/dependabot/cargo/packages/aethyme/rust/cargo-patch-e3e0769812
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7134944Z  * [new branch]        dependabot/github_actions/actions-d76694cdc8 -> origin/dependabot/github_actions/actions-d76694cdc8
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7135936Z  * [new branch]        docs/broker-benchmark-r1                 -> origin/docs/broker-benchmark-r1
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7136789Z  * [new branch]        docs/phase4-stream-c                     -> origin/docs/phase4-stream-c
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7137573Z  * [new branch]        docs/phase5-report-pilot-kit             -> origin/docs/phase5-report-pilot-kit
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7138734Z  * [new branch]        docs/v0-7-22-schema-41-and-locked        -> origin/docs/v0-7-22-schema-41-and-locked
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7139587Z  * [new branch]        docs/windows-port-scope                  -> origin/docs/windows-port-scope
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7140380Z  * [new branch]        feat/blocker-registry                    -> origin/feat/blocker-registry
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7141552Z  * [new branch]        feat/broker-six-verbs                    -> origin/feat/broker-six-verbs
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7142359Z  * [new branch]        feat/declared-session-scope              -> origin/feat/declared-session-scope
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7143287Z  * [new branch]        feat/explore-answer-safety-and-split     -> origin/feat/explore-answer-safety-and-split
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7144345Z  * [new branch]        feat/gate-load-disk-metrics              -> origin/feat/gate-load-disk-metrics
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7145083Z  * [new branch]        feat/gate-policy-trust                   -> origin/feat/gate-policy-trust
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7145878Z  * [new branch]        feat/gc-gate-cache-reclaim               -> origin/feat/gc-gate-cache-reclaim
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7146707Z  * [new branch]        feat/graph-free-explore                  -> origin/feat/graph-free-explore
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7147588Z  * [new branch]        feat/main-reconcile-fast-forward         -> origin/feat/main-reconcile-fast-forward
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7148508Z  * [new branch]        feat/min-compatible-schema               -> origin/feat/min-compatible-schema
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7149436Z  * [new branch]        feat/orphaned-console-stop               -> origin/feat/orphaned-console-stop
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7150302Z  * [new branch]        feat/phase4-guidance-explore-hook        -> origin/feat/phase4-guidance-explore-hook
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7151201Z  * [new branch]        feat/preparation-cache-reclaim           -> origin/feat/preparation-cache-reclaim
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7152025Z  * [new branch]        feat/self-cleaning-sweep                 -> origin/feat/self-cleaning-sweep
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7152768Z  * [new branch]        feat/worktree-report                     -> origin/feat/worktree-report
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7153862Z  * [new branch]        fix/adopt-records-declared-scope         -> origin/fix/adopt-records-declared-scope
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7154759Z  * [new branch]        fix/build-provenance-tracks-ref          -> origin/fix/build-provenance-tracks-ref
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7155692Z  * [new branch]        fix/cargo-test-gate-timeout              -> origin/fix/cargo-test-gate-timeout
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7156542Z  * [new branch]        fix/clone-no-local                       -> origin/fix/clone-no-local
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7157509Z  * [new branch]        fix/close-operation-classification-bypasses -> origin/fix/close-operation-classification-bypasses
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7158521Z  * [new branch]        fix/closed-session-worktree-leak         -> origin/fix/closed-session-worktree-leak
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7159373Z  * [new branch]        fix/contract-justified-none              -> origin/fix/contract-justified-none
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7160247Z  * [new branch]        fix/contract-none-justification          -> origin/fix/contract-none-justification
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7161163Z  * [new branch]        fix/contract-symbol-boundaries           -> origin/fix/contract-symbol-boundaries
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7162621Z  * [new branch]        fix/deploy-symlinks-journal-redaction    -> origin/fix/deploy-symlinks-journal-redaction
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7163578Z  * [new branch]        fix/distinct-exit-codes                  -> origin/fix/distinct-exit-codes
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7164378Z  * [new branch]        fix/drop-engine-pin-check                -> origin/fix/drop-engine-pin-check
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7165272Z  * [new branch]        fix/explore-no-graph-free-answer-promotion -> origin/fix/explore-no-graph-free-answer-promotion
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7166214Z  * [new branch]        fix/finish-reachable-remedy              -> origin/fix/finish-reachable-remedy
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7167185Z  * [new branch]        fix/gates-from-base-tree                 -> origin/fix/gates-from-base-tree
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7168133Z  * [new branch]        fix/git-timeout-safe-killpg-file-locks   -> origin/fix/git-timeout-safe-killpg-file-locks
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7169003Z  * [new branch]        fix/graph-engine-pin-254                 -> origin/fix/graph-engine-pin-254
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7169868Z  * [new branch]        fix/load-sensitive-broker-tests          -> origin/fix/load-sensitive-broker-tests
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7171013Z  * [new branch]        fix/reconcile-collected-terminal-entries -> origin/fix/reconcile-collected-terminal-entries
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7171993Z  * [new branch]        fix/release-pinned-toolchain-target      -> origin/fix/release-pinned-toolchain-target
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7172961Z  * [new branch]        fix/report-unpromoted-reason             -> origin/fix/report-unpromoted-reason
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7173807Z  * [new branch]        fix/review-lane-forks-credentials        -> origin/fix/review-lane-forks-credentials
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7174793Z  * [new branch]        fix/scope-liveness-allow-list            -> origin/fix/scope-liveness-allow-list
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7175692Z  * [new branch]        fix/stop-discarding-state-writes         -> origin/fix/stop-discarding-state-writes
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7176512Z  * [new branch]        fix/supply-chain-advisories              -> origin/fix/supply-chain-advisories
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7177361Z  * [new branch]        fix/ts-indexer-exports                   -> origin/fix/ts-indexer-exports
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7178163Z  * [new branch]        fix/verify-only-followups                -> origin/fix/verify-only-followups
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7178976Z  * [new branch]        fix/worktree-relative-push-source        -> origin/fix/worktree-relative-push-source
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7180805Z  * [new branch]        main                                     -> origin/main
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7181502Z  * [new branch]        perf/explore-bm25f-corpus-avgdl          -> origin/perf/explore-bm25f-corpus-avgdl
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7182171Z  * [new branch]        perf/explore-bm25f-ranking               -> origin/perf/explore-bm25f-ranking
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7183002Z  * [new branch]        perf/explore-lean-default-output         -> origin/perf/explore-lean-default-output
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7183633Z  * [new branch]        refactor/cli-flag-validation-and-split   -> origin/refactor/cli-flag-validation-and-split
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7184378Z  * [new branch]        refactor/clippy-zero-warnings            -> origin/refactor/clippy-zero-warnings
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7185018Z  * [new branch]        refactor/remove-eval-tuned-auth-ranking  -> origin/refactor/remove-eval-tuned-auth-ranking
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7185717Z  * [new branch]        refactor/retire-python-parity            -> origin/refactor/retire-python-parity
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7186410Z  * [new branch]        refactor/stop-committing-graph-fragments -> origin/refactor/stop-committing-graph-fragments
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7187112Z  * [new branch]        release/land-integration-290             -> origin/release/land-integration-290
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7187776Z  * [new branch]        release/land-integration-v0.7.22         -> origin/release/land-integration-v0.7.22
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7188344Z  * [new branch]        release/v0.7.22                          -> origin/release/v0.7.22
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7188878Z  * [new branch]        release/v0.7.24                          -> origin/release/v0.7.24
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7189340Z  * [new branch]        release/v0.7.25                          -> origin/release/v0.7.25
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7189822Z  * [new branch]        release/v0.8.0                           -> origin/release/v0.8.0
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7190319Z  * [new branch]        release/v0.8.1                           -> origin/release/v0.8.1
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7190827Z  * [new branch]        release/v0.8.2                           -> origin/release/v0.8.2
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7191429Z  * [new branch]        release/v0.8.3                           -> origin/release/v0.8.3
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7191914Z  * [new branch]        release/v0.8.4                           -> origin/release/v0.8.4
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7192345Z  * [new branch]        release/v0.8.5                           -> origin/release/v0.8.5
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7192964Z  * [new branch]        release/v0.8.6                           -> origin/release/v0.8.6
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7193553Z  * [new branch]        test/broker-benchmark-harness            -> origin/test/broker-benchmark-harness
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7194141Z  * [new branch]        test/eval-devset-123                     -> origin/test/eval-devset-123
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7194684Z  * [new branch]        test/eval-devset-audited                 -> origin/test/eval-devset-audited
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7195277Z  * [new branch]        test/heldout-navigation-eval             -> origin/test/heldout-navigation-eval
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7195857Z  * [new tag]           v0.1.0                                   -> v0.1.0
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7196247Z  * [new tag]           v0.1.1                                   -> v0.1.1
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7196652Z  * [new tag]           v0.1.2                                   -> v0.1.2
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7197038Z  * [new tag]           v0.1.3                                   -> v0.1.3
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7197405Z  * [new tag]           v0.1.4                                   -> v0.1.4
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7197788Z  * [new tag]           v0.1.5                                   -> v0.1.5
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7198249Z  * [new tag]           v0.2.0                                   -> v0.2.0
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7198635Z  * [new tag]           v0.2.1                                   -> v0.2.1
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7199585Z  * [new tag]           v0.2.2                                   -> v0.2.2
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7200069Z  * [new tag]           v0.3.0                                   -> v0.3.0
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7200552Z  * [new tag]           v0.4.0                                   -> v0.4.0
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7200911Z  * [new tag]           v0.4.1                                   -> v0.4.1
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7201367Z  * [new tag]           v0.4.2                                   -> v0.4.2
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7201830Z  * [new tag]           v0.5.0                                   -> v0.5.0
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7202194Z  * [new tag]           v0.6.0                                   -> v0.6.0
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7202629Z  * [new tag]           v0.7.0                                   -> v0.7.0
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7203007Z  * [new tag]           v0.7.1                                   -> v0.7.1
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7203359Z  * [new tag]           v0.7.10                                  -> v0.7.10
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7203755Z  * [new tag]           v0.7.11                                  -> v0.7.11
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7204123Z  * [new tag]           v0.7.12                                  -> v0.7.12
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7204580Z  * [new tag]           v0.7.13                                  -> v0.7.13
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7204977Z  * [new tag]           v0.7.14                                  -> v0.7.14
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7205400Z  * [new tag]           v0.7.15                                  -> v0.7.15
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7205808Z  * [new tag]           v0.7.16                                  -> v0.7.16
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7206203Z  * [new tag]           v0.7.17                                  -> v0.7.17
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7206553Z  * [new tag]           v0.7.18                                  -> v0.7.18
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7207020Z  * [new tag]           v0.7.19                                  -> v0.7.19
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7207451Z  * [new tag]           v0.7.2                                   -> v0.7.2
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7207831Z  * [new tag]           v0.7.20                                  -> v0.7.20
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7208200Z  * [new tag]           v0.7.21                                  -> v0.7.21
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7208677Z  * [new tag]           v0.7.22                                  -> v0.7.22
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7209058Z  * [new tag]           v0.7.23                                  -> v0.7.23
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7209415Z  * [new tag]           v0.7.24                                  -> v0.7.24
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7209777Z  * [new tag]           v0.7.25                                  -> v0.7.25
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7210167Z  * [new tag]           v0.7.3                                   -> v0.7.3
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7210696Z  * [new tag]           v0.7.4                                   -> v0.7.4
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7211236Z  * [new tag]           v0.7.5                                   -> v0.7.5
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7211662Z  * [new tag]           v0.7.6                                   -> v0.7.6
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7212029Z  * [new tag]           v0.7.7                                   -> v0.7.7
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7212391Z  * [new tag]           v0.7.8                                   -> v0.7.8
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7212748Z  * [new tag]           v0.7.9                                   -> v0.7.9
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7213196Z  * [new tag]           v0.8.0                                   -> v0.8.0
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7213619Z  * [new tag]           v0.8.1                                   -> v0.8.1
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7213995Z  * [new tag]           v0.8.10                                  -> v0.8.10
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7214357Z  * [new tag]           v0.8.11                                  -> v0.8.11
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7214732Z  * [new tag]           v0.8.12                                  -> v0.8.12
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7215134Z  * [new tag]           v0.8.13                                  -> v0.8.13
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7215530Z  * [new tag]           v0.8.14                                  -> v0.8.14
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7215884Z  * [new tag]           v0.8.15                                  -> v0.8.15
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7216363Z  * [new tag]           v0.8.16                                  -> v0.8.16
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7216705Z  * [new tag]           v0.8.17                                  -> v0.8.17
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7217195Z  * [new tag]           v0.8.18                                  -> v0.8.18
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7217566Z  * [new tag]           v0.8.19                                  -> v0.8.19
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7217924Z  * [new tag]           v0.8.2                                   -> v0.8.2
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7218300Z  * [new tag]           v0.8.20                                  -> v0.8.20
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7218651Z  * [new tag]           v0.8.21                                  -> v0.8.21
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7219055Z  * [new tag]           v0.8.22                                  -> v0.8.22
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7219955Z  * [new tag]           v0.8.23                                  -> v0.8.23
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7220375Z  * [new tag]           v0.8.24                                  -> v0.8.24
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7220784Z  * [new tag]           v0.8.25                                  -> v0.8.25
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7221149Z  * [new tag]           v0.8.26                                  -> v0.8.26
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7221525Z  * [new tag]           v0.8.3                                   -> v0.8.3
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7221934Z  * [new tag]           v0.8.4                                   -> v0.8.4
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7222361Z  * [new tag]           v0.8.5                                   -> v0.8.5
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7222736Z  * [new tag]           v0.8.6                                   -> v0.8.6
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7223117Z  * [new tag]           v0.8.7                                   -> v0.8.7
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7223483Z  * [new tag]           v0.8.8                                   -> v0.8.8
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7223874Z  * [new tag]           v0.8.9                                   -> v0.8.9
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7224325Z  * [new ref]           c72d80af88e6957be50adb2b45dfd70051b5ab58 -> pull/785/merge
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7226381Z ##[endgroup]
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7226855Z ##[group]Determining the checkout info
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7227285Z ##[endgroup]
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7227654Z [command]"C:\Program Files\Git\bin\git.exe" sparse-checkout disable
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7493110Z [command]"C:\Program Files\Git\bin\git.exe" config --local --unset-all extensions.worktreeConfig
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7897662Z ##[group]Checking out the ref
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:56.7905559Z [command]"C:\Program Files\Git\bin\git.exe" checkout --progress --force refs/remotes/pull/785/merge
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:57.0063529Z ##[error]error: unable to create file packages/aethyme/docs/architecture/local-v3-qualification/sensitive-response-2026-10-15/payloads/current-source/mutations/m1-response-gated-archive-read/mutated-source/packages/aethyme/rust/crates/aethyme-broker/src/collaboration_archive.rs: Filename too long
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:57.0121764Z ##[error]error: unable to create file packages/aethyme/docs/architecture/local-v3-qualification/sensitive-response-2026-10-15/payloads/current-source/mutations/m3-omit-import-rehearsals-root/mutated-source/packages/aethyme/rust/crates/aethyme-broker/src/collaboration_sensitive.rs: Filename too long
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:57.0136096Z warning: unable to access 'packages/aethyme/docs/architecture/local-v3-qualification/sensitive-response-2026-10-15/payloads/current-source/mutations/m4-publish-database-receipt-before-table-delete/backup/packages/aethyme/rust/crates/aethyme-broker/src/.gitattributes': Filename too long
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:57.0140537Z ##[error]error: unable to create file packages/aethyme/docs/architecture/local-v3-qualification/sensitive-response-2026-10-15/payloads/current-source/mutations/m4-publish-database-receipt-before-table-delete/backup/packages/aethyme/rust/crates/aethyme-broker/src/collaboration_sensitive.rs: Filename too long
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:57.0148607Z ##[error]fatal: cannot create directory at 'packages/aethyme/docs/architecture/local-v3-qualification/sensitive-response-2026-10-15/payloads/current-source/mutations/m4-publish-database-receipt-before-table-delete/mutated-source/packages/aethyme/rust/crates/aethyme-broker': Filename too long
+Windows x64 build and native smoke	Checkout	2026-10-15T22:12:57.0233708Z ##[error]The process 'C:\Program Files\Git\bin\git.exe' failed with exit code 128
+Windows x64 build and native smoke	Post Checkout	﻿2026-10-15T22:12:57.0703551Z Post job cleanup.
+Windows x64 build and native smoke	Post Checkout	2026-10-15T22:12:57.2443422Z [command]"C:\Program Files\Git\bin\git.exe" version
+Windows x64 build and native smoke	Post Checkout	2026-10-15T22:12:57.2764612Z git version 2.56.0.windows.2
+Windows x64 build and native smoke	Post Checkout	2026-10-15T22:12:57.2843455Z Temporarily overriding HOME='D:\a\_temp\223e2bae-435f-43c8-9e30-1a538ae41023' before making global git config changes
+Windows x64 build and native smoke	Post Checkout	2026-10-15T22:12:57.2844193Z Adding repository directory to the temporary git global config as a safe directory
+Windows x64 build and native smoke	Post Checkout	2026-10-15T22:12:57.2853292Z [command]"C:\Program Files\Git\bin\git.exe" config --global --add safe.directory D:\a\Aethyme\Aethyme
+Windows x64 build and native smoke	Post Checkout	2026-10-15T22:12:57.3196459Z Removing SSH command configuration
+Windows x64 build and native smoke	Post Checkout	2026-10-15T22:12:57.3206843Z [command]"C:\Program Files\Git\bin\git.exe" config --local --name-only --get-regexp core\.sshCommand
+Windows x64 build and native smoke	Post Checkout	2026-10-15T22:12:57.3557675Z [command]"C:\Program Files\Git\bin\git.exe" submodule foreach --recursive "sh -c \"git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :\""
+Windows x64 build and native smoke	Post Checkout	2026-10-15T22:12:57.8937199Z Removing HTTP extra header
+Windows x64 build and native smoke	Post Checkout	2026-10-15T22:12:57.8946951Z [command]"C:\Program Files\Git\bin\git.exe" config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
+Windows x64 build and native smoke	Post Checkout	2026-10-15T22:12:57.9281042Z [command]"C:\Program Files\Git\bin\git.exe" submodule foreach --recursive "sh -c \"git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :\""
+Windows x64 build and native smoke	Post Checkout	2026-10-15T22:12:58.4645633Z Removing includeIf entries pointing to credentials config files
+Windows x64 build and native smoke	Post Checkout	2026-10-15T22:12:58.4657073Z [command]"C:\Program Files\Git\bin\git.exe" config --local --name-only --get-regexp ^includeIf\.gitdir:
+Windows x64 build and native smoke	Post Checkout	2026-10-15T22:12:58.4948333Z includeif.gitdir:D:/a/Aethyme/Aethyme/.git.path
+Windows x64 build and native smoke	Post Checkout	2026-10-15T22:12:58.4948897Z includeif.gitdir:D:/a/Aethyme/Aethyme/.git/worktrees/*.path
+Windows x64 build and native smoke	Post Checkout	2026-10-15T22:12:58.4949376Z includeif.gitdir:/github/workspace/.git.path
+Windows x64 build and native smoke	Post Checkout	2026-10-15T22:12:58.4949787Z includeif.gitdir:/github/workspace/.git/worktrees/*.path
+Windows x64 build and native smoke	Post Checkout	2026-10-15T22:12:58.4995636Z [command]"C:\Program Files\Git\bin\git.exe" config --local --get-all includeif.gitdir:D:/a/Aethyme/Aethyme/.git.path
+Windows x64 build and native smoke	Post Checkout	2026-10-15T22:12:58.5281451Z D:\a\_temp\git-credentials-6f15cf6c-1fd5-49e7-8881-ea32d08b4417.config
+Windows x64 build and native smoke	Post Checkout	2026-10-15T22:12:58.5326835Z [command]"C:\Program Files\Git\bin\git.exe" config --local --unset includeif.gitdir:D:/a/Aethyme/Aethyme/.git.path D\:\\a\\_temp\\git\-credentials\-6f15cf6c\-1fd5\-49e7\-8881\-ea32d08b4417\.config
+Windows x64 build and native smoke	Post Checkout	2026-10-15T22:12:58.5699835Z [command]"C:\Program Files\Git\bin\git.exe" config --local --get-all includeif.gitdir:D:/a/Aethyme/Aethyme/.git/worktrees/*.path
+Windows x64 build and native smoke	Post Checkout	2026-10-15T22:12:58.5983642Z D:\a\_temp\git-credentials-6f15cf6c-1fd5-49e7-8881-ea32d08b4417.config
+Windows x64 build and native smoke	Post Checkout	2026-10-15T22:12:58.6027275Z [command]"C:\Program Files\Git\bin\git.exe" config --local --unset includeif.gitdir:D:/a/Aethyme/Aethyme/.git/worktrees/*.path D\:\\a\\_temp\\git\-credentials\-6f15cf6c\-1fd5\-49e7\-8881\-ea32d08b4417\.config
+Windows x64 build and native smoke	Post Checkout	2026-10-15T22:12:58.6357320Z [command]"C:\Program Files\Git\bin\git.exe" config --local --get-all includeif.gitdir:/github/workspace/.git.path
+Windows x64 build and native smoke	Post Checkout	2026-10-15T22:12:58.6639238Z /github/runner_temp/git-credentials-6f15cf6c-1fd5-49e7-8881-ea32d08b4417.config
+Windows x64 build and native smoke	Post Checkout	2026-10-15T22:12:58.6680088Z [command]"C:\Program Files\Git\bin\git.exe" config --local --unset includeif.gitdir:/github/workspace/.git.path \/github\/runner_temp\/git\-credentials\-6f15cf6c\-1fd5\-49e7\-8881\-ea32d08b4417\.config
+Windows x64 build and native smoke	Post Checkout	2026-10-15T22:12:58.7037994Z [command]"C:\Program Files\Git\bin\git.exe" config --local --get-all includeif.gitdir:/github/workspace/.git/worktrees/*.path
+Windows x64 build and native smoke	Post Checkout	2026-10-15T22:12:58.7338191Z /github/runner_temp/git-credentials-6f15cf6c-1fd5-49e7-8881-ea32d08b4417.config
+Windows x64 build and native smoke	Post Checkout	2026-10-15T22:12:58.7384034Z [command]"C:\Program Files\Git\bin\git.exe" config --local --unset includeif.gitdir:/github/workspace/.git/worktrees/*.path \/github\/runner_temp\/git\-credentials\-6f15cf6c\-1fd5\-49e7\-8881\-ea32d08b4417\.config
+Windows x64 build and native smoke	Post Checkout	2026-10-15T22:12:58.7718640Z [command]"C:\Program Files\Git\bin\git.exe" submodule foreach --recursive "git config --local --show-origin --name-only --get-regexp remote.origin.url"
+Windows x64 build and native smoke	Post Checkout	2026-10-15T22:12:59.2765027Z Removing credentials config 'D:\a\_temp\git-credentials-6f15cf6c-1fd5-49e7-8881-ea32d08b4417.config'
+Windows x64 build and native smoke	Complete job	﻿2026-10-15T22:12:59.2983846Z Cleaning up orphan processes

@@ -1,0 +1,112 @@
+{
+  "schema": "aethyme.composition-inputs/provisional-v0",
+  "case": "HX06",
+  "trees": {
+    "t0": {
+      "accepted": true
+    }
+  },
+  "contributions": [
+    {
+      "id": "c1",
+      "base": "tree:t0",
+      "atomic_group": "g1"
+    },
+    {
+      "id": "c2",
+      "base": "tree:t0",
+      "atomic_group": "g1",
+      "requires": [
+        "c1"
+      ]
+    },
+    {
+      "id": "c3",
+      "base": "tree:t0",
+      "atomic_group": "g1",
+      "revision_of": "c1"
+    },
+    {
+      "id": "c4",
+      "base": "tree:t0",
+      "requires": [
+        "c5"
+      ]
+    },
+    {
+      "id": "c5",
+      "base": "tree:t0",
+      "requires": [
+        "c4"
+      ]
+    }
+  ],
+  "scenarios": [
+    {
+      "id": "s1",
+      "baseline": "t0",
+      "request": {
+        "compose": [
+          "c1",
+          "c2"
+        ]
+      },
+      "orders": [
+        [
+          "c1",
+          "c2"
+        ]
+      ],
+      "commutative": false
+    },
+    {
+      "id": "s2",
+      "baseline": "t0",
+      "request": {
+        "compose": [
+          "c2"
+        ]
+      },
+      "orders": [
+        [
+          "c2"
+        ]
+      ],
+      "commutative": false
+    },
+    {
+      "id": "s3",
+      "baseline": "t0",
+      "request": {
+        "compose": [
+          "c4",
+          "c5"
+        ]
+      },
+      "orders": [
+        [
+          "c4",
+          "c5"
+        ]
+      ],
+      "commutative": false
+    },
+    {
+      "id": "s4",
+      "baseline": "t0",
+      "request": {
+        "compose": [
+          "c3",
+          "c2"
+        ]
+      },
+      "orders": [
+        [
+          "c3",
+          "c2"
+        ]
+      ],
+      "commutative": false
+    }
+  ]
+}

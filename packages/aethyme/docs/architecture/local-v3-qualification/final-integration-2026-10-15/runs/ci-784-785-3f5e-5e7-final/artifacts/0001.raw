@@ -1,0 +1,49 @@
+# PR 784 / 785 CI evidence capture
+
+Captured at 2026-10-15 22:46:34 UTC with read-only GitHub API requests using `gh` and a clean `PATH`; the final #784 job-status and available-log refresh was received at 22:48:44 UTC. No workflow was rerun and no repository checkout was modified. `bundle-inventory.json` records byte sizes and SHA-256 values for the evidence files; it excludes itself and `SHA256SUMS`. `SHA256SUMS` binds every file except itself, including the inventory.
+
+## Requested runs and exact CI checkouts
+
+| PR | PR head used by the run | Actions run | Merge checkout SHA | Merge tree | Outcome at capture |
+|---|---|---|---|---|---|
+| 784 | `3f5e23adb49a50230eec28f287a8f2060d6e3f05` | Windows `38817965846`; OSS CI `38817965918` | `732c8fbff708a52b627fd1b58be63ae95f9dca73` | `35c5d2b64e51b240fa18253e190aa9abbd2d1b75` | Windows and lint failed; workspace job later cancelled; product path and doctests passed |
+| 785 | `5e7fe7bf533ad269e03b8baa6e0afbfc38694f06` | Windows `38815529979`; OSS CI `38815530375` | `c72d80af88e6957be50adb2b45dfd70051b5ab58` | `bb712b8f6baa06bc52cd2ad726fc3bf3cb5e35a1` | Windows and workspace failed; lint, product path, and doctests passed |
+
+The GitHub PR API merge commit and the Actions checkout logs agree on these merge SHAs. The merge commit API responses preserve each merge commit's two parents: #784 merges base `5e7fe7bf533ad269e03b8baa6e0afbfc38694f06` with head `3f5e23adb49a50230eec28f287a8f2060d6e3f05`; #785 merges base `8daffab2bb80ae0cce8286c530d70fad42c033f5` with head `5e7fe7bf533ad269e03b8baa6e0afbfc38694f06`. Recursive tree responses are complete (`truncated=false`; 3,050 entries for #784 and 3,042 for #785).
+
+A later read-only PR refresh showed #784 had already advanced to head `469a2d158a743968907bde9db847dc5217de508a` and merge SHA `40ce144946da2af86e6fe8de527ca0dbfcfc370c`. The failing run listed above remains specifically bound to its earlier `3f5e23a` head. #785 remained at `5e7fe7b`.
+
+## Diagnosed failures
+
+### PR 784
+
+- The Windows x64 job failed during `actions/checkout` while checking out `refs/remotes/pull/784/merge`, before build or native smoke steps. Git for Windows reports `Filename too long` for tracked paths under `packages/aethyme/docs/architecture/local-v3-qualification/sensitive-response-2026-10-15/payloads/current-source/mutations/`; checkout exits 128. See `raw-784-win.log` (checkout/failure around lines 531–538).
+- The lint job failed only at `cargo fmt --all -- --check`. The raw job log shows two formatting diffs in `packages/aethyme/rust/crates/aethyme-broker/src/execution_verifier/tests.rs` around lines 235 and 449, both long `capture(...)` calls. Clippy and the dependency audit were skipped after formatting failed. See `raw-784-lint.log` around lines 492–528.
+- A final API refresh marked run `38817965918` and workspace job `116707659366` cancelled (updated `2026-10-15T22:45:17Z`). The now-available raw log reaches nextest progress `2274/4623`, then reports `The operation was canceled.` It contains 50 `TRY 1 FAIL` events for 50 distinct tests before cancellation; this is observed progress, not a completed test count or terminal failure denominator. No final workspace test summary is present. The first log GET had returned HTTP 404 / `BlobNotFound` at 22:44:19Z; that response remains preserved in `unavailable-784-workspace-log-response.xml` plus `.stderr`. A following GET returned HTTP 200 headers but the CLI refused to print ANSI log contents; its response and diagnostic are preserved in `refresh-log-784-workspace-after-cancel.raw` and `.stderr`. The successful retry used `--allow-escape-sequences`; its headers plus unmodified log body are preserved in `raw-784-workspace-after-cancel.log`.
+- The first two verifier failures in that raw log are source-mapped to the retained test snapshot: `trusted_operator_rotates_and_revokes_exact_producer_generations` panics at `tests.rs:135` on `configure(...).unwrap()` with `Mismatch`; the frozen source builds a policy without capturing the canonical harness inventory. `retained_journal_is_required_and_mismatches_are_refused` panics at `tests.rs:740` with `Io(NotFound)` during evidence loading; the materialized inventory lookup uses the wrong nested path. The corresponding source test fixture and materialized-path corrections were separately reviewed, but this cancelled CI run does not validate them.
+
+### PR 785
+
+- The Windows x64 job failed during `actions/checkout` of `refs/remotes/pull/785/merge`, before build or native smoke steps, with the same Git for Windows `Filename too long` checkout failure and exit 128. See `raw-785-win.log` around lines 531–538.
+- The merge tree's longest tracked file path is 259 characters relative to the repository root: `packages/aethyme/docs/architecture/local-v3-qualification/sensitive-response-2026-10-15/payloads/current-source/mutations/m4-publish-database-receipt-before-table-delete/mutated-source/packages/aethyme/rust/crates/aethyme-broker/src/collaboration_sensitive.rs`. The runner checkout root shown in the log is `D:\a\Aethyme\Aethyme`; the full path is 280 characters. This source path is present in both merge trees. The errors name M1 and M3 mutated-source files, M4 backup `.gitattributes` and source files, and the M4 mutated-source directory.
+- The workspace run completed 4,602 tests: 4,601 passed, 1 failed, 32 skipped. `aethyme-testkit::docs_hygiene::documentation_has_last_updated` fails at `crates/aethyme-testkit/tests/docs_hygiene.rs:309` because three tracked Markdown evidence plans lack either `Last Updated:` or `Last Reviewed:`. The exact paths reported by CI are:
+  - `packages/aethyme/docs/architecture/local-v3-qualification/sensitive-response-2026-10-15/payloads/history/session1128/frozen-pretrial/t56-runtime-drill-plan-v3-2026-10-15.md`
+  - `packages/aethyme/docs/architecture/local-v3-qualification/sensitive-response-2026-10-15/payloads/history/session1128/frozen-pretrial/t56-runtime-drill-plan-v4-draft-2026-10-15.md`
+  - `packages/aethyme/docs/architecture/local-v3-qualification/sensitive-response-2026-10-15/payloads/protocol/t56-runtime-drill-plan-v4-2026-10-15.md`
+
+## Source bindings
+
+- `tree-784.json` binds PR 784's full path set to merge tree `35c5d2b...`; `src-784-execution-verifier-tests.rs` is the exact test source blob `22ccf189f4760abe9a6c8386c6163c8981e88e42` referenced by the format failure.
+- `tree-785.json` binds PR 785's full path set to merge tree `bb712b8...`. `src-docs_hygiene.rs` is the exact test source blob `942479f6c5b0525ae3e22e588b5d95534599cfce`; the three `src-t56-*.md` files are the exact blobs at the paths above. `src-longpath-collaboration_sensitive.rs` is the exact blob stored at the longest nested tracked path.
+- The corresponding raw GitHub blob JSON files are retained beside each decoded source file. Tree entries provide blob IDs, Git modes, and byte sizes; merge commit API objects bind them to the exact CI merge checkouts.
+
+## Capture contents
+
+- `root-ci-snapshot.summary.json` and `.raw.json` are byte copies of the root's 22:36:25Z CI snapshot and source response.
+- `pr-*.json`, `run-*.json`, `run-*-jobs.json`, `merge-*.json`, `tree-*.json`, `branch-*-runs.json`, and `refresh-*.json` preserve GitHub's PR, run, job, merge, tree, and later status responses. `refresh-run-784-oss-final.json` and `refresh-jobs-784-oss-final.json` bind the cancellation status to the run and job IDs above.
+- `raw-*.log` are full per-job logs returned from the Actions job-log API with escape sequences allowed. `log-*.txt` are the `gh run view --log` aggregate captures; empty files and corresponding stderr are retained where GitHub had not made a log available yet.
+- `raw-784-workspace-after-cancel.log` preserves the later successful workspace-job log GET, including response headers; the earlier 404 response is also retained separately.
+- `blob-*.json` retain exact source blob API responses; `src-*` files are their decoded bytes.
+- `api-log-785-workspace.raw` is a second unaggregated workspace log response captured directly from the run log endpoint.
+
+All GitHub requests were GET-only. The `gh run list` files and original root snapshot are kept to show the state that led to these exact run IDs; no rerun, cancellation, retry, or mutation was performed by this reviewer.

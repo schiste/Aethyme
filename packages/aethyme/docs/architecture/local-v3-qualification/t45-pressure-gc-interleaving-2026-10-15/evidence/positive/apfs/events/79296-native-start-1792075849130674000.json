@@ -1,0 +1,13 @@
+{
+  "args": [
+    "-convert",
+    "json",
+    "-o",
+    "-",
+    "/Volumes/T7-repositories/Application Support/Aethyme/qualification/local-check-temporaries/t45-gc-apfs-source-pressure-positive-4b5f3bc-tmp-m7bukujf/.tmp8VK9Y3/.tmpfqwFEz"
+  ],
+  "command": 4,
+  "deadline_seconds": 10,
+  "output_limit_each": 1048576,
+  "program": "/usr/bin/plutil"
+}

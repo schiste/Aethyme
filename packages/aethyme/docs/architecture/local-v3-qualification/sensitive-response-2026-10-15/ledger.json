@@ -1,0 +1,2638 @@
+{
+  "attempts": [
+    {
+      "denominator": {
+        "failed": 0,
+        "ignored": 0,
+        "passed": 28
+      },
+      "evidence_prefix": "payloads/current-source/sensitive-module/",
+      "exit_code": 0,
+      "id": "current-sensitive-module",
+      "result": "PASS",
+      "selector": "collaboration_sensitive::tests",
+      "source_binding_complete": true,
+      "source_dirty_diff_sha256": null,
+      "source_dirty_state": "clean",
+      "source_head": "425a0bc8e41031cea6b0ff8b5bc0e9cc80748b31",
+      "source_tree": "01f8a9f6a51818732cf6feb38125a34c81745d5b",
+      "source_unchanged": true,
+      "test_summary": "28 passed; 0 failed; 0 ignored"
+    },
+    {
+      "command": "cargo clippy --locked -j4 -p aethyme-broker --all-targets -- -D warnings",
+      "evidence_prefix": "payloads/current-source/strict-clippy/",
+      "exit_code": 0,
+      "id": "current-strict-broker-clippy",
+      "result": "PASS",
+      "source_binding_complete": true,
+      "source_dirty_diff_sha256": null,
+      "source_dirty_state": "clean",
+      "source_head": "425a0bc8e41031cea6b0ff8b5bc0e9cc80748b31",
+      "source_tree": "01f8a9f6a51818732cf6feb38125a34c81745d5b",
+      "source_unchanged": true
+    },
+    {
+      "diagnostic": "schema 24; readable only by binaries supporting schema 24 or later; this binary supports 23",
+      "disposable_state_unchanged": true,
+      "evidence_prefix": "payloads/current-source/old-v23-fence/floor24-positive/",
+      "exit_code": 0,
+      "id": "old-v23-schema24-positive",
+      "numeric_exit_status_evidence": "payloads/current-source/old-v23-fence/floor24-positive/old-v23-status-status.json",
+      "old_binary_sha256": "1268402c5d49ac303b61bc28b4e4726bf95b1d17d64d7099850f2f67950f7e6f",
+      "refusal_code": "schema_too_new",
+      "result": "PASS",
+      "source_binding_complete": true,
+      "source_dirty_diff_sha256": null,
+      "source_dirty_state": "clean",
+      "source_head": "425a0bc8e41031cea6b0ff8b5bc0e9cc80748b31",
+      "source_tree": "01f8a9f6a51818732cf6feb38125a34c81745d5b",
+      "test_summary": null
+    },
+    {
+      "evidence_prefix": "payloads/current-source/old-v23-fence/floor23-negative-control/",
+      "exit_code": 0,
+      "id": "old-v23-floor23-negative-control",
+      "input_state_mutation": "payloads/current-source/old-v23-fence/floor23-negative-control/floor-mutation.json",
+      "note": "After lowering only min_compatible_schema to 23, the exact schema_too_new diagnostic disappears; this is a negative control, not a product failure.",
+      "numeric_exit_status_evidence": "payloads/current-source/old-v23-fence/floor23-negative-control/old-v23-floor23-control-status.json",
+      "oracle_credit": true,
+      "result": "EXPECTED_CONTROL_FAILURE",
+      "source_binding_complete": true,
+      "source_dirty_diff_sha256": null,
+      "source_dirty_state": "source code clean; disposable fixture DB floor row was changed and separately recorded",
+      "source_head": "425a0bc8e41031cea6b0ff8b5bc0e9cc80748b31",
+      "source_tree": "01f8a9f6a51818732cf6feb38125a34c81745d5b"
+    },
+    {
+      "evidence_prefix": "payloads/current-source/mutations/m1-response-gated-archive-read/",
+      "exit_code": 101,
+      "id": "M1-response-gated-archive-read",
+      "independent_raw_log_reconciliation": "payloads/current-source/mutations/m1-response-gated-archive-read/reconciliation.json",
+      "note": "Original recorder exact_named_test_failed was false due output parser format; byte-preserved reconciliation sidecar verifies exact selected test/assertion. No rerun.",
+      "oracle_credit": true,
+      "result": "EXPECTED_MUTANT_DETECTION_RECONCILED",
+      "runner_status_mutation_oracle_credit": false,
+      "source_binding_complete": true,
+      "source_dirty_diff_sha256": null,
+      "source_dirty_file_paths": [
+        "packages/aethyme/rust/crates/aethyme-broker/src/collaboration_archive.rs"
+      ],
+      "source_dirty_state": "one named source mutation applied then byte-identically restored",
+      "source_head": "425a0bc8e41031cea6b0ff8b5bc0e9cc80748b31",
+      "source_restore_exact": true,
+      "source_tree": "01f8a9f6a51818732cf6feb38125a34c81745d5b",
+      "test_summary": "0 passed; 1 failed; 0 ignored"
+    },
+    {
+      "evidence_prefix": "payloads/current-source/mutations/m2-omit-generations-root/",
+      "exit_code": 101,
+      "id": "M2-m2-omit-generations-root",
+      "oracle_credit": true,
+      "result": "EXPECTED_MUTANT_DETECTION",
+      "source_binding_complete": true,
+      "source_dirty_diff_sha256": null,
+      "source_dirty_file_paths": [
+        "packages/aethyme/rust/crates/aethyme-broker/src/collaboration_sensitive.rs"
+      ],
+      "source_dirty_state": "one named source mutation applied then byte-identically restored",
+      "source_head": "425a0bc8e41031cea6b0ff8b5bc0e9cc80748b31",
+      "source_restore_exact": true,
+      "source_tree": "01f8a9f6a51818732cf6feb38125a34c81745d5b",
+      "source_unchanged_after_restore": true,
+      "test_summary": "0 passed; 1 failed; 0 ignored"
+    },
+    {
+      "evidence_prefix": "payloads/current-source/mutations/m3-omit-import-rehearsals-root/",
+      "exit_code": 101,
+      "id": "M3-m3-omit-import-rehearsals-root",
+      "oracle_credit": true,
+      "result": "EXPECTED_MUTANT_DETECTION",
+      "source_binding_complete": true,
+      "source_dirty_diff_sha256": null,
+      "source_dirty_file_paths": [
+        "packages/aethyme/rust/crates/aethyme-broker/src/collaboration_sensitive.rs"
+      ],
+      "source_dirty_state": "one named source mutation applied then byte-identically restored",
+      "source_head": "425a0bc8e41031cea6b0ff8b5bc0e9cc80748b31",
+      "source_restore_exact": true,
+      "source_tree": "01f8a9f6a51818732cf6feb38125a34c81745d5b",
+      "source_unchanged_after_restore": true,
+      "test_summary": "0 passed; 1 failed; 0 ignored"
+    },
+    {
+      "evidence_prefix": "payloads/current-source/mutations/m4-publish-database-receipt-before-table-delete/",
+      "exit_code": 101,
+      "id": "M4-m4-publish-database-receipt-before-table-delete",
+      "oracle_credit": true,
+      "result": "EXPECTED_MUTANT_DETECTION",
+      "source_binding_complete": true,
+      "source_dirty_diff_sha256": null,
+      "source_dirty_file_paths": [
+        "packages/aethyme/rust/crates/aethyme-broker/src/collaboration_sensitive.rs"
+      ],
+      "source_dirty_state": "one named source mutation applied then byte-identically restored",
+      "source_head": "425a0bc8e41031cea6b0ff8b5bc0e9cc80748b31",
+      "source_restore_exact": true,
+      "source_tree": "01f8a9f6a51818732cf6feb38125a34c81745d5b",
+      "source_unchanged_after_restore": true,
+      "test_summary": "0 passed; 1 failed; 0 ignored"
+    },
+    {
+      "evidence_prefix": "payloads/current-source/mutations/m5-delete-view-despite-live-hold/",
+      "exit_code": 101,
+      "id": "M5-m5-delete-view-despite-live-hold",
+      "oracle_credit": true,
+      "result": "EXPECTED_MUTANT_DETECTION",
+      "source_binding_complete": true,
+      "source_dirty_diff_sha256": null,
+      "source_dirty_file_paths": [
+        "packages/aethyme/rust/crates/aethyme-broker/src/collaboration_sensitive.rs"
+      ],
+      "source_dirty_state": "one named source mutation applied then byte-identically restored",
+      "source_head": "425a0bc8e41031cea6b0ff8b5bc0e9cc80748b31",
+      "source_restore_exact": true,
+      "source_tree": "01f8a9f6a51818732cf6feb38125a34c81745d5b",
+      "source_unchanged_after_restore": true,
+      "test_summary": "0 passed; 1 failed; 0 ignored"
+    },
+    {
+      "evidence_prefix": "payloads/current-source/mutations/m6-lower-minimum-compatible-schema/",
+      "exit_code": 101,
+      "id": "M6-m6-lower-minimum-compatible-schema",
+      "oracle_credit": true,
+      "result": "EXPECTED_MUTANT_DETECTION",
+      "source_binding_complete": true,
+      "source_dirty_diff_sha256": null,
+      "source_dirty_file_paths": [
+        "packages/aethyme/rust/crates/aethyme-broker/src/collaboration_state.rs"
+      ],
+      "source_dirty_state": "one named source mutation applied then byte-identically restored",
+      "source_head": "425a0bc8e41031cea6b0ff8b5bc0e9cc80748b31",
+      "source_restore_exact": true,
+      "source_tree": "01f8a9f6a51818732cf6feb38125a34c81745d5b",
+      "source_unchanged_after_restore": true,
+      "test_summary": "0 passed; 1 failed; 0 ignored"
+    },
+    {
+      "evidence_prefix": "payloads/current-source/mutations/m7-accept-nonempty-capture-locks/",
+      "exit_code": 101,
+      "id": "M7-m7-accept-nonempty-capture-locks",
+      "oracle_credit": true,
+      "result": "EXPECTED_MUTANT_DETECTION",
+      "source_binding_complete": true,
+      "source_dirty_diff_sha256": null,
+      "source_dirty_file_paths": [
+        "packages/aethyme/rust/crates/aethyme-broker/src/collaboration_sensitive.rs"
+      ],
+      "source_dirty_state": "one named source mutation applied then byte-identically restored",
+      "source_head": "425a0bc8e41031cea6b0ff8b5bc0e9cc80748b31",
+      "source_restore_exact": true,
+      "source_tree": "01f8a9f6a51818732cf6feb38125a34c81745d5b",
+      "source_unchanged_after_restore": true,
+      "test_summary": "0 passed; 1 failed; 0 ignored"
+    },
+    {
+      "evidence_prefix": "payloads/current-source/mutations/m8-skip-typed-directory-removal/",
+      "exit_code": 101,
+      "id": "M8-m8-skip-typed-directory-removal",
+      "oracle_credit": true,
+      "result": "EXPECTED_MUTANT_DETECTION",
+      "source_binding_complete": true,
+      "source_dirty_diff_sha256": null,
+      "source_dirty_file_paths": [
+        "packages/aethyme/rust/crates/aethyme-broker/src/collaboration_sensitive.rs"
+      ],
+      "source_dirty_state": "one named source mutation applied then byte-identically restored",
+      "source_head": "425a0bc8e41031cea6b0ff8b5bc0e9cc80748b31",
+      "source_restore_exact": true,
+      "source_tree": "01f8a9f6a51818732cf6feb38125a34c81745d5b",
+      "source_unchanged_after_restore": true,
+      "test_summary": "0 passed; 1 failed; 0 ignored"
+    }
+  ],
+  "attempts_total": 38,
+  "created_at_utc": "2026-10-16",
+  "files": [
+    {
+      "bytes": 451,
+      "sha256": "a4c7c91e39c81aa28333759709cb14d22140941b6c71b7d59c77987bfb826406",
+      "path": "artifacts/0001.raw",
+      "logical_path": "current-source/base-source.json",
+      "media_type": "application/json",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 116178,
+      "sha256": "241764af8a693bb0e5618aebc2c80f8e3f833d989adb8099ca51d8e08ac549f5",
+      "path": "artifacts/0002.raw",
+      "logical_path": "current-source/mutations/m1-response-gated-archive-read/backup/packages/aethyme/rust/crates/aethyme-broker/src/collaboration_archive.rs",
+      "media_type": "text/x-rust",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 1344,
+      "sha256": "e77059f48d1536c4546348bb2bd41e983d2118e4b7b466bae1bfb1f8ccd2703e",
+      "path": "artifacts/0003.raw",
+      "logical_path": "current-source/mutations/m1-response-gated-archive-read/command.json",
+      "media_type": "application/json",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 2317,
+      "sha256": "342907c912cba5e53ee1690199a683943e3af3f8a4b359e37562224e758f96c6",
+      "path": "artifacts/0004.raw",
+      "logical_path": "current-source/mutations/m1-response-gated-archive-read/command.log",
+      "media_type": "text/plain",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 116104,
+      "sha256": "17aa4789f0a2294bafd8d5090dfd2633ac43f36d7e8a2c417d193e2d2284e1e3",
+      "path": "artifacts/0005.raw",
+      "logical_path": "current-source/mutations/m1-response-gated-archive-read/mutated-source/packages/aethyme/rust/crates/aethyme-broker/src/collaboration_archive.rs",
+      "media_type": "text/x-rust",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 404,
+      "sha256": "184592a5c9a10e5ef8caeb0c4d9ee714ca07a02f86a2e04ac7b844ccca649099",
+      "path": "artifacts/0006.raw",
+      "logical_path": "current-source/mutations/m1-response-gated-archive-read/mutation.patch",
+      "media_type": "text/x-diff",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 1364,
+      "sha256": "df791052c5ce6c8b598a9ca60948141ad4ec8a59e6ae8bc119edc5eca3a54789",
+      "path": "artifacts/0007.raw",
+      "logical_path": "current-source/mutations/m1-response-gated-archive-read/reconciliation.json",
+      "media_type": "application/json",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 248,
+      "sha256": "b60aa18afd763a12fa6387ae45dc61782a08c9f6e51fee6c47f4b3e41274c3ed",
+      "path": "artifacts/0008.raw",
+      "logical_path": "current-source/mutations/m1-response-gated-archive-read/running.json",
+      "media_type": "application/json",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 1380,
+      "sha256": "f3354bffff128ccc6931494d616c3816deda053c8dc4ef869b7c9233737a565b",
+      "path": "artifacts/0009.raw",
+      "logical_path": "current-source/mutations/m1-response-gated-archive-read/source-binding.json",
+      "media_type": "application/json",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 1573,
+      "sha256": "2b054efd56c46c8436c892269242b689dad9fcfa549c3ba72b1cd1c5f7a5b1c3",
+      "path": "artifacts/0010.raw",
+      "logical_path": "current-source/mutations/m1-response-gated-archive-read/status.json",
+      "media_type": "application/json",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 193627,
+      "sha256": "cbc9ee50c65628f145d9d7fd3180e3f5f73a21ffaab01e7b6dcefe7b8a4b9ac1",
+      "path": "artifacts/0011.raw",
+      "logical_path": "current-source/mutations/m2-omit-generations-root/backup/packages/aethyme/rust/crates/aethyme-broker/src/collaboration_sensitive.rs",
+      "media_type": "text/x-rust",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 1304,
+      "sha256": "e419f5c5e2b73b2cde2b049bc686df1a63addbc80e641894cbb07e5de47298fe",
+      "path": "artifacts/0012.raw",
+      "logical_path": "current-source/mutations/m2-omit-generations-root/command.json",
+      "media_type": "application/json",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 1381,
+      "sha256": "ea2e4787d9e1ea7f5e9c8ffe9f13bc0ab3f2c5efe9cafc0194c731b33bca0025",
+      "path": "artifacts/0013.raw",
+      "logical_path": "current-source/mutations/m2-omit-generations-root/command.log",
+      "media_type": "text/plain",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 193601,
+      "sha256": "02b5cafbf89c9e7b7c5384a9d440d88c13ad41caf12428a6e367abeb3c65b519",
+      "path": "artifacts/0014.raw",
+      "logical_path": "current-source/mutations/m2-omit-generations-root/mutated-source/packages/aethyme/rust/crates/aethyme-broker/src/collaboration_sensitive.rs",
+      "media_type": "text/x-rust",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 580,
+      "sha256": "b71a3079a8102215b0d40f02e708847292955f8145b1333cf393f47c2e44f58b",
+      "path": "artifacts/0015.raw",
+      "logical_path": "current-source/mutations/m2-omit-generations-root/mutation.patch",
+      "media_type": "text/x-diff",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 242,
+      "sha256": "89d614130a919f2691f00215bbcdaf0470c06b679467c9919361e86c396c550b",
+      "path": "artifacts/0016.raw",
+      "logical_path": "current-source/mutations/m2-omit-generations-root/running.json",
+      "media_type": "application/json",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 1344,
+      "sha256": "ac59029a2087c3de2c0e0dacf8f324a292c65ec061cac3ff73bd2d38f967d6b1",
+      "path": "artifacts/0017.raw",
+      "logical_path": "current-source/mutations/m2-omit-generations-root/source-binding.json",
+      "media_type": "application/json",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 1539,
+      "sha256": "c7c7e13376172984f2498071a6d07e6c657dca8d0c5376675e52add71b20fd3a",
+      "path": "artifacts/0018.raw",
+      "logical_path": "current-source/mutations/m2-omit-generations-root/status.json",
+      "media_type": "application/json",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 193627,
+      "sha256": "cbc9ee50c65628f145d9d7fd3180e3f5f73a21ffaab01e7b6dcefe7b8a4b9ac1",
+      "path": "artifacts/0019.raw",
+      "logical_path": "current-source/mutations/m3-omit-import-rehearsals-root/backup/packages/aethyme/rust/crates/aethyme-broker/src/collaboration_sensitive.rs",
+      "media_type": "text/x-rust",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 1315,
+      "sha256": "27b37ec73c10956d0222e8639207d56daecff4c2d96c1383187b11a266cbd123",
+      "path": "artifacts/0020.raw",
+      "logical_path": "current-source/mutations/m3-omit-import-rehearsals-root/command.json",
+      "media_type": "application/json",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 1209,
+      "sha256": "c5ec46e037baf83f728de45c902a5fc3b84bca35241b0f62f0235e23e0d2f8c9",
+      "path": "artifacts/0021.raw",
+      "logical_path": "current-source/mutations/m3-omit-import-rehearsals-root/command.log",
+      "media_type": "text/plain",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 193595,
+      "sha256": "c14e4ffaf4545989d5795f62561c3b4a70303a7bbfb863cd4ecda964bddcd2c9",
+      "path": "artifacts/0022.raw",
+      "logical_path": "current-source/mutations/m3-omit-import-rehearsals-root/mutated-source/packages/aethyme/rust/crates/aethyme-broker/src/collaboration_sensitive.rs",
+      "media_type": "text/x-rust",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 574,
+      "sha256": "beea661418671611567b3f5af0958d2e0833e4f0acae32d06f122b396634a701",
+      "path": "artifacts/0023.raw",
+      "logical_path": "current-source/mutations/m3-omit-import-rehearsals-root/mutation.patch",
+      "media_type": "text/x-diff",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 248,
+      "sha256": "f9c68036d8b3409cce2d594606c4bccb66b10c5bf3de8c05d4ee199eec9c0a28",
+      "path": "artifacts/0024.raw",
+      "logical_path": "current-source/mutations/m3-omit-import-rehearsals-root/running.json",
+      "media_type": "application/json",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 1355,
+      "sha256": "fd58aaee277b1eda2c20393c54657be89ba37a81a78887571e8d5bcfa0b2c37d",
+      "path": "artifacts/0025.raw",
+      "logical_path": "current-source/mutations/m3-omit-import-rehearsals-root/source-binding.json",
+      "media_type": "application/json",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 1544,
+      "sha256": "737a3a76db92cf192a44e3e4363712ce1f26f9b06bf639e3ba7ac54dd298923c",
+      "path": "artifacts/0026.raw",
+      "logical_path": "current-source/mutations/m3-omit-import-rehearsals-root/status.json",
+      "media_type": "application/json",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 193627,
+      "sha256": "cbc9ee50c65628f145d9d7fd3180e3f5f73a21ffaab01e7b6dcefe7b8a4b9ac1",
+      "path": "artifacts/0027.raw",
+      "logical_path": "current-source/mutations/m4-publish-database-receipt-before-table-delete/backup/packages/aethyme/rust/crates/aethyme-broker/src/collaboration_sensitive.rs",
+      "media_type": "text/x-rust",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 1309,
+      "sha256": "a71d17ff081f44b6a45be42c09bfd4b7089c88def1bbd75707972e603a41d0db",
+      "path": "artifacts/0028.raw",
+      "logical_path": "current-source/mutations/m4-publish-database-receipt-before-table-delete/command.json",
+      "media_type": "application/json",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 1212,
+      "sha256": "0bd3bf092aaaeffef40be84498d968fa79efcccc2e1d6cd4c478f2616314f475",
+      "path": "artifacts/0029.raw",
+      "logical_path": "current-source/mutations/m4-publish-database-receipt-before-table-delete/command.log",
+      "media_type": "text/plain",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 193900,
+      "sha256": "aa2c1761aac4624fed9dffcdbec3bf8e438cccc26012ea7b3742cc5317db5788",
+      "path": "artifacts/0030.raw",
+      "logical_path": "current-source/mutations/m4-publish-database-receipt-before-table-delete/mutated-source/packages/aethyme/rust/crates/aethyme-broker/src/collaboration_sensitive.rs",
+      "media_type": "text/x-rust",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 762,
+      "sha256": "b4eddc19933240373d4146fdd127d8fbc910d8636b5ac5e707cdec1296174795",
+      "path": "artifacts/0031.raw",
+      "logical_path": "current-source/mutations/m4-publish-database-receipt-before-table-delete/mutation.patch",
+      "media_type": "text/x-diff",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 263,
+      "sha256": "3f152ce24054356cad7e3227dfcd97b7003d05ed5610a1fa3cc79464e31a6868",
+      "path": "artifacts/0032.raw",
+      "logical_path": "current-source/mutations/m4-publish-database-receipt-before-table-delete/running.json",
+      "media_type": "application/json",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 1349,
+      "sha256": "3b2b1c7b4ccfba2a977adfd862eb621566ea0ca7425f0167dcaad86388082d5d",
+      "path": "artifacts/0033.raw",
+      "logical_path": "current-source/mutations/m4-publish-database-receipt-before-table-delete/source-binding.json",
+      "media_type": "application/json",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 1528,
+      "sha256": "a3fa5668b8b1893886693bd0cd2c43c06cb2617563d77c56d6431ff3d136b0f7",
+      "path": "artifacts/0034.raw",
+      "logical_path": "current-source/mutations/m4-publish-database-receipt-before-table-delete/status.json",
+      "media_type": "application/json",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 193627,
+      "sha256": "cbc9ee50c65628f145d9d7fd3180e3f5f73a21ffaab01e7b6dcefe7b8a4b9ac1",
+      "path": "artifacts/0035.raw",
+      "logical_path": "current-source/mutations/m5-delete-view-despite-live-hold/backup/packages/aethyme/rust/crates/aethyme-broker/src/collaboration_sensitive.rs",
+      "media_type": "text/x-rust",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 1292,
+      "sha256": "507b7b4b9453b5cdd0f0c8e1f37517817b2fb4d4e4f6e749613c37206e97d10b",
+      "path": "artifacts/0036.raw",
+      "logical_path": "current-source/mutations/m5-delete-view-despite-live-hold/command.json",
+      "media_type": "application/json",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 1139,
+      "sha256": "7ef49a31cf47234d056bbe294dfe05141eac65ae3788518708b42edaf16bb4f4",
+      "path": "artifacts/0037.raw",
+      "logical_path": "current-source/mutations/m5-delete-view-despite-live-hold/command.log",
+      "media_type": "text/plain",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 193521,
+      "sha256": "6994282ea7bb2a4028cb86637e132d9ae312ef95d839ba779f2edf4d25488d7d",
+      "path": "artifacts/0038.raw",
+      "logical_path": "current-source/mutations/m5-delete-view-despite-live-hold/mutated-source/packages/aethyme/rust/crates/aethyme-broker/src/collaboration_sensitive.rs",
+      "media_type": "text/x-rust",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 556,
+      "sha256": "70dce3313c13d1acf0cb889b278f4be5741fc68064ed4d49aae4df9141853744",
+      "path": "artifacts/0039.raw",
+      "logical_path": "current-source/mutations/m5-delete-view-despite-live-hold/mutation.patch",
+      "media_type": "text/x-diff",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 249,
+      "sha256": "0cd932e8ea8e5a9f415ae72a93cdb4d7701263a5294ff6c38577177ef053dd9a",
+      "path": "artifacts/0040.raw",
+      "logical_path": "current-source/mutations/m5-delete-view-despite-live-hold/running.json",
+      "media_type": "application/json",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 1332,
+      "sha256": "24193f2a4e50603ba0b964660da0f0b4d86de27a60f01dcd03a8a9063c29d1cb",
+      "path": "artifacts/0041.raw",
+      "logical_path": "current-source/mutations/m5-delete-view-despite-live-hold/source-binding.json",
+      "media_type": "application/json",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 1539,
+      "sha256": "3ce64e73fd1eaa3740c11e43921a6335529e4933f7e40365c12b62453627aa46",
+      "path": "artifacts/0042.raw",
+      "logical_path": "current-source/mutations/m5-delete-view-despite-live-hold/status.json",
+      "media_type": "application/json",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 90149,
+      "sha256": "bef0d8042a5ccf030b1c15010973735d81ae27baf9b97a46809d6636d02b1fd9",
+      "path": "artifacts/0043.raw",
+      "logical_path": "current-source/mutations/m6-lower-minimum-compatible-schema/backup/packages/aethyme/rust/crates/aethyme-broker/src/collaboration_state.rs",
+      "media_type": "text/x-rust",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 1264,
+      "sha256": "c8de415898b903fb7691478ca523a1e0328b8446a58e6dc20f12ba6e9630773c",
+      "path": "artifacts/0044.raw",
+      "logical_path": "current-source/mutations/m6-lower-minimum-compatible-schema/command.json",
+      "media_type": "application/json",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 1138,
+      "sha256": "4bb204c78ebdf80374b8d6be853670bf8bd0791b8d1f95c42a06b2db20ac7eee",
+      "path": "artifacts/0045.raw",
+      "logical_path": "current-source/mutations/m6-lower-minimum-compatible-schema/command.log",
+      "media_type": "text/plain",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 90149,
+      "sha256": "ea4c4f57d0748cb88ae5e466473841c763bad09c3f35f37b319f3c2da9e312bb",
+      "path": "artifacts/0046.raw",
+      "logical_path": "current-source/mutations/m6-lower-minimum-compatible-schema/mutated-source/packages/aethyme/rust/crates/aethyme-broker/src/collaboration_state.rs",
+      "media_type": "text/x-rust",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 675,
+      "sha256": "69d3e710eb5914f6c2b003cec96efee446c50344d8cc46c787e999578ebf2499",
+      "path": "artifacts/0047.raw",
+      "logical_path": "current-source/mutations/m6-lower-minimum-compatible-schema/mutation.patch",
+      "media_type": "text/x-diff",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 251,
+      "sha256": "b840200a4b96a358e6569ede2e62d355ad0f39a48256d3bb60bfa3a5eedd7a6d",
+      "path": "artifacts/0048.raw",
+      "logical_path": "current-source/mutations/m6-lower-minimum-compatible-schema/running.json",
+      "media_type": "application/json",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 1294,
+      "sha256": "a3dfdb73919d9a59f4a879b7531dd45963393e80fd9a7214dd57ce47cd64f03b",
+      "path": "artifacts/0049.raw",
+      "logical_path": "current-source/mutations/m6-lower-minimum-compatible-schema/source-binding.json",
+      "media_type": "application/json",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 1508,
+      "sha256": "935be5848044e3246b5aa7e737d54ab8d43ac2689a73a94055dc9e13137e5f67",
+      "path": "artifacts/0050.raw",
+      "logical_path": "current-source/mutations/m6-lower-minimum-compatible-schema/status.json",
+      "media_type": "application/json",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 193627,
+      "sha256": "cbc9ee50c65628f145d9d7fd3180e3f5f73a21ffaab01e7b6dcefe7b8a4b9ac1",
+      "path": "artifacts/0051.raw",
+      "logical_path": "current-source/mutations/m7-accept-nonempty-capture-locks/backup/packages/aethyme/rust/crates/aethyme-broker/src/collaboration_sensitive.rs",
+      "media_type": "text/x-rust",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 1322,
+      "sha256": "62174124e1c2d338789bfea7173afaffaf6149620794e71400bef1557b53d270",
+      "path": "artifacts/0052.raw",
+      "logical_path": "current-source/mutations/m7-accept-nonempty-capture-locks/command.json",
+      "media_type": "application/json",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 1169,
+      "sha256": "527c92024a231389e84d25a718f6ef72f6f51a5dbec7e89058040f97ea7ebc82",
+      "path": "artifacts/0053.raw",
+      "logical_path": "current-source/mutations/m7-accept-nonempty-capture-locks/command.log",
+      "media_type": "text/plain",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 193531,
+      "sha256": "1c26db126bca3652647a7d96c5c74b8fb92c15bf5054be9c5cd93ea2111859bb",
+      "path": "artifacts/0054.raw",
+      "logical_path": "current-source/mutations/m7-accept-nonempty-capture-locks/mutated-source/packages/aethyme/rust/crates/aethyme-broker/src/collaboration_sensitive.rs",
+      "media_type": "text/x-rust",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 1022,
+      "sha256": "179e2243b0e4436fcfc0b854c28e39cbb54c096e16a2087e42640c78e36113a6",
+      "path": "artifacts/0055.raw",
+      "logical_path": "current-source/mutations/m7-accept-nonempty-capture-locks/mutation.patch",
+      "media_type": "text/x-diff",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 249,
+      "sha256": "39fb05875616288cb006fee26093398c7163030b8c8c376603a74c8e42f9eb09",
+      "path": "artifacts/0056.raw",
+      "logical_path": "current-source/mutations/m7-accept-nonempty-capture-locks/running.json",
+      "media_type": "application/json",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 1362,
+      "sha256": "deebf30f54885ecbc10a71a2157128223c0042c58f1f84f0d9c807aad9d695bb",
+      "path": "artifacts/0057.raw",
+      "logical_path": "current-source/mutations/m7-accept-nonempty-capture-locks/source-binding.json",
+      "media_type": "application/json",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 1569,
+      "sha256": "a63536ef98ce04bb42078f2e175c9fb90e5af92616142bc3c5961545e9d72d70",
+      "path": "artifacts/0058.raw",
+      "logical_path": "current-source/mutations/m7-accept-nonempty-capture-locks/status.json",
+      "media_type": "application/json",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 193627,
+      "sha256": "cbc9ee50c65628f145d9d7fd3180e3f5f73a21ffaab01e7b6dcefe7b8a4b9ac1",
+      "path": "artifacts/0059.raw",
+      "logical_path": "current-source/mutations/m8-skip-typed-directory-removal/backup/packages/aethyme/rust/crates/aethyme-broker/src/collaboration_sensitive.rs",
+      "media_type": "text/x-rust",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 1351,
+      "sha256": "529bc53e040d2279a740213a132240305134071b9dc8222078a42124abf1c595",
+      "path": "artifacts/0060.raw",
+      "logical_path": "current-source/mutations/m8-skip-typed-directory-removal/command.json",
+      "media_type": "application/json",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 2597,
+      "sha256": "9410b1b4ec960590ae1247c2da954c1f1e4a14dea4dde1a197db890fc38fed14",
+      "path": "artifacts/0061.raw",
+      "logical_path": "current-source/mutations/m8-skip-typed-directory-removal/command.log",
+      "media_type": "text/plain",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 193648,
+      "sha256": "8d6cfa59b78e36bfffc6d064bf25a8ef9b4fbd84d7ec803248223f0e1110c1f1",
+      "path": "artifacts/0062.raw",
+      "logical_path": "current-source/mutations/m8-skip-typed-directory-removal/mutated-source/packages/aethyme/rust/crates/aethyme-broker/src/collaboration_sensitive.rs",
+      "media_type": "text/x-rust",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 424,
+      "sha256": "ee054b264b6ba3cc2bf3d1af289ee2d11d5a07ec2940863a25e4976911dd3fcf",
+      "path": "artifacts/0063.raw",
+      "logical_path": "current-source/mutations/m8-skip-typed-directory-removal/mutation.patch",
+      "media_type": "text/x-diff",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 248,
+      "sha256": "7e21d0aff7da4c10be69ed9b1bfa223aa68146eb0e0ce348d8966db9bf9a2384",
+      "path": "artifacts/0064.raw",
+      "logical_path": "current-source/mutations/m8-skip-typed-directory-removal/running.json",
+      "media_type": "application/json",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 1391,
+      "sha256": "5630ecffc6effc44b4f3c3daa08043a0d7dadb2946716138d8c53cecffc0c81e",
+      "path": "artifacts/0065.raw",
+      "logical_path": "current-source/mutations/m8-skip-typed-directory-removal/source-binding.json",
+      "media_type": "application/json",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 1571,
+      "sha256": "8f14bf0bf734efa10c614e9d39a12d5c5c6aad77d817fb9cfbc68e1c08e8b9d1",
+      "path": "artifacts/0066.raw",
+      "logical_path": "current-source/mutations/m8-skip-typed-directory-removal/status.json",
+      "media_type": "application/json",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 5680,
+      "sha256": "6de132234b5741bb5b0656561c879d7d737bef65c6e9c324a571465b00edfcc4",
+      "path": "artifacts/0067.raw",
+      "logical_path": "current-source/mutations/specs.json",
+      "media_type": "application/json",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 251,
+      "sha256": "f2c4648e54f0582902e05163c0c3c3c01e0c315d2308355fdf0e681b6574a6e3",
+      "path": "artifacts/0068.raw",
+      "logical_path": "current-source/old-v23-fence/floor23-negative-control/assertions.json",
+      "media_type": "application/json",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 406,
+      "sha256": "513504e878394561380155b5522dd7c92ef0386ea3c7a1f4d9219ac9eb8bb3ad",
+      "path": "artifacts/0069.raw",
+      "logical_path": "current-source/old-v23-fence/floor23-negative-control/floor-mutation.json",
+      "media_type": "application/json",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 7895,
+      "sha256": "a38d526bc12e06b7a2f154e0bad4856aeb6bdcc8e6566d3445fb8b185fa7140d",
+      "path": "artifacts/0070.raw",
+      "logical_path": "current-source/old-v23-fence/floor23-negative-control/old-v23-floor23-control-after-inventory.json",
+      "media_type": "application/json",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 7895,
+      "sha256": "a38d526bc12e06b7a2f154e0bad4856aeb6bdcc8e6566d3445fb8b185fa7140d",
+      "path": "artifacts/0071.raw",
+      "logical_path": "current-source/old-v23-fence/floor23-negative-control/old-v23-floor23-control-before-inventory.json",
+      "media_type": "application/json",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 1050,
+      "sha256": "b004c1b4aa6f9a9e942ca61b1729176ac9d398566f19695defaddef2ec7cead5",
+      "path": "artifacts/0072.raw",
+      "logical_path": "current-source/old-v23-fence/floor23-negative-control/old-v23-floor23-control-command.json",
+      "media_type": "application/json",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 1029,
+      "sha256": "bbb50e9ddc1af88c5dc24be9344bac1333ad37f5e27aede36aa5ced79de3779f",
+      "path": "artifacts/0073.raw",
+      "logical_path": "current-source/old-v23-fence/floor23-negative-control/old-v23-floor23-control-command.log",
+      "media_type": "text/plain",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 2220,
+      "sha256": "8481856cfe553159f5ed54665d4b7c90a2351b25b166bc97c97b866c59a52e3b",
+      "path": "artifacts/0074.raw",
+      "logical_path": "current-source/old-v23-fence/floor23-negative-control/old-v23-floor23-control-status.json",
+      "media_type": "application/json",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 291,
+      "sha256": "f144f468742f4b7fc273a5992bb4505837bb7baa21a34985efe33da2e8045365",
+      "path": "artifacts/0075.raw",
+      "logical_path": "current-source/old-v23-fence/floor24-positive/assertions.json",
+      "media_type": "application/json",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 7870,
+      "sha256": "b548a15ed73d01812aa98811bd7314663aa1eb2bf6cf674e2f2461f2b5618a52",
+      "path": "artifacts/0076.raw",
+      "logical_path": "current-source/old-v23-fence/floor24-positive/old-v23-status-after-inventory.json",
+      "media_type": "application/json",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 7870,
+      "sha256": "b548a15ed73d01812aa98811bd7314663aa1eb2bf6cf674e2f2461f2b5618a52",
+      "path": "artifacts/0077.raw",
+      "logical_path": "current-source/old-v23-fence/floor24-positive/old-v23-status-before-inventory.json",
+      "media_type": "application/json",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 1008,
+      "sha256": "8c76bb748fcfe17779056948e1a8741ee08369df2affb285bba5357a9de41cad",
+      "path": "artifacts/0078.raw",
+      "logical_path": "current-source/old-v23-fence/floor24-positive/old-v23-status-command.json",
+      "media_type": "application/json",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 930,
+      "sha256": "3dfb03d23005627e20d6f64eb8422bc73eacce170e35109ef2aa1075a6ac2ac8",
+      "path": "artifacts/0079.raw",
+      "logical_path": "current-source/old-v23-fence/floor24-positive/old-v23-status-command.log",
+      "media_type": "text/plain",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 2084,
+      "sha256": "b2e5b6cd520793932dd45f43fc1685a7448c7e1edb8e93bcf4611ca657d310f1",
+      "path": "artifacts/0080.raw",
+      "logical_path": "current-source/old-v23-fence/floor24-positive/old-v23-status-status.json",
+      "media_type": "application/json",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 365,
+      "sha256": "c246d8d9c421a1d9f3c8c42cc684d42eaa2db8d3eb6c91e36c054261b8977f3e",
+      "path": "artifacts/0081.raw",
+      "logical_path": "current-source/old-v23-fence/overall-status.json",
+      "media_type": "application/json",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 8805,
+      "sha256": "ec43264838c42c6e5010f31b0f6a8448a77a4d72b45511b280e78cc65cd3f4e8",
+      "path": "artifacts/0082.raw",
+      "logical_path": "current-source/old-v23-fence/source-binding.json",
+      "media_type": "application/json",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 1375,
+      "sha256": "b320634063fca5fdbb3e2c0f397d170138447e02cad89918554cc5f45ec5fcfe",
+      "path": "artifacts/0083.raw",
+      "logical_path": "current-source/sensitive-module/run-20261015/command.json",
+      "media_type": "application/json",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 3930,
+      "sha256": "307128ff166a21cc77b8f0954b015355868ffa6aaf4186f746e2ebc0885cb8c6",
+      "path": "artifacts/0084.raw",
+      "logical_path": "current-source/sensitive-module/run-20261015/command.log",
+      "media_type": "text/plain",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 400,
+      "sha256": "ce1b2e62ad9154c5fe6ad40eb67435fc5267dfd5fa7268026869b01f0e0b660a",
+      "path": "artifacts/0085.raw",
+      "logical_path": "current-source/sensitive-module/run-20261015/status.json",
+      "media_type": "application/json",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 582,
+      "sha256": "d503c331a23ccc8e8c33c096f4d482f7b7f4bc836a3396a5fc2e938411549d4b",
+      "path": "artifacts/0086.raw",
+      "logical_path": "current-source/sensitive-module/spec.json",
+      "media_type": "application/json",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 491,
+      "sha256": "c6179febe4f22cddeb3e7cf141300eaba53693dc695b20bec8af162d407dda88",
+      "path": "artifacts/0087.raw",
+      "logical_path": "current-source/strict-clippy/manifest.json",
+      "media_type": "application/json",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 1328,
+      "sha256": "6fb3471839c295774b1915b58efbaf230bd9524c9be6cd9f8bda31f9b8cc431c",
+      "path": "artifacts/0088.raw",
+      "logical_path": "current-source/strict-clippy/run-20261015/command.json",
+      "media_type": "application/json",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 495,
+      "sha256": "6575309c6811066af011137e6bf501ead92376eb36ed3db5e416ebf741160ca4",
+      "path": "artifacts/0089.raw",
+      "logical_path": "current-source/strict-clippy/run-20261015/command.log",
+      "media_type": "text/plain",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 400,
+      "sha256": "2605e267391629d5e433990710e8c37e14a74ad5061fa0fec1ecba04a71f34c6",
+      "path": "artifacts/0090.raw",
+      "logical_path": "current-source/strict-clippy/run-20261015/status.json",
+      "media_type": "application/json",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 4,
+      "sha256": "39b8dc3fc8b44765c8e6f1adee04c5b465e555ab791cc42d0d9e810d5b64297c",
+      "path": "artifacts/0091.raw",
+      "logical_path": "history/root-preserved/compile-history-20261015T1955/0-aethyme-t56-compile-8c691b042618-20261015T191025Z-29796.exit.status",
+      "media_type": "text/plain",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 1534,
+      "sha256": "f98136fbee4b9da4b7c8c7d45918bddae54919fb89a148f0adf39dfd63a25583",
+      "path": "artifacts/0092.raw",
+      "logical_path": "history/root-preserved/compile-history-20261015T1955/0-aethyme-t56-compile-8c691b042618-20261015T191025Z-29796.log",
+      "media_type": "text/plain",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 4,
+      "sha256": "39b8dc3fc8b44765c8e6f1adee04c5b465e555ab791cc42d0d9e810d5b64297c",
+      "path": "artifacts/0093.raw",
+      "logical_path": "history/root-preserved/compile-history-20261015T1955/1-aethyme-t56-compile-95438f62-20261015T191356Z-51068.exit.status",
+      "media_type": "text/plain",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 1233,
+      "sha256": "014365f4992f5c966fb2a19514ddf742cb20efa96ddad66a728c20f474a1bde3",
+      "path": "artifacts/0094.raw",
+      "logical_path": "history/root-preserved/compile-history-20261015T1955/1-aethyme-t56-compile-95438f62-20261015T191356Z-51068.log",
+      "media_type": "text/plain",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 2,
+      "sha256": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa",
+      "path": "artifacts/0095.raw",
+      "logical_path": "history/root-preserved/compile-history-20261015T1955/2-aethyme-t56-compile-cc31a0de-20261015T191505Z-73508.exit.status",
+      "media_type": "text/plain",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 32165,
+      "sha256": "66108f8c8945fad5d1748c23fcf2d1d1a4f9cf380903ff1bc18f73908c9dd7e9",
+      "path": "artifacts/0096.raw",
+      "logical_path": "history/root-preserved/compile-history-20261015T1955/2-aethyme-t56-compile-cc31a0de-20261015T191505Z-73508.log",
+      "media_type": "text/plain",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 5272,
+      "sha256": "9a1ca4303c9ecbc3c28293c07141b2f9c808cd02025b3b66d9b2a1fab2a50c6d",
+      "path": "artifacts/0097.raw",
+      "logical_path": "history/root-preserved/compile-history-20261015T1955/3-t56-norun-1a13.2e2WEk.log",
+      "media_type": "text/plain",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 2092,
+      "sha256": "fc8145ba28d1a2630832742d9dcf9c7913482cc58c3ec6e704f5afeaa0737614",
+      "path": "artifacts/0098.raw",
+      "logical_path": "history/root-preserved/compile-history-20261015T1955/4-t56-norun-view-controls.QvjMXT.log",
+      "media_type": "text/plain",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 2,
+      "sha256": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa",
+      "path": "artifacts/0099.raw",
+      "logical_path": "history/root-preserved/compile-history-20261015T1955/5-t56-norun-v4-final-8F7SaT.exit-status",
+      "media_type": "text/plain",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 1671,
+      "sha256": "5b8a3168c95e8486fda7d16efe60779b3c3cf6437fd70fce8d02fcb89f52b8e9",
+      "path": "artifacts/0100.raw",
+      "logical_path": "history/root-preserved/compile-history-20261015T1955/5-t56-norun-v4-final-8F7SaT.log",
+      "media_type": "text/plain",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 4,
+      "sha256": "39b8dc3fc8b44765c8e6f1adee04c5b465e555ab791cc42d0d9e810d5b64297c",
+      "path": "artifacts/0101.raw",
+      "logical_path": "history/root-preserved/compile-history-20261015T1955/6-t56-norun-v4-QvOnqg.exit-status",
+      "media_type": "text/plain",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 253,
+      "sha256": "6b3912d83b92ec44f1b105e6b6f715cc4d7cf55a9b13bec14f40dff30c37d786",
+      "path": "artifacts/0102.raw",
+      "logical_path": "history/root-preserved/compile-history-20261015T1955/6-t56-norun-v4-QvOnqg.log",
+      "media_type": "text/plain",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 469,
+      "sha256": "a803b0b85494691115541cc98fd23987a35003fa1459db400ca441f7baa2071d",
+      "path": "artifacts/0103.raw",
+      "logical_path": "history/root-preserved/compile-history-20261015T1955/additional-copy-4.json",
+      "media_type": "application/json",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 571,
+      "sha256": "a5bc9efed6c7633fc87f51459810a6d9da5f54a9fee6dd49e22940e081cde5d4",
+      "path": "artifacts/0104.raw",
+      "logical_path": "history/root-preserved/compile-history-20261015T1955/additional-copy-5.json",
+      "media_type": "application/json",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 472,
+      "sha256": "139920fef811676d8b186ee9d4a4a3f9b6e22582542a84617ab07054a606b844",
+      "path": "artifacts/0105.raw",
+      "logical_path": "history/root-preserved/compile-history-20261015T1955/additional-copy-6.json",
+      "media_type": "application/json",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 439,
+      "sha256": "da2d01fda6f4162d13ef3fc3e89ff6ea8c1a36758be82ee084b7860807e3e050",
+      "path": "artifacts/0106.raw",
+      "logical_path": "history/root-preserved/compile-history-20261015T1955/additional-copy-7.json",
+      "media_type": "application/json",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 1519,
+      "sha256": "e15717d83888fd8118ab03cb3da55a50cdb29416995e0b3d5ff38e56e2bb69b1",
+      "path": "artifacts/0107.raw",
+      "logical_path": "history/root-preserved/compile-history-20261015T1955/copy-manifest.json",
+      "media_type": "application/json",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 2,
+      "sha256": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa",
+      "path": "artifacts/0108.raw",
+      "logical_path": "history/root-preserved/compile-history-20261015T1955/t56-69e820-readerror-compile.exit-status",
+      "media_type": "text/plain",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 1882,
+      "sha256": "f2f34442da601225e00da32b4ca514ff955d25fb3feef8c6195ce925b62106a8",
+      "path": "artifacts/0109.raw",
+      "logical_path": "history/root-preserved/compile-history-20261015T1955/t56-69e820-readerror-compile.log",
+      "media_type": "text/plain",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 2027,
+      "sha256": "ad79c8747859cc6c71556d7c3ad8c9952811381bb26dc32ea7a0618743f55b25",
+      "path": "artifacts/0110.raw",
+      "logical_path": "history/root-preserved/t56-618c850-clippy/command.log",
+      "media_type": "text/plain",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 215,
+      "sha256": "1c49df883cfaf33e86042620cd8a06f21b5547936049edbc788f713e6f3b7c18",
+      "path": "artifacts/0111.raw",
+      "logical_path": "history/root-preserved/t56-618c850-clippy/root-copy-manifest.json",
+      "media_type": "application/json",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 3815,
+      "sha256": "b8d312119f4526ac911b108b8ddf135cfa7ea112ac0bdf7659b04b5f313af252",
+      "path": "artifacts/0112.raw",
+      "logical_path": "history/root-preserved/t56-94282330-sensitive-module-tmp/command.log",
+      "media_type": "text/plain",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 391,
+      "sha256": "17e6060f3d994e548e6eba41b83cbf69ff412e07cc5eff23fb6a2ffecadc876f",
+      "path": "artifacts/0113.raw",
+      "logical_path": "history/root-preserved/t56-94282330-sensitive-module-tmp/root-copy-manifest.json",
+      "media_type": "application/json",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 5843,
+      "sha256": "3d6164db311c76a7e44ae4cb313ae757285dcda1a56d1bc152e580558865e8b8",
+      "path": "artifacts/0114.raw",
+      "logical_path": "history/root-preserved/t56-c90f1bf-sensitive-module-tmp/command.log",
+      "media_type": "text/plain",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 432,
+      "sha256": "0b0e1d4f002938fbc9a398e5cfd028e262cf97c1646d9e7cd31456a8f7afee97",
+      "path": "artifacts/0115.raw",
+      "logical_path": "history/root-preserved/t56-c90f1bf-sensitive-module-tmp/root-copy-manifest.json",
+      "media_type": "application/json",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 730,
+      "sha256": "16873633492994dac2aae2186c968cdf89a08c7a16450569539f0c6b657cf088",
+      "path": "artifacts/0116.raw",
+      "logical_path": "history/root-preserved/t56-cb857-norun-tmp/command-escalated.log",
+      "media_type": "text/plain",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 253,
+      "sha256": "6b3912d83b92ec44f1b105e6b6f715cc4d7cf55a9b13bec14f40dff30c37d786",
+      "path": "artifacts/0117.raw",
+      "logical_path": "history/root-preserved/t56-cb857-norun-tmp/command.log",
+      "media_type": "text/plain",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 531,
+      "sha256": "0af078f98b6a9ca7911f22c161edac1a3cb45b006aea733dddfa0a9e48c3a374",
+      "path": "artifacts/0118.raw",
+      "logical_path": "history/root-preserved/t56-cb857-norun-tmp/root-copy-manifest.json",
+      "media_type": "application/json",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 1245,
+      "sha256": "f39ff7ce32db98537b091e89d0d5f35c79b1ee99f0d2521c8b6f534aac0669b1",
+      "path": "artifacts/0119.raw",
+      "logical_path": "history/root-preserved/t56-dbfb8df-norun-tmp/command.log",
+      "media_type": "text/plain",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 332,
+      "sha256": "7102096a8e75787c1f53612362f993b473f7a846616df6b4751d47a237ccc6d7",
+      "path": "artifacts/0120.raw",
+      "logical_path": "history/root-preserved/t56-dbfb8df-norun-tmp/root-copy-manifest.json",
+      "media_type": "application/json",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 1793,
+      "sha256": "372f73eddb44e21b496da8e236210e9da77dfc2414fca2b1d484b89b174c1293",
+      "path": "artifacts/0121.raw",
+      "logical_path": "history/root-preserved/t56-old23-fence-94282330/cargo-build.log",
+      "media_type": "text/plain",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 634,
+      "sha256": "2cd44fe99e8c0b794ea098c6e764afcdfffa9b2a70fedcf853e344bf5c49adb4",
+      "path": "artifacts/0122.raw",
+      "logical_path": "history/root-preserved/t56-old23-fence-94282330/files.before",
+      "media_type": "text/plain",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 310,
+      "sha256": "ef9f749e16ab04968d13e0c383ed4e403b3d4ae0ff1777f0da9687b4d23f7172",
+      "path": "artifacts/0123.raw",
+      "logical_path": "history/root-preserved/t56-old23-fence-94282330/initialize-state.log",
+      "media_type": "text/plain",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 255,
+      "sha256": "5e82a8eb1d17e1554d3fabf32b5818b098478580c31670ff821d6b285984c14f",
+      "path": "artifacts/0124.raw",
+      "logical_path": "history/root-preserved/t56-old23-fence-94282330/old-binary.sha256",
+      "media_type": "text/plain",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 930,
+      "sha256": "099be060a113404bf50b6aad557a259986e33314fbd098847a726c1053790e19",
+      "path": "artifacts/0125.raw",
+      "logical_path": "history/root-preserved/t56-old23-fence-94282330/old-status-json-clean.log",
+      "media_type": "text/plain",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 2,
+      "sha256": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa",
+      "path": "artifacts/0126.raw",
+      "logical_path": "history/root-preserved/t56-old23-fence-94282330/old-status-json-clean.status",
+      "media_type": "text/plain",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 930,
+      "sha256": "099be060a113404bf50b6aad557a259986e33314fbd098847a726c1053790e19",
+      "path": "artifacts/0127.raw",
+      "logical_path": "history/root-preserved/t56-old23-fence-94282330/old-status-json.log",
+      "media_type": "text/plain",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 499,
+      "sha256": "75826e76560cc31b8151cb694e71c96efed4a7fe2d7c115fd48279f657e38302",
+      "path": "artifacts/0128.raw",
+      "logical_path": "history/root-preserved/t56-old23-fence-94282330/old-status-text.log",
+      "media_type": "text/plain",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 2,
+      "sha256": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa",
+      "path": "artifacts/0129.raw",
+      "logical_path": "history/root-preserved/t56-old23-fence-94282330/old-status-text.status",
+      "media_type": "text/plain",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 634,
+      "sha256": "2cd44fe99e8c0b794ea098c6e764afcdfffa9b2a70fedcf853e344bf5c49adb4",
+      "path": "artifacts/0130.raw",
+      "logical_path": "history/root-preserved/t56-old23-fence-94282330/probe.files.after",
+      "media_type": "text/plain",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 634,
+      "sha256": "2cd44fe99e8c0b794ea098c6e764afcdfffa9b2a70fedcf853e344bf5c49adb4",
+      "path": "artifacts/0131.raw",
+      "logical_path": "history/root-preserved/t56-old23-fence-94282330/probe.files.before",
+      "media_type": "text/plain",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 255,
+      "sha256": "5e82a8eb1d17e1554d3fabf32b5818b098478580c31670ff821d6b285984c14f",
+      "path": "artifacts/0132.raw",
+      "logical_path": "history/root-preserved/t56-old23-fence-94282330/probe.old-binary.after",
+      "media_type": "text/plain",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 255,
+      "sha256": "5e82a8eb1d17e1554d3fabf32b5818b098478580c31670ff821d6b285984c14f",
+      "path": "artifacts/0133.raw",
+      "logical_path": "history/root-preserved/t56-old23-fence-94282330/probe.old-binary.before",
+      "media_type": "text/plain",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 4352,
+      "sha256": "5796be1309702e60bcf210323badbe9fba9fe72d8c12b62f012810c3a13fb176",
+      "path": "artifacts/0134.raw",
+      "logical_path": "history/root-preserved/t56-old23-fence-94282330/probe.repo-files.after",
+      "media_type": "text/plain",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 4352,
+      "sha256": "5796be1309702e60bcf210323badbe9fba9fe72d8c12b62f012810c3a13fb176",
+      "path": "artifacts/0135.raw",
+      "logical_path": "history/root-preserved/t56-old23-fence-94282330/probe.repo-files.before",
+      "media_type": "text/plain",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 3554,
+      "sha256": "1c76bc2bdd018b38a4521c504cd8f92f99a58b9421f8d3ddd2aab8665c48d68c",
+      "path": "artifacts/0136.raw",
+      "logical_path": "history/root-preserved/t56-old23-fence-94282330/probe.repo-tree.after",
+      "media_type": "text/plain",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 3554,
+      "sha256": "1c76bc2bdd018b38a4521c504cd8f92f99a58b9421f8d3ddd2aab8665c48d68c",
+      "path": "artifacts/0137.raw",
+      "logical_path": "history/root-preserved/t56-old23-fence-94282330/probe.repo-tree.before",
+      "media_type": "text/plain",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 930,
+      "sha256": "099be060a113404bf50b6aad557a259986e33314fbd098847a726c1053790e19",
+      "path": "artifacts/0138.raw",
+      "logical_path": "history/root-preserved/t56-old23-fence-94282330/probe.status-json.log",
+      "media_type": "text/plain",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 2,
+      "sha256": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa",
+      "path": "artifacts/0139.raw",
+      "logical_path": "history/root-preserved/t56-old23-fence-94282330/probe.status-json.status",
+      "media_type": "text/plain",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 499,
+      "sha256": "75826e76560cc31b8151cb694e71c96efed4a7fe2d7c115fd48279f657e38302",
+      "path": "artifacts/0140.raw",
+      "logical_path": "history/root-preserved/t56-old23-fence-94282330/probe.status-text.log",
+      "media_type": "text/plain",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 2,
+      "sha256": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa",
+      "path": "artifacts/0141.raw",
+      "logical_path": "history/root-preserved/t56-old23-fence-94282330/probe.status-text.status",
+      "media_type": "text/plain",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 512,
+      "sha256": "88a2f13b4d96d29526eb07fad6e68e33f9aa811466e3871931d2c224ad12d7f6",
+      "path": "artifacts/0142.raw",
+      "logical_path": "history/root-preserved/t56-old23-fence-94282330/probe.tree.after",
+      "media_type": "text/plain",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 512,
+      "sha256": "88a2f13b4d96d29526eb07fad6e68e33f9aa811466e3871931d2c224ad12d7f6",
+      "path": "artifacts/0143.raw",
+      "logical_path": "history/root-preserved/t56-old23-fence-94282330/probe.tree.before",
+      "media_type": "text/plain",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 11562,
+      "sha256": "e400b6ffe6eb06d7c078f094dda54d74f47f03df39d2e4a4cc63cd91b6763792",
+      "path": "artifacts/0144.raw",
+      "logical_path": "history/root-preserved/t56-old23-fence-94282330/root-copy-manifest.json",
+      "media_type": "application/json",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 517,
+      "sha256": "ac20061d784f8196391330d5cd5846925cf5c586d688d2e052aaffce110dfe63",
+      "path": "artifacts/0145.raw",
+      "logical_path": "history/root-preserved/t56-old23-fence-94282330/seed-state-workspace.log",
+      "media_type": "text/plain",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 133,
+      "sha256": "fd84e09b8d1dbe07e43ab51c85a822f5cf2fb7d2c62a234d6fb7786c23f053f1",
+      "path": "artifacts/0146.raw",
+      "logical_path": "history/root-preserved/t56-old23-fence-94282330/seed-state.log",
+      "media_type": "text/plain",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 512,
+      "sha256": "88a2f13b4d96d29526eb07fad6e68e33f9aa811466e3871931d2c224ad12d7f6",
+      "path": "artifacts/0147.raw",
+      "logical_path": "history/root-preserved/t56-old23-fence-94282330/tree.before",
+      "media_type": "text/plain",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 983,
+      "sha256": "f36e0c0521bf9c1eabdf5fcfbfeeb0ef7785e24dec33d6a7207816d935027378",
+      "path": "artifacts/0148.raw",
+      "logical_path": "history/root-preserved/t56-old23-fence-94282330/verify-schema24.json",
+      "media_type": "application/json",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 613,
+      "sha256": "6edb459b0546cdd6ca6e5d13d7147001c8206cb18627aa6bc25e5f25de906017",
+      "path": "artifacts/0149.raw",
+      "logical_path": "history/root-preserved/t56-positive-m4-e70a72d/manifest.json",
+      "media_type": "application/json",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 697,
+      "sha256": "f7acd4587d78785dcafa5a1b26acabe8111a85c2d708f2be941124d197c094c3",
+      "path": "artifacts/0150.raw",
+      "logical_path": "history/root-preserved/t56-positive-m4-e70a72d/root-copy-manifest.json",
+      "media_type": "application/json",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 1458,
+      "sha256": "7b1ab8545160e53f6b3bfa203bab340f457516201c56764023ba2c07426c68cb",
+      "path": "artifacts/0151.raw",
+      "logical_path": "history/root-preserved/t56-positive-m4-e70a72d/run-20261015/command.json",
+      "media_type": "application/json",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 960,
+      "sha256": "badcf0ea4a04b50555e5ee64b06204cf5b7614f66e051ecd08e0320236b81ba3",
+      "path": "artifacts/0152.raw",
+      "logical_path": "history/root-preserved/t56-positive-m4-e70a72d/run-20261015/command.log",
+      "media_type": "text/plain",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 400,
+      "sha256": "0bd022cf8370220f15f97c05779d7d8c2236b7f947a308b3ae37d2cfc5d5dba8",
+      "path": "artifacts/0153.raw",
+      "logical_path": "history/root-preserved/t56-positive-m4-e70a72d/run-20261015/status.json",
+      "media_type": "application/json",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 534,
+      "sha256": "84e56dcab707e9d3502cc65ec46263dc8bef1018695a566cfac6ff035c276bc5",
+      "path": "artifacts/0154.raw",
+      "logical_path": "history/root-preserved/t56-restored-module-e70a72d/manifest.json",
+      "media_type": "application/json",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 702,
+      "sha256": "c41790c1fc8e45290d1155275bf61f7348b7d16b33f4957c6072b562fe79ceca",
+      "path": "artifacts/0155.raw",
+      "logical_path": "history/root-preserved/t56-restored-module-e70a72d/root-copy-manifest.json",
+      "media_type": "application/json",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 1375,
+      "sha256": "9b32567ebd181e39d5c9d2489ce17fcc91fea363bd4a69ddbf63df0c706bc34b",
+      "path": "artifacts/0156.raw",
+      "logical_path": "history/root-preserved/t56-restored-module-e70a72d/run-20261015/command.json",
+      "media_type": "application/json",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 3507,
+      "sha256": "4c398a292ea47b5b8ace33d53567f96fe0537f2750f73af50048d22008e99d02",
+      "path": "artifacts/0157.raw",
+      "logical_path": "history/root-preserved/t56-restored-module-e70a72d/run-20261015/command.log",
+      "media_type": "text/plain",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 401,
+      "sha256": "1d508cde1d1eca94a1bbf8c92c58d453e6a4ade17ddee66077dee9f28e123833",
+      "path": "artifacts/0158.raw",
+      "logical_path": "history/root-preserved/t56-restored-module-e70a72d/run-20261015/status.json",
+      "media_type": "application/json",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 867,
+      "sha256": "abe578d4059379e5e7367ec814ba89c1e3d6a0c89e44c7e5adff62a141fd7589",
+      "path": "artifacts/0159.raw",
+      "logical_path": "history/root-preserved/t56-runtime-69e820-main-1cZpb4/attempt.json",
+      "media_type": "application/json",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 2801,
+      "sha256": "ecc47a9a6b56ba327f4b8a11c6c07adae2209dc58ffb9ec8224b1d94327de637",
+      "path": "artifacts/0160.raw",
+      "logical_path": "history/root-preserved/t56-runtime-69e820-main-1cZpb4/command.log",
+      "media_type": "text/plain",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 1161,
+      "sha256": "9c70f3acb826edee881c6806b34882c658832c417922d6c34d78e09d64fbcf58",
+      "path": "artifacts/0161.raw",
+      "logical_path": "history/root-preserved/t56-runtime-69e820-main-1cZpb4/copy-manifest.json",
+      "media_type": "application/json",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 4,
+      "sha256": "39b8dc3fc8b44765c8e6f1adee04c5b465e555ab791cc42d0d9e810d5b64297c",
+      "path": "artifacts/0162.raw",
+      "logical_path": "history/root-preserved/t56-runtime-69e820-main-1cZpb4/status",
+      "media_type": "text/plain",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 1212,
+      "sha256": "38bef605599ac967b441b10f7c819e14c2d8b5cc924754211e2a4dbed96daada",
+      "path": "artifacts/0163.raw",
+      "logical_path": "history/root-preserved/t56-runtime-b6fea172-composite-retry/command.log",
+      "media_type": "text/plain",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 759,
+      "sha256": "070a1bd3072c827086056f4c924921a14592018ff2a8d6749d31863212caeb12",
+      "path": "artifacts/0164.raw",
+      "logical_path": "history/root-preserved/t56-runtime-b6fea172-composite-retry/copy-manifest.json",
+      "media_type": "application/json",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 4,
+      "sha256": "39b8dc3fc8b44765c8e6f1adee04c5b465e555ab791cc42d0d9e810d5b64297c",
+      "path": "artifacts/0165.raw",
+      "logical_path": "history/root-preserved/t56-runtime-b6fea172-composite-retry/status",
+      "media_type": "text/plain",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 1102,
+      "sha256": "66d38e2bf8c03fe8579deda458d3b617038642e2da46d3ddc500607d863e94ed",
+      "path": "artifacts/0166.raw",
+      "logical_path": "history/root-preserved/t56-v4-503ffd-unreadable-view-inventory/command.log",
+      "media_type": "text/plain",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 758,
+      "sha256": "0db56592c7a7dcd5945c93bf64acde883caed0cadd8d6b48333ab0cc9a0a9a87",
+      "path": "artifacts/0167.raw",
+      "logical_path": "history/root-preserved/t56-v4-503ffd-unreadable-view-inventory/copy-manifest.json",
+      "media_type": "application/json",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 4,
+      "sha256": "39b8dc3fc8b44765c8e6f1adee04c5b465e555ab791cc42d0d9e810d5b64297c",
+      "path": "artifacts/0168.raw",
+      "logical_path": "history/root-preserved/t56-v4-503ffd-unreadable-view-inventory/status",
+      "media_type": "text/plain",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 928,
+      "sha256": "82441fb35890dfd862ec6789582a885902ea951198fa4e110224220c944b0e1d",
+      "path": "artifacts/0169.raw",
+      "logical_path": "history/root-preserved/t56-v4-8387-managed-dir-controls/command.log",
+      "media_type": "text/plain",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 524,
+      "sha256": "bba47df07c312282ce1b6f5a0920ca6af941eaa1f752a0e12db0fd946912299a",
+      "path": "artifacts/0170.raw",
+      "logical_path": "history/root-preserved/t56-v4-8387-managed-dir-controls/root-copy-manifest.json",
+      "media_type": "application/json",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 2,
+      "sha256": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa",
+      "path": "artifacts/0171.raw",
+      "logical_path": "history/root-preserved/t56-v4-8387-managed-dir-controls/status",
+      "media_type": "text/plain",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 8279,
+      "sha256": "d7096f9d8167f69e74b9294556b86c6a108e83a7451d10f6c16ba02d506ecc21",
+      "path": "artifacts/0172.raw",
+      "logical_path": "history/root-preserved/t56-v4-8387-sensitive-module/command.log",
+      "media_type": "text/plain",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 558,
+      "sha256": "e960b3ca16fc6638c5aa9411b0d9385cff2e5c60ce4766d9b94cd495c3c9a093",
+      "path": "artifacts/0173.raw",
+      "logical_path": "history/root-preserved/t56-v4-8387-sensitive-module/root-copy-manifest.json",
+      "media_type": "application/json",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 4,
+      "sha256": "39b8dc3fc8b44765c8e6f1adee04c5b465e555ab791cc42d0d9e810d5b64297c",
+      "path": "artifacts/0174.raw",
+      "logical_path": "history/root-preserved/t56-v4-8387-sensitive-module/status",
+      "media_type": "text/plain",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 730,
+      "sha256": "42dc867ed88c8484e8e7aa2bf559e883e23be255928d0086046763dbf31a91a9",
+      "path": "artifacts/0175.raw",
+      "logical_path": "history/root-preserved/t56-v4-8387fd9f-norun/command.log",
+      "media_type": "text/plain",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 513,
+      "sha256": "f391ac955f88d412399223f6d36e0fba26512822b337f7facba482dd578be13b",
+      "path": "artifacts/0176.raw",
+      "logical_path": "history/root-preserved/t56-v4-8387fd9f-norun/root-copy-manifest.json",
+      "media_type": "application/json",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 2,
+      "sha256": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa",
+      "path": "artifacts/0177.raw",
+      "logical_path": "history/root-preserved/t56-v4-8387fd9f-norun/status",
+      "media_type": "text/plain",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 1045,
+      "sha256": "8369ddc2f598506439935bb02c4844a1397dd39dd8da22ec76156d951f19746a",
+      "path": "artifacts/0178.raw",
+      "logical_path": "history/root-preserved/t56-v4-967766-norun-correctcwd/command.log",
+      "media_type": "text/plain",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 523,
+      "sha256": "c60352657890660c03983118cc94c899ef11a0d56d318e7882bab160c1192784",
+      "path": "artifacts/0179.raw",
+      "logical_path": "history/root-preserved/t56-v4-967766-norun-correctcwd/root-copy-manifest.json",
+      "media_type": "application/json",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 4,
+      "sha256": "39b8dc3fc8b44765c8e6f1adee04c5b465e555ab791cc42d0d9e810d5b64297c",
+      "path": "artifacts/0180.raw",
+      "logical_path": "history/root-preserved/t56-v4-967766-norun-correctcwd/status",
+      "media_type": "text/plain",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 193,
+      "sha256": "e855013f7925b7759cd2e65c808c20e6d6a26cf77634eefdc47ba89c8c79d989",
+      "path": "artifacts/0181.raw",
+      "logical_path": "history/root-preserved/t56-v4-967766-norun/command.log",
+      "media_type": "text/plain",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 511,
+      "sha256": "5afc194023282a1476e9e9eea35b969cbe7c94be4e29106451709ae4c528df15",
+      "path": "artifacts/0182.raw",
+      "logical_path": "history/root-preserved/t56-v4-967766-norun/root-copy-manifest.json",
+      "media_type": "application/json",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 4,
+      "sha256": "39b8dc3fc8b44765c8e6f1adee04c5b465e555ab791cc42d0d9e810d5b64297c",
+      "path": "artifacts/0183.raw",
+      "logical_path": "history/root-preserved/t56-v4-967766-norun/status",
+      "media_type": "text/plain",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 730,
+      "sha256": "8da62438a5ff8a6e30a35111e9c16ab502465334f33184edbfd4bb76a83ee6e2",
+      "path": "artifacts/0184.raw",
+      "logical_path": "history/root-preserved/t56-v4-b6fea172-norun/command.log",
+      "media_type": "text/plain",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 668,
+      "sha256": "65b678d2ba32d7b173d5acae92cd2df9dc72ad387fd23ac69534b4e2111253c1",
+      "path": "artifacts/0185.raw",
+      "logical_path": "history/root-preserved/t56-v4-b6fea172-norun/copy-manifest.json",
+      "media_type": "application/json",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 2,
+      "sha256": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa",
+      "path": "artifacts/0186.raw",
+      "logical_path": "history/root-preserved/t56-v4-b6fea172-norun/status",
+      "media_type": "text/plain",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 13088,
+      "sha256": "ee53ad7b76828f2c303fdf548598b57e190947bdea358ff5674d32f138926a43",
+      "path": "artifacts/0187.raw",
+      "logical_path": "history/session1128/frozen-pretrial/t56-runtime-drill-plan-v3-2026-10-15.md",
+      "media_type": "text/markdown",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 14595,
+      "sha256": "0988d7ef8228553c4d09e7289bf80198398aa4fa88be179273a114bb91d8f142",
+      "path": "artifacts/0188.raw",
+      "logical_path": "history/session1128/frozen-pretrial/t56-runtime-drill-plan-v4-draft-2026-10-15.md",
+      "media_type": "text/markdown",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 4783,
+      "sha256": "e52aff483232fc7882eb3eaefa31628b66e49644e44979ec8feda596d797dfc3",
+      "path": "artifacts/0189.raw",
+      "logical_path": "history/session1128/retention-checks/20261015T181355Z-t56-freeze-quarantine-f7abe4cf/command.json",
+      "media_type": "application/json",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 2487,
+      "sha256": "db53ddbabfef7217caa7b3ce4957fcc1e2ef282320ec89bb7c59f79fb7ec8e56",
+      "path": "artifacts/0190.raw",
+      "logical_path": "history/session1128/retention-checks/20261015T181355Z-t56-freeze-quarantine-f7abe4cf/command.log",
+      "media_type": "text/plain",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 2,
+      "sha256": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa",
+      "path": "artifacts/0191.raw",
+      "logical_path": "history/session1128/retention-checks/20261015T181355Z-t56-freeze-quarantine-f7abe4cf/command.status",
+      "media_type": "text/plain",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 4215,
+      "sha256": "7ea43b55df74fe0a14df366b8acee123c7f65fbde6eee7aee71ceb842cbe2f3d",
+      "path": "artifacts/0192.raw",
+      "logical_path": "history/session1128/retention-checks/20261015T182903Z-t56-reader-recovery-local-authority-module-63874cff/command.json",
+      "media_type": "application/json",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 862,
+      "sha256": "3d71c8e1ccab666f9bcc60d2b5a777b45fc142e76dc4594a75c43fd6cc552372",
+      "path": "artifacts/0193.raw",
+      "logical_path": "history/session1128/retention-checks/20261015T182903Z-t56-reader-recovery-local-authority-module-63874cff/command.log",
+      "media_type": "text/plain",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 4,
+      "sha256": "39b8dc3fc8b44765c8e6f1adee04c5b465e555ab791cc42d0d9e810d5b64297c",
+      "path": "artifacts/0194.raw",
+      "logical_path": "history/session1128/retention-checks/20261015T182903Z-t56-reader-recovery-local-authority-module-63874cff/command.status",
+      "media_type": "text/plain",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 4250,
+      "sha256": "814828fef92c59b585422d8b44851f5012b53f2c0683d4c60f8ac943fc792a37",
+      "path": "artifacts/0195.raw",
+      "logical_path": "history/session1128/retention-checks/20261015T183013Z-t56-reader-recovery-local-authority-module-retry1-56574d07/command.json",
+      "media_type": "application/json",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 4579,
+      "sha256": "5d28ab758f14af7fd1a8f383aca77ac714cd8abdd3fc8bbcf6cdbf24c41b740d",
+      "path": "artifacts/0196.raw",
+      "logical_path": "history/session1128/retention-checks/20261015T183013Z-t56-reader-recovery-local-authority-module-retry1-56574d07/command.log",
+      "media_type": "text/plain",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 4,
+      "sha256": "39b8dc3fc8b44765c8e6f1adee04c5b465e555ab791cc42d0d9e810d5b64297c",
+      "path": "artifacts/0197.raw",
+      "logical_path": "history/session1128/retention-checks/20261015T183013Z-t56-reader-recovery-local-authority-module-retry1-56574d07/command.status",
+      "media_type": "text/plain",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 4250,
+      "sha256": "7778c5aa384f0f22074a8301b095b0b93bb3efdb04ab1d8daad07a43ecb1ea45",
+      "path": "artifacts/0198.raw",
+      "logical_path": "history/session1128/retention-checks/20261015T183205Z-t56-reader-recovery-local-authority-module-retry2-432ec7b1/command.json",
+      "media_type": "application/json",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 4283,
+      "sha256": "370f1612fdcf5bbd18b82f983a5fee9114d42cd5cb3d4cb8e9367a0f6f830e2b",
+      "path": "artifacts/0199.raw",
+      "logical_path": "history/session1128/retention-checks/20261015T183205Z-t56-reader-recovery-local-authority-module-retry2-432ec7b1/command.log",
+      "media_type": "text/plain",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 4,
+      "sha256": "39b8dc3fc8b44765c8e6f1adee04c5b465e555ab791cc42d0d9e810d5b64297c",
+      "path": "artifacts/0200.raw",
+      "logical_path": "history/session1128/retention-checks/20261015T183205Z-t56-reader-recovery-local-authority-module-retry2-432ec7b1/command.status",
+      "media_type": "text/plain",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 920,
+      "sha256": "b020fb1ce3781aeeddbe3e7335a103778764cb9a92572574e3584bffc605cc32",
+      "path": "artifacts/0201.raw",
+      "logical_path": "history/session1128/t56-schema24-cargo-check-40100a42/command.json",
+      "media_type": "application/json",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 495,
+      "sha256": "44aaa65fa184f176749fc663c128d7a3d301ac5d238059573aa47a9d3cac95dd",
+      "path": "artifacts/0202.raw",
+      "logical_path": "history/session1128/t56-schema24-cargo-check-40100a42/command.log",
+      "media_type": "text/plain",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 21,
+      "sha256": "cfdbfaee0d74e64b2e16d67f6b1c011d6e424a026da2bd47c04d2241177adad6",
+      "path": "artifacts/0203.raw",
+      "logical_path": "history/session1128/t56-schema24-cargo-check-40100a42/started_at_utc",
+      "media_type": "text/plain",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 2,
+      "sha256": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa",
+      "path": "artifacts/0204.raw",
+      "logical_path": "history/session1128/t56-schema24-cargo-check-40100a42/status",
+      "media_type": "text/plain",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 920,
+      "sha256": "38502287798495c9758faea3553bfd08f0ffe3b973b647902c9c341e40a212b0",
+      "path": "artifacts/0205.raw",
+      "logical_path": "history/session1128/t56-schema24-cargo-check-584d914/command.json",
+      "media_type": "application/json",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 8791,
+      "sha256": "ec09c5a1893ae8c10426b6e1c75bb328d52008d191d285055a3c23380a477b2f",
+      "path": "artifacts/0206.raw",
+      "logical_path": "history/session1128/t56-schema24-cargo-check-584d914/command.log",
+      "media_type": "text/plain",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 21,
+      "sha256": "2993ee34c641a1e3ae0b2ef83b3c21fcac451183a88b63b7b70ad9fb8ca52ea9",
+      "path": "artifacts/0207.raw",
+      "logical_path": "history/session1128/t56-schema24-cargo-check-584d914/started_at_utc",
+      "media_type": "text/plain",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 4,
+      "sha256": "39b8dc3fc8b44765c8e6f1adee04c5b465e555ab791cc42d0d9e810d5b64297c",
+      "path": "artifacts/0208.raw",
+      "logical_path": "history/session1128/t56-schema24-cargo-check-584d914/status",
+      "media_type": "text/plain",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 997,
+      "sha256": "7dfebaf4383ac62d7bee3a1af731d9a22e459fd48729a9de50af6a635f4dd223",
+      "path": "artifacts/0209.raw",
+      "logical_path": "history/session1128/t56-schema24-initial-check/command.json",
+      "media_type": "application/json",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 49,
+      "sha256": "308eb80f9f890352572b3679779bec78398738b5cc3da92cb655a8b9c1e32962",
+      "path": "artifacts/0210.raw",
+      "logical_path": "history/session1128/t56-schema24-initial-check/command.log",
+      "media_type": "text/plain",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 4,
+      "sha256": "39b8dc3fc8b44765c8e6f1adee04c5b465e555ab791cc42d0d9e810d5b64297c",
+      "path": "artifacts/0211.raw",
+      "logical_path": "history/session1128/t56-schema24-initial-check/status",
+      "media_type": "text/plain",
+      "artifact_role": "original_payload"
+    },
+    {
+      "bytes": 17888,
+      "sha256": "e2ccd66349a0968fa9c3c2ab112aa763649662ced0b6ed7a11c46f29d0c94ccf",
+      "path": "artifacts/0212.raw",
+      "logical_path": "protocol/t56-runtime-drill-plan-v4-2026-10-15.md",
+      "media_type": "text/markdown",
+      "artifact_role": "original_payload"
+    },
+    {
+      "path": "artifacts/0213.raw",
+      "logical_path": "ledger.json",
+      "logical_path_base": "package_root",
+      "bytes": 90225,
+      "sha256": "ae892f97564e327bac1d170eb848de0cddefe96dc92104e358fa75774b7e69b1",
+      "media_type": "application/json",
+      "artifact_role": "source_ledger_snapshot"
+    }
+  ],
+  "historical_artifact_roots": [
+    {
+      "prefix": "payloads/history/session1128/",
+      "source": "1128 target/local-resume session artifacts"
+    },
+    {
+      "prefix": "payloads/history/root-preserved/",
+      "source": "1122 copied compile/runtime attempt history"
+    }
+  ],
+  "historical_attempts": [
+    {
+      "category": "historical_runtime_or_compile_attempt",
+      "classification": "raw output retained; see log",
+      "evidence_prefix": "history/root-preserved/t56-618c850-clippy",
+      "exit_code": null,
+      "id": "history/root-preserved/t56-618c850-clippy/command.log",
+      "numeric_exit_status_evidence": null,
+      "numeric_exit_status_recorded": false,
+      "raw_log_bytes": 2027,
+      "raw_log_sha256": "ad79c8747859cc6c71556d7c3ad8c9952811381bb26dc32ea7a0618743f55b25",
+      "source_binding_complete": false,
+      "source_binding_evidence": [
+        "history/root-preserved/t56-618c850-clippy/root-copy-manifest.json"
+      ],
+      "source_dirty_diff_sha256": null,
+      "source_dirty_state": "not_recorded",
+      "source_head": null,
+      "source_tree": null,
+      "test_summary": null
+    },
+    {
+      "category": "historical_runtime_or_compile_attempt",
+      "classification": "test output retained; original numeric status missing",
+      "evidence_prefix": "history/root-preserved/t56-94282330-sensitive-module-tmp",
+      "exit_code": null,
+      "id": "history/root-preserved/t56-94282330-sensitive-module-tmp/command.log",
+      "numeric_exit_status_evidence": null,
+      "numeric_exit_status_recorded": false,
+      "raw_log_bytes": 3815,
+      "raw_log_sha256": "b8d312119f4526ac911b108b8ddf135cfa7ea112ac0bdf7659b04b5f313af252",
+      "source_binding_complete": false,
+      "source_binding_evidence": [
+        "source commit referenced in contemporaneous source-review/copy-manifest record; tree resolved from Git"
+      ],
+      "source_dirty_diff_sha256": null,
+      "source_dirty_state": "not_recorded_in_original_copy_metadata",
+      "source_head": "94282330ee63986eda437391ad66f4c2a389badd",
+      "source_tree": "9d42c8509435baed633b4eef00570a54d87c9801",
+      "test_summary": "test result: ok. 27 passed; 0 failed; 0 ignored; 0 measured; 1839 filtered out; finished in 69.96s"
+    },
+    {
+      "category": "historical_runtime_or_compile_attempt",
+      "classification": "22 run; 20 passed; 2 failed; exit101; overlapping prior controls; not a final-source positive",
+      "evidence_prefix": "history/root-preserved/t56-c90f1bf-sensitive-module-tmp",
+      "exit_code": 101,
+      "id": "history/root-preserved/t56-c90f1bf-sensitive-module-tmp/command.log",
+      "numeric_exit_status_evidence": "copy-manifest classification explicitly records exit101",
+      "numeric_exit_status_recorded": true,
+      "raw_log_bytes": 5843,
+      "raw_log_sha256": "3d6164db311c76a7e44ae4cb313ae757285dcda1a56d1bc152e580558865e8b8",
+      "source_binding_complete": false,
+      "source_binding_evidence": [
+        "history/root-preserved/t56-c90f1bf-sensitive-module-tmp/root-copy-manifest.json"
+      ],
+      "source_dirty_diff_sha256": null,
+      "source_dirty_state": "not_recorded",
+      "source_head": "c90f1bf1cdb7e4e4a1971502e83c8625e30d0d14",
+      "source_tree": "8ca6358cccf56a1f73ff7f493737155b1bc674f6",
+      "test_summary": "test result: FAILED. 20 passed; 2 failed; 0 ignored; 0 measured; 1839 filtered out; finished in 70.89s"
+    },
+    {
+      "category": "historical_runtime_or_compile_attempt",
+      "classification": "raw output retained; see log",
+      "evidence_prefix": "history/root-preserved/t56-cb857-norun-tmp",
+      "exit_code": null,
+      "id": "history/root-preserved/t56-cb857-norun-tmp/command-escalated.log",
+      "numeric_exit_status_evidence": null,
+      "numeric_exit_status_recorded": false,
+      "raw_log_bytes": 730,
+      "raw_log_sha256": "16873633492994dac2aae2186c968cdf89a08c7a16450569539f0c6b657cf088",
+      "source_binding_complete": false,
+      "source_binding_evidence": [
+        "source commit referenced in contemporaneous source-review/copy-manifest record; tree resolved from Git"
+      ],
+      "source_dirty_diff_sha256": null,
+      "source_dirty_state": "not_recorded_in_original_copy_metadata",
+      "source_head": "cb857147d7ac046b81de31909d17815d726f4ac3",
+      "source_tree": "58f689b2c772d2bfccafadcc9889bc2aedf8dde6",
+      "test_summary": null
+    },
+    {
+      "category": "historical_runtime_or_compile_attempt",
+      "classification": "raw output retained; see log",
+      "evidence_prefix": "history/root-preserved/t56-cb857-norun-tmp",
+      "exit_code": null,
+      "id": "history/root-preserved/t56-cb857-norun-tmp/command.log",
+      "numeric_exit_status_evidence": null,
+      "numeric_exit_status_recorded": false,
+      "raw_log_bytes": 253,
+      "raw_log_sha256": "6b3912d83b92ec44f1b105e6b6f715cc4d7cf55a9b13bec14f40dff30c37d786",
+      "source_binding_complete": false,
+      "source_binding_evidence": [
+        "source commit referenced in contemporaneous source-review/copy-manifest record; tree resolved from Git"
+      ],
+      "source_dirty_diff_sha256": null,
+      "source_dirty_state": "not_recorded_in_original_copy_metadata",
+      "source_head": "cb857147d7ac046b81de31909d17815d726f4ac3",
+      "source_tree": "58f689b2c772d2bfccafadcc9889bc2aedf8dde6",
+      "test_summary": null
+    },
+    {
+      "category": "historical_runtime_or_compile_attempt",
+      "classification": "raw output retained; see log",
+      "evidence_prefix": "history/root-preserved/t56-dbfb8df-norun-tmp",
+      "exit_code": null,
+      "id": "history/root-preserved/t56-dbfb8df-norun-tmp/command.log",
+      "numeric_exit_status_evidence": null,
+      "numeric_exit_status_recorded": false,
+      "raw_log_bytes": 1245,
+      "raw_log_sha256": "f39ff7ce32db98537b091e89d0d5f35c79b1ee99f0d2521c8b6f534aac0669b1",
+      "source_binding_complete": false,
+      "source_binding_evidence": [
+        "history/root-preserved/t56-dbfb8df-norun-tmp/root-copy-manifest.json"
+      ],
+      "source_dirty_diff_sha256": null,
+      "source_dirty_state": "not_recorded",
+      "source_head": null,
+      "source_tree": null,
+      "test_summary": null
+    },
+    {
+      "category": "historical_runtime_or_compile_attempt",
+      "classification": "test output retained; original numeric status missing",
+      "evidence_prefix": "history/root-preserved/t56-positive-m4-e70a72d/run-20261015",
+      "exit_code": 0,
+      "id": "history/root-preserved/t56-positive-m4-e70a72d/run-20261015/command.log",
+      "numeric_exit_status_evidence": "history/root-preserved/t56-positive-m4-e70a72d/run-20261015/status.json",
+      "numeric_exit_status_recorded": true,
+      "raw_log_bytes": 960,
+      "raw_log_sha256": "badcf0ea4a04b50555e5ee64b06204cf5b7614f66e051ecd08e0320236b81ba3",
+      "source_binding_complete": false,
+      "source_binding_evidence": [
+        "run status head_after/tree_after plus manifest; original command metadata lacks pre-run binding"
+      ],
+      "source_dirty_diff_sha256": null,
+      "source_dirty_state": "unchanged_during_run; clean start not present in copied command record",
+      "source_head": "e70a72dcd2c2886ae0f1664ac40dcea4188e9fb0",
+      "source_tree": "955e197b445891f7de6baa36fa2d5647995ee5ba",
+      "test_summary": "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1866 filtered out; finished in 3.36s"
+    },
+    {
+      "category": "historical_runtime_or_compile_attempt",
+      "classification": "test output retained; original numeric status missing",
+      "evidence_prefix": "history/root-preserved/t56-restored-module-e70a72d/run-20261015",
+      "exit_code": 0,
+      "id": "history/root-preserved/t56-restored-module-e70a72d/run-20261015/command.log",
+      "numeric_exit_status_evidence": "history/root-preserved/t56-restored-module-e70a72d/run-20261015/status.json",
+      "numeric_exit_status_recorded": true,
+      "raw_log_bytes": 3507,
+      "raw_log_sha256": "4c398a292ea47b5b8ace33d53567f96fe0537f2750f73af50048d22008e99d02",
+      "source_binding_complete": false,
+      "source_binding_evidence": [
+        "run status head_after/tree_after plus manifest; original command metadata lacks pre-run binding"
+      ],
+      "source_dirty_diff_sha256": null,
+      "source_dirty_state": "unchanged_during_run; clean start not present in copied command record",
+      "source_head": "e70a72dcd2c2886ae0f1664ac40dcea4188e9fb0",
+      "source_tree": "955e197b445891f7de6baa36fa2d5647995ee5ba",
+      "test_summary": "test result: ok. 28 passed; 0 failed; 0 ignored; 0 measured; 1839 filtered out; finished in 73.51s"
+    },
+    {
+      "category": "historical_runtime_or_compile_attempt",
+      "classification": "actual focused runtime FAIL101;1run0PASS1FAIL;UnknownWork at sensitive.rs3929 after13.53seconds;no retry yet",
+      "evidence_prefix": "history/root-preserved/t56-runtime-69e820-main-1cZpb4",
+      "exit_code": 101,
+      "id": "history/root-preserved/t56-runtime-69e820-main-1cZpb4/command.log",
+      "numeric_exit_status_evidence": "history/root-preserved/t56-runtime-69e820-main-1cZpb4/status",
+      "numeric_exit_status_recorded": true,
+      "raw_log_bytes": 2801,
+      "raw_log_sha256": "ecc47a9a6b56ba327f4b8a11c6c07adae2209dc58ffb9ec8224b1d94327de637",
+      "source_binding_complete": true,
+      "source_binding_evidence": [
+        "history/root-preserved/t56-runtime-69e820-main-1cZpb4/attempt.json"
+      ],
+      "source_dirty_diff_sha256": null,
+      "source_dirty_state": "clean",
+      "source_head": "69e8202a64dea2d2aa45d64ce89b223fc76b48a1",
+      "source_tree": "15909c7cedd2814486d35fd773a085885bef844c",
+      "test_summary": "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1855 filtered out; finished in 13.53s"
+    },
+    {
+      "category": "historical_runtime_or_compile_attempt",
+      "classification": "actualcompositeFAIL101;originalgeneration/importemptydircleanupmissing;productionfixpendingreview;nooracletuning",
+      "evidence_prefix": "history/root-preserved/t56-runtime-b6fea172-composite-retry",
+      "exit_code": 101,
+      "id": "history/root-preserved/t56-runtime-b6fea172-composite-retry/command.log",
+      "numeric_exit_status_evidence": "history/root-preserved/t56-runtime-b6fea172-composite-retry/status",
+      "numeric_exit_status_recorded": true,
+      "raw_log_bytes": 1212,
+      "raw_log_sha256": "38bef605599ac967b441b10f7c819e14c2d8b5cc924754211e2a4dbed96daada",
+      "source_binding_complete": false,
+      "source_binding_evidence": [
+        "history/root-preserved/t56-runtime-b6fea172-composite-retry/copy-manifest.json"
+      ],
+      "source_dirty_diff_sha256": null,
+      "source_dirty_state": "not_recorded",
+      "source_head": null,
+      "source_tree": null,
+      "test_summary": "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1855 filtered out; finished in 14.29s"
+    },
+    {
+      "category": "historical_runtime_or_compile_attempt",
+      "classification": "compile-onlyFAIL101privatefield;zeroexecuted",
+      "evidence_prefix": "history/root-preserved/t56-v4-503ffd-unreadable-view-inventory",
+      "exit_code": 101,
+      "id": "history/root-preserved/t56-v4-503ffd-unreadable-view-inventory/command.log",
+      "numeric_exit_status_evidence": "history/root-preserved/t56-v4-503ffd-unreadable-view-inventory/status",
+      "numeric_exit_status_recorded": true,
+      "raw_log_bytes": 1102,
+      "raw_log_sha256": "66d38e2bf8c03fe8579deda458d3b617038642e2da46d3ddc500607d863e94ed",
+      "source_binding_complete": false,
+      "source_binding_evidence": [
+        "source commit referenced in contemporaneous source-review/copy-manifest record; tree resolved from Git"
+      ],
+      "source_dirty_diff_sha256": null,
+      "source_dirty_state": "not_recorded_in_original_copy_metadata",
+      "source_head": "503ffd0175063b6efb8d60c5b2774941c6f8b9bc",
+      "source_tree": "1391316f5b9dd66c9a698c35ef379550e6b0d425",
+      "test_summary": null
+    },
+    {
+      "category": "historical_runtime_or_compile_attempt",
+      "classification": "4 directory controls passed; overlap with the later 21-test suite, do not double-count",
+      "evidence_prefix": "history/root-preserved/t56-v4-8387-managed-dir-controls",
+      "exit_code": 0,
+      "id": "history/root-preserved/t56-v4-8387-managed-dir-controls/command.log",
+      "numeric_exit_status_evidence": "history/root-preserved/t56-v4-8387-managed-dir-controls/status",
+      "numeric_exit_status_recorded": true,
+      "raw_log_bytes": 928,
+      "raw_log_sha256": "82441fb35890dfd862ec6789582a885902ea951198fa4e110224220c944b0e1d",
+      "source_binding_complete": false,
+      "source_binding_evidence": [
+        "history/root-preserved/t56-v4-8387-managed-dir-controls/root-copy-manifest.json"
+      ],
+      "source_dirty_diff_sha256": null,
+      "source_dirty_state": "not_recorded",
+      "source_head": null,
+      "source_tree": null,
+      "test_summary": "test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 1856 filtered out; finished in 8.18s"
+    },
+    {
+      "category": "historical_runtime_or_compile_attempt",
+      "classification": "21 run; 13 passed; 8 failed; exit101; included four directory controls also run separately",
+      "evidence_prefix": "history/root-preserved/t56-v4-8387-sensitive-module",
+      "exit_code": 101,
+      "id": "history/root-preserved/t56-v4-8387-sensitive-module/command.log",
+      "numeric_exit_status_evidence": "history/root-preserved/t56-v4-8387-sensitive-module/status",
+      "numeric_exit_status_recorded": true,
+      "raw_log_bytes": 8279,
+      "raw_log_sha256": "d7096f9d8167f69e74b9294556b86c6a108e83a7451d10f6c16ba02d506ecc21",
+      "source_binding_complete": false,
+      "source_binding_evidence": [
+        "source commit referenced in contemporaneous source-review/copy-manifest record; tree resolved from Git"
+      ],
+      "source_dirty_diff_sha256": null,
+      "source_dirty_state": "not_recorded_in_original_copy_metadata",
+      "source_head": "8387fd9f78e53c5a66c76938b10020b67c3cdbe6",
+      "source_tree": "eb89e29c54256b10463f5fb3de1ddea66790df44",
+      "test_summary": "test result: FAILED. 13 passed; 8 failed; 0 ignored; 0 measured; 1839 filtered out; finished in 67.47s"
+    },
+    {
+      "category": "historical_runtime_or_compile_attempt",
+      "classification": "raw output retained; see log",
+      "evidence_prefix": "history/root-preserved/t56-v4-8387fd9f-norun",
+      "exit_code": 0,
+      "id": "history/root-preserved/t56-v4-8387fd9f-norun/command.log",
+      "numeric_exit_status_evidence": "history/root-preserved/t56-v4-8387fd9f-norun/status",
+      "numeric_exit_status_recorded": true,
+      "raw_log_bytes": 730,
+      "raw_log_sha256": "42dc867ed88c8484e8e7aa2bf559e883e23be255928d0086046763dbf31a91a9",
+      "source_binding_complete": false,
+      "source_binding_evidence": [
+        "source commit referenced in contemporaneous source-review/copy-manifest record; tree resolved from Git"
+      ],
+      "source_dirty_diff_sha256": null,
+      "source_dirty_state": "not_recorded_in_original_copy_metadata",
+      "source_head": "8387fd9f78e53c5a66c76938b10020b67c3cdbe6",
+      "source_tree": "eb89e29c54256b10463f5fb3de1ddea66790df44",
+      "test_summary": null
+    },
+    {
+      "category": "historical_runtime_or_compile_attempt",
+      "classification": "wrong-working-directory/setup failure; exit101; no tests",
+      "evidence_prefix": "history/root-preserved/t56-v4-967766-norun",
+      "exit_code": 101,
+      "id": "history/root-preserved/t56-v4-967766-norun/command.log",
+      "numeric_exit_status_evidence": "history/root-preserved/t56-v4-967766-norun/status",
+      "numeric_exit_status_recorded": true,
+      "raw_log_bytes": 193,
+      "raw_log_sha256": "e855013f7925b7759cd2e65c808c20e6d6a26cf77634eefdc47ba89c8c79d989",
+      "source_binding_complete": false,
+      "source_binding_evidence": [
+        "source commit referenced in contemporaneous source-review/copy-manifest record; tree resolved from Git"
+      ],
+      "source_dirty_diff_sha256": null,
+      "source_dirty_state": "not_recorded_in_original_copy_metadata",
+      "source_head": "967766042172925c9cb3b99a683cd83def8b4867",
+      "source_tree": "d7f9a4c545b70b697f84060742e8299fc58dda22",
+      "test_summary": null
+    },
+    {
+      "category": "historical_runtime_or_compile_attempt",
+      "classification": "correct-working-directory compile failure; exit101; no tests",
+      "evidence_prefix": "history/root-preserved/t56-v4-967766-norun-correctcwd",
+      "exit_code": 101,
+      "id": "history/root-preserved/t56-v4-967766-norun-correctcwd/command.log",
+      "numeric_exit_status_evidence": "history/root-preserved/t56-v4-967766-norun-correctcwd/status",
+      "numeric_exit_status_recorded": true,
+      "raw_log_bytes": 1045,
+      "raw_log_sha256": "8369ddc2f598506439935bb02c4844a1397dd39dd8da22ec76156d951f19746a",
+      "source_binding_complete": false,
+      "source_binding_evidence": [
+        "source commit referenced in contemporaneous source-review/copy-manifest record; tree resolved from Git"
+      ],
+      "source_dirty_diff_sha256": null,
+      "source_dirty_state": "not_recorded_in_original_copy_metadata",
+      "source_head": "967766042172925c9cb3b99a683cd83def8b4867",
+      "source_tree": "d7f9a4c545b70b697f84060742e8299fc58dda22",
+      "test_summary": null
+    },
+    {
+      "category": "historical_runtime_or_compile_attempt",
+      "classification": "compile-onlyPASS0;zerotests",
+      "evidence_prefix": "history/root-preserved/t56-v4-b6fea172-norun",
+      "exit_code": 0,
+      "id": "history/root-preserved/t56-v4-b6fea172-norun/command.log",
+      "numeric_exit_status_evidence": "history/root-preserved/t56-v4-b6fea172-norun/status",
+      "numeric_exit_status_recorded": true,
+      "raw_log_bytes": 730,
+      "raw_log_sha256": "8da62438a5ff8a6e30a35111e9c16ab502465334f33184edbfd4bb76a83ee6e2",
+      "source_binding_complete": false,
+      "source_binding_evidence": [
+        "history/root-preserved/t56-v4-b6fea172-norun/copy-manifest.json"
+      ],
+      "source_dirty_diff_sha256": null,
+      "source_dirty_state": "not_recorded",
+      "source_head": null,
+      "source_tree": null,
+      "test_summary": null
+    },
+    {
+      "category": "historical_multi_command_probe",
+      "classification": "superseded old-v23 probe; individual command statuses below; current-source paired probe is the primary evidence",
+      "evidence_prefix": "history/root-preserved/t56-old23-fence-94282330",
+      "exit_code": null,
+      "id": "historical-old-v23-probe-94282330",
+      "numeric_exit_status_recorded": false,
+      "source_binding_complete": false,
+      "source_binding_evidence": [
+        "source commit referenced in contemporaneous source-review/copy-manifest record; tree resolved from Git"
+      ],
+      "source_dirty_diff_sha256": null,
+      "source_dirty_state": "not_recorded_in_original_copy_metadata",
+      "source_head": "94282330ee63986eda437391ad66f4c2a389badd",
+      "source_tree": "9d42c8509435baed633b4eef00570a54d87c9801",
+      "subcommands": [
+        {
+          "bytes": 1793,
+          "exit_code": null,
+          "log": "history/root-preserved/t56-old23-fence-94282330/cargo-build.log",
+          "sha256": "372f73eddb44e21b496da8e236210e9da77dfc2414fca2b1d484b89b174c1293",
+          "status_evidence": null,
+          "test_summary": null
+        },
+        {
+          "bytes": 310,
+          "exit_code": null,
+          "log": "history/root-preserved/t56-old23-fence-94282330/initialize-state.log",
+          "sha256": "ef9f749e16ab04968d13e0c383ed4e403b3d4ae0ff1777f0da9687b4d23f7172",
+          "status_evidence": null,
+          "test_summary": null
+        },
+        {
+          "bytes": 930,
+          "exit_code": 0,
+          "log": "history/root-preserved/t56-old23-fence-94282330/old-status-json-clean.log",
+          "sha256": "099be060a113404bf50b6aad557a259986e33314fbd098847a726c1053790e19",
+          "status_evidence": "history/root-preserved/t56-old23-fence-94282330/old-status-json-clean.status",
+          "test_summary": null
+        },
+        {
+          "bytes": 930,
+          "exit_code": null,
+          "log": "history/root-preserved/t56-old23-fence-94282330/old-status-json.log",
+          "sha256": "099be060a113404bf50b6aad557a259986e33314fbd098847a726c1053790e19",
+          "status_evidence": null,
+          "test_summary": null
+        },
+        {
+          "bytes": 499,
+          "exit_code": 0,
+          "log": "history/root-preserved/t56-old23-fence-94282330/old-status-text.log",
+          "sha256": "75826e76560cc31b8151cb694e71c96efed4a7fe2d7c115fd48279f657e38302",
+          "status_evidence": "history/root-preserved/t56-old23-fence-94282330/old-status-text.status",
+          "test_summary": null
+        },
+        {
+          "bytes": 930,
+          "exit_code": 0,
+          "log": "history/root-preserved/t56-old23-fence-94282330/probe.status-json.log",
+          "sha256": "099be060a113404bf50b6aad557a259986e33314fbd098847a726c1053790e19",
+          "status_evidence": "history/root-preserved/t56-old23-fence-94282330/probe.status-json.status",
+          "test_summary": null
+        },
+        {
+          "bytes": 499,
+          "exit_code": 0,
+          "log": "history/root-preserved/t56-old23-fence-94282330/probe.status-text.log",
+          "sha256": "75826e76560cc31b8151cb694e71c96efed4a7fe2d7c115fd48279f657e38302",
+          "status_evidence": "history/root-preserved/t56-old23-fence-94282330/probe.status-text.status",
+          "test_summary": null
+        },
+        {
+          "bytes": 517,
+          "exit_code": null,
+          "log": "history/root-preserved/t56-old23-fence-94282330/seed-state-workspace.log",
+          "sha256": "ac20061d784f8196391330d5cd5846925cf5c586d688d2e052aaffce110dfe63",
+          "status_evidence": null,
+          "test_summary": null
+        },
+        {
+          "bytes": 133,
+          "exit_code": null,
+          "log": "history/root-preserved/t56-old23-fence-94282330/seed-state.log",
+          "sha256": "fd84e09b8d1dbe07e43ab51c85a822f5cf2fb7d2c62a234d6fb7786c23f053f1",
+          "status_evidence": null,
+          "test_summary": null
+        }
+      ],
+      "tested_binary_commit": "1d0ce264",
+      "tested_binary_sha256": "1268402c5d49ac303b61bc28b4e4726bf95b1d17d64d7099850f2f67950f7e6f"
+    },
+    {
+      "category": "historical_setup_or_compile_attempt",
+      "classification": "escalated compile log retained by original source-copy manifest; no test credit",
+      "evidence_prefix": "history/root-preserved/t56-cb857-norun-tmp",
+      "exit_code": null,
+      "id": "history/root-preserved/t56-cb857-norun-tmp/command-escalated.log",
+      "numeric_exit_status_evidence": null,
+      "numeric_exit_status_recorded": false,
+      "raw_log_bytes": 730,
+      "raw_log_sha256": "16873633492994dac2aae2186c968cdf89a08c7a16450569539f0c6b657cf088",
+      "source_binding_complete": false,
+      "source_binding_evidence": [
+        "source commit referenced in contemporaneous source-review/copy-manifest record; tree resolved from Git"
+      ],
+      "source_dirty_diff_sha256": null,
+      "source_dirty_state": "not_recorded_in_original_copy_metadata",
+      "source_head": "cb857147d7ac046b81de31909d17815d726f4ac3",
+      "source_tree": "58f689b2c772d2bfccafadcc9889bc2aedf8dde6",
+      "test_summary": null
+    },
+    {
+      "category": "session1128_setup_or_test_attempt",
+      "classification": "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1834 filtered out; finished in 0.88s",
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-j4",
+        "-p",
+        "aethyme-broker",
+        "--lib",
+        "local_authority::tests::completed_freeze_rebinds_the_frozen_epoch_and_allows_sensitive_quarantine",
+        "--",
+        "--exact"
+      ],
+      "evidence_prefix": "history/session1128/retention-checks/20261015T181355Z-t56-freeze-quarantine-f7abe4cf",
+      "exit_code": 0,
+      "id": "history/session1128/retention-checks/20261015T181355Z-t56-freeze-quarantine-f7abe4cf/command.log",
+      "numeric_exit_status_evidence": "history/session1128/retention-checks/20261015T181355Z-t56-freeze-quarantine-f7abe4cf/command.status",
+      "numeric_exit_status_recorded": true,
+      "raw_log_bytes": 2487,
+      "raw_log_sha256": "db53ddbabfef7217caa7b3ce4957fcc1e2ef282320ec89bb7c59f79fb7ec8e56",
+      "source_binding_complete": false,
+      "source_binding_evidence": [
+        "history/session1128/retention-checks/20261015T181355Z-t56-freeze-quarantine-f7abe4cf/command.json"
+      ],
+      "source_dirty_diff_sha256": null,
+      "source_dirty_state": "not_recorded_in_original_command_metadata",
+      "source_head": null,
+      "source_tree": null,
+      "test_summary": "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1834 filtered out; finished in 0.88s"
+    },
+    {
+      "category": "session1128_setup_or_test_attempt",
+      "classification": "compile failed; no tests ran",
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-j4",
+        "-p",
+        "aethyme-broker",
+        "--lib",
+        "local_authority::tests::"
+      ],
+      "evidence_prefix": "history/session1128/retention-checks/20261015T182903Z-t56-reader-recovery-local-authority-module-63874cff",
+      "exit_code": 101,
+      "id": "history/session1128/retention-checks/20261015T182903Z-t56-reader-recovery-local-authority-module-63874cff/command.log",
+      "numeric_exit_status_evidence": "history/session1128/retention-checks/20261015T182903Z-t56-reader-recovery-local-authority-module-63874cff/command.status",
+      "numeric_exit_status_recorded": true,
+      "raw_log_bytes": 862,
+      "raw_log_sha256": "3d71c8e1ccab666f9bcc60d2b5a777b45fc142e76dc4594a75c43fd6cc552372",
+      "source_binding_complete": false,
+      "source_binding_evidence": [
+        "history/session1128/retention-checks/20261015T182903Z-t56-reader-recovery-local-authority-module-63874cff/command.json"
+      ],
+      "source_dirty_diff_sha256": null,
+      "source_dirty_state": "not_recorded_in_original_command_metadata",
+      "source_head": null,
+      "source_tree": null,
+      "test_summary": null
+    },
+    {
+      "category": "session1128_setup_or_test_attempt",
+      "classification": "test result: FAILED. 25 passed; 1 failed; 1 ignored; 0 measured; 1813 filtered out; finished in 9.79s",
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-j4",
+        "-p",
+        "aethyme-broker",
+        "--lib",
+        "local_authority::tests::"
+      ],
+      "evidence_prefix": "history/session1128/retention-checks/20261015T183013Z-t56-reader-recovery-local-authority-module-retry1-56574d07",
+      "exit_code": 101,
+      "id": "history/session1128/retention-checks/20261015T183013Z-t56-reader-recovery-local-authority-module-retry1-56574d07/command.log",
+      "numeric_exit_status_evidence": "history/session1128/retention-checks/20261015T183013Z-t56-reader-recovery-local-authority-module-retry1-56574d07/command.status",
+      "numeric_exit_status_recorded": true,
+      "raw_log_bytes": 4579,
+      "raw_log_sha256": "5d28ab758f14af7fd1a8f383aca77ac714cd8abdd3fc8bbcf6cdbf24c41b740d",
+      "source_binding_complete": false,
+      "source_binding_evidence": [
+        "history/session1128/retention-checks/20261015T183013Z-t56-reader-recovery-local-authority-module-retry1-56574d07/command.json"
+      ],
+      "source_dirty_diff_sha256": null,
+      "source_dirty_state": "not_recorded_in_original_command_metadata",
+      "source_head": null,
+      "source_tree": null,
+      "test_summary": "test result: FAILED. 25 passed; 1 failed; 1 ignored; 0 measured; 1813 filtered out; finished in 9.79s"
+    },
+    {
+      "category": "session1128_setup_or_test_attempt",
+      "classification": "test result: FAILED. 25 passed; 1 failed; 1 ignored; 0 measured; 1813 filtered out; finished in 10.58s",
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-j4",
+        "-p",
+        "aethyme-broker",
+        "--lib",
+        "local_authority::tests::"
+      ],
+      "evidence_prefix": "history/session1128/retention-checks/20261015T183205Z-t56-reader-recovery-local-authority-module-retry2-432ec7b1",
+      "exit_code": 101,
+      "id": "history/session1128/retention-checks/20261015T183205Z-t56-reader-recovery-local-authority-module-retry2-432ec7b1/command.log",
+      "numeric_exit_status_evidence": "history/session1128/retention-checks/20261015T183205Z-t56-reader-recovery-local-authority-module-retry2-432ec7b1/command.status",
+      "numeric_exit_status_recorded": true,
+      "raw_log_bytes": 4283,
+      "raw_log_sha256": "370f1612fdcf5bbd18b82f983a5fee9114d42cd5cb3d4cb8e9367a0f6f830e2b",
+      "source_binding_complete": false,
+      "source_binding_evidence": [
+        "history/session1128/retention-checks/20261015T183205Z-t56-reader-recovery-local-authority-module-retry2-432ec7b1/command.json"
+      ],
+      "source_dirty_diff_sha256": null,
+      "source_dirty_state": "not_recorded_in_original_command_metadata",
+      "source_head": null,
+      "source_tree": null,
+      "test_summary": "test result: FAILED. 25 passed; 1 failed; 1 ignored; 0 measured; 1813 filtered out; finished in 10.58s"
+    },
+    {
+      "category": "session1128_setup_or_test_attempt",
+      "classification": "raw command result retained; status and output below",
+      "command": [
+        "cargo",
+        "check",
+        "--locked",
+        "-j4",
+        "-p",
+        "aethyme-broker"
+      ],
+      "evidence_prefix": "history/session1128/t56-schema24-cargo-check-40100a42",
+      "exit_code": 0,
+      "id": "history/session1128/t56-schema24-cargo-check-40100a42/command.log",
+      "numeric_exit_status_evidence": "history/session1128/t56-schema24-cargo-check-40100a42/status",
+      "numeric_exit_status_recorded": true,
+      "raw_log_bytes": 495,
+      "raw_log_sha256": "44aaa65fa184f176749fc663c128d7a3d301ac5d238059573aa47a9d3cac95dd",
+      "source_binding_complete": false,
+      "source_binding_evidence": [
+        "history/session1128/t56-schema24-cargo-check-40100a42/command.json"
+      ],
+      "source_dirty_diff_sha256": null,
+      "source_dirty_state": "not_recorded_in_original_command_metadata",
+      "source_head": "40100a42dfd72e444a8d29270802efd5373b11cf",
+      "source_tree": null,
+      "test_summary": null
+    },
+    {
+      "category": "session1128_setup_or_test_attempt",
+      "classification": "compile failed; no tests ran",
+      "command": [
+        "cargo",
+        "check",
+        "--locked",
+        "-j4",
+        "-p",
+        "aethyme-broker"
+      ],
+      "evidence_prefix": "history/session1128/t56-schema24-cargo-check-584d914",
+      "exit_code": 101,
+      "id": "history/session1128/t56-schema24-cargo-check-584d914/command.log",
+      "numeric_exit_status_evidence": "history/session1128/t56-schema24-cargo-check-584d914/status",
+      "numeric_exit_status_recorded": true,
+      "raw_log_bytes": 8791,
+      "raw_log_sha256": "ec09c5a1893ae8c10426b6e1c75bb328d52008d191d285055a3c23380a477b2f",
+      "source_binding_complete": false,
+      "source_binding_evidence": [
+        "history/session1128/t56-schema24-cargo-check-584d914/command.json"
+      ],
+      "source_dirty_diff_sha256": null,
+      "source_dirty_state": "not_recorded_in_original_command_metadata",
+      "source_head": "584d914f2661952e3413326cf16a7447bd6378f2",
+      "source_tree": null,
+      "test_summary": null
+    },
+    {
+      "category": "session1128_setup_or_test_attempt",
+      "classification": "raw command result retained; status and output below",
+      "command": [
+        "cargo",
+        "check",
+        "--locked",
+        "-j4",
+        "-p",
+        "aethyme-broker",
+        "--manifest-path",
+        "Cargo.toml"
+      ],
+      "evidence_prefix": "history/session1128/t56-schema24-initial-check",
+      "exit_code": 101,
+      "id": "history/session1128/t56-schema24-initial-check/command.log",
+      "numeric_exit_status_evidence": "history/session1128/t56-schema24-initial-check/status",
+      "numeric_exit_status_recorded": true,
+      "raw_log_bytes": 49,
+      "raw_log_sha256": "308eb80f9f890352572b3679779bec78398738b5cc3da92cb655a8b9c1e32962",
+      "source_binding_complete": false,
+      "source_binding_evidence": [
+        "history/session1128/t56-schema24-initial-check/command.json"
+      ],
+      "source_dirty_diff_sha256": null,
+      "source_dirty_state": "not_recorded_in_original_command_metadata",
+      "source_head": "584d914f2661952e3413326cf16a7447bd6378f2",
+      "source_tree": null,
+      "test_summary": null
+    }
+  ],
+  "historical_attempts_count": 26,
+  "omitted_historical_input_payloads": [
+    {
+      "kind": "generated SQLite databases and Playground working trees from the superseded 2026-10-15 old-v23 probe",
+      "reason": "Retained raw before/after inventory JSON, verification records, command logs and source/copy manifests instead; excludes transient fixture state bytes and .git working-tree internals from publication. The previous probe’s copied host SQLite database and working tree remain represented by the original complete inventory manifests; they are not copied here.",
+      "replacement_evidence": "current-source/old-v23-fence includes the final probe JSON, exact host/repository inventory hashes, raw diagnostics, and floor-mutation/control receipts."
+    }
+  ],
+  "qualification_limits": [
+    "Tests used synthetic fixture content only; no real user secret or held-out data was used.",
+    "This finite profile does not establish secure or universal erasure.",
+    "Unmanaged exports, raw Git objects, external backups and other copies outside the inventoried managed store remain explicit residuals.",
+    "A schema floor blocks future old-binary opens; it does not revoke an already-open v23 reader or raw same-user filesystem access.",
+    "Cooperative process and filesystem locking, the pinned local host and the enumerated T56 interruption cases bound this result."
+  ],
+  "raw_file_inventory_count": 213,
+  "schema": "aethyme.local-sensitive-response-evidence.v1",
+  "scope": "T56 local administrative sensitive-content response, bounded synthetic Playground qualification",
+  "source": {
+    "commit": "425a0bc8e41031cea6b0ff8b5bc0e9cc80748b31",
+    "final_source_archive_copy_included": false,
+    "mutant_source_archive_note": "Archive omitted from tracked evidence; exact archive byte count/SHA and full source-tree inventory are recorded in base-source.json. The committed source tree is bound by Git head/tree.",
+    "mutant_source_archive_sha256": "936399325d06221e9eb553e578e6b4569b6be65a816513a4e681b9f3b066bae8",
+    "mutant_source_inventory_sha256": "8e0cb59f3ee0bbb19980dbbd6f49e8333633b20e323901fccb174bb7f6ab93c3",
+    "tree": "01f8a9f6a51818732cf6feb38125a34c81745d5b",
+    "worktree_clean_at_validation": true
+  },
+  "original_payload_count": 212,
+  "original_payload_bytes": 3082009,
+  "storage_artifact_count": 213,
+  "packaging_revision": 2,
+  "packaging_updated_at_utc": "2026-10-15",
+  "source_ledger_snapshot": {
+    "path": "artifacts/0213.raw",
+    "logical_path": "ledger.json",
+    "logical_path_base": "package_root",
+    "bytes": 90225,
+    "sha256": "ae892f97564e327bac1d170eb848de0cddefe96dc92104e358fa75774b7e69b1",
+    "original_schema": "aethyme.local-sensitive-response-evidence.v1",
+    "original_payload_inventory_count": 212,
+    "included_in_files": true,
+    "note": "Byte-exact ledger snapshot from before the opaque flat-storage packaging revision."
+  }
+}

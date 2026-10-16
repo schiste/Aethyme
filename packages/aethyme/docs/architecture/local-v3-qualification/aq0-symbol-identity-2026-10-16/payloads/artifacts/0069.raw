@@ -1,0 +1,43 @@
+AQ0 constructor lint follow-up; pre-runtime static freeze
+
+Base source branch commit/tree:
+  1df98deb1654dbf2b198ed0c9b915896440faa51
+  575ca56e05539107a320c89deab3e0f801b21d42
+Current source changes are uncommitted and frozen as an immutable patch:
+  /private/tmp/aq0-mutants-1c763a10/constructor-input-v2.patch
+  SHA-256 8c93845dc16b7bedd379a160c244ccd4d3d685c0eab99955a34474f8904bdfec
+Current source SHA-256:
+  packages/aethyme/rust/crates/aethyme-broker/src/experimental_symbol_mapping.rs
+  cdc5a2aadee4e9e914f5330913cacc7bd054cfee33f2ad505425262ba882698f
+Current actual-clone integration test SHA-256:
+  packages/aethyme/rust/crates/aethyme-broker/tests/symbol_identity_binding.rs
+  9d63dcf33f4db8b4f4ad6040ac5f005574409eb264edbfcce218eeed3cc2757f
+
+Only change: replace the eight-argument CloneSnapshotBinding::from_snapshots
+shape with four arguments (project, left CapturedCloneSnapshot, right
+CapturedCloneSnapshot, profile). Each new input groups exactly the clone ID,
+repo component and borrowed source snapshot for one clone. Existing distinct
+clone, repo component, and source snapshot validation and stored fields remain
+in the implementation. No resolver guard predicate, schema, wire data, NodeId
+code, fixtures or authority behavior changes. `git diff --check` passes.
+
+The six existing one-predicate patches are byte-identical to the reviewed
+inventory in manifest.txt (SHA-256 cfca2e5e565bbd803cf607729038ecc0172d4d146198bd12ddb73d34826fb3f5),
+and read-only `git apply --check` passed against the current source worktree
+for each:
+  01-predecode-count.patch  77d7f4a90f8583729e7fd529de9cc2f2b8edddc179ccecef2ae56a27f59196a9
+  02-right-source-binding.patch 6742a6981b84f7b8eb8c10e701b6d83fec94d560a2e0498e6da786acfb8209d0
+  03-profile-binding.patch c33537103ad5ee5692709f182aeaa700e7f7082a612a2563e514b605ef648af7
+  04-claim-origin-refs.patch 49c160c2d1adddfa81461b771eb5855db1efaee36e05c907798b87864a063d10
+  05-right-origin-record.patch 692df77bf8d6c89ac5de7f8f731bf66e6b30a53652bd8f3aca9fb8e2187580a6
+  06-proposed-state.patch 1f6db2f94eebdffa079e7c4d6f25cb07689c1156012c94d5749cc404764cae61
+All six predicates are unchanged by the constructor patch. Request independent
+review of the exact immutable patch plus applicability/reachability before
+running focused tests, strict Clippy, formatter check, or mutants on this source.
+
+Preserved strict-Clippy failure on prior source commit 1df98deb:
+  command: cargo clippy --locked -j4 --manifest-path packages/aethyme/rust/Cargo.toml
+           -p aethyme-contracts -p aethyme-broker --all-targets -- -D warnings
+  log: /private/tmp/aq0-restored-1df98deb-clippy.txt
+  SHA-256 a0e01b8162840393f42c987e4d07bea32836b9ee708941f4a9fd8e012e79bcae
+  sole reported error: too_many_arguments on from_snapshots.

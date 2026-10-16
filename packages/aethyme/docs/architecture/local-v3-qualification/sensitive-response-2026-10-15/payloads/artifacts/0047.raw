@@ -1,0 +1,11 @@
+--- a/packages/aethyme/rust/crates/aethyme-broker/src/collaboration_state.rs
++++ b/packages/aethyme/rust/crates/aethyme-broker/src/collaboration_state.rs
+@@ -65,7 +65,7 @@
+ // Schema 22 cannot interpret explicit native-job root release.
+ // Schema 23 does not honor the permanent sensitive-response tombstone and
+ // could read, recapture, or export data after administrative removal.
+-const MIN_COMPATIBLE_SCHEMA: i64 = 24;
++const MIN_COMPATIBLE_SCHEMA: i64 = 23;
+ const ROOT_DIRECTORY: &str = "collaboration";
+ /// Schema steps after the version 1 layout (`meta` only), applied in
+ /// order. Step 17 adds separately indexed historical imports and rehearsals. The floor is

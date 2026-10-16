@@ -1,0 +1,1507 @@
+//! Provisional Local budget reservation model (#668).
+//! This records declared envelopes, not enforced process limits or invoices.
+//! The future trusted executor must enforce a grant and provide usage receipts.
+//! Host capacity grants remain in `resources::HostResourceCoordinator`.
+
+use std::collections::BTreeMap;
+
+use aethyme_contracts::experimental_v0::{FieldKind, FieldSpec, Record, RecordId, RecordSchema};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use serde::{Deserialize, Serialize};
+
+use crate::collaboration_state::CollaborationStore;
+use crate::local_target::{self as target, ControllerOwner, Phase, TargetError};
+use crate::local_wave::{self as wave, WavePhase};
+
+const SCHEMA_NAME: &str = "aethyme.local-budget/provisional-v0";
+static SCHEMA: RecordSchema = RecordSchema {
+    name: SCHEMA_NAME,
+    fields: &[FieldSpec {
+        name: "spec",
+        required: true,
+        kind: FieldKind::Opaque,
+        capability: None,
+    }],
+    capabilities: &[],
+};
+const MAX_LINEAGE_DEPTH: usize = 8;
+const MAX_LINEAGE_RECORDS: i64 = 4096;
+
+/// Conservative cumulative envelope units. Memory/disk/slot amounts are not
+/// reclaimed automatically after a lease expires or a process disappears.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Units {
+    pub time_ms: i64,
+    pub memory_bytes: i64,
+    pub disk_bytes: i64,
+    pub model_requests: i64,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub spend_microunits: i64,
+    pub slots: i64,
+    pub previews: i64,
+}
+impl Units {
+    fn values(self) -> [i64; 9] {
+        [
+            self.time_ms,
+            self.memory_bytes,
+            self.disk_bytes,
+            self.model_requests,
+            self.input_tokens,
+            self.output_tokens,
+            self.spend_microunits,
+            self.slots,
+            self.previews,
+        ]
+    }
+    fn from_values(v: [i64; 9]) -> Self {
+        Self {
+            time_ms: v[0],
+            memory_bytes: v[1],
+            disk_bytes: v[2],
+            model_requests: v[3],
+            input_tokens: v[4],
+            output_tokens: v[5],
+            spend_microunits: v[6],
+            slots: v[7],
+            previews: v[8],
+        }
+    }
+    fn validate(self) -> Result<(), BudgetError> {
+        if self.values().iter().any(|v| *v < 0 || *v > i64::MAX / 4096) {
+            return Err(BudgetError::Invalid("unit bounds".into()));
+        }
+        Ok(())
+    }
+    fn zero(self) -> bool {
+        self == Self::default()
+    }
+    fn within(self, cap: Self) -> bool {
+        self.values().iter().zip(cap.values()).all(|(a, b)| *a <= b)
+    }
+    fn add(self, other: Self) -> Result<Self, BudgetError> {
+        let mut v = self.values();
+        for (a, b) in v.iter_mut().zip(other.values()) {
+            *a = a.checked_add(b).ok_or(BudgetError::Arithmetic)?;
+        }
+        Ok(Self::from_values(v))
+    }
+    fn subtract(self, other: Self) -> Result<Self, BudgetError> {
+        if !other.within(self) {
+            return Err(BudgetError::Arithmetic);
+        }
+        let mut v = self.values();
+        for (a, b) in v.iter_mut().zip(other.values()) {
+            *a -= b;
+        }
+        Ok(Self::from_values(v))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectPolicy {
+    pub authorization: String,
+    pub price_profile: String,
+    pub cap: Units,
+    pub recovery_headroom: Units,
+    pub mandatory_headroom: Units,
+    pub max_root_reservations: usize,
+}
+impl ProjectPolicy {
+    fn validate(&self) -> Result<(), BudgetError> {
+        id(&self.authorization)?;
+        id(&self.price_profile)?;
+        self.cap.validate()?;
+        self.recovery_headroom.validate()?;
+        self.mandatory_headroom.validate()?;
+        if self.cap.zero()
+            || !self
+                .recovery_headroom
+                .add(self.mandatory_headroom)?
+                .within(self.cap)
+            || self.max_root_reservations == 0
+            || self.max_root_reservations > 4096
+        {
+            return Err(BudgetError::Invalid("project policy bounds".into()));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkKind {
+    Composition,
+    Verification,
+    OptionalAnalysis,
+    Recovery,
+}
+impl WorkKind {
+    fn optional(self) -> bool {
+        self == Self::OptionalAnalysis
+    }
+    fn recovery(self) -> bool {
+        self == Self::Recovery
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Request {
+    pub nonce: String,
+    pub recipe: String,
+    pub kind: WorkKind,
+    pub units: Units,
+    pub max_attempts: u32,
+    pub deadline_ms: i64,
+}
+impl Request {
+    fn validate(&self) -> Result<(), BudgetError> {
+        id(&self.nonce)?;
+        id(&self.recipe)?;
+        self.units.validate()?;
+        if self.units.zero()
+            || self.max_attempts == 0
+            || self.max_attempts > 8
+            || self.deadline_ms < 0
+        {
+            return Err(BudgetError::Invalid("request bounds".into()));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReservationSpec {
+    issuer: String,
+    target: String,
+    revision: String,
+    wave: String,
+    objective: String,
+    project_policy: String,
+    objective_policy: String,
+    request: Request,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parent: Option<String>,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum State {
+    Reserved,
+    PartlyConsumed,
+    CompletionPending,
+    Consumed,
+    ReleasedUnused,
+    ConsumptionUnknown,
+}
+impl State {
+    fn held(self) -> bool {
+        !matches!(self, Self::Consumed | Self::ReleasedUnused)
+    }
+    fn code(self) -> &'static str {
+        match self {
+            Self::Reserved => "reserved",
+            Self::PartlyConsumed => "partly_consumed",
+            Self::CompletionPending => "completion_pending",
+            Self::Consumed => "consumed",
+            Self::ReleasedUnused => "released_unused",
+            Self::ConsumptionUnknown => "consumption_unknown",
+        }
+    }
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Reservation {
+    pub id: RecordId,
+    pub root: RecordId,
+    pub state: State,
+    pub allocated: Units,
+    pub spent: Units,
+    pub attempts: u32,
+    pub version: i64,
+    /// A reported overrun remains visible and blocks new project admission.
+    pub observed_overrun: Option<Units>,
+    pub receipt: Option<RecordId>,
+    spec: ReservationSpec,
+}
+
+/// Bounded read-only view for an operator reconciling a lost command response.
+/// These are declared ledger amounts and states, not measured process usage.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ReservationStatus {
+    pub id: String,
+    pub root: String,
+    pub parent: Option<String>,
+    pub target: String,
+    pub revision: String,
+    pub wave: String,
+    pub objective: String,
+    pub nonce: String,
+    pub recipe: String,
+    pub kind: WorkKind,
+    pub deadline_ms: i64,
+    pub phase: State,
+    pub allocated: Units,
+    pub charged: Units,
+    pub spent: Units,
+    pub attempts: u32,
+    pub max_attempts: u32,
+    pub version: i64,
+    pub observed_overrun: Option<Units>,
+    pub receipt: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ObjectiveStatus {
+    pub authorization: String,
+    pub policy: String,
+    pub cap: Units,
+    pub root_charged: Units,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BudgetStatus {
+    pub target: String,
+    pub issuer: String,
+    pub revision: Option<String>,
+    pub objective_authorization: Option<String>,
+    pub project_policy: String,
+    pub project: ProjectPolicy,
+    pub project_root_charged: Units,
+    pub objectives: Vec<ObjectiveStatus>,
+    pub reservations: Vec<ReservationStatus>,
+    pub reservation_count: u64,
+    pub reservations_truncated: bool,
+    pub selected_reservation: Option<ReservationStatus>,
+    pub nonce_lookup: Option<NonceLookupStatus>,
+}
+
+/// Bounded, read-only reconciliation for a dispatch command whose stdout was
+/// lost. A nonce lookup never retries or resumes the associated work.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct NonceLookupStatus {
+    pub nonce: String,
+    pub outcome: NonceLookupOutcome,
+    /// At most two rows are returned. The schema makes nonce unique; an
+    /// ambiguous result is a defensive signal for a corrupt or legacy ledger.
+    pub matches: Vec<ReservationStatus>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NonceLookupOutcome {
+    NotFound,
+    Found,
+    Ambiguous,
+}
+
+fn nonce_lookup_outcome(matches: usize) -> NonceLookupOutcome {
+    match matches {
+        0 => NonceLookupOutcome::NotFound,
+        1 => NonceLookupOutcome::Found,
+        _ => NonceLookupOutcome::Ambiguous,
+    }
+}
+
+/// A non-cloneable attempt identity. This is a model dispatch permit, not an
+/// executor capability, verification receipt or permission to publish source.
+#[derive(Debug)]
+pub struct Attempt {
+    reservation: RecordId,
+    version: i64,
+    number: u32,
+    remaining: Units,
+    pub(crate) epoch: crate::local_authority::Epoch,
+    pub(crate) project_dir: std::path::PathBuf,
+}
+impl Attempt {
+    pub fn reservation(&self) -> &RecordId {
+        &self.reservation
+    }
+    pub fn number(&self) -> u32 {
+        self.number
+    }
+    pub fn remaining(&self) -> Units {
+        self.remaining
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum BudgetError {
+    #[error("invalid budget ledger: {0}")]
+    Invalid(String),
+    #[error("budget arithmetic overflow or underflow")]
+    Arithmetic,
+    #[error("immutable budget authorization or idempotency key differs")]
+    Immutable,
+    #[error("budget unavailable in {0}")]
+    Capacity(&'static str),
+    #[error("reservation missing")]
+    Missing,
+    #[error("reservation has outstanding or unknown work")]
+    Pending,
+    #[error("reservation or attempt is stale")]
+    Stale,
+    #[error("receipt identity was already assigned to another accounting observation")]
+    ReceiptReplay,
+    #[error("retry allowance exhausted")]
+    AttemptsExhausted,
+    #[error("measured usage exceeded its reserved envelope; consumption remains unknown")]
+    UsageExceeded,
+    #[error(transparent)]
+    Target(#[from] TargetError),
+    #[error(transparent)]
+    Wave(#[from] wave::WaveError),
+    #[error(transparent)]
+    Sensitive(#[from] crate::collaboration_sensitive::SensitiveError),
+    #[error(transparent)]
+    Sqlite(#[from] rusqlite::Error),
+    #[error(transparent)]
+    Json(#[from] serde_json::Error),
+}
+fn id(value: &str) -> Result<RecordId, BudgetError> {
+    RecordId::parse(value).map_err(|e| BudgetError::Invalid(e.to_string()))
+}
+fn record(spec: &impl Serialize) -> Result<Record, BudgetError> {
+    let bytes = serde_json::to_vec(&serde_json::json!({"schema":SCHEMA_NAME,"spec":spec}))?;
+    Record::decode(&bytes, &[&SCHEMA]).map_err(|e| BudgetError::Invalid(e.to_string()))
+}
+fn decode<T: serde::de::DeserializeOwned>(key: &str, body: &[u8]) -> Result<T, BudgetError> {
+    let r = Record::decode(body, &[&SCHEMA]).map_err(|e| BudgetError::Invalid(e.to_string()))?;
+    if r.id() != id(key)? || r.canonical_bytes() != body {
+        return Err(BudgetError::Invalid("record digest".into()));
+    }
+    let v: serde_json::Value = serde_json::from_slice(body)?;
+    Ok(serde_json::from_value(v["spec"].clone())?)
+}
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProjectRecord {
+    issuer: String,
+    kind: String,
+    policy: ProjectPolicy,
+}
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ObjectiveRecord {
+    issuer: String,
+    kind: String,
+    objective: String,
+    project_policy: String,
+    cap: Units,
+}
+fn project(conn: &Connection, issuer: &str) -> Result<(RecordId, ProjectPolicy), BudgetError> {
+    let (key, body, appointed): (String, Vec<u8>, String) = conn
+        .query_row(
+            "SELECT policy,body,issuer FROM local_budget_project WHERE singleton=1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()?
+        .ok_or(BudgetError::Missing)?;
+    let spec: ProjectRecord = decode(&key, &body)?;
+    spec.policy.validate()?;
+    if spec.kind != "project" || spec.issuer != issuer || appointed != issuer {
+        return Err(BudgetError::Invalid("project issuer".into()));
+    }
+    Ok((id(&key)?, spec.policy))
+}
+fn objective(
+    conn: &Connection,
+    issuer: &str,
+    auth: &str,
+    project_id: &RecordId,
+) -> Result<(RecordId, Units), BudgetError> {
+    let (key, body, appointed): (String, Vec<u8>, String) = conn
+        .query_row(
+            "SELECT policy,body,issuer FROM local_budget_objectives WHERE objective=?1",
+            [auth],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()?
+        .ok_or(BudgetError::Missing)?;
+    let spec: ObjectiveRecord = decode(&key, &body)?;
+    spec.cap.validate()?;
+    if spec.kind != "objective"
+        || spec.issuer != issuer
+        || appointed != issuer
+        || spec.objective != auth
+        || spec.project_policy != project_id.as_str()
+    {
+        return Err(BudgetError::Invalid("objective authority".into()));
+    }
+    Ok((id(&key)?, spec.cap))
+}
+
+/// Appoint one project budget issuer with immutable caps and protected lanes.
+/// Project aggregate limits remain necessary even for fresh objective IDs.
+pub fn configure_project(
+    store: &mut CollaborationStore,
+    owner: &ControllerOwner,
+    policy: ProjectPolicy,
+) -> Result<RecordId, BudgetError> {
+    let _authority = target::authorize(store, owner)?;
+    target::authorize(store, owner)?;
+    policy.validate()?;
+    let r = record(&ProjectRecord {
+        issuer: owner.issuer().into(),
+        kind: "project".into(),
+        policy,
+    })?;
+    let tx = store
+        .connection()
+        .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let existing: Option<String> = tx
+        .query_row(
+            "SELECT policy FROM local_budget_project WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(existing) = existing {
+        if existing != r.id().as_str() {
+            return Err(BudgetError::Immutable);
+        }
+    } else {
+        tx.execute(
+            "INSERT INTO local_budget_project(singleton,issuer,policy,body) VALUES(1,?1,?2,?3)",
+            params![owner.issuer(), r.id().as_str(), r.canonical_bytes()],
+        )?;
+    }
+    tx.commit()?;
+    Ok(r.id())
+}
+
+/// A stable objective lineage. Calling this again cannot replenish its cap.
+pub fn authorize_objective(
+    store: &mut CollaborationStore,
+    owner: &ControllerOwner,
+    cap: Units,
+) -> Result<RecordId, BudgetError> {
+    let _authority = target::authorize(store, owner)?;
+    target::authorize(store, owner)?;
+    cap.validate()?;
+    let state = target::status(store, owner.target())?;
+    let revision =
+        target::load_revision(store, state.revision.as_ref().ok_or(TargetError::Missing)?)?;
+    let (p, policy) = project(store.read_connection(), owner.issuer())?;
+    if cap.zero() || !cap.within(policy.cap) {
+        return Err(BudgetError::Invalid("objective cap".into()));
+    }
+    let auth = &revision.spec.objective_authorization;
+    let r = record(&ObjectiveRecord {
+        issuer: owner.issuer().into(),
+        kind: "objective".into(),
+        objective: auth.clone(),
+        project_policy: p.to_string(),
+        cap,
+    })?;
+    let tx = store
+        .connection()
+        .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    guard(&tx, owner, revision.id.as_str(), state.version)?;
+    let existing: Option<String> = tx
+        .query_row(
+            "SELECT policy FROM local_budget_objectives WHERE objective=?1",
+            [auth],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(existing) = existing {
+        if existing != r.id().as_str() {
+            return Err(BudgetError::Immutable);
+        }
+    } else {
+        tx.execute(
+            "INSERT INTO local_budget_objectives(objective,issuer,policy,body) VALUES(?1,?2,?3,?4)",
+            params![auth, owner.issuer(), r.id().as_str(), r.canonical_bytes()],
+        )?;
+    }
+    tx.commit()?;
+    Ok(r.id())
+}
+
+fn load_conn(conn: &Connection, key: &RecordId) -> Result<Reservation, BudgetError> {
+    load_conn_at(conn, key, 0)
+}
+fn load_conn_at(
+    conn: &Connection,
+    key: &RecordId,
+    depth: usize,
+) -> Result<Reservation, BudgetError> {
+    if depth >= MAX_LINEAGE_DEPTH {
+        return Err(BudgetError::Invalid("lineage depth".into()));
+    }
+    type Row = (
+        Vec<u8>,
+        String,
+        Vec<u8>,
+        u32,
+        i64,
+        String,
+        Option<String>,
+        String,
+        String,
+        String,
+        String,
+    );
+    let row:Row=conn.query_row("SELECT body,phase,spent,attempts,version,root,parent,target,revision,wave,nonce FROM local_budget_reservations WHERE reservation=?1",[key.as_str()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?,r.get(8)?,r.get(9)?,r.get(10)?))).optional()?.ok_or(BudgetError::Missing)?;
+    let spec: ReservationSpec = decode(key.as_str(), &row.0)?;
+    spec.request.validate()?;
+    let spent: Units = serde_json::from_slice(&row.2)?;
+    spent.validate()?;
+    let state: State = serde_json::from_value(serde_json::Value::String(row.1))?;
+    if spec.parent != row.6
+        || spec.target != row.7
+        || spec.revision != row.8
+        || spec.wave != row.9
+        || spec.request.nonce != row.10
+        || !spent.within(spec.request.units)
+        || row.3 > spec.request.max_attempts
+        || row.4 < 0
+    {
+        return Err(BudgetError::Invalid("reservation index".into()));
+    }
+    let (p, _) = project(conn, &spec.issuer)?;
+    let (o, cap) = objective(conn, &spec.issuer, &spec.objective, &p)?;
+    if spec.project_policy != p.as_str()
+        || spec.objective_policy != o.as_str()
+        || !spec.request.units.within(cap)
+    {
+        return Err(BudgetError::Invalid("reservation policy".into()));
+    }
+    let root = id(&row.5)?;
+    if spec.parent.is_none() && root != *key {
+        return Err(BudgetError::Invalid("root lineage".into()));
+    }
+    if let Some(parent) = &spec.parent {
+        let parent = load_conn_at(conn, &id(parent)?, depth + 1)?;
+        if parent.root != root
+            || parent.spec.issuer != spec.issuer
+            || parent.spec.target != spec.target
+            || parent.spec.revision != spec.revision
+            || parent.spec.wave != spec.wave
+            || parent.spec.objective != spec.objective
+            || parent.spec.request.kind != spec.request.kind
+            || parent.spec.request.recipe != spec.request.recipe
+            || spec.request.deadline_ms > parent.spec.request.deadline_ms
+            || spec.request.max_attempts > parent.spec.request.max_attempts
+            || !spec.request.units.within(parent.allocated)
+        {
+            return Err(BudgetError::Invalid("delegation authority".into()));
+        }
+    }
+    let (observed, receipt): (Option<Vec<u8>>, Option<String>) = conn.query_row(
+        "SELECT observed_overrun,receipt FROM local_budget_reservations WHERE reservation=?1",
+        [key.as_str()],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    let observed_overrun: Option<Units> = observed
+        .as_deref()
+        .map(serde_json::from_slice)
+        .transpose()?;
+    if let Some(usage) = observed_overrun {
+        usage.validate()?;
+        if state != State::ConsumptionUnknown || receipt.is_none() {
+            return Err(BudgetError::Invalid("overrun state".into()));
+        }
+    }
+    Ok(Reservation {
+        id: key.clone(),
+
+        root,
+        state,
+        allocated: spec.request.units,
+        spent,
+        attempts: row.3,
+        version: row.4,
+        observed_overrun,
+        receipt: receipt.as_deref().map(id).transpose()?,
+        spec,
+    })
+}
+pub fn load(store: &CollaborationStore, key: &RecordId) -> Result<Reservation, BudgetError> {
+    let _response = crate::collaboration_sensitive::response_use(store)?;
+    let r = load_conn(store.read_connection(), key)?;
+    let w = wave::load(store, &id(&r.spec.wave)?)?;
+    if r.spec.target != w.spec.target
+        || r.spec.issuer != w.spec.issuer
+        || r.spec.revision != w.spec.revision
+        || r.spec.objective != w.spec.objective_authorization
+    {
+        return Err(BudgetError::Invalid("wave authorization".into()));
+    }
+    Ok(r)
+}
+
+fn rows(conn: &Connection, sql: &str, args: &[&str]) -> Result<Vec<Reservation>, BudgetError> {
+    let keys: Vec<String> = conn
+        .prepare(sql)?
+        .query_map(rusqlite::params_from_iter(args.iter()), |r| r.get(0))?
+        .collect::<Result<_, _>>()?;
+    keys.into_iter()
+        .map(|k| load_conn(conn, &id(&k)?))
+        .collect()
+}
+fn charge(r: &Reservation) -> Units {
+    if r.state.held() { r.allocated } else { r.spent }
+}
+fn sum(items: impl IntoIterator<Item = Units>) -> Result<Units, BudgetError> {
+    items.into_iter().try_fold(Units::default(), Units::add)
+}
+fn guard(
+    conn: &Connection,
+    owner: &ControllerOwner,
+    revision: &str,
+    version: i64,
+) -> Result<(), BudgetError> {
+    let valid:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM local_targets WHERE target=?1 AND issuer=?2 AND active_revision=?3 AND version=?4)",params![owner.target(),owner.issuer(),revision,version],|r|r.get(0))?;
+    if !valid {
+        return Err(BudgetError::Stale);
+    }
+    Ok(())
+}
+fn reject_overrun(conn: &Connection) -> Result<(), BudgetError> {
+    let overrun: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM local_budget_reservations WHERE observed_overrun IS NOT NULL)",
+        [],
+        |row| row.get(0),
+    )?;
+    if overrun {
+        return Err(BudgetError::Capacity("unreconciled overrun"));
+    }
+
+    Ok(())
+}
+
+fn current(
+    store: &CollaborationStore,
+    owner: &ControllerOwner,
+    wave_id: &RecordId,
+    kind: WorkKind,
+) -> Result<(wave::Wave, target::ControllerStatus), BudgetError> {
+    target::authorize(store, owner)?;
+    let w = wave::load(store, wave_id)?;
+    let s = target::status(store, owner.target())?;
+    if w.spec.target != owner.target()
+        || w.spec.issuer != owner.issuer()
+        || s.revision.as_ref().map(RecordId::as_str) != Some(w.spec.revision.as_str())
+    {
+        return Err(BudgetError::Stale);
+    }
+    let phase_ok = match kind {
+        WorkKind::Composition => w.phase == WavePhase::Frozen && s.phase == Phase::WaveFrozen,
+        WorkKind::Verification => {
+            w.phase == WavePhase::Verifying
+                && (s.phase == Phase::Verifying
+                    || (s.phase == Phase::WaitingForInput
+                        && s.resume_phase == Some(Phase::Verifying)))
+        }
+        WorkKind::OptionalAnalysis => {
+            matches!(w.phase, WavePhase::Frozen | WavePhase::Verifying)
+                && !matches!(
+                    s.phase,
+                    Phase::StopRequested
+                        | Phase::Stopped
+                        | Phase::BlockedTargetDrift
+                        | Phase::OutcomeUnknown
+                )
+        }
+        WorkKind::Recovery => true,
+    };
+    if !phase_ok {
+        return Err(BudgetError::Stale);
+    }
+    Ok((w, s))
+}
+fn insert(
+    conn: &Connection,
+    r: &Record,
+    spec: &ReservationSpec,
+    root: &RecordId,
+) -> Result<(), BudgetError> {
+    conn.execute("INSERT INTO local_budget_reservations(reservation,nonce,target,revision,wave,root,parent,body,phase,spent) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,'reserved',?9)",params![r.id().as_str(),spec.request.nonce,spec.target,spec.revision,spec.wave,root.as_str(),spec.parent,r.canonical_bytes(),serde_json::to_vec(&Units::default())?])?;
+    Ok(())
+}
+fn nonce_key(conn: &Connection, nonce: &str) -> Result<Option<RecordId>, BudgetError> {
+    let key: Option<String> = conn
+        .query_row(
+            "SELECT reservation FROM local_budget_reservations WHERE nonce=?1",
+            [nonce],
+            |r| r.get(0),
+        )
+        .optional()?;
+    key.as_deref().map(id).transpose()
+}
+fn duplicate(
+    conn: &Connection,
+    nonce: &str,
+    r: &Record,
+) -> Result<Option<Reservation>, BudgetError> {
+    let key: Option<String> = conn
+        .query_row(
+            "SELECT reservation FROM local_budget_reservations WHERE nonce=?1",
+            [nonce],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(key) = key {
+        if key != r.id().as_str() {
+            return Err(BudgetError::Immutable);
+        }
+        return Ok(Some(load_conn(conn, &id(&key)?)?));
+    }
+    Ok(None)
+}
+
+/// Reserve declared aggregate and objective envelopes in one transaction.
+/// Optional analysis cannot use the protected mandatory/recovery headroom.
+pub fn reserve(
+    store: &mut CollaborationStore,
+    owner: &ControllerOwner,
+    wave_id: &RecordId,
+    request: Request,
+    now_ms: i64,
+) -> Result<Reservation, BudgetError> {
+    let _authority = target::authorize(store, owner)?;
+    target::authorize(store, owner)?;
+    if let Some(key) = nonce_key(store.read_connection(), &request.nonce)? {
+        let existing = owned(store, owner, &key)?;
+        if existing.spec.wave != wave_id.as_str()
+            || existing.spec.parent.is_some()
+            || existing.spec.request != request
+        {
+            return Err(BudgetError::Immutable);
+        }
+        return Ok(existing);
+    }
+    request.validate()?;
+    if now_ms < 0
+        || now_ms >= request.deadline_ms
+        || request.deadline_ms.saturating_sub(now_ms) > 86_400_000
+    {
+        return Err(BudgetError::Invalid("deadline".into()));
+    }
+    let (w, state) = current(store, owner, wave_id, request.kind)?;
+    let (p, policy) = project(store.read_connection(), owner.issuer())?;
+    let (o, cap) = objective(
+        store.read_connection(),
+        owner.issuer(),
+        &w.spec.objective_authorization,
+        &p,
+    )?;
+    let spec = ReservationSpec {
+        issuer: owner.issuer().into(),
+        target: owner.target().into(),
+        revision: w.spec.revision,
+        wave: wave_id.to_string(),
+        objective: w.spec.objective_authorization,
+        project_policy: p.to_string(),
+        objective_policy: o.to_string(),
+        request,
+        parent: None,
+    };
+    let r = record(&spec)?;
+    let tx = store
+        .connection()
+        .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    guard(&tx, owner, &spec.revision, state.version)?;
+    reject_overrun(&tx)?;
+    if let Some(existing) = duplicate(&tx, &spec.request.nonce, &r)? {
+        return Ok(existing);
+    }
+    let roots = rows(
+        &tx,
+        "SELECT reservation FROM local_budget_reservations WHERE parent IS NULL",
+        &[],
+    )?;
+    if roots.len() >= policy.max_root_reservations {
+        return Err(BudgetError::Capacity("ledger bound"));
+    }
+    let total = sum(roots.iter().map(charge))?.add(spec.request.units)?;
+    if !total.within(policy.cap) {
+        return Err(BudgetError::Capacity("project"));
+    }
+    let objective = sum(roots
+        .iter()
+        .filter(|r| r.spec.objective == spec.objective)
+        .map(charge))?
+    .add(spec.request.units)?;
+    if !objective.within(cap) {
+        return Err(BudgetError::Capacity("objective"));
+    }
+    if !spec.request.kind.recovery() {
+        let used = sum(roots
+            .iter()
+            .filter(|r| !r.spec.request.kind.recovery())
+            .map(charge))?
+        .add(spec.request.units)?;
+        if !used.within(policy.cap.subtract(policy.recovery_headroom)?) {
+            return Err(BudgetError::Capacity("recovery headroom"));
+        }
+    }
+    if spec.request.kind.optional() {
+        let used = sum(roots
+            .iter()
+            .filter(|r| r.spec.request.kind.optional())
+            .map(charge))?
+        .add(spec.request.units)?;
+        if !used.within(
+            policy
+                .cap
+                .subtract(policy.recovery_headroom)?
+                .subtract(policy.mandatory_headroom)?,
+        ) {
+            return Err(BudgetError::Capacity("mandatory headroom"));
+        }
+    }
+    insert(&tx, &r, &spec, &r.id())?;
+    tx.commit()?;
+    load(store, &r.id())
+}
+
+fn owned(
+    store: &CollaborationStore,
+    owner: &ControllerOwner,
+    key: &RecordId,
+) -> Result<Reservation, BudgetError> {
+    target::authorize(store, owner)?;
+    let r = load(store, key)?;
+    if r.spec.target != owner.target() || r.spec.issuer != owner.issuer() {
+        return Err(BudgetError::Stale);
+    }
+    Ok(r)
+}
+fn children(conn: &Connection, key: &RecordId) -> Result<Vec<Reservation>, BudgetError> {
+    rows(
+        conn,
+        "SELECT reservation FROM local_budget_reservations WHERE parent=?1",
+        &[key.as_str()],
+    )
+}
+
+/// Delegation subdivides existing allowance; it never charges a new root cap.
+pub fn delegate(
+    store: &mut CollaborationStore,
+    owner: &ControllerOwner,
+    parent: &RecordId,
+    mut request: Request,
+    now_ms: i64,
+) -> Result<Reservation, BudgetError> {
+    let _authority = target::authorize(store, owner)?;
+    let parent = owned(store, owner, parent)?;
+    if let Some(key) = nonce_key(store.read_connection(), &request.nonce)? {
+        let existing = owned(store, owner, &key)?;
+        if existing.spec.parent.as_deref() != Some(parent.id.as_str())
+            || existing.spec.request != request
+        {
+            return Err(BudgetError::Immutable);
+        }
+        return Ok(existing);
+    }
+    request.validate()?;
+
+    if !matches!(parent.state, State::Reserved | State::PartlyConsumed)
+        || now_ms < 0
+        || now_ms >= request.deadline_ms
+        || request.deadline_ms > parent.spec.request.deadline_ms
+        || request.kind != parent.spec.request.kind
+        || request.recipe != parent.spec.request.recipe
+        || request.max_attempts > parent.spec.request.max_attempts
+    {
+        return Err(BudgetError::Pending);
+    }
+    let (_, state) = current(store, owner, &id(&parent.spec.wave)?, request.kind)?;
+    // Children inherit the pinned recipe/class and retry envelope; the issuer
+    // cannot promote optional work by relabelling a delegated allocation.
+    request.kind = parent.spec.request.kind;
+    let spec = ReservationSpec {
+        request,
+        parent: Some(parent.id.to_string()),
+        ..parent.spec.clone()
+    };
+    let record = record(&spec)?;
+    let tx = store
+        .connection()
+        .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    guard(&tx, owner, &spec.revision, state.version)?;
+    reject_overrun(&tx)?;
+    let latest = load_conn(&tx, &parent.id)?;
+    if latest.version != parent.version {
+        return Err(BudgetError::Stale);
+    }
+    if let Some(existing) = duplicate(&tx, &spec.request.nonce, &record)? {
+        return Ok(existing);
+    }
+    let mut ancestor = Some(parent.id.clone());
+    let mut depth = 0;
+    while let Some(key) = ancestor {
+        depth += 1;
+        if depth >= MAX_LINEAGE_DEPTH {
+            return Err(BudgetError::Capacity("delegation depth"));
+        }
+        let r = load_conn(&tx, &key)?;
+        if r.root != parent.root {
+            return Err(BudgetError::Invalid("delegation lineage".into()));
+        }
+        ancestor = r.spec.parent.as_deref().map(id).transpose()?;
+    }
+    let records: i64 = tx.query_row(
+        "SELECT count(*) FROM local_budget_reservations WHERE root=?1",
+        [parent.root.as_str()],
+        |r| r.get(0),
+    )?;
+    if records >= MAX_LINEAGE_RECORDS {
+        return Err(BudgetError::Capacity("lineage records"));
+    }
+    let used = parent
+        .spent
+        .add(sum(children(&tx, &parent.id)?.iter().map(charge))?)?;
+    if !used.add(spec.request.units)?.within(parent.allocated) {
+        return Err(BudgetError::Capacity("parent"));
+    }
+    insert(&tx, &record, &spec, &parent.root)?;
+    tx.execute(
+        "UPDATE local_budget_reservations SET version=version+1 WHERE reservation=?1",
+        [parent.id.as_str()],
+    )?;
+    tx.commit()?;
+    load(store, &record.id())
+}
+
+/// Persist completion_pending before external dispatch. Deadline expiration
+/// does not settle prior work, and retry counters never reset the spent units.
+pub fn begin_attempt(
+    store: &mut CollaborationStore,
+    owner: &ControllerOwner,
+    key: &RecordId,
+    now_ms: i64,
+) -> Result<Attempt, BudgetError> {
+    let _authority = target::authorize(store, owner)?;
+    let r = owned(store, owner, key)?;
+    let (_, state) = current(store, owner, &id(&r.spec.wave)?, r.spec.request.kind)?;
+    if now_ms < 0 || now_ms >= r.spec.request.deadline_ms {
+        return Err(BudgetError::Invalid("deadline".into()));
+    }
+    let tx = store
+        .connection()
+        .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    guard(&tx, owner, &r.spec.revision, state.version)?;
+    reject_overrun(&tx)?;
+    let r = load_conn(&tx, key)?;
+    if !matches!(r.state, State::Reserved | State::PartlyConsumed)
+        || children(&tx, key)?.iter().any(|c| c.state.held())
+    {
+        return Err(BudgetError::Pending);
+    }
+    if r.attempts >= r.spec.request.max_attempts {
+        return Err(BudgetError::AttemptsExhausted);
+    }
+    // Every subdivided ancestor retains its own retry envelope. Grandchildren
+    // share a smaller parent's allowance even when the root has more attempts.
+    let mut ancestor = Some(r.id.clone());
+    while let Some(key) = ancestor {
+        let allocation = load_conn(&tx, &key)?;
+        let used_attempts: u32 = tx.query_row(
+            "WITH RECURSIVE subtree(reservation) AS (SELECT ?1 UNION ALL SELECT r.reservation FROM local_budget_reservations r JOIN subtree s ON r.parent=s.reservation) SELECT coalesce(sum(attempts),0) FROM local_budget_reservations WHERE reservation IN (SELECT reservation FROM subtree)",
+            [key.as_str()], |row| row.get(0))?;
+        if used_attempts >= allocation.spec.request.max_attempts {
+            return Err(BudgetError::AttemptsExhausted);
+        }
+        ancestor = allocation.spec.parent.as_deref().map(id).transpose()?;
+    }
+    let used = r.spent.add(sum(children(&tx, key)?.iter().map(charge))?)?;
+    let remaining = r.allocated.subtract(used)?;
+    if remaining.zero() {
+        return Err(BudgetError::Capacity("reservation"));
+    }
+
+    tx.execute("UPDATE local_budget_reservations SET phase='completion_pending',attempts=attempts+1,version=version+1 WHERE reservation=?1",[key.as_str()])?;
+    tx.commit()?;
+    Ok(Attempt {
+        reservation: key.clone(),
+        version: r.version + 1,
+        number: r.attempts + 1,
+        remaining,
+        epoch: owner.authority_epoch().clone(),
+        project_dir: store.project_dir().to_owned(),
+    })
+}
+
+/// Native execution adapter: a live pending attempt must name this exact frozen
+/// execution recipe, current wave/revision/epoch and sufficient finite envelope.
+/// Reading a reservation or importing an attempt's JSON cannot mint this permit.
+pub(crate) fn authorize_execution(
+    store: &CollaborationStore,
+    owner: &ControllerOwner,
+    attempt: &Attempt,
+    execution: &crate::execution_snapshot::ExecutionSnapshot,
+    envelope: Units,
+) -> Result<(), BudgetError> {
+    let _authority = target::authorize(store, owner)?;
+    reject_overrun(store.read_connection())?;
+    let reservation = owned(store, owner, &attempt.reservation)?;
+    let (wave, state) = current(
+        store,
+        owner,
+        &id(&reservation.spec.wave)?,
+        WorkKind::Verification,
+    )?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| BudgetError::Stale)?
+        .as_millis();
+    envelope.validate()?;
+    if attempt.project_dir != store.project_dir()
+        || &attempt.epoch != owner.authority_epoch()
+        || reservation.state != State::CompletionPending
+        || reservation.version != attempt.version
+        || reservation.attempts != attempt.number
+        || reservation.spec.request.kind != WorkKind::Verification
+        || reservation.spec.request.recipe != execution.id().as_str()
+        || reservation.spec.revision != execution.target_revision().as_str()
+        || wave.candidate_snapshot.as_ref().map(|id| id.as_str())
+            != Some(execution.spec().candidate_source.as_str())
+        || state.phase != Phase::Verifying
+        || now >= reservation.spec.request.deadline_ms as u128
+        || !envelope.within(attempt.remaining)
+    {
+        return Err(BudgetError::Stale);
+    }
+    Ok(())
+}
+
+pub(crate) struct ExecutionGuard<'a> {
+    _authority: crate::local_authority::Guard,
+    _transaction: rusqlite::Transaction<'a>,
+}
+pub(crate) fn execution_guard<'a>(
+    store: &'a CollaborationStore,
+    owner: &ControllerOwner,
+    attempt: &Attempt,
+    execution: &crate::execution_snapshot::ExecutionSnapshot,
+    envelope: Units,
+) -> Result<ExecutionGuard<'a>, BudgetError> {
+    let authority = target::authorize(store, owner)?;
+    // Settlement, stop and producer changes cannot race the dispatch decision
+    // between its final ledger read and daemon start acknowledgement.
+    let transaction = rusqlite::Transaction::new_unchecked(
+        store.read_connection(),
+        TransactionBehavior::Immediate,
+    )?;
+    authorize_execution(store, owner, attempt, execution, envelope)?;
+    Ok(ExecutionGuard {
+        _authority: authority,
+        _transaction: transaction,
+    })
+}
+pub(crate) fn execution_unknown(
+    store: &mut CollaborationStore,
+    owner: &ControllerOwner,
+    attempt: &Attempt,
+    detail: &str,
+) -> Result<(), BudgetError> {
+    mark_unknown(store, owner, &attempt.reservation, attempt.version, detail)?;
+    Ok(())
+}
+fn charge_usage(
+    store: &mut CollaborationStore,
+    owner: &ControllerOwner,
+    key: &RecordId,
+    version: i64,
+    usage: Units,
+    receipt: &RecordId,
+    reconcile: bool,
+) -> Result<Reservation, BudgetError> {
+    owned(store, owner, key)?;
+    usage.validate()?;
+    let tx = store
+        .connection()
+        .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let r = load_conn(&tx, key)?;
+    let expected = if reconcile {
+        State::ConsumptionUnknown
+    } else {
+        State::CompletionPending
+    };
+    if r.version != version || r.state != expected {
+        return Err(BudgetError::Stale);
+    }
+    if children(&tx, key)?.iter().any(|c| c.state.held()) {
+        return Err(BudgetError::Pending);
+    }
+    let assigned: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM local_budget_receipts WHERE receipt=?1)",
+        [receipt.as_str()],
+        |r| r.get(0),
+    )?;
+    if assigned {
+        return Err(BudgetError::ReceiptReplay);
+    }
+    // A disputed overrun has no qualified correction workflow in this model.
+    // Repeating observations cannot mint rows or erase the recorded lower bound.
+    if r.observed_overrun.is_some() {
+        return Err(BudgetError::UsageExceeded);
+    }
+    tx.execute(
+        "INSERT INTO local_budget_receipts(receipt,reservation,attempt,usage) VALUES(?1,?2,?3,?4)",
+        params![
+            receipt.as_str(),
+            key.as_str(),
+            r.attempts,
+            serde_json::to_vec(&usage)?
+        ],
+    )?;
+    let next = r.spent.add(usage)?;
+
+    let children_spent = sum(children(&tx, key)?.iter().map(charge))?;
+    if !next.add(children_spent)?.within(r.allocated) {
+        tx.execute("UPDATE local_budget_reservations SET phase='consumption_unknown',detail='usage exceeded reserved envelope',observed_overrun=?2,receipt=?3,version=version+1 WHERE reservation=?1",params![key.as_str(),serde_json::to_vec(&usage)?,receipt.as_str()])?;
+        tx.commit()?;
+        return Err(BudgetError::UsageExceeded);
+    }
+    tx.execute("UPDATE local_budget_reservations SET phase='partly_consumed',spent=?2,receipt=?3,detail=NULL,version=version+1 WHERE reservation=?1",params![key.as_str(),serde_json::to_vec(&next)?,receipt.as_str()])?;
+    tx.commit()?;
+    load(store, key)
+}
+
+/// Owner-supplied accounting only. A future trusted receipt adapter must verify
+/// producer, exact attempt/profile and actual usage before calling this API.
+pub fn settle(
+    store: &mut CollaborationStore,
+    owner: &ControllerOwner,
+    attempt: &Attempt,
+    usage: Units,
+    receipt: &RecordId,
+) -> Result<Reservation, BudgetError> {
+    let _authority = target::authorize(store, owner)?;
+    if &attempt.epoch != owner.authority_epoch() {
+        return Err(BudgetError::Stale);
+    }
+    charge_usage(
+        store,
+        owner,
+        &attempt.reservation,
+        attempt.version,
+        usage,
+        receipt,
+        false,
+    )
+}
+/// Conservative crash/provider ambiguity. No automatic timeout release.
+pub fn mark_unknown(
+    store: &mut CollaborationStore,
+    owner: &ControllerOwner,
+    key: &RecordId,
+    version: i64,
+    detail: &str,
+) -> Result<Reservation, BudgetError> {
+    let _authority = target::authorize(store, owner)?;
+    owned(store, owner, key)?;
+    let tx = store
+        .connection()
+        .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let r = load_conn(&tx, key)?;
+    if r.version != version || r.state != State::CompletionPending {
+        return Err(BudgetError::Stale);
+    }
+    tx.execute("UPDATE local_budget_reservations SET phase='consumption_unknown',detail=?2,version=version+1 WHERE reservation=?1",params![key.as_str(),detail])?;
+    tx.commit()?;
+    load(store, key)
+}
+/// Only explicit reconciled usage can turn unknown consumption into a receipt.
+pub fn reconcile(
+    store: &mut CollaborationStore,
+    owner: &ControllerOwner,
+    key: &RecordId,
+    version: i64,
+    usage: Units,
+    receipt: &RecordId,
+) -> Result<Reservation, BudgetError> {
+    let _authority = target::authorize(store, owner)?;
+    charge_usage(store, owner, key, version, usage, receipt, true)
+}
+
+/// Release unused remainder only after all delegated/in-flight work settled.
+/// Consumed descendants are rolled into the root charge exactly once.
+pub fn close(
+    store: &mut CollaborationStore,
+    owner: &ControllerOwner,
+    key: &RecordId,
+    version: i64,
+) -> Result<Reservation, BudgetError> {
+    let _authority = target::authorize(store, owner)?;
+    owned(store, owner, key)?;
+    let tx = store
+        .connection()
+        .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let r = load_conn(&tx, key)?;
+    if r.version != version {
+        return Err(BudgetError::Stale);
+    }
+    if !matches!(r.state, State::Reserved | State::PartlyConsumed) {
+        return Err(BudgetError::Pending);
+    }
+    let children = children(&tx, key)?;
+    if children.iter().any(|c| c.state.held()) {
+        return Err(BudgetError::Pending);
+    }
+    let spent = r.spent.add(sum(children.iter().map(charge))?)?;
+    if !spent.within(r.allocated) {
+        return Err(BudgetError::Invalid("delegated spending".into()));
+    }
+    let phase = if spent.zero() {
+        State::ReleasedUnused
+    } else {
+        State::Consumed
+    };
+    tx.execute("UPDATE local_budget_reservations SET phase=?2,spent=?3,version=version+1 WHERE reservation=?1",params![key.as_str(),phase.code(),serde_json::to_vec(&spent)?])?;
+    tx.commit()?;
+    load(store, key)
+}
+
+/// Ledger totals count each root once. This report is not measured throughput.
+pub fn charged(store: &CollaborationStore, owner: &ControllerOwner) -> Result<Units, BudgetError> {
+    let _authority = target::authorize(store, owner)?;
+    target::authorize(store, owner)?;
+    project(store.read_connection(), owner.issuer())?;
+    sum(rows(
+        store.read_connection(),
+        "SELECT reservation FROM local_budget_reservations WHERE parent IS NULL",
+        &[],
+    )?
+    .iter()
+    .map(charge))
+}
+
+pub const STATUS_RESERVATION_LIMIT: i64 = 500;
+const STATUS_ROOT_LIMIT: usize = 100_000;
+const STATUS_OBJECTIVE_LIMIT: usize = 4096;
+
+fn reservation_status(reservation: &Reservation) -> ReservationStatus {
+    ReservationStatus {
+        id: reservation.id.as_str().into(),
+        root: reservation.root.as_str().into(),
+        parent: reservation.spec.parent.clone(),
+        target: reservation.spec.target.clone(),
+        revision: reservation.spec.revision.clone(),
+        wave: reservation.spec.wave.clone(),
+        objective: reservation.spec.objective.clone(),
+        nonce: reservation.spec.request.nonce.clone(),
+        recipe: reservation.spec.request.recipe.clone(),
+        kind: reservation.spec.request.kind,
+        deadline_ms: reservation.spec.request.deadline_ms,
+        phase: reservation.state,
+        allocated: reservation.allocated,
+        charged: charge(reservation),
+        spent: reservation.spent,
+        attempts: reservation.attempts,
+        max_attempts: reservation.spec.request.max_attempts,
+        version: reservation.version,
+        observed_overrun: reservation.observed_overrun,
+        receipt: reservation
+            .receipt
+            .as_ref()
+            .map(|receipt| receipt.as_str().into()),
+    }
+}
+
+/// Read the immutable project/objective budgets and bounded reservation
+/// history. This remains a metadata-only report after authority is frozen,
+/// but the sensitive-response tombstone always blocks it. `reservation`
+/// optionally requests one exact row outside the newest 500-row page.
+pub fn status(
+    store: &CollaborationStore,
+    target_name: &str,
+    issuer: &str,
+    reservation: Option<&RecordId>,
+    nonce: Option<&str>,
+) -> Result<BudgetStatus, BudgetError> {
+    if reservation.is_some() && nonce.is_some() {
+        return Err(BudgetError::Invalid(
+            "reservation and nonce lookups are mutually exclusive".into(),
+        ));
+    }
+    if let Some(nonce) = nonce {
+        id(nonce)?;
+    }
+    let _response = crate::collaboration_sensitive::response_use(store)?;
+    let actual_issuer: Option<String> = store
+        .read_connection()
+        .query_row(
+            "SELECT issuer FROM local_targets WHERE target=?1",
+            [target_name],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if actual_issuer.as_deref() != Some(issuer) {
+        return Err(BudgetError::Target(if actual_issuer.is_none() {
+            TargetError::Missing
+        } else {
+            TargetError::Unauthorized
+        }));
+    }
+
+    let (project_id, project_policy) = project(store.read_connection(), issuer)?;
+    let target_status = target::status(store, target_name)?;
+    let current_revision = target_status
+        .revision
+        .as_ref()
+        .map(|revision| target::load_revision(store, revision))
+        .transpose()?;
+    if current_revision
+        .as_ref()
+        .is_some_and(|revision| revision.target != target_name || revision.issuer != issuer)
+    {
+        return Err(BudgetError::Invalid(
+            "selected target revision binding".into(),
+        ));
+    }
+    let objective_authorization = current_revision
+        .as_ref()
+        .map(|revision| revision.spec.objective_authorization.clone());
+
+    let root_count: i64 = store.read_connection().query_row(
+        "SELECT count(*) FROM local_budget_reservations WHERE parent IS NULL",
+        [],
+        |row| row.get(0),
+    )?;
+    if root_count < 0 || root_count as usize > STATUS_ROOT_LIMIT {
+        return Err(BudgetError::Invalid("root reservation status bound".into()));
+    }
+    let roots = rows(
+        store.read_connection(),
+        "SELECT reservation FROM local_budget_reservations WHERE parent IS NULL ORDER BY rowid",
+        &[],
+    )?;
+    let project_root_charged = sum(roots.iter().map(charge))?;
+    let mut objective_charges = BTreeMap::<String, Units>::new();
+    for root in &roots {
+        let current = objective_charges
+            .get(&root.spec.objective)
+            .copied()
+            .unwrap_or_default();
+        objective_charges.insert(root.spec.objective.clone(), current.add(charge(root))?);
+    }
+
+    let objective_count: i64 = store.read_connection().query_row(
+        "SELECT count(*) FROM local_budget_objectives",
+        [],
+        |row| row.get(0),
+    )?;
+    if objective_count < 0 || objective_count as usize > STATUS_OBJECTIVE_LIMIT {
+        return Err(BudgetError::Invalid("objective status bound".into()));
+    }
+    let objective_rows: Vec<(String, String, Vec<u8>, String)> = store
+        .read_connection()
+        .prepare(
+            "SELECT objective,policy,body,issuer FROM local_budget_objectives ORDER BY objective",
+        )?
+        .query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })?
+        .collect::<Result<_, _>>()?;
+    let mut objectives = Vec::with_capacity(objective_rows.len());
+    for (authorization, key, body, appointed) in objective_rows {
+        let decoded: ObjectiveRecord = decode(&key, &body)?;
+        if appointed != issuer || decoded.issuer != issuer || decoded.objective != authorization {
+            return Err(BudgetError::Invalid("objective status binding".into()));
+        }
+        let (objective_id, cap) =
+            objective(store.read_connection(), issuer, &authorization, &project_id)?;
+        if objective_id.as_str() != key || decoded.cap != cap {
+            return Err(BudgetError::Invalid("objective status identity".into()));
+        }
+        objectives.push(ObjectiveStatus {
+            authorization: authorization.clone(),
+            policy: objective_id.as_str().into(),
+            cap,
+            root_charged: objective_charges
+                .get(&authorization)
+                .copied()
+                .unwrap_or_default(),
+        });
+    }
+
+    let reservation_count: i64 = store.read_connection().query_row(
+        "SELECT count(*) FROM local_budget_reservations",
+        [],
+        |row| row.get(0),
+    )?;
+    if reservation_count < 0 {
+        return Err(BudgetError::Invalid("reservation count".into()));
+    }
+    let keys: Vec<String> = store
+        .read_connection()
+        .prepare("SELECT reservation FROM local_budget_reservations ORDER BY rowid DESC LIMIT ?1")?
+        .query_map([STATUS_RESERVATION_LIMIT], |row| row.get(0))?
+        .collect::<Result<_, _>>()?;
+    let reservations = keys
+        .iter()
+        .map(|key| load(store, &id(key)?).map(|row| reservation_status(&row)))
+        .collect::<Result<Vec<_>, _>>()?;
+    let selected_reservation = reservation
+        .map(|key| load(store, key))
+        .transpose()?
+        .map(|row| {
+            if row.spec.issuer != issuer {
+                return Err(BudgetError::Invalid("selected reservation issuer".into()));
+            }
+            Ok(reservation_status(&row))
+        })
+        .transpose()?;
+
+    let nonce_lookup = if let Some(nonce) = nonce {
+        let keys: Vec<String> = store
+            .read_connection()
+            .prepare(
+                "SELECT reservation FROM local_budget_reservations WHERE nonce=?1 AND target=?2 ORDER BY rowid LIMIT 2",
+            )?
+            .query_map(params![nonce, target_name], |row| row.get(0))?
+            .collect::<Result<_, _>>()?;
+        let reservations = keys
+            .iter()
+            .map(|key| load(store, &id(key)?))
+            .collect::<Result<Vec<_>, _>>()?;
+        if reservations.iter().any(|row| {
+            row.spec.target != target_name
+                || row.spec.issuer != issuer
+                || row.spec.request.nonce != nonce
+        }) {
+            return Err(BudgetError::Invalid("nonce lookup binding".into()));
+        }
+        let outcome = nonce_lookup_outcome(reservations.len());
+        let matches = reservations.iter().map(reservation_status).collect();
+        Some(NonceLookupStatus {
+            nonce: nonce.into(),
+            outcome,
+            matches,
+        })
+    } else {
+        None
+    };
+
+    Ok(BudgetStatus {
+        target: target_name.into(),
+        issuer: issuer.into(),
+        revision: target_status
+            .revision
+            .map(|revision| revision.as_str().into()),
+        objective_authorization,
+        project_policy: project_id.as_str().into(),
+        project: project_policy,
+        project_root_charged,
+        objectives,
+        reservations,
+        reservation_count: reservation_count as u64,
+        reservations_truncated: reservation_count > STATUS_RESERVATION_LIMIT,
+        selected_reservation,
+        nonce_lookup,
+    })
+}
+
+#[cfg(test)]
+mod tests;

@@ -1,0 +1,7 @@
+/attempts-and-controls.tar.gz binary
+/archive-index.json text eol=lf
+/archive-files.sha256 text eol=lf
+/attempts-and-controls.tar.gz.sha256 text eol=lf
+/summary.json text eol=lf
+/README.md text eol=lf
+/.gitattributes text eol=lf

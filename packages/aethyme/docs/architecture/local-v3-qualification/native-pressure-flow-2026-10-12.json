@@ -1,0 +1,600 @@
+{
+  "schema": "aethyme.local.qualification.native/provisional-v0",
+  "date": "2026-10-12",
+  "complete_local_qualification": false,
+  "composition_qualification": "provisional; separately owned E1 pending",
+  "runtime": {
+    "cli": "/opt/homebrew/bin/docker",
+    "cli_version": "29.8.0",
+    "server_version": "29.5.2",
+    "daemon": "9c943a04-41ca-4943-a8f5-c5734144b14b",
+    "os": "linux",
+    "architecture": "aarch64",
+    "cpus": 4,
+    "memory_bytes": 8308363264,
+    "image": "sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251"
+  },
+  "denominator": {
+    "scheduled_command_runs": 12,
+    "executed_command_runs": 10,
+    "unrun_command_runs": 2,
+    "scheduled_positive_test_executions": 20,
+    "passing_positive_test_executions": 16,
+    "failed_positive_test_executions": 2,
+    "unrun_positive_test_executions": 2,
+    "proof_removal_tests": 3,
+    "qualified_intended_failures": 3
+  },
+  "native_attempts": [
+    {
+      "attempt": 1,
+      "source_commit": "1b3468bb02ff70f0ac0b26b0eda7781bee413c9d",
+      "source_tree": "a32eb579611abe4650c49f0a85aef6eecf02312c",
+      "profile": "native-pressure-and-local-flow/provisional-v0",
+      "scheduled_commands": 3,
+      "scheduled_tests": 5,
+      "rows": [
+        {
+          "name": "controls",
+          "argv": [
+            "cargo",
+            "test",
+            "--locked",
+            "-j",
+            "4",
+            "--manifest-path",
+            "packages/aethyme/rust/Cargo.toml",
+            "-p",
+            "aethyme-broker",
+            "--lib",
+            "completed_native_control_",
+            "--",
+            "--test-threads=1",
+            "--nocapture"
+          ],
+          "exit_status": 0,
+          "signal": null,
+          "output_bytes": 1785,
+          "output_sha256": "a1837ebb526ba491f69cfea01338fe5573442cc37e798564d42451c4bbaf31b8",
+          "output_file": "aethyme-1097-qualification-20261012-39816-zoeg8d/controls.log",
+          "counts": {
+            "passed": 3,
+            "failed": 0,
+            "ignored": 0
+          },
+          "credited": true,
+          "environment": {
+            "AETHYME_DOCKER_CLI": "/opt/homebrew/bin/docker",
+            "AETHYME_DOCKER_TEST_IMAGE": "sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251",
+            "RUSTC_WRAPPER": "",
+            "CARGO_TARGET_DIR": "shared external cache; physical root omitted"
+          }
+        },
+        {
+          "name": "pressure",
+          "argv": [
+            "cargo",
+            "test",
+            "--locked",
+            "-j",
+            "4",
+            "--manifest-path",
+            "packages/aethyme/rust/Cargo.toml",
+            "-p",
+            "aethyme-broker",
+            "--lib",
+            "execution_resources::qualification::actual_pressure_preserves_retained_source_and_bounded_native_cleanup",
+            "--",
+            "--exact",
+            "--ignored",
+            "--test-threads=1",
+            "--nocapture"
+          ],
+          "exit_status": 101,
+          "signal": null,
+          "output_bytes": 2483,
+          "output_sha256": "d126445b632e39378be2752971cf351e16f3e29fbe0b6fe568282040e9599358",
+          "output_file": "aethyme-1097-qualification-20261012-39816-zoeg8d/pressure.log",
+          "counts": {
+            "passed": 0,
+            "failed": 1,
+            "ignored": 0
+          },
+          "credited": false,
+          "environment": {
+            "AETHYME_DOCKER_CLI": "/opt/homebrew/bin/docker",
+            "AETHYME_DOCKER_TEST_IMAGE": "sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251",
+            "RUSTC_WRAPPER": "",
+            "CARGO_TARGET_DIR": "shared external cache; physical root omitted"
+          }
+        },
+        {
+          "name": "flow",
+          "state": "UNRUN",
+          "scheduled_tests": 1,
+          "reason": "serial runner stopped after failed pressure assertion",
+          "credited": false
+        }
+      ],
+      "whole_profile_passed": false
+    },
+    {
+      "attempt": 2,
+      "source_commit": "c98794206a7f583872817b35f53a61cc7d0c4e9d",
+      "source_tree": "8bd1beab4d16bdf4ebe573c927a88587a18ad428",
+      "profile": "native-pressure-and-local-flow/provisional-v0",
+      "scheduled_commands": 3,
+      "scheduled_tests": 5,
+      "rows": [
+        {
+          "name": "controls",
+          "argv": [
+            "cargo",
+            "test",
+            "--locked",
+            "-j",
+            "4",
+            "--manifest-path",
+            "packages/aethyme/rust/Cargo.toml",
+            "-p",
+            "aethyme-broker",
+            "--lib",
+            "completed_native_control_",
+            "--",
+            "--test-threads=1",
+            "--nocapture"
+          ],
+          "exit_status": 0,
+          "signal": null,
+          "output_bytes": 1785,
+          "output_sha256": "6d337be7db883e67483ccc09dab279da2367ed82f6cf8f634078a41e7932b4f5",
+          "output_file": "aethyme-1097-qualification-20261012-66166-sack96/controls.log",
+          "counts": {
+            "passed": 3,
+            "failed": 0,
+            "ignored": 0
+          },
+          "credited": true,
+          "environment": {
+            "AETHYME_DOCKER_CLI": "/opt/homebrew/bin/docker",
+            "AETHYME_DOCKER_TEST_IMAGE": "sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251",
+            "RUSTC_WRAPPER": "",
+            "CARGO_TARGET_DIR": "shared external cache; physical root omitted"
+          }
+        },
+        {
+          "name": "pressure",
+          "argv": [
+            "cargo",
+            "test",
+            "--locked",
+            "-j",
+            "4",
+            "--manifest-path",
+            "packages/aethyme/rust/Cargo.toml",
+            "-p",
+            "aethyme-broker",
+            "--lib",
+            "execution_resources::qualification::actual_pressure_preserves_retained_source_and_bounded_native_cleanup",
+            "--",
+            "--exact",
+            "--ignored",
+            "--test-threads=1",
+            "--nocapture"
+          ],
+          "exit_status": 101,
+          "signal": null,
+          "output_bytes": 2460,
+          "output_sha256": "fcd889ef5a202e1040b0f7df9bf4ef07ca103ea9a4560555d28c23e1e53bc5dd",
+          "output_file": "aethyme-1097-qualification-20261012-66166-sack96/pressure.log",
+          "counts": {
+            "passed": 0,
+            "failed": 1,
+            "ignored": 0
+          },
+          "credited": false,
+          "environment": {
+            "AETHYME_DOCKER_CLI": "/opt/homebrew/bin/docker",
+            "AETHYME_DOCKER_TEST_IMAGE": "sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251",
+            "RUSTC_WRAPPER": "",
+            "CARGO_TARGET_DIR": "shared external cache; physical root omitted"
+          }
+        },
+        {
+          "name": "flow",
+          "state": "UNRUN",
+          "scheduled_tests": 1,
+          "reason": "serial runner stopped after failed pressure assertion",
+          "credited": false
+        }
+      ],
+      "whole_profile_passed": false
+    },
+    {
+      "attempt": 3,
+      "source_commit": "7b729848cce271af6022eaa163eb704e9eedd758",
+      "source_tree": "9b0b95e739d0a8dcddbd6d8e6207e180d69b5d79",
+      "profile": "native-pressure-and-local-flow/provisional-v0",
+      "scheduled_commands": 3,
+      "scheduled_tests": 5,
+      "rows": [
+        {
+          "name": "controls",
+          "argv": [
+            "cargo",
+            "test",
+            "--locked",
+            "-j",
+            "4",
+            "--manifest-path",
+            "packages/aethyme/rust/Cargo.toml",
+            "-p",
+            "aethyme-broker",
+            "--lib",
+            "completed_native_control_",
+            "--",
+            "--test-threads=1",
+            "--nocapture"
+          ],
+          "exit_status": 0,
+          "signal": null,
+          "output_bytes": 1785,
+          "output_sha256": "2ab5917f9fbc695f8828185521d34a32191b12179fb1ca9f70ad4c1546cc21f8",
+          "output_file": "aethyme-1097-qualification-20261012-96807-bpgr78/controls.log",
+          "counts": {
+            "passed": 3,
+            "failed": 0,
+            "ignored": 0
+          },
+          "credited": true,
+          "environment": {
+            "AETHYME_DOCKER_CLI": "/opt/homebrew/bin/docker",
+            "AETHYME_DOCKER_TEST_IMAGE": "sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251",
+            "RUSTC_WRAPPER": "",
+            "CARGO_TARGET_DIR": "shared external cache; physical root omitted"
+          }
+        },
+        {
+          "name": "pressure",
+          "argv": [
+            "cargo",
+            "test",
+            "--locked",
+            "-j",
+            "4",
+            "--manifest-path",
+            "packages/aethyme/rust/Cargo.toml",
+            "-p",
+            "aethyme-broker",
+            "--lib",
+            "execution_resources::qualification::actual_pressure_preserves_retained_source_and_bounded_native_cleanup",
+            "--",
+            "--exact",
+            "--ignored",
+            "--test-threads=1",
+            "--nocapture"
+          ],
+          "exit_status": 0,
+          "signal": null,
+          "output_bytes": 1645,
+          "output_sha256": "75ef404fdd90ad83a41e6db8b51385c4fffaa8a4a63bb778aa09ce6fea8b92da",
+          "output_file": "aethyme-1097-qualification-20261012-96807-bpgr78/pressure.log",
+          "counts": {
+            "passed": 1,
+            "failed": 0,
+            "ignored": 0
+          },
+          "credited": true,
+          "environment": {
+            "AETHYME_DOCKER_CLI": "/opt/homebrew/bin/docker",
+            "AETHYME_DOCKER_TEST_IMAGE": "sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251",
+            "RUSTC_WRAPPER": "",
+            "CARGO_TARGET_DIR": "shared external cache; physical root omitted"
+          }
+        },
+        {
+          "name": "flow",
+          "argv": [
+            "cargo",
+            "test",
+            "--locked",
+            "-j",
+            "4",
+            "--manifest-path",
+            "packages/aethyme/rust/Cargo.toml",
+            "-p",
+            "aethyme-broker",
+            "--lib",
+            "execution_resources::qualification::native_flow::actual_native_local_path_retains_context_and_rebinds_without_reviving_authority",
+            "--",
+            "--exact",
+            "--ignored",
+            "--test-threads=1",
+            "--nocapture"
+          ],
+          "exit_status": 0,
+          "signal": null,
+          "output_bytes": 540,
+          "output_sha256": "4ce76f161d3d7b542d2327b18d68a9f82b47a8f53ab23daec97c88c21d71f490",
+          "output_file": "aethyme-1097-qualification-20261012-96807-bpgr78/flow.log",
+          "counts": {
+            "passed": 1,
+            "failed": 0,
+            "ignored": 0
+          },
+          "credited": true,
+          "environment": {
+            "AETHYME_DOCKER_CLI": "/opt/homebrew/bin/docker",
+            "AETHYME_DOCKER_TEST_IMAGE": "sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251",
+            "RUSTC_WRAPPER": "",
+            "CARGO_TARGET_DIR": "shared external cache; physical root omitted"
+          }
+        }
+      ],
+      "whole_profile_passed": true
+    },
+    {
+      "attempt": 4,
+      "source_commit": "f61a6de32de4284269dc0e739df8f3193e3cfb65",
+      "source_tree": "13b9817784a90c756543e0039b9341aa3a5b268b",
+      "profile": "native-pressure-and-local-flow/provisional-v0",
+      "scheduled_commands": 3,
+      "scheduled_tests": 5,
+      "rows": [
+        {
+          "name": "controls",
+          "argv": [
+            "cargo",
+            "test",
+            "--locked",
+            "-j",
+            "4",
+            "--manifest-path",
+            "packages/aethyme/rust/Cargo.toml",
+            "-p",
+            "aethyme-broker",
+            "--lib",
+            "completed_native_control_",
+            "--",
+            "--test-threads=1",
+            "--nocapture"
+          ],
+          "exit_status": 0,
+          "signal": null,
+          "output_bytes": 1575,
+          "output_sha256": "8e9075c8d34471b0a557f23a06fc0e21d3562147074bfb0419bad84774b366d4",
+          "output_file": "aethyme-1097-qualification-20261012-77296-d8t61u/controls.log",
+          "counts": {
+            "passed": 3,
+            "failed": 0,
+            "ignored": 0
+          },
+          "credited": true,
+          "environment": {
+            "AETHYME_DOCKER_CLI": "/opt/homebrew/bin/docker",
+            "AETHYME_DOCKER_TEST_IMAGE": "sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251",
+            "RUSTC_WRAPPER": "",
+            "CARGO_TARGET_DIR": "shared external cache; physical root omitted"
+          }
+        },
+        {
+          "name": "pressure",
+          "argv": [
+            "cargo",
+            "test",
+            "--locked",
+            "-j",
+            "4",
+            "--manifest-path",
+            "packages/aethyme/rust/Cargo.toml",
+            "-p",
+            "aethyme-broker",
+            "--lib",
+            "execution_resources::qualification::actual_pressure_preserves_retained_source_and_bounded_native_cleanup",
+            "--",
+            "--exact",
+            "--ignored",
+            "--test-threads=1",
+            "--nocapture"
+          ],
+          "exit_status": 0,
+          "signal": null,
+          "output_bytes": 1645,
+          "output_sha256": "1ddfacd0ca16f1e263c5063c60be1ff981ad00f7a6e755cd02eb32e962cd4b92",
+          "output_file": "aethyme-1097-qualification-20261012-77296-d8t61u/pressure.log",
+          "counts": {
+            "passed": 1,
+            "failed": 0,
+            "ignored": 0
+          },
+          "credited": true,
+          "environment": {
+            "AETHYME_DOCKER_CLI": "/opt/homebrew/bin/docker",
+            "AETHYME_DOCKER_TEST_IMAGE": "sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251",
+            "RUSTC_WRAPPER": "",
+            "CARGO_TARGET_DIR": "shared external cache; physical root omitted"
+          }
+        },
+        {
+          "name": "flow",
+          "argv": [
+            "cargo",
+            "test",
+            "--locked",
+            "-j",
+            "4",
+            "--manifest-path",
+            "packages/aethyme/rust/Cargo.toml",
+            "-p",
+            "aethyme-broker",
+            "--lib",
+            "execution_resources::qualification::native_flow::actual_native_local_path_retains_context_and_rebinds_without_reviving_authority",
+            "--",
+            "--exact",
+            "--ignored",
+            "--test-threads=1",
+            "--nocapture"
+          ],
+          "exit_status": 0,
+          "signal": null,
+          "output_bytes": 539,
+          "output_sha256": "5b8ba72947b044f88ea49504e6aad8bdb19d1ab45d8ea28f9285603cbbe2c903",
+          "output_file": "aethyme-1097-qualification-20261012-77296-d8t61u/flow.log",
+          "counts": {
+            "passed": 1,
+            "failed": 0,
+            "ignored": 0
+          },
+          "credited": true,
+          "environment": {
+            "AETHYME_DOCKER_CLI": "/opt/homebrew/bin/docker",
+            "AETHYME_DOCKER_TEST_IMAGE": "sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251",
+            "RUSTC_WRAPPER": "",
+            "CARGO_TARGET_DIR": "shared external cache; physical root omitted"
+          }
+        }
+      ],
+      "whole_profile_passed": true
+    }
+  ],
+  "proofs": {
+    "source_commit": "f61a6de32de4284269dc0e739df8f3193e3cfb65",
+    "rows": [
+      {
+        "name": "deadline",
+        "test": "execution_resources::qualification::completed_native_control_cannot_bypass_deadline",
+        "argv": [
+          "cargo",
+          "test",
+          "--locked",
+          "-j",
+          "4",
+          "--manifest-path",
+          "packages/aethyme/rust/Cargo.toml",
+          "-p",
+          "aethyme-broker",
+          "--lib",
+          "execution_resources::qualification::completed_native_control_cannot_bypass_deadline",
+          "--",
+          "--exact",
+          "--test-threads=1",
+          "--nocapture"
+        ],
+        "exit_status": 101,
+        "signal": null,
+        "output_sha256": "2b29aadf1fe09d5baf73536a154023a5a07c014fe0640abb794fded7b7733142",
+        "output_bytes": 1741,
+        "counts": {
+          "passed": 0,
+          "failed": 1,
+          "ignored": 0
+        },
+        "mutated_source_sha256": "420d502a24ae44f059302bf75a584797753559c34d30eda5ee6937f18bcbcce2",
+        "output_file": "aethyme-1097-neuter-20261011-20261012-43254-5si6la/deadline.log",
+        "intended_assertion": "cached native success must not bypass the observation deadline",
+        "qualified": true
+      },
+      {
+        "name": "actual-new-root",
+        "test": "execution_resources::qualification::native_flow::actual_native_local_path_retains_context_and_rebinds_without_reviving_authority",
+        "argv": [
+          "cargo",
+          "test",
+          "--locked",
+          "-j",
+          "4",
+          "--manifest-path",
+          "packages/aethyme/rust/Cargo.toml",
+          "-p",
+          "aethyme-broker",
+          "--lib",
+          "execution_resources::qualification::native_flow::actual_native_local_path_retains_context_and_rebinds_without_reviving_authority",
+          "--",
+          "--exact",
+          "--ignored",
+          "--test-threads=1",
+          "--nocapture"
+        ],
+        "exit_status": 101,
+        "signal": null,
+        "output_sha256": "e7f644665228c58ea316cfdc05a79152dbd851c4fab1daa3dcefc7fb42c466bf",
+        "output_bytes": 1567,
+        "counts": {
+          "passed": 0,
+          "failed": 1,
+          "ignored": 0
+        },
+        "mutated_source_sha256": "ad1c5132b54d2b849c4112c5d741b6a7c9a9700ac414c5d55b56551a0e73c24e",
+        "output_file": "aethyme-1097-neuter-20261011-20261012-43254-5si6la/actual-new-root.log",
+        "intended_assertion": "native adoption omitted unique new-root output",
+        "qualified": true
+      },
+      {
+        "name": "selected-history",
+        "test": "execution_resources::qualification::native_flow::actual_native_local_path_retains_context_and_rebinds_without_reviving_authority",
+        "argv": [
+          "cargo",
+          "test",
+          "--locked",
+          "-j",
+          "4",
+          "--manifest-path",
+          "packages/aethyme/rust/Cargo.toml",
+          "-p",
+          "aethyme-broker",
+          "--lib",
+          "execution_resources::qualification::native_flow::actual_native_local_path_retains_context_and_rebinds_without_reviving_authority",
+          "--",
+          "--exact",
+          "--ignored",
+          "--test-threads=1",
+          "--nocapture"
+        ],
+        "exit_status": 101,
+        "signal": null,
+        "output_sha256": "e9feaa562898772acd333bd21e41d9fb89da3487c0a10c8d8f70ba1c22f27ec1",
+        "output_bytes": 2345,
+        "counts": {
+          "passed": 0,
+          "failed": 1,
+          "ignored": 0
+        },
+        "mutated_source_sha256": "572d0084a246a7671ba81a4e6b1923b633311ffa46d804d5f9c15ca743ce9f4f",
+        "output_file": "aethyme-1097-neuter-20261011-20261012-43254-5si6la/selected-history.log",
+        "intended_assertion": "native path must actually carry all four historical records",
+        "qualified": true
+      }
+    ],
+    "restoration": [
+      {
+        "file": "packages/aethyme/rust/crates/aethyme-broker/src/local_qualification.rs",
+        "original_sha256": "5773154eddeab2b099969d59330ab8ba7e0231028f4601b5f752d1e3983dbdf0",
+        "restored_sha256": "5773154eddeab2b099969d59330ab8ba7e0231028f4601b5f752d1e3983dbdf0",
+        "byte_identical": true
+      },
+      {
+        "file": "packages/aethyme/rust/crates/aethyme-broker/src/local_qualification/native_flow.rs",
+        "original_sha256": "8109546d26cac233af896479f518fc5f4e7c9a955c6fc51438100811ed934325",
+        "restored_sha256": "8109546d26cac233af896479f518fc5f4e7c9a955c6fc51438100811ed934325",
+        "byte_identical": true
+      }
+    ],
+    "restored_positive_attempt": 4
+  },
+  "limitations": [
+    "owned workload tmpfs ENOSPC and bounded cgroup OOM only; daemon disk, host disk, capture and hydration ENOSPC remain unqualified",
+    "private generic Git and appointed local native observation; no live GitHub/Mergify qualification",
+    "joined flow is an explicit finite operator profile; not an autonomous background daemon or CLI run adapter",
+    "new root was acknowledged by an actual controlled local process; old open handles remain historical and descendant liveness is not guaranteed",
+    "restored history grants no current verifier, provider or agent authority",
+    "separately owned native gate candidate integration waits for #725",
+    "FX08 matched brief qualification awaits proposed-task review before fixture construction",
+    "all tests ran against disposable Playground source; no held-out reruns"
+  ],
+  "review": {
+    "pressure_repairs": "independent read-only reviews cleared empty eligible GC plan handling and exact-ID native absence interpretation",
+    "joined_path": "independent review cleared unique new-root bytes and complete historical record selection",
+    "proof_assertion": "f61 clarified intended new-root assertion without changing positive behavior; independent review cleared"
+  },
+  "output_artifacts": "original complete command transcripts retained in operator temporary evidence directories; locations above are relative directory names, not authority receipts"
+}

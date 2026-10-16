@@ -1,0 +1,90 @@
+{
+  "schema": "aethyme.composition-inputs/provisional-v0",
+  "case": "FX03",
+  "trees": {
+    "t0": {
+      "accepted": true
+    },
+    "t1": {
+      "accepted": true,
+      "parent": "t0"
+    },
+    "t2": {
+      "accepted": false,
+      "parent": "t0"
+    }
+  },
+  "contributions": [
+    {
+      "id": "c1",
+      "base": "tree:t0"
+    },
+    {
+      "id": "c2",
+      "base": "contribution:c1"
+    },
+    {
+      "id": "c3",
+      "base": "tree:t2"
+    }
+  ],
+  "scenarios": [
+    {
+      "id": "s1",
+      "baseline": "t1",
+      "request": {
+        "compose": [
+          "c1",
+          "c2"
+        ]
+      },
+      "orders": [
+        [
+          "c1",
+          "c2"
+        ]
+      ],
+      "commutative": false
+    },
+    {
+      "id": "s2",
+      "baseline": "t1",
+      "request": {
+        "compose": [
+          "c1",
+          "c2"
+        ],
+        "deliveries": [
+          "c1",
+          "c1",
+          "c2",
+          "c1"
+        ]
+      },
+      "orders": [
+        [
+          "c1",
+          "c1",
+          "c2",
+          "c1"
+        ]
+      ],
+      "commutative": false
+    },
+    {
+      "id": "s3",
+      "baseline": "t1",
+      "request": {
+        "compose": [
+          "c3"
+        ]
+      },
+      "orders": [
+        [
+          "c3"
+        ]
+      ],
+      "commutative": false
+    }
+  ]
+}

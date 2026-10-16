@@ -1,0 +1,13 @@
+{
+  "source": "/private/tmp/t56-c90f1bf-sensitive-module-tmp",
+  "captured_at_utc": "2026-10-15T20:58:58.181543+00:00",
+  "source_head": "c90f1bf1cdb7e4e4a1971502e83c8625e30d0d14",
+  "result": "22run20PASS2FAIL exit101; overlappriorcontrols; no complete T56positive",
+  "files": [
+    {
+      "path": "command.log",
+      "bytes": 5843,
+      "sha256": "3d6164db311c76a7e44ae4cb313ae757285dcda1a56d1bc152e580558865e8b8"
+    }
+  ]
+}

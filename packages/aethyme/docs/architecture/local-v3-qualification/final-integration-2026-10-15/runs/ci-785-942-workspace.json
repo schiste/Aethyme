@@ -1,0 +1,24 @@
+{
+  "schema": "aethyme.local-ci-command-result/v1",
+  "id": "ci-785-942-workspace",
+  "pr": 785,
+  "branch_head": "94282330ee63986eda437391ad66f4c2a389badd",
+  "ci_checkout_commit": "27839326099282faafcff0f7bd78d9c36b74436e",
+  "ci_checkout_tree": "9d42c8509435baed633b4eef00570a54d87c9801",
+  "ci_checkout_parents": [
+    "8daffab2bb80ae0cce8286c530d70fad42c033f5",
+    "94282330ee63986eda437391ad66f4c2a389badd"
+  ],
+  "job_url": "https://github.com/schiste/Aethyme/actions/runs/38807247749/job/116671353859",
+  "conclusion": "FAILURE",
+  "numeric_exit": 100,
+  "tests_run": 4601,
+  "tests_passed": 4600,
+  "tests_failed": 1,
+  "tests_skipped": 32,
+  "test_commands_completed": 1,
+  "failure": "The complete workspace command failed only help_surface_matches_snapshots: collab.snap differs. The 4600 passing test cases do not make the workspace command pass. All retries and original output retained.",
+  "credited_as_passing_command": false,
+  "log_sha256": "86e5778934a60ecf28370d4a10d21284628f0038589d9a69400a7a9aa291fda5",
+  "scope": "Actual GitHub merge-ref checkout and complete original raw log; no credit for later source."
+}

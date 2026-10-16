@@ -548,6 +548,39 @@ impl HostResourceCoordinator {
         })
     }
 
+    /// Read an existing grant for an exact durable request after a caller crash.
+    /// This never acquires capacity, renews a lease or changes its generation.
+    /// The caller must already own its private recovery journal and run lock.
+    pub(crate) fn recover_request(
+        &self,
+        request: &HostResourceRequest,
+    ) -> Result<Option<HostResourceGrant>, HostResourceError> {
+        validate_request(request)?;
+        let digest = request_digest(request)?;
+        let found = self
+            .conn
+            .query_row(
+                "SELECT request_digest,ownership_token FROM resource_leases WHERE request_id=?1",
+                [&request.request_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        let Some((existing_digest, token)) = found else {
+            return Ok(None);
+        };
+        if existing_digest != digest {
+            return Err(HostResourceError::IdempotencyMismatch(
+                request.request_id.clone(),
+            ));
+        }
+        let lease = load_lease(&self.conn, "request_id", &request.request_id)?
+            .ok_or_else(|| HostResourceError::LeaseNotFound(request.request_id.clone()))?;
+        Ok(Some(HostResourceGrant {
+            lease,
+            ownership_token: token,
+        }))
+    }
+
     /// Acquire a bundle, waiting only for ordinary contention. All other
     /// failures are returned immediately. The same request id is reused for
     /// every attempt so a successful acquire remains idempotent.

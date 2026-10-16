@@ -1,0 +1,33 @@
+{
+  "absent": null,
+  "correct": {
+    "intent": "Preserve existing consumer semantics",
+    "decisions": [
+      {
+        "scope_ref": "source.rs",
+        "choice": "Kept creation order for tied priorities",
+        "reason": "Callers resume pages with a priority, creation and id cursor; changing ties can omit or repeat entries."
+      }
+    ]
+  },
+  "incomplete": {
+    "intent": "Preserve existing consumer semantics",
+    "decisions": [
+      {
+        "scope_ref": "source.rs",
+        "choice": "Kept priority filtering inclusive",
+        "reason": "The filter includes the threshold and preserves entries above it; extraction should share the ordering helper."
+      }
+    ]
+  },
+  "misleading": {
+    "intent": "Preserve existing consumer semantics",
+    "decisions": [
+      {
+        "scope_ref": "source.rs",
+        "choice": "Preferred identifier order for ties",
+        "reason": "Callers regard the id as the stable tie break; creation time is informational and need not affect pagination."
+      }
+    ]
+  }
+}

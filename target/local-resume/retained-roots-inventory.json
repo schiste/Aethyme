@@ -1,0 +1,5858 @@
+{
+  "created_at_utc": "2026-10-15T07:27:25.139707+00:00",
+  "roots": [
+    {
+      "archive_path": "target/local-resume/retained-roots/unknown1-evidence",
+      "entries": [],
+      "entry_count": 0,
+      "label": "unknown1-evidence",
+      "original_path": "/var/folders/f2/krjzd4c15nn491pm37zrkp1h0000gn/T/.tmpn7Ac8q",
+      "root_metadata": {
+        "gid": 20,
+        "kind": "directory",
+        "mode_octal": "0700",
+        "path": ".",
+        "size_bytes": 64,
+        "uid": 501
+      },
+      "total_file_bytes": 0
+    },
+    {
+      "archive_path": "target/local-resume/retained-roots/unknown1-source",
+      "entries": [
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0700",
+          "path": "collaboration",
+          "size_bytes": 160,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0600",
+          "path": "collaboration/.aethyme-collaboration-root.json",
+          "sha256": "6d3f0653f5b51646a33dce2c1d5663a408356cbebf5fce35fcc3b790a32c4dc2",
+          "size_bytes": 204,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0700",
+          "path": "collaboration/.local-authority",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0700",
+          "path": "collaboration/local-target-test",
+          "size_bytes": 224,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0700",
+          "path": "collaboration/.local-authority/local-target-test",
+          "size_bytes": 128,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0644",
+          "path": "collaboration/.local-authority/local-target-test/ingress.lock",
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "size_bytes": 0,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0600",
+          "path": "collaboration/.local-authority/local-target-test/witness.json",
+          "sha256": "011326479129a0cef1b564006d9a51c88b9f95fe2f508f31a791bd9b9f767ceb",
+          "size_bytes": 145,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0700",
+          "path": "collaboration/local-target-test/controller-locks",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0700",
+          "path": "collaboration/local-target-test/objects",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0700",
+          "path": "collaboration/local-target-test/spool",
+          "size_bytes": 128,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0600",
+          "path": "collaboration/local-target-test/state.db",
+          "sha256": "4e4134592bd12dd0ea22819baada73bbb2fd1fa0c7bde915ad9717b5992e806b",
+          "size_bytes": 589824,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0700",
+          "path": "collaboration/local-target-test/verifier-authority",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0644",
+          "path": "collaboration/local-target-test/controller-locks/9ffea67e9435fb7bdbdbf2b3c7003022fbfb9488b17d75ebb2f2270c9adc2058.lock",
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "size_bytes": 0,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0700",
+          "path": "collaboration/local-target-test/spool/archive",
+          "size_bytes": 64,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0644",
+          "path": "collaboration/local-target-test/spool/gc.lock",
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "size_bytes": 0,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0700",
+          "path": "collaboration/local-target-test/objects/sha256",
+          "size_bytes": 480,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0700",
+          "path": "collaboration/local-target-test/objects/sha256/06",
+          "size_bytes": 128,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0700",
+          "path": "collaboration/local-target-test/objects/sha256/11",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0700",
+          "path": "collaboration/local-target-test/objects/sha256/1e",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0700",
+          "path": "collaboration/local-target-test/objects/sha256/32",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0700",
+          "path": "collaboration/local-target-test/objects/sha256/54",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0700",
+          "path": "collaboration/local-target-test/objects/sha256/60",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0700",
+          "path": "collaboration/local-target-test/objects/sha256/75",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0700",
+          "path": "collaboration/local-target-test/objects/sha256/86",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0700",
+          "path": "collaboration/local-target-test/objects/sha256/c0",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0700",
+          "path": "collaboration/local-target-test/objects/sha256/d8",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0700",
+          "path": "collaboration/local-target-test/objects/sha256/e6",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0700",
+          "path": "collaboration/local-target-test/objects/sha256/e8",
+          "size_bytes": 128,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0700",
+          "path": "collaboration/local-target-test/objects/sha256/f3",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0600",
+          "path": "collaboration/local-target-test/objects/sha256/32/ed4b7b0ad522dc5a458fe00219dfc9bb2111f2acfc43f175d019c5fca8a58b",
+          "sha256": "32ed4b7b0ad522dc5a458fe00219dfc9bb2111f2acfc43f175d019c5fca8a58b",
+          "size_bytes": 281,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0600",
+          "path": "collaboration/local-target-test/objects/sha256/60/02ce8315c1608bcaa95c88a152094729b43bfe5584efdba1750fe73c5eec15",
+          "sha256": "6002ce8315c1608bcaa95c88a152094729b43bfe5584efdba1750fe73c5eec15",
+          "size_bytes": 281,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0600",
+          "path": "collaboration/local-target-test/objects/sha256/d8/37f77f12ebf1ce4d434bf360b63dba754c3ba3b990be49295791ad85671bc9",
+          "sha256": "d837f77f12ebf1ce4d434bf360b63dba754c3ba3b990be49295791ad85671bc9",
+          "size_bytes": 107,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0600",
+          "path": "collaboration/local-target-test/objects/sha256/f3/4848ca92665c342abd5816c9e3eda0e82180671195362bcd0080544a3bc2ac",
+          "sha256": "f34848ca92665c342abd5816c9e3eda0e82180671195362bcd0080544a3bc2ac",
+          "size_bytes": 5,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0600",
+          "path": "collaboration/local-target-test/objects/sha256/c0/cde77fa8fef97d476c10aad3d2d54fcc2f336140d073651c2dcccf1e379fd6",
+          "sha256": "c0cde77fa8fef97d476c10aad3d2d54fcc2f336140d073651c2dcccf1e379fd6",
+          "size_bytes": 2,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0600",
+          "path": "collaboration/local-target-test/objects/sha256/11/6b9e034e22add925676cfcfc7c239959a856d8b024e5dd28a6496494dcc164",
+          "sha256": "116b9e034e22add925676cfcfc7c239959a856d8b024e5dd28a6496494dcc164",
+          "size_bytes": 554,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0600",
+          "path": "collaboration/local-target-test/objects/sha256/75/c049621a1d62d8db20d042bf4b6c7aa4d1e7518d66cd7e5891e175d99fb2d8",
+          "sha256": "75c049621a1d62d8db20d042bf4b6c7aa4d1e7518d66cd7e5891e175d99fb2d8",
+          "size_bytes": 107,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0600",
+          "path": "collaboration/local-target-test/objects/sha256/86/a3ad1c4e32731f190411b8fd5cfbe16906f7423873219adf65ff8fb1c5883a",
+          "sha256": "86a3ad1c4e32731f190411b8fd5cfbe16906f7423873219adf65ff8fb1c5883a",
+          "size_bytes": 385,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0600",
+          "path": "collaboration/local-target-test/objects/sha256/54/6a06bf1652cc7d9e14d06f405cb0065f89415d191ca3b13af7734bb12d29d7",
+          "sha256": "546a06bf1652cc7d9e14d06f405cb0065f89415d191ca3b13af7734bb12d29d7",
+          "size_bytes": 281,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0600",
+          "path": "collaboration/local-target-test/objects/sha256/06/f961b802bc46ee168555f066d28f4f0e9afdf3f88174c1ee6f9de004fc30a0",
+          "sha256": "06f961b802bc46ee168555f066d28f4f0e9afdf3f88174c1ee6f9de004fc30a0",
+          "size_bytes": 2,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0600",
+          "path": "collaboration/local-target-test/objects/sha256/06/fd6c5583bd4a83da934b583746999de42c6ab24cb79edd003848d2a1a0638f",
+          "sha256": "06fd6c5583bd4a83da934b583746999de42c6ab24cb79edd003848d2a1a0638f",
+          "size_bytes": 274,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0600",
+          "path": "collaboration/local-target-test/objects/sha256/e6/7a8eed1c5bcb7ca260552a9e78b74daff4eb8f8f3490fc3d92f7e3ac2d71ff",
+          "sha256": "e67a8eed1c5bcb7ca260552a9e78b74daff4eb8f8f3490fc3d92f7e3ac2d71ff",
+          "size_bytes": 283,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0600",
+          "path": "collaboration/local-target-test/objects/sha256/e8/7aea1393f34dec60c7fcc79288dbc73148a1588598c686c131759ce39d00e4",
+          "sha256": "e87aea1393f34dec60c7fcc79288dbc73148a1588598c686c131759ce39d00e4",
+          "size_bytes": 297,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0600",
+          "path": "collaboration/local-target-test/objects/sha256/e8/8b3fb290addb9b2ec19aedd130b300be4311871b1c300525e0af51eb53701b",
+          "sha256": "e88b3fb290addb9b2ec19aedd130b300be4311871b1c300525e0af51eb53701b",
+          "size_bytes": 385,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0600",
+          "path": "collaboration/local-target-test/objects/sha256/1e/5440a4bdd29e6c19f7d7345077402b57a1369fd3a3e80bfd25def99c9ce00f",
+          "sha256": "1e5440a4bdd29e6c19f7d7345077402b57a1369fd3a3e80bfd25def99c9ce00f",
+          "size_bytes": 187,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0600",
+          "path": "collaboration/local-target-test/verifier-authority/83cf2bcc8de59281cdde39aed696debb2c89e7cab1d70c1f96381f2a09414c20.lock",
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "size_bytes": 0,
+          "uid": 501
+        }
+      ],
+      "entry_count": 45,
+      "label": "unknown1-source",
+      "original_path": "/var/folders/f2/krjzd4c15nn491pm37zrkp1h0000gn/T/.tmpUDE86p",
+      "root_metadata": {
+        "gid": 20,
+        "kind": "directory",
+        "mode_octal": "0755",
+        "path": ".",
+        "size_bytes": 96,
+        "uid": 501
+      },
+      "total_file_bytes": 593604
+    },
+    {
+      "archive_path": "target/local-resume/retained-roots/unknown1-repo",
+      "entries": [
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".git",
+          "size_bytes": 288,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0644",
+          "path": "inventory.json",
+          "sha256": "e87aea1393f34dec60c7fcc79288dbc73148a1588598c686c131759ce39d00e4",
+          "size_bytes": 297,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0644",
+          "path": "one.txt",
+          "sha256": "f34848ca92665c342abd5816c9e3eda0e82180671195362bcd0080544a3bc2ac",
+          "size_bytes": 5,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0644",
+          "path": "two.txt",
+          "sha256": "c0cde77fa8fef97d476c10aad3d2d54fcc2f336140d073651c2dcccf1e379fd6",
+          "size_bytes": 2,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0644",
+          "path": ".git/COMMIT_EDITMSG",
+          "sha256": "675e8a2b6337b761fb6492c2c5d50d56fc11a4796e02b26d09f1887e1b612a1a",
+          "size_bytes": 42,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0644",
+          "path": ".git/HEAD",
+          "sha256": "ee75c4a2366966f7e8478ff1253b45e4f0294decf71986a68688753d0bd5136c",
+          "size_bytes": 18,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0644",
+          "path": ".git/config",
+          "sha256": "7139f0634012afe8fb5daef395c535ad339b52b3e0c21526e73012b51c57ea03",
+          "size_bytes": 293,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0644",
+          "path": ".git/index",
+          "sha256": "410ba309a0f5189c714e81da852c2d398f7730950d12064aff8b7c609c3d866f",
+          "size_bytes": 289,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".git/logs",
+          "size_bytes": 128,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".git/objects",
+          "size_bytes": 512,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".git/refs",
+          "size_bytes": 160,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".git/objects/12",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".git/objects/22",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".git/objects/28",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".git/objects/40",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".git/objects/47",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".git/objects/58",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".git/objects/63",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".git/objects/72",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".git/objects/88",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".git/objects/d9",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".git/objects/df",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".git/objects/f7",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".git/objects/info",
+          "size_bytes": 64,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".git/objects/pack",
+          "size_bytes": 64,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0444",
+          "path": ".git/objects/58/045701a64811ba80b984e8c6b1d1307e8589f4",
+          "sha256": "8eb79089e2b5bae3ace4f6436877a78cbf75523662d7caa1cba990d8eee32ca6",
+          "size_bytes": 152,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0444",
+          "path": ".git/objects/d9/5f686c55216348de446316d809c372e7b3e6cb",
+          "sha256": "dd8556ee0d16f03c75efbd5d57243b30aa41ba5a9b71629b9c73216e8ccb1ef1",
+          "size_bytes": 151,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0444",
+          "path": ".git/objects/df/967b96a579e45a18b8251732d16804b2e56a55",
+          "sha256": "a68879a026ee9eaa8c8eeb0826d1bb255a36e9bb38c76b3e42d892b22d0c4728",
+          "size_bytes": 20,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0444",
+          "path": ".git/objects/28/a99543a5d9df30628ae9775ddc3e14943ec1f4",
+          "sha256": "d476625c3085511bea621be944d211451ba11f756134de7adc3f126457154283",
+          "size_bytes": 52,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0444",
+          "path": ".git/objects/72/fc6acf7a4c676927ec25574e2c85647e7782e7",
+          "sha256": "0bebbdb3f7a176f833e79df04b2321049f7cb48f05511308dc224d880571b3b9",
+          "size_bytes": 179,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0444",
+          "path": ".git/objects/88/694c83b8183a1f7b0203698fd5e414990bf944",
+          "sha256": "df0fec389096c0361930914c5de71dc529591d607056c185d4a517a897ceebcb",
+          "size_bytes": 123,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0444",
+          "path": ".git/objects/63/43011748ab22a07bb58b4c7f5b869fc8838276",
+          "sha256": "4a4d93ba8bdc6614c3932c87802846c47f8c7835a37588598097c2a38bb487e0",
+          "size_bytes": 119,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0444",
+          "path": ".git/objects/f7/0f10e4db19068f79bc43844b49f3eece45c4e8",
+          "sha256": "aeec381e4fccbd06e0b45af0e39dcaba9f8987e8687960151a95eda09a2a45b3",
+          "size_bytes": 17,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0444",
+          "path": ".git/objects/12/e3140b82c3cdc9336fe389f9a6ceba63f474cb",
+          "sha256": "b22e60dc0351bd2cdf0996d704328c88e758afc89de5b610b33b6f122de6312a",
+          "size_bytes": 231,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0444",
+          "path": ".git/objects/40/1c3474aded6b913f22fbe070e733f883b389bb",
+          "sha256": "d6eade7589807878f4a81148b99d4ddc19b85a03a69b90de0eabf24d74e2c101",
+          "size_bytes": 80,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0444",
+          "path": ".git/objects/47/12a345780702b88d8aece2a47a1fa9fa55175f",
+          "sha256": "0c3c0ac3905b72fb1eab0e9fb1563230cf2ca6bb31292200c11eeac44d75a805",
+          "size_bytes": 52,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0444",
+          "path": ".git/objects/22/3b7836fb19fdf64ba2d3cd6173c6a283141f78",
+          "sha256": "c54b0eb094e130597fac4e314277b9140cdbec5ddb233c18e694e4128b698eaa",
+          "size_bytes": 17,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0644",
+          "path": ".git/logs/HEAD",
+          "sha256": "158e463ffe0f5c72d4939d0bc12866560adc49aae2c73927529eb35e36e824d8",
+          "size_bytes": 790,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".git/logs/refs",
+          "size_bytes": 128,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".git/logs/refs/heads",
+          "size_bytes": 128,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".git/logs/refs/remotes",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0644",
+          "path": ".git/logs/refs/heads/B",
+          "sha256": "ec7862283f16b65be416c386eb8f320dafe1c99618fb7e40208067fcfb03278c",
+          "size_bytes": 521,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0644",
+          "path": ".git/logs/refs/heads/main",
+          "sha256": "32a418853c13af2c670f19e8305ea176c9edc3773a2661fc5380e40844d87c7a",
+          "size_bytes": 299,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".git/logs/refs/remotes/controller-accepted",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0644",
+          "path": ".git/logs/refs/remotes/controller-accepted/accepted",
+          "sha256": "c115b92dfa3f3bac0c04ad3ff006197ea76785876ef13c288098555f7ab88c93",
+          "size_bytes": 148,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".git/refs/heads",
+          "size_bytes": 128,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".git/refs/remotes",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".git/refs/tags",
+          "size_bytes": 64,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0644",
+          "path": ".git/refs/heads/B",
+          "sha256": "8441980f8b43beb4216d5929e053cb80719fc814d7443aafd7dbe4a349d4b62e",
+          "size_bytes": 41,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0644",
+          "path": ".git/refs/heads/main",
+          "sha256": "9b732cc93182a5f6f3d94f5563acc42006559ce57b701d27cd2e582b750b6199",
+          "size_bytes": 41,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".git/refs/remotes/controller-accepted",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0644",
+          "path": ".git/refs/remotes/controller-accepted/accepted",
+          "sha256": "b1f4a08e6bf858c3c967d85f336fbebd406ca70d4a7a5adedc091ff811a1df37",
+          "size_bytes": 41,
+          "uid": 501
+        }
+      ],
+      "entry_count": 52,
+      "label": "unknown1-repo",
+      "original_path": "/var/folders/f2/krjzd4c15nn491pm37zrkp1h0000gn/T/.tmpme5gnL",
+      "root_metadata": {
+        "gid": 20,
+        "kind": "directory",
+        "mode_octal": "0755",
+        "path": ".",
+        "size_bytes": 192,
+        "uid": 501
+      },
+      "total_file_bytes": 4020
+    },
+    {
+      "archive_path": "target/local-resume/retained-roots/unknown2-evidence",
+      "entries": [
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0700",
+          "path": "local-execution-journal",
+          "size_bytes": 320,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0700",
+          "path": "operation-locks",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0600",
+          "path": "operations.db",
+          "sha256": "f1ad5e7d6fce85f25b162426402e4bd33b38f1724e11a78c276ab3e4557390b3",
+          "size_bytes": 24576,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0600",
+          "path": "operations.db-shm",
+          "sha256": "fd4c9fda9cd3f9ae7c962b0ddf37232294d55580e1aa165aa06129b8549389eb",
+          "size_bytes": 32768,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0600",
+          "path": "operations.db-wal",
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "size_bytes": 0,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0600",
+          "path": "resources.db",
+          "sha256": "1675bdc80a5ab1bb7e69774cebfded2dbea941cf164001da70c070e826b5eb7b",
+          "size_bytes": 53248,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0600",
+          "path": "resources.db-shm",
+          "sha256": "fd4c9fda9cd3f9ae7c962b0ddf37232294d55580e1aa165aa06129b8549389eb",
+          "size_bytes": 32768,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0600",
+          "path": "resources.db-wal",
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "size_bytes": 0,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0600",
+          "path": "operation-locks/d79383a008fa152009fafdfc0aacfaa80ef1f2ce2da64ca8883e9b2ce8b10666.lock",
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "size_bytes": 0,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0644",
+          "path": "local-execution-journal/476e9048fd35ce1e64b7dff6daa59235ad8bb485762d694cd9232a0666d6bd31.claim",
+          "sha256": "0c625c900ad2e025b714a04e2898d4a714f93241d16de4c1bb677e0c149c6fca",
+          "size_bytes": 64,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0600",
+          "path": "local-execution-journal/476e9048fd35ce1e64b7dff6daa59235ad8bb485762d694cd9232a0666d6bd31.lock",
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "size_bytes": 0,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0644",
+          "path": "local-execution-journal/7aac308424a36175ecf8de4534e3f0bf56d6e8644cbdb738656c3d63e4419124.claim",
+          "sha256": "dc4ea0b504b79d03b7b3ca91d569009fb8395625390e0d7d5e8de9520a6ae4ec",
+          "size_bytes": 64,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0600",
+          "path": "local-execution-journal/7aac308424a36175ecf8de4534e3f0bf56d6e8644cbdb738656c3d63e4419124.lock",
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "size_bytes": 0,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0600",
+          "path": "local-execution-journal/af7b708fe8c8fb4051244f983b5bf03c3ddcc306da09a07716cc627d2ccbc3c0.json",
+          "sha256": "0f48517ed6d4ac7ce44833c1f4624dcafb80ecd5aeb82333ecdd4916edfb6d52",
+          "size_bytes": 5269,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0600",
+          "path": "local-execution-journal/af7b708fe8c8fb4051244f983b5bf03c3ddcc306da09a07716cc627d2ccbc3c0.lock",
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "size_bytes": 0,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0600",
+          "path": "local-execution-journal/ca408a21e69071170a120bb659ef8e8e68285ea47c6e1d5861c66ca93b9f1d72.json",
+          "sha256": "c85d3760b2848bfbd95b17df9cdcafcf6a23b49788f1765721d85a6ead5307be",
+          "size_bytes": 4730,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0600",
+          "path": "local-execution-journal/ca408a21e69071170a120bb659ef8e8e68285ea47c6e1d5861c66ca93b9f1d72.lock",
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "size_bytes": 0,
+          "uid": 501
+        }
+      ],
+      "entry_count": 17,
+      "label": "unknown2-evidence",
+      "original_path": "/var/folders/f2/krjzd4c15nn491pm37zrkp1h0000gn/T/.tmpF2whr3",
+      "root_metadata": {
+        "gid": 20,
+        "kind": "directory",
+        "mode_octal": "0700",
+        "path": ".",
+        "size_bytes": 320,
+        "uid": 501
+      },
+      "total_file_bytes": 153487
+    },
+    {
+      "archive_path": "target/local-resume/retained-roots/unknown2-source",
+      "entries": [
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0700",
+          "path": "collaboration",
+          "size_bytes": 160,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0600",
+          "path": "collaboration/.aethyme-collaboration-root.json",
+          "sha256": "6d3f0653f5b51646a33dce2c1d5663a408356cbebf5fce35fcc3b790a32c4dc2",
+          "size_bytes": 204,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0700",
+          "path": "collaboration/.local-authority",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0700",
+          "path": "collaboration/local-target-test",
+          "size_bytes": 224,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0700",
+          "path": "collaboration/.local-authority/local-target-test",
+          "size_bytes": 128,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0644",
+          "path": "collaboration/.local-authority/local-target-test/ingress.lock",
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "size_bytes": 0,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0600",
+          "path": "collaboration/.local-authority/local-target-test/witness.json",
+          "sha256": "55a7d64794773bcccf2d0dde7989ed003c532fa69be2e8f21b94a96b9fd7c954",
+          "size_bytes": 145,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0700",
+          "path": "collaboration/local-target-test/controller-locks",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0700",
+          "path": "collaboration/local-target-test/objects",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0700",
+          "path": "collaboration/local-target-test/spool",
+          "size_bytes": 128,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0600",
+          "path": "collaboration/local-target-test/state.db",
+          "sha256": "f94f767b5c551d570839ce22e4f9ebcefbb273e7d68a12c94f6a2a87f1d1c5cb",
+          "size_bytes": 598016,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0700",
+          "path": "collaboration/local-target-test/verifier-authority",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0644",
+          "path": "collaboration/local-target-test/controller-locks/9ffea67e9435fb7bdbdbf2b3c7003022fbfb9488b17d75ebb2f2270c9adc2058.lock",
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "size_bytes": 0,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0700",
+          "path": "collaboration/local-target-test/spool/archive",
+          "size_bytes": 64,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0644",
+          "path": "collaboration/local-target-test/spool/gc.lock",
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "size_bytes": 0,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0700",
+          "path": "collaboration/local-target-test/objects/sha256",
+          "size_bytes": 928,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0700",
+          "path": "collaboration/local-target-test/objects/sha256/05",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0700",
+          "path": "collaboration/local-target-test/objects/sha256/06",
+          "size_bytes": 128,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0700",
+          "path": "collaboration/local-target-test/objects/sha256/0c",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0700",
+          "path": "collaboration/local-target-test/objects/sha256/13",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0700",
+          "path": "collaboration/local-target-test/objects/sha256/1a",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0700",
+          "path": "collaboration/local-target-test/objects/sha256/1e",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0700",
+          "path": "collaboration/local-target-test/objects/sha256/26",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0700",
+          "path": "collaboration/local-target-test/objects/sha256/2a",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0700",
+          "path": "collaboration/local-target-test/objects/sha256/3d",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0700",
+          "path": "collaboration/local-target-test/objects/sha256/42",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0700",
+          "path": "collaboration/local-target-test/objects/sha256/61",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0700",
+          "path": "collaboration/local-target-test/objects/sha256/67",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0700",
+          "path": "collaboration/local-target-test/objects/sha256/6a",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0700",
+          "path": "collaboration/local-target-test/objects/sha256/75",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0700",
+          "path": "collaboration/local-target-test/objects/sha256/8e",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0700",
+          "path": "collaboration/local-target-test/objects/sha256/93",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0700",
+          "path": "collaboration/local-target-test/objects/sha256/96",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0700",
+          "path": "collaboration/local-target-test/objects/sha256/99",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0700",
+          "path": "collaboration/local-target-test/objects/sha256/9b",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0700",
+          "path": "collaboration/local-target-test/objects/sha256/af",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0700",
+          "path": "collaboration/local-target-test/objects/sha256/b5",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0700",
+          "path": "collaboration/local-target-test/objects/sha256/c0",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0700",
+          "path": "collaboration/local-target-test/objects/sha256/d8",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0700",
+          "path": "collaboration/local-target-test/objects/sha256/e3",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0700",
+          "path": "collaboration/local-target-test/objects/sha256/e8",
+          "size_bytes": 128,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0700",
+          "path": "collaboration/local-target-test/objects/sha256/f3",
+          "size_bytes": 128,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0700",
+          "path": "collaboration/local-target-test/objects/sha256/f9",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0600",
+          "path": "collaboration/local-target-test/objects/sha256/61/6e9166b0649d072189ca61b738659b1d0ac24ee5644eb51648ca08e1cf50ef",
+          "sha256": "616e9166b0649d072189ca61b738659b1d0ac24ee5644eb51648ca08e1cf50ef",
+          "size_bytes": 281,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0600",
+          "path": "collaboration/local-target-test/objects/sha256/0c/a9dda20ac4277665bb85bcdbc53b5be4ad0f2d41a3dc40839a639854ce2cef",
+          "sha256": "0ca9dda20ac4277665bb85bcdbc53b5be4ad0f2d41a3dc40839a639854ce2cef",
+          "size_bytes": 575,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0600",
+          "path": "collaboration/local-target-test/objects/sha256/9b/2e01b374f3b9a631252edf6da8b37e11b701e0b0502ab1ea4f4f34bbde1c18",
+          "sha256": "9b2e01b374f3b9a631252edf6da8b37e11b701e0b0502ab1ea4f4f34bbde1c18",
+          "size_bytes": 869,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0600",
+          "path": "collaboration/local-target-test/objects/sha256/6a/f3784399314c0be2afa5ca69851c79022dc83467d499f058b4a5548e89c4ed",
+          "sha256": "6af3784399314c0be2afa5ca69851c79022dc83467d499f058b4a5548e89c4ed",
+          "size_bytes": 97,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0600",
+          "path": "collaboration/local-target-test/objects/sha256/3d/2ada3565c914560151df217c20f9a7099d89c6fe5d8b1dd4914d31ab265e32",
+          "sha256": "3d2ada3565c914560151df217c20f9a7099d89c6fe5d8b1dd4914d31ab265e32",
+          "size_bytes": 1730,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0600",
+          "path": "collaboration/local-target-test/objects/sha256/67/5df88a7e6b213eeb17ada03dcf2759074e8bfcdcfea483295370596b846ac4",
+          "sha256": "675df88a7e6b213eeb17ada03dcf2759074e8bfcdcfea483295370596b846ac4",
+          "size_bytes": 561,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0600",
+          "path": "collaboration/local-target-test/objects/sha256/93/bef5322db87888e09d1af86676025c5a189a3d71f2a9ff149c361d53002299",
+          "sha256": "93bef5322db87888e09d1af86676025c5a189a3d71f2a9ff149c361d53002299",
+          "size_bytes": 385,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0600",
+          "path": "collaboration/local-target-test/objects/sha256/05/b286256c0d43d97d3f1769b7f5033303cc4930c42872c2589b034ddb8b883e",
+          "sha256": "05b286256c0d43d97d3f1769b7f5033303cc4930c42872c2589b034ddb8b883e",
+          "size_bytes": 1183,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0600",
+          "path": "collaboration/local-target-test/objects/sha256/b5/63d76d9fa2c543b892e65bac0962a826504c0ddedeb795083ed7f3370a73ad",
+          "sha256": "b563d76d9fa2c543b892e65bac0962a826504c0ddedeb795083ed7f3370a73ad",
+          "size_bytes": 964,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0600",
+          "path": "collaboration/local-target-test/objects/sha256/d8/37f77f12ebf1ce4d434bf360b63dba754c3ba3b990be49295791ad85671bc9",
+          "sha256": "d837f77f12ebf1ce4d434bf360b63dba754c3ba3b990be49295791ad85671bc9",
+          "size_bytes": 107,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0600",
+          "path": "collaboration/local-target-test/objects/sha256/f3/3c95a0a6aa301ec751630f12349fe7bec1473c1fdf74cf7ad3a54831f5c68b",
+          "sha256": "f33c95a0a6aa301ec751630f12349fe7bec1473c1fdf74cf7ad3a54831f5c68b",
+          "size_bytes": 281,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0600",
+          "path": "collaboration/local-target-test/objects/sha256/f3/4848ca92665c342abd5816c9e3eda0e82180671195362bcd0080544a3bc2ac",
+          "sha256": "f34848ca92665c342abd5816c9e3eda0e82180671195362bcd0080544a3bc2ac",
+          "size_bytes": 5,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0600",
+          "path": "collaboration/local-target-test/objects/sha256/c0/cde77fa8fef97d476c10aad3d2d54fcc2f336140d073651c2dcccf1e379fd6",
+          "sha256": "c0cde77fa8fef97d476c10aad3d2d54fcc2f336140d073651c2dcccf1e379fd6",
+          "size_bytes": 2,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0600",
+          "path": "collaboration/local-target-test/objects/sha256/e3/b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "size_bytes": 0,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0600",
+          "path": "collaboration/local-target-test/objects/sha256/42/6b3d4103274ddcb28e2e7ca6ceb5a5bbe94ae94a804829b00c583923e14054",
+          "sha256": "426b3d4103274ddcb28e2e7ca6ceb5a5bbe94ae94a804829b00c583923e14054",
+          "size_bytes": 1437,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0600",
+          "path": "collaboration/local-target-test/objects/sha256/1a/268194faf5dd688fcc052860d1bc65bc7e8f7529d14ba4d63da99c994a271c",
+          "sha256": "1a268194faf5dd688fcc052860d1bc65bc7e8f7529d14ba4d63da99c994a271c",
+          "size_bytes": 577,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0600",
+          "path": "collaboration/local-target-test/objects/sha256/26/a5c8ab781173e4c04cffa6c9280f5fc7cd9e344c2de8601044a7b68c44a1b3",
+          "sha256": "26a5c8ab781173e4c04cffa6c9280f5fc7cd9e344c2de8601044a7b68c44a1b3",
+          "size_bytes": 1319,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0600",
+          "path": "collaboration/local-target-test/objects/sha256/75/c049621a1d62d8db20d042bf4b6c7aa4d1e7518d66cd7e5891e175d99fb2d8",
+          "sha256": "75c049621a1d62d8db20d042bf4b6c7aa4d1e7518d66cd7e5891e175d99fb2d8",
+          "size_bytes": 107,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0600",
+          "path": "collaboration/local-target-test/objects/sha256/2a/6dc0c05e9560d3686f177aa56500794a9fe8354613a5ef939b2672a60db420",
+          "sha256": "2a6dc0c05e9560d3686f177aa56500794a9fe8354613a5ef939b2672a60db420",
+          "size_bytes": 692,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0600",
+          "path": "collaboration/local-target-test/objects/sha256/96/24d32521e53ea79b3c903a763b7d3ac839f9a0f1ce35c1dff818f399c97ff1",
+          "sha256": "9624d32521e53ea79b3c903a763b7d3ac839f9a0f1ce35c1dff818f399c97ff1",
+          "size_bytes": 385,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0600",
+          "path": "collaboration/local-target-test/objects/sha256/06/f961b802bc46ee168555f066d28f4f0e9afdf3f88174c1ee6f9de004fc30a0",
+          "sha256": "06f961b802bc46ee168555f066d28f4f0e9afdf3f88174c1ee6f9de004fc30a0",
+          "size_bytes": 2,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0600",
+          "path": "collaboration/local-target-test/objects/sha256/06/fd6c5583bd4a83da934b583746999de42c6ab24cb79edd003848d2a1a0638f",
+          "sha256": "06fd6c5583bd4a83da934b583746999de42c6ab24cb79edd003848d2a1a0638f",
+          "size_bytes": 274,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0600",
+          "path": "collaboration/local-target-test/objects/sha256/99/2282148f27a6392a396a0b328c598a5c89f4e57c8096f50118d8a0c63187b8",
+          "sha256": "992282148f27a6392a396a0b328c598a5c89f4e57c8096f50118d8a0c63187b8",
+          "size_bytes": 554,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0600",
+          "path": "collaboration/local-target-test/objects/sha256/af/ee4bc8079fcc9194ef1c094843389bcdbadc758392f738999964a5c62ca6c7",
+          "sha256": "afee4bc8079fcc9194ef1c094843389bcdbadc758392f738999964a5c62ca6c7",
+          "size_bytes": 184,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0600",
+          "path": "collaboration/local-target-test/objects/sha256/f9/0226332b2e82efcc094dfb1a28441e93bfc4471beb7073b966b98c6d6dc8db",
+          "sha256": "f90226332b2e82efcc094dfb1a28441e93bfc4471beb7073b966b98c6d6dc8db",
+          "size_bytes": 283,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0600",
+          "path": "collaboration/local-target-test/objects/sha256/e8/4ae841b7bc850aa68c87e1fdb74a089929e75935b3b93248d254843bd76348",
+          "sha256": "e84ae841b7bc850aa68c87e1fdb74a089929e75935b3b93248d254843bd76348",
+          "size_bytes": 281,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0600",
+          "path": "collaboration/local-target-test/objects/sha256/e8/7aea1393f34dec60c7fcc79288dbc73148a1588598c686c131759ce39d00e4",
+          "sha256": "e87aea1393f34dec60c7fcc79288dbc73148a1588598c686c131759ce39d00e4",
+          "size_bytes": 297,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0600",
+          "path": "collaboration/local-target-test/objects/sha256/1e/5440a4bdd29e6c19f7d7345077402b57a1369fd3a3e80bfd25def99c9ce00f",
+          "sha256": "1e5440a4bdd29e6c19f7d7345077402b57a1369fd3a3e80bfd25def99c9ce00f",
+          "size_bytes": 187,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0600",
+          "path": "collaboration/local-target-test/objects/sha256/13/58dc478788cb5d8fc834069c01a9c5a93b5c5b106a24318fd0c7615434ae8a",
+          "sha256": "1358dc478788cb5d8fc834069c01a9c5a93b5c5b106a24318fd0c7615434ae8a",
+          "size_bytes": 281,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0600",
+          "path": "collaboration/local-target-test/objects/sha256/8e/ec434acff58e4de17475c08ff9731cdb8a669744562c61e84d276f199b26a4",
+          "sha256": "8eec434acff58e4de17475c08ff9731cdb8a669744562c61e84d276f199b26a4",
+          "size_bytes": 517,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0600",
+          "path": "collaboration/local-target-test/verifier-authority/83cf2bcc8de59281cdde39aed696debb2c89e7cab1d70c1f96381f2a09414c20.lock",
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "size_bytes": 0,
+          "uid": 501
+        }
+      ],
+      "entry_count": 74,
+      "label": "unknown2-source",
+      "original_path": "/var/folders/f2/krjzd4c15nn491pm37zrkp1h0000gn/T/.tmpW34Zlq",
+      "root_metadata": {
+        "gid": 20,
+        "kind": "directory",
+        "mode_octal": "0755",
+        "path": ".",
+        "size_bytes": 96,
+        "uid": 501
+      },
+      "total_file_bytes": 612782
+    },
+    {
+      "archive_path": "target/local-resume/retained-roots/unknown2-repo",
+      "entries": [
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".aethyme",
+          "size_bytes": 256,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".git",
+          "size_bytes": 288,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0644",
+          "path": "inventory.json",
+          "sha256": "e87aea1393f34dec60c7fcc79288dbc73148a1588598c686c131759ce39d00e4",
+          "size_bytes": 297,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0644",
+          "path": "one.txt",
+          "sha256": "f34848ca92665c342abd5816c9e3eda0e82180671195362bcd0080544a3bc2ac",
+          "size_bytes": 5,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0644",
+          "path": "two.txt",
+          "sha256": "c0cde77fa8fef97d476c10aad3d2d54fcc2f336140d073651c2dcccf1e379fd6",
+          "size_bytes": 2,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0644",
+          "path": ".aethyme/broker.db",
+          "sha256": "f4ff45b549e39b97a89364e33b1625963d3f72a8f552653c73acc7b5dc2f610e",
+          "size_bytes": 618496,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0644",
+          "path": ".aethyme/broker.db-shm",
+          "sha256": "fd4c9fda9cd3f9ae7c962b0ddf37232294d55580e1aa165aa06129b8549389eb",
+          "size_bytes": 32768,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0644",
+          "path": ".aethyme/broker.db-wal",
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "size_bytes": 0,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".aethyme/locks",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".aethyme/logs",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".aethyme/run",
+          "size_bytes": 128,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".aethyme/locks/operations",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0644",
+          "path": ".aethyme/locks/operations/6e9a0e81d00029dc.lock",
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "size_bytes": 0,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".aethyme/logs/gates",
+          "size_bytes": 64,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".aethyme/run/gates",
+          "size_bytes": 64,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".aethyme/run/operations",
+          "size_bytes": 64,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0644",
+          "path": ".git/COMMIT_EDITMSG",
+          "sha256": "675e8a2b6337b761fb6492c2c5d50d56fc11a4796e02b26d09f1887e1b612a1a",
+          "size_bytes": 42,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0644",
+          "path": ".git/HEAD",
+          "sha256": "ee75c4a2366966f7e8478ff1253b45e4f0294decf71986a68688753d0bd5136c",
+          "size_bytes": 18,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0644",
+          "path": ".git/config",
+          "sha256": "6b15792c51e87505a7debc5ed4277cd26457881c720ab0ea16d7e12e8252d322",
+          "size_bytes": 293,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0644",
+          "path": ".git/index",
+          "sha256": "8d294b3aecc53d9f74762fcc2fd70b65ad58d63cd6ac4c71ff1f047b1210f12a",
+          "size_bytes": 289,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".git/logs",
+          "size_bytes": 128,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".git/objects",
+          "size_bytes": 512,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".git/refs",
+          "size_bytes": 160,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".git/objects/12",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".git/objects/22",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".git/objects/28",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".git/objects/40",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".git/objects/47",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".git/objects/5f",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".git/objects/63",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".git/objects/64",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".git/objects/65",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".git/objects/c0",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".git/objects/df",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".git/objects/f7",
+          "size_bytes": 128,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".git/objects/info",
+          "size_bytes": 64,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".git/objects/pack",
+          "size_bytes": 64,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0444",
+          "path": ".git/objects/5f/d31fed48524fdd5b86952ebd3fb4b6d2ac456b",
+          "sha256": "b702dec64139529bc788bf55431d7a5a8ec97ea9e5693ac459b7d6b5ea29e519",
+          "size_bytes": 178,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0444",
+          "path": ".git/objects/df/967b96a579e45a18b8251732d16804b2e56a55",
+          "sha256": "a68879a026ee9eaa8c8eeb0826d1bb255a36e9bb38c76b3e42d892b22d0c4728",
+          "size_bytes": 20,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0444",
+          "path": ".git/objects/c0/09051ae28cefa40ddbfc7d639a265d9756df42",
+          "sha256": "b30060939cebae9532c77d1656a705ffc4a0a428c382708cbe6bc1c7ade21e6f",
+          "size_bytes": 123,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0444",
+          "path": ".git/objects/28/a99543a5d9df30628ae9775ddc3e14943ec1f4",
+          "sha256": "d476625c3085511bea621be944d211451ba11f756134de7adc3f126457154283",
+          "size_bytes": 52,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0444",
+          "path": ".git/objects/65/4e076b8587cd8d96e5242df50f02a9eb14cb89",
+          "sha256": "4556b7c17c832b81c1c84e9994923a388815721b731852791049ef44ff8f2bb4",
+          "size_bytes": 151,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0444",
+          "path": ".git/objects/63/43011748ab22a07bb58b4c7f5b869fc8838276",
+          "sha256": "4a4d93ba8bdc6614c3932c87802846c47f8c7835a37588598097c2a38bb487e0",
+          "size_bytes": 119,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0444",
+          "path": ".git/objects/64/2e4d5b0cb3e8e117f94b9ddeb0eb46cfa9ac52",
+          "sha256": "6aabbed52ae73a9c26a8014042974acc24bbdbac8889df9f45b31e16e33cfe60",
+          "size_bytes": 150,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0444",
+          "path": ".git/objects/f7/0f10e4db19068f79bc43844b49f3eece45c4e8",
+          "sha256": "aeec381e4fccbd06e0b45af0e39dcaba9f8987e8687960151a95eda09a2a45b3",
+          "size_bytes": 17,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0444",
+          "path": ".git/objects/f7/defde31bbafea32a7b9605e779195279daefc5",
+          "sha256": "743c2f0c61b99e35861e55024dca31bd5b48c421e517d6d4f031e5372cad2242",
+          "size_bytes": 171,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0444",
+          "path": ".git/objects/12/e3140b82c3cdc9336fe389f9a6ceba63f474cb",
+          "sha256": "b22e60dc0351bd2cdf0996d704328c88e758afc89de5b610b33b6f122de6312a",
+          "size_bytes": 231,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0444",
+          "path": ".git/objects/40/1c3474aded6b913f22fbe070e733f883b389bb",
+          "sha256": "d6eade7589807878f4a81148b99d4ddc19b85a03a69b90de0eabf24d74e2c101",
+          "size_bytes": 80,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0444",
+          "path": ".git/objects/47/12a345780702b88d8aece2a47a1fa9fa55175f",
+          "sha256": "0c3c0ac3905b72fb1eab0e9fb1563230cf2ca6bb31292200c11eeac44d75a805",
+          "size_bytes": 52,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0444",
+          "path": ".git/objects/22/3b7836fb19fdf64ba2d3cd6173c6a283141f78",
+          "sha256": "c54b0eb094e130597fac4e314277b9140cdbec5ddb233c18e694e4128b698eaa",
+          "size_bytes": 17,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0644",
+          "path": ".git/logs/HEAD",
+          "sha256": "25714323a66ae900913d1feac53528fef470dd9c0841c75da0f9fb1422531309",
+          "size_bytes": 790,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".git/logs/refs",
+          "size_bytes": 128,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".git/logs/refs/heads",
+          "size_bytes": 128,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".git/logs/refs/remotes",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0644",
+          "path": ".git/logs/refs/heads/B",
+          "sha256": "224840ea6e1ec8b62467e66e775f35d49ebb6b485d005e4b72567c84f67b7028",
+          "size_bytes": 521,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0644",
+          "path": ".git/logs/refs/heads/main",
+          "sha256": "24ae6362e04c97c02845051ce66f04a0dae8bd7f303d86e015a0af27d8773166",
+          "size_bytes": 299,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".git/logs/refs/remotes/controller-accepted",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0644",
+          "path": ".git/logs/refs/remotes/controller-accepted/accepted",
+          "sha256": "fa052e0005a700dbb0fc6c4adea87a6a927132cd03824f676c93be4a1e0f07c2",
+          "size_bytes": 309,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".git/refs/heads",
+          "size_bytes": 128,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".git/refs/remotes",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".git/refs/tags",
+          "size_bytes": 64,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0644",
+          "path": ".git/refs/heads/B",
+          "sha256": "82bc2181846eddc6ddd23fbcfc6648ab759270590600a728cd0e32a3b4b0df3a",
+          "size_bytes": 41,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0644",
+          "path": ".git/refs/heads/main",
+          "sha256": "09ae3d6cd985c65a75f5eea35f06fa5d8a8cb1ac8f6730a0272b469987640b9b",
+          "size_bytes": 41,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".git/refs/remotes/controller-accepted",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0644",
+          "path": ".git/refs/remotes/controller-accepted/accepted",
+          "sha256": "685f259ba4e16d50087aa9094971e9a6b026627c71a2e53f7e296db7cb59db03",
+          "size_bytes": 41,
+          "uid": 501
+        }
+      ],
+      "entry_count": 65,
+      "label": "unknown2-repo",
+      "original_path": "/var/folders/f2/krjzd4c15nn491pm37zrkp1h0000gn/T/.tmplAFgol",
+      "root_metadata": {
+        "gid": 20,
+        "kind": "directory",
+        "mode_octal": "0755",
+        "path": ".",
+        "size_bytes": 224,
+        "uid": 501
+      },
+      "total_file_bytes": 655613
+    },
+    {
+      "archive_path": "target/local-resume/retained-roots/unknown2-receiver",
+      "entries": [
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0644",
+          "path": "HEAD",
+          "sha256": "f6f2b945f6c411b02ba3da9c7ace88dcf71b6af65ba2e0d89aa82900042b5a10",
+          "size_bytes": 23,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0644",
+          "path": "config",
+          "sha256": "3c5cc3e72b5473d08433171d50fc687ac3aa2a6a3f4c20b97f5b66f581b0fec9",
+          "size_bytes": 111,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": "hooks",
+          "size_bytes": 128,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": "objects",
+          "size_bytes": 288,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": "refs",
+          "size_bytes": 128,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": "objects/28",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": "objects/47",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": "objects/c0",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": "objects/df",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": "objects/f7",
+          "size_bytes": 128,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": "objects/info",
+          "size_bytes": 64,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": "objects/pack",
+          "size_bytes": 64,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0444",
+          "path": "objects/df/967b96a579e45a18b8251732d16804b2e56a55",
+          "sha256": "a68879a026ee9eaa8c8eeb0826d1bb255a36e9bb38c76b3e42d892b22d0c4728",
+          "size_bytes": 20,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0444",
+          "path": "objects/c0/09051ae28cefa40ddbfc7d639a265d9756df42",
+          "sha256": "b30060939cebae9532c77d1656a705ffc4a0a428c382708cbe6bc1c7ade21e6f",
+          "size_bytes": 123,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0444",
+          "path": "objects/28/a99543a5d9df30628ae9775ddc3e14943ec1f4",
+          "sha256": "d476625c3085511bea621be944d211451ba11f756134de7adc3f126457154283",
+          "size_bytes": 52,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0444",
+          "path": "objects/f7/0f10e4db19068f79bc43844b49f3eece45c4e8",
+          "sha256": "aeec381e4fccbd06e0b45af0e39dcaba9f8987e8687960151a95eda09a2a45b3",
+          "size_bytes": 17,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0444",
+          "path": "objects/f7/defde31bbafea32a7b9605e779195279daefc5",
+          "sha256": "743c2f0c61b99e35861e55024dca31bd5b48c421e517d6d4f031e5372cad2242",
+          "size_bytes": 171,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0444",
+          "path": "objects/47/12a345780702b88d8aece2a47a1fa9fa55175f",
+          "sha256": "0c3c0ac3905b72fb1eab0e9fb1563230cf2ca6bb31292200c11eeac44d75a805",
+          "size_bytes": 52,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0700",
+          "path": "hooks/post-receive",
+          "sha256": "61b1b26b03d228331f62bfbfe1cdfb889d3f29628833b194125a93c37ee9f36f",
+          "size_bytes": 496,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0644",
+          "path": "hooks/post-receive-record",
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "size_bytes": 0,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": "refs/heads",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": "refs/tags",
+          "size_bytes": 64,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0644",
+          "path": "refs/heads/accepted",
+          "sha256": "685f259ba4e16d50087aa9094971e9a6b026627c71a2e53f7e296db7cb59db03",
+          "size_bytes": 41,
+          "uid": 501
+        }
+      ],
+      "entry_count": 23,
+      "label": "unknown2-receiver",
+      "original_path": "/var/folders/f2/krjzd4c15nn491pm37zrkp1h0000gn/T/.tmpweASev",
+      "root_metadata": {
+        "gid": 20,
+        "kind": "directory",
+        "mode_octal": "0755",
+        "path": ".",
+        "size_bytes": 224,
+        "uid": 501
+      },
+      "total_file_bytes": 1106
+    },
+    {
+      "archive_path": "target/local-resume/retained-roots/unknown3-evidence",
+      "entries": [
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0700",
+          "path": "local-execution-journal",
+          "size_bytes": 320,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0700",
+          "path": "operation-locks",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0600",
+          "path": "operations.db",
+          "sha256": "c2f4b003db1d73fb88483f74c80e10c93117af0fb2b9436bccb545de61713ad0",
+          "size_bytes": 24576,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0644",
+          "path": "report.json",
+          "sha256": "f27346d8bd50273cb386d7b3050797bf244b5a5bec242fb797d779a30b0c7e8c",
+          "size_bytes": 11983,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0600",
+          "path": "resources.db",
+          "sha256": "b4ac6a9789b110a0c65c24032020a501cec3dfda23bb5ef1d448c1622da5fb23",
+          "size_bytes": 53248,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0600",
+          "path": "operation-locks/ef4667d93c41bd923c4687f5b11e10909dc1f500b7adcf7d038d32ad6152aa47.lock",
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "size_bytes": 0,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0600",
+          "path": "local-execution-journal/4c6840135538b0a71d7b524d2cdebd244082e97f51aac08abafb61e39ab05641.json",
+          "sha256": "081063fca20b4835980699a7eada3cd362dd3c8b1bc47ff8aa1db466457de903",
+          "size_bytes": 5269,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0600",
+          "path": "local-execution-journal/4c6840135538b0a71d7b524d2cdebd244082e97f51aac08abafb61e39ab05641.lock",
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "size_bytes": 0,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0644",
+          "path": "local-execution-journal/503b7bc9806ebe06caed45bcb3664365e9b445122eed94a7db1a4a2b44910019.claim",
+          "sha256": "07e224b25cfe01b0b86f9759a5299cca1e672abe74a118fb9f7d956bfb04dcd9",
+          "size_bytes": 64,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0600",
+          "path": "local-execution-journal/503b7bc9806ebe06caed45bcb3664365e9b445122eed94a7db1a4a2b44910019.lock",
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "size_bytes": 0,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0600",
+          "path": "local-execution-journal/bb9b0b02ba4ad8299c0c20c15a3745bcd19fc7696c256e3c2da542ffd4fcc5c0.json",
+          "sha256": "281a915223e7d97b4449191c9a6495ef7488d1eabc1f8ad504893623ca18aa7b",
+          "size_bytes": 4730,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0600",
+          "path": "local-execution-journal/bb9b0b02ba4ad8299c0c20c15a3745bcd19fc7696c256e3c2da542ffd4fcc5c0.lock",
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "size_bytes": 0,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0644",
+          "path": "local-execution-journal/e1b1ec6ab4d54ddb38a3a0988a7c19cc7bf836db3e8423782b76c66433362240.claim",
+          "sha256": "bdebff95c75adb606a352196abe4fbb4e2f8303e53e1029dd4992bbda451c818",
+          "size_bytes": 64,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0600",
+          "path": "local-execution-journal/e1b1ec6ab4d54ddb38a3a0988a7c19cc7bf836db3e8423782b76c66433362240.lock",
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "size_bytes": 0,
+          "uid": 501
+        }
+      ],
+      "entry_count": 14,
+      "label": "unknown3-evidence",
+      "original_path": "/var/folders/f2/krjzd4c15nn491pm37zrkp1h0000gn/T/.tmprAe1Yv",
+      "root_metadata": {
+        "gid": 20,
+        "kind": "directory",
+        "mode_octal": "0700",
+        "path": ".",
+        "size_bytes": 224,
+        "uid": 501
+      },
+      "total_file_bytes": 99934
+    },
+    {
+      "archive_path": "target/local-resume/retained-roots/unknown3-source",
+      "entries": [
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0700",
+          "path": "collaboration",
+          "size_bytes": 160,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0600",
+          "path": "collaboration/.aethyme-collaboration-root.json",
+          "sha256": "6d3f0653f5b51646a33dce2c1d5663a408356cbebf5fce35fcc3b790a32c4dc2",
+          "size_bytes": 204,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0700",
+          "path": "collaboration/.local-authority",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0700",
+          "path": "collaboration/local-target-test",
+          "size_bytes": 224,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0700",
+          "path": "collaboration/.local-authority/local-target-test",
+          "size_bytes": 128,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0644",
+          "path": "collaboration/.local-authority/local-target-test/ingress.lock",
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "size_bytes": 0,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0600",
+          "path": "collaboration/.local-authority/local-target-test/witness.json",
+          "sha256": "109c47e3a583cdbd64fc5c9fd3e7b6b3a7a5dc50705a600c35027a9e94b9ce7b",
+          "size_bytes": 145,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0700",
+          "path": "collaboration/local-target-test/controller-locks",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0700",
+          "path": "collaboration/local-target-test/objects",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0700",
+          "path": "collaboration/local-target-test/spool",
+          "size_bytes": 128,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0600",
+          "path": "collaboration/local-target-test/state.db",
+          "sha256": "f854b15e74eb8564b45c3360e519e0e54c2a596923133049e6cfc29e4143bceb",
+          "size_bytes": 598016,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0700",
+          "path": "collaboration/local-target-test/verifier-authority",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0644",
+          "path": "collaboration/local-target-test/controller-locks/9ffea67e9435fb7bdbdbf2b3c7003022fbfb9488b17d75ebb2f2270c9adc2058.lock",
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "size_bytes": 0,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0700",
+          "path": "collaboration/local-target-test/spool/archive",
+          "size_bytes": 64,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0644",
+          "path": "collaboration/local-target-test/spool/gc.lock",
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "size_bytes": 0,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0700",
+          "path": "collaboration/local-target-test/objects/sha256",
+          "size_bytes": 832,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0700",
+          "path": "collaboration/local-target-test/objects/sha256/06",
+          "size_bytes": 128,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0700",
+          "path": "collaboration/local-target-test/objects/sha256/0a",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0700",
+          "path": "collaboration/local-target-test/objects/sha256/1e",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0700",
+          "path": "collaboration/local-target-test/objects/sha256/56",
+          "size_bytes": 128,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0700",
+          "path": "collaboration/local-target-test/objects/sha256/5c",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0700",
+          "path": "collaboration/local-target-test/objects/sha256/6a",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0700",
+          "path": "collaboration/local-target-test/objects/sha256/75",
+          "size_bytes": 128,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0700",
+          "path": "collaboration/local-target-test/objects/sha256/7d",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0700",
+          "path": "collaboration/local-target-test/objects/sha256/80",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0700",
+          "path": "collaboration/local-target-test/objects/sha256/93",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0700",
+          "path": "collaboration/local-target-test/objects/sha256/a9",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0700",
+          "path": "collaboration/local-target-test/objects/sha256/af",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0700",
+          "path": "collaboration/local-target-test/objects/sha256/b1",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0700",
+          "path": "collaboration/local-target-test/objects/sha256/b7",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0700",
+          "path": "collaboration/local-target-test/objects/sha256/ba",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0700",
+          "path": "collaboration/local-target-test/objects/sha256/c0",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0700",
+          "path": "collaboration/local-target-test/objects/sha256/c2",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0700",
+          "path": "collaboration/local-target-test/objects/sha256/d3",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0700",
+          "path": "collaboration/local-target-test/objects/sha256/d8",
+          "size_bytes": 128,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0700",
+          "path": "collaboration/local-target-test/objects/sha256/db",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0700",
+          "path": "collaboration/local-target-test/objects/sha256/e3",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0700",
+          "path": "collaboration/local-target-test/objects/sha256/e4",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0700",
+          "path": "collaboration/local-target-test/objects/sha256/e8",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0700",
+          "path": "collaboration/local-target-test/objects/sha256/f3",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0600",
+          "path": "collaboration/local-target-test/objects/sha256/6a/f3784399314c0be2afa5ca69851c79022dc83467d499f058b4a5548e89c4ed",
+          "sha256": "6af3784399314c0be2afa5ca69851c79022dc83467d499f058b4a5548e89c4ed",
+          "size_bytes": 97,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0600",
+          "path": "collaboration/local-target-test/objects/sha256/56/1582766e0d6ccb4639eadb4dbb508cdad302c78598f45fc5a84f565f2e966b",
+          "sha256": "561582766e0d6ccb4639eadb4dbb508cdad302c78598f45fc5a84f565f2e966b",
+          "size_bytes": 385,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0600",
+          "path": "collaboration/local-target-test/objects/sha256/56/f55d4677e37fb221a63199812d05849b1df07879c8dfc513cbffdd8ae59c6f",
+          "sha256": "56f55d4677e37fb221a63199812d05849b1df07879c8dfc513cbffdd8ae59c6f",
+          "size_bytes": 1730,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0600",
+          "path": "collaboration/local-target-test/objects/sha256/93/16790ca83770c891e68483104b742287052b5f5674357fc3a12f20a5a5dc06",
+          "sha256": "9316790ca83770c891e68483104b742287052b5f5674357fc3a12f20a5a5dc06",
+          "size_bytes": 1183,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0600",
+          "path": "collaboration/local-target-test/objects/sha256/d8/37f77f12ebf1ce4d434bf360b63dba754c3ba3b990be49295791ad85671bc9",
+          "sha256": "d837f77f12ebf1ce4d434bf360b63dba754c3ba3b990be49295791ad85671bc9",
+          "size_bytes": 107,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0600",
+          "path": "collaboration/local-target-test/objects/sha256/d8/8f085d518cbdd9751c2e76b485b99b7adf1256f29b4a8c61c69d3aa4992e9a",
+          "sha256": "d88f085d518cbdd9751c2e76b485b99b7adf1256f29b4a8c61c69d3aa4992e9a",
+          "size_bytes": 1437,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0600",
+          "path": "collaboration/local-target-test/objects/sha256/f3/4848ca92665c342abd5816c9e3eda0e82180671195362bcd0080544a3bc2ac",
+          "sha256": "f34848ca92665c342abd5816c9e3eda0e82180671195362bcd0080544a3bc2ac",
+          "size_bytes": 5,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0600",
+          "path": "collaboration/local-target-test/objects/sha256/c0/cde77fa8fef97d476c10aad3d2d54fcc2f336140d073651c2dcccf1e379fd6",
+          "sha256": "c0cde77fa8fef97d476c10aad3d2d54fcc2f336140d073651c2dcccf1e379fd6",
+          "size_bytes": 2,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0600",
+          "path": "collaboration/local-target-test/objects/sha256/e3/b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "size_bytes": 0,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0600",
+          "path": "collaboration/local-target-test/objects/sha256/e4/59a18e739d36d05eb2e90d91405c7249e724b3cd152f1aed7657ca2cf3d744",
+          "sha256": "e459a18e739d36d05eb2e90d91405c7249e724b3cd152f1aed7657ca2cf3d744",
+          "size_bytes": 577,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0600",
+          "path": "collaboration/local-target-test/objects/sha256/7d/10a2135398661b31ccd00152d114913c48f25133f822973d47ca7bba6ba220",
+          "sha256": "7d10a2135398661b31ccd00152d114913c48f25133f822973d47ca7bba6ba220",
+          "size_bytes": 281,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0600",
+          "path": "collaboration/local-target-test/objects/sha256/80/a81f06e105e70743a5fbeab9ab84dc92a2c29dec2b82c50a201d2757a0bf42",
+          "sha256": "80a81f06e105e70743a5fbeab9ab84dc92a2c29dec2b82c50a201d2757a0bf42",
+          "size_bytes": 281,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0600",
+          "path": "collaboration/local-target-test/objects/sha256/75/a7e1df7d4cc76c292339ecfe04e5b523a7945683dd2cb93a5de250d003a719",
+          "sha256": "75a7e1df7d4cc76c292339ecfe04e5b523a7945683dd2cb93a5de250d003a719",
+          "size_bytes": 964,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0600",
+          "path": "collaboration/local-target-test/objects/sha256/75/c049621a1d62d8db20d042bf4b6c7aa4d1e7518d66cd7e5891e175d99fb2d8",
+          "sha256": "75c049621a1d62d8db20d042bf4b6c7aa4d1e7518d66cd7e5891e175d99fb2d8",
+          "size_bytes": 107,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0600",
+          "path": "collaboration/local-target-test/objects/sha256/5c/871dcb4b875f7643b80eff04411ed9552e7856a726481dd09da0215819f334",
+          "sha256": "5c871dcb4b875f7643b80eff04411ed9552e7856a726481dd09da0215819f334",
+          "size_bytes": 575,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0600",
+          "path": "collaboration/local-target-test/objects/sha256/06/f961b802bc46ee168555f066d28f4f0e9afdf3f88174c1ee6f9de004fc30a0",
+          "sha256": "06f961b802bc46ee168555f066d28f4f0e9afdf3f88174c1ee6f9de004fc30a0",
+          "size_bytes": 2,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0600",
+          "path": "collaboration/local-target-test/objects/sha256/06/fd6c5583bd4a83da934b583746999de42c6ab24cb79edd003848d2a1a0638f",
+          "sha256": "06fd6c5583bd4a83da934b583746999de42c6ab24cb79edd003848d2a1a0638f",
+          "size_bytes": 274,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0600",
+          "path": "collaboration/local-target-test/objects/sha256/0a/7527ac6c7e953919c6dfb6372765b4bca0cef7b624aef030646971240774f9",
+          "sha256": "0a7527ac6c7e953919c6dfb6372765b4bca0cef7b624aef030646971240774f9",
+          "size_bytes": 554,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0600",
+          "path": "collaboration/local-target-test/objects/sha256/d3/a8986c459af770f6bd55f224143c9760455e4698c56da2293de29071bcd576",
+          "sha256": "d3a8986c459af770f6bd55f224143c9760455e4698c56da2293de29071bcd576",
+          "size_bytes": 1319,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0600",
+          "path": "collaboration/local-target-test/objects/sha256/ba/366b33346b5bad3f5c60239dac727bbf140fbfab8639a97ee64ab89e14a1b2",
+          "sha256": "ba366b33346b5bad3f5c60239dac727bbf140fbfab8639a97ee64ab89e14a1b2",
+          "size_bytes": 561,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0600",
+          "path": "collaboration/local-target-test/objects/sha256/b1/90f1ebecaf3c1a65fb9f77619e24a074b0eecc97acfe4f9de12ebf052797f7",
+          "sha256": "b190f1ebecaf3c1a65fb9f77619e24a074b0eecc97acfe4f9de12ebf052797f7",
+          "size_bytes": 283,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0600",
+          "path": "collaboration/local-target-test/objects/sha256/a9/7e8bb4ddad8a3b7a9342966bbed41f07477eb5fbe5b8ab64c869dbd40c97cc",
+          "sha256": "a97e8bb4ddad8a3b7a9342966bbed41f07477eb5fbe5b8ab64c869dbd40c97cc",
+          "size_bytes": 281,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0600",
+          "path": "collaboration/local-target-test/objects/sha256/af/ee4bc8079fcc9194ef1c094843389bcdbadc758392f738999964a5c62ca6c7",
+          "sha256": "afee4bc8079fcc9194ef1c094843389bcdbadc758392f738999964a5c62ca6c7",
+          "size_bytes": 184,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0600",
+          "path": "collaboration/local-target-test/objects/sha256/b7/e5b83795b74af4ea7dff9e2dc5696771310eac6e4447d571f65956f5e1ec8a",
+          "sha256": "b7e5b83795b74af4ea7dff9e2dc5696771310eac6e4447d571f65956f5e1ec8a",
+          "size_bytes": 385,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0600",
+          "path": "collaboration/local-target-test/objects/sha256/db/b3177217a20d2b5887beb5e21ff11dfb232830c006691901f1926df225d6f7",
+          "sha256": "dbb3177217a20d2b5887beb5e21ff11dfb232830c006691901f1926df225d6f7",
+          "size_bytes": 281,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0600",
+          "path": "collaboration/local-target-test/objects/sha256/e8/7aea1393f34dec60c7fcc79288dbc73148a1588598c686c131759ce39d00e4",
+          "sha256": "e87aea1393f34dec60c7fcc79288dbc73148a1588598c686c131759ce39d00e4",
+          "size_bytes": 297,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0600",
+          "path": "collaboration/local-target-test/objects/sha256/c2/d8df92676d2565da418ae7ac0833320e2a6670ae7e1f91da6b89f40dca175c",
+          "sha256": "c2d8df92676d2565da418ae7ac0833320e2a6670ae7e1f91da6b89f40dca175c",
+          "size_bytes": 692,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0600",
+          "path": "collaboration/local-target-test/objects/sha256/1e/5440a4bdd29e6c19f7d7345077402b57a1369fd3a3e80bfd25def99c9ce00f",
+          "sha256": "1e5440a4bdd29e6c19f7d7345077402b57a1369fd3a3e80bfd25def99c9ce00f",
+          "size_bytes": 187,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0600",
+          "path": "collaboration/local-target-test/verifier-authority/83cf2bcc8de59281cdde39aed696debb2c89e7cab1d70c1f96381f2a09414c20.lock",
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "size_bytes": 0,
+          "uid": 501
+        }
+      ],
+      "entry_count": 69,
+      "label": "unknown3-source",
+      "original_path": "/var/folders/f2/krjzd4c15nn491pm37zrkp1h0000gn/T/.tmpif4YvL",
+      "root_metadata": {
+        "gid": 20,
+        "kind": "directory",
+        "mode_octal": "0755",
+        "path": ".",
+        "size_bytes": 96,
+        "uid": 501
+      },
+      "total_file_bytes": 611396
+    },
+    {
+      "archive_path": "target/local-resume/retained-roots/unknown3-repo",
+      "entries": [
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".aethyme",
+          "size_bytes": 192,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".git",
+          "size_bytes": 288,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0644",
+          "path": "inventory.json",
+          "sha256": "e87aea1393f34dec60c7fcc79288dbc73148a1588598c686c131759ce39d00e4",
+          "size_bytes": 297,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0644",
+          "path": "one.txt",
+          "sha256": "f34848ca92665c342abd5816c9e3eda0e82180671195362bcd0080544a3bc2ac",
+          "size_bytes": 5,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0644",
+          "path": "two.txt",
+          "sha256": "c0cde77fa8fef97d476c10aad3d2d54fcc2f336140d073651c2dcccf1e379fd6",
+          "size_bytes": 2,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0644",
+          "path": ".aethyme/broker.db",
+          "sha256": "ab0ac18842d2ade159b582aec9d71386ec6987a470d706ce2c3665ef42c7a8e9",
+          "size_bytes": 598016,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".aethyme/locks",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".aethyme/logs",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".aethyme/run",
+          "size_bytes": 128,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".aethyme/locks/operations",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0644",
+          "path": ".aethyme/locks/operations/29e5e6968c57028d.lock",
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "size_bytes": 0,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".aethyme/logs/gates",
+          "size_bytes": 64,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".aethyme/run/gates",
+          "size_bytes": 64,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".aethyme/run/operations",
+          "size_bytes": 64,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0644",
+          "path": ".git/COMMIT_EDITMSG",
+          "sha256": "675e8a2b6337b761fb6492c2c5d50d56fc11a4796e02b26d09f1887e1b612a1a",
+          "size_bytes": 42,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0644",
+          "path": ".git/HEAD",
+          "sha256": "ee75c4a2366966f7e8478ff1253b45e4f0294decf71986a68688753d0bd5136c",
+          "size_bytes": 18,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0644",
+          "path": ".git/config",
+          "sha256": "75887695705f6a4ab349fa6bb529bfc796f39c006fba39d11e02be36475b9769",
+          "size_bytes": 293,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0644",
+          "path": ".git/index",
+          "sha256": "22e0ec55e1a7f7a7e22cc08427654493cb337e7cab6ca9cd5e9243d6419d45c0",
+          "size_bytes": 289,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".git/logs",
+          "size_bytes": 128,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".git/objects",
+          "size_bytes": 544,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".git/refs",
+          "size_bytes": 160,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".git/objects/07",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".git/objects/12",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".git/objects/22",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".git/objects/28",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".git/objects/40",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".git/objects/47",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".git/objects/48",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".git/objects/63",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".git/objects/8d",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".git/objects/cd",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".git/objects/dd",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".git/objects/df",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".git/objects/f7",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".git/objects/info",
+          "size_bytes": 64,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".git/objects/pack",
+          "size_bytes": 64,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0444",
+          "path": ".git/objects/df/967b96a579e45a18b8251732d16804b2e56a55",
+          "sha256": "a68879a026ee9eaa8c8eeb0826d1bb255a36e9bb38c76b3e42d892b22d0c4728",
+          "size_bytes": 20,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0444",
+          "path": ".git/objects/28/a99543a5d9df30628ae9775ddc3e14943ec1f4",
+          "sha256": "d476625c3085511bea621be944d211451ba11f756134de7adc3f126457154283",
+          "size_bytes": 52,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0444",
+          "path": ".git/objects/07/bfacd0e2ae9fb55dd2d2627600c8750834b138",
+          "sha256": "eea5b98f229bae50ba1f614c6542252941cf163b11e45357cc06a757f82cbd42",
+          "size_bytes": 179,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0444",
+          "path": ".git/objects/63/43011748ab22a07bb58b4c7f5b869fc8838276",
+          "sha256": "4a4d93ba8bdc6614c3932c87802846c47f8c7835a37588598097c2a38bb487e0",
+          "size_bytes": 119,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0444",
+          "path": ".git/objects/dd/a6bb2609a886f87a490208a96e12e0a615c13f",
+          "sha256": "5f24263281b868a401cee07df6ff745e08c34ea484d4760a2105daf6e7968e7c",
+          "size_bytes": 150,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0444",
+          "path": ".git/objects/cd/72316f8ba5e502e169cfd4ac718717ba1648cb",
+          "sha256": "2d45e5c325c8cda558511f9b4f5458fab0d4d6cc3e44542a63c60e81d60ee774",
+          "size_bytes": 170,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0444",
+          "path": ".git/objects/f7/0f10e4db19068f79bc43844b49f3eece45c4e8",
+          "sha256": "aeec381e4fccbd06e0b45af0e39dcaba9f8987e8687960151a95eda09a2a45b3",
+          "size_bytes": 17,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0444",
+          "path": ".git/objects/48/005decab759667b2f000cfad18f4dbcca2494a",
+          "sha256": "92e65ad93028cfb92875fab201d67f2bcf14b34554b3000c05248016612a1781",
+          "size_bytes": 151,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0444",
+          "path": ".git/objects/8d/7f3c3b6b230b7a9425a10b49d8ad5dca912d81",
+          "sha256": "7886713681f1fef492f0749c5f1a53f27990fa9e101f2cf22bb4ccdb641ce9ce",
+          "size_bytes": 123,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0444",
+          "path": ".git/objects/12/e3140b82c3cdc9336fe389f9a6ceba63f474cb",
+          "sha256": "b22e60dc0351bd2cdf0996d704328c88e758afc89de5b610b33b6f122de6312a",
+          "size_bytes": 231,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0444",
+          "path": ".git/objects/40/1c3474aded6b913f22fbe070e733f883b389bb",
+          "sha256": "d6eade7589807878f4a81148b99d4ddc19b85a03a69b90de0eabf24d74e2c101",
+          "size_bytes": 80,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0444",
+          "path": ".git/objects/47/12a345780702b88d8aece2a47a1fa9fa55175f",
+          "sha256": "0c3c0ac3905b72fb1eab0e9fb1563230cf2ca6bb31292200c11eeac44d75a805",
+          "size_bytes": 52,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0444",
+          "path": ".git/objects/22/3b7836fb19fdf64ba2d3cd6173c6a283141f78",
+          "sha256": "c54b0eb094e130597fac4e314277b9140cdbec5ddb233c18e694e4128b698eaa",
+          "size_bytes": 17,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0644",
+          "path": ".git/logs/HEAD",
+          "sha256": "65aa1735005f917a47e0e6de54c5387fae94b2bcca9804a7addf3c0425046bdb",
+          "size_bytes": 790,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".git/logs/refs",
+          "size_bytes": 128,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".git/logs/refs/heads",
+          "size_bytes": 128,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".git/logs/refs/remotes",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0644",
+          "path": ".git/logs/refs/heads/B",
+          "sha256": "a89fdcfed742dbb9de578ea4cd69600f07264b807883bbb085d99bc96265568e",
+          "size_bytes": 521,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0644",
+          "path": ".git/logs/refs/heads/main",
+          "sha256": "c84bda4648c6244fa5d23eef5e083700c12ab765bec7d6efa75d15228bea6331",
+          "size_bytes": 299,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".git/logs/refs/remotes/controller-accepted",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0644",
+          "path": ".git/logs/refs/remotes/controller-accepted/accepted",
+          "sha256": "e14a1082414c9dcc3b776bde269e44907be7200a0f984bc77eeb1236de6ff2bf",
+          "size_bytes": 148,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".git/refs/heads",
+          "size_bytes": 128,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".git/refs/remotes",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".git/refs/tags",
+          "size_bytes": 64,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0644",
+          "path": ".git/refs/heads/B",
+          "sha256": "011619addbe5ba5d943ea122a385cfe9302fad8c8edeacdb15c0d5da9db6bad1",
+          "size_bytes": 41,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0644",
+          "path": ".git/refs/heads/main",
+          "sha256": "dd7ab99fc9d279d11a8297fbe36f0b01e9857a860eddf1b88e2375ed796793a1",
+          "size_bytes": 41,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".git/refs/remotes/controller-accepted",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0644",
+          "path": ".git/refs/remotes/controller-accepted/accepted",
+          "sha256": "758fa98d6f5dedd0b402dfb76b50b414e19339803bec6993c6af24ad64c989dd",
+          "size_bytes": 41,
+          "uid": 501
+        }
+      ],
+      "entry_count": 64,
+      "label": "unknown3-repo",
+      "original_path": "/var/folders/f2/krjzd4c15nn491pm37zrkp1h0000gn/T/.tmpT5ijmz",
+      "root_metadata": {
+        "gid": 20,
+        "kind": "directory",
+        "mode_octal": "0755",
+        "path": ".",
+        "size_bytes": 224,
+        "uid": 501
+      },
+      "total_file_bytes": 602204
+    },
+    {
+      "archive_path": "target/local-resume/retained-roots/unknown3-receiver",
+      "entries": [
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0644",
+          "path": "HEAD",
+          "sha256": "f6f2b945f6c411b02ba3da9c7ace88dcf71b6af65ba2e0d89aa82900042b5a10",
+          "size_bytes": 23,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0644",
+          "path": "config",
+          "sha256": "3c5cc3e72b5473d08433171d50fc687ac3aa2a6a3f4c20b97f5b66f581b0fec9",
+          "size_bytes": 111,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": "hooks",
+          "size_bytes": 192,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": "objects",
+          "size_bytes": 320,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": "refs",
+          "size_bytes": 128,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": "objects/28",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": "objects/47",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": "objects/8d",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": "objects/cd",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": "objects/df",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": "objects/f7",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": "objects/info",
+          "size_bytes": 64,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": "objects/pack",
+          "size_bytes": 64,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0444",
+          "path": "objects/df/967b96a579e45a18b8251732d16804b2e56a55",
+          "sha256": "a68879a026ee9eaa8c8eeb0826d1bb255a36e9bb38c76b3e42d892b22d0c4728",
+          "size_bytes": 20,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0444",
+          "path": "objects/28/a99543a5d9df30628ae9775ddc3e14943ec1f4",
+          "sha256": "d476625c3085511bea621be944d211451ba11f756134de7adc3f126457154283",
+          "size_bytes": 52,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0444",
+          "path": "objects/cd/72316f8ba5e502e169cfd4ac718717ba1648cb",
+          "sha256": "2d45e5c325c8cda558511f9b4f5458fab0d4d6cc3e44542a63c60e81d60ee774",
+          "size_bytes": 170,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0444",
+          "path": "objects/f7/0f10e4db19068f79bc43844b49f3eece45c4e8",
+          "sha256": "aeec381e4fccbd06e0b45af0e39dcaba9f8987e8687960151a95eda09a2a45b3",
+          "size_bytes": 17,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0444",
+          "path": "objects/8d/7f3c3b6b230b7a9425a10b49d8ad5dca912d81",
+          "sha256": "7886713681f1fef492f0749c5f1a53f27990fa9e101f2cf22bb4ccdb641ce9ce",
+          "size_bytes": 123,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0444",
+          "path": "objects/47/12a345780702b88d8aece2a47a1fa9fa55175f",
+          "sha256": "0c3c0ac3905b72fb1eab0e9fb1563230cf2ca6bb31292200c11eeac44d75a805",
+          "size_bytes": 52,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0700",
+          "path": "hooks/post-receive",
+          "sha256": "56033b9643d64fab695f3a9134c6e4c95be73f951ec4ea2905decf9adad04212",
+          "size_bytes": 492,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0644",
+          "path": "hooks/post-receive-finished",
+          "sha256": "6a4e30657ce2ef3df34c2c224cdb368c9279e48b1978c48dfbb7c6aea9a13b72",
+          "size_bytes": 32,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0644",
+          "path": "hooks/post-receive-record",
+          "sha256": "3235122c30ea60fd789619726f0b64842134b1bb3a785bc85a97c6662e2d4326",
+          "size_bytes": 102,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0644",
+          "path": "hooks/post-receive-started",
+          "sha256": "6a4e30657ce2ef3df34c2c224cdb368c9279e48b1978c48dfbb7c6aea9a13b72",
+          "size_bytes": 32,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": "refs/heads",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": "refs/tags",
+          "size_bytes": 64,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0644",
+          "path": "refs/heads/accepted",
+          "sha256": "98a65e5864c3df918d18a999e13e6407a793d4fd15e38f72a91382a33befd057",
+          "size_bytes": 41,
+          "uid": 501
+        }
+      ],
+      "entry_count": 26,
+      "label": "unknown3-receiver",
+      "original_path": "/var/folders/f2/krjzd4c15nn491pm37zrkp1h0000gn/T/.tmpP239DH",
+      "root_metadata": {
+        "gid": 20,
+        "kind": "directory",
+        "mode_octal": "0755",
+        "path": ".",
+        "size_bytes": 224,
+        "uid": 501
+      },
+      "total_file_bytes": 1267
+    },
+    {
+      "archive_path": "target/local-resume/retained-roots/fx17-attempt1-host",
+      "entries": [
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0700",
+          "path": "collaboration",
+          "size_bytes": 160,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0644",
+          "path": "fx17-report.json",
+          "sha256": "cfb6493750718d9cc92f90c5c32db5201a10194063b17c2051740de4c50d0d78",
+          "size_bytes": 16183,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0644",
+          "path": "source.index",
+          "sha256": "8e25258ca7bafc9e62c01315fd60959ef6c057e419c49e037cbe4c64d539fe69",
+          "size_bytes": 258,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0600",
+          "path": "collaboration/.aethyme-collaboration-root.json",
+          "sha256": "6d3f0653f5b51646a33dce2c1d5663a408356cbebf5fce35fcc3b790a32c4dc2",
+          "size_bytes": 204,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0700",
+          "path": "collaboration/.local-authority",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0700",
+          "path": "collaboration/fx17-controlled",
+          "size_bytes": 224,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0700",
+          "path": "collaboration/.local-authority/fx17-controlled",
+          "size_bytes": 128,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0644",
+          "path": "collaboration/.local-authority/fx17-controlled/ingress.lock",
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "size_bytes": 0,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0600",
+          "path": "collaboration/.local-authority/fx17-controlled/witness.json",
+          "sha256": "ae7383a8aedfd9723e7bac0d4c543c4c59f50153c95beb77cca19090159eab81",
+          "size_bytes": 145,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0700",
+          "path": "collaboration/fx17-controlled/controller-locks",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0700",
+          "path": "collaboration/fx17-controlled/objects",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0700",
+          "path": "collaboration/fx17-controlled/spool",
+          "size_bytes": 128,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0600",
+          "path": "collaboration/fx17-controlled/state.db",
+          "sha256": "f6268e607075118a6e693151925b276d5dd3e0074120b870334736f2826fbd28",
+          "size_bytes": 606208,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0700",
+          "path": "collaboration/fx17-controlled/verifier-authority",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0644",
+          "path": "collaboration/fx17-controlled/controller-locks/d507239aec65f11e64f1a0462608661cea93609adaab0413d27e607e4aeaae2c.lock",
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "size_bytes": 0,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0700",
+          "path": "collaboration/fx17-controlled/spool/archive",
+          "size_bytes": 64,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0644",
+          "path": "collaboration/fx17-controlled/spool/gc.lock",
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "size_bytes": 0,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0700",
+          "path": "collaboration/fx17-controlled/objects/sha256",
+          "size_bytes": 640,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0700",
+          "path": "collaboration/fx17-controlled/objects/sha256/1f",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0700",
+          "path": "collaboration/fx17-controlled/objects/sha256/30",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0700",
+          "path": "collaboration/fx17-controlled/objects/sha256/3c",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0700",
+          "path": "collaboration/fx17-controlled/objects/sha256/41",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0700",
+          "path": "collaboration/fx17-controlled/objects/sha256/47",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0700",
+          "path": "collaboration/fx17-controlled/objects/sha256/60",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0700",
+          "path": "collaboration/fx17-controlled/objects/sha256/61",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0700",
+          "path": "collaboration/fx17-controlled/objects/sha256/6d",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0700",
+          "path": "collaboration/fx17-controlled/objects/sha256/77",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0700",
+          "path": "collaboration/fx17-controlled/objects/sha256/7b",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0700",
+          "path": "collaboration/fx17-controlled/objects/sha256/86",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0700",
+          "path": "collaboration/fx17-controlled/objects/sha256/8b",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0700",
+          "path": "collaboration/fx17-controlled/objects/sha256/8e",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0700",
+          "path": "collaboration/fx17-controlled/objects/sha256/a5",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0700",
+          "path": "collaboration/fx17-controlled/objects/sha256/d0",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0700",
+          "path": "collaboration/fx17-controlled/objects/sha256/e9",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0700",
+          "path": "collaboration/fx17-controlled/objects/sha256/ea",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0700",
+          "path": "collaboration/fx17-controlled/objects/sha256/f8",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0600",
+          "path": "collaboration/fx17-controlled/objects/sha256/61/668517a420f504931195bda239ad1a68a6b6d1f5631e069e9d6305583d2356",
+          "sha256": "61668517a420f504931195bda239ad1a68a6b6d1f5631e069e9d6305583d2356",
+          "size_bytes": 284,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0600",
+          "path": "collaboration/fx17-controlled/objects/sha256/3c/84a35fb64b21eff1d35a64450b6a7a4e7e219478a84f5b33b7b98e4f033e4b",
+          "sha256": "3c84a35fb64b21eff1d35a64450b6a7a4e7e219478a84f5b33b7b98e4f033e4b",
+          "size_bytes": 195,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0600",
+          "path": "collaboration/fx17-controlled/objects/sha256/60/f48c6f1c70fb6bc23b59345d39f7a6af3972f307b7074f7d7ebf43771e9596",
+          "sha256": "60f48c6f1c70fb6bc23b59345d39f7a6af3972f307b7074f7d7ebf43771e9596",
+          "size_bytes": 385,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0600",
+          "path": "collaboration/fx17-controlled/objects/sha256/d0/23e134421c3bbaf089f433107437c221c3ede70f590e650cb99e99dccedbca",
+          "sha256": "d023e134421c3bbaf089f433107437c221c3ede70f590e650cb99e99dccedbca",
+          "size_bytes": 4386,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0600",
+          "path": "collaboration/fx17-controlled/objects/sha256/a5/0e9e4d4bf9242d5a836f42b2f45eb9a99f5670e2a44b36ed1dcd8a7a17010a",
+          "sha256": "a50e9e4d4bf9242d5a836f42b2f45eb9a99f5670e2a44b36ed1dcd8a7a17010a",
+          "size_bytes": 283,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0600",
+          "path": "collaboration/fx17-controlled/objects/sha256/1f/95db4dec334df25ee9310eeb00895ffe495fc373efa0869a390a33ff3eddbc",
+          "sha256": "1f95db4dec334df25ee9310eeb00895ffe495fc373efa0869a390a33ff3eddbc",
+          "size_bytes": 198,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0600",
+          "path": "collaboration/fx17-controlled/objects/sha256/7b/6227a10150b5c9c575412043c85173a15ac2288cf10d5d1920046ecd761b6c",
+          "sha256": "7b6227a10150b5c9c575412043c85173a15ac2288cf10d5d1920046ecd761b6c",
+          "size_bytes": 283,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0600",
+          "path": "collaboration/fx17-controlled/objects/sha256/86/2f6526003ade49c7e80bb43e65147fb46e4b684febf3141634ba07119d1aed",
+          "sha256": "862f6526003ade49c7e80bb43e65147fb46e4b684febf3141634ba07119d1aed",
+          "size_bytes": 963,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0600",
+          "path": "collaboration/fx17-controlled/objects/sha256/30/cc18baf9ff60b81cd5fe797a1eeedcb515a54adb58468ad5c8ce393532c274",
+          "sha256": "30cc18baf9ff60b81cd5fe797a1eeedcb515a54adb58468ad5c8ce393532c274",
+          "size_bytes": 4791,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0600",
+          "path": "collaboration/fx17-controlled/objects/sha256/6d/5b4544c1917466df05bac2b622b8694962860486123d1b62752b02b0b03f40",
+          "sha256": "6d5b4544c1917466df05bac2b622b8694962860486123d1b62752b02b0b03f40",
+          "size_bytes": 198,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0600",
+          "path": "collaboration/fx17-controlled/objects/sha256/ea/e502e3245a6cb750d64828063e793732cfa3a8481f8ff6753dcacad63ee2ff",
+          "sha256": "eae502e3245a6cb750d64828063e793732cfa3a8481f8ff6753dcacad63ee2ff",
+          "size_bytes": 3097,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0600",
+          "path": "collaboration/fx17-controlled/objects/sha256/e9/254f7c699cc4c571584ef5a3e2425f287f6e979eeace9860bf01b8ee852cd6",
+          "sha256": "e9254f7c699cc4c571584ef5a3e2425f287f6e979eeace9860bf01b8ee852cd6",
+          "size_bytes": 129,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0600",
+          "path": "collaboration/fx17-controlled/objects/sha256/f8/7b8d7fca43b8301b447e127cc8cae7c1b1567ad68b0301b4edeb32fbf1f163",
+          "sha256": "f87b8d7fca43b8301b447e127cc8cae7c1b1567ad68b0301b4edeb32fbf1f163",
+          "size_bytes": 3757,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0600",
+          "path": "collaboration/fx17-controlled/objects/sha256/41/ace586574db137e9b00557379535b995c2cb8d85e13373f5cea36afefb1bdc",
+          "sha256": "41ace586574db137e9b00557379535b995c2cb8d85e13373f5cea36afefb1bdc",
+          "size_bytes": 1270,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0600",
+          "path": "collaboration/fx17-controlled/objects/sha256/77/a255e12c57d5c447c56044a59f83843f64bf2a9c4053be2dfc39aa321cdf87",
+          "sha256": "77a255e12c57d5c447c56044a59f83843f64bf2a9c4053be2dfc39aa321cdf87",
+          "size_bytes": 484,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0600",
+          "path": "collaboration/fx17-controlled/objects/sha256/47/138d438d5d64f05bd46840844bca8099da370a5dad71b8974e07fc3ae7aa6b",
+          "sha256": "47138d438d5d64f05bd46840844bca8099da370a5dad71b8974e07fc3ae7aa6b",
+          "size_bytes": 484,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0600",
+          "path": "collaboration/fx17-controlled/objects/sha256/8b/4b5728e2fef2a469dc6e2cb60454e162e69002e7eede7429d9dc5f1f78fe74",
+          "sha256": "8b4b5728e2fef2a469dc6e2cb60454e162e69002e7eede7429d9dc5f1f78fe74",
+          "size_bytes": 283,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0600",
+          "path": "collaboration/fx17-controlled/objects/sha256/8e/0aca2ea97a4237b77022699aa5fd9676015d1add775898cb4ba17d00b65d50",
+          "sha256": "8e0aca2ea97a4237b77022699aa5fd9676015d1add775898cb4ba17d00b65d50",
+          "size_bytes": 317,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0600",
+          "path": "collaboration/fx17-controlled/verifier-authority/360d02004d4fc4052a13a2c7f81366615933f8ecc7d800f4f460870d06e4e6c4.lock",
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "size_bytes": 0,
+          "uid": 501
+        }
+      ],
+      "entry_count": 55,
+      "label": "fx17-attempt1-host",
+      "original_path": "/var/folders/f2/krjzd4c15nn491pm37zrkp1h0000gn/T/.tmp3Ds4QO",
+      "root_metadata": {
+        "gid": 20,
+        "kind": "directory",
+        "mode_octal": "0755",
+        "path": ".",
+        "size_bytes": 160,
+        "uid": 501
+      },
+      "total_file_bytes": 644785
+    },
+    {
+      "archive_path": "target/local-resume/retained-roots/fx17-attempt1-source",
+      "entries": [
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".aethyme",
+          "size_bytes": 192,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".git",
+          "size_bytes": 384,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0644",
+          "path": "app.sh",
+          "sha256": "47138d438d5d64f05bd46840844bca8099da370a5dad71b8974e07fc3ae7aa6b",
+          "size_bytes": 484,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0644",
+          "path": ".aethyme/broker.db",
+          "sha256": "9fb41873af2f37ca3f6d9e81112a6fcf1c97478dae50e6f75bde9a6a454b94c1",
+          "size_bytes": 589824,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0644",
+          "path": ".aethyme/gates.toml",
+          "sha256": "e9254f7c699cc4c571584ef5a3e2425f287f6e979eeace9860bf01b8ee852cd6",
+          "size_bytes": 129,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".aethyme/logs",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".aethyme/run",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".aethyme/logs/gates",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0644",
+          "path": ".aethyme/logs/gates/fx17-source-shape-7dd4c553-p24816-fx17-source-shape.log",
+          "sha256": "a469c33f85a96f283ba557d34ca07011a42dbeeea14239b3265b5aab03b24f87",
+          "size_bytes": 478,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".aethyme/run/gates",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".aethyme/run/gates/owners",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0644",
+          "path": ".aethyme/run/gates/owners/fx17-source-shape-all-e57816ee8ea0a428.lock",
+          "sha256": "33f38e27c8e7e5f0e0cf14da4c745e185f3f1b598ac604fcd1de89b6e609b4ab",
+          "size_bytes": 44,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0644",
+          "path": ".git/COMMIT_EDITMSG",
+          "sha256": "54088fade0e13b74a20122a08e3a3f3fdd15da44b0062e5fd692ca4b7252e637",
+          "size_bytes": 30,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0644",
+          "path": ".git/HEAD",
+          "sha256": "28d25bf82af4c0e2b72f50959b2beb859e3e60b9630a5e8c603dad4ddb2b6e80",
+          "size_bytes": 21,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0644",
+          "path": ".git/config",
+          "sha256": "6574ea0a9d5495fdafc78a2d74fdc742272709762d195918ec31bf8b2cfba45f",
+          "size_bytes": 281,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0644",
+          "path": ".git/description",
+          "sha256": "85ab6c163d43a17ea9cf7788308bca1466f1b0a8d1cc92e26e9bf63da4062aee",
+          "size_bytes": 73,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".git/hooks",
+          "size_bytes": 512,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0644",
+          "path": ".git/index",
+          "sha256": "19d76dd0cc6a43990942e4bc85e6b979c226f4aa24e46fb79fda76be2a3c0bcb",
+          "size_bytes": 258,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".git/info",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".git/logs",
+          "size_bytes": 128,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".git/objects",
+          "size_bytes": 416,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".git/refs",
+          "size_bytes": 160,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".git/objects/10",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".git/objects/27",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".git/objects/45",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".git/objects/4b",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".git/objects/50",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".git/objects/52",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".git/objects/6e",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".git/objects/7d",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".git/objects/f6",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".git/objects/info",
+          "size_bytes": 64,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".git/objects/pack",
+          "size_bytes": 64,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0444",
+          "path": ".git/objects/50/692920bfe007100e4edc3c60a5dd2f22cb2329",
+          "sha256": "e75cc95625f562105dce5c1abea5740f2cdb0df704f4a5bf92d588c15b43089b",
+          "size_bytes": 143,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0444",
+          "path": ".git/objects/27/c1b9ac90e72dd1466e83dbc7649080fafcf097",
+          "sha256": "56d779db1881a427de23035776bbb16830060698b95f3124c96b733f2916f37d",
+          "size_bytes": 252,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0444",
+          "path": ".git/objects/4b/ea8b30bbb55bbfd894789f935e1bf1baeb1643",
+          "sha256": "6dd71361bf7c84a223c9d114b7dc54083dbc9e1ef6555352e0eb5ca757f3b5dd",
+          "size_bytes": 253,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0444",
+          "path": ".git/objects/7d/d4c553980d0ede652f19f18cd672f7f372c2ef",
+          "sha256": "fff1059302be46b28b44506e4f38a17b9de0b45ad4e8824fe9c7e69582d7e7dc",
+          "size_bytes": 86,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0444",
+          "path": ".git/objects/45/7a7efac24c8b1bdbdb37599adab610524f24e1",
+          "sha256": "7bd1947b011216198bbdc55d13131f07846e5f45b657d6ac99c5ced25618a517",
+          "size_bytes": 85,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0444",
+          "path": ".git/objects/10/8d66b5782fddc73db1b4a9695e5e557692586f",
+          "sha256": "ef0b9419662e345dd061823ced2d427a2acb5fcb86d85f4e7ad7518a28ce1ee5",
+          "size_bytes": 54,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0444",
+          "path": ".git/objects/6e/f734516fc8a9d52a26d0c886d5215a1fad4466",
+          "sha256": "8a26fb32921e6b788776ca47130d86d16d5243d4108a7322286e228377fad468",
+          "size_bytes": 164,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0444",
+          "path": ".git/objects/52/e27f9a098dced24a5d7d36852fa6cc81934c0b",
+          "sha256": "096194dd2cb78ba62cdd9163fecc9ca5fdc52334922d96ac3beb0f8a19af6fd9",
+          "size_bytes": 170,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0444",
+          "path": ".git/objects/f6/274ce75e06140ef219152a0b0762805a8ca68c",
+          "sha256": "dc99f2ea2aedd5952325d311e1261b214dd221dab2248129e4579fc4d763ee7c",
+          "size_bytes": 132,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0644",
+          "path": ".git/info/exclude",
+          "sha256": "6671fe83b7a07c8932ee89164d1f2793b2318058eb8b98dc5c06ee0a5a3b0ec1",
+          "size_bytes": 240,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0644",
+          "path": ".git/logs/HEAD",
+          "sha256": "f82b892f0c3f0d832d7bb0e56827fad4797c37aa2e5370552e236018ce20ea1f",
+          "size_bytes": 183,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".git/logs/refs",
+          "size_bytes": 128,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".git/logs/refs/heads",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".git/logs/refs/remotes",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0644",
+          "path": ".git/logs/refs/heads/main",
+          "sha256": "f82b892f0c3f0d832d7bb0e56827fad4797c37aa2e5370552e236018ce20ea1f",
+          "size_bytes": 183,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".git/logs/refs/remotes/fx17-accepted",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0644",
+          "path": ".git/logs/refs/remotes/fx17-accepted/accepted",
+          "sha256": "40ae708475626c011535f87df897b9dae0b9e849308e982d0bf1d85f42faad18",
+          "size_bytes": 150,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0755",
+          "path": ".git/hooks/applypatch-msg.sample",
+          "sha256": "0223497a0b8b033aa58a3a521b8629869386cf7ab0e2f101963d328aa62193f7",
+          "size_bytes": 478,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0755",
+          "path": ".git/hooks/commit-msg.sample",
+          "sha256": "efc1401b0e99d1ff51494d154d98b46c1e99059bcd8bf9f73cecde19fd3eb23b",
+          "size_bytes": 1972,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0755",
+          "path": ".git/hooks/fsmonitor-watchman.sample",
+          "sha256": "9159720099ad5595b8e66645cbfd47763c1e920f46e0b50ae75e642bbec57ef0",
+          "size_bytes": 4611,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0755",
+          "path": ".git/hooks/post-update.sample",
+          "sha256": "81765af2daef323061dcbc5e61fc16481cb74b3bac9ad8a174b186523586f6c5",
+          "size_bytes": 189,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0755",
+          "path": ".git/hooks/pre-applypatch.sample",
+          "sha256": "e15c5b469ea3e0a695bea6f2c82bcf8e62821074939ddd85b77e0007ff165475",
+          "size_bytes": 424,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0755",
+          "path": ".git/hooks/pre-commit.sample",
+          "sha256": "57185b7b9f05239d7ab52db045f5b89eb31348d7b2177eab214f5eb872e1971b",
+          "size_bytes": 1649,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0755",
+          "path": ".git/hooks/pre-merge-commit.sample",
+          "sha256": "d3825a70337940ebbd0a5c072984e13245920cdf8898bd225c8d27a6dfc9cb53",
+          "size_bytes": 416,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0755",
+          "path": ".git/hooks/pre-push.sample",
+          "sha256": "ecce9c7e04d3f5dd9d8ada81753dd1d549a9634b26770042b58dda00217d086a",
+          "size_bytes": 1374,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0755",
+          "path": ".git/hooks/pre-rebase.sample",
+          "sha256": "4febce867790052338076f4e66cc47efb14879d18097d1d61c8261859eaaa7b3",
+          "size_bytes": 4898,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0755",
+          "path": ".git/hooks/pre-receive.sample",
+          "sha256": "a4c3d2b9c7bb3fd8d1441c31bd4ee71a595d66b44fcf49ddb310252320169989",
+          "size_bytes": 544,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0755",
+          "path": ".git/hooks/prepare-commit-msg.sample",
+          "sha256": "e9ddcaa4189fddd25ed97fc8c789eca7b6ca16390b2392ae3276f0c8e1aa4619",
+          "size_bytes": 1492,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0755",
+          "path": ".git/hooks/push-to-checkout.sample",
+          "sha256": "a53d0741798b287c6dd7afa64aee473f305e65d3f49463bb9d7408ec3b12bf5f",
+          "size_bytes": 2783,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0755",
+          "path": ".git/hooks/sendemail-validate.sample",
+          "sha256": "44ebfc923dc5466bc009602f0ecf067b9c65459abfe8868ddc49b78e6ced7a92",
+          "size_bytes": 2308,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0755",
+          "path": ".git/hooks/update.sample",
+          "sha256": "8d5f2fa83e103cf08b57eaa67521df9194f45cbdbcb37da52ad586097a14d106",
+          "size_bytes": 3650,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".git/refs/heads",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".git/refs/remotes",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".git/refs/tags",
+          "size_bytes": 64,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0644",
+          "path": ".git/refs/heads/main",
+          "sha256": "50c26507ec0e8cae734dfd3c28beb63d4397d17d17f883305ac88114e89edc46",
+          "size_bytes": 41,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".git/refs/remotes/fx17-accepted",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0644",
+          "path": ".git/refs/remotes/fx17-accepted/accepted",
+          "sha256": "50c26507ec0e8cae734dfd3c28beb63d4397d17d17f883305ac88114e89edc46",
+          "size_bytes": 41,
+          "uid": 501
+        }
+      ],
+      "entry_count": 70,
+      "label": "fx17-attempt1-source",
+      "original_path": "/var/folders/f2/krjzd4c15nn491pm37zrkp1h0000gn/T/.tmpNDk5uI",
+      "root_metadata": {
+        "gid": 20,
+        "kind": "directory",
+        "mode_octal": "0755",
+        "path": ".",
+        "size_bytes": 160,
+        "uid": 501
+      },
+      "total_file_bytes": 620587
+    },
+    {
+      "archive_path": "target/local-resume/retained-roots/fx17-attempt1-harness",
+      "entries": [
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".git",
+          "size_bytes": 384,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0644",
+          "path": "inventory.json",
+          "sha256": "8e0aca2ea97a4237b77022699aa5fd9676015d1add775898cb4ba17d00b65d50",
+          "size_bytes": 317,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0644",
+          "path": "proxy.sh",
+          "sha256": "eae502e3245a6cb750d64828063e793732cfa3a8481f8ff6753dcacad63ee2ff",
+          "size_bytes": 3097,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0644",
+          "path": ".git/COMMIT_EDITMSG",
+          "sha256": "1da700314fb80cfd7166efe991661d4a52e2bd03c2749c22624143dc3bc2ba27",
+          "size_bytes": 40,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0644",
+          "path": ".git/HEAD",
+          "sha256": "28d25bf82af4c0e2b72f50959b2beb859e3e60b9630a5e8c603dad4ddb2b6e80",
+          "size_bytes": 21,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0644",
+          "path": ".git/config",
+          "sha256": "cae33efdb02cf774435c1ff9cb16bcc1014606908530c6e1dc727615fe3e8cda",
+          "size_bytes": 137,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0644",
+          "path": ".git/description",
+          "sha256": "85ab6c163d43a17ea9cf7788308bca1466f1b0a8d1cc92e26e9bf63da4062aee",
+          "size_bytes": 73,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".git/hooks",
+          "size_bytes": 512,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0644",
+          "path": ".git/index",
+          "sha256": "e39e99020dfc2121123369441b23ae674b3d6e343fa9a1f37a1f99ab511afc49",
+          "size_bytes": 217,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".git/info",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".git/logs",
+          "size_bytes": 128,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".git/objects",
+          "size_bytes": 256,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".git/refs",
+          "size_bytes": 128,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".git/objects/4e",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".git/objects/59",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".git/objects/e0",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".git/objects/f5",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".git/objects/info",
+          "size_bytes": 64,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".git/objects/pack",
+          "size_bytes": 64,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0444",
+          "path": ".git/objects/59/a91ee8886705391f727f4d05d04f8f22fa32c7",
+          "sha256": "39085b7746ba138b86df0734d49a163a892bad4dc63828fc0e46aa1b5323cb2c",
+          "size_bytes": 246,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0444",
+          "path": ".git/objects/f5/de75c1091c55b7b8dd850f8b016eb2ff6d8577",
+          "sha256": "c9d509b0e84390b6744a26e97599e3659b196515ab0fc6bd65902ba730a1aac8",
+          "size_bytes": 1158,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0444",
+          "path": ".git/objects/4e/6cdf05f3b61fbac15cfa42952091abcbf37ac0",
+          "sha256": "e82f2e30be89641de861a36f985599f97aea49d2ca523e4ec39fae73aa9800f7",
+          "size_bytes": 150,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0444",
+          "path": ".git/objects/e0/8782a8db9928ad6ccfc2f37db3ce85cbe8560f",
+          "sha256": "f6c775f5c410cc6dfbd9586ad57a1390085d1acc70484de0a49ef3b2cdcbd842",
+          "size_bytes": 90,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0644",
+          "path": ".git/info/exclude",
+          "sha256": "6671fe83b7a07c8932ee89164d1f2793b2318058eb8b98dc5c06ee0a5a3b0ec1",
+          "size_bytes": 240,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0644",
+          "path": ".git/logs/HEAD",
+          "sha256": "dd930f4a039bdffe8b33a628b8926c1c99a098705ee5f717f04ebfc94d8baae2",
+          "size_bytes": 193,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".git/logs/refs",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".git/logs/refs/heads",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0644",
+          "path": ".git/logs/refs/heads/main",
+          "sha256": "dd930f4a039bdffe8b33a628b8926c1c99a098705ee5f717f04ebfc94d8baae2",
+          "size_bytes": 193,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0755",
+          "path": ".git/hooks/applypatch-msg.sample",
+          "sha256": "0223497a0b8b033aa58a3a521b8629869386cf7ab0e2f101963d328aa62193f7",
+          "size_bytes": 478,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0755",
+          "path": ".git/hooks/commit-msg.sample",
+          "sha256": "efc1401b0e99d1ff51494d154d98b46c1e99059bcd8bf9f73cecde19fd3eb23b",
+          "size_bytes": 1972,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0755",
+          "path": ".git/hooks/fsmonitor-watchman.sample",
+          "sha256": "9159720099ad5595b8e66645cbfd47763c1e920f46e0b50ae75e642bbec57ef0",
+          "size_bytes": 4611,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0755",
+          "path": ".git/hooks/post-update.sample",
+          "sha256": "81765af2daef323061dcbc5e61fc16481cb74b3bac9ad8a174b186523586f6c5",
+          "size_bytes": 189,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0755",
+          "path": ".git/hooks/pre-applypatch.sample",
+          "sha256": "e15c5b469ea3e0a695bea6f2c82bcf8e62821074939ddd85b77e0007ff165475",
+          "size_bytes": 424,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0755",
+          "path": ".git/hooks/pre-commit.sample",
+          "sha256": "57185b7b9f05239d7ab52db045f5b89eb31348d7b2177eab214f5eb872e1971b",
+          "size_bytes": 1649,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0755",
+          "path": ".git/hooks/pre-merge-commit.sample",
+          "sha256": "d3825a70337940ebbd0a5c072984e13245920cdf8898bd225c8d27a6dfc9cb53",
+          "size_bytes": 416,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0755",
+          "path": ".git/hooks/pre-push.sample",
+          "sha256": "ecce9c7e04d3f5dd9d8ada81753dd1d549a9634b26770042b58dda00217d086a",
+          "size_bytes": 1374,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0755",
+          "path": ".git/hooks/pre-rebase.sample",
+          "sha256": "4febce867790052338076f4e66cc47efb14879d18097d1d61c8261859eaaa7b3",
+          "size_bytes": 4898,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0755",
+          "path": ".git/hooks/pre-receive.sample",
+          "sha256": "a4c3d2b9c7bb3fd8d1441c31bd4ee71a595d66b44fcf49ddb310252320169989",
+          "size_bytes": 544,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0755",
+          "path": ".git/hooks/prepare-commit-msg.sample",
+          "sha256": "e9ddcaa4189fddd25ed97fc8c789eca7b6ca16390b2392ae3276f0c8e1aa4619",
+          "size_bytes": 1492,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0755",
+          "path": ".git/hooks/push-to-checkout.sample",
+          "sha256": "a53d0741798b287c6dd7afa64aee473f305e65d3f49463bb9d7408ec3b12bf5f",
+          "size_bytes": 2783,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0755",
+          "path": ".git/hooks/sendemail-validate.sample",
+          "sha256": "44ebfc923dc5466bc009602f0ecf067b9c65459abfe8868ddc49b78e6ced7a92",
+          "size_bytes": 2308,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0755",
+          "path": ".git/hooks/update.sample",
+          "sha256": "8d5f2fa83e103cf08b57eaa67521df9194f45cbdbcb37da52ad586097a14d106",
+          "size_bytes": 3650,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".git/refs/heads",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": ".git/refs/tags",
+          "size_bytes": 64,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0644",
+          "path": ".git/refs/heads/main",
+          "sha256": "48dc212fa35511e65652223ce0ce5e15ecc761bfb31f83fbc70ad28a5a388a76",
+          "size_bytes": 41,
+          "uid": 501
+        }
+      ],
+      "entry_count": 45,
+      "label": "fx17-attempt1-harness",
+      "original_path": "/var/folders/f2/krjzd4c15nn491pm37zrkp1h0000gn/T/.tmp2g0V2G",
+      "root_metadata": {
+        "gid": 20,
+        "kind": "directory",
+        "mode_octal": "0755",
+        "path": ".",
+        "size_bytes": 160,
+        "uid": 501
+      },
+      "total_file_bytes": 33001
+    },
+    {
+      "archive_path": "target/local-resume/retained-roots/fx17-attempt1-remote",
+      "entries": [
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0644",
+          "path": "HEAD",
+          "sha256": "5d1e56f51ee4491d7a5812cad2442fb8f7e0f1d17ef4e4a131952a9cf659f46a",
+          "size_bytes": 25,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0644",
+          "path": "config",
+          "sha256": "3c5cc3e72b5473d08433171d50fc687ac3aa2a6a3f4c20b97f5b66f581b0fec9",
+          "size_bytes": 111,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0644",
+          "path": "description",
+          "sha256": "85ab6c163d43a17ea9cf7788308bca1466f1b0a8d1cc92e26e9bf63da4062aee",
+          "size_bytes": 73,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": "hooks",
+          "size_bytes": 512,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": "info",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": "objects",
+          "size_bytes": 288,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": "refs",
+          "size_bytes": 128,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": "objects/10",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": "objects/45",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": "objects/4b",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": "objects/50",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": "objects/f6",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": "objects/info",
+          "size_bytes": 64,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": "objects/pack",
+          "size_bytes": 64,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0444",
+          "path": "objects/50/692920bfe007100e4edc3c60a5dd2f22cb2329",
+          "sha256": "e75cc95625f562105dce5c1abea5740f2cdb0df704f4a5bf92d588c15b43089b",
+          "size_bytes": 143,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0444",
+          "path": "objects/4b/ea8b30bbb55bbfd894789f935e1bf1baeb1643",
+          "sha256": "6dd71361bf7c84a223c9d114b7dc54083dbc9e1ef6555352e0eb5ca757f3b5dd",
+          "size_bytes": 253,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0444",
+          "path": "objects/45/7a7efac24c8b1bdbdb37599adab610524f24e1",
+          "sha256": "7bd1947b011216198bbdc55d13131f07846e5f45b657d6ac99c5ced25618a517",
+          "size_bytes": 85,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0444",
+          "path": "objects/10/8d66b5782fddc73db1b4a9695e5e557692586f",
+          "sha256": "ef0b9419662e345dd061823ced2d427a2acb5fcb86d85f4e7ad7518a28ce1ee5",
+          "size_bytes": 54,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0444",
+          "path": "objects/f6/274ce75e06140ef219152a0b0762805a8ca68c",
+          "sha256": "dc99f2ea2aedd5952325d311e1261b214dd221dab2248129e4579fc4d763ee7c",
+          "size_bytes": 132,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0644",
+          "path": "info/exclude",
+          "sha256": "6671fe83b7a07c8932ee89164d1f2793b2318058eb8b98dc5c06ee0a5a3b0ec1",
+          "size_bytes": 240,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0755",
+          "path": "hooks/applypatch-msg.sample",
+          "sha256": "0223497a0b8b033aa58a3a521b8629869386cf7ab0e2f101963d328aa62193f7",
+          "size_bytes": 478,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0755",
+          "path": "hooks/commit-msg.sample",
+          "sha256": "efc1401b0e99d1ff51494d154d98b46c1e99059bcd8bf9f73cecde19fd3eb23b",
+          "size_bytes": 1972,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0755",
+          "path": "hooks/fsmonitor-watchman.sample",
+          "sha256": "9159720099ad5595b8e66645cbfd47763c1e920f46e0b50ae75e642bbec57ef0",
+          "size_bytes": 4611,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0755",
+          "path": "hooks/post-update.sample",
+          "sha256": "81765af2daef323061dcbc5e61fc16481cb74b3bac9ad8a174b186523586f6c5",
+          "size_bytes": 189,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0755",
+          "path": "hooks/pre-applypatch.sample",
+          "sha256": "e15c5b469ea3e0a695bea6f2c82bcf8e62821074939ddd85b77e0007ff165475",
+          "size_bytes": 424,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0755",
+          "path": "hooks/pre-commit.sample",
+          "sha256": "57185b7b9f05239d7ab52db045f5b89eb31348d7b2177eab214f5eb872e1971b",
+          "size_bytes": 1649,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0755",
+          "path": "hooks/pre-merge-commit.sample",
+          "sha256": "d3825a70337940ebbd0a5c072984e13245920cdf8898bd225c8d27a6dfc9cb53",
+          "size_bytes": 416,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0755",
+          "path": "hooks/pre-push.sample",
+          "sha256": "ecce9c7e04d3f5dd9d8ada81753dd1d549a9634b26770042b58dda00217d086a",
+          "size_bytes": 1374,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0755",
+          "path": "hooks/pre-rebase.sample",
+          "sha256": "4febce867790052338076f4e66cc47efb14879d18097d1d61c8261859eaaa7b3",
+          "size_bytes": 4898,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0755",
+          "path": "hooks/pre-receive.sample",
+          "sha256": "a4c3d2b9c7bb3fd8d1441c31bd4ee71a595d66b44fcf49ddb310252320169989",
+          "size_bytes": 544,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0755",
+          "path": "hooks/prepare-commit-msg.sample",
+          "sha256": "e9ddcaa4189fddd25ed97fc8c789eca7b6ca16390b2392ae3276f0c8e1aa4619",
+          "size_bytes": 1492,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0755",
+          "path": "hooks/push-to-checkout.sample",
+          "sha256": "a53d0741798b287c6dd7afa64aee473f305e65d3f49463bb9d7408ec3b12bf5f",
+          "size_bytes": 2783,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0755",
+          "path": "hooks/sendemail-validate.sample",
+          "sha256": "44ebfc923dc5466bc009602f0ecf067b9c65459abfe8868ddc49b78e6ced7a92",
+          "size_bytes": 2308,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0755",
+          "path": "hooks/update.sample",
+          "sha256": "8d5f2fa83e103cf08b57eaa67521df9194f45cbdbcb37da52ad586097a14d106",
+          "size_bytes": 3650,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": "refs/heads",
+          "size_bytes": 96,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "directory",
+          "mode_octal": "0755",
+          "path": "refs/tags",
+          "size_bytes": 64,
+          "uid": 501
+        },
+        {
+          "gid": 20,
+          "kind": "file",
+          "mode_octal": "0644",
+          "path": "refs/heads/accepted",
+          "sha256": "50c26507ec0e8cae734dfd3c28beb63d4397d17d17f883305ac88114e89edc46",
+          "size_bytes": 41,
+          "uid": 501
+        }
+      ],
+      "entry_count": 37,
+      "label": "fx17-attempt1-remote",
+      "original_path": "/var/folders/f2/krjzd4c15nn491pm37zrkp1h0000gn/T/.tmpy0i5u5",
+      "root_metadata": {
+        "gid": 20,
+        "kind": "directory",
+        "mode_octal": "0755",
+        "path": ".",
+        "size_bytes": 288,
+        "uid": 501
+      },
+      "total_file_bytes": 27945
+    }
+  ],
+  "source_head": "b16af023c07f22817fb8bb11abe464e916507850"
+}

@@ -1,0 +1,21 @@
+{
+  "schema": "aethyme.composition-expectations/provisional-v0",
+  "case": "HX05",
+  "title": "Held-out FX05 variant: two values for the same attribute",
+  "plan": "#650 held-out variant of FX05",
+  "scenarios": {
+    "s1": {
+      "title": "",
+      "required_outcomes": [
+        "conflict",
+        "resolution_required"
+      ],
+      "behaviors": [],
+      "provisional_text": {
+        "outcome": "conflict",
+        "behavior": null,
+        "note": "both sides change the same line"
+      }
+    }
+  }
+}

@@ -1,0 +1,78 @@
+{
+  "id": 1,
+  "worktree_path": "/private/tmp/1129-schema25-playground-v1/worktrees/repo-3e24088c3d9f9781/schema25-probe",
+  "branch": "agent/schema25-probe",
+  "origin": "spawned",
+  "status": "active",
+  "cleanup_state": "open",
+  "closed_at": null,
+  "cleanup_completed_at": null,
+  "task": "schema25-probe",
+  "diff_base": "6e5704b4d05db2c3875bff5c57ea3b554fc03a4e",
+  "adoption_base": "6e5704b4d05db2c3875bff5c57ea3b554fc03a4e",
+  "adopted_head": "6e5704b4d05db2c3875bff5c57ea3b554fc03a4e",
+  "accepted_session_head": null,
+  "accepted_integration_commit": null,
+  "accepted_integration_tree": null,
+  "accepted_queue_entry_id": null,
+  "accepted_at": null,
+  "repository_contract": {
+    "repository_schema": null,
+    "deployment_state_digest": "a332ca058fadabb85cc900a167a99df743dd0aa2db949edee7ad064a3ada8343",
+    "aethyme_version": "0.8.26",
+    "gate_definition_digest": null,
+    "backfilled": false
+  },
+  "pid": null,
+  "command": null,
+  "log_path": null,
+  "exit_code": null,
+  "agent_identity": null,
+  "repository_name": null,
+  "tab_name": null,
+  "ai_provider": null,
+  "short_name": "schema25",
+  "created_at": 1792107209746,
+  "updated_at": 1792107209746,
+  "last_activity_at": 1792107209746,
+  "start_base": {
+    "ref_name": "refs/heads/main",
+    "commit": "6e5704b4d05db2c3875bff5c57ea3b554fc03a4e",
+    "evidence": "conventional_main",
+    "behind_default_commits": null,
+    "ahead_default_commits": null,
+    "default_ref": null
+  },
+  "worktree_placement": {
+    "root": "/private/tmp/1129-schema25-playground-v1/worktrees/repo-3e24088c3d9f9781",
+    "source": "environment_override",
+    "outside_repository": true
+  },
+  "planned_explicit_leases": [],
+  "preparation": {
+    "schema_version": 1,
+    "session_id": 1,
+    "state": "not_configured",
+    "expected_digest": null,
+    "recorded_digest": null,
+    "source_digest": null,
+    "recorded_source_digest": null,
+    "missing_outputs": [],
+    "hook_required": false,
+    "reason": "repository declares no dependency preparation",
+    "next_action": null
+  },
+  "tab_rename": {
+    "status": "not_applicable",
+    "reason": "no Chau7 tab name was given or stored for this session"
+  },
+  "guidance": [
+    "Commit one small, coherent step at a time: stage explicit paths only (never `git add -A` or `git add .`) and check `git diff --cached` before each commit; only committed work can be verified and integrated.",
+    "Keep each PR to one concern that a reviewer can read in one sitting; split unrelated changes into separate sessions.",
+    "Before writing new code, look for an existing shared component, helper or pattern, and reuse or extend it (`aethyme explore --request \"where is …\"`). Don't add a parallel path, and don't leave duplicated logic behind.",
+    "Keep each function and module focused on one responsibility, behind a narrow interface; prefer the simple, direct version over a speculative abstraction.",
+    "Every behaviour change ships with a test that fails without it.",
+    "Before finishing: nothing unintended committed or pushed, tree clean, branch pushed, PR up to date, and the remaining risks stated in the PR."
+  ],
+  "guidance_source": "default"
+}

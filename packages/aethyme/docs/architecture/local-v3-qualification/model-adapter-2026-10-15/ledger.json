@@ -1,0 +1,77 @@
+{
+  "schema": "aethyme.local-model-adapter-checks/v1",
+  "source_head": "caef9cc94ca47b6f75f1d712e3e85359ccad55e1",
+  "source_tree": "d796ddd4c0110e1b8b3e589b88967c779e4954ab",
+  "source_runner_sha256": "2e3a93668a6aeae8c61e2579e909a91e1b17c50ee1a1b9e33ed615a94d3f2df8",
+  "passing_selected_tests": 6,
+  "passing_test_command_exit": 0,
+  "mutation_commands": 3,
+  "expected_mutation_exit": 1,
+  "mutation_named_failures": 3,
+  "mutation_source_exactly_restored": true,
+  "model_requests": 0,
+  "behavioral_evaluator_runs": 0,
+  "isolation_controls_runs": 0,
+  "files": [
+    {
+      "path": "fx17-no-model-regressions.json",
+      "bytes": 2175,
+      "sha256": "f04d94ce3bbcd8ba614e311a8dc5ba1b027a7baaa94d3b57cfd56284eeb3203c"
+    },
+    {
+      "path": "fx17-no-model-regressions.log",
+      "bytes": 98,
+      "sha256": "af88bdd7a54cc39cfb5904eec849f46c36db3b008cd00a1693c86331142646eb"
+    },
+    {
+      "path": "fx17-no-model-regressions.status",
+      "bytes": 2,
+      "sha256": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa"
+    },
+    {
+      "path": "schema-root-composition-guard.json",
+      "bytes": 1279,
+      "sha256": "1254e25f4afbd1e5e5c80bb5904f263bc6b79a8081d2cde0c0e0b7bee662ae9b"
+    },
+    {
+      "path": "schema-root-composition-guard.log",
+      "bytes": 816,
+      "sha256": "9a79d7380e80c6d26c0dc86c84bf7c0deb57867cc5cdc74acce5e13d428abc49"
+    },
+    {
+      "path": "schema-root-composition-guard.status",
+      "bytes": 2,
+      "sha256": "4355a46b19d348dc2f57c046f8ef63d4538ebb936000f3c9ee954a27460dd865"
+    },
+    {
+      "path": "tool-error-item-guard.json",
+      "bytes": 1302,
+      "sha256": "aa38686124635a342e92cd735bd91acf5b0bd9a435fce6c466851490c2cd4125"
+    },
+    {
+      "path": "tool-error-item-guard.log",
+      "bytes": 1404,
+      "sha256": "9234ce5fcf902fe6d84951c5b2358f95301dc4bb90292f9f94626af9b77cb488"
+    },
+    {
+      "path": "tool-error-item-guard.status",
+      "bytes": 2,
+      "sha256": "4355a46b19d348dc2f57c046f8ef63d4538ebb936000f3c9ee954a27460dd865"
+    },
+    {
+      "path": "candidate-refusal-exclusivity-guard.json",
+      "bytes": 1286,
+      "sha256": "6003eb3b124fdd809639d3a2c582b3521cf12eaeea912e71f5d4d9d0b757951c"
+    },
+    {
+      "path": "candidate-refusal-exclusivity-guard.log",
+      "bytes": 1759,
+      "sha256": "36ba88e7e546cbc02ca5cbc12f83dded1c5202dbcf0708959f5861c9f0d26df1"
+    },
+    {
+      "path": "candidate-refusal-exclusivity-guard.status",
+      "bytes": 2,
+      "sha256": "4355a46b19d348dc2f57c046f8ef63d4538ebb936000f3c9ee954a27460dd865"
+    }
+  ]
+}

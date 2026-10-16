@@ -1,0 +1,33 @@
+{
+  "argv": [
+    "cargo",
+    "clippy",
+    "--locked",
+    "-j4",
+    "-p",
+    "aethyme-broker",
+    "--all-targets",
+    "--",
+    "-D",
+    "warnings"
+  ],
+  "cwd": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/implement-local-administrative-sensitive/packages/aethyme/rust",
+  "environment": {
+    "CARGO_BUILD_JOBS": "4",
+    "CARGO_HOME": "/Users/christophehenner/.cargo",
+    "CARGO_NET_OFFLINE": "true",
+    "CARGO_TARGET_DIR": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/integrate-reviewed-local-bare-git-servic/target/local-resume/cargo",
+    "CARGO_TERM_COLOR": "never",
+    "HOME": "/Users/christophehenner",
+    "LANG": "en_US.UTF-8",
+    "LC_ALL": "en_US.UTF-8",
+    "PATH": "/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/christophehenner/.cargo/bin",
+    "RUSTC_WRAPPER": "",
+    "RUSTUP_HOME": "/Users/christophehenner/.rustup",
+    "TMPDIR": "/private/tmp/t56-strict-clippy-425a0bc/run-20261015/tmp"
+  },
+  "head": "425a0bc8e41031cea6b0ff8b5bc0e9cc80748b31",
+  "repo": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/implement-local-administrative-sensitive",
+  "started_at_utc": "2026-10-15T21:46:04.230627+00:00",
+  "tree": "01f8a9f6a51818732cf6feb38125a34c81745d5b"
+}

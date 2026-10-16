@@ -1,0 +1,23 @@
+{
+  "reference": "Independent Python standard-library oracle; raw-byte SHA-256 and canonical ASCII-key JSON.",
+  "descriptor": {
+    "anchor_commit": "1111111111111111111111111111111111111111",
+    "anchor_snapshot": "sha256:2939b109e979106efe56e4132e534918d03524dd8391186d54e237cd871a43e3",
+    "acceptance_target": "unbound",
+    "files": [
+      {
+        "content_sha256": "536e506bb90914c243a12b397b9a998f85ae2cbd9ba02dfd03a9e155ca5ca0f4",
+        "file_id": "file:sha256:fd0ee6dc0f6b45715b845b427f345007bd60c53f1b75196d94be53bec48ed33e",
+        "mode": "100644",
+        "path_hex": "7372632f6c69622e7273"
+      }
+    ],
+    "policy_location": ".aethyme/config.toml",
+    "project_id": "proj:aaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "schema": "aethyme.project-descriptor/experimental-v0",
+    "source_binding": "git-commit:1111111111111111111111111111111111111111",
+    "visibility_boundary": "local"
+  },
+  "content_hex": "666e206d61696e2829207b7d0a",
+  "descriptor_record_id": "sha256:fd653fa8879751de70df354eae024d77e9e0179e70adb59567eade4d6c6bbbb7"
+}

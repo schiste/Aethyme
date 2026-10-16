@@ -1,0 +1,22 @@
+   Compiling aethyme-testkit v0.1.0 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/fix-analysis-view-hold-retire-and-public/packages/aethyme/rust/crates/aethyme-testkit)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.34s
+     Running tests/docs_hygiene.rs (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/integrate-reviewed-local-bare-git-servic/target/local-resume/cargo/debug/deps/docs_hygiene-85182808376e2d1a)
+
+running 14 tests
+test docs_directory_exists ... ok
+test markdown_files_exist ... ok
+test internal_links_valid_at_the_repository_root ... ok
+test required_documentation_exists ... ok
+test runbooks_have_standard_sections ... ok
+test documentation_has_last_updated ... ok
+test curl_examples_valid ... ok
+test sql_examples_basic_syntax ... ok
+test code_blocks_have_language ... ok
+test json_examples_valid ... ok
+test no_unverifiable_python_examples ... ok
+test internal_links_valid ... ok
+test no_absolute_github_links ... ok
+test bash_examples_syntax ... ok
+
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.93s
+

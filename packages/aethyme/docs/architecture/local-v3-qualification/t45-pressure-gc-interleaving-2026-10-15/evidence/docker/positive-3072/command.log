@@ -1,0 +1,16 @@
+   Compiling aethyme-engine v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/implement-deterministic-t45-gc-and-stora/packages/aethyme/rust/crates/aethyme-engine)
+   Compiling aethyme-broker v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/implement-deterministic-t45-gc-and-stora/packages/aethyme/rust/crates/aethyme-broker)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1m 28s
+     Running unittests src/lib.rs (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/integrate-reviewed-local-bare-git-servic/target/local-resume/cargo/debug/deps/aethyme_broker-0f278e0d02146111)
+
+running 1 test
+test execution_resources::qualification::actual_pressure_preserves_retained_source_and_bounded_native_cleanup ... Local QA durable host journal /Volumes/T7-repositories/Application Support/Aethyme/qualification/local-check-temporaries/t45-gc-docker-bounded-positive-handoff-bc0b03d-tmp-ifakhtmg/.tmpGuPXBj
+Local QA retained stable source root /Volumes/T7-repositories/Application Support/Aethyme/qualification/local-check-temporaries/t45-gc-docker-bounded-positive-handoff-bc0b03d-tmp-ifakhtmg/.tmpiYzciC
+Local QA retained pressure source root /Volumes/T7-repositories/Application Support/Aethyme/qualification/local-check-temporaries/t45-gc-docker-bounded-positive-handoff-bc0b03d-tmp-ifakhtmg/.tmpSklY8e
+Local QA kernel ENOSPC diagnostic SHA-256 32856e6c4a5d886a7e301a21ea68a5def6d298936c8f0b1ba80956b4a4c5e5c6 while GC holds archive EX
+Local QA pressure transcript {"artifact":false,"daemon":"9c943a04-41ca-4943-a8f5-c5734144b14b","execution":"sha256:54a2e8482dfe357ebb266f8ce0d7e8cbc3caf51424bed15c77665af0ef7f4ba6","exit":28,"image":"sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251","outcome":"CodeFailed","retained_source_reconstructed":true,"runtime":"sha256:8d852ccd1dfebb5df5a524955ef5ce64c7496705a1db9cfe045e8c5e3cea46f5","same_store_gc":"held_archive_ex_during_pressure_then_reclaimed_named_orphan","trial":"bounded-tmpfs-enospc"}
+Local QA pressure transcript {"artifact":false,"daemon":"9c943a04-41ca-4943-a8f5-c5734144b14b","execution":"sha256:a626daa1a3a3a46c3da0592dfd9fca3580df7d5fe3779e9a8d65377a45401ef4","exit":null,"image":"sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251","outcome":"InfrastructureDeferred","retained_source_reconstructed":true,"runtime":"sha256:8d852ccd1dfebb5df5a524955ef5ce64c7496705a1db9cfe045e8c5e3cea46f5","same_store_gc":"held_archive_ex_during_pressure_then_reclaimed_named_orphan","trial":"bounded-cgroup-oom"}
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1830 filtered out; finished in 64.27s
+

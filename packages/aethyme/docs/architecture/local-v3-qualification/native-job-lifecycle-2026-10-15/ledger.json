@@ -1,0 +1,2043 @@
+{
+  "schema": "aethyme.local-native-job-lifecycle/v1",
+  "recorded_at": "2026-10-15T14:53:01Z",
+  "scope": "Explicit release of prepared/completed native-job roots, retention of dispatching/unknown jobs, and safe reopened status/GC behavior.",
+  "artifact_roots": {
+    "session_worktree": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/reconcile-retention-of-inactive-native-g",
+    "review_worktree": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/682-reconcile-final-local-qualification"
+  },
+  "reviewed_sources": [
+    {
+      "commit": "d6518745a1df9d75dc77ab2e44af35d5ef3ef470",
+      "tree": "88bf1707e1bac7925e8b453e5f676c11c4ef8dda",
+      "scope": "Production API, CLI, migration and lifecycle behavior",
+      "result": "Independent production review clear; no production findings."
+    },
+    {
+      "commit": "1a799a3eead55b9ed2380661c517d2ab0a8b4ce5",
+      "tree": "128a07026ffd8ccf2e3215b4ddfaff6362082949",
+      "scope": "StoredJobRow SQL mapping and independently enumerated fixture/spec roots",
+      "result": "Static review clear for typed mapping and expected fixture/spec identities."
+    },
+    {
+      "commit": "d524f3e695baa26a14302e68e3040fc61cef61d0",
+      "tree": "8b8302ffd16f6893bcd0fc8e67478b22728f3fa2",
+      "scope": "Complete independently derived source closure for dispatching and unknown GC plans",
+      "result": "Independent test review clear for fixture-derived manifests, snapshot entry blobs and metadata, contribution lineage/brief records, job and recipe records, and both GC plans."
+    }
+  ],
+  "test_filter": "native_gates::",
+  "selected_test_cases": 15,
+  "local_test_argv": [
+    "/usr/bin/caffeinate",
+    "-i",
+    "/Users/christophehenner/.cargo/bin/cargo",
+    "test",
+    "--locked",
+    "-j4",
+    "-p",
+    "aethyme-broker",
+    "--lib",
+    "native_gates::",
+    "--",
+    "--nocapture"
+  ],
+  "attempt_denominator": {
+    "local_native_gates_commands": 15,
+    "selected_slots": 85,
+    "returned_ok": 51,
+    "returned_assertion_failures": 8,
+    "not_returned_before_termination": 1,
+    "complete_passing_commands": 2,
+    "credited_native_gates_passes": 16,
+    "ci_checks_without_test_execution": 3,
+    "ci_test_cases_executed": 9114,
+    "returned_environment_failures": 15,
+    "ci_workspace_checks": 2,
+    "ci_test_cases_passed": 9104,
+    "ci_test_cases_failed": 10,
+    "ci_test_cases_skipped": 62,
+    "incomplete_commands_without_numeric_status": 2,
+    "unresolved_slots_from_incomplete_commands": 10,
+    "abandoned_attempts_without_numeric_status": 2,
+    "complete_native_gates_suite_passes": 1,
+    "focused_restored_sanity_passes": 1,
+    "mutation_guard_confirmations": 6,
+    "interpretation": "The local native_gates denominator includes four original commands and eleven resumed focused, mutation, and restored-sanity commands. Slots reconcile as 51 returned ok + 8 assertion failures + 15 environment failures + 1 stopped before result + 10 unresolved = 85. The two complete passing native commands were the 15-test suite and one restored-source sanity check. Mutation assertions confirm guards and are not baseline passes. The two recorded GitHub Actions workspace jobs executed 9,114 tests total: 9,104 passed, 10 failed, and 62 were skipped. The later PR 782 check on head 166f50ff91edab18636ec60743aca64bd6f0ea7a failed only the docs-hygiene test for the preserved original note copy; after its byte-preserving rename to .txt, no new CI result is recorded."
+  },
+  "attempts": [
+    {
+      "id": "ci-622-compile",
+      "source_commit": "622c633eb9c34b762ba795d2edf2b604b5b29c5b",
+      "source_tree": "be1a2a78620362549570002e1020f777babc22f5",
+      "kind": "CI compile check",
+      "numeric_exit": 101,
+      "tests_executed": 0,
+      "finding": "E0382 moved observation compile error before tests.",
+      "credited": false,
+      "artifacts": [
+        {
+          "path": "target/local-resume/pr782-116370216652-622.log",
+          "artifact_root": "review_worktree",
+          "bytes": 49095,
+          "sha256": "3c9b16d9b5b7a75df9f80d4f07dae085f37fde68144584ce291ee73265af89a7",
+          "kind": "complete raw CI log"
+        }
+      ]
+    },
+    {
+      "id": "ci-622-rustfmt",
+      "source_commit": "622c633eb9c34b762ba795d2edf2b604b5b29c5b",
+      "source_tree": "be1a2a78620362549570002e1020f777babc22f5",
+      "kind": "CI formatting check",
+      "numeric_exit": 1,
+      "tests_executed": 0,
+      "finding": "cargo fmt --all -- --check failed before tests.",
+      "credited": false,
+      "artifacts": [
+        {
+          "path": "target/local-resume/pr782-116370216237-622.log",
+          "artifact_root": "review_worktree",
+          "bytes": 53851,
+          "sha256": "fdc00755d03c4541d7c12b25840fcfd3637d368d3728e692b237f45ff8f7b761",
+          "kind": "complete raw CI log"
+        }
+      ]
+    },
+    {
+      "id": "local-native-gates-346001",
+      "source_commit": "346001298a2db1467b2807610dd04006f4b76889",
+      "source_tree": "d758e054309073ef99deb46360e362de98fb2271",
+      "kind": "focused local native-gates tests",
+      "source_worktree_clean_before_and_after": true,
+      "source_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "started_at_utc": "2026-10-15T10:40:55.101816+00:00",
+      "finished_at_utc": "2026-10-15T10:44:12.806987+00:00",
+      "wall_seconds": 197.643,
+      "numeric_exit": 101,
+      "results": {
+        "selected": 15,
+        "passed": 14,
+        "failed": 1,
+        "ignored": 0,
+        "filtered_out": 1805
+      },
+      "failure": "dispatching_and_unknown_jobs_stay_rooted_without_a_process_tree_proof: the test required dispatching_plan.entities to be empty, although unrelated collectible fixture entities may remain.",
+      "credited": false,
+      "artifacts": [
+        {
+          "path": "target/local-resume/final-integration-20261015T104055Z/native-gates-all.json",
+          "artifact_root": "session_worktree",
+          "bytes": 1686,
+          "sha256": "a7c14168ec9676fe869c02dacf1d1b604a0123a1e904457cfb32d7c081e81562",
+          "kind": "recorder metadata"
+        },
+        {
+          "path": "target/local-resume/final-integration-20261015T104055Z/native-gates-all.log",
+          "artifact_root": "session_worktree",
+          "bytes": 4362,
+          "sha256": "421db81263b95501477ac23084cae46b2c6d012c67500f83e3d9fbaac04e0892",
+          "kind": "complete raw local test output"
+        },
+        {
+          "path": "target/local-resume/final-integration-20261015T104055Z/native-gates-all.status",
+          "artifact_root": "session_worktree",
+          "bytes": 4,
+          "sha256": "39b8dc3fc8b44765c8e6f1adee04c5b465e555ab791cc42d0d9e810d5b64297c",
+          "kind": "numeric status file; content 101 plus newline"
+        },
+        {
+          "path": "target/local-resume/pr782-lint-346001.log",
+          "artifact_root": "review_worktree",
+          "bytes": 49838,
+          "sha256": "431d6da0d6ac49876aaa94496b740de7dd830aca7aac2251e576da43b85c2c62",
+          "kind": "complete raw CI lint log"
+        }
+      ],
+      "ci_lint_result": {
+        "numeric_exit": 101,
+        "finding": "Strict Clippy type_complexity on the eight-field retained-row tuple at native_gates.rs:171.",
+        "tests_executed": 0,
+        "credited": false
+      }
+    },
+    {
+      "id": "local-native-gates-d524-interrupted",
+      "source_commit": "d524f3e695baa26a14302e68e3040fc61cef61d0",
+      "source_tree": "8b8302ffd16f6893bcd0fc8e67478b22728f3fa2",
+      "kind": "focused local native-gates tests, interrupted",
+      "source_worktree_clean_before_and_after": true,
+      "source_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "started_at_utc": "2026-10-15T10:57:19.986873+00:00",
+      "finished_at_utc": "2026-10-15T11:01:34.935459+00:00",
+      "wall_seconds": 254.891,
+      "numeric_exit": 101,
+      "termination_signal": "SIGTERM",
+      "results": {
+        "selected": 15,
+        "returned_ok": 14,
+        "returned_assertion_failures": 0,
+        "not_returned_before_termination": 1,
+        "incomplete_test": "budget_capacity_and_requirement_holds_do_not_dispatch_prepared_jobs"
+      },
+      "termination_reason": "Stopped while temporary SQLite fixtures were using host Data storage near capacity; this was not an assertion failure.",
+      "credited": false,
+      "artifacts": [
+        {
+          "path": "target/local-resume/final-integration-20261015T105719Z/native-gates-full-closure-d524f3e.json",
+          "artifact_root": "session_worktree",
+          "bytes": 1703,
+          "sha256": "007b264cc318f357cf92d636e3c1ffc2e0d3eace25224172cd60060149855269",
+          "kind": "recorder metadata"
+        },
+        {
+          "path": "target/local-resume/final-integration-20261015T105719Z/native-gates-full-closure-d524f3e.log",
+          "artifact_root": "session_worktree",
+          "bytes": 4433,
+          "sha256": "edac8513324259d2d0984dc6ae7437d9f18287eaf955fd4281850f993c142660",
+          "kind": "complete raw local output through termination"
+        },
+        {
+          "path": "target/local-resume/final-integration-20261015T105719Z/native-gates-full-closure-d524f3e.status",
+          "artifact_root": "session_worktree",
+          "bytes": 4,
+          "sha256": "39b8dc3fc8b44765c8e6f1adee04c5b465e555ab791cc42d0d9e810d5b64297c",
+          "kind": "numeric status file; content 101 plus newline"
+        }
+      ]
+    },
+    {
+      "id": "ci-workspace-d524",
+      "source_commit": "d524f3e695baa26a14302e68e3040fc61cef61d0",
+      "source_tree": "8b8302ffd16f6893bcd0fc8e67478b22728f3fa2",
+      "kind": "full workspace CI test command",
+      "numeric_exit": 100,
+      "tests_executed": 4557,
+      "results": {
+        "passed": 4548,
+        "failed": 9,
+        "skipped": 31
+      },
+      "findings": [
+        "Seven migration-fixture tests rewind a current-schema store without removing schema-23 local_native_gate_jobs state; migration 23 then reports duplicate column roots_released_ms. The fixture paths are archive v1, context schema 5, state schema 2 and 3, controller schema 18, exchange schema 14, and target schema 6. The controller schema-18 fixture must keep its schema-18 native-job tables and remove only schema-23 column/trigger; fixtures older than migration 18 can drop the native-job tables so migration 18 recreates them.",
+        "CLI help_surface_matches_snapshots is stale after the lifecycle commands were added.",
+        "broker_production_code_does_not_discard_more_results reports 144 let _ = sites versus the baseline of 143; inspect the exact added site and compare against integrated GC changes before changing the ratchet."
+      ],
+      "credited": false,
+      "artifacts": [
+        {
+          "path": "target/local-resume/pr782-workspace-d524.log",
+          "artifact_root": "review_worktree",
+          "bytes": 1060792,
+          "sha256": "7d120b0e565b8afc87d423acbb70d46fceba03bd92e72a7cee41bf3a5cbb066a",
+          "kind": "complete raw workspace CI test log"
+        }
+      ]
+    },
+    {
+      "id": "local-native-gates-cached-serial-d524-nested-tmpdir",
+      "source_commit": "27d1b2e9de6a3b09bb0dcf9bc598c22d8f39b52a",
+      "source_tree": "d0822c4484f37efdf90ff039fe6c13a08f293aa3",
+      "equivalent_rust_source_commit": "d524f3e695baa26a14302e68e3040fc61cef61d0",
+      "kind": "serial focused native-gates tests using cached binary; failed environmental preflight",
+      "source_worktree_clean_before_and_after": true,
+      "source_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "binary_sha256": "4b2376a7f628100d52b2b28d0f60511917c42a7d306a7eb88a6d4f599c8b6945",
+      "numeric_exit": 101,
+      "results": {
+        "selected": 15,
+        "passed": 1,
+        "failed": 14,
+        "ignored": 0,
+        "filtered_out": 1805
+      },
+      "failure": "The one pass and 14 failures occurred because TMPDIR was inside the checked-out Git worktree; the temporary repositories failed nested-worktree environmental preflight. This attempt receives no qualification credit.",
+      "credited": false,
+      "artifacts": [
+        {
+          "path": "target/local-resume/final-integration-20261015T111345Z/native-gates-cached-serial-d524-20261015.json",
+          "artifact_root": "session_worktree",
+          "bytes": 2047,
+          "sha256": "2b00411eba0fd497194162ca1aacdba63a8134bc385a3a77541108fb9cf818c2",
+          "kind": "complete recorder metadata including source binding, argv, environment and numeric status"
+        },
+        {
+          "path": "target/local-resume/final-integration-20261015T111345Z/native-gates-cached-serial-d524-20261015.log",
+          "artifact_root": "session_worktree",
+          "bytes": 11683,
+          "sha256": "5638959ccce7c071871723f19d5272df0ac4fb2bb156fa125ab8c8266d93cd0d",
+          "kind": "complete raw cached-binary test output"
+        },
+        {
+          "path": "target/local-resume/final-integration-20261015T111345Z/native-gates-cached-serial-d524-20261015.status",
+          "artifact_root": "session_worktree",
+          "bytes": 4,
+          "sha256": "39b8dc3fc8b44765c8e6f1adee04c5b465e555ab791cc42d0d9e810d5b64297c",
+          "kind": "numeric status file; content 101 plus newline"
+        }
+      ]
+    },
+    {
+      "id": "local-native-gates-cached-serial-d524-offtree-no-final-status",
+      "source_commit": "27d1b2e9de6a3b09bb0dcf9bc598c22d8f39b52a",
+      "source_tree": "d0822c4484f37efdf90ff039fe6c13a08f293aa3",
+      "source_diff_sha256": "5cb3b142fb06fa39181a37496ad5ab84267b93c277980f40aca26cbf3688a94b",
+      "equivalent_rust_source_commit": "d524f3e695baa26a14302e68e3040fc61cef61d0",
+      "kind": "serial focused native-gates tests using cached binary; abandoned without final status",
+      "working_directory": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/reconcile-retention-of-inactive-native-g/packages/aethyme/rust",
+      "argv": [
+        "/usr/bin/caffeinate",
+        "-i",
+        "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/integrate-reviewed-local-bare-git-servic/target/local-resume/cargo/debug/deps/aethyme_broker-0f278e0d02146111",
+        "native_gates::tests",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "source_worktree_clean_before": false,
+      "source_worktree_clean_after": null,
+      "binary_sha256": "4b2376a7f628100d52b2b28d0f60511917c42a7d306a7eb88a6d4f599c8b6945",
+      "started_at_utc": "2026-10-15T11:16:55.344673+00:00",
+      "metadata_state_at_reconciliation": "running",
+      "numeric_exit": null,
+      "results": {
+        "selected": 15,
+        "observed_ok_lines": 6,
+        "final_failed": null,
+        "ignored": null,
+        "unresolved_without_result": 9
+      },
+      "final_status_present": false,
+      "credited": false,
+      "failure": "The unchanged partial raw log contains six completed ok lines and stops during the ninth test with no result or numeric status. No matching process or exact log writer remained when reconciled; no exit or complete-command result is inferred.",
+      "artifacts": [
+        {
+          "path": "target/local-resume/final-integration-20261015T111655Z/native-gates-cached-serial-d524-offtree-tmp-20261015.json",
+          "bytes": 1575,
+          "sha256": "8a5b5cf3d7680f78d58cfc0ffdaf187393620ca8c1729e57e3bb0b8960133f56",
+          "kind": "original recorder metadata, preserved unchanged"
+        },
+        {
+          "path": "target/local-resume/final-integration-20261015T111655Z/native-gates-cached-serial-d524-offtree-tmp-20261015.log",
+          "bytes": 1156,
+          "sha256": "4f1ad62cc55c2c0994e626607321cc764ea1025f274fc6ad621c12156dd2d30f",
+          "kind": "original partial raw test output, preserved unchanged"
+        },
+        {
+          "path": "target/local-resume/final-integration-20261015T111655Z/native-gates-cached-serial-d524-offtree-tmp-20261015-reconciliation.json",
+          "bytes": 3964,
+          "sha256": "b5b29e7edf4954c170fc222fb3354079720fdd5e81508f9c97f97c688f93dae7",
+          "kind": "separate abandoned-run ownership and status reconciliation"
+        }
+      ],
+      "missing_artifacts": [
+        {
+          "path": "target/local-resume/final-integration-20261015T111655Z/native-gates-cached-serial-d524-offtree-tmp-20261015.status",
+          "reason": "No status file was created before the recorder stopped."
+        }
+      ]
+    },
+    {
+      "id": "local-native-gates-e9a62-full-filter-pass",
+      "source_commit": "e9a62f328db011d00def7a40ffccbe2da4c82967",
+      "source_tree": "61a3bceeb876587819222cca6344574e04d77857",
+      "source_worktree_clean_before_and_after": false,
+      "source_diff_sha256": "cae12d642517bdf0215aaf9fa6a2aa6910cd32ee01ac46e08dea122d83c3c023",
+      "source_overlay": "Qualification ledger only; source file hashes are in source-bindings.json.",
+      "started_at_utc": "2026-10-15T13:27:51.027172Z",
+      "finished_at_utc": "2026-10-15T13:33:41.201639Z",
+      "wall_seconds": 350.289814,
+      "kind": "complete focused native_gates suite after fixture correction",
+      "argv": [
+        "cargo",
+        "test",
+        "--locked",
+        "-j",
+        "4",
+        "-p",
+        "aethyme-broker",
+        "--lib",
+        "native_gates::tests",
+        "--",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "numeric_exit": 0,
+      "results": {
+        "selected": 15,
+        "passed": 15,
+        "failed": 0,
+        "ignored": 0,
+        "filtered_out": 1805
+      },
+      "credited": true,
+      "complete_command_pass": true,
+      "artifacts": [
+        {
+          "path": "evidence/retention-checks/20261015T132750Z-native-gates-15-after-fixture-fix-34b08bec/command.json",
+          "bytes": 4447,
+          "sha256": "27d39c714a9282c0082ddf71db9ba637ec5f462c371c2f348715f2ff4fa53582",
+          "kind": "original recorder metadata, copied unchanged"
+        },
+        {
+          "path": "evidence/retention-checks/20261015T132750Z-native-gates-15-after-fixture-fix-34b08bec/command.log",
+          "bytes": 2586,
+          "sha256": "74064f29e659a67c197c87c13934f8f893d1244b5d9b5988b6b982a731e29fc5",
+          "kind": "raw command output, copied unchanged"
+        },
+        {
+          "path": "evidence/retention-checks/20261015T132750Z-native-gates-15-after-fixture-fix-34b08bec/command.status",
+          "bytes": 2,
+          "sha256": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa",
+          "kind": "original numeric status, copied unchanged"
+        }
+      ]
+    },
+    {
+      "id": "local-migration-fixture-matrix-e9a62",
+      "source_commit": "e9a62f328db011d00def7a40ffccbe2da4c82967",
+      "source_tree": "61a3bceeb876587819222cca6344574e04d77857",
+      "kind": "seven focused broker migration fixture tests",
+      "results": {
+        "commands": 7,
+        "selected": 7,
+        "passed": 7,
+        "failed": 0,
+        "ignored": 0
+      },
+      "checks": [
+        {
+          "run": "20261015T133413Z-migration-archive-v1-8676b9f4",
+          "test": "a_version_one_database_is_migrated",
+          "numeric_exit": 0,
+          "selected": 1,
+          "passed": 1,
+          "failed": 0,
+          "source_commit": "e9a62f328db011d00def7a40ffccbe2da4c82967",
+          "source_tree": "61a3bceeb876587819222cca6344574e04d77857"
+        },
+        {
+          "run": "20261015T133429Z-migration-context-v5-broad-postings-992372d0",
+          "test": "migrating_to_schema_6_rebuilds_the_index_with_broad_postings",
+          "numeric_exit": 0,
+          "selected": 1,
+          "passed": 1,
+          "failed": 0,
+          "source_commit": "e9a62f328db011d00def7a40ffccbe2da4c82967",
+          "source_tree": "61a3bceeb876587819222cca6344574e04d77857"
+        },
+        {
+          "run": "20261015T133432Z-migration-state-v3-floor-d0c3a6d8",
+          "test": "the_floor_is_raised_for_new_and_migrated_stores",
+          "numeric_exit": 0,
+          "selected": 1,
+          "passed": 1,
+          "failed": 0,
+          "source_commit": "e9a62f328db011d00def7a40ffccbe2da4c82967",
+          "source_tree": "61a3bceeb876587819222cca6344574e04d77857"
+        },
+        {
+          "run": "20261015T133436Z-migration-state-v2-inspection-read-only-e66ce180",
+          "test": "inspection_reads_without_migrating_or_writing",
+          "numeric_exit": 0,
+          "selected": 1,
+          "passed": 1,
+          "failed": 0,
+          "source_commit": "e9a62f328db011d00def7a40ffccbe2da4c82967",
+          "source_tree": "61a3bceeb876587819222cca6344574e04d77857"
+        },
+        {
+          "run": "20261015T133439Z-migration-exchange-v14-capture-rows-16c299f6",
+          "test": "migration_preserves_capture_rows_and_operation_constraints_without_fake_captures",
+          "numeric_exit": 0,
+          "selected": 1,
+          "passed": 1,
+          "failed": 0,
+          "source_commit": "e9a62f328db011d00def7a40ffccbe2da4c82967",
+          "source_tree": "61a3bceeb876587819222cca6344574e04d77857"
+        },
+        {
+          "run": "20261015T133442Z-migration-target-v6-resolution-attempts-2764effa",
+          "test": "migration_adopts_charged_resolution_attempts_and_fences_schema_six",
+          "numeric_exit": 0,
+          "selected": 1,
+          "passed": 1,
+          "failed": 0,
+          "source_commit": "e9a62f328db011d00def7a40ffccbe2da4c82967",
+          "source_tree": "61a3bceeb876587819222cca6344574e04d77857"
+        },
+        {
+          "run": "20261015T133445Z-migration-controller-v18-retained-journals-903a4924",
+          "test": "controller_migrations_adopt_existing_journals_without_erasing_rows",
+          "numeric_exit": 0,
+          "selected": 1,
+          "passed": 1,
+          "failed": 0,
+          "source_commit": "e9a62f328db011d00def7a40ffccbe2da4c82967",
+          "source_tree": "61a3bceeb876587819222cca6344574e04d77857"
+        }
+      ],
+      "credited": true,
+      "artifacts": [
+        {
+          "path": "evidence/retention-checks/20261015T133413Z-migration-archive-v1-8676b9f4/command.json",
+          "bytes": 4370,
+          "sha256": "47b2abf103ec2fc9252ec8f0fd1da21a8803ac3c9d7336d6f45e476f0a951d68",
+          "kind": "original recorder metadata, copied unchanged"
+        },
+        {
+          "path": "evidence/retention-checks/20261015T133413Z-migration-archive-v1-8676b9f4/command.log",
+          "bytes": 499,
+          "sha256": "0b4302a21e86317aba9571d541e4127c187150a45d247f6e5875192a1fe1bb95",
+          "kind": "raw command output, copied unchanged"
+        },
+        {
+          "path": "evidence/retention-checks/20261015T133413Z-migration-archive-v1-8676b9f4/command.status",
+          "bytes": 2,
+          "sha256": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa",
+          "kind": "original numeric status, copied unchanged"
+        },
+        {
+          "path": "evidence/retention-checks/20261015T133429Z-migration-context-v5-broad-postings-992372d0/command.json",
+          "bytes": 4471,
+          "sha256": "941076934d5d3bc56c817e9b8c39e456343d5a1bb90ac9a3fb9e2b621e71274f",
+          "kind": "original recorder metadata, copied unchanged"
+        },
+        {
+          "path": "evidence/retention-checks/20261015T133429Z-migration-context-v5-broad-postings-992372d0/command.log",
+          "bytes": 525,
+          "sha256": "d87699cd33a559da84d338727d62671283b8e04a4d7824ca5039112c7cedce72",
+          "kind": "raw command output, copied unchanged"
+        },
+        {
+          "path": "evidence/retention-checks/20261015T133429Z-migration-context-v5-broad-postings-992372d0/command.status",
+          "bytes": 2,
+          "sha256": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa",
+          "kind": "original numeric status, copied unchanged"
+        },
+        {
+          "path": "evidence/retention-checks/20261015T133432Z-migration-state-v3-floor-d0c3a6d8/command.json",
+          "bytes": 4403,
+          "sha256": "8df096ef541721ae0763a35c8ef8025dd5f51846fd8f08813f16fc7d1f814dc6",
+          "kind": "original recorder metadata, copied unchanged"
+        },
+        {
+          "path": "evidence/retention-checks/20261015T133432Z-migration-state-v3-floor-d0c3a6d8/command.log",
+          "bytes": 510,
+          "sha256": "cffcbe42adb693ab79fde0266ed5abd663b4118bb0cba8aab542026ed8204946",
+          "kind": "raw command output, copied unchanged"
+        },
+        {
+          "path": "evidence/retention-checks/20261015T133432Z-migration-state-v3-floor-d0c3a6d8/command.status",
+          "bytes": 2,
+          "sha256": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa",
+          "kind": "original numeric status, copied unchanged"
+        },
+        {
+          "path": "evidence/retention-checks/20261015T133436Z-migration-state-v2-inspection-read-only-e66ce180/command.json",
+          "bytes": 4476,
+          "sha256": "12ac6eb742eff096a22f2f3cb82a1d61cc8c7cecce12ed3247bb01e2a54f1e09",
+          "kind": "original recorder metadata, copied unchanged"
+        },
+        {
+          "path": "evidence/retention-checks/20261015T133436Z-migration-state-v2-inspection-read-only-e66ce180/command.log",
+          "bytes": 508,
+          "sha256": "98f06d2c252060faaec2270997d68210ea1d9ea9c1901a7da584f11b22e78325",
+          "kind": "raw command output, copied unchanged"
+        },
+        {
+          "path": "evidence/retention-checks/20261015T133436Z-migration-state-v2-inspection-read-only-e66ce180/command.status",
+          "bytes": 2,
+          "sha256": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa",
+          "kind": "original numeric status, copied unchanged"
+        },
+        {
+          "path": "evidence/retention-checks/20261015T133439Z-migration-exchange-v14-capture-rows-16c299f6/command.json",
+          "bytes": 4491,
+          "sha256": "768136d32f9f37cad08a6559dc587d8c42a8d49a3bcd2536034468f3ec956eae",
+          "kind": "original recorder metadata, copied unchanged"
+        },
+        {
+          "path": "evidence/retention-checks/20261015T133439Z-migration-exchange-v14-capture-rows-16c299f6/command.log",
+          "bytes": 547,
+          "sha256": "fa6871fb97764ff6daf17537d1bcba7e422c83dd4516cdc8a1d8451d2d1fe500",
+          "kind": "raw command output, copied unchanged"
+        },
+        {
+          "path": "evidence/retention-checks/20261015T133439Z-migration-exchange-v14-capture-rows-16c299f6/command.status",
+          "bytes": 2,
+          "sha256": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa",
+          "kind": "original numeric status, copied unchanged"
+        },
+        {
+          "path": "evidence/retention-checks/20261015T133442Z-migration-target-v6-resolution-attempts-2764effa/command.json",
+          "bytes": 4497,
+          "sha256": "e5b6985fb7f48ab45433df4c1426af48cfe1071a043d687ac83543d4f501539f",
+          "kind": "original recorder metadata, copied unchanged"
+        },
+        {
+          "path": "evidence/retention-checks/20261015T133442Z-migration-target-v6-resolution-attempts-2764effa/command.log",
+          "bytes": 522,
+          "sha256": "eb63bd41e93bce6d173fb37a66c6b30b1f512c20a13ecdb8dc9bafd3f6c37bf3",
+          "kind": "raw command output, copied unchanged"
+        },
+        {
+          "path": "evidence/retention-checks/20261015T133442Z-migration-target-v6-resolution-attempts-2764effa/command.status",
+          "bytes": 2,
+          "sha256": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa",
+          "kind": "original numeric status, copied unchanged"
+        },
+        {
+          "path": "evidence/retention-checks/20261015T133445Z-migration-controller-v18-retained-journals-903a4924/command.json",
+          "bytes": 4512,
+          "sha256": "eeeb860b2dd31c41bc3d00fa55cb4037b2f0cc5282914aabb87c349471d54754",
+          "kind": "original recorder metadata, copied unchanged"
+        },
+        {
+          "path": "evidence/retention-checks/20261015T133445Z-migration-controller-v18-retained-journals-903a4924/command.log",
+          "bytes": 533,
+          "sha256": "743557f5e74fe96fe091ac992f4fd4293d51e7afc906263166ee1ce7cae36887",
+          "kind": "raw command output, copied unchanged"
+        },
+        {
+          "path": "evidence/retention-checks/20261015T133445Z-migration-controller-v18-retained-journals-903a4924/command.status",
+          "bytes": 2,
+          "sha256": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa",
+          "kind": "original numeric status, copied unchanged"
+        }
+      ]
+    },
+    {
+      "id": "M1",
+      "name": "m1-release-without-archive-use",
+      "guard": "archive-use serialization while release waits for in-progress GC",
+      "source_path": "packages/aethyme/rust/crates/aethyme-broker/src/native_gates.rs",
+      "source_commit": "d52bc0a514fc5035fe143b97208a9e328f6a5d8e",
+      "source_tree": "8840983777e2bc46dac1a2b5c748935955cb7be6",
+      "source_restored_sha256": "e17607f4b349556be3eb38651e8bd270087c84d3023c7b767b3308293aa838b5",
+      "backup_sha256": "e17607f4b349556be3eb38651e8bd270087c84d3023c7b767b3308293aa838b5",
+      "test": "native_gates::tests::root_release_waits_for_an_in_progress_gc_generation",
+      "numeric_exit": 101,
+      "results": {
+        "selected": 1,
+        "returned_ok": 0,
+        "returned_assertion_failures": 1,
+        "ignored": 0
+      },
+      "classification": "expected_named_assertion_failure_after_mutation",
+      "credited_as_baseline_pass": false,
+      "confirmed_guard": true,
+      "artifacts": [
+        {
+          "path": "evidence/retention-checks/20261015T134530Z-native-guard-m1-no-archive-use-0cbc0750/command.json",
+          "bytes": 4530,
+          "sha256": "96c661592a68c4616e3bf8a90631b9e9850a98b4ff363473318c70ebe13756fd",
+          "kind": "original recorder metadata, copied unchanged"
+        },
+        {
+          "path": "evidence/retention-checks/20261015T134530Z-native-guard-m1-no-archive-use-0cbc0750/command.log",
+          "bytes": 4087,
+          "sha256": "3b47a36cd2a86bd0843028a9c06007077d328ac7769bbaf3c2736ed1d4b55543",
+          "kind": "raw command output, copied unchanged"
+        },
+        {
+          "path": "evidence/retention-checks/20261015T134530Z-native-guard-m1-no-archive-use-0cbc0750/command.status",
+          "bytes": 4,
+          "sha256": "39b8dc3fc8b44765c8e6f1adee04c5b465e555ab791cc42d0d9e810d5b64297c",
+          "kind": "original numeric status, copied unchanged"
+        },
+        {
+          "path": "evidence/mutation-backups/m1-release-without-archive-use.NKsZIC",
+          "bytes": 38968,
+          "sha256": "e17607f4b349556be3eb38651e8bd270087c84d3023c7b767b3308293aa838b5",
+          "kind": "original mutation source backup, copied unchanged"
+        },
+        {
+          "path": "evidence/retention-checks/20261015T134530Z-native-guard-m1-no-archive-use-0cbc0750/m1-classification-correction.json",
+          "bytes": 3776,
+          "sha256": "18b2f91a1c122aebb3da5bc14e0098bb440d649e886dd9b758406b985c988267",
+          "kind": "separate classification correction; no rerun"
+        }
+      ],
+      "classification_correction": {
+        "scope": "metadata_classification_only",
+        "raw_attempt_unchanged": true,
+        "rerun_performed": false,
+        "artifact": {
+          "path": "evidence/retention-checks/20261015T134530Z-native-guard-m1-no-archive-use-0cbc0750/m1-classification-correction.json",
+          "bytes": 3776,
+          "sha256": "18b2f91a1c122aebb3da5bc14e0098bb440d649e886dd9b758406b985c988267",
+          "kind": "separate classification correction; no rerun"
+        }
+      }
+    },
+    {
+      "id": "M2",
+      "name": "m2-release-without-owner-authorization",
+      "guard": "owner authorization for release",
+      "source_path": "packages/aethyme/rust/crates/aethyme-broker/src/native_gates.rs",
+      "source_commit": "d52bc0a514fc5035fe143b97208a9e328f6a5d8e",
+      "source_tree": "8840983777e2bc46dac1a2b5c748935955cb7be6",
+      "source_restored_sha256": "e17607f4b349556be3eb38651e8bd270087c84d3023c7b767b3308293aa838b5",
+      "backup_sha256": "e17607f4b349556be3eb38651e8bd270087c84d3023c7b767b3308293aa838b5",
+      "test": "native_gates::tests::stale_owner_cannot_release_but_current_owner_can_release_old_epoch_history",
+      "numeric_exit": 101,
+      "results": {
+        "selected": 1,
+        "returned_ok": 0,
+        "returned_assertion_failures": 1,
+        "ignored": 0
+      },
+      "classification": "expected_named_assertion_failure_after_mutation",
+      "credited_as_baseline_pass": false,
+      "confirmed_guard": true,
+      "artifacts": [
+        {
+          "path": "evidence/retention-checks/20261015T134702Z-native-guard-m2-no-owner-authorization-b8444950/command.json",
+          "bytes": 4601,
+          "sha256": "e1436d4d4a5fed00d0d8722d9a19f393e770b2f74bf8c88fd69121d31ae2e5aa",
+          "kind": "original recorder metadata, copied unchanged"
+        },
+        {
+          "path": "evidence/retention-checks/20261015T134702Z-native-guard-m2-no-owner-authorization-b8444950/command.log",
+          "bytes": 4039,
+          "sha256": "6341e166bd156cea3c4e302babd73b54e285ff89230c902fe7ef0dd145dbc3b0",
+          "kind": "raw command output, copied unchanged"
+        },
+        {
+          "path": "evidence/retention-checks/20261015T134702Z-native-guard-m2-no-owner-authorization-b8444950/command.status",
+          "bytes": 4,
+          "sha256": "39b8dc3fc8b44765c8e6f1adee04c5b465e555ab791cc42d0d9e810d5b64297c",
+          "kind": "original numeric status, copied unchanged"
+        },
+        {
+          "path": "evidence/mutation-backups/m2-release-without-owner-authorization.73zwDd",
+          "bytes": 38968,
+          "sha256": "e17607f4b349556be3eb38651e8bd270087c84d3023c7b767b3308293aa838b5",
+          "kind": "original mutation source backup, copied unchanged"
+        }
+      ]
+    },
+    {
+      "id": "M3",
+      "name": "m3-disabled-schema23-old-client-trigger",
+      "guard": "schema-23 old-client trigger",
+      "source_path": "packages/aethyme/rust/crates/aethyme-broker/src/collaboration_state.rs",
+      "source_commit": "d52bc0a514fc5035fe143b97208a9e328f6a5d8e",
+      "source_tree": "8840983777e2bc46dac1a2b5c748935955cb7be6",
+      "source_restored_sha256": "998d698813a6ea3091e8445db54cc155b9b041633748c7c7cb86ee78761f0cd8",
+      "backup_sha256": "998d698813a6ea3091e8445db54cc155b9b041633748c7c7cb86ee78761f0cd8",
+      "test": "native_gates::tests::released_prepared_job_remains_readable_but_cannot_be_dispatched_or_replayed",
+      "numeric_exit": 101,
+      "results": {
+        "selected": 1,
+        "returned_ok": 0,
+        "returned_assertion_failures": 1,
+        "ignored": 0
+      },
+      "classification": "expected_named_assertion_failure_after_mutation",
+      "credited_as_baseline_pass": false,
+      "confirmed_guard": true,
+      "artifacts": [
+        {
+          "path": "evidence/retention-checks/20261015T134810Z-native-guard-m3-disabled-schema23-old-client-trigger-5d2acfdb/command.json",
+          "bytes": 4673,
+          "sha256": "8ab815b164831e01b8146670701ef766e6ed9518e9fc7174ba9719f31654997d",
+          "kind": "original recorder metadata, copied unchanged"
+        },
+        {
+          "path": "evidence/retention-checks/20261015T134810Z-native-guard-m3-disabled-schema23-old-client-trigger-5d2acfdb/command.log",
+          "bytes": 4110,
+          "sha256": "25082683d43e55f8c01118923c1cb8e05fc03e70a0d762d3b5e648a184da2b41",
+          "kind": "raw command output, copied unchanged"
+        },
+        {
+          "path": "evidence/retention-checks/20261015T134810Z-native-guard-m3-disabled-schema23-old-client-trigger-5d2acfdb/command.status",
+          "bytes": 4,
+          "sha256": "39b8dc3fc8b44765c8e6f1adee04c5b465e555ab791cc42d0d9e810d5b64297c",
+          "kind": "original numeric status, copied unchanged"
+        },
+        {
+          "path": "evidence/mutation-backups/m3-disabled-schema23-old-client-trigger.Mqpbij",
+          "bytes": 83144,
+          "sha256": "998d698813a6ea3091e8445db54cc155b9b041633748c7c7cb86ee78761f0cd8",
+          "kind": "original mutation source backup, copied unchanged"
+        }
+      ]
+    },
+    {
+      "id": "M4",
+      "name": "m4-release-dispatching-unknown-roots",
+      "guard": "retain dispatching and unknown roots without process-tree proof",
+      "source_path": "packages/aethyme/rust/crates/aethyme-broker/src/native_gates.rs",
+      "source_commit": "d52bc0a514fc5035fe143b97208a9e328f6a5d8e",
+      "source_tree": "8840983777e2bc46dac1a2b5c748935955cb7be6",
+      "source_restored_sha256": "e17607f4b349556be3eb38651e8bd270087c84d3023c7b767b3308293aa838b5",
+      "backup_sha256": "e17607f4b349556be3eb38651e8bd270087c84d3023c7b767b3308293aa838b5",
+      "test": "native_gates::tests::dispatching_and_unknown_jobs_stay_rooted_without_a_process_tree_proof",
+      "numeric_exit": 101,
+      "results": {
+        "selected": 1,
+        "returned_ok": 0,
+        "returned_assertion_failures": 1,
+        "ignored": 0
+      },
+      "classification": "expected_named_assertion_failure_after_mutation",
+      "credited_as_baseline_pass": false,
+      "confirmed_guard": true,
+      "artifacts": [
+        {
+          "path": "evidence/retention-checks/20261015T134909Z-native-guard-m4-release-dispatching-unknown-roots-795818d2/command.json",
+          "bytes": 4649,
+          "sha256": "0e8972ee1b796b9554cc84f894e5d84e8e9eb584ce5767585c8ad3a77fdd7180",
+          "kind": "original recorder metadata, copied unchanged"
+        },
+        {
+          "path": "evidence/retention-checks/20261015T134909Z-native-guard-m4-release-dispatching-unknown-roots-795818d2/command.log",
+          "bytes": 4165,
+          "sha256": "6dfde99f095a506f9b89fa9744ef356331c472177794f6b5d9a5abe839a99e6b",
+          "kind": "raw command output, copied unchanged"
+        },
+        {
+          "path": "evidence/retention-checks/20261015T134909Z-native-guard-m4-release-dispatching-unknown-roots-795818d2/command.status",
+          "bytes": 4,
+          "sha256": "39b8dc3fc8b44765c8e6f1adee04c5b465e555ab791cc42d0d9e810d5b64297c",
+          "kind": "original numeric status, copied unchanged"
+        },
+        {
+          "path": "evidence/mutation-backups/m4-release-dispatching-unknown-roots.7vJKeT",
+          "bytes": 38968,
+          "sha256": "e17607f4b349556be3eb38651e8bd270087c84d3023c7b767b3308293aa838b5",
+          "kind": "original mutation source backup, copied unchanged"
+        }
+      ]
+    },
+    {
+      "id": "M5",
+      "name": "m5-gc-ignores-retained-root-marker",
+      "guard": "GC liveness for retained native-job roots",
+      "source_path": "packages/aethyme/rust/crates/aethyme-broker/src/collaboration_gc.rs",
+      "source_commit": "d52bc0a514fc5035fe143b97208a9e328f6a5d8e",
+      "source_tree": "8840983777e2bc46dac1a2b5c748935955cb7be6",
+      "source_restored_sha256": "aa98ce865560de6a91b426fbcdf4fa570c8e1258845675a63d620995c89ddb1f",
+      "backup_sha256": "aa98ce865560de6a91b426fbcdf4fa570c8e1258845675a63d620995c89ddb1f",
+      "test": "native_gates::tests::completed_job_release_survives_real_gc_and_reopened_status_reads",
+      "numeric_exit": 101,
+      "results": {
+        "selected": 1,
+        "returned_ok": 0,
+        "returned_assertion_failures": 1,
+        "ignored": 0
+      },
+      "classification": "expected_named_assertion_failure_after_mutation",
+      "credited_as_baseline_pass": false,
+      "confirmed_guard": true,
+      "artifacts": [
+        {
+          "path": "evidence/retention-checks/20261015T135015Z-native-guard-m5-gc-retains-released-root-8b5583e1/command.json",
+          "bytes": 4597,
+          "sha256": "e33adef9ef96fdfba9fbd1056d07736dcec3f8e65c72f36562e3e653f45996ed",
+          "kind": "original recorder metadata, copied unchanged"
+        },
+        {
+          "path": "evidence/retention-checks/20261015T135015Z-native-guard-m5-gc-retains-released-root-8b5583e1/command.log",
+          "bytes": 4564,
+          "sha256": "5e93bb6eaabc352f209342df8d828e278c02dd2c529270a6609b43ea8553948e",
+          "kind": "raw command output, copied unchanged"
+        },
+        {
+          "path": "evidence/retention-checks/20261015T135015Z-native-guard-m5-gc-retains-released-root-8b5583e1/command.status",
+          "bytes": 4,
+          "sha256": "39b8dc3fc8b44765c8e6f1adee04c5b465e555ab791cc42d0d9e810d5b64297c",
+          "kind": "original numeric status, copied unchanged"
+        },
+        {
+          "path": "evidence/mutation-backups/m5-gc-ignores-retained-root-marker.lUgHDo",
+          "bytes": 118203,
+          "sha256": "aa98ce865560de6a91b426fbcdf4fa570c8e1258845675a63d620995c89ddb1f",
+          "kind": "original mutation source backup, copied unchanged"
+        }
+      ]
+    },
+    {
+      "id": "M6",
+      "name": "m6-prepare-ignores-release-marker",
+      "guard": "prepare rejects released jobs before replay or dispatch",
+      "source_path": "packages/aethyme/rust/crates/aethyme-broker/src/native_gates.rs",
+      "source_commit": "d52bc0a514fc5035fe143b97208a9e328f6a5d8e",
+      "source_tree": "8840983777e2bc46dac1a2b5c748935955cb7be6",
+      "source_restored_sha256": "e17607f4b349556be3eb38651e8bd270087c84d3023c7b767b3308293aa838b5",
+      "backup_sha256": "e17607f4b349556be3eb38651e8bd270087c84d3023c7b767b3308293aa838b5",
+      "test": "native_gates::tests::released_prepared_job_remains_readable_but_cannot_be_dispatched_or_replayed",
+      "numeric_exit": 101,
+      "results": {
+        "selected": 1,
+        "returned_ok": 0,
+        "returned_assertion_failures": 1,
+        "ignored": 0
+      },
+      "classification": "expected_named_assertion_failure_after_mutation",
+      "credited_as_baseline_pass": false,
+      "confirmed_guard": true,
+      "artifacts": [
+        {
+          "path": "evidence/retention-checks/20261015T135121Z-native-guard-m6-prepare-ignores-release-marker-beb3eec0/command.json",
+          "bytes": 4638,
+          "sha256": "9e41e88418b166b4f50b26b71182fe6a3732664faac0448266cbdfdbd996a6e1",
+          "kind": "original recorder metadata, copied unchanged"
+        },
+        {
+          "path": "evidence/retention-checks/20261015T135121Z-native-guard-m6-prepare-ignores-release-marker-beb3eec0/command.log",
+          "bytes": 4208,
+          "sha256": "0b5fd4b60d5a37f530d7502076c3defccc00acfaa3058a76b1be77d2ecf97c38",
+          "kind": "raw command output, copied unchanged"
+        },
+        {
+          "path": "evidence/retention-checks/20261015T135121Z-native-guard-m6-prepare-ignores-release-marker-beb3eec0/command.status",
+          "bytes": 4,
+          "sha256": "39b8dc3fc8b44765c8e6f1adee04c5b465e555ab791cc42d0d9e810d5b64297c",
+          "kind": "original numeric status, copied unchanged"
+        },
+        {
+          "path": "evidence/mutation-backups/m6-prepare-ignores-released-marker.631Yrm",
+          "bytes": 38968,
+          "sha256": "e17607f4b349556be3eb38651e8bd270087c84d3023c7b767b3308293aa838b5",
+          "kind": "original mutation source backup, copied unchanged"
+        }
+      ]
+    },
+    {
+      "id": "local-native-restore-sanity-stale-mutant-binary",
+      "source_commit": "d52bc0a514fc5035fe143b97208a9e328f6a5d8e",
+      "source_tree": "8840983777e2bc46dac1a2b5c748935955cb7be6",
+      "kind": "focused restored-source native lifecycle sanity test",
+      "started_at_utc": "2026-10-15T13:54:09.296607Z",
+      "finished_at_utc": "2026-10-15T13:54:33.401298Z",
+      "wall_seconds": 24.177095,
+      "argv": [
+        "cargo",
+        "test",
+        "--locked",
+        "-j",
+        "4",
+        "-p",
+        "aethyme-broker",
+        "--lib",
+        "released_prepared_job_remains_readable_but_cannot_be_dispatched_or_replayed",
+        "--",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "numeric_exit": 101,
+      "classification": "stale_cached_binary_after_source_restore",
+      "source_unchanged": true,
+      "results": {
+        "selected": 1,
+        "test_result": {
+          "test_result": "FAILED",
+          "passed": 0,
+          "failed": 1,
+          "ignored": 0,
+          "measured": 0,
+          "filtered_out": 1819
+        }
+      },
+      "credited": false,
+      "artifacts": [
+        {
+          "path": "evidence/retention-checks/20261015T135408Z-native-restore-sanity-released-prepared-job-ecca5b1b/command.json",
+          "bytes": 4527,
+          "sha256": "b1b700ea326309e6c639ac4f02fc36ee1426f8e8dc625569caadec0e080144ad",
+          "kind": "original recorder metadata, copied unchanged"
+        },
+        {
+          "path": "evidence/retention-checks/20261015T135408Z-native-restore-sanity-released-prepared-job-ecca5b1b/command.log",
+          "bytes": 1107,
+          "sha256": "ebb965c24ebc024d0d6c949b011cd9a530dce0c1e359bdbab64a09da13b2a976",
+          "kind": "raw command output, copied unchanged"
+        },
+        {
+          "path": "evidence/retention-checks/20261015T135408Z-native-restore-sanity-released-prepared-job-ecca5b1b/command.status",
+          "bytes": 4,
+          "sha256": "39b8dc3fc8b44765c8e6f1adee04c5b465e555ab791cc42d0d9e810d5b64297c",
+          "kind": "original numeric status, copied unchanged"
+        }
+      ],
+      "finding": "Cargo reported an already-finished test profile without rebuilding; the RootsReleased assertion still failed after source restoration. No restored-source pass credit."
+    },
+    {
+      "id": "local-native-restore-sanity-after-mtime-invalidation-no-final-status",
+      "source_commit": "d52bc0a514fc5035fe143b97208a9e328f6a5d8e",
+      "source_tree": "8840983777e2bc46dac1a2b5c748935955cb7be6",
+      "kind": "focused restored-source native lifecycle sanity test",
+      "started_at_utc": "2026-10-15T13:55:42.917462Z",
+      "finished_at_utc": null,
+      "wall_seconds": null,
+      "argv": [
+        "cargo",
+        "test",
+        "--locked",
+        "-j",
+        "4",
+        "-p",
+        "aethyme-broker",
+        "--lib",
+        "released_prepared_job_remains_readable_but_cannot_be_dispatched_or_replayed",
+        "--",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "numeric_exit": null,
+      "classification": "incomplete_no_final_status",
+      "source_unchanged": null,
+      "results": {
+        "selected": 1,
+        "test_started": true,
+        "test_result": null,
+        "unresolved": 1
+      },
+      "credited": false,
+      "artifacts": [
+        {
+          "path": "evidence/retention-checks/20261015T135542Z-native-restore-sanity-released-prepared-job-after-mtime-invalidation-1d87690d/command.json",
+          "bytes": 3825,
+          "sha256": "60ee3ec6d03e5f5b427206883044b1a03c829b558e8b068d34da6f8fcbce4cb7",
+          "kind": "original recorder metadata, copied unchanged"
+        },
+        {
+          "path": "evidence/retention-checks/20261015T135542Z-native-restore-sanity-released-prepared-job-after-mtime-invalidation-1d87690d/command.log",
+          "bytes": 641,
+          "sha256": "f5bb4ff16ae1d90199ad29cd195963192b5d3f9e954b7522bcb79d1270ccdc98",
+          "kind": "raw command output, copied unchanged"
+        },
+        {
+          "path": "reconciliations/20261015T135542Z-native-restore-sanity-incomplete.json",
+          "bytes": 2440,
+          "sha256": "7c52ae6be5cd06d07c5d816dd28a76008e8443ec327c384138749faa0abee8a1",
+          "kind": "separate missing-status reconciliation"
+        }
+      ],
+      "reconciliation": "reconciliations/20261015T135542Z-native-restore-sanity-incomplete.json"
+    },
+    {
+      "id": "local-native-restore-sanity-host-state-setup-failure",
+      "source_commit": "3df43525dafede5f5c0119b9e8444ed9730dea9f",
+      "source_tree": "04d4728e2f5a92c8e6928197d26fb743b2269ac8",
+      "kind": "focused restored-source native lifecycle sanity test",
+      "started_at_utc": "2026-10-15T14:13:05.209105Z",
+      "finished_at_utc": "2026-10-15T14:14:15.684677Z",
+      "wall_seconds": 70.60756,
+      "argv": [
+        "/usr/bin/caffeinate",
+        "-i",
+        "/Users/christophehenner/.cargo/bin/cargo",
+        "test",
+        "--locked",
+        "-j",
+        "4",
+        "-p",
+        "aethyme-broker",
+        "--lib",
+        "released_prepared_job_remains_readable_but_cannot_be_dispatched_or_replayed",
+        "--",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "numeric_exit": 101,
+      "classification": "environment_setup_failure",
+      "source_unchanged": true,
+      "results": {
+        "selected": 1,
+        "returned_environment_failures": 1,
+        "assertion_failures": 0
+      },
+      "credited": false,
+      "artifacts": [
+        {
+          "path": "evidence/retention-checks/20261015T141304Z-native-restore-sanity-released-prepared-job-restored-source-3eb184a8/command.json",
+          "bytes": 4455,
+          "sha256": "79a24b46cc5795470d3aabe648103a290ee3fd4362521208580e0f359889647a",
+          "kind": "original recorder metadata, copied unchanged"
+        },
+        {
+          "path": "evidence/retention-checks/20261015T141304Z-native-restore-sanity-released-prepared-job-restored-source-3eb184a8/command.log",
+          "bytes": 1588,
+          "sha256": "6bd108d144b5269ec4378ded24d2922d3cba4c748efa3dd9e3268820697d5d45",
+          "kind": "raw command output, copied unchanged"
+        },
+        {
+          "path": "evidence/retention-checks/20261015T141304Z-native-restore-sanity-released-prepared-job-restored-source-3eb184a8/command.status",
+          "bytes": 4,
+          "sha256": "39b8dc3fc8b44765c8e6f1adee04c5b465e555ab791cc42d0d9e810d5b64297c",
+          "kind": "original numeric status, copied unchanged"
+        }
+      ],
+      "finding": "Fixture setup failed because neither HOME nor AETHYME_HOST_STATE_DIR was set; no lifecycle assertion was evaluated."
+    },
+    {
+      "id": "local-native-restore-sanity-restored-source-pass",
+      "source_commit": "3df43525dafede5f5c0119b9e8444ed9730dea9f",
+      "source_tree": "04d4728e2f5a92c8e6928197d26fb743b2269ac8",
+      "kind": "focused restored-source native lifecycle sanity test",
+      "started_at_utc": "2026-10-15T14:16:08.305782Z",
+      "finished_at_utc": "2026-10-15T14:16:12.681309Z",
+      "wall_seconds": 4.529217,
+      "argv": [
+        "/usr/bin/caffeinate",
+        "-i",
+        "/Users/christophehenner/.cargo/bin/cargo",
+        "test",
+        "--locked",
+        "-j",
+        "4",
+        "-p",
+        "aethyme-broker",
+        "--lib",
+        "released_prepared_job_remains_readable_but_cannot_be_dispatched_or_replayed",
+        "--",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "numeric_exit": 0,
+      "classification": "passed",
+      "source_unchanged": true,
+      "results": {
+        "selected": 1,
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0
+      },
+      "credited": true,
+      "artifacts": [
+        {
+          "path": "evidence/retention-checks/20261015T141607Z-native-restore-sanity-released-prepared-job-restored-source-private-host-state-a1484db1/command.json",
+          "bytes": 4741,
+          "sha256": "c10d27256f6d53c37ba33a8566bef020cb27ff808b8526fd1427170db86565eb",
+          "kind": "original recorder metadata, copied unchanged"
+        },
+        {
+          "path": "evidence/retention-checks/20261015T141607Z-native-restore-sanity-released-prepared-job-restored-source-private-host-state-a1484db1/command.log",
+          "bytes": 531,
+          "sha256": "ed8b43c6c5621688230e7f7e03545b45cae42c3c29233954b095e22809c3f33f",
+          "kind": "raw command output, copied unchanged"
+        },
+        {
+          "path": "evidence/retention-checks/20261015T141607Z-native-restore-sanity-released-prepared-job-restored-source-private-host-state-a1484db1/command.status",
+          "bytes": 2,
+          "sha256": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa",
+          "kind": "original numeric status, copied unchanged"
+        }
+      ]
+    },
+    {
+      "id": "local-cli-snapshot-and-discarded-ratchet",
+      "kind": "CLI help snapshot and discarded-results ratchet checks",
+      "results": {
+        "command_runs": 5,
+        "selected": 5,
+        "passed": 5,
+        "failed": 0
+      },
+      "checks": [
+        {
+          "run": "20261015T133705Z-cli-help-snapshot-regeneration-06cc7e7d",
+          "kind": "snapshot_regeneration",
+          "source_commit": "e9a62f328db011d00def7a40ffccbe2da4c82967",
+          "source_tree": "61a3bceeb876587819222cca6344574e04d77857",
+          "numeric_exit": 0,
+          "selected": 1,
+          "passed": 1,
+          "source_unchanged": false,
+          "final_restored_source_check": false
+        },
+        {
+          "run": "20261015T133842Z-cli-help-snapshot-verify-ccc765ce",
+          "kind": "snapshot_verification_after_regeneration",
+          "source_commit": "e9a62f328db011d00def7a40ffccbe2da4c82967",
+          "source_tree": "61a3bceeb876587819222cca6344574e04d77857",
+          "numeric_exit": 0,
+          "selected": 1,
+          "passed": 1,
+          "source_unchanged": true,
+          "final_restored_source_check": false
+        },
+        {
+          "run": "20261015T133929Z-discarded-results-ratchet-143-925ec645",
+          "kind": "discarded_results_ratchet_before_restore",
+          "source_commit": "e9a62f328db011d00def7a40ffccbe2da4c82967",
+          "source_tree": "61a3bceeb876587819222cca6344574e04d77857",
+          "numeric_exit": 0,
+          "selected": 1,
+          "passed": 1,
+          "source_unchanged": true,
+          "final_restored_source_check": false
+        },
+        {
+          "run": "20261015T141649Z-cli-help-snapshot-verify-after-restored-source-169e1579",
+          "kind": "final_snapshot_verification_after_restore",
+          "source_commit": "3df43525dafede5f5c0119b9e8444ed9730dea9f",
+          "source_tree": "04d4728e2f5a92c8e6928197d26fb743b2269ac8",
+          "numeric_exit": 0,
+          "selected": 1,
+          "passed": 1,
+          "source_unchanged": true,
+          "final_restored_source_check": true
+        },
+        {
+          "run": "20261015T141801Z-discarded-results-ratchet-after-restored-source-3c4ca041",
+          "kind": "final_discarded_results_ratchet_after_restore",
+          "source_commit": "3df43525dafede5f5c0119b9e8444ed9730dea9f",
+          "source_tree": "04d4728e2f5a92c8e6928197d26fb743b2269ac8",
+          "numeric_exit": 0,
+          "selected": 1,
+          "passed": 1,
+          "source_unchanged": true,
+          "final_restored_source_check": true
+        }
+      ],
+      "credited_final_restored_source_runs": 2,
+      "artifacts": [
+        {
+          "path": "evidence/retention-checks/20261015T133705Z-cli-help-snapshot-regeneration-06cc7e7d/command.json",
+          "bytes": 4594,
+          "sha256": "e772556ef954a8a3e20dbef30e09d05ad349811e4e36bdf71bebe1f04c6aa544",
+          "kind": "original recorder metadata, copied unchanged"
+        },
+        {
+          "path": "evidence/retention-checks/20261015T133705Z-cli-help-snapshot-regeneration-06cc7e7d/command.log",
+          "bytes": 3610,
+          "sha256": "a637ca806b3a8a0ac7921dd427caedeb606681969b714025650cbe13c6a24a23",
+          "kind": "raw command output, copied unchanged"
+        },
+        {
+          "path": "evidence/retention-checks/20261015T133705Z-cli-help-snapshot-regeneration-06cc7e7d/command.status",
+          "bytes": 2,
+          "sha256": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa",
+          "kind": "original numeric status, copied unchanged"
+        },
+        {
+          "path": "evidence/retention-checks/20261015T133842Z-cli-help-snapshot-verify-ccc765ce/command.json",
+          "bytes": 4562,
+          "sha256": "8b34526290fe999ebfd2e17c2c9e5a7db5b61115124861fee14f71d6e4dda195",
+          "kind": "original recorder metadata, copied unchanged"
+        },
+        {
+          "path": "evidence/retention-checks/20261015T133842Z-cli-help-snapshot-verify-ccc765ce/command.log",
+          "bytes": 465,
+          "sha256": "5795e18f6689cc7c14bf4e080a3fb2c7d68ee8d768fd66659aa06625d28e0847",
+          "kind": "raw command output, copied unchanged"
+        },
+        {
+          "path": "evidence/retention-checks/20261015T133842Z-cli-help-snapshot-verify-ccc765ce/command.status",
+          "bytes": 2,
+          "sha256": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa",
+          "kind": "original numeric status, copied unchanged"
+        },
+        {
+          "path": "evidence/retention-checks/20261015T133929Z-discarded-results-ratchet-143-925ec645/command.json",
+          "bytes": 4623,
+          "sha256": "964abc89e8a0526047fcf24138d065795c92dfcd9658360597c92d6fefb50541",
+          "kind": "original recorder metadata, copied unchanged"
+        },
+        {
+          "path": "evidence/retention-checks/20261015T133929Z-discarded-results-ratchet-143-925ec645/command.log",
+          "bytes": 507,
+          "sha256": "ae8b1654e299d57db818d8add85b77c2ad0b201ba409bfef1180b62146b50606",
+          "kind": "raw command output, copied unchanged"
+        },
+        {
+          "path": "evidence/retention-checks/20261015T133929Z-discarded-results-ratchet-143-925ec645/command.status",
+          "bytes": 2,
+          "sha256": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa",
+          "kind": "original numeric status, copied unchanged"
+        },
+        {
+          "path": "evidence/retention-checks/20261015T141649Z-cli-help-snapshot-verify-after-restored-source-169e1579/command.json",
+          "bytes": 4547,
+          "sha256": "433a601136f3cdfbde7db231a5957abd96a50f90d5b88e4c884a78448c49ae18",
+          "kind": "original recorder metadata, copied unchanged"
+        },
+        {
+          "path": "evidence/retention-checks/20261015T141649Z-cli-help-snapshot-verify-after-restored-source-169e1579/command.log",
+          "bytes": 1093,
+          "sha256": "e8336ebc96c49ce8d4c6bd598317fcb459342fe8a25b39e0f498c9504e241755",
+          "kind": "raw command output, copied unchanged"
+        },
+        {
+          "path": "evidence/retention-checks/20261015T141649Z-cli-help-snapshot-verify-after-restored-source-169e1579/command.status",
+          "bytes": 2,
+          "sha256": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa",
+          "kind": "original numeric status, copied unchanged"
+        },
+        {
+          "path": "evidence/retention-checks/20261015T141801Z-discarded-results-ratchet-after-restored-source-3c4ca041/command.json",
+          "bytes": 4585,
+          "sha256": "2474e0d9e0360ebe662769c2f6f3aa55137ff9ce79d9e8b17e72f240270af445",
+          "kind": "original recorder metadata, copied unchanged"
+        },
+        {
+          "path": "evidence/retention-checks/20261015T141801Z-discarded-results-ratchet-after-restored-source-3c4ca041/command.log",
+          "bytes": 507,
+          "sha256": "23d2f3c70766436819241c028d5994264148792b2489410af96c6467b6b5441b",
+          "kind": "raw command output, copied unchanged"
+        },
+        {
+          "path": "evidence/retention-checks/20261015T141801Z-discarded-results-ratchet-after-restored-source-3c4ca041/command.status",
+          "bytes": 2,
+          "sha256": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa",
+          "kind": "original numeric status, copied unchanged"
+        }
+      ]
+    },
+    {
+      "id": "local-strict-clippy-wrong-working-directory",
+      "source_commit": "e9a62f328db011d00def7a40ffccbe2da4c82967",
+      "source_tree": "61a3bceeb876587819222cca6344574e04d77857",
+      "kind": "strict Clippy for broker library and tests",
+      "argv": [
+        "cargo",
+        "clippy",
+        "--locked",
+        "-j",
+        "4",
+        "-p",
+        "aethyme-broker",
+        "--lib",
+        "--tests",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "working_directory": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/reconcile-retention-of-inactive-native-g",
+      "numeric_exit": 101,
+      "tests_executed": 0,
+      "credited_as_test_pass": false,
+      "finding": "Cargo manifest was not found from the wrong working directory; no compilation or tests ran.",
+      "credited_as_lint_pass": false,
+      "artifacts": [
+        {
+          "path": "evidence/retention-checks/20261015T134059Z-native-strict-clippy-broker-lib-tests-e9a62-aa63c39d/command.json",
+          "bytes": 4392,
+          "sha256": "71ad8a478378f21d2562ad2ab08ca4b8e07cb7a3a05b77206211a9d699b0e934",
+          "kind": "original recorder metadata, copied unchanged"
+        },
+        {
+          "path": "evidence/retention-checks/20261015T134059Z-native-strict-clippy-broker-lib-tests-e9a62-aa63c39d/command.log",
+          "bytes": 193,
+          "sha256": "3ec7efe3b7a2fa91f8fced8726eea8960572d0f5ac8cb8517b461c07e21c55a2",
+          "kind": "raw command output, copied unchanged"
+        },
+        {
+          "path": "evidence/retention-checks/20261015T134059Z-native-strict-clippy-broker-lib-tests-e9a62-aa63c39d/command.status",
+          "bytes": 4,
+          "sha256": "39b8dc3fc8b44765c8e6f1adee04c5b465e555ab791cc42d0d9e810d5b64297c",
+          "kind": "original numeric status, copied unchanged"
+        }
+      ]
+    },
+    {
+      "id": "local-strict-clippy-broker-lib-tests-pass",
+      "source_commit": "e9a62f328db011d00def7a40ffccbe2da4c82967",
+      "source_tree": "61a3bceeb876587819222cca6344574e04d77857",
+      "kind": "strict Clippy for broker library and tests",
+      "argv": [
+        "cargo",
+        "clippy",
+        "--locked",
+        "-j",
+        "4",
+        "-p",
+        "aethyme-broker",
+        "--lib",
+        "--tests",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "working_directory": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/reconcile-retention-of-inactive-native-g/packages/aethyme/rust",
+      "numeric_exit": 0,
+      "tests_executed": 0,
+      "credited_as_test_pass": false,
+      "finding": "Correct-cwd strict broker Clippy completed with exit 0.",
+      "credited_as_lint_pass": true,
+      "artifacts": [
+        {
+          "path": "evidence/retention-checks/20261015T134117Z-native-strict-clippy-broker-lib-tests-e9a62-correct-cwd-ac4dbd2b/command.json",
+          "bytes": 4657,
+          "sha256": "cc80e763ebcf09c5e7f2f7653e24045eee5d7607cf706e50a398576c5cfdd5c0",
+          "kind": "original recorder metadata, copied unchanged"
+        },
+        {
+          "path": "evidence/retention-checks/20261015T134117Z-native-strict-clippy-broker-lib-tests-e9a62-correct-cwd-ac4dbd2b/command.log",
+          "bytes": 495,
+          "sha256": "7558bf6d73ad856d6c0fa57daab753ffef9ef713f42f857a084f3062f9eff173",
+          "kind": "raw command output, copied unchanged"
+        },
+        {
+          "path": "evidence/retention-checks/20261015T134117Z-native-strict-clippy-broker-lib-tests-e9a62-correct-cwd-ac4dbd2b/command.status",
+          "bytes": 2,
+          "sha256": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa",
+          "kind": "original numeric status, copied unchanged"
+        }
+      ]
+    },
+    {
+      "id": "local-recorder-selfcheck",
+      "source_commit": "e9a62f328db011d00def7a40ffccbe2da4c82967",
+      "source_tree": "61a3bceeb876587819222cca6344574e04d77857",
+      "kind": "local recorder self-check",
+      "numeric_exit": 0,
+      "tests_executed": 0,
+      "credited_as_native_test": false,
+      "artifacts": [
+        {
+          "path": "evidence/retention-checks/20261015T132651Z-recorder-selfcheck-7a489324/command.json",
+          "bytes": 4181,
+          "sha256": "0c8b095a71a1635d3f57ca8c4cd2dd5ddf67d28349bf6e180a21ed2484ed2506",
+          "kind": "original recorder metadata, copied unchanged"
+        },
+        {
+          "path": "evidence/retention-checks/20261015T132651Z-recorder-selfcheck-7a489324/command.log",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "kind": "raw command output, copied unchanged"
+        },
+        {
+          "path": "evidence/retention-checks/20261015T132651Z-recorder-selfcheck-7a489324/command.status",
+          "bytes": 2,
+          "sha256": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa",
+          "kind": "original numeric status, copied unchanged"
+        }
+      ]
+    },
+    {
+      "id": "ci-pr782-workspace-166f-evidence-packaging",
+      "source_commit": "166f50ff91edab18636ec60743aca64bd6f0ea7a",
+      "source_tree": "8dfa038eb4ee36e5480e53d5fd41efd1ecf6d1f0",
+      "base_commit": "ca871706c78fcf2fa14ef4f12280dcfc398d4246",
+      "tested_merge_commit": "e79cf215ab9a1b37001f322e9e09ab1b20d7324b",
+      "tested_merge_tree": "8dfa038eb4ee36e5480e53d5fd41efd1ecf6d1f0",
+      "kind": "GitHub Actions full Rust workspace test job",
+      "workflow_run_id": 38752441026,
+      "check_run_id": 116482035155,
+      "check_run_name": "Rust workspace tests",
+      "check_run_url": "https://github.com/schiste/Aethyme/actions/runs/38752441026/job/116482035155",
+      "started_at_utc": "2026-10-15T14:33:24Z",
+      "finished_at_utc": "2026-10-15T14:46:31Z",
+      "numeric_exit": 100,
+      "tests_executed": 4557,
+      "results": {
+        "passed": 4556,
+        "failed": 1,
+        "skipped": 31
+      },
+      "failure": "The sole failed test was aethyme-testkit::docs_hygiene::documentation_has_last_updated, which reported missing last-updated metadata at evidence/notes/attempts-ledger-original.md. The original note bytes are preserved unchanged under the .txt extension. This CI result remains failed; no post-rename CI result is recorded.",
+      "credited": false,
+      "artifacts": [
+        {
+          "path": "evidence/ci/pr782-116482035155-166f-workspace.log",
+          "artifact_root": "review_worktree",
+          "bytes": 980131,
+          "sha256": "d6422dad63a24f151cfaddcf80e8b2e62967c355e70a4de2815474699936629d",
+          "kind": "complete raw GitHub Actions CI log, copied unchanged"
+        }
+      ]
+    }
+  ],
+  "pending_checks_as_of_record": [],
+  "limits": [
+    "The final local native_gates filter passed all 15 selected tests; the focused restored-source lifecycle sanity check passed 1 of 1. These results qualify only the local native-job lifecycle checks recorded here.",
+    "The six guard-removal mutations each produced the exact named assertion failure against mutated source; restored source hashes match all six backups. Mutation failures confirm guards and are not baseline test passes.",
+    "A stale-binary restore attempt failed after Cargo reused an existing test binary; a later mtime-invalidated run compiled the restored crate but has no final status or result. Both receive no restored-source pass credit.",
+    "The later clean restored-source attempt first failed setup because HOME and AETHYME_HOST_STATE_DIR were absent; the successful run used an isolated private host-state directory.",
+    "The off-tree cached-binary retry at 11:16:55Z has six completed ok lines and ends during the ninth test without numeric status; nine selected cases are unresolved. The separate reconciliation records no matching process and no exact log writer. No exit or outcome is inferred.",
+    "The d524 full workspace CI run remains historical: 4,557 cases, 4,548 passed, 9 failed, 31 skipped (exit 100). Its migration fixture, CLI snapshot, and discarded-results findings are preserved; this package did not rerun the full workspace. A later PR 782 workspace CI run on head 166f50ff91edab18636ec60743aca64bd6f0ea7a (synthetic merge e79cf215ab9a1b37001f322e9e09ab1b20d7324b) executed 4,557 tests: 4,556 passed, 1 failed, and 31 skipped (exit 100). Its sole failure was the docs-hygiene check on the original attempts note's Markdown extension. That payload is now preserved byte-for-byte as .txt; no post-rename CI result is recorded.",
+    "The initial nested-TMPDIR run returned one pass and 14 environmental failures before intended lifecycle assertions. It remains in the denominator with zero qualification credit.",
+    "Compile, formatting, wrong-working-directory Clippy and CI checks that executed no tests receive no test credit. Correct-cwd strict broker Clippy passed.",
+    "No model calls, sealed evaluation or private oracle use is part of this lifecycle qualification."
+  ],
+  "reconciliations": [
+    {
+      "id": "reconcile-cached-serial-d524-offtree-20261015",
+      "recorded_at_utc": "2026-10-15T13:20:31Z",
+      "attempt_id": "local-native-gates-cached-serial-d524-offtree-no-final-status",
+      "record": "target/local-resume/final-integration-20261015T111655Z/native-gates-cached-serial-d524-offtree-tmp-20261015-reconciliation.json",
+      "record_bytes": 3964,
+      "record_sha256": "b5b29e7edf4954c170fc222fb3354079720fdd5e81508f9c97f97c688f93dae7",
+      "state": "abandoned_without_final_status",
+      "numeric_exit": null,
+      "complete_command_pass": false,
+      "original_artifacts_modified": false
+    },
+    {
+      "id": "reconcile-restored-sanity-after-mtime-invalidation-20261015",
+      "recorded_at_utc": "2026-10-15T14:26:46Z",
+      "attempt_id": "local-native-restore-sanity-after-mtime-invalidation-no-final-status",
+      "record": "reconciliations/20261015T135542Z-native-restore-sanity-incomplete.json",
+      "record_bytes": 2440,
+      "record_sha256": "7c52ae6be5cd06d07c5d816dd28a76008e8443ec327c384138749faa0abee8a1",
+      "state": "incomplete_no_final_status",
+      "numeric_exit": null,
+      "complete_command_pass": false,
+      "original_artifacts_modified": false
+    }
+  ],
+  "source_bindings": "source-bindings.json",
+  "artifacts": [
+    {
+      "path": "README.md",
+      "bytes": 3475,
+      "sha256": "69f9f84bc2827ac7a4dc814c83f1808a1965c9bae0dc80bdade85549472d31c6"
+    },
+    {
+      "path": "evidence/ci/pr782-116370216237-622.log",
+      "bytes": 53851,
+      "sha256": "fdc00755d03c4541d7c12b25840fcfd3637d368d3728e692b237f45ff8f7b761"
+    },
+    {
+      "path": "evidence/ci/pr782-116370216652-622.log",
+      "bytes": 49095,
+      "sha256": "3c9b16d9b5b7a75df9f80d4f07dae085f37fde68144584ce291ee73265af89a7"
+    },
+    {
+      "path": "evidence/ci/pr782-116482035155-166f-workspace.log",
+      "bytes": 980131,
+      "sha256": "d6422dad63a24f151cfaddcf80e8b2e62967c355e70a4de2815474699936629d"
+    },
+    {
+      "path": "evidence/ci/pr782-lint-346001.log",
+      "bytes": 49838,
+      "sha256": "431d6da0d6ac49876aaa94496b740de7dd830aca7aac2251e576da43b85c2c62"
+    },
+    {
+      "path": "evidence/ci/pr782-workspace-d524.log",
+      "bytes": 1060792,
+      "sha256": "7d120b0e565b8afc87d423acbb70d46fceba03bd92e72a7cee41bf3a5cbb066a"
+    },
+    {
+      "path": "evidence/final-integration/final-integration-20261015T104055Z/native-gates-all.json",
+      "bytes": 1686,
+      "sha256": "a7c14168ec9676fe869c02dacf1d1b604a0123a1e904457cfb32d7c081e81562"
+    },
+    {
+      "path": "evidence/final-integration/final-integration-20261015T104055Z/native-gates-all.log",
+      "bytes": 4362,
+      "sha256": "421db81263b95501477ac23084cae46b2c6d012c67500f83e3d9fbaac04e0892"
+    },
+    {
+      "path": "evidence/final-integration/final-integration-20261015T104055Z/native-gates-all.status",
+      "bytes": 4,
+      "sha256": "39b8dc3fc8b44765c8e6f1adee04c5b465e555ab791cc42d0d9e810d5b64297c"
+    },
+    {
+      "path": "evidence/final-integration/final-integration-20261015T105719Z/native-gates-full-closure-d524f3e.json",
+      "bytes": 1703,
+      "sha256": "007b264cc318f357cf92d636e3c1ffc2e0d3eace25224172cd60060149855269"
+    },
+    {
+      "path": "evidence/final-integration/final-integration-20261015T105719Z/native-gates-full-closure-d524f3e.log",
+      "bytes": 4433,
+      "sha256": "edac8513324259d2d0984dc6ae7437d9f18287eaf955fd4281850f993c142660"
+    },
+    {
+      "path": "evidence/final-integration/final-integration-20261015T105719Z/native-gates-full-closure-d524f3e.status",
+      "bytes": 4,
+      "sha256": "39b8dc3fc8b44765c8e6f1adee04c5b465e555ab791cc42d0d9e810d5b64297c"
+    },
+    {
+      "path": "evidence/final-integration/final-integration-20261015T111345Z/native-gates-cached-serial-d524-20261015.json",
+      "bytes": 2047,
+      "sha256": "2b00411eba0fd497194162ca1aacdba63a8134bc385a3a77541108fb9cf818c2"
+    },
+    {
+      "path": "evidence/final-integration/final-integration-20261015T111345Z/native-gates-cached-serial-d524-20261015.log",
+      "bytes": 11683,
+      "sha256": "5638959ccce7c071871723f19d5272df0ac4fb2bb156fa125ab8c8266d93cd0d"
+    },
+    {
+      "path": "evidence/final-integration/final-integration-20261015T111345Z/native-gates-cached-serial-d524-20261015.status",
+      "bytes": 4,
+      "sha256": "39b8dc3fc8b44765c8e6f1adee04c5b465e555ab791cc42d0d9e810d5b64297c"
+    },
+    {
+      "path": "evidence/final-integration/final-integration-20261015T111655Z/native-gates-cached-serial-d524-offtree-tmp-20261015-reconciliation.json",
+      "bytes": 3964,
+      "sha256": "b5b29e7edf4954c170fc222fb3354079720fdd5e81508f9c97f97c688f93dae7"
+    },
+    {
+      "path": "evidence/final-integration/final-integration-20261015T111655Z/native-gates-cached-serial-d524-offtree-tmp-20261015.json",
+      "bytes": 1575,
+      "sha256": "8a5b5cf3d7680f78d58cfc0ffdaf187393620ca8c1729e57e3bb0b8960133f56"
+    },
+    {
+      "path": "evidence/final-integration/final-integration-20261015T111655Z/native-gates-cached-serial-d524-offtree-tmp-20261015.log",
+      "bytes": 1156,
+      "sha256": "4f1ad62cc55c2c0994e626607321cc764ea1025f274fc6ad621c12156dd2d30f"
+    },
+    {
+      "path": "evidence/mutation-backups/m1-release-without-archive-use.NKsZIC",
+      "bytes": 38968,
+      "sha256": "e17607f4b349556be3eb38651e8bd270087c84d3023c7b767b3308293aa838b5"
+    },
+    {
+      "path": "evidence/mutation-backups/m2-release-without-owner-authorization.73zwDd",
+      "bytes": 38968,
+      "sha256": "e17607f4b349556be3eb38651e8bd270087c84d3023c7b767b3308293aa838b5"
+    },
+    {
+      "path": "evidence/mutation-backups/m3-disabled-schema23-old-client-trigger.Mqpbij",
+      "bytes": 83144,
+      "sha256": "998d698813a6ea3091e8445db54cc155b9b041633748c7c7cb86ee78761f0cd8"
+    },
+    {
+      "path": "evidence/mutation-backups/m4-release-dispatching-unknown-roots.7vJKeT",
+      "bytes": 38968,
+      "sha256": "e17607f4b349556be3eb38651e8bd270087c84d3023c7b767b3308293aa838b5"
+    },
+    {
+      "path": "evidence/mutation-backups/m5-gc-ignores-retained-root-marker.lUgHDo",
+      "bytes": 118203,
+      "sha256": "aa98ce865560de6a91b426fbcdf4fa570c8e1258845675a63d620995c89ddb1f"
+    },
+    {
+      "path": "evidence/mutation-backups/m6-prepare-ignores-released-marker.631Yrm",
+      "bytes": 38968,
+      "sha256": "e17607f4b349556be3eb38651e8bd270087c84d3023c7b767b3308293aa838b5"
+    },
+    {
+      "path": "evidence/notes/attempts-ledger-original.txt",
+      "bytes": 11210,
+      "sha256": "ea1f9d27c6ac00bbbfdbb842ec3c1b035fb15ce235ac1d3ff2de4a21f0559704"
+    },
+    {
+      "path": "evidence/retention-checks/20261015T132651Z-recorder-selfcheck-7a489324/command.json",
+      "bytes": 4181,
+      "sha256": "0c8b095a71a1635d3f57ca8c4cd2dd5ddf67d28349bf6e180a21ed2484ed2506"
+    },
+    {
+      "path": "evidence/retention-checks/20261015T132651Z-recorder-selfcheck-7a489324/command.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "evidence/retention-checks/20261015T132651Z-recorder-selfcheck-7a489324/command.status",
+      "bytes": 2,
+      "sha256": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa"
+    },
+    {
+      "path": "evidence/retention-checks/20261015T132750Z-native-gates-15-after-fixture-fix-34b08bec/command.json",
+      "bytes": 4447,
+      "sha256": "27d39c714a9282c0082ddf71db9ba637ec5f462c371c2f348715f2ff4fa53582"
+    },
+    {
+      "path": "evidence/retention-checks/20261015T132750Z-native-gates-15-after-fixture-fix-34b08bec/command.log",
+      "bytes": 2586,
+      "sha256": "74064f29e659a67c197c87c13934f8f893d1244b5d9b5988b6b982a731e29fc5"
+    },
+    {
+      "path": "evidence/retention-checks/20261015T132750Z-native-gates-15-after-fixture-fix-34b08bec/command.status",
+      "bytes": 2,
+      "sha256": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa"
+    },
+    {
+      "path": "evidence/retention-checks/20261015T133413Z-migration-archive-v1-8676b9f4/command.json",
+      "bytes": 4370,
+      "sha256": "47b2abf103ec2fc9252ec8f0fd1da21a8803ac3c9d7336d6f45e476f0a951d68"
+    },
+    {
+      "path": "evidence/retention-checks/20261015T133413Z-migration-archive-v1-8676b9f4/command.log",
+      "bytes": 499,
+      "sha256": "0b4302a21e86317aba9571d541e4127c187150a45d247f6e5875192a1fe1bb95"
+    },
+    {
+      "path": "evidence/retention-checks/20261015T133413Z-migration-archive-v1-8676b9f4/command.status",
+      "bytes": 2,
+      "sha256": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa"
+    },
+    {
+      "path": "evidence/retention-checks/20261015T133429Z-migration-context-v5-broad-postings-992372d0/command.json",
+      "bytes": 4471,
+      "sha256": "941076934d5d3bc56c817e9b8c39e456343d5a1bb90ac9a3fb9e2b621e71274f"
+    },
+    {
+      "path": "evidence/retention-checks/20261015T133429Z-migration-context-v5-broad-postings-992372d0/command.log",
+      "bytes": 525,
+      "sha256": "d87699cd33a559da84d338727d62671283b8e04a4d7824ca5039112c7cedce72"
+    },
+    {
+      "path": "evidence/retention-checks/20261015T133429Z-migration-context-v5-broad-postings-992372d0/command.status",
+      "bytes": 2,
+      "sha256": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa"
+    },
+    {
+      "path": "evidence/retention-checks/20261015T133432Z-migration-state-v3-floor-d0c3a6d8/command.json",
+      "bytes": 4403,
+      "sha256": "8df096ef541721ae0763a35c8ef8025dd5f51846fd8f08813f16fc7d1f814dc6"
+    },
+    {
+      "path": "evidence/retention-checks/20261015T133432Z-migration-state-v3-floor-d0c3a6d8/command.log",
+      "bytes": 510,
+      "sha256": "cffcbe42adb693ab79fde0266ed5abd663b4118bb0cba8aab542026ed8204946"
+    },
+    {
+      "path": "evidence/retention-checks/20261015T133432Z-migration-state-v3-floor-d0c3a6d8/command.status",
+      "bytes": 2,
+      "sha256": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa"
+    },
+    {
+      "path": "evidence/retention-checks/20261015T133436Z-migration-state-v2-inspection-read-only-e66ce180/command.json",
+      "bytes": 4476,
+      "sha256": "12ac6eb742eff096a22f2f3cb82a1d61cc8c7cecce12ed3247bb01e2a54f1e09"
+    },
+    {
+      "path": "evidence/retention-checks/20261015T133436Z-migration-state-v2-inspection-read-only-e66ce180/command.log",
+      "bytes": 508,
+      "sha256": "98f06d2c252060faaec2270997d68210ea1d9ea9c1901a7da584f11b22e78325"
+    },
+    {
+      "path": "evidence/retention-checks/20261015T133436Z-migration-state-v2-inspection-read-only-e66ce180/command.status",
+      "bytes": 2,
+      "sha256": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa"
+    },
+    {
+      "path": "evidence/retention-checks/20261015T133439Z-migration-exchange-v14-capture-rows-16c299f6/command.json",
+      "bytes": 4491,
+      "sha256": "768136d32f9f37cad08a6559dc587d8c42a8d49a3bcd2536034468f3ec956eae"
+    },
+    {
+      "path": "evidence/retention-checks/20261015T133439Z-migration-exchange-v14-capture-rows-16c299f6/command.log",
+      "bytes": 547,
+      "sha256": "fa6871fb97764ff6daf17537d1bcba7e422c83dd4516cdc8a1d8451d2d1fe500"
+    },
+    {
+      "path": "evidence/retention-checks/20261015T133439Z-migration-exchange-v14-capture-rows-16c299f6/command.status",
+      "bytes": 2,
+      "sha256": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa"
+    },
+    {
+      "path": "evidence/retention-checks/20261015T133442Z-migration-target-v6-resolution-attempts-2764effa/command.json",
+      "bytes": 4497,
+      "sha256": "e5b6985fb7f48ab45433df4c1426af48cfe1071a043d687ac83543d4f501539f"
+    },
+    {
+      "path": "evidence/retention-checks/20261015T133442Z-migration-target-v6-resolution-attempts-2764effa/command.log",
+      "bytes": 522,
+      "sha256": "eb63bd41e93bce6d173fb37a66c6b30b1f512c20a13ecdb8dc9bafd3f6c37bf3"
+    },
+    {
+      "path": "evidence/retention-checks/20261015T133442Z-migration-target-v6-resolution-attempts-2764effa/command.status",
+      "bytes": 2,
+      "sha256": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa"
+    },
+    {
+      "path": "evidence/retention-checks/20261015T133445Z-migration-controller-v18-retained-journals-903a4924/command.json",
+      "bytes": 4512,
+      "sha256": "eeeb860b2dd31c41bc3d00fa55cb4037b2f0cc5282914aabb87c349471d54754"
+    },
+    {
+      "path": "evidence/retention-checks/20261015T133445Z-migration-controller-v18-retained-journals-903a4924/command.log",
+      "bytes": 533,
+      "sha256": "743557f5e74fe96fe091ac992f4fd4293d51e7afc906263166ee1ce7cae36887"
+    },
+    {
+      "path": "evidence/retention-checks/20261015T133445Z-migration-controller-v18-retained-journals-903a4924/command.status",
+      "bytes": 2,
+      "sha256": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa"
+    },
+    {
+      "path": "evidence/retention-checks/20261015T133705Z-cli-help-snapshot-regeneration-06cc7e7d/command.json",
+      "bytes": 4594,
+      "sha256": "e772556ef954a8a3e20dbef30e09d05ad349811e4e36bdf71bebe1f04c6aa544"
+    },
+    {
+      "path": "evidence/retention-checks/20261015T133705Z-cli-help-snapshot-regeneration-06cc7e7d/command.log",
+      "bytes": 3610,
+      "sha256": "a637ca806b3a8a0ac7921dd427caedeb606681969b714025650cbe13c6a24a23"
+    },
+    {
+      "path": "evidence/retention-checks/20261015T133705Z-cli-help-snapshot-regeneration-06cc7e7d/command.status",
+      "bytes": 2,
+      "sha256": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa"
+    },
+    {
+      "path": "evidence/retention-checks/20261015T133842Z-cli-help-snapshot-verify-ccc765ce/command.json",
+      "bytes": 4562,
+      "sha256": "8b34526290fe999ebfd2e17c2c9e5a7db5b61115124861fee14f71d6e4dda195"
+    },
+    {
+      "path": "evidence/retention-checks/20261015T133842Z-cli-help-snapshot-verify-ccc765ce/command.log",
+      "bytes": 465,
+      "sha256": "5795e18f6689cc7c14bf4e080a3fb2c7d68ee8d768fd66659aa06625d28e0847"
+    },
+    {
+      "path": "evidence/retention-checks/20261015T133842Z-cli-help-snapshot-verify-ccc765ce/command.status",
+      "bytes": 2,
+      "sha256": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa"
+    },
+    {
+      "path": "evidence/retention-checks/20261015T133929Z-discarded-results-ratchet-143-925ec645/command.json",
+      "bytes": 4623,
+      "sha256": "964abc89e8a0526047fcf24138d065795c92dfcd9658360597c92d6fefb50541"
+    },
+    {
+      "path": "evidence/retention-checks/20261015T133929Z-discarded-results-ratchet-143-925ec645/command.log",
+      "bytes": 507,
+      "sha256": "ae8b1654e299d57db818d8add85b77c2ad0b201ba409bfef1180b62146b50606"
+    },
+    {
+      "path": "evidence/retention-checks/20261015T133929Z-discarded-results-ratchet-143-925ec645/command.status",
+      "bytes": 2,
+      "sha256": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa"
+    },
+    {
+      "path": "evidence/retention-checks/20261015T134059Z-native-strict-clippy-broker-lib-tests-e9a62-aa63c39d/command.json",
+      "bytes": 4392,
+      "sha256": "71ad8a478378f21d2562ad2ab08ca4b8e07cb7a3a05b77206211a9d699b0e934"
+    },
+    {
+      "path": "evidence/retention-checks/20261015T134059Z-native-strict-clippy-broker-lib-tests-e9a62-aa63c39d/command.log",
+      "bytes": 193,
+      "sha256": "3ec7efe3b7a2fa91f8fced8726eea8960572d0f5ac8cb8517b461c07e21c55a2"
+    },
+    {
+      "path": "evidence/retention-checks/20261015T134059Z-native-strict-clippy-broker-lib-tests-e9a62-aa63c39d/command.status",
+      "bytes": 4,
+      "sha256": "39b8dc3fc8b44765c8e6f1adee04c5b465e555ab791cc42d0d9e810d5b64297c"
+    },
+    {
+      "path": "evidence/retention-checks/20261015T134117Z-native-strict-clippy-broker-lib-tests-e9a62-correct-cwd-ac4dbd2b/command.json",
+      "bytes": 4657,
+      "sha256": "cc80e763ebcf09c5e7f2f7653e24045eee5d7607cf706e50a398576c5cfdd5c0"
+    },
+    {
+      "path": "evidence/retention-checks/20261015T134117Z-native-strict-clippy-broker-lib-tests-e9a62-correct-cwd-ac4dbd2b/command.log",
+      "bytes": 495,
+      "sha256": "7558bf6d73ad856d6c0fa57daab753ffef9ef713f42f857a084f3062f9eff173"
+    },
+    {
+      "path": "evidence/retention-checks/20261015T134117Z-native-strict-clippy-broker-lib-tests-e9a62-correct-cwd-ac4dbd2b/command.status",
+      "bytes": 2,
+      "sha256": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa"
+    },
+    {
+      "path": "evidence/retention-checks/20261015T134530Z-native-guard-m1-no-archive-use-0cbc0750/command.json",
+      "bytes": 4530,
+      "sha256": "96c661592a68c4616e3bf8a90631b9e9850a98b4ff363473318c70ebe13756fd"
+    },
+    {
+      "path": "evidence/retention-checks/20261015T134530Z-native-guard-m1-no-archive-use-0cbc0750/command.log",
+      "bytes": 4087,
+      "sha256": "3b47a36cd2a86bd0843028a9c06007077d328ac7769bbaf3c2736ed1d4b55543"
+    },
+    {
+      "path": "evidence/retention-checks/20261015T134530Z-native-guard-m1-no-archive-use-0cbc0750/command.status",
+      "bytes": 4,
+      "sha256": "39b8dc3fc8b44765c8e6f1adee04c5b465e555ab791cc42d0d9e810d5b64297c"
+    },
+    {
+      "path": "evidence/retention-checks/20261015T134530Z-native-guard-m1-no-archive-use-0cbc0750/m1-classification-correction.json",
+      "bytes": 3776,
+      "sha256": "18b2f91a1c122aebb3da5bc14e0098bb440d649e886dd9b758406b985c988267"
+    },
+    {
+      "path": "evidence/retention-checks/20261015T134702Z-native-guard-m2-no-owner-authorization-b8444950/command.json",
+      "bytes": 4601,
+      "sha256": "e1436d4d4a5fed00d0d8722d9a19f393e770b2f74bf8c88fd69121d31ae2e5aa"
+    },
+    {
+      "path": "evidence/retention-checks/20261015T134702Z-native-guard-m2-no-owner-authorization-b8444950/command.log",
+      "bytes": 4039,
+      "sha256": "6341e166bd156cea3c4e302babd73b54e285ff89230c902fe7ef0dd145dbc3b0"
+    },
+    {
+      "path": "evidence/retention-checks/20261015T134702Z-native-guard-m2-no-owner-authorization-b8444950/command.status",
+      "bytes": 4,
+      "sha256": "39b8dc3fc8b44765c8e6f1adee04c5b465e555ab791cc42d0d9e810d5b64297c"
+    },
+    {
+      "path": "evidence/retention-checks/20261015T134810Z-native-guard-m3-disabled-schema23-old-client-trigger-5d2acfdb/command.json",
+      "bytes": 4673,
+      "sha256": "8ab815b164831e01b8146670701ef766e6ed9518e9fc7174ba9719f31654997d"
+    },
+    {
+      "path": "evidence/retention-checks/20261015T134810Z-native-guard-m3-disabled-schema23-old-client-trigger-5d2acfdb/command.log",
+      "bytes": 4110,
+      "sha256": "25082683d43e55f8c01118923c1cb8e05fc03e70a0d762d3b5e648a184da2b41"
+    },
+    {
+      "path": "evidence/retention-checks/20261015T134810Z-native-guard-m3-disabled-schema23-old-client-trigger-5d2acfdb/command.status",
+      "bytes": 4,
+      "sha256": "39b8dc3fc8b44765c8e6f1adee04c5b465e555ab791cc42d0d9e810d5b64297c"
+    },
+    {
+      "path": "evidence/retention-checks/20261015T134909Z-native-guard-m4-release-dispatching-unknown-roots-795818d2/command.json",
+      "bytes": 4649,
+      "sha256": "0e8972ee1b796b9554cc84f894e5d84e8e9eb584ce5767585c8ad3a77fdd7180"
+    },
+    {
+      "path": "evidence/retention-checks/20261015T134909Z-native-guard-m4-release-dispatching-unknown-roots-795818d2/command.log",
+      "bytes": 4165,
+      "sha256": "6dfde99f095a506f9b89fa9744ef356331c472177794f6b5d9a5abe839a99e6b"
+    },
+    {
+      "path": "evidence/retention-checks/20261015T134909Z-native-guard-m4-release-dispatching-unknown-roots-795818d2/command.status",
+      "bytes": 4,
+      "sha256": "39b8dc3fc8b44765c8e6f1adee04c5b465e555ab791cc42d0d9e810d5b64297c"
+    },
+    {
+      "path": "evidence/retention-checks/20261015T135015Z-native-guard-m5-gc-retains-released-root-8b5583e1/command.json",
+      "bytes": 4597,
+      "sha256": "e33adef9ef96fdfba9fbd1056d07736dcec3f8e65c72f36562e3e653f45996ed"
+    },
+    {
+      "path": "evidence/retention-checks/20261015T135015Z-native-guard-m5-gc-retains-released-root-8b5583e1/command.log",
+      "bytes": 4564,
+      "sha256": "5e93bb6eaabc352f209342df8d828e278c02dd2c529270a6609b43ea8553948e"
+    },
+    {
+      "path": "evidence/retention-checks/20261015T135015Z-native-guard-m5-gc-retains-released-root-8b5583e1/command.status",
+      "bytes": 4,
+      "sha256": "39b8dc3fc8b44765c8e6f1adee04c5b465e555ab791cc42d0d9e810d5b64297c"
+    },
+    {
+      "path": "evidence/retention-checks/20261015T135121Z-native-guard-m6-prepare-ignores-release-marker-beb3eec0/command.json",
+      "bytes": 4638,
+      "sha256": "9e41e88418b166b4f50b26b71182fe6a3732664faac0448266cbdfdbd996a6e1"
+    },
+    {
+      "path": "evidence/retention-checks/20261015T135121Z-native-guard-m6-prepare-ignores-release-marker-beb3eec0/command.log",
+      "bytes": 4208,
+      "sha256": "0b5fd4b60d5a37f530d7502076c3defccc00acfaa3058a76b1be77d2ecf97c38"
+    },
+    {
+      "path": "evidence/retention-checks/20261015T135121Z-native-guard-m6-prepare-ignores-release-marker-beb3eec0/command.status",
+      "bytes": 4,
+      "sha256": "39b8dc3fc8b44765c8e6f1adee04c5b465e555ab791cc42d0d9e810d5b64297c"
+    },
+    {
+      "path": "evidence/retention-checks/20261015T135408Z-native-restore-sanity-released-prepared-job-ecca5b1b/command.json",
+      "bytes": 4527,
+      "sha256": "b1b700ea326309e6c639ac4f02fc36ee1426f8e8dc625569caadec0e080144ad"
+    },
+    {
+      "path": "evidence/retention-checks/20261015T135408Z-native-restore-sanity-released-prepared-job-ecca5b1b/command.log",
+      "bytes": 1107,
+      "sha256": "ebb965c24ebc024d0d6c949b011cd9a530dce0c1e359bdbab64a09da13b2a976"
+    },
+    {
+      "path": "evidence/retention-checks/20261015T135408Z-native-restore-sanity-released-prepared-job-ecca5b1b/command.status",
+      "bytes": 4,
+      "sha256": "39b8dc3fc8b44765c8e6f1adee04c5b465e555ab791cc42d0d9e810d5b64297c"
+    },
+    {
+      "path": "evidence/retention-checks/20261015T135542Z-native-restore-sanity-released-prepared-job-after-mtime-invalidation-1d87690d/command.json",
+      "bytes": 3825,
+      "sha256": "60ee3ec6d03e5f5b427206883044b1a03c829b558e8b068d34da6f8fcbce4cb7"
+    },
+    {
+      "path": "evidence/retention-checks/20261015T135542Z-native-restore-sanity-released-prepared-job-after-mtime-invalidation-1d87690d/command.log",
+      "bytes": 641,
+      "sha256": "f5bb4ff16ae1d90199ad29cd195963192b5d3f9e954b7522bcb79d1270ccdc98"
+    },
+    {
+      "path": "evidence/retention-checks/20261015T141304Z-native-restore-sanity-released-prepared-job-restored-source-3eb184a8/command.json",
+      "bytes": 4455,
+      "sha256": "79a24b46cc5795470d3aabe648103a290ee3fd4362521208580e0f359889647a"
+    },
+    {
+      "path": "evidence/retention-checks/20261015T141304Z-native-restore-sanity-released-prepared-job-restored-source-3eb184a8/command.log",
+      "bytes": 1588,
+      "sha256": "6bd108d144b5269ec4378ded24d2922d3cba4c748efa3dd9e3268820697d5d45"
+    },
+    {
+      "path": "evidence/retention-checks/20261015T141304Z-native-restore-sanity-released-prepared-job-restored-source-3eb184a8/command.status",
+      "bytes": 4,
+      "sha256": "39b8dc3fc8b44765c8e6f1adee04c5b465e555ab791cc42d0d9e810d5b64297c"
+    },
+    {
+      "path": "evidence/retention-checks/20261015T141607Z-native-restore-sanity-released-prepared-job-restored-source-private-host-state-a1484db1/command.json",
+      "bytes": 4741,
+      "sha256": "c10d27256f6d53c37ba33a8566bef020cb27ff808b8526fd1427170db86565eb"
+    },
+    {
+      "path": "evidence/retention-checks/20261015T141607Z-native-restore-sanity-released-prepared-job-restored-source-private-host-state-a1484db1/command.log",
+      "bytes": 531,
+      "sha256": "ed8b43c6c5621688230e7f7e03545b45cae42c3c29233954b095e22809c3f33f"
+    },
+    {
+      "path": "evidence/retention-checks/20261015T141607Z-native-restore-sanity-released-prepared-job-restored-source-private-host-state-a1484db1/command.status",
+      "bytes": 2,
+      "sha256": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa"
+    },
+    {
+      "path": "evidence/retention-checks/20261015T141649Z-cli-help-snapshot-verify-after-restored-source-169e1579/command.json",
+      "bytes": 4547,
+      "sha256": "433a601136f3cdfbde7db231a5957abd96a50f90d5b88e4c884a78448c49ae18"
+    },
+    {
+      "path": "evidence/retention-checks/20261015T141649Z-cli-help-snapshot-verify-after-restored-source-169e1579/command.log",
+      "bytes": 1093,
+      "sha256": "e8336ebc96c49ce8d4c6bd598317fcb459342fe8a25b39e0f498c9504e241755"
+    },
+    {
+      "path": "evidence/retention-checks/20261015T141649Z-cli-help-snapshot-verify-after-restored-source-169e1579/command.status",
+      "bytes": 2,
+      "sha256": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa"
+    },
+    {
+      "path": "evidence/retention-checks/20261015T141801Z-discarded-results-ratchet-after-restored-source-3c4ca041/command.json",
+      "bytes": 4585,
+      "sha256": "2474e0d9e0360ebe662769c2f6f3aa55137ff9ce79d9e8b17e72f240270af445"
+    },
+    {
+      "path": "evidence/retention-checks/20261015T141801Z-discarded-results-ratchet-after-restored-source-3c4ca041/command.log",
+      "bytes": 507,
+      "sha256": "23d2f3c70766436819241c028d5994264148792b2489410af96c6467b6b5441b"
+    },
+    {
+      "path": "evidence/retention-checks/20261015T141801Z-discarded-results-ratchet-after-restored-source-3c4ca041/command.status",
+      "bytes": 2,
+      "sha256": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa"
+    },
+    {
+      "path": "evidence/tools/mutate-native-retention-guard.py",
+      "bytes": 4390,
+      "sha256": "0b2e660db3c4b5bf39faada40c15205768cfa23e08b8cad54f011417a9cd0d8a"
+    },
+    {
+      "path": "evidence/tools/record-native-retention-check.before-host-state-allowlist.py",
+      "bytes": 11644,
+      "sha256": "f3558f9fa415bc620e8c4d4a27e32ae83cffabad1ec93019ea374b763df5a9c4"
+    },
+    {
+      "path": "evidence/tools/record-native-retention-check.py",
+      "bytes": 11674,
+      "sha256": "30df4e4b421c69c2b3753c6a395e3305d4e8f4012aa9bfea63e27b3dd81ddba6"
+    },
+    {
+      "path": "evidence/tools/run-native-retention-guard-mutation.sh",
+      "bytes": 4200,
+      "sha256": "6bca5008e516b2f70b8cddfea03f609c0bfcb4a38957f6f86f73038502187105"
+    },
+    {
+      "path": "reconciliations/20261015T135542Z-native-restore-sanity-incomplete.json",
+      "bytes": 2440,
+      "sha256": "7c52ae6be5cd06d07c5d816dd28a76008e8443ec327c384138749faa0abee8a1"
+    },
+    {
+      "path": "source-bindings.json",
+      "bytes": 5597,
+      "sha256": "c0b748ef15d1461545cd588bf247d73482729ec00519222da0fbe5cc9cac2060"
+    }
+  ],
+  "artifact_inventory": {
+    "path_base": "packages/aethyme/docs/architecture/local-v3-qualification/native-job-lifecycle-2026-10-15/",
+    "entry_schema": {
+      "path": "relative path from the ledger folder",
+      "bytes": "exact byte count",
+      "sha256": "SHA-256"
+    },
+    "file_count": 109,
+    "total_bytes": 2801205,
+    "ledger_itself_excluded": true
+  }
+}

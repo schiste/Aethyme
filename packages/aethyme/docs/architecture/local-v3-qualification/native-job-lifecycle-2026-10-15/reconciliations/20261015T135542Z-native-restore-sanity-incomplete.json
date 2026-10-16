@@ -1,0 +1,50 @@
+{
+  "schema": "aethyme.local-check-reconciliation/v1",
+  "id": "reconcile-restored-sanity-after-mtime-invalidation-20261015",
+  "recorded_at_utc": "2026-10-15T14:26:46Z",
+  "attempt_id": "local-native-restore-sanity-after-mtime-invalidation-no-final-status",
+  "source_commit": "d52bc0a514fc5035fe143b97208a9e328f6a5d8e",
+  "source_tree": "8840983777e2bc46dac1a2b5c748935955cb7be6",
+  "original_recorder_state": "running",
+  "original_numeric_exit": null,
+  "original_status_present": false,
+  "raw_artifacts_unchanged": true,
+  "raw_log": {
+    "path": "evidence/retention-checks/20261015T135542Z-native-restore-sanity-released-prepared-job-after-mtime-invalidation-1d87690d/command.log",
+    "bytes": 641,
+    "sha256": "f5bb4ff16ae1d90199ad29cd195963192b5d3f9e954b7522bcb79d1270ccdc98",
+    "observation": "Cargo completed aethyme-broker compilation and one selected test began; the log ends after the test name without a result."
+  },
+  "process_reconciliation": {
+    "observed_at_utc": "2026-10-15T14:10:46Z",
+    "provenance": "Root session's complete process scan and exact-log open-writer check, reported to this session.",
+    "cargo_process_present": false,
+    "rustc_process_present": false,
+    "matching_native_test_process_present": false,
+    "recorder_process_present": false,
+    "exact_log_open_writer_present": false
+  },
+  "status": "incomplete_no_final_status",
+  "selected_tests": 1,
+  "observed_test_start": true,
+  "tests_with_result": 0,
+  "unresolved_slots": 1,
+  "numeric_exit_inferred": false,
+  "test_outcome_inferred": false,
+  "complete_command_result_inferred": false,
+  "decision": "Preserve the original running metadata and raw partial log unchanged. Record the missing status separately; infer no exit, pass, or failure.",
+  "artifacts": [
+    {
+      "path": "evidence/retention-checks/20261015T135542Z-native-restore-sanity-released-prepared-job-after-mtime-invalidation-1d87690d/command.json",
+      "bytes": 3825,
+      "sha256": "60ee3ec6d03e5f5b427206883044b1a03c829b558e8b068d34da6f8fcbce4cb7",
+      "kind": "original recorder metadata copied unchanged"
+    },
+    {
+      "path": "evidence/retention-checks/20261015T135542Z-native-restore-sanity-released-prepared-job-after-mtime-invalidation-1d87690d/command.log",
+      "bytes": 641,
+      "sha256": "f5bb4ff16ae1d90199ad29cd195963192b5d3f9e954b7522bcb79d1270ccdc98",
+      "kind": "original partial raw output copied unchanged"
+    }
+  ]
+}

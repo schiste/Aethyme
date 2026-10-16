@@ -1,0 +1,63 @@
+{
+  "schema": "aethyme.composition-expectations/provisional-v0",
+  "case": "HX07",
+  "title": "Held-out FX07 variant: subtract from a synthesized link change",
+  "plan": "#650 held-out variant of FX07",
+  "scenarios": {
+    "s1": {
+      "title": "",
+      "required_outcomes": [
+        "candidate",
+        "inseparable_selection",
+        "unsupported"
+      ],
+      "behaviors": [
+        {
+          "check": "attr",
+          "file": "nav.html",
+          "selector": "#docs",
+          "name": "title",
+          "equals": "Read the documentation"
+        },
+        {
+          "check": "text",
+          "file": "nav.html",
+          "selector": "#docs",
+          "equals": "Docs"
+        },
+        {
+          "check": "attr_absent",
+          "file": "nav.html",
+          "selector": "#home",
+          "name": "data-track"
+        }
+      ],
+      "provisional_text": {
+        "outcome": "candidate",
+        "behavior": "passes",
+        "note": "measured as a fresh composition of the retained original c1 on t0",
+        "measured_orders": [
+          [
+            "c1"
+          ]
+        ]
+      },
+      "allowed_changes": [
+        "c1"
+      ]
+    },
+    "s2": {
+      "title": "",
+      "required_outcomes": [
+        "inseparable_selection",
+        "missing_input"
+      ],
+      "behaviors": [],
+      "provisional_text": {
+        "outcome": null,
+        "behavior": null,
+        "note": "planning refusal: decided from lineage, selection and records before any merge engine runs, so the text profile is not measured"
+      }
+    }
+  }
+}

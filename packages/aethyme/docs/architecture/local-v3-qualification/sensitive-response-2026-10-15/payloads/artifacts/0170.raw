@@ -1,0 +1,17 @@
+{
+  "captured_at_utc": "2026-10-15T20:41:40.004755+00:00",
+  "source": "/private/tmp/t56-v4-8387-managed-dir-controls",
+  "scope": "Exact retained source-bound attempts; no test credit for compile-only or setup failures.",
+  "files": [
+    {
+      "path": "command.log",
+      "bytes": 928,
+      "sha256": "82441fb35890dfd862ec6789582a885902ea951198fa4e110224220c944b0e1d"
+    },
+    {
+      "path": "status",
+      "bytes": 2,
+      "sha256": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa"
+    }
+  ]
+}

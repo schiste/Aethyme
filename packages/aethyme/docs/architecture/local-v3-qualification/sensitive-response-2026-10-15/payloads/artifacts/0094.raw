@@ -1,0 +1,17 @@
+   Compiling aethyme-engine v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/implement-local-administrative-sensitive/packages/aethyme/rust/crates/aethyme-engine)
+   Compiling aethyme-broker v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/implement-local-administrative-sensitive/packages/aethyme/rust/crates/aethyme-broker)
+error[E0599]: no method named `join` found for struct `TempDir` in the current scope
+    --> crates/aethyme-broker/src/collaboration_sensitive.rs:2013:36
+     |
+2013 |         let export_path = run_root.join("external-export.bundle");
+     |                                    ^^^^ method not found in `TempDir`
+
+error[E0599]: no method named `join` found for struct `TempDir` in the current scope
+    --> crates/aethyme-broker/src/collaboration_sensitive.rs:2140:27
+     |
+2140 |                 &run_root.join("blocked-export.bundle")
+     |                           ^^^^ method not found in `TempDir`
+
+For more information about this error, try `rustc --explain E0599`.
+error: could not compile `aethyme-broker` (lib test) due to 2 previous errors
+warning: build failed, waiting for other jobs to finish...

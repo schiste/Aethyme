@@ -2,6 +2,7 @@
 members = [
     "crates/aethyme-broker",
     "crates/aethyme-cli",
+    "crates/aethyme-contracts",
     "crates/aethyme-engine",
     "crates/aethyme-enhance",
     "crates/aethyme-graph-indexer",
@@ -42,13 +43,16 @@ semver = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
+sha1 = "0.10"
 similar = "3"
+tar = { version = "=0.4.46", default-features = false }
 tempfile = "3"
 thiserror = "2"
 toml = "0.8"
 toml_edit = "0.22"
 tree-sitter = "0.25"
 tree-sitter-php = "=0.23.11"
+unicode-normalization = "0.1"
 walkdir = "2"
 
 [workspace.package]

@@ -22,9 +22,12 @@ name = "broker-cli-shim"
 path = "src/bin/broker-cli-shim.rs"
 
 [dependencies]
+# Experimental v0 contracts: the AQ0 analysis envelope (#655).
+aethyme-contracts = { path = "../aethyme-contracts" }
 aethyme-engine = { path = "../aethyme-engine" }
 aethyme-enhance = { path = "../aethyme-enhance" }
 aethyme-graph-indexer = { path = "../aethyme-graph-indexer" }
+aethyme-graph-schema = { path = "../aethyme-graph-schema" }
 aethyme-graph-storage = { path = "../aethyme-graph-storage" }
 # Bundled SQLite so the broker has zero system dependencies and one
 # known SQLite version across platforms (macOS/Linux are the v0 targets).
@@ -41,13 +44,23 @@ noyalib = { workspace = true }
 toml = { workspace = true }
 # Gate trigger globs (gates.toml). Same matcher family ripgrep uses.
 globset = { workspace = true }
+# Folding paths the way case- and normalization-insensitive file systems
+# do, so a protected path cannot be written under another spelling (#665).
+unicode-normalization = { workspace = true }
 # killpg for gate-run cancellation (the external `kill` utility parses
 # negative pgids as options on Linux).
 libc = { workspace = true }
 # Offline report digests are the review/filing confirmation contract.
 sha2 = { workspace = true }
+# The composer's text profile detects moved blocks with a line diff (#664).
+similar = { workspace = true }
+# Archived blobs are checked against their Git object id while they are
+# copied; SHA-1 repositories need SHA-1 for that (#657).
+sha1 = { workspace = true }
 # Atomic report publication uses a sibling tempfile plus persist_noclobber.
 tempfile = { workspace = true }
+# Inspect candidate output tar entries without unpacking untrusted paths.
+tar = { workspace = true }
 # Release availability and downgrade decisions use semantic versions rather
 # than string ordering.
 semver = { workspace = true }

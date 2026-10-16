@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>Reading desk</title></head>
+<body>
+<nav><a id="catalog-link" href="#catalog">Catalog</a></nav>
+<aside id="drawer"><h2>Desk shortcuts</h2>
+  <section id="loan-panel" aria-labelledby="loan-title">
+    <h1 id="loan-title">Loan finder</h1>
+    <form id="loan-form">
+      <label for="loan-query">Title fragment</label>
+      <input id="loan-query" aria-label="Title fragment" autocomplete="off">
+      <button id="loan-submit" type="submit">Find</button>
+    </form>
+    <output id="loan-matches" aria-live="polite"></output>
+  </section>
+</aside>
+<main id="primary">
+  <section id="summary-panel" aria-labelledby="summary-title">
+    <h2 id="summary-title">Reading summary</h2>
+    <form id="summary-form">
+      <label for="summary-query">Title fragment</label>
+      <input id="summary-query" aria-label="Summary title fragment" autocomplete="off">
+      <button id="summary-submit" type="button">Find summary</button>
+    </form>
+    <output id="summary-matches">No summary selected</output>
+  </section>
+  <section id="catalog"><h2>Public catalog</h2><p>Slate Atlas; Cedar Almanac; Amber Reader</p></section>
+</main>
+<script>
+const titles = ["Slate Atlas", "Cedar Almanac", "Amber Reader"];
+document.getElementById("loan-form").addEventListener("submit", event => {
+  event.preventDefault();
+  const fragment = document.getElementById("loan-query").value.toLowerCase();
+  document.getElementById("loan-matches").textContent = titles.filter(title => title.toLowerCase().includes(fragment)).join(" | ");
+});
+</script>
+</body></html>

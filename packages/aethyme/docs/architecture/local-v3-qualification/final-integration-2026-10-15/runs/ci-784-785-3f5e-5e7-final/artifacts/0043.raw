@@ -1,0 +1,571 @@
+﻿2026-10-15T22:12:48.2423152Z Current runner version: '2.337.0'
+2026-10-15T22:12:48.2457159Z ##[group]Runner Image Provisioner
+2026-10-15T22:12:48.2458182Z Hosted Compute Agent
+2026-10-15T22:12:48.2458806Z Version: 20261002.596
+2026-10-15T22:12:48.2459492Z Commit: c3d12f3313a95f25162a1503be624f3b0617f8c0
+2026-10-15T22:12:48.2460243Z Build Date: 2026-10-02T22:28:27Z
+2026-10-15T22:12:48.2460997Z Worker ID: {d1a79722-748e-4d04-ba2c-7821133c8d04}
+2026-10-15T22:12:48.2461798Z Region: centralus
+2026-10-15T22:12:48.2462332Z Cloud: Azure
+2026-10-15T22:12:48.2462882Z ##[endgroup]
+2026-10-15T22:12:48.2464883Z ##[group]Operating System
+2026-10-15T22:12:48.2465684Z Microsoft Windows Server 2025
+2026-10-15T22:12:48.2466471Z 10.0.26100
+2026-10-15T22:12:48.2467021Z Datacenter
+2026-10-15T22:12:48.2467528Z ##[endgroup]
+2026-10-15T22:12:48.2468179Z ##[group]Runner Image
+2026-10-15T22:12:48.2468863Z Image: windows-2025-vs2026
+2026-10-15T22:12:48.2469622Z Version: 20261007.264.1
+2026-10-15T22:12:48.2471399Z Included Software: https://github.com/actions/runner-images/blob/win25-vs2026/20261007.264/images/windows/Windows2025-VS2026-Readme.md
+2026-10-15T22:12:48.2473151Z Image Release: https://github.com/actions/runner-images/releases/tag/win25-vs2026%2F20261007.264
+2026-10-15T22:12:48.2474145Z ##[endgroup]
+2026-10-15T22:12:48.2475209Z ##[group]GITHUB_TOKEN Permissions
+2026-10-15T22:12:48.2478335Z Contents: read
+2026-10-15T22:12:48.2478976Z Metadata: read
+2026-10-15T22:12:48.2479553Z ##[endgroup]
+2026-10-15T22:12:48.2481976Z Secret source: Actions
+2026-10-15T22:12:48.2482952Z Cache mode: write
+2026-10-15T22:12:48.2483649Z Prepare workflow directory
+2026-10-15T22:12:48.2826805Z Prepare all required actions
+2026-10-15T22:12:48.2885555Z Getting action download info
+2026-10-15T22:12:48.5407453Z Download action repository 'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1' (SHA:3d3c42e5aac5ba805825da76410c181273ba90b1)
+2026-10-15T22:12:48.6433552Z Download action repository 'dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87' (SHA:6bed0761d98439e5a578e2877258200ad565ba87)
+2026-10-15T22:12:48.9551295Z Complete job name: Windows x64 build and native smoke
+2026-10-15T22:12:49.0779076Z ##[group]Run actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+2026-10-15T22:12:49.0780553Z with:
+2026-10-15T22:12:49.0781079Z   fetch-depth: 0
+2026-10-15T22:12:49.0781554Z   repository: schiste/Aethyme
+2026-10-15T22:12:49.0785161Z   token: ***
+2026-10-15T22:12:49.0785577Z   ssh-strict: true
+2026-10-15T22:12:49.0785969Z   ssh-user: git
+2026-10-15T22:12:49.0786412Z   persist-credentials: true
+2026-10-15T22:12:49.0786851Z   clean: true
+2026-10-15T22:12:49.0787261Z   sparse-checkout-cone-mode: true
+2026-10-15T22:12:49.0787861Z   fetch-tags: false
+2026-10-15T22:12:49.0788260Z   show-progress: true
+2026-10-15T22:12:49.0788752Z   lfs: false
+2026-10-15T22:12:49.0789179Z   submodules: false
+2026-10-15T22:12:49.0789591Z   set-safe-directory: true
+2026-10-15T22:12:49.0790104Z   allow-unsafe-pr-checkout: false
+2026-10-15T22:12:49.0791759Z ##[endgroup]
+2026-10-15T22:12:49.2218495Z Syncing repository: schiste/Aethyme
+2026-10-15T22:12:49.2220689Z ##[group]Getting Git version info
+2026-10-15T22:12:49.2221444Z Working directory is 'D:\a\Aethyme\Aethyme'
+2026-10-15T22:12:49.2940957Z [command]"C:\Program Files\Git\bin\git.exe" version
+2026-10-15T22:12:49.6661266Z git version 2.56.0.windows.2
+2026-10-15T22:12:49.6712460Z ##[endgroup]
+2026-10-15T22:12:49.6730377Z Temporarily overriding HOME='D:\a\_temp\bf0c50f3-3821-4b38-99b3-abbcaa41dee6' before making global git config changes
+2026-10-15T22:12:49.6739428Z Adding repository directory to the temporary git global config as a safe directory
+2026-10-15T22:12:49.6741426Z [command]"C:\Program Files\Git\bin\git.exe" config --global --add safe.directory D:\a\Aethyme\Aethyme
+2026-10-15T22:12:49.7415589Z Deleting the contents of 'D:\a\Aethyme\Aethyme'
+2026-10-15T22:12:49.7421103Z ##[group]Determining repository object format
+2026-10-15T22:12:49.7423647Z ##[endgroup]
+2026-10-15T22:12:49.7427383Z ##[group]Initializing the repository
+2026-10-15T22:12:49.7433558Z [command]"C:\Program Files\Git\bin\git.exe" init D:\a\Aethyme\Aethyme
+2026-10-15T22:12:49.8353168Z Initialized empty Git repository in D:/a/Aethyme/Aethyme/.git/
+2026-10-15T22:12:49.8406713Z [command]"C:\Program Files\Git\bin\git.exe" remote add origin https://github.com/schiste/Aethyme
+2026-10-15T22:12:49.9122772Z ##[endgroup]
+2026-10-15T22:12:49.9124871Z ##[group]Disabling automatic garbage collection
+2026-10-15T22:12:49.9130726Z [command]"C:\Program Files\Git\bin\git.exe" config --local gc.auto 0
+2026-10-15T22:12:49.9477102Z ##[endgroup]
+2026-10-15T22:12:49.9478603Z ##[group]Setting up auth
+2026-10-15T22:12:49.9479729Z Removing SSH command configuration
+2026-10-15T22:12:49.9485620Z [command]"C:\Program Files\Git\bin\git.exe" config --local --name-only --get-regexp core\.sshCommand
+2026-10-15T22:12:49.9830740Z [command]"C:\Program Files\Git\bin\git.exe" submodule foreach --recursive "sh -c \"git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :\""
+2026-10-15T22:12:51.5685122Z Removing HTTP extra header
+2026-10-15T22:12:51.5694605Z [command]"C:\Program Files\Git\bin\git.exe" config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
+2026-10-15T22:12:51.6051383Z [command]"C:\Program Files\Git\bin\git.exe" submodule foreach --recursive "sh -c \"git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :\""
+2026-10-15T22:12:52.1246515Z Removing includeIf entries pointing to credentials config files
+2026-10-15T22:12:52.1259905Z [command]"C:\Program Files\Git\bin\git.exe" config --local --name-only --get-regexp ^includeIf\.gitdir:
+2026-10-15T22:12:52.1592711Z [command]"C:\Program Files\Git\bin\git.exe" submodule foreach --recursive "git config --local --show-origin --name-only --get-regexp remote.origin.url"
+2026-10-15T22:12:52.6698274Z [command]"C:\Program Files\Git\bin\git.exe" config --file D:\a\_temp\git-credentials-6f15cf6c-1fd5-49e7-8881-ea32d08b4417.config http.https://github.com/.extraheader "AUTHORIZATION: basic ***"
+2026-10-15T22:12:52.7035966Z [command]"C:\Program Files\Git\bin\git.exe" config --local includeIf.gitdir:D:/a/Aethyme/Aethyme/.git.path D:\a\_temp\git-credentials-6f15cf6c-1fd5-49e7-8881-ea32d08b4417.config
+2026-10-15T22:12:52.7363103Z [command]"C:\Program Files\Git\bin\git.exe" config --local includeIf.gitdir:D:/a/Aethyme/Aethyme/.git/worktrees/*.path D:\a\_temp\git-credentials-6f15cf6c-1fd5-49e7-8881-ea32d08b4417.config
+2026-10-15T22:12:52.7751904Z [command]"C:\Program Files\Git\bin\git.exe" config --local includeIf.gitdir:/github/workspace/.git.path /github/runner_temp/git-credentials-6f15cf6c-1fd5-49e7-8881-ea32d08b4417.config
+2026-10-15T22:12:52.8105397Z [command]"C:\Program Files\Git\bin\git.exe" config --local includeIf.gitdir:/github/workspace/.git/worktrees/*.path /github/runner_temp/git-credentials-6f15cf6c-1fd5-49e7-8881-ea32d08b4417.config
+2026-10-15T22:12:52.8457442Z ##[endgroup]
+2026-10-15T22:12:52.8458191Z ##[group]Fetching the repository
+2026-10-15T22:12:52.8475007Z [command]"C:\Program Files\Git\bin\git.exe" -c protocol.version=2 fetch --no-tags --prune --no-recurse-submodules origin +refs/heads/*:refs/remotes/origin/* +refs/tags/*:refs/tags/* +c72d80af88e6957be50adb2b45dfd70051b5ab58:refs/remotes/pull/785/merge
+2026-10-15T22:12:56.6850603Z From https://github.com/schiste/Aethyme
+2026-10-15T22:12:56.6851726Z  * [new branch]        aethyme/delivery/q667-253fd5e0b72c       -> origin/aethyme/delivery/q667-253fd5e0b72c
+2026-10-15T22:12:56.6852722Z  * [new branch]        aethyme/delivery/q689-b6318e5109ae       -> origin/aethyme/delivery/q689-b6318e5109ae
+2026-10-15T22:12:56.6853765Z  * [new branch]        agent/650-e1-composition-feasibility-and-struc -> origin/agent/650-e1-composition-feasibility-and-struc
+2026-10-15T22:12:56.6854686Z  * [new branch]        agent/652-l1-id-experimental-sourcesnapshotid -> origin/agent/652-l1-id-experimental-sourcesnapshotid
+2026-10-15T22:12:56.6857021Z  * [new branch]        agent/653-l1-canonical-record-encoding-digest -> origin/agent/653-l1-canonical-record-encoding-digest
+2026-10-15T22:12:56.6858034Z  * [new branch]        agent/654-l1-decision-brief-aethyme-brief-toke -> origin/agent/654-l1-decision-brief-aethyme-brief-toke
+2026-10-15T22:12:56.6859026Z  * [new branch]        agent/655-l1-analysis-envelope-aq0-and-conserv -> origin/agent/655-l1-analysis-envelope-aq0-and-conserv
+2026-10-15T22:12:56.6860020Z  * [new branch]        agent/656-l2-isolate-collaboration-state-root -> origin/agent/656-l2-isolate-collaboration-state-root
+2026-10-15T22:12:56.6862401Z  * [new branch]        agent/657-l2-content-addressed-archive-of-exac -> origin/agent/657-l2-content-addressed-archive-of-exac
+2026-10-15T22:12:56.6863273Z  * [new branch]        agent/658-l2-crash-safe-capture-intent-record -> origin/agent/658-l2-crash-safe-capture-intent-record
+2026-10-15T22:12:56.6864116Z  * [new branch]        agent/659-l2-reference-safe-collaboration-gc -> origin/agent/659-l2-reference-safe-collaboration-gc
+2026-10-15T22:12:56.6864966Z  * [new branch]        agent/660-l2-opt-in-capture-beside-legacy-subm -> origin/agent/660-l2-opt-in-capture-beside-legacy-subm
+2026-10-15T22:12:56.6865759Z  * [new branch]        agent/661-fx08-matched-cold-start-brief-trials -> origin/agent/661-fx08-matched-cold-start-brief-trials
+2026-10-15T22:12:56.6866625Z  * [new branch]        agent/661-l3-bounded-explainable-contribution -> origin/agent/661-l3-bounded-explainable-contribution
+2026-10-15T22:12:56.6868624Z  * [new branch]        agent/662-l3-scoped-context-cache-invalidation -> origin/agent/662-l3-scoped-context-cache-invalidation
+2026-10-15T22:12:56.6869686Z  * [new branch]        agent/666-complete-autonomous-appointed-local -> origin/agent/666-complete-autonomous-appointed-local
+2026-10-15T22:12:56.6870581Z  * [new branch]        agent/680-complete-explicit-local-target-stop -> origin/agent/680-complete-explicit-local-target-stop
+2026-10-15T22:12:56.6872620Z  * [new branch]        agent/680-l9-slice-1-opt-in-collaboration-comm -> origin/agent/680-l9-slice-1-opt-in-collaboration-comm
+2026-10-15T22:12:56.6873618Z  * [new branch]        agent/682-complete-local-qualification-ledger -> origin/agent/682-complete-local-qualification-ledger
+2026-10-15T22:12:56.6874538Z  * [new branch]        agent/682-qualify-bounded-native-capture-and-m -> origin/agent/682-qualify-bounded-native-capture-and-m
+2026-10-15T22:12:56.6875562Z  * [new branch]        agent/682-reconcile-final-local-qualification -> origin/agent/682-reconcile-final-local-qualification
+2026-10-15T22:12:56.6876594Z  * [new branch]        agent/684-x2-one-base-private-analysis-views-p -> origin/agent/684-x2-one-base-private-analysis-views-p
+2026-10-15T22:12:56.6877513Z  * [new branch]        agent/692-local-v3-integrate-typed-verificatio -> origin/agent/692-local-v3-integrate-typed-verificatio
+2026-10-15T22:12:56.6878527Z  * [new branch]        agent/add-a-complete-git-worktree-inventory-to -> origin/agent/add-a-complete-git-worktree-inventory-to
+2026-10-15T22:12:56.6879581Z  * [new branch]        agent/add-actual-native-publication-outcomeunk -> origin/agent/add-actual-native-publication-outcomeunk
+2026-10-15T22:12:56.6881406Z  * [new branch]        agent/add-audited-exact-path-operator-lease-ha -> origin/agent/add-audited-exact-path-operator-lease-ha
+2026-10-15T22:12:56.6882234Z  * [new branch]        agent/add-broker-advanced-merge-chain-sequenti -> origin/agent/add-broker-advanced-merge-chain-sequenti
+2026-10-15T22:12:56.6882999Z  * [new branch]        agent/add-broker-gc-reclaim-artifacts-and-a-lo -> origin/agent/add-broker-gc-reclaim-artifacts-and-a-lo
+2026-10-15T22:12:56.6883756Z  * [new branch]        agent/add-read-only-repo-branches-audit-classi -> origin/agent/add-read-only-repo-branches-audit-classi
+2026-10-15T22:12:56.6884539Z  * [new branch]        agent/address-aethyme-378-unify-broker-runtime -> origin/agent/address-aethyme-378-unify-broker-runtime
+2026-10-15T22:12:56.6885552Z  * [new branch]        agent/address-aethyme-415-persist-bounded-acti -> origin/agent/address-aethyme-415-persist-bounded-acti
+2026-10-15T22:12:56.6886567Z  * [new branch]        agent/address-aethyme-416-preserve-cleared-gat -> origin/agent/address-aethyme-416-preserve-cleared-gat
+2026-10-15T22:12:56.6887360Z  * [new branch]        agent/admit-expensive-gates-by-host-load-inste -> origin/agent/admit-expensive-gates-by-host-load-inste
+2026-10-15T22:12:56.6888192Z  * [new branch]        agent/advise-landing-a-shared-edit-first-when -> origin/agent/advise-landing-a-shared-edit-first-when
+2026-10-15T22:12:56.6888919Z  * [new branch]        agent/allow-pr-close-reopen-without-ref-writes -> origin/agent/allow-pr-close-reopen-without-ref-writes
+2026-10-15T22:12:56.6889671Z  * [new branch]        agent/audit-remediation-batch-1-security-escap -> origin/agent/audit-remediation-batch-1-security-escap
+2026-10-15T22:12:56.6890443Z  * [new branch]        agent/audit-remediation-drop-vestigial-python -> origin/agent/audit-remediation-drop-vestigial-python
+2026-10-15T22:12:56.6891213Z  * [new branch]        agent/automate-safe-finish-cleanup-for-landed -> origin/agent/automate-safe-finish-cleanup-for-landed
+2026-10-15T22:12:56.6891956Z  * [new branch]        agent/backfill-provable-worktree-root-markers -> origin/agent/backfill-provable-worktree-root-markers
+2026-10-15T22:12:56.6892798Z  * [new branch]        agent/batch-submit-s-per-commit-provenance-che -> origin/agent/batch-submit-s-per-commit-provenance-che
+2026-10-15T22:12:56.6893550Z  * [new branch]        agent/bind-broker-sessions-to-their-holder-pro -> origin/agent/bind-broker-sessions-to-their-holder-pro
+2026-10-15T22:12:56.6894310Z  * [new branch]        agent/bound-broker-status-latency-with-truthfu -> origin/agent/bound-broker-status-latency-with-truthfu
+2026-10-15T22:12:56.6895068Z  * [new branch]        agent/bound-the-build-artifact-scan-on-health -> origin/agent/bound-the-build-artifact-scan-on-health
+2026-10-15T22:12:56.6895930Z  * [new branch]        agent/bound-the-cleanup-eligibility-pass-on-do -> origin/agent/bound-the-cleanup-eligibility-pass-on-do
+2026-10-15T22:12:56.6896683Z  * [new branch]        agent/bound-the-gc-sweep-on-broker-open  -> origin/agent/bound-the-gc-sweep-on-broker-open
+2026-10-15T22:12:56.6897603Z  * [new branch]        agent/broker-pr-workflow-template-based-push-p -> origin/agent/broker-pr-workflow-template-based-push-p
+2026-10-15T22:12:56.6898913Z  * [new branch]        agent/bump-noyalib-to-0-0-53-for-rustsec-2026 -> origin/agent/bump-noyalib-to-0-0-53-for-rustsec-2026
+2026-10-15T22:12:56.6899722Z  * [new branch]        agent/cargo-test-gate-run-the-workspace-suite -> origin/agent/cargo-test-gate-run-the-workspace-suite
+2026-10-15T22:12:56.6900389Z  * [new branch]        agent/cargo-test-no-fail-fast            -> origin/agent/cargo-test-no-fail-fast
+2026-10-15T22:12:56.6901291Z  * [new branch]        agent/complete-286-paired-write-recovery-accep -> origin/agent/complete-286-paired-write-recovery-accep
+2026-10-15T22:12:56.6902140Z  * [new branch]        agent/complete-393-follow-ups-protect-implicit -> origin/agent/complete-393-follow-ups-protect-implicit
+2026-10-15T22:12:56.6902852Z  * [new branch]        agent/complete-670-l6-exact-input-materializat -> origin/agent/complete-670-l6-exact-input-materializat
+2026-10-15T22:12:56.6903609Z  * [new branch]        agent/complete-671-l6-isolated-linux-superviso -> origin/agent/complete-671-l6-isolated-linux-superviso
+2026-10-15T22:12:56.6904339Z  * [new branch]        agent/complete-672-local-independent-verifier -> origin/agent/complete-672-local-independent-verifier
+2026-10-15T22:12:56.6905051Z  * [new branch]        agent/complete-673-local-verifier-host-resourc -> origin/agent/complete-673-local-verifier-host-resourc
+2026-10-15T22:12:56.6905789Z  * [new branch]        agent/complete-674-local-exact-retained-candid -> origin/agent/complete-674-local-exact-retained-candid
+2026-10-15T22:12:56.6906548Z  * [new branch]        agent/complete-675-local-configured-github-mer -> origin/agent/complete-675-local-configured-github-mer
+2026-10-15T22:12:56.6907493Z  * [new branch]        agent/complete-676-local-resumable-inbox-outbo -> origin/agent/complete-676-local-resumable-inbox-outbo
+2026-10-15T22:12:56.6908216Z  * [new branch]        agent/complete-677-local-accepted-source-gener -> origin/agent/complete-677-local-accepted-source-gener
+2026-10-15T22:12:56.6908996Z  * [new branch]        agent/complete-678-local-controlled-generation -> origin/agent/complete-678-local-controlled-generation
+2026-10-15T22:12:56.6909930Z  * [new branch]        agent/complete-679-local-retained-record-expor -> origin/agent/complete-679-local-retained-record-expor
+2026-10-15T22:12:56.6910757Z  * [new branch]        agent/complete-681-local-old-binary-disabled-o -> origin/agent/complete-681-local-old-binary-disabled-o
+2026-10-15T22:12:56.6911507Z  * [new branch]        agent/complete-709-fx08-package-and-evidence-f -> origin/agent/complete-709-fx08-package-and-evidence-f
+2026-10-15T22:12:56.6912269Z  * [new branch]        agent/complete-fresh-local-cli-bootstrap-and-c -> origin/agent/complete-fresh-local-cli-bootstrap-and-c
+2026-10-15T22:12:56.6913135Z  * [new branch]        agent/complete-issue-253-verify-automated-home -> origin/agent/complete-issue-253-verify-automated-home
+2026-10-15T22:12:56.6914114Z  * [new branch]        agent/complete-issue-335-lifecycle-acceptance -> origin/agent/complete-issue-335-lifecycle-acceptance
+2026-10-15T22:12:56.6914831Z  * [new branch]        agent/complete-issue-356-native-linux-arm64-re -> origin/agent/complete-issue-356-native-linux-arm64-re
+2026-10-15T22:12:56.6915615Z  * [new branch]        agent/configurable-host-worktree-root-with-fal -> origin/agent/configurable-host-worktree-root-with-fal
+2026-10-15T22:12:56.6916358Z  * [new branch]        agent/count-untracked-folders-once-in-broker-p -> origin/agent/count-untracked-folders-once-in-broker-p
+2026-10-15T22:12:56.6916985Z  * [new branch]        agent/cut-release-v0-8-16                -> origin/agent/cut-release-v0-8-16
+2026-10-15T22:12:56.6917673Z  * [new branch]        agent/cut-release-v0-8-17                -> origin/agent/cut-release-v0-8-17
+2026-10-15T22:12:56.6918232Z  * [new branch]        agent/cut-release-v0-8-19                -> origin/agent/cut-release-v0-8-19
+2026-10-15T22:12:56.6918855Z  * [new branch]        agent/cut-release-v0-8-20                -> origin/agent/cut-release-v0-8-20
+2026-10-15T22:12:56.6919524Z  * [new branch]        agent/declare-the-v0-8-10-contract-decision-fo -> origin/agent/declare-the-v0-8-10-contract-decision-fo
+2026-10-15T22:12:56.6920245Z  * [new branch]        agent/deduplicate-lease-overlaps-rank-by-hunk -> origin/agent/deduplicate-lease-overlaps-rank-by-hunk
+2026-10-15T22:12:56.6921390Z  * [new branch]        agent/defer-load-admitted-gates-when-sustained -> origin/agent/defer-load-admitted-gates-when-sustained
+2026-10-15T22:12:56.6922220Z  * [new branch]        agent/defer-resource-failures-v2         -> origin/agent/defer-resource-failures-v2
+2026-10-15T22:12:56.6923012Z  * [new branch]        agent/detect-broken-core-hookspath-in-doctor-a -> origin/agent/detect-broken-core-hookspath-in-doctor-a
+2026-10-15T22:12:56.6923756Z  * [new branch]        agent/docs-follow-up-for-354-document-broker-f -> origin/agent/docs-follow-up-for-354-document-broker-f
+2026-10-15T22:12:56.6924527Z  * [new branch]        agent/drop-clap-derive-so-the-workspace-builds -> origin/agent/drop-clap-derive-so-the-workspace-builds
+2026-10-15T22:12:56.6925283Z  * [new branch]        agent/enable-push-session-branches-and-promote -> origin/agent/enable-push-session-branches-and-promote
+2026-10-15T22:12:56.6926045Z  * [new branch]        agent/expire-recovery-archives-through-reviewe -> origin/agent/expire-recovery-archives-through-reviewe
+2026-10-15T22:12:56.6926793Z  * [new branch]        agent/explain-read-only-compatibility-refusals -> origin/agent/explain-read-only-compatibility-refusals
+2026-10-15T22:12:56.6928107Z  * [new branch]        agent/explain-shallow-clone-cleanup-inspection -> origin/agent/explain-shallow-clone-cleanup-inspection
+2026-10-15T22:12:56.6928889Z  * [new branch]        agent/faster-ci-cache-gates-warm-macos-cache-f -> origin/agent/faster-ci-cache-gates-warm-macos-cache-f
+2026-10-15T22:12:56.6929644Z  * [new branch]        agent/feat-broker-scaffold-aethyme-prepare-tom -> origin/agent/feat-broker-scaffold-aethyme-prepare-tom
+2026-10-15T22:12:56.6930386Z  * [new branch]        agent/finalize-aethyme-release-after-pr-403 -> origin/agent/finalize-aethyme-release-after-pr-403
+2026-10-15T22:12:56.6931059Z  * [new branch]        agent/finish-cleanup-resolve-archive     -> origin/agent/finish-cleanup-resolve-archive
+2026-10-15T22:12:56.6931744Z  * [new branch]        agent/fix-361-disposable-databases-for-broker -> origin/agent/fix-361-disposable-databases-for-broker
+2026-10-15T22:12:56.6932462Z  * [new branch]        agent/fix-366-make-path-lease-coverage-explici -> origin/agent/fix-366-make-path-lease-coverage-explici
+2026-10-15T22:12:56.6933261Z  * [new branch]        agent/fix-383-centralize-workspace-dependency -> origin/agent/fix-383-centralize-workspace-dependency
+2026-10-15T22:12:56.6933988Z  * [new branch]        agent/fix-385-correct-the-explore-wrapper-runt -> origin/agent/fix-385-correct-the-explore-wrapper-runt
+2026-10-15T22:12:56.6934717Z  * [new branch]        agent/fix-393-remaining-cross-session-ref-and -> origin/agent/fix-393-remaining-cross-session-ref-and
+2026-10-15T22:12:56.6935382Z  * [new branch]        agent/fix-405-integration-reconcile      -> origin/agent/fix-405-integration-reconcile
+2026-10-15T22:12:56.6936038Z  * [new branch]        agent/fix-413-admit-the-cross-process-contract -> origin/agent/fix-413-admit-the-cross-process-contract
+2026-10-15T22:12:56.6936795Z  * [new branch]        agent/fix-413-defer-the-cost-1-cross-process-c -> origin/agent/fix-413-defer-the-cost-1-cross-process-c
+2026-10-15T22:12:56.6937590Z  * [new branch]        agent/fix-418-preflight-associated-pr-contract -> origin/agent/fix-418-preflight-associated-pr-contract
+2026-10-15T22:12:56.6938704Z  * [new branch]        agent/fix-419-replace-flaky-fixed-delay-broker -> origin/agent/fix-419-replace-flaky-fixed-delay-broker
+2026-10-15T22:12:56.6939442Z  * [new branch]        agent/fix-430-concurrent-gate-workers-sharing -> origin/agent/fix-430-concurrent-gate-workers-sharing
+2026-10-15T22:12:56.6940161Z  * [new branch]        agent/fix-471-r1-account-for-inode-headroom-an -> origin/agent/fix-471-r1-account-for-inode-headroom-an
+2026-10-15T22:12:56.6940958Z  * [new branch]        agent/fix-481-make-affected-gate-inspection-re -> origin/agent/fix-481-make-affected-gate-inspection-re
+2026-10-15T22:12:56.6942121Z  * [new branch]        agent/fix-493-cap-promotion-commit-subjects-at -> origin/agent/fix-493-cap-promotion-commit-subjects-at
+2026-10-15T22:12:56.6942871Z  * [new branch]        agent/fix-549-classify-an-explicit-auto-merge -> origin/agent/fix-549-classify-an-explicit-auto-merge
+2026-10-15T22:12:56.6943613Z  * [new branch]        agent/fix-595-reject-the-unsupported-broker-su -> origin/agent/fix-595-reject-the-unsupported-broker-su
+2026-10-15T22:12:56.6944501Z  * [new branch]        agent/fix-695-inspect-remote-exact-ref-push-ou -> origin/agent/fix-695-inspect-remote-exact-ref-push-ou
+2026-10-15T22:12:56.6945265Z  * [new branch]        agent/fix-696-make-finish-integration-reconcil -> origin/agent/fix-696-make-finish-integration-reconcil
+2026-10-15T22:12:56.6946055Z  * [new branch]        agent/fix-analysis-view-hold-retire-and-public -> origin/agent/fix-analysis-view-hold-retire-and-public
+2026-10-15T22:12:56.6946823Z  * [new branch]        agent/fix-default-branch-ownership-in-ref-guar -> origin/agent/fix-default-branch-ownership-in-ref-guar
+2026-10-15T22:12:56.6947584Z  * [new branch]        agent/fix-gc-reclaim-tracked-dirs        -> origin/agent/fix-gc-reclaim-tracked-dirs
+2026-10-15T22:12:56.6948244Z  * [new branch]        agent/fix-main-duplicate-gitrepo-operation-in -> origin/agent/fix-main-duplicate-gitrepo-operation-in
+2026-10-15T22:12:56.6949148Z  * [new branch]        agent/fix-projection-github-writes-refused-by -> origin/agent/fix-projection-github-writes-refused-by
+2026-10-15T22:12:56.6949825Z  * [new branch]        agent/gate-capacity-slot                 -> origin/agent/gate-capacity-slot
+2026-10-15T22:12:56.6950442Z  * [new branch]        agent/gc-reclaim-apply-reviewed-subset   -> origin/agent/gc-reclaim-apply-reviewed-subset
+2026-10-15T22:12:56.6951078Z  * [new branch]        agent/gc-shared-artifact-catalog         -> origin/agent/gc-shared-artifact-catalog
+2026-10-15T22:12:56.6951911Z  * [new branch]        agent/gc-storage-retire-cleaned-empty-roots -> origin/agent/gc-storage-retire-cleaned-empty-roots
+2026-10-15T22:12:56.6952781Z  * [new branch]        agent/gc-sweep-idle-open-sessions        -> origin/agent/gc-sweep-idle-open-sessions
+2026-10-15T22:12:56.6953682Z  * [new branch]        agent/generated-agent-instructions-push-sessio -> origin/agent/generated-agent-instructions-push-sessio
+2026-10-15T22:12:56.6954734Z  * [new branch]        agent/graph-tooling-audit-remediation-15-recom -> origin/agent/graph-tooling-audit-remediation-15-recom
+2026-10-15T22:12:56.6955645Z  * [new branch]        agent/hermetic-free-space-probe-for-tests -> origin/agent/hermetic-free-space-probe-for-tests
+2026-10-15T22:12:56.6956629Z  * [new branch]        agent/hook-overlap-notes-use-current-session-c -> origin/agent/hook-overlap-notes-use-current-session-c
+2026-10-15T22:12:56.6957733Z  * [new branch]        agent/implement-213-vertical-slice-rust-and-ty -> origin/agent/implement-213-vertical-slice-rust-and-ty
+2026-10-15T22:12:56.6958666Z  * [new branch]        agent/implement-232-isolate-broker-gates-from -> origin/agent/implement-232-isolate-broker-gates-from
+2026-10-15T22:12:56.6959610Z  * [new branch]        agent/implement-232-warn-when-exploring-a-stal -> origin/agent/implement-232-warn-when-exploring-a-stal
+2026-10-15T22:12:56.6960548Z  * [new branch]        agent/implement-237-clean                -> origin/agent/implement-237-clean
+2026-10-15T22:12:56.6963078Z  * [new branch]        agent/implement-237-persist-operation-progress -> origin/agent/implement-237-persist-operation-progress
+2026-10-15T22:12:56.6964271Z  * [new branch]        agent/implement-258-reclaim-verified-regenerab -> origin/agent/implement-258-reclaim-verified-regenerab
+2026-10-15T22:12:56.6965289Z  * [new branch]        agent/implement-264-skip-verification-for-dele -> origin/agent/implement-264-skip-verification-for-dele
+2026-10-15T22:12:56.6966198Z  * [new branch]        agent/implement-280-292-graph-integrity-stale -> origin/agent/implement-280-292-graph-integrity-stale
+2026-10-15T22:12:56.6967059Z  * [new branch]        agent/implement-287-broker-doctor-across-store -> origin/agent/implement-287-broker-doctor-across-store
+2026-10-15T22:12:56.6967828Z  * [new branch]        agent/implement-293-251-install-replacement-de -> origin/agent/implement-293-251-install-replacement-de
+2026-10-15T22:12:56.6968629Z  * [new branch]        agent/implement-294-keep-submission-ownership -> origin/agent/implement-294-keep-submission-ownership
+2026-10-15T22:12:56.6969374Z  * [new branch]        agent/implement-352-integration-as-a-disposabl -> origin/agent/implement-352-integration-as-a-disposabl
+2026-10-15T22:12:56.6970285Z  * [new branch]        agent/implement-358-release-leases-on-a-verifi -> origin/agent/implement-358-release-leases-on-a-verifi
+2026-10-15T22:12:56.6971256Z  * [new branch]        agent/implement-359-lease-release-requests-ack -> origin/agent/implement-359-lease-release-requests-ack
+2026-10-15T22:12:56.6972239Z  * [new branch]        agent/implement-360-lease-liveness-bound-to-th -> origin/agent/implement-360-lease-liveness-bound-to-th
+2026-10-15T22:12:56.6973279Z  * [new branch]        agent/implement-369-independently-ship-a-verif -> origin/agent/implement-369-independently-ship-a-verif
+2026-10-15T22:12:56.6974279Z  * [new branch]        agent/implement-374-section-3-orphaned-console -> origin/agent/implement-374-section-3-orphaned-console
+2026-10-15T22:12:56.6975531Z  * [new branch]        agent/implement-381-enhance-first-aethyme-enha -> origin/agent/implement-381-enhance-first-aethyme-enha
+2026-10-15T22:12:56.6976558Z  * [new branch]        agent/implement-381-integration-suites-for-aet -> origin/agent/implement-381-integration-suites-for-aet
+2026-10-15T22:12:56.6977517Z  * [new branch]        agent/implement-384-remove-quality-inspect-fal -> origin/agent/implement-384-remove-quality-inspect-fal
+2026-10-15T22:12:56.6978531Z  * [new branch]        agent/implement-386-add-reproducible-criterion -> origin/agent/implement-386-add-reproducible-criterion
+2026-10-15T22:12:56.6979586Z  * [new branch]        agent/implement-393-remainder-guard-gh-ref-del -> origin/agent/implement-393-remainder-guard-gh-ref-del
+2026-10-15T22:12:56.6980978Z  * [new branch]        agent/implement-417-back-off-empty-delivery-po -> origin/agent/implement-417-back-off-empty-delivery-po
+2026-10-15T22:12:56.6982401Z  * [new branch]        agent/implement-460-bound-full-broker-status-a -> origin/agent/implement-460-bound-full-broker-status-a
+2026-10-15T22:12:56.6983571Z  * [new branch]        agent/implement-464-tracked-elsewhere-reconcil -> origin/agent/implement-464-tracked-elsewhere-reconcil
+2026-10-15T22:12:56.6984873Z  * [new branch]        agent/implement-494-make-broker-operation-lock -> origin/agent/implement-494-make-broker-operation-lock
+2026-10-15T22:12:56.6985870Z  * [new branch]        agent/implement-549-and-286-definitive-gh-reje -> origin/agent/implement-549-and-286-definitive-gh-reje
+2026-10-15T22:12:56.6986866Z  * [new branch]        agent/implement-555-bound-brokered-read-only-g -> origin/agent/implement-555-bound-brokered-read-only-g
+2026-10-15T22:12:56.6987941Z  * [new branch]        agent/implement-559-bound-broker-worktrees-jso -> origin/agent/implement-559-bound-broker-worktrees-jso
+2026-10-15T22:12:56.6989009Z  * [new branch]        agent/implement-584-a-compute-pr-size-and-risk -> origin/agent/implement-584-a-compute-pr-size-and-risk
+2026-10-15T22:12:56.6990370Z  * [new branch]        agent/implement-584-b-rule-conditions-on-size -> origin/agent/implement-584-b-rule-conditions-on-size
+2026-10-15T22:12:56.6991446Z  * [new branch]        agent/implement-588-a-ancestry-fast-path-for-l -> origin/agent/implement-588-a-ancestry-fast-path-for-l
+2026-10-15T22:12:56.6992655Z  * [new branch]        agent/implement-588-b-automatic-removal-of-dis -> origin/agent/implement-588-b-automatic-removal-of-dis
+2026-10-15T22:12:56.6993815Z  * [new branch]        agent/implement-596-configurable-comment-actio -> origin/agent/implement-596-configurable-comment-actio
+2026-10-15T22:12:56.6994705Z  * [new branch]        agent/implement-598-a-one-local-test-command-t -> origin/agent/implement-598-a-one-local-test-command-t
+2026-10-15T22:12:56.6995855Z  * [new branch]        agent/implement-598-b-stabilise-the-flaky-gc-c -> origin/agent/implement-598-b-stabilise-the-flaky-gc-c
+2026-10-15T22:12:56.6996841Z  * [new branch]        agent/implement-606-repo-wide-pr-subscriptions -> origin/agent/implement-606-repo-wide-pr-subscriptions
+2026-10-15T22:12:56.6997840Z  * [new branch]        agent/implement-663-l4-candidate-boundary-and -> origin/agent/implement-663-l4-candidate-boundary-and
+2026-10-15T22:12:56.6998910Z  * [new branch]        agent/implement-664-provisional-composer-over -> origin/agent/implement-664-provisional-composer-over
+2026-10-15T22:12:56.6999915Z  * [new branch]        agent/implement-665-bounded-resolution-request -> origin/agent/implement-665-bounded-resolution-request
+2026-10-15T22:12:56.7000894Z  * [new branch]        agent/implement-666-provisional-l5-target-revi -> origin/agent/implement-666-provisional-l5-target-revi
+2026-10-15T22:12:56.7002897Z  * [new branch]        agent/implement-667-provisional-l5-finite-cand -> origin/agent/implement-667-provisional-l5-finite-cand
+2026-10-15T22:12:56.7003894Z  * [new branch]        agent/implement-668-provisional-l5-reservation -> origin/agent/implement-668-provisional-l5-reservation
+2026-10-15T22:12:56.7005206Z  * [new branch]        agent/implement-669-provisional-l5-stop-restor -> origin/agent/implement-669-provisional-l5-stop-restor
+2026-10-15T22:12:56.7006209Z  * [new branch]        agent/implement-691-reject-unknown-promote-mod -> origin/agent/implement-691-reject-unknown-promote-mod
+2026-10-15T22:12:56.7007209Z  * [new branch]        agent/implement-692-add-a-typed-verification-c -> origin/agent/implement-692-add-a-typed-verification-c
+2026-10-15T22:12:56.7008233Z  * [new branch]        agent/implement-693-make-verify-only-submit-pl -> origin/agent/implement-693-make-verify-only-submit-pl
+2026-10-15T22:12:56.7009156Z  * [new branch]        agent/implement-694-extract-shared-delivery-ou -> origin/agent/implement-694-extract-shared-delivery-ou
+2026-10-15T22:12:56.7010189Z  * [new branch]        agent/implement-broker-short-names-and-chau7-t -> origin/agent/implement-broker-short-names-and-chau7-t
+2026-10-15T22:12:56.7011120Z  * [new branch]        agent/implement-deterministic-t45-gc-and-stora -> origin/agent/implement-deterministic-t45-gc-and-stora
+2026-10-15T22:12:56.7012154Z  * [new branch]        agent/implement-fx10-actual-sustained-arrival -> origin/agent/implement-fx10-actual-sustained-arrival
+2026-10-15T22:12:56.7013176Z  * [new branch]        agent/implement-fx17-sealed-model-payload-and -> origin/agent/implement-fx17-sealed-model-payload-and
+2026-10-15T22:12:56.7014165Z  * [new branch]        agent/implement-github-issue-224-configurable -> origin/agent/implement-github-issue-224-configurable
+2026-10-15T22:12:56.7015154Z  * [new branch]        agent/implement-issue-213-dispatchable-imports -> origin/agent/implement-issue-213-dispatchable-imports
+2026-10-15T22:12:56.7016149Z  * [new branch]        agent/implement-issue-218-diagnose-and-reclaim -> origin/agent/implement-issue-218-diagnose-and-reclaim
+2026-10-15T22:12:56.7017092Z  * [new branch]        agent/implement-issue-219-prepared-admission-o -> origin/agent/implement-issue-219-prepared-admission-o
+2026-10-15T22:12:56.7018338Z  * [new branch]        agent/implement-issue-222-promotion-landing-pr -> origin/agent/implement-issue-222-promotion-landing-pr
+2026-10-15T22:12:56.7019307Z  * [new branch]        agent/implement-issue-225-extend-storage-to-en -> origin/agent/implement-issue-225-extend-storage-to-en
+2026-10-15T22:12:56.7020877Z  * [new branch]        agent/implement-issue-232-safe-automatic-fast -> origin/agent/implement-issue-232-safe-automatic-fast
+2026-10-15T22:12:56.7021945Z  * [new branch]        agent/implement-issue-335-unify-safe-worktree -> origin/agent/implement-issue-335-unify-safe-worktree
+2026-10-15T22:12:56.7023020Z  * [new branch]        agent/implement-issue-380-add-nightly-workspac -> origin/agent/implement-issue-380-add-nightly-workspac
+2026-10-15T22:12:56.7024011Z  * [new branch]        agent/implement-issue-496-skip-chau7-tab-looku -> origin/agent/implement-issue-496-skip-chau7-tab-looku
+2026-10-15T22:12:56.7024990Z  * [new branch]        agent/implement-issue-621-preserve-and-surface -> origin/agent/implement-issue-621-preserve-and-surface
+2026-10-15T22:12:56.7025990Z  * [new branch]        agent/implement-issue-640-report-branch-drift -> origin/agent/implement-issue-640-report-branch-drift
+2026-10-15T22:12:56.7027008Z  * [new branch]        agent/implement-issue-688-fix-broker-finish-mi -> origin/agent/implement-issue-688-fix-broker-finish-mi
+2026-10-15T22:12:56.7028097Z  * [new branch]        agent/implement-issue-689-bind-cached-gate-ver -> origin/agent/implement-issue-689-bind-cached-gate-ver
+2026-10-15T22:12:56.7029097Z  * [new branch]        agent/implement-issue-690-pin-pytest-in-the-py -> origin/agent/implement-issue-690-pin-pytest-in-the-py
+2026-10-15T22:12:56.7030105Z  * [new branch]        agent/implement-local-administrative-sensitive -> origin/agent/implement-local-administrative-sensitive
+2026-10-15T22:12:56.7031160Z  * [new branch]        agent/implement-prioritized-open-issue-687-ver -> origin/agent/implement-prioritized-open-issue-687-ver
+2026-10-15T22:12:56.7033176Z  * [new branch]        agent/implement-remaining-actionable-proposals -> origin/agent/implement-remaining-actionable-proposals
+2026-10-15T22:12:56.7034321Z  * [new branch]        agent/implement-the-actual-fx17-20-controlled -> origin/agent/implement-the-actual-fx17-20-controlled
+2026-10-15T22:12:56.7035367Z  * [new branch]        agent/implement-the-maintainer-approved-phase -> origin/agent/implement-the-maintainer-approved-phase
+2026-10-15T22:12:56.7036355Z  * [new branch]        agent/insights-session-throughput-telemetry-fe -> origin/agent/insights-session-throughput-telemetry-fe
+2026-10-15T22:12:56.7037394Z  * [new branch]        agent/integrate-reviewed-local-bare-git-servic -> origin/agent/integrate-reviewed-local-bare-git-servic
+2026-10-15T22:12:56.7038378Z  * [new branch]        agent/investigate-all-issues-flagged-triaged-a -> origin/agent/investigate-all-issues-flagged-triaged-a
+2026-10-15T22:12:56.7039415Z  * [new branch]        agent/issue-126-finish-internal-only-pilot-acc -> origin/agent/issue-126-finish-internal-only-pilot-acc
+2026-10-15T22:12:56.7040791Z  * [new branch]        agent/issue-213-tranche-implement-non-code-and -> origin/agent/issue-213-tranche-implement-non-code-and
+2026-10-15T22:12:56.7041771Z  * [new branch]        agent/issue-369-reject-broker-ship-in-verify-o -> origin/agent/issue-369-reject-broker-ship-in-verify-o
+2026-10-15T22:12:56.7042571Z  * [new branch]        agent/issue-382-part-1-pure-move-broker-rs-int -> origin/agent/issue-382-part-1-pure-move-broker-rs-int
+2026-10-15T22:12:56.7043321Z  * [new branch]        agent/issue-382-part-2-pure-move-store-rs-into -> origin/agent/issue-382-part-2-pure-move-store-rs-into
+2026-10-15T22:12:56.7044061Z  * [new branch]        agent/issue-382-part-3-pure-move-broker-operat -> origin/agent/issue-382-part-3-pure-move-broker-operat
+2026-10-15T22:12:56.7044813Z  * [new branch]        agent/issue-413-include-measured-host-load-in -> origin/agent/issue-413-include-measured-host-load-in
+2026-10-15T22:12:56.7046300Z  * [new branch]        agent/issue-460-bound-interactive-broker-reads -> origin/agent/issue-460-bound-interactive-broker-reads
+2026-10-15T22:12:56.7047083Z  * [new branch]        agent/issue-460-bound-interactive-broker-statu -> origin/agent/issue-460-bound-interactive-broker-statu
+2026-10-15T22:12:56.7047819Z  * [new branch]        agent/issue-481-instrument-gates-affected-per -> origin/agent/issue-481-instrument-gates-affected-per
+2026-10-15T22:12:56.7048545Z  * [new branch]        agent/issue-494-observable-lock-and-lease-wait -> origin/agent/issue-494-observable-lock-and-lease-wait
+2026-10-15T22:12:56.7049297Z  * [new branch]        agent/issue-637-unblock-advice-respects-pendin -> origin/agent/issue-637-unblock-advice-respects-pendin
+2026-10-15T22:12:56.7050059Z  * [new branch]        agent/l0-audit-651-revision-bound-reuse-and-co -> origin/agent/l0-audit-651-revision-bound-reuse-and-co
+2026-10-15T22:12:56.7050810Z  * [new branch]        agent/lease-aware-hook-context-and-note-delive -> origin/agent/lease-aware-hook-context-and-note-delive
+2026-10-15T22:12:56.7051771Z  * [new branch]        agent/lease-claims-inform-instead-of-block-in -> origin/agent/lease-claims-inform-instead-of-block-in
+2026-10-15T22:12:56.7052525Z  * [new branch]        agent/local-bare-git-endpoint-verifier-helper -> origin/agent/local-bare-git-endpoint-verifier-helper
+2026-10-15T22:12:56.7053295Z  * [new branch]        agent/make-broker-schema-migrations-idempotent -> origin/agent/make-broker-schema-migrations-idempotent
+2026-10-15T22:12:56.7054036Z  * [new branch]        agent/make-broker-sync-report-what-it-merged-a -> origin/agent/make-broker-sync-report-what-it-merged-a
+2026-10-15T22:12:56.7054823Z  * [new branch]        agent/make-the-main-branch-contract-gate-read -> origin/agent/make-the-main-branch-contract-gate-read
+2026-10-15T22:12:56.7055496Z  * [new branch]        agent/merge-pr-517-and-cut-v0-8-18       -> origin/agent/merge-pr-517-and-cut-v0-8-18
+2026-10-15T22:12:56.7056165Z  * [new branch]        agent/merge-remaining-prs-and-cut-the-next-rel -> origin/agent/merge-remaining-prs-and-cut-the-next-rel
+2026-10-15T22:12:56.7057126Z  * [new branch]        agent/mode-aware-integration-advice-none-of-it -> origin/agent/mode-aware-integration-advice-none-of-it
+2026-10-15T22:12:56.7057889Z  * [new branch]        agent/operator-claims-show-release-orchestrati -> origin/agent/operator-claims-show-release-orchestrati
+2026-10-15T22:12:56.7058664Z  * [new branch]        agent/overlap-classification-scales-with-sessi -> origin/agent/overlap-classification-scales-with-sessi
+2026-10-15T22:12:56.7059728Z  * [new branch]        agent/per-repository-session-guidance-shown-at -> origin/agent/per-repository-session-guidance-shown-at
+2026-10-15T22:12:56.7061056Z  * [new branch]        agent/perf-broker-batch-the-cleanup-representa -> origin/agent/perf-broker-batch-the-cleanup-representa
+2026-10-15T22:12:56.7062090Z  * [new branch]        agent/prepare-and-publish-the-v0-8-11-patch-re -> origin/agent/prepare-and-publish-the-v0-8-11-patch-re
+2026-10-15T22:12:56.7063068Z  * [new branch]        agent/prepare-and-publish-the-v0-8-12-patch-re -> origin/agent/prepare-and-publish-the-v0-8-12-patch-re
+2026-10-15T22:12:56.7064106Z  * [new branch]        agent/prepare-and-publish-the-v0-8-13-patch-re -> origin/agent/prepare-and-publish-the-v0-8-13-patch-re
+2026-10-15T22:12:56.7065262Z  * [new branch]        agent/prepare-and-publish-the-v0-8-14-patch-re -> origin/agent/prepare-and-publish-the-v0-8-14-patch-re
+2026-10-15T22:12:56.7066231Z  * [new branch]        agent/prepare-external-adopter-pilot-kit-for-i -> origin/agent/prepare-external-adopter-pilot-kit-for-i
+2026-10-15T22:12:56.7067276Z  * [new branch]        agent/prepare-publish-and-install-aethyme-v0-8 -> origin/agent/prepare-publish-and-install-aethyme-v0-8
+2026-10-15T22:12:56.7068280Z  * [new branch]        agent/prepare-v0-8-8-release-after-pr-402 -> origin/agent/prepare-v0-8-8-release-after-pr-402
+2026-10-15T22:12:56.7069309Z  * [new branch]        agent/provisional-fx01-fx07-composition-fixtur -> origin/agent/provisional-fx01-fx07-composition-fixtur
+2026-10-15T22:12:56.7070651Z  * [new branch]        agent/push-early-delivery-agents-push-session -> origin/agent/push-early-delivery-agents-push-session
+2026-10-15T22:12:56.7071706Z  * [new branch]        agent/ready-issue-169-implement-the-triaged-sh -> origin/agent/ready-issue-169-implement-the-triaged-sh
+2026-10-15T22:12:56.7072661Z  * [new branch]        agent/ready-issue-174-complete-typed-review-le -> origin/agent/ready-issue-174-complete-typed-review-le
+2026-10-15T22:12:56.7073519Z  * [new branch]        agent/ready-issue-185-classify-local-git-confl -> origin/agent/ready-issue-185-classify-local-git-confl
+2026-10-15T22:12:56.7074406Z  * [new branch]        agent/ready-issue-192-make-regenerable-artifac -> origin/agent/ready-issue-192-make-regenerable-artifac
+2026-10-15T22:12:56.7075170Z  * [new branch]        agent/ready-issue-193-make-retention-parsing-f -> origin/agent/ready-issue-193-make-retention-parsing-f
+2026-10-15T22:12:56.7076000Z  * [new branch]        agent/ready-issue-194-align-gc-age-policy-with -> origin/agent/ready-issue-194-align-gc-age-policy-with
+2026-10-15T22:12:56.7076999Z  * [new branch]        agent/ready-issue-195-implement-host-scoped-st -> origin/agent/ready-issue-195-implement-host-scoped-st
+2026-10-15T22:12:56.7077937Z  * [new branch]        agent/ready-issue-196-make-gc-protections-mono -> origin/agent/ready-issue-196-make-gc-protections-mono
+2026-10-15T22:12:56.7078990Z  * [new branch]        agent/ready-issue-198-surface-stale-broker-bin -> origin/agent/ready-issue-198-surface-stale-broker-bin
+2026-10-15T22:12:56.7080000Z  * [new branch]        agent/ready-issue-200-make-reclaim-confirmatio -> origin/agent/ready-issue-200-make-reclaim-confirmatio
+2026-10-15T22:12:56.7081282Z  * [new branch]        agent/ready-issues-159-and-161-unify-revision -> origin/agent/ready-issues-159-and-161-unify-revision
+2026-10-15T22:12:56.7082310Z  * [new branch]        agent/reconcile-retention-of-inactive-native-g -> origin/agent/reconcile-retention-of-inactive-native-g
+2026-10-15T22:12:56.7083630Z  * [new branch]        agent/record-a-redacted-error-message-with-fai -> origin/agent/record-a-redacted-error-message-with-fai
+2026-10-15T22:12:56.7084635Z  * [new branch]        agent/record-definitive-github-refusals-as-fai -> origin/agent/record-definitive-github-refusals-as-fai
+2026-10-15T22:12:56.7085679Z  * [new branch]        agent/record-the-maintainer-s-internal-only-pi -> origin/agent/record-the-maintainer-s-internal-only-pi
+2026-10-15T22:12:56.7086733Z  * [new branch]        agent/refuse-coordinated-ops-when-repo-does-no -> origin/agent/refuse-coordinated-ops-when-repo-does-no
+2026-10-15T22:12:56.7087774Z  * [new branch]        agent/refuse-destructive-writes-to-another-liv -> origin/agent/refuse-destructive-writes-to-another-liv
+2026-10-15T22:12:56.7088853Z  * [new branch]        agent/regenerate-broker-lifecycle-split-382-pa -> origin/agent/regenerate-broker-lifecycle-split-382-pa
+2026-10-15T22:12:56.7090031Z  * [new branch]        agent/regenerate-broker-store-split-382-part-2 -> origin/agent/regenerate-broker-store-split-382-part-2
+2026-10-15T22:12:56.7091267Z  * [new branch]        agent/regenerate-coordinated-operations-split -> origin/agent/regenerate-coordinated-operations-split
+2026-10-15T22:12:56.7092387Z  * [new branch]        agent/register-broker-push-help-snapshot-and-g -> origin/agent/register-broker-push-help-snapshot-and-g
+2026-10-15T22:12:56.7093260Z  * [new branch]        agent/release-0-8-21                     -> origin/agent/release-0-8-21
+2026-10-15T22:12:56.7093920Z  * [new branch]        agent/release-0-8-22                     -> origin/agent/release-0-8-22
+2026-10-15T22:12:56.7094617Z  * [new branch]        agent/release-0-8-23                     -> origin/agent/release-0-8-23
+2026-10-15T22:12:56.7095315Z  * [new branch]        agent/release-0-8-24                     -> origin/agent/release-0-8-24
+2026-10-15T22:12:56.7096024Z  * [new branch]        agent/release-0-8-25                     -> origin/agent/release-0-8-25
+2026-10-15T22:12:56.7096985Z  * [new branch]        agent/release-0-8-26                     -> origin/agent/release-0-8-26
+2026-10-15T22:12:56.7097919Z  * [new branch]        agent/remove-duplicate-graph-task-skill-sectio -> origin/agent/remove-duplicate-graph-task-skill-sectio
+2026-10-15T22:12:56.7099018Z  * [new branch]        agent/report-leftover-integration-work-in-aeth -> origin/agent/report-leftover-integration-work-in-aeth
+2026-10-15T22:12:56.7099881Z  * [new branch]        agent/report-worktree-lock-failures-instead-of -> origin/agent/report-worktree-lock-failures-instead-of
+2026-10-15T22:12:56.7101066Z  * [new branch]        agent/resolve-safe-behind-only-integration-dri -> origin/agent/resolve-safe-behind-only-integration-dri
+2026-10-15T22:12:56.7102763Z  * [new branch]        agent/review-and-upgrade-pr-487-insights-repor -> origin/agent/review-and-upgrade-pr-487-insights-repor
+2026-10-15T22:12:56.7103779Z  * [new branch]        agent/run-review-on-broker-push-head-template -> origin/agent/run-review-on-broker-push-head-template
+2026-10-15T22:12:56.7104864Z  * [new branch]        agent/run-the-cargo-test-gate-with-nextest-and -> origin/agent/run-the-cargo-test-gate-with-nextest-and
+2026-10-15T22:12:56.7105913Z  * [new branch]        agent/session-scoped-reclaim-plans-scan-only-t -> origin/agent/session-scoped-reclaim-plans-scan-only-t
+2026-10-15T22:12:56.7106890Z  * [new branch]        agent/shared-landed-work-check           -> origin/agent/shared-landed-work-check
+2026-10-15T22:12:56.7107820Z  * [new branch]        agent/show-position-and-progress-while-broker -> origin/agent/show-position-and-progress-while-broker
+2026-10-15T22:12:56.7108871Z  * [new branch]        agent/skip-aethyme-gates-workspace-suite-gates -> origin/agent/skip-aethyme-gates-workspace-suite-gates
+2026-10-15T22:12:56.7109877Z  * [new branch]        agent/start-fetches-the-default-branch-broker -> origin/agent/start-fetches-the-default-branch-broker
+2026-10-15T22:12:56.7111217Z  * [new branch]        agent/start-sessions-from-upstream-when-integr -> origin/agent/start-sessions-from-upstream-when-integr
+2026-10-15T22:12:56.7112093Z  * [new branch]        agent/status-hot-path                    -> origin/agent/status-hot-path
+2026-10-15T22:12:56.7112908Z  * [new branch]        agent/storage-foreign-worktree-root      -> origin/agent/storage-foreign-worktree-root
+2026-10-15T22:12:56.7113828Z  * [new branch]        agent/storage-inventory-treat-a-git-worktree-a -> origin/agent/storage-inventory-treat-a-git-worktree-a
+2026-10-15T22:12:56.7114928Z  * [new branch]        agent/surface-stale-diverged-aethyme-integrati -> origin/agent/surface-stale-diverged-aethyme-integrati
+2026-10-15T22:12:56.7115999Z  * [new branch]        agent/surface-unpushed-session-work-and-stop-f -> origin/agent/surface-unpushed-session-work-and-stop-f
+2026-10-15T22:12:56.7117035Z  * [new branch]        agent/treat-a-gate-that-starves-after-it-start -> origin/agent/treat-a-gate-that-starves-after-it-start
+2026-10-15T22:12:56.7118151Z  * [new branch]        agent/tree-keyed-verification-slot       -> origin/agent/tree-keyed-verification-slot
+2026-10-15T22:12:56.7118999Z  * [new branch]        agent/tree-keyed-verification-slot-v2    -> origin/agent/tree-keyed-verification-slot-v2
+2026-10-15T22:12:56.7119893Z  * [new branch]        agent/trustworthy-gate-verdicts-fix-391-cache -> origin/agent/trustworthy-gate-verdicts-fix-391-cache
+2026-10-15T22:12:56.7120751Z  * [new branch]        agent/unify-disk-model                   -> origin/agent/unify-disk-model
+2026-10-15T22:12:56.7121888Z  * [new branch]        agent/use-git-patch-id-verbatim-for-every-land -> origin/agent/use-git-patch-id-verbatim-for-every-land
+2026-10-15T22:12:56.7122962Z  * [new branch]        agent/validate-aethyme-path-references-against -> origin/agent/validate-aethyme-path-references-against
+2026-10-15T22:12:56.7124010Z  * [new branch]        agent/verify-only-repos-submit-and-push-agains -> origin/agent/verify-only-repos-submit-and-push-agains
+2026-10-15T22:12:56.7125271Z  * [new branch]        agent/warn-on-duplicate-sessions-for-one-pr-mi -> origin/agent/warn-on-duplicate-sessions-for-one-pr-mi
+2026-10-15T22:12:56.7126415Z  * [new branch]        agent/warn-when-a-session-overlaps-open-pull-r -> origin/agent/warn-when-a-session-overlaps-open-pull-r
+2026-10-15T22:12:56.7127425Z  * [new branch]        build/ci-release-gating-macos            -> origin/build/ci-release-gating-macos
+2026-10-15T22:12:56.7128313Z  * [new branch]        build/debug-trim-sccache                 -> origin/build/debug-trim-sccache
+2026-10-15T22:12:56.7129205Z  * [new branch]        build/gate-every-main-commit             -> origin/build/gate-every-main-commit
+2026-10-15T22:12:56.7130077Z  * [new branch]        build/release-linux-arm64-musl-tap       -> origin/build/release-linux-arm64-musl-tap
+2026-10-15T22:12:56.7131042Z  * [new branch]        chore/migrate-deprecated-broker-callers  -> origin/chore/migrate-deprecated-broker-callers
+2026-10-15T22:12:56.7131946Z  * [new branch]        chore/regenerate-guidance-phase4         -> origin/chore/regenerate-guidance-phase4
+2026-10-15T22:12:56.7132804Z  * [new branch]        chore/rustfmt-workspace                  -> origin/chore/rustfmt-workspace
+2026-10-15T22:12:56.7133848Z  * [new branch]        dependabot/cargo/packages/aethyme/rust/cargo-patch-e3e0769812 -> origin/dependabot/cargo/packages/aethyme/rust/cargo-patch-e3e0769812
+2026-10-15T22:12:56.7134949Z  * [new branch]        dependabot/github_actions/actions-d76694cdc8 -> origin/dependabot/github_actions/actions-d76694cdc8
+2026-10-15T22:12:56.7135942Z  * [new branch]        docs/broker-benchmark-r1                 -> origin/docs/broker-benchmark-r1
+2026-10-15T22:12:56.7136794Z  * [new branch]        docs/phase4-stream-c                     -> origin/docs/phase4-stream-c
+2026-10-15T22:12:56.7137578Z  * [new branch]        docs/phase5-report-pilot-kit             -> origin/docs/phase5-report-pilot-kit
+2026-10-15T22:12:56.7138739Z  * [new branch]        docs/v0-7-22-schema-41-and-locked        -> origin/docs/v0-7-22-schema-41-and-locked
+2026-10-15T22:12:56.7139600Z  * [new branch]        docs/windows-port-scope                  -> origin/docs/windows-port-scope
+2026-10-15T22:12:56.7140385Z  * [new branch]        feat/blocker-registry                    -> origin/feat/blocker-registry
+2026-10-15T22:12:56.7141563Z  * [new branch]        feat/broker-six-verbs                    -> origin/feat/broker-six-verbs
+2026-10-15T22:12:56.7142363Z  * [new branch]        feat/declared-session-scope              -> origin/feat/declared-session-scope
+2026-10-15T22:12:56.7143294Z  * [new branch]        feat/explore-answer-safety-and-split     -> origin/feat/explore-answer-safety-and-split
+2026-10-15T22:12:56.7144352Z  * [new branch]        feat/gate-load-disk-metrics              -> origin/feat/gate-load-disk-metrics
+2026-10-15T22:12:56.7145088Z  * [new branch]        feat/gate-policy-trust                   -> origin/feat/gate-policy-trust
+2026-10-15T22:12:56.7145890Z  * [new branch]        feat/gc-gate-cache-reclaim               -> origin/feat/gc-gate-cache-reclaim
+2026-10-15T22:12:56.7146712Z  * [new branch]        feat/graph-free-explore                  -> origin/feat/graph-free-explore
+2026-10-15T22:12:56.7147592Z  * [new branch]        feat/main-reconcile-fast-forward         -> origin/feat/main-reconcile-fast-forward
+2026-10-15T22:12:56.7148512Z  * [new branch]        feat/min-compatible-schema               -> origin/feat/min-compatible-schema
+2026-10-15T22:12:56.7149441Z  * [new branch]        feat/orphaned-console-stop               -> origin/feat/orphaned-console-stop
+2026-10-15T22:12:56.7150306Z  * [new branch]        feat/phase4-guidance-explore-hook        -> origin/feat/phase4-guidance-explore-hook
+2026-10-15T22:12:56.7151205Z  * [new branch]        feat/preparation-cache-reclaim           -> origin/feat/preparation-cache-reclaim
+2026-10-15T22:12:56.7152031Z  * [new branch]        feat/self-cleaning-sweep                 -> origin/feat/self-cleaning-sweep
+2026-10-15T22:12:56.7152990Z  * [new branch]        feat/worktree-report                     -> origin/feat/worktree-report
+2026-10-15T22:12:56.7153867Z  * [new branch]        fix/adopt-records-declared-scope         -> origin/fix/adopt-records-declared-scope
+2026-10-15T22:12:56.7154816Z  * [new branch]        fix/build-provenance-tracks-ref          -> origin/fix/build-provenance-tracks-ref
+2026-10-15T22:12:56.7155697Z  * [new branch]        fix/cargo-test-gate-timeout              -> origin/fix/cargo-test-gate-timeout
+2026-10-15T22:12:56.7156549Z  * [new branch]        fix/clone-no-local                       -> origin/fix/clone-no-local
+2026-10-15T22:12:56.7157515Z  * [new branch]        fix/close-operation-classification-bypasses -> origin/fix/close-operation-classification-bypasses
+2026-10-15T22:12:56.7158527Z  * [new branch]        fix/closed-session-worktree-leak         -> origin/fix/closed-session-worktree-leak
+2026-10-15T22:12:56.7159379Z  * [new branch]        fix/contract-justified-none              -> origin/fix/contract-justified-none
+2026-10-15T22:12:56.7160332Z  * [new branch]        fix/contract-none-justification          -> origin/fix/contract-none-justification
+2026-10-15T22:12:56.7161167Z  * [new branch]        fix/contract-symbol-boundaries           -> origin/fix/contract-symbol-boundaries
+2026-10-15T22:12:56.7162636Z  * [new branch]        fix/deploy-symlinks-journal-redaction    -> origin/fix/deploy-symlinks-journal-redaction
+2026-10-15T22:12:56.7163585Z  * [new branch]        fix/distinct-exit-codes                  -> origin/fix/distinct-exit-codes
+2026-10-15T22:12:56.7164382Z  * [new branch]        fix/drop-engine-pin-check                -> origin/fix/drop-engine-pin-check
+2026-10-15T22:12:56.7165276Z  * [new branch]        fix/explore-no-graph-free-answer-promotion -> origin/fix/explore-no-graph-free-answer-promotion
+2026-10-15T22:12:56.7166218Z  * [new branch]        fix/finish-reachable-remedy              -> origin/fix/finish-reachable-remedy
+2026-10-15T22:12:56.7167196Z  * [new branch]        fix/gates-from-base-tree                 -> origin/fix/gates-from-base-tree
+2026-10-15T22:12:56.7168143Z  * [new branch]        fix/git-timeout-safe-killpg-file-locks   -> origin/fix/git-timeout-safe-killpg-file-locks
+2026-10-15T22:12:56.7169008Z  * [new branch]        fix/graph-engine-pin-254                 -> origin/fix/graph-engine-pin-254
+2026-10-15T22:12:56.7169873Z  * [new branch]        fix/load-sensitive-broker-tests          -> origin/fix/load-sensitive-broker-tests
+2026-10-15T22:12:56.7171018Z  * [new branch]        fix/reconcile-collected-terminal-entries -> origin/fix/reconcile-collected-terminal-entries
+2026-10-15T22:12:56.7171997Z  * [new branch]        fix/release-pinned-toolchain-target      -> origin/fix/release-pinned-toolchain-target
+2026-10-15T22:12:56.7172966Z  * [new branch]        fix/report-unpromoted-reason             -> origin/fix/report-unpromoted-reason
+2026-10-15T22:12:56.7173811Z  * [new branch]        fix/review-lane-forks-credentials        -> origin/fix/review-lane-forks-credentials
+2026-10-15T22:12:56.7174807Z  * [new branch]        fix/scope-liveness-allow-list            -> origin/fix/scope-liveness-allow-list
+2026-10-15T22:12:56.7175697Z  * [new branch]        fix/stop-discarding-state-writes         -> origin/fix/stop-discarding-state-writes
+2026-10-15T22:12:56.7176516Z  * [new branch]        fix/supply-chain-advisories              -> origin/fix/supply-chain-advisories
+2026-10-15T22:12:56.7177368Z  * [new branch]        fix/ts-indexer-exports                   -> origin/fix/ts-indexer-exports
+2026-10-15T22:12:56.7178168Z  * [new branch]        fix/verify-only-followups                -> origin/fix/verify-only-followups
+2026-10-15T22:12:56.7178982Z  * [new branch]        fix/worktree-relative-push-source        -> origin/fix/worktree-relative-push-source
+2026-10-15T22:12:56.7180843Z  * [new branch]        main                                     -> origin/main
+2026-10-15T22:12:56.7181507Z  * [new branch]        perf/explore-bm25f-corpus-avgdl          -> origin/perf/explore-bm25f-corpus-avgdl
+2026-10-15T22:12:56.7182408Z  * [new branch]        perf/explore-bm25f-ranking               -> origin/perf/explore-bm25f-ranking
+2026-10-15T22:12:56.7183006Z  * [new branch]        perf/explore-lean-default-output         -> origin/perf/explore-lean-default-output
+2026-10-15T22:12:56.7183741Z  * [new branch]        refactor/cli-flag-validation-and-split   -> origin/refactor/cli-flag-validation-and-split
+2026-10-15T22:12:56.7184382Z  * [new branch]        refactor/clippy-zero-warnings            -> origin/refactor/clippy-zero-warnings
+2026-10-15T22:12:56.7185022Z  * [new branch]        refactor/remove-eval-tuned-auth-ranking  -> origin/refactor/remove-eval-tuned-auth-ranking
+2026-10-15T22:12:56.7185722Z  * [new branch]        refactor/retire-python-parity            -> origin/refactor/retire-python-parity
+2026-10-15T22:12:56.7186415Z  * [new branch]        refactor/stop-committing-graph-fragments -> origin/refactor/stop-committing-graph-fragments
+2026-10-15T22:12:56.7187124Z  * [new branch]        release/land-integration-290             -> origin/release/land-integration-290
+2026-10-15T22:12:56.7187816Z  * [new branch]        release/land-integration-v0.7.22         -> origin/release/land-integration-v0.7.22
+2026-10-15T22:12:56.7188348Z  * [new branch]        release/v0.7.22                          -> origin/release/v0.7.22
+2026-10-15T22:12:56.7188881Z  * [new branch]        release/v0.7.24                          -> origin/release/v0.7.24
+2026-10-15T22:12:56.7189343Z  * [new branch]        release/v0.7.25                          -> origin/release/v0.7.25
+2026-10-15T22:12:56.7189826Z  * [new branch]        release/v0.8.0                           -> origin/release/v0.8.0
+2026-10-15T22:12:56.7190322Z  * [new branch]        release/v0.8.1                           -> origin/release/v0.8.1
+2026-10-15T22:12:56.7190831Z  * [new branch]        release/v0.8.2                           -> origin/release/v0.8.2
+2026-10-15T22:12:56.7191438Z  * [new branch]        release/v0.8.3                           -> origin/release/v0.8.3
+2026-10-15T22:12:56.7191918Z  * [new branch]        release/v0.8.4                           -> origin/release/v0.8.4
+2026-10-15T22:12:56.7192348Z  * [new branch]        release/v0.8.5                           -> origin/release/v0.8.5
+2026-10-15T22:12:56.7192971Z  * [new branch]        release/v0.8.6                           -> origin/release/v0.8.6
+2026-10-15T22:12:56.7193560Z  * [new branch]        test/broker-benchmark-harness            -> origin/test/broker-benchmark-harness
+2026-10-15T22:12:56.7194145Z  * [new branch]        test/eval-devset-123                     -> origin/test/eval-devset-123
+2026-10-15T22:12:56.7194688Z  * [new branch]        test/eval-devset-audited                 -> origin/test/eval-devset-audited
+2026-10-15T22:12:56.7195280Z  * [new branch]        test/heldout-navigation-eval             -> origin/test/heldout-navigation-eval
+2026-10-15T22:12:56.7195860Z  * [new tag]           v0.1.0                                   -> v0.1.0
+2026-10-15T22:12:56.7196259Z  * [new tag]           v0.1.1                                   -> v0.1.1
+2026-10-15T22:12:56.7196655Z  * [new tag]           v0.1.2                                   -> v0.1.2
+2026-10-15T22:12:56.7197041Z  * [new tag]           v0.1.3                                   -> v0.1.3
+2026-10-15T22:12:56.7197409Z  * [new tag]           v0.1.4                                   -> v0.1.4
+2026-10-15T22:12:56.7197792Z  * [new tag]           v0.1.5                                   -> v0.1.5
+2026-10-15T22:12:56.7198252Z  * [new tag]           v0.2.0                                   -> v0.2.0
+2026-10-15T22:12:56.7198639Z  * [new tag]           v0.2.1                                   -> v0.2.1
+2026-10-15T22:12:56.7199596Z  * [new tag]           v0.2.2                                   -> v0.2.2
+2026-10-15T22:12:56.7200071Z  * [new tag]           v0.3.0                                   -> v0.3.0
+2026-10-15T22:12:56.7200555Z  * [new tag]           v0.4.0                                   -> v0.4.0
+2026-10-15T22:12:56.7201019Z  * [new tag]           v0.4.1                                   -> v0.4.1
+2026-10-15T22:12:56.7201369Z  * [new tag]           v0.4.2                                   -> v0.4.2
+2026-10-15T22:12:56.7201833Z  * [new tag]           v0.5.0                                   -> v0.5.0
+2026-10-15T22:12:56.7202197Z  * [new tag]           v0.6.0                                   -> v0.6.0
+2026-10-15T22:12:56.7202632Z  * [new tag]           v0.7.0                                   -> v0.7.0
+2026-10-15T22:12:56.7203010Z  * [new tag]           v0.7.1                                   -> v0.7.1
+2026-10-15T22:12:56.7203363Z  * [new tag]           v0.7.10                                  -> v0.7.10
+2026-10-15T22:12:56.7203759Z  * [new tag]           v0.7.11                                  -> v0.7.11
+2026-10-15T22:12:56.7204126Z  * [new tag]           v0.7.12                                  -> v0.7.12
+2026-10-15T22:12:56.7204583Z  * [new tag]           v0.7.13                                  -> v0.7.13
+2026-10-15T22:12:56.7204991Z  * [new tag]           v0.7.14                                  -> v0.7.14
+2026-10-15T22:12:56.7205404Z  * [new tag]           v0.7.15                                  -> v0.7.15
+2026-10-15T22:12:56.7205811Z  * [new tag]           v0.7.16                                  -> v0.7.16
+2026-10-15T22:12:56.7206207Z  * [new tag]           v0.7.17                                  -> v0.7.17
+2026-10-15T22:12:56.7206556Z  * [new tag]           v0.7.18                                  -> v0.7.18
+2026-10-15T22:12:56.7207023Z  * [new tag]           v0.7.19                                  -> v0.7.19
+2026-10-15T22:12:56.7207455Z  * [new tag]           v0.7.2                                   -> v0.7.2
+2026-10-15T22:12:56.7207834Z  * [new tag]           v0.7.20                                  -> v0.7.20
+2026-10-15T22:12:56.7208203Z  * [new tag]           v0.7.21                                  -> v0.7.21
+2026-10-15T22:12:56.7208685Z  * [new tag]           v0.7.22                                  -> v0.7.22
+2026-10-15T22:12:56.7209061Z  * [new tag]           v0.7.23                                  -> v0.7.23
+2026-10-15T22:12:56.7209417Z  * [new tag]           v0.7.24                                  -> v0.7.24
+2026-10-15T22:12:56.7209779Z  * [new tag]           v0.7.25                                  -> v0.7.25
+2026-10-15T22:12:56.7210212Z  * [new tag]           v0.7.3                                   -> v0.7.3
+2026-10-15T22:12:56.7210701Z  * [new tag]           v0.7.4                                   -> v0.7.4
+2026-10-15T22:12:56.7211239Z  * [new tag]           v0.7.5                                   -> v0.7.5
+2026-10-15T22:12:56.7211666Z  * [new tag]           v0.7.6                                   -> v0.7.6
+2026-10-15T22:12:56.7212031Z  * [new tag]           v0.7.7                                   -> v0.7.7
+2026-10-15T22:12:56.7212395Z  * [new tag]           v0.7.8                                   -> v0.7.8
+2026-10-15T22:12:56.7212757Z  * [new tag]           v0.7.9                                   -> v0.7.9
+2026-10-15T22:12:56.7213246Z  * [new tag]           v0.8.0                                   -> v0.8.0
+2026-10-15T22:12:56.7213622Z  * [new tag]           v0.8.1                                   -> v0.8.1
+2026-10-15T22:12:56.7213998Z  * [new tag]           v0.8.10                                  -> v0.8.10
+2026-10-15T22:12:56.7214360Z  * [new tag]           v0.8.11                                  -> v0.8.11
+2026-10-15T22:12:56.7214737Z  * [new tag]           v0.8.12                                  -> v0.8.12
+2026-10-15T22:12:56.7215136Z  * [new tag]           v0.8.13                                  -> v0.8.13
+2026-10-15T22:12:56.7215533Z  * [new tag]           v0.8.14                                  -> v0.8.14
+2026-10-15T22:12:56.7215887Z  * [new tag]           v0.8.15                                  -> v0.8.15
+2026-10-15T22:12:56.7216368Z  * [new tag]           v0.8.16                                  -> v0.8.16
+2026-10-15T22:12:56.7216803Z  * [new tag]           v0.8.17                                  -> v0.8.17
+2026-10-15T22:12:56.7217197Z  * [new tag]           v0.8.18                                  -> v0.8.18
+2026-10-15T22:12:56.7217569Z  * [new tag]           v0.8.19                                  -> v0.8.19
+2026-10-15T22:12:56.7217926Z  * [new tag]           v0.8.2                                   -> v0.8.2
+2026-10-15T22:12:56.7218302Z  * [new tag]           v0.8.20                                  -> v0.8.20
+2026-10-15T22:12:56.7218655Z  * [new tag]           v0.8.21                                  -> v0.8.21
+2026-10-15T22:12:56.7219058Z  * [new tag]           v0.8.22                                  -> v0.8.22
+2026-10-15T22:12:56.7219967Z  * [new tag]           v0.8.23                                  -> v0.8.23
+2026-10-15T22:12:56.7220377Z  * [new tag]           v0.8.24                                  -> v0.8.24
+2026-10-15T22:12:56.7220787Z  * [new tag]           v0.8.25                                  -> v0.8.25
+2026-10-15T22:12:56.7221158Z  * [new tag]           v0.8.26                                  -> v0.8.26
+2026-10-15T22:12:56.7221528Z  * [new tag]           v0.8.3                                   -> v0.8.3
+2026-10-15T22:12:56.7221937Z  * [new tag]           v0.8.4                                   -> v0.8.4
+2026-10-15T22:12:56.7222364Z  * [new tag]           v0.8.5                                   -> v0.8.5
+2026-10-15T22:12:56.7222740Z  * [new tag]           v0.8.6                                   -> v0.8.6
+2026-10-15T22:12:56.7223120Z  * [new tag]           v0.8.7                                   -> v0.8.7
+2026-10-15T22:12:56.7223486Z  * [new tag]           v0.8.8                                   -> v0.8.8
+2026-10-15T22:12:56.7223878Z  * [new tag]           v0.8.9                                   -> v0.8.9
+2026-10-15T22:12:56.7224329Z  * [new ref]           c72d80af88e6957be50adb2b45dfd70051b5ab58 -> pull/785/merge
+2026-10-15T22:12:56.7226386Z ##[endgroup]
+2026-10-15T22:12:56.7226869Z ##[group]Determining the checkout info
+2026-10-15T22:12:56.7227287Z ##[endgroup]
+2026-10-15T22:12:56.7227698Z [command]"C:\Program Files\Git\bin\git.exe" sparse-checkout disable
+2026-10-15T22:12:56.7493163Z [command]"C:\Program Files\Git\bin\git.exe" config --local --unset-all extensions.worktreeConfig
+2026-10-15T22:12:56.7897719Z ##[group]Checking out the ref
+2026-10-15T22:12:56.7905573Z [command]"C:\Program Files\Git\bin\git.exe" checkout --progress --force refs/remotes/pull/785/merge
+2026-10-15T22:12:57.0063589Z ##[error]error: unable to create file packages/aethyme/docs/architecture/local-v3-qualification/sensitive-response-2026-10-15/payloads/current-source/mutations/m1-response-gated-archive-read/mutated-source/packages/aethyme/rust/crates/aethyme-broker/src/collaboration_archive.rs: Filename too long
+2026-10-15T22:12:57.0121833Z ##[error]error: unable to create file packages/aethyme/docs/architecture/local-v3-qualification/sensitive-response-2026-10-15/payloads/current-source/mutations/m3-omit-import-rehearsals-root/mutated-source/packages/aethyme/rust/crates/aethyme-broker/src/collaboration_sensitive.rs: Filename too long
+2026-10-15T22:12:57.0136118Z warning: unable to access 'packages/aethyme/docs/architecture/local-v3-qualification/sensitive-response-2026-10-15/payloads/current-source/mutations/m4-publish-database-receipt-before-table-delete/backup/packages/aethyme/rust/crates/aethyme-broker/src/.gitattributes': Filename too long
+2026-10-15T22:12:57.0140601Z ##[error]error: unable to create file packages/aethyme/docs/architecture/local-v3-qualification/sensitive-response-2026-10-15/payloads/current-source/mutations/m4-publish-database-receipt-before-table-delete/backup/packages/aethyme/rust/crates/aethyme-broker/src/collaboration_sensitive.rs: Filename too long
+2026-10-15T22:12:57.0149687Z ##[error]fatal: cannot create directory at 'packages/aethyme/docs/architecture/local-v3-qualification/sensitive-response-2026-10-15/payloads/current-source/mutations/m4-publish-database-receipt-before-table-delete/mutated-source/packages/aethyme/rust/crates/aethyme-broker': Filename too long
+2026-10-15T22:12:57.0233730Z ##[error]The process 'C:\Program Files\Git\bin\git.exe' failed with exit code 128
+2026-10-15T22:12:57.0703585Z Post job cleanup.
+2026-10-15T22:12:57.2443475Z [command]"C:\Program Files\Git\bin\git.exe" version
+2026-10-15T22:12:57.2764660Z git version 2.56.0.windows.2
+2026-10-15T22:12:57.2843494Z Temporarily overriding HOME='D:\a\_temp\223e2bae-435f-43c8-9e30-1a538ae41023' before making global git config changes
+2026-10-15T22:12:57.2844257Z Adding repository directory to the temporary git global config as a safe directory
+2026-10-15T22:12:57.2853318Z [command]"C:\Program Files\Git\bin\git.exe" config --global --add safe.directory D:\a\Aethyme\Aethyme
+2026-10-15T22:12:57.3196518Z Removing SSH command configuration
+2026-10-15T22:12:57.3206860Z [command]"C:\Program Files\Git\bin\git.exe" config --local --name-only --get-regexp core\.sshCommand
+2026-10-15T22:12:57.3557723Z [command]"C:\Program Files\Git\bin\git.exe" submodule foreach --recursive "sh -c \"git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :\""
+2026-10-15T22:12:57.8937444Z Removing HTTP extra header
+2026-10-15T22:12:57.8946967Z [command]"C:\Program Files\Git\bin\git.exe" config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
+2026-10-15T22:12:57.9281087Z [command]"C:\Program Files\Git\bin\git.exe" submodule foreach --recursive "sh -c \"git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :\""
+2026-10-15T22:12:58.4645689Z Removing includeIf entries pointing to credentials config files
+2026-10-15T22:12:58.4657119Z [command]"C:\Program Files\Git\bin\git.exe" config --local --name-only --get-regexp ^includeIf\.gitdir:
+2026-10-15T22:12:58.4948382Z includeif.gitdir:D:/a/Aethyme/Aethyme/.git.path
+2026-10-15T22:12:58.4948900Z includeif.gitdir:D:/a/Aethyme/Aethyme/.git/worktrees/*.path
+2026-10-15T22:12:58.4949379Z includeif.gitdir:/github/workspace/.git.path
+2026-10-15T22:12:58.4949820Z includeif.gitdir:/github/workspace/.git/worktrees/*.path
+2026-10-15T22:12:58.4995670Z [command]"C:\Program Files\Git\bin\git.exe" config --local --get-all includeif.gitdir:D:/a/Aethyme/Aethyme/.git.path
+2026-10-15T22:12:58.5281497Z D:\a\_temp\git-credentials-6f15cf6c-1fd5-49e7-8881-ea32d08b4417.config
+2026-10-15T22:12:58.5326880Z [command]"C:\Program Files\Git\bin\git.exe" config --local --unset includeif.gitdir:D:/a/Aethyme/Aethyme/.git.path D\:\\a\\_temp\\git\-credentials\-6f15cf6c\-1fd5\-49e7\-8881\-ea32d08b4417\.config
+2026-10-15T22:12:58.5699876Z [command]"C:\Program Files\Git\bin\git.exe" config --local --get-all includeif.gitdir:D:/a/Aethyme/Aethyme/.git/worktrees/*.path
+2026-10-15T22:12:58.5984359Z D:\a\_temp\git-credentials-6f15cf6c-1fd5-49e7-8881-ea32d08b4417.config
+2026-10-15T22:12:58.6027301Z [command]"C:\Program Files\Git\bin\git.exe" config --local --unset includeif.gitdir:D:/a/Aethyme/Aethyme/.git/worktrees/*.path D\:\\a\\_temp\\git\-credentials\-6f15cf6c\-1fd5\-49e7\-8881\-ea32d08b4417\.config
+2026-10-15T22:12:58.6357395Z [command]"C:\Program Files\Git\bin\git.exe" config --local --get-all includeif.gitdir:/github/workspace/.git.path
+2026-10-15T22:12:58.6639292Z /github/runner_temp/git-credentials-6f15cf6c-1fd5-49e7-8881-ea32d08b4417.config
+2026-10-15T22:12:58.6680128Z [command]"C:\Program Files\Git\bin\git.exe" config --local --unset includeif.gitdir:/github/workspace/.git.path \/github\/runner_temp\/git\-credentials\-6f15cf6c\-1fd5\-49e7\-8881\-ea32d08b4417\.config
+2026-10-15T22:12:58.7038043Z [command]"C:\Program Files\Git\bin\git.exe" config --local --get-all includeif.gitdir:/github/workspace/.git/worktrees/*.path
+2026-10-15T22:12:58.7338252Z /github/runner_temp/git-credentials-6f15cf6c-1fd5-49e7-8881-ea32d08b4417.config
+2026-10-15T22:12:58.7384079Z [command]"C:\Program Files\Git\bin\git.exe" config --local --unset includeif.gitdir:/github/workspace/.git/worktrees/*.path \/github\/runner_temp\/git\-credentials\-6f15cf6c\-1fd5\-49e7\-8881\-ea32d08b4417\.config
+2026-10-15T22:12:58.7720744Z [command]"C:\Program Files\Git\bin\git.exe" submodule foreach --recursive "git config --local --show-origin --name-only --get-regexp remote.origin.url"
+2026-10-15T22:12:59.2765083Z Removing credentials config 'D:\a\_temp\git-credentials-6f15cf6c-1fd5-49e7-8881-ea32d08b4417.config'
+2026-10-15T22:12:59.2983872Z Cleaning up orphan processes

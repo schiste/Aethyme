@@ -1,0 +1,93 @@
+{
+  "captured_at": "2026-10-15T23:38:18.420095+00:00",
+  "actions_head": "badd670065871f1c02755be2c3e427f375f3c248",
+  "checkout": "ba7c8bf150f8436a8a140a90ae299650cdc9c024",
+  "tree": "229b8b0d14425a0931856bdd41a3716225d507af",
+  "parents": [
+    "3af335ab87618cc7fcb92a4a5b01ad23edb633d9",
+    "badd670065871f1c02755be2c3e427f375f3c248"
+  ],
+  "files": [
+    {
+      "path": "checkout-commit.status",
+      "bytes": 2,
+      "sha256": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa"
+    },
+    {
+      "path": "checkout-commit.stderr",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "checkout-commit.stdout",
+      "bytes": 2616,
+      "sha256": "60f576d473af73beadc1147e4584e503b459563dc4149cbfde2a052296e88f1d"
+    },
+    {
+      "path": "inventory.json",
+      "bytes": 1291,
+      "sha256": "82156b76eda79539f513be67eff3aa8ddf951b2d238fd083fe893e310cef75f7"
+    },
+    {
+      "path": "job.status",
+      "bytes": 2,
+      "sha256": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa"
+    },
+    {
+      "path": "job.stderr",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "job.stdout",
+      "bytes": 2392,
+      "sha256": "e8334482827d29e3ce2ae77786d9efc5ff399ba9690d2c1f1c861396aa3edf1a"
+    },
+    {
+      "path": "log-allowed.status",
+      "bytes": 2,
+      "sha256": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa"
+    },
+    {
+      "path": "log-allowed.stderr",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "log-allowed.stdout",
+      "bytes": 69662,
+      "sha256": "727b41e56eddecea4934481f5262ff7acfe1c88f58a75651b15d1bd572cfe3f3"
+    },
+    {
+      "path": "log.status",
+      "bytes": 2,
+      "sha256": "4355a46b19d348dc2f57c046f8ef63d4538ebb936000f3c9ee954a27460dd865"
+    },
+    {
+      "path": "log.stderr",
+      "bytes": 99,
+      "sha256": "8b6407b2fdbca54bf3d53fb93e79a3560dbe59567fa5044cfee4bed1b5b6e467"
+    },
+    {
+      "path": "log.stdout",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "workflow.status",
+      "bytes": 2,
+      "sha256": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa"
+    },
+    {
+      "path": "workflow.stderr",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "workflow.stdout",
+      "bytes": 12185,
+      "sha256": "fd2e9e288057bf66d73389b7c2ac88dd9c0c5e8a3f0593bc2d4dc24db78b31e7"
+    }
+  ],
+  "scope": "Product path only. Dependency download HTTP2 error exit101; no product-path assertion executed. Earlier raw terminal-display refusal retained separately."
+}

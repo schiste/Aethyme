@@ -1,0 +1,438 @@
+{
+  "schema": "aethyme.local.qualification.restored/provisional-v0",
+  "date": "2026-10-12",
+  "source_commit": "f61a6de32de4284269dc0e739df8f3193e3cfb65",
+  "source_tree": "13b9817784a90c756543e0039b9341aa3a5b268b",
+  "complete_local_qualification": false,
+  "command_runs": 14,
+  "passing_selected_test_executions": 500,
+  "ignored_selected_test_executions": 13,
+  "failed_selected_test_executions": 0,
+  "strict_clippy": "passed --lib --tests -D warnings",
+  "counts_are_overlapping_executions": true,
+  "rows": [
+    {
+      "name": "local",
+      "argv": [
+        "cargo",
+        "test",
+        "--locked",
+        "-j",
+        "4",
+        "--manifest-path",
+        "packages/aethyme/rust/Cargo.toml",
+        "-p",
+        "aethyme-broker",
+        "--lib",
+        "local_",
+        "--",
+        "--test-threads=4"
+      ],
+      "exit_status": 0,
+      "signal": null,
+      "output_bytes": 23069,
+      "output_sha256": "1a7408de4083984013fdb44a0f6f618b8abcba4de10d9c56b1992c4ca0c96ce6",
+      "output_file": "aethyme-1097-qualification-20261012-4865-fgtvzf/local.log",
+      "counts": {
+        "passed": 207,
+        "failed": 0,
+        "ignored": 7
+      },
+      "credited": true,
+      "validation_kind": "selected_test_executions"
+    },
+    {
+      "name": "collaboration",
+      "argv": [
+        "cargo",
+        "test",
+        "--locked",
+        "-j",
+        "4",
+        "--manifest-path",
+        "packages/aethyme/rust/Cargo.toml",
+        "-p",
+        "aethyme-broker",
+        "--lib",
+        "collaboration_",
+        "--",
+        "--test-threads=4"
+      ],
+      "exit_status": 0,
+      "signal": null,
+      "output_bytes": 15325,
+      "output_sha256": "28c36f2d7769321371c09e76851cda0baf638a987613fc19b57b7cb68b18794d",
+      "output_file": "aethyme-1097-qualification-20261012-4865-fgtvzf/collaboration.log",
+      "counts": {
+        "passed": 152,
+        "failed": 0,
+        "ignored": 4
+      },
+      "credited": true,
+      "validation_kind": "selected_test_executions"
+    },
+    {
+      "name": "snapshot",
+      "argv": [
+        "cargo",
+        "test",
+        "--locked",
+        "-j",
+        "4",
+        "--manifest-path",
+        "packages/aethyme/rust/Cargo.toml",
+        "-p",
+        "aethyme-broker",
+        "--lib",
+        "execution_snapshot::tests",
+        "--",
+        "--test-threads=4"
+      ],
+      "exit_status": 0,
+      "signal": null,
+      "output_bytes": 1648,
+      "output_sha256": "c0c321b1fbae7e846bdd1b1e314ff31e31f46f51a7b1d4469758a2c405ed091c",
+      "output_file": "aethyme-1097-qualification-20261012-4865-fgtvzf/snapshot.log",
+      "counts": {
+        "passed": 14,
+        "failed": 0,
+        "ignored": 0
+      },
+      "credited": true,
+      "validation_kind": "selected_test_executions"
+    },
+    {
+      "name": "verifier",
+      "argv": [
+        "cargo",
+        "test",
+        "--locked",
+        "-j",
+        "4",
+        "--manifest-path",
+        "packages/aethyme/rust/Cargo.toml",
+        "-p",
+        "aethyme-broker",
+        "--lib",
+        "execution_verifier::tests",
+        "--",
+        "--test-threads=4"
+      ],
+      "exit_status": 0,
+      "signal": null,
+      "output_bytes": 1491,
+      "output_sha256": "e9923ef216ef340f58afa1a9a98962984ba65fbe4f15534570930bbb1e2798d0",
+      "output_file": "aethyme-1097-qualification-20261012-4865-fgtvzf/verifier.log",
+      "counts": {
+        "passed": 10,
+        "failed": 0,
+        "ignored": 1
+      },
+      "credited": true,
+      "validation_kind": "selected_test_executions"
+    },
+    {
+      "name": "resources",
+      "argv": [
+        "cargo",
+        "test",
+        "--locked",
+        "-j",
+        "4",
+        "--manifest-path",
+        "packages/aethyme/rust/Cargo.toml",
+        "-p",
+        "aethyme-broker",
+        "--lib",
+        "execution_resources::tests",
+        "--",
+        "--test-threads=4"
+      ],
+      "exit_status": 0,
+      "signal": null,
+      "output_bytes": 1515,
+      "output_sha256": "f6428f02a697ccb8f7831fdbb5704169e8911f0497f1cabf6f0f440ee5d4f5ec",
+      "output_file": "aethyme-1097-qualification-20261012-4865-fgtvzf/resources.log",
+      "counts": {
+        "passed": 10,
+        "failed": 0,
+        "ignored": 1
+      },
+      "credited": true,
+      "validation_kind": "selected_test_executions"
+    },
+    {
+      "name": "review",
+      "argv": [
+        "cargo",
+        "test",
+        "--locked",
+        "-j",
+        "4",
+        "--manifest-path",
+        "packages/aethyme/rust/Cargo.toml",
+        "-p",
+        "aethyme-broker",
+        "--lib",
+        "review::tests",
+        "--",
+        "--test-threads=4"
+      ],
+      "exit_status": 0,
+      "signal": null,
+      "output_bytes": 1398,
+      "output_sha256": "427c826967f1d85360cc725af503dfb088d7a786ca53b6d882d5e3d7a17ea94d",
+      "output_file": "aethyme-1097-qualification-20261012-4865-fgtvzf/review.log",
+      "counts": {
+        "passed": 14,
+        "failed": 0,
+        "ignored": 0
+      },
+      "credited": true,
+      "validation_kind": "selected_test_executions"
+    },
+    {
+      "name": "ship",
+      "argv": [
+        "cargo",
+        "test",
+        "--locked",
+        "-j",
+        "4",
+        "--manifest-path",
+        "packages/aethyme/rust/Cargo.toml",
+        "-p",
+        "aethyme-broker",
+        "--lib",
+        "ship::tests",
+        "--",
+        "--test-threads=4"
+      ],
+      "exit_status": 0,
+      "signal": null,
+      "output_bytes": 1117,
+      "output_sha256": "0f469dc1a5d548890e326f93f99b0e9c2af0d0f6de6b7bf4b9e44c3e14299a04",
+      "output_file": "aethyme-1097-qualification-20261012-4865-fgtvzf/ship.log",
+      "counts": {
+        "passed": 10,
+        "failed": 0,
+        "ignored": 0
+      },
+      "credited": true,
+      "validation_kind": "selected_test_executions"
+    },
+    {
+      "name": "git",
+      "argv": [
+        "cargo",
+        "test",
+        "--locked",
+        "-j",
+        "4",
+        "--manifest-path",
+        "packages/aethyme/rust/Cargo.toml",
+        "-p",
+        "aethyme-broker",
+        "--lib",
+        "git::",
+        "--",
+        "--test-threads=4"
+      ],
+      "exit_status": 0,
+      "signal": null,
+      "output_bytes": 3439,
+      "output_sha256": "696168dc48eb824236b13bee7227b5e2de919f0d6da12f3301049f6ca2c0e611",
+      "output_file": "aethyme-1097-qualification-20261012-4865-fgtvzf/git.log",
+      "counts": {
+        "passed": 36,
+        "failed": 0,
+        "ignored": 0
+      },
+      "credited": true,
+      "validation_kind": "selected_test_executions"
+    },
+    {
+      "name": "composer",
+      "argv": [
+        "cargo",
+        "test",
+        "--locked",
+        "-j",
+        "4",
+        "--manifest-path",
+        "packages/aethyme/rust/Cargo.toml",
+        "-p",
+        "aethyme-broker",
+        "--lib",
+        "composer::tests",
+        "--",
+        "--test-threads=4"
+      ],
+      "exit_status": 0,
+      "signal": null,
+      "output_bytes": 901,
+      "output_sha256": "a231685a46cec069495d90d1509ba96927304e954cbff6331155e281a8a1d5d8",
+      "output_file": "aethyme-1097-qualification-20261012-4865-fgtvzf/composer.log",
+      "counts": {
+        "passed": 8,
+        "failed": 0,
+        "ignored": 0
+      },
+      "credited": true,
+      "validation_kind": "selected_test_executions"
+    },
+    {
+      "name": "resolution",
+      "argv": [
+        "cargo",
+        "test",
+        "--locked",
+        "-j",
+        "4",
+        "--manifest-path",
+        "packages/aethyme/rust/Cargo.toml",
+        "-p",
+        "aethyme-broker",
+        "--test",
+        "resolution_boundaries",
+        "--",
+        "--test-threads=4"
+      ],
+      "exit_status": 0,
+      "signal": null,
+      "output_bytes": 1609,
+      "output_sha256": "d9b61cd53c9377b96b281f7efe09ec925337c8c67ff3c740fe1705f730d3850a",
+      "output_file": "aethyme-1097-qualification-20261012-4865-fgtvzf/resolution.log",
+      "counts": {
+        "passed": 18,
+        "failed": 0,
+        "ignored": 0
+      },
+      "credited": true,
+      "validation_kind": "selected_test_executions"
+    },
+    {
+      "name": "discarded",
+      "argv": [
+        "cargo",
+        "test",
+        "--locked",
+        "-j",
+        "4",
+        "--manifest-path",
+        "packages/aethyme/rust/Cargo.toml",
+        "-p",
+        "aethyme-testkit",
+        "--test",
+        "broker_discarded_results",
+        "--",
+        "--test-threads=4"
+      ],
+      "exit_status": 0,
+      "signal": null,
+      "output_bytes": 497,
+      "output_sha256": "b0bed06950fe86f79193de4df1f1232ba97577dee98e4a3c275678bd8cc13e60",
+      "output_file": "aethyme-1097-qualification-20261012-4865-fgtvzf/discarded.log",
+      "counts": {
+        "passed": 3,
+        "failed": 0,
+        "ignored": 0
+      },
+      "credited": true,
+      "validation_kind": "selected_test_executions"
+    },
+    {
+      "name": "deprecated",
+      "argv": [
+        "cargo",
+        "test",
+        "--locked",
+        "-j",
+        "4",
+        "--manifest-path",
+        "packages/aethyme/rust/Cargo.toml",
+        "-p",
+        "aethyme-testkit",
+        "--test",
+        "deprecated_spelling_callers",
+        "--",
+        "--test-threads=4"
+      ],
+      "exit_status": 0,
+      "signal": null,
+      "output_bytes": 595,
+      "output_sha256": "529f70b8b3e1bd864117f3ed8d05d199260e233335637f9c7d835a1ef68d3cad",
+      "output_file": "aethyme-1097-qualification-20261012-4865-fgtvzf/deprecated.log",
+      "counts": {
+        "passed": 4,
+        "failed": 0,
+        "ignored": 0
+      },
+      "credited": true,
+      "validation_kind": "selected_test_executions"
+    },
+    {
+      "name": "docs",
+      "argv": [
+        "cargo",
+        "test",
+        "--locked",
+        "-j",
+        "4",
+        "--manifest-path",
+        "packages/aethyme/rust/Cargo.toml",
+        "-p",
+        "aethyme-testkit",
+        "--test",
+        "docs_hygiene",
+        "--",
+        "--test-threads=4"
+      ],
+      "exit_status": 0,
+      "signal": null,
+      "output_bytes": 835,
+      "output_sha256": "7bf813871cf1a2dc677114d5b29f436d25de17533b64a9c241ac083db264d060",
+      "output_file": "aethyme-1097-qualification-20261012-4865-fgtvzf/docs.log",
+      "counts": {
+        "passed": 14,
+        "failed": 0,
+        "ignored": 0
+      },
+      "credited": true,
+      "validation_kind": "selected_test_executions"
+    },
+    {
+      "name": "clippy",
+      "argv": [
+        "cargo",
+        "clippy",
+        "--locked",
+        "-j",
+        "4",
+        "--manifest-path",
+        "packages/aethyme/rust/Cargo.toml",
+        "-p",
+        "aethyme-broker",
+        "--lib",
+        "--tests",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "exit_status": 0,
+      "signal": null,
+      "output_bytes": 493,
+      "output_sha256": "c2e438c3be70ab1372d58e34add2d668d0685abf9411921694a467af3bc5ec22",
+      "output_file": "aethyme-1097-qualification-20261012-4865-fgtvzf/clippy.log",
+      "counts": null,
+      "credited": true,
+      "validation_kind": "strict_lint"
+    }
+  ],
+  "limitations": [
+    "explicit ignored native pressure/flow tests are credited separately by their actual invocation ledger",
+    "selected executions overlap; not a count of distinct tests",
+    "composition remains provisional and native gate candidate integration is separately owned",
+    "whole-stack CI and independent adversarial review are distinct from this serial runner"
+  ]
+}

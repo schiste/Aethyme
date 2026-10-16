@@ -1,0 +1,110 @@
+{
+  "schema": "aethyme.local-v3.t01-t02-typescript-parity.v1",
+  "status": "pass",
+  "runtime": "v26.8.2",
+  "referenceCommit": "025103777c16607639073cbf9024d2ad0c39f72d",
+  "assertions": 880,
+  "vectors": {
+    "canonicalJson": {
+      "valid": 16,
+      "invalid": 40
+    },
+    "records": {
+      "valid": 16,
+      "invalid": 21
+    },
+    "sourceSnapshots": {
+      "valid": 13,
+      "invalid": 17,
+      "unsupportedModes": 5
+    },
+    "briefs": {
+      "tokenCases": 30,
+      "calibrationCases": 27,
+      "validDecisionFiles": 9,
+      "invalidDecisionFiles": 25,
+      "validRecords": 1,
+      "invalidRecords": 6
+    }
+  },
+  "frozenSources": [
+    {
+      "path": "packages/aethyme/rust/crates/aethyme-contracts/fixtures/experimental-v0/canonical_json.json",
+      "sha256": "23aeb5caff95304ae2047e1b13eca3825cb8cebb46e1e56676db2b4ef7001450"
+    },
+    {
+      "path": "packages/aethyme/rust/crates/aethyme-contracts/fixtures/experimental-v0/records.json",
+      "sha256": "2c6e2a21c1cd7e3fad9f670152bf04ae474fbfb87e12c74901088e9f96c3176b"
+    },
+    {
+      "path": "packages/aethyme/rust/crates/aethyme-contracts/fixtures/experimental-v0/source_snapshot.json",
+      "sha256": "9d5f05a3525e9000875e3f0fc6c3ad41802a23c9336e6f82f6e9e781ef622840"
+    },
+    {
+      "path": "packages/aethyme/rust/crates/aethyme-contracts/tests/canonical_json_vectors.rs",
+      "sha256": "403d6afa08ac94b71b1386bc20a50b401e513cb9765f2d60007c3ff7e8bba96e"
+    },
+    {
+      "path": "packages/aethyme/rust/crates/aethyme-contracts/tests/record_vectors.rs",
+      "sha256": "563bd824740be45f994d50999da3f1a6dccb50b3f652378a9c0fd94533207c61"
+    },
+    {
+      "path": "packages/aethyme/rust/crates/aethyme-contracts/tests/source_snapshot_vectors.rs",
+      "sha256": "881fb26bddb06042605b922dd706430502de4e4354ab6cfa9eefe53150623a40"
+    },
+    {
+      "path": "packages/aethyme/rust/crates/aethyme-contracts/src/experimental_v0/canonical_json.rs",
+      "sha256": "90070c56f613bb94564072c56076daf2428f2888f0b71e34a526b718c55b52f3"
+    },
+    {
+      "path": "packages/aethyme/rust/crates/aethyme-contracts/src/experimental_v0/record.rs",
+      "sha256": "d4888555e1653ea8897f383dfb6f6f9c50e5e2abd19ee113eb440ee575ad4400"
+    },
+    {
+      "path": "packages/aethyme/rust/crates/aethyme-contracts/src/experimental_v0/source_snapshot.rs",
+      "sha256": "d36bcd57d0f2ccc47aff1a4c69d5ee974d09a22879cfc0ce938687761737ed14"
+    },
+    {
+      "path": "packages/aethyme/rust/crates/aethyme-contracts/fixtures/experimental-v0/brief_tokens.json",
+      "sha256": "cff420ec39830255df6b3f408eae566bbccbb7a7759cffc877c797a0cee1ffd1"
+    },
+    {
+      "path": "packages/aethyme/rust/crates/aethyme-contracts/fixtures/experimental-v0/briefs.json",
+      "sha256": "08aec8cb3a1722a5c41c0ff2c5efc359e8cc084130be9b521564e3edd45369fd"
+    },
+    {
+      "path": "packages/aethyme/rust/crates/aethyme-contracts/fixtures/experimental-v0/brief_calibration.json",
+      "sha256": "d4f62dfbe73d2906fe766d70bb240d16717d1eaf53b7bddbe6bd55de5cc7d695"
+    },
+    {
+      "path": "packages/aethyme/rust/crates/aethyme-contracts/tests/brief_vectors.rs",
+      "sha256": "22540d74de0440ddfc1faa6e3b7479e49c00fb8a13ff05e300667052edf803e7"
+    },
+    {
+      "path": "packages/aethyme/rust/crates/aethyme-contracts/src/experimental_v0/brief.rs",
+      "sha256": "3a903fbadb0775a0bc9ac669f2e8b8b37fb6c54ca4f0687571ae315474792a17"
+    }
+  ],
+  "typescriptSources": [
+    {
+      "path": "packages/aethyme-eval/local-v3/t01-canonical-parity/canonical-json.mts",
+      "sha256": "0b9f582e57d1472abd7e78cb2f2c1e8d9ef2b65ae9ece4d3a4bb0274cb1b2e7f"
+    },
+    {
+      "path": "packages/aethyme-eval/local-v3/t01-canonical-parity/records.mts",
+      "sha256": "9f6ddc29981cc67a732886f192ecf46a1eb994dc30fcd91eec1206e709c28bf8"
+    },
+    {
+      "path": "packages/aethyme-eval/local-v3/t01-canonical-parity/source-snapshot.mts",
+      "sha256": "07554ca81e017137a43537f38a58e2c41518ac867ef3369369ed1e1ebd8ef2b3"
+    },
+    {
+      "path": "packages/aethyme-eval/local-v3/t01-canonical-parity/brief-profile.mts",
+      "sha256": "b1b5c42a0b8c5f71dcd1482969504a342a0b01333f9237ac3f9dd0ca3ada0628"
+    },
+    {
+      "path": "packages/aethyme-eval/local-v3/t01-canonical-parity/t01-canonical-parity.mts",
+      "sha256": "edaec9d682f939f401fdcf66a52abca4810b75bfae4fd3cf8ebf72b73a5e5898"
+    }
+  ]
+}

@@ -1,0 +1,13 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.11s
+     Running unittests src/lib.rs (target/debug/deps/aethyme_broker-0f278e0d02146111)
+
+running 6 tests
+test collaboration_cli::contribution::tests::an_old_omitted_fields_retry_inherits_the_current_operations_and_dependencies ... ok
+test collaboration_cli::contribution::tests::distinct_capture_operations_for_the_same_pair_mint_distinct_contributions ... ok
+test collaboration_cli::contribution::tests::malformed_source_operations_and_dependencies_are_rejected_before_store_access ... ok
+test collaboration_cli::contribution::tests::public_handler_applies_valid_rename_and_exact_dependency_updates ... ok
+test collaboration_cli::contribution::tests::public_handler_creates_rationale_only_revisions_and_old_retry_does_not_rewind_head ... ok
+test collaboration_cli::contribution::tests::two_real_clone_bindings_resolve_the_same_bootstrap_file_identity_map ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 1948 filtered out; finished in 7.26s
+

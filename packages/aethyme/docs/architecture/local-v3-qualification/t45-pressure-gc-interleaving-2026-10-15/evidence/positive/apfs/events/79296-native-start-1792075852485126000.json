@@ -1,0 +1,10 @@
+{
+  "args": [
+    "info",
+    "-plist"
+  ],
+  "command": 11,
+  "deadline_seconds": 10,
+  "output_limit_each": 1048576,
+  "program": "/usr/bin/hdiutil"
+}

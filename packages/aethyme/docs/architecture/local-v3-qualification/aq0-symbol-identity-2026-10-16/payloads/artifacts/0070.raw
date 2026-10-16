@@ -1,0 +1,60 @@
+AQ0 formatting freeze after constructor Clippy fix
+
+Base source branch commit/tree:
+  a31ce23b2151442e29b73f17b8caaaefd17c4fc1
+  d041db07713de8984275f8efbb2ac56795a6c2ae
+Exact uncommitted formatting patch from that base:
+  /private/tmp/aq0-mutants-1c763a10/constructor-input-v2-formatted.patch
+  SHA-256 80e462df34fa27f7943d59e3318a72a0c5788aeaed4bf1804f6f9d817fb59fbf
+Current source SHA-256:
+  packages/aethyme/rust/crates/aethyme-broker/src/experimental_symbol_mapping.rs
+  0263ad2f61841f041faded9780f2046cdd28cc5485deb1a57752a0c722d7604f
+Current integration-test SHA-256:
+  packages/aethyme/rust/crates/aethyme-broker/tests/symbol_identity_binding.rs
+  24222dc71132d8593ab2a3e9dafbbfc1e54ffff682868c673c5e5cdd037c82b0
+
+The broker-guarded `rustfmt --edition 2024` command targeted only the two
+AQ0-owned files. The first guarded invocation actually formatted these two files
+but reported the resolver file outside session 1130's explicit lease. No
+`.aethyme/broker-action-required.md` existed. I claimed the resolver source path,
+then reran the same guarded formatter; it reported no new edits. Direct
+`rustfmt --check --edition 2024` on the exact two files now passes. The edits
+are formatting only beyond the already-reviewed constructor input refactor;
+no fixtures, guards, IDs, schema or authority changed. `git diff --check` passes.
+
+The earlier workspace `cargo fmt --all -- --check` was first attempted without a
+manifest from this crate-worktree root and failed to locate Cargo.toml (log
+`/private/tmp/aq0-a31ce23-fmt-check.txt`, SHA-256
+d51f7464855a673ea6513d2739410460b46fba04181a829ec60f8f3bba2751c3). The
+correct Rust-workspace manifest check then reported formatting differences in
+these two files and other repository files, before these two owned files were
+formatted (log `/private/tmp/aq0-a31ce23-fmt-check-workspace.txt`, SHA-256
+ee3f81030bc4ffb6831b7f3fea73f4ddf03ec872319a23ef72fc37b1259f5489). Run it
+again after committing this freeze; do not format unrelated files.
+
+Six mutation patches remain one-predicate controls. Four original patches apply
+unchanged to this formatted freeze:
+  01-predecode-count.patch  77d7f4a90f8583729e7fd529de9cc2f2b8edddc179ccecef2ae56a27f59196a9
+  04-claim-origin-refs.patch 49c160c2d1adddfa81461b771eb5855db1efaee36e05c907798b87864a063d10
+  05-right-origin-record.patch 692df77bf8d6c89ac5de7f8f731bf66e6b30a53652bd8f3aca9fb8e2187580a6
+  06-proposed-state.patch 1f6db2f94eebdffa079e7c4d6f25cb07689c1156012c94d5749cc404764cae61
+The two source-binding patches were re-anchored only because rustfmt wrapped
+those expressions; old files remain preserved and unchanged:
+  02-right-source-binding-v2.patch
+  SHA-256 fbc1b8c418b70e1b8798c10a49167d89ce15bd0f39fa298dc0d89f100f453af5
+  03-profile-binding-v2.patch
+  SHA-256 4a44785c32d4c34f423e997d1628dfc5f602af87118636f7c016b2e29ca34255
+All six exact intended patches pass read-only `git apply --check` on the current
+worktree. Their unchanged one-predicate intent and reachability need independent
+review against this formatted freeze before any v3 runtime.
+
+Constructor refactor's reviewer CLEAR remains: each clone input groups clone
+ID, repository component and borrowed source snapshot; project/profile remain
+separate, same-clone and repo checks plus source ID assignments unchanged.
+
+Clippy failure on committed pre-refactor source remains preserved at
+`/private/tmp/aq0-restored-1df98deb-clippy.txt`, SHA-256
+`a0e01b8162840393f42c987e4d07bea32836b9ee708941f4a9fd8e012e79bcae` (sole
+error was too_many_arguments). The first v2 clone test ran 4/4 on uncommitted
+source; exact log `/private/tmp/aq0-v2-clone-binding.txt`, pending final committed
+rerun, no qualification credit.

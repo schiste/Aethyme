@@ -1,0 +1,78 @@
+{
+  "attempts": [
+    {
+      "daemon_mem_total_bytes": 4095193088,
+      "exit_code": 101,
+      "id": "docker-pool-4096-admission-refusal",
+      "outcome": "FAIL_BEFORE_PRESSURE",
+      "pressure_profile_credit": false,
+      "raw_command_json_sha256": "3adcb35234386aa93c833785da4c9dac295f02fe6491d1a5bc425204ba03dd8f",
+      "raw_command_log_sha256": "dbf96779398346bc9a2642e9e519ca01ffbec1744c11d13ddbd1e98581ac8a10",
+      "raw_command_status_sha256": "39b8dc3fc8b44765c8e6f1adee04c5b465e555ab791cc42d0d9e810d5b64297c",
+      "required_pool_bytes": 4294967296,
+      "shortfall_bytes": 199774208,
+      "source_head": "4b5f3bc329d5f4108e3df62c67221a224c3c0710",
+      "source_triage": "Job::capacity refused before meter volume/container creation; durable journal ended cleaned and settled with no objects; lease released.",
+      "test_failure": "exact native builder never became running"
+    },
+    {
+      "cleanup": "Exact recorder was interrupted; both run generations were reconciled. First lease released; second journal cleaned=true/settled=false and all seven objects removed; lease then released through the broker. No normal settled-journal claim.",
+      "cleanup_receipt_bytes": 2175,
+      "cleanup_receipt_sha256": "98f71dc2d08964e43c93cf8b11073ce47a66b5bbb483cee6ebe94fac4cd7791a",
+      "exit_code": -2,
+      "failure_boundary": "worker waits in Run::finish for archive SH while the test joins it with GC still holding archive EX; the test had observed kernel ENOSPC but could not collect the build outcome.",
+      "id": "docker-pool-3072-before-prefinish-handoff",
+      "outcome": "INTERRUPTED_BEFORE_OBSERVATION",
+      "pressure_profile_credit": false,
+      "private_snapshot_artifacts_withheld": true,
+      "raw_command_json_sha256": "f0bd852c6417b6a6c4faa46d3843cfe6512b7aff062f254cae1f0f1f88db4eeb",
+      "raw_command_log_sha256": "eaa3202728984aab8df74625e16c46d4f0949c15e90ca35abe9fcbe9bf5b1d6d",
+      "raw_command_status_sha256": "4b883e04ed1a2af32c21811a12f2ccc766a1d73040b533ae4bcdfad8aca74293",
+      "source_head": "ec6f550b6524d8d932dcf9ed4dbbff2cfa0192bd",
+      "source_tree": "d7df008b46dcff68c0daa6f42f982ff739be7b8d"
+    },
+    {
+      "completed_recorder_metadata": false,
+      "credit": false,
+      "id": "m4-pre-dispatch-attempt",
+      "raw_attempt_json_bytes": 3510,
+      "raw_attempt_json_sha256": "61fcb3b5465d219fa056ead1471fae17b392728fa519376a8ea70c834d035b45",
+      "source_head": "bc0b03d08d63080da4fd86a5afba8a4449428623",
+      "source_restored_exactly": true,
+      "state": "restored_after_interruption_or_setup_error"
+    },
+    {
+      "credit": false,
+      "dispatch_record": false,
+      "id": "corrected-docker-preflight-pin-mismatch",
+      "pins_match": false,
+      "raw_preflight_bytes": 4393,
+      "raw_preflight_sha256": "dffd959a6ea5b9f6f4cd3d799e24d19c8384dcd55326d8dafdd315fd3dcbc891",
+      "read_only_command_exit_codes": {
+        "colima_profile": 0,
+        "containers": 0,
+        "daemon": 0,
+        "default_context": 0,
+        "image": 0
+      }
+    },
+    {
+      "claim": "No exit status or test result is asserted for an empty directory.",
+      "dispatch_or_status_record": false,
+      "files_retained_at_package_time": 0,
+      "id": "corrected-docker-retry-directory"
+    },
+    {
+      "cargo_spawned": false,
+      "credit": false,
+      "exit_code": 1,
+      "id": "ratchet-launch-preflight-failure",
+      "raw_attempt_json_bytes": 735,
+      "raw_attempt_json_sha256": "a83f81aee8bf4ba2d83d972bc4743db70384e669099bc568095ba0bea7c5aa14",
+      "recorder_metadata_created": false,
+      "state": "preflight_failed_before_cargo_spawn"
+    }
+  ],
+  "denominator_note": "This ledger distinguishes dispatched test runs from pre-dispatch setup records. It does not infer a result for the empty retry folder or claim a total count of unpersisted launch attempts.",
+  "schema": "aethyme.t45-noncredit-attempts/v1"
+}

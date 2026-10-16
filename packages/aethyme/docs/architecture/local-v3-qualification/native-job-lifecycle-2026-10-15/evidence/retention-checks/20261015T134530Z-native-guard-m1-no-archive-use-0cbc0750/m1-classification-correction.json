@@ -1,0 +1,57 @@
+{
+  "classification": {
+    "assertion": "release_roots must wait for GC at its own archive lock",
+    "expected": "[Blocked, Acquired, Finished]",
+    "failure_summary_contains_test": true,
+    "numeric_cargo_exit": 101,
+    "observed": "[Finished]",
+    "reason_for_correction": "The original wrapper searched for a same-line `... FAILED` marker. Rust\u2019s harness printed the test as the active test line and placed its name in the later failures summary. The unchanged raw log has the exact test name under failures:, test result: FAILED, exit 101, and the expected assertion mismatch.",
+    "rerun_performed": false,
+    "result": "named_assertion_failure_confirms_guard"
+  },
+  "correction_scope": "metadata_classification_only",
+  "created_at_utc": "2026-10-15T13:53:23.939850Z",
+  "label": "native-guard-m1-no-archive-use",
+  "mutation": {
+    "backup": "target/local-resume/mutation-backups/m1-release-without-archive-use.NKsZIC",
+    "backup_sha256": "e17607f4b349556be3eb38651e8bd270087c84d3023c7b767b3308293aa838b5",
+    "name": "m1-release-without-archive-use",
+    "source_mutant_sha256": "2b110f214ac4cc9c65a4c03d7bb406b6435c39a0351cbea8721b3e9b0c3d67af",
+    "source_original_sha256": "e17607f4b349556be3eb38651e8bd270087c84d3023c7b767b3308293aa838b5",
+    "source_restored_sha256": "e17607f4b349556be3eb38651e8bd270087c84d3023c7b767b3308293aa838b5",
+    "test": "native_gates::tests::root_release_waits_for_an_in_progress_gc_generation"
+  },
+  "raw_attempt": {
+    "log": "target/local-resume/retention-checks/20261015T134530Z-native-guard-m1-no-archive-use-0cbc0750/command.log",
+    "log_sha256": "3b47a36cd2a86bd0843028a9c06007077d328ac7769bbaf3c2736ed1d4b55543",
+    "metadata": "target/local-resume/retention-checks/20261015T134530Z-native-guard-m1-no-archive-use-0cbc0750/command.json",
+    "metadata_sha256": "96c661592a68c4616e3bf8a90631b9e9850a98b4ff363473318c70ebe13756fd",
+    "numeric_exit": 101,
+    "source_after": {
+      "diff_sha256": "cae12d642517bdf0215aaf9fa6a2aa6910cd32ee01ac46e08dea122d83c3c023",
+      "head": "d52bc0a514fc5035fe143b97208a9e328f6a5d8e",
+      "status": " M packages/aethyme/docs/architecture/local-v3-qualification/native-job-lifecycle-2026-10-15/ledger.json\n",
+      "tree": "8840983777e2bc46dac1a2b5c748935955cb7be6",
+      "untracked_content_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "source_before": {
+      "diff_sha256": "cae12d642517bdf0215aaf9fa6a2aa6910cd32ee01ac46e08dea122d83c3c023",
+      "head": "d52bc0a514fc5035fe143b97208a9e328f6a5d8e",
+      "status": " M packages/aethyme/docs/architecture/local-v3-qualification/native-job-lifecycle-2026-10-15/ledger.json\n",
+      "tree": "8840983777e2bc46dac1a2b5c748935955cb7be6",
+      "untracked_content_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "source_unchanged": true,
+    "status": "target/local-resume/retention-checks/20261015T134530Z-native-guard-m1-no-archive-use-0cbc0750/command.status",
+    "status_sha256": "39b8dc3fc8b44765c8e6f1adee04c5b465e555ab791cc42d0d9e810d5b64297c"
+  },
+  "raw_attempt_unchanged": true,
+  "schema": "aethyme.local-check-classification-correction/v1",
+  "source_binding": {
+    "head": "d52bc0a514fc5035fe143b97208a9e328f6a5d8e",
+    "note": "The only tracked overlay was the already-dirty lifecycle ledger; the generated collab.snap was committed in d52bc0a5. The Rust source file was restored byte-for-byte to its e9 content.",
+    "tracked_source_diff_sha256": "cae12d642517bdf0215aaf9fa6a2aa6910cd32ee01ac46e08dea122d83c3c023",
+    "tree": "8840983777e2bc46dac1a2b5c748935955cb7be6",
+    "working_tree_overlay": " M packages/aethyme/docs/architecture/local-v3-qualification/native-job-lifecycle-2026-10-15/ledger.json\n"
+  }
+}

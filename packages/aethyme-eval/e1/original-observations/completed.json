@@ -1,0 +1,2490 @@
+{
+  "engine_sha256": "cda5175440f474b4f887c8e6e39878911d15e1a4825d70b4e949a0841820cc3c",
+  "rows": [
+    {
+      "accepted": true,
+      "case": "FX01",
+      "infrastructure_errors": 0,
+      "oracle_failures": [],
+      "profile": "git-text-baseline",
+      "retained_playground": "/private/tmp/aethyme-e1-original-campaign-20261012-d1910b/Playground-E1-EUh0tX",
+      "runs": [
+        {
+          "candidate": {
+            "commit": "1034fa2a3c924bb9581ccd490e8827b6fafb5209",
+            "directory": "/private/tmp/aethyme-e1-original-campaign-20261012-d1910b/Playground-E1-EUh0tX/candidate-0",
+            "mode": "Text",
+            "snapshot": "sha256:b343e40e5b77891291bf02eef5e5a71fe84140ffaca06373338fe3a63774acaf",
+            "tree": "b0e244d19b077e4c497eeca4d60dee3c389abced"
+          },
+          "observations": [],
+          "order": [
+            "c1",
+            "c2",
+            "c3"
+          ],
+          "outcome": "candidate",
+          "recipe": "sha256:179b09221cad048e80e3e9e441b40369224a609758f3d763f5ef535f3be05128",
+          "repeat": 0,
+          "state": "completed",
+          "wall_ms": 464
+        },
+        {
+          "candidate": {
+            "commit": "1034fa2a3c924bb9581ccd490e8827b6fafb5209",
+            "directory": "/private/tmp/aethyme-e1-original-campaign-20261012-d1910b/Playground-E1-EUh0tX/candidate-1",
+            "mode": "Text",
+            "snapshot": "sha256:b343e40e5b77891291bf02eef5e5a71fe84140ffaca06373338fe3a63774acaf",
+            "tree": "b0e244d19b077e4c497eeca4d60dee3c389abced"
+          },
+          "observations": [],
+          "order": [
+            "c1",
+            "c2",
+            "c3"
+          ],
+          "outcome": "candidate",
+          "recipe": "sha256:179b09221cad048e80e3e9e441b40369224a609758f3d763f5ef535f3be05128",
+          "repeat": 1,
+          "state": "completed",
+          "wall_ms": 328
+        },
+        {
+          "candidate": {
+            "commit": "1034fa2a3c924bb9581ccd490e8827b6fafb5209",
+            "directory": "/private/tmp/aethyme-e1-original-campaign-20261012-d1910b/Playground-E1-EUh0tX/candidate-2",
+            "mode": "Text",
+            "snapshot": "sha256:b343e40e5b77891291bf02eef5e5a71fe84140ffaca06373338fe3a63774acaf",
+            "tree": "b0e244d19b077e4c497eeca4d60dee3c389abced"
+          },
+          "observations": [],
+          "order": [
+            "c1",
+            "c3",
+            "c2"
+          ],
+          "outcome": "candidate",
+          "recipe": "sha256:f3ebaa854bca812e890713c49aa3e258031684b64b34bd4fafc23241854ea58a",
+          "repeat": 0,
+          "state": "completed",
+          "wall_ms": 335
+        },
+        {
+          "candidate": {
+            "commit": "1034fa2a3c924bb9581ccd490e8827b6fafb5209",
+            "directory": "/private/tmp/aethyme-e1-original-campaign-20261012-d1910b/Playground-E1-EUh0tX/candidate-3",
+            "mode": "Text",
+            "snapshot": "sha256:b343e40e5b77891291bf02eef5e5a71fe84140ffaca06373338fe3a63774acaf",
+            "tree": "b0e244d19b077e4c497eeca4d60dee3c389abced"
+          },
+          "observations": [],
+          "order": [
+            "c1",
+            "c3",
+            "c2"
+          ],
+          "outcome": "candidate",
+          "recipe": "sha256:f3ebaa854bca812e890713c49aa3e258031684b64b34bd4fafc23241854ea58a",
+          "repeat": 1,
+          "state": "completed",
+          "wall_ms": 259
+        },
+        {
+          "candidate": {
+            "commit": "1034fa2a3c924bb9581ccd490e8827b6fafb5209",
+            "directory": "/private/tmp/aethyme-e1-original-campaign-20261012-d1910b/Playground-E1-EUh0tX/candidate-4",
+            "mode": "Text",
+            "snapshot": "sha256:b343e40e5b77891291bf02eef5e5a71fe84140ffaca06373338fe3a63774acaf",
+            "tree": "b0e244d19b077e4c497eeca4d60dee3c389abced"
+          },
+          "observations": [],
+          "order": [
+            "c2",
+            "c1",
+            "c3"
+          ],
+          "outcome": "candidate",
+          "recipe": "sha256:cc87338533f1619191c2e563e617ffb257a2638a0f866c4e0e14ac15b6dec25b",
+          "repeat": 0,
+          "state": "completed",
+          "wall_ms": 288
+        },
+        {
+          "candidate": {
+            "commit": "1034fa2a3c924bb9581ccd490e8827b6fafb5209",
+            "directory": "/private/tmp/aethyme-e1-original-campaign-20261012-d1910b/Playground-E1-EUh0tX/candidate-5",
+            "mode": "Text",
+            "snapshot": "sha256:b343e40e5b77891291bf02eef5e5a71fe84140ffaca06373338fe3a63774acaf",
+            "tree": "b0e244d19b077e4c497eeca4d60dee3c389abced"
+          },
+          "observations": [],
+          "order": [
+            "c2",
+            "c1",
+            "c3"
+          ],
+          "outcome": "candidate",
+          "recipe": "sha256:cc87338533f1619191c2e563e617ffb257a2638a0f866c4e0e14ac15b6dec25b",
+          "repeat": 1,
+          "state": "completed",
+          "wall_ms": 272
+        },
+        {
+          "candidate": {
+            "commit": "1034fa2a3c924bb9581ccd490e8827b6fafb5209",
+            "directory": "/private/tmp/aethyme-e1-original-campaign-20261012-d1910b/Playground-E1-EUh0tX/candidate-6",
+            "mode": "Text",
+            "snapshot": "sha256:b343e40e5b77891291bf02eef5e5a71fe84140ffaca06373338fe3a63774acaf",
+            "tree": "b0e244d19b077e4c497eeca4d60dee3c389abced"
+          },
+          "observations": [],
+          "order": [
+            "c2",
+            "c3",
+            "c1"
+          ],
+          "outcome": "candidate",
+          "recipe": "sha256:33018668e8f57d6788d36b6482ccef1b4a40141ee92e5b51bd67bb86978295cb",
+          "repeat": 0,
+          "state": "completed",
+          "wall_ms": 304
+        },
+        {
+          "candidate": {
+            "commit": "1034fa2a3c924bb9581ccd490e8827b6fafb5209",
+            "directory": "/private/tmp/aethyme-e1-original-campaign-20261012-d1910b/Playground-E1-EUh0tX/candidate-7",
+            "mode": "Text",
+            "snapshot": "sha256:b343e40e5b77891291bf02eef5e5a71fe84140ffaca06373338fe3a63774acaf",
+            "tree": "b0e244d19b077e4c497eeca4d60dee3c389abced"
+          },
+          "observations": [],
+          "order": [
+            "c2",
+            "c3",
+            "c1"
+          ],
+          "outcome": "candidate",
+          "recipe": "sha256:33018668e8f57d6788d36b6482ccef1b4a40141ee92e5b51bd67bb86978295cb",
+          "repeat": 1,
+          "state": "completed",
+          "wall_ms": 284
+        },
+        {
+          "candidate": {
+            "commit": "1034fa2a3c924bb9581ccd490e8827b6fafb5209",
+            "directory": "/private/tmp/aethyme-e1-original-campaign-20261012-d1910b/Playground-E1-EUh0tX/candidate-8",
+            "mode": "Text",
+            "snapshot": "sha256:b343e40e5b77891291bf02eef5e5a71fe84140ffaca06373338fe3a63774acaf",
+            "tree": "b0e244d19b077e4c497eeca4d60dee3c389abced"
+          },
+          "observations": [],
+          "order": [
+            "c3",
+            "c1",
+            "c2"
+          ],
+          "outcome": "candidate",
+          "recipe": "sha256:0d0e7f6aee2627fe366a142526ef49efeca0026eea4f33035353a94fbd674fba",
+          "repeat": 0,
+          "state": "completed",
+          "wall_ms": 305
+        },
+        {
+          "candidate": {
+            "commit": "1034fa2a3c924bb9581ccd490e8827b6fafb5209",
+            "directory": "/private/tmp/aethyme-e1-original-campaign-20261012-d1910b/Playground-E1-EUh0tX/candidate-9",
+            "mode": "Text",
+            "snapshot": "sha256:b343e40e5b77891291bf02eef5e5a71fe84140ffaca06373338fe3a63774acaf",
+            "tree": "b0e244d19b077e4c497eeca4d60dee3c389abced"
+          },
+          "observations": [],
+          "order": [
+            "c3",
+            "c1",
+            "c2"
+          ],
+          "outcome": "candidate",
+          "recipe": "sha256:0d0e7f6aee2627fe366a142526ef49efeca0026eea4f33035353a94fbd674fba",
+          "repeat": 1,
+          "state": "completed",
+          "wall_ms": 410
+        },
+        {
+          "candidate": {
+            "commit": "1034fa2a3c924bb9581ccd490e8827b6fafb5209",
+            "directory": "/private/tmp/aethyme-e1-original-campaign-20261012-d1910b/Playground-E1-EUh0tX/candidate-10",
+            "mode": "Text",
+            "snapshot": "sha256:b343e40e5b77891291bf02eef5e5a71fe84140ffaca06373338fe3a63774acaf",
+            "tree": "b0e244d19b077e4c497eeca4d60dee3c389abced"
+          },
+          "observations": [],
+          "order": [
+            "c3",
+            "c2",
+            "c1"
+          ],
+          "outcome": "candidate",
+          "recipe": "sha256:f7b488a787de7aba7b1443ff4e65531deb7bf158b4d38f8b3b518c7ee07893f3",
+          "repeat": 0,
+          "state": "completed",
+          "wall_ms": 392
+        },
+        {
+          "candidate": {
+            "commit": "1034fa2a3c924bb9581ccd490e8827b6fafb5209",
+            "directory": "/private/tmp/aethyme-e1-original-campaign-20261012-d1910b/Playground-E1-EUh0tX/candidate-11",
+            "mode": "Text",
+            "snapshot": "sha256:b343e40e5b77891291bf02eef5e5a71fe84140ffaca06373338fe3a63774acaf",
+            "tree": "b0e244d19b077e4c497eeca4d60dee3c389abced"
+          },
+          "observations": [],
+          "order": [
+            "c3",
+            "c2",
+            "c1"
+          ],
+          "outcome": "candidate",
+          "recipe": "sha256:f7b488a787de7aba7b1443ff4e65531deb7bf158b4d38f8b3b518c7ee07893f3",
+          "repeat": 1,
+          "state": "completed",
+          "wall_ms": 355
+        }
+      ],
+      "scenario": "s1",
+      "state": "completed"
+    },
+    {
+      "accepted": false,
+      "case": "FX02",
+      "infrastructure_errors": 0,
+      "oracle_failures": [
+        "run 0 [\"c1\", \"c2\"]: outcome conflict is not one of [\"candidate\"]",
+        "run 1 [\"c1\", \"c2\"]: outcome conflict is not one of [\"candidate\"]",
+        "run 2 [\"c2\", \"c1\"]: outcome conflict is not one of [\"candidate\"]",
+        "run 3 [\"c2\", \"c1\"]: outcome conflict is not one of [\"candidate\"]"
+      ],
+      "profile": "git-text-baseline",
+      "retained_playground": "/private/tmp/aethyme-e1-original-campaign-20261012-d1910b/Playground-E1-aNCLkA",
+      "runs": [
+        {
+          "observations": [],
+          "order": [
+            "c1",
+            "c2"
+          ],
+          "outcome": "conflict",
+          "repeat": 0,
+          "state": "completed",
+          "wall_ms": 97
+        },
+        {
+          "observations": [],
+          "order": [
+            "c1",
+            "c2"
+          ],
+          "outcome": "conflict",
+          "repeat": 1,
+          "state": "completed",
+          "wall_ms": 100
+        },
+        {
+          "observations": [],
+          "order": [
+            "c2",
+            "c1"
+          ],
+          "outcome": "conflict",
+          "repeat": 0,
+          "state": "completed",
+          "wall_ms": 123
+        },
+        {
+          "observations": [],
+          "order": [
+            "c2",
+            "c1"
+          ],
+          "outcome": "conflict",
+          "repeat": 1,
+          "state": "completed",
+          "wall_ms": 108
+        }
+      ],
+      "scenario": "s1",
+      "state": "completed"
+    },
+    {
+      "accepted": true,
+      "case": "FX02",
+      "infrastructure_errors": 0,
+      "oracle_failures": [],
+      "profile": "git-text-baseline",
+      "retained_playground": "/private/tmp/aethyme-e1-original-campaign-20261012-d1910b/Playground-E1-Gczn1C",
+      "runs": [
+        {
+          "observations": [],
+          "order": [
+            "c3",
+            "c4"
+          ],
+          "outcome": "conflict",
+          "repeat": 0,
+          "state": "completed",
+          "wall_ms": 131
+        },
+        {
+          "observations": [],
+          "order": [
+            "c3",
+            "c4"
+          ],
+          "outcome": "conflict",
+          "repeat": 1,
+          "state": "completed",
+          "wall_ms": 134
+        },
+        {
+          "observations": [],
+          "order": [
+            "c4",
+            "c3"
+          ],
+          "outcome": "conflict",
+          "repeat": 0,
+          "state": "completed",
+          "wall_ms": 133
+        },
+        {
+          "observations": [],
+          "order": [
+            "c4",
+            "c3"
+          ],
+          "outcome": "conflict",
+          "repeat": 1,
+          "state": "completed",
+          "wall_ms": 129
+        }
+      ],
+      "scenario": "s2",
+      "state": "completed"
+    },
+    {
+      "accepted": true,
+      "case": "FX03",
+      "infrastructure_errors": 0,
+      "oracle_failures": [],
+      "profile": "git-text-baseline",
+      "retained_playground": "/private/tmp/aethyme-e1-original-campaign-20261012-d1910b/Playground-E1-02jhWY",
+      "runs": [
+        {
+          "candidate": {
+            "commit": "008d753a5460987943f8a3b38624551399c29f08",
+            "directory": "/private/tmp/aethyme-e1-original-campaign-20261012-d1910b/Playground-E1-02jhWY/candidate-0",
+            "mode": "Text",
+            "snapshot": "sha256:e30f47f0db32b7d382e7c40de4a1c03be78353c1ec99598bf0ef22d756ad9f71",
+            "tree": "10002d7f9e944288b7a618163a82b9572a767911"
+          },
+          "observations": [],
+          "order": [
+            "c1",
+            "c2"
+          ],
+          "outcome": "candidate",
+          "recipe": "sha256:7da2839170e7ad597ce36b82c5223992710a82b2dbc8fb1c0414913a9d754272",
+          "repeat": 0,
+          "state": "completed",
+          "wall_ms": 531
+        },
+        {
+          "candidate": {
+            "commit": "008d753a5460987943f8a3b38624551399c29f08",
+            "directory": "/private/tmp/aethyme-e1-original-campaign-20261012-d1910b/Playground-E1-02jhWY/candidate-1",
+            "mode": "Text",
+            "snapshot": "sha256:e30f47f0db32b7d382e7c40de4a1c03be78353c1ec99598bf0ef22d756ad9f71",
+            "tree": "10002d7f9e944288b7a618163a82b9572a767911"
+          },
+          "observations": [],
+          "order": [
+            "c1",
+            "c2"
+          ],
+          "outcome": "candidate",
+          "recipe": "sha256:7da2839170e7ad597ce36b82c5223992710a82b2dbc8fb1c0414913a9d754272",
+          "repeat": 1,
+          "state": "completed",
+          "wall_ms": 404
+        }
+      ],
+      "scenario": "s1",
+      "state": "completed"
+    },
+    {
+      "accepted": true,
+      "case": "FX03",
+      "infrastructure_errors": 0,
+      "oracle_failures": [],
+      "profile": "git-text-baseline",
+      "retained_playground": "/private/tmp/aethyme-e1-original-campaign-20261012-d1910b/Playground-E1-5UxAYN",
+      "runs": [
+        {
+          "candidate": {
+            "commit": "008d753a5460987943f8a3b38624551399c29f08",
+            "directory": "/private/tmp/aethyme-e1-original-campaign-20261012-d1910b/Playground-E1-5UxAYN/candidate-0",
+            "mode": "Text",
+            "snapshot": "sha256:e30f47f0db32b7d382e7c40de4a1c03be78353c1ec99598bf0ef22d756ad9f71",
+            "tree": "10002d7f9e944288b7a618163a82b9572a767911"
+          },
+          "observations": [],
+          "order": [
+            "c1",
+            "c1",
+            "c2",
+            "c1"
+          ],
+          "outcome": "candidate",
+          "recipe": "sha256:da74802a03fb59c55ce4b2f4dd044f40447c561c8914ba2cccea88330e684b35",
+          "repeat": 0,
+          "state": "completed",
+          "wall_ms": 487
+        },
+        {
+          "candidate": {
+            "commit": "008d753a5460987943f8a3b38624551399c29f08",
+            "directory": "/private/tmp/aethyme-e1-original-campaign-20261012-d1910b/Playground-E1-5UxAYN/candidate-1",
+            "mode": "Text",
+            "snapshot": "sha256:e30f47f0db32b7d382e7c40de4a1c03be78353c1ec99598bf0ef22d756ad9f71",
+            "tree": "10002d7f9e944288b7a618163a82b9572a767911"
+          },
+          "observations": [],
+          "order": [
+            "c1",
+            "c1",
+            "c2",
+            "c1"
+          ],
+          "outcome": "candidate",
+          "recipe": "sha256:da74802a03fb59c55ce4b2f4dd044f40447c561c8914ba2cccea88330e684b35",
+          "repeat": 1,
+          "state": "completed",
+          "wall_ms": 408
+        }
+      ],
+      "scenario": "s2",
+      "state": "completed"
+    },
+    {
+      "accepted": true,
+      "case": "FX03",
+      "infrastructure_errors": 0,
+      "oracle_failures": [],
+      "profile": "git-text-baseline",
+      "retained_playground": "/private/tmp/aethyme-e1-original-campaign-20261012-d1910b/Playground-E1-QbfXFC",
+      "runs": [
+        {
+          "observations": [],
+          "order": [
+            "c3"
+          ],
+          "outcome": "unknown_base",
+          "repeat": 0,
+          "state": "completed",
+          "wall_ms": 201
+        },
+        {
+          "observations": [],
+          "order": [
+            "c3"
+          ],
+          "outcome": "unknown_base",
+          "repeat": 1,
+          "state": "completed",
+          "wall_ms": 183
+        }
+      ],
+      "scenario": "s3",
+      "state": "completed"
+    },
+    {
+      "accepted": false,
+      "case": "FX04",
+      "infrastructure_errors": 0,
+      "oracle_failures": [
+        "run 0 [\"c1\", \"c2\"]: app.ts: looks up #submit, which is not in app.html",
+        "run 0 [\"c1\", \"c2\"]: app.ts: no \"keydown\" listener looks up #send-signup",
+        "run 1 [\"c1\", \"c2\"]: app.ts: looks up #submit, which is not in app.html",
+        "run 1 [\"c1\", \"c2\"]: app.ts: no \"keydown\" listener looks up #send-signup",
+        "run 2 [\"c2\", \"c1\"]: app.ts: looks up #submit, which is not in app.html",
+        "run 2 [\"c2\", \"c1\"]: app.ts: no \"keydown\" listener looks up #send-signup",
+        "run 3 [\"c2\", \"c1\"]: app.ts: looks up #submit, which is not in app.html",
+        "run 3 [\"c2\", \"c1\"]: app.ts: no \"keydown\" listener looks up #send-signup"
+      ],
+      "profile": "git-text-baseline",
+      "retained_playground": "/private/tmp/aethyme-e1-original-campaign-20261012-d1910b/Playground-E1-7udyep",
+      "runs": [
+        {
+          "candidate": {
+            "commit": "7387552d78df77f2c569498c268e79b11e9f64bd",
+            "directory": "/private/tmp/aethyme-e1-original-campaign-20261012-d1910b/Playground-E1-7udyep/candidate-0",
+            "mode": "Text",
+            "snapshot": "sha256:f0c04e1b3987a2fbaeb72904abe02f18977cbfa93b19ae88ea001e787868d2f4",
+            "tree": "f91a946ad93e638bcc2a04d94338e5c13cf69971"
+          },
+          "observations": [],
+          "order": [
+            "c1",
+            "c2"
+          ],
+          "outcome": "candidate",
+          "recipe": "sha256:fc72db73c3080b9b1678b3e11e194e4d9b113cc0ce8f97375c2d034c2c64b887",
+          "repeat": 0,
+          "state": "completed",
+          "wall_ms": 396
+        },
+        {
+          "candidate": {
+            "commit": "7387552d78df77f2c569498c268e79b11e9f64bd",
+            "directory": "/private/tmp/aethyme-e1-original-campaign-20261012-d1910b/Playground-E1-7udyep/candidate-1",
+            "mode": "Text",
+            "snapshot": "sha256:f0c04e1b3987a2fbaeb72904abe02f18977cbfa93b19ae88ea001e787868d2f4",
+            "tree": "f91a946ad93e638bcc2a04d94338e5c13cf69971"
+          },
+          "observations": [],
+          "order": [
+            "c1",
+            "c2"
+          ],
+          "outcome": "candidate",
+          "recipe": "sha256:fc72db73c3080b9b1678b3e11e194e4d9b113cc0ce8f97375c2d034c2c64b887",
+          "repeat": 1,
+          "state": "completed",
+          "wall_ms": 369
+        },
+        {
+          "candidate": {
+            "commit": "7387552d78df77f2c569498c268e79b11e9f64bd",
+            "directory": "/private/tmp/aethyme-e1-original-campaign-20261012-d1910b/Playground-E1-7udyep/candidate-2",
+            "mode": "Text",
+            "snapshot": "sha256:f0c04e1b3987a2fbaeb72904abe02f18977cbfa93b19ae88ea001e787868d2f4",
+            "tree": "f91a946ad93e638bcc2a04d94338e5c13cf69971"
+          },
+          "observations": [],
+          "order": [
+            "c2",
+            "c1"
+          ],
+          "outcome": "candidate",
+          "recipe": "sha256:83e7c64dee921c57b23a7694ac7abc6b32b4f429c7a7d3b43663709007361790",
+          "repeat": 0,
+          "state": "completed",
+          "wall_ms": 345
+        },
+        {
+          "candidate": {
+            "commit": "7387552d78df77f2c569498c268e79b11e9f64bd",
+            "directory": "/private/tmp/aethyme-e1-original-campaign-20261012-d1910b/Playground-E1-7udyep/candidate-3",
+            "mode": "Text",
+            "snapshot": "sha256:f0c04e1b3987a2fbaeb72904abe02f18977cbfa93b19ae88ea001e787868d2f4",
+            "tree": "f91a946ad93e638bcc2a04d94338e5c13cf69971"
+          },
+          "observations": [],
+          "order": [
+            "c2",
+            "c1"
+          ],
+          "outcome": "candidate",
+          "recipe": "sha256:83e7c64dee921c57b23a7694ac7abc6b32b4f429c7a7d3b43663709007361790",
+          "repeat": 1,
+          "state": "completed",
+          "wall_ms": 346
+        }
+      ],
+      "scenario": "s1",
+      "state": "completed"
+    },
+    {
+      "accepted": true,
+      "case": "FX05",
+      "infrastructure_errors": 0,
+      "oracle_failures": [],
+      "profile": "git-text-baseline",
+      "retained_playground": "/private/tmp/aethyme-e1-original-campaign-20261012-d1910b/Playground-E1-17wC2y",
+      "runs": [
+        {
+          "observations": [],
+          "order": [
+            "c1",
+            "c2"
+          ],
+          "outcome": "conflict",
+          "repeat": 0,
+          "state": "completed",
+          "wall_ms": 117
+        },
+        {
+          "observations": [],
+          "order": [
+            "c1",
+            "c2"
+          ],
+          "outcome": "conflict",
+          "repeat": 1,
+          "state": "completed",
+          "wall_ms": 121
+        },
+        {
+          "observations": [],
+          "order": [
+            "c2",
+            "c1"
+          ],
+          "outcome": "conflict",
+          "repeat": 0,
+          "state": "completed",
+          "wall_ms": 109
+        },
+        {
+          "observations": [],
+          "order": [
+            "c2",
+            "c1"
+          ],
+          "outcome": "conflict",
+          "repeat": 1,
+          "state": "completed",
+          "wall_ms": 114
+        }
+      ],
+      "scenario": "s1",
+      "state": "completed"
+    },
+    {
+      "accepted": true,
+      "case": "FX06",
+      "infrastructure_errors": 0,
+      "oracle_failures": [],
+      "profile": "git-text-baseline",
+      "retained_playground": "/private/tmp/aethyme-e1-original-campaign-20261012-d1910b/Playground-E1-DCqI7X",
+      "runs": [
+        {
+          "candidate": {
+            "commit": "e7ec22209b0e5a7dd855b0d35a08cfa603de86e6",
+            "directory": "/private/tmp/aethyme-e1-original-campaign-20261012-d1910b/Playground-E1-DCqI7X/candidate-0",
+            "mode": "Text",
+            "snapshot": "sha256:49507241a03f3c88398ec7ff0958584983b03d62d0e2aaaea5a092f350520f2e",
+            "tree": "cef2e6a0b5e50538f496c4ca1ac77a534d73c6c1"
+          },
+          "observations": [],
+          "order": [
+            "c1",
+            "c3"
+          ],
+          "outcome": "candidate",
+          "recipe": "sha256:78e59d794253ea61eaaede15525952d32ec52d8a971edb286878d18d7d955283",
+          "repeat": 0,
+          "state": "completed",
+          "wall_ms": 357
+        },
+        {
+          "candidate": {
+            "commit": "e7ec22209b0e5a7dd855b0d35a08cfa603de86e6",
+            "directory": "/private/tmp/aethyme-e1-original-campaign-20261012-d1910b/Playground-E1-DCqI7X/candidate-1",
+            "mode": "Text",
+            "snapshot": "sha256:49507241a03f3c88398ec7ff0958584983b03d62d0e2aaaea5a092f350520f2e",
+            "tree": "cef2e6a0b5e50538f496c4ca1ac77a534d73c6c1"
+          },
+          "observations": [],
+          "order": [
+            "c1",
+            "c3"
+          ],
+          "outcome": "candidate",
+          "recipe": "sha256:78e59d794253ea61eaaede15525952d32ec52d8a971edb286878d18d7d955283",
+          "repeat": 1,
+          "state": "completed",
+          "wall_ms": 359
+        }
+      ],
+      "scenario": "s1",
+      "state": "completed"
+    },
+    {
+      "accepted": true,
+      "case": "FX06",
+      "infrastructure_errors": 0,
+      "oracle_failures": [],
+      "profile": "git-text-baseline",
+      "retained_playground": "/private/tmp/aethyme-e1-original-campaign-20261012-d1910b/Playground-E1-8RhTnN",
+      "runs": [
+        {
+          "observations": [],
+          "order": [
+            "c3"
+          ],
+          "outcome": "missing_input",
+          "repeat": 0,
+          "state": "completed",
+          "wall_ms": 151
+        },
+        {
+          "observations": [],
+          "order": [
+            "c3"
+          ],
+          "outcome": "missing_input",
+          "repeat": 1,
+          "state": "completed",
+          "wall_ms": 151
+        }
+      ],
+      "scenario": "s2",
+      "state": "completed"
+    },
+    {
+      "accepted": true,
+      "case": "FX06",
+      "infrastructure_errors": 0,
+      "oracle_failures": [],
+      "profile": "git-text-baseline",
+      "retained_playground": "/private/tmp/aethyme-e1-original-campaign-20261012-d1910b/Playground-E1-UCPOOF",
+      "runs": [
+        {
+          "observations": [],
+          "order": [
+            "c1"
+          ],
+          "outcome": "missing_input",
+          "repeat": 0,
+          "state": "completed",
+          "wall_ms": 150
+        },
+        {
+          "observations": [],
+          "order": [
+            "c1"
+          ],
+          "outcome": "missing_input",
+          "repeat": 1,
+          "state": "completed",
+          "wall_ms": 134
+        }
+      ],
+      "scenario": "s3",
+      "state": "completed"
+    },
+    {
+      "accepted": true,
+      "case": "FX06",
+      "infrastructure_errors": 0,
+      "oracle_failures": [],
+      "profile": "git-text-baseline",
+      "retained_playground": "/private/tmp/aethyme-e1-original-campaign-20261012-d1910b/Playground-E1-mLlQGh",
+      "runs": [
+        {
+          "observations": [],
+          "order": [
+            "c4",
+            "c5"
+          ],
+          "outcome": "dependency_cycle",
+          "repeat": 0,
+          "state": "completed",
+          "wall_ms": 157
+        },
+        {
+          "observations": [],
+          "order": [
+            "c4",
+            "c5"
+          ],
+          "outcome": "dependency_cycle",
+          "repeat": 1,
+          "state": "completed",
+          "wall_ms": 152
+        }
+      ],
+      "scenario": "s4",
+      "state": "completed"
+    },
+    {
+      "accepted": true,
+      "case": "FX06",
+      "infrastructure_errors": 0,
+      "oracle_failures": [],
+      "profile": "git-text-baseline",
+      "retained_playground": "/private/tmp/aethyme-e1-original-campaign-20261012-d1910b/Playground-E1-ONP2lh",
+      "runs": [
+        {
+          "observations": [],
+          "order": [
+            "c1",
+            "c2",
+            "c3"
+          ],
+          "outcome": "competing_revisions",
+          "repeat": 0,
+          "state": "completed",
+          "wall_ms": 144
+        },
+        {
+          "observations": [],
+          "order": [
+            "c1",
+            "c2",
+            "c3"
+          ],
+          "outcome": "competing_revisions",
+          "repeat": 1,
+          "state": "completed",
+          "wall_ms": 139
+        }
+      ],
+      "scenario": "s5",
+      "state": "completed"
+    },
+    {
+      "accepted": true,
+      "case": "FX06",
+      "infrastructure_errors": 0,
+      "oracle_failures": [],
+      "profile": "git-text-baseline",
+      "retained_playground": "/private/tmp/aethyme-e1-original-campaign-20261012-d1910b/Playground-E1-pxjBsT",
+      "runs": [
+        {
+          "observations": [],
+          "order": [
+            "c2",
+            "c3"
+          ],
+          "outcome": "competing_revisions",
+          "repeat": 0,
+          "state": "completed",
+          "wall_ms": 140
+        },
+        {
+          "observations": [],
+          "order": [
+            "c2",
+            "c3"
+          ],
+          "outcome": "competing_revisions",
+          "repeat": 1,
+          "state": "completed",
+          "wall_ms": 145
+        }
+      ],
+      "scenario": "s6",
+      "state": "completed"
+    },
+    {
+      "accepted": true,
+      "case": "FX07",
+      "infrastructure_errors": 0,
+      "oracle_failures": [],
+      "profile": "git-text-baseline",
+      "retained_playground": "/private/tmp/aethyme-e1-original-campaign-20261012-d1910b/Playground-E1-VazKTw",
+      "runs": [
+        {
+          "candidate": {
+            "commit": "2f6ae1a624ecc2abb4950e993394f7c3614cfae1",
+            "directory": "/private/tmp/aethyme-e1-original-campaign-20261012-d1910b/Playground-E1-VazKTw/candidate-0",
+            "mode": "Text",
+            "snapshot": "sha256:181805ff7fbfe6602b4fe65410e63db86e65b24080179ebb53ef7a98941299b9",
+            "tree": "bdab02b408a6ad7f5c90c5b88e840b5551d833fb"
+          },
+          "observations": [],
+          "order": [],
+          "outcome": "candidate",
+          "recipe": "sha256:cc7f0e7da1332fd0c3ff468e7f1e730fa1ccc284958dbc1de7b498064ed9ad4a",
+          "repeat": 0,
+          "state": "completed",
+          "wall_ms": 346
+        },
+        {
+          "candidate": {
+            "commit": "2f6ae1a624ecc2abb4950e993394f7c3614cfae1",
+            "directory": "/private/tmp/aethyme-e1-original-campaign-20261012-d1910b/Playground-E1-VazKTw/candidate-1",
+            "mode": "Text",
+            "snapshot": "sha256:181805ff7fbfe6602b4fe65410e63db86e65b24080179ebb53ef7a98941299b9",
+            "tree": "bdab02b408a6ad7f5c90c5b88e840b5551d833fb"
+          },
+          "observations": [],
+          "order": [],
+          "outcome": "candidate",
+          "recipe": "sha256:cc7f0e7da1332fd0c3ff468e7f1e730fa1ccc284958dbc1de7b498064ed9ad4a",
+          "repeat": 1,
+          "state": "completed",
+          "wall_ms": 318
+        }
+      ],
+      "scenario": "s1",
+      "state": "completed"
+    },
+    {
+      "accepted": true,
+      "case": "FX07",
+      "infrastructure_errors": 0,
+      "oracle_failures": [],
+      "profile": "git-text-baseline",
+      "retained_playground": "/private/tmp/aethyme-e1-original-campaign-20261012-d1910b/Playground-E1-cTL8Gd",
+      "runs": [
+        {
+          "observations": [],
+          "order": [],
+          "outcome": "inseparable_selection",
+          "repeat": 0,
+          "state": "completed",
+          "wall_ms": 0
+        },
+        {
+          "observations": [],
+          "order": [],
+          "outcome": "inseparable_selection",
+          "repeat": 1,
+          "state": "completed",
+          "wall_ms": 0
+        }
+      ],
+      "scenario": "s2",
+      "state": "completed"
+    },
+    {
+      "accepted": true,
+      "case": "FX07",
+      "infrastructure_errors": 0,
+      "oracle_failures": [],
+      "profile": "git-text-baseline",
+      "retained_playground": "/private/tmp/aethyme-e1-original-campaign-20261012-d1910b/Playground-E1-nYoGYH",
+      "runs": [
+        {
+          "observations": [],
+          "order": [],
+          "outcome": "inseparable_selection",
+          "repeat": 0,
+          "state": "completed",
+          "wall_ms": 0
+        },
+        {
+          "observations": [],
+          "order": [],
+          "outcome": "inseparable_selection",
+          "repeat": 1,
+          "state": "completed",
+          "wall_ms": 1
+        }
+      ],
+      "scenario": "s3",
+      "state": "completed"
+    },
+    {
+      "accepted": true,
+      "case": "FX01",
+      "infrastructure_errors": 0,
+      "oracle_failures": [],
+      "profile": "mergiraf-html-candidate",
+      "retained_playground": "/private/tmp/aethyme-e1-original-campaign-20261012-d1910b/Playground-E1-vbb2tt",
+      "runs": [
+        {
+          "candidate": {
+            "commit": "1034fa2a3c924bb9581ccd490e8827b6fafb5209",
+            "directory": "/private/tmp/aethyme-e1-original-campaign-20261012-d1910b/Playground-E1-vbb2tt/candidate-0",
+            "mode": "Text",
+            "snapshot": "sha256:b343e40e5b77891291bf02eef5e5a71fe84140ffaca06373338fe3a63774acaf",
+            "tree": "b0e244d19b077e4c497eeca4d60dee3c389abced"
+          },
+          "observations": [
+            {
+              "base_sha256": "510313da8dcfa24402598d7282d435cd8a7f7f8b2a938720b94d7909a77c95bc",
+              "current_sha256": "976101ce75b3d28213b2f4ae635baf922c488d8cca61d6d6ea0482a0fe06c0a2",
+              "diagnostic": "DEBUG line-based merge took 1.424625ms\nDEBUG ~~~ Merge statistics ~~~\nDEBUG line_based: 0 conflicts, 0 mass, has_additional_issues: false\nDEBUG Selected best merge: line_based\n",
+              "diagnostic_sha256": "2c3421c0a3769687740904a035e35eb04896302fea3abfdf2db6b934b6154da9",
+              "exit_code": 0,
+              "method": "LineBased",
+              "output_sha256": "76dc52d623b20a986169de483369a566b4cb2cbeb79f127bda388e291a2ac5da",
+              "path": "app.html",
+              "result_sha256": "9578ffc6d68c3dd9fcd1c2568b6e83b53f8a43b2af72811e968e6e2bb0e9b884",
+              "timed_fallback": false
+            },
+            {
+              "base_sha256": "510313da8dcfa24402598d7282d435cd8a7f7f8b2a938720b94d7909a77c95bc",
+              "current_sha256": "76dc52d623b20a986169de483369a566b4cb2cbeb79f127bda388e291a2ac5da",
+              "diagnostic": "DEBUG line-based merge took 161.5µs\nDEBUG ~~~ Merge statistics ~~~\nDEBUG line_based: 0 conflicts, 0 mass, has_additional_issues: false\nDEBUG Selected best merge: line_based\n",
+              "diagnostic_sha256": "5d952b67be52f518d41f71a112a70f4f770bc8edc17c0d47c348d571abad5cbd",
+              "exit_code": 0,
+              "method": "LineBased",
+              "output_sha256": "47486ff4ab9286a0b78f40aa49697ca988845b8bc47276a6245bc809b201a113",
+              "path": "app.html",
+              "result_sha256": "ee42ce5a2e1100f384ec4e3e97d174ff10ffa8cc9099f2cf637ab82dda085449",
+              "timed_fallback": false
+            }
+          ],
+          "order": [
+            "c1",
+            "c2",
+            "c3"
+          ],
+          "outcome": "candidate",
+          "recipe": "sha256:44eed267accbffc520e4fd70ff1af1667f4a5a322346f7622bab33aee2edd237",
+          "repeat": 0,
+          "state": "completed",
+          "wall_ms": 832
+        },
+        {
+          "candidate": {
+            "commit": "1034fa2a3c924bb9581ccd490e8827b6fafb5209",
+            "directory": "/private/tmp/aethyme-e1-original-campaign-20261012-d1910b/Playground-E1-vbb2tt/candidate-1",
+            "mode": "Text",
+            "snapshot": "sha256:b343e40e5b77891291bf02eef5e5a71fe84140ffaca06373338fe3a63774acaf",
+            "tree": "b0e244d19b077e4c497eeca4d60dee3c389abced"
+          },
+          "observations": [
+            {
+              "base_sha256": "510313da8dcfa24402598d7282d435cd8a7f7f8b2a938720b94d7909a77c95bc",
+              "current_sha256": "976101ce75b3d28213b2f4ae635baf922c488d8cca61d6d6ea0482a0fe06c0a2",
+              "diagnostic": "DEBUG line-based merge took 239.584µs\nDEBUG ~~~ Merge statistics ~~~\nDEBUG line_based: 0 conflicts, 0 mass, has_additional_issues: false\nDEBUG Selected best merge: line_based\n",
+              "diagnostic_sha256": "fcb54604ce90cab8be84374af562996a5217322f6cc4faef56774cec42efcd44",
+              "exit_code": 0,
+              "method": "LineBased",
+              "output_sha256": "76dc52d623b20a986169de483369a566b4cb2cbeb79f127bda388e291a2ac5da",
+              "path": "app.html",
+              "result_sha256": "9578ffc6d68c3dd9fcd1c2568b6e83b53f8a43b2af72811e968e6e2bb0e9b884",
+              "timed_fallback": false
+            },
+            {
+              "base_sha256": "510313da8dcfa24402598d7282d435cd8a7f7f8b2a938720b94d7909a77c95bc",
+              "current_sha256": "76dc52d623b20a986169de483369a566b4cb2cbeb79f127bda388e291a2ac5da",
+              "diagnostic": "DEBUG line-based merge took 265.042µs\nDEBUG ~~~ Merge statistics ~~~\nDEBUG line_based: 0 conflicts, 0 mass, has_additional_issues: false\nDEBUG Selected best merge: line_based\n",
+              "diagnostic_sha256": "e1ef4021bf16e5b3d1e2a30cddd5193ba81ccbabd09cd9ed30232ccc25f64aa3",
+              "exit_code": 0,
+              "method": "LineBased",
+              "output_sha256": "47486ff4ab9286a0b78f40aa49697ca988845b8bc47276a6245bc809b201a113",
+              "path": "app.html",
+              "result_sha256": "ee42ce5a2e1100f384ec4e3e97d174ff10ffa8cc9099f2cf637ab82dda085449",
+              "timed_fallback": false
+            }
+          ],
+          "order": [
+            "c1",
+            "c2",
+            "c3"
+          ],
+          "outcome": "candidate",
+          "recipe": "sha256:44eed267accbffc520e4fd70ff1af1667f4a5a322346f7622bab33aee2edd237",
+          "repeat": 1,
+          "state": "completed",
+          "wall_ms": 440
+        },
+        {
+          "candidate": {
+            "commit": "1034fa2a3c924bb9581ccd490e8827b6fafb5209",
+            "directory": "/private/tmp/aethyme-e1-original-campaign-20261012-d1910b/Playground-E1-vbb2tt/candidate-2",
+            "mode": "Text",
+            "snapshot": "sha256:b343e40e5b77891291bf02eef5e5a71fe84140ffaca06373338fe3a63774acaf",
+            "tree": "b0e244d19b077e4c497eeca4d60dee3c389abced"
+          },
+          "observations": [
+            {
+              "base_sha256": "510313da8dcfa24402598d7282d435cd8a7f7f8b2a938720b94d7909a77c95bc",
+              "current_sha256": "976101ce75b3d28213b2f4ae635baf922c488d8cca61d6d6ea0482a0fe06c0a2",
+              "diagnostic": "DEBUG line-based merge took 268.542µs\nDEBUG ~~~ Merge statistics ~~~\nDEBUG line_based: 0 conflicts, 0 mass, has_additional_issues: false\nDEBUG Selected best merge: line_based\n",
+              "diagnostic_sha256": "37181c0581a0a104d4e6de25419f638a8958eb0a02097416901410911ed88020",
+              "exit_code": 0,
+              "method": "LineBased",
+              "output_sha256": "8a9660575279ec3d1db486178007bcbea1a7c950356968d6eb2886b8e167bd9b",
+              "path": "app.html",
+              "result_sha256": "ee42ce5a2e1100f384ec4e3e97d174ff10ffa8cc9099f2cf637ab82dda085449",
+              "timed_fallback": false
+            },
+            {
+              "base_sha256": "510313da8dcfa24402598d7282d435cd8a7f7f8b2a938720b94d7909a77c95bc",
+              "current_sha256": "8a9660575279ec3d1db486178007bcbea1a7c950356968d6eb2886b8e167bd9b",
+              "diagnostic": "DEBUG line-based merge took 276.25µs\nDEBUG ~~~ Merge statistics ~~~\nDEBUG line_based: 0 conflicts, 0 mass, has_additional_issues: false\nDEBUG Selected best merge: line_based\n",
+              "diagnostic_sha256": "53b37a4ea3ddde3bb2640d4bc27aef7115b2f9627b3317d0e53d12a0a4c973c7",
+              "exit_code": 0,
+              "method": "LineBased",
+              "output_sha256": "47486ff4ab9286a0b78f40aa49697ca988845b8bc47276a6245bc809b201a113",
+              "path": "app.html",
+              "result_sha256": "9578ffc6d68c3dd9fcd1c2568b6e83b53f8a43b2af72811e968e6e2bb0e9b884",
+              "timed_fallback": false
+            }
+          ],
+          "order": [
+            "c1",
+            "c3",
+            "c2"
+          ],
+          "outcome": "candidate",
+          "recipe": "sha256:e2f5c7adea2e2d7d638e9103b1d83f36530da89be26afd2f51362e78a813c16f",
+          "repeat": 0,
+          "state": "completed",
+          "wall_ms": 428
+        },
+        {
+          "candidate": {
+            "commit": "1034fa2a3c924bb9581ccd490e8827b6fafb5209",
+            "directory": "/private/tmp/aethyme-e1-original-campaign-20261012-d1910b/Playground-E1-vbb2tt/candidate-3",
+            "mode": "Text",
+            "snapshot": "sha256:b343e40e5b77891291bf02eef5e5a71fe84140ffaca06373338fe3a63774acaf",
+            "tree": "b0e244d19b077e4c497eeca4d60dee3c389abced"
+          },
+          "observations": [
+            {
+              "base_sha256": "510313da8dcfa24402598d7282d435cd8a7f7f8b2a938720b94d7909a77c95bc",
+              "current_sha256": "976101ce75b3d28213b2f4ae635baf922c488d8cca61d6d6ea0482a0fe06c0a2",
+              "diagnostic": "DEBUG line-based merge took 285µs\nDEBUG ~~~ Merge statistics ~~~\nDEBUG line_based: 0 conflicts, 0 mass, has_additional_issues: false\nDEBUG Selected best merge: line_based\n",
+              "diagnostic_sha256": "e27dfa7153e7d7bfc0c4fabf63b60c3efb439d1a2f649ed21ce7a7fa4bdea75f",
+              "exit_code": 0,
+              "method": "LineBased",
+              "output_sha256": "8a9660575279ec3d1db486178007bcbea1a7c950356968d6eb2886b8e167bd9b",
+              "path": "app.html",
+              "result_sha256": "ee42ce5a2e1100f384ec4e3e97d174ff10ffa8cc9099f2cf637ab82dda085449",
+              "timed_fallback": false
+            },
+            {
+              "base_sha256": "510313da8dcfa24402598d7282d435cd8a7f7f8b2a938720b94d7909a77c95bc",
+              "current_sha256": "8a9660575279ec3d1db486178007bcbea1a7c950356968d6eb2886b8e167bd9b",
+              "diagnostic": "DEBUG line-based merge took 164.834µs\nDEBUG ~~~ Merge statistics ~~~\nDEBUG line_based: 0 conflicts, 0 mass, has_additional_issues: false\nDEBUG Selected best merge: line_based\n",
+              "diagnostic_sha256": "f5c865049800e8c612e39aa7d2f849107b5b2857aef3d833a2875e7981919702",
+              "exit_code": 0,
+              "method": "LineBased",
+              "output_sha256": "47486ff4ab9286a0b78f40aa49697ca988845b8bc47276a6245bc809b201a113",
+              "path": "app.html",
+              "result_sha256": "9578ffc6d68c3dd9fcd1c2568b6e83b53f8a43b2af72811e968e6e2bb0e9b884",
+              "timed_fallback": false
+            }
+          ],
+          "order": [
+            "c1",
+            "c3",
+            "c2"
+          ],
+          "outcome": "candidate",
+          "recipe": "sha256:e2f5c7adea2e2d7d638e9103b1d83f36530da89be26afd2f51362e78a813c16f",
+          "repeat": 1,
+          "state": "completed",
+          "wall_ms": 432
+        },
+        {
+          "candidate": {
+            "commit": "1034fa2a3c924bb9581ccd490e8827b6fafb5209",
+            "directory": "/private/tmp/aethyme-e1-original-campaign-20261012-d1910b/Playground-E1-vbb2tt/candidate-4",
+            "mode": "Text",
+            "snapshot": "sha256:b343e40e5b77891291bf02eef5e5a71fe84140ffaca06373338fe3a63774acaf",
+            "tree": "b0e244d19b077e4c497eeca4d60dee3c389abced"
+          },
+          "observations": [
+            {
+              "base_sha256": "510313da8dcfa24402598d7282d435cd8a7f7f8b2a938720b94d7909a77c95bc",
+              "current_sha256": "9578ffc6d68c3dd9fcd1c2568b6e83b53f8a43b2af72811e968e6e2bb0e9b884",
+              "diagnostic": "DEBUG line-based merge took 254.416µs\nDEBUG ~~~ Merge statistics ~~~\nDEBUG line_based: 0 conflicts, 0 mass, has_additional_issues: false\nDEBUG Selected best merge: line_based\n",
+              "diagnostic_sha256": "e63065b5784182f54bd86ca258fb2649c03cc7c6379b894d9d805f34000d9d17",
+              "exit_code": 0,
+              "method": "LineBased",
+              "output_sha256": "76dc52d623b20a986169de483369a566b4cb2cbeb79f127bda388e291a2ac5da",
+              "path": "app.html",
+              "result_sha256": "976101ce75b3d28213b2f4ae635baf922c488d8cca61d6d6ea0482a0fe06c0a2",
+              "timed_fallback": false
+            },
+            {
+              "base_sha256": "510313da8dcfa24402598d7282d435cd8a7f7f8b2a938720b94d7909a77c95bc",
+              "current_sha256": "76dc52d623b20a986169de483369a566b4cb2cbeb79f127bda388e291a2ac5da",
+              "diagnostic": "DEBUG line-based merge took 285.667µs\nDEBUG ~~~ Merge statistics ~~~\nDEBUG line_based: 0 conflicts, 0 mass, has_additional_issues: false\nDEBUG Selected best merge: line_based\n",
+              "diagnostic_sha256": "3e46ded65133575c708951aba26e2df8f8b61b090603289d654e6fba30ba10b2",
+              "exit_code": 0,
+              "method": "LineBased",
+              "output_sha256": "47486ff4ab9286a0b78f40aa49697ca988845b8bc47276a6245bc809b201a113",
+              "path": "app.html",
+              "result_sha256": "ee42ce5a2e1100f384ec4e3e97d174ff10ffa8cc9099f2cf637ab82dda085449",
+              "timed_fallback": false
+            }
+          ],
+          "order": [
+            "c2",
+            "c1",
+            "c3"
+          ],
+          "outcome": "candidate",
+          "recipe": "sha256:dc5a1f52820b341ec9a7d7834aeb6e0bc74a95dfde4dca94267bef71edb75f52",
+          "repeat": 0,
+          "state": "completed",
+          "wall_ms": 439
+        },
+        {
+          "candidate": {
+            "commit": "1034fa2a3c924bb9581ccd490e8827b6fafb5209",
+            "directory": "/private/tmp/aethyme-e1-original-campaign-20261012-d1910b/Playground-E1-vbb2tt/candidate-5",
+            "mode": "Text",
+            "snapshot": "sha256:b343e40e5b77891291bf02eef5e5a71fe84140ffaca06373338fe3a63774acaf",
+            "tree": "b0e244d19b077e4c497eeca4d60dee3c389abced"
+          },
+          "observations": [
+            {
+              "base_sha256": "510313da8dcfa24402598d7282d435cd8a7f7f8b2a938720b94d7909a77c95bc",
+              "current_sha256": "9578ffc6d68c3dd9fcd1c2568b6e83b53f8a43b2af72811e968e6e2bb0e9b884",
+              "diagnostic": "DEBUG line-based merge took 258.5µs\nDEBUG ~~~ Merge statistics ~~~\nDEBUG line_based: 0 conflicts, 0 mass, has_additional_issues: false\nDEBUG Selected best merge: line_based\n",
+              "diagnostic_sha256": "ebc4bc9c6617ef395875587465c8180439584ec598b3572121cf1f15496f892b",
+              "exit_code": 0,
+              "method": "LineBased",
+              "output_sha256": "76dc52d623b20a986169de483369a566b4cb2cbeb79f127bda388e291a2ac5da",
+              "path": "app.html",
+              "result_sha256": "976101ce75b3d28213b2f4ae635baf922c488d8cca61d6d6ea0482a0fe06c0a2",
+              "timed_fallback": false
+            },
+            {
+              "base_sha256": "510313da8dcfa24402598d7282d435cd8a7f7f8b2a938720b94d7909a77c95bc",
+              "current_sha256": "76dc52d623b20a986169de483369a566b4cb2cbeb79f127bda388e291a2ac5da",
+              "diagnostic": "DEBUG line-based merge took 269.791µs\nDEBUG ~~~ Merge statistics ~~~\nDEBUG line_based: 0 conflicts, 0 mass, has_additional_issues: false\nDEBUG Selected best merge: line_based\n",
+              "diagnostic_sha256": "27ea72e4799f10a3d3e7487c9205d2490c705b65360bd235f1f825ec89c5c753",
+              "exit_code": 0,
+              "method": "LineBased",
+              "output_sha256": "47486ff4ab9286a0b78f40aa49697ca988845b8bc47276a6245bc809b201a113",
+              "path": "app.html",
+              "result_sha256": "ee42ce5a2e1100f384ec4e3e97d174ff10ffa8cc9099f2cf637ab82dda085449",
+              "timed_fallback": false
+            }
+          ],
+          "order": [
+            "c2",
+            "c1",
+            "c3"
+          ],
+          "outcome": "candidate",
+          "recipe": "sha256:dc5a1f52820b341ec9a7d7834aeb6e0bc74a95dfde4dca94267bef71edb75f52",
+          "repeat": 1,
+          "state": "completed",
+          "wall_ms": 451
+        },
+        {
+          "candidate": {
+            "commit": "1034fa2a3c924bb9581ccd490e8827b6fafb5209",
+            "directory": "/private/tmp/aethyme-e1-original-campaign-20261012-d1910b/Playground-E1-vbb2tt/candidate-6",
+            "mode": "Text",
+            "snapshot": "sha256:b343e40e5b77891291bf02eef5e5a71fe84140ffaca06373338fe3a63774acaf",
+            "tree": "b0e244d19b077e4c497eeca4d60dee3c389abced"
+          },
+          "observations": [
+            {
+              "base_sha256": "510313da8dcfa24402598d7282d435cd8a7f7f8b2a938720b94d7909a77c95bc",
+              "current_sha256": "9578ffc6d68c3dd9fcd1c2568b6e83b53f8a43b2af72811e968e6e2bb0e9b884",
+              "diagnostic": "DEBUG line-based merge took 165.5µs\nDEBUG ~~~ Merge statistics ~~~\nDEBUG line_based: 0 conflicts, 0 mass, has_additional_issues: false\nDEBUG Selected best merge: line_based\n",
+              "diagnostic_sha256": "4e2115c45c0cf96b320dafc7a8a4e08f1141750a1f69fe4cbe9f5c974400b61b",
+              "exit_code": 0,
+              "method": "LineBased",
+              "output_sha256": "a5f449e73f8b000102c1462ba764322e625c2fa139b5f62c46964df12ab839e4",
+              "path": "app.html",
+              "result_sha256": "ee42ce5a2e1100f384ec4e3e97d174ff10ffa8cc9099f2cf637ab82dda085449",
+              "timed_fallback": false
+            },
+            {
+              "base_sha256": "510313da8dcfa24402598d7282d435cd8a7f7f8b2a938720b94d7909a77c95bc",
+              "current_sha256": "a5f449e73f8b000102c1462ba764322e625c2fa139b5f62c46964df12ab839e4",
+              "diagnostic": "DEBUG line-based merge took 282.334µs\nDEBUG ~~~ Merge statistics ~~~\nDEBUG line_based: 0 conflicts, 0 mass, has_additional_issues: false\nDEBUG Selected best merge: line_based\n",
+              "diagnostic_sha256": "2ab7c17b6c06400a9050a900e8d6a459177732f4b10230acee9ce0860e26423f",
+              "exit_code": 0,
+              "method": "LineBased",
+              "output_sha256": "47486ff4ab9286a0b78f40aa49697ca988845b8bc47276a6245bc809b201a113",
+              "path": "app.html",
+              "result_sha256": "976101ce75b3d28213b2f4ae635baf922c488d8cca61d6d6ea0482a0fe06c0a2",
+              "timed_fallback": false
+            }
+          ],
+          "order": [
+            "c2",
+            "c3",
+            "c1"
+          ],
+          "outcome": "candidate",
+          "recipe": "sha256:edc083c9dad00e3cdb15d110de33dbc729b88e35504c7a02463a7bcce9b6eb73",
+          "repeat": 0,
+          "state": "completed",
+          "wall_ms": 434
+        },
+        {
+          "candidate": {
+            "commit": "1034fa2a3c924bb9581ccd490e8827b6fafb5209",
+            "directory": "/private/tmp/aethyme-e1-original-campaign-20261012-d1910b/Playground-E1-vbb2tt/candidate-7",
+            "mode": "Text",
+            "snapshot": "sha256:b343e40e5b77891291bf02eef5e5a71fe84140ffaca06373338fe3a63774acaf",
+            "tree": "b0e244d19b077e4c497eeca4d60dee3c389abced"
+          },
+          "observations": [
+            {
+              "base_sha256": "510313da8dcfa24402598d7282d435cd8a7f7f8b2a938720b94d7909a77c95bc",
+              "current_sha256": "9578ffc6d68c3dd9fcd1c2568b6e83b53f8a43b2af72811e968e6e2bb0e9b884",
+              "diagnostic": "DEBUG line-based merge took 284.959µs\nDEBUG ~~~ Merge statistics ~~~\nDEBUG line_based: 0 conflicts, 0 mass, has_additional_issues: false\nDEBUG Selected best merge: line_based\n",
+              "diagnostic_sha256": "c9f62ef4b359ab398da20da272153eecf0afcd86633e03d52d88a8b5d3012a21",
+              "exit_code": 0,
+              "method": "LineBased",
+              "output_sha256": "a5f449e73f8b000102c1462ba764322e625c2fa139b5f62c46964df12ab839e4",
+              "path": "app.html",
+              "result_sha256": "ee42ce5a2e1100f384ec4e3e97d174ff10ffa8cc9099f2cf637ab82dda085449",
+              "timed_fallback": false
+            },
+            {
+              "base_sha256": "510313da8dcfa24402598d7282d435cd8a7f7f8b2a938720b94d7909a77c95bc",
+              "current_sha256": "a5f449e73f8b000102c1462ba764322e625c2fa139b5f62c46964df12ab839e4",
+              "diagnostic": "DEBUG line-based merge took 274µs\nDEBUG ~~~ Merge statistics ~~~\nDEBUG line_based: 0 conflicts, 0 mass, has_additional_issues: false\nDEBUG Selected best merge: line_based\n",
+              "diagnostic_sha256": "8ef2da96e37f75f8f4311af14ebeacdd9b1898a80d3ce1c2119515ba97c1f605",
+              "exit_code": 0,
+              "method": "LineBased",
+              "output_sha256": "47486ff4ab9286a0b78f40aa49697ca988845b8bc47276a6245bc809b201a113",
+              "path": "app.html",
+              "result_sha256": "976101ce75b3d28213b2f4ae635baf922c488d8cca61d6d6ea0482a0fe06c0a2",
+              "timed_fallback": false
+            }
+          ],
+          "order": [
+            "c2",
+            "c3",
+            "c1"
+          ],
+          "outcome": "candidate",
+          "recipe": "sha256:edc083c9dad00e3cdb15d110de33dbc729b88e35504c7a02463a7bcce9b6eb73",
+          "repeat": 1,
+          "state": "completed",
+          "wall_ms": 398
+        },
+        {
+          "candidate": {
+            "commit": "1034fa2a3c924bb9581ccd490e8827b6fafb5209",
+            "directory": "/private/tmp/aethyme-e1-original-campaign-20261012-d1910b/Playground-E1-vbb2tt/candidate-8",
+            "mode": "Text",
+            "snapshot": "sha256:b343e40e5b77891291bf02eef5e5a71fe84140ffaca06373338fe3a63774acaf",
+            "tree": "b0e244d19b077e4c497eeca4d60dee3c389abced"
+          },
+          "observations": [
+            {
+              "base_sha256": "510313da8dcfa24402598d7282d435cd8a7f7f8b2a938720b94d7909a77c95bc",
+              "current_sha256": "ee42ce5a2e1100f384ec4e3e97d174ff10ffa8cc9099f2cf637ab82dda085449",
+              "diagnostic": "DEBUG line-based merge took 257.375µs\nDEBUG ~~~ Merge statistics ~~~\nDEBUG line_based: 0 conflicts, 0 mass, has_additional_issues: false\nDEBUG Selected best merge: line_based\n",
+              "diagnostic_sha256": "676ef4ebf8c59838acac9e32a92f5d3e62335729650aa4a8a549db0e1234441f",
+              "exit_code": 0,
+              "method": "LineBased",
+              "output_sha256": "8a9660575279ec3d1db486178007bcbea1a7c950356968d6eb2886b8e167bd9b",
+              "path": "app.html",
+              "result_sha256": "976101ce75b3d28213b2f4ae635baf922c488d8cca61d6d6ea0482a0fe06c0a2",
+              "timed_fallback": false
+            },
+            {
+              "base_sha256": "510313da8dcfa24402598d7282d435cd8a7f7f8b2a938720b94d7909a77c95bc",
+              "current_sha256": "8a9660575279ec3d1db486178007bcbea1a7c950356968d6eb2886b8e167bd9b",
+              "diagnostic": "DEBUG line-based merge took 272.291µs\nDEBUG ~~~ Merge statistics ~~~\nDEBUG line_based: 0 conflicts, 0 mass, has_additional_issues: false\nDEBUG Selected best merge: line_based\n",
+              "diagnostic_sha256": "7b5aaf27ccd9bfbcfa192a42f2c61a6687416b95dbfd2dc81fc3fbbdf4e62ba8",
+              "exit_code": 0,
+              "method": "LineBased",
+              "output_sha256": "47486ff4ab9286a0b78f40aa49697ca988845b8bc47276a6245bc809b201a113",
+              "path": "app.html",
+              "result_sha256": "9578ffc6d68c3dd9fcd1c2568b6e83b53f8a43b2af72811e968e6e2bb0e9b884",
+              "timed_fallback": false
+            }
+          ],
+          "order": [
+            "c3",
+            "c1",
+            "c2"
+          ],
+          "outcome": "candidate",
+          "recipe": "sha256:16677e10b05e231964b41b0ec26313ac3bbf86041d1c39a63912cb99eabaf53c",
+          "repeat": 0,
+          "state": "completed",
+          "wall_ms": 465
+        },
+        {
+          "candidate": {
+            "commit": "1034fa2a3c924bb9581ccd490e8827b6fafb5209",
+            "directory": "/private/tmp/aethyme-e1-original-campaign-20261012-d1910b/Playground-E1-vbb2tt/candidate-9",
+            "mode": "Text",
+            "snapshot": "sha256:b343e40e5b77891291bf02eef5e5a71fe84140ffaca06373338fe3a63774acaf",
+            "tree": "b0e244d19b077e4c497eeca4d60dee3c389abced"
+          },
+          "observations": [
+            {
+              "base_sha256": "510313da8dcfa24402598d7282d435cd8a7f7f8b2a938720b94d7909a77c95bc",
+              "current_sha256": "ee42ce5a2e1100f384ec4e3e97d174ff10ffa8cc9099f2cf637ab82dda085449",
+              "diagnostic": "DEBUG line-based merge took 269.458µs\nDEBUG ~~~ Merge statistics ~~~\nDEBUG line_based: 0 conflicts, 0 mass, has_additional_issues: false\nDEBUG Selected best merge: line_based\n",
+              "diagnostic_sha256": "f10bc328c9f63126876419eb256905e13c3bcca6ddcf1d7df49619672b366ff1",
+              "exit_code": 0,
+              "method": "LineBased",
+              "output_sha256": "8a9660575279ec3d1db486178007bcbea1a7c950356968d6eb2886b8e167bd9b",
+              "path": "app.html",
+              "result_sha256": "976101ce75b3d28213b2f4ae635baf922c488d8cca61d6d6ea0482a0fe06c0a2",
+              "timed_fallback": false
+            },
+            {
+              "base_sha256": "510313da8dcfa24402598d7282d435cd8a7f7f8b2a938720b94d7909a77c95bc",
+              "current_sha256": "8a9660575279ec3d1db486178007bcbea1a7c950356968d6eb2886b8e167bd9b",
+              "diagnostic": "DEBUG line-based merge took 179.792µs\nDEBUG ~~~ Merge statistics ~~~\nDEBUG line_based: 0 conflicts, 0 mass, has_additional_issues: false\nDEBUG Selected best merge: line_based\n",
+              "diagnostic_sha256": "3582c1de576159e08a6eb1bf57b14a8b50bfe6f14d408a677d98b700936619d9",
+              "exit_code": 0,
+              "method": "LineBased",
+              "output_sha256": "47486ff4ab9286a0b78f40aa49697ca988845b8bc47276a6245bc809b201a113",
+              "path": "app.html",
+              "result_sha256": "9578ffc6d68c3dd9fcd1c2568b6e83b53f8a43b2af72811e968e6e2bb0e9b884",
+              "timed_fallback": false
+            }
+          ],
+          "order": [
+            "c3",
+            "c1",
+            "c2"
+          ],
+          "outcome": "candidate",
+          "recipe": "sha256:16677e10b05e231964b41b0ec26313ac3bbf86041d1c39a63912cb99eabaf53c",
+          "repeat": 1,
+          "state": "completed",
+          "wall_ms": 413
+        },
+        {
+          "candidate": {
+            "commit": "1034fa2a3c924bb9581ccd490e8827b6fafb5209",
+            "directory": "/private/tmp/aethyme-e1-original-campaign-20261012-d1910b/Playground-E1-vbb2tt/candidate-10",
+            "mode": "Text",
+            "snapshot": "sha256:b343e40e5b77891291bf02eef5e5a71fe84140ffaca06373338fe3a63774acaf",
+            "tree": "b0e244d19b077e4c497eeca4d60dee3c389abced"
+          },
+          "observations": [
+            {
+              "base_sha256": "510313da8dcfa24402598d7282d435cd8a7f7f8b2a938720b94d7909a77c95bc",
+              "current_sha256": "ee42ce5a2e1100f384ec4e3e97d174ff10ffa8cc9099f2cf637ab82dda085449",
+              "diagnostic": "DEBUG line-based merge took 273.208µs\nDEBUG ~~~ Merge statistics ~~~\nDEBUG line_based: 0 conflicts, 0 mass, has_additional_issues: false\nDEBUG Selected best merge: line_based\n",
+              "diagnostic_sha256": "ec4474db57a99a8c1b4ea193971d4e3d3ccb81ff900442479f35c116d57192d6",
+              "exit_code": 0,
+              "method": "LineBased",
+              "output_sha256": "a5f449e73f8b000102c1462ba764322e625c2fa139b5f62c46964df12ab839e4",
+              "path": "app.html",
+              "result_sha256": "9578ffc6d68c3dd9fcd1c2568b6e83b53f8a43b2af72811e968e6e2bb0e9b884",
+              "timed_fallback": false
+            },
+            {
+              "base_sha256": "510313da8dcfa24402598d7282d435cd8a7f7f8b2a938720b94d7909a77c95bc",
+              "current_sha256": "a5f449e73f8b000102c1462ba764322e625c2fa139b5f62c46964df12ab839e4",
+              "diagnostic": "DEBUG line-based merge took 273.208µs\nDEBUG ~~~ Merge statistics ~~~\nDEBUG line_based: 0 conflicts, 0 mass, has_additional_issues: false\nDEBUG Selected best merge: line_based\n",
+              "diagnostic_sha256": "ec4474db57a99a8c1b4ea193971d4e3d3ccb81ff900442479f35c116d57192d6",
+              "exit_code": 0,
+              "method": "LineBased",
+              "output_sha256": "47486ff4ab9286a0b78f40aa49697ca988845b8bc47276a6245bc809b201a113",
+              "path": "app.html",
+              "result_sha256": "976101ce75b3d28213b2f4ae635baf922c488d8cca61d6d6ea0482a0fe06c0a2",
+              "timed_fallback": false
+            }
+          ],
+          "order": [
+            "c3",
+            "c2",
+            "c1"
+          ],
+          "outcome": "candidate",
+          "recipe": "sha256:ae05626e0362c5465e68bfe1b3880b68fdc8e4794350d0e3bc18301ad56bdabb",
+          "repeat": 0,
+          "state": "completed",
+          "wall_ms": 421
+        },
+        {
+          "candidate": {
+            "commit": "1034fa2a3c924bb9581ccd490e8827b6fafb5209",
+            "directory": "/private/tmp/aethyme-e1-original-campaign-20261012-d1910b/Playground-E1-vbb2tt/candidate-11",
+            "mode": "Text",
+            "snapshot": "sha256:b343e40e5b77891291bf02eef5e5a71fe84140ffaca06373338fe3a63774acaf",
+            "tree": "b0e244d19b077e4c497eeca4d60dee3c389abced"
+          },
+          "observations": [
+            {
+              "base_sha256": "510313da8dcfa24402598d7282d435cd8a7f7f8b2a938720b94d7909a77c95bc",
+              "current_sha256": "ee42ce5a2e1100f384ec4e3e97d174ff10ffa8cc9099f2cf637ab82dda085449",
+              "diagnostic": "DEBUG line-based merge took 165.042µs\nDEBUG ~~~ Merge statistics ~~~\nDEBUG line_based: 0 conflicts, 0 mass, has_additional_issues: false\nDEBUG Selected best merge: line_based\n",
+              "diagnostic_sha256": "9b93a44a81f075b49ad92d6f362bd8216ce3c3764f92e6f883110132bad445ae",
+              "exit_code": 0,
+              "method": "LineBased",
+              "output_sha256": "a5f449e73f8b000102c1462ba764322e625c2fa139b5f62c46964df12ab839e4",
+              "path": "app.html",
+              "result_sha256": "9578ffc6d68c3dd9fcd1c2568b6e83b53f8a43b2af72811e968e6e2bb0e9b884",
+              "timed_fallback": false
+            },
+            {
+              "base_sha256": "510313da8dcfa24402598d7282d435cd8a7f7f8b2a938720b94d7909a77c95bc",
+              "current_sha256": "a5f449e73f8b000102c1462ba764322e625c2fa139b5f62c46964df12ab839e4",
+              "diagnostic": "DEBUG line-based merge took 158.375µs\nDEBUG ~~~ Merge statistics ~~~\nDEBUG line_based: 0 conflicts, 0 mass, has_additional_issues: false\nDEBUG Selected best merge: line_based\n",
+              "diagnostic_sha256": "08f1f61433fc0d65874121da41f83998d00f97bce876364a8f7d468e5c86d78d",
+              "exit_code": 0,
+              "method": "LineBased",
+              "output_sha256": "47486ff4ab9286a0b78f40aa49697ca988845b8bc47276a6245bc809b201a113",
+              "path": "app.html",
+              "result_sha256": "976101ce75b3d28213b2f4ae635baf922c488d8cca61d6d6ea0482a0fe06c0a2",
+              "timed_fallback": false
+            }
+          ],
+          "order": [
+            "c3",
+            "c2",
+            "c1"
+          ],
+          "outcome": "candidate",
+          "recipe": "sha256:ae05626e0362c5465e68bfe1b3880b68fdc8e4794350d0e3bc18301ad56bdabb",
+          "repeat": 1,
+          "state": "completed",
+          "wall_ms": 433
+        }
+      ],
+      "scenario": "s1",
+      "state": "completed"
+    },
+    {
+      "accepted": true,
+      "case": "FX02",
+      "infrastructure_errors": 0,
+      "oracle_failures": [],
+      "profile": "mergiraf-html-candidate",
+      "retained_playground": "/private/tmp/aethyme-e1-original-campaign-20261012-d1910b/Playground-E1-5nlws5",
+      "runs": [
+        {
+          "candidate": {
+            "commit": "de8cf1813786c1aa706a1befd66bfc023c024ca5",
+            "directory": "/private/tmp/aethyme-e1-original-campaign-20261012-d1910b/Playground-E1-5nlws5/candidate-0",
+            "mode": "Structural",
+            "snapshot": "sha256:e45f2400c690d81956683028ff3bf990fabf1040298621ecc77b08288bf2276d",
+            "tree": "80514d56d214370948246568348da88422e7bf61"
+          },
+          "observations": [
+            {
+              "base_sha256": "a5a7f9d4b8916e4b92c7701d638e76f41da66158682348127fd9d3f5edd6cdea",
+              "current_sha256": "79796c120e6791be287327c1ef385d037e8b59feaf7ef586336d5db92bf3b7bb",
+              "diagnostic": "DEBUG line-based merge took 900.459µs\nDEBUG re-constructing revisions from parsed merge took 8.916µs\nDEBUG parsing all three files took 622.25µs\nDEBUG matching base to left\nDEBUG matching base to right\nDEBUG top-down phase yielded 193 matches\nDEBUG top-down phase yielded 243 matches\nDEBUG matching took 1.0755ms\nDEBUG matching took 1.100458ms\nDEBUG matching left to right\nDEBUG top-down phase yielded 0 matches\nDEBUG matching took 193.042µs\nDEBUG matching all three pairs took 1.509125ms\nDEBUG constructing the classmapping took 83.042µs\nDEBUG generating PCS triples\nDEBUG generating PCS triples took 65.75µs\nDEBUG number of triples: 81\nDEBUG cleaning up PCS triples took 44µs\nDEBUG Exact(document:0…576@Base/.L./)\nDEBUG deleted and modified: element:291…418@Base\nDEBUG really deleted children: element:291…418@Base\nDEBUG parents to recompute: element:264…567@Base\nDEBUG constructing the merged tree took 478.708µs\nDEBUG post-processing the merged tree for signature conflicts took 334ns\nDEBUG Mixed(document:0…576@Base\n  Mixed(element:0…575@Base\n    Exact(start_tag:0…15@Base/.L./)\n    Exact(element:18…261@Base/.L./)\n    LineBasedConflict()\n    Exact(end_tag:568…575@Base/.L./)\n  )\n)\nDEBUG parsing all three files took 199.084µs\nDEBUG matching base to left\nDEBUG matching base to right\nDEBUG top-down phase yielded 191 matches\nDEBUG top-down phase yielded 186 matches\nDEBUG discarding match with similarity 0.33707866, close to threshold 0.4\nDEBUG matching took 154.167µs\nDEBUG matching took 196µs\nDEBUG matching left to right\nDEBUG top-down phase yielded 0 matches\nDEBUG matching took 156.833µs\nDEBUG matching all three pairs took 508.458µs\nDEBUG constructing the classmapping took 111.708µs\nDEBUG generating PCS triples\nDEBUG generating PCS triples took 49.5µs\nDEBUG number of triples: 43\nDEBUG cleaning up PCS triples took 35.459µs\nDEBUG Mixed(document:0…436@Base\n  Mixed(element:124…427@Base\n    Exact(start_tag:0…15@Base/BLR/)\n    Mixed(element:18…121@Base\n      Exact(start_tag:18…38@Base/BLR/)\n      Exact(element:43…77@Base/BLR/)\n      Mixed(element:82…110@Base\n        Exact(start_tag:82…99@Base/BLR/)\n        Exact(element:151…278@Base/..R/)\n        Exact(end_tag:104…110@Base/BLR/)\n      )\n      Exact(end_tag:113…121@Base/BLR/)\n    )\n    Exact(element:0…435@Base/.L./)\n    Exact(end_tag:428…435@Base/BLR/)\n  )\n)\nDEBUG deleted and modified: element:124…427@Base, element:0…435@Base, element:82…110@Base\nDEBUG really deleted children: \nDEBUG parents to recompute: \nDEBUG constructing the merged tree took 514.5µs\nDEBUG post-processing the merged tree for signature conflicts took 916ns\nDEBUG Mixed(document:0…436@Base\n  Mixed(element:124…427@Base\n    Exact(start_tag:0…15@Base/BLR/)\n    Mixed(element:18…121@Base\n      Exact(start_tag:18…38@Base/BLR/)\n      Exact(element:43…77@Base/BLR/)\n      Mixed(element:82…110@Base\n        Exact(start_tag:82…99@Base/BLR/)\n        Exact(element:151…278@Base/..R/)\n        Exact(end_tag:104…110@Base/BLR/)\n      )\n      Exact(end_tag:113…121@Base/BLR/)\n    )\n    Exact(element:0…435@Base/.L./)\n    Exact(end_tag:428…435@Base/BLR/)\n  )\n)\nDEBUG ~~~ Merge statistics ~~~\nDEBUG fully_structured: 0 conflicts, 0 mass, has_additional_issues: false\nDEBUG structured_resolution: 1 conflict, 314 mass, has_additional_issues: false\nDEBUG line_based: 1 conflict, 318 mass, has_additional_issues: false\nINFO Mergiraf: Solved 1 conflict. Review with: mergiraf review base.html_UlCScWsN\nDEBUG Selected best merge: fully_structured\n",
+              "diagnostic_sha256": "eb71066df11fd2019ab2ef06248b159c711a6e0eedc9efea8799a0bcdfe875fd",
+              "exit_code": 0,
+              "method": "FullyStructured",
+              "output_sha256": "1c01d8bb5b44f2e2d034e930588b70cceb54ce79565ee205d7783c0c800f4819",
+              "path": "app.html",
+              "result_sha256": "4c32490bdc5bc88b011b1a69791e0e83fd8697142189745bb03559874d040339",
+              "timed_fallback": false
+            }
+          ],
+          "order": [
+            "c1",
+            "c2"
+          ],
+          "outcome": "candidate",
+          "recipe": "sha256:f380e77b1c59bc2569efb69d50d65b019a52baf252b87b94be571cbc7f52492a",
+          "repeat": 0,
+          "state": "completed",
+          "wall_ms": 413
+        },
+        {
+          "candidate": {
+            "commit": "de8cf1813786c1aa706a1befd66bfc023c024ca5",
+            "directory": "/private/tmp/aethyme-e1-original-campaign-20261012-d1910b/Playground-E1-5nlws5/candidate-1",
+            "mode": "Structural",
+            "snapshot": "sha256:e45f2400c690d81956683028ff3bf990fabf1040298621ecc77b08288bf2276d",
+            "tree": "80514d56d214370948246568348da88422e7bf61"
+          },
+          "observations": [
+            {
+              "base_sha256": "a5a7f9d4b8916e4b92c7701d638e76f41da66158682348127fd9d3f5edd6cdea",
+              "current_sha256": "79796c120e6791be287327c1ef385d037e8b59feaf7ef586336d5db92bf3b7bb",
+              "diagnostic": "DEBUG line-based merge took 952.667µs\nDEBUG re-constructing revisions from parsed merge took 10.25µs\nDEBUG parsing all three files took 603.375µs\nDEBUG matching base to left\nDEBUG matching base to right\nDEBUG top-down phase yielded 193 matches\nDEBUG top-down phase yielded 243 matches\nDEBUG matching took 150.583µs\nDEBUG matching took 221.083µs\nDEBUG matching left to right\nDEBUG top-down phase yielded 0 matches\nDEBUG matching took 179.667µs\nDEBUG matching all three pairs took 560.084µs\nDEBUG constructing the classmapping took 147.542µs\nDEBUG generating PCS triples\nDEBUG generating PCS triples took 135.833µs\nDEBUG number of triples: 81\nDEBUG cleaning up PCS triples took 92.209µs\nDEBUG Exact(document:0…576@Base/.L./)\nDEBUG deleted and modified: element:291…418@Base\nDEBUG really deleted children: element:291…418@Base\nDEBUG parents to recompute: element:264…567@Base\nDEBUG constructing the merged tree took 435.375µs\nDEBUG post-processing the merged tree for signature conflicts took 625ns\nDEBUG Mixed(document:0…576@Base\n  Mixed(element:0…575@Base\n    Exact(start_tag:0…15@Base/.L./)\n    Exact(element:18…261@Base/.L./)\n    LineBasedConflict()\n    Exact(end_tag:568…575@Base/.L./)\n  )\n)\nDEBUG parsing all three files took 442.791µs\nDEBUG matching base to left\nDEBUG matching base to right\nDEBUG top-down phase yielded 191 matches\nDEBUG discarding match with similarity 0.33707866, close to threshold 0.4\nDEBUG top-down phase yielded 186 matches\nDEBUG matching took 144.041µs\nDEBUG matching took 200.375µs\nDEBUG matching left to right\nDEBUG top-down phase yielded 0 matches\nDEBUG matching took 148.084µs\nDEBUG matching all three pairs took 492µs\nDEBUG constructing the classmapping took 104.416µs\nDEBUG generating PCS triples\nDEBUG generating PCS triples took 46.833µs\nDEBUG number of triples: 43\nDEBUG cleaning up PCS triples took 33.708µs\nDEBUG Mixed(document:0…436@Base\n  Mixed(element:124…427@Base\n    Exact(start_tag:0…15@Base/BLR/)\n    Mixed(element:18…121@Base\n      Exact(start_tag:18…38@Base/BLR/)\n      Exact(element:43…77@Base/BLR/)\n      Mixed(element:82…110@Base\n        Exact(start_tag:82…99@Base/BLR/)\n        Exact(element:151…278@Base/..R/)\n        Exact(end_tag:104…110@Base/BLR/)\n      )\n      Exact(end_tag:113…121@Base/BLR/)\n    )\n    Exact(element:0…435@Base/.L./)\n    Exact(end_tag:428…435@Base/BLR/)\n  )\n)\nDEBUG deleted and modified: element:0…435@Base, element:82…110@Base, element:124…427@Base\nDEBUG really deleted children: \nDEBUG parents to recompute: \nDEBUG constructing the merged tree took 484.459µs\nDEBUG post-processing the merged tree for signature conflicts took 791ns\nDEBUG Mixed(document:0…436@Base\n  Mixed(element:124…427@Base\n    Exact(start_tag:0…15@Base/BLR/)\n    Mixed(element:18…121@Base\n      Exact(start_tag:18…38@Base/BLR/)\n      Exact(element:43…77@Base/BLR/)\n      Mixed(element:82…110@Base\n        Exact(start_tag:82…99@Base/BLR/)\n        Exact(element:151…278@Base/..R/)\n        Exact(end_tag:104…110@Base/BLR/)\n      )\n      Exact(end_tag:113…121@Base/BLR/)\n    )\n    Exact(element:0…435@Base/.L./)\n    Exact(end_tag:428…435@Base/BLR/)\n  )\n)\nDEBUG ~~~ Merge statistics ~~~\nDEBUG fully_structured: 0 conflicts, 0 mass, has_additional_issues: false\nDEBUG structured_resolution: 1 conflict, 314 mass, has_additional_issues: false\nDEBUG line_based: 1 conflict, 318 mass, has_additional_issues: false\nINFO Mergiraf: Solved 1 conflict. Review with: mergiraf review base.html_4gQPOAoa\nDEBUG Selected best merge: fully_structured\n",
+              "diagnostic_sha256": "46c657768658a60266018833759b1069c82c771bab4c665a54abb84c4193993c",
+              "exit_code": 0,
+              "method": "FullyStructured",
+              "output_sha256": "1c01d8bb5b44f2e2d034e930588b70cceb54ce79565ee205d7783c0c800f4819",
+              "path": "app.html",
+              "result_sha256": "4c32490bdc5bc88b011b1a69791e0e83fd8697142189745bb03559874d040339",
+              "timed_fallback": false
+            }
+          ],
+          "order": [
+            "c1",
+            "c2"
+          ],
+          "outcome": "candidate",
+          "recipe": "sha256:f380e77b1c59bc2569efb69d50d65b019a52baf252b87b94be571cbc7f52492a",
+          "repeat": 1,
+          "state": "completed",
+          "wall_ms": 394
+        },
+        {
+          "candidate": {
+            "commit": "de8cf1813786c1aa706a1befd66bfc023c024ca5",
+            "directory": "/private/tmp/aethyme-e1-original-campaign-20261012-d1910b/Playground-E1-5nlws5/candidate-2",
+            "mode": "Structural",
+            "snapshot": "sha256:e45f2400c690d81956683028ff3bf990fabf1040298621ecc77b08288bf2276d",
+            "tree": "80514d56d214370948246568348da88422e7bf61"
+          },
+          "observations": [
+            {
+              "base_sha256": "a5a7f9d4b8916e4b92c7701d638e76f41da66158682348127fd9d3f5edd6cdea",
+              "current_sha256": "4c32490bdc5bc88b011b1a69791e0e83fd8697142189745bb03559874d040339",
+              "diagnostic": "DEBUG line-based merge took 880.875µs\nDEBUG re-constructing revisions from parsed merge took 4.666µs\nDEBUG parsing all three files took 600.708µs\nDEBUG matching base to left\nDEBUG matching base to right\nDEBUG top-down phase yielded 193 matches\nDEBUG top-down phase yielded 243 matches\nDEBUG matching took 146.333µs\nDEBUG matching took 226.833µs\nDEBUG matching left to right\nDEBUG top-down phase yielded 0 matches\nDEBUG matching took 203.416µs\nDEBUG matching all three pairs took 631.208µs\nDEBUG constructing the classmapping took 157.708µs\nDEBUG generating PCS triples\nDEBUG generating PCS triples took 126.792µs\nDEBUG number of triples: 81\nDEBUG cleaning up PCS triples took 85.291µs\nDEBUG Exact(document:0…576@Base/..R/)\nDEBUG deleted and modified: element:291…418@Base\nDEBUG really deleted children: element:291…418@Base\nDEBUG parents to recompute: element:264…567@Base\nDEBUG constructing the merged tree took 427.333µs\nDEBUG post-processing the merged tree for signature conflicts took 584ns\nDEBUG Mixed(document:0…576@Base\n  Mixed(element:0…575@Base\n    Exact(start_tag:0…15@Base/..R/)\n    Exact(element:18…261@Base/..R/)\n    LineBasedConflict()\n    Exact(end_tag:568…575@Base/..R/)\n  )\n)\nDEBUG parsing all three files took 443.625µs\nDEBUG matching base to left\nDEBUG matching base to right\nDEBUG top-down phase yielded 191 matches\nDEBUG top-down phase yielded 186 matches\nDEBUG discarding match with similarity 0.33707866, close to threshold 0.4\nDEBUG matching took 149.916µs\nDEBUG matching took 208.75µs\nDEBUG matching left to right\nDEBUG top-down phase yielded 0 matches\nDEBUG matching took 150.833µs\nDEBUG matching all three pairs took 538.625µs\nDEBUG constructing the classmapping took 103.416µs\nDEBUG generating PCS triples\nDEBUG generating PCS triples took 48.667µs\nDEBUG number of triples: 43\nDEBUG cleaning up PCS triples took 46.459µs\nDEBUG Mixed(document:0…436@Base\n  Mixed(element:124…427@Base\n    Exact(start_tag:0…15@Base/BLR/)\n    Mixed(element:18…121@Base\n      Exact(start_tag:18…38@Base/BLR/)\n      Exact(element:43…77@Base/BLR/)\n      Mixed(element:82…110@Base\n        Exact(start_tag:82…99@Base/BLR/)\n        Exact(element:151…278@Base/.L./)\n        Exact(end_tag:104…110@Base/BLR/)\n      )\n      Exact(end_tag:113…121@Base/BLR/)\n    )\n    Exact(element:0…435@Base/..R/)\n    Exact(end_tag:428…435@Base/BLR/)\n  )\n)\nDEBUG deleted and modified: start_tag:215…250@Base, element:124…427@Base\nDEBUG really deleted children: \nDEBUG parents to recompute: \nDEBUG constructing the merged tree took 586.25µs\nDEBUG post-processing the merged tree for signature conflicts took 750ns\nDEBUG Mixed(document:0…436@Base\n  Mixed(element:124…427@Base\n    Exact(start_tag:0…15@Base/BLR/)\n    Mixed(element:18…121@Base\n      Exact(start_tag:18…38@Base/BLR/)\n      Exact(element:43…77@Base/BLR/)\n      Mixed(element:82…110@Base\n        Exact(start_tag:82…99@Base/BLR/)\n        Exact(element:151…278@Base/.L./)\n        Exact(end_tag:104…110@Base/BLR/)\n      )\n      Exact(end_tag:113…121@Base/BLR/)\n    )\n    Exact(element:0…435@Base/..R/)\n    Exact(end_tag:428…435@Base/BLR/)\n  )\n)\nDEBUG ~~~ Merge statistics ~~~\nDEBUG fully_structured: 0 conflicts, 0 mass, has_additional_issues: false\nDEBUG structured_resolution: 1 conflict, 314 mass, has_additional_issues: false\nDEBUG line_based: 1 conflict, 318 mass, has_additional_issues: false\nINFO Mergiraf: Solved 1 conflict. Review with: mergiraf review base.html_2ilBfFC9\nDEBUG Selected best merge: fully_structured\n",
+              "diagnostic_sha256": "41af802810843e5d85508f137716aceeb763af7f05725fd3bc46b81e922a0088",
+              "exit_code": 0,
+              "method": "FullyStructured",
+              "output_sha256": "1c01d8bb5b44f2e2d034e930588b70cceb54ce79565ee205d7783c0c800f4819",
+              "path": "app.html",
+              "result_sha256": "79796c120e6791be287327c1ef385d037e8b59feaf7ef586336d5db92bf3b7bb",
+              "timed_fallback": false
+            }
+          ],
+          "order": [
+            "c2",
+            "c1"
+          ],
+          "outcome": "candidate",
+          "recipe": "sha256:9fed053d3b6cf15b9ec571e4d8d1ead5198b9cb8409d0c60814825c275073437",
+          "repeat": 0,
+          "state": "completed",
+          "wall_ms": 383
+        },
+        {
+          "candidate": {
+            "commit": "de8cf1813786c1aa706a1befd66bfc023c024ca5",
+            "directory": "/private/tmp/aethyme-e1-original-campaign-20261012-d1910b/Playground-E1-5nlws5/candidate-3",
+            "mode": "Structural",
+            "snapshot": "sha256:e45f2400c690d81956683028ff3bf990fabf1040298621ecc77b08288bf2276d",
+            "tree": "80514d56d214370948246568348da88422e7bf61"
+          },
+          "observations": [
+            {
+              "base_sha256": "a5a7f9d4b8916e4b92c7701d638e76f41da66158682348127fd9d3f5edd6cdea",
+              "current_sha256": "4c32490bdc5bc88b011b1a69791e0e83fd8697142189745bb03559874d040339",
+              "diagnostic": "DEBUG line-based merge took 898.083µs\nDEBUG re-constructing revisions from parsed merge took 6.792µs\nDEBUG parsing all three files took 594.333µs\nDEBUG matching base to left\nDEBUG matching base to right\nDEBUG top-down phase yielded 193 matches\nDEBUG top-down phase yielded 243 matches\nDEBUG matching took 142.792µs\nDEBUG matching took 235.917µs\nDEBUG matching left to right\nDEBUG top-down phase yielded 0 matches\nDEBUG matching took 204µs\nDEBUG matching all three pairs took 652.167µs\nDEBUG constructing the classmapping took 157.917µs\nDEBUG generating PCS triples\nDEBUG generating PCS triples took 140µs\nDEBUG number of triples: 81\nDEBUG cleaning up PCS triples took 90.667µs\nDEBUG Exact(document:0…576@Base/..R/)\nDEBUG deleted and modified: element:291…418@Base\nDEBUG really deleted children: element:291…418@Base\nDEBUG parents to recompute: element:264…567@Base\nDEBUG constructing the merged tree took 450.75µs\nDEBUG post-processing the merged tree for signature conflicts took 875ns\nDEBUG Mixed(document:0…576@Base\n  Mixed(element:0…575@Base\n    Exact(start_tag:0…15@Base/..R/)\n    Exact(element:18…261@Base/..R/)\n    LineBasedConflict()\n    Exact(end_tag:568…575@Base/..R/)\n  )\n)\nDEBUG parsing all three files took 449.5µs\nDEBUG matching base to left\nDEBUG matching base to right\nDEBUG top-down phase yielded 191 matches\nDEBUG top-down phase yielded 186 matches\nDEBUG discarding match with similarity 0.33707866, close to threshold 0.4\nDEBUG matching took 147.959µs\nDEBUG matching took 211.708µs\nDEBUG matching left to right\nDEBUG top-down phase yielded 0 matches\nDEBUG matching took 160.625µs\nDEBUG matching all three pairs took 548.208µs\nDEBUG constructing the classmapping took 108.25µs\nDEBUG generating PCS triples\nDEBUG generating PCS triples took 49.25µs\nDEBUG number of triples: 43\nDEBUG cleaning up PCS triples took 48.666µs\nDEBUG Mixed(document:0…436@Base\n  Mixed(element:124…427@Base\n    Exact(start_tag:0…15@Base/BLR/)\n    Mixed(element:18…121@Base\n      Exact(start_tag:18…38@Base/BLR/)\n      Exact(element:43…77@Base/BLR/)\n      Mixed(element:82…110@Base\n        Exact(start_tag:82…99@Base/BLR/)\n        Exact(element:151…278@Base/.L./)\n        Exact(end_tag:104…110@Base/BLR/)\n      )\n      Exact(end_tag:113…121@Base/BLR/)\n    )\n    Exact(element:0…435@Base/..R/)\n    Exact(end_tag:428…435@Base/BLR/)\n  )\n)\nDEBUG deleted and modified: element:124…427@Base, start_tag:215…250@Base\nDEBUG really deleted children: \nDEBUG parents to recompute: \nDEBUG constructing the merged tree took 589.792µs\nDEBUG post-processing the merged tree for signature conflicts took 667ns\nDEBUG Mixed(document:0…436@Base\n  Mixed(element:124…427@Base\n    Exact(start_tag:0…15@Base/BLR/)\n    Mixed(element:18…121@Base\n      Exact(start_tag:18…38@Base/BLR/)\n      Exact(element:43…77@Base/BLR/)\n      Mixed(element:82…110@Base\n        Exact(start_tag:82…99@Base/BLR/)\n        Exact(element:151…278@Base/.L./)\n        Exact(end_tag:104…110@Base/BLR/)\n      )\n      Exact(end_tag:113…121@Base/BLR/)\n    )\n    Exact(element:0…435@Base/..R/)\n    Exact(end_tag:428…435@Base/BLR/)\n  )\n)\nDEBUG ~~~ Merge statistics ~~~\nDEBUG fully_structured: 0 conflicts, 0 mass, has_additional_issues: false\nDEBUG structured_resolution: 1 conflict, 314 mass, has_additional_issues: false\nDEBUG line_based: 1 conflict, 318 mass, has_additional_issues: false\nINFO Mergiraf: Solved 1 conflict. Review with: mergiraf review base.html_xXCmajLl\nDEBUG Selected best merge: fully_structured\n",
+              "diagnostic_sha256": "866c8adf0dbb5f24a463b5793c12d3d76be02828859bea9b0d9bcdbf08102021",
+              "exit_code": 0,
+              "method": "FullyStructured",
+              "output_sha256": "1c01d8bb5b44f2e2d034e930588b70cceb54ce79565ee205d7783c0c800f4819",
+              "path": "app.html",
+              "result_sha256": "79796c120e6791be287327c1ef385d037e8b59feaf7ef586336d5db92bf3b7bb",
+              "timed_fallback": false
+            }
+          ],
+          "order": [
+            "c2",
+            "c1"
+          ],
+          "outcome": "candidate",
+          "recipe": "sha256:9fed053d3b6cf15b9ec571e4d8d1ead5198b9cb8409d0c60814825c275073437",
+          "repeat": 1,
+          "state": "completed",
+          "wall_ms": 404
+        }
+      ],
+      "scenario": "s1",
+      "state": "completed"
+    },
+    {
+      "accepted": true,
+      "case": "FX02",
+      "infrastructure_errors": 0,
+      "oracle_failures": [],
+      "profile": "mergiraf-html-candidate",
+      "retained_playground": "/private/tmp/aethyme-e1-original-campaign-20261012-d1910b/Playground-E1-O956bB",
+      "runs": [
+        {
+          "observations": [],
+          "order": [
+            "c3",
+            "c4"
+          ],
+          "outcome": "conflict",
+          "repeat": 0,
+          "state": "completed",
+          "wall_ms": 130
+        },
+        {
+          "observations": [],
+          "order": [
+            "c3",
+            "c4"
+          ],
+          "outcome": "conflict",
+          "repeat": 1,
+          "state": "completed",
+          "wall_ms": 106
+        },
+        {
+          "observations": [],
+          "order": [
+            "c4",
+            "c3"
+          ],
+          "outcome": "conflict",
+          "repeat": 0,
+          "state": "completed",
+          "wall_ms": 147
+        },
+        {
+          "observations": [],
+          "order": [
+            "c4",
+            "c3"
+          ],
+          "outcome": "conflict",
+          "repeat": 1,
+          "state": "completed",
+          "wall_ms": 133
+        }
+      ],
+      "scenario": "s2",
+      "state": "completed"
+    },
+    {
+      "accepted": true,
+      "case": "FX03",
+      "infrastructure_errors": 0,
+      "oracle_failures": [],
+      "profile": "mergiraf-html-candidate",
+      "retained_playground": "/private/tmp/aethyme-e1-original-campaign-20261012-d1910b/Playground-E1-oY7U4m",
+      "runs": [
+        {
+          "candidate": {
+            "commit": "008d753a5460987943f8a3b38624551399c29f08",
+            "directory": "/private/tmp/aethyme-e1-original-campaign-20261012-d1910b/Playground-E1-oY7U4m/candidate-0",
+            "mode": "Text",
+            "snapshot": "sha256:e30f47f0db32b7d382e7c40de4a1c03be78353c1ec99598bf0ef22d756ad9f71",
+            "tree": "10002d7f9e944288b7a618163a82b9572a767911"
+          },
+          "observations": [
+            {
+              "base_sha256": "7a790be65a8fd3068fa58ff74e741c83b619fea756995f95f9f7e7780bc0f7f4",
+              "current_sha256": "7781840299334ff8af015aba75d782ef8c90a84d32745a4a7913bcfe21c87e1b",
+              "diagnostic": "DEBUG line-based merge took 263.833µs\nDEBUG ~~~ Merge statistics ~~~\nDEBUG line_based: 0 conflicts, 0 mass, has_additional_issues: false\nDEBUG Selected best merge: line_based\n",
+              "diagnostic_sha256": "1c4db939a05a7fcc159c84c6fbe09efea0f5d5ac09b04ed6171fc590c905b0c0",
+              "exit_code": 0,
+              "method": "LineBased",
+              "output_sha256": "2709bd412bab74e1664c18a58c5e5642b7fb5a6ff9de7a4b52ebf5ad00bcb24c",
+              "path": "app.html",
+              "result_sha256": "ddbf30059f87a8f51364ad08be4d1140ebc80e6dea593594f49c1f5789b58c1d",
+              "timed_fallback": false
+            },
+            {
+              "base_sha256": "ddbf30059f87a8f51364ad08be4d1140ebc80e6dea593594f49c1f5789b58c1d",
+              "current_sha256": "2709bd412bab74e1664c18a58c5e5642b7fb5a6ff9de7a4b52ebf5ad00bcb24c",
+              "diagnostic": "DEBUG line-based merge took 160.042µs\nDEBUG ~~~ Merge statistics ~~~\nDEBUG line_based: 0 conflicts, 0 mass, has_additional_issues: false\nDEBUG Selected best merge: line_based\n",
+              "diagnostic_sha256": "4984db77b8dd431986e9d4295d6d06f74d5168748c20788f4f23dcdc1544d483",
+              "exit_code": 0,
+              "method": "LineBased",
+              "output_sha256": "4dabb5c7843722b5658f598b2bda5f529b00764d8573797c9383943532ea4060",
+              "path": "app.html",
+              "result_sha256": "8617122f618235de1fc71a235e28830e45d2c438f1d059341df2ceaadfba3031",
+              "timed_fallback": false
+            }
+          ],
+          "order": [
+            "c1",
+            "c2"
+          ],
+          "outcome": "candidate",
+          "recipe": "sha256:5fb2bd5ae8e8e4321602f7da64581f4a23d9156aef95d36a35b6c544e04d0dee",
+          "repeat": 0,
+          "state": "completed",
+          "wall_ms": 562
+        },
+        {
+          "candidate": {
+            "commit": "008d753a5460987943f8a3b38624551399c29f08",
+            "directory": "/private/tmp/aethyme-e1-original-campaign-20261012-d1910b/Playground-E1-oY7U4m/candidate-1",
+            "mode": "Text",
+            "snapshot": "sha256:e30f47f0db32b7d382e7c40de4a1c03be78353c1ec99598bf0ef22d756ad9f71",
+            "tree": "10002d7f9e944288b7a618163a82b9572a767911"
+          },
+          "observations": [
+            {
+              "base_sha256": "7a790be65a8fd3068fa58ff74e741c83b619fea756995f95f9f7e7780bc0f7f4",
+              "current_sha256": "7781840299334ff8af015aba75d782ef8c90a84d32745a4a7913bcfe21c87e1b",
+              "diagnostic": "DEBUG line-based merge took 169.042µs\nDEBUG ~~~ Merge statistics ~~~\nDEBUG line_based: 0 conflicts, 0 mass, has_additional_issues: false\nDEBUG Selected best merge: line_based\n",
+              "diagnostic_sha256": "9982dbb9e266c105c625ea06336ae2e2662e5ba567e7bd7f521edbe743ec4dc9",
+              "exit_code": 0,
+              "method": "LineBased",
+              "output_sha256": "2709bd412bab74e1664c18a58c5e5642b7fb5a6ff9de7a4b52ebf5ad00bcb24c",
+              "path": "app.html",
+              "result_sha256": "ddbf30059f87a8f51364ad08be4d1140ebc80e6dea593594f49c1f5789b58c1d",
+              "timed_fallback": false
+            },
+            {
+              "base_sha256": "ddbf30059f87a8f51364ad08be4d1140ebc80e6dea593594f49c1f5789b58c1d",
+              "current_sha256": "2709bd412bab74e1664c18a58c5e5642b7fb5a6ff9de7a4b52ebf5ad00bcb24c",
+              "diagnostic": "DEBUG line-based merge took 269.375µs\nDEBUG ~~~ Merge statistics ~~~\nDEBUG line_based: 0 conflicts, 0 mass, has_additional_issues: false\nDEBUG Selected best merge: line_based\n",
+              "diagnostic_sha256": "0ab99dbebb76ac2ac63628b25bdbd17cafd5afc8449b042a39c75b50c264e3ef",
+              "exit_code": 0,
+              "method": "LineBased",
+              "output_sha256": "4dabb5c7843722b5658f598b2bda5f529b00764d8573797c9383943532ea4060",
+              "path": "app.html",
+              "result_sha256": "8617122f618235de1fc71a235e28830e45d2c438f1d059341df2ceaadfba3031",
+              "timed_fallback": false
+            }
+          ],
+          "order": [
+            "c1",
+            "c2"
+          ],
+          "outcome": "candidate",
+          "recipe": "sha256:5fb2bd5ae8e8e4321602f7da64581f4a23d9156aef95d36a35b6c544e04d0dee",
+          "repeat": 1,
+          "state": "completed",
+          "wall_ms": 526
+        }
+      ],
+      "scenario": "s1",
+      "state": "completed"
+    },
+    {
+      "accepted": true,
+      "case": "FX03",
+      "infrastructure_errors": 0,
+      "oracle_failures": [],
+      "profile": "mergiraf-html-candidate",
+      "retained_playground": "/private/tmp/aethyme-e1-original-campaign-20261012-d1910b/Playground-E1-k9OeiT",
+      "runs": [
+        {
+          "candidate": {
+            "commit": "008d753a5460987943f8a3b38624551399c29f08",
+            "directory": "/private/tmp/aethyme-e1-original-campaign-20261012-d1910b/Playground-E1-k9OeiT/candidate-0",
+            "mode": "Text",
+            "snapshot": "sha256:e30f47f0db32b7d382e7c40de4a1c03be78353c1ec99598bf0ef22d756ad9f71",
+            "tree": "10002d7f9e944288b7a618163a82b9572a767911"
+          },
+          "observations": [
+            {
+              "base_sha256": "7a790be65a8fd3068fa58ff74e741c83b619fea756995f95f9f7e7780bc0f7f4",
+              "current_sha256": "7781840299334ff8af015aba75d782ef8c90a84d32745a4a7913bcfe21c87e1b",
+              "diagnostic": "DEBUG line-based merge took 259.834µs\nDEBUG ~~~ Merge statistics ~~~\nDEBUG line_based: 0 conflicts, 0 mass, has_additional_issues: false\nDEBUG Selected best merge: line_based\n",
+              "diagnostic_sha256": "6dd296c8da18f221568c9d69925cd2e163d02f3021afc4707f8be5697ba54bf3",
+              "exit_code": 0,
+              "method": "LineBased",
+              "output_sha256": "2709bd412bab74e1664c18a58c5e5642b7fb5a6ff9de7a4b52ebf5ad00bcb24c",
+              "path": "app.html",
+              "result_sha256": "ddbf30059f87a8f51364ad08be4d1140ebc80e6dea593594f49c1f5789b58c1d",
+              "timed_fallback": false
+            },
+            {
+              "base_sha256": "ddbf30059f87a8f51364ad08be4d1140ebc80e6dea593594f49c1f5789b58c1d",
+              "current_sha256": "2709bd412bab74e1664c18a58c5e5642b7fb5a6ff9de7a4b52ebf5ad00bcb24c",
+              "diagnostic": "DEBUG line-based merge took 206.417µs\nDEBUG ~~~ Merge statistics ~~~\nDEBUG line_based: 0 conflicts, 0 mass, has_additional_issues: false\nDEBUG Selected best merge: line_based\n",
+              "diagnostic_sha256": "aadfe187fcb513e42764b8be97daf9cc42a44ee75e36c6fb387e29e7e402dcf0",
+              "exit_code": 0,
+              "method": "LineBased",
+              "output_sha256": "4dabb5c7843722b5658f598b2bda5f529b00764d8573797c9383943532ea4060",
+              "path": "app.html",
+              "result_sha256": "8617122f618235de1fc71a235e28830e45d2c438f1d059341df2ceaadfba3031",
+              "timed_fallback": false
+            }
+          ],
+          "order": [
+            "c1",
+            "c1",
+            "c2",
+            "c1"
+          ],
+          "outcome": "candidate",
+          "recipe": "sha256:39b41b883e95d806145ebe7693a608db8b9d24fc2af49bc40277ba4a988f599a",
+          "repeat": 0,
+          "state": "completed",
+          "wall_ms": 513
+        },
+        {
+          "candidate": {
+            "commit": "008d753a5460987943f8a3b38624551399c29f08",
+            "directory": "/private/tmp/aethyme-e1-original-campaign-20261012-d1910b/Playground-E1-k9OeiT/candidate-1",
+            "mode": "Text",
+            "snapshot": "sha256:e30f47f0db32b7d382e7c40de4a1c03be78353c1ec99598bf0ef22d756ad9f71",
+            "tree": "10002d7f9e944288b7a618163a82b9572a767911"
+          },
+          "observations": [
+            {
+              "base_sha256": "7a790be65a8fd3068fa58ff74e741c83b619fea756995f95f9f7e7780bc0f7f4",
+              "current_sha256": "7781840299334ff8af015aba75d782ef8c90a84d32745a4a7913bcfe21c87e1b",
+              "diagnostic": "DEBUG line-based merge took 560.834µs\nDEBUG ~~~ Merge statistics ~~~\nDEBUG line_based: 0 conflicts, 0 mass, has_additional_issues: false\nDEBUG Selected best merge: line_based\n",
+              "diagnostic_sha256": "69a9a224c81ce15a3e59a21081fa253c9518cc73531aebb891c176e254a4433f",
+              "exit_code": 0,
+              "method": "LineBased",
+              "output_sha256": "2709bd412bab74e1664c18a58c5e5642b7fb5a6ff9de7a4b52ebf5ad00bcb24c",
+              "path": "app.html",
+              "result_sha256": "ddbf30059f87a8f51364ad08be4d1140ebc80e6dea593594f49c1f5789b58c1d",
+              "timed_fallback": false
+            },
+            {
+              "base_sha256": "ddbf30059f87a8f51364ad08be4d1140ebc80e6dea593594f49c1f5789b58c1d",
+              "current_sha256": "2709bd412bab74e1664c18a58c5e5642b7fb5a6ff9de7a4b52ebf5ad00bcb24c",
+              "diagnostic": "DEBUG line-based merge took 268.666µs\nDEBUG ~~~ Merge statistics ~~~\nDEBUG line_based: 0 conflicts, 0 mass, has_additional_issues: false\nDEBUG Selected best merge: line_based\n",
+              "diagnostic_sha256": "143764dae83f78515a03a69d6ea19aae12ee4754885425191c448a4d4564ebad",
+              "exit_code": 0,
+              "method": "LineBased",
+              "output_sha256": "4dabb5c7843722b5658f598b2bda5f529b00764d8573797c9383943532ea4060",
+              "path": "app.html",
+              "result_sha256": "8617122f618235de1fc71a235e28830e45d2c438f1d059341df2ceaadfba3031",
+              "timed_fallback": false
+            }
+          ],
+          "order": [
+            "c1",
+            "c1",
+            "c2",
+            "c1"
+          ],
+          "outcome": "candidate",
+          "recipe": "sha256:39b41b883e95d806145ebe7693a608db8b9d24fc2af49bc40277ba4a988f599a",
+          "repeat": 1,
+          "state": "completed",
+          "wall_ms": 448
+        }
+      ],
+      "scenario": "s2",
+      "state": "completed"
+    },
+    {
+      "accepted": true,
+      "case": "FX03",
+      "infrastructure_errors": 0,
+      "oracle_failures": [],
+      "profile": "mergiraf-html-candidate",
+      "retained_playground": "/private/tmp/aethyme-e1-original-campaign-20261012-d1910b/Playground-E1-fl1ctT",
+      "runs": [
+        {
+          "observations": [],
+          "order": [
+            "c3"
+          ],
+          "outcome": "unknown_base",
+          "repeat": 0,
+          "state": "completed",
+          "wall_ms": 175
+        },
+        {
+          "observations": [],
+          "order": [
+            "c3"
+          ],
+          "outcome": "unknown_base",
+          "repeat": 1,
+          "state": "completed",
+          "wall_ms": 195
+        }
+      ],
+      "scenario": "s3",
+      "state": "completed"
+    },
+    {
+      "accepted": false,
+      "case": "FX04",
+      "infrastructure_errors": 0,
+      "oracle_failures": [
+        "run 0 [\"c1\", \"c2\"]: app.ts: looks up #submit, which is not in app.html",
+        "run 0 [\"c1\", \"c2\"]: app.ts: no \"keydown\" listener looks up #send-signup",
+        "run 1 [\"c1\", \"c2\"]: app.ts: looks up #submit, which is not in app.html",
+        "run 1 [\"c1\", \"c2\"]: app.ts: no \"keydown\" listener looks up #send-signup",
+        "run 2 [\"c2\", \"c1\"]: app.ts: looks up #submit, which is not in app.html",
+        "run 2 [\"c2\", \"c1\"]: app.ts: no \"keydown\" listener looks up #send-signup",
+        "run 3 [\"c2\", \"c1\"]: app.ts: looks up #submit, which is not in app.html",
+        "run 3 [\"c2\", \"c1\"]: app.ts: no \"keydown\" listener looks up #send-signup"
+      ],
+      "profile": "mergiraf-html-candidate",
+      "retained_playground": "/private/tmp/aethyme-e1-original-campaign-20261012-d1910b/Playground-E1-0SR7Is",
+      "runs": [
+        {
+          "candidate": {
+            "commit": "7387552d78df77f2c569498c268e79b11e9f64bd",
+            "directory": "/private/tmp/aethyme-e1-original-campaign-20261012-d1910b/Playground-E1-0SR7Is/candidate-0",
+            "mode": "Text",
+            "snapshot": "sha256:f0c04e1b3987a2fbaeb72904abe02f18977cbfa93b19ae88ea001e787868d2f4",
+            "tree": "f91a946ad93e638bcc2a04d94338e5c13cf69971"
+          },
+          "observations": [],
+          "order": [
+            "c1",
+            "c2"
+          ],
+          "outcome": "candidate",
+          "recipe": "sha256:036328867cd08a575bb4cb84184430fc53413b1c36c09e3b6784306b901c5756",
+          "repeat": 0,
+          "state": "completed",
+          "wall_ms": 411
+        },
+        {
+          "candidate": {
+            "commit": "7387552d78df77f2c569498c268e79b11e9f64bd",
+            "directory": "/private/tmp/aethyme-e1-original-campaign-20261012-d1910b/Playground-E1-0SR7Is/candidate-1",
+            "mode": "Text",
+            "snapshot": "sha256:f0c04e1b3987a2fbaeb72904abe02f18977cbfa93b19ae88ea001e787868d2f4",
+            "tree": "f91a946ad93e638bcc2a04d94338e5c13cf69971"
+          },
+          "observations": [],
+          "order": [
+            "c1",
+            "c2"
+          ],
+          "outcome": "candidate",
+          "recipe": "sha256:036328867cd08a575bb4cb84184430fc53413b1c36c09e3b6784306b901c5756",
+          "repeat": 1,
+          "state": "completed",
+          "wall_ms": 373
+        },
+        {
+          "candidate": {
+            "commit": "7387552d78df77f2c569498c268e79b11e9f64bd",
+            "directory": "/private/tmp/aethyme-e1-original-campaign-20261012-d1910b/Playground-E1-0SR7Is/candidate-2",
+            "mode": "Text",
+            "snapshot": "sha256:f0c04e1b3987a2fbaeb72904abe02f18977cbfa93b19ae88ea001e787868d2f4",
+            "tree": "f91a946ad93e638bcc2a04d94338e5c13cf69971"
+          },
+          "observations": [],
+          "order": [
+            "c2",
+            "c1"
+          ],
+          "outcome": "candidate",
+          "recipe": "sha256:30afe80808a9679329332f965b96c3e093c84bf91284fe56baee686f0557f46d",
+          "repeat": 0,
+          "state": "completed",
+          "wall_ms": 378
+        },
+        {
+          "candidate": {
+            "commit": "7387552d78df77f2c569498c268e79b11e9f64bd",
+            "directory": "/private/tmp/aethyme-e1-original-campaign-20261012-d1910b/Playground-E1-0SR7Is/candidate-3",
+            "mode": "Text",
+            "snapshot": "sha256:f0c04e1b3987a2fbaeb72904abe02f18977cbfa93b19ae88ea001e787868d2f4",
+            "tree": "f91a946ad93e638bcc2a04d94338e5c13cf69971"
+          },
+          "observations": [],
+          "order": [
+            "c2",
+            "c1"
+          ],
+          "outcome": "candidate",
+          "recipe": "sha256:30afe80808a9679329332f965b96c3e093c84bf91284fe56baee686f0557f46d",
+          "repeat": 1,
+          "state": "completed",
+          "wall_ms": 372
+        }
+      ],
+      "scenario": "s1",
+      "state": "completed"
+    },
+    {
+      "accepted": true,
+      "case": "FX05",
+      "infrastructure_errors": 0,
+      "oracle_failures": [],
+      "profile": "mergiraf-html-candidate",
+      "retained_playground": "/private/tmp/aethyme-e1-original-campaign-20261012-d1910b/Playground-E1-5uKWO9",
+      "runs": [
+        {
+          "observations": [
+            {
+              "base_sha256": "56582938538c0616546fbd10da7f935098f48083f6994b9027b1b661df607cb9",
+              "current_sha256": "a7a6207b076ad2791ed21d12118ddebd365b32a9aa5d5ebd5cf2e3aa79682eef",
+              "diagnostic": "DEBUG line-based merge took 270.041µs\nDEBUG re-constructing revisions from parsed merge took 1.041µs\nDEBUG parsing all three files took 142.292µs\nDEBUG matching base to left\nDEBUG matching base to right\nDEBUG top-down phase yielded 71 matches\nDEBUG top-down phase yielded 71 matches\nDEBUG matching took 63.083µs\nDEBUG matching took 60.167µs\nDEBUG matching left to right\nDEBUG top-down phase yielded 0 matches\nDEBUG matching took 36.583µs\nDEBUG matching all three pairs took 224µs\nDEBUG constructing the classmapping took 25.792µs\nDEBUG generating PCS triples\nDEBUG generating PCS triples took 9.917µs\nDEBUG number of triples: 13\nDEBUG cleaning up PCS triples took 9.5µs\nDEBUG Mixed(document:0…146@Base\n  Mixed(element:0…145@Base\n    Exact(start_tag:0…15@Base/BLR/)\n    Exact(element:18…48@Base/BLR/)\n    Mixed(element:51…98@Base\n      Exact(start_tag:51…85@Base/BLR/)\n      Conflict()\n      Exact(end_tag:89…98@Base/BLR/)\n    )\n    Exact(element:101…137@Base/BLR/)\n    Exact(end_tag:138…145@Base/BLR/)\n  )\n)\nDEBUG deleted and modified: \nDEBUG really deleted children: \nDEBUG parents to recompute: \nDEBUG constructing the merged tree took 34.833µs\nDEBUG post-processing the merged tree for signature conflicts took 375ns\nDEBUG Mixed(document:0…146@Base\n  Mixed(element:0…145@Base\n    Exact(start_tag:0…15@Base/BLR/)\n    Exact(element:18…48@Base/BLR/)\n    Mixed(element:51…98@Base\n      Exact(start_tag:51…85@Base/BLR/)\n      Conflict()\n      Exact(end_tag:89…98@Base/BLR/)\n    )\n    Exact(element:101…137@Base/BLR/)\n    Exact(end_tag:138…145@Base/BLR/)\n  )\n)\nDEBUG parsing all three files took 85.709µs\nDEBUG matching base to left\nDEBUG matching base to right\nDEBUG top-down phase yielded 71 matches\nDEBUG top-down phase yielded 71 matches\nDEBUG matching took 40.208µs\nDEBUG matching took 38.042µs\nDEBUG matching left to right\nDEBUG top-down phase yielded 0 matches\nDEBUG matching took 26.042µs\nDEBUG matching all three pairs took 149.292µs\nDEBUG constructing the classmapping took 25.375µs\nDEBUG generating PCS triples\nDEBUG generating PCS triples took 8µs\nDEBUG number of triples: 13\nDEBUG cleaning up PCS triples took 5.584µs\nDEBUG Mixed(document:0…146@Base\n  Mixed(element:0…145@Base\n    Exact(start_tag:0…15@Base/BLR/)\n    Exact(element:18…48@Base/BLR/)\n    Mixed(element:51…98@Base\n      Exact(start_tag:51…85@Base/BLR/)\n      Conflict()\n      Exact(end_tag:89…98@Base/BLR/)\n    )\n    Exact(element:101…137@Base/BLR/)\n    Exact(end_tag:138…145@Base/BLR/)\n  )\n)\nDEBUG deleted and modified: \nDEBUG really deleted children: \nDEBUG parents to recompute: \nDEBUG constructing the merged tree took 19.459µs\nDEBUG post-processing the merged tree for signature conflicts took 250ns\nDEBUG Mixed(document:0…146@Base\n  Mixed(element:0…145@Base\n    Exact(start_tag:0…15@Base/BLR/)\n    Exact(element:18…48@Base/BLR/)\n    Mixed(element:51…98@Base\n      Exact(start_tag:51…85@Base/BLR/)\n      Conflict()\n      Exact(end_tag:89…98@Base/BLR/)\n    )\n    Exact(element:101…137@Base/BLR/)\n    Exact(end_tag:138…145@Base/BLR/)\n  )\n)\nDEBUG ~~~ Merge statistics ~~~\nDEBUG structured_resolution: 1 conflict, 17 mass, has_additional_issues: false\nDEBUG fully_structured: 1 conflict, 17 mass, has_additional_issues: false\nDEBUG line_based: 1 conflict, 155 mass, has_additional_issues: false\nDEBUG Selected best merge: structured_resolution\n",
+              "diagnostic_sha256": "fcd8279eb4a512736b3036ff39e2c7a5b69d2eda429246586dd3879643523818",
+              "exit_code": 1,
+              "method": "StructuredResolution",
+              "output_sha256": "7ef1d2a8504c521c8cd33900776d641928b558436a4e1496b8e798300d1f40d0",
+              "path": "app.html",
+              "result_sha256": "d19020c984b815f8f1736e7925cd8e38e3f01794d072a4dfe0b1a35ccdb82aa6",
+              "timed_fallback": false
+            }
+          ],
+          "order": [
+            "c1",
+            "c2"
+          ],
+          "outcome": "conflict",
+          "repeat": 0,
+          "state": "completed",
+          "wall_ms": 140
+        },
+        {
+          "observations": [
+            {
+              "base_sha256": "56582938538c0616546fbd10da7f935098f48083f6994b9027b1b661df607cb9",
+              "current_sha256": "a7a6207b076ad2791ed21d12118ddebd365b32a9aa5d5ebd5cf2e3aa79682eef",
+              "diagnostic": "DEBUG line-based merge took 554.375µs\nDEBUG re-constructing revisions from parsed merge took 1.417µs\nDEBUG parsing all three files took 156.375µs\nDEBUG matching base to left\nDEBUG matching base to right\nDEBUG top-down phase yielded 71 matches\nDEBUG top-down phase yielded 71 matches\nDEBUG matching took 63.917µs\nDEBUG matching took 62.667µs\nDEBUG matching left to right\nDEBUG top-down phase yielded 0 matches\nDEBUG matching took 34.709µs\nDEBUG matching all three pairs took 187.792µs\nDEBUG constructing the classmapping took 29.125µs\nDEBUG generating PCS triples\nDEBUG generating PCS triples took 12.584µs\nDEBUG number of triples: 13\nDEBUG cleaning up PCS triples took 8.583µs\nDEBUG Mixed(document:0…146@Base\n  Mixed(element:0…145@Base\n    Exact(start_tag:0…15@Base/BLR/)\n    Exact(element:18…48@Base/BLR/)\n    Mixed(element:51…98@Base\n      Exact(start_tag:51…85@Base/BLR/)\n      Conflict()\n      Exact(end_tag:89…98@Base/BLR/)\n    )\n    Exact(element:101…137@Base/BLR/)\n    Exact(end_tag:138…145@Base/BLR/)\n  )\n)\nDEBUG deleted and modified: \nDEBUG really deleted children: \nDEBUG parents to recompute: \nDEBUG constructing the merged tree took 36µs\nDEBUG post-processing the merged tree for signature conflicts took 375ns\nDEBUG Mixed(document:0…146@Base\n  Mixed(element:0…145@Base\n    Exact(start_tag:0…15@Base/BLR/)\n    Exact(element:18…48@Base/BLR/)\n    Mixed(element:51…98@Base\n      Exact(start_tag:51…85@Base/BLR/)\n      Conflict()\n      Exact(end_tag:89…98@Base/BLR/)\n    )\n    Exact(element:101…137@Base/BLR/)\n    Exact(end_tag:138…145@Base/BLR/)\n  )\n)\nDEBUG parsing all three files took 85.5µs\nDEBUG matching base to left\nDEBUG matching base to right\nDEBUG top-down phase yielded 71 matches\nDEBUG top-down phase yielded 71 matches\nDEBUG matching took 36.5µs\nDEBUG matching took 46.708µs\nDEBUG matching left to right\nDEBUG top-down phase yielded 0 matches\nDEBUG matching took 31.584µs\nDEBUG matching all three pairs took 127.25µs\nDEBUG constructing the classmapping took 24.667µs\nDEBUG generating PCS triples\nDEBUG generating PCS triples took 10.125µs\nDEBUG number of triples: 13\nDEBUG cleaning up PCS triples took 7.083µs\nDEBUG Mixed(document:0…146@Base\n  Mixed(element:0…145@Base\n    Exact(start_tag:0…15@Base/BLR/)\n    Exact(element:18…48@Base/BLR/)\n    Mixed(element:51…98@Base\n      Exact(start_tag:51…85@Base/BLR/)\n      Conflict()\n      Exact(end_tag:89…98@Base/BLR/)\n    )\n    Exact(element:101…137@Base/BLR/)\n    Exact(end_tag:138…145@Base/BLR/)\n  )\n)\nDEBUG deleted and modified: \nDEBUG really deleted children: \nDEBUG parents to recompute: \nDEBUG constructing the merged tree took 21.875µs\nDEBUG post-processing the merged tree for signature conflicts took 291ns\nDEBUG Mixed(document:0…146@Base\n  Mixed(element:0…145@Base\n    Exact(start_tag:0…15@Base/BLR/)\n    Exact(element:18…48@Base/BLR/)\n    Mixed(element:51…98@Base\n      Exact(start_tag:51…85@Base/BLR/)\n      Conflict()\n      Exact(end_tag:89…98@Base/BLR/)\n    )\n    Exact(element:101…137@Base/BLR/)\n    Exact(end_tag:138…145@Base/BLR/)\n  )\n)\nDEBUG ~~~ Merge statistics ~~~\nDEBUG structured_resolution: 1 conflict, 17 mass, has_additional_issues: false\nDEBUG fully_structured: 1 conflict, 17 mass, has_additional_issues: false\nDEBUG line_based: 1 conflict, 155 mass, has_additional_issues: false\nDEBUG Selected best merge: structured_resolution\n",
+              "diagnostic_sha256": "911af9aa76b0721f61599c1426a97cdba7660b15d8a6772cc4e988079e845d03",
+              "exit_code": 1,
+              "method": "StructuredResolution",
+              "output_sha256": "7ef1d2a8504c521c8cd33900776d641928b558436a4e1496b8e798300d1f40d0",
+              "path": "app.html",
+              "result_sha256": "d19020c984b815f8f1736e7925cd8e38e3f01794d072a4dfe0b1a35ccdb82aa6",
+              "timed_fallback": false
+            }
+          ],
+          "order": [
+            "c1",
+            "c2"
+          ],
+          "outcome": "conflict",
+          "repeat": 1,
+          "state": "completed",
+          "wall_ms": 135
+        },
+        {
+          "observations": [
+            {
+              "base_sha256": "56582938538c0616546fbd10da7f935098f48083f6994b9027b1b661df607cb9",
+              "current_sha256": "d19020c984b815f8f1736e7925cd8e38e3f01794d072a4dfe0b1a35ccdb82aa6",
+              "diagnostic": "DEBUG line-based merge took 462.583µs\nDEBUG re-constructing revisions from parsed merge took 8.166µs\nDEBUG parsing all three files took 152.833µs\nDEBUG matching base to left\nDEBUG matching base to right\nDEBUG top-down phase yielded 71 matches\nDEBUG top-down phase yielded 71 matches\nDEBUG matching took 59.625µs\nDEBUG matching took 56.333µs\nDEBUG matching left to right\nDEBUG top-down phase yielded 0 matches\nDEBUG matching took 35.542µs\nDEBUG matching all three pairs took 158.625µs\nDEBUG constructing the classmapping took 29.416µs\nDEBUG generating PCS triples\nDEBUG generating PCS triples took 11.833µs\nDEBUG number of triples: 13\nDEBUG cleaning up PCS triples took 9.583µs\nDEBUG Mixed(document:0…146@Base\n  Mixed(element:0…145@Base\n    Exact(start_tag:0…15@Base/BLR/)\n    Exact(element:18…48@Base/BLR/)\n    Mixed(element:51…98@Base\n      Exact(start_tag:51…85@Base/BLR/)\n      Conflict()\n      Exact(end_tag:89…98@Base/BLR/)\n    )\n    Exact(element:101…137@Base/BLR/)\n    Exact(end_tag:138…145@Base/BLR/)\n  )\n)\nDEBUG deleted and modified: \nDEBUG really deleted children: \nDEBUG parents to recompute: \nDEBUG constructing the merged tree took 81.875µs\nDEBUG post-processing the merged tree for signature conflicts took 375ns\nDEBUG Mixed(document:0…146@Base\n  Mixed(element:0…145@Base\n    Exact(start_tag:0…15@Base/BLR/)\n    Exact(element:18…48@Base/BLR/)\n    Mixed(element:51…98@Base\n      Exact(start_tag:51…85@Base/BLR/)\n      Conflict()\n      Exact(end_tag:89…98@Base/BLR/)\n    )\n    Exact(element:101…137@Base/BLR/)\n    Exact(end_tag:138…145@Base/BLR/)\n  )\n)\nDEBUG parsing all three files took 85.25µs\nDEBUG matching base to left\nDEBUG matching base to right\nDEBUG top-down phase yielded 71 matches\nDEBUG top-down phase yielded 71 matches\nDEBUG matching took 38.791µs\nDEBUG matching took 42.5µs\nDEBUG matching left to right\nDEBUG top-down phase yielded 0 matches\nDEBUG matching took 29.709µs\nDEBUG matching all three pairs took 121.625µs\nDEBUG constructing the classmapping took 25.958µs\nDEBUG generating PCS triples\nDEBUG generating PCS triples took 9.75µs\nDEBUG number of triples: 13\nDEBUG cleaning up PCS triples took 6.958µs\nDEBUG Mixed(document:0…146@Base\n  Mixed(element:0…145@Base\n    Exact(start_tag:0…15@Base/BLR/)\n    Exact(element:18…48@Base/BLR/)\n    Mixed(element:51…98@Base\n      Exact(start_tag:51…85@Base/BLR/)\n      Conflict()\n      Exact(end_tag:89…98@Base/BLR/)\n    )\n    Exact(element:101…137@Base/BLR/)\n    Exact(end_tag:138…145@Base/BLR/)\n  )\n)\nDEBUG deleted and modified: \nDEBUG really deleted children: \nDEBUG parents to recompute: \nDEBUG constructing the merged tree took 21.625µs\nDEBUG post-processing the merged tree for signature conflicts took 333ns\nDEBUG Mixed(document:0…146@Base\n  Mixed(element:0…145@Base\n    Exact(start_tag:0…15@Base/BLR/)\n    Exact(element:18…48@Base/BLR/)\n    Mixed(element:51…98@Base\n      Exact(start_tag:51…85@Base/BLR/)\n      Conflict()\n      Exact(end_tag:89…98@Base/BLR/)\n    )\n    Exact(element:101…137@Base/BLR/)\n    Exact(end_tag:138…145@Base/BLR/)\n  )\n)\nDEBUG ~~~ Merge statistics ~~~\nDEBUG structured_resolution: 1 conflict, 17 mass, has_additional_issues: false\nDEBUG fully_structured: 1 conflict, 17 mass, has_additional_issues: false\nDEBUG line_based: 1 conflict, 155 mass, has_additional_issues: false\nDEBUG Selected best merge: structured_resolution\n",
+              "diagnostic_sha256": "1ec797ab6c114dcf17d5d04948779eecf73d7069c5a399ef4949179521769057",
+              "exit_code": 1,
+              "method": "StructuredResolution",
+              "output_sha256": "1bc14b964e5fa06e7f03b13786f34605d514b32cdd210109fc0f61f1ea358660",
+              "path": "app.html",
+              "result_sha256": "a7a6207b076ad2791ed21d12118ddebd365b32a9aa5d5ebd5cf2e3aa79682eef",
+              "timed_fallback": false
+            }
+          ],
+          "order": [
+            "c2",
+            "c1"
+          ],
+          "outcome": "conflict",
+          "repeat": 0,
+          "state": "completed",
+          "wall_ms": 135
+        },
+        {
+          "observations": [
+            {
+              "base_sha256": "56582938538c0616546fbd10da7f935098f48083f6994b9027b1b661df607cb9",
+              "current_sha256": "d19020c984b815f8f1736e7925cd8e38e3f01794d072a4dfe0b1a35ccdb82aa6",
+              "diagnostic": "DEBUG line-based merge took 545.167µs\nDEBUG re-constructing revisions from parsed merge took 4.833µs\nDEBUG parsing all three files took 221.584µs\nDEBUG matching base to left\nDEBUG matching base to right\nDEBUG top-down phase yielded 71 matches\nDEBUG top-down phase yielded 71 matches\nDEBUG matching took 102.583µs\nDEBUG matching took 99µs\nDEBUG matching left to right\nDEBUG top-down phase yielded 0 matches\nDEBUG matching took 41.834µs\nDEBUG matching all three pairs took 271.125µs\nDEBUG constructing the classmapping took 30.292µs\nDEBUG generating PCS triples\nDEBUG generating PCS triples took 12.833µs\nDEBUG number of triples: 13\nDEBUG cleaning up PCS triples took 8.334µs\nDEBUG Mixed(document:0…146@Base\n  Mixed(element:0…145@Base\n    Exact(start_tag:0…15@Base/BLR/)\n    Exact(element:18…48@Base/BLR/)\n    Mixed(element:51…98@Base\n      Exact(start_tag:51…85@Base/BLR/)\n      Conflict()\n      Exact(end_tag:89…98@Base/BLR/)\n    )\n    Exact(element:101…137@Base/BLR/)\n    Exact(end_tag:138…145@Base/BLR/)\n  )\n)\nDEBUG deleted and modified: \nDEBUG really deleted children: \nDEBUG parents to recompute: \nDEBUG constructing the merged tree took 43.125µs\nDEBUG post-processing the merged tree for signature conflicts took 416ns\nDEBUG Mixed(document:0…146@Base\n  Mixed(element:0…145@Base\n    Exact(start_tag:0…15@Base/BLR/)\n    Exact(element:18…48@Base/BLR/)\n    Mixed(element:51…98@Base\n      Exact(start_tag:51…85@Base/BLR/)\n      Conflict()\n      Exact(end_tag:89…98@Base/BLR/)\n    )\n    Exact(element:101…137@Base/BLR/)\n    Exact(end_tag:138…145@Base/BLR/)\n  )\n)\nDEBUG parsing all three files took 86.25µs\nDEBUG matching base to left\nDEBUG matching base to right\nDEBUG top-down phase yielded 71 matches\nDEBUG top-down phase yielded 71 matches\nDEBUG matching took 84.375µs\nDEBUG matching took 91.833µs\nDEBUG matching left to right\nDEBUG top-down phase yielded 0 matches\nDEBUG matching took 26.209µs\nDEBUG matching all three pairs took 181.791µs\nDEBUG constructing the classmapping took 23.875µs\nDEBUG generating PCS triples\nDEBUG generating PCS triples took 8µs\nDEBUG number of triples: 13\nDEBUG cleaning up PCS triples took 6.125µs\nDEBUG Mixed(document:0…146@Base\n  Mixed(element:0…145@Base\n    Exact(start_tag:0…15@Base/BLR/)\n    Exact(element:18…48@Base/BLR/)\n    Mixed(element:51…98@Base\n      Exact(start_tag:51…85@Base/BLR/)\n      Conflict()\n      Exact(end_tag:89…98@Base/BLR/)\n    )\n    Exact(element:101…137@Base/BLR/)\n    Exact(end_tag:138…145@Base/BLR/)\n  )\n)\nDEBUG deleted and modified: \nDEBUG really deleted children: \nDEBUG parents to recompute: \nDEBUG constructing the merged tree took 19.917µs\nDEBUG post-processing the merged tree for signature conflicts took 167ns\nDEBUG Mixed(document:0…146@Base\n  Mixed(element:0…145@Base\n    Exact(start_tag:0…15@Base/BLR/)\n    Exact(element:18…48@Base/BLR/)\n    Mixed(element:51…98@Base\n      Exact(start_tag:51…85@Base/BLR/)\n      Conflict()\n      Exact(end_tag:89…98@Base/BLR/)\n    )\n    Exact(element:101…137@Base/BLR/)\n    Exact(end_tag:138…145@Base/BLR/)\n  )\n)\nDEBUG ~~~ Merge statistics ~~~\nDEBUG structured_resolution: 1 conflict, 17 mass, has_additional_issues: false\nDEBUG fully_structured: 1 conflict, 17 mass, has_additional_issues: false\nDEBUG line_based: 1 conflict, 155 mass, has_additional_issues: false\nDEBUG Selected best merge: structured_resolution\n",
+              "diagnostic_sha256": "98382da19eeb0e6926291860d244bbd23e621a91ee7e8f1d00721bc06c72cb13",
+              "exit_code": 1,
+              "method": "StructuredResolution",
+              "output_sha256": "1bc14b964e5fa06e7f03b13786f34605d514b32cdd210109fc0f61f1ea358660",
+              "path": "app.html",
+              "result_sha256": "a7a6207b076ad2791ed21d12118ddebd365b32a9aa5d5ebd5cf2e3aa79682eef",
+              "timed_fallback": false
+            }
+          ],
+          "order": [
+            "c2",
+            "c1"
+          ],
+          "outcome": "conflict",
+          "repeat": 1,
+          "state": "completed",
+          "wall_ms": 139
+        }
+      ],
+      "scenario": "s1",
+      "state": "completed"
+    },
+    {
+      "accepted": true,
+      "case": "FX06",
+      "infrastructure_errors": 0,
+      "oracle_failures": [],
+      "profile": "mergiraf-html-candidate",
+      "retained_playground": "/private/tmp/aethyme-e1-original-campaign-20261012-d1910b/Playground-E1-HcWjhV",
+      "runs": [
+        {
+          "candidate": {
+            "commit": "e7ec22209b0e5a7dd855b0d35a08cfa603de86e6",
+            "directory": "/private/tmp/aethyme-e1-original-campaign-20261012-d1910b/Playground-E1-HcWjhV/candidate-0",
+            "mode": "Text",
+            "snapshot": "sha256:49507241a03f3c88398ec7ff0958584983b03d62d0e2aaaea5a092f350520f2e",
+            "tree": "cef2e6a0b5e50538f496c4ca1ac77a534d73c6c1"
+          },
+          "observations": [],
+          "order": [
+            "c1",
+            "c3"
+          ],
+          "outcome": "candidate",
+          "recipe": "sha256:035b824d82c9c504587977cd293d6bfc33d9cf01f2132dded806a2b67aa53a90",
+          "repeat": 0,
+          "state": "completed",
+          "wall_ms": 408
+        },
+        {
+          "candidate": {
+            "commit": "e7ec22209b0e5a7dd855b0d35a08cfa603de86e6",
+            "directory": "/private/tmp/aethyme-e1-original-campaign-20261012-d1910b/Playground-E1-HcWjhV/candidate-1",
+            "mode": "Text",
+            "snapshot": "sha256:49507241a03f3c88398ec7ff0958584983b03d62d0e2aaaea5a092f350520f2e",
+            "tree": "cef2e6a0b5e50538f496c4ca1ac77a534d73c6c1"
+          },
+          "observations": [],
+          "order": [
+            "c1",
+            "c3"
+          ],
+          "outcome": "candidate",
+          "recipe": "sha256:035b824d82c9c504587977cd293d6bfc33d9cf01f2132dded806a2b67aa53a90",
+          "repeat": 1,
+          "state": "completed",
+          "wall_ms": 389
+        }
+      ],
+      "scenario": "s1",
+      "state": "completed"
+    },
+    {
+      "accepted": true,
+      "case": "FX06",
+      "infrastructure_errors": 0,
+      "oracle_failures": [],
+      "profile": "mergiraf-html-candidate",
+      "retained_playground": "/private/tmp/aethyme-e1-original-campaign-20261012-d1910b/Playground-E1-BqSNQf",
+      "runs": [
+        {
+          "observations": [],
+          "order": [
+            "c3"
+          ],
+          "outcome": "missing_input",
+          "repeat": 0,
+          "state": "completed",
+          "wall_ms": 135
+        },
+        {
+          "observations": [],
+          "order": [
+            "c3"
+          ],
+          "outcome": "missing_input",
+          "repeat": 1,
+          "state": "completed",
+          "wall_ms": 133
+        }
+      ],
+      "scenario": "s2",
+      "state": "completed"
+    },
+    {
+      "accepted": true,
+      "case": "FX06",
+      "infrastructure_errors": 0,
+      "oracle_failures": [],
+      "profile": "mergiraf-html-candidate",
+      "retained_playground": "/private/tmp/aethyme-e1-original-campaign-20261012-d1910b/Playground-E1-B6bAID",
+      "runs": [
+        {
+          "observations": [],
+          "order": [
+            "c1"
+          ],
+          "outcome": "missing_input",
+          "repeat": 0,
+          "state": "completed",
+          "wall_ms": 126
+        },
+        {
+          "observations": [],
+          "order": [
+            "c1"
+          ],
+          "outcome": "missing_input",
+          "repeat": 1,
+          "state": "completed",
+          "wall_ms": 134
+        }
+      ],
+      "scenario": "s3",
+      "state": "completed"
+    },
+    {
+      "accepted": true,
+      "case": "FX06",
+      "infrastructure_errors": 0,
+      "oracle_failures": [],
+      "profile": "mergiraf-html-candidate",
+      "retained_playground": "/private/tmp/aethyme-e1-original-campaign-20261012-d1910b/Playground-E1-UFbOuS",
+      "runs": [
+        {
+          "observations": [],
+          "order": [
+            "c4",
+            "c5"
+          ],
+          "outcome": "dependency_cycle",
+          "repeat": 0,
+          "state": "completed",
+          "wall_ms": 151
+        },
+        {
+          "observations": [],
+          "order": [
+            "c4",
+            "c5"
+          ],
+          "outcome": "dependency_cycle",
+          "repeat": 1,
+          "state": "completed",
+          "wall_ms": 181
+        }
+      ],
+      "scenario": "s4",
+      "state": "completed"
+    },
+    {
+      "accepted": true,
+      "case": "FX06",
+      "infrastructure_errors": 0,
+      "oracle_failures": [],
+      "profile": "mergiraf-html-candidate",
+      "retained_playground": "/private/tmp/aethyme-e1-original-campaign-20261012-d1910b/Playground-E1-porfSh",
+      "runs": [
+        {
+          "observations": [],
+          "order": [
+            "c1",
+            "c2",
+            "c3"
+          ],
+          "outcome": "competing_revisions",
+          "repeat": 0,
+          "state": "completed",
+          "wall_ms": 124
+        },
+        {
+          "observations": [],
+          "order": [
+            "c1",
+            "c2",
+            "c3"
+          ],
+          "outcome": "competing_revisions",
+          "repeat": 1,
+          "state": "completed",
+          "wall_ms": 140
+        }
+      ],
+      "scenario": "s5",
+      "state": "completed"
+    },
+    {
+      "accepted": true,
+      "case": "FX06",
+      "infrastructure_errors": 0,
+      "oracle_failures": [],
+      "profile": "mergiraf-html-candidate",
+      "retained_playground": "/private/tmp/aethyme-e1-original-campaign-20261012-d1910b/Playground-E1-YYz58d",
+      "runs": [
+        {
+          "observations": [],
+          "order": [
+            "c2",
+            "c3"
+          ],
+          "outcome": "competing_revisions",
+          "repeat": 0,
+          "state": "completed",
+          "wall_ms": 142
+        },
+        {
+          "observations": [],
+          "order": [
+            "c2",
+            "c3"
+          ],
+          "outcome": "competing_revisions",
+          "repeat": 1,
+          "state": "completed",
+          "wall_ms": 158
+        }
+      ],
+      "scenario": "s6",
+      "state": "completed"
+    },
+    {
+      "accepted": true,
+      "case": "FX07",
+      "infrastructure_errors": 0,
+      "oracle_failures": [],
+      "profile": "mergiraf-html-candidate",
+      "retained_playground": "/private/tmp/aethyme-e1-original-campaign-20261012-d1910b/Playground-E1-pe5dRv",
+      "runs": [
+        {
+          "candidate": {
+            "commit": "2f6ae1a624ecc2abb4950e993394f7c3614cfae1",
+            "directory": "/private/tmp/aethyme-e1-original-campaign-20261012-d1910b/Playground-E1-pe5dRv/candidate-0",
+            "mode": "Text",
+            "snapshot": "sha256:181805ff7fbfe6602b4fe65410e63db86e65b24080179ebb53ef7a98941299b9",
+            "tree": "bdab02b408a6ad7f5c90c5b88e840b5551d833fb"
+          },
+          "observations": [],
+          "order": [],
+          "outcome": "candidate",
+          "recipe": "sha256:f6e4a8cda17e883573a252fc20814df4f279d0156fd80bb8fcdf069760feebcb",
+          "repeat": 0,
+          "state": "completed",
+          "wall_ms": 355
+        },
+        {
+          "candidate": {
+            "commit": "2f6ae1a624ecc2abb4950e993394f7c3614cfae1",
+            "directory": "/private/tmp/aethyme-e1-original-campaign-20261012-d1910b/Playground-E1-pe5dRv/candidate-1",
+            "mode": "Text",
+            "snapshot": "sha256:181805ff7fbfe6602b4fe65410e63db86e65b24080179ebb53ef7a98941299b9",
+            "tree": "bdab02b408a6ad7f5c90c5b88e840b5551d833fb"
+          },
+          "observations": [],
+          "order": [],
+          "outcome": "candidate",
+          "recipe": "sha256:f6e4a8cda17e883573a252fc20814df4f279d0156fd80bb8fcdf069760feebcb",
+          "repeat": 1,
+          "state": "completed",
+          "wall_ms": 326
+        }
+      ],
+      "scenario": "s1",
+      "state": "completed"
+    },
+    {
+      "accepted": true,
+      "case": "FX07",
+      "infrastructure_errors": 0,
+      "oracle_failures": [],
+      "profile": "mergiraf-html-candidate",
+      "retained_playground": "/private/tmp/aethyme-e1-original-campaign-20261012-d1910b/Playground-E1-DMvdOL",
+      "runs": [
+        {
+          "observations": [],
+          "order": [],
+          "outcome": "inseparable_selection",
+          "repeat": 0,
+          "state": "completed",
+          "wall_ms": 0
+        },
+        {
+          "observations": [],
+          "order": [],
+          "outcome": "inseparable_selection",
+          "repeat": 1,
+          "state": "completed",
+          "wall_ms": 0
+        }
+      ],
+      "scenario": "s2",
+      "state": "completed"
+    },
+    {
+      "accepted": true,
+      "case": "FX07",
+      "infrastructure_errors": 0,
+      "oracle_failures": [],
+      "profile": "mergiraf-html-candidate",
+      "retained_playground": "/private/tmp/aethyme-e1-original-campaign-20261012-d1910b/Playground-E1-4n6Sug",
+      "runs": [
+        {
+          "observations": [],
+          "order": [],
+          "outcome": "inseparable_selection",
+          "repeat": 0,
+          "state": "completed",
+          "wall_ms": 1
+        },
+        {
+          "observations": [],
+          "order": [],
+          "outcome": "inseparable_selection",
+          "repeat": 1,
+          "state": "completed",
+          "wall_ms": 1
+        }
+      ],
+      "scenario": "s3",
+      "state": "completed"
+    }
+  ],
+  "schema": "aethyme.e1.original-fixture-campaign/v1",
+  "state": "completed"
+}

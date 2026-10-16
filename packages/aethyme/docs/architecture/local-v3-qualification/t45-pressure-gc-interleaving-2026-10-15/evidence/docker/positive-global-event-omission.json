@@ -1,0 +1,14 @@
+{
+  "full_postflight_snapshot": {
+    "bytes": 162400,
+    "sha256": "0dd364403b9efabee88ebeb1d8d433216012d09e00f650fd8be3b48e42030542"
+  },
+  "positive_attempt": "corrected bounded Docker build pressure run",
+  "public_payload_included": false,
+  "raw_event_stream": {
+    "bytes": 146458,
+    "sha256": "ba747429b978cadfab42ba93b2f165d403ba2b979f62602d689b32cd57581e39"
+  },
+  "reason": "The fixture removed the journals during successful cleanup, so the exact object-ID union needed to filter the mixed event window is not retained. No owned-event count or global event-derived ownership claim is made.",
+  "schema": "aethyme.t45-private-event-omission/v1"
+}

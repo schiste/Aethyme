@@ -22,6 +22,7 @@
 
 mod advisories;
 pub mod agent_hook;
+pub mod analysis_view;
 mod artifact_catalog;
 mod atomic_file;
 pub mod attribution;
@@ -34,9 +35,24 @@ mod chau7_tabs;
 mod cleanup_audit;
 mod cleanup_resolve;
 mod clock;
+pub mod collaboration_archive;
+pub mod collaboration_capture;
+pub mod collaboration_cli;
+pub mod collaboration_context;
+pub mod collaboration_gc;
+pub mod collaboration_identity_store;
+pub mod collaboration_sensitive;
+pub mod collaboration_state;
+pub mod collaboration_submit;
+pub mod composer;
+pub mod composition;
 mod disk_headroom;
 mod duplicate_work;
 pub mod exit_status;
+pub mod experimental_symbol_mapping;
+pub mod local_capture_notice;
+pub mod native_gates;
+pub mod resolution;
 pub use disk_headroom::{
     DEFAULT_GATE_HEADROOM_BYTES, GateCacheUsage, TEST_AVAILABLE_BYTES_ENV, available_bytes,
     refusal as disk_headroom_refusal,
@@ -64,6 +80,10 @@ pub use gate_debris::{
     RuntimeResource, RuntimeResourceKind,
 };
 mod auto_cleanup;
+pub mod execution_resources;
+pub mod execution_snapshot;
+pub mod execution_supervisor;
+pub mod execution_verifier;
 mod gate_doctor;
 mod gates;
 mod gc;
@@ -71,6 +91,7 @@ mod gh_ref_guard;
 mod git;
 mod github_target;
 mod graph_impact;
+mod graph_impact_envelope;
 mod graph_integrity;
 mod homebrew;
 pub mod hooks;
@@ -83,6 +104,17 @@ pub mod install_replacement;
 mod issue_form;
 mod lease_export;
 mod leases;
+pub mod local_acceptance;
+pub mod local_authority;
+pub mod local_budget;
+pub mod local_controller;
+pub mod local_exchange;
+pub mod local_generation;
+pub mod local_handoff;
+pub mod local_restore;
+pub mod local_source_transport;
+pub mod local_target;
+pub mod local_wave;
 mod main_drift;
 pub mod main_reconcile;
 mod measurement;
@@ -313,6 +345,7 @@ pub use graph_impact::{
     GraphImpactStatus, GraphStoreImpactProvider, diff_digest, parse_diff_text,
     revision_bound_impact_report,
 };
+pub use graph_impact_envelope::{UnbindableImpactReport, impact_analysis_envelope};
 pub use graph_integrity::{
     GraphIntegrityOutcome, GraphIntegrityRejection, GraphIntegrityStatus, GraphIntegrityVerdict,
 };
@@ -548,7 +581,9 @@ pub use rule_comments::{
     RuleCommentWants, own_rule_comments, plan_rule_comments, render_rule_comment,
     rule_comment_wants,
 };
-pub use schema::{EVENTS_SCHEMA_VERSION, SCHEMA_VERSION};
+pub use schema::{
+    COLLABORATION_FENCE_SCHEMA, CollaborationFence, EVENTS_SCHEMA_VERSION, SCHEMA_VERSION,
+};
 pub use scopes::{
     ScopeConflictSeverity, ScopeOverlap, classify as classify_scope_pair, detect_scope_overlaps,
     parse_scope_argument,
@@ -723,3 +758,6 @@ mod broker_db_path_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod local_compatibility;

@@ -1,0 +1,10 @@
+{
+  "args": [
+    "list",
+    "-plist"
+  ],
+  "command": 40,
+  "deadline_seconds": 10,
+  "output_limit_each": 1048576,
+  "program": "/usr/sbin/diskutil"
+}

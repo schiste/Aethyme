@@ -1,0 +1,76 @@
+{
+  "schema": "aethyme.composition-expectations/provisional-v0",
+  "case": "HX06",
+  "title": "Held-out FX06 variant: a different producer/consumer API, a cycle and a competing revision",
+  "plan": "#650 held-out variant of FX06",
+  "scenarios": {
+    "s1": {
+      "title": "",
+      "required_outcomes": [
+        "candidate"
+      ],
+      "behaviors": [
+        {
+          "check": "call_arity",
+          "file": "dates.ts",
+          "function": "parseDate",
+          "consumers": [
+            "event.ts"
+          ]
+        },
+        {
+          "check": "contains",
+          "file": "dates.ts",
+          "text": "zone: string"
+        },
+        {
+          "check": "contains",
+          "file": "event.ts",
+          "text": "\"UTC\""
+        }
+      ],
+      "provisional_text": {
+        "outcome": "candidate",
+        "behavior": "passes",
+        "note": "producer and consumer change different files"
+      }
+    },
+    "s2": {
+      "title": "",
+      "required_outcomes": [
+        "missing_input"
+      ],
+      "behaviors": [],
+      "provisional_text": {
+        "outcome": null,
+        "behavior": null,
+        "note": "planning refusal: decided from lineage, selection and records before any merge engine runs, so the text profile is not measured"
+      }
+    },
+    "s3": {
+      "title": "",
+      "required_outcomes": [
+        "dependency_cycle"
+      ],
+      "behaviors": [],
+      "provisional_text": {
+        "outcome": null,
+        "behavior": null,
+        "note": "planning refusal: decided from lineage, selection and records before any merge engine runs, so the text profile is not measured"
+      }
+    },
+    "s4": {
+      "title": "",
+      "required_outcomes": [
+        "competing_revisions",
+        "missing_input"
+      ],
+      "behaviors": [],
+      "provisional_text": {
+        "outcome": null,
+        "behavior": null,
+        "note": "planning refusal: decided from lineage, selection and records before any merge engine runs, so the text profile is not measured"
+      }
+    }
+  }
+}

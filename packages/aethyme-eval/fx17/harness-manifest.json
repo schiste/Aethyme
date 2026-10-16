@@ -1,0 +1,40 @@
+{
+  "effect_scope": {
+    "artifact": "read-only mounted artifact containing only app.sh",
+    "limitation": "This does not prove complete filesystem-effect absence. The 21 controlled scripts also require the frozen static source review. Any sealed model run requires a separately approved deny-default child/effect-observation design.",
+    "network": "Docker verifier container uses --network none",
+    "scratch": "container /tmp is writable tmpfs; proxy uses it for joined stream capture and removes it on exit"
+  },
+  "expected_transcript": {
+    "derived_from": "independent oracle only; no controlled or candidate source was executed",
+    "format": "FX17V1\\n then id<TAB>actual-exit<TAB>stdout-hex<TAB>stderr-hex<LF> for each frozen case in source order",
+    "path": "oracle/baseline65-proxy-transcript.txt",
+    "rows": 65,
+    "sha256": "db545a7b7e8f18a9dbeb6931dc327f99a6e8d074d039d08d60dfc57ff208d8bb"
+  },
+  "frozen_proposal_manifest_sha256": "b3846f2fcca9bc8fb3bbcad26c0adedbc96fba723eddbbb174a9f3545ba11abc",
+  "independent_oracle": {
+    "cases": 65,
+    "path": "oracle/baseline-cases.json",
+    "provenance_sha256": "6c6205982af3a7fc20d3e62134e4b30d9ad5ee7b3bb8f424a005a3296083829f",
+    "sha256": "bfbec841810ac9269b34c628969a4c8207809b70716753d979750ecedb605a06",
+    "source_review_sha256": "de7d56d9cc37f68787540e298bd49577c3fdf83b51544e3113aed4928eebb74e"
+  },
+  "outer_inventory": {
+    "case_count": 1,
+    "case_id": "fx17-baseline65-proxy-transcript",
+    "expected_exit_code": 0,
+    "expected_stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "expected_stdout_sha256": "db545a7b7e8f18a9dbeb6931dc327f99a6e8d074d039d08d60dfc57ff208d8bb",
+    "rationale": "The native verifier limits each inventory to 32 cases; one independent transcript digest covers all 65 required vectors without changing verifier semantics or dropping cases."
+  },
+  "profile": "aethyme.fx17-controlled-evolution-harness/v1",
+  "proxy": {
+    "candidate_exit_codes_and_streams": "transported as tabular rows with lowercase hex streams; proxy exits zero only when the full transcript is emitted",
+    "literal_shell_command_bytes": 3097,
+    "path": "proxy.sh",
+    "sha256": "eae502e3245a6cb750d64828063e793732cfa3a8481f8ff6753dcacad63ee2ff",
+    "subject_argv": "/bin/sh /artifact/app.sh <each frozen argv vector>"
+  },
+  "public_contract_sha256": "81d22e805fe6fa48424b1c83fe3bf54d1c9d0e76e5bb14d9cc8c20e84f3be13a"
+}

@@ -1,0 +1,81 @@
+
+running 15 tests
+test native_gates::tests::a_dispatched_job_reopens_unknown_without_any_retry ... 
+thread 'native_gates::tests::a_dispatched_job_reopens_unknown_without_any_retry' (26759496) panicked at crates/aethyme-broker/src/local_target/tests.rs:100:6:
+called `Result::unwrap()` on an `Err` value: InsideGitWorktree { root: "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/reconcile-retention-of-inactive-native-g/target/local-resume/final-integration-20261015T111345Z/native-gates-cached-serial-d524-20261015-tmp/.tmp8ZFPuP/collaboration", worktree: "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/reconcile-retention-of-inactive-native-g" }
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+test native_gates::tests::actual_composer_candidate_runs_native_gates_without_legacy_queue_or_ref_writes ... 
+thread 'native_gates::tests::actual_composer_candidate_runs_native_gates_without_legacy_queue_or_ref_writes' (26759551) panicked at crates/aethyme-broker/src/local_target/tests.rs:100:6:
+called `Result::unwrap()` on an `Err` value: InsideGitWorktree { root: "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/reconcile-retention-of-inactive-native-g/target/local-resume/final-integration-20261015T111345Z/native-gates-cached-serial-d524-20261015-tmp/.tmp8dNSP7/collaboration", worktree: "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/reconcile-retention-of-inactive-native-g" }
+FAILED
+test native_gates::tests::budget_capacity_and_requirement_holds_do_not_dispatch_prepared_jobs ... 
+thread 'native_gates::tests::budget_capacity_and_requirement_holds_do_not_dispatch_prepared_jobs' (26759571) panicked at crates/aethyme-broker/src/local_target/tests.rs:100:6:
+called `Result::unwrap()` on an `Err` value: InsideGitWorktree { root: "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/reconcile-retention-of-inactive-native-g/target/local-resume/final-integration-20261015T111345Z/native-gates-cached-serial-d524-20261015-tmp/.tmpl1d5CY/collaboration", worktree: "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/reconcile-retention-of-inactive-native-g" }
+FAILED
+test native_gates::tests::checkout_placement_refuses_upward_project_discovery ... 
+thread 'native_gates::tests::checkout_placement_refuses_upward_project_discovery' (26759632) panicked at crates/aethyme-broker/src/native_gates/tests.rs:336:67:
+called `Result::unwrap()` on an `Err` value: Unsupported("native checkout must be outside enclosing repositories and project manifests")
+FAILED
+test native_gates::tests::completed_job_release_survives_real_gc_and_reopened_status_reads ... 
+thread 'native_gates::tests::completed_job_release_survives_real_gc_and_reopened_status_reads' (26759633) panicked at crates/aethyme-broker/src/local_target/tests.rs:100:6:
+called `Result::unwrap()` on an `Err` value: InsideGitWorktree { root: "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/reconcile-retention-of-inactive-native-g/target/local-resume/final-integration-20261015T111345Z/native-gates-cached-serial-d524-20261015-tmp/.tmpVrbHbX/collaboration", worktree: "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/reconcile-retention-of-inactive-native-g" }
+FAILED
+test native_gates::tests::corrupt_projected_job_identity_and_source_binding_refuse_before_dispatch ... 
+thread 'native_gates::tests::corrupt_projected_job_identity_and_source_binding_refuse_before_dispatch' (26759680) panicked at crates/aethyme-broker/src/local_target/tests.rs:100:6:
+called `Result::unwrap()` on an `Err` value: InsideGitWorktree { root: "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/reconcile-retention-of-inactive-native-g/target/local-resume/final-integration-20261015T111345Z/native-gates-cached-serial-d524-20261015-tmp/.tmpSHl9cp/collaboration", worktree: "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/reconcile-retention-of-inactive-native-g" }
+FAILED
+test native_gates::tests::dispatching_and_unknown_jobs_stay_rooted_without_a_process_tree_proof ... 
+thread 'native_gates::tests::dispatching_and_unknown_jobs_stay_rooted_without_a_process_tree_proof' (26759716) panicked at crates/aethyme-broker/src/local_target/tests.rs:100:6:
+called `Result::unwrap()` on an `Err` value: InsideGitWorktree { root: "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/reconcile-retention-of-inactive-native-g/target/local-resume/final-integration-20261015T111345Z/native-gates-cached-serial-d524-20261015-tmp/.tmputcODw/collaboration", worktree: "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/reconcile-retention-of-inactive-native-g" }
+FAILED
+test native_gates::tests::fresh_dispatch_refuses_a_job_completed_after_the_callers_snapshot ... 
+thread 'native_gates::tests::fresh_dispatch_refuses_a_job_completed_after_the_callers_snapshot' (26759756) panicked at crates/aethyme-broker/src/local_target/tests.rs:100:6:
+called `Result::unwrap()` on an `Err` value: InsideGitWorktree { root: "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/reconcile-retention-of-inactive-native-g/target/local-resume/final-integration-20261015T111345Z/native-gates-cached-serial-d524-20261015-tmp/.tmpp7oPs2/collaboration", worktree: "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/reconcile-retention-of-inactive-native-g" }
+FAILED
+test native_gates::tests::native_gate_roots_survive_revision_root_release ... 
+thread 'native_gates::tests::native_gate_roots_survive_revision_root_release' (26759782) panicked at crates/aethyme-broker/src/local_target/tests.rs:100:6:
+called `Result::unwrap()` on an `Err` value: InsideGitWorktree { root: "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/reconcile-retention-of-inactive-native-g/target/local-resume/final-integration-20261015T111345Z/native-gates-cached-serial-d524-20261015-tmp/.tmpUjuWtY/collaboration", worktree: "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/reconcile-retention-of-inactive-native-g" }
+FAILED
+test native_gates::tests::no_gate_configuration_is_explicitly_not_verification ... 
+thread 'native_gates::tests::no_gate_configuration_is_explicitly_not_verification' (26759823) panicked at crates/aethyme-broker/src/local_target/tests.rs:100:6:
+called `Result::unwrap()` on an `Err` value: InsideGitWorktree { root: "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/reconcile-retention-of-inactive-native-g/target/local-resume/final-integration-20261015T111345Z/native-gates-cached-serial-d524-20261015-tmp/.tmpZuVvbe/collaboration", worktree: "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/reconcile-retention-of-inactive-native-g" }
+FAILED
+test native_gates::tests::physical_subject_includes_mode_symlink_target_and_untracked_source ... ok
+test native_gates::tests::prepared_job_cannot_borrow_another_repository_trust_or_survive_revocation ... 
+thread 'native_gates::tests::prepared_job_cannot_borrow_another_repository_trust_or_survive_revocation' (26759857) panicked at crates/aethyme-broker/src/local_target/tests.rs:100:6:
+called `Result::unwrap()` on an `Err` value: InsideGitWorktree { root: "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/reconcile-retention-of-inactive-native-g/target/local-resume/final-integration-20261015T111345Z/native-gates-cached-serial-d524-20261015-tmp/.tmpHkLsD4/collaboration", worktree: "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/reconcile-retention-of-inactive-native-g" }
+FAILED
+test native_gates::tests::released_prepared_job_remains_readable_but_cannot_be_dispatched_or_replayed ... 
+thread 'native_gates::tests::released_prepared_job_remains_readable_but_cannot_be_dispatched_or_replayed' (26759878) panicked at crates/aethyme-broker/src/local_target/tests.rs:100:6:
+called `Result::unwrap()` on an `Err` value: InsideGitWorktree { root: "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/reconcile-retention-of-inactive-native-g/target/local-resume/final-integration-20261015T111345Z/native-gates-cached-serial-d524-20261015-tmp/.tmp9MmlZf/collaboration", worktree: "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/reconcile-retention-of-inactive-native-g" }
+FAILED
+test native_gates::tests::root_release_waits_for_an_in_progress_gc_generation ... 
+thread 'native_gates::tests::root_release_waits_for_an_in_progress_gc_generation' (26759911) panicked at crates/aethyme-broker/src/local_target/tests.rs:100:6:
+called `Result::unwrap()` on an `Err` value: InsideGitWorktree { root: "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/reconcile-retention-of-inactive-native-g/target/local-resume/final-integration-20261015T111345Z/native-gates-cached-serial-d524-20261015-tmp/.tmpbS9m5X/collaboration", worktree: "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/reconcile-retention-of-inactive-native-g" }
+FAILED
+test native_gates::tests::stale_owner_cannot_release_but_current_owner_can_release_old_epoch_history ... 
+thread 'native_gates::tests::stale_owner_cannot_release_but_current_owner_can_release_old_epoch_history' (26759985) panicked at crates/aethyme-broker/src/local_target/tests.rs:100:6:
+called `Result::unwrap()` on an `Err` value: InsideGitWorktree { root: "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/reconcile-retention-of-inactive-native-g/target/local-resume/final-integration-20261015T111345Z/native-gates-cached-serial-d524-20261015-tmp/.tmp8QQQpJ/collaboration", worktree: "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/reconcile-retention-of-inactive-native-g" }
+FAILED
+
+failures:
+
+failures:
+    native_gates::tests::a_dispatched_job_reopens_unknown_without_any_retry
+    native_gates::tests::actual_composer_candidate_runs_native_gates_without_legacy_queue_or_ref_writes
+    native_gates::tests::budget_capacity_and_requirement_holds_do_not_dispatch_prepared_jobs
+    native_gates::tests::checkout_placement_refuses_upward_project_discovery
+    native_gates::tests::completed_job_release_survives_real_gc_and_reopened_status_reads
+    native_gates::tests::corrupt_projected_job_identity_and_source_binding_refuse_before_dispatch
+    native_gates::tests::dispatching_and_unknown_jobs_stay_rooted_without_a_process_tree_proof
+    native_gates::tests::fresh_dispatch_refuses_a_job_completed_after_the_callers_snapshot
+    native_gates::tests::native_gate_roots_survive_revision_root_release
+    native_gates::tests::no_gate_configuration_is_explicitly_not_verification
+    native_gates::tests::prepared_job_cannot_borrow_another_repository_trust_or_survive_revocation
+    native_gates::tests::released_prepared_job_remains_readable_but_cannot_be_dispatched_or_replayed
+    native_gates::tests::root_release_waits_for_an_in_progress_gc_generation
+    native_gates::tests::stale_owner_cannot_release_but_current_owner_can_release_old_epoch_history
+
+test result: FAILED. 1 passed; 14 failed; 0 ignored; 0 measured; 1805 filtered out; finished in 1.36s
+

@@ -1,0 +1,35 @@
+{
+  "all_mutated_files_restored": true,
+  "base_head": "425a0bc8e41031cea6b0ff8b5bc0e9cc80748b31",
+  "base_tree": "01f8a9f6a51818732cf6feb38125a34c81745d5b",
+  "case": "m4-publish-database-receipt-before-table-delete",
+  "exact_named_test_failed": true,
+  "exit_code": 101,
+  "expected_failure_fragment": "left: Some(",
+  "expected_failure_fragment_present": true,
+  "finished_at_utc": "2026-10-15T21:53:07.937595+00:00",
+  "full_source_inventory_restored": true,
+  "full_source_inventory_sha256_after": "8e0cb59f3ee0bbb19980dbbd6f49e8333633b20e323901fccb174bb7f6ab93c3",
+  "full_source_inventory_sha256_before": "8e0cb59f3ee0bbb19980dbbd6f49e8333633b20e323901fccb174bb7f6ab93c3",
+  "log_bytes": 1212,
+  "log_sha256": "0bd3bf092aaaeffef40be84498d968fa79efcccc2e1d6cd4c478f2616314f475",
+  "mutation_oracle_credit": true,
+  "mutation_patch_sha256": "b4eddc19933240373d4146fdd127d8fbc910d8636b5ac5e707cdec1296174795",
+  "pid": 627,
+  "restored_source_files": {
+    "packages/aethyme/rust/crates/aethyme-broker/src/collaboration_sensitive.rs": {
+      "byte_identical": true,
+      "expected_bytes": 193627,
+      "expected_sha256": "cbc9ee50c65628f145d9d7fd3180e3f5f73a21ffaab01e7b6dcefe7b8a4b9ac1",
+      "restored_bytes": 193627,
+      "restored_sha256": "cbc9ee50c65628f145d9d7fd3180e3f5f73a21ffaab01e7b6dcefe7b8a4b9ac1"
+    }
+  },
+  "started_at_utc": "2026-10-15T21:52:47.123903+00:00",
+  "status_written_at_utc": "2026-10-15T21:53:08.277692+00:00",
+  "test_summary": {
+    "failed": 1,
+    "ignored": 0,
+    "passed": 0
+  }
+}

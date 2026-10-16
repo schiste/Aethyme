@@ -1,0 +1,10 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.03s
+     Running tests/symbol_identity_vectors.rs (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/integrate-reviewed-local-bare-git-servic/target/local-resume/cargo/debug/deps/symbol_identity_vectors-d75383bf9791b54b)
+
+running 3 tests
+test symbol_record_schema_is_selected_from_the_encoded_schema ... ok
+test malformed_ids_and_noncanonical_or_oversized_inputs_fail_closed ... ok
+test frozen_vectors_bind_the_independent_canonical_profile_and_domain ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+

@@ -1,0 +1,101 @@
+{
+  "schema": "aethyme.composition-expectations/provisional-v0",
+  "case": "FX06",
+  "title": "Atomic producer/consumer change, a dependency cycle, and competing prerequisite revisions",
+  "plan": "#650 FX06; plan v3 §7.2 rows 'cross-file API/caller change' and 'cyclic prerequisites or conflicting prerequisite revisions'; §7.3 step 2; T21 stays in Q3",
+  "scenarios": {
+    "s1": {
+      "title": "producer c1 and its consumer c3",
+      "required_outcomes": [
+        "candidate"
+      ],
+      "behaviors": [
+        {
+          "check": "call_arity",
+          "file": "price.ts",
+          "function": "formatPrice",
+          "consumers": [
+            "cart.ts"
+          ]
+        },
+        {
+          "check": "contains",
+          "file": "price.ts",
+          "text": "currency: string"
+        },
+        {
+          "check": "contains",
+          "file": "cart.ts",
+          "text": "\"EUR\""
+        }
+      ],
+      "provisional_text": {
+        "outcome": "candidate",
+        "behavior": "passes",
+        "note": "producer and consumer change different files"
+      }
+    },
+    "s2": {
+      "title": "consumer c3 without its pinned prerequisite c1",
+      "required_outcomes": [
+        "missing_input"
+      ],
+      "behaviors": [],
+      "provisional_text": {
+        "outcome": null,
+        "behavior": null,
+        "note": "planning refusal: decided from lineage, selection and records before any merge engine runs, so the text profile is not measured"
+      }
+    },
+    "s3": {
+      "title": "producer c1 without the rest of atomic group g1",
+      "required_outcomes": [
+        "missing_input",
+        "inseparable_selection"
+      ],
+      "behaviors": [],
+      "provisional_text": {
+        "outcome": null,
+        "behavior": null,
+        "note": "planning refusal: decided from lineage, selection and records before any merge engine runs, so the text profile is not measured"
+      }
+    },
+    "s4": {
+      "title": "c4 and c5 require each other",
+      "required_outcomes": [
+        "dependency_cycle"
+      ],
+      "behaviors": [],
+      "provisional_text": {
+        "outcome": null,
+        "behavior": null,
+        "note": "planning refusal: decided from lineage, selection and records before any merge engine runs, so the text profile is not measured"
+      }
+    },
+    "s5": {
+      "title": "two revisions (c1, c2) of the same producer selected together",
+      "required_outcomes": [
+        "competing_revisions"
+      ],
+      "behaviors": [],
+      "provisional_text": {
+        "outcome": null,
+        "behavior": null,
+        "note": "planning refusal: decided from lineage, selection and records before any merge engine runs, so the text profile is not measured"
+      }
+    },
+    "s6": {
+      "title": "c3 pins c1 exactly, but the selection has c1's other revision c2",
+      "required_outcomes": [
+        "competing_revisions",
+        "missing_input"
+      ],
+      "behaviors": [],
+      "provisional_text": {
+        "outcome": null,
+        "behavior": null,
+        "note": "planning refusal: decided from lineage, selection and records before any merge engine runs, so the text profile is not measured"
+      }
+    }
+  }
+}

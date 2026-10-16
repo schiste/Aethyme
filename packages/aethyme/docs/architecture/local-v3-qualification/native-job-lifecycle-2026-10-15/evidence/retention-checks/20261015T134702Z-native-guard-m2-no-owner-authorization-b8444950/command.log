@@ -1,0 +1,51 @@
+MUTATION_RUNNER_SHA256=b78af5398d30f7302854271b4228648e4cc30e8c66c4593759622ce7c9d7f1f3
+MUTATOR_SHA256=0b2e660db3c4b5bf39faada40c15205768cfa23e08b8cad54f011417a9cd0d8a
+MUTANT=m2-release-without-owner-authorization
+TEST_FILTER=stale_owner_cannot_release_but_current_owner_can_release_old_epoch_history
+SOURCE=/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/reconcile-retention-of-inactive-native-g/packages/aethyme/rust/crates/aethyme-broker/src/native_gates.rs
+ORIGINAL_SHA256=e17607f4b349556be3eb38651e8bd270087c84d3023c7b767b3308293aa838b5
+MUTATION_BACKUP=/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/reconcile-retention-of-inactive-native-g/target/local-resume/mutation-backups/m2-release-without-owner-authorization.73zwDd
+ORIGINAL_SHA256=e17607f4b349556be3eb38651e8bd270087c84d3023c7b767b3308293aa838b5
+MUTANT_SHA256=1c9c88afb3b65162426e99a108db96078c5384560fbd1b856ad73d38f129e00c
+APPLIED_SHA256=1c9c88afb3b65162426e99a108db96078c5384560fbd1b856ad73d38f129e00c
+DIFF_BEGIN
+--- /Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/reconcile-retention-of-inactive-native-g/target/local-resume/mutation-backups/m2-release-without-owner-authorization.73zwDd	2026-10-15 12:48:30
++++ /Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/reconcile-retention-of-inactive-native-g/packages/aethyme/rust/crates/aethyme-broker/src/native_gates.rs	2026-10-15 15:47:03
+@@ -307,7 +307,7 @@
+     owner: &ControllerOwner,
+     key: &RecordId,
+ ) -> Result<RootRelease, NativeGateError> {
+-    let _authority = target::authorize(store, owner)?;
++    // MUTATION: target-owner authorization guard removed.
+     let _archive = crate::collaboration_gc::archive_use(store)?;
+     let tx = store
+         .connection()
+DIFF_END
+MUTANT_SOURCE_SHA256=1c9c88afb3b65162426e99a108db96078c5384560fbd1b856ad73d38f129e00c
+CARGO_LOG_PATH=/Volumes/T7-repositories/Application Support/Aethyme/qualification/local-check-temporaries/native-guard-m2-no-owner-authorization-tmp-fypkx08j/native-retention-m2-release-without-owner-authorization-cargo.ewbCEj
+CARGO_EXIT=101
+   Compiling aethyme-broker v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/reconcile-retention-of-inactive-native-g/packages/aethyme/rust/crates/aethyme-broker)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 28.77s
+     Running unittests src/lib.rs (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/integrate-reviewed-local-bare-git-servic/target/local-resume/cargo/debug/deps/aethyme_broker-0f278e0d02146111)
+
+running 1 test
+test native_gates::tests::stale_owner_cannot_release_but_current_owner_can_release_old_epoch_history ... 
+thread 'native_gates::tests::stale_owner_cannot_release_but_current_owner_can_release_old_epoch_history' (494859) panicked at crates/aethyme-broker/src/native_gates/tests.rs:876:5:
+assertion failed: release_roots(&mut s.f.store,
+        s.owner.as_ref().expect("stale setup owner is retained"),
+        &job.id).is_err()
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+
+failures:
+    native_gates::tests::stale_owner_cannot_release_but_current_owner_can_release_old_epoch_history
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1819 filtered out; finished in 25.30s
+
+error: test failed, to rerun pass `-p aethyme-broker --lib`
+NAMED_ASSERTION_FAILURE_CONFIRMED=native_gates::tests::stale_owner_cannot_release_but_current_owner_can_release_old_epoch_history
+RESTORED_SHA256=e17607f4b349556be3eb38651e8bd270087c84d3023c7b767b3308293aa838b5
+BACKUP_PATH=/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/reconcile-retention-of-inactive-native-g/target/local-resume/mutation-backups/m2-release-without-owner-authorization.73zwDd
+BACKUP_SHA256=e17607f4b349556be3eb38651e8bd270087c84d3023c7b767b3308293aa838b5

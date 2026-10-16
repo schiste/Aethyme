@@ -1,0 +1,110 @@
+{
+  "argv": [
+    "/usr/bin/caffeinate",
+    "-i",
+    "/Users/christophehenner/.cargo/bin/cargo",
+    "test",
+    "--locked",
+    "-j",
+    "4",
+    "-p",
+    "aethyme-broker",
+    "--lib",
+    "--",
+    "--ignored",
+    "--exact",
+    "local_controller::drive::tests::fx17::actual_fx17_twenty_controlled_changes_preserve_all_65_vectors",
+    "--nocapture"
+  ],
+  "attempt": "actual-fx17-twenty-stage-attempt3",
+  "cargo_started_at_utc": "2026-10-15T08:38:43.413305+00:00",
+  "elapsed_seconds": 564.769,
+  "environment": {
+    "AETHYME_DOCKER_CLI": "/opt/homebrew/bin/docker",
+    "AETHYME_DOCKER_TEST_IMAGE": "sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251",
+    "CARGO_TARGET_DIR": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/integrate-reviewed-local-bare-git-servic/target/local-resume/cargo",
+    "HOME": "/Users/christophehenner",
+    "PATH": "/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/christophehenner/.cargo/bin",
+    "RUSTC_WRAPPER": "",
+    "TMPDIR": "/var/folders/f2/krjzd4c15nn491pm37zrkp1h0000gn/T/"
+  },
+  "finished_at_utc": "2026-10-15T08:48:08.312463+00:00",
+  "finite_profile": {
+    "appointments": 20,
+    "assertions": {
+      "actual_changes": 20,
+      "baseline_vectors": 65,
+      "frozen_controlled_states": 21,
+      "model_exports": 0
+    },
+    "cargo_jobs": 4,
+    "cargo_profile": "test (default, non-release)",
+    "docker_resources": {
+      "disk_mib": 2048,
+      "job_slots": 2,
+      "memory_mib": 2048,
+      "process_slots": 1024
+    },
+    "execution_limits": {
+      "artifact_mount": "read-only",
+      "memory_bytes": 67108864,
+      "network": "disabled",
+      "output_bytes": 1048576,
+      "process_ids": 32,
+      "timeout_ms": 60000
+    },
+    "per_appointment": {
+      "completions": 1,
+      "expected_ticks": 1,
+      "max_drive_wall_ms": 900000,
+      "max_elapsed_ms": 900000,
+      "max_ticks": 2,
+      "poll_ms": 20
+    },
+    "project_budget": {
+      "disk_bytes": 137438953472,
+      "memory_bytes": 68719476736,
+      "slots": 200,
+      "time_ms": 1000000000
+    },
+    "test_threads": "Rust test harness default; exact filter selects one test"
+  },
+  "log": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/implement-the-actual-fx17-20-controlled/target/local-resume/actual-fx17-twenty-stage-attempt3.log",
+  "numeric_exit_code": 0,
+  "pinned_image": {
+    "inspect_argv": [
+      "/opt/homebrew/bin/docker",
+      "image",
+      "inspect",
+      "--format={{.Id}}",
+      "sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251"
+    ],
+    "inspect_status": 0,
+    "inspect_stderr": "",
+    "inspect_stdout": "sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251",
+    "inspected_id": "sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251",
+    "requested": "sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251"
+  },
+  "preflight": "passed",
+  "report_copied": true,
+  "report_copy": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/implement-the-actual-fx17-20-controlled/target/local-resume/actual-fx17-twenty-stage-attempt3-report.json",
+  "report_copy_sha256": "2b6fbc67bf093b1e248bedba3e8117b950d2fe9eb8983a31b3dfe8bf6420cec4",
+  "report_source": "/var/folders/f2/krjzd4c15nn491pm37zrkp1h0000gn/T/.tmpR2Cdzn/fx17-report.json",
+  "source": {
+    "head": "c45d4096f9d0238b800ccadbeb07f9b93ae30a3e",
+    "status_porcelain": "",
+    "tree": "874654af26ac7fd9bbaa9bedbc7a04fa8a834e40"
+  },
+  "source_unchanged": {
+    "head": "c45d4096f9d0238b800ccadbeb07f9b93ae30a3e",
+    "status_porcelain": "",
+    "tree": "874654af26ac7fd9bbaa9bedbc7a04fa8a834e40"
+  },
+  "started_at_utc": "2026-10-15T08:38:43.411966+00:00",
+  "status_file": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/implement-the-actual-fx17-20-controlled/target/local-resume/actual-fx17-twenty-stage-attempt3.status",
+  "test_result_lines": [
+    "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1798 filtered out; finished in 462.53s"
+  ],
+  "workspace": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/implement-the-actual-fx17-20-controlled/packages/aethyme/rust",
+  "worktree": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/implement-the-actual-fx17-20-controlled"
+}

@@ -1,0 +1,25 @@
+{
+  "schema": "aethyme.local-ci-command-result/v1",
+  "id": "ci-785-69e820-workspace-cancelled",
+  "pr": 785,
+  "branch_head": "69e8202a64dea2d2aa45d64ce89b223fc76b48a1",
+  "ci_checkout_commit": "598c32c7a6aa40963c4caa80ac8c6da940c415a9",
+  "ci_checkout_tree": "15909c7cedd2814486d35fd773a085885bef844c",
+  "ci_checkout_parents": [
+    "8daffab2bb80ae0cce8286c530d70fad42c033f5",
+    "69e8202a64dea2d2aa45d64ce89b223fc76b48a1"
+  ],
+  "job_url": "https://github.com/schiste/Aethyme/actions/runs/38799703441/job/116645605119",
+  "conclusion": "CANCELLED",
+  "numeric_exit": null,
+  "test_commands_completed": 0,
+  "failure": "The workspace command was cancelled before completion. Fifteen distinct first-attempt failures all reported UnknownWork in controls whose shared fixture retained a verifying wave. Retries and the incomplete raw schedule are preserved. No completed-suite denominator or passing command is credited.",
+  "credited_as_passing_command": false,
+  "log_sha256": "7d764d325c60d09c6fad76191f21cb38bc67404743d45704f15c773f2c8ef90f",
+  "scope": "Actual GitHub merge-ref checkout and full original log, distinct from a completed passing run or later fixed source.",
+  "observed_distinct_first_attempt_failures": 15,
+  "tests_run": null,
+  "tests_passed": null,
+  "tests_failed": null,
+  "tests_skipped": null
+}

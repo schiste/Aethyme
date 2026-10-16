@@ -1,0 +1,79 @@
+--- a/packages/aethyme/rust/crates/aethyme-broker/tests/symbol_identity_binding.rs
++++ b/packages/aethyme/rust/crates/aethyme-broker/tests/symbol_identity_binding.rs
+@@
+     Exact,
+     CrossProject,
+     SameClone,
++    CloneBindingMismatch,
+     SourceMismatch,
+@@
+-    let right_clone_in_records = if matches!(scenario, RecordScenario::SameClone) {
+-        left_clone.clone()
+-    } else {
+-        right_clone.clone()
++    let right_clone_in_records = match scenario {
++        RecordScenario::SameClone => left_clone.clone(),
++        RecordScenario::CloneBindingMismatch => rid("clone-c"),
++        _ => right_clone.clone(),
+@@
+-    let (mapping, mapping_bytes) = canonical_record(mapping_value);
+-    let mapping_id = record_id(&mapping);
++    let (mapping_id, mapping_bytes) = if matches!(
++        scenario,
++        RecordScenario::SameClone | RecordScenario::AliasedOrigin
++    ) {
++        (
++            rid("invalid mapping record"),
++            serde_json::to_vec(&mapping_value).unwrap(),
++        )
++    } else {
++        let (mapping, bytes) = canonical_record(mapping_value);
++        (record_id(&mapping), bytes)
++    };
+@@
+-        (RecordScenario::SameClone, "captured_clone_binding_mismatch"),
++        (RecordScenario::SameClone, "invalid_evidence_record"),
++        (
++            RecordScenario::CloneBindingMismatch,
++            "captured_clone_binding_mismatch",
++        ),
+@@
+-        (RecordScenario::AliasedOrigin, "evidence_set_not_exact"),
++        (RecordScenario::AliasedOrigin, "invalid_evidence_record"),
+@@
+     let fixture = mapping_fixture(&clones, RecordScenario::Exact);
+     let records: Vec<&[u8]> = fixture.records.iter().map(Vec::as_slice).collect();
++    let right_observation = decode_symbol_identity_record(&fixture.records[2]).unwrap();
++    let right_observation_id = right_observation.id();
++    let mut wrong_evidence_claim: Value = serde_json::from_slice(&fixture.claim).unwrap();
++    let first_origin = wrong_evidence_claim["evidence"][0]
++        .as_str()
++        .unwrap()
++        .to_owned();
++    let mut wrong_evidence_refs = [
++        first_origin,
++        right_observation_id.as_str().to_owned(),
++    ];
++    wrong_evidence_refs.sort();
++    wrong_evidence_claim["evidence"] = json!(wrong_evidence_refs);
++    let wrong_evidence_claim = serde_json::to_vec(&wrong_evidence_claim).unwrap();
++    assert!(matches!(
++        resolve_within_binding(&fixture.binding, &wrong_evidence_claim, &records),
++        MappingResolution::Unknown("evidence_set_not_exact")
++    ));
++
+     let malformed: &[u8] = b"not-json";
+@@
+-    let established_wire = claim_with_state(&fixture.claim, "established");
++    let unknown_wire = claim_with_state(&fixture.claim, "unknown");
+     assert!(matches!(
+-        resolve_within_binding(&fixture.binding, &established_wire, &records),
++        resolve_within_binding(&fixture.binding, &unknown_wire, &records),
+         MappingResolution::Unknown("claim_not_proposed")
+     ));
++    let established_wire = claim_with_state(&fixture.claim, "established");
++    assert!(matches!(
++        resolve_within_binding(&fixture.binding, &established_wire, &records),
++        MappingResolution::Unknown("invalid_or_non_claim_record")
++    ));
+*** End Patch

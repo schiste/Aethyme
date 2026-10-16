@@ -1,0 +1,35 @@
+   Compiling aethyme-testkit v0.1.0 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/682-reconcile-final-local-qualification/packages/aethyme/rust/crates/aethyme-testkit)
+   Compiling aethyme-contracts v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/682-reconcile-final-local-qualification/packages/aethyme/rust/crates/aethyme-contracts)
+   Compiling aethyme-broker v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/682-reconcile-final-local-qualification/packages/aethyme/rust/crates/aethyme-broker)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 3.10s
+     Running unittests examples/homebrew_formula.rs (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/integrate-reviewed-local-bare-git-servic/target/local-resume/cargo/debug/examples/homebrew_formula-cbcb6116eee68812)
+
+running 4 tests
+test tests::release_binding_accepts_the_exact_tag_and_source_commit ... ok
+test tests::release_binding_rejects_a_different_source_commit ... ok
+test tests::release_binding_rejects_a_tag_for_another_manifest_version ... ok
+test tests::release_binding_rejects_tags_without_the_release_prefix ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests examples/release_manifest.rs (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/integrate-reviewed-local-bare-git-servic/target/local-resume/cargo/debug/examples/release_manifest-3e8e260f717cac40)
+
+running 3 tests
+test tests::manifest_covers_every_supported_archive_and_compatibility_boundary ... ok
+test tests::outputs_include_manifest_and_standalone_checksums ... ok
+test tests::manifest_rejects_tag_sha_channel_and_archive_drift ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running unittests examples/check_brief.rs (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/integrate-reviewed-local-bare-git-servic/target/local-resume/cargo/debug/examples/check_brief-0cc40cf6e5398d5c)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests examples/release_notes.rs (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/integrate-reviewed-local-bare-git-servic/target/local-resume/cargo/debug/examples/release_notes-38ab00feee3a7327)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

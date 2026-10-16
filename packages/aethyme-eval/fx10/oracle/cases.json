@@ -1,0 +1,173 @@
+[
+  {
+    "id": "lookup_alpha",
+    "arguments": [
+      "lookup",
+      "alpha"
+    ],
+    "stdin_hex": "",
+    "exit_code": 0,
+    "stdout": "Alpine|08:10\n",
+    "stderr": ""
+  },
+  {
+    "id": "lookup_beta",
+    "arguments": [
+      "lookup",
+      "beta"
+    ],
+    "stdin_hex": "",
+    "exit_code": 0,
+    "stdout": "Coastal|08:25\n",
+    "stderr": ""
+  },
+  {
+    "id": "lookup_gamma",
+    "arguments": [
+      "lookup",
+      "gamma"
+    ],
+    "stdin_hex": "",
+    "exit_code": 0,
+    "stdout": "River|08:40\n",
+    "stderr": ""
+  },
+  {
+    "id": "lookup_delta",
+    "arguments": [
+      "lookup",
+      "delta"
+    ],
+    "stdin_hex": "",
+    "exit_code": 0,
+    "stdout": "Garden|08:55\n",
+    "stderr": ""
+  },
+  {
+    "id": "lookup_epsilon",
+    "arguments": [
+      "lookup",
+      "epsilon"
+    ],
+    "stdin_hex": "",
+    "exit_code": 0,
+    "stdout": "Harbor|09:10\n",
+    "stderr": ""
+  },
+  {
+    "id": "lookup_zeta",
+    "arguments": [
+      "lookup",
+      "zeta"
+    ],
+    "stdin_hex": "",
+    "exit_code": 0,
+    "stdout": "Market|09:25\n",
+    "stderr": ""
+  },
+  {
+    "id": "list",
+    "arguments": [
+      "list"
+    ],
+    "stdin_hex": "",
+    "exit_code": 0,
+    "stdout": "alpha\nbeta\ngamma\ndelta\nepsilon\nzeta\n",
+    "stderr": ""
+  },
+  {
+    "id": "arity_zero",
+    "arguments": [],
+    "stdin_hex": "",
+    "exit_code": 2,
+    "stdout": "",
+    "stderr": "usage: lookup KEY | list\n"
+  },
+  {
+    "id": "lookup_missing",
+    "arguments": [
+      "lookup"
+    ],
+    "stdin_hex": "",
+    "exit_code": 2,
+    "stdout": "",
+    "stderr": "usage: lookup KEY | list\n"
+  },
+  {
+    "id": "lookup_extra",
+    "arguments": [
+      "lookup",
+      "alpha",
+      "extra"
+    ],
+    "stdin_hex": "",
+    "exit_code": 2,
+    "stdout": "",
+    "stderr": "usage: lookup KEY | list\n"
+  },
+  {
+    "id": "mode_unknown",
+    "arguments": [
+      "route"
+    ],
+    "stdin_hex": "",
+    "exit_code": 2,
+    "stdout": "",
+    "stderr": "usage: lookup KEY | list\n"
+  },
+  {
+    "id": "lookup_unknown",
+    "arguments": [
+      "lookup",
+      "eta"
+    ],
+    "stdin_hex": "",
+    "exit_code": 2,
+    "stdout": "",
+    "stderr": "usage: lookup KEY | list\n"
+  },
+  {
+    "id": "lookup_shell_sequence",
+    "arguments": [
+      "lookup",
+      "alpha; printf INJECTED"
+    ],
+    "stdin_hex": "",
+    "exit_code": 2,
+    "stdout": "",
+    "stderr": "usage: lookup KEY | list\n"
+  },
+  {
+    "id": "lookup_command_substitution",
+    "arguments": [
+      "lookup",
+      "$(printf alpha)"
+    ],
+    "stdin_hex": "",
+    "exit_code": 2,
+    "stdout": "",
+    "stderr": "usage: lookup KEY | list\n"
+  },
+  {
+    "id": "mode_upper_lookup",
+    "arguments": [
+      "LOOKUP",
+      "alpha"
+    ],
+    "stdin_hex": "",
+    "exit_code": 2,
+    "stdout": "",
+    "stderr": "usage: lookup KEY | list\n"
+  },
+  {
+    "id": "list_extra",
+    "arguments": [
+      "list",
+      "alpha"
+    ],
+    "stdin_hex": "",
+    "exit_code": 2,
+    "stdout": "",
+    "stderr": "usage: lookup KEY | list\n"
+  }
+]

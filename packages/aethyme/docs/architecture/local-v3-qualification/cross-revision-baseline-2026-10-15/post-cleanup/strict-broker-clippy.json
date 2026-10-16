@@ -1,0 +1,31 @@
+{
+  "run": "strict-broker-clippy",
+  "started_utc": "2026-10-15T08:26:29.130528+00:00",
+  "cwd": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/implement-the-actual-fx17-20-controlled/packages/aethyme/rust",
+  "head": "9677dc7f98e44f0f504fb88a7e1a46d091102726",
+  "head_tree": "d2bd88b5df49a6495f90e399ebc37741856c153c",
+  "worktree_status": "M crates/aethyme-broker/src/local_wave.rs",
+  "diff_sha256": "bdfed2947ec537d68856cedf6520167c622336d55029e06f125cfcba9ca19426",
+  "local_wave_sha256": "c5f8bc4e98e87dcb0a069f6f1b4a301c4557b705c2a258d8f58b823139883a09",
+  "argv": [
+    "/usr/bin/caffeinate",
+    "-i",
+    "cargo",
+    "clippy",
+    "--locked",
+    "-j4",
+    "-p",
+    "aethyme-broker",
+    "--lib",
+    "--tests",
+    "--",
+    "-D",
+    "warnings"
+  ],
+  "env": {
+    "PATH": "/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/christophehenner/.cargo/bin",
+    "RUSTC_WRAPPER": "",
+    "CARGO_TARGET_DIR": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/integrate-reviewed-local-bare-git-servic/target/local-resume/cargo"
+  },
+  "caffeinate_foreground": true
+}

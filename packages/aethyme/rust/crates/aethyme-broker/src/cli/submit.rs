@@ -503,7 +503,10 @@ pub(super) fn run_submit(parsed: Parsed) -> Result<(), UsageError> {
             );
         }
     }
-    let outcome = broker.submit_with_intent(
+    // Opt-in collaboration capture (#660). Off unless `[collaboration]`
+    // asks for it, and then this is exactly the legacy submit.
+    let submitted = crate::collaboration_submit::submit(
+        &mut broker,
         session,
         if parsed.no_cache {
             crate::CachePolicy::Bypass
@@ -516,9 +519,89 @@ pub(super) fn run_submit(parsed: Parsed) -> Result<(), UsageError> {
             crate::PromotionIntent::Configured
         },
     )?;
+    let (outcome, capture) = match submitted {
+        crate::collaboration_submit::CaptureSubmit::Submitted { outcome, capture } => {
+            (*outcome, capture)
+        }
+        crate::collaboration_submit::CaptureSubmit::Refused(report) => {
+            if parsed.json {
+                out!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "submitted": false,
+                        "collaboration_capture": report,
+                    }))?
+                );
+            } else {
+                eprintln!("✗ {}", report.summary());
+            }
+            return Err(UsageError::Exit {
+                message: "required collaboration capture was not acknowledged; nothing was \
+                          submitted"
+                    .into(),
+                code: crate::exit_status::REFUSED,
+            });
+        }
+        crate::collaboration_submit::CaptureSubmit::HeadMoved { report, error } => {
+            // The acknowledged capture retains a commit that was not
+            // submitted; it is harmless and answers again if that commit is
+            // ever submitted.
+            if parsed.json {
+                out!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "submitted": false,
+                        "error": {
+                            "code": "captured_head_moved",
+                            "message": error.to_string(),
+                        },
+                        "collaboration_capture": report,
+                    }))?
+                );
+            } else {
+                out!("{}", report.summary());
+            }
+            return Err(UsageError::Exit {
+                message: error.to_string(),
+                code: crate::exit_status::for_broker_error(&error),
+            });
+        }
+    };
     if parsed.json {
-        out!("{}", serde_json::to_string_pretty(&outcome)?);
-    } else if !outcome.conflicts.is_empty() {
+        match capture {
+            None => out!("{}", serde_json::to_string_pretty(&outcome)?),
+            Some(capture) => {
+                let report = capture.finish(&broker);
+                out!(
+                    "{}",
+                    serde_json::to_string_pretty(&crate::collaboration_submit::WithCapture {
+                        outcome: &outcome,
+                        collaboration_capture: &report,
+                    })?
+                );
+            }
+        }
+        let code = submission_exit_code(&outcome);
+        if code != crate::exit_status::SUCCESS {
+            return Err(UsageError::SilentExit(code));
+        }
+        return Ok(());
+    }
+    // The legacy verdict is printed first; an advisory capture runs after it
+    // and only adds a line. Its outcome never replaces the legacy result.
+    let legacy = render_submit_text(&mut broker, &outcome);
+    if let Some(capture) = capture {
+        out!("{}", capture.finish(&broker).summary());
+    }
+    legacy
+}
+
+/// The legacy text rendering of a submit and its exit status.
+fn render_submit_text(
+    broker: &mut crate::Broker,
+    outcome: &crate::SubmitOutcome,
+) -> Result<(), UsageError> {
+    if !outcome.conflicts.is_empty() {
         eprintln!("✗ conflict — rejected before any gate ran. Conflicting files:");
         for conflict in &outcome.conflict_details {
             eprintln!(
@@ -723,7 +806,7 @@ pub(super) fn run_submit(parsed: Parsed) -> Result<(), UsageError> {
                      the broker cannot hold it back. Fix forward on main and resubmit."
                 );
             }
-            let code = submission_exit_code(&outcome);
+            let code = submission_exit_code(outcome);
             return Err(UsageError::Exit {
                 message: if code == crate::exit_status::ENVIRONMENT {
                     "gates could not run on this host (resource contention or \
@@ -774,7 +857,7 @@ pub(super) fn run_submit(parsed: Parsed) -> Result<(), UsageError> {
     }
     // `--json` used to exit 0 for a rejected or conflicted entry, so a
     // caller reading only the exit code saw a failed gate as success.
-    let code = submission_exit_code(&outcome);
+    let code = submission_exit_code(outcome);
     if code != crate::exit_status::SUCCESS {
         return Err(UsageError::SilentExit(code));
     }

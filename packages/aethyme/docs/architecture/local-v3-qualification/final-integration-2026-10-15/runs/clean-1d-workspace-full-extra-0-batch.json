@@ -1,0 +1,145 @@
+{
+  "source_head": "1d0ce2647f277a7246d0994d4f935f1ca1bc183d",
+  "checks": [
+    {
+      "label": "workspace-full",
+      "cwd": ".",
+      "argv": [
+        "packages/aethyme/scripts/test-like-ci.sh",
+        "--full"
+      ]
+    },
+    {
+      "label": "workspace-fmt",
+      "cwd": "packages/aethyme/rust",
+      "argv": [
+        "cargo",
+        "fmt",
+        "--all",
+        "--",
+        "--check"
+      ]
+    },
+    {
+      "label": "workspace-clippy",
+      "cwd": "packages/aethyme/rust",
+      "argv": [
+        "cargo",
+        "clippy",
+        "--locked",
+        "-j",
+        "4",
+        "--workspace",
+        "--all-targets",
+        "--",
+        "-D",
+        "warnings"
+      ]
+    },
+    {
+      "label": "workspace-examples",
+      "cwd": "packages/aethyme/rust",
+      "argv": [
+        "cargo",
+        "test",
+        "--locked",
+        "-j",
+        "4",
+        "--workspace",
+        "--examples"
+      ]
+    },
+    {
+      "label": "workspace-doc",
+      "cwd": "packages/aethyme/rust",
+      "argv": [
+        "cargo",
+        "test",
+        "--locked",
+        "-j",
+        "4",
+        "--workspace",
+        "--doc"
+      ]
+    }
+  ],
+  "results": [
+    {
+      "label": "workspace-full",
+      "recorder_returncode": 0,
+      "metadata": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/682-reconcile-final-local-qualification/target/local-resume/final-workspace-batches/20261015T165406Z-1d0ce2647f27/runs/20261015T165406Z-workspace-full-1d0ce2647f27-d8d4d6af/command.json",
+      "source_unchanged_and_clean": true,
+      "source_after": {
+        "head": "1d0ce2647f277a7246d0994d4f935f1ca1bc183d",
+        "status": ""
+      },
+      "junit_copy": {
+        "path": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/682-reconcile-final-local-qualification/target/local-resume/final-workspace-batches/20261015T165406Z-1d0ce2647f27/workspace-full.junit.xml",
+        "bytes": 939961,
+        "sha256": "0eb620153ec3d37324baf24189f2579a317be0de6fdab6fb4d3a95eaf1685757"
+      }
+    },
+    {
+      "label": "workspace-fmt",
+      "recorder_returncode": 0,
+      "metadata": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/682-reconcile-final-local-qualification/target/local-resume/final-workspace-batches/20261015T165406Z-1d0ce2647f27/runs/20261015T171106Z-workspace-fmt-1d0ce2647f27-4d579ba8/command.json",
+      "source_unchanged_and_clean": true,
+      "source_after": {
+        "head": "1d0ce2647f277a7246d0994d4f935f1ca1bc183d",
+        "status": ""
+      }
+    },
+    {
+      "label": "workspace-clippy",
+      "recorder_returncode": 0,
+      "metadata": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/682-reconcile-final-local-qualification/target/local-resume/final-workspace-batches/20261015T165406Z-1d0ce2647f27/runs/20261015T171116Z-workspace-clippy-1d0ce2647f27-90f50720/command.json",
+      "source_unchanged_and_clean": true,
+      "source_after": {
+        "head": "1d0ce2647f277a7246d0994d4f935f1ca1bc183d",
+        "status": ""
+      }
+    },
+    {
+      "label": "workspace-examples",
+      "recorder_returncode": 0,
+      "metadata": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/682-reconcile-final-local-qualification/target/local-resume/final-workspace-batches/20261015T165406Z-1d0ce2647f27/runs/20261015T171324Z-workspace-examples-1d0ce2647f27-f5c8d9bb/command.json",
+      "source_unchanged_and_clean": true,
+      "source_after": {
+        "head": "1d0ce2647f277a7246d0994d4f935f1ca1bc183d",
+        "status": ""
+      }
+    },
+    {
+      "label": "workspace-doc",
+      "recorder_returncode": 0,
+      "metadata": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/682-reconcile-final-local-qualification/target/local-resume/final-workspace-batches/20261015T165406Z-1d0ce2647f27/runs/20261015T171329Z-workspace-doc-1d0ce2647f27-554ddfc8/command.json",
+      "source_unchanged_and_clean": true,
+      "source_after": {
+        "head": "1d0ce2647f277a7246d0994d4f935f1ca1bc183d",
+        "status": ""
+      }
+    }
+  ],
+  "declared_environment": {
+    "HOME": "/Users/christophehenner",
+    "LANG": "en_US.UTF-8",
+    "LC_ALL": "en_US.UTF-8",
+    "PATH": "/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/christophehenner/.cargo/bin",
+    "RUSTC_WRAPPER": "",
+    "CARGO_BUILD_JOBS": "4",
+    "CARGO_TARGET_DIR": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/integrate-reviewed-local-bare-git-servic/target/local-resume/cargo"
+  },
+  "runtime_handoff": {
+    "path": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/682-reconcile-final-local-qualification/target/local-resume/final-workspace-runtime-handoff.json",
+    "sha256": "939e8730c4743b61014caed83427f28943f9f574af62a6db4418b4378b309132",
+    "record": {
+      "cargo_native_slot_released": true,
+      "root_source_head": "1d0ce2647f277a7246d0994d4f935f1ca1bc183d",
+      "created_at_utc": "2026-10-15T16:54:06.093257+00:00",
+      "released_by_session": 1122,
+      "release_message": "1126 released runtime; root completed positive16, intentional negative101, exact restoration and restoredpositive. No siblingruntime. Retry uses reviewedv3 and whitespace-free temp; official Git isolation preserved. Root owns sole runtime through allfive stages."
+    }
+  },
+  "shared_target_lock": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/integrate-reviewed-local-bare-git-servic/target/local-resume/cargo/.aethyme-final-local-validation.lock",
+  "preflight_active_compilers": []
+}

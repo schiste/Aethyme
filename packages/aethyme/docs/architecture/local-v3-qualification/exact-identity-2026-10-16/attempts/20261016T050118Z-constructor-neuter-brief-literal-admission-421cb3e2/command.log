@@ -1,0 +1,29 @@
+   Compiling aethyme-contracts v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/complete-exact-immutable-contribution-co/packages/aethyme/rust/crates/aethyme-contracts)
+warning: unused variable: `brief`
+   --> crates/aethyme-contracts/src/experimental_v0/contribution_revision.rs:140:21
+    |
+140 |         if let Some(brief) = &brief {
+    |                     ^^^^^ help: if this is intentional, prefix it with an underscore: `_brief`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: `aethyme-contracts` (lib) generated 1 warning (run `cargo fix --lib -p aethyme-contracts` to apply 1 suggestion)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.70s
+     Running tests/contribution_revision.rs (target/debug/deps/contribution_revision-9c0c2fe7d725049d)
+
+running 1 test
+test constructor_revalidates_public_brief_reference_literals ... 
+thread 'constructor_revalidates_public_brief_reference_literals' (16840739) panicked at crates/aethyme-contracts/tests/contribution_revision.rs:335:5:
+assertion failed: matches!(empty_revision_with_brief(Some(malformed)),
+    Err(ContributionRevisionError::InvalidBriefDigest))
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+
+failures:
+    constructor_revalidates_public_brief_reference_literals
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 7 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p aethyme-contracts --test contribution_revision`

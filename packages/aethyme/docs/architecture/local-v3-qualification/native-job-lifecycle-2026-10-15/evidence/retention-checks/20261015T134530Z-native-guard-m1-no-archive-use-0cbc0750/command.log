@@ -1,0 +1,52 @@
+MUTATION_RUNNER_SHA256=c945c42afe7cd11617ccea3acecc43804d322c3de767a53222a011dd229f413a
+MUTATOR_SHA256=0b2e660db3c4b5bf39faada40c15205768cfa23e08b8cad54f011417a9cd0d8a
+MUTANT=m1-release-without-archive-use
+TEST_FILTER=root_release_waits_for_an_in_progress_gc_generation
+SOURCE=/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/reconcile-retention-of-inactive-native-g/packages/aethyme/rust/crates/aethyme-broker/src/native_gates.rs
+ORIGINAL_SHA256=e17607f4b349556be3eb38651e8bd270087c84d3023c7b767b3308293aa838b5
+MUTATION_BACKUP=/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/reconcile-retention-of-inactive-native-g/target/local-resume/mutation-backups/m1-release-without-archive-use.NKsZIC
+ORIGINAL_SHA256=e17607f4b349556be3eb38651e8bd270087c84d3023c7b767b3308293aa838b5
+MUTANT_SHA256=2b110f214ac4cc9c65a4c03d7bb406b6435c39a0351cbea8721b3e9b0c3d67af
+APPLIED_SHA256=2b110f214ac4cc9c65a4c03d7bb406b6435c39a0351cbea8721b3e9b0c3d67af
+DIFF_BEGIN
+--- /Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/reconcile-retention-of-inactive-native-g/target/local-resume/mutation-backups/m1-release-without-archive-use.NKsZIC	2026-10-15 12:48:30
++++ /Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/reconcile-retention-of-inactive-native-g/packages/aethyme/rust/crates/aethyme-broker/src/native_gates.rs	2026-10-15 15:45:31
+@@ -308,7 +308,7 @@
+     key: &RecordId,
+ ) -> Result<RootRelease, NativeGateError> {
+     let _authority = target::authorize(store, owner)?;
+-    let _archive = crate::collaboration_gc::archive_use(store)?;
++    // MUTATION: archive-use serialization guard removed.
+     let tx = store
+         .connection()
+         .transaction_with_behavior(TransactionBehavior::Immediate)?;
+DIFF_END
+MUTANT_SOURCE_SHA256=2b110f214ac4cc9c65a4c03d7bb406b6435c39a0351cbea8721b3e9b0c3d67af
+CARGO_LOG_PATH=/Volumes/T7-repositories/Application Support/Aethyme/qualification/local-check-temporaries/native-guard-m1-no-archive-use-tmp-stq9ja4k/native-retention-m1-release-without-archive-use-cargo.aQsbwD
+CARGO_EXIT=101
+   Compiling aethyme-engine v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/reconcile-retention-of-inactive-native-g/packages/aethyme/rust/crates/aethyme-engine)
+   Compiling aethyme-broker v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/reconcile-retention-of-inactive-native-g/packages/aethyme/rust/crates/aethyme-broker)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 31.66s
+     Running unittests src/lib.rs (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/integrate-reviewed-local-bare-git-servic/target/local-resume/cargo/debug/deps/aethyme_broker-0f278e0d02146111)
+
+running 1 test
+test native_gates::tests::root_release_waits_for_an_in_progress_gc_generation ... 
+thread 'native_gates::tests::root_release_waits_for_an_in_progress_gc_generation' (478647) panicked at crates/aethyme-broker/src/native_gates/tests.rs:1071:5:
+assertion `left == right` failed: release_roots must wait for GC at its own archive lock
+  left: [Finished]
+ right: [Blocked, Acquired, Finished]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+
+failures:
+    native_gates::tests::root_release_waits_for_an_in_progress_gc_generation
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1819 filtered out; finished in 20.48s
+
+error: test failed, to rerun pass `-p aethyme-broker --lib`
+NO_MUTATION_CREDIT: named focused test did not report FAILED
+RESTORED_SHA256=e17607f4b349556be3eb38651e8bd270087c84d3023c7b767b3308293aa838b5
+BACKUP_PATH=/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/reconcile-retention-of-inactive-native-g/target/local-resume/mutation-backups/m1-release-without-archive-use.NKsZIC
+BACKUP_SHA256=e17607f4b349556be3eb38651e8bd270087c84d3023c7b767b3308293aa838b5

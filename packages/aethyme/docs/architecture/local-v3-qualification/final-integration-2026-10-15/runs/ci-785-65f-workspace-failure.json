@@ -1,0 +1,33 @@
+{
+  "schema": "aethyme.local-ci-command-result/v1",
+  "id": "ci-785-65f-workspace-failure",
+  "pr": 785,
+  "branch_head": "65f0bce9a918acbd92b67c54550edde072d40a03",
+  "ci_checkout_commit": "91bbf7acfd2346699105bfac4f524a0af37c2fd7",
+  "ci_checkout_tree": "186bd1b33f15687d1c49afa703fc5491ed312290",
+  "ci_checkout_parents": [
+    "8daffab2bb80ae0cce8286c530d70fad42c033f5",
+    "65f0bce9a918acbd92b67c54550edde072d40a03"
+  ],
+  "job_url": "https://github.com/schiste/Aethyme/actions/runs/38786908006/job/116601635249",
+  "numeric_exit": 100,
+  "tests_run": 4575,
+  "tests_passed": 4566,
+  "tests_failed": 9,
+  "tests_skipped": 32,
+  "failed_tests": [
+    "aethyme-broker collaboration_archive::tests::a_version_one_database_is_migrated",
+    "aethyme-broker collaboration_context::tests::migrating_to_schema_6_rebuilds_the_index_with_broad_postings",
+    "aethyme-broker collaboration_state::tests::inspection_reads_without_migrating_or_writing",
+    "aethyme-broker collaboration_state::tests::the_floor_is_raised_for_new_and_migrated_stores",
+    "aethyme-broker local_controller::drive::tests::controller_migrations_adopt_existing_journals_without_erasing_rows",
+    "aethyme-broker local_exchange::tests::durable::migration_preserves_capture_rows_and_operation_constraints_without_fake_captures",
+    "aethyme-broker local_target::tests::migration_adopts_charged_resolution_attempts_and_fences_schema_six",
+    "aethyme-broker native_gates::tests::released_prepared_job_remains_readable_but_cannot_be_dispatched_or_replayed",
+    "aethyme-cli::help_snapshots help_surface_matches_snapshots"
+  ],
+  "failure": "Eight synthetic historical-schema fixtures omit dropping new schema-24 tables; changed collab help snapshot is stale.",
+  "credited_as_passing_command": false,
+  "log_sha256": "433b200449210baeeb95a1401c32db4b8ea89780329521ab3f74140464da8c48",
+  "scope": "Actual GitHub merge-ref source, separate from PR head. Compile failures supply no executed-test credit. Full original job log preserved without normalization."
+}

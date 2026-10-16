@@ -1,0 +1,18 @@
+{
+  "copied_at_utc": "2026-10-15T20:25:56.250186+00:00",
+  "kind": "compile-onlyPASS0;zerotests",
+  "files": [
+    {
+      "source": "/private/tmp/t56-v4-b6fea172-norun/command.log",
+      "copy": "target/local-resume/t56-runtime-history-20261015/t56-v4-b6fea172-norun/command.log",
+      "bytes": 730,
+      "sha256": "8da62438a5ff8a6e30a35111e9c16ab502465334f33184edbfd4bb76a83ee6e2"
+    },
+    {
+      "source": "/private/tmp/t56-v4-b6fea172-norun/status",
+      "copy": "target/local-resume/t56-runtime-history-20261015/t56-v4-b6fea172-norun/status",
+      "bytes": 2,
+      "sha256": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa"
+    }
+  ]
+}

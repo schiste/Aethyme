@@ -1,0 +1,15 @@
+F                                                                        [100%]
+=================================== FAILURES ===================================
+______________ test_response_schema_gate_rejects_root_composition ______________
+
+    def test_response_schema_gate_rejects_root_composition() -> None:
+        schema = copy.deepcopy(fx17.RESPONSE_SCHEMA)
+        schema["oneOf"] = []
+>       with pytest.raises(fx17.Fx17Error, match="strict root object"):
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       Failed: DID NOT RAISE Fx17Error
+
+tests/test_fx17_model_protocol.py:34: Failed
+=========================== short test summary info ============================
+FAILED tests/test_fx17_model_protocol.py::test_response_schema_gate_rejects_root_composition
+1 failed in 0.04s

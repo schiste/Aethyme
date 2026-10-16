@@ -1,0 +1,24 @@
+{
+  "argv": [
+    "/opt/homebrew/bin/node",
+    "--max-old-space-size=256",
+    "--experimental-strip-types",
+    "packages/aethyme-eval/local-v3/d10-identity-parity/d10-identity-parity.mts"
+  ],
+  "completed_at_utc": "2026-10-16T04:01:36.051947+00:00",
+  "cwd": "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/add-finite-d10-typescript-parity-for-pro",
+  "deadline_seconds": 60,
+  "environment": {
+    "LANG": "C.UTF-8",
+    "LC_ALL": "C.UTF-8",
+    "PATH": "/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+  },
+  "launcher": "/private/tmp/aethyme_d10_attempt005_launcher.py",
+  "launcher_sha256": "07527917bb39751c190156170ef7353263f05a34f838bd37dcf270581942e656",
+  "max_old_space_size_mib": 256,
+  "runner_exit_code": 1,
+  "started_at_utc": "2026-10-16T04:01:35.940508+00:00",
+  "stderr_path": "packages/aethyme-eval/local-v3/d10-identity-parity/qualification/attempt-005-clean-08578f25/d10-identity-parity/stderr",
+  "stdout_path": "packages/aethyme-eval/local-v3/d10-identity-parity/qualification/attempt-005-clean-08578f25/d10-identity-parity/stdout",
+  "timed_out": false
+}

@@ -1,0 +1,1326 @@
+#!/usr/bin/env python3
+"""Read-only integrity verification for retained Local evidence packages.
+
+The legacy groups and their claims remain separate from the new exact-identity
+inventory and D10 TypeScript profile records. This checks retained bytes and
+metadata only; it does not rerun qualification or upgrade any historical result.
+"""
+import argparse
+import hashlib
+import io
+import json
+import os
+import posixpath
+import pathlib
+import re
+import stat
+import subprocess
+import sys
+import tarfile
+import urllib.parse
+
+HEX64 = re.compile(r"[0-9a-f]{64}\Z")
+HEX40 = re.compile(r"[0-9a-f]{40}\Z")
+
+# Frozen identity of the reviewed, static-only v4 qualification driver and run.
+D10_V4_DRIVER_SHA256 = "b5110523da6b3faa333a75e30141898e500d43070ea8502f780e1723001cfb4b"
+D10_V4_MANIFEST_SHA256 = "2d52971538f36518c9b4eb265c1652fc7a97ccecc787fc9287c8452955220f03"
+D10_V3_DRIVER_SHA256 = "0f882b260aae632094fe193c5ff2768e76edb3f8f1654fe804fd6931d5086494"
+D10_PIN_FILE_SHA256 = "b12fc193b8eddeb14b475f837b80df8ec30122bd89028f5eafafb6874ca5e61d"
+D10_NODE_BINARY_SHA256 = "3e401401d90e7f0367b7737a613801242c9a6b2966fb50c2e48eb1c45d701c6a"
+D10_NODE_PATH = "/opt/homebrew/bin/node"
+D10_NODE_REALPATH = "/opt/homebrew/Cellar/node/26.8.2/bin/node"
+D10_QUALIFICATION_ROOT = "/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/add-finite-d10-typescript-parity-for-pro"
+D10_QUALIFICATION_BRANCH = "agent/add-finite-d10-typescript-parity-for-pro"
+D10_QUALIFICATION_COMMIT = "f02096084b3b17703ff8dc3e07d0fdc84795ddb2"
+D10_QUALIFICATION_TREE = "e261027b49b71015305017a473584322073b98c5"
+D10_MAX_ARCHIVE_UNCOMPRESSED_BYTES = 4 * 1024 * 1024
+D10_PROCESS_STATUS_FIELDS = {
+    "name", "argv", "cwd", "environment_allowlist", "deadline_seconds",
+    "started_at_utc", "elapsed_seconds", "timed_out", "numeric_exit_status",
+    "launch_error", "deferred_error", "stdout_bytes", "stderr_bytes",
+    "stdout_sha256", "stderr_sha256", "stdout_path", "stderr_path",
+}
+D10_CONTROL_ASSERTIONS = {
+    "01-early-reference-count": "ContributionRevision scans oversized reference arrays before malformed change semantics",
+    "02-brief-digest-precedence": "ContributionRevision validates the borrowed brief digest before change semantics",
+    "03-full-envelope-cap": "ContributionRevision rejects an oversized full envelope before malformed change semantics",
+    "04-raw-path-predecode-cap": "ContributionRevision rejects path_hex over the raw-path cap before decoding",
+    "05-utf8-byte-count": "bounded canonical size counts a two-byte UTF-8 scalar at the exact limit",
+    "06-newline-escape-byte-count": "bounded canonical size counts newline escaping at the exact limit",
+}
+D10_CONTROL_ERROR_LINES = {
+    "01-early-reference-count": "Error: ContributionRevision scans oversized reference arrays before malformed change semantics: expected too_many_references, got too_large_revision",
+    "02-brief-digest-precedence": "Error: ContributionRevision validates the borrowed brief digest before change semantics: expected invalid_brief_object_sha256, got invalid_source_change",
+    "03-full-envelope-cap": "Error: ContributionRevision rejects an oversized full envelope before malformed change semantics: expected too_large_revision, got invalid_source_change",
+    "04-raw-path-predecode-cap": "Error: ContributionRevision rejects path_hex over the raw-path cap before decoding: expected invalid_source_change, got invalid_path",
+    "05-utf8-byte-count": "Error: bounded canonical size counts a two-byte UTF-8 scalar at the exact limit",
+    "06-newline-escape-byte-count": "Error: bounded canonical size counts newline escaping at the exact limit",
+}
+D10_CONTROL_SOURCE_PATHS = {
+    **{key: "packages/aethyme-eval/local-v3/d10-identity-parity/project-identity.mts"
+       for key in ("01-early-reference-count", "02-brief-digest-precedence", "03-full-envelope-cap", "04-raw-path-predecode-cap")},
+    "05-utf8-byte-count": "packages/aethyme-eval/local-v3/t01-canonical-parity/canonical-json.mts",
+    "06-newline-escape-byte-count": "packages/aethyme-eval/local-v3/t01-canonical-parity/canonical-json.mts",
+}
+D10_T01_SOURCE_PATHS = {
+    "packages/aethyme/rust/crates/aethyme-contracts/fixtures/experimental-v0/brief_calibration.json",
+    "packages/aethyme/rust/crates/aethyme-contracts/fixtures/experimental-v0/brief_tokens.json",
+    "packages/aethyme/rust/crates/aethyme-contracts/fixtures/experimental-v0/briefs.json",
+    "packages/aethyme/rust/crates/aethyme-contracts/fixtures/experimental-v0/canonical_json.json",
+    "packages/aethyme/rust/crates/aethyme-contracts/fixtures/experimental-v0/records.json",
+    "packages/aethyme/rust/crates/aethyme-contracts/fixtures/experimental-v0/source_snapshot.json",
+    "packages/aethyme/rust/crates/aethyme-contracts/src/experimental_v0/brief.rs",
+    "packages/aethyme/rust/crates/aethyme-contracts/src/experimental_v0/canonical_json.rs",
+    "packages/aethyme/rust/crates/aethyme-contracts/src/experimental_v0/record.rs",
+    "packages/aethyme/rust/crates/aethyme-contracts/src/experimental_v0/source_snapshot.rs",
+    "packages/aethyme/rust/crates/aethyme-contracts/tests/brief_vectors.rs",
+    "packages/aethyme/rust/crates/aethyme-contracts/tests/canonical_json_vectors.rs",
+    "packages/aethyme/rust/crates/aethyme-contracts/tests/record_vectors.rs",
+    "packages/aethyme/rust/crates/aethyme-contracts/tests/source_snapshot_vectors.rs",
+    "packages/aethyme-eval/local-v3/t01-canonical-parity/brief-profile.mts",
+    "packages/aethyme-eval/local-v3/t01-canonical-parity/canonical-json.mts",
+    "packages/aethyme-eval/local-v3/t01-canonical-parity/records.mts",
+    "packages/aethyme-eval/local-v3/t01-canonical-parity/source-snapshot.mts",
+    "packages/aethyme-eval/local-v3/t01-canonical-parity/t01-canonical-parity.mts",
+}
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--root", type=pathlib.Path, default=pathlib.Path.cwd())
+args = parser.parse_args()
+root = args.root.resolve()
+errors = []
+groups = []
+seen = set()  # Preserve the v6 legacy unique-payload denominator.
+
+try:
+    tracked = set(
+        subprocess.check_output(
+            ["/opt/homebrew/bin/git", "ls-files", "-z"], cwd=root
+        ).decode("utf-8").split("\0")
+    )
+except (OSError, subprocess.CalledProcessError, UnicodeError) as exc:
+    print(json.dumps({"errors": [f"cannot read tracked paths: {exc}"]}, indent=2))
+    sys.exit(2)
+
+
+def fail(label, message):
+    errors.append(f"{label}: {message}")
+
+
+def path_parts(value, label):
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"{label}: empty or non-string path")
+    if "\x00" in value or "\\" in value or value.startswith("/"):
+        raise ValueError(f"{label}: non-canonical or absolute path {value!r}")
+    if re.match(r"\A[A-Za-z]:", value):
+        raise ValueError(f"{label}: drive-qualified path {value!r}")
+    parts = value.split("/")
+    if any(part in ("", ".", "..") for part in parts):
+        raise ValueError(f"{label}: unsafe path components {value!r}")
+    return parts
+
+
+def base_relative(base, label):
+    try:
+        rel = base.relative_to(root)
+    except ValueError:
+        raise ValueError(f"{label}: base escapes root")
+    if rel == pathlib.Path("."):
+        return []
+    parts = list(rel.parts)
+    if any(part in ("", ".", "..") for part in parts):
+        raise ValueError(f"{label}: unsafe base path")
+    return parts
+
+
+def safe_file(relative, label, max_bytes=None):
+    """Return (repo-relative POSIX name, bytes), rejecting symlinks at every step."""
+    try:
+        parts = path_parts(relative, label)
+    except ValueError as exc:
+        fail(label, str(exc))
+        return None, None
+    current = root
+    for index, part in enumerate(parts):
+        current = current / part
+        try:
+            info = current.lstat()
+        except OSError as exc:
+            fail(label, f"missing/unreadable {relative}: {exc}")
+            return None, None
+        if stat.S_ISLNK(info.st_mode):
+            fail(label, f"symlink path component {relative}")
+            return None, None
+        if index < len(parts) - 1 and not stat.S_ISDIR(info.st_mode):
+            fail(label, f"non-directory path component {relative}")
+            return None, None
+        if index == len(parts) - 1 and not stat.S_ISREG(info.st_mode):
+            fail(label, f"not a regular file {relative}")
+            return None, None
+    normalized = "/".join(parts)
+    if normalized not in tracked:
+        fail(label, f"untracked {normalized}")
+    if max_bytes is not None and info.st_size > max_bytes:
+        fail(label, f"file exceeds {max_bytes}-byte read limit: {normalized}")
+        return normalized, None
+    try:
+        if max_bytes is None:
+            data = current.read_bytes()
+        else:
+            with current.open("rb") as stream:
+                data = stream.read(max_bytes + 1)
+            if len(data) > max_bytes:
+                fail(label, f"file exceeds {max_bytes}-byte read limit: {normalized}")
+                return normalized, None
+        return normalized, data
+    except OSError as exc:
+        fail(label, f"cannot read {normalized}: {exc}")
+        return normalized, None
+
+
+def safe_directory(relative, label):
+    try:
+        parts = path_parts(relative, label)
+    except ValueError as exc:
+        fail(label, str(exc))
+        return None
+    current = root
+    for part in parts:
+        current = current / part
+        try:
+            info = current.lstat()
+        except OSError as exc:
+            fail(label, f"missing/unreadable directory {relative}: {exc}")
+            return None
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+            fail(label, f"unsafe or non-directory component {relative}")
+            return None
+    return current
+
+
+def read_json(relative, label):
+    _, data = safe_file(relative, label)
+    if data is None:
+        return None
+    try:
+        value = json.loads(data)
+    except (json.JSONDecodeError, UnicodeError) as exc:
+        fail(label, f"invalid JSON: {exc}")
+        return None
+    if not isinstance(value, dict):
+        fail(label, "expected JSON object")
+        return None
+    return value
+
+
+def check(base, rows, label, include_legacy_seen=True, include_group=True):
+    """Check a declared list of files relative to a safe repository directory."""
+    try:
+        prefix = base_relative(base, label)
+    except ValueError as exc:
+        fail(label, str(exc))
+        if include_group:
+            groups.append({"inventory": label, "checked": 0})
+        return 0
+    if not isinstance(rows, list):
+        fail(label, "artifact list is missing or not an array")
+        if include_group:
+            groups.append({"inventory": label, "checked": 0})
+        return 0
+    count = 0
+    local_paths = set()
+    for row in rows:
+        if not isinstance(row, dict):
+            fail(label, "malformed artifact row")
+            continue
+        name = row.get("path")
+        digest = row.get("sha256")
+        size = row.get("bytes", row.get("size_bytes"))
+        try:
+            parts = path_parts(name, label)
+        except ValueError as exc:
+            fail(label, str(exc))
+            continue
+        relative = "/".join(prefix + parts)
+        if relative in local_paths:
+            fail(label, f"duplicate path {relative}")
+            continue
+        local_paths.add(relative)
+        if not isinstance(digest, str) or not HEX64.fullmatch(digest):
+            fail(label, f"missing or malformed SHA-256 for {relative}")
+            continue
+        if size is not None and (not isinstance(size, int) or isinstance(size, bool) or size < 0):
+            fail(label, f"invalid byte count for {relative}")
+            continue
+        _, data = safe_file(relative, label)
+        if data is None:
+            continue
+        if hashlib.sha256(data).hexdigest() != digest:
+            fail(label, f"hash mismatch {relative}")
+        if size is not None and len(data) != size:
+            fail(label, f"size mismatch {relative}")
+        if include_legacy_seen:
+            seen.add(relative)
+        count += 1
+    if include_group:
+        groups.append({"inventory": label, "checked": count})
+    return count
+
+
+def require_manifest(relative, label):
+    value = read_json(relative, label)
+    if value is None:
+        return None
+    return value
+
+
+def strict_runtime_json(data, label):
+    """Parse the new v1 package with duplicate-key and non-standard-value rejection."""
+    def unique_object(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError(f"{label}: duplicate JSON object key {key!r}")
+            result[key] = value
+        return result
+
+    def reject_constant(value):
+        raise ValueError(f"{label}: non-standard JSON value {value}")
+
+    value = json.loads(
+        data.decode("utf-8"), object_pairs_hook=unique_object,
+        parse_constant=reject_constant,
+    )
+    if not isinstance(value, dict):
+        raise ValueError(f"{label}: expected JSON object")
+    return value
+
+
+# Retained v6 groups. Each fixed manifest is now required; a missing manifest
+# cannot silently remove an evidence group from the report.
+qualification = root / "packages/aethyme/docs/architecture/local-v3-qualification"
+fx17_inventory_path = "target/local-resume/actual-fx17-twenty-stage-evidence-inventory.json"
+fx17_inventory = require_manifest(fx17_inventory_path, fx17_inventory_path)
+if fx17_inventory is not None:
+    check(root, fx17_inventory.get("evidence_files"), fx17_inventory_path)
+
+legacy_packages = [
+    ("cross-revision-baseline-2026-10-15", "raw_artifacts", "ledger.json"),
+    ("unknown-publication-2026-10-15", "raw_artifacts", "ledger.json"),
+    ("model-adapter-2026-10-15", "files", "ledger.json"),
+    ("analysis-view-lifecycle-2026-10-15", "artifacts", "artifact-inventory.json"),
+    ("final-integration-2026-10-15", "files", "ledger.json"),
+    ("native-job-lifecycle-2026-10-15", "raw_artifacts", "ledger.json"),
+    ("sensitive-response-2026-10-15", "files", "ledger.json"),
+    ("t64-cli-bootstrap-2026-10-15", "files", "ledger.json"),
+    ("aq0-symbol-identity-2026-10-16", "artifacts", "ledger.json"),
+]
+for package_name, key, filename in legacy_packages:
+    manifest_rel = f"packages/aethyme/docs/architecture/local-v3-qualification/{package_name}/{filename}"
+    package_manifest = require_manifest(manifest_rel, manifest_rel)
+    if package_manifest is None:
+        continue
+    if package_name == "t64-cli-bootstrap-2026-10-15" and package_manifest.get("schema") == "aethyme.local-cli-qualification/v1":
+        key = "payload_catalog"
+    if key not in package_manifest:
+        candidates = [k for k in ("files", "raw_artifacts", "artifacts", "evidence_files") if isinstance(package_manifest.get(k), list)]
+        if len(candidates) == 1:
+            key = candidates[0]
+        else:
+            fail(manifest_rel, "unable to identify artifact list")
+            continue
+    inventory_base = (
+        qualification / package_name / "payloads"
+        if package_manifest.get("schema") == "aethyme.local-sensitive-response-evidence.v1"
+        else qualification / package_name
+    )
+    check(inventory_base, package_manifest[key], manifest_rel)
+
+t45_inventory_rel = "packages/aethyme/docs/architecture/local-v3-qualification/t45-pressure-gc-interleaving-2026-10-15/evidence/inventory.json"
+t45_inventory = require_manifest(t45_inventory_rel, t45_inventory_rel)
+if t45_inventory is not None:
+    check(qualification / "t45-pressure-gc-interleaving-2026-10-15", t45_inventory.get("files"), t45_inventory_rel)
+
+# Keep the existing FX10 inventory and checksum semantics.
+fx10_inventory_rel = "packages/aethyme-eval/fx10/evidence/actual-1123-1f7b2266/INVENTORY.tsv"
+fx10_inventory_path, fx10_bytes = safe_file(fx10_inventory_rel, fx10_inventory_rel)
+fx10_rows = []
+if fx10_bytes is not None:
+    try:
+        lines = fx10_bytes.decode("utf-8").splitlines()
+        if not lines:
+            raise ValueError("empty inventory")
+        for line in lines[1:]:
+            digest, raw_size, name = line.split("\t", 2)
+            if name != "README.md":
+                fx10_rows.append({"path": name, "bytes": int(raw_size), "sha256": digest})
+        sums_rel = "packages/aethyme-eval/fx10/evidence/actual-1123-1f7b2266/SHA256SUMS.txt"
+        _, sums_bytes = safe_file(sums_rel, sums_rel)
+        if sums_bytes is not None:
+            for line in sums_bytes.decode("utf-8").splitlines():
+                digest, name = line.split("  ", 1)
+                if name == "INVENTORY.tsv":
+                    fx10_rows.append({"path": name, "sha256": digest})
+        check(root / "packages/aethyme-eval/fx10/evidence/actual-1123-1f7b2266", fx10_rows, fx10_inventory_rel)
+    except (UnicodeError, ValueError) as exc:
+        fail(fx10_inventory_rel, f"malformed inventory/checksum data: {exc}")
+
+# Existing finite TypeScript package archive. Keep its group separate from the
+# new D10 profile below.
+ts_legacy_rel = "packages/aethyme-eval/docs/t01-t02-typescript-parity"
+ts_legacy_dir = safe_directory(ts_legacy_rel, "legacy TypeScript parity package")
+archive_groups = []
+
+def manifest_rows(data, label):
+    rows = []
+    names = set()
+    for line in data.decode("utf-8").splitlines():
+        match = re.fullmatch(r"([0-9a-f]{64})  (.+)", line)
+        if not match:
+            raise ValueError(f"{label}: malformed digest row")
+        name = match.group(2)
+        while name.startswith("./"):
+            name = name[2:]
+        parts = path_parts(name, label)
+        name = "/".join(parts)
+        if name in names:
+            raise ValueError(f"{label}: duplicate path {name}")
+        names.add(name)
+        rows.append({"path": name, "sha256": match.group(1)})
+    if not rows:
+        raise ValueError(f"{label}: empty manifest")
+    return rows
+
+if ts_legacy_dir is not None:
+    try:
+        wrapper_rel = f"{ts_legacy_rel}/ledger/proposal.sha256"
+        _, wrapper_bytes = safe_file(wrapper_rel, "legacy TS wrapper")
+        if wrapper_bytes is None:
+            raise ValueError("missing proposal.sha256")
+        check(ts_legacy_dir, manifest_rows(wrapper_bytes, "TS wrapper"), wrapper_rel)
+        seen.add(wrapper_rel)  # Preserve the v6 legacy unique-payload denominator.
+        payload_manifest_rel = f"{ts_legacy_rel}/ledger/portable-package-manifest.sha256"
+        _, payload_manifest = safe_file(payload_manifest_rel, "TS archive manifest")
+        if payload_manifest is None:
+            raise ValueError("missing portable-package-manifest.sha256")
+        expected_rows = manifest_rows(payload_manifest, "TS archive manifest")
+        expected = {row["path"]: row["sha256"] for row in expected_rows}
+        expected["artifact-manifest.sha256"] = hashlib.sha256(payload_manifest).hexdigest()
+        archive_rel = f"{ts_legacy_rel}/qualification.tar.gz"
+        _, archive_bytes = safe_file(archive_rel, "TS archive")
+        if archive_bytes is None:
+            raise ValueError("missing qualification.tar.gz")
+        archive_digest_rel = f"{ts_legacy_rel}/ledger/qualification.sha256"
+        _, archive_digest_bytes = safe_file(archive_digest_rel, "TS archive digest")
+        if archive_digest_bytes is None:
+            raise ValueError("missing qualification.sha256")
+        archive_digest_rows = manifest_rows(archive_digest_bytes, "TS archive digest")
+        if archive_digest_rows != [{"path": "qualification.tar.gz", "sha256": hashlib.sha256(archive_bytes).hexdigest()}]:
+            raise ValueError("TS archive digest does not match retained bytes")
+        actual = {}
+        archive_member_names = set()
+        with tarfile.open(fileobj=io.BytesIO(archive_bytes), mode="r:gz") as bundle:
+            for member in bundle:
+                name = member.name
+                while name.startswith("./"):
+                    name = name[2:]
+                if not name:
+                    raise ValueError("empty TS archive member")
+                if member.isdir() and name.endswith("/"):
+                    name = name.rstrip("/")
+                parts = path_parts(name, "TS archive member")
+                name = "/".join(parts)
+                if name in archive_member_names:
+                    raise ValueError(f"duplicate TS archive member {name}")
+                archive_member_names.add(name)
+                if member.isdir():
+                    continue
+                if not member.isfile() or name not in expected:
+                    raise ValueError(f"unsafe or unlisted TS archive member {name}")
+                if member.size < 0 or member.size > 32 * 1024 * 1024:
+                    raise ValueError("invalid or oversized TS archive member")
+                stream = bundle.extractfile(member)
+                if stream is None:
+                    raise ValueError(f"missing TS archive member bytes {name}")
+                data = stream.read(member.size + 1)
+                if len(data) != member.size:
+                    raise ValueError(f"TS archive member size mismatch {name}")
+                actual[name] = hashlib.sha256(data).hexdigest()
+        if actual != expected:
+            raise ValueError("TS archive payload inventory mismatch")
+        archive_groups.append({"archive": archive_rel, "verified_files": len(actual)})
+    except (OSError, ValueError, tarfile.TarError, UnicodeError) as exc:
+        fail("TypeScript parity evidence", str(exc))
+
+# New exact-identity inventory. Its exact schema alone authorizes the bounded
+# package walk; older inventory formats are never recursively enumerated.
+identity_rel = "packages/aethyme/docs/architecture/local-v3-qualification/exact-identity-2026-10-16"
+identity_dir = safe_directory(identity_rel, "exact-identity package")
+identity_summary = None
+if identity_dir is not None:
+    inventory_rel = f"{identity_rel}/inventory.json"
+    identity_manifest = require_manifest(inventory_rel, inventory_rel)
+    identity_supported = False
+    if identity_manifest is not None:
+        identity_supported = identity_manifest.get("schema") == "aethyme.local-identity-attempts/experimental-v0"
+        if not identity_supported:
+            fail(inventory_rel, f"unsupported schema {identity_manifest.get('schema')!r}")
+        attempts = identity_manifest.get("attempts")
+        files = identity_manifest.get("files")
+        if not isinstance(identity_manifest.get("scope"), str) or not identity_manifest["scope"].strip():
+            fail(inventory_rel, "missing scope description")
+        file_paths = set()
+        if isinstance(files, list):
+            for row in files:
+                if isinstance(row, dict) and isinstance(row.get("path"), str):
+                    try:
+                        file_paths.add("/".join(path_parts(row["path"], inventory_rel)))
+                    except ValueError as exc:
+                        fail(inventory_rel, str(exc))
+        else:
+            fail(inventory_rel, "files must be an array")
+        attempt_ids = set()
+        raw_directories = set()
+        if not isinstance(attempts, list) or not attempts:
+            fail(inventory_rel, "attempts must be a non-empty array")
+            attempts = []
+        for attempt in attempts:
+            if not isinstance(attempt, dict):
+                fail(inventory_rel, "malformed attempt row")
+                continue
+            required = ("attempt", "label", "kind", "numeric_exit", "source_unchanged", "source", "raw_directory")
+            if any(key not in attempt for key in required):
+                fail(inventory_rel, "attempt row is missing required metadata")
+                continue
+            attempt_id = attempt["attempt"]
+            raw_directory = attempt["raw_directory"]
+            if not isinstance(attempt_id, str) or not attempt_id:
+                fail(inventory_rel, "attempt id must be a non-empty string")
+                continue
+            if attempt_id in attempt_ids:
+                fail(inventory_rel, f"duplicate attempt id {attempt_id}")
+            attempt_ids.add(attempt_id)
+            try:
+                raw_parts = path_parts(raw_directory, inventory_rel)
+            except ValueError as exc:
+                fail(inventory_rel, str(exc))
+                continue
+            normalized_raw = "/".join(raw_parts)
+            if raw_parts != ["attempts", attempt_id]:
+                fail(inventory_rel, f"raw_directory does not bind the attempt id {attempt_id}")
+            if normalized_raw in raw_directories:
+                fail(inventory_rel, f"duplicate raw_directory {normalized_raw}")
+            raw_directories.add(normalized_raw)
+            if not isinstance(attempt["label"], str) or not isinstance(attempt["kind"], str):
+                fail(inventory_rel, f"invalid label/kind for {attempt_id}")
+            if not isinstance(attempt["numeric_exit"], int) or isinstance(attempt["numeric_exit"], bool):
+                fail(inventory_rel, f"invalid numeric_exit for {attempt_id}")
+            if not isinstance(attempt["source_unchanged"], bool):
+                fail(inventory_rel, f"invalid source_unchanged for {attempt_id}")
+            source = attempt["source"]
+            if not isinstance(source, dict) or not HEX40.fullmatch(str(source.get("head", ""))) or not HEX40.fullmatch(str(source.get("tree", ""))):
+                fail(inventory_rel, f"invalid source binding for {attempt_id}")
+            for hash_field in ("diff_sha256", "untracked_content_sha256"):
+                if not isinstance(source, dict) or not isinstance(source.get(hash_field), str) or not HEX64.fullmatch(source[hash_field]):
+                    fail(inventory_rel, f"invalid {hash_field} for {attempt_id}")
+            if not isinstance(attempt.get("test_results"), list):
+                fail(inventory_rel, f"invalid test_results for {attempt_id}")
+            for required_payload in (f"{normalized_raw}/command.json", f"{normalized_raw}/command.status"):
+                if required_payload not in file_paths:
+                    fail(inventory_rel, f"missing expected payload row {required_payload}")
+        if identity_supported and isinstance(files, list):
+            check(identity_dir, files, inventory_rel, include_legacy_seen=False, include_group=False)
+        inventory_file_rel = f"{identity_rel}/inventory.json"
+        if "inventory.json" in file_paths:
+            fail(inventory_rel, "inventory must not self-list")
+        safe_file(inventory_file_rel, "exact-identity inventory file")
+        expected_package_files = {f"{identity_rel}/{name}" for name in file_paths}
+        expected_package_files.add(inventory_file_rel)
+        actual_package_files = set()
+        walked = os.walk(identity_dir, followlinks=False) if identity_supported else ()
+        for current_text, directories, filenames in walked:
+            current = pathlib.Path(current_text)
+            for directory in list(directories):
+                candidate = current / directory
+                try:
+                    info = candidate.lstat()
+                except OSError as exc:
+                    fail(inventory_rel, f"cannot inspect package directory {candidate}: {exc}")
+                    directories.remove(directory)
+                    continue
+                if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+                    fail(inventory_rel, f"unsafe package directory {candidate.relative_to(identity_dir)}")
+                    directories.remove(directory)
+            for filename in filenames:
+                candidate = current / filename
+                relative_inside = candidate.relative_to(identity_dir).as_posix()
+                try:
+                    info = candidate.lstat()
+                except OSError as exc:
+                    fail(inventory_rel, f"cannot inspect payload {relative_inside}: {exc}")
+                    continue
+                if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+                    fail(inventory_rel, f"unsafe package payload {relative_inside}")
+                    continue
+                actual_package_files.add(f"{identity_rel}/{relative_inside}")
+        if identity_supported and actual_package_files != expected_package_files:
+            missing = sorted(expected_package_files - actual_package_files)
+            extra = sorted(actual_package_files - expected_package_files)
+            if missing:
+                fail(inventory_rel, f"missing expected payloads {missing[:8]}")
+            if extra:
+                fail(inventory_rel, f"unlisted package payloads {extra[:8]}")
+            for relative in actual_package_files:
+                if relative not in tracked:
+                    fail(inventory_rel, f"untracked package payload {relative}")
+        if identity_supported:
+            identity_summary = {
+                "schema": identity_manifest.get("schema"),
+                "attempt_rows": len(attempts),
+                "inventory_file_rows": len(files) if isinstance(files, list) else 0,
+                "directory_file_rows_including_inventory": len(actual_package_files),
+                "scope": "retained inventory integrity only; no attempt or qualification totals are added to legacy groups",
+            }
+
+# D10 TypeScript additive profile: this format has source pins and frozen
+# attempt metadata, but no complete payload inventory. Verify only those
+# explicit records and their recorded outputs; do not recurse into this tree.
+d10_rel = "packages/aethyme-eval/local-v3/d10-identity-parity"
+d10_dir = safe_directory(d10_rel, "D10 TypeScript profile")
+d10_summary = None
+pins_rel = f"{d10_rel}/source-pins.json"
+pins = None
+current_pin_hash = None
+source_pin_rows = {}
+current_pin_matches = 0
+current_pin_drift = []
+if d10_dir is not None:
+    readme_rel = f"{d10_rel}/README.md"
+    _, readme_bytes = safe_file(readme_rel, "D10 TypeScript README")
+    pins_rel = f"{d10_rel}/source-pins.json"
+    pins = require_manifest(pins_rel, pins_rel)
+    current_pin_hash = hashlib.sha256(pins_bytes).hexdigest() if (pins_bytes := (safe_file(pins_rel, "D10 source pins")[1])) is not None else None
+    attempt_rel = f"{d10_rel}/qualification/attempt-006-clean-d6eb7352"
+    snapshot_rel = f"{attempt_rel}/source-snapshot.json"
+    snapshot = require_manifest(snapshot_rel, snapshot_rel)
+    launcher_rel = f"{attempt_rel}/launcher.py"
+    _, launcher_bytes = safe_file(launcher_rel, "D10 attempt launcher")
+    run_rel = f"{attempt_rel}/d10-identity-parity/run.json"
+    run = require_manifest(run_rel, run_rel)
+    output_rows_checked = 0
+    if run is not None:
+        for stream_name in ("stdout", "stderr"):
+            output_rel = f"{attempt_rel}/d10-identity-parity/{stream_name}"
+            _, output_bytes = safe_file(output_rel, f"D10 {stream_name}")
+            expected_size = run.get(f"{stream_name}_bytes")
+            expected_hash = run.get(f"{stream_name}_sha256")
+            if output_bytes is not None:
+                if not isinstance(expected_size, int) or isinstance(expected_size, bool) or len(output_bytes) != expected_size:
+                    fail(run_rel, f"{stream_name} byte count does not match run metadata")
+                if not isinstance(expected_hash, str) or not HEX64.fullmatch(expected_hash) or hashlib.sha256(output_bytes).hexdigest() != expected_hash:
+                    fail(run_rel, f"{stream_name} SHA-256 does not match run metadata")
+                output_rows_checked += 1
+    source_pin_rows = {}
+    current_pin_matches = 0
+    current_pin_drift = []
+    if pins is not None:
+        if pins.get("schema") != "aethyme.local-d10-typescript-parity-pins/v2":
+            fail(pins_rel, f"unsupported schema {pins.get('schema')!r}")
+        for category, prefix in (("rust_sources", ""), ("typescript_sources", ""), ("fixture_files", f"{d10_rel}/")):
+            rows = pins.get(category)
+            if not isinstance(rows, list) or not rows:
+                fail(pins_rel, f"{category} must be a non-empty array")
+                continue
+            for row in rows:
+                if not isinstance(row, dict):
+                    fail(pins_rel, f"malformed {category} pin row")
+                    continue
+                name = row.get("path")
+                digest = row.get("sha256")
+                try:
+                    parts = path_parts(name, pins_rel)
+                except ValueError as exc:
+                    fail(pins_rel, str(exc))
+                    continue
+                manifest_name = "/".join(parts)
+                source_rel = prefix + manifest_name
+                if manifest_name in source_pin_rows:
+                    fail(pins_rel, f"duplicate pinned path {manifest_name}")
+                    continue
+                if not isinstance(digest, str) or not HEX64.fullmatch(digest):
+                    fail(pins_rel, f"invalid digest for {manifest_name}")
+                    continue
+                source_pin_rows[manifest_name] = {"category": category, "sha256": digest}
+                _, source_bytes = safe_file(source_rel, f"D10 pinned {category}")
+                if source_bytes is not None:
+                    if hashlib.sha256(source_bytes).hexdigest() == digest:
+                        current_pin_matches += 1
+                    else:
+                        current_pin_drift.append(manifest_name)
+    snapshot_recorded_match = None
+    fixture_source_commit_matches = None
+    snapshot_row_count = 0
+    if snapshot is not None:
+        if snapshot.get("schema") != "aethyme.d10-offline-typescript-qualification-attempt/v1":
+            fail(snapshot_rel, f"unsupported schema {snapshot.get('schema')!r}")
+        recorded_pin_hash = snapshot.get("source_pins_sha256")
+        runner_report = snapshot.get("runner_report")
+        if not isinstance(recorded_pin_hash, str) or not HEX64.fullmatch(recorded_pin_hash):
+            fail(snapshot_rel, "missing/malformed recorded source-pins digest")
+        if not isinstance(runner_report, dict) or runner_report.get("schema") != "aethyme.local-d10-typescript-parity-report/v1":
+            fail(snapshot_rel, "missing/unsupported frozen runner report")
+        elif runner_report.get("source_pins_sha256") != recorded_pin_hash:
+            fail(snapshot_rel, "attempt and runner report disagree on source-pins digest")
+        if snapshot.get("source_pins_path") != pins_rel:
+            fail(snapshot_rel, "recorded source-pins path does not match package")
+        recorded_hashes = snapshot.get("source_hashes")
+        if not isinstance(recorded_hashes, list):
+            fail(snapshot_rel, "source_hashes must be an array")
+            recorded_hashes = []
+        snapshot_row_count = len(recorded_hashes)
+        recorded_map = {}
+        recorded_categories = {"rust_sources": 0, "typescript_sources": 0, "fixture_files": 0}
+        for row in recorded_hashes:
+            if not isinstance(row, dict):
+                fail(snapshot_rel, "malformed source_hashes row")
+                continue
+            name = row.get("path")
+            category = row.get("kind")
+            digest = row.get("sha256")
+            expected = row.get("expected_sha256")
+            if not isinstance(name, str) or category not in recorded_categories:
+                fail(snapshot_rel, "invalid historical pin path/category")
+                continue
+            try:
+                path_parts(name, snapshot_rel)
+            except ValueError as exc:
+                fail(snapshot_rel, str(exc))
+                continue
+            key = (category, name)
+            if key in recorded_map:
+                fail(snapshot_rel, f"duplicate historical source row {name}")
+                continue
+            if not isinstance(digest, str) or not HEX64.fullmatch(digest) or expected != digest or row.get("matches_pin") is not True:
+                fail(snapshot_rel, f"inconsistent historical pin row {name}")
+                continue
+            recorded_map[key] = digest
+            recorded_categories[category] += 1
+        if snapshot.get("source_pin_count") != len(recorded_hashes):
+            fail(snapshot_rel, "source_pin_count does not match source_hashes")
+        if isinstance(runner_report, dict):
+            report_rows = runner_report.get("verified_files")
+            if not isinstance(report_rows, list):
+                fail(snapshot_rel, "runner report verified_files must be an array")
+            else:
+                report_map = {}
+                for row in report_rows:
+                    if not isinstance(row, dict) or not isinstance(row.get("path"), str) or not isinstance(row.get("sha256"), str):
+                        fail(snapshot_rel, "malformed runner verified_files row")
+                        continue
+                    key = row["path"]
+                    if key in report_map:
+                        fail(snapshot_rel, f"duplicate runner verified_files path {key}")
+                    report_map[key] = row["sha256"]
+                source_map = {name: digest for (_, name), digest in recorded_map.items()}
+                if report_map != source_map:
+                    fail(snapshot_rel, "runner report and source_hashes disagree")
+            # The frozen v1 report calls fixture_files "frozen_fixture_files";
+            # source-snapshot rows use the source-pins category name.
+            expected_report_counts = {
+                "rust_sources": recorded_categories["rust_sources"],
+                "typescript_sources": recorded_categories["typescript_sources"],
+                "frozen_fixture_files": recorded_categories["fixture_files"],
+            }
+            if runner_report.get("pin_counts") != expected_report_counts:
+                fail(snapshot_rel, "runner report pin_counts disagree with source_hashes")
+        if pins is not None:
+            current_recorded_map = {(row["category"], name): row["sha256"] for name, row in source_pin_rows.items()}
+            snapshot_recorded_map = recorded_map
+            snapshot_recorded_match = (
+                current_pin_hash == recorded_pin_hash
+                and current_recorded_map == snapshot_recorded_map
+            )
+    if launcher_bytes is not None and snapshot is not None:
+        launcher_hash = snapshot.get("launcher_script_sha256")
+        if not isinstance(launcher_hash, str) or not HEX64.fullmatch(launcher_hash) or hashlib.sha256(launcher_bytes).hexdigest() != launcher_hash:
+            fail(snapshot_rel, "launcher hash does not match source snapshot")
+    if pins is not None and snapshot is not None:
+        fixture_source_commit_matches = pins.get("fixture_source_commit") == snapshot.get("fixture_source_commit")
+        if pins.get("fixture_source_commit") != snapshot.get("fixture_source_commit"):
+            # Keep this as a visible qualification gap; old run metadata remains historical.
+            fixture_source_commit_matches = False
+    gaps = []
+    if snapshot_recorded_match is False:
+        gaps.append("current source-pins.json differs from the manifest digest or pin rows recorded by attempt 006")
+    if pins is not None and snapshot is not None and pins.get("qualification_source_commit") != snapshot.get("qualification_source_commit"):
+        gaps.append("current qualification source pin differs from the source commit recorded by attempt 006")
+    if fixture_source_commit_matches is False:
+        gaps.append("current fixture source pin differs from attempt-006 metadata")
+    if current_pin_drift:
+        gaps.append("current tracked source files differ from the intermediate source pin set; final-source repinning remains pending")
+    if snapshot is None or pins is None or run is None:
+        gaps.append("the explicit D10 TypeScript metadata chain is incomplete")
+    d10_summary = {
+        "inventory_completeness": "no complete D10 payload inventory is present; checks are limited to source-pins and the explicit attempt-006 metadata chain",
+        "source_pin_rows": len(source_pin_rows),
+        "current_source_pin_content_matches": current_pin_matches,
+        "current_source_pin_drift_rows": len(current_pin_drift),
+        "current_source_pin_drift_paths": current_pin_drift,
+        "attempt_006_recorded_source_hash_rows": snapshot_row_count,
+        "attempt_006_output_streams_verified": output_rows_checked,
+        "attempt_006_pin_manifest_matches_current": snapshot_recorded_match,
+        "qualification_credit": "none; attempt 006 is historical metadata only and grants no current-profile credit",
+        "qualification_gaps": gaps,
+    }
+
+# D10 runtime qualification package (additive to, and separate from, the
+# historical attempt-006 metadata above). The v1 archive index is the only
+# authority for this finite archive's members; do not recursively enumerate
+# the old D10 qualification tree or add attempt-001 to attempt-002 totals.
+d10_runtime_rel = "packages/aethyme-eval/docs/t01-t02-typescript-parity/ledger/runtime-qualification-2026-10-16"
+d10_runtime_summary = None
+runtime_errors_before = len(errors)
+try:
+    runtime_dir = safe_directory(d10_runtime_rel, "D10 runtime evidence package")
+    if runtime_dir is None:
+        raise ValueError("runtime evidence package directory is unavailable")
+    summary_rel = f"{d10_runtime_rel}/summary.json"
+    index_rel = f"{d10_runtime_rel}/archive-index.json"
+    archive_rel = f"{d10_runtime_rel}/attempts-and-controls.tar.gz"
+    archive_digest_rel = f"{archive_rel}.sha256"
+    member_manifest_rel = f"{d10_runtime_rel}/archive-files.sha256"
+    _, runtime_manifest_bytes = safe_file(summary_rel, summary_rel, max_bytes=1024 * 1024)
+    _, archive_index_bytes = safe_file(index_rel, index_rel, max_bytes=1024 * 1024)
+    runtime_manifest = strict_runtime_json(runtime_manifest_bytes, summary_rel) if runtime_manifest_bytes is not None else None
+    archive_index = strict_runtime_json(archive_index_bytes, index_rel) if archive_index_bytes is not None else None
+    _, runtime_archive_bytes = safe_file(archive_rel, "D10 runtime archive", max_bytes=16 * 1024 * 1024)
+    _, runtime_digest_bytes = safe_file(archive_digest_rel, "D10 runtime archive digest", max_bytes=256)
+    _, member_manifest_bytes = safe_file(member_manifest_rel, "D10 runtime member digest manifest", max_bytes=64 * 1024)
+    if any(value is None for value in (runtime_manifest, archive_index, runtime_archive_bytes, runtime_digest_bytes, member_manifest_bytes)):
+        raise ValueError("one or more required D10 runtime manifests or archive files are unavailable")
+
+    def runtime_need(condition, message):
+        if not condition:
+            raise ValueError(message)
+
+    runtime_need(len(runtime_archive_bytes) <= 16 * 1024 * 1024, "D10 runtime archive exceeds the reviewed compressed-size limit")
+    runtime_need(runtime_manifest.get("schema") == "aethyme.local-ts-parity-runtime-summary.v1", "unsupported D10 runtime summary schema")
+    runtime_need(archive_index.get("schema") == "aethyme.local-ts-parity-runtime-evidence-index.v1", "unsupported D10 runtime archive-index schema")
+    runtime_need(set(runtime_manifest) == {
+        "attempt_001", "attempt_002", "attempts_archive", "d10", "mutation_controls",
+        "parser_refusal_controls", "qualification_scope", "qualification_source_checkpoint",
+        "runtime", "schema", "t01_profile",
+    }, "D10 runtime summary fields do not match the reviewed v1 contract")
+    runtime_need(set(archive_index) == {
+        "archive", "archive_sha256", "member_count", "members", "regular_file_members_only", "schema",
+    }, "D10 archive-index fields do not match the reviewed v1 contract")
+    _, strict_current_pin_bytes = safe_file(pins_rel, "D10 strict current source pins")
+    runtime_need(strict_current_pin_bytes is not None, "current D10 source-pins bytes are unavailable")
+    strict_current_pins = strict_runtime_json(strict_current_pin_bytes, pins_rel)
+    runtime_need(strict_current_pins == pins, "strict current D10 source-pins object differs from the legacy pin read")
+    pins = strict_current_pins
+    runtime_need(set(pins) == {
+        "fixture_files", "fixture_source_commit", "qualification_source_commit",
+        "rust_sources", "schema", "typescript_sources",
+    }, "current D10 source-pins fields differ from the reviewed v2 contract")
+    runtime_need(
+        all(isinstance(pins.get(category), list) and len(pins[category]) == count
+            and all(isinstance(row, dict) and set(row) == {"path", "sha256"}
+                    for row in pins[category])
+            for category, count in (("rust_sources", 12), ("typescript_sources", 3), ("fixture_files", 20))),
+        "current D10 source-pins category lists or row schemas differ from the reviewed set",
+    )
+    runtime_need(hashlib.sha256(strict_current_pin_bytes).hexdigest() == D10_PIN_FILE_SHA256, "current D10 source-pins file differs from the frozen qualification pins")
+
+    archive_sha = hashlib.sha256(runtime_archive_bytes).hexdigest()
+    runtime_need(runtime_digest_bytes.decode("utf-8").splitlines() == [f"{archive_sha}  attempts-and-controls.tar.gz"], "D10 archive SHA sidecar does not match retained archive bytes")
+    runtime_need(archive_index.get("archive") == "attempts-and-controls.tar.gz", "D10 archive index names an unexpected archive")
+    runtime_need(archive_index.get("archive_sha256") == archive_sha, "D10 archive index digest does not match retained archive bytes")
+    runtime_need(archive_index.get("regular_file_members_only") is True, "D10 archive index does not require regular files only")
+    _, package_readme_bytes = safe_file(f"{d10_runtime_rel}/README.md", "D10 runtime evidence README")
+    _, package_attributes_bytes = safe_file(f"{d10_runtime_rel}/.gitattributes", "D10 runtime evidence attributes")
+    runtime_need(package_readme_bytes is not None and package_attributes_bytes is not None, "D10 runtime package README or attributes file is unavailable")
+    index_rows = archive_index.get("members")
+    runtime_need(isinstance(index_rows, list) and archive_index.get("member_count") == len(index_rows) == 76, "D10 archive index member count must be exactly 76")
+    indexed = {}
+    for row in index_rows:
+        runtime_need(isinstance(row, dict) and set(row) == {"path", "bytes", "sha256", "type"}, "malformed D10 archive-index member row")
+        path = row.get("path")
+        parts = path_parts(path, "D10 archive-index member")
+        name = "/".join(parts)
+        runtime_need(name not in indexed, f"duplicate D10 archive-index member {name}")
+        size = row.get("bytes")
+        digest = row.get("sha256")
+        runtime_need(isinstance(size, int) and not isinstance(size, bool) and 0 <= size <= 32 * 1024 * 1024, f"invalid/oversized D10 archive-index member {name}")
+        runtime_need(row.get("type") == "regular", f"non-regular D10 archive-index member {name}")
+        runtime_need(isinstance(digest, str) and HEX64.fullmatch(digest), f"invalid D10 member SHA-256 {name}")
+        indexed[name] = {"bytes": size, "sha256": digest}
+    total_uncompressed_bytes = sum(row["bytes"] for row in indexed.values())
+    runtime_need(total_uncompressed_bytes <= D10_MAX_ARCHIVE_UNCOMPRESSED_BYTES, "D10 runtime archive exceeds the 4 MiB aggregate uncompressed-size limit")
+    runtime_need(sum(name.startswith("attempt-001/") for name in indexed) == 12, "D10 attempt-001 archive member count mismatch")
+    runtime_need(sum(name.startswith("attempt-002/") for name in indexed) == 61, "D10 attempt-002 archive member count mismatch")
+    runtime_need({name for name in indexed if name.startswith("drivers/")} == {
+        "drivers/reviewed-v3/offline_ts_qualification_1135-v3.py",
+        "drivers/reviewed-v4/offline_ts_qualification_1135-v4.py",
+        "drivers/reviewed-v4/proposal-manifest.json",
+    }, "D10 archive driver member set mismatch")
+    attempt1_expected = {
+        "attempt-001/initial-positive/d10/status.json",
+        "attempt-001/initial-positive/d10/stderr.bin",
+        "attempt-001/initial-positive/d10/stdout.bin",
+        "attempt-001/initial-positive/evaluation.json",
+        "attempt-001/initial-positive/t01-t02/status.json",
+        "attempt-001/initial-positive/t01-t02/stderr.bin",
+        "attempt-001/initial-positive/t01-t02/stdout.bin",
+        "attempt-001/node-version/status.json",
+        "attempt-001/node-version/stderr.bin",
+        "attempt-001/node-version/stdout.bin",
+        "attempt-001/qualification-results.json",
+        "attempt-001/start.json",
+    }
+    attempt2_expected = {
+        "attempt-002/start.json", "attempt-002/qualification-results.json",
+        "attempt-002/node-version/status.json", "attempt-002/node-version/stdout.bin",
+        "attempt-002/node-version/stderr.bin",
+    }
+    for stage in ("initial-positive", "restored-positive"):
+        attempt2_expected.add(f"attempt-002/{stage}/evaluation.json")
+        for lane in ("t01-t02", "d10"):
+            for filename in ("status.json", "stdout.bin", "stderr.bin"):
+                attempt2_expected.add(f"attempt-002/{stage}/{lane}/{filename}")
+    for argument_id in ("t01-unknown-source-profile", "t01-unsupported-arguments"):
+        for filename in ("status.json", "stdout.bin", "stderr.bin"):
+            attempt2_expected.add(f"attempt-002/argument-controls/{argument_id}/{filename}")
+    expected_control_ids = [
+        "01-early-reference-count", "02-brief-digest-precedence", "03-full-envelope-cap",
+        "04-raw-path-predecode-cap", "05-utf8-byte-count", "06-newline-escape-byte-count",
+    ]
+    for control_id in expected_control_ids:
+        control_prefix = f"attempt-002/controls/{control_id}"
+        attempt2_expected.add(f"{control_prefix}/control-status.json")
+        for filename in ("status.json", "stdout.bin", "stderr.bin"):
+            attempt2_expected.add(f"{control_prefix}/d10/{filename}")
+        backup_files = [name for name in indexed if name.startswith(f"{control_prefix}/pristine-backup-")]
+        backup_dirs = {name.rsplit("/", 1)[0] for name in backup_files}
+        runtime_need(len(backup_files) == 2 and len(backup_dirs) == 1, f"D10 control backup set is missing or ambiguous: {control_id}")
+        backup_dir = next(iter(backup_dirs))
+        backup_token = backup_dir.rsplit("/", 1)[-1]
+        runtime_need(re.fullmatch(r"pristine-backup-[A-Za-z0-9_-]+", backup_token) is not None, f"invalid unique D10 pristine-backup directory: {control_id}")
+        runtime_need({name.rsplit("/", 1)[-1] for name in backup_files} == {"source.bytes", "source-pins.json"}, f"unexpected D10 pristine-backup files: {control_id}")
+        attempt2_expected.update(backup_files)
+    driver_expected = {
+        "drivers/reviewed-v3/offline_ts_qualification_1135-v3.py",
+        "drivers/reviewed-v4/offline_ts_qualification_1135-v4.py",
+        "drivers/reviewed-v4/proposal-manifest.json",
+    }
+    runtime_need(set(indexed) == attempt1_expected | attempt2_expected | driver_expected, "D10 archive path set differs from the exact attempt/control inventory")
+
+    member_rows = manifest_rows(member_manifest_bytes, "D10 runtime member digest manifest")
+    runtime_need(len(member_rows) == 76, "D10 runtime member digest manifest must contain 76 rows")
+    member_digests = {row["path"]: row["sha256"] for row in member_rows}
+    runtime_need(member_digests == {name: row["sha256"] for name, row in indexed.items()}, "D10 per-member digest manifest disagrees with archive index")
+
+    archived_payloads = {}
+    with tarfile.open(fileobj=io.BytesIO(runtime_archive_bytes), mode="r:gz") as bundle:
+        for member in bundle:
+            name = "/".join(path_parts(member.name, "D10 tar member"))
+            runtime_need(name in indexed, f"unlisted D10 tar member {name}")
+            runtime_need(name not in archived_payloads, f"duplicate D10 tar member {name}")
+            runtime_need(member.isfile() and not member.issym() and not member.islnk(), f"non-regular D10 tar member {name}")
+            expected = indexed[name]
+            runtime_need(member.size == expected["bytes"], f"D10 tar member size differs from index: {name}")
+            stream = bundle.extractfile(member)
+            runtime_need(stream is not None, f"D10 tar member bytes are unavailable: {name}")
+            data = stream.read(member.size + 1)
+            runtime_need(len(data) == member.size, f"D10 tar member byte count mismatch: {name}")
+            runtime_need(hashlib.sha256(data).hexdigest() == expected["sha256"], f"D10 tar member hash mismatch: {name}")
+            archived_payloads[name] = data
+    runtime_need(set(archived_payloads) == set(indexed), "D10 tar member set differs from complete archive index")
+
+    def runtime_json(name):
+        data = archived_payloads.get(name)
+        runtime_need(data is not None, f"missing D10 archived metadata {name}")
+        return strict_runtime_json(data, name)
+
+    def runtime_string_hash(value, label):
+        runtime_need(isinstance(value, str) and HEX64.fullmatch(value), f"invalid SHA-256 in {label}")
+
+    attempt1 = runtime_manifest["attempt_001"]
+    attempt2 = runtime_manifest["attempt_002"]
+    d10_record = runtime_manifest["d10"]
+    t01_record = runtime_manifest["t01_profile"]
+    runtime_record = runtime_manifest["runtime"]
+    checkpoint = runtime_manifest["qualification_source_checkpoint"]
+    scope = runtime_manifest["qualification_scope"]
+    runtime_need(all(isinstance(value, dict) for value in (attempt1, attempt2, d10_record, t01_record, runtime_record, checkpoint, scope)), "D10 runtime summary nested records must be objects")
+    runtime_need(isinstance(checkpoint, dict) and set(checkpoint) == {"branch", "clean_after_run", "commit", "tree"}, "malformed D10 source checkpoint fields")
+    runtime_need(checkpoint.get("clean_after_run") is True and checkpoint.get("branch") == D10_QUALIFICATION_BRANCH and checkpoint.get("commit") == D10_QUALIFICATION_COMMIT and checkpoint.get("tree") == D10_QUALIFICATION_TREE, "D10 source checkpoint differs from the reviewed v4 driver checkpoint")
+    runtime_need(isinstance(scope, dict) and set(scope) == {
+        "aethyme_evaluation_target", "cargo_or_native_commands", "fixture_or_oracle_edits",
+        "network_or_install_commands", "product_runtime_claim", "provider_or_heldout_calls",
+    } and all(value is False for value in scope.values()), "D10 runtime scope contains an unsupported broader claim")
+    runtime_need(isinstance(runtime_record, dict) and runtime_record.get("heap_mib") == 256 and runtime_record.get("per_process_deadline_seconds") == 60, "D10 runtime limits do not match the reviewed profile")
+    runtime_need(runtime_record.get("node_version") == "v26.8.2" and runtime_record.get("node_path") == D10_NODE_PATH, "D10 runtime identity differs from reviewed profile")
+    runtime_need(runtime_record.get("node_binary_sha256") == D10_NODE_BINARY_SHA256, "D10 runtime Node binary differs from the reviewed qualification binary")
+    runtime_need(runtime_record.get("node_realpath") == D10_NODE_REALPATH, "D10 runtime real path differs from the reviewed qualification binary")
+
+    expected_archive_summary = {
+        "member_count": 76, "path": "attempts-and-controls.tar.gz",
+        "regular_file_members_only": True, "sha256": archive_sha,
+    }
+    runtime_need(runtime_manifest.get("attempts_archive") == expected_archive_summary, "D10 summary archive receipt disagrees with verified archive")
+    start = runtime_json("attempt-002/start.json")
+    qualification = runtime_json("attempt-002/qualification-results.json")
+    attempt1_start = runtime_json("attempt-001/start.json")
+    attempt1_results = runtime_json("attempt-001/qualification-results.json")
+    runtime_need(isinstance(qualification.get("end"), dict) and isinstance(qualification.get("initial_positive"), dict) and isinstance(qualification.get("restored_positive"), dict), "attempt-002 qualification result checkpoints/positive runs must be objects")
+    runtime_need(isinstance(attempt1_results.get("initial_positive"), dict) and isinstance(attempt1_start.get("worktree"), dict), "attempt-001 retained baseline records must have reviewed object shapes")
+    v4_driver_bytes = archived_payloads["drivers/reviewed-v4/offline_ts_qualification_1135-v4.py"]
+    v3_driver_bytes = archived_payloads["drivers/reviewed-v3/offline_ts_qualification_1135-v3.py"]
+    proposal_manifest = runtime_json("drivers/reviewed-v4/proposal-manifest.json")
+    runtime_need(hashlib.sha256(v4_driver_bytes).hexdigest() == D10_V4_DRIVER_SHA256, "archived v4 driver differs from the independently reviewed driver")
+    runtime_need(hashlib.sha256(v3_driver_bytes).hexdigest() == D10_V3_DRIVER_SHA256, "archived v3 driver differs from the reviewed historical driver")
+    runtime_need(hashlib.sha256(archived_payloads["drivers/reviewed-v4/proposal-manifest.json"]).hexdigest() == D10_V4_MANIFEST_SHA256, "attempt-002 reviewed v4 proposal manifest hash mismatch")
+    runtime_need(proposal_manifest.get("schema") == "aethyme.offline-typescript-qualification-proposal.v1" and proposal_manifest.get("proposal_driver_sha256") == D10_V4_DRIVER_SHA256 and proposal_manifest.get("reviewed_v3_driver_sha256") == D10_V3_DRIVER_SHA256, "pinned v4 proposal manifest does not bind the reviewed v3/v4 drivers")
+    runtime_need(proposal_manifest.get("runtime_started_for_this_proposal") is False and proposal_manifest.get("source_checkpoint", {}).get("branch") == D10_QUALIFICATION_BRANCH and proposal_manifest.get("source_checkpoint", {}).get("commit") == D10_QUALIFICATION_COMMIT and proposal_manifest.get("source_checkpoint", {}).get("tree") == D10_QUALIFICATION_TREE, "pinned v4 proposal manifest has an unexpected run/checkpoint status")
+    runtime_need(hashlib.sha256(archived_payloads["attempt-002/start.json"]).hexdigest() == attempt2.get("start_manifest_sha256"), "attempt-002 start manifest hash disagrees with summary")
+    runtime_need(hashlib.sha256(archived_payloads["attempt-002/qualification-results.json"]).hexdigest() == attempt2.get("qualification_results_sha256"), "attempt-002 qualification result hash disagrees with summary")
+    runtime_need(hashlib.sha256(archived_payloads["attempt-001/initial-positive/t01-t02/stderr.bin"]).hexdigest() == attempt1.get("t01_stderr_sha256"), "attempt-001 stderr hash disagrees with summary")
+    runtime_need(start.get("qualification_driver_sha256") == D10_V4_DRIVER_SHA256 and attempt1_start.get("qualification_driver_sha256") == D10_V3_DRIVER_SHA256, "archived run receipts do not bind the reviewed qualification drivers")
+    runtime_need(start.get("worktree") == {
+        "branch": D10_QUALIFICATION_BRANCH, "head": D10_QUALIFICATION_COMMIT,
+        "status_paths": [], "tree": D10_QUALIFICATION_TREE,
+    }, "attempt-002 source checkpoint disagrees with the reviewed source checkpoint")
+    runtime_need(qualification.get("end", {}).get("worktree") == start.get("worktree"), "attempt-002 final source checkpoint changed")
+    runtime_need(start.get("source_pins_file_sha256") == d10_record.get("source_pins_sha256"), "attempt-002 source-pins digest disagrees with D10 summary")
+    runtime_need(qualification.get("end", {}).get("source_pins_sha256") == d10_record.get("source_pins_sha256"), "attempt-002 final source-pins digest changed")
+    runtime_need(start.get("node_binary_sha256") == runtime_record.get("node_binary_sha256") and start.get("node_version") == runtime_record.get("node_version") and start.get("heap_mib") == runtime_record.get("heap_mib") and start.get("per_process_deadline_seconds") == runtime_record.get("per_process_deadline_seconds"), "attempt-002 runtime metadata disagrees with summary")
+    runtime_need(start.get("node_path_requested") == runtime_record.get("node_path") and start.get("node_realpath") == runtime_record.get("node_realpath"), "attempt-002 Node path metadata disagrees with summary")
+    runtime_need(start.get("cargo_or_native_commands") is False and start.get("fixture_or_oracle_mutation") is False and start.get("network_or_install_commands") is False and start.get("provider_or_heldout_calls") is False and start.get("commands_scope") == ["local Git metadata reads", "Node runtime version", "T01 argument-refusal controls", "T01/T02 runner with explicit source profile", "D10 runner"], "attempt-002 command scope is broader than the reviewed offline profile")
+    runtime_need(hashlib.sha256(archived_payloads["drivers/reviewed-v4/offline_ts_qualification_1135-v4.py"]).hexdigest() == start.get("qualification_driver_sha256"), "attempt-002 qualification-driver hash disagrees with archived reviewed v4 driver")
+    runtime_need(hashlib.sha256(archived_payloads["drivers/reviewed-v4/proposal-manifest.json"]).hexdigest() == "2d52971538f36518c9b4eb265c1652fc7a97ccecc787fc9287c8452955220f03", "attempt-002 reviewed v4 proposal manifest hash mismatch")
+    runtime_need(start.get("source_pin_inventory", {}).get("counts") == {
+        "fixture_files": 20, "rust_sources": 12, "typescript_sources": 3,
+    }, "attempt-002 source-pin inventory counts mismatch")
+    runtime_need(attempt2.get("classification") == "PASS" and attempt2.get("positive_run_pairs") == 2 and attempt2.get("mutation_control_count") == 6 and attempt2.get("argument_control_count") == 2 and attempt2.get("control_errors") == 0 and attempt2.get("source_or_fixture_bytes_mutated") is False, "attempt-002 summary does not describe the complete bounded PASS")
+    runtime_need(qualification.get("overall_status") == "PASS" and len(qualification.get("controls", [])) == 6 and len(qualification.get("t01_argument_controls", [])) == 2, "attempt-002 raw qualification result is incomplete or non-PASS")
+
+    # Require the archived attempt's 35 verified-file report to equal both the
+    # current, tracked source-pins.json and the existing direct pin checks.
+    runtime_need(pins is not None and current_pin_hash == D10_PIN_FILE_SHA256 == d10_record.get("source_pins_sha256"), "current D10 source-pins.json differs from the frozen runtime checkpoint")
+    runtime_need(current_pin_matches == 35 and not current_pin_drift and len(source_pin_rows) == 35, "current D10 source pins are incomplete or drifted")
+    runtime_need({category: sum(1 for row in source_pin_rows.values() if row["category"] == category) for category in ("rust_sources", "typescript_sources", "fixture_files")} == {"rust_sources": 12, "typescript_sources": 3, "fixture_files": 20}, "current D10 pin category counts differ from the reviewed set")
+    expected_pin_counts = {"rust_sources": 12, "typescript_sources": 3, "frozen_fixture_files": 20}
+    runtime_need(d10_record.get("pin_counts") == expected_pin_counts and d10_record.get("verified_source_and_fixture_files") == 35, "D10 summary source-pin counts mismatch")
+    runtime_need(d10_record.get("assertions_initial") == 224 and d10_record.get("assertions_restored") == 224, "D10 summary assertion totals mismatch")
+    runtime_need(t01_record.get("assertions_initial") == 880 and t01_record.get("assertions_restored") == 880 and t01_record.get("name") == "local-state26-e6fb95" and t01_record.get("reference_commit") == "e6fb95f65f3bf91d46c1ab76136486f492529ebb", "T01/T02 summary profile or assertion totals mismatch")
+
+    def validate_process_status(status_name, output_prefix, expected_exit, expected_argv):
+        status = runtime_json(status_name)
+        runtime_need(set(status) == D10_PROCESS_STATUS_FIELDS, f"D10 process status fields differ from the reviewed recorder schema: {status_name}")
+        runtime_need(isinstance(status.get("name"), str) and status["name"].strip(), f"D10 process name is missing: {status_name}")
+        runtime_need(status.get("argv") == expected_argv, f"D10 process argv mismatch: {status_name}")
+        runtime_need(type(status.get("numeric_exit_status")) is int and status["numeric_exit_status"] == expected_exit, f"D10 process numeric exit status mismatch: {status_name}")
+        runtime_need(status.get("timed_out") is False and status.get("launch_error") is None and status.get("deferred_error") is None, f"D10 process did not complete cleanly: {status_name}")
+        runtime_need(type(status.get("deadline_seconds")) is int and status["deadline_seconds"] == 60 and type(status.get("elapsed_seconds")) in (int, float) and 0 <= status["elapsed_seconds"] <= 60, f"D10 process deadline/elapsed time mismatch: {status_name}")
+        runtime_need(isinstance(status.get("started_at_utc"), str) and re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?\+00:00", status["started_at_utc"]) is not None, f"D10 process UTC start time is malformed: {status_name}")
+        runtime_need(status.get("cwd") == D10_QUALIFICATION_ROOT, f"D10 process ran from an unexpected source root: {status_name}")
+        runtime_need(status.get("stdout_path") == "stdout.bin" and status.get("stderr_path") == "stderr.bin", f"D10 stream paths mismatch: {status_name}")
+        relative_tmp = output_prefix.split("/", 1)[1]
+        tmp_pattern = r"/private/tmp/aethyme-ts1135-qualified-[A-Za-z0-9_-]+/" + re.escape(relative_tmp)
+        environment = status.get("environment_allowlist")
+        runtime_need(isinstance(environment, dict) and set(environment) == {"LANG", "LC_ALL", "PATH", "TMPDIR", "TZ"}, f"D10 process environment allowlist mismatch: {status_name}")
+        runtime_need(environment == {
+            "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8",
+            "PATH": "/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+            "TMPDIR": environment.get("TMPDIR"), "TZ": "UTC",
+        } and isinstance(environment.get("TMPDIR"), str) and re.fullmatch(tmp_pattern, environment["TMPDIR"]) is not None, f"D10 process environment values or private TMPDIR mismatch: {status_name}")
+        streams = {}
+        for stream_name in ("stdout", "stderr"):
+            relative = f"{output_prefix}/{stream_name}.bin"
+            data = archived_payloads.get(relative)
+            runtime_need(data is not None, f"missing D10 process output {relative}")
+            runtime_need(type(status.get(f"{stream_name}_bytes")) is int and status[f"{stream_name}_bytes"] == len(data) and isinstance(status.get(f"{stream_name}_sha256"), str) and HEX64.fullmatch(status[f"{stream_name}_sha256"]) and status[f"{stream_name}_sha256"] == hashlib.sha256(data).hexdigest(), f"D10 process output metadata mismatch: {relative}")
+            streams[stream_name] = data
+        return status, streams
+
+    def validate_run_status(status_name, output_prefix, expected_exit, expected_script, expected_extra):
+        expected_argv = [D10_NODE_PATH, "--max-old-space-size=256", "--experimental-strip-types", expected_script, *expected_extra]
+        return validate_process_status(status_name, output_prefix, expected_exit, expected_argv)
+
+    node_version_status, node_version_streams = validate_process_status(
+        "attempt-002/node-version/status.json", "attempt-002/node-version", 0,
+        [D10_NODE_PATH, "--max-old-space-size=256", "--version"],
+    )
+    runtime_need(node_version_status.get("name") == "Node runtime version", "attempt-002 Node version process name mismatch")
+    node_version_stdout = node_version_streams["stdout"]
+    node_version_stderr = node_version_streams["stderr"]
+    runtime_need(node_version_stdout == b"v26.8.2\n" and node_version_stderr == b"", "attempt-002 Node version output mismatch")
+
+    def compare_positive(stage):
+        base = f"attempt-002/{stage}"
+        t01_status, t01_streams = validate_run_status(
+            f"{base}/t01-t02/status.json", f"{base}/t01-t02", 0,
+            "packages/aethyme-eval/local-v3/t01-canonical-parity/t01-canonical-parity.mts",
+            ["--source-profile", "local-state26-e6fb95"],
+        )
+        d10_status, d10_streams = validate_run_status(
+            f"{base}/d10/status.json", f"{base}/d10", 0,
+            "packages/aethyme-eval/local-v3/d10-identity-parity/d10-identity-parity.mts", [],
+        )
+        t01_stdout = strict_runtime_json(t01_streams["stdout"], f"{stage} T01/T02 stdout report")
+        d10_stdout = strict_runtime_json(d10_streams["stdout"], f"{stage} D10 stdout report")
+        runtime_need(t01_stdout.get("schema") == "aethyme.local-v3.t01-t02-typescript-parity.v1" and t01_stdout.get("status") == "pass" and t01_stdout.get("sourceProfile") == t01_record.get("name") and t01_stdout.get("referenceCommit") == t01_record.get("reference_commit") and t01_stdout.get("assertions") == 880 and t01_stdout.get("vectors") == t01_record.get("vectors"), f"T01/T02 output report mismatch at {stage}")
+        runtime_need(d10_stdout.get("schema") == "aethyme.local-d10-typescript-parity-report/v1" and d10_stdout.get("qualification_source_commit") == pins.get("qualification_source_commit") and d10_stdout.get("fixture_source_commit") == pins.get("fixture_source_commit") and d10_stdout.get("ordinal_manifest_sha256") == source_pin_rows.get("vectors/ordinal-supplement/manifest.json", {}).get("sha256") and d10_stdout.get("assertions") == 224 and d10_stdout.get("source_pins_sha256") == d10_record.get("source_pins_sha256") and d10_stdout.get("pin_counts") == expected_pin_counts and d10_stdout.get("vectors") == d10_record.get("vectors"), f"D10 output report mismatch at {stage}")
+        report_pin_map = {}
+        for row in d10_stdout.get("verified_files", []):
+            runtime_need(isinstance(row, dict) and set(row) == {"path", "sha256"} and isinstance(row.get("path"), str) and isinstance(row.get("sha256"), str) and HEX64.fullmatch(row["sha256"]), f"malformed D10 verified_files row at {stage}")
+            runtime_need(row["path"] not in report_pin_map, f"duplicate D10 verified_files path at {stage}: {row['path']}")
+            report_pin_map[row["path"]] = row["sha256"]
+        expected_report_pin_map = {name: value["sha256"] for name, value in source_pin_rows.items()}
+        runtime_need(len(report_pin_map) == 35 and report_pin_map == expected_report_pin_map, f"D10 output verified_files do not match current 35 source pins at {stage}")
+        # T01/T02 has its own report-time Rust and TypeScript pin rows. Check
+        # those bytes directly too; the D10 source-pins manifest does not list
+        # the T01/T02 runner itself or all of its frozen vector inputs.
+        t01_report_rows = []
+        for category in ("frozenSources", "typescriptSources"):
+            rows = t01_stdout.get(category)
+            runtime_need(isinstance(rows, list) and rows, f"T01/T02 {category} inventory missing at {stage}")
+            t01_report_rows.extend(rows)
+        t01_source_map = {}
+        for row in t01_report_rows:
+            runtime_need(isinstance(row, dict) and set(row) == {"path", "sha256"}, f"malformed T01/T02 source row at {stage}")
+            parts = path_parts(row.get("path"), f"T01/T02 {stage} source row")
+            name = "/".join(parts)
+            digest = row.get("sha256")
+            runtime_need(isinstance(digest, str) and HEX64.fullmatch(digest) and name not in t01_source_map, f"invalid/duplicate T01/T02 source pin at {stage}: {name}")
+            t01_source_map[name] = digest
+            _, current_bytes = safe_file(name, f"T01/T02 runtime pinned source {stage}")
+            runtime_need(current_bytes is not None and hashlib.sha256(current_bytes).hexdigest() == digest, f"T01/T02 report source differs from current tracked bytes at {stage}: {name}")
+        runtime_need(len(t01_source_map) == 19 and set(t01_source_map) == D10_T01_SOURCE_PATHS, f"T01/T02 report source inventory paths/count differ from the reviewed source set at {stage}")
+        runtime_need(t01_record.get("canonical_json_source_sha256") == t01_source_map.get("packages/aethyme/rust/crates/aethyme-contracts/src/experimental_v0/canonical_json.rs"), f"T01/T02 summary canonical JSON source pin mismatch at {stage}")
+        evaluation = runtime_json(f"attempt-002/{stage}/evaluation.json")
+        raw_positive = qualification["initial_positive" if stage == "initial-positive" else "restored_positive"]
+        runtime_need(evaluation == raw_positive.get("evaluation"), f"{stage} evaluation receipt differs from qualification results")
+        runtime_need(evaluation.get("pass") is True, f"{stage} did not report an overall pass")
+        eval_t01 = evaluation.get("t01_t02", {})
+        eval_d10 = evaluation.get("d10", {})
+        runtime_need(eval_t01.get("pass") is True and eval_t01.get("assertions") == 880 and eval_t01.get("source_profile") == t01_record.get("name") and eval_t01.get("reference_commit") == t01_record.get("reference_commit") and eval_t01.get("vectors") == t01_record.get("vectors"), f"{stage} T01/T02 evaluation summary mismatch")
+        runtime_need(eval_d10.get("pass") is True and eval_d10.get("assertions") == 224 and eval_d10.get("verified_file_count") == 35 and eval_d10.get("pin_counts") == expected_pin_counts and eval_d10.get("vectors") == d10_record.get("vectors"), f"{stage} D10 evaluation summary mismatch")
+        return {"t01_status": t01_status, "d10_status": d10_status, "t01_report": t01_stdout, "d10_report": d10_stdout}
+
+    positive_statuses = [compare_positive("initial-positive"), compare_positive("restored-positive")]
+    runtime_need(positive_statuses[0]["t01_status"]["cwd"] == positive_statuses[0]["d10_status"]["cwd"] == positive_statuses[1]["t01_status"]["cwd"] == positive_statuses[1]["d10_status"]["cwd"], "positive D10 runs do not share the recorded source worktree")
+    runtime_need(positive_statuses[0]["t01_report"] == positive_statuses[1]["t01_report"] and positive_statuses[0]["d10_report"] == positive_statuses[1]["d10_report"], "initial/restored T01/T02 or D10 reports differ")
+
+    # Attempt 001 is preserved as a negative historical record only. Its D10
+    # pass never becomes a complete T01/T02 + D10 qualification pair.
+    runtime_need(attempt1.get("classification") == "UNQUALIFIED_BASELINE_FAILURE" and attempt1.get("t01_t02_assertions") is None and attempt1.get("mutant_controls_run") == 0, "attempt-001 summary improperly grants qualification credit")
+    runtime_need(attempt1_results.get("overall_status") == "UNQUALIFIED_BASELINE_FAILURE" and not attempt1_results.get("controls") and not attempt1_results.get("t01_argument_controls"), "attempt-001 raw result is not the retained unqualified failure")
+    attempt1_eval = runtime_json("attempt-001/initial-positive/evaluation.json")
+    runtime_need(attempt1_eval == attempt1_results.get("initial_positive", {}).get("evaluation"), "attempt-001 raw evaluation receipt disagrees with qualification results")
+    attempt1_t01_status, attempt1_t01_streams = validate_run_status(
+        "attempt-001/initial-positive/t01-t02/status.json", "attempt-001/initial-positive/t01-t02", 1,
+        "packages/aethyme-eval/local-v3/t01-canonical-parity/t01-canonical-parity.mts", [],
+    )
+    attempt1_stderr = attempt1_t01_streams["stderr"].decode("utf-8")
+    attempt1_d10_status, attempt1_d10_streams = validate_run_status(
+        "attempt-001/initial-positive/d10/status.json", "attempt-001/initial-positive/d10", 0,
+        "packages/aethyme-eval/local-v3/d10-identity-parity/d10-identity-parity.mts", [],
+    )
+    attempt1_d10_report = strict_runtime_json(attempt1_d10_streams["stdout"], "attempt-001 D10 stdout report")
+    runtime_need(attempt1_eval.get("pass") is False and attempt1_eval.get("t01_t02", {}).get("assertions") is None and attempt1_eval.get("d10", {}).get("pass") is True and attempt1_eval.get("d10", {}).get("assertions") == 224, "attempt-001 raw evaluation does not show the recorded partial failure")
+    runtime_need(attempt1.get("d10_assertions") == attempt1_d10_report.get("assertions") == 224 and attempt1_d10_report.get("source_pins_sha256") == d10_record.get("source_pins_sha256"), "attempt-001 partial D10 output differs from retained summary")
+    runtime_need(type(attempt1.get("t01_exit_status")) is int and attempt1.get("t01_exit_status") == 1 and attempt1.get("t01_refusal") in attempt1_stderr, "attempt-001 stale-pin refusal is not present in retained stderr")
+    runtime_need(attempt1.get("source_checkpoint") == {
+        "branch": attempt1_start.get("worktree", {}).get("branch"),
+        "head": attempt1_start.get("worktree", {}).get("head"),
+        "status_paths": attempt1_start.get("worktree", {}).get("status_paths"),
+        "tree": attempt1_start.get("worktree", {}).get("tree"),
+    }, "attempt-001 checkpoint differs from archived start manifest")
+    runtime_need(hashlib.sha256(archived_payloads["drivers/reviewed-v3/offline_ts_qualification_1135-v3.py"]).hexdigest() == attempt1_start.get("qualification_driver_sha256"), "attempt-001 qualification-driver hash disagrees with archived reviewed v3 driver")
+
+    summary_controls = runtime_manifest.get("mutation_controls")
+    raw_controls = qualification.get("controls")
+    runtime_need(isinstance(summary_controls, list) and len(summary_controls) == len(expected_control_ids) and all(isinstance(row, dict) for row in summary_controls), "D10 summary mutation-control rows must be six objects")
+    runtime_need([row.get("id") for row in summary_controls] == expected_control_ids, "D10 summary mutation control inventory mismatch")
+    expected_summary_control_fields = {"id", "expected_assertion", "classification", "credited", "exact_restore", "restoration_clean", "backup_hashes", "restored_hashes"}
+    runtime_need(all(set(row) == expected_summary_control_fields for row in summary_controls), "D10 summary mutation-control row schema mismatch")
+    runtime_need(isinstance(raw_controls, list) and len(raw_controls) == len(expected_control_ids) and all(isinstance(row, dict) for row in raw_controls), "attempt-002 mutation-control rows must be six objects")
+    runtime_need([row.get("id") for row in raw_controls] == expected_control_ids, "attempt-002 mutation control inventory mismatch")
+    for summary_control, raw_control, expected_id in zip(summary_controls, raw_controls, expected_control_ids):
+        control_base = f"attempt-002/controls/{expected_id}"
+        control_receipt = runtime_json(f"{control_base}/control-status.json")
+        runtime_need(set(control_receipt) == {"backup_dir", "backup_files", "backup_hashes", "classification", "credited", "exact_restore", "executed", "expected_assertion", "expected_error_string_found", "forbidden_preflight_or_compile_error", "id", "mutant_pin_matches", "mutant_sha256", "mutant_source_pins_sha256", "process", "process_status_dir", "restoration_clean", "restore_errors", "restored_git_status_paths", "restored_hashes", "source_path", "stop_requested_signal"} and raw_control == control_receipt, f"mutation control raw/individual receipts differ from the reviewed row schema: {expected_id}")
+        expected_assertion = D10_CONTROL_ASSERTIONS[expected_id]
+        runtime_need(summary_control.get("id") == expected_id and summary_control.get("expected_assertion") == expected_assertion and raw_control.get("expected_assertion") == expected_assertion and control_receipt.get("expected_assertion") == expected_assertion, f"mutation assertion label differs from the frozen reviewed assertion: {expected_id}")
+        for field in ("classification", "credited", "exact_restore", "restoration_clean"):
+            runtime_need(summary_control.get(field) == raw_control.get(field) == control_receipt.get(field), f"mutation control {field} differs: {expected_id}")
+        runtime_need(control_receipt.get("id") == expected_id and control_receipt.get("executed") is True and control_receipt.get("credited") is True and control_receipt.get("classification") == "intended_named_assertion_failure", f"mutation control is not a credited intended assertion failure: {expected_id}")
+        runtime_need(control_receipt.get("exact_restore") is True and control_receipt.get("restoration_clean") is True and control_receipt.get("restored_git_status_paths") == [] and control_receipt.get("restore_errors") == [] and control_receipt.get("stop_requested_signal") is None, f"mutation restore receipt is incomplete: {expected_id}")
+        expected_source_path = D10_CONTROL_SOURCE_PATHS[expected_id]
+        runtime_need(control_receipt.get("source_path") == expected_source_path, f"mutation source path differs from the reviewed control target: {expected_id}")
+        backup_dir = control_receipt.get("backup_dir")
+        runtime_need(isinstance(backup_dir, str) and posixpath.isabs(backup_dir) and posixpath.normpath(backup_dir) == backup_dir, f"mutation backup_dir is not a canonical absolute path: {expected_id}")
+        archived_backup_dirs = {
+            name.rsplit("/", 1)[0]
+            for name in archived_payloads
+            if name.startswith(f"{control_base}/pristine-backup-")
+        }
+        runtime_need(len(archived_backup_dirs) == 1, f"mutation archived pristine-backup directory is missing or ambiguous: {expected_id}")
+        archived_backup_dir = next(iter(archived_backup_dirs))
+        archived_backup_token = posixpath.basename(archived_backup_dir)
+        runtime_need(re.fullmatch(r"pristine-backup-[A-Za-z0-9_-]+", archived_backup_token) is not None, f"mutation archived backup directory token is malformed: {expected_id}")
+        runtime_need(backup_dir.endswith(f"/controls/{expected_id}/{archived_backup_token}"), f"mutation backup_dir suffix does not bind to its unique archived backup directory: {expected_id}")
+        hashes = control_receipt.get("backup_hashes")
+        runtime_need(isinstance(hashes, dict) and hashes == control_receipt.get("restored_hashes") == summary_control.get("backup_hashes") == summary_control.get("restored_hashes"), f"mutation backup/restored hashes differ: {expected_id}")
+        runtime_need(set(hashes) == {"source", "source_pins"} and all(isinstance(value, str) and HEX64.fullmatch(value) for value in hashes.values()), f"mutation restore hashes malformed: {expected_id}")
+        runtime_need(hashes.get("source") == source_pin_rows.get(expected_source_path, {}).get("sha256") and hashes.get("source_pins") == D10_PIN_FILE_SHA256, f"mutation pristine backup hashes do not match current pinned source/pin bytes: {expected_id}")
+        runtime_need(control_receipt.get("mutant_pin_matches") is True and isinstance(control_receipt.get("mutant_sha256"), str) and HEX64.fullmatch(control_receipt["mutant_sha256"]) and control_receipt["mutant_sha256"] != hashes["source"] and isinstance(control_receipt.get("mutant_source_pins_sha256"), str) and HEX64.fullmatch(control_receipt["mutant_source_pins_sha256"]) and control_receipt["mutant_source_pins_sha256"] != D10_PIN_FILE_SHA256, f"mutation did not record a distinct pinned mutant: {expected_id}")
+        for file_key, basename in (("source", "source.bytes"), ("source_pins", "source-pins.json")):
+            matches = [name for name in archived_payloads if name.startswith(f"{control_base}/pristine-backup-") and name.endswith(f"/{basename}")]
+            runtime_need(len(matches) == 1, f"mutation pristine backup is missing or ambiguous: {expected_id}/{basename}")
+            backup_data = archived_payloads[matches[0]]
+            backup_files = control_receipt.get("backup_files")
+            runtime_need(isinstance(backup_files, dict) and set(backup_files) == {"source", "source_pins"}, f"mutation backup-file metadata schema mismatch: {expected_id}")
+            backup_meta = backup_files[file_key]
+            runtime_need(isinstance(backup_meta, dict) and set(backup_meta) == {"path", "bytes", "sha256"}, f"mutation backup-file row schema mismatch: {expected_id}/{basename}")
+            runtime_need(isinstance(backup_meta.get("path"), str) and posixpath.isabs(backup_meta["path"]) and posixpath.normpath(backup_meta["path"]) == backup_meta["path"] and backup_meta["path"] == posixpath.join(backup_dir, basename), f"mutation backup file path does not equal backup_dir/{basename}: {expected_id}")
+            runtime_need(backup_meta.get("bytes") == len(backup_data) and backup_meta.get("sha256") == hashlib.sha256(backup_data).hexdigest() == hashes[file_key], f"mutation pristine backup bytes/hash mismatch: {expected_id}/{basename}")
+            if file_key == "source":
+                _, pristine_target_bytes = safe_file(expected_source_path, f"D10 pristine control target {expected_id}")
+                runtime_need(pristine_target_bytes is not None and backup_data == pristine_target_bytes, f"mutation source backup differs byte-for-byte from current pinned target: {expected_id}")
+            else:
+                runtime_need(backup_data == strict_current_pin_bytes, f"mutation source-pins backup differs byte-for-byte from current pristine pin file: {expected_id}")
+        d10_status, d10_streams = validate_run_status(
+            f"{control_base}/d10/status.json", f"{control_base}/d10", 1,
+            "packages/aethyme-eval/local-v3/d10-identity-parity/d10-identity-parity.mts", [],
+        )
+        control_tmpdir = d10_status["environment_allowlist"]["TMPDIR"]
+        runtime_need(backup_dir == posixpath.join(posixpath.dirname(control_tmpdir), archived_backup_token), f"mutation backup_dir is not in the recorded private control run directory: {expected_id}")
+        process_receipt = control_receipt.get("process")
+        runtime_need(isinstance(process_receipt, dict) and set(process_receipt) == {"argv", "elapsed_seconds", "timed_out", "numeric_exit_status", "launch_error", "stdout_bytes", "stderr_bytes", "stdout_sha256", "stderr_sha256"}, f"mutation process receipt fields mismatch: {expected_id}")
+        runtime_need(type(process_receipt.get("numeric_exit_status")) is int and process_receipt["numeric_exit_status"] == 1 and process_receipt.get("timed_out") is False and process_receipt.get("launch_error") is None and control_receipt.get("forbidden_preflight_or_compile_error") is False and control_receipt.get("expected_error_string_found") is True, f"mutation process did not reach its intended assertion: {expected_id}")
+        expected_process_receipt = {key: d10_status[key] for key in ("argv", "elapsed_seconds", "timed_out", "numeric_exit_status", "launch_error", "stdout_bytes", "stderr_bytes", "stdout_sha256", "stderr_sha256")}
+        runtime_need(raw_control.get("process") == process_receipt == expected_process_receipt, f"mutation process receipts disagree with the full recorded process status: {expected_id}")
+        runtime_need(process_receipt.get("stderr_sha256") == hashlib.sha256(d10_streams["stderr"]).hexdigest() and process_receipt.get("stdout_sha256") == hashlib.sha256(d10_streams["stdout"]).hexdigest(), f"mutation stream hashes disagree: {expected_id}")
+        control_stderr = d10_streams["stderr"].decode("utf-8")
+        error_lines = [line for line in control_stderr.splitlines() if line.startswith("Error: ")]
+        runtime_need(error_lines == [D10_CONTROL_ERROR_LINES[expected_id]], f"mutation stderr lacks the one exact frozen assertion error line: {expected_id}")
+        combined_control_output = d10_streams["stdout"] + b"\n" + d10_streams["stderr"]
+        forbidden_markers = (b"SyntaxError", b"ERR_MODULE_NOT_FOUND", b"ERR_UNSUPPORTED_TYPESCRIPT_SYNTAX", b"Cannot find module", b"Cannot find package")
+        runtime_need(not any(marker in combined_control_output for marker in forbidden_markers), f"mutation process hit a preflight/compile/module error: {expected_id}")
+
+    expected_arguments = {
+        "t01-unknown-source-profile": "Error: unsupported T01 source profile: local-state26-unreviewed\n",
+        "t01-unsupported-arguments": "Error: unsupported T01 command-line arguments: --unexpected\n",
+    }
+    summary_arguments = runtime_manifest.get("parser_refusal_controls")
+    raw_arguments = qualification.get("t01_argument_controls")
+    runtime_need(isinstance(summary_arguments, list) and len(summary_arguments) == len(expected_arguments) and all(isinstance(row, dict) for row in summary_arguments), "D10 parser-refusal summary rows must be exactly two objects")
+    runtime_need([row.get("id") for row in summary_arguments] == list(expected_arguments), "D10 parser-refusal summary inventory mismatch")
+    expected_summary_argument_fields = {"id", "expected_stderr", "stderr_sha256", "numeric_exit_status", "exact_parser_refusal"}
+    runtime_need(all(set(row) == expected_summary_argument_fields for row in summary_arguments), "D10 parser-refusal summary row schema mismatch")
+    runtime_need(isinstance(raw_arguments, list) and len(raw_arguments) == len(expected_arguments) and all(isinstance(row, dict) for row in raw_arguments), "D10 parser-refusal raw rows must be exactly two objects")
+    runtime_need([row.get("id") for row in raw_arguments] == list(expected_arguments), "D10 parser-refusal raw inventory mismatch")
+    runtime_need(all(set(row) == {"argv", "exact_parser_refusal", "expected_stderr", "id", "launch_error", "numeric_exit_status", "pass", "stderr_bytes", "stderr_sha256", "stdout_bytes", "stdout_sha256", "timed_out"} for row in raw_arguments), "D10 parser-refusal raw row schema mismatch")
+    for summary_argument, raw_argument, (argument_id, expected_stderr) in zip(summary_arguments, raw_arguments, expected_arguments.items()):
+        argument_base = f"attempt-002/argument-controls/{argument_id}"
+        status, streams = validate_run_status(
+            f"{argument_base}/status.json", argument_base, 2,
+            "packages/aethyme-eval/local-v3/t01-canonical-parity/t01-canonical-parity.mts",
+            ["--source-profile", "local-state26-unreviewed"] if argument_id == "t01-unknown-source-profile" else ["--unexpected"],
+        )
+        runtime_need(type(raw_argument.get("numeric_exit_status")) is int and raw_argument.get("pass") is True and raw_argument.get("argv") == status.get("argv") and raw_argument.get("numeric_exit_status") == status.get("numeric_exit_status") and raw_argument.get("stdout_bytes") == status.get("stdout_bytes") and raw_argument.get("stdout_sha256") == status.get("stdout_sha256") and raw_argument.get("stderr_bytes") == status.get("stderr_bytes") and raw_argument.get("stderr_sha256") == status.get("stderr_sha256") and raw_argument.get("timed_out") == status.get("timed_out") and raw_argument.get("launch_error") == status.get("launch_error"), f"parser-refusal process receipts disagree: {argument_id}")
+        runtime_need(summary_argument.get("expected_stderr") == raw_argument.get("expected_stderr") == expected_stderr and summary_argument.get("stderr_sha256") == raw_argument.get("stderr_sha256") == hashlib.sha256(streams["stderr"]).hexdigest(), f"parser-refusal stderr receipt mismatch: {argument_id}")
+        runtime_need(type(summary_argument.get("numeric_exit_status")) is int and summary_argument.get("numeric_exit_status") == raw_argument.get("numeric_exit_status") == status.get("numeric_exit_status") == 2 and summary_argument.get("exact_parser_refusal") is True and raw_argument.get("exact_parser_refusal") is True and streams["stderr"].decode("utf-8") == expected_stderr and streams["stdout"] == b"", f"parser-refusal output/exit mismatch: {argument_id}")
+
+    runtime_need(len(errors) == runtime_errors_before, "D10 runtime integrity checks reported an error")
+    d10_runtime_summary = {
+        "archive_members_verified": len(archived_payloads),
+        "attempt_001_disposition": "historical unqualified baseline failure; its partial D10 pass is not credited",
+        "attempt_002_source_checkpoint": {"commit": checkpoint["commit"], "tree": checkpoint["tree"]},
+        "attempt_002_positive_pairs": 2,
+        "t01_t02_assertions_per_pair": 880,
+        "d10_assertions_per_pair": 224,
+        "d10_verified_source_and_fixture_files_per_pair": 35,
+        "mutation_controls_verified": 6,
+        "parser_refusal_controls_verified": 2,
+        "attempt_006_status": "historical metadata only; no current runtime qualification credit",
+        "qualification_scope": "finite offline eval-side TypeScript contract parity only; no production consumer, product runtime, or Aethyme evaluation claim",
+    }
+except (OSError, ValueError, TypeError, KeyError, UnicodeError, tarfile.TarError, json.JSONDecodeError) as exc:
+    fail("D10 runtime qualification archive", str(exc))
+    d10_runtime_summary = {
+        "integrity_verified": False,
+        "qualification_credit": "none; required D10 runtime archive checks did not complete",
+    }
+if len(errors) > runtime_errors_before and d10_runtime_summary is not None:
+    d10_runtime_summary["integrity_verified"] = False
+    d10_runtime_summary["qualification_credit"] = "none; required D10 runtime archive checks reported errors"
+elif d10_runtime_summary is not None:
+    d10_runtime_summary["integrity_verified"] = True
+    d10_runtime_summary["qualification_credit"] = "bounded profile qualification at the recorded source checkpoint only"
+
+# Preserve the v6 local-summary-link check, with safe paths and required source files.
+links = 0
+
+def safe_link_target(relative_target, label):
+    """Resolve a local markdown target without following symlinks or leaving root."""
+    if "\x00" in relative_target or "\\" in relative_target or relative_target.startswith("/"):
+        fail(label, f"unsafe link target {relative_target!r}")
+        return
+    if re.match(r"\A[A-Za-z]:", relative_target):
+        fail(label, f"drive-qualified link target {relative_target!r}")
+        return
+    combined = posixpath.normpath(posixpath.join(posixpath.dirname(label), relative_target))
+    if combined in ("", ".", "..") or combined.startswith("../") or combined.startswith("/"):
+        fail(label, f"link escapes root: {relative_target}")
+        return
+    current = root
+    parts = combined.split("/")
+    for index, part in enumerate(parts):
+        current = current / part
+        try:
+            info = current.lstat()
+        except OSError as exc:
+            fail(label, f"missing link target {relative_target}: {exc}")
+            return
+        if stat.S_ISLNK(info.st_mode):
+            fail(label, f"symlink link target {relative_target}")
+            return
+        if index < len(parts) - 1 and not stat.S_ISDIR(info.st_mode):
+            fail(label, f"non-directory link component {relative_target}")
+            return
+        if index == len(parts) - 1 and not (stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode)):
+            fail(label, f"invalid link target {relative_target}")
+
+for name in ("local-v3-qualification.md", "local-v3-autonomous-controller.md", "local-v3-native-gates.md"):
+    relative = f"packages/aethyme/docs/architecture/{name}"
+    _, summary_bytes = safe_file(relative, name)
+    if summary_bytes is None:
+        continue
+    for label, target in re.findall(r"\[([^\]]+)\]\(([^)]+)\)", summary_bytes.decode("utf-8", errors="replace")):
+        target = target.strip("<>")
+        url = urllib.parse.urlsplit(target)
+        if url.scheme or not url.path:
+            continue
+        links += 1
+        decoded_path = urllib.parse.unquote(url.path)
+        safe_link_target(decoded_path, relative)
+
+result = {
+    "verification_scope": "retained artifact integrity and local links only; does not establish Local qualification or operator rehearsal completion",
+    "source_head": subprocess.check_output(["/opt/homebrew/bin/git", "rev-parse", "HEAD"], cwd=root, text=True).strip(),
+    "unique_payloads": len(seen),
+    "groups": groups,
+    "local_summary_links": links,
+    "archive_groups": archive_groups,
+    "identity_attempt_inventory": identity_summary,
+    "d10_typescript_additive_profile_integrity": d10_summary,
+    "d10_typescript_runtime_qualification_integrity": d10_runtime_summary,
+    "errors": errors,
+}
+print(json.dumps(result, indent=2))
+sys.exit(bool(errors))

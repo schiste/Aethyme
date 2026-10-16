@@ -1,0 +1,493 @@
+{
+  "schema": "aethyme.local.qualification.evidence/provisional-v0",
+  "status": "selected_checks_passed",
+  "complete_local_qualification": false,
+  "source_commit": "9179a3efb05493a6fb7a15761b257f88bb569a3c",
+  "source_tree": "05e95acd91580a98b3f3ae31e10af1be14806745",
+  "independent_review": {
+    "status": "clear",
+    "implementation_commit": "caaeba6030f869f5e5d9643ff4a7f01a604ce74e",
+    "parent_fixture_review_commit": "2a60952cdbdaa3f3c6dc403663ab5253a0af5e96",
+    "review_execution": "read-only private snapshots; no Cargo"
+  },
+  "denominator": {
+    "selected_passed_executions": 443,
+    "selected_ignored_executions": 7,
+    "unique_scenario_count": null
+  },
+  "required_pending": [
+    "E1 structural composition requalification",
+    "native gate join after other-owned #725",
+    "configured live Playground GitHub/Mergify qualification",
+    "matched brief-usefulness/evolution and remaining Local qualification"
+  ],
+  "rows": [
+    {
+      "kind": "restored_selected_test",
+      "source_commit": "9179a3efb05493a6fb7a15761b257f88bb569a3c",
+      "source_tree": "05e95acd91580a98b3f3ae31e10af1be14806745",
+      "profile": "Local provisional stack; Playground source/native fixtures",
+      "argv": [
+        "cargo",
+        "test",
+        "--locked",
+        "-j",
+        "4",
+        "--manifest-path",
+        "packages/aethyme/rust/Cargo.toml",
+        "-p",
+        "aethyme-broker",
+        "--lib",
+        "local_",
+        "--",
+        "--test-threads=4"
+      ],
+      "exit_status": 0,
+      "stdout_and_stderr_sha256": "9b612c18d074feba98ce4de2947817fe11c44fffdab12d0107a48375ca1de811",
+      "bytes": 19425,
+      "counts": {
+        "passed": 179,
+        "failed": 0,
+        "ignored": 2
+      },
+      "environment": {
+        "PATH": "/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:$HOME/.cargo/bin",
+        "RUSTC_WRAPPER": "",
+        "CARGO_TARGET_DIR": "external exclusive root qualification cache"
+      },
+      "limitations": [
+        "overlapping selections are executions, not unique scenarios",
+        "ignored helpers are not ordinary selected passes",
+        "does not establish whole Local Q3/Q4 closure",
+        "handshake and child schedules are not verification confinement or tree cleanup"
+      ]
+    },
+    {
+      "kind": "restored_selected_test",
+      "source_commit": "9179a3efb05493a6fb7a15761b257f88bb569a3c",
+      "source_tree": "05e95acd91580a98b3f3ae31e10af1be14806745",
+      "profile": "Local provisional stack; Playground source/native fixtures",
+      "argv": [
+        "cargo",
+        "test",
+        "--locked",
+        "-j",
+        "4",
+        "--manifest-path",
+        "packages/aethyme/rust/Cargo.toml",
+        "-p",
+        "aethyme-broker",
+        "--lib",
+        "collaboration_",
+        "--",
+        "--test-threads=4"
+      ],
+      "exit_status": 0,
+      "stdout_and_stderr_sha256": "71a5cffba7e72b72158a35904afe54899ed86a5728c9dc2b5239ad6b8874ed37",
+      "bytes": 14818,
+      "counts": {
+        "passed": 151,
+        "failed": 0,
+        "ignored": 4
+      },
+      "environment": {
+        "PATH": "/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:$HOME/.cargo/bin",
+        "RUSTC_WRAPPER": "",
+        "CARGO_TARGET_DIR": "external exclusive root qualification cache"
+      },
+      "limitations": [
+        "overlapping selections are executions, not unique scenarios",
+        "ignored helpers are not ordinary selected passes",
+        "does not establish whole Local Q3/Q4 closure",
+        "handshake and child schedules are not verification confinement or tree cleanup"
+      ]
+    },
+    {
+      "kind": "restored_selected_test",
+      "source_commit": "9179a3efb05493a6fb7a15761b257f88bb569a3c",
+      "source_tree": "05e95acd91580a98b3f3ae31e10af1be14806745",
+      "profile": "Local provisional stack; Playground source/native fixtures",
+      "argv": [
+        "cargo",
+        "test",
+        "--locked",
+        "-j",
+        "4",
+        "--manifest-path",
+        "packages/aethyme/rust/Cargo.toml",
+        "-p",
+        "aethyme-broker",
+        "--lib",
+        "execution_snapshot::tests",
+        "--",
+        "--test-threads=4"
+      ],
+      "exit_status": 0,
+      "stdout_and_stderr_sha256": "bf2502cbc10f0aa270b748a7e76d4008fcbc3a4e74c891439b740e79a5959dc3",
+      "bytes": 1648,
+      "counts": {
+        "passed": 14,
+        "failed": 0,
+        "ignored": 0
+      },
+      "environment": {
+        "PATH": "/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:$HOME/.cargo/bin",
+        "RUSTC_WRAPPER": "",
+        "CARGO_TARGET_DIR": "external exclusive root qualification cache"
+      },
+      "limitations": [
+        "overlapping selections are executions, not unique scenarios",
+        "ignored helpers are not ordinary selected passes",
+        "does not establish whole Local Q3/Q4 closure",
+        "handshake and child schedules are not verification confinement or tree cleanup"
+      ]
+    },
+    {
+      "kind": "restored_selected_test",
+      "source_commit": "9179a3efb05493a6fb7a15761b257f88bb569a3c",
+      "source_tree": "05e95acd91580a98b3f3ae31e10af1be14806745",
+      "profile": "Local provisional stack; Playground source/native fixtures",
+      "argv": [
+        "cargo",
+        "test",
+        "--locked",
+        "-j",
+        "4",
+        "--manifest-path",
+        "packages/aethyme/rust/Cargo.toml",
+        "-p",
+        "aethyme-broker",
+        "--lib",
+        "execution_verifier::tests",
+        "--",
+        "--test-threads=4"
+      ],
+      "exit_status": 0,
+      "stdout_and_stderr_sha256": "b74f3775bf6398ef927aca89e70c824a0dcac23c37c98c51bb1a1f4537082b50",
+      "bytes": 1491,
+      "counts": {
+        "passed": 10,
+        "failed": 0,
+        "ignored": 1
+      },
+      "environment": {
+        "PATH": "/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:$HOME/.cargo/bin",
+        "RUSTC_WRAPPER": "",
+        "CARGO_TARGET_DIR": "external exclusive root qualification cache"
+      },
+      "limitations": [
+        "overlapping selections are executions, not unique scenarios",
+        "ignored helpers are not ordinary selected passes",
+        "does not establish whole Local Q3/Q4 closure",
+        "handshake and child schedules are not verification confinement or tree cleanup"
+      ]
+    },
+    {
+      "kind": "restored_selected_test",
+      "source_commit": "9179a3efb05493a6fb7a15761b257f88bb569a3c",
+      "source_tree": "05e95acd91580a98b3f3ae31e10af1be14806745",
+      "profile": "Local provisional stack; Playground source/native fixtures",
+      "argv": [
+        "cargo",
+        "test",
+        "--locked",
+        "-j",
+        "4",
+        "--manifest-path",
+        "packages/aethyme/rust/Cargo.toml",
+        "-p",
+        "aethyme-broker",
+        "--lib",
+        "review::tests",
+        "--",
+        "--test-threads=4"
+      ],
+      "exit_status": 0,
+      "stdout_and_stderr_sha256": "000761fc4102d3b96bd760cf31ba8da07a4b16bf7318fbadb28a983b2ad45dd9",
+      "bytes": 1398,
+      "counts": {
+        "passed": 14,
+        "failed": 0,
+        "ignored": 0
+      },
+      "environment": {
+        "PATH": "/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:$HOME/.cargo/bin",
+        "RUSTC_WRAPPER": "",
+        "CARGO_TARGET_DIR": "external exclusive root qualification cache"
+      },
+      "limitations": [
+        "overlapping selections are executions, not unique scenarios",
+        "ignored helpers are not ordinary selected passes",
+        "does not establish whole Local Q3/Q4 closure",
+        "handshake and child schedules are not verification confinement or tree cleanup"
+      ]
+    },
+    {
+      "kind": "restored_selected_test",
+      "source_commit": "9179a3efb05493a6fb7a15761b257f88bb569a3c",
+      "source_tree": "05e95acd91580a98b3f3ae31e10af1be14806745",
+      "profile": "Local provisional stack; Playground source/native fixtures",
+      "argv": [
+        "cargo",
+        "test",
+        "--locked",
+        "-j",
+        "4",
+        "--manifest-path",
+        "packages/aethyme/rust/Cargo.toml",
+        "-p",
+        "aethyme-broker",
+        "--lib",
+        "ship::tests",
+        "--",
+        "--test-threads=4"
+      ],
+      "exit_status": 0,
+      "stdout_and_stderr_sha256": "6d11ccbc652499060bcad0d8386c8513fb77f5b0d3537fd8c0c90f3901ffb667",
+      "bytes": 1117,
+      "counts": {
+        "passed": 10,
+        "failed": 0,
+        "ignored": 0
+      },
+      "environment": {
+        "PATH": "/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:$HOME/.cargo/bin",
+        "RUSTC_WRAPPER": "",
+        "CARGO_TARGET_DIR": "external exclusive root qualification cache"
+      },
+      "limitations": [
+        "overlapping selections are executions, not unique scenarios",
+        "ignored helpers are not ordinary selected passes",
+        "does not establish whole Local Q3/Q4 closure",
+        "handshake and child schedules are not verification confinement or tree cleanup"
+      ]
+    },
+    {
+      "kind": "restored_selected_test",
+      "source_commit": "9179a3efb05493a6fb7a15761b257f88bb569a3c",
+      "source_tree": "05e95acd91580a98b3f3ae31e10af1be14806745",
+      "profile": "Local provisional stack; Playground source/native fixtures",
+      "argv": [
+        "cargo",
+        "test",
+        "--locked",
+        "-j",
+        "4",
+        "--manifest-path",
+        "packages/aethyme/rust/Cargo.toml",
+        "-p",
+        "aethyme-broker",
+        "--lib",
+        "git::",
+        "--",
+        "--test-threads=4"
+      ],
+      "exit_status": 0,
+      "stdout_and_stderr_sha256": "c558ee34060e615d5a03dabdc0ce10a594db7eea6080d58ebdc77b41a1ecb471",
+      "bytes": 3439,
+      "counts": {
+        "passed": 36,
+        "failed": 0,
+        "ignored": 0
+      },
+      "environment": {
+        "PATH": "/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:$HOME/.cargo/bin",
+        "RUSTC_WRAPPER": "",
+        "CARGO_TARGET_DIR": "external exclusive root qualification cache"
+      },
+      "limitations": [
+        "overlapping selections are executions, not unique scenarios",
+        "ignored helpers are not ordinary selected passes",
+        "does not establish whole Local Q3/Q4 closure",
+        "handshake and child schedules are not verification confinement or tree cleanup"
+      ]
+    },
+    {
+      "kind": "restored_selected_test",
+      "source_commit": "9179a3efb05493a6fb7a15761b257f88bb569a3c",
+      "source_tree": "05e95acd91580a98b3f3ae31e10af1be14806745",
+      "profile": "Local provisional stack; Playground source/native fixtures",
+      "argv": [
+        "cargo",
+        "test",
+        "--locked",
+        "-j",
+        "4",
+        "--manifest-path",
+        "packages/aethyme/rust/Cargo.toml",
+        "-p",
+        "aethyme-broker",
+        "--lib",
+        "composer::tests",
+        "--",
+        "--test-threads=4"
+      ],
+      "exit_status": 0,
+      "stdout_and_stderr_sha256": "4057e55c96ee347afcac493926911b3481c7c7299892c970938c2af60b2c7026",
+      "bytes": 901,
+      "counts": {
+        "passed": 8,
+        "failed": 0,
+        "ignored": 0
+      },
+      "environment": {
+        "PATH": "/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:$HOME/.cargo/bin",
+        "RUSTC_WRAPPER": "",
+        "CARGO_TARGET_DIR": "external exclusive root qualification cache"
+      },
+      "limitations": [
+        "overlapping selections are executions, not unique scenarios",
+        "ignored helpers are not ordinary selected passes",
+        "does not establish whole Local Q3/Q4 closure",
+        "handshake and child schedules are not verification confinement or tree cleanup"
+      ]
+    },
+    {
+      "kind": "restored_selected_test",
+      "source_commit": "9179a3efb05493a6fb7a15761b257f88bb569a3c",
+      "source_tree": "05e95acd91580a98b3f3ae31e10af1be14806745",
+      "profile": "Local provisional stack; Playground source/native fixtures",
+      "argv": [
+        "cargo",
+        "test",
+        "--locked",
+        "-j",
+        "4",
+        "--manifest-path",
+        "packages/aethyme/rust/Cargo.toml",
+        "-p",
+        "aethyme-testkit",
+        "--test",
+        "broker_discarded_results",
+        "--",
+        "--test-threads=4"
+      ],
+      "exit_status": 0,
+      "stdout_and_stderr_sha256": "31fb97424eaacf9fe12637fa433f979caddf20a587585d7ec0aa95467374fd9e",
+      "bytes": 497,
+      "counts": {
+        "passed": 3,
+        "failed": 0,
+        "ignored": 0
+      },
+      "environment": {
+        "PATH": "/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:$HOME/.cargo/bin",
+        "RUSTC_WRAPPER": "",
+        "CARGO_TARGET_DIR": "external exclusive root qualification cache"
+      },
+      "limitations": [
+        "overlapping selections are executions, not unique scenarios",
+        "ignored helpers are not ordinary selected passes",
+        "does not establish whole Local Q3/Q4 closure",
+        "handshake and child schedules are not verification confinement or tree cleanup"
+      ]
+    },
+    {
+      "kind": "restored_selected_test",
+      "source_commit": "9179a3efb05493a6fb7a15761b257f88bb569a3c",
+      "source_tree": "05e95acd91580a98b3f3ae31e10af1be14806745",
+      "profile": "Local provisional stack; Playground source/native fixtures",
+      "argv": [
+        "cargo",
+        "test",
+        "--locked",
+        "-j",
+        "4",
+        "--manifest-path",
+        "packages/aethyme/rust/Cargo.toml",
+        "-p",
+        "aethyme-testkit",
+        "--test",
+        "deprecated_spelling_callers",
+        "--",
+        "--test-threads=4"
+      ],
+      "exit_status": 0,
+      "stdout_and_stderr_sha256": "21f0ea23eae4bd8a6d95ce1ac2ddd353b1e9755fda70e3bfc6aa24427d805ea5",
+      "bytes": 595,
+      "counts": {
+        "passed": 4,
+        "failed": 0,
+        "ignored": 0
+      },
+      "environment": {
+        "PATH": "/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:$HOME/.cargo/bin",
+        "RUSTC_WRAPPER": "",
+        "CARGO_TARGET_DIR": "external exclusive root qualification cache"
+      },
+      "limitations": [
+        "overlapping selections are executions, not unique scenarios",
+        "ignored helpers are not ordinary selected passes",
+        "does not establish whole Local Q3/Q4 closure",
+        "handshake and child schedules are not verification confinement or tree cleanup"
+      ]
+    },
+    {
+      "kind": "restored_selected_test",
+      "source_commit": "9179a3efb05493a6fb7a15761b257f88bb569a3c",
+      "source_tree": "05e95acd91580a98b3f3ae31e10af1be14806745",
+      "profile": "Local provisional stack; Playground source/native fixtures",
+      "argv": [
+        "cargo",
+        "test",
+        "--locked",
+        "-j",
+        "4",
+        "--manifest-path",
+        "packages/aethyme/rust/Cargo.toml",
+        "-p",
+        "aethyme-testkit",
+        "--test",
+        "docs_hygiene",
+        "--",
+        "--test-threads=4"
+      ],
+      "exit_status": 0,
+      "stdout_and_stderr_sha256": "d8c28b0de2475d5da4d6abf4479191a46e18b2bc7dc175a4dd66aa37a60d38ee",
+      "bytes": 835,
+      "counts": {
+        "passed": 14,
+        "failed": 0,
+        "ignored": 0
+      },
+      "environment": {
+        "PATH": "/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:$HOME/.cargo/bin",
+        "RUSTC_WRAPPER": "",
+        "CARGO_TARGET_DIR": "external exclusive root qualification cache"
+      },
+      "limitations": [
+        "overlapping selections are executions, not unique scenarios",
+        "ignored helpers are not ordinary selected passes",
+        "does not establish whole Local Q3/Q4 closure",
+        "handshake and child schedules are not verification confinement or tree cleanup"
+      ]
+    },
+    {
+      "kind": "strict_clippy",
+      "source_commit": "9179a3efb05493a6fb7a15761b257f88bb569a3c",
+      "source_tree": "05e95acd91580a98b3f3ae31e10af1be14806745",
+      "argv": [
+        "cargo",
+        "clippy",
+        "--locked",
+        "-j",
+        "4",
+        "--manifest-path",
+        "packages/aethyme/rust/Cargo.toml",
+        "-p",
+        "aethyme-broker",
+        "--lib",
+        "--tests",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "exit_status": 0,
+      "stdout_and_stderr_sha256": "51969ff44e9a648a96e7d62499d2728430afd455cf96a1ecb9f47d9bce383d3a",
+      "bytes": 2027,
+      "limitations": [
+        "static lint; not runtime qualification"
+      ]
+    }
+  ]
+}

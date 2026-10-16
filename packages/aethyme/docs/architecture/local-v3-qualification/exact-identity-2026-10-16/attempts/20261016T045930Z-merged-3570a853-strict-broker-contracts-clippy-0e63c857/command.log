@@ -1,0 +1,188 @@
+    Checking aethyme-contracts v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/complete-exact-immutable-contribution-co/packages/aethyme/rust/crates/aethyme-contracts)
+   Compiling aethyme-engine v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/complete-exact-immutable-contribution-co/packages/aethyme/rust/crates/aethyme-engine)
+   Compiling aethyme-broker v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/complete-exact-immutable-contribution-co/packages/aethyme/rust/crates/aethyme-broker)
+error: this function has too many arguments (8/7)
+   --> crates/aethyme-broker/src/composer.rs:714:1
+    |
+714 | / fn compose_inner(
+715 | |     store: &mut CollaborationStore,
+716 | |     repo: &Path,
+717 | |     request: &CompositionRequest,
+...   |
+722 | |     profile: &mut MergeProfile<'_>,
+723 | | ) -> Result<Composition, ComposeError> {
+    | |______________________________________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#too_many_arguments
+    = note: `-D clippy::too-many-arguments` implied by `-D warnings`
+    = help: to override `-D warnings` add `#[allow(clippy::too_many_arguments)]`
+
+error: this function has too many arguments (8/7)
+    --> crates/aethyme-broker/src/composer.rs:2303:1
+     |
+2303 | / fn recipe_record(
+2304 | |     candidate: &Candidate,
+2305 | |     plan: &Plan,
+2306 | |     request: &CompositionRequest,
+...    |
+2311 | |     profile: &MergeProfile<'_>,
+2312 | | ) -> Result<(Vec<u8>, RecordId), ComposeError> {
+     | |______________________________________________^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#too_many_arguments
+
+error: manual implementation of `.is_multiple_of()`
+   --> crates/aethyme-broker/src/local_exchange.rs:127:8
+    |
+127 |     if value.len() % 2 != 0 || value.len() / 2 > max_bytes {
+    |        ^^^^^^^^^^^^^^^^^^^^ help: replace with: `!value.len().is_multiple_of(2)`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#manual_is_multiple_of
+    = note: `-D clippy::manual-is-multiple-of` implied by `-D warnings`
+    = help: to override `-D warnings` add `#[allow(clippy::manual_is_multiple_of)]`
+
+error: large size difference between variants
+   --> crates/aethyme-broker/src/local_exchange.rs:285:1
+    |
+285 | /   pub enum Metadata {
+286 | | /     Contribution {
+287 | | |         contribution: String,
+288 | | |         source: String,
+289 | | |         availability: SourceAvailability,
+...   | |
+292 | | |         brief: Option<String>,
+293 | | |     },
+    | | |_____- the second-largest variant contains at least 152 bytes
+...   |
+297 | | /     RevisionContribution {
+298 | | |         project_id: String,
+299 | | |         descriptor_record_id: String,
+300 | | |         descriptor_object_sha256: String,
+...   | |
+315 | | |         scope: Vec<String>,
+316 | | |     },
+    | | |_____- the largest variant contains at least 400 bytes
+...   |
+322 | |       },
+323 | |   }
+    | |___^ the entire enum is at least 400 bytes
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#large_enum_variant
+    = note: `-D clippy::large-enum-variant` implied by `-D warnings`
+    = help: to override `-D warnings` add `#[allow(clippy::large_enum_variant)]`
+help: consider boxing the large fields or introducing indirection in some other way to reduce the total size of the enum
+    |
+314 -         availability: SourceAvailability,
+314 +         availability: Box<SourceAvailability>,
+    |
+
+error: manual implementation of `.is_multiple_of()`
+   --> crates/aethyme-broker/src/local_exchange.rs:495:12
+    |
+495 |         || value.len() % 2 != 0
+    |            ^^^^^^^^^^^^^^^^^^^^ help: replace with: `!value.len().is_multiple_of(2)`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#manual_is_multiple_of
+
+error: this function has too many arguments (15/7)
+   --> crates/aethyme-broker/src/local_exchange.rs:572:5
+    |
+572 | /     fn validate_revision(
+573 | |         project_id: &str,
+574 | |         descriptor_record_id: &str,
+575 | |         descriptor_object_sha256: &str,
+...   |
+587 | |         scope: &[String],
+588 | |     ) -> Result<(), ExchangeError> {
+    | |__________________________________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#too_many_arguments
+
+error: this expression creates a reference which is immediately dereferenced by the compiler
+   --> crates/aethyme-broker/src/local_exchange.rs:600:24
+    |
+600 |         revision_paths(&scope)?;
+    |                        ^^^^^^ help: change this to: `scope`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#needless_borrow
+    = note: `-D clippy::needless-borrow` implied by `-D warnings`
+    = help: to override `-D warnings` add `#[allow(clippy::needless_borrow)]`
+
+error: this expression creates a reference which is immediately dereferenced by the compiler
+   --> crates/aethyme-broker/src/local_target/revision.rs:232:61
+    |
+232 |             let (_, observed_brief_id) = Brief::from_record(&brief_bytes)
+    |                                                             ^^^^^^^^^^^^ help: change this to: `brief_bytes`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#needless_borrow
+
+error: could not compile `aethyme-broker` (lib) due to 8 previous errors
+warning: build failed, waiting for other jobs to finish...
+error: using `clone` on type `ObjectDigest` which implements the `Copy` trait
+   --> crates/aethyme-broker/src/local_target/revision.rs:645:17
+    |
+645 |                 descriptor_object.clone(),
+    |                 ^^^^^^^^^^^^^^^^^^^^^^^^^ help: try removing the `clone` call: `descriptor_object`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#clone_on_copy
+    = note: `-D clippy::clone-on-copy` implied by `-D warnings`
+    = help: to override `-D warnings` add `#[allow(clippy::clone_on_copy)]`
+
+error: using `clone` on type `ObjectDigest` which implements the `Copy` trait
+   --> crates/aethyme-broker/src/local_target/revision.rs:646:17
+    |
+646 |                 revision_object.clone(),
+    |                 ^^^^^^^^^^^^^^^^^^^^^^^ help: try removing the `clone` call: `revision_object`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#clone_on_copy
+
+error: using `clone` on type `ObjectDigest` which implements the `Copy` trait
+   --> crates/aethyme-broker/src/local_target/revision.rs:647:17
+    |
+647 |                 brief_object.clone(),
+    |                 ^^^^^^^^^^^^^^^^^^^^ help: try removing the `clone` call: `brief_object`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#clone_on_copy
+
+error: using `clone` on type `ObjectDigest` which implements the `Copy` trait
+   --> crates/aethyme-broker/src/local_target/revision.rs:648:17
+    |
+648 |                 recipe_object.clone(),
+    |                 ^^^^^^^^^^^^^^^^^^^^^ help: try removing the `clone` call: `recipe_object`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#clone_on_copy
+
+error: used `assert_eq!` with a literal bool
+   --> crates/aethyme-broker/src/local_target/revision.rs:697:9
+    |
+697 |         assert_eq!(descriptor_id.as_str().starts_with("sha256:"), true);
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#bool_assert_comparison
+    = note: `-D clippy::bool-assert-comparison` implied by `-D warnings`
+    = help: to override `-D warnings` add `#[allow(clippy::bool_assert_comparison)]`
+help: replace it with `assert!(..)`
+    |
+697 -         assert_eq!(descriptor_id.as_str().starts_with("sha256:"), true);
+697 +         assert!(descriptor_id.as_str().starts_with("sha256:"));
+    |
+
+error: useless conversion to the same type: `std::string::String`
+  --> crates/aethyme-broker/src/local_target/revision_tests.rs:66:37
+   |
+66 |             revision_object_sha256: revision.object_digest().hex().into(),
+   |                                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: consider removing `.into()`: `revision.object_digest().hex()`
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#useless_conversion
+   = note: `-D clippy::useless-conversion` implied by `-D warnings`
+   = help: to override `-D warnings` add `#[allow(clippy::useless_conversion)]`
+
+error: useless conversion to the same type: `std::string::String`
+  --> crates/aethyme-broker/src/local_target/revision_tests.rs:73:35
+   |
+73 |         descriptor_object_sha256: fixture.binding.descriptor_object().hex().into(),
+   |                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: consider removing `.into()`: `fixture.binding.descriptor_object().hex()`
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#useless_conversion
+
+error: could not compile `aethyme-broker` (lib test) due to 15 previous errors

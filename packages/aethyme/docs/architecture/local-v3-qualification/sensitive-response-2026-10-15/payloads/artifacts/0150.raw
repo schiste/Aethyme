@@ -1,0 +1,25 @@
+{
+  "original": "/private/tmp/t56-positive-m4-e70a72d",
+  "items": [
+    {
+      "path": "manifest.json",
+      "bytes": 613,
+      "sha256": "6edb459b0546cdd6ca6e5d13d7147001c8206cb18627aa6bc25e5f25de906017"
+    },
+    {
+      "path": "run-20261015/command.json",
+      "bytes": 1458,
+      "sha256": "7b1ab8545160e53f6b3bfa203bab340f457516201c56764023ba2c07426c68cb"
+    },
+    {
+      "path": "run-20261015/command.log",
+      "bytes": 960,
+      "sha256": "badcf0ea4a04b50555e5ee64b06204cf5b7614f66e051ecd08e0320236b81ba3"
+    },
+    {
+      "path": "run-20261015/status.json",
+      "bytes": 400,
+      "sha256": "0bd022cf8370220f15f97c05779d7d8c2236b7f947a308b3ae37d2cfc5d5dba8"
+    }
+  ]
+}

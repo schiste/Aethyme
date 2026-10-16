@@ -1,0 +1,24 @@
+ARGV: ["/usr/bin/caffeinate", "-i", "/Users/christophehenner/.cargo/bin/cargo", "test", "--locked", "-j", "4", "-p", "aethyme-broker", "--lib", "--", "--ignored", "--exact", "local_controller::drive::tests::fx17::actual_fx17_twenty_controlled_changes_preserve_all_65_vectors", "--nocapture"]
+SOURCE: {"head": "b16af023c07f22817fb8bb11abe464e916507850", "status_porcelain": "", "tree": "7e857b8e50e28f4b62acb8ed71a5070215061c95"}
+PINNED_IMAGE: {"inspect_argv": ["/opt/homebrew/bin/docker", "image", "inspect", "--format={{.Id}}", "sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251"], "inspect_status": 0, "inspect_stderr": "", "inspect_stdout": "sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251", "inspected_id": "sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251", "requested": "sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251"}
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.74s
+     Running unittests src/lib.rs (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/integrate-reviewed-local-bare-git-servic/target/local-resume/cargo/debug/deps/aethyme_broker-20bbfe5c0b2dd5c0)
+
+running 1 test
+FX17 actual trial report /var/folders/f2/krjzd4c15nn491pm37zrkp1h0000gn/T/.tmp3Ds4QO/fx17-report.json, source /var/folders/f2/krjzd4c15nn491pm37zrkp1h0000gn/T/.tmpNDk5uI, host /var/folders/f2/krjzd4c15nn491pm37zrkp1h0000gn/T/.tmp3Ds4QO, remote /var/folders/f2/krjzd4c15nn491pm37zrkp1h0000gn/T/.tmpy0i5u5, harness /var/folders/f2/krjzd4c15nn491pm37zrkp1h0000gn/T/.tmp2g0V2G
+gate fx17-source-shape started (cost 0, tree 7dd4c553980d)
+gate fx17-source-shape pass in 0s (tree 7dd4c553980d) at load 1m 6.8/10 cpus
+
+thread 'local_controller::drive::tests::fx17::actual_fx17_twenty_controlled_changes_preserve_all_65_vectors' (21806329) panicked at crates/aethyme-broker/src/local_controller/fx17_tests.rs:1349:13:
+FX17 actual evolution failed; retained report: /var/folders/f2/krjzd4c15nn491pm37zrkp1h0000gn/T/.tmp3Ds4QO/fx17-report.json
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test local_controller::drive::tests::fx17::actual_fx17_twenty_controlled_changes_preserve_all_65_vectors ... FAILED
+
+failures:
+
+failures:
+    local_controller::drive::tests::fx17::actual_fx17_twenty_controlled_changes_preserve_all_65_vectors
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1795 filtered out; finished in 7.37s
+
+error: test failed, to rerun pass `-p aethyme-broker --lib`

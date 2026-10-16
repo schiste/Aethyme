@@ -1,0 +1,51 @@
+   Compiling serde v1.0.229
+   Compiling zerocopy v0.8.42
+   Compiling zerocopy-derive v0.8.42
+   Compiling aethyme-engine v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/complete-exact-immutable-contribution-co/packages/aethyme/rust/crates/aethyme-engine)
+   Compiling ciborium-io v0.2.2
+   Compiling aethyme-broker v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/complete-exact-immutable-contribution-co/packages/aethyme/rust/crates/aethyme-broker)
+   Compiling aethyme-contracts v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/complete-exact-immutable-contribution-co/packages/aethyme/rust/crates/aethyme-contracts)
+   Compiling itertools v0.10.5
+   Compiling serde_spanned v0.6.9
+   Compiling oxc_index v4.1.0
+   Compiling toml_datetime v0.6.11
+   Compiling toml_edit v0.22.27
+   Compiling oxc_syntax v0.125.0
+   Compiling oxc_ast v0.125.0
+   Compiling bincode v1.3.3
+   Compiling aethyme-graph-schema v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/complete-exact-immutable-contribution-co/packages/aethyme/rust/crates/aethyme-graph-schema)
+   Compiling toml v0.8.23
+   Compiling ahash v0.8.12
+   Compiling hashbrown v0.14.5
+   Compiling aethyme-graph-storage v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/complete-exact-immutable-contribution-co/packages/aethyme/rust/crates/aethyme-graph-storage)
+   Compiling half v2.7.1
+   Compiling ciborium-ll v0.2.2
+   Compiling rowan v0.15.18
+   Compiling hashlink v0.9.1
+   Compiling rusqlite v0.32.1
+   Compiling ra_ap_syntax v0.0.331
+   Compiling aethyme-producers v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/complete-exact-immutable-contribution-co/packages/aethyme/rust/crates/aethyme-producers)
+   Compiling oxc_ecmascript v0.125.0
+   Compiling oxc_ast_visit v0.125.0
+   Compiling oxc_parser v0.125.0
+   Compiling aethyme-enhance v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/complete-exact-immutable-contribution-co/packages/aethyme/rust/crates/aethyme-enhance)
+   Compiling aethyme-cli v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/complete-exact-immutable-contribution-co/packages/aethyme/rust/crates/aethyme-cli)
+   Compiling cast v0.3.0
+   Compiling criterion-plot v0.5.0
+   Compiling aethyme-graph-indexer v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/complete-exact-immutable-contribution-co/packages/aethyme/rust/crates/aethyme-graph-indexer)
+   Compiling ciborium v0.2.2
+   Compiling tinytemplate v1.2.1
+   Compiling aethyme-quality v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/complete-exact-immutable-contribution-co/packages/aethyme/rust/crates/aethyme-quality)
+   Compiling is-terminal v0.4.17
+   Compiling oorandom v11.1.5
+   Compiling anes v0.1.6
+   Compiling criterion v0.5.1
+   Compiling aethyme-testkit v0.1.0 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/complete-exact-immutable-contribution-co/packages/aethyme/rust/crates/aethyme-testkit)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 32.96s
+     Running tests/help_snapshots.rs (target/debug/deps/help_snapshots-d590986b11cd8d3e)
+
+running 1 test
+test help_surface_matches_snapshots ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.85s
+

@@ -21,9 +21,11 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 name = "aethyme-broker"
 version = "0.8.26"
 dependencies = [
+ "aethyme-contracts",
  "aethyme-engine",
  "aethyme-enhance",
  "aethyme-graph-indexer",
+ "aethyme-graph-schema",
  "aethyme-graph-storage",
  "aethyme-testkit",
  "fastrand",
@@ -34,10 +36,14 @@ dependencies = [
  "semver",
  "serde",
  "serde_json",
+ "sha1",
  "sha2",
+ "similar",
+ "tar",
  "tempfile",
  "thiserror",
  "toml",
+ "unicode-normalization",
 ]
 
 [[package]]
@@ -58,6 +64,17 @@ dependencies = [
  "sha2",
  "tempfile",
  "toml_edit",
+]
+
+[[package]]
+name = "aethyme-contracts"
+version = "0.8.26"
+dependencies = [
+ "data-encoding",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
 ]
 
 [[package]]
@@ -168,6 +185,7 @@ dependencies = [
 name = "aethyme-testkit"
 version = "0.1.0"
 dependencies = [
+ "serde",
  "serde_json",
  "sha2",
  "tempfile",
@@ -728,6 +746,16 @@ name = "fastrand"
 version = "2.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f1f227452a390804cdb637b74a86990f2a7d7ba4b7d5693aac9b4dd6defd8d6"
+
+[[package]]
+name = "filetime"
+version = "0.2.29"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5c287a33c7f0a620c38e641e7f60827713987b3c0f26e8ddc9462cc69cf75759"
+dependencies = [
+ "cfg-if",
+ "libc",
+]
 
 [[package]]
 name = "find-msvc-tools"
@@ -2002,6 +2030,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "sha1"
+version = "0.10.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a978451301f4db1d02937a4ab3ccce137717b81826e79b7d49ffe3244a13c3b8"
+dependencies = [
+ "cfg-if",
+ "cpufeatures 0.2.17",
+ "digest",
+]
+
+[[package]]
 name = "sha2"
 version = "0.10.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2093,6 +2132,16 @@ dependencies = [
  "proc-macro2",
  "quote",
  "unicode-ident",
+]
+
+[[package]]
+name = "tar"
+version = "0.4.46"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3f6221d9a6003c78398e3b239969f352578258df48c8eb051caadae0015bc840"
+dependencies = [
+ "filetime",
+ "libc",
 ]
 
 [[package]]

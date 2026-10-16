@@ -1,0 +1,125 @@
+{
+  "completed_runs": 2,
+  "completion": {
+    "acceptance_receipt": "sha256:da0ce85aaa0314267a925ca3dc9bedbb637078ebb0404071d104882a7ac602ba",
+    "accepted_commit": "142404ceb3014075c028d762fe9df77e4a1eb644",
+    "accepted_tree": "4712a345780702b88d8aece2a47a1fa9fa55175f",
+    "candidate_commit": "142404ceb3014075c028d762fe9df77e4a1eb644",
+    "candidate_tree": "4712a345780702b88d8aece2a47a1fa9fa55175f",
+    "epoch": "sha256:05c1cdeba57880ed713307a0e68a56cdf40872d4c6953c22f8fb0717f9d5dc9d",
+    "qualification": "sha256:7820d01a5c06ff01b1a3fefc6d47058773e7b65987dc0df8fe064228167f97f0",
+    "revision": "sha256:d4ba6e6d2b71e765458b2dae1903415e496400f379489352c6839f5ad93cc3e7",
+    "source": "sha256:d837f77f12ebf1ce4d434bf360b63dba754c3ba3b990be49295791ad85671bc9",
+    "target": "native-controller",
+    "wave": "sha256:7941cda46829089fdce45d5ac429b91386155054a9fcefbe582bc63b3b1fdf18"
+  },
+  "host": "/var/folders/f2/krjzd4c15nn491pm37zrkp1h0000gn/T/.tmpEAWbYn",
+  "original_head": "cec23428b8f726cf17a14656b211291a1c46a2d0",
+  "pending_reservations": 0,
+  "profile": "aethyme.local-controller/experimental-v1",
+  "remote": "/var/folders/f2/krjzd4c15nn491pm37zrkp1h0000gn/T/.tmpyuEVb7",
+  "runtime": {
+    "api": "1.54",
+    "architecture": "arm64",
+    "client": "sha256:95e661f587166c7b3cd6b5877e6f23a2fc8e423c7466e26d289660fbd83c886b",
+    "components": [
+      {
+        "Details": {
+          "ApiVersion": "1.54",
+          "Arch": "arm64",
+          "BuildTime": "Wed May 20 14:39:25 2026",
+          "Experimental": "false",
+          "GitCommit": "568f755",
+          "GoVersion": "go1.26.3",
+          "KernelVersion": "6.8.0-117-generic",
+          "MinAPIVersion": "1.40",
+          "Module": "github.com/moby/moby/v2",
+          "ModuleVersion": "v2.0.0+unknown",
+          "Os": "linux"
+        },
+        "Name": "Engine",
+        "Version": "29.5.2"
+      },
+      {
+        "Details": {
+          "GitCommit": "193637f7ee8ae5f5aa5248f49e7baa3e6164966e"
+        },
+        "Name": "containerd",
+        "Version": "v2.2.4"
+      },
+      {
+        "Details": {
+          "GitCommit": "v1.3.5-0-g488fc13e"
+        },
+        "Name": "runc",
+        "Version": "1.3.5"
+      },
+      {
+        "Details": {
+          "GitCommit": "de40ad0"
+        },
+        "Name": "docker-init",
+        "Version": "0.19.0"
+      }
+    ],
+    "daemon_id": "9c943a04-41ca-4943-a8f5-c5734144b14b",
+    "endpoint": "unix:///Volumes/T7-repositories/Colima/home/default/docker.sock",
+    "engine": "29.5.2",
+    "kernel": "6.8.0-117-generic",
+    "native": "sha256:68bd56c0e45118ff11ebba0186dc1f638d51ccecacabee37a1bb675d1f8b3044",
+    "policy": "rootfs-ro;uid65534;caps-none;nnp;seccomp-builtin;network-none;private-pid-ipc-cgroup;cpu1;swap-none;pids-bounded;tmpfs-output-bounded;no-logs;no-healthcheck;env-clear;no-cache;timeout-pid1-v0",
+    "profile": "aethyme.docker-linux/offline-v0"
+  },
+  "second_completion": {
+    "acceptance_receipt": "sha256:2b4332489f6ea01b8679471d39aa08aa04aba9adaec799f98a1e3975a9ca107e",
+    "accepted_commit": "bc4790765832d1a82a403f83530131ee9eff66d4",
+    "accepted_tree": "e0508f29edef948e2ded1dbeed32d686ea8a7289",
+    "candidate_commit": "bc4790765832d1a82a403f83530131ee9eff66d4",
+    "candidate_tree": "e0508f29edef948e2ded1dbeed32d686ea8a7289",
+    "epoch": "sha256:05c1cdeba57880ed713307a0e68a56cdf40872d4c6953c22f8fb0717f9d5dc9d",
+    "qualification": "sha256:3afa1310cc89919dfeb4d1f0facbb7667ae3931ec9e7951a8c87cfbc33460872",
+    "revision": "sha256:d4ba6e6d2b71e765458b2dae1903415e496400f379489352c6839f5ad93cc3e7",
+    "source": "sha256:603d6c554d2ae70ad66fd945494e581f2db905113aea511d74c903258209c16a",
+    "target": "native-controller",
+    "wave": "sha256:ab84bdba33dcf9891fc7bea5a5076105ff3fb6065f94920cf94673f9ded9cfe8"
+  },
+  "service": {
+    "appointment": "sha256:257456cc41db03bcc5b42e63980041696297af8c94bb93e77c9d31dc33d626e9",
+    "completions": [
+      {
+        "acceptance_receipt": "sha256:da0ce85aaa0314267a925ca3dc9bedbb637078ebb0404071d104882a7ac602ba",
+        "accepted_commit": "142404ceb3014075c028d762fe9df77e4a1eb644",
+        "accepted_tree": "4712a345780702b88d8aece2a47a1fa9fa55175f",
+        "candidate_commit": "142404ceb3014075c028d762fe9df77e4a1eb644",
+        "candidate_tree": "4712a345780702b88d8aece2a47a1fa9fa55175f",
+        "epoch": "sha256:05c1cdeba57880ed713307a0e68a56cdf40872d4c6953c22f8fb0717f9d5dc9d",
+        "qualification": "sha256:7820d01a5c06ff01b1a3fefc6d47058773e7b65987dc0df8fe064228167f97f0",
+        "revision": "sha256:d4ba6e6d2b71e765458b2dae1903415e496400f379489352c6839f5ad93cc3e7",
+        "source": "sha256:d837f77f12ebf1ce4d434bf360b63dba754c3ba3b990be49295791ad85671bc9",
+        "target": "native-controller",
+        "wave": "sha256:7941cda46829089fdce45d5ac429b91386155054a9fcefbe582bc63b3b1fdf18"
+      },
+      {
+        "acceptance_receipt": "sha256:2b4332489f6ea01b8679471d39aa08aa04aba9adaec799f98a1e3975a9ca107e",
+        "accepted_commit": "bc4790765832d1a82a403f83530131ee9eff66d4",
+        "accepted_tree": "e0508f29edef948e2ded1dbeed32d686ea8a7289",
+        "candidate_commit": "bc4790765832d1a82a403f83530131ee9eff66d4",
+        "candidate_tree": "e0508f29edef948e2ded1dbeed32d686ea8a7289",
+        "epoch": "sha256:05c1cdeba57880ed713307a0e68a56cdf40872d4c6953c22f8fb0717f9d5dc9d",
+        "qualification": "sha256:3afa1310cc89919dfeb4d1f0facbb7667ae3931ec9e7951a8c87cfbc33460872",
+        "revision": "sha256:d4ba6e6d2b71e765458b2dae1903415e496400f379489352c6839f5ad93cc3e7",
+        "source": "sha256:603d6c554d2ae70ad66fd945494e581f2db905113aea511d74c903258209c16a",
+        "target": "native-controller",
+        "wave": "sha256:ab84bdba33dcf9891fc7bea5a5076105ff3fb6065f94920cf94673f9ded9cfe8"
+      }
+    ],
+    "detail": null,
+    "epoch": "sha256:05c1cdeba57880ed713307a0e68a56cdf40872d4c6953c22f8fb0717f9d5dc9d",
+    "outcome": "completion_allowance",
+    "revision": "sha256:d4ba6e6d2b71e765458b2dae1903415e496400f379489352c6839f5ad93cc3e7",
+    "target": "native-controller",
+    "ticks": 3
+  },
+  "source_host": "/var/folders/f2/krjzd4c15nn491pm37zrkp1h0000gn/T/.tmpTwY8Yd",
+  "source_repository": "/var/folders/f2/krjzd4c15nn491pm37zrkp1h0000gn/T/.tmpVURbAH"
+}

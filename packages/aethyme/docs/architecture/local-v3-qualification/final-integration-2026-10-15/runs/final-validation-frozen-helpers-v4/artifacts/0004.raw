@@ -1,0 +1,56 @@
+#!/usr/bin/env python3
+"""Preserve original local recorder payloads; append a source-bound ledger row."""
+import argparse
+import datetime
+import hashlib
+import json
+from pathlib import Path
+import re
+import shutil
+
+p = argparse.ArgumentParser()
+p.add_argument('--root', type=Path, default=Path.cwd())
+p.add_argument('--run', type=Path, required=True)
+p.add_argument('--id', required=True)
+p.add_argument('--note', required=True)
+p.add_argument('--extra', type=Path, action='append', default=[])
+a = p.parse_args()
+root = a.root.resolve()
+source = a.run.resolve()
+folder = root / 'packages/aethyme/docs/architecture/local-v3-qualification/final-integration-2026-10-15'
+ledger = folder / 'ledger.json'
+data = json.loads(ledger.read_text())
+assert re.fullmatch(r'[a-z0-9][a-z0-9-]{0,63}', a.id), 'unsafe run ID'
+assert not any(row['id'] == a.id for row in data['runs']), 'duplicate run ID'
+assert not (folder / 'runs' / a.id).exists(), 'payload directory already exists'
+metadata = json.loads((source / 'command.json').read_text())
+assert metadata['state'] != 'running', 'incomplete runs require separate reconciliation'
+assert isinstance(metadata['numeric_exit'], int), 'numeric exit required'
+assert (source / 'command.status').read_text() == str(metadata['numeric_exit']) + '\n'
+log = (source / 'command.log').read_bytes()
+assert len(log) == metadata['log_bytes']
+assert hashlib.sha256(log).hexdigest() == metadata['log_sha256']
+assert len((source / 'command.status').read_bytes()) == metadata['status_bytes']
+assert hashlib.sha256((source / 'command.status').read_bytes()).hexdigest() == metadata['status_sha256']
+originals = [source / ('command.' + ext) for ext in ['json', 'log', 'status']] + [s.resolve() for s in a.extra]
+assert len(set(originals)) == len(originals), 'duplicate payload source'
+payloads = [(original, f'runs/{a.id}/artifacts/{i:04d}.raw') for i, original in enumerate(originals, 1)]
+for original, relative in payloads:
+    destination = folder / relative
+    assert original.is_file() and not destination.exists()
+for original, relative in payloads:
+    destination = folder / relative
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(original, destination)
+    contents = destination.read_bytes()
+    try:
+        original_name = str(original.relative_to(root))
+    except ValueError:
+        original_name = str(original)
+    data['files'].append({'path': relative, 'logical_path': original.name, 'source_path': original_name, 'bytes': len(contents), 'sha256': hashlib.sha256(contents).hexdigest()})
+plain_log = re.sub(r'\x1b\[[0-9;]*m', '', log.decode('utf-8', 'replace'))
+summaries = [line for line in plain_log.splitlines() if any(token in line for token in ['test result:', 'Summary [', 'passed in ', 'Wall time:', 'error: test run failed'])]
+data['runs'].append({'id': a.id, 'metadata': payloads[0][1], 'log': payloads[1][1], 'status': payloads[2][1], 'source_before': metadata['source_before'], 'source_after': metadata['source_after'], 'source_unchanged': metadata['source_unchanged'], 'command': metadata['argv'], 'exit_code': metadata['numeric_exit'], 'wall_seconds': metadata['duration_seconds'], 'result_lines': summaries, 'log_sha256': metadata['log_sha256'], 'scope': a.note})
+data['updated_at_utc'] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+ledger.write_text(json.dumps(data, indent=2) + '\n')
+print(json.dumps({'id': a.id, 'exit_code': metadata['numeric_exit'], 'source_unchanged': metadata['source_unchanged'], 'new_payloads': len(payloads), 'total_payloads': len(data['files']), 'result_lines': summaries}, indent=2))

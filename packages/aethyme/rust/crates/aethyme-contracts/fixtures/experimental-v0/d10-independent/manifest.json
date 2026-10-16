@@ -1,0 +1,30 @@
+{
+  "review": "independent static D10 canonical record oracle",
+  "source_commit": "d3205f352a65a8aa71fecac178cd56b877b20717",
+  "source_tree": "63903677489a88fdb104a7a98779f67c398c742e",
+  "source_parent": "5ebe8d315062c7db0855bfa760a0379012a51743",
+  "source_archive": "/private/tmp/review-d320.nPezbT",
+  "source_files": {
+    "contribution_revision.rs": "28a48b1d16b8039f68eb99fef509e51399101f0a8f44ba43c1287a9e1ada0ee1",
+    "project_identity.rs": "4ec838df615f2cea097dba5d4511c4a5c646ccfe4edbd88c4bc0f3768cdc6f4c",
+    "source_snapshot.rs": "d36bcd57d0f2ccc47aff1a4c69d5ee974d09a22879cfc0ce938687761737ed14",
+    "record.rs": "d4888555e1653ea8897f383dfb6f6f9c50e5e2abd19ee113eb440ee575ad4400"
+  },
+  "inputs": {
+    "file": "inputs.json",
+    "sha256": "be5e1daa719a1ae076c58e1728f330900af06aeb63cbb3253fa1c97c4aacb2dd"
+  },
+  "oracle": {
+    "file": "oracle.py",
+    "sha256": "bd6685735a17a72014a05e1319b16d62983fef5381f8b2d8d4795ba39f032c95",
+    "runtime": "Python standard library only; no package imports or Aethyme/Rust execution"
+  },
+  "output": {
+    "file": "expected.json",
+    "sha256": "08b1d82960efa01461b4d1cdbf19d9da36a8a89bf2ed46e5918501ae3af78998",
+    "no_brief_revision_id": "sha256:8b0b211cac7981f435553d489926b8dc99d7404621493dc03e7778d94a6eb0fc",
+    "brief_only_revision_id": "sha256:bb5e76fd85974656b65552edf90225637b3edbf3a5b7c66b7e771ebc5d6e29ed",
+    "minimal_new_file_revision_id": "sha256:873a2e376da3eae9b8455ab287a46732f65ec8b1d5e0fb42263c64d3b972c360"
+  },
+  "scope": "The baseline/rationale-only pair matches the existing contribution_revision test inputs. The third vector independently derives a valid new-file source change and proposed FileId using the written formulas. These are external expected values for future parity checks, not product test results."
+}

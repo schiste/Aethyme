@@ -1,0 +1,19 @@
+   Compiling aethyme-broker v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/implement-the-actual-fx17-20-controlled/packages/aethyme/rust/crates/aethyme-broker)
+error[E0609]: no field `epoch` on type `local_wave::WaveSpec`
+   --> crates/aethyme-broker/src/local_wave.rs:285:41
+    |
+285 |             || completion.epoch != spec.epoch
+    |                                         ^^^^^ unknown field
+    |
+    = note: available fields are: `target`, `issuer`, `revision`, `objective_authorization`, `sequence` ... and 4 others
+
+error[E0609]: no field `epoch` on type `local_wave::WaveSpec`
+   --> crates/aethyme-broker/src/local_wave.rs:351:17
+    |
+351 |         || spec.epoch != completion.epoch
+    |                 ^^^^^ unknown field
+    |
+    = note: available fields are: `target`, `issuer`, `revision`, `objective_authorization`, `sequence` ... and 4 others
+
+For more information about this error, try `rustc --explain E0609`.
+error: could not compile `aethyme-broker` (lib test) due to 2 previous errors

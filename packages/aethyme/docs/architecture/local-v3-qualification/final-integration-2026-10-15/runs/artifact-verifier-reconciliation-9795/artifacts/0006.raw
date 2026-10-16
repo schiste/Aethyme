@@ -1,0 +1,48 @@
+{
+  "source_head": "9795ec1be5d9d6ec6e9248467320c8efba49520c",
+  "unique_payloads": 753,
+  "groups": [
+    {
+      "inventory": "target/local-resume/actual-fx17-twenty-stage-evidence-inventory.json",
+      "checked": 22
+    },
+    {
+      "inventory": "packages/aethyme/docs/architecture/local-v3-qualification/cross-revision-baseline-2026-10-15/ledger.json",
+      "checked": 42
+    },
+    {
+      "inventory": "packages/aethyme/docs/architecture/local-v3-qualification/unknown-publication-2026-10-15/ledger.json",
+      "checked": 10
+    },
+    {
+      "inventory": "packages/aethyme/docs/architecture/local-v3-qualification/model-adapter-2026-10-15/ledger.json",
+      "checked": 12
+    },
+    {
+      "inventory": "packages/aethyme/docs/architecture/local-v3-qualification/analysis-view-lifecycle-2026-10-15/artifact-inventory.json",
+      "checked": 59
+    },
+    {
+      "inventory": "packages/aethyme/docs/architecture/local-v3-qualification/final-integration-2026-10-15/ledger.json",
+      "checked": 125
+    },
+    {
+      "inventory": "packages/aethyme/docs/architecture/local-v3-qualification/native-job-lifecycle-2026-10-15/ledger.json",
+      "checked": 109
+    },
+    {
+      "inventory": "packages/aethyme/docs/architecture/local-v3-qualification/sensitive-response-2026-10-15/ledger.json",
+      "checked": 212
+    },
+    {
+      "inventory": "packages/aethyme/docs/architecture/local-v3-qualification/t45-pressure-gc-interleaving-2026-10-15/evidence/inventory.json",
+      "checked": 126
+    },
+    {
+      "inventory": "packages/aethyme-eval/fx10/evidence/actual-1123-1f7b2266/INVENTORY.tsv",
+      "checked": 36
+    }
+  ],
+  "local_summary_links": 37,
+  "errors": []
+}

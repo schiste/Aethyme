@@ -1,0 +1,14 @@
+{
+  "schema": "aethyme.local-recorder-preflight/v1",
+  "recorded_at_utc": "2026-10-15T13:32:58.811366+00:00",
+  "source_head": "e105edc81a4cdf9464e7bbfdca54540cea2f7bfb",
+  "source_tree": "5cef88b29c2a669c0669edef0f2dbde1c2d6b714",
+  "numeric_exit": 1,
+  "reason": "Recorder rejected --env RUSTC_WRAPPER because --env accepts only explicitly approved profile keys. Corrected invocation passes this base environment key via inherited environment.",
+  "stdout": "--env key is not an approved non-secret profile key: RUSTC_WRAPPER\n",
+  "stdout_sha256": "96af44857228dc3d6184b601e827a6930e0f8fe06fbea94aa7e68802f0ac815c",
+  "test_commands_launched": 0,
+  "model_requests": 0,
+  "private_evaluator_runs": 0,
+  "credit": false
+}

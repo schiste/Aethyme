@@ -1,0 +1,12 @@
+{
+  "source": "/private/tmp/t56-94282330-sensitive-module-tmp",
+  "captured_at_utc": "2026-10-15T21:09:13.427244+00:00",
+  "scope": "Source-bound attempts preserved including setup denial and compile-only without test credit",
+  "files": [
+    {
+      "path": "command.log",
+      "bytes": 3815,
+      "sha256": "b8d312119f4526ac911b108b8ddf135cfa7ea112ac0bdf7659b04b5f313af252"
+    }
+  ]
+}

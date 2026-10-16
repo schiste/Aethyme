@@ -1,0 +1,57 @@
+   Compiling aethyme-broker v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/implement-the-actual-fx17-20-controlled/packages/aethyme/rust/crates/aethyme-broker)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 47.06s
+     Running unittests src/lib.rs (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/integrate-reviewed-local-bare-git-servic/target/local-resume/cargo/debug/deps/aethyme_broker-20bbfe5c0b2dd5c0)
+
+running 3 tests
+test local_controller::drive::tests::cross_revision_completion_anchor_binds_candidate_parent_and_publication_lease ... 
+thread 'local_controller::drive::tests::cross_revision_completion_anchor_binds_candidate_parent_and_publication_lease' (22720606) panicked at crates/aethyme-broker/src/local_controller/drive_tests.rs:317:5:
+assertion `left == right` failed: cross-revision composition did not produce a candidate: Wave {
+    id: RecordId(
+        "sha256:a54efdf1a5fc9f650f5ea87ff802b5f7bba3c6a9b9c3f80e723d804640861c27",
+    ),
+    spec: WaveSpec {
+        target: "cross-revision",
+        issuer: "operator",
+        revision: "sha256:b1b205871f8793223f1212b52ab4dcef1d72e99e44d389878416e0d0121a593c",
+        objective_authorization: "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        sequence: 3,
+        baseline: "sha256:d837f77f12ebf1ce4d434bf360b63dba754c3ba3b990be49295791ad85671bc9",
+        prior_completion: Some(
+            "sha256:5615ea26879665aa7cbaceeeb2ee1c83a1d3edc239fb3a887db802baccb6102d",
+        ),
+        selected: [
+            "B",
+        ],
+        policy: WavePolicy {
+            batch_width: 3,
+            max_group: 1024,
+            debounce_ms: 0,
+            age_promotion_ms: 5000,
+            drift_rechecks: 2,
+        },
+    },
+    phase: Blocked,
+    candidate_snapshot: None,
+    candidate_commit: None,
+    recipe_object: None,
+    detail: Some(
+        "unknown_base",
+    ),
+    composition_ms: 71,
+    drift_count: 0,
+}
+  left: Blocked
+ right: Verifying
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+test local_controller::drive::tests::cross_revision_lookup_rejects_wrong_source_target_and_epoch ... ok
+test local_controller::drive::tests::cross_revision_stale_completion_epoch_is_rechecked_at_composition_and_completion_use ... ok
+
+failures:
+
+failures:
+    local_controller::drive::tests::cross_revision_completion_anchor_binds_candidate_parent_and_publication_lease
+
+test result: FAILED. 2 passed; 1 failed; 0 ignored; 0 measured; 1796 filtered out; finished in 3.99s
+
+error: test failed, to rerun pass `-p aethyme-broker --lib`

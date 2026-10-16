@@ -1,0 +1,35 @@
+   Compiling aethyme-engine v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/complete-fresh-local-cli-bootstrap-and-c/packages/aethyme/rust/crates/aethyme-engine)
+   Compiling aethyme-broker v0.8.26 (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/complete-fresh-local-cli-bootstrap-and-c/packages/aethyme/rust/crates/aethyme-broker)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 58.55s
+     Running unittests src/lib.rs (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/integrate-reviewed-local-bare-git-servic/target/local-resume/cargo/debug/deps/aethyme_broker-0f278e0d02146111)
+
+running 12 tests
+test execution_verifier::tests::real_cli_assertions_observe_behavior_and_refuse_forged_or_stale_receipts ... ignored, requires explicitly selected cached public Linux Docker image
+test execution_verifier::tests::missing_duplicate_invalid_and_oversized_inventories_are_refused ... ok
+test execution_verifier::tests::inventory_identity_is_canonical_and_independently_calculated ... ok
+test execution_verifier::tests::oversized_or_escaped_inventory_is_rejected_at_construction ... ok
+
+thread 'execution_verifier::tests::trusted_operator_rotates_and_revokes_exact_producer_generations' (11506942) panicked at crates/aethyme-broker/src/execution_verifier/tests.rs:135:81:
+called `Result::unwrap()` on an `Err` value: Mismatch
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test execution_verifier::tests::producer_policy_profile_bounds_and_target_policy_must_match ... ok
+test execution_verifier::tests::verifier_prepare_refuses_sensitive_tombstone_before_harness_or_runtime_access ... ok
+test execution_verifier::tests::trusted_operator_rotates_and_revokes_exact_producer_generations ... FAILED
+
+thread 'execution_verifier::tests::retained_journal_is_required_and_mismatches_are_refused' (11506940) panicked at crates/aethyme-broker/src/execution_verifier/tests.rs:740:6:
+called `Result::unwrap()` on an `Err` value: Io(Os { code: 2, kind: NotFound, message: "No such file or directory" })
+test execution_verifier::tests::producer_dispatch_guard_excludes_rotation_until_acknowledgement ... ok
+test execution_verifier::tests::retained_journal_is_required_and_mismatches_are_refused ... FAILED
+test execution_verifier::tests::cancellation_at_receipt_issuance_leaves_no_recoverable_pass ... ok
+test execution_verifier::tests::incomplete_wrong_subject_expired_and_revoked_evidence_cannot_pass ... ok
+test execution_verifier::tests::stop_target_drift_and_artifact_changes_invalidate_current_evidence ... ok
+
+failures:
+
+failures:
+    execution_verifier::tests::retained_journal_is_required_and_mismatches_are_refused
+    execution_verifier::tests::trusted_operator_rotates_and_revokes_exact_producer_generations
+
+test result: FAILED. 9 passed; 2 failed; 1 ignored; 0 measured; 1876 filtered out; finished in 5.95s
+
+error: test failed, to rerun pass `-p aethyme-broker --lib`

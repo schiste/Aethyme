@@ -1,0 +1,9 @@
+run=broker-discarded-results-ratchet
+command=cargo test --locked -j4 -p aethyme-testkit --test broker_discarded_results -- --nocapture
+started=2026-10-15T09:47:54Z
+1f7b226660dbef8f036e5e10c1c301fe7a38d50a
+5b46a4281c56518c361643563e602d084f820b12a7ebec37614489a1b183ed32  crates/aethyme-broker/src/local_controller/drive_tests/sustained_arrivals.rs
+01aa466182a9054f5f4f0bd1f71fa1a3f2869ea731cee0f69ed0098a2b679ae1  ../../aethyme-eval/fx10/proposal-manifest.json
+CARGO_TARGET_DIR=/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/integrate-reviewed-local-bare-git-servic/target/local-resume/cargo
+PATH=/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/christophehenner/.cargo/bin
+RUSTC_WRAPPER=

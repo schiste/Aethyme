@@ -1,0 +1,58 @@
+{
+  "schema": "aethyme.composition-expectations/provisional-v0",
+  "case": "HX01",
+  "title": "Held-out FX01 variant: renamed elements, reordered siblings",
+  "plan": "#650 held-out variant of FX01",
+  "scenarios": {
+    "s1": {
+      "title": "",
+      "required_outcomes": [
+        "candidate"
+      ],
+      "behaviors": [
+        {
+          "check": "text",
+          "file": "page.html",
+          "selector": "label[for=phone]",
+          "equals": "Phone number"
+        },
+        {
+          "check": "attr",
+          "file": "page.html",
+          "selector": "#call",
+          "name": "aria-label",
+          "equals": "Call the office"
+        },
+        {
+          "check": "text",
+          "file": "page.html",
+          "selector": "#lead",
+          "equals": "We answer within a day."
+        },
+        {
+          "check": "inside",
+          "file": "page.html",
+          "selector": "#lead",
+          "ancestor": "#shell"
+        },
+        {
+          "check": "not_inside",
+          "file": "page.html",
+          "selector": "#lead",
+          "ancestor": "#contact"
+        },
+        {
+          "check": "text",
+          "file": "page.html",
+          "selector": "#fine-print",
+          "equals": "Office hours only."
+        }
+      ],
+      "provisional_text": {
+        "outcome": "conflict",
+        "behavior": null,
+        "note": "the wording and aria changes touch adjacent lines, so a line merge conflicts: the text profile does not generalize beyond FX01's spacing"
+      }
+    }
+  }
+}

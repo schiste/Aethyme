@@ -100,6 +100,11 @@ impl ReviewPolicy {
                 });
             }
         };
+        Self::from_config_text(&text)
+    }
+
+    /// Reuse the same strict policy parser for verified committed configuration.
+    pub fn from_config_text(text: &str) -> Result<Self, BrokerOpError> {
         let value =
             text.parse::<toml::Value>()
                 .map_err(|error| BrokerOpError::ReviewLifecycle {
@@ -365,11 +370,32 @@ pub fn load_review_provider_snapshot(
     pr_number: i64,
     policy: &ReviewPolicy,
 ) -> Result<ReviewProviderSnapshot, BrokerOpError> {
+    load_review_provider_snapshot_native(cwd, repository, pr_number, policy, None)
+}
+
+/// Preserve ordinary aggregate review semantics with a native finite reader.
+pub(crate) fn load_review_provider_snapshot_bounded(
+    cwd: &Path,
+    repository: &str,
+    pr_number: i64,
+    policy: &ReviewPolicy,
+    budget: std::time::Duration,
+) -> Result<ReviewProviderSnapshot, BrokerOpError> {
+    load_review_provider_snapshot_native(cwd, repository, pr_number, policy, Some(budget))
+}
+fn load_review_provider_snapshot_native(
+    cwd: &Path,
+    repository: &str,
+    pr_number: i64,
+    policy: &ReviewPolicy,
+    budget: Option<std::time::Duration>,
+) -> Result<ReviewProviderSnapshot, BrokerOpError> {
     if pr_number <= 0 {
         return review_error("pull request number must be positive");
     }
     let target = crate::resolve_github_target(repository, &[])?;
-    let output = Command::new("gh")
+    let mut command = Command::new("gh");
+    command
         .args([
             "pr",
             "view",
@@ -379,11 +405,29 @@ pub fn load_review_provider_snapshot(
             "--json",
             "number,baseRefName,headRefOid,state,isDraft,reviewDecision",
         ])
-        .current_dir(cwd)
-        .output()
-        .map_err(|_| BrokerOpError::ReviewLifecycle {
-            reason: "GitHub review evidence is unavailable".into(),
-        })?;
+        .current_dir(cwd);
+    let output = if let Some(budget) = budget {
+        command
+            .env("GH_HOST", "github.com")
+            .env_remove("GH_REPO")
+            .env_remove("GH_DEBUG");
+        crate::bounded_output::output_within(&mut command, budget)
+            .map_err(|_| BrokerOpError::ReviewLifecycle {
+                reason: "GitHub review evidence is unavailable".into(),
+            })?
+            .ok_or_else(|| BrokerOpError::ReviewLifecycle {
+                reason: "GitHub review evidence deadline expired".into(),
+            })?
+    } else {
+        command
+            .output()
+            .map_err(|_| BrokerOpError::ReviewLifecycle {
+                reason: "GitHub review evidence is unavailable".into(),
+            })?
+    };
+    if budget.is_some() && output.stdout.len() > 4 * 1024 * 1024 {
+        return review_error("GitHub review evidence exceeds response limit");
+    }
     if !output.status.success() {
         return review_error("GitHub review evidence is unavailable; no transition was attempted");
     }

@@ -1,0 +1,11 @@
+{
+  "attempt": "launcher-preflight-001",
+  "runner_started": false,
+  "source_commit": "9bd890360f2d986071178279f15acd2401a1650d",
+  "source_tree": "78d953e1b2c4f33e356fec095fb243e39dcf248f",
+  "failed_helper_sha256": "c38147f996c9cfd0c4d26f26830b6e0d06cc424b9cd239dcb5a6a3e5d867d753",
+  "numeric_tool_exit_code": 1,
+  "advanced_exec_child_exit_code": 2,
+  "stderr_and_tool_output": "preflight/runtime-wrapper error: FileNotFoundError: [Errno 2] No such file or directory: '/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/add-finite-d10-typescript-parity-for-pro/vectors/ordinal-supplement/manifest.json'\nexec session 1135: command failed (2)\n  command ran: yes\n  edits remain after command: no\n  changed paths: none\nError: guarded exec: the command ran and exited 2 \u2014 the guard found no ownership violation, so this is the command's own failure\n",
+  "classification": "capture-wrapper fixture-path resolution failure; no Node qualification process ran"
+}

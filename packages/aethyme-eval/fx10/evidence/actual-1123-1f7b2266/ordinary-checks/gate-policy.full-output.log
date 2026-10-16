@@ -1,0 +1,12 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.58s
+     Running tests/gate_policy.rs (/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/integrate-reviewed-local-bare-git-servic/target/local-resume/cargo/debug/deps/gate_policy-308a348f7ad3ece2)
+
+running 5 tests
+test fast_guards_precede_cargo_test_on_every_path_it_covers ... ok
+test gate_policy_changes_select_a_triggered_gate ... ok
+test cross_process_contract_uses_load_admission_despite_its_low_cost ... ok
+test installer_and_pilot_scripts_select_their_narrow_contract_gate ... ok
+test every_trigger_glob_matches_a_tracked_file ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
