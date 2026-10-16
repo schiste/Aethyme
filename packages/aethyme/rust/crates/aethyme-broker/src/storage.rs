@@ -19,8 +19,6 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
 
-use crate::broker::directory_size_without_following_links;
-
 use crate::broker::{WORKTREE_ROOT_MARKER, WORKTREE_ROOT_SCHEMA_VERSION, WorktreeRootMarker};
 use crate::gc::{TreeRemoval, remove_condemned_tree};
 use crate::reclaim::is_artefact_directory_with_extras;
@@ -1456,6 +1454,7 @@ enum PreparationCacheSweepOutcome {
     Stop,
 }
 
+#[derive(Debug)]
 enum PreparationCacheLeaseError {
     Busy,
     Deadline,
