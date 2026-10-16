@@ -550,7 +550,46 @@ says `experimental-v0`, and a consumer must check `schema` first.
 | `collab gc resume` | `aethyme.collab-gc-resume/experimental-v0` |
 | `collab context` | `aethyme.collab-context/experimental-v0` |
 | `collab brief attach` | `aethyme.collab-brief-attach/experimental-v0` |
+| `collab resolution prepare` | `aethyme.collab-resolution-prepare/experimental-v0` |
+| `collab resolution status` | `aethyme.collab-resolution-status/experimental-v0` |
+| `collab resolution mark-dispatching` | `aethyme.collab-resolution-mark-dispatching/experimental-v0` |
+| `collab resolution mark-unknown` | `aethyme.collab-resolution-mark-unknown/experimental-v0` |
+| `collab resolution packet` | `aethyme.collab-resolution-packet/experimental-v0` |
+| `collab resolution input` | `aethyme.collab-resolution-input/experimental-v0` |
+| `collab resolution import` | `aethyme.collab-resolution-import/experimental-v0` |
 | any refusal or failure | `aethyme.collab-error/experimental-v0` |
+
+Resolution handoff commands are local and experimental. Every success object
+states `dispatches_agent: false` and `grants_acceptance: false`. `prepare`
+requires explicit strict JSON byte/entry limits and commits the attempt charge
+before returning the metadata-only packet. Reusing its client key returns
+`started: false` and no packet. `packet` can recover a still-exported packet;
+it cannot replenish the allowance. `status` opens a read-only snapshot and
+does not create state or migrate it. Session labels are provenance only.
+
+`prepare` and `mark-dispatching` require `--target`, `--issuer`, `--wave`
+and `--version`, acquire the appointed local controller, and check that the
+exact request belongs to the current active wave at that target version.
+Stale, terminal or stopped waves cannot prepare or mark new handoff intent.
+Status, unknown-delivery bookkeeping and response import remain usable for
+historical charged attempts; they grant no current-wave attachment authority.
+
+`mark-dispatching` records handoff intent before an operator supplies the
+packet to a local agent. It returns `status` and starts no process. A response
+cannot be imported while the attempt is merely exported. `mark-unknown`
+records uncertainty from a capped UTF-8 detail file, preserving the charge
+and permitting a late bound response. Its `automatic_replay` is always false.
+Both commands grant no dispatch or acceptance authority.
+
+`input` returns one exact manifested snapshot/path as a `file` object with
+`kind`, `bytes`, `sha256` and lowercase `bytes_hex`, or `null` for an absent
+path. Text mode also prints versioned JSON, preserving arbitrary input bytes.
+`import` accepts only a capped regular response file with a strict
+`aethyme.resolution-attempt-response/experimental-v0` envelope bound to the
+attempt, session label, request record/object and input-manifest digest.
+Its `outcome` describes the resolution result; successful command execution
+does not mean synthesis succeeded. Synthesized results require fresh
+verification and are retained without wave attachment or acceptance.
 
 A refusal or failure is printed on stdout in `--json` mode:
 
