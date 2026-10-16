@@ -33,6 +33,9 @@ description: Use after repo-onboarding or Explore when moving from orientation i
   or the shared resource database. Library startup needs a process-owned host
   state/cache capsule before opening a broker; later builder overrides are
   too late to isolate that startup work.
+  For a CLI launched from another directory or a session checkout, derive
+  isolation paths from the owning repository fixture and set its working
+  directory separately.
 - Run the fastest relevant test command first.
 - For each deliberate guard-removal check, run the same named regression on
   unmodified source, with the deliberate break, and after byte-for-byte
