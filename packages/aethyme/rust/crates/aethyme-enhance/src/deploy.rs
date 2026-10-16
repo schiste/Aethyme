@@ -866,6 +866,24 @@ mod tests {
         // 1 AGENTS + 6 onboarding + 20 targets + settings = 28.
         assert_eq!(actions.len(), 28);
 
+        let codex_broker_reference =
+            std::fs::read_to_string(repo.join(".codex/skills/aethyme/references/broker.md"))
+                .unwrap();
+        let claude_broker_reference =
+            std::fs::read_to_string(repo.join(".claude/skills/aethyme/references/broker.md"))
+                .unwrap();
+        assert_eq!(codex_broker_reference, claude_broker_reference);
+        for required in [
+            "aethyme broker advanced main reconcile plan",
+            "aethyme broker advanced main reconcile apply --session <id> --confirm <sha256>",
+        ] {
+            assert!(
+                codex_broker_reference.contains(required),
+                "generated broker reference is missing {required:?}"
+            );
+        }
+        assert!(!codex_broker_reference.contains("broker main reconcile"));
+
         let settings = std::fs::read_to_string(repo.join(SETTINGS_FILE)).unwrap();
         assert_eq!(
             settings,
