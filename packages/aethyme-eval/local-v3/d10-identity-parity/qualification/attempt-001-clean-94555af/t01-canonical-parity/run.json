@@ -1,0 +1,19 @@
+{
+  "runner": "t01-canonical-parity",
+  "script": "packages/aethyme-eval/local-v3/t01-canonical-parity/t01-canonical-parity.mts",
+  "argv": [
+    "/opt/homebrew/bin/node",
+    "--max-old-space-size=256",
+    "--experimental-strip-types",
+    "packages/aethyme-eval/local-v3/t01-canonical-parity/t01-canonical-parity.mts"
+  ],
+  "started_at_utc": "2026-10-16T03:21:34.500057+00:00",
+  "deadline_seconds": 60,
+  "max_old_space_size_mib": 256,
+  "timed_out": false,
+  "exit_code": 0,
+  "stdout_bytes": 4356,
+  "stderr_bytes": 0,
+  "stdout_sha256": "a073e477a79d1ed3aef96a25b6b4f0f3071fa7a58db764bd64f3c9de0fc65e8b",
+  "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+}
