@@ -664,6 +664,29 @@ mod tests {
             )
             .unwrap();
         assert_eq!(alias, new_brief.as_str());
+        let operation =
+            crate::collaboration_capture::OperationId::parse(old.capture_operation_id().unwrap())
+                .unwrap();
+        let historical_retry = revise(&mut fixture, &operation, old.brief().unwrap());
+        assert_eq!(historical_retry.record_id(), old.record_id());
+        let head_after_retry: String = fixture.store.read_connection().query_row(
+            "SELECT revision_record_id FROM contribution_revision_heads WHERE contribution_id=?1",
+            [old.revision().contribution_id().as_str()], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(
+            head_after_retry, head,
+            "retrying X after Y must not rewind the head"
+        );
+        let alias_after_retry: String = fixture
+            .store
+            .read_connection()
+            .query_row(
+                "SELECT brief_record_id FROM contribution_briefs WHERE lineage_record_id=?1",
+                [old.capture_record_id().as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(alias_after_retry, new_brief.as_str());
         let digest: String = fixture
             .store
             .read_connection()
