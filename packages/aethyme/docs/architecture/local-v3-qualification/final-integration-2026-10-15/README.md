@@ -235,3 +235,15 @@ The package preserves all original collector artifacts, including unsuccessful
 log requests, complete raw logs, API responses and their manifest. The observed
 PR head at collection was already `5ebe8d31`; these failures remain bound to
 the older checkout and supply no passing credit to subsequent repairs.
+
+## TypeScript checkpoint CI dependency failure
+
+At PR #787 head `fc711d13172a61bc9188c59731579a4f5ac63ca0`, workspace
+run `38834487227` failed during the product binary build: crates.io retrieval
+of `bstr` returned an HTTP/2 framing error (exit 101). Workspace test compilation
+and execution were skipped, so this attempt supplies no executed-test count.
+The actual merge checkout was `48ae7c6df372a7f71302c1febf6d8d87870c9fab`,
+tree `afa3d2c3e5b35b6c5079f06a6fc1c05989ba2a48`. The full failed job log,
+job/run metadata, checkout metadata and numeric collection statuses are retained
+byte-exact. This CI failure does not alter the separately recorded local
+TypeScript qualification or supply passing credit to subsequent changes.

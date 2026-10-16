@@ -74,15 +74,20 @@ digest caused its corresponding intended one-test assertion failure (exit 101);
 exact source restoration was verified and both tests passed again. These are two
 distinct positive cases executed twice, with two negative controls.
 
-The audit also identified required L1 work that remains unqualified: T01/T02
-Rust/TypeScript parity, T03 explicit descriptor binding, T05 file provenance and
-D10 immutable contribution revisions for rationale-only changes. Draft #787 adds a finite eval-side Rust/TypeScript parity harness; draft #788
-adds experimental descriptor, file-lineage and immutable-revision contracts and
-their local adapters. The first TypeScript run failed a frozen Chinese token
-vector and receives no passing credit. After its reviewed generic tokenizer fix,
-source `a4b478126edc5f03b84dd8bebc3cedeab7c5947b` passed 880 assertions in the
-bounded offline run `aethyme-t01-positive-20261016-004213`, with unchanged source
-and input hashes. Mutation controls and final evidence packaging remain open.
+The [finite Rust/TypeScript parity qualification](../../../aethyme-eval/docs/t01-t02-typescript-parity/README.md)
+at source `a4b478126edc5f03b84dd8bebc3cedeab7c5947b` passed 880 assertions,
+five intended guard-removal failures and 880 assertions after exact restoration.
+The bounded offline runs used unchanged source and input hashes. Its reviewed
+portable archive retains 346 files, including the first failed Chinese token
+vector run. Separate wrapper files retain the rejected archive inventory and
+review; neither failed attempt receives passing credit.
+This is an eval-side implementation, with no production TypeScript client claim.
+
+Required L1 integration remains open: T03 explicit descriptor binding, T05 file
+provenance, D10 immutable contribution revisions for rationale-only changes and
+their added cross-language vectors. Draft #788 adds experimental contracts and
+local adapters; its 44 contract tests and strict scoped Clippy check pass, while
+the actual store, CLI and downstream consumer integration remain unqualified.
 These additions must complete independent review and their applicable local
 checks before final combined-source qualification. Frozen fixtures are unchanged.
 

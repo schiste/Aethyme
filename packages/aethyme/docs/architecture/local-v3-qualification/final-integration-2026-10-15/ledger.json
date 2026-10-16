@@ -3218,9 +3218,121 @@
       "source_path": "/private/tmp/ci-pr788-38830415286-20261016/manifest.json",
       "bytes": 11344,
       "sha256": "cd2dbf0d3869870323c25bdee65a286208929fcc47f13a5ebf03db77ebd88147"
+    },
+    {
+      "path": "runs/ci-787-fc711-dependency/artifacts/0001.raw",
+      "logical_path": "run.stdout",
+      "source_path": "/private/tmp/ci-pr787-38834487227-7zub5525/run.stdout",
+      "bytes": 12167,
+      "sha256": "f499bd20c6c2d76410068eeda9d7f2aed7965ab24ca8084ea6250cb7866277a7"
+    },
+    {
+      "path": "runs/ci-787-fc711-dependency/artifacts/0002.raw",
+      "logical_path": "run.stderr",
+      "source_path": "/private/tmp/ci-pr787-38834487227-7zub5525/run.stderr",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "runs/ci-787-fc711-dependency/artifacts/0003.raw",
+      "logical_path": "run.command.json",
+      "source_path": "/private/tmp/ci-pr787-38834487227-7zub5525/run.command.json",
+      "bytes": 171,
+      "sha256": "10fb65dd1863853b7caf12cfac9e6960c2622663ec5f0f8c7b9cc0828daba32f"
+    },
+    {
+      "path": "runs/ci-787-fc711-dependency/artifacts/0004.raw",
+      "logical_path": "jobs.stdout",
+      "source_path": "/private/tmp/ci-pr787-38834487227-7zub5525/jobs.stdout",
+      "bytes": 12035,
+      "sha256": "57acf95ae18ddb7580bb49be8153dfff484b521bc48194676b931fd8aa78498d"
+    },
+    {
+      "path": "runs/ci-787-fc711-dependency/artifacts/0005.raw",
+      "logical_path": "jobs.stderr",
+      "source_path": "/private/tmp/ci-pr787-38834487227-7zub5525/jobs.stderr",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "runs/ci-787-fc711-dependency/artifacts/0006.raw",
+      "logical_path": "jobs.command.json",
+      "source_path": "/private/tmp/ci-pr787-38834487227-7zub5525/jobs.command.json",
+      "bytes": 189,
+      "sha256": "0a25cb41e5ca473d663ba223abb58b00827c6c2a162f24751f5d35823b7e1bc7"
+    },
+    {
+      "path": "runs/ci-787-fc711-dependency/artifacts/0007.raw",
+      "logical_path": "workspace-job.stdout",
+      "source_path": "/private/tmp/ci-pr787-38834487227-7zub5525/workspace-job.stdout",
+      "bytes": 2821,
+      "sha256": "addf5659cdc9a405d6b2c3fc7db5283ce508fa2c8a659d74ffe2b1ad44960535"
+    },
+    {
+      "path": "runs/ci-787-fc711-dependency/artifacts/0008.raw",
+      "logical_path": "workspace-job.stderr",
+      "source_path": "/private/tmp/ci-pr787-38834487227-7zub5525/workspace-job.stderr",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "runs/ci-787-fc711-dependency/artifacts/0009.raw",
+      "logical_path": "workspace-job.command.json",
+      "source_path": "/private/tmp/ci-pr787-38834487227-7zub5525/workspace-job.command.json",
+      "bytes": 172,
+      "sha256": "efa71f11ca07ca69c4d48d0a7d114ad0e2ee475792489015537a1f6f2bb9144b"
+    },
+    {
+      "path": "runs/ci-787-fc711-dependency/artifacts/0010.raw",
+      "logical_path": "workspace-log.stdout",
+      "source_path": "/private/tmp/ci-pr787-38834487227-7zub5525/workspace-log.stdout",
+      "bytes": 60150,
+      "sha256": "c614d228475d03cf46ba549a61442b3f431532f30cde85ceefcfc57f847d84b7"
+    },
+    {
+      "path": "runs/ci-787-fc711-dependency/artifacts/0011.raw",
+      "logical_path": "workspace-log.stderr",
+      "source_path": "/private/tmp/ci-pr787-38834487227-7zub5525/workspace-log.stderr",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "runs/ci-787-fc711-dependency/artifacts/0012.raw",
+      "logical_path": "workspace-log.command.json",
+      "source_path": "/private/tmp/ci-pr787-38834487227-7zub5525/workspace-log.command.json",
+      "bytes": 231,
+      "sha256": "9d6aa5ba759f03ba71337a218e21a026cae9bf33c79656b469dd2aa9daf70690"
+    },
+    {
+      "path": "runs/ci-787-fc711-dependency/artifacts/0013.raw",
+      "logical_path": "checkout.stdout",
+      "source_path": "/private/tmp/ci-pr787-38834487227-7zub5525/checkout.stdout",
+      "bytes": 181348,
+      "sha256": "0ddacf80a88a0f35915c0ac4e1d295f45bca6d1fd4aef4a525155611565824b5"
+    },
+    {
+      "path": "runs/ci-787-fc711-dependency/artifacts/0014.raw",
+      "logical_path": "checkout.stderr",
+      "source_path": "/private/tmp/ci-pr787-38834487227-7zub5525/checkout.stderr",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "runs/ci-787-fc711-dependency/artifacts/0015.raw",
+      "logical_path": "checkout.command.json",
+      "source_path": "/private/tmp/ci-pr787-38834487227-7zub5525/checkout.command.json",
+      "bytes": 195,
+      "sha256": "3efa7fe5ce1028a1bcba1feda13c4497092cbd91bb029e03aec3dc2a55d21049"
+    },
+    {
+      "path": "runs/ci-787-fc711-dependency/artifacts/0016.raw",
+      "logical_path": "manifest.json",
+      "source_path": "/private/tmp/ci-pr787-38834487227-7zub5525/manifest.json",
+      "bytes": 2698,
+      "sha256": "ee1a4a57e35fed01d918f0368f8a4e54dc88c2684fa9cceb10397a4a071c203d"
     }
   ],
-  "updated_at_utc": "2026-10-16T00:55:49.429422+00:00",
+  "updated_at_utc": "2026-10-16T01:35:21.251849+00:00",
   "preflight_failures": [
     {
       "metadata": "runs/aggregate-offline-fx17-recorder-preflight-failure.json",
@@ -3699,6 +3811,31 @@
       "completed_counts": null,
       "scope": "Compilation failed before qualifying test execution. Formatting passed in the lint job; Clippy could not compile. Later commits are not qualified by this attempt.",
       "bundle_inventory": "runs/ci-788-63a3-compile/artifacts/0066.raw"
+    },
+    {
+      "id": "ci-787-fc711-dependency",
+      "workflow_run_id": 38834487227,
+      "job_id": 116760424917,
+      "metadata": "runs/ci-787-fc711-dependency/artifacts/0007.raw",
+      "run_metadata": "runs/ci-787-fc711-dependency/artifacts/0001.raw",
+      "log": "runs/ci-787-fc711-dependency/artifacts/0010.raw",
+      "checkout": "runs/ci-787-fc711-dependency/artifacts/0013.raw",
+      "checkout_source": {
+        "actions_run_head_sha": "fc711d13172a61bc9188c59731579a4f5ac63ca0",
+        "merge_commit_sha": "48ae7c6df372a7f71302c1febf6d8d87870c9fab",
+        "merge_tree_sha": "afa3d2c3e5b35b6c5079f06a6fc1c05989ba2a48",
+        "merge_parent_shas": [
+          "5f760b0e1d0b21faa3c26c3bf5c63205a487ca15",
+          "fc711d13172a61bc9188c59731579a4f5ac63ca0"
+        ],
+        "pr": 787
+      },
+      "exit_code": 101,
+      "conclusion": "FAILURE",
+      "passing_command": false,
+      "completed_counts": null,
+      "scope": "crates.io bstr HTTP2 framing dependency fetch failure before product binary build; exit101, no tests executed",
+      "bundle_inventory": "runs/ci-787-fc711-dependency/artifacts/0016.raw"
     }
   ],
   "artifact_bundles": [
@@ -3747,6 +3884,11 @@
       "inventory": "runs/ci-788-63a3-compile/artifacts/0066.raw",
       "summary": "runs/ci-788-63a3-compile/artifacts/0003.raw",
       "scope": "All 65 original collector artifacts plus its byte-exact manifest, including failed log requests and complete successful raw logs; four compile failures, no executed-test denominator."
+    },
+    {
+      "id": "ci-787-fc711-dependency",
+      "inventory": "runs/ci-787-fc711-dependency/artifacts/0016.raw",
+      "scope": "Complete raw failed workspace job log and exact API metadata/command statuses; dependency retrieval failed before tests, no passing credit."
     }
   ]
 }
