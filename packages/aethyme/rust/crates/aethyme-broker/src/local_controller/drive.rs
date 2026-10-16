@@ -9,6 +9,7 @@ use crate::execution_verifier::{self as verifier, ProducerPermit, VerificationOu
 use crate::local_budget::{self as budget, WorkKind};
 use crate::local_source_transport as transport;
 use crate::native_gates;
+use crate::resolution::{self, FailedCheck};
 use rusqlite::OptionalExtension;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -385,6 +386,89 @@ fn require_fresh_native(job: &native_gates::Job) -> Result<(), ControllerError> 
     Ok(())
 }
 
+fn trusted_native_failed_checks(observation: &serde_json::Value) -> Vec<FailedCheck> {
+    if observation["current_authority"] != true || observation["status"] != "failed" {
+        return Vec::new();
+    }
+    let Some(gates) = observation["gates"].as_array() else {
+        return Vec::new();
+    };
+    let failed = gates
+        .iter()
+        .filter(|gate| gate["status"] != "pass")
+        .collect::<Vec<_>>();
+    if failed.is_empty()
+        || failed.iter().any(|gate| {
+            gate["status"] != "fail"
+                || gate["host_fault"] == true
+                || !matches!(
+                    gate["failure_class"].as_str(),
+                    Some("test_failure" | "build_failure" | "cached_prior_fail")
+                )
+        })
+    {
+        return Vec::new();
+    }
+    failed
+        .into_iter()
+        .map(|gate| {
+            let name = gate["gate"].as_str()?;
+            let definition = gate["definition_hash"].as_str()?;
+            if name.is_empty()
+                || name.len() > 256
+                || name.bytes().any(|byte| byte.is_ascii_control())
+                || definition.len() != 64
+                || !definition
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            {
+                return None;
+            }
+            Some(FailedCheck {
+                check: format!("native-gate:{name}:{definition}"),
+            })
+        })
+        .collect::<Option<Vec<_>>>()
+        .filter(|checks| !checks.is_empty())
+        .unwrap_or_default()
+}
+
+fn raise_failed_check_request(
+    store: &mut CollaborationStore,
+    owner: &ControllerOwner,
+    repo: &Path,
+    spec: &RunSpec,
+    wave_id: &RecordId,
+    cancel: &AtomicBool,
+    source: Option<&wave::CompositionSource>,
+    checks: Vec<FailedCheck>,
+) -> Result<Option<&'static str>, ControllerError> {
+    if checks.is_empty() {
+        return Ok(None);
+    }
+    let Some(source) = source else {
+        // Legacy/resumed waves without their exact original composition may
+        // still be verified, but never synthesize context for a new request.
+        return Ok(Some(
+            "legacy wave has no retained composition context for resolution",
+        ));
+    };
+    check(store, owner, spec, cancel)?;
+    match wave::raise_resolution_for_failed_checks(
+        store, owner, repo, wave_id, source, &checks, cancel,
+    ) {
+        Ok(_) => {}
+        Err(wave::WaveError::ResolutionUnsupported) => {
+            return Ok(Some(
+                "accepted-baseline incremental resolution is unsupported",
+            ));
+        }
+        Err(error) => return Err(error.into()),
+    }
+    check(store, owner, spec, cancel)?;
+    Ok(None)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run(
     store: &mut CollaborationStore,
@@ -423,7 +507,9 @@ fn run(
         },
         spec.deadline_ms,
     )?;
-    let active = wave::compose(store, owner, broker.repo_handle().root(), wave_id)?;
+    let composed = wave::compose_with_source(store, owner, broker.repo_handle().root(), wave_id)?;
+    let active = composed.wave;
+    let source = composed.source;
     if active.phase != WavePhase::Verifying {
         budget::settle(
             store,
@@ -468,9 +554,23 @@ fn run(
             || (spec.policy.allow_empty_native_gates
                 && matches!(status, "no_configuration" | "no_gates_triggered")))
     {
+        let failed_checks = trusted_native_failed_checks(&observation);
+        let resolution_hold = raise_failed_check_request(
+            store,
+            owner,
+            broker.repo_handle().root(),
+            spec,
+            wave_id,
+            cancel,
+            source.as_ref(),
+            failed_checks,
+        )?;
         return Ok(DriveResult::Held {
             wave: wave_id.clone(),
-            detail: format!("native gates {status}"),
+            detail: resolution_hold.map_or_else(
+                || format!("native gates {status}"),
+                |reason| format!("native gates {status}; resolution held: {reason}"),
+            ),
         });
     }
     check(store, owner, spec, cancel)?;
@@ -495,6 +595,26 @@ fn run(
     let built = executor.build(store, owner, &execution, &build_attempt, cancel)?;
     close(store, owner, &build_attempt)?;
     if built.outcome() != Outcome::Built {
+        if built.outcome() == Outcome::CodeFailed {
+            let resolution_hold = raise_failed_check_request(
+                store,
+                owner,
+                broker.repo_handle().root(),
+                spec,
+                wave_id,
+                cancel,
+                source.as_ref(),
+                vec![FailedCheck {
+                    check: format!("native-build:{}:{}", execution.id(), built.generation()),
+                }],
+            )?;
+            if let Some(reason) = resolution_hold {
+                return Ok(DriveResult::Held {
+                    wave: wave_id.clone(),
+                    detail: format!("build {:?}; resolution held: {reason}", built.outcome()),
+                });
+            }
+        }
         return Ok(DriveResult::Held {
             wave: wave_id.clone(),
             detail: format!("build {:?}", built.outcome()),
@@ -524,6 +644,31 @@ fn run(
     )?;
     close(store, owner, &verify_attempt)?;
     if evidence.outcome() != VerificationOutcome::Passed {
+        if evidence.outcome() == VerificationOutcome::AssertionFailed {
+            let resolution_hold = raise_failed_check_request(
+                store,
+                owner,
+                broker.repo_handle().root(),
+                spec,
+                wave_id,
+                cancel,
+                source.as_ref(),
+                evidence
+                    .failed_assertion_ids()
+                    .into_iter()
+                    .map(|check| FailedCheck { check })
+                    .collect(),
+            )?;
+            if let Some(reason) = resolution_hold {
+                return Ok(DriveResult::Held {
+                    wave: wave_id.clone(),
+                    detail: format!(
+                        "verification {:?}; resolution held: {reason}",
+                        evidence.outcome()
+                    ),
+                });
+            }
+        }
         return Ok(DriveResult::Held {
             wave: wave_id.clone(),
             detail: format!("verification {:?}", evidence.outcome()),
@@ -607,3 +752,7 @@ fn run(
 #[cfg(all(test, unix))]
 #[path = "drive_tests.rs"]
 pub(crate) mod tests;
+
+#[cfg(test)]
+#[path = "drive_resolution_tests.rs"]
+mod resolution_tests;
