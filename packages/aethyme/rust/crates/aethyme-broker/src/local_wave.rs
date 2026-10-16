@@ -1768,6 +1768,95 @@ fn guard_current(
     Ok(())
 }
 
+/// Prove that a retained request still belongs to the latest eligible wave
+/// before the controller prepares a charged resolution attempt. This checks
+/// the request from its archived record, not from caller-provided trigger data.
+pub(crate) fn require_current_resolution_request(
+    store: &mut CollaborationStore,
+    repo: &Path,
+    owner: &ControllerOwner,
+    wave_id: &RecordId,
+    expected_version: i64,
+    request_ref: &resolution::RecordRef,
+) -> Result<(), WaveError> {
+    let _archive_guard = archive_use(store)?;
+    let _response_guard = crate::collaboration_sensitive::response_use(store)?;
+    let _authority_guard = target::authorize(store, owner)?;
+    let wave = load(store, wave_id)?;
+    let state = target::status(store, owner.target())?;
+    let revision = id(&wave.spec.revision)?;
+    if state.version != expected_version
+        || state.revision.as_ref() != Some(&revision)
+        || wave.spec.target != owner.target()
+        || wave.spec.issuer != owner.issuer()
+        || wave.resolution_request.as_ref() != Some(request_ref)
+    {
+        return Err(WaveError::Stale);
+    }
+    let released: bool = store.read_connection().query_row(
+        "SELECT released FROM local_target_revisions WHERE revision=?1",
+        [revision.as_str()],
+        |row| row.get(0),
+    )?;
+    if released {
+        return Err(WaveError::Stale);
+    }
+
+    let latest_sequence: i64 = store.read_connection().query_row(
+        "SELECT COALESCE(MAX(sequence), 0) FROM local_waves WHERE target=?1 AND revision=?2",
+        params![owner.target(), revision.as_str()],
+        |row| row.get(0),
+    )?;
+    if latest_sequence != wave.spec.sequence {
+        return Err(WaveError::Stale);
+    }
+
+    let request = resolution::load_request(store, repo, request_ref)?;
+    match (&wave.phase, request.trigger()) {
+        (WavePhase::Blocked, resolution::Trigger::Conflict(conflicts))
+            if !conflicts.is_empty()
+                && state.phase == Phase::Idle
+                && state.resume_phase.is_none() =>
+        {
+            let current: bool = store.read_connection().query_row(
+                "SELECT EXISTS(
+                    SELECT 1
+                    FROM local_targets t
+                    JOIN local_waves w ON w.target=t.target
+                    WHERE t.target=?1 AND t.issuer=?2 AND t.active_revision=?3
+                      AND t.version=?4 AND t.phase='idle' AND t.resume_phase IS NULL
+                      AND w.wave=?5 AND w.revision=t.active_revision
+                      AND w.phase='blocked' AND w.sequence=?6
+                )",
+                params![
+                    owner.target(),
+                    owner.issuer(),
+                    revision.as_str(),
+                    expected_version,
+                    wave.id.as_str(),
+                    wave.spec.sequence,
+                ],
+                |row| row.get(0),
+            )?;
+            if !current {
+                return Err(WaveError::Stale);
+            }
+        }
+        (WavePhase::Verifying, resolution::Trigger::FailedChecks { candidate, checks })
+            if Some(candidate) == wave.candidate_snapshot.as_ref()
+                && !checks.is_empty()
+                && (state.phase == Phase::Verifying
+                    || (state.phase == Phase::WaitingForInput
+                        && state.resume_phase == Some(Phase::Verifying))) =>
+        {
+            guard_current(store.read_connection(), owner, &wave, expected_version)?;
+        }
+        _ => return Err(WaveError::Stale),
+    }
+
+    Ok(())
+}
+
 /// One durable dispatch. Replaying a completed composition returns its stored
 /// candidate; a crash during dispatch is explicit, never silently retried.
 pub fn compose(
