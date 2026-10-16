@@ -572,18 +572,15 @@ pub(crate) fn validate_source(
         ));
     }
     match &w.spec.prior_completion {
-        Some(key) => {
-            let (completion, prior) = wave::accepted_completion(store, &id(key)?, w.spec.sequence)?;
-            let members = if completion.revision == w.spec.revision {
-                prior.selected
-            } else {
-                Vec::new()
-            };
-            if body["accepted_baseline"]["completion"] != *key
-                || body["accepted_baseline"]["members"] != serde_json::to_value(members)?
-                || completion.epoch != spec.epoch
-                || completion.accepted_commit != spec.base_commit
-                || body["profile"] != "aethyme.compose.git-merge-file/accepted-baseline-v0"
+        Some(_) => {
+            let revision = target::load_revision(store, &id(&spec.revision)?)?;
+            let prior = wave::prior_completion::load(store, owner, &w, &revision)?
+                .ok_or(NativeGateError::Mismatch)?;
+            prior.validate_retained_completion(store)?;
+            prior.validate_git_binding(repo)?;
+            if body["accepted_baseline"] != prior.recipe_binding()
+                || prior.request_baseline_commit().as_str() != spec.base_commit
+                || body["profile"] != prior.producer_profile()
             {
                 return Err(NativeGateError::Binding(
                     "accepted-baseline recipe differs from prior private completion",

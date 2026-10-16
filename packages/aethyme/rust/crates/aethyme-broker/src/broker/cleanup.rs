@@ -1265,34 +1265,64 @@ impl Broker {
         })
     }
 
-    /// Free space where this repository's gates run, and the directory read.
-    ///
-    /// A gate refuses on the free space at its own checkout, and no gate runs
-    /// beside the repository: a session gate runs in the session worktree,
-    /// under the broker worktree root, and a merge verification slot is placed
-    /// in host state beside it. Reading the repository's volume instead says
-    /// nothing about either when the repository sits on another disk -- one
-    /// checked out on an external drive reported that drive's space while
-    /// every gate refused on a full startup disk.
-    ///
-    /// Both locations are read and the lower wins, because either kind of
-    /// gate refusing is enough to stop work. The repository is the fallback
-    /// only when neither location is known (an ephemeral repository with no
-    /// host state). Each location is read at its nearest existing directory:
-    /// a worktree root does not exist before the first session, and a missing
-    /// path would read as unknown, which never escalates.
+    /// Free space on volumes where gate work can write: repository state and
+    /// logs, the broker database, the selected session-worktree root, the
+    /// exact-tree verification slot, and managed build cache when configured.
+    /// Each path is read at its nearest existing directory; this method does
+    /// not create a missing root or cache.
     pub(super) fn gate_headroom_probes(&self) -> Vec<PathBuf> {
-        let worktree_root = self
-            .worktree_root_plan()
-            .ok()
-            .and_then(|plan| plan.preferred_root);
-        let host_state = crate::host_state::default_host_state_dir();
-        let probes: Vec<PathBuf> = worktree_root.into_iter().chain(host_state).collect();
-        if probes.is_empty() {
-            vec![self.main_root.clone()]
-        } else {
-            probes
+        let mut probes = std::collections::BTreeSet::from([
+            self.main_root.join(".aethyme"),
+            self.store
+                .db_path()
+                .parent()
+                .unwrap_or(&self.main_root)
+                .to_path_buf(),
+        ]);
+        let worktree_root_plan = self.worktree_root_plan().ok();
+        if let Some(plan) = &worktree_root_plan
+            && let Some((root, _)) = crate::broker::lifecycle::worktree_root_candidates_for(plan)
+                .into_iter()
+                .find(|(root, source)| {
+                    *source != crate::WorktreeRootSource::RepositoryFallback
+                        && crate::verification::removable_volume_unavailable_reason(root).is_none()
+                })
+        {
+            probes.insert(root);
         }
+        let verification = worktree_root_plan.as_ref().map_or_else(
+            || crate::verification::plan_slot_placement(&self.main_root, "merge-sim"),
+            |plan| {
+                crate::verification::plan_slot_placement_with_worktree_root_plan(
+                    &self.main_root,
+                    "merge-sim",
+                    plan,
+                )
+            },
+        );
+        if crate::verification::removable_volume_unavailable_reason(&verification.directory)
+            .is_none()
+        {
+            probes.insert(verification.directory);
+        }
+
+        let (uses_managed_cache, uses_host_resource_db) = crate::gates::load_gates(&self.main_root)
+            .map(|gates| {
+                (
+                    gates.iter().any(|gate| gate.managed_cache.is_some()),
+                    gates
+                        .iter()
+                        .any(|gate| !gate.resources.is_empty() || gate.managed_cache.is_some()),
+                )
+            })
+            .unwrap_or_default();
+        if uses_managed_cache && let Some(cache) = crate::host_state::default_host_cache_dir() {
+            probes.insert(cache);
+        }
+        if uses_host_resource_db && let Ok(database) = crate::default_host_resource_db_path() {
+            probes.insert(database.parent().unwrap_or(&self.main_root).to_path_buf());
+        }
+        probes.into_iter().collect()
     }
 
     fn gate_headroom(&self) -> (GateHeadroom, bool) {

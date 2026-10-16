@@ -1050,11 +1050,21 @@ impl Broker {
         session_id: Option<i64>,
     ) -> Result<crate::GraphIntegrityOutcome, BrokerOpError> {
         let policy = crate::GraphIntegrityPolicy::load(checkout.root())?;
-        let outcome = crate::graph_integrity::verify_checkout_without_mutation(
-            &self.main_root,
-            checkout,
-            &policy,
-        )?;
+        let outcome = if policy.enforces_committed_fragments() {
+            let worktree_root_plan = self.worktree_root_plan()?;
+            crate::graph_integrity::verify_checkout_without_mutation_with_worktree_root_plan(
+                &self.main_root,
+                checkout,
+                &policy,
+                &worktree_root_plan,
+            )?
+        } else {
+            crate::graph_integrity::verify_checkout_without_mutation(
+                &self.main_root,
+                checkout,
+                &policy,
+            )?
+        };
         if outcome.enforced {
             self.store.append_event(
                 crate::events::GRAPH_INTEGRITY_CHECKED,
