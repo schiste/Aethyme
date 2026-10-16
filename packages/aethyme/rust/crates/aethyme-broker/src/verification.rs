@@ -603,12 +603,13 @@ mod tests {
 
     fn fixture() -> Fixture {
         let root = tempfile::tempdir().unwrap();
-        let main = root.path().join("repo");
+        let root_path = root.path().canonicalize().unwrap();
+        let main = root_path.join("repo");
         std::fs::create_dir_all(&main).unwrap();
         Fixture {
             main,
-            host: root.path().join("host"),
-            temp: root.path().join("temp"),
+            host: root_path.join("host"),
+            temp: root_path.join("temp"),
             _root: root,
         }
     }
@@ -667,7 +668,13 @@ mod tests {
         std::fs::write(&fx.temp, "not a directory").unwrap();
         let placement = plan_slot_placement_in(&fx.main, "merge-sim", Some(&fx.host), &fx.temp);
         assert!(placement.inside_repository);
-        assert_eq!(placement.directory, fx.main.join(".aethyme/run/merge-sim"));
+        assert_eq!(
+            placement.directory,
+            fx.main
+                .canonicalize()
+                .unwrap()
+                .join(".aethyme/run/merge-sim")
+        );
         let preferred = placement.preferred.expect("the wanted location is named");
         assert!(preferred.starts_with(&fx.host), "{}", preferred.display());
         assert!(preferred.ends_with("merge-sim"));
@@ -882,7 +889,12 @@ mod tests {
                 |_| None,
                 |_| Some(reason.to_string()),
             );
-            let expected = override_root.join(".aethyme/run/merge-sim");
+            let expected = fx
+                ._root
+                .path()
+                .canonicalize()
+                .unwrap()
+                .join("library-worktrees/.aethyme/run/merge-sim");
 
             assert!(placement.blocking_refusal.is_some(), "{reason}");
             assert!(placement.refusals[0].contains(reason));
