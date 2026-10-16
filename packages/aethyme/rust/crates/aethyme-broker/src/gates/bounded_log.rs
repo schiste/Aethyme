@@ -7,9 +7,12 @@
 use std::collections::VecDeque;
 use std::fs::File;
 use std::io::{self, Read, Write};
+#[cfg(unix)]
 use std::os::fd::AsRawFd;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+#[cfg(unix)]
+use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, AtomicI64};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -58,7 +61,9 @@ const PREFIX_BUDGET_BYTES: usize = MAX_LOG_BYTES as usize
     - FOOTER_RESERVE_BYTES
     - FINAL_NOTE_RESERVE_BYTES;
 const WRITE_BUFFER_BYTES: usize = 32 * 1024;
+#[cfg(unix)]
 const READ_BUFFER_BYTES: usize = 8 * 1024;
+#[cfg(unix)]
 const POLL_INTERVAL_MS: i32 = 50;
 const MAX_PATTERN_LEN: usize = 32;
 
@@ -335,6 +340,7 @@ fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
             .any(|window| window == needle)
 }
 
+#[cfg(unix)]
 pub(super) fn set_nonblocking<R: AsRawFd>(reader: &R) -> io::Result<()> {
     let fd = reader.as_raw_fd();
     // SAFETY: fcntl reads and updates flags on this live pipe descriptor.
@@ -350,6 +356,12 @@ pub(super) fn set_nonblocking<R: AsRawFd>(reader: &R) -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(not(unix))]
+pub(super) fn set_nonblocking<R>(_reader: &R) -> io::Result<()> {
+    Err(unsupported_pipe_capture())
+}
+
+#[cfg(unix)]
 pub(super) fn drain_pipe<R: Read + AsRawFd + Send + 'static>(
     mut reader: R,
     collector: Arc<Mutex<BoundedGateLog>>,
@@ -390,12 +402,14 @@ pub(super) fn drain_pipe<R: Read + AsRawFd + Send + 'static>(
             match reader.read(&mut buffer) {
                 Ok(0) => return Ok(()),
                 Ok(count) => {
-                    let _ = first_output_ms.compare_exchange(
-                        -1,
-                        started.elapsed().as_millis().min(i64::MAX as u128) as i64,
-                        Ordering::AcqRel,
-                        Ordering::Acquire,
-                    );
+                    first_output_ms
+                        .compare_exchange(
+                            -1,
+                            started.elapsed().as_millis().min(i64::MAX as u128) as i64,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .unwrap_or_else(|recorded| recorded);
                     let mut state = collector
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -410,6 +424,29 @@ pub(super) fn drain_pipe<R: Read + AsRawFd + Send + 'static>(
             }
         }
     }
+}
+
+#[cfg(not(unix))]
+pub(super) fn drain_pipe<R: Read + Send + 'static>(
+    _reader: R,
+    _collector: Arc<Mutex<BoundedGateLog>>,
+    _stop: Arc<AtomicBool>,
+    _first_output_ms: Arc<AtomicI64>,
+    drain_failed: Arc<AtomicBool>,
+    drain_error: Arc<Mutex<Option<String>>>,
+    _started: Instant,
+) -> io::Result<()> {
+    let error = unsupported_pipe_capture();
+    record_drain_error(&drain_failed, &drain_error, &error);
+    Err(error)
+}
+
+#[cfg(not(unix))]
+fn unsupported_pipe_capture() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::Unsupported,
+        "bounded nonblocking gate pipe capture is unavailable on this platform",
+    )
 }
 
 fn record_drain_error(failed: &AtomicBool, slot: &Mutex<Option<String>>, error: &io::Error) {
