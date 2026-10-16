@@ -134,9 +134,7 @@ impl PinnedTreeRemoval {
         }
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
-            drop(_validate);
             let _self = self;
-            let _ = (_witness_name, _deadline);
             Err(unsupported_platform())
         }
     }
@@ -176,7 +174,6 @@ pub(crate) fn remove_condemned_tree_with_progress(
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
-        let _ = (_dir, _keep_until_last, _deadline);
         Err(TreeRemovalError {
             source: unsupported_platform(),
             entries_reclaimed: 0,
