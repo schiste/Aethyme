@@ -3360,50 +3360,52 @@ mod tests {
         drop(store);
 
         let mut migrated = open(host.path(), &[]).unwrap();
-        let job: (
-            String,
-            String,
-            String,
-            String,
-            String,
-            Vec<u8>,
-            String,
-            Option<Vec<u8>>,
-            Option<i64>,
-        ) = migrated
+        #[derive(Debug, PartialEq, Eq)]
+        struct LegacyGateJob {
+            id: String,
+            wave: String,
+            target: String,
+            revision: String,
+            epoch: String,
+            body: Vec<u8>,
+            state: String,
+            observation: Option<Vec<u8>>,
+            roots_released_ms: Option<i64>,
+        }
+        let job = migrated
             .read_connection()
             .query_row(
                 "SELECT id,wave,target,revision,epoch,body,state,observation,roots_released_ms
                  FROM local_native_gate_jobs WHERE id='job:legacy'",
                 [],
                 |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                        row.get(5)?,
-                        row.get(6)?,
-                        row.get(7)?,
-                        row.get(8)?,
-                    ))
+                    Ok(LegacyGateJob {
+                        id: row.get(0)?,
+                        wave: row.get(1)?,
+                        target: row.get(2)?,
+                        revision: row.get(3)?,
+                        epoch: row.get(4)?,
+                        body: row.get(5)?,
+                        state: row.get(6)?,
+                        observation: row.get(7)?,
+                        roots_released_ms: row.get(8)?,
+                    })
                 },
             )
             .unwrap();
         assert_eq!(
             job,
-            (
-                "job:legacy".into(),
-                "wave".into(),
-                "target".into(),
-                "revision".into(),
-                "epoch".into(),
-                vec![3, 4],
-                "completed".into(),
-                Some(vec![5, 6]),
-                Some(1234),
-            )
+            LegacyGateJob {
+                id: "job:legacy".into(),
+                wave: "wave".into(),
+                target: "target".into(),
+                revision: "revision".into(),
+                epoch: "epoch".into(),
+                body: vec![3, 4],
+                state: "completed".into(),
+                observation: Some(vec![5, 6]),
+                roots_released_ms: Some(1234),
+            }
         );
         let roots: Vec<(String, String, String)> = migrated
             .read_connection()
