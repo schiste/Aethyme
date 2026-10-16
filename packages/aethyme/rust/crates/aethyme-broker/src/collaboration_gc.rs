@@ -766,11 +766,18 @@ impl<'a> Closure<'a> {
                 if length > limit {
                     return Err(GcError::IdentityManifestLimit);
                 }
-                let bytes = read_object_bounded(self.store, &manifest_digest, limit).ok();
-                if let Some(bytes) = &bytes {
-                    *remaining -= bytes.len();
-                }
-                bytes
+                // Debit before I/O, including failed/corrupt reads. Read no
+                // more than the admitted size (plus the reader's one-byte
+                // overflow sentinel), and stop the entire discovery on error.
+                *remaining -= length;
+                Some(
+                    read_object_bounded(self.store, &manifest_digest, length).map_err(|_| {
+                        GcError::Blocked(vec![GcBlocker {
+                            kind: "dangling_root",
+                            detail: format!("the manifest of snapshot {id} is unreadable"),
+                        }])
+                    })?,
+                )
             } else {
                 read_object(self.store, &manifest_digest).ok()
             }
@@ -1190,7 +1197,7 @@ fn live_closure_with_identity_limit(
     // job retires these edges; dispatching and unknown jobs remain rooted.
     let native_roots: Vec<(String, String)> = collect_live_roots(
         connection
-        .prepare("SELECT roots.kind,roots.reference FROM local_native_gate_roots AS roots JOIN local_native_gate_jobs AS jobs ON jobs.id=roots.job WHERE jobs.roots_released_ms IS NULL UNION SELECT kind,reference FROM local_controller_completion_roots")?
+        .prepare("SELECT roots.kind,roots.reference FROM local_native_gate_roots AS roots JOIN local_native_gate_jobs AS jobs ON jobs.id=roots.job WHERE jobs.roots_released_ms IS NULL UNION ALL SELECT kind,reference FROM local_controller_completion_roots")?
         .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?,
         &mut live.identity_roots_remaining,
     )?;
@@ -2639,6 +2646,50 @@ mod tests {
         ordinary.snapshot(&receipt.base.to_string()).unwrap();
         ordinary.snapshot(&receipt.result.to_string()).unwrap();
         assert!(ordinary.problems.is_empty());
+    }
+
+    #[test]
+    fn identity_corrupt_manifest_is_charged_and_stops_discovery() {
+        let host = tempfile::tempdir().unwrap();
+        let (source, base, result) = repo("identity-corrupt-budget");
+        let mut store = open(host.path());
+        let receipt = captured(
+            &mut store,
+            &request(
+                source.path(),
+                "identity-corrupt-budget",
+                &base,
+                &result,
+                RetentionBoundary::UntilReleased,
+            ),
+        );
+        let path = object_path(&store, &ObjectDigest::of_snapshot(&receipt.base));
+        let mut bytes = std::fs::read(&path).unwrap();
+        let length = bytes.len();
+        bytes[0] ^= 1;
+        std::fs::write(path, bytes).unwrap();
+        let mut closure = Closure::with_identity_revision_limit(&store, Some(10));
+        closure.identity_manifest_bytes_remaining = Some(length);
+        assert!(
+            matches!(
+                closure.snapshot(&receipt.base.to_string()),
+                Err(GcError::Blocked(_))
+            ),
+            "a corrupt proof aborts identity discovery"
+        );
+        assert_eq!(
+            closure.identity_manifest_bytes_remaining,
+            Some(0),
+            "failed reads still consume the admitted budget"
+        );
+        assert!(matches!(
+            closure.snapshot(&receipt.result.to_string()),
+            Err(GcError::IdentityManifestLimit)
+        ));
+        // Ordinary GC keeps its existing problem-collection behavior.
+        let mut ordinary = Closure::new(&store);
+        ordinary.snapshot(&receipt.base.to_string()).unwrap();
+        assert_eq!(ordinary.problems.len(), 1);
     }
 
     #[test]
