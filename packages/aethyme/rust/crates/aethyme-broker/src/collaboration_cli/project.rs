@@ -1375,6 +1375,7 @@ mod binding_tests {
         fixture.commit_pointer(PROJECT_DESCRIPTOR_PATH).unwrap();
         let error = fixture.bind("not-a-record-id").unwrap_err();
         assert_eq!(error.code, "usage");
+        assert_eq!(error.exit, crate::exit_status::USAGE);
         assert_eq!(binding_count(&fixture.store), 0);
         assert!(
             collaboration_identity_store::resolve_approved_project_binding(&fixture.store)
