@@ -1216,7 +1216,7 @@ mod tests {
         ] {
             assert!(reference.contains(needle), "missing {needle:?}");
         }
-        assert!(!reference.contains("broker main reconcile plan/apply"));
+        assert!(!reference.contains("broker main reconcile"));
     }
 
     #[test]

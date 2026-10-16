@@ -884,7 +884,7 @@ mod tests {
                 "generated broker reference is missing {required:?}"
             );
         }
-        assert!(!codex_broker_reference.contains("broker main reconcile plan/apply"));
+        assert!(!codex_broker_reference.contains("broker main reconcile"));
 
         let settings = std::fs::read_to_string(repo.join(SETTINGS_FILE)).unwrap();
         assert_eq!(
