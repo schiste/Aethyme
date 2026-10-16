@@ -225,7 +225,7 @@ pub fn serve(
             Ok(DriveResult::Completed {
                 completion,
                 historical: false,
-            }) => report.completions.push(completion),
+            }) => report.completions.push(*completion),
             Ok(DriveResult::Waiting(_)) => {
                 let wake = std::time::Instant::now() + Duration::from_millis(policy.poll_ms);
                 while std::time::Instant::now() < wake && !cancel.load(Ordering::SeqCst) {
