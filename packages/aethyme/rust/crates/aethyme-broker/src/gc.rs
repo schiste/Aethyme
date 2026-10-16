@@ -4338,7 +4338,13 @@ impl Broker {
             write_journal(&journal_path, &journal)?;
         }
 
-        while !journal.remaining_orphans.is_empty() && !check_deadline(deadline) {
+        // Visit each candidate at most once per apply. A temporarily unreadable
+        // tree stays durable at the tail without starving healthy roots.
+        let orphan_visits = journal.remaining_orphans.len();
+        for _ in 0..orphan_visits {
+            if journal.remaining_orphans.is_empty() || check_deadline(deadline) {
+                break;
+            }
             let candidate = journal.remaining_orphans[0].clone();
             let root = PathBuf::from(&candidate.worktree_root);
             let Some(fingerprint) = candidate.ownership_fingerprint.as_deref() else {
@@ -4373,8 +4379,9 @@ impl Broker {
                         "{}: orphan removal temporarily unavailable ({error}); retained in journal",
                         candidate.worktree_root
                     ));
+                    journal.remaining_orphans.rotate_left(1);
                     write_journal(&journal_path, &journal)?;
-                    break;
+                    continue;
                 }
             };
             if removal_claim.already_absent {
@@ -4392,8 +4399,9 @@ impl Broker {
                         "{}: orphan deletion unavailable ({error}); retained in journal",
                         candidate.worktree_root
                     ));
+                    journal.remaining_orphans.rotate_left(1);
                     write_journal(&journal_path, &journal)?;
-                    break;
+                    continue;
                 }
             }
             journal.reclaimed_bytes = journal
@@ -5933,7 +5941,37 @@ mod tests {
             0,
             "run this test as an unprivileged user"
         );
-        let (_fixture, mut broker, root, digest) = registered_orphan_fixture();
+        let (fixture, mut broker, root, _digest) = registered_orphan_fixture();
+        let healthy = root.parent().unwrap().join("z-healthy-root");
+        let healthy_origin = fixture.path().join("healthy-origin");
+        std::fs::create_dir(&healthy).unwrap();
+        std::fs::create_dir(&healthy_origin).unwrap();
+        let marker = crate::broker::WorktreeRootMarker {
+            schema_version: crate::broker::WORKTREE_ROOT_SCHEMA_VERSION,
+            repository_key: "healthy-historic-root".into(),
+            repository_root: healthy_origin.clone(),
+        };
+        std::fs::write(
+            healthy.join(WORKTREE_ROOT_MARKER),
+            serde_json::to_vec(&marker).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(healthy.join("payload.txt"), "healthy payload").unwrap();
+        crate::worktree_registry::register(
+            &broker.host_operation_database_path().unwrap(),
+            &healthy,
+            &marker,
+            crate::WorktreeRootSource::LibraryOverride,
+        )
+        .unwrap();
+        std::fs::remove_dir(&healthy_origin).unwrap();
+        let journal_path = broker.main_root().join(".aethyme/gc-journal.json");
+        std::fs::remove_file(&journal_path).unwrap();
+        let plan = broker.gc_plan().unwrap();
+        assert_eq!(plan.orphans.len(), 2);
+        assert_eq!(plan.orphans[0].worktree_root, root.to_string_lossy());
+        let digest = plan.digest.clone();
+        write_journal(&journal_path, &GcJournal::from(plan)).unwrap();
         let child = root.join("temporarily-unreadable");
         std::fs::create_dir(&child).unwrap();
         std::fs::write(child.join("retained.txt"), "recoverable payload").unwrap();
@@ -5950,14 +5988,18 @@ mod tests {
         let blocked = broker.gc_apply(&digest).unwrap();
         assert!(!blocked.complete, "{blocked:?}");
         assert!(blocked.recovery_action.is_some());
-        assert!(blocked.orphans_removed.is_empty());
+        assert_eq!(
+            blocked.orphans_removed,
+            vec![healthy.to_string_lossy().into_owned()],
+            "an unavailable root must not starve the healthy candidate behind it"
+        );
+        assert!(!healthy.exists());
         assert!(
             blocked
                 .failures
                 .iter()
                 .any(|reason| reason.contains("retained in journal"))
         );
-        let journal_path = broker.main_root().join(".aethyme/gc-journal.json");
         assert_eq!(
             load_journal(&journal_path)
                 .unwrap()
@@ -5977,7 +6019,10 @@ mod tests {
         assert!(completed.complete, "{completed:?}");
         assert_eq!(
             completed.orphans_removed,
-            vec![root.to_string_lossy().into_owned()]
+            vec![
+                healthy.to_string_lossy().into_owned(),
+                root.to_string_lossy().into_owned()
+            ]
         );
         assert!(!root.exists());
         assert!(!journal_path.exists());
