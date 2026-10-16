@@ -188,13 +188,13 @@ pub fn open_fixture_broker(
     fixture_root: &Path,
 ) -> Result<FixtureBroker, BrokerOpError> {
     let worktree_root_path = fixture_root.join("worktrees");
+    let host_state_dir = fixture_host_state_dir(fixture_root);
     let broker = Broker::open(repository)?;
     Ok(FixtureBroker {
         broker: broker
-            .with_host_operation_database(
-                fixture_host_state_dir(fixture_root).join("host-operations.db"),
-            )
-            .with_worktree_root(worktree_root_path.clone()),
+            .with_host_operation_database(host_state_dir.join("host-operations.db"))
+            .with_worktree_root(worktree_root_path.clone())
+            .with_collaboration_state(host_state_dir),
         worktree_root: worktree_root_path,
     })
 }
