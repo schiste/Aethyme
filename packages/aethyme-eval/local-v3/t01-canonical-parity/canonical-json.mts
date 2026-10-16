@@ -209,14 +209,19 @@ class Parser {
 
   private parseString(): string {
     this.position += 1;
-    let output = "";
+    const output: string[] = [];
+    let decodedBytes = 0;
+
+    const append = (codePoint: number): void => {
+      decodedBytes += this.appendScalar(output, codePoint);
+    };
 
     while (true) {
       const current = this.peek();
       if (current === undefined) throw new CanonicalProfileError("syntax");
       if (current === '"') {
         this.position += 1;
-        return output;
+        return output.join("");
       }
       if (current === "\\") {
         this.position += 1;
@@ -225,35 +230,33 @@ class Parser {
           case '"':
           case "\\":
           case "/":
-            output += escape;
+            append(escape.codePointAt(0)!);
             this.position += 1;
             break;
           case "b":
-            output += "\b";
+            append(0x08);
             this.position += 1;
             break;
           case "f":
-            output += "\f";
+            append(0x0c);
             this.position += 1;
             break;
           case "n":
-            output += "\n";
+            append(0x0a);
             this.position += 1;
             break;
           case "r":
-            output += "\r";
+            append(0x0d);
             this.position += 1;
             break;
           case "t":
-            output += "\t";
+            append(0x09);
             this.position += 1;
             break;
-          case "u": {
+          case "u":
             this.position += 1;
-            const codePoint = this.parseUnicodeEscape();
-            output = this.appendScalar(output, codePoint);
+            append(this.parseUnicodeEscape());
             break;
-          }
           default:
             throw new CanonicalProfileError("syntax");
         }
@@ -262,11 +265,11 @@ class Parser {
         if (codeUnit < 0x20) throw new CanonicalProfileError("syntax");
         const codePoint = this.text.codePointAt(this.position);
         if (codePoint === undefined) throw new CanonicalProfileError("syntax");
-        output = this.appendScalar(output, codePoint);
+        append(codePoint);
         this.position += codePoint > 0xffff ? 2 : 1;
       }
 
-      if (Buffer.byteLength(output, "utf8") > PROFILE_LIMITS.max_string_bytes) {
+      if (decodedBytes > PROFILE_LIMITS.max_string_bytes) {
         throw new CanonicalProfileError("string_too_long");
       }
     }
@@ -300,14 +303,18 @@ class Parser {
     return Number.parseInt(digits, 16);
   }
 
-  private appendScalar(output: string, codePoint: number): string {
+  private appendScalar(output: string[], codePoint: number): number {
     if (
       (codePoint >= 0xfdd0 && codePoint <= 0xfdef) ||
       (codePoint & 0xfffe) === 0xfffe
     ) {
       throw new CanonicalProfileError("noncharacter");
     }
-    return output + String.fromCodePoint(codePoint);
+    output.push(String.fromCodePoint(codePoint));
+    if (codePoint <= 0x7f) return 1;
+    if (codePoint <= 0x7ff) return 2;
+    if (codePoint <= 0xffff) return 3;
+    return 4;
   }
 }
 
