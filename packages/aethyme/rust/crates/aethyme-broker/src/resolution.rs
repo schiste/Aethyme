@@ -3736,6 +3736,51 @@ pub(crate) fn read_synthesized_attempt_result_for_refs(
     Ok(synthesis)
 }
 
+/// Read the exact synthesized result settled for one request and async token.
+/// The result reference comes from the immutable ledger row; caller-provided
+/// token/request data can only select that row, never retarget its group.
+pub(crate) fn read_synthesized_attempt_result_for_token_request(
+    store: &mut CollaborationStore,
+    repo: &Path,
+    token: &str,
+    request: &RecordRef,
+) -> Result<UnverifiedSynthesis, ResolutionError> {
+    let result_count: i64 = store.read_connection().query_row(
+        "SELECT count(*) FROM resolution_attempts
+         WHERE async_token=?1 AND request_record_id=?2 AND request_sha256=?3
+           AND async_state='settled' AND outcome='synthesized'
+           AND result_record_id IS NOT NULL AND result_sha256 IS NOT NULL
+           AND session_label IS NOT NULL",
+        rusqlite::params![token, request.id.as_str(), request.object.hex()],
+        |row| row.get(0),
+    )?;
+    if result_count != 1 {
+        return Err(invalid(
+            "token and request do not identify one settled synthesized result",
+        ));
+    }
+    let (result_id, result_sha256): (String, String) = store.read_connection().query_row(
+        "SELECT result_record_id,result_sha256 FROM resolution_attempts
+         WHERE async_token=?1 AND request_record_id=?2 AND request_sha256=?3
+           AND async_state='settled' AND outcome='synthesized'
+           AND result_record_id IS NOT NULL AND result_sha256 IS NOT NULL
+           AND session_label IS NOT NULL",
+        rusqlite::params![token, request.id.as_str(), request.object.hex()],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let result = RecordRef {
+        id: RecordId::parse(&result_id).map_err(|_| invalid("result record id is malformed"))?,
+        object: ObjectDigest::from_bytes(parse_digest_hex(&result_sha256)?),
+    };
+    let synthesis = read_synthesized_attempt_result_for_refs(store, repo, request, &result)?;
+    if synthesis.status.token != token || synthesis.status.request != *request {
+        return Err(invalid(
+            "settled result token or request changed during read",
+        ));
+    }
+    Ok(synthesis)
+}
+
 fn verify_manifest_objects(
     store: &CollaborationStore,
     status: &ResolutionAttemptStatus,

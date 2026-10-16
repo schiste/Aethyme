@@ -428,7 +428,7 @@ fn assert_native_job_sources_retained(
     }
 
     let job_record = ObjectDigest::of(&record(&job.spec).unwrap().canonical_bytes());
-    let recipe_record = digest(&job.spec.recipe).unwrap();
+    let recipe_record = digest(job.spec.recipe.as_deref().unwrap()).unwrap();
     archive::read_object(store, &job_record).unwrap();
     archive::read_object(store, &recipe_record).unwrap();
     expected_objects
@@ -547,6 +547,142 @@ fn actual_composer_candidate_runs_native_gates_without_legacy_queue_or_ref_write
     .unwrap();
     assert_eq!(repeated.observation, complete.observation);
 }
+
+#[test]
+fn exact_spec_identity_preserves_old_job_and_separates_same_wave_synthesis() {
+    let mut s = setup(Some(GATES));
+    let job = prepare(
+        &mut s.f.store,
+        s.owner.as_ref().expect("setup owner is present"),
+        &mut s.broker,
+        &s.wave,
+    )
+    .unwrap();
+
+    let mut legacy_spec = serde_json::Map::new();
+    macro_rules! legacy_field {
+        ($field:ident) => {
+            legacy_spec.insert(
+                stringify!($field).into(),
+                serde_json::to_value(&job.spec.$field).unwrap(),
+            );
+        };
+    }
+    legacy_field!(profile);
+    legacy_field!(repository_root);
+    legacy_field!(repository_common_dir);
+    legacy_field!(target);
+    legacy_field!(revision);
+    legacy_field!(epoch);
+    legacy_field!(wave);
+    legacy_spec.insert(
+        "recipe".into(),
+        serde_json::json!(job.spec.recipe.as_deref().unwrap()),
+    );
+    legacy_field!(baseline);
+    legacy_field!(subject);
+    legacy_field!(base_commit);
+    legacy_field!(tree);
+    legacy_field!(commit);
+    legacy_field!(inputs);
+    legacy_field!(policy_sha256);
+    for (name, value) in [
+        ("gate_config_sha256", &job.spec.gate_config_sha256),
+        ("graph_config_sha256", &job.spec.graph_config_sha256),
+        ("preparation_sha256", &job.spec.preparation_sha256),
+    ] {
+        if let Some(value) = value {
+            legacy_spec.insert(name.into(), serde_json::json!(value));
+        }
+    }
+    legacy_field!(max_dispatches);
+    legacy_field!(execution_allowance_seconds);
+    let old_shape = Record::decode(
+        &serde_json::to_vec(&json!({
+            "schema": SCHEMA_NAME,
+            "spec": serde_json::Value::Object(legacy_spec),
+        }))
+        .unwrap(),
+        &[&SCHEMA],
+    )
+    .unwrap();
+    assert_eq!(
+        old_shape.canonical_bytes(),
+        record(&job.spec).unwrap().canonical_bytes()
+    );
+
+    let old_observation = json!({"status":"historical original observation"});
+    s.f.store
+        .connection()
+        .execute(
+            "UPDATE local_native_gate_jobs SET state='completed',observation=?2 WHERE id=?1",
+            params![
+                job.id.as_str(),
+                serde_json::to_vec(&old_observation).unwrap()
+            ],
+        )
+        .unwrap();
+    let mut synthesized = job.spec.clone();
+    synthesized.synthesized_group = Some(wave::SynthesizedGroupProvenance {
+        schema: "aethyme.synthesized-group-provenance/experimental-v1".into(),
+        version: 1,
+        trust: "unverified_local".into(),
+        request_record_id: "sha256:request".into(),
+        request_object: "a".repeat(64),
+        group_record_id: "sha256:group".into(),
+        group_object: "b".repeat(64),
+        input_manifest_sha256: "c".repeat(64),
+        baseline_snapshot: synthesized.baseline.clone(),
+        baseline_commit: synthesized.base_commit.clone(),
+        candidate_subject: synthesized.subject.clone(),
+        candidate_tree: synthesized.tree.clone(),
+        candidate_commit: synthesized.commit.clone(),
+        inputs: Vec::new(),
+    });
+    let synthesized_record = record(&synthesized).unwrap();
+    assert_ne!(synthesized_record.id(), job.id);
+    s.f.store
+        .connection()
+        .execute(
+            "INSERT INTO local_native_gate_jobs(id,wave,target,revision,epoch,body,state)
+             VALUES(?1,?2,?3,?4,?5,?6,'prepared')",
+            params![
+                synthesized_record.id().as_str(),
+                synthesized.wave,
+                synthesized.target,
+                synthesized.revision,
+                synthesized.epoch,
+                synthesized_record.canonical_bytes(),
+            ],
+        )
+        .unwrap();
+
+    let loaded_old = load_exact_spec(&s.f.store, &job.spec).unwrap().unwrap();
+    let loaded_new = load_exact_spec(&s.f.store, &synthesized).unwrap().unwrap();
+    assert_eq!(loaded_old.id, job.id);
+    assert_eq!(loaded_old.observation, Some(old_observation.clone()));
+    assert_eq!(loaded_new.id, synthesized_record.id());
+    let prepared = prepare(
+        &mut s.f.store,
+        s.owner.as_ref().expect("setup owner is present"),
+        &mut s.broker,
+        &s.wave,
+    )
+    .unwrap();
+    assert_eq!(prepared.id, job.id);
+    assert_eq!(prepared.observation, Some(old_observation));
+    let same_wave_jobs: i64 =
+        s.f.store
+            .connection()
+            .query_row(
+                "SELECT count(*) FROM local_native_gate_jobs WHERE wave=?1",
+                [&job.spec.wave],
+                |row| row.get(0),
+            )
+            .unwrap();
+    assert_eq!(same_wave_jobs, 2);
+}
+
 #[test]
 fn a_dispatched_job_reopens_unknown_without_any_retry() {
     let mut s = setup(Some(GATES));
@@ -639,7 +775,12 @@ fn corrupt_projected_job_identity_and_source_binding_refuse_before_dispatch() {
     let mut forged = job.spec.clone();
     forged.subject = forged.baseline.clone();
     assert!(matches!(
-        validate_source(&s.f.store, s.f._repo.path(), &forged),
+        validate_source(
+            &mut s.f.store,
+            s.owner.as_ref().expect("setup owner is present"),
+            s.f._repo.path(),
+            &forged,
+        ),
         Err(NativeGateError::Mismatch | NativeGateError::Binding(_))
     ));
     s.f.store

@@ -182,9 +182,302 @@ pub struct Wave {
     /// Exact inputs and result of the original composition, retained so a
     /// later controller invocation can build a request without recomposing.
     pub composition_source: Option<resolution::RecordRef>,
+    /// An exact settled synthesized result attached after Local verification
+    /// was requested. This remains unverified until fresh trusted gates run.
+    pub resolution_result: Option<resolution::RecordRef>,
     pub detail: Option<String>,
     pub composition_ms: i64,
     pub drift_count: u32,
+}
+
+/// Exact lineage and candidate provenance carried into each synthesized
+/// native-gate Spec. These are source bindings only and confer no trust.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SynthesizedGroupInput {
+    pub id: String,
+    pub lineage: String,
+    pub base_snapshot: String,
+    pub result_snapshot: String,
+    pub base_commit: String,
+    pub result_commit: String,
+}
+
+/// Versioned binding from a Local wave to one strict async-ledger result.
+/// The resolver's group is still unverified; native gates must run against
+/// this exact candidate before it can advance.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SynthesizedGroupProvenance {
+    pub schema: String,
+    pub version: u32,
+    pub trust: String,
+    pub request_record_id: String,
+    pub request_object: String,
+    pub group_record_id: String,
+    pub group_object: String,
+    pub input_manifest_sha256: String,
+    pub baseline_snapshot: String,
+    pub baseline_commit: String,
+    pub candidate_subject: String,
+    pub candidate_tree: String,
+    pub candidate_commit: String,
+    pub inputs: Vec<SynthesizedGroupInput>,
+}
+
+const SYNTHESIZED_GROUP_PROVENANCE_SCHEMA: &str =
+    "aethyme.synthesized-group-provenance/experimental-v1";
+
+/// Re-read an attached result through the exact settled ledger binding and
+/// prove that it contains every selected lineage exactly once. Conflict
+/// requests that only contain an applied prefix remain unattached until a
+/// separate full-tail recomposition exists.
+pub(crate) fn read_synthesized_wave_result(
+    store: &mut CollaborationStore,
+    repo: &Path,
+    wave: &Wave,
+) -> Result<Option<(resolution::UnverifiedSynthesis, SynthesizedGroupProvenance)>, WaveError> {
+    let (Some(request_ref), Some(result_ref)) = (&wave.resolution_request, &wave.resolution_result)
+    else {
+        if wave.resolution_request.is_none() && wave.resolution_result.is_none() {
+            return Ok(None);
+        }
+        return Err(WaveError::Invalid(
+            "synthesized result requires an exact request/result pair".into(),
+        ));
+    };
+    if wave.phase != WavePhase::Verifying || wave.spec.prior_completion.is_some() {
+        return Err(WaveError::ResolutionUnsupported);
+    }
+    let synthesis =
+        resolution::read_synthesized_attempt_result_for_refs(store, repo, request_ref, result_ref)?;
+    if synthesis.status.request != *request_ref
+        || synthesis.group_record != *result_ref
+        || synthesis.request.record() != request_ref
+        || synthesis.candidate.producer
+            != (Producer::Resolver {
+                profile: resolution::SYNTHESIS_PROFILE.into(),
+            })
+        || synthesis.candidate.mode != CompositionMode::Synthesized
+        || synthesis.candidate.baseline_source != composer::COMPOSER_BASELINE_SOURCE
+        || synthesis.candidate.baseline != synthesis.request.baseline.commit
+        || synthesis.request.baseline.snapshot_id.as_str() != wave.spec.baseline
+        || wave.candidate_snapshot.as_ref() != Some(&synthesis.candidate.subject)
+        || wave.candidate_commit.as_ref() != Some(&synthesis.candidate.commit)
+    {
+        return Err(WaveError::Invalid(
+            "synthesized group differs from the current request or candidate contract".into(),
+        ));
+    }
+
+    let revision = target::load_revision(store, &id(&wave.spec.revision)?)?;
+    if revision.target != wave.spec.target || revision.issuer != wave.spec.issuer {
+        return Err(WaveError::Stale);
+    }
+    let mut selected = BTreeMap::new();
+    let mut selected_lineages = std::collections::BTreeSet::new();
+    for selected_id in &wave.spec.selected {
+        let contribution = revision
+            .spec
+            .contributions
+            .iter()
+            .find(|contribution| contribution.id == *selected_id)
+            .ok_or(WaveError::Stale)?;
+        let lineage = contribution
+            .lineage
+            .as_ref()
+            .ok_or_else(|| WaveError::Invalid("selected lineage is missing".into()))?;
+        if !selected_lineages.insert(lineage.as_str().to_owned())
+            || selected
+                .insert(selected_id.clone(), lineage.as_str().to_owned())
+                .is_some()
+        {
+            return Err(WaveError::Invalid(
+                "selected lineages and contribution ids must be unique".into(),
+            ));
+        }
+    }
+
+    let mut request_members = BTreeMap::new();
+    for member in synthesis
+        .request
+        .contents()
+        .iter()
+        .chain(synthesis.request.members())
+    {
+        let lineage = member.lineage.as_str().to_owned();
+        if request_members
+            .get(&lineage)
+            .is_some_and(|previous| *previous != member)
+        {
+            return Err(WaveError::Invalid(
+                "request contains conflicting inputs for one lineage".into(),
+            ));
+        }
+        request_members.insert(lineage, member);
+    }
+    if request_members
+        .keys()
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>()
+        != selected_lineages
+    {
+        return Err(WaveError::Invalid(
+            "synthesized inputs do not cover the complete selected wave".into(),
+        ));
+    }
+
+    let expected_inputs = selected
+        .iter()
+        .map(|(selected_id, lineage)| {
+            let member = request_members.get(lineage).ok_or_else(|| {
+                WaveError::Invalid("selected input is absent from request".into())
+            })?;
+            if member.id != *selected_id {
+                return Err(WaveError::Invalid(
+                    "request input id does not match the selected contribution".into(),
+                ));
+            }
+            let retained = archive::retained_contribution(store, &member.lineage)?
+                .ok_or(TargetError::Missing)?;
+            if retained.base.snapshot_id != member.base
+                || retained.result.snapshot_id != member.result
+                || retained.base.commit != member.base_commit
+                || retained.result.commit != member.result_commit
+                || archive::snapshot_of_commit(repo, &member.base_commit)?.id() != member.base
+                || archive::snapshot_of_commit(repo, &member.result_commit)?.id() != member.result
+            {
+                return Err(WaveError::Invalid(
+                    "selected input differs from its retained lineage".into(),
+                ));
+            }
+            Ok((
+                member.base.as_str().to_owned(),
+                member.result.as_str().to_owned(),
+                member.base_commit.as_str().to_owned(),
+                member.result_commit.as_str().to_owned(),
+            ))
+        })
+        .collect::<Result<Vec<_>, WaveError>>()?;
+    let mut actual_inputs = synthesis
+        .candidate
+        .inputs
+        .iter()
+        .map(|input| {
+            Ok((
+                input
+                    .base_snapshot
+                    .as_ref()
+                    .ok_or_else(|| {
+                        WaveError::Invalid("synthesized base snapshot is missing".into())
+                    })?
+                    .as_str()
+                    .to_owned(),
+                input
+                    .result_snapshot
+                    .as_ref()
+                    .ok_or_else(|| {
+                        WaveError::Invalid("synthesized result snapshot is missing".into())
+                    })?
+                    .as_str()
+                    .to_owned(),
+                input.base.as_str().to_owned(),
+                input.result.as_str().to_owned(),
+            ))
+        })
+        .collect::<Result<Vec<_>, WaveError>>()?;
+    let mut expected_inputs = expected_inputs;
+    actual_inputs.sort();
+    expected_inputs.sort();
+    if actual_inputs != expected_inputs {
+        return Err(WaveError::Invalid(
+            "synthesized candidate inputs differ from the selected lineages".into(),
+        ));
+    }
+
+    let inputs = selected
+        .iter()
+        .map(|(selected_id, lineage)| {
+            let member = request_members[lineage];
+            SynthesizedGroupInput {
+                id: selected_id.clone(),
+                lineage: lineage.clone(),
+                base_snapshot: member.base.to_string(),
+                result_snapshot: member.result.to_string(),
+                base_commit: member.base_commit.to_string(),
+                result_commit: member.result_commit.to_string(),
+            }
+        })
+        .collect();
+    let provenance = SynthesizedGroupProvenance {
+        schema: SYNTHESIZED_GROUP_PROVENANCE_SCHEMA.into(),
+        version: 1,
+        trust: "unverified_local".into(),
+        request_record_id: request_ref.id.to_string(),
+        request_object: request_ref.object.hex(),
+        group_record_id: result_ref.id.to_string(),
+        group_object: result_ref.object.hex(),
+        input_manifest_sha256: synthesis.input_manifest.sha256,
+        baseline_snapshot: synthesis.request.baseline.snapshot_id.to_string(),
+        baseline_commit: synthesis.request.baseline.commit.to_string(),
+        candidate_subject: synthesis.candidate.subject.to_string(),
+        candidate_tree: synthesis.candidate.tree,
+        candidate_commit: synthesis.candidate.commit.to_string(),
+        inputs,
+    };
+    Ok(Some((synthesis, provenance)))
+}
+
+pub(crate) fn validate_synthesized_group_roots(
+    store: &CollaborationStore,
+    wave: &Wave,
+    synthesis: &resolution::UnverifiedSynthesis,
+    provenance: &SynthesizedGroupProvenance,
+) -> Result<(), WaveError> {
+    let revision = wave.spec.revision.as_str();
+    let require_root = |kind: &str, reference: &str| -> Result<(), WaveError> {
+        let rooted: bool = store.read_connection().query_row(
+            "SELECT EXISTS(SELECT 1 FROM local_target_roots WHERE revision=?1 AND kind=?2 AND reference=?3)",
+            params![revision, kind, reference],
+            |row| row.get(0),
+        )?;
+        if !rooted {
+            return Err(WaveError::Invalid(format!(
+                "synthesized provenance {kind} {reference} is not retained by its revision"
+            )));
+        }
+        Ok(())
+    };
+    for object_ref in [
+        provenance.request_object.as_str(),
+        provenance.group_object.as_str(),
+        provenance.input_manifest_sha256.as_str(),
+    ] {
+        require_root("object", object_ref)?;
+    }
+    for content in synthesis
+        .input_manifest
+        .entries
+        .iter()
+        .filter_map(|entry| entry.sha256.as_deref())
+    {
+        require_root("object", content)?;
+    }
+    for snapshot_ref in std::iter::once(provenance.baseline_snapshot.as_str())
+        .chain(std::iter::once(provenance.candidate_subject.as_str()))
+        .chain(
+            provenance
+                .inputs
+                .iter()
+                .flat_map(|input| [input.base_snapshot.as_str(), input.result_snapshot.as_str()]),
+        )
+    {
+        require_root("snapshot", snapshot_ref)?;
+    }
+    for input in &provenance.inputs {
+        require_root("contribution", &input.lineage)?;
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -457,13 +750,15 @@ pub fn load(store: &CollaborationStore, wave: &RecordId) -> Result<Wave, WaveErr
         Option<String>,
         Option<String>,
         Option<String>,
+        Option<String>,
+        Option<String>,
         String,
         String,
         i64,
     );
     let row: Row = store.read_connection().query_row(
-        "SELECT body, phase, candidate_snapshot, candidate_commit, recipe_object, detail, composition_ms, drift_count, resolution_request_record_id, resolution_request_object, composition_source_record_id, composition_source_object, target, revision, sequence FROM local_waves WHERE wave = ?1", [wave.as_str()],
-        |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?,r.get(8)?,r.get(9)?,r.get(10)?,r.get(11)?,r.get(12)?,r.get(13)?,r.get(14)?)),
+        "SELECT body, phase, candidate_snapshot, candidate_commit, recipe_object, detail, composition_ms, drift_count, resolution_request_record_id, resolution_request_object, composition_source_record_id, composition_source_object, resolution_result_record_id, resolution_result_object, target, revision, sequence FROM local_waves WHERE wave = ?1", [wave.as_str()],
+        |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?,r.get(8)?,r.get(9)?,r.get(10)?,r.get(11)?,r.get(12)?,r.get(13)?,r.get(14)?,r.get(15)?,r.get(16)?)),
     ).optional()?.ok_or(TargetError::Missing)?;
     let record =
         Record::decode(&row.0, &[&SCHEMA]).map_err(|e| WaveError::Invalid(e.to_string()))?;
@@ -475,9 +770,9 @@ pub fn load(store: &CollaborationStore, wave: &RecordId) -> Result<Wave, WaveErr
     spec.policy.validate()?;
     let pinned = target::load_revision(store, &id(&spec.revision)?)?;
     let unique: std::collections::BTreeSet<_> = spec.selected.iter().collect();
-    if spec.target != row.12
-        || spec.revision != row.13
-        || spec.sequence != row.14
+    if spec.target != row.14
+        || spec.revision != row.15
+        || spec.sequence != row.16
         || spec.sequence <= 0
         || spec.target != pinned.target
         || spec.issuer != pinned.issuer
@@ -524,6 +819,7 @@ pub fn load(store: &CollaborationStore, wave: &RecordId) -> Result<Wave, WaveErr
         recipe_object: row.4.as_deref().map(object).transpose()?,
         resolution_request: record_ref(row.8.as_deref(), row.9.as_deref())?,
         composition_source: record_ref(row.10.as_deref(), row.11.as_deref())?,
+        resolution_result: record_ref(row.12.as_deref(), row.13.as_deref())?,
         detail: row.5,
         composition_ms: row.6,
         drift_count: row.7,
@@ -970,8 +1266,9 @@ fn validate_source_context(
         .recipe
         .as_ref()
         .ok_or_else(|| WaveError::Invalid("composition source has no recipe".into()))?;
-    if wave.candidate_snapshot.as_ref() != Some(&candidate.subject)
-        || wave.candidate_commit.as_ref() != Some(&candidate.commit)
+    if (wave.resolution_result.is_none()
+        && (wave.candidate_snapshot.as_ref() != Some(&candidate.subject)
+            || wave.candidate_commit.as_ref() != Some(&candidate.commit)))
         || wave.recipe_object.as_ref() != Some(&recipe.object)
         || source.record != *wave.composition_source.as_ref().ok_or(WaveError::Stale)?
         || candidate.baseline != source.request.baseline
@@ -1087,16 +1384,30 @@ fn validate_source_context(
     Ok(())
 }
 
-fn load_composition_source(
+pub(crate) fn load_composition_source(
     store: &mut CollaborationStore,
     owner: &ControllerOwner,
     repo: &Path,
     wave_id: &RecordId,
 ) -> Result<(Wave, Option<CompositionSource>), WaveError> {
+    let observed = load(store, wave_id)?;
+    let synthesized = if observed.resolution_result.is_some() {
+        read_synthesized_wave_result(store, repo, &observed)?
+    } else {
+        None
+    };
     let _archive_guard = archive_use(store)?;
     let response_guard = crate::collaboration_sensitive::response_use(store)?;
     let _authority_guard = target::authorize(store, owner)?;
     let wave = load(store, wave_id)?;
+    if wave.resolution_request != observed.resolution_request
+        || wave.resolution_result != observed.resolution_result
+    {
+        return Err(WaveError::Stale);
+    }
+    if let Some((synthesis, provenance)) = &synthesized {
+        validate_synthesized_group_roots(store, &wave, synthesis, provenance)?;
+    }
     let _state = current(store, owner, &wave)?;
     if wave.phase != WavePhase::Verifying {
         return Ok((wave, None));
@@ -1927,6 +2238,255 @@ pub fn require_current_resolution_request(
     }
 
     Ok(())
+}
+
+/// Attach the exact settled async result to its still-current wave. This only
+/// links unverified source and roots its inputs; it does not settle attempts,
+/// change allowance, or authorize acceptance.
+pub fn attach_synthesized_attempt_result(
+    store: &mut CollaborationStore,
+    owner: &ControllerOwner,
+    repo: &Path,
+    wave_id: &RecordId,
+    expected_version: i64,
+    request_ref: &resolution::RecordRef,
+    token: &str,
+    cancel: &AtomicBool,
+) -> Result<Wave, WaveError> {
+    let observed = load(store, wave_id)?;
+    if observed.resolution_request.as_ref() != Some(request_ref)
+        || observed.spec.prior_completion.is_some()
+        || observed.spec.target != owner.target()
+        || observed.spec.issuer != owner.issuer()
+    {
+        return Err(WaveError::Stale);
+    }
+
+    let synthesis = resolution::read_synthesized_attempt_result_for_token_request(
+        store,
+        repo,
+        token,
+        request_ref,
+    )?;
+    if synthesis.status.request != *request_ref || synthesis.status.token != token {
+        return Err(WaveError::Stale);
+    }
+    if let Some(existing) = &observed.resolution_result {
+        if existing != &synthesis.group_record || observed.phase != WavePhase::Verifying {
+            return Err(WaveError::Stale);
+        }
+        let (_, provenance) =
+            read_synthesized_wave_result(store, repo, &observed)?.ok_or(WaveError::Stale)?;
+        validate_synthesized_group_roots(store, &observed, &synthesis, &provenance)?;
+        if cancel.load(Ordering::SeqCst) {
+            return Err(WaveError::Stale);
+        }
+        let _authority_guard = target::authorize(store, owner)?;
+        let status = target::status(store, owner.target())?;
+        let latest_sequence: i64 = store.read_connection().query_row(
+            "SELECT COALESCE(MAX(sequence),0) FROM local_waves WHERE target=?1 AND revision=?2",
+            params![owner.target(), observed.spec.revision],
+            |row| row.get(0),
+        )?;
+        if Some(status.version) != expected_version.checked_add(1)
+            || status.revision.as_ref().map(RecordId::as_str)
+                != Some(observed.spec.revision.as_str())
+            || latest_sequence != observed.spec.sequence
+            || !(status.phase == Phase::Verifying
+                || (status.phase == Phase::WaitingForInput
+                    && status.resume_phase == Some(Phase::Verifying)))
+        {
+            return Err(WaveError::Stale);
+        }
+        return Ok(observed);
+    }
+
+    require_current_resolution_request(store, repo, owner, wave_id, expected_version, request_ref)?;
+    let mut prospective = observed.clone();
+    prospective.phase = WavePhase::Verifying;
+    prospective.candidate_snapshot = Some(synthesis.candidate.subject.clone());
+    prospective.candidate_commit = Some(synthesis.candidate.commit.clone());
+    prospective.resolution_result = Some(synthesis.group_record.clone());
+    let (_, provenance) =
+        read_synthesized_wave_result(store, repo, &prospective)?.ok_or(WaveError::Stale)?;
+
+    let archive_guard = archive_use(store)?;
+    let response_guard = crate::collaboration_sensitive::response_use(store)?;
+    let authority_guard = target::authorize(store, owner)?;
+    let pinned = target::load_revision_under_response(
+        store,
+        &id(&observed.spec.revision)?,
+        &response_guard,
+    )?;
+    if pinned.target != owner.target() || pinned.issuer != owner.issuer() {
+        return Err(WaveError::Stale);
+    }
+    let mut snapshots = BTreeMap::new();
+    let mut add_snapshot = |snapshot: &SourceSnapshotId| {
+        snapshots.insert(snapshot.to_string(), snapshot.clone());
+    };
+    add_snapshot(&synthesis.request.baseline().snapshot_id);
+    add_snapshot(&synthesis.request.accumulator().snapshot_id);
+    add_snapshot(&synthesis.candidate.subject);
+    for member in synthesis
+        .request
+        .contents()
+        .iter()
+        .chain(synthesis.request.members())
+    {
+        add_snapshot(&member.base);
+        add_snapshot(&member.result);
+    }
+    for input in &provenance.inputs {
+        add_snapshot(&snapshot(&input.base_snapshot)?);
+        add_snapshot(&snapshot(&input.result_snapshot)?);
+    }
+    let snapshots = snapshots.into_values().collect::<Vec<_>>();
+    let mut objects = BTreeMap::new();
+    for digest in [
+        synthesis.status.request.object,
+        synthesis.group_record.object,
+        object(&synthesis.input_manifest.sha256)?,
+    ] {
+        objects.insert(digest.hex(), digest);
+    }
+    for entry in &synthesis.input_manifest.entries {
+        if let Some(content) = &entry.sha256 {
+            let digest = object(content)?;
+            objects.insert(digest.hex(), digest);
+        }
+    }
+    let objects = objects.into_values().collect::<Vec<_>>();
+    let retention = target::ArtifactRetentionPermit::new(
+        store,
+        owner,
+        &archive_guard,
+        &response_guard,
+        &authority_guard,
+    )?;
+    target::retain_artifacts_under_guards(store, &pinned.id, &snapshots, &objects, &retention)?;
+
+    let tx = store
+        .connection()
+        .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    if cancel.load(Ordering::SeqCst) {
+        return Err(WaveError::Stale);
+    }
+    let (version, target_phase, resume_phase, active_revision): (i64, String, Option<String>, Option<String>) = tx
+        .query_row(
+            "SELECT version,phase,resume_phase,active_revision FROM local_targets WHERE target=?1 AND issuer=?2",
+            params![owner.target(), owner.issuer()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+    let (wave_phase, request_id, request_object, result_id, result_object, candidate, commit): (
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    ) = tx.query_row(
+        "SELECT phase,resolution_request_record_id,resolution_request_object,
+                resolution_result_record_id,resolution_result_object,candidate_snapshot,candidate_commit
+         FROM local_waves WHERE wave=?1 AND target=?2 AND revision=?3 AND sequence=?4",
+        params![wave_id.as_str(), owner.target(), observed.spec.revision, observed.spec.sequence],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?)),
+    )?;
+    if version != expected_version
+        || active_revision.as_deref() != Some(observed.spec.revision.as_str())
+        || request_id.as_deref() != Some(request_ref.id.as_str())
+        || request_object.as_deref() != Some(request_ref.object.hex().as_str())
+        || result_id.is_some()
+        || result_object.is_some()
+        || candidate.as_deref()
+            != observed
+                .candidate_snapshot
+                .as_ref()
+                .map(SourceSnapshotId::as_str)
+        || commit.as_deref() != observed.candidate_commit.as_ref().map(CommitOid::as_str)
+        || wave_phase
+            != serde_json::to_value(observed.phase)?
+                .as_str()
+                .unwrap_or_default()
+    {
+        return Err(WaveError::Stale);
+    }
+    let latest_sequence: i64 = tx.query_row(
+        "SELECT COALESCE(MAX(sequence),0) FROM local_waves WHERE target=?1 AND revision=?2",
+        params![owner.target(), observed.spec.revision],
+        |row| row.get(0),
+    )?;
+    if latest_sequence != observed.spec.sequence {
+        return Err(WaveError::Stale);
+    }
+    let allowed_target = match observed.phase {
+        WavePhase::Blocked => target_phase == "idle" && resume_phase.is_none(),
+        WavePhase::Verifying => {
+            target_phase == "verifying"
+                || (target_phase == "waiting_for_input"
+                    && resume_phase.as_deref() == Some("verifying"))
+        }
+        _ => false,
+    };
+    if !allowed_target {
+        return Err(WaveError::Stale);
+    }
+    if cancel.load(Ordering::SeqCst) {
+        return Err(WaveError::Stale);
+    }
+    if tx.execute(
+        "UPDATE local_waves SET phase='verifying',candidate_snapshot=?2,candidate_commit=?3,
+                resolution_result_record_id=?4,resolution_result_object=?5,
+                detail='synthesized candidate awaits fresh verification'
+         WHERE wave=?1 AND phase=?6 AND resolution_result_record_id IS NULL
+           AND resolution_result_object IS NULL AND resolution_request_record_id=?7
+           AND resolution_request_object=?8",
+        params![
+            wave_id.as_str(),
+            synthesis.candidate.subject.as_str(),
+            synthesis.candidate.commit.as_str(),
+            synthesis.group_record.id.as_str(),
+            synthesis.group_record.object.hex(),
+            wave_phase,
+            request_ref.id.as_str(),
+            request_ref.object.hex(),
+        ],
+    )? != 1
+    {
+        return Err(WaveError::Stale);
+    }
+    if tx.execute(
+        "UPDATE local_targets SET phase='verifying',resume_phase=NULL,version=version+1
+         WHERE target=?1 AND issuer=?2 AND active_revision=?3 AND version=?4 AND phase=?5",
+        params![
+            owner.target(),
+            owner.issuer(),
+            observed.spec.revision,
+            expected_version,
+            target_phase,
+        ],
+    )? != 1
+    {
+        return Err(WaveError::Stale);
+    }
+    if observed.phase == WavePhase::Blocked {
+        for selected in &observed.spec.selected {
+            if tx.execute(
+                "UPDATE local_target_dispositions SET status='in_wave',detail=NULL
+                 WHERE revision=?1 AND contribution=?2 AND status='blocked'",
+                params![observed.spec.revision, selected],
+            )? != 1
+            {
+                return Err(WaveError::Stale);
+            }
+        }
+    }
+    if cancel.load(Ordering::SeqCst) {
+        return Err(WaveError::Stale);
+    }
+    tx.commit()?;
+    load(store, wave_id)
 }
 
 /// One durable dispatch. Replaying a completed composition returns its stored

@@ -406,7 +406,7 @@ fn cross_revision_completion_anchor_binds_candidate_parent_and_publication_lease
     let mut wrong_epoch = native.spec.clone();
     wrong_epoch.epoch = format!("sha256:{}", "f".repeat(64));
     assert!(matches!(
-        crate::native_gates::validate_source(&f.store, f._repo.path(), &wrong_epoch),
+        crate::native_gates::validate_source(&mut f.store, &owner, f._repo.path(), &wrong_epoch,),
         Err(crate::native_gates::NativeGateError::Binding(
             "accepted-baseline recipe differs from prior private completion"
         ))

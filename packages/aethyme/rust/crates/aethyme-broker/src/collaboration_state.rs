@@ -37,7 +37,7 @@ use serde::Serialize;
 pub use crate::host_state::HostStateSource;
 
 /// The schema this binary writes.
-pub const COLLABORATION_STATE_SCHEMA_VERSION: i64 = 27;
+pub const COLLABORATION_STATE_SCHEMA_VERSION: i64 = 28;
 /// The oldest schema a database written by this binary can be read by.
 /// Unlike `host-operations.db`, a newer database stays readable by an older
 /// binary until a release raises this floor.
@@ -72,7 +72,9 @@ pub const COLLABORATION_STATE_SCHEMA_VERSION: i64 = 27;
 // that head or rooting superseded brief objects, so stop it before writes.
 // Schema 27 adds single-use, session-bound resolution imports and durable
 // request identity. Schema 26 writers do not preserve that state or its roots.
-const MIN_COMPATIBLE_SCHEMA: i64 = 27;
+// Schema 28 adds an immutable optional resolution-result link; schema 27
+// writers can advance a linked wave without preserving that provenance.
+const MIN_COMPATIBLE_SCHEMA: i64 = 28;
 const ROOT_DIRECTORY: &str = "collaboration";
 /// Schema steps after the version 1 layout (`meta` only), applied in
 /// order. Step 17 adds separately indexed historical imports and rehearsals. The floor is
@@ -889,10 +891,77 @@ const MIGRATIONS: &[(i64, &str)] = &[
              SELECT RAISE(ABORT, 'composition source reference must be complete');
          END;",
     ),
+    (
+        28,
+        r#"ALTER TABLE local_waves ADD COLUMN resolution_result_record_id TEXT;
+         ALTER TABLE local_waves ADD COLUMN resolution_result_object TEXT;
+         CREATE TRIGGER local_waves_resolution_result_pair_insert
+         BEFORE INSERT ON local_waves
+         WHEN ((NEW.resolution_result_record_id IS NULL)
+               != (NEW.resolution_result_object IS NULL))
+           OR (NEW.resolution_result_record_id IS NOT NULL
+               AND (NEW.resolution_request_record_id IS NULL
+                    OR NEW.resolution_request_object IS NULL))
+         BEGIN
+             SELECT RAISE(ABORT, 'resolution result reference must be complete and linked to a request');
+         END;
+         CREATE TRIGGER local_waves_resolution_result_pair_update
+         BEFORE UPDATE OF resolution_request_record_id,resolution_request_object,
+                          resolution_result_record_id,resolution_result_object,
+                          candidate_snapshot,candidate_commit
+         ON local_waves
+         WHEN ((NEW.resolution_result_record_id IS NULL)
+               != (NEW.resolution_result_object IS NULL))
+           OR (NEW.resolution_result_record_id IS NOT NULL
+               AND (NEW.resolution_request_record_id IS NULL
+                    OR NEW.resolution_request_object IS NULL))
+           OR (OLD.resolution_result_record_id IS NOT NULL
+               AND (NEW.resolution_request_record_id IS NOT OLD.resolution_request_record_id
+                    OR NEW.resolution_request_object IS NOT OLD.resolution_request_object
+                    OR NEW.resolution_result_record_id IS NOT OLD.resolution_result_record_id
+                    OR NEW.resolution_result_object IS NOT OLD.resolution_result_object
+                    OR NEW.candidate_snapshot IS NOT OLD.candidate_snapshot
+                    OR NEW.candidate_commit IS NOT OLD.candidate_commit))
+         BEGIN
+             SELECT RAISE(ABORT, 'resolution result provenance is immutable once attached');
+         END;
+
+         DROP TRIGGER IF EXISTS local_native_gate_no_dispatch_after_root_release;
+         CREATE TABLE local_native_gate_jobs_v28 (
+             id TEXT PRIMARY KEY NOT NULL,
+             wave TEXT NOT NULL REFERENCES local_waves(wave),
+             target TEXT NOT NULL, revision TEXT NOT NULL, epoch TEXT NOT NULL,
+             body BLOB NOT NULL,
+             state TEXT NOT NULL CHECK(state IN ('prepared','dispatching','completed','unknown')),
+             observation BLOB,
+             roots_released_ms INTEGER
+         ) STRICT;
+         CREATE TABLE local_native_gate_roots_v28 (
+             job TEXT NOT NULL REFERENCES local_native_gate_jobs_v28(id),
+             kind TEXT NOT NULL, reference TEXT NOT NULL,
+             PRIMARY KEY(job,kind,reference)
+         ) STRICT;
+         INSERT INTO local_native_gate_jobs_v28
+             (id,wave,target,revision,epoch,body,state,observation,roots_released_ms)
+             SELECT id,wave,target,revision,epoch,body,state,observation,roots_released_ms
+             FROM local_native_gate_jobs;
+         INSERT INTO local_native_gate_roots_v28 (job,kind,reference)
+             SELECT job,kind,reference FROM local_native_gate_roots;
+         DROP TABLE local_native_gate_roots;
+         DROP TABLE local_native_gate_jobs;
+         ALTER TABLE local_native_gate_jobs_v28 RENAME TO local_native_gate_jobs;
+         ALTER TABLE local_native_gate_roots_v28 RENAME TO local_native_gate_roots;
+         CREATE INDEX local_native_gate_jobs_by_wave
+             ON local_native_gate_jobs(wave,id);
+         CREATE TRIGGER local_native_gate_no_dispatch_after_root_release
+         BEFORE UPDATE OF state ON local_native_gate_jobs
+         WHEN OLD.roots_released_ms IS NOT NULL AND NEW.state<>OLD.state
+         BEGIN SELECT RAISE(ABORT, 'native gate roots were released'); END;"#,
+    ),
 ];
 /// Reconstruct the exact pre-schema-26 shape in historical migration fixtures
 /// while preserving all schema-25 rows. Fixtures start from a current store,
-/// so also remove schema-27 additions before lowering their version marker;
+/// so also remove schema-28 and schema-27 additions before lowering their version marker;
 /// otherwise they model an impossible hybrid database and make the migration
 /// add columns that the fixture already has. This is test setup only:
 /// production migrations continue to reject malformed databases instead of
@@ -942,16 +1011,64 @@ pub(crate) fn drop_identity_revision_schema_for_legacy_fixture(
     Ok(())
 }
 
-/// Remove only schema-27 additions from a current test store before a fixture
+/// Remove only schema-28 wave result references from a current test store.
+/// Refuse before dropping triggers or columns if a result has been attached, so
+/// a historical fixture cannot silently erase current provenance.
+#[cfg(test)]
+fn drop_resolution_schema_28_for_legacy_fixture(
+    connection: &rusqlite::Connection,
+) -> rusqlite::Result<()> {
+    if !fixture_table_exists(connection, "local_waves")? {
+        return Ok(());
+    }
+    let has_result_id =
+        fixture_column_exists(connection, "local_waves", "resolution_result_record_id")?;
+    let has_result_object =
+        fixture_column_exists(connection, "local_waves", "resolution_result_object")?;
+    assert_eq!(
+        has_result_id, has_result_object,
+        "cannot downgrade a fixture with an incomplete schema-28 result pair"
+    );
+    if !has_result_id {
+        return Ok(());
+    }
+
+    let has_v28_result_data: bool = connection.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM local_waves
+             WHERE resolution_result_record_id IS NOT NULL
+                OR resolution_result_object IS NOT NULL
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+    assert!(
+        !has_v28_result_data,
+        "cannot downgrade a fixture containing schema-28 resolution-result data"
+    );
+
+    connection.execute_batch(
+        "DROP TRIGGER IF EXISTS local_waves_resolution_result_pair_insert;
+         DROP TRIGGER IF EXISTS local_waves_resolution_result_pair_update;",
+    )?;
+    connection.execute_batch(
+        "ALTER TABLE local_waves DROP COLUMN resolution_result_object;
+         ALTER TABLE local_waves DROP COLUMN resolution_result_record_id;",
+    )?;
+    Ok(())
+}
+
+/// Remove schema-28 and schema-27 additions from a current test store before a fixture
 /// lowers `schema_version` to exercise an older migration. Keep the original
 /// resolution-attempt columns and rows: an old database has those, while it
 /// cannot contain the later async-ledger bindings or wave archive references.
-/// Refuse to discard any actual v27 data so this helper cannot make a test's
+/// Refuse to discard any actual v27 or v28 data so this helper cannot make a test's
 /// current-state records disappear under the guise of a historical fixture.
 #[cfg(test)]
 fn drop_resolution_schema_27_for_legacy_fixture(
     connection: &rusqlite::Connection,
 ) -> rusqlite::Result<()> {
+    drop_resolution_schema_28_for_legacy_fixture(connection)?;
     let has_attempts = fixture_table_exists(connection, "resolution_attempts")?;
     let has_waves = fixture_table_exists(connection, "local_waves")?;
     if !has_attempts && !has_waves {
@@ -2532,11 +2649,425 @@ mod tests {
         let versions: Vec<i64> = MIGRATIONS.iter().map(|(version, _)| *version).collect();
         let expected: Vec<i64> = (2..=COLLABORATION_STATE_SCHEMA_VERSION).collect();
         assert_eq!(versions, expected);
-        assert_eq!(MIN_COMPATIBLE_SCHEMA, 27);
+        assert_eq!(MIN_COMPATIBLE_SCHEMA, 28);
         const { assert!(MIN_COMPATIBLE_SCHEMA <= COLLABORATION_STATE_SCHEMA_VERSION) };
         // Earlier writers cannot preserve immutable revision heads, durable
         // asynchronous attempts or the archive roots those attempts name.
-        const { assert!(MIN_COMPATIBLE_SCHEMA >= 27) };
+        const { assert!(MIN_COMPATIBLE_SCHEMA >= 28) };
+    }
+
+    #[test]
+    fn schema_28_migrates_existing_waves_with_null_result_references() {
+        let host = tempfile::tempdir().unwrap();
+        let mut store = open(host.path(), &[]).unwrap();
+        store
+            .connection()
+            .execute_batch(
+                "INSERT INTO local_targets (target, issuer) VALUES ('target', 'issuer');
+                 INSERT INTO local_target_revisions (revision, target, body)
+                     VALUES ('revision', 'target', X'01');
+                 INSERT INTO local_waves
+                     (wave, target, revision, sequence, body, phase,
+                      resolution_request_record_id, resolution_request_object)
+                     VALUES ('wave', 'target', 'revision', 1, X'02', 'verifying',
+                             'request:legacy', '1111111111111111111111111111111111111111111111111111111111111111');",
+            )
+            .unwrap();
+        drop_resolution_schema_28_for_legacy_fixture(store.connection()).unwrap();
+        store
+            .connection()
+            .execute_batch(
+                "UPDATE meta SET value = '27'
+                 WHERE key IN ('schema_version', 'min_compatible_schema');",
+            )
+            .unwrap();
+        drop(store);
+
+        let migrated = open(host.path(), &[]).unwrap();
+        let wave: (
+            String,
+            String,
+            String,
+            String,
+            Vec<u8>,
+            Option<String>,
+            Option<String>,
+        ) = migrated
+            .read_connection()
+            .query_row(
+                "SELECT wave,target,revision,phase,body,
+                            resolution_result_record_id,resolution_result_object
+                     FROM local_waves WHERE wave='wave'",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            wave,
+            (
+                "wave".into(),
+                "target".into(),
+                "revision".into(),
+                "verifying".into(),
+                vec![2],
+                None,
+                None,
+            )
+        );
+        assert_eq!(
+            migrated.schema_version(),
+            COLLABORATION_STATE_SCHEMA_VERSION
+        );
+    }
+
+    #[test]
+    fn schema_28_rebuild_preserves_native_gate_jobs_roots_and_foreign_keys() {
+        let host = tempfile::tempdir().unwrap();
+        let mut store = open(host.path(), &[]).unwrap();
+        store
+            .connection()
+            .execute_batch(
+                "INSERT INTO local_targets (target, issuer) VALUES ('target', 'issuer');
+                 INSERT INTO local_target_revisions (revision, target, body)
+                     VALUES ('revision', 'target', X'01');
+                 INSERT INTO local_waves
+                     (wave, target, revision, sequence, body, phase)
+                     VALUES ('wave', 'target', 'revision', 1, X'02', 'verifying');
+                 INSERT INTO local_waves
+                     (wave, target, revision, sequence, body, phase)
+                     VALUES ('wave:unknown', 'target', 'revision', 2, X'08', 'verifying');
+
+                 DROP TRIGGER local_native_gate_no_dispatch_after_root_release;
+                 DROP INDEX local_native_gate_jobs_by_wave;
+                 DROP TABLE local_native_gate_roots;
+                 DROP TABLE local_native_gate_jobs;
+                 CREATE TABLE local_native_gate_jobs (
+                     id TEXT PRIMARY KEY NOT NULL,
+                     wave TEXT NOT NULL UNIQUE REFERENCES local_waves(wave),
+                     target TEXT NOT NULL, revision TEXT NOT NULL, epoch TEXT NOT NULL,
+                     body BLOB NOT NULL,
+                     state TEXT NOT NULL CHECK(state IN ('prepared','dispatching','completed','unknown')),
+                     observation BLOB,
+                     roots_released_ms INTEGER
+                 ) STRICT;
+                 CREATE TABLE local_native_gate_roots (
+                     job TEXT NOT NULL REFERENCES local_native_gate_jobs(id),
+                     kind TEXT NOT NULL, reference TEXT NOT NULL,
+                     PRIMARY KEY(job,kind,reference)
+                 ) STRICT;
+                 CREATE TRIGGER local_native_gate_no_dispatch_after_root_release
+                 BEFORE UPDATE OF state ON local_native_gate_jobs
+                 WHEN OLD.roots_released_ms IS NOT NULL AND NEW.state<>OLD.state
+                 BEGIN SELECT RAISE(ABORT, 'native gate roots were released'); END;
+                 INSERT INTO local_native_gate_jobs
+                     (id,wave,target,revision,epoch,body,state,observation,roots_released_ms)
+                     VALUES ('job:legacy','wave','target','revision','epoch',X'0304',
+                             'completed',X'0506',1234);
+                 INSERT INTO local_native_gate_roots VALUES
+                     ('job:legacy','snapshot','sha256:subject'),
+                     ('job:legacy','object','0123456789abcdef');
+                 INSERT INTO local_native_gate_jobs
+                     (id,wave,target,revision,epoch,body,state,observation,roots_released_ms)
+                     VALUES ('job:unknown','wave:unknown','target','revision','epoch',X'090a',
+                             'unknown',X'0b0c',NULL);
+                 INSERT INTO local_native_gate_roots VALUES
+                     ('job:unknown','snapshot','sha256:unknown');",
+            )
+            .unwrap();
+        drop_resolution_schema_28_for_legacy_fixture(store.connection()).unwrap();
+        store
+            .connection()
+            .execute_batch(
+                "UPDATE meta SET value = '27'
+                 WHERE key IN ('schema_version', 'min_compatible_schema');",
+            )
+            .unwrap();
+        drop(store);
+
+        let migrated = open(host.path(), &[]).unwrap();
+        let job: (
+            String,
+            String,
+            String,
+            String,
+            String,
+            Vec<u8>,
+            String,
+            Option<Vec<u8>>,
+            Option<i64>,
+        ) = migrated
+            .read_connection()
+            .query_row(
+                "SELECT id,wave,target,revision,epoch,body,state,observation,roots_released_ms
+                 FROM local_native_gate_jobs WHERE id='job:legacy'",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                        row.get(8)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            job,
+            (
+                "job:legacy".into(),
+                "wave".into(),
+                "target".into(),
+                "revision".into(),
+                "epoch".into(),
+                vec![3, 4],
+                "completed".into(),
+                Some(vec![5, 6]),
+                Some(1234),
+            )
+        );
+        let roots: Vec<(String, String, String)> = migrated
+            .read_connection()
+            .prepare(
+                "SELECT job,kind,reference FROM local_native_gate_roots ORDER BY kind,reference",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            roots,
+            vec![
+                (
+                    "job:legacy".into(),
+                    "object".into(),
+                    "0123456789abcdef".into()
+                ),
+                (
+                    "job:legacy".into(),
+                    "snapshot".into(),
+                    "sha256:subject".into()
+                ),
+                (
+                    "job:unknown".into(),
+                    "snapshot".into(),
+                    "sha256:unknown".into()
+                ),
+            ]
+        );
+        let unknown_job: (String, Option<Vec<u8>>, Option<i64>) = migrated
+            .read_connection()
+            .query_row(
+                "SELECT state,observation,roots_released_ms FROM local_native_gate_jobs
+                 WHERE id='job:unknown'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(unknown_job, ("unknown".into(), Some(vec![11, 12]), None));
+        assert!(
+            migrated
+                .connection()
+                .execute(
+                    "UPDATE local_native_gate_jobs SET state='unknown' WHERE id='job:legacy'",
+                    [],
+                )
+                .is_err()
+        );
+        let root_fk_target: String = migrated
+            .read_connection()
+            .query_row(
+                "SELECT \"table\" FROM pragma_foreign_key_list('local_native_gate_roots')
+                 WHERE \"from\"='job'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(root_fk_target, "local_native_gate_jobs");
+        let wave_index_unique: i64 = migrated
+            .read_connection()
+            .query_row(
+                "SELECT \"unique\" FROM pragma_index_list('local_native_gate_jobs')
+                 WHERE name='local_native_gate_jobs_by_wave'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(wave_index_unique, 0);
+        let violations: i64 = migrated
+            .read_connection()
+            .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(violations, 0);
+        migrated
+            .connection()
+            .execute(
+                "INSERT INTO local_native_gate_jobs
+                     (id,wave,target,revision,epoch,body,state)
+                 VALUES ('job:new-spec','wave','target','revision','epoch',X'07','prepared')",
+                [],
+            )
+            .unwrap();
+        drop(migrated);
+
+        let reopened = open(host.path(), &[]).unwrap();
+        let jobs: i64 = reopened
+            .read_connection()
+            .query_row(
+                "SELECT count(*) FROM local_native_gate_jobs WHERE wave='wave'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(jobs, 2);
+        let unknown_job: (String, Option<Vec<u8>>, Option<i64>) = reopened
+            .read_connection()
+            .query_row(
+                "SELECT state,observation,roots_released_ms FROM local_native_gate_jobs
+                 WHERE id='job:unknown'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(unknown_job, ("unknown".into(), Some(vec![11, 12]), None));
+        assert!(
+            reopened
+                .connection()
+                .execute(
+                    "UPDATE local_native_gate_jobs SET state='unknown' WHERE id='job:legacy'",
+                    [],
+                )
+                .is_err()
+        );
+        let violations: i64 = reopened
+            .read_connection()
+            .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(violations, 0);
+    }
+
+    #[test]
+    fn schema_28_result_references_are_paired_immutable_and_fixture_downgrade_refuses_data() {
+        let host = tempfile::tempdir().unwrap();
+        let mut store = open(host.path(), &[]).unwrap();
+        store
+            .connection()
+            .execute_batch(
+                "INSERT INTO local_targets (target, issuer) VALUES ('target', 'issuer');
+                 INSERT INTO local_target_revisions (revision, target, body)
+                     VALUES ('revision', 'target', X'01');
+                 INSERT INTO local_waves
+                     (wave, target, revision, sequence, body, phase,
+                      candidate_snapshot, candidate_commit,
+                      resolution_request_record_id, resolution_request_object)
+                     VALUES ('wave', 'target', 'revision', 1, X'02', 'verifying',
+                             'snapshot:1', 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+                             'request:1', '1111111111111111111111111111111111111111111111111111111111111111');",
+            )
+            .unwrap();
+        assert!(
+            store
+                .connection()
+                .execute(
+                    "UPDATE local_waves SET resolution_result_record_id='result' WHERE wave='wave'",
+                    [],
+                )
+                .is_err()
+        );
+        assert!(store
+            .connection()
+            .execute(
+                "UPDATE local_waves
+                 SET resolution_request_record_id=NULL,
+                     resolution_request_object=NULL,
+                     resolution_result_record_id='result',
+                     resolution_result_object='2222222222222222222222222222222222222222222222222222222222222222'
+                 WHERE wave='wave'",
+                [],
+            )
+            .is_err());
+        store
+            .connection()
+            .execute(
+                "UPDATE local_waves
+                 SET resolution_result_record_id='result:1',
+                     resolution_result_object='2222222222222222222222222222222222222222222222222222222222222222'
+                 WHERE wave='wave'",
+                [],
+            )
+            .unwrap();
+        for statement in [
+            "UPDATE local_waves SET resolution_result_record_id=NULL, resolution_result_object=NULL WHERE wave='wave'",
+            "UPDATE local_waves SET resolution_result_record_id='result:2' WHERE wave='wave'",
+            "UPDATE local_waves SET resolution_request_record_id='request:2' WHERE wave='wave'",
+            "UPDATE local_waves SET candidate_snapshot='snapshot:2' WHERE wave='wave'",
+        ] {
+            assert!(
+                store.connection().execute(statement, []).is_err(),
+                "attached result and its request binding are immutable"
+            );
+        }
+
+        let downgrade = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            drop_resolution_schema_28_for_legacy_fixture(store.connection())
+        }));
+        assert!(
+            downgrade.is_err(),
+            "fixture downgrade must refuse linked results"
+        );
+        let preserved: (Option<String>, Option<String>) = store
+            .read_connection()
+            .query_row(
+                "SELECT resolution_result_record_id,resolution_result_object
+                 FROM local_waves WHERE wave='wave'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            preserved,
+            (
+                Some("result:1".into()),
+                Some("2222222222222222222222222222222222222222222222222222222222222222".into()),
+            )
+        );
+        assert!(
+            fixture_column_exists(
+                store.connection(),
+                "local_waves",
+                "resolution_result_record_id"
+            )
+            .unwrap()
+        );
+        let result_trigger_count: i64 = store
+            .read_connection()
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type='trigger' AND name='local_waves_resolution_result_pair_update'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(result_trigger_count, 1);
     }
 
     #[test]
