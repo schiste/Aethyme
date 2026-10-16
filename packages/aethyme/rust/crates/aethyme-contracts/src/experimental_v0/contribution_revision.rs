@@ -14,7 +14,8 @@ use super::source_snapshot::{EntryKind, SourceEntry, SourceSnapshot, SourceSnaps
 
 pub const CONTRIBUTION_REVISION_SCHEMA_NAME: &str = "aethyme.contribution-revision/experimental-v0";
 pub const MAX_CONTRIBUTION_REVISION_BYTES: usize = canonical_json::MAX_DOCUMENT_BYTES;
-pub const MAX_REVISION_CHANGES: usize = canonical_json::MAX_CONTAINER_ENTRIES;
+pub const MAX_REVISION_ARRAY_ENTRIES: usize = canonical_json::MAX_CONTAINER_ENTRIES;
+pub const MAX_REVISION_CHANGES: usize = MAX_REVISION_ARRAY_ENTRIES;
 
 const fn field(name: &'static str, required: bool, kind: FieldKind) -> FieldSpec {
     FieldSpec {
@@ -134,7 +135,7 @@ impl ContributionRevision {
                 source_changes.len(),
             ));
         }
-        if depends_on.len() > canonical_json::MAX_CONTAINER_ENTRIES {
+        if depends_on.len() > MAX_REVISION_ARRAY_ENTRIES {
             return Err(ContributionRevisionError::TooManyDependencies(
                 depends_on.len(),
             ));
@@ -430,7 +431,7 @@ fn object_ids(
 ) -> Result<Vec<FileId>, ContributionRevisionError> {
     match object.get(field) {
         Some(Value::Array(values)) => {
-            if values.len() > canonical_json::MAX_CONTAINER_ENTRIES {
+            if values.len() > MAX_REVISION_ARRAY_ENTRIES {
                 return Err(ContributionRevisionError::TooManyReferences(values.len()));
             }
             values
@@ -506,12 +507,10 @@ pub enum ContributionRevisionError {
     TooLarge(usize),
     #[error("contribution revision has more than {MAX_REVISION_CHANGES} source changes ({0})")]
     TooManyChanges(usize),
-    #[error(
-        "contribution revision has more than {canonical_json::MAX_CONTAINER_ENTRIES} dependencies ({0})"
-    )]
+    #[error("contribution revision has more than {MAX_REVISION_ARRAY_ENTRIES} dependencies ({0})")]
     TooManyDependencies(usize),
     #[error(
-        "a contribution source change has more than {canonical_json::MAX_CONTAINER_ENTRIES} file references ({0})"
+        "a contribution source change has more than {MAX_REVISION_ARRAY_ENTRIES} file references ({0})"
     )]
     TooManyReferences(usize),
     #[error("contribution revision must be a JSON object")]
