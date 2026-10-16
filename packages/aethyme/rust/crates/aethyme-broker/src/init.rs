@@ -693,6 +693,13 @@ fn check_config_valid(main_root: &Path) -> Check {
             };
         }
     }
+    if let Some(error) = invalid_collaboration_descriptor_pointer(&value) {
+        return Check {
+            id: "certify.config",
+            status: CheckStatus::Fail,
+            detail: format!("config.toml invalid: {error}"),
+        };
+    }
     let unknown = unknown_config_keys(&value);
     if !unknown.is_empty() {
         return Check {
@@ -710,6 +717,28 @@ fn check_config_valid(main_root: &Path) -> Check {
         id: "certify.config",
         status: CheckStatus::Pass,
         detail: format!("config.toml valid (schema {CONFIG_SCHEMA_VERSION})"),
+    }
+}
+
+/// The descriptor pointer is optional for capture-only config, but when
+/// present project binding only accepts the canonical contracts path.
+fn invalid_collaboration_descriptor_pointer(value: &toml::Value) -> Option<String> {
+    let descriptor = value.get("collaboration")?.as_table()?.get("descriptor")?;
+    match descriptor {
+        toml::Value::String(pointer)
+            if pointer
+                == aethyme_contracts::experimental_v0::project_identity::PROJECT_DESCRIPTOR_PATH =>
+        {
+            None
+        }
+        toml::Value::String(_) => Some(format!(
+            "[collaboration] descriptor must be exactly {:?}",
+            aethyme_contracts::experimental_v0::project_identity::PROJECT_DESCRIPTOR_PATH
+        )),
+        other => Some(format!(
+            "[collaboration] descriptor must be a string, not {}",
+            other.type_str()
+        )),
     }
 }
 

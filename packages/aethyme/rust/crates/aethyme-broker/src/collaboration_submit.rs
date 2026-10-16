@@ -1516,6 +1516,23 @@ mod tests {
         ));
     }
 
+    /// Descriptor pointers are optional for capture and validated only by
+    /// certification and the explicit project-binding command.
+    #[test]
+    fn advisory_capture_does_not_block_on_an_unused_descriptor_pointer() {
+        let setting = setting_from_text(Some(
+            "[collaboration]\ncapture = \"advisory\"\nproject = \"p\"\ndescriptor = 7\n",
+        ));
+        assert!(matches!(
+            setting,
+            Setting::On {
+                policy: CapturePolicy::Advisory,
+                project: Ok(_),
+                ..
+            }
+        ));
+    }
+
     #[test]
     fn details_carry_no_host_paths() {
         let known = vec![
