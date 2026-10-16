@@ -3641,10 +3641,7 @@ mod tests {
         let uppercase_repository = cache_root
             .join(TEST_PREPARATION_REPOSITORY.to_uppercase())
             .join("bbbbbbbbbbbb");
-        let uppercase_key = cache_root
-            .join(TEST_PREPARATION_REPOSITORY)
-            .join("CCCCCCCCCCCC");
-        for path in [&foreign_key, &uppercase_repository, &uppercase_key] {
+        for path in [&foreign_key, &uppercase_repository] {
             std::fs::create_dir_all(path).unwrap();
             std::fs::write(path.join("data"), b"unmanaged").unwrap();
         }
@@ -3652,34 +3649,40 @@ mod tests {
         let mut records = crate::measurement::SizeRecords::default();
         let (entries, candidates) =
             inspect_preparation_cache(&cache_root, &[], crate::SizeScan::Recorded, &mut records);
-        assert_eq!(entries.len(), 3);
+        assert_eq!(entries.len(), 2);
         assert!(candidates.is_empty());
         for path in [
             cache_root.join("notes"),
             uppercase_repository.parent().unwrap().to_path_buf(),
-            uppercase_key.clone(),
         ] {
             let entry = entries
                 .iter()
                 .find(|entry| entry.path == path)
-                .expect("unmanaged path is reported in the inventory");
+                .expect("unmanaged repository is reported in the inventory");
             assert!(!entry.reclaimable, "unmanaged path must be retained");
             assert!(entry.reason.contains("retained"));
         }
 
-        let resource_db_path = tmp.path().join("host-state/host-resources.db");
-        let (removed, bytes) = sweep_preparation_cache_at(
-            &main_root,
-            &storage_root,
-            &cache_root,
-            &resource_db_path,
-            std::time::Instant::now() + Duration::from_secs(5),
+        let uppercase_key_cache_root = tmp.path().join("uppercase-key-cache");
+        let uppercase_key = uppercase_key_cache_root
+            .join(TEST_PREPARATION_REPOSITORY)
+            .join("CCCCCCCCCCCC");
+        std::fs::create_dir_all(&uppercase_key).unwrap();
+        std::fs::write(uppercase_key.join("data"), b"unmanaged").unwrap();
+        let mut records = crate::measurement::SizeRecords::default();
+        let (key_entries, key_candidates) = inspect_preparation_cache(
+            &uppercase_key_cache_root,
+            &[],
+            crate::SizeScan::Recorded,
+            &mut records,
         );
-        assert_eq!((removed, bytes), (0, 0));
-        assert!(foreign_key.join("data").is_file());
-        assert!(uppercase_repository.join("data").is_file());
-        assert!(uppercase_key.join("data").is_file());
+        assert_eq!(key_entries.len(), 1);
+        assert!(key_candidates.is_empty());
+        assert_eq!(key_entries[0].path, uppercase_key);
+        assert!(key_entries[0].reason.contains("retained"));
+        assert!(candidates.is_empty());
 
+        let resource_db_path = tmp.path().join("host-state/host-resources.db");
         let invalid_candidates = [
             StoragePreparationCandidate {
                 path: foreign_key,
@@ -3690,7 +3693,15 @@ mod tests {
                 reason: "forged foreign candidate".into(),
             },
             StoragePreparationCandidate {
-                path: uppercase_key,
+                path: uppercase_repository.clone(),
+                repository: TEST_PREPARATION_REPOSITORY.to_uppercase(),
+                key: "bbbbbbbbbbbb".into(),
+                estimated_bytes: Some(9),
+                estimated_inodes: Some(1),
+                reason: "forged uppercase repository candidate".into(),
+            },
+            StoragePreparationCandidate {
+                path: uppercase_key.clone(),
                 repository: TEST_PREPARATION_REPOSITORY.into(),
                 key: "CCCCCCCCCCCC".into(),
                 estimated_bytes: Some(9),
@@ -3713,6 +3724,20 @@ mod tests {
             !resource_db_path.exists(),
             "shape refusal happens before host lease state is opened"
         );
+
+        let resource_db_path = test_host_resource_db(tmp.path());
+        for root in [&cache_root, &uppercase_key_cache_root] {
+            let (removed, bytes) = sweep_preparation_cache_at(
+                &main_root,
+                &storage_root,
+                root,
+                &resource_db_path,
+                std::time::Instant::now() + Duration::from_secs(5),
+            );
+            assert_eq!((removed, bytes), (0, 0));
+        }
+        assert!(uppercase_repository.join("data").is_file());
+        assert!(uppercase_key.join("data").is_file());
     }
 
     #[test]
