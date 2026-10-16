@@ -41,6 +41,8 @@ use crate::collaboration_state::{
 use crate::collaboration_submit::{Setting, setting};
 use crate::exit_status;
 
+#[path = "collaboration_cli/context_revisions.rs"]
+mod context_revisions;
 #[path = "collaboration_cli/lifecycle.rs"]
 mod lifecycle;
 #[path = "collaboration_cli/project.rs"]
@@ -113,15 +115,18 @@ Usage:
       Finish an interrupted apply, putting back anything now relied on.
   aethyme collab context --path <path> [--path <path>...] [--source <snapshot-id>]
                          [--analysis <envelope-file>...] [--max-items N]
+                         [--revision-pin CONTRIBUTION@REVISION@sha256:HEX...]
                          [--max-brief-tokens N] [--max-matched-paths N] [--max-bytes N]
                          [--json]
       Retained contributions relevant to the paths, ranked, budgeted and
       explained. Briefs are untrusted data written by other agents. Without
       --source and a complete analysis covering every path, the answer is
       partial: an empty answer is not evidence that nothing relevant exists.
+      --revision-pin selects exact immutable revisions; repeat it for each pin.
   aethyme collab brief attach --contribution <record-id> <decision-file> [--json]
       Attach a decision brief (aethyme-brief-tokens/v0, at most 150 tokens) to
-      a retained contribution, replacing an earlier one.
+      a retained contribution. Bound contributions append an immutable revision;
+      an ambiguous shared lineage requires an exact operation selector.
 
 Additional explicit lifecycle commands (provisional Local packages):
   aethyme collab authority status [--json]
@@ -1401,6 +1406,7 @@ fn number(rest: &[&str], name: &str, default: usize) -> Result<usize, Failure> {
 fn context(main_root: &Path, rest: &[&str]) -> Result<Output, Failure> {
     const FLAGS: &[&str] = &[
         "--path",
+        "--revision-pin",
         "--source",
         "--analysis",
         "--max-items",
@@ -1409,6 +1415,7 @@ fn context(main_root: &Path, rest: &[&str]) -> Result<Output, Failure> {
         "--max-bytes",
     ];
     no_extra(rest, FLAGS, 0)?;
+    let pins = context_revisions::pins(rest)?;
     let mut scope = Vec::new();
     let mut analysis = Vec::new();
     let mut index = 0;
@@ -1464,6 +1471,9 @@ fn context(main_root: &Path, rest: &[&str]) -> Result<Output, Failure> {
         analysis,
         budget,
     };
+    if !pins.is_empty() {
+        return context_revisions::retrieve(&store, &query, &pins);
+    }
     let answer = crate::collaboration_context::retrieve_cached(&mut store, &query, &LocalProject)
         .map_err(|error| Failure::domain(error.code(), error.to_string()))?;
     let record: Value = serde_json::from_slice(&answer.record)
