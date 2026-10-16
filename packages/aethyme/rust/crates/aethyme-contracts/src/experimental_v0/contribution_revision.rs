@@ -144,6 +144,26 @@ impl ContributionRevision {
             // by `to_record`.
             validate_brief_digest(&brief.object_sha256)?;
         }
+        // Measure the complete record envelope before semantic validation or
+        // copying the dependency set. The template contains empty arrays for
+        // both variable-size fields; their exact borrowed sizes replace those
+        // two `[]` values below.
+        let size_template = Self {
+            project_id: project_id.clone(),
+            contribution_id: contribution_id.clone(),
+            capture_record_id: capture_record_id.clone(),
+            base: base.clone(),
+            result: result.clone(),
+            source_changes: Vec::new(),
+            brief: brief.clone(),
+            depends_on: Vec::new(),
+        }
+        .canonical_record_value(Value::Array(Vec::new()));
+        let fixed_size =
+            canonical_json::bounded_canonical_size(&size_template, MAX_CONTRIBUTION_REVISION_BYTES)
+                .ok_or(ContributionRevisionError::TooLarge(
+                    MAX_CONTRIBUTION_REVISION_BYTES + 1,
+                ))?;
         let source_changes_bytes = canonical_json::bounded_canonical_array_size(
             &source_changes,
             MAX_CONTRIBUTION_REVISION_BYTES,
@@ -151,6 +171,21 @@ impl ContributionRevision {
         .ok_or(ContributionRevisionError::TooLarge(
             MAX_CONTRIBUTION_REVISION_BYTES + 1,
         ))?;
+        let depends_on_bytes =
+            bounded_record_id_array_size(&depends_on, MAX_CONTRIBUTION_REVISION_BYTES).ok_or(
+                ContributionRevisionError::TooLarge(MAX_CONTRIBUTION_REVISION_BYTES + 1),
+            )?;
+        let measured_size = fixed_size
+            .checked_sub(4)
+            .and_then(|size| size.checked_add(source_changes_bytes))
+            .and_then(|size| size.checked_add(depends_on_bytes))
+            .ok_or(ContributionRevisionError::TooLarge(
+                MAX_CONTRIBUTION_REVISION_BYTES + 1,
+            ))?;
+        if measured_size > MAX_CONTRIBUTION_REVISION_BYTES {
+            return Err(ContributionRevisionError::TooLarge(measured_size));
+        }
+
         validate_changes(&source_changes)?;
         let mut dependency_ids: Vec<String> = depends_on
             .iter()
@@ -174,22 +209,6 @@ impl ContributionRevision {
             brief,
             depends_on,
         };
-        let fixed_size = canonical_json::bounded_canonical_size(
-            &revision.canonical_record_value(Value::Array(Vec::new())),
-            MAX_CONTRIBUTION_REVISION_BYTES,
-        )
-        .ok_or(ContributionRevisionError::TooLarge(
-            MAX_CONTRIBUTION_REVISION_BYTES + 1,
-        ))?;
-        let measured_size = fixed_size
-            .checked_sub(2)
-            .and_then(|size| size.checked_add(source_changes_bytes))
-            .ok_or(ContributionRevisionError::TooLarge(
-                MAX_CONTRIBUTION_REVISION_BYTES + 1,
-            ))?;
-        if measured_size > MAX_CONTRIBUTION_REVISION_BYTES {
-            return Err(ContributionRevisionError::TooLarge(measured_size));
-        }
         Ok(revision)
     }
 
@@ -436,6 +455,26 @@ fn oversized_reference_count(changes: &[Value]) -> Option<usize> {
     None
 }
 
+/// Measure the canonical array of record IDs without allocating strings.
+/// `RecordId` admits only `sha256:` plus lowercase hexadecimal, so its JSON
+/// string representation adds exactly two quote bytes and requires no escapes.
+fn bounded_record_id_array_size(ids: &[RecordId], limit: usize) -> Option<usize> {
+    if ids.len() > MAX_REVISION_ARRAY_ENTRIES {
+        return None;
+    }
+    let mut size = 2usize;
+    for (index, id) in ids.iter().enumerate() {
+        if index > 0 {
+            size = size.checked_add(1)?;
+        }
+        size = size.checked_add(id.as_str().len().checked_add(2)?)?;
+        if size > limit {
+            return None;
+        }
+    }
+    Some(size)
+}
+
 /// Parsed source file state: canonical raw path bytes.
 fn object_state(
     object: &Object,
@@ -450,7 +489,7 @@ fn object_state(
             }
             let path = decode_hex(object_string(state, "path_hex")?, "path_hex")?;
             let mode = object_string(state, "mode")?;
-            let kind = EntryKind::from_git_mode(&mode)
+            let kind = EntryKind::from_git_mode(mode)
                 .map_err(|_| ContributionRevisionError::InvalidSourceChange)?;
             let content = decode_hex(object_string(state, "content_sha256")?, "content_sha256")?;
             let content: [u8; 32] = content
