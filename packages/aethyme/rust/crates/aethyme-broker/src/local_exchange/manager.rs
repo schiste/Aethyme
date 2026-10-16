@@ -610,6 +610,7 @@ fn validate_revision_project_binding(
     .map_err(|_| invalid("revision base identity state unavailable"))?
     {
         crate::collaboration_identity_store::IdentityStateResolution::Anchor(state)
+        | crate::collaboration_identity_store::IdentityStateResolution::Bootstrap(state)
         | crate::collaboration_identity_store::IdentityStateResolution::Replayed(state) => state,
         crate::collaboration_identity_store::IdentityStateResolution::Unknown { .. } => {
             return Err(invalid("revision base identity state is unknown"));

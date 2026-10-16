@@ -1,4 +1,9 @@
 use super::*;
+use crate::collaboration_capture::OperationId;
+use crate::collaboration_cli::project_test_support::BoundProjectFixture;
+use crate::collaboration_identity_store::{
+    ContributionRevisionRequest, ResolvedContributionRevision, revise_contribution_for_operation,
+};
 use crate::local_target::tests::Fixture;
 
 fn setup(f: &mut Fixture, selected: &[&str]) -> (ControllerOwner, RecordId) {
@@ -16,6 +21,188 @@ fn policy() -> WavePolicy {
         age_promotion_ms: 1000,
         ..WavePolicy::default()
     }
+}
+
+fn revise_bound_operation(
+    fixture: &mut BoundProjectFixture,
+    operation_id: &str,
+) -> ResolvedContributionRevision {
+    let operation_id = OperationId::parse(operation_id).unwrap();
+    revise_contribution_for_operation(
+        &mut fixture.store,
+        &fixture.binding,
+        ContributionRevisionRequest {
+            operation_id: &operation_id,
+            file_operations: None,
+            brief: None,
+            depends_on: None,
+        },
+    )
+    .unwrap()
+}
+
+fn conflicting_bound_revisions() -> (
+    BoundProjectFixture,
+    ResolvedContributionRevision,
+    ResolvedContributionRevision,
+) {
+    let mut fixture = BoundProjectFixture::new().unwrap();
+    let base = fixture.bootstrap_commit.clone();
+    let first_result = fixture
+        .commit_file("src/shared.rs", b"pub fn shared_a() {}\n")
+        .unwrap();
+
+    // Create a second independently captured result from the same base. The
+    // path overlaps, while the distinct source commits keep the two legacy
+    // capture lineages separate for wave admission.
+    crate::local_target::tests::git(fixture.repo_path(), &["switch", "--detach", base.as_str()]);
+    std::fs::write(
+        fixture.repo_path().join("src/shared.rs"),
+        b"pub fn shared_b() {}\n",
+    )
+    .unwrap();
+    crate::local_target::tests::git(fixture.repo_path(), &["add", "--", "src/shared.rs"]);
+    crate::local_target::tests::git(
+        fixture.repo_path(),
+        &["commit", "-q", "-m", "second independent source change"],
+    );
+    let second_result = CommitOid::parse(&crate::local_target::tests::git(
+        fixture.repo_path(),
+        &["rev-parse", "HEAD"],
+    ))
+    .unwrap();
+
+    fixture
+        .capture_operation("wave-operation-a", &base, &first_result)
+        .unwrap();
+    fixture
+        .capture_operation("wave-operation-b", &base, &second_result)
+        .unwrap();
+    let first = revise_bound_operation(&mut fixture, "wave-operation-a");
+    let second = revise_bound_operation(&mut fixture, "wave-operation-b");
+    assert_ne!(first.capture_lineage(), second.capture_lineage());
+    (fixture, first, second)
+}
+
+fn propose_d10_wave_target(
+    fixture: &mut BoundProjectFixture,
+    name: &str,
+    revisions: &[(&str, &ResolvedContributionRevision)],
+    selected: &[&str],
+) -> (ControllerOwner, RecordId) {
+    let contributions = revisions
+        .iter()
+        .map(|(alias, revision)| target::RequestedContribution {
+            id: (*alias).into(),
+            lineage: revision.capture_lineage().to_string(),
+            requires: Vec::new(),
+            atomic_group: None,
+            revision_of: None,
+            derived_from: Vec::new(),
+        })
+        .collect();
+    let pins = selected
+        .iter()
+        .map(|alias| {
+            let revision = revisions
+                .iter()
+                .find(|(candidate, _)| candidate == alias)
+                .expect("each selected alias has a bound revision")
+                .1;
+            target::D10RevisionPin {
+                contribution: (*alias).into(),
+                logical_contribution_id: revision.revision().contribution_id().to_string(),
+                revision_record_id: revision.record_id().to_string(),
+                revision_object_sha256: revision.object_digest().hex(),
+            }
+        })
+        .collect();
+    let spec = target::TargetSpec {
+        objective_authorization: format!("sha256:{}", "1".repeat(64)),
+        objective: "compose a source-bound selected cohort".into(),
+        baseline: fixture.bootstrap_snapshot.as_str().into(),
+        contributions,
+        selected: selected.iter().map(|alias| (*alias).into()).collect(),
+        requirements: vec![format!("sha256:{}", "2".repeat(64))],
+        acceptance_policy: format!("sha256:{}", "3".repeat(64)),
+        composer_profile: crate::composer::PROVISIONAL_TEXT_PROFILE.into(),
+    };
+    let bindings = target::D10RevisionBindings {
+        profile: target::D10_TARGET_PROFILE.into(),
+        project_id: fixture.binding.project_id().to_string(),
+        descriptor_record_id: fixture.binding.descriptor_record_id().to_string(),
+        descriptor_object_sha256: fixture.binding.descriptor_object().hex(),
+        revisions: pins,
+    };
+    let owner = target::acquire_controller(&mut fixture.store, name, "issuer").unwrap();
+    let revision =
+        target::propose_revision_with_d10_bindings(&mut fixture.store, &owner, spec, bindings)
+            .unwrap();
+    target::select_revision(&mut fixture.store, &owner, &revision.id).unwrap();
+    (owner, revision.id)
+}
+
+#[test]
+fn split_single_item_waves_refuse_conflicts_across_the_full_selected_cohort() {
+    let (mut fixture, first, second) = conflicting_bound_revisions();
+    let (owner, _) = propose_d10_wave_target(
+        &mut fixture,
+        "d10-wave-conflict",
+        &[("A", &first), ("B", &second)],
+        &["A", "B"],
+    );
+    available(&mut fixture.store, &owner, "A", 0).unwrap();
+    available(&mut fixture.store, &owner, "B", 1).unwrap();
+    let one_item = WavePolicy {
+        batch_width: 1,
+        ..policy()
+    };
+
+    let first_wave = frozen(admit(&mut fixture.store, &owner, one_item, 1).unwrap());
+    assert_eq!(first_wave.spec.selected, ["A"]);
+    let first_result = compose(
+        &mut fixture.store,
+        &owner,
+        fixture.repo_path(),
+        &first_wave.id,
+    )
+    .unwrap();
+    assert_eq!(first_result.phase, WavePhase::Blocked);
+    assert!(first_result.candidate_snapshot.is_none());
+
+    let second_wave = frozen(admit(&mut fixture.store, &owner, one_item, 2).unwrap());
+    assert_eq!(second_wave.spec.selected, ["B"]);
+    let second_result = compose(
+        &mut fixture.store,
+        &owner,
+        fixture.repo_path(),
+        &second_wave.id,
+    )
+    .unwrap();
+    assert_eq!(second_result.phase, WavePhase::Blocked);
+    assert!(second_result.candidate_snapshot.is_none());
+}
+
+#[test]
+fn d10_wave_validation_does_not_include_conflicting_unselected_catalog_entries() {
+    let (mut fixture, first, second) = conflicting_bound_revisions();
+    let (owner, _) = propose_d10_wave_target(
+        &mut fixture,
+        "d10-wave-subset",
+        &[("A", &first), ("B", &second)],
+        &["A"],
+    );
+    available(&mut fixture.store, &owner, "A", 0).unwrap();
+    let one_item = WavePolicy {
+        batch_width: 1,
+        ..policy()
+    };
+    let wave = frozen(admit(&mut fixture.store, &owner, one_item, 0).unwrap());
+    assert_eq!(wave.spec.selected, ["A"]);
+
+    let result = compose(&mut fixture.store, &owner, fixture.repo_path(), &wave.id).unwrap();
+    assert_eq!(result.phase, WavePhase::Verifying);
+    assert!(result.candidate_snapshot.is_some());
 }
 
 #[test]

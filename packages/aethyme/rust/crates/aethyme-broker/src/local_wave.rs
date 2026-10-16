@@ -813,8 +813,11 @@ pub fn compose(
             &id(&wave.spec.revision)?,
             &response_guard,
         )?;
+        // Validate the complete issuer-selected cohort before composing this
+        // scheduling batch. A narrow wave must not hide conflicts with a
+        // selected revision that will be admitted in a later wave.
         let namespace_conflict =
-            match target::validate_d10_file_namespace(store, &pinned, &wave.spec.selected) {
+            match target::validate_d10_file_namespace(store, &pinned, &pinned.spec.selected) {
                 Ok(()) => None,
                 Err(TargetError::FileNamespaceConflict(detail)) => Some(detail),
                 Err(error) => return Err(error.into()),
