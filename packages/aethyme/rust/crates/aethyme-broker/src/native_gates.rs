@@ -1107,13 +1107,15 @@ fn run_inner(
         // Same gate engine used by merge.rs. No separate gate definitions,
         // runner, cache implementation, queue replay or promotion path.
         let main = broker.main_root_path();
-        let outcomes = crate::gates::run_affected_bounded(
+        let storage = broker.storage_context().gate_storage_locations();
+        let outcomes = crate::gates::run_affected_bounded_in(
             broker.store(),
             &main,
             &checkout.repo,
             &p.gates,
             &changed,
             Duration::from_secs(job.spec.execution_allowance_seconds),
+            storage,
         )?;
         let status = if !p.present {
             "no_configuration"

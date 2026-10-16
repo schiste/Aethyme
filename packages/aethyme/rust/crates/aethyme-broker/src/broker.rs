@@ -99,6 +99,8 @@ pub(crate) const WORKTREE_ROOT_MARKER: &str = ".aethyme-worktree-root.json";
 
 #[derive(Debug, thiserror::Error)]
 pub enum BrokerOpError {
+    #[error("invalid captured broker storage context: {reason}")]
+    InvalidStorageContext { reason: Box<str> },
     /// The repository opted into the push lane and the session holds commits
     /// no remote has, so closing it would leave the only copy in a worktree
     /// the broker is about to stop tracking.
@@ -1048,6 +1050,7 @@ pub(crate) struct BrokerStorageContext {
     pub(crate) worktree_root_environment_override: Option<PathBuf>,
     pub(crate) collaboration_state_dir: Option<PathBuf>,
     pub(crate) host_state_dir_is_explicit: bool,
+    pub(crate) capture_error: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]

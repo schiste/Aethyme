@@ -1316,10 +1316,11 @@ impl Broker {
                 )
             })
             .unwrap_or_default();
-        if uses_managed_cache && let Some(cache) = crate::host_state::default_host_cache_dir() {
+        let gate_storage = self.storage_context().gate_storage_locations();
+        if uses_managed_cache && let Some(cache) = gate_storage.cache_dir() {
             probes.insert(cache);
         }
-        if uses_host_resource_db && let Ok(database) = crate::default_host_resource_db_path() {
+        if uses_host_resource_db && let Ok(database) = gate_storage.resource_db_path() {
             probes.insert(database.parent().unwrap_or(&self.main_root).to_path_buf());
         }
         probes.into_iter().collect()

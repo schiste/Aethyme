@@ -761,7 +761,8 @@ impl Broker {
         cache_policy: crate::gates::CachePolicy,
     ) -> Result<Vec<crate::gates::GateRunOutcome>, BrokerOpError> {
         let (checkout, gates, changed) = self.gate_inputs(session_id)?;
-        crate::gates::run_affected(
+        let storage = self.storage_context().gate_storage_locations();
+        crate::gates::run_affected_in(
             &mut self.store,
             &self.main_root,
             &checkout,
@@ -769,6 +770,7 @@ impl Broker {
             &changed,
             Some(session_id),
             cache_policy,
+            storage,
         )
     }
 
@@ -783,7 +785,8 @@ impl Broker {
         cache_policy: crate::gates::CachePolicy,
     ) -> Result<Vec<crate::gates::GateRunOutcome>, BrokerOpError> {
         let (checkout, gates, changed) = self.gate_inputs(session_id)?;
-        crate::gates::run_named(
+        let storage = self.storage_context().gate_storage_locations();
+        crate::gates::run_named_in(
             &mut self.store,
             &self.main_root,
             &checkout,
@@ -792,6 +795,7 @@ impl Broker {
             gate_name,
             Some(session_id),
             cache_policy,
+            storage,
         )
     }
 
@@ -817,7 +821,8 @@ impl Broker {
         progress: &dyn crate::gates::GateProgressSink,
     ) -> Result<Vec<crate::gates::GateRunOutcome>, BrokerOpError> {
         let (checkout, gates, changed) = self.gate_inputs(session_id)?;
-        crate::gates::run_affected_with_progress(
+        let storage = self.storage_context().gate_storage_locations();
+        crate::gates::run_affected_with_progress_in(
             &mut self.store,
             &self.main_root,
             &checkout,
@@ -828,6 +833,7 @@ impl Broker {
                 cache_policy,
                 progress,
             },
+            storage,
         )
     }
 
@@ -872,13 +878,15 @@ impl Broker {
         self.record_graph_integrity(&checkout, None)?;
         let config_root = checkout.root().to_path_buf();
         let gates = self.load_and_sync_gates_from(&config_root)?;
-        crate::gates::run_all(
+        let storage = self.storage_context().gate_storage_locations();
+        crate::gates::run_all_in(
             &mut self.store,
             &self.main_root,
             &checkout,
             &gates,
             None,
             cache_policy,
+            storage,
         )
     }
 
@@ -893,7 +901,8 @@ impl Broker {
         self.record_graph_integrity(&checkout, None)?;
         let config_root = checkout.root().to_path_buf();
         let gates = self.load_and_sync_gates_from(&config_root)?;
-        crate::gates::run_named(
+        let storage = self.storage_context().gate_storage_locations();
+        crate::gates::run_named_in(
             &mut self.store,
             &self.main_root,
             &checkout,
@@ -902,6 +911,7 @@ impl Broker {
             gate_name,
             None,
             cache_policy,
+            storage,
         )
     }
 
@@ -949,7 +959,8 @@ impl Broker {
         self.record_graph_integrity(&checkout, None)?;
         let config_root = checkout.root().to_path_buf();
         let gates = self.load_and_sync_gates_from(&config_root)?;
-        crate::gates::run_all_with_progress(
+        let storage = self.storage_context().gate_storage_locations();
+        crate::gates::run_all_with_progress_in(
             &mut self.store,
             &self.main_root,
             &checkout,
@@ -957,6 +968,7 @@ impl Broker {
             None,
             cache_policy,
             progress,
+            storage,
         )
     }
 

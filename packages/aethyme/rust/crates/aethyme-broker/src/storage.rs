@@ -1222,7 +1222,44 @@ fn sweep_preparation_cache_at(
     resource_db_path: &Path,
     deadline: std::time::Instant,
 ) -> (usize, u64) {
-    let live_roots = match discover_preparation_live_roots(main_root, storage_root, deadline) {
+    sweep_preparation_cache_with_discovery(
+        main_root,
+        cache_root,
+        resource_db_path,
+        deadline,
+        |deadline| discover_preparation_live_roots(main_root, storage_root, deadline),
+    )
+}
+
+/// The Broker-backed sweep uses the root candidates captured by that Broker
+/// rather than re-reading the process environment during startup maintenance.
+pub(crate) fn sweep_preparation_cache_for_roots(
+    main_root: &Path,
+    worktree_roots: &[PathBuf],
+    cache_root: &Path,
+    resource_db_path: &Path,
+    deadline: std::time::Instant,
+) -> (usize, u64) {
+    if check_preparation_sweep_deadline(deadline).is_err() || worktree_roots.is_empty() {
+        return (0, 0);
+    }
+    sweep_preparation_cache_with_discovery(
+        main_root,
+        cache_root,
+        resource_db_path,
+        deadline,
+        |deadline| discover_preparation_live_roots_from_roots(main_root, worktree_roots, deadline),
+    )
+}
+
+fn sweep_preparation_cache_with_discovery(
+    main_root: &Path,
+    cache_root: &Path,
+    resource_db_path: &Path,
+    deadline: std::time::Instant,
+    mut discover_live_roots: impl FnMut(std::time::Instant) -> Result<Vec<PathBuf>, StorageError>,
+) -> (usize, u64) {
+    let live_roots = match discover_live_roots(deadline) {
         Ok(roots) => roots,
         Err(_) => return (0, 0),
     };
@@ -1297,11 +1334,10 @@ fn sweep_preparation_cache_at(
             // longer used by writers, but the same lease prevents cleanup
             // from racing another rotation or active preparation command.
             let outcome = (|| {
-                let current_roots =
-                    match discover_preparation_live_roots(main_root, storage_root, deadline) {
-                        Ok(roots) => roots,
-                        Err(_) => return PreparationCacheSweepOutcome::Stop,
-                    };
+                let current_roots = match discover_live_roots(deadline) {
+                    Ok(roots) => roots,
+                    Err(_) => return PreparationCacheSweepOutcome::Stop,
+                };
                 if current_preparation_keys(&current_roots, deadline).is_err() {
                     return PreparationCacheSweepOutcome::Stop;
                 }
@@ -1387,11 +1423,10 @@ fn sweep_preparation_cache_at(
             // so preparation cannot start using the entry between the check
             // and delete.
             let outcome = (|| {
-                let current_roots =
-                    match discover_preparation_live_roots(main_root, storage_root, deadline) {
-                        Ok(roots) => roots,
-                        Err(_) => return PreparationCacheSweepOutcome::Stop,
-                    };
+                let current_roots = match discover_live_roots(deadline) {
+                    Ok(roots) => roots,
+                    Err(_) => return PreparationCacheSweepOutcome::Stop,
+                };
                 let current_keys = match current_preparation_keys(&current_roots, deadline) {
                     Ok(keys) => keys,
                     Err(_) => return PreparationCacheSweepOutcome::Stop,
@@ -1703,6 +1738,107 @@ fn discover_preparation_live_roots(
                 });
             }
             if child_type.is_dir() {
+                roots.insert(child.path());
+            }
+        }
+    }
+    check_preparation_sweep_deadline(deadline)?;
+    Ok(roots.into_iter().collect())
+}
+
+/// Resolve live checkouts from the exact worktree roots selected by one
+/// Broker's captured storage context. Each candidate is the repository root
+/// that carries the ownership marker; unlike the environment-default scanner,
+/// no parent directory is re-resolved from process state.
+fn discover_preparation_live_roots_from_roots(
+    main_root: &Path,
+    worktree_roots: &[PathBuf],
+    deadline: std::time::Instant,
+) -> Result<Vec<PathBuf>, StorageError> {
+    check_preparation_sweep_deadline(deadline)?;
+    let main_metadata =
+        std::fs::symlink_metadata(main_root).map_err(|source| StorageError::Io {
+            path: main_root.to_path_buf(),
+            source,
+        })?;
+    if main_metadata.file_type().is_symlink() || !main_metadata.is_dir() {
+        return Err(StorageError::Unavailable {
+            reason: "invoking checkout is not a real directory".into(),
+        });
+    }
+
+    let mut roots = BTreeSet::from([main_root.to_path_buf()]);
+    let mut examined = 0_usize;
+    for root in worktree_roots {
+        check_preparation_sweep_deadline(deadline)?;
+        let metadata = match std::fs::symlink_metadata(root) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(source) => {
+                return Err(StorageError::Io {
+                    path: root.clone(),
+                    source,
+                });
+            }
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(StorageError::Unavailable {
+                reason: format!(
+                    "worktree storage root {} is not a real directory",
+                    root.display()
+                ),
+            });
+        }
+        let marker = read_worktree_marker_for_liveness(root, deadline)?.ok_or_else(|| {
+            StorageError::Unavailable {
+                reason: format!(
+                    "worktree root {} has no readable ownership marker",
+                    root.display()
+                ),
+            }
+        })?;
+        if marker.schema_version != WORKTREE_ROOT_SCHEMA_VERSION
+            || marker.repository_key.is_empty()
+            || !marker.repository_root.is_absolute()
+        {
+            return Err(StorageError::Unavailable {
+                reason: format!(
+                    "worktree root {} has an invalid ownership marker",
+                    root.display()
+                ),
+            });
+        }
+        roots.insert(root.clone());
+        roots.insert(marker.repository_root);
+
+        let children = std::fs::read_dir(root).map_err(|source| StorageError::Io {
+            path: root.clone(),
+            source,
+        })?;
+        check_preparation_sweep_deadline(deadline)?;
+        for child in children {
+            check_preparation_sweep_deadline(deadline)?;
+            let child = child.map_err(|source| StorageError::Io {
+                path: root.clone(),
+                source,
+            })?;
+            examined += 1;
+            if examined > PREPARATION_SWEEP_MAX_DISCOVERY_PATHS {
+                return Err(StorageError::Unavailable {
+                    reason: "worktree-root discovery exceeded its entry bound".into(),
+                });
+            }
+            let file_type = child.file_type().map_err(|source| StorageError::Io {
+                path: child.path(),
+                source,
+            })?;
+            check_preparation_sweep_deadline(deadline)?;
+            if file_type.is_symlink() {
+                return Err(StorageError::Unavailable {
+                    reason: "worktree root contains a symlinked checkout".into(),
+                });
+            }
+            if file_type.is_dir() {
                 roots.insert(child.path());
             }
         }

@@ -1622,24 +1622,26 @@ impl Broker {
                     .collect()
             })
             .unwrap_or_default();
-        let (gate_cache, gate_caches) = match crate::gate_cache_gc::location(&main_root) {
-            Some(location) => {
-                let (inventory, candidates) = crate::gate_cache_gc::inspect(
-                    &main_root,
-                    &location,
-                    crate::gate_cache_gc::KeepRule {
-                        budget_bytes: policy.gate_cache_bytes_budget,
-                        include_active: include_active_gate_cache,
-                        configured_keys: &configured_keys,
-                    },
-                    evaluated_at,
-                    scan,
-                    &mut size_records,
-                );
-                (Some(inventory), candidates)
-            }
-            None => (None, Vec::new()),
-        };
+        let gate_storage = self.storage_context().gate_storage_locations();
+        let (gate_cache, gate_caches) =
+            match crate::gate_cache_gc::location_in(&main_root, &gate_storage) {
+                Some(location) => {
+                    let (inventory, candidates) = crate::gate_cache_gc::inspect(
+                        &main_root,
+                        &location,
+                        crate::gate_cache_gc::KeepRule {
+                            budget_bytes: policy.gate_cache_bytes_budget,
+                            include_active: include_active_gate_cache,
+                            configured_keys: &configured_keys,
+                        },
+                        evaluated_at,
+                        scan,
+                        &mut size_records,
+                    );
+                    (Some(inventory), candidates)
+                }
+                None => (None, Vec::new()),
+            };
         if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
             deferred_checks.push("gate_cache_inventory".into());
         }
@@ -2316,11 +2318,33 @@ impl Broker {
             // checkout computes is unreadable forever, so it needs no operator
             // review. It was reachable only from the manual lane, which is why a
             // hand reclaim of 13.3 GB returned as 15 GB within three days.
-            let (cache_entries, cache_bytes) = crate::storage::sweep_preparation_cache(
-                &main_root,
-                policy.orphan_worktree_roots_days,
-                deadline,
-            );
+            let storage_context = self.storage_context().clone();
+            let worktree_roots = self
+                .worktree_root_plan()
+                .ok()
+                .map(|plan| {
+                    crate::broker::lifecycle::worktree_root_candidates_for(&plan)
+                        .into_iter()
+                        .map(|(root, _source)| root)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let (cache_entries, cache_bytes) = match (
+                worktree_roots.is_empty(),
+                storage_context.preparation_cache_root(),
+                storage_context.host_resource_db_path.as_deref(),
+            ) {
+                (false, Some(cache_root), Some(resource_db_path)) => {
+                    crate::storage::sweep_preparation_cache_for_roots(
+                        &main_root,
+                        &worktree_roots,
+                        &cache_root,
+                        resource_db_path,
+                        deadline,
+                    )
+                }
+                _ => (0, 0),
+            };
             if cache_entries > 0 {
                 let payload = serde_json::json!({
                     "entries": cache_entries,
@@ -2996,7 +3020,17 @@ impl Broker {
             && !check_deadline(deadline)
         {
             let candidate = journal.remaining_gate_caches[0].clone();
-            match crate::gate_cache_gc::reclaim(&main_root, &candidate, deadline) {
+            let gate_storage = self.storage_context().gate_storage_locations();
+            let location = crate::gate_cache_gc::location_in(&main_root, &gate_storage);
+            let reclaim = match location.as_ref() {
+                Some(location) => {
+                    crate::gate_cache_gc::reclaim_in(&main_root, location, &candidate, deadline)
+                }
+                None => {
+                    Err("this repository's captured gate cache location cannot be resolved".into())
+                }
+            };
+            match reclaim {
                 Ok(crate::gate_cache_gc::GateCacheReclaim::Removed(bytes)) => {
                     journal.reclaimed_bytes = journal.reclaimed_bytes.saturating_add(bytes);
                     journal.gate_caches_reclaimed.push(candidate.path);

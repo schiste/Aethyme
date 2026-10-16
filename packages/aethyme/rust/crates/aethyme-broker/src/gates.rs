@@ -905,12 +905,55 @@ pub(crate) struct GateExecutionContext<'a> {
     pub progress: &'a dyn GateProgressSink,
 }
 
+/// Storage locations captured by the owning Broker handle. Standalone gate
+/// APIs leave these unset and retain their existing environment-based
+/// defaults; Broker-backed runs pass the exact paths captured at open time.
+#[derive(Debug, Clone, Default)]
+pub(crate) enum GateStorageLocations {
+    /// Standalone gate APIs retain their process-environment defaults.
+    #[default]
+    Defaults,
+    /// Broker-backed runs use the paths captured when that Broker opened.
+    /// A captured `None` remains unavailable; it must not silently resolve a
+    /// later, possibly different process-environment value.
+    Captured {
+        host_resource_db_path: Option<PathBuf>,
+        host_cache_dir: Option<PathBuf>,
+    },
+}
+
+impl GateStorageLocations {
+    pub(crate) fn resource_db_path(&self) -> Result<PathBuf, String> {
+        match self {
+            Self::Defaults => {
+                crate::default_host_resource_db_path().map_err(|error| error.to_string())
+            }
+            Self::Captured {
+                host_resource_db_path: Some(path),
+                ..
+            } => Ok(path.clone()),
+            Self::Captured {
+                host_resource_db_path: None,
+                ..
+            } => Err("the broker's captured host resource database path is unavailable".into()),
+        }
+    }
+
+    pub(crate) fn cache_dir(&self) -> Option<PathBuf> {
+        match self {
+            Self::Defaults => crate::host_state::default_host_cache_dir(),
+            Self::Captured { host_cache_dir, .. } => host_cache_dir.clone(),
+        }
+    }
+}
+
 /// Per-run host sampling and progress dependencies. Tests inject deterministic
 /// load readings; production uses the system load sampler.
 struct GateRuntimeContext<'a> {
     progress: &'a dyn GateProgressSink,
     admission_host: &'a dyn crate::gate_admission::AdmissionHost,
     deadline: Option<Instant>,
+    storage: GateStorageLocations,
 }
 
 pub(crate) fn heartbeat_interval() -> Duration {
@@ -1305,8 +1348,31 @@ pub(crate) fn run_affected(
     session_id: Option<i64>,
     cache_policy: CachePolicy,
 ) -> Result<Vec<GateRunOutcome>, crate::broker::BrokerOpError> {
+    run_affected_in(
+        store,
+        main_root,
+        checkout,
+        gates,
+        changed,
+        session_id,
+        cache_policy,
+        GateStorageLocations::default(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_affected_in(
+    store: &mut BrokerStore,
+    main_root: &Path,
+    checkout: &GitRepo,
+    gates: &[Gate],
+    changed: &[String],
+    session_id: Option<i64>,
+    cache_policy: CachePolicy,
+    storage: GateStorageLocations,
+) -> Result<Vec<GateRunOutcome>, crate::broker::BrokerOpError> {
     let progress = StderrGateProgressSink;
-    run_affected_with_progress(
+    run_affected_with_progress_in(
         store,
         main_root,
         checkout,
@@ -1317,6 +1383,7 @@ pub(crate) fn run_affected(
             cache_policy,
             progress: &progress,
         },
+        storage,
     )
 }
 
@@ -1333,8 +1400,33 @@ pub(crate) fn run_affected_for_submit(
     cache_policy: CachePolicy,
     submit: Option<&crate::submit_progress::SubmitProgress>,
 ) -> Result<Vec<GateRunOutcome>, crate::broker::BrokerOpError> {
+    run_affected_for_submit_in(
+        store,
+        main_root,
+        checkout,
+        gates,
+        changed,
+        session_id,
+        cache_policy,
+        submit,
+        GateStorageLocations::default(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_affected_for_submit_in(
+    store: &mut BrokerStore,
+    main_root: &Path,
+    checkout: &GitRepo,
+    gates: &[Gate],
+    changed: &[String],
+    session_id: Option<i64>,
+    cache_policy: CachePolicy,
+    submit: Option<&crate::submit_progress::SubmitProgress>,
+    storage: GateStorageLocations,
+) -> Result<Vec<GateRunOutcome>, crate::broker::BrokerOpError> {
     let Some(submit) = submit else {
-        return run_affected(
+        return run_affected_in(
             store,
             main_root,
             checkout,
@@ -1342,10 +1434,11 @@ pub(crate) fn run_affected_for_submit(
             changed,
             session_id,
             cache_policy,
+            storage,
         );
     };
     let progress = SubmitGateProgressSink { progress: submit };
-    run_affected_with_progress(
+    run_affected_with_progress_in(
         store,
         main_root,
         checkout,
@@ -1356,6 +1449,7 @@ pub(crate) fn run_affected_for_submit(
             cache_policy,
             progress: &progress,
         },
+        storage,
     )
 }
 
@@ -1369,6 +1463,27 @@ pub(crate) fn run_affected_bounded(
     changed: &[String],
     allowance: Duration,
 ) -> Result<Vec<GateRunOutcome>, crate::broker::BrokerOpError> {
+    run_affected_bounded_in(
+        store,
+        main_root,
+        checkout,
+        gates,
+        changed,
+        allowance,
+        GateStorageLocations::default(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_affected_bounded_in(
+    store: &mut BrokerStore,
+    main_root: &Path,
+    checkout: &GitRepo,
+    gates: &[Gate],
+    changed: &[String],
+    allowance: Duration,
+    storage: GateStorageLocations,
+) -> Result<Vec<GateRunOutcome>, crate::broker::BrokerOpError> {
     let progress = StderrGateProgressSink;
     run_selections(
         store,
@@ -1381,6 +1496,7 @@ pub(crate) fn run_affected_bounded(
             progress: &progress,
             admission_host: &crate::gate_admission::SystemAdmissionHost,
             deadline: Some(Instant::now() + allowance),
+            storage,
         },
     )
 }
@@ -1395,6 +1511,29 @@ pub(crate) fn run_affected_with_progress(
     session_id: Option<i64>,
     context: GateExecutionContext<'_>,
 ) -> Result<Vec<GateRunOutcome>, crate::broker::BrokerOpError> {
+    run_affected_with_progress_in(
+        store,
+        main_root,
+        checkout,
+        gates,
+        changed,
+        session_id,
+        context,
+        GateStorageLocations::default(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_affected_with_progress_in(
+    store: &mut BrokerStore,
+    main_root: &Path,
+    checkout: &GitRepo,
+    gates: &[Gate],
+    changed: &[String],
+    session_id: Option<i64>,
+    context: GateExecutionContext<'_>,
+    storage: GateStorageLocations,
+) -> Result<Vec<GateRunOutcome>, crate::broker::BrokerOpError> {
     let selections = select_gates(gates, changed);
     run_selections(
         store,
@@ -1407,6 +1546,7 @@ pub(crate) fn run_affected_with_progress(
             progress: context.progress,
             admission_host: &crate::gate_admission::SystemAdmissionHost,
             deadline: None,
+            storage,
         },
     )
 }
@@ -1424,8 +1564,28 @@ pub(crate) fn run_all(
     session_id: Option<i64>,
     cache_policy: CachePolicy,
 ) -> Result<Vec<GateRunOutcome>, crate::broker::BrokerOpError> {
+    run_all_in(
+        store,
+        main_root,
+        checkout,
+        gates,
+        session_id,
+        cache_policy,
+        GateStorageLocations::default(),
+    )
+}
+
+pub(crate) fn run_all_in(
+    store: &mut BrokerStore,
+    main_root: &Path,
+    checkout: &GitRepo,
+    gates: &[Gate],
+    session_id: Option<i64>,
+    cache_policy: CachePolicy,
+    storage: GateStorageLocations,
+) -> Result<Vec<GateRunOutcome>, crate::broker::BrokerOpError> {
     let progress = StderrGateProgressSink;
-    run_all_with_progress(
+    run_all_with_progress_in(
         store,
         main_root,
         checkout,
@@ -1433,6 +1593,7 @@ pub(crate) fn run_all(
         session_id,
         cache_policy,
         &progress,
+        storage,
     )
 }
 
@@ -1445,6 +1606,29 @@ pub(crate) fn run_all_with_progress(
     session_id: Option<i64>,
     cache_policy: CachePolicy,
     progress: &dyn GateProgressSink,
+) -> Result<Vec<GateRunOutcome>, crate::broker::BrokerOpError> {
+    run_all_with_progress_in(
+        store,
+        main_root,
+        checkout,
+        gates,
+        session_id,
+        cache_policy,
+        progress,
+        GateStorageLocations::default(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_all_with_progress_in(
+    store: &mut BrokerStore,
+    main_root: &Path,
+    checkout: &GitRepo,
+    gates: &[Gate],
+    session_id: Option<i64>,
+    cache_policy: CachePolicy,
+    progress: &dyn GateProgressSink,
+    storage: GateStorageLocations,
 ) -> Result<Vec<GateRunOutcome>, crate::broker::BrokerOpError> {
     // Every gate, already cost-sorted by load_gates; `triggered_by` is
     // None because nothing was selected by a diff.
@@ -1467,6 +1651,7 @@ pub(crate) fn run_all_with_progress(
             progress,
             admission_host: &crate::gate_admission::SystemAdmissionHost,
             deadline: None,
+            storage,
         },
     )
 }
@@ -1483,6 +1668,31 @@ pub(crate) fn run_named(
     name: &str,
     session_id: Option<i64>,
     cache_policy: CachePolicy,
+) -> Result<Vec<GateRunOutcome>, crate::broker::BrokerOpError> {
+    run_named_in(
+        store,
+        main_root,
+        checkout,
+        gates,
+        changed,
+        name,
+        session_id,
+        cache_policy,
+        GateStorageLocations::default(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_named_in(
+    store: &mut BrokerStore,
+    main_root: &Path,
+    checkout: &GitRepo,
+    gates: &[Gate],
+    changed: &[String],
+    name: &str,
+    session_id: Option<i64>,
+    cache_policy: CachePolicy,
+    storage: GateStorageLocations,
 ) -> Result<Vec<GateRunOutcome>, crate::broker::BrokerOpError> {
     let gate = gates.iter().find(|gate| gate.name == name).ok_or_else(|| {
         crate::broker::BrokerOpError::UnknownGate {
@@ -1510,6 +1720,7 @@ pub(crate) fn run_named(
             progress: &progress,
             admission_host: &crate::gate_admission::SystemAdmissionHost,
             deadline: None,
+            storage,
         },
     )
 }
@@ -1738,6 +1949,7 @@ fn gate_worker_id(session_id: Option<i64>, gate_name: &str) -> String {
 struct GateResourceRuntime {
     grant: crate::HostResourceGrant,
     ttl_seconds: u64,
+    resource_db_path: PathBuf,
 }
 
 struct ManagedGateCacheRuntime {
@@ -1747,7 +1959,7 @@ struct ManagedGateCacheRuntime {
 
 impl GateResourceRuntime {
     fn release(&mut self) -> Result<(), crate::HostResourceError> {
-        let mut coordinator = crate::HostResourceCoordinator::open_default()?;
+        let mut coordinator = crate::HostResourceCoordinator::open(&self.resource_db_path)?;
         self.grant.lease = coordinator.release(
             &self.grant.lease.lease_id,
             self.grant.lease.generation,
@@ -1764,6 +1976,7 @@ fn acquire_gate_resources(
     worker_id: &str,
     progress: &dyn GateProgressSink,
     deadline: Option<Instant>,
+    storage: GateStorageLocations,
 ) -> Result<Option<GateResourceRuntime>, String> {
     if gate.resources.is_empty() && gate.managed_cache.is_none() {
         return Ok(None);
@@ -1797,8 +2010,9 @@ fn acquire_gate_resources(
         holder_pid: Some(std::process::id()),
         resources,
     };
-    let mut coordinator =
-        crate::HostResourceCoordinator::open_default().map_err(|error| error.to_string())?;
+    let resource_db_path = storage.resource_db_path()?;
+    let mut coordinator = crate::HostResourceCoordinator::open(&resource_db_path)
+        .map_err(|error| error.to_string())?;
     let mut next_report = std::time::Instant::now();
     let grant = coordinator
         .acquire_with_wait(
@@ -1824,6 +2038,7 @@ fn acquire_gate_resources(
     Ok(Some(GateResourceRuntime {
         grant,
         ttl_seconds: gate.resource_ttl_seconds,
+        resource_db_path,
     }))
 }
 
@@ -1892,11 +2107,12 @@ fn prepare_managed_gate_cache(
     checkout: &GitRepo,
     progress: &dyn GateProgressSink,
     gate_name: &str,
+    storage: GateStorageLocations,
 ) -> Result<Option<ManagedGateCacheRuntime>, std::io::Error> {
     if policy.is_none() {
         return Ok(None);
     }
-    let root = crate::host_state::default_host_cache_dir().ok_or_else(|| {
+    let root = storage.cache_dir().ok_or_else(|| {
         std::io::Error::other("cannot find per-user cache directory; set AETHYME_HOST_CACHE_DIR")
     })?;
     let mut runtime =
@@ -2043,6 +2259,7 @@ fn gate_storage_probes(
     database_path: &Path,
     checkout: &GitRepo,
     gate: &Gate,
+    storage: GateStorageLocations,
 ) -> Vec<GateStorageProbe> {
     let mut probes = vec![
         GateStorageProbe {
@@ -2058,10 +2275,8 @@ fn gate_storage_probes(
             path: checkout.root().to_path_buf(),
         },
     ];
-    if let (Some(cache_key), Some(cache_root)) = (
-        gate.managed_cache.as_ref(),
-        crate::host_state::default_host_cache_dir(),
-    ) {
+    if let (Some(cache_key), Some(cache_root)) = (gate.managed_cache.as_ref(), storage.cache_dir())
+    {
         let repository = git_origin_fingerprint(checkout);
         probes.push(GateStorageProbe {
             label: "managed gate cache",
@@ -2072,7 +2287,7 @@ fn gate_storage_probes(
         });
     }
     if (!gate.resources.is_empty() || gate.managed_cache.is_some())
-        && let Ok(database) = crate::default_host_resource_db_path()
+        && let Ok(database) = storage.resource_db_path()
     {
         probes.push(GateStorageProbe {
             label: "host resource database",
@@ -2138,15 +2353,22 @@ fn gate_storage_admission_refusal(
     main_root: &Path,
     checkout: &GitRepo,
     gate: &Gate,
+    storage: GateStorageLocations,
 ) -> Option<String> {
+    if gate.managed_cache.is_some() && storage.cache_dir().is_none() {
+        return Some(
+            "the broker's captured host cache directory is unavailable for this managed cache"
+                .into(),
+        );
+    }
     if (!gate.resources.is_empty() || gate.managed_cache.is_some())
-        && let Err(error) = crate::default_host_resource_db_path()
+        && let Err(error) = storage.resource_db_path()
     {
         return Some(format!(
             "host resource database storage is unavailable: {error}"
         ));
     }
-    let probes = gate_storage_probes(main_root, store.db_path(), checkout, gate);
+    let probes = gate_storage_probes(main_root, store.db_path(), checkout, gate, storage);
     gate_storage_refusal(main_root, &probes)
 }
 
@@ -2191,6 +2413,7 @@ fn run_selections(
     cache_policy: CachePolicy,
     runtime: GateRuntimeContext<'_>,
 ) -> Result<Vec<GateRunOutcome>, crate::broker::BrokerOpError> {
+    let storage = runtime.storage.clone();
     run_selections_with_admission(
         store,
         main_root,
@@ -2200,7 +2423,9 @@ fn run_selections(
         cache_policy,
         runtime,
         broker_database_storage_refusal,
-        gate_storage_admission_refusal,
+        move |store, main_root, checkout, gate| {
+            gate_storage_admission_refusal(store, main_root, checkout, gate, storage.clone())
+        },
     )
 }
 
@@ -2448,6 +2673,7 @@ where
             &worker_id,
             progress,
             runtime.deadline,
+            runtime.storage.clone(),
         ) {
             Ok(runtime) => runtime,
             Err(message) => {
@@ -2484,6 +2710,7 @@ where
             checkout,
             progress,
             &gate.name,
+            runtime.storage.clone(),
         ) {
             Ok(runtime) => runtime,
             Err(error) => {
@@ -3914,6 +4141,7 @@ mod tests {
                 progress: &progress,
                 admission_host: &admission_host,
                 deadline: None,
+                storage: GateStorageLocations::default(),
             },
             |_, _| Some("broker database is below the gate reserve".to_string()),
             |_, _, _, _| Some("gate checkout is below the gate reserve".to_string()),
@@ -3992,6 +4220,7 @@ mod tests {
                 progress: &progress,
                 admission_host: &admission_host,
                 deadline: None,
+                storage: GateStorageLocations::default(),
             },
             |_, _| Some("broker database is below the gate reserve".to_string()),
             |_, _, _, _| panic!("a cache hit cannot dispatch a gate"),
@@ -4067,6 +4296,7 @@ mod tests {
                 progress: &progress,
                 admission_host: &admission_host,
                 deadline: None,
+                storage: GateStorageLocations::default(),
             },
             |_, _| None,
             move |_, _, _, _| {
@@ -4464,6 +4694,7 @@ mod tests {
                 progress: &progress,
                 admission_host: &host,
                 deadline: None,
+                storage: GateStorageLocations::default(),
             },
         )
         .unwrap();
@@ -4505,6 +4736,7 @@ mod tests {
                 progress: &progress,
                 admission_host: &recovered_host,
                 deadline: None,
+                storage: GateStorageLocations::default(),
             },
         )
         .unwrap();
@@ -4551,6 +4783,7 @@ mod tests {
                 progress: &progress,
                 admission_host: &host,
                 deadline: None,
+                storage: GateStorageLocations::default(),
             },
         )
         .unwrap();
