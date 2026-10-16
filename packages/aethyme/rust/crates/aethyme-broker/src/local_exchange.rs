@@ -629,7 +629,7 @@ impl Metadata {
         }
         let revision_bytes = revision_bytes_hex.decode(MAX_REVISION_OBJECT_BYTES_IN_PACKET)?;
         if crate::collaboration_archive::ObjectDigest::of(&revision_bytes).hex()
-            != revision_object_sha256
+            != revision_object_sha256.as_str()
         {
             return Err(invalid("revision object digest"));
         }
