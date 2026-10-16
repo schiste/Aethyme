@@ -151,6 +151,119 @@ impl Value {
     }
 }
 
+/// Measure a value's canonical representation without allocating the encoded
+/// document. This is used at constructor boundaries before cloning a caller's
+/// value tree into an immutable record. `None` means either the byte limit or
+/// a canonical-profile limit would be exceeded.
+pub(crate) fn bounded_canonical_size(value: &Value, limit: usize) -> Option<usize> {
+    bounded_canonical_size_at_depth(value, 0, limit)
+}
+
+fn bounded_canonical_size_at_depth(value: &Value, depth: usize, limit: usize) -> Option<usize> {
+    fn add(total: usize, amount: usize, limit: usize) -> Option<usize> {
+        let next = total.checked_add(amount)?;
+        (next <= limit).then_some(next)
+    }
+
+    fn string_size(value: &str, limit: usize) -> Option<usize> {
+        if value.len() > MAX_STRING_BYTES {
+            return None;
+        }
+        let mut size = 2usize;
+        for character in value.chars() {
+            let code = character as u32;
+            if (0xFDD0..=0xFDEF).contains(&code) || code & 0xFFFE == 0xFFFE {
+                return None;
+            }
+            let encoded = match character {
+                '"' | '\\' | '\u{8}' | '\u{c}' | '\n' | '\r' | '\t' => 2,
+                character if (character as u32) < 0x20 => 6,
+                character => character.len_utf8(),
+            };
+            size = add(size, encoded, limit)?;
+        }
+        (size <= limit).then_some(size)
+    }
+
+    fn visit(value: &Value, depth: usize, limit: usize) -> Option<usize> {
+        match value {
+            Value::Bool(true) => (limit >= 4).then_some(4),
+            Value::Bool(false) => (limit >= 5).then_some(5),
+            Value::Integer(number) => {
+                if number.unsigned_abs() > MAX_SAFE_INTEGER as u64 {
+                    return None;
+                }
+                let size = number.to_string().len();
+                (size <= limit).then_some(size)
+            }
+            Value::String(value) => string_size(value, limit),
+            Value::Array(items) => {
+                if depth >= MAX_DEPTH || items.len() > MAX_CONTAINER_ENTRIES {
+                    return None;
+                }
+                let mut size = 2usize;
+                if size > limit {
+                    return None;
+                }
+                for (index, item) in items.iter().enumerate() {
+                    if index > 0 {
+                        size = add(size, 1, limit)?;
+                    }
+                    size = add(size, visit(item, depth + 1, limit - size)?, limit)?;
+                }
+                Some(size)
+            }
+            Value::Object(object) => {
+                if depth >= MAX_DEPTH || object.len() > MAX_CONTAINER_ENTRIES {
+                    return None;
+                }
+                let mut size = 2usize;
+                if size > limit {
+                    return None;
+                }
+                for (index, (key, item)) in object.iter().enumerate() {
+                    if index > 0 {
+                        size = add(size, 1, limit)?;
+                    }
+                    size = add(size, string_size(key, limit - size)?, limit)?;
+                    size = add(size, 1, limit)?;
+                    size = add(size, visit(item, depth + 1, limit - size)?, limit)?;
+                }
+                Some(size)
+            }
+        }
+    }
+
+    visit(value, depth, limit)
+}
+
+/// Measure an array field in a top-level canonical record without cloning it.
+pub(crate) fn bounded_canonical_array_size(values: &[Value], limit: usize) -> Option<usize> {
+    let mut size = 2usize;
+    if size > limit {
+        return None;
+    }
+    if values.len() > MAX_CONTAINER_ENTRIES {
+        return None;
+    }
+    for (index, value) in values.iter().enumerate() {
+        if index > 0 {
+            size = size.checked_add(1)?;
+            if size > limit {
+                return None;
+            }
+        }
+        // The top-level record object is depth zero here; the array field is
+        // depth one, and each item starts at depth two.
+        let item_size = bounded_canonical_size_at_depth(value, 2, limit - size)?;
+        size = size.checked_add(item_size)?;
+        if size > limit {
+            return None;
+        }
+    }
+    Some(size)
+}
+
 fn write_string(s: &str, out: &mut Vec<u8>) {
     out.push(b'"');
     for ch in s.chars() {

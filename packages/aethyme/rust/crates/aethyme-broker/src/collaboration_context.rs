@@ -725,7 +725,10 @@ pub fn attach_brief(
 /// Drop a contribution from the derived index, and every cached answer that
 /// carries its data: a released or re-briefed contribution's content must not
 /// outlive it in the cache, even though no key would reach those answers.
-fn forget(connection: &rusqlite::Connection, contribution: &str) -> rusqlite::Result<()> {
+pub(crate) fn forget(
+    connection: &rusqlite::Connection,
+    contribution: &str,
+) -> rusqlite::Result<()> {
     for sql in [
         "DELETE FROM context_postings WHERE lineage_record_id = ?1",
         "DELETE FROM context_indexed WHERE lineage_record_id = ?1",
@@ -3922,6 +3925,10 @@ mod tests {
         fixture.contribute(&[("Cargo.toml", "[workspace]\n")]);
         fresh(&mut fixture, &["src/search.rs"], &reader);
         // As a schema 5 binary would have left it.
+        crate::collaboration_state::drop_identity_revision_schema_for_legacy_fixture(
+            fixture.store.connection(),
+        )
+        .unwrap();
         crate::collaboration_sensitive::drop_sensitive_response_tables_for_legacy_fixture(
             fixture.store.connection(),
         )

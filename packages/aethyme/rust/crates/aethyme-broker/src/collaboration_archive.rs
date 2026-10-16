@@ -1298,6 +1298,38 @@ pub(crate) fn retain_snapshot_with(
     )
 }
 
+/// Retain one committed snapshot while the caller holds the shared archive
+/// barrier. Project binding uses this for its explicit enrollment bootstrap;
+/// the lock must cover validation through the transaction that roots the map.
+pub(crate) fn retain_snapshot_for_binding(
+    store: &mut CollaborationStore,
+    repo: &Path,
+    commit: &CommitOid,
+    archive_use: &crate::collaboration_gc::ArchiveUse,
+) -> Result<RetainedSnapshot, ArchiveError> {
+    let path = crate::collaboration_gc::lock_path(store);
+    if !archive_use.covers(store) {
+        return Err(ArchiveError::Io {
+            path,
+            source: std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "archive-use guard belongs to a different collaboration store",
+            ),
+        });
+    }
+    let mut before_blob = |_: usize| Ok(());
+    let mut before_copy_write = |_: &CommitOid, _: u64| {};
+    let mut on_copy_error = |_: &ArchiveError| {};
+    retain_snapshot_inner(
+        store,
+        repo,
+        commit,
+        &mut before_blob,
+        &mut before_copy_write,
+        &mut on_copy_error,
+    )
+}
+
 fn retain_snapshot_inner(
     store: &mut CollaborationStore,
     repo: &Path,
@@ -2980,6 +3012,10 @@ mod tests {
     #[test]
     fn a_version_one_database_is_migrated() {
         let (host, mut store) = store();
+        crate::collaboration_state::drop_identity_revision_schema_for_legacy_fixture(
+            store.connection(),
+        )
+        .unwrap();
         crate::collaboration_sensitive::drop_sensitive_response_tables_for_legacy_fixture(
             store.connection(),
         )
