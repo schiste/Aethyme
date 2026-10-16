@@ -23,7 +23,7 @@ use crate::{
 
 mod tree_removal;
 pub(crate) use tree_removal::{
-    PinnedTreeRemoval, TreeObjectIdentity, TreeRemoval, TreeRemovalError, remove_condemned_tree,
+    PinnedTreeRemoval, TreeObjectIdentity, TreeRemoval, remove_condemned_tree,
     remove_condemned_tree_with_progress,
 };
 
