@@ -105,7 +105,8 @@ fn synthesized_middle_conflict_replays_the_exact_selected_suffix() {
     use crate::{local_target as target, local_wave as wave, resolution};
 
     let mut fixture = crate::local_target::tests::Fixture::new();
-    let repo = fixture._repo.path();
+    let repo_path = fixture._repo.path().to_path_buf();
+    let repo = repo_path.as_path();
     let baseline = fixture.a.base.commit.clone();
     let git = crate::local_target::tests::git;
 
