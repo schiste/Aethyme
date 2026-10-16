@@ -1103,11 +1103,13 @@ impl Broker {
             progress.phase(crate::submit_progress::PHASE_WAITING_FOR_SLOT);
         }
         let main_root = self.main_root_path();
+        let worktree_root_plan = self.worktree_root_plan()?;
         let mut verification_slot =
-            crate::verification::ExactTreeVerificationSlot::acquire_pooled_reporting(
+            crate::verification::ExactTreeVerificationSlot::acquire_pooled_reporting_with_worktree_root_plan(
                 &main_root,
                 "merge-sim",
                 MERGE_VERIFICATION_SLOTS,
+                &worktree_root_plan,
                 crate::gates::heartbeat_interval(),
                 &mut |waited| {
                     if let Some(progress) = progress {

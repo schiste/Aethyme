@@ -8,9 +8,9 @@
         "string"
       ],
       "id": "string",
-      "queue_entry_id": "null",
+      "queue_entry_id": "integer|null",
       "reason": "string",
-      "session_id": "null",
+      "session_id": "integer|null",
       "severity": "string",
       "summary": "string"
     }
