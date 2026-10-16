@@ -568,8 +568,9 @@ fn audit_is_scoped_to_the_named_repository_and_renders_a_summary() {
     .unwrap();
 
     // Run from an unrelated directory, naming the repository explicitly.
-    let output = cli(
-        other.path(),
+    let output = isolation::command(
+        CLI,
+        &repo,
         &[
             "finish",
             "cleanup",
@@ -577,7 +578,10 @@ fn audit_is_scoped_to_the_named_repository_and_renders_a_summary() {
             "--repo",
             repo.to_str().unwrap(),
         ],
-    );
+    )
+    .current_dir(other.path())
+    .output()
+    .unwrap();
     assert!(
         output.status.success(),
         "{}",
