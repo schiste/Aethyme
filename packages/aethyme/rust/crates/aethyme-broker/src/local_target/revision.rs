@@ -532,8 +532,9 @@ mod tests {
         RequestedContribution, acquire_controller, propose_revision, release_revision,
         retain_artifacts, select_revision,
     };
+    use aethyme_contracts::experimental_v0::brief::Brief;
     use aethyme_contracts::experimental_v0::{
-        Brief, BriefReference, EntryKind, ProjectDescriptor, SourceEntry, SourceSnapshot,
+        BriefReference, EntryKind, ProjectDescriptor, SourceEntry, SourceSnapshot,
         SourceSnapshotId, advance_file_identities,
     };
 
@@ -637,7 +638,8 @@ mod tests {
         .unwrap();
         let recipe_object = archive::put_object(&fixture.store, &recipe_bytes).unwrap();
 
-        let first = propose_revision(&mut fixture.store, &owner, fixture.spec()).unwrap();
+        let spec = fixture.spec();
+        let first = propose_revision(&mut fixture.store, &owner, spec).unwrap();
         retain_artifacts(
             &mut fixture.store,
             &owner,

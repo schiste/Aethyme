@@ -13,8 +13,7 @@ use crate::local_exchange::{
 };
 use aethyme_contracts::experimental_v0::brief::Brief;
 use aethyme_contracts::experimental_v0::{
-    BriefReference, ContributionId, ContributionRevision, Record, RecordId, SourceSnapshot,
-    advance_file_identities,
+    BriefReference, ContributionId, ContributionRevision, Record, RecordId, advance_file_identities,
 };
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -137,7 +136,7 @@ impl TrustedPeer for RevisionSnapshotPeer {
         Ok(SnapshotPage {
             snapshot: SnapshotDescriptor {
                 stream,
-                identity,
+                identity: identity.to_string(),
                 item_count: 1,
                 watermark: 1,
             },
@@ -154,12 +153,9 @@ fn received_unindexed_revision_keeps_its_source_and_transitive_proof_after_captu
     let parent_result = receiver
         .commit_file("src/parent.rs", b"pub fn parent() {}\n")
         .unwrap();
+    let bootstrap_commit = receiver.bootstrap_commit.clone();
     let parent_capture = receiver
-        .capture_operation(
-            "parent-revision",
-            &receiver.bootstrap_commit,
-            &parent_result,
-        )
+        .capture_operation("parent-revision", &bootstrap_commit, &parent_result)
         .unwrap();
     let parent_operation = OperationId::parse("parent-revision").unwrap();
     let parent_brief = Brief {
