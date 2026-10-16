@@ -37,7 +37,7 @@ use serde::Serialize;
 pub use crate::host_state::HostStateSource;
 
 /// The schema this binary writes.
-pub const COLLABORATION_STATE_SCHEMA_VERSION: i64 = 28;
+pub const COLLABORATION_STATE_SCHEMA_VERSION: i64 = 29;
 /// The oldest schema a database written by this binary can be read by.
 /// Unlike `host-operations.db`, a newer database stays readable by an older
 /// binary until a release raises this floor.
@@ -74,7 +74,10 @@ pub const COLLABORATION_STATE_SCHEMA_VERSION: i64 = 28;
 // request identity. Schema 26 writers do not preserve that state or its roots.
 // Schema 28 adds an immutable optional resolution-result link; schema 27
 // writers can advance a linked wave without preserving that provenance.
-const MIN_COMPATIBLE_SCHEMA: i64 = 28;
+// Schema 29 adds immutable Local resolution reservation proofs and their
+// one-to-one shared-attempt bindings. Older writers cannot preserve managed
+// resolution authority or its idempotency roots.
+const MIN_COMPATIBLE_SCHEMA: i64 = 29;
 const ROOT_DIRECTORY: &str = "collaboration";
 /// Schema steps after the version 1 layout (`meta` only), applied in
 /// order. Step 17 adds separately indexed historical imports and rehearsals. The floor is
@@ -958,10 +961,129 @@ const MIGRATIONS: &[(i64, &str)] = &[
          WHEN OLD.roots_released_ms IS NOT NULL AND NEW.state<>OLD.state
          BEGIN SELECT RAISE(ABORT, 'native gate roots were released'); END;"#,
     ),
+    (
+        29,
+        r#"CREATE TABLE local_resolution_reservation_proofs (
+             reservation TEXT PRIMARY KEY NOT NULL
+                 REFERENCES local_budget_reservations(reservation),
+             target TEXT NOT NULL,
+             issuer TEXT NOT NULL,
+             authority_epoch TEXT NOT NULL,
+             client_key TEXT NOT NULL CHECK(length(client_key) BETWEEN 1 AND 256),
+             wave TEXT NOT NULL REFERENCES local_waves(wave),
+             request_record_id TEXT NOT NULL,
+             request_object_sha256 TEXT NOT NULL CHECK(length(request_object_sha256)=64),
+             input_manifest_sha256 TEXT NOT NULL CHECK(length(input_manifest_sha256)=64),
+             trigger_sha256 TEXT NOT NULL CHECK(length(trigger_sha256)=64),
+             project_policy TEXT NOT NULL,
+             objective_policy TEXT NOT NULL,
+             price_profile TEXT NOT NULL,
+             reserved_envelope BLOB NOT NULL CHECK(length(reserved_envelope) BETWEEN 1 AND 4096),
+             deadline_ms INTEGER NOT NULL CHECK(deadline_ms >= 0),
+             created_ms INTEGER NOT NULL CHECK(created_ms >= 0),
+             UNIQUE(target,issuer,client_key)
+         ) STRICT;
+         CREATE TABLE local_resolution_reservation_roots (
+             reservation TEXT NOT NULL
+                 REFERENCES local_resolution_reservation_proofs(reservation),
+             lineage_record_id TEXT NOT NULL,
+             PRIMARY KEY(reservation,lineage_record_id)
+         ) STRICT;
+         CREATE TABLE local_managed_resolution_attempt_bindings (
+             binding_id TEXT PRIMARY KEY NOT NULL,
+             reservation TEXT NOT NULL UNIQUE
+                 REFERENCES local_resolution_reservation_proofs(reservation),
+             attempt_id INTEGER NOT NULL UNIQUE
+                 REFERENCES resolution_attempts(attempt_id),
+             authority_epoch TEXT NOT NULL,
+             reservation_version INTEGER NOT NULL CHECK(reservation_version >= 1),
+             attempt_number INTEGER NOT NULL CHECK(attempt_number >= 1),
+             route TEXT NOT NULL
+                 CHECK(route='local_managed_resolution_v1'),
+             created_ms INTEGER NOT NULL CHECK(created_ms >= 0)
+         ) STRICT;
+         CREATE TRIGGER local_resolution_reservation_proof_scope
+         BEFORE INSERT ON local_resolution_reservation_proofs
+         WHEN NOT EXISTS (
+             SELECT 1
+             FROM local_budget_reservations r
+             JOIN local_targets t ON t.target=r.target
+             WHERE r.reservation=NEW.reservation AND r.target=NEW.target
+               AND r.wave=NEW.wave AND r.parent IS NULL
+               AND t.issuer=NEW.issuer
+         )
+         BEGIN
+             SELECT RAISE(ABORT, 'managed resolution proof must match a root reservation');
+         END;
+         CREATE TRIGGER local_resolution_reservation_proof_immutable
+         BEFORE UPDATE ON local_resolution_reservation_proofs
+         BEGIN
+             SELECT RAISE(ABORT, 'managed resolution reservation proof is immutable');
+         END;
+         CREATE TRIGGER local_resolution_reservation_proof_no_delete
+         BEFORE DELETE ON local_resolution_reservation_proofs
+         BEGIN
+             SELECT RAISE(ABORT, 'managed resolution reservation proof is permanent');
+         END;
+         CREATE TRIGGER local_resolution_reservation_root_immutable
+         BEFORE UPDATE ON local_resolution_reservation_roots
+         BEGIN
+             SELECT RAISE(ABORT, 'managed resolution reservation roots are immutable');
+         END;
+         CREATE TRIGGER local_resolution_reservation_root_no_delete
+         BEFORE DELETE ON local_resolution_reservation_roots
+         BEGIN
+             SELECT RAISE(ABORT, 'managed resolution reservation roots are permanent');
+         END;
+         CREATE TRIGGER local_resolution_reservation_root_before_binding
+         BEFORE INSERT ON local_resolution_reservation_roots
+         WHEN EXISTS (
+             SELECT 1 FROM local_managed_resolution_attempt_bindings b
+             WHERE b.reservation=NEW.reservation
+         )
+         BEGIN
+             SELECT RAISE(ABORT, 'managed resolution roots are closed by attempt binding');
+         END;
+         CREATE TRIGGER local_managed_resolution_binding_matches_attempt
+         BEFORE INSERT ON local_managed_resolution_attempt_bindings
+         WHEN NOT EXISTS (
+             SELECT 1
+             FROM local_resolution_reservation_proofs p
+             JOIN local_budget_reservations r ON r.reservation=p.reservation
+             JOIN resolution_attempts a ON a.attempt_id=NEW.attempt_id
+             WHERE p.reservation=NEW.reservation
+               AND p.authority_epoch=NEW.authority_epoch
+               AND r.phase='completion_pending'
+               AND r.version=NEW.reservation_version
+               AND EXISTS (
+                   SELECT 1 FROM local_resolution_reservation_roots rr
+                   WHERE rr.reservation=p.reservation
+               )
+               AND a.request_record_id=p.request_record_id
+               AND a.request_sha256=p.request_object_sha256
+               AND a.input_manifest_sha256=p.input_manifest_sha256
+               AND a.client_key=p.client_key
+               AND a.attempt_number=NEW.attempt_number
+         )
+         BEGIN
+             SELECT RAISE(ABORT, 'managed resolution binding does not match its charged attempt');
+         END;
+         CREATE TRIGGER local_managed_resolution_binding_immutable
+         BEFORE UPDATE ON local_managed_resolution_attempt_bindings
+         BEGIN
+             SELECT RAISE(ABORT, 'managed resolution attempt binding is immutable');
+         END;
+         CREATE TRIGGER local_managed_resolution_binding_no_delete
+         BEFORE DELETE ON local_managed_resolution_attempt_bindings
+         BEGIN
+             SELECT RAISE(ABORT, 'managed resolution attempt binding is permanent');
+         END;"#,
+    ),
 ];
 /// Reconstruct the exact pre-schema-26 shape in historical migration fixtures
 /// while preserving all schema-25 rows. Fixtures start from a current store,
-/// so also remove schema-28 and schema-27 additions before lowering their version marker;
+/// so also remove schema-29, schema-28 and schema-27 additions before
+/// lowering their version marker;
 /// otherwise they model an impossible hybrid database and make the migration
 /// add columns that the fixture already has. This is test setup only:
 /// production migrations continue to reject malformed databases instead of
@@ -1018,6 +1140,7 @@ pub(crate) fn drop_identity_revision_schema_for_legacy_fixture(
 fn drop_resolution_schema_28_for_legacy_fixture(
     connection: &rusqlite::Connection,
 ) -> rusqlite::Result<()> {
+    drop_resolution_schema_29_for_legacy_fixture(connection)?;
     if !fixture_table_exists(connection, "local_waves")? {
         return Ok(());
     }
@@ -1058,8 +1181,45 @@ fn drop_resolution_schema_28_for_legacy_fixture(
     Ok(())
 }
 
-/// Remove schema-28 and schema-27 additions from a current test store before a fixture
-/// lowers `schema_version` to exercise an older migration. Keep the original
+/// Remove only schema-29 managed-resolution authority from an empty current
+/// test store before it becomes a historical fixture. Never hide or discard a
+/// reservation proof, a selected root, or an attempt binding.
+#[cfg(test)]
+fn drop_resolution_schema_29_for_legacy_fixture(
+    connection: &rusqlite::Connection,
+) -> rusqlite::Result<()> {
+    if !fixture_table_exists(connection, "local_resolution_reservation_proofs")? {
+        return Ok(());
+    }
+    let has_authority: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM local_resolution_reservation_proofs)
+             OR EXISTS(SELECT 1 FROM local_resolution_reservation_roots)
+             OR EXISTS(SELECT 1 FROM local_managed_resolution_attempt_bindings)",
+        [],
+        |row| row.get(0),
+    )?;
+    assert!(
+        !has_authority,
+        "cannot downgrade a fixture containing schema-29 managed-resolution authority"
+    );
+    connection.execute_batch(
+        "DROP TRIGGER IF EXISTS local_managed_resolution_binding_no_delete;
+         DROP TRIGGER IF EXISTS local_managed_resolution_binding_immutable;
+         DROP TRIGGER IF EXISTS local_managed_resolution_binding_matches_attempt;
+         DROP TRIGGER IF EXISTS local_resolution_reservation_root_no_delete;
+         DROP TRIGGER IF EXISTS local_resolution_reservation_root_immutable;
+         DROP TRIGGER IF EXISTS local_resolution_reservation_proof_no_delete;
+         DROP TRIGGER IF EXISTS local_resolution_reservation_proof_immutable;
+         DROP TRIGGER IF EXISTS local_resolution_reservation_proof_scope;
+         DROP TABLE IF EXISTS local_managed_resolution_attempt_bindings;
+         DROP TABLE IF EXISTS local_resolution_reservation_roots;
+         DROP TABLE IF EXISTS local_resolution_reservation_proofs;",
+    )?;
+    Ok(())
+}
+
+/// Remove schema-29, schema-28 and schema-27 additions from a current test
+/// store before a fixture lowers `schema_version` to exercise an older migration. Keep the original
 /// resolution-attempt columns and rows: an old database has those, while it
 /// cannot contain the later async-ledger bindings or wave archive references.
 /// Refuse to discard any actual v27 or v28 data so this helper cannot make a test's
@@ -2649,11 +2809,11 @@ mod tests {
         let versions: Vec<i64> = MIGRATIONS.iter().map(|(version, _)| *version).collect();
         let expected: Vec<i64> = (2..=COLLABORATION_STATE_SCHEMA_VERSION).collect();
         assert_eq!(versions, expected);
-        assert_eq!(MIN_COMPATIBLE_SCHEMA, 28);
+        assert_eq!(MIN_COMPATIBLE_SCHEMA, 29);
         const { assert!(MIN_COMPATIBLE_SCHEMA <= COLLABORATION_STATE_SCHEMA_VERSION) };
         // Earlier writers cannot preserve immutable revision heads, durable
         // asynchronous attempts or the archive roots those attempts name.
-        const { assert!(MIN_COMPATIBLE_SCHEMA >= 28) };
+        const { assert!(MIN_COMPATIBLE_SCHEMA >= 29) };
     }
 
     #[test]
