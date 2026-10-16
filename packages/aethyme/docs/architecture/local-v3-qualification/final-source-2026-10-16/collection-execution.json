@@ -1,0 +1,10 @@
+{
+  "argv": [
+    "/usr/bin/python3",
+    "-E",
+    "/private/tmp/package-final-local-source-evidence-proposal-v4.py"
+  ],
+  "exit": 0,
+  "stdout": "{\"output\": \"/private/tmp/aethyme-final-source-evidence-piw6wyxv\", \"members\": 264, \"archive_sha256\": \"f90003f59791c5c9c7062031c9f72e24453161fe91acdc3163539866fefc3916\", \"archive_bytes\": 587461}\n",
+  "stderr": ""
+}

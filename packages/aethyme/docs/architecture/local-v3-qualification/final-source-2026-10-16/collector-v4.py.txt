@@ -1,0 +1,150 @@
+#!/usr/bin/python3
+"""Copy retained Local qualification bytes into a deterministic TMP archive.
+
+Proposal: run only after independent review and workspace runtime completion.
+This records evidence, and neither runs checks nor grants qualification credit.
+"""
+import gzip
+import hashlib
+import io
+import json
+import os
+from pathlib import Path
+import stat
+import subprocess
+import tarfile
+import tempfile
+import sys
+
+def require(condition, message):
+    if not condition:
+        raise RuntimeError(message)
+
+require(sys.flags.optimize == 0, "optimized Python mode is forbidden")
+
+ROOT = Path('/Volumes/T7-repositories/Application Support/Aethyme/worktrees/aethyme-6f13a03e16f294c6/complete-final-combined-local-qualificat')
+HEAD = '2f2d2c1f27eaddded1875316de59c0935591804c'
+TREE = '86124ec0cdb795b1b3d546d51d443566a9538fdf'
+BATCH = ROOT / 'target/local-resume/final-workspace-batches/20261016T055753Z-2f2d2c1f27ea'
+GROUPS = {
+    'source-build': (Path('/private/tmp/aethyme-final-cli-build-2f2d2c1f27ea-1g0nc2ez'), 16),
+    'source-rebuild-after-workspace': (Path('/private/tmp/aethyme-final-cli-build-2f2d2c1f27ea-zeekb580'), 16),
+    'floor-attempt-001-failed': (Path('/private/tmp/aethyme-schema26-old23-2x5rh_39/evidence'), 98),
+    'floor-attempt-002-pass': (Path('/private/tmp/aethyme-schema26-old23-4gc8yjqx/evidence'), 110),
+    'workspace-attempt-001': (BATCH, None),
+}
+PINNED = {
+    'source-rebuild-after-workspace/cli-build-receipt-v1.json': '38f1eadad11e13688a2e0652b58d09610a1c0e955e727adaa4b2e25216430aaa',
+    'source-rebuild-after-workspace/engine-binary-manifest-v1.json': '8da32352f9568dce7dbfc3d57e16abb591197cc4a1eed103ab040a254e4e0e03',
+    'workspace-attempt-001/batch.json': '1c31536ad8b076002eb74e06550f4d75560c54b8a4a39ed3143ca0d1f87d7a3d',
+    'source-build/cli-build-receipt-v1.json': 'c147a6e4dba393e0726e8901bfa2b0f12b6e37acfc7e4cdf72a6187eb9ca8b7e',
+    'source-build/engine-binary-manifest-v1.json': 'b69cd262b18d2d2ac16324d7f9f85c0d4c88bf34ffbb60e861ea7f7435742887',
+    'floor-attempt-001-failed/final-manifest.json': '4e4bdd0607d17328b70b88a1cf87abb20f7aba8986577c7d1ff1309612ea3c95',
+    'floor-attempt-002-pass/final-manifest.json': '74f829fd6961d76b11c83af5728ffb0d68289a0034084022f92e0e0c9983dc9d',
+}
+EXTRA = {
+    'drivers/build.py': ('/private/tmp/final-cli-build-receipt-proposal.tts1RY/produce-final-cli-build-receipt.py', '7f9f8573714b8bb235c859a55119bcf237e8e189ca556fcdf005e0fc7153fd27'),
+    'drivers/floor-v2.py': ('/private/tmp/aethyme-schema26-old23-review.Ueu0b1/prepare-and-run-schema26-old23-v2.py', 'c637d951f51a98ce489e7d0bcb48318581b4e93073d0999049c194545dd1ab66'),
+    'drivers/floor-v3.py': ('/private/tmp/aethyme-schema26-old23-v3-proposal-h14hbrw1/prepare-and-run-schema26-old23-v3.py', 'abdbd9146d63f08bf573fcc2f8a15a884ddd35fe1277ae57f34d4bae4cd4203e'),
+    'drivers/workspace.py': (str(ROOT / 'target/local-resume/run-final-workspace-checks-v3.py'), '6b0c4332fddceabe89dc0dcb4cae947fe6f972be847fcd5ec82de1fd4feb815b'),
+    'drivers/recorder.py': (str(ROOT / 'target/local-resume/record-final-local-check-v2.py'), '29d2319c55cea24d6a1c76d7038b4bfd96cc105ae17e7ef4c00ef927d19286bc'),
+    'drivers/workspace-plan.json': (str(ROOT / 'target/local-resume/final-local-validation-plan-v5.json'), '33ada2e727deb1b8a0cf7bcd6dc5e9bfed428e171aeaa6a445fcc989ca0f3705'),
+    'ci/final-oss.log': ('/private/tmp/local-ci-38857121712-success.log', 'fc68c890586d5b8aab09d92b3944a60a9e2d59d3dc5d4aeefac71b6e7dd53c6b'),
+}
+
+def sha(data):
+    return hashlib.sha256(data).hexdigest()
+
+def clean_source():
+    def git(*args):
+        return subprocess.check_output(['/opt/homebrew/bin/git', *args], cwd=ROOT).decode().strip()
+    require(git('rev-parse', 'HEAD') == HEAD, "validation failed: git('rev-parse', 'HEAD') == HEAD")
+    require(git('rev-parse', 'HEAD^{tree}') == TREE, "validation failed: git('rev-parse', 'HEAD^{tree}') == TREE")
+    require(git('status', '--porcelain=v1', '--untracked-files=all') == '', "validation failed: git('status', '--porcelain=v1', '--untracked-files=all') == ''")
+
+def read_regular(path):
+    before = path.lstat()
+    require(stat.S_ISREG(before.st_mode) and (not path.is_symlink()), path)
+    require(before.st_size <= 32 * 1024 * 1024, path)
+    data = path.read_bytes()
+    after = path.lstat()
+    require((before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) == (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns), path)
+    require(len(data) == before.st_size, 'validation failed: len(data) == before.st_size')
+    return data
+
+clean_source()
+batch = json.loads(read_regular(BATCH / 'batch.json'))
+require(batch['source_head'] == HEAD and len(batch['results']) == 5, 'workspace attempt not completed')
+expected_labels = ['workspace-full', 'workspace-fmt', 'workspace-clippy', 'workspace-examples', 'workspace-doc']
+require([row['label'] for row in batch['checks']] == expected_labels, 'check labels differ')
+require([row['label'] for row in batch['results']] == expected_labels, 'result labels differ')
+metadata_paths = {Path(row['metadata']) for row in batch['results']}
+require(len(metadata_paths) == 5 and metadata_paths == set(BATCH.glob('runs/*/command.json')), 'workspace command manifest set differs')
+for check, result in zip(batch['checks'], batch['results']):
+    metadata = Path(result['metadata'])
+    require(metadata.parent.parent == BATCH / 'runs' and metadata.name == 'command.json', 'metadata outside exact batch')
+    item = json.loads(read_regular(metadata))
+    require(item['state'] == 'completed' and type(item['numeric_exit']) is int and item['numeric_exit'] == 0 and item['launcher_error'] is None, 'workspace command not passing')
+    require(item['label'] == check['label'] + '-' + HEAD[:12] and item['argv'] == check['argv'], 'workspace label/argv mismatch')
+    require(item['working_directory'] == str(ROOT / check['cwd']), 'workspace cwd mismatch')
+    require(result['recorder_returncode'] == 0 and result['source_unchanged_and_clean'] is True and item['source_unchanged'] is True, 'workspace source changed')
+    for key in ('source_before', 'source_after'):
+        require(item[key]['head'] == HEAD and item[key]['tree'] == TREE and item[key]['status'] == '', 'workspace source identity mismatch')
+    for kind in ('log', 'status'):
+        record_path = Path(item[kind + '_path'])
+        require(record_path == metadata.with_suffix('.' + kind), 'workspace record path mismatch')
+        data = read_regular(record_path)
+        require(len(data) == item[kind + '_bytes'] and sha(data) == item[kind + '_sha256'], 'workspace record bytes differ')
+        if kind == 'status':
+            require(data == b'0\n', 'workspace status is not zero')
+payloads = {}
+loaded_bytes = 0
+
+def add_payload(name, path):
+    global loaded_bytes
+    require(name not in payloads, 'duplicate archive member: ' + name)
+    size = path.lstat().st_size
+    require(loaded_bytes + size <= 64 * 1024 * 1024, 'aggregate payload limit exceeded')
+    data = read_regular(path)
+    require(loaded_bytes + len(data) <= 64 * 1024 * 1024, 'aggregate payload limit exceeded')
+    loaded_bytes += len(data)
+    payloads[name] = data
+for label, (base, expected_count) in GROUPS.items():
+    require(base.is_dir() and (not base.is_symlink()), 'validation failed: base.is_dir() and (not base.is_symlink())')
+    rows = []
+    for path in sorted(base.rglob('*')):
+        st = path.lstat()
+        require(not path.is_symlink(), path)
+        if stat.S_ISDIR(st.st_mode):
+            continue
+        rel = path.relative_to(base)
+        require(all((part not in ('', '.', '..') for part in rel.parts)), "validation failed: all((part not in ('', '.', '..') for part in rel.parts))")
+        name = label + '/' + rel.as_posix()
+        require(name not in payloads, 'validation failed: name not in payloads')
+        add_payload(name, path)
+        rows.append(name)
+    require(expected_count is None or len(rows) == expected_count, (label, len(rows)))
+for name, (path, expected) in EXTRA.items():
+    require(name not in payloads, 'validation failed: name not in payloads')
+    add_payload(name, Path(path))
+    require(sha(payloads[name]) == expected, name)
+for name, expected in PINNED.items():
+    require(sha(payloads[name]) == expected, name)
+require(sum(map(len, payloads.values())) <= 64 * 1024 * 1024, 'validation failed: sum(map(len, payloads.values())) <= 64 * 1024 * 1024')
+clean_source()
+out = Path(tempfile.mkdtemp(prefix='aethyme-final-source-evidence-', dir='/private/tmp'))
+archive = out / 'source-qualification-attempts.tar.gz'
+with archive.open('xb') as raw:
+    with gzip.GzipFile(filename='', mode='wb', fileobj=raw, mtime=0) as zipped:
+        with tarfile.open(fileobj=zipped, mode='w|', format=tarfile.USTAR_FORMAT) as bundle:
+            for name, data in sorted(payloads.items()):
+                member = tarfile.TarInfo(name)
+                member.size = len(data)
+                member.mode = 0o600
+                member.mtime = 0
+                bundle.addfile(member, io.BytesIO(data))
+    raw.flush()
+    os.fsync(raw.fileno())
+index = {'schema': 'aethyme.local-final-source-evidence-index/v1', 'source_commit': HEAD, 'source_tree': TREE, 'qualification_credit': 'none from packaging; outcomes retain their original source-bound manifests', 'collection_scope': 'Per-member byte collection with pinned top-level receipts; workspace command linkage is checked. Build and floor internal manifest-to-payload consistency requires separate independent review before publication.', 'archive': archive.name, 'archive_sha256': sha(archive.read_bytes()), 'members': [{'path': name, 'bytes': len(data), 'sha256': sha(data)} for name, data in sorted(payloads.items())]}
+(out / 'archive-index.json').write_text(json.dumps(index, indent=2) + '\n')
+print(json.dumps({'output': str(out), 'members': len(payloads), 'archive_sha256': index['archive_sha256'], 'archive_bytes': archive.stat().st_size}))

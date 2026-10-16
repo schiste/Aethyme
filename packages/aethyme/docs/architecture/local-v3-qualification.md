@@ -29,16 +29,19 @@ lock witnesses; five deliberate guard breaks failed as intended. The clean-sourc
 workspace check at `1d0ce264` passed all 4,569 executed tests, with 38 skipped;
 formatting, strict workspace Clippy, examples and documentation commands also
 passed. The bounded Local sensitive-content response profile passed its
-source-bound checks. The current CLI source profile also passed its bounded checks; fresh independent operator qualification remains open. These finite observations do not establish reliable autonomous operation. All results
-below name their source and profile; earlier operator profiles retain their
-original limits.
+source-bound checks. The current CLI source profile passed its recorded finite
+selection. The [final-source check summary](local-v3-qualification/final-source-2026-10-16/README.md)
+records separate final-head workspace, CI and schema-floor checks; the public
+T64 rehearsal remains open. These finite observations do not establish reliable
+autonomous operation. All results below name their source and profile; earlier
+operator profiles retain their original limits.
 
 ## Evidence inventory
 
 | Local surface | Implementations | Evidence and remaining qualification |
 |---|---|---|
 | Baseline reuse, cleanup, trust and analysis audit | #704 | [L0 audit and completion checklist](local-v3-l0/README.md), including the [D37 analysis inventory](local-v3-l0/d-analysis-inventory-d37.md); observations remain bound to the audited source |
-| Revision identities, records, briefs and analysis envelope | #704–#710/#786; #787/#788 in progress | Independent canonical vectors and baseline AQ0 fixtures; [scoped symbol qualification](local-v3-qualification/aq0-symbol-identity-2026-10-16/README.md) passed its bounded profile; explicit project/file binding and cross-language qualification remain open; records remain experimental |
+| Revision identities, records, briefs and analysis envelope | #704–#710/#786; #787–#791 | [Exact-identity evidence](local-v3-qualification/exact-identity-2026-10-16/README.md) inventories 106 attempts and 409 files, with 20 named guard controls; bounded project/file binding, immutable D10 consumers, context handling and identity-GC checks passed at their recorded source checkpoints. [Schema-26 TypeScript parity](../../../aethyme-eval/docs/t01-t02-typescript-parity/ledger/runtime-qualification-2026-10-16/README.md) retains 35 pins and finite offline T01/T02/D10 results. These are separate checkpoint claims, not final combined-source or production TypeScript consumer qualification; records remain experimental |
 | Retained source, capture, roots and GC | #714–#719 | Capture/crash/cleanup schedules; bounded native workload and APFS retained-source pressure below; host/daemon and mid-journal exhaustion remain unqualified |
 | Bounded context and fresh analysis views | #718/#730/#731/#756/#781 | Scoped invalidation schedules, [reviewed lifecycle fixes](local-v3-qualification/analysis-view-lifecycle-2026-10-15/README.md), and [once-final FX08 campaign](local-v3-fx08-qualification.md): all 56 outcomes retained; reliable brief usefulness was not established |
 | Composition and bounded resolution | #733–#736/#755 | Historical provisional text profile plus [bounded external HTML structural profile](local-v3-e1-profile.md); semantic repair/consumer/subtraction evidence; original held-outs are not rerun; [reachable request guards](local-v3-qualification/resolution-guards-2026-10-12.json) |
@@ -50,7 +53,7 @@ original limits.
 | Disable, old binary, offline and paired CLI behavior | #751 | [Native compatibility ledger](local-v3-qualification/compatibility-native-2026-10-12.json); one pinned old binary and a declared finite paired-command set |
 | Administrative sensitive-content response | #785 | [Bounded T56 evidence](local-v3-qualification/sensitive-response-2026-10-15/README.md): 28 tests, eight intended guard failures and pinned old-binary controls at the recorded source; unmanaged copies remain outside the claim |
 | Explicit lifecycle commands | #732 and #753 | [CLI qualification ledger](https://github.com/schiste/Aethyme/blob/97fd3ecaee36b110fda842eb93ba5d3aba0118cd/packages/aethyme/docs/architecture/local-v3-qualification/cli-restored-2026-10-12.json): 527 overlapping passing executions, 13 ignores, seven named guard failures and two strict Clippy checks; finite explicit commands only |
-| Current CLI source qualification | #784 | [Source-bound CLI ledger](local-v3-qualification/t64-cli-bootstrap-2026-10-15/ledger.json): 101 passing executions, two ignores, eight guard controls and schema-25 compatibility at source `3af335ab`; fresh T64 operator remains unrun |
+| Current CLI source qualification | #784 | [Source-bound CLI ledger](local-v3-qualification/t64-cli-bootstrap-2026-10-15/ledger.json): 101 passing executions, two ignores, eight guard controls and schema-25 compatibility at source `3af335ab`. [Final-source checks](local-v3-qualification/final-source-2026-10-16/README.md) record source `2f2d2c1f27eaddded1875316de59c0935591804c`, 4,718 workspace tests passed with 38 skipped, formatting/strict Clippy/examples/docs passed, OSS CI 4,715 passed with 32 skipped, Windows CI passed, and the schema-26 state refused the old schema-23 CLI without changing state bytes. The T64 public/native rehearsal remains open. |
 
 Each artifact names its tested source. A later parent fix does not turn
 historical evidence into evidence for a newer tree. Selected regression
@@ -91,13 +94,16 @@ exact parser refusals. All 35 source/fixture pins and exact restores were checke
 The first attempt remains an unqualified baseline failure; this is finite offline
 contract parity, with no production TypeScript consumer claim.
 
-Required L1 integration remains open: T03 explicit descriptor binding, T05 file
-provenance, D10 immutable contribution revisions for rationale-only changes and
-their added cross-language vectors. Draft #788 adds experimental contracts and
-local adapters; its 44 contract tests and strict scoped Clippy check pass, while
-the actual store, CLI and downstream consumer integration remain unqualified.
-These additions must complete independent review and their applicable local
-checks before final combined-source qualification. Frozen fixtures are unchanged.
+Project/file binding, immutable D10 consumers (including rationale-only
+revisions), context handling and identity GC are implemented and have separate
+bounded passing checks. The [exact-identity evidence](local-v3-qualification/exact-identity-2026-10-16/README.md)
+inventories 106 attempts and 409 files, including 20 intended guard controls;
+failed and uncredited attempts remain distinct. The [schema-26 TypeScript parity
+package](../../../aethyme-eval/docs/t01-t02-typescript-parity/ledger/runtime-qualification-2026-10-16/README.md)
+records offline parity over 35 source/fixture pins, including 224 D10 assertions,
+restored positives and six mutation controls. These source-specific checks do
+not establish whole-plan qualification or a production TypeScript consumer.
+Frozen fixtures remain unchanged, and contribution records remain experimental.
 
 ## Completed E1, FX08 and native integration
 
