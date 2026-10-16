@@ -3,12 +3,30 @@
 use aethyme_contracts::experimental_v0::{
     BriefReference, ContributionId, ContributionRevision, EntryKind, FileId, ProjectDescriptor,
     ProjectId, RecordId, SourceEntry, SourceSnapshot, advance_file_identities,
-    canonical_json::{Object, Value},
-    contribution_revision::{ContributionRevisionError, MAX_CONTRIBUTION_REVISION_BYTES},
+    canonical_json::{MAX_STRING_BYTES, Object, Value},
+    contribution_revision::{
+        ContributionRevisionError, MAX_CONTRIBUTION_REVISION_BYTES, MAX_REVISION_CHANGES,
+    },
 };
 
 fn project() -> ProjectId {
     ProjectId::parse("proj:aaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap()
+}
+
+fn empty_revision_with_brief(
+    brief: Option<BriefReference>,
+) -> Result<ContributionRevision, ContributionRevisionError> {
+    let snapshot = SourceSnapshot::new(std::iter::empty::<SourceEntry>()).unwrap();
+    ContributionRevision::new(
+        project(),
+        ContributionId::parse(&format!("contrib:{}e", "b".repeat(25))).unwrap(),
+        RecordId::parse(&format!("sha256:{}", "1".repeat(64))).unwrap(),
+        snapshot.id(),
+        snapshot.id(),
+        Vec::new(),
+        brief,
+        Vec::new(),
+    )
 }
 
 fn lower_hex(bytes: &[u8]) -> String {
@@ -166,5 +184,53 @@ fn constructor_rejects_a_revision_larger_than_the_canonical_record_limit() {
         result,
         Err(ContributionRevisionError::TooLarge(bytes))
             if bytes > MAX_CONTRIBUTION_REVISION_BYTES
+    ));
+}
+
+#[test]
+fn constructor_preflights_aggregate_values_before_semantic_cloning() {
+    let snapshot = SourceSnapshot::new(std::iter::empty::<SourceEntry>()).unwrap();
+    let contribution = ContributionId::parse(&format!("contrib:{}e", "b".repeat(25))).unwrap();
+    let capture_record_id = RecordId::parse(&format!("sha256:{}", "1".repeat(64))).unwrap();
+    let changes = (0..MAX_REVISION_CHANGES)
+        .map(|_| Value::String("x".repeat(300)))
+        .collect();
+
+    let result = ContributionRevision::new(
+        project(),
+        contribution,
+        capture_record_id,
+        snapshot.id(),
+        snapshot.id(),
+        changes,
+        None,
+        Vec::new(),
+    );
+    assert!(matches!(
+        result,
+        Err(ContributionRevisionError::TooLarge(bytes))
+            if bytes > MAX_CONTRIBUTION_REVISION_BYTES
+    ));
+}
+
+#[test]
+fn constructor_revalidates_public_brief_reference_literals() {
+    let record_id = RecordId::parse(&format!("sha256:{}", "2".repeat(64))).unwrap();
+    let malformed = BriefReference {
+        record_id: record_id.clone(),
+        object_sha256: "x".into(),
+    };
+    assert!(matches!(
+        empty_revision_with_brief(Some(malformed)),
+        Err(ContributionRevisionError::InvalidBriefDigest)
+    ));
+
+    let oversized = BriefReference {
+        record_id,
+        object_sha256: "a".repeat(MAX_STRING_BYTES + 1),
+    };
+    assert!(matches!(
+        empty_revision_with_brief(Some(oversized)),
+        Err(ContributionRevisionError::InvalidBriefDigest)
     ));
 }

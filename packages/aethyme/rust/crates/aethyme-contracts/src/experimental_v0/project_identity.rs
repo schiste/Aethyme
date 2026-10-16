@@ -159,27 +159,62 @@ pub struct ProjectDescriptor {
 impl ProjectDescriptor {
     pub fn from_snapshot(
         project_id: ProjectId,
-        anchor_commit: impl Into<String>,
+        anchor_commit: impl AsRef<str>,
         snapshot: &SourceSnapshot,
     ) -> Result<Self, ProjectIdentityError> {
-        let anchor_commit = anchor_commit.into();
-        validate_commit(&anchor_commit)?;
+        let anchor_commit = anchor_commit.as_ref();
+        validate_commit(anchor_commit)?;
+        let anchor_commit = anchor_commit.to_string();
         if snapshot.entries().len() > MAX_DESCRIPTOR_FILES {
             return Err(ProjectIdentityError::TooManyFiles {
                 count: snapshot.entries().len(),
             });
         }
         let anchor_snapshot = snapshot.id();
-        let files = snapshot
-            .entries()
-            .iter()
-            .map(|entry| EnrolledFile {
+        let empty_descriptor = descriptor_value(
+            &project_id,
+            &anchor_commit,
+            &anchor_snapshot,
+            Value::Array(Vec::new()),
+        );
+        let mut encoded_size =
+            canonical_json::bounded_canonical_size(&empty_descriptor, MAX_DESCRIPTOR_BYTES).ok_or(
+                ProjectIdentityError::DescriptorTooLarge {
+                    bytes: MAX_DESCRIPTOR_BYTES + 1,
+                },
+            )?;
+        let mut files = Vec::with_capacity(snapshot.entries().len());
+        for entry in snapshot.entries() {
+            let file_id = FileId::enrolled(&project_id, &anchor_snapshot, entry.path());
+            // Measure one bounded entry before retaining its path bytes or
+            // constructing the next path-hex Value.
+            let encoded_file =
+                descriptor_file_value(entry.path(), entry.kind(), entry.content_sha256(), &file_id);
+            let file_size =
+                canonical_json::bounded_canonical_size(&encoded_file, MAX_DESCRIPTOR_BYTES).ok_or(
+                    ProjectIdentityError::DescriptorTooLarge {
+                        bytes: MAX_DESCRIPTOR_BYTES + 1,
+                    },
+                )?;
+            let comma_size = if files.is_empty() { 0 } else { 1 };
+            encoded_size = encoded_size
+                .checked_add(file_size)
+                .and_then(|size| size.checked_add(comma_size))
+                .ok_or(ProjectIdentityError::DescriptorTooLarge {
+                    bytes: MAX_DESCRIPTOR_BYTES + 1,
+                })?;
+            if encoded_size > MAX_DESCRIPTOR_BYTES {
+                return Err(ProjectIdentityError::DescriptorTooLarge {
+                    bytes: encoded_size,
+                });
+            }
+            files.push(EnrolledFile {
                 path: entry.path().to_vec(),
                 kind: entry.kind(),
                 content_sha256: *entry.content_sha256(),
-                file_id: FileId::enrolled(&project_id, &anchor_snapshot, entry.path()),
-            })
-            .collect();
+                file_id,
+            });
+        }
         let descriptor = Self {
             project_id,
             anchor_commit,
@@ -263,38 +298,16 @@ impl ProjectDescriptor {
             .files
             .iter()
             .map(|file| {
-                Value::Object(
-                    Object::new(vec![
-                        ("path_hex".into(), text(&HEXLOWER.encode(&file.path))),
-                        ("mode".into(), text(file.kind.git_mode())),
-                        (
-                            "content_sha256".into(),
-                            text(&HEXLOWER.encode(&file.content_sha256)),
-                        ),
-                        ("file_id".into(), text(file.file_id.as_str())),
-                    ])
-                    .expect("distinct file fields"),
-                )
+                descriptor_file_value(&file.path, file.kind, &file.content_sha256, &file.file_id)
             })
             .collect();
-        let fields = vec![
-            ("schema".into(), text(PROJECT_DESCRIPTOR_SCHEMA_NAME)),
-            ("project_id".into(), text(self.project_id.as_str())),
-            ("anchor_commit".into(), text(&self.anchor_commit)),
-            (
-                "anchor_snapshot".into(),
-                text(self.anchor_snapshot.as_str()),
-            ),
-            (
-                "source_binding".into(),
-                text(&format!("git-commit:{}", self.anchor_commit)),
-            ),
-            ("policy_location".into(), text(PROJECT_POLICY_PATH)),
-            ("acceptance_target".into(), text("unbound")),
-            ("visibility_boundary".into(), text("local")),
-            ("files".into(), Value::Array(files)),
-        ];
-        Value::Object(Object::new(fields).expect("distinct descriptor fields")).to_canonical_bytes()
+        descriptor_value(
+            &self.project_id,
+            &self.anchor_commit,
+            &self.anchor_snapshot,
+            Value::Array(files),
+        )
+        .to_canonical_bytes()
     }
 
     pub fn from_record(input: &[u8]) -> Result<(Self, RecordId), ProjectIdentityError> {
@@ -451,6 +464,49 @@ impl ProjectDescriptor {
         }
         Ok(())
     }
+}
+
+fn descriptor_file_value(
+    path: &[u8],
+    kind: EntryKind,
+    content_sha256: &[u8; 32],
+    file_id: &FileId,
+) -> Value {
+    Value::Object(
+        Object::new(vec![
+            ("path_hex".into(), text(&HEXLOWER.encode(path))),
+            ("mode".into(), text(kind.git_mode())),
+            (
+                "content_sha256".into(),
+                text(&HEXLOWER.encode(content_sha256)),
+            ),
+            ("file_id".into(), text(file_id.as_str())),
+        ])
+        .expect("distinct file fields"),
+    )
+}
+
+fn descriptor_value(
+    project_id: &ProjectId,
+    anchor_commit: &str,
+    anchor_snapshot: &SourceSnapshotId,
+    files: Value,
+) -> Value {
+    let fields = vec![
+        ("schema".into(), text(PROJECT_DESCRIPTOR_SCHEMA_NAME)),
+        ("project_id".into(), text(project_id.as_str())),
+        ("anchor_commit".into(), text(anchor_commit)),
+        ("anchor_snapshot".into(), text(anchor_snapshot.as_str())),
+        (
+            "source_binding".into(),
+            text(&format!("git-commit:{anchor_commit}")),
+        ),
+        ("policy_location".into(), text(PROJECT_POLICY_PATH)),
+        ("acceptance_target".into(), text("unbound")),
+        ("visibility_boundary".into(), text("local")),
+        ("files".into(), files),
+    ];
+    Value::Object(Object::new(fields).expect("distinct descriptor fields"))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
