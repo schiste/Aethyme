@@ -1512,9 +1512,15 @@ mod tests {
             .connection()
             .execute(
                 "UPDATE local_budget_reservations
-                 SET observed_overrun='injected between admission and acknowledgement'
-                 WHERE target='target' AND phase='completion_pending'",
-                [],
+                 SET phase='consumption_unknown',attempts=1,version=version+1,
+                     receipt=?1,detail='injected overrun between admission and acknowledgement',
+                     observed_overrun=?2
+                 WHERE target='target' AND nonce=?3 AND phase='reserved'",
+                params![
+                    reference('c'),
+                    serde_json::to_vec(&units(11)).unwrap(),
+                    reference('a')
+                ],
             )
             .unwrap();
         assert_eq!(updated, 1);
@@ -1963,6 +1969,22 @@ mod tests {
     fn acknowledgement_rechecks_overrun_after_admission_commit() {
         let (mut fixture, owner, wave) = conflict_fixture();
         let command = command(&fixture.store, &wave);
+        let now_ms = wall_clock_ms().unwrap();
+        super::super::reserve(
+            &mut fixture.store,
+            &owner,
+            &wave.id,
+            Request {
+                nonce: reference('a'),
+                recipe: command.request.id.as_str().to_owned(),
+                kind: WorkKind::Recovery,
+                units: units(10),
+                max_attempts: 1,
+                deadline_ms: now_ms + 60_000,
+            },
+            now_ms,
+        )
+        .unwrap();
         let before = write_snapshot(&fixture.store, owner.target());
         reset_acknowledgements();
         let _adapter = register_test_adapter(acknowledge);
