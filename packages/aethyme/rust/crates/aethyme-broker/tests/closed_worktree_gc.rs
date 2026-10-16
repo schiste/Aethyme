@@ -12,6 +12,8 @@ use std::process::Command;
 
 use aethyme_broker::{Broker, BrokerOpError, SessionCleanupState};
 
+mod common;
+
 fn git(repo: &Path, args: &[&str]) {
     let output = Command::new("git")
         .args(args)
@@ -45,7 +47,7 @@ impl Fixture {
     }
 
     fn open(&self) -> Broker {
-        Broker::open(&self.path())
+        common::open_fixture_broker(&self.path(), self.0.path())
             .unwrap()
             .with_worktree_root(self.0.path().join("worktrees"))
     }

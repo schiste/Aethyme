@@ -1,8 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-use aethyme_broker::Broker;
-
 const CLI: &str = env!("CARGO_BIN_EXE_broker-cli-shim");
 mod common;
 
@@ -36,13 +34,14 @@ fn run(repo: &Path, state: &Path, args: &[&str]) -> Output {
     common::broker_cli(CLI, args)
         .current_dir(repo)
         .env("AETHYME_HOST_STATE_DIR", state)
+        .env("AETHYME_HOST_CACHE_DIR", state.with_file_name("host-cache"))
         .env_remove("AETHYME_WORKTREE_ROOT")
         .output()
         .unwrap()
 }
 
 fn run_with_root(repo: &Path, root: &Path, args: &[&str]) -> Output {
-    common::broker_cli(CLI, args)
+    common::broker_cli_for_fixture(CLI, args, repo)
         .current_dir(repo)
         .env("AETHYME_WORKTREE_ROOT", root)
         .output()
@@ -208,7 +207,9 @@ fn cleanup_accepts_a_worktree_owned_by_the_external_root_marker() {
     let root = tmp.path().join("owned-worktrees");
     fixture_at(&repo);
 
-    let mut broker = Broker::open(&repo).unwrap().with_worktree_root(&root);
+    let mut broker = common::open_fixture_broker(&repo, &repo)
+        .unwrap()
+        .with_worktree_root(&root);
     let session = broker
         .start_worktree("cleanup external checkout", None)
         .unwrap();

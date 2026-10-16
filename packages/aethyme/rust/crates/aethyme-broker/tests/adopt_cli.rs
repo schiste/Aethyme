@@ -1,8 +1,6 @@
 use std::path::Path;
 use std::process::{Command, Output};
 
-use aethyme_broker::Broker;
-
 const CLI: &str = env!("CARGO_BIN_EXE_broker-cli-shim");
 mod common;
 
@@ -31,7 +29,7 @@ fn git_output(repo: &Path, args: &[&str]) -> String {
 }
 
 fn run(repo: &Path, args: &[&str]) -> Output {
-    common::broker_cli(CLI, args)
+    common::broker_cli_for_fixture(CLI, args, repo)
         .current_dir(repo)
         .output()
         .unwrap()
@@ -170,11 +168,15 @@ fn start_without_a_chau7_tab_skips_mcp_lookup() {
     permissions.set_mode(0o755);
     std::fs::set_permissions(&bridge, permissions).unwrap();
 
-    let output = common::broker_cli(CLI, &["start", "--task", "without a tab", "--json"])
-        .current_dir(tmp.path())
-        .env("AETHYME_CHAU7_MCP_BRIDGE", &bridge)
-        .output()
-        .unwrap();
+    let output = common::broker_cli_for_fixture(
+        CLI,
+        &["start", "--task", "without a tab", "--json"],
+        tmp.path(),
+    )
+    .current_dir(tmp.path())
+    .env("AETHYME_CHAU7_MCP_BRIDGE", &bridge)
+    .output()
+    .unwrap();
     let report: serde_json::Value =
         serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
             panic!(
@@ -230,7 +232,7 @@ fn adopted_reused_session_without_a_chau7_tab_skips_mcp_lookup() {
     permissions.set_mode(0o755);
     std::fs::set_permissions(&bridge, permissions).unwrap();
 
-    let output = common::broker_cli(
+    let output = common::broker_cli_for_fixture(
         CLI,
         &[
             "start",
@@ -240,6 +242,7 @@ fn adopted_reused_session_without_a_chau7_tab_skips_mcp_lookup() {
             "follow-up",
             "--json",
         ],
+        tmp.path(),
     )
     .current_dir(tmp.path())
     .env("AETHYME_CHAU7_MCP_BRIDGE", &bridge)
@@ -278,7 +281,7 @@ fn mcp_timeout_keeps_start_successful_and_is_bounded() {
     std::fs::set_permissions(&bridge, permissions).unwrap();
 
     let started_at = Instant::now();
-    let output = common::broker_cli(
+    let output = common::broker_cli_for_fixture(
         CLI,
         &[
             "start",
@@ -290,6 +293,7 @@ fn mcp_timeout_keeps_start_successful_and_is_bounded() {
             "Named tab",
             "--json",
         ],
+        tmp.path(),
     )
     .current_dir(tmp.path())
     .env("AETHYME_CHAU7_MCP_BRIDGE", &bridge)
@@ -321,22 +325,24 @@ fn mcp_timeout_keeps_start_successful_and_is_bounded() {
 
 /// Run the CLI exactly as given: [`run`] adds a short name to every start.
 fn run_verbatim(repo: &Path, args: &[&str]) -> Output {
-    Command::new(CLI)
+    let mut command = Command::new(CLI);
+    command
         .args(args)
         .current_dir(repo)
-        .env("AETHYME_CHAU7_MCP_BRIDGE", common::disabled_bridge_path())
-        .output()
-        .unwrap()
+        .env("AETHYME_CHAU7_MCP_BRIDGE", common::disabled_bridge_path());
+    common::isolate_host_paths(&mut command, repo);
+    command.output().unwrap()
 }
 
 /// `run_verbatim` without the fixture override: the production default.
 fn run_enforced(repo: &Path, args: &[&str]) -> Output {
-    Command::new(CLI)
+    let mut command = Command::new(CLI);
+    command
         .args(args)
         .current_dir(repo)
-        .env("AETHYME_CHAU7_MCP_BRIDGE", common::disabled_bridge_path())
-        .output()
-        .unwrap()
+        .env("AETHYME_CHAU7_MCP_BRIDGE", common::disabled_bridge_path());
+    common::isolate_host_paths(&mut command, repo);
+    command.output().unwrap()
 }
 
 /// Callers written before short names existed keep working: the session is
@@ -745,7 +751,7 @@ fn start_refuses_a_pull_request_review_before_creating_a_session() {
     assert!(stderr.contains("integration-tip worktree"), "{stderr}");
     assert!(stderr.contains("pull-request review #42"), "{stderr}");
     assert!(
-        Broker::open(tmp.path())
+        common::open_fixture_broker(tmp.path(), tmp.path())
             .unwrap()
             .store()
             .live_sessions()
@@ -965,7 +971,7 @@ fn adopt_warns_about_uncommitted_paths_it_did_not_create() {
 }
 
 fn overlaps(repo: &Path) -> Vec<aethyme_broker::ScopeOverlap> {
-    Broker::open(repo)
+    common::open_fixture_broker(repo, repo)
         .unwrap()
         .scope_overlaps_snapshot()
         .unwrap()
@@ -1110,7 +1116,7 @@ fn a_new_session_on_the_main_checkout_is_refused_however_it_is_spelled() {
         assert_main_checkout_refused(&output);
     }
     assert!(
-        Broker::open(root)
+        common::open_fixture_broker(root, root)
             .unwrap()
             .store()
             .live_sessions()
@@ -1156,7 +1162,8 @@ fn the_main_checkout_needs_an_explicit_override_and_its_session_stays_reusable()
 #[test]
 fn the_main_checkout_environment_variable_is_not_an_operator_override() {
     let tmp = fixture();
-    let output = Command::new(CLI)
+    let mut command = Command::new(CLI);
+    command
         .args([
             "start",
             "--adopt",
@@ -1168,9 +1175,9 @@ fn the_main_checkout_environment_variable_is_not_an_operator_override() {
         ])
         .current_dir(tmp.path())
         .env("AETHYME_CHAU7_MCP_BRIDGE", common::disabled_bridge_path())
-        .env("AETHYME_ALLOW_MAIN_CHECKOUT", "1")
-        .output()
-        .unwrap();
+        .env("AETHYME_ALLOW_MAIN_CHECKOUT", "1");
+    common::isolate_host_paths(&mut command, tmp.path());
+    let output = command.output().unwrap();
     assert_main_checkout_refused(&output);
 }
 

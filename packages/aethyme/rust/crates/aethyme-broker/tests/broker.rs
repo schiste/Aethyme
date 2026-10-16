@@ -5,12 +5,18 @@
 use std::path::Path;
 use std::process::Command;
 
+mod common;
+
 use aethyme_broker::{
     AdoptIntegrationRelation, AdoptIntegrationSyncOutcome, AdoptMode, AdoptOptions, Broker,
     BrokerOpError, CleanupDisposition, CleanupRepresentation, FinishGateCacheSource,
     FinishLeaseState, FinishOptions, FinishStatus, GateStatus, NewGateResult, NewSession,
     SessionOrigin, SessionStatus, VersionDriftStatus, events,
 };
+
+fn open_fixture_broker(path: &Path) -> Result<Broker, BrokerOpError> {
+    common::open_fixture_broker(path, path)
+}
 
 fn sh(cwd: &Path, args: &[&str]) {
     let status = Command::new("git")
@@ -83,7 +89,7 @@ fn adopted_hand_made_worktree_and_spawned_session_are_indistinguishable() {
     // Broker opened from INSIDE the hand-made worktree still resolves to
     // the main checkout's database (attach-first, one shared db).
     let external_root = tempfile::tempdir().unwrap();
-    let mut broker = Broker::open(&hand_made)
+    let mut broker = open_fixture_broker(&hand_made)
         .unwrap()
         .with_worktree_root(external_root.path());
     assert_eq!(
@@ -130,7 +136,7 @@ fn start_worktree_creates_broker_managed_session_without_process() {
     let tmp = tempfile::tempdir().unwrap();
     let external_root = tempfile::tempdir().unwrap();
     init_repo(tmp.path());
-    let mut broker = Broker::open(tmp.path())
+    let mut broker = open_fixture_broker(tmp.path())
         .unwrap()
         .with_worktree_root(external_root.path());
 
@@ -180,7 +186,7 @@ fn two_session_worktrees_are_distinct_and_registered() {
     let tmp = tempfile::tempdir().unwrap();
     let external_root = tempfile::tempdir().unwrap();
     init_repo(tmp.path());
-    let mut broker = Broker::open(tmp.path())
+    let mut broker = open_fixture_broker(tmp.path())
         .unwrap()
         .with_worktree_root(external_root.path());
 
@@ -211,7 +217,7 @@ fn two_session_worktrees_are_distinct_and_registered() {
 fn compatibility_status_snapshot_derives_without_reconciling_state() {
     let tmp = tempfile::tempdir().unwrap();
     init_repo(tmp.path());
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = open_fixture_broker(tmp.path()).unwrap();
     let session = broker.adopt(tmp.path(), Some("snapshot task")).unwrap();
     std::fs::write(tmp.path().join("uncommitted.txt"), "snapshot only\n").unwrap();
     let event_count = broker.store().events_after(0, 10_000).unwrap().len();
@@ -264,7 +270,7 @@ fn session_creation_pins_repository_contract_and_reuse_does_not_refresh_it() {
     )
     .unwrap();
 
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = open_fixture_broker(tmp.path()).unwrap();
     let created = broker.adopt(tmp.path(), Some("pinned task")).unwrap();
     let original_contract = created
         .repository_contract
@@ -311,7 +317,7 @@ fn opening_the_broker_backfills_live_pre_contract_sessions() {
     init_repo(tmp.path());
     let head = rev(tmp.path(), "HEAD");
     let session_id = {
-        let mut broker = Broker::open(tmp.path()).unwrap();
+        let mut broker = open_fixture_broker(tmp.path()).unwrap();
         broker
             .store()
             .register_session(&NewSession {
@@ -332,7 +338,7 @@ fn opening_the_broker_backfills_live_pre_contract_sessions() {
             .id
     };
 
-    let mut reopened = Broker::open(tmp.path()).unwrap();
+    let mut reopened = open_fixture_broker(tmp.path()).unwrap();
     let backfilled = reopened.store().session(session_id).unwrap();
     assert_eq!(backfilled.adoption_base.as_deref(), Some(head.as_str()));
     let contract = backfilled
@@ -347,7 +353,7 @@ fn opening_the_broker_backfills_live_pre_contract_sessions() {
 fn dead_spawned_pid_reconciles_to_exited_and_activity_drives_idle() {
     let tmp = tempfile::tempdir().unwrap();
     init_repo(tmp.path());
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = open_fixture_broker(tmp.path()).unwrap();
 
     let session = broker.start_agent("quick", "true", None).unwrap();
     // Let the child exit.
@@ -391,7 +397,7 @@ fn dead_spawned_pid_reconciles_to_exited_and_activity_drives_idle() {
 fn cleanup_refuses_dirty_and_unmerged_then_force_discards() {
     let tmp = tempfile::tempdir().unwrap();
     init_repo(tmp.path());
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = open_fixture_broker(tmp.path()).unwrap();
 
     let session = broker.start_agent("doomed", "true", None).unwrap();
     let wt = std::path::PathBuf::from(&session.worktree_path);
@@ -423,7 +429,7 @@ fn cleanup_plan_and_apply_reclaim_only_safe_closed_broker_worktrees() {
     std::fs::write(tmp.path().join(".gitignore"), "/.aethyme/\n/target/\n").unwrap();
     sh(tmp.path(), &["add", ".gitignore"]);
     sh(tmp.path(), &["commit", "-qm", "ignore build output"]);
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = open_fixture_broker(tmp.path()).unwrap();
 
     let safe = broker.start_worktree("safe cleanup", None).unwrap();
     let safe_path = std::path::PathBuf::from(&safe.worktree_path);
@@ -579,7 +585,7 @@ fn cleanup_plan_and_apply_reclaim_only_safe_closed_broker_worktrees() {
 fn cleanup_recovers_after_worktree_removal_and_prunes_only_the_exact_branch_tip() {
     let tmp = tempfile::tempdir().unwrap();
     init_repo(tmp.path());
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = open_fixture_broker(tmp.path()).unwrap();
 
     let session = broker.start_worktree("interrupted cleanup", None).unwrap();
     let worktree = std::path::PathBuf::from(&session.worktree_path);
@@ -630,7 +636,7 @@ fn cleanup_recovers_after_worktree_removal_and_prunes_only_the_exact_branch_tip(
 fn cleanup_distinguishes_pending_commits_from_missing_acceptance_provenance() {
     let tmp = tempfile::tempdir().unwrap();
     init_repo(tmp.path());
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = open_fixture_broker(tmp.path()).unwrap();
 
     let pending = broker.start_worktree("pending cleanup", None).unwrap();
     let pending_path = std::path::PathBuf::from(&pending.worktree_path);
@@ -662,7 +668,7 @@ fn cleanup_distinguishes_pending_commits_from_missing_acceptance_provenance() {
         .unwrap();
     drop(connection);
 
-    let broker = Broker::open(tmp.path()).unwrap();
+    let broker = open_fixture_broker(tmp.path()).unwrap();
     let plan = broker.cleanup_plan().unwrap();
     let pending_item = plan
         .worktrees
@@ -707,7 +713,7 @@ fn cleanup_distinguishes_pending_commits_from_missing_acceptance_provenance() {
 fn missing_acceptance_bookkeeping_does_not_strand_work_on_integration() {
     let tmp = tempfile::tempdir().unwrap();
     init_repo(tmp.path());
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = open_fixture_broker(tmp.path()).unwrap();
     let session = broker
         .start_worktree("promoted then forgotten", None)
         .unwrap();
@@ -730,7 +736,7 @@ fn missing_acceptance_bookkeeping_does_not_strand_work_on_integration() {
     }
     drop(connection);
 
-    let broker = Broker::open(tmp.path()).unwrap();
+    let broker = open_fixture_broker(tmp.path()).unwrap();
     let plan = broker.cleanup_plan().unwrap();
     let item = plan
         .worktrees
@@ -753,7 +759,7 @@ fn missing_acceptance_bookkeeping_does_not_strand_work_on_integration() {
 fn cleanup_names_a_shallow_clone_when_inspection_fails() {
     let tmp = tempfile::tempdir().unwrap();
     init_repo(tmp.path());
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = open_fixture_broker(tmp.path()).unwrap();
     let session = broker
         .start_worktree("older than the boundary", None)
         .unwrap();
@@ -778,7 +784,7 @@ fn cleanup_names_a_shallow_clone_when_inspection_fails() {
     )
     .unwrap();
 
-    let broker = Broker::open(tmp.path()).unwrap();
+    let broker = open_fixture_broker(tmp.path()).unwrap();
     let plan = broker.cleanup_plan().unwrap();
     let item = plan
         .worktrees
@@ -798,7 +804,7 @@ fn cleanup_names_a_shallow_clone_when_inspection_fails() {
 fn doctor_reports_healthy_then_finds_missing_worktree() {
     let tmp = tempfile::tempdir().unwrap();
     init_repo(tmp.path());
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = open_fixture_broker(tmp.path()).unwrap();
 
     let report = broker.doctor().unwrap();
     assert_eq!(report.integrity, "ok");
@@ -831,7 +837,7 @@ fn doctor_reports_healthy_then_finds_missing_worktree() {
 fn adopt_conflict_close_reuse_and_replace_stale_lifecycle() {
     let tmp = tempfile::tempdir().unwrap();
     init_repo(tmp.path());
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = open_fixture_broker(tmp.path()).unwrap();
 
     let first = broker
         .adopt_with(
@@ -940,7 +946,7 @@ fn adopt_conflict_close_reuse_and_replace_stale_lifecycle() {
 fn adopt_reuse_reports_behind_drift_and_dirty_path_overlap() {
     let tmp = tempfile::tempdir().unwrap();
     init_repo(tmp.path());
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = open_fixture_broker(tmp.path()).unwrap();
     let session = broker.adopt(tmp.path(), Some("first task")).unwrap();
 
     sh(tmp.path(), &["checkout", "-qb", "integration-work"]);
@@ -974,7 +980,7 @@ fn adopt_reuse_reports_behind_drift_and_dirty_path_overlap() {
 fn adopt_reuse_reports_diverged_commit_counts_and_overlap() {
     let tmp = tempfile::tempdir().unwrap();
     init_repo(tmp.path());
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = open_fixture_broker(tmp.path()).unwrap();
     let session = broker.adopt(tmp.path(), Some("first task")).unwrap();
 
     sh(tmp.path(), &["checkout", "-qb", "integration-work"]);
@@ -1018,7 +1024,7 @@ fn adopt_reuse_reports_ahead_work_and_routes_it_to_submit() {
             "main",
         ],
     );
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = open_fixture_broker(tmp.path()).unwrap();
     let session = broker.adopt(&worktree, Some("first task")).unwrap();
     std::fs::write(worktree.join("ahead.txt"), "session work\n").unwrap();
     sh(&worktree, &["add", "ahead.txt"]);
@@ -1041,7 +1047,7 @@ fn adopt_reuse_reports_ahead_work_and_routes_it_to_submit() {
 fn adopt_reuse_sync_fast_forwards_before_refreshing_the_baseline() {
     let tmp = tempfile::tempdir().unwrap();
     init_repo(tmp.path());
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = open_fixture_broker(tmp.path()).unwrap();
     let session = broker.adopt(tmp.path(), Some("first task")).unwrap();
     let original_head = rev(tmp.path(), "HEAD");
 
@@ -1091,7 +1097,7 @@ fn adopt_reuse_sync_fast_forwards_before_refreshing_the_baseline() {
 fn adopt_reuse_sync_reports_an_already_current_checkout() {
     let tmp = tempfile::tempdir().unwrap();
     init_repo(tmp.path());
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = open_fixture_broker(tmp.path()).unwrap();
     let session = broker.adopt(tmp.path(), Some("first task")).unwrap();
     let head = rev(tmp.path(), "HEAD");
 
@@ -1120,7 +1126,7 @@ fn adopt_reuse_sync_reports_an_already_current_checkout() {
 fn adopt_reuse_sync_refuses_dirty_state_without_changing_head_or_session() {
     let tmp = tempfile::tempdir().unwrap();
     init_repo(tmp.path());
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = open_fixture_broker(tmp.path()).unwrap();
     let session = broker.adopt(tmp.path(), Some("first task")).unwrap();
     let original_head = rev(tmp.path(), "HEAD");
 
@@ -1156,7 +1162,7 @@ fn adopt_reuse_sync_refuses_dirty_state_without_changing_head_or_session() {
 fn adopt_reuse_sync_refuses_divergence_without_changing_head_or_session() {
     let tmp = tempfile::tempdir().unwrap();
     init_repo(tmp.path());
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = open_fixture_broker(tmp.path()).unwrap();
     let session = broker.adopt(tmp.path(), Some("first task")).unwrap();
 
     sh(tmp.path(), &["checkout", "-qb", "integration-work"]);
@@ -1214,7 +1220,7 @@ fn finish_retention_policy_keeps_safe_worktrees_when_disabled_or_invalid() {
         std::fs::create_dir_all(tmp.path().join(".aethyme")).unwrap();
         std::fs::write(tmp.path().join(".aethyme/broker.toml"), policy).unwrap();
 
-        let mut broker = Broker::open(tmp.path())
+        let mut broker = open_fixture_broker(tmp.path())
             .unwrap()
             .with_worktree_root(external_root.path());
         let session = broker.start_worktree("keep landed worktree", None).unwrap();
@@ -1273,7 +1279,7 @@ fn a_squash_merged_session_can_be_recorded_and_finished() {
     );
 
     let external_root = tempfile::tempdir().unwrap();
-    let mut broker = Broker::open(tmp.path())
+    let mut broker = open_fixture_broker(tmp.path())
         .unwrap()
         .with_worktree_root(external_root.path());
     let session = broker.start_worktree("squash task", None).unwrap();
@@ -1384,7 +1390,7 @@ fn unlanded_work_is_refused_and_the_session_stays_blocked() {
             "main",
         ],
     );
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = open_fixture_broker(tmp.path()).unwrap();
     let session = broker.adopt(&wt, Some("local task")).unwrap();
     std::fs::write(wt.join("local.txt"), "never merged\n").unwrap();
     sh(&wt, &["add", "-A"]);
@@ -1421,7 +1427,7 @@ fn finish_blocks_dirty_then_unsubmitted_commits() {
             "main",
         ],
     );
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = open_fixture_broker(tmp.path()).unwrap();
     let session = broker.adopt(&wt, Some("finish task")).unwrap();
 
     std::fs::write(wt.join("wip.txt"), "dirty\n").unwrap();
@@ -1505,7 +1511,7 @@ fn finish_counts_only_commits_missing_from_the_remote_default_branch() {
             "main",
         ],
     );
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = open_fixture_broker(tmp.path()).unwrap();
     let session = broker.adopt(&wt, Some("upstream drift task")).unwrap();
 
     // The session picks up a commit that reaches the remote default branch
@@ -1577,7 +1583,7 @@ fn finish_closes_promoted_session_and_suggests_cleanup_when_integration_contains
             "main",
         ],
     );
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = open_fixture_broker(tmp.path()).unwrap();
     let session = broker.adopt(&wt, Some("promoted finish task")).unwrap();
 
     std::fs::write(wt.join("done.txt"), "done\n").unwrap();
@@ -1781,7 +1787,7 @@ fn finish_distinguishes_fully_published_work_from_local_promotion() {
             "main",
         ],
     );
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = open_fixture_broker(tmp.path()).unwrap();
     let session = broker.adopt(&wt, Some("published finish task")).unwrap();
     std::fs::write(wt.join("published.txt"), "published\n").unwrap();
     sh(&wt, &["add", "-A"]);
@@ -1833,7 +1839,7 @@ fn finish_missing_worktree_persists_an_explicitly_incomplete_snapshot() {
             "main",
         ],
     );
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = open_fixture_broker(tmp.path()).unwrap();
     let session = broker.adopt(&wt, Some("missing finish task")).unwrap();
     sh(
         tmp.path(),
@@ -1879,7 +1885,7 @@ fn status_flags_default_branch_commits_that_never_passed_through_submit() {
     // skipped rather than guessing a default branch name.
     sh(&repo, &["remote", "set-head", "origin", "main"]);
 
-    let mut broker = Broker::open(&repo).unwrap();
+    let mut broker = open_fixture_broker(&repo).unwrap();
     let session = broker.start_worktree("promote something", None).unwrap();
     let worktree = std::path::PathBuf::from(&session.worktree_path);
     std::fs::write(worktree.join("owned.txt"), "work\n").unwrap();
@@ -1955,7 +1961,7 @@ fn adopting_a_worktree_with_pre_existing_commits_says_they_are_not_owned() {
     sh(&recovered, &["add", "-A"]);
     sh(&recovered, &["commit", "-qm", "feat: recovered work"]);
 
-    let mut broker = Broker::open(&repo).unwrap();
+    let mut broker = open_fixture_broker(&repo).unwrap();
     let report = broker
         .adopt_with(
             &recovered,
@@ -2006,7 +2012,7 @@ fn re_adopting_a_closed_session_keeps_its_unsubmitted_commits_owned() {
         ],
     );
 
-    let mut broker = Broker::open(&repo).unwrap();
+    let mut broker = open_fixture_broker(&repo).unwrap();
     let first = broker
         .adopt_with(&work, Some("first task"), AdoptMode::New, None)
         .unwrap();
@@ -2073,7 +2079,7 @@ fn re_adopting_a_closed_session_keeps_its_unsubmitted_commits_owned() {
 fn status_brief_skips_the_implicit_lease_refresh() {
     let tmp = tempfile::tempdir().unwrap();
     init_repo(tmp.path());
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = open_fixture_broker(tmp.path()).unwrap();
     let session = broker.adopt(tmp.path(), Some("brief task")).unwrap();
     std::fs::write(tmp.path().join("README.md"), "edited, uncommitted\n").unwrap();
     assert!(broker.store().active_leases().unwrap().is_empty());
@@ -2109,7 +2115,7 @@ fn status_brief_skips_the_implicit_lease_refresh() {
 fn status_brief_still_records_liveness_transitions() {
     let tmp = tempfile::tempdir().unwrap();
     init_repo(tmp.path());
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = open_fixture_broker(tmp.path()).unwrap();
     let session = broker.adopt(tmp.path(), Some("liveness task")).unwrap();
     assert_eq!(
         broker.store().session(session.id).unwrap().status,
@@ -2141,7 +2147,7 @@ fn status_brief_still_records_liveness_transitions() {
 fn a_finished_session_stops_colliding_on_its_declared_targets() {
     let tmp = tempfile::tempdir().unwrap();
     init_repo(tmp.path());
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = open_fixture_broker(tmp.path()).unwrap();
 
     // Two real worktrees: one session per checkout, as the broker requires.
     let first_tree = tmp.path().join(".aethyme/worktrees/rewriter");
@@ -2223,7 +2229,7 @@ fn refreshed_summary_and_integration_status_agree_after_an_unpushed_fast_forward
         ],
     );
     let published = rev(tmp.path(), "HEAD");
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = open_fixture_broker(tmp.path()).unwrap();
     broker.integration_status(now_ms()).unwrap();
 
     // Two commits land on integration without touching main.
@@ -2271,7 +2277,7 @@ fn refreshed_summary_and_integration_status_agree_after_an_unpushed_fast_forward
 fn routine_status_reports_unknown_checks_and_does_not_refresh_dirty_leases() {
     let tmp = tempfile::tempdir().unwrap();
     init_repo(tmp.path());
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = open_fixture_broker(tmp.path()).unwrap();
     broker.adopt(tmp.path(), Some("routine status")).unwrap();
     std::fs::write(tmp.path().join("README.md"), "uncommitted\n").unwrap();
     let status = broker.status_current(now_ms()).unwrap();
@@ -2311,7 +2317,7 @@ fn routine_status_reports_unknown_checks_and_does_not_refresh_dirty_leases() {
 fn routine_status_never_authorizes_cleanup_of_a_dirty_closed_checkout() {
     let tmp = tempfile::tempdir().unwrap();
     init_repo(tmp.path());
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = open_fixture_broker(tmp.path()).unwrap();
     let session = broker.start_worktree("closed retained work", None).unwrap();
     let checkout = std::path::PathBuf::from(&session.worktree_path);
     std::fs::write(checkout.join("keep.txt"), "untracked user work\n").unwrap();
@@ -2343,7 +2349,7 @@ fn routine_status_never_authorizes_cleanup_of_a_dirty_closed_checkout() {
 fn summary_snapshot_does_not_persist_liveness_transitions() {
     let tmp = tempfile::tempdir().unwrap();
     init_repo(tmp.path());
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = open_fixture_broker(tmp.path()).unwrap();
     let session = broker.adopt(tmp.path(), Some("snapshot status")).unwrap();
     let snapshot = Broker::open_snapshot(tmp.path()).unwrap();
     let report = snapshot
@@ -2361,7 +2367,7 @@ fn summary_snapshot_does_not_persist_liveness_transitions() {
 fn routine_status_counts_rendered_advisories_but_summary_does_not() {
     let tmp = tempfile::tempdir().unwrap();
     init_repo(tmp.path());
-    let mut broker = Broker::open(tmp.path()).unwrap();
+    let mut broker = open_fixture_broker(tmp.path()).unwrap();
     let session = broker
         .adopt(tmp.path(), Some("advisory reporting"))
         .unwrap();

@@ -6,6 +6,8 @@ use std::process::Command;
 
 use aethyme_broker::{Broker, MergeStatus};
 
+mod common;
+
 fn sh(cwd: &Path, args: &[&str]) {
     let out = Command::new("git")
         .args(args)
@@ -32,7 +34,7 @@ fn repo_with_session(tmp: &Path) -> (std::path::PathBuf, Broker, i64, std::path:
     sh(&repo, &["add", "-A"]);
     sh(&repo, &["commit", "-qm", "init"]);
 
-    let mut broker = Broker::open(&repo).unwrap();
+    let mut broker = common::open_fixture_broker(&repo, tmp).unwrap();
     let session = broker.start_worktree("work", None).unwrap();
     let worktree = std::path::PathBuf::from(&session.worktree_path);
     std::fs::write(worktree.join("work.txt"), "landed\n").unwrap();
