@@ -35,15 +35,15 @@ fn retained_worktree_uses_its_fixture_root_and_is_removed_at_teardown() {
             assert!(output.status.success(), "{output:?}");
         }
 
+        let expected_root = isolation::worktree_root(fixture.path());
+        std::fs::create_dir_all(&expected_root).unwrap();
+        let expected_root = expected_root.canonicalize().unwrap();
         let mut broker = isolation::open(fixture.path());
         let session = broker.start_worktree("retained fixture", None).unwrap();
         let worktree = PathBuf::from(session.worktree_path);
         assert!(
-            worktree.canonicalize().unwrap().starts_with(
-                isolation::worktree_root(fixture.path())
-                    .canonicalize()
-                    .unwrap()
-            )
+            worktree.canonicalize().unwrap().starts_with(&expected_root),
+            "library checkout must stay under the fixture-owned worktree root"
         );
         assert!(!poison.exists(), "inherited placement must remain unused");
 
@@ -77,11 +77,11 @@ fn retained_worktree_uses_its_fixture_root_and_is_removed_at_teardown() {
         let cli_session: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
         let cli_worktree = PathBuf::from(cli_session["worktree_path"].as_str().unwrap());
         assert!(
-            cli_worktree.canonicalize().unwrap().starts_with(
-                isolation::worktree_root(fixture.path())
-                    .canonicalize()
-                    .unwrap()
-            )
+            cli_worktree
+                .canonicalize()
+                .unwrap()
+                .starts_with(&expected_root),
+            "CLI checkout must stay under the fixture-owned worktree root"
         );
         let repo = fixture.path().to_path_buf();
         let root = repo.parent().unwrap().to_path_buf();

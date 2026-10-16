@@ -104,11 +104,18 @@ fn apply(repo: &Path, id: &str, digest: &str) -> Output {
     )
 }
 
-fn archive_entries(repo: &Path) -> Vec<PathBuf> {
-    let root = repo.join(".aethyme/recovery-archives");
-    match std::fs::read_dir(&root) {
+fn archive_root(repo: &Path, plan: &serde_json::Value) -> PathBuf {
+    let root = PathBuf::from(plan["archive_root"].as_str().unwrap());
+    let owned = repo.parent().unwrap().join("host-state/recovery-archives");
+    assert_eq!(root.parent(), Some(owned.as_path()));
+    root
+}
+
+fn archive_entries(root: &Path) -> Vec<PathBuf> {
+    match std::fs::read_dir(root) {
         Ok(entries) => entries.map(|entry| entry.unwrap().path()).collect(),
-        Err(_) => Vec::new(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => panic!("cannot inspect archive root {}: {error}", root.display()),
     }
 }
 
@@ -142,7 +149,7 @@ fn a_dirty_worktree_is_archived_restored_and_then_removed() {
     let archive = PathBuf::from(outcome["archive"].as_str().unwrap());
     let canonical = |path: &Path| std::fs::canonicalize(path).unwrap();
     assert_eq!(
-        archive_entries(tmp.path())
+        archive_entries(&archive_root(tmp.path(), &reviewed))
             .iter()
             .map(|entry| canonical(entry))
             .collect::<Vec<_>>(),
@@ -283,7 +290,7 @@ fn a_stale_digest_is_refused_and_nothing_moves() {
     assert!(stderr.contains("no longer matches"), "{stderr}");
     assert!(worktree.join("notes/todo.txt").is_file());
     assert!(
-        archive_entries(tmp.path()).is_empty(),
+        archive_entries(&archive_root(tmp.path(), &reviewed)).is_empty(),
         "nothing was archived"
     );
 }
@@ -295,12 +302,9 @@ fn a_failed_archive_leaves_the_worktree_in_place() {
     let (id, worktree) = dirty_closed_session(tmp.path());
     let reviewed = plan(tmp.path(), &id);
     // A file where the archive root's directory must go.
-    std::fs::create_dir_all(tmp.path().join(".aethyme")).unwrap();
-    std::fs::write(
-        tmp.path().join(".aethyme/recovery-archives"),
-        "not a directory",
-    )
-    .unwrap();
+    let root = archive_root(tmp.path(), &reviewed);
+    std::fs::create_dir_all(root.parent().unwrap()).unwrap();
+    std::fs::write(root, "not a directory").unwrap();
 
     let refused = apply(tmp.path(), &id, reviewed["digest"].as_str().unwrap());
     assert!(!refused.status.success());
