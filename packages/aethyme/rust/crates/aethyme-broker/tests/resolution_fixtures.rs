@@ -15,6 +15,8 @@ use std::cell::Cell;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::rc::Rc;
+use std::sync::mpsc;
+use std::time::Duration;
 
 use aethyme_broker::collaboration_archive::{self, CommitOid};
 use aethyme_broker::collaboration_capture::{
@@ -28,21 +30,31 @@ use aethyme_broker::composer::{
 };
 use aethyme_broker::composition::{CompositionMode, CompositionOutcome, Producer};
 use aethyme_broker::resolution::{
-    self, FailedCheck, MAX_SYNTHESIS_ATTEMPTS, Preference, Proposal, ProposedFile, RequirementRef,
-    Resolution, ResolutionFailure, ResolutionInputs, ResolutionOutcome, ResolutionRequest,
-    Resolver, ResolverIdentity, Response, Trigger,
+    self, BeginResolutionAttempt, DispatchLimits, FailedCheck, MAX_SYNTHESIS_ATTEMPTS, Preference,
+    Proposal, ProposedFile, RequirementRef, Resolution, ResolutionAttemptState, ResolutionFailure,
+    ResolutionInputs, ResolutionOutcome, ResolutionRequest, Resolver, ResolverIdentity, Response,
+    Trigger,
 };
 use aethyme_contracts::experimental_v0::canonical_json::Value;
 use aethyme_contracts::experimental_v0::{EntryKind, RecordId};
 use aethyme_testkit::composition_fixtures::{
     self as fx, CaseInput, Observed, Outcome, ScenarioInput,
 };
+use sha2::{Digest, Sha256};
 
 fn open_store(root: &Path, repo: &Path) -> CollaborationStore {
     CollaborationStore::open(
         &CollaborationRoot::under_host_state(root),
         &ProjectKey::parse("fixtures").unwrap(),
         &forbidden_roots(repo),
+    )
+    .unwrap()
+}
+
+fn read_only_state_connection(store: &CollaborationStore) -> rusqlite::Connection {
+    rusqlite::Connection::open_with_flags(
+        store.project_dir().join("state.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
     )
     .unwrap()
 }
@@ -589,6 +601,499 @@ fn a_failed_check_raises_an_exact_scoped_request() {
     assert_eq!(request.baseline().commit, world.baseline);
     assert!(request.protected().iter().any(|p| p == "dir:.aethyme"));
     resolution::read_record(&world.store, request.record()).unwrap();
+}
+
+#[test]
+fn asynchronous_attempt_is_charged_before_export_and_imported_once() {
+    let (case, input) = interaction();
+    let (mut world, request) = raise(&case, &input);
+    let limits = DispatchLimits {
+        max_manifest_bytes: 4 * 1024 * 1024,
+        max_manifest_entries: 8192,
+        max_file_bytes: 4 * 1024 * 1024,
+        max_total_input_bytes: 32 * 1024 * 1024,
+        max_response_bytes: 64 * 1024,
+    };
+    let started = resolution::begin_attempt(
+        &mut world.store,
+        &world.repo,
+        request.record(),
+        "session-test-1",
+        "client-key-1",
+        limits,
+    )
+    .unwrap();
+    let (status, exported_request, input_manifest) = match started {
+        BeginResolutionAttempt::Started {
+            status,
+            request,
+            input_manifest,
+        } => (status, request, input_manifest),
+        other => panic!("unexpected begin result: {other:?}"),
+    };
+    assert_eq!(status.state, ResolutionAttemptState::Exported);
+    assert_eq!(status.attempt, 1);
+    assert_eq!(status.limits, limits);
+    assert_eq!(input_manifest.sha256, status.input_manifest_sha256);
+    assert!(!input_manifest.entries.is_empty());
+    let packet = exported_request
+        .export_json(&status, &input_manifest)
+        .unwrap();
+    assert_eq!(
+        packet["input_manifest"]["sha256"],
+        status.input_manifest_sha256
+    );
+    assert_eq!(packet["authority"]["session_label"], "provenance_only");
+    assert!(packet["request"]["requirements"].is_array());
+
+    let ledger = read_only_state_connection(&world.store);
+    let charged: i64 = ledger
+        .query_row(
+            "SELECT count(*) FROM resolution_attempts WHERE async_token=?1",
+            [&status.token],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(charged, 1, "the ledger charge precedes request export");
+
+    let holder = format!("resolution:{}", status.token);
+    let snapshot_roots: i64 = ledger
+        .query_row(
+            "SELECT count(*) FROM reader_leases
+             WHERE holder=?1 AND target_kind='snapshot'",
+            [&holder],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let contribution_roots: i64 = ledger
+        .query_row(
+            "SELECT count(*) FROM reader_leases
+             WHERE holder=?1 AND target_kind='contribution'",
+            [&holder],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let request_roots: i64 = ledger
+        .query_row(
+            "SELECT count(*) FROM object_pins
+             WHERE holder=?1 AND object_sha256=?2",
+            rusqlite::params![holder, status.request.object.hex()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(snapshot_roots > 0);
+    assert!(contribution_roots > 0);
+    assert_eq!(request_roots, 1);
+
+    let input_entry = input_manifest
+        .entries
+        .iter()
+        .find(|entry| entry.kind.is_some())
+        .expect("the scoped request includes a file");
+    let input = resolution::read_attempt_input(
+        &mut world.store,
+        &world.repo,
+        &status.token,
+        "session-test-1",
+        &input_entry.snapshot,
+        &input_entry.path,
+    )
+    .unwrap()
+    .expect("the exact manifest names a file");
+    assert_eq!(input.bytes.len() as u64, input_entry.bytes);
+    assert_eq!(
+        format!("{:x}", Sha256::digest(&input.bytes)),
+        input_entry.sha256.as_deref().unwrap()
+    );
+    assert!(
+        resolution::read_attempt_input(
+            &mut world.store,
+            &world.repo,
+            &status.token,
+            "session-test-1",
+            &input_entry.snapshot,
+            "not-in-request.txt",
+        )
+        .is_err()
+    );
+
+    let repeated = resolution::begin_attempt(
+        &mut world.store,
+        &world.repo,
+        request.record(),
+        "session-test-1",
+        "client-key-1",
+        limits,
+    )
+    .unwrap();
+    let BeginResolutionAttempt::Existing(repeated) = repeated else {
+        panic!("idempotent begin returned another export");
+    };
+    assert_eq!(repeated.token, status.token);
+    assert_eq!(repeated.state, ResolutionAttemptState::Exported);
+
+    let dispatching =
+        resolution::mark_attempt_dispatching(&mut world.store, &status.token, "session-test-1")
+            .unwrap();
+    assert_eq!(dispatching.state, ResolutionAttemptState::Dispatching);
+    let unknown = resolution::mark_attempt_unknown(
+        &mut world.store,
+        &status.token,
+        "session-test-1",
+        "operator did not receive a completion signal",
+    )
+    .unwrap();
+    assert_eq!(unknown.state, ResolutionAttemptState::OutcomeUnknown);
+    assert_eq!(unknown.attempt, 1);
+
+    let response_envelope = serde_json::json!({
+        "schema": resolution::ASYNC_RESPONSE_ENVELOPE_SCHEMA,
+        "attempt_token": status.token,
+        "session_label": "session-test-1",
+        "request_record_id": status.request.id.as_str(),
+        "request_object_sha256": status.request.object.hex(),
+        "input_manifest_sha256": status.input_manifest_sha256,
+        "response": {"kind": "unresolved", "detail": "no safe synthesis"},
+    });
+    let response_bytes = serde_json::to_vec(&response_envelope).unwrap();
+    let wrong_binding = serde_json::json!({
+        "schema": resolution::ASYNC_RESPONSE_ENVELOPE_SCHEMA,
+        "attempt_token": status.token,
+        "session_label": "session-test-1",
+        "request_record_id": status.request.id.as_str(),
+        "request_object_sha256": "0".repeat(64),
+        "input_manifest_sha256": status.input_manifest_sha256,
+        "response": {"kind": "unresolved", "detail": "wrong request"},
+    });
+    let wrong_bytes = serde_json::to_vec(&wrong_binding).unwrap();
+    assert!(resolution::decode_attempt_response_envelope(&unknown, &wrong_bytes).is_err());
+    let bound = resolution::decode_attempt_response_envelope(&unknown, &response_bytes).unwrap();
+    let late = resolution::finish_bound_attempt(&mut world.store, &world.repo, &bound).unwrap();
+    assert_eq!(
+        failure(&late),
+        Some(ResolutionFailure::Unresolved),
+        "the late response settles the existing charge"
+    );
+    let settled =
+        resolution::attempt_status(&world.store, &status.token, "session-test-1").unwrap();
+    assert_eq!(settled.state, ResolutionAttemptState::Settled);
+    assert_eq!(settled.outcome.as_deref(), Some("unresolved"));
+    assert!(resolution::finish_bound_attempt(&mut world.store, &world.repo, &bound).is_err());
+    let after_settlement = resolution::begin_attempt(
+        &mut world.store,
+        &world.repo,
+        request.record(),
+        "session-test-1",
+        "client-key-1",
+        limits,
+    )
+    .unwrap();
+    let BeginResolutionAttempt::Existing(after_settlement) = after_settlement else {
+        panic!("settled idempotency key created another attempt");
+    };
+    assert_eq!(after_settlement.token, status.token);
+    assert_eq!(after_settlement.state, ResolutionAttemptState::Settled);
+}
+
+#[test]
+fn importing_attempt_resumes_after_store_reopen() {
+    let (case, input) = interaction();
+    let (mut world, request) = raise(&case, &input);
+    let limits = DispatchLimits {
+        max_manifest_bytes: 4 * 1024 * 1024,
+        max_manifest_entries: 8192,
+        max_file_bytes: 4 * 1024 * 1024,
+        max_total_input_bytes: 32 * 1024 * 1024,
+        max_response_bytes: 64 * 1024,
+    };
+    let started = resolution::begin_attempt(
+        &mut world.store,
+        &world.repo,
+        request.record(),
+        "session-test-reopen",
+        "client-key-reopen",
+        limits,
+    )
+    .unwrap();
+    let BeginResolutionAttempt::Started { status, .. } = started else {
+        panic!("expected a new charged attempt");
+    };
+    resolution::mark_attempt_dispatching(&mut world.store, &status.token, "session-test-reopen")
+        .unwrap();
+
+    let response = Response::Unresolved("recovered after import interruption".into());
+    let response_bytes =
+        resolution::encode_response_bytes(&response, limits.max_response_bytes).unwrap();
+    git(
+        &world.repo,
+        &["checkout", "--detach", world.baseline.as_str()],
+    );
+    let base = world.baseline.as_str().to_owned();
+    let response_path = world.repo.join("async-response.fixture");
+    std::fs::write(&response_path, &response_bytes).unwrap();
+    git(&world.repo, &["add", "async-response.fixture"]);
+    git(
+        &world.repo,
+        &["commit", "-m", "fixture async response archive object"],
+    );
+    let result = git(&world.repo, &["rev-parse", "HEAD"]);
+    capture_lineage(&mut world.store, &world.repo, &base, &result);
+
+    let response_sha256 = format!("{:x}", Sha256::digest(&response_bytes));
+    let holder = format!("resolution:{}", status.token);
+    let mut ledger = rusqlite::Connection::open_with_flags(
+        world.store.project_dir().join("state.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .unwrap();
+    ledger.busy_timeout(Duration::from_secs(5)).unwrap();
+    let transaction = ledger
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .unwrap();
+    let changed = transaction
+        .execute(
+            "UPDATE resolution_attempts
+             SET async_state='importing', response_sha256=?1
+             WHERE async_token=?2 AND session_label=?3 AND async_state='dispatching'",
+            rusqlite::params![response_sha256, status.token, "session-test-reopen"],
+        )
+        .unwrap();
+    assert_eq!(changed, 1);
+    transaction
+        .execute(
+            "INSERT INTO object_pins(class,object_sha256,holder,until_ms,created_ms)
+             VALUES('cited_evidence',?1,?2,NULL,1)",
+            rusqlite::params![response_sha256, holder],
+        )
+        .unwrap();
+    transaction.commit().unwrap();
+    drop(ledger);
+
+    let importing =
+        resolution::attempt_status(&world.store, &status.token, "session-test-reopen").unwrap();
+    assert_eq!(importing.state, ResolutionAttemptState::Importing);
+    assert_eq!(
+        importing.response_sha256.as_deref(),
+        Some(response_sha256.as_str())
+    );
+
+    let host = world.root.path().join("state");
+    let repo = world.repo.clone();
+    drop(world.store);
+    world.store = open_store(&host, &repo);
+    let resumed = resolution::resume_attempt_import(
+        &mut world.store,
+        &world.repo,
+        &status.token,
+        "session-test-reopen",
+    )
+    .unwrap();
+    assert_eq!(failure(&resumed), Some(ResolutionFailure::Unresolved));
+    let settled =
+        resolution::attempt_status(&world.store, &status.token, "session-test-reopen").unwrap();
+    assert_eq!(settled.state, ResolutionAttemptState::Settled);
+    assert_eq!(
+        settled.response_sha256.as_deref(),
+        Some(response_sha256.as_str())
+    );
+    assert_eq!(settled.outcome.as_deref(), Some("unresolved"));
+}
+
+#[test]
+fn concurrent_bound_imports_settle_one_attempt_once() {
+    let (case, input) = interaction();
+    let (mut world, request) = raise(&case, &input);
+    let limits = DispatchLimits {
+        max_manifest_bytes: 4 * 1024 * 1024,
+        max_manifest_entries: 8192,
+        max_file_bytes: 4 * 1024 * 1024,
+        max_total_input_bytes: 32 * 1024 * 1024,
+        max_response_bytes: 64 * 1024,
+    };
+    let started = resolution::begin_attempt(
+        &mut world.store,
+        &world.repo,
+        request.record(),
+        "session-test-concurrent",
+        "client-key-concurrent",
+        limits,
+    )
+    .unwrap();
+    let BeginResolutionAttempt::Started { status, .. } = started else {
+        panic!("expected a new charged attempt");
+    };
+    resolution::mark_attempt_dispatching(
+        &mut world.store,
+        &status.token,
+        "session-test-concurrent",
+    )
+    .unwrap();
+    let response_envelope = serde_json::json!({
+        "schema": resolution::ASYNC_RESPONSE_ENVELOPE_SCHEMA,
+        "attempt_token": status.token,
+        "session_label": "session-test-concurrent",
+        "request_record_id": status.request.id.as_str(),
+        "request_object_sha256": status.request.object.hex(),
+        "input_manifest_sha256": status.input_manifest_sha256,
+        "response": {"kind": "unresolved", "detail": "one concurrent settlement"},
+    });
+    let response_bytes = serde_json::to_vec(&response_envelope).unwrap();
+    let bound = resolution::decode_attempt_response_envelope(&status, &response_bytes).unwrap();
+
+    let host = world.root.path().join("state");
+    let repo = world.repo.clone();
+    let first_bound = bound.clone();
+    let first_host = host.clone();
+    let first_repo = repo.clone();
+    let (first_ready_tx, first_ready_rx) = mpsc::channel();
+    let (first_start_tx, first_start_rx) = mpsc::channel();
+    let (first_result_tx, first_result_rx) = mpsc::channel();
+    let first_worker = std::thread::spawn(move || {
+        let mut store = open_store(&first_host, &first_repo);
+        let _ = first_ready_tx.send(());
+        if first_start_rx
+            .recv_timeout(Duration::from_secs(30))
+            .is_err()
+        {
+            return;
+        }
+        let result = resolution::finish_bound_attempt(&mut store, &first_repo, &first_bound);
+        drop(store);
+        let _ = first_result_tx.send(result);
+    });
+    let second_bound = bound;
+    let (second_ready_tx, second_ready_rx) = mpsc::channel();
+    let (second_start_tx, second_start_rx) = mpsc::channel();
+    let (second_result_tx, second_result_rx) = mpsc::channel();
+    let second_worker = std::thread::spawn(move || {
+        let mut store = open_store(&host, &repo);
+        let _ = second_ready_tx.send(());
+        if second_start_rx
+            .recv_timeout(Duration::from_secs(30))
+            .is_err()
+        {
+            return;
+        }
+        let result = resolution::finish_bound_attempt(&mut store, &repo, &second_bound);
+        drop(store);
+        let _ = second_result_tx.send(result);
+    });
+    let first_ready = first_ready_rx.recv_timeout(Duration::from_secs(30));
+    let second_ready = second_ready_rx.recv_timeout(Duration::from_secs(30));
+    if first_ready.is_err() || second_ready.is_err() {
+        let _ = first_start_tx.send(());
+        let _ = second_start_tx.send(());
+        panic!("both import workers must open before concurrent dispatch");
+    }
+    first_start_tx.send(()).unwrap();
+    second_start_tx.send(()).unwrap();
+    let first = first_result_rx
+        .recv_timeout(Duration::from_secs(30))
+        .expect("first import worker must finish within the bounded wait");
+    let second = second_result_rx
+        .recv_timeout(Duration::from_secs(30))
+        .expect("second import worker must finish within the bounded wait");
+    drop(first_worker);
+    drop(second_worker);
+    assert_eq!(usize::from(first.is_ok()) + usize::from(second.is_ok()), 1);
+
+    let settled =
+        resolution::attempt_status(&world.store, &status.token, "session-test-concurrent").unwrap();
+    assert_eq!(settled.state, ResolutionAttemptState::Settled);
+    assert_eq!(settled.outcome.as_deref(), Some("unresolved"));
+    let ledger = read_only_state_connection(&world.store);
+    let attempts: i64 = ledger
+        .query_row(
+            "SELECT count(*) FROM resolution_attempts WHERE async_token=?1",
+            [&status.token],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(attempts, 1);
+}
+
+#[test]
+fn asynchronous_attempt_rejects_oversized_scoped_inputs_before_charge() {
+    let (case, input) = interaction();
+    let (mut world, request) = raise(&case, &input);
+    let limits = DispatchLimits {
+        max_manifest_bytes: 1024 * 1024,
+        max_manifest_entries: 1024,
+        max_file_bytes: 1,
+        max_total_input_bytes: 1,
+        max_response_bytes: 1024,
+    };
+    assert!(
+        resolution::begin_attempt(
+            &mut world.store,
+            &world.repo,
+            request.record(),
+            "session-test-oversize",
+            "client-key-oversize",
+            limits,
+        )
+        .is_err()
+    );
+    let ledger = read_only_state_connection(&world.store);
+    let charged: i64 = ledger
+        .query_row(
+            "SELECT count(*) FROM resolution_attempts WHERE session_label='session-test-oversize'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        charged, 0,
+        "oversized input is refused before request export"
+    );
+}
+
+#[test]
+fn asynchronous_response_over_limit_remains_charged_and_dispatching() {
+    let (case, input) = interaction();
+    let (mut world, request) = raise(&case, &input);
+    let limits = DispatchLimits {
+        max_manifest_bytes: 1024 * 1024,
+        max_manifest_entries: 1024,
+        max_file_bytes: 1024,
+        max_total_input_bytes: 16 * 1024,
+        max_response_bytes: 1024,
+    };
+    let started = resolution::begin_attempt(
+        &mut world.store,
+        &world.repo,
+        request.record(),
+        "session-test-response-limit",
+        "client-key-response-limit",
+        limits,
+    )
+    .unwrap();
+    let BeginResolutionAttempt::Started { status, .. } = started else {
+        panic!("unexpected begin result: {started:?}");
+    };
+    resolution::mark_attempt_dispatching(
+        &mut world.store,
+        &status.token,
+        "session-test-response-limit",
+    )
+    .unwrap();
+    let too_large_envelope = serde_json::json!({
+        "schema": resolution::ASYNC_RESPONSE_ENVELOPE_SCHEMA,
+        "attempt_token": status.token,
+        "session_label": "session-test-response-limit",
+        "request_record_id": status.request.id.as_str(),
+        "request_object_sha256": status.request.object.hex(),
+        "input_manifest_sha256": status.input_manifest_sha256,
+        "response": {"kind": "unresolved", "detail": "response too large".repeat(256)},
+    });
+    let too_large_bytes = serde_json::to_vec(&too_large_envelope).unwrap();
+    assert!(resolution::decode_attempt_response_envelope(&status, &too_large_bytes).is_err());
+    let current =
+        resolution::attempt_status(&world.store, &status.token, "session-test-response-limit")
+            .unwrap();
+    assert_eq!(current.state, ResolutionAttemptState::Dispatching);
+    assert!(current.response_sha256.is_none());
+    assert!(current.outcome.is_none());
 }
 
 fn changed(repo: &Path, base: &str, result: &str) -> Vec<String> {
